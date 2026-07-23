@@ -425,6 +425,22 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Agent-logged minor-friction capture settings (#419) and opt-in auto-file settings (#421)."),
+  // Opt-in correction auto-file (#500). Unlike `papercuts`, correction_event
+  // capture itself (#499) is unconditional — every accepted operator
+  // correction or recovered failure is recorded regardless of config — so this
+  // block only gates auto-filing and has no capture-side `enabled` key.
+  // Single-host concurrency scope (#459): see the field descriptions below and
+  // `autoFileCorrections` in `stages/papercut.ts`.
+  corrections: z
+    .object({
+      auto_file: z.boolean().optional().describe("When true, automatically file pipeline:backlog issues for recurring correction clusters at run_complete and queue-batch end. Single-host concurrency scope (#459) — see docs."),
+      auto_file_window_hours: z.number().positive().optional().describe("Trailing window (hours) over which correction_event records are clustered for auto-filing."),
+      auto_file_max_per_window: z.number().int().positive().optional().describe("Maximum number of issues auto-filed within the trailing window."),
+      auto_file_min_occurrences: z.number().int().min(2).optional().describe("Minimum in-window distinct-occurrence count a correction cluster must meet to be auto-filed (floor 2)."),
+    })
+    .strict()
+    .optional()
+    .describe("Opt-in auto-file settings for recurring correction_event clusters (#500). Correction capture itself is unconditional (#499); this block only controls auto-filing."),
   // Optional override for the reviewer-role harness (#40). When set, the review
   // step invokes this CLI instead of the profile's default reviewer. An arbitrary
   // string (not an enum) because a custom reviewer CLI name is unconstrained;
@@ -982,6 +998,15 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         fileConfig.papercuts?.auto_file_max_per_window ?? DEFAULT_CONFIG.papercuts.auto_file_max_per_window,
       auto_file_min_occurrences:
         fileConfig.papercuts?.auto_file_min_occurrences ?? DEFAULT_CONFIG.papercuts.auto_file_min_occurrences,
+    },
+    corrections: {
+      auto_file: fileConfig.corrections?.auto_file ?? DEFAULT_CONFIG.corrections.auto_file,
+      auto_file_window_hours:
+        fileConfig.corrections?.auto_file_window_hours ?? DEFAULT_CONFIG.corrections.auto_file_window_hours,
+      auto_file_max_per_window:
+        fileConfig.corrections?.auto_file_max_per_window ?? DEFAULT_CONFIG.corrections.auto_file_max_per_window,
+      auto_file_min_occurrences:
+        fileConfig.corrections?.auto_file_min_occurrences ?? DEFAULT_CONFIG.corrections.auto_file_min_occurrences,
     },
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,
@@ -1883,6 +1908,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
   const doctor = { ...d.doctor, ...config.doctor };
   const loopCfg = { ...d.loop, ...config.loop };
   const papercuts = { ...d.papercuts, ...config.papercuts };
+  const corrections = { ...d.corrections, ...config.corrections };
   const autoLoop = { ...d.auto_loop, ...config.auto_loop };
   const designGate = { ...d.design_gate, ...config.design_gate, limits: { ...d.design_gate.limits, ...config.design_gate?.limits } };
   const autoMergeEligibility = { ...d.auto_merge_eligibility, ...config.auto_merge_eligibility };
@@ -2077,6 +2103,16 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         `#   auto_file_window_hours: ${yamlScalar(papercuts.auto_file_window_hours)} # ${sd("papercuts.auto_file_window_hours", "trailing window (hours) over which papercut events are clustered for auto-filing")}`,
         `#   auto_file_max_per_window: ${yamlScalar(papercuts.auto_file_max_per_window)} # ${sd("papercuts.auto_file_max_per_window", "maximum number of issues auto-filed within the trailing window")}`,
         `#   auto_file_min_occurrences: ${yamlScalar(papercuts.auto_file_min_occurrences)} # ${sd("papercuts.auto_file_min_occurrences", "minimum in-window occurrence count a papercut cluster must meet to be auto-filed")}`,
+      ].join("\n"),
+    "",
+    config.corrections !== undefined
+      ? `corrections: # opt-in correction auto-file (#500) — correction_event capture (#499) is unconditional; this only gates auto-filing\n${yamlBlock(config.corrections, 2)}`
+      : [
+        "# corrections: # opt-in correction auto-file (#500) — uncomment to auto-file recurring correction_event clusters. Capture (#499) is unconditional and unaffected.",
+        `#   auto_file: false # ${sd("corrections.auto_file", "opt in to auto-file pipeline:backlog issues for recurring correction clusters at run_complete and queue-batch end. Single-host concurrency scope (#459).")}`,
+        `#   auto_file_window_hours: ${yamlScalar(corrections.auto_file_window_hours)} # ${sd("corrections.auto_file_window_hours", "trailing window (hours) over which correction_event records are clustered for auto-filing")}`,
+        `#   auto_file_max_per_window: ${yamlScalar(corrections.auto_file_max_per_window)} # ${sd("corrections.auto_file_max_per_window", "maximum number of issues auto-filed within the trailing window")}`,
+        `#   auto_file_min_occurrences: ${yamlScalar(corrections.auto_file_min_occurrences)} # ${sd("corrections.auto_file_min_occurrences", "minimum in-window distinct-occurrence count a correction cluster must meet to be auto-filed (floor 2)")}`,
       ].join("\n"),
     "",
     config.auto_loop !== undefined
@@ -2307,6 +2343,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     doctor: { ...d.doctor, ...config.doctor },
     loop: { ...d.loop, ...config.loop },
     papercuts: { ...d.papercuts, ...config.papercuts },
+    corrections: { ...d.corrections, ...config.corrections },
     setup_command: config.setup_command,
     build_command: config.build_command,
     conventions_md_path: config.conventions_md_path,

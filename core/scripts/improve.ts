@@ -9,12 +9,44 @@ import { createInterface } from "node:readline";
 import { spawnSync } from "node:child_process";
 import { runsDir } from "./run-store.ts";
 import { summarizeInterventions } from "./intervention.ts";
+import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-export type ClusterCategory = "review-finding" | "blocker" | "flaky-gate" | "token-waste" | "papercut";
+export type ClusterCategory =
+  | "review-finding"
+  | "blocker"
+  | "flaky-gate"
+  | "token-waste"
+  | "papercut"
+  | "correction";
+
+/** Next control level named by a correction proposal (#500). `undetermined` is
+ *  a compiler-side sentinel, never an emitted `proposed_control` value — it
+ *  means no consistent bounded evidence justified naming one of the other five. */
+export type ControlLevel =
+  | "instruction"
+  | "skill-rubric"
+  | "eval"
+  | "deterministic-gate"
+  | "human-judgment"
+  | "undetermined";
+
+/** Bounded evidence bundle carried only by `correction`-category clusters
+ *  (#500). Every field is derived purely from the `correction_event` contract
+ *  (#499) — never from raw-text similarity or an LLM. */
+export interface CorrectionEvidence {
+  distinctRunCount: number;
+  distinctItemIds: string[];
+  firstSeen: string | null;
+  lastSeen: string | null;
+  stages: string[];
+  actors: string[];
+  failureClasses: string[];
+  controlLevel: ControlLevel;
+}
 
 export interface ClusterEntry {
   category: ClusterCategory;
@@ -26,6 +58,8 @@ export interface ClusterEntry {
   /** True when issueUrl points at a pre-existing open issue found by dedup,
    *  rather than one just created by this invocation. */
   alreadyTracked?: boolean;
+  /** Populated only when category === "correction" (#500). */
+  correction?: CorrectionEvidence;
 }
 
 /** An open GitHub issue whose title carries the `[pipeline-improve]` prefix
@@ -289,6 +323,20 @@ export interface ClusterAccum {
   count: number;
   runIds: Set<string>;
   excerpt: string;
+  // correction-specific accumulation (#500) — populated only for category === "correction".
+  /** Distinct `correction_id`s seen. `count` mirrors this set's size so that
+   *  repeated delivery/replay of one correction_id (#499 idempotency) never
+   *  double-counts an occurrence. */
+  correctionIds?: Set<string>;
+  itemIds?: Set<string>;
+  stages?: Set<string>;
+  actors?: Set<string>;
+  failureClasses?: Set<string>;
+  /** Distinct `proposed_control` values seen — a cluster only gets a
+   *  deterministic control level when this set has exactly one member. */
+  proposedControls?: Set<string>;
+  firstSeen?: string;
+  lastSeen?: string;
 }
 
 function truncateExcerpt(s: string): string {
@@ -470,6 +518,163 @@ export function clusterPapercuts(
   }
 }
 
+/**
+ * Extract a `correction_event` (#499) and accumulate into clusters keyed on
+ * `correction:${correction_key}` (#500). Cluster *identity* is the event
+ * contract's deterministic `correction_key` — never `normalizeSignal` free
+ * text — so category isolation and cluster membership never depend on prose
+ * similarity or a model. `normalizeSignal` is used only to derive the
+ * human-readable `signal`/excerpt label, matching the other categories.
+ *
+ * Occurrence counting collapses duplicate deliveries/replays of one
+ * `correction_id` (#499 idempotency guarantee) to a single occurrence: the
+ * cluster's `count` always mirrors `correctionIds.size`, so re-processing the
+ * same event twice (e.g. a corrupt/retried run artifact) never inflates it.
+ */
+export function clusterCorrections(
+  event: Record<string, unknown>,
+  runId: string,
+  clusters: Map<string, ClusterAccum>,
+): void {
+  if (event["type"] !== "correction_event") return;
+  const correctionKey = typeof event["correction_key"] === "string" ? event["correction_key"] : "";
+  const correctionId = typeof event["correction_id"] === "string" ? event["correction_id"] : "";
+  if (!correctionKey || !correctionId) return;
+
+  const correctionText = typeof event["correction"] === "string" ? event["correction"] : "";
+  const stage = typeof event["stage"] === "string" ? event["stage"] : null;
+  const actorKind = typeof event["actor_kind"] === "string" ? event["actor_kind"] : "";
+  const failureClass = typeof event["failure_class"] === "string" ? event["failure_class"] : "";
+  const issue = typeof event["issue"] === "number" ? event["issue"] : null;
+  const at = typeof event["at"] === "string" ? event["at"] : "";
+  const proposedControl = typeof event["proposed_control"] === "string" ? event["proposed_control"] : "";
+
+  const key = `correction:${correctionKey}`;
+  let existing = clusters.get(key);
+  if (!existing) {
+    existing = {
+      category: "correction",
+      // Belt-and-braces (#500, matching #421 D7): correction text is already
+      // sanitized/redacted at emission time (correction.ts), but re-sanitize
+      // here so a secret can never reach a report line via a raw artifact read.
+      signal: normalizeSignal(sanitize(redactSecrets(correctionText || correctionKey))),
+      count: 0,
+      runIds: new Set(),
+      excerpt: truncateExcerpt(sanitize(redactSecrets(correctionText || correctionKey))),
+      correctionIds: new Set(),
+      itemIds: new Set(),
+      stages: new Set(),
+      actors: new Set(),
+      failureClasses: new Set(),
+      proposedControls: new Set(),
+    };
+    clusters.set(key, existing);
+  }
+
+  existing.runIds.add(runId);
+  if (issue !== null) existing.itemIds!.add(String(issue));
+  if (stage) existing.stages!.add(stage);
+  if (actorKind) existing.actors!.add(actorKind);
+  if (failureClass) existing.failureClasses!.add(failureClass);
+  if (proposedControl) existing.proposedControls!.add(proposedControl);
+  if (at) {
+    if (!existing.firstSeen || at < existing.firstSeen) existing.firstSeen = at;
+    if (!existing.lastSeen || at > existing.lastSeen) existing.lastSeen = at;
+  }
+  if (!existing.correctionIds!.has(correctionId)) {
+    existing.correctionIds!.add(correctionId);
+    existing.count = existing.correctionIds!.size;
+  }
+}
+
+/**
+ * Name the next control level for a correction cluster (#500). This is a pure
+ * function of the cluster's `proposedControls` set — the deterministic,
+ * bounded `proposed_control` field recorded per-event by #499 — and never
+ * consults raw text or an LLM, so cluster qualification/identity/level are
+ * unaffected by whether any enrichment dep is present.
+ *
+ * Enforces the graduation ladder (`documented rule -> skill/rubric -> eval ->
+ * deterministic gate`) by construction: the compiler only ever *repeats* a
+ * level every event in the cluster already agreed on at emission time. It
+ * never escalates — an absent or mixed `proposed_control` set (zero or 2+
+ * distinct values) always falls back to `"undetermined"` rather than guessing
+ * or inventing an `eval`/`deterministic-gate` level from partial evidence.
+ */
+export function proposeControlLevel(cluster: { proposedControls?: Iterable<string> }): ControlLevel {
+  const distinct = new Set(cluster.proposedControls ?? []);
+  if (distinct.size !== 1) return "undetermined";
+  const [level] = distinct;
+  if ((CONTROL_LEVELS as readonly string[]).includes(level)) {
+    return level as ControlLevel;
+  }
+  return "undetermined";
+}
+
+const CONTROL_LEVELS = [
+  "instruction",
+  "skill-rubric",
+  "eval",
+  "deterministic-gate",
+  "human-judgment",
+] as const;
+
+const CONTROL_LEVEL_ACCEPTANCE_CRITERIA: Record<ControlLevel, string[]> = {
+  instruction: [
+    "Add or update a documented instruction covering this failure class and stage.",
+    "The next occurrence of this correction_key is prevented or caught earlier by the updated instruction.",
+  ],
+  "skill-rubric": [
+    "Add or update a skill/rubric that encodes the correction as a checklist item.",
+    "A reviewer or agent following the skill/rubric catches this failure class before it recurs.",
+  ],
+  eval: [
+    "Add a golden-task eval that reproduces this failure class and asserts the corrected behavior.",
+    "The eval fails without the fix and passes with it (proves the eval bites).",
+  ],
+  "deterministic-gate": [
+    "Add a deterministic validator/gate that blocks this failure class before it reaches review.",
+    "The gate fires on a reproduction of this failure class and is silent otherwise (no false positives on passing runs).",
+  ],
+  "human-judgment": [
+    "Document the judgment boundary this correction reflects (taste, strategy, product judgment, or authority) rather than encoding it as a rule.",
+    "Revisit only if this correction_key keeps recurring with materially new evidence.",
+  ],
+  undetermined: [
+    "A human reviews the evidence below and selects one of: instruction, skill-rubric, eval, deterministic-gate, or human-judgment.",
+    "No control level is proposed automatically until that review happens.",
+  ],
+};
+
+/** Rationale line tying the named control level to the cluster's evidence
+ *  (#500). Deterministic and template-based — never an LLM call. */
+function controlLevelRationale(c: ClusterEntry): string {
+  const ev = c.correction;
+  if (!ev) return "";
+  if (ev.controlLevel === "undetermined") {
+    return `${c.count} correction occurrence(s) did not carry a single consistent proposed_control ` +
+      `(absent or mixed across occurrences) — the graduation ladder (documented rule -> skill/rubric ` +
+      `-> eval -> deterministic gate) is never escalated without consistent bounded evidence.`;
+  }
+  return `Every one of ${c.count} correction occurrence(s) in this cluster consistently recorded ` +
+    `proposed_control: "${ev.controlLevel}" (failure_class: ${ev.failureClasses.join(", ") || "unknown"}).`;
+}
+
+/** Render the control-level proposal block (level, rationale, acceptance
+ *  criteria) for a qualifying correction cluster — shared by the report and
+ *  the auto-file/`--apply` issue body so all three surfaces agree. */
+export function renderControlProposal(c: ClusterEntry): string[] {
+  const ev = c.correction;
+  if (!ev) return [];
+  const lines = [
+    `**Next control level**: ${ev.controlLevel}`,
+    `**Rationale**: ${controlLevelRationale(c)}`,
+    `**Acceptance criteria**:`,
+    ...CONTROL_LEVEL_ACCEPTANCE_CRITERIA[ev.controlLevel].map((s) => `- ${s}`),
+  ];
+  return lines;
+}
+
 // ---------------------------------------------------------------------------
 // clustersToEntries — convert internal map to sorted ClusterEntry[]
 // ---------------------------------------------------------------------------
@@ -481,13 +686,28 @@ export function clustersToEntries(
   return [...clusters.values()]
     .sort((a, b) => b.count - a.count)
     .slice(0, top)
-    .map((c) => ({
-      category: c.category,
-      signal: c.signal,
-      count: c.count,
-      runIds: [...c.runIds],
-      excerpt: c.excerpt,
-    }));
+    .map((c) => {
+      const entry: ClusterEntry = {
+        category: c.category,
+        signal: c.signal,
+        count: c.count,
+        runIds: [...c.runIds],
+        excerpt: c.excerpt,
+      };
+      if (c.category === "correction") {
+        entry.correction = {
+          distinctRunCount: c.runIds.size,
+          distinctItemIds: [...(c.itemIds ?? [])],
+          firstSeen: c.firstSeen ?? null,
+          lastSeen: c.lastSeen ?? null,
+          stages: [...(c.stages ?? [])],
+          actors: [...(c.actors ?? [])],
+          failureClasses: [...(c.failureClasses ?? [])],
+          controlLevel: proposeControlLevel({ proposedControls: c.proposedControls }),
+        };
+      }
+      return entry;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +725,15 @@ export function formatReport(clusters: ClusterEntry[], tokenWasteSkipped: boolea
     lines.push(`**Occurrences**: ${c.count}`);
     lines.push(`**Affected runs**: ${c.runIds.join(", ")}`);
     lines.push(`**Excerpt**: ${c.excerpt}`);
+    if (c.correction) {
+      lines.push(`**Distinct runs**: ${c.correction.distinctRunCount}`);
+      lines.push(`**Distinct items (issues/PRs)**: ${c.correction.distinctItemIds.join(", ") || "none"}`);
+      lines.push(`**First seen**: ${c.correction.firstSeen ?? "unknown"}`);
+      lines.push(`**Last seen**: ${c.correction.lastSeen ?? "unknown"}`);
+      lines.push(`**Affected stages**: ${c.correction.stages.join(", ") || "none"}`);
+      lines.push(`**Affected actors**: ${c.correction.actors.join(", ") || "none"}`);
+      lines.push(...renderControlProposal(c));
+    }
     lines.push(`**Proposed issue title**: ${proposedTitle(c)}`);
     if (c.issueUrl && c.alreadyTracked) {
       lines.push(`**Already tracked**: ${c.issueUrl}`);
@@ -532,6 +761,7 @@ export function formatJson(clusters: ClusterEntry[]): string {
       count: c.count,
       runIds: c.runIds,
       excerpt: c.excerpt,
+      ...(c.correction !== undefined ? { correction: c.correction } : {}),
       ...(c.issueUrl !== undefined ? { issueUrl: c.issueUrl } : {}),
       ...(c.alreadyTracked !== undefined ? { alreadyTracked: c.alreadyTracked } : {}),
     })),
@@ -544,13 +774,20 @@ export function formatJson(clusters: ClusterEntry[]): string {
 // Apply mode
 // ---------------------------------------------------------------------------
 
+/** Per-category default `--min-occurrences` threshold: the `correction`
+ *  category defaults to 2 (#500 — singletons stay visible in report/`--json`
+ *  but are never filed), every other category keeps the pre-existing default
+ *  of 3. An explicit `opts.minOccurrences` overrides every category uniformly. */
+function minOccurrencesFor(category: ClusterCategory, opts: { minOccurrences?: number }): number {
+  if (opts.minOccurrences !== undefined) return opts.minOccurrences;
+  return category === "correction" ? 2 : 3;
+}
+
 export async function applyIssues(
   clusters: ClusterEntry[],
   opts: { minOccurrences?: number },
   deps: Pick<ImproveDeps, "createIssue" | "ghAuthCheck" | "listOpenImproveIssues" | "log">,
 ): Promise<void> {
-  const minOcc = opts.minOccurrences ?? 3;
-
   const authed = await deps.ghAuthCheck();
   if (!authed) {
     throw new Error(
@@ -562,7 +799,7 @@ export async function applyIssues(
   const openIssues = await deps.listOpenImproveIssues();
   const byTitle = new Map(openIssues.filter((i) => i.state === "OPEN").map((i) => [i.title, i]));
 
-  const qualifying = clusters.filter((c) => c.count >= minOcc);
+  const qualifying = clusters.filter((c) => c.count >= minOccurrencesFor(c.category, opts));
   for (const c of qualifying) {
     const title = proposedTitle(c);
     const existing = byTitle.get(title);
@@ -586,6 +823,20 @@ export async function applyIssues(
       "```",
       c.excerpt,
       "```",
+      ...(c.correction
+        ? [
+          ``,
+          `### Correction evidence bundle`,
+          `- Distinct runs: ${c.correction.distinctRunCount}`,
+          `- Distinct items (issues/PRs): ${c.correction.distinctItemIds.join(", ") || "none"}`,
+          `- First seen: ${c.correction.firstSeen ?? "unknown"}`,
+          `- Last seen: ${c.correction.lastSeen ?? "unknown"}`,
+          `- Affected stages: ${c.correction.stages.join(", ") || "none"}`,
+          `- Affected actors: ${c.correction.actors.join(", ") || "none"}`,
+          ``,
+          ...renderControlProposal(c),
+        ]
+        : []),
       ``,
       `---`,
       `_Generated by \`pipeline improve\`. Verify the pattern independently before acting._`,
@@ -607,7 +858,6 @@ export async function applyIssues(
 export async function runImprove(opts: ImproveOpts, deps: ImproveDeps): Promise<void> {
   const runsDirPath = runsDir(opts.repoDir);
   const top = opts.top ?? 5;
-  const minOcc = opts.minOccurrences ?? 3;
 
   const runs = await discoverRuns(runsDirPath, opts.since, deps);
 
@@ -646,6 +896,7 @@ export async function runImprove(opts: ImproveOpts, deps: ImproveDeps): Promise<
       clusterBlockers(event, run.runId, clusters);
       clusterFlakyGates(event, run.runId, clusters);
       clusterPapercuts(event, run.runId, clusters);
+      clusterCorrections(event, run.runId, clusters);
     }
 
     const summaryPath = path.join(run.dir, "summary.json");
@@ -670,7 +921,7 @@ export async function runImprove(opts: ImproveOpts, deps: ImproveDeps): Promise<
         log: (msg) => { process.stderr.write(msg + "\n"); },
       }
       : deps;
-    await applyIssues(entries, { minOccurrences: minOcc }, applyDeps);
+    await applyIssues(entries, { minOccurrences: opts.minOccurrences }, applyDeps);
     if (opts.json) {
       for (const e of entries) {
         if (e.issueUrl === undefined) e.issueUrl = null;

@@ -12,7 +12,11 @@ import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { runsDir, runIdFor } from "../run-store.ts";
 import { BLOCKED_LABEL } from "../types.ts";
-import { autoFilePapercuts as realAutoFilePapercuts, realAutoFileDeps } from "./papercut.ts";
+import {
+  autoFileCorrections as realAutoFileCorrections,
+  autoFilePapercuts as realAutoFilePapercuts,
+  realAutoFileDeps,
+} from "./papercut.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -68,6 +72,14 @@ export interface QueueOpts {
     auto_file_max_per_window: number;
     auto_file_min_occurrences: number;
   };
+  /** Opt-in correction auto-file settings (#500). Absent/auto_file:false → inert.
+   *  Capture itself (#499) is unconditional; only auto-filing is gated here. */
+  corrections?: {
+    auto_file: boolean;
+    auto_file_window_hours: number;
+    auto_file_max_per_window: number;
+    auto_file_min_occurrences: number;
+  };
 }
 
 export interface PerIssueSummary {
@@ -114,6 +126,16 @@ export interface QueueDeps {
    *  make a real gh/network call — the real impl delegates to
    *  `autoFilePapercuts` from `./papercut.ts`. */
   autoFilePapercuts(opts: {
+    repoDir: string;
+    domain: string;
+    windowHours: number;
+    maxPerWindow: number;
+    minOccurrences: number;
+  }): Promise<void>;
+  /** Opt-in correction auto-file (#500) at batch end. Injectable so tests never
+   *  make a real gh/network call — the real impl delegates to
+   *  `autoFileCorrections` from `./papercut.ts`. */
+  autoFileCorrections(opts: {
     repoDir: string;
     domain: string;
     windowHours: number;
@@ -322,6 +344,7 @@ export function realQueueDeps(repoDir: string, _profile?: string): QueueDeps {
 
     withQueueLock: withQueueBatchLock,
     autoFilePapercuts: (autoFileOpts) => realAutoFilePapercuts(autoFileOpts, realAutoFileDeps(repoDir)),
+    autoFileCorrections: (autoFileOpts) => realAutoFileCorrections(autoFileOpts, realAutoFileDeps(repoDir)),
     log: (msg: string) => process.stdout.write(msg + "\n"),
     clock: () => Date.now(),
   };
@@ -725,6 +748,20 @@ async function runQueueUnlocked(opts: QueueOpts, deps: QueueDeps): Promise<void>
       windowHours: opts.papercuts.auto_file_window_hours,
       maxPerWindow: opts.papercuts.auto_file_max_per_window,
       minOccurrences: opts.papercuts.auto_file_min_occurrences,
+    }).catch(() => {});
+  }
+
+  // Opt-in correction auto-file (#500): correction_event capture (#499) is
+  // unconditional, so this gates only on auto_file (no capture-side enabled flag,
+  // unlike papercuts). Best-effort, wrapped so a failure can never alter the
+  // batch's outcome or exit status.
+  if (opts.corrections?.auto_file && opts.domain) {
+    await deps.autoFileCorrections({
+      repoDir: opts.repoDir,
+      domain: opts.domain,
+      windowHours: opts.corrections.auto_file_window_hours,
+      maxPerWindow: opts.corrections.auto_file_max_per_window,
+      minOccurrences: opts.corrections.auto_file_min_occurrences,
     }).catch(() => {});
   }
 

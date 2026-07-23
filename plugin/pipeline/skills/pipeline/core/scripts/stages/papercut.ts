@@ -18,11 +18,13 @@ import {
   type PapercutEvent,
 } from "../run-store.ts";
 import {
+  clusterCorrections,
   clusterPapercuts,
   clustersToEntries,
   proposedTitle,
   readEventsLines,
   realImproveDeps,
+  renderControlProposal,
   type ClusterAccum,
   type ClusterEntry,
   type OpenImproveIssue,
@@ -228,6 +230,12 @@ export async function reportPapercuts(
  *  overflow. */
 export const AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:papercut-auto-filed -->";
 
+/** Same role as `AUTO_FILE_PROVENANCE_MARKER`, but for issues auto-filed from
+ *  recurring `correction` clusters (#500) — kept distinct so a papercut- and a
+ *  correction-sourced auto-filed issue are never confused with each other by
+ *  reconciliation, even though both reuse the same reconciliation function. */
+export const CORRECTION_AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:correction-auto-filed -->";
+
 /** Post-create read-back reconciliation (#459, hardened for review finding
  *  f09ce15de2e6911a): re-list improve issues once and correct two distinct
  *  cross-host races against that single snapshot.
@@ -260,21 +268,22 @@ async function reconcilePostCreateState(
   deps: AutoFileDeps,
   cutoffMs: number,
   maxPerWindow: number,
+  marker: string,
+  logPrefix: string,
 ): Promise<void> {
   let issues: OpenImproveIssue[];
   try {
     issues = await deps.listOpenImproveIssues();
   } catch (err) {
     deps.log(
-      `[pipeline] papercut auto-file: reconciliation list failed (non-fatal) — ${title}: ${(err as Error).message}`,
+      `[pipeline] ${logPrefix}: reconciliation list failed (non-fatal) — ${title}: ${(err as Error).message}`,
     );
     return;
   }
 
   const closedNumbers = new Set<number>();
 
-  const isAutoFiled = (i: OpenImproveIssue): boolean =>
-    (i.body ?? "").includes(AUTO_FILE_PROVENANCE_MARKER);
+  const isAutoFiled = (i: OpenImproveIssue): boolean => (i.body ?? "").includes(marker);
 
   const dupes = issues
     .filter((i) => i.state === "OPEN" && i.title === title && isAutoFiled(i))
@@ -292,11 +301,11 @@ async function reconcilePostCreateState(
         );
         closedNumbers.add(dup.number);
         deps.log(
-          `[pipeline] papercut auto-file: reconciled cross-host duplicate — closed #${dup.number}, kept #${survivor.number}`,
+          `[pipeline] ${logPrefix}: reconciled cross-host duplicate — closed #${dup.number}, kept #${survivor.number}`,
         );
       } catch (err) {
         deps.log(
-          `[pipeline] papercut auto-file: reconciliation close failed (non-fatal) for #${dup.number}: ${(err as Error).message}`,
+          `[pipeline] ${logPrefix}: reconciliation close failed (non-fatal) for #${dup.number}: ${(err as Error).message}`,
         );
       }
     }
@@ -321,10 +330,10 @@ async function reconcilePostCreateState(
           `pipeline run on another host filed past the cap before this host's pre-create check ` +
           `observed it (cross-host auto-file reconciliation).`,
       );
-      deps.log(`[pipeline] papercut auto-file: reconciled rate-cap overflow — closed #${over.number}`);
+      deps.log(`[pipeline] ${logPrefix}: reconciled rate-cap overflow — closed #${over.number}`);
     } catch (err) {
       deps.log(
-        `[pipeline] papercut auto-file: reconciliation close failed (non-fatal) for #${over.number}: ${(err as Error).message}`,
+        `[pipeline] ${logPrefix}: reconciliation close failed (non-fatal) for #${over.number}: ${(err as Error).message}`,
       );
     }
   }
@@ -437,16 +446,86 @@ function buildAutoFileBody(c: ClusterEntry, windowHours: number): string {
   ].join("\n");
 }
 
-/** Cluster in-window `papercut` events across every run under `.agent-pipeline/runs/`
- *  and file one `pipeline:backlog` issue per qualifying, not-already-tracked cluster,
- *  up to the per-window rate cap. Total: every failure (unauthenticated gh, unreadable
- *  run artifacts, a throwing issue-creation call) is caught, logged as a non-fatal
- *  warning, and swallowed — this function can never fail a run, a stage, or a batch. */
-export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps): Promise<void> {
+/** Correction-cluster analogue of `buildAutoFileBody` (#500): agent/pipeline-reported-
+ *  provenance banner, sanitized evidence bundle, and the control-level proposal —
+ *  reusing `renderControlProposal` so the auto-filed body agrees with the report and
+ *  `--apply` issue body. Also states the single-host concurrency framing required by
+ *  #459: the dedup/rate-cap and post-create reconciliation below are inherited from the
+ *  papercut auto-file path's cross-host mechanism, but no cross-host global-dedup
+ *  guarantee is newly asserted for the correction source. */
+function buildCorrectionAutoFileBody(c: ClusterEntry, windowHours: number): string {
+  const ev = c.correction;
+  const detail = [
+    `**Signal**: ${c.signal}`,
+    `**Occurrences**: ${c.count} (trailing ${windowHours}h window)`,
+    ...(ev
+      ? [
+        `**Distinct runs**: ${ev.distinctRunCount}`,
+        `**Distinct items (issues/PRs)**: ${ev.distinctItemIds.join(", ") || "none"}`,
+        `**First seen**: ${ev.firstSeen ?? "unknown"}`,
+        `**Last seen**: ${ev.lastSeen ?? "unknown"}`,
+        `**Affected stages**: ${ev.stages.join(", ") || "none"}`,
+        `**Affected actors**: ${ev.actors.join(", ") || "none"}`,
+      ]
+      : []),
+    ``,
+    `### Affected run IDs`,
+    ...c.runIds.map((id) => `- ${id}`),
+    ``,
+    `### Evidence excerpt`,
+    "```",
+    c.excerpt,
+    "```",
+    ``,
+    ...renderControlProposal(c),
+  ].join("\n");
+  return [
+    CORRECTION_AUTO_FILE_PROVENANCE_MARKER,
+    `## Recurring correction detected by \`pipeline\` (auto-filed)`,
+    ``,
+    `_This issue was filed automatically by the pipeline from recurring \`correction_event\` ` +
+      `records (#499/#500). The content below is agent/pipeline-reported, not human-authored ` +
+      `or human-verified — verify independently before acting._`,
+    ``,
+    `_Concurrency scope (#459): correction auto-filing is supported single-host. The dedup, ` +
+      `rate-cap, and post-create reconciliation checks below reuse the papercut auto-file ` +
+      `path's cross-host mechanism, but that is described only as inherited behaviour — no new ` +
+      `cross-host global-deduplication guarantee is asserted for the correction source._`,
+    ``,
+    sanitize(redactSecrets(detail)),
+  ].join("\n");
+}
+
+/** Shape shared by `autoFilePapercuts` and `autoFileCorrections` (#500): which
+ *  event type to cluster, how to accumulate it, how to render its issue body,
+ *  the provenance marker reconciliation uses to recognize its own issues, and
+ *  the log-line prefix. */
+interface AutoFileCategory {
+  eventType: string;
+  clusterFn: (event: Record<string, unknown>, runId: string, clusters: Map<string, ClusterAccum>) => void;
+  buildBody: (c: ClusterEntry, windowHours: number) => string;
+  marker: string;
+  logPrefix: string;
+}
+
+/** Cluster in-window events of `category.eventType` across every run under
+ *  `.agent-pipeline/runs/` and file one `pipeline:backlog` issue per qualifying,
+ *  not-already-tracked cluster, up to the per-window rate cap. Total: every
+ *  failure (unauthenticated gh, unreadable run artifacts, a throwing
+ *  issue-creation call) is caught, logged as a non-fatal warning, and
+ *  swallowed — this function can never fail a run, a stage, or a batch. Shared
+ *  by `autoFilePapercuts` (#421) and `autoFileCorrections` (#500) so both reuse
+ *  the exact same minimum-occurrence, dedup, rate-cap, sanitization, and
+ *  cross-host reconciliation machinery. */
+async function autoFileClusterCategory(
+  opts: AutoFileOpts,
+  deps: AutoFileDeps,
+  category: AutoFileCategory,
+): Promise<void> {
   try {
     const authed = await deps.ghAuthCheck();
     if (!authed) {
-      deps.log("[pipeline] papercut auto-file: skipped (gh not authenticated)");
+      deps.log(`[pipeline] ${category.logPrefix}: skipped (gh not authenticated)`);
       return;
     }
 
@@ -467,10 +546,10 @@ export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps):
       const runId = entry.name;
       const eventsPath = path.join(dir, runId, "events.jsonl");
       for await (const event of readEventsLines(eventsPath, deps)) {
-        if ((event as { type?: unknown }).type !== "papercut") continue;
+        if ((event as { type?: unknown }).type !== category.eventType) continue;
         const at = typeof event["at"] === "string" ? Date.parse(event["at"] as string) : NaN;
         if (!Number.isFinite(at) || at < cutoffMs) continue;
-        clusterPapercuts(event, runId, clusters);
+        category.clusterFn(event, runId, clusters);
       }
     }
 
@@ -494,7 +573,7 @@ export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps):
       for (const c of qualifying) {
         const title = proposedTitle(c);
         if (byTitle.has(title)) {
-          deps.log(`[pipeline] papercut auto-file: already tracked — ${title}`);
+          deps.log(`[pipeline] ${category.logPrefix}: already tracked — ${title}`);
           continue;
         }
         toFile.push(c);
@@ -514,7 +593,7 @@ export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps):
         // differ only past the 60-char truncation in proposedTitle() must not both
         // file an issue for the same title within one invocation.
         if (byTitle.has(title)) {
-          deps.log(`[pipeline] papercut auto-file: already tracked — ${title}`);
+          deps.log(`[pipeline] ${category.logPrefix}: already tracked — ${title}`);
           continue;
         }
 
@@ -529,33 +608,66 @@ export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps):
           freshIssues = await deps.listOpenImproveIssues();
         } catch (err) {
           deps.log(
-            `[pipeline] papercut auto-file: cross-host state check failed (non-fatal), skipping — ${title}: ${(err as Error).message}`,
+            `[pipeline] ${category.logPrefix}: cross-host state check failed (non-fatal), skipping — ${title}: ${(err as Error).message}`,
           );
           continue;
         }
         const freshOpenTitle = freshIssues.find((i) => i.state === "OPEN" && i.title === title);
         if (freshOpenTitle) {
           byTitle.set(title, freshOpenTitle);
-          deps.log(`[pipeline] papercut auto-file: already tracked (cross-host) — ${title}`);
+          deps.log(`[pipeline] ${category.logPrefix}: already tracked (cross-host) — ${title}`);
           continue;
         }
         if (filedInWindowCount(freshIssues) >= opts.maxPerWindow) {
-          deps.log(`[pipeline] papercut auto-file: deferred (rate cap) — ${title}`);
+          deps.log(`[pipeline] ${category.logPrefix}: deferred (rate cap) — ${title}`);
           continue;
         }
 
         try {
-          const body = buildAutoFileBody(c, opts.windowHours);
+          const body = category.buildBody(c, opts.windowHours);
           const url = await deps.createIssue(title, body, ["pipeline:backlog"]);
-          deps.log(`[pipeline] papercut auto-file: created ${url}`);
+          deps.log(`[pipeline] ${category.logPrefix}: created ${url}`);
           byTitle.set(title, { title, url, state: "OPEN", createdAt: "", labels: ["pipeline:backlog"], body });
-          await reconcilePostCreateState(title, deps, cutoffMs, opts.maxPerWindow);
+          await reconcilePostCreateState(title, deps, cutoffMs, opts.maxPerWindow, category.marker, category.logPrefix);
         } catch (err) {
-          deps.log(`[pipeline] papercut auto-file: create failed (non-fatal): ${(err as Error).message}`);
+          deps.log(`[pipeline] ${category.logPrefix}: create failed (non-fatal): ${(err as Error).message}`);
         }
       }
     });
   } catch (err) {
-    deps.log(`[pipeline] papercut auto-file failed (non-fatal): ${(err as Error).message}`);
+    deps.log(`[pipeline] ${category.logPrefix} failed (non-fatal): ${(err as Error).message}`);
   }
+}
+
+const PAPERCUT_AUTO_FILE_CATEGORY: AutoFileCategory = {
+  eventType: "papercut",
+  clusterFn: clusterPapercuts,
+  buildBody: buildAutoFileBody,
+  marker: AUTO_FILE_PROVENANCE_MARKER,
+  logPrefix: "papercut auto-file",
+};
+
+const CORRECTION_AUTO_FILE_CATEGORY: AutoFileCategory = {
+  eventType: "correction_event",
+  clusterFn: clusterCorrections,
+  buildBody: buildCorrectionAutoFileBody,
+  marker: CORRECTION_AUTO_FILE_PROVENANCE_MARKER,
+  logPrefix: "correction auto-file",
+};
+
+/** Opt-in papercut auto-file (#421). See `autoFileClusterCategory` for the
+ *  shared machinery and its totality/non-fatal contract. */
+export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps): Promise<void> {
+  return autoFileClusterCategory(opts, deps, PAPERCUT_AUTO_FILE_CATEGORY);
+}
+
+/** Opt-in correction auto-file (#500): reuses the exact same minimum-occurrence,
+ *  open-issue dedup, per-window rate cap, sanitization, provenance, and
+ *  cross-host reconciliation machinery as `autoFilePapercuts` (#421), keyed on
+ *  `correction` clusters instead of `papercut` clusters. Off/inert unless the
+ *  caller gates it on `config.corrections.auto_file` — see `pipeline-run.ts`
+ *  and `stages/queue.ts`. Honors the single-host concurrency scope of #459 —
+ *  see `buildCorrectionAutoFileBody` for the documented framing. */
+export async function autoFileCorrections(opts: AutoFileOpts, deps: AutoFileDeps): Promise<void> {
+  return autoFileClusterCategory(opts, deps, CORRECTION_AUTO_FILE_CATEGORY);
 }

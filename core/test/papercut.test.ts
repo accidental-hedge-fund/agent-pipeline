@@ -10,6 +10,8 @@ import {
   reportPapercuts,
   papercutsEnabled,
   autoFilePapercuts,
+  autoFileCorrections,
+  CORRECTION_AUTO_FILE_PROVENANCE_MARKER,
   issueNumberFromUrl,
   type PapercutDeps,
   type AutoFileDeps,
@@ -1058,4 +1060,147 @@ test("autoFilePapercuts: genuinely concurrent cross-host cap — two hosts racin
     1,
     `cap overshoot after reconciliation: ${openInWindow.length} open issues in window`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// autoFileCorrections (#500) — reuses the same shared machinery as
+// autoFilePapercuts, keyed on correction_event records. Coverage here is
+// intentionally light on cross-host/reconciliation edge cases (already proven
+// exhaustively above for the shared code path) and focused on what's specific
+// to the correction category: distinct-correction_id occurrence counting,
+// the control-level proposal, and the correction-specific provenance marker.
+// ---------------------------------------------------------------------------
+
+function correctionLine(opts: {
+  at: string;
+  correctionKey: string;
+  correctionId: string;
+  correction?: string;
+  stage?: string | null;
+  actorKind?: string;
+  failureClass?: string;
+  issue?: number;
+  proposedControl?: string;
+}): string {
+  return JSON.stringify({
+    schema_version: 1,
+    type: "correction_event",
+    at: opts.at,
+    correction_id: opts.correctionId,
+    correction_key: opts.correctionKey,
+    source_kind: "override",
+    failure_class: opts.failureClass ?? "review-finding",
+    actor_kind: opts.actorKind ?? "human",
+    issue: opts.issue ?? 500,
+    repo: "org/repo",
+    run_id: "500-r",
+    stage: opts.stage ?? "review",
+    reviewed_sha: null,
+    head_sha: null,
+    evidence_ref: { kind: "finding", id: "f1" },
+    correction: opts.correction ?? "Use X instead of Y",
+    reusable: "yes",
+    ...(opts.proposedControl !== undefined ? { proposed_control: opts.proposedControl } : {}),
+  });
+}
+
+test("autoFileCorrections: qualifying cluster (2 distinct correction_id) is filed with the pipeline:backlog label", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const deps = makeAutoFileDeps({
+    runs: {
+      r1: [correctionLine({ at, correctionKey: "k1", correctionId: "c1" })],
+      r2: [correctionLine({ at, correctionKey: "k1", correctionId: "c2" })],
+    },
+  });
+  await autoFileCorrections(defaultAutoFileOpts({ minOccurrences: 2 }), deps);
+  assert.equal(deps._createCalls.length, 1);
+  assert.deepEqual(deps._createCalls[0].labels, ["pipeline:backlog"]);
+});
+
+test("autoFileCorrections: duplicate delivery of one correction_id does not qualify a 2-occurrence threshold", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const deps = makeAutoFileDeps({
+    runs: {
+      r1: [correctionLine({ at, correctionKey: "k1", correctionId: "c1" })],
+      r2: [correctionLine({ at, correctionKey: "k1", correctionId: "c1" })], // same correction_id, replayed
+    },
+  });
+  await autoFileCorrections(defaultAutoFileOpts({ minOccurrences: 2 }), deps);
+  assert.equal(deps._createCalls.length, 0);
+});
+
+test("autoFileCorrections: below-threshold (singleton) cluster is not filed", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const deps = makeAutoFileDeps({
+    runs: {
+      r1: [correctionLine({ at, correctionKey: "k1", correctionId: "c1" })],
+    },
+  });
+  await autoFileCorrections(defaultAutoFileOpts({ minOccurrences: 2 }), deps);
+  assert.equal(deps._createCalls.length, 0);
+});
+
+test("autoFileCorrections: body carries the correction provenance marker, control-level proposal, sanitized excerpt, and single-host framing", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const deps = makeAutoFileDeps({
+    runs: {
+      r1: [correctionLine({
+        at, correctionKey: "k1", correctionId: "c1",
+        correction: "The API key sk-ABCDEFGHIJKLMNOPQRSTUVWX01234567 must be rotated",
+        proposedControl: "instruction",
+      })],
+      r2: [correctionLine({ at, correctionKey: "k1", correctionId: "c2", proposedControl: "instruction" })],
+    },
+  });
+  await autoFileCorrections(defaultAutoFileOpts({ minOccurrences: 2 }), deps);
+  assert.equal(deps._createCalls.length, 1);
+  const body = deps._createCalls[0].body;
+  assert.match(body, new RegExp(CORRECTION_AUTO_FILE_PROVENANCE_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(body, /Next control level.*instruction/);
+  assert.match(body, /single-host/i);
+  assert.doesNotMatch(body, /sk-ABCDEFGHIJKLMNOPQRSTUVWX01234567/);
+  assert.match(body, /\[REDACTED\]/);
+});
+
+test("autoFileCorrections: dedup suppresses filing when an open issue already matches the title", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const existingTitle = "[pipeline-improve] Recurring correction: use x instead of y";
+  const deps = makeAutoFileDeps({
+    openIssues: [{ title: existingTitle, url: "https://github.com/org/repo/issues/1", state: "OPEN", createdAt: new Date(NOW_MS).toISOString(), labels: ["pipeline:backlog"] }],
+    runs: {
+      r1: [correctionLine({ at, correctionKey: "k1", correctionId: "c1" })],
+      r2: [correctionLine({ at, correctionKey: "k1", correctionId: "c2" })],
+    },
+  });
+  await autoFileCorrections(defaultAutoFileOpts({ minOccurrences: 2 }), deps);
+  assert.equal(deps._createCalls.length, 0);
+});
+
+test("autoFileCorrections: a throwing createIssue resolves without throwing (non-fatal)", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const deps = makeAutoFileDeps({
+    runs: {
+      r1: [correctionLine({ at, correctionKey: "k1", correctionId: "c1" })],
+      r2: [correctionLine({ at, correctionKey: "k1", correctionId: "c2" })],
+    },
+    createIssueImpl: async () => { throw new Error("simulated gh failure"); },
+  });
+  await assert.doesNotReject(autoFileCorrections(defaultAutoFileOpts({ minOccurrences: 2 }), deps));
+});
+
+test("autoFileCorrections: an unauthenticated gh resolves without throwing and creates no issues", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const deps = makeAutoFileDeps({
+    authed: false,
+    runs: {
+      r1: [correctionLine({ at, correctionKey: "k1", correctionId: "c1" })],
+      r2: [correctionLine({ at, correctionKey: "k1", correctionId: "c2" })],
+    },
+  });
+  await assert.doesNotReject(autoFileCorrections(defaultAutoFileOpts({ minOccurrences: 2 }), deps));
+  assert.equal(deps._createCalls.length, 0);
+});
+
+test("autoFileCorrections: papercut and correction auto-file provenance markers are distinct", () => {
+  assert.notEqual(CORRECTION_AUTO_FILE_PROVENANCE_MARKER, "<!-- pipeline:papercut-auto-filed -->");
 });
