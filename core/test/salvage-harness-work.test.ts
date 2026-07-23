@@ -15,6 +15,9 @@ import {
   salvageUncommittedWork,
   trySalvageUncommittedWork,
   SALVAGE_NODE_MODULES_EXCLUDE,
+  SALVAGE_MARKER_EXCLUDE,
+  SALVAGE_MARKER_RESTORE_PATHSPEC,
+  PIPELINE_INTERNAL_MARKER_FILES,
   type SalvageDeps,
 } from "../scripts/salvage-harness-work.ts";
 import { enforceImplCommitRef } from "../scripts/stages/planning.ts";
@@ -22,6 +25,7 @@ import { enforceFixCommitGate, fixSalvageStageLabel } from "../scripts/stages/fi
 import { enforceTestFixCommitFormat, testFixSalvageStageLabel } from "../scripts/testgate.ts";
 import { verifyHarnessCommits, type VerifyDeps } from "../scripts/verify-harness-commits.ts";
 import { validateCommitTrailers } from "../scripts/traceability.ts";
+import { REBASE_MARKER_FILE } from "../scripts/stages/pre_merge.ts";
 
 const RUN_ID = "131/2026-06-12T18:14:44Z";
 
@@ -32,6 +36,7 @@ function fakeGit(status: string) {
   };
   const deps: SalvageDeps = {
     gitStatus: async () => status,
+    gitRestoreStaged: async () => {},
     gitAddAll: async (wt, _args) => {
       calls.order.push(`add:${wt}`);
     },
@@ -226,6 +231,7 @@ test("salvage [scoped, 3.1 bites]: unscoped salvage omits openspec/ restriction 
   let capturedArgs: string[] | null = null;
   const deps: SalvageDeps = {
     gitStatus: async () => " M tasks/todo.md\nA  openspec/changes/x/proposal.md\n",
+    gitRestoreStaged: async () => {},
     gitAddAll: async (_wt, args) => { capturedArgs = [...args]; },
     gitCommit: async () => {},
   };
@@ -260,6 +266,7 @@ test("salvage [scoped, 3.2]: in-scope-clean worktree → {salvaged: false}, no g
       if (scope === "openspec/") return "";
       return " M tasks/todo.md\n";
     },
+    gitRestoreStaged: async () => {},
     gitAddAll: async () => { addCalled = true; },
     gitCommit: async () => { commitCalled = true; },
   };
@@ -341,9 +348,17 @@ test("salvage [scoped, regression #321]: pre-staged tasks/todo.md is unstaged vi
   const res = await salvageUncommittedWork("/wt", 321, RUN_ID, "OpenSpec authoring", deps, "openspec/");
   assert.equal(res.salvaged, true, "dirty-in-scope → salvage runs");
 
-  // gitRestoreStaged must be called first to clear pre-staged out-of-scope entries
-  assert.equal(restoreCalls.length, 1, "gitRestoreStaged must be called exactly once for scoped salvage");
-  const restoreArgs = restoreCalls[0];
+  // gitRestoreStaged is called twice for scoped salvage: once (unconditionally)
+  // to clear any already-staged pipeline-internal marker (#522 round 2), then
+  // once to clear pre-staged out-of-scope entries.
+  assert.equal(restoreCalls.length, 2, "gitRestoreStaged must be called twice for scoped salvage");
+  for (const spec of SALVAGE_MARKER_RESTORE_PATHSPEC) {
+    assert.ok(
+      restoreCalls[0].includes(spec),
+      `first restore call must target the marker pathspec; got ${JSON.stringify(restoreCalls[0])}`,
+    );
+  }
+  const restoreArgs = restoreCalls[1];
   assert.ok(restoreArgs.includes("."), "restore args must include '.' to cover all files");
   assert.ok(
     restoreArgs.includes(":(exclude)openspec/"),
@@ -394,22 +409,33 @@ test("salvage [scoped, regression #321]: pre-staged tasks/todo.md is unstaged vi
   assert.equal(gatePasses.ok, true, "with gitRestoreStaged applied, commit has only openspec/ files → gate passes");
 });
 
-test("salvage [scoped, regression #321 — gitRestoreStaged NOT called without scope]: unscoped salvage does not call gitRestoreStaged", async () => {
-  let restoreCalled = false;
+test("salvage [scoped, regression #321 — only the marker restore fires without scope]: unscoped salvage calls gitRestoreStaged once, for the marker pathspec, not the out-of-scope restore", async () => {
+  const restoreCalls: string[][] = [];
   const deps: SalvageDeps = {
     gitStatus: async () => " M tasks/todo.md\n M core/scripts/foo.ts\n",
-    gitRestoreStaged: async () => { restoreCalled = true; },
+    gitRestoreStaged: async (_wt, args) => { restoreCalls.push([...args]); },
     gitAddAll: async () => {},
     gitCommit: async () => {},
   };
   await salvageUncommittedWork("/wt", 321, RUN_ID, "implement", deps);
-  assert.equal(restoreCalled, false, "gitRestoreStaged must NOT be called for unscoped (implement) salvage");
+  assert.equal(restoreCalls.length, 1, "gitRestoreStaged must be called exactly once for unscoped salvage");
+  for (const spec of SALVAGE_MARKER_RESTORE_PATHSPEC) {
+    assert.ok(
+      restoreCalls[0].includes(spec),
+      `unscoped restore call must target the marker pathspec; got ${JSON.stringify(restoreCalls[0])}`,
+    );
+  }
+  assert.ok(
+    !restoreCalls[0].includes(":(exclude)openspec/"),
+    "unscoped salvage must not run the out-of-scope restore",
+  );
 });
 
 test("salvage [scoped, 3.4]: unscoped implement-stage salvage still stages non-openspec/ files unchanged", async () => {
   let capturedArgs: string[] | null = null;
   const deps: SalvageDeps = {
     gitStatus: async () => " M tasks/todo.md\n M core/scripts/foo.ts\n",
+    gitRestoreStaged: async () => {},
     gitAddAll: async (_wt, args) => { capturedArgs = [...args]; },
     gitCommit: async () => {},
   };
@@ -418,8 +444,8 @@ test("salvage [scoped, 3.4]: unscoped implement-stage salvage still stages non-o
   assert.equal(res.salvaged, true);
   assert.deepEqual(
     capturedArgs,
-    ["add", "-A", "--", ...SALVAGE_NODE_MODULES_EXCLUDE],
-    "unscoped implement salvage args are byte-for-byte unchanged apart from the #521 depth-agnostic exclusion",
+    ["add", "-A", "--", ...SALVAGE_NODE_MODULES_EXCLUDE, ...SALVAGE_MARKER_EXCLUDE],
+    "unscoped implement salvage args are byte-for-byte unchanged apart from the #521/#522 depth-agnostic exclusions",
   );
 });
 
@@ -449,9 +475,9 @@ test("salvage [scoped, regression #321 — node_modules not excluded from restor
 
   const res = await salvageUncommittedWork("/wt", 321, RUN_ID, "OpenSpec authoring", deps, "openspec/");
   assert.equal(res.salvaged, true, "dirty-in-scope → salvage runs");
-  assert.equal(restoreCalls.length, 1, "gitRestoreStaged called once");
+  assert.equal(restoreCalls.length, 2, "gitRestoreStaged called twice (marker unstage + out-of-scope restore)");
 
-  const restoreArgs = restoreCalls[0];
+  const restoreArgs = restoreCalls[1];
   // node_modules must NOT be in the exclude list so the restore unstages them
   assert.ok(
     !restoreArgs.includes(":(exclude)node_modules"),
@@ -478,6 +504,7 @@ test("salvage: gitAddAll receives the depth-agnostic node_modules exclusion when
   let commitCreated = false;
   const deps: SalvageDeps = {
     gitStatus: async () => status,
+    gitRestoreStaged: async () => {},
     gitAddAll: async (_wt, args) => { capturedArgs = [...args]; },
     gitCommit: async () => { commitCreated = true; },
   };
@@ -551,6 +578,7 @@ test("regression #521: salvage stages a nested-node_modules dirty worktree using
   let capturedArgs: string[] | null = null;
   const deps: SalvageDeps = {
     gitStatus: async () => status,
+    gitRestoreStaged: async () => {},
     gitAddAll: async (_wt, args) => { capturedArgs = [...args]; },
     gitCommit: async () => {},
   };
@@ -565,4 +593,150 @@ test("regression #521: salvage stages a nested-node_modules dirty worktree using
   }
   const msg = res.salvaged ? res.message : "";
   assert.doesNotMatch(msg, /node_modules/, "the salvage commit message does not reference node_modules");
+});
+
+// ---------------------------------------------------------------------------
+// Regression #522: pipeline-internal marker files excluded from salvage
+// ---------------------------------------------------------------------------
+
+const MARKER = PIPELINE_INTERNAL_MARKER_FILES[0];
+
+test("regression #522: worktree dirty only with the rebase marker → {salvaged: false}, no gitAddAll/gitCommit; bites without the marker exclusion (4.1)", async () => {
+  const status = `?? ${MARKER}\n`;
+
+  // Fix in place: marker-only status is treated as clean.
+  const clean = fakeGit(status);
+  const res = await salvageUncommittedWork("/wt", 522, RUN_ID, "implement", clean.deps);
+  assert.deepEqual(res, { salvaged: false }, "marker-only worktree is treated as clean");
+  assert.deepEqual(clean.calls.order, [], "neither gitAddAll nor gitCommit is called");
+
+  // Bites: without the marker exclusion, the same status is non-empty →
+  // salvage runs and produces a commit whose only content is the marker.
+  const rawStatusIsDirty = status.trim().length > 0;
+  assert.ok(rawStatusIsDirty, "sanity: the raw porcelain status is non-empty on its own");
+});
+
+test("regression #522: real changed file + marker → salvage stages the real file, gitAddAll args exclude the marker, marker not committed (4.2)", async () => {
+  const status = ` M core/scripts/foo.ts\n?? ${MARKER}\n`;
+  const { deps, calls } = fakeGit(status);
+  let capturedArgs: string[] | null = null;
+  deps.gitAddAll = async (wt, args) => {
+    capturedArgs = [...args];
+    calls.order.push(`add:${wt}`);
+  };
+
+  const res = await salvageUncommittedWork("/wt", 522, RUN_ID, "implement", deps);
+  assert.equal(res.salvaged, true, "genuine uncommitted work alongside the marker is still salvaged");
+  assert.deepEqual(calls.order, ["add:/wt", "commit:/wt"]);
+  assert.ok(capturedArgs !== null, "gitAddAll must be called");
+  for (const excl of SALVAGE_MARKER_EXCLUDE) {
+    assert.ok(
+      (capturedArgs as string[]).includes(excl),
+      `gitAddAll args must include the marker exclusion; got ${JSON.stringify(capturedArgs)}`,
+    );
+  }
+});
+
+test("regression #522: scoped (openspec/) salvage also excludes the marker (4.3)", async () => {
+  let capturedArgs: string[] | null = null;
+  const deps: SalvageDeps = {
+    gitStatus: async (_wt, scope) => {
+      if (scope === "openspec/") return "A  openspec/changes/x/proposal.md\n";
+      return `A  openspec/changes/x/proposal.md\n?? ${MARKER}\n`;
+    },
+    gitRestoreStaged: async () => {},
+    gitAddAll: async (_wt, args) => { capturedArgs = [...args]; },
+    gitCommit: async () => {},
+  };
+
+  const res = await salvageUncommittedWork("/wt", 522, RUN_ID, "OpenSpec authoring", deps, "openspec/");
+  assert.equal(res.salvaged, true, "in-scope real change → salvage runs");
+  assert.ok(capturedArgs !== null, "gitAddAll must be called");
+  assert.ok((capturedArgs as string[]).includes("openspec/"), "still restricts staging to scope");
+  for (const excl of SALVAGE_MARKER_EXCLUDE) {
+    assert.ok(
+      (capturedArgs as string[]).includes(excl),
+      `scoped gitAddAll args must include the marker exclusion; got ${JSON.stringify(capturedArgs)}`,
+    );
+  }
+});
+
+test("regression #522: scoped (openspec/) salvage dirty only with the marker → {salvaged: false} (4.3)", async () => {
+  let addCalled = false;
+  let commitCalled = false;
+  const deps: SalvageDeps = {
+    gitStatus: async (_wt, scope) => {
+      if (scope === "openspec/") return `?? ${MARKER}\n`;
+      return `?? ${MARKER}\n`;
+    },
+    gitRestoreStaged: async () => {},
+    gitAddAll: async () => { addCalled = true; },
+    gitCommit: async () => { commitCalled = true; },
+  };
+
+  const res = await salvageUncommittedWork("/wt", 522, RUN_ID, "OpenSpec authoring", deps, "openspec/");
+  assert.deepEqual(res, { salvaged: false }, "scoped worktree dirty only with the marker → no salvage");
+  assert.equal(addCalled, false);
+  assert.equal(commitCalled, false);
+});
+
+test("regression #522 (review round 2): a marker already staged from an earlier interrupted salvage is unstaged before an unscoped commit — commit contains only the real file", async () => {
+  // Reproduces the finding: a prior interrupted salvage left the marker staged
+  // in the index (status reports it with a staged status code), and a genuine
+  // file is separately modified. stripPipelineInternalMarkers hides the marker
+  // line from the dirtiness check, but without an explicit unstage the marker
+  // remains in the index and rides along into the commit alongside the real
+  // file when `git commit` runs (git-add's exclude pathspec cannot remove an
+  // already-staged entry).
+  const status = `M  ${MARKER}\n M core/scripts/foo.ts\n`;
+  const restoreCalls: string[][] = [];
+  let addArgs: string[] | null = null;
+  let committed = false;
+  const deps: SalvageDeps = {
+    gitStatus: async () => status,
+    gitRestoreStaged: async (_wt, args) => { restoreCalls.push([...args]); },
+    gitAddAll: async (_wt, args) => { addArgs = [...args]; },
+    gitCommit: async () => { committed = true; },
+  };
+
+  const res = await salvageUncommittedWork("/wt", 522, RUN_ID, "implement", deps);
+  assert.equal(res.salvaged, true, "genuine uncommitted work alongside the pre-staged marker is still salvaged");
+
+  // The pre-staged marker must be explicitly unstaged before the commit — the
+  // fix bites: without this call, the already-staged marker survives `git add`
+  // (which can only prevent NEW staging, not remove an existing index entry)
+  // and would be committed alongside the real file.
+  assert.equal(restoreCalls.length, 1, "gitRestoreStaged must be called to clear the pre-staged marker");
+  for (const spec of SALVAGE_MARKER_RESTORE_PATHSPEC) {
+    assert.ok(
+      restoreCalls[0].includes(spec),
+      `restore call must target the marker pathspec; got ${JSON.stringify(restoreCalls[0])}`,
+    );
+  }
+  assert.ok(addArgs !== null, "gitAddAll must be called");
+  for (const excl of SALVAGE_MARKER_EXCLUDE) {
+    assert.ok(
+      (addArgs as string[]).includes(excl),
+      `gitAddAll args must still exclude the marker; got ${JSON.stringify(addArgs)}`,
+    );
+  }
+  assert.equal(committed, true, "commit is created after the marker is unstaged and the real file staged");
+});
+
+test("regression #522: drift guard — REBASE_MARKER_FILE (pre_merge) equals the canonical marker constant (4.4)", () => {
+  assert.equal(
+    REBASE_MARKER_FILE,
+    PIPELINE_INTERNAL_MARKER_FILES[0],
+    "pre_merge's marker writer must refer to the same canonical filename the salvage exclusion uses",
+  );
+  assert.equal(PIPELINE_INTERNAL_MARKER_FILES.length, 1, "exactly one canonical marker filename today");
+});
+
+test("regression #522: SALVAGE_MARKER_EXCLUDE carries a depth-agnostic exclusion pathspec for every marker", () => {
+  for (const file of PIPELINE_INTERNAL_MARKER_FILES) {
+    assert.ok(
+      SALVAGE_MARKER_EXCLUDE.includes(`:(exclude,glob)**/${file}`),
+      `missing depth-agnostic exclusion for ${file}; got ${JSON.stringify(SALVAGE_MARKER_EXCLUDE)}`,
+    );
+  }
 });

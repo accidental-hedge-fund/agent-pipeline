@@ -31,6 +31,7 @@ import {
   transition,
 } from "../gh.ts";
 import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
+import { PIPELINE_INTERNAL_MARKER_FILES } from "../salvage-harness-work.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import {
   attestPipelineComment,
@@ -119,7 +120,7 @@ const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
 const VISUAL_PUBLISH_COMMIT_PATTERN = new RegExp(
   `^${VISUAL_PUBLISH_COMMIT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d+$`,
 );
-const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
+export const REBASE_MARKER_FILE = PIPELINE_INTERNAL_MARKER_FILES[0];
 
 /**
  * Commit-subject prefix for the pre-merge bounded auto-fix round (#359).
