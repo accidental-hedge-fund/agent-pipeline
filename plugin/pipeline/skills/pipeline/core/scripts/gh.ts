@@ -446,7 +446,7 @@ export async function getPrDetail(cfg: PipelineConfig, prNumber: number): Promis
     "view",
     String(prNumber),
     "--json",
-    "number,title,body,state,url,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,isDraft,additions,deletions,changedFiles",
+    "number,title,body,state,url,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,isDraft,additions,deletions,changedFiles,mergeCommit",
     "-R",
     cfg.repo,
   ]);
@@ -465,6 +465,7 @@ export async function getPrDetail(cfg: PipelineConfig, prNumber: number): Promis
     additions: number;
     deletions: number;
     changedFiles: number;
+    mergeCommit: { oid: string } | null;
   };
   const stateUpper = data.state.toUpperCase();
   const state =
@@ -485,6 +486,7 @@ export async function getPrDetail(cfg: PipelineConfig, prNumber: number): Promis
     additions: data.additions,
     deletions: data.deletions,
     changed_files: data.changedFiles,
+    merge_commit_sha: data.mergeCommit?.oid ?? null,
   };
 }
 
@@ -1200,6 +1202,29 @@ export async function getPrForIssue(
     "number,headRefName,isCrossRepository,closingIssuesReferences",
     "--state",
     "open",
+    "-L",
+    "100",
+    "-R",
+    cfg.repo,
+  ]);
+  return resolvePrForIssue(parsePrList(stdout), issueNumber, cfg.repo);
+}
+
+/** Same resolution as {@link getPrForIssue} but across every PR state (open,
+ *  closed, merged) — used by reconciliation (#511), which must still find a
+ *  since-merged PR to observe `pr_state: "merged"` (an open-only lookup would
+ *  never see it, defeating forward drift detection). */
+export async function getPrForIssueAnyState(
+  cfg: PipelineConfig,
+  issueNumber: number,
+): Promise<number | null> {
+  const stdout = await ghRun([
+    "pr",
+    "list",
+    "--json",
+    "number,headRefName,isCrossRepository,closingIssuesReferences",
+    "--state",
+    "all",
     "-L",
     "100",
     "-R",

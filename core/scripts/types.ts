@@ -1045,6 +1045,9 @@ export interface PrDetail {
   additions: number;
   deletions: number;
   changed_files: number;
+  /** The merge commit's SHA once merged, else null (#511, `getPrDetail`'s
+   *  `mergeCommit{oid}` field — confirmed against real `gh pr view --json` output). */
+  merge_commit_sha: string | null;
 }
 
 export interface CheckRun {
