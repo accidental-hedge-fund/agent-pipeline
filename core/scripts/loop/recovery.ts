@@ -25,7 +25,7 @@ import {
   type LoopLedger,
   type LoopEngineName,
 } from "./types.ts";
-import { readLedger, writeLedger, appendEvent, type LoopStoreDeps } from "./store.ts";
+import { initRun, readLedger, writeLedger, appendEvent, type LoopStoreDeps } from "./store.ts";
 
 // ---------------------------------------------------------------------------
 // Recovery policy compilation — fail closed.
@@ -188,6 +188,31 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy({
   },
 });
 
+/** A run-contract shape accepted at real initialization time: every
+ *  {@link LoopContract} field except `recovery_policy`, which is either the
+ *  raw (uncompiled) policy to validate or omitted to install
+ *  {@link DEFAULT_RECOVERY_POLICY}. */
+export type LoopContractInit = Omit<LoopContract, "recovery_policy"> & { recovery_policy?: unknown };
+
+/** The real run-contract initialization entry point: compiles/validates
+ *  `contract.recovery_policy` (installing {@link DEFAULT_RECOVERY_POLICY} when
+ *  omitted) BEFORE creating the run directory, so a malformed policy fails
+ *  closed and no run directory is created (`initRun`/`compileRecoveryPolicy`
+ *  never run). This is the only sanctioned way to produce a `LoopContract`
+ *  with a usable `recovery_policy` — do not call `initRun` directly with a
+ *  hand-built policy. */
+export async function initRecoverableRun(
+  deps: LoopStoreDeps,
+  contract: LoopContractInit,
+  ledger: LoopLedger,
+): Promise<LoopContract> {
+  const recovery_policy =
+    contract.recovery_policy === undefined ? DEFAULT_RECOVERY_POLICY : compileRecoveryPolicy(contract.recovery_policy);
+  const compiled: LoopContract = { ...contract, recovery_policy } as LoopContract;
+  await initRun(deps, compiled, ledger);
+  return compiled;
+}
+
 // ---------------------------------------------------------------------------
 // Fail-closed classification.
 // ---------------------------------------------------------------------------
@@ -266,12 +291,15 @@ export interface BlockItemInput {
 
 /** Transitions an item into `blocked` carrying a validated
  *  {@link DurableBlockerClass}. Refuses (LoopError "validation") a missing or
- *  out-of-enum class, leaving the item unchanged. Fingerprints the evidence
- *  and, when it repeats the item's immediately preceding fingerprint past the
- *  class's `repeated_evidence_limit`, additionally records a terminal
- *  `repeated_no_progress` run stop — independent of the class recovery
- *  budget, which this transition never charges (budget is charged only on
- *  recovery — see {@link recoverItem}). */
+ *  out-of-enum class, leaving the item unchanged. When the class's policy
+ *  routes to `human_authority`, immediately records a terminal `human_authority`
+ *  run stop — the item is handed to a human and every subsequent transition on
+ *  the run is refused. Otherwise, fingerprints the evidence and, when it
+ *  repeats the item's immediately preceding fingerprint past the class's
+ *  `repeated_evidence_limit`, records a terminal `repeated_no_progress` run
+ *  stop — independent of the class recovery budget, which this transition
+ *  never charges (budget is charged only on recovery — see
+ *  {@link recoverItem}). */
 export async function blockItem(deps: LoopStoreDeps, contract: LoopContract, input: BlockItemInput): Promise<LoopLedger> {
   if (!input.blockerClass || !isDurableBlockerClass(input.blockerClass)) {
     throw new LoopError("validation", `"${input.blockerClass}" is not a valid DurableBlockerClass`);
@@ -299,7 +327,9 @@ export async function blockItem(deps: LoopStoreDeps, contract: LoopContract, inp
   item.repeated_evidence_count = repeatedCount;
   item.history.push({ time, from: fromState, to: "blocked", engine: input.engine, theme: blockerClass, evidence: input.evidence, note: input.note });
 
-  if (repeatedCount >= policyEntry.repeated_evidence_limit) {
+  if (policyEntry.terminal_outcome === "human_authority") {
+    ledger.stop = { reason: "human_authority", time, item_id: input.itemId, theme: blockerClass };
+  } else if (repeatedCount >= policyEntry.repeated_evidence_limit) {
     ledger.stop = {
       reason: "repeated_no_progress",
       time,
@@ -366,13 +396,17 @@ export interface RecoverItemResult {
 }
 
 /** Attempts to recover a blocked item. Charges the recovery budget keyed by
- *  the item's typed blocker classification (falling back to `default`), and
- *  on success resumes the SAME item `blocked` -> `in_progress`, retaining its
- *  history, class, and evidence records. Refuses (LoopError "stop") when the
- *  run already carries a terminal stop, when the class budget is already
- *  exhausted (recording a terminal `recovery_exhausted` stop), or when the
- *  class is a human-authority class (recording the attempt as
- *  `human_authority` with no budget charged and no recipe attempted). */
+ *  the item's typed blocker classification (falling back to the class's
+ *  compiled `retry_budget` from the policy, not the ledger's unrelated
+ *  `default`, when the item has no class-specific ledger entry yet), and on
+ *  success resumes the SAME item `blocked` -> `in_progress`, retaining its
+ *  history, class, and evidence records. Refuses (LoopError "validation") a
+ *  retry-capable recovery attempted with an empty action list — at least one
+ *  permitted recipe must actually have been attempted. Refuses (LoopError
+ *  "stop") when the run already carries a terminal stop (including the
+ *  `human_authority` stop {@link blockItem} records immediately for
+ *  human-authority classes), or when the class budget is already exhausted
+ *  (recording a terminal `recovery_exhausted` stop). */
 export async function recoverItem(deps: LoopStoreDeps, contract: LoopContract, input: RecoverItemInput): Promise<RecoverItemResult> {
   const ledger = await readLedger(deps, input.runId);
   if (ledger.stop) {
@@ -389,6 +423,12 @@ export async function recoverItem(deps: LoopStoreDeps, contract: LoopContract, i
   if (invalidAction) {
     throw new LoopError("validation", `recipe "${invalidAction}" is not permitted for blocker class "${blockerClass}"`);
   }
+  if (policyEntry.terminal_outcome !== "human_authority" && input.actions.length === 0) {
+    throw new LoopError(
+      "validation",
+      `recovery for blocker class "${blockerClass}" requires at least one permitted recovery action — none was attempted`,
+    );
+  }
 
   const time = deps.now().toISOString();
   let outcome: RecoveryAttemptOutcome;
@@ -396,7 +436,7 @@ export async function recoverItem(deps: LoopStoreDeps, contract: LoopContract, i
   if (policyEntry.terminal_outcome === "human_authority") {
     outcome = "human_authority";
   } else {
-    const remaining = item.recovery_budgets_remaining[blockerClass] ?? item.recovery_budgets_remaining.default;
+    const remaining = item.recovery_budgets_remaining[blockerClass] ?? policyEntry.retry_budget;
     if (remaining <= 0) {
       outcome = "exhausted";
       ledger.stop = { reason: "recovery_exhausted", time, item_id: input.itemId, theme: blockerClass };
@@ -447,7 +487,11 @@ export function isRunFatalBlocked(contract: LoopContract, ledger: LoopLedger): b
   });
 }
 
-const DONE_STATES = new Set(["merged", "released", "deployed"]);
+// This pipeline stops at `pipeline:ready-to-deploy` (`ready`) and never
+// merges (CLAUDE.md golden rule #4), so `ready` — not `merged` — is this
+// engine's actual completion state; `merged`/`released`/`deployed` are
+// retained for engines/imports whose lifecycle continues past that point.
+const DONE_STATES = new Set(["ready", "merged", "released", "deployed"]);
 
 /** Pending items with no dependency on a blocked item, whose declared
  *  dependencies are all done — eligible to start while another item is

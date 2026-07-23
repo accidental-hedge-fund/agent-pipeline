@@ -16,9 +16,10 @@ import {
   recoverItem,
   isRunFatalBlocked,
   eligibleIndependentItems,
+  initRecoverableRun,
 } from "../scripts/loop/recovery.ts";
 import { mapLegacyThemeToBlockerClass } from "../scripts/loop/import.ts";
-import { initRun, readLedger, acquireLock, type LoopStoreDeps } from "../scripts/loop/store.ts";
+import { initRun, readContract, readLedger, acquireLock, type LoopStoreDeps } from "../scripts/loop/store.ts";
 import {
   DURABLE_BLOCKER_CLASSES,
   LOOP_CONTRACT_SCHEMA,
@@ -210,6 +211,40 @@ test("no permitted recipe across any class performs a merge, release, credential
 });
 
 // ---------------------------------------------------------------------------
+// Real run-contract initialization — compiles/installs the policy before the
+// run directory is created (the actual call-site integration finding 1
+// required, not just a pre-populated test fixture).
+// ---------------------------------------------------------------------------
+
+function initInput(): Record<string, unknown> {
+  const { recovery_policy: _recovery_policy, ...rest } = testContract();
+  return rest;
+}
+
+test("initRecoverableRun: omitting recovery_policy installs DEFAULT_RECOVERY_POLICY via the real init path", async () => {
+  const { deps } = fakeDeps();
+  const compiled = await initRecoverableRun(deps, initInput(), testLedger());
+  assert.deepEqual(compiled.recovery_policy, DEFAULT_RECOVERY_POLICY);
+  const onDisk = await readContract(deps, "run-1");
+  assert.deepEqual(onDisk.recovery_policy, DEFAULT_RECOVERY_POLICY);
+});
+
+test("initRecoverableRun: a malformed policy fails compilation closed and no run directory is created", async () => {
+  const { deps } = fakeDeps();
+  const partial: Record<string, unknown> = { ...DEFAULT_RECOVERY_POLICY };
+  delete partial["workflow-engine-defect"];
+  await assert.rejects(
+    () => initRecoverableRun(deps, { ...initInput(), recovery_policy: partial }, testLedger()),
+    (err: unknown) => {
+      assert.ok(err instanceof LoopError);
+      assert.equal(err.loopFailureClass, "validation");
+      return true;
+    },
+  );
+  await assert.rejects(() => readContract(deps, "run-1"), /not found/);
+});
+
+// ---------------------------------------------------------------------------
 // Classification — fail closed on unknown/ambiguous.
 // ---------------------------------------------------------------------------
 
@@ -388,6 +423,32 @@ test("recoverItem: budget is charged only on recovery, keyed by the item's block
   assert.equal(ledger.items["100"].recovery_budgets_remaining.default, 3, "the unrelated default key is untouched");
 });
 
+test("recoverItem: a class budget with no ledger entry falls back to the POLICY's retry_budget, not the ledger's unrelated default", async () => {
+  const { deps, contract, token } = await setup();
+  // "transient-rate-limit" has a policy retry_budget of 5 — the ledger's
+  // seeded `default` of 3 must not shadow it.
+  await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "transient-rate-limit", evidence: "429 rate limited" });
+  const { ledger, attempt } = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["wait_and_retry"] });
+  assert.equal(attempt.outcome, "recovered");
+  assert.equal(ledger.items["100"].recovery_budgets_remaining["transient-rate-limit"], 4, "decremented from the policy's retry_budget of 5, not the ledger default of 3");
+});
+
+test("recoverItem: an empty action list is refused for a retry-capable class — recovery cannot succeed with no recovery action", async () => {
+  const { deps, contract, token } = await setup();
+  await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed" });
+  await assert.rejects(
+    () => recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: [] }),
+    (err: unknown) => {
+      assert.ok(err instanceof LoopError);
+      assert.equal(err.loopFailureClass, "validation");
+      return true;
+    },
+  );
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "blocked", "item is not falsely resumed");
+  assert.equal(ledger.recovery_attempts.length, 0, "no attempt is recorded for a refused call");
+});
+
 test("recoverItem: exhausted class budget stops the run terminally", async () => {
   const { deps, contract, token } = await setup();
   const ledgerFile = "run-1";
@@ -418,21 +479,40 @@ test("recoverItem: on success the same item resumes blocked -> in_progress, reta
   assert.equal(ledger.items["200"].state, "pending", "no other item was started in its place");
 });
 
-test("recoverItem: missing-authority routes to a human, not a retry — no budget charged, no recipe attempted", async () => {
+test("blockItem: missing-authority immediately records a terminal human_authority stop — no budget charged, no recipe attempted", async () => {
   const { deps, contract, token } = await setup();
-  await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "missing-authority", evidence: "needs a merge grant" });
   const before = (await readLedger(deps, "run-1")).items["100"].recovery_budgets_remaining;
-  const { ledger, attempt } = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: [] });
-  assert.equal(attempt.outcome, "human_authority");
+  const ledger = await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "missing-authority", evidence: "needs a merge grant" });
+  assert.equal(ledger.stop?.reason, "human_authority");
+  assert.equal(ledger.stop?.item_id, "100");
   assert.equal(ledger.items["100"].state, "blocked", "item stays blocked pending a human, not retried");
   assert.deepEqual(ledger.items["100"].recovery_budgets_remaining, before, "no budget charged");
+
+  // The terminal stop refuses every subsequent transition, including a
+  // recovery attempt on the same item.
+  await assert.rejects(
+    () => recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: [] }),
+    (err: unknown) => {
+      assert.ok(err instanceof LoopError);
+      assert.equal(err.loopFailureClass, "stop");
+      return true;
+    },
+  );
+  await assert.rejects(
+    () => blockItem(deps, contract, { runId: "run-1", token, itemId: "200", engine: "claude", blockerClass: "implementation-ci", evidence: "x" }),
+    (err: unknown) => {
+      assert.ok(err instanceof LoopError);
+      assert.equal(err.loopFailureClass, "stop");
+      return true;
+    },
+  );
 });
 
-test("recoverItem: specification-decision routes to a human, not a retry", async () => {
+test("blockItem: specification-decision immediately records a terminal human_authority stop", async () => {
   const { deps, contract, token } = await setup();
-  await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "specification-decision", evidence: "ambiguous requirement" });
-  const { attempt } = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: [] });
-  assert.equal(attempt.outcome, "human_authority");
+  const ledger = await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "specification-decision", evidence: "ambiguous requirement" });
+  assert.equal(ledger.stop?.reason, "human_authority");
+  assert.equal(ledger.stop?.theme, "specification-decision");
 });
 
 test("recoverItem: a recipe not permitted for the class is refused", async () => {
@@ -500,6 +580,32 @@ test("eligibleIndependentItems: an item depending on the blocked item is not eli
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed" });
   const ledger = await readLedger(deps, "run-1");
   assert.deepEqual(eligibleIndependentItems(contract, ledger), [], "200 depends on the blocked item 100");
+});
+
+test("eligibleIndependentItems: a dependency completed at this pipeline's actual terminal state (ready) makes the item eligible", async () => {
+  const { deps } = fakeDeps();
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }, { id: "200", depends_on: ["100"] }, { id: "300", depends_on: [] }] });
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "run-1",
+    items: {
+      "100": { id: "100", state: "ready", history: [], recovery_budgets_remaining: { default: 3 } },
+      "200": { id: "200", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+      "300": { id: "300", state: "in_progress", history: [], recovery_budgets_remaining: { default: 3 } },
+    },
+    consecutive_blocked: 0,
+    merge_barrier: null,
+    stop: null,
+    last_native_goal_check: null,
+    last_reconciliation: null,
+    reconciliation_sequence: 0,
+    recovery_attempts: [],
+  } as LoopLedger;
+  await initRun(deps, contract, ledger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await blockItem(deps, contract, { runId: "run-1", token, itemId: "300", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed" });
+  const afterBlock = await readLedger(deps, "run-1");
+  assert.deepEqual(eligibleIndependentItems(contract, afterBlock), ["200"], "200's dependency 100 is done (ready) under this pipeline's supported lifecycle");
 });
 
 test("eligibleIndependentItems: the single-active-item invariant holds — no item is eligible while one is in_progress", async () => {

@@ -196,7 +196,7 @@ export interface LoopMergeBarrier {
 }
 
 export interface LoopStopRecord {
-  reason: "recovery_exhausted" | "consecutive_blocked" | "needs_human_classification" | "repeated_no_progress";
+  reason: "recovery_exhausted" | "consecutive_blocked" | "needs_human_classification" | "repeated_no_progress" | "human_authority";
   time: string;
   item_id?: string;
   theme?: string;
