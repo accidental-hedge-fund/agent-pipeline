@@ -253,3 +253,189 @@ test("pipeline correction record: mutates no GitHub or code state — only side 
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// CLI: `pipeline correction attribute` (#501)
+// ---------------------------------------------------------------------------
+
+function ledgerPath(repoDir: string): string {
+  return path.join(repoDir, ".agent-pipeline", "control-attributions.jsonl");
+}
+
+function requiredAttributeArgs(overrides: Record<string, string> = {}): string[] {
+  const base: Record<string, string> = {
+    "--correction-key": "abc12345",
+    "--control-type": "deterministic-gate",
+    "--disposition": "implemented",
+    "--effective-at": "2026-01-01T00:00:00Z",
+  };
+  const merged = { ...base, ...overrides };
+  return Object.entries(merged).flatMap(([k, v]) => [k, v]);
+}
+
+test("command-registry: correction entry allows the correction-attribute flags", () => {
+  const entry = COMMAND_REGISTRY.correction;
+  for (const flag of ["correctionKey", "controlType", "disposition", "pr", "effectiveCommit", "effectiveRelease", "effectiveAt", "supersedes", "note"]) {
+    assert.ok((entry.allowedFlags as Set<string>).has(flag), `correction.allowedFlags should include "${flag}"`);
+  }
+});
+
+test("pipeline correction attribute: complete invocation appends exactly one control_attribution and exits 0, no run required", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-"));
+  try {
+    const result = runCli(["correction", "attribute", "--repo-path", tmp, ...requiredAttributeArgs()], tmp);
+    assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+    const lines = fs.readFileSync(ledgerPath(tmp), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].type, "control_attribution");
+    assert.equal(lines[0].correction_key, "abc12345");
+    assert.equal(lines[0].control_type, "deterministic-gate");
+    assert.equal(lines[0].disposition, "implemented");
+    assert.ok(lines[0].effective_at, "implemented disposition sets effective_at");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction attribute: missing required field exits non-zero and appends nothing", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-missing-"));
+  try {
+    const args = requiredAttributeArgs();
+    const idx = args.indexOf("--disposition");
+    args.splice(idx, 2);
+    const result = runCli(["correction", "attribute", "--repo-path", tmp, ...args], tmp);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--disposition/);
+    assert.equal(fs.existsSync(ledgerPath(tmp)), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction attribute: invalid --control-type exits non-zero and appends nothing", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-bad-control-"));
+  try {
+    const result = runCli(["correction", "attribute", "--repo-path", tmp, ...requiredAttributeArgs({ "--control-type": "not-a-real-control" })], tmp);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--control-type/);
+    assert.equal(fs.existsSync(ledgerPath(tmp)), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction attribute: invalid --disposition exits non-zero and appends nothing", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-bad-disposition-"));
+  try {
+    const result = runCli(["correction", "attribute", "--repo-path", tmp, ...requiredAttributeArgs({ "--disposition": "not-a-real-disposition" })], tmp);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--disposition/);
+    assert.equal(fs.existsSync(ledgerPath(tmp)), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction attribute: malformed --evidence-ref (no colon) exits non-zero and appends nothing", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-bad-evref-"));
+  try {
+    const result = runCli(["correction", "attribute", "--repo-path", tmp, ...requiredAttributeArgs({ "--evidence-ref": "no-colon-here" })], tmp);
+    assert.notEqual(result.status, 0);
+    assert.equal(fs.existsSync(ledgerPath(tmp)), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction attribute: an undeclared flag is rejected with exit 2 before any append", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-undeclared-flag-"));
+  try {
+    const result = runCli(["correction", "attribute", "--repo-path", tmp, "--dry-run", ...requiredAttributeArgs()], tmp);
+    assert.equal(result.status, 2, `stderr: ${result.stderr}`);
+    assert.equal(fs.existsSync(ledgerPath(tmp)), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction attribute: implemented disposition without --effective-at exits non-zero and appends nothing", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-no-effective-at-"));
+  try {
+    const args = requiredAttributeArgs();
+    const idx = args.indexOf("--effective-at");
+    args.splice(idx, 2);
+    const result = runCli(["correction", "attribute", "--repo-path", tmp, ...args], tmp);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--effective-at/);
+    assert.equal(fs.existsSync(ledgerPath(tmp)), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction attribute: unparseable --effective-at exits non-zero and appends nothing", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-bad-effective-at-"));
+  try {
+    const result = runCli(["correction", "attribute", "--repo-path", tmp, ...requiredAttributeArgs({ "--effective-at": "not-a-date" })], tmp);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--effective-at/);
+    assert.equal(fs.existsSync(ledgerPath(tmp)), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction attribute: human-owned/rejected dispositions append with effective_at null", () => {
+  for (const disposition of ["human-owned", "rejected"]) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-disposition-"));
+    try {
+      const result = runCli(["correction", "attribute", "--repo-path", tmp, ...requiredAttributeArgs({ "--disposition": disposition })], tmp);
+      assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+      const record = JSON.parse(fs.readFileSync(ledgerPath(tmp), "utf8").trim());
+      assert.equal(record.effective_at, null, disposition);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+});
+
+test("pipeline correction attribute: mutates no GitHub or code state — only side effect is the appended ledger entry", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-no-mutation-"));
+  try {
+    fs.mkdirSync(tmp, { recursive: true });
+    const before = fs.readdirSync(tmp).sort();
+    const result = runCli(["correction", "attribute", "--repo-path", tmp, ...requiredAttributeArgs()], tmp);
+    assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+    assert.ok(fs.existsSync(ledgerPath(tmp)));
+    const after = fs.readdirSync(tmp).filter((name) => name !== ".agent-pipeline").sort();
+    assert.deepEqual(before, after, "no new top-level files/dirs beyond .agent-pipeline");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction attribute: repeated invocation with the same identifying fields is idempotent (same attribution_id)", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-idempotent-"));
+  try {
+    runCli(["correction", "attribute", "--repo-path", tmp, ...requiredAttributeArgs()], tmp);
+    runCli(["correction", "attribute", "--repo-path", tmp, ...requiredAttributeArgs()], tmp);
+    const records = fs.readFileSync(ledgerPath(tmp), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(records.length, 2, "each invocation appends its own record — dedup is a consumer-side concern");
+    // attribution_id is derived from identifying fields only, never from
+    // append time (`at`) or the explicit `effective_at`, so a replay with the
+    // same identifying fields shares one attribution_id and a consumer
+    // deduping by it collapses the two appends to one logical attribution.
+    assert.equal(records[0].attribution_id, records[1].attribution_id);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction: closing an issue or merging a PR never writes an attribution — attribute is the only write path", () => {
+  // Structural guarantee: no state-machine dispatch path in pipeline.ts calls
+  // emitControlAttribution except the `correction attribute` branch itself.
+  const pipelineSource = fs.readFileSync(path.join(__dirname, "..", "scripts", "pipeline.ts"), "utf8");
+  const callSites = pipelineSource.split("emitControlAttribution(").length - 1;
+  // One import reference + exactly one call site (inside the attribute branch).
+  assert.equal(callSites, 1, "emitControlAttribution must be called from exactly one place: the correction attribute branch");
+});
