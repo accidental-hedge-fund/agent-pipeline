@@ -27,3 +27,7 @@ node_modules/
 # Stage-eval-runner experiment output (manifest/plan/runs/failures); local-only,
 # never committed.
 .agent-pipeline/evals/
+
+# Durable control-attribution ledger written by `pipeline correction attribute`;
+# local-only, never committed.
+.agent-pipeline/control-attributions.jsonl

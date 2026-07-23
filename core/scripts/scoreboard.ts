@@ -7,6 +7,13 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
 import { runsDir } from "./run-store.ts";
+import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
+import {
+  controlAttributionsPath,
+  validateCorrectionEvent,
+  validateControlAttribution,
+  type ControlAttribution,
+} from "./correction.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -125,6 +132,100 @@ export interface ScoreboardGrouping {
   groups: ScoreboardGroupEntry[];
 }
 
+// ---------------------------------------------------------------------------
+// Repeat-correction / control-attribution recurrence (#501)
+// ---------------------------------------------------------------------------
+
+export type CorrectionsByDimension =
+  | "repo" | "stage" | "harness" | "model" | "source_kind"
+  | "failure_class" | "proposed_control" | "implemented_control";
+
+export const CORRECTIONS_BY_VALUES: CorrectionsByDimension[] = [
+  "repo", "stage", "harness", "model", "source_kind",
+  "failure_class", "proposed_control", "implemented_control",
+];
+
+export type CorrectionRecurrenceStatus = "recurred" | "no_recurrence_observed" | "insufficient_post_control_evidence";
+
+export interface CorrectionEvidencePointer {
+  correction_id: string;
+  at: string;
+  run_id: string;
+  evidence_ref: { kind: string; id: string };
+}
+
+export interface CorrectionAttributionSummary {
+  attribution_id: string;
+  control_type: string;
+  disposition: string;
+  issue: number | null;
+  pr: number | null;
+  effective_commit: string | null;
+  effective_release: string | null;
+  effective_at: string | null;
+}
+
+export interface CorrectionClassRecurrence {
+  /** Null when the class's control history is entirely rolled back (no
+   *  currently-active effective control) — the class reads as unattributed
+   *  going forward, but `superseded` still surfaces its control history. */
+  attribution: CorrectionAttributionSummary | null;
+  superseded: CorrectionAttributionSummary[];
+  time_to_control_ms: number | null;
+  eligible_post_control_runs: number;
+  /** Null exactly when `attribution` is null — there is no active boundary
+   *  to classify recurrence against. */
+  status: CorrectionRecurrenceStatus | null;
+  recurrence_evidence: CorrectionEvidencePointer[];
+}
+
+export interface CorrectionClassSummary {
+  correction_key: string;
+  source_kind: string;
+  failure_class: string;
+  stage: string | null;
+  repo: string;
+  distinct_corrections: number;
+  repeated: boolean;
+  first_seen_at: string;
+  last_seen_at: string;
+  recurrence: CorrectionClassRecurrence | null;
+}
+
+export interface CorrectionGroupEntry {
+  key: string;
+  total_corrections: number;
+  distinct_classes: number;
+  repeated_class_count: number;
+  recurred_classes: number;
+  no_recurrence_observed_classes: number;
+  insufficient_evidence_classes: number;
+  unattributed_classes: number;
+}
+
+export interface CorrectionGrouping {
+  dimension: CorrectionsByDimension;
+  groups: CorrectionGroupEntry[];
+}
+
+/** Lightweight per-period totals (#501, 4.2): each `--bucket` period carries
+ *  its own repeat-correction totals, deduped within that period's runs only —
+ *  since a run (and every correction it emits) is assigned to exactly one
+ *  period by `assignRunsToPeriods`, per-period totals always sum to the
+ *  window total without needing to re-resolve cross-period recurrence. */
+export interface CorrectionTotals {
+  total_corrections: number;
+  distinct_classes: number;
+  repeated_class_count: number;
+  repeated_class_rate: RateValue;
+  corrections_per_ready_item: RateValue;
+}
+
+export interface CorrectionMetrics extends CorrectionTotals {
+  classes: CorrectionClassSummary[];
+  top_still_recurring: CorrectionClassSummary[];
+}
+
 export interface ScoreboardMetrics {
   ready_to_deploy_without_human_intervention: RateValue;
   cost_per_ready_pr_usd: CostMetric;
@@ -164,6 +265,7 @@ export interface ScoreboardPeriod {
   metrics: ScoreboardMetrics;
   by?: ScoreboardGroupBy;
   grouping?: ScoreboardGrouping;
+  corrections?: CorrectionTotals;
 }
 
 export interface ScoreboardReport {
@@ -176,6 +278,9 @@ export interface ScoreboardReport {
   series?: ScoreboardPeriod[];
   by?: ScoreboardGroupBy;
   grouping?: ScoreboardGrouping;
+  corrections?: CorrectionMetrics;
+  correctionsBy?: CorrectionsByDimension;
+  correctionsGrouping?: CorrectionGrouping;
 }
 
 export interface ScoreboardOpts {
@@ -189,6 +294,9 @@ export interface ScoreboardOpts {
   /** Raw `--by` flag values, collected repeatably so a repeated flag can be
    *  detected (not silently last-wins). Parsed by parseScoreboardGroupBy(). */
   by?: string[];
+  /** Raw `--corrections-by` flag values, collected repeatably so a repeated
+   *  flag can be detected (#501). Parsed by parseScoreboardCorrectionsBy(). */
+  correctionsBy?: string[];
   /** Write a self-contained offline HTML export of the report to this path (#427). */
   html?: string;
   now?: Date;
@@ -338,6 +446,21 @@ export function parseScoreboardGroupBy(values: string[] | undefined): Scoreboard
   throw new Error(`--by must be one of: ${SCOREBOARD_GROUP_BY_VALUES.join(", ")} (got: ${value})`);
 }
 
+/** Validates `--corrections-by` before any artifact is read (#501, mirrors
+ *  parseScoreboardGroupBy exactly). `null` for an absent flag; throws naming
+ *  all supported dimensions for an unsupported value; throws stating that
+ *  exactly one dimension is supported when the flag was supplied more than
+ *  once. */
+export function parseScoreboardCorrectionsBy(values: string[] | undefined): CorrectionsByDimension | null {
+  if (values === undefined || values.length === 0) return null;
+  if (values.length > 1) {
+    throw new Error(`--corrections-by supports exactly one grouping dimension per invocation, got ${values.length}: ${values.join(", ")}`);
+  }
+  const value = values[0];
+  if ((CORRECTIONS_BY_VALUES as string[]).includes(value)) return value as CorrectionsByDimension;
+  throw new Error(`--corrections-by must be one of: ${CORRECTIONS_BY_VALUES.join(", ")} (got: ${value})`);
+}
+
 export function parseEstimateCosts(values: string[] | undefined): Record<string, number> {
   const estimates: Record<string, number> = {};
   for (const raw of values ?? []) {
@@ -363,14 +486,38 @@ export async function buildScoreboardReport(
   const window = parseScoreboardWindow(opts);
   const bucket = parseScoreboardBucket(opts.bucket);
   const groupBy = parseScoreboardGroupBy(opts.by);
+  const correctionsBy = parseScoreboardCorrectionsBy(opts.correctionsBy);
   const estimates = parseEstimateCosts(opts.estimateCost);
   const scan = await scanRunStore(opts.repoDir, window, deps);
-  const report = aggregateRuns(window, scan, estimates, groupBy);
+  const core = aggregateRuns(window, scan, estimates, groupBy);
+
+  const correctionDiagnostics: ScoreboardDiagnostic[] = [];
+  const attributions = await readControlAttributionLedger(opts.repoDir, deps, correctionDiagnostics);
+  const { metrics: corrections, grouping: correctionsGrouping } = computeCorrectionMetrics(
+    opts.repoDir,
+    scan.runs,
+    attributions,
+    correctionDiagnostics,
+    correctionsBy,
+    core.totals.successful_prs,
+  );
+
+  const diagnostics = [...core.diagnostics, ...correctionDiagnostics];
+  const report: ScoreboardReport = {
+    ...core,
+    diagnostics,
+    totals: { ...core.totals, diagnostics: diagnostics.length },
+    corrections,
+    ...(correctionsBy ? { correctionsBy, correctionsGrouping } : {}),
+  };
   if (bucket === null) return report;
 
   const periods = computePeriods(window, bucket);
   const assigned = assignRunsToPeriods(periods, scan.runs);
-  const series: ScoreboardPeriod[] = periods.map((period, i) => buildPeriodEntry(period, assigned[i], estimates, groupBy));
+  const series: ScoreboardPeriod[] = periods.map((period, i) => {
+    const entry = buildPeriodEntry(period, assigned[i], estimates, groupBy);
+    return { ...entry, corrections: computeCorrectionTotals(assigned[i], entry.totals.successful_prs) };
+  });
   return { ...report, bucket, series };
 }
 
@@ -609,6 +756,400 @@ export async function scanRunStore(
   }
 
   return { scannedRuns: dirs.length, runs, diagnostics };
+}
+
+// ---------------------------------------------------------------------------
+// Repeat-correction / control-attribution recurrence (#501)
+// ---------------------------------------------------------------------------
+
+/** One deduped correction instance (by `correction_id`) drawn from the
+ *  included runs' `correction_event` records. */
+interface CorrectionInstance {
+  correction_id: string;
+  correction_key: string;
+  source_kind: string;
+  failure_class: string;
+  stage: string | null;
+  repo: string;
+  at: string;
+  run_id: string;
+  proposed_control?: string;
+  evidence_ref: { kind: string; id: string };
+}
+
+/** Read `.agent-pipeline/control-attributions.jsonl` (#501). Missing file →
+ *  empty list (valid empty state, not an error); a malformed line, an
+ *  unrecognized `schema_version`, or a validation failure is surfaced as a
+ *  diagnostic rather than thrown. */
+async function readControlAttributionLedger(
+  repoDir: string,
+  deps: Pick<ScoreboardDeps, "readFile">,
+  diagnostics: ScoreboardDiagnostic[],
+): Promise<ControlAttribution[]> {
+  const ledgerPath = controlAttributionsPath(repoDir);
+  let raw: string;
+  try {
+    raw = await deps.readFile(ledgerPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    diagnostics.push({
+      severity: "warning",
+      code: "corrupt_attribution",
+      path: ledgerPath,
+      message: `control-attributions ledger could not be read: ${(err as Error).message}`,
+    });
+    return [];
+  }
+  const attributions: ControlAttribution[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      diagnostics.push({
+        severity: "warning",
+        code: "corrupt_attribution",
+        path: ledgerPath,
+        message: "control-attributions ledger contains an invalid JSON line",
+      });
+      continue;
+    }
+    const validation = validateControlAttribution(parsed);
+    if (!validation.ok) {
+      const code = validation.error.includes("schema_version") ? "unknown_schema_version" : "corrupt_attribution";
+      diagnostics.push({ severity: "warning", code, path: ledgerPath, message: validation.error });
+      continue;
+    }
+    attributions.push(validation.attribution);
+  }
+  return attributions;
+}
+
+/** Deduped `correction_event` instances across the included runs, keyed by
+ *  `correction_id` so a replayed/duplicate delivery counts once. A malformed
+ *  record or an unrecognized `schema_version` is surfaced as a diagnostic and
+ *  skipped rather than crashing the scan. */
+function collectCorrectionInstances(runs: IncludedRun[], diagnostics: ScoreboardDiagnostic[]): CorrectionInstance[] {
+  const byId = new Map<string, CorrectionInstance>();
+  for (const run of runs) {
+    for (const [index, event] of run.events.entries()) {
+      if (event["type"] !== "correction_event") continue;
+      const validation = validateCorrectionEvent(event);
+      if (!validation.ok) {
+        const code = validation.error.includes("schema_version") ? "unknown_schema_version" : "corrupt_correction_event";
+        diagnostics.push({
+          severity: "warning",
+          code,
+          path: run.eventsPath,
+          message: `${validation.error} (event index ${index})`,
+        });
+        continue;
+      }
+      const e = validation.event;
+      if (byId.has(e.correction_id)) continue;
+      byId.set(e.correction_id, {
+        correction_id: e.correction_id,
+        correction_key: e.correction_key,
+        source_kind: e.source_kind,
+        failure_class: e.failure_class,
+        stage: e.stage,
+        repo: e.repo,
+        at: e.at,
+        run_id: run.runId,
+        proposed_control: e.proposed_control,
+        evidence_ref: e.evidence_ref,
+      });
+    }
+  }
+  return [...byId.values()];
+}
+
+/** Lightweight per-period totals (#501 4.2) — dedup only within `runs`
+ *  (already assigned to exactly one period each), so per-period totals sum
+ *  to the window total without re-resolving cross-period recurrence. */
+function computeCorrectionTotals(runs: IncludedRun[], successfulPrs: number): CorrectionTotals {
+  const instances = collectCorrectionInstances(runs, []);
+  const classCounts = new Map<string, number>();
+  for (const inst of instances) {
+    classCounts.set(inst.correction_key, (classCounts.get(inst.correction_key) ?? 0) + 1);
+  }
+  const repeatedClassCount = [...classCounts.values()].filter((n) => n >= 2).length;
+  return {
+    total_corrections: instances.length,
+    distinct_classes: classCounts.size,
+    repeated_class_count: repeatedClassCount,
+    repeated_class_rate: rate(repeatedClassCount, classCounts.size),
+    corrections_per_ready_item: rate(instances.length, successfulPrs),
+  };
+}
+
+function summarizeAttribution(attr: ControlAttribution): CorrectionAttributionSummary {
+  return {
+    attribution_id: attr.attribution_id,
+    control_type: attr.control_type,
+    disposition: attr.disposition,
+    issue: attr.issue,
+    pr: attr.pr,
+    effective_commit: attr.effective_commit,
+    effective_release: attr.effective_release,
+    effective_at: attr.effective_at,
+  };
+}
+
+/** Resolves a `correction_key`'s active control-attribution boundary (#501
+ *  decision 6): the latest attribution that ships an effective control
+ *  (`effective_at !== null`) is active; every attribution it replaces is
+ *  superseded. A `rejected`/`human-owned`/bare-`superseded` record whose
+ *  `supersedes` points at the current active attribution rolls it back
+ *  (active becomes null — the class reads as unattributed going forward),
+ *  while the rolled-back attribution is still surfaced in `superseded`. */
+function resolveActiveBoundary(attrs: ControlAttribution[]): { active: ControlAttribution | null; superseded: ControlAttribution[] } {
+  const sorted = [...attrs].sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  let active: ControlAttribution | null = null;
+  const superseded: ControlAttribution[] = [];
+  for (const rec of sorted) {
+    if (rec.effective_at !== null) {
+      if (active) superseded.push(active);
+      active = rec;
+    } else if (rec.supersedes && active && active.attribution_id === rec.supersedes) {
+      superseded.push(active);
+      active = null;
+    }
+  }
+  return { active, superseded };
+}
+
+const TOP_STILL_RECURRING_LIMIT = 10;
+
+/** Ranks classes still recurring after their control (most post-control
+ *  recurrence evidence first), then unattributed repeated classes (most
+ *  in-window corrections first), and caps the list. */
+function rankTopStillRecurring(classes: CorrectionClassSummary[]): CorrectionClassSummary[] {
+  const recurring = classes
+    .filter((c) => c.recurrence?.status === "recurred")
+    .sort((a, b) => (b.recurrence!.recurrence_evidence.length - a.recurrence!.recurrence_evidence.length));
+  const unattributed = classes
+    .filter((c) => c.repeated && (!c.recurrence || c.recurrence.attribution === null))
+    .sort((a, b) => b.distinct_corrections - a.distinct_corrections);
+  return [...recurring, ...unattributed].slice(0, TOP_STILL_RECURRING_LIMIT);
+}
+
+function resolveCorrectionGroupKey(
+  inst: CorrectionInstance,
+  classesByKey: Map<string, CorrectionClassSummary>,
+  runsById: Map<string, IncludedRun>,
+  dimension: CorrectionsByDimension,
+): string {
+  switch (dimension) {
+    case "repo":
+      return inst.repo || "unknown";
+    case "stage":
+      return inst.stage ?? "unknown";
+    case "source_kind":
+      return inst.source_kind;
+    case "failure_class":
+      return inst.failure_class;
+    case "proposed_control":
+      return inst.proposed_control ?? "unknown";
+    case "implemented_control": {
+      const cls = classesByKey.get(inst.correction_key);
+      return cls?.recurrence?.attribution?.control_type ?? "not applicable";
+    }
+    case "harness":
+    case "model": {
+      const run = runsById.get(inst.run_id);
+      if (!run || !inst.stage) return "unknown";
+      const normalized = collectAccountingRecords(run)
+        .map((ref) => normalizeAccountingRecord(ref.record, run))
+        .find((n): n is NormalizedAccountingRecord => n !== null && n.stage === inst.stage);
+      if (!normalized) return "unknown";
+      return dimension === "harness" ? normalized.harness : normalized.model;
+    }
+  }
+}
+
+function buildCorrectionGrouping(
+  runs: IncludedRun[],
+  instances: CorrectionInstance[],
+  classes: CorrectionClassSummary[],
+  dimension: CorrectionsByDimension,
+): CorrectionGrouping {
+  const classesByKey = new Map(classes.map((c) => [c.correction_key, c]));
+  const runsById = new Map(runs.map((r) => [r.runId, r]));
+
+  const instancesByGroup = new Map<string, CorrectionInstance[]>();
+  for (const inst of instances) {
+    const key = resolveCorrectionGroupKey(inst, classesByKey, runsById, dimension);
+    if (!instancesByGroup.has(key)) instancesByGroup.set(key, []);
+    instancesByGroup.get(key)!.push(inst);
+  }
+
+  const groups: CorrectionGroupEntry[] = [];
+  for (const [key, insts] of instancesByGroup.entries()) {
+    const classKeys = new Set(insts.map((i) => i.correction_key));
+    let repeatedClassCount = 0;
+    let recurred = 0;
+    let noRecurrenceObserved = 0;
+    let insufficientEvidence = 0;
+    let unattributed = 0;
+    for (const classKey of classKeys) {
+      const cls = classesByKey.get(classKey);
+      if (!cls) continue;
+      if (cls.repeated) repeatedClassCount++;
+      if (!cls.recurrence || cls.recurrence.status === null) unattributed++;
+      else if (cls.recurrence.status === "recurred") recurred++;
+      else if (cls.recurrence.status === "no_recurrence_observed") noRecurrenceObserved++;
+      else insufficientEvidence++;
+    }
+    groups.push({
+      key,
+      total_corrections: insts.length,
+      distinct_classes: classKeys.size,
+      repeated_class_count: repeatedClassCount,
+      recurred_classes: recurred,
+      no_recurrence_observed_classes: noRecurrenceObserved,
+      insufficient_evidence_classes: insufficientEvidence,
+      unattributed_classes: unattributed,
+    });
+  }
+  groups.sort((a, b) => b.total_corrections - a.total_corrections || a.key.localeCompare(b.key));
+  return { dimension, groups };
+}
+
+/** Full window-scoped repeat-correction and recurrence metrics (#501): reads
+ *  `correction_event` records (deduped by `correction_id`) and joins them to
+ *  the durable `control_attribution` ledger by `correction_key`, evaluates
+ *  post-control recurrence over eligible exposure per decision 5, and
+ *  (optionally) groups by one `--corrections-by` dimension. Read-only: never
+ *  writes the attribution ledger or any run artifact. */
+function computeCorrectionMetrics(
+  repoDir: string,
+  runs: IncludedRun[],
+  attributions: ControlAttribution[],
+  diagnostics: ScoreboardDiagnostic[],
+  groupBy: CorrectionsByDimension | null,
+  successfulPrs: number,
+): { metrics: CorrectionMetrics; grouping?: CorrectionGrouping } {
+  const ledgerPath = controlAttributionsPath(repoDir);
+  const instances = collectCorrectionInstances(runs, diagnostics);
+
+  const byKey = new Map<string, CorrectionInstance[]>();
+  for (const inst of instances) {
+    if (!byKey.has(inst.correction_key)) byKey.set(inst.correction_key, []);
+    byKey.get(inst.correction_key)!.push(inst);
+  }
+  for (const list of byKey.values()) list.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+
+  const runStageMap = new Map<string, Set<string>>();
+  for (const run of runs) {
+    const stages = new Set<string>();
+    for (const event of run.events) {
+      const type = event["type"];
+      if (type !== "stage_start" && type !== "stage_complete") continue;
+      const stage = stringField(event, "stage");
+      if (stage) stages.add(stage);
+    }
+    runStageMap.set(run.runId, stages);
+  }
+
+  const attrsByKey = new Map<string, ControlAttribution[]>();
+  for (const attr of attributions) {
+    if (!byKey.has(attr.correction_key)) {
+      diagnostics.push({
+        severity: "warning",
+        code: "orphan_attribution",
+        path: ledgerPath,
+        message: `control_attribution ${attr.attribution_id} references unknown correction_key "${attr.correction_key}" (no observed correction in this window)`,
+      });
+    }
+    if (!attrsByKey.has(attr.correction_key)) attrsByKey.set(attr.correction_key, []);
+    attrsByKey.get(attr.correction_key)!.push(attr);
+  }
+
+  const classes: CorrectionClassSummary[] = [];
+  for (const [key, list] of byKey.entries()) {
+    const first = list[0];
+    const last = list[list.length - 1];
+    const { active, superseded } = resolveActiveBoundary(attrsByKey.get(key) ?? []);
+
+    let recurrence: CorrectionClassRecurrence | null = null;
+    if (active || superseded.length > 0) {
+      let status: CorrectionRecurrenceStatus | null = null;
+      let eligibleRunCount = 0;
+      let timeToControlMs: number | null = null;
+      let recurrenceEvidence: CorrectionEvidencePointer[] = [];
+      if (active) {
+        const boundaryMs = Date.parse(active.effective_at!);
+        const eligibleRuns = runs.filter((run) => {
+          if (Date.parse(run.startAt) <= boundaryMs) return false;
+          if (first.stage === null) return true;
+          return (runStageMap.get(run.runId) ?? new Set()).has(first.stage);
+        });
+        eligibleRunCount = eligibleRuns.length;
+        const eligibleRunIds = new Set(eligibleRuns.map((r) => r.runId));
+        const recurredInstances = list.filter((inst) => eligibleRunIds.has(inst.run_id));
+        status = eligibleRuns.length === 0
+          ? "insufficient_post_control_evidence"
+          : recurredInstances.length > 0
+            ? "recurred"
+            : "no_recurrence_observed";
+        recurrenceEvidence = recurredInstances.map((inst) => ({
+          correction_id: inst.correction_id,
+          at: inst.at,
+          run_id: inst.run_id,
+          evidence_ref: {
+            kind: inst.evidence_ref.kind,
+            id: sanitize(redactSecrets(inst.evidence_ref.id)),
+          },
+        }));
+        const firstSeenMs = Date.parse(first.at);
+        timeToControlMs = Number.isFinite(boundaryMs) && Number.isFinite(firstSeenMs) && boundaryMs >= firstSeenMs
+          ? boundaryMs - firstSeenMs
+          : null;
+      }
+      recurrence = {
+        attribution: active ? summarizeAttribution(active) : null,
+        superseded: superseded.map(summarizeAttribution),
+        time_to_control_ms: timeToControlMs,
+        eligible_post_control_runs: eligibleRunCount,
+        status,
+        recurrence_evidence: recurrenceEvidence,
+      };
+    }
+
+    classes.push({
+      correction_key: key,
+      source_kind: first.source_kind,
+      failure_class: first.failure_class,
+      stage: first.stage,
+      repo: first.repo,
+      distinct_corrections: list.length,
+      repeated: list.length >= 2,
+      first_seen_at: first.at,
+      last_seen_at: last.at,
+      recurrence,
+    });
+  }
+  classes.sort((a, b) => a.correction_key.localeCompare(b.correction_key));
+
+  const totalCorrections = instances.length;
+  const distinctClasses = classes.length;
+  const repeatedClassCount = classes.filter((c) => c.repeated).length;
+
+  const metrics: CorrectionMetrics = {
+    total_corrections: totalCorrections,
+    distinct_classes: distinctClasses,
+    repeated_class_count: repeatedClassCount,
+    repeated_class_rate: rate(repeatedClassCount, distinctClasses),
+    corrections_per_ready_item: rate(totalCorrections, successfulPrs),
+    classes,
+    top_still_recurring: rankTopStillRecurring(classes),
+  };
+
+  if (!groupBy) return { metrics };
+  return { metrics, grouping: buildCorrectionGrouping(runs, instances, classes, groupBy) };
 }
 
 async function readJsonArtifact(
@@ -1712,6 +2253,11 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
     appendGroupingSection(lines, report.by, report.grouping);
   }
 
+  if (report.corrections) {
+    lines.push("");
+    appendCorrectionsSection(lines, report.corrections, report.correctionsBy, report.correctionsGrouping);
+  }
+
   if (report.diagnostics.length > 0) {
     lines.push("");
     lines.push("Diagnostics:");
@@ -1743,10 +2289,95 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
         lines.push("");
         appendGroupingSection(lines, period.by, period.grouping);
       }
+      if (period.corrections) {
+        lines.push(`Repeat corrections: ${formatCorrectionTotalsLine(period.corrections)}`);
+      }
     }
   }
 
   return lines.join("\n");
+}
+
+function formatCorrectionTotalsLine(totals: CorrectionTotals): string {
+  return (
+    `total ${totals.total_corrections}; distinct classes ${totals.distinct_classes}; ` +
+    `repeated classes ${formatRate(totals.repeated_class_rate)}; ` +
+    `per ready item ${formatRatioValue(totals.corrections_per_ready_item)}`
+  );
+}
+
+function formatAttributionSummary(attr: CorrectionAttributionSummary): string {
+  return (
+    `${attr.control_type} (${attr.disposition})` +
+    `${attr.issue !== null ? ` #${attr.issue}` : ""}` +
+    `${attr.pr !== null ? ` PR#${attr.pr}` : ""}` +
+    `${attr.effective_commit ? ` @${attr.effective_commit}` : ""}` +
+    `${attr.effective_release ? ` ${attr.effective_release}` : ""}` +
+    `${attr.effective_at ? ` effective ${attr.effective_at}` : ""}`
+  );
+}
+
+function formatCorrectionClass(cls: CorrectionClassSummary): string {
+  const header = `${cls.correction_key} (${cls.source_kind}/${cls.failure_class}/${cls.stage ?? "no-stage"}): ` +
+    `${cls.distinct_corrections} correction(s)${cls.repeated ? ", repeated" : ""}; ` +
+    `first ${cls.first_seen_at}; last ${cls.last_seen_at}`;
+  if (!cls.recurrence) return `${header}; unattributed`;
+  const parts: string[] = [header];
+  if (cls.recurrence.attribution) {
+    const ttc = cls.recurrence.time_to_control_ms === null ? "n/a" : formatMs(cls.recurrence.time_to_control_ms);
+    parts.push(`control: ${formatAttributionSummary(cls.recurrence.attribution)}; time-to-control ${ttc}; status ${cls.recurrence.status}`);
+  } else {
+    parts.push("control history superseded/rolled back; class currently unattributed");
+  }
+  for (const sup of cls.recurrence.superseded) {
+    parts.push(`  superseded: ${formatAttributionSummary(sup)}`);
+  }
+  return parts.join("; ");
+}
+
+function appendCorrectionsSection(
+  lines: string[],
+  corrections: CorrectionMetrics,
+  correctionsBy?: CorrectionsByDimension,
+  grouping?: CorrectionGrouping,
+): void {
+  lines.push("Repeat corrections:");
+  lines.push(`  ${formatCorrectionTotalsLine(corrections)}`);
+  lines.push("  Classes:");
+  if (corrections.classes.length === 0) {
+    lines.push("    (no correction_event records in this window)");
+  } else {
+    for (const cls of corrections.classes) {
+      lines.push(`    ${formatCorrectionClass(cls)}`);
+    }
+  }
+  lines.push("  Top still-recurring classes:");
+  if (corrections.top_still_recurring.length === 0) {
+    lines.push("    (none)");
+  } else {
+    for (const cls of corrections.top_still_recurring) {
+      lines.push(`    ${formatCorrectionClass(cls)}`);
+      const evidence = cls.recurrence?.recurrence_evidence ?? [];
+      for (const pointer of evidence) {
+        lines.push(`      evidence: ${pointer.evidence_ref.kind}:${pointer.evidence_ref.id} (${pointer.correction_id} @ ${pointer.at})`);
+      }
+    }
+  }
+  if (correctionsBy && grouping) {
+    lines.push(`  Grouped by ${correctionsBy}:`);
+    if (grouping.groups.length === 0) {
+      lines.push("    (no corrections recorded)");
+    } else {
+      for (const group of grouping.groups) {
+        lines.push(
+          `    ${group.key}: total ${group.total_corrections}; distinct classes ${group.distinct_classes}; ` +
+            `repeated ${group.repeated_class_count}; recurred ${group.recurred_classes}; ` +
+            `no-recurrence ${group.no_recurrence_observed_classes}; insufficient-evidence ${group.insufficient_evidence_classes}; ` +
+            `unattributed ${group.unattributed_classes}`,
+        );
+      }
+    }
+  }
 }
 
 function formatRate(value: RateValue): string {
@@ -1950,12 +2581,42 @@ ${htmlRow("Eval pass rate", formatGate(metrics.gate_pass_rates.eval))}
 ${htmlRow("Shipcheck pass rate", formatGate(metrics.gate_pass_rates.shipcheck))}
 </table>
 ${period.by && period.grouping ? renderGroupingSection(period.by, period.grouping) : ""}
+${period.corrections ? `<h3>Repeat corrections</h3><p>${escapeHtml(formatCorrectionTotalsLine(period.corrections))}</p>` : ""}
 </section>`;
 }
 
 function renderGroupingSection(by: ScoreboardGroupBy, grouping: ScoreboardGrouping): string {
   return `<h3>Grouped by ${escapeHtml(by)}</h3>
 ${htmlListOrEmpty(grouping.groups.map(formatGroupEntry), "(no stage accounting records)")}`;
+}
+
+function renderCorrectionsSection(
+  corrections: CorrectionMetrics,
+  correctionsBy?: CorrectionsByDimension,
+  grouping?: CorrectionGrouping,
+): string {
+  const classItems = corrections.classes.map(formatCorrectionClass);
+  const topItems = corrections.top_still_recurring.map(formatCorrectionClass);
+  const groupingHtml = correctionsBy && grouping
+    ? `<h3>Grouped by ${escapeHtml(correctionsBy)}</h3>${htmlListOrEmpty(
+        grouping.groups.map(
+          (g) =>
+            `${g.key}: total ${g.total_corrections}; distinct classes ${g.distinct_classes}; repeated ${g.repeated_class_count}; ` +
+            `recurred ${g.recurred_classes}; no-recurrence ${g.no_recurrence_observed_classes}; ` +
+            `insufficient-evidence ${g.insufficient_evidence_classes}; unattributed ${g.unattributed_classes}`,
+        ),
+        "(no corrections recorded)",
+      )}`
+    : "";
+  return `<section>
+<h2>Repeat corrections</h2>
+<p>${escapeHtml(formatCorrectionTotalsLine(corrections))}</p>
+<h3>Classes</h3>
+${htmlListOrEmpty(classItems, "(no correction_event records in this window)")}
+<h3>Top still-recurring classes</h3>
+${htmlListOrEmpty(topItems, "(none)")}
+${groupingHtml}
+</section>`;
 }
 
 function renderDiagnosticsSection(diagnostics: ScoreboardDiagnostic[]): string {
@@ -1995,6 +2656,9 @@ ${htmlRow("Report window", `${escapeHtml(report.window.since)} to ${escapeHtml(r
   ];
   if (report.by && report.grouping) {
     sections.push(`<section>${renderGroupingSection(report.by, report.grouping)}</section>`);
+  }
+  if (report.corrections) {
+    sections.push(renderCorrectionsSection(report.corrections, report.correctionsBy, report.correctionsGrouping));
   }
   sections.push(renderDiagnosticsSection(report.diagnostics));
   if (report.bucket && report.series) {

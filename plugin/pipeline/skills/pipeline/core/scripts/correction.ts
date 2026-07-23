@@ -10,7 +10,9 @@
 // `emitHumanIntervention` (intervention.ts) currently bypasses.
 
 import { createHash } from "node:crypto";
+import * as path from "node:path";
 import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
+import { artifactSubdir, CONTROL_ATTRIBUTIONS_ARTIFACT } from "./artifact-ignore.ts";
 import {
   appendEvent,
   defaultRunStoreDeps,
@@ -403,4 +405,215 @@ export function validateCorrectionEvent(raw: unknown): CorrectionEventValidation
     return { ok: false, error: "correction_event has a malformed evidence_ref" };
   }
   return { ok: true, event: raw as CorrectionEvent };
+}
+
+// ---------------------------------------------------------------------------
+// control_attribution (#501): a durable, explicit, audited record linking a
+// correction_key to the control that resolved it. Written only by the
+// explicit `pipeline correction attribute` command — never inferred from an
+// issue close or PR merge. Lives in its own repo-level, append-only ledger
+// (`.agent-pipeline/control-attributions.jsonl`), not a per-run artifact,
+// since attribution is a factory-level fact rather than something scoped to
+// one run.
+// ---------------------------------------------------------------------------
+
+export const CONTROL_ATTRIBUTION_DISPOSITIONS = [
+  "implemented",
+  "human-owned",
+  "rejected",
+  "superseded",
+] as const;
+export type ControlAttributionDisposition = (typeof CONTROL_ATTRIBUTION_DISPOSITIONS)[number];
+
+export interface ControlAttribution {
+  schema_version: 1;
+  type: "control_attribution";
+  at: string;
+  attribution_id: string;
+  correction_key: string;
+  control_type: CorrectionProposedControl;
+  disposition: ControlAttributionDisposition;
+  issue: number | null;
+  pr: number | null;
+  effective_commit: string | null;
+  effective_release: string | null;
+  effective_at: string | null;
+  supersedes: string | null;
+  evidence_ref: EvidenceRef;
+  note: string;
+}
+
+/** Absolute path of the durable, repo-level control-attribution ledger. A
+ *  single append-only file (not a per-run directory) — see the module
+ *  comment above. */
+export function controlAttributionsPath(repoDir: string): string {
+  return artifactSubdir(repoDir, CONTROL_ATTRIBUTIONS_ARTIFACT);
+}
+
+/**
+ * Pure hash of an attribution's identifying fields, so re-recording the same
+ * attribution (crash-and-retry, replay) is idempotent — a consumer deduping
+ * by `attribution_id` collapses the duplicates to one logical attribution.
+ * Two attributions that differ in any identifying field produce distinct ids.
+ */
+export function deriveAttributionId(args: {
+  correction_key: string;
+  control_type: CorrectionProposedControl;
+  disposition: ControlAttributionDisposition;
+  issue?: number | null;
+  pr?: number | null;
+  effective_commit?: string | null;
+  effective_release?: string | null;
+}): string {
+  const basis = [
+    args.correction_key,
+    args.control_type,
+    args.disposition,
+    String(args.issue ?? ""),
+    String(args.pr ?? ""),
+    args.effective_commit ?? "",
+    args.effective_release ?? "",
+  ].join(FS);
+  return createHash("sha1").update(basis).digest("hex").slice(0, 16);
+}
+
+const ATTRIBUTION_NOTE_CAP = 500;
+
+/** An `effective_at` timestamp records the recurrence boundary — it is set
+ *  only when this record ships an effective control: a plain `implemented`
+ *  disposition, or a `superseded` record that itself names the replacement
+ *  control's effective commit/release (recording the supersession and its
+ *  own effective control in one append). `human-owned`/`rejected` (and a
+ *  bare `superseded` record with no replacement-control evidence) set no
+ *  boundary. */
+function resolveEffectiveAt(
+  disposition: ControlAttributionDisposition,
+  effectiveCommit: string | null,
+  effectiveRelease: string | null,
+  at: string,
+): string | null {
+  if (disposition === "implemented") return at;
+  if (disposition === "superseded" && (effectiveCommit !== null || effectiveRelease !== null)) return at;
+  return null;
+}
+
+export interface EmitControlAttributionPayload {
+  correction_key: string;
+  control_type: CorrectionProposedControl;
+  disposition: ControlAttributionDisposition;
+  issue?: number | null;
+  pr?: number | null;
+  effective_commit?: string | null;
+  effective_release?: string | null;
+  supersedes?: string | null;
+  evidence_ref?: EvidenceRef;
+  note?: string;
+}
+
+/**
+ * Build, sanitize, and append one `control_attribution` record to the
+ * durable repo-level ledger. Mirrors `emitCorrectionEvent`'s sanitization and
+ * non-fatal discipline: `note`/`evidence_ref.id` are screened through the
+ * injection denylist and secret redaction, and an append failure is caught,
+ * logged as a warning, and never propagates. Returns whether the record was
+ * actually durably appended, so the `correction attribute` CLI can avoid
+ * reporting success on a silent failure.
+ */
+export async function emitControlAttribution(
+  repoDir: string,
+  payload: EmitControlAttributionPayload,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<boolean> {
+  try {
+    const at = nowIso();
+    const issue = payload.issue ?? null;
+    const pr = payload.pr ?? null;
+    const effectiveCommit = payload.effective_commit ?? null;
+    const effectiveRelease = payload.effective_release ?? null;
+    const rawEvidenceRef = payload.evidence_ref ?? { kind: "comment", id: "" };
+    const evidenceRef: EvidenceRef = {
+      kind: rawEvidenceRef.kind,
+      id: sanitize(redactSecrets(rawEvidenceRef.id)),
+    };
+    const note = sanitize(redactSecrets((payload.note ?? "").slice(0, ATTRIBUTION_NOTE_CAP)));
+
+    const record: ControlAttribution = {
+      schema_version: RUN_SCHEMA_VERSION as 1,
+      type: "control_attribution",
+      at,
+      attribution_id: deriveAttributionId({
+        correction_key: payload.correction_key,
+        control_type: payload.control_type,
+        disposition: payload.disposition,
+        issue,
+        pr,
+        effective_commit: effectiveCommit,
+        effective_release: effectiveRelease,
+      }),
+      correction_key: payload.correction_key,
+      control_type: payload.control_type,
+      disposition: payload.disposition,
+      issue,
+      pr,
+      effective_commit: effectiveCommit,
+      effective_release: effectiveRelease,
+      effective_at: resolveEffectiveAt(payload.disposition, effectiveCommit, effectiveRelease, at),
+      supersedes: payload.supersedes ?? null,
+      evidence_ref: evidenceRef,
+      note,
+    };
+
+    const ledgerPath = controlAttributionsPath(repoDir);
+    await deps.mkdir(path.dirname(ledgerPath), { recursive: true });
+    await deps.appendFile(ledgerPath, `${JSON.stringify(record)}\n`);
+    return true;
+  } catch (err) {
+    console.warn(
+      `[pipeline] correction: emitControlAttribution failed (non-fatal): ${(err as Error).message}`,
+    );
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Report-side visible failure (#501): validate a control_attribution record
+// read back from the durable ledger before a consumer (the scoreboard) trusts
+// it, mirroring validateCorrectionEvent's tolerant-but-visible discipline.
+// ---------------------------------------------------------------------------
+
+export type ControlAttributionValidation =
+  | { ok: true; attribution: ControlAttribution }
+  | { ok: false; error: string };
+
+export function validateControlAttribution(raw: unknown): ControlAttributionValidation {
+  if (!raw || typeof raw !== "object") {
+    return { ok: false, error: "control_attribution is not an object" };
+  }
+  const r = raw as Record<string, unknown>;
+  if (r.type !== "control_attribution") {
+    return { ok: false, error: `expected type "control_attribution", got ${JSON.stringify(r.type)}` };
+  }
+  if (r.schema_version !== 1) {
+    return { ok: false, error: `unknown control_attribution schema_version: ${JSON.stringify(r.schema_version)}` };
+  }
+  const requiredStrings: (keyof ControlAttribution)[] = [
+    "at", "attribution_id", "correction_key", "control_type", "disposition", "evidence_ref",
+  ];
+  for (const field of requiredStrings) {
+    if (r[field] === undefined || r[field] === null) {
+      return { ok: false, error: `control_attribution missing required field "${field}"` };
+    }
+  }
+  if (!(CORRECTION_PROPOSED_CONTROLS as readonly string[]).includes(r.control_type as string)) {
+    return { ok: false, error: `control_attribution has an invalid control_type: ${JSON.stringify(r.control_type)}` };
+  }
+  if (!(CONTROL_ATTRIBUTION_DISPOSITIONS as readonly string[]).includes(r.disposition as string)) {
+    return { ok: false, error: `control_attribution has an invalid disposition: ${JSON.stringify(r.disposition)}` };
+  }
+  const evidenceRef = r.evidence_ref as Record<string, unknown> | null;
+  if (!evidenceRef || typeof evidenceRef !== "object" || typeof evidenceRef.id !== "string" ||
+    !(EVIDENCE_REF_KINDS as readonly string[]).includes(evidenceRef.kind as string)) {
+    return { ok: false, error: "control_attribution has a malformed evidence_ref" };
+  }
+  return { ok: true, attribution: raw as ControlAttribution };
 }

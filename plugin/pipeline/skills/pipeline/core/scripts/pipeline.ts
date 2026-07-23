@@ -105,15 +105,18 @@ import * as autoRecover from "./stages/auto_recover.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
 import {
   emitCorrectionEvent,
+  emitControlAttribution,
   CORRECTION_HUMAN_SOURCE_KINDS,
   CORRECTION_FAILURE_CLASSES,
   CORRECTION_REUSABLE,
   CORRECTION_PROPOSED_CONTROLS,
+  CONTROL_ATTRIBUTION_DISPOSITIONS,
   EVIDENCE_REF_KINDS,
   type CorrectionFailureClass,
   type CorrectionProposedControl,
   type CorrectionReusable,
   type CorrectionSourceKind,
+  type ControlAttributionDisposition,
   type EvidenceRefKind,
 } from "./correction.ts";
 import {
@@ -296,6 +299,24 @@ export interface CliOpts {
   reviewedSha?: string;
   /** correction record: optional current head SHA at record time. */
   headSha?: string;
+  /** correction attribute: the correction_key (from a correction_event) this control resolves. */
+  correctionKey?: string;
+  /** correction attribute: bounded control type (instruction|skill-rubric|eval|deterministic-gate|human-judgment). */
+  controlType?: string;
+  /** correction attribute: bounded disposition (implemented|human-owned|rejected|superseded). */
+  disposition?: string;
+  /** correction attribute: the PR that shipped the control. */
+  pr?: number;
+  /** correction attribute: optional commit SHA the control became effective at. */
+  effectiveCommit?: string;
+  /** correction attribute: optional release/tag the control became effective at. */
+  effectiveRelease?: string;
+  /** correction attribute: optional attribution_id this record supersedes. */
+  supersedes?: string;
+  /** correction attribute: optional bounded free-text note. */
+  note?: string;
+  /** scoreboard: group correction/recurrence metrics by a single correction dimension. */
+  correctionsBy?: string[];
 }
 
 /**
@@ -399,7 +420,20 @@ export function buildCmd(): Command {
     .option("--reusable <value>", `correction record: ${CORRECTION_REUSABLE.join("|")}`)
     .option("--proposed-control <control>", `correction record: optional — ${CORRECTION_PROPOSED_CONTROLS.join("|")}`)
     .option("--reviewed-sha <sha>", "correction record: optional — the SHA the corrected evidence was reviewed against")
-    .option("--head-sha <sha>", "correction record: optional — the current head SHA at record time");
+    .option("--head-sha <sha>", "correction record: optional — the current head SHA at record time")
+    // correction attribute (#501): a narrow, non-mutating CLI that records one
+    // control_attribution against the durable repo-level attribution ledger.
+    // Same authority boundary as `correction record` — no advance/unblock/
+    // override/merge/deploy path, no GitHub call.
+    .option("--correction-key <key>", "correction attribute: the correction_key (from a correction_event) this control resolves")
+    .option("--control-type <type>", `correction attribute: ${CORRECTION_PROPOSED_CONTROLS.join("|")}`)
+    .option("--disposition <value>", `correction attribute: ${CONTROL_ATTRIBUTION_DISPOSITIONS.join("|")}`)
+    .option("--pr <n>", "correction attribute: the PR that shipped the control", Number)
+    .option("--effective-commit <sha>", "correction attribute: optional — the commit SHA the control became effective at")
+    .option("--effective-release <tag>", "correction attribute: optional — the release/tag the control became effective at")
+    .option("--supersedes <attribution-id>", "correction attribute: optional — the attribution_id this record supersedes")
+    .option("--note <text>", "correction attribute: optional bounded free-text note")
+    .option("--corrections-by <dimension>", "scoreboard: group correction/recurrence metrics by repo|stage|harness|model|source_kind|failure_class|proposed_control|implemented_control; repeatable (to detect a duplicate flag)", collectRepeatable, []);
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate/sync` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -516,7 +550,7 @@ async function main(): Promise<void> {
   }
   if (rawArgs[0] === "scoreboard" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
     process.stdout.write(
-      "Usage: pipeline scoreboard [--since <date>] [--until <date>] [--days <n>] [--estimate-cost <harness=usd>] [--bucket <unit>] [--by <dimension>] [--html <path>] [--json]\n\n" +
+      "Usage: pipeline scoreboard [--since <date>] [--until <date>] [--days <n>] [--estimate-cost <harness=usd>] [--bucket <unit>] [--by <dimension>] [--corrections-by <dimension>] [--html <path>] [--json]\n\n" +
       "Read-only factory report: scans .agent-pipeline/runs/*/{run.json,events.jsonl,summary.json}\n" +
       "and prints throughput, autonomy, cost, duration, retry, blocker, fallback, and gate metrics.\n\n" +
       "Options:\n" +
@@ -526,6 +560,7 @@ async function main(): Promise<void> {
       "  --estimate-cost <harness=usd>  estimate missing per-call cost; repeatable\n" +
       "  --bucket <unit>             add a chronological day|week time-series (default: none)\n" +
       "  --by <dimension>            group metrics by harness|model|effort|executor (default: none, exactly one)\n" +
+      "  --corrections-by <dimension>  group correction/recurrence metrics by repo|stage|harness|model|source_kind|failure_class|proposed_control|implemented_control (default: none, exactly one)\n" +
       "  --html <path>               write a self-contained, offline HTML export of the report to this path (local/archival only)\n" +
       "  --json                      emit one unfenced JSON object\n" +
       "  --repo-path <path>          override the target repo working tree\n\n" +
@@ -960,12 +995,83 @@ async function main(): Promise<void> {
   if (numArg === "correction") {
     const correctionStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
     const repoDir = findGitRoot(correctionStart) ?? correctionStart;
+
+    // `pipeline correction attribute` (#501) — a narrow, non-mutating command
+    // that appends exactly one control_attribution to the durable repo-level
+    // ledger. Unlike `correction record`, this is never scoped to a run — a
+    // control_attribution links a correction_key (a factory-level class) to
+    // its control, not to any one run — so it needs no run lookup at all.
+    if (cmd.args[1] === "attribute") {
+      const attrMissing: string[] = [];
+      if (!opts.correctionKey) attrMissing.push("--correction-key");
+      if (!opts.controlType) attrMissing.push("--control-type");
+      if (!opts.disposition) attrMissing.push("--disposition");
+      if (attrMissing.length > 0) {
+        console.error(`pipeline correction attribute: missing required field(s): ${attrMissing.join(", ")}`);
+        process.exitCode = 2;
+        return;
+      }
+      if (!(CORRECTION_PROPOSED_CONTROLS as readonly string[]).includes(opts.controlType!)) {
+        console.error(`pipeline correction attribute: --control-type must be one of ${CORRECTION_PROPOSED_CONTROLS.join("|")}`);
+        process.exitCode = 2;
+        return;
+      }
+      if (!(CONTROL_ATTRIBUTION_DISPOSITIONS as readonly string[]).includes(opts.disposition!)) {
+        console.error(`pipeline correction attribute: --disposition must be one of ${CONTROL_ATTRIBUTION_DISPOSITIONS.join("|")}`);
+        process.exitCode = 2;
+        return;
+      }
+      let evidenceRefKind: string | undefined;
+      let evidenceRefId: string | undefined;
+      if (opts.evidenceRef !== undefined) {
+        const evidenceSep = opts.evidenceRef.indexOf(":");
+        if (evidenceSep === -1) {
+          console.error('pipeline correction attribute: --evidence-ref must be "<kind>:<id>"');
+          process.exitCode = 2;
+          return;
+        }
+        evidenceRefKind = opts.evidenceRef.slice(0, evidenceSep);
+        evidenceRefId = opts.evidenceRef.slice(evidenceSep + 1);
+        if (!(EVIDENCE_REF_KINDS as readonly string[]).includes(evidenceRefKind)) {
+          console.error(`pipeline correction attribute: --evidence-ref kind must be one of ${EVIDENCE_REF_KINDS.join("|")}`);
+          process.exitCode = 2;
+          return;
+        }
+      }
+
+      const attributed = await emitControlAttribution(repoDir, {
+        correction_key: opts.correctionKey!,
+        control_type: opts.controlType as CorrectionProposedControl,
+        disposition: opts.disposition as ControlAttributionDisposition,
+        issue: opts.issue ?? null,
+        pr: opts.pr ?? null,
+        effective_commit: opts.effectiveCommit ?? null,
+        effective_release: opts.effectiveRelease ?? null,
+        supersedes: opts.supersedes ?? null,
+        ...(evidenceRefKind !== undefined
+          ? { evidence_ref: { kind: evidenceRefKind as EvidenceRefKind, id: evidenceRefId! } }
+          : {}),
+        note: opts.note ?? "",
+      }, defaultRunStoreDeps);
+      if (!attributed) {
+        console.error(`pipeline correction attribute: failed to append control_attribution to ${repoDir}.`);
+        process.exitCode = 1;
+        return;
+      }
+      process.exitCode = 0;
+      return;
+    }
+
     if (cmd.args[1] !== "record") {
       console.error(
         'pipeline correction: unrecognized action.\n' +
           '  Usage: pipeline correction record --issue <N> --source-kind <kind> --failure-class <class> ' +
           '--stage <stage> --evidence-ref <kind:id> --correction-text <text> --reusable <yes|no|unknown> ' +
-          '[--proposed-control <control>] [--run-id <id>]',
+          '[--proposed-control <control>] [--run-id <id>]\n' +
+          '     or: pipeline correction attribute --correction-key <key> --control-type <type> ' +
+          '--disposition <implemented|human-owned|rejected|superseded> [--issue <n>] [--pr <n>] ' +
+          '[--effective-commit <sha>] [--effective-release <tag>] [--supersedes <attribution-id>] ' +
+          '[--evidence-ref <kind:id>] [--note <text>]',
       );
       process.exitCode = 2;
       return;
@@ -1120,6 +1226,7 @@ async function main(): Promise<void> {
           estimateCost: opts.estimateCost,
           bucket: opts.bucket,
           by: opts.by,
+          correctionsBy: opts.correctionsBy,
           html: opts.html,
         },
         realScoreboardDeps(),

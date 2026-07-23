@@ -14,11 +14,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 export interface ArtifactContractEntry {
-  /** Directory name under `.agent-pipeline/` (no slashes, no leading/trailing slash). */
+  /** Directory (or, when `isFile` is set, file) name under `.agent-pipeline/`
+   *  (no slashes, no leading/trailing slash). */
   name: string;
-  /** Human-readable line describing what the directory holds, rendered as a
-   *  comment immediately above this entry's ignore path. */
+  /** Human-readable line describing what the directory/file holds, rendered
+   *  as a comment immediately above this entry's ignore path. */
   comment: string;
+  /** When true, `name` is a single file rather than a directory: the
+   *  rendered ignore path omits the trailing slash. Defaults to false
+   *  (directory). */
+  isFile?: boolean;
 }
 
 export const RUNS_ARTIFACT: ArtifactContractEntry = {
@@ -41,14 +46,25 @@ export const EVALS_ARTIFACT: ArtifactContractEntry = {
   comment: "Stage-eval-runner experiment output (manifest/plan/runs/failures); local-only, never committed.",
 };
 
-/** Ordered contract of every `.agent-pipeline/` directory the engine writes.
- *  No other module SHALL independently define an `.agent-pipeline/` artifact
- *  directory path — derive it from an entry here instead. */
+/** Durable append-only control-attribution ledger (#501): a single file, not
+ *  a per-run directory — attributions are factory-level facts, not scoped to
+ *  one run, and are written only by the explicit `pipeline correction
+ *  attribute` command. Local-only, never committed. */
+export const CONTROL_ATTRIBUTIONS_ARTIFACT: ArtifactContractEntry = {
+  name: "control-attributions.jsonl",
+  comment: "Durable control-attribution ledger written by `pipeline correction attribute`; local-only, never committed.",
+  isFile: true,
+};
+
+/** Ordered contract of every `.agent-pipeline/` directory (or file) the
+ *  engine writes. No other module SHALL independently define an
+ *  `.agent-pipeline/` artifact path — derive it from an entry here instead. */
 export const ARTIFACT_CONTRACT: readonly ArtifactContractEntry[] = [
   RUNS_ARTIFACT,
   ROADMAP_ARTIFACT,
   HISTORY_ARTIFACT,
   EVALS_ARTIFACT,
+  CONTROL_ATTRIBUTIONS_ARTIFACT,
 ];
 
 /** Resolve `<repoDir>/.agent-pipeline/<entry.name>` for a contract entry. */
@@ -57,7 +73,7 @@ export function artifactSubdir(repoDir: string, entry: ArtifactContractEntry): s
 }
 
 function ignorePathFor(entry: ArtifactContractEntry): string {
-  return `.agent-pipeline/${entry.name}/`;
+  return entry.isFile ? `.agent-pipeline/${entry.name}` : `.agent-pipeline/${entry.name}/`;
 }
 
 const SENTINEL_OPEN = "# >>> agent-pipeline artifacts (managed by `pipeline init`) >>>";
