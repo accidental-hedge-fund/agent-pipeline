@@ -1820,12 +1820,30 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
   const loopCfg = { ...d.loop, ...config.loop };
   const papercuts = { ...d.papercuts, ...config.papercuts };
   const autoLoop = { ...d.auto_loop, ...config.auto_loop };
+  const designGate = { ...d.design_gate, ...config.design_gate, limits: { ...d.design_gate.limits, ...config.design_gate?.limits } };
+  const autoMergeEligibility = { ...d.auto_merge_eligibility, ...config.auto_merge_eligibility };
 
   const optionalTop: string[] = [];
-  if (config.repo !== undefined) optionalTop.push(renderMaybeScalar("repo", config.repo, "GitHub repo override (owner/name)"));
-  if (config.domain_name !== undefined) optionalTop.push(renderMaybeScalar("domain_name", config.domain_name, "human-readable project name used in prompts"));
-  if (config.domain_description !== undefined) optionalTop.push(renderMaybeScalar("domain_description", config.domain_description, "short project description used in prompts"));
-  if (config.conventions_md_path !== undefined) optionalTop.push(renderMaybeScalar("conventions_md_path", config.conventions_md_path, "repo-root-relative conventions file embedded in prompts"));
+  optionalTop.push(
+    config.repo !== undefined
+      ? renderMaybeScalar("repo", config.repo, "GitHub repo override (owner/name)")
+      : '# repo: "owner/name" # GitHub repo override; auto-detected from the git remote when absent',
+  );
+  optionalTop.push(
+    config.domain_name !== undefined
+      ? renderMaybeScalar("domain_name", config.domain_name, "human-readable project name used in prompts")
+      : '# domain_name: "My Project" # human-readable project name used in prompts; absent (default): no name substituted',
+  );
+  optionalTop.push(
+    config.domain_description !== undefined
+      ? renderMaybeScalar("domain_description", config.domain_description, "short project description used in prompts")
+      : '# domain_description: "Short description of what this repo does" # used in prompts; absent by default',
+  );
+  optionalTop.push(
+    config.conventions_md_path !== undefined
+      ? renderMaybeScalar("conventions_md_path", config.conventions_md_path, "repo-root-relative conventions file embedded in prompts")
+      : '# conventions_md_path: "CONVENTIONS.md" # repo-root-relative conventions file embedded in stage prompts; absent by default (no conventions file embedded)',
+  );
 
   const reviewPolicyOptional: string[] = [];
   if (hasOwn(config.review_policy, "risk_proportional")) {
@@ -1848,9 +1866,11 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     source === "init"
       ? "# Pipeline configuration for this repo — created by `pipeline init`."
       : "# Pipeline configuration for this repo — synced with `pipeline config sync`.",
-    "# Every key is shown at its current default value; edit any line to override.",
-    "# Delete a key to fall back to the built-in default. Lines that are commented",
-    "# out (e.g. the `command:` entries) are optional overrides — uncomment to set.",
+    "# Every option accepted by the config schema is documented below: either active",
+    "# at its resolved default value, or shown commented-out as an opt-in example with",
+    "# its default/absence semantics explained. Edit an active line to override; delete",
+    "# it to fall back to the built-in default. Uncomment any commented example to opt",
+    "# in — every example as written is schema-valid.",
     "",
     ...optionalTop,
     optionalTop.length ? "" : undefined,
@@ -1888,6 +1908,34 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     `  standard_review: ${yamlScalar(steps.standard_review)} # review-1 (and its fix round)`,
     `  adversarial_review: ${yamlScalar(steps.adversarial_review)} # review-2 (and its fix round)`,
     `  docs: ${yamlScalar(steps.docs)} # include the docs-update instruction in the implementing prompt`,
+    "",
+    config.design_gate !== undefined
+      ? [
+        "design_gate: # risk-triggered design-interrogation gate (#436)",
+        `  enabled: ${yamlScalar(designGate.enabled)} # set true to enable`,
+        `  triggers: ${yamlInline(designGate.triggers)} # built-in risk classes armed for trigger evaluation; known: ${DESIGN_GATE_TRIGGER_CLASSES.join(", ")}`,
+        `  extra_triggers: ${yamlInline(designGate.extra_triggers)} # {trigger_class: [path globs]} merged into a named class`,
+        `  max_rounds: ${yamlScalar(designGate.max_rounds)} # interrogation/response rounds before parking at needs-human`,
+        `  block_threshold: ${yamlScalar(designGate.block_threshold)} # critical|high|medium|low — challenges at/above this block advancement`,
+        `  min_confidence: ${yamlScalar(designGate.min_confidence)} # 0..1 — challenges below this confidence advise, not block`,
+        "  limits: # size bounds for the decision-record artifact",
+        `    max_decisions: ${yamlScalar(designGate.limits.max_decisions)} # max decisions retained per record`,
+        `    max_field_chars: ${yamlScalar(designGate.limits.max_field_chars)} # max characters per free-text field before truncation`,
+        `    max_artifact_bytes: ${yamlScalar(designGate.limits.max_artifact_bytes)} # max persisted artifact size in bytes`,
+      ].join("\n")
+      : [
+        "# design_gate: # risk-triggered design-interrogation gate (#436). Disabled by default.",
+        `#   enabled: ${yamlScalar(d.design_gate.enabled)} # set true to enable`,
+        `#   triggers: ${yamlInline(d.design_gate.triggers)} # built-in risk classes armed for trigger evaluation; known: ${DESIGN_GATE_TRIGGER_CLASSES.join(", ")}`,
+        '#   extra_triggers: {} # {trigger_class: [path globs]} merged into a named class, e.g. {storage: ["db/migrations/**"]}',
+        `#   max_rounds: ${yamlScalar(d.design_gate.max_rounds)} # interrogation/response rounds before parking at needs-human`,
+        `#   block_threshold: ${yamlScalar(d.design_gate.block_threshold)} # critical|high|medium|low — challenges at/above this block advancement`,
+        `#   min_confidence: ${yamlScalar(d.design_gate.min_confidence)} # 0..1 — challenges below this confidence advise, not block`,
+        "#   limits: # size bounds for the decision-record artifact",
+        `#     max_decisions: ${yamlScalar(d.design_gate.limits.max_decisions)} # max decisions retained per record`,
+        `#     max_field_chars: ${yamlScalar(d.design_gate.limits.max_field_chars)} # max characters per free-text field before truncation`,
+        `#     max_artifact_bytes: ${yamlScalar(d.design_gate.limits.max_artifact_bytes)} # max persisted artifact size in bytes`,
+      ].join("\n"),
     "",
     "test_gate: # run the repo's tests/build before opening a PR",
     `  enabled: ${yamlScalar(testGate.enabled)} # set false to disable entirely`,
@@ -1966,27 +2014,27 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     "",
     config.auto_loop !== undefined
       ? [
-        "auto_loop: # bounded auto-loop mode (#149)",
+        "auto_loop: # bounded auto-loop mode (#149) — SECURITY: grants automatic continuation authority at allowlisted stages within bounded rounds/wall-clock; never grants merge/deploy/publish authority or bypasses a human checkpoint",
         `  enabled: ${yamlScalar(autoLoop.enabled)} # set true to enable`,
         `  max_rounds: ${yamlScalar(autoLoop.max_rounds)} # maximum automatic continuations per run before parking at needs-human`,
         `  max_wallclock_minutes: ${yamlScalar(autoLoop.max_wallclock_minutes)} # wall-clock budget in minutes (independent of max_rounds)`,
         `  stages: ${yamlInline(autoLoop.stages)} # allowlisted stages eligible for automatic continuation`,
       ].join("\n")
       : [
-        "# auto_loop: # bounded auto-loop mode (#149) — opt-in; disabled by default",
+        "# auto_loop: # bounded auto-loop mode (#149) — opt-in; disabled by default. SECURITY: grants automatic continuation authority at allowlisted stages within bounded rounds/wall-clock; never grants merge/deploy/publish authority or bypasses a human checkpoint.",
         `#   enabled: ${yamlScalar(d.auto_loop.enabled)} # set true to enable; when false (default) the advance loop is byte-for-byte unchanged`,
         `#   max_rounds: ${yamlScalar(d.auto_loop.max_rounds)} # maximum automatic continuations per run before parking at needs-human`,
         `#   max_wallclock_minutes: ${yamlScalar(d.auto_loop.max_wallclock_minutes)} # wall-clock budget in minutes (independent of max_rounds)`,
-        "#   # stages: [eval-gate, shipcheck-gate] # allowlisted stages eligible for automatic continuation",
+        "#   stages: [eval-gate, shipcheck-gate] # allowlisted stages eligible for automatic continuation",
         "#   #   Known stages: backlog, ready, planning, plan-review, implementing,",
         "#   #                 review-1, fix-1, review-2, fix-2, pre-merge, eval-gate,",
         "#   #                 shipcheck-gate, ready-to-deploy, needs-human",
       ].join("\n"),
     "",
     config.setup_command !== undefined
-      ? `setup_command: ${yamlScalar(config.setup_command)} # shell command to run in the worktree after creation, before the test gate; empty string skips`
+      ? `setup_command: ${yamlScalar(config.setup_command)} # SECURITY: runs an arbitrary shell command in the worktree with the harness's permissions, before the test gate; empty string skips`
       : [
-        '# setup_command: "pnpm install" # shell command to run in the worktree after creation, before the test gate (#174)',
+        '# setup_command: "pnpm install" # shell command to run in the worktree after creation, before the test gate (#174). SECURITY: runs with the harness\'s permissions — treat like any other repo-controlled build step.',
         "#   Auto-detected from lockfile when absent (pnpm-lock.yaml -> pnpm install, yarn.lock -> yarn install, package-lock.json -> npm ci)",
         '#   Set to "" to skip the install step entirely (opt-out). Examples:',
         '#     setup_command: ""                                       # opt-out',
@@ -1995,9 +2043,9 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       ].join("\n"),
     "",
     config.build_command !== undefined
-      ? `build_command: ${yamlScalar(config.build_command)} # shell command run after fix/auto-fix edits; its output is folded into the round commit`
+      ? `build_command: ${yamlScalar(config.build_command)} # SECURITY: runs an arbitrary shell command with the harness's permissions after fix/auto-fix edits; its output is folded into the round commit`
       : [
-        '# build_command: "npm run build" # repo build command run after fix/auto-fix edits (#387)',
+        '# build_command: "npm run build" # repo build command run after fix/auto-fix edits (#387). SECURITY: runs with the harness\'s permissions — treat like any other repo-controlled build step.',
         "#   When declared, fix and auto-fix rounds run it after committing source edits and fold any",
         "#   resulting generated-artifact changes (dist/, a plugin manifest, …) into the round commit,",
         "#   so committed artifacts stay fresh and a CI artifact-drift check never fails on drift the",
@@ -2005,9 +2053,9 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       ].join("\n"),
     "",
     renderOptionalArray("format_gate", config.format_gate, [
-      "# format_gate: [] # run formatter/linter commands after the implementing and fix-round harnesses (#182)",
-      "#   Each entry runs in the worktree root. auto_fix: true commits any changes and re-runs to verify;",
-      "#   auto_fix: false blocks immediately on non-zero exit. Default: [] (no gate; existing behavior).",
+      "# format_gate: [] # run formatter/linter commands after the implementing and fix-round harnesses (#182). SECURITY: each command runs an arbitrary shell command with the harness's permissions.",
+      '#   Each entry runs in the worktree root; "auto_fix: true" commits any changes and re-runs to verify,',
+      '#   "auto_fix: false" blocks immediately on non-zero exit. Default: [] (no gate; existing behavior).',
       "#   Examples (Rust repo):",
       "#     - command: cargo fmt",
       "#       auto_fix: true",
@@ -2019,27 +2067,98 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     ]),
     "",
     config.harness_sandbox !== undefined
-      ? `harness_sandbox: ${yamlScalar(config.harness_sandbox)} # set true to run the claude implementer with --permission-mode default`
+      ? `harness_sandbox: ${yamlScalar(config.harness_sandbox)} # SECURITY: set true to run the claude implementer with --permission-mode default (sandboxed) instead of bypassPermissions`
       : [
-        "# harness_sandbox: false # set true to run the claude implementer with --permission-mode default",
+        "# harness_sandbox: false # SECURITY: set true to run the claude implementer with --permission-mode default (sandboxed)",
         "#   instead of bypassPermissions (#21). The codex harness is already sandboxed",
         "#   via --full-auto and is unaffected. Default false -> current invocation unchanged.",
       ].join("\n"),
     "",
     config.event_sink !== undefined
-      ? `event_sink: # optional external event sink (#343) — deliver run events.jsonl records to an operator-controlled forwarder\n${yamlBlock(config.event_sink, 2)}`
+      ? `event_sink: # optional external event sink (#343) — deliver run events.jsonl records to an operator-controlled forwarder. SECURITY: forwards run/stage/issue/PR event metadata to the configured command — treat it as a trusted destination.\n${yamlBlock(config.event_sink, 2)}`
       : [
-        "# event_sink: # optional external event sink (#343) — uncomment to deliver run events.jsonl records to an operator-controlled forwarder",
+        "# event_sink: # optional external event sink (#343) — uncomment to deliver run events.jsonl records to an operator-controlled forwarder. SECURITY: forwards run/stage/issue/PR event metadata to the configured command — treat it as a trusted destination.",
         '#   command: "logger -t pipeline" # forwarder command; receives each event JSON line on stdin. Unset -> no sink (local events.jsonl only, unchanged).',
         "#   mode: additive # additive (default): write events.jsonl AND deliver to the sink | exclusive: sink only (events.jsonl is not written)",
         "#   Env overrides: PIPELINE_EVENT_SINK_COMMAND, PIPELINE_EVENT_SINK_MODE (win over file config). Delivery failures are non-fatal.",
       ].join("\n"),
-    config.roadmap !== undefined ? `\nroadmap:\n${yamlBlock(config.roadmap, 2)}` : undefined,
-    config.sweep !== undefined ? `\nsweep:\n${yamlBlock(config.sweep, 2)}` : undefined,
-    config.trusted_override_actors !== undefined ? `\ntrusted_override_actors:\n${yamlBlock(config.trusted_override_actors, 2)}` : undefined,
-    config.queue !== undefined ? `\nqueue:\n${yamlBlock(config.queue, 2)}` : undefined,
-    config.auto_merge_eligibility !== undefined ? `\nauto_merge_eligibility:\n${yamlBlock(config.auto_merge_eligibility, 2)}` : undefined,
-    config.context_snapshot !== undefined ? `\ncontext_snapshot:\n${yamlBlock(config.context_snapshot, 2)}` : undefined,
+    config.roadmap !== undefined
+      ? `\nroadmap: # backlog roadmap engine overrides (#171)\n${yamlBlock(config.roadmap, 2)}`
+      : [
+        "",
+        "# roadmap: # backlog roadmap engine overrides (#171) — uncomment to override; absent (default): built-in roadmap defaults apply",
+        "#   include_labels: [] # only score issues carrying at least one of these labels (default: all)",
+        "#   exclude_labels: [] # exclude issues carrying any of these labels",
+        "#   score_weights: # multiplier overrides for each scoring sub-factor (default: 1.0 each)",
+        "#     impact: 1.0",
+        "#     confidence: 1.0",
+        "#     ease: 1.0",
+        "#     risk_reduction: 1.0",
+        "#     dep_leverage: 1.0",
+        "#   hygiene_auto_apply: false # when true, hygiene actions are applied automatically with --apply",
+        "#   pr_docs: true # when false, skip opening the roadmap.md PR",
+        "#   release_model: semver # semver (default): version-numbered release lanes | continuous: group by theme/epic",
+        "#   release_capacity: # capacity policy for the semver release model",
+        "#     effort_budget: 8 # per-milestone effort-points budget (XS=1 S=2 M=3 L=5 XL=8); an issue at/above this gets its own milestone",
+        "#     isolate_breaking: true # give each breaking-change issue its own milestone",
+        "#   inventory_concurrency: 4 # max concurrent harness calls during inventory phase",
+        "#   depgraph_concurrency: 4 # max concurrent harness calls during dependency verification",
+        "#   depgraph_verify_cap: 20 # max candidates to source-verify; excess go to open_questions",
+      ].join("\n"),
+    config.sweep !== undefined
+      ? `\nsweep: # sweep backlog maintenance thresholds (#168)\n${yamlBlock(config.sweep, 2)}`
+      : [
+        "",
+        "# sweep: # sweep backlog maintenance thresholds (#168) — uncomment to override; absent (default): built-in thresholds apply",
+        "#   min_body_length: 150 # minimum body character count for an issue to be considered sufficient",
+        '#   required_sections: ["Summary", "User story", "Acceptance criteria", "Out of scope"] # section headings (without ##) that must be present',
+      ].join("\n"),
+    config.trusted_override_actors !== undefined
+      ? `\ntrusted_override_actors: # additional GitHub identities trusted for override sentinels (#229)\n${yamlBlock(config.trusted_override_actors, 2)}`
+      : [
+        "",
+        "# trusted_override_actors: [] # additional GitHub identities whose '## Pipeline: Finding override' / '## Pipeline: Scope override' comments are trusted, besides the current pipeline actor (#229). Absent (default): only the current actor is trusted.",
+        "#   Grants override authority to each listed identity — SECURITY: it can dispose of blocking review findings without further review; keep this list minimal and audited.",
+        '#   e.g. trusted_override_actors: ["octocat"]',
+      ].join("\n"),
+    config.queue !== undefined
+      ? `\nqueue: # queue batch factory operator defaults (#305) — CLI flags override these\n${yamlBlock(config.queue, 2)}`
+      : [
+        "",
+        "# queue: # queue batch factory operator defaults (#305) — uncomment to override. Precedence: CLI flags > these values > built-in defaults. Absent by default.",
+        "#   max_issues: 10 # max issues to dispatch in a batch run",
+        "#   budget_dollars: null # stop launching new runs once cumulative cost reaches this many USD; null (default) means unlimited",
+        "#   concurrency: 1 # max simultaneously active pipeline runs",
+        "#   max_failure_rate: 1.0 # 0.0-1.0 — halt new launches once failedCount/completedCount reaches this (requires >=3 completed runs); 1.0 (default) means unlimited (never halts)",
+      ].join("\n"),
+    config.auto_merge_eligibility !== undefined
+      ? [
+        "",
+        "auto_merge_eligibility: # auto-merge eligibility classification (#306) — SECURITY: informational classification only; the pipeline never merges (#4) — a human still owns the merge button regardless of this setting",
+        `  enabled: ${yamlScalar(autoMergeEligibility.enabled)} # set true to enable`,
+        `  max_diff_lines: ${yamlScalar(autoMergeEligibility.max_diff_lines)} # hard-deny if total PR diff lines (additions+deletions) exceed this`,
+        `  max_files: ${yamlScalar(autoMergeEligibility.max_files)} # hard-deny if changed file count exceeds this`,
+        `  deny_paths: ${yamlInline(autoMergeEligibility.deny_paths)} # glob patterns that always force needs-human`,
+        `  allow_paths: ${yamlInline(autoMergeEligibility.allow_paths)} # when non-empty, any changed file outside this list forces needs-human`,
+        `  min_confidence: ${yamlScalar(autoMergeEligibility.min_confidence)} # 0..1 — LLM judge confidence floor; below this routes to needs-human`,
+      ].join("\n")
+      : [
+        "",
+        "# auto_merge_eligibility: # auto-merge eligibility classification (#306). Disabled by default. SECURITY: informational classification only — the pipeline never merges (#4); a human still owns the merge button regardless of this setting.",
+        `#   enabled: ${yamlScalar(d.auto_merge_eligibility.enabled)} # set true to enable`,
+        `#   max_diff_lines: ${yamlScalar(d.auto_merge_eligibility.max_diff_lines)} # hard-deny if total PR diff lines (additions+deletions) exceed this`,
+        `#   max_files: ${yamlScalar(d.auto_merge_eligibility.max_files)} # hard-deny if changed file count exceeds this`,
+        '#   deny_paths: [] # glob patterns that always force needs-human, e.g. ["infra/**", "**/migrations/**"]',
+        "#   allow_paths: [] # when non-empty, any changed file outside this list forces needs-human",
+        `#   min_confidence: ${yamlScalar(d.auto_merge_eligibility.min_confidence)} # 0..1 — LLM judge confidence floor; below this routes to needs-human`,
+      ].join("\n"),
+    config.context_snapshot !== undefined
+      ? `\ncontext_snapshot: # stage-aware issue context snapshot cap override (#318)\n${yamlBlock(config.context_snapshot, 2)}`
+      : [
+        "",
+        "# context_snapshot: # stage-aware issue context snapshot cap override (#318) — uncomment to override; absent (default): an 8000-character cap applies",
+        "#   max_chars: 8000 # max total character count for human comment bodies in the snapshot injected into planning/review/shipcheck prompts; oldest entries dropped first when exceeded",
+      ].join("\n"),
     config.repo_map !== undefined
       ? [
         "",
@@ -2055,12 +2174,12 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         "#   depends_on: [] # owner/repo strings this repo consumes (e.g. - acme/shared-lib)",
         "#   depended_on_by: [] # owner/repo strings that consume this repo (e.g. - acme/consumer-app)",
       ].join("\n"),
-    config.executors !== undefined ? `\nexecutors:\n${yamlBlock(config.executors, 2)}` : undefined,
+    config.executors !== undefined ? `\nexecutors: # SECURITY: delegates execution and prompt content to an external endpoint; credential is an env-var NAME, never a literal secret\n${yamlBlock(config.executors, 2)}` : undefined,
     config.stage_executors !== undefined ? `\nstage_executors:\n${yamlBlock(config.stage_executors, 2)}` : undefined,
     config.executors === undefined && config.stage_executors === undefined
       ? [
         "",
-        "# executors: # external stage executors (#314) — uncomment to delegate model-invoking stages to an external agent system or model endpoint",
+        "# executors: # external stage executors (#314) — uncomment to delegate model-invoking stages to an external agent system or model endpoint. SECURITY: the assigned stage's prompt/context is sent to this external endpoint; credential is an env-var NAME, never a literal secret.",
         "#   opencode-main:",
         "#     type: agent-system # full execution backend (OpenCode/HermesAgent/OpenClaw), valid for any model-invoking stage",
         "#     provider: opencode",
@@ -2108,6 +2227,11 @@ function normalizeForSync(config: PartialConfig): unknown {
     openspec: { ...d.openspec, ...config.openspec },
     last30days: { ...d.last30days, ...config.last30days },
     steps: { ...d.steps, ...config.steps },
+    design_gate: {
+      ...d.design_gate,
+      ...config.design_gate,
+      limits: { ...d.design_gate.limits, ...config.design_gate?.limits },
+    },
     test_gate: { ...d.test_gate, ...config.test_gate },
     eval_gate: { ...d.eval_gate, ...config.eval_gate },
     visual_gate: { ...d.visual_gate, ...config.visual_gate },
@@ -2130,7 +2254,7 @@ function normalizeForSync(config: PartialConfig): unknown {
       : undefined,
     sweep: config.sweep,
     queue: config.queue,
-    auto_merge_eligibility: config.auto_merge_eligibility,
+    auto_merge_eligibility: { ...d.auto_merge_eligibility, ...config.auto_merge_eligibility },
     context_snapshot: config.context_snapshot,
     repo_map: config.repo_map,
     event_sink: config.event_sink,
