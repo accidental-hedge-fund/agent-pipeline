@@ -280,7 +280,10 @@ test(
     const events1 = await readEvents(deps, RUN_ID);
     const scheduleEvent1 = events1.filter((e) => e.kind === "loop_schedule_evaluated")[0];
     assert.ok(scheduleEvent1, "the scheduling pass must be a durable planning record");
-    const decision1 = scheduleEvent1.data as { selected: string[]; rationale: Array<{ item_id: string; disposition: string; counterpart_item_id?: string }> };
+    const decision1 = scheduleEvent1.data as {
+      selected: string[];
+      rationale: Array<{ item_id: string; disposition: string; counterpart_item_id?: string; detail?: string }>;
+    };
     assert.deepEqual([...decision1.selected].sort(), [ITEM_A, ITEM_B], "only the proven-disjoint pair is admitted");
     const unknownRationale = decision1.rationale.find((r) => r.item_id === ITEM_UNKNOWN)!;
     assert.equal(unknownRationale.disposition, "unknown_ownership");
@@ -300,8 +303,20 @@ test(
     assert.equal(ledgerEntries.length, 3, "one ledger entry per evaluated pair: (A,B), (A,C), (A,E)");
     const byPair = new Map(ledgerEntries.map((e) => [`${e.a_item_id}:${e.b_item_id}`, e]));
     assert.deepEqual(byPair.get(`${ITEM_A}:${ITEM_B}`), { a_item_id: ITEM_A, b_item_id: ITEM_B, disposition: "parallelized", reason: "admitted" });
-    assert.deepEqual(byPair.get(`${ITEM_A}:${ITEM_UNKNOWN}`), { a_item_id: ITEM_A, b_item_id: ITEM_UNKNOWN, disposition: "serialized", reason: "unknown_ownership" });
-    assert.deepEqual(byPair.get(`${ITEM_A}:${ITEM_CONFLICT}`), { a_item_id: ITEM_A, b_item_id: ITEM_CONFLICT, disposition: "serialized", reason: "conflict_edge" });
+    assert.deepEqual(byPair.get(`${ITEM_A}:${ITEM_UNKNOWN}`), {
+      a_item_id: ITEM_A,
+      b_item_id: ITEM_UNKNOWN,
+      disposition: "serialized",
+      reason: "unknown_ownership",
+      detail: unknownRationale.detail,
+    });
+    assert.deepEqual(byPair.get(`${ITEM_A}:${ITEM_CONFLICT}`), {
+      a_item_id: ITEM_A,
+      b_item_id: ITEM_CONFLICT,
+      disposition: "serialized",
+      reason: "conflict_edge",
+      ...(conflictRationale.detail !== undefined ? { detail: conflictRationale.detail } : {}),
+    });
 
     // --- Cycle 2+: once A is done, D becomes eligible and is scheduled in a later, separate pass —
     // proving the dependency-linked pair was serialized (never concurrent), not merely delayed by

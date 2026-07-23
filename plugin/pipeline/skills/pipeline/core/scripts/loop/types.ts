@@ -453,6 +453,10 @@ export interface LoopParallelizationLedgerEntry {
   b_item_id: string;
   disposition: LoopParallelizationDisposition;
   reason: ScheduleDisposition;
+  /** The scheduler rationale's optional `detail` carried through verbatim (e.g. the conflicting
+   *  surface, `"shared_config:release.yml"`) — preserves the auditable detail behind `reason`
+   *  instead of collapsing it to the bare disposition. */
+  detail?: string;
 }
 
 /** The durable replan-request record for changed-file-overlap parking (design.md Decision 5) — an

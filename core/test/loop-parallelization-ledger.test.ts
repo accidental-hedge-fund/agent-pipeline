@@ -45,8 +45,20 @@ test("accumulateParallelizationLedger: a mixed frontier yields one entry per eva
   assert.equal(entries.length, 3, "exactly one entry per evaluated pair — (A,B), (A,C), (A,E)");
   const byPair = new Map(entries.map((e) => [`${e.a_item_id}:${e.b_item_id}`, e]));
   assert.deepEqual(byPair.get("A:B"), { a_item_id: "A", b_item_id: "B", disposition: "parallelized", reason: "admitted" });
-  assert.deepEqual(byPair.get("A:C"), { a_item_id: "A", b_item_id: "C", disposition: "serialized", reason: "unknown_ownership" });
-  assert.deepEqual(byPair.get("A:E"), { a_item_id: "A", b_item_id: "E", disposition: "serialized", reason: "conflict_edge" });
+  assert.deepEqual(byPair.get("A:C"), {
+    a_item_id: "A",
+    b_item_id: "C",
+    disposition: "serialized",
+    reason: "unknown_ownership",
+    detail: "C carries no ownership declaration",
+  });
+  assert.deepEqual(byPair.get("A:E"), {
+    a_item_id: "A",
+    b_item_id: "E",
+    disposition: "serialized",
+    reason: "conflict_edge",
+    detail: "explicit conflicts_with edge",
+  });
 });
 
 test("accumulateParallelizationLedger: a serialized pair names its structured reason (conflict-edge surface)", () => {
@@ -60,6 +72,7 @@ test("accumulateParallelizationLedger: a serialized pair names its structured re
   const [entry] = accumulateParallelizationLedger([decision]);
   assert.equal(entry.disposition, "serialized");
   assert.equal(entry.reason, "conflict_edge");
+  assert.equal(entry.detail, "shared_config:release.yml", "the conflict-edge reason's naming detail must survive into the ledger entry");
   assert.deepEqual([entry.a_item_id, entry.b_item_id].sort(), ["A", "E"]);
 });
 
