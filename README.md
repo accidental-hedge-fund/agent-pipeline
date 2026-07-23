@@ -783,6 +783,7 @@ visual_gate:                         # run the repo's E2E/visual suite after pre
   timeout: 900                       # hard stage-level budget in seconds per visual run
   max_attempts: 2                    # total visual runs (1 = no retry/fix round); gate mode: fix rounds = max_attempts - 1
   artifacts_dir: .pipeline-visual     # worktree-relative dir the command writes screenshots/diffs/traces into
+  publish: false                     # default: false; set true to commit captured artifacts to the PR branch as PR-visible evidence (repo-history tradeoff — see below)
 eval_gate:                           # run the repo's eval harness after pre-merge, before ready-to-deploy
   enabled: false                     # default: false; set true to enable (one-time declaration per repo)
   command: "pnpm evals"              # shell command to run; supports pipes, env vars, &&, etc.
@@ -1397,6 +1398,14 @@ When `visual_gate.enabled` (default **off**), the target repo's E2E/visual suite
 - **Tooling failures always block immediately, regardless of mode, and never route to a fix round.**
 - `artifacts_dir` (default `.pipeline-visual`, worktree-relative) is where the command should write screenshots/diffs/traces. After each run the stage enumerates the directory (bounded count/size, deterministic order, explicit truncation note if over budget), copies the files into the run directory so they survive worktree cleanup, and lists the captured paths in the `## Visual Gate` comment and the evidence bundle. A missing/empty directory is not a failure — it's recorded as "no artifacts captured" — and a path that resolves outside the worktree is rejected outright, never read.
 - The command's environment carries `PIPELINE_PR_NUMBER`, `PIPELINE_BRANCH`, `PIPELINE_ISSUE`, `PIPELINE_RUN_ID`, and `PIPELINE_VISUAL_ARTIFACTS_DIR` (absolute), so a repo-defined suite can target its own per-PR preview deployment instead of only a locally served build. The pipeline never fetches or validates any preview URL itself — that stays entirely inside your command.
+- A file whose copy into the run directory fails is never reported as captured — it's listed per file in the manifest as "(copy failed)" so evidence never claims a file it didn't actually persist.
+
+**Publishing artifacts to the PR (`publish`, default `false`).** The manifest above lists paths that live only in the run store on the runner — a human reviewing the PR can't open them without shell access. Setting `visual_gate.publish: true` makes the gate, once the deciding run's manifest is settled, write the captured files to a dedicated worktree evidence path (`.pipeline-visual-evidence/`, distinct from `artifacts_dir` so a gitignored scratch directory is never swept in), commit them, and push the commit to the PR branch — so they render inline in the PR's "Files changed" tab. Manifest entries for published files become Markdown links to the committed `blob/<branch>/...` URL instead of bare filenames.
+
+- **Bounded, not the same bounds as capture**: publishing uses its own, tighter limits (20 files, 2MB per file, 10MB total) than artifact enumeration, applied in the same deterministic order. A file that doesn't fit is listed as "(not published: exceeds bound)" and is never committed.
+- **Repo-history tradeoff**: committed evidence enters the branch's permanent git history, and since this repo squash-merges, a merged PR carries the final evidence tree into `main` unless a human removes it. Publishing writes a single evidence set per pass (replacing any prior set in the same commit), so at most one bounded set is ever present — but that set does persist after merge. Leave `publish` off (the default) if your repo shouldn't accept image blobs in history; the run-store manifest still works exactly as before.
+- **Pipeline-internal commit**: the publish commit uses the prescribed subject `chore: publish visual-gate evidence for #<N>`, which `isPipelineInternalCommit` recognizes — it does not invalidate a recorded pre-merge review verdict and is never mistaken for a visual-fix commit.
+- **Best-effort**: a publish push/commit failure is surfaced in the `## Visual Gate` comment (and per-file as "(not published: publish failed)") but never turns an otherwise-passing gate into a block.
 
 **Targeting a per-PR preview deployment** (e.g. a Vercel-style preview URL your CI already publishes for `PIPELINE_BRANCH`):
 

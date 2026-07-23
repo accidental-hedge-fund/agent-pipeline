@@ -507,6 +507,32 @@ test("validateConfig: visual_gate.artifacts_dir inside the repo root does not er
   assert.equal(result.valid, true);
 });
 
+// ---- visual_gate.publish (#463) ----
+
+test("validateConfig: visual_gate.publish: true is accepted", () => {
+  const deps = makeDeps('visual_gate:\n  enabled: true\n  command: "npx playwright test"\n  publish: true\n');
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, true);
+});
+
+test("validateConfig: misspelled visual_gate.publish (publsh) is an error, not silently accepted", () => {
+  const deps = makeDeps("visual_gate:\n  publsh: true\n");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path.startsWith("visual_gate"));
+  assert.ok(d, `expected diagnostic for visual_gate unknown key, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+});
+
+test("validateConfig: bad visual_gate.publish type → error diagnostic", () => {
+  const deps = makeDeps("visual_gate:\n  publish: \"yes\"\n");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "visual_gate.publish");
+  assert.ok(d, `expected diagnostic for visual_gate.publish, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+});
+
 // ---------------------------------------------------------------------------
 // 5.12 validateConfig: review_harness override applies to inert-model detection (finding 3)
 // ---------------------------------------------------------------------------

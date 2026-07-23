@@ -98,6 +98,7 @@ export {
 } from "../openspec-consistency.ts";
 import { invoke } from "../harness.ts";
 import { reviewerModelSourceWasAuto } from "../stage-routing.ts";
+import { VISUAL_PUBLISH_COMMIT_PREFIX } from "./visual.ts";
 import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -106,6 +107,18 @@ import type { RunStoreDeps, StageAccountingEvent } from "../run-store.ts";
 import { runTestGate } from "../testgate.ts";
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
+
+/**
+ * Exact publish-commit subject pattern (#463): the full prescribed subject,
+ * `VISUAL_PUBLISH_COMMIT_PREFIX` followed by an issue number and nothing
+ * else. Matched in full (not as a prefix) so a developer's own code-changing
+ * commit merely starting with the same words — e.g. `chore: publish
+ * visual-gate evidence for #463 and tweak layout` — does NOT match and still
+ * triggers the required re-review.
+ */
+const VISUAL_PUBLISH_COMMIT_PATTERN = new RegExp(
+  `^${VISUAL_PUBLISH_COMMIT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d+$`,
+);
 const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
 
 /**
@@ -155,10 +168,17 @@ export type AttemptPreMergeAutoFixFn = (
  * still triggers a re-review. A `docs: update documentation for #N` commit is
  * NOT pipeline-internal: the pre-merge docs harness was removed (#91, docs now
  * land inside the reviewed implementation diff), so any such commit can only
- * come from a developer. Exported for tests.
+ * come from a developer. Also matches the visual-gate artifact-publish commit
+ * (#463): it republishes already-reviewed evidence, does not change the code
+ * the reviewer evaluated, and must not invalidate the verdict or be mistaken
+ * for a visual-fix commit (distinct prefix from `visualFixCommitPattern`).
+ * Exported for tests.
  */
 export function isPipelineInternalCommit(messageHeadline: string): boolean {
-  return messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX);
+  return (
+    messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX) ||
+    VISUAL_PUBLISH_COMMIT_PATTERN.test(messageHeadline)
+  );
 }
 
 /**
