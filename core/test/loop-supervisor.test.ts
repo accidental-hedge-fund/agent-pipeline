@@ -15,7 +15,7 @@ import {
   runSupervisorCycle,
   type SupervisorDeps,
 } from "../scripts/loop/supervisor.ts";
-import { acquireLock, initRun, readLedger, writeLedger, type LoopStoreDeps } from "../scripts/loop/store.ts";
+import { acquireLock, initRun, readLedger, readLock, writeLedger, type LoopStoreDeps } from "../scripts/loop/store.ts";
 import { DEFAULT_RECOVERY_POLICY } from "../scripts/loop/recovery.ts";
 import type { ReconcileObserveDeps } from "../scripts/loop/reconcile.ts";
 import {
@@ -493,4 +493,69 @@ test("audit renders identity/timeline/watchdog/position with zero durable writes
   assert.ok(afterDrive.process);
   assert.ok(afterDrive.action_evidence.length > 0);
   assert.equal(afterDrive.status.run_id, "run-1");
+});
+
+// ---------------------------------------------------------------------------
+// 6.8 — lock-release test (#512 review 1, finding 2728bea1).
+// ---------------------------------------------------------------------------
+
+test("driveSupervisor releases the lock once the run reaches a terminal condition, so a second supervisor can attach without --resume", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem } = coordinatedFakes();
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+  assert.equal(result.allDone, true);
+
+  assert.equal(await readLock(deps, "run-1"), null, "lock must be released after the run completes");
+  // The process-identity record survives the lock release as the last-process record.
+  const report = await auditSupervisor(deps, "run-1");
+  assert.ok(report.process, "supervisor.json must remain as the last-process record");
+
+  // A second supervisor can now attach without --resume, since no lock is held.
+  const secondDrive = await driveSupervisor(
+    { store: deps, observe: fakeObserveDeps().deps, dispatchItem: coordinatedFakes().dispatchItem },
+    { runId: "run-1", engine: "codex" },
+  );
+  assert.equal(secondDrive.allDone, true);
+});
+
+test("driveSupervisor releases the lock on the watchdog no-progress stop", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: ["200"] },
+      { id: "200", depends_on: ["999"] },
+    ],
+    consecutive_no_progress_limit: 2,
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { deps: observe } = fakeObserveDeps();
+  const { dispatchItem } = coordinatedFakes();
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+  assert.equal(result.stop?.reason, "supervisor_no_progress");
+
+  assert.equal(await readLock(deps, "run-1"), null, "lock must be released after a watchdog stop");
+});
+
+test("driveSupervisor releases the lock even when a cycle throws", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const observe: ReconcileObserveDeps = {
+    ...fakeObserveDeps().deps,
+    async getIssueStateAndLabels() {
+      throw new Error("simulated transient failure");
+    },
+  };
+  const { dispatchItem } = coordinatedFakes();
+
+  await assert.rejects(
+    () => driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" }),
+    /simulated transient failure/,
+  );
+
+  assert.equal(await readLock(deps, "run-1"), null, "lock must be released even when a cycle throws");
 });

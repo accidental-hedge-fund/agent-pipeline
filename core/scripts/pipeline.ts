@@ -16,8 +16,8 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
-import { writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { writeFileSync, readFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import { Command, Option } from "commander";
 import { resolveConfig, resolveReleaseConfig, resolveLoopNativeGoalAttestation, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig, repoMapAdd, repoMapRemove, repoMapList, type RepoMapRelation } from "./config.ts";
@@ -463,12 +463,11 @@ export function workListRunId(repo: string, engine: LoopEngine, issues: readonly
   return `loop-${hash}`;
 }
 
-/** Compiles a `LoopContractInit` + seeded `LoopLedger` for an explicit
- *  issue-number selector — each item independent (no fabricated
- *  dependencies), executed in list order by the supervisor's single-active-item
- *  invariant. Milestone/label/roadmap-slice selectors require resolving a
- *  GitHub query into an issue list, which is not yet implemented in-repo (see
- *  `runLoopCommand`'s explicit refusal for those selector types). */
+/** Compiles a `LoopContractInit` + seeded `LoopLedger` for an already-resolved
+ *  issue-number list — each item independent (no fabricated dependencies),
+ *  executed in list order by the supervisor's single-active-item invariant.
+ *  Milestone/label/roadmap-slice selectors are resolved into this same
+ *  explicit list by {@link resolveSelectorIssues} before compilation. */
 export function compileWorkListRun(
   cfg: PipelineConfig,
   engine: LoopEngine,
@@ -518,13 +517,23 @@ export function compileWorkListRun(
  *  (never the external goal-loop skill), then maps the issue's final label
  *  state to a terminal outcome. Injected so unit tests never spawn a real
  *  process. */
+/** Builds the child-process argv for the per-item advance loop hand-off.
+ *  Deliberately omits `--once`: the child must run its normal advance loop
+ *  to completion (a defined `pipeline/loop-execution@1` terminal outcome —
+ *  ready-to-deploy, blocked, or closed), not stop after a single stage (#512
+ *  review 1, finding 57fe63fa). Exported as a pure function so this contract
+ *  is unit-testable without spawning a real process. */
+export function dispatchItemChildArgs(scriptPath: string, issueNumber: number, engine: LoopEngine, repoDir: string): string[] {
+  return [scriptPath, String(issueNumber), "--profile", engine, "--repo-path", repoDir];
+}
+
 export function realDispatchItem(cfg: PipelineConfig, engine: LoopEngine): SupervisorDeps["dispatchItem"] {
   return async (request: LoopExecutionRequest): Promise<LoopExecutionResponse> => {
     const issueNumber = Number(request.item_id);
     await new Promise<void>((resolve, reject) => {
       const child = spawn(
         process.execPath,
-        [fileURLToPath(import.meta.url), String(issueNumber), "--profile", engine, "--repo-path", cfg.repo_dir, "--once"],
+        dispatchItemChildArgs(fileURLToPath(import.meta.url), issueNumber, engine, cfg.repo_dir),
         { stdio: "inherit" },
       );
       child.on("error", reject);
@@ -560,6 +569,114 @@ export function realDispatchItem(cfg: PipelineConfig, engine: LoopEngine): Super
       evidence: { pr_number: prNumber, pipeline_run_id: `pipeline-loop-${request.run_id}-${request.item_id}` },
     };
   };
+}
+
+/** One open issue's labels/milestone, as needed to resolve a `milestone` or
+ *  `label` selector into a concrete work list. */
+export interface SelectorOpenIssue {
+  number: number;
+  labels: string[];
+  milestone: string | null;
+}
+
+/** IO seam for {@link resolveSelectorIssues}: listing open issues (for
+ *  milestone/label selectors) and reading ROADMAP.md (for roadmap-slice
+ *  selectors) — injected so unit tests resolve selectors with no real gh or
+ *  filesystem access. */
+export interface SelectorResolveDeps {
+  listOpenIssues: (cfg: PipelineConfig) => Promise<SelectorOpenIssue[]>;
+  readRoadmap: (cfg: PipelineConfig) => Promise<string>;
+}
+
+export function realSelectorResolveDeps(): SelectorResolveDeps {
+  return {
+    listOpenIssues: async (cfg: PipelineConfig): Promise<SelectorOpenIssue[]> => {
+      const result = spawnSync(
+        "gh",
+        ["issue", "list", "--state", "open", "--json", "number,labels,milestone", "--limit", "500"],
+        { encoding: "utf8", stdio: "pipe", cwd: cfg.repo_dir },
+      );
+      if (result.status !== 0) {
+        throw new Error(`gh issue list failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`);
+      }
+      const items = JSON.parse(result.stdout.trim() || "[]") as Array<{
+        number: number;
+        labels: Array<{ name: string }>;
+        milestone: { title: string } | null;
+      }>;
+      return items.map((item) => ({
+        number: item.number,
+        labels: item.labels.map((l) => l.name),
+        milestone: item.milestone?.title ?? null,
+      }));
+    },
+    readRoadmap: async (cfg: PipelineConfig): Promise<string> =>
+      readFileSync(path.join(cfg.repo_dir, "ROADMAP.md"), "utf8"),
+  };
+}
+
+/** Extracts the issue numbers referenced under a named roadmap slice —
+ *  a `**<slice> — ...:**` heading in ROADMAP.md (e.g. `**v1.16.0 — ...**`) —
+ *  from its table rows, stopping at the next top-level heading or slice. A
+ *  heading marked `(shipped ...)` is never matched: this repo's own
+ *  ROADMAP.md reuses a version number between an already-shipped heading and
+ *  a still-forward slice of the same name (e.g. two `v1.16.0` headings), and
+ *  a loop run must only ever select unshipped work. An unshipped slice's
+ *  table leads each row with a bare `| #NNN | What | Why |` issue reference —
+ *  the first `#NNN` on the row is taken as the issue number. Deduplicated and
+ *  sorted ascending so the resulting work list (and its derived run id) is
+ *  deterministic. */
+export function extractRoadmapSliceIssues(roadmapText: string, slice: string): number[] {
+  const headingRe = /^\*\*(\S+)\s+—/;
+  let capturing = false;
+  const issues = new Set<number>();
+  for (const rawLine of roadmapText.split("\n")) {
+    const line = rawLine.trim();
+    const heading = headingRe.exec(line);
+    if (heading) {
+      capturing = heading[1] === slice && !/\(shipped\b/i.test(line);
+      continue;
+    }
+    if (line.startsWith("#")) {
+      capturing = false;
+      continue;
+    }
+    if (!capturing || !line.startsWith("|")) continue;
+    const match = /#(\d+)/.exec(line);
+    if (match) issues.add(Number(match[1]));
+  }
+  return [...issues].sort((a, b) => a - b);
+}
+
+/** Resolves any {@link LoopSelector} into an explicit, ordered issue-number
+ *  work list — the shared compilation step `defaultRunLoopEngine` uses for
+ *  every selector type so milestone/label/roadmap-slice selectors reach the
+ *  supervisor the same way an explicit issue list already did (#512). */
+export async function resolveSelectorIssues(
+  cfg: PipelineConfig,
+  selector: LoopSelector,
+  deps: SelectorResolveDeps,
+): Promise<string[]> {
+  if (selector.type === "work-list") return selector.value;
+
+  if (selector.type === "milestone" || selector.type === "label") {
+    const issues = await deps.listOpenIssues(cfg);
+    const matches = issues
+      .filter((i) => (selector.type === "milestone" ? i.milestone === selector.value : i.labels.includes(selector.value)))
+      .map((i) => i.number)
+      .sort((a, b) => a - b);
+    if (matches.length === 0) {
+      throw new Error(`no open issues found for ${selector.type} "${selector.value}"`);
+    }
+    return matches.map(String);
+  }
+
+  const roadmapText = await deps.readRoadmap(cfg);
+  const matches = extractRoadmapSliceIssues(roadmapText, selector.value);
+  if (matches.length === 0) {
+    throw new Error(`roadmap slice "${selector.value}" was not found in ROADMAP.md, or references no issues`);
+  }
+  return matches.map(String);
 }
 
 export interface RunLoopEngineInput {
@@ -611,15 +728,12 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
   if (input.resumeRunId) {
     runId = input.resumeRunId;
   } else if (input.selector) {
-    if (input.selector.type !== "work-list") {
-      return {
-        kind: "error",
-        message:
-          `the in-repo supervisor does not yet compile a "${input.selector.type}" selector into a run — ` +
-          `pass explicit issue numbers (or --range) until milestone/label/roadmap-slice resolution is implemented`,
-      };
+    let issues: string[];
+    try {
+      issues = await resolveSelectorIssues(cfg, input.selector, realSelectorResolveDeps());
+    } catch (err) {
+      return { kind: "error", message: `selector resolution failed: ${(err as Error).message}` };
     }
-    const issues = input.selector.value;
     runId = workListRunId(cfg.repo, input.engine, issues);
     if (!(await loopRunExists(store, runId))) {
       const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, runId);

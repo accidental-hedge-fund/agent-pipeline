@@ -32,6 +32,7 @@ import {
   readLock,
   readSupervisorProcess,
   recoverLock,
+  releaseLock,
   writeLedger,
   writeSupervisorProcess,
   type LoopStatus,
@@ -409,7 +410,12 @@ export interface DriveSupervisorResult {
  *  done/abandoned, a recorded stop, an outstanding paused/waiting hold, or the
  *  run-level watchdog stop. On resume, runs a reconciliation pass before
  *  continuing and appends a resume marker to the action-evidence trail (task
- *  4.2) before entering the cycle loop. */
+ *  4.2) before entering the cycle loop. The lock is held only while actively
+ *  driving: it is released in a `finally` once the run reaches a terminal
+ *  condition (or the drive throws), so a released-lock resume can proceed on
+ *  another host/process without a takeover. `supervisor.json` (the process
+ *  identity record) is left in place as the last-process record — releasing
+ *  the lock does not touch it. */
 export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervisorInput): Promise<DriveSupervisorResult> {
   const attach = await attachSupervisor(deps, { runId: input.runId, engine: input.engine, resume: input.resume });
   const token = attach.token;
@@ -417,69 +423,73 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
   const contract = await readContract(deps.store, input.runId);
   const limit = input.consecutiveNoProgressLimit ?? contract.consecutive_no_progress_limit ?? DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT;
 
-  if (attach.resumed) {
-    try {
-      await reconcile(deps.store, deps.observe, { runId: input.runId, token, engine: input.engine });
-    } catch (err) {
-      if (!(err instanceof LoopError && err.loopFailureClass === "stop")) throw err;
-    }
-    await appendActionEvidence(deps.store, input.runId, token, {
-      item_id: null,
-      action: "resume",
-      outcome: "resumed",
-      next_action: null,
-      progress: "progress",
-    });
-  }
-
-  let cycles = 0;
-  let stop: LoopStopRecord | null = null;
-  let holdOutstanding = false;
-  let allDone = false;
-
-  while (cycles < MAX_CYCLES_SAFETY) {
-    cycles++;
-    const result = await runSupervisorCycle(deps, input.runId, token, input.engine);
-
-    record = {
-      ...record,
-      heartbeat_at: deps.store.now().toISOString(),
-      consecutive_no_progress: result.progress ? 0 : record.consecutive_no_progress + 1,
-    };
-    await writeSupervisorProcess(deps.store, record, token);
-
-    if (result.stop) {
-      stop = result.stop;
-      break;
-    }
-    if (result.holdOutstanding) {
-      holdOutstanding = true;
-      break;
-    }
-    if (result.allDone) {
-      allDone = true;
-      break;
-    }
-
-    if (record.consecutive_no_progress >= limit) {
-      const time = deps.store.now().toISOString();
-      const ledger = await readLedger(deps.store, input.runId);
-      const newLedger: LoopLedger = { ...ledger, stop: { reason: "supervisor_no_progress", time } };
-      await writeLedger(deps.store, newLedger, token);
-      await appendEvent(deps.store, input.runId, token, "loop_run_stopped", { reason: "supervisor_no_progress" });
+  try {
+    if (attach.resumed) {
+      try {
+        await reconcile(deps.store, deps.observe, { runId: input.runId, token, engine: input.engine });
+      } catch (err) {
+        if (!(err instanceof LoopError && err.loopFailureClass === "stop")) throw err;
+      }
       await appendActionEvidence(deps.store, input.runId, token, {
         item_id: null,
-        action: "stop",
-        outcome: "supervisor_no_progress",
+        action: "resume",
+        outcome: "resumed",
         next_action: null,
-        progress: "no_progress",
+        progress: "progress",
       });
-      stop = newLedger.stop;
-      break;
     }
-  }
 
-  return { runId: input.runId, cycles, stop, holdOutstanding, allDone, resumed: attach.resumed };
+    let cycles = 0;
+    let stop: LoopStopRecord | null = null;
+    let holdOutstanding = false;
+    let allDone = false;
+
+    while (cycles < MAX_CYCLES_SAFETY) {
+      cycles++;
+      const result = await runSupervisorCycle(deps, input.runId, token, input.engine);
+
+      record = {
+        ...record,
+        heartbeat_at: deps.store.now().toISOString(),
+        consecutive_no_progress: result.progress ? 0 : record.consecutive_no_progress + 1,
+      };
+      await writeSupervisorProcess(deps.store, record, token);
+
+      if (result.stop) {
+        stop = result.stop;
+        break;
+      }
+      if (result.holdOutstanding) {
+        holdOutstanding = true;
+        break;
+      }
+      if (result.allDone) {
+        allDone = true;
+        break;
+      }
+
+      if (record.consecutive_no_progress >= limit) {
+        const time = deps.store.now().toISOString();
+        const ledger = await readLedger(deps.store, input.runId);
+        const newLedger: LoopLedger = { ...ledger, stop: { reason: "supervisor_no_progress", time } };
+        await writeLedger(deps.store, newLedger, token);
+        await appendEvent(deps.store, input.runId, token, "loop_run_stopped", { reason: "supervisor_no_progress" });
+        await appendActionEvidence(deps.store, input.runId, token, {
+          item_id: null,
+          action: "stop",
+          outcome: "supervisor_no_progress",
+          next_action: null,
+          progress: "no_progress",
+        });
+        stop = newLedger.stop;
+        break;
+      }
+    }
+
+    return { runId: input.runId, cycles, stop, holdOutstanding, allDone, resumed: attach.resumed };
+  } finally {
+    await releaseLock(deps.store, input.runId, token);
+  }
 }
 
 // ---------------------------------------------------------------------------
