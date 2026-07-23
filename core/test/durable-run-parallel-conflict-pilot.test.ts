@@ -38,6 +38,7 @@ import { recoverItem, DEFAULT_RECOVERY_POLICY } from "../scripts/loop/recovery.t
 import { type ReconcileObserveDeps } from "../scripts/loop/reconcile.ts";
 import { evaluateOwnershipEvidence, recordOwnershipEvidence } from "../scripts/loop/ownership.ts";
 import { selectSchedulableSet } from "../scripts/loop/schedule.ts";
+import { buildLoopEvidenceBundle } from "../scripts/loop/evidence.ts";
 import {
   LOOP_CONTRACT_SCHEMA,
   LOOP_LEDGER_SCHEMA,
@@ -307,68 +308,9 @@ async function latestEventOfKind(deps: LoopStoreDeps, runId: string, kind: strin
 
 // ---------------------------------------------------------------------------
 // 6 — evidence bundle: derived from recorded run state, never a narrative
-// (design.md Decision 6).
+// (design.md Decision 6). Sourced from the shipped `loop/evidence.ts`
+// projection (#531 review 2 finding c1c0ce0b) — not a test-only helper.
 // ---------------------------------------------------------------------------
-
-interface PilotEvidenceBundle {
-  runId: string;
-  observedConcurrency: Array<{ selected: string[] }>;
-  pairwiseDecisions: Array<{ a_item_id: string; b_item_id: string; verdict: string; reason: unknown }>;
-  worktreeIdentity: Record<string, string>;
-  changedFileOverlap: { affected_item_ids: string[]; overlapping_paths: string[]; reason: string } | null;
-  mergeBarrierCleared: { item_id: string; merged_sha: string } | null;
-  terminalOutcomes: Record<string, string>;
-  stop: LoopLedger["stop"];
-}
-
-async function buildPilotEvidenceBundle(
-  deps: LoopStoreDeps,
-  runId: string,
-): Promise<PilotEvidenceBundle> {
-  const ledger = await readLedger(deps, runId);
-  const events = await readEvents(deps, runId);
-  const actionEvidence = await readActionEvidence(deps, runId);
-
-  // Worktree identity is derived solely from the durable action-evidence trail — each item's
-  // first `dispatch_item` entry carries the `worktree_root` the dispatch response reported
-  // (`pipeline/loop-execution@1`'s `LoopEvidencePointer.worktree_root`), never from a test-local
-  // map (#531 review 1 finding cfa926e8).
-  const worktreeIdentity: Record<string, string> = {};
-  for (const entry of actionEvidence) {
-    if (entry.action !== "dispatch_item" || !entry.item_id || entry.worktree_root == null) continue;
-    if (!(entry.item_id in worktreeIdentity)) worktreeIdentity[entry.item_id] = entry.worktree_root;
-  }
-
-  const observedConcurrency = events
-    .filter((e) => e.kind === "loop_schedule_evaluated")
-    .map((e) => ({ selected: (e.data as { selected: string[] }).selected }));
-
-  const ownershipEvent = events.find((e) => e.kind === "loop_ownership_evaluated");
-  const pairwiseDecisions = ownershipEvent
-    ? (ownershipEvent.data as { pairs: PilotEvidenceBundle["pairwiseDecisions"] }).pairs
-    : [];
-
-  const replanEvent = events.find((e) => e.kind === "loop_replan_requested");
-  const changedFileOverlap = replanEvent
-    ? (replanEvent.data as { affected_item_ids: string[]; overlapping_paths: string[]; reason: string })
-    : null;
-
-  const barrierClearedEvent = events.find((e) => e.kind === "loop_merge_barrier_cleared");
-  const mergeBarrierCleared = barrierClearedEvent
-    ? (barrierClearedEvent.data as { item_id: string; merged_sha: string })
-    : null;
-
-  return {
-    runId,
-    observedConcurrency,
-    pairwiseDecisions,
-    worktreeIdentity,
-    changedFileOverlap,
-    mergeBarrierCleared,
-    terminalOutcomes: Object.fromEntries(Object.entries(ledger.items).map(([id, i]) => [id, i.state])),
-    stop: ledger.stop,
-  };
-}
 
 // ---------------------------------------------------------------------------
 // 7.1 — the composed end-to-end simulation.
@@ -580,7 +522,7 @@ test(
 
     // --- 6.1/6.2: the evidence bundle is derived from recorded run state and locates every one of
     // the five exercised behaviors. ---
-    const bundle = await buildPilotEvidenceBundle(deps, RUN_ID);
+    const bundle = await buildLoopEvidenceBundle(deps, RUN_ID);
     assert.ok(
       bundle.observedConcurrency.some((c) => [...c.selected].sort().join(",") === [ITEM_A, ITEM_B].join(",")),
       "observed concurrency (A and B admitted together) must be locatable",
@@ -688,7 +630,7 @@ test("bite check: without a reported worktree_root, the durable action-evidence 
   await runSupervisorCycle({ store: deps, observe, dispatchItem }, RUN_ID, token, "claude");
   await releaseLock(deps, RUN_ID, token);
 
-  const bundle = await buildPilotEvidenceBundle(deps, RUN_ID);
+  const bundle = await buildLoopEvidenceBundle(deps, RUN_ID);
   assert.equal(bundle.worktreeIdentity[ITEM_A], undefined, "without a reported worktree_root, the bundle records no worktree identity for A");
   assert.equal(bundle.worktreeIdentity[ITEM_B], undefined, "without a reported worktree_root, the bundle records no worktree identity for B");
   assert.notEqual(
