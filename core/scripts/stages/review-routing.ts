@@ -332,8 +332,17 @@ export async function advanceReview(
     ? extractReviewedSha([lastPriorRoundForRepair])?.sha ?? null
     : null;
 
-  async function emitRepairedKeys(currentBlockingKeys: Set<string>): Promise<void> {
-    const repairedKeys = [...priorKeysForRepair].filter((k) => !currentBlockingKeys.has(k));
+  // #499 review-2 finding c89694f9: a prior finding that is still returned by
+  // the reviewer but merely demoted to advisory (lower confidence, an
+  // override, a settled-reversal demotion, etc.) is a policy disposition, not
+  // a landed repair — it must stay absent from the reviewer's own findings
+  // AND the head must have actually moved since the round that raised it, or
+  // no code change could have repaired anything.
+  async function emitRepairedKeys(currentFindingKeys: Set<string>): Promise<void> {
+    const headChanged = priorRoundReviewedSha !== null && priorRoundReviewedSha !== commitSha;
+    const repairedKeys = headChanged
+      ? [...priorKeysForRepair].filter((k) => !currentFindingKeys.has(k))
+      : [];
     if (!opts.runDir || repairedKeys.length === 0) return;
     const runId = path.basename(opts.runDir);
     for (const key of repairedKeys) {
@@ -565,9 +574,10 @@ export async function advanceReview(
         reviewer_model: reviewerModel, self_review: selfReview,
       }, opts.runStoreDeps).catch(() => {});
     }
-    // #499 repair detection: an approve verdict blocks on nothing, so every
-    // key the prior round recorded as blocking is repaired.
-    await emitRepairedKeys(new Set());
+    // #499 repair detection: an approve verdict still needs to check the
+    // reviewer's own findings (which may carry non-blocking advisory
+    // findings) — not assume every prior blocking key is gone.
+    await emitRepairedKeys(new Set(verdict.findings.map((f) => findingKey(f))));
     await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, diffHash, review1RiskForComment)));
     if (round === 1) {
       const r1Blocked = await safeTransitionFn("review-1", "review-2",
@@ -690,11 +700,12 @@ export async function advanceReview(
   const blockingKeysSet = new Set(partition.blocking.map((f) => findingKey(f)));
 
   // #499 repair detection: a finding that blocked the prior round and no
-  // longer appears among this round's blocking findings was cleared on
-  // re-check — a durably-landed repair, not a bare detection. Computed here
-  // (before the early "all clear" return below) so both the fully-resolved
-  // and the still-partially-blocking paths detect a repair.
-  await emitRepairedKeys(blockingKeysSet);
+  // longer appears among this round's reviewer findings at all — not merely
+  // non-blocking — was cleared on re-check — a durably-landed repair, not a
+  // bare detection or a policy demotion. Computed here (before the early
+  // "all clear" return below) so both the fully-resolved and the
+  // still-partially-blocking paths detect a repair.
+  await emitRepairedKeys(new Set(verdict.findings.map((f) => findingKey(f))));
 
   if (partition.blocking.length === 0) {
     await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions, alternativeDemotions)));

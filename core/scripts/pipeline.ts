@@ -105,7 +105,7 @@ import * as autoRecover from "./stages/auto_recover.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
 import {
   emitCorrectionEvent,
-  CORRECTION_SOURCE_KINDS,
+  CORRECTION_HUMAN_SOURCE_KINDS,
   CORRECTION_FAILURE_CLASSES,
   CORRECTION_REUSABLE,
   CORRECTION_PROPOSED_CONTROLS,
@@ -392,7 +392,7 @@ export function buildCmd(): Command {
     // merge/deploy/code-mutation authority — its only side effect is one
     // appended, sanitized correction_event.
     .option("--issue <n>", "correction record: issue number to record the correction against", Number)
-    .option("--source-kind <kind>", `correction record: ${CORRECTION_SOURCE_KINDS.join("|")}`)
+    .option("--source-kind <kind>", `correction record: ${CORRECTION_HUMAN_SOURCE_KINDS.join("|")}`)
     .option("--failure-class <class>", `correction record: ${CORRECTION_FAILURE_CLASSES.join("|")}`)
     .option("--evidence-ref <kind:id>", `correction record: "<kind>:<id>" evidence pointer (kind one of ${EVIDENCE_REF_KINDS.join("|")})`)
     .option("--correction-text <text>", "correction record: the observable correction/disposition text")
@@ -981,8 +981,13 @@ async function main(): Promise<void> {
       process.exitCode = 2;
       return;
     }
-    if (!(CORRECTION_SOURCE_KINDS as readonly string[]).includes(opts.sourceKind!)) {
-      console.error(`pipeline correction record: --source-kind must be one of ${CORRECTION_SOURCE_KINDS.join("|")}`);
+    // #499 review-2 finding 34d10c78: the manual command is human-only —
+    // `retry`/`repair` are reserved for the Pipeline-owned recovery and
+    // repair paths (which derive actor_kind: "pipeline"); accepting them here
+    // would let an operator record a manual correction that misattributes
+    // itself as an autonomous pipeline action.
+    if (!(CORRECTION_HUMAN_SOURCE_KINDS as readonly string[]).includes(opts.sourceKind!)) {
+      console.error(`pipeline correction record: --source-kind must be one of ${CORRECTION_HUMAN_SOURCE_KINDS.join("|")}`);
       process.exitCode = 2;
       return;
     }

@@ -30,6 +30,20 @@ run cannot be located, the command SHALL append no event and exit non-zero with 
 - **THEN** the command SHALL append no `correction_event`
 - **AND** it SHALL exit non-zero with an error
 
+### Requirement: The correction record command SHALL only accept operator-driven source kinds
+
+Because `correction record` always emits `actor_kind: "human"`, its `--source-kind` SHALL be
+restricted to the operator-driven source kinds (`override`, `rejection`, `unblock`, `manual`).
+The autonomous-recovery source kinds `retry` and `repair` SHALL be rejected, since accepting
+them would let a human-invoked command produce a record that misattributes an operator action
+as an autonomous pipeline recovery or repair.
+
+#### Scenario: retry/repair are rejected
+
+- **WHEN** `correction record` is invoked with `--source-kind retry` or `--source-kind repair`
+- **THEN** the command SHALL append no `correction_event`
+- **AND** it SHALL exit non-zero with an error naming `--source-kind`
+
 ### Requirement: The correction record command SHALL have no advance, unblock, override, merge, deploy, or code-mutation authority
 
 The `correction record` command SHALL be strictly evidence-recording: its only side effect

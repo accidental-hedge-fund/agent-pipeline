@@ -89,17 +89,18 @@ test("pipeline correction record: complete invocation appends exactly one correc
   }
 });
 
-test("pipeline correction record: actor_kind is always derived from source_kind, never forced — regression for #499 finding 36c6080c", () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "correction-cli-actor-"));
-  try {
-    const runDir = writeRunJson(tmp, "499-2026-07-23T00-00-00-000Z", 499);
-    const result = runCli(["correction", "record", "--repo-path", tmp, ...requiredArgs({ "--source-kind": "retry" })], tmp);
-    assert.equal(result.status, 0, `stderr: ${result.stderr}`);
-    const events = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8")
-      .trim().split("\n").map((l) => JSON.parse(l));
-    assert.equal(events[0].actor_kind, "pipeline");
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+test("pipeline correction record: rejects retry/repair — those source kinds are reserved for the pipeline-owned recovery/repair paths — regression for #499 review-2 finding 34d10c78", () => {
+  for (const sourceKind of ["retry", "repair"]) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "correction-cli-actor-"));
+    try {
+      const runDir = writeRunJson(tmp, "499-2026-07-23T00-00-00-000Z", 499);
+      const result = runCli(["correction", "record", "--repo-path", tmp, ...requiredArgs({ "--source-kind": sourceKind })], tmp);
+      assert.notEqual(result.status, 0, `--source-kind ${sourceKind} should be rejected`);
+      assert.match(result.stderr, /--source-kind/);
+      assert.equal(fs.existsSync(path.join(runDir, "events.jsonl")), false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   }
 });
 

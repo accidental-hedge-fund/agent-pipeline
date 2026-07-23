@@ -136,6 +136,39 @@ test("deriveCorrectionId: distinct correction text (same evidence/run/source/sha
   assert.notEqual(a, b);
 });
 
+test("deriveCorrectionId: distinct occurrence ordinal → distinct id — regression for #499 review-2 finding 2d4be3a1", () => {
+  // Two accepted corrections that agree on every other field (run, source,
+  // evidence, SHA, text) must still get distinct ids when they are genuinely
+  // separate instances — the occurrence ordinal is the durable discriminator.
+  const base = {
+    run_id: "499-2026-07-23T00-00-00-000Z",
+    source_kind: "unblock" as const,
+    evidence_ref: { kind: "blocker" as const, id: "review-2" },
+    reviewed_sha: null,
+    correction: "same answer, posted twice",
+  };
+  const first = deriveCorrectionId({ ...base, occurrence: 0 });
+  const second = deriveCorrectionId({ ...base, occurrence: 1 });
+  assert.notEqual(first, second);
+});
+
+test("deriveCorrectionId: distinct head_sha, reusable, or proposed_control → distinct id — regression for #499 review-2 finding 2d4be3a1", () => {
+  const base = {
+    run_id: "499-2026-07-23T00-00-00-000Z",
+    source_kind: "repair" as const,
+    evidence_ref: { kind: "finding" as const, id: "abc12345" },
+    reviewed_sha: "a".repeat(40),
+    correction: "cleared on re-check",
+  };
+  const a = deriveCorrectionId({ ...base, head_sha: "b".repeat(40), reusable: "yes" as const });
+  const b = deriveCorrectionId({ ...base, head_sha: "c".repeat(40), reusable: "yes" as const });
+  const c = deriveCorrectionId({ ...base, head_sha: "b".repeat(40), reusable: "no" as const });
+  const d = deriveCorrectionId({ ...base, head_sha: "b".repeat(40), reusable: "yes" as const, proposed_control: "eval" as const });
+  assert.notEqual(a, b);
+  assert.notEqual(a, c);
+  assert.notEqual(a, d);
+});
+
 // ---------------------------------------------------------------------------
 // actorKindForSourceKind
 // ---------------------------------------------------------------------------
@@ -204,7 +237,11 @@ test("emitCorrectionEvent: actor_kind is always derived from source_kind — no 
   assert.equal(event.actor_kind, "pipeline");
 });
 
-test("emitCorrectionEvent: replay of the same correction (same evidence/sha/run/source) yields the same correction_id", async () => {
+test("emitCorrectionEvent: replay after a crash before durable append yields the same correction_id", async () => {
+  // memDeps' readFile never reflects prior appendFile calls (it always
+  // reports ENOENT) — this simulates a crash-and-retry where the first
+  // attempt's write never landed durably, so the retry recomputes the same
+  // occurrence ordinal (0) and therefore the same id.
   const { deps, lines } = memDeps();
   await emitCorrectionEvent("/tmp/run", { ...BASE_PAYLOAD, reviewed_sha: "a".repeat(40) }, deps);
   await emitCorrectionEvent("/tmp/run", { ...BASE_PAYLOAD, reviewed_sha: "a".repeat(40) }, deps);
@@ -213,6 +250,34 @@ test("emitCorrectionEvent: replay of the same correction (same evidence/sha/run/
   // A downstream consumer deduping by correction_id collapses these two deliveries to one.
   const deduped = new Map([e1, e2].map((e) => [e.correction_id, e]));
   assert.equal(deduped.size, 1);
+});
+
+function memDepsDurable(): { deps: RunStoreDeps; lines: () => string[] } {
+  let content = "";
+  const deps: RunStoreDeps = {
+    readFile: async () => {
+      if (!content) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return content;
+    },
+    writeFile: async () => {},
+    appendFile: async (_p, data) => { content += data; },
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async () => ({ mtime: new Date(0) }),
+  };
+  return { deps, lines: () => content.trim().split("\n").filter(Boolean) };
+}
+
+test("emitCorrectionEvent: two genuinely distinct accepted corrections that agree on every other field get distinct correction_ids — regression for #499 review-2 finding 2d4be3a1", async () => {
+  // e.g. a run blocked, unblocked with a given answer, blocked again, and
+  // unblocked again with the identical answer at the same stage — two
+  // distinct accepted corrections, not a replay of one.
+  const { deps, lines } = memDepsDurable();
+  await emitCorrectionEvent("/tmp/run", { ...BASE_PAYLOAD, source_kind: "unblock", failure_class: "blocker", evidence_ref: { kind: "blocker", id: "review-2" }, reviewed_sha: null, correction: "same answer, posted twice" }, deps);
+  await emitCorrectionEvent("/tmp/run", { ...BASE_PAYLOAD, source_kind: "unblock", failure_class: "blocker", evidence_ref: { kind: "blocker", id: "review-2" }, reviewed_sha: null, correction: "same answer, posted twice" }, deps);
+  const [e1, e2] = lines().map((l) => JSON.parse(l) as CorrectionEvent);
+  assert.notEqual(e1.correction_id, e2.correction_id, "two distinct accepted corrections must not collide on correction_id");
 });
 
 test("emitCorrectionEvent: injection span in correction text is redacted", async () => {

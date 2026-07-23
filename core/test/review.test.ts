@@ -4049,6 +4049,32 @@ test("repair (#499): a recurring finding (still blocking, unchanged key) is NOT 
   assert.equal(corrections.length, 0, "a recurring/still-blocking finding is a detection, not a correction");
 });
 
+test("repair (#499): a finding merely demoted to advisory (still returned by the reviewer, below min_confidence) is NOT recorded as a repair — regression for #499 review-2 finding c89694f9", async (t) => {
+  // Same finding, same key, still enumerated by the reviewer — only its
+  // confidence dropped below cfgConverge's min_confidence (0.7), so policy
+  // demotes it to advisory. It never disappeared from the reviewer's own
+  // findings, so this must not read as a landed repair.
+  const demotedFinding: ReviewFinding = { ...FINDING_BUG, confidence: 0.5 };
+  assert.equal(findingKey(demotedFinding), KEY_BUG, "must share the same key as the prior-round finding (test is meaningful)");
+  const currentNaVerdictJson = JSON.stringify({
+    verdict: "needs-attention",
+    summary: "same finding, now below confidence threshold",
+    findings: [demotedFinding],
+    next_steps: [],
+  });
+  const { deps, rec } = makeDeps([currentNaVerdictJson]);
+  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(2, [FINDING_BUG])]);
+  const { runStoreDeps, lines } = memRunStoreDepsForCorrection();
+
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, { runDir: "/tmp/run", runStoreDeps }, 0, deps);
+  });
+
+  assert.ok(!rec.transitions.some((tr) => tr.to === "needs-human"), "demoted-only round advances, it does not park");
+  const corrections = lines().map((l) => JSON.parse(l)).filter((e) => e.type === "correction_event");
+  assert.equal(corrections.length, 0, "a policy demotion is not a landed repair — the finding is still raised");
+});
+
 test("repair (#499): a first review round (no prior comment) never emits a correction_event", async (t) => {
   const { deps, rec } = makeDeps([APPROVE]);
   const { runStoreDeps, lines } = memRunStoreDepsForCorrection();
