@@ -252,6 +252,11 @@ test("externalDependencyStatus: open issue is pending; closed-as-completed is sa
   assert.equal(externalDependencyStatus(null, false), "pending");
 });
 
+test("externalDependencyStatus: a closed issue with an unknown or reopened-adjacent stateReason is not treated as satisfied", () => {
+  assert.equal(externalDependencyStatus({ state: "closed", stateReason: null }, false), "pending");
+  assert.equal(externalDependencyStatus({ state: "closed", stateReason: "reopened" }, false), "pending");
+});
+
 test("an item with a pending external dependency is not eligible to start; it becomes eligible once the dependency is observed satisfied — verified through the injected seam with zero real network/git/subprocess calls", async () => {
   const contract = testContract({ items: [{ id: "100", depends_on: [], external_depends_on: ["999"] }] });
   const ledger = testLedger({ "100": itemEntry("100", "pending") });

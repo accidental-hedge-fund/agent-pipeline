@@ -114,7 +114,9 @@ export function externalDependencyStatus(
   if (linkedPrMerged) return "satisfied";
   if (!issueState) return "pending";
   if (issueState.state === "open") return "pending";
-  return issueState.stateReason === "not_planned" ? "unsatisfiable" : "satisfied";
+  if (issueState.stateReason === "completed") return "satisfied";
+  if (issueState.stateReason === "not_planned") return "unsatisfiable";
+  return "pending";
 }
 
 /** Every distinct external dependency id declared across `contract.items`. */
