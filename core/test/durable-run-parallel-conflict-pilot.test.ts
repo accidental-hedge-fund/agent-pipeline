@@ -25,7 +25,9 @@ import {
 } from "../scripts/loop/supervisor.ts";
 import {
   acquireLock,
+  appendEvent,
   initRun,
+  readActionEvidence,
   readEvents,
   readLedger,
   releaseLock,
@@ -251,6 +253,12 @@ function pilotFakes(_deps: LoopStoreDeps, _contract: LoopContract) {
     const pr = prByItem[item];
     if (pr === undefined) throw new Error(`pilot fixture invariant: unexpected dispatch for item ${item}`);
     dispatched.add(item);
+    // Model the per-item review and pre-merge gates the opaque `pipeline/loop-execution@1`
+    // contract intentionally does not expose a verb for (design.md decision 2, #451): the
+    // whole-item dispatch call is the only seam at this composition boundary, so review/pre-merge
+    // completion is recorded as ordered markers on that same call rather than a separate seam.
+    calls.push(`review:${item}`);
+    calls.push(`premerge:${item}`);
     if (!mutatedOnce.has(item)) {
       mutatedOnce.add(item);
       mutations.push({ kind: "pr_create", item, pr });
@@ -261,7 +269,7 @@ function pilotFakes(_deps: LoopStoreDeps, _contract: LoopContract) {
       item_id: item,
       run_id: request.run_id,
       outcome: "ready_to_deploy",
-      evidence: { pr_number: pr, pipeline_run_id: `pipeline-run-${item}` },
+      evidence: { pr_number: pr, pipeline_run_id: `pipeline-run-${item}`, worktree_root: worktreeByItem.get(item)! },
     };
     return response;
   };
@@ -316,10 +324,20 @@ interface PilotEvidenceBundle {
 async function buildPilotEvidenceBundle(
   deps: LoopStoreDeps,
   runId: string,
-  worktreeByItem: Map<string, string>,
 ): Promise<PilotEvidenceBundle> {
   const ledger = await readLedger(deps, runId);
   const events = await readEvents(deps, runId);
+  const actionEvidence = await readActionEvidence(deps, runId);
+
+  // Worktree identity is derived solely from the durable action-evidence trail — each item's
+  // first `dispatch_item` entry carries the `worktree_root` the dispatch response reported
+  // (`pipeline/loop-execution@1`'s `LoopEvidencePointer.worktree_root`), never from a test-local
+  // map (#531 review 1 finding cfa926e8).
+  const worktreeIdentity: Record<string, string> = {};
+  for (const entry of actionEvidence) {
+    if (entry.action !== "dispatch_item" || !entry.item_id || entry.worktree_root == null) continue;
+    if (!(entry.item_id in worktreeIdentity)) worktreeIdentity[entry.item_id] = entry.worktree_root;
+  }
 
   const observedConcurrency = events
     .filter((e) => e.kind === "loop_schedule_evaluated")
@@ -344,7 +362,7 @@ async function buildPilotEvidenceBundle(
     runId,
     observedConcurrency,
     pairwiseDecisions,
-    worktreeIdentity: Object.fromEntries(worktreeByItem),
+    worktreeIdentity,
     changedFileOverlap,
     mergeBarrierCleared,
     terminalOutcomes: Object.fromEntries(Object.entries(ledger.items).map(([id, i]) => [id, i.state])),
@@ -362,7 +380,7 @@ test(
     const contract = pilotContract();
     const ledger = pilotLedger();
     const deps = await setup(contract, ledger);
-    const { observe, dispatchItem, getChangedFiles, calls, mutations, worktreeByItem, setOverlapRound, setAMerged, setBaseHasA } = pilotFakes(deps, contract);
+    const { observe, dispatchItem, getChangedFiles, calls, mutations, setOverlapRound, setAMerged, setBaseHasA } = pilotFakes(deps, contract);
 
     // --- 3.1/3.2: declared/evaluated conflict (planning-time channel, design.md Decision 3) — C
     // conflicts with A via an explicit conflicts_with edge; A and B evaluate disjoint. ---
@@ -399,8 +417,21 @@ test(
     assert.equal(cRationale.disposition, "conflict_edge", "C must be serialized with a conflict disposition, not merely budget-truncated");
     assert.equal(cRationale.counterpart_item_id, ITEM_A, "C's serialization must name the admitted item it conflicts with");
 
-    assert.equal(worktreeByItem.size, 2, "only A and B have been dispatched into a managed worktree so far");
-    assert.notEqual(worktreeByItem.get(ITEM_A), worktreeByItem.get(ITEM_B), "each concurrent item must be assigned its own separate managed worktree");
+    // Worktree identity is read back from the durable action-evidence trail — the dispatch
+    // response's `evidence.worktree_root` recorded on each item's `dispatch_item` action-evidence
+    // entry — never from the test-local `worktreeByItem` map, which only backs the fixture's own
+    // dispatch fake (#531 review 1 finding cfa926e8).
+    const actionEvidenceAfterCycle1 = await readActionEvidence(deps, RUN_ID);
+    const dispatchEvidenceAfterCycle1 = actionEvidenceAfterCycle1.filter((e) => e.action === "dispatch_item");
+    const worktreeRootsSoFar = new Map(dispatchEvidenceAfterCycle1.map((e) => [e.item_id!, e.worktree_root]));
+    assert.equal(worktreeRootsSoFar.size, 2, "only A and B have a durable dispatch_item action-evidence entry so far");
+    assert.ok(worktreeRootsSoFar.get(ITEM_A), "A's worktree root must be recorded in durable action-evidence");
+    assert.ok(worktreeRootsSoFar.get(ITEM_B), "B's worktree root must be recorded in durable action-evidence");
+    assert.notEqual(
+      worktreeRootsSoFar.get(ITEM_A),
+      worktreeRootsSoFar.get(ITEM_B),
+      "each concurrent item must be assigned its own separate managed worktree, per the durable action-evidence record",
+    );
 
     const replanEvent1 = await latestEventOfKind(deps, RUN_ID, "loop_replan_requested");
     assert.ok(replanEvent1, "an observed overlap must record a durable replan request");
@@ -459,6 +490,15 @@ test(
       { ...ledgerForBarrier, merge_barrier: { item_id: ITEM_A, merged_sha: MERGED_SHA_A, set_at: "2026-07-23T00:00:10.000Z" } },
       barrierToken,
     );
+    // Record the merge-class operation's start boundary as a durable event — symmetric to the
+    // production `loop_merge_barrier_cleared` event `reconcile()` already appends on clear — so the
+    // set/clear/redispatch sequence has a recorded order to assert on, not just a call count (#531
+    // review 1 finding 8e33046a).
+    await appendEvent(deps, RUN_ID, barrierToken, "loop_merge_barrier_set", {
+      item_id: ITEM_A,
+      merged_sha: MERGED_SHA_A,
+      set_at: "2026-07-23T00:00:10.000Z",
+    });
     await releaseLock(deps, RUN_ID, barrierToken);
 
     // --- The replan is now "fixed" (the observed overlap no longer recurs) — A and B's already-real
@@ -506,9 +546,41 @@ test(
     assert.ok(barrierClearedEvent);
     assert.equal((barrierClearedEvent!.data as { item_id: string }).item_id, ITEM_A);
 
+    // --- 5.1/5.2 continued: merge-class operations (barrier set, barrier clear, C's admission) do
+    // not overlap — proven from recorded timestamps (the fixture's clock is shared and monotonic
+    // across every durable log), not merely from a call count (#531 review 1 finding 8e33046a). ---
+    const barrierSetEvent = await latestEventOfKind(deps, RUN_ID, "loop_merge_barrier_set");
+    assert.ok(barrierSetEvent, "the merge barrier's start boundary must be a durable record");
+    const cDispatchEvidence = (await readActionEvidence(deps, RUN_ID)).find(
+      (e) => e.action === "dispatch_item" && e.item_id === ITEM_C,
+    );
+    assert.ok(cDispatchEvidence, "C's dispatch must be a durable action-evidence record");
+    assert.ok(
+      barrierSetEvent!.time < barrierClearedEvent!.time,
+      "the barrier must be recorded as set before it is recorded as cleared",
+    );
+    assert.ok(
+      barrierClearedEvent!.time < cDispatchEvidence!.time,
+      "the barrier must be recorded as cleared before C's merge-class-gated dispatch is recorded",
+    );
+
+    // --- 5.2 continued: each admitted item's terminal `ready_to_deploy` outcome is preceded by
+    // this composition's modeled review and pre-merge gate markers, on every occasion it was
+    // dispatched — the scheduler grants concurrency, never merge authority or a review/pre-merge
+    // bypass (#531 review 1 finding 8e33046a). ---
+    for (const itemId of [ITEM_A, ITEM_B, ITEM_C]) {
+      const dispatchIdx = calls.indexOf(`dispatch:${itemId}`);
+      const reviewIdx = calls.indexOf(`review:${itemId}`);
+      const premergeIdx = calls.indexOf(`premerge:${itemId}`);
+      assert.ok(
+        dispatchIdx >= 0 && reviewIdx > dispatchIdx && premergeIdx > reviewIdx,
+        `item ${itemId} must pass review then pre-merge before its dispatch response reports ready_to_deploy`,
+      );
+    }
+
     // --- 6.1/6.2: the evidence bundle is derived from recorded run state and locates every one of
     // the five exercised behaviors. ---
-    const bundle = await buildPilotEvidenceBundle(deps, RUN_ID, worktreeByItem);
+    const bundle = await buildPilotEvidenceBundle(deps, RUN_ID);
     assert.ok(
       bundle.observedConcurrency.some((c) => [...c.selected].sort().join(",") === [ITEM_A, ITEM_B].join(",")),
       "observed concurrency (A and B admitted together) must be locatable",
@@ -599,4 +671,45 @@ test("bite check: without a merge barrier, C starts immediately once A and B are
   // the composed test's "C stays pending while the barrier is set" assertion would fail here.
   assert.equal(ledgerAfter.items[ITEM_C].state, "ready");
   assert.equal(calls.filter((c) => c === `dispatch:${ITEM_C}`).length, 1, "without a barrier, C's dispatch is not gated on any human merge observation");
+});
+
+test("bite check: without a reported worktree_root, the durable action-evidence trail carries no worktree identity — proves the evidence bundle's worktree identity is sourced from durable state, not a test-local map", async () => {
+  const contract = pilotContract();
+  const ledger = pilotLedger();
+  const deps = await setup(contract, ledger);
+  const { observe, dispatchItem: realDispatchItem } = pilotFakes(deps, contract);
+  // The exact regression this leg guards against: a dispatch response that omits worktree_root,
+  // as every dispatch response did before #531 review 1 finding cfa926e8's fix.
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    const response = await realDispatchItem(request);
+    return { ...response, evidence: { pr_number: response.evidence.pr_number, pipeline_run_id: response.evidence.pipeline_run_id } };
+  };
+  const { token } = await acquireLock(deps, RUN_ID, "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, RUN_ID, token, "claude");
+  await releaseLock(deps, RUN_ID, token);
+
+  const bundle = await buildPilotEvidenceBundle(deps, RUN_ID);
+  assert.equal(bundle.worktreeIdentity[ITEM_A], undefined, "without a reported worktree_root, the bundle records no worktree identity for A");
+  assert.equal(bundle.worktreeIdentity[ITEM_B], undefined, "without a reported worktree_root, the bundle records no worktree identity for B");
+  assert.notEqual(
+    bundle.worktreeIdentity[ITEM_A],
+    "/managed/pilot-300",
+    "the composed test's 'distinct per-item worktree identity must be locatable' assertion would fail against this regression rather than silently reading a stale test-local value",
+  );
+});
+
+test("bite check: without the review/pre-merge markers, an item's dispatch response still reports ready_to_deploy — proves the composition's review/pre-merge-before-ready ordering assertion is load-bearing", () => {
+  const calls: string[] = [`dispatch:${ITEM_A}`];
+  // The exact regression this leg guards against: a dispatch that reports ready_to_deploy without
+  // ever recording that review and pre-merge gates ran first.
+  const dispatchIdx = calls.indexOf(`dispatch:${ITEM_A}`);
+  const reviewIdx = calls.indexOf(`review:${ITEM_A}`);
+  const premergeIdx = calls.indexOf(`premerge:${ITEM_A}`);
+  assert.ok(dispatchIdx >= 0);
+  assert.equal(reviewIdx, -1, "no review marker was recorded");
+  assert.equal(premergeIdx, -1, "no pre-merge marker was recorded");
+  assert.ok(
+    !(reviewIdx > dispatchIdx && premergeIdx > reviewIdx),
+    "the composed test's 'review then pre-merge before ready_to_deploy' assertion would fail against this regression",
+  );
 });
