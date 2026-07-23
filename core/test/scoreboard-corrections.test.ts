@@ -19,7 +19,7 @@ import {
   type ScoreboardDeps,
 } from "../scripts/scoreboard.ts";
 import { runsDir } from "../scripts/run-store.ts";
-import { deriveCorrectionKey, controlAttributionsPath } from "../scripts/correction.ts";
+import { deriveCorrectionKey, controlAttributionsPath, deriveAttributionId } from "../scripts/correction.ts";
 
 const REPO_DIR = "/repo";
 
@@ -405,6 +405,73 @@ test("corrections: a replayed attribution append (same attribution_id) collapses
   assert.equal(cls!.recurrence?.superseded.length, 0, "the replay must not surface as a superseded prior copy");
   assert.equal(cls!.recurrence?.attribution?.attribution_id, "attr-replay");
   assert.equal(cls!.recurrence?.attribution?.effective_at, "2026-06-02T00:00:00Z", "boundary pinned to the earliest valid append, not the retry's later one");
+});
+
+test("corrections: two rollback records with distinct supersession targets get distinct attribution_ids and both survive dedup (#501 review-2 finding d1f6f1b5)", async () => {
+  const files: Record<string, string> = {};
+  const key = deriveCorrectionKey({ source_kind: "manual", failure_class: "other", stage: "review-2" });
+  addRun(files, "1-2026-06-01T00-00-00-000Z", "2026-06-01T00:00:00Z", [
+    correctionEvent({
+      correction_id: "r1", correction_key: key, source_kind: "manual", failure_class: "other",
+      stage: "review-2", at: "2026-06-01T00:00:00Z",
+    }),
+  ]);
+
+  const idA = deriveAttributionId({
+    correction_key: key, control_type: "deterministic-gate", disposition: "implemented",
+    issue: null, pr: null, effective_commit: "a".repeat(40), effective_release: null, supersedes: null,
+  });
+  const idB = deriveAttributionId({
+    correction_key: key, control_type: "deterministic-gate", disposition: "implemented",
+    issue: null, pr: null, effective_commit: "b".repeat(40), effective_release: null, supersedes: null,
+  });
+  // Two otherwise-identical rollback records — same correction_key, control_type,
+  // disposition, and null issue/pr/effective fields — that supersede different
+  // targets (A vs. B). Pre-fix these collided on one attribution_id, so
+  // dedupeAttributionsById silently dropped the later (real) rollback of B.
+  const rollbackOfA = attribution({
+    attribution_id: deriveAttributionId({
+      correction_key: key, control_type: "deterministic-gate", disposition: "rejected",
+      issue: null, pr: null, effective_commit: null, effective_release: null, supersedes: idA,
+    }),
+    correction_key: key,
+    control_type: "deterministic-gate",
+    disposition: "rejected",
+    at: "2026-06-02T12:00:00Z",
+    effective_at: null,
+    supersedes: idA,
+  });
+  const rollbackOfB = attribution({
+    attribution_id: deriveAttributionId({
+      correction_key: key, control_type: "deterministic-gate", disposition: "rejected",
+      issue: null, pr: null, effective_commit: null, effective_release: null, supersedes: idB,
+    }),
+    correction_key: key,
+    control_type: "deterministic-gate",
+    disposition: "rejected",
+    at: "2026-06-03T00:00:00Z",
+    effective_at: null,
+    supersedes: idB,
+  });
+  assert.notEqual(rollbackOfA.attribution_id, rollbackOfB.attribution_id, "distinct supersession targets must not collide");
+
+  files[controlAttributionsPath(REPO_DIR)] = ledgerContent([
+    attribution({
+      attribution_id: idA, correction_key: key, control_type: "deterministic-gate", disposition: "implemented",
+      at: "2026-06-01T12:00:00Z", effective_at: "2026-06-01T12:00:00Z", effective_commit: "a".repeat(40),
+    }),
+    attribution({
+      attribution_id: idB, correction_key: key, control_type: "deterministic-gate", disposition: "implemented",
+      at: "2026-06-02T00:00:00Z", effective_at: "2026-06-02T00:00:00Z", effective_commit: "b".repeat(40),
+    }),
+    rollbackOfA,
+    rollbackOfB,
+  ]);
+
+  const report = await buildScoreboardReport(WINDOW_OPTS, memDeps(files));
+  const cls = report.corrections?.classes.find((c) => c.correction_key === key);
+  assert.equal(cls!.recurrence?.attribution, null, "the real rollback of B must clear the active boundary");
+  assert.equal(cls!.recurrence?.superseded.length, 2, "both A (naturally superseded by B) and B (rolled back) must be surfaced");
 });
 
 // ---------------------------------------------------------------------------

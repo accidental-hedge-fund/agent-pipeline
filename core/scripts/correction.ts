@@ -464,6 +464,7 @@ export function deriveAttributionId(args: {
   pr?: number | null;
   effective_commit?: string | null;
   effective_release?: string | null;
+  supersedes?: string | null;
 }): string {
   const basis = [
     args.correction_key,
@@ -473,6 +474,7 @@ export function deriveAttributionId(args: {
     String(args.pr ?? ""),
     args.effective_commit ?? "",
     args.effective_release ?? "",
+    args.supersedes ?? "",
   ].join(FS);
   return createHash("sha1").update(basis).digest("hex").slice(0, 16);
 }
@@ -574,6 +576,7 @@ export async function emitControlAttribution(
         pr,
         effective_commit: effectiveCommit,
         effective_release: effectiveRelease,
+        supersedes: payload.supersedes ?? null,
       }),
       correction_key: payload.correction_key,
       control_type: payload.control_type,
@@ -622,18 +625,58 @@ export function validateControlAttribution(raw: unknown): ControlAttributionVali
     return { ok: false, error: `unknown control_attribution schema_version: ${JSON.stringify(r.schema_version)}` };
   }
   const requiredStrings: (keyof ControlAttribution)[] = [
-    "at", "attribution_id", "correction_key", "control_type", "disposition", "evidence_ref",
+    "at", "attribution_id", "correction_key", "control_type", "disposition", "note",
   ];
   for (const field of requiredStrings) {
-    if (r[field] === undefined || r[field] === null) {
-      return { ok: false, error: `control_attribution missing required field "${field}"` };
+    if (typeof r[field] !== "string") {
+      return { ok: false, error: `control_attribution missing or invalid required field "${field}"` };
     }
+  }
+  if (Number.isNaN(Date.parse(r.at as string))) {
+    return { ok: false, error: `control_attribution has an invalid "at" timestamp: ${JSON.stringify(r.at)}` };
   }
   if (!(CORRECTION_PROPOSED_CONTROLS as readonly string[]).includes(r.control_type as string)) {
     return { ok: false, error: `control_attribution has an invalid control_type: ${JSON.stringify(r.control_type)}` };
   }
   if (!(CONTROL_ATTRIBUTION_DISPOSITIONS as readonly string[]).includes(r.disposition as string)) {
     return { ok: false, error: `control_attribution has an invalid disposition: ${JSON.stringify(r.disposition)}` };
+  }
+  const nullableNumberFields: (keyof ControlAttribution)[] = ["issue", "pr"];
+  for (const field of nullableNumberFields) {
+    if (r[field] !== null && typeof r[field] !== "number") {
+      return { ok: false, error: `control_attribution field "${field}" must be a number or null` };
+    }
+  }
+  const nullableStringFields: (keyof ControlAttribution)[] = ["effective_commit", "effective_release", "supersedes"];
+  for (const field of nullableStringFields) {
+    if (r[field] !== null && typeof r[field] !== "string") {
+      return { ok: false, error: `control_attribution field "${field}" must be a string or null` };
+    }
+  }
+  if (r.effective_at !== null && (typeof r.effective_at !== "string" || Number.isNaN(Date.parse(r.effective_at)))) {
+    return { ok: false, error: `control_attribution field "effective_at" must be null or a valid ISO timestamp` };
+  }
+  const disposition = r.disposition as ControlAttributionDisposition;
+  if ((disposition === "human-owned" || disposition === "rejected") && r.effective_at !== null) {
+    return { ok: false, error: `control_attribution with disposition "${disposition}" must have a null "effective_at"` };
+  }
+  if (disposition === "implemented" && r.effective_at === null) {
+    return { ok: false, error: `control_attribution with disposition "implemented" must have a non-null "effective_at"` };
+  }
+  if (disposition === "superseded") {
+    const shipsReplacementControl = r.effective_commit !== null || r.effective_release !== null;
+    if (shipsReplacementControl && r.effective_at === null) {
+      return {
+        ok: false,
+        error: 'control_attribution with disposition "superseded" carrying a replacement control must have a non-null "effective_at"',
+      };
+    }
+    if (!shipsReplacementControl && r.effective_at !== null) {
+      return {
+        ok: false,
+        error: 'control_attribution with disposition "superseded" without a replacement control must have a null "effective_at"',
+      };
+    }
   }
   const evidenceRef = r.evidence_ref as Record<string, unknown> | null;
   if (!evidenceRef || typeof evidenceRef !== "object" || typeof evidenceRef.id !== "string" ||

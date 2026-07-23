@@ -91,6 +91,21 @@ test("deriveAttributionId: distinct issue/pr/effective_commit/effective_release 
   assert.notEqual(a, e);
 });
 
+test("deriveAttributionId: distinct supersedes -> distinct id (#501 review-2 finding d1f6f1b5)", () => {
+  const base = {
+    correction_key: "k1",
+    control_type: "human-judgment" as const,
+    disposition: "rejected" as const,
+    issue: null,
+    pr: null,
+    effective_commit: null,
+    effective_release: null,
+  };
+  const rollsBackA = deriveAttributionId({ ...base, supersedes: "attribution-a" });
+  const rollsBackB = deriveAttributionId({ ...base, supersedes: "attribution-b" });
+  assert.notEqual(rollsBackA, rollsBackB);
+});
+
 // ---------------------------------------------------------------------------
 // emitControlAttribution — contract shape, effective_at rule, sanitization, non-fatal
 // ---------------------------------------------------------------------------
@@ -290,4 +305,74 @@ test("validateControlAttribution: not an object -> visible error, does not throw
   assert.equal(validateControlAttribution(null).ok, false);
   assert.equal(validateControlAttribution("garbage").ok, false);
   assert.equal(validateControlAttribution(42).ok, false);
+});
+
+test("validateControlAttribution: an implemented record missing effective_at -> visible error (#501 review-2 finding 8d017c46)", async () => {
+  const { deps, lines } = memDeps();
+  await emitControlAttribution("/repo", BASE_PAYLOAD, deps);
+  const record = JSON.parse(lines()[0]);
+  record.effective_at = null;
+  const result = validateControlAttribution(record);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok && result.error.includes("effective_at"), !result.ok ? result.error : "");
+});
+
+test("validateControlAttribution: a rejected record with a non-null effective_at -> visible error", async () => {
+  const { deps, lines } = memDeps();
+  await emitControlAttribution("/repo", { ...BASE_PAYLOAD, disposition: "rejected" }, deps);
+  const record = JSON.parse(lines()[0]);
+  record.effective_at = "2026-01-01T00:00:00Z";
+  const result = validateControlAttribution(record);
+  assert.equal(result.ok, false);
+});
+
+test("validateControlAttribution: a non-ISO effective_at -> visible error", async () => {
+  const { deps, lines } = memDeps();
+  await emitControlAttribution("/repo", BASE_PAYLOAD, deps);
+  const record = JSON.parse(lines()[0]);
+  record.effective_at = "not-a-date";
+  assert.equal(validateControlAttribution(record).ok, false);
+});
+
+test("validateControlAttribution: a non-ISO at timestamp -> visible error", async () => {
+  const { deps, lines } = memDeps();
+  await emitControlAttribution("/repo", BASE_PAYLOAD, deps);
+  const record = JSON.parse(lines()[0]);
+  record.at = "not-a-date";
+  assert.equal(validateControlAttribution(record).ok, false);
+});
+
+test("validateControlAttribution: a wrongly typed nullable field -> visible error", async () => {
+  const { deps, lines } = memDeps();
+  await emitControlAttribution("/repo", BASE_PAYLOAD, deps);
+  const record = JSON.parse(lines()[0]);
+  record.issue = "501";
+  assert.equal(validateControlAttribution(record).ok, false);
+
+  const { deps: deps2, lines: lines2 } = memDeps();
+  await emitControlAttribution("/repo", BASE_PAYLOAD, deps2);
+  const record2 = JSON.parse(lines2()[0]);
+  record2.supersedes = 42;
+  assert.equal(validateControlAttribution(record2).ok, false);
+});
+
+test("validateControlAttribution: a superseded record shipping a replacement control with no effective_at -> visible error", async () => {
+  const { deps, lines } = memDeps();
+  await emitControlAttribution("/repo", {
+    ...BASE_PAYLOAD,
+    disposition: "superseded",
+    supersedes: "prior-id",
+    effective_commit: "a".repeat(40),
+  }, deps);
+  const record = JSON.parse(lines()[0]);
+  record.effective_at = null;
+  assert.equal(validateControlAttribution(record).ok, false);
+});
+
+test("validateControlAttribution: a bare superseded record with a non-null effective_at -> visible error", async () => {
+  const { deps, lines } = memDeps();
+  await emitControlAttribution("/repo", { ...BASE_PAYLOAD, disposition: "superseded", supersedes: "prior-id" }, deps);
+  const record = JSON.parse(lines()[0]);
+  record.effective_at = "2026-01-01T00:00:00Z";
+  assert.equal(validateControlAttribution(record).ok, false);
 });
