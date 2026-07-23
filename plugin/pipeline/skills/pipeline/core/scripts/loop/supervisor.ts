@@ -39,8 +39,9 @@ import {
   type LoopStoreDeps,
 } from "./store.ts";
 import { reconcile, transitionItem, type ReconcileObserveDeps } from "./reconcile.ts";
-import { blockItem, classifyAndBlockItem, eligibleIndependentItems } from "./recovery.ts";
+import { blockItem, classifyAndBlockItem } from "./recovery.ts";
 import { computeExternalDependencyStatuses, detectDependencyDeadlock, propagateSkips } from "./dependencies.ts";
+import { detectChangedFileOverlap, selectSchedulableSet } from "./schedule.ts";
 import {
   LOOP_EXECUTION_CONTRACT_SCHEMA,
   normalizeLoopOutcome,
@@ -70,6 +71,12 @@ export interface SupervisorDeps {
   store: LoopStoreDeps;
   observe: ReconcileObserveDeps;
   dispatchItem(request: LoopExecutionRequest): Promise<LoopExecutionResponse>;
+  /** The live changed-file-overlap seam (#530, capability
+   *  `durable-run-independent-scheduler`): returns the paths an item's managed worktree actually
+   *  changed versus base. Consulted only when more than one item is dispatched in the same cycle
+   *  (i.e. concurrency is actually in effect) — absent by default, so the serialized default never
+   *  requires it. */
+  getChangedFiles?(itemId: string): Promise<string[]>;
   /** Best-effort hook invoked once `driveSupervisor` reaches a terminal stop
    *  or full completion — never on an outstanding pause/hold, since the run
    *  is not yet done there (capability `durable-run-blocker-auto-file`, #538).
@@ -251,16 +258,25 @@ export async function runSupervisorCycle(
     return { progress: drifted || propagated, stop: null, holdOutstanding: false, allDone: true };
   }
 
-  let activeItemId = Object.values(ledger.items).find((i) => i.state === "in_progress")?.id ?? null;
-  if (!activeItemId) {
-    const eligible = eligibleIndependentItems(contract, ledger, externalStatuses);
-    if (eligible.length > 0) {
-      activeItemId = eligible[0];
-      ledger = await startItem(deps.store, { runId, token, itemId: activeItemId, engine });
+  let activeItemIds = Object.values(ledger.items).filter((i) => i.state === "in_progress").map((i) => i.id);
+
+  if (activeItemIds.length === 0) {
+    // The independent-set scheduler (#530, capability `durable-run-independent-scheduler`)
+    // replaces the prior bare `eligible[0]` pick. Absent a `concurrency` run policy (or a budget
+    // of one) it still ever admits at most one item — the same item `eligible[0]` would have
+    // picked pre-#530 — so the serialized default's observable selection is unchanged; it
+    // additionally now records a durable allow/deny rationale for every eligible candidate.
+    const decision = selectSchedulableSet({ contract, ledger, externalStatuses });
+    if (decision.rationale.length > 0) {
+      await appendEvent(deps.store, runId, token, "loop_schedule_evaluated", decision);
     }
+    for (const itemId of decision.selected) {
+      ledger = await startItem(deps.store, { runId, token, itemId, engine });
+    }
+    activeItemIds = decision.selected;
   }
 
-  if (!activeItemId) {
+  if (activeItemIds.length === 0) {
     const deadlockChain = detectDependencyDeadlock(contract, ledger, externalStatuses);
     if (deadlockChain) {
       const time = deps.store.now().toISOString();
@@ -288,65 +304,111 @@ export async function runSupervisorCycle(
     return { progress: drifted || propagated, stop: null, holdOutstanding: false, allDone: false };
   }
 
-  const request: LoopExecutionRequest = {
+  // Dispatch every admitted item concurrently through the unchanged, per-item
+  // `pipeline/loop-execution@1` contract — each item is driven against its own managed worktree
+  // by that seam exactly as it already is today. With exactly one active item this `Promise.all`
+  // is equivalent to a single awaited call, including error propagation, so the serialized
+  // default's behavior (including a thrown `dispatchItem` rejection) is unchanged.
+  const buildRequest = (itemId: string): LoopExecutionRequest => ({
     schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
-    item_id: activeItemId,
+    item_id: itemId,
     repo: contract.repo,
     engine,
     worktree_policy: contract.worktree_policy,
     done_definition: contract.done_definition,
     run_id: runId,
-  };
-  const response = await deps.dispatchItem(request);
-  const outcome = normalizeLoopOutcome(response.outcome);
-  const reconciliationAfter = ledger.last_reconciliation;
-  const nextAction = reconciliationAfter?.next_actions[activeItemId] ?? null;
+  });
+  const responses = await Promise.all(activeItemIds.map((itemId) => deps.dispatchItem(buildRequest(itemId))));
+  const rawOutcomeByItem = new Map(activeItemIds.map((itemId, i) => [itemId, responses[i].outcome]));
+  const outcomeByItem = new Map(activeItemIds.map((itemId, i) => [itemId, normalizeLoopOutcome(responses[i].outcome)]));
 
-  if (outcome === "ready_to_deploy") {
-    ledger = await transitionItem(deps.store, deps.observe, contract, {
-      runId,
-      token,
-      itemId: activeItemId,
-      engine,
-      to: "ready",
-      note: "pipeline/loop-execution@1 reported ready_to_deploy",
-    });
-  } else if (outcome === "abandoned") {
-    ledger = await abandonInProgressItem(deps.store, runId, token, activeItemId, engine);
-  } else if (outcome === "blocked_needs_human") {
-    ledger = (
-      await classifyAndBlockItem(deps.store, contract, {
-        runId,
-        token,
-        itemId: activeItemId,
-        engine,
-        candidateClasses: ["missing-authority"],
-        evidence: `pipeline/loop-execution@1 reported blocked_needs_human for item ${activeItemId}`,
-      })
-    );
-  } else {
-    // "failed" — either reported directly or normalized from an outcome
-    // outside the defined terminal set (LOOP_TERMINAL_OUTCOMES). Recorded as
-    // a blocked item under the workflow-engine-defect class so it is never
-    // silently re-dispatched: that class's default policy is run_fatal,
-    // stopping the run immediately.
-    ledger = await blockItem(deps.store, contract, {
-      runId,
-      token,
-      itemId: activeItemId,
-      engine,
-      blockerClass: "workflow-engine-defect",
-      evidence: `pipeline/loop-execution@1 reported outcome "${String(response.outcome)}" for item ${activeItemId}, normalized to failed`,
-    });
+  // Changed-file-overlap parking (#530 task 4): a post-run safety net over declared ownership,
+  // meaningful only when more than one item actually ran concurrently this cycle and the caller
+  // supplies the live changed-files seam. Parking never merges, pushes, or deletes a
+  // branch/worktree — it reuses the existing "workflow-state" blocked class so a parked item
+  // recovers through the already-tested block/recover machinery instead of inventing a new state.
+  let parkedItemIds = new Set<string>();
+  if (activeItemIds.length > 1 && deps.getChangedFiles) {
+    const actualChangedFiles: Record<string, readonly string[]> = {};
+    for (const itemId of activeItemIds) {
+      actualChangedFiles[itemId] = await deps.getChangedFiles(itemId);
+    }
+    const overlap = detectChangedFileOverlap(actualChangedFiles);
+    if (overlap.affected_item_ids.length > 0) {
+      parkedItemIds = new Set(overlap.affected_item_ids);
+      await appendEvent(deps.store, runId, token, "loop_replan_requested", {
+        time: deps.store.now().toISOString(),
+        affected_item_ids: overlap.affected_item_ids,
+        overlapping_paths: overlap.overlapping_paths,
+        reason: `observed changed-file overlap not predicted by declared ownership: ${overlap.overlapping_paths.join(", ")}`,
+      });
+    }
   }
 
-  await appendActionEvidence(deps.store, runId, token, {
-    item_id: activeItemId,
-    action: "dispatch_item",
-    outcome,
-    next_action: nextAction,
-    progress: "progress",
-  });
+  for (const itemId of activeItemIds) {
+    // A prior item in this same cycle may have already recorded a terminal run stop (e.g. a
+    // run-fatal block) — every subsequent transition/block call refuses once `ledger.stop` is
+    // set, so further processing this cycle is skipped rather than crashing. The still-in_progress
+    // remainder is untouched; a stopped run never dispatches again, so this causes no duplicate
+    // work (loop-supervisor's `if (ledger.stop) return` at the top of the next cycle).
+    if (ledger.stop) break;
+
+    const outcome = outcomeByItem.get(itemId)!;
+    const nextAction = ledger.last_reconciliation?.next_actions[itemId] ?? null;
+
+    if (parkedItemIds.has(itemId)) {
+      ledger = await blockItem(deps.store, contract, {
+        runId,
+        token,
+        itemId,
+        engine,
+        blockerClass: "workflow-state",
+        evidence: "parked for replan: observed changed-file overlap with a concurrently-run item",
+      });
+    } else if (outcome === "ready_to_deploy") {
+      ledger = await transitionItem(deps.store, deps.observe, contract, {
+        runId,
+        token,
+        itemId,
+        engine,
+        to: "ready",
+        note: "pipeline/loop-execution@1 reported ready_to_deploy",
+      });
+    } else if (outcome === "abandoned") {
+      ledger = await abandonInProgressItem(deps.store, runId, token, itemId, engine);
+    } else if (outcome === "blocked_needs_human") {
+      ledger = await classifyAndBlockItem(deps.store, contract, {
+        runId,
+        token,
+        itemId,
+        engine,
+        candidateClasses: ["missing-authority"],
+        evidence: `pipeline/loop-execution@1 reported blocked_needs_human for item ${itemId}`,
+      });
+    } else {
+      // "failed" — either reported directly or normalized from an outcome
+      // outside the defined terminal set (LOOP_TERMINAL_OUTCOMES). Recorded as
+      // a blocked item under the workflow-engine-defect class so it is never
+      // silently re-dispatched: that class's default policy is run_fatal,
+      // stopping the run immediately.
+      ledger = await blockItem(deps.store, contract, {
+        runId,
+        token,
+        itemId,
+        engine,
+        blockerClass: "workflow-engine-defect",
+        evidence: `pipeline/loop-execution@1 reported outcome "${String(rawOutcomeByItem.get(itemId))}" for item ${itemId}, normalized to failed`,
+      });
+    }
+
+    await appendActionEvidence(deps.store, runId, token, {
+      item_id: itemId,
+      action: "dispatch_item",
+      outcome: parkedItemIds.has(itemId) ? "parked_for_replan" : outcome,
+      next_action: nextAction,
+      progress: "progress",
+    });
+  }
 
   return { progress: true, stop: ledger.stop, holdOutstanding: false, allDone: false };
 }
