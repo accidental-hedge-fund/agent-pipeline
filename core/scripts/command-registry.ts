@@ -310,6 +310,24 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     mutatesGitHub: false,
     supportsJson: true,
   },
+
+  // correction (#499): `pipeline correction record` — a narrow, non-mutating
+  // command that records exactly one correction_event against an existing
+  // run. mutatesGitHub:false and needsGhAuth:false are the properties that
+  // back its authority boundary: its only side effect is one appended,
+  // sanitized correction_event; it is never wired to the advance, unblock,
+  // override, merge, or deploy handlers.
+  correction: {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath", "profile", "issue", "runId", "sourceKind", "failureClass",
+      "stage", "evidenceRef", "correctionText", "reusable", "proposedControl",
+    ]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: false,
+  },
 };
 
 /**

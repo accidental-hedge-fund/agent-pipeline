@@ -23,6 +23,7 @@ import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
 import { stageDurationMs } from "./evidence-bundle.ts";
 import type { GhMetricsSummary } from "./gh.ts";
 import type { HumanInterventionEvent } from "./intervention.ts";
+import type { CorrectionEvent } from "./correction.ts";
 import { accountingSummary, sanitizeStageAccountingRecord } from "./accounting.ts";
 import { RUNS_ARTIFACT, HISTORY_ARTIFACT, artifactSubdir } from "./artifact-ignore.ts";
 
@@ -288,6 +289,7 @@ export interface SettledSurfaceUnverifiedEvent extends RunEventBase {
 }
 
 export type { HumanInterventionEvent };
+export type { CorrectionEvent };
 
 export type RunEvent =
   | RunStartEvent
@@ -315,7 +317,8 @@ export type RunEvent =
   | DeltaRoundCeilingEvent
   | DeltaChurnSuspectedEvent
   | EngineDriftEvent
-  | HumanInterventionEvent;
+  | HumanInterventionEvent
+  | CorrectionEvent;
 
 // ---------------------------------------------------------------------------
 // Deps — injectable I/O seam; unit tests inject in-memory fakes
@@ -729,6 +732,7 @@ export async function finalizeRun(
   let deltaRoundEvents: DeltaRoundEvent[] = [];
   let deltaCeilingEvents: DeltaRoundCeilingEvent[] = [];
   let deltaChurnEvents: DeltaChurnSuspectedEvent[] = [];
+  let corrections: CorrectionEvent[] = [];
   if (deps.summaryEvents) {
     interventions = deps.summaryEvents.filter(
       (e): e is HumanInterventionEvent => e.type === "human_intervention",
@@ -739,6 +743,7 @@ export async function finalizeRun(
     deltaRoundEvents = deps.summaryEvents.filter((e): e is DeltaRoundEvent => e.type === "delta_round");
     deltaCeilingEvents = deps.summaryEvents.filter((e): e is DeltaRoundCeilingEvent => e.type === "delta_round_ceiling");
     deltaChurnEvents = deps.summaryEvents.filter((e): e is DeltaChurnSuspectedEvent => e.type === "delta_churn_suspected");
+    corrections = deps.summaryEvents.filter((e): e is CorrectionEvent => e.type === "correction_event");
   } else {
     try {
       const eventsForSummary = await readEvents(runDir, deps);
@@ -751,6 +756,7 @@ export async function finalizeRun(
       deltaRoundEvents = eventsForSummary.filter((e): e is DeltaRoundEvent => e.type === "delta_round");
       deltaCeilingEvents = eventsForSummary.filter((e): e is DeltaRoundCeilingEvent => e.type === "delta_round_ceiling");
       deltaChurnEvents = eventsForSummary.filter((e): e is DeltaChurnSuspectedEvent => e.type === "delta_churn_suspected");
+      corrections = eventsForSummary.filter((e): e is CorrectionEvent => e.type === "correction_event");
     } catch {
       // Non-fatal: missing or unreadable events.jsonl → empty arrays
     }
@@ -788,6 +794,7 @@ export async function finalizeRun(
     schema_version: RUN_SCHEMA_VERSION,
     run_id: fileRunId,
     interventions,
+    corrections,
   };
   const cleanedBundle = sanitizeDeep(summaryWithVersion);
   const serialized = sanitize(redactSecrets(`${JSON.stringify(cleanedBundle, null, 2)}\n`));
@@ -874,6 +881,25 @@ export async function listRunIds(
 
   withMtime.sort((a, b) => b.mtime - a.mtime);
   return withMtime.map((e) => e.name);
+}
+
+// ---------------------------------------------------------------------------
+// latestRunDirForIssue — locate the current run directory for a
+// Pipeline-owned correction_event emission point (#499), host-locally.
+// ---------------------------------------------------------------------------
+
+/** Return the absolute path of the most-recent run directory for `issueNumber`
+ *  (by run-id prefix, already sorted by mtime descending by `listRunIds`), or
+ *  `null` when no matching run directory exists. */
+export async function latestRunDirForIssue(
+  repoDir: string,
+  issueNumber: number,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<string | null> {
+  const allIds = await listRunIds(repoDir, deps);
+  const prefix = `${issueNumber}-`;
+  const matchId = allIds.find((rid) => rid.startsWith(prefix));
+  return matchId ? runDirPath(repoDir, matchId) : null;
 }
 
 // ---------------------------------------------------------------------------

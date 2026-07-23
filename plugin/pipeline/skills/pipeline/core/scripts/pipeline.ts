@@ -64,6 +64,7 @@ import {
   finalizeRun,
   initRunDir,
   isValidSummaryBundle,
+  latestRunDirForIssue,
   latestRunEventsSummaryForIssue,
   latestSummaryForIssue,
   listRunIds,
@@ -96,6 +97,19 @@ import * as shipchecKStage from "./stages/shipcheck.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
+import {
+  emitCorrectionEvent,
+  CORRECTION_SOURCE_KINDS,
+  CORRECTION_FAILURE_CLASSES,
+  CORRECTION_REUSABLE,
+  CORRECTION_PROPOSED_CONTROLS,
+  EVIDENCE_REF_KINDS,
+  type CorrectionFailureClass,
+  type CorrectionProposedControl,
+  type CorrectionReusable,
+  type CorrectionSourceKind,
+  type EvidenceRefKind,
+} from "./correction.ts";
 import {
   formatDoctorJson,
   formatDoctorSummary,
@@ -258,6 +272,20 @@ export interface CliOpts {
   resume?: string;
   /** loop: read-only report for the run instead of starting/resuming. */
   audit?: boolean;
+  /** correction record: issue number to record the correction against. */
+  issue?: number;
+  /** correction record: bounded source kind (override|rejection|retry|repair|unblock|manual). */
+  sourceKind?: string;
+  /** correction record: bounded failure class. */
+  failureClass?: string;
+  /** correction record: evidence reference, "<kind>:<id>" (kind one of finding|blocker|event|comment|artifact). */
+  evidenceRef?: string;
+  /** correction record: the observable correction/disposition text. */
+  correctionText?: string;
+  /** correction record: reusability disposition (yes|no|unknown). */
+  reusable?: string;
+  /** correction record: optional bounded proposed control. */
+  proposedControl?: string;
 }
 
 /**
@@ -274,7 +302,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill | evals | loop")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill | evals | loop | correction")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -348,7 +376,18 @@ export function buildCmd(): Command {
     .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)")
     // backfill options (#327)
     .option("--capability <name>", "backfill: scope the apply slice to a named capability")
-    .option("--rel <relation>", "config repo-map add/remove: depends_on or depended_on_by (default: depends_on)");
+    .option("--rel <relation>", "config repo-map add/remove: depends_on or depended_on_by (default: depends_on)")
+    // correction record (#499): a narrow, non-mutating CLI that records one
+    // correction_event against an existing run. No advance/unblock/override/
+    // merge/deploy/code-mutation authority — its only side effect is one
+    // appended, sanitized correction_event.
+    .option("--issue <n>", "correction record: issue number to record the correction against", Number)
+    .option("--source-kind <kind>", `correction record: ${CORRECTION_SOURCE_KINDS.join("|")}`)
+    .option("--failure-class <class>", `correction record: ${CORRECTION_FAILURE_CLASSES.join("|")}`)
+    .option("--evidence-ref <kind:id>", `correction record: "<kind>:<id>" evidence pointer (kind one of ${EVIDENCE_REF_KINDS.join("|")})`)
+    .option("--correction-text <text>", "correction record: the observable correction/disposition text")
+    .option("--reusable <value>", `correction record: ${CORRECTION_REUSABLE.join("|")}`)
+    .option("--proposed-control <control>", `correction record: optional — ${CORRECTION_PROPOSED_CONTROLS.join("|")}`);
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate/sync` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -777,7 +816,8 @@ async function main(): Promise<void> {
     cmd.args[0] === "triage" ||
     cmd.args[0] === "merge" ||
     cmd.args[0] === "status" ||
-    cmd.args[0] === "papercut"
+    cmd.args[0] === "papercut" ||
+    cmd.args[0] === "correction"
       ? 2
       : cmd.args[0] === "unblock" || cmd.args[0] === "override"
       ? 3
@@ -893,6 +933,108 @@ async function main(): Promise<void> {
       // Never propagate — recordPapercut is already a total function, this is
       // belt-and-suspenders at the CLI boundary per the spec's non-fatal contract.
     }
+    process.exitCode = 0;
+    return;
+  }
+
+  // Early `pipeline correction record` dispatch (#499) — a narrow, non-mutating
+  // command that records exactly one correction_event against an EXISTING run.
+  // No config resolution or gh auth required — it locates the run directory
+  // host-locally and appends via emitCorrectionEvent. It has no
+  // advance/unblock/override/merge/deploy/code-mutation path: on success its
+  // only side effect is the one appended, sanitized correction_event.
+  if (numArg === "correction") {
+    const correctionStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(correctionStart) ?? correctionStart;
+    if (cmd.args[1] !== "record") {
+      console.error(
+        'pipeline correction: unrecognized action.\n' +
+          '  Usage: pipeline correction record --issue <N> --source-kind <kind> --failure-class <class> ' +
+          '--stage <stage> --evidence-ref <kind:id> --correction-text <text> --reusable <yes|no|unknown> ' +
+          '[--proposed-control <control>] [--run-id <id>]',
+      );
+      process.exitCode = 2;
+      return;
+    }
+    const missing: string[] = [];
+    if (opts.issue === undefined) missing.push("--issue");
+    if (!opts.sourceKind) missing.push("--source-kind");
+    if (!opts.failureClass) missing.push("--failure-class");
+    if (!opts.stage) missing.push("--stage");
+    if (!opts.evidenceRef) missing.push("--evidence-ref");
+    if (!opts.correctionText) missing.push("--correction-text");
+    if (!opts.reusable) missing.push("--reusable");
+    if (missing.length > 0) {
+      console.error(`pipeline correction record: missing required field(s): ${missing.join(", ")}`);
+      process.exitCode = 2;
+      return;
+    }
+    if (!(CORRECTION_SOURCE_KINDS as readonly string[]).includes(opts.sourceKind!)) {
+      console.error(`pipeline correction record: --source-kind must be one of ${CORRECTION_SOURCE_KINDS.join("|")}`);
+      process.exitCode = 2;
+      return;
+    }
+    if (!(CORRECTION_FAILURE_CLASSES as readonly string[]).includes(opts.failureClass!)) {
+      console.error(`pipeline correction record: --failure-class must be one of ${CORRECTION_FAILURE_CLASSES.join("|")}`);
+      process.exitCode = 2;
+      return;
+    }
+    if (!(CORRECTION_REUSABLE as readonly string[]).includes(opts.reusable!)) {
+      console.error(`pipeline correction record: --reusable must be one of ${CORRECTION_REUSABLE.join("|")}`);
+      process.exitCode = 2;
+      return;
+    }
+    if (opts.proposedControl !== undefined && !(CORRECTION_PROPOSED_CONTROLS as readonly string[]).includes(opts.proposedControl)) {
+      console.error(`pipeline correction record: --proposed-control must be one of ${CORRECTION_PROPOSED_CONTROLS.join("|")}`);
+      process.exitCode = 2;
+      return;
+    }
+    const evidenceSep = opts.evidenceRef!.indexOf(":");
+    if (evidenceSep === -1) {
+      console.error('pipeline correction record: --evidence-ref must be "<kind>:<id>"');
+      process.exitCode = 2;
+      return;
+    }
+    const evidenceRefKind = opts.evidenceRef!.slice(0, evidenceSep);
+    const evidenceRefId = opts.evidenceRef!.slice(evidenceSep + 1);
+    if (!(EVIDENCE_REF_KINDS as readonly string[]).includes(evidenceRefKind)) {
+      console.error(`pipeline correction record: --evidence-ref kind must be one of ${EVIDENCE_REF_KINDS.join("|")}`);
+      process.exitCode = 2;
+      return;
+    }
+
+    const correctionRunDir = opts.runId
+      ? runDirPath(repoDir, opts.runId)
+      : await latestRunDirForIssue(repoDir, opts.issue!, defaultRunStoreDeps).catch(() => null);
+    if (!correctionRunDir) {
+      console.error(`pipeline correction record: no run found for issue #${opts.issue} (pass --run-id to target a specific run).`);
+      process.exitCode = 1;
+      return;
+    }
+
+    let repo = "";
+    try {
+      const raw = await defaultRunStoreDeps.readFile(path.join(correctionRunDir, "run.json"));
+      repo = (JSON.parse(raw) as { repo?: string }).repo ?? "";
+    } catch {
+      // run.json unreadable — repo stays "" (best-effort, non-fatal record)
+    }
+
+    await emitCorrectionEvent(correctionRunDir, {
+      issue: opts.issue!,
+      repo,
+      run_id: path.basename(correctionRunDir),
+      stage: opts.stage!,
+      source_kind: opts.sourceKind as CorrectionSourceKind,
+      failure_class: opts.failureClass as CorrectionFailureClass,
+      evidence_ref: { kind: evidenceRefKind as EvidenceRefKind, id: evidenceRefId },
+      correction: opts.correctionText!,
+      reusable: opts.reusable as CorrectionReusable,
+      ...(opts.proposedControl !== undefined
+        ? { proposed_control: opts.proposedControl as CorrectionProposedControl }
+        : {}),
+      actor_kind: "human",
+    }, defaultRunStoreDeps);
     process.exitCode = 0;
     return;
   }
@@ -2576,13 +2718,28 @@ export function buildUnblockedComment(args: {
   return attestPipelineComment("unblocked", rendered);
 }
 
+/** IO seam for {@link runUnblock} so unit tests inject fakes — no real gh. */
+export interface RunUnblockDeps {
+  getIssueDetail: typeof getIssueDetail;
+  postComment: typeof postComment;
+  clearBlocked: typeof clearBlocked;
+}
+
+const defaultRunUnblockDeps: RunUnblockDeps = {
+  getIssueDetail,
+  postComment,
+  clearBlocked,
+};
+
 async function runUnblock(
   cfg: PipelineConfig,
   issueNumber: number,
   answer: string,
   originalNumber: number = issueNumber,
+  runStoreDeps: RunStoreDeps = defaultRunStoreDeps,
+  deps: RunUnblockDeps = defaultRunUnblockDeps,
 ): Promise<void> {
-  const detail = await getIssueDetail(cfg, issueNumber);
+  const detail = await deps.getIssueDetail(cfg, issueNumber);
   if (!isBlocked(detail.labels)) {
     console.log(`#${issueNumber}: not blocked — nothing to do.`);
     return;
@@ -2590,11 +2747,30 @@ async function runUnblock(
   const stage = pickStage(detail.labels) ?? "(unknown)";
   const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const body = buildUnblockedComment({ stage, ts, answer });
-  await postComment(cfg, issueNumber, body);
-  await clearBlocked(cfg, issueNumber);
-  await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber);
+  await deps.postComment(cfg, issueNumber, body);
+  await deps.clearBlocked(cfg, issueNumber);
+  await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber, runStoreDeps);
   const unblockLine = `[pipeline] #${issueNumber}: unblocked at ${stage}`;
   console.log(unblockLine);
+
+  // #499: the label clear above just succeeded (a throw would have aborted
+  // before this point), so the unblock is durably accepted — emit exactly one
+  // correction_event. Non-fatal and best-effort: no run directory for this
+  // issue (e.g. a very old/foreign run) silently skips emission.
+  const unblockRunDir = await latestRunDirForIssue(cfg.repo_dir, originalNumber, runStoreDeps).catch(() => null);
+  if (unblockRunDir) {
+    await emitCorrectionEvent(unblockRunDir, {
+      issue: originalNumber,
+      repo: cfg.repo,
+      run_id: path.basename(unblockRunDir),
+      stage,
+      source_kind: "unblock",
+      failure_class: "blocker",
+      evidence_ref: { kind: "blocker", id: stage },
+      correction: answer,
+      reusable: "unknown",
+    }, runStoreDeps).catch(() => {});
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2627,6 +2803,7 @@ export async function runOverride(
   opts: CliOpts,
   deps: RunOverrideDeps = defaultRunOverrideDeps,
   originalNumber: number = issueNumber,
+  runStoreDeps: RunStoreDeps = defaultRunStoreDeps,
 ): Promise<void> {
   // --dry-run is incompatible: --override always records an audited disposition
   // (postComment, clearBlocked, silentTransition).  Allowing the combination would
@@ -2677,9 +2854,30 @@ export async function runOverride(
   // the blocker so the resumed run can re-evaluate with the override applied.
   if (isBlocked(detail.labels)) {
     await deps.clearBlocked(cfg, issueNumber);
-    await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber);
+    await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber, runStoreDeps);
   }
   console.log(`[pipeline] #${issueNumber}: ${overrideLogMsg}`);
+
+  // #499: the disposition comment above just posted durably — the operator's
+  // judgment (key/scope + disposition + reason) IS the accepted correction.
+  // "rejected" is a rejection disposition; every other disposition (e.g.
+  // "deferred-#N") is an override. Non-fatal/best-effort: no run directory for
+  // this issue silently skips emission.
+  const overrideRunDir = await latestRunDirForIssue(cfg.repo_dir, originalNumber, runStoreDeps).catch(() => null);
+  if (overrideRunDir) {
+    const evidenceRefId = parsed.kind === "key" ? parsed.key : `${parsed.scopeType}:${parsed.scopeValue}`;
+    await emitCorrectionEvent(overrideRunDir, {
+      issue: originalNumber,
+      repo: cfg.repo,
+      run_id: path.basename(overrideRunDir),
+      stage,
+      source_kind: parsed.disposition === "rejected" ? "rejection" : "override",
+      failure_class: "review-finding",
+      evidence_ref: { kind: "finding", id: evidenceRefId },
+      correction: `${parsed.disposition}: ${parsed.reason}`,
+      reusable: "unknown",
+    }, runStoreDeps).catch(() => {});
+  }
 
   // #135: the human's judgment WAS the key+reason — everything from here is
   // deterministic (the advance loop re-runs partitionFindings against the
@@ -2739,6 +2937,7 @@ export const _internals = {
   realPlanningRecoveryDeps,
   appendBlockerCleared,
   findBlockerClearedRunId,
+  runUnblock,
 };
 
 // Suppress unused import warnings for test-only helpers.
