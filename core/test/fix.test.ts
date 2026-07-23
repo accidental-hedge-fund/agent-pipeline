@@ -1450,7 +1450,7 @@ test("advanceFix source pin: the needs-human-decision park is evaluated before t
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
   const humanDecisionIdx = src.indexOf("decideHumanDecisionPark(\n          invokedIdentities,");
   const dnrIdx = src.indexOf("decideDoesNotReproduceAdvance(\n          invokedIdentities,");
-  const noCommitsIdx = src.indexOf('const noCommitsMsg = `${stage} reported success but produced no new commits.`;');
+  const noCommitsIdx = src.indexOf("const noCommitsMsg = noCommitSalvageFailure");
   assert.ok(humanDecisionIdx !== -1, "expected the needs-human-decision park decision call to exist");
   assert.ok(dnrIdx !== -1, "expected the does-not-reproduce decision call to exist");
   assert.ok(noCommitsIdx !== -1, "expected the no-commits block to exist");
@@ -1610,7 +1610,7 @@ test("advanceFix source pin: the all-dispositioned skip-advance return precedes 
 test("advanceFix source pin: the does-not-reproduce carve-out is checked before the no-commits block", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
   const dnrIdx = src.indexOf("decideDoesNotReproduceAdvance(\n          invokedIdentities,");
-  const noCommitsIdx = src.indexOf('const noCommitsMsg = `${stage} reported success but produced no new commits.`;');
+  const noCommitsIdx = src.indexOf("const noCommitsMsg = noCommitSalvageFailure");
   assert.ok(dnrIdx !== -1, "expected the does-not-reproduce decision call to exist");
   assert.ok(noCommitsIdx !== -1, "expected the no-commits block to exist");
   assert.ok(dnrIdx < noCommitsIdx, "the does-not-reproduce carve-out must be evaluated before the no-commits block");
@@ -2150,7 +2150,7 @@ test("advanceFix source pin: no destructive git/worktree call anywhere in fix.ts
 test("advanceFix source pin: on retry exhaustion, salvage is attempted before the terminal harness-failure block (#486)", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
   const retryIdx = src.indexOf("const retryResult = await invokeFixHarnessWithRetry(");
-  const salvageIdx = src.indexOf("const salvaged = await trySalvageUncommittedWork(", retryIdx);
+  const salvageIdx = src.indexOf("const { salvaged, failureReason: crashSalvageFailure } = await trySalvageUncommittedWork(", retryIdx);
   const blockIdx = src.indexOf('await setBlocked(cfg, issueNumber, reason, stage, "harness-failure");', retryIdx);
   assert.ok(retryIdx !== -1 && salvageIdx !== -1 && blockIdx !== -1);
   assert.ok(retryIdx < salvageIdx, "the retry loop must run before salvage is attempted");

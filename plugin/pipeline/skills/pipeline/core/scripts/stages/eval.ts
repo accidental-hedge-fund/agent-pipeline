@@ -138,14 +138,15 @@ export interface EvalDeps {
   /** Full commit messages for commits reachable from HEAD but not `baseRef`, used
    *  to validate the eval-fix commit(s) carry the required traceability trailers. */
   gitCommitMessages?: (cwd: string, baseRef: string) => Promise<string[]>;
-  /** Salvage uncommitted eval-fix work into a commit (#131). Returns true when a
-   *  salvage commit was created. */
+  /** Salvage uncommitted eval-fix work into a commit (#131). `salvaged` is true
+   *  when a salvage commit was created; `failureReason` is set when a salvage
+   *  was attempted and its git operation failed (#521). */
   salvage?: (
     wtPath: string,
     issueNumber: number,
     pipelineRunId: string,
     stageLabel: string,
-  ) => Promise<boolean>;
+  ) => Promise<{ salvaged: boolean; failureReason?: string }>;
   /** Verify the eval-fix commit message format. Injectable for tests. */
   verifyEvalFix?: (wtPath: string, headBefore: string) => Promise<VerifyResult>;
   /** Authenticated gh actor login, used to trust-filter review comments when
@@ -289,7 +290,7 @@ interface EvalFixRoundDeps {
   gitDirty: (cwd: string) => Promise<boolean>;
   gitPush: (cwd: string, branch: string) => Promise<{ code: number; stderr: string }>;
   gitCommitMessages: (cwd: string, baseRef: string) => Promise<string[]>;
-  salvage: (wtPath: string, issueNumber: number, pipelineRunId: string, stageLabel: string) => Promise<boolean>;
+  salvage: (wtPath: string, issueNumber: number, pipelineRunId: string, stageLabel: string) => Promise<{ salvaged: boolean; failureReason?: string }>;
   verifyEvalFix: (wtPath: string, headBefore: string) => Promise<VerifyResult>;
 }
 
@@ -370,11 +371,17 @@ async function runEvalFixRound(
   // uncommitted changes into a commit instead of discarding it.
   let headAfter = await deps.gitHead(wtPath);
   if (headBefore && headAfter && headBefore === headAfter) {
-    const salvaged = await deps.salvage(wtPath, issueNumber, pipelineRunId, evalFixSalvageStageLabel(issueNumber));
+    const { salvaged, failureReason } = await deps.salvage(wtPath, issueNumber, pipelineRunId, evalFixSalvageStageLabel(issueNumber));
     if (!salvaged) {
+      // #521: disclose why nothing was salvaged so the operator can see that
+      // recoverable work may still exist without reading terminal.log.
+      const reason = failureReason
+        ? `eval-gate fix round ${attempt} reported success but produced no new commits. ` +
+          `Salvage of uncommitted work also failed: ${failureReason}`
+        : `eval-gate fix round ${attempt} reported success but produced no new commits.`;
       return {
         ok: false,
-        reason: `eval-gate fix round ${attempt} reported success but produced no new commits.`,
+        reason,
         blockerKind: "harness-failure",
       };
     }

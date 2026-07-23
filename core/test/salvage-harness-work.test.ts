@@ -14,6 +14,7 @@ import {
   buildSalvageCommitMessage,
   salvageUncommittedWork,
   trySalvageUncommittedWork,
+  SALVAGE_NODE_MODULES_EXCLUDE,
   type SalvageDeps,
 } from "../scripts/salvage-harness-work.ts";
 import { enforceImplCommitRef } from "../scripts/stages/planning.ts";
@@ -91,22 +92,20 @@ test("salvage: gitCommit throws → error propagates (1.2c)", async () => {
   assert.deepEqual(calls.order, ["add:/wt"], "add ran before the failing commit");
 });
 
-test("trySalvage: returns true on dirty, false on clean, false (not throw) on git failure", async () => {
+test("trySalvage: returns {salvaged:true} on dirty, {salvaged:false} on clean, {salvaged:false} (not throw) on git failure", async () => {
   const dirty = fakeGit("?? f\n");
-  assert.equal(await trySalvageUncommittedWork("/wt", 131, RUN_ID, "implement", dirty.deps), true);
+  assert.deepEqual(await trySalvageUncommittedWork("/wt", 131, RUN_ID, "implement", dirty.deps), { salvaged: true });
 
   const clean = fakeGit("");
-  assert.equal(await trySalvageUncommittedWork("/wt", 131, RUN_ID, "implement", clean.deps), false);
+  assert.deepEqual(await trySalvageUncommittedWork("/wt", 131, RUN_ID, "implement", clean.deps), { salvaged: false });
 
   const broken = fakeGit("?? f\n");
   broken.deps.gitCommit = async () => {
     throw new Error("commit boom");
   };
-  assert.equal(
-    await trySalvageUncommittedWork("/wt", 131, RUN_ID, "implement", broken.deps),
-    false,
-    "salvage failure degrades to the caller's existing block path",
-  );
+  const res = await trySalvageUncommittedWork("/wt", 131, RUN_ID, "implement", broken.deps);
+  assert.equal(res.salvaged, false, "salvage failure degrades to the caller's existing block path");
+  assert.match(res.failureReason ?? "", /commit boom/, "the caught git failure is captured for blocker disclosure (#521)");
 });
 
 // ---------------------------------------------------------------------------
@@ -215,10 +214,12 @@ test("salvage [scoped, 3.1]: gitAddAll args restrict to scope and gitStatus rece
     (capturedArgs as string[]).includes("openspec/"),
     `gitAddAll args must include scope; got ${JSON.stringify(capturedArgs)}`,
   );
-  assert.ok(
-    (capturedArgs as string[]).includes(":(exclude)node_modules"),
-    "gitAddAll args must still exclude node_modules",
-  );
+  for (const excl of SALVAGE_NODE_MODULES_EXCLUDE) {
+    assert.ok(
+      (capturedArgs as string[]).includes(excl),
+      `gitAddAll args must still exclude node_modules; missing ${excl} in ${JSON.stringify(capturedArgs)}`,
+    );
+  }
 });
 
 test("salvage [scoped, 3.1 bites]: unscoped salvage omits openspec/ restriction and fails the authoring gate", async () => {
@@ -417,8 +418,8 @@ test("salvage [scoped, 3.4]: unscoped implement-stage salvage still stages non-o
   assert.equal(res.salvaged, true);
   assert.deepEqual(
     capturedArgs,
-    ["add", "-A", "--", ":(exclude)node_modules"],
-    "unscoped implement salvage args are byte-for-byte unchanged from the pre-#321 default",
+    ["add", "-A", "--", ...SALVAGE_NODE_MODULES_EXCLUDE],
+    "unscoped implement salvage args are byte-for-byte unchanged apart from the #521 depth-agnostic exclusion",
   );
 });
 
@@ -460,16 +461,18 @@ test("salvage [scoped, regression #321 — node_modules not excluded from restor
 
   // gitAddAll must still exclude node_modules so they are never re-staged
   assert.ok(addArgs !== null, "gitAddAll must be called");
-  assert.ok(
-    (addArgs as string[]).includes(":(exclude)node_modules"),
-    `gitAddAll must still exclude node_modules; got ${JSON.stringify(addArgs)}`,
-  );
+  for (const excl of SALVAGE_NODE_MODULES_EXCLUDE) {
+    assert.ok(
+      (addArgs as string[]).includes(excl),
+      `gitAddAll must still exclude node_modules; missing ${excl} in ${JSON.stringify(addArgs)}`,
+    );
+  }
 });
 
-test("salvage: gitAddAll receives :(exclude)node_modules pathspec when worktree contains node_modules (#180)", async () => {
+test("salvage: gitAddAll receives the depth-agnostic node_modules exclusion when worktree contains node_modules (#180)", async () => {
   // Simulates: harness exits with a node_modules symlink AND a real modified file.
-  // The salvage path must pass :(exclude)node_modules in the args so the symlink
-  // is never staged even if .git/info/exclude was not yet written.
+  // The salvage path must pass the depth-agnostic exclusion in the args so the
+  // symlink is never staged even if .git/info/exclude was not yet written.
   const status = "?? node_modules\n M core/scripts/foo.ts\n";
   let capturedArgs: string[] | null = null;
   let commitCreated = false;
@@ -481,9 +484,85 @@ test("salvage: gitAddAll receives :(exclude)node_modules pathspec when worktree 
   const res = await salvageUncommittedWork("/wt", 131, RUN_ID, "implement", deps);
   assert.equal(res.salvaged, true, "worktree is dirty so salvage must run");
   assert.ok(capturedArgs !== null, "gitAddAll must be called");
-  assert.ok(
-    (capturedArgs as string[]).includes(":(exclude)node_modules"),
-    `gitAddAll args must include :(exclude)node_modules; got ${JSON.stringify(capturedArgs)}`,
-  );
+  for (const excl of SALVAGE_NODE_MODULES_EXCLUDE) {
+    assert.ok(
+      (capturedArgs as string[]).includes(excl),
+      `gitAddAll args must include ${excl}; got ${JSON.stringify(capturedArgs)}`,
+    );
+  }
   assert.equal(commitCreated, true, "commit must be created after staging");
+});
+
+// ---------------------------------------------------------------------------
+// Regression #521: depth-agnostic node_modules exclusion for nested installs
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal reimplementation of git's pathspec-exclusion matching, scoped to the
+ * two shapes this module relies on:
+ *   - a literal exclude ("node_modules"): matches only a worktree-root entry
+ *     and its children (no glob magic, no leading-segment wildcard).
+ *   - a `glob`-magic exclude with a `**\/` prefix ("**\/node_modules" or
+ *     "**\/node_modules/**"): `**\/` matches zero or more leading path
+ *     segments, so the entry is matched at any nesting depth.
+ * Used only to prove the exclusion set actually covers a nested path — no
+ * real git process is spawned.
+ */
+function isExcludedBy(pathspecs: string[], relPath: string): boolean {
+  return pathspecs.some((spec) => {
+    if (spec === ":(exclude)node_modules") {
+      return relPath === "node_modules" || relPath.startsWith("node_modules/");
+    }
+    if (spec === ":(exclude,glob)**/node_modules") {
+      return relPath === "node_modules" || relPath.endsWith("/node_modules");
+    }
+    if (spec === ":(exclude,glob)**/node_modules/**") {
+      return relPath.startsWith("node_modules/") || relPath.includes("/node_modules/");
+    }
+    return false;
+  });
+}
+
+test("regression #521: nested node_modules install is excluded by the depth-agnostic pathspec; the legacy top-level-only pathspec misses it (bites)", () => {
+  const nested = "apps/web/node_modules/.pnpm/lodash@4/index.js";
+
+  assert.ok(
+    isExcludedBy(SALVAGE_NODE_MODULES_EXCLUDE, nested),
+    `the depth-agnostic exclusion must cover a nested install; SALVAGE_NODE_MODULES_EXCLUDE=${JSON.stringify(SALVAGE_NODE_MODULES_EXCLUDE)}`,
+  );
+
+  // Bites: narrowing back to the pre-#521 top-level-only literal pathspec no
+  // longer excludes the nested path — this is exactly the bug (#521): git add
+  // -A enumerates the ignored nested path and refuses it without -f.
+  assert.equal(
+    isExcludedBy([":(exclude)node_modules"], nested),
+    false,
+    "the legacy top-level-only pathspec must NOT exclude a nested node_modules path — proves the fix is load-bearing",
+  );
+
+  // A worktree-root node_modules entry (and its children) remains excluded too.
+  assert.ok(isExcludedBy(SALVAGE_NODE_MODULES_EXCLUDE, "node_modules"));
+  assert.ok(isExcludedBy(SALVAGE_NODE_MODULES_EXCLUDE, "node_modules/.bin/tsc"));
+});
+
+test("regression #521: salvage stages a nested-node_modules dirty worktree using the depth-agnostic exclusion", async () => {
+  const status =
+    " M apps/web/src/foo.ts\n?? apps/web/node_modules/.pnpm/lodash@4/index.js\n";
+  let capturedArgs: string[] | null = null;
+  const deps: SalvageDeps = {
+    gitStatus: async () => status,
+    gitAddAll: async (_wt, args) => { capturedArgs = [...args]; },
+    gitCommit: async () => {},
+  };
+  const res = await salvageUncommittedWork("/wt", 521, RUN_ID, "implement", deps);
+  assert.equal(res.salvaged, true, "dirty worktree with real + nested-ignored changes → salvage runs");
+  assert.ok(capturedArgs !== null, "gitAddAll must be called");
+  for (const excl of SALVAGE_NODE_MODULES_EXCLUDE) {
+    assert.ok(
+      (capturedArgs as string[]).includes(excl),
+      `gitAddAll args must include ${excl}; got ${JSON.stringify(capturedArgs)}`,
+    );
+  }
+  const msg = res.salvaged ? res.message : "";
+  assert.doesNotMatch(msg, /node_modules/, "the salvage commit message does not reference node_modules");
 });

@@ -91,14 +91,15 @@ export interface TestGateDeps {
    *  fix harness creates. Returns [] when `baseRef` equals HEAD (no new commits)
    *  or when the git command fails (non-git directory). */
   gitCommitMessages?: (cwd: string, baseRef: string) => Promise<string[]>;
-  /** Salvage uncommitted test-fix work into a commit (#131). Returns true when
-   *  a salvage commit was created. Injectable for tests. */
+  /** Salvage uncommitted test-fix work into a commit (#131). `salvaged` is true
+   *  when a salvage commit was created; `failureReason` is set when a salvage
+   *  was attempted and its git operation failed (#521). Injectable for tests. */
   salvage?: (
     wtPath: string,
     issueNumber: number,
     pipelineRunId: string,
     stageLabel: string,
-  ) => Promise<boolean>;
+  ) => Promise<{ salvaged: boolean; failureReason?: string }>;
   /** Return raw `git status --porcelain` output for dirty-path surfacing in block
    *  reasons (#352). Injectable so tests can verify path inclusion without real git. */
   gitStatusPorcelain?: (cwd: string) => Promise<string>;
@@ -424,21 +425,28 @@ export async function runTestGate(
     // committed AND left dirt still hits the dirty block (its commits must not
     // be silently amended with leftovers).
     const headAfterFix = await gitHeadFn(wtPath);
+    let salvageFailureReason: string | undefined;
     if (headBefore && headAfterFix === headBefore && (await gitDirtyFn(wtPath))) {
-      await salvageFn(wtPath, issueNumber, pipelineRunId, testFixSalvageStageLabel(issueNumber));
+      const salvageResult = await salvageFn(wtPath, issueNumber, pipelineRunId, testFixSalvageStageLabel(issueNumber));
+      salvageFailureReason = salvageResult.failureReason;
     }
 
     // Require a clean worktree after every fix attempt regardless of whether HEAD
     // advanced. If uncommitted changes remain, the test run would certify state
     // that can't be pushed as-is, defeating the gate's trust invariant.
     if (await gitDirtyFn(wtPath)) {
+      // #521: disclose why nothing was salvaged so the operator can see that
+      // recoverable work may still exist without reading terminal.log.
+      const dirtyReason =
+        "Fix harness left uncommitted changes in the working tree. " +
+        "Test results can't be trusted — stage and commit the fix before re-running.";
       return {
         skipped: false,
         passed: false,
         attempts: attempt,
-        blockReason:
-          "Fix harness left uncommitted changes in the working tree. " +
-          "Test results can't be trusted — stage and commit the fix before re-running.",
+        blockReason: salvageFailureReason
+          ? `${dirtyReason} Salvage of uncommitted work also failed: ${salvageFailureReason}`
+          : dirtyReason,
       };
     }
 

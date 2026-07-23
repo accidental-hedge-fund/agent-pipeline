@@ -159,7 +159,7 @@ function cleanFixDeps(): Pick<
     gitPush: async () => ({ code: 0, stderr: "" }),
     gitCommitMessages: async () => [],
     verifyVisualFix: async () => ({ ok: true }),
-    salvage: async () => true,
+    salvage: async () => ({ salvaged: true }),
   };
 }
 
@@ -386,6 +386,51 @@ test("visual-gate: visual-fix round → harness error → blocks (harness-failur
   assert.equal(out.advanced, false);
   assert.equal(log.blocked.length, 1);
   assert.equal(log.blocked[0].kind, "harness-failure");
+});
+
+test("visual-gate: visual-fix round → harness produces no new commit → blocks (harness-failure), visual NOT re-run", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let runCalled = 0;
+
+  const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
+  deps.runVisual = async () => { runCalled++; return failResult("visual checks failed"); };
+  deps.invoke = async () => okInvoke();
+  deps.gitHead = async () => "same-sha"; // HEAD never advances: no harness commit
+  deps.gitDirty = async () => false;
+  deps.salvage = async () => ({ salvaged: false });
+
+  const out = await advanceVisual(cfg, 701, {}, deps);
+
+  assert.equal(runCalled, 1, "the visual command must not be re-run after a failed fix round");
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "harness-failure");
+  assert.ok(log.blocked[0].reason.includes("no new commits"));
+});
+
+test("visual-gate (#521): visual-fix round → salvage attempt fails → its failure reason is threaded into the block reason", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+
+  const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
+  deps.runVisual = async () => failResult("visual checks failed");
+  deps.invoke = async () => okInvoke();
+  deps.gitHead = async () => "same-sha"; // HEAD never advances: no harness commit
+  deps.gitDirty = async () => false;
+  deps.salvage = async () => ({ salvaged: false, failureReason: "git add failed: ignored nested paths" });
+
+  const out = await advanceVisual(cfg, 701, {}, deps);
+
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.ok(log.blocked[0].reason.includes("no new commits"));
+  assert.ok(
+    log.blocked[0].reason.includes("Salvage of uncommitted work also failed: git add failed: ignored nested paths"),
+    `blocked reason must disclose the salvage failure; got: ${log.blocked[0].reason}`,
+  );
 });
 
 test("visual-gate: visual-fix round → push fails → blocks (push-failed), visual NOT re-run", async () => {
