@@ -372,7 +372,7 @@ export function buildCmd(): Command {
     .option("--baseline <treatment_id>", "evals report: the treatment_id every paired delta is computed against (required)")
     .option("--judge", "evals grade: opt in to the optional model judge (disabled by default; recorded separately from deterministic grades)")
     .option("--top <n>", "improve: emit top-N clusters in the report (default: 5)", Number)
-    .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, requires --apply)", Number)
+    .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, 2 for the correction category; requires --apply)", Number)
     .option("--interventions", "improve: print an intervention summary as JSON instead of the cluster report")
     .option("--remove-worktree", "remove issue N's on-disk worktree and local branch, then exit (bypasses kill switch)")
     .option("--force", "modifier for --remove-worktree: remove despite uncommitted changes (usage error without --remove-worktree)")
@@ -498,13 +498,15 @@ async function main(): Promise<void> {
     process.stdout.write(
       "Usage: pipeline improve [--apply] [--top <n>] [--since <date>] [--min-occurrences <n>] [--json]\n\n" +
       "Read-only analyzer: reads .agent-pipeline/runs/**/events.jsonl and summary.json,\n" +
-      "clusters recurring failure patterns (review findings, blockers, flaky gates, token waste),\n" +
-      "and prints a dry-run report. With --apply, creates GitHub issues for the top clusters.\n\n" +
+      "clusters recurring failure patterns (review findings, blockers, flaky gates, token waste,\n" +
+      "papercuts, and recurring correction_event corrections), and prints a dry-run report.\n" +
+      "With --apply, creates GitHub issues for the top clusters.\n\n" +
       "Options:\n" +
       "  --apply                   create GitHub issues for top-N qualifying clusters\n" +
       "  --top <n>                 emit top-N clusters in the report (default: 5)\n" +
       "  --since <date>            restrict to runs on or after this ISO date (e.g. 2026-06-01)\n" +
-      "  --min-occurrences <n>     --apply threshold: skip clusters below this count (default: 3)\n" +
+      "  --min-occurrences <n>     --apply threshold: skip clusters below this count (default: 3;\n" +
+      "                            2 for the correction category)\n" +
       "  --json                    emit a JSON array instead of the Markdown-ish report\n" +
       "  --repo-path <path>        override the target repo working tree\n\n" +
       "The command never modifies pipeline labels, branches, PRs, worktrees, or repo files.\n" +
@@ -1251,6 +1253,7 @@ async function main(): Promise<void> {
           base: opts.base,
           domain: queueCfg.domain,
           papercuts: queueCfg.papercuts,
+          corrections: queueCfg.corrections,
         },
         realQueueDeps(queueCfg.repo_dir, opts.profile),
       );

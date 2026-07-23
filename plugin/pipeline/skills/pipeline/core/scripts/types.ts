@@ -755,6 +755,18 @@ export interface PipelineConfig {
     auto_file_max_per_window: number;
     auto_file_min_occurrences: number;
   };
+  // Correction auto-file (#500). Opt-in; default disabled. Unlike `papercuts`,
+  // correction capture itself is unconditional (#499 — every accepted operator
+  // correction or recovered failure is recorded regardless of config), so this
+  // block only gates auto-filing, mirroring `papercuts`' auto_file_* keys with
+  // no capture-side `enabled` flag. Honors the single-host concurrency scope of
+  // #459 — see `core/scripts/stages/papercut.ts` (`autoFileCorrections`).
+  corrections: {
+    auto_file: boolean;
+    auto_file_window_hours: number;
+    auto_file_max_per_window: number;
+    auto_file_min_occurrences: number;
+  };
   // Worktree bootstrap: dependency install step (#174).
   // When set to a non-empty string, that shell command is run in the worktree
   // instead of auto-detection. When set to "" the install step is skipped
@@ -958,6 +970,14 @@ export const DEFAULT_CONFIG: Omit<
     auto_file_window_hours: 24,
     auto_file_max_per_window: 3,
     auto_file_min_occurrences: 3,
+  },
+  corrections: {
+    auto_file: false,
+    auto_file_window_hours: 24,
+    auto_file_max_per_window: 3,
+    // Floor is 2 (config.ts enforces via zod .min(2)) — matches the
+    // correction category's own default --min-occurrences (#500).
+    auto_file_min_occurrences: 2,
   },
   format_gate: [] as { command: string; auto_fix: boolean }[],
   harness_sandbox: false,

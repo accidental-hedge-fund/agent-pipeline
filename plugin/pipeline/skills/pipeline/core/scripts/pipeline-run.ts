@@ -61,7 +61,7 @@ import {
 import { makePipelineRunId } from "./traceability.ts";
 import { parseOverrideArg } from "./review-policy.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
-import { autoFilePapercuts, realAutoFileDeps } from "./stages/papercut.ts";
+import { autoFileCorrections, autoFilePapercuts, realAutoFileDeps } from "./stages/papercut.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -1015,6 +1015,21 @@ export async function runAdvance(
                 windowHours: cfg.papercuts.auto_file_window_hours,
                 maxPerWindow: cfg.papercuts.auto_file_max_per_window,
                 minOccurrences: cfg.papercuts.auto_file_min_occurrences,
+              },
+              realAutoFileDeps(cfg.repo_dir),
+            ).catch(() => {});
+          }
+          // Opt-in correction auto-file (#500): correction_event capture (#499) is
+          // unconditional, so this gates only on auto_file (no capture-side enabled flag,
+          // unlike papercuts). Best-effort, wrapped so a failure can never alter the run's outcome.
+          if (cfg.corrections.auto_file) {
+            await autoFileCorrections(
+              {
+                repoDir: cfg.repo_dir,
+                domain: cfg.domain,
+                windowHours: cfg.corrections.auto_file_window_hours,
+                maxPerWindow: cfg.corrections.auto_file_max_per_window,
+                minOccurrences: cfg.corrections.auto_file_min_occurrences,
               },
               realAutoFileDeps(cfg.repo_dir),
             ).catch(() => {});

@@ -60,6 +60,7 @@ function makeDeps(overrides: Partial<QueueDeps> = {}): QueueDeps & { written: Ma
     readRunCost: async (_issueNumber) => null,
     writeFile: async (filePath, content) => { written.set(filePath, content); },
     autoFilePapercuts: async () => {},
+    autoFileCorrections: async () => {},
     log: (msg) => { logs.push(msg); },
     clock: () => ++tick * 100,
     written,
@@ -562,6 +563,7 @@ test("papercut auto-file: papercuts absent makes zero autoFilePapercuts calls", 
   const deps = makeDeps({
     listEligibleIssues: async () => issues,
     autoFilePapercuts: async () => { calls++; },
+    autoFileCorrections: async () => {},
   });
   await runQueue(makeOpts({ papercuts: undefined }), deps);
   assert.equal(calls, 0);
@@ -573,6 +575,7 @@ test("papercut auto-file: auto_file false makes zero autoFilePapercuts calls", a
   const deps = makeDeps({
     listEligibleIssues: async () => issues,
     autoFilePapercuts: async () => { calls++; },
+    autoFileCorrections: async () => {},
   });
   await runQueue(
     makeOpts({
@@ -596,6 +599,7 @@ test("papercut auto-file: enabled false makes zero autoFilePapercuts calls even 
   const deps = makeDeps({
     listEligibleIssues: async () => issues,
     autoFilePapercuts: async () => { calls++; },
+    autoFileCorrections: async () => {},
   });
   await runQueue(
     makeOpts({
@@ -619,6 +623,7 @@ test("papercut auto-file: auto_file true fires exactly once at batch end with re
   const deps = makeDeps({
     listEligibleIssues: async () => issues,
     autoFilePapercuts: async (opts) => { calls.push(opts); },
+    autoFileCorrections: async () => {},
   });
   await runQueue(
     makeOpts({
@@ -651,6 +656,7 @@ test("papercut auto-file: a failing autoFilePapercuts still leaves batch-summary
     listEligibleIssues: async () => issues,
     writeFile: async (p, c) => { written.set(p, c); },
     autoFilePapercuts: async () => { throw new Error("simulated gh failure"); },
+    autoFileCorrections: async () => {},
   });
   await assert.doesNotReject(() =>
     runQueue(
