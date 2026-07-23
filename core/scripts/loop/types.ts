@@ -425,6 +425,36 @@ export interface ScheduleDecision {
   rationale: ScheduleRationale[];
 }
 
+// ---------------------------------------------------------------------------
+// Run-scoped parallelization decision ledger (#528, capability
+// `conflict-aware-parallel-execution`). A pure accumulation of the
+// independent-set scheduler's already-emitted per-pass `loop_schedule_evaluated`
+// planning records into one durable, run-lifetime, per-pair view — see
+// loop/parallelization-ledger.ts and
+// openspec/changes/conflict-aware-parallel-execution/design.md. It re-decides
+// nothing and adds no external write path.
+// ---------------------------------------------------------------------------
+
+export const LOOP_PARALLELIZATION_DISPOSITIONS = ["parallelized", "serialized"] as const;
+
+export type LoopParallelizationDisposition = (typeof LOOP_PARALLELIZATION_DISPOSITIONS)[number];
+
+export function isLoopParallelizationDisposition(value: unknown): value is LoopParallelizationDisposition {
+  return typeof value === "string" && (LOOP_PARALLELIZATION_DISPOSITIONS as readonly string[]).includes(value);
+}
+
+/** One run-scoped ledger entry — an unordered item pair (`a_item_id` < `b_item_id`,
+ *  lexically sorted, so a pair's ordering is deterministic regardless of which item's rationale
+ *  named the other), its disposition, and exactly one reason drawn from the scheduler's own
+ *  closed {@link ScheduleDisposition} set — no new reason vocabulary (design.md "A run-scoped
+ *  ledger that accumulates, not a second decision path"). */
+export interface LoopParallelizationLedgerEntry {
+  a_item_id: string;
+  b_item_id: string;
+  disposition: LoopParallelizationDisposition;
+  reason: ScheduleDisposition;
+}
+
 /** The durable replan-request record for changed-file-overlap parking (design.md Decision 5) — an
  *  audit/hold artifact only; producing it never merges, pushes, or deletes a branch/worktree. */
 export interface LoopReplanRequest {

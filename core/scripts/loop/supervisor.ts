@@ -268,6 +268,9 @@ export async function runSupervisorCycle(
     // additionally now records a durable allow/deny rationale for every eligible candidate.
     const decision = selectSchedulableSet({ contract, ledger, externalStatuses });
     if (decision.rationale.length > 0) {
+      // This durable event is the sole source the run-scoped parallelization decision ledger
+      // (#528, loop/parallelization-ledger.ts) accumulates from — it adds no second write path;
+      // see openspec/changes/conflict-aware-parallel-execution/design.md.
       await appendEvent(deps.store, runId, token, "loop_schedule_evaluated", decision);
     }
     for (const itemId of decision.selected) {
