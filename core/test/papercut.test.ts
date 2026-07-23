@@ -1164,7 +1164,9 @@ test("autoFileCorrections: body carries the correction provenance marker, contro
 
 test("autoFileCorrections: dedup suppresses filing when an open issue already matches the title", async () => {
   const at = new Date(NOW_MS - 3600_000).toISOString();
-  const existingTitle = "[pipeline-improve] Recurring correction: use x instead of y";
+  // Title identity is the deterministic correction_key (#500 review 1 finding
+  // fcb8ee87), not the free-text correction prose.
+  const existingTitle = "[pipeline-improve] Recurring correction: k1";
   const deps = makeAutoFileDeps({
     openIssues: [{ title: existingTitle, url: "https://github.com/org/repo/issues/1", state: "OPEN", createdAt: new Date(NOW_MS).toISOString(), labels: ["pipeline:backlog"] }],
     runs: {

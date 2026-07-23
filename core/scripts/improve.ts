@@ -38,6 +38,10 @@ export type ControlLevel =
  *  (#500). Every field is derived purely from the `correction_event` contract
  *  (#499) — never from raw-text similarity or an LLM. */
 export interface CorrectionEvidence {
+  /** The event contract's deterministic `correction_key` (#499) — the cluster's
+   *  identity. Used as the dedup/title identity for auto-filed issues so that
+   *  issue-level dedup never depends on free-text correction prose (#500 review 1). */
+  correctionKey: string;
   distinctRunCount: number;
   distinctItemIds: string[];
   firstSeen: string | null;
@@ -112,8 +116,18 @@ export interface ImproveDeps {
 
 /** `[pipeline-improve]`-prefixed issue title proposed for a cluster. Shared by
  *  the report, dedup lookup, and issue-creation paths so all three agree on
- *  the same title string. */
-export function proposedTitle(c: Pick<ClusterEntry, "category" | "signal">): string {
+ *  the same title string.
+ *
+ *  For `correction` clusters, the title's identity is the deterministic
+ *  `correction_key` (#500 review 1 finding fcb8ee87) rather than free-text
+ *  `signal` prose — two different `correction_key`s that happen to normalize
+ *  to identical prose must not collide, and the same `correction_key` whose
+ *  source prose changes must still dedup against its prior issue. Prose stays
+ *  in the issue body as descriptive evidence only. */
+export function proposedTitle(c: Pick<ClusterEntry, "category" | "signal" | "correction">): string {
+  if (c.category === "correction" && c.correction) {
+    return `[pipeline-improve] Recurring correction: ${c.correction.correctionKey}`;
+  }
   return `[pipeline-improve] Recurring ${c.category}: ${c.signal.slice(0, 60)}`;
 }
 
@@ -328,12 +342,19 @@ export interface ClusterAccum {
    *  repeated delivery/replay of one correction_id (#499 idempotency) never
    *  double-counts an occurrence. */
   correctionIds?: Set<string>;
+  /** The `correction_key` this cluster is keyed on — the title/dedup identity
+   *  for auto-filed correction issues (#500 review 1). */
+  correctionKey?: string;
   itemIds?: Set<string>;
   stages?: Set<string>;
   actors?: Set<string>;
   failureClasses?: Set<string>;
-  /** Distinct `proposed_control` values seen — a cluster only gets a
-   *  deterministic control level when this set has exactly one member. */
+  /** `proposed_control` recorded per distinct `correction_id` — including an
+   *  empty string when a distinct occurrence carries no `proposed_control` at
+   *  all. A cluster only gets a deterministic control level when this set has
+   *  exactly one member and it's a valid, non-empty level; any absent or
+   *  mixed occurrence yields a second distinct member and falls back to
+   *  `undetermined` (#500 review 1 finding cc5edfd1). */
   proposedControls?: Set<string>;
   firstSeen?: string;
   lastSeen?: string;
@@ -562,6 +583,7 @@ export function clusterCorrections(
       runIds: new Set(),
       excerpt: truncateExcerpt(sanitize(redactSecrets(correctionText || correctionKey))),
       correctionIds: new Set(),
+      correctionKey,
       itemIds: new Set(),
       stages: new Set(),
       actors: new Set(),
@@ -576,7 +598,6 @@ export function clusterCorrections(
   if (stage) existing.stages!.add(stage);
   if (actorKind) existing.actors!.add(actorKind);
   if (failureClass) existing.failureClasses!.add(failureClass);
-  if (proposedControl) existing.proposedControls!.add(proposedControl);
   if (at) {
     if (!existing.firstSeen || at < existing.firstSeen) existing.firstSeen = at;
     if (!existing.lastSeen || at > existing.lastSeen) existing.lastSeen = at;
@@ -584,6 +605,12 @@ export function clusterCorrections(
   if (!existing.correctionIds!.has(correctionId)) {
     existing.correctionIds!.add(correctionId);
     existing.count = existing.correctionIds!.size;
+    // Recorded once per distinct correction_id, including "" when absent, so
+    // an occurrence with no proposed_control is never silently dropped from
+    // consideration — it shows up as a second distinct member alongside any
+    // real level and correctly forces `undetermined` (#500 review 1 finding
+    // a239bc44cbf42e7f).
+    existing.proposedControls!.add(proposedControl);
   }
 }
 
@@ -696,6 +723,7 @@ export function clustersToEntries(
       };
       if (c.category === "correction") {
         entry.correction = {
+          correctionKey: c.correctionKey ?? "",
           distinctRunCount: c.runIds.size,
           distinctItemIds: [...(c.itemIds ?? [])],
           firstSeen: c.firstSeen ?? null,

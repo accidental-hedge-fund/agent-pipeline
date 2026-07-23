@@ -712,6 +712,14 @@ test("graduation ladder: mixed eval/human-judgment proposed_control resolves to 
   assert.equal(entry.correction!.controlLevel, "undetermined");
 });
 
+test("graduation ladder: one occurrence with proposed_control and one distinct occurrence with none resolves to undetermined, never silently to the single named level (#500 review 1 finding cc5edfd1)", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1", proposed_control: "eval" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_id: "id-2", proposed_control: undefined }), "run-2", clusters);
+  const entry = clustersToEntries(clusters, 10).find((e) => e.category === "correction")!;
+  assert.equal(entry.correction!.controlLevel, "undetermined");
+});
+
 test("renderControlProposal: names the level, includes a rationale, and includes acceptance criteria", () => {
   const clusters = new Map();
   clusterCorrections(correctionEvent({ correction_id: "id-1", proposed_control: "skill-rubric" }), "run-1", clusters);
@@ -1178,6 +1186,42 @@ test("applyIssues: two clusters that truncate to the same title in one invocatio
   );
   assert.equal(clusters[0].issueUrl, "https://github.com/org/repo/issues/1");
   assert.equal(clusters[1].alreadyTracked, true, "the second cluster should be recognized as a duplicate of the just-created title");
+});
+
+test("applyIssues: correction dedup keys on correction_key, not free-text prose (#500 review 1 finding fcb8ee87)", async () => {
+  // Same correction_key, prose changed between runs (e.g. wording tweaked) — must
+  // still dedup against the prior issue rather than filing a second one.
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1", correction: "original wording" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_id: "id-2", correction: "revised wording, totally different prose" }), "run-2", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const openIssues: OpenImproveIssue[] = [
+    {
+      title: proposedTitle(entries[0]),
+      url: "https://github.com/org/repo/issues/42",
+      state: "OPEN",
+      createdAt: "2026-07-01T00:00:00Z",
+      labels: [],
+    },
+  ];
+  const deps = makeApplyDeps({ openIssues });
+  await applyIssues(entries, {}, deps);
+  assert.equal(deps._createCalls.length, 0, "changed prose under the same correction_key must still dedup");
+  assert.equal(entries[0].alreadyTracked, true);
+});
+
+test("applyIssues: two different correction_key clusters with identical prose file two issues, never merge (#500 review 1 finding fcb8ee87)", async () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_key: "key-a", correction_id: "id-1", correction: "same wording" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_key: "key-a", correction_id: "id-2", correction: "same wording" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_key: "key-b", correction_id: "id-3", correction: "same wording" }), "run-2", clusters);
+  clusterCorrections(correctionEvent({ correction_key: "key-b", correction_id: "id-4", correction: "same wording" }), "run-2", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  assert.equal(entries.length, 2);
+  const deps = makeApplyDeps();
+  await applyIssues(entries, {}, deps);
+  assert.equal(deps._createCalls.length, 2, "identical prose under different correction_keys must not dedup against each other");
+  assert.notEqual(deps._createCalls[0].title, deps._createCalls[1].title);
 });
 
 test("applyIssues: listOpenImproveIssues is called exactly once regardless of cluster count", async () => {
