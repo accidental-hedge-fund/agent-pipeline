@@ -364,6 +364,74 @@ export interface LoopContract {
    *  goal-loop run — names the schema id the run originated from. Absent for
    *  natively-compiled contracts. */
   imported_from_schema?: string;
+  /** Additive, optional run policy governing the scheduler's concurrency budget (#530, capability
+   *  `durable-run-independent-scheduler`). Absent, or `max_concurrent: 1`, keeps the run's
+   *  observable behavior identical to the pre-#530 serialized single-active-item invariant —
+   *  concurrency above one is admitted only when {@link selectSchedulableSet} (loop/schedule.ts)
+   *  can additionally prove the extra items independent. */
+  concurrency?: LoopConcurrencyPolicy;
+}
+
+// ---------------------------------------------------------------------------
+// Durable-run independent-set scheduler (#530, capability
+// `durable-run-independent-scheduler`). Consumes dependency (loop/dependencies.ts), ownership
+// (loop/ownership.ts), reconciliation drift, and merge-barrier state to select a
+// concurrency-bounded, provably-independent set of items — see loop/schedule.ts and
+// openspec/changes/durable-run-independent-scheduler/design.md.
+// ---------------------------------------------------------------------------
+
+export interface LoopConcurrencyPolicy {
+  /** A positive-integer concurrency budget. `1` (or the field's absence) is fully serialized —
+   *  identical to today's single-active-item behavior. */
+  max_concurrent: number;
+}
+
+/** The closed set of scheduling dispositions — every eligible candidate is recorded as exactly
+ *  one of these (design.md Decision 3's fixed reason precedence). */
+export const SCHEDULE_DISPOSITIONS = [
+  "admitted",
+  "dependency_path",
+  "conflict_edge",
+  "unknown_ownership",
+  "merge_barrier",
+  "unresolved_drift",
+  "budget_truncation",
+] as const;
+
+export type ScheduleDisposition = (typeof SCHEDULE_DISPOSITIONS)[number];
+
+export function isScheduleDisposition(value: unknown): value is ScheduleDisposition {
+  return typeof value === "string" && (SCHEDULE_DISPOSITIONS as readonly string[]).includes(value);
+}
+
+/** One eligible candidate's recorded scheduling rationale — exactly one structured disposition.
+ *  `counterpart_item_id` names the other item the disposition was decided against, when the
+ *  disposition is inherently pairwise (`dependency_path`, `conflict_edge`, `unknown_ownership`);
+ *  absent for `admitted`, `merge_barrier`, `unresolved_drift`, and `budget_truncation`, which carry
+ *  no counterpart. `detail` is an optional human-readable elaboration (e.g. the overlapping
+ *  surface). */
+export interface ScheduleRationale {
+  item_id: string;
+  disposition: ScheduleDisposition;
+  counterpart_item_id?: string;
+  detail?: string;
+}
+
+/** The scheduler's deterministic output for one planning pass — a pure decision that itself
+ *  starts, merges, or serializes nothing (design.md Goals). `selected` is ordered by the same
+ *  documented total order the rationale entries are evaluated in. */
+export interface ScheduleDecision {
+  selected: string[];
+  rationale: ScheduleRationale[];
+}
+
+/** The durable replan-request record for changed-file-overlap parking (design.md Decision 5) — an
+ *  audit/hold artifact only; producing it never merges, pushes, or deletes a branch/worktree. */
+export interface LoopReplanRequest {
+  time: string;
+  affected_item_ids: string[];
+  overlapping_paths: string[];
+  reason: string;
 }
 
 export interface LoopHistoryEntry {

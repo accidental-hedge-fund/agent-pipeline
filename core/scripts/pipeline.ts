@@ -574,6 +574,33 @@ export function realDispatchItem(cfg: PipelineConfig, engine: LoopEngine): Super
   };
 }
 
+/** Injectable seam for {@link realGetChangedFiles} — defaults to the real
+ *  on-disk worktree lookup and `git diff`, overridable so unit tests exercise
+ *  the changed-file mapping/filtering with no real filesystem/git access. */
+export interface RealGetChangedFilesDeps {
+  getOnDiskForIssue?: typeof getOnDiskForIssue;
+  gitInWorktree?: typeof gitInWorktree;
+}
+
+/** The real live changed-file-overlap observer (#530 review 1, finding
+ *  ffbf2be1): resolves an item's on-disk managed worktree (zero gh API calls
+ *  via {@link getOnDiskForIssue}) and diffs it against the configured base
+ *  branch. Returns an empty list when the item has no on-disk worktree yet —
+ *  the overlap check this feeds is a post-run safety net over declared
+ *  ownership, so "nothing observed yet" degrades to "no overlap observed"
+ *  rather than throwing and failing an otherwise-successful cycle. */
+export function realGetChangedFiles(cfg: PipelineConfig, deps: RealGetChangedFilesDeps = {}): SupervisorDeps["getChangedFiles"] {
+  const getOnDiskForIssueFn = deps.getOnDiskForIssue ?? getOnDiskForIssue;
+  const gitInWorktreeFn = deps.gitInWorktree ?? gitInWorktree;
+  return async (itemId: string): Promise<string[]> => {
+    const issueNumber = Number(itemId);
+    const wt = await getOnDiskForIssueFn(cfg, issueNumber);
+    if (!wt) return [];
+    const result = await gitInWorktreeFn(wt.path, ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`], { ignoreFailure: true });
+    return result.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  };
+}
+
 /** One open issue's labels/milestone, as needed to resolve a `milestone` or
  *  `label` selector into a concrete work list. */
 export interface SelectorOpenIssue {
@@ -750,6 +777,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     store,
     observe: defaultReconcileObserveDeps(cfg),
     dispatchItem: realDispatchItem(cfg, input.engine),
+    getChangedFiles: realGetChangedFiles(cfg),
     // Opt-in durable-run-blocker auto-file (#538): best-effort, gated on
     // resolved config, wrapped so a failure here can never alter the drive
     // result (driveSupervisor's own onDriveEnd call site already swallows any

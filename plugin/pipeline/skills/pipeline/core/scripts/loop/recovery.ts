@@ -334,6 +334,12 @@ export interface BlockItemInput {
   blockerClass: DurableBlockerClass | string;
   evidence: string;
   note?: string;
+  /** Batch/deferred-stop escape hatch (#530 review 2 finding a7abc98c): when true, this call
+   *  still records the item's own block classification even if the ledger already carries a
+   *  terminal `stop` from an earlier item processed in the same concurrent batch — the existing
+   *  first-cause `stop` record is preserved (not overwritten). Only the supervisor's same-cycle
+   *  sibling classification pass sets this; every other caller keeps the default refusal. */
+  allowAlreadyStopped?: boolean;
 }
 
 /** Transitions an item into `blocked` carrying a validated
@@ -364,7 +370,7 @@ export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract
   const contract = upgradeContractForRecovery(contractInput);
 
   const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId));
-  if (ledger.stop) {
+  if (ledger.stop && !input.allowAlreadyStopped) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
   const item = ledger.items[input.itemId];
@@ -390,18 +396,24 @@ export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract
   item.repeated_evidence_count = repeatedCount;
   item.history.push({ time, from: fromState, to: "blocked", engine: input.engine, theme: blockerClass, evidence: input.evidence, note: input.note });
 
-  if (policyEntry.terminal_outcome === "human_authority") {
-    ledger.stop = { reason: "human_authority", time, item_id: input.itemId, theme: blockerClass };
-  } else if (repeatedCount >= policyEntry.repeated_evidence_limit) {
-    ledger.stop = {
-      reason: "repeated_no_progress",
-      time,
-      item_id: input.itemId,
-      theme: blockerClass,
-      fingerprint,
-    };
-  } else if (policyEntry.run_fatal) {
-    ledger.stop = { reason: "run_fatal", time, item_id: input.itemId, theme: blockerClass };
+  // A batch call that already found `ledger.stop` set never overwrites that first-cause stop
+  // record with its own — the run is already terminally stopped for the earlier reason, and this
+  // item's own classification is recorded regardless (#530 review 2 finding a7abc98c).
+  const stopAlreadyRecorded = !!ledger.stop;
+  if (!ledger.stop) {
+    if (policyEntry.terminal_outcome === "human_authority") {
+      ledger.stop = { reason: "human_authority", time, item_id: input.itemId, theme: blockerClass };
+    } else if (repeatedCount >= policyEntry.repeated_evidence_limit) {
+      ledger.stop = {
+        reason: "repeated_no_progress",
+        time,
+        item_id: input.itemId,
+        theme: blockerClass,
+        fingerprint,
+      };
+    } else if (policyEntry.run_fatal) {
+      ledger.stop = { reason: "run_fatal", time, item_id: input.itemId, theme: blockerClass };
+    }
   }
 
   await writeLedger(deps, ledger, input.token);
@@ -411,7 +423,7 @@ export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract
     evidence_fingerprint: fingerprint,
     repeated_evidence_count: repeatedCount,
   });
-  if (ledger.stop) {
+  if (ledger.stop && !stopAlreadyRecorded) {
     await appendEvent(deps, input.runId, input.token, "loop_run_stopped", {
       reason: ledger.stop.reason,
       item_id: input.itemId,
