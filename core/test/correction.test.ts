@@ -92,6 +92,7 @@ test("deriveCorrectionId: identical inputs → identical id (replay is idempoten
     source_kind: "repair" as const,
     evidence_ref: { kind: "finding" as const, id: "abc12345" },
     reviewed_sha: "f".repeat(40),
+    correction: "cleared on re-check",
   };
   assert.equal(deriveCorrectionId(args), deriveCorrectionId({ ...args }));
 });
@@ -101,6 +102,7 @@ test("deriveCorrectionId: distinct evidence_ref.id → distinct id", () => {
     run_id: "499-2026-07-23T00-00-00-000Z",
     source_kind: "repair" as const,
     reviewed_sha: "f".repeat(40),
+    correction: "cleared on re-check",
   };
   const a = deriveCorrectionId({ ...base, evidence_ref: { kind: "finding", id: "abc12345" } });
   const b = deriveCorrectionId({ ...base, evidence_ref: { kind: "finding", id: "def67890" } });
@@ -112,9 +114,25 @@ test("deriveCorrectionId: distinct reviewed_sha → distinct id (different round
     run_id: "499-2026-07-23T00-00-00-000Z",
     source_kind: "repair" as const,
     evidence_ref: { kind: "finding" as const, id: "abc12345" },
+    correction: "cleared on re-check",
   };
   const a = deriveCorrectionId({ ...base, reviewed_sha: "a".repeat(40) });
   const b = deriveCorrectionId({ ...base, reviewed_sha: "b".repeat(40) });
+  assert.notEqual(a, b);
+});
+
+test("deriveCorrectionId: distinct correction text (same evidence/run/source/sha) → distinct id — regression for #499 finding cb4662e7", () => {
+  // Two distinct manual dispositions tied to the same finding in the same run
+  // must not collapse to one correction_id, or downstream replay dedup would
+  // silently discard the second disposition.
+  const base = {
+    run_id: "499-2026-07-23T00-00-00-000Z",
+    source_kind: "override" as const,
+    evidence_ref: { kind: "finding" as const, id: "abc12345" },
+    reviewed_sha: "f".repeat(40),
+  };
+  const a = deriveCorrectionId({ ...base, correction: "deferred-#600: tracked separately" });
+  const b = deriveCorrectionId({ ...base, correction: "rejected: false positive" });
   assert.notEqual(a, b);
 });
 
@@ -179,11 +197,11 @@ test("emitCorrectionEvent: reviewed_sha/head_sha present as strings when supplie
   assert.equal(event.head_sha, sha);
 });
 
-test("emitCorrectionEvent: actor_kind override forces human regardless of source_kind (correction record CLI)", async () => {
+test("emitCorrectionEvent: actor_kind is always derived from source_kind — no override accepted — regression for #499 finding 36c6080c", async () => {
   const { deps, lines } = memDeps();
-  await emitCorrectionEvent("/tmp/run", { ...BASE_PAYLOAD, source_kind: "retry", actor_kind: "human" }, deps);
+  await emitCorrectionEvent("/tmp/run", { ...BASE_PAYLOAD, source_kind: "retry" }, deps);
   const event = JSON.parse(lines()[0]) as CorrectionEvent;
-  assert.equal(event.actor_kind, "human");
+  assert.equal(event.actor_kind, "pipeline");
 });
 
 test("emitCorrectionEvent: replay of the same correction (same evidence/sha/run/source) yields the same correction_id", async () => {
@@ -227,7 +245,7 @@ test("emitCorrectionEvent: correction text is capped at 500 chars", async () => 
   assert.equal(event.correction.length, 500);
 });
 
-test("emitCorrectionEvent: non-fatal — a throwing appendFile does not propagate", async () => {
+test("emitCorrectionEvent: non-fatal — a throwing appendFile does not propagate, and reports failure — regression for #499 finding 9f3a5ede", async () => {
   const deps: RunStoreDeps = {
     readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
     writeFile: async () => {},
@@ -237,8 +255,11 @@ test("emitCorrectionEvent: non-fatal — a throwing appendFile does not propagat
     readdir: async () => [],
     stat: async () => ({ mtime: new Date(0) }),
   };
-  // Must not throw — a stage's outcome must never depend on this succeeding.
-  await emitCorrectionEvent("/tmp/run", BASE_PAYLOAD, deps);
+  // Must not throw — a stage's outcome must never depend on this succeeding —
+  // but a caller that must not report success on a silent failure (e.g. the
+  // `correction record` CLI) can observe the resolved false.
+  const appended = await emitCorrectionEvent("/tmp/run", BASE_PAYLOAD, deps);
+  assert.equal(appended, false);
 });
 
 test("emitCorrectionEvent: sink delivery is byte-identical to the local events.jsonl line", async () => {

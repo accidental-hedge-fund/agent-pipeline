@@ -322,6 +322,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     allowedFlags: new Set([
       "repoPath", "profile", "issue", "runId", "sourceKind", "failureClass",
       "stage", "evidenceRef", "correctionText", "reusable", "proposedControl",
+      "reviewedSha", "headSha",
     ]),
     needsConfig: false,
     needsGhAuth: false,

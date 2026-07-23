@@ -131,7 +131,11 @@ export async function tryAutoRecover(
     };
   }
 
-  // Reset labels: remove implementing + blocked, add ready.
+  // Reset labels: remove implementing + blocked, add ready. Clearing
+  // `implementing` is best-effort (its presence isn't load-bearing for the
+  // reset), but clearing `blocked` is required: if it fails, the issue stays
+  // blocked and neither the ready label nor the recovery comment/correction
+  // event may be recorded as if the reset succeeded (#499 finding c41e8715).
   try {
     await deps.removeLabel(cfg, issueNumber, "pipeline:implementing");
   } catch {
@@ -139,8 +143,12 @@ export async function tryAutoRecover(
   }
   try {
     await deps.removeLabel(cfg, issueNumber, "blocked");
-  } catch {
-    /* ignore */
+  } catch (err) {
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: `auto-recovery failed to clear the blocked label: ${(err as Error).message}`,
+    };
   }
   await deps.addLabel(cfg, issueNumber, "pipeline:ready");
 

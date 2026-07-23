@@ -128,6 +128,11 @@ export function deriveCorrectionId(args: {
   source_kind: CorrectionSourceKind;
   evidence_ref: EvidenceRef;
   reviewed_sha: string | null;
+  /** The durable disposition text (post-sanitize/truncate, matching what is
+   *  actually persisted) — distinguishes two distinct corrections against the
+   *  same evidence (e.g. two different override dispositions for one finding)
+   *  while staying identical across a replay of the same correction. */
+  correction: string;
 }): string {
   const basis = [
     args.run_id,
@@ -135,6 +140,7 @@ export function deriveCorrectionId(args: {
     args.evidence_ref.kind,
     args.evidence_ref.id,
     args.reviewed_sha ?? "",
+    args.correction,
   ].join(FS);
   return createHash("sha1").update(basis).digest("hex").slice(0, 16);
 }
@@ -169,10 +175,6 @@ export interface EmitCorrectionEventPayload {
   correction: string;
   reusable: CorrectionReusable;
   proposed_control?: CorrectionProposedControl;
-  /** Override the `actor_kind` normally derived from `source_kind` (#499
-   *  correction-record-command: the `pipeline correction record` CLI always
-   *  forces `"human"`, regardless of the chosen `source_kind`). */
-  actor_kind?: CorrectionActorKind;
 }
 
 const CORRECTION_TEXT_CAP = 500;
@@ -186,13 +188,17 @@ function nowIso(): string {
  * inherits `--json-events` streaming, byte-identical event-sink delivery, and
  * `summaryEvents` accumulation. Non-fatal: an append failure (including a
  * throwing/rejecting `appendEvent`) is caught and logged as a warning and never
- * propagates, matching every other run-store emitter.
+ * propagates, matching every other run-store emitter. Returns whether the
+ * event was actually durably appended, so a caller that must not report
+ * success on a silent failure (e.g. the `correction record` CLI) can observe
+ * it without changing the non-fatal contract for every other caller, which is
+ * free to ignore the resolved value.
  */
 export async function emitCorrectionEvent(
   runDir: string,
   payload: EmitCorrectionEventPayload,
   deps: RunStoreDeps = defaultRunStoreDeps,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const reviewedSha = payload.reviewed_sha ?? null;
     const evidenceRef: EvidenceRef = {
@@ -211,6 +217,7 @@ export async function emitCorrectionEvent(
         source_kind: payload.source_kind,
         evidence_ref: payload.evidence_ref,
         reviewed_sha: reviewedSha,
+        correction: correctionText,
       }),
       correction_key: deriveCorrectionKey({
         source_kind: payload.source_kind,
@@ -219,7 +226,7 @@ export async function emitCorrectionEvent(
       }),
       source_kind: payload.source_kind,
       failure_class: payload.failure_class,
-      actor_kind: payload.actor_kind ?? actorKindForSourceKind(payload.source_kind),
+      actor_kind: actorKindForSourceKind(payload.source_kind),
       issue: payload.issue,
       repo: payload.repo,
       run_id: payload.run_id,
@@ -233,11 +240,12 @@ export async function emitCorrectionEvent(
         ? { proposed_control: payload.proposed_control }
         : {}),
     };
-    await appendEvent(runDir, event, deps);
+    return await appendEvent(runDir, event, deps);
   } catch (err) {
     console.warn(
       `[pipeline] correction: emitCorrectionEvent failed (non-fatal): ${(err as Error).message}`,
     );
+    return false;
   }
 }
 

@@ -75,6 +75,7 @@ import {
   extractDiffHashFromComment,
   extractReview1Risk,
   extractReviewArtifact,
+  extractReviewedSha,
   parseStrictVerdict,
   parseStructuredVerdict,
   REVIEW_MARKER_PREFIX_R1,
@@ -319,6 +320,18 @@ export async function advanceReview(
     ? extractBlockingKeysFromComment(lastPriorRoundForRepair.body)
     : new Set<string>();
 
+  // #499 finding 7971a697: the reviewed SHA a repaired finding is lineage-
+  // stamped against must be the SHA the finding was actually raised at — the
+  // same prior round's comment that `priorKeysForRepair` was read from above
+  // — not the current head, or a stale finding would read as current.
+  // `head_sha` is separately the current head (`commitSha`), so a consumer
+  // can still compute staleness/currency from the pair. Reuses
+  // `extractReviewedSha`'s existing artifact-then-legacy-sentinel fallback
+  // rather than reimplementing it.
+  const priorRoundReviewedSha = lastPriorRoundForRepair
+    ? extractReviewedSha([lastPriorRoundForRepair])?.sha ?? null
+    : null;
+
   async function emitRepairedKeys(currentBlockingKeys: Set<string>): Promise<void> {
     const repairedKeys = [...priorKeysForRepair].filter((k) => !currentBlockingKeys.has(k));
     if (!opts.runDir || repairedKeys.length === 0) return;
@@ -331,7 +344,7 @@ export async function advanceReview(
         stage,
         source_kind: "repair",
         failure_class: "review-finding",
-        reviewed_sha: commitSha,
+        reviewed_sha: priorRoundReviewedSha,
         head_sha: commitSha,
         evidence_ref: { kind: "finding", id: key },
         correction: `finding ${key} no longer raised at round ${round} — cleared on re-check`,

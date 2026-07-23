@@ -27,6 +27,7 @@ import {
 } from "../scripts/pipeline.ts";
 import { advanceReview, type AdvanceReviewDeps } from "../scripts/stages/review.ts";
 import { findingKey } from "../scripts/review-policy.ts";
+import { formatReviewComment } from "../scripts/stages/review-rendering.ts";
 import type { Outcome, PipelineConfig, Stage } from "../scripts/types.ts";
 
 type Comment = { author: string; body: string; createdAt: string };
@@ -538,6 +539,38 @@ test("runOverride (#499): a 'deferred' disposition appends one correction_event 
     const corrections = events.filter((e) => e.type === "correction_event");
     assert.equal(corrections.length, 1);
     assert.equal(corrections[0].source_kind, "override");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("runOverride (#499): reviewed_sha is stamped from the finding's originating review round, not left null — regression for finding 7971a697", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "override-correction-reviewed-sha-"));
+  try {
+    const runDir = writeRunJson(tmp, "7-2026-06-29T00-00-00-000Z", 7);
+    const priorRoundSha = "1".repeat(40);
+    const priorRoundComment: Comment = {
+      author: "pipeline-bot",
+      body: formatReviewComment(
+        { verdict: "needs-attention", summary: "s", findings: [BLOCKER_A], next_steps: [], commitSha: priorRoundSha },
+        2,
+        "codex",
+      ),
+      createdAt: "2026-06-12T00:00:00Z",
+    };
+    const detail = detailAt(["pipeline:review-1", "blocked"], [priorRoundComment]);
+    const { deps } = makeOverrideDeps(detail);
+    const cfg = { ...CFG, repo_dir: tmp } as PipelineConfig;
+
+    await quiet(t, async () => {
+      await runOverride(cfg, 7, `${KEY_A}: rejected — false positive`, OPTS, deps);
+    });
+
+    const events = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8")
+      .trim().split("\n").map((l) => JSON.parse(l));
+    const corrections = events.filter((e) => e.type === "correction_event");
+    assert.equal(corrections.length, 1);
+    assert.equal(corrections[0].reviewed_sha, priorRoundSha);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

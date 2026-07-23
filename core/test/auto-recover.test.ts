@@ -152,3 +152,18 @@ test("tryAutoRecover: no runDir supplied → recovery still succeeds but no corr
   const out = await tryAutoRecover(CFG, 499, undefined, undefined, undefined, baseDeps());
   assert.equal(out.advanced, true);
 });
+
+test("tryAutoRecover: blocked-label clear failure returns a non-success outcome and emits no correction_event — regression for #499 finding c41e8715", async () => {
+  const { deps: runStoreDeps, lines } = memRunStoreDeps();
+  const postCommentCalls: string[] = [];
+  const out = await tryAutoRecover(CFG, 499, undefined, "/tmp/run", runStoreDeps, baseDeps({
+    removeLabel: async (_cfg, _issue, label) => {
+      if (label === "blocked") throw new Error("gh: label removal failed (network error)");
+    },
+    postComment: async (_cfg, _issue, body) => { postCommentCalls.push(body); },
+  }));
+  assert.equal(out.advanced, false);
+  assert.equal(out.status, "blocked");
+  assert.equal(lines().length, 0, "no correction_event may be recorded when the blocked label was not durably cleared");
+  assert.equal(postCommentCalls.length, 0, "no recovery comment may be posted claiming success when the reset did not happen");
+});

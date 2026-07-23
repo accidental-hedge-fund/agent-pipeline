@@ -56,7 +56,7 @@ test("command-registry: correction entry is non-mutating and needs no gh auth", 
   assert.equal(entry.mutatesGitHub, false);
   assert.equal(entry.needsGhAuth, false);
   assert.equal(entry.needsIssueNumber, false);
-  for (const flag of ["issue", "runId", "sourceKind", "failureClass", "stage", "evidenceRef", "correctionText", "reusable", "proposedControl"]) {
+  for (const flag of ["issue", "runId", "sourceKind", "failureClass", "stage", "evidenceRef", "correctionText", "reusable", "proposedControl", "reviewedSha", "headSha"]) {
     assert.ok((entry.allowedFlags as Set<string>).has(flag), `correction.allowedFlags should include "${flag}"`);
   }
 });
@@ -89,7 +89,7 @@ test("pipeline correction record: complete invocation appends exactly one correc
   }
 });
 
-test("pipeline correction record: forces actor_kind human even for a pipeline-owned source_kind", () => {
+test("pipeline correction record: actor_kind is always derived from source_kind, never forced — regression for #499 finding 36c6080c", () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "correction-cli-actor-"));
   try {
     const runDir = writeRunJson(tmp, "499-2026-07-23T00-00-00-000Z", 499);
@@ -97,7 +97,7 @@ test("pipeline correction record: forces actor_kind human even for a pipeline-ow
     assert.equal(result.status, 0, `stderr: ${result.stderr}`);
     const events = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8")
       .trim().split("\n").map((l) => JSON.parse(l));
-    assert.equal(events[0].actor_kind, "human");
+    assert.equal(events[0].actor_kind, "pipeline");
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -146,6 +146,53 @@ test("pipeline correction record: unlocatable run exits non-zero and appends not
     const result = runCli(["correction", "record", "--repo-path", tmp, ...requiredArgs()], tmp);
     assert.notEqual(result.status, 0);
     assert.equal(fs.existsSync(path.join(tmp, ".agent-pipeline", "runs")), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction record: --run-id pointing at a nonexistent run directory exits non-zero and appends nothing — regression for #499 finding 9f3a5ede", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "correction-cli-ghost-run-"));
+  try {
+    const result = runCli(
+      ["correction", "record", "--repo-path", tmp, "--run-id", "499-2026-07-23T00-00-00-000Z", ...requiredArgs()],
+      tmp,
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /could not be read/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction record: run belonging to a different issue exits non-zero and appends nothing — regression for #499 finding 9f3a5ede", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "correction-cli-wrong-issue-"));
+  try {
+    const runDir = writeRunJson(tmp, "777-2026-07-23T00-00-00-000Z", 777);
+    const result = runCli(
+      ["correction", "record", "--repo-path", tmp, "--run-id", "777-2026-07-23T00-00-00-000Z", ...requiredArgs()],
+      tmp,
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /belongs to issue #777, not #499/);
+    assert.equal(fs.existsSync(path.join(runDir, "events.jsonl")), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction record: malformed run.json exits non-zero and appends nothing — regression for #499 finding 9f3a5ede", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "correction-cli-malformed-run-"));
+  try {
+    const runDir = path.join(tmp, ".agent-pipeline", "runs", "499-2026-07-23T00-00-00-000Z");
+    fs.mkdirSync(runDir, { recursive: true });
+    fs.writeFileSync(path.join(runDir, "run.json"), "{ not valid json");
+    const result = runCli(
+      ["correction", "record", "--repo-path", tmp, "--run-id", "499-2026-07-23T00-00-00-000Z", ...requiredArgs()],
+      tmp,
+    );
+    assert.notEqual(result.status, 0);
+    assert.equal(fs.existsSync(path.join(runDir, "events.jsonl")), false);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

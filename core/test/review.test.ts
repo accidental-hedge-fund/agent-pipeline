@@ -3982,6 +3982,28 @@ test("repair (#499): a fully-cleared prior blocking finding (approve verdict) ap
   assert.deepEqual(corrections[0].evidence_ref, { kind: "finding", id: KEY_BUG });
 });
 
+test("repair (#499): reviewed_sha is stamped from the finding's originating round, not the current head — regression for finding 7971a697", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(2, [FINDING_BUG])]);
+  const { runStoreDeps, lines } = memRunStoreDepsForCorrection();
+
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, { runDir: "/tmp/run", runStoreDeps }, 0, deps);
+  });
+
+  assert.deepEqual(rec.transitions, [{ to: "pre-merge" }]);
+  const corrections = lines().map((l) => JSON.parse(l)).filter((e) => e.type === "correction_event");
+  assert.equal(corrections.length, 1);
+  // SHA_A is the SHA the prior round's verdict comment (and therefore
+  // FINDING_BUG) was actually reviewed against; the PR's current head_sha
+  // ("f".repeat(40)) is a different, later SHA — reviewed_sha must reflect
+  // the finding's origin, not the current head, or a stale finding would
+  // read as current.
+  assert.equal(corrections[0].reviewed_sha, SHA_A);
+  assert.equal(corrections[0].head_sha, "f".repeat(40));
+  assert.notEqual(corrections[0].reviewed_sha, corrections[0].head_sha);
+});
+
 test("repair (#499): a partially-cleared round (prior finding gone, a NEW distinct finding blocks instead) appends one correction_event for only the cleared key", async (t) => {
   // FINDING_NEW is a genuinely distinct finding (different title → different
   // key), so it is a fresh detection, not a recurrence of FINDING_BUG — this

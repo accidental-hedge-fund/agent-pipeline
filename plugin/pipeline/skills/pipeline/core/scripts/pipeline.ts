@@ -41,7 +41,13 @@ import {
 } from "./gh.ts";
 import { isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
-import { attestPipelineComment } from "./stages/review-parsing.ts";
+import {
+  attestPipelineComment,
+  extractBlockingKeysFromComment,
+  extractReviewedSha,
+  REVIEW_MARKER_PREFIX_R1,
+  REVIEW_MARKER_PREFIX_R2,
+} from "./stages/review-parsing.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, removeWorktreeForIssue, sweepMergedWorktrees } from "./worktree.ts";
 import {
@@ -286,6 +292,10 @@ export interface CliOpts {
   reusable?: string;
   /** correction record: optional bounded proposed control. */
   proposedControl?: string;
+  /** correction record: optional SHA the corrected evidence was reviewed against. */
+  reviewedSha?: string;
+  /** correction record: optional current head SHA at record time. */
+  headSha?: string;
 }
 
 /**
@@ -387,7 +397,9 @@ export function buildCmd(): Command {
     .option("--evidence-ref <kind:id>", `correction record: "<kind>:<id>" evidence pointer (kind one of ${EVIDENCE_REF_KINDS.join("|")})`)
     .option("--correction-text <text>", "correction record: the observable correction/disposition text")
     .option("--reusable <value>", `correction record: ${CORRECTION_REUSABLE.join("|")}`)
-    .option("--proposed-control <control>", `correction record: optional — ${CORRECTION_PROPOSED_CONTROLS.join("|")}`);
+    .option("--proposed-control <control>", `correction record: optional — ${CORRECTION_PROPOSED_CONTROLS.join("|")}`)
+    .option("--reviewed-sha <sha>", "correction record: optional — the SHA the corrected evidence was reviewed against")
+    .option("--head-sha <sha>", "correction record: optional — the current head SHA at record time");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate/sync` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -1012,29 +1024,48 @@ async function main(): Promise<void> {
       return;
     }
 
-    let repo = "";
+    // #499 finding 9f3a5ede: a constructed path is not a located run — require
+    // a readable, parseable run.json AND confirm it actually belongs to
+    // --issue before recording anything against it.
+    let runMeta: { issue?: number; repo?: string } | null = null;
     try {
       const raw = await defaultRunStoreDeps.readFile(path.join(correctionRunDir, "run.json"));
-      repo = (JSON.parse(raw) as { repo?: string }).repo ?? "";
+      runMeta = JSON.parse(raw) as { issue?: number; repo?: string };
     } catch {
-      // run.json unreadable — repo stays "" (best-effort, non-fatal record)
+      runMeta = null;
+    }
+    if (!runMeta) {
+      console.error(`pipeline correction record: run directory for #${opts.issue} could not be read (missing or malformed run.json).`);
+      process.exitCode = 1;
+      return;
+    }
+    if (runMeta.issue !== opts.issue) {
+      console.error(`pipeline correction record: run ${path.basename(correctionRunDir)} belongs to issue #${runMeta.issue}, not #${opts.issue}.`);
+      process.exitCode = 1;
+      return;
     }
 
-    await emitCorrectionEvent(correctionRunDir, {
+    const appended = await emitCorrectionEvent(correctionRunDir, {
       issue: opts.issue!,
-      repo,
+      repo: runMeta.repo ?? "",
       run_id: path.basename(correctionRunDir),
       stage: opts.stage!,
       source_kind: opts.sourceKind as CorrectionSourceKind,
       failure_class: opts.failureClass as CorrectionFailureClass,
+      reviewed_sha: opts.reviewedSha ?? null,
+      head_sha: opts.headSha ?? null,
       evidence_ref: { kind: evidenceRefKind as EvidenceRefKind, id: evidenceRefId },
       correction: opts.correctionText!,
       reusable: opts.reusable as CorrectionReusable,
       ...(opts.proposedControl !== undefined
         ? { proposed_control: opts.proposedControl as CorrectionProposedControl }
         : {}),
-      actor_kind: "human",
     }, defaultRunStoreDeps);
+    if (!appended) {
+      console.error(`pipeline correction record: failed to append correction_event to run ${path.basename(correctionRunDir)}.`);
+      process.exitCode = 1;
+      return;
+    }
     process.exitCode = 0;
     return;
   }
@@ -2866,6 +2897,26 @@ export async function runOverride(
   const overrideRunDir = await latestRunDirForIssue(cfg.repo_dir, originalNumber, runStoreDeps).catch(() => null);
   if (overrideRunDir) {
     const evidenceRefId = parsed.kind === "key" ? parsed.key : `${parsed.scopeType}:${parsed.scopeValue}`;
+    // #499 finding 7971a697: stamp the SHA the overridden/rejected finding was
+    // actually raised at (the originating round's comment), not left null —
+    // only resolvable for a key-scoped disposition, since a scope override
+    // isn't tied to one finding's round. Mirrors the same repair-path fix in
+    // review-routing.ts: reuse extractBlockingKeysFromComment (the same
+    // marker-or-legacy-fallback logic that identifies a repaired finding) and
+    // extractReviewedSha (artifact-then-legacy-sentinel) rather than
+    // reimplementing either.
+    let overrideReviewedSha: string | null = null;
+    if (parsed.kind === "key") {
+      const roundComments = detail.comments.filter(
+        (c) => c.body.startsWith(REVIEW_MARKER_PREFIX_R1) || c.body.startsWith(REVIEW_MARKER_PREFIX_R2),
+      );
+      for (let i = roundComments.length - 1; i >= 0; i--) {
+        if (extractBlockingKeysFromComment(roundComments[i].body).has(parsed.key)) {
+          overrideReviewedSha = extractReviewedSha([roundComments[i]])?.sha ?? null;
+          break;
+        }
+      }
+    }
     await emitCorrectionEvent(overrideRunDir, {
       issue: originalNumber,
       repo: cfg.repo,
@@ -2873,6 +2924,7 @@ export async function runOverride(
       stage,
       source_kind: parsed.disposition === "rejected" ? "rejection" : "override",
       failure_class: "review-finding",
+      reviewed_sha: overrideReviewedSha,
       evidence_ref: { kind: "finding", id: evidenceRefId },
       correction: `${parsed.disposition}: ${parsed.reason}`,
       reusable: "unknown",
