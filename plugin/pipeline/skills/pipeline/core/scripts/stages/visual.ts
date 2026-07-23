@@ -62,6 +62,28 @@ const MAX_COMMENT_OUTPUT = 2000;
 const MAX_ARTIFACT_FILES = 100;
 const MAX_ARTIFACT_TOTAL_BYTES = 50 * 1024 * 1024; // 50MB
 
+// ---------------------------------------------------------------------------
+// Artifact publishing (#463): committing captured artifacts to the PR branch
+// so a human can open them from the PR without runner-filesystem access.
+// Publish bounds are deliberately tighter than the enumeration bounds above —
+// committed blobs enter permanent git history, unlike the run-store copy.
+// ---------------------------------------------------------------------------
+
+const PUBLISH_MAX_FILES = 20;
+const PUBLISH_MAX_FILE_BYTES = 2 * 1024 * 1024; // 2MB per file
+const PUBLISH_MAX_TOTAL_BYTES = 10 * 1024 * 1024; // 10MB total
+
+/** Dedicated worktree-relative path for published evidence — distinct from
+ *  `artifacts_dir` so a repo-gitignored scratch directory is never swept into
+ *  the publish commit by `git add -f`. */
+const PUBLISH_EVIDENCE_DIR = ".pipeline-visual-evidence";
+
+/** Commit-subject prefix for the artifact-publish commit. Recognized by
+ *  `isPipelineInternalCommit` (pre_merge.ts) so it does not invalidate a
+ *  recorded review verdict; must NOT match `visualFixCommitPattern` so it is
+ *  never mistaken for a visual-fix commit. */
+export const VISUAL_PUBLISH_COMMIT_PREFIX = "chore: publish visual-gate evidence for #";
+
 export interface AdvanceVisualOpts {
   dryRun?: boolean;
   /** Evidence-bundle run/state dir (#147); when set, the visual command is
@@ -92,12 +114,28 @@ export interface VisualRunResult {
 export interface ArtifactManifest {
   /** False when the directory was absent or contained no files. */
   captured: boolean;
-  /** Relative paths (sorted, deterministic), bounded by MAX_ARTIFACT_FILES / MAX_ARTIFACT_TOTAL_BYTES. */
+  /** Relative paths of files successfully copied into the run directory
+   *  (sorted, deterministic), bounded by MAX_ARTIFACT_FILES / MAX_ARTIFACT_TOTAL_BYTES.
+   *  A file whose copy failed is excluded and listed in `copyFailed` instead —
+   *  a file is reported captured only once it has actually been persisted. */
   files: string[];
   /** True when the full listing exceeded the count or size bound. */
   truncated: boolean;
   /** Total files found before bounding (for the truncation note). */
   totalFound: number;
+  /** Relative paths whose copy into the run directory failed. Never counted
+   *  as captured and never published. */
+  copyFailed: string[];
+}
+
+/** `ArtifactManifest` plus the byte size of each captured file, used
+ *  internally to select which captured files fit the publish bounds. */
+interface CapturedManifest extends ArtifactManifest {
+  fileSizes: Record<string, number>;
+}
+
+function emptyManifest(): CapturedManifest {
+  return { captured: false, files: [], truncated: false, totalFound: 0, copyFailed: [], fileSizes: {} };
 }
 
 /** Signature of the harness `invoke` — injectable so the visual-fix loop is unit-testable. */
@@ -188,8 +226,26 @@ export interface VisualGateDeps {
    *  real fs. Returns [] when the directory is absent. */
   listArtifacts?: (absArtifactsDir: string) => Promise<{ rel: string; size: number }[]>;
   /** Copy the bounded artifact file list into `destDir` (creating parent dirs
-   *  as needed). Injectable for tests. */
-  copyArtifacts?: (absArtifactsDir: string, files: string[], destDir: string) => Promise<void>;
+   *  as needed). Returns a per-file result — a file whose copy fails is
+   *  reported `ok: false` rather than silently swallowed (d50013b8).
+   *  Injectable for tests. */
+  copyArtifacts?: (
+    absArtifactsDir: string,
+    files: string[],
+    destDir: string,
+  ) => Promise<{ rel: string; ok: boolean }[]>;
+  /** Copy the selected published files from the run-directory attempt copy
+   *  into the worktree evidence path (`PUBLISH_EVIDENCE_DIR`). Injectable
+   *  for tests. */
+  copyForPublish?: (srcDir: string, files: string[], destDir: string) => Promise<void>;
+  /** Remove the worktree evidence dir, replacing any prior published set
+   *  before the new one is written. Injectable for tests. */
+  removeEvidenceDir?: (destDir: string) => Promise<void>;
+  /** `git add -f <relPath>` in the worktree — force-adds only the evidence
+   *  path so a gitignored `artifacts_dir` is never swept in. Injectable for tests. */
+  gitAddForce?: (cwd: string, relPath: string) => Promise<{ code: number; stderr: string }>;
+  /** `git commit -m <message>` in the worktree for the publish commit. Injectable for tests. */
+  gitCommit?: (cwd: string, message: string) => Promise<{ code: number; stderr: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -272,14 +328,25 @@ async function defaultListArtifacts(absDir: string): Promise<{ rel: string; size
   return out;
 }
 
-async function defaultCopyArtifacts(absDir: string, files: string[], destDir: string): Promise<void> {
+async function defaultCopyArtifacts(
+  absDir: string,
+  files: string[],
+  destDir: string,
+): Promise<{ rel: string; ok: boolean }[]> {
   await fsp.mkdir(destDir, { recursive: true });
+  const results: { rel: string; ok: boolean }[] = [];
   for (const rel of files) {
     const src = path.join(absDir, rel);
     const dest = path.join(destDir, rel);
-    await fsp.mkdir(path.dirname(dest), { recursive: true });
-    await fsp.copyFile(src, dest).catch(() => {});
+    try {
+      await fsp.mkdir(path.dirname(dest), { recursive: true });
+      await fsp.copyFile(src, dest);
+      results.push({ rel, ok: true });
+    } catch {
+      results.push({ rel, ok: false });
+    }
   }
+  return results;
 }
 
 /** Bound a full artifact listing by count and cumulative size, in deterministic
@@ -305,36 +372,246 @@ async function captureArtifacts(
   worktreePath: string,
   attempt: number,
   opts: AdvanceVisualOpts,
-  deps: { listArtifacts: (absDir: string) => Promise<{ rel: string; size: number }[]>; copyArtifacts: (absDir: string, files: string[], destDir: string) => Promise<void> },
-): Promise<ArtifactManifest & { escapeError?: string }> {
+  deps: {
+    listArtifacts: (absDir: string) => Promise<{ rel: string; size: number }[]>;
+    copyArtifacts: (absDir: string, files: string[], destDir: string) => Promise<{ rel: string; ok: boolean }[]>;
+  },
+): Promise<CapturedManifest & { escapeError?: string }> {
   const resolved = resolveArtifactsDir(worktreePath, cfg.visual_gate.artifacts_dir);
   if (!resolved.ok) {
-    return { captured: false, files: [], truncated: false, totalFound: 0, escapeError: resolved.reason };
+    return { ...emptyManifest(), escapeError: resolved.reason };
   }
   const canonical = await realpathContained(worktreePath, resolved.abs);
   if (!canonical.ok) {
-    return { captured: false, files: [], truncated: false, totalFound: 0, escapeError: canonical.reason };
+    return { ...emptyManifest(), escapeError: canonical.reason };
   }
   const absDir = canonical.real ?? resolved.abs;
   const all = await deps.listArtifacts(absDir);
   if (all.length === 0) {
-    return { captured: false, files: [], truncated: false, totalFound: 0 };
+    return emptyManifest();
   }
   const { files, truncated } = boundArtifacts(all);
+  const sizeByRel = new Map(all.map((f) => [f.rel, f.size]));
+
+  let capturedFiles = files;
+  let copyFailed: string[] = [];
   if (opts.runDir) {
     const destDir = path.join(opts.runDir, "visual", `attempt-${attempt}`);
-    await deps.copyArtifacts(absDir, files, destDir).catch(() => {});
+    const results = await deps
+      .copyArtifacts(absDir, files, destDir)
+      .catch(() => files.map((rel) => ({ rel, ok: false })));
+    capturedFiles = results.filter((r) => r.ok).map((r) => r.rel);
+    copyFailed = results.filter((r) => !r.ok).map((r) => r.rel);
   }
-  return { captured: true, files, truncated, totalFound: all.length };
+
+  const fileSizes: Record<string, number> = {};
+  for (const rel of capturedFiles) fileSizes[rel] = sizeByRel.get(rel) ?? 0;
+
+  return { captured: true, files: capturedFiles, truncated, totalFound: all.length, copyFailed, fileSizes };
 }
 
-function formatArtifactManifest(manifest: ArtifactManifest): string {
+/** Per-file publish-status annotation for manifest rendering. */
+type PublishAnnotation =
+  | { status: "published"; url: string }
+  | { status: "over-bound" }
+  | { status: "push-failed" };
+
+function formatArtifactManifest(
+  manifest: ArtifactManifest,
+  annotations?: Map<string, PublishAnnotation>,
+): string {
   if (!manifest.captured) return "(no artifacts captured)";
-  const lines = manifest.files.map((f) => `- ${f}`);
+  const lines: string[] = [];
+  for (const f of manifest.files) {
+    const ann = annotations?.get(f);
+    if (ann?.status === "published") {
+      lines.push(`- [${f}](${ann.url})`);
+    } else if (ann?.status === "over-bound") {
+      lines.push(`- ${f} (not published: exceeds bound)`);
+    } else if (ann?.status === "push-failed") {
+      lines.push(`- ${f} (not published: publish failed)`);
+    } else {
+      lines.push(`- ${f}`);
+    }
+  }
+  for (const f of manifest.copyFailed) {
+    lines.push(`- ${f} (copy failed)`);
+  }
   if (manifest.truncated) {
     lines.push(`- … (${manifest.totalFound} files found; listing truncated)`);
   }
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Artifact publishing (#463): opt-in commit of the deciding run's captured
+// artifacts to the PR branch so a human can open them from the PR itself.
+// ---------------------------------------------------------------------------
+
+/** Partition `files` (in their existing deterministic order) into what fits
+ *  the publish bounds and what exceeds them — over-bound files are never
+ *  committed, and their manifest entry says so explicitly. Pure function,
+ *  exported for unit testing. */
+export function selectPublishFiles(
+  files: string[],
+  fileSizes: Record<string, number>,
+): { toPublish: string[]; overBound: string[] } {
+  const toPublish: string[] = [];
+  const overBound: string[] = [];
+  let totalBytes = 0;
+  for (const rel of files) {
+    const size = fileSizes[rel] ?? 0;
+    if (toPublish.length >= PUBLISH_MAX_FILES || size > PUBLISH_MAX_FILE_BYTES || totalBytes + size > PUBLISH_MAX_TOTAL_BYTES) {
+      overBound.push(rel);
+      continue;
+    }
+    toPublish.push(rel);
+    totalBytes += size;
+  }
+  return { toPublish, overBound };
+}
+
+/** Branch-relative blob URL for a published file — survives worktree cleanup
+ *  and keeps resolving as the branch head advances. */
+export function publishBlobUrl(repo: string, branch: string, rel: string): string {
+  return `https://github.com/${repo}/blob/${branch}/${PUBLISH_EVIDENCE_DIR}/${rel}`;
+}
+
+interface PublishGitDeps {
+  copyForPublish: (srcDir: string, files: string[], destDir: string) => Promise<void>;
+  removeEvidenceDir: (destDir: string) => Promise<void>;
+  gitAddForce: (cwd: string, relPath: string) => Promise<{ code: number; stderr: string }>;
+  gitCommit: (cwd: string, message: string) => Promise<{ code: number; stderr: string }>;
+  gitDirty: (cwd: string) => Promise<boolean>;
+  gitPush: (cwd: string, branch: string) => Promise<{ code: number; stderr: string }>;
+}
+
+interface PublishResult {
+  /** True when publishing was actually attempted (enabled, files captured, and at
+   *  least one fit the bounds). */
+  attempted: boolean;
+  ok: boolean;
+  failureReason?: string;
+  published: Set<string>;
+  overBound: Set<string>;
+}
+
+/**
+ * Best-effort: any git/push failure is surfaced via `failureReason` and
+ * degrades that run's manifest to non-published bare paths — it never blocks
+ * an otherwise-passing gate (design.md decision 4).
+ */
+async function publishVisualArtifacts(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  wtPath: string,
+  slug: string,
+  attempt: number,
+  manifest: CapturedManifest,
+  opts: AdvanceVisualOpts,
+  deps: PublishGitDeps,
+): Promise<PublishResult> {
+  if (!cfg.visual_gate.publish || manifest.files.length === 0) {
+    return { attempted: false, ok: false, published: new Set(), overBound: new Set() };
+  }
+
+  const { toPublish, overBound } = selectPublishFiles(manifest.files, manifest.fileSizes);
+  const overBoundSet = new Set(overBound);
+  if (toPublish.length === 0) {
+    return { attempted: false, ok: false, published: new Set(), overBound: overBoundSet };
+  }
+
+  if (!opts.runDir) {
+    return {
+      attempted: true,
+      ok: false,
+      failureReason: "no run directory available to publish artifacts from",
+      published: new Set(),
+      overBound: overBoundSet,
+    };
+  }
+
+  const srcDir = path.join(opts.runDir, "visual", `attempt-${attempt}`);
+  const evidenceAbsDir = path.join(wtPath, PUBLISH_EVIDENCE_DIR);
+
+  try {
+    await deps.removeEvidenceDir(evidenceAbsDir);
+    await deps.copyForPublish(srcDir, toPublish, evidenceAbsDir);
+
+    const addRes = await deps.gitAddForce(wtPath, PUBLISH_EVIDENCE_DIR);
+    if (addRes.code !== 0) {
+      return {
+        attempted: true,
+        ok: false,
+        failureReason: `git add failed: ${addRes.stderr.trim()}`,
+        published: new Set(),
+        overBound: overBoundSet,
+      };
+    }
+
+    const dirty = await deps.gitDirty(wtPath);
+    if (!dirty) {
+      // Evidence content is unchanged from the prior publish — already on the branch.
+      return { attempted: true, ok: true, published: new Set(toPublish), overBound: overBoundSet };
+    }
+
+    const commitRes = await deps.gitCommit(wtPath, `${VISUAL_PUBLISH_COMMIT_PREFIX}${issueNumber}`);
+    if (commitRes.code !== 0) {
+      return {
+        attempted: true,
+        ok: false,
+        failureReason: `git commit failed: ${commitRes.stderr.trim()}`,
+        published: new Set(),
+        overBound: overBoundSet,
+      };
+    }
+
+    const branch = branchName(issueNumber, slug);
+    const pushRes = await deps.gitPush(wtPath, branch);
+    if (pushRes.code !== 0) {
+      return {
+        attempted: true,
+        ok: false,
+        failureReason: `git push failed: ${pushRes.stderr.trim()}`,
+        published: new Set(),
+        overBound: overBoundSet,
+      };
+    }
+
+    return { attempted: true, ok: true, published: new Set(toPublish), overBound: overBoundSet };
+  } catch (err) {
+    return {
+      attempted: true,
+      ok: false,
+      failureReason: err instanceof Error ? err.message : String(err),
+      published: new Set(),
+      overBound: overBoundSet,
+    };
+  }
+}
+
+async function defaultCopyForPublish(srcDir: string, files: string[], destDir: string): Promise<void> {
+  await fsp.mkdir(destDir, { recursive: true });
+  for (const rel of files) {
+    const src = path.join(srcDir, rel);
+    const dest = path.join(destDir, rel);
+    await fsp.mkdir(path.dirname(dest), { recursive: true });
+    await fsp.copyFile(src, dest);
+  }
+}
+
+async function defaultRemoveEvidenceDir(destDir: string): Promise<void> {
+  await fsp.rm(destDir, { recursive: true, force: true });
+}
+
+async function defaultGitAddForce(cwd: string, relPath: string): Promise<{ code: number; stderr: string }> {
+  const res = await gitInWorktree(cwd, ["add", "-f", "--", relPath], { ignoreFailure: true });
+  return { code: res.code, stderr: res.stderr };
+}
+
+async function defaultGitCommit(cwd: string, message: string): Promise<{ code: number; stderr: string }> {
+  const res = await gitInWorktree(cwd, ["commit", "-m", message], { ignoreFailure: true });
+  return { code: res.code, stderr: res.stderr };
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +875,10 @@ export async function advanceVisual(
   const getPrCommitsFn = deps.getPrCommits ?? defaultGetPrCommits;
   const listArtifactsFn = deps.listArtifacts ?? defaultListArtifacts;
   const copyArtifactsFn = deps.copyArtifacts ?? defaultCopyArtifacts;
+  const copyForPublishFn = deps.copyForPublish ?? defaultCopyForPublish;
+  const removeEvidenceDirFn = deps.removeEvidenceDir ?? defaultRemoveEvidenceDir;
+  const gitAddForceFn = deps.gitAddForce ?? defaultGitAddForce;
+  const gitCommitFn = deps.gitCommit ?? defaultGitCommit;
   const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
 
   // Dry-run: no GitHub writes, no command execution.
@@ -646,7 +927,8 @@ export async function advanceVisual(
   let stageDeadlineMs = Date.now() + timeoutSec * 1000;
 
   let lastResult: VisualRunResult | null = null;
-  let lastManifest: ArtifactManifest = { captured: false, files: [], truncated: false, totalFound: 0 };
+  let lastManifest: CapturedManifest = emptyManifest();
+  let lastAttempt = 1;
   let fixRoundBlocked: { reason: string; blockerKind: "harness-failure" | "push-failed" } | null = null;
   let fixCommitLandedThisInvocation = false;
 
@@ -688,6 +970,7 @@ export async function advanceVisual(
     if (prNumber) runContextEnv.PIPELINE_PR_NUMBER = String(prNumber);
     lastResult = await runFn(cfg.visual_gate.command, wt.path, remainingSec, runContextEnv);
     const endedAt = new Date();
+    lastAttempt = attempt;
 
     lastManifest = await captureArtifacts(cfg, issueNumber, wt.path, attempt, opts, {
       listArtifacts: listArtifactsFn,
@@ -768,12 +1051,36 @@ export async function advanceVisual(
   const outcome = result.passed ? "PASS" : "FAIL";
   const excerpt = truncate(result.output, MAX_COMMENT_OUTPUT);
 
+  const publishResult = await publishVisualArtifacts(cfg, issueNumber, wt.path, wt.slug, lastAttempt, manifest, opts, {
+    copyForPublish: copyForPublishFn,
+    removeEvidenceDir: removeEvidenceDirFn,
+    gitAddForce: gitAddForceFn,
+    gitCommit: gitCommitFn,
+    gitDirty: gitDirtyFn,
+    gitPush: gitPushFn,
+  });
+  const publishAnnotations = new Map<string, PublishAnnotation>();
+  if (cfg.visual_gate.publish) {
+    const branch = branchName(issueNumber, wt.slug);
+    for (const f of manifest.files) {
+      if (publishResult.published.has(f)) {
+        publishAnnotations.set(f, { status: "published", url: publishBlobUrl(cfg.repo, branch, f) });
+      } else if (publishResult.overBound.has(f)) {
+        publishAnnotations.set(f, { status: "over-bound" });
+      } else if (publishResult.attempted && !publishResult.ok) {
+        publishAnnotations.set(f, { status: "push-failed" });
+      }
+    }
+  }
+
   const commentBody = redactSecrets(buildVisualComment({
     outcome,
     mode: cfg.visual_gate.mode,
     durationSec: result.durationSec,
     excerpt,
     manifest,
+    publishAnnotations,
+    publishFailure: publishResult.attempted && !publishResult.ok ? publishResult.failureReason : undefined,
   }));
   await postCommentFn(cfg, issueNumber, commentBody);
 
@@ -874,6 +1181,10 @@ function buildVisualComment(opts: {
   durationSec: number;
   excerpt: string;
   manifest: ArtifactManifest;
+  publishAnnotations?: Map<string, PublishAnnotation>;
+  /** Set when publishing was attempted and failed — surfaced explicitly;
+   *  never blocks the gate (best-effort evidence). */
+  publishFailure?: string;
 }): string {
   return [
     "## Visual Gate",
@@ -888,7 +1199,8 @@ function buildVisualComment(opts: {
     "```",
     "",
     "### Artifacts",
-    formatArtifactManifest(opts.manifest),
+    formatArtifactManifest(opts.manifest, opts.publishAnnotations),
+    ...(opts.publishFailure ? ["", `**Publish**: failed — ${opts.publishFailure}`] : []),
     "",
     "---",
     "*Automated by Claude Code Pipeline Skill*",

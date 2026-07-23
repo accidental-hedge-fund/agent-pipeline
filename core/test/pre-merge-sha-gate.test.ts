@@ -63,6 +63,21 @@ test("isPipelineInternalCommit: auto-format commit is NOT pipeline-internal (#22
 });
 
 // ---------------------------------------------------------------------------
+// isPipelineInternalCommit — visual-gate artifact-publish commit (#463)
+// ---------------------------------------------------------------------------
+
+test("isPipelineInternalCommit: visual-gate artifact-publish commit is pipeline-internal, does not invalidate the verdict", () => {
+  assert.equal(isPipelineInternalCommit("chore: publish visual-gate evidence for #16"), true);
+  assert.equal(isPipelineInternalCommit("chore: publish visual-gate evidence for #1"), true);
+});
+
+test("isPipelineInternalCommit: visual-gate artifact-publish commit is NOT read as a visual-fix commit", () => {
+  const publishCommit = "chore: publish visual-gate evidence for #16";
+  assert.equal(isPipelineInternalCommit(publishCommit), true);
+  assert.doesNotMatch(publishCommit, /fix:\s+resolve visual-gate failures \(#16\)/i);
+});
+
+// ---------------------------------------------------------------------------
 // staleReviewNotice — pure
 // ---------------------------------------------------------------------------
 

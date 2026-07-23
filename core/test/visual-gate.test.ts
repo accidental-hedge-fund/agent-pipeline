@@ -11,7 +11,10 @@ import { tmpdir } from "node:os";
 import { join, isAbsolute } from "node:path";
 import {
   advanceVisual,
+  publishBlobUrl,
   resolveArtifactsDir,
+  selectPublishFiles,
+  VISUAL_PUBLISH_COMMIT_PREFIX,
   type VisualGateDeps,
   type VisualRunResult,
 } from "../scripts/stages/visual.ts";
@@ -69,6 +72,7 @@ function baseCfg(overrides: Partial<PipelineConfig["visual_gate"]> = {}): Pipeli
       timeout: 900,
       max_attempts: 1,
       artifacts_dir: ".pipeline-visual",
+      publish: false,
       ...overrides,
     },
     shipcheck_gate: {
@@ -118,7 +122,7 @@ function makeDeps(
     getPrForIssue: async () => null,
     getPrCommits: async () => [],
     listArtifacts: async () => [],
-    copyArtifacts: async () => {},
+    copyArtifacts: async (_abs, files) => files.map((rel) => ({ rel, ok: true })),
   };
 }
 
@@ -653,6 +657,7 @@ test("visual-gate: artifacts captured and listed in the comment + evidence bundl
     deps.copyArtifacts = async (_abs, files, destDir) => {
       copiedTo = destDir;
       copiedFiles = files;
+      return files.map((rel) => ({ rel, ok: true }));
     };
 
     const out = await advanceVisual(cfg, 800, { stateDir: dir, runDir: "/runs/800" }, deps);
@@ -750,4 +755,202 @@ test("visual-gate: artifacts_dir that is a symlink escaping the worktree → err
     await rm(worktreeDir, { recursive: true, force: true });
     await rm(outsideDir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Per-file copy-failure surfacing (d50013b8)
+// ---------------------------------------------------------------------------
+
+test("visual-gate: a file whose copy fails is reported copy-failed, not captured", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });
+  const deps = makeDeps(log, [passResult("checks passed")]);
+  deps.listArtifacts = async () => [
+    { rel: "ok.png", size: 100 },
+    { rel: "broken.png", size: 100 },
+  ];
+  deps.copyArtifacts = async (_abs, files) =>
+    files.map((rel) => ({ rel, ok: rel !== "broken.png" }));
+
+  const out = await advanceVisual(cfg, 810, { runDir: "/runs/810" }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.ok(log.comments[0].includes("ok.png"));
+  assert.ok(log.comments[0].includes("broken.png (copy failed)"), "copy-failed file must be annotated, not listed as a bare captured file");
+  assert.ok(!log.comments[0].includes("- broken.png\n"), "copy-failed file must never appear as a plain captured entry");
+});
+
+// ---------------------------------------------------------------------------
+// Publish bound selection (pure)
+// ---------------------------------------------------------------------------
+
+test("selectPublishFiles: bounds by file count, per-file size, and total size", () => {
+  const files = ["a.png", "b.png", "c.png"];
+  const sizes = { "a.png": 1024, "b.png": 3 * 1024 * 1024, "c.png": 1024 };
+
+  const { toPublish, overBound } = selectPublishFiles(files, sizes);
+
+  assert.deepEqual(toPublish, ["a.png", "c.png"], "b.png exceeds the per-file cap and must be excluded");
+  assert.deepEqual(overBound, ["b.png"]);
+});
+
+test("selectPublishFiles: total-byte bound excludes files once the cumulative budget is exceeded", () => {
+  // Each file is under the 2MB per-file cap, but six of them exceed the 10MB total budget.
+  const files = ["a.png", "b.png", "c.png", "d.png", "e.png", "f.png"];
+  const perFileBytes = 1.9 * 1024 * 1024;
+  const sizes = Object.fromEntries(files.map((f) => [f, perFileBytes]));
+
+  const { toPublish, overBound } = selectPublishFiles(files, sizes);
+
+  assert.deepEqual(toPublish, ["a.png", "b.png", "c.png", "d.png", "e.png"]);
+  assert.deepEqual(overBound, ["f.png"], "the 6th file would push the cumulative total over the 10MB budget");
+});
+
+test("selectPublishFiles: file-count bound stops at PUBLISH_MAX_FILES", () => {
+  const files = Array.from({ length: 25 }, (_, i) => `f${i}.png`);
+  const sizes = Object.fromEntries(files.map((f) => [f, 10]));
+
+  const { toPublish, overBound } = selectPublishFiles(files, sizes);
+
+  assert.equal(toPublish.length, 20);
+  assert.equal(overBound.length, 5);
+});
+
+test("publishBlobUrl: builds a branch-relative blob URL under the evidence path", () => {
+  const url = publishBlobUrl("acme/widget", "pipeline/46-slug", "screenshot.png");
+  assert.equal(url, "https://github.com/acme/widget/blob/pipeline/46-slug/.pipeline-visual-evidence/screenshot.png");
+});
+
+// ---------------------------------------------------------------------------
+// Publish step (#463)
+// ---------------------------------------------------------------------------
+
+function publishGitDeps(
+  overrides: Partial<
+    Pick<VisualGateDeps, "copyForPublish" | "removeEvidenceDir" | "gitAddForce" | "gitCommit" | "gitDirty" | "gitPush">
+  > = {},
+): Pick<VisualGateDeps, "copyForPublish" | "removeEvidenceDir" | "gitAddForce" | "gitCommit" | "gitDirty" | "gitPush"> {
+  return {
+    copyForPublish: async () => {},
+    removeEvidenceDir: async () => {},
+    gitAddForce: async () => ({ code: 0, stderr: "" }),
+    gitCommit: async () => ({ code: 0, stderr: "" }),
+    gitDirty: async () => true,
+    gitPush: async () => ({ code: 0, stderr: "" }),
+    ...overrides,
+  };
+}
+
+test("visual-gate: publish disabled (default) — no publish git ops, manifest stays bare paths", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1, publish: false });
+  const deps = makeDeps(log, [passResult("checks passed")]);
+  deps.listArtifacts = async () => [{ rel: "screenshot.png", size: 100 }];
+  let addCalled = 0;
+  Object.assign(deps, publishGitDeps({ gitAddForce: async () => { addCalled++; return { code: 0, stderr: "" }; } }));
+
+  const out = await advanceVisual(cfg, 820, { runDir: "/runs/820" }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(addCalled, 0, "publish disabled must never call git add");
+  assert.ok(log.comments[0].includes("- screenshot.png\n") || log.comments[0].trimEnd().endsWith("- screenshot.png"));
+  assert.ok(!log.comments[0].includes("]("), "manifest must not contain a link when publish is disabled");
+});
+
+test("visual-gate: publish enabled — captured artifacts are committed and pushed, manifest links to the blob URL", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1, publish: true });
+  const deps = makeDeps(log, [passResult("checks passed")]);
+  deps.listArtifacts = async () => [{ rel: "screenshot.png", size: 100 }];
+  let addRel = "";
+  let commitMsg = "";
+  let pushed = false;
+  Object.assign(
+    deps,
+    publishGitDeps({
+      gitAddForce: async (_cwd, relPath) => { addRel = relPath; return { code: 0, stderr: "" }; },
+      gitCommit: async (_cwd, message) => { commitMsg = message; return { code: 0, stderr: "" }; },
+      gitPush: async () => { pushed = true; return { code: 0, stderr: "" }; },
+    }),
+  );
+
+  const out = await advanceVisual(cfg, 821, { runDir: "/runs/821" }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(addRel, ".pipeline-visual-evidence");
+  assert.equal(commitMsg, `${VISUAL_PUBLISH_COMMIT_PREFIX}821`);
+  assert.equal(pushed, true);
+  assert.ok(
+    log.comments[0].includes(
+      "[screenshot.png](https://github.com/acme/widget/blob/pipeline/821-42-slug/.pipeline-visual-evidence/screenshot.png)",
+    ),
+    `comment must link to the published blob URL, got: ${log.comments[0]}`,
+  );
+});
+
+test("visual-gate: publish enabled but nothing captured → no publish commit", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1, publish: true });
+  const deps = makeDeps(log, [passResult("checks passed")]);
+  deps.listArtifacts = async () => [];
+  let addCalled = 0;
+  Object.assign(deps, publishGitDeps({ gitAddForce: async () => { addCalled++; return { code: 0, stderr: "" }; } }));
+
+  const out = await advanceVisual(cfg, 822, { runDir: "/runs/822" }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(addCalled, 0, "no captured artifacts must never trigger a publish commit");
+});
+
+test("visual-gate: publish push failure is surfaced in the comment and does not block a passing gate", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1, publish: true });
+  const deps = makeDeps(log, [passResult("checks passed")]);
+  deps.listArtifacts = async () => [{ rel: "screenshot.png", size: 100 }];
+  Object.assign(
+    deps,
+    publishGitDeps({ gitPush: async () => ({ code: 1, stderr: "remote rejected" }) }),
+  );
+
+  const out = await advanceVisual(cfg, 823, { runDir: "/runs/823" }, deps);
+
+  assert.equal(out.advanced, true, "a publish failure must never turn a passing gate into a block");
+  assert.equal(log.blocked.length, 0);
+  assert.ok(log.comments[0].includes("**Publish**: failed"), "publish failure must be surfaced in the evidence comment");
+  assert.ok(log.comments[0].includes("screenshot.png (not published: publish failed)"));
+});
+
+test("visual-gate: over-bound file is annotated 'not published' and is not committed", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1, publish: true });
+  const deps = makeDeps(log, [passResult("checks passed")]);
+  deps.listArtifacts = async () => [
+    { rel: "small.png", size: 100 },
+    { rel: "huge.png", size: 3 * 1024 * 1024 },
+  ];
+  let addCalled = 0;
+  Object.assign(deps, publishGitDeps({ gitAddForce: async (cwd, rel) => { addCalled++; return { code: 0, stderr: "" }; } }));
+
+  const out = await advanceVisual(cfg, 824, { runDir: "/runs/824" }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(addCalled, 1, "an in-bound file must still trigger a publish commit even when a sibling is over-bound");
+  assert.ok(log.comments[0].includes("huge.png (not published: exceeds bound)"));
+  assert.ok(log.comments[0].includes("[small.png]("), "the in-bound file must still be published and linked");
+});
+
+test("visual-gate: copy-failed files are excluded from publish", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1, publish: true });
+  const deps = makeDeps(log, [passResult("checks passed")]);
+  deps.listArtifacts = async () => [{ rel: "broken.png", size: 100 }];
+  deps.copyArtifacts = async (_abs, files) => files.map((rel) => ({ rel, ok: false }));
+  let addCalled = 0;
+  Object.assign(deps, publishGitDeps({ gitAddForce: async () => { addCalled++; return { code: 0, stderr: "" }; } }));
+
+  const out = await advanceVisual(cfg, 825, { runDir: "/runs/825" }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(addCalled, 0, "a file that never made it into the run directory must never be published");
+  assert.ok(log.comments[0].includes("broken.png (copy failed)"));
 });

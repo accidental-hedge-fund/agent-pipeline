@@ -326,6 +326,8 @@ test("resolveConfig: visual_gate defaults apply when block is absent", async () 
     assert.equal(cfg.visual_gate.artifacts_dir, DEFAULT_CONFIG.visual_gate.artifacts_dir);
     assert.equal(cfg.visual_gate.artifacts_dir, ".pipeline-visual");
     assert.equal(cfg.visual_gate.command, undefined);
+    assert.equal(cfg.visual_gate.publish, DEFAULT_CONFIG.visual_gate.publish);
+    assert.equal(cfg.visual_gate.publish, false);
   } finally {
     process.env.PATH = oldPath;
   }
@@ -333,7 +335,7 @@ test("resolveConfig: visual_gate defaults apply when block is absent", async () 
 
 test("resolveConfig: visual_gate enabled with command, advisory mode, and custom artifacts_dir", async () => {
   const repo = makeFakeRepo(
-    `visual_gate:\n  enabled: true\n  command: "npx playwright test"\n  mode: advisory\n  timeout: 600\n  max_attempts: 3\n  artifacts_dir: ".e2e-out"\n`,
+    `visual_gate:\n  enabled: true\n  command: "npx playwright test"\n  mode: advisory\n  timeout: 600\n  max_attempts: 3\n  artifacts_dir: ".e2e-out"\n  publish: true\n`,
   );
   const binDir = makeFakeGh("acme/vg1");
   const oldPath = process.env.PATH;
@@ -347,6 +349,7 @@ test("resolveConfig: visual_gate enabled with command, advisory mode, and custom
     assert.equal(cfg.visual_gate.timeout, 600);
     assert.equal(cfg.visual_gate.max_attempts, 3);
     assert.equal(cfg.visual_gate.artifacts_dir, ".e2e-out");
+    assert.equal(cfg.visual_gate.publish, true);
   } finally {
     process.env.PATH = oldPath;
   }
@@ -1851,6 +1854,19 @@ test("syncConfig: context_snapshot.max_chars is preserved through sync --apply",
   assert.equal(result.applied, true);
   assert.match(synced, /^context_snapshot:/m, "context_snapshot block must be present after sync");
   assert.match(synced, /max_chars: 4000/, "max_chars value must be preserved");
+});
+
+test("syncConfig: visual_gate.publish is preserved through sync --apply", () => {
+  const repo = makeFakeRepo('visual_gate:\n  enabled: true\n  command: "npx playwright test"\n  publish: true\n');
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = syncConfig(repo, { apply: true });
+  const synced = fs.readFileSync(configPath, "utf8");
+
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(result.applied, true);
+  assert.match(synced, /^visual_gate:/m, "visual_gate block must be present after sync");
+  assert.match(synced, /^\s*publish: true/m, "publish: true value must be preserved");
 });
 
 test("syncConfig: queue settings are preserved through sync --apply", () => {

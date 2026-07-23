@@ -685,6 +685,10 @@ export interface PipelineConfig {
     timeout: number;   // seconds
     max_attempts: number; // total attempts (1 = no retry)
     artifacts_dir: string; // worktree-relative
+    // Opt-in (#463): publish the deciding run's captured artifacts to the PR
+    // branch (bounded, pipeline-internal commit) so they render inline in the
+    // PR's "Files changed" tab. Default false preserves #395 behavior exactly.
+    publish: boolean;
   };
   // Review severity policy (#17). Declares which finding severities block
   // progression vs. merely advise. Findings below `block_threshold` (or below
@@ -938,7 +942,7 @@ export const DEFAULT_CONFIG: Omit<
   },
   test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
-  visual_gate: { enabled: false, mode: "gate" as const, timeout: 900, max_attempts: 2, artifacts_dir: ".pipeline-visual" },
+  visual_gate: { enabled: false, mode: "gate" as const, timeout: 900, max_attempts: 2, artifacts_dir: ".pipeline-visual", publish: false },
   shipcheck_gate: {
     enabled: false,
     mode: "advisory" as const,

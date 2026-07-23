@@ -98,6 +98,7 @@ export {
 } from "../openspec-consistency.ts";
 import { invoke } from "../harness.ts";
 import { reviewerModelSourceWasAuto } from "../stage-routing.ts";
+import { VISUAL_PUBLISH_COMMIT_PREFIX } from "./visual.ts";
 import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -155,10 +156,17 @@ export type AttemptPreMergeAutoFixFn = (
  * still triggers a re-review. A `docs: update documentation for #N` commit is
  * NOT pipeline-internal: the pre-merge docs harness was removed (#91, docs now
  * land inside the reviewed implementation diff), so any such commit can only
- * come from a developer. Exported for tests.
+ * come from a developer. Also matches the visual-gate artifact-publish commit
+ * (#463): it republishes already-reviewed evidence, does not change the code
+ * the reviewer evaluated, and must not invalidate the verdict or be mistaken
+ * for a visual-fix commit (distinct prefix from `visualFixCommitPattern`).
+ * Exported for tests.
  */
 export function isPipelineInternalCommit(messageHeadline: string): boolean {
-  return messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX);
+  return (
+    messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX) ||
+    messageHeadline.startsWith(VISUAL_PUBLISH_COMMIT_PREFIX)
+  );
 }
 
 /**

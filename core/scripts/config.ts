@@ -342,6 +342,7 @@ const PartialConfigSchema = z.object({
       timeout: z.number().int().positive().optional().describe("Stage-level budget in seconds (shared across attempts)."),
       max_attempts: z.number().int().positive().optional().describe("Total attempts before giving up (1 = no retry)."),
       artifacts_dir: z.string().optional().describe("Worktree-relative directory the command writes screenshots/diffs/traces into."),
+      publish: z.boolean().optional().describe("Publish the deciding run's captured artifacts to the PR branch as a bounded, pipeline-internal commit (default false)."),
     })
     .strict()
     .optional()
@@ -936,6 +937,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       timeout: fileConfig.visual_gate?.timeout ?? DEFAULT_CONFIG.visual_gate.timeout,
       max_attempts: fileConfig.visual_gate?.max_attempts ?? DEFAULT_CONFIG.visual_gate.max_attempts,
       artifacts_dir: fileConfig.visual_gate?.artifacts_dir ?? DEFAULT_CONFIG.visual_gate.artifacts_dir,
+      publish: fileConfig.visual_gate?.publish ?? DEFAULT_CONFIG.visual_gate.publish,
     },
     shipcheck_gate: {
       enabled: fileConfig.shipcheck_gate?.enabled ?? DEFAULT_CONFIG.shipcheck_gate.enabled,
@@ -1904,6 +1906,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     `  timeout: ${yamlScalar(visualGate.timeout)} # stage-level budget in seconds (shared across attempts)`,
     `  max_attempts: ${yamlScalar(visualGate.max_attempts)} # total attempts before giving up (1 = no retry)`,
     `  artifacts_dir: ${yamlScalar(visualGate.artifacts_dir)} # worktree-relative dir the command writes screenshots/diffs/traces into`,
+    `  publish: ${yamlScalar(visualGate.publish)} # commit captured artifacts to the PR branch as a bounded, pipeline-internal commit so they render on the PR (repo-history tradeoff — see README)`,
     "",
     "eval_gate: # run the repo's eval harness after pre-merge",
     `  enabled: ${yamlScalar(evalGate.enabled)} # set true to enable (one-time declaration per repo)`,
