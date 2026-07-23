@@ -899,3 +899,66 @@ test("autoFilePapercuts: a throwing closeIssue during reconciliation is caught, 
     deps._logLines.some((l) => l.includes("reconciliation close failed") && l.includes("non-fatal")),
   );
 });
+
+test("autoFilePapercuts: genuinely concurrent cross-host cap — two hosts racing past the same pre-create read, filing different titles, still converge to the cap after reconciliation (review finding f09ce15de2e6911a)", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const github = makeFakeGithub();
+
+  // Force both hosts' pre-create cap check (the 2nd listOpenImproveIssues call
+  // in the per-cluster loop) to observe the same stale, pre-create snapshot —
+  // neither create is visible to the other's check yet — before either is
+  // allowed to proceed to `createIssue`. This is what the sequential
+  // "host A completes before host B starts" cap test above cannot exercise.
+  let barrierArrivals = 0;
+  let releaseBarrier: () => void;
+  const barrier = new Promise<void>((resolve) => {
+    releaseBarrier = resolve;
+  });
+  const gate = async () => {
+    barrierArrivals++;
+    if (barrierArrivals >= 2) releaseBarrier();
+    await barrier;
+  };
+
+  function makeGatedHostDeps(runs: Record<string, string[]>) {
+    const deps = makeAutoFileDeps({ runs, github });
+    const originalList = deps.listOpenImproveIssues;
+    let listCalls = 0;
+    deps.listOpenImproveIssues = async () => {
+      listCalls++;
+      const result = await originalList();
+      if (listCalls === 2) await gate();
+      return result;
+    };
+    return deps;
+  }
+
+  const depsHostA = makeGatedHostDeps({
+    r1: [papercutLine(at, "alpha cluster")],
+    r2: [papercutLine(at, "alpha cluster")],
+    r3: [papercutLine(at, "alpha cluster")],
+  });
+  const depsHostB = makeGatedHostDeps({
+    r4: [papercutLine(at, "beta cluster")],
+    r5: [papercutLine(at, "beta cluster")],
+    r6: [papercutLine(at, "beta cluster")],
+  });
+
+  await Promise.all([
+    autoFilePapercuts(defaultAutoFileOpts({ maxPerWindow: 1 }), depsHostA),
+    autoFilePapercuts(defaultAutoFileOpts({ maxPerWindow: 1 }), depsHostB),
+  ]);
+
+  assert.equal(depsHostA._createCalls.length, 1, "host A's stale pre-create snapshot showed the cap not yet reached");
+  assert.equal(depsHostB._createCalls.length, 1, "host B raced past the same stale snapshot with a different title");
+
+  const cutoffMs = NOW_MS - 24 * 3600_000;
+  const openInWindow = github.issues.filter(
+    (i) => i.state === "OPEN" && i.labels.includes("pipeline:backlog") && Date.parse(i.createdAt) >= cutoffMs,
+  );
+  assert.equal(
+    openInWindow.length,
+    1,
+    `cap overshoot after reconciliation: ${openInWindow.length} open issues in window`,
+  );
+});

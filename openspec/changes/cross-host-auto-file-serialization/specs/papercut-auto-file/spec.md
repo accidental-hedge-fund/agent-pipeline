@@ -45,9 +45,14 @@ the trailing `auto_file_window_hours` window does not exceed `auto_file_max_per_
 hosts**, not merely per host. The engine SHALL derive the in-window auto-filed count from
 GitHub-authored issue state at or immediately before each create — rather than solely from a single
 up-front host-local snapshot decremented in memory — so that an issue already created by another host
-is counted before this host files. Any residual overshoot from a simultaneous cross-host create SHALL
-be corrected by the duplicate reconciliation above, since a closed duplicate no longer counts as an
-open auto-filed issue.
+is counted before this host files. Because two hosts can both pass this pre-create check before either
+create lands — including for **different** cluster titles, which the duplicate-title reconciliation
+above cannot detect — the post-create reconciliation SHALL also recompute the in-window open
+auto-filed set from a fresh read-back and close every issue past the lowest-numbered
+`auto_file_max_per_window` survivors, ordered by issue number ascending. This rate-cap reconciliation
+SHALL use the same deterministic lowest-numbered-survivor rule as the duplicate-title reconciliation
+so that two hosts reconciling independently — even against snapshots taken at different times —
+converge on the same surviving set once every involved host's post-create reconciliation has run.
 
 #### Scenario: Concurrent hosts near the cap do not overshoot
 
@@ -62,3 +67,14 @@ open auto-filed issue.
   issue for a different cluster
 - **THEN** host B's cap count SHALL include host A's issue as read from GitHub
 - **AND** host B SHALL stop filing once the GitHub-authored in-window count reaches the cap
+
+#### Scenario: Concurrent hosts filing different titles past the cap converge after reconciliation
+
+- **WHEN** two pipeline processes on distinct hosts each pass the pre-create cap check against the
+  same stale, pre-create snapshot — because neither host's create is visible to the other's check
+  yet — and each creates an issue for a **different** cluster title, together exceeding
+  `auto_file_max_per_window`
+- **THEN** each host's post-create reconciliation SHALL recompute the in-window open auto-filed set
+  and close every issue past the lowest-numbered `auto_file_max_per_window` survivors
+- **AND** once every involved host's reconciliation has run, the number of open auto-filed issues in
+  the window SHALL NOT exceed `auto_file_max_per_window`

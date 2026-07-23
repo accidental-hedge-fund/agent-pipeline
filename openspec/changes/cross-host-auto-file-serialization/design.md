@@ -42,14 +42,23 @@ files cheaply and avoids redundant gh calls). On top of it:
    the cap. Because both hosts observe the same GitHub-authored `createdAt`/labels, the count
    converges.
 
-2. **Post-create read-back reconciliation.** A residual TOCTOU window remains: both hosts can pass
-   the pre-create title/cap check simultaneously and both create. After each create the path
-   re-lists improve issues; if the just-filed title now maps to more than one **open** issue, it
-   keeps the lowest-numbered issue (deterministic, host-independent tiebreak — both hosts pick the
-   same survivor) and closes the rest with a short comment referencing the survivor. This makes
-   dedup **eventually consistent to exactly one open issue per cluster** even when the create race
-   is lost, and it retroactively corrects any transient cap overshoot (the closed duplicates no
-   longer count as open auto-filed issues).
+2. **Post-create read-back reconciliation — duplicate title and rate-cap overflow.** A residual
+   TOCTOU window remains: both hosts can pass the pre-create title/cap check simultaneously and
+   both create. After each create the path re-lists improve issues once and runs two deterministic
+   corrections against that snapshot:
+   - if the just-filed title now maps to more than one **open** issue, keep the lowest-numbered
+     issue and close the rest with a short comment referencing the survivor — dedup becomes
+     **eventually consistent to exactly one open issue per cluster** even when the create race is
+     lost;
+   - recompute the in-window open auto-filed set (across *all* titles) and close every issue past
+     the lowest-numbered `maxPerWindow` survivors. This is required because same-title dedup cannot
+     catch a cap overshoot from two hosts racing past the same pre-create cap check with
+     **different** cluster titles (review finding f09ce15de2e6911a on #459's first round) — nothing
+     ever looks like a "duplicate" in that case, so only a cap-scoped reconciliation catches it.
+
+   Both corrections use the same lowest-numbered-survivor rule, so two hosts reconciling
+   independently — even against snapshots taken at different times — converge on the same surviving
+   set once every involved host's reconciliation has run.
 
 Both mechanisms sit inside the existing outer `try/catch` that swallows all failures — a failing
 list/close call logs a non-fatal warning and leaves the (at worst) duplicate for the next
