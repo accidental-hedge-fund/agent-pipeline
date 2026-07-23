@@ -241,6 +241,18 @@ function checksRegressed(bound: LoopExternalIdentity | null, identity: LoopExter
   return !!bound && bound.checks_conclusion === "success" && (identity.checks_conclusion === "failure" || identity.checks_conclusion === "pending");
 }
 
+/** The furthest {@link LoopItemState} the verified `identity` alone supports —
+ *  `null` when no PR exists yet. `LoopExternalIdentity` carries no
+ *  release/deployment evidence, so `merged` is the furthest derivable target
+ *  (mirrors `identitySupportsState`'s `released`/`deployed` refusal below). */
+function verifiedForwardTarget(identity: LoopExternalIdentity): LoopItemState | null {
+  if (identity.pr_state === "merged") return "merged";
+  if (identity.pr_number !== null && identity.pr_state === "open") {
+    return identity.ready_label_present ? "ready" : "pr_opened";
+  }
+  return null;
+}
+
 /** Classifies the disagreement (if any) between `state` and the freshly
  *  observed `identity`, using `bound` — the item's last verified identity, if
  *  any — to detect an object-identity change (`identity-mismatch`). Returns
@@ -253,9 +265,13 @@ export function classifyDrift(
   bound: LoopExternalIdentity | null,
 ): LoopDriftClass | null {
   if (!REMOTE_PROVING_STATES.has(state)) {
-    // Local states (pending/in_progress/blocked/abandoned/implemented) are
-    // never over-claimed by definition — reconciliation only ever advises on
-    // check regressions once a PR already exists.
+    // Local states (pending/in_progress/blocked/abandoned/implemented) never
+    // over-claim by definition, but a verified PR already ahead of the
+    // ledger IS forward catch-up drift — a worker that crashed after
+    // opening/merging the PR but before recording the transition (#511
+    // review-2 finding: this branch used to hard-return null here and could
+    // never recover such a crash).
+    if (verifiedForwardTarget(identity)) return "ledger-behind";
     return checksRegressed(bound, identity) ? "checks-regressed" : null;
   }
 
@@ -338,8 +354,6 @@ export function computeNextAction(
 // Reconciliation pass — verified truth -> drift -> repair -> next action.
 // ---------------------------------------------------------------------------
 
-const REPAIR_TARGET: LoopItemState = "merged";
-
 export interface ReconcileInput {
   runId: string;
   token: string;
@@ -381,15 +395,19 @@ export async function reconcile(
     }
 
     if (driftClass === "ledger-behind") {
+      const target = verifiedForwardTarget(identity);
+      if (!target) {
+        throw new LoopError("validation", `classifyDrift reported "ledger-behind" for item "${id}" but verifiedForwardTarget found no verified target — these must agree`);
+      }
       const time = deps.now().toISOString();
       const from = entry.state;
       const repaired: LoopItemLedgerEntry = {
         ...entry,
-        state: REPAIR_TARGET,
+        state: target,
         last_verified_identity: identity,
         history: [
           ...entry.history,
-          { time, from, to: REPAIR_TARGET, engine: input.engine, note: "reconciliation repaired forward on verified external identity" },
+          { time, from, to: target, engine: input.engine, note: "reconciliation repaired forward on verified external identity" },
         ],
       };
       items[id] = repaired;

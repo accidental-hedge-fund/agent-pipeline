@@ -8,6 +8,7 @@ import {
   extractHumanPlanComments,
   getHarnessLabel,
   getIssueLabelEvents,
+  getPrForIssueAnyState,
   isBlocked,
   mapRawIssue,
   mapApiIssue,
@@ -17,6 +18,7 @@ import {
   parseMergeable,
   parsePrList,
   parsePrMergeState,
+  pickPrFromTimelinePage,
   pickStage,
   resolvePrForIssue,
   selectPrForBranch,
@@ -798,4 +800,96 @@ test("addIssueComment: timeout surfaces as an error rather than hanging", async 
     () => addIssueComment(GH_WRITE_CFG, 1, "body", fakeRun),
     /ETIMEDOUT/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// getPrForIssueAnyState / pickPrFromTimelinePage (#511 review-2 regression)
+//
+// The bug: the previous implementation called `gh pr list --state all -L 100`
+// — a repository-wide scan bounded to the first 100 PRs. On a repo with more
+// than 100 historical PRs, an older merged PR for this issue could fall
+// outside that window and reconciliation would report `external-absent`
+// instead of the true `merged` state. The fix resolves the PR from the
+// issue's own timeline (issue-scoped, not repo-wide), paginating backward
+// through history until a link is found or the timeline is exhausted.
+// ---------------------------------------------------------------------------
+
+const TIMELINE_CFG = { repo: "accidental-hedge-fund/agent-pipeline" } as PipelineConfig;
+
+function connectedEventNode(prNumber: number, isCrossRepository = false) {
+  return {
+    __typename: "ConnectedEvent",
+    subject: { __typename: "PullRequest", number: prNumber, headRefName: `pr-${prNumber}`, isCrossRepository },
+  };
+}
+
+function crossReferencedEventNode(prNumber: number, willCloseTarget: boolean, isCrossRepository = false) {
+  return {
+    __typename: "CrossReferencedEvent",
+    willCloseTarget,
+    source: { __typename: "PullRequest", number: prNumber, headRefName: `pr-${prNumber}`, isCrossRepository },
+  };
+}
+
+function timelinePageResponse(
+  nodes: ReturnType<typeof connectedEventNode>[],
+  pageInfo: { hasPreviousPage: boolean; startCursor: string | null } = { hasPreviousPage: false, startCursor: null },
+): string {
+  return JSON.stringify({
+    data: { repository: { issue: { timelineItems: { pageInfo, nodes } } } },
+  });
+}
+
+test("pickPrFromTimelinePage: a ConnectedEvent (manual link) resolves the PR", () => {
+  assert.equal(pickPrFromTimelinePage([connectedEventNode(9)]), 9);
+});
+
+test("pickPrFromTimelinePage: a CrossReferencedEvent only resolves when willCloseTarget is true", () => {
+  assert.equal(pickPrFromTimelinePage([crossReferencedEventNode(9, false)]), null, "a mere mention must not match");
+  assert.equal(pickPrFromTimelinePage([crossReferencedEventNode(9, true)]), 9);
+});
+
+test("pickPrFromTimelinePage: a fork PR (isCrossRepository) is excluded", () => {
+  assert.equal(pickPrFromTimelinePage([connectedEventNode(9, true)]), null);
+  assert.equal(pickPrFromTimelinePage([crossReferencedEventNode(9, true, true)]), null);
+});
+
+test("pickPrFromTimelinePage: scans newest-first when multiple links exist", () => {
+  assert.equal(pickPrFromTimelinePage([connectedEventNode(5), connectedEventNode(9)]), 9);
+});
+
+test("getPrForIssueAnyState: resolves via GraphQL timeline query, not a repo-wide gh pr list scan", async () => {
+  let captured: string[] = [];
+  const run: GhApiRunner = async (args) => {
+    captured = args;
+    return timelinePageResponse([connectedEventNode(42)]);
+  };
+  const result = await getPrForIssueAnyState(TIMELINE_CFG, 154, run);
+  assert.equal(result, 42);
+  const joined = captured.join(" ");
+  assert.ok(captured.includes("graphql"), "must call the GraphQL endpoint");
+  assert.ok(joined.includes("timelineItems"), "must query the issue timeline");
+  assert.ok(!joined.includes("pr list"), "must not fall back to a repo-wide pr list scan");
+});
+
+test("getPrForIssueAnyState: an old merged PR beyond a 100-PR window is still found by paginating backward", async () => {
+  // Page 1 (most recent 50 timeline events): no link for this issue yet.
+  // Page 2 (the next 50, older): the historical merged PR's ConnectedEvent.
+  let calls = 0;
+  const run: GhApiRunner = async () => {
+    calls++;
+    if (calls === 1) {
+      return timelinePageResponse([], { hasPreviousPage: true, startCursor: "cursor-1" });
+    }
+    return timelinePageResponse([connectedEventNode(7)], { hasPreviousPage: true, startCursor: "cursor-2" });
+  };
+  const result = await getPrForIssueAnyState(TIMELINE_CFG, 154, run);
+  assert.equal(result, 7);
+  assert.equal(calls, 2, "must page backward instead of stopping at the first page");
+});
+
+test("getPrForIssueAnyState: returns null once the timeline is exhausted with no link found", async () => {
+  const run: GhApiRunner = async () => timelinePageResponse([], { hasPreviousPage: false, startCursor: null });
+  const result = await getPrForIssueAnyState(TIMELINE_CFG, 154, run);
+  assert.equal(result, null);
 });

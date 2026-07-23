@@ -301,8 +301,16 @@ test("classifyDrift: checks regressing from success to failure on an otherwise a
   assert.equal(classifyDrift("pr_opened", now, bound), "checks-regressed");
 });
 
-test("classifyDrift: a local state (implemented) is never over-claimed even when a PR is discovered", () => {
-  assert.equal(classifyDrift("implemented", openPrIdentity(), null), null);
+test("classifyDrift: a local state (implemented) with no PR at all produces no drift", () => {
+  assert.equal(classifyDrift("implemented", openPrIdentity({ pr_number: null, pr_state: null }), null), null);
+});
+
+test("classifyDrift: a local state (implemented) is ledger-behind when a PR is already discovered (#511 review-2 regression)", () => {
+  // A worker that crashed after opening (or even merging) the PR but before
+  // recording implemented -> pr_opened must be repaired forward, not treated
+  // as aligned — the old behavior hard-returned null for every local state.
+  assert.equal(classifyDrift("implemented", openPrIdentity(), null), "ledger-behind");
+  assert.equal(classifyDrift("implemented", openPrIdentity({ pr_state: "merged" }), null), "ledger-behind");
 });
 
 test("classifyDrift: every produced class is a member of the closed LoopDriftClass set", () => {
@@ -444,6 +452,48 @@ test("reconcile: benign ledger-behind drift is repaired forward with a history e
   // ReconcileObserveDeps exposes only read methods (get*/find*/baseBranchContainsSha) —
   // there is no merge/push/label-write/PR-edit method reachable through the seam at all,
   // so this repair could not have performed an external mutation even in principle.
+});
+
+test("reconcile: a crash before recording implemented -> pr_opened is repaired to the verified target, not hard-coded to merged (#511 review-2 regression)", async () => {
+  const { deps, token } = await setup("implemented");
+  const { deps: observeDeps } = fakeObserveDeps({
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+  });
+
+  const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  assert.equal(result.drift[0].class, "ledger-behind");
+  assert.equal(result.next_actions["100"], "repair-forward");
+
+  const ledger = await readLedger(deps, "run-1");
+  // The PR is only open (not merged) — repairing to a hard-coded "merged"
+  // target would fabricate an unproven merge; the verified target is pr_opened.
+  assert.equal(ledger.items["100"].state, "pr_opened");
+  const last = ledger.items["100"].history.at(-1);
+  assert.equal(last?.from, "implemented");
+  assert.equal(last?.to, "pr_opened");
+});
+
+test("reconcile: a crash before recording implemented -> merged repairs all the way to merged", async () => {
+  const { deps, token } = await setup("implemented");
+  const { deps: observeDeps } = fakeObserveDeps({
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "merged", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: "mergesha" };
+    },
+  });
+
+  const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  assert.equal(result.drift[0].class, "ledger-behind");
+
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "merged");
 });
 
 test("reconcile: an over-claim (ledger-ahead) is surfaced, not rewritten — state is left untouched", async () => {
