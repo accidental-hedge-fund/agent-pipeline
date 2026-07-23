@@ -656,7 +656,7 @@ export async function advanceFix(
     const finalReason = result.timed_out
       ? `timed out after ${result.duration.toFixed(0)}s`
       : `exit ${result.exit_code}`;
-    const salvaged = await trySalvageUncommittedWork(
+    const { salvaged, failureReason: crashSalvageFailure } = await trySalvageUncommittedWork(
       wt.path,
       issueNumber,
       pipelineRunId,
@@ -669,7 +669,12 @@ export async function advanceFix(
       const budgetNote = retryResult.budgetExhausted
         ? " The remaining fix_timeout budget was exhausted before another retry could be attempted."
         : "";
-      const baseReason = `Fix harness (${harness}) failed${attemptsNote}: ${finalReason}.${budgetNote}`;
+      // #521: disclose why nothing was salvaged so the operator can see that
+      // recoverable work may still exist without reading terminal.log.
+      const salvageNote = crashSalvageFailure
+        ? ` Salvage of uncommitted work also failed: ${crashSalvageFailure}`
+        : "";
+      const baseReason = `Fix harness (${harness}) failed${attemptsNote}: ${finalReason}.${budgetNote}${salvageNote}`;
       const reason = await appendWorktreeStateDisclosure(wt.path, baseReason);
       await setBlocked(cfg, issueNumber, reason, stage, "harness-failure");
       return fixHarnessFailureOutcome(finalReason);
@@ -697,7 +702,7 @@ export async function advanceFix(
     // #131: the harness reported success without committing — salvage real
     // uncommitted work into a commit instead of discarding it. A clean
     // worktree (nothing salvaged) keeps the existing block path.
-    const salvaged = await trySalvageUncommittedWork(
+    const { salvaged, failureReason: noCommitSalvageFailure } = await trySalvageUncommittedWork(
       wt.path,
       issueNumber,
       pipelineRunId,
@@ -837,7 +842,12 @@ export async function advanceFix(
           await transition(cfg, issueNumber, stage, dnrDecision.to, msg);
           return { advanced: true, from: stage, to: dnrDecision.to, summary: "no reproducible findings" };
         }
-        const noCommitsMsg = `${stage} reported success but produced no new commits.`;
+        // #521: disclose why nothing was salvaged so the operator can see that
+        // recoverable work may still exist without reading terminal.log.
+        const noCommitsMsg = noCommitSalvageFailure
+          ? `${stage} reported success but produced no new commits. ` +
+            `Salvage of uncommitted work also failed: ${noCommitSalvageFailure}`
+          : `${stage} reported success but produced no new commits.`;
         const noCommitsReason = await appendWorktreeStateDisclosure(wt.path, noCommitsMsg);
         await setBlocked(cfg, issueNumber, noCommitsReason, stage, "no-commits");
         return { advanced: false, status: "blocked", reason: noCommitsMsg, blockerKind: "no-commits" };

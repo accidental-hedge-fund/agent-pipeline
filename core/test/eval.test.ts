@@ -154,7 +154,7 @@ function cleanFixDeps(): Pick<
     gitPush: async () => ({ code: 0, stderr: "" }),
     gitCommitMessages: async () => [],
     verifyEvalFix: async () => ({ ok: true }),
-    salvage: async () => true,
+    salvage: async () => ({ salvaged: true }),
   };
 }
 
@@ -510,7 +510,7 @@ test("eval-gate: eval-fix round → harness produces no new commit → blocks (h
   deps.invoke = async () => okInvoke();
   deps.gitHead = async () => "same-sha"; // HEAD never advances: no harness commit
   deps.gitDirty = async () => false; // and nothing left uncommitted to salvage
-  deps.salvage = async () => false;
+  deps.salvage = async () => ({ salvaged: false });
 
   const out = await advanceEval(cfg, 701, {}, deps);
 
@@ -519,6 +519,29 @@ test("eval-gate: eval-fix round → harness produces no new commit → blocks (h
   assert.equal(log.blocked.length, 1);
   assert.equal(log.blocked[0].kind, "harness-failure");
   assert.ok(log.blocked[0].reason.includes("no new commits"));
+});
+
+test("eval-gate (#521): eval-fix round → salvage attempt fails → its failure reason is threaded into the block reason", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+
+  const deps = makeDeps(log, []);
+  Object.assign(deps, cleanFixDeps());
+  deps.runEval = async () => failResult("evals failed");
+  deps.invoke = async () => okInvoke();
+  deps.gitHead = async () => "same-sha"; // HEAD never advances: no harness commit
+  deps.gitDirty = async () => false;
+  deps.salvage = async () => ({ salvaged: false, failureReason: "git add failed: ignored nested paths" });
+
+  const out = await advanceEval(cfg, 701, {}, deps);
+
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.ok(log.blocked[0].reason.includes("no new commits"));
+  assert.ok(
+    log.blocked[0].reason.includes("Salvage of uncommitted work also failed: git add failed: ignored nested paths"),
+    `blocked reason must disclose the salvage failure; got: ${log.blocked[0].reason}`,
+  );
 });
 
 test("eval-gate: eval-fix round → worktree left dirty after fix → blocks (harness-failure), eval NOT re-run", async () => {

@@ -1147,7 +1147,7 @@ test("gate (#131): fix harness edits but doesn't commit → salvage runs, tests 
       salvage: async (_wt, _issue, _run, stageLabel) => {
         salvageCalls.push(stageLabel);
         dirty = false; // salvage committed the leftover work
-        return true;
+        return { salvaged: true };
       },
       verifyTestFix: async () => ({ ok: true }),
       gitCommitMessages: async () => [],
@@ -1182,7 +1182,7 @@ test("gate (#131, bites): salvage that salvages nothing → dirty block exactly 
       },
       gitHead: async () => "h0",
       gitDirty: async () => dirty,
-      salvage: async () => false,
+      salvage: async () => ({ salvaged: false }),
       verifyTestFix: async () => ({ ok: true }),
       gitCommitMessages: async () => [],
     },
@@ -1190,6 +1190,68 @@ test("gate (#131, bites): salvage that salvages nothing → dirty block exactly 
   );
   assert.equal(out.passed, false);
   assert.match(out.blockReason ?? "", /Fix harness left uncommitted changes/);
+});
+
+test("gate (#521): salvage attempt fails → its failure reason is threaded into the dirty block reason", async () => {
+  // The salvage git operation itself failed (e.g. the nested-node_modules add
+  // refusal this change fixes upstream) — the block reason must disclose why,
+  // not just say "left uncommitted changes" with no detail.
+  let dirty = false;
+  const out = await runTestGate(
+    cfgWith({}),
+    42,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => failResult,
+      invoke: async () => {
+        dirty = true;
+        return okInvoke();
+      },
+      gitHead: async () => "h0",
+      gitDirty: async () => dirty,
+      salvage: async () => ({ salvaged: false, failureReason: "git add failed: ignored nested paths" }),
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [],
+    },
+    "42/2026-06-12T18:14:44Z",
+  );
+  assert.equal(out.passed, false);
+  assert.match(out.blockReason ?? "", /Fix harness left uncommitted changes/);
+  assert.match(
+    out.blockReason ?? "",
+    /Salvage of uncommitted work also failed: git add failed: ignored nested paths/,
+    "the salvage failure reason must be disclosed in the blocker reason",
+  );
+});
+
+test("gate (#521): clean/no-attempt salvage cases leave the dirty block reason unchanged", async () => {
+  // When salvage was never attempted (worktree stayed clean), the block reason
+  // must be byte-for-byte the pre-#521 text — no salvage-failure section.
+  let dirtyCalls = 0;
+  let head = 0;
+  const out = await runTestGate(
+    cfgWith({}),
+    42,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => failResult,
+      invoke: async () => okInvoke(),
+      gitHead: async () => `h${head++}`, // HEAD advances: harness committed, salvage not attempted
+      gitDirty: async () => dirtyCalls++ > 0, // clean pre-gate, dirty after (leftover artifacts)
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [],
+    },
+    "42/2026-06-12T18:14:44Z",
+  );
+  assert.equal(out.passed, false);
+  assert.equal(
+    out.blockReason,
+    "Fix harness left uncommitted changes in the working tree. " +
+      "Test results can't be trusted — stage and commit the fix before re-running.",
+    "no salvage attempt → blockReason unchanged from the pre-#521 text",
+  );
 });
 
 test("gate (#131): salvaged but tests still fail → blocked with the test-gate reason", async () => {
@@ -1213,7 +1275,7 @@ test("gate (#131): salvaged but tests still fail → blocked with the test-gate 
       salvage: async () => {
         salvaged++;
         dirty = false;
-        return true;
+        return { salvaged: true };
       },
       verifyTestFix: async () => ({ ok: true }),
       gitCommitMessages: async () => [],
@@ -1240,7 +1302,7 @@ test("gate (#131): clean worktree with no commit → salvage not attempted, no-c
       gitDirty: async () => false, // genuinely empty harness run
       salvage: async (_wt, _issue, _run, stageLabel) => {
         salvageCalls.push(stageLabel);
-        return true;
+        return { salvaged: true };
       },
       // Real format gate over an empty range → the existing no-commit block.
       verifyTestFix: (wt, hb) =>
@@ -1274,7 +1336,7 @@ test("gate (#131): harness committed AND left dirt → salvage not attempted, di
       gitDirty: async () => dirtyCalls++ > 0, // clean pre-gate, dirty after the fix
       salvage: async (_wt, _issue, _run, stageLabel) => {
         salvageCalls.push(stageLabel);
-        return true;
+        return { salvaged: true };
       },
       verifyTestFix: async () => ({ ok: true }),
       gitCommitMessages: async () => [],

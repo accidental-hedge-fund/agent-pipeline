@@ -195,14 +195,15 @@ export interface VisualGateDeps {
   gitPush?: (cwd: string, branch: string) => Promise<{ code: number; stderr: string }>;
   /** Full commit messages for commits reachable from HEAD but not `baseRef`. */
   gitCommitMessages?: (cwd: string, baseRef: string) => Promise<string[]>;
-  /** Salvage uncommitted visual-fix work into a commit. Returns true when a
-   *  salvage commit was created. */
+  /** Salvage uncommitted visual-fix work into a commit. `salvaged` is true
+   *  when a salvage commit was created; `failureReason` is set when a salvage
+   *  was attempted and its git operation failed (#521). */
   salvage?: (
     wtPath: string,
     issueNumber: number,
     pipelineRunId: string,
     stageLabel: string,
-  ) => Promise<boolean>;
+  ) => Promise<{ salvaged: boolean; failureReason?: string }>;
   /** Verify the visual-fix commit message format. Injectable for tests. */
   verifyVisualFix?: (wtPath: string, headBefore: string) => Promise<VerifyResult>;
   /** Authenticated gh actor login, used to trust-filter review comments when
@@ -735,7 +736,7 @@ interface VisualFixRoundDeps {
   gitDirty: (cwd: string) => Promise<boolean>;
   gitPush: (cwd: string, branch: string) => Promise<{ code: number; stderr: string }>;
   gitCommitMessages: (cwd: string, baseRef: string) => Promise<string[]>;
-  salvage: (wtPath: string, issueNumber: number, pipelineRunId: string, stageLabel: string) => Promise<boolean>;
+  salvage: (wtPath: string, issueNumber: number, pipelineRunId: string, stageLabel: string) => Promise<{ salvaged: boolean; failureReason?: string }>;
   verifyVisualFix: (wtPath: string, headBefore: string) => Promise<VerifyResult>;
 }
 
@@ -813,11 +814,17 @@ async function runVisualFixRound(
 
   let headAfter = await deps.gitHead(wtPath);
   if (headBefore && headAfter && headBefore === headAfter) {
-    const salvaged = await deps.salvage(wtPath, issueNumber, pipelineRunId, visualFixSalvageStageLabel(issueNumber));
+    const { salvaged, failureReason } = await deps.salvage(wtPath, issueNumber, pipelineRunId, visualFixSalvageStageLabel(issueNumber));
     if (!salvaged) {
+      // #521: disclose why nothing was salvaged so the operator can see that
+      // recoverable work may still exist without reading terminal.log.
+      const reason = failureReason
+        ? `visual-gate fix round ${attempt} reported success but produced no new commits. ` +
+          `Salvage of uncommitted work also failed: ${failureReason}`
+        : `visual-gate fix round ${attempt} reported success but produced no new commits.`;
       return {
         ok: false,
-        reason: `visual-gate fix round ${attempt} reported success but produced no new commits.`,
+        reason,
         blockerKind: "harness-failure",
       };
     }

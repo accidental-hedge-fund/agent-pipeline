@@ -28,11 +28,11 @@ export interface SalvageDeps {
   gitRestoreStaged?: (wtPath: string, args: string[]) => Promise<void>;
   /**
    * Stage changes in the worktree using the provided git-add args array.
-   * The default implementation passes `["add", "-A", "--", ":(exclude)node_modules"]`
-   * so that a node_modules symlink or directory is never staged even if
-   * `.git/info/exclude` is absent or stale.  The args are passed through as
-   * a parameter so tests can assert the required pathspec without relying on
-   * the default implementation.
+   * The default implementation passes `["add", "-A", "--", ...SALVAGE_NODE_MODULES_EXCLUDE]`
+   * so that a node_modules symlink or directory is never staged — at any
+   * nesting depth — even if `.git/info/exclude` is absent or stale.  The args
+   * are passed through as a parameter so tests can assert the required
+   * pathspec without relying on the default implementation.
    */
   gitAddAll?: (wtPath: string, args: string[]) => Promise<void>;
   /** `git commit -m <message>` in the worktree. */
@@ -55,7 +55,20 @@ async function defaultGitStatus(wtPath: string, scope?: string): Promise<string>
   return res.stdout;
 }
 
-const SALVAGE_GIT_ADD_ARGS = ["add", "-A", "--", ":(exclude)node_modules"];
+// Depth-agnostic node_modules exclusion (#521): `:(exclude)node_modules` is a
+// literal pathspec that only matches a worktree-root node_modules entry, so a
+// nested monorepo install (e.g. apps/web/node_modules/.pnpm/…) falls outside
+// it, `git add -A` enumerates the ignored nested paths, and git refuses to add
+// them without `-f` — aborting the whole salvage. `glob` magic with a `**/`
+// prefix matches zero or more leading path components, so both members
+// together exclude a node_modules entry (and everything under it) at any
+// nesting depth, not only the root.
+export const SALVAGE_NODE_MODULES_EXCLUDE = [
+  ":(exclude,glob)**/node_modules",
+  ":(exclude,glob)**/node_modules/**",
+];
+
+const SALVAGE_GIT_ADD_ARGS = ["add", "-A", "--", ...SALVAGE_NODE_MODULES_EXCLUDE];
 
 async function defaultGitRestoreStaged(wtPath: string, args: string[]): Promise<void> {
   await gitInWorktree(wtPath, args);
@@ -136,18 +149,28 @@ export async function salvageUncommittedWork(
     await (deps.gitRestoreStaged ?? defaultGitRestoreStaged)(wtPath, restoreArgs);
   }
   const addArgs = scope
-    ? ["add", "-A", "--", ":(exclude)node_modules", scope]
+    ? ["add", "-A", "--", ...SALVAGE_NODE_MODULES_EXCLUDE, scope]
     : SALVAGE_GIT_ADD_ARGS;
   await (deps.gitAddAll ?? defaultGitAddAll)(wtPath, addArgs);
   await (deps.gitCommit ?? defaultGitCommit)(wtPath, message);
   return { salvaged: true, message };
 }
 
+/** Outcome of {@link trySalvageUncommittedWork}: `salvaged` is `true` only when a
+ *  salvage commit was created. `failureReason` is set only when a salvage was
+ *  attempted (the worktree was dirty) and its git operation threw — callers
+ *  thread it into a no-commit blocker comment so the operator can see why
+ *  nothing was salvaged without reading terminal.log (#521). */
+export type TrySalvageResult = { salvaged: boolean; failureReason?: string };
+
 /**
  * Non-throwing wrapper for the stage call sites: a salvage failure must never
  * make the run worse than today's block path, so errors are logged and treated
  * as "nothing salvaged" (the caller falls through to its existing block).
- * Returns `true` only when a salvage commit was created.
+ * Returns `{ salvaged: true }` only when a salvage commit was created;
+ * `{ salvaged: false, failureReason }` when the attempted salvage's git
+ * operation failed; `{ salvaged: false }` when the worktree was clean (no
+ * attempt made).
  */
 export async function trySalvageUncommittedWork(
   wtPath: string,
@@ -156,7 +179,7 @@ export async function trySalvageUncommittedWork(
   stageLabel: string,
   deps: SalvageDeps = {},
   scope?: string,
-): Promise<boolean> {
+): Promise<TrySalvageResult> {
   try {
     const res = await salvageUncommittedWork(wtPath, issueNumber, pipelineRunId, stageLabel, deps, scope);
     if (res.salvaged) {
@@ -164,11 +187,12 @@ export async function trySalvageUncommittedWork(
         `[pipeline] #${issueNumber}: salvaged uncommitted ${stageLabel} harness work into a commit`,
       );
     }
-    return res.salvaged;
+    return { salvaged: res.salvaged };
   } catch (err) {
+    const failureReason = (err as Error).message;
     console.warn(
-      `[pipeline] #${issueNumber}: salvage of uncommitted ${stageLabel} harness work failed: ${(err as Error).message}`,
+      `[pipeline] #${issueNumber}: salvage of uncommitted ${stageLabel} harness work failed: ${failureReason}`,
     );
-    return false;
+    return { salvaged: false, failureReason };
   }
 }

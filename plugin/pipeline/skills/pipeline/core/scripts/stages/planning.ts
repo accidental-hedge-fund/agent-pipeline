@@ -729,15 +729,21 @@ export async function runPlanningPhases(
 
   // #131: the implementer may have done the work without committing — salvage
   // real uncommitted changes into a commit before the no-commit checks below.
-  await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "implement", implHeadBefore);
+  const implSalvage = await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "implement", implHeadBefore);
 
   // ---- Verify commits ----
   const ahead = await doHasCommitsAhead(wt.path, cfg.base_branch);
   if (!ahead) {
+    // #521: disclose why nothing was salvaged so the operator can see that
+    // recoverable work may still exist without reading terminal.log.
+    const noCommitsReason = implSalvage.failureReason
+      ? `Implementation harness (${primary}) completed but produced no commits. ` +
+        `Salvage of uncommitted work also failed: ${implSalvage.failureReason}`
+      : `Implementation harness (${primary}) completed but produced no commits.`;
     await doSetBlocked(
       cfg,
       issueNumber,
-      `Implementation harness (${primary}) completed but produced no commits.`,
+      noCommitsReason,
       "implementing",
       "no-commits",
     );
@@ -1078,7 +1084,7 @@ export function makeOpenspecPlanningHooks(
       // commit-range verification below (the change folder may exist only on disk).
       // Scope to openspec/ so only intent files are staged — aligns with the
       // path-constraint guard below and fixes the sandbox-lock contamination (#321).
-      await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "OpenSpec authoring", osAuthorHeadBefore, "openspec/");
+      const authorSalvage = await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "OpenSpec authoring", osAuthorHeadBefore, "openspec/");
 
       // #352: commit openspec/config.yaml when the CLI left it untracked/modified.
       // The openspec CLI writes this file lazily (ensureDefaultConfig) on the first
@@ -1093,10 +1099,16 @@ export function makeOpenspecPlanningHooks(
       const fresh = after.filter((c) => !beforeList.includes(c));
       const changeResult = enforceOpenspecChangeSingular(fresh, after);
       if (!changeResult.ok) {
+        // #521: disclose why nothing was salvaged so the operator can see that
+        // recoverable authoring work may still exist without reading terminal.log.
+        const noChangeReason =
+          "OpenSpec is active but the planning step produced no change under `openspec/changes/`. " +
+          "Ensure the `openspec` CLI is installed and the repo is initialized (`openspec init`).";
         const blockMsg =
           changeResult.reason === "no openspec change created"
-            ? "OpenSpec is active but the planning step produced no change under `openspec/changes/`. " +
-              "Ensure the `openspec` CLI is installed and the repo is initialized (`openspec init`)."
+            ? authorSalvage.failureReason
+              ? `${noChangeReason} Salvage of uncommitted work also failed: ${authorSalvage.failureReason}`
+              : noChangeReason
             : changeResult.reason;
         return { ok: false, reason: blockMsg, tag: "needs-human" };
       }
@@ -1528,6 +1540,9 @@ export async function dispatchResume(
  * salvage any uncommitted work in the worktree into a commit so the downstream
  * commit-range checks validate it instead of blocking on "no commits". A clean
  * worktree salvages nothing and the caller's existing block path is unchanged.
+ * Returns the salvage outcome (including a `failureReason` when a salvage
+ * attempt's git operation failed) so callers can disclose it in a no-commit
+ * blocker comment (#521).
  */
 async function salvageIfNoNewCommit(
   wtPath: string,
@@ -1536,14 +1551,15 @@ async function salvageIfNoNewCommit(
   stageLabel: string,
   headBefore: string,
   scope?: string,
-): Promise<void> {
-  if (!headBefore) return;
+): Promise<{ salvaged: boolean; failureReason?: string }> {
+  if (!headBefore) return { salvaged: false };
   const headAfter = (
     await gitInWorktree(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
   if (headAfter && headAfter === headBefore) {
-    await trySalvageUncommittedWork(wtPath, issueNumber, pipelineRunId, stageLabel, {}, scope);
+    return trySalvageUncommittedWork(wtPath, issueNumber, pipelineRunId, stageLabel, {}, scope);
   }
+  return { salvaged: false };
 }
 
 // ---------------------------------------------------------------------------
