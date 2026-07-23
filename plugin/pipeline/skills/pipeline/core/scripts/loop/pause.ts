@@ -272,6 +272,19 @@ export interface ResumeResponseInput {
   value: string;
 }
 
+/** Validates a resume's response at runtime — `value` is only a TypeScript annotation on
+ *  {@link ResumeResponseInput} and is not enforced at the call boundary. Refuses (LoopError
+ *  "validation") a missing/non-object response or a `value` that is not a non-empty string,
+ *  before any request-semantics check or durable write (finding 56a736fa). */
+function validateResumeResponse(response: unknown): asserts response is ResumeResponseInput {
+  if (!response || typeof response !== "object" || Array.isArray(response)) {
+    throw new LoopError("validation", `resume requires a response object`);
+  }
+  if (typeof (response as { value?: unknown }).value !== "string" || (response as { value: string }).value.trim() === "") {
+    throw new LoopError("validation", `resume requires a non-empty response.value`);
+  }
+}
+
 export interface ResumeHoldInput {
   runId: string;
   token: string;
@@ -317,6 +330,8 @@ export async function resumeHold(deps: LoopStoreDeps, input: ResumeHoldInput): P
     );
   }
 
+  validateResumeResponse(input.response);
+
   if (item.state === "waiting") {
     const outstanding = item.hold_request;
     if (!outstanding) {
@@ -341,13 +356,10 @@ export async function resumeHold(deps: LoopStoreDeps, input: ResumeHoldInput): P
 
   const time = deps.now().toISOString();
   const fromState = item.state;
-  item.state = "in_progress";
-  item.hold_request = undefined;
-  item.history.push({ time, from: fromState, to: "in_progress", engine: input.engine, note: input.note });
-  ledger.last_native_goal_check = input.native_goal as LoopNativeGoalCheck;
 
-  await writeLedger(deps, ledger, input.token);
-  await appendEvent(deps, input.runId, input.token, "loop_item_resumed", { item_id: input.itemId, from: fromState });
+  // Decision logged before the ledger is durably updated: if appendDecision fails, the ledger
+  // write below never runs, so a resume can never take effect without its audited decision
+  // (finding 639c2bbb).
   await appendDecision(deps, input.runId, input.token, "loop_hold_resumed", {
     item_id: input.itemId,
     from_state: fromState,
@@ -356,6 +368,14 @@ export async function resumeHold(deps: LoopStoreDeps, input: ResumeHoldInput): P
     response: input.response,
     time,
   });
+
+  item.state = "in_progress";
+  item.hold_request = undefined;
+  item.history.push({ time, from: fromState, to: "in_progress", engine: input.engine, note: input.note });
+  ledger.last_native_goal_check = input.native_goal as LoopNativeGoalCheck;
+
+  await writeLedger(deps, ledger, input.token);
+  await appendEvent(deps, input.runId, input.token, "loop_item_resumed", { item_id: input.itemId, from: fromState });
   return ledger;
 }
 

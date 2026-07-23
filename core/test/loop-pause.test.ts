@@ -514,6 +514,92 @@ test("resumeHold: a bare paused hold (no request) resumes with just a response a
   assert.equal(ledger.items["100"].state, "in_progress");
 });
 
+test("resumeHold: a waiting request with no permitted_responses cannot be resumed with a missing response value", async () => {
+  const { deps, token } = await setup();
+  const waiting = await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: { kind: "answer", prompt: "which?" } });
+  const requestId = waiting.items["100"].hold_request!.request_id;
+  await assert.rejects(
+    () =>
+      resumeHold(deps, {
+        runId: "run-1",
+        token,
+        itemId: "100",
+        engine: "claude",
+        actor: "human:alice",
+        response: { request_id: requestId } as never,
+        pipeline_preflight: PREFLIGHT_OK,
+        native_goal: NATIVE_GOAL_OK,
+      }),
+    (err: unknown) => assertClass(err, "validation"),
+  );
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "waiting", "resume was refused, item stays in its hold");
+  assert.ok(ledger.items["100"].hold_request, "outstanding request intact");
+  const decisions = await readDecisions(deps, "run-1");
+  assert.equal(decisions.length, 0, "no resume decision appended for a rejected resume");
+});
+
+test("resumeHold: a non-object response is refused, leaving state unchanged", async () => {
+  const { deps, token } = await setup();
+  await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: { kind: "answer", prompt: "which?" } });
+  await assert.rejects(
+    () =>
+      resumeHold(deps, {
+        runId: "run-1",
+        token,
+        itemId: "100",
+        engine: "claude",
+        actor: "human:alice",
+        response: null as never,
+        pipeline_preflight: PREFLIGHT_OK,
+        native_goal: NATIVE_GOAL_OK,
+      }),
+    (err: unknown) => assertClass(err, "validation"),
+  );
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "waiting");
+});
+
+test("resumeHold: a decision-log append failure leaves the ledger un-resumed and the hold intact", async () => {
+  const { deps, files } = fakeDeps({
+    async appendLine(p, line) {
+      if (p.endsWith("decisions.jsonl")) throw new Error("simulated decision-log append failure");
+      const existing = files.get(p) ?? "";
+      files.set(p, existing + line + "\n");
+    },
+  });
+  const contract = testContract();
+  await initRun(deps, contract, testLedger());
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const waiting = await waitItem(deps, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    request: { kind: "decision", prompt: "go ahead?", permitted_responses: ["yes", "no"] },
+  });
+  const requestId = waiting.items["100"].hold_request!.request_id;
+
+  await assert.rejects(
+    () =>
+      resumeHold(deps, {
+        runId: "run-1",
+        token,
+        itemId: "100",
+        engine: "claude",
+        actor: "human:alice",
+        response: { request_id: requestId, value: "yes" },
+        pipeline_preflight: PREFLIGHT_OK,
+        native_goal: NATIVE_GOAL_OK,
+      }),
+    /simulated decision-log append failure/,
+  );
+
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "waiting", "no unaudited resume was left durably committed");
+  assert.ok(ledger.items["100"].hold_request, "outstanding request intact — resume never took effect");
+});
+
 // ---------------------------------------------------------------------------
 // Scoped, audited authority amendments.
 // ---------------------------------------------------------------------------
