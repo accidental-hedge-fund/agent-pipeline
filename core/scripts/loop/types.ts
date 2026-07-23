@@ -228,6 +228,13 @@ export interface LoopContract {
   concurrency_model: "exclusive_lock_single_engine";
   items: LoopContractItem[];
   canonical_hash: string;
+  /** The run-level cycle watchdog bound (#512, capability
+   *  `durable-loop-supervisor`) — consecutive no-progress cycles permitted
+   *  before the supervisor stops the run with `supervisor_no_progress`.
+   *  Optional so a pre-#512 contract resumes; see
+   *  `DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT` (loop/supervisor.ts) for the
+   *  default applied when absent. */
+  consecutive_no_progress_limit?: number;
   /** Present only when this contract was produced by importing a legacy
    *  goal-loop run — names the schema id the run originated from. Absent for
    *  natively-compiled contracts. */
@@ -286,7 +293,17 @@ export interface LoopStopRecord {
      *  immediately at block time (#509 review round 2 finding 6ced9fe0), even
      *  for a retry-capable class, since a run-fatal class's whole point is
      *  that the run cannot safely continue automatically. */
-    | "run_fatal";
+    | "run_fatal"
+    /** The run-level cycle watchdog (#512, capability `durable-loop-supervisor`)
+     *  stopped the run after `consecutive_no_progress_limit` cycles produced
+     *  no durable delta — distinct from the item-level `repeated_no_progress`
+     *  bound above; see loop/supervisor.ts. */
+    | "supervisor_no_progress"
+    /** The absolute cycle safety backstop (`MAX_CYCLES_SAFETY`, #512 review
+     *  round 2) was exhausted while every cycle still reported progress — a
+     *  durable terminal stop so a run can never fall through the cap silently
+     *  nonterminal and unheld; see loop/supervisor.ts. */
+    | "supervisor_cycle_cap";
   time: string;
   item_id?: string;
   theme?: string;
@@ -439,4 +456,62 @@ export class LoopError extends Error {
     this.loopFailureClass = loopFailureClass;
     this.name = "LoopError";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Durable loop supervisor (#512, capability `durable-loop-supervisor`) —
+// process identity + heartbeat and the append-only action-evidence trail. See
+// loop/supervisor.ts and openspec/changes/in-repo-loop-supervisor/design.md.
+// ---------------------------------------------------------------------------
+
+/** A durable process-identity record — distinct from {@link LoopLockRecord}
+ *  (design.md decision 1): the lock answers "who may write"; this record
+ *  answers "who is driving right now and is it still alive and progressing."
+ *  Written at attach and refreshed every cycle through the store's injected
+ *  seam. */
+export interface LoopSupervisorProcess {
+  run_id: string;
+  engine: LoopEngineName;
+  pid: number;
+  hostname: string;
+  /** A per-boot identifier, distinguishing successive processes that might
+   *  reuse the same pid across restarts. */
+  boot_id: string;
+  started_at: string;
+  heartbeat_at: string;
+  /** The lock token this process currently holds. */
+  token: string;
+  /** The run-level watchdog's current consecutive-no-progress count — reset
+   *  to 0 on any progress cycle (design.md decision 2/3). */
+  consecutive_no_progress: number;
+}
+
+export const LOOP_SUPERVISOR_ACTIONS = [
+  "reconcile",
+  "start_item",
+  "dispatch_item",
+  "block_item",
+  "abandon_item",
+  "resume",
+  "stop",
+  "noop",
+] as const;
+
+export type LoopSupervisorAction = (typeof LOOP_SUPERVISOR_ACTIONS)[number];
+
+export function isLoopSupervisorAction(value: unknown): value is LoopSupervisorAction {
+  return typeof value === "string" && (LOOP_SUPERVISOR_ACTIONS as readonly string[]).includes(value);
+}
+
+/** One append-only action-evidence entry (design.md decision 3) — a durable
+ *  record of exactly what the supervisor decided and did on one cycle, so a
+ *  resuming process or an auditor can reconstruct the run's history. */
+export interface LoopActionEvidence {
+  seq: number;
+  time: string;
+  item_id: string | null;
+  action: LoopSupervisorAction;
+  outcome: string;
+  next_action: LoopNextAction | null;
+  progress: "progress" | "no_progress";
 }

@@ -16,8 +16,9 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
-import { writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { writeFileSync, readFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import * as crypto from "node:crypto";
 import { Command, Option } from "commander";
 import { resolveConfig, resolveReleaseConfig, resolveLoopNativeGoalAttestation, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig, repoMapAdd, repoMapRemove, repoMapList, type RepoMapRelation } from "./config.ts";
 import { ensureArtifactIgnoreBlock } from "./artifact-ignore.ts";
@@ -128,7 +129,13 @@ import {
   storePreflightResult,
   type PreflightResult,
 } from "./stages/doctor.ts";
-import { runLoopPreflight, type LoopEngine, type LoopPreflightOutcome, type RawLoopArgs, type NativeGoalAttestation } from "./loop-preflight.ts";
+import { runLoopPreflight, type LoopEngine, type LoopPreflightOutcome, type LoopSelector, type RawLoopArgs, type NativeGoalAttestation } from "./loop-preflight.ts";
+import { auditSupervisor, driveSupervisor, type SupervisorDeps } from "./loop/supervisor.ts";
+import { defaultLoopStoreDeps, runExists as loopRunExists } from "./loop/store.ts";
+import { initRecoverableRun } from "./loop/recovery.ts";
+import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
+import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type LoopLedger } from "./loop/types.ts";
+import { LOOP_EXECUTION_CONTRACT_SCHEMA, normalizeLoopOutcome, type LoopExecutionRequest, type LoopExecutionResponse } from "./loop-execution-contract.ts";
 import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
   LABEL_PREFIX,
@@ -446,21 +453,333 @@ export function buildCmd(): Command {
   return cmd;
 }
 
-/** IO seam for {@link runLoopCommand} — the same DoctorDeps-shaped preflight
- *  used by `pipeline doctor` and the installer (design.md decision 4: one
- *  implementation, no divergent copies). */
-export interface LoopCliDeps {
-  runLoopPreflight: typeof runLoopPreflight;
+/** Derives a deterministic run id for an explicit issue-number selector
+ *  (`--range` or a bare issue list) — the only selector the in-repo compiler
+ *  below resolves without a GitHub query. Stable across repeated invocations
+ *  of the same list so a second `pipeline loop 100 101` naturally resumes the
+ *  same run instead of creating a duplicate. */
+export function workListRunId(repo: string, engine: LoopEngine, issues: readonly string[]): string {
+  const hash = crypto.createHash("sha256").update(`${repo}:${engine}:${issues.join(",")}`).digest("hex").slice(0, 16);
+  return `loop-${hash}`;
 }
 
-const defaultLoopCliDeps: LoopCliDeps = { runLoopPreflight };
+/** Compiles a `LoopContractInit` + seeded `LoopLedger` for an already-resolved
+ *  issue-number list — each item independent (no fabricated dependencies),
+ *  executed in list order by the supervisor's single-active-item invariant.
+ *  Milestone/label/roadmap-slice selectors are resolved into this same
+ *  explicit list by {@link resolveSelectorIssues} before compilation. */
+export function compileWorkListRun(
+  cfg: PipelineConfig,
+  engine: LoopEngine,
+  issues: readonly string[],
+  runId: string,
+): { contract: import("./loop/recovery.ts").LoopContractInit; ledger: LoopLedger } {
+  const contract: import("./loop/recovery.ts").LoopContractInit = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: runId,
+    engine,
+    repo: { name: cfg.repo, base_branch: cfg.base_branch },
+    selector: { type: "work-list", value: issues },
+    objective: `advance ${issues.join(", ")} to pipeline:ready-to-deploy`,
+    worktree_policy: "default",
+    done_definition: "pipeline:ready-to-deploy",
+    authority_grants: [],
+    recovery_budgets: { default: 3 },
+    consecutive_blocked_limit: 3,
+    verification: null,
+    report_format: "markdown",
+    ordering: "dependency_sequential",
+    max_active_items: 1,
+    concurrency_model: "exclusive_lock_single_engine",
+    items: issues.map((id) => ({ id, depends_on: [] })),
+    canonical_hash: runId,
+  };
+  const ledger: LoopLedger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: runId,
+    items: Object.fromEntries(
+      issues.map((id) => [id, { id, state: "pending" as const, history: [], recovery_budgets_remaining: { default: 3 } }]),
+    ),
+    consecutive_blocked: 0,
+    merge_barrier: null,
+    stop: null,
+    last_native_goal_check: null,
+    last_reconciliation: null,
+    reconciliation_sequence: 0,
+    recovery_attempts: [],
+    authority_amendments: [],
+  };
+  return { contract, ledger };
+}
 
-/** `pipeline loop ...` (#451): normalize arguments, run the deterministic
- *  loop:contract-coherence + native-/goal checks, and — on success — print the
- *  compiled selector as JSON for the calling agent to hand off to the
- *  installed goal-loop skill (see each host's SKILL.md). Every failure path
- *  exits non-zero with remediation and performs zero external mutation: no gh
- *  call, no lock, no ledger write, no worktree or branch creation. */
+/** The real `pipeline/loop-execution@1` dispatch seam: runs the per-item
+ *  advance loop for `item_id` to completion as a synchronous child process
+ *  (never the external goal-loop skill), then maps the issue's final label
+ *  state to a terminal outcome. Injected so unit tests never spawn a real
+ *  process. */
+/** Builds the child-process argv for the per-item advance loop hand-off.
+ *  Deliberately omits `--once`: the child must run its normal advance loop
+ *  to completion (a defined `pipeline/loop-execution@1` terminal outcome —
+ *  ready-to-deploy, blocked, or closed), not stop after a single stage (#512
+ *  review 1, finding 57fe63fa). Exported as a pure function so this contract
+ *  is unit-testable without spawning a real process. */
+export function dispatchItemChildArgs(scriptPath: string, issueNumber: number, engine: LoopEngine, repoDir: string): string[] {
+  return [scriptPath, String(issueNumber), "--profile", engine, "--repo-path", repoDir];
+}
+
+export function realDispatchItem(cfg: PipelineConfig, engine: LoopEngine): SupervisorDeps["dispatchItem"] {
+  return async (request: LoopExecutionRequest): Promise<LoopExecutionResponse> => {
+    const issueNumber = Number(request.item_id);
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        dispatchItemChildArgs(fileURLToPath(import.meta.url), issueNumber, engine, cfg.repo_dir),
+        { stdio: "inherit" },
+      );
+      child.on("error", reject);
+      child.on("exit", () => resolve());
+    });
+
+    let outcome: LoopExecutionResponse["outcome"] = "failed";
+    let prNumber: number | null = null;
+    try {
+      const detail = await getIssueDetail(cfg, issueNumber);
+      const readyLabel = `${LABEL_PREFIX}ready-to-deploy`;
+      const blockedLabel = `${LABEL_PREFIX}blocked`;
+      if (detail.labels.includes(readyLabel)) {
+        outcome = "ready_to_deploy";
+      } else if (detail.labels.includes(blockedLabel)) {
+        outcome = "blocked_needs_human";
+      } else if (detail.state === "closed") {
+        outcome = "abandoned";
+      } else {
+        outcome = "failed";
+      }
+      const pr = await getPrForIssue(cfg, issueNumber).catch(() => null);
+      prNumber = pr ?? null;
+    } catch {
+      outcome = "failed";
+    }
+
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: normalizeLoopOutcome(outcome),
+      evidence: { pr_number: prNumber, pipeline_run_id: `pipeline-loop-${request.run_id}-${request.item_id}` },
+    };
+  };
+}
+
+/** One open issue's labels/milestone, as needed to resolve a `milestone` or
+ *  `label` selector into a concrete work list. */
+export interface SelectorOpenIssue {
+  number: number;
+  labels: string[];
+  milestone: string | null;
+}
+
+/** IO seam for {@link resolveSelectorIssues}: listing open issues (for
+ *  milestone/label selectors) and reading ROADMAP.md (for roadmap-slice
+ *  selectors) — injected so unit tests resolve selectors with no real gh or
+ *  filesystem access. */
+export interface SelectorResolveDeps {
+  listOpenIssues: (cfg: PipelineConfig) => Promise<SelectorOpenIssue[]>;
+  readRoadmap: (cfg: PipelineConfig) => Promise<string>;
+}
+
+export function realSelectorResolveDeps(): SelectorResolveDeps {
+  return {
+    listOpenIssues: async (cfg: PipelineConfig): Promise<SelectorOpenIssue[]> => {
+      const result = spawnSync(
+        "gh",
+        ["issue", "list", "--state", "open", "--json", "number,labels,milestone", "--limit", "500"],
+        { encoding: "utf8", stdio: "pipe", cwd: cfg.repo_dir },
+      );
+      if (result.status !== 0) {
+        throw new Error(`gh issue list failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`);
+      }
+      const items = JSON.parse(result.stdout.trim() || "[]") as Array<{
+        number: number;
+        labels: Array<{ name: string }>;
+        milestone: { title: string } | null;
+      }>;
+      return items.map((item) => ({
+        number: item.number,
+        labels: item.labels.map((l) => l.name),
+        milestone: item.milestone?.title ?? null,
+      }));
+    },
+    readRoadmap: async (cfg: PipelineConfig): Promise<string> =>
+      readFileSync(path.join(cfg.repo_dir, "ROADMAP.md"), "utf8"),
+  };
+}
+
+/** Extracts the issue numbers referenced under a named roadmap slice —
+ *  a `**<slice> — ...:**` heading in ROADMAP.md (e.g. `**v1.16.0 — ...**`) —
+ *  from its table rows, stopping at the next top-level heading or slice. A
+ *  heading marked `(shipped ...)` is never matched: this repo's own
+ *  ROADMAP.md reuses a version number between an already-shipped heading and
+ *  a still-forward slice of the same name (e.g. two `v1.16.0` headings), and
+ *  a loop run must only ever select unshipped work. An unshipped slice's
+ *  table leads each row with a bare `| #NNN | What | Why |` issue reference —
+ *  the first `#NNN` on the row is taken as the issue number. Deduplicated and
+ *  sorted ascending so the resulting work list (and its derived run id) is
+ *  deterministic. */
+export function extractRoadmapSliceIssues(roadmapText: string, slice: string): number[] {
+  const headingRe = /^\*\*(\S+)\s+—/;
+  let capturing = false;
+  const issues = new Set<number>();
+  for (const rawLine of roadmapText.split("\n")) {
+    const line = rawLine.trim();
+    const heading = headingRe.exec(line);
+    if (heading) {
+      capturing = heading[1] === slice && !/\(shipped\b/i.test(line);
+      continue;
+    }
+    if (line.startsWith("#")) {
+      capturing = false;
+      continue;
+    }
+    if (!capturing || !line.startsWith("|")) continue;
+    const match = /#(\d+)/.exec(line);
+    if (match) issues.add(Number(match[1]));
+  }
+  return [...issues].sort((a, b) => a - b);
+}
+
+/** Resolves any {@link LoopSelector} into an explicit, ordered issue-number
+ *  work list — the shared compilation step `defaultRunLoopEngine` uses for
+ *  every selector type so milestone/label/roadmap-slice selectors reach the
+ *  supervisor the same way an explicit issue list already did (#512). */
+export async function resolveSelectorIssues(
+  cfg: PipelineConfig,
+  selector: LoopSelector,
+  deps: SelectorResolveDeps,
+): Promise<string[]> {
+  if (selector.type === "work-list") return selector.value;
+
+  if (selector.type === "milestone" || selector.type === "label") {
+    const issues = await deps.listOpenIssues(cfg);
+    const matches = issues
+      .filter((i) => (selector.type === "milestone" ? i.milestone === selector.value : i.labels.includes(selector.value)))
+      .map((i) => i.number)
+      .sort((a, b) => a - b);
+    if (matches.length === 0) {
+      throw new Error(`no open issues found for ${selector.type} "${selector.value}"`);
+    }
+    return matches.map(String);
+  }
+
+  const roadmapText = await deps.readRoadmap(cfg);
+  const matches = extractRoadmapSliceIssues(roadmapText, selector.value);
+  if (matches.length === 0) {
+    throw new Error(`roadmap slice "${selector.value}" was not found in ROADMAP.md, or references no issues`);
+  }
+  return matches.map(String);
+}
+
+export interface RunLoopEngineInput {
+  engine: LoopEngine;
+  selector?: LoopSelector;
+  resumeRunId?: string;
+  audit: boolean;
+  repoDir: string;
+}
+
+export type LoopEngineResult =
+  | { kind: "audit"; report: Awaited<ReturnType<typeof auditSupervisor>> }
+  | { kind: "drive"; result: Awaited<ReturnType<typeof driveSupervisor>> }
+  | { kind: "error"; message: string };
+
+/** Drives (or audits) the in-repo supervisor for an already-passed preflight —
+ *  the replacement for the former external-skill delegation payload (#512).
+ *  `--audit` performs zero durable writes (it never resolves gh config); a
+ *  fresh start or `--resume` resolves `PipelineConfig` and drives the
+ *  supervisor through the real store/observe/dispatch seams. */
+async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngineResult> {
+  const store = defaultLoopStoreDeps();
+
+  if (input.audit) {
+    if (!input.resumeRunId) {
+      return {
+        kind: "error",
+        message:
+          "pipeline loop --audit requires --resume <run-id> naming the run to audit " +
+          "(canonical run resolution without an explicit id is not yet supported)",
+      };
+    }
+    try {
+      const report = await auditSupervisor(store, input.resumeRunId);
+      return { kind: "audit", report };
+    } catch (err) {
+      return { kind: "error", message: (err as Error).message };
+    }
+  }
+
+  let cfg: PipelineConfig;
+  try {
+    cfg = resolveConfig({ repoPath: input.repoDir, profile: input.engine });
+  } catch (err) {
+    return { kind: "error", message: `config error: ${(err as Error).message}` };
+  }
+
+  let runId: string;
+  if (input.resumeRunId) {
+    runId = input.resumeRunId;
+  } else if (input.selector) {
+    let issues: string[];
+    try {
+      issues = await resolveSelectorIssues(cfg, input.selector, realSelectorResolveDeps());
+    } catch (err) {
+      return { kind: "error", message: `selector resolution failed: ${(err as Error).message}` };
+    }
+    runId = workListRunId(cfg.repo, input.engine, issues);
+    if (!(await loopRunExists(store, runId))) {
+      const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, runId);
+      await initRecoverableRun(store, contract, ledger);
+    }
+  } else {
+    return { kind: "error", message: "no selector or --resume run id was provided" };
+  }
+
+  const supervisorDeps: SupervisorDeps = {
+    store,
+    observe: defaultReconcileObserveDeps(cfg),
+    dispatchItem: realDispatchItem(cfg, input.engine),
+  };
+
+  try {
+    const result = await driveSupervisor(supervisorDeps, {
+      runId,
+      engine: input.engine as LoopEngineName,
+      resume: !!input.resumeRunId,
+    });
+    return { kind: "drive", result };
+  } catch (err) {
+    return { kind: "error", message: (err as Error).message };
+  }
+}
+
+/** IO seam for {@link runLoopCommand}: the same DoctorDeps-shaped preflight
+ *  used by `pipeline doctor` and the installer (design.md decision 4: one
+ *  implementation, no divergent copies), plus the supervisor drive/audit
+ *  entry point — injected so unit tests exercise the whole command with no
+ *  real gh/filesystem/subprocess access. */
+export interface LoopCliDeps {
+  runLoopPreflight: typeof runLoopPreflight;
+  runLoopEngine: (input: RunLoopEngineInput) => Promise<LoopEngineResult>;
+}
+
+const defaultLoopCliDeps: LoopCliDeps = { runLoopPreflight, runLoopEngine: defaultRunLoopEngine };
+
+/** `pipeline loop ...` (#512): normalize arguments, run the deterministic
+ *  loop:store-schema-compatibility + native-/goal preflight checks, and — on
+ *  success — drive (or resume) the in-repo durable loop supervisor, or render
+ *  its read-only audit report. Replaces the former external-skill delegation
+ *  payload: the loop path never discovers, requires, or invokes an installed
+ *  goal-loop skill. Every preflight failure path exits non-zero with
+ *  remediation and performs zero external mutation. */
 export async function runLoopCommand(
   opts: CliOpts,
   positionalIssues: string[],
@@ -479,7 +798,7 @@ export async function runLoopCommand(
 
   // Read only the loop.native_goal_attestation key, gh-free (design.md
   // decision 4) — resolveLoopNativeGoalAttestation never shells out, unlike
-  // resolveConfig(), so this command stays zero-gh-call on every path.
+  // resolveConfig(), so the preflight stays zero-gh-call on every path.
   const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
   const repoDir = findGitRoot(startDir) ?? startDir;
   let attestation: NativeGoalAttestation;
@@ -499,16 +818,39 @@ export async function runLoopCommand(
     return;
   }
 
+  const engineResult = await deps.runLoopEngine({
+    engine,
+    selector: outcome.args.selector,
+    resumeRunId: outcome.args.resumeRunId,
+    audit: outcome.args.audit,
+    repoDir,
+  });
+
+  if (engineResult.kind === "error") {
+    console.error(`pipeline loop: ${engineResult.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (engineResult.kind === "audit") {
+    console.log(JSON.stringify({ schema_version: "1", engine, ...engineResult.report }));
+    process.exitCode = 0;
+    return;
+  }
+
   console.log(
     JSON.stringify({
       schema_version: "1",
       engine,
-      selector: outcome.args.selector ?? null,
-      resume_run_id: outcome.args.resumeRunId ?? null,
-      audit: outcome.args.audit,
+      run_id: engineResult.result.runId,
+      cycles: engineResult.result.cycles,
+      stop: engineResult.result.stop,
+      hold_outstanding: engineResult.result.holdOutstanding,
+      all_done: engineResult.result.allDone,
+      resumed: engineResult.result.resumed,
     }),
   );
-  process.exitCode = 0;
+  process.exitCode = engineResult.result.stop || engineResult.result.holdOutstanding ? 1 : 0;
 }
 
 async function main(): Promise<void> {

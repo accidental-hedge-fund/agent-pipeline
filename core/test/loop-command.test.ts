@@ -10,7 +10,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { runLoopCommand, buildCmd, type CliOpts, type LoopCliDeps } from "../scripts/pipeline.ts";
-import type { LoopPreflightOutcome } from "../scripts/loop-preflight.ts";
+import { runLoopPreflight as realRunLoopPreflight, type LoopPreflightOutcome } from "../scripts/loop-preflight.ts";
+import type { DoctorDeps } from "../scripts/stages/doctor.ts";
 import { COMMAND_REGISTRY } from "../scripts/command-registry.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "loop-command-test-"));
@@ -43,6 +44,21 @@ async function withCapturedConsole(fn: () => Promise<void>): Promise<{ out: stri
   return { out, err };
 }
 
+const NEVER_CALLED_ENGINE = async (): Promise<never> => {
+  throw new Error("runLoopEngine must not be called when the preflight fails or short-circuits");
+};
+
+function fakeAuditReport(runId: string) {
+  return {
+    run_id: runId,
+    process: null,
+    action_evidence: [],
+    consecutive_no_progress: 0,
+    stop: null,
+    status: { run_id: runId } as unknown,
+  };
+}
+
 test("runLoopCommand — preflight failure exits non-zero with remediation, prints no JSON", async () => {
   let calls = 0;
   const deps: LoopCliDeps = {
@@ -50,11 +66,12 @@ test("runLoopCommand — preflight failure exits non-zero with remediation, prin
       calls++;
       return {
         ok: false,
-        failedCheck: "loop:contract-coherence",
+        failedCheck: "loop:store-schema-compatibility",
         detail: "no installed goal-loop skill could be discovered",
         remediation: "Install goal-loop.",
       } satisfies LoopPreflightOutcome;
     },
+    runLoopEngine: NEVER_CALLED_ENGINE,
   };
   process.exitCode = undefined;
   const { out, err } = await withCapturedConsole(() => runLoopCommand({ milestone: "v2" } as CliOpts, [], deps));
@@ -62,17 +79,25 @@ test("runLoopCommand — preflight failure exits non-zero with remediation, prin
   assert.equal(process.exitCode, 1);
   process.exitCode = 0;
   assert.equal(out.length, 0, "no JSON handoff is printed on a failing preflight");
-  assert.match(err.join("\n"), /loop:contract-coherence/);
+  assert.match(err.join("\n"), /loop:store-schema-compatibility/);
   assert.match(err.join("\n"), /Install goal-loop/);
 });
 
-test("runLoopCommand — success prints a JSON handoff envelope and exits 0", async () => {
+test("runLoopCommand — success drives the supervisor and prints its result as JSON, exiting 0", async () => {
   const deps: LoopCliDeps = {
     runLoopPreflight: async () =>
       ({
         ok: true,
-        args: { selector: { type: "milestone", value: "v2" }, resumeRunId: undefined, audit: false },
+        args: { selector: { type: "work-list", value: ["100"] }, resumeRunId: undefined, audit: false },
       }) satisfies LoopPreflightOutcome,
+    runLoopEngine: async (input) => {
+      assert.equal(input.engine, "claude");
+      assert.deepEqual(input.selector, { type: "work-list", value: ["100"] });
+      return {
+        kind: "drive",
+        result: { runId: "loop-abc123", cycles: 2, stop: null, holdOutstanding: false, allDone: true, resumed: false },
+      };
+    },
   };
   process.exitCode = undefined;
   const { out } = await withCapturedConsole(() =>
@@ -81,9 +106,28 @@ test("runLoopCommand — success prints a JSON handoff envelope and exits 0", as
   assert.equal(process.exitCode, 0);
   const parsed = JSON.parse(out[0]);
   assert.equal(parsed.engine, "claude");
-  assert.deepEqual(parsed.selector, { type: "milestone", value: "v2" });
-  assert.equal(parsed.resume_run_id, null);
-  assert.equal(parsed.audit, false);
+  assert.equal(parsed.run_id, "loop-abc123");
+  assert.equal(parsed.all_done, true);
+  assert.equal(parsed.stop, null);
+});
+
+test("runLoopCommand — a run-engine error (e.g. an unsupported selector type) exits non-zero", async () => {
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async () =>
+      ({
+        ok: true,
+        args: { selector: { type: "milestone", value: "v2" }, resumeRunId: undefined, audit: false },
+      }) satisfies LoopPreflightOutcome,
+    runLoopEngine: async () => ({ kind: "error", message: "unsupported selector" }),
+  };
+  process.exitCode = undefined;
+  const { out, err } = await withCapturedConsole(() =>
+    runLoopCommand({ milestone: "v2", profile: "claude" } as CliOpts, [], deps),
+  );
+  assert.equal(process.exitCode, 1);
+  process.exitCode = 0;
+  assert.equal(out.length, 0);
+  assert.match(err.join("\n"), /unsupported selector/);
 });
 
 test("runLoopCommand — an invalid loop.native_goal_attestation value fails closed before the preflight runs (#506)", async () => {
@@ -93,6 +137,7 @@ test("runLoopCommand — an invalid loop.native_goal_attestation value fails clo
       calls++;
       return { ok: true, args: { selector: undefined, resumeRunId: undefined, audit: true } } satisfies LoopPreflightOutcome;
     },
+    runLoopEngine: NEVER_CALLED_ENGINE,
   };
   const repoPath = makeFakeRepo("loop:\n  native_goal_attestation: sometimes\n");
   process.exitCode = undefined;
@@ -110,8 +155,9 @@ test("runLoopCommand — threads the resolved attestation from pipeline.yml into
   const deps: LoopCliDeps = {
     runLoopPreflight: async (_raw, _engine, _doctorDeps, _roots, attestation) => {
       receivedAttestation = attestation;
-      return { ok: true, args: { selector: undefined, resumeRunId: undefined, audit: true } } satisfies LoopPreflightOutcome;
+      return { ok: true, args: { selector: undefined, resumeRunId: "run-1", audit: true } } satisfies LoopPreflightOutcome;
     },
+    runLoopEngine: async () => ({ kind: "audit", report: fakeAuditReport("run-1") }),
   };
   const repoPath = makeFakeRepo("loop:\n  native_goal_attestation: available\n");
   process.exitCode = undefined;
@@ -125,14 +171,55 @@ test("runLoopCommand — engine defaults to codex when --profile is absent (matc
   const deps: LoopCliDeps = {
     runLoopPreflight: async () =>
       ({ ok: true, args: { selector: undefined, resumeRunId: "run-1", audit: true } }) satisfies LoopPreflightOutcome,
+    runLoopEngine: async (input) => {
+      assert.equal(input.resumeRunId, "run-1");
+      assert.equal(input.audit, true);
+      return { kind: "audit", report: fakeAuditReport("run-1") };
+    },
   };
   const { out } = await withCapturedConsole(() =>
     runLoopCommand({ resume: "run-1", audit: true } as CliOpts, [], deps),
   );
   const parsed = JSON.parse(out[0]);
   assert.equal(parsed.engine, "codex");
-  assert.equal(parsed.resume_run_id, "run-1");
-  assert.equal(parsed.audit, true);
+  assert.equal(parsed.run_id, "run-1");
+});
+
+// ---------------------------------------------------------------------------
+// 6.8 — a host with no goal-loop skill installed at any root still starts and
+// runs, end to end through runLoopCommand (real runLoopPreflight, fake
+// DoctorDeps, fake supervisor drive) — no external-skill subprocess recorded
+// on any path.
+// ---------------------------------------------------------------------------
+
+test("runLoopCommand — a host with no goal-loop skill installed at any root starts, executes, and reports a run id (#512)", async () => {
+  const fakeDoctorDeps: DoctorDeps = {
+    exec: async () => ({ ok: true, stdout: "/goal autonomous mode", stderr: "" }),
+    execCheck: async () => true,
+    fsExists: async () => false, // no goal-loop install discoverable at any root
+    fileMtime: async () => 1000,
+    readTextFile: async () => null,
+  };
+  let engineCalled = false;
+  const deps: LoopCliDeps = {
+    runLoopPreflight: (raw, engine, _realDeps, roots, attestation) =>
+      realRunLoopPreflight(raw, engine, fakeDoctorDeps, roots, attestation),
+    runLoopEngine: async (input) => {
+      engineCalled = true;
+      assert.deepEqual(input.selector, { type: "work-list", value: ["100"] });
+      return {
+        kind: "drive",
+        result: { runId: "loop-noskill", cycles: 1, stop: null, holdOutstanding: false, allDone: true, resumed: false },
+      };
+    },
+  };
+  process.exitCode = undefined;
+  const { out, err } = await withCapturedConsole(() => runLoopCommand({ profile: "claude" } as CliOpts, ["100"], deps));
+  assert.equal(process.exitCode, 0);
+  assert.equal(err.length, 0, "no install-remediation failure on a host with no goal-loop skill installed");
+  assert.ok(engineCalled);
+  const parsed = JSON.parse(out[0]);
+  assert.equal(parsed.run_id, "loop-noskill");
 });
 
 // ---------------------------------------------------------------------------

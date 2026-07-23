@@ -260,7 +260,7 @@ or `$pipeline:<command>` (Codex) entry. The advance loop has no sub-command.
 /pipeline:merge <pr>                          human-invoked squash-merge of a ready-to-deploy PR (no advance loop)
 /pipeline:release <version>                   prepare a release PR for the given version
 /pipeline:logs [<run-id>] [-f]               list or stream pipeline run logs
-/pipeline:loop --milestone v2  $pipeline:loop --milestone v2   canonical durable multi-item run (delegates to goal-loop)
+/pipeline:loop --milestone v2  $pipeline:loop --milestone v2   canonical durable multi-item run (driven in-repo by Pipeline's own supervisor)
 /pipeline:loop --resume <run-id>              resume an existing durable run by id, on either engine
 /pipeline:loop --audit                        read-only report for the run; no writes
 /pipeline improve                             read run artifacts; print dry-run cluster report (read-only)
@@ -675,11 +675,13 @@ After every run, `queue` writes `.agent-pipeline/runs/batch-<batch_id>/batch-sum
 `pipeline queue` (above) is Pipeline's own bounded, single-session batch mode. For a
 **durable** run that spans sessions or engines — selection, dependency-aware ordering,
 recovery, reconciliation, and resume across many issues — use `/pipeline:loop` (Claude
-Code) or `$pipeline:loop` (Codex) instead. It is a thin facade: it runs a deterministic,
-read-only preflight in the Pipeline CLI, then delegates the actual durable run to the
-separately installed [goal-loop](https://github.com/comamitc/goal-loop) skill. Every
-selected item still executes through the normal Pipeline state machine and evidence
-gates — the facade never sets a stage label itself and never merges.
+Code) or `$pipeline:loop` (Codex) instead. It runs a deterministic, read-only preflight
+in the Pipeline CLI, then drives the run — contract, ledger, lock, recovery,
+reconciliation, resume — entirely in-repo through Pipeline's own durable loop
+supervisor. It never discovers, requires, or invokes an externally installed goal-loop
+skill. Every selected item still executes through the normal Pipeline state machine and
+evidence gates via the `pipeline/loop-execution@1` hand-off contract — the supervisor
+never sets a stage label itself and never merges.
 
 ```
 /pipeline:loop --milestone v2        select every issue in milestone v2
@@ -693,12 +695,21 @@ gates — the facade never sets a stage label itself and never merges.
 
 The preflight order is fixed and every failure path is read-only, so it never leaves a
 lock, ledger write, or GitHub mutation behind: argument normalization, then
-`loop:contract-coherence` (verifies the installed goal-loop's contract/ledger schema
-ids are within Pipeline's supported set — also reported by `pipeline doctor` and
-checked by the installer), then a check that the active engine's built-in autonomous
-`/goal` mode is available. `pipeline:loop` refuses to start rather than falling back to
-a non-durable substitute loop when either check fails. `/goal-loop` and `$goal-loop`
-remain fully functional, undeprecated aliases for the same durable runs.
+`loop:store-schema-compatibility` (a self-check that this build's own in-repo durable
+loop store contract/ledger schema ids are well-formed — it discovers no external
+install, so a host with no goal-loop skill installed anywhere still passes), then a
+check that the active engine's built-in autonomous `/goal` mode is available.
+`pipeline:loop` refuses to start rather than falling back to a non-durable substitute
+loop when either check fails.
+
+`--resume <run-id>` attaches a fresh supervisor to an existing run only when the prior
+holder is provably gone — a released lock, or a same-host dead-pid lock recovered
+through the store's provably-dead path; a run whose supervisor is still alive (or whose
+holder is on a different, unverifiable host) is refused with zero writes rather than
+double-driven. `--audit` renders the run's process identity, its append-only
+action-evidence timeline, and its watchdog/no-progress state with zero durable writes —
+no ledger write, no lock, no GitHub mutation. A pre-existing run created by a legacy
+goal-loop invocation remains addressable by `--resume <run-id>` (read-only import).
 
 **Native-`/goal` detection (#506).** `/goal` is an interactive slash command, not a CLI
 flag — it never appears in `<engine> --help`, so absence of a marker there is not
@@ -1015,7 +1026,7 @@ The checks (each emits one sentence of remediation text on failure or warning):
 | `package-install` | `node_modules` exists and is not older than `package-lock.json` | the repo root has no `package-lock.json` |
 | `openspec-cli` | the `openspec` CLI is on `PATH` | OpenSpec is not active (`openspec.enabled: off`, or `auto` with no `openspec/` dir) |
 | `eval-command` | the configured eval command's binary resolves on `PATH` | the eval gate is off or has no `command` |
-| `loop:contract-coherence` | an installed [goal-loop](https://github.com/comamitc/goal-loop) skill is discovered whose contract/ledger schema ids are within Pipeline's supported set | — (fails, naming both sides, when goal-loop is absent or its schema ids are outside the supported set — see [`pipeline:loop`](#durable-multi-item-runs-pipelineloop)) |
+| `loop:contract-coherence` | an installed [goal-loop](https://github.com/comamitc/goal-loop) skill is discovered whose contract/ledger schema ids are within Pipeline's supported set (reported by `pipeline doctor` and the installer only — `pipeline:loop` itself no longer requires this; see [`pipeline:loop`](#durable-multi-item-runs-pipelineloop)) | — (fails, naming both sides, when goal-loop is absent or its schema ids are outside the supported set) |
 
 **Stale-install warning (#385).** `install:version-freshness` compares the installed engine against the latest `accidental-hedge-fund/agent-pipeline` GitHub release tag. A behind install reports `warn` — loud but **non-blocking**: it never fails the preflight, never sets a non-zero exit code, and never aborts a `--doctor` / `doctor.runOnStart` run. The remediation names the [update command](#updating-an-npxclone-install). The check only reports; it never updates anything itself.
 
