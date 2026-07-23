@@ -42,12 +42,13 @@ a read-only mode that performs no mutation.
 
 ### Requirement: Equivalent invocations on either engine SHALL address one canonical durable run
 
-`pipeline:loop` SHALL derive run identity solely from the goal-loop contract
-compilation, so that equivalent inputs on the Claude and Codex hosts start or resume
+`pipeline:loop` SHALL derive run identity solely from the in-repo durable loop engine's
+contract compilation, so that equivalent inputs on the Claude and Codex hosts start or resume
 the same run: one run id, one contract, one ledger, one lock. `--resume <run-id>` SHALL
-address a run by id regardless of which engine created it. A run already held by
-another process SHALL NOT be started concurrently; the facade SHALL surface the
-existing lock holder rather than creating a parallel run.
+address a run by id regardless of which engine created it, including a run created before
+this change by the external goal-loop skill. A run already held by another process SHALL NOT
+be started concurrently; the facade SHALL surface the existing lock holder rather than
+creating a parallel run.
 
 #### Scenario: Cross-engine resume reuses the same run id
 
@@ -68,33 +69,6 @@ existing lock holder rather than creating a parallel run.
 - **WHEN** `pipeline:loop` targets a run whose lock is already held
 - **THEN** it SHALL report the existing lock holder and exit without creating a second
   run or a second lock
-
----
-
-### Requirement: The facade SHALL delegate all durable state to the installed goal-loop store
-
-`pipeline:loop` SHALL NOT create or maintain any durable state of its own. All run
-identity, contract compilation, locking, item transitions, decision records, events,
-reconciliation, status, and audit output SHALL be produced by the installed goal-loop
-state interface. The change SHALL NOT introduce a second ledger, a second run-id
-namespace, a second lock, or a second run directory, and SHALL NOT copy or reimplement
-the goal-loop state engine inside Agent Pipeline.
-
-#### Scenario: No durable writes originate in the facade
-
-- **WHEN** a loop run is exercised end to end against injected fakes
-- **THEN** every durable write SHALL have been issued through the goal-loop state
-  interface
-- **AND** the facade SHALL have created no ledger, lock, run-id, or run-directory
-  artifact of its own
-
-#### Scenario: Pre-existing runs resume without migration
-
-- **WHEN** `pipeline:loop --resume <run-id>` targets a run created before this change
-  by a direct goal-loop invocation
-- **THEN** the run SHALL resume from its existing contract and ledger
-- **AND** no migration step, schema rewrite, or destructive modification of the
-  existing run SHALL occur
 
 ---
 
@@ -138,8 +112,8 @@ Every item selected by a loop run SHALL be executed through the normal Agent Pip
 state machine, review layer, and evidence gates. The facade SHALL NOT set, skip, or
 reorder pipeline stage labels itself, SHALL NOT weaken or bypass review, eval, or
 pre-merge gates, and SHALL treat an item as done only at `pipeline:ready-to-deploy`.
-The facade SHALL NOT merge, and SHALL NOT weaken goal-loop's authority, merge, release,
-dependency, or reconciliation gates.
+The facade SHALL NOT merge, and SHALL NOT weaken the durable loop engine's authority,
+merge, release, dependency, or reconciliation gates.
 
 #### Scenario: The facade does not move stage labels
 
@@ -157,8 +131,8 @@ dependency, or reconciliation gates.
 #### Scenario: A blocked item does not advance the run past its gates
 
 - **WHEN** an item's execution reports `blocked_needs_human`
-- **THEN** the run SHALL record the block and honor goal-loop's existing stop and
-  reconciliation semantics
+- **THEN** the run SHALL record the block and honor the durable loop engine's existing stop
+  and reconciliation semantics
 - **AND** the item SHALL NOT be recorded as done
 
 ---
@@ -224,71 +198,50 @@ SHALL NOT read undocumented engine-internal files.
 ### Requirement: The preflight SHALL run before any external mutation
 
 `pipeline:loop` SHALL execute its checks in a fixed order: argument normalization
-(pure), then the `loop:contract-coherence` compatibility check, then the native-goal
+(pure), then the durable loop store's schema-compatibility check, then the native-goal
 capability check, and only then contract compilation, lock acquisition, and run
 start/resume. Every check before contract compilation SHALL be read-only. A failure in
 any of them SHALL exit non-zero with actionable remediation and SHALL leave no external
-side effect.
+side effect. The preflight SHALL NOT check for, discover, or require an externally
+installed goal-loop skill, and its absence SHALL NOT fail any check.
 
-#### Scenario: Incompatible contract version aborts with zero writes
+#### Scenario: An unsupported store schema aborts with zero writes
 
-- **WHEN** the installed goal-loop's contract schema id is outside Pipeline's supported
-  set and `pipeline:loop` is invoked
-- **THEN** the command SHALL exit non-zero naming both the installed and the supported
+- **WHEN** a targeted run records a contract or ledger schema id outside the durable loop
+  store's supported set and `pipeline:loop` is invoked
+- **THEN** the command SHALL exit non-zero naming both the recorded and the supported
   schema ids
 - **AND** the injected write seams SHALL record zero calls — no lock, no ledger write,
   no GitHub mutation, no worktree or branch creation
 
-#### Scenario: goal-loop absent aborts with an install remediation
+#### Scenario: A missing goal-loop install is not a failure
 
-- **WHEN** no installed goal-loop skill can be discovered
-- **THEN** `pipeline:loop` SHALL exit non-zero with remediation instructing the user to
-  install goal-loop
-- **AND** it SHALL perform no external mutation
+- **WHEN** `pipeline:loop` is invoked on a host where no goal-loop skill is installed at any
+  root
+- **THEN** the preflight SHALL pass its store-compatibility check
+- **AND** it SHALL proceed to the native-goal capability check and contract compilation
 
 ---
 
 ### Requirement: Legacy `goal-loop` invocations SHALL remain functional, with deprecation gated on proven evidence
 
-The `/goal-loop` (Claude) and `$goal-loop` (Codex) invocations SHALL remain fully
-functional aliases for the same durable behavior, targeting the same runs and the same
-store. This change SHALL NOT emit a deprecation notice. A deprecation notice, and the
-documented deprecation window it announces, SHALL be enabled only after a bounded live
-run through `pipeline:loop` has been recorded as evidence that the facade works.
+The `/goal-loop` (Claude) and `$goal-loop` (Codex) invocations SHALL, where they remain
+installed on a host, continue to address the same runs a `pipeline:loop` invocation would,
+via the import path defined for pre-existing runs. Agent Pipeline SHALL NOT require, ship, or
+depend on those invocations, and SHALL NOT execute them. A run that Pipeline has imported
+SHALL be marked so a legacy invocation cannot drive a divergent second copy of it.
 
-#### Scenario: Legacy alias still starts and resumes the same run
+#### Scenario: A pre-existing legacy run is addressable by run id
 
-- **WHEN** `/goal-loop` or `$goal-loop` is invoked with a selector or `--resume`
-  equivalent to a `pipeline:loop` invocation
-- **THEN** it SHALL address the same run id, contract, and ledger
-- **AND** its behavior SHALL be unchanged from before this change
+- **WHEN** `/pipeline:loop --resume <run-id>` names a run created by a legacy `/goal-loop`
+  invocation
+- **THEN** it SHALL address that run's contract, ledger, and history
+- **AND** it SHALL not create a second run for that id
 
-#### Scenario: No deprecation notice before the facade is proven
+#### Scenario: Pipeline never executes the legacy skill
 
-- **WHEN** `/goal-loop` or `$goal-loop` is invoked as part of this change
-- **THEN** no deprecation or compatibility-warning text SHALL be emitted
-
----
-
-### Requirement: Repository consolidation SHALL remain out of scope pending a recorded live run
-
-This change SHALL NOT merge, archive, or delete the goal-loop repository, SHALL NOT
-absorb its state engine into Agent Pipeline, and SHALL NOT alter the goal-loop release
-or version boundary. Any consolidation SHALL be a separately approved change, taken
-only after a bounded live run through `pipeline:loop` is recorded and the re-decision
-criteria in this change's design record are evaluated.
-
-#### Scenario: No consolidation artifacts in this change
-
-- **WHEN** this change's diff is inspected
-- **THEN** it SHALL contain no goal-loop repository archive/deletion, no copied state
-  engine, and no change to goal-loop's release or versioning boundary
-
-#### Scenario: Consolidation is evidence-gated
-
-- **WHEN** a repository-consolidation decision is proposed
-- **THEN** it SHALL cite a recorded bounded live run through `pipeline:loop`
-- **AND** it SHALL be evaluated against the documented re-decision criteria
+- **WHEN** any `pipeline:loop` path is exercised through the injected seams
+- **THEN** no subprocess invocation of a goal-loop skill or its state CLI SHALL be recorded
 
 ### Requirement: The native-goal probe SHALL honor an explicit operator attestation
 
@@ -358,4 +311,28 @@ having no floor rather than being given a guessed value.
   subprocess, network, or git access
 - **AND** they SHALL cover a capable host whose `--help` omits the marker, a below-floor host,
   an engine with no known floor, an unparseable version, and both attestation directions
+
+### Requirement: The facade SHALL delegate all durable state to the in-repo durable loop engine
+
+`pipeline:loop` SHALL NOT create or maintain any durable state of its own. All run identity,
+contract compilation, locking, item transitions, decision records, events, reconciliation,
+status, and audit output SHALL be produced by the in-repo durable loop engine. The facade
+SHALL NOT introduce a second ledger, a second run-id namespace, a second lock, or a second
+run directory, and SHALL NOT reimplement any part of the engine inside the command layer.
+
+#### Scenario: No durable writes originate in the facade
+
+- **WHEN** a loop run is exercised end to end against injected fakes
+- **THEN** every durable write SHALL have been issued through the durable loop engine's
+  interface
+- **AND** the facade SHALL have created no ledger, lock, run-id, or run-directory artifact of
+  its own
+
+#### Scenario: Exactly one durable store is authoritative
+
+- **WHEN** a run is started, resumed, and audited
+- **THEN** all three SHALL read and write the same single run directory under the Pipeline
+  state home
+- **AND** no second durable store SHALL be consulted except the documented read-only legacy
+  import path
 
