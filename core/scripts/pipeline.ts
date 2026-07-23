@@ -134,6 +134,7 @@ import { auditSupervisor, driveSupervisor, type SupervisorDeps } from "./loop/su
 import { defaultLoopStoreDeps, runExists as loopRunExists } from "./loop/store.ts";
 import { initRecoverableRun } from "./loop/recovery.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
+import { compileContractItems } from "./loop/dependencies.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type LoopLedger } from "./loop/types.ts";
 import { LOOP_EXECUTION_CONTRACT_SCHEMA, normalizeLoopOutcome, type LoopExecutionRequest, type LoopExecutionResponse } from "./loop-execution-contract.ts";
 import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
@@ -491,7 +492,7 @@ export function compileWorkListRun(
     ordering: "dependency_sequential",
     max_active_items: 1,
     concurrency_model: "exclusive_lock_single_engine",
-    items: issues.map((id) => ({ id, depends_on: [] })),
+    items: compileContractItems(issues.map((id) => ({ id, depends_on: [] }))),
     canonical_hash: runId,
   };
   const ledger: LoopLedger = {

@@ -16,6 +16,7 @@ import {
   isDurableBlockerClass,
   isRecoveryRecipe,
   type DurableBlockerClass,
+  type ExternalDependencyStatus,
   type RecoveryPolicy,
   type RecoveryPolicyEntry,
   type RecoveryRecipe,
@@ -580,13 +581,18 @@ export function isRunFatalBlocked(contractInput: LoopContract, ledgerInput: Loop
 const DONE_STATES = new Set(["ready", "merged", "released", "deployed"]);
 
 /** Pending items with no dependency on a blocked item, whose declared
- *  dependencies are all done — eligible to start while another item is
- *  blocked, subject to the existing single-active-item invariant (never
- *  returns items when one is already `in_progress`) and to the class-level
- *  `run_fatal` gate (returns none when any block is run-fatal). Preserves the
- *  merge-barrier invariant by never bypassing it — it is enforced elsewhere,
- *  unaffected by this selection. */
-export function eligibleIndependentItems(contractInput: LoopContract, ledgerInput: LoopLedger): string[] {
+ *  dependencies are all done, and whose external dependencies (capability
+ *  `durable-run-dependency-integrity`) are all `satisfied` — eligible to start while another item
+ *  is blocked, subject to the existing single-active-item invariant (never returns items when one
+ *  is already `in_progress`) and to the class-level `run_fatal` gate (returns none when any block
+ *  is run-fatal). `externalStatuses` defaults to `{}` (no external dependencies) so existing
+ *  callers with no external gating are unaffected. Preserves the merge-barrier invariant by never
+ *  bypassing it — it is enforced elsewhere, unaffected by this selection. */
+export function eligibleIndependentItems(
+  contractInput: LoopContract,
+  ledgerInput: LoopLedger,
+  externalStatuses: Readonly<Record<string, ExternalDependencyStatus>> = {},
+): string[] {
   const contract = upgradeContractForRecovery(contractInput);
   const ledger = upgradeLedgerForRecovery(ledgerInput);
   if (ledger.stop) return [];
@@ -595,6 +601,7 @@ export function eligibleIndependentItems(contractInput: LoopContract, ledgerInpu
 
   const blockedIds = new Set(Object.values(ledger.items).filter((item) => item.state === "blocked").map((item) => item.id));
   const dependsOn = new Map(contract.items.map((i) => [i.id, i.depends_on]));
+  const externalDependsOn = new Map(contract.items.map((i) => [i.id, i.external_depends_on ?? []]));
 
   return contract.items
     .filter((i) => {
@@ -602,10 +609,13 @@ export function eligibleIndependentItems(contractInput: LoopContract, ledgerInpu
       if (!entry || entry.state !== "pending") return false;
       const deps = dependsOn.get(i.id) ?? [];
       if (deps.some((d) => blockedIds.has(d))) return false;
-      return deps.every((d) => {
+      const inSnapshotDone = deps.every((d) => {
         const depEntry = ledger.items[d];
         return depEntry !== undefined && DONE_STATES.has(depEntry.state);
       });
+      if (!inSnapshotDone) return false;
+      const externalDeps = externalDependsOn.get(i.id) ?? [];
+      return externalDeps.every((id) => externalStatuses[id] === "satisfied");
     })
     .map((i) => i.id);
 }

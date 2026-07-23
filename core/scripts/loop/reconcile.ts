@@ -20,6 +20,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { LABEL_PREFIX, type PipelineConfig } from "../types.ts";
 import {
+  getIssueCloseState,
   getIssueStateAndLabels,
   getPrChecks,
   getPrDetail,
@@ -88,6 +89,13 @@ export interface ReconcileObserveDeps {
    *  to clear a barrier. Returns null when the base branch head cannot be
    *  determined (e.g. remote unreachable) — treated as "not yet proven". */
   baseBranchContainsSha(sha: string): Promise<boolean | null>;
+  /** An external dependency issue's live open/closed state and close reason — capability
+   *  `durable-run-dependency-integrity` (see loop/dependencies.ts). Returns null when the issue
+   *  cannot be observed, which classifies as `pending` (never `satisfied`) — an unobservable
+   *  dependency is never treated as proven. */
+  getExternalDependencyIssueState(
+    issueNumber: number,
+  ): Promise<{ state: "open" | "closed"; stateReason: "completed" | "not_planned" | "reopened" | null } | null>;
   now(): Date;
 }
 
@@ -156,6 +164,9 @@ export function defaultReconcileObserveDeps(cfg: PipelineConfig): ReconcileObser
         if (code === 1) return false; // exit 1 => not-an-ancestor (well-formed answer)
         return null; // any other failure (bad ref, no remote, timeout) — not yet provable
       }
+    },
+    async getExternalDependencyIssueState(issueNumber) {
+      return getIssueCloseState(cfg, issueNumber);
     },
     now: () => new Date(),
   };
@@ -530,6 +541,15 @@ export async function transitionItem(
   const item = ledger.items[input.itemId];
   if (!item) {
     throw new LoopError("validation", `item "${input.itemId}" not found in run "${input.runId}"`);
+  }
+  if (input.to === "skipped") {
+    throw new LoopError(
+      "validation",
+      `item "${input.itemId}" cannot transition to "skipped" via transitionItem — skipped is entered only by dependency propagation (capability durable-run-dependency-integrity), never a caller-requested transition`,
+    );
+  }
+  if (item.state === "skipped") {
+    throw new LoopError("validation", `item "${input.itemId}" cannot transition from "skipped" — skipped is terminal`);
   }
 
   let observedIdentity: LoopExternalIdentity | undefined;

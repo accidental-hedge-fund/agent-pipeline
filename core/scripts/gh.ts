@@ -400,6 +400,42 @@ export async function getIssueStateAndLabels(
   }
 }
 
+/** An issue's open/closed state plus GitHub's own close reason — the evidence the
+ *  `durable-run-dependency-integrity` capability needs to classify an external dependency as
+ *  `satisfied` (closed as completed) vs. `unsatisfiable` (closed as not planned) vs. `pending`
+ *  (open). `stateReason` is null for an open issue. Confirmed real `gh issue view --json` field
+ *  names via `gh issue view --json foo` (unknown-field error listing) and a live closed-issue
+ *  read (CLAUDE.md golden rule #5) — values observed: "COMPLETED", "NOT_PLANNED". */
+export async function getIssueCloseState(
+  cfg: PipelineConfig,
+  issueNumber: number,
+): Promise<{ state: "open" | "closed"; stateReason: "completed" | "not_planned" | "reopened" | null } | null> {
+  try {
+    const stdout = await ghRun([
+      "issue",
+      "view",
+      String(issueNumber),
+      "--json",
+      "state,stateReason",
+      "-R",
+      cfg.repo,
+    ]);
+    const data = JSON.parse(stdout) as { state: string; stateReason: string | null };
+    const state = data.state.toUpperCase() === "CLOSED" ? "closed" : "open";
+    const stateReason =
+      data.stateReason === "COMPLETED"
+        ? "completed"
+        : data.stateReason === "NOT_PLANNED"
+          ? "not_planned"
+          : data.stateReason === "REOPENED"
+            ? "reopened"
+            : null;
+    return { state, stateReason };
+  } catch {
+    return null;
+  }
+}
+
 /** Detect issue vs PR via the REST API (PRs have a `pull_request` field). */
 export async function getItemKind(
   cfg: PipelineConfig,

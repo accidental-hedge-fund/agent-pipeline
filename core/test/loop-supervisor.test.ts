@@ -290,9 +290,11 @@ test("supervisor.json is written at attach and its heartbeat advances per cycle 
 // 6.3 — watchdog test.
 // ---------------------------------------------------------------------------
 
-test("a spin scenario (no eligible item, no drift, no recovery) stops with supervisor_no_progress instead of looping unbounded", async () => {
+test("a spin scenario gated on a dangling dependency reports a typed dependency_deadlock instead of spinning to supervisor_no_progress (#513)", async () => {
   // "100" depends on "200", which itself depends on a non-existent "999" —
-  // neither item is ever eligible, so every cycle is classified no-progress.
+  // neither item is ever eligible. Pre-#513 this silently spun to the generic
+  // supervisor_no_progress watchdog; the durable-run-dependency-integrity
+  // capability now reports the typed stop immediately, naming the chain.
   const contract = testContract({
     items: [
       { id: "100", depends_on: ["200"] },
@@ -307,8 +309,12 @@ test("a spin scenario (no eligible item, no drift, no recovery) stops with super
 
   const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
 
-  assert.equal(result.cycles, 3);
-  assert.equal(result.stop?.reason, "supervisor_no_progress");
+  assert.equal(result.cycles, 1, "the deadlock is structural, not a no-progress accident — it is reported on the first cycle");
+  assert.equal(result.stop?.reason, "dependency_deadlock");
+  assert.deepEqual(result.stop?.deadlock_chain, [
+    { item_id: "100", waiting_on: "200", kind: "in_run", observed_state: "pending" },
+    { item_id: "200", waiting_on: "999", kind: "in_run", observed_state: "missing" },
+  ]);
   assert.equal(calls.length, 0, "no item was ever eligible, so dispatchItem must never be called");
 });
 
@@ -593,7 +599,7 @@ test("driveSupervisor releases the lock once the run reaches a terminal conditio
   assert.equal(secondDrive.allDone, true);
 });
 
-test("driveSupervisor releases the lock on the watchdog no-progress stop", async () => {
+test("driveSupervisor releases the lock on a dependency_deadlock stop", async () => {
   const contract = testContract({
     items: [
       { id: "100", depends_on: ["200"] },
@@ -607,9 +613,9 @@ test("driveSupervisor releases the lock on the watchdog no-progress stop", async
   const { dispatchItem } = coordinatedFakes();
 
   const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
-  assert.equal(result.stop?.reason, "supervisor_no_progress");
+  assert.equal(result.stop?.reason, "dependency_deadlock");
 
-  assert.equal(await readLock(deps, "run-1"), null, "lock must be released after a watchdog stop");
+  assert.equal(await readLock(deps, "run-1"), null, "lock must be released after a dependency_deadlock stop");
 });
 
 test("driveSupervisor releases the lock even when a cycle throws", async () => {
