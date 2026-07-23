@@ -20,13 +20,16 @@ The `pipeline improve` subcommand SHALL read existing run artifacts under `.agen
 
 ### Requirement: improve command clusters recurring patterns by category
 
-The analyzer SHALL group run evidence into five named categories: `review-finding` (same normalized
+The analyzer SHALL group run evidence into six named categories: `review-finding` (same normalized
 finding title across runs), `blocker` (same normalized blocker reason across runs), `flaky-gate`
 (same stage name with repeated `outcome: "error"` events), `token-waste` (stages with anomalously
-high duration or token cost when data is available), and `papercut` (same normalized `message` across
-`papercut` events recorded by agents during runs). Each cluster SHALL record: category, normalized
-signal string, occurrence count, affected run IDs, and at least one evidence excerpt (truncated to
-≤ 200 characters).
+high duration or token cost when data is available), `papercut` (same normalized `message` across
+`papercut` events recorded by agents during runs), and `correction` (recurring `correction_event`
+records clustered by their deterministic `correction_key`). Each cluster SHALL record: category,
+normalized signal string, occurrence count, affected run IDs, and at least one evidence excerpt
+(truncated to ≤ 200 characters). The `correction` category SHALL key its clusters on the event
+contract's `correction_key` rather than on `normalizeSignal`, and its per-cluster fields are
+specified by the `correction-compiler` capability.
 
 #### Scenario: Repeated review finding titles cluster together
 
@@ -65,21 +68,19 @@ signal string, occurrence count, affected run IDs, and at least one evidence exc
 - **AND** the cluster SHALL record the normalized message as its signal, the occurrence count, every
   affected run ID, and an evidence excerpt drawn from the papercut message
 
-#### Scenario: Papercut clusters appear in the dry-run report and JSON output
+#### Scenario: Repeated corrections cluster by correction_key
 
-- **WHEN** `pipeline improve` is run over run directories containing `papercut` events
-- **THEN** the printed report SHALL include the `papercut` clusters alongside the other categories,
-  each showing its normalized signal and occurrence count
-- **AND** `pipeline improve --json` over the same data SHALL emit those clusters with
-  `category: "papercut"`
+- **WHEN** `correction_event` records across two or more runs share the same `correction_key`
+- **THEN** those records SHALL be grouped into a single `correction` cluster keyed on that
+  `correction_key`
+- **AND** the cluster's identity SHALL NOT depend on the free-text `correction` prose or any model
+  output
 
-#### Scenario: No papercut events yields no papercut clusters
+#### Scenario: No correction events yields no correction clusters
 
-- **WHEN** the analyzed runs contain no `papercut` events
-- **THEN** the report SHALL contain no `papercut` cluster
+- **WHEN** the analyzed runs contain no `correction_event` records
+- **THEN** the report SHALL contain no `correction` cluster
 - **AND** the command SHALL exit 0 with the other categories reported as before
-
----
 
 ### Requirement: improve command normalizes signals before clustering
 Before grouping, the analyzer SHALL normalize finding titles and blocker reason strings by: converting to lowercase, removing issue/PR/SHA/line-number tokens (patterns matching `#\d+`, `[0-9a-f]{7,40}`, `:\d+`), and collapsing whitespace. Two records whose normalized strings are equal SHALL be treated as the same cluster.
@@ -175,11 +176,12 @@ The analyzer SHALL read each `events.jsonl` line-by-line and accumulate only nor
 
 ### Requirement: Improve clusters SHALL be isolated by category and never merged across categories
 
-The analyzer SHALL key every cluster by the pair (category, normalized signal), so that evidence from
+The analyzer SHALL key every cluster by the pair (category, cluster key), so that evidence from
 different categories SHALL NEVER accumulate into the same cluster. In particular, an agent-reported
 `papercut` cluster SHALL remain a distinct cluster from a telemetry-derived `flaky-gate` or
-`token-waste` cluster even when both describe the same underlying problem, and the analyzer SHALL NOT
-apply any cross-category similarity merging.
+`token-waste` cluster even when both describe the same underlying problem, a `correction` cluster
+SHALL remain distinct from every other category even when its signal coincides with theirs, and the
+analyzer SHALL NOT apply any cross-category similarity merging.
 
 #### Scenario: Papercut and flaky-gate describing the same problem stay separate
 
@@ -201,7 +203,12 @@ apply any cross-category similarity merging.
 - **THEN** the analyzer SHALL emit two clusters, one per category
 - **AND** neither cluster's occurrence count SHALL include the other category's events
 
----
+#### Scenario: Correction and papercut describing the same problem stay separate
+
+- **WHEN** a `correction` cluster and a `papercut` cluster concern the same underlying failure and
+  their signals coincide
+- **THEN** the report SHALL contain one `correction` cluster and one `papercut` cluster
+- **AND** their occurrence counts SHALL be independent and SHALL NOT be combined
 
 ### Requirement: `improve --apply` SHALL NOT create a duplicate issue for a cluster that already has an open issue
 
