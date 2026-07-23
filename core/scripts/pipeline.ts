@@ -311,6 +311,10 @@ export interface CliOpts {
   effectiveCommit?: string;
   /** correction attribute: optional release/tag the control became effective at. */
   effectiveRelease?: string;
+  /** correction attribute: required for an effective control (disposition implemented,
+   *  or superseded shipping a replacement control) — the ISO timestamp the control
+   *  actually became effective, distinct from the record's append time. */
+  effectiveAt?: string;
   /** correction attribute: optional attribution_id this record supersedes. */
   supersedes?: string;
   /** correction attribute: optional bounded free-text note. */
@@ -431,6 +435,7 @@ export function buildCmd(): Command {
     .option("--pr <n>", "correction attribute: the PR that shipped the control", Number)
     .option("--effective-commit <sha>", "correction attribute: optional — the commit SHA the control became effective at")
     .option("--effective-release <tag>", "correction attribute: optional — the release/tag the control became effective at")
+    .option("--effective-at <iso>", "correction attribute: the ISO timestamp the control actually became effective — required when --disposition is implemented, or superseded with --effective-commit/--effective-release")
     .option("--supersedes <attribution-id>", "correction attribute: optional — the attribution_id this record supersedes")
     .option("--note <text>", "correction attribute: optional bounded free-text note")
     .option("--corrections-by <dimension>", "scoreboard: group correction/recurrence metrics by repo|stage|harness|model|source_kind|failure_class|proposed_control|implemented_control; repeatable (to detect a duplicate flag)", collectRepeatable, []);
@@ -1021,6 +1026,20 @@ async function main(): Promise<void> {
         process.exitCode = 2;
         return;
       }
+      // An effective control's recurrence boundary is the control's actual
+      // effective time, not this command's invocation time (#501 review-1
+      // finding c98822e3) — required whenever this record ships one.
+      const shipsEffectiveControl =
+        opts.disposition === "implemented" ||
+        (opts.disposition === "superseded" && (opts.effectiveCommit !== undefined || opts.effectiveRelease !== undefined));
+      if (shipsEffectiveControl && (!opts.effectiveAt || Number.isNaN(Date.parse(opts.effectiveAt)))) {
+        console.error(
+          'pipeline correction attribute: --effective-at <iso> is required (and must be a valid ISO timestamp) ' +
+            'when --disposition is implemented, or superseded with --effective-commit/--effective-release',
+        );
+        process.exitCode = 2;
+        return;
+      }
       let evidenceRefKind: string | undefined;
       let evidenceRefId: string | undefined;
       if (opts.evidenceRef !== undefined) {
@@ -1047,6 +1066,7 @@ async function main(): Promise<void> {
         pr: opts.pr ?? null,
         effective_commit: opts.effectiveCommit ?? null,
         effective_release: opts.effectiveRelease ?? null,
+        effective_at: opts.effectiveAt ?? null,
         supersedes: opts.supersedes ?? null,
         ...(evidenceRefKind !== undefined
           ? { evidence_ref: { kind: evidenceRefKind as EvidenceRefKind, id: evidenceRefId! } }
@@ -1070,8 +1090,9 @@ async function main(): Promise<void> {
           '[--proposed-control <control>] [--run-id <id>]\n' +
           '     or: pipeline correction attribute --correction-key <key> --control-type <type> ' +
           '--disposition <implemented|human-owned|rejected|superseded> [--issue <n>] [--pr <n>] ' +
-          '[--effective-commit <sha>] [--effective-release <tag>] [--supersedes <attribution-id>] ' +
-          '[--evidence-ref <kind:id>] [--note <text>]',
+          '[--effective-commit <sha>] [--effective-release <tag>] --effective-at <iso> ' +
+          '(required for implemented, or superseded with --effective-commit/--effective-release) ' +
+          '[--supersedes <attribution-id>] [--evidence-ref <kind:id>] [--note <text>]',
       );
       process.exitCode = 2;
       return;

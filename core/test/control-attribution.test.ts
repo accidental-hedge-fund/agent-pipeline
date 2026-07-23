@@ -39,6 +39,7 @@ const BASE_PAYLOAD = {
   correction_key: "abc12345",
   control_type: "deterministic-gate" as const,
   disposition: "implemented" as const,
+  effective_at: "2026-01-01T00:00:00Z",
 };
 
 // ---------------------------------------------------------------------------
@@ -116,11 +117,27 @@ test("emitControlAttribution: appends a well-formed control_attribution with the
   assert.equal(record.note, "");
 });
 
-test("emitControlAttribution: effective_at is set for an implemented disposition", async () => {
+test("emitControlAttribution: effective_at is the caller-supplied control-effective time, not the append time", async () => {
   const { deps, lines } = memDeps();
   await emitControlAttribution("/repo", BASE_PAYLOAD, deps);
   const record = JSON.parse(lines()[0]) as ControlAttribution;
-  assert.equal(record.effective_at, record.at);
+  assert.equal(record.effective_at, "2026-01-01T00:00:00Z");
+  assert.notEqual(record.effective_at, record.at);
+});
+
+test("emitControlAttribution: rejects an implemented disposition with no effective_at (non-fatal, nothing appended)", async () => {
+  const { deps, lines } = memDeps();
+  const { effective_at, ...withoutEffectiveAt } = BASE_PAYLOAD;
+  const appended = await emitControlAttribution("/repo", withoutEffectiveAt, deps);
+  assert.equal(appended, false);
+  assert.equal(lines().length, 0);
+});
+
+test("emitControlAttribution: rejects an implemented disposition with an unparseable effective_at", async () => {
+  const { deps, lines } = memDeps();
+  const appended = await emitControlAttribution("/repo", { ...BASE_PAYLOAD, effective_at: "not-a-date" }, deps);
+  assert.equal(appended, false);
+  assert.equal(lines().length, 0);
 });
 
 test("emitControlAttribution: effective_at is null for human-owned and rejected dispositions", async () => {
@@ -148,7 +165,20 @@ test("emitControlAttribution: a superseded disposition carrying a replacement co
     effective_commit: "a".repeat(40),
   }, deps);
   const record = JSON.parse(lines()[0]) as ControlAttribution;
-  assert.equal(record.effective_at, record.at);
+  assert.equal(record.effective_at, "2026-01-01T00:00:00Z");
+});
+
+test("emitControlAttribution: rejects a superseded disposition shipping a replacement control with no effective_at", async () => {
+  const { deps, lines } = memDeps();
+  const appended = await emitControlAttribution("/repo", {
+    correction_key: "abc12345",
+    control_type: "deterministic-gate",
+    disposition: "superseded",
+    supersedes: "prior-id",
+    effective_commit: "a".repeat(40),
+  }, deps);
+  assert.equal(appended, false);
+  assert.equal(lines().length, 0);
 });
 
 test("emitControlAttribution: issue/pr/effective_commit/effective_release/supersedes/note/evidence_ref present as supplied", async () => {

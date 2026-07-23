@@ -267,6 +267,7 @@ function requiredAttributeArgs(overrides: Record<string, string> = {}): string[]
     "--correction-key": "abc12345",
     "--control-type": "deterministic-gate",
     "--disposition": "implemented",
+    "--effective-at": "2026-01-01T00:00:00Z",
   };
   const merged = { ...base, ...overrides };
   return Object.entries(merged).flatMap(([k, v]) => [k, v]);
@@ -274,7 +275,7 @@ function requiredAttributeArgs(overrides: Record<string, string> = {}): string[]
 
 test("command-registry: correction entry allows the correction-attribute flags", () => {
   const entry = COMMAND_REGISTRY.correction;
-  for (const flag of ["correctionKey", "controlType", "disposition", "pr", "effectiveCommit", "effectiveRelease", "supersedes", "note"]) {
+  for (const flag of ["correctionKey", "controlType", "disposition", "pr", "effectiveCommit", "effectiveRelease", "effectiveAt", "supersedes", "note"]) {
     assert.ok((entry.allowedFlags as Set<string>).has(flag), `correction.allowedFlags should include "${flag}"`);
   }
 });
@@ -357,6 +358,33 @@ test("pipeline correction attribute: an undeclared flag is rejected with exit 2 
   }
 });
 
+test("pipeline correction attribute: implemented disposition without --effective-at exits non-zero and appends nothing", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-no-effective-at-"));
+  try {
+    const args = requiredAttributeArgs();
+    const idx = args.indexOf("--effective-at");
+    args.splice(idx, 2);
+    const result = runCli(["correction", "attribute", "--repo-path", tmp, ...args], tmp);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--effective-at/);
+    assert.equal(fs.existsSync(ledgerPath(tmp)), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("pipeline correction attribute: unparseable --effective-at exits non-zero and appends nothing", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-bad-effective-at-"));
+  try {
+    const result = runCli(["correction", "attribute", "--repo-path", tmp, ...requiredAttributeArgs({ "--effective-at": "not-a-date" })], tmp);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--effective-at/);
+    assert.equal(fs.existsSync(ledgerPath(tmp)), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("pipeline correction attribute: human-owned/rejected dispositions append with effective_at null", () => {
   for (const disposition of ["human-owned", "rejected"]) {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "attribute-cli-disposition-"));
@@ -392,13 +420,12 @@ test("pipeline correction attribute: repeated invocation with the same identifyi
     runCli(["correction", "attribute", "--repo-path", tmp, ...requiredAttributeArgs()], tmp);
     runCli(["correction", "attribute", "--repo-path", tmp, ...requiredAttributeArgs()], tmp);
     const records = fs.readFileSync(ledgerPath(tmp), "utf8").trim().split("\n").map((l) => JSON.parse(l));
-    assert.equal(records.length, 2, "each invocation appends its own record");
-    // effective_at differs between invocations (real clock), so the two ids
-    // legitimately differ here — this test only proves the field is present
-    // and stable in shape, not cross-invocation collapsing (that is proven by
-    // the pure-function unit test in control-attribution.test.ts).
-    assert.equal(typeof records[0].attribution_id, "string");
-    assert.equal(typeof records[1].attribution_id, "string");
+    assert.equal(records.length, 2, "each invocation appends its own record — dedup is a consumer-side concern");
+    // attribution_id is derived from identifying fields only, never from
+    // append time (`at`) or the explicit `effective_at`, so a replay with the
+    // same identifying fields shares one attribution_id and a consumer
+    // deduping by it collapses the two appends to one logical attribution.
+    assert.equal(records[0].attribution_id, records[1].attribution_id);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

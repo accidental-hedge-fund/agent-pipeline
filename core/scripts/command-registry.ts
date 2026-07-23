@@ -326,7 +326,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
       "reviewedSha", "headSha",
       // correction attribute (#501)
       "correctionKey", "controlType", "disposition", "pr", "effectiveCommit",
-      "effectiveRelease", "supersedes", "note",
+      "effectiveRelease", "effectiveAt", "supersedes", "note",
     ]),
     needsConfig: false,
     needsGhAuth: false,

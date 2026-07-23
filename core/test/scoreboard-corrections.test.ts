@@ -154,6 +154,28 @@ test("corrections: total corrections dedup by correction_id, count distinct clas
   assert.deepEqual(report.corrections?.repeated_class_rate, { numerator: 1, denominator: 2, ratio: 0.5 });
 });
 
+test("corrections: bucketed period totals dedup a replayed correction_id once window-wide, and sum to the window total (#501 review-1 bcf2f196)", async () => {
+  const files: Record<string, string> = {};
+  const key = deriveCorrectionKey({ source_kind: "override", failure_class: "review-finding", stage: "review-2" });
+  // A replayed delivery of the same correction_id shows up in runs assigned
+  // to two different day buckets — the window-level metric counts it once;
+  // per-period totals must not each count it again.
+  addRun(files, "run-day1", "2026-06-01T00:00:00Z", [
+    correctionEvent({ correction_id: "dup1", correction_key: key, run_id: "run-day1", at: "2026-06-01T00:00:00Z" }),
+  ]);
+  addRun(files, "run-day2", "2026-06-02T00:00:00Z", [
+    correctionEvent({ correction_id: "dup1", correction_key: key, run_id: "run-day2", at: "2026-06-02T00:00:00Z" }),
+    correctionEvent({ correction_id: "a2", correction_key: key, run_id: "run-day2", at: "2026-06-02T00:00:00Z" }),
+  ]);
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-03T00:00:00Z", bucket: "day" },
+    memDeps(files),
+  );
+  assert.equal(report.corrections?.total_corrections, 2, "dup1 (deduped window-wide) + a2");
+  const seriesSum = report.series!.reduce((sum, p) => sum + p.corrections!.total_corrections, 0);
+  assert.equal(seriesSum, report.corrections?.total_corrections, "per-period totals sum to the window total");
+});
+
 test("corrections: corrections-per-ready-item uses the successful-PR denominator, null at zero PRs", async () => {
   const files: Record<string, string> = {};
   const key = deriveCorrectionKey({ source_kind: "override", failure_class: "review-finding", stage: "review-2" });
@@ -349,6 +371,40 @@ test("corrections: a rollback (rejected disposition superseding an implemented o
   assert.equal(cls!.recurrence?.status, null);
   assert.equal(cls!.recurrence?.superseded.length, 1);
   assert.equal(cls!.recurrence?.superseded[0].attribution_id, "attr-r-a");
+});
+
+test("corrections: a replayed attribution append (same attribution_id) collapses to one canonical copy, not a false supersession (#501 review-1 1ea368e9)", async () => {
+  const files: Record<string, string> = {};
+  const key = deriveCorrectionKey({ source_kind: "override", failure_class: "review-finding", stage: "review-2" });
+  addRun(files, "1-2026-06-01T00-00-00-000Z", "2026-06-01T00:00:00Z", [
+    correctionEvent({ correction_id: "a1", correction_key: key, at: "2026-06-01T00:00:00Z" }),
+  ]);
+  // Two appends of the SAME logical attribution (identical attribution_id,
+  // as a crash-and-retry would produce) — a later append time must not read
+  // as a new attribution superseding the earlier one, and the recurrence
+  // boundary must stay pinned to the earliest valid append.
+  files[controlAttributionsPath(REPO_DIR)] = ledgerContent([
+    attribution({
+      attribution_id: "attr-replay",
+      correction_key: key,
+      disposition: "implemented",
+      at: "2026-06-02T00:00:00Z",
+      effective_at: "2026-06-02T00:00:00Z",
+    }),
+    attribution({
+      attribution_id: "attr-replay",
+      correction_key: key,
+      disposition: "implemented",
+      at: "2026-06-05T00:00:00Z",
+      effective_at: "2026-06-05T00:00:00Z",
+    }),
+  ]);
+
+  const report = await buildScoreboardReport(WINDOW_OPTS, memDeps(files));
+  const cls = report.corrections?.classes.find((c) => c.correction_key === key);
+  assert.equal(cls!.recurrence?.superseded.length, 0, "the replay must not surface as a superseded prior copy");
+  assert.equal(cls!.recurrence?.attribution?.attribution_id, "attr-replay");
+  assert.equal(cls!.recurrence?.attribution?.effective_at, "2026-06-02T00:00:00Z", "boundary pinned to the earliest valid append, not the retry's later one");
 });
 
 // ---------------------------------------------------------------------------

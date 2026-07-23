@@ -493,7 +493,11 @@ export async function buildScoreboardReport(
 
   const correctionDiagnostics: ScoreboardDiagnostic[] = [];
   const attributions = await readControlAttributionLedger(opts.repoDir, deps, correctionDiagnostics);
-  const { metrics: corrections, grouping: correctionsGrouping } = computeCorrectionMetrics(
+  const {
+    metrics: corrections,
+    instances: correctionInstances,
+    grouping: correctionsGrouping,
+  } = computeCorrectionMetrics(
     opts.repoDir,
     scan.runs,
     attributions,
@@ -514,9 +518,10 @@ export async function buildScoreboardReport(
 
   const periods = computePeriods(window, bucket);
   const assigned = assignRunsToPeriods(periods, scan.runs);
+  const correctionsByPeriod = partitionCorrectionInstancesByPeriod(correctionInstances, assigned);
   const series: ScoreboardPeriod[] = periods.map((period, i) => {
     const entry = buildPeriodEntry(period, assigned[i], estimates, groupBy);
-    return { ...entry, corrections: computeCorrectionTotals(assigned[i], entry.totals.successful_prs) };
+    return { ...entry, corrections: computeCorrectionTotals(correctionsByPeriod[i], entry.totals.successful_prs) };
   });
   return { ...report, bucket, series };
 }
@@ -824,7 +829,25 @@ async function readControlAttributionLedger(
     }
     attributions.push(validation.attribution);
   }
-  return attributions;
+  return dedupeAttributionsById(attributions);
+}
+
+/** Collapse replayed appends of the same logical attribution (#501 review-1
+ *  finding 1ea368e9): `attribution_id` is a pure function of the record's
+ *  identifying fields (see `deriveAttributionId`), so two records sharing an
+ *  `attribution_id` are the same logical attribution re-recorded (e.g. after
+ *  a crash-and-retry) — collapse them to one canonical copy, the earliest
+ *  valid append by `at`, so a repeated append never falsely supersedes the
+ *  prior copy or moves the active recurrence boundary. */
+function dedupeAttributionsById(attributions: ControlAttribution[]): ControlAttribution[] {
+  const byId = new Map<string, ControlAttribution>();
+  for (const attr of attributions) {
+    const existing = byId.get(attr.attribution_id);
+    if (!existing || Date.parse(attr.at) < Date.parse(existing.at)) {
+      byId.set(attr.attribution_id, attr);
+    }
+  }
+  return [...byId.values()];
 }
 
 /** Deduped `correction_event` instances across the included runs, keyed by
@@ -866,11 +889,36 @@ function collectCorrectionInstances(runs: IncludedRun[], diagnostics: Scoreboard
   return [...byId.values()];
 }
 
-/** Lightweight per-period totals (#501 4.2) — dedup only within `runs`
- *  (already assigned to exactly one period each), so per-period totals sum
- *  to the window total without re-resolving cross-period recurrence. */
-function computeCorrectionTotals(runs: IncludedRun[], successfulPrs: number): CorrectionTotals {
-  const instances = collectCorrectionInstances(runs, []);
+/** Assigns each already run-scoped period bucket to its owning canonical
+ *  correction instance (#501 review-1 finding bcf2f196): a correction
+ *  instance is deduped once for the whole window (`collectCorrectionInstances`
+ *  over every included run), then partitioned here by the period its
+ *  originating run was assigned to — never re-derived per period — so a
+ *  replayed `correction_id` delivered across runs in different buckets is
+ *  still counted exactly once overall and period totals sum to the window
+ *  total. */
+function partitionCorrectionInstancesByPeriod(
+  instances: CorrectionInstance[],
+  assigned: IncludedRun[][],
+): CorrectionInstance[][] {
+  const periodByRunId = new Map<string, number>();
+  assigned.forEach((runs, periodIndex) => {
+    for (const run of runs) periodByRunId.set(run.runId, periodIndex);
+  });
+  const buckets: CorrectionInstance[][] = assigned.map(() => []);
+  for (const inst of instances) {
+    const periodIndex = periodByRunId.get(inst.run_id);
+    if (periodIndex === undefined) continue;
+    buckets[periodIndex].push(inst);
+  }
+  return buckets;
+}
+
+/** Per-period totals (#501 4.2) computed from an already window-deduped
+ *  `instances` list (see `partitionCorrectionInstancesByPeriod`) — never
+ *  re-dedupes per period, so a correction instance counts in exactly one
+ *  period and period totals sum to the window total. */
+function computeCorrectionTotals(instances: CorrectionInstance[], successfulPrs: number): CorrectionTotals {
   const classCounts = new Map<string, number>();
   for (const inst of instances) {
     classCounts.set(inst.correction_key, (classCounts.get(inst.correction_key) ?? 0) + 1);
@@ -1031,7 +1079,7 @@ function computeCorrectionMetrics(
   diagnostics: ScoreboardDiagnostic[],
   groupBy: CorrectionsByDimension | null,
   successfulPrs: number,
-): { metrics: CorrectionMetrics; grouping?: CorrectionGrouping } {
+): { metrics: CorrectionMetrics; instances: CorrectionInstance[]; grouping?: CorrectionGrouping } {
   const ledgerPath = controlAttributionsPath(repoDir);
   const instances = collectCorrectionInstances(runs, diagnostics);
 
@@ -1148,8 +1196,8 @@ function computeCorrectionMetrics(
     top_still_recurring: rankTopStillRecurring(classes),
   };
 
-  if (!groupBy) return { metrics };
-  return { metrics, grouping: buildCorrectionGrouping(runs, instances, classes, groupBy) };
+  if (!groupBy) return { metrics, instances };
+  return { metrics, instances, grouping: buildCorrectionGrouping(runs, instances, classes, groupBy) };
 }
 
 async function readJsonArtifact(

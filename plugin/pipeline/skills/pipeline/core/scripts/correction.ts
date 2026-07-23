@@ -485,15 +485,23 @@ const ATTRIBUTION_NOTE_CAP = 500;
  *  control's effective commit/release (recording the supersession and its
  *  own effective control in one append). `human-owned`/`rejected` (and a
  *  bare `superseded` record with no replacement-control evidence) set no
- *  boundary. */
+ *  boundary.
+ *
+ *  The boundary is the caller-supplied, validated `effectiveAt` — the time
+ *  the control actually became effective — never the append-time `at`. A
+ *  maintainer routinely records an attribution after the control already
+ *  shipped; using append time as the boundary would exclude every run
+ *  between shipment and attribution from time-to-control and post-control
+ *  recurrence (#501 review-1 finding c98822e3). The append-time `at` field
+ *  is retained separately for audit history. */
 function resolveEffectiveAt(
   disposition: ControlAttributionDisposition,
   effectiveCommit: string | null,
   effectiveRelease: string | null,
-  at: string,
+  effectiveAt: string | null,
 ): string | null {
-  if (disposition === "implemented") return at;
-  if (disposition === "superseded" && (effectiveCommit !== null || effectiveRelease !== null)) return at;
+  if (disposition === "implemented") return effectiveAt;
+  if (disposition === "superseded" && (effectiveCommit !== null || effectiveRelease !== null)) return effectiveAt;
   return null;
 }
 
@@ -505,6 +513,12 @@ export interface EmitControlAttributionPayload {
   pr?: number | null;
   effective_commit?: string | null;
   effective_release?: string | null;
+  /** Required (a non-null, parseable ISO timestamp) when this record ships
+   *  an effective control — `disposition: "implemented"`, or a `superseded`
+   *  record that also names a replacement `effective_commit`/
+   *  `effective_release`. The control's actual effective time, not the
+   *  append time — see `resolveEffectiveAt`. */
+  effective_at?: string | null;
   supersedes?: string | null;
   evidence_ref?: EvidenceRef;
   note?: string;
@@ -530,6 +544,17 @@ export async function emitControlAttribution(
     const pr = payload.pr ?? null;
     const effectiveCommit = payload.effective_commit ?? null;
     const effectiveRelease = payload.effective_release ?? null;
+    const shipsEffectiveControl =
+      payload.disposition === "implemented" ||
+      (payload.disposition === "superseded" && (effectiveCommit !== null || effectiveRelease !== null));
+    const explicitEffectiveAt = payload.effective_at ?? null;
+    if (shipsEffectiveControl && (explicitEffectiveAt === null || Number.isNaN(Date.parse(explicitEffectiveAt)))) {
+      console.warn(
+        '[pipeline] correction: emitControlAttribution rejected: a valid "effective_at" timestamp is required ' +
+          `when disposition is "implemented" or a "superseded" record ships a replacement control`,
+      );
+      return false;
+    }
     const rawEvidenceRef = payload.evidence_ref ?? { kind: "comment", id: "" };
     const evidenceRef: EvidenceRef = {
       kind: rawEvidenceRef.kind,
@@ -557,7 +582,7 @@ export async function emitControlAttribution(
       pr,
       effective_commit: effectiveCommit,
       effective_release: effectiveRelease,
-      effective_at: resolveEffectiveAt(payload.disposition, effectiveCommit, effectiveRelease, at),
+      effective_at: resolveEffectiveAt(payload.disposition, effectiveCommit, effectiveRelease, explicitEffectiveAt),
       supersedes: payload.supersedes ?? null,
       evidence_ref: evidenceRef,
       note,
