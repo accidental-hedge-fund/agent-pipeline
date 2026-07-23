@@ -104,13 +104,18 @@ export interface RecoveryPolicyEntry {
  *  refuses a policy missing any class as a validation failure. */
 export type RecoveryPolicy = Record<DurableBlockerClass, RecoveryPolicyEntry>;
 
-/** The outcome of one recovery attempt on a blocked item. */
+/** The outcome of one recovery attempt on a blocked item. `failed` records a
+ *  recovery action that was actually attempted but did not succeed — the item
+ *  stays `blocked` and no budget is charged (#509 review round 2 finding
+ *  2794f4b6: a caller-reported failure must never be persisted as a
+ *  successful resume). */
 export type RecoveryAttemptOutcome =
   | "recovered"
   | "exhausted"
   | "repeated_no_progress"
   | "needs_human"
-  | "human_authority";
+  | "human_authority"
+  | "failed";
 
 /** A single persisted recovery attempt — the ledger.recovery_attempts entry
  *  the durable-blocker-classification capability requires to survive a
@@ -196,7 +201,17 @@ export interface LoopMergeBarrier {
 }
 
 export interface LoopStopRecord {
-  reason: "recovery_exhausted" | "consecutive_blocked" | "needs_human_classification" | "repeated_no_progress" | "human_authority";
+  reason:
+    | "recovery_exhausted"
+    | "consecutive_blocked"
+    | "needs_human_classification"
+    | "repeated_no_progress"
+    | "human_authority"
+    /** A block whose class's policy is `run_fatal` — the run stops
+     *  immediately at block time (#509 review round 2 finding 6ced9fe0), even
+     *  for a retry-capable class, since a run-fatal class's whole point is
+     *  that the run cannot safely continue automatically. */
+    | "run_fatal";
   time: string;
   item_id?: string;
   theme?: string;

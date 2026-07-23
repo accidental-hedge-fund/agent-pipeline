@@ -18,6 +18,12 @@ stop-class failure naming the stop record.
   recorded on the history entry
 - **AND** no other transition SHALL change any budget
 
+#### Scenario: A failed recovery action charges no budget and does not transition the item
+
+- **WHEN** a recovery is attempted and the attempted actions did not succeed
+- **THEN** no budget SHALL be decremented
+- **AND** the item SHALL remain `blocked` rather than transitioning to `in_progress`
+
 #### Scenario: Exhausted budget stops the run terminally
 
 - **WHEN** a recovery is attempted with the applicable budget already at zero

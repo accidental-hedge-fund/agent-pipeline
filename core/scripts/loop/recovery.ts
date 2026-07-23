@@ -26,6 +26,7 @@ import {
   type LoopEngineName,
 } from "./types.ts";
 import { initRun, readLedger, writeLedger, appendEvent, type LoopStoreDeps } from "./store.ts";
+import { mapLegacyThemeToBlockerClass } from "./import.ts";
 
 // ---------------------------------------------------------------------------
 // Recovery policy compilation — fail closed.
@@ -214,6 +215,51 @@ export async function initRecoverableRun(
 }
 
 // ---------------------------------------------------------------------------
+// Pre-#509 durable-state migration (#509 review round 2 finding 9635d6fb): a
+// contract/ledger persisted before this capability existed carries no
+// `recovery_policy` / `recovery_attempts` field and may carry a legacy
+// free-text `blocked_theme`. Every recovery-path entry point below runs its
+// contract/ledger through these pure upgraders before use, so a pre-#509 run
+// resumes instead of faulting on a missing field or an unrecognized theme.
+// The upgraded shape is written back on the next successful mutation.
+// ---------------------------------------------------------------------------
+
+/** Installs {@link DEFAULT_RECOVERY_POLICY} when `recovery_policy` is absent
+ *  or missing a class (a pre-#509 contract has no such field at all). A
+ *  no-op for an already-compiled contract. */
+export function upgradeContractForRecovery(contract: LoopContract): LoopContract {
+  const policy = contract.recovery_policy;
+  const complete = policy && DURABLE_BLOCKER_CLASSES.every((cls) => policy[cls] !== undefined);
+  return complete ? contract : { ...contract, recovery_policy: DEFAULT_RECOVERY_POLICY };
+}
+
+/** Defaults `recovery_attempts` to `[]` when absent (a pre-#509 ledger has no
+ *  such field, so `recoverItem`'s `.length`/`.push` access would otherwise
+ *  fault), and maps every item's legacy free-text `blocked_theme` onto its
+ *  {@link DurableBlockerClass} via {@link mapLegacyThemeToBlockerClass}. A
+ *  legacy theme with no known mapping is left as-is — the item's next
+ *  `blockItem`/`recoverItem` call then fails closed on the invalid class
+ *  rather than this read silently discarding it. */
+export function upgradeLedgerForRecovery(ledger: LoopLedger): LoopLedger {
+  let itemsChanged = false;
+  const items: LoopLedger["items"] = {};
+  for (const [id, item] of Object.entries(ledger.items)) {
+    if (item.blocked_theme && !isDurableBlockerClass(item.blocked_theme)) {
+      try {
+        items[id] = { ...item, blocked_theme: mapLegacyThemeToBlockerClass(item.blocked_theme) };
+        itemsChanged = true;
+        continue;
+      } catch {
+        // Unmapped legacy theme — left unchanged; fails closed downstream.
+      }
+    }
+    items[id] = item;
+  }
+  if (!itemsChanged && ledger.recovery_attempts) return ledger;
+  return { ...ledger, items, recovery_attempts: ledger.recovery_attempts ?? [] };
+}
+
+// ---------------------------------------------------------------------------
 // Fail-closed classification.
 // ---------------------------------------------------------------------------
 
@@ -244,7 +290,7 @@ export async function recordNeedsHumanClassificationStop(
   itemId: string,
   detail: string,
 ): Promise<LoopLedger> {
-  const ledger = await readLedger(deps, runId);
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps, runId));
   if (ledger.stop) {
     throw new LoopError("stop", `loop run "${runId}" is already stopped: ${ledger.stop.reason}`);
   }
@@ -291,28 +337,44 @@ export interface BlockItemInput {
 
 /** Transitions an item into `blocked` carrying a validated
  *  {@link DurableBlockerClass}. Refuses (LoopError "validation") a missing or
- *  out-of-enum class, leaving the item unchanged. When the class's policy
- *  routes to `human_authority`, immediately records a terminal `human_authority`
- *  run stop — the item is handed to a human and every subsequent transition on
- *  the run is refused. Otherwise, fingerprints the evidence and, when it
+ *  out-of-enum class, leaving the item unchanged. Only a currently
+ *  `in_progress` item may block (LoopError "validation" otherwise) — this is
+ *  the valid active-state transition the engine actually produces, and it is
+ *  what makes `repeated_evidence_count` mean "consecutive recovery cycles
+ *  that reproduced the same evidence" rather than "duplicate block reports on
+ *  an item nothing ever tried to resume" (#509 review round 2 finding
+ *  49de4f8c): reaching this function again for the same item requires an
+ *  intervening successful {@link recoverItem} resume back to `in_progress`.
+ *  When the class's policy routes to `human_authority`, or is `run_fatal`,
+ *  immediately records a terminal run stop (`human_authority` / `run_fatal`
+ *  respectively, #509 review round 2 finding 6ced9fe0 for the latter) — every
+ *  subsequent transition on the run is refused, including a recovery attempt
+ *  on this same item. Otherwise, fingerprints the evidence and, when it
  *  repeats the item's immediately preceding fingerprint past the class's
  *  `repeated_evidence_limit`, records a terminal `repeated_no_progress` run
  *  stop — independent of the class recovery budget, which this transition
  *  never charges (budget is charged only on recovery — see
  *  {@link recoverItem}). */
-export async function blockItem(deps: LoopStoreDeps, contract: LoopContract, input: BlockItemInput): Promise<LoopLedger> {
+export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract, input: BlockItemInput): Promise<LoopLedger> {
   if (!input.blockerClass || !isDurableBlockerClass(input.blockerClass)) {
     throw new LoopError("validation", `"${input.blockerClass}" is not a valid DurableBlockerClass`);
   }
   const blockerClass = input.blockerClass;
+  const contract = upgradeContractForRecovery(contractInput);
 
-  const ledger = await readLedger(deps, input.runId);
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId));
   if (ledger.stop) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
   const item = ledger.items[input.itemId];
   if (!item) {
     throw new LoopError("validation", `item "${input.itemId}" not found in run "${input.runId}"`);
+  }
+  if (item.state !== "in_progress") {
+    throw new LoopError(
+      "validation",
+      `item "${input.itemId}" cannot block from state "${item.state}" — only an in_progress item may transition into blocked (a blocked item must be recovered back to in_progress first)`,
+    );
   }
 
   const policyEntry = contract.recovery_policy[blockerClass];
@@ -337,6 +399,8 @@ export async function blockItem(deps: LoopStoreDeps, contract: LoopContract, inp
       theme: blockerClass,
       fingerprint,
     };
+  } else if (policyEntry.run_fatal) {
+    ledger.stop = { reason: "run_fatal", time, item_id: input.itemId, theme: blockerClass };
   }
 
   await writeLedger(deps, ledger, input.token);
@@ -388,6 +452,14 @@ export interface RecoverItemInput {
   /** The recipe(s) actually attempted — each must be permitted by the item's
    *  blocked class's policy entry. */
   actions: RecoveryRecipe[];
+  /** Whether the attempted `actions` actually succeeded, as observed by the
+   *  caller (#509 review round 2 finding 2794f4b6: the caller — not this
+   *  function — executes the recipe, so it is the only party that knows the
+   *  real result; this call must never assume success). A `false` result is
+   *  persisted as a `failed` attempt: the item stays `blocked` and no budget
+   *  is charged. Ignored when the class routes to `human_authority`, which
+   *  has no automated recipe to succeed or fail. */
+  succeeded: boolean;
 }
 
 export interface RecoverItemResult {
@@ -398,17 +470,23 @@ export interface RecoverItemResult {
 /** Attempts to recover a blocked item. Charges the recovery budget keyed by
  *  the item's typed blocker classification (falling back to the class's
  *  compiled `retry_budget` from the policy, not the ledger's unrelated
- *  `default`, when the item has no class-specific ledger entry yet), and on
- *  success resumes the SAME item `blocked` -> `in_progress`, retaining its
- *  history, class, and evidence records. Refuses (LoopError "validation") a
- *  retry-capable recovery attempted with an empty action list — at least one
- *  permitted recipe must actually have been attempted. Refuses (LoopError
- *  "stop") when the run already carries a terminal stop (including the
- *  `human_authority` stop {@link blockItem} records immediately for
- *  human-authority classes), or when the class budget is already exhausted
- *  (recording a terminal `recovery_exhausted` stop). */
-export async function recoverItem(deps: LoopStoreDeps, contract: LoopContract, input: RecoverItemInput): Promise<RecoverItemResult> {
-  const ledger = await readLedger(deps, input.runId);
+ *  `default`, when the item has no class-specific ledger entry yet), and only
+ *  when `input.succeeded` is true resumes the SAME item `blocked` ->
+ *  `in_progress`, retaining its history, class, and evidence records. A
+ *  `false` `input.succeeded` records a `failed` attempt without moving the
+ *  item out of `blocked` and without charging any budget. Refuses (LoopError
+ *  "validation") a retry-capable recovery attempted with an empty action
+ *  list — at least one permitted recipe must actually have been attempted,
+ *  regardless of whether it succeeded. Refuses (LoopError "stop") when the
+ *  run already carries a terminal stop (including the `human_authority` /
+ *  `run_fatal` stops {@link blockItem} records immediately for those
+ *  classes), or when the class budget is already exhausted (recording a
+ *  terminal `recovery_exhausted` stop) — budget exhaustion is checked before
+ *  `input.succeeded`, since a caller cannot spend budget that is already
+ *  gone regardless of this attempt's outcome. */
+export async function recoverItem(deps: LoopStoreDeps, contractInput: LoopContract, input: RecoverItemInput): Promise<RecoverItemResult> {
+  const contract = upgradeContractForRecovery(contractInput);
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId));
   if (ledger.stop) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
@@ -440,6 +518,8 @@ export async function recoverItem(deps: LoopStoreDeps, contract: LoopContract, i
     if (remaining <= 0) {
       outcome = "exhausted";
       ledger.stop = { reason: "recovery_exhausted", time, item_id: input.itemId, theme: blockerClass };
+    } else if (!input.succeeded) {
+      outcome = "failed";
     } else {
       outcome = "recovered";
       item.recovery_budgets_remaining[blockerClass] = remaining - 1;
@@ -479,8 +559,14 @@ export async function recoverItem(deps: LoopStoreDeps, contract: LoopContract, i
 // ---------------------------------------------------------------------------
 
 /** True when any currently-blocked item's class is `run_fatal` — in which
- *  case the whole run stops and no further item may be started. */
-export function isRunFatalBlocked(contract: LoopContract, ledger: LoopLedger): boolean {
+ *  case the whole run stops and no further item may be started. Since
+ *  {@link blockItem} now records a terminal `run_fatal` stop at block time
+ *  (#509 review round 2 finding 6ced9fe0), `ledger.stop` is the primary
+ *  signal for callers; this predicate remains for direct class-level
+ *  inspection of an already-loaded ledger. */
+export function isRunFatalBlocked(contractInput: LoopContract, ledgerInput: LoopLedger): boolean {
+  const contract = upgradeContractForRecovery(contractInput);
+  const ledger = upgradeLedgerForRecovery(ledgerInput);
   return Object.values(ledger.items).some((item) => {
     if (item.state !== "blocked" || !item.blocked_theme || !isDurableBlockerClass(item.blocked_theme)) return false;
     return contract.recovery_policy[item.blocked_theme].run_fatal;
@@ -500,7 +586,9 @@ const DONE_STATES = new Set(["ready", "merged", "released", "deployed"]);
  *  `run_fatal` gate (returns none when any block is run-fatal). Preserves the
  *  merge-barrier invariant by never bypassing it — it is enforced elsewhere,
  *  unaffected by this selection. */
-export function eligibleIndependentItems(contract: LoopContract, ledger: LoopLedger): string[] {
+export function eligibleIndependentItems(contractInput: LoopContract, ledgerInput: LoopLedger): string[] {
+  const contract = upgradeContractForRecovery(contractInput);
+  const ledger = upgradeLedgerForRecovery(ledgerInput);
   if (ledger.stop) return [];
   if (isRunFatalBlocked(contract, ledger)) return [];
   if (Object.values(ledger.items).some((item) => item.state === "in_progress")) return [];

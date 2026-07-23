@@ -9,13 +9,24 @@ every structurally distinct durable-run failure class, comprising exactly: `tran
 transition into the `blocked` state SHALL carry exactly one member of this enum, and the recorded
 blocked theme SHALL be that member's name so a block's typed class is its budget key. A block that
 supplies no class, or a value outside the enum, SHALL be refused as a validation failure that
-leaves durable state unchanged.
+leaves durable state unchanged. Only an item currently `in_progress` SHALL be eligible to
+transition into `blocked` — an item already `blocked` SHALL be refused a second blocking
+transition as a validation failure, so a duplicate or retried block report on an item nothing has
+attempted to recover can never be counted as repeated no-progress; reaching `blocked` again for the
+same item requires an intervening successful recovery back to `in_progress`.
 
 #### Scenario: A blocked transition carries a valid class
 
 - **WHEN** an item transitions into `blocked` with class `implementation-ci`
 - **THEN** the transition SHALL be accepted
 - **AND** the item's recorded blocked theme SHALL be `implementation-ci`
+
+#### Scenario: A duplicate block report on an already-blocked item is refused
+
+- **WHEN** an item that is already `blocked` is given another blocking transition without an
+  intervening successful recovery back to `in_progress`
+- **THEN** it SHALL be refused as a validation failure
+- **AND** the item's repeated-evidence count SHALL NOT be incremented
 
 #### Scenario: A blocked transition without a class is refused
 
@@ -137,9 +148,11 @@ and never bypasses, the engine's existing authority gates.
 
 For every recovery attempt the engine SHALL persist in the ledger a record carrying the item id,
 the blocker class, the attempted recovery actions, the evidence fingerprint, and the outcome
-(recovered, exhausted, repeated-no-progress, needs-human, or human-authority). The engine SHALL
-emit a Pipeline-native event for each such attempt. Persistence SHALL survive process restart via
-the durable store so a resuming engine reads the same history.
+(recovered, exhausted, repeated-no-progress, needs-human, human-authority, or failed). The engine
+SHALL determine the outcome from the actual result of the attempted actions — reported explicitly
+by the caller that executed them — and SHALL NOT record `recovered` for actions that did not
+succeed. The engine SHALL emit a Pipeline-native event for each such attempt. Persistence SHALL
+survive process restart via the durable store so a resuming engine reads the same history.
 
 #### Scenario: A recovery attempt is recorded and emitted
 
@@ -147,6 +160,13 @@ the durable store so a resuming engine reads the same history.
 - **THEN** the ledger SHALL carry a record naming the item, class, attempted actions, evidence
   fingerprint, and outcome
 - **AND** a Pipeline-native event SHALL be emitted for that attempt
+
+#### Scenario: A failed recovery action is recorded as failed, not recovered
+
+- **WHEN** the recovery actions attempted for a blocked item did not succeed
+- **THEN** the ledger SHALL record the attempt's outcome as `failed`
+- **AND** the item SHALL remain `blocked`
+- **AND** no recovery budget SHALL be charged for that attempt
 
 #### Scenario: Recovery history survives restart
 
@@ -177,7 +197,10 @@ its blocker-class and evidence records.
 
 When an item is blocked, the engine SHALL allow a dependency-independent eligible item to continue
 only when the blocking class's policy marks the block non-run-fatal. When the blocking class's
-policy is run-fatal, the engine SHALL stop the whole run and SHALL NOT start any further item.
+policy is run-fatal, the engine SHALL record the terminal stop at the moment of the blocking
+transition itself and SHALL NOT start any further item, and SHALL NOT permit the blocked item to
+recover automatically — a run-fatal class's whole point is that the run cannot safely continue
+without a human, so recovery is refused the same way it is for every other terminal stop.
 Independent-item continuation SHALL respect the existing single-active-item and merge-barrier
 invariants.
 
@@ -191,5 +214,7 @@ invariants.
 #### Scenario: A run-fatal block stops the whole run
 
 - **WHEN** an item is blocked under a class whose policy is run-fatal
-- **THEN** the run SHALL be recorded as stopped
+- **THEN** the run SHALL be recorded as stopped at that same blocking transition
 - **AND** no further item SHALL be started
+- **AND** a recovery attempt on the blocked item itself SHALL also be refused with a stop-class
+  failure

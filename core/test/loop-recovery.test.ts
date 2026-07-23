@@ -17,6 +17,8 @@ import {
   isRunFatalBlocked,
   eligibleIndependentItems,
   initRecoverableRun,
+  upgradeContractForRecovery,
+  upgradeLedgerForRecovery,
 } from "../scripts/loop/recovery.ts";
 import { mapLegacyThemeToBlockerClass } from "../scripts/loop/import.ts";
 import { initRun, readContract, readLedger, acquireLock, type LoopStoreDeps } from "../scripts/loop/store.ts";
@@ -360,7 +362,24 @@ test("blockItem: an out-of-enum class is refused naming the value, state unchang
   assert.equal(ledger.items["100"].state, "in_progress");
 });
 
-test("blockItem: identical evidence repeated past the limit stops the run even with budget remaining", async () => {
+test("blockItem: an already-blocked item cannot block again without an intervening recovery — a duplicate block report is refused, not counted as a repeat", async () => {
+  const { deps, contract, token } = await setup();
+  await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed" });
+  await assert.rejects(
+    () => blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed" }),
+    (err: unknown) => {
+      assert.ok(err instanceof LoopError);
+      assert.equal(err.loopFailureClass, "validation");
+      assert.match((err as Error).message, /in_progress/);
+      return true;
+    },
+  );
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].repeated_evidence_count, 0, "the refused duplicate call never counted as a repeat");
+  assert.equal(ledger.stop, null);
+});
+
+test("blockItem: identical evidence repeated across recovery cycles up to the limit stops the run even with budget remaining", async () => {
   const { deps, contract, token } = await setup();
   // "workflow-state" has repeated_evidence_limit: 2 in DEFAULT_RECOVERY_POLICY.
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "workflow-state", evidence: "stuck in review" });
@@ -368,15 +387,21 @@ test("blockItem: identical evidence repeated past the limit stops the run even w
   assert.equal(ledger.stop, null);
   assert.equal(ledger.items["100"].recovery_budgets_remaining.default, 3, "budget untouched by blocking");
 
+  // A successful recovery cycle in between each block is required — a
+  // duplicate block report on an already-blocked item is refused (see the
+  // test above), so reaching the repeat limit legitimately requires the item
+  // to actually resume and re-block with the same evidence each time.
+  await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["resync_workflow_state"], succeeded: true });
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "workflow-state", evidence: "stuck in review" });
   ledger = await readLedger(deps, "run-1");
   assert.equal(ledger.stop, null, "one repeat is still under the limit of 2");
 
+  await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["resync_workflow_state"], succeeded: true });
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "workflow-state", evidence: "stuck in review" });
   ledger = await readLedger(deps, "run-1");
   assert.equal(ledger.stop?.reason, "repeated_no_progress");
   assert.equal(ledger.stop?.item_id, "100");
-  assert.equal(ledger.items["100"].recovery_budgets_remaining.default, 3, "class budget still had room when the run stopped");
+  assert.equal(ledger.items["100"].recovery_budgets_remaining["workflow-state"], 1, "class budget still had room (2 charged of 3) when the run stopped");
 });
 
 test("blockItem: a differing fingerprint resets the repeated-evidence count to zero", async () => {
@@ -385,10 +410,12 @@ test("blockItem: a differing fingerprint resets the repeated-evidence count to z
   let ledger = await readLedger(deps, "run-1");
   assert.equal(ledger.items["100"].repeated_evidence_count, 0);
 
+  await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["resync_workflow_state"], succeeded: true });
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "workflow-state", evidence: "stuck in review" });
   ledger = await readLedger(deps, "run-1");
   assert.equal(ledger.items["100"].repeated_evidence_count, 1);
 
+  await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["resync_workflow_state"], succeeded: true });
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "workflow-state", evidence: "a completely different failure now" });
   ledger = await readLedger(deps, "run-1");
   assert.equal(ledger.items["100"].repeated_evidence_count, 0);
@@ -398,8 +425,40 @@ test("blockItem: a differing fingerprint resets the repeated-evidence count to z
 test("blockItem: a stopped run refuses every further transition", async () => {
   const { deps, contract, token } = await setup();
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "workflow-state", evidence: "e" });
+  await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["resync_workflow_state"], succeeded: true });
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "workflow-state", evidence: "e" });
-  await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "workflow-state", evidence: "e" }); // stops the run
+  await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["resync_workflow_state"], succeeded: true });
+  await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "workflow-state", evidence: "e" }); // stops the run (repeat limit 2)
+  await assert.rejects(
+    () => blockItem(deps, contract, { runId: "run-1", token, itemId: "200", engine: "claude", blockerClass: "implementation-ci", evidence: "x" }),
+    (err: unknown) => {
+      assert.ok(err instanceof LoopError);
+      assert.equal(err.loopFailureClass, "stop");
+      return true;
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Run-fatal blockers stop the whole run at block time (#509 review round 2
+// finding 6ced9fe0).
+// ---------------------------------------------------------------------------
+
+test("blockItem: a run-fatal, retry-capable class (environment-auth) records a terminal run_fatal stop and refuses recovery", async () => {
+  const { deps, contract, token } = await setup();
+  const ledger = await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "environment-auth", evidence: "token expired" });
+  assert.equal(ledger.stop?.reason, "run_fatal");
+  assert.equal(ledger.stop?.item_id, "100");
+  assert.equal(ledger.items["100"].state, "blocked");
+
+  await assert.rejects(
+    () => recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["reauthenticate"], succeeded: true }),
+    (err: unknown) => {
+      assert.ok(err instanceof LoopError);
+      assert.equal(err.loopFailureClass, "stop");
+      return true;
+    },
+  );
   await assert.rejects(
     () => blockItem(deps, contract, { runId: "run-1", token, itemId: "200", engine: "claude", blockerClass: "implementation-ci", evidence: "x" }),
     (err: unknown) => {
@@ -417,7 +476,7 @@ test("blockItem: a stopped run refuses every further transition", async () => {
 test("recoverItem: budget is charged only on recovery, keyed by the item's blocker class", async () => {
   const { deps, contract, token } = await setup();
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed" });
-  const { ledger, attempt } = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["rerun_ci"] });
+  const { ledger, attempt } = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["rerun_ci"] , succeeded: true });
   assert.equal(attempt.outcome, "recovered");
   assert.equal(ledger.items["100"].recovery_budgets_remaining["implementation-ci"], 2, "class budget decremented from the policy's retry_budget of 3");
   assert.equal(ledger.items["100"].recovery_budgets_remaining.default, 3, "the unrelated default key is untouched");
@@ -428,7 +487,7 @@ test("recoverItem: a class budget with no ledger entry falls back to the POLICY'
   // "transient-rate-limit" has a policy retry_budget of 5 — the ledger's
   // seeded `default` of 3 must not shadow it.
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "transient-rate-limit", evidence: "429 rate limited" });
-  const { ledger, attempt } = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["wait_and_retry"] });
+  const { ledger, attempt } = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["wait_and_retry"] , succeeded: true });
   assert.equal(attempt.outcome, "recovered");
   assert.equal(ledger.items["100"].recovery_budgets_remaining["transient-rate-limit"], 4, "decremented from the policy's retry_budget of 5, not the ledger default of 3");
 });
@@ -437,7 +496,7 @@ test("recoverItem: an empty action list is refused for a retry-capable class —
   const { deps, contract, token } = await setup();
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed" });
   await assert.rejects(
-    () => recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: [] }),
+    () => recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: [] , succeeded: true }),
     (err: unknown) => {
       assert.ok(err instanceof LoopError);
       assert.equal(err.loopFailureClass, "validation");
@@ -458,18 +517,18 @@ test("recoverItem: exhausted class budget stops the run terminally", async () =>
   await import("../scripts/loop/store.ts").then((m) => m.writeLedger(deps, ledger, token));
 
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed again" });
-  const result = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["rerun_ci"] });
+  const result = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["rerun_ci"] , succeeded: true });
   assert.equal(result.attempt.outcome, "exhausted");
   assert.equal(result.ledger.stop?.reason, "recovery_exhausted");
   assert.equal(result.ledger.items["100"].state, "blocked", "item does not resume when its budget is exhausted");
 
-  await assert.rejects(() => recoverItem(deps, contract, { runId: "run-1", token, itemId: "200", engine: "claude", actions: [] }));
+  await assert.rejects(() => recoverItem(deps, contract, { runId: "run-1", token, itemId: "200", engine: "claude", actions: [] , succeeded: true }));
 });
 
 test("recoverItem: on success the same item resumes blocked -> in_progress, retaining history, class, and evidence", async () => {
   const { deps, contract, token } = await setup();
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed", note: "first block" });
-  const { ledger } = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["rerun_ci"] });
+  const { ledger } = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["rerun_ci"] , succeeded: true });
   const item = ledger.items["100"];
   assert.equal(item.state, "in_progress");
   assert.equal(item.blocked_theme, "implementation-ci", "blocker class is retained after recovery");
@@ -477,6 +536,29 @@ test("recoverItem: on success the same item resumes blocked -> in_progress, reta
   assert.ok(item.history.some((h) => h.to === "blocked" && h.note === "first block"), "prior history is retained");
   assert.ok(item.history.some((h) => h.from === "blocked" && h.to === "in_progress"), "resume is recorded on history");
   assert.equal(ledger.items["200"].state, "pending", "no other item was started in its place");
+});
+
+test("recoverItem: a failed recovery action is persisted as a failed attempt — it does not resume the item and does not charge budget", async () => {
+  const { deps, contract, token } = await setup();
+  await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed" });
+  const before = (await readLedger(deps, "run-1")).items["100"].recovery_budgets_remaining;
+
+  const { ledger, attempt } = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["rerun_ci"], succeeded: false });
+  assert.equal(attempt.outcome, "failed");
+  assert.equal(ledger.items["100"].state, "blocked", "a failed attempt does not falsely resume the item");
+  assert.deepEqual(ledger.items["100"].recovery_budgets_remaining, before, "no budget charged for a failed attempt");
+  assert.equal(ledger.stop, null, "a single failed attempt with budget remaining does not stop the run");
+
+  // Persisted even though it failed — the attempt record survives a resuming read.
+  const resumed = await readLedger(deps, "run-1");
+  assert.equal(resumed.recovery_attempts.length, 1);
+  assert.equal(resumed.recovery_attempts[0].outcome, "failed");
+
+  // A subsequent attempt can still succeed — the item was never falsely
+  // resumed, so a real recovery remains possible.
+  const second = await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["rerun_ci"], succeeded: true });
+  assert.equal(second.attempt.outcome, "recovered");
+  assert.equal(second.ledger.items["100"].state, "in_progress");
 });
 
 test("blockItem: missing-authority immediately records a terminal human_authority stop — no budget charged, no recipe attempted", async () => {
@@ -491,7 +573,7 @@ test("blockItem: missing-authority immediately records a terminal human_authorit
   // The terminal stop refuses every subsequent transition, including a
   // recovery attempt on the same item.
   await assert.rejects(
-    () => recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: [] }),
+    () => recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: [] , succeeded: true }),
     (err: unknown) => {
       assert.ok(err instanceof LoopError);
       assert.equal(err.loopFailureClass, "stop");
@@ -519,7 +601,7 @@ test("recoverItem: a recipe not permitted for the class is refused", async () =>
   const { deps, contract, token } = await setup();
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed" });
   await assert.rejects(
-    () => recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["reauthenticate"] }),
+    () => recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["reauthenticate"] , succeeded: true }),
     (err: unknown) => {
       assert.ok(err instanceof LoopError);
       assert.equal(err.loopFailureClass, "validation");
@@ -531,7 +613,7 @@ test("recoverItem: a recipe not permitted for the class is refused", async () =>
 test("recovery attempts persist in the ledger and survive a resuming read", async () => {
   const { deps, contract, token } = await setup();
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed" });
-  await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["rerun_ci"] });
+  await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["rerun_ci"] , succeeded: true });
 
   // A fresh read (as a resuming process would perform) sees the same history.
   const resumed = await readLedger(deps, "run-1");
@@ -546,7 +628,7 @@ test("recovery attempts persist in the ledger and survive a resuming read", asyn
 test("a Pipeline-native event is emitted for every recovery attempt", async () => {
   const { deps, contract, token } = await setup();
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed" });
-  await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["rerun_ci"] });
+  await recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["rerun_ci"] , succeeded: true });
   const events = (await import("../scripts/loop/store.ts")).readEvents;
   const log = await events(deps, "run-1");
   assert.ok(log.some((e) => e.kind === "loop_recovery_attempt"));
@@ -615,6 +697,75 @@ test("eligibleIndependentItems: the single-active-item invariant holds — no it
   ledger.items["100"].blocked_theme = "implementation-ci";
   ledger.items["200"].state = "in_progress";
   assert.deepEqual(eligibleIndependentItems(contract, ledger), []);
+});
+
+// ---------------------------------------------------------------------------
+// Pre-#509 durable-state migration (#509 review round 2 finding 9635d6fb): a
+// contract/ledger persisted before this capability existed has no
+// `recovery_policy` / `recovery_attempts` field and may carry a legacy
+// free-text `blocked_theme`.
+// ---------------------------------------------------------------------------
+
+test("upgradeContractForRecovery: a pre-#509 contract with no recovery_policy is defaulted, an already-compiled contract is untouched", () => {
+  const legacy = { ...testContract() } as Record<string, unknown>;
+  delete legacy.recovery_policy;
+  const upgraded = upgradeContractForRecovery(legacy as unknown as LoopContract);
+  assert.deepEqual(upgraded.recovery_policy, DEFAULT_RECOVERY_POLICY);
+
+  const compiled = testContract();
+  assert.equal(upgradeContractForRecovery(compiled), compiled, "an already-compiled contract is returned unchanged");
+});
+
+test("upgradeLedgerForRecovery: a pre-#509 ledger with no recovery_attempts is defaulted to an empty array", () => {
+  const legacy = { ...testLedger() } as Record<string, unknown>;
+  delete legacy.recovery_attempts;
+  const upgraded = upgradeLedgerForRecovery(legacy as unknown as LoopLedger);
+  assert.deepEqual(upgraded.recovery_attempts, []);
+});
+
+test("upgradeLedgerForRecovery: a legacy free-text blocked_theme is mapped onto its DurableBlockerClass", () => {
+  const legacy = testLedger();
+  legacy.items["100"] = { ...legacy.items["100"], state: "blocked", blocked_theme: "ci_failure" };
+  const upgraded = upgradeLedgerForRecovery(legacy);
+  assert.equal(upgraded.items["100"].blocked_theme, "implementation-ci");
+});
+
+test("upgradeLedgerForRecovery: an unmapped legacy theme is left as-is rather than guessed", () => {
+  const legacy = testLedger();
+  legacy.items["100"] = { ...legacy.items["100"], state: "blocked", blocked_theme: "something-nobody-ever-recorded" };
+  const upgraded = upgradeLedgerForRecovery(legacy);
+  assert.equal(upgraded.items["100"].blocked_theme, "something-nobody-ever-recorded");
+});
+
+test("recoverItem: a pre-#509 contract and ledger (missing recovery_policy / recovery_attempts, legacy blocked_theme) resume without faulting", async () => {
+  const { deps } = fakeDeps();
+  const legacyContract = { ...testContract() } as Record<string, unknown>;
+  delete legacyContract.recovery_policy;
+  const legacyLedger = {
+    ...testLedger(),
+    items: {
+      "100": { id: "100", state: "blocked", history: [], recovery_budgets_remaining: { default: 3 }, blocked_theme: "ci_failure" },
+      "200": { id: "200", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+    },
+  } as Record<string, unknown>;
+  delete legacyLedger.recovery_attempts;
+
+  await initRun(deps, legacyContract as unknown as LoopContract, legacyLedger as unknown as LoopLedger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const rawContract = await readContract(deps, "run-1");
+
+  const result = await recoverItem(deps, rawContract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    actions: ["rerun_ci"],
+    succeeded: true,
+  });
+  assert.equal(result.attempt.outcome, "recovered");
+  assert.equal(result.attempt.class, "implementation-ci", "the legacy theme 'ci_failure' migrated to its class");
+  assert.equal(result.ledger.items["100"].state, "in_progress");
+  assert.equal(result.ledger.recovery_attempts.length, 1, "recovery_attempts initialized rather than faulting on .push");
 });
 
 // ---------------------------------------------------------------------------
