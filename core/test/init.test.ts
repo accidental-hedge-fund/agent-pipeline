@@ -311,7 +311,7 @@ test("scaffoldDefaultConfig: scaffolded models: comment documents passthrough + 
   const repo = makeTempRepo();
   await scaffoldDefaultConfig(repo);
   const content = fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8");
-  const modelsLine = content.split("\n").find((line) => line.includes("per-phase model alias"));
+  const modelsLine = content.split("\n").find((line) => line.includes("Per-phase model alias"));
   assert.ok(modelsLine, "scaffold must include the models: comment line");
   assert.match(modelsLine!, /review is honored by both the claude and codex reviewer harnesses/);
   assert.match(modelsLine!, /config error/, "must state a Claude alias against a codex reviewer is a config error");

@@ -1724,55 +1724,115 @@ function hasOwn(obj: object | undefined, key: string): boolean {
   return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
 }
 
+// ---------------------------------------------------------------------------
+// Schema-sourced field descriptions (#504 review finding 1): a single
+// introspection helper so `renderConfigTemplate`'s "what this field does"
+// prose is sourced from the schema's own `.describe()` text rather than
+// hand-typed a second time, independently, in the renderer. The renderer
+// still owns its own layout job on top of this (default-value formatting,
+// active-vs-commented presentation, SECURITY notes, examples) — this helper
+// only answers "what does the schema say this field is for".
+// ---------------------------------------------------------------------------
+
+/** Unwrap zod v4 wrapper types (optional/default/nullable/prefault/readonly/
+ *  nonoptional — anything with a `def.innerType`) down to the underlying
+ *  structural (object/record/array/...) node. `.describe()` sets its meta on
+ *  the outermost wrapper, so callers must read `.description` BEFORE
+ *  unwrapping — this helper is only for descending into a node's shape. */
+function unwrapToStructural(node: unknown): any {
+  let current: any = node;
+  while (current?._zod?.def?.innerType !== undefined) {
+    current = current._zod.def.innerType;
+  }
+  return current;
+}
+
+/**
+ * Walk `PartialConfigSchema` by dotted path (e.g. "design_gate.limits.max_decisions")
+ * and return that field's `.describe()` text, or undefined if the path doesn't
+ * resolve to a schema node or that node has no description. This is the single
+ * source of truth `renderConfigTemplate` sources its base descriptive sentence
+ * from, so editing a schema `.describe()` call changes the rendered template's
+ * wording for that field without touching the renderer (drift-proof).
+ */
+export function schemaFieldDescription(dotPath: string): string | undefined {
+  const segments = dotPath.split(".");
+  let node: any = PartialConfigSchema;
+  for (let i = 0; i < segments.length; i++) {
+    const structural = unwrapToStructural(node);
+    const def = structural?._zod?.def;
+    let field: any;
+    if (def?.type === "object") {
+      field = structural.shape?.[segments[i]];
+    } else if (def?.type === "record") {
+      // Any key of a record maps to the same valueType description.
+      field = def.valueType;
+    } else {
+      return undefined;
+    }
+    if (field === undefined) return undefined;
+    if (i === segments.length - 1) return field.description;
+    node = field;
+  }
+  return undefined;
+}
+
+/** `schemaFieldDescription(dotPath)` with a literal fallback for paths that
+ *  don't carry a schema `.describe()` (structural/union fields, or fields not
+ *  yet described in the schema) — used at call sites that must always render
+ *  some comment text. */
+function sd(dotPath: string, fallback: string): string {
+  return schemaFieldDescription(dotPath) ?? fallback;
+}
+
 function renderModelLines(models: PartialConfig["models"]): string {
   const d = DEFAULT_CONFIG.models;
   const keys = ["planning", "implementing", "review", "fix", "intake", "sweep"] as const;
-  const comments: Record<typeof keys[number], string> = {
-    planning: "implementer harness",
-    implementing: "implementer harness",
-    review: "reviewer harness",
-    fix: "implementer harness",
-    intake: "intake spec-generation — always the claude harness (never inert)",
-    sweep: "sweep spec-generation — always the claude harness (never inert)",
-  };
+  const comment = (key: typeof keys[number]) => sd(`models.${key}`, key);
+  const baseHeader = sd(
+    "models",
+    "Per-phase model aliases. review is honored by both the claude and codex reviewer harnesses; planning/implementing/fix are honored only by the claude implementer harness (codex ignores them).",
+  );
+  // Renderer-owned addendum (#504 finding 1): behavioral nuance not captured
+  // by the schema's one-line `.describe()` — a Claude alias against a codex
+  // reviewer is a parse-time config error, not silently honored, and a
+  // custom reviewer/implementer CLI ignores its alias too (warns, inert).
+  const header = `${baseHeader} A Claude alias like "sonnet" against a codex reviewer is a config error, not honored. A custom reviewer/implementer CLI ignores its alias too — setting an inert one prints a warning.`;
   if (!models) {
     return [
-      "# models: # per-phase model alias. review is honored by both the claude and codex reviewer harnesses (a Claude alias like \"sonnet\" against a codex reviewer is a config error, not honored); planning/implementing/fix are honored only by the claude implementer harness (codex ignores them). A custom reviewer/implementer CLI ignores its alias too — setting an inert one prints a warning. Each key also accepts \"auto\" (#366). Uncomment to override.",
-      ...keys.map((key) => `#   ${key}: ${yamlScalar(d[key])} # ${comments[key]}`),
+      `# models: # ${header} Uncomment to override.`,
+      ...keys.map((key) => `#   ${key}: ${yamlScalar(d[key])} # ${comment(key)}`),
     ].join("\n");
   }
   return [
-    "models: # per-phase model alias. review is honored by both the claude and codex reviewer harnesses (a Claude alias like \"sonnet\" against a codex reviewer is a config error, not honored); planning/implementing/fix are honored only by the claude implementer harness (codex ignores them). A custom reviewer/implementer CLI ignores its alias too — setting an inert one prints a warning. Each key also accepts \"auto\".",
+    `models: # ${header}`,
     ...keys.map((key) =>
       hasOwn(models, key)
-        ? `  ${key}: ${yamlScalar(models[key])} # ${comments[key]}`
-        : `#   ${key}: ${yamlScalar(d[key])} # ${comments[key]}`,
+        ? `  ${key}: ${yamlScalar(models[key])} # ${comment(key)}`
+        : `#   ${key}: ${yamlScalar(d[key])} # ${comment(key)}`,
     ),
   ].join("\n");
 }
 
 function renderEffortLines(effort: PartialConfig["effort"]): string {
   const keys = ["planning", "implementing", "review", "fix", "intake", "sweep"] as const;
-  const comments: Record<typeof keys[number], string> = {
-    planning: "implementer harness — also sources plan-review's effort (Adversarial/Definitive)",
-    implementing: "implementer harness",
-    review: "reviewer harness — resolved round-aware (review-1 vs. review-2)",
-    fix: "implementer harness",
-    intake: "intake spec-generation — always the claude harness",
-    sweep: "sweep spec-generation — always the claude harness",
-  };
+  const comment = (key: typeof keys[number]) => sd(`effort.${key}`, key);
+  const header = sd(
+    "effort",
+    "per-phase reasoning-effort overrides: codex via -c model_reasoning_effort, claude via --effort (#366).",
+  );
   if (!effort) {
     return [
-      "# effort: # per-phase reasoning effort — codex via -c model_reasoning_effort, claude via --effort (#366). Each key also accepts \"auto\". Absent key: no flag (operator's global setting applies). Uncomment to override.",
-      ...keys.map((key) => `#   ${key}: medium # ${comments[key]}`),
+      `# effort: # ${header} Absent key: no flag (operator's global setting applies). Uncomment to override.`,
+      ...keys.map((key) => `#   ${key}: medium # ${comment(key)}`),
     ].join("\n");
   }
   return [
-    "effort: # per-phase reasoning effort — codex via -c model_reasoning_effort, claude via --effort (#366). Each key also accepts \"auto\".",
+    `effort: # ${header}`,
     ...keys.map((key) =>
       hasOwn(effort, key)
-        ? `  ${key}: ${yamlScalar(effort[key])} # ${comments[key]}`
-        : `#   ${key}: medium # ${comments[key]}`,
+        ? `  ${key}: ${yamlScalar(effort[key])} # ${comment(key)}`
+        : `#   ${key}: medium # ${comment(key)}`,
     ),
   ].join("\n");
 }
@@ -1780,14 +1840,18 @@ function renderEffortLines(effort: PartialConfig["effort"]): string {
 /** Render the `review_harness:` block for either the string shorthand or the
  *  structured `{ command, model?, effort? }` form (#366). */
 function renderReviewHarnessBlock(reviewHarness: PartialConfig["review_harness"]): string {
+  const topDescription = sd(
+    "review_harness",
+    "Override the reviewer CLI for the review step (profile default when absent).",
+  );
   if (reviewHarness === undefined) {
-    return "# review_harness: my-reviewer # override the reviewer CLI for the review step (default: the profile's reviewer). The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.\n#   Or a structured form for independent reviewer model/effort/prompt-delivery control:\n# review_harness:\n#   command: my-reviewer\n#   model: auto # or an explicit alias\n#   effort: auto # or an explicit level (round-aware: review-1 Iterative, review-2/plan-review Definitive)\n#   prompt_delivery: argv # or \"stdin\" if the CLI reads its prompt from standard input (avoids the OS per-argument size limit)";
+    return `# review_harness: my-reviewer # ${topDescription} The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.\n#   Or a structured form for independent reviewer model/effort/prompt-delivery control:\n# review_harness:\n#   command: my-reviewer\n#   model: auto # or an explicit alias\n#   effort: auto # or an explicit level (round-aware: review-1 Iterative, review-2/plan-review Definitive)\n#   prompt_delivery: argv # or \"stdin\" if the CLI reads its prompt from standard input (avoids the OS per-argument size limit)`;
   }
   if (typeof reviewHarness === "string") {
-    return `review_harness: ${yamlScalar(reviewHarness)} # override the reviewer CLI for the review step`;
+    return `review_harness: ${yamlScalar(reviewHarness)} # ${topDescription}`;
   }
   const lines = [
-    "review_harness: # override the reviewer CLI, and optionally its model/effort/prompt-delivery (#366, #492)",
+    `review_harness: # ${topDescription} (#366, #492)`,
     `  command: ${yamlScalar(reviewHarness.command)}`,
   ];
   if (reviewHarness.model !== undefined) lines.push(`  model: ${yamlScalar(reviewHarness.model)} # or "auto"`);
@@ -1820,54 +1884,77 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
   const loopCfg = { ...d.loop, ...config.loop };
   const papercuts = { ...d.papercuts, ...config.papercuts };
   const autoLoop = { ...d.auto_loop, ...config.auto_loop };
+  const designGate = { ...d.design_gate, ...config.design_gate, limits: { ...d.design_gate.limits, ...config.design_gate?.limits } };
+  const autoMergeEligibility = { ...d.auto_merge_eligibility, ...config.auto_merge_eligibility };
 
   const optionalTop: string[] = [];
-  if (config.repo !== undefined) optionalTop.push(renderMaybeScalar("repo", config.repo, "GitHub repo override (owner/name)"));
-  if (config.domain_name !== undefined) optionalTop.push(renderMaybeScalar("domain_name", config.domain_name, "human-readable project name used in prompts"));
-  if (config.domain_description !== undefined) optionalTop.push(renderMaybeScalar("domain_description", config.domain_description, "short project description used in prompts"));
-  if (config.conventions_md_path !== undefined) optionalTop.push(renderMaybeScalar("conventions_md_path", config.conventions_md_path, "repo-root-relative conventions file embedded in prompts"));
+  optionalTop.push(
+    config.repo !== undefined
+      ? renderMaybeScalar("repo", config.repo, sd("repo", "GitHub repo override (owner/name)"))
+      : `# repo: "owner/name" # ${sd("repo", "GitHub repo override (owner/name)")} Auto-detected from the git remote when absent.`,
+  );
+  optionalTop.push(
+    config.domain_name !== undefined
+      ? renderMaybeScalar("domain_name", config.domain_name, sd("domain_name", "human-readable project name used in prompts"))
+      : `# domain_name: "My Project" # ${sd("domain_name", "human-readable project name used in prompts")} Absent (default): no name substituted.`,
+  );
+  optionalTop.push(
+    config.domain_description !== undefined
+      ? renderMaybeScalar("domain_description", config.domain_description, sd("domain_description", "short project description used in prompts"))
+      : `# domain_description: "Short description of what this repo does" # ${sd("domain_description", "short project description used in prompts")} Absent by default.`,
+  );
+  optionalTop.push(
+    config.conventions_md_path !== undefined
+      ? renderMaybeScalar("conventions_md_path", config.conventions_md_path, sd("conventions_md_path", "repo-root-relative conventions file embedded in prompts"))
+      : `# conventions_md_path: "CONVENTIONS.md" # ${sd("conventions_md_path", "repo-root-relative conventions file embedded in stage prompts")} Absent by default (no conventions file embedded).`,
+  );
 
   const reviewPolicyOptional: string[] = [];
+  const riskProportionalDesc = sd("review_policy.risk_proportional", "when true and review-1 approved with 0 findings, review-2 only blocks on high/critical findings");
   if (hasOwn(config.review_policy, "risk_proportional")) {
-    reviewPolicyOptional.push(`  risk_proportional: ${yamlScalar(reviewPolicy.risk_proportional)} # when true and review-1 approved with 0 findings, review-2 only blocks on high/critical findings (#232)`);
+    reviewPolicyOptional.push(`  risk_proportional: ${yamlScalar(reviewPolicy.risk_proportional)} # ${riskProportionalDesc} (#232)`);
   } else {
-    reviewPolicyOptional.push(`  # risk_proportional: ${yamlScalar(d.review_policy.risk_proportional)} # when true and review-1 approved with 0 findings, review-2 only blocks on high/critical findings (#232)`);
+    reviewPolicyOptional.push(`  # risk_proportional: ${yamlScalar(d.review_policy.risk_proportional)} # ${riskProportionalDesc} (#232)`);
   }
+  const ceilingActionDesc = sd("review_policy.ceiling_action", "action at the max_adversarial_rounds round-budget ceiling");
   if (hasOwn(config.review_policy, "ceiling_action")) {
-    reviewPolicyOptional.push(`  ceiling_action: ${yamlScalar(reviewPolicy.ceiling_action)} # park | demote_and_advance (#233)`);
+    reviewPolicyOptional.push(`  ceiling_action: ${yamlScalar(reviewPolicy.ceiling_action)} # ${ceilingActionDesc} (#233)`);
   } else {
-    reviewPolicyOptional.push(`  # ceiling_action: ${yamlScalar(d.review_policy.ceiling_action)} # park (default): hard-park at needs-human; demote_and_advance: auto-demote below-high findings and advance (#233)`);
+    reviewPolicyOptional.push(`  # ceiling_action: ${yamlScalar(d.review_policy.ceiling_action)} # ${ceilingActionDesc} (#233)`);
   }
+  const surfaceRecurrenceDesc = sd("review_policy.surface_recurrence_rounds", "consecutive-round threshold for the same-surface recurrence guard; 0 disables");
   if (hasOwn(config.review_policy, "surface_recurrence_rounds")) {
-    reviewPolicyOptional.push(`  surface_recurrence_rounds: ${yamlScalar(reviewPolicy.surface_recurrence_rounds)} # same-surface recurrence guard; 0 disables (#234)`);
+    reviewPolicyOptional.push(`  surface_recurrence_rounds: ${yamlScalar(reviewPolicy.surface_recurrence_rounds)} # ${surfaceRecurrenceDesc} (#234)`);
   } else {
-    reviewPolicyOptional.push(`  # surface_recurrence_rounds: ${yamlScalar(d.review_policy.surface_recurrence_rounds)} # same-surface recurrence guard; 0 disables (#234)`);
+    reviewPolicyOptional.push(`  # surface_recurrence_rounds: ${yamlScalar(d.review_policy.surface_recurrence_rounds)} # ${surfaceRecurrenceDesc} (#234)`);
   }
 
   const parts = [
     source === "init"
       ? "# Pipeline configuration for this repo — created by `pipeline init`."
       : "# Pipeline configuration for this repo — synced with `pipeline config sync`.",
-    "# Every key is shown at its current default value; edit any line to override.",
-    "# Delete a key to fall back to the built-in default. Lines that are commented",
-    "# out (e.g. the `command:` entries) are optional overrides — uncomment to set.",
+    "# Every option accepted by the config schema is documented below: either active",
+    "# at its resolved default value, or shown commented-out as an opt-in example with",
+    "# its default/absence semantics explained. Edit an active line to override; delete",
+    "# it to fall back to the built-in default. Uncomment any commented example to opt",
+    "# in — every example as written is schema-valid.",
     "",
     ...optionalTop,
     optionalTop.length ? "" : undefined,
-    `base_branch: ${yamlScalar(config.base_branch ?? d.base_branch)} # branch PRs target and worktrees branch from`,
-    `worktree_root: ${yamlScalar(config.worktree_root ?? d.worktree_root)} # dir (relative to repo) holding pipeline worktrees`,
-    `max_concurrent_worktrees: ${yamlScalar(config.max_concurrent_worktrees ?? d.max_concurrent_worktrees)} # cap on simultaneous in-flight worktrees`,
-    `auto_recovery_max_retries: ${yamlScalar(config.auto_recovery_max_retries ?? d.auto_recovery_max_retries)} # auto-recovery attempts when implementation blocks`,
-    `implementation_timeout: ${yamlScalar(config.implementation_timeout ?? d.implementation_timeout)} # seconds for the implementation harness`,
-    `review_timeout: ${yamlScalar(config.review_timeout ?? d.review_timeout)} # seconds per review stage`,
-    `plan_review_timeout: ${yamlScalar(config.plan_review_timeout ?? d.plan_review_timeout)} # seconds for the plan-review harness (shorter cap; fails fast on runaway review)`,
-    `fix_timeout: ${yamlScalar(config.fix_timeout ?? d.fix_timeout)} # seconds per fix stage`,
-    `intake_timeout: ${yamlScalar(config.intake_timeout ?? d.intake_timeout)} # seconds for the intake harness call before timing out`,
-    `sweep_timeout: ${yamlScalar(config.sweep_timeout ?? d.sweep_timeout)} # seconds for the sweep harness call before timing out`,
-    `ci_timeout: ${yamlScalar(config.ci_timeout ?? d.ci_timeout)} # seconds to wait for CI at pre-merge`,
-    `ci_poll_interval: ${yamlScalar(config.ci_poll_interval ?? d.ci_poll_interval)} # seconds between CI status polls`,
-    `ci_no_run_grace_s: ${yamlScalar(config.ci_no_run_grace_s ?? d.ci_no_run_grace_s)} # seconds to wait before checking for zero check-runs when CI appears pending; set to 0 to check immediately`,
-    `ci_mode: ${yamlScalar(config.ci_mode ?? d.ci_mode)} # github (default): wait for GitHub Actions check-runs; local: rely on the current run's local test-gate result and skip the GitHub Actions wait`,
+    `base_branch: ${yamlScalar(config.base_branch ?? d.base_branch)} # ${sd("base_branch", "branch PRs target and worktrees branch from")}`,
+    `worktree_root: ${yamlScalar(config.worktree_root ?? d.worktree_root)} # ${sd("worktree_root", "dir (relative to repo) holding pipeline worktrees")}`,
+    `max_concurrent_worktrees: ${yamlScalar(config.max_concurrent_worktrees ?? d.max_concurrent_worktrees)} # ${sd("max_concurrent_worktrees", "cap on simultaneous in-flight worktrees")}`,
+    `auto_recovery_max_retries: ${yamlScalar(config.auto_recovery_max_retries ?? d.auto_recovery_max_retries)} # ${sd("auto_recovery_max_retries", "auto-recovery attempts when implementation blocks")}`,
+    `implementation_timeout: ${yamlScalar(config.implementation_timeout ?? d.implementation_timeout)} # ${sd("implementation_timeout", "seconds for the implementation harness")}`,
+    `review_timeout: ${yamlScalar(config.review_timeout ?? d.review_timeout)} # ${sd("review_timeout", "seconds per review stage")}`,
+    `plan_review_timeout: ${yamlScalar(config.plan_review_timeout ?? d.plan_review_timeout)} # ${sd("plan_review_timeout", "seconds for the plan-review harness")} (shorter cap; fails fast on runaway review)`,
+    `fix_timeout: ${yamlScalar(config.fix_timeout ?? d.fix_timeout)} # ${sd("fix_timeout", "seconds per fix stage")}`,
+    `intake_timeout: ${yamlScalar(config.intake_timeout ?? d.intake_timeout)} # ${sd("intake_timeout", "seconds for the intake harness call before timing out")}`,
+    `sweep_timeout: ${yamlScalar(config.sweep_timeout ?? d.sweep_timeout)} # ${sd("sweep_timeout", "seconds for the sweep harness call before timing out")}`,
+    `ci_timeout: ${yamlScalar(config.ci_timeout ?? d.ci_timeout)} # ${sd("ci_timeout", "seconds to wait for CI at pre-merge")}`,
+    `ci_poll_interval: ${yamlScalar(config.ci_poll_interval ?? d.ci_poll_interval)} # ${sd("ci_poll_interval", "seconds between CI status polls")}`,
+    `ci_no_run_grace_s: ${yamlScalar(config.ci_no_run_grace_s ?? d.ci_no_run_grace_s)} # ${sd("ci_no_run_grace_s", "seconds to wait before checking for zero check-runs when CI appears pending; set to 0 to check immediately")}`,
+    `ci_mode: ${yamlScalar(config.ci_mode ?? d.ci_mode)} # ${sd("ci_mode", "github (default): wait for GitHub Actions check-runs; local: rely on the current run's local test-gate result and skip the GitHub Actions wait")}`,
     "",
     renderModelLines(config.models),
     "",
@@ -1876,117 +1963,145 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     renderReviewHarnessBlock(config.review_harness),
     "",
     "openspec:",
-    `  enabled: ${yamlScalar(openspec.enabled)} # auto | on | off`,
-    `  bootstrap: ${yamlScalar(openspec.bootstrap)} # if true, run \`openspec init\` on repos lacking openspec/`,
+    `  enabled: ${yamlScalar(openspec.enabled)} # ${sd("openspec.enabled", "auto | on | off")}`,
+    `  bootstrap: ${yamlScalar(openspec.bootstrap)} # ${sd("openspec.bootstrap", "if true, run `openspec init` on repos lacking openspec/")}`,
     "",
     "last30days:",
-    `  enabled: ${yamlScalar(last30days.enabled)} # opt-in pre-planning activity brief`,
-    `  timeout: ${yamlScalar(last30days.timeout)} # seconds`,
+    `  enabled: ${yamlScalar(last30days.enabled)} # ${sd("last30days.enabled", "opt-in pre-planning activity brief")}`,
+    `  timeout: ${yamlScalar(last30days.timeout)} # ${sd("last30days.timeout", "seconds")}`,
     "",
     "steps: # turn optional steps off for speed/preference (default: all on)",
-    `  plan_review: ${yamlScalar(steps.plan_review)} # cross-harness review of the plan before coding`,
-    `  standard_review: ${yamlScalar(steps.standard_review)} # review-1 (and its fix round)`,
-    `  adversarial_review: ${yamlScalar(steps.adversarial_review)} # review-2 (and its fix round)`,
-    `  docs: ${yamlScalar(steps.docs)} # include the docs-update instruction in the implementing prompt`,
+    `  plan_review: ${yamlScalar(steps.plan_review)} # ${sd("steps.plan_review", "cross-harness review of the plan before coding")}`,
+    `  standard_review: ${yamlScalar(steps.standard_review)} # ${sd("steps.standard_review", "review-1 (and its fix round)")}`,
+    `  adversarial_review: ${yamlScalar(steps.adversarial_review)} # ${sd("steps.adversarial_review", "review-2 (and its fix round)")}`,
+    `  docs: ${yamlScalar(steps.docs)} # ${sd("steps.docs", "include the docs-update instruction in the implementing prompt")}`,
+    "",
+    config.design_gate !== undefined
+      ? [
+        "design_gate: # risk-triggered design-interrogation gate (#436)",
+        `  enabled: ${yamlScalar(designGate.enabled)} # ${sd("design_gate.enabled", "set true to enable")}`,
+        `  triggers: ${yamlInline(designGate.triggers)} # ${sd("design_gate.triggers", "built-in risk classes armed for trigger evaluation")}; known: ${DESIGN_GATE_TRIGGER_CLASSES.join(", ")}`,
+        `  extra_triggers: ${yamlInline(designGate.extra_triggers)} # ${sd("design_gate.extra_triggers", "{trigger_class: [path globs]} merged into a named class")}`,
+        `  max_rounds: ${yamlScalar(designGate.max_rounds)} # ${sd("design_gate.max_rounds", "interrogation/response rounds before parking at needs-human")}`,
+        `  block_threshold: ${yamlScalar(designGate.block_threshold)} # ${sd("design_gate.block_threshold", "critical|high|medium|low — challenges at/above this block advancement")}`,
+        `  min_confidence: ${yamlScalar(designGate.min_confidence)} # ${sd("design_gate.min_confidence", "0..1 — challenges below this confidence advise, not block")}`,
+        "  limits: # size bounds for the decision-record artifact",
+        `    max_decisions: ${yamlScalar(designGate.limits.max_decisions)} # ${sd("design_gate.limits.max_decisions", "max decisions retained per record")}`,
+        `    max_field_chars: ${yamlScalar(designGate.limits.max_field_chars)} # ${sd("design_gate.limits.max_field_chars", "max characters per free-text field before truncation")}`,
+        `    max_artifact_bytes: ${yamlScalar(designGate.limits.max_artifact_bytes)} # ${sd("design_gate.limits.max_artifact_bytes", "max persisted artifact size in bytes")}`,
+      ].join("\n")
+      : [
+        "# design_gate: # risk-triggered design-interrogation gate (#436). Disabled by default.",
+        `#   enabled: ${yamlScalar(d.design_gate.enabled)} # ${sd("design_gate.enabled", "set true to enable")}`,
+        `#   triggers: ${yamlInline(d.design_gate.triggers)} # ${sd("design_gate.triggers", "built-in risk classes armed for trigger evaluation")}; known: ${DESIGN_GATE_TRIGGER_CLASSES.join(", ")}`,
+        `#   extra_triggers: {} # ${sd("design_gate.extra_triggers", "{trigger_class: [path globs]} merged into a named class")}, e.g. {storage: ["db/migrations/**"]}`,
+        `#   max_rounds: ${yamlScalar(d.design_gate.max_rounds)} # ${sd("design_gate.max_rounds", "interrogation/response rounds before parking at needs-human")}`,
+        `#   block_threshold: ${yamlScalar(d.design_gate.block_threshold)} # ${sd("design_gate.block_threshold", "critical|high|medium|low — challenges at/above this block advancement")}`,
+        `#   min_confidence: ${yamlScalar(d.design_gate.min_confidence)} # ${sd("design_gate.min_confidence", "0..1 — challenges below this confidence advise, not block")}`,
+        "#   limits: # size bounds for the decision-record artifact",
+        `#     max_decisions: ${yamlScalar(d.design_gate.limits.max_decisions)} # ${sd("design_gate.limits.max_decisions", "max decisions retained per record")}`,
+        `#     max_field_chars: ${yamlScalar(d.design_gate.limits.max_field_chars)} # ${sd("design_gate.limits.max_field_chars", "max characters per free-text field before truncation")}`,
+        `#     max_artifact_bytes: ${yamlScalar(d.design_gate.limits.max_artifact_bytes)} # ${sd("design_gate.limits.max_artifact_bytes", "max persisted artifact size in bytes")}`,
+      ].join("\n"),
     "",
     "test_gate: # run the repo's tests/build before opening a PR",
-    `  enabled: ${yamlScalar(testGate.enabled)} # set false to disable entirely`,
+    `  enabled: ${yamlScalar(testGate.enabled)} # ${sd("test_gate.enabled", "set false to disable entirely")}`,
     testGate.command !== undefined
-      ? `  command: ${yamlScalar(testGate.command)} # explicit command; auto-detected when absent`
-      : "  # command: pnpm test # explicit command; auto-detected when absent",
-    `  max_attempts: ${yamlScalar(testGate.max_attempts)} # fix-harness invocations before blocking`,
-    `  timeout: ${yamlScalar(testGate.timeout)} # seconds per test/build run`,
+      ? `  command: ${yamlScalar(testGate.command)} # ${sd("test_gate.command", "explicit command; auto-detected when absent")}`
+      : `  # command: pnpm test # ${sd("test_gate.command", "explicit command; auto-detected when absent")}`,
+    `  max_attempts: ${yamlScalar(testGate.max_attempts)} # ${sd("test_gate.max_attempts", "fix-harness invocations before blocking")}`,
+    `  timeout: ${yamlScalar(testGate.timeout)} # ${sd("test_gate.timeout", "seconds per test/build run")}`,
     "",
     "visual_gate: # run the repo's E2E/visual suite after pre-merge and before eval-gate",
-    `  enabled: ${yamlScalar(visualGate.enabled)} # set true to enable (one-time declaration per repo)`,
+    `  enabled: ${yamlScalar(visualGate.enabled)} # ${sd("visual_gate.enabled", "set true to enable (one-time declaration per repo)")}`,
     visualGate.command !== undefined
-      ? `  command: ${yamlScalar(visualGate.command)} # shell command to run; required when enabled`
-      : "  # command: npx playwright test # shell command to run; required when enabled",
-    `  mode: ${yamlScalar(visualGate.mode)} # gate: block on fail | advisory: record and advance`,
-    `  timeout: ${yamlScalar(visualGate.timeout)} # stage-level budget in seconds (shared across attempts)`,
-    `  max_attempts: ${yamlScalar(visualGate.max_attempts)} # total attempts before giving up (1 = no retry)`,
-    `  artifacts_dir: ${yamlScalar(visualGate.artifacts_dir)} # worktree-relative dir the command writes screenshots/diffs/traces into`,
-    `  publish: ${yamlScalar(visualGate.publish)} # commit captured artifacts to the PR branch as a bounded, pipeline-internal commit so they render on the PR (repo-history tradeoff — see README)`,
+      ? `  command: ${yamlScalar(visualGate.command)} # ${sd("visual_gate.command", "shell command to run the E2E/visual suite (required when enabled)")}`
+      : `  # command: npx playwright test # ${sd("visual_gate.command", "shell command to run the E2E/visual suite (required when enabled)")}`,
+    `  mode: ${yamlScalar(visualGate.mode)} # ${sd("visual_gate.mode", "gate: block on failure; advisory: record result and advance")}`,
+    `  timeout: ${yamlScalar(visualGate.timeout)} # ${sd("visual_gate.timeout", "stage-level budget in seconds (shared across attempts)")}`,
+    `  max_attempts: ${yamlScalar(visualGate.max_attempts)} # ${sd("visual_gate.max_attempts", "total attempts before giving up (1 = no retry)")}`,
+    `  artifacts_dir: ${yamlScalar(visualGate.artifacts_dir)} # ${sd("visual_gate.artifacts_dir", "worktree-relative dir the command writes screenshots/diffs/traces into")}`,
+    `  publish: ${yamlScalar(visualGate.publish)} # ${sd("visual_gate.publish", "publish the deciding run's captured artifacts to the PR branch as a bounded, pipeline-internal commit")} (repo-history tradeoff — see README)`,
     "",
     "eval_gate: # run the repo's eval harness after pre-merge",
-    `  enabled: ${yamlScalar(evalGate.enabled)} # set true to enable (one-time declaration per repo)`,
+    `  enabled: ${yamlScalar(evalGate.enabled)} # ${sd("eval_gate.enabled", "set true to enable (one-time declaration per repo)")}`,
     evalGate.command !== undefined
-      ? `  command: ${yamlScalar(evalGate.command)} # shell command to run; required when enabled`
-      : "  # command: pnpm evals # shell command to run; required when enabled",
-    `  mode: ${yamlScalar(evalGate.mode)} # gate: block on fail | advisory: record and advance`,
-    `  timeout: ${yamlScalar(evalGate.timeout)} # stage-level budget in seconds (shared across attempts)`,
-    `  max_attempts: ${yamlScalar(evalGate.max_attempts)} # total attempts before giving up (1 = no retry)`,
+      ? `  command: ${yamlScalar(evalGate.command)} # ${sd("eval_gate.command", "shell command to run evals (required when enabled)")}`
+      : `  # command: pnpm evals # ${sd("eval_gate.command", "shell command to run evals (required when enabled)")}`,
+    `  mode: ${yamlScalar(evalGate.mode)} # ${sd("eval_gate.mode", "gate: block on failure; advisory: record result and advance")}`,
+    `  timeout: ${yamlScalar(evalGate.timeout)} # ${sd("eval_gate.timeout", "stage-level budget in seconds (shared across attempts)")}`,
+    `  max_attempts: ${yamlScalar(evalGate.max_attempts)} # ${sd("eval_gate.max_attempts", "total attempts before giving up (1 = no retry)")}`,
     "",
     config.shipcheck_gate !== undefined
       ? [
         "shipcheck_gate: # reviewer-owned acceptance rubric after eval-gate (#148)",
-        `  enabled: ${yamlScalar(shipcheckGate.enabled)} # set true to enable`,
-        `  mode: ${yamlScalar(shipcheckGate.mode)} # advisory: record findings without blocking | gate: block on fail`,
-        `  max_rounds: ${yamlScalar(shipcheckGate.max_rounds)} # max reviewer invocations before needs-human`,
-        `  rubric_path: ${yamlScalar(shipcheckGate.rubric_path)} # repo-root-relative path to Markdown rubric file`,
-        `  block_on_partial: ${yamlScalar(shipcheckGate.block_on_partial)} # when true and mode=gate, partial verdict also blocks`,
+        `  enabled: ${yamlScalar(shipcheckGate.enabled)} # ${sd("shipcheck_gate.enabled", "set true to enable")}`,
+        `  mode: ${yamlScalar(shipcheckGate.mode)} # ${sd("shipcheck_gate.mode", "advisory: record findings without blocking; gate: block on failure")}`,
+        `  max_rounds: ${yamlScalar(shipcheckGate.max_rounds)} # ${sd("shipcheck_gate.max_rounds", "maximum reviewer invocations before routing to needs-human")}`,
+        `  rubric_path: ${yamlScalar(shipcheckGate.rubric_path)} # ${sd("shipcheck_gate.rubric_path", "repo-root-relative path to the Markdown rubric file")}`,
+        `  block_on_partial: ${yamlScalar(shipcheckGate.block_on_partial)} # ${sd("shipcheck_gate.block_on_partial", "when true and mode=gate, a partial verdict also blocks")}`,
       ].join("\n")
       : [
         "# shipcheck_gate: # reviewer-owned acceptance rubric after eval-gate (#148). Disabled by default.",
-        `#   enabled: ${yamlScalar(d.shipcheck_gate.enabled)} # set true to enable`,
-        `#   mode: ${yamlScalar(d.shipcheck_gate.mode)} # advisory: record findings without blocking | gate: block on fail`,
-        `#   max_rounds: ${yamlScalar(d.shipcheck_gate.max_rounds)} # max reviewer invocations before needs-human`,
-        `#   rubric_path: ${yamlScalar(d.shipcheck_gate.rubric_path)} # repo-root-relative path to Markdown rubric file`,
-        `#   block_on_partial: ${yamlScalar(d.shipcheck_gate.block_on_partial)} # when true and mode=gate, partial verdict also blocks`,
+        `#   enabled: ${yamlScalar(d.shipcheck_gate.enabled)} # ${sd("shipcheck_gate.enabled", "set true to enable")}`,
+        `#   mode: ${yamlScalar(d.shipcheck_gate.mode)} # ${sd("shipcheck_gate.mode", "advisory: record findings without blocking; gate: block on failure")}`,
+        `#   max_rounds: ${yamlScalar(d.shipcheck_gate.max_rounds)} # ${sd("shipcheck_gate.max_rounds", "maximum reviewer invocations before routing to needs-human")}`,
+        `#   rubric_path: ${yamlScalar(d.shipcheck_gate.rubric_path)} # ${sd("shipcheck_gate.rubric_path", "repo-root-relative path to the Markdown rubric file")}`,
+        `#   block_on_partial: ${yamlScalar(d.shipcheck_gate.block_on_partial)} # ${sd("shipcheck_gate.block_on_partial", "when true and mode=gate, a partial verdict also blocks")}`,
       ].join("\n"),
     "",
     "review_policy: # which review findings block progression vs. merely advise (#17)",
-    `  block_threshold: ${yamlScalar(reviewPolicy.block_threshold)} # critical|high|medium|low — findings below this advise, not block (set 'low' to block on every finding)`,
-    `  min_confidence: ${yamlScalar(reviewPolicy.min_confidence)} # 0..1 — findings below this confidence advise, not block`,
-    `  max_adversarial_rounds: ${yamlScalar(reviewPolicy.max_adversarial_rounds)} # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to needs-human`,
-    `  max_delta_rounds: ${yamlScalar(reviewPolicy.max_delta_rounds)} # cap pre-merge delta review rounds per item (#483), counted from the issue's delta-review comment thread; independent of max_adversarial_rounds`,
+    `  block_threshold: ${yamlScalar(reviewPolicy.block_threshold)} # ${sd("review_policy.block_threshold", "findings at or above this severity block progression; below advise only")}`,
+    `  min_confidence: ${yamlScalar(reviewPolicy.min_confidence)} # ${sd("review_policy.min_confidence", "findings below this confidence score (0-1) advise rather than block")}`,
+    `  max_adversarial_rounds: ${yamlScalar(reviewPolicy.max_adversarial_rounds)} # ${sd("review_policy.max_adversarial_rounds", "maximum adversarial review re-runs before routing still-blocking findings to needs-human")}`,
+    `  max_delta_rounds: ${yamlScalar(reviewPolicy.max_delta_rounds)} # ${sd("review_policy.max_delta_rounds", "cap on pre-merge delta review rounds per item (#483)")}`,
     ...reviewPolicyOptional,
     "",
     "doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here",
-    `  runOnStart: ${yamlScalar(doctor.runOnStart)} # if true, run the preflight checks before planning and abort the run on any failure`,
-    `  failFast: ${yamlScalar(doctor.failFast)} # if true, stop at the first failing check instead of collecting all failures`,
+    `  runOnStart: ${yamlScalar(doctor.runOnStart)} # ${sd("doctor.runOnStart", "run preflight checks before planning; abort on any failure")}`,
+    `  failFast: ${yamlScalar(doctor.failFast)} # ${sd("doctor.failFast", "stop at the first failing check instead of collecting all failures")}`,
     "",
     config.loop !== undefined
       ? `loop: # pipeline:loop native-goal capability attestation (#506)\n${yamlBlock(config.loop, 2)}`
       : [
         "# loop: # pipeline:loop native-goal capability attestation (#506) — uncomment to override automatic detection",
-        `#   native_goal_attestation: ${yamlScalar(loopCfg.native_goal_attestation)} # auto (default): detect via --help marker / version floor | available|unavailable: explicit operator override`,
+        `#   native_goal_attestation: ${yamlScalar(loopCfg.native_goal_attestation)} # ${sd("loop.native_goal_attestation", "auto (default) detects automatically; available/unavailable overrides detection")}`,
       ].join("\n"),
     "",
     config.papercuts !== undefined
       ? `papercuts: # agent-logged minor-friction capture (#419) — opt in to record friction via 'pipeline papercut' without stopping the run\n${yamlBlock(config.papercuts, 2)}`
       : [
         "# papercuts: # agent-logged minor-friction capture (#419) — uncomment to enable 'pipeline papercut' and its prompt instruction",
-        "#   enabled: true",
-        "#   auto_file: false # opt in (#421) to auto-file pipeline:backlog issues for recurring papercut clusters at run_complete and queue-batch end",
-        `#   auto_file_window_hours: ${yamlScalar(papercuts.auto_file_window_hours)} # trailing window over which papercuts are clustered for auto-filing`,
-        `#   auto_file_max_per_window: ${yamlScalar(papercuts.auto_file_max_per_window)} # max issues auto-filed within the window`,
-        `#   auto_file_min_occurrences: ${yamlScalar(papercuts.auto_file_min_occurrences)} # min in-window occurrences a cluster must meet to be auto-filed`,
+        `#   enabled: true # ${sd("papercuts.enabled", "gate the papercut instruction into prompts and pass run/stage identity to harness child processes")}`,
+        `#   auto_file: false # ${sd("papercuts.auto_file", "opt in (#421) to auto-file pipeline:backlog issues for recurring papercut clusters at run_complete and queue-batch end")}`,
+        `#   auto_file_window_hours: ${yamlScalar(papercuts.auto_file_window_hours)} # ${sd("papercuts.auto_file_window_hours", "trailing window (hours) over which papercut events are clustered for auto-filing")}`,
+        `#   auto_file_max_per_window: ${yamlScalar(papercuts.auto_file_max_per_window)} # ${sd("papercuts.auto_file_max_per_window", "maximum number of issues auto-filed within the trailing window")}`,
+        `#   auto_file_min_occurrences: ${yamlScalar(papercuts.auto_file_min_occurrences)} # ${sd("papercuts.auto_file_min_occurrences", "minimum in-window occurrence count a papercut cluster must meet to be auto-filed")}`,
       ].join("\n"),
     "",
     config.auto_loop !== undefined
       ? [
-        "auto_loop: # bounded auto-loop mode (#149)",
-        `  enabled: ${yamlScalar(autoLoop.enabled)} # set true to enable`,
-        `  max_rounds: ${yamlScalar(autoLoop.max_rounds)} # maximum automatic continuations per run before parking at needs-human`,
-        `  max_wallclock_minutes: ${yamlScalar(autoLoop.max_wallclock_minutes)} # wall-clock budget in minutes (independent of max_rounds)`,
-        `  stages: ${yamlInline(autoLoop.stages)} # allowlisted stages eligible for automatic continuation`,
+        "auto_loop: # bounded auto-loop mode (#149) — SECURITY: grants automatic continuation authority at allowlisted stages within bounded rounds/wall-clock; never grants merge/deploy/publish authority or bypasses a human checkpoint",
+        `  enabled: ${yamlScalar(autoLoop.enabled)} # ${sd("auto_loop.enabled", "enable bounded auto-loop mode (default false)")}`,
+        `  max_rounds: ${yamlScalar(autoLoop.max_rounds)} # ${sd("auto_loop.max_rounds", "maximum automatic continuations per run before parking at needs-human")}`,
+        `  max_wallclock_minutes: ${yamlScalar(autoLoop.max_wallclock_minutes)} # ${sd("auto_loop.max_wallclock_minutes", "wall-clock budget in minutes; independent of max_rounds")}`,
+        `  stages: ${yamlInline(autoLoop.stages)} # ${sd("auto_loop.stages", "pipeline stages eligible for automatic continuation when a recoverable stop occurs")}`,
       ].join("\n")
       : [
-        "# auto_loop: # bounded auto-loop mode (#149) — opt-in; disabled by default",
-        `#   enabled: ${yamlScalar(d.auto_loop.enabled)} # set true to enable; when false (default) the advance loop is byte-for-byte unchanged`,
-        `#   max_rounds: ${yamlScalar(d.auto_loop.max_rounds)} # maximum automatic continuations per run before parking at needs-human`,
-        `#   max_wallclock_minutes: ${yamlScalar(d.auto_loop.max_wallclock_minutes)} # wall-clock budget in minutes (independent of max_rounds)`,
-        "#   # stages: [eval-gate, shipcheck-gate] # allowlisted stages eligible for automatic continuation",
+        "# auto_loop: # bounded auto-loop mode (#149) — opt-in; disabled by default. SECURITY: grants automatic continuation authority at allowlisted stages within bounded rounds/wall-clock; never grants merge/deploy/publish authority or bypasses a human checkpoint.",
+        `#   enabled: ${yamlScalar(d.auto_loop.enabled)} # ${sd("auto_loop.enabled", "enable bounded auto-loop mode (default false)")}; when false (default) the advance loop is byte-for-byte unchanged`,
+        `#   max_rounds: ${yamlScalar(d.auto_loop.max_rounds)} # ${sd("auto_loop.max_rounds", "maximum automatic continuations per run before parking at needs-human")}`,
+        `#   max_wallclock_minutes: ${yamlScalar(d.auto_loop.max_wallclock_minutes)} # ${sd("auto_loop.max_wallclock_minutes", "wall-clock budget in minutes; independent of max_rounds")}`,
+        "#   stages: [eval-gate, shipcheck-gate] # allowlisted stages eligible for automatic continuation",
         "#   #   Known stages: backlog, ready, planning, plan-review, implementing,",
         "#   #                 review-1, fix-1, review-2, fix-2, pre-merge, eval-gate,",
         "#   #                 shipcheck-gate, ready-to-deploy, needs-human",
       ].join("\n"),
     "",
     config.setup_command !== undefined
-      ? `setup_command: ${yamlScalar(config.setup_command)} # shell command to run in the worktree after creation, before the test gate; empty string skips`
+      ? `setup_command: ${yamlScalar(config.setup_command)} # SECURITY: runs an arbitrary shell command in the worktree with the harness's permissions, before the test gate; empty string skips`
       : [
-        '# setup_command: "pnpm install" # shell command to run in the worktree after creation, before the test gate (#174)',
+        '# setup_command: "pnpm install" # shell command to run in the worktree after creation, before the test gate (#174). SECURITY: runs with the harness\'s permissions — treat like any other repo-controlled build step.',
         "#   Auto-detected from lockfile when absent (pnpm-lock.yaml -> pnpm install, yarn.lock -> yarn install, package-lock.json -> npm ci)",
         '#   Set to "" to skip the install step entirely (opt-out). Examples:',
         '#     setup_command: ""                                       # opt-out',
@@ -1995,9 +2110,9 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       ].join("\n"),
     "",
     config.build_command !== undefined
-      ? `build_command: ${yamlScalar(config.build_command)} # shell command run after fix/auto-fix edits; its output is folded into the round commit`
+      ? `build_command: ${yamlScalar(config.build_command)} # SECURITY: runs an arbitrary shell command with the harness's permissions after fix/auto-fix edits; its output is folded into the round commit`
       : [
-        '# build_command: "npm run build" # repo build command run after fix/auto-fix edits (#387)',
+        '# build_command: "npm run build" # repo build command run after fix/auto-fix edits (#387). SECURITY: runs with the harness\'s permissions — treat like any other repo-controlled build step.',
         "#   When declared, fix and auto-fix rounds run it after committing source edits and fold any",
         "#   resulting generated-artifact changes (dist/, a plugin manifest, …) into the round commit,",
         "#   so committed artifacts stay fresh and a CI artifact-drift check never fails on drift the",
@@ -2005,9 +2120,9 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       ].join("\n"),
     "",
     renderOptionalArray("format_gate", config.format_gate, [
-      "# format_gate: [] # run formatter/linter commands after the implementing and fix-round harnesses (#182)",
-      "#   Each entry runs in the worktree root. auto_fix: true commits any changes and re-runs to verify;",
-      "#   auto_fix: false blocks immediately on non-zero exit. Default: [] (no gate; existing behavior).",
+      "# format_gate: [] # run formatter/linter commands after the implementing and fix-round harnesses (#182). SECURITY: each command runs an arbitrary shell command with the harness's permissions.",
+      '#   Each entry runs in the worktree root; "auto_fix: true" commits any changes and re-runs to verify,',
+      '#   "auto_fix: false" blocks immediately on non-zero exit. Default: [] (no gate; existing behavior).',
       "#   Examples (Rust repo):",
       "#     - command: cargo fmt",
       "#       auto_fix: true",
@@ -2019,33 +2134,104 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     ]),
     "",
     config.harness_sandbox !== undefined
-      ? `harness_sandbox: ${yamlScalar(config.harness_sandbox)} # set true to run the claude implementer with --permission-mode default`
+      ? `harness_sandbox: ${yamlScalar(config.harness_sandbox)} # SECURITY: set true to run the claude implementer with --permission-mode default (sandboxed) instead of bypassPermissions`
       : [
-        "# harness_sandbox: false # set true to run the claude implementer with --permission-mode default",
+        "# harness_sandbox: false # SECURITY: set true to run the claude implementer with --permission-mode default (sandboxed)",
         "#   instead of bypassPermissions (#21). The codex harness is already sandboxed",
         "#   via --full-auto and is unaffected. Default false -> current invocation unchanged.",
       ].join("\n"),
     "",
     config.event_sink !== undefined
-      ? `event_sink: # optional external event sink (#343) — deliver run events.jsonl records to an operator-controlled forwarder\n${yamlBlock(config.event_sink, 2)}`
+      ? `event_sink: # optional external event sink (#343) — deliver run events.jsonl records to an operator-controlled forwarder. SECURITY: forwards run/stage/issue/PR event metadata to the configured command — treat it as a trusted destination.\n${yamlBlock(config.event_sink, 2)}`
       : [
-        "# event_sink: # optional external event sink (#343) — uncomment to deliver run events.jsonl records to an operator-controlled forwarder",
+        "# event_sink: # optional external event sink (#343) — uncomment to deliver run events.jsonl records to an operator-controlled forwarder. SECURITY: forwards run/stage/issue/PR event metadata to the configured command — treat it as a trusted destination.",
         '#   command: "logger -t pipeline" # forwarder command; receives each event JSON line on stdin. Unset -> no sink (local events.jsonl only, unchanged).',
         "#   mode: additive # additive (default): write events.jsonl AND deliver to the sink | exclusive: sink only (events.jsonl is not written)",
         "#   Env overrides: PIPELINE_EVENT_SINK_COMMAND, PIPELINE_EVENT_SINK_MODE (win over file config). Delivery failures are non-fatal.",
       ].join("\n"),
-    config.roadmap !== undefined ? `\nroadmap:\n${yamlBlock(config.roadmap, 2)}` : undefined,
-    config.sweep !== undefined ? `\nsweep:\n${yamlBlock(config.sweep, 2)}` : undefined,
-    config.trusted_override_actors !== undefined ? `\ntrusted_override_actors:\n${yamlBlock(config.trusted_override_actors, 2)}` : undefined,
-    config.queue !== undefined ? `\nqueue:\n${yamlBlock(config.queue, 2)}` : undefined,
-    config.auto_merge_eligibility !== undefined ? `\nauto_merge_eligibility:\n${yamlBlock(config.auto_merge_eligibility, 2)}` : undefined,
-    config.context_snapshot !== undefined ? `\ncontext_snapshot:\n${yamlBlock(config.context_snapshot, 2)}` : undefined,
+    config.roadmap !== undefined
+      ? `\nroadmap: # backlog roadmap engine overrides (#171)\n${yamlBlock(config.roadmap, 2)}`
+      : [
+        "",
+        "# roadmap: # backlog roadmap engine overrides (#171) — uncomment to override; absent (default): built-in roadmap defaults apply",
+        `#   include_labels: [] # ${sd("roadmap.include_labels", "include only issues with at least one of these labels")}`,
+        `#   exclude_labels: [] # ${sd("roadmap.exclude_labels", "exclude issues that carry any of these labels")}`,
+        `#   score_weights: # ${sd("roadmap.score_weights", "multiplier overrides for each scoring sub-factor (default: 1.0 each)")}`,
+        "#     impact: 1.0",
+        "#     confidence: 1.0",
+        "#     ease: 1.0",
+        "#     risk_reduction: 1.0",
+        "#     dep_leverage: 1.0",
+        `#   hygiene_auto_apply: false # ${sd("roadmap.hygiene_auto_apply", "when true, hygiene actions are applied automatically with --apply (default: false)")}`,
+        `#   pr_docs: true # ${sd("roadmap.pr_docs", "when false, skip opening the roadmap.md PR (default: true)")}`,
+        `#   release_model: semver # ${sd("roadmap.release_model", "how the roadmap groups issues into milestones")}`,
+        `#   release_capacity: # ${sd("roadmap.release_capacity", "capacity policy for the semver release model")}`,
+        `#     effort_budget: 8 # ${sd("roadmap.release_capacity.effort_budget", "per-milestone effort-points capacity budget for the semver model")}`,
+        `#     isolate_breaking: true # ${sd("roadmap.release_capacity.isolate_breaking", "give each breaking-change issue its own milestone instead of sharing one with unrelated issues")}`,
+        `#   inventory_concurrency: 4 # ${sd("roadmap.inventory_concurrency", "maximum concurrent harness calls during inventory phase (default: 4)")}`,
+        `#   depgraph_concurrency: 4 # ${sd("roadmap.depgraph_concurrency", "maximum concurrent harness calls during dependency verification (default: 4)")}`,
+        `#   depgraph_verify_cap: 20 # ${sd("roadmap.depgraph_verify_cap", "maximum candidates to source-verify; excess go to open_questions (default: 20)")}`,
+      ].join("\n"),
+    config.sweep !== undefined
+      ? `\nsweep: # sweep backlog maintenance thresholds (#168)\n${yamlBlock(config.sweep, 2)}`
+      : [
+        "",
+        "# sweep: # sweep backlog maintenance thresholds (#168) — uncomment to override; absent (default): built-in thresholds apply",
+        `#   min_body_length: 150 # ${sd("sweep.min_body_length", "minimum body character count for an issue to be considered sufficient (default: 150)")}`,
+        `#   required_sections: ["Summary", "User story", "Acceptance criteria", "Out of scope"] # ${sd("sweep.required_sections", "section headings (without ##) that must be present for an issue to be considered sufficient")}`,
+      ].join("\n"),
+    config.trusted_override_actors !== undefined
+      ? `\ntrusted_override_actors: # additional GitHub identities trusted for override sentinels (#229)\n${yamlBlock(config.trusted_override_actors, 2)}`
+      : [
+        "",
+        `# trusted_override_actors: [] # ${sd("trusted_override_actors", "additional GitHub identities whose override sentinels are trusted in addition to the current actor")} (#229). Absent (default): only the current actor is trusted.`,
+        "#   Grants override authority to each listed identity — SECURITY: it can dispose of blocking review findings without further review; keep this list minimal and audited.",
+        '#   e.g. trusted_override_actors: ["octocat"]',
+      ].join("\n"),
+    config.queue !== undefined
+      ? `\nqueue: # queue batch factory operator defaults (#305) — CLI flags override these\n${yamlBlock(config.queue, 2)}`
+      : [
+        "",
+        "# queue: # queue batch factory operator defaults (#305) — uncomment to override. Precedence: CLI flags > these values > built-in defaults. Absent by default.",
+        `#   max_issues: 10 # ${sd("queue.max_issues", "maximum number of issues to dispatch in a batch run (default: 10)")}`,
+        `#   budget_dollars: null # ${sd("queue.budget_dollars", "stop launching new runs when cumulative cost reaches this limit in USD; null means unlimited")}`,
+        `#   concurrency: 1 # ${sd("queue.concurrency", "maximum simultaneously active pipeline runs (default: 1)")}`,
+        `#   max_failure_rate: 1.0 # ${sd("queue.max_failure_rate", "halt new launches when failedCount/completedCount reaches this threshold (0.0-1.0); requires at least 3 completed runs (default: 1.0)")}`,
+      ].join("\n"),
+    config.auto_merge_eligibility !== undefined
+      ? [
+        "",
+        "auto_merge_eligibility: # auto-merge eligibility classification (#306) — SECURITY: informational classification only; the pipeline never merges (#4) — a human still owns the merge button regardless of this setting",
+        `  enabled: ${yamlScalar(autoMergeEligibility.enabled)} # ${sd("auto_merge_eligibility.enabled", "enable the auto-merge eligibility gate (default false)")}`,
+        `  max_diff_lines: ${yamlScalar(autoMergeEligibility.max_diff_lines)} # ${sd("auto_merge_eligibility.max_diff_lines", "hard-deny if total PR diff lines (additions + deletions) exceed this threshold (default 300)")}`,
+        `  max_files: ${yamlScalar(autoMergeEligibility.max_files)} # ${sd("auto_merge_eligibility.max_files", "hard-deny if changed file count exceeds this threshold (default 10)")}`,
+        `  deny_paths: ${yamlInline(autoMergeEligibility.deny_paths)} # ${sd("auto_merge_eligibility.deny_paths", "additional glob patterns that always trigger needs-human regardless of other checks (default [])")}`,
+        `  allow_paths: ${yamlInline(autoMergeEligibility.allow_paths)} # ${sd("auto_merge_eligibility.allow_paths", "when non-empty, any changed file not covered by this list triggers needs-human (default [])")}`,
+        `  min_confidence: ${yamlScalar(autoMergeEligibility.min_confidence)} # ${sd("auto_merge_eligibility.min_confidence", "LLM judge confidence floor (0-1); outputs below this route to needs-human (default 0.8)")}`,
+      ].join("\n")
+      : [
+        "",
+        "# auto_merge_eligibility: # auto-merge eligibility classification (#306). Disabled by default. SECURITY: informational classification only — the pipeline never merges (#4); a human still owns the merge button regardless of this setting.",
+        `#   enabled: ${yamlScalar(d.auto_merge_eligibility.enabled)} # ${sd("auto_merge_eligibility.enabled", "enable the auto-merge eligibility gate (default false)")}`,
+        `#   max_diff_lines: ${yamlScalar(d.auto_merge_eligibility.max_diff_lines)} # ${sd("auto_merge_eligibility.max_diff_lines", "hard-deny if total PR diff lines (additions + deletions) exceed this threshold (default 300)")}`,
+        `#   max_files: ${yamlScalar(d.auto_merge_eligibility.max_files)} # ${sd("auto_merge_eligibility.max_files", "hard-deny if changed file count exceeds this threshold (default 10)")}`,
+        `#   deny_paths: [] # ${sd("auto_merge_eligibility.deny_paths", "additional glob patterns that always trigger needs-human regardless of other checks (default [])")}, e.g. ["infra/**", "**/migrations/**"]`,
+        `#   allow_paths: [] # ${sd("auto_merge_eligibility.allow_paths", "when non-empty, any changed file not covered by this list triggers needs-human (default [])")}`,
+        `#   min_confidence: ${yamlScalar(d.auto_merge_eligibility.min_confidence)} # ${sd("auto_merge_eligibility.min_confidence", "LLM judge confidence floor (0-1); outputs below this route to needs-human (default 0.8)")}`,
+      ].join("\n"),
+    config.context_snapshot !== undefined
+      ? `\ncontext_snapshot: # stage-aware issue context snapshot cap override (#318)\n${yamlBlock(config.context_snapshot, 2)}`
+      : [
+        "",
+        "# context_snapshot: # stage-aware issue context snapshot cap override (#318) — uncomment to override; absent (default): an 8000-character cap applies",
+        `#   max_chars: 8000 # ${sd("context_snapshot.max_chars", "maximum total character count for human comment bodies in the context snapshot")}`,
+      ].join("\n"),
     config.repo_map !== undefined
       ? [
         "",
         "repo_map: # cross-repo dependency map (#312) — declare inter-repo relationships for planning context",
-        `  depends_on: ${yamlInline(config.repo_map.depends_on ?? [])} # owner/repo strings this repo consumes`,
-        `  depended_on_by: ${yamlInline(config.repo_map.depended_on_by ?? [])} # owner/repo strings that consume this repo`,
+        `  depends_on: ${yamlInline(config.repo_map.depends_on ?? [])} # ${sd("repo_map.depends_on", "repos this repo consumes (owner/repo strings)")}`,
+        `  depended_on_by: ${yamlInline(config.repo_map.depended_on_by ?? [])} # ${sd("repo_map.depended_on_by", "repos that consume this repo (owner/repo strings)")}`,
       ].join("\n")
       : [
         "",
@@ -2055,12 +2241,12 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         "#   depends_on: [] # owner/repo strings this repo consumes (e.g. - acme/shared-lib)",
         "#   depended_on_by: [] # owner/repo strings that consume this repo (e.g. - acme/consumer-app)",
       ].join("\n"),
-    config.executors !== undefined ? `\nexecutors:\n${yamlBlock(config.executors, 2)}` : undefined,
+    config.executors !== undefined ? `\nexecutors: # SECURITY: delegates execution and prompt content to an external endpoint; credential is an env-var NAME, never a literal secret\n${yamlBlock(config.executors, 2)}` : undefined,
     config.stage_executors !== undefined ? `\nstage_executors:\n${yamlBlock(config.stage_executors, 2)}` : undefined,
     config.executors === undefined && config.stage_executors === undefined
       ? [
         "",
-        "# executors: # external stage executors (#314) — uncomment to delegate model-invoking stages to an external agent system or model endpoint",
+        "# executors: # external stage executors (#314) — uncomment to delegate model-invoking stages to an external agent system or model endpoint. SECURITY: the assigned stage's prompt/context is sent to this external endpoint; credential is an env-var NAME, never a literal secret.",
         "#   opencode-main:",
         "#     type: agent-system # full execution backend (OpenCode/HermesAgent/OpenClaw), valid for any model-invoking stage",
         "#     provider: opencode",
@@ -2108,6 +2294,11 @@ function normalizeForSync(config: PartialConfig): unknown {
     openspec: { ...d.openspec, ...config.openspec },
     last30days: { ...d.last30days, ...config.last30days },
     steps: { ...d.steps, ...config.steps },
+    design_gate: {
+      ...d.design_gate,
+      ...config.design_gate,
+      limits: { ...d.design_gate.limits, ...config.design_gate?.limits },
+    },
     test_gate: { ...d.test_gate, ...config.test_gate },
     eval_gate: { ...d.eval_gate, ...config.eval_gate },
     visual_gate: { ...d.visual_gate, ...config.visual_gate },
@@ -2130,7 +2321,7 @@ function normalizeForSync(config: PartialConfig): unknown {
       : undefined,
     sweep: config.sweep,
     queue: config.queue,
-    auto_merge_eligibility: config.auto_merge_eligibility,
+    auto_merge_eligibility: { ...d.auto_merge_eligibility, ...config.auto_merge_eligibility },
     context_snapshot: config.context_snapshot,
     repo_map: config.repo_map,
     event_sink: config.event_sink,
@@ -2148,6 +2339,80 @@ function stableJson(value: unknown): string {
     return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJson(v)}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+/** Extract the top-level key a raw template/config line declares, if any —
+ *  either active (`key: value`) or commented-out (`# key: value` / `# key: # ...`)
+ *  at zero indent. Returns null for continuation/nested lines (indented, or
+ *  a `#`-prefixed line whose text after the leading `# ` doesn't start
+ *  directly with `identifier:`) and for preamble prose comments. */
+function topLevelKeyOf(line: string): string | null {
+  let rest = line;
+  if (rest.startsWith("#")) {
+    rest = rest.slice(1);
+    if (rest.startsWith(" ")) rest = rest.slice(1);
+  }
+  const m = rest.match(/^([A-Za-z_][A-Za-z0-9_]*):/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Split a rendered/raw `.github/pipeline.yml` text into its top-level blocks:
+ * a block is a zero-indent key line (active or commented) plus every
+ * following line up to (but not including) the next zero-indent key line or
+ * EOF, with trailing blank lines trimmed. Any text before the first
+ * top-level key (the file's preamble comment) is not part of any block and
+ * is dropped from the returned map — callers needing the preamble read it
+ * from the raw text directly. Used by `syncConfig` (#504 finding 2) to find
+ * which top-level keys the fresh render documents that the operator's
+ * current file doesn't yet have, without ever touching the text of a block
+ * that's already present.
+ */
+function splitTopLevelBlocks(text: string): Map<string, string> {
+  const blocks = new Map<string, string>();
+  let currentKey: string | null = null;
+  let currentLines: string[] = [];
+  const flush = () => {
+    if (currentKey !== null) {
+      while (currentLines.length && currentLines[currentLines.length - 1].trim() === "") {
+        currentLines.pop();
+      }
+      blocks.set(currentKey, currentLines.join("\n"));
+    }
+    currentLines = [];
+  };
+  for (const line of text.split("\n")) {
+    const key = topLevelKeyOf(line);
+    if (key !== null) {
+      flush();
+      currentKey = key;
+      currentLines = [line];
+    } else if (currentKey !== null) {
+      currentLines.push(line);
+    }
+  }
+  flush();
+  return blocks;
+}
+
+/**
+ * Build the sync candidate as an append-only merge (#504 finding 2): every
+ * line already present in `current` is preserved byte-for-byte — including
+ * operator-added comments and non-canonical formatting — and only top-level
+ * keys the fresh render documents but `current` doesn't yet have are
+ * appended (in the fresh render's canonical order), each as a blank-line-
+ * separated block taken verbatim from the fresh render. When `current`
+ * already documents every key the fresh render does, `current` is returned
+ * unchanged (not even a trailing-whitespace touch-up), so a fully up to
+ * date file is reported as unchanged rather than spuriously diffed.
+ */
+function buildSyncCandidate(current: string, freshRender: string): string {
+  const currentKeys = new Set(splitTopLevelBlocks(current).keys());
+  const freshBlocks = splitTopLevelBlocks(freshRender);
+  const missingKeys = [...freshBlocks.keys()].filter((k) => !currentKeys.has(k));
+  if (missingKeys.length === 0) return current;
+  const appended = missingKeys.map((k) => freshBlocks.get(k)!).join("\n\n");
+  return `${current.trimEnd()}\n\n${appended}\n`;
 }
 
 export function configSyncDiff(before: string, after: string, relPath = ".github/pipeline.yml"): string {
@@ -2208,7 +2473,13 @@ export function syncConfig(
     return { ok: false, changed: false, applied: false, configPath, diagnostics: validation.diagnostics };
   }
 
-  const candidate = renderConfigTemplate(parsed);
+  // The fresh render is used only as a REFERENCE to diff against — never as
+  // the new file wholesale (#504 finding 2). `buildSyncCandidate` appends
+  // only the top-level keys the fresh render documents that `current`
+  // doesn't already have; every line already in `current` (including
+  // operator comments and non-canonical formatting) is preserved untouched.
+  const freshRender = renderConfigTemplate(parsed);
+  const candidate = buildSyncCandidate(current, freshRender);
   const candidateValidation = validateConfig(gitRoot, {
     ...deps,
     readFile: (p) => (path.resolve(p) === path.resolve(configPath) ? candidate : readFileFn(p)),
