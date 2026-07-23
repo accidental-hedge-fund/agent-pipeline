@@ -507,6 +507,32 @@ test("validateConfig: visual_gate.artifacts_dir inside the repo root does not er
   assert.equal(result.valid, true);
 });
 
+// ---- visual_gate.publish (#463) ----
+
+test("validateConfig: visual_gate.publish: true is accepted", () => {
+  const deps = makeDeps('visual_gate:\n  enabled: true\n  command: "npx playwright test"\n  publish: true\n');
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, true);
+});
+
+test("validateConfig: misspelled visual_gate.publish (publsh) is an error, not silently accepted", () => {
+  const deps = makeDeps("visual_gate:\n  publsh: true\n");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path.startsWith("visual_gate"));
+  assert.ok(d, `expected diagnostic for visual_gate unknown key, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+});
+
+test("validateConfig: bad visual_gate.publish type → error diagnostic", () => {
+  const deps = makeDeps("visual_gate:\n  publish: \"yes\"\n");
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "visual_gate.publish");
+  assert.ok(d, `expected diagnostic for visual_gate.publish, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+});
+
 // ---------------------------------------------------------------------------
 // 5.12 validateConfig: review_harness override applies to inert-model detection (finding 3)
 // ---------------------------------------------------------------------------
@@ -756,6 +782,61 @@ test("RIGOR_GATING_PATHS: includes review_policy.surface_recurrence_rounds", () 
     RIGOR_GATING_PATHS.includes("review_policy.surface_recurrence_rounds"),
     "RIGOR_GATING_PATHS must include review_policy.surface_recurrence_rounds",
   );
+});
+
+// ---------------------------------------------------------------------------
+// 5.17 review_policy.max_delta_rounds (#483)
+// ---------------------------------------------------------------------------
+
+test("DEFAULT_CONFIG: max_delta_rounds defaults to 4", () => {
+  assert.equal(DEFAULT_CONFIG.review_policy.max_delta_rounds, 4);
+});
+
+test("validateConfig: max_delta_rounds accepts declared value → valid", () => {
+  const result = validateConfig("/repo", makeDeps("review_policy:\n  max_delta_rounds: 6\n"));
+  assert.equal(result.valid, true);
+  assert.equal(result.diagnostics.filter((d) => d.path === "review_policy.max_delta_rounds").length, 0);
+});
+
+test("validateConfig: max_delta_rounds rejects 0 → error with rigorGating:true", () => {
+  const result = validateConfig("/repo", makeDeps("review_policy:\n  max_delta_rounds: 0\n"));
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "review_policy.max_delta_rounds");
+  assert.ok(d, `expected diagnostic for review_policy.max_delta_rounds, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+  assert.equal(d!.rigorGating, true);
+});
+
+test("validateConfig: max_delta_rounds rejects negative value → error with rigorGating:true", () => {
+  const result = validateConfig("/repo", makeDeps("review_policy:\n  max_delta_rounds: -2\n"));
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "review_policy.max_delta_rounds");
+  assert.ok(d, `expected diagnostic for review_policy.max_delta_rounds, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+  assert.equal(d!.rigorGating, true);
+});
+
+test("validateConfig: max_delta_rounds rejects non-integer (float) → error with rigorGating:true", () => {
+  const result = validateConfig("/repo", makeDeps("review_policy:\n  max_delta_rounds: 2.5\n"));
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "review_policy.max_delta_rounds");
+  assert.ok(d, `expected diagnostic for review_policy.max_delta_rounds, got: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(d!.severity, "error");
+  assert.equal(d!.rigorGating, true);
+});
+
+test("RIGOR_GATING_PATHS: includes review_policy.max_delta_rounds", () => {
+  assert.ok(
+    RIGOR_GATING_PATHS.includes("review_policy.max_delta_rounds"),
+    "RIGOR_GATING_PATHS must include review_policy.max_delta_rounds",
+  );
+});
+
+test("validateConfig: misspelled review_policy.max_delta_round is reported as unknown key", () => {
+  const result = validateConfig("/repo", makeDeps("review_policy:\n  max_delta_round: 4\n"));
+  assert.equal(result.valid, false);
+  const d = result.diagnostics.find((x) => x.path === "review_policy.max_delta_round");
+  assert.ok(d, `expected diagnostic for misspelled key, got: ${JSON.stringify(result.diagnostics)}`);
 });
 
 // ---------------------------------------------------------------------------

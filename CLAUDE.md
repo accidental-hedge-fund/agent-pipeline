@@ -84,6 +84,25 @@ into the living specs and runs `openspec validate --all` — a structurally inva
   the concern and withholds the push. All three disciplines are drift-guarded by tests in
   `prompt-loader.test.ts`.
 
+## Concurrency scope (#459)
+
+- The engine's `/tmp` PID locks (`lock.ts`) — the per-issue/domain advance lock, the queue-batch
+  serialization, and the live-planning marker — are **host-local**: they provide mutual exclusion
+  only between processes on the same machine, none across distinct hosts. **Single-host operation
+  is the supported concurrency scope for these lock sites.** Each guards host-local state (one
+  host's worktrees, run-state dir, queue) whose cross-host failure mode is two hosts each doing
+  their own thing in their own worktree — not a persistent, irreversible shared artifact — so this
+  is a documented engineering disposition, not an oversight (see
+  `openspec/changes/cross-host-auto-file-serialization/design.md` for the full per-site
+  assessment).
+- **Exception: the `pipeline improve` auto-file path** (`autoFilePapercuts`,
+  `core/scripts/stages/papercut.ts`) is hardened to be **cross-host safe**, because its failure
+  mode — a duplicate or over-cap auto-filed GitHub issue — is exactly that kind of irreversible
+  artifact. It uses GitHub-authored issue state (not the host-local lock) as the cross-host source
+  of truth: the in-window rate cap is recomputed from GitHub immediately before each create, and a
+  post-create read-back closes any duplicate title down to the lowest-numbered open issue. The
+  `/tmp` lock is retained only as a same-host fast path.
+
 ## Conventions
 
 - Simplicity first; find root causes, no temporary patches. Match surrounding code style.

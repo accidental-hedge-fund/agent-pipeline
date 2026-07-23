@@ -894,6 +894,112 @@ test("finalizeRun: exclusive sink mode still embeds accounting + interventions v
   assert.equal(summary.interventions[0].kind, "human-risk-override");
 });
 
+// #499 — correction_event survives into summary.json, both via re-read and
+// via the exclusive-sink summaryEvents accumulator.
+test("finalizeRun: correction_event records reach summary.json (events.jsonl re-read path)", async () => {
+  const { deps, readFile } = memRunStore();
+  const bundle = makeBundle();
+
+  await appendEvent(
+    RUN_DIR,
+    {
+      schema_version: RUN_SCHEMA_VERSION,
+      type: "correction_event",
+      at: STARTED_AT_ISO,
+      correction_id: "abc123",
+      correction_key: "def456",
+      source_kind: "override",
+      failure_class: "review-finding",
+      actor_kind: "human",
+      issue: ISSUE,
+      repo: "acme/repo",
+      run_id: `${ISSUE}-${STARTED_AT}`,
+      stage: "review-2",
+      reviewed_sha: null,
+      head_sha: null,
+      evidence_ref: { kind: "finding", id: "abc12345" },
+      correction: "rejected — false positive",
+      reusable: "unknown",
+    } as unknown as RunEvent,
+    deps,
+  );
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary.corrections.length, 1);
+  assert.equal(summary.corrections[0].source_kind, "override");
+});
+
+test("finalizeRun: exclusive sink mode still embeds correction_event via summaryEvents", async () => {
+  const { deps, readFile, files } = memRunStore();
+  deps.eventSink = () => {};
+  deps.eventSinkMode = "exclusive";
+  deps.summaryEvents = [];
+  const bundle = makeBundle();
+
+  await appendEvent(
+    RUN_DIR,
+    {
+      schema_version: RUN_SCHEMA_VERSION,
+      type: "correction_event",
+      at: STARTED_AT_ISO,
+      correction_id: "abc123",
+      correction_key: "def456",
+      source_kind: "retry",
+      failure_class: "harness-crash",
+      actor_kind: "pipeline",
+      issue: ISSUE,
+      repo: "acme/repo",
+      run_id: `${ISSUE}-${STARTED_AT}`,
+      stage: "implementing",
+      reviewed_sha: null,
+      head_sha: null,
+      evidence_ref: { kind: "blocker", id: "no-commits" },
+      correction: "auto-recovery 1/3",
+      reusable: "unknown",
+    } as unknown as RunEvent,
+    deps,
+  );
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  assert.equal(files.has(path.join(RUN_DIR, "events.jsonl")), false, "exclusive mode must not create events.jsonl");
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary.corrections.length, 1);
+  assert.equal(summary.corrections[0].source_kind, "retry");
+});
+
+test("finalizeRun: a run with no correction_event records still writes an empty corrections array", async () => {
+  const { deps, readFile } = memRunStore();
+  const bundle = makeBundle();
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.deepEqual(summary.corrections, []);
+});
+
+// ---------------------------------------------------------------------------
+// latestRunDirForIssue (#499)
+// ---------------------------------------------------------------------------
+
+test("latestRunDirForIssue: returns null when no run directory matches the issue prefix", async () => {
+  const { deps } = memRunStore();
+  const { latestRunDirForIssue } = await import("../scripts/run-store.ts");
+  const result = await latestRunDirForIssue(REPO_DIR, 999, deps);
+  assert.equal(result, null);
+});
+
+test("latestRunDirForIssue: returns the most-recent matching run directory (mtime descending)", async () => {
+  const { deps, files } = memRunStore();
+  const { latestRunDirForIssue } = await import("../scripts/run-store.ts");
+  const olderId = "155-run-b"; // memRunStore's stat() treats "run-b" as older
+  const newerId = "155-run-a"; // and "run-a" as newer
+  files.set(path.join(runsDir(REPO_DIR), olderId, "run.json"), "{}");
+  files.set(path.join(runsDir(REPO_DIR), newerId, "run.json"), "{}");
+  const result = await latestRunDirForIssue(REPO_DIR, 155, deps);
+  assert.equal(result, runDirPath(REPO_DIR, newerId));
+});
+
 // 4.7 — backward-compat regression test
 test("finalizeRun: writes legacy evidence.json with same content as summary.json", async () => {
   const { deps, readFile } = memRunStore();
@@ -1689,4 +1795,82 @@ test("isValidSummaryBundle: returns true for well-formed nested command/override
     recoveries: [{ trigger: "harness-timeout", round: 1, at: "2026-06-20T00:00:00Z" }],
   };
   assert.equal(isValidSummaryBundle(b), true, "well-formed nested entries must be accepted");
+});
+
+// ---------------------------------------------------------------------------
+// Pre-merge delta-round accounting (#483)
+// ---------------------------------------------------------------------------
+
+test("appendEvent + finalizeRun: delta_round and delta_round_ceiling events land in summary.json's deltaRounds accounting", async () => {
+  const { deps, readFile } = memRunStore();
+  const bundle = makeBundle();
+
+  await appendEvent(RUN_DIR, {
+    schema_version: RUN_SCHEMA_VERSION, type: "delta_round", at: "2026-06-16T21:12:00Z",
+    round: 1, cap: 4,
+  }, deps);
+  await appendEvent(RUN_DIR, {
+    schema_version: RUN_SCHEMA_VERSION, type: "delta_round", at: "2026-06-16T21:13:00Z",
+    round: 2, cap: 4,
+  }, deps);
+  await appendEvent(RUN_DIR, {
+    schema_version: RUN_SCHEMA_VERSION, type: "delta_round_ceiling", at: "2026-06-16T21:14:00Z",
+    observed: 2, cap: 4, ceiling_action: "park",
+  }, deps);
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary.deltaRounds.count, 2);
+  assert.equal(summary.deltaRounds.cap, 4);
+  assert.deepEqual(summary.deltaRounds.ceiling, { observed: 2, ceilingAction: "park" });
+  assert.deepEqual(summary.deltaRounds.churnRounds, []);
+});
+
+test("appendEvent + finalizeRun: delta_churn_suspected events are listed with their axes", async () => {
+  const { deps, readFile } = memRunStore();
+  const bundle = makeBundle();
+
+  await appendEvent(RUN_DIR, {
+    schema_version: RUN_SCHEMA_VERSION, type: "delta_round", at: "2026-06-16T21:12:00Z",
+    round: 1, cap: 4,
+  }, deps);
+  await appendEvent(RUN_DIR, {
+    schema_version: RUN_SCHEMA_VERSION, type: "delta_churn_suspected", at: "2026-06-16T21:12:30Z",
+    round: 1, axes: [{ surface: "src/pool.ts|correctness", prior_max_confidence: 0.9, new_confidence: 0.7 }],
+  }, deps);
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.deepEqual(summary.deltaRounds.churnRounds, [
+    { round: 1, axes: [{ surface: "src/pool.ts|correctness", priorMaxConfidence: 0.9, newConfidence: 0.7 }] },
+  ]);
+});
+
+test("finalizeRun: no delta rounds → summary.json is valid without a deltaRounds field", async () => {
+  const { deps, readFile } = memRunStore();
+  const bundle = makeBundle();
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary.deltaRounds, undefined);
+});
+
+test("finalizeRun: a summary.json write failure is non-fatal even with delta-round events present", async () => {
+  const { deps } = memRunStore();
+  const bundle = makeBundle();
+  await appendEvent(RUN_DIR, {
+    schema_version: RUN_SCHEMA_VERSION, type: "delta_round", at: "2026-06-16T21:12:00Z",
+    round: 1, cap: 4,
+  }, deps);
+  const failingDeps: RunStoreDeps = {
+    ...deps,
+    writeFile: async (p: string) => {
+      if (p.endsWith("summary.json.tmp")) throw new Error("disk full");
+      return deps.writeFile(p, "");
+    },
+  };
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, failingDeps); // must not throw
 });

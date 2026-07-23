@@ -11,7 +11,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  addIssueComment,
   closePr,
+  createIssue,
   getGhActor,
   getHeadCheckRunCount,
   getSuccessfulCheckRunCount,
@@ -29,31 +31,53 @@ import {
   transition,
 } from "../gh.ts";
 import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
+import { PIPELINE_INTERNAL_MARKER_FILES } from "../salvage-harness-work.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import {
   attestPipelineComment,
+  buildDeltaFollowupIssueBody,
+  buildDeltaFollowupUpdateComment,
   computeDiffHash,
   DELTA_REVIEW_MARKER_PREFIX,
+  deltaRoundCeilingComment,
+  deltaRoundCeilingDemotionComment,
   diffFilePaths,
   extractBlockingKeysFromComment,
   extractBlockingKeysMarker,
+  extractCeilingFollowupNumber,
   extractDiffHashFromComment,
   extractReviewArtifact,
   findLatestReviewCommentBody,
   formatDeltaReviewComment,
   extractReviewedSha,
   parseStructuredVerdict,
+  type DeltaCeilingFinding,
 } from "./review.ts";
 import {
+  applySettledSurfaceEvidenceRule,
   buildTrustedOverrideComments,
   extractOverrides,
   extractScopedOverrides,
   findingKey,
+  overrideComment,
   partitionFindings,
+  severityRank,
   surfaceKey,
+  type AlternativeReinstatementMatch,
   type ReversalMatch,
+  type UnverifiedSettledSurfaceMatch,
 } from "../review-policy.ts";
-import { buildPriorRoundDigest, settledFindings, type PriorRoundDigest } from "../review-history.ts";
+import {
+  buildPriorRoundDigest,
+  countDeltaRounds,
+  detectSuspectedChurn,
+  settledFindings,
+  settledFindingsSurfaceFiles,
+  settledFindingsVerification,
+  type HeadFileState,
+  type PriorRoundDigest,
+  type SettledFindingVerification,
+} from "../review-history.ts";
 import { appendEvent, RUN_SCHEMA_VERSION } from "../run-store.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import { buildDeltaReviewPrompt, buildFixPrompt } from "../prompts/index.ts";
@@ -75,6 +99,7 @@ export {
 } from "../openspec-consistency.ts";
 import { invoke } from "../harness.ts";
 import { reviewerModelSourceWasAuto } from "../stage-routing.ts";
+import { VISUAL_PUBLISH_COMMIT_PREFIX } from "./visual.ts";
 import type { ReviewFinding } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -83,7 +108,19 @@ import type { RunStoreDeps, StageAccountingEvent } from "../run-store.ts";
 import { runTestGate } from "../testgate.ts";
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
-const REBASE_MARKER_FILE = ".pipeline-rebase-attempted";
+
+/**
+ * Exact publish-commit subject pattern (#463): the full prescribed subject,
+ * `VISUAL_PUBLISH_COMMIT_PREFIX` followed by an issue number and nothing
+ * else. Matched in full (not as a prefix) so a developer's own code-changing
+ * commit merely starting with the same words — e.g. `chore: publish
+ * visual-gate evidence for #463 and tweak layout` — does NOT match and still
+ * triggers the required re-review.
+ */
+const VISUAL_PUBLISH_COMMIT_PATTERN = new RegExp(
+  `^${VISUAL_PUBLISH_COMMIT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d+$`,
+);
+export const REBASE_MARKER_FILE = PIPELINE_INTERNAL_MARKER_FILES[0];
 
 /**
  * Commit-subject prefix for the pre-merge bounded auto-fix round (#359).
@@ -132,10 +169,17 @@ export type AttemptPreMergeAutoFixFn = (
  * still triggers a re-review. A `docs: update documentation for #N` commit is
  * NOT pipeline-internal: the pre-merge docs harness was removed (#91, docs now
  * land inside the reviewed implementation diff), so any such commit can only
- * come from a developer. Exported for tests.
+ * come from a developer. Also matches the visual-gate artifact-publish commit
+ * (#463): it republishes already-reviewed evidence, does not change the code
+ * the reviewer evaluated, and must not invalidate the verdict or be mistaken
+ * for a visual-fix commit (distinct prefix from `visualFixCommitPattern`).
+ * Exported for tests.
  */
 export function isPipelineInternalCommit(messageHeadline: string): boolean {
-  return messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX);
+  return (
+    messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX) ||
+    VISUAL_PUBLISH_COMMIT_PATTERN.test(messageHeadline)
+  );
 }
 
 /**
@@ -1037,8 +1081,93 @@ export type RunDeltaReviewFn = (
   deltaDiff: string,
   worktreePath: string,
   specContext: string,
-  accounting?: { runDir?: string; runStoreDeps?: RunStoreDeps; priorRoundsDigest?: PriorRoundDigest },
+  accounting?: {
+    runDir?: string;
+    runStoreDeps?: RunStoreDeps;
+    priorRoundsDigest?: PriorRoundDigest;
+    /** Resolved-finding verification entries (#496); see {@link ReadHeadFilesFn}. */
+    settledFindingsVerification?: SettledFindingVerification[];
+    /** HEAD content of the files those entries' surfaces name (#496). */
+    headFiles?: HeadFileState[];
+  },
 ) => Promise<DeltaReviewResult>;
+
+/**
+ * Injectable seam (#496 task 2.1) for reading a set of files' content at the
+ * reviewed head from the delta reviewer's worktree — the resolved-finding
+ * verification context's evidence surface. Returns one entry per requested
+ * `path`, in the same order, so unit tests can assert deterministically.
+ */
+export type ReadHeadFilesFn = (worktreePath: string, treeSha: string, paths: string[]) => Promise<HeadFileState[]>;
+
+/** Per-file byte cap for the HEAD file-state injection (#496 design.md
+ *  Decision 3), next to the existing 50KB diff cap so the total prompt
+ *  budget is reviewable in one place. */
+export const HEAD_FILE_PER_FILE_CAP = 8_000;
+/** Total byte cap across all injected HEAD files (#496 design.md Decision 3). */
+export const HEAD_FILE_TOTAL_CAP = 24_000;
+
+/** Default implementation of the `readHeadFiles` seam (#496): reads each
+ *  requested path from the IMMUTABLE reviewed Git tree (`git show
+ *  <treeSha>:<path>`), never from the mutable worktree filesystem — so no
+ *  concurrent writer, symlink swap, or validation-to-read race can inject
+ *  external content or fake deletion evidence (#496 delta finding 8f981a57);
+ *  the object store is the security boundary. Bounded by
+ *  {@link HEAD_FILE_PER_FILE_CAP} and {@link HEAD_FILE_TOTAL_CAP}. A path
+ *  absent from the tree yields `present: false` with `"not-found"` — citable
+ *  deletion evidence (design.md Decision 3). A traversal-shaped path is
+ *  `"rejected"` without ever reaching git (#496 finding cdd406db); symlinks
+ *  in the tree are blobs of link text, not followed (#496 finding 702a99fc).
+ */
+export async function defaultReadHeadFiles(
+  worktreePath: string,
+  treeSha: string,
+  paths: string[],
+  gitFn: typeof gitInWorktree = gitInWorktree,
+): Promise<HeadFileState[]> {
+  const results: HeadFileState[] = [];
+  let totalUsed = 0;
+  for (const p of paths) {
+    // Runtime string guard (#496 delta finding cdd406db round 2, refined for
+    // 49da0f1a7403d6f4): surfaces originate in untrusted prior-review history
+    // and types are stripped at runtime — a non-string value must render as
+    // rejected, never throw. String(p) is unsafe here: a malformed value like
+    // { toString: null } throws TypeError during coercion instead of
+    // rejecting cleanly, so a fixed marker is used instead of coercing.
+    if (typeof p !== "string") {
+      results.push({ path: "<non-string surface>", content: "", truncated: false, present: false, absenceReason: "rejected" });
+      continue;
+    }
+    const rel = path.posix.normalize(p.split(path.sep).join(path.posix.sep));
+    if (rel === "" || rel === "." || rel.startsWith("..") || path.posix.isAbsolute(rel)) {
+      results.push({ path: p, content: "", truncated: false, present: false, absenceReason: "rejected" });
+      continue;
+    }
+    const shown = await gitFn(worktreePath, ["show", `${treeSha}:${rel}`], { ignoreFailure: true });
+    if (shown.code !== 0) {
+      const absenceReason =
+        /does not exist|exists on disk, but not in|invalid object name|not a valid object name/i.test(shown.stderr)
+          ? "not-found"
+          : "unreadable";
+      results.push({ path: p, content: "", truncated: false, present: false, absenceReason });
+      continue;
+    }
+    let content = shown.stdout;
+    let truncated = false;
+    if (content.length > HEAD_FILE_PER_FILE_CAP) {
+      content = content.slice(0, HEAD_FILE_PER_FILE_CAP);
+      truncated = true;
+    }
+    const remaining = HEAD_FILE_TOTAL_CAP - totalUsed;
+    if (content.length > remaining) {
+      content = content.slice(0, Math.max(remaining, 0));
+      truncated = true;
+    }
+    totalUsed += content.length;
+    results.push({ path: p, content, truncated, present: true });
+  }
+  return results;
+}
 
 /**
  * External seams for {@link enforceReviewShaGate}, overridable in tests.
@@ -1067,6 +1196,9 @@ export interface ShaGateDeps {
   ) => Promise<string>;
   /** Runs the pre-merge delta review (#228) and returns the parsed verdict. */
   runDeltaReview?: RunDeltaReviewFn;
+  /** Reads settled findings' surface files at the reviewed head from the
+   *  delta worktree (#496). Default: {@link defaultReadHeadFiles}. */
+  readHeadFiles?: ReadHeadFilesFn;
   postComment?: typeof postComment;
   transition?: typeof transition;
   setBlocked?: typeof setBlocked;
@@ -1102,6 +1234,12 @@ export interface ShaGateDeps {
    * view) before proceeding. Production default: `defaultGetRemoteHead`.
    */
   getRemoteHead?: (cwd: string, branch: string) => Promise<string | null>;
+  /** Files the single tracked follow-up issue at the pre-merge delta-round
+   *  ceiling under `ceiling_action: demote_and_advance` (#483). Mirrors the
+   *  review-2 ceiling's seam. */
+  createIssue?: (title: string, body: string, labels: string[]) => Promise<number>;
+  /** Appends to an existing delta-round-ceiling follow-up issue on re-entry (#483). */
+  addIssueComment?: (issueNumber: number, body: string) => Promise<void>;
 }
 
 /** `git ls-remote origin refs/heads/<branch>` from `cwd`; null on any failure. */
@@ -1134,7 +1272,10 @@ export async function enforceReviewShaGate(
   const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
   const getCommitDeltaDiffFn = deps.getCommitDeltaDiff ?? defaultGetCommitDeltaDiff;
   const runDeltaReviewFn = deps.runDeltaReview ?? defaultRunDeltaReview;
+  const readHeadFilesFn = deps.readHeadFiles ?? defaultReadHeadFiles;
   const getRemoteHeadFn = deps.getRemoteHead ?? defaultGetRemoteHead;
+  const createIssueFn = deps.createIssue ?? ((title: string, body: string, labels: string[]) => createIssue(cfg, title, body, labels));
+  const addIssueCommentFn = deps.addIssueComment ?? ((issueNum: number, body: string) => addIssueComment(cfg, issueNum, body));
   const postCommentFn = deps.postComment ?? postComment;
   const transitionFn = deps.transition ?? transition;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
@@ -1442,6 +1583,116 @@ export async function enforceReviewShaGate(
         return null;
       }
 
+      // Pre-merge delta-round ceiling (#483): the diff changed and the prior
+      // verdict is stale, so a delta review would normally run — but bound how
+      // many times that can happen per item. Computed BEFORE invoking the
+      // reviewer, purely from the durable delta-review comment thread, so this
+      // check never depends on run-local state.
+      const deltaRoundCount = countDeltaRounds(detail.comments, {
+        actor, trustedOverrideActors: cfg.trusted_override_actors,
+      });
+      const deltaRoundCap = cfg.review_policy.max_delta_rounds;
+      if (deltaRoundCap > 0 && deltaRoundCount >= deltaRoundCap) {
+        if (deps.runDir) {
+          const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+          await appendEvent(deps.runDir, {
+            schema_version: RUN_SCHEMA_VERSION, type: "delta_round_ceiling", at,
+            observed: deltaRoundCount, cap: deltaRoundCap, ceiling_action: cfg.review_policy.ceiling_action,
+          }, deps.runStoreDeps).catch(() => {});
+        }
+
+        // Reconstruct the outstanding blocking delta findings from the last
+        // trusted delta-review comment — no reviewer invocation happens at the
+        // ceiling, so there is no fresh ReviewFinding to partition. Filter out
+        // any key since overridden by a trusted operator disposition.
+        const lastDeltaComment = trustedComments
+          .filter((c) => c.body.startsWith(DELTA_REVIEW_MARKER_PREFIX))
+          .at(-1);
+        const lastDeltaArtifact = lastDeltaComment ? extractReviewArtifact(lastDeltaComment.body) : null;
+        const rawOutstanding: DeltaCeilingFinding[] = lastDeltaArtifact?.blockingFindings
+          ? lastDeltaArtifact.blockingFindings.map((f) => ({
+              key: f.key, surface: f.surface, severity: f.severity, title: f.title,
+            }))
+          : [...(lastDeltaComment ? (extractBlockingKeysMarker(lastDeltaComment.body) ?? new Set<string>()) : new Set<string>())]
+              .map((key) => ({ key, surface: null, severity: "unknown", title: "(title unavailable)" }));
+        const currentOverrides = extractOverrides(trustedOverrideComments);
+        const outstanding = rawOutstanding.filter((f) => !currentOverrides.has(f.key));
+
+        if (outstanding.length === 0) {
+          // Every previously-recorded blocking key is now overridden (or the
+          // last delta round left nothing blocking) — nothing to disposition;
+          // proceed as if the gate passed.
+          console.log(
+            `[pipeline] #${issueNumber}: pre-merge delta-round ceiling reached (${deltaRoundCount}/${deltaRoundCap}) ` +
+            `with no outstanding blocking findings; proceeding`,
+          );
+          return null;
+        }
+
+        const highOrCritical = outstanding.filter((f) => severityRank(f.severity) >= severityRank("high"));
+        const belowHigh = outstanding.filter((f) => severityRank(f.severity) < severityRank("high"));
+        const shouldDemote =
+          cfg.review_policy.ceiling_action === "demote_and_advance" &&
+          highOrCritical.length === 0 &&
+          belowHigh.length > 0;
+
+        if (!shouldDemote) {
+          await postCommentFn(
+            cfg, issueNumber,
+            deltaRoundCeilingComment(cfg, deltaRoundCount, deltaRoundCap, cfg.review_policy.ceiling_action, outstanding),
+          );
+          await setBlockedFn(
+            cfg, issueNumber,
+            `Pre-merge delta review reached the ${deltaRoundCap}-round ceiling with ${outstanding.length} ` +
+              `unresolved blocking finding(s).`,
+            "pre-merge", "needs-human",
+          );
+          return {
+            advanced: false,
+            status: "blocked",
+            reason: `pre-merge delta-round ceiling: ${outstanding.length} unresolved blocking finding(s)`,
+          };
+        }
+
+        const existingFollowup = extractCeilingFollowupNumber(detail.comments, actor);
+        let followupNumber: number;
+        if (existingFollowup !== null) {
+          followupNumber = existingFollowup;
+          await addIssueCommentFn(followupNumber, buildDeltaFollowupUpdateComment(issueNumber, deltaRoundCount, belowHigh));
+        } else {
+          followupNumber = await createIssueFn(
+            `[Deferred] Pre-merge delta review ceiling findings from #${issueNumber}`,
+            buildDeltaFollowupIssueBody(issueNumber, belowHigh),
+            [],
+          );
+        }
+
+        await postCommentFn(
+          cfg, issueNumber,
+          deltaRoundCeilingDemotionComment(cfg, deltaRoundCount, deltaRoundCap, belowHigh, followupNumber),
+        );
+
+        const ceilingTimestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+        for (const f of belowHigh) {
+          const disposition = `deferred-#${followupNumber}`;
+          const body = overrideComment({
+            key: f.key,
+            disposition,
+            reason: `auto-demoted at pre-merge delta-round ceiling (round ${deltaRoundCount}/${deltaRoundCap}); deferred to #${followupNumber}`,
+            stage: "pre-merge",
+            timestamp: ceilingTimestamp,
+            footer: cfg.marker_footer,
+          });
+          await postCommentFn(cfg, issueNumber, body);
+        }
+
+        console.log(
+          `[pipeline] #${issueNumber}: pre-merge delta-round ceiling (${deltaRoundCount}/${deltaRoundCap}); ` +
+          `${belowHigh.length} below-high finding(s) demoted, advancing (follow-up #${followupNumber})`,
+        );
+        return null;
+      }
+
       // Resolve worktree and spec context for the delta reviewer (Finding 3): the
       // delta reviewer must run from the issue worktree (not cfg.repo_dir) so it
       // can inspect PR-branch files, and must receive OpenSpec context for any
@@ -1473,8 +1724,18 @@ export async function enforceReviewShaGate(
         ? openspecContextFromDiff(cfg, deltaWt.path, diffFilePaths(deltaDiff))
         : "";
 
+      if (deps.runDir) {
+        const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+        await appendEvent(deps.runDir, {
+          schema_version: RUN_SCHEMA_VERSION, type: "delta_round", at,
+          round: deltaRoundCount + 1, cap: deltaRoundCap,
+        }, deps.runStoreDeps).catch(() => {});
+      }
+
       let deltaResult: DeltaReviewResult;
       let priorRoundsDigest: PriorRoundDigest;
+      let settledVerification: SettledFindingVerification[] = [];
+      let headFiles: HeadFileState[] = [];
       let supersessionAttempts = 0;
       for (;;) {
         // Cross-round memory digest (#389): the pre-merge delta review is one of
@@ -1482,11 +1743,20 @@ export async function enforceReviewShaGate(
         priorRoundsDigest = buildPriorRoundDigest(detail.comments, {
           actor, trustedOverrideActors: cfg.trusted_override_actors,
         });
+        // Resolved-finding verification context (#496): the settled findings
+        // from the digest, plus their surfaces' HEAD content, so the delta
+        // reviewer can verify a claimed resolution instead of assuming
+        // persistence. Absent settled history => no read, no context (design.md
+        // Decision 5) — the delta prompt stays byte-identical to before #496.
+        settledVerification = settledFindingsVerification(priorRoundsDigest);
+        headFiles = settledVerification.length > 0
+          ? await readHeadFilesFn(deltaWorktreePath, targetHead, settledFindingsSurfaceFiles(settledVerification))
+          : [];
         deltaResult = await runDeltaReviewFn(
           cfg, issueNumber, detail, deltaDiff, deltaWorktreePath, deltaSpecContext,
           deps.runDir
-            ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps, priorRoundsDigest }
-            : { priorRoundsDigest },
+            ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps, priorRoundsDigest, settledFindingsVerification: settledVerification, headFiles }
+            : { priorRoundsDigest, settledFindingsVerification: settledVerification, headFiles },
         );
         // Guard: needs-attention with zero findings indicates unparseable reviewer output
         // (#228 fix-1). Mirror advanceReview's zero-findings handling: throw to the
@@ -1532,18 +1802,71 @@ export async function enforceReviewShaGate(
       const settled = settledFindings(priorRoundsDigest);
       const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides, scopes, new Map(), null, settled);
       const reversalDemotions = new Map<string, ReversalMatch>();
-      for (const { finding, reason, reversalMatch } of partition.advisory) {
-        if (reason !== "reversal-unacknowledged" || !reversalMatch) continue;
-        reversalDemotions.set(findingKey(finding), reversalMatch);
+      const alternativeDemotions = new Map<string, AlternativeReinstatementMatch>();
+      for (const { finding, reason, reversalMatch, alternativeMatch } of partition.advisory) {
+        if (reason === "reversal-unacknowledged" && reversalMatch) {
+          reversalDemotions.set(findingKey(finding), reversalMatch);
+          if (deps.runDir) {
+            const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+            await appendEvent(deps.runDir, {
+              schema_version: RUN_SCHEMA_VERSION, type: "reversal_unacknowledged", at,
+              finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
+              settled_finding_key: reversalMatch.settledKey, settling_round: reversalMatch.settledRound,
+              matched_by: reversalMatch.matchedBy,
+            }, deps.runStoreDeps).catch(() => {});
+          }
+          continue;
+        }
+        if (reason === "settled-alternative-reinstated" && alternativeMatch) {
+          alternativeDemotions.set(findingKey(finding), alternativeMatch);
+          if (deps.runDir) {
+            const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+            await appendEvent(deps.runDir, {
+              schema_version: RUN_SCHEMA_VERSION, type: "settled_alternative_reinstated", at,
+              finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
+              settled_finding_key: alternativeMatch.settledKey, settling_round: alternativeMatch.settledRound,
+              matched_alternative: alternativeMatch.matchedAlternative,
+            }, deps.runStoreDeps).catch(() => {});
+          }
+        }
+      }
+
+      // Resolved-finding evidence rule (#496): a still-blocking finding whose
+      // surface matches a settled finding's surface, and which cites no
+      // evidence drawn from the supplied HEAD file state, is demoted to
+      // advisory — the same routing the #389 reversal machinery uses, with a
+      // distinct reason so it is not double-reported as an unacknowledged
+      // reversal. A no-op when there is no settled history (design.md
+      // Decision 5). Runs AFTER the reversal/alternative guards above so a
+      // finding already demoted there is not reconsidered here.
+      const unverifiedSurfaceDemotions = new Map<string, UnverifiedSettledSurfaceMatch>();
+      const evidenceResult = applySettledSurfaceEvidenceRule(partition.blocking, settledVerification, headFiles);
+      partition.blocking = evidenceResult.blocking;
+      for (const { finding, match } of evidenceResult.demoted) {
+        partition.advisory.push({ finding, reason: "settled-surface-unverified", unverifiedSurfaceMatch: match });
+        unverifiedSurfaceDemotions.set(findingKey(finding), match);
         if (deps.runDir) {
           const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
           await appendEvent(deps.runDir, {
-            schema_version: RUN_SCHEMA_VERSION, type: "reversal_unacknowledged", at,
+            schema_version: RUN_SCHEMA_VERSION, type: "settled_surface_unverified", at,
             finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
-            settled_finding_key: reversalMatch.settledKey, settling_round: reversalMatch.settledRound,
-            matched_by: reversalMatch.matchedBy,
+            settled_finding_key: match.settledKey, settling_round: match.settledRound,
           }, deps.runStoreDeps).catch(() => {});
         }
+      }
+
+      // Confidence-trend churn detector (#483): audit-only — labels the posted
+      // comment and emits one event, never alters the blocking partition above.
+      const churn = detectSuspectedChurn(partition.blocking, priorRoundsDigest);
+      if (churn.suspected && deps.runDir) {
+        const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+        await appendEvent(deps.runDir, {
+          schema_version: RUN_SCHEMA_VERSION, type: "delta_churn_suspected", at,
+          round: deltaRoundCount + 1,
+          axes: churn.axes.map((a) => ({
+            surface: a.surface, prior_max_confidence: a.priorMaxConfidence, new_confidence: a.newConfidence,
+          })),
+        }, deps.runStoreDeps).catch(() => {});
       }
 
       const newHash = computeDiffHash(currentDiff);
@@ -1571,6 +1894,9 @@ export async function enforceReviewShaGate(
         blockingKeysSet.size > 0 ? blockingKeysSet : undefined,
         newHash,
         reversalDemotions,
+        alternativeDemotions,
+        churn,
+        unverifiedSurfaceDemotions,
       );
       // Place the banner AFTER the heading so isDeltaReviewComment (startsWith check)
       // still recognizes the comment on the next pre-merge re-entry (#228 Finding 5).
@@ -1680,15 +2006,36 @@ export async function enforceReviewShaGate(
               actor, trustedOverrideActors: cfg.trusted_override_actors,
             });
             const reSettled = settledFindings(reReviewDigest);
+            const reSettledVerification = settledFindingsVerification(reReviewDigest);
+            const reHeadFiles = reSettledVerification.length > 0
+              ? await readHeadFilesFn(deltaWorktreePath, newPrHead, settledFindingsSurfaceFiles(reSettledVerification))
+              : [];
             const reResult = await runDeltaReviewFn(
               cfg, issueNumber, detail, reReviewDiff, deltaWorktreePath, deltaSpecContext,
               deps.runDir
-                ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps, priorRoundsDigest: reReviewDigest }
-                : { priorRoundsDigest: reReviewDigest },
+                ? { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps, priorRoundsDigest: reReviewDigest, settledFindingsVerification: reSettledVerification, headFiles: reHeadFiles }
+                : { priorRoundsDigest: reReviewDigest, settledFindingsVerification: reSettledVerification, headFiles: reHeadFiles },
             );
             const rePartition = partitionFindings(
               reResult.findings, cfg.review_policy, overrides, scopes, new Map(), null, reSettled,
             );
+            // Resolved-finding evidence rule (#496), mirroring the primary
+            // delta-review application above.
+            const reUnverifiedSurfaceDemotions = new Map<string, UnverifiedSettledSurfaceMatch>();
+            const reEvidenceResult = applySettledSurfaceEvidenceRule(rePartition.blocking, reSettledVerification, reHeadFiles);
+            rePartition.blocking = reEvidenceResult.blocking;
+            for (const { finding, match } of reEvidenceResult.demoted) {
+              rePartition.advisory.push({ finding, reason: "settled-surface-unverified", unverifiedSurfaceMatch: match });
+              reUnverifiedSurfaceDemotions.set(findingKey(finding), match);
+              if (deps.runDir) {
+                const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+                await appendEvent(deps.runDir, {
+                  schema_version: RUN_SCHEMA_VERSION, type: "settled_surface_unverified", at,
+                  finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
+                  settled_finding_key: match.settledKey, settling_round: match.settledRound,
+                }, deps.runStoreDeps).catch(() => {});
+              }
+            }
             // Mirror the initial delta review guard (#228): needs-attention with zero
             // findings is likely unparseable reviewer output — block conservatively.
             // Detect BEFORE formatting/posting the comment so we do not write a
@@ -1731,6 +2078,9 @@ export async function enforceReviewShaGate(
               reBlockingKeys.size > 0 ? reBlockingKeys : undefined,
               reNewHash,
               reReversalDemotions,
+              undefined,
+              undefined,
+              reUnverifiedSurfaceDemotions,
             );
             const reComment = reSelfReview
               ? (() => {
@@ -1979,7 +2329,13 @@ async function defaultRunDeltaReview(
   deltaDiff: string,
   worktreePath: string,
   specContext: string,
-  accounting?: { runDir?: string; runStoreDeps?: RunStoreDeps; priorRoundsDigest?: PriorRoundDigest },
+  accounting?: {
+    runDir?: string;
+    runStoreDeps?: RunStoreDeps;
+    priorRoundsDigest?: PriorRoundDigest;
+    settledFindingsVerification?: SettledFindingVerification[];
+    headFiles?: HeadFileState[];
+  },
 ): Promise<DeltaReviewResult> {
   const prompt = buildDeltaReviewPrompt({
     cfg,
@@ -1989,6 +2345,8 @@ async function defaultRunDeltaReview(
     deltaDiff,
     specContext,
     priorRoundsDigest: accounting?.priorRoundsDigest,
+    settledFindingsVerification: accounting?.settledFindingsVerification,
+    headFiles: accounting?.headFiles,
   });
   // Not yet guarded against the effective reviewer command — invokeReviewer
   // applies resolveReviewerModelForHarness itself, per attempted harness, so a

@@ -538,28 +538,36 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 
 ## Improve sub-command
 
-`pipeline improve` is a **read-only** batch analyzer that reads `.agent-pipeline/runs/**/events.jsonl` and `summary.json`, clusters recurring failure patterns (review findings, blockers, flaky gates, token waste) and agent-reported friction (papercuts), and prints a dry-run report. It never modifies pipeline labels, branches, PRs, worktrees, or repo files.
+`pipeline improve` is a **read-only** batch analyzer that reads `.agent-pipeline/runs/**/events.jsonl` and `summary.json`, clusters recurring failure patterns (review findings, blockers, flaky gates, token waste), agent-reported friction (papercuts), and recurring expert corrections (`correction_event` records, #499/#500), and prints a dry-run report. It never modifies pipeline labels, branches, PRs, worktrees, or repo files.
 
 ```bash
 /pipeline improve                         # dry-run: print cluster report to stdout
 /pipeline improve --json                  # emit a JSON array of cluster objects
 /pipeline improve --since 2026-06-01      # restrict to runs from this date onward
 /pipeline improve --top 10               # show top-10 clusters instead of the default 5
-/pipeline improve --apply                 # create GitHub issues for clusters with ≥3 occurrences
-/pipeline improve --apply --min-occurrences 5  # raise the issue-creation threshold
+/pipeline improve --apply                 # create GitHub issues for clusters with ≥3 occurrences (≥2 for correction)
+/pipeline improve --apply --min-occurrences 5  # raise the issue-creation threshold for every category
 ```
 
-**Cluster categories:** `review-finding` (same normalized finding title across runs), `blocker` (same normalized blocker reason), `flaky-gate` (same stage with repeated `outcome: error`), `token-waste` (stages with anomalously high token count or duration, when data is available), and `papercut` (same normalized message across agent-logged `pipeline papercut` events, #419/#421). A `papercut` cluster is never merged with a `flaky-gate`/`token-waste` cluster even when both describe the same underlying problem — agent-reported and telemetry-inferred evidence always stay in separate clusters.
+**Cluster categories:** `review-finding` (same normalized finding title across runs), `blocker` (same normalized blocker reason), `flaky-gate` (same stage with repeated `outcome: error`), `token-waste` (stages with anomalously high token count or duration, when data is available), `papercut` (same normalized message across agent-logged `pipeline papercut` events, #419/#421), and `correction` (recurring `correction_event` records sharing the same deterministic `correction_key`, #500). A `papercut`/`correction` cluster is never merged with any other category even when both describe the same underlying problem — agent-reported and telemetry-inferred evidence always stay in separate clusters.
 
-**Output:** the default human-readable report lists category, normalized signal, occurrence count, affected run IDs, an evidence excerpt, and a proposed issue title. `--json` emits a JSON array with the same fields. When `--apply --json` are combined, each cluster object also includes the `issueUrl` of the created issue (and `alreadyTracked: true` when it points at a pre-existing issue rather than one just created).
+**The `correction` category (control compiler, #500):** clusters `correction_event` records (#499) by their deterministic `correction_key` — never by free-text similarity or an LLM. Occurrences are counted by distinct `correction_id`, so a replayed/duplicate delivery of one correction never inflates the count. Singletons stay visible in the report/`--json` output but are never filed — issue creation for this category needs **2** distinct occurrences by default (every other category still needs 3). Each correction cluster's evidence bundle records distinct run/item counts, first/last seen timestamps, affected stages and actors, and a sanitized evidence excerpt. Every qualifying cluster names one **next control level** — `instruction`, `skill-rubric`, `eval`, `deterministic-gate`, `human-judgment`, or the explicit `undetermined` — seeded only from a *consistent* `proposed_control` value recorded across every event in the cluster (an absent or mixed value always yields `undetermined`, never a guess). This enforces the graduation ladder (`documented rule -> skill/rubric -> eval -> deterministic gate`) by construction: the compiler only ever repeats a level the bounded event contract already agreed on, so provisional taste/strategy/product-judgment/authority corrections can never be silently hardened into an `eval` or `deterministic-gate`.
+
+**Output:** the default human-readable report lists category, normalized signal, occurrence count, affected run IDs, an evidence excerpt, and a proposed issue title (plus the evidence bundle and control-level proposal for `correction` clusters). `--json` emits a JSON array with the same fields. When `--apply --json` are combined, each cluster object also includes the `issueUrl` of the created issue (and `alreadyTracked: true` when it points at a pre-existing issue rather than one just created).
 
 **`--apply` safety:** only `gh issue create` is ever called — no label mutations, no branch writes, no pipeline state changes. Requires gh authentication; fails fast with a clear error if not authenticated. Before creating anything, `--apply` looks up open issues titled `[pipeline-improve] ...` once per invocation and skips any cluster that already has an open issue — re-running `--apply` never files a duplicate.
 
 **Auto-file (opt-in, #421):** set `papercuts.auto_file: true` (see "Per-repo config") to skip the manual `--apply` step entirely. When enabled, the engine reuses this same clustering/dedup logic to file `pipeline:backlog`-only issues for recurring papercut clusters at `run_complete` and at the end of every `pipeline queue` batch, subject to `auto_file_min_occurrences`, a per-window rate cap (`auto_file_max_per_window` within `auto_file_window_hours`), and the same open-issue dedup as `--apply`. Auto-filed issues carry an explicit agent-reported-provenance statement and sanitized evidence, receive no label besides `pipeline:backlog`, and are never queued or advanced. The auto-file path is best-effort: any failure is logged and swallowed and can never fail a run, a stage, or a batch.
 
+**Correction auto-file (opt-in, #500):** set `corrections.auto_file: true` to auto-file recurring `correction` clusters the same way. Unlike `papercuts`, correction capture itself (#499) is unconditional — every accepted operator correction or recovered failure is recorded regardless of config — so `corrections` has no capture-side `enabled` flag, only the `auto_file*` keys mirroring `papercuts`' (with `auto_file_min_occurrences` floored at 2, matching the category's own `--apply` default). Auto-filed correction issues carry the same sanitized evidence bundle and control-level proposal as the report, an explicit agent/pipeline-reported-provenance statement, and are `pipeline:backlog`-only, never queued or advanced.
+
+**Cross-host safety (#459):** unlike most of the engine's concurrency primitives (see "Concurrency scope" below), papercut auto-file's dedup and rate cap are safe across pipeline processes running on **different hosts**, not just within one host's process-local lock. The in-window rate cap is recomputed from GitHub-authored issue state immediately before each create (so an issue another host already filed counts before this host files), and after every create the engine re-reads the issue list and, if the just-filed title now matches more than one open issue, closes all but the lowest-numbered with a comment referencing the survivor. Both mechanisms are best-effort and never fail a run, stage, or batch. **Correction auto-file reuses this exact machinery** but is documented only as supported **single-host** (#459): until cross-host serialization exists for this source, no cross-host global-deduplication guarantee is claimed for it beyond the inherited papercut reconciliation behaviour.
+
 ## Scoreboard sub-command
 
 `pipeline scoreboard` is a **read-only** factory-control report over `.agent-pipeline/runs/*/run.json`, `events.jsonl`, and `summary.json`. It summarizes ready-to-deploy autonomy, cost per ready PR, stage accounting by issue/stage/harness/model/outcome, prompt size, run and stage durations, harness calls, fix rounds, blocker kinds, `pipeline:needs-human`, same-harness fallback, and test/eval/shipcheck pass rates. It never reads `terminal.log` and never modifies GitHub labels/comments, worktrees, config, or run artifacts.
+
+**Repeat-correction and control-attribution recurrence (#501):** the report additionally reads `correction_event` records (deduped by `correction_id`) and reports total corrections, distinct correction classes (distinct `correction_key`), the repeated-class count/rate, and corrections per ready-to-deploy item. It joins each class to `.agent-pipeline/control-attributions.jsonl` — the durable, explicit attribution ledger written only by `pipeline correction attribute` (never inferred from a closed issue or merged PR) — and reports the attributed `control_type`, `time-to-control`, and post-control recurrence classified as `recurred`, `no_recurrence_observed`, or `insufficient_post_control_evidence` (measured only over included runs that started after the control's `effective_at` and exercised the class's stage — zero such runs is never reported as "no recurrence"). Supersession and rollback are surfaced rather than hidden, and the report states only temporal attribution and recurrence evidence, never a causal claim. `--corrections-by <dimension>` (`repo`, `stage`, `harness`, `model`, `source_kind`, `failure_class`, `proposed_control`, or `implemented_control`; exactly one) adds an additive grouping section, and a top-still-recurring-classes list with sanitized evidence pointers is always included.
 
 ```bash
 /pipeline scoreboard
@@ -585,6 +593,17 @@ Queue selection and launch are serialized by a repo-local lock at
 `.agent-pipeline/locks/queue.lock`. A second `pipeline queue` invocation in the
 same repo exits before launching work while a live queue batch owns the lock;
 stale locks from dead processes are cleared automatically.
+
+**Concurrency scope (#459):** this queue lock, the per-issue/domain advance lock, and the
+live-planning marker are all `/tmp`-/repo-local PID locks — they serialize processes on the
+**same host only** and provide no mutual exclusion between processes on different machines.
+**Single-host operation is the engine's supported concurrency scope for these lock sites.** Each
+one guards host-local state (this host's worktrees, run-state directory, or queue), so its
+cross-host failure mode is two hosts each doing their own work on their own machine — not a
+shared, irreversible artifact — and running the pipeline against the same repository from more
+than one host at a time is unsupported. The one documented exception is `pipeline improve`
+auto-file (above), whose dedup/rate-cap guarantees are cross-host safe because its failure mode
+(a duplicate or over-cap GitHub issue) is exactly that kind of irreversible shared artifact.
 
 ```bash
 # Default run: up to 10 issues, concurrency 1, no budget cap
@@ -783,6 +802,7 @@ visual_gate:                         # run the repo's E2E/visual suite after pre
   timeout: 900                       # hard stage-level budget in seconds per visual run
   max_attempts: 2                    # total visual runs (1 = no retry/fix round); gate mode: fix rounds = max_attempts - 1
   artifacts_dir: .pipeline-visual     # worktree-relative dir the command writes screenshots/diffs/traces into
+  publish: false                     # default: false; set true to commit captured artifacts to the PR branch as PR-visible evidence (repo-history tradeoff — see below)
 eval_gate:                           # run the repo's eval harness after pre-merge, before ready-to-deploy
   enabled: false                     # default: false; set true to enable (one-time declaration per repo)
   command: "pnpm evals"              # shell command to run; supports pipes, env vars, &&, etc.
@@ -804,6 +824,7 @@ review_policy:                       # which review findings block progression v
   block_threshold: medium            # critical|high|medium|low — findings below this advise, not block (default: medium; 'high' = more throughput, 'low' = block on everything)
   min_confidence: 0.7                # 0..1 — findings below this confidence advise, not block (default: 0.7)
   max_adversarial_rounds: 3          # cap review-round re-runs; after this, still-blocking findings go advisory and the item routes to pipeline:needs-human
+  max_delta_rounds: 4                 # cap pre-merge delta review rounds per item (#483), counted from the issue's delta-review comment thread; independent of max_adversarial_rounds
 doctor:                              # deterministic preflight capability check — see "Preflight (doctor)"
   runOnStart: false                  # default: false; if true, run the preflight before planning and abort the run on any failure
   failFast: false                    # default: false; if true, stop at the first failing check instead of collecting all failures
@@ -813,6 +834,11 @@ papercuts:                           # agent-logged minor-friction capture — s
   auto_file_window_hours: 24         # default: 24 — trailing window over which papercuts are clustered for auto-filing
   auto_file_max_per_window: 3        # default: 3 — max issues auto-filed within the window
   auto_file_min_occurrences: 3       # default: 3 (must be ≥2) — min in-window occurrences a cluster must meet to be auto-filed
+corrections:                         # opt-in correction auto-file — see "Improve sub-command". Capture (#499) is unconditional; this only gates auto-filing.
+  auto_file: false                   # default: false; if true, auto-file pipeline:backlog issues for recurring correction clusters at run_complete and queue-batch end. Single-host concurrency scope (#459).
+  auto_file_window_hours: 24         # default: 24 — trailing window over which corrections are clustered for auto-filing
+  auto_file_max_per_window: 3        # default: 3 — max issues auto-filed within the window
+  auto_file_min_occurrences: 2       # default: 2 (floor 2) — min in-window distinct correction occurrences a cluster must meet to be auto-filed
 review_harness: my-reviewer          # optional: override the reviewer CLI for the review step — see "Custom reviewer harness" (default: the profile's reviewer)
 # The implementer harness is owned by the install profile and cannot be set here.
 # Only the reviewer is overridable, via `review_harness`; a `harnesses:` key is
@@ -1396,6 +1422,14 @@ When `visual_gate.enabled` (default **off**), the target repo's E2E/visual suite
 - **Tooling failures always block immediately, regardless of mode, and never route to a fix round.**
 - `artifacts_dir` (default `.pipeline-visual`, worktree-relative) is where the command should write screenshots/diffs/traces. After each run the stage enumerates the directory (bounded count/size, deterministic order, explicit truncation note if over budget), copies the files into the run directory so they survive worktree cleanup, and lists the captured paths in the `## Visual Gate` comment and the evidence bundle. A missing/empty directory is not a failure — it's recorded as "no artifacts captured" — and a path that resolves outside the worktree is rejected outright, never read.
 - The command's environment carries `PIPELINE_PR_NUMBER`, `PIPELINE_BRANCH`, `PIPELINE_ISSUE`, `PIPELINE_RUN_ID`, and `PIPELINE_VISUAL_ARTIFACTS_DIR` (absolute), so a repo-defined suite can target its own per-PR preview deployment instead of only a locally served build. The pipeline never fetches or validates any preview URL itself — that stays entirely inside your command.
+- A file whose copy into the run directory fails is never reported as captured — it's listed per file in the manifest as "(copy failed)" so evidence never claims a file it didn't actually persist.
+
+**Publishing artifacts to the PR (`publish`, default `false`).** The manifest above lists paths that live only in the run store on the runner — a human reviewing the PR can't open them without shell access. Setting `visual_gate.publish: true` makes the gate, once the deciding run's manifest is settled, write the captured files to a dedicated worktree evidence path (`.pipeline-visual-evidence/`, distinct from `artifacts_dir` so a gitignored scratch directory is never swept in), commit them, and push the commit to the PR branch — so they render inline in the PR's "Files changed" tab. Manifest entries for published files become Markdown links to the committed `blob/<branch>/...` URL instead of bare filenames.
+
+- **Bounded, not the same bounds as capture**: publishing uses its own, tighter limits (20 files, 2MB per file, 10MB total) than artifact enumeration, applied in the same deterministic order. A file that doesn't fit is listed as "(not published: exceeds bound)" and is never committed.
+- **Repo-history tradeoff**: committed evidence enters the branch's permanent git history, and since this repo squash-merges, a merged PR carries the final evidence tree into `main` unless a human removes it. Publishing writes a single evidence set per pass (replacing any prior set in the same commit), so at most one bounded set is ever present — but that set does persist after merge. Leave `publish` off (the default) if your repo shouldn't accept image blobs in history; the run-store manifest still works exactly as before.
+- **Pipeline-internal commit**: the publish commit uses the prescribed subject `chore: publish visual-gate evidence for #<N>`, which `isPipelineInternalCommit` recognizes — it does not invalidate a recorded pre-merge review verdict and is never mistaken for a visual-fix commit.
+- **Best-effort**: a publish push/commit failure is surfaced in the `## Visual Gate` comment (and per-file as "(not published: publish failed)") but never turns an otherwise-passing gate into a block.
 
 **Targeting a per-PR preview deployment** (e.g. a Vercel-style preview URL your CI already publishes for `PIPELINE_BRANCH`):
 
@@ -1461,6 +1495,7 @@ By default only **high/critical, well-confident** findings block: a `needs-atten
 - **`block_threshold`** (`critical`|`high`|`medium`|`low`, default `medium`) — findings whose severity is **below** the threshold are recorded as **advisory** and do not route to a fix round. The default `medium` blocks medium-and-above (only low-severity findings advise), so real issues are fixed or explicitly overridden rather than silently advised past at merge (review comments land on the issue, but a human merges the PR). Set `high` to also advise medium findings (more throughput, less rigor), or `low` to block on every finding.
 - **`min_confidence`** (`0`..`1`, default `0.7`) — findings whose reported confidence is below this floor advise rather than block, even if high-severity.
 - **`max_adversarial_rounds`** (integer, default `3`) — caps how many times a review round may re-run after a fix. Once a round hits the cap with findings still blocking, they are recorded as advisory and the item is parked at the **`pipeline:needs-human`** terminal with a punch-list comment — it never loops to exhaustion and never auto-advances with unresolved blocking findings. Resume by `--override`-ing a finding — which records the disposition and **auto-resumes the run**, flipping the label back to the review round recorded in the ceiling comment — or by fixing the findings by hand and relabeling `pipeline:needs-human` → `pipeline:review-<round>` (the round is recorded in the ceiling comment). Running `--status` on a parked item surfaces this punch-list inline — the count of unresolved blocking findings plus the resume steps — so you don't have to open the issue to see what's left.
+- **`max_delta_rounds`** (integer, default `4`) — caps how many pre-merge **delta** review rounds (the focused re-review of unreviewed commits at pre-merge, #228) a single item may run, counted durably from that item's delta-review comment thread — independent of `max_adversarial_rounds`, which delta rounds never consume. At the cap, no further delta review runs; `ceiling_action` (below) disposes of the item's outstanding blocking delta findings the same way it does at the `max_adversarial_rounds` ceiling — `park` hard-parks at `needs-human` with a punch list, `demote_and_advance` demotes below-high findings to advisory and files a single tracked follow-up issue, and a high/critical finding hard-parks regardless. This closes a loop that was previously unbounded: without a cap, a reviewer oscillating on a contested trade-off could re-review the same PR indefinitely, each round costing a fix/override cycle. A separate guard also protects this loop: when a later delta round's recommendation would reinstate a design a settled finding already required removed — even under a fresh finding key and a re-worded title — it is demoted to advisory as `settled-alternative-reinstated` unless explicitly acknowledged via `prior_round_acknowledgment`.
 
 The loop is also **recurrence-aware**: when a re-review after a fix round emits a blocking finding whose stable finding key matches one from the immediately-prior round — the exact same finding survived a fix attempt — the item parks at `needs-human` immediately instead of grinding to the round cap (an unchanged re-emit is a proven non-convergence signal; a finding that moves to a different file, severity, or 5-line band carries a different key and is treated as new — but a mere *title rewording* at the same location keeps the same key and is correctly seen as recurring). Each finding on the punch-list is tagged **`RECURRING (n rounds)`** or **`NEW`** so you can instantly see which findings a fix has already failed to resolve. Both mechanisms are pure set-comparisons of the finding keys the pipeline already emits — no extra model or network calls, and no new authority: they only end the loop earlier at the same human gate.
 
@@ -1737,7 +1772,7 @@ Each `Diagnostic` object has the shape:
 ```
 
 - `line` is present for YAML syntax errors (1-indexed); absent for field-level Zod errors.
-- For rigor/cost-gating fields (`review_policy.block_threshold`, `review_policy.min_confidence`, `review_policy.max_adversarial_rounds`, `steps.*`, `visual_gate.enabled/mode`, `eval_gate.enabled/mode`, `shipcheck_gate.enabled/mode`), an invalid value produces a diagnostic with an additional `"rigorGating": true` marker. These are always `severity: "error"` (exit 1) — a typo must never silently flip a rigor switch.
+- For rigor/cost-gating fields (`review_policy.block_threshold`, `review_policy.min_confidence`, `review_policy.max_adversarial_rounds`, `review_policy.max_delta_rounds`, `steps.*`, `visual_gate.enabled/mode`, `eval_gate.enabled/mode`, `shipcheck_gate.enabled/mode`), an invalid value produces a diagnostic with an additional `"rigorGating": true` marker. These are always `severity: "error"` (exit 1) — a typo must never silently flip a rigor switch.
 - Inert-model alias warnings (`models.planning`/`implementing`/`fix` set while the implementer harness is `codex`, or `models.review` set while the reviewer is a custom CLI — neither `claude` nor `codex`) are `severity: "warning"` and do not affect the exit code when they are the only findings.
 
 Without `--json`, a human-readable summary is printed (one line per diagnostic). The same exit-code rules apply.

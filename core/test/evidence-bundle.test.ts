@@ -1221,3 +1221,40 @@ test("injection denylist: clean bundle content is written without modification",
   // Core fields must still be present.
   assert.ok(raw.includes('"pipeline/test"'), "branch field must be preserved");
 });
+
+// ---------------------------------------------------------------------------
+// formatSummary: pre-merge delta-round accounting (#483)
+// ---------------------------------------------------------------------------
+
+test("formatSummary: renders delta-round count, cap, and ceiling disposition when present", () => {
+  const bundle: EvidenceBundle = {
+    ...baseBundle(),
+    deltaRounds: {
+      count: 4, cap: 4,
+      ceiling: { observed: 4, ceilingAction: "park" },
+      churnRounds: [],
+    },
+  };
+  const out = formatSummary(bundle);
+  assert.match(out, /Pre-merge delta rounds:/);
+  assert.match(out, /count: 4\s+cap: 4/);
+  assert.match(out, /ceiling reached: observed 4, action park/);
+});
+
+test("formatSummary: renders suspected-churn rounds with their axes", () => {
+  const bundle: EvidenceBundle = {
+    ...baseBundle(),
+    deltaRounds: {
+      count: 2, cap: 4,
+      churnRounds: [{ round: 2, axes: [{ surface: "src/pool.ts|correctness", priorMaxConfidence: 0.9, newConfidence: 0.7 }] }],
+    },
+  };
+  const out = formatSummary(bundle);
+  assert.match(out, /suspected churn:/);
+  assert.match(out, /round 2: src\/pool\.ts\|correctness \(0\.9→0\.7\)/);
+});
+
+test("formatSummary: no deltaRounds field → section omitted entirely", () => {
+  const out = formatSummary(baseBundle());
+  assert.doesNotMatch(out, /Pre-merge delta rounds:/);
+});

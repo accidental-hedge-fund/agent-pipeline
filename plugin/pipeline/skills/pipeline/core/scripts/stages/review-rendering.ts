@@ -20,11 +20,14 @@ import {
   findingPayloadFingerprint,
   formatBlockingSurfacesMarker,
   surfaceKey,
+  type AlternativeReinstatementMatch,
   type PartitionResult,
   type ReversalMatch,
   type Review1Risk,
+  type UnverifiedSettledSurfaceMatch,
   SPEC_DIVERGENCE_CATEGORY,
 } from "../review-policy.ts";
+import type { ChurnResult } from "../review-history.ts";
 import type { PipelineConfig, ReviewFinding, ReviewVerdict } from "../types.ts";
 
 export function cfgFooter(cfg: PipelineConfig | undefined): string {
@@ -40,16 +43,25 @@ function truncateTitleFor389(title: string): string {
 
 /** Build the `ReviewArtifact.blockingFindings` extension array (#389) from a
  *  round's blocking findings, keyed/surfaced identically to the existing
- *  `pipeline-blocking-surfaces` marker. */
+ *  `pipeline-blocking-surfaces` marker. Carries `confidence` and
+ *  `rejectedAlternatives` (#483) when the reviewer supplied them, so a later
+ *  round's digest can check a new recommendation against what THIS round
+ *  required removed — omitted (not defaulted to 0/[]) when absent so the
+ *  digest can tell "not reported" apart from "reported as empty". */
 function buildBlockingFindingsExtension(
   findings: ReviewFinding[],
-): Array<{ key: string; surface: string | null; severity: string; title: string }> {
-  return findings.map((f) => ({
-    key: findingKey(f),
-    surface: surfaceKey(f),
-    severity: f.severity ?? "medium",
-    title: truncateTitleFor389(f.title),
-  }));
+): Array<{ key: string; surface: string | null; severity: string; title: string; confidence?: number; rejectedAlternatives?: string[] }> {
+  return findings.map((f) => {
+    const entry: { key: string; surface: string | null; severity: string; title: string; confidence?: number; rejectedAlternatives?: string[] } = {
+      key: findingKey(f),
+      surface: surfaceKey(f),
+      severity: f.severity ?? "medium",
+      title: truncateTitleFor389(f.title),
+    };
+    if (typeof f.confidence === "number" && Number.isFinite(f.confidence)) entry.confidence = f.confidence;
+    if (f.rejected_alternatives && f.rejected_alternatives.length > 0) entry.rejectedAlternatives = f.rejected_alternatives;
+    return entry;
+  });
 }
 
 /**
@@ -82,6 +94,7 @@ export function formatReviewComment(
   diffHash?: string,
   review1Risk?: Review1Risk,
   reversalDemotions?: Map<string, ReversalMatch>,
+  alternativeDemotions?: Map<string, AlternativeReinstatementMatch>,
 ): string {
   const cfg = maybeReviewer === undefined ? undefined : cfgOrVerdict as PipelineConfig;
   const verdict = maybeReviewer === undefined
@@ -118,7 +131,11 @@ export function formatReviewComment(
       const reversalTag = reversalMatch
         ? ` \`REVERSAL-UNACKNOWLEDGED: re-raises ${reversalMatch.settledKey} "${reversalMatch.settledTitle}" settled in round ${reversalMatch.settledRound}\``
         : "";
-      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}${reversalTag}`);
+      const alternativeMatch = alternativeDemotions?.get(findingKey(f));
+      const alternativeTag = alternativeMatch
+        ? ` \`SETTLED-ALTERNATIVE-REINSTATED: reinstates "${alternativeMatch.matchedAlternative}" rejected by ${alternativeMatch.settledKey} settled in round ${alternativeMatch.settledRound}\``
+        : "";
+      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}${reversalTag}${alternativeTag}`);
       // Machine-readable payload fingerprint, emitted at render time from the
       // structured finding (#391 delta, keys 0fb96f45/b827b914): consumers
       // (fix-stage summaries, disposition matching) read it verbatim instead
@@ -194,12 +211,25 @@ export function formatDeltaReviewComment(
   blockingKeys?: Set<string>,
   diffHash?: string,
   reversalDemotions?: Map<string, ReversalMatch>,
+  alternativeDemotions?: Map<string, AlternativeReinstatementMatch>,
+  churn?: ChurnResult,
+  unverifiedSurfaceDemotions?: Map<string, UnverifiedSettledSurfaceMatch>,
 ): string {
   const shortSha = verdict.commitSha ? verdict.commitSha.slice(0, 7) : "";
   const heading = shortSha
     ? `${DELTA_REVIEW_MARKER_PREFIX} — ${verdict.verdict} (commit ${shortSha})`
     : `${DELTA_REVIEW_MARKER_PREFIX} — ${verdict.verdict}`;
   const lines: string[] = [heading, `**Reviewer**: ${reviewer}`, "", verdict.summary];
+  if (churn?.suspected) {
+    lines.push(
+      "",
+      "⚠️ **SUSPECTED CHURN**: every blocking finding in this round sits on a settled axis at " +
+        "confidence below that axis's prior maximum:",
+      ...churn.axes.map(
+        (a) => `- \`${a.surface}\` — prior max confidence ${a.priorMaxConfidence}, this round ${a.newConfidence}`,
+      ),
+    );
+  }
   const advisoryOrdinals: number[] = [];
   if (verdict.findings.length > 0) {
     lines.push("", "### Findings");
@@ -219,7 +249,15 @@ export function formatDeltaReviewComment(
       const reversalTag = reversalMatch
         ? ` \`REVERSAL-UNACKNOWLEDGED: re-raises ${reversalMatch.settledKey} "${reversalMatch.settledTitle}" settled in round ${reversalMatch.settledRound}\``
         : "";
-      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}${reversalTag}`);
+      const alternativeMatch = alternativeDemotions?.get(findingKey(f));
+      const alternativeTag = alternativeMatch
+        ? ` \`SETTLED-ALTERNATIVE-REINSTATED: reinstates "${alternativeMatch.matchedAlternative}" rejected by ${alternativeMatch.settledKey} settled in round ${alternativeMatch.settledRound}\``
+        : "";
+      const unverifiedMatch = unverifiedSurfaceDemotions?.get(findingKey(f));
+      const unverifiedTag = unverifiedMatch
+        ? ` \`SETTLED-SURFACE-UNVERIFIED: shares surface with ${unverifiedMatch.settledKey} settled in round ${unverifiedMatch.settledRound} — no HEAD-state evidence cited\``
+        : "";
+      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}${reversalTag}${alternativeTag}${unverifiedTag}`);
       // Machine-readable payload fingerprint, emitted at render time from the
       // structured finding (#391 delta, keys 0fb96f45/b827b914): consumers
       // (fix-stage summaries, disposition matching) read it verbatim instead
@@ -480,6 +518,165 @@ export function buildFollowupUpdateComment(
   lines.push(
     "",
     `> Re-entered from #${originalIssue} at round ${roundNumber} ceiling. Do not add a \`pipeline:\` label.`,
+  );
+  return lines.join("\n");
+}
+
+/**
+ * A blocking delta finding reconstructed from the durable `blockingFindings`
+ * digest/artifact entries at the pre-merge delta-round ceiling (#483) — NOT a
+ * fresh `ReviewFinding`, since no reviewer runs at the ceiling. Carries the
+ * finding's ALREADY-COMPUTED stable key verbatim (never recomputed via
+ * `findingKey`, which would require the original `line_start` this entry does
+ * not carry and would silently mint a key an operator's `--override` could
+ * never match).
+ */
+export interface DeltaCeilingFinding {
+  key: string;
+  surface: string | null;
+  severity: string;
+  title: string;
+}
+
+/**
+ * Ceiling comment posted when a pre-merge item's durable delta-round count has
+ * reached `review_policy.max_delta_rounds` (#483) and `ceiling_action` is
+ * `park` (or a high/critical finding hard-parks regardless of
+ * `ceiling_action`). Deliberately does NOT start with `DELTA_REVIEW_MARKER_PREFIX`
+ * so it is never itself counted as a further delta round by `countDeltaRounds`.
+ * Exported for tests.
+ */
+export function deltaRoundCeilingComment(
+  cfg: PipelineConfig,
+  observed: number,
+  cap: number,
+  ceilingAction: "park" | "demote_and_advance",
+  blockingFindings: DeltaCeilingFinding[],
+): string {
+  const lines = [
+    "## Pipeline: Pre-merge delta round ceiling reached — human decision required",
+    "",
+    `Pre-merge delta review has run ${observed} round(s), reaching the configured ` +
+      `\`review_policy.max_delta_rounds\` cap of ${cap}. Per \`ceiling_action: ${ceilingAction}\`, no further ` +
+      `delta review will run for this item; it is recorded as advisory and parked at \`needs-human\` — it ` +
+      `will NOT auto-advance to ready-to-deploy.`,
+    "",
+    "### Unresolved blocking delta findings",
+  ];
+  for (const f of blockingFindings) {
+    const loc = f.surface ? ` — \`${f.surface}\`` : "";
+    lines.push(`- \`${f.key}\` **[${f.severity.toUpperCase()}]** ${f.title}${loc}`);
+  }
+  lines.push(
+    "",
+    "### To resume",
+    `- Accept a finding: \`--override "<key>: <reason>"\` (audited) — records the decision and auto-resumes.`,
+    `- Or fix the finding(s) by hand.`,
+    "",
+    cfgFooter(cfg),
+  );
+  return attestPipelineComment("delta-round-ceiling", lines.join("\n"));
+}
+
+/**
+ * Audited demotion comment posted when a pre-merge item's durable delta-round
+ * count has reached `review_policy.max_delta_rounds`, `ceiling_action` is
+ * `demote_and_advance`, and every outstanding blocking delta finding is below
+ * high severity (#483). Mirrors `reviewCeilingDemotionComment`'s idempotency
+ * marker. Does NOT start with `DELTA_REVIEW_MARKER_PREFIX` for the same reason
+ * as {@link deltaRoundCeilingComment}. Exported for tests.
+ */
+export function deltaRoundCeilingDemotionComment(
+  cfg: PipelineConfig,
+  observed: number,
+  cap: number,
+  demotedFindings: DeltaCeilingFinding[],
+  followupNumber: number,
+): string {
+  const lines = [
+    "## Pipeline: Pre-merge delta round ceiling — findings demoted and deferred",
+    "",
+    `Pre-merge delta review has run ${observed} round(s), reaching the configured ` +
+      `\`review_policy.max_delta_rounds\` cap of ${cap}, with all remaining blocking finding(s) below ` +
+      `**high** severity. Per \`ceiling_action: demote_and_advance\`, these findings are demoted to ` +
+      `**advisory** and captured in follow-up issue #${followupNumber}. This item advances without human ` +
+      `intervention.`,
+    "",
+    "### Demoted findings (advisory — tracked in follow-up)",
+  ];
+  for (const f of demotedFindings) {
+    const loc = f.surface ? ` — \`${f.surface}\`` : "";
+    lines.push(`- \`${f.key}\` **[${f.severity.toUpperCase()}]** ${f.title}${loc}`);
+  }
+  lines.push(
+    "",
+    `See #${followupNumber} for the complete deferred finding list.`,
+    "",
+    "⚠️ The demoted findings were **not fixed** — review them before merging this PR.",
+    "",
+    cfgFooter(cfg),
+    "",
+    `<!-- pipeline-ceiling-followup: #${followupNumber} -->`,
+  );
+  return attestPipelineComment("delta-round-ceiling-demotion", lines.join("\n"));
+}
+
+/**
+ * Body of the single tracked follow-up issue filed when delta findings are
+ * demoted at the pre-merge delta-round ceiling (#483). Mirrors
+ * `buildFollowupIssueBody`, but over {@link DeltaCeilingFinding} (stored keys,
+ * not recomputed) since no fresh `ReviewFinding` exists at the ceiling.
+ */
+export function buildDeltaFollowupIssueBody(
+  originalIssue: number,
+  demotedFindings: DeltaCeilingFinding[],
+): string {
+  const lines = [
+    `Deferred pre-merge delta review findings from #${originalIssue}`,
+    "",
+    `These findings were demoted to advisory at the pre-merge delta-round ceiling ` +
+      `(\`review_policy.max_delta_rounds\`) because they are all below high severity ` +
+      `and the pipeline is configured with \`ceiling_action: demote_and_advance\`. ` +
+      `They should be reviewed and addressed in a follow-up change.`,
+    "",
+    "## Deferred findings",
+  ];
+  for (const f of demotedFindings) {
+    const loc = f.surface ? ` — \`${f.surface}\`` : "";
+    lines.push(`- \`${f.key}\` **[${f.severity.toUpperCase()}]** ${f.title}${loc}`);
+  }
+  lines.push(
+    "",
+    `> Deferred from #${originalIssue} at the pre-merge delta-round ceiling. Do not add a ` +
+      `\`pipeline:\` label — this issue tracks follow-up work, not an in-progress pipeline run.`,
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Update comment appended to an existing delta-ceiling follow-up issue when
+ * the item re-enters the delta-round ceiling again (#483). Mirrors
+ * `buildFollowupUpdateComment` over {@link DeltaCeilingFinding}.
+ */
+export function buildDeltaFollowupUpdateComment(
+  originalIssue: number,
+  observed: number,
+  demotedFindings: DeltaCeilingFinding[],
+): string {
+  const lines = [
+    `Additional deferred pre-merge delta findings from #${originalIssue} (re-entry at delta-round ceiling, observed ${observed})`,
+    "",
+    "The item re-entered the pre-merge delta-round ceiling. The following below-high findings were demoted to advisory in this run:",
+    "",
+    "## Additional deferred findings",
+  ];
+  for (const f of demotedFindings) {
+    const loc = f.surface ? ` — \`${f.surface}\`` : "";
+    lines.push(`- \`${f.key}\` **[${f.severity.toUpperCase()}]** ${f.title}${loc}`);
+  }
+  lines.push(
+    "",
+    `> Re-entered from #${originalIssue} at the pre-merge delta-round ceiling (observed ${observed}). Do not add a \`pipeline:\` label.`,
   );
   return lines.join("\n");
 }

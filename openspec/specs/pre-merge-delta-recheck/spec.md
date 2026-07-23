@@ -194,3 +194,292 @@ unresolved blocking keys still blocks pre-merge.
 - **THEN** the pre-merge stage SHALL block the issue at `pipeline:pre-merge` with `needs-human`
   exactly as before this change
 
+### Requirement: The pipeline SHALL count an item's prior pre-merge delta rounds purely from the durable comment thread
+
+The pipeline SHALL expose a pure, deterministic function that returns the number of pre-merge delta rounds already performed for an issue, computed only from that issue's comment list. A comment SHALL count as one delta round when its body begins with the delta-review marker prefix (`## Pre-merge Delta Review`) and its author is the authenticated pipeline actor or a trusted override actor. The function SHALL perform no filesystem, network, git, or subprocess access, and SHALL NOT read run-local state under the run directory, so the count survives a crashed run, a fresh clone, and a host switch.
+
+#### Scenario: Count is derived from trusted delta-review comments
+
+- **WHEN** an issue's comment thread contains three comments authored by the pipeline actor whose bodies begin with the delta-review marker prefix, interleaved with unrelated comments
+- **THEN** the counting function SHALL return 3
+
+#### Scenario: Untrusted or non-delta comments are not counted
+
+- **WHEN** a comment begins with the delta-review marker prefix but was authored by an identity that is neither the pipeline actor nor a trusted override actor
+- **THEN** that comment SHALL NOT contribute to the count
+
+#### Scenario: Counting is pure
+
+- **WHEN** the counting function is invoked twice with the same comment list
+- **THEN** it SHALL return the same value both times
+- **AND** SHALL make no filesystem, network, git, or subprocess call
+
+---
+
+### Requirement: Pre-merge SHALL cap delta rounds per item at `review_policy.max_delta_rounds` and apply `ceiling_action` at the ceiling
+
+Before invoking the reviewer for a pre-merge delta round, `enforceReviewShaGate` SHALL compare the item's durable delta-round count to `review_policy.max_delta_rounds`. When the count is greater than or equal to the cap, the pipeline SHALL NOT invoke the reviewer for another delta round and SHALL instead dispose of the item's outstanding blocking delta findings through the configured `ceiling_action`:
+
+- Under `ceiling_action: park`, the pipeline SHALL route the item to the `needs-human` terminal with a punch list of the unresolved blocking delta findings.
+- Under `ceiling_action: demote_and_advance`, the pipeline SHALL record below-high blocking delta findings as audited advisory dispositions, capture them in a single tracked follow-up issue, and allow pre-merge to proceed.
+- Under either setting, an outstanding blocking delta finding of severity `high` or `critical` SHALL hard-park the item at `needs-human`, mirroring the review-2 ceiling behavior.
+
+The comment the pipeline posts at the ceiling SHALL name the observed round count, the configured cap, and the applied `ceiling_action`. When the count is below the cap, behavior SHALL be unchanged from before this requirement.
+
+#### Scenario: At the cap the reviewer is not invoked again
+
+- **WHEN** an item's durable delta-round count equals `review_policy.max_delta_rounds` and pre-merge re-enters the SHA gate with a changed diff hash
+- **THEN** the pipeline SHALL NOT invoke the delta-review seam
+- **AND** SHALL apply the configured `ceiling_action`
+- **AND** SHALL post a comment naming the observed count, the cap, and the applied action
+
+#### Scenario: Ceiling under park routes to needs-human
+
+- **WHEN** the delta-round cap is reached with outstanding blocking delta findings and `ceiling_action` is `park`
+- **THEN** the item SHALL be routed to the `needs-human` terminal
+- **AND** the posted punch list SHALL enumerate the unresolved blocking delta findings
+
+#### Scenario: Ceiling under demote_and_advance demotes below-high findings and advances
+
+- **WHEN** the delta-round cap is reached, `ceiling_action` is `demote_and_advance`, and every outstanding blocking delta finding is below `high` severity
+- **THEN** those findings SHALL be recorded as audited advisory dispositions
+- **AND** SHALL be captured in a single tracked follow-up issue
+- **AND** `enforceReviewShaGate` SHALL allow pre-merge to proceed
+
+#### Scenario: High or critical findings hard-park regardless of ceiling_action
+
+- **WHEN** the delta-round cap is reached with at least one outstanding blocking delta finding of severity `high` or `critical` and `ceiling_action` is `demote_and_advance`
+- **THEN** the item SHALL be routed to the `needs-human` terminal
+- **AND** SHALL NOT advance past pre-merge
+
+#### Scenario: Below the cap behavior is unchanged
+
+- **WHEN** an item's durable delta-round count is strictly less than `review_policy.max_delta_rounds`
+- **THEN** the delta review SHALL run exactly as it did before this requirement
+
+---
+
+### Requirement: The delta-round ceiling SHALL be budgeted independently of `max_adversarial_rounds`
+
+Running or ceiling-disposing a pre-merge delta round SHALL NOT increment or consume the `max_adversarial_rounds` review-2 round budget, and reaching `max_adversarial_rounds` SHALL NOT consume delta-round budget. The two ceilings SHALL share only the `ceiling_action` setting.
+
+#### Scenario: Delta rounds do not consume review-2 budget
+
+- **WHEN** an item performs delta rounds up to and including the `max_delta_rounds` ceiling
+- **THEN** the `max_adversarial_rounds` counter SHALL be unchanged
+- **AND** the item's remaining review-2 ceiling budget SHALL be unchanged
+
+#### Scenario: Review-2 rounds do not consume delta budget
+
+- **WHEN** an item performs review-2 rounds
+- **THEN** its durable delta-round count SHALL be unchanged
+
+---
+
+### Requirement: A delta round whose blocking findings show declining confidence on settled axes SHALL be flagged as suspected churn
+
+When the pure churn detector reports suspected churn for a delta round's blocking findings against the prior-round digest, the pipeline SHALL label the posted delta-review comment as a suspected-churn round, naming the settled axes and the prior-versus-new confidences, and SHALL emit exactly one suspected-churn event for that round. The flag SHALL be audit-only: it SHALL NOT by itself change whether the round's findings block, and the round's blocking disposition SHALL be decided by the active `review_policy` and the settled-finding guards exactly as it would without the flag.
+
+#### Scenario: Suspected-churn round is labelled and evented
+
+- **WHEN** a delta round's blocking findings all sit on settled axes at strictly lower confidence than each axis's prior maximum
+- **THEN** the posted delta-review comment SHALL carry a suspected-churn label naming the settled axes and the prior and new confidences
+- **AND** exactly one suspected-churn event SHALL be emitted for that round
+
+#### Scenario: The churn flag does not alter blocking disposition
+
+- **WHEN** a delta round is flagged as suspected churn
+- **THEN** the set of blocking findings SHALL be identical to the set produced for the same findings, policy, overrides, and settled entries without the flag
+
+#### Scenario: A non-churn round carries no label or event
+
+- **WHEN** the churn detector reports no suspected churn for a delta round
+- **THEN** the posted comment SHALL carry no suspected-churn label
+- **AND** no suspected-churn event SHALL be emitted
+
+---
+
+### Requirement: Delta-round observability SHALL be recorded in the run events and the evidence bundle
+
+For each pre-merge delta round performed, the pipeline SHALL emit one `delta_round` event carrying the round number and the configured cap. When the cap is reached, it SHALL emit one `delta_round_ceiling` event carrying the observed count, the cap, and the applied `ceiling_action`. The evidence bundle SHALL record the item's delta-round count, the configured cap, the ceiling disposition when one occurred, and any suspected-churn flags. As with all evidence-bundle writes, a failure to record SHALL NOT fail the run.
+
+#### Scenario: Each delta round emits a round event
+
+- **WHEN** a pre-merge delta round runs
+- **THEN** exactly one `delta_round` event SHALL be appended carrying that round's number and the configured cap
+
+#### Scenario: Ceiling emits a ceiling event
+
+- **WHEN** the delta-round cap is reached
+- **THEN** exactly one `delta_round_ceiling` event SHALL be appended carrying the observed count, the cap, and the applied `ceiling_action`
+
+#### Scenario: Evidence bundle records delta-round accounting
+
+- **WHEN** a run performs at least one pre-merge delta round
+- **THEN** the evidence bundle SHALL report the delta-round count, the cap, the ceiling disposition when one occurred, and any suspected-churn flags
+
+#### Scenario: Bundle write failure is non-fatal
+
+- **WHEN** recording delta-round accounting into the evidence bundle fails
+- **THEN** the run SHALL continue and the pre-merge outcome SHALL be unaffected
+
+---
+
+### Requirement: The five-round oscillation history SHALL be covered by a regression test
+
+The test suite SHALL include a regression test replaying the observed five-delta-round history (PraxisIQ/fuseiq-core#95): four rounds of genuine blocking findings followed by a fifth round re-raising a settled axis under new finding keys, re-worded titles, declining confidence, and a recommendation that reinstates a design a prior round required removed. The test SHALL use fake comment fixtures with no network, git, or subprocess access, and SHALL assert both that the cap prevents the fifth round from being reviewed under the default configuration and that, when the fifth round's findings are partitioned, they are demoted rather than blocking.
+
+#### Scenario: Replay asserts the loop is bounded and the round-5 findings are demoted
+
+- **WHEN** the five-round fixture history is replayed against the gate and the partitioner
+- **THEN** the fifth delta round SHALL NOT be invoked under the default `max_delta_rounds`
+- **AND** the round-5 findings, when partitioned against the settled entries, SHALL land in the advisory partition
+
+### Requirement: The pre-merge delta review SHALL carry a resolved-finding verification context
+
+The pipeline SHALL derive, from the prior-round digest already built for the pre-merge delta review,
+the set of prior blocking findings whose recorded resolution is `resolved-by-fix` or `overridden`,
+and SHALL render them into the delta-review prompt as a resolved-finding verification section. Each
+entry SHALL carry the finding key, the surface (file and category) recorded for it, the finding
+title, the round that settled it, and its disposition. The section SHALL be derived only from the
+digest — the pipeline SHALL NOT introduce a separate durable artifact, comment marker, or run-local
+store for it — and SHALL therefore inherit the digest's trust model and fail-closed behavior.
+
+#### Scenario: Settled findings are rendered into the delta prompt
+
+- **WHEN** a pre-merge delta review is built and the prior-round digest contains findings resolved
+  by fix and/or settled by override
+- **THEN** the delta-review prompt SHALL contain a resolved-finding verification section
+- **AND** the section SHALL list each such finding's key, surface, title, settling round, and
+  disposition (`resolved-by-fix` or `overridden`)
+- **AND** findings that were advisory-only or still outstanding SHALL NOT appear in it
+
+#### Scenario: Fail-closed digest yields no verification context
+
+- **WHEN** the prior-round digest is empty because the authenticated actor could not be resolved
+- **THEN** the delta-review prompt SHALL contain no resolved-finding verification section
+
+### Requirement: The verification section SHALL require HEAD-state evidence to re-assert a settled finding
+
+The resolved-finding verification section SHALL instruct the reviewer that each listed finding is
+presumed resolved at the current head, and that re-asserting it as blocking requires citing the
+current state of the code (the file content supplied in the prompt). The instruction SHALL state
+explicitly that the finding's absence from the narrow delta diff — for example "outside this
+delta's narrow fixes" or "these commits do not address it" — is NOT sufficient grounds to re-assert
+it, and that a reviewer unable to verify persistence against the supplied file state SHALL NOT
+raise the finding as blocking.
+
+#### Scenario: Instruction text is present and drift-guarded
+
+- **WHEN** the resolved-finding verification section is rendered
+- **THEN** it SHALL state that listed findings are presumed resolved at HEAD
+- **AND** SHALL require current-file-state evidence for any re-assertion
+- **AND** SHALL reject narrow-delta-scope rationale as grounds for re-assertion
+- **AND** a test SHALL pin this instruction so the prompt cannot silently drop it
+
+### Requirement: The delta review SHALL supply HEAD file state for settled findings' surfaces
+
+For each distinct file named by a settled finding's surface, the pipeline SHALL read that file's
+content at the reviewed head from the delta reviewer's worktree — the same directory the delta diff
+is computed from — and SHALL include it in the delta-review prompt labelled with its repository
+path. Reads SHALL go through an injectable seam so unit tests perform no filesystem access. Files
+SHALL be emitted deduplicated and in ascending path order. Content SHALL be bounded by a per-file
+and a total byte cap, and any trimmed content SHALL be marked as truncated in-band. A file that is
+absent or unreadable at the head SHALL be rendered as an explicit not-present note rather than
+silently omitted.
+
+#### Scenario: Settled surfaces' files are injected at HEAD
+
+- **WHEN** the digest carries settled findings whose surfaces name `core/scripts/a.ts` and
+  `core/scripts/b.ts`
+- **THEN** the delta-review prompt SHALL include the head content of both files read from the delta
+  worktree path
+- **AND** each SHALL be labelled with its repository path
+- **AND** the files SHALL appear in ascending path order with duplicates collapsed
+
+#### Scenario: Oversized content is truncated and disclosed
+
+- **WHEN** an injected file exceeds the per-file cap, or the accumulated content exceeds the total
+  cap
+- **THEN** the emitted content SHALL be trimmed at the cap
+- **AND** the trimmed entry SHALL be marked as truncated in the prompt
+
+#### Scenario: Missing file at HEAD is disclosed, not dropped
+
+- **WHEN** a settled finding's surface names a file that does not exist at the reviewed head
+- **THEN** the prompt SHALL render an explicit note that the file is not present at HEAD
+- **AND** SHALL NOT omit the entry silently
+
+### Requirement: Injected resolution context and file state SHALL be fenced as untrusted evidence
+
+The resolved-finding verification section and the injected file content SHALL be sanitized and
+fenced on the same terms as the cross-round digest: fences SHALL be chosen so embedded content
+cannot escape them, and the surrounding text SHALL mark the content as external evidence to be
+evaluated, not as instructions to be followed.
+
+#### Scenario: Embedded fences and directives cannot escape
+
+- **WHEN** an injected file's content contains a code fence or text resembling reviewer
+  instructions
+- **THEN** the rendered section SHALL keep that content inside its fence
+- **AND** SHALL label it as untrusted external evidence
+
+### Requirement: An unverified re-assertion of a settled finding SHALL be demoted to advisory
+
+The pipeline SHALL partition as advisory rather than blocking any pre-merge delta finding whose
+surface matches a settled finding's surface and whose body cites no evidence drawn from the
+supplied head file state. The demotion SHALL reuse the existing
+settled-finding demotion path rather than introducing a parallel mechanism, and SHALL name the
+settled finding and its settling round in both the posted review comment and the emitted run event,
+with a reason distinguishing it from an unacknowledged reversal. A delta finding on a settled
+surface that does cite current file state SHALL remain blocking under the normal severity and
+confidence policy.
+
+#### Scenario: Narrow-delta rationale is demoted
+
+- **WHEN** a delta finding re-asserts a settled finding's surface with the rationale that the delta
+  does not address it, citing no head file state
+- **THEN** the finding SHALL be classified advisory, not blocking
+- **AND** the review comment and the run event SHALL name the settled finding key and its settling
+  round
+- **AND** the run SHALL NOT require an audited override to advance
+
+#### Scenario: Verified regression on a settled surface still blocks
+
+- **WHEN** a delta finding on a settled surface cites the current head file state as evidence that
+  the behavior regressed
+- **THEN** the finding SHALL be evaluated under the normal severity and confidence policy
+- **AND** SHALL block when it meets the policy's blocking threshold
+
+### Requirement: The delta path SHALL be unchanged when there is no settled history
+
+When the prior-round digest carries no settled findings, the pipeline SHALL render no
+resolved-finding verification section, SHALL perform no head file reads, and SHALL produce a
+delta-review prompt identical to the one produced before this change. No finding SHALL be demoted by
+the settled-surface evidence rule in that case.
+
+#### Scenario: First delta round is a no-op
+
+- **WHEN** a pre-merge delta review runs with a digest containing no resolved or overridden findings
+- **THEN** the prompt SHALL contain no resolved-finding verification section and no injected file
+  content
+- **AND** no file read SHALL be attempted
+- **AND** every returned finding SHALL be partitioned exactly as it is today
+
+### Requirement: Regression coverage SHALL pin the #451 re-assertion history
+
+The repository SHALL carry a regression fixture replaying the #451 case: a prior-round history in
+which findings `ac3bdbd2`, `4040cada`, and `edfd3cf1` are recorded blocking and then settled on
+their recorded surfaces, followed by a narrow delta whose review re-asserts all three with
+narrow-delta rationale and no head-state evidence. The fixture SHALL assert that all three are
+demoted to advisory, that the delta round advances without an audited override, and that the
+prompt built for that delta carries the verification section and the head content of the settled
+surfaces' files.
+
+#### Scenario: #451 history replays without overrides
+
+- **WHEN** the #451 fixture history is replayed through the pre-merge delta path
+- **THEN** all three re-asserted findings SHALL be advisory
+- **AND** the run SHALL advance without recording an override disposition
+- **AND** the assertions SHALL fail against the pre-change behavior
+

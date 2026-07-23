@@ -36,7 +36,8 @@ export const REVIEW_VERDICT_SCHEMA_BLOCK = `{
             "category": "<optional: spec-divergence|correctness|security|...>",
             "spec_divergence_direction": "<optional: code-behind-spec|spec-behind-code>",
             "blocking": true | false,
-            "prior_round_acknowledgment": "<optional: required when re-raising a settled finding from the prior-round digest as blocking — name the prior round and why a new resolution, not a reversal, is warranted; a new, distinct defect on a previously-fixed file/surface needs no acknowledgment>"
+            "prior_round_acknowledgment": "<optional: required when re-raising a settled finding from the prior-round digest as blocking — name the prior round and why a new resolution, not a reversal, is warranted; a new, distinct defect on a previously-fixed file/surface needs no acknowledgment>",
+            "rejected_alternatives": ["<optional: required when this recommendation removes or replaces an existing design — name the specific alternative(s) being ruled out>"]
         }
     ],
     "next_steps": ["<action item>"]
@@ -62,6 +63,7 @@ const FINDING_FIELD_GUARD: Record<keyof ReviewFinding, true> = {
   spec_divergence_direction: true,
   blocking: true,
   prior_round_acknowledgment: true,
+  rejected_alternatives: true,
 };
 const VERDICT_FIELD_GUARD: Record<Exclude<keyof ReviewVerdict, "commitSha">, true> = {
   verdict: true,

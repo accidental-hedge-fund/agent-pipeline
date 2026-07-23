@@ -23,9 +23,11 @@ import {
   runOverride,
   type CliOpts,
   type RunOverrideDeps,
+  type RunUnblockDeps,
 } from "../scripts/pipeline.ts";
 import { advanceReview, type AdvanceReviewDeps } from "../scripts/stages/review.ts";
 import { findingKey } from "../scripts/review-policy.ts";
+import { formatReviewComment } from "../scripts/stages/review-rendering.ts";
 import type { Outcome, PipelineConfig, Stage } from "../scripts/types.ts";
 
 type Comment = { author: string; body: string; createdAt: string };
@@ -481,9 +483,170 @@ test("runOverride appends blocker_cleared to the original PR-number run store", 
     });
 
     assert.equal(rec.clearedBlocked, 1);
-    const event = JSON.parse(fs.readFileSync(path.join(prRunDir, "events.jsonl"), "utf8").trim());
-    assert.equal(event.type, "blocker_cleared");
+    const events = fs.readFileSync(path.join(prRunDir, "events.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.ok(events.some((e) => e.type === "blocker_cleared"));
     assert.equal(rec.advances, 1);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #499 — runOverride emits exactly one correction_event on durable acceptance
+// ---------------------------------------------------------------------------
+
+test("runOverride (#499): a 'rejected' disposition appends one correction_event with source_kind: rejection", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "override-correction-rejection-"));
+  try {
+    const runDir = writeRunJson(tmp, "7-2026-06-29T00-00-00-000Z", 7);
+    const detail = detailAt(["pipeline:review-1", "blocked"], []);
+    const { deps } = makeOverrideDeps(detail);
+    const cfg = { ...CFG, repo_dir: tmp } as PipelineConfig;
+
+    await quiet(t, async () => {
+      await runOverride(cfg, 7, `${KEY_A}: rejected — false positive`, OPTS, deps);
+    });
+
+    const events = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8")
+      .trim().split("\n").map((l) => JSON.parse(l));
+    const corrections = events.filter((e) => e.type === "correction_event");
+    assert.equal(corrections.length, 1);
+    assert.equal(corrections[0].source_kind, "rejection");
+    assert.equal(corrections[0].actor_kind, "human");
+    assert.deepEqual(corrections[0].evidence_ref, { kind: "finding", id: KEY_A });
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("runOverride (#499): a 'deferred' disposition appends one correction_event with source_kind: override", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "override-correction-override-"));
+  try {
+    const runDir = writeRunJson(tmp, "7-2026-06-29T00-00-00-000Z", 7);
+    const detail = detailAt(["pipeline:review-1", "blocked"], []);
+    const { deps } = makeOverrideDeps(detail);
+    const cfg = { ...CFG, repo_dir: tmp } as PipelineConfig;
+
+    await quiet(t, async () => {
+      await runOverride(cfg, 7, `${KEY_A}: deferred #99`, OPTS, deps);
+    });
+
+    const events = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8")
+      .trim().split("\n").map((l) => JSON.parse(l));
+    const corrections = events.filter((e) => e.type === "correction_event");
+    assert.equal(corrections.length, 1);
+    assert.equal(corrections[0].source_kind, "override");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("runOverride (#499): reviewed_sha is stamped from the finding's originating review round, not left null — regression for finding 7971a697", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "override-correction-reviewed-sha-"));
+  try {
+    const runDir = writeRunJson(tmp, "7-2026-06-29T00-00-00-000Z", 7);
+    const priorRoundSha = "1".repeat(40);
+    const priorRoundComment: Comment = {
+      author: "pipeline-bot",
+      body: formatReviewComment(
+        { verdict: "needs-attention", summary: "s", findings: [BLOCKER_A], next_steps: [], commitSha: priorRoundSha },
+        2,
+        "codex",
+      ),
+      createdAt: "2026-06-12T00:00:00Z",
+    };
+    const detail = detailAt(["pipeline:review-1", "blocked"], [priorRoundComment]);
+    const { deps } = makeOverrideDeps(detail);
+    const cfg = { ...CFG, repo_dir: tmp } as PipelineConfig;
+
+    await quiet(t, async () => {
+      await runOverride(cfg, 7, `${KEY_A}: rejected — false positive`, OPTS, deps);
+    });
+
+    const events = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8")
+      .trim().split("\n").map((l) => JSON.parse(l));
+    const corrections = events.filter((e) => e.type === "correction_event");
+    assert.equal(corrections.length, 1);
+    assert.equal(corrections[0].reviewed_sha, priorRoundSha);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("runOverride (#499): no matching run directory → no correction_event, no throw", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "override-correction-no-run-"));
+  try {
+    const detail = detailAt(["pipeline:review-1", "blocked"], []);
+    const { deps, rec } = makeOverrideDeps(detail);
+    const cfg = { ...CFG, repo_dir: tmp } as PipelineConfig;
+
+    await quiet(t, async () => {
+      await runOverride(cfg, 7, `${KEY_A}: rejected — false positive`, OPTS, deps);
+    });
+
+    // No run directory exists at all — the disposition itself still succeeds.
+    assert.equal(rec.posted.length, 1);
+    assert.equal(fs.existsSync(path.join(tmp, ".agent-pipeline", "runs")), false);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #499 — runUnblock emits exactly one correction_event on durable acceptance
+// ---------------------------------------------------------------------------
+
+test("runUnblock (#499): a successful unblock (label cleared) appends one correction_event with source_kind: unblock", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "unblock-correction-"));
+  try {
+    const runDir = writeRunJson(tmp, "7-2026-06-29T00-00-00-000Z", 7);
+    const cfg = { ...CFG, repo_dir: tmp } as PipelineConfig;
+    const detail = detailAt(["pipeline:review-2", "blocked"], []);
+    const unblockDeps = {
+      getIssueDetail: (async () => detail) as RunUnblockDeps["getIssueDetail"],
+      postComment: async () => {},
+      clearBlocked: async () => {},
+    } as RunUnblockDeps;
+
+    await quiet(t, async () => {
+      await _internals.runUnblock(cfg, 7, "The fix is in branch feat/foo", 7, undefined, unblockDeps);
+    });
+
+    const events = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8")
+      .trim().split("\n").map((l) => JSON.parse(l));
+    const corrections = events.filter((e) => e.type === "correction_event");
+    assert.equal(corrections.length, 1);
+    assert.equal(corrections[0].source_kind, "unblock");
+    assert.equal(corrections[0].actor_kind, "human");
+    assert.equal(corrections[0].correction, "The fix is in branch feat/foo");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("runUnblock (#499): not-blocked issue is a no-op — no correction_event appended", async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "unblock-correction-noop-"));
+  try {
+    writeRunJson(tmp, "7-2026-06-29T00-00-00-000Z", 7);
+    const cfg = { ...CFG, repo_dir: tmp } as PipelineConfig;
+    const detail = detailAt(["pipeline:review-2"], []); // not blocked
+    let postCalled = false;
+    const unblockDeps = {
+      getIssueDetail: (async () => detail) as RunUnblockDeps["getIssueDetail"],
+      postComment: async () => { postCalled = true; },
+      clearBlocked: async () => {},
+    } as RunUnblockDeps;
+
+    await quiet(t, async () => {
+      await _internals.runUnblock(cfg, 7, "irrelevant answer", 7, undefined, unblockDeps);
+    });
+
+    assert.equal(postCalled, false, "not-blocked is a no-op — postComment must not be called");
+    const eventsPath = path.join(tmp, ".agent-pipeline", "runs", "7-2026-06-29T00-00-00-000Z", "events.jsonl");
+    assert.equal(fs.existsSync(eventsPath), false, "no event of any kind must be appended for a no-op unblock");
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

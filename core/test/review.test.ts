@@ -41,6 +41,7 @@ import type { HarnessResult } from "../scripts/harness.ts";
 import { REVIEW_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
 import { extractBlockingSurfacesFromComment, extractOverrides, findingKey, findingPayloadFingerprint, formatBlockingSurfacesMarker, nonReproducingDispositionComment, overrideComment, scopedOverrideComment, severityRank, surfaceKey } from "../scripts/review-policy.ts";
 import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
+import type { RunStoreDeps } from "../scripts/run-store.ts";
 
 // ---------------------------------------------------------------------------
 // parseStructuredVerdict — parse paths
@@ -3943,4 +3944,158 @@ test("advanceReview (#314): unreachable executor blocks before dispatch — no s
   assert.match(rec.blocked[0], /local-ollama/);
   assert.match(rec.blocked[0], /review-1/);
   assert.ok(!/Same-harness self-review/.test(JSON.stringify(rec)), "no #39 self-review fallback for a stage_executors assignment");
+});
+
+// ---------------------------------------------------------------------------
+// #499 — repair correction_event: a prior-round blocking finding cleared on
+// re-check appends one correction_event with source_kind: "repair".
+// ---------------------------------------------------------------------------
+
+function memRunStoreDepsForCorrection(): { runStoreDeps: RunStoreDeps; lines: () => string[] } {
+  const appends: string[] = [];
+  const runStoreDeps: RunStoreDeps = {
+    readFile: async () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); },
+    writeFile: async () => {},
+    appendFile: async (_p, data) => { appends.push(data); },
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async () => ({ mtime: new Date(0) }),
+  };
+  return { runStoreDeps, lines: () => appends };
+}
+
+test("repair (#499): a fully-cleared prior blocking finding (approve verdict) appends one correction_event with source_kind: repair", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(2, [FINDING_BUG])]);
+  const { runStoreDeps, lines } = memRunStoreDepsForCorrection();
+
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, { runDir: "/tmp/run", runStoreDeps }, 0, deps);
+  });
+
+  assert.deepEqual(rec.transitions, [{ to: "pre-merge" }]);
+  const corrections = lines().map((l) => JSON.parse(l)).filter((e) => e.type === "correction_event");
+  assert.equal(corrections.length, 1);
+  assert.equal(corrections[0].source_kind, "repair");
+  assert.equal(corrections[0].actor_kind, "pipeline");
+  assert.deepEqual(corrections[0].evidence_ref, { kind: "finding", id: KEY_BUG });
+});
+
+test("repair (#499): reviewed_sha is stamped from the finding's originating round, not the current head — regression for finding 7971a697", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(2, [FINDING_BUG])]);
+  const { runStoreDeps, lines } = memRunStoreDepsForCorrection();
+
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, { runDir: "/tmp/run", runStoreDeps }, 0, deps);
+  });
+
+  assert.deepEqual(rec.transitions, [{ to: "pre-merge" }]);
+  const corrections = lines().map((l) => JSON.parse(l)).filter((e) => e.type === "correction_event");
+  assert.equal(corrections.length, 1);
+  // SHA_A is the SHA the prior round's verdict comment (and therefore
+  // FINDING_BUG) was actually reviewed against; the PR's current head_sha
+  // ("f".repeat(40)) is a different, later SHA — reviewed_sha must reflect
+  // the finding's origin, not the current head, or a stale finding would
+  // read as current.
+  assert.equal(corrections[0].reviewed_sha, SHA_A);
+  assert.equal(corrections[0].head_sha, "f".repeat(40));
+  assert.notEqual(corrections[0].reviewed_sha, corrections[0].head_sha);
+});
+
+test("repair (#499): a partially-cleared round (prior finding gone, a NEW distinct finding blocks instead) appends one correction_event for only the cleared key", async (t) => {
+  // FINDING_NEW is a genuinely distinct finding (different title → different
+  // key), so it is a fresh detection, not a recurrence of FINDING_BUG — this
+  // isolates "one prior blocker cleared" from the unrelated recurrence guard.
+  const FINDING_NEW: ReviewFinding = {
+    severity: "high",
+    title: "an unrelated new bug",
+    body: "b",
+    confidence: 0.8,
+    recommendation: "fix it too",
+  };
+  const currentNaVerdictJson = JSON.stringify({
+    verdict: "needs-attention",
+    summary: "prior finding cleared; a new one appeared",
+    findings: [FINDING_NEW],
+    next_steps: [],
+  });
+  const { deps, rec } = makeDeps([currentNaVerdictJson]);
+  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(2, [FINDING_BUG])]);
+  const { runStoreDeps, lines } = memRunStoreDepsForCorrection();
+
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, { runDir: "/tmp/run", runStoreDeps }, 0, deps);
+  });
+
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
+  const corrections = lines().map((l) => JSON.parse(l)).filter((e) => e.type === "correction_event");
+  assert.equal(corrections.length, 1, "the cleared FINDING_BUG is a repair — the new, unrelated finding is not");
+  assert.deepEqual(corrections[0].evidence_ref, { kind: "finding", id: KEY_BUG });
+});
+
+test("repair (#499): a recurring finding (still blocking, unchanged key) is NOT recorded as repaired", async (t) => {
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]); // re-emits FINDING_BUG (high) — still blocking
+  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(2, [FINDING_BUG])]);
+  const { runStoreDeps, lines } = memRunStoreDepsForCorrection();
+
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, { runDir: "/tmp/run", runStoreDeps }, 0, deps);
+  });
+
+  assert.deepEqual(rec.transitions, [{ to: "needs-human" }]);
+  const corrections = lines().map((l) => JSON.parse(l)).filter((e) => e.type === "correction_event");
+  assert.equal(corrections.length, 0, "a recurring/still-blocking finding is a detection, not a correction");
+});
+
+test("repair (#499): a finding merely demoted to advisory (still returned by the reviewer, below min_confidence) is NOT recorded as a repair — regression for #499 review-2 finding c89694f9", async (t) => {
+  // Same finding, same key, still enumerated by the reviewer — only its
+  // confidence dropped below cfgConverge's min_confidence (0.7), so policy
+  // demotes it to advisory. It never disappeared from the reviewer's own
+  // findings, so this must not read as a landed repair.
+  const demotedFinding: ReviewFinding = { ...FINDING_BUG, confidence: 0.5 };
+  assert.equal(findingKey(demotedFinding), KEY_BUG, "must share the same key as the prior-round finding (test is meaningful)");
+  const currentNaVerdictJson = JSON.stringify({
+    verdict: "needs-attention",
+    summary: "same finding, now below confidence threshold",
+    findings: [demotedFinding],
+    next_steps: [],
+  });
+  const { deps, rec } = makeDeps([currentNaVerdictJson]);
+  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(2, [FINDING_BUG])]);
+  const { runStoreDeps, lines } = memRunStoreDepsForCorrection();
+
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 2, { runDir: "/tmp/run", runStoreDeps }, 0, deps);
+  });
+
+  assert.ok(!rec.transitions.some((tr) => tr.to === "needs-human"), "demoted-only round advances, it does not park");
+  const corrections = lines().map((l) => JSON.parse(l)).filter((e) => e.type === "correction_event");
+  assert.equal(corrections.length, 0, "a policy demotion is not a landed repair — the finding is still raised");
+});
+
+test("repair (#499): a first review round (no prior comment) never emits a correction_event", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  const { runStoreDeps, lines } = memRunStoreDepsForCorrection();
+
+  await quiet(t, async () => {
+    await advanceReview(cfgConverge, 1, 1, { runDir: "/tmp/run", runStoreDeps }, 0, deps);
+  });
+
+  assert.deepEqual(rec.transitions, [{ to: "review-2" }]);
+  const corrections = lines().map((l) => JSON.parse(l)).filter((e) => e.type === "correction_event");
+  assert.equal(corrections.length, 0);
+});
+
+test("repair (#499): no opts.runDir supplied → no correction_event, no throw", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(2, [FINDING_BUG])]);
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
+  });
+  assert.equal(outcome.advanced, true);
+  assert.deepEqual(rec.transitions, [{ to: "pre-merge" }]);
 });

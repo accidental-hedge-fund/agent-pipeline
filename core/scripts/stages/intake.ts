@@ -17,6 +17,8 @@ import {
   insertReleasePlanRow,
   insertPerIssueRow,
   insertDetailSectionBullet,
+  scaffoldDetailSectionHeading,
+  validateGlobalRoadmapAnchors,
   computeUnifiedDiff,
 } from "./release.ts";
 import { extractSpecDocument, isCaptureShaped, REQUIRED_SPEC_SECTIONS } from "./spec-output.ts";
@@ -493,6 +495,15 @@ export async function runIntake(
     d.log(`[pipeline intake] proposed release slot: v${version}`);
   }
 
+  // 3b. Global ROADMAP anchor precondition — runs BEFORE the model harness call so a
+  //     fundamentally malformed ROADMAP.md aborts in seconds at zero token cost. This
+  //     checks only the anchors every intake insertion depends on (the release-plan
+  //     `| *(none)* |` sentinel row and the per-issue table header) — NOT the
+  //     target-release `### vX.Y.Z` detail section, which is legitimately absent for a
+  //     milestone created without ROADMAP structure and is scaffolded (or degraded to a
+  //     gap report) after spec generation instead of aborting here.
+  validateGlobalRoadmapAnchors(roadmapAtBase);
+
   // 4. Extract ROADMAP context for the harness prompt.
   const releaseContext = extractReleaseContext(roadmapAtBase, version);
 
@@ -539,12 +550,13 @@ export async function runIntake(
   // 6. Validate the generated spec body — fail early before any irreversible action.
   validateSpecBody(specBody);
 
-  // 7. Precompute roadmap mutations with a placeholder issue number to validate all
-  //    ROADMAP anchors exist.  Uses base-branch content so anchor validation reflects
-  //    the integration branch, not a potentially-stale caller worktree.
-  //    This must succeed before creating any GitHub issue so anchor drift never leaves
-  //    behind an orphaned issue with no roadmap PR.
-  const prevalidatedRoadmap = applyRoadmapMutations(roadmapAtBase, version, 0, title, oneLiner);
+  // 7. Precompute roadmap mutations with a placeholder issue number. Uses base-branch
+  //    content so the preview reflects the integration branch, not a potentially-stale
+  //    caller worktree. A missing target-release detail section is scaffolded here (not
+  //    an abort) — see applyRoadmapMutations. Global anchor validation already ran as a
+  //    precondition above, before the harness call.
+  const { text: prevalidatedRoadmap, roadmapGap: prevalidatedGap } =
+    applyRoadmapMutations(roadmapAtBase, version, 0, title, oneLiner);
 
   // Dry-run path: print proposed body + diff and exit without any writes.
   if (opts.dryRun) {
@@ -553,6 +565,9 @@ export async function runIntake(
     d.log(specBody);
     d.log("\n=== Proposed ROADMAP.md diff ===\n");
     d.log(diff || "(no changes)");
+    if (prevalidatedGap) {
+      d.log(`\n${prevalidatedGap}`);
+    }
     return;
   }
 
@@ -603,8 +618,13 @@ export async function runIntake(
   // 12. Apply the three ROADMAP mutations with the real issue number, write onto the
   //     prepared branch, commit, push (fast-forward onto the reserved ref), and open the PR.
   //     Past issue creation a failure here leaves the issue + reserved branch live, so log a
-  //     recovery command.
-  const mutatedRoadmap = applyRoadmapMutations(roadmapAtBase, version, issueNumber, title, oneLiner);
+  //     recovery command. A missing target-release detail section is scaffolded (not an
+  //     abort); if scaffolding is genuinely impossible, roadmapGap carries a gap report
+  //     that is logged below — the issue is never discarded on account of it.
+  const { text: mutatedRoadmap, roadmapGap } = applyRoadmapMutations(roadmapAtBase, version, issueNumber, title, oneLiner);
+  if (roadmapGap) {
+    d.log(`\n${roadmapGap}`);
+  }
   const prTitle = `intake: ROADMAP slot for #${issueNumber} — ${title}`;
   try {
     d.writeFile(roadmapPath, mutatedRoadmap);
@@ -637,13 +657,24 @@ export async function runIntake(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Apply the three ROADMAP mutations. The release-plan row and per-issue row insert
+ * against the GLOBAL anchors (validated as a precondition before the harness call) and
+ * never require pre-existing per-version structure. The detail-section bullet does
+ * require a `### vX.Y.Z` heading — when absent (e.g. a milestone created via the GitHub
+ * API with no ROADMAP structure), scaffold it (scaffoldDetailSectionHeading) rather than
+ * aborting. If scaffolding is genuinely impossible (the detail-section container itself
+ * is missing), degrade: return the release-plan + per-issue mutations WITHOUT the
+ * detail bullet, plus a `roadmapGap` report — the caller SHALL still create the issue and
+ * SHALL NOT discard the generated spec.
+ */
 function applyRoadmapMutations(
   text: string,
   version: string,
   issueNumber: number,
   title: string,
   oneLiner: string,
-): string {
+): { text: string; roadmapGap?: string } {
   const issueRef = issueNumber > 0 ? `#${issueNumber}` : "#TBD";
   let mutated = text;
   mutated = insertReleasePlanRow(
@@ -663,12 +694,25 @@ function applyRoadmapMutations(
     version,
     "—",
   );
-  mutated = insertDetailSectionBullet(
-    mutated,
-    version,
-    `**${issueRef}** — ${oneLiner}`,
-  );
-  return mutated;
+
+  try {
+    mutated = scaffoldDetailSectionHeading(mutated, version);
+    mutated = insertDetailSectionBullet(
+      mutated,
+      version,
+      `**${issueRef}** — ${oneLiner}`,
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      text: mutated,
+      roadmapGap:
+        `[pipeline intake] roadmap gap: could not scaffold a "### v${version}" detail section — ${msg}\n` +
+        `  The release-plan row and per-issue row were still added; the detail bullet was not.\n` +
+        `  Reconcile manually: pipeline roadmap --apply   (or)   pipeline sweep --apply`,
+    };
+  }
+  return { text: mutated };
 }
 
 function extractReleaseContext(roadmapText: string, version: string): string {

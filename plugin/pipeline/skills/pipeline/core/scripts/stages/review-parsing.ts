@@ -76,8 +76,20 @@ export interface ReviewArtifact {
    * scraping markdown. Optional for backward compat with artifacts encoded
    * before this field existed — absent on legacy comments, which fall back to
    * the `pipeline-blocking-surfaces` / `pipeline-blocking-keys` markers.
+   *
+   * `confidence` and `rejectedAlternatives` (#483) extend each entry: the
+   * finding's reported confidence and the design alternatives its
+   * recommendation required removed/replaced. Both are optional for backward
+   * compat with artifacts encoded before these fields existed.
    */
-  blockingFindings?: Array<{ key: string; surface: string | null; severity: string; title: string }>;
+  blockingFindings?: Array<{
+    key: string;
+    surface: string | null;
+    severity: string;
+    title: string;
+    confidence?: number;
+    rejectedAlternatives?: string[];
+  }>;
 }
 
 /**
@@ -98,18 +110,36 @@ export function hashReviewBody(text: string): string {
 /** Structural validator for `ReviewArtifact.blockingFindings` (#389): true only
  *  when `v` is an array of objects each carrying `key`/`severity`/`title` as
  *  strings and `surface` as a string or null. Used to reject a malformed or
- *  tampered `blockingFindings` array rather than trust it structurally. */
-function isValidBlockingFindings(v: unknown): v is Array<{ key: string; surface: string | null; severity: string; title: string }> {
+ *  tampered `blockingFindings` array rather than trust it structurally.
+ *  `confidence` (#483) is optional and must be a finite number when present;
+ *  `rejectedAlternatives` (#483) is optional and must be a string array when
+ *  present — a structurally invalid value on either field rejects the whole
+ *  entry set (fail closed) rather than silently coercing it. */
+function isValidBlockingFindings(v: unknown): v is Array<{
+  key: string;
+  surface: string | null;
+  severity: string;
+  title: string;
+  confidence?: number;
+  rejectedAlternatives?: string[];
+}> {
   if (!Array.isArray(v)) return false;
-  return v.every(
-    (e) =>
-      typeof e === "object" &&
-      e !== null &&
-      typeof (e as Record<string, unknown>).key === "string" &&
-      ((e as Record<string, unknown>).surface === null || typeof (e as Record<string, unknown>).surface === "string") &&
-      typeof (e as Record<string, unknown>).severity === "string" &&
-      typeof (e as Record<string, unknown>).title === "string",
-  );
+  return v.every((e) => {
+    if (typeof e !== "object" || e === null) return false;
+    const r = e as Record<string, unknown>;
+    if (typeof r.key !== "string") return false;
+    if (r.surface !== null && typeof r.surface !== "string") return false;
+    if (typeof r.severity !== "string") return false;
+    if (typeof r.title !== "string") return false;
+    if (r.confidence !== undefined && (typeof r.confidence !== "number" || !Number.isFinite(r.confidence))) return false;
+    if (
+      r.rejectedAlternatives !== undefined &&
+      (!Array.isArray(r.rejectedAlternatives) || !r.rejectedAlternatives.every((a) => typeof a === "string"))
+    ) {
+      return false;
+    }
+    return true;
+  });
 }
 
 /** True when `re` has at least one match starting after `pos` in `body`. */

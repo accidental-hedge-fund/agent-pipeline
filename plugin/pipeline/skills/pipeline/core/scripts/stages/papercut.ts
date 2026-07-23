@@ -18,11 +18,14 @@ import {
   type PapercutEvent,
 } from "../run-store.ts";
 import {
+  clusterCorrections,
   clusterPapercuts,
   clustersToEntries,
+  collectFindingSeverities,
   proposedTitle,
   readEventsLines,
   realImproveDeps,
+  renderControlProposal,
   type ClusterAccum,
   type ClusterEntry,
   type OpenImproveIssue,
@@ -218,6 +221,125 @@ export async function reportPapercuts(
   return results;
 }
 
+/** Machine-readable marker (#459 review 2, finding 582c19e6) embedded in every
+ *  auto-filed issue body by `buildAutoFileBody`. Neither the `[pipeline-improve]`
+ *  title prefix (also used by `pipeline improve --apply`) nor the `pipeline:backlog`
+ *  label (also applied by `/pipeline:triage` to human-managed issues) alone proves an
+ *  issue was created by this auto-file path — reconciliation below requires this marker
+ *  in the body before treating an issue as a reconciliation candidate, so a human-managed
+ *  or otherwise-provenanced `pipeline:backlog` issue is never closed as a dupe or cap
+ *  overflow. */
+export const AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:papercut-auto-filed -->";
+
+/** Same role as `AUTO_FILE_PROVENANCE_MARKER`, but for issues auto-filed from
+ *  recurring `correction` clusters (#500) — kept distinct so a papercut- and a
+ *  correction-sourced auto-filed issue are never confused with each other by
+ *  reconciliation, even though both reuse the same reconciliation function. */
+export const CORRECTION_AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:correction-auto-filed -->";
+
+/** Post-create read-back reconciliation (#459, hardened for review finding
+ *  f09ce15de2e6911a): re-list improve issues once and correct two distinct
+ *  cross-host races against that single snapshot.
+ *
+ *  1. Duplicate-title: when `title` now maps to more than one **open** issue
+ *     (a foreign host raced into the same create in the pre-create check's
+ *     TOCTOU window), keep the lowest-numbered open issue and close the rest
+ *     with a comment naming the survivor.
+ *  2. Rate-cap overflow: two hosts near the cap can both pass the pre-create
+ *     cap check (which only reads GitHub *before* either create lands) and
+ *     then file *different* titles, overshooting `maxPerWindow` in a way the
+ *     duplicate-title check above cannot see (different titles never look
+ *     like dupes of each other). Recompute the in-window open auto-filed set
+ *     from the same snapshot and close every issue past the lowest-numbered
+ *     `maxPerWindow` survivors.
+ *
+ *  Both candidate sets are additionally restricted to issues whose body carries
+ *  `AUTO_FILE_PROVENANCE_MARKER` (#459 review 2, finding 582c19e6) — a human-managed or
+ *  `pipeline improve --apply`-created `pipeline:backlog`/`[pipeline-improve]`-titled issue
+ *  never carries this marker and so is never a reconciliation candidate.
+ *
+ *  Both rules pick survivors by ascending issue number, so two hosts
+ *  reconciling independently — potentially against different snapshots taken
+ *  at different times — always converge on the same surviving set once every
+ *  host's post-create reconciliation has run. Total: any failure (list or
+ *  close) is caught, logged non-fatal, and left for a later trigger to
+ *  reconcile — it never propagates. */
+async function reconcilePostCreateState(
+  title: string,
+  deps: AutoFileDeps,
+  cutoffMs: number,
+  maxPerWindow: number,
+  marker: string,
+  logPrefix: string,
+): Promise<void> {
+  let issues: OpenImproveIssue[];
+  try {
+    issues = await deps.listOpenImproveIssues();
+  } catch (err) {
+    deps.log(
+      `[pipeline] ${logPrefix}: reconciliation list failed (non-fatal) — ${title}: ${(err as Error).message}`,
+    );
+    return;
+  }
+
+  const closedNumbers = new Set<number>();
+
+  const isAutoFiled = (i: OpenImproveIssue): boolean => (i.body ?? "").includes(marker);
+
+  const dupes = issues
+    .filter((i) => i.state === "OPEN" && i.title === title && isAutoFiled(i))
+    .map((i) => ({ issue: i, number: issueNumberFromUrl(i.url) }))
+    .filter((x): x is { issue: OpenImproveIssue; number: number } => x.number !== null)
+    .sort((a, b) => a.number - b.number);
+  if (dupes.length > 1) {
+    const survivor = dupes[0];
+    for (const dup of dupes.slice(1)) {
+      try {
+        await deps.closeIssue(
+          dup.number,
+          `Closed as a duplicate of #${survivor.number} — a concurrent pipeline run on another ` +
+            `host auto-filed the same cluster (cross-host auto-file reconciliation).`,
+        );
+        closedNumbers.add(dup.number);
+        deps.log(
+          `[pipeline] ${logPrefix}: reconciled cross-host duplicate — closed #${dup.number}, kept #${survivor.number}`,
+        );
+      } catch (err) {
+        deps.log(
+          `[pipeline] ${logPrefix}: reconciliation close failed (non-fatal) for #${dup.number}: ${(err as Error).message}`,
+        );
+      }
+    }
+  }
+
+  const inWindow = issues
+    .filter((i) => i.state === "OPEN" && i.labels.includes("pipeline:backlog") && isAutoFiled(i))
+    .map((i) => ({ number: issueNumberFromUrl(i.url), createdMs: Date.parse(i.createdAt) }))
+    .filter(
+      (x): x is { number: number; createdMs: number } =>
+        x.number !== null &&
+        !closedNumbers.has(x.number) &&
+        Number.isFinite(x.createdMs) &&
+        x.createdMs >= cutoffMs,
+    )
+    .sort((a, b) => a.number - b.number);
+  for (const over of inWindow.slice(maxPerWindow)) {
+    try {
+      await deps.closeIssue(
+        over.number,
+        `Closed to enforce the auto-file rate cap (${maxPerWindow} per window) — a concurrent ` +
+          `pipeline run on another host filed past the cap before this host's pre-create check ` +
+          `observed it (cross-host auto-file reconciliation).`,
+      );
+      deps.log(`[pipeline] ${logPrefix}: reconciled rate-cap overflow — closed #${over.number}`);
+    } catch (err) {
+      deps.log(
+        `[pipeline] ${logPrefix}: reconciliation close failed (non-fatal) for #${over.number}: ${(err as Error).message}`,
+      );
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // autoFilePapercuts (#421)
 // ---------------------------------------------------------------------------
@@ -240,6 +362,9 @@ export interface AutoFileDeps {
   listOpenImproveIssues: () => Promise<OpenImproveIssue[]>;
   /** Create a GitHub issue with the given labels and return its URL. */
   createIssue: (title: string, body: string, labels: string[]) => Promise<string>;
+  /** Close an issue with an explanatory comment (#459 cross-host duplicate
+   *  reconciliation). Injectable so tests never touch real gh. */
+  closeIssue: (number: number, comment: string) => Promise<void>;
   ghAuthCheck: () => Promise<boolean>;
   readLines: (p: string) => AsyncIterable<string>;
   readdir: (p: string) => Promise<Array<{ name: string; isDirectory(): boolean }>>;
@@ -271,7 +396,26 @@ export function realAutoFileDeps(repoDir: string): AutoFileDeps {
       }
       return (r.stdout ?? "").trim();
     },
+    closeIssue: async (number, comment) => {
+      const r = spawnSync(
+        "gh",
+        ["issue", "close", String(number), "--comment", comment],
+        { encoding: "utf8", cwd: repoDir },
+      );
+      if (r.status !== 0) {
+        throw new Error(`gh issue close failed: ${r.stderr?.trim() ?? "unknown error"}`);
+      }
+    },
   };
+}
+
+/** Extract the issue number from a `gh`-authored issue URL
+ *  (`https://github.com/{owner}/{repo}/issues/{number}`). Returns null for any
+ *  URL that doesn't match — callers must treat that as "can't determine a
+ *  reliable ordering" rather than guessing. */
+export function issueNumberFromUrl(url: string): number | null {
+  const m = url.match(/\/issues\/(\d+)(?:[/?#].*)?$/);
+  return m ? Number(m[1]) : null;
 }
 
 /** Agent-reported-provenance banner + sanitized evidence detail, following
@@ -292,6 +436,7 @@ function buildAutoFileBody(c: ClusterEntry, windowHours: number): string {
     "```",
   ].join("\n");
   return [
+    AUTO_FILE_PROVENANCE_MARKER,
     `## Agent-reported friction (auto-filed by \`pipeline\`)`,
     ``,
     `_This issue was filed automatically by the pipeline from agent-reported friction ` +
@@ -302,16 +447,92 @@ function buildAutoFileBody(c: ClusterEntry, windowHours: number): string {
   ].join("\n");
 }
 
-/** Cluster in-window `papercut` events across every run under `.agent-pipeline/runs/`
- *  and file one `pipeline:backlog` issue per qualifying, not-already-tracked cluster,
- *  up to the per-window rate cap. Total: every failure (unauthenticated gh, unreadable
- *  run artifacts, a throwing issue-creation call) is caught, logged as a non-fatal
- *  warning, and swallowed — this function can never fail a run, a stage, or a batch. */
-export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps): Promise<void> {
+/** Correction-cluster analogue of `buildAutoFileBody` (#500): agent/pipeline-reported-
+ *  provenance banner, sanitized evidence bundle, and the control-level proposal —
+ *  reusing `renderControlProposal` so the auto-filed body agrees with the report and
+ *  `--apply` issue body. Also states the single-host concurrency framing required by
+ *  #459: the dedup/rate-cap and post-create reconciliation below are inherited from the
+ *  papercut auto-file path's cross-host mechanism, but no cross-host global-dedup
+ *  guarantee is newly asserted for the correction source. */
+function buildCorrectionAutoFileBody(c: ClusterEntry, windowHours: number): string {
+  const ev = c.correction;
+  const detail = [
+    `**Signal**: ${c.signal}`,
+    `**Occurrences**: ${c.count} (trailing ${windowHours}h window)`,
+    ...(ev
+      ? [
+        `**Distinct runs**: ${ev.distinctRunCount}`,
+        `**Distinct items (issues/PRs)**: ${ev.distinctItemIds.join(", ") || "none"}`,
+        `**First seen**: ${ev.firstSeen ?? "unknown"}`,
+        `**Last seen**: ${ev.lastSeen ?? "unknown"}`,
+        `**Affected stages**: ${ev.stages.join(", ") || "none"}`,
+        `**Affected actors**: ${ev.actors.join(", ") || "none"}`,
+        ...(ev.severities.length > 0 ? [`**Severity evidence**: ${ev.severities.join(", ")}`] : []),
+      ]
+      : []),
+    ``,
+    `### Affected run IDs`,
+    ...c.runIds.map((id) => `- ${id}`),
+    ``,
+    `### Evidence excerpt`,
+    "```",
+    c.excerpt,
+    "```",
+    ``,
+    ...renderControlProposal(c),
+  ].join("\n");
+  return [
+    CORRECTION_AUTO_FILE_PROVENANCE_MARKER,
+    `## Recurring correction detected by \`pipeline\` (auto-filed)`,
+    ``,
+    `_This issue was filed automatically by the pipeline from recurring \`correction_event\` ` +
+      `records (#499/#500). The content below is agent/pipeline-reported, not human-authored ` +
+      `or human-verified — verify independently before acting._`,
+    ``,
+    `_Concurrency scope (#459): correction auto-filing is supported single-host. The dedup, ` +
+      `rate-cap, and post-create reconciliation checks below reuse the papercut auto-file ` +
+      `path's cross-host mechanism, but that is described only as inherited behaviour — no new ` +
+      `cross-host global-deduplication guarantee is asserted for the correction source._`,
+    ``,
+    sanitize(redactSecrets(detail)),
+  ].join("\n");
+}
+
+/** Shape shared by `autoFilePapercuts` and `autoFileCorrections` (#500): which
+ *  event type to cluster, how to accumulate it, how to render its issue body,
+ *  the provenance marker reconciliation uses to recognize its own issues, and
+ *  the log-line prefix. */
+interface AutoFileCategory {
+  eventType: string;
+  clusterFn: (
+    event: Record<string, unknown>,
+    runId: string,
+    clusters: Map<string, ClusterAccum>,
+    findingSeverities?: Map<string, string>,
+  ) => void;
+  buildBody: (c: ClusterEntry, windowHours: number) => string;
+  marker: string;
+  logPrefix: string;
+}
+
+/** Cluster in-window events of `category.eventType` across every run under
+ *  `.agent-pipeline/runs/` and file one `pipeline:backlog` issue per qualifying,
+ *  not-already-tracked cluster, up to the per-window rate cap. Total: every
+ *  failure (unauthenticated gh, unreadable run artifacts, a throwing
+ *  issue-creation call) is caught, logged as a non-fatal warning, and
+ *  swallowed — this function can never fail a run, a stage, or a batch. Shared
+ *  by `autoFilePapercuts` (#421) and `autoFileCorrections` (#500) so both reuse
+ *  the exact same minimum-occurrence, dedup, rate-cap, sanitization, and
+ *  cross-host reconciliation machinery. */
+async function autoFileClusterCategory(
+  opts: AutoFileOpts,
+  deps: AutoFileDeps,
+  category: AutoFileCategory,
+): Promise<void> {
   try {
     const authed = await deps.ghAuthCheck();
     if (!authed) {
-      deps.log("[pipeline] papercut auto-file: skipped (gh not authenticated)");
+      deps.log(`[pipeline] ${category.logPrefix}: skipped (gh not authenticated)`);
       return;
     }
 
@@ -331,11 +552,17 @@ export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps):
       if (!entry.isDirectory()) continue;
       const runId = entry.name;
       const eventsPath = path.join(dir, runId, "events.jsonl");
+      // Per-run findingKey -> severity lookup (#500 review 2 finding
+      // 02b2a1921d7c779a), mirroring runImprove — lets a correction cluster's
+      // evidence bundle resolve severity via evidence_ref even on this
+      // reduced, single-event-type-filtered scan.
+      const findingSeverities = new Map<string, string>();
       for await (const event of readEventsLines(eventsPath, deps)) {
-        if ((event as { type?: unknown }).type !== "papercut") continue;
+        collectFindingSeverities(event, findingSeverities);
+        if ((event as { type?: unknown }).type !== category.eventType) continue;
         const at = typeof event["at"] === "string" ? Date.parse(event["at"] as string) : NaN;
         if (!Number.isFinite(at) || at < cutoffMs) continue;
-        clusterPapercuts(event, runId, clusters);
+        category.clusterFn(event, runId, clusters, findingSeverities);
       }
     }
 
@@ -359,22 +586,19 @@ export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps):
       for (const c of qualifying) {
         const title = proposedTitle(c);
         if (byTitle.has(title)) {
-          deps.log(`[pipeline] papercut auto-file: already tracked — ${title}`);
+          deps.log(`[pipeline] ${category.logPrefix}: already tracked — ${title}`);
           continue;
         }
         toFile.push(c);
       }
       if (toFile.length === 0) return;
 
-      // Rate cap (#421 D4, finding 3) — count pipeline:backlog + [pipeline-improve]
-      // issues created inside the trailing window, including closed ones: an
-      // auto-filed issue closed during the window must still count toward the cap.
-      const filedInWindow = openIssues.filter((i) => {
-        if (!i.labels.includes("pipeline:backlog")) return false;
-        const createdMs = Date.parse(i.createdAt);
-        return Number.isFinite(createdMs) && createdMs >= cutoffMs;
-      }).length;
-      let remaining = Math.max(0, opts.maxPerWindow - filedInWindow);
+      const filedInWindowCount = (issues: OpenImproveIssue[]): number =>
+        issues.filter((i) => {
+          if (!i.labels.includes("pipeline:backlog")) return false;
+          const createdMs = Date.parse(i.createdAt);
+          return Number.isFinite(createdMs) && createdMs >= cutoffMs;
+        }).length;
 
       for (const c of toFile) {
         const title = proposedTitle(c);
@@ -382,25 +606,81 @@ export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps):
         // differ only past the 60-char truncation in proposedTitle() must not both
         // file an issue for the same title within one invocation.
         if (byTitle.has(title)) {
-          deps.log(`[pipeline] papercut auto-file: already tracked — ${title}`);
+          deps.log(`[pipeline] ${category.logPrefix}: already tracked — ${title}`);
           continue;
         }
-        if (remaining <= 0) {
-          deps.log(`[pipeline] papercut auto-file: deferred (rate cap) — ${title}`);
-          continue;
-        }
+
+        // Cross-host cap + dedup (#459): `withLock` only serializes this host.
+        // Re-read GitHub-authored issue state immediately before creating so a
+        // duplicate title or a cap-filling issue filed by another host (or by
+        // this host's own prior iteration, once created) is counted before we
+        // file — rather than trusting the single up-front `openIssues` snapshot
+        // for the whole loop.
+        let freshIssues: OpenImproveIssue[];
         try {
-          const body = buildAutoFileBody(c, opts.windowHours);
-          const url = await deps.createIssue(title, body, ["pipeline:backlog"]);
-          deps.log(`[pipeline] papercut auto-file: created ${url}`);
-          byTitle.set(title, { title, url, state: "OPEN", createdAt: "", labels: ["pipeline:backlog"] });
-          remaining--;
+          freshIssues = await deps.listOpenImproveIssues();
         } catch (err) {
-          deps.log(`[pipeline] papercut auto-file: create failed (non-fatal): ${(err as Error).message}`);
+          deps.log(
+            `[pipeline] ${category.logPrefix}: cross-host state check failed (non-fatal), skipping — ${title}: ${(err as Error).message}`,
+          );
+          continue;
+        }
+        const freshOpenTitle = freshIssues.find((i) => i.state === "OPEN" && i.title === title);
+        if (freshOpenTitle) {
+          byTitle.set(title, freshOpenTitle);
+          deps.log(`[pipeline] ${category.logPrefix}: already tracked (cross-host) — ${title}`);
+          continue;
+        }
+        if (filedInWindowCount(freshIssues) >= opts.maxPerWindow) {
+          deps.log(`[pipeline] ${category.logPrefix}: deferred (rate cap) — ${title}`);
+          continue;
+        }
+
+        try {
+          const body = category.buildBody(c, opts.windowHours);
+          const url = await deps.createIssue(title, body, ["pipeline:backlog"]);
+          deps.log(`[pipeline] ${category.logPrefix}: created ${url}`);
+          byTitle.set(title, { title, url, state: "OPEN", createdAt: "", labels: ["pipeline:backlog"], body });
+          await reconcilePostCreateState(title, deps, cutoffMs, opts.maxPerWindow, category.marker, category.logPrefix);
+        } catch (err) {
+          deps.log(`[pipeline] ${category.logPrefix}: create failed (non-fatal): ${(err as Error).message}`);
         }
       }
     });
   } catch (err) {
-    deps.log(`[pipeline] papercut auto-file failed (non-fatal): ${(err as Error).message}`);
+    deps.log(`[pipeline] ${category.logPrefix} failed (non-fatal): ${(err as Error).message}`);
   }
+}
+
+const PAPERCUT_AUTO_FILE_CATEGORY: AutoFileCategory = {
+  eventType: "papercut",
+  clusterFn: clusterPapercuts,
+  buildBody: buildAutoFileBody,
+  marker: AUTO_FILE_PROVENANCE_MARKER,
+  logPrefix: "papercut auto-file",
+};
+
+const CORRECTION_AUTO_FILE_CATEGORY: AutoFileCategory = {
+  eventType: "correction_event",
+  clusterFn: clusterCorrections,
+  buildBody: buildCorrectionAutoFileBody,
+  marker: CORRECTION_AUTO_FILE_PROVENANCE_MARKER,
+  logPrefix: "correction auto-file",
+};
+
+/** Opt-in papercut auto-file (#421). See `autoFileClusterCategory` for the
+ *  shared machinery and its totality/non-fatal contract. */
+export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps): Promise<void> {
+  return autoFileClusterCategory(opts, deps, PAPERCUT_AUTO_FILE_CATEGORY);
+}
+
+/** Opt-in correction auto-file (#500): reuses the exact same minimum-occurrence,
+ *  open-issue dedup, per-window rate cap, sanitization, provenance, and
+ *  cross-host reconciliation machinery as `autoFilePapercuts` (#421), keyed on
+ *  `correction` clusters instead of `papercut` clusters. Off/inert unless the
+ *  caller gates it on `config.corrections.auto_file` — see `pipeline-run.ts`
+ *  and `stages/queue.ts`. Honors the single-host concurrency scope of #459 —
+ *  see `buildCorrectionAutoFileBody` for the documented framing. */
+export async function autoFileCorrections(opts: AutoFileOpts, deps: AutoFileDeps): Promise<void> {
+  return autoFileClusterCategory(opts, deps, CORRECTION_AUTO_FILE_CATEGORY);
 }

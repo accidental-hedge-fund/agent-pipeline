@@ -14,6 +14,10 @@ import {
   clusterFlakyGates,
   clusterTokenWaste,
   clusterPapercuts,
+  clusterCorrections,
+  collectFindingSeverities,
+  proposeControlLevel,
+  renderControlProposal,
   clustersToEntries,
   formatReport,
   formatJson,
@@ -507,6 +511,405 @@ test("category isolation: papercut and token-waste clusters about the same stage
 });
 
 // ---------------------------------------------------------------------------
+// clusterCorrections / proposeControlLevel / renderControlProposal (#500)
+// ---------------------------------------------------------------------------
+
+function correctionEvent(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    type: "correction_event",
+    schema_version: 1,
+    at: "2026-07-01T00:00:00Z",
+    correction_id: "id-1",
+    correction_key: "key-1",
+    source_kind: "override",
+    failure_class: "review-finding",
+    actor_kind: "human",
+    issue: 500,
+    repo: "org/repo",
+    run_id: "run-1",
+    stage: "review",
+    reviewed_sha: null,
+    head_sha: null,
+    evidence_ref: { kind: "finding", id: "f1" },
+    correction: "Use X instead of Y",
+    reusable: "yes",
+    ...overrides,
+  };
+}
+
+test("clusterCorrections: identical correction_key clusters together (identity is the bounded key, not free text)", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1", correction: "Use X instead of Y" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_id: "id-2", correction: "totally different prose" }), "run-2", clusters);
+  assert.equal(clusters.size, 1, `expected 1 cluster, got ${clusters.size}`);
+  const entry = clusters.get("correction:key-1");
+  assert.equal(entry.count, 2);
+  assert.deepEqual([...entry.runIds].sort(), ["run-1", "run-2"]);
+});
+
+test("clusterCorrections: different correction_key does not merge even with identical free-text correction prose", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_key: "key-a", correction_id: "id-1", correction: "same wording" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_key: "key-b", correction_id: "id-2", correction: "same wording" }), "run-1", clusters);
+  assert.equal(clusters.size, 2, `expected 2 clusters, got ${clusters.size}`);
+});
+
+test("clusterCorrections: duplicate delivery of one correction_id counts once", () => {
+  const clusters = new Map();
+  const event = correctionEvent({ correction_id: "id-1" });
+  clusterCorrections(event, "run-1", clusters);
+  clusterCorrections(event, "run-1", clusters); // replay of the same event
+  const entry = clusters.get("correction:key-1");
+  assert.equal(entry.count, 1);
+});
+
+test("clusterCorrections: two distinct correction_ids within one correction_key count as two", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_id: "id-2" }), "run-1", clusters);
+  const entry = clusters.get("correction:key-1");
+  assert.equal(entry.count, 2);
+});
+
+test("clusterCorrections: non-correction_event events are ignored", () => {
+  const clusters = new Map();
+  clusterCorrections({ type: "blocker_set", reason: "ci failed" }, "run-1", clusters);
+  assert.equal(clusters.size, 0);
+});
+
+test("clusterCorrections: missing correction_key or correction_id is ignored", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_key: undefined }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_id: undefined }), "run-1", clusters);
+  assert.equal(clusters.size, 0);
+});
+
+test("clusterCorrections: evidence bundle records distinct items, first/last seen, stages, and actors", () => {
+  const clusters = new Map();
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-1", issue: 10, stage: "review", actor_kind: "human", at: "2026-07-01T00:00:00Z" }),
+    "run-1",
+    clusters,
+  );
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-2", issue: 11, stage: "fix-1", actor_kind: "pipeline", at: "2026-07-03T00:00:00Z" }),
+    "run-2",
+    clusters,
+  );
+  const entries = clustersToEntries(clusters, 10);
+  const entry = entries.find((e) => e.category === "correction")!;
+  assert.ok(entry.correction);
+  assert.equal(entry.correction!.distinctRunCount, 2);
+  assert.deepEqual([...entry.correction!.distinctItemIds].sort(), ["10", "11"]);
+  assert.equal(entry.correction!.firstSeen, "2026-07-01T00:00:00Z");
+  assert.equal(entry.correction!.lastSeen, "2026-07-03T00:00:00Z");
+  assert.deepEqual([...entry.correction!.stages].sort(), ["fix-1", "review"]);
+  assert.deepEqual([...entry.correction!.actors].sort(), ["human", "pipeline"]);
+});
+
+// ---------------------------------------------------------------------------
+// Severity/impact evidence cross-reference (#500 review 2 finding 02b2a1921d7c779a)
+// ---------------------------------------------------------------------------
+
+test("collectFindingSeverities: indexes key -> severity from a review_verdict event's findings", () => {
+  const out = new Map<string, string>();
+  collectFindingSeverities(
+    { type: "review_verdict", findings: [{ key: "f1", severity: "high" }, { key: "f2", severity: "low" }] },
+    out,
+  );
+  assert.equal(out.get("f1"), "high");
+  assert.equal(out.get("f2"), "low");
+});
+
+test("collectFindingSeverities: non-review_verdict events and malformed findings are ignored", () => {
+  const out = new Map<string, string>();
+  collectFindingSeverities({ type: "correction_event" }, out);
+  collectFindingSeverities({ type: "review_verdict", findings: "not-an-array" }, out);
+  collectFindingSeverities({ type: "review_verdict", findings: [{ key: "f1" }, null, "garbage"] }, out);
+  assert.equal(out.size, 0);
+});
+
+test("clusterCorrections: resolves severity evidence via evidence_ref when the finding's severity is available", () => {
+  const clusters = new Map();
+  const findingSeverities = new Map([["f1", "high"]]);
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-1", evidence_ref: { kind: "finding", id: "f1" } }),
+    "run-1",
+    clusters,
+    findingSeverities,
+  );
+  const entries = clustersToEntries(clusters, 10);
+  const entry = entries.find((e) => e.category === "correction")!;
+  assert.deepEqual(entry.correction!.severities, ["high"]);
+});
+
+test("clusterCorrections: severities is empty when no severity map is passed", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1" }), "run-1", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const entry = entries.find((e) => e.category === "correction")!;
+  assert.deepEqual(entry.correction!.severities, []);
+});
+
+test("clusterCorrections: severities is empty when evidence_ref does not reference a finding", () => {
+  const clusters = new Map();
+  const findingSeverities = new Map([["f1", "high"]]);
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-1", evidence_ref: { kind: "blocker", id: "b1" } }),
+    "run-1",
+    clusters,
+    findingSeverities,
+  );
+  const entries = clustersToEntries(clusters, 10);
+  const entry = entries.find((e) => e.category === "correction")!;
+  assert.deepEqual(entry.correction!.severities, []);
+});
+
+test("clusterCorrections: distinct severities across occurrences accumulate deduplicated", () => {
+  const clusters = new Map();
+  const findingSeverities = new Map([["f1", "high"], ["f2", "medium"]]);
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-1", evidence_ref: { kind: "finding", id: "f1" } }),
+    "run-1",
+    clusters,
+    findingSeverities,
+  );
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-2", evidence_ref: { kind: "finding", id: "f2" } }),
+    "run-1",
+    clusters,
+    findingSeverities,
+  );
+  const entries = clustersToEntries(clusters, 10);
+  const entry = entries.find((e) => e.category === "correction")!;
+  assert.deepEqual(entry.correction!.severities, ["high", "medium"]);
+});
+
+test("formatReport: renders severity evidence for a correction cluster when present", () => {
+  const clusters = new Map();
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-1", evidence_ref: { kind: "finding", id: "f1" } }),
+    "run-1",
+    clusters,
+    new Map([["f1", "critical"]]),
+  );
+  const entries = clustersToEntries(clusters, 10);
+  const report = formatReport(entries, false);
+  assert.match(report, /\*\*Severity evidence\*\*: critical/);
+});
+
+test("formatReport: omits the severity evidence line for a correction cluster with none", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1" }), "run-1", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const report = formatReport(entries, false);
+  assert.doesNotMatch(report, /Severity evidence/);
+});
+
+test("clusterCorrections: a secret in the correction text is redacted from both signal and excerpt", () => {
+  const clusters = new Map();
+  clusterCorrections(
+    correctionEvent({ correction: "rotate the key sk-ABCDEFGHIJKLMNOPQRSTUVWX01234567 immediately" }),
+    "run-1",
+    clusters,
+  );
+  const entry = clusters.get("correction:key-1");
+  assert.doesNotMatch(entry.signal, /sk-ABCDEFGHIJKLMNOPQRSTUVWX01234567/);
+  assert.doesNotMatch(entry.excerpt, /sk-ABCDEFGHIJKLMNOPQRSTUVWX01234567/);
+  assert.match(entry.excerpt, /\[redacted\]|\[REDACTED\]/i);
+});
+
+test("category isolation: a correction cluster never merges with a papercut cluster whose signal coincides", () => {
+  const clusters = new Map();
+  clusterPapercuts({ type: "papercut", message: "flaky test gate" }, "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction: "flaky test gate", correction_key: "key-flaky" }), "run-1", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  assert.equal(entries.length, 2);
+  const categories = entries.map((e) => e.category).sort();
+  assert.deepEqual(categories, ["correction", "papercut"]);
+  assert.equal(entries.find((e) => e.category === "papercut")!.count, 1);
+  assert.equal(entries.find((e) => e.category === "correction")!.count, 1);
+});
+
+test("category isolation: a correction cluster never merges with a flaky-gate cluster for the same stage", () => {
+  const clusters = new Map();
+  clusterFlakyGates({ type: "stage_complete", stage: "review", outcome: "error" }, "run-1", clusters);
+  clusterCorrections(correctionEvent({ stage: "review" }), "run-1", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const categories = entries.map((e) => e.category).sort();
+  assert.deepEqual(categories, ["correction", "flaky-gate"]);
+});
+
+test("category isolation: a correction cluster never merges with a token-waste cluster for the same stage", () => {
+  const clusters = new Map();
+  const HIGH_MS = 35 * 60 * 1000;
+  clusterTokenWaste({ stages: [{ stage: "review", commands: [{ durationMs: HIGH_MS }] }] }, "run-1", clusters);
+  clusterCorrections(correctionEvent({ stage: "review" }), "run-1", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const categories = entries.map((e) => e.category).sort();
+  assert.deepEqual(categories, ["correction", "token-waste"]);
+});
+
+test("category isolation: a correction cluster never merges with a blocker cluster whose reason coincides", () => {
+  const clusters = new Map();
+  clusterBlockers({ type: "blocker_set", reason: "spec ambiguous" }, "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction: "spec ambiguous", correction_key: "key-spec" }), "run-1", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const categories = entries.map((e) => e.category).sort();
+  assert.deepEqual(categories, ["blocker", "correction"]);
+});
+
+test("clusterCorrections: identity/dedup/qualification are unaffected across repeated runs (no LLM/enrichment hook exists in the clustering path)", () => {
+  // #500 authority boundary: clusterCorrections and proposeControlLevel are pure
+  // functions of the bounded event contract — there is no enrichment dependency
+  // parameter anywhere in the clustering path for an LLM to influence identity,
+  // dedup, or qualification through. Running the same fixture twice, independently,
+  // must produce byte-identical cluster keys/counts/levels every time.
+  const events = [
+    correctionEvent({ correction_id: "id-1", proposed_control: "instruction" }),
+    correctionEvent({ correction_id: "id-2", proposed_control: "instruction" }),
+  ];
+  function run() {
+    const clusters = new Map();
+    for (const e of events) clusterCorrections(e, "run-1", clusters);
+    return clustersToEntries(clusters, 10);
+  }
+  const a = run();
+  const b = run();
+  assert.deepEqual(a, b);
+});
+
+test("proposeControlLevel: a single consistent proposed_control seeds the level deterministically", () => {
+  assert.equal(proposeControlLevel({ proposedControls: ["eval"] }), "eval");
+  assert.equal(proposeControlLevel({ proposedControls: ["instruction"] }), "instruction");
+});
+
+test("proposeControlLevel: absent proposed_control yields undetermined", () => {
+  assert.equal(proposeControlLevel({ proposedControls: [] }), "undetermined");
+  assert.equal(proposeControlLevel({}), "undetermined");
+});
+
+test("proposeControlLevel: mixed proposed_control never escalates — yields undetermined", () => {
+  assert.equal(proposeControlLevel({ proposedControls: ["instruction", "eval"] }), "undetermined");
+  assert.equal(proposeControlLevel({ proposedControls: ["human-judgment", "deterministic-gate"] }), "undetermined");
+});
+
+test("graduation ladder: a human-judgment correction is never hardened into an eval or deterministic-gate", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1", proposed_control: "human-judgment", failure_class: "other" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_id: "id-2", proposed_control: "human-judgment", failure_class: "other" }), "run-2", clusters);
+  const entry = clustersToEntries(clusters, 10).find((e) => e.category === "correction")!;
+  assert.equal(entry.correction!.controlLevel, "human-judgment");
+  assert.notEqual(entry.correction!.controlLevel, "eval");
+  assert.notEqual(entry.correction!.controlLevel, "deterministic-gate");
+});
+
+test("graduation ladder: mixed eval/human-judgment proposed_control resolves to undetermined, never silently to eval", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1", proposed_control: "eval" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_id: "id-2", proposed_control: "human-judgment" }), "run-2", clusters);
+  const entry = clustersToEntries(clusters, 10).find((e) => e.category === "correction")!;
+  assert.equal(entry.correction!.controlLevel, "undetermined");
+});
+
+test("graduation ladder: one occurrence with proposed_control and one distinct occurrence with none resolves to undetermined, never silently to the single named level (#500 review 1 finding cc5edfd1)", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1", proposed_control: "eval" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_id: "id-2", proposed_control: undefined }), "run-2", clusters);
+  const entry = clustersToEntries(clusters, 10).find((e) => e.category === "correction")!;
+  assert.equal(entry.correction!.controlLevel, "undetermined");
+});
+
+test("renderControlProposal: names the level, includes a rationale, and includes acceptance criteria", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1", proposed_control: "skill-rubric" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_id: "id-2", proposed_control: "skill-rubric" }), "run-2", clusters);
+  const entry = clustersToEntries(clusters, 10).find((e) => e.category === "correction")!;
+  const lines = renderControlProposal(entry);
+  const text = lines.join("\n");
+  assert.match(text, /Next control level.*skill-rubric/);
+  assert.match(text, /Rationale/);
+  assert.match(text, /Acceptance criteria/);
+  assert.ok(lines.some((l) => l.startsWith("- ")), "expected at least one acceptance-criteria bullet");
+});
+
+test("renderControlProposal: undetermined cluster still renders acceptance criteria pointing at a human review", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1" }), "run-1", clusters); // no proposed_control
+  const entry = clustersToEntries(clusters, 10).find((e) => e.category === "correction")!;
+  const text = renderControlProposal(entry).join("\n");
+  assert.match(text, /Next control level.*undetermined/);
+  assert.match(text, /human reviews the evidence/i);
+});
+
+test("renderControlProposal: non-correction cluster renders nothing", () => {
+  assert.deepEqual(renderControlProposal({ category: "papercut", signal: "x", count: 1, runIds: ["r1"], excerpt: "x" }), []);
+});
+
+test("formatReport: correction cluster includes evidence bundle fields and control-level proposal", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1", proposed_control: "instruction" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_id: "id-2", proposed_control: "instruction" }), "run-2", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const report = formatReport(entries, false);
+  assert.match(report, /Distinct runs/);
+  assert.match(report, /Distinct items/);
+  assert.match(report, /First seen/);
+  assert.match(report, /Next control level.*instruction/);
+});
+
+test("formatJson: correction cluster emits a correction evidence bundle", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1", proposed_control: "eval" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_id: "id-2", proposed_control: "eval" }), "run-2", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const json = JSON.parse(formatJson(entries));
+  assert.equal(json[0].category, "correction");
+  assert.ok(json[0].correction);
+  assert.equal(json[0].correction.controlLevel, "eval");
+});
+
+test("applyIssues: correction category defaults to a 2-occurrence threshold (not the 3 used by other categories)", async () => {
+  const singleton: ClusterEntry = { category: "correction", signal: "s", count: 1, runIds: ["r1"], excerpt: "x" };
+  const pair: ClusterEntry = { category: "correction", signal: "t", count: 2, runIds: ["r1", "r2"], excerpt: "y" };
+  const createCalls: string[] = [];
+  const deps = {
+    createIssue: async (title: string) => { createCalls.push(title); return `https://github.com/org/repo/issues/1`; },
+    ghAuthCheck: async () => true,
+    listOpenImproveIssues: async () => [],
+    log: () => {},
+  };
+  await applyIssues([singleton, pair], {}, deps);
+  assert.equal(createCalls.length, 1, "only the 2-occurrence cluster should qualify at the default threshold");
+  assert.equal(singleton.issueUrl, undefined, "singleton must remain unfiled");
+  assert.ok(pair.issueUrl);
+});
+
+test("applyIssues: a non-correction category still requires 3 occurrences by default even when correction's default is 2", async () => {
+  const pair: ClusterEntry = { category: "papercut", signal: "s", count: 2, runIds: ["r1", "r2"], excerpt: "x" };
+  const deps = {
+    createIssue: async () => "https://github.com/org/repo/issues/1",
+    ghAuthCheck: async () => true,
+    listOpenImproveIssues: async () => [],
+    log: () => {},
+  };
+  await applyIssues([pair], {}, deps);
+  assert.equal(pair.issueUrl, undefined);
+});
+
+test("applyIssues: an explicit --min-occurrences overrides the per-category default uniformly", async () => {
+  const pair: ClusterEntry = { category: "correction", signal: "s", count: 2, runIds: ["r1", "r2"], excerpt: "x" };
+  const deps = {
+    createIssue: async () => "https://github.com/org/repo/issues/1",
+    ghAuthCheck: async () => true,
+    listOpenImproveIssues: async () => [],
+    log: () => {},
+  };
+  await applyIssues([pair], { minOccurrences: 3 }, deps);
+  assert.equal(pair.issueUrl, undefined, "explicit --min-occurrences 3 should override correction's default of 2");
+});
+
+// ---------------------------------------------------------------------------
 // 5.4 formatReport
 // ---------------------------------------------------------------------------
 
@@ -883,6 +1286,63 @@ test("applyIssues: two clusters that truncate to the same title in one invocatio
   );
   assert.equal(clusters[0].issueUrl, "https://github.com/org/repo/issues/1");
   assert.equal(clusters[1].alreadyTracked, true, "the second cluster should be recognized as a duplicate of the just-created title");
+});
+
+test("applyIssues: correction dedup keys on correction_key, not free-text prose (#500 review 1 finding fcb8ee87)", async () => {
+  // Same correction_key, prose changed between runs (e.g. wording tweaked) — must
+  // still dedup against the prior issue rather than filing a second one.
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1", correction: "original wording" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_id: "id-2", correction: "revised wording, totally different prose" }), "run-2", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const openIssues: OpenImproveIssue[] = [
+    {
+      title: proposedTitle(entries[0]),
+      url: "https://github.com/org/repo/issues/42",
+      state: "OPEN",
+      createdAt: "2026-07-01T00:00:00Z",
+      labels: [],
+    },
+  ];
+  const deps = makeApplyDeps({ openIssues });
+  await applyIssues(entries, {}, deps);
+  assert.equal(deps._createCalls.length, 0, "changed prose under the same correction_key must still dedup");
+  assert.equal(entries[0].alreadyTracked, true);
+});
+
+test("applyIssues: two different correction_key clusters with identical prose file two issues, never merge (#500 review 1 finding fcb8ee87)", async () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_key: "key-a", correction_id: "id-1", correction: "same wording" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_key: "key-a", correction_id: "id-2", correction: "same wording" }), "run-1", clusters);
+  clusterCorrections(correctionEvent({ correction_key: "key-b", correction_id: "id-3", correction: "same wording" }), "run-2", clusters);
+  clusterCorrections(correctionEvent({ correction_key: "key-b", correction_id: "id-4", correction: "same wording" }), "run-2", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  assert.equal(entries.length, 2);
+  const deps = makeApplyDeps();
+  await applyIssues(entries, {}, deps);
+  assert.equal(deps._createCalls.length, 2, "identical prose under different correction_keys must not dedup against each other");
+  assert.notEqual(deps._createCalls[0].title, deps._createCalls[1].title);
+});
+
+test("applyIssues: correction issue body carries severity evidence when present (#500 review 2 finding 02b2a1921d7c779a)", async () => {
+  const clusters = new Map();
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-1", evidence_ref: { kind: "finding", id: "f1" } }),
+    "run-1",
+    clusters,
+    new Map([["f1", "high"]]),
+  );
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-2", evidence_ref: { kind: "finding", id: "f1" } }),
+    "run-2",
+    clusters,
+    new Map([["f1", "high"]]),
+  );
+  const entries = clustersToEntries(clusters, 10);
+  const deps = makeApplyDeps();
+  await applyIssues(entries, {}, deps);
+  assert.equal(deps._createCalls.length, 1);
+  assert.match(deps._createCalls[0].body, /Severity evidence: high/);
 });
 
 test("applyIssues: listOpenImproveIssues is called exactly once regardless of cluster count", async () => {

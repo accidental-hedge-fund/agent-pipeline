@@ -194,7 +194,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   scoreboard: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "since", "until", "days", "json", "estimateCost", "bucket", "by", "html"]),
+    allowedFlags: new Set(["repoPath", "since", "until", "days", "json", "estimateCost", "bucket", "by", "correctionsBy", "html"]),
     needsConfig: false,
     needsGhAuth: false,
     mutatesGitHub: false,
@@ -309,6 +309,29 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     needsGhAuth: false,
     mutatesGitHub: false,
     supportsJson: true,
+  },
+
+  // correction (#499, #501): `pipeline correction record` and `pipeline
+  // correction attribute` — narrow, non-mutating commands whose only side
+  // effect is one appended, sanitized record (a correction_event or a
+  // control_attribution). mutatesGitHub:false and needsGhAuth:false are the
+  // properties that back both subcommands' authority boundary: neither is
+  // ever wired to the advance, unblock, override, merge, or deploy handlers,
+  // and no issue-close or PR-merge path writes a control_attribution.
+  correction: {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath", "profile", "issue", "runId", "sourceKind", "failureClass",
+      "stage", "evidenceRef", "correctionText", "reusable", "proposedControl",
+      "reviewedSha", "headSha",
+      // correction attribute (#501)
+      "correctionKey", "controlType", "disposition", "pr", "effectiveCommit",
+      "effectiveRelease", "effectiveAt", "supersedes", "note",
+    ]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: false,
   },
 };
 

@@ -685,6 +685,10 @@ export interface PipelineConfig {
     timeout: number;   // seconds
     max_attempts: number; // total attempts (1 = no retry)
     artifacts_dir: string; // worktree-relative
+    // Opt-in (#463): publish the deciding run's captured artifacts to the PR
+    // branch (bounded, pipeline-internal commit) so they render inline in the
+    // PR's "Files changed" tab. Default false preserves #395 behavior exactly.
+    publish: boolean;
   };
   // Review severity policy (#17). Declares which finding severities block
   // progression vs. merely advise. Findings below `block_threshold` (or below
@@ -718,6 +722,13 @@ export interface PipelineConfig {
     // guard (#234). When N consecutive rounds each raise a new-key blocking finding
     // on the same (file + category) surface, the guard fires. 0 disables the guard.
     surface_recurrence_rounds: number;
+    // Cap on pre-merge delta review rounds per item (#483), counted durably from
+    // the issue's delta-review comment thread — independent of
+    // `max_adversarial_rounds`, which never bounds delta rounds and is never
+    // consumed by them. At the ceiling, `ceiling_action` (above) disposes of the
+    // item's outstanding blocking delta findings instead of running another
+    // delta review. No "unbounded" sentinel — must be a positive integer.
+    max_delta_rounds: number;
   };
   // Doctor / preflight (#146). Opt-in, deterministic capability check that runs
   // before any autonomous work. `runOnStart` (default false) makes the checks run
@@ -739,6 +750,18 @@ export interface PipelineConfig {
     // clusters recurring papercut events and files pipeline:backlog issues
     // at run_complete and queue-batch end without a human running
     // `pipeline improve --apply`.
+    auto_file: boolean;
+    auto_file_window_hours: number;
+    auto_file_max_per_window: number;
+    auto_file_min_occurrences: number;
+  };
+  // Correction auto-file (#500). Opt-in; default disabled. Unlike `papercuts`,
+  // correction capture itself is unconditional (#499 — every accepted operator
+  // correction or recovered failure is recorded regardless of config), so this
+  // block only gates auto-filing, mirroring `papercuts`' auto_file_* keys with
+  // no capture-side `enabled` flag. Honors the single-host concurrency scope of
+  // #459 — see `core/scripts/stages/papercut.ts` (`autoFileCorrections`).
+  corrections: {
     auto_file: boolean;
     auto_file_window_hours: number;
     auto_file_max_per_window: number;
@@ -931,7 +954,7 @@ export const DEFAULT_CONFIG: Omit<
   },
   test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
-  visual_gate: { enabled: false, mode: "gate" as const, timeout: 900, max_attempts: 2, artifacts_dir: ".pipeline-visual" },
+  visual_gate: { enabled: false, mode: "gate" as const, timeout: 900, max_attempts: 2, artifacts_dir: ".pipeline-visual", publish: false },
   shipcheck_gate: {
     enabled: false,
     mode: "advisory" as const,
@@ -939,7 +962,7 @@ export const DEFAULT_CONFIG: Omit<
     rubric_path: ".github/shipcheck-rubric.md",
     block_on_partial: false,
   },
-  review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3, risk_proportional: false, ceiling_action: "park" as const, surface_recurrence_rounds: 3 },
+  review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3, risk_proportional: false, ceiling_action: "park" as const, surface_recurrence_rounds: 3, max_delta_rounds: 4 },
   doctor: { runOnStart: false, failFast: false },
   papercuts: {
     enabled: false,
@@ -947,6 +970,14 @@ export const DEFAULT_CONFIG: Omit<
     auto_file_window_hours: 24,
     auto_file_max_per_window: 3,
     auto_file_min_occurrences: 3,
+  },
+  corrections: {
+    auto_file: false,
+    auto_file_window_hours: 24,
+    auto_file_max_per_window: 3,
+    // Floor is 2 (config.ts enforces via zod .min(2)) — matches the
+    // correction category's own default --min-occurrences (#500).
+    auto_file_min_occurrences: 2,
   },
   format_gate: [] as { command: string; auto_fix: boolean }[],
   harness_sandbox: false,
@@ -1070,6 +1101,14 @@ export interface ReviewFinding {
   // reason "reversal-unacknowledged" (see partitionFindings). Ignored when the
   // finding's surface is not settled or no digest was supplied.
   prior_round_acknowledgment?: string;
+  // Rejected-alternative registry (#483): populated when this finding's
+  // `recommendation` requires removing or replacing an existing design — names
+  // the alternative(s) being ruled out. Rides the durable `blockingFindings`
+  // artifact extension into the prior-round digest so a LATER round's
+  // recommendation can be checked against what an earlier, now-settled round
+  // required removed, even under a fresh finding key and a re-worded title
+  // (the escape `matchSettledFinding`'s key/title axis cannot see).
+  rejected_alternatives?: string[];
 }
 
 export interface ReviewVerdict {
@@ -1386,6 +1425,10 @@ export interface EvidenceBundle {
    *  order. Populated by `finalizeRun` from `events.jsonl`. Additive and
    *  optional: consumers that do not recognize this field SHALL ignore it. */
   interventions?: import("./intervention.ts").HumanInterventionEvent[];
+  /** All `correction_event` records emitted during the run, in chronological
+   *  order. Populated by `finalizeRun` from `events.jsonl` (#499). Additive
+   *  and optional: consumers that do not recognize this field SHALL ignore it. */
+  corrections?: import("./correction.ts").CorrectionEvent[];
   /** Finalized stage accounting copied from `stage_accounting` events by
    *  `finalizeRun`. Additive and optional for older bundles. */
   accounting?: StageAccountingSummary;
@@ -1406,6 +1449,30 @@ export interface EvidenceBundle {
    *  (#450). Additive and optional; absent for pre-#450 bundles and for runs
    *  where the engine identity never changed. */
   engineDrifts?: EngineDriftRecord[];
+  /** Pre-merge delta-round accounting (#483), derived from `delta_round` /
+   *  `delta_round_ceiling` / `delta_churn_suspected` events. Absent when the
+   *  run performed no pre-merge delta rounds. */
+  deltaRounds?: DeltaRoundAccounting;
+}
+
+/** Pre-merge delta-round accounting (#483): the item's durable delta-round
+ *  count, the configured cap, the ceiling disposition when the cap was
+ *  reached, and any rounds flagged as suspected churn. */
+export interface DeltaRoundAccounting {
+  /** Highest observed delta-round number across the run's `delta_round` events. */
+  count: number;
+  /** The configured `review_policy.max_delta_rounds` at the time these rounds ran. */
+  cap: number;
+  /** Present only when a `delta_round_ceiling` event was recorded this run. */
+  ceiling?: {
+    observed: number;
+    ceilingAction: "park" | "demote_and_advance";
+  };
+  /** One entry per round flagged suspected churn, in event order. */
+  churnRounds: {
+    round: number;
+    axes: { surface: string; priorMaxConfidence: number; newConfidence: number }[];
+  }[];
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ import {
   RUNS_ARTIFACT,
   ROADMAP_ARTIFACT,
   HISTORY_ARTIFACT,
+  CONTROL_ATTRIBUTIONS_ARTIFACT,
   artifactSubdir,
   renderArtifactIgnoreBlock,
   ensureArtifactIgnoreBlock,
@@ -39,12 +40,19 @@ function makeFakeFs(initial: string | null): { deps: ArtifactIgnoreDeps; get(): 
 // Contract (drift guard, #5.1/#5.3)
 // ---------------------------------------------------------------------------
 
-test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, and evals/ with non-empty comments", () => {
+test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, evals/, and control-attributions.jsonl with non-empty comments", () => {
   const names = ARTIFACT_CONTRACT.map((e) => e.name);
-  assert.deepEqual(names, ["runs", "roadmap", "history", "evals"]);
+  assert.deepEqual(names, ["runs", "roadmap", "history", "evals", "control-attributions.jsonl"]);
   for (const entry of ARTIFACT_CONTRACT) {
     assert.ok(entry.comment.length > 0, `entry ${entry.name} must have a non-empty comment`);
   }
+});
+
+test("ARTIFACT_CONTRACT: control-attributions.jsonl is a file entry, ignored without a trailing slash", () => {
+  assert.equal(CONTROL_ATTRIBUTIONS_ARTIFACT.isFile, true);
+  const block = renderArtifactIgnoreBlock();
+  assert.ok(block.includes(".agent-pipeline/control-attributions.jsonl\n"));
+  assert.ok(!block.includes(".agent-pipeline/control-attributions.jsonl/"));
 });
 
 test("ARTIFACT_CONTRACT: includes .agent-pipeline/history/ (regression for #452)", () => {
@@ -65,9 +73,10 @@ test("drift guard: every engine-written .agent-pipeline/ directory helper resolv
   // including the ones derived above.
   const block = renderArtifactIgnoreBlock();
   for (const entry of ARTIFACT_CONTRACT) {
+    const expected = entry.isFile ? `.agent-pipeline/${entry.name}` : `.agent-pipeline/${entry.name}/`;
     assert.ok(
-      block.includes(`.agent-pipeline/${entry.name}/`),
-      `rendered block must contain .agent-pipeline/${entry.name}/`,
+      block.includes(expected),
+      `rendered block must contain ${expected}`,
     );
   }
 });

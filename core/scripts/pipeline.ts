@@ -41,7 +41,13 @@ import {
 } from "./gh.ts";
 import { isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
-import { attestPipelineComment } from "./stages/review-parsing.ts";
+import {
+  attestPipelineComment,
+  extractBlockingKeysFromComment,
+  extractReviewedSha,
+  REVIEW_MARKER_PREFIX_R1,
+  REVIEW_MARKER_PREFIX_R2,
+} from "./stages/review-parsing.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, removeWorktreeForIssue, sweepMergedWorktrees } from "./worktree.ts";
 import {
@@ -64,6 +70,7 @@ import {
   finalizeRun,
   initRunDir,
   isValidSummaryBundle,
+  latestRunDirForIssue,
   latestRunEventsSummaryForIssue,
   latestSummaryForIssue,
   listRunIds,
@@ -96,6 +103,22 @@ import * as shipchecKStage from "./stages/shipcheck.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
+import {
+  emitCorrectionEvent,
+  emitControlAttribution,
+  CORRECTION_HUMAN_SOURCE_KINDS,
+  CORRECTION_FAILURE_CLASSES,
+  CORRECTION_REUSABLE,
+  CORRECTION_PROPOSED_CONTROLS,
+  CONTROL_ATTRIBUTION_DISPOSITIONS,
+  EVIDENCE_REF_KINDS,
+  type CorrectionFailureClass,
+  type CorrectionProposedControl,
+  type CorrectionReusable,
+  type CorrectionSourceKind,
+  type ControlAttributionDisposition,
+  type EvidenceRefKind,
+} from "./correction.ts";
 import {
   formatDoctorJson,
   formatDoctorSummary,
@@ -258,6 +281,46 @@ export interface CliOpts {
   resume?: string;
   /** loop: read-only report for the run instead of starting/resuming. */
   audit?: boolean;
+  /** correction record: issue number to record the correction against. */
+  issue?: number;
+  /** correction record: bounded source kind (override|rejection|retry|repair|unblock|manual). */
+  sourceKind?: string;
+  /** correction record: bounded failure class. */
+  failureClass?: string;
+  /** correction record: evidence reference, "<kind>:<id>" (kind one of finding|blocker|event|comment|artifact). */
+  evidenceRef?: string;
+  /** correction record: the observable correction/disposition text. */
+  correctionText?: string;
+  /** correction record: reusability disposition (yes|no|unknown). */
+  reusable?: string;
+  /** correction record: optional bounded proposed control. */
+  proposedControl?: string;
+  /** correction record: optional SHA the corrected evidence was reviewed against. */
+  reviewedSha?: string;
+  /** correction record: optional current head SHA at record time. */
+  headSha?: string;
+  /** correction attribute: the correction_key (from a correction_event) this control resolves. */
+  correctionKey?: string;
+  /** correction attribute: bounded control type (instruction|skill-rubric|eval|deterministic-gate|human-judgment). */
+  controlType?: string;
+  /** correction attribute: bounded disposition (implemented|human-owned|rejected|superseded). */
+  disposition?: string;
+  /** correction attribute: the PR that shipped the control. */
+  pr?: number;
+  /** correction attribute: optional commit SHA the control became effective at. */
+  effectiveCommit?: string;
+  /** correction attribute: optional release/tag the control became effective at. */
+  effectiveRelease?: string;
+  /** correction attribute: required for an effective control (disposition implemented,
+   *  or superseded shipping a replacement control) — the ISO timestamp the control
+   *  actually became effective, distinct from the record's append time. */
+  effectiveAt?: string;
+  /** correction attribute: optional attribution_id this record supersedes. */
+  supersedes?: string;
+  /** correction attribute: optional bounded free-text note. */
+  note?: string;
+  /** scoreboard: group correction/recurrence metrics by a single correction dimension. */
+  correctionsBy?: string[];
 }
 
 /**
@@ -274,7 +337,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill | evals | loop")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill | evals | loop | correction")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -334,7 +397,7 @@ export function buildCmd(): Command {
     .option("--baseline <treatment_id>", "evals report: the treatment_id every paired delta is computed against (required)")
     .option("--judge", "evals grade: opt in to the optional model judge (disabled by default; recorded separately from deterministic grades)")
     .option("--top <n>", "improve: emit top-N clusters in the report (default: 5)", Number)
-    .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, requires --apply)", Number)
+    .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, 2 for the correction category; requires --apply)", Number)
     .option("--interventions", "improve: print an intervention summary as JSON instead of the cluster report")
     .option("--remove-worktree", "remove issue N's on-disk worktree and local branch, then exit (bypasses kill switch)")
     .option("--force", "modifier for --remove-worktree: remove despite uncommitted changes (usage error without --remove-worktree)")
@@ -348,7 +411,34 @@ export function buildCmd(): Command {
     .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)")
     // backfill options (#327)
     .option("--capability <name>", "backfill: scope the apply slice to a named capability")
-    .option("--rel <relation>", "config repo-map add/remove: depends_on or depended_on_by (default: depends_on)");
+    .option("--rel <relation>", "config repo-map add/remove: depends_on or depended_on_by (default: depends_on)")
+    // correction record (#499): a narrow, non-mutating CLI that records one
+    // correction_event against an existing run. No advance/unblock/override/
+    // merge/deploy/code-mutation authority — its only side effect is one
+    // appended, sanitized correction_event.
+    .option("--issue <n>", "correction record: issue number to record the correction against", Number)
+    .option("--source-kind <kind>", `correction record: ${CORRECTION_HUMAN_SOURCE_KINDS.join("|")}`)
+    .option("--failure-class <class>", `correction record: ${CORRECTION_FAILURE_CLASSES.join("|")}`)
+    .option("--evidence-ref <kind:id>", `correction record: "<kind>:<id>" evidence pointer (kind one of ${EVIDENCE_REF_KINDS.join("|")})`)
+    .option("--correction-text <text>", "correction record: the observable correction/disposition text")
+    .option("--reusable <value>", `correction record: ${CORRECTION_REUSABLE.join("|")}`)
+    .option("--proposed-control <control>", `correction record: optional — ${CORRECTION_PROPOSED_CONTROLS.join("|")}`)
+    .option("--reviewed-sha <sha>", "correction record: optional — the SHA the corrected evidence was reviewed against")
+    .option("--head-sha <sha>", "correction record: optional — the current head SHA at record time")
+    // correction attribute (#501): a narrow, non-mutating CLI that records one
+    // control_attribution against the durable repo-level attribution ledger.
+    // Same authority boundary as `correction record` — no advance/unblock/
+    // override/merge/deploy path, no GitHub call.
+    .option("--correction-key <key>", "correction attribute: the correction_key (from a correction_event) this control resolves")
+    .option("--control-type <type>", `correction attribute: ${CORRECTION_PROPOSED_CONTROLS.join("|")}`)
+    .option("--disposition <value>", `correction attribute: ${CONTROL_ATTRIBUTION_DISPOSITIONS.join("|")}`)
+    .option("--pr <n>", "correction attribute: the PR that shipped the control", Number)
+    .option("--effective-commit <sha>", "correction attribute: optional — the commit SHA the control became effective at")
+    .option("--effective-release <tag>", "correction attribute: optional — the release/tag the control became effective at")
+    .option("--effective-at <iso>", "correction attribute: the ISO timestamp the control actually became effective — required when --disposition is implemented, or superseded with --effective-commit/--effective-release")
+    .option("--supersedes <attribution-id>", "correction attribute: optional — the attribution_id this record supersedes")
+    .option("--note <text>", "correction attribute: optional bounded free-text note")
+    .option("--corrections-by <dimension>", "scoreboard: group correction/recurrence metrics by repo|stage|harness|model|source_kind|failure_class|proposed_control|implemented_control; repeatable (to detect a duplicate flag)", collectRepeatable, []);
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate/sync` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -447,13 +537,15 @@ async function main(): Promise<void> {
     process.stdout.write(
       "Usage: pipeline improve [--apply] [--top <n>] [--since <date>] [--min-occurrences <n>] [--json]\n\n" +
       "Read-only analyzer: reads .agent-pipeline/runs/**/events.jsonl and summary.json,\n" +
-      "clusters recurring failure patterns (review findings, blockers, flaky gates, token waste),\n" +
-      "and prints a dry-run report. With --apply, creates GitHub issues for the top clusters.\n\n" +
+      "clusters recurring failure patterns (review findings, blockers, flaky gates, token waste,\n" +
+      "papercuts, and recurring correction_event corrections), and prints a dry-run report.\n" +
+      "With --apply, creates GitHub issues for the top clusters.\n\n" +
       "Options:\n" +
       "  --apply                   create GitHub issues for top-N qualifying clusters\n" +
       "  --top <n>                 emit top-N clusters in the report (default: 5)\n" +
       "  --since <date>            restrict to runs on or after this ISO date (e.g. 2026-06-01)\n" +
-      "  --min-occurrences <n>     --apply threshold: skip clusters below this count (default: 3)\n" +
+      "  --min-occurrences <n>     --apply threshold: skip clusters below this count (default: 3;\n" +
+      "                            2 for the correction category)\n" +
       "  --json                    emit a JSON array instead of the Markdown-ish report\n" +
       "  --repo-path <path>        override the target repo working tree\n\n" +
       "The command never modifies pipeline labels, branches, PRs, worktrees, or repo files.\n" +
@@ -463,7 +555,7 @@ async function main(): Promise<void> {
   }
   if (rawArgs[0] === "scoreboard" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
     process.stdout.write(
-      "Usage: pipeline scoreboard [--since <date>] [--until <date>] [--days <n>] [--estimate-cost <harness=usd>] [--bucket <unit>] [--by <dimension>] [--html <path>] [--json]\n\n" +
+      "Usage: pipeline scoreboard [--since <date>] [--until <date>] [--days <n>] [--estimate-cost <harness=usd>] [--bucket <unit>] [--by <dimension>] [--corrections-by <dimension>] [--html <path>] [--json]\n\n" +
       "Read-only factory report: scans .agent-pipeline/runs/*/{run.json,events.jsonl,summary.json}\n" +
       "and prints throughput, autonomy, cost, duration, retry, blocker, fallback, and gate metrics.\n\n" +
       "Options:\n" +
@@ -473,6 +565,7 @@ async function main(): Promise<void> {
       "  --estimate-cost <harness=usd>  estimate missing per-call cost; repeatable\n" +
       "  --bucket <unit>             add a chronological day|week time-series (default: none)\n" +
       "  --by <dimension>            group metrics by harness|model|effort|executor (default: none, exactly one)\n" +
+      "  --corrections-by <dimension>  group correction/recurrence metrics by repo|stage|harness|model|source_kind|failure_class|proposed_control|implemented_control (default: none, exactly one)\n" +
       "  --html <path>               write a self-contained, offline HTML export of the report to this path (local/archival only)\n" +
       "  --json                      emit one unfenced JSON object\n" +
       "  --repo-path <path>          override the target repo working tree\n\n" +
@@ -777,7 +870,8 @@ async function main(): Promise<void> {
     cmd.args[0] === "triage" ||
     cmd.args[0] === "merge" ||
     cmd.args[0] === "status" ||
-    cmd.args[0] === "papercut"
+    cmd.args[0] === "papercut" ||
+    cmd.args[0] === "correction"
       ? 2
       : cmd.args[0] === "unblock" || cmd.args[0] === "override"
       ? 3
@@ -897,6 +991,219 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early `pipeline correction record` dispatch (#499) — a narrow, non-mutating
+  // command that records exactly one correction_event against an EXISTING run.
+  // No config resolution or gh auth required — it locates the run directory
+  // host-locally and appends via emitCorrectionEvent. It has no
+  // advance/unblock/override/merge/deploy/code-mutation path: on success its
+  // only side effect is the one appended, sanitized correction_event.
+  if (numArg === "correction") {
+    const correctionStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(correctionStart) ?? correctionStart;
+
+    // `pipeline correction attribute` (#501) — a narrow, non-mutating command
+    // that appends exactly one control_attribution to the durable repo-level
+    // ledger. Unlike `correction record`, this is never scoped to a run — a
+    // control_attribution links a correction_key (a factory-level class) to
+    // its control, not to any one run — so it needs no run lookup at all.
+    if (cmd.args[1] === "attribute") {
+      const attrMissing: string[] = [];
+      if (!opts.correctionKey) attrMissing.push("--correction-key");
+      if (!opts.controlType) attrMissing.push("--control-type");
+      if (!opts.disposition) attrMissing.push("--disposition");
+      if (attrMissing.length > 0) {
+        console.error(`pipeline correction attribute: missing required field(s): ${attrMissing.join(", ")}`);
+        process.exitCode = 2;
+        return;
+      }
+      if (!(CORRECTION_PROPOSED_CONTROLS as readonly string[]).includes(opts.controlType!)) {
+        console.error(`pipeline correction attribute: --control-type must be one of ${CORRECTION_PROPOSED_CONTROLS.join("|")}`);
+        process.exitCode = 2;
+        return;
+      }
+      if (!(CONTROL_ATTRIBUTION_DISPOSITIONS as readonly string[]).includes(opts.disposition!)) {
+        console.error(`pipeline correction attribute: --disposition must be one of ${CONTROL_ATTRIBUTION_DISPOSITIONS.join("|")}`);
+        process.exitCode = 2;
+        return;
+      }
+      // An effective control's recurrence boundary is the control's actual
+      // effective time, not this command's invocation time (#501 review-1
+      // finding c98822e3) — required whenever this record ships one.
+      const shipsEffectiveControl =
+        opts.disposition === "implemented" ||
+        (opts.disposition === "superseded" && (opts.effectiveCommit !== undefined || opts.effectiveRelease !== undefined));
+      if (shipsEffectiveControl && (!opts.effectiveAt || Number.isNaN(Date.parse(opts.effectiveAt)))) {
+        console.error(
+          'pipeline correction attribute: --effective-at <iso> is required (and must be a valid ISO timestamp) ' +
+            'when --disposition is implemented, or superseded with --effective-commit/--effective-release',
+        );
+        process.exitCode = 2;
+        return;
+      }
+      let evidenceRefKind: string | undefined;
+      let evidenceRefId: string | undefined;
+      if (opts.evidenceRef !== undefined) {
+        const evidenceSep = opts.evidenceRef.indexOf(":");
+        if (evidenceSep === -1) {
+          console.error('pipeline correction attribute: --evidence-ref must be "<kind>:<id>"');
+          process.exitCode = 2;
+          return;
+        }
+        evidenceRefKind = opts.evidenceRef.slice(0, evidenceSep);
+        evidenceRefId = opts.evidenceRef.slice(evidenceSep + 1);
+        if (!(EVIDENCE_REF_KINDS as readonly string[]).includes(evidenceRefKind)) {
+          console.error(`pipeline correction attribute: --evidence-ref kind must be one of ${EVIDENCE_REF_KINDS.join("|")}`);
+          process.exitCode = 2;
+          return;
+        }
+      }
+
+      const attributed = await emitControlAttribution(repoDir, {
+        correction_key: opts.correctionKey!,
+        control_type: opts.controlType as CorrectionProposedControl,
+        disposition: opts.disposition as ControlAttributionDisposition,
+        issue: opts.issue ?? null,
+        pr: opts.pr ?? null,
+        effective_commit: opts.effectiveCommit ?? null,
+        effective_release: opts.effectiveRelease ?? null,
+        effective_at: opts.effectiveAt ?? null,
+        supersedes: opts.supersedes ?? null,
+        ...(evidenceRefKind !== undefined
+          ? { evidence_ref: { kind: evidenceRefKind as EvidenceRefKind, id: evidenceRefId! } }
+          : {}),
+        note: opts.note ?? "",
+      }, defaultRunStoreDeps);
+      if (!attributed) {
+        console.error(`pipeline correction attribute: failed to append control_attribution to ${repoDir}.`);
+        process.exitCode = 1;
+        return;
+      }
+      process.exitCode = 0;
+      return;
+    }
+
+    if (cmd.args[1] !== "record") {
+      console.error(
+        'pipeline correction: unrecognized action.\n' +
+          '  Usage: pipeline correction record --issue <N> --source-kind <kind> --failure-class <class> ' +
+          '--stage <stage> --evidence-ref <kind:id> --correction-text <text> --reusable <yes|no|unknown> ' +
+          '[--proposed-control <control>] [--run-id <id>]\n' +
+          '     or: pipeline correction attribute --correction-key <key> --control-type <type> ' +
+          '--disposition <implemented|human-owned|rejected|superseded> [--issue <n>] [--pr <n>] ' +
+          '[--effective-commit <sha>] [--effective-release <tag>] --effective-at <iso> ' +
+          '(required for implemented, or superseded with --effective-commit/--effective-release) ' +
+          '[--supersedes <attribution-id>] [--evidence-ref <kind:id>] [--note <text>]',
+      );
+      process.exitCode = 2;
+      return;
+    }
+    const missing: string[] = [];
+    if (opts.issue === undefined) missing.push("--issue");
+    if (!opts.sourceKind) missing.push("--source-kind");
+    if (!opts.failureClass) missing.push("--failure-class");
+    if (!opts.stage) missing.push("--stage");
+    if (!opts.evidenceRef) missing.push("--evidence-ref");
+    if (!opts.correctionText) missing.push("--correction-text");
+    if (!opts.reusable) missing.push("--reusable");
+    if (missing.length > 0) {
+      console.error(`pipeline correction record: missing required field(s): ${missing.join(", ")}`);
+      process.exitCode = 2;
+      return;
+    }
+    // #499 review-2 finding 34d10c78: the manual command is human-only —
+    // `retry`/`repair` are reserved for the Pipeline-owned recovery and
+    // repair paths (which derive actor_kind: "pipeline"); accepting them here
+    // would let an operator record a manual correction that misattributes
+    // itself as an autonomous pipeline action.
+    if (!(CORRECTION_HUMAN_SOURCE_KINDS as readonly string[]).includes(opts.sourceKind!)) {
+      console.error(`pipeline correction record: --source-kind must be one of ${CORRECTION_HUMAN_SOURCE_KINDS.join("|")}`);
+      process.exitCode = 2;
+      return;
+    }
+    if (!(CORRECTION_FAILURE_CLASSES as readonly string[]).includes(opts.failureClass!)) {
+      console.error(`pipeline correction record: --failure-class must be one of ${CORRECTION_FAILURE_CLASSES.join("|")}`);
+      process.exitCode = 2;
+      return;
+    }
+    if (!(CORRECTION_REUSABLE as readonly string[]).includes(opts.reusable!)) {
+      console.error(`pipeline correction record: --reusable must be one of ${CORRECTION_REUSABLE.join("|")}`);
+      process.exitCode = 2;
+      return;
+    }
+    if (opts.proposedControl !== undefined && !(CORRECTION_PROPOSED_CONTROLS as readonly string[]).includes(opts.proposedControl)) {
+      console.error(`pipeline correction record: --proposed-control must be one of ${CORRECTION_PROPOSED_CONTROLS.join("|")}`);
+      process.exitCode = 2;
+      return;
+    }
+    const evidenceSep = opts.evidenceRef!.indexOf(":");
+    if (evidenceSep === -1) {
+      console.error('pipeline correction record: --evidence-ref must be "<kind>:<id>"');
+      process.exitCode = 2;
+      return;
+    }
+    const evidenceRefKind = opts.evidenceRef!.slice(0, evidenceSep);
+    const evidenceRefId = opts.evidenceRef!.slice(evidenceSep + 1);
+    if (!(EVIDENCE_REF_KINDS as readonly string[]).includes(evidenceRefKind)) {
+      console.error(`pipeline correction record: --evidence-ref kind must be one of ${EVIDENCE_REF_KINDS.join("|")}`);
+      process.exitCode = 2;
+      return;
+    }
+
+    const correctionRunDir = opts.runId
+      ? runDirPath(repoDir, opts.runId)
+      : await latestRunDirForIssue(repoDir, opts.issue!, defaultRunStoreDeps).catch(() => null);
+    if (!correctionRunDir) {
+      console.error(`pipeline correction record: no run found for issue #${opts.issue} (pass --run-id to target a specific run).`);
+      process.exitCode = 1;
+      return;
+    }
+
+    // #499 finding 9f3a5ede: a constructed path is not a located run — require
+    // a readable, parseable run.json AND confirm it actually belongs to
+    // --issue before recording anything against it.
+    let runMeta: { issue?: number; repo?: string } | null = null;
+    try {
+      const raw = await defaultRunStoreDeps.readFile(path.join(correctionRunDir, "run.json"));
+      runMeta = JSON.parse(raw) as { issue?: number; repo?: string };
+    } catch {
+      runMeta = null;
+    }
+    if (!runMeta) {
+      console.error(`pipeline correction record: run directory for #${opts.issue} could not be read (missing or malformed run.json).`);
+      process.exitCode = 1;
+      return;
+    }
+    if (runMeta.issue !== opts.issue) {
+      console.error(`pipeline correction record: run ${path.basename(correctionRunDir)} belongs to issue #${runMeta.issue}, not #${opts.issue}.`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const appended = await emitCorrectionEvent(correctionRunDir, {
+      issue: opts.issue!,
+      repo: runMeta.repo ?? "",
+      run_id: path.basename(correctionRunDir),
+      stage: opts.stage!,
+      source_kind: opts.sourceKind as CorrectionSourceKind,
+      failure_class: opts.failureClass as CorrectionFailureClass,
+      reviewed_sha: opts.reviewedSha ?? null,
+      head_sha: opts.headSha ?? null,
+      evidence_ref: { kind: evidenceRefKind as EvidenceRefKind, id: evidenceRefId },
+      correction: opts.correctionText!,
+      reusable: opts.reusable as CorrectionReusable,
+      ...(opts.proposedControl !== undefined
+        ? { proposed_control: opts.proposedControl as CorrectionProposedControl }
+        : {}),
+    }, defaultRunStoreDeps);
+    if (!appended) {
+      console.error(`pipeline correction record: failed to append correction_event to run ${path.basename(correctionRunDir)}.`);
+      process.exitCode = 1;
+      return;
+    }
+    process.exitCode = 0;
+    return;
+  }
+
   // Early improve dispatch — no issue number, no config resolution required.
   // Read-only by default; --apply creates GitHub issues via gh issue create only.
   if (numArg === "improve") {
@@ -940,6 +1247,7 @@ async function main(): Promise<void> {
           estimateCost: opts.estimateCost,
           bucket: opts.bucket,
           by: opts.by,
+          correctionsBy: opts.correctionsBy,
           html: opts.html,
         },
         realScoreboardDeps(),
@@ -1073,6 +1381,7 @@ async function main(): Promise<void> {
           base: opts.base,
           domain: queueCfg.domain,
           papercuts: queueCfg.papercuts,
+          corrections: queueCfg.corrections,
         },
         realQueueDeps(queueCfg.repo_dir, opts.profile),
       );
@@ -2576,13 +2885,28 @@ export function buildUnblockedComment(args: {
   return attestPipelineComment("unblocked", rendered);
 }
 
+/** IO seam for {@link runUnblock} so unit tests inject fakes — no real gh. */
+export interface RunUnblockDeps {
+  getIssueDetail: typeof getIssueDetail;
+  postComment: typeof postComment;
+  clearBlocked: typeof clearBlocked;
+}
+
+const defaultRunUnblockDeps: RunUnblockDeps = {
+  getIssueDetail,
+  postComment,
+  clearBlocked,
+};
+
 async function runUnblock(
   cfg: PipelineConfig,
   issueNumber: number,
   answer: string,
   originalNumber: number = issueNumber,
+  runStoreDeps: RunStoreDeps = defaultRunStoreDeps,
+  deps: RunUnblockDeps = defaultRunUnblockDeps,
 ): Promise<void> {
-  const detail = await getIssueDetail(cfg, issueNumber);
+  const detail = await deps.getIssueDetail(cfg, issueNumber);
   if (!isBlocked(detail.labels)) {
     console.log(`#${issueNumber}: not blocked — nothing to do.`);
     return;
@@ -2590,11 +2914,30 @@ async function runUnblock(
   const stage = pickStage(detail.labels) ?? "(unknown)";
   const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const body = buildUnblockedComment({ stage, ts, answer });
-  await postComment(cfg, issueNumber, body);
-  await clearBlocked(cfg, issueNumber);
-  await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber);
+  await deps.postComment(cfg, issueNumber, body);
+  await deps.clearBlocked(cfg, issueNumber);
+  await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber, runStoreDeps);
   const unblockLine = `[pipeline] #${issueNumber}: unblocked at ${stage}`;
   console.log(unblockLine);
+
+  // #499: the label clear above just succeeded (a throw would have aborted
+  // before this point), so the unblock is durably accepted — emit exactly one
+  // correction_event. Non-fatal and best-effort: no run directory for this
+  // issue (e.g. a very old/foreign run) silently skips emission.
+  const unblockRunDir = await latestRunDirForIssue(cfg.repo_dir, originalNumber, runStoreDeps).catch(() => null);
+  if (unblockRunDir) {
+    await emitCorrectionEvent(unblockRunDir, {
+      issue: originalNumber,
+      repo: cfg.repo,
+      run_id: path.basename(unblockRunDir),
+      stage,
+      source_kind: "unblock",
+      failure_class: "blocker",
+      evidence_ref: { kind: "blocker", id: stage },
+      correction: answer,
+      reusable: "unknown",
+    }, runStoreDeps).catch(() => {});
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2627,6 +2970,7 @@ export async function runOverride(
   opts: CliOpts,
   deps: RunOverrideDeps = defaultRunOverrideDeps,
   originalNumber: number = issueNumber,
+  runStoreDeps: RunStoreDeps = defaultRunStoreDeps,
 ): Promise<void> {
   // --dry-run is incompatible: --override always records an audited disposition
   // (postComment, clearBlocked, silentTransition).  Allowing the combination would
@@ -2677,9 +3021,51 @@ export async function runOverride(
   // the blocker so the resumed run can re-evaluate with the override applied.
   if (isBlocked(detail.labels)) {
     await deps.clearBlocked(cfg, issueNumber);
-    await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber);
+    await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber, runStoreDeps);
   }
   console.log(`[pipeline] #${issueNumber}: ${overrideLogMsg}`);
+
+  // #499: the disposition comment above just posted durably — the operator's
+  // judgment (key/scope + disposition + reason) IS the accepted correction.
+  // "rejected" is a rejection disposition; every other disposition (e.g.
+  // "deferred-#N") is an override. Non-fatal/best-effort: no run directory for
+  // this issue silently skips emission.
+  const overrideRunDir = await latestRunDirForIssue(cfg.repo_dir, originalNumber, runStoreDeps).catch(() => null);
+  if (overrideRunDir) {
+    const evidenceRefId = parsed.kind === "key" ? parsed.key : `${parsed.scopeType}:${parsed.scopeValue}`;
+    // #499 finding 7971a697: stamp the SHA the overridden/rejected finding was
+    // actually raised at (the originating round's comment), not left null —
+    // only resolvable for a key-scoped disposition, since a scope override
+    // isn't tied to one finding's round. Mirrors the same repair-path fix in
+    // review-routing.ts: reuse extractBlockingKeysFromComment (the same
+    // marker-or-legacy-fallback logic that identifies a repaired finding) and
+    // extractReviewedSha (artifact-then-legacy-sentinel) rather than
+    // reimplementing either.
+    let overrideReviewedSha: string | null = null;
+    if (parsed.kind === "key") {
+      const roundComments = detail.comments.filter(
+        (c) => c.body.startsWith(REVIEW_MARKER_PREFIX_R1) || c.body.startsWith(REVIEW_MARKER_PREFIX_R2),
+      );
+      for (let i = roundComments.length - 1; i >= 0; i--) {
+        if (extractBlockingKeysFromComment(roundComments[i].body).has(parsed.key)) {
+          overrideReviewedSha = extractReviewedSha([roundComments[i]])?.sha ?? null;
+          break;
+        }
+      }
+    }
+    await emitCorrectionEvent(overrideRunDir, {
+      issue: originalNumber,
+      repo: cfg.repo,
+      run_id: path.basename(overrideRunDir),
+      stage,
+      source_kind: parsed.disposition === "rejected" ? "rejection" : "override",
+      failure_class: "review-finding",
+      reviewed_sha: overrideReviewedSha,
+      evidence_ref: { kind: "finding", id: evidenceRefId },
+      correction: `${parsed.disposition}: ${parsed.reason}`,
+      reusable: "unknown",
+    }, runStoreDeps).catch(() => {});
+  }
 
   // #135: the human's judgment WAS the key+reason — everything from here is
   // deterministic (the advance loop re-runs partitionFindings against the
@@ -2739,6 +3125,7 @@ export const _internals = {
   realPlanningRecoveryDeps,
   appendBlockerCleared,
   findBlockerClearedRunId,
+  runUnblock,
 };
 
 // Suppress unused import warnings for test-only helpers.
