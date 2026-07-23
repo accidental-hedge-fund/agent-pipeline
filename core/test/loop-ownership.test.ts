@@ -313,6 +313,20 @@ test("evaluateConflict: overlapping exclusive globs conflict and name the surfac
   }
 });
 
+test("evaluateConflict: an exclusive surface overlapping another item's shared surface conflicts", () => {
+  const declA: OwnershipDeclaration = { exclusive: ["src/**"] };
+  const declB: OwnershipDeclaration = { shared: { public_api: ["src/api.ts"] } };
+  const a = { id: "100", decl: declA, normalized: normalizeOwnership(declA) };
+  const b = { id: "200", decl: declB, normalized: normalizeOwnership(declB) };
+  const verdict = evaluateConflict(a, b);
+  assert.equal(verdict.verdict, "conflict");
+  assert.equal(verdict.reason?.kind, "overlapping_surface");
+});
+
+test("evaluateConflict: dot-dot path aliases do not bypass overlap detection — declaration is rejected", () => {
+  assert.throws(() => validateOwnershipDeclaration({ exclusive: ["src/../shared/config.ts"] }));
+});
+
 // ---------------------------------------------------------------------------
 // 5.4 Shared generated output & package/config/state conflicts by default.
 // ---------------------------------------------------------------------------
@@ -483,6 +497,18 @@ test("evaluateOwnershipEvidence: a disjoint pair's evidence records its verdict 
   assert.equal(pair.reason, null);
   assert.deepEqual(evidence.items[0].surfaces, normalizeOwnership(declA));
   assert.deepEqual(evidence.items[1].surfaces, normalizeOwnership(declB));
+});
+
+test("evaluateOwnershipEvidence: rejects a malformed runtime declaration rather than evaluating it", () => {
+  // `shared.shared_config` must be an array of glob strings — a bare string would be iterated as
+  // characters by normalizeOwnership if validation were skipped, producing an unsafe verdict.
+  const malformed = { shared: { shared_config: "config.yml" } } as unknown as OwnershipDeclaration;
+  assert.throws(() =>
+    evaluateOwnershipEvidence([
+      { id: "100", ownership: malformed },
+      { id: "200", ownership: { exclusive: ["src/b/**"] } },
+    ]),
+  );
 });
 
 // ---------------------------------------------------------------------------

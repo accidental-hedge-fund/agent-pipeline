@@ -51,6 +51,9 @@ function isMalformedGlob(pattern: string): boolean {
   for (const segment of trimmed.split("/")) {
     if (segment.length === 0) continue;
     if (segment.includes("**") && segment !== "**") return true;
+    // A `..` parent-directory segment lets two spellings alias the same filesystem surface while
+    // comparing as lexically distinct, defeating overlap detection (finding #529 review 2).
+    if (segment === "..") return true;
   }
   return false;
 }
@@ -332,6 +335,18 @@ export function evaluateConflict(a: OwnershipEvalInput, b: OwnershipEvalInput): 
     }
   }
 
+  // A path claimed `exclusive` by one item and `shared` by the other still names the same
+  // filesystem surface — comparing only within-class misses this and produces an unsafe
+  // `disjoint` verdict (finding #529 review 2).
+  for (const sa of a.normalized) {
+    for (const sb of b.normalized) {
+      if (sa.class === sb.class) continue;
+      if (globOverlap(sa.pattern, sb.pattern)) {
+        return { verdict: "conflict", reason: { kind: "overlapping_surface", surface: sa } };
+      }
+    }
+  }
+
   return { verdict: "disjoint", reason: null };
 }
 
@@ -345,11 +360,14 @@ export function evaluateConflict(a: OwnershipEvalInput, b: OwnershipEvalInput): 
 export function evaluateOwnershipEvidence(
   items: ReadonlyArray<{ id: string; ownership?: OwnershipDeclaration | null }>,
 ): OwnershipEvaluationEvidence {
-  const evalInputs: OwnershipEvalInput[] = items.map((item) => ({
-    id: item.id,
-    decl: item.ownership,
-    normalized: normalizeOwnership(item.ownership),
-  }));
+  const evalInputs: OwnershipEvalInput[] = items.map((item) => {
+    validateOwnershipDeclaration(item.ownership);
+    return {
+      id: item.id,
+      decl: item.ownership,
+      normalized: normalizeOwnership(item.ownership),
+    };
+  });
 
   const evidenceItems: OwnershipEvidenceItem[] = evalInputs.map((i) => ({ item_id: i.id, surfaces: i.normalized }));
 
