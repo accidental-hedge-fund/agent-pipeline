@@ -238,6 +238,10 @@ export type OwnershipSurfaceKind = "source" | OwnershipSharedSurfaceKind;
  *  edge or an unknown-ownership conflict. */
 export interface OwnershipException {
   surface: { kind: OwnershipSharedSurfaceKind; pattern: string };
+  /** The other item id this exception is reviewed for — the exception suppresses a shared-surface
+   *  conflict only for the pair naming this counterpart, never for the declaring item's surface
+   *  against any other item. */
+  counterpart_item_id: string;
   justification: string;
   review_ref: string;
 }

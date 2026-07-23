@@ -160,6 +160,7 @@ test("validateOwnershipDeclaration accepts a well-formed declaration", () => {
     exceptions: [
       {
         surface: { kind: "generated_artifact", pattern: "dist/schema.json" },
+        counterpart_item_id: "200",
         justification: "reviewed: both items append disjoint keys",
         review_ref: "PR#42",
       },
@@ -196,7 +197,14 @@ test("validateOwnershipDeclaration rejects an exception missing justification or
     () =>
       validateOwnershipDeclaration({
         shared: { schema_state: ["schema.json"] },
-        exceptions: [{ surface: { kind: "schema_state", pattern: "schema.json" }, justification: "", review_ref: "PR#1" }],
+        exceptions: [
+          {
+            surface: { kind: "schema_state", pattern: "schema.json" },
+            counterpart_item_id: "200",
+            justification: "",
+            review_ref: "PR#1",
+          },
+        ],
       }),
     (err: unknown) => err instanceof LoopError && err.loopFailureClass === "validation",
   );
@@ -204,7 +212,22 @@ test("validateOwnershipDeclaration rejects an exception missing justification or
     () =>
       validateOwnershipDeclaration({
         shared: { schema_state: ["schema.json"] },
-        exceptions: [{ surface: { kind: "schema_state", pattern: "schema.json" }, justification: "ok" }],
+        exceptions: [
+          { surface: { kind: "schema_state", pattern: "schema.json" }, counterpart_item_id: "200", justification: "ok" },
+        ],
+      }),
+    (err: unknown) => err instanceof LoopError && err.loopFailureClass === "validation",
+  );
+});
+
+test("validateOwnershipDeclaration rejects an exception missing counterpart_item_id", () => {
+  assert.throws(
+    () =>
+      validateOwnershipDeclaration({
+        shared: { schema_state: ["schema.json"] },
+        exceptions: [
+          { surface: { kind: "schema_state", pattern: "schema.json" }, justification: "ok", review_ref: "PR#1" },
+        ],
       }),
     (err: unknown) => err instanceof LoopError && err.loopFailureClass === "validation",
   );
@@ -317,6 +340,7 @@ for (const kind of ["generated_artifact", "package_version", "schema_state", "ci
 test("evaluateConflict: a valid reviewed exception flips a shared-surface conflict to disjoint", () => {
   const exception = {
     surface: { kind: "generated_artifact" as const, pattern: "dist/schema.json" },
+    counterpart_item_id: "200",
     justification: "both items append disjoint keys, reviewed",
     review_ref: "PR#42",
   };
@@ -329,9 +353,34 @@ test("evaluateConflict: a valid reviewed exception flips a shared-surface confli
   assert.equal(verdict.reason, null);
 });
 
+test("evaluateConflict: an exception reviewed for a different pair does not suppress this pair's conflict", () => {
+  // Regression for review 1 finding 02334167: an exception reviewed for A<->B must not also
+  // suppress A<->C on the same shared surface.
+  const exception = {
+    surface: { kind: "generated_artifact" as const, pattern: "dist/schema.json" },
+    counterpart_item_id: "200",
+    justification: "reviewed for 100<->200 only",
+    review_ref: "PR#42",
+  };
+  const declA: OwnershipDeclaration = { shared: { generated_artifact: ["dist/schema.json"] }, exceptions: [exception] };
+  const declB: OwnershipDeclaration = { shared: { generated_artifact: ["dist/schema.json"] } };
+  const declC: OwnershipDeclaration = { shared: { generated_artifact: ["dist/schema.json"] } };
+  const a = { id: "100", decl: declA, normalized: normalizeOwnership(declA) };
+  const b = { id: "200", decl: declB, normalized: normalizeOwnership(declB) };
+  const c = { id: "300", decl: declC, normalized: normalizeOwnership(declC) };
+
+  const abVerdict = evaluateConflict(a, b);
+  assert.equal(abVerdict.verdict, "disjoint");
+
+  const acVerdict = evaluateConflict(a, c);
+  assert.equal(acVerdict.verdict, "conflict");
+  assert.equal(acVerdict.reason?.kind, "overlapping_surface");
+});
+
 test("evaluateConflict: an exception does not suppress an explicit conflicts_with edge", () => {
   const exception = {
     surface: { kind: "generated_artifact" as const, pattern: "dist/schema.json" },
+    counterpart_item_id: "200",
     justification: "reviewed anyway",
     review_ref: "PR#42",
   };
@@ -443,6 +492,7 @@ test("evaluateOwnershipEvidence: a disjoint pair's evidence records its verdict 
 test("evaluateConflict and evaluateOwnershipEvidence expose no merge or review authority", () => {
   const exception = {
     surface: { kind: "generated_artifact" as const, pattern: "dist/schema.json" },
+    counterpart_item_id: "200",
     justification: "reviewed",
     review_ref: "PR#42",
   };
