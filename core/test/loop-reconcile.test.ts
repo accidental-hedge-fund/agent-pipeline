@@ -540,12 +540,16 @@ test("reconcile: refuses to run against an already-stopped run", async () => {
 
 // ---------------------------------------------------------------------------
 // transitionItem — caller-supplied state never proves a remote transition.
+// `TransitionItemInput` carries no identity field at all: the only evidence
+// transitionItem ever considers is what it observes itself, live, through the
+// injected ReconcileObserveDeps seam — a caller has nothing to fabricate.
 // ---------------------------------------------------------------------------
 
-test("transitionItem: a remote-proving transition with no verified identity is refused, state unchanged", async () => {
+test("transitionItem: a remote-proving transition with no PR observed is refused, state unchanged", async () => {
   const { deps, contract, token } = await setup("implemented");
+  const { deps: observeDeps } = fakeObserveDeps();
   await assert.rejects(
-    transitionItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", to: "pr_opened" }),
+    transitionItem(deps, observeDeps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", to: "pr_opened" }),
     (err: unknown) => {
       assert.ok(err instanceof LoopError);
       assert.equal(err.loopFailureClass, "validation");
@@ -556,26 +560,40 @@ test("transitionItem: a remote-proving transition with no verified identity is r
   assert.equal(ledger.items["100"].state, "implemented");
 });
 
-test("transitionItem: a remote-proving transition backed by a fresh verified identity is accepted", async () => {
+test("transitionItem: a remote-proving transition backed by the engine's own live observation is accepted", async () => {
   const { deps, contract, token } = await setup("implemented");
-  const identity = openPrIdentity({ observed_at: "2026-07-23T00:00:00.000Z" });
-  const ledger = await transitionItem(deps, contract, {
+  const { deps: observeDeps } = fakeObserveDeps({
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+  });
+  const ledger = await transitionItem(deps, observeDeps, contract, {
     runId: "run-1",
     token,
     itemId: "100",
     engine: "claude",
     to: "pr_opened",
-    verifiedIdentity: identity,
   });
   assert.equal(ledger.items["100"].state, "pr_opened");
   assert.equal(ledger.items["100"].last_verified_identity?.pr_number, 12);
 });
 
-test("transitionItem: an identity observed outside the freshness window does not prove the transition", async () => {
+test("transitionItem: an observation taken outside the freshness window does not prove the transition", async () => {
   const { deps, contract, token } = await setup("implemented", {});
-  const stale = openPrIdentity({ observed_at: "2020-01-01T00:00:00.000Z" });
+  const { deps: observeDeps } = fakeObserveDeps({
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    now: () => new Date("2020-01-01T00:00:00.000Z"),
+  });
   await assert.rejects(
-    transitionItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", to: "pr_opened", verifiedIdentity: stale }),
+    transitionItem(deps, observeDeps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", to: "pr_opened" }),
     (err: unknown) => {
       assert.ok(err instanceof LoopError);
       assert.equal(err.loopFailureClass, "validation");
@@ -586,25 +604,64 @@ test("transitionItem: an identity observed outside the freshness window does not
   assert.equal(ledger.items["100"].state, "implemented");
 });
 
-test("transitionItem: an identity that does not support the target state is refused", async () => {
+test("transitionItem: an observation that does not support the target state is refused", async () => {
   const { deps, contract, token } = await setup("implemented");
-  const notOpen = openPrIdentity({ pr_state: "closed" });
+  const { deps: observeDeps } = fakeObserveDeps({
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "closed", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+  });
   await assert.rejects(
-    transitionItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", to: "pr_opened", verifiedIdentity: notOpen }),
+    transitionItem(deps, observeDeps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", to: "pr_opened" }),
   );
+});
+
+test("transitionItem: a merged PR never proves released or deployed — no evidence field exists for either", async () => {
+  const { deps, contract, token } = await setup("merged");
+  const { deps: observeDeps } = fakeObserveDeps({
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "merged", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: "mergesha" };
+    },
+  });
+  for (const to of ["released", "deployed"] as const) {
+    await assert.rejects(
+      transitionItem(deps, observeDeps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", to }),
+      (err: unknown) => {
+        assert.ok(err instanceof LoopError);
+        assert.equal(err.loopFailureClass, "validation");
+        return true;
+      },
+    );
+  }
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "merged");
 });
 
 test("transitionItem: a local transition (implemented) needs no external identity", async () => {
   const { deps, contract, token } = await setup("in_progress");
-  const ledger = await transitionItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", to: "implemented" });
+  const { deps: observeDeps } = fakeObserveDeps();
+  const ledger = await transitionItem(deps, observeDeps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", to: "implemented" });
   assert.equal(ledger.items["100"].state, "implemented");
 });
 
-test("transitionItem: a remote-proving transition without the granted authority gate is refused even with a good identity", async () => {
+test("transitionItem: a remote-proving transition without the granted authority gate is refused even with a good observation", async () => {
   const { deps, contract, token } = await setup("implemented", { authority_grants: [] });
-  const identity = openPrIdentity();
+  const { deps: observeDeps } = fakeObserveDeps({
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+  });
   await assert.rejects(
-    transitionItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", to: "pr_opened", verifiedIdentity: identity }),
+    transitionItem(deps, observeDeps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", to: "pr_opened" }),
     (err: unknown) => {
       assert.ok(err instanceof LoopError);
       assert.equal(err.loopFailureClass, "authority");

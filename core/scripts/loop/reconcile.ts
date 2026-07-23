@@ -461,9 +461,14 @@ function identitySupportsState(state: LoopItemState, identity: LoopExternalIdent
     case "ready":
       return identity.pr_number !== null && identity.pr_state === "open" && identity.ready_label_present;
     case "merged":
+      return identity.pr_state === "merged";
     case "released":
     case "deployed":
-      return identity.pr_state === "merged";
+      // LoopExternalIdentity carries no release/deployment evidence (it observes
+      // only issue/PR/checks state) — a merged PR proves merged, never released or
+      // deployed. Refuse both until a dedicated evidence field exists (finding
+      // 54e0ccf4/c4efacb2e973537a) rather than accept a merge as a stand-in proof.
+      return false;
     default:
       return true;
   }
@@ -480,23 +485,23 @@ export interface TransitionItemInput {
   engine: LoopEngineName;
   to: LoopItemState;
   note?: string;
-  /** Required — and validated as fresh and state-supporting — only when `to`
-   *  is a member of {@link REMOTE_PROVING_STATES}. A transition into a local
-   *  state (e.g. `implemented`) needs none. */
-  verifiedIdentity?: LoopExternalIdentity;
 }
 
 /** The sanctioned entry point for moving an item into a remote-proving state.
  *  Refuses (LoopError "validation") a transition into `pr_opened` / `ready` /
- *  `merged` / `released` / `deployed` unless a fresh (within
- *  {@link NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS}) verified identity supporting
- *  that exact state is supplied — a caller's claim alone can never move an
- *  item into these states. Composes with (never bypasses) the existing
+ *  `merged` / `released` / `deployed` unless the engine's own live observation
+ *  — taken through the injected {@link ReconcileObserveDeps} seam immediately
+ *  before the transition, never a value the caller supplies — is fresh
+ *  (within {@link NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS}) and supports that
+ *  exact state. A caller cannot fabricate this evidence: `TransitionItemInput`
+ *  carries no identity field at all, so there is nothing for a caller to
+ *  substitute a claim into. Composes with (never bypasses) the existing
  *  authority-gate + directly-verified-evidence requirement via
  *  `authorizeGatedTransition` (loop/pause.ts) for every state that maps to a
  *  {@link LoopAuthorityGate}. */
 export async function transitionItem(
   deps: LoopStoreDeps,
+  observeDeps: ReconcileObserveDeps,
   contractInput: LoopContract,
   input: TransitionItemInput,
 ): Promise<LoopLedger> {
@@ -509,31 +514,27 @@ export async function transitionItem(
     throw new LoopError("validation", `item "${input.itemId}" not found in run "${input.runId}"`);
   }
 
+  let observedIdentity: LoopExternalIdentity | undefined;
   if (REMOTE_PROVING_STATES.has(input.to)) {
-    const identity = input.verifiedIdentity;
-    if (!identity) {
-      throw new LoopError(
-        "validation",
-        `transition into "${input.to}" for item "${input.itemId}" requires a fresh engine-verified external identity — none was supplied; caller-supplied state never proves a remote transition`,
-      );
-    }
+    const identity = await observeExternalIdentity(observeDeps, input.itemId);
     const ageSeconds = (deps.now().getTime() - Date.parse(identity.observed_at)) / 1000;
     if (!Number.isFinite(ageSeconds) || ageSeconds < 0 || ageSeconds > NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS) {
       throw new LoopError(
         "validation",
-        `transition into "${input.to}" for item "${input.itemId}" requires a verified identity within the ${NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS}s freshness window — the supplied identity was observed at ${identity.observed_at}`,
+        `transition into "${input.to}" for item "${input.itemId}" requires a verified identity within the ${NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS}s freshness window — the engine's live observation was taken at ${identity.observed_at}`,
       );
     }
     if (!identitySupportsState(input.to, identity)) {
       throw new LoopError(
         "validation",
-        `transition into "${input.to}" for item "${input.itemId}" is not supported by the verified external identity`,
+        `transition into "${input.to}" for item "${input.itemId}" is not supported by the engine's verified external identity — caller-supplied state never proves a remote transition`,
       );
     }
     const gate = STATE_TO_GATE[input.to];
     if (gate && isLoopAuthorityGate(gate)) {
       authorizeGatedTransition(contractInput.authority_grants, ledger, gate, input.itemId, describeIdentityEvidence(identity));
     }
+    observedIdentity = identity;
   }
 
   const time = deps.now().toISOString();
@@ -542,7 +543,7 @@ export async function transitionItem(
     ...item,
     state: input.to,
     history: [...item.history, { time, from, to: input.to, engine: input.engine, note: input.note }],
-    ...(input.verifiedIdentity ? { last_verified_identity: input.verifiedIdentity } : {}),
+    ...(observedIdentity ? { last_verified_identity: observedIdentity } : {}),
   };
   ledger.items = { ...ledger.items, [input.itemId]: updated };
 
