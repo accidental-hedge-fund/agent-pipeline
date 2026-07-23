@@ -446,7 +446,7 @@ export async function getPrDetail(cfg: PipelineConfig, prNumber: number): Promis
     "view",
     String(prNumber),
     "--json",
-    "number,title,body,state,url,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,isDraft,additions,deletions,changedFiles",
+    "number,title,body,state,url,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,isDraft,additions,deletions,changedFiles,mergeCommit",
     "-R",
     cfg.repo,
   ]);
@@ -465,6 +465,7 @@ export async function getPrDetail(cfg: PipelineConfig, prNumber: number): Promis
     additions: number;
     deletions: number;
     changedFiles: number;
+    mergeCommit: { oid: string } | null;
   };
   const stateUpper = data.state.toUpperCase();
   const state =
@@ -485,6 +486,7 @@ export async function getPrDetail(cfg: PipelineConfig, prNumber: number): Promis
     additions: data.additions,
     deletions: data.deletions,
     changed_files: data.changedFiles,
+    merge_commit_sha: data.mergeCommit?.oid ?? null,
   };
 }
 
@@ -1206,6 +1208,97 @@ export async function getPrForIssue(
     cfg.repo,
   ]);
   return resolvePrForIssue(parsePrList(stdout), issueNumber, cfg.repo);
+}
+
+/** One page of an issue's `CONNECTED_EVENT`/`CROSS_REFERENCED_EVENT` timeline,
+ *  as returned by the GraphQL query in {@link getPrForIssueAnyState}. */
+interface IssueTimelinePage {
+  hasPreviousPage: boolean;
+  startCursor: string | null;
+  nodes: {
+    __typename: string;
+    willCloseTarget?: boolean;
+    subject?: { __typename?: string; number?: number; headRefName?: string; isCrossRepository?: boolean } | null;
+    source?: { __typename?: string; number?: number; headRefName?: string; isCrossRepository?: boolean } | null;
+  }[];
+}
+
+/** Picks the most recent same-repo PR linked to the issue from one timeline
+ *  page: a `ConnectedEvent` (manual link) always counts; a
+ *  `CrossReferencedEvent` counts only when `willCloseTarget` is true (mirrors
+ *  `closingIssuesReferences` semantics — a PR that merely mentions the issue
+ *  does not match). Fork PRs (`isCrossRepository`) are excluded, same as
+ *  {@link resolvePrForIssue}. Scans newest-first within the page. Exported for
+ *  tests. */
+export function pickPrFromTimelinePage(nodes: IssueTimelinePage["nodes"]): number | null {
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const node = nodes[i];
+    const pr =
+      node.__typename === "ConnectedEvent"
+        ? node.subject
+        : node.__typename === "CrossReferencedEvent" && node.willCloseTarget
+          ? node.source
+          : null;
+    if (pr && pr.__typename === "PullRequest" && pr.number !== undefined && !pr.isCrossRepository) {
+      return pr.number;
+    }
+  }
+  return null;
+}
+
+const ISSUE_TIMELINE_QUERY =
+  "query($owner:String!,$repo:String!,$num:Int!,$before:String){repository(owner:$owner,name:$repo)" +
+  "{issue(number:$num){timelineItems(last:50,before:$before,itemTypes:[CONNECTED_EVENT,CROSS_REFERENCED_EVENT])" +
+  "{pageInfo{hasPreviousPage startCursor}nodes{__typename " +
+  "... on ConnectedEvent{subject{__typename ... on PullRequest{number headRefName isCrossRepository}}} " +
+  "... on CrossReferencedEvent{willCloseTarget source{__typename ... on PullRequest{number headRefName isCrossRepository}}}}}}}}";
+
+/** Same resolution as {@link getPrForIssue} but across every PR state (open,
+ *  closed, merged) — used by reconciliation (#511), which must still find a
+ *  since-merged PR to observe `pr_state: "merged"` (an open-only lookup would
+ *  never see it, defeating forward drift detection).
+ *
+ *  Resolves via the issue's own `CONNECTED_EVENT`/`CROSS_REFERENCED_EVENT`
+ *  timeline (paginated backward through history) rather than a repository-wide
+ *  `gh pr list` scan: the timeline is scoped to this one issue, so it cannot
+ *  lose a historical merged PR to an unrelated bounded-size repo-wide list
+ *  (#511 review-2 finding — a fixed `-L 100` repo-wide scan silently drops
+ *  older PRs once a repo has passed 100 total PRs). */
+export async function getPrForIssueAnyState(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  run: GhApiRunner = (args) => ghRun(args),
+): Promise<number | null> {
+  const [owner, repo] = cfg.repo.split("/");
+  let before: string | null = null;
+  // Safety bound only — 40 pages * 50 events = 2000 timeline events for a
+  // single issue, far beyond any real issue's link history.
+  for (let page = 0; page < 40; page++) {
+    const args = [
+      "api",
+      "graphql",
+      "-f",
+      `query=${ISSUE_TIMELINE_QUERY}`,
+      "-F",
+      `owner=${owner}`,
+      "-F",
+      `repo=${repo}`,
+      "-F",
+      `num=${issueNumber}`,
+    ];
+    if (before) args.push("-F", `before=${before}`);
+    const stdout = await run(args);
+    const data = JSON.parse(stdout) as {
+      data: { repository: { issue: { timelineItems: IssueTimelinePage } | null } };
+    };
+    const timelineItems = data.data.repository.issue?.timelineItems;
+    if (!timelineItems) return null;
+    const found = pickPrFromTimelinePage(timelineItems.nodes);
+    if (found !== null) return found;
+    if (!timelineItems.pageInfo.hasPreviousPage) return null;
+    before = timelineItems.pageInfo.startCursor;
+  }
+  return null;
 }
 
 /** Select the first same-repo PR whose headRefName exactly equals {@link branch}.

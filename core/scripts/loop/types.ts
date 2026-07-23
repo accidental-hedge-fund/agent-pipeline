@@ -261,6 +261,12 @@ export interface LoopItemLedgerEntry {
   /** Present only while `state === "waiting"` — the outstanding human-input request a resume
    *  must satisfy. Cleared on a successful resume or abandon. */
   hold_request?: LoopHumanInputRequest;
+  /** The most recent {@link LoopExternalIdentity} verified to actually support this item's
+   *  current state — set on a proven remote-proving transition and refreshed on every aligned
+   *  or repaired-forward reconciliation pass. The anchor a later reconciliation compares a fresh
+   *  observation against to detect `identity-mismatch` drift (e.g. the bound PR/head SHA changed
+   *  out from under an already-proven state). Absent for an item that has never been verified. */
+  last_verified_identity?: LoopExternalIdentity;
 }
 
 export interface LoopMergeBarrier {
@@ -297,11 +303,77 @@ export interface LoopNativeGoalCheck {
   checked_at: string;
 }
 
+// ---------------------------------------------------------------------------
+// Verified live reconciliation (#511, capability `durable-run-reconciliation`).
+// Structured external identities, typed drift classification, and the closed
+// next-action set — see core/scripts/loop/reconcile.ts and
+// openspec/changes/durable-run-reconciliation/design.md.
+// ---------------------------------------------------------------------------
+
+/** A structured binding of one item to the concrete live external objects
+ *  that can prove its state — replaces the free-form `observed: unknown`
+ *  reconciliation used to carry. Produced only by an engine-owned live
+ *  observation seam (see `ReconcileObserveDeps`), never by a caller claim. */
+export interface LoopExternalIdentity {
+  issue_number: number;
+  issue_open: boolean;
+  ready_label_present: boolean;
+  pr_number: number | null;
+  pr_state: "open" | "closed" | "merged" | null;
+  head_branch: string;
+  head_sha: string;
+  merge_commit_sha: string | null;
+  checks_conclusion: "success" | "failure" | "pending" | "none";
+  observed_at: string;
+}
+
+export const LOOP_DRIFT_CLASSES = [
+  "ledger-behind",
+  "ledger-ahead",
+  "external-absent",
+  "identity-mismatch",
+  "checks-regressed",
+] as const;
+
+export type LoopDriftClass = (typeof LOOP_DRIFT_CLASSES)[number];
+
+export function isLoopDriftClass(value: unknown): value is LoopDriftClass {
+  return typeof value === "string" && (LOOP_DRIFT_CLASSES as readonly string[]).includes(value);
+}
+
+export const LOOP_NEXT_ACTIONS = [
+  "advance",
+  "await-checks",
+  "repair-forward",
+  "clear-merge-barrier",
+  "hold-for-human",
+  "noop",
+] as const;
+
+export type LoopNextAction = (typeof LOOP_NEXT_ACTIONS)[number];
+
+export function isLoopNextAction(value: unknown): value is LoopNextAction {
+  return typeof value === "string" && (LOOP_NEXT_ACTIONS as readonly string[]).includes(value);
+}
+
+/** One item's drift record — always carries exactly one {@link LoopDriftClass};
+ *  there is deliberately no way to construct a drift record without a valid
+ *  class (see `isLoopDriftClass` / `classifyDrift` in reconcile.ts). */
+export interface LoopDrift {
+  item_id: string;
+  ledger_state: LoopItemState;
+  observed_state: string;
+  class: LoopDriftClass;
+}
+
 export interface LoopReconciliation {
   sequence: number;
   time: string;
-  observed: unknown;
-  drift: Array<{ item_id: string; ledger_state: LoopItemState; observed_state: string }>;
+  /** Every item's verified live identity as of this reconciliation pass. */
+  observed: Record<string, LoopExternalIdentity>;
+  drift: LoopDrift[];
+  /** Every active item's deterministically computed next action. */
+  next_actions: Record<string, LoopNextAction>;
 }
 
 export interface LoopLedger {

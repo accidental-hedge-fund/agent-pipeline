@@ -217,7 +217,9 @@ export async function abandonHold(deps: LoopStoreDeps, input: AbandonHoldInput):
 // Audited, fail-closed resume.
 // ---------------------------------------------------------------------------
 
-const NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS = 300;
+/** Exported so `reconcile.ts`'s remote-proving-transition freshness guard can mirror the same
+ *  bounded window rather than inventing a second constant (#511 design.md). */
+export const NATIVE_GOAL_FRESHNESS_WINDOW_SECONDS = 300;
 
 function validatePipelinePreflightEvidence(evidence: LoopPipelinePreflightEvidence | null | undefined): void {
   if (!evidence || evidence.passed !== true) {

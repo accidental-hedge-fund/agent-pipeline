@@ -403,40 +403,6 @@ SHALL emit an event carrying the barrier being cleared.
 
 ---
 
-### Requirement: Reconciliation SHALL record caller-observed truth and report drift without resolving it
-
-The engine SHALL accept an observed-truth document supplied by the caller and SHALL NOT read
-GitHub or any other external system itself. It SHALL compare each ledger item against the
-observed state for that item, report every mismatch as the item id with its ledger state and
-its observed state, and SHALL NOT modify item states to match the observation. Items absent
-from the observation and observed items absent from the ledger SHALL be ignored.
-Reconciliation SHALL record the observation with a monotonically increasing sequence number
-and the time, emit an event, and succeed even when mismatches are reported.
-
-#### Scenario: Drift is reported, not silently applied
-
-- **WHEN** the observed state of an item differs from its ledger state
-- **THEN** the mismatch SHALL be reported with the item id, the ledger state, and the observed
-  state
-- **AND** the item's ledger state SHALL be unchanged
-
-#### Scenario: Reconciliation reads no external system
-
-- **WHEN** reconciliation runs through the injected seams
-- **THEN** zero GitHub calls and zero subprocess invocations SHALL have been recorded
-
-#### Scenario: Unmatched items are ignored
-
-- **WHEN** the observation omits a ledger item, or names an item the ledger does not have
-- **THEN** no mismatch SHALL be reported for it and reconciliation SHALL succeed
-
-#### Scenario: Reconciliations are sequenced
-
-- **WHEN** reconciliation runs repeatedly
-- **THEN** each SHALL record a sequence number one greater than the previous
-
----
-
 ### Requirement: The engine SHALL expose a stable failure taxonomy
 
 The engine SHALL classify every refusal into exactly one documented class — validation, lock,
