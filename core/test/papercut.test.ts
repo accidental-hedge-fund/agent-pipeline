@@ -460,6 +460,7 @@ function makeAutoFileDeps(opts: {
         state: "OPEN",
         createdAt: new Date(opts.nowMs ?? NOW_MS).toISOString(),
         labels,
+        body,
       });
       return url;
     },
@@ -750,6 +751,7 @@ test("autoFilePapercuts: cross-host duplicate — read-back reconciliation keeps
         state: "OPEN",
         createdAt: new Date(NOW_MS).toISOString(),
         labels,
+        body,
       });
       const ownUrl = `https://github.com/org/repo/issues/${github.nextNumber++}`;
       github.issues.push({
@@ -758,6 +760,7 @@ test("autoFilePapercuts: cross-host duplicate — read-back reconciliation keeps
         state: "OPEN",
         createdAt: new Date(NOW_MS).toISOString(),
         labels,
+        body,
       });
       return ownUrl;
     },
@@ -818,6 +821,98 @@ test("autoFilePapercuts: cross-host cap — a second host's run stops once GitHu
   assert.ok(openInWindow <= 1, `cap overshoot: ${openInWindow} open issues in window`);
 });
 
+test("autoFilePapercuts: rate-cap reconciliation never closes a human-managed pipeline:backlog issue lacking the auto-file provenance marker (review 2, finding 582c19e6)", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const deps = makeAutoFileDeps({
+    runs: {
+      r1: [papercutLine(at, "flaky test gate")],
+      r2: [papercutLine(at, "flaky test gate")],
+      r3: [papercutLine(at, "flaky test gate")],
+    },
+  });
+  const originalList = deps.listOpenImproveIssues;
+  let listCallCount = 0;
+  let humanIssueNumber = -1;
+  deps.listOpenImproveIssues = async () => {
+    listCallCount++;
+    const issues = await originalList();
+    // Inject a human-managed issue — same [pipeline-improve] title prefix and
+    // pipeline:backlog label the real auto-filed issue carries, but no
+    // AUTO_FILE_PROVENANCE_MARKER in the body — right before the post-create
+    // reconciliation read-back (3rd call), simulating one appearing in the
+    // window at the worst possible moment relative to this host's create.
+    if (listCallCount === 3) {
+      humanIssueNumber = Math.max(0, ...issues.map((i) => issueNumberFromUrl(i.url) ?? 0)) + 1;
+      issues.push({
+        title: "[pipeline-improve] Recurring papercut: an unrelated human note",
+        url: `https://github.com/org/repo/issues/${humanIssueNumber}`,
+        state: "OPEN",
+        createdAt: new Date(NOW_MS).toISOString(),
+        labels: ["pipeline:backlog"],
+        body: "Filed by a human during triage — not an auto-filed issue.",
+      });
+    }
+    return issues;
+  };
+
+  await autoFilePapercuts(defaultAutoFileOpts({ maxPerWindow: 1 }), deps);
+
+  assert.equal(deps._createCalls.length, 1, "the qualifying cluster should still be auto-filed");
+  assert.equal(
+    deps._closeCalls.length,
+    0,
+    "the human-managed issue has no provenance marker, so it must never be selected as a cap-overflow candidate",
+  );
+});
+
+test("autoFilePapercuts: duplicate-title reconciliation never closes a same-titled human-managed issue lacking the auto-file provenance marker (review 2, finding 582c19e6)", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const title = "[pipeline-improve] Recurring papercut: flaky test gate";
+  const github = makeFakeGithub();
+  const deps = makeAutoFileDeps({
+    runs: {
+      r1: [papercutLine(at, "flaky test gate")],
+      r2: [papercutLine(at, "flaky test gate")],
+      r3: [papercutLine(at, "flaky test gate")],
+    },
+    github,
+    // Simulate a human-managed issue that happens to carry the exact same
+    // title as the cluster's proposedTitle() — no provenance marker in body —
+    // appearing in the same TOCTOU window as this host's own create.
+    createIssueImpl: async (t, body, labels) => {
+      const humanUrl = `https://github.com/org/repo/issues/${github.nextNumber++}`;
+      github.issues.push({
+        title: t,
+        url: humanUrl,
+        state: "OPEN",
+        createdAt: new Date(NOW_MS).toISOString(),
+        labels,
+        body: "Filed by a human — coincidentally the same title, no provenance marker.",
+      });
+      const ownUrl = `https://github.com/org/repo/issues/${github.nextNumber++}`;
+      github.issues.push({
+        title: t,
+        url: ownUrl,
+        state: "OPEN",
+        createdAt: new Date(NOW_MS).toISOString(),
+        labels,
+        body,
+      });
+      return ownUrl;
+    },
+  });
+
+  await autoFilePapercuts(defaultAutoFileOpts(), deps);
+
+  const openForTitle = github.issues.filter((i) => i.title === title && i.state === "OPEN");
+  assert.equal(
+    openForTitle.length,
+    2,
+    "both issues must remain open — the human-managed one is never a duplicate-title candidate",
+  );
+  assert.equal(deps._closeCalls.length, 0);
+});
+
 test("autoFilePapercuts: single-host run with no duplicate performs no reconciliation (closeIssue never called)", async () => {
   const at = new Date(NOW_MS - 3600_000).toISOString();
   const deps = makeAutoFileDeps({
@@ -875,6 +970,7 @@ test("autoFilePapercuts: a throwing closeIssue during reconciliation is caught, 
         state: "OPEN",
         createdAt: new Date(NOW_MS).toISOString(),
         labels,
+        body,
       });
       const ownUrl = `https://github.com/org/repo/issues/${github.nextNumber++}`;
       github.issues.push({
@@ -883,6 +979,7 @@ test("autoFilePapercuts: a throwing closeIssue during reconciliation is caught, 
         state: "OPEN",
         createdAt: new Date(NOW_MS).toISOString(),
         labels,
+        body,
       });
       return ownUrl;
     },

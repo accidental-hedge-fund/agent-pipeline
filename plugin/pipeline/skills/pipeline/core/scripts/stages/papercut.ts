@@ -218,6 +218,16 @@ export async function reportPapercuts(
   return results;
 }
 
+/** Machine-readable marker (#459 review 2, finding 582c19e6) embedded in every
+ *  auto-filed issue body by `buildAutoFileBody`. Neither the `[pipeline-improve]`
+ *  title prefix (also used by `pipeline improve --apply`) nor the `pipeline:backlog`
+ *  label (also applied by `/pipeline:triage` to human-managed issues) alone proves an
+ *  issue was created by this auto-file path — reconciliation below requires this marker
+ *  in the body before treating an issue as a reconciliation candidate, so a human-managed
+ *  or otherwise-provenanced `pipeline:backlog` issue is never closed as a dupe or cap
+ *  overflow. */
+export const AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:papercut-auto-filed -->";
+
 /** Post-create read-back reconciliation (#459, hardened for review finding
  *  f09ce15de2e6911a): re-list improve issues once and correct two distinct
  *  cross-host races against that single snapshot.
@@ -233,6 +243,11 @@ export async function reportPapercuts(
  *     like dupes of each other). Recompute the in-window open auto-filed set
  *     from the same snapshot and close every issue past the lowest-numbered
  *     `maxPerWindow` survivors.
+ *
+ *  Both candidate sets are additionally restricted to issues whose body carries
+ *  `AUTO_FILE_PROVENANCE_MARKER` (#459 review 2, finding 582c19e6) — a human-managed or
+ *  `pipeline improve --apply`-created `pipeline:backlog`/`[pipeline-improve]`-titled issue
+ *  never carries this marker and so is never a reconciliation candidate.
  *
  *  Both rules pick survivors by ascending issue number, so two hosts
  *  reconciling independently — potentially against different snapshots taken
@@ -258,8 +273,11 @@ async function reconcilePostCreateState(
 
   const closedNumbers = new Set<number>();
 
+  const isAutoFiled = (i: OpenImproveIssue): boolean =>
+    (i.body ?? "").includes(AUTO_FILE_PROVENANCE_MARKER);
+
   const dupes = issues
-    .filter((i) => i.state === "OPEN" && i.title === title)
+    .filter((i) => i.state === "OPEN" && i.title === title && isAutoFiled(i))
     .map((i) => ({ issue: i, number: issueNumberFromUrl(i.url) }))
     .filter((x): x is { issue: OpenImproveIssue; number: number } => x.number !== null)
     .sort((a, b) => a.number - b.number);
@@ -285,7 +303,7 @@ async function reconcilePostCreateState(
   }
 
   const inWindow = issues
-    .filter((i) => i.state === "OPEN" && i.labels.includes("pipeline:backlog"))
+    .filter((i) => i.state === "OPEN" && i.labels.includes("pipeline:backlog") && isAutoFiled(i))
     .map((i) => ({ number: issueNumberFromUrl(i.url), createdMs: Date.parse(i.createdAt) }))
     .filter(
       (x): x is { number: number; createdMs: number } =>
@@ -408,6 +426,7 @@ function buildAutoFileBody(c: ClusterEntry, windowHours: number): string {
     "```",
   ].join("\n");
   return [
+    AUTO_FILE_PROVENANCE_MARKER,
     `## Agent-reported friction (auto-filed by \`pipeline\`)`,
     ``,
     `_This issue was filed automatically by the pipeline from agent-reported friction ` +
@@ -529,7 +548,7 @@ export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps):
           const body = buildAutoFileBody(c, opts.windowHours);
           const url = await deps.createIssue(title, body, ["pipeline:backlog"]);
           deps.log(`[pipeline] papercut auto-file: created ${url}`);
-          byTitle.set(title, { title, url, state: "OPEN", createdAt: "", labels: ["pipeline:backlog"] });
+          byTitle.set(title, { title, url, state: "OPEN", createdAt: "", labels: ["pipeline:backlog"], body });
           await reconcilePostCreateState(title, deps, cutoffMs, opts.maxPerWindow);
         } catch (err) {
           deps.log(`[pipeline] papercut auto-file: create failed (non-fatal): ${(err as Error).message}`);
