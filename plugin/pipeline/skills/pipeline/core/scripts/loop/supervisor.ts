@@ -350,20 +350,42 @@ export async function runSupervisorCycle(
   // supplies the live changed-files seam. Parking never merges, pushes, or deletes a
   // branch/worktree — it reuses the existing "workflow-state" blocked class so a parked item
   // recovers through the already-tested block/recover machinery instead of inventing a new state.
+  // `Promise.allSettled` (not sequential awaits) is deliberate (#530 review 2 finding 0526bc5f): a
+  // rejected worktree/git observation for one item must never abort classification for the whole
+  // cycle, which would otherwise leave every dispatched item — including already-`ready_to_deploy`
+  // siblings — stranded `in_progress` and eligible for duplicate redispatch. An item whose
+  // observation itself fails cannot be proven non-overlapping, so it is conservatively parked
+  // alongside any item found to actually overlap.
   let parkedItemIds = new Set<string>();
+  const unobservedItemIds = new Set<string>();
   if (activeItemIds.length > 1 && deps.getChangedFiles) {
+    const getChangedFiles = deps.getChangedFiles;
+    const settledObservations = await Promise.allSettled(activeItemIds.map((itemId) => getChangedFiles(itemId)));
     const actualChangedFiles: Record<string, readonly string[]> = {};
-    for (const itemId of activeItemIds) {
-      actualChangedFiles[itemId] = await deps.getChangedFiles(itemId);
-    }
+    settledObservations.forEach((result, i) => {
+      const itemId = activeItemIds[i];
+      if (result.status === "fulfilled") {
+        actualChangedFiles[itemId] = result.value;
+      } else {
+        unobservedItemIds.add(itemId);
+      }
+    });
     const overlap = detectChangedFileOverlap(actualChangedFiles);
-    if (overlap.affected_item_ids.length > 0) {
-      parkedItemIds = new Set(overlap.affected_item_ids);
+    const affectedItemIds = new Set([...overlap.affected_item_ids, ...unobservedItemIds]);
+    if (affectedItemIds.size > 0) {
+      parkedItemIds = affectedItemIds;
+      const reasonParts: string[] = [];
+      if (unobservedItemIds.size > 0) {
+        reasonParts.push(`changed-file observation failed for item(s) ${[...unobservedItemIds].join(", ")} — conservatively parked as unproven`);
+      }
+      if (overlap.overlapping_paths.length > 0) {
+        reasonParts.push(`observed changed-file overlap not predicted by declared ownership: ${overlap.overlapping_paths.join(", ")}`);
+      }
       await appendEvent(deps.store, runId, token, "loop_replan_requested", {
         time: deps.store.now().toISOString(),
-        affected_item_ids: overlap.affected_item_ids,
+        affected_item_ids: [...affectedItemIds].sort(),
         overlapping_paths: overlap.overlapping_paths,
-        reason: `observed changed-file overlap not predicted by declared ownership: ${overlap.overlapping_paths.join(", ")}`,
+        reason: reasonParts.join("; "),
       });
     }
   }
@@ -403,14 +425,13 @@ export async function runSupervisorCycle(
   }
 
   // Pass 2 — items requiring a block-family mutation (parked, blocked_needs_human, failed), which
-  // may record a terminal run stop. A prior item in this pass may already have recorded one — every
-  // subsequent block/classify call refuses once `ledger.stop` is set, so further processing this
-  // cycle is skipped rather than crashing. The still-in_progress remainder is untouched; a stopped
-  // run never dispatches again, so this causes no duplicate work (loop-supervisor's
-  // `if (ledger.stop) return` at the top of the next cycle) — and, unlike before this fix, it can no
-  // longer strand a pass-1 item's outcome, since pass 1 has already fully persisted by this point.
+  // may record a terminal run stop. A prior item in this pass may already have recorded one; every
+  // subsequent block/classify call below passes `allowAlreadyStopped: true` (#530 review 2 finding
+  // a7abc98c) so it still durably classifies its own item — preserving the first-cause stop record
+  // rather than overwriting it — instead of being refused and left `in_progress` (which would make
+  // it eligible for duplicate dispatch on a later recovery/resume). A stopped run never dispatches
+  // again once this cycle returns, so classifying every sibling here causes no duplicate work.
   for (const itemId of activeItemIds) {
-    if (ledger.stop) break;
     const outcome = outcomeByItem.get(itemId)!;
     if (!parkedItemIds.has(itemId) && (outcome === "ready_to_deploy" || outcome === "abandoned")) continue;
 
@@ -423,7 +444,10 @@ export async function runSupervisorCycle(
         itemId,
         engine,
         blockerClass: "workflow-state",
-        evidence: "parked for replan: observed changed-file overlap with a concurrently-run item",
+        evidence: unobservedItemIds.has(itemId)
+          ? "parked for replan: changed-file observation failed for this item, so independence could not be proven"
+          : "parked for replan: observed changed-file overlap with a concurrently-run item",
+        allowAlreadyStopped: true,
       });
     } else if (outcome === "blocked_needs_human") {
       ledger = await classifyAndBlockItem(deps.store, contract, {
@@ -433,6 +457,7 @@ export async function runSupervisorCycle(
         engine,
         candidateClasses: ["missing-authority"],
         evidence: `pipeline/loop-execution@1 reported blocked_needs_human for item ${itemId}`,
+        allowAlreadyStopped: true,
       });
     } else {
       // "failed" — either reported directly, a rejected dispatch, or normalized from an outcome
@@ -449,6 +474,7 @@ export async function runSupervisorCycle(
         evidence: dispatchError
           ? `pipeline/loop-execution@1 dispatch rejected for item ${itemId}: ${dispatchError}`
           : `pipeline/loop-execution@1 reported outcome "${String(rawOutcomeByItem.get(itemId))}" for item ${itemId}, normalized to failed`,
+        allowAlreadyStopped: true,
       });
     }
 

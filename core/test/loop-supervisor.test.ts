@@ -972,3 +972,81 @@ test("runSupervisorCycle: a rejected concurrent dispatch is durably classified f
   assert.equal(finalLedger.items["100"].evidence_fingerprint !== undefined, true);
   assert.equal(finalLedger.items["200"].state, "ready", "the successful sibling's outcome survives the sibling's rejected dispatch");
 });
+
+// #530 review 2 finding a7abc98c: a terminal run-fatal stop recorded for the first dispatched
+// item in pass 2 must not leave a later sibling's own failed/blocked outcome unclassified and
+// `in_progress` (and therefore eligible for duplicate redispatch on a later resume).
+test("runSupervisorCycle: a terminal stop from one dispatched item does not strand a later sibling's own failed outcome in_progress", async () => {
+  const contract = testContract({
+    concurrency: { max_concurrent: 2 },
+    items: [
+      { id: "100", depends_on: [], ownership: { exclusive: ["src/one/**"] } },
+      { id: "200", depends_on: [], ownership: { exclusive: ["src/two/**"] } },
+    ],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem } = coordinatedFakes(() => "bogus_outcome");
+
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const result = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.equal(result.stop?.reason, "run_fatal", "the first item's block records the run-fatal stop");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked", "the first item is durably classified");
+  assert.equal(
+    finalLedger.items["200"].state,
+    "blocked",
+    "the second item is also durably classified despite the run already being terminally stopped by the first — never left in_progress",
+  );
+  assert.equal(finalLedger.items["200"].blocked_theme, "workflow-engine-defect");
+  // The first-cause stop reason/item is preserved — the second item's own classification never
+  // overwrites which item actually caused the run to stop.
+  assert.equal(finalLedger.stop?.item_id, "100");
+
+  const events = await readEvents(deps, "run-1");
+  const stopEvents = events.filter((e: any) => e.kind === "loop_run_stopped");
+  assert.equal(stopEvents.length, 1, "only one loop_run_stopped event is recorded — the second item's classification doesn't re-fire it");
+});
+
+// #530 review 2 finding 0526bc5f: a rejected changed-file observation for one concurrently-run
+// item must not abort classification for the whole cycle — every dispatched item, including an
+// already-ready_to_deploy sibling, must still be durably persisted rather than stranded
+// in_progress.
+test("runSupervisorCycle: a rejected changed-file observation for one item does not abort classification for the cycle", async () => {
+  const contract = testContract({
+    concurrency: { max_concurrent: 2 },
+    items: [
+      { id: "100", depends_on: [], ownership: { exclusive: ["src/one/**"] } },
+      { id: "200", depends_on: [], ownership: { exclusive: ["src/two/**"] } },
+    ],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem, calls } = coordinatedFakes();
+  const getChangedFiles: NonNullable<SupervisorDeps["getChangedFiles"]> = async (itemId) => {
+    if (itemId === "100") throw new Error("simulated worktree observation failure");
+    return ["src/two/b.ts"];
+  };
+
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const result = await runSupervisorCycle({ store: deps, observe, dispatchItem, getChangedFiles }, "run-1", token, "claude");
+
+  assert.equal(result.progress, true, "the cycle completes without throwing despite the rejected observation");
+  assert.deepEqual(new Set(calls.map((c) => c.item_id)), new Set(["100", "200"]));
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked", "the item whose observation failed is conservatively parked, not stranded in_progress");
+  assert.equal(finalLedger.items["100"].blocked_theme, "workflow-state");
+  assert.equal(
+    finalLedger.items["200"].state,
+    "ready",
+    "the sibling's own successfully-observed outcome is still classified and not stranded in_progress by the other item's observation failure",
+  );
+
+  const events = await readEvents(deps, "run-1");
+  const replan = events.find((e: any) => e.kind === "loop_replan_requested") as any;
+  assert.ok(replan, "a durable replan-request record is written for the observation failure");
+  assert.ok(replan.data.reason.includes("observation failed"));
+});
