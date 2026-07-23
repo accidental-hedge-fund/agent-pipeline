@@ -701,6 +701,62 @@ export function insertPerIssueRow(
 }
 
 /**
+ * Validate the GLOBAL ROADMAP anchors that every intake insertion depends on — the
+ * release-plan `| *(none)* |` sentinel row and the per-issue sem-ver table header.
+ * Their absence means ROADMAP.md is fundamentally malformed, distinct from a missing
+ * TARGET-RELEASE `### vX.Y.Z` detail section (a legitimate, scaffoldable gap for a
+ * milestone created without ROADMAP structure — see scaffoldDetailSectionHeading).
+ * Intended to run as a precondition BEFORE the intake spec-generation harness call,
+ * so a malformed ROADMAP aborts at zero token cost.
+ */
+export function validateGlobalRoadmapAnchors(text: string): void {
+  // Line-anchored (not a bare substring search): the per-issue table's own
+  // "*(none)*" → Release cells contain "| *(none)* |" as a mid-line substring, which
+  // would false-positive a substring check even when the release-plan sentinel ROW
+  // itself is missing.
+  if (!text.split("\n").some((l) => l.startsWith("| *(none)* |"))) {
+    throw new Error(
+      `ROADMAP anchor not found: release-plan-none-row` +
+        ` (expected "| *(none)* |" row in the release plan table)`,
+    );
+  }
+  const tableHeader = "| # | Impact | Config | Theme | → Release | Depends on |";
+  if (!text.includes(tableHeader)) {
+    throw new Error(
+      `ROADMAP anchor not found: per-issue-table` +
+        ` (expected "${tableHeader}" header in the per-issue detail table)`,
+    );
+  }
+}
+
+/**
+ * Scaffold a minimal `### vX.Y.Z` detail-section heading into the
+ * "Remaining work — detail" section when it is absent — e.g. for a milestone created
+ * via the GitHub API with no ROADMAP structure. Idempotent: a no-op when the heading
+ * already exists. Throws when the container section itself is missing/unrecognizable
+ * (the genuinely-unscaffoldable case, handled by the caller's degrade fallback).
+ */
+export function scaffoldDetailSectionHeading(text: string, version: string): string {
+  const headingRe = new RegExp(`^### v${escapeRegex(version)}\\b`, "m");
+  if (headingRe.test(text)) return text;
+
+  const lines = text.split("\n");
+  const containerIdx = lines.findIndex((l) => l.startsWith("## Remaining work — detail"));
+  if (containerIdx === -1) {
+    throw new Error(
+      `ROADMAP anchor not found: detail-section-container` +
+        ` (expected a "## Remaining work — detail" section to scaffold "### v${version}" into)`,
+    );
+  }
+  let insertIdx = containerIdx + 1;
+  if (insertIdx < lines.length && lines[insertIdx].trim() === "") {
+    insertIdx++;
+  }
+  lines.splice(insertIdx, 0, `### v${version} — (intake)`, "");
+  return lines.join("\n");
+}
+
+/**
  * Insert a bullet at the top of the `### vX.Y.Z` detail section, after the
  * heading line and before any existing bullets.
  */

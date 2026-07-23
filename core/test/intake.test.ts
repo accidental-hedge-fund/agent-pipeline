@@ -27,6 +27,8 @@ import {
   insertReleasePlanRow,
   insertPerIssueRow,
   insertDetailSectionBullet,
+  scaffoldDetailSectionHeading,
+  validateGlobalRoadmapAnchors,
 } from "../scripts/stages/release.ts";
 
 // ---------------------------------------------------------------------------
@@ -429,12 +431,17 @@ test("intake: non-capture-shaped invalid spec blocks immediately — harness cal
 // 6.8 Error path — ROADMAP anchor missing
 // ---------------------------------------------------------------------------
 
-test("intake: exits non-zero with anchor name when release-plan anchor is absent", async () => {
+test("intake: exits non-zero with anchor name when release-plan anchor is absent, BEFORE the harness runs", async () => {
   const roadmapWithoutNoneRow = ROADMAP_FIXTURE.replace("| *(none)* |", "| REMOVED |");
+  let harnessCallCount = 0;
   const deps = makeDeps({
     readFileAtBase: (_dir, _baseBranch, relPath) => {
       if (relPath === "ROADMAP.md") return roadmapWithoutNoneRow;
       throw new Error(`readFileAtBase not mocked for ${relPath}`);
+    },
+    runHarness: async (_p, _t) => {
+      harnessCallCount++;
+      return { success: true, output: "" };
     },
   });
   const opts: IntakeOpts = { description: "add retry logic", release: "1.6.0" };
@@ -443,11 +450,13 @@ test("intake: exits non-zero with anchor name when release-plan anchor is absent
     () => runIntake(opts, DEFAULT_CFG, deps),
     /ROADMAP anchor not found/,
   );
-  // Regression: anchor preflight must run BEFORE createIssue (finding 2).
+  // Regression (#539): the global-anchor precondition must run BEFORE the
+  // spec-generation harness call, so a doomed intake costs zero tokens.
+  assert.equal(harnessCallCount, 0, "runHarness must not be called when a global roadmap anchor is missing");
   assert.equal(deps._createIssueCalls.length, 0, "no issue should be created when roadmap anchor is missing");
 });
 
-test("intake: exits non-zero with anchor name when detail section is absent for version", async () => {
+test("intake: a missing target-release detail section is scaffolded, not aborted (#539)", async () => {
   const roadmapWithoutSection = ROADMAP_FIXTURE.replace(
     "### v1.6.0 — intake & backlog automation (minor)",
     "### v1.7.0 — something else (minor)",
@@ -460,12 +469,54 @@ test("intake: exits non-zero with anchor name when detail section is absent for 
   });
   const opts: IntakeOpts = { description: "add retry logic", release: "1.6.0" };
 
-  await assert.rejects(
-    () => runIntake(opts, DEFAULT_CFG, deps),
-    /ROADMAP anchor not found.*detail-section/,
+  await runIntake(opts, DEFAULT_CFG, deps);
+
+  // The generated spec is never discarded: the issue is still created.
+  assert.equal(deps._createIssueCalls.length, 1, "issue must still be created when the detail section is scaffolded");
+
+  const written = deps._writtenFiles["/fake/repo/ROADMAP.md"];
+  assert.ok(written, "ROADMAP.md should have been written");
+  assert.match(written, /### v1\.6\.0 — \(intake\)/, "scaffolded heading must be present");
+  assert.match(written, /\| \*\*v1\.6\.0\*\* \| minor \|/, "release-plan row must be present");
+  assert.match(written, /\| #999 \|.*\| v1\.6\.0 \|/, "per-issue row must be present");
+  assert.match(written, /- \*\*#999\*\* —/, "detail-section bullet must be present");
+  // No roadmap-gap report should be logged — scaffolding succeeded.
+  assert.ok(
+    !deps._logLines.some((l) => l.includes("roadmap gap")),
+    "no roadmap-gap report expected when scaffolding succeeds",
   );
-  // Regression: anchor preflight must run BEFORE createIssue (finding 2).
-  assert.equal(deps._createIssueCalls.length, 0, "no issue should be created when detail section is missing");
+});
+
+test("intake: degrades to issue-plus-gap-report when the detail-section container itself is missing (#539)", async () => {
+  const roadmapWithoutContainer = ROADMAP_FIXTURE.replace(
+    /## Remaining work — detail[\s\S]*$/,
+    "",
+  );
+  const deps = makeDeps({
+    readFileAtBase: (_dir, _baseBranch, relPath) => {
+      if (relPath === "ROADMAP.md") return roadmapWithoutContainer;
+      throw new Error(`readFileAtBase not mocked for ${relPath}`);
+    },
+    readFile: (p) => {
+      if (p.endsWith("ROADMAP.md")) return roadmapWithoutContainer;
+      throw new Error(`readFile not mocked for ${p}`);
+    },
+  });
+  const opts: IntakeOpts = { description: "add retry logic", release: "1.6.0" };
+
+  await runIntake(opts, DEFAULT_CFG, deps);
+
+  // The generated spec is never silently discarded: the issue is still created.
+  assert.equal(deps._createIssueCalls.length, 1, "issue must still be created when scaffolding is impossible");
+  assert.ok(
+    deps._logLines.some((l) => /roadmap gap/.test(l) && /pipeline roadmap --apply/.test(l)),
+    "a roadmap-gap report naming the reconciliation command must be logged",
+  );
+
+  const written = deps._writtenFiles["/fake/repo/ROADMAP.md"];
+  assert.ok(written, "ROADMAP.md should still have been written with the mutations that DID succeed");
+  assert.match(written, /\| \*\*v1\.6\.0\*\* \| minor \|/, "release-plan row must still be present");
+  assert.match(written, /\| #999 \|.*\| v1\.6\.0 \|/, "per-issue row must still be present");
 });
 
 // ---------------------------------------------------------------------------
@@ -490,6 +541,69 @@ test("insertDetailSectionBullet: throws anchor-not-found when version section ab
     () => insertDetailSectionBullet(text, "1.6.0", "new bullet"),
     /ROADMAP anchor not found.*detail-section-v1\.6\.0/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// scaffoldDetailSectionHeading unit tests (task 3.4)
+// ---------------------------------------------------------------------------
+
+test("scaffoldDetailSectionHeading: inserts a heading at the top of the container section when absent", () => {
+  const text = "# Roadmap\n\n## Remaining work — detail\n\n### v1.5.0 — shipped (minor)\n\n- **#153** — thing.\n";
+  const result = scaffoldDetailSectionHeading(text, "1.6.0");
+  const lines = result.split("\n");
+  const newIdx = lines.findIndex((l) => l === "### v1.6.0 — (intake)");
+  const oldIdx = lines.findIndex((l) => l.startsWith("### v1.5.0"));
+  assert.ok(newIdx >= 0, "scaffolded heading must be present");
+  assert.ok(newIdx < oldIdx, "scaffolded heading must precede the existing section");
+});
+
+test("scaffoldDetailSectionHeading: idempotent when the heading already exists", () => {
+  const text = "# Roadmap\n\n## Remaining work — detail\n\n### v1.6.0 — foo (minor)\n\n- **#158** — existing.\n";
+  const result = scaffoldDetailSectionHeading(text, "1.6.0");
+  assert.equal(result, text, "must be a no-op when the heading already exists");
+});
+
+test("scaffoldDetailSectionHeading: throws detail-section-container when the container section is absent", () => {
+  const text = "# Roadmap\n\n## Release plan (sem-ver)\n\n| Release |\n";
+  assert.throws(
+    () => scaffoldDetailSectionHeading(text, "1.6.0"),
+    /ROADMAP anchor not found: detail-section-container/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// validateGlobalRoadmapAnchors unit tests
+// ---------------------------------------------------------------------------
+
+test("validateGlobalRoadmapAnchors: passes when both global anchors are present", () => {
+  assert.doesNotThrow(() => validateGlobalRoadmapAnchors(ROADMAP_FIXTURE));
+});
+
+test("validateGlobalRoadmapAnchors: throws release-plan-none-row when the sentinel row is absent", () => {
+  const text = ROADMAP_FIXTURE.replace("| *(none)* |", "| REMOVED |");
+  assert.throws(
+    () => validateGlobalRoadmapAnchors(text),
+    /ROADMAP anchor not found: release-plan-none-row/,
+  );
+});
+
+test("validateGlobalRoadmapAnchors: throws per-issue-table when the table header is absent", () => {
+  const text = ROADMAP_FIXTURE.replace(
+    "| # | Impact | Config | Theme | → Release | Depends on |",
+    "| REMOVED |",
+  );
+  assert.throws(
+    () => validateGlobalRoadmapAnchors(text),
+    /ROADMAP anchor not found: per-issue-table/,
+  );
+});
+
+test("validateGlobalRoadmapAnchors: does NOT throw when only the target-release detail section is absent", () => {
+  const text = ROADMAP_FIXTURE.replace(
+    "### v1.6.0 — intake & backlog automation (minor)",
+    "### v1.7.0 — something else (minor)",
+  );
+  assert.doesNotThrow(() => validateGlobalRoadmapAnchors(text));
 });
 
 // ---------------------------------------------------------------------------
