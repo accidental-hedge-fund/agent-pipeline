@@ -10,6 +10,7 @@ import {
   reportPapercuts,
   papercutsEnabled,
   autoFilePapercuts,
+  issueNumberFromUrl,
   type PapercutDeps,
   type AutoFileDeps,
   type AutoFileOpts,
@@ -371,24 +372,46 @@ test("reportPapercuts: results sorted ascending by at", async () => {
 const NOW_MS = Date.parse("2026-07-21T12:00:00Z");
 const RUNS_ROOT = "/repo/.agent-pipeline/runs";
 
+/** A shared, mutable in-memory "GitHub" — the source of truth that one or more
+ *  `AutoFileDeps` instances read/write, so cross-host tests (#459) can drive
+ *  two independent `autoFilePapercuts` invocations against the same state, the
+ *  same way two hosts' `gh` calls hit the same real repository. */
+function makeFakeGithub(initial: OpenImproveIssue[] = []): {
+  issues: OpenImproveIssue[];
+  nextNumber: number;
+} {
+  const maxNumber = initial.reduce((m, i) => {
+    const n = issueNumberFromUrl(i.url);
+    return n !== null && n > m ? n : m;
+  }, 0);
+  return { issues: [...initial], nextNumber: maxNumber + 1 };
+}
+
 function makeAutoFileDeps(opts: {
   runs?: Record<string, string[]>; // runId -> raw jsonl lines
   authed?: boolean;
   openIssues?: OpenImproveIssue[];
+  /** Share a `makeFakeGithub()` state across multiple `makeAutoFileDeps()`
+   *  calls to simulate distinct hosts talking to the same repository. */
+  github?: ReturnType<typeof makeFakeGithub>;
   createIssueImpl?: (title: string, body: string, labels: string[]) => Promise<string>;
+  closeIssueImpl?: (number: number, comment: string) => Promise<void>;
   nowMs?: number;
   /** When true, `withLock` throws (simulates another process holding the
    *  repository-wide lock) instead of running the critical section. */
   lockHeld?: boolean;
 } = {}): AutoFileDeps & {
   _createCalls: Array<{ title: string; body: string; labels: string[] }>;
+  _closeCalls: Array<{ number: number; comment: string }>;
   _logLines: string[];
   _listCalls: number;
   _lockCalls: number;
 } {
   const runs = opts.runs ?? {};
   const dirEntries = Object.keys(runs).map((name) => ({ name, isDirectory: () => true }));
+  const github = opts.github ?? makeFakeGithub(opts.openIssues ?? []);
   const createCalls: Array<{ title: string; body: string; labels: string[] }> = [];
+  const closeCalls: Array<{ number: number; comment: string }> = [];
   const logLines: string[] = [];
   const listCalls = { n: 0 };
   const lockCalls = { n: 0 };
@@ -407,7 +430,7 @@ function makeAutoFileDeps(opts: {
     },
     listOpenImproveIssues: async () => {
       listCalls.n++;
-      return opts.openIssues ?? [];
+      return [...github.issues];
     },
     readdir: async (p: string) => {
       if (p !== RUNS_ROOT) {
@@ -429,9 +452,25 @@ function makeAutoFileDeps(opts: {
     createIssue: async (title, body, labels) => {
       if (opts.createIssueImpl) return opts.createIssueImpl(title, body, labels);
       createCalls.push({ title, body, labels });
-      return `https://github.com/org/repo/issues/${createCalls.length}`;
+      const number = github.nextNumber++;
+      const url = `https://github.com/org/repo/issues/${number}`;
+      github.issues.push({
+        title,
+        url,
+        state: "OPEN",
+        createdAt: new Date(opts.nowMs ?? NOW_MS).toISOString(),
+        labels,
+      });
+      return url;
+    },
+    closeIssue: async (number, comment) => {
+      closeCalls.push({ number, comment });
+      if (opts.closeIssueImpl) return opts.closeIssueImpl(number, comment);
+      const issue = github.issues.find((i) => issueNumberFromUrl(i.url) === number);
+      if (issue) issue.state = "CLOSED";
     },
     _createCalls: createCalls,
+    _closeCalls: closeCalls,
     _logLines: logLines,
     get _listCalls() {
       return listCalls.n;
@@ -682,5 +721,181 @@ test("autoFilePapercuts: two clusters that truncate to the same title within one
     deps._createCalls.length,
     1,
     "both signals truncate to the same 60-char proposedTitle() — only one issue should be filed",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Cross-host serialization (#459)
+// ---------------------------------------------------------------------------
+
+test("autoFilePapercuts: cross-host duplicate — read-back reconciliation keeps the lowest-numbered issue and closes the rest", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const github = makeFakeGithub();
+  const title = "[pipeline-improve] Recurring papercut: flaky test gate";
+  const deps = makeAutoFileDeps({
+    runs: {
+      r1: [papercutLine(at, "flaky test gate")],
+      r2: [papercutLine(at, "flaky test gate")],
+      r3: [papercutLine(at, "flaky test gate")],
+    },
+    github,
+    // Simulate the TOCTOU race directly: a foreign host's create for the same
+    // title lands on the shared "GitHub" in the same window as this host's own
+    // create — neither was visible to the other's pre-create check.
+    createIssueImpl: async (t, body, labels) => {
+      const foreignUrl = `https://github.com/org/repo/issues/${github.nextNumber++}`;
+      github.issues.push({
+        title: t,
+        url: foreignUrl,
+        state: "OPEN",
+        createdAt: new Date(NOW_MS).toISOString(),
+        labels,
+      });
+      const ownUrl = `https://github.com/org/repo/issues/${github.nextNumber++}`;
+      github.issues.push({
+        title: t,
+        url: ownUrl,
+        state: "OPEN",
+        createdAt: new Date(NOW_MS).toISOString(),
+        labels,
+      });
+      return ownUrl;
+    },
+  });
+
+  await autoFilePapercuts(defaultAutoFileOpts(), deps);
+
+  const openForTitle = github.issues.filter((i) => i.title === title && i.state === "OPEN");
+  assert.equal(
+    openForTitle.length,
+    1,
+    `expected exactly one open issue after reconciliation, got ${openForTitle.length}`,
+  );
+  const allNumbers = github.issues
+    .filter((i) => i.title === title)
+    .map((i) => issueNumberFromUrl(i.url)!);
+  const survivorNumber = issueNumberFromUrl(openForTitle[0].url);
+  assert.equal(survivorNumber, Math.min(...allNumbers), "survivor should be the lowest-numbered duplicate");
+  assert.equal(deps._closeCalls.length, 1);
+  assert.ok(deps._closeCalls[0].comment.includes(`#${survivorNumber}`));
+});
+
+test("autoFilePapercuts: cross-host cap — a second host's run stops once GitHub's in-window count reaches the cap", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const github = makeFakeGithub();
+  const depsHostA = makeAutoFileDeps({
+    runs: {
+      r1: [papercutLine(at, "alpha cluster")],
+      r2: [papercutLine(at, "alpha cluster")],
+      r3: [papercutLine(at, "alpha cluster")],
+    },
+    github,
+  });
+  const depsHostB = makeAutoFileDeps({
+    runs: {
+      r4: [papercutLine(at, "beta cluster")],
+      r5: [papercutLine(at, "beta cluster")],
+      r6: [papercutLine(at, "beta cluster")],
+    },
+    github,
+  });
+
+  await autoFilePapercuts(defaultAutoFileOpts({ maxPerWindow: 1 }), depsHostA);
+  await autoFilePapercuts(defaultAutoFileOpts({ maxPerWindow: 1 }), depsHostB);
+
+  assert.equal(depsHostA._createCalls.length, 1);
+  assert.equal(
+    depsHostB._createCalls.length,
+    0,
+    "host B should read host A's GitHub-authored issue and stop at the cap",
+  );
+  assert.ok(depsHostB._logLines.some((l) => l.includes("deferred (rate cap)")));
+
+  const cutoffMs = NOW_MS - 24 * 3600_000;
+  const openInWindow = github.issues.filter(
+    (i) => i.labels.includes("pipeline:backlog") && Date.parse(i.createdAt) >= cutoffMs,
+  ).length;
+  assert.ok(openInWindow <= 1, `cap overshoot: ${openInWindow} open issues in window`);
+});
+
+test("autoFilePapercuts: single-host run with no duplicate performs no reconciliation (closeIssue never called)", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const deps = makeAutoFileDeps({
+    runs: {
+      r1: [papercutLine(at, "flaky test gate")],
+      r2: [papercutLine(at, "flaky test gate")],
+      r3: [papercutLine(at, "flaky test gate")],
+    },
+  });
+  await autoFilePapercuts(defaultAutoFileOpts(), deps);
+  assert.equal(deps._createCalls.length, 1);
+  assert.equal(deps._closeCalls.length, 0, "no cross-host duplicate exists — reconciliation must not fire");
+});
+
+test("autoFilePapercuts: a throwing reconciliation list call is caught, logged non-fatal, and the create still succeeds", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const deps = makeAutoFileDeps({
+    runs: {
+      r1: [papercutLine(at, "flaky test gate")],
+      r2: [papercutLine(at, "flaky test gate")],
+      r3: [papercutLine(at, "flaky test gate")],
+    },
+  });
+  const originalList = deps.listOpenImproveIssues;
+  let listCallCount = 0;
+  deps.listOpenImproveIssues = async () => {
+    listCallCount++;
+    // 1st call: initial dedup. 2nd call: cross-host pre-create check. 3rd
+    // call: post-create reconciliation read-back — fail only that one.
+    if (listCallCount > 2) throw new Error("simulated gh list failure during reconciliation");
+    return originalList();
+  };
+  await assert.doesNotReject(() => autoFilePapercuts(defaultAutoFileOpts(), deps));
+  assert.equal(deps._createCalls.length, 1, "creation itself must still succeed");
+  assert.ok(
+    deps._logLines.some((l) => l.includes("reconciliation list failed") && l.includes("non-fatal")),
+  );
+});
+
+test("autoFilePapercuts: a throwing closeIssue during reconciliation is caught, logged non-fatal, and the run still completes", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const github = makeFakeGithub();
+  const deps = makeAutoFileDeps({
+    runs: {
+      r1: [papercutLine(at, "flaky test gate")],
+      r2: [papercutLine(at, "flaky test gate")],
+      r3: [papercutLine(at, "flaky test gate")],
+    },
+    github,
+    createIssueImpl: async (t, body, labels) => {
+      const foreignUrl = `https://github.com/org/repo/issues/${github.nextNumber++}`;
+      github.issues.push({
+        title: t,
+        url: foreignUrl,
+        state: "OPEN",
+        createdAt: new Date(NOW_MS).toISOString(),
+        labels,
+      });
+      const ownUrl = `https://github.com/org/repo/issues/${github.nextNumber++}`;
+      github.issues.push({
+        title: t,
+        url: ownUrl,
+        state: "OPEN",
+        createdAt: new Date(NOW_MS).toISOString(),
+        labels,
+      });
+      return ownUrl;
+    },
+    closeIssueImpl: async () => {
+      throw new Error("simulated gh issue close failure");
+    },
+  });
+
+  await assert.doesNotReject(() => autoFilePapercuts(defaultAutoFileOpts(), deps));
+  assert.equal(deps._closeCalls.length, 1, "close was attempted despite failing");
+  const stillOpen = github.issues.filter((i) => i.state === "OPEN");
+  assert.equal(stillOpen.length, 2, "duplicate remains open — a later trigger will reconcile it");
+  assert.ok(
+    deps._logLines.some((l) => l.includes("reconciliation close failed") && l.includes("non-fatal")),
   );
 });
