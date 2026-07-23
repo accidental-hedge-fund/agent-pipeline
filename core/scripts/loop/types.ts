@@ -202,6 +202,108 @@ export interface LoopRecoveryAttempt {
   outcome: RecoveryAttemptOutcome;
 }
 
+// ---------------------------------------------------------------------------
+// Durable-run ownership + conflict declarations (#529, capability
+// `durable-run-ownership-conflicts`). A pure planning-input model: what
+// surfaces an item owns, and which surfaces conflict by default. See
+// loop/ownership.ts and openspec/changes/durable-run-ownership-conflicts/
+// design.md for the normalization and evaluation semantics this implements.
+// ---------------------------------------------------------------------------
+
+/** The closed catalogue of shared-by-default surface classes — a shared surface has no disjoint
+ *  sub-region, so two items that own the *same* one conflict unless a reviewed exception names
+ *  it (design.md "Two surface classes, one asymmetry"). */
+export const OWNERSHIP_SHARED_SURFACE_KINDS = [
+  "schema_state",
+  "generated_artifact",
+  "shared_config",
+  "public_api",
+  "ci_workflow",
+  "package_version",
+] as const;
+
+export type OwnershipSharedSurfaceKind = (typeof OWNERSHIP_SHARED_SURFACE_KINDS)[number];
+
+export function isOwnershipSharedSurfaceKind(value: unknown): value is OwnershipSharedSurfaceKind {
+  return typeof value === "string" && (OWNERSHIP_SHARED_SURFACE_KINDS as readonly string[]).includes(value);
+}
+
+/** The kind of a normalized surface entry: `"source"` for an exclusive-ownership path/module
+ *  glob, or one of the shared-by-default classes. */
+export type OwnershipSurfaceKind = "source" | OwnershipSharedSurfaceKind;
+
+/** A reviewed exception suppressing the auto-derived shared-surface conflict it names, for the
+ *  pair it is declared on — nothing else (design.md "Reviewed exceptions suppress only
+ *  auto-derived shared conflicts"). Never suppresses an explicit {@link OwnershipDeclaration.conflicts_with}
+ *  edge or an unknown-ownership conflict. */
+export interface OwnershipException {
+  surface: { kind: OwnershipSharedSurfaceKind; pattern: string };
+  justification: string;
+  review_ref: string;
+}
+
+/** A per-item ownership + conflict declaration — additive and optional on {@link LoopContractItem}.
+ *  Absent or empty (no `exclusive`/`shared` surfaces declared) denotes **unknown ownership**,
+ *  which evaluates as a conflict against every other item (never `disjoint`), the conservative
+ *  default required by capability `durable-run-ownership-conflicts`. */
+export interface OwnershipDeclaration {
+  /** Exclusive-ownership source path/module globs — conflict with another item's exclusive
+   *  globs only when they overlap. */
+  exclusive?: string[];
+  /** Shared-by-default surfaces, keyed by class — conflict with another item that owns the
+   *  identical pattern under the same class, unless a valid {@link OwnershipException} applies. */
+  shared?: Partial<Record<OwnershipSharedSurfaceKind, string[]>>;
+  /** Explicit manual conflict edges naming other item ids — always conflict, never
+   *  suppressible by any exception. */
+  conflicts_with?: string[];
+  /** Reviewed exceptions suppressing specific auto-derived shared-surface conflicts. */
+  exceptions?: OwnershipException[];
+}
+
+/** One canonicalized entry in an item's normalized surface set — the unit of comparison for
+ *  pairwise evaluation and the artifact recorded as planning evidence. */
+export interface NormalizedOwnershipSurface {
+  kind: OwnershipSurfaceKind;
+  pattern: string;
+  class: "exclusive" | "shared";
+}
+
+/** The structured cause of a `conflict` verdict — exactly one of an overlapping surface (naming
+ *  it), an explicit `conflicts_with` edge, or unknown ownership. */
+export type OwnershipConflictReason =
+  | { kind: "overlapping_surface"; surface: NormalizedOwnershipSurface }
+  | { kind: "explicit_edge" }
+  | { kind: "unknown_ownership"; detail: string };
+
+/** The typed outcome of a pairwise ownership evaluation — `reason` is `null` iff `verdict ===
+ *  "disjoint"`. */
+export interface OwnershipConflictVerdict {
+  verdict: "disjoint" | "conflict";
+  reason: OwnershipConflictReason | null;
+}
+
+/** One item's contribution to durable planning evidence — its normalized surface set. */
+export interface OwnershipEvidenceItem {
+  item_id: string;
+  surfaces: NormalizedOwnershipSurface[];
+}
+
+/** One evaluated pair's contribution to durable planning evidence. */
+export interface OwnershipEvidencePair {
+  a_item_id: string;
+  b_item_id: string;
+  verdict: "disjoint" | "conflict";
+  reason: OwnershipConflictReason | null;
+}
+
+/** The durable planning-evidence record for one ownership evaluation pass — a record only; it
+ *  schedules nothing and grants no merge or review bypass (design.md "Planning-input-only
+ *  guarantee"). */
+export interface OwnershipEvaluationEvidence {
+  items: OwnershipEvidenceItem[];
+  pairs: OwnershipEvidencePair[];
+}
+
 export interface LoopContractItem {
   id: string;
   /** In-snapshot dependency ids only — order-constraining and cycle-checked. An id declared by
@@ -214,6 +316,11 @@ export interface LoopContractItem {
    *  live truth before a dependent item may start (capability `durable-run-dependency-integrity`,
    *  see loop/dependencies.ts). Empty for a contract compiled with no external dependencies. */
   external_depends_on: string[];
+  /** Optional ownership + conflict declaration (capability `durable-run-ownership-conflicts`).
+   *  Absent/empty ⇒ unknown ownership ⇒ conflict with every other item — see
+   *  {@link OwnershipDeclaration}. A planning input only; never schedules, merges, or bypasses
+   *  review. */
+  ownership?: OwnershipDeclaration;
 }
 
 export interface LoopContract {
