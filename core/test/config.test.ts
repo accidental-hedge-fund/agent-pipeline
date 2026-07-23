@@ -14,6 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import yaml from "js-yaml";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
 import { findGitRoot, syncConfig, repoMapAdd, repoMapRemove, repoMapList, validateOwnerRepo } from "../scripts/config.ts";
 import { resolveReviewerModelForHarness } from "../scripts/stage-routing.ts";
@@ -1509,7 +1510,10 @@ test("syncConfig: build_command is preserved through sync --apply", () => {
 
   assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
   assert.equal(result.applied, true);
-  assert.match(synced, /^build_command: npm run build/m, "build_command must be preserved after sync");
+  // Append-only sync (#504 finding 2): an already-present key is never
+  // rewritten/reformatted, so the operator's original quoted form survives
+  // byte-for-byte rather than being re-rendered as an unquoted scalar.
+  assert.match(synced, /^build_command: "npm run build"$/m, "build_command must be preserved byte-for-byte after sync");
 });
 
 // ---- harness_sandbox (#21) ----
@@ -1767,8 +1771,8 @@ test("syncConfig: preview reports drift and does not write", () => {
   assert.equal(fs.readFileSync(configPath, "utf8"), original, "preview must not mutate pipeline.yml");
 });
 
-test("syncConfig: apply writes a validated behavior-preserving candidate", () => {
-  const repo = makeFakeRepo(`base_branch: staging
+test("syncConfig: apply appends missing schema-documented blocks while preserving existing ones untouched (#504 finding 2)", () => {
+  const original = `base_branch: staging
 models:
   review: sonnet
 test_gate:
@@ -1778,7 +1782,8 @@ review_policy:
   block_threshold: high
   min_confidence: 0.8
 format_gate: []
-`);
+`;
+  const repo = makeFakeRepo(original);
   const configPath = path.join(repo, ".github", "pipeline.yml");
 
   const result = syncConfig(repo, { apply: true });
@@ -1787,17 +1792,89 @@ format_gate: []
   assert.equal(result.ok, true);
   assert.equal(result.changed, true);
   assert.equal(result.applied, true);
-  assert.match(synced, /# Pipeline configuration for this repo — synced with `pipeline config sync`\./);
-  assert.match(synced, /^base_branch: staging/m);
-  assert.match(synced, /^models:/m);
-  assert.match(synced, /config error/, "config sync (#454) must refresh the models: comment to the post-#441 contract");
-  assert.match(synced, /^  review: sonnet # reviewer harness/m);
-  assert.doesNotMatch(synced, /^  planning:/m, "absent model aliases must stay commented, not become explicit");
-  assert.match(synced, /^  command: npm run ci # explicit command/m);
-  assert.match(synced, /^  max_attempts: 4 # fix-harness/m);
-  assert.match(synced, /^  block_threshold: high #/m);
-  assert.match(synced, /^  min_confidence: 0\.8 #/m);
-  assert.match(synced, /^format_gate: \[\]/m);
+  // Append-only merge: every already-present top-level block (base_branch,
+  // models, test_gate, review_policy, format_gate) is preserved byte-for-byte
+  // as a literal prefix of the synced output — never rewritten/reformatted.
+  assert.ok(
+    synced.startsWith(original.trimEnd()),
+    `existing content must survive untouched as a literal prefix, got:\n${synced.slice(0, 400)}`,
+  );
+  // Keys the schema documents but the original file omitted are appended.
+  assert.match(synced, /^openspec:/m, "missing openspec block must be appended");
+  assert.match(synced, /^doctor:/m, "missing doctor block must be appended");
+  assert.match(synced, /^review_timeout: /m, "missing review_timeout scalar must be appended");
+});
+
+// Regression (#504 finding 2): syncConfig previously re-rendered the ENTIRE
+// file from renderConfigTemplate(parsed), discarding any operator-added
+// comment and any non-canonical formatting on an already-documented block —
+// a hand comment or an oddly-indented line would silently vanish on the next
+// `pipeline config sync --apply`. The fix makes sync append-only: existing
+// lines are never rewritten, only top-level keys the fresh render documents
+// but the current file lacks are appended. This test fails against the
+// pre-fix (wholesale re-render) implementation — verified by temporarily
+// reverting the syncConfig change and re-running just this test, see PR notes.
+test("syncConfig: apply preserves operator comments and non-canonical formatting on existing blocks, only appending missing ones (#504 finding 2)", () => {
+  const original = `base_branch: staging
+# NOTE: our team always keeps ci_timeout high because CI is slow on this repo
+ci_timeout: 3600
+
+test_gate:
+   enabled: true
+   command: npm run ci # our custom test command, moved comment
+   max_attempts: 4
+   timeout: 300
+
+models:
+  review: sonnet
+`;
+  const repo = makeFakeRepo(original);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  // Sanity: the fixture omits design_gate entirely, a key the current schema
+  // documents — this is the "missing top-level key" the sync must append.
+  assert.doesNotMatch(original, /design_gate/);
+
+  const result = syncConfig(repo, { apply: true });
+  const synced = fs.readFileSync(configPath, "utf8");
+
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(result.applied, true);
+
+  // (a) The operator's hand-written comment survives byte-for-byte.
+  assert.ok(
+    synced.includes("# NOTE: our team always keeps ci_timeout high because CI is slow on this repo"),
+    "operator hand-written comment must survive sync byte-for-byte",
+  );
+
+  // (b) The non-canonically-formatted existing test_gate block (3-space
+  // indent on `enabled`, a comment relocated onto `command`) survives
+  // byte-for-byte — sync must not reformat or reflow it.
+  const testGateBlock = [
+    "test_gate:",
+    "   enabled: true",
+    "   command: npm run ci # our custom test command, moved comment",
+    "   max_attempts: 4",
+    "   timeout: 300",
+  ].join("\n");
+  assert.ok(
+    synced.includes(testGateBlock),
+    `existing test_gate block must survive byte-for-byte untouched, got:\n${synced}`,
+  );
+
+  // (c) The missing design_gate block (schema-documented, absent from the
+  // original file) is freshly appended.
+  assert.match(synced, /^# design_gate:/m, "missing design_gate block must be appended");
+
+  // (d) The effective resolved config for pre-existing keys is unchanged:
+  // appending only previously-absent top-level keys (which resolve to their
+  // defaults on both sides) must not alter ci_timeout/test_gate/models.
+  const before = yaml.load(original) as Record<string, unknown>;
+  const after = yaml.load(synced) as Record<string, unknown>;
+  assert.equal(after.ci_timeout, 3600);
+  assert.equal(before.ci_timeout, after.ci_timeout);
+  assert.deepEqual(after.test_gate, before.test_gate);
+  assert.deepEqual(after.models, before.models);
 });
 
 test("syncConfig: invalid current config is not rewritten", () => {
@@ -1825,7 +1902,7 @@ test("syncConfig: missing config directs the user to run init", () => {
   assert.match(result.diagnostics[0]?.message ?? "", /pipeline init/);
 });
 
-test("syncConfig: newline scalar overrides render as valid inline YAML", () => {
+test("syncConfig: newline scalar overrides survive sync untouched as valid inline YAML", () => {
   const repo = makeFakeRepo('domain_description: "first line\\nsecond line"\n');
   const configPath = path.join(repo, ".github", "pipeline.yml");
 
@@ -1834,7 +1911,9 @@ test("syncConfig: newline scalar overrides render as valid inline YAML", () => {
 
   assert.equal(result.ok, true);
   assert.equal(result.applied, true);
-  assert.match(synced, /^domain_description: "first line\\nsecond line" #/m);
+  // Append-only sync never rewrites an already-present key, so the operator's
+  // original valid-YAML scalar form is preserved byte-for-byte, uncommented.
+  assert.match(synced, /^domain_description: "first line\\nsecond line"$/m);
 });
 
 // ---------------------------------------------------------------------------
@@ -1927,8 +2006,11 @@ test("CLI: `pipeline config sync --apply` writes refreshed config", () => {
 
   assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
   assert.match(result.stdout, /pipeline config sync: updated/);
-  assert.match(synced, /# Pipeline configuration for this repo — synced with `pipeline config sync`\./);
-  assert.match(synced, /^base_branch: staging/m);
+  // Append-only sync (#504 finding 2): the pre-existing base_branch line is
+  // preserved untouched (no comment injected), and missing schema-documented
+  // blocks are appended.
+  assert.match(synced, /^base_branch: staging$/m);
+  assert.match(synced, /^openspec:/m, "sync must append missing top-level blocks documented by the schema");
 });
 
 test("CLI: `pipeline config repo-map add` writes the entry and exits 0", () => {

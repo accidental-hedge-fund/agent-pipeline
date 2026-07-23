@@ -18,7 +18,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
-import { buildConfigTemplate, generateConfigSchema } from "../scripts/config.ts";
+import { buildConfigTemplate, generateConfigSchema, schemaFieldDescription } from "../scripts/config.ts";
 import { CONTEXT_SNAPSHOT_MAX_CHARS_DEFAULT } from "../scripts/issue-context-snapshot.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-cfg-template-test-"));
@@ -314,3 +314,60 @@ for (const key of ADDED_KEYS) {
     }
   });
 }
+
+// ---------------------------------------------------------------------------
+// 6. Shared-source proof (#504 review finding 1): the rendered template's
+//    field comments are SOURCED from the schema's `.describe()` text via
+//    `schemaFieldDescription`, not independently hand-typed prose that could
+//    drift out of sync with the schema.
+// ---------------------------------------------------------------------------
+
+test("shared-source: rendered comments for repo/domain_name/max_concurrent_worktrees contain the exact schema .describe() text", () => {
+  const template = buildConfigTemplate();
+  for (const path_ of ["repo", "domain_name", "max_concurrent_worktrees"]) {
+    const description = schemaFieldDescription(path_);
+    assert.ok(description, `expected a schema .describe() for ${path_}`);
+    assert.ok(
+      template.includes(description!),
+      `template must contain the exact schema .describe() text for ${path_} as a substring: ${description}`,
+    );
+  }
+});
+
+// This is the drift-proof guard: mutate a live copy of config.ts's schema
+// .describe() text for one field and confirm the rendered template's wording
+// for that field changes to match — proving the renderer sources its prose
+// from the schema rather than from independently hand-typed text that could
+// silently diverge. Reverting `renderConfigTemplate` to a hardcoded string
+// for `repo` (instead of `sd("repo", ...)`) makes this test fail, because the
+// mutated schema text would then never reach the rendered output.
+test("shared-source bites: editing the schema's repo .describe() text changes the rendered template's wording", async () => {
+  // The mutated copy must live under core/ (not /tmp) so bare-specifier
+  // imports (zod, js-yaml, yaml) still resolve via node's ancestor
+  // node_modules search from the mutated file's location.
+  const liveScriptsDir = path.join(import.meta.dirname, "..", "scripts");
+  const coreDir = path.join(import.meta.dirname, "..");
+  const tmpScriptsDir = fs.mkdtempSync(path.join(coreDir, ".tmp-mutated-scripts-"));
+  try {
+    fs.cpSync(liveScriptsDir, tmpScriptsDir, { recursive: true });
+
+    const configPath = path.join(tmpScriptsDir, "config.ts");
+    const original = fs.readFileSync(configPath, "utf8");
+    const marker = "TOTALLY-DISTINCT-MUTATED-REPO-DESCRIPTION-9f3c1a";
+    const needle = `repo: z.string().optional().describe("GitHub repository in 'owner/name' format (overrides auto-detected value).")`;
+    assert.ok(original.includes(needle), "test assumption broken: repo's .describe() text in config.ts no longer matches the expected literal — update the `needle` above");
+    const mutated = original.replace(needle, `repo: z.string().optional().describe("${marker}")`);
+    assert.notEqual(mutated, original, "mutation must actually change the file");
+    fs.writeFileSync(configPath, mutated, "utf8");
+
+    const mutatedCfgMod = await import(`${configPath}?cb=${Date.now()}`);
+    const mutatedTemplate = mutatedCfgMod.buildConfigTemplate();
+
+    assert.ok(
+      mutatedTemplate.includes(marker),
+      "editing the schema .describe() text for `repo` alone must change the rendered template's wording (drift-proof property) — if this fails, the renderer has reverted to independently hand-typed prose for `repo`",
+    );
+  } finally {
+    fs.rmSync(tmpScriptsDir, { recursive: true, force: true });
+  }
+});
