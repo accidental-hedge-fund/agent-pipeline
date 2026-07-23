@@ -1264,6 +1264,34 @@ test("autoFileDurableRunBlockers: a terminal-stop cluster files from a single ru
   assert.match(deps._createCalls[0].title, /Durable-run blocker: workflow-engine-defect:fp-1/);
 });
 
+test("autoFileDurableRunBlockers: a terminal stop still files when its blocked-history entry predates the auto-file window (#538 review 2 finding c5457eee500bcb8d)", async () => {
+  const deps = makeAutoFileDeps({
+    durableBlockerOccurrences: [
+      durableOccurrence({
+        terminal: true,
+        time: new Date(NOW_MS - 48 * 3600_000).toISOString(), // older than the 24h window
+        terminalTime: new Date(NOW_MS - 3600_000).toISOString(), // terminal stop is fresh
+      }),
+    ],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts({ windowHours: 24 }), deps);
+  assert.equal(deps._createCalls.length, 1);
+});
+
+test("autoFileDurableRunBlockers: a terminal stop with no parseable terminal-stop timestamp is retained rather than dropped", async () => {
+  const deps = makeAutoFileDeps({
+    durableBlockerOccurrences: [
+      durableOccurrence({
+        terminal: true,
+        time: new Date(NOW_MS - 48 * 3600_000).toISOString(),
+        terminalTime: undefined,
+      }),
+    ],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts({ windowHours: 24 }), deps);
+  assert.equal(deps._createCalls.length, 1);
+});
+
 test("autoFileDurableRunBlockers: the same (class, fingerprint) recurring across 2 runs files", async () => {
   const deps = makeAutoFileDeps({
     durableBlockerOccurrences: [

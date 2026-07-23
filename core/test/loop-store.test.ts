@@ -679,6 +679,7 @@ test("readDurableRunBlockerOccurrences: projects a blocked item's class/fingerpr
     evidenceExcerpt: "auth failed",
     time: "2026-07-20T00:00:00.000Z",
     terminal: false,
+    terminalTime: undefined,
   });
 });
 
@@ -696,6 +697,26 @@ test("readDurableRunBlockerOccurrences: terminal is true only for the item named
   const byItem = new Map(occurrences.map((o) => [o.itemId, o]));
   assert.equal(byItem.get("100")!.terminal, true);
   assert.equal(byItem.get("200")!.terminal, false);
+});
+
+test("readDurableRunBlockerOccurrences: terminalTime carries the stop record's own time, distinct from the (older) blocked-history time", async () => {
+  const { deps, files } = fakeDeps();
+  await seedLedger(deps, files, "run-1", {
+    ...testLedger("run-1"),
+    items: {
+      "100": blockedItem({
+        itemId: "100",
+        blockerClass: "workflow-engine-defect",
+        fingerprint: "fp-a",
+        evidence: "engine crashed",
+        time: "2026-07-01T00:00:00.000Z",
+      }),
+    },
+    stop: { reason: "run_fatal", time: "2026-07-20T01:00:00.000Z", item_id: "100", theme: "workflow-engine-defect" },
+  });
+  const occurrences = await readDurableRunBlockerOccurrences(deps);
+  assert.equal(occurrences[0].time, "2026-07-01T00:00:00.000Z");
+  assert.equal(occurrences[0].terminalTime, "2026-07-20T01:00:00.000Z");
 });
 
 test("readDurableRunBlockerOccurrences: an item with no blocked_theme/evidence_fingerprint is skipped", async () => {

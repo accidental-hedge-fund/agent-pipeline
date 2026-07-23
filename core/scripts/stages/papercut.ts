@@ -748,8 +748,20 @@ async function buildDurableRunBlockerClusters(opts: AutoFileOpts, deps: AutoFile
   const cutoffMs = deps.now() - windowMs;
   const clusters = new Map<string, ClusterAccum>();
   for (const occurrence of occurrences) {
-    const at = Date.parse(occurrence.time);
-    if (!Number.isFinite(at) || at < cutoffMs) continue;
+    // A terminal occurrence must be windowed on the terminal-stop time, not the
+    // (possibly much older) `blocked` history entry — otherwise a run that stayed
+    // blocked longer than the window before reaching its terminal stop has that
+    // terminal occurrence dropped before `qualifiesDurableRunBlocker` ever sees it
+    // (#538 review 2 finding c5457eee500bcb8d). A terminal occurrence with no
+    // parseable terminal-stop timestamp is retained rather than discarded, since
+    // the spec requires a terminal stop to qualify unconditionally.
+    if (occurrence.terminal) {
+      const terminalAt = occurrence.terminalTime ? Date.parse(occurrence.terminalTime) : NaN;
+      if (Number.isFinite(terminalAt) && terminalAt < cutoffMs) continue;
+    } else {
+      const at = Date.parse(occurrence.time);
+      if (!Number.isFinite(at) || at < cutoffMs) continue;
+    }
     clusterDurableRunBlockers(occurrence, clusters);
   }
   return clusters;

@@ -328,9 +328,17 @@ export interface DurableBlockerOccurrence {
    *  history entry — callers MUST sanitize before rendering or filing. */
   evidenceExcerpt: string;
   /** ISO-8601 timestamp of the history entry the evidence excerpt was drawn
-   *  from — used by callers for trailing-window filtering. */
+   *  from — used by callers for trailing-window filtering of non-terminal
+   *  occurrences. */
   time: string;
   terminal: boolean;
+  /** ISO-8601 timestamp of the {@link LoopStopRecord} when `terminal` is true
+   *  (undefined otherwise) — callers MUST filter a terminal occurrence's
+   *  trailing window against this timestamp, not `time`: `time` is the
+   *  underlying `blocked` history entry, which can predate the window even
+   *  when the terminal stop itself just happened (#538 review 2 finding
+   *  c5457eee500bcb8d). */
+  terminalTime?: string;
 }
 
 /** Enumerates every durable-run ledger under the loop state home and
@@ -365,6 +373,7 @@ export async function readDurableRunBlockerOccurrences(
           .reverse()
           .find((h) => h.to === "blocked" && h.theme === item.blocked_theme);
 
+        const terminal = !!stop && stop.item_id === itemId;
         out.push({
           runId,
           itemId,
@@ -372,7 +381,8 @@ export async function readDurableRunBlockerOccurrences(
           fingerprint: item.evidence_fingerprint,
           evidenceExcerpt: historyEntry?.evidence ?? "",
           time: historyEntry?.time ?? "",
-          terminal: !!stop && stop.item_id === itemId,
+          terminal,
+          terminalTime: terminal ? stop!.time : undefined,
         });
       }
     } catch {
