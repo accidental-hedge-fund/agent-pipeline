@@ -120,6 +120,7 @@ function testContract(runId = "run-1"): LoopContract {
     done_definition: "pipeline:ready-to-deploy",
     authority_grants: [],
     recovery_budgets: { default: 3 },
+    recovery_policy: {} as LoopContract["recovery_policy"],
     consecutive_blocked_limit: 3,
     verification: null,
     report_format: "markdown",
@@ -142,6 +143,7 @@ function testLedger(runId = "run-1"): LoopLedger {
     last_native_goal_check: null,
     last_reconciliation: null,
     reconciliation_sequence: 0,
+    recovery_attempts: [],
   };
 }
 

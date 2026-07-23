@@ -30,6 +30,107 @@ export interface LoopRecoveryBudgets {
   [theme: string]: number;
 }
 
+// ---------------------------------------------------------------------------
+// Typed durable-run blocker classification & recovery policy (#509).
+//
+// The recorded `blocked_theme` (LoopHistoryEntry.theme / LoopItemLedgerEntry
+// .blocked_theme) is redefined to be exactly one of these class names — see
+// openspec/changes/durable-run-blocker-classification/design.md decision
+// "Blocker class is the budget key; theme becomes the class name". A theme
+// string outside this set is no longer a legal blocked_theme.
+// ---------------------------------------------------------------------------
+
+export const DURABLE_BLOCKER_CLASSES = [
+  "transient-rate-limit",
+  "workflow-state",
+  "implementation-ci",
+  "environment-auth",
+  "specification-decision",
+  "missing-authority",
+  "upstream-dependency",
+  "workflow-engine-defect",
+] as const;
+
+export type DurableBlockerClass = (typeof DURABLE_BLOCKER_CLASSES)[number];
+
+export function isDurableBlockerClass(value: unknown): value is DurableBlockerClass {
+  return typeof value === "string" && (DURABLE_BLOCKER_CLASSES as readonly string[]).includes(value);
+}
+
+/** A recovery recipe never performs a merge, release, credential, or deploy
+ *  action (#509 acceptance criterion) — this is the closed catalogue every
+ *  policy entry's `recipes` must draw from. */
+export const RECOVERY_RECIPES = [
+  "wait_and_retry",
+  "reauthenticate",
+  "rerun_ci",
+  "resync_workflow_state",
+  "retry_upstream_check",
+  "restart_workflow_engine",
+] as const;
+
+export type RecoveryRecipe = (typeof RECOVERY_RECIPES)[number];
+
+export function isRecoveryRecipe(value: unknown): value is RecoveryRecipe {
+  return typeof value === "string" && (RECOVERY_RECIPES as readonly string[]).includes(value);
+}
+
+/** `human_authority` classes never retry automatically — see the
+ *  `missing-authority` / `specification-decision` requirement. */
+export type RecoveryTerminalOutcome = "retry" | "human_authority";
+
+export interface RecoveryBackoff {
+  initial_seconds: number;
+  multiplier: number;
+  max_seconds: number;
+}
+
+export interface RecoveryPolicyEntry {
+  recipes: RecoveryRecipe[];
+  retry_budget: number;
+  backoff: RecoveryBackoff;
+  terminal_outcome: RecoveryTerminalOutcome;
+  /** When true, this class's block stops the whole run rather than allowing
+   *  dependency-independent items to continue. */
+  run_fatal: boolean;
+  /** Consecutive identical-evidence-fingerprint repeats permitted on the same
+   *  item before the run stops terminally for repeated no-progress. */
+  repeated_evidence_limit: number;
+}
+
+/** A machine-readable, validated recovery policy covering every
+ *  {@link DurableBlockerClass} — compiled into {@link LoopContract} at init.
+ *  Never partially populated: {@link compileRecoveryPolicy} (loop/recovery.ts)
+ *  refuses a policy missing any class as a validation failure. */
+export type RecoveryPolicy = Record<DurableBlockerClass, RecoveryPolicyEntry>;
+
+/** The outcome of one recovery attempt on a blocked item. `failed` records a
+ *  recovery action that was actually attempted but did not succeed — the item
+ *  stays `blocked` and no budget is charged (#509 review round 2 finding
+ *  2794f4b6: a caller-reported failure must never be persisted as a
+ *  successful resume). */
+export type RecoveryAttemptOutcome =
+  | "recovered"
+  | "exhausted"
+  | "repeated_no_progress"
+  | "needs_human"
+  | "human_authority"
+  | "failed";
+
+/** A single persisted recovery attempt — the ledger.recovery_attempts entry
+ *  the durable-blocker-classification capability requires to survive a
+ *  resume (#509 requirement "Classification, actions, evidence, and outcome
+ *  SHALL be persisted and emitted"). */
+export interface LoopRecoveryAttempt {
+  seq: number;
+  time: string;
+  item_id: string;
+  class: DurableBlockerClass;
+  actions: RecoveryRecipe[];
+  evidence_fingerprint: string;
+  outcome: RecoveryAttemptOutcome;
+}
+
 export interface LoopContractItem {
   id: string;
   depends_on: string[];
@@ -49,6 +150,9 @@ export interface LoopContract {
   done_definition: "pipeline:ready-to-deploy";
   authority_grants: LoopAuthorityGate[];
   recovery_budgets: LoopRecoveryBudgets;
+  /** Compiled at init by `compileRecoveryPolicy` (loop/recovery.ts); covers
+   *  every {@link DurableBlockerClass}. */
+  recovery_policy: RecoveryPolicy;
   consecutive_blocked_limit: number;
   verification: unknown;
   report_format: string;
@@ -78,8 +182,16 @@ export interface LoopItemLedgerEntry {
   id: string;
   state: LoopItemState;
   history: LoopHistoryEntry[];
+  /** The item's current {@link DurableBlockerClass} name when `state ===
+   *  "blocked"` — this is also the key into `recovery_budgets_remaining`. */
   blocked_theme?: string;
   recovery_budgets_remaining: LoopRecoveryBudgets;
+  /** The pure fingerprint (`fingerprintEvidence`, loop/recovery.ts) of the
+   *  most recent blocked evidence recorded for this item. */
+  evidence_fingerprint?: string;
+  /** Consecutive prior blocks whose fingerprint equals `evidence_fingerprint`
+   *  — 0 on first occurrence, reset to 0 whenever the fingerprint changes. */
+  repeated_evidence_count?: number;
 }
 
 export interface LoopMergeBarrier {
@@ -89,11 +201,24 @@ export interface LoopMergeBarrier {
 }
 
 export interface LoopStopRecord {
-  reason: "recovery_exhausted" | "consecutive_blocked";
+  reason:
+    | "recovery_exhausted"
+    | "consecutive_blocked"
+    | "needs_human_classification"
+    | "repeated_no_progress"
+    | "human_authority"
+    /** A block whose class's policy is `run_fatal` — the run stops
+     *  immediately at block time (#509 review round 2 finding 6ced9fe0), even
+     *  for a retry-capable class, since a run-fatal class's whole point is
+     *  that the run cannot safely continue automatically. */
+    | "run_fatal";
   time: string;
   item_id?: string;
   theme?: string;
   limit?: number;
+  /** Set when `reason === "repeated_no_progress"` — the evidence fingerprint
+   *  that repeated past the class's `repeated_evidence_limit`. */
+  fingerprint?: string;
 }
 
 export interface LoopNativeGoalCheck {
@@ -120,6 +245,10 @@ export interface LoopLedger {
   last_native_goal_check: LoopNativeGoalCheck | null;
   last_reconciliation: LoopReconciliation | null;
   reconciliation_sequence: number;
+  /** Append-only record of every recovery attempt across every item in this
+   *  run — persisted here (not just in the events log) so a resuming engine
+   *  can read per-item recovery history directly off the ledger. */
+  recovery_attempts: LoopRecoveryAttempt[];
 }
 
 export interface LoopLockRecord {
