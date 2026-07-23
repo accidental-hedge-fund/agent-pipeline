@@ -15,6 +15,9 @@ import {
   clusterTokenWaste,
   clusterPapercuts,
   clusterCorrections,
+  clusterDurableRunBlockers,
+  qualifiesDurableRunBlocker,
+  suggestMilestoneForBlockerClass,
   collectFindingSeverities,
   proposeControlLevel,
   renderControlProposal,
@@ -25,11 +28,13 @@ import {
   proposedTitle,
   listOpenImproveIssuesArgs,
   parseOpenImproveIssuesPages,
+  type ClusterAccum,
   type ClusterEntry,
   type ImproveDeps,
   type OpenImproveIssue,
   type RunInfo,
 } from "../scripts/improve.ts";
+import type { DurableBlockerOccurrence } from "../scripts/loop/store.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1415,4 +1420,193 @@ test("clustersToEntries: sorts by count descending and slices to top-N", () => {
   assert.equal(entries.length, 2);
   assert.equal(entries[0].signal, "b");
   assert.equal(entries[1].signal, "c");
+});
+
+// ---------------------------------------------------------------------------
+// clusterDurableRunBlockers / qualifiesDurableRunBlocker (#538)
+// ---------------------------------------------------------------------------
+
+function durableOccurrence(overrides: Partial<DurableBlockerOccurrence> = {}): DurableBlockerOccurrence {
+  return {
+    runId: "run-1",
+    itemId: "100",
+    blockerClass: "workflow-engine-defect",
+    fingerprint: "fp-1",
+    evidenceExcerpt: "engine crashed mid-cycle",
+    time: "2026-07-20T00:00:00.000Z",
+    terminal: false,
+    ...overrides,
+  };
+}
+
+test("clusterDurableRunBlockers: keys on (class, fingerprint), never free-text prose", () => {
+  const clusters = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(durableOccurrence({ runId: "run-1", evidenceExcerpt: "wording A" }), clusters);
+  clusterDurableRunBlockers(durableOccurrence({ runId: "run-2", evidenceExcerpt: "totally different wording B" }), clusters);
+  assert.equal(clusters.size, 1);
+  const [entry] = [...clusters.values()];
+  assert.equal(entry.count, 2);
+  assert.deepEqual([...entry.runIds].sort(), ["run-1", "run-2"]);
+});
+
+test("clusterDurableRunBlockers: count mirrors distinct affected runs, not raw occurrence count", () => {
+  const clusters = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(durableOccurrence({ runId: "run-1", itemId: "100" }), clusters);
+  clusterDurableRunBlockers(durableOccurrence({ runId: "run-1", itemId: "200" }), clusters);
+  const [entry] = [...clusters.values()];
+  assert.equal(entry.count, 1); // one distinct run, even though two items in it shared the fingerprint
+  assert.deepEqual([...entry.itemIds!].sort(), ["100", "200"]);
+});
+
+test("clusterDurableRunBlockers: terminal is sticky once any occurrence is terminal", () => {
+  const clusters = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(durableOccurrence({ runId: "run-1", terminal: true }), clusters);
+  clusterDurableRunBlockers(durableOccurrence({ runId: "run-2", terminal: false }), clusters);
+  const [entry] = [...clusters.values()];
+  assert.equal(entry.terminal, true);
+});
+
+test("clusterDurableRunBlockers: a secret in the evidence excerpt is redacted (belt-and-braces sanitization)", () => {
+  const clusters = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(
+    durableOccurrence({ evidenceExcerpt: "failed with GITHUB_TOKEN=ghp_abcdefghij1234567890" }),
+    clusters,
+  );
+  const [entry] = [...clusters.values()];
+  assert.ok(!entry.excerpt.includes("ghp_abcdefghij1234567890"));
+});
+
+test("category isolation: a durable-run-blocker cluster never merges with a blocker cluster whose signal coincides", () => {
+  const clusters = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(durableOccurrence({ blockerClass: "workflow-state", fingerprint: "fp-1" }), clusters);
+  clusterBlockers({ type: "blocker_set", reason: "workflow-state" }, "run-9", clusters);
+  assert.equal(clusters.size, 2);
+});
+
+test("suggestMilestoneForBlockerClass: deterministic, non-empty for every DurableBlockerClass", () => {
+  const classes = [
+    "transient-rate-limit",
+    "workflow-state",
+    "implementation-ci",
+    "environment-auth",
+    "specification-decision",
+    "missing-authority",
+    "upstream-dependency",
+    "workflow-engine-defect",
+  ] as const;
+  for (const cls of classes) {
+    const a = suggestMilestoneForBlockerClass(cls);
+    const b = suggestMilestoneForBlockerClass(cls);
+    assert.equal(a, b);
+    assert.ok(a.length > 0);
+  }
+});
+
+test("qualifiesDurableRunBlocker: a terminal cluster qualifies from a single run", () => {
+  const entry = clustersToEntries((() => {
+    const clusters = new Map<string, ClusterAccum>();
+    clusterDurableRunBlockers(durableOccurrence({ terminal: true }), clusters);
+    return clusters;
+  })(), 10)[0];
+  assert.equal(qualifiesDurableRunBlocker(entry, 2), true);
+});
+
+test("qualifiesDurableRunBlocker: a non-terminal single-run occurrence never qualifies", () => {
+  const entry = clustersToEntries((() => {
+    const clusters = new Map<string, ClusterAccum>();
+    clusterDurableRunBlockers(durableOccurrence({ terminal: false }), clusters);
+    return clusters;
+  })(), 10)[0];
+  assert.equal(qualifiesDurableRunBlocker(entry, 2), false);
+});
+
+test("qualifiesDurableRunBlocker: a non-terminal cluster qualifies once it recurs across 2 distinct runs", () => {
+  const clusters = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(durableOccurrence({ runId: "run-1", terminal: false }), clusters);
+  clusterDurableRunBlockers(durableOccurrence({ runId: "run-2", terminal: false }), clusters);
+  const entry = clustersToEntries(clusters, 10)[0];
+  assert.equal(qualifiesDurableRunBlocker(entry, 2), true);
+});
+
+test("qualifiesDurableRunBlocker: minOccurrences below the floor of 2 is still floored at 2", () => {
+  const entry = clustersToEntries((() => {
+    const clusters = new Map<string, ClusterAccum>();
+    clusterDurableRunBlockers(durableOccurrence({ runId: "run-1", terminal: false }), clusters);
+    return clusters;
+  })(), 10)[0];
+  assert.equal(qualifiesDurableRunBlocker(entry, 1), false);
+});
+
+test("proposedTitle: durable-run-blocker title identity is (class, fingerprint), never free-text prose", () => {
+  const clusters = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(durableOccurrence({ blockerClass: "environment-auth", fingerprint: "fp-abc", evidenceExcerpt: "wording one" }), clusters);
+  const entryA = clustersToEntries(clusters, 10)[0];
+  const clusters2 = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(durableOccurrence({ blockerClass: "environment-auth", fingerprint: "fp-abc", evidenceExcerpt: "totally different wording" }), clusters2);
+  const entryB = clustersToEntries(clusters2, 10)[0];
+  assert.equal(proposedTitle(entryA), proposedTitle(entryB));
+  assert.equal(proposedTitle(entryA), "[pipeline-improve] Durable-run blocker: environment-auth:fp-abc");
+});
+
+test("formatReport: durable-run-blocker cluster includes fingerprint, terminal flag, item ids, and suggested milestone", () => {
+  const clusters = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(durableOccurrence({ terminal: true }), clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const report = formatReport(entries, false);
+  assert.match(report, /\*\*Blocker class\*\*: workflow-engine-defect/);
+  assert.match(report, /\*\*Evidence fingerprint\*\*: fp-1/);
+  assert.match(report, /\*\*Terminal stop\*\*: yes/);
+  assert.match(report, /\*\*Affected item ids\*\*: 100/);
+  assert.match(report, /\*\*Suggested milestone\*\*: .+/);
+});
+
+test("formatJson: durable-run-blocker cluster emits a durableRunBlocker bundle", () => {
+  const clusters = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(durableOccurrence(), clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const parsed = JSON.parse(formatJson(entries));
+  assert.equal(parsed[0].category, "durable-run-blocker");
+  assert.equal(parsed[0].durableRunBlocker.blockerClass, "workflow-engine-defect");
+  assert.equal(parsed[0].durableRunBlocker.fingerprint, "fp-1");
+});
+
+test("applyIssues: a terminal durable-run-blocker cluster is filed from a single run", async () => {
+  const clusters = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(durableOccurrence({ terminal: true }), clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const deps = makeApplyDeps();
+  await applyIssues(entries, {}, deps);
+  assert.equal(deps._createCalls.length, 1);
+  assert.equal(entries[0].issueUrl, "https://github.com/org/repo/issues/1");
+});
+
+test("applyIssues: a single non-terminal durable-run-blocker occurrence is not filed", async () => {
+  const clusters = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(durableOccurrence({ terminal: false }), clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const deps = makeApplyDeps();
+  await applyIssues(entries, {}, deps);
+  assert.equal(deps._createCalls.length, 0);
+});
+
+test("applyIssues: a non-terminal durable-run-blocker cluster recurring across 2 runs is filed", async () => {
+  const clusters = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(durableOccurrence({ runId: "run-1", terminal: false }), clusters);
+  clusterDurableRunBlockers(durableOccurrence({ runId: "run-2", terminal: false }), clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const deps = makeApplyDeps();
+  await applyIssues(entries, {}, deps);
+  assert.equal(deps._createCalls.length, 1);
+});
+
+test("applyIssues: durable-run-blocker issue body carries evidence and a no-milestone-assigned note", async () => {
+  const clusters = new Map<string, ClusterAccum>();
+  clusterDurableRunBlockers(durableOccurrence({ terminal: true }), clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const deps = makeApplyDeps();
+  await applyIssues(entries, {}, deps);
+  const body = deps._createCalls[0].body;
+  assert.match(body, /Blocker class: workflow-engine-defect/);
+  assert.match(body, /Evidence fingerprint: fp-1/);
+  assert.match(body, /never auto-assigned/);
 });

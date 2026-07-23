@@ -24,6 +24,7 @@ import {
   releaseLock,
   requireToken,
   getStatus,
+  readDurableRunBlockerOccurrences,
   type LoopStoreDeps,
   defaultLoopStoreDeps,
   LEGACY_PIPELINE_STATE_HOME_ENV,
@@ -620,4 +621,121 @@ test("defaultLoopStoreDeps: real-fs lock lifecycle — acquire, release via comp
   } finally {
     fsMod.rmSync(stateHome, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// readDurableRunBlockerOccurrences (#538) — read-only durable-run-blocker
+// evidence projection over the loop store's ledgers. Feeds the
+// `durable-run-blocker` improve-cluster category (capability
+// `durable-run-blocker-auto-file`).
+// ---------------------------------------------------------------------------
+
+function blockedItem(opts: {
+  itemId: string;
+  blockerClass: string;
+  fingerprint: string;
+  evidence: string;
+  time?: string;
+}): LoopLedger["items"][string] {
+  return {
+    id: opts.itemId,
+    state: "blocked",
+    history: [
+      {
+        time: opts.time ?? "2026-07-20T00:00:00.000Z",
+        from: "in_progress",
+        to: "blocked",
+        engine: "claude",
+        theme: opts.blockerClass,
+        evidence: opts.evidence,
+      },
+    ],
+    recovery_budgets_remaining: { default: 3 },
+    blocked_theme: opts.blockerClass,
+    evidence_fingerprint: opts.fingerprint,
+  };
+}
+
+async function seedLedger(deps: LoopStoreDeps, files: Map<string, string>, runId: string, ledger: LoopLedger): Promise<void> {
+  const dir = runDir(deps, runId);
+  files.set(`${dir}/ledger.json`, JSON.stringify(ledger));
+}
+
+test("readDurableRunBlockerOccurrences: projects a blocked item's class/fingerprint/excerpt, terminal false when no stop is attributable", async () => {
+  const { deps, files } = fakeDeps();
+  await seedLedger(deps, files, "run-1", {
+    ...testLedger("run-1"),
+    items: {
+      "100": blockedItem({ itemId: "100", blockerClass: "environment-auth", fingerprint: "fp-1", evidence: "auth failed" }),
+    },
+  });
+  const occurrences = await readDurableRunBlockerOccurrences(deps);
+  assert.equal(occurrences.length, 1);
+  assert.deepEqual(occurrences[0], {
+    runId: "run-1",
+    itemId: "100",
+    blockerClass: "environment-auth",
+    fingerprint: "fp-1",
+    evidenceExcerpt: "auth failed",
+    time: "2026-07-20T00:00:00.000Z",
+    terminal: false,
+  });
+});
+
+test("readDurableRunBlockerOccurrences: terminal is true only for the item named by the run's stop record", async () => {
+  const { deps, files } = fakeDeps();
+  await seedLedger(deps, files, "run-1", {
+    ...testLedger("run-1"),
+    items: {
+      "100": blockedItem({ itemId: "100", blockerClass: "workflow-engine-defect", fingerprint: "fp-a", evidence: "engine crashed" }),
+      "200": blockedItem({ itemId: "200", blockerClass: "transient-rate-limit", fingerprint: "fp-b", evidence: "429 rate limited" }),
+    },
+    stop: { reason: "run_fatal", time: "2026-07-20T01:00:00.000Z", item_id: "100", theme: "workflow-engine-defect" },
+  });
+  const occurrences = await readDurableRunBlockerOccurrences(deps);
+  const byItem = new Map(occurrences.map((o) => [o.itemId, o]));
+  assert.equal(byItem.get("100")!.terminal, true);
+  assert.equal(byItem.get("200")!.terminal, false);
+});
+
+test("readDurableRunBlockerOccurrences: an item with no blocked_theme/evidence_fingerprint is skipped", async () => {
+  const { deps, files } = fakeDeps();
+  await seedLedger(deps, files, "run-1", {
+    ...testLedger("run-1"),
+    items: {
+      "100": { id: "100", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+    },
+  });
+  const occurrences = await readDurableRunBlockerOccurrences(deps);
+  assert.equal(occurrences.length, 0);
+});
+
+test("readDurableRunBlockerOccurrences: an unreadable/malformed ledger is skipped, not fatal — other runs still surface", async () => {
+  const { deps, files } = fakeDeps();
+  await seedLedger(deps, files, "run-good", {
+    ...testLedger("run-good"),
+    items: {
+      "100": blockedItem({ itemId: "100", blockerClass: "missing-authority", fingerprint: "fp-x", evidence: "needs a human decision" }),
+    },
+  });
+  const badDir = runDir(deps, "run-bad");
+  files.set(`${badDir}/ledger.json`, "{ not valid json");
+
+  const occurrences = await readDurableRunBlockerOccurrences(deps);
+  assert.equal(occurrences.length, 1);
+  assert.equal(occurrences[0].runId, "run-good");
+});
+
+test("readDurableRunBlockerOccurrences: performs zero writes, zero lock acquisition", async () => {
+  const { deps, files, writes } = fakeDeps();
+  await seedLedger(deps, files, "run-1", {
+    ...testLedger("run-1"),
+    items: {
+      "100": blockedItem({ itemId: "100", blockerClass: "upstream-dependency", fingerprint: "fp-z", evidence: "upstream check pending" }),
+    },
+  });
+  writes.length = 0;
+  await readDurableRunBlockerOccurrences(deps);
+  assert.equal(writes.length, 0);
+  assert.equal(await readLock(deps, "run-1"), null);
 });

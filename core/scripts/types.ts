@@ -767,6 +767,18 @@ export interface PipelineConfig {
     auto_file_max_per_window: number;
     auto_file_min_occurrences: number;
   };
+  // Durable-run-blocker auto-file (#538, capability `durable-run-blocker-auto-file`).
+  // Opt-in; default disabled. Mirrors `corrections`' shape (no capture-side
+  // `enabled` flag — typed blocker classification (#509) itself is unconditional,
+  // this block only gates auto-filing). `auto_file_min_occurrences` floors at 2 —
+  // a single non-terminal occurrence never qualifies regardless of this setting;
+  // a terminal stop always qualifies from a single occurrence.
+  durable_runs: {
+    auto_file: boolean;
+    auto_file_window_hours: number;
+    auto_file_max_per_window: number;
+    auto_file_min_occurrences: number;
+  };
   // Worktree bootstrap: dependency install step (#174).
   // When set to a non-empty string, that shell command is run in the worktree
   // instead of auto-detection. When set to "" the install step is skipped
@@ -977,6 +989,15 @@ export const DEFAULT_CONFIG: Omit<
     auto_file_max_per_window: 3,
     // Floor is 2 (config.ts enforces via zod .min(2)) — matches the
     // correction category's own default --min-occurrences (#500).
+    auto_file_min_occurrences: 2,
+  },
+  durable_runs: {
+    auto_file: false,
+    auto_file_window_hours: 24,
+    auto_file_max_per_window: 3,
+    // Floor is 2 (config.ts enforces via zod .min(2)) — a single non-terminal
+    // occurrence never qualifies regardless (#538); a terminal stop always
+    // qualifies from a single occurrence.
     auto_file_min_occurrences: 2,
   },
   format_gate: [] as { command: string; auto_fix: boolean }[],

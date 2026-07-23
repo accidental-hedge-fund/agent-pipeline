@@ -10,6 +10,12 @@ import { spawnSync } from "node:child_process";
 import { runsDir } from "./run-store.ts";
 import { summarizeInterventions } from "./intervention.ts";
 import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
+import {
+  defaultLoopStoreDeps,
+  readDurableRunBlockerOccurrences,
+  type DurableBlockerOccurrence,
+} from "./loop/store.ts";
+import type { DurableBlockerClass } from "./loop/types.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -21,7 +27,8 @@ export type ClusterCategory =
   | "flaky-gate"
   | "token-waste"
   | "papercut"
-  | "correction";
+  | "correction"
+  | "durable-run-blocker";
 
 /** Next control level named by a correction proposal (#500). `undetermined` is
  *  a compiler-side sentinel, never an emitted `proposed_control` value — it
@@ -59,6 +66,22 @@ export interface CorrectionEvidence {
   severities: string[];
 }
 
+/** Bounded evidence bundle carried only by `durable-run-blocker`-category
+ *  clusters (#538, capability `durable-run-blocker-auto-file`). Every field
+ *  is derived purely from the durable-loop store's typed blocker records
+ *  (#509) via {@link readDurableRunBlockerOccurrences} — never from raw-text
+ *  similarity or an LLM. Milestone assignment stays a human decision:
+ *  `suggestedMilestone` is advisory text only, never applied to a filed issue. */
+export interface DurableRunBlockerEvidence {
+  blockerClass: DurableBlockerClass;
+  fingerprint: string;
+  /** True when any occurrence in this cluster was a durable run's terminal
+   *  {@link LoopStopRecord}. */
+  terminal: boolean;
+  itemIds: string[];
+  suggestedMilestone: string;
+}
+
 export interface ClusterEntry {
   category: ClusterCategory;
   signal: string;
@@ -71,6 +94,8 @@ export interface ClusterEntry {
   alreadyTracked?: boolean;
   /** Populated only when category === "correction" (#500). */
   correction?: CorrectionEvidence;
+  /** Populated only when category === "durable-run-blocker" (#538). */
+  durableRunBlocker?: DurableRunBlockerEvidence;
 }
 
 /** An open GitHub issue whose title carries the `[pipeline-improve]` prefix
@@ -118,6 +143,10 @@ export interface ImproveDeps {
    *  callers that need a rate-window count (#421 finding 3) use both states.
    *  Called once per invocation regardless of cluster count. */
   listOpenImproveIssues: () => Promise<OpenImproveIssue[]>;
+  /** Read-only projection over the durable-loop store's ledgers (#538,
+   *  capability `durable-run-blocker-auto-file`) — a distinct source from
+   *  `readLines`/`readdir` above, which read `.agent-pipeline/runs/`. */
+  readDurableRunBlockerOccurrences: () => Promise<DurableBlockerOccurrence[]>;
   log: (msg: string) => void;
 }
 
@@ -131,9 +160,14 @@ export interface ImproveDeps {
  *  to identical prose must not collide, and the same `correction_key` whose
  *  source prose changes must still dedup against its prior issue. Prose stays
  *  in the issue body as descriptive evidence only. */
-export function proposedTitle(c: Pick<ClusterEntry, "category" | "signal" | "correction">): string {
+export function proposedTitle(
+  c: Pick<ClusterEntry, "category" | "signal" | "correction" | "durableRunBlocker">,
+): string {
   if (c.category === "correction" && c.correction) {
     return `[pipeline-improve] Recurring correction: ${c.correction.correctionKey}`;
+  }
+  if (c.category === "durable-run-blocker" && c.durableRunBlocker) {
+    return `[pipeline-improve] Durable-run blocker: ${c.durableRunBlocker.blockerClass}:${c.durableRunBlocker.fingerprint}`;
   }
   return `[pipeline-improve] Recurring ${c.category}: ${c.signal.slice(0, 60)}`;
 }
@@ -230,6 +264,7 @@ export function realImproveDeps(repoDir: string): ImproveDeps {
       const pages = JSON.parse(r.stdout || "[]") as RawApiIssue[][];
       return parseOpenImproveIssuesPages(pages);
     },
+    readDurableRunBlockerOccurrences: () => readDurableRunBlockerOccurrences(defaultLoopStoreDeps()),
     log: (msg) => process.stdout.write(msg + "\n"),
   };
 }
@@ -368,6 +403,16 @@ export interface ClusterAccum {
   /** Severity values resolved via `evidence_ref` cross-reference — see
    *  `CorrectionEvidence.severities`. */
   severities?: Set<string>;
+  // durable-run-blocker-specific accumulation (#538) — populated only for
+  // category === "durable-run-blocker". `itemIds` above is reused as-is.
+  /** The `DurableBlockerClass` this cluster is keyed on. */
+  blockerClass?: DurableBlockerClass;
+  /** The `evidence_fingerprint` this cluster is keyed on — the title/dedup
+   *  identity for auto-filed durable-run-blocker issues. */
+  fingerprint?: string;
+  /** True once any occurrence folded into this cluster was a durable run's
+   *  terminal stop attributable to it. Sticky — never reset back to false. */
+  terminal?: boolean;
 }
 
 function truncateExcerpt(s: string): string {
@@ -663,6 +708,85 @@ export function clusterCorrections(
   }
 }
 
+/** Deterministic, advisory-only milestone suggestion per {@link DurableBlockerClass}
+ *  (#538). Never assigned to a filed issue — surfaced only as report/body prose so
+ *  the "does this join the current release?" decision stays human. */
+const SUGGESTED_MILESTONE_BY_BLOCKER_CLASS: Record<DurableBlockerClass, string> = {
+  "transient-rate-limit": "next reliability-hardening milestone",
+  "workflow-state": "next reliability-hardening milestone",
+  "implementation-ci": "next reliability-hardening milestone",
+  "environment-auth": "next operational-hardening milestone",
+  "specification-decision": "next spec/process milestone",
+  "missing-authority": "next spec/process milestone",
+  "upstream-dependency": "next dependency-hardening milestone",
+  "workflow-engine-defect": "next engine defect-fix milestone",
+};
+
+/** Deterministic *suggested* milestone for a durable-run-blocker cluster —
+ *  advisory text only (#538). Exported so the report, `--apply` issue body,
+ *  and auto-file body all agree on the same suggestion. */
+export function suggestMilestoneForBlockerClass(blockerClass: DurableBlockerClass): string {
+  return SUGGESTED_MILESTONE_BY_BLOCKER_CLASS[blockerClass];
+}
+
+/**
+ * Extract a {@link DurableBlockerOccurrence} (#538, capability
+ * `durable-run-blocker-auto-file`) and accumulate into clusters keyed on
+ * `durable-run-blocker:<class>:<fingerprint>`. Cluster identity is the pair
+ * `(blockerClass, fingerprint)` — never free-text prose — so title/dedup
+ * identity never depends on the evidence excerpt's wording.
+ *
+ * `count` always mirrors `runIds.size` (distinct affected runs), matching the
+ * qualification rule: a cluster qualifies to file when a terminal stop is
+ * attributable to it OR it recurs across >= 2 distinct runs — never on raw
+ * occurrence count within a single run. `terminal` is sticky: once any
+ * occurrence in the cluster was a terminal stop, it stays true.
+ */
+export function clusterDurableRunBlockers(
+  occurrence: DurableBlockerOccurrence,
+  clusters: Map<string, ClusterAccum>,
+): void {
+  const key = `durable-run-blocker:${occurrence.blockerClass}:${occurrence.fingerprint}`;
+  // Belt-and-braces (#538, matching #421 D7 / #500): ledger evidence text is
+  // never sanitized at write time (loop/recovery.ts records the raw evidence
+  // string), so sanitize here before it ever reaches a report line or issue body.
+  const sanitizedExcerpt = sanitize(redactSecrets(occurrence.evidenceExcerpt));
+
+  let existing = clusters.get(key);
+  if (!existing) {
+    existing = {
+      category: "durable-run-blocker",
+      signal: occurrence.blockerClass,
+      count: 0,
+      runIds: new Set(),
+      excerpt: truncateExcerpt(sanitizedExcerpt),
+      itemIds: new Set(),
+      blockerClass: occurrence.blockerClass,
+      fingerprint: occurrence.fingerprint,
+      terminal: false,
+    };
+    clusters.set(key, existing);
+  }
+
+  existing.runIds.add(occurrence.runId);
+  existing.itemIds!.add(occurrence.itemId);
+  existing.count = existing.runIds.size;
+  if (occurrence.terminal) existing.terminal = true;
+}
+
+/** Qualification predicate for a `durable-run-blocker` cluster (#538): fires
+ *  when a terminal stop is attributable to it OR it recurs across a
+ *  configured minimum of distinct runs (floored at 2 — a single non-terminal
+ *  occurrence never qualifies). Exported so the report/`--apply` path
+ *  (`applyIssues` below) and the auto-file path (`stages/papercut.ts`) agree
+ *  on the exact same rule. */
+export function qualifiesDurableRunBlocker(c: Pick<ClusterEntry, "runIds" | "durableRunBlocker">, minOccurrences: number): boolean {
+  if (!c.durableRunBlocker) return false;
+  if (c.durableRunBlocker.terminal) return true;
+  const floor = Math.max(2, minOccurrences);
+  return c.runIds.length >= floor;
+}
+
 /**
  * Name the next control level for a correction cluster (#500). This is a pure
  * function of the cluster's `proposedControls` set — the deterministic,
@@ -784,6 +908,15 @@ export function clustersToEntries(
           severities: [...(c.severities ?? [])].sort(),
         };
       }
+      if (c.category === "durable-run-blocker" && c.blockerClass && c.fingerprint) {
+        entry.durableRunBlocker = {
+          blockerClass: c.blockerClass,
+          fingerprint: c.fingerprint,
+          terminal: c.terminal ?? false,
+          itemIds: [...(c.itemIds ?? [])],
+          suggestedMilestone: suggestMilestoneForBlockerClass(c.blockerClass),
+        };
+      }
       return entry;
     });
 }
@@ -815,6 +948,13 @@ export function formatReport(clusters: ClusterEntry[], tokenWasteSkipped: boolea
       }
       lines.push(...renderControlProposal(c));
     }
+    if (c.durableRunBlocker) {
+      lines.push(`**Blocker class**: ${c.durableRunBlocker.blockerClass}`);
+      lines.push(`**Evidence fingerprint**: ${c.durableRunBlocker.fingerprint}`);
+      lines.push(`**Terminal stop**: ${c.durableRunBlocker.terminal ? "yes" : "no"}`);
+      lines.push(`**Affected item ids**: ${c.durableRunBlocker.itemIds.join(", ") || "none"}`);
+      lines.push(`**Suggested milestone**: ${c.durableRunBlocker.suggestedMilestone} (advisory only — never auto-assigned)`);
+    }
     lines.push(`**Proposed issue title**: ${proposedTitle(c)}`);
     if (c.issueUrl && c.alreadyTracked) {
       lines.push(`**Already tracked**: ${c.issueUrl}`);
@@ -843,6 +983,7 @@ export function formatJson(clusters: ClusterEntry[]): string {
       runIds: c.runIds,
       excerpt: c.excerpt,
       ...(c.correction !== undefined ? { correction: c.correction } : {}),
+      ...(c.durableRunBlocker !== undefined ? { durableRunBlocker: c.durableRunBlocker } : {}),
       ...(c.issueUrl !== undefined ? { issueUrl: c.issueUrl } : {}),
       ...(c.alreadyTracked !== undefined ? { alreadyTracked: c.alreadyTracked } : {}),
     })),
@@ -861,7 +1002,17 @@ export function formatJson(clusters: ClusterEntry[]): string {
  *  of 3. An explicit `opts.minOccurrences` overrides every category uniformly. */
 function minOccurrencesFor(category: ClusterCategory, opts: { minOccurrences?: number }): number {
   if (opts.minOccurrences !== undefined) return opts.minOccurrences;
-  return category === "correction" ? 2 : 3;
+  return category === "correction" || category === "durable-run-blocker" ? 2 : 3;
+}
+
+/** Whether a cluster qualifies to file, honoring the `durable-run-blocker`
+ *  category's distinct OR-based rule (#538) instead of the plain
+ *  `count >= minOccurrences` threshold every other category uses. */
+function qualifiesToFile(c: ClusterEntry, opts: { minOccurrences?: number }): boolean {
+  if (c.category === "durable-run-blocker") {
+    return qualifiesDurableRunBlocker(c, minOccurrencesFor(c.category, opts));
+  }
+  return c.count >= minOccurrencesFor(c.category, opts);
 }
 
 export async function applyIssues(
@@ -880,7 +1031,7 @@ export async function applyIssues(
   const openIssues = await deps.listOpenImproveIssues();
   const byTitle = new Map(openIssues.filter((i) => i.state === "OPEN").map((i) => [i.title, i]));
 
-  const qualifying = clusters.filter((c) => c.count >= minOccurrencesFor(c.category, opts));
+  const qualifying = clusters.filter((c) => qualifiesToFile(c, opts));
   for (const c of qualifying) {
     const title = proposedTitle(c);
     const existing = byTitle.get(title);
@@ -917,6 +1068,17 @@ export async function applyIssues(
           ...(c.correction.severities.length > 0 ? [`- Severity evidence: ${c.correction.severities.join(", ")}`] : []),
           ``,
           ...renderControlProposal(c),
+        ]
+        : []),
+      ...(c.durableRunBlocker
+        ? [
+          ``,
+          `### Durable-run blocker evidence`,
+          `- Blocker class: ${c.durableRunBlocker.blockerClass}`,
+          `- Evidence fingerprint: ${c.durableRunBlocker.fingerprint}`,
+          `- Terminal stop: ${c.durableRunBlocker.terminal ? "yes" : "no"}`,
+          `- Affected item ids: ${c.durableRunBlocker.itemIds.join(", ") || "none"}`,
+          `- Suggested milestone (advisory only — never auto-assigned): ${c.durableRunBlocker.suggestedMilestone}`,
         ]
         : []),
       ``,
@@ -959,7 +1121,15 @@ export async function runImprove(opts: ImproveOpts, deps: ImproveDeps): Promise<
     return;
   }
 
-  if (runs.length === 0) {
+  // Durable-run-blocker evidence (#538) lives under the loop state home, a
+  // distinct source from `.agent-pipeline/runs/` above — read independently
+  // so a report/`--apply` still surfaces these clusters even when no
+  // `.agent-pipeline/runs/` data exists (e.g. a repo that only runs
+  // `pipeline:loop`).
+  const durableOccurrences = await deps.readDurableRunBlockerOccurrences();
+  const sinceMs = opts.since ? Date.parse(opts.since) : null;
+
+  if (runs.length === 0 && durableOccurrences.length === 0) {
     if (opts.json) {
       process.stdout.write(JSON.stringify([]) + "\n");
     } else {
@@ -970,6 +1140,14 @@ export async function runImprove(opts: ImproveOpts, deps: ImproveDeps): Promise<
 
   const clusters = new Map<string, ClusterAccum>();
   let tokenWasteSkipped = true;
+
+  for (const occurrence of durableOccurrences) {
+    if (sinceMs !== null) {
+      const occMs = Date.parse(occurrence.time);
+      if (!isNaN(occMs) && occMs < sinceMs) continue;
+    }
+    clusterDurableRunBlockers(occurrence, clusters);
+  }
 
   for (const run of runs) {
     const eventsPath = path.join(run.dir, "events.jsonl");

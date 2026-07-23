@@ -637,3 +637,76 @@ test("driveSupervisor releases the lock even when a cycle throws", async () => {
 
   assert.equal(await readLock(deps, "run-1"), null, "lock must be released even when a cycle throws");
 });
+
+// ---------------------------------------------------------------------------
+// onDriveEnd hook (#538, capability durable-run-blocker-auto-file) — a
+// best-effort, config/gh-free hook fired once driveSupervisor reaches a
+// terminal stop or full completion. Never fired on an outstanding pause/hold;
+// never allowed to alter the drive result or the lock release.
+// ---------------------------------------------------------------------------
+
+test("onDriveEnd fires exactly once on full completion (allDone)", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem } = coordinatedFakes();
+  const calls: unknown[] = [];
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem, onDriveEnd: async (r) => { calls.push(r); } },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(result.allDone, true);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], result);
+});
+
+test("onDriveEnd fires exactly once on a terminal stop", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: ["200"] },
+      { id: "200", depends_on: ["999"] },
+    ],
+    consecutive_no_progress_limit: 3,
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { deps: observe } = fakeObserveDeps();
+  const { dispatchItem } = coordinatedFakes();
+  const calls: unknown[] = [];
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem, onDriveEnd: async (r) => { calls.push(r); } },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(result.stop?.reason, "dependency_deadlock");
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], result);
+});
+
+test("onDriveEnd is best-effort — a throwing hook never alters the drive result and the lock is still released", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem } = coordinatedFakes();
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem, onDriveEnd: async () => { throw new Error("simulated auto-file failure"); } },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(result.allDone, true);
+  assert.equal(await readLock(deps, "run-1"), null, "lock must still be released when onDriveEnd throws");
+});
+
+test("onDriveEnd is absent by default (optional) — existing SupervisorDeps callers are unaffected", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem } = coordinatedFakes();
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+  assert.equal(result.allDone, true);
+});
