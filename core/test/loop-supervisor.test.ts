@@ -312,6 +312,78 @@ test("a spin scenario (no eligible item, no drift, no recovery) stops with super
   assert.equal(calls.length, 0, "no item was ever eligible, so dispatchItem must never be called");
 });
 
+test("exhausting the cycle safety cap while every cycle reports progress records a durable supervisor_cycle_cap stop instead of exiting unheld (review round 2, finding 8e8af6cd)", async () => {
+  // Item "100" is parked in "pr_opened" with a bound identity whose checks
+  // were "success"; the live observed identity keeps reporting "failure" on
+  // every cycle. classifyDrift only updates the bound identity on a clean
+  // (non-drifted) pass, so this "checks-regressed" drift — and therefore
+  // `progress: true` — recurs every single cycle forever: a reconciliation
+  // defect or continually changing non-actionable live state, never settling
+  // into a stop, hold, or all-done terminal condition on its own.
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const boundIdentity = {
+    issue_number: 100,
+    issue_open: true,
+    ready_label_present: false,
+    pr_number: 12,
+    pr_state: "open" as const,
+    head_branch: "pipeline/100-x",
+    head_sha: "abc123",
+    merge_commit_sha: null,
+    checks_conclusion: "success" as const,
+    observed_at: "2026-07-23T00:00:00.000Z",
+  };
+  const ledger = testLedger({
+    "100": { ...itemEntry("100", "pr_opened"), last_verified_identity: boundIdentity },
+  });
+  const { deps } = await setup(contract, ledger);
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: [] };
+    },
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-x", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "fail" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const { dispatchItem, calls } = coordinatedFakes();
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem },
+    { runId: "run-1", engine: "claude", maxCyclesSafety: 5 },
+  );
+
+  assert.equal(calls.length, 0, "the drifting item is never dependency-eligible, so it must never be dispatched");
+  assert.equal(result.cycles, 5);
+  assert.equal(result.holdOutstanding, false);
+  assert.equal(result.allDone, false);
+  assert.equal(result.stop?.reason, "supervisor_cycle_cap");
+  assert.equal(result.stop?.limit, 5);
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.stop?.reason, "supervisor_cycle_cap");
+
+  const auditAfter = await auditSupervisor(deps, "run-1");
+  const lastEntry = auditAfter.action_evidence.at(-1);
+  assert.equal(lastEntry?.outcome, "supervisor_cycle_cap");
+  assert.equal(lastEntry?.progress, "progress");
+
+  const lockAfter = await readLock(deps, "run-1");
+  assert.equal(lockAfter, null, "the lock must still be released even though the run stopped via the cap");
+});
+
 test("a progress cycle following a no-progress cycle is classified progress, not accumulated", async () => {
   // "100" depends on "200"; "200" starts undone, so cycle 1 has no eligible
   // item. Between cycles the test simulates external forward progress on

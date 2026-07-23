@@ -395,6 +395,8 @@ export interface DriveSupervisorInput {
   /** Override for tests; production reads `contract.consecutive_no_progress_limit`
    *  falling back to {@link DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT}. */
   consecutiveNoProgressLimit?: number;
+  /** Override for tests; production uses {@link MAX_CYCLES_SAFETY}. */
+  maxCyclesSafety?: number;
 }
 
 export interface DriveSupervisorResult {
@@ -422,6 +424,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
   let record = attach.record;
   const contract = await readContract(deps.store, input.runId);
   const limit = input.consecutiveNoProgressLimit ?? contract.consecutive_no_progress_limit ?? DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT;
+  const cyclesSafetyCap = input.maxCyclesSafety ?? MAX_CYCLES_SAFETY;
 
   try {
     if (attach.resumed) {
@@ -444,7 +447,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
     let holdOutstanding = false;
     let allDone = false;
 
-    while (cycles < MAX_CYCLES_SAFETY) {
+    while (cycles < cyclesSafetyCap) {
       cycles++;
       const result = await runSupervisorCycle(deps, input.runId, token, input.engine);
 
@@ -484,6 +487,22 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
         stop = newLedger.stop;
         break;
       }
+    }
+
+    if (!stop && !holdOutstanding && !allDone && cycles >= cyclesSafetyCap) {
+      const time = deps.store.now().toISOString();
+      const ledger = await readLedger(deps.store, input.runId);
+      const newLedger: LoopLedger = { ...ledger, stop: { reason: "supervisor_cycle_cap", time, limit: cyclesSafetyCap } };
+      await writeLedger(deps.store, newLedger, token);
+      await appendEvent(deps.store, input.runId, token, "loop_run_stopped", { reason: "supervisor_cycle_cap" });
+      await appendActionEvidence(deps.store, input.runId, token, {
+        item_id: null,
+        action: "stop",
+        outcome: "supervisor_cycle_cap",
+        next_action: null,
+        progress: "progress",
+      });
+      stop = newLedger.stop;
     }
 
     return { runId: input.runId, cycles, stop, holdOutstanding, allDone, resumed: attach.resumed };

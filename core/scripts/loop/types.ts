@@ -298,7 +298,12 @@ export interface LoopStopRecord {
      *  stopped the run after `consecutive_no_progress_limit` cycles produced
      *  no durable delta — distinct from the item-level `repeated_no_progress`
      *  bound above; see loop/supervisor.ts. */
-    | "supervisor_no_progress";
+    | "supervisor_no_progress"
+    /** The absolute cycle safety backstop (`MAX_CYCLES_SAFETY`, #512 review
+     *  round 2) was exhausted while every cycle still reported progress — a
+     *  durable terminal stop so a run can never fall through the cap silently
+     *  nonterminal and unheld; see loop/supervisor.ts. */
+    | "supervisor_cycle_cap";
   time: string;
   item_id?: string;
   theme?: string;
