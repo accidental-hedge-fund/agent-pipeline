@@ -227,13 +227,16 @@ export interface VisualGateDeps {
   listArtifacts?: (absArtifactsDir: string) => Promise<{ rel: string; size: number }[]>;
   /** Copy the bounded artifact file list into `destDir` (creating parent dirs
    *  as needed). Returns a per-file result — a file whose copy fails is
-   *  reported `ok: false` rather than silently swallowed (d50013b8).
-   *  Injectable for tests. */
+   *  reported `ok: false` rather than silently swallowed (d50013b8). A
+   *  successful result's `size` is the byte size actually persisted at
+   *  `destDir` (not the pre-copy enumeration size), so a file that grows
+   *  between enumeration and copy is bounded by what was really captured
+   *  (#463 review 2). Injectable for tests. */
   copyArtifacts?: (
     absArtifactsDir: string,
     files: string[],
     destDir: string,
-  ) => Promise<{ rel: string; ok: boolean }[]>;
+  ) => Promise<{ rel: string; ok: boolean; size?: number }[]>;
   /** Copy the selected published files from the run-directory attempt copy
    *  into the worktree evidence path (`PUBLISH_EVIDENCE_DIR`). Injectable
    *  for tests. */
@@ -246,8 +249,10 @@ export interface VisualGateDeps {
   /** `git add -f <relPath>` in the worktree — force-adds only the evidence
    *  path so a gitignored `artifacts_dir` is never swept in. Injectable for tests. */
   gitAddForce?: (cwd: string, relPath: string) => Promise<{ code: number; stderr: string }>;
-  /** `git commit -m <message>` in the worktree for the publish commit. Injectable for tests. */
-  gitCommit?: (cwd: string, message: string) => Promise<{ code: number; stderr: string }>;
+  /** `git commit -m <message> -- <relPath>` in the worktree for the publish commit —
+   *  pathspec-scoped so any other staged/dirty content in the worktree is left
+   *  staged and untouched rather than swept into the publish commit. Injectable for tests. */
+  gitCommit?: (cwd: string, message: string, relPath: string) => Promise<{ code: number; stderr: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -334,16 +339,19 @@ async function defaultCopyArtifacts(
   absDir: string,
   files: string[],
   destDir: string,
-): Promise<{ rel: string; ok: boolean }[]> {
+): Promise<{ rel: string; ok: boolean; size?: number }[]> {
   await fsp.mkdir(destDir, { recursive: true });
-  const results: { rel: string; ok: boolean }[] = [];
+  const results: { rel: string; ok: boolean; size?: number }[] = [];
   for (const rel of files) {
     const src = path.join(absDir, rel);
     const dest = path.join(destDir, rel);
     try {
       await fsp.mkdir(path.dirname(dest), { recursive: true });
       await fsp.copyFile(src, dest);
-      results.push({ rel, ok: true });
+      // Stat the persisted copy rather than trusting the pre-copy enumeration
+      // size — the source file may have grown between listing and copying.
+      const st = await fsp.stat(dest);
+      results.push({ rel, ok: true, size: st.size });
     } catch {
       results.push({ rel, ok: false });
     }
@@ -376,7 +384,11 @@ async function captureArtifacts(
   opts: AdvanceVisualOpts,
   deps: {
     listArtifacts: (absDir: string) => Promise<{ rel: string; size: number }[]>;
-    copyArtifacts: (absDir: string, files: string[], destDir: string) => Promise<{ rel: string; ok: boolean }[]>;
+    copyArtifacts: (
+      absDir: string,
+      files: string[],
+      destDir: string,
+    ) => Promise<{ rel: string; ok: boolean; size?: number }[]>;
   },
 ): Promise<CapturedManifest & { escapeError?: string }> {
   const resolved = resolveArtifactsDir(worktreePath, cfg.visual_gate.artifacts_dir);
@@ -397,6 +409,7 @@ async function captureArtifacts(
 
   let capturedFiles = files;
   let copyFailed: string[] = [];
+  const copiedSizeByRel = new Map<string, number>();
   if (opts.runDir) {
     const destDir = path.join(opts.runDir, "visual", `attempt-${attempt}`);
     const results = await deps
@@ -404,10 +417,17 @@ async function captureArtifacts(
       .catch(() => files.map((rel) => ({ rel, ok: false })));
     capturedFiles = results.filter((r) => r.ok).map((r) => r.rel);
     copyFailed = results.filter((r) => !r.ok).map((r) => r.rel);
+    for (const r of results) {
+      if (r.ok && r.size !== undefined) copiedSizeByRel.set(r.rel, r.size);
+    }
   }
 
+  // Prefer the size actually persisted by the copy (post-copy stat) over the
+  // pre-copy enumeration size, so a file that grew between listing and
+  // copying is bounded by what was really captured (#463 review 2). Falls
+  // back to the enumeration size only when no copy took place (no runDir).
   const fileSizes: Record<string, number> = {};
-  for (const rel of capturedFiles) fileSizes[rel] = sizeByRel.get(rel) ?? 0;
+  for (const rel of capturedFiles) fileSizes[rel] = copiedSizeByRel.get(rel) ?? sizeByRel.get(rel) ?? 0;
 
   return { captured: true, files: capturedFiles, truncated, totalFound: all.length, copyFailed, fileSizes };
 }
@@ -483,7 +503,7 @@ interface PublishGitDeps {
   copyForPublish: (srcDir: string, files: string[], destDir: string) => Promise<void>;
   removeEvidenceDir: (destDir: string) => Promise<boolean>;
   gitAddForce: (cwd: string, relPath: string) => Promise<{ code: number; stderr: string }>;
-  gitCommit: (cwd: string, message: string) => Promise<{ code: number; stderr: string }>;
+  gitCommit: (cwd: string, message: string, relPath: string) => Promise<{ code: number; stderr: string }>;
   gitDirty: (cwd: string) => Promise<boolean>;
   gitPush: (cwd: string, branch: string) => Promise<{ code: number; stderr: string }>;
 }
@@ -557,22 +577,22 @@ async function publishVisualArtifacts(
     }
 
     const dirty = await deps.gitDirty(wtPath);
-    if (!dirty) {
-      // Evidence content is unchanged from the prior publish — already on the branch.
-      return { attempted: true, ok: true, published: new Set(toPublish), overBound: overBoundSet };
+    if (dirty) {
+      const commitRes = await deps.gitCommit(wtPath, `${VISUAL_PUBLISH_COMMIT_PREFIX}${issueNumber}`, PUBLISH_EVIDENCE_DIR);
+      if (commitRes.code !== 0) {
+        return {
+          attempted: true,
+          ok: false,
+          failureReason: `git commit failed: ${commitRes.stderr.trim()}`,
+          published: new Set(),
+          overBound: overBoundSet,
+        };
+      }
     }
-
-    const commitRes = await deps.gitCommit(wtPath, `${VISUAL_PUBLISH_COMMIT_PREFIX}${issueNumber}`);
-    if (commitRes.code !== 0) {
-      return {
-        attempted: true,
-        ok: false,
-        failureReason: `git commit failed: ${commitRes.stderr.trim()}`,
-        published: new Set(),
-        overBound: overBoundSet,
-      };
-    }
-
+    // Always push, even when the worktree wasn't dirty this round: a prior
+    // invocation may have committed the evidence locally and then failed to
+    // push it, leaving the local branch ahead of the PR branch. Files are
+    // only reported published once the push actually succeeds (#463 review 2).
     const branch = branchName(issueNumber, slug);
     const pushRes = await deps.gitPush(wtPath, branch);
     if (pushRes.code !== 0) {
@@ -621,8 +641,15 @@ async function defaultGitAddForce(cwd: string, relPath: string): Promise<{ code:
   return { code: res.code, stderr: res.stderr };
 }
 
-async function defaultGitCommit(cwd: string, message: string): Promise<{ code: number; stderr: string }> {
-  const res = await gitInWorktree(cwd, ["commit", "-m", message], { ignoreFailure: true });
+async function defaultGitCommit(
+  cwd: string,
+  message: string,
+  relPath: string,
+): Promise<{ code: number; stderr: string }> {
+  // Pathspec-scoped: commits only `relPath`, regardless of whatever else is
+  // staged in the worktree's index, and leaves other staged content staged
+  // rather than sweeping it into the publish commit (#463 review 2).
+  const res = await gitInWorktree(cwd, ["commit", "-m", message, "--", relPath], { ignoreFailure: true });
   return { code: res.code, stderr: res.stderr };
 }
 

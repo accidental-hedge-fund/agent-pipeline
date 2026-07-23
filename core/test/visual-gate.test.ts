@@ -968,6 +968,98 @@ test("visual-gate: an all-over-bound deciding run still replaces stale published
   assert.ok(log.comments[0].includes("huge.png (not published: exceeds bound)"));
 });
 
+test("visual-gate: publish commit is scoped to the evidence path, not the full index (#463 review 2)", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1, publish: true });
+  const deps = makeDeps(log, [passResult("checks passed")]);
+  deps.listArtifacts = async () => [{ rel: "screenshot.png", size: 100 }];
+  let commitPath = "";
+  Object.assign(
+    deps,
+    publishGitDeps({
+      gitCommit: async (_cwd, message, relPath) => { commitPath = relPath; return { code: 0, stderr: "" }; },
+    }),
+  );
+
+  const out = await advanceVisual(cfg, 827, { runDir: "/runs/827" }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(commitPath, ".pipeline-visual-evidence", "the publish commit must be pathspec-scoped to the evidence dir, not the whole index");
+});
+
+test("visual-gate: a locally-committed-but-unpushed evidence set is retried and only reported published once the push succeeds (#463 review 2)", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1, publish: true });
+  const deps = makeDeps(log, [passResult("checks passed")]);
+  deps.listArtifacts = async () => [{ rel: "screenshot.png", size: 100 }];
+  let commitCalled = 0;
+  let pushCalled = 0;
+  Object.assign(
+    deps,
+    publishGitDeps({
+      // Simulates a prior invocation that committed locally but failed to push:
+      // the recopied evidence tree matches what's already committed, so the
+      // worktree is clean this round.
+      gitDirty: async () => false,
+      gitCommit: async () => { commitCalled++; return { code: 0, stderr: "" }; },
+      gitPush: async () => { pushCalled++; return { code: 0, stderr: "" }; },
+    }),
+  );
+
+  const out = await advanceVisual(cfg, 828, { runDir: "/runs/828" }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(commitCalled, 0, "nothing changed locally, so no new commit should be made");
+  assert.equal(pushCalled, 1, "push must still be attempted to verify the prior local commit actually reached the remote");
+  assert.ok(
+    log.comments[0].includes("[screenshot.png]("),
+    "once the retried push succeeds, the file must be reported published",
+  );
+});
+
+test("visual-gate: an unpushed local commit whose retried push fails must not be reported published (#463 review 2)", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1, publish: true });
+  const deps = makeDeps(log, [passResult("checks passed")]);
+  deps.listArtifacts = async () => [{ rel: "screenshot.png", size: 100 }];
+  Object.assign(
+    deps,
+    publishGitDeps({
+      gitDirty: async () => false,
+      gitPush: async () => ({ code: 1, stderr: "remote rejected" }),
+    }),
+  );
+
+  const out = await advanceVisual(cfg, 829, { runDir: "/runs/829" }, deps);
+
+  assert.equal(out.advanced, true, "a publish push failure must never block a passing gate");
+  assert.ok(
+    !log.comments[0].includes("[screenshot.png]("),
+    "a file must never be reported published while its push has not succeeded",
+  );
+  assert.ok(log.comments[0].includes("screenshot.png (not published: publish failed)"));
+});
+
+test("visual-gate: publish bounds are enforced against the size actually persisted by the copy, not the pre-copy listing (#463 review 2)", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1, publish: true });
+  const deps = makeDeps(log, [passResult("checks passed")]);
+  // The file is small at enumeration time...
+  deps.listArtifacts = async () => [{ rel: "growing.png", size: 100 }];
+  // ...but has grown past the 2MB per-file publish bound by the time it is
+  // actually persisted into the run directory (e.g. a background writer).
+  deps.copyArtifacts = async (_abs, files) =>
+    files.map((rel) => ({ rel, ok: true, size: 3 * 1024 * 1024 }));
+  let addCalled = 0;
+  Object.assign(deps, publishGitDeps({ gitAddForce: async () => { addCalled++; return { code: 0, stderr: "" }; } }));
+
+  const out = await advanceVisual(cfg, 830, { runDir: "/runs/830" }, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(addCalled, 0, "a file that grew past the publish bound during copy must never be committed");
+  assert.ok(log.comments[0].includes("growing.png (not published: exceeds bound)"));
+});
+
 test("visual-gate: copy-failed files are excluded from publish", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1, publish: true });
