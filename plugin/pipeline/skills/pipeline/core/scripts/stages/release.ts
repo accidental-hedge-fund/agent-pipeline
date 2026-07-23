@@ -44,6 +44,18 @@ export interface CommandResult {
   stderr: string;
 }
 
+/**
+ * Outcome of classifying a candidate number parsed from a squash-merge `(#N)`
+ * suffix: `pr` means GitHub confirms it is a pull request; `not-a-pr` means
+ * GitHub reports it does not resolve to a pull request (the false-positive
+ * parse of an issue reference on a non-PR commit); `error` means a genuine
+ * API failure (network / auth / rate-limit) that could not be classified.
+ */
+export type PRClassification =
+  | { kind: "pr" }
+  | { kind: "not-a-pr" }
+  | { kind: "error"; message: string };
+
 /** Injectable I/O seam — unit tests inject fakes, production uses realReleaseDeps(). */
 export interface ReleaseDeps {
   readFile(p: string): string;
@@ -51,6 +63,12 @@ export interface ReleaseDeps {
   runCommand(cmd: string, args: string[], opts?: { cwd?: string }): CommandResult;
   spawnEditor(editor: string, filePath: string): void;
   fetchPRTitle(num: number): Promise<string>;
+  /**
+   * Classify a candidate number parsed from a squash-merge `(#N)` suffix (#498).
+   * Only called for suffix-parsed candidates — `Merge pull request #N` numbers
+   * are unambiguously PRs and bypass classification.
+   */
+  classifyPR(num: number): Promise<PRClassification>;
   /** Fetch the issue numbers closed by a given PR via `gh pr view --json closingIssuesReferences`. */
   fetchPRClosingIssues(num: number): Promise<number[]>;
   today(): string;
@@ -99,6 +117,22 @@ export function realReleaseDeps(repoDir?: string): ReleaseDeps {
       );
       if (result.status !== 0) return `PR #${num}`;
       return result.stdout.trim() || `PR #${num}`;
+    },
+    classifyPR: async (num) => {
+      const result = spawnSync(
+        "gh",
+        ["pr", "view", String(num), "--json", "number"],
+        { encoding: "utf8", stdio: "pipe", cwd: repoDir },
+      );
+      if (result.status === 0) return { kind: "pr" };
+      const stderr = result.stderr ?? "";
+      if (/could not resolve to a pullrequest/i.test(stderr)) {
+        return { kind: "not-a-pr" };
+      }
+      return {
+        kind: "error",
+        message: stderr.trim() || `gh pr view #${num} exited ${result.status}`,
+      };
     },
     fetchPRClosingIssues: async (num) => {
       const result = spawnSync(
@@ -283,7 +317,7 @@ const SQUASH_PR_RE = /\(#(\d+)\)/g;
 export async function discoverShippedPRs(
   lastTag: string,
   repoDir: string,
-  deps: Pick<ReleaseDeps, "runCommand" | "fetchPRTitle" | "stderr">,
+  deps: Pick<ReleaseDeps, "runCommand" | "fetchPRTitle" | "classifyPR" | "stderr">,
   localOnly = false,
 ): Promise<ShippedPR[]> {
   const range = lastTag ? `${lastTag}..HEAD` : "HEAD";
@@ -294,21 +328,27 @@ export async function discoverShippedPRs(
     return [];
   }
 
-  const prNums = new Set<number>();
+  // `mergePRNums` are parsed from an unambiguous `Merge pull request #N` subject —
+  // definitionally PRs, trusted without classification. `candidateNums` are parsed
+  // from a trailing `(#N)` suffix, which a non-PR commit (e.g. a docs commit ending
+  // in an issue reference) can also produce — these require classification (#498).
+  const mergePRNums = new Set<number>();
+  const candidateNums = new Set<number>();
   for (const line of result.stdout.split("\n")) {
-    for (const m of line.matchAll(MERGE_PR_RE)) prNums.add(Number(m[1]));
+    for (const m of line.matchAll(MERGE_PR_RE)) mergePRNums.add(Number(m[1]));
     // Pipeline squash commits carry both issue and PR numbers: "...title (#issue) (#pr)".
     // Only the last (# N) on the line is the actual squash-merge PR number.
     const squashMatches = [...line.matchAll(SQUASH_PR_RE)];
-    if (squashMatches.length > 0) prNums.add(Number(squashMatches[squashMatches.length - 1][1]));
+    if (squashMatches.length > 0) candidateNums.add(Number(squashMatches[squashMatches.length - 1][1]));
   }
 
-  if (prNums.size === 0) {
+  const allNums = new Set([...mergePRNums, ...candidateNums]);
+  if (allNums.size === 0) {
     deps.stderr("[pipeline release] warning: no merged PRs detected in git log since last tag");
     return [];
   }
 
-  const sorted = [...prNums].sort((a, b) => a - b);
+  const sorted = [...allNums].sort((a, b) => a - b);
   if (localOnly) {
     // Dry-run path: return placeholder titles without calling any GitHub API.
     return sorted.map((num) => ({ number: num, title: `PR #${num}` }));
@@ -316,6 +356,21 @@ export async function discoverShippedPRs(
 
   const prs: ShippedPR[] = [];
   for (const num of sorted) {
+    if (!mergePRNums.has(num)) {
+      // Suffix-parsed candidate — classify before trusting it as a PR.
+      const classification = await deps.classifyPR(num);
+      if (classification.kind === "not-a-pr") {
+        deps.stderr(
+          `[pipeline release] warning: #${num} is not a pull request — excluding from shipped set ` +
+          `(likely an issue reference on a non-PR commit)`,
+        );
+        continue;
+      }
+      // On a genuine classification error, fall through and still attempt title
+      // enrichment: the number may be a real PR whose failure surfaces (and
+      // aborts the release) at closing-issue resolution, preserving the
+      // existing safety net rather than silently dropping it here.
+    }
     const title = await deps.fetchPRTitle(num);
     prs.push({ number: num, title });
   }

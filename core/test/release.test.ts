@@ -46,6 +46,7 @@ function makeDeps(overrides: Partial<ReleaseDeps> = {}): ReleaseDeps {
     runCommand: () => ({ code: 0, stdout: "", stderr: "" }),
     spawnEditor: (editor, filePath) => { editorCalls.push(`${editor}:${filePath}`); },
     fetchPRTitle: async (n) => `Title of PR #${n}`,
+    classifyPR: async (_n) => ({ kind: "pr" }),
     fetchPRClosingIssues: async (_n) => [],
     today: () => "2026-06-16",
     stdout: (msg) => { stdoutLines.push(msg); },
@@ -549,6 +550,67 @@ test("discoverShippedPRs: deduplicates PR numbers that appear more than once", a
   const prs = await discoverShippedPRs("v1.5.0", "/repo", deps);
   assert.equal(prs.length, 1, "duplicate PR deduplicated");
   assert.equal(prs[0].number, 203);
+});
+
+// ---------------------------------------------------------------------------
+// discoverShippedPRs: non-PR (#N) tolerance (#498)
+// ---------------------------------------------------------------------------
+
+test("discoverShippedPRs: excludes a suffix-parsed candidate that GitHub reports is not a PR, with a warning", async () => {
+  const gitLog = [
+    "docs: add v1.21.0 release-plan row to ROADMAP (#451)",
+    "feat: something (#203)",
+  ].join("\n");
+
+  const deps = makeDeps({
+    runCommand: () => ({ code: 0, stdout: gitLog, stderr: "" }),
+    fetchPRTitle: async (n) => `PR #${n}`,
+    classifyPR: async (n) =>
+      n === 451 ? { kind: "not-a-pr" } : { kind: "pr" },
+  });
+
+  const prs = await discoverShippedPRs("v1.20.0", "/repo", deps);
+  assert.equal(prs.length, 1, "only the genuine PR is kept");
+  assert.equal(prs[0].number, 203);
+  assert.ok(!prs.some((p) => p.number === 451), "#451 excluded from shipped set");
+  const stderrLines = getStderr(deps);
+  assert.ok(
+    stderrLines.some((l) => l.includes("#451") && l.includes("not a pull request")),
+    "warning names the excluded number",
+  );
+});
+
+test("discoverShippedPRs: a genuine classification error still keeps the candidate (safety net preserved)", async () => {
+  const gitLog = ["fix: something (#204)"].join("\n");
+
+  const deps = makeDeps({
+    runCommand: () => ({ code: 0, stdout: gitLog, stderr: "" }),
+    fetchPRTitle: async (n) => `PR #${n}`,
+    classifyPR: async () => ({ kind: "error", message: "network error" }),
+  });
+
+  const prs = await discoverShippedPRs("v1.5.0", "/repo", deps);
+  assert.equal(prs.length, 1, "candidate is not silently dropped on a genuine error");
+  assert.equal(prs[0].number, 204);
+});
+
+test("discoverShippedPRs: Merge pull request #N numbers are trusted and bypass classification", async () => {
+  const gitLog = ["Merge pull request #451 from user/branch"].join("\n");
+
+  let classifyCalled = false;
+  const deps = makeDeps({
+    runCommand: () => ({ code: 0, stdout: gitLog, stderr: "" }),
+    fetchPRTitle: async (n) => `PR #${n}`,
+    classifyPR: async () => {
+      classifyCalled = true;
+      return { kind: "not-a-pr" };
+    },
+  });
+
+  const prs = await discoverShippedPRs("v1.20.0", "/repo", deps);
+  assert.equal(prs.length, 1, "merge-commit number is kept regardless of classification");
+  assert.equal(prs[0].number, 451);
+  assert.ok(!classifyCalled, "classifyPR must NOT be called for merge-commit-sourced numbers");
 });
 
 // ---------------------------------------------------------------------------
@@ -1232,6 +1294,54 @@ test("runRelease live: issue discovery failure aborts and rolls back via git che
   assert.ok(
     !commands.some((c) => c[0] === "git" && c[1] === "checkout" && c[2] === "-b"),
     "release branch is not created when issue discovery fails",
+  );
+});
+
+test("runRelease live: a docs-style non-PR (#N) commit does not abort the release (#498)", async () => {
+  // Reproduces the v1.21.0 cut: a release-prep docs commit ending in a single
+  // issue reference (#451) is parsed as a squash-merge PR candidate alongside
+  // the genuine squash-merge PR #204 (which resolves to issue #158, a row
+  // SAMPLE_ROADMAP plans for v1.6.0). Without the fix, `gh pr view 451` fails
+  // ("Could not resolve to a PullRequest"), issue discovery sets hadFailures,
+  // and the release aborts with "issue discovery failed".
+  const gitLog = [
+    "fix: something (#204)",
+    "docs: add v1.21.0 release-plan row to ROADMAP (#451)",
+  ].join("\n");
+
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: gitLog, stderr: "" };
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "create") {
+        return { code: 0, stdout: "https://github.com/org/repo/pull/200", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchPRTitle: async (n) => `Title #${n}`,
+    classifyPR: async (n) => (n === 451 ? { kind: "not-a-pr" } : { kind: "pr" }),
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158] : []),
+  });
+
+  // Must NOT reject — this is the regression: without the fix it rejects with
+  // /issue discovery failed/.
+  await runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+
+  const written = getWritten(deps);
+  const roadmapWrite = Object.entries(written).find(([p]) => p.endsWith("ROADMAP.md"));
+  assert.ok(roadmapWrite, "ROADMAP.md was written");
+  assert.ok(!roadmapWrite![1].includes("#451"), "excluded #451 produces no Shipped row");
+
+  const stderrLines = getStderr(deps);
+  assert.ok(
+    stderrLines.some((l) => l.includes("#451") && l.includes("not a pull request")),
+    "warning names the excluded #451",
   );
 });
 
