@@ -532,6 +532,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.20.0** ✅ shipped | minor | Risk-triggered design-interrogation gate + large-prompt harness delivery | #436, #492 | Shipped 2026-07-21 (tag `v1.20.0`). See **Shipped** above for the per-PR detail. |
 | **v1.21.0** ✅ shipped | minor | Durable goal orchestration behind pipeline:loop | #451 | Shipped 2026-07-21 (tag `v1.21.0`). See **Shipped** above for the per-PR detail. |
 | **v1.22.0** ✅ shipped | minor | Factory robustness: fix-stage recovery, gate/installer/worktree hardening, structured fix outcomes | #486, #484, #485, #450, #443, #472, #473, #506 | Shipped 2026-07-22 (tag `v1.22.0`). See **Shipped** above for the per-PR detail. |
+| **v1.23.0** | minor | Review-quality context: bounded delta rounds, immutable resolved-finding evidence, PR-visible visual artifacts | #483, #496, #463 | Delta rounds are bounded and settled trade-offs persist under new finding keys (#483); delta reviews receive resolved-finding context with evidence read from the immutable reviewed Git tree (#496); visual-gate artifacts publish as PR-visible evidence with a bypass-hardened publish commit (#463). |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
