@@ -11,13 +11,16 @@ import {
   papercutsEnabled,
   autoFilePapercuts,
   autoFileCorrections,
+  autoFileDurableRunBlockers,
   CORRECTION_AUTO_FILE_PROVENANCE_MARKER,
+  DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER,
   issueNumberFromUrl,
   type PapercutDeps,
   type AutoFileDeps,
   type AutoFileOpts,
 } from "../scripts/stages/papercut.ts";
 import type { OpenImproveIssue } from "../scripts/improve.ts";
+import type { DurableBlockerOccurrence } from "../scripts/loop/store.ts";
 
 // ---------------------------------------------------------------------------
 // Fake deps factory
@@ -402,6 +405,9 @@ function makeAutoFileDeps(opts: {
   /** When true, `withLock` throws (simulates another process holding the
    *  repository-wide lock) instead of running the critical section. */
   lockHeld?: boolean;
+  /** Durable-run-blocker occurrences (#538) — a distinct evidence source from
+   *  `runs`/`readLines` above, which read `.agent-pipeline/runs/`. */
+  durableBlockerOccurrences?: DurableBlockerOccurrence[];
 } = {}): AutoFileDeps & {
   _createCalls: Array<{ title: string; body: string; labels: string[] }>;
   _closeCalls: Array<{ number: number; comment: string }>;
@@ -449,6 +455,7 @@ function makeAutoFileDeps(opts: {
         for (const l of lines) yield l;
       })();
     },
+    readDurableRunBlockerOccurrences: async () => opts.durableBlockerOccurrences ?? [],
     now: () => opts.nowMs ?? NOW_MS,
     log: (msg: string) => logLines.push(msg),
     createIssue: async (title, body, labels) => {
@@ -1228,4 +1235,148 @@ test("autoFileCorrections: an unauthenticated gh resolves without throwing and c
 
 test("autoFileCorrections: papercut and correction auto-file provenance markers are distinct", () => {
   assert.notEqual(CORRECTION_AUTO_FILE_PROVENANCE_MARKER, "<!-- pipeline:papercut-auto-filed -->");
+});
+
+// ---------------------------------------------------------------------------
+// autoFileDurableRunBlockers (#538, capability durable-run-blocker-auto-file)
+// ---------------------------------------------------------------------------
+
+function durableOccurrence(overrides: Partial<DurableBlockerOccurrence> = {}): DurableBlockerOccurrence {
+  return {
+    runId: "run-1",
+    itemId: "100",
+    blockerClass: "workflow-engine-defect",
+    fingerprint: "fp-1",
+    evidenceExcerpt: "engine crashed mid-cycle",
+    time: new Date(NOW_MS - 3600_000).toISOString(),
+    terminal: false,
+    ...overrides,
+  };
+}
+
+test("autoFileDurableRunBlockers: a terminal-stop cluster files from a single run", async () => {
+  const deps = makeAutoFileDeps({
+    durableBlockerOccurrences: [durableOccurrence({ terminal: true })],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts(), deps);
+  assert.equal(deps._createCalls.length, 1);
+  assert.deepEqual(deps._createCalls[0].labels, ["pipeline:backlog"]);
+  assert.match(deps._createCalls[0].title, /Durable-run blocker: workflow-engine-defect:fp-1/);
+});
+
+test("autoFileDurableRunBlockers: a terminal stop still files when its blocked-history entry predates the auto-file window (#538 review 2 finding c5457eee500bcb8d)", async () => {
+  const deps = makeAutoFileDeps({
+    durableBlockerOccurrences: [
+      durableOccurrence({
+        terminal: true,
+        time: new Date(NOW_MS - 48 * 3600_000).toISOString(), // older than the 24h window
+        terminalTime: new Date(NOW_MS - 3600_000).toISOString(), // terminal stop is fresh
+      }),
+    ],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts({ windowHours: 24 }), deps);
+  assert.equal(deps._createCalls.length, 1);
+});
+
+test("autoFileDurableRunBlockers: a terminal stop with no parseable terminal-stop timestamp is retained rather than dropped", async () => {
+  const deps = makeAutoFileDeps({
+    durableBlockerOccurrences: [
+      durableOccurrence({
+        terminal: true,
+        time: new Date(NOW_MS - 48 * 3600_000).toISOString(),
+        terminalTime: undefined,
+      }),
+    ],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts({ windowHours: 24 }), deps);
+  assert.equal(deps._createCalls.length, 1);
+});
+
+test("autoFileDurableRunBlockers: the same (class, fingerprint) recurring across 2 runs files", async () => {
+  const deps = makeAutoFileDeps({
+    durableBlockerOccurrences: [
+      durableOccurrence({ runId: "run-1", terminal: false }),
+      durableOccurrence({ runId: "run-2", terminal: false }),
+    ],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts({ minOccurrences: 2 }), deps);
+  assert.equal(deps._createCalls.length, 1);
+});
+
+test("autoFileDurableRunBlockers: a single non-terminal occurrence does not file and is not reported as qualifying", async () => {
+  const deps = makeAutoFileDeps({
+    durableBlockerOccurrences: [durableOccurrence({ terminal: false })],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts({ minOccurrences: 2 }), deps);
+  assert.equal(deps._createCalls.length, 0);
+  assert.equal(deps._logLines.some((l) => l.includes("already tracked")), false);
+});
+
+test("autoFileDurableRunBlockers: a qualifying cluster whose title matches an open issue is not re-filed (dedup)", async () => {
+  const title = "[pipeline-improve] Durable-run blocker: workflow-engine-defect:fp-1";
+  const deps = makeAutoFileDeps({
+    durableBlockerOccurrences: [durableOccurrence({ terminal: true })],
+    openIssues: [{ title, url: "https://github.com/org/repo/issues/7", state: "OPEN", createdAt: new Date(NOW_MS).toISOString(), labels: ["pipeline:backlog"], body: DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER }],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts(), deps);
+  assert.equal(deps._createCalls.length, 0);
+});
+
+test("autoFileDurableRunBlockers: the rate cap defers clusters once the window's issue count is reached", async () => {
+  const github = makeFakeGithub([
+    { title: "[pipeline-improve] Recurring papercut: pre-existing 1", url: "https://github.com/org/repo/issues/1", state: "OPEN", createdAt: new Date(NOW_MS).toISOString(), labels: ["pipeline:backlog"], body: "" },
+  ]);
+  const deps = makeAutoFileDeps({
+    github,
+    durableBlockerOccurrences: [durableOccurrence({ terminal: true, blockerClass: "environment-auth", fingerprint: "fp-cap" })],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts({ maxPerWindow: 1 }), deps);
+  assert.equal(deps._createCalls.length, 0);
+  assert.ok(deps._logLines.some((l) => l.includes("deferred (rate cap)")));
+});
+
+test("autoFileDurableRunBlockers: evidence excerpt is sanitized — a secret is redacted from the filed body", async () => {
+  const deps = makeAutoFileDeps({
+    durableBlockerOccurrences: [durableOccurrence({ terminal: true, evidenceExcerpt: "auth failed: GITHUB_TOKEN=ghp_abcdefghij1234567890" })],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts(), deps);
+  assert.equal(deps._createCalls.length, 1);
+  assert.ok(!deps._createCalls[0].body.includes("ghp_abcdefghij1234567890"));
+  assert.ok(deps._createCalls[0].body.includes(DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER));
+});
+
+test("autoFileDurableRunBlockers: inert by default — no gh call is made when the caller never gates it on (mirrors config.durable_runs.auto_file absent/false)", async () => {
+  // The engine only calls autoFileDurableRunBlockers when `cfg.durable_runs.auto_file`
+  // resolves true (see pipeline.ts's onDriveEnd wiring) — this test proves the
+  // function itself is a no-op when there is nothing to file, and never calls gh
+  // when unauthenticated, matching the papercut/correction inert-by-default contract.
+  const deps = makeAutoFileDeps({
+    authed: false,
+    durableBlockerOccurrences: [durableOccurrence({ terminal: true })],
+  });
+  await assert.doesNotReject(autoFileDurableRunBlockers(defaultAutoFileOpts(), deps));
+  assert.equal(deps._createCalls.length, 0);
+});
+
+test("autoFileDurableRunBlockers: report/apply body carries no milestone assignment, only an advisory suggestion", async () => {
+  const deps = makeAutoFileDeps({
+    durableBlockerOccurrences: [durableOccurrence({ terminal: true })],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts(), deps);
+  const body = deps._createCalls[0].body;
+  assert.match(body, /Suggested milestone \(advisory only — never auto-assigned\)/);
+});
+
+test("autoFileDurableRunBlockers: does not scan .agent-pipeline/runs/ at all — absence of that directory never blocks filing", async () => {
+  const deps = makeAutoFileDeps({
+    // No `runs` entries at all — readdir(RUNS_ROOT) throws ENOENT in makeAutoFileDeps.
+    durableBlockerOccurrences: [durableOccurrence({ terminal: true })],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts(), deps);
+  assert.equal(deps._createCalls.length, 1);
+});
+
+test("autoFileDurableRunBlockers: provenance marker is distinct from papercut and correction markers", () => {
+  assert.notEqual(DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER, CORRECTION_AUTO_FILE_PROVENANCE_MARKER);
+  assert.notEqual(DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER, "<!-- pipeline:papercut-auto-filed -->");
 });

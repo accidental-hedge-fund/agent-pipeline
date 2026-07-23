@@ -19,10 +19,12 @@ import {
 } from "../run-store.ts";
 import {
   clusterCorrections,
+  clusterDurableRunBlockers,
   clusterPapercuts,
   clustersToEntries,
   collectFindingSeverities,
   proposedTitle,
+  qualifiesDurableRunBlocker,
   readEventsLines,
   realImproveDeps,
   renderControlProposal,
@@ -32,6 +34,7 @@ import {
 } from "../improve.ts";
 import { redactSecrets, sanitize } from "../artifact-sanitize.ts";
 import { withLock } from "../lock.ts";
+import { defaultLoopStoreDeps, readDurableRunBlockerOccurrences, type DurableBlockerOccurrence } from "../loop/store.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -237,6 +240,11 @@ export const AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:papercut-auto-filed --
  *  reconciliation, even though both reuse the same reconciliation function. */
 export const CORRECTION_AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:correction-auto-filed -->";
 
+/** Same role as `AUTO_FILE_PROVENANCE_MARKER`/`CORRECTION_AUTO_FILE_PROVENANCE_MARKER`,
+ *  but for issues auto-filed from durable-run-blocker clusters (#538) — kept distinct so
+ *  reconciliation never conflates the three auto-file sources. */
+export const DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:durable-run-blocker-auto-filed -->";
+
 /** Post-create read-back reconciliation (#459, hardened for review finding
  *  f09ce15de2e6911a): re-list improve issues once and correct two distinct
  *  cross-host races against that single snapshot.
@@ -368,6 +376,10 @@ export interface AutoFileDeps {
   ghAuthCheck: () => Promise<boolean>;
   readLines: (p: string) => AsyncIterable<string>;
   readdir: (p: string) => Promise<Array<{ name: string; isDirectory(): boolean }>>;
+  /** Read-only projection over the durable-loop store's ledgers (#538) — a
+   *  distinct source from `readLines`/`readdir` above, which read
+   *  `.agent-pipeline/runs/`. Used only by `autoFileDurableRunBlockers`. */
+  readDurableRunBlockerOccurrences: () => Promise<DurableBlockerOccurrence[]>;
   /** Current time in epoch ms — injectable so tests control the trailing window. */
   now: () => number;
   /** Repository-wide critical section (#421 finding 2) — injectable so tests
@@ -384,6 +396,7 @@ export function realAutoFileDeps(repoDir: string): AutoFileDeps {
     ghAuthCheck: improveDeps.ghAuthCheck,
     readLines: improveDeps.readLines,
     readdir: improveDeps.readdir,
+    readDurableRunBlockerOccurrences: () => readDurableRunBlockerOccurrences(defaultLoopStoreDeps()),
     now: () => Date.now(),
     withLock: (domain, fn) => withLock(domain, fn),
     log: (msg) => console.warn(msg),
@@ -498,6 +511,42 @@ function buildCorrectionAutoFileBody(c: ClusterEntry, windowHours: number): stri
   ].join("\n");
 }
 
+/** Durable-run-blocker analogue of `buildAutoFileBody`/`buildCorrectionAutoFileBody`
+ *  (#538): agent/pipeline-reported-provenance banner, sanitized ledger reproduction
+ *  context (run ids, item ids, blocker class, evidence fingerprint, evidence excerpt),
+ *  and the suggested-milestone note. The filed issue carries only `pipeline:backlog` —
+ *  no milestone is ever assigned; the suggestion is advisory prose only. */
+function buildDurableRunBlockerAutoFileBody(c: ClusterEntry, windowHours: number): string {
+  const ev = c.durableRunBlocker;
+  const detail = [
+    `**Blocker class**: ${ev?.blockerClass ?? c.signal}`,
+    `**Evidence fingerprint**: ${ev?.fingerprint ?? "unknown"}`,
+    `**Terminal stop**: ${ev?.terminal ? "yes" : "no"}`,
+    `**Distinct runs affected (trailing ${windowHours}h window)**: ${c.count}`,
+    `**Affected item ids**: ${ev?.itemIds.join(", ") || "none"}`,
+    `**Suggested milestone (advisory only — never auto-assigned)**: ${ev?.suggestedMilestone ?? "unknown"}`,
+    ``,
+    `### Affected run IDs`,
+    ...c.runIds.map((id) => `- ${id}`),
+    ``,
+    `### Evidence excerpt`,
+    "```",
+    c.excerpt,
+    "```",
+  ].join("\n");
+  return [
+    DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER,
+    `## Durable-run blocker detected by \`pipeline:loop\` (auto-filed)`,
+    ``,
+    `_This issue was filed automatically by the pipeline from a durable \`pipeline:loop\` run's ` +
+      `typed blocker classification (#509). The content below is agent/pipeline-reported, not ` +
+      `human-authored or human-verified — verify independently before acting. Milestone assignment ` +
+      `stays a human decision: the suggestion above is advisory only._`,
+    ``,
+    sanitize(redactSecrets(detail)),
+  ].join("\n");
+}
+
 /** Shape shared by `autoFilePapercuts` and `autoFileCorrections` (#500): which
  *  event type to cluster, how to accumulate it, how to render its issue body,
  *  the provenance marker reconciliation uses to recognize its own issues, and
@@ -513,6 +562,14 @@ interface AutoFileCategory {
   buildBody: (c: ClusterEntry, windowHours: number) => string;
   marker: string;
   logPrefix: string;
+  /** Overrides the default `.agent-pipeline/runs/` events.jsonl scan below with
+   *  a category-specific cluster source (#538) — used by the durable-run-blocker
+   *  category, whose evidence lives under the loop state home instead. */
+  buildClusters?: (opts: AutoFileOpts, deps: AutoFileDeps) => Promise<Map<string, ClusterAccum>>;
+  /** Overrides the default `count >= opts.minOccurrences` qualification check
+   *  (#538) — used by the durable-run-blocker category's OR-based rule
+   *  (terminal stop OR recurs across >= minOccurrences distinct runs). */
+  qualifies?: (c: ClusterEntry, opts: AutoFileOpts) => boolean;
 }
 
 /** Cluster in-window events of `category.eventType` across every run under
@@ -536,38 +593,50 @@ async function autoFileClusterCategory(
       return;
     }
 
+    // `.agent-pipeline/runs/` is a different evidence source from the durable-loop
+    // store's ledgers (#538) — a category with its own `buildClusters` reads
+    // neither this directory nor its listing, so its absence must never short-
+    // circuit that category (e.g. a repo that only runs `pipeline:loop`).
     const dir = runsDir(opts.repoDir);
-    let entries: Array<{ name: string; isDirectory(): boolean }>;
-    try {
-      entries = await deps.readdir(dir);
-    } catch {
-      return;
+    let entries: Array<{ name: string; isDirectory(): boolean }> = [];
+    if (!category.buildClusters) {
+      try {
+        entries = await deps.readdir(dir);
+      } catch {
+        return;
+      }
     }
 
     const windowMs = opts.windowHours * 60 * 60 * 1000;
     const cutoffMs = deps.now() - windowMs;
 
-    const clusters = new Map<string, ClusterAccum>();
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const runId = entry.name;
-      const eventsPath = path.join(dir, runId, "events.jsonl");
-      // Per-run findingKey -> severity lookup (#500 review 2 finding
-      // 02b2a1921d7c779a), mirroring runImprove — lets a correction cluster's
-      // evidence bundle resolve severity via evidence_ref even on this
-      // reduced, single-event-type-filtered scan.
-      const findingSeverities = new Map<string, string>();
-      for await (const event of readEventsLines(eventsPath, deps)) {
-        collectFindingSeverities(event, findingSeverities);
-        if ((event as { type?: unknown }).type !== category.eventType) continue;
-        const at = typeof event["at"] === "string" ? Date.parse(event["at"] as string) : NaN;
-        if (!Number.isFinite(at) || at < cutoffMs) continue;
-        category.clusterFn(event, runId, clusters, findingSeverities);
+    const clusters = category.buildClusters
+      ? await category.buildClusters(opts, deps)
+      : new Map<string, ClusterAccum>();
+    if (!category.buildClusters) {
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const runId = entry.name;
+        const eventsPath = path.join(dir, runId, "events.jsonl");
+        // Per-run findingKey -> severity lookup (#500 review 2 finding
+        // 02b2a1921d7c779a), mirroring runImprove — lets a correction cluster's
+        // evidence bundle resolve severity via evidence_ref even on this
+        // reduced, single-event-type-filtered scan.
+        const findingSeverities = new Map<string, string>();
+        for await (const event of readEventsLines(eventsPath, deps)) {
+          collectFindingSeverities(event, findingSeverities);
+          if ((event as { type?: unknown }).type !== category.eventType) continue;
+          const at = typeof event["at"] === "string" ? Date.parse(event["at"] as string) : NaN;
+          if (!Number.isFinite(at) || at < cutoffMs) continue;
+          category.clusterFn(event, runId, clusters, findingSeverities);
+        }
       }
     }
 
     const allEntries = clustersToEntries(clusters, Number.MAX_SAFE_INTEGER);
-    const qualifying = allEntries.filter((c) => c.count >= opts.minOccurrences);
+    const qualifying = category.qualifies
+      ? allEntries.filter((c) => category.qualifies!(c, opts))
+      : allEntries.filter((c) => c.count >= opts.minOccurrences);
     if (qualifying.length === 0) return;
 
     // Concurrency (#421 finding 2): the dedup lookup, cap calculation, and issue
@@ -668,6 +737,48 @@ const CORRECTION_AUTO_FILE_CATEGORY: AutoFileCategory = {
   logPrefix: "correction auto-file",
 };
 
+/** Builds `durable-run-blocker` clusters from the durable-loop store's ledgers
+ *  (#538) instead of `.agent-pipeline/runs/` events.jsonl — the evidence source
+ *  the other two categories scan. Honors the same trailing-window semantics
+ *  (`opts.windowHours` against `deps.now()`) via each occurrence's own
+ *  evidence timestamp. */
+async function buildDurableRunBlockerClusters(opts: AutoFileOpts, deps: AutoFileDeps): Promise<Map<string, ClusterAccum>> {
+  const occurrences = await deps.readDurableRunBlockerOccurrences();
+  const windowMs = opts.windowHours * 60 * 60 * 1000;
+  const cutoffMs = deps.now() - windowMs;
+  const clusters = new Map<string, ClusterAccum>();
+  for (const occurrence of occurrences) {
+    // A terminal occurrence must be windowed on the terminal-stop time, not the
+    // (possibly much older) `blocked` history entry — otherwise a run that stayed
+    // blocked longer than the window before reaching its terminal stop has that
+    // terminal occurrence dropped before `qualifiesDurableRunBlocker` ever sees it
+    // (#538 review 2 finding c5457eee500bcb8d). A terminal occurrence with no
+    // parseable terminal-stop timestamp is retained rather than discarded, since
+    // the spec requires a terminal stop to qualify unconditionally.
+    if (occurrence.terminal) {
+      const terminalAt = occurrence.terminalTime ? Date.parse(occurrence.terminalTime) : NaN;
+      if (Number.isFinite(terminalAt) && terminalAt < cutoffMs) continue;
+    } else {
+      const at = Date.parse(occurrence.time);
+      if (!Number.isFinite(at) || at < cutoffMs) continue;
+    }
+    clusterDurableRunBlockers(occurrence, clusters);
+  }
+  return clusters;
+}
+
+const DURABLE_RUN_BLOCKER_AUTO_FILE_CATEGORY: AutoFileCategory = {
+  eventType: "loop_item_blocked",
+  clusterFn: () => {
+    throw new Error("durable-run-blocker uses buildClusters, not the events.jsonl clusterFn path");
+  },
+  buildBody: buildDurableRunBlockerAutoFileBody,
+  marker: DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER,
+  logPrefix: "durable-run-blocker auto-file",
+  buildClusters: buildDurableRunBlockerClusters,
+  qualifies: (c, opts) => qualifiesDurableRunBlocker(c, opts.minOccurrences),
+};
+
 /** Opt-in papercut auto-file (#421). See `autoFileClusterCategory` for the
  *  shared machinery and its totality/non-fatal contract. */
 export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps): Promise<void> {
@@ -683,4 +794,18 @@ export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps):
  *  see `buildCorrectionAutoFileBody` for the documented framing. */
 export async function autoFileCorrections(opts: AutoFileOpts, deps: AutoFileDeps): Promise<void> {
   return autoFileClusterCategory(opts, deps, CORRECTION_AUTO_FILE_CATEGORY);
+}
+
+/** Opt-in durable-run-blocker auto-file (#538, capability
+ *  `durable-run-blocker-auto-file`): reuses `autoFileClusterCategory`'s dedup,
+ *  rate-cap, sanitization, provenance, and cross-host reconciliation machinery
+ *  unchanged, keyed on `durable-run-blocker` clusters built from the
+ *  durable-loop store's ledgers instead of `.agent-pipeline/runs/` events.
+ *  Qualification is the OR-based rule from `qualifiesDurableRunBlocker`
+ *  (terminal stop OR recurs across >= minOccurrences distinct runs), not the
+ *  plain count threshold `autoFilePapercuts`/`autoFileCorrections` use.
+ *  Off/inert unless the caller gates it on `config.durable_runs.auto_file` —
+ *  see `pipeline.ts`. */
+export async function autoFileDurableRunBlockers(opts: AutoFileOpts, deps: AutoFileDeps): Promise<void> {
+  return autoFileClusterCategory(opts, deps, DURABLE_RUN_BLOCKER_AUTO_FILE_CATEGORY);
 }

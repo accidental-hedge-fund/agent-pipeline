@@ -91,6 +91,8 @@ import {
   reportPapercuts,
   papercutsEnabled,
   realPapercutDeps,
+  autoFileDurableRunBlockers,
+  realAutoFileDeps,
 } from "./stages/papercut.ts";
 import { runSweep, realSweepDeps } from "./stages/sweep.ts";
 import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
@@ -748,6 +750,24 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     store,
     observe: defaultReconcileObserveDeps(cfg),
     dispatchItem: realDispatchItem(cfg, input.engine),
+    // Opt-in durable-run-blocker auto-file (#538): best-effort, gated on
+    // resolved config, wrapped so a failure here can never alter the drive
+    // result (driveSupervisor's own onDriveEnd call site already swallows any
+    // throw — this catch is belt-and-braces).
+    onDriveEnd: cfg.durable_runs.auto_file
+      ? async () => {
+        await autoFileDurableRunBlockers(
+          {
+            repoDir: cfg.repo_dir,
+            domain: cfg.domain,
+            windowHours: cfg.durable_runs.auto_file_window_hours,
+            maxPerWindow: cfg.durable_runs.auto_file_max_per_window,
+            minOccurrences: cfg.durable_runs.auto_file_min_occurrences,
+          },
+          realAutoFileDeps(cfg.repo_dir),
+        ).catch(() => {});
+      }
+      : undefined,
   };
 
   try {

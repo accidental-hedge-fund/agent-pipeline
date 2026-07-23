@@ -70,6 +70,14 @@ export interface SupervisorDeps {
   store: LoopStoreDeps;
   observe: ReconcileObserveDeps;
   dispatchItem(request: LoopExecutionRequest): Promise<LoopExecutionResponse>;
+  /** Best-effort hook invoked once `driveSupervisor` reaches a terminal stop
+   *  or full completion — never on an outstanding pause/hold, since the run
+   *  is not yet done there (capability `durable-run-blocker-auto-file`, #538).
+   *  Any error this hook throws is caught and swallowed: it can never alter
+   *  the drive result, the released lock, or the run's outcome. Absent by
+   *  default — this module stays config/gh-free; the caller (e.g. `pipeline.ts`)
+   *  supplies the actual auto-file behavior. */
+  onDriveEnd?(result: DriveSupervisorResult): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -539,7 +547,15 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
       stop = newLedger.stop;
     }
 
-    return { runId: input.runId, cycles, stop, holdOutstanding, allDone, resumed: attach.resumed };
+    const result: DriveSupervisorResult = { runId: input.runId, cycles, stop, holdOutstanding, allDone, resumed: attach.resumed };
+    if ((stop || allDone) && deps.onDriveEnd) {
+      try {
+        await deps.onDriveEnd(result);
+      } catch {
+        // best-effort (#538) — must never alter the drive result
+      }
+    }
+    return result;
   } finally {
     await releaseLock(deps.store, input.runId, token);
   }

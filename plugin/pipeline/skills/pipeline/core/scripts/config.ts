@@ -441,6 +441,20 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Opt-in auto-file settings for recurring correction_event clusters (#500). Correction capture itself is unconditional (#499); this block only controls auto-filing."),
+  // Opt-in durable-run-blocker auto-file (#538, capability
+  // `durable-run-blocker-auto-file`). Unlike `papercuts`, typed blocker
+  // classification (#509) itself is unconditional — this block only gates
+  // auto-filing, mirroring `corrections`' shape with no capture-side `enabled` key.
+  durable_runs: z
+    .object({
+      auto_file: z.boolean().optional().describe("When true, automatically file pipeline:backlog issues for terminal or recurring durable-run-blocker clusters at durable-run terminal stop/completion."),
+      auto_file_window_hours: z.number().positive().optional().describe("Trailing window (hours) over which durable-run-blocker occurrences are clustered for auto-filing."),
+      auto_file_max_per_window: z.number().int().positive().optional().describe("Maximum number of issues auto-filed within the trailing window."),
+      auto_file_min_occurrences: z.number().int().min(2).optional().describe("Minimum cross-run recurrence count a non-terminal durable-run-blocker cluster must meet to be auto-filed (floor 2). A terminal stop always qualifies from a single occurrence."),
+    })
+    .strict()
+    .optional()
+    .describe("Opt-in auto-file settings for durable-run-blocker clusters (#538). Typed blocker classification (#509) itself is unconditional; this block only controls auto-filing."),
   // Optional override for the reviewer-role harness (#40). When set, the review
   // step invokes this CLI instead of the profile's default reviewer. An arbitrary
   // string (not an enum) because a custom reviewer CLI name is unconstrained;
@@ -1007,6 +1021,15 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         fileConfig.corrections?.auto_file_max_per_window ?? DEFAULT_CONFIG.corrections.auto_file_max_per_window,
       auto_file_min_occurrences:
         fileConfig.corrections?.auto_file_min_occurrences ?? DEFAULT_CONFIG.corrections.auto_file_min_occurrences,
+    },
+    durable_runs: {
+      auto_file: fileConfig.durable_runs?.auto_file ?? DEFAULT_CONFIG.durable_runs.auto_file,
+      auto_file_window_hours:
+        fileConfig.durable_runs?.auto_file_window_hours ?? DEFAULT_CONFIG.durable_runs.auto_file_window_hours,
+      auto_file_max_per_window:
+        fileConfig.durable_runs?.auto_file_max_per_window ?? DEFAULT_CONFIG.durable_runs.auto_file_max_per_window,
+      auto_file_min_occurrences:
+        fileConfig.durable_runs?.auto_file_min_occurrences ?? DEFAULT_CONFIG.durable_runs.auto_file_min_occurrences,
     },
     conventions_md_path: fileConfig.conventions_md_path,
     domain_name: fileConfig.domain_name,
@@ -1909,6 +1932,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
   const loopCfg = { ...d.loop, ...config.loop };
   const papercuts = { ...d.papercuts, ...config.papercuts };
   const corrections = { ...d.corrections, ...config.corrections };
+  const durableRuns = { ...d.durable_runs, ...config.durable_runs };
   const autoLoop = { ...d.auto_loop, ...config.auto_loop };
   const designGate = { ...d.design_gate, ...config.design_gate, limits: { ...d.design_gate.limits, ...config.design_gate?.limits } };
   const autoMergeEligibility = { ...d.auto_merge_eligibility, ...config.auto_merge_eligibility };
@@ -2113,6 +2137,16 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         `#   auto_file_window_hours: ${yamlScalar(corrections.auto_file_window_hours)} # ${sd("corrections.auto_file_window_hours", "trailing window (hours) over which correction_event records are clustered for auto-filing")}`,
         `#   auto_file_max_per_window: ${yamlScalar(corrections.auto_file_max_per_window)} # ${sd("corrections.auto_file_max_per_window", "maximum number of issues auto-filed within the trailing window")}`,
         `#   auto_file_min_occurrences: ${yamlScalar(corrections.auto_file_min_occurrences)} # ${sd("corrections.auto_file_min_occurrences", "minimum in-window distinct-occurrence count a correction cluster must meet to be auto-filed (floor 2)")}`,
+      ].join("\n"),
+    "",
+    config.durable_runs !== undefined
+      ? `durable_runs: # opt-in durable-run-blocker auto-file (#538) — typed blocker classification (#509) is unconditional; this only gates auto-filing\n${yamlBlock(config.durable_runs, 2)}`
+      : [
+        "# durable_runs: # opt-in durable-run-blocker auto-file (#538) — uncomment to auto-file terminal or recurring durable-run-blocker clusters at durable-run terminal stop/completion",
+        `#   auto_file: false # ${sd("durable_runs.auto_file", "opt in to auto-file pipeline:backlog issues for terminal or recurring durable-run-blocker clusters. Milestone assignment stays human — the report only suggests one.")}`,
+        `#   auto_file_window_hours: ${yamlScalar(durableRuns.auto_file_window_hours)} # ${sd("durable_runs.auto_file_window_hours", "trailing window (hours) over which durable-run-blocker occurrences are clustered for auto-filing")}`,
+        `#   auto_file_max_per_window: ${yamlScalar(durableRuns.auto_file_max_per_window)} # ${sd("durable_runs.auto_file_max_per_window", "maximum number of issues auto-filed within the trailing window")}`,
+        `#   auto_file_min_occurrences: ${yamlScalar(durableRuns.auto_file_min_occurrences)} # ${sd("durable_runs.auto_file_min_occurrences", "minimum cross-run recurrence count a non-terminal durable-run-blocker cluster must meet to be auto-filed (floor 2); a terminal stop always qualifies from a single occurrence")}`,
       ].join("\n"),
     "",
     config.auto_loop !== undefined
@@ -2344,6 +2378,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     loop: { ...d.loop, ...config.loop },
     papercuts: { ...d.papercuts, ...config.papercuts },
     corrections: { ...d.corrections, ...config.corrections },
+    durable_runs: { ...d.durable_runs, ...config.durable_runs },
     setup_command: config.setup_command,
     build_command: config.build_command,
     conventions_md_path: config.conventions_md_path,

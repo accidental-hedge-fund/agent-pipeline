@@ -13,9 +13,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { homedir } from "node:os";
 import {
+  isDurableBlockerClass,
   LOOP_CONTRACT_SCHEMA,
   LOOP_LEDGER_SCHEMA,
   LoopError,
+  type DurableBlockerClass,
   type LoopActionEvidence,
   type LoopAuthorityAmendment,
   type LoopContract,
@@ -24,6 +26,7 @@ import {
   type LoopHumanInputRequest,
   type LoopLedger,
   type LoopLockRecord,
+  type LoopStopRecord,
   type LoopSupervisorProcess,
 } from "./types.ts";
 
@@ -300,6 +303,94 @@ export async function readEvents(deps: LoopStoreDeps, runId: string) {
 
 export async function readDecisions(deps: LoopStoreDeps, runId: string) {
   return readLog(deps, decisionsPath(runDir(deps, runId)));
+}
+
+// ---------------------------------------------------------------------------
+// Durable-run-blocker evidence projection (#538) — read-only, zero writes,
+// zero lock. A distinct evidence source from `runsDir()`/events.jsonl in
+// `improve.ts`: this reads the durable-loop store's own ledgers under the
+// loop state home, not `.agent-pipeline/runs/`.
+// ---------------------------------------------------------------------------
+
+/** One durable-run-blocker occurrence — an item's current typed blocker
+ *  classification as recorded in a run's ledger, projected for the
+ *  `durable-run-blocker` improve-cluster category (capability
+ *  `durable-run-blocker-auto-file`). `terminal` is true when this run's
+ *  {@link LoopStopRecord} is attributable to this exact item — a terminal
+ *  stop with a different or absent `item_id` never marks an unrelated
+ *  item's occurrence as terminal. */
+export interface DurableBlockerOccurrence {
+  runId: string;
+  itemId: string;
+  blockerClass: DurableBlockerClass;
+  fingerprint: string;
+  /** Raw (unsanitized) evidence excerpt from the item's most recent `blocked`
+   *  history entry — callers MUST sanitize before rendering or filing. */
+  evidenceExcerpt: string;
+  /** ISO-8601 timestamp of the history entry the evidence excerpt was drawn
+   *  from — used by callers for trailing-window filtering of non-terminal
+   *  occurrences. */
+  time: string;
+  terminal: boolean;
+  /** ISO-8601 timestamp of the {@link LoopStopRecord} when `terminal` is true
+   *  (undefined otherwise) — callers MUST filter a terminal occurrence's
+   *  trailing window against this timestamp, not `time`: `time` is the
+   *  underlying `blocked` history entry, which can predate the window even
+   *  when the terminal stop itself just happened (#538 review 2 finding
+   *  c5457eee500bcb8d). */
+  terminalTime?: string;
+}
+
+/** Enumerates every durable-run ledger under the loop state home and
+ *  projects each item currently (or most recently) carrying a typed
+ *  {@link DurableBlockerClass} into a {@link DurableBlockerOccurrence}.
+ *  Read-only: acquires no lock, writes no ledger, appends no event. A single
+ *  unreadable or malformed ledger is skipped rather than aborting the whole
+ *  projection — one corrupt run must never hide every other run's evidence. */
+export async function readDurableRunBlockerOccurrences(
+  deps: Pick<LoopStoreDeps, "listDir" | "readTextFile" | "env" | "hostname">,
+): Promise<DurableBlockerOccurrence[]> {
+  const root = path.join(resolveStateHome(deps), "runs");
+  let runIds: string[];
+  try {
+    runIds = [...new Set(await deps.listDir(root))];
+  } catch {
+    return []; // no runs root (e.g. pipeline:loop never ran on this host) — no durable evidence, not fatal
+  }
+  const out: DurableBlockerOccurrence[] = [];
+
+  for (const runId of runIds) {
+    try {
+      const text = await deps.readTextFile(ledgerPath(path.join(root, runId)));
+      if (!text) continue;
+      const ledger = JSON.parse(text) as LoopLedger;
+      const stop: LoopStopRecord | null = ledger.stop ?? null;
+
+      for (const [itemId, item] of Object.entries(ledger.items ?? {})) {
+        if (!item.blocked_theme || !isDurableBlockerClass(item.blocked_theme) || !item.evidence_fingerprint) continue;
+
+        const historyEntry = [...(item.history ?? [])]
+          .reverse()
+          .find((h) => h.to === "blocked" && h.theme === item.blocked_theme);
+
+        const terminal = !!stop && stop.item_id === itemId;
+        out.push({
+          runId,
+          itemId,
+          blockerClass: item.blocked_theme,
+          fingerprint: item.evidence_fingerprint,
+          evidenceExcerpt: historyEntry?.evidence ?? "",
+          time: historyEntry?.time ?? "",
+          terminal,
+          terminalTime: terminal ? stop!.time : undefined,
+        });
+      }
+    } catch {
+      continue; // unreadable/malformed ledger — skip, never fatal
+    }
+  }
+
+  return out;
 }
 
 // ---------------------------------------------------------------------------
