@@ -91,7 +91,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline config repo-map <add|remove|list>  add/remove/list repo_map entries in .github/pipeline.yml
 /pipeline refine-spec --title "<t>" --body "<b>"  refine existing issue spec; non-mutating JSON output
 /pipeline queue                          batch factory: dispatch all pipeline:ready issues up to limits
-/pipeline:loop --milestone v2            canonical durable multi-item run — delegates to the installed goal-loop skill
+/pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor
 /pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
 /pipeline:loop --audit                   read-only report for the run; no writes
 /pipeline evals plan <manifest.json>     expand + persist an experiment's run plan; invokes no harness, creates no worktree
@@ -117,18 +117,23 @@ resolved to their linked closing issue (the pipeline is issue-centric). PRs
 without a `Closes #N` reference are refused with an explanation.
 
 `/pipeline:loop` is the canonical command for a **durable** multi-item run —
-one that is expected to span sessions or engines. It is a thin facade: it runs
-a deterministic, read-only preflight in this skill (argument normalization,
-`loop:contract-coherence`, native-`/goal` capability), then delegates the
-actual durable run — selection, contract, ledger, lock, recovery,
-reconciliation, resume — to the separately installed **goal-loop** skill. It
-never sets a stage label or merges itself; every selected item still executes
-through this skill's own state machine and evidence gates. It refuses to start
-(with zero external mutation) when goal-loop is missing or its contract/ledger
-schema ids are outside this skill's supported set, or when the engine's
-built-in autonomous `/goal` mode is unavailable — there is no non-durable
-fallback loop. `/goal-loop` remains a fully functional, undeprecated alias for
-the same runs.
+one that is expected to span sessions or engines. It runs a deterministic,
+read-only preflight in this skill (argument normalization,
+`loop:store-schema-compatibility`, native-`/goal` capability), then drives the
+run — contract, ledger, lock, recovery, reconciliation, resume — entirely
+in-repo through this skill's own durable loop supervisor. It never discovers,
+requires, or invokes an externally installed goal-loop skill, and it never
+sets a stage label or merges itself; every selected item still executes
+through this skill's own state machine and evidence gates via the
+`pipeline/loop-execution@1` hand-off contract. It refuses to start (with zero
+durable writes) when the engine's built-in autonomous `/goal` mode is
+unavailable — there is no non-durable fallback loop. `--resume <run-id>`
+takes over a run whose prior supervisor is provably gone; a run whose
+supervisor is still alive is refused rather than double-driven. `--audit`
+renders the run's process identity, action-evidence timeline, and
+watchdog/no-progress state with zero durable writes. A pre-existing run
+created by a legacy goal-loop invocation remains addressable by `--resume
+<run-id>` (read-only import).
 
 The native-`/goal` check never treats an absent marker in `claude --help` as
 evidence the capability is missing (`/goal` is a slash command, not a CLI

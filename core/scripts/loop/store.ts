@@ -16,6 +16,7 @@ import {
   LOOP_CONTRACT_SCHEMA,
   LOOP_LEDGER_SCHEMA,
   LoopError,
+  type LoopActionEvidence,
   type LoopAuthorityAmendment,
   type LoopContract,
   type LoopDecision,
@@ -23,6 +24,7 @@ import {
   type LoopHumanInputRequest,
   type LoopLedger,
   type LoopLockRecord,
+  type LoopSupervisorProcess,
 } from "./types.ts";
 
 export const PIPELINE_STATE_HOME_ENV = "AGENT_PIPELINE_STATE_HOME";
@@ -127,6 +129,12 @@ function eventsPath(dir: string): string {
 }
 function decisionsPath(dir: string): string {
   return path.join(dir, "decisions.jsonl");
+}
+function supervisorPath(dir: string): string {
+  return path.join(dir, "supervisor.json");
+}
+function actionEvidencePath(dir: string): string {
+  return path.join(dir, "action-evidence.jsonl");
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +303,67 @@ export async function readDecisions(deps: LoopStoreDeps, runId: string) {
 }
 
 // ---------------------------------------------------------------------------
+// Supervisor process identity (#512, capability `durable-loop-supervisor`) —
+// a distinct atomic-write document from lock.json (design.md decision 1).
+// ---------------------------------------------------------------------------
+
+/** Writes (or overwrites) the run's process-identity record. Requires the
+ *  current lock holder's token, mirroring {@link writeLedger} — the record
+ *  can only be written by whoever currently holds the run. */
+export async function writeSupervisorProcess(
+  deps: LoopStoreDeps,
+  record: LoopSupervisorProcess,
+  token: string,
+): Promise<void> {
+  await requireToken(deps, record.run_id, token);
+  const dir = runDir(deps, record.run_id);
+  await deps.writeFileAtomic(supervisorPath(dir), JSON.stringify(record, null, 2));
+}
+
+/** Reads the run's process-identity record. Returns null when absent — a
+ *  pre-#512 run, or a run no supervisor has ever attached to. */
+export async function readSupervisorProcess(deps: LoopStoreDeps, runId: string): Promise<LoopSupervisorProcess | null> {
+  const text = await deps.readTextFile(supervisorPath(runDir(deps, runId)));
+  return text ? (JSON.parse(text) as LoopSupervisorProcess) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Action-evidence trail (#512) — append-only, token-guarded, mirroring
+// appendEvent/readLog. Entries carry their own seq/time (unlike LoopEvent),
+// so this uses the same nextSeq/appendQueues serialization directly rather
+// than wrapping appendLog's {seq,time,kind,data} envelope.
+// ---------------------------------------------------------------------------
+
+export async function appendActionEvidence(
+  deps: LoopStoreDeps,
+  runId: string,
+  token: string,
+  entry: Omit<LoopActionEvidence, "seq" | "time">,
+): Promise<LoopActionEvidence> {
+  await requireToken(deps, runId, token);
+  const logPath = actionEvidencePath(runDir(deps, runId));
+  const prior = appendQueues.get(logPath) ?? Promise.resolve();
+  const task = prior.catch(() => {}).then(async () => {
+    const seq = await nextSeq(deps, logPath);
+    const record: LoopActionEvidence = { seq, time: deps.now().toISOString(), ...entry };
+    await deps.appendLine(logPath, JSON.stringify(record));
+    nextSeqCache.set(logPath, seq + 1);
+    return record;
+  });
+  appendQueues.set(logPath, task);
+  return task;
+}
+
+export async function readActionEvidence(deps: LoopStoreDeps, runId: string): Promise<LoopActionEvidence[]> {
+  const text = await deps.readTextFile(actionEvidencePath(runDir(deps, runId)));
+  if (!text) return [];
+  return text
+    .split("\n")
+    .filter((l) => l.length > 0)
+    .map((l) => JSON.parse(l) as LoopActionEvidence);
+}
+
+// ---------------------------------------------------------------------------
 // Locking
 // ---------------------------------------------------------------------------
 
@@ -420,6 +489,13 @@ export interface LoopStatus {
   outstanding_requests: Record<string, LoopHumanInputRequest>;
   /** Every audited scoped authority amendment recorded on this run. */
   authority_amendments: LoopAuthorityAmendment[];
+  /** The supervisor's process identity, when one has ever attached — null for
+   *  a pre-#512 run or one no supervisor has driven yet. */
+  supervisor: LoopSupervisorProcess | null;
+  /** The full append-only action-evidence timeline, in order. */
+  action_evidence: LoopActionEvidence[];
+  /** The watchdog's current consecutive-no-progress count — 0 when absent. */
+  consecutive_no_progress: number;
 }
 
 const ACTIVE_STATES = new Set(["in_progress"]);
@@ -430,6 +506,8 @@ export async function getStatus(deps: LoopStoreDeps, runId: string): Promise<Loo
   const lock = await readLock(deps, runId);
   const staleness = lock ? await classifyStaleness(deps, lock) : null;
   const events = await readEvents(deps, runId);
+  const supervisor = await readSupervisorProcess(deps, runId);
+  const action_evidence = await readActionEvidence(deps, runId);
 
   const items: Record<string, { state: string }> = {};
   const active: string[] = [];
@@ -456,6 +534,9 @@ export async function getStatus(deps: LoopStoreDeps, runId: string): Promise<Loo
     event_count: events.length,
     outstanding_requests,
     authority_amendments: ledger.authority_amendments ?? [],
+    supervisor,
+    action_evidence,
+    consecutive_no_progress: supervisor?.consecutive_no_progress ?? 0,
   };
 }
 

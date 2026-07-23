@@ -111,25 +111,31 @@ test("goalLoopDiscoveryRoots — codex engine only discovers the Codex store (pl
   assert.match(roots[0], /\.codex[/\\]skills[/\\]goal-loop$/);
 });
 
-test("runLoopPreflight — codex engine does not fall back to a stale Claude-only install", async () => {
-  // A compatible install exists ONLY under the Claude root; the active engine is codex.
-  // Per finding 1, this must fail closed (goal-loop undiscoverable for codex) rather
-  // than silently validating the unrelated Claude install.
+test("runLoopPreflight — codex engine needs no goal-loop install of any kind, Claude-only or otherwise (#512)", async () => {
+  // The run-start preflight no longer discovers an external goal-loop skill at all
+  // (#512, capability durable-loop-supervisor): a Claude-only install being present is
+  // simply irrelevant — the codex-engine preflight must still pass on its own merits.
   const env = { CLAUDE_CONFIG_DIR: "/home/user/.claude", CODEX_HOME: "/home/user/.codex" } as NodeJS.ProcessEnv;
   const claudeRoot = "/home/user/.claude/skills/goal-loop";
+  let goalLoopPathTouched = false;
   const deps = fakeDeps({
-    fsExists: (p) => p === `${claudeRoot}/.goal-loop-manifest.json`,
+    fsExists: (p) => {
+      if (p.includes("goal-loop")) goalLoopPathTouched = true;
+      return p === `${claudeRoot}/.goal-loop-manifest.json`;
+    },
     readTextFile: (p) => {
+      if (p.includes("goal-loop")) goalLoopPathTouched = true;
       if (p === `${claudeRoot}/.goal-loop-manifest.json`) return MANIFEST_OK;
       if (p === `${claudeRoot}/state.py`) return STATE_PY_OK;
       return null;
     },
+    exec: () => ({ ok: true, stdout: "/goal autonomous mode", stderr: "" }),
   });
   const codexRoots = goalLoopDiscoveryRoots("codex", env);
   assert.ok(!codexRoots.includes(claudeRoot), "codex-scoped roots must not include the Claude store");
   const outcome = await runLoopPreflight({ milestone: "v2" }, "codex", deps, codexRoots);
-  assert.equal(outcome.ok, false);
-  if (!outcome.ok) assert.equal(outcome.failedCheck, "loop:contract-coherence");
+  assert.equal(outcome.ok, true);
+  assert.equal(goalLoopPathTouched, false, "the run-start preflight must never touch a goal-loop install path");
 });
 
 // ---------------------------------------------------------------------------
@@ -539,22 +545,21 @@ test("runLoopPreflight — invalid args short-circuit before any check runs (zer
   assert.equal(calls, 0, "no I/O primitive should be invoked when argument normalization fails");
 });
 
-test("runLoopPreflight — contract-coherence failure short-circuits before the native-goal check", async () => {
+test("runLoopPreflight — a host with no goal-loop skill installed at any root still starts (#512 task 6.8)", async () => {
   let nativeGoalCalled = false;
   const deps = fakeDeps({
     exec: () => {
       nativeGoalCalled = true;
       return { ok: true, stdout: "/goal", stderr: "" };
     },
-    fsExists: () => false, // goal-loop undiscoverable
+    fsExists: () => false, // no goal-loop skill installed at any root — irrelevant now
   });
   const outcome = await runLoopPreflight({ milestone: "v2" }, "claude", deps, ROOTS);
-  assert.equal(outcome.ok, false);
-  if (!outcome.ok) assert.equal(outcome.failedCheck, "loop:contract-coherence");
-  assert.equal(nativeGoalCalled, false, "native-goal must not run once contract-coherence has failed");
+  assert.equal(outcome.ok, true, "the run-start preflight must not require an installed goal-loop skill");
+  assert.equal(nativeGoalCalled, true, "the native-goal check still runs — only goal-loop discovery is retired");
 });
 
-test("runLoopPreflight — native-goal failure reported after a passing contract-coherence check", async () => {
+test("runLoopPreflight — native-goal failure reported after a passing schema-compatibility check", async () => {
   const deps = compatibleDeps({ exec: () => ({ ok: true, stdout: "no autonomous mode here", stderr: "" }) });
   const outcome = await runLoopPreflight({ milestone: "v2" }, "codex", deps, ROOTS);
   assert.equal(outcome.ok, false);

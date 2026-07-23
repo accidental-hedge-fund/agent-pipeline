@@ -20,6 +20,7 @@
 import * as path from "node:path";
 import { homedir } from "node:os";
 import type { CheckResult, DoctorDeps } from "./stages/doctor.ts";
+import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA } from "./loop/types.ts";
 
 // ---------------------------------------------------------------------------
 // Supported goal-loop contract/ledger schema ids (#451 — the "supported set").
@@ -156,6 +157,36 @@ export async function checkLoopContractCoherence(
   }
 
   return pass(`goal-loop v${manifest.version} at ${root} implements ${contractSchema} / ${ledgerSchema}`);
+}
+
+// ---------------------------------------------------------------------------
+// In-repo durable loop store schema-compatibility check (#512, capability
+// `durable-loop-supervisor`, design.md decision 6). Replaces the run-start
+// preflight's former `loop:contract-coherence` external goal-loop discovery:
+// the in-repo durable loop store is now the sole authoritative engine, so
+// the run-start gate is a self-check that this build's own contract/ledger
+// schema constants are well-formed — never a discovery of, or dependency on,
+// an externally installed goal-loop skill. checkLoopContractCoherence /
+// discoverGoalLoop above are retained only for `pipeline doctor` and the
+// installer, which still support the legacy external-skill install
+// independently of the loop run-start path.
+// ---------------------------------------------------------------------------
+
+const SCHEMA_ID_RE = /^[a-z0-9/_-]+@\d+$/i;
+
+/** `loop:store-schema-compatibility`: verifies this build's own durable loop
+ *  store contract/ledger schema ids are well-formed — always passes for a
+ *  healthy build. Performs no filesystem, network, or subprocess access and
+ *  discovers no external install, so the run-start preflight never fails for
+ *  a host with no goal-loop skill installed at any root. */
+export function checkLoopStoreSchemaCompatibility(): CheckResult {
+  if (!SCHEMA_ID_RE.test(LOOP_CONTRACT_SCHEMA) || !SCHEMA_ID_RE.test(LOOP_LEDGER_SCHEMA)) {
+    return fail(
+      `the in-repo durable loop store's schema ids are malformed (${LOOP_CONTRACT_SCHEMA} / ${LOOP_LEDGER_SCHEMA})`,
+      "This indicates a corrupted Agent Pipeline install — reinstall the pipeline skill.",
+    );
+  }
+  return pass(`in-repo durable loop store implements ${LOOP_CONTRACT_SCHEMA} / ${LOOP_LEDGER_SCHEMA}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +447,7 @@ export function normalizeLoopArgs(raw: RawLoopArgs): LoopArgs {
 
 export type LoopPreflightOutcome =
   | { ok: true; args: LoopArgs }
-  | { ok: false; failedCheck: "args" | "loop:contract-coherence" | "native-goal"; detail: string; remediation?: string };
+  | { ok: false; failedCheck: "args" | "loop:store-schema-compatibility" | "native-goal"; detail: string; remediation?: string };
 
 export async function runLoopPreflight(
   raw: RawLoopArgs,
@@ -432,13 +463,13 @@ export async function runLoopPreflight(
     return { ok: false, failedCheck: "args", detail: (err as Error).message };
   }
 
-  const coherence = await checkLoopContractCoherence(deps, roots);
-  if (coherence.status === "fail") {
+  const schemaCompat = checkLoopStoreSchemaCompatibility();
+  if (schemaCompat.status === "fail") {
     return {
       ok: false,
-      failedCheck: "loop:contract-coherence",
-      detail: coherence.detail,
-      remediation: coherence.remediation,
+      failedCheck: "loop:store-schema-compatibility",
+      detail: schemaCompat.detail,
+      remediation: schemaCompat.remediation,
     };
   }
 

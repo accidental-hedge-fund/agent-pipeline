@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 import * as path from "node:path";
 import { writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
+import * as crypto from "node:crypto";
 import { Command, Option } from "commander";
 import { resolveConfig, resolveReleaseConfig, resolveLoopNativeGoalAttestation, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig, repoMapAdd, repoMapRemove, repoMapList, type RepoMapRelation } from "./config.ts";
 import { ensureArtifactIgnoreBlock } from "./artifact-ignore.ts";
@@ -128,7 +129,13 @@ import {
   storePreflightResult,
   type PreflightResult,
 } from "./stages/doctor.ts";
-import { runLoopPreflight, type LoopEngine, type LoopPreflightOutcome, type RawLoopArgs, type NativeGoalAttestation } from "./loop-preflight.ts";
+import { runLoopPreflight, type LoopEngine, type LoopPreflightOutcome, type LoopSelector, type RawLoopArgs, type NativeGoalAttestation } from "./loop-preflight.ts";
+import { auditSupervisor, driveSupervisor, type SupervisorDeps } from "./loop/supervisor.ts";
+import { defaultLoopStoreDeps, runExists as loopRunExists } from "./loop/store.ts";
+import { initRecoverableRun } from "./loop/recovery.ts";
+import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
+import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type LoopLedger } from "./loop/types.ts";
+import { LOOP_EXECUTION_CONTRACT_SCHEMA, normalizeLoopOutcome, type LoopExecutionRequest, type LoopExecutionResponse } from "./loop-execution-contract.ts";
 import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
   LABEL_PREFIX,
@@ -446,21 +453,219 @@ export function buildCmd(): Command {
   return cmd;
 }
 
-/** IO seam for {@link runLoopCommand} — the same DoctorDeps-shaped preflight
- *  used by `pipeline doctor` and the installer (design.md decision 4: one
- *  implementation, no divergent copies). */
-export interface LoopCliDeps {
-  runLoopPreflight: typeof runLoopPreflight;
+/** Derives a deterministic run id for an explicit issue-number selector
+ *  (`--range` or a bare issue list) — the only selector the in-repo compiler
+ *  below resolves without a GitHub query. Stable across repeated invocations
+ *  of the same list so a second `pipeline loop 100 101` naturally resumes the
+ *  same run instead of creating a duplicate. */
+export function workListRunId(repo: string, engine: LoopEngine, issues: readonly string[]): string {
+  const hash = crypto.createHash("sha256").update(`${repo}:${engine}:${issues.join(",")}`).digest("hex").slice(0, 16);
+  return `loop-${hash}`;
 }
 
-const defaultLoopCliDeps: LoopCliDeps = { runLoopPreflight };
+/** Compiles a `LoopContractInit` + seeded `LoopLedger` for an explicit
+ *  issue-number selector — each item independent (no fabricated
+ *  dependencies), executed in list order by the supervisor's single-active-item
+ *  invariant. Milestone/label/roadmap-slice selectors require resolving a
+ *  GitHub query into an issue list, which is not yet implemented in-repo (see
+ *  `runLoopCommand`'s explicit refusal for those selector types). */
+export function compileWorkListRun(
+  cfg: PipelineConfig,
+  engine: LoopEngine,
+  issues: readonly string[],
+  runId: string,
+): { contract: import("./loop/recovery.ts").LoopContractInit; ledger: LoopLedger } {
+  const contract: import("./loop/recovery.ts").LoopContractInit = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: runId,
+    engine,
+    repo: { name: cfg.repo, base_branch: cfg.base_branch },
+    selector: { type: "work-list", value: issues },
+    objective: `advance ${issues.join(", ")} to pipeline:ready-to-deploy`,
+    worktree_policy: "default",
+    done_definition: "pipeline:ready-to-deploy",
+    authority_grants: [],
+    recovery_budgets: { default: 3 },
+    consecutive_blocked_limit: 3,
+    verification: null,
+    report_format: "markdown",
+    ordering: "dependency_sequential",
+    max_active_items: 1,
+    concurrency_model: "exclusive_lock_single_engine",
+    items: issues.map((id) => ({ id, depends_on: [] })),
+    canonical_hash: runId,
+  };
+  const ledger: LoopLedger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: runId,
+    items: Object.fromEntries(
+      issues.map((id) => [id, { id, state: "pending" as const, history: [], recovery_budgets_remaining: { default: 3 } }]),
+    ),
+    consecutive_blocked: 0,
+    merge_barrier: null,
+    stop: null,
+    last_native_goal_check: null,
+    last_reconciliation: null,
+    reconciliation_sequence: 0,
+    recovery_attempts: [],
+    authority_amendments: [],
+  };
+  return { contract, ledger };
+}
 
-/** `pipeline loop ...` (#451): normalize arguments, run the deterministic
- *  loop:contract-coherence + native-/goal checks, and — on success — print the
- *  compiled selector as JSON for the calling agent to hand off to the
- *  installed goal-loop skill (see each host's SKILL.md). Every failure path
- *  exits non-zero with remediation and performs zero external mutation: no gh
- *  call, no lock, no ledger write, no worktree or branch creation. */
+/** The real `pipeline/loop-execution@1` dispatch seam: runs the per-item
+ *  advance loop for `item_id` to completion as a synchronous child process
+ *  (never the external goal-loop skill), then maps the issue's final label
+ *  state to a terminal outcome. Injected so unit tests never spawn a real
+ *  process. */
+export function realDispatchItem(cfg: PipelineConfig, engine: LoopEngine): SupervisorDeps["dispatchItem"] {
+  return async (request: LoopExecutionRequest): Promise<LoopExecutionResponse> => {
+    const issueNumber = Number(request.item_id);
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        [fileURLToPath(import.meta.url), String(issueNumber), "--profile", engine, "--repo-path", cfg.repo_dir, "--once"],
+        { stdio: "inherit" },
+      );
+      child.on("error", reject);
+      child.on("exit", () => resolve());
+    });
+
+    let outcome: LoopExecutionResponse["outcome"] = "failed";
+    let prNumber: number | null = null;
+    try {
+      const detail = await getIssueDetail(cfg, issueNumber);
+      const readyLabel = `${LABEL_PREFIX}ready-to-deploy`;
+      const blockedLabel = `${LABEL_PREFIX}blocked`;
+      if (detail.labels.includes(readyLabel)) {
+        outcome = "ready_to_deploy";
+      } else if (detail.labels.includes(blockedLabel)) {
+        outcome = "blocked_needs_human";
+      } else if (detail.state === "closed") {
+        outcome = "abandoned";
+      } else {
+        outcome = "failed";
+      }
+      const pr = await getPrForIssue(cfg, issueNumber).catch(() => null);
+      prNumber = pr ?? null;
+    } catch {
+      outcome = "failed";
+    }
+
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: normalizeLoopOutcome(outcome),
+      evidence: { pr_number: prNumber, pipeline_run_id: `pipeline-loop-${request.run_id}-${request.item_id}` },
+    };
+  };
+}
+
+export interface RunLoopEngineInput {
+  engine: LoopEngine;
+  selector?: LoopSelector;
+  resumeRunId?: string;
+  audit: boolean;
+  repoDir: string;
+}
+
+export type LoopEngineResult =
+  | { kind: "audit"; report: Awaited<ReturnType<typeof auditSupervisor>> }
+  | { kind: "drive"; result: Awaited<ReturnType<typeof driveSupervisor>> }
+  | { kind: "error"; message: string };
+
+/** Drives (or audits) the in-repo supervisor for an already-passed preflight —
+ *  the replacement for the former external-skill delegation payload (#512).
+ *  `--audit` performs zero durable writes (it never resolves gh config); a
+ *  fresh start or `--resume` resolves `PipelineConfig` and drives the
+ *  supervisor through the real store/observe/dispatch seams. */
+async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngineResult> {
+  const store = defaultLoopStoreDeps();
+
+  if (input.audit) {
+    if (!input.resumeRunId) {
+      return {
+        kind: "error",
+        message:
+          "pipeline loop --audit requires --resume <run-id> naming the run to audit " +
+          "(canonical run resolution without an explicit id is not yet supported)",
+      };
+    }
+    try {
+      const report = await auditSupervisor(store, input.resumeRunId);
+      return { kind: "audit", report };
+    } catch (err) {
+      return { kind: "error", message: (err as Error).message };
+    }
+  }
+
+  let cfg: PipelineConfig;
+  try {
+    cfg = resolveConfig({ repoPath: input.repoDir, profile: input.engine });
+  } catch (err) {
+    return { kind: "error", message: `config error: ${(err as Error).message}` };
+  }
+
+  let runId: string;
+  if (input.resumeRunId) {
+    runId = input.resumeRunId;
+  } else if (input.selector) {
+    if (input.selector.type !== "work-list") {
+      return {
+        kind: "error",
+        message:
+          `the in-repo supervisor does not yet compile a "${input.selector.type}" selector into a run — ` +
+          `pass explicit issue numbers (or --range) until milestone/label/roadmap-slice resolution is implemented`,
+      };
+    }
+    const issues = input.selector.value;
+    runId = workListRunId(cfg.repo, input.engine, issues);
+    if (!(await loopRunExists(store, runId))) {
+      const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, runId);
+      await initRecoverableRun(store, contract, ledger);
+    }
+  } else {
+    return { kind: "error", message: "no selector or --resume run id was provided" };
+  }
+
+  const supervisorDeps: SupervisorDeps = {
+    store,
+    observe: defaultReconcileObserveDeps(cfg),
+    dispatchItem: realDispatchItem(cfg, input.engine),
+  };
+
+  try {
+    const result = await driveSupervisor(supervisorDeps, {
+      runId,
+      engine: input.engine as LoopEngineName,
+      resume: !!input.resumeRunId,
+    });
+    return { kind: "drive", result };
+  } catch (err) {
+    return { kind: "error", message: (err as Error).message };
+  }
+}
+
+/** IO seam for {@link runLoopCommand}: the same DoctorDeps-shaped preflight
+ *  used by `pipeline doctor` and the installer (design.md decision 4: one
+ *  implementation, no divergent copies), plus the supervisor drive/audit
+ *  entry point — injected so unit tests exercise the whole command with no
+ *  real gh/filesystem/subprocess access. */
+export interface LoopCliDeps {
+  runLoopPreflight: typeof runLoopPreflight;
+  runLoopEngine: (input: RunLoopEngineInput) => Promise<LoopEngineResult>;
+}
+
+const defaultLoopCliDeps: LoopCliDeps = { runLoopPreflight, runLoopEngine: defaultRunLoopEngine };
+
+/** `pipeline loop ...` (#512): normalize arguments, run the deterministic
+ *  loop:store-schema-compatibility + native-/goal preflight checks, and — on
+ *  success — drive (or resume) the in-repo durable loop supervisor, or render
+ *  its read-only audit report. Replaces the former external-skill delegation
+ *  payload: the loop path never discovers, requires, or invokes an installed
+ *  goal-loop skill. Every preflight failure path exits non-zero with
+ *  remediation and performs zero external mutation. */
 export async function runLoopCommand(
   opts: CliOpts,
   positionalIssues: string[],
@@ -479,7 +684,7 @@ export async function runLoopCommand(
 
   // Read only the loop.native_goal_attestation key, gh-free (design.md
   // decision 4) — resolveLoopNativeGoalAttestation never shells out, unlike
-  // resolveConfig(), so this command stays zero-gh-call on every path.
+  // resolveConfig(), so the preflight stays zero-gh-call on every path.
   const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
   const repoDir = findGitRoot(startDir) ?? startDir;
   let attestation: NativeGoalAttestation;
@@ -499,16 +704,39 @@ export async function runLoopCommand(
     return;
   }
 
+  const engineResult = await deps.runLoopEngine({
+    engine,
+    selector: outcome.args.selector,
+    resumeRunId: outcome.args.resumeRunId,
+    audit: outcome.args.audit,
+    repoDir,
+  });
+
+  if (engineResult.kind === "error") {
+    console.error(`pipeline loop: ${engineResult.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (engineResult.kind === "audit") {
+    console.log(JSON.stringify({ schema_version: "1", engine, ...engineResult.report }));
+    process.exitCode = 0;
+    return;
+  }
+
   console.log(
     JSON.stringify({
       schema_version: "1",
       engine,
-      selector: outcome.args.selector ?? null,
-      resume_run_id: outcome.args.resumeRunId ?? null,
-      audit: outcome.args.audit,
+      run_id: engineResult.result.runId,
+      cycles: engineResult.result.cycles,
+      stop: engineResult.result.stop,
+      hold_outstanding: engineResult.result.holdOutstanding,
+      all_done: engineResult.result.allDone,
+      resumed: engineResult.result.resumed,
     }),
   );
-  process.exitCode = 0;
+  process.exitCode = engineResult.result.stop || engineResult.result.holdOutstanding ? 1 : 0;
 }
 
 async function main(): Promise<void> {
