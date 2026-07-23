@@ -541,6 +541,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.21.0** ✅ shipped | minor | Durable goal orchestration behind pipeline:loop | #451 | Shipped 2026-07-21 (tag `v1.21.0`). See **Shipped** above for the per-PR detail. |
 | **v1.22.0** ✅ shipped | minor | Factory robustness: fix-stage recovery, gate/installer/worktree hardening, structured fix outcomes | #486, #484, #485, #450, #443, #472, #473, #506 | Shipped 2026-07-22 (tag `v1.22.0`). See **Shipped** above for the per-PR detail. |
 | **v1.23.0** ✅ shipped | minor | Review-quality context: bounded delta rounds, immutable resolved-finding evidence, PR-visible visual artifacts | #483, #496, #463 | Shipped 2026-07-23 (tag `v1.23.0`). See **Shipped** above for the per-PR detail. |
+| **v1.24.0** | minor | Factory hygiene: release-discovery tolerance + cross-host auto-file serialization | #498, #459 | Release PR discovery tolerates non-PR commits whose subjects end in an issue reference (#498); improve auto-file dedup/rate-cap is safe across concurrent hosts, with cap reconciliation scoped strictly to auto-filed issues (#459). |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
