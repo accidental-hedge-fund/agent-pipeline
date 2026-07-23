@@ -128,10 +128,17 @@ function collectExternalDependencyIds(contract: LoopContract): string[] {
   return [...ids];
 }
 
+/** A canonical GitHub issue id: plain decimal digits, no leading zero, no sign, no exponent, no
+ *  radix prefix, no surrounding whitespace. `Number(id)` alone accepts all of those (e.g. "1e3",
+ *  "0x10", "2.0") as if they were a different issue's number — this regex is the fail-closed gate
+ *  in front of it, so a non-canonical id is verified against no issue rather than the wrong one. */
+const CANONICAL_ISSUE_ID_RE = /^[1-9][0-9]*$/;
+
 /** Verifies every external dependency declared anywhere in `contract` against live truth through
  *  the injected {@link ReconcileObserveDeps} seam, never a caller claim. Performs zero seam calls
  *  (and zero real network/git/subprocess calls under test) when no item declares an external
- *  dependency. */
+ *  dependency. A non-canonical id (anything but plain decimal digits) is classified `pending`
+ *  without ever being queried — it fails closed rather than resolving to an unrelated issue. */
 export async function computeExternalDependencyStatuses(
   observeDeps: ReconcileObserveDeps,
   contract: LoopContract,
@@ -139,9 +146,13 @@ export async function computeExternalDependencyStatuses(
   const ids = collectExternalDependencyIds(contract);
   const statuses: Record<string, ExternalDependencyStatus> = {};
   for (const id of ids) {
+    if (!CANONICAL_ISSUE_ID_RE.test(id)) {
+      statuses[id] = "pending";
+      continue;
+    }
     const issueNumber = Number(id);
-    const issueState = Number.isInteger(issueNumber) && issueNumber > 0 ? await observeDeps.getExternalDependencyIssueState(issueNumber) : null;
-    const prNumber = Number.isInteger(issueNumber) && issueNumber > 0 ? await observeDeps.findPrForIssue(issueNumber) : null;
+    const issueState = await observeDeps.getExternalDependencyIssueState(issueNumber);
+    const prNumber = await observeDeps.findPrForIssue(issueNumber);
     const prDetail = prNumber !== null ? await observeDeps.getPrDetail(prNumber) : null;
     statuses[id] = externalDependencyStatus(issueState, prDetail?.state === "merged");
   }

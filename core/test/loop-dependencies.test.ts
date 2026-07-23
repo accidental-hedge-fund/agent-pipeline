@@ -290,6 +290,34 @@ test("computeExternalDependencyStatuses performs zero seam calls when no item de
   assert.deepEqual(calls, []);
 });
 
+test("computeExternalDependencyStatuses: a non-canonical dependency id is classified pending and never queried against a different issue number", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [], external_depends_on: ["1e3", "0x10", "2.0", " 5", "5 ", "-7", "007", "999"] },
+    ],
+  });
+  const { deps: observe, calls } = fakeObserveDeps({
+    async getExternalDependencyIssueState(n) {
+      calls.push(`getExternalDependencyIssueState:${n}`);
+      return { state: "closed", stateReason: "completed" };
+    },
+  });
+  const statuses = await computeExternalDependencyStatuses(observe, contract);
+  assert.equal(statuses["1e3"], "pending");
+  assert.equal(statuses["0x10"], "pending");
+  assert.equal(statuses["2.0"], "pending");
+  assert.equal(statuses[" 5"], "pending");
+  assert.equal(statuses["5 "], "pending");
+  assert.equal(statuses["-7"], "pending");
+  assert.equal(statuses["007"], "pending");
+  // only the canonical id is verified through the seam
+  assert.equal(statuses["999"], "satisfied");
+  assert.deepEqual(
+    calls.filter((c) => c.startsWith("getExternalDependencyIssueState")),
+    ["getExternalDependencyIssueState:999"],
+  );
+});
+
 test("allExternalDependenciesSatisfied: true only when every external dependency is satisfied", () => {
   assert.equal(allExternalDependenciesSatisfied({ external_depends_on: [] }, {}), true);
   assert.equal(allExternalDependenciesSatisfied({ external_depends_on: ["1", "2"] }, { "1": "satisfied", "2": "satisfied" }), true);
