@@ -557,6 +557,8 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 
 **Auto-file (opt-in, #421):** set `papercuts.auto_file: true` (see "Per-repo config") to skip the manual `--apply` step entirely. When enabled, the engine reuses this same clustering/dedup logic to file `pipeline:backlog`-only issues for recurring papercut clusters at `run_complete` and at the end of every `pipeline queue` batch, subject to `auto_file_min_occurrences`, a per-window rate cap (`auto_file_max_per_window` within `auto_file_window_hours`), and the same open-issue dedup as `--apply`. Auto-filed issues carry an explicit agent-reported-provenance statement and sanitized evidence, receive no label besides `pipeline:backlog`, and are never queued or advanced. The auto-file path is best-effort: any failure is logged and swallowed and can never fail a run, a stage, or a batch.
 
+**Cross-host safety (#459):** unlike most of the engine's concurrency primitives (see "Concurrency scope" below), auto-file's dedup and rate cap are safe across pipeline processes running on **different hosts**, not just within one host's process-local lock. The in-window rate cap is recomputed from GitHub-authored issue state immediately before each create (so an issue another host already filed counts before this host files), and after every create the engine re-reads the issue list and, if the just-filed title now matches more than one open issue, closes all but the lowest-numbered with a comment referencing the survivor. Both mechanisms are best-effort and never fail a run, stage, or batch.
+
 ## Scoreboard sub-command
 
 `pipeline scoreboard` is a **read-only** factory-control report over `.agent-pipeline/runs/*/run.json`, `events.jsonl`, and `summary.json`. It summarizes ready-to-deploy autonomy, cost per ready PR, stage accounting by issue/stage/harness/model/outcome, prompt size, run and stage durations, harness calls, fix rounds, blocker kinds, `pipeline:needs-human`, same-harness fallback, and test/eval/shipcheck pass rates. It never reads `terminal.log` and never modifies GitHub labels/comments, worktrees, config, or run artifacts.
@@ -585,6 +587,17 @@ Queue selection and launch are serialized by a repo-local lock at
 `.agent-pipeline/locks/queue.lock`. A second `pipeline queue` invocation in the
 same repo exits before launching work while a live queue batch owns the lock;
 stale locks from dead processes are cleared automatically.
+
+**Concurrency scope (#459):** this queue lock, the per-issue/domain advance lock, and the
+live-planning marker are all `/tmp`-/repo-local PID locks — they serialize processes on the
+**same host only** and provide no mutual exclusion between processes on different machines.
+**Single-host operation is the engine's supported concurrency scope for these lock sites.** Each
+one guards host-local state (this host's worktrees, run-state directory, or queue), so its
+cross-host failure mode is two hosts each doing their own work on their own machine — not a
+shared, irreversible artifact — and running the pipeline against the same repository from more
+than one host at a time is unsupported. The one documented exception is `pipeline improve`
+auto-file (above), whose dedup/rate-cap guarantees are cross-host safe because its failure mode
+(a duplicate or over-cap GitHub issue) is exactly that kind of irreversible shared artifact.
 
 ```bash
 # Default run: up to 10 issues, concurrency 1, no budget cap

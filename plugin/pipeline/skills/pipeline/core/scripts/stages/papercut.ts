@@ -218,6 +218,118 @@ export async function reportPapercuts(
   return results;
 }
 
+/** Machine-readable marker (#459 review 2, finding 582c19e6) embedded in every
+ *  auto-filed issue body by `buildAutoFileBody`. Neither the `[pipeline-improve]`
+ *  title prefix (also used by `pipeline improve --apply`) nor the `pipeline:backlog`
+ *  label (also applied by `/pipeline:triage` to human-managed issues) alone proves an
+ *  issue was created by this auto-file path — reconciliation below requires this marker
+ *  in the body before treating an issue as a reconciliation candidate, so a human-managed
+ *  or otherwise-provenanced `pipeline:backlog` issue is never closed as a dupe or cap
+ *  overflow. */
+export const AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:papercut-auto-filed -->";
+
+/** Post-create read-back reconciliation (#459, hardened for review finding
+ *  f09ce15de2e6911a): re-list improve issues once and correct two distinct
+ *  cross-host races against that single snapshot.
+ *
+ *  1. Duplicate-title: when `title` now maps to more than one **open** issue
+ *     (a foreign host raced into the same create in the pre-create check's
+ *     TOCTOU window), keep the lowest-numbered open issue and close the rest
+ *     with a comment naming the survivor.
+ *  2. Rate-cap overflow: two hosts near the cap can both pass the pre-create
+ *     cap check (which only reads GitHub *before* either create lands) and
+ *     then file *different* titles, overshooting `maxPerWindow` in a way the
+ *     duplicate-title check above cannot see (different titles never look
+ *     like dupes of each other). Recompute the in-window open auto-filed set
+ *     from the same snapshot and close every issue past the lowest-numbered
+ *     `maxPerWindow` survivors.
+ *
+ *  Both candidate sets are additionally restricted to issues whose body carries
+ *  `AUTO_FILE_PROVENANCE_MARKER` (#459 review 2, finding 582c19e6) — a human-managed or
+ *  `pipeline improve --apply`-created `pipeline:backlog`/`[pipeline-improve]`-titled issue
+ *  never carries this marker and so is never a reconciliation candidate.
+ *
+ *  Both rules pick survivors by ascending issue number, so two hosts
+ *  reconciling independently — potentially against different snapshots taken
+ *  at different times — always converge on the same surviving set once every
+ *  host's post-create reconciliation has run. Total: any failure (list or
+ *  close) is caught, logged non-fatal, and left for a later trigger to
+ *  reconcile — it never propagates. */
+async function reconcilePostCreateState(
+  title: string,
+  deps: AutoFileDeps,
+  cutoffMs: number,
+  maxPerWindow: number,
+): Promise<void> {
+  let issues: OpenImproveIssue[];
+  try {
+    issues = await deps.listOpenImproveIssues();
+  } catch (err) {
+    deps.log(
+      `[pipeline] papercut auto-file: reconciliation list failed (non-fatal) — ${title}: ${(err as Error).message}`,
+    );
+    return;
+  }
+
+  const closedNumbers = new Set<number>();
+
+  const isAutoFiled = (i: OpenImproveIssue): boolean =>
+    (i.body ?? "").includes(AUTO_FILE_PROVENANCE_MARKER);
+
+  const dupes = issues
+    .filter((i) => i.state === "OPEN" && i.title === title && isAutoFiled(i))
+    .map((i) => ({ issue: i, number: issueNumberFromUrl(i.url) }))
+    .filter((x): x is { issue: OpenImproveIssue; number: number } => x.number !== null)
+    .sort((a, b) => a.number - b.number);
+  if (dupes.length > 1) {
+    const survivor = dupes[0];
+    for (const dup of dupes.slice(1)) {
+      try {
+        await deps.closeIssue(
+          dup.number,
+          `Closed as a duplicate of #${survivor.number} — a concurrent pipeline run on another ` +
+            `host auto-filed the same cluster (cross-host auto-file reconciliation).`,
+        );
+        closedNumbers.add(dup.number);
+        deps.log(
+          `[pipeline] papercut auto-file: reconciled cross-host duplicate — closed #${dup.number}, kept #${survivor.number}`,
+        );
+      } catch (err) {
+        deps.log(
+          `[pipeline] papercut auto-file: reconciliation close failed (non-fatal) for #${dup.number}: ${(err as Error).message}`,
+        );
+      }
+    }
+  }
+
+  const inWindow = issues
+    .filter((i) => i.state === "OPEN" && i.labels.includes("pipeline:backlog") && isAutoFiled(i))
+    .map((i) => ({ number: issueNumberFromUrl(i.url), createdMs: Date.parse(i.createdAt) }))
+    .filter(
+      (x): x is { number: number; createdMs: number } =>
+        x.number !== null &&
+        !closedNumbers.has(x.number) &&
+        Number.isFinite(x.createdMs) &&
+        x.createdMs >= cutoffMs,
+    )
+    .sort((a, b) => a.number - b.number);
+  for (const over of inWindow.slice(maxPerWindow)) {
+    try {
+      await deps.closeIssue(
+        over.number,
+        `Closed to enforce the auto-file rate cap (${maxPerWindow} per window) — a concurrent ` +
+          `pipeline run on another host filed past the cap before this host's pre-create check ` +
+          `observed it (cross-host auto-file reconciliation).`,
+      );
+      deps.log(`[pipeline] papercut auto-file: reconciled rate-cap overflow — closed #${over.number}`);
+    } catch (err) {
+      deps.log(
+        `[pipeline] papercut auto-file: reconciliation close failed (non-fatal) for #${over.number}: ${(err as Error).message}`,
+      );
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // autoFilePapercuts (#421)
 // ---------------------------------------------------------------------------
@@ -240,6 +352,9 @@ export interface AutoFileDeps {
   listOpenImproveIssues: () => Promise<OpenImproveIssue[]>;
   /** Create a GitHub issue with the given labels and return its URL. */
   createIssue: (title: string, body: string, labels: string[]) => Promise<string>;
+  /** Close an issue with an explanatory comment (#459 cross-host duplicate
+   *  reconciliation). Injectable so tests never touch real gh. */
+  closeIssue: (number: number, comment: string) => Promise<void>;
   ghAuthCheck: () => Promise<boolean>;
   readLines: (p: string) => AsyncIterable<string>;
   readdir: (p: string) => Promise<Array<{ name: string; isDirectory(): boolean }>>;
@@ -271,7 +386,26 @@ export function realAutoFileDeps(repoDir: string): AutoFileDeps {
       }
       return (r.stdout ?? "").trim();
     },
+    closeIssue: async (number, comment) => {
+      const r = spawnSync(
+        "gh",
+        ["issue", "close", String(number), "--comment", comment],
+        { encoding: "utf8", cwd: repoDir },
+      );
+      if (r.status !== 0) {
+        throw new Error(`gh issue close failed: ${r.stderr?.trim() ?? "unknown error"}`);
+      }
+    },
   };
+}
+
+/** Extract the issue number from a `gh`-authored issue URL
+ *  (`https://github.com/{owner}/{repo}/issues/{number}`). Returns null for any
+ *  URL that doesn't match — callers must treat that as "can't determine a
+ *  reliable ordering" rather than guessing. */
+export function issueNumberFromUrl(url: string): number | null {
+  const m = url.match(/\/issues\/(\d+)(?:[/?#].*)?$/);
+  return m ? Number(m[1]) : null;
 }
 
 /** Agent-reported-provenance banner + sanitized evidence detail, following
@@ -292,6 +426,7 @@ function buildAutoFileBody(c: ClusterEntry, windowHours: number): string {
     "```",
   ].join("\n");
   return [
+    AUTO_FILE_PROVENANCE_MARKER,
     `## Agent-reported friction (auto-filed by \`pipeline\`)`,
     ``,
     `_This issue was filed automatically by the pipeline from agent-reported friction ` +
@@ -366,15 +501,12 @@ export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps):
       }
       if (toFile.length === 0) return;
 
-      // Rate cap (#421 D4, finding 3) — count pipeline:backlog + [pipeline-improve]
-      // issues created inside the trailing window, including closed ones: an
-      // auto-filed issue closed during the window must still count toward the cap.
-      const filedInWindow = openIssues.filter((i) => {
-        if (!i.labels.includes("pipeline:backlog")) return false;
-        const createdMs = Date.parse(i.createdAt);
-        return Number.isFinite(createdMs) && createdMs >= cutoffMs;
-      }).length;
-      let remaining = Math.max(0, opts.maxPerWindow - filedInWindow);
+      const filedInWindowCount = (issues: OpenImproveIssue[]): number =>
+        issues.filter((i) => {
+          if (!i.labels.includes("pipeline:backlog")) return false;
+          const createdMs = Date.parse(i.createdAt);
+          return Number.isFinite(createdMs) && createdMs >= cutoffMs;
+        }).length;
 
       for (const c of toFile) {
         const title = proposedTitle(c);
@@ -385,16 +517,39 @@ export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps):
           deps.log(`[pipeline] papercut auto-file: already tracked — ${title}`);
           continue;
         }
-        if (remaining <= 0) {
+
+        // Cross-host cap + dedup (#459): `withLock` only serializes this host.
+        // Re-read GitHub-authored issue state immediately before creating so a
+        // duplicate title or a cap-filling issue filed by another host (or by
+        // this host's own prior iteration, once created) is counted before we
+        // file — rather than trusting the single up-front `openIssues` snapshot
+        // for the whole loop.
+        let freshIssues: OpenImproveIssue[];
+        try {
+          freshIssues = await deps.listOpenImproveIssues();
+        } catch (err) {
+          deps.log(
+            `[pipeline] papercut auto-file: cross-host state check failed (non-fatal), skipping — ${title}: ${(err as Error).message}`,
+          );
+          continue;
+        }
+        const freshOpenTitle = freshIssues.find((i) => i.state === "OPEN" && i.title === title);
+        if (freshOpenTitle) {
+          byTitle.set(title, freshOpenTitle);
+          deps.log(`[pipeline] papercut auto-file: already tracked (cross-host) — ${title}`);
+          continue;
+        }
+        if (filedInWindowCount(freshIssues) >= opts.maxPerWindow) {
           deps.log(`[pipeline] papercut auto-file: deferred (rate cap) — ${title}`);
           continue;
         }
+
         try {
           const body = buildAutoFileBody(c, opts.windowHours);
           const url = await deps.createIssue(title, body, ["pipeline:backlog"]);
           deps.log(`[pipeline] papercut auto-file: created ${url}`);
-          byTitle.set(title, { title, url, state: "OPEN", createdAt: "", labels: ["pipeline:backlog"] });
-          remaining--;
+          byTitle.set(title, { title, url, state: "OPEN", createdAt: "", labels: ["pipeline:backlog"], body });
+          await reconcilePostCreateState(title, deps, cutoffMs, opts.maxPerWindow);
         } catch (err) {
           deps.log(`[pipeline] papercut auto-file: create failed (non-fatal): ${(err as Error).message}`);
         }

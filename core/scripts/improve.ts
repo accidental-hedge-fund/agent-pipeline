@@ -31,13 +31,21 @@ export interface ClusterEntry {
 /** An open GitHub issue whose title carries the `[pipeline-improve]` prefix
  *  (#421 dedup). Normalized from `gh api repos/{owner}/{repo}/issues` (REST) pages: the raw
  *  shape uses `html_url`/`created_at`/lowercase `state`, mapped to this shape's
- *  `url`/`createdAt`/uppercase `"OPEN" | "CLOSED"` by `parseOpenImproveIssuesPages`. */
+ *  `url`/`createdAt`/uppercase `"OPEN" | "CLOSED"` by `parseOpenImproveIssuesPages`.
+ *
+ *  `body` (#459 review 2, finding 582c19e6) carries the issue body so callers can check for a
+ *  provenance marker before treating an issue as auto-filed — the `[pipeline-improve]` title
+ *  prefix and `pipeline:backlog` label are both applied by legitimate non-auto-file paths too
+ *  (`pipeline improve --apply`, and `/pipeline:triage` respectively), so neither alone proves an
+ *  issue was created by the papercut auto-file path. Optional/defaulted to "" so callers that
+ *  never fetched a body (in-memory placeholders) degrade to "no provenance" rather than throwing. */
 export interface OpenImproveIssue {
   title: string;
   url: string;
   state: "OPEN" | "CLOSED";
   createdAt: string;
   labels: string[];
+  body?: string;
 }
 
 export interface ImproveOpts {
@@ -96,6 +104,7 @@ export interface RawApiIssue {
   labels: Array<{ name: string }>;
   /** Present on pull requests; absent on issues. The REST issues endpoint lists both. */
   pull_request?: unknown;
+  body?: string | null;
 }
 
 /** Flatten `--slurp`-wrapped pages (`[[page1...], [page2...], ...]`), drop pull requests, and
@@ -112,6 +121,7 @@ export function parseOpenImproveIssuesPages(pages: RawApiIssue[][]): OpenImprove
       state: (i.state?.toLowerCase() === "closed" ? "CLOSED" : "OPEN") as "OPEN" | "CLOSED",
       createdAt: i.created_at,
       labels: (i.labels ?? []).map((l) => l.name),
+      body: i.body ?? "",
     }));
 }
 
