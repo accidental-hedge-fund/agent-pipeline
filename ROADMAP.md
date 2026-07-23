@@ -549,6 +549,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.22.0** ✅ shipped | minor | Factory robustness: fix-stage recovery, gate/installer/worktree hardening, structured fix outcomes | #486, #484, #485, #450, #443, #472, #473, #506 | Shipped 2026-07-22 (tag `v1.22.0`). See **Shipped** above for the per-PR detail. |
 | **v1.23.0** ✅ shipped | minor | Review-quality context: bounded delta rounds, immutable resolved-finding evidence, PR-visible visual artifacts | #483, #496, #463 | Shipped 2026-07-23 (tag `v1.23.0`). See **Shipped** above for the per-PR detail. |
 | **v1.24.0** ✅ shipped | minor | Factory hygiene: release-discovery tolerance + cross-host auto-file serialization | #498, #459 | Shipped 2026-07-23 (tag `v1.24.0`). See **Shipped** above for the per-PR detail. |
+| **v1.25.0** | minor | Correction intelligence: structured correction ledger, correction compiler, closed-loop attribution + salvage/intake/init hardening | #521, #522, #504, #539, #499, #500, #501 | Salvage staging correctness (#521, #522), exhaustive drift-proof init config (#504), intake anchor fix (#539), correction_event ledger (#499), correction compiler (#500), closed-loop attribution scoreboard (#501). |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
