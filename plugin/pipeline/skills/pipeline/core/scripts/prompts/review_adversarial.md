@@ -10,7 +10,7 @@ Round role: targeted deep-dive on high-risk vectors not yet resolved by round-1 
 
 {{review1_section}}
 
-{{prior_review2_findings}}{{prior_rounds_digest}}
+{{prior_review2_findings}}{{prior_rounds_digest}}{{resolved_finding_verification}}
 
 {{spec_context}}
 

@@ -20,7 +20,14 @@
 // pre-#17 behavior exactly: every finding blocks.
 
 import { createHash } from "node:crypto";
-import { matchSettledAlternative, matchSettledFinding, type MatchBasis, type SettledFinding } from "./review-history.ts";
+import {
+  matchSettledAlternative,
+  matchSettledFinding,
+  type HeadFileState,
+  type MatchBasis,
+  type SettledFinding,
+  type SettledFindingVerification,
+} from "./review-history.ts";
 import { attestPipelineComment, isVerifiedPipelineAttestation } from "./stages/review-parsing.ts";
 import type { ReviewFinding } from "./types.ts";
 
@@ -327,13 +334,154 @@ export interface AlternativeReinstatementMatch {
   matchedAlternative: string;
 }
 
+/**
+ * Audit detail for a `settled-surface-unverified` demotion (#496): which
+ * settled finding's surface the demoted finding shares, and the round that
+ * settled it.
+ */
+export interface UnverifiedSettledSurfaceMatch {
+  settledKey: string;
+  settledRound: number;
+}
+
+/**
+ * Decides whether `finding`'s surface matches ANY entry in `settled` (#496),
+ * independent of key/title (unlike {@link matchSettledFinding}, which requires
+ * the SAME defect — key or title-similarity — on top of surface identity).
+ * When more than one settled entry shares the surface, the most recently
+ * settled (highest round) is returned, since it is the current record of that
+ * surface's state. Returns null when the finding has no surface or no settled
+ * entry shares it. Pure: no I/O.
+ */
+export function matchSettledSurface(
+  finding: Pick<ReviewFinding, "file" | "category">,
+  settled: SettledFindingVerification[],
+): UnverifiedSettledSurfaceMatch | null {
+  const fSurface = surfaceKey(finding);
+  if (fSurface === null) return null;
+  let best: SettledFindingVerification | null = null;
+  for (const entry of settled) {
+    if (entry.surface !== fSurface) continue;
+    if (best === null || entry.round > best.round) best = entry;
+  }
+  return best === null ? null : { settledKey: best.key, settledRound: best.round };
+}
+
+/** Minimum length (after whitespace normalization) a line from a supplied
+ *  HEAD file must reach to count as a citable quote (#496 design.md D3/D4
+ *  risk note: the floor is deliberately low — the rule only raises the bar
+ *  from "assume persistence" to "look at the file", it does not attempt to
+ *  verify semantic correctness of the citation). */
+const HEAD_EVIDENCE_MIN_QUOTE_LENGTH = 15;
+
+function normalizeForEvidenceMatch(s: string): string {
+  return s.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+/**
+ * True when `text` (a finding's body) quotes at least one line of
+ * `matchedFile`'s content within `headFiles` — the mechanical proxy for
+ * "cites evidence drawn from the current file state" (#496). Deliberately a
+ * literal-substring check, not semantic understanding: design.md accepts that
+ * a reviewer could satisfy it by pasting a token file reference, since the
+ * rule's job is only to raise the floor from "assume persistence" to "look at
+ * the file", not to certify comprehension. Bound to `matchedFile` — the
+ * finding's own (matched) settled surface — so a citation from an unrelated
+ * injected file cannot satisfy evidence for a different surface (#496 finding
+ * 594c736a).
+ */
+export function citesHeadFileEvidence(text: string, headFiles: HeadFileState[], matchedFile: string): boolean {
+  const normalizedText = normalizeForEvidenceMatch(text);
+  if (!normalizedText) return false;
+  const normalizedMatchedFile = normalizeFile(matchedFile);
+  if (!normalizedMatchedFile) return false;
+  for (const file of headFiles) {
+    if (!file.present) continue;
+    if (normalizeFile(file.path) !== normalizedMatchedFile) continue;
+    for (const rawLine of file.content.split("\n")) {
+      const line = normalizeForEvidenceMatch(rawLine);
+      if (line.length < HEAD_EVIDENCE_MIN_QUOTE_LENGTH) continue;
+      if (normalizedText.includes(line)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True when `headFiles` supplies a *verified* not-present state — genuine
+ * ENOENT, `absenceReason === "not-found"` — for the file named by `finding`'s
+ * surface (#496 finding d0603bbc): a settled finding's fix can consist of
+ * deleting the file that carried the defect, so the file's documented
+ * deletion at HEAD is itself citable evidence. An `"unreadable"` or
+ * `"rejected"` absence (a read error, an out-of-worktree path, or a symlink
+ * escape — none of which assert the file does not exist) does NOT count: it
+ * is indeterminate, not evidence, and must fall through to
+ * {@link applySettledSurfaceEvidenceRule}'s demotion like any other
+ * unverified re-assertion (#496 finding 73a71b80).
+ */
+export function citesAbsentHeadFile(
+  finding: Pick<ReviewFinding, "file">,
+  headFiles: HeadFileState[],
+): boolean {
+  const findingFile = normalizeFile(finding.file);
+  if (!findingFile) return false;
+  return headFiles.some(
+    (file) => !file.present && file.absenceReason === "not-found" && normalizeFile(file.path) === findingFile,
+  );
+}
+
+/** One finding demoted by {@link applySettledSurfaceEvidenceRule}. */
+export interface SettledSurfaceDemotion {
+  finding: ReviewFinding;
+  match: UnverifiedSettledSurfaceMatch;
+}
+
+/**
+ * The delta review's evidence rule (#496 design.md Decision 4): moves any
+ * still-blocking finding whose surface matches a settled finding's surface,
+ * and whose body/recommendation/acknowledgment cites no HEAD-state evidence,
+ * out of `blocking`. Reuses the same advisory routing the #389 reversal
+ * machinery uses (called by the pre-merge delta path AFTER `partitionFindings`
+ * so it only sees findings that already survived the ordinary reversal guard —
+ * a finding demoted there is not double-reported here). A no-op when `settled`
+ * is empty (design.md Decision 5 — no settled history, no evidence read, no
+ * demotion), so this ONLY ever fires on the delta review path where a
+ * non-empty `settled` list is supplied.
+ */
+export function applySettledSurfaceEvidenceRule(
+  blocking: ReviewFinding[],
+  settled: SettledFindingVerification[],
+  headFiles: HeadFileState[],
+): { blocking: ReviewFinding[]; demoted: SettledSurfaceDemotion[] } {
+  if (settled.length === 0) return { blocking, demoted: [] };
+  const stillBlocking: ReviewFinding[] = [];
+  const demoted: SettledSurfaceDemotion[] = [];
+  for (const f of blocking) {
+    const match = matchSettledSurface(f, settled);
+    if (!match) {
+      stillBlocking.push(f);
+      continue;
+    }
+    // Evidence must come from the finding body itself, not the recommendation
+    // or prior-round acknowledgment (#496 finding 594c736a) — those can quote
+    // boilerplate the reviewer did not draw from the supplied HEAD state.
+    if (citesHeadFileEvidence(f.body ?? "", headFiles, f.file ?? "") || citesAbsentHeadFile(f, headFiles)) {
+      stillBlocking.push(f);
+      continue;
+    }
+    demoted.push({ finding: f, match });
+  }
+  return { blocking: stillBlocking, demoted };
+}
+
 export interface PartitionResult {
   /** Findings that block: at/above threshold, at/above confidence, not overridden. */
   blocking: ReviewFinding[];
   /** Below the severity threshold or confidence floor — recorded, not blocking.
    *  `reversalMatch` is present iff `reason === "reversal-unacknowledged"`.
-   *  `alternativeMatch` is present iff `reason === "settled-alternative-reinstated"`. */
-  advisory: { finding: ReviewFinding; reason: string; reversalMatch?: ReversalMatch; alternativeMatch?: AlternativeReinstatementMatch }[];
+   *  `alternativeMatch` is present iff `reason === "settled-alternative-reinstated"`.
+   *  `unverifiedSurfaceMatch` is present iff `reason === "settled-surface-unverified"`. */
+  advisory: { finding: ReviewFinding; reason: string; reversalMatch?: ReversalMatch; alternativeMatch?: AlternativeReinstatementMatch; unverifiedSurfaceMatch?: UnverifiedSettledSurfaceMatch }[];
   /** Operator-dispositioned via a `pipeline-override` or `pipeline-override-scope`
    *  sentinel — not blocking. Discriminated by `kind`. */
   overridden: OverriddenEntry[];

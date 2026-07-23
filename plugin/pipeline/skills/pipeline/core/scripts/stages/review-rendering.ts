@@ -24,6 +24,7 @@ import {
   type PartitionResult,
   type ReversalMatch,
   type Review1Risk,
+  type UnverifiedSettledSurfaceMatch,
   SPEC_DIVERGENCE_CATEGORY,
 } from "../review-policy.ts";
 import type { ChurnResult } from "../review-history.ts";
@@ -212,6 +213,7 @@ export function formatDeltaReviewComment(
   reversalDemotions?: Map<string, ReversalMatch>,
   alternativeDemotions?: Map<string, AlternativeReinstatementMatch>,
   churn?: ChurnResult,
+  unverifiedSurfaceDemotions?: Map<string, UnverifiedSettledSurfaceMatch>,
 ): string {
   const shortSha = verdict.commitSha ? verdict.commitSha.slice(0, 7) : "";
   const heading = shortSha
@@ -251,7 +253,11 @@ export function formatDeltaReviewComment(
       const alternativeTag = alternativeMatch
         ? ` \`SETTLED-ALTERNATIVE-REINSTATED: reinstates "${alternativeMatch.matchedAlternative}" rejected by ${alternativeMatch.settledKey} settled in round ${alternativeMatch.settledRound}\``
         : "";
-      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}${reversalTag}${alternativeTag}`);
+      const unverifiedMatch = unverifiedSurfaceDemotions?.get(findingKey(f));
+      const unverifiedTag = unverifiedMatch
+        ? ` \`SETTLED-SURFACE-UNVERIFIED: shares surface with ${unverifiedMatch.settledKey} settled in round ${unverifiedMatch.settledRound} — no HEAD-state evidence cited\``
+        : "";
+      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}${reversalTag}${alternativeTag}${unverifiedTag}`);
       // Machine-readable payload fingerprint, emitted at render time from the
       // structured finding (#391 delta, keys 0fb96f45/b827b914): consumers
       // (fix-stage summaries, disposition matching) read it verbatim instead

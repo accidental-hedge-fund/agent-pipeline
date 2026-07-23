@@ -270,6 +270,23 @@ export interface DeltaChurnSuspectedEvent extends RunEventBase {
   axes: { surface: string; prior_max_confidence: number; new_confidence: number }[];
 }
 
+/** A delta-review finding was demoted to advisory because its surface matches
+ *  a settled finding's surface and it cited no evidence drawn from the
+ *  supplied HEAD file state (#496) — the evidence rule that raises the floor
+ *  from "assume persistence" to "look at the file" for narrow follow-up
+ *  diffs. Distinct from `reversal_unacknowledged`: this fires even when the
+ *  finding carries a `prior_round_acknowledgment`, since that acknowledgment
+ *  alone is not evidence. Never blocks and never changes visibility — the
+ *  finding is still recorded and posted, tagged `SETTLED-SURFACE-UNVERIFIED`;
+ *  this event is purely an audit record. */
+export interface SettledSurfaceUnverifiedEvent extends RunEventBase {
+  type: "settled_surface_unverified";
+  finding_key: string;
+  surface: string;
+  settled_finding_key: string;
+  settling_round: number;
+}
+
 export type { HumanInterventionEvent };
 
 export type RunEvent =
@@ -293,6 +310,7 @@ export type RunEvent =
   | PapercutEvent
   | ReversalUnacknowledgedEvent
   | SettledAlternativeReinstatedEvent
+  | SettledSurfaceUnverifiedEvent
   | DeltaRoundEvent
   | DeltaRoundCeilingEvent
   | DeltaChurnSuspectedEvent
