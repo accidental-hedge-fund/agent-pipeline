@@ -381,6 +381,8 @@ test(
     // — see the merge-refresh-barrier step below — while still driving A's
     // recovery continuation through driveSupervisor's own resume ->
     // reconcile -> append-resume-marker -> cycle-loop sequence. ---
+    const reconciliationsBeforeResume = (await readEvents(deps, "pilot-run-1")).filter((e) => e.kind === "loop_reconciled").length;
+
     const resumedDrive = await driveSupervisor(
       { store: deps, observe, dispatchItem },
       { runId: "pilot-run-1", engine: "claude", resume: true, maxCycles: 1 },
@@ -394,6 +396,15 @@ test(
     assert.notEqual(resumeIndex, -1, "a resume marker must be appended to the action-evidence trail");
     assert.notEqual(dispatchIndex, -1, "the resumed cycle's dispatch outcome must be recorded in the trail");
     assert.ok(resumeIndex < dispatchIndex, "the resume marker (and its preceding reconciliation) must precede the resumed dispatch");
+
+    const resumeMarkerTime = trailAfterResume[resumeIndex].time;
+    const reconciliationsUpToResumeMarker = (await readEvents(deps, "pilot-run-1")).filter(
+      (e) => e.kind === "loop_reconciled" && e.time <= resumeMarkerTime,
+    ).length;
+    assert.ok(
+      reconciliationsUpToResumeMarker > reconciliationsBeforeResume,
+      "resume must run a reconciliation pass BEFORE appending its resume marker — a regression that appends the resume marker without first reconciling must fail here",
+    );
 
     const ledgerAfterResumedCycle = await readLedger(deps, "pilot-run-1");
     const aFreshStarts = ledgerAfterResumedCycle.items[ITEM_A].history.filter((h) => h.to === "in_progress" && h.from === "pending");
@@ -549,4 +560,35 @@ test("bite check: a caller cannot force a remote-proving transition without a su
     /not supported by the engine's verified external identity/,
     "with no PR ever dispatched, the observe seam supports no forward state — the transition must be refused",
   );
+});
+
+test("bite check: a resume marker appended without a preceding reconciliation pass is caught by the main test's resume-reconciliation assertion", async () => {
+  const contract = pilotContract();
+  const ledger = pilotLedger();
+  const deps = await setup(contract, ledger);
+  const { token } = await acquireLock(deps, "pilot-run-1", "claude");
+
+  const reconciliationsBeforeResume = (await readEvents(deps, "pilot-run-1")).filter((e) => e.kind === "loop_reconciled").length;
+
+  // Reproduces exactly the regression the review flagged: append the
+  // action-evidence "resume" marker WITHOUT first running the reconciliation
+  // pass driveSupervisor's resume branch is required to run (supervisor.ts
+  // calls reconcile() before appendActionEvidence(..., action: "resume")).
+  await appendActionEvidence(deps, "pilot-run-1", token, {
+    item_id: null,
+    action: "resume",
+    outcome: "resumed",
+    next_action: null,
+    progress: "progress",
+  });
+
+  const reconciliationsAfterResume = (await readEvents(deps, "pilot-run-1")).filter((e) => e.kind === "loop_reconciled").length;
+  assert.equal(reconciliationsAfterResume, reconciliationsBeforeResume, "this reproduces an omitted resume-time reconciliation");
+  assert.notEqual(
+    reconciliationsAfterResume,
+    reconciliationsBeforeResume + 1,
+    "the composed test's resume-reconciliation assertion (count === before + 1) would fail against this regression, proving it bites",
+  );
+
+  await releaseLock(deps, "pilot-run-1", token);
 });
