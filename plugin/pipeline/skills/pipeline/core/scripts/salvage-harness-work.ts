@@ -19,11 +19,13 @@ export interface SalvageDeps {
    *  status check is restricted to in-scope paths only. */
   gitStatus?: (wtPath: string, scope?: string) => Promise<string>;
   /**
-   * Unstage index entries outside the scope before the scoped git-add.
-   * Only invoked when a staging scope is provided. Args are the full
-   * `git restore --staged` argument array. Using `--staged` touches only
-   * the index; the working-tree content is left intact (no `git restore`
-   * without `--staged` is ever called).
+   * Unstage index entries via `git restore --staged`. Args are the full
+   * argument array. Using `--staged` touches only the index; the
+   * working-tree content is left intact (no `git restore` without
+   * `--staged` is ever called). Two distinct call sites share this seam:
+   * an unconditional pipeline-internal-marker unstage (any already-staged
+   * marker, regardless of scope) and, when a staging scope is provided, an
+   * additional unstage of index entries outside that scope.
    */
   gitRestoreStaged?: (wtPath: string, args: string[]) => Promise<void>;
   /**
@@ -71,6 +73,15 @@ export const PIPELINE_INTERNAL_MARKER_FILES = [".pipeline-rebase-attempted"];
 
 export const SALVAGE_MARKER_EXCLUDE = PIPELINE_INTERNAL_MARKER_FILES.map(
   (file) => `:(exclude,glob)**/${file}`,
+);
+
+// Positive (non-exclude) counterpart used to unstage an already-staged marker
+// (#522 review round 2): SALVAGE_MARKER_EXCLUDE keeps `git add` from newly
+// staging a marker, but it cannot remove one that a prior partial salvage
+// already left in the index. `git restore --staged` needs a pathspec that
+// matches the marker itself, not an exclusion of it.
+export const SALVAGE_MARKER_RESTORE_PATHSPEC = PIPELINE_INTERNAL_MARKER_FILES.map(
+  (file) => `:(glob)**/${file}`,
 );
 
 function isPipelineInternalMarkerPath(pathPart: string): boolean {
@@ -171,6 +182,27 @@ export async function salvageUncommittedWork(
   deps: SalvageDeps = {},
   scope?: string,
 ): Promise<SalvageResult> {
+  // Unstage any pipeline-internal marker already sitting in the index (e.g.
+  // left behind by an earlier interrupted salvage) before deciding what to
+  // salvage. SALVAGE_MARKER_EXCLUDE (used by the git-add below) only keeps a
+  // marker from being newly staged — it cannot remove an entry that is
+  // already staged — so without this an already-staged marker would ride
+  // along into this salvage's commit alongside genuine uncommitted work
+  // (review round 2, #522). A restore whose pathspec matches no staged entry
+  // exits non-zero ("pathspec did not match any files"), which is the common
+  // case (no marker was staged), so failures here are ignored the same way
+  // defaultGitStatus ignores a failing status.
+  try {
+    await (deps.gitRestoreStaged ?? defaultGitRestoreStaged)(wtPath, [
+      "restore",
+      "--staged",
+      "--",
+      ...SALVAGE_MARKER_RESTORE_PATHSPEC,
+    ]);
+  } catch {
+    // No staged marker to clear — expected in the common case.
+  }
+
   const rawStatus = await (deps.gitStatus ?? defaultGitStatus)(wtPath, scope);
   // A worktree whose only dirty path is a pipeline-internal marker file (e.g.
   // `.pipeline-rebase-attempted`) is treated as clean — the marker is not
