@@ -21,6 +21,7 @@ import {
   clusterCorrections,
   clusterPapercuts,
   clustersToEntries,
+  collectFindingSeverities,
   proposedTitle,
   readEventsLines,
   realImproveDeps,
@@ -466,6 +467,7 @@ function buildCorrectionAutoFileBody(c: ClusterEntry, windowHours: number): stri
         `**Last seen**: ${ev.lastSeen ?? "unknown"}`,
         `**Affected stages**: ${ev.stages.join(", ") || "none"}`,
         `**Affected actors**: ${ev.actors.join(", ") || "none"}`,
+        ...(ev.severities.length > 0 ? [`**Severity evidence**: ${ev.severities.join(", ")}`] : []),
       ]
       : []),
     ``,
@@ -502,7 +504,12 @@ function buildCorrectionAutoFileBody(c: ClusterEntry, windowHours: number): stri
  *  the log-line prefix. */
 interface AutoFileCategory {
   eventType: string;
-  clusterFn: (event: Record<string, unknown>, runId: string, clusters: Map<string, ClusterAccum>) => void;
+  clusterFn: (
+    event: Record<string, unknown>,
+    runId: string,
+    clusters: Map<string, ClusterAccum>,
+    findingSeverities?: Map<string, string>,
+  ) => void;
   buildBody: (c: ClusterEntry, windowHours: number) => string;
   marker: string;
   logPrefix: string;
@@ -545,11 +552,17 @@ async function autoFileClusterCategory(
       if (!entry.isDirectory()) continue;
       const runId = entry.name;
       const eventsPath = path.join(dir, runId, "events.jsonl");
+      // Per-run findingKey -> severity lookup (#500 review 2 finding
+      // 02b2a1921d7c779a), mirroring runImprove — lets a correction cluster's
+      // evidence bundle resolve severity via evidence_ref even on this
+      // reduced, single-event-type-filtered scan.
+      const findingSeverities = new Map<string, string>();
       for await (const event of readEventsLines(eventsPath, deps)) {
+        collectFindingSeverities(event, findingSeverities);
         if ((event as { type?: unknown }).type !== category.eventType) continue;
         const at = typeof event["at"] === "string" ? Date.parse(event["at"] as string) : NaN;
         if (!Number.isFinite(at) || at < cutoffMs) continue;
-        category.clusterFn(event, runId, clusters);
+        category.clusterFn(event, runId, clusters, findingSeverities);
       }
     }
 

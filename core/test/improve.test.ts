@@ -15,6 +15,7 @@ import {
   clusterTokenWaste,
   clusterPapercuts,
   clusterCorrections,
+  collectFindingSeverities,
   proposeControlLevel,
   renderControlProposal,
   clustersToEntries,
@@ -604,6 +605,105 @@ test("clusterCorrections: evidence bundle records distinct items, first/last see
   assert.equal(entry.correction!.lastSeen, "2026-07-03T00:00:00Z");
   assert.deepEqual([...entry.correction!.stages].sort(), ["fix-1", "review"]);
   assert.deepEqual([...entry.correction!.actors].sort(), ["human", "pipeline"]);
+});
+
+// ---------------------------------------------------------------------------
+// Severity/impact evidence cross-reference (#500 review 2 finding 02b2a1921d7c779a)
+// ---------------------------------------------------------------------------
+
+test("collectFindingSeverities: indexes key -> severity from a review_verdict event's findings", () => {
+  const out = new Map<string, string>();
+  collectFindingSeverities(
+    { type: "review_verdict", findings: [{ key: "f1", severity: "high" }, { key: "f2", severity: "low" }] },
+    out,
+  );
+  assert.equal(out.get("f1"), "high");
+  assert.equal(out.get("f2"), "low");
+});
+
+test("collectFindingSeverities: non-review_verdict events and malformed findings are ignored", () => {
+  const out = new Map<string, string>();
+  collectFindingSeverities({ type: "correction_event" }, out);
+  collectFindingSeverities({ type: "review_verdict", findings: "not-an-array" }, out);
+  collectFindingSeverities({ type: "review_verdict", findings: [{ key: "f1" }, null, "garbage"] }, out);
+  assert.equal(out.size, 0);
+});
+
+test("clusterCorrections: resolves severity evidence via evidence_ref when the finding's severity is available", () => {
+  const clusters = new Map();
+  const findingSeverities = new Map([["f1", "high"]]);
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-1", evidence_ref: { kind: "finding", id: "f1" } }),
+    "run-1",
+    clusters,
+    findingSeverities,
+  );
+  const entries = clustersToEntries(clusters, 10);
+  const entry = entries.find((e) => e.category === "correction")!;
+  assert.deepEqual(entry.correction!.severities, ["high"]);
+});
+
+test("clusterCorrections: severities is empty when no severity map is passed", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1" }), "run-1", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const entry = entries.find((e) => e.category === "correction")!;
+  assert.deepEqual(entry.correction!.severities, []);
+});
+
+test("clusterCorrections: severities is empty when evidence_ref does not reference a finding", () => {
+  const clusters = new Map();
+  const findingSeverities = new Map([["f1", "high"]]);
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-1", evidence_ref: { kind: "blocker", id: "b1" } }),
+    "run-1",
+    clusters,
+    findingSeverities,
+  );
+  const entries = clustersToEntries(clusters, 10);
+  const entry = entries.find((e) => e.category === "correction")!;
+  assert.deepEqual(entry.correction!.severities, []);
+});
+
+test("clusterCorrections: distinct severities across occurrences accumulate deduplicated", () => {
+  const clusters = new Map();
+  const findingSeverities = new Map([["f1", "high"], ["f2", "medium"]]);
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-1", evidence_ref: { kind: "finding", id: "f1" } }),
+    "run-1",
+    clusters,
+    findingSeverities,
+  );
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-2", evidence_ref: { kind: "finding", id: "f2" } }),
+    "run-1",
+    clusters,
+    findingSeverities,
+  );
+  const entries = clustersToEntries(clusters, 10);
+  const entry = entries.find((e) => e.category === "correction")!;
+  assert.deepEqual(entry.correction!.severities, ["high", "medium"]);
+});
+
+test("formatReport: renders severity evidence for a correction cluster when present", () => {
+  const clusters = new Map();
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-1", evidence_ref: { kind: "finding", id: "f1" } }),
+    "run-1",
+    clusters,
+    new Map([["f1", "critical"]]),
+  );
+  const entries = clustersToEntries(clusters, 10);
+  const report = formatReport(entries, false);
+  assert.match(report, /\*\*Severity evidence\*\*: critical/);
+});
+
+test("formatReport: omits the severity evidence line for a correction cluster with none", () => {
+  const clusters = new Map();
+  clusterCorrections(correctionEvent({ correction_id: "id-1" }), "run-1", clusters);
+  const entries = clustersToEntries(clusters, 10);
+  const report = formatReport(entries, false);
+  assert.doesNotMatch(report, /Severity evidence/);
 });
 
 test("clusterCorrections: a secret in the correction text is redacted from both signal and excerpt", () => {
@@ -1222,6 +1322,27 @@ test("applyIssues: two different correction_key clusters with identical prose fi
   await applyIssues(entries, {}, deps);
   assert.equal(deps._createCalls.length, 2, "identical prose under different correction_keys must not dedup against each other");
   assert.notEqual(deps._createCalls[0].title, deps._createCalls[1].title);
+});
+
+test("applyIssues: correction issue body carries severity evidence when present (#500 review 2 finding 02b2a1921d7c779a)", async () => {
+  const clusters = new Map();
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-1", evidence_ref: { kind: "finding", id: "f1" } }),
+    "run-1",
+    clusters,
+    new Map([["f1", "high"]]),
+  );
+  clusterCorrections(
+    correctionEvent({ correction_id: "id-2", evidence_ref: { kind: "finding", id: "f1" } }),
+    "run-2",
+    clusters,
+    new Map([["f1", "high"]]),
+  );
+  const entries = clustersToEntries(clusters, 10);
+  const deps = makeApplyDeps();
+  await applyIssues(entries, {}, deps);
+  assert.equal(deps._createCalls.length, 1);
+  assert.match(deps._createCalls[0].body, /Severity evidence: high/);
 });
 
 test("applyIssues: listOpenImproveIssues is called exactly once regardless of cluster count", async () => {

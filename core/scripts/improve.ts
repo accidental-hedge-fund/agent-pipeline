@@ -50,6 +50,13 @@ export interface CorrectionEvidence {
   actors: string[];
   failureClasses: string[];
   controlLevel: ControlLevel;
+  /** Severity values (`critical`/`high`/`medium`/`low`) of finding evidence for this
+   *  cluster's corrections, when available (#500 review 2 finding 02b2a1921d7c779a).
+   *  `correction_event` (#499) itself never carries severity/impact — this is
+   *  cross-referenced from the same run's `review_verdict` finding records via
+   *  `evidence_ref: { kind: "finding", id }`. Empty when no correction in the
+   *  cluster references a finding whose severity could be resolved. */
+  severities: string[];
 }
 
 export interface ClusterEntry {
@@ -358,6 +365,9 @@ export interface ClusterAccum {
   proposedControls?: Set<string>;
   firstSeen?: string;
   lastSeen?: string;
+  /** Severity values resolved via `evidence_ref` cross-reference — see
+   *  `CorrectionEvidence.severities`. */
+  severities?: Set<string>;
 }
 
 function truncateExcerpt(s: string): string {
@@ -396,6 +406,28 @@ export function clusterReviewFindings(
         excerpt: truncateExcerpt(body || title),
       });
     }
+  }
+}
+
+/** Index a `review_verdict` event's per-finding `key -> severity` into `out` (#500
+ *  review 2 finding 02b2a1921d7c779a). `correction_event` (#499) never carries
+ *  severity itself; a finding-derived correction's `evidence_ref.id` equals the
+ *  originating finding's `findingKey` (see `correction.test.ts`), so severity is
+ *  cross-referenced from this same run's `review_verdict` records rather than
+ *  invented or guessed. */
+export function collectFindingSeverities(
+  event: Record<string, unknown>,
+  out: Map<string, string>,
+): void {
+  if (event["type"] !== "review_verdict") return;
+  const findings = event["findings"];
+  if (!Array.isArray(findings)) return;
+  for (const f of findings) {
+    if (typeof f !== "object" || f === null) continue;
+    const obj = f as Record<string, unknown>;
+    const key = typeof obj["key"] === "string" ? obj["key"] : "";
+    const severity = typeof obj["severity"] === "string" ? obj["severity"] : "";
+    if (key && severity) out.set(key, severity);
   }
 }
 
@@ -551,11 +583,17 @@ export function clusterPapercuts(
  * `correction_id` (#499 idempotency guarantee) to a single occurrence: the
  * cluster's `count` always mirrors `correctionIds.size`, so re-processing the
  * same event twice (e.g. a corrupt/retried run artifact) never inflates it.
+ *
+ * `findingSeverities` (#500 review 2 finding 02b2a1921d7c779a) is an optional
+ * `findingKey -> severity` lookup — see `collectFindingSeverities` — used to
+ * resolve severity evidence for a finding-derived correction via its
+ * `evidence_ref`. Absent when the caller has no severity data for this run.
  */
 export function clusterCorrections(
   event: Record<string, unknown>,
   runId: string,
   clusters: Map<string, ClusterAccum>,
+  findingSeverities?: Map<string, string>,
 ): void {
   if (event["type"] !== "correction_event") return;
   const correctionKey = typeof event["correction_key"] === "string" ? event["correction_key"] : "";
@@ -569,6 +607,15 @@ export function clusterCorrections(
   const issue = typeof event["issue"] === "number" ? event["issue"] : null;
   const at = typeof event["at"] === "string" ? event["at"] : "";
   const proposedControl = typeof event["proposed_control"] === "string" ? event["proposed_control"] : "";
+  const evidenceRef = event["evidence_ref"];
+  const severity =
+    findingSeverities && typeof evidenceRef === "object" && evidenceRef !== null
+      ? (() => {
+        const ref = evidenceRef as Record<string, unknown>;
+        if (ref["kind"] !== "finding" || typeof ref["id"] !== "string") return "";
+        return findingSeverities.get(ref["id"]) ?? "";
+      })()
+      : "";
 
   const key = `correction:${correctionKey}`;
   let existing = clusters.get(key);
@@ -589,6 +636,7 @@ export function clusterCorrections(
       actors: new Set(),
       failureClasses: new Set(),
       proposedControls: new Set(),
+      severities: new Set(),
     };
     clusters.set(key, existing);
   }
@@ -598,6 +646,7 @@ export function clusterCorrections(
   if (stage) existing.stages!.add(stage);
   if (actorKind) existing.actors!.add(actorKind);
   if (failureClass) existing.failureClasses!.add(failureClass);
+  if (severity) existing.severities!.add(severity);
   if (at) {
     if (!existing.firstSeen || at < existing.firstSeen) existing.firstSeen = at;
     if (!existing.lastSeen || at > existing.lastSeen) existing.lastSeen = at;
@@ -732,6 +781,7 @@ export function clustersToEntries(
           actors: [...(c.actors ?? [])],
           failureClasses: [...(c.failureClasses ?? [])],
           controlLevel: proposeControlLevel({ proposedControls: c.proposedControls }),
+          severities: [...(c.severities ?? [])].sort(),
         };
       }
       return entry;
@@ -760,6 +810,9 @@ export function formatReport(clusters: ClusterEntry[], tokenWasteSkipped: boolea
       lines.push(`**Last seen**: ${c.correction.lastSeen ?? "unknown"}`);
       lines.push(`**Affected stages**: ${c.correction.stages.join(", ") || "none"}`);
       lines.push(`**Affected actors**: ${c.correction.actors.join(", ") || "none"}`);
+      if (c.correction.severities.length > 0) {
+        lines.push(`**Severity evidence**: ${c.correction.severities.join(", ")}`);
+      }
       lines.push(...renderControlProposal(c));
     }
     lines.push(`**Proposed issue title**: ${proposedTitle(c)}`);
@@ -861,6 +914,7 @@ export async function applyIssues(
           `- Last seen: ${c.correction.lastSeen ?? "unknown"}`,
           `- Affected stages: ${c.correction.stages.join(", ") || "none"}`,
           `- Affected actors: ${c.correction.actors.join(", ") || "none"}`,
+          ...(c.correction.severities.length > 0 ? [`- Severity evidence: ${c.correction.severities.join(", ")}`] : []),
           ``,
           ...renderControlProposal(c),
         ]
@@ -919,12 +973,17 @@ export async function runImprove(opts: ImproveOpts, deps: ImproveDeps): Promise<
 
   for (const run of runs) {
     const eventsPath = path.join(run.dir, "events.jsonl");
+    // Per-run findingKey -> severity lookup (#500 review 2 finding 02b2a1921d7c779a):
+    // populated as review_verdict events stream by, so a later correction_event in
+    // the same run's append-only log can resolve its evidence_ref's severity.
+    const findingSeverities = new Map<string, string>();
     for await (const event of readEventsLines(eventsPath, deps)) {
+      collectFindingSeverities(event, findingSeverities);
       clusterReviewFindings(event, run.runId, clusters);
       clusterBlockers(event, run.runId, clusters);
       clusterFlakyGates(event, run.runId, clusters);
       clusterPapercuts(event, run.runId, clusters);
-      clusterCorrections(event, run.runId, clusters);
+      clusterCorrections(event, run.runId, clusters, findingSeverities);
     }
 
     const summaryPath = path.join(run.dir, "summary.json");

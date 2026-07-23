@@ -1162,6 +1162,29 @@ test("autoFileCorrections: body carries the correction provenance marker, contro
   assert.match(body, /\[REDACTED\]/);
 });
 
+test("autoFileCorrections: body carries severity evidence resolved from a review_verdict record in the same run (#500 review 2 finding 02b2a1921d7c779a)", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const reviewVerdictLine = JSON.stringify({
+    schema_version: 1,
+    type: "review_verdict",
+    at,
+    round: 1,
+    sha: "a".repeat(40),
+    verdict: "needs-attention",
+    finding_counts: { high: 1 },
+    findings: [{ key: "f1", severity: "high", title: "t", body: "b", confidence: 0.9, recommendation: "r" }],
+  });
+  const deps = makeAutoFileDeps({
+    runs: {
+      r1: [reviewVerdictLine, correctionLine({ at, correctionKey: "k1", correctionId: "c1" })],
+      r2: [correctionLine({ at, correctionKey: "k1", correctionId: "c2" })],
+    },
+  });
+  await autoFileCorrections(defaultAutoFileOpts({ minOccurrences: 2 }), deps);
+  assert.equal(deps._createCalls.length, 1);
+  assert.match(deps._createCalls[0].body, /Severity evidence.*high/);
+});
+
 test("autoFileCorrections: dedup suppresses filing when an open issue already matches the title", async () => {
   const at = new Date(NOW_MS - 3600_000).toISOString();
   // Title identity is the deterministic correction_key (#500 review 1 finding
