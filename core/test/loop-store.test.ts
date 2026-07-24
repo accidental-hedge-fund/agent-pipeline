@@ -25,6 +25,8 @@ import {
   requireToken,
   getStatus,
   readDurableRunBlockerOccurrences,
+  markRunSuperseded,
+  resolveSupersessionChainHead,
   type LoopStoreDeps,
   defaultLoopStoreDeps,
   LEGACY_PIPELINE_STATE_HOME_ENV,
@@ -769,4 +771,80 @@ test("readDurableRunBlockerOccurrences: performs zero writes, zero lock acquisit
   await readDurableRunBlockerOccurrences(deps);
   assert.equal(writes.length, 0);
   assert.equal(await readLock(deps, "run-1"), null);
+});
+
+// ---------------------------------------------------------------------------
+// Run supersession (#568, capability `loop-run-supersession`)
+// ---------------------------------------------------------------------------
+
+function stoppedLedger(runId: string): LoopLedger {
+  return {
+    ...testLedger(runId),
+    stop: { reason: "run_fatal", time: "2026-07-24T00:00:00.000Z", item_id: "100", theme: "workflow-engine-defect" },
+  };
+}
+
+test("markRunSuperseded refuses (no write) when the named run is not terminally stopped", async () => {
+  const { deps, writes } = fakeDeps();
+  await initRun(deps, testContract("run-1"), testLedger("run-1"));
+  writes.length = 0;
+  await assert.rejects(() => markRunSuperseded(deps, "run-1", "run-1-s1"), /not terminally stopped/);
+  assert.deepEqual(writes, []);
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal((ledger as LoopLedger).superseded_by, undefined);
+});
+
+test("markRunSuperseded sets superseded_by on a terminally-stopped run's ledger and requires no lock token", async () => {
+  const { deps } = fakeDeps();
+  await initRun(deps, testContract("run-1"), stoppedLedger("run-1"));
+  assert.equal(await readLock(deps, "run-1"), null, "a terminally-stopped run holds no lock");
+
+  await markRunSuperseded(deps, "run-1", "run-1-s1");
+
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal((ledger as LoopLedger).superseded_by, "run-1-s1");
+  const events = await readEvents(deps, "run-1");
+  const supersededEvent = events.find((e) => e.kind === "loop_run_superseded");
+  assert.ok(supersededEvent, "a loop_run_superseded event must be recorded");
+  assert.deepEqual(supersededEvent!.data, { superseded_by: "run-1-s1" });
+});
+
+test("markRunSuperseded never overwrites the terminal stop it recorded", async () => {
+  const { deps } = fakeDeps();
+  await initRun(deps, testContract("run-1"), stoppedLedger("run-1"));
+  await markRunSuperseded(deps, "run-1", "run-1-s1");
+  const ledger = (await readLedger(deps, "run-1")) as LoopLedger;
+  assert.equal(ledger.stop?.reason, "run_fatal");
+});
+
+test("resolveSupersessionChainHead: a run with no superseded_by is its own chain head, chainLength 0", async () => {
+  const { deps } = fakeDeps();
+  await initRun(deps, testContract("run-1"), testLedger("run-1"));
+  const { headRunId, chainLength } = await resolveSupersessionChainHead(deps, "run-1");
+  assert.equal(headRunId, "run-1");
+  assert.equal(chainLength, 0);
+});
+
+test("resolveSupersessionChainHead: walks a multi-hop supersession chain to its current head", async () => {
+  const { deps } = fakeDeps();
+  await initRun(deps, testContract("run-1"), stoppedLedger("run-1"));
+  await markRunSuperseded(deps, "run-1", "run-1-s1");
+  await initRun(deps, testContract("run-1-s1"), stoppedLedger("run-1-s1"));
+  await markRunSuperseded(deps, "run-1-s1", "run-1-s2");
+  await initRun(deps, testContract("run-1-s2"), testLedger("run-1-s2")); // active, not yet superseded
+
+  const fromCanonical = await resolveSupersessionChainHead(deps, "run-1");
+  assert.equal(fromCanonical.headRunId, "run-1-s2");
+  assert.equal(fromCanonical.chainLength, 2);
+
+  const fromMiddle = await resolveSupersessionChainHead(deps, "run-1-s1");
+  assert.equal(fromMiddle.headRunId, "run-1-s2");
+  assert.equal(fromMiddle.chainLength, 1);
+});
+
+test("resolveSupersessionChainHead: refuses a cyclic chain rather than looping forever", async () => {
+  const { deps } = fakeDeps();
+  await initRun(deps, testContract("run-a"), { ...stoppedLedger("run-a"), superseded_by: "run-b" });
+  await initRun(deps, testContract("run-b"), { ...stoppedLedger("run-b"), superseded_by: "run-a" });
+  await assert.rejects(() => resolveSupersessionChainHead(deps, "run-a"), /cycle/);
 });

@@ -48,6 +48,10 @@ import {
 import { LOOP_EXECUTION_CONTRACT_SCHEMA, type LoopExecutionRequest, type LoopExecutionResponse } from "../scripts/loop-execution-contract.ts";
 
 const READY_LABEL = "pipeline:ready-to-deploy";
+// The precondition stage gate (#568, capability `loop-precondition-stage-gate`) excludes a
+// pending item with no `pipeline:*` label — this file's items are otherwise ready to dispatch, so
+// they default to `pipeline:ready` (orthogonal to the parking/serialization behavior under test).
+const PIPELINE_READY_LABEL = "pipeline:ready";
 const RUN_ID = "pilot-parallel-run-1";
 const ITEM_A = "300";
 const ITEM_B = "400";
@@ -208,7 +212,7 @@ function pilotFakes(_deps: LoopStoreDeps, _contract: LoopContract) {
   const observe: ReconcileObserveDeps = {
     async getIssueStateAndLabels(issueNumber) {
       for (const [item, pr] of Object.entries(prByItem)) {
-        if (issueNumber === Number(item)) return { state: "open", labels: dispatched.has(item) ? [READY_LABEL] : [] };
+        if (issueNumber === Number(item)) return { state: "open", labels: dispatched.has(item) ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
       }
       return null;
     },

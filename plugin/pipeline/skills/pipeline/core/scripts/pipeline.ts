@@ -133,7 +133,13 @@ import {
 } from "./stages/doctor.ts";
 import { runLoopPreflight, type LoopEngine, type LoopPreflightOutcome, type LoopSelector, type RawLoopArgs, type NativeGoalAttestation } from "./loop-preflight.ts";
 import { auditSupervisor, driveSupervisor, type SupervisorDeps } from "./loop/supervisor.ts";
-import { defaultLoopStoreDeps, runExists as loopRunExists } from "./loop/store.ts";
+import {
+  defaultLoopStoreDeps,
+  markRunSuperseded,
+  readLedger,
+  resolveSupersessionChainHead,
+  runExists as loopRunExists,
+} from "./loop/store.ts";
 import { initRecoverableRun } from "./loop/recovery.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
 import { compileContractItems } from "./loop/dependencies.ts";
@@ -291,6 +297,8 @@ export interface CliOpts {
   resume?: string;
   /** loop: read-only report for the run instead of starting/resuming. */
   audit?: boolean;
+  /** loop: start a fresh run superseding a terminally-stopped canonical run for the same selector. */
+  newRun?: boolean;
   /** correction record: issue number to record the correction against. */
   issue?: number;
   /** correction record: bounded source kind (override|rejection|retry|repair|unblock|manual). */
@@ -390,6 +398,7 @@ export function buildCmd(): Command {
     .option("--roadmap-slice <slice>", "loop: named roadmap slice selector")
     .option("--resume <run-id>", "loop: resume an existing durable run by id, regardless of which engine created it")
     .option("--audit", "loop: read-only report for the run instead of starting/resuming")
+    .option("--new-run", "loop: start a fresh run superseding a terminally-stopped canonical run for the same selector")
     // papercut (#419) is agent-facing, not human-facing: registered and directly invocable
     // (see command-registry.ts + the dispatch block below) but deliberately absent from the
     // `[number]` argument's subcommand description above and from these two options'
@@ -719,6 +728,9 @@ export interface RunLoopEngineInput {
   selector?: LoopSelector;
   resumeRunId?: string;
   audit: boolean;
+  /** `--new-run` (#568, capability `loop-run-supersession`): only ever true alongside `selector`
+   *  — {@link normalizeLoopArgs} refuses it with `--resume` or with no selector present. */
+  newRun?: boolean;
   repoDir: string;
 }
 
@@ -769,10 +781,37 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     } catch (err) {
       return { kind: "error", message: `selector resolution failed: ${(err as Error).message}` };
     }
-    runId = workListRunId(cfg.repo, input.engine, issues);
-    if (!(await loopRunExists(store, runId))) {
-      const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, runId);
-      await initRecoverableRun(store, contract, ledger);
+    const canonicalRunId = workListRunId(cfg.repo, input.engine, issues);
+
+    if (input.newRun) {
+      if (!(await loopRunExists(store, canonicalRunId))) {
+        return {
+          kind: "error",
+          message: `--new-run: no existing run found for this selector (canonical run "${canonicalRunId}") — nothing to supersede`,
+        };
+      }
+      const { headRunId, chainLength } = await resolveSupersessionChainHead(store, canonicalRunId);
+      const headLedger = await readLedger(store, headRunId);
+      if (!headLedger.stop) {
+        return {
+          kind: "error",
+          message: `--new-run: run "${headRunId}" for this selector is not terminally stopped — resume it instead (--resume ${headRunId})`,
+        };
+      }
+      const newRunId = `${canonicalRunId}-s${chainLength + 1}`;
+      if (!(await loopRunExists(store, newRunId))) {
+        const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, newRunId);
+        contract.supersedes = headRunId;
+        await initRecoverableRun(store, contract, ledger);
+        await markRunSuperseded(store, headRunId, newRunId);
+      }
+      runId = newRunId;
+    } else {
+      runId = canonicalRunId;
+      if (!(await loopRunExists(store, runId))) {
+        const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, runId);
+        await initRecoverableRun(store, contract, ledger);
+      }
     }
   } else {
     return { kind: "error", message: "no selector or --resume run id was provided" };
@@ -848,6 +887,7 @@ export async function runLoopCommand(
     issues: positionalIssues,
     resume: opts.resume,
     audit: opts.audit,
+    newRun: opts.newRun,
   };
 
   // Read only the loop.native_goal_attestation key, gh-free (design.md
@@ -877,6 +917,7 @@ export async function runLoopCommand(
     selector: outcome.args.selector,
     resumeRunId: outcome.args.resumeRunId,
     audit: outcome.args.audit,
+    newRun: outcome.args.newRun,
     repoDir,
   });
 

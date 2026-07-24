@@ -176,6 +176,10 @@ function ledgerFixture(): LoopLedger {
 }
 
 const READY_LABEL = "pipeline:ready-to-deploy";
+// The precondition stage gate (#568, capability `loop-precondition-stage-gate`) excludes a
+// pending item with no `pipeline:*` label — this file's items are otherwise ready to dispatch, so
+// they default to `pipeline:ready` (orthogonal to the concurrency/conflict behavior under test).
+const PIPELINE_READY_LABEL = "pipeline:ready";
 
 function fakes() {
   const dispatched = new Set<string>();
@@ -188,7 +192,7 @@ function fakes() {
     async getIssueStateAndLabels(issueNumber) {
       const item = Object.entries(PR_BY_ITEM).find(([id]) => Number(id) === issueNumber)?.[0];
       if (!item) return null;
-      return { state: "open", labels: dispatched.has(item) ? [READY_LABEL] : [] };
+      return { state: "open", labels: dispatched.has(item) ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
     },
     async findPrForIssue(issueNumber) {
       const item = Object.entries(PR_BY_ITEM).find(([id]) => Number(id) === issueNumber)?.[0];

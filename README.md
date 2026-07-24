@@ -263,6 +263,7 @@ or `$pipeline:<command>` (Codex) entry. The advance loop has no sub-command.
 /pipeline:loop --milestone v2  $pipeline:loop --milestone v2   canonical durable multi-item run (driven in-repo by Pipeline's own supervisor)
 /pipeline:loop --resume <run-id>              resume an existing durable run by id, on either engine
 /pipeline:loop --audit                        read-only report for the run; no writes
+/pipeline:loop --milestone v2 --new-run       start a fresh run superseding a terminally-stopped canonical run for the same selector
 /pipeline improve                             read run artifacts; print dry-run cluster report (read-only)
 /pipeline improve --apply                     same, then create GitHub issues for top-N recurring patterns
 /pipeline improve --top 10 --since 2026-06-01 --json  limit scope + emit JSON array of clusters
@@ -695,6 +696,7 @@ never sets a stage label itself and never merges.
 /pipeline:loop 418 419 420           select an explicit issue list
 /pipeline:loop --resume <run-id>     resume an existing run — on either engine, by run id
 /pipeline:loop --audit               read-only report for a run; performs no write
+/pipeline:loop --milestone v2 --new-run   supersede a terminally-stopped canonical run for the same selector with a fresh run
 ```
 
 The preflight order is fixed and every failure path is read-only, so it never leaves a
@@ -714,6 +716,18 @@ double-driven. `--audit` renders the run's process identity, its append-only
 action-evidence timeline, and its watchdog/no-progress state with zero durable writes —
 no ledger write, no lock, no GitHub mutation. A pre-existing run created by a legacy
 goal-loop invocation remains addressable by `--resume <run-id>` (read-only import).
+
+**Pre-pipeline items are excluded, not fatal.** A selected item still carrying
+`pipeline:backlog` (or no `pipeline:*` label at all) is excluded from dispatch every
+cycle with a durable, non-fatal `precondition` rationale naming the required stage
+(`pipeline:ready`) — it is never treated as an engine defect and never durably stops the
+run. Every other selected item still advances, and triaging the excluded item to
+`pipeline:ready` mid-run (`pipeline:triage N --stage ready`) admits it on the very next
+cycle, with no restart. If `--new-run`'s canonical run is terminally stopped for a
+genuine reason, `--new-run` mints a fresh, deterministic, re-resumable run for the same
+selector, recording a `supersedes`/`superseded_by` pointer pair so the retired run's
+ledger and audit trail stay intact — no hand-moving durable state. It is refused
+(zero writes) unless the canonical run is actually terminally stopped.
 
 **Native-`/goal` detection (#506).** `/goal` is an interactive slash command, not a CLI
 flag — it never appears in `<engine> --help`, so absence of a marker there is not

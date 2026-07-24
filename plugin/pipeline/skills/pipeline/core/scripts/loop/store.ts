@@ -394,6 +394,58 @@ export async function readDurableRunBlockerOccurrences(
 }
 
 // ---------------------------------------------------------------------------
+// Run supersession (#568, capability `loop-run-supersession`) — an audited,
+// operator-invoked way to retire a terminally-stopped run and start a fresh
+// run for the same selector, linked by supersedes/superseded_by pointers. See
+// openspec/changes/loop-precondition-stage-gate/design.md decision 4.
+// ---------------------------------------------------------------------------
+
+/** Marks a terminally-stopped run as superseded by `newRunId` — a narrow, token-free
+ *  administrative write mirroring {@link recoverLock}/{@link appendEventUnchecked}: a
+ *  terminally-stopped run has released its lock (driveSupervisor's `finally`), so there is no
+ *  holder token to check against. Refuses (LoopError "validation") when the named run is not
+ *  terminally stopped — the caller MUST verify this itself before calling, since this function's
+ *  own guard exists only to prevent a coding error from marking a live run superseded, not as the
+ *  sole enforcement point. */
+export async function markRunSuperseded(deps: LoopStoreDeps, runId: string, newRunId: string): Promise<void> {
+  const ledger = await readLedger(deps, runId);
+  if (!ledger.stop) {
+    throw new LoopError("validation", `loop run "${runId}" is not terminally stopped — refusing to mark it superseded`);
+  }
+  const dir = runDir(deps, runId);
+  const updated: LoopLedger = { ...ledger, superseded_by: newRunId };
+  await deps.writeFileAtomic(ledgerPath(dir), JSON.stringify(updated, null, 2));
+  await appendEventUnchecked(deps, runId, "loop_run_superseded", { superseded_by: newRunId });
+}
+
+/** Walks a run's supersession chain forward from `runId` via each ledger's `superseded_by`
+ *  pointer, returning the chain's current head (the run nothing yet supersedes) and how many
+ *  supersessions preceded it. `chainLength` is 0 when `runId` itself has never been superseded —
+ *  the caller (the `--new-run` CLI path) uses it to mint the next deterministic superseding run
+ *  id. Refuses (LoopError "validation") on a cyclic chain — a defensive guard against a corrupted
+ *  ledger, since a well-formed chain is always acyclic by construction (each superseding run id
+ *  is freshly minted). */
+export async function resolveSupersessionChainHead(
+  deps: LoopStoreDeps,
+  runId: string,
+): Promise<{ headRunId: string; chainLength: number }> {
+  let current = runId;
+  let chainLength = 0;
+  const seen = new Set<string>([current]);
+  for (;;) {
+    const ledger = await readLedger(deps, current);
+    if (!ledger.superseded_by) break;
+    if (seen.has(ledger.superseded_by)) {
+      throw new LoopError("validation", `loop run "${runId}": supersession chain contains a cycle at "${ledger.superseded_by}"`);
+    }
+    current = ledger.superseded_by;
+    seen.add(current);
+    chainLength++;
+  }
+  return { headRunId: current, chainLength };
+}
+
+// ---------------------------------------------------------------------------
 // Supervisor process identity (#512, capability `durable-loop-supervisor`) —
 // a distinct atomic-write document from lock.json (design.md decision 1).
 // ---------------------------------------------------------------------------
@@ -587,6 +639,13 @@ export interface LoopStatus {
   action_evidence: LoopActionEvidence[];
   /** The watchdog's current consecutive-no-progress count — 0 when absent. */
   consecutive_no_progress: number;
+  /** Present when this run was created via `pipeline loop --new-run` to supersede a
+   *  terminally-stopped run — names the retired run id (#568, capability
+   *  `loop-run-supersession`). */
+  supersedes: string | null;
+  /** Present once this terminally-stopped run has itself been superseded — names the fresh run
+   *  that replaced it (#568, capability `loop-run-supersession`). */
+  superseded_by: string | null;
 }
 
 const ACTIVE_STATES = new Set(["in_progress"]);
@@ -628,6 +687,8 @@ export async function getStatus(deps: LoopStoreDeps, runId: string): Promise<Loo
     supervisor,
     action_evidence,
     consecutive_no_progress: supervisor?.consecutive_no_progress ?? 0,
+    supersedes: contract.supersedes ?? null,
+    superseded_by: ledger.superseded_by ?? null,
   };
 }
 

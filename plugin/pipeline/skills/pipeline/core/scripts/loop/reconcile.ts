@@ -28,6 +28,7 @@ import {
   parseChecksAggregate,
 } from "../gh.ts";
 import { getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
+import { pipelineStageFromLabels } from "./precondition.ts";
 import {
   LoopError,
   isLoopAuthorityGate,
@@ -200,6 +201,7 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
   const issue = await deps.getIssueStateAndLabels(issueNumber);
   const issue_open = issue?.state === "open";
   const ready_label_present = issue?.labels.includes(READY_LABEL) ?? false;
+  const pipeline_stage = pipelineStageFromLabels(issue?.labels ?? []);
 
   let pr_number: number | null = null;
   let pr_state: LoopExternalIdentity["pr_state"] = null;
@@ -240,6 +242,7 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
     head_sha,
     merge_commit_sha,
     checks_conclusion,
+    pipeline_stage,
     observed_at: deps.now().toISOString(),
   };
 }

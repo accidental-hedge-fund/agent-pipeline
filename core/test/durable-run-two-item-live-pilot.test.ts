@@ -43,6 +43,10 @@ import {
 import { LOOP_EXECUTION_CONTRACT_SCHEMA, type LoopExecutionRequest, type LoopExecutionResponse } from "../scripts/loop-execution-contract.ts";
 
 const READY_LABEL = "pipeline:ready-to-deploy";
+// The precondition stage gate (#568, capability `loop-precondition-stage-gate`) excludes a
+// pending item with no `pipeline:*` label — this file's items are otherwise ready to dispatch, so
+// they default to `pipeline:ready` (orthogonal to the recovery/resume behavior under test).
+const PIPELINE_READY_LABEL = "pipeline:ready";
 const ITEM_A = "100";
 const ITEM_B = "200";
 const PR_A = 501;
@@ -191,8 +195,8 @@ function pilotFakes(deps: LoopStoreDeps, contract: LoopContract) {
 
   const observe: ReconcileObserveDeps = {
     async getIssueStateAndLabels(issueNumber) {
-      if (issueNumber === Number(ITEM_A)) return { state: "open", labels: aDispatched ? [READY_LABEL] : [] };
-      if (issueNumber === Number(ITEM_B)) return { state: "open", labels: bDispatched ? [READY_LABEL] : [] };
+      if (issueNumber === Number(ITEM_A)) return { state: "open", labels: aDispatched ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+      if (issueNumber === Number(ITEM_B)) return { state: "open", labels: bDispatched ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
       return null;
     },
     async findPrForIssue(issueNumber) {

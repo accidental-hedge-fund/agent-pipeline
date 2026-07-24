@@ -462,6 +462,33 @@ test("normalizeLoopArgs — standalone audit (no selector, no resume) is accepte
 });
 
 // ---------------------------------------------------------------------------
+// normalizeLoopArgs — --new-run (#568, capability `loop-run-supersession`)
+// ---------------------------------------------------------------------------
+
+test("normalizeLoopArgs — --new-run combined with a selector is accepted", () => {
+  const args = normalizeLoopArgs({ milestone: "v2", newRun: true });
+  assert.equal(args.newRun, true);
+  assert.deepEqual(args.selector, { type: "milestone", value: "v2" });
+});
+
+test("normalizeLoopArgs — newRun defaults to false when absent", () => {
+  const args = normalizeLoopArgs({ milestone: "v2" });
+  assert.equal(args.newRun, false);
+});
+
+test("normalizeLoopArgs — rejects --new-run combined with --resume", () => {
+  assert.throws(() => normalizeLoopArgs({ resume: "run-123", newRun: true }), LoopArgError);
+});
+
+test("normalizeLoopArgs — rejects --new-run with no selector present", () => {
+  assert.throws(() => normalizeLoopArgs({ newRun: true }), LoopArgError);
+});
+
+test("normalizeLoopArgs — rejects --new-run with only --audit and no selector", () => {
+  assert.throws(() => normalizeLoopArgs({ newRun: true, audit: true }), LoopArgError);
+});
+
+// ---------------------------------------------------------------------------
 // runLoopPreflight — fixed order, zero I/O on invalid args
 // ---------------------------------------------------------------------------
 
