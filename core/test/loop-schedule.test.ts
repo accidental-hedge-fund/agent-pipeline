@@ -139,11 +139,15 @@ test("selectSchedulableSet: a dependent and its prerequisite are never co-admitt
     concurrency: { max_concurrent: 5 },
   });
   // "a" has not finished, so "b" is not even in the eligible frontier — the dependent is never a
-  // schedulable candidate while its prerequisite is outstanding.
+  // schedulable candidate while its prerequisite is outstanding. It still receives a durable
+  // dependency_path rationale entry naming "a", so the run-scoped parallelization ledger can
+  // recover why the pair was serialized (#528 review round 2).
   const ledger = makeLedger([ledgerEntry("a"), ledgerEntry("b")]);
   const decision = selectSchedulableSet({ contract, ledger });
   assert.deepEqual(decision.selected, ["a"]);
-  assert.equal(decision.rationale.some((r) => r.item_id === "b"), false);
+  const bRationale = decision.rationale.find((r) => r.item_id === "b");
+  assert.equal(bRationale?.disposition, "dependency_path");
+  assert.equal(bRationale?.counterpart_item_id, "a");
 });
 
 test("selectSchedulableSet: without the scheduler's dependency-free check a same-pass sibling dependency would be admitted", () => {

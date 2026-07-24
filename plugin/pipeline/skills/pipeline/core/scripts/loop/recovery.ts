@@ -590,7 +590,7 @@ export function isRunFatalBlocked(contractInput: LoopContract, ledgerInput: Loop
 // merges (CLAUDE.md golden rule #4), so `ready` — not `merged` — is this
 // engine's actual completion state; `merged`/`released`/`deployed` are
 // retained for engines/imports whose lifecycle continues past that point.
-const DONE_STATES = new Set(["ready", "merged", "released", "deployed"]);
+export const DONE_STATES = new Set(["ready", "merged", "released", "deployed"]);
 
 /** Pending items with no dependency on a blocked item, whose declared
  *  dependencies are all done, and whose external dependencies (capability

@@ -291,16 +291,19 @@ test(
     const conflictRationale = decision1.rationale.find((r) => r.item_id === ITEM_CONFLICT)!;
     assert.equal(conflictRationale.disposition, "conflict_edge");
     assert.equal(conflictRationale.counterpart_item_id, ITEM_A);
-    assert.equal(
-      decision1.rationale.some((r) => r.item_id === ITEM_DEP),
-      false,
-      "D never entered the frontier at all this pass — dependency-linked serialization is enforced upstream of the scheduler's own pairwise evaluation",
-    );
+    // D never enters the frontier's own pairwise evaluation this pass — dependency-linked
+    // serialization is enforced upstream by the pre-frontier dependency filter — but the scheduler
+    // still durably records why: a `dependency_path` rationale entry naming its unmet dependency,
+    // so the run-scoped ledger can recover the (A, D) decision (#528 review round 2).
+    const depRationale = decision1.rationale.find((r) => r.item_id === ITEM_DEP)!;
+    assert.ok(depRationale, "D receives a durable dependency_path rationale entry even though it never entered the frontier");
+    assert.equal(depRationale.disposition, "dependency_path");
+    assert.equal(depRationale.counterpart_item_id, ITEM_A);
 
     // --- The run-scoped parallelization ledger (task 2), reconstructed from the durable event log
-    // alone: one entry per pair the scheduler actually evaluated. ---
+    // alone: one entry per pair the scheduler actually evaluated or excluded from the frontier. ---
     const ledgerEntries = parallelizationLedgerFromEvents(events1);
-    assert.equal(ledgerEntries.length, 3, "one ledger entry per evaluated pair: (A,B), (A,C), (A,E)");
+    assert.equal(ledgerEntries.length, 4, "one ledger entry per evaluated pair: (A,B), (A,C), (A,E), (A,D)");
     const byPair = new Map(ledgerEntries.map((e) => [`${e.a_item_id}:${e.b_item_id}`, e]));
     assert.deepEqual(byPair.get(`${ITEM_A}:${ITEM_B}`), { a_item_id: ITEM_A, b_item_id: ITEM_B, disposition: "parallelized", reason: "admitted" });
     assert.deepEqual(byPair.get(`${ITEM_A}:${ITEM_UNKNOWN}`), {
@@ -316,6 +319,12 @@ test(
       disposition: "serialized",
       reason: "conflict_edge",
       ...(conflictRationale.detail !== undefined ? { detail: conflictRationale.detail } : {}),
+    });
+    assert.deepEqual(byPair.get(`${ITEM_A}:${ITEM_DEP}`), {
+      a_item_id: ITEM_A,
+      b_item_id: ITEM_DEP,
+      disposition: "serialized",
+      reason: "dependency_path",
     });
 
     // --- Cycle 2+: once A is done, D becomes eligible and is scheduled in a later, separate pass —
