@@ -1029,6 +1029,17 @@ export async function runLoopCommand(
     return;
   }
 
+  // A stop must never silently strand a ready-to-deploy item (#570, capability
+  // `loop-needs-human-blocker-disposition`): name every outstanding `ready` item on the CLI
+  // output whenever a stop carries one, alongside the machine-readable `stop.outstanding_ready`
+  // already embedded in the JSON below.
+  const outstandingReady = engineResult.result.stop?.outstanding_ready ?? [];
+  if (outstandingReady.length > 0) {
+    console.error(
+      `pipeline loop: stopped with ${outstandingReady.length} item(s) stranded at ready-to-deploy, awaiting human merge: ${outstandingReady.join(", ")}`,
+    );
+  }
+
   console.log(
     JSON.stringify({
       schema_version: "1",
