@@ -126,8 +126,15 @@ names. The contract fixes the following now, so it is implementable without furt
   emitted, so it is globally unique within the installation and never reused or derived from mutable
   process state; `pipeline_version` and `schema_version` are semver strings; `envelope_version` is an
   integer `major.minor` pair encoded as the string `"<major>.<minor>"`; `seq` is a non-negative integer,
-  unique and monotonically increasing per `run_id`; `payload` is the verbatim, already-screened
-  `events.jsonl` line, carried as an embedded JSON value (not a re-encoded string).
+  unique and monotonically increasing per `run_id`; `run_origin` is a string, 1–128 bytes,
+  `^[A-Za-z0-9_-]+$`, an immutable per-run-instance marker (e.g. a UUIDv4, or `host_id` joined with the
+  run's creation timestamp) assigned once at run creation, durably persisted alongside `run_id`, stable
+  across every envelope of the run and distinct between two runs that reuse the same `run_id` — the
+  collector records it on first ingest of a `(installation_id, run_id)` pair and validates it before any
+  idempotency de-duplication or per-run merge, so two hosts that reuse a `run_id` are flagged as a
+  duplicate-run-id conflict rather than silently interleaved (see the collector contract); `payload` is
+  the verbatim, already-screened `events.jsonl` line, carried as an embedded JSON value (not a re-encoded
+  string).
 - **Idempotency-key encoding.** Each envelope carries its own idempotency key as an `idempotency_key`
   field **inside the envelope object**, the lowercase-hex SHA-256 digest of the UTF-8 bytes
   `"{tenant_id}:{installation_id}:{run_id}:{seq}"`, never derived from mutable payload content. This
@@ -149,11 +156,17 @@ names. The contract fixes the following now, so it is implementable without furt
   `cross_tenant_scope`) so senders can branch on it without string matching. The response correlates to
   the request via the same `idempotency_key`, which is present on rejection responses too. For a batch
   request, the collector responds `207 Multi-Status` with
-  `{"results": [{"idempotency_key": "<key>", "status": "accepted"|"rejected", "reason_code":
-  "<code-or-null>"}, ...]}`, one result per submitted envelope in request order, each keyed by that
-  envelope's own `idempotency_key`. A batch is never all-or-nothing: the sender retires each spooled
-  envelope independently as its own result arrives, so a partially invalid batch tells the sender exactly
-  which spooled records to retire, which to drop as rejected, and which to retry.
+  `{"results": [{"index": <int>, "idempotency_key": "<key-or-null>", "status": "accepted"|"rejected",
+  "reason_code": "<code-or-null>", "disposition": "acknowledged"|"terminal"|"transient"}, ...]}`, one
+  result per submitted envelope, correlated by its **zero-based `index`** in the submitted array. The
+  `index` — not the `idempotency_key` — is the authoritative correlation handle, because a
+  `malformed_envelope` may omit or invalidate its embedded key; such a result carries
+  `"idempotency_key": null` and the sender matches it to the spooled record it submitted at that
+  position. A batch is never all-or-nothing; the sender acts on each result by its `disposition`:
+  `acknowledged` retires the record as delivered; `terminal` (a rejection that can never succeed on
+  retry — `malformed_envelope`, `unsupported_major_version`, `cross_tenant_scope`) retires it as an
+  accounted rejected loss recording its `reason_code`; `transient` (e.g. `unauthorized`) leaves it
+  spooled for retry after the condition clears. The sender never guesses retirement from a missing key.
 - **Version-compatibility rule.** `envelope_version` follows semver-like major.minor: the collector
   rejects an envelope whose major component it does not list in `/fleet/v1/capabilities`, and accepts
   any minor within a supported major, tolerating unknown optional fields (D7).
@@ -186,6 +199,16 @@ decision fixes that contract, symmetric to D10's ingest profile:
   lineage requirement) without embedding full event payloads in the response. `next_cursor` is `null`
   once the last page has been returned; the caller pages by resubmitting the same request with
   `page.cursor` set to the previous `next_cursor`.
+- **Snapshot-consistent pagination.** The first request of a paginated report SHALL establish a read
+  snapshot bound to (a) the resolved tenant, (b) a fingerprint of the query's `time_window`, `filter`,
+  and `group_by`, and (c) an ingest high-water mark captured at that instant. `next_cursor` opaquely
+  encodes that snapshot, and every subsequent page SHALL be served against the same snapshot/high-water
+  mark, so events ingested, expired, or deleted between pages never change the report's dataset
+  mid-pagination. The collector SHALL reject a cursor whose encoded snapshot has expired or whose query
+  fingerprint does not match the resubmitted body with a `409` bearing the D10 rejection envelope
+  (`reason_code: "cursor_expired"` or `"cursor_query_mismatch"`), rather than silently paging over a
+  different dataset. A report's metrics and lineage therefore always describe one snapshot, or the query
+  fails explicitly.
 - **Cross-tenant refusal.** If the request's `filter` names an `installation_id` outside the credential's
   bound tenant, the collector responds `403` with the same rejection envelope as D10
   (`{"status": "rejected", "reason_code": "cross_tenant_scope", "detail": "<human string>"}`) and returns

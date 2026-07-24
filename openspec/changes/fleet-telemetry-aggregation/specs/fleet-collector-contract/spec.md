@@ -112,19 +112,33 @@ regardless of arrival order.
 
 The collector SHALL treat `run_id` as unique within an installation and SHALL NOT silently merge or
 interleave envelopes from two distinct runs that present the same `run_id` under the same
-`installation_id`. When the collector observes `seq` values for a given `(installation_id, run_id)` pair
-that are inconsistent with a single monotonic per-run sequence (for example, a lower `seq` arriving after
-a materially later one has already advanced the run's high-water mark by more than the collector's
-configured reordering tolerance), it SHALL flag the run as a duplicate-run-id conflict rather than
-merging the conflicting streams into one ordered run, and SHALL surface the conflict through the
-delivery-health diagnostics.
+`installation_id`. Distinctness SHALL be decided by an immutable `run_origin` marker carried on every
+envelope — an identifier assigned once at run creation (for example a random per-run-instance UUID, or
+`host_id` combined with the run's creation timestamp) that is stable across every envelope of that run
+and differs between two runs that reuse the same `run_id`. On first ingest of a `(installation_id,
+run_id)` pair the collector SHALL record that pair's `run_origin`, and before de-duplicating or merging
+any subsequent envelope by its idempotency key it SHALL compare that envelope's `run_origin` against the
+recorded one. An envelope whose `run_origin` matches SHALL be reconstructed into the run's order by
+`(run_id, seq)` **regardless of arrival order** — out-of-order or delayed delivery, including a lower
+`seq` arriving after a higher one, SHALL NOT be treated as a conflict. An envelope whose `run_origin`
+differs SHALL be flagged as a duplicate-run-id conflict for that `(installation_id, run_id)` pair, SHALL
+NOT be interleaved into or silently de-duplicated against the first run's stream, and SHALL be surfaced
+through the delivery-health diagnostics.
+
+#### Scenario: delayed low-seq envelope is reordered, not flagged
+
+- **WHEN** an envelope with a low `seq` (e.g. `seq=0`) arrives after envelopes with much higher `seq`
+  values for the same `(installation_id, run_id, run_origin)` have already advanced the run
+- **THEN** the collector SHALL reconstruct it into the run's order by `(run_id, seq)`
+- **AND** it SHALL NOT flag a conflict, because out-of-order arrival is explicitly supported
 
 #### Scenario: duplicate run-id from two hosts is flagged, not merged
 
 - **WHEN** two distinct hosts each emit envelopes using the same `run_id` under the same
-  `installation_id`, producing sequences that cannot both be a single monotonic per-run order
+  `installation_id` but with different `run_origin` markers
 - **THEN** the collector SHALL flag a duplicate-run-id conflict for that `(installation_id, run_id)` pair
-- **AND** it SHALL NOT silently interleave the two hosts' events into one merged per-run order
+  on the first envelope whose `run_origin` mismatches the recorded one
+- **AND** it SHALL NOT silently interleave or de-duplicate the two hosts' events into one merged per-run order
 
 ### Requirement: Collector writes to customer-owned storage with no upstream path
 

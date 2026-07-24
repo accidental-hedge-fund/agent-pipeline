@@ -34,10 +34,21 @@ idempotency key, embedded in the envelope itself (not a request-level header), d
 delivery is deduplicable and does not skew metrics. When multiple envelopes are delivered in one batch
 request, each envelope SHALL retire independently based on its own per-envelope result in the batch
 response — a batch SHALL NOT be treated as all-or-nothing, so a partially rejected batch retires only
-the accepted envelopes and leaves rejected/unacknowledged ones spooled for retry or diagnostic handling.
-The at-least-once guarantee applies only to envelopes admitted to the spool; an envelope dropped by the
-overflow policy (see below) before or after admission is accounted telemetry loss, not a violation of
-at-least-once.
+the accepted envelopes plus any **terminally** rejected ones (see below), and leaves transiently
+rejected/unacknowledged envelopes spooled for retry. A rejection whose `reason_code` is terminal
+(`malformed_envelope`, `unsupported_major_version`, `cross_tenant_scope` — a rejection that can never
+succeed on retry) SHALL be retired from the spool as an **accounted rejected loss**: its `reason_code`
+and correlation are recorded in the delivery-health accounting and the envelope is removed, distinct
+from an acknowledgement and distinct from a transient rejection (e.g. `unauthorized`, which remains
+spooled until the credential is refreshed). This keeps the bounded spool from filling with un-retryable
+records while never silently discarding a record that could still be delivered.
+The at-least-once guarantee applies to every envelope admitted to the spool: an admitted, un-acknowledged
+envelope SHALL NOT be evicted by the overflow policy. Overflow is therefore an admission-control decision
+only — when the durable spool is at capacity, a newly produced envelope that cannot be admitted is
+accounted telemetry loss **at admission time** (recorded in delivery-health accounting), while every
+already-admitted envelope is retained until its own acknowledgement (or terminal-rejection retirement)
+removes it. The overflow policy governs which incoming envelopes are refused admission, never the
+deletion of already-admitted ones.
 
 #### Scenario: envelope retires only on acknowledgement
 
@@ -45,12 +56,24 @@ at-least-once.
 - **THEN** it SHALL be retired from the spool only after the collector acknowledges that envelope
 - **AND** an un-acknowledged envelope SHALL remain spooled for retry
 
-#### Scenario: batch delivery retires only the accepted envelopes
+#### Scenario: batch delivery retires accepted and terminally-rejected envelopes independently
 
-- **WHEN** a batch of envelopes is delivered and the collector's response accepts some and rejects others
-- **THEN** each accepted envelope SHALL retire from the spool independently, keyed by its own
-  `idempotency_key`
-- **AND** each rejected or unacknowledged envelope SHALL remain spooled for retry or diagnostic handling
+- **WHEN** a batch of envelopes is delivered and the collector's per-envelope results accept some,
+  terminally reject others (`malformed_envelope`, `unsupported_major_version`, `cross_tenant_scope`),
+  and transiently reject the rest (e.g. `unauthorized`)
+- **THEN** each accepted envelope SHALL retire from the spool as delivered, correlated by its result's
+  `index`
+- **AND** each terminally-rejected envelope SHALL retire from the spool as an **accounted rejected loss**
+  recording its `reason_code`, so an un-retryable record never fills the bounded spool
+- **AND** each transiently-rejected or unacknowledged envelope SHALL remain spooled for retry
+
+#### Scenario: malformed envelope is correlated without a valid key
+
+- **WHEN** a submitted envelope is rejected as `malformed_envelope` and its embedded `idempotency_key`
+  is absent or invalid
+- **THEN** the sender SHALL correlate the rejection to the spooled record by the result's zero-based
+  `index` in the submitted batch (the result carrying `"idempotency_key": null`)
+- **AND** the sender SHALL terminally retire exactly that record and no other
 
 #### Scenario: spool replays after restart
 
