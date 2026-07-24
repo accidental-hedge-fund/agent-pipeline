@@ -247,31 +247,53 @@ function isPidLiveDefault(pid) {
   }
 }
 
+/** Unlink a lock file, ignoring ENOENT. Pure I/O seam; unit tests inject a fake. */
+function removeLockFile(lockPath) {
+  try {
+    unlinkSync(lockPath);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+}
+
 // Default seams for findLiveRunLocks. Named per-field so tests can override
 // exactly one.
 const defaultLockSeams = {
   listLocks: listPipelineLocks,
   readLock: readLockFile,
   isPidLive: isPidLiveDefault,
+  removeLock: removeLockFile,
 };
 
 /** Pure scan: returns the subset of `/tmp/pipeline-*.lock` files that are held
  *  by a live PID, as `{ path, pid }`. A lock with unparseable contents (no
  *  integer PID) is treated as stale, not live — mirrors PipelineLock's garbage-
- *  contents handling. Performs no real filesystem/process-signal call when
- *  `listLocks`/`readLock`/`isPidLive` are all overridden (unit-test seam). */
+ *  contents handling. As a side effect, sweeps (unlinks) any lock whose PID is
+ *  provably dead (`isPidLive` false, i.e. ESRCH) or unparseable — the same
+ *  liveness semantics as PipelineLock, so a live or EPERM (conservatively
+ *  live) lock is never swept and still blocks. Performs no real
+ *  filesystem/process-signal call when `listLocks`/`readLock`/`isPidLive`/
+ *  `removeLock` are all overridden (unit-test seam). */
 function findLiveRunLocks({
   listLocks = defaultLockSeams.listLocks,
   readLock = defaultLockSeams.readLock,
   isPidLive = defaultLockSeams.isPidLive,
+  removeLock = defaultLockSeams.removeLock,
 } = {}) {
   const live = [];
   for (const lockPath of listLocks()) {
     const raw = readLock(lockPath);
-    if (raw === null) continue; // unreadable → treat as stale
+    if (raw === null) continue; // unreadable → treat as stale, leave in place
     const pid = Number.parseInt(raw, 10);
-    if (!Number.isFinite(pid) || pid <= 0) continue; // unparseable → stale
-    if (isPidLive(pid)) live.push({ path: lockPath, pid });
+    if (!Number.isFinite(pid) || pid <= 0) {
+      removeLock(lockPath); // unparseable → provably stale, sweep it
+      continue;
+    }
+    if (isPidLive(pid)) {
+      live.push({ path: lockPath, pid });
+    } else {
+      removeLock(lockPath); // ESRCH → provably dead, sweep it
+    }
   }
   return live;
 }

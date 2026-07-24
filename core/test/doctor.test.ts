@@ -76,6 +76,9 @@ interface FakeOverrides {
   fileMtime?: (p: string) => number | null;
   readTextFile?: (p: string) => string | null;
   onCall?: (file: string, args: string[]) => void;
+  listPipelineLocks?: () => string[];
+  isPidLive?: (pid: number) => boolean;
+  removeLockFile?: (p: string) => void;
 }
 
 /** Build DoctorDeps fakes. Defaults: every command succeeds, every path exists,
@@ -107,6 +110,11 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
         return 'CONTRACT_SCHEMA = "goal-loop/contract@2"\nLEDGER_SCHEMA = "goal-loop/ledger@2"\n';
       }
       return '{"version":"1.0.0"}';
+    },
+    listPipelineLocks: async () => (o.listPipelineLocks ? o.listPipelineLocks() : []),
+    isPidLive: async (pid) => (o.isPidLive ? o.isPidLive(pid) : true),
+    removeLockFile: async (p) => {
+      o.removeLockFile?.(p);
     },
   };
 }
@@ -528,6 +536,121 @@ test("check install:version-coherence — fails with reinstall remediation when 
   );
   assertFailWithRemediation(r);
   assert.match(r.remediation!, /reinstall/i);
+});
+
+// ---------------------------------------------------------------------------
+// locks:stale-sweep check (#567) — sweeps provably-dead pipeline locks and
+// warns on accumulation. Driven entirely through the injectable deps seam:
+// no real filesystem, process-signal, or subprocess call.
+// ---------------------------------------------------------------------------
+
+test("check locks:stale-sweep — no locks present → pass, nothing removed", async () => {
+  const removed: string[] = [];
+  const r = await getCheck(makeConfig(), "locks:stale-sweep").run(
+    fakeDeps({ listPipelineLocks: () => [], removeLockFile: (p) => removed.push(p) }),
+  );
+  assert.equal(r.status, "pass");
+  assert.deepEqual(removed, []);
+});
+
+test("check locks:stale-sweep — sweeps a dead-PID lock and passes below the warn threshold", async () => {
+  const removed: string[] = [];
+  const r = await getCheck(makeConfig(), "locks:stale-sweep").run(
+    fakeDeps({
+      listPipelineLocks: () => ["/tmp/pipeline-a-1.lock"],
+      readTextFile: () => "99999",
+      isPidLive: () => false,
+      removeLockFile: (p) => removed.push(p),
+    }),
+  );
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /swept 1/);
+  assert.deepEqual(removed, ["/tmp/pipeline-a-1.lock"]);
+});
+
+test("check locks:stale-sweep — sweeps a lock with unparseable contents", async () => {
+  const removed: string[] = [];
+  const r = await getCheck(makeConfig(), "locks:stale-sweep").run(
+    fakeDeps({
+      listPipelineLocks: () => ["/tmp/pipeline-a-1.lock"],
+      readTextFile: () => "not-a-pid",
+      isPidLive: () => true,
+      removeLockFile: (p) => removed.push(p),
+    }),
+  );
+  assert.equal(r.status, "pass");
+  assert.deepEqual(removed, ["/tmp/pipeline-a-1.lock"]);
+});
+
+test("check locks:stale-sweep — never sweeps a live lock", async () => {
+  const removed: string[] = [];
+  const r = await getCheck(makeConfig(), "locks:stale-sweep").run(
+    fakeDeps({
+      listPipelineLocks: () => ["/tmp/pipeline-a-1.lock"],
+      readTextFile: () => "12345",
+      isPidLive: () => true,
+      removeLockFile: (p) => removed.push(p),
+    }),
+  );
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /1 live/);
+  assert.deepEqual(removed, [], "a live lock must never be swept");
+});
+
+test("check locks:stale-sweep — never sweeps an unreadable lock", async () => {
+  const removed: string[] = [];
+  const r = await getCheck(makeConfig(), "locks:stale-sweep").run(
+    fakeDeps({
+      listPipelineLocks: () => ["/tmp/pipeline-a-1.lock"],
+      readTextFile: () => null,
+      isPidLive: () => true,
+      removeLockFile: (p) => removed.push(p),
+    }),
+  );
+  assert.equal(r.status, "pass");
+  assert.deepEqual(removed, []);
+});
+
+test("check locks:stale-sweep — warns (non-blocking) when swept count exceeds the accumulation threshold", async () => {
+  const removed: string[] = [];
+  const paths = Array.from({ length: 12 }, (_, i) => `/tmp/pipeline-a-${i}.lock`);
+  const r = await getCheck(makeConfig(), "locks:stale-sweep").run(
+    fakeDeps({
+      listPipelineLocks: () => paths,
+      readTextFile: () => "99999",
+      isPidLive: () => false,
+      removeLockFile: (p) => removed.push(p),
+    }),
+  );
+  assert.equal(r.status, "warn");
+  assert.match(r.detail, /12/);
+  assert.equal(removed.length, 12, "every stale lock is still swept even when warning");
+});
+
+test("check locks:stale-sweep — a warn does not fail overall runPreflight", async () => {
+  const cfg = makeConfig();
+  const paths = Array.from({ length: 12 }, (_, i) => `/tmp/pipeline-a-${i}.lock`);
+  const result = await runPreflight(
+    cfg,
+    fakeDeps({
+      listPipelineLocks: () => paths,
+      // Only stub lock-file reads with a dead PID; every other readTextFile
+      // caller (e.g. install:version-coherence, loop:contract-coherence) must
+      // keep getting fakeDeps' own default all-pass fixtures.
+      readTextFile: (p) => {
+        if (p.includes("pipeline-a-")) return "99999";
+        if (p.endsWith(".goal-loop-manifest.json")) return '{"package":"goal-loop","version":"0.2.0"}';
+        if (p.endsWith("state.py")) return 'CONTRACT_SCHEMA = "goal-loop/contract@2"\nLEDGER_SCHEMA = "goal-loop/ledger@2"\n';
+        return '{"version":"1.0.0"}';
+      },
+      isPidLive: () => false,
+    }),
+    {},
+    FAKE_VERSION,
+  );
+  const sweep = result.checks.find((c) => c.id === "locks:stale-sweep");
+  assert.equal(sweep?.status, "warn");
+  assert.equal(result.ok, true, "a warn must not fail the overall preflight result");
 });
 
 // ---------------------------------------------------------------------------

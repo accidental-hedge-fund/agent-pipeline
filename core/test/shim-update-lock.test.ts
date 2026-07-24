@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as vm from "node:vm";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -92,6 +93,89 @@ test("shim: refuses to start the engine while the installer's update lock is hel
       .readdirSync(isolatedTmp)
       .filter((f) => /^pipeline-starting-\d+\.lock$/.test(f));
     assert.deepEqual(reservations, [], "a refused start must not leave a dangling reservation");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(isolatedTmp, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Read-only-command exemption (#567) — `logs`/`status`/`summary` must not
+// reserve or hold the `pipeline-starting-<pid>.lock` slot, so a long-lived
+// `logs --follow` never blocks a concurrent `install.mjs update`. A
+// run-mutating command (e.g. `advance`) must keep reserving — the #450
+// deferral is unchanged.
+// ---------------------------------------------------------------------------
+
+/** Extract just the `READ_ONLY_COMMANDS` + `isReadOnlyCommand` source from the
+ *  template and evaluate it in an isolated vm context — proves the classifier
+ *  itself is a pure function with no real filesystem/process-signal/subprocess
+ *  call, independent of the rest of the shim (which does touch the filesystem). */
+function loadIsReadOnlyCommand(): (argv0: string | undefined) => boolean {
+  const src = fs.readFileSync(TEMPLATE_PATH, "utf8");
+  const start = src.indexOf("const READ_ONLY_COMMANDS");
+  const end = src.indexOf("function updateInProgress");
+  assert.ok(start >= 0 && end > start, "expected to find the read-only classifier block in the template");
+  const snippet = src.slice(start, end) + "\nisReadOnlyCommand";
+  const context = vm.createContext({});
+  return vm.runInContext(snippet, context);
+}
+
+test("isReadOnlyCommand: classifies logs/status/summary read-only, everything else run-mutating (pure, no I/O)", () => {
+  const isReadOnlyCommand = loadIsReadOnlyCommand();
+  assert.equal(isReadOnlyCommand("logs"), true);
+  assert.equal(isReadOnlyCommand("status"), true);
+  assert.equal(isReadOnlyCommand("summary"), true);
+  assert.equal(isReadOnlyCommand("advance"), false);
+  assert.equal(isReadOnlyCommand("loop"), false);
+  assert.equal(isReadOnlyCommand("queue"), false);
+  assert.equal(isReadOnlyCommand("improve"), false);
+  assert.equal(isReadOnlyCommand(undefined), false, "fail-safe default: unknown/absent command reserves");
+});
+
+test("shim: a logs-shaped invocation reserves no pipeline-starting-<pid>.lock, even under --follow", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-shim-readonly-test-"));
+  const isolatedTmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-shim-readonly-isolated-"));
+  try {
+    const shimPath = buildShimLayout(tmpDir, REPORT_RESERVATION_STUB);
+
+    const result = spawnSync(process.execPath, [shimPath, "logs", "42", "--events", "--follow"], {
+      encoding: "utf8",
+      env: { ...process.env, TMPDIR: isolatedTmp },
+    });
+
+    assert.equal(result.status, 0, `shim exited ${result.status}; stderr:\n${result.stderr}`);
+    const match = result.stdout.match(/RESERVED:(\[.*\])/);
+    assert.ok(match, `expected a RESERVED: line in stdout, got:\n${result.stdout}`);
+    const files = JSON.parse(match[1]);
+    assert.deepEqual(files, [], "a read-only `logs --follow` invocation must hold no run-liveness lock");
+
+    const remaining = fs
+      .readdirSync(isolatedTmp)
+      .filter((f) => /^pipeline-starting-\d+\.lock$/.test(f));
+    assert.deepEqual(remaining, [], "no reservation should remain after the read-only command exits");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(isolatedTmp, { recursive: true, force: true });
+  }
+});
+
+test("shim: a run-mutating invocation (advance) still reserves a pipeline-starting-<pid>.lock", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-shim-mutating-test-"));
+  const isolatedTmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-shim-mutating-isolated-"));
+  try {
+    const shimPath = buildShimLayout(tmpDir, REPORT_RESERVATION_STUB);
+
+    const result = spawnSync(process.execPath, [shimPath, "advance", "42"], {
+      encoding: "utf8",
+      env: { ...process.env, TMPDIR: isolatedTmp },
+    });
+
+    assert.equal(result.status, 0, `shim exited ${result.status}; stderr:\n${result.stderr}`);
+    const match = result.stdout.match(/RESERVED:(\[.*\])/);
+    assert.ok(match, `expected a RESERVED: line in stdout, got:\n${result.stdout}`);
+    const files = JSON.parse(match[1]);
+    assert.equal(files.length, 1, "a run-mutating command must still reserve exactly one slot (#450 unchanged)");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
     fs.rmSync(isolatedTmp, { recursive: true, force: true });

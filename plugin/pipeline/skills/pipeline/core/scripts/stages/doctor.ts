@@ -14,6 +14,7 @@ import * as path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import * as fs from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import type { PipelineConfig } from "../types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "../artifact-sanitize.ts";
@@ -44,6 +45,14 @@ export interface DoctorDeps {
   fileMtime(p: string): Promise<number | null>;
   /** Read a file as UTF-8 text; returns null on any error (missing, permission, etc). */
   readTextFile(p: string): Promise<string | null>;
+  /** List `/tmp/pipeline-*.lock` file paths (the same run-liveness lock naming
+   *  the installer's live-run scan and `PipelineLock` use). */
+  listPipelineLocks(): Promise<string[]>;
+  /** Whether `pid` is a live, signalable process. Same conservative semantics
+   *  as `PipelineLock`/the installer's scan: ESRCH → false, EPERM → true. */
+  isPidLive(pid: number): Promise<boolean>;
+  /** Unlink a lock file, ignoring a missing file. */
+  removeLockFile(p: string): Promise<void>;
 }
 
 export type CheckStatus = "pass" | "fail" | "skip" | "warn";
@@ -119,7 +128,36 @@ export function realDoctorDeps(): DoctorDeps {
       return null;
     }
   };
-  return { exec, execCheck, fsExists, fileMtime, readTextFile };
+  const listPipelineLocks: DoctorDeps["listPipelineLocks"] = async () => {
+    let entries: string[];
+    try {
+      entries = await fs.promises.readdir(tmpdir());
+    } catch {
+      return [];
+    }
+    return entries.filter((name) => /^pipeline-.*\.lock$/.test(name)).map((name) => path.join(tmpdir(), name));
+  };
+  // Mirrors PipelineLock.handleExistingLock / scripts/install.mjs's isPidLiveDefault.
+  const isPidLive: DoctorDeps["isPidLive"] = async (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code === "ESRCH") return false;
+      if (e.code === "EPERM") return true; // exists, can't signal → conservative
+      return false;
+    }
+  };
+  const removeLockFile: DoctorDeps["removeLockFile"] = async (p) => {
+    try {
+      await fs.promises.unlink(p);
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code !== "ENOENT") throw err;
+    }
+  };
+  return { exec, execCheck, fsExists, fileMtime, readTextFile, listPipelineLocks, isPidLive, removeLockFile };
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +192,11 @@ function protectedBranches(config: PipelineConfig): Set<string> {
  *  (the target repo the pipeline operates on). Mirrors the constant used by
  *  scripts/build.mjs, scripts/install.mjs, and scripts/postinstall.mjs. */
 const UPSTREAM_REPO = "accidental-hedge-fund/agent-pipeline";
+
+/** Above this many stale locks swept in one doctor run, surface a non-blocking
+ *  `warn` naming the count (#567) — evidence showed 58 accumulating on a host
+ *  where nothing ever ran the installer's scan. */
+const STALE_LOCK_WARN_THRESHOLD = 10;
 
 /** Strip a leading "v"/"V" so a release tag ("v1.14.0") and the running
  *  VERSION constant ("1.14.0") compare on the same footing. */
@@ -502,6 +545,50 @@ export function buildPreflightChecks(
     id: "loop:contract-coherence",
     description: "Installed goal-loop contract/ledger schema ids are within Pipeline's supported set",
     run: async (deps) => checkLoopContractCoherence(deps),
+  });
+
+  // 11. Stale pipeline lock sweep (#567) — /tmp/pipeline-*.lock files whose
+  //     recorded PID is provably dead accumulate when nothing else runs the
+  //     installer's live-run scan (a common case: a host that's never updated).
+  //     Doctor sweeps them here using the exact same conservative liveness
+  //     semantics as PipelineLock/the installer scan, so a live or EPERM
+  //     (unsignalable) lock is never touched. Non-blocking: this is
+  //     housekeeping, not a run-blocking defect.
+  checks.push({
+    id: "locks:stale-sweep",
+    description: "Stale (dead-PID) /tmp/pipeline-*.lock files are swept",
+    run: async (deps) => {
+      const lockPaths = await deps.listPipelineLocks();
+      let swept = 0;
+      let live = 0;
+      for (const lockPath of lockPaths) {
+        const raw = await deps.readTextFile(lockPath);
+        if (raw === null) continue; // unreadable → leave in place
+        const pid = Number.parseInt(raw.trim(), 10);
+        if (!Number.isFinite(pid) || pid <= 0) {
+          await deps.removeLockFile(lockPath); // unparseable → provably stale
+          swept++;
+          continue;
+        }
+        if (await deps.isPidLive(pid)) {
+          live++;
+        } else {
+          await deps.removeLockFile(lockPath); // ESRCH → provably dead
+          swept++;
+        }
+      }
+      if (swept === 0) {
+        return pass(live > 0 ? `no stale pipeline locks found (${live} live)` : "no pipeline locks found");
+      }
+      if (swept > STALE_LOCK_WARN_THRESHOLD) {
+        return warn(
+          `swept ${swept} stale pipeline lock(s) — more than ${STALE_LOCK_WARN_THRESHOLD} had accumulated`,
+          "No action needed — doctor already swept them. If this recurs often, something is exiting " +
+            "without releasing its lock (e.g. a killed run) — consider running doctor more regularly.",
+        );
+      }
+      return pass(`swept ${swept} stale pipeline lock(s)`);
+    },
   });
 
   return checks;
