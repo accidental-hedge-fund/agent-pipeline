@@ -581,6 +581,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.24.0** ✅ shipped | minor | Factory hygiene: release-discovery tolerance + cross-host auto-file serialization | #498, #459 | Shipped 2026-07-23 (tag `v1.24.0`). See **Shipped** above for the per-PR detail. |
 | **v1.25.0** ✅ shipped | minor | Correction intelligence: structured correction ledger, correction compiler, closed-loop attribution + salvage/intake/init hardening | #521, #522, #504, #539, #499, #500, #501 | Shipped 2026-07-23 (tag `v1.25.0`). See **Shipped** above for the per-PR detail. |
 | **v1.26.0** ✅ shipped | minor | Integrated Durable Orchestration: in-repo pipeline:loop supervisor + conflict-aware parallel execution | #509, #510, #511, #512, #513, #538, #514, #515, #529, #530, #531, #528 | Shipped 2026-07-24 (tag `v1.26.0`). See **Shipped** above for the per-PR detail. |
+| **v1.27.0** | minor | Trace-Driven Eval Engineering: human-approved trace-to-fixture authoring + bounded eval-diagnosis trajectory artifacts | #535, #536 | Human-approved trace-to-fixture authoring with explicit environment fidelity (#535), bounded treatment/verifier trajectory artifacts for eval diagnosis (#536). |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
