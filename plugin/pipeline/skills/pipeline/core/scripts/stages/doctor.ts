@@ -51,8 +51,21 @@ export interface DoctorDeps {
   /** Whether `pid` is a live, signalable process. Same conservative semantics
    *  as `PipelineLock`/the installer's scan: ESRCH → false, EPERM → true. */
   isPidLive(pid: number): Promise<boolean>;
-  /** Unlink a lock file, ignoring a missing file. */
-  removeLockFile(p: string): Promise<void>;
+  /** Atomically move a lock file believed stale out of the way for
+   *  re-inspection (rename, not unlink), so a concurrent `PipelineLock`
+   *  acquisition that reclaimed this exact path cannot have its fresh lock
+   *  disappear underneath it. Returns the claimed file's raw contents and the
+   *  path it now lives at, or `null` if `p` no longer existed (the race was
+   *  already resolved by someone else). */
+  claimStaleLockFile(p: string): Promise<{ claimPath: string; content: string | null } | null>;
+  /** Return a lock file claimed via `claimStaleLockFile` back to `originalPath`
+   *  without clobbering a fresh lock a third process may have created there in
+   *  the meantime (used when the claimed content turned out to belong to a
+   *  still-live process). Always removes the claim file afterward. */
+  restoreClaimedLockFile(claimPath: string, originalPath: string): Promise<void>;
+  /** Permanently discard a lock file claimed via `claimStaleLockFile` (the
+   *  claimed content was confirmed stale). */
+  discardClaimedLockFile(claimPath: string): Promise<void>;
 }
 
 export type CheckStatus = "pass" | "fail" | "skip" | "warn";
@@ -149,15 +162,64 @@ export function realDoctorDeps(): DoctorDeps {
       return false;
     }
   };
-  const removeLockFile: DoctorDeps["removeLockFile"] = async (p) => {
+  // Mirrors scripts/install.mjs's acquireUpdateLock stale-reclaim: rename is
+  // atomic, so exactly one racer captures whatever currently sits at `p` — a
+  // concurrent PipelineLock acquisition that already replaced the stale file
+  // with its own fresh lock is captured intact, never unlinked blind.
+  const claimStaleLockFile: DoctorDeps["claimStaleLockFile"] = async (p) => {
+    const claimPath = `${p}.stale-claim.${process.pid}`;
     try {
-      await fs.promises.unlink(p);
+      await fs.promises.rename(p, claimPath);
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code === "ENOENT") return null;
+      throw err;
+    }
+    let content: string | null;
+    try {
+      content = await fs.promises.readFile(claimPath, "utf8");
+    } catch {
+      content = null;
+    }
+    return { claimPath, content };
+  };
+  const restoreClaimedLockFile: DoctorDeps["restoreClaimedLockFile"] = async (claimPath, originalPath) => {
+    try {
+      // link (not rename) is atomic and fails with EEXIST instead of
+      // clobbering, so a third process that has since re-created
+      // originalPath is never overwritten.
+      await fs.promises.link(claimPath, originalPath);
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code !== "EEXIST") throw err;
+    }
+    try {
+      await fs.promises.unlink(claimPath);
     } catch (err) {
       const e = err as NodeJS.ErrnoException;
       if (e.code !== "ENOENT") throw err;
     }
   };
-  return { exec, execCheck, fsExists, fileMtime, readTextFile, listPipelineLocks, isPidLive, removeLockFile };
+  const discardClaimedLockFile: DoctorDeps["discardClaimedLockFile"] = async (claimPath) => {
+    try {
+      await fs.promises.unlink(claimPath);
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code !== "ENOENT") throw err;
+    }
+  };
+  return {
+    exec,
+    execCheck,
+    fsExists,
+    fileMtime,
+    readTextFile,
+    listPipelineLocks,
+    isPidLive,
+    claimStaleLockFile,
+    restoreClaimedLockFile,
+    discardClaimedLockFile,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -565,17 +627,27 @@ export function buildPreflightChecks(
         const raw = await deps.readTextFile(lockPath);
         if (raw === null) continue; // unreadable → leave in place
         const pid = Number.parseInt(raw.trim(), 10);
-        if (!Number.isFinite(pid) || pid <= 0) {
-          await deps.removeLockFile(lockPath); // unparseable → provably stale
-          swept++;
+        const provisionallyStale = !Number.isFinite(pid) || pid <= 0 || !(await deps.isPidLive(pid));
+        if (!provisionallyStale) {
+          live++;
           continue;
         }
-        if (await deps.isPidLive(pid)) {
+        // Claim atomically before discarding: a concurrent PipelineLock
+        // acquisition may have replaced this exact stale lock with its own
+        // fresh, live one between the probe above and now. Unlinking the
+        // path directly would delete that live reservation out from under it
+        // (#567 review 2, finding 8d28e405).
+        const claimed = await deps.claimStaleLockFile(lockPath);
+        if (claimed === null) continue; // already reclaimed by someone else
+        const claimedPid = claimed.content !== null ? Number.parseInt(claimed.content.trim(), 10) : NaN;
+        if (Number.isFinite(claimedPid) && claimedPid > 0 && (await deps.isPidLive(claimedPid))) {
+          // A fresh live lock landed here mid-sweep — give it back untouched.
+          await deps.restoreClaimedLockFile(claimed.claimPath, lockPath);
           live++;
-        } else {
-          await deps.removeLockFile(lockPath); // ESRCH → provably dead
-          swept++;
+          continue;
         }
+        await deps.discardClaimedLockFile(claimed.claimPath); // confirmed stale
+        swept++;
       }
       if (swept === 0) {
         return pass(live > 0 ? `no stale pipeline locks found (${live} live)` : "no pipeline locks found");
