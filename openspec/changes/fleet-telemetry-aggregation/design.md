@@ -68,7 +68,16 @@ spool-admitted envelopes rather than unconditional, because the spool has an **e
 overflow policy (customer-selected `drop-oldest` or `back-pressure`, never unbounded growth): under
 `drop-oldest`, an overflow-dropped envelope is accounted telemetry loss, not a silent violation of
 at-least-once — it is dropped by identified `run_id`/`seq`, counted in the drop count, and surfaced
-through delivery-health diagnostics; under `back-pressure`, nothing is dropped. A sink outage never
+through delivery-health diagnostics. Under `back-pressure`, admission of a new envelope into a full spool
+is delayed, but only up to a configured, bounded `admission_timeout`; the delay is applied to the
+fleet-delivery producer call (which is already asynchronous/non-blocking relative to the Pipeline stage,
+per the #343 non-fatal contract), never to the stage itself, so no stage outcome is ever changed or
+blocked. If the timeout elapses before spool space frees (via delivery/retirement), the new envelope is
+dropped as **accounted pre-admission loss** — identified by `run_id`/`seq`, counted in the same drop
+count, and surfaced through delivery-health diagnostics exactly like a `drop-oldest` drop. This resolves
+the three constraints (bounded spool, no silent loss, no stage impact) without requiring any of them to
+be unconditional: the spool never grows past its bound, every loss is accounted and observable, and the
+bound is enforced by dropping an admission candidate rather than by blocking the run. A sink outage never
 changes a stage outcome — delivery is best-effort relative to the run, exactly like the #343 non-fatal
 contract. Delivery lag, drop counts, rejected-schema counts, and last successful acknowledgement are
 exposed as machine-readable diagnostics.
@@ -109,26 +118,42 @@ are refused and audited, matching the tenant-isolation invariant already require
 Independently implemented senders and collectors interoperate only if they agree on more than field
 names. The contract fixes the following now, so it is implementable without further design work:
 - **Canonical encoding.** The envelope is a single UTF-8 JSON object per event (no batching envelope
-  around it at the wire level — batching, if used, is a transport-level array of these objects). Field
-  types: `tenant_id`, `installation_id`, `repo_id`, `host_id`, `run_id` are strings, 1–128 bytes,
-  `^[A-Za-z0-9_-]+$`; `pipeline_version` and `schema_version` are semver strings; `envelope_version` is
-  an integer `major.minor` pair encoded as the string `"<major>.<minor>"`; `seq` is a non-negative
-  integer, unique and monotonically increasing per `run_id`; `payload` is the verbatim, already-screened
+  around it at the wire level — batching, if used, is a transport-level array of these objects, each
+  still carrying its own full header). Field types: `tenant_id`, `installation_id`, `repo_id`, `host_id`
+  are strings, 1–128 bytes, `^[A-Za-z0-9_-]+$`; `run_id` is a string, 1–128 bytes,
+  `^[A-Za-z0-9_-]+$`, and MUST be a value with at least 122 bits of entropy (e.g. a UUIDv4 or ULID)
+  generated once per run and durably persisted (in the run's `run.json`) before the first event is
+  emitted, so it is globally unique within the installation and never reused or derived from mutable
+  process state; `pipeline_version` and `schema_version` are semver strings; `envelope_version` is an
+  integer `major.minor` pair encoded as the string `"<major>.<minor>"`; `seq` is a non-negative integer,
+  unique and monotonically increasing per `run_id`; `payload` is the verbatim, already-screened
   `events.jsonl` line, carried as an embedded JSON value (not a re-encoded string).
-- **Idempotency-key encoding.** The idempotency key is the lowercase-hex SHA-256 digest of the UTF-8
-  bytes `"{tenant_id}:{installation_id}:{run_id}:{seq}"`, sent as the `Idempotency-Key` request header
-  (or equivalent transport field) and never derived from mutable payload content.
+- **Idempotency-key encoding.** Each envelope carries its own idempotency key as an `idempotency_key`
+  field **inside the envelope object**, the lowercase-hex SHA-256 digest of the UTF-8 bytes
+  `"{tenant_id}:{installation_id}:{run_id}:{seq}"`, never derived from mutable payload content. This
+  keeps the key per-envelope rather than per-request, so it survives batching. For a single-envelope
+  request, the sender MAY additionally mirror the same value in an `Idempotency-Key` request header as a
+  transport-level convenience, but the embedded `idempotency_key` field is the authoritative identity in
+  both single and batch requests.
 - **Authenticated ingest request.** Delivery is an HTTPS `POST` to a collector-defined ingest endpoint,
   `Authorization: Bearer <scoped-ingest-credential>`, `Content-Type: application/json`, body containing
-  one envelope object. A batch profile MAY send a JSON array body of envelope objects under the same
-  headers; the collector advertises which it supports at `/fleet/v1/capabilities`.
-- **Acknowledgement / rejection schema.** The collector responds `202 Accepted` with
-  `{"status": "accepted", "idempotency_key": "<key>"}` on success (including on a deduplicated repeat —
-  the response is identical whether the envelope was newly stored or already seen), or a `4xx` with
-  `{"status": "rejected", "reason_code": "<machine-readable-code>", "detail": "<human string>"}` on
-  schema/version rejection. `reason_code` is drawn from a fixed enum (`malformed_envelope`,
-  `unsupported_major_version`, `unauthorized`, `cross_tenant_scope`) so senders can branch on it without
-  string matching. The response correlates to the request via the same `idempotency_key`.
+  one envelope object, or, under the batch profile, a JSON array of envelope objects (each with its own
+  `idempotency_key` as above — there is no request-level idempotency identity for a batch). The
+  collector advertises which mode(s) it supports at `/fleet/v1/capabilities`.
+- **Acknowledgement / rejection schema.** For a single-envelope request, the collector responds
+  `202 Accepted` with `{"status": "accepted", "idempotency_key": "<key>"}` on success (including on a
+  deduplicated repeat — the response is identical whether the envelope was newly stored or already
+  seen), or a `4xx` with `{"status": "rejected", "reason_code": "<machine-readable-code>",
+  "idempotency_key": "<key>", "detail": "<human string>"}` on schema/version rejection. `reason_code` is
+  drawn from a fixed enum (`malformed_envelope`, `unsupported_major_version`, `unauthorized`,
+  `cross_tenant_scope`) so senders can branch on it without string matching. The response correlates to
+  the request via the same `idempotency_key`, which is present on rejection responses too. For a batch
+  request, the collector responds `207 Multi-Status` with
+  `{"results": [{"idempotency_key": "<key>", "status": "accepted"|"rejected", "reason_code":
+  "<code-or-null>"}, ...]}`, one result per submitted envelope in request order, each keyed by that
+  envelope's own `idempotency_key`. A batch is never all-or-nothing: the sender retires each spooled
+  envelope independently as its own result arrives, so a partially invalid batch tells the sender exactly
+  which spooled records to retire, which to drop as rejected, and which to retry.
 - **Version-compatibility rule.** `envelope_version` follows semver-like major.minor: the collector
   rejects an envelope whose major component it does not list in `/fleet/v1/capabilities`, and accepts
   any minor within a supported major, tolerating unknown optional fields (D7).
@@ -141,6 +166,36 @@ names. The contract fixes the following now, so it is implementable without furt
 Transport implementations (sender or collector) MAY vary in language/runtime but MUST conform to this
 profile to interoperate; a future major transport revision follows the same `envelope_version` major-bump
 rule above.
+
+### D11 — Versioned authenticated query/report profile (the collector-side read contract)
+D8 requires cross-fleet reports and D6/D9 require query credentials to be tenant-scoped, but neither
+specifies a transport a sender-independent `pipeline fleet report` implementation can call. This
+decision fixes that contract, symmetric to D10's ingest profile:
+- **Endpoint and auth.** The collector exposes an authenticated HTTPS `POST /fleet/v1/query` endpoint,
+  `Authorization: Bearer <scoped-query-credential>`, `Content-Type: application/json`. The credential's
+  bound tenant is resolved from the credential itself (never from a request field), so a request cannot
+  claim a different tenant than its credential's scope.
+- **Request shape.** The JSON body carries: `time_window` (`{"from": "<RFC3339>", "to": "<RFC3339>"}`,
+  required), `filter` (optional object keyed by `installation_id`, `repo_id`, `host_id`,
+  `pipeline_version`, `stage`, `harness`, `outcome` — each an exact-match or array-of-exact-match value),
+  `group_by` (optional array drawn from the same dimension names), and `page` (optional
+  `{"cursor": "<opaque-string>", "limit": <int, default 100, max 1000>}`).
+- **Response shape.** `200 OK` with `{"metrics": [...], "lineage": {"<metric-id>": ["<run_id>", ...]}},
+  "next_cursor": "<opaque-string-or-null>"}`. Each entry in `metrics` carries a stable `metric_id` used
+  as the key into `lineage`, so every reported number traces back to its contributing `run_id`s (D8's
+  lineage requirement) without embedding full event payloads in the response. `next_cursor` is `null`
+  once the last page has been returned; the caller pages by resubmitting the same request with
+  `page.cursor` set to the previous `next_cursor`.
+- **Cross-tenant refusal.** If the request's `filter` names an `installation_id` outside the credential's
+  bound tenant, the collector responds `403` with the same rejection envelope as D10
+  (`{"status": "rejected", "reason_code": "cross_tenant_scope", "detail": "<human string>"}`) and returns
+  no data for the out-of-scope installation.
+- **Capabilities.** `/fleet/v1/capabilities` (D10) additionally advertises the supported query API
+  version, so `pipeline fleet report` can detect an incompatible collector before querying.
+
+This makes fleet reporting implementable end-to-end: `pipeline fleet report` is a client of this query
+endpoint, not a direct reader of collector storage, which also keeps the tenant-isolation invariant
+enforced in exactly one place (the collector).
 
 ## Relationship to adjacent issues
 - **#343** — reused: the sanitized, versioned records and the sink producer path are the substrate;

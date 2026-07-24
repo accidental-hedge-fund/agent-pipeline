@@ -27,18 +27,30 @@ and `improve` behavior SHALL remain unchanged.
 
 Each fleet envelope SHALL be delivered to the collector at least once, once it is successfully admitted
 to the durable local spool that fleet delivery writes to when active. An envelope SHALL be retired from the spool
-only upon a collector acknowledgement, and delivery SHALL survive process restart by replaying
-un-acknowledged spooled envelopes. Each envelope SHALL carry a deterministic idempotency key derived
-from `(tenant_id, installation_id, run_id, seq)` (or an equivalent event-content digest) so that
-duplicate delivery is deduplicable and does not skew metrics. The at-least-once guarantee applies only
-to envelopes admitted to the spool; an envelope dropped by the overflow policy (see below) before or
-after admission is accounted telemetry loss, not a violation of at-least-once.
+only upon a collector acknowledgement **of that specific envelope**, and delivery SHALL survive process
+restart by replaying un-acknowledged spooled envelopes. Each envelope SHALL carry its own deterministic
+idempotency key, embedded in the envelope itself (not a request-level header), derived from
+`(tenant_id, installation_id, run_id, seq)` (or an equivalent event-content digest) so that duplicate
+delivery is deduplicable and does not skew metrics. When multiple envelopes are delivered in one batch
+request, each envelope SHALL retire independently based on its own per-envelope result in the batch
+response — a batch SHALL NOT be treated as all-or-nothing, so a partially rejected batch retires only
+the accepted envelopes and leaves rejected/unacknowledged ones spooled for retry or diagnostic handling.
+The at-least-once guarantee applies only to envelopes admitted to the spool; an envelope dropped by the
+overflow policy (see below) before or after admission is accounted telemetry loss, not a violation of
+at-least-once.
 
 #### Scenario: envelope retires only on acknowledgement
 
 - **WHEN** a fleet envelope is delivered to the collector
-- **THEN** it SHALL be retired from the spool only after the collector acknowledges it
+- **THEN** it SHALL be retired from the spool only after the collector acknowledges that envelope
 - **AND** an un-acknowledged envelope SHALL remain spooled for retry
+
+#### Scenario: batch delivery retires only the accepted envelopes
+
+- **WHEN** a batch of envelopes is delivered and the collector's response accepts some and rejects others
+- **THEN** each accepted envelope SHALL retire from the spool independently, keyed by its own
+  `idempotency_key`
+- **AND** each rejected or unacknowledged envelope SHALL remain spooled for retry or diagnostic handling
 
 #### Scenario: spool replays after restart
 
@@ -60,9 +72,12 @@ silently mix the two. When the overflow policy engages, delivery SHALL emit a ma
 diagnostic identifying the affected envelope(s) (at minimum `run_id` and `seq`) and a running
 overflow-drop count, exposed through the delivery-health diagnostics (see below) as accounted telemetry
 loss rather than silent data loss. Under `drop-oldest`, the dropped envelope is always the
-oldest-`seq`-per-run entry currently in the spool; under `back-pressure`, no envelope is dropped and
-event emission SHALL continue without changing stage outcomes (per the non-fatal requirement below)
-even while the spool is full.
+oldest-`seq`-per-run entry currently in the spool. Under `back-pressure`, admission of a new envelope
+into a full spool SHALL be delayed, bounded by a configured `admission_timeout`, applied only to the
+fleet-delivery producer call (never to the Pipeline stage itself, consistent with the non-fatal
+requirement below); if the timeout elapses before spool space frees, the new envelope SHALL be dropped
+as accounted pre-admission loss — identified by `run_id`/`seq` and counted in the same overflow-drop
+count — rather than growing the spool or blocking the stage.
 
 #### Scenario: failed delivery retries with bounded backoff
 
@@ -77,10 +92,19 @@ even while the spool is full.
 - **AND** a machine-readable diagnostic SHALL identify the dropped envelope's `run_id`/`seq` and
   increment the delivery-health drop count
 
-#### Scenario: back-pressure overflow drops nothing
+#### Scenario: back-pressure overflow delays admission within a bounded timeout
 
-- **WHEN** the spool reaches its configured bound under `back-pressure`
-- **THEN** no envelope SHALL be dropped
+- **WHEN** the spool reaches its configured bound under `back-pressure` and space frees before the
+  configured `admission_timeout` elapses
+- **THEN** the new envelope SHALL be admitted once space frees
+- **AND** event emission SHALL continue without changing any Pipeline stage outcome
+
+#### Scenario: back-pressure overflow drops the new envelope after the admission timeout
+
+- **WHEN** the spool remains full under `back-pressure` for longer than the configured
+  `admission_timeout`
+- **THEN** the new envelope SHALL be dropped as accounted pre-admission loss, identified by `run_id`/`seq`
+  and counted in the overflow-drop count
 - **AND** event emission SHALL continue without changing any Pipeline stage outcome
 
 ### Requirement: Delivery failures never change a stage outcome and delivery health is observable

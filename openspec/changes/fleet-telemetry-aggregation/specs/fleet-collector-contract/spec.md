@@ -2,24 +2,35 @@
 
 ### Requirement: Collector implements a versioned wire transport profile
 
-The collector SHALL expose an authenticated HTTPS ingest endpoint accepting one envelope (or a JSON
-array of envelopes) per request, bound to the canonical field types/limits and idempotency-key encoding
-defined in the design's wire transport profile (`design.md` D10). The collector SHALL respond to a
-successful ingest with a `202`-class acknowledgement carrying the envelope's idempotency key, and to a
-rejection with a `4xx`-class response carrying a machine-readable `reason_code` drawn from a fixed enum
-and the same idempotency key for correlation. The collector SHALL advertise its supported
-`envelope_version` majors and request-batching mode at a capabilities endpoint.
+The collector SHALL expose an authenticated HTTPS ingest endpoint accepting one envelope, or, under the
+batch profile, a JSON array of envelopes, per request, bound to the canonical field types/limits and
+per-envelope idempotency-key encoding defined in the design's wire transport profile (`design.md` D10).
+For a single-envelope request, the collector SHALL respond to a successful ingest with a `202`-class
+acknowledgement carrying the envelope's idempotency key, and to a rejection with a `4xx`-class response
+carrying a machine-readable `reason_code` drawn from a fixed enum and the same idempotency key for
+correlation. For a batch request, the collector SHALL respond `207 Multi-Status` with a per-envelope
+`results` array — one entry per submitted envelope, each keyed by that envelope's own idempotency key and
+carrying its own `accepted`/`rejected` status and `reason_code` — so a partially invalid batch is never
+treated as all-or-nothing. The collector SHALL advertise its supported `envelope_version` majors and
+request-batching mode at a capabilities endpoint.
 
 #### Scenario: acknowledgement correlates to the request
 
-- **WHEN** the collector accepts an envelope
+- **WHEN** the collector accepts a single-envelope request
 - **THEN** it SHALL respond with a `202`-class acknowledgement carrying that envelope's idempotency key
 
 #### Scenario: rejection carries a machine-readable reason code
 
-- **WHEN** the collector rejects an envelope
+- **WHEN** the collector rejects a single-envelope request
 - **THEN** it SHALL respond with a `4xx`-class response carrying a `reason_code` from a fixed enum and
   the envelope's idempotency key
+
+#### Scenario: batch response carries a per-envelope result
+
+- **WHEN** the collector receives a batch request containing a mix of valid and invalid envelopes
+- **THEN** it SHALL respond `207 Multi-Status` with one result per submitted envelope, each keyed by that
+  envelope's own idempotency key and carrying its own accept/reject status and reason code
+- **AND** the acceptance of one envelope in the batch SHALL NOT be affected by the rejection of another
 
 #### Scenario: capabilities are advertised
 
@@ -97,6 +108,24 @@ regardless of arrival order.
 - **WHEN** envelopes for one run arrive out of `seq` order
 - **THEN** the collector SHALL reconstruct their order from `(run_id, seq)`
 
+### Requirement: Collector enforces run-id uniqueness within an installation
+
+The collector SHALL treat `run_id` as unique within an installation and SHALL NOT silently merge or
+interleave envelopes from two distinct runs that present the same `run_id` under the same
+`installation_id`. When the collector observes `seq` values for a given `(installation_id, run_id)` pair
+that are inconsistent with a single monotonic per-run sequence (for example, a lower `seq` arriving after
+a materially later one has already advanced the run's high-water mark by more than the collector's
+configured reordering tolerance), it SHALL flag the run as a duplicate-run-id conflict rather than
+merging the conflicting streams into one ordered run, and SHALL surface the conflict through the
+delivery-health diagnostics.
+
+#### Scenario: duplicate run-id from two hosts is flagged, not merged
+
+- **WHEN** two distinct hosts each emit envelopes using the same `run_id` under the same
+  `installation_id`, producing sequences that cannot both be a single monotonic per-run order
+- **THEN** the collector SHALL flag a duplicate-run-id conflict for that `(installation_id, run_id)` pair
+- **AND** it SHALL NOT silently interleave the two hosts' events into one merged per-run order
+
 ### Requirement: Collector writes to customer-owned storage with no upstream path
 
 The reference collector SHALL write ingested telemetry to customer-owned storage on the customer's
@@ -109,3 +138,29 @@ own storage.
 - **WHEN** the collector ingests fleet telemetry
 - **THEN** it SHALL write to customer-owned storage
 - **AND** it SHALL NOT forward the telemetry to Agent Pipeline maintainers
+
+### Requirement: Collector implements an authenticated query/report endpoint
+
+The collector SHALL expose an authenticated `POST /fleet/v1/query` endpoint, bound to the query request
+and response shape defined in the design's query profile (`design.md` D11): a scoped query credential in
+`Authorization: Bearer`, a request body carrying a required `time_window` and optional `filter`,
+`group_by`, and `page` fields, and a response carrying aggregated `metrics`, a `lineage` map from each
+metric's id to its contributing `run_id`s, and a `next_cursor` for pagination. The credential's bound
+tenant SHALL be resolved from the credential itself, never from a request field, and a request whose
+`filter` names an installation outside the credential's tenant scope SHALL be refused with a `403` and
+the `cross_tenant_scope` reason code, returning no data for the out-of-scope installation. This is the
+only transport through which `pipeline fleet report` (see the `fleet-reporting` capability) retrieves
+collected telemetry.
+
+#### Scenario: a scoped query returns paginated, lineage-preserving metrics
+
+- **WHEN** a query credential scoped to tenant A requests a report for a time window
+- **THEN** the collector SHALL respond with metrics, a lineage map from each metric to its contributing
+  `run_id`s, and a `next_cursor` that is `null` once the last page has been returned
+
+#### Scenario: cross-tenant filter is refused
+
+- **WHEN** a query credential scoped to tenant A submits a `filter` naming an installation belonging to
+  tenant B
+- **THEN** the collector SHALL refuse the request with a `403` and the `cross_tenant_scope` reason code
+- **AND** it SHALL NOT return tenant B's data

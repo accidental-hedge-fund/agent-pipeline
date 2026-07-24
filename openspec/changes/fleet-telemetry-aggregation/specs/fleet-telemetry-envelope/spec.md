@@ -7,7 +7,10 @@ The fleet telemetry envelope SHALL wrap each sanitized run event (the record del
 `installation_id`, pseudonymous `repo_id`, pseudonymous `host_id`, `pipeline_version`, `run_id`, the
 event `schema_version`, an explicit `envelope_version`, and a per-run monotonically increasing `seq`.
 The wrapped payload SHALL be byte-identical to the line written to `events.jsonl` for that same event,
-and the envelope SHALL add no fields to the payload itself.
+and the envelope SHALL add no fields to the payload itself. `run_id` SHALL be a value with at least 122
+bits of entropy (e.g. a UUIDv4 or ULID), generated once per run and durably persisted before the first
+event of that run is emitted, so that it is unique across every repository and host in the installation
+and is never reused or reconstructed from mutable process state.
 
 #### Scenario: envelope carries stable fleet identity
 
@@ -22,6 +25,13 @@ and the envelope SHALL add no fields to the payload itself.
 - **THEN** each envelope SHALL carry a per-run monotonically increasing `seq`
 - **AND** a consumer SHALL be able to reconstruct append order from `(run_id, seq)` even when envelopes
   arrive out of order
+
+#### Scenario: run id is unique across hosts in the installation
+
+- **WHEN** two distinct hosts in the same installation each start a new run
+- **THEN** each run SHALL generate its own high-entropy `run_id` and durably persist it before emitting
+  its first event
+- **AND** the two runs SHALL NOT share a `run_id`
 
 #### Scenario: envelope adds no payload fields and preserves schema version
 

@@ -4,9 +4,11 @@
 
 The pipeline SHALL provide a read-only fleet report that aggregates the existing `scoreboard` and
 `improve` metrics across authorized repositories and hosts from the collected fleet telemetry. The
-report SHALL be available in both human-readable and JSON form, and SHALL NOT mutate GitHub
-labels/comments, worktrees, pipeline configuration, or any run artifact — mirroring the read-only
-contract of the local `scoreboard` and `improve` commands.
+report SHALL be retrieved via the authenticated `POST /fleet/v1/query` endpoint defined by the
+`fleet-collector-contract` capability (`design.md` D11), authenticating with a scoped query credential
+rather than reading collector storage directly. The report SHALL be available in both human-readable and
+JSON form, and SHALL NOT mutate GitHub labels/comments, worktrees, pipeline configuration, or any run
+artifact — mirroring the read-only contract of the local `scoreboard` and `improve` commands.
 
 #### Scenario: fleet report aggregates existing scoreboard metrics
 
