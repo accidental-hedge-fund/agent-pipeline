@@ -78,6 +78,11 @@
 
 ## 6. Gate
 
-- [ ] 6.1 `node scripts/build.mjs` regenerates the `plugin/` mirror; commit it in the same change.
-- [ ] 6.2 `npm run ci` (incl. `openspec validate --all`) is green; every new test bites (fails without
+- [x] 6.1 `node scripts/build.mjs` regenerates the `plugin/` mirror; commit it in the same change.
+- [x] 6.2 `npm run ci` (incl. `openspec validate --all`) is green; every new test bites (fails without
       the guard).
+
+Sections 1–5 above describe the accepted implementation order for the tracked follow-up issues
+(see "Deferred implementation" in `proposal.md`); this OpenSpec change is intent-only and lands no
+application code, so those items stay unchecked here and are the scope of their own follow-up
+changes.
