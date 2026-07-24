@@ -150,6 +150,47 @@ test("selectSchedulableSet: a dependent and its prerequisite are never co-admitt
   assert.equal(bRationale?.counterpart_item_id, "a");
 });
 
+test("selectSchedulableSet: a three-item dependency chain records both direct and transitive serialized pairs", () => {
+  // Chain a <- b <- c. The frontier's safety check (hasDependencyPath) is transitive, so the
+  // scheduler serializes pair c:a as well as c:b — the durable rationale must therefore name
+  // both counterparts for "c", not only its direct depends_on edge (#528 pre-merge delta
+  // finding 043b3c36). Without the transitive traversal this test fails: "c" would receive a
+  // single dependency_path entry naming "b" and the c:a pair would be absent from the ledger.
+  const contract = makeContract(
+    [
+      contractItem("a", { ownership: disjoint("src/a.ts") }),
+      contractItem("b", { depends_on: ["a"], ownership: disjoint("src/b.ts") }),
+      contractItem("c", { depends_on: ["b"], ownership: disjoint("src/c.ts") }),
+    ],
+    { concurrency: { max_concurrent: 5 } },
+  );
+  const ledger = makeLedger([ledgerEntry("a"), ledgerEntry("b"), ledgerEntry("c")]);
+  const decision = selectSchedulableSet({ contract, ledger });
+  assert.deepEqual(decision.selected, ["a"]);
+  const bPairs = decision.rationale.filter((r) => r.item_id === "b" && r.disposition === "dependency_path").map((r) => r.counterpart_item_id);
+  assert.deepEqual(bPairs, ["a"]);
+  const cPairs = decision.rationale.filter((r) => r.item_id === "c" && r.disposition === "dependency_path").map((r) => r.counterpart_item_id);
+  assert.deepEqual(cPairs.sort(), ["a", "b"]);
+});
+
+test("selectSchedulableSet: a diamond dependency graph deduplicates the shared transitive counterpart", () => {
+  // d depends on b and c, both of which depend on a: the traversal reaches "a" twice but must
+  // record the d:a pair exactly once.
+  const contract = makeContract(
+    [
+      contractItem("a", { ownership: disjoint("src/a.ts") }),
+      contractItem("b", { depends_on: ["a"], ownership: disjoint("src/b.ts") }),
+      contractItem("c", { depends_on: ["a"], ownership: disjoint("src/c.ts") }),
+      contractItem("d", { depends_on: ["b", "c"], ownership: disjoint("src/d.ts") }),
+    ],
+    { concurrency: { max_concurrent: 5 } },
+  );
+  const ledger = makeLedger([ledgerEntry("a"), ledgerEntry("b"), ledgerEntry("c"), ledgerEntry("d")]);
+  const decision = selectSchedulableSet({ contract, ledger });
+  const dPairs = decision.rationale.filter((r) => r.item_id === "d" && r.disposition === "dependency_path").map((r) => r.counterpart_item_id);
+  assert.deepEqual(dPairs.sort(), ["a", "b", "c"]);
+});
+
 test("selectSchedulableSet: without the scheduler's dependency-free check a same-pass sibling dependency would be admitted", () => {
   // Proves the test bites: a naive scheduler that only budget-truncates (ignoring dependency
   // edges) would admit both "a" and "b" once "a" is DONE and "b" is eligible — the pairwise

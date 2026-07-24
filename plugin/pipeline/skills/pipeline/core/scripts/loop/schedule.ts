@@ -60,22 +60,33 @@ function hasDependencyPath(itemsById: ReadonlyMap<string, LoopContractItem>, a: 
 }
 
 /** Records a `dependency_path` rationale entry for every `pending` item excluded from the
- *  frontier by {@link eligibleIndependentItems} because one of its own declared `depends_on`
- *  edges names an item that is not yet done — the pairwise decision the pre-frontier dependency
- *  filter makes but, absent this, never durably recorded (#528 review round 2). These items never
- *  reach the frontier's own pairwise `dependency_path` check (a defense-in-depth guard against a
- *  case the pre-filter already rules out — see {@link hasDependencyPath}'s docstring), so without
- *  this the run-scoped parallelization ledger would have no entry at all for a dependency-linked
- *  pair. */
+ *  frontier by {@link eligibleIndependentItems}, naming every not-yet-done dependency counterpart
+ *  reachable over the item's **declared dependency graph** — transitive edges included, not just
+ *  the item's own `depends_on` list (#528 pre-merge delta finding 043b3c36). The frontier's safety
+ *  check ({@link hasDependencyPath}) is transitive, so for a chain a <- b <- c the scheduler
+ *  serializes pair c:a as well as c:b — and the durable evidence must name both, or the
+ *  parallelization ledger under-reports why a dependency-linked pair never ran concurrently.
+ *  These items never reach the frontier's own pairwise `dependency_path` check (a defense-in-depth
+ *  guard against a case the pre-filter already rules out — see {@link hasDependencyPath}'s
+ *  docstring), so without this the run-scoped parallelization ledger would have no entry at all
+ *  for a dependency-linked pair. Breadth-first over contract-declared edges keeps the emission
+ *  order deterministic; the `visited` set deduplicates diamond-shaped graphs. */
 function dependencyBlockedRationale(contract: LoopContract, ledger: LoopLedger): ScheduleRationale[] {
+  const itemsById = new Map(contract.items.map((item) => [item.id, item]));
   const rationale: ScheduleRationale[] = [];
   for (const item of contract.items) {
     if (ledger.items[item.id]?.state !== "pending") continue;
-    for (const dep of item.depends_on ?? []) {
+    const queue = [...(item.depends_on ?? [])];
+    const visited = new Set<string>();
+    while (queue.length > 0) {
+      const dep = queue.shift()!;
+      if (visited.has(dep)) continue;
+      visited.add(dep);
       const depEntry = ledger.items[dep];
       if (depEntry === undefined || !DONE_STATES.has(depEntry.state)) {
         rationale.push({ item_id: item.id, disposition: "dependency_path", counterpart_item_id: dep });
       }
+      queue.push(...(itemsById.get(dep)?.depends_on ?? []));
     }
   }
   return rationale;
