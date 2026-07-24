@@ -21,6 +21,7 @@ import { computeDiffHash, DELTA_REVIEW_MARKER_PREFIX } from "../scripts/stages/r
 import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
 import type { InvokeFn } from "../scripts/openspec-consistency.ts";
 import type { PriorRoundDigest } from "../scripts/review-history.ts";
+import type { TrySalvageResult } from "../scripts/salvage-harness-work.ts";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -1368,3 +1369,208 @@ test(
     );
   },
 );
+
+// ---------------------------------------------------------------------------
+// #547: pre-merge auto-fix salvage — no new commit + dirty worktree gets
+// salvaged into a commit instead of discarded via reset --hard / clean -fd.
+// ---------------------------------------------------------------------------
+
+function makeFailInvoke(timedOut = false): InvokeFn {
+  return async () => ({
+    success: false,
+    stdout: "",
+    stderr: "",
+    exit_code: timedOut ? 124 : 1,
+    duration: 1,
+    timed_out: timedOut,
+  });
+}
+
+function makeSalvageFn(result: TrySalvageResult): {
+  fn: (wtPath: string, issueNumber: number, pipelineRunId: string, stageLabel: string) => Promise<TrySalvageResult>;
+  calls: string[];
+} {
+  const calls: string[] = [];
+  return {
+    fn: async (_wtPath, _issueNumber, _pipelineRunId, stageLabel) => {
+      calls.push(stageLabel);
+      return result;
+    },
+    calls,
+  };
+}
+
+test("performPreMergeAutoFix #547: harness times out with a dirty worktree → salvaged, amended, pushed (not discarded)", async () => {
+  const { fn: gitFn, calls } = makeSeqGitFn([
+    // rev-parse HEAD (headBefore)
+    { code: 0, stdout: "sha1" },
+    // status --porcelain (pre-fix: clean)
+    { code: 0, stdout: "" },
+    // checkout -B <branch> (reattach succeeds)
+    { code: 0, stdout: "" },
+    // rev-parse HEAD (headAfterHarness — SAME as headBefore: no new commit)
+    { code: 0, stdout: "sha1" },
+    // commit --amend -m ... (amend succeeds, over the salvaged commit)
+    { code: 0, stdout: "" },
+    // rev-parse HEAD (postFixHead, read after the amend — #371)
+    { code: 0, stdout: "sha3" },
+    // push origin <branch> (push succeeds)
+    { code: 0, stdout: "" },
+  ]);
+  const { fn: salvageFn, calls: salvageCalls } = makeSalvageFn({ salvaged: true });
+
+  const result = await performPreMergeAutoFix(
+    autoFixCfg,
+    42,
+    "run-id",
+    "finding: dirty state",
+    "Test issue",
+    autoFixWt,
+    gitFn,
+    makeFailInvoke(true),
+    salvageFn,
+  );
+
+  assert.deepEqual(
+    result,
+    { status: "fix-committed", headSha: "sha3" },
+    "a crashed/timed-out harness's uncommitted work must be salvaged and pushed, not discarded",
+  );
+  assert.equal(salvageCalls.length, 1, "salvage must be attempted exactly once");
+  const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
+  assert.equal(resetCall, undefined, "a successful salvage must NOT roll back the worktree");
+});
+
+test("performPreMergeAutoFix #547: harness reports success without committing, worktree dirty → salvaged, amended, pushed", async () => {
+  const { fn: gitFn, calls } = makeSeqGitFn([
+    // rev-parse HEAD (headBefore)
+    { code: 0, stdout: "sha1" },
+    // status --porcelain (pre-fix: clean)
+    { code: 0, stdout: "" },
+    // checkout -B <branch> (reattach succeeds)
+    { code: 0, stdout: "" },
+    // rev-parse HEAD (headAfterHarness — SAME as headBefore: no new commit)
+    { code: 0, stdout: "sha1" },
+    // commit --amend -m ... (amend succeeds, over the salvaged commit)
+    { code: 0, stdout: "" },
+    // rev-parse HEAD (postFixHead, read after the amend — #371)
+    { code: 0, stdout: "sha3" },
+    // push origin <branch> (push succeeds)
+    { code: 0, stdout: "" },
+  ]);
+  const { fn: salvageFn, calls: salvageCalls } = makeSalvageFn({ salvaged: true });
+
+  const result = await performPreMergeAutoFix(
+    autoFixCfg,
+    42,
+    "run-id",
+    "finding: need fix",
+    "Test issue",
+    autoFixWt,
+    gitFn,
+    makeSucceedInvoke(),
+    salvageFn,
+  );
+
+  assert.deepEqual(
+    result,
+    { status: "fix-committed", headSha: "sha3" },
+    "harness work left uncommitted must be salvaged and pushed, not discarded (issue #547, run 648)",
+  );
+  assert.equal(salvageCalls.length, 1, "salvage must be attempted exactly once");
+  const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
+  assert.equal(resetCall, undefined, "a successful salvage must NOT roll back the worktree");
+});
+
+test("performPreMergeAutoFix #547: genuinely clean worktree (nothing to salvage) → existing fail-closed rollback unchanged", async () => {
+  const { fn: gitFn, calls } = makeSeqGitFn([
+    // rev-parse HEAD (headBefore)
+    { code: 0, stdout: "sha1" },
+    // status --porcelain (pre-fix: clean)
+    { code: 0, stdout: "" },
+    // checkout -B <branch> (reattach succeeds)
+    { code: 0, stdout: "" },
+    // rev-parse HEAD (headAfterHarness — SAME as headBefore: no new commit)
+    { code: 0, stdout: "sha1" },
+    // reset --hard sha1 (rollback, since salvage found nothing)
+    { code: 0, stdout: "" },
+    // clean -fd (rollback)
+    { code: 0, stdout: "" },
+  ]);
+  const { fn: salvageFn, calls: salvageCalls } = makeSalvageFn({ salvaged: false });
+
+  const result = await performPreMergeAutoFix(
+    autoFixCfg,
+    42,
+    "run-id",
+    "finding: need fix",
+    "Test issue",
+    autoFixWt,
+    gitFn,
+    makeFailInvoke(true),
+    salvageFn,
+  );
+
+  assert.deepEqual(
+    result,
+    { status: "error" },
+    "a clean worktree (nothing salvageable) must keep the existing fail-closed rollback",
+  );
+  assert.equal(salvageCalls.length, 1, "salvage is attempted (and finds nothing) before rollback");
+  const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
+  assert.ok(resetCall, "git reset --hard must still be called when nothing was salvaged");
+});
+
+test("performPreMergeAutoFix #547: harness committed AND left extra dirt → ambiguous case stays out of scope, existing rollback unchanged", async () => {
+  const { fn: gitFn, calls } = makeSeqGitFn([
+    // rev-parse HEAD (headBefore)
+    { code: 0, stdout: "sha1" },
+    // status --porcelain (pre-fix: clean)
+    { code: 0, stdout: "" },
+    // checkout -B <branch> (reattach succeeds)
+    { code: 0, stdout: "" },
+    // rev-parse HEAD (headAfterHarness — DIFFERENT: a commit was made)
+    { code: 0, stdout: "sha2" },
+    // status --porcelain (post-harness: extra dirt remains)
+    { code: 0, stdout: "M  core/scripts/foo.ts" },
+    // reset --hard sha1 (rollback)
+    { code: 0, stdout: "" },
+    // clean -fd (rollback)
+    { code: 0, stdout: "" },
+  ]);
+  const { fn: salvageFn, calls: salvageCalls } = makeSalvageFn({ salvaged: true });
+
+  const result = await performPreMergeAutoFix(
+    autoFixCfg,
+    42,
+    "run-id",
+    "finding: need fix",
+    "Test issue",
+    autoFixWt,
+    gitFn,
+    makeSucceedInvoke(),
+    salvageFn,
+  );
+
+  assert.deepEqual(
+    result,
+    { status: "error" },
+    "a commit alongside extra leftover dirt is out of scope (design decision 2) — must still roll back",
+  );
+  assert.equal(
+    salvageCalls.length, 0,
+    "salvage must NOT be attempted when the harness already produced a commit",
+  );
+  const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
+  assert.ok(resetCall, "git reset --hard must still be called for the ambiguous commit+dirt case");
+});
+
+// Bite check: without the #547 salvage wiring (i.e. the pre-change code),
+// the "harness times out with a dirty worktree" scenario above would instead
+// hit the unconditional `!result.success` rollback (never calling salvageFn,
+// never checking hasNewCommitHarness) and return `{ status: "error" }` — the
+// exact behavior observed on lyric-utils run 648/2026-07-23 that this change
+// fixes. This is proven by the assertions above: `salvageCalls.length === 1`
+// only holds because the fix calls `salvageFn` before rolling back on the
+// crash path, and `result.status === "fix-committed"` only holds because a
+// successful salvage is no longer discarded.
