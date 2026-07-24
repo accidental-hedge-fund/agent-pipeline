@@ -5,7 +5,20 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { runJudging, deterministicPass } from "../scripts/evals/grading/judge.ts";
 import { blindDisagreement, opaqueKeyForCell, resolveAdjudication } from "../scripts/evals/grading/adjudication.ts";
+import type { ArtifactStoreDeps } from "../scripts/evals/trajectory/store.ts";
 import type { GradeRecord } from "../scripts/evals/grading/types.ts";
+
+function fakeArtifactFs(): ArtifactStoreDeps & { files: Map<string, string> } {
+  const files = new Map<string, string>();
+  return {
+    files,
+    mkdir: async () => {},
+    writeFile: async (p, content) => {
+      files.set(p, content);
+    },
+    readFile: async (p) => (files.has(p) ? files.get(p)! : null),
+  };
+}
 
 function baseGrade(overrides: Partial<GradeRecord> = {}): GradeRecord {
   return {
@@ -83,6 +96,45 @@ test("agreement produces no disagreement record", async () => {
     judgePromptVersion: "v1",
   });
   assert.equal(disagreements.length, 0);
+});
+
+test("a configured verifier byte ceiling truncates judge evidence deterministically (#536 review 2)", async () => {
+  const grade = baseGrade();
+  const artifactStore = {
+    repoDir: "/repo",
+    verifiersDir: "/repo/.agent-pipeline/evals/exp1/verifiers",
+  };
+  const deps = {
+    invokeJudge: async () => ({ pass: true }),
+    judgeHarness: "claude",
+    judgeModel: "sonnet",
+    judgePromptVersion: "v1",
+    verifierCeilings: { maxEvents: 200, maxBytes: 10 },
+  };
+
+  const fs1 = fakeArtifactFs();
+  const { judgeRecords: first } = await runJudging([grade], { ...deps, artifactStore: { ...artifactStore, deps: fs1 } });
+  assert.ok(first[0].verifier_artifact, "expected a verifier artifact descriptor");
+  assert.equal(first[0].verifier_artifact!.truncation_status, "truncated");
+
+  // Deterministic: bounding the same input with the same ceilings twice
+  // produces byte-identical artifact content (same content hash).
+  const fs2 = fakeArtifactFs();
+  const { judgeRecords: second } = await runJudging([grade], { ...deps, artifactStore: { ...artifactStore, deps: fs2 } });
+  assert.equal(second[0].verifier_artifact!.content_hash, first[0].verifier_artifact!.content_hash);
+
+  // Without a custom ceiling (default 200KB), the same small grade fits
+  // untruncated — proving the small ceiling above, not the grade itself,
+  // caused the truncation.
+  const fs3 = fakeArtifactFs();
+  const { judgeRecords: untruncated } = await runJudging([grade], {
+    invokeJudge: deps.invokeJudge,
+    judgeHarness: deps.judgeHarness,
+    judgeModel: deps.judgeModel,
+    judgePromptVersion: deps.judgePromptVersion,
+    artifactStore: { ...artifactStore, deps: fs3 },
+  });
+  assert.equal(untruncated[0].verifier_artifact!.truncation_status, "none");
 });
 
 test("adjudication material is blinded: no harness/provider/model/effort string appears", () => {

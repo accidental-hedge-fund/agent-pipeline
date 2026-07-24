@@ -65,10 +65,11 @@ function manifestJson() {
 function makeFilesFakeFs(files: Record<string, string>) {
   const written: Record<string, string> = {};
   return {
-    readFile: async (p: string) => (p in files ? files[p] : null),
+    readFile: async (p: string) => (p in files ? files[p] : (p in written ? written[p] : null)),
     writeFile: async (p: string, content: string) => {
       written[p] = content;
     },
+    mkdir: async (_dir: string) => {},
     written,
   };
 }
@@ -286,6 +287,48 @@ test("gradeExperiment: a completed end-to-end cell emits a composite grade for i
     grades[0].graders.map((g) => g.grader).sort(),
     ["planning", "review"],
   );
+});
+
+test("gradeExperiment: a composite grade emits one independently-addressable verifier artifact per sub-grader, not one collapsed 'composite' artifact (review 1 finding c7218eb4)", async () => {
+  const runRecord = {
+    cell_id: "exp1/e2e/harness=claude/1",
+    experiment_id: "exp1",
+    fixture_id: "e2e",
+    treatment_id: "harness=claude",
+    replicate: 1,
+    prompt_hash: "h",
+    config_hash: "c",
+    base_sha: SHA,
+    result_class: "completed",
+    detail: {
+      stages: [],
+      output_text: "1. Add a flag.",
+      findings: [{ file: "a.ts", line_start: 11, line_end: 11, severity: "high" }],
+    },
+  };
+  const files = {
+    "/out/exp1/manifest.json": endToEndManifestJson(),
+    "/out/exp1/runs.jsonl": `${JSON.stringify(runRecord)}\n`,
+  };
+  const fake = makeFilesFakeFs(files);
+  const fixtures = new Map([["e2e", fixtureEndToEnd()]]);
+  const { grades } = await gradeExperiment(CFG, "/out", "exp1", fixtures, {
+    readFile: fake.readFile,
+    writeFile: fake.writeFile,
+    mkdir: fake.mkdir,
+  });
+
+  assert.equal(grades.length, 1);
+  assert.equal(grades[0].verifier_artifact, undefined, "a composite grade must not carry the singular verifier_artifact field");
+  assert.ok(grades[0].verifier_artifacts, "expected per-grader verifier_artifacts on a composite grade");
+  const artifacts = grades[0].verifier_artifacts!;
+  assert.equal(artifacts.length, 2);
+  const graders = artifacts.map((a) => a.grader).sort();
+  assert.deepEqual(graders, ["planning", "review"]);
+  // Each sub-grader's artifact is independently addressable — distinct
+  // content hashes, not one shared "composite" artifact.
+  const hashes = new Set(artifacts.map((a) => a.artifact.content_hash));
+  assert.equal(hashes.size, 2);
 });
 
 test("gradeExperiment: an end-to-end cell with no captured review/planning output and a fixture with no grader_ref is skipped", async () => {

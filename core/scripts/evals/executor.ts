@@ -21,6 +21,7 @@ import {
   type GhRefusalRecord,
 } from "./gh-eval-surface.ts";
 import { materializeStagePrompt, stagesForMode } from "./stage-adapters.ts";
+import type { BuildTreatmentTrajectoryInput, RawStageEntry } from "./trajectory/collect.ts";
 import type { Cell, CellExecutionClass, CellOutcome, EnvironmentDependency, EvalStageName, ExperimentManifest, Fixture, Treatment } from "./types.ts";
 
 function sanitizeForPath(cellId: string): string {
@@ -377,6 +378,12 @@ export interface CellExecutionResult {
   materializedPrompt: string;
   effectiveConfig: Record<string, unknown>;
   ghRefusals: GhRefusalRecord[];
+  /** Raw (pre-sanitize, pre-bound) treatment trajectory input (#536) — the
+   *  caller (run.ts) builds and persists the artifact from this via
+   *  trajectory/collect.ts + trajectory/store.ts. Collected best-effort for
+   *  every result_class, including infra_error/auth_error/timeout, since
+   *  diagnosing *why* a cell didn't complete is exactly the trajectory's job. */
+  trajectory: BuildTreatmentTrajectoryInput;
 }
 
 /** Execute exactly one cell: fresh isolated worktree at the fixture's
@@ -408,6 +415,39 @@ export async function runCell(
     timeout: manifest.timeout,
   };
 
+  // Treatment trajectory collection (#536): best-effort, capability-aware.
+  // No harness/executor this engine drives exposes structured tool-call
+  // telemetry today, so that channel is always recorded `unavailable` with a
+  // reason rather than fabricated as an empty-but-successful channel (task
+  // 3.1). Populated across every return below via `finish()` so a cell that
+  // never reaches a harness invocation (e.g. worktree creation failure) still
+  // yields a trajectory recording what did happen.
+  const trajectoryExecutionClass: CellExecutionClass = cell.treatment.executor ? "api-key" : "local-cli";
+  const trajectoryActions: string[] = [];
+  const trajectoryStages: RawStageEntry[] = [];
+  const TOOL_EVENTS_UNAVAILABLE: BuildTreatmentTrajectoryInput["toolEvents"] = {
+    availability: { available: false, reason: "harness/executor does not expose structured tool-call telemetry" },
+  };
+  function finish(outcome: CellOutcome): CellExecutionResult {
+    return {
+      outcome,
+      materializedPrompt,
+      effectiveConfig,
+      ghRefusals: recorder.refusals,
+      trajectory: {
+        cell_id: cell.cell_id,
+        experiment_id: cell.experiment_id,
+        execution_class: trajectoryExecutionClass,
+        stages: trajectoryStages,
+        actions: trajectoryActions,
+        toolEvents: TOOL_EVENTS_UNAVAILABLE,
+        producedArtifacts: (outcome.detail?.changed_paths as string[] | undefined) ?? [],
+        result_class: outcome.result_class,
+        error: outcome.error,
+      },
+    };
+  }
+
   // A fixture-declared `forbidden` dependency must still be *deterministically
   // denied at the dependency boundary* rather than refusing the whole cell
   // before it runs (review 2 finding d906091a): a permitted fixture mode
@@ -434,13 +474,10 @@ export async function runCell(
       baseCommit: cell.base_sha,
     });
     worktreeCreated = true;
+    trajectoryActions.push(`created worktree at ${identity.branch}`);
   } catch (err) {
-    return {
-      outcome: { result_class: "infra_error", error: `worktree creation failed: ${(err as Error).message}` },
-      materializedPrompt,
-      effectiveConfig,
-      ghRefusals: recorder.refusals,
-    };
+    trajectoryActions.push(`worktree creation failed: ${(err as Error).message}`);
+    return finish({ result_class: "infra_error", error: `worktree creation failed: ${(err as Error).message}` });
   }
 
   try {
@@ -456,13 +493,11 @@ export async function runCell(
         deadlineMs: setupDeadlineMs,
       });
       if (!result.ok) {
-        return {
-          outcome: { result_class: "infra_error", error: `simulated dependency ${JSON.stringify(dep.name)} ${result.error}` },
-          materializedPrompt,
-          effectiveConfig,
-          ghRefusals: recorder.refusals,
-        };
+        const error = `simulated dependency ${JSON.stringify(dep.name)} ${result.error}`;
+        trajectoryActions.push(error);
+        return finish({ result_class: "infra_error", error });
       }
+      trajectoryActions.push(`ran setup for simulated dependency ${JSON.stringify(dep.name)}`);
     }
 
     // API treatment path (#434 task 6): the cell binds to a named
@@ -473,20 +508,15 @@ export async function runCell(
     if (cell.treatment.executor) {
       const invokeExecutorFn = deps.invokeExecutor ?? realInvokeExecutor;
       if (stages.length !== 1 || !(stages[0] in API_TREATMENT_STAGE_MAP)) {
-        return {
-          outcome: {
-            result_class: "infra_error",
-            error:
-              `API treatment executor "${cell.treatment.executor}" is only valid for a single-stage ` +
-              `"plan-review" or "review" cell — mode "${cell.mode}" requires ${stages.length} stage(s)`,
-          },
-          materializedPrompt,
-          effectiveConfig,
-          ghRefusals: recorder.refusals,
-        };
+        const error =
+          `API treatment executor "${cell.treatment.executor}" is only valid for a single-stage ` +
+          `"plan-review" or "review" cell — mode "${cell.mode}" requires ${stages.length} stage(s)`;
+        trajectoryActions.push(error);
+        return finish({ result_class: "infra_error", error });
       }
       const pipelineStage = API_TREATMENT_STAGE_MAP[stages[0]]!;
       const override = deriveModelEndpointOverride(cell.treatment);
+      trajectoryActions.push(`invoking API executor "${cell.treatment.executor}" for stage "${pipelineStage}"`);
       const invoked = await invokeExecutorFn({
         cfg,
         stage: pipelineStage,
@@ -496,14 +526,18 @@ export async function runCell(
         override,
       });
       if (!invoked.ok) {
-        return {
-          outcome: { result_class: "infra_error", error: invoked.error },
-          materializedPrompt,
-          effectiveConfig,
-          ghRefusals: recorder.refusals,
-        };
+        trajectoryActions.push(`API executor invocation failed: ${invoked.error}`);
+        return finish({ result_class: "infra_error", error: invoked.error });
       }
       const result = invoked.result;
+      trajectoryStages.push({
+        stage: pipelineStage,
+        message: prompts[0],
+        output: result.stdout,
+        error: result.success ? undefined : result.stderr,
+        duration_ms: Math.round(result.duration * 1000),
+        success: result.success,
+      });
       const executionClass: CellExecutionClass = "api-key";
       const detail: Record<string, unknown> = {
         stages: [{ stage: pipelineStage, success: result.success, exit_code: result.exit_code, duration: result.duration }],
@@ -513,12 +547,7 @@ export async function runCell(
       const findings = parseReviewFindings(result.stdout);
       if (findings !== undefined) detail.findings = findings;
       if (environmentDetail !== undefined) detail.environment = environmentDetail;
-      return {
-        outcome: { result_class: "completed", detail },
-        materializedPrompt,
-        effectiveConfig,
-        ghRefusals: recorder.refusals,
-      };
+      return finish({ result_class: "completed", detail });
     }
 
     const harness = cell.treatment.harness;
@@ -526,12 +555,8 @@ export async function runCell(
 
     const resolvedModel = resolveTreatmentModel(effectiveHarness, cell.treatment);
     if (!resolvedModel.ok) {
-      return {
-        outcome: { result_class: "infra_error", error: resolvedModel.error },
-        materializedPrompt,
-        effectiveConfig,
-        ghRefusals: recorder.refusals,
-      };
+      trajectoryActions.push(resolvedModel.error);
+      return finish({ result_class: "infra_error", error: resolvedModel.error });
     }
 
     if (harness) {
@@ -542,22 +567,17 @@ export async function runCell(
           effort: cell.treatment.effort,
         });
       } catch (err) {
-        return {
-          outcome: { result_class: "infra_error", error: `preflight failed: ${(err as Error).message}` },
-          materializedPrompt,
-          effectiveConfig,
-          ghRefusals: recorder.refusals,
-        };
+        const error = `preflight failed: ${(err as Error).message}`;
+        trajectoryActions.push(error);
+        return finish({ result_class: "infra_error", error });
       }
       if (!preflightResult.ok) {
         const resultClass = preflightResult.failure === "unauthenticated" ? "auth_error" : "infra_error";
-        return {
-          outcome: { result_class: resultClass, error: preflightResult.message ?? preflightResult.failure },
-          materializedPrompt,
-          effectiveConfig,
-          ghRefusals: recorder.refusals,
-        };
+        const error = preflightResult.message ?? preflightResult.failure;
+        trajectoryActions.push(`preflight failed: ${error}`);
+        return finish({ result_class: resultClass, error });
       }
+      trajectoryActions.push(`preflight passed for harness "${harness}"`);
     }
 
     // Per-cell deadline (review 2 finding cb0500d0): a fixed, shared budget
@@ -575,15 +595,9 @@ export async function runCell(
       const prompt = prompts[i];
       const remainingMs = cellDeadlineMs - Date.now();
       if (remainingMs <= 0) {
-        return {
-          outcome: {
-            result_class: "timeout",
-            error: `cell exceeded its ${manifest.timeout}s per-cell timeout before stage "${stage}" could start`,
-          },
-          materializedPrompt,
-          effectiveConfig,
-          ghRefusals: recorder.refusals,
-        };
+        const error = `cell exceeded its ${manifest.timeout}s per-cell timeout before stage "${stage}" could start`;
+        trajectoryActions.push(error);
+        return finish({ result_class: "timeout", error });
       }
 
       let result: HarnessInvokeResultLike;
@@ -599,29 +613,28 @@ export async function runCell(
           env: isolatedGhEnv(identity.worktreePath),
         });
       } catch (err) {
-        return {
-          outcome: { result_class: "infra_error", error: `harness invocation failed: ${(err as Error).message}` },
-          materializedPrompt,
-          effectiveConfig,
-          ghRefusals: recorder.refusals,
-        };
+        const error = `harness invocation failed: ${(err as Error).message}`;
+        trajectoryActions.push(`stage "${stage}": ${error}`);
+        return finish({ result_class: "infra_error", error });
       }
 
+      // Record this stage's bounded output/error/timing/success regardless of
+      // outcome below — a timed-out or failed stage is exactly what a
+      // maintainer needs to see in the trajectory (#536).
+      trajectoryStages.push({
+        stage,
+        message: prompt,
+        output: result.stdout,
+        error: result.success ? undefined : result.stderr,
+        duration_ms: Math.round(result.duration * 1000),
+        success: result.success,
+      });
+
       if (result.timed_out) {
-        return {
-          outcome: { result_class: "timeout", error: `stage "${stage}" exceeded the per-cell timeout` },
-          materializedPrompt,
-          effectiveConfig,
-          ghRefusals: recorder.refusals,
-        };
+        return finish({ result_class: "timeout", error: `stage "${stage}" exceeded the per-cell timeout` });
       }
       if (result.spawn_error) {
-        return {
-          outcome: { result_class: "infra_error", error: `stage "${stage}" failed to spawn the harness process` },
-          materializedPrompt,
-          effectiveConfig,
-          ghRefusals: recorder.refusals,
-        };
+        return finish({ result_class: "infra_error", error: `stage "${stage}" failed to spawn the harness process` });
       }
 
       // Invocation-time auth/quota/rate-limit refusals must not be counted as
@@ -633,15 +646,11 @@ export async function runCell(
           effort: cell.treatment.effort,
         });
         if (authFailure) {
-          return {
-            outcome: { result_class: "auth_error", error: `stage "${stage}" ${authFailure}` },
-            materializedPrompt,
-            effectiveConfig,
-            ghRefusals: recorder.refusals,
-          };
+          return finish({ result_class: "auth_error", error: `stage "${stage}" ${authFailure}` });
         }
       }
 
+      trajectoryActions.push(`invoked stage "${stage}" via harness "${effectiveHarness}" (${result.success ? "success" : "failure"})`);
       stageDetails.push({
         stage,
         success: result.success,
@@ -673,32 +682,25 @@ export async function runCell(
       // in checks and still come back `completed`.
       const remainingForChecks = cellDeadlineMs - Date.now();
       if (remainingForChecks <= 0) {
-        return {
-          outcome: {
-            result_class: "timeout",
-            error: `cell exceeded its ${manifest.timeout}s per-cell timeout before checks could start`,
-          },
-          materializedPrompt,
-          effectiveConfig,
-          ghRefusals: recorder.refusals,
-        };
+        const error = `cell exceeded its ${manifest.timeout}s per-cell timeout before checks could start`;
+        trajectoryActions.push(error);
+        return finish({ result_class: "timeout", error });
       }
       const runChecksFn = deps.runChecks ?? defaultRunChecks;
+      // Note: check bodies/results (`detail.checks`) are verifier-only
+      // material — deliberately NOT recorded on the trajectory, only in the
+      // grader's own verifier evidence artifact (hidden-material
+      // containment, #536 task 5).
       detail.checks = await runChecksFn({
         worktreeDir: identity.worktreePath,
         checks: allChecks,
         deadlineMs: remainingForChecks,
       });
+      trajectoryActions.push(`ran ${allChecks.length} check(s) in the cell's worktree`);
       if (Date.now() > cellDeadlineMs) {
-        return {
-          outcome: {
-            result_class: "timeout",
-            error: `cell exceeded its ${manifest.timeout}s per-cell timeout while running checks`,
-          },
-          materializedPrompt,
-          effectiveConfig,
-          ghRefusals: recorder.refusals,
-        };
+        const error = `cell exceeded its ${manifest.timeout}s per-cell timeout while running checks`;
+        trajectoryActions.push(error);
+        return finish({ result_class: "timeout", error });
       }
     }
     if (fixture.allowed_change_paths !== undefined) {
@@ -710,12 +712,7 @@ export async function runCell(
     if (planningSelfAssessment !== undefined) detail.self_assessment = planningSelfAssessment;
     if (environmentDetail !== undefined) detail.environment = environmentDetail;
 
-    return {
-      outcome: { result_class: "completed", detail },
-      materializedPrompt,
-      effectiveConfig,
-      ghRefusals: recorder.refusals,
-    };
+    return finish({ result_class: "completed", detail });
   } finally {
     // A teardown failure must never override the primary outcome computed
     // above by rejecting `runCell` (review 2 finding 7f5ab0d8) — log and

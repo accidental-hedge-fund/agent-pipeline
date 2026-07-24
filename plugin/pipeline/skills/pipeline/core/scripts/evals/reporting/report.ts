@@ -14,8 +14,9 @@ import { paretoFrontier, type ParetoPoint } from "./pareto.ts";
 import { groupBy, type GroupableEntry } from "./grouping.ts";
 import { costFromDetail, summarizeCost } from "./cost.ts";
 import type { CellRecord, ExperimentManifest, Fixture, RunPlan } from "../types.ts";
-import type { GradeRecord } from "../grading/types.ts";
-import type { GroupDimension, ReliabilityRates, Summary, TreatmentSummary } from "./types.ts";
+import type { ArtifactDescriptor } from "../trajectory/types.ts";
+import type { GradeRecord, JudgeDisagreementRecord, ReviewGrade } from "../grading/types.ts";
+import type { GroupDimension, LinkedArtifactEntry, ReliabilityRates, Summary, TreatmentSummary } from "./types.ts";
 import { SUMMARY_SCHEMA_VERSION } from "./types.ts";
 
 const GROUP_DIMENSIONS: GroupDimension[] = ["stage", "harness", "provider", "model", "effort", "category", "risk"];
@@ -66,6 +67,116 @@ export interface GenerateSummaryOptions {
   baselineTreatmentId: string;
   seed?: number;
   underpoweredThreshold?: number;
+  /** Opt-in (#536 task 6.1): additively attach trajectory/verifier artifact
+   *  references for flagged cells — outliers, judge disagreements, false
+   *  positives/negatives, and failed cells. Default (absent/false) output is
+   *  byte-identical to the pre-#536 summary. */
+  linkArtifacts?: boolean;
+}
+
+/** Standard deviation of quality scores, or `null` when fewer than two
+ *  values (an outlier z-score is meaningless with n<2). */
+function stdDev(values: number[]): number | null {
+  if (values.length < 2) return null;
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  const variance = values.reduce((sum, v) => sum + (v - mean) ** 2, 0) / values.length;
+  return Math.sqrt(variance);
+}
+
+const OUTLIER_Z_SCORE_THRESHOLD = 2;
+
+/** Deterministically dedupe artifact descriptors by content hash and sort by
+ *  it, so `linked_artifacts` is stable across repeated summarization. */
+function dedupeArtifacts(descriptors: ArtifactDescriptor[]): ArtifactDescriptor[] {
+  const byHash = new Map<string, ArtifactDescriptor>();
+  for (const d of descriptors) byHash.set(d.content_hash, d);
+  return [...byHash.values()].sort((a, b) => a.content_hash.localeCompare(b.content_hash));
+}
+
+/** Compute the opt-in `linked_artifacts` field (#536 task 6.1): flags
+ *  outliers (|z-score| over threshold within a treatment's graded, completed
+ *  cells), judge disagreements, review false positives/negatives, and every
+ *  failed cell — attaching each flagged cell's treatment trajectory
+ *  descriptor (from its `runs.jsonl`/`failures.jsonl` record) and every
+ *  verifier artifact descriptor available for it (grade + disagreement).
+ *  Pure and deterministic given the same inputs. */
+function computeLinkedArtifacts(
+  runs: CellRecord[],
+  failures: CellRecord[],
+  grades: GradeRecord[],
+  disagreements: JudgeDisagreementRecord[],
+  qualityByTreatmentFlat: Map<string, Array<{ cell_id: string; score: number }>>,
+): LinkedArtifactEntry[] {
+  const recordByCell = new Map<string, CellRecord>();
+  for (const r of [...runs, ...failures]) recordByCell.set(r.cell_id, r);
+  const gradeByCell = new Map(grades.map((g) => [g.cell_id, g]));
+
+  const reasonsByCell = new Map<string, Set<string>>();
+  const verifierArtifactsByCell = new Map<string, ArtifactDescriptor[]>();
+  function flag(cellId: string, reason: string, verifierArtifacts: ArtifactDescriptor[] = []): void {
+    if (!reasonsByCell.has(cellId)) reasonsByCell.set(cellId, new Set());
+    reasonsByCell.get(cellId)!.add(reason);
+    if (verifierArtifacts.length > 0) {
+      if (!verifierArtifactsByCell.has(cellId)) verifierArtifactsByCell.set(cellId, []);
+      verifierArtifactsByCell.get(cellId)!.push(...verifierArtifacts);
+    }
+  }
+
+  // A `composite` grade carries its per-sub-grader artifacts under
+  // `verifier_artifacts`, not the singular `verifier_artifact` other payload
+  // kinds use (review 1 finding c7218eb4) — flatten either shape to a list.
+  function verifierArtifactsOf(grade: GradeRecord | undefined): ArtifactDescriptor[] {
+    if (!grade) return [];
+    if (grade.payload.kind === "composite") {
+      return (grade.verifier_artifacts ?? []).map((v) => v.artifact);
+    }
+    return grade.verifier_artifact ? [grade.verifier_artifact] : [];
+  }
+
+  for (const f of failures) {
+    flag(f.cell_id, `failed:${f.result_class}`);
+  }
+
+  function reviewGradeOf(grade: GradeRecord): ReviewGrade | undefined {
+    if (grade.payload.kind === "review") return grade.payload.grade;
+    if (grade.payload.kind === "composite") {
+      const reviewSub = grade.payload.grades.find((g) => g.kind === "review");
+      return reviewSub?.kind === "review" ? reviewSub.grade : undefined;
+    }
+    return undefined;
+  }
+  for (const grade of grades) {
+    const review = reviewGradeOf(grade);
+    if (review && (review.false_positives > 0 || review.false_negatives > 0)) {
+      flag(grade.cell_id, "false_positive_or_negative", verifierArtifactsOf(grade));
+    }
+  }
+
+  for (const [, entries] of qualityByTreatmentFlat) {
+    const scores = entries.map((e) => e.score);
+    const sd = stdDev(scores);
+    if (sd === null || sd === 0) continue;
+    const mean = scores.reduce((a, b) => a + b, 0) / scores.length;
+    for (const entry of entries) {
+      const z = Math.abs((entry.score - mean) / sd);
+      if (z > OUTLIER_Z_SCORE_THRESHOLD) {
+        flag(entry.cell_id, "outlier", verifierArtifactsOf(gradeByCell.get(entry.cell_id)));
+      }
+    }
+  }
+
+  for (const d of disagreements) {
+    flag(d.cell_id, "judge_disagreement", d.verifier_artifact ? [d.verifier_artifact] : []);
+  }
+
+  return [...reasonsByCell.entries()]
+    .map(([cellId, reasons]) => ({
+      cell_id: cellId,
+      reasons: [...reasons].sort(),
+      treatment_artifact: recordByCell.get(cellId)?.trajectory_artifact,
+      verifier_artifacts: dedupeArtifacts(verifierArtifactsByCell.get(cellId) ?? []),
+    }))
+    .sort((a, b) => a.cell_id.localeCompare(b.cell_id));
 }
 
 export function generateSummary(
@@ -76,6 +187,7 @@ export function generateSummary(
   grades: GradeRecord[],
   fixtures: Map<string, Fixture>,
   opts: GenerateSummaryOptions,
+  disagreements: JudgeDisagreementRecord[] = [],
 ): Summary {
   const underpoweredThreshold = opts.underpoweredThreshold ?? DEFAULT_UNDERPOWERED_THRESHOLD;
   const intervalMethod = defaultIntervalMethod(opts.seed ?? manifest.seed);
@@ -86,13 +198,19 @@ export function generateSummary(
   // Per-treatment quality-by-fixture (reduced-per-replicate happens in
   // pairAgainstBaseline; here we just collect every graded replicate's score).
   const qualityByTreatmentFixture = new Map<string, Map<string, number[]>>();
+  // Per-treatment flat (cell_id, score) list — only consumed by the opt-in
+  // outlier-linking computation below; never affects any aggregate.
+  const qualityByTreatmentFlat = new Map<string, Array<{ cell_id: string; score: number }>>();
   for (const run of runs) {
     const grade = gradeByCell.get(run.cell_id);
     if (!grade) continue;
     if (!qualityByTreatmentFixture.has(run.treatment_id)) qualityByTreatmentFixture.set(run.treatment_id, new Map());
     const byFixture = qualityByTreatmentFixture.get(run.treatment_id)!;
     if (!byFixture.has(run.fixture_id)) byFixture.set(run.fixture_id, []);
-    byFixture.get(run.fixture_id)!.push(qualityScore(grade));
+    const score = qualityScore(grade);
+    byFixture.get(run.fixture_id)!.push(score);
+    if (!qualityByTreatmentFlat.has(run.treatment_id)) qualityByTreatmentFlat.set(run.treatment_id, []);
+    qualityByTreatmentFlat.get(run.treatment_id)!.push({ cell_id: run.cell_id, score });
   }
 
   const plannedByTreatment = new Map<string, number>();
@@ -201,6 +319,9 @@ export function generateSummary(
       quality_vs_cost: paretoFrontier(costPoints),
     },
     groups,
+    ...(opts.linkArtifacts
+      ? { linked_artifacts: computeLinkedArtifacts(runs, failures, grades, disagreements, qualityByTreatmentFlat) }
+      : {}),
   };
 }
 
@@ -226,8 +347,13 @@ export async function reportExperiment(
   const runs = parseJsonl<CellRecord>(await readFileFn(path.join(dir, "runs.jsonl")));
   const failures = parseJsonl<CellRecord>(await readFileFn(path.join(dir, "failures.jsonl")));
   const grades = parseJsonl<GradeRecord>(await readFileFn(path.join(dir, "grades.jsonl")));
+  // disagreements.jsonl is only ever read when linking is opted in — reading
+  // it never changes the default (disabled) path (#536 task 6.1).
+  const disagreements = opts.linkArtifacts
+    ? parseJsonl<JudgeDisagreementRecord>(await readFileFn(path.join(dir, "disagreements.jsonl")))
+    : [];
 
-  const summary = generateSummary(manifest, plan, runs, failures, grades, fixtures, opts);
+  const summary = generateSummary(manifest, plan, runs, failures, grades, fixtures, opts, disagreements);
   await writeFileFn(path.join(dir, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`);
   return summary;
 }

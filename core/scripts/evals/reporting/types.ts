@@ -2,6 +2,8 @@
 // shape — additive over grades.jsonl/runs.jsonl/failures.jsonl/plan.json,
 // never mutating them (report.ts).
 
+import type { ArtifactDescriptor } from "../trajectory/types.ts";
+
 export interface IntervalMethod {
   name: "bootstrap-percentile";
   resamples: number;
@@ -60,6 +62,17 @@ export interface GroupEntry {
 
 export type GroupDimension = "stage" | "harness" | "provider" | "model" | "effort" | "category" | "risk";
 
+/** One flagged cell's linked artifact references (#536 task 6.1) — opt-in,
+ *  additive only. `reasons` names every reason the cell was flagged
+ *  (deterministically sorted); `verifier_artifacts` is deduplicated by
+ *  content hash and sorted the same way. */
+export interface LinkedArtifactEntry {
+  cell_id: string;
+  reasons: string[];
+  treatment_artifact?: ArtifactDescriptor;
+  verifier_artifacts: ArtifactDescriptor[];
+}
+
 export interface Summary {
   schema_version: number;
   experiment_id: string;
@@ -69,6 +82,10 @@ export interface Summary {
   treatments: TreatmentSummary[];
   pareto: ParetoFrontiers;
   groups: Partial<Record<GroupDimension, GroupEntry[]>>;
+  /** Present only when trajectory linking is opted in (report.ts
+   *  `linkArtifacts`); absent — never an empty array — by default, so the
+   *  default summary is byte-identical to the pre-#536 output. */
+  linked_artifacts?: LinkedArtifactEntry[];
 }
 
 export const SUMMARY_SCHEMA_VERSION = 1;

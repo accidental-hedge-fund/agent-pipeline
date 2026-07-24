@@ -294,7 +294,10 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
   // repo-local fixture write — never a GitHub write.
   evals: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "base", "profile", "fixtures", "baseline", "judge", "apply", "planOnly", "out"]),
+    allowedFlags: new Set([
+      "repoPath", "base", "profile", "fixtures", "baseline", "judge", "apply", "planOnly", "out",
+      "trajectoryMaxEvents", "trajectoryMaxBytes", "linkArtifacts",
+    ]),
     needsConfig: true,
     needsGhAuth: false,
     mutatesGitHub: false,

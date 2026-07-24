@@ -5,6 +5,7 @@
 // (openspec/changes/stage-eval-runner/design.md).
 
 import type { ModelEndpointParams } from "../types.ts";
+import type { ArtifactDescriptor } from "./trajectory/types.ts";
 
 /** The six independently-invocable stage entry points, plus the end-to-end mode. */
 export const EVAL_STAGE_NAMES = [
@@ -257,4 +258,13 @@ export interface CellRecord {
   result_class: CellResultClass;
   detail?: Record<string, unknown>;
   error?: string;
+  /** Descriptor for this cell's treatment trajectory artifact (#536), when
+   *  collection succeeded. Absent when collection failed or produced no
+   *  artifact — never a stand-in for an empty trajectory. */
+  trajectory_artifact?: ArtifactDescriptor;
+  /** Durable record of why `trajectory_artifact` is absent despite the cell
+   *  having run (#536, review 1 finding 5ae0fa6e) — a build failure, a
+   *  content-address collision, or a write failure. Absent when collection
+   *  succeeded. Never affects `result_class`: collection is diagnostic-only. */
+  trajectory_artifact_error?: string;
 }
