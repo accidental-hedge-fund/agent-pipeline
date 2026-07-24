@@ -81,9 +81,10 @@ control-plane command channel — this is telemetry and read-only analysis only 
 - [ ] Operators can map pseudonymous repo IDs to friendly names locally or in customer-controlled
       metadata, and upstream maintainers never receive that mapping through this feature (proven by a
       local-mapping test and asserted in the trust-boundary spec).
-- [ ] Retention, deletion, export, access audit, and credential rotation are documented and testable
-      (proven by per-behavior tests: retention window, tenant deletion, export dump, audit entry, and
-      rotation without repository-config change).
+- [ ] Retention, deletion, export, access audit, and credential rotation are documented and testable,
+      and deletion/export are refused across tenant scope (proven by per-behavior tests: retention
+      window, tenant deletion, cross-tenant deletion refusal, export dump, cross-tenant export refusal,
+      audit entry, and rotation without repository-config change).
 - [ ] Existing `event_sink.command`, additive/exclusive modes, local `scoreboard`, and local `improve`
       remain backward compatible (proven by an existing-behavior test with no `fleet` block present).
 - [ ] Tests cover multiple tenants/repositories/hosts, out-of-order and duplicate events, sink

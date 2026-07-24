@@ -60,13 +60,17 @@ collector from `(run_id, seq)`, so out-of-order or duplicate delivery is tolerat
 metrics. The idempotency key is deterministic — `(tenant, installation, run_id, seq)` (or an
 event-content digest) — so the same event delivered twice deduplicates to one stored record.
 
-### D5 — At-least-once durable delivery, non-fatal, with a bounded spool
-Delivery treats the network as at-least-once. Envelopes are written to a durable **local spool** first,
-then delivered with bounded retry/backoff; a delivery is retired from the spool only on a collector
-acknowledgement. A sink outage never changes a stage outcome — delivery is best-effort relative to the
-run, exactly like the #343 non-fatal contract — and the spool has an **explicit, bounded** overflow
-policy (documented drop-oldest or back-pressure, never unbounded growth) that emits a diagnostic when
-it engages. Delivery lag, drop counts, rejected-schema counts, and last successful acknowledgement are
+### D5 — At-least-once-once-spooled delivery, non-fatal, with a bounded and accounted spool
+Delivery treats the network as at-least-once **for any envelope successfully admitted to the durable
+local spool**: it is written to the spool first, then delivered with bounded retry/backoff, and retired
+from the spool only on a collector acknowledgement. This guarantee is deliberately scoped to
+spool-admitted envelopes rather than unconditional, because the spool has an **explicit, bounded**
+overflow policy (customer-selected `drop-oldest` or `back-pressure`, never unbounded growth): under
+`drop-oldest`, an overflow-dropped envelope is accounted telemetry loss, not a silent violation of
+at-least-once — it is dropped by identified `run_id`/`seq`, counted in the drop count, and surfaced
+through delivery-health diagnostics; under `back-pressure`, nothing is dropped. A sink outage never
+changes a stage outcome — delivery is best-effort relative to the run, exactly like the #343 non-fatal
+contract. Delivery lag, drop counts, rejected-schema counts, and last successful acknowledgement are
 exposed as machine-readable diagnostics.
 
 ### D6 — Scoped ingest credentials; tenant isolation is a collector invariant
@@ -93,10 +97,50 @@ evidence exists). Every aggregated metric preserves **evidence lineage** back to
 runs/events. Human and JSON output both support filter/group by pseudonymous repo, installation, host,
 Pipeline version, stage, harness/model, outcome, and time window.
 
-### D9 — Governance is customer-controlled and testable
+### D9 — Governance is customer-controlled, tenant-scoped, and testable
 Retention windows, tenant deletion, export, access audit, and credential rotation are specified as
 collector-side, customer-controlled operations with observable, testable outcomes — not as prose
-promises. They live on the customer's control plane; maintainers have no access path.
+promises. They live on the customer's control plane; maintainers have no access path. Deletion requires
+a privileged credential bound to the target tenant/installation (distinct from an ordinary ingest/query
+credential); export is limited to the caller's own query scope. Cross-tenant deletion or export attempts
+are refused and audited, matching the tenant-isolation invariant already required of ingest/query (D6).
+
+### D10 — Versioned wire transport profile (the interoperable contract)
+Independently implemented senders and collectors interoperate only if they agree on more than field
+names. The contract fixes the following now, so it is implementable without further design work:
+- **Canonical encoding.** The envelope is a single UTF-8 JSON object per event (no batching envelope
+  around it at the wire level — batching, if used, is a transport-level array of these objects). Field
+  types: `tenant_id`, `installation_id`, `repo_id`, `host_id`, `run_id` are strings, 1–128 bytes,
+  `^[A-Za-z0-9_-]+$`; `pipeline_version` and `schema_version` are semver strings; `envelope_version` is
+  an integer `major.minor` pair encoded as the string `"<major>.<minor>"`; `seq` is a non-negative
+  integer, unique and monotonically increasing per `run_id`; `payload` is the verbatim, already-screened
+  `events.jsonl` line, carried as an embedded JSON value (not a re-encoded string).
+- **Idempotency-key encoding.** The idempotency key is the lowercase-hex SHA-256 digest of the UTF-8
+  bytes `"{tenant_id}:{installation_id}:{run_id}:{seq}"`, sent as the `Idempotency-Key` request header
+  (or equivalent transport field) and never derived from mutable payload content.
+- **Authenticated ingest request.** Delivery is an HTTPS `POST` to a collector-defined ingest endpoint,
+  `Authorization: Bearer <scoped-ingest-credential>`, `Content-Type: application/json`, body containing
+  one envelope object. A batch profile MAY send a JSON array body of envelope objects under the same
+  headers; the collector advertises which it supports at `/fleet/v1/capabilities`.
+- **Acknowledgement / rejection schema.** The collector responds `202 Accepted` with
+  `{"status": "accepted", "idempotency_key": "<key>"}` on success (including on a deduplicated repeat —
+  the response is identical whether the envelope was newly stored or already seen), or a `4xx` with
+  `{"status": "rejected", "reason_code": "<machine-readable-code>", "detail": "<human string>"}` on
+  schema/version rejection. `reason_code` is drawn from a fixed enum (`malformed_envelope`,
+  `unsupported_major_version`, `unauthorized`, `cross_tenant_scope`) so senders can branch on it without
+  string matching. The response correlates to the request via the same `idempotency_key`.
+- **Version-compatibility rule.** `envelope_version` follows semver-like major.minor: the collector
+  rejects an envelope whose major component it does not list in `/fleet/v1/capabilities`, and accepts
+  any minor within a supported major, tolerating unknown optional fields (D7).
+- **Credential-reference resolution.** The `fleet` config's credential field is a *reference*
+  (e.g. an environment-variable name or secret-store path), never an inline secret. At delivery time the
+  sender resolves the reference to a bearer token; refresh/rotation is picked up by re-resolving the
+  reference on each delivery attempt (or on `401`), so rotation takes effect without a config change,
+  matching D6.
+
+Transport implementations (sender or collector) MAY vary in language/runtime but MUST conform to this
+profile to interoperate; a future major transport revision follows the same `envelope_version` major-bump
+rule above.
 
 ## Relationship to adjacent issues
 - **#343** — reused: the sanitized, versioned records and the sink producer path are the substrate;
@@ -121,6 +165,7 @@ promises. They live on the customer's control plane; maintainers have no access 
   friendly-name mapping never in payload nor upstream).
 
 ## Open questions (resolve during decomposition, not here)
-- Concrete wire encoding/transport for delivery (HTTPS batch vs. queue) — deferred to implementation.
-- Exact credential broker / short-lived-token issuer shape — coordinate with #459 identity work.
+- Exact credential broker / short-lived-token issuer shape (how a reference is minted and where it is
+  stored) — coordinate with #459 identity work; the resolution *contract* (D10) is fixed, the issuer
+  implementation is not.
 - Reference collector packaging/storage backend specifics — downstream of an accepted contract.

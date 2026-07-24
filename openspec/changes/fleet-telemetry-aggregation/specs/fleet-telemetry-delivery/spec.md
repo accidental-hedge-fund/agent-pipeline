@@ -23,14 +23,16 @@ and `improve` behavior SHALL remain unchanged.
 - **THEN** config resolution SHALL throw a schema error identifying the offending field rather than
   silently using a wrong value
 
-### Requirement: Delivery is at-least-once with a durable spool, idempotency, and acknowledgements
+### Requirement: Delivery is at-least-once once spooled, with idempotency and acknowledgements
 
-When fleet delivery is active, each fleet envelope SHALL be written to a durable local spool before
-delivery and SHALL be delivered to the collector at least once. An envelope SHALL be retired from the
-spool only upon a collector acknowledgement, and delivery SHALL survive process restart by replaying
+Each fleet envelope SHALL be delivered to the collector at least once, once it is successfully admitted
+to the durable local spool that fleet delivery writes to when active. An envelope SHALL be retired from the spool
+only upon a collector acknowledgement, and delivery SHALL survive process restart by replaying
 un-acknowledged spooled envelopes. Each envelope SHALL carry a deterministic idempotency key derived
 from `(tenant_id, installation_id, run_id, seq)` (or an equivalent event-content digest) so that
-duplicate delivery is deduplicable and does not skew metrics.
+duplicate delivery is deduplicable and does not skew metrics. The at-least-once guarantee applies only
+to envelopes admitted to the spool; an envelope dropped by the overflow policy (see below) before or
+after admission is accounted telemetry loss, not a violation of at-least-once.
 
 #### Scenario: envelope retires only on acknowledgement
 
@@ -49,12 +51,18 @@ duplicate delivery is deduplicable and does not skew metrics.
 - **THEN** each delivery SHALL carry the same deterministic idempotency key
 - **AND** the collector SHALL be able to deduplicate on that key without skewing metrics
 
-### Requirement: Delivery has bounded retry/backoff and explicit overflow behavior
+### Requirement: Delivery has bounded retry/backoff and explicit, accounted overflow behavior
 
 Fleet delivery SHALL retry failed deliveries with bounded backoff and SHALL bound the local spool with
 an explicit overflow policy — documented drop-oldest or back-pressure — that SHALL NOT allow unbounded
-spool growth. When the overflow policy engages, delivery SHALL emit a machine-readable diagnostic
-recording that overflow occurred and how many envelopes were affected.
+spool growth. A customer SHALL select the overflow policy via the `fleet` config; the pipeline SHALL NOT
+silently mix the two. When the overflow policy engages, delivery SHALL emit a machine-readable
+diagnostic identifying the affected envelope(s) (at minimum `run_id` and `seq`) and a running
+overflow-drop count, exposed through the delivery-health diagnostics (see below) as accounted telemetry
+loss rather than silent data loss. Under `drop-oldest`, the dropped envelope is always the
+oldest-`seq`-per-run entry currently in the spool; under `back-pressure`, no envelope is dropped and
+event emission SHALL continue without changing stage outcomes (per the non-fatal requirement below)
+even while the spool is full.
 
 #### Scenario: failed delivery retries with bounded backoff
 
@@ -64,10 +72,16 @@ recording that overflow occurred and how many envelopes were affected.
 
 #### Scenario: spool overflow is explicit and observable
 
-- **WHEN** the spool reaches its configured bound
-- **THEN** the configured overflow policy (drop-oldest or back-pressure) SHALL engage rather than
-  growing without bound
-- **AND** a machine-readable diagnostic SHALL record the overflow and the number of affected envelopes
+- **WHEN** the spool reaches its configured bound under `drop-oldest`
+- **THEN** the oldest spooled envelope SHALL be dropped rather than the spool growing without bound
+- **AND** a machine-readable diagnostic SHALL identify the dropped envelope's `run_id`/`seq` and
+  increment the delivery-health drop count
+
+#### Scenario: back-pressure overflow drops nothing
+
+- **WHEN** the spool reaches its configured bound under `back-pressure`
+- **THEN** no envelope SHALL be dropped
+- **AND** event emission SHALL continue without changing any Pipeline stage outcome
 
 ### Requirement: Delivery failures never change a stage outcome and delivery health is observable
 

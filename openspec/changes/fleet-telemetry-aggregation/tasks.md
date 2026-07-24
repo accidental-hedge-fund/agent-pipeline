@@ -37,17 +37,20 @@
 
 ## 3. Reference collector contract
 
-- [ ] 3.1 Validate each envelope; reject malformed and unsupported-major-version envelopes with a
+- [ ] 3.1 Implement the versioned wire transport profile (design.md D10): authenticated HTTPS ingest
+      endpoint, canonical field types/limits, idempotency-key encoding, `202`/`4xx` acknowledgement and
+      reason-code rejection schema, and a `/fleet/v1/capabilities` endpoint.
+- [ ] 3.2 Validate each envelope; reject malformed and unsupported-major-version envelopes with a
       machine-readable reason; accept forward-compatible optional fields; document the migration policy.
-- [ ] 3.2 Enforce tenant isolation: a scoped write credential writes only its tenant's data and a query
+- [ ] 3.3 Enforce tenant isolation: a scoped write credential writes only its tenant's data and a query
       credential reads only its tenant's data — cross-tenant write and query are refused.
-- [ ] 3.3 Deterministically deduplicate on the idempotency key so duplicate delivery does not skew
+- [ ] 3.4 Deterministically deduplicate on the idempotency key so duplicate delivery does not skew
       metrics; reconstruct per-run order from `(run_id, seq)`.
-- [ ] 3.4 Write to customer-owned storage; assert there is no upstream path to Agent Pipeline
+- [ ] 3.5 Write to customer-owned storage; assert there is no upstream path to Agent Pipeline
       maintainers.
-- [ ] 3.5 Tests: multi-tenant/multi-repo/multi-host ingest, out-of-order and duplicate events, malformed
-      + unsupported-version rejection, unknown-optional-field acceptance, cross-tenant write/query
-      refusal — each biting.
+- [ ] 3.6 Tests: capabilities/ack/rejection wire-format conformance, multi-tenant/multi-repo/multi-host
+      ingest, out-of-order and duplicate events, malformed + unsupported-version rejection,
+      unknown-optional-field acceptance, cross-tenant write/query refusal — each biting.
 
 ## 4. Read-only fleet reporting
 
@@ -68,11 +71,13 @@
 
 - [ ] 5.1 Retention: enforce a customer-configured retention window; test that out-of-window data is
       dropped/expired.
-- [ ] 5.2 Deletion: support tenant/installation data deletion; test that deleted data no longer appears
-      in queries.
-- [ ] 5.3 Export: support a customer-owned export dump; test its shape.
-- [ ] 5.4 Access audit: record an audit entry for ingest/query/credential operations; test it is
-      written.
+- [ ] 5.2 Deletion: support tenant/installation data deletion gated on a privileged credential bound to
+      the target tenant; test that deleted data no longer appears in queries and that a cross-tenant
+      deletion attempt is refused and audited.
+- [ ] 5.3 Export: support a customer-owned export dump limited to the caller's scoped tenant; test its
+      shape and that a cross-tenant export attempt is refused and audited.
+- [ ] 5.4 Access audit: record an audit entry (scoped principal + outcome) for ingest/query/deletion/
+      export/credential operations; test it is written for both accepted and refused attempts.
 - [ ] 5.5 Credential rotation: rotate/revoke a scoped credential without repository-config change; test
       a revoked credential's write/query is refused.
 

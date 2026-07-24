@@ -1,5 +1,31 @@
 ## ADDED Requirements
 
+### Requirement: Collector implements a versioned wire transport profile
+
+The collector SHALL expose an authenticated HTTPS ingest endpoint accepting one envelope (or a JSON
+array of envelopes) per request, bound to the canonical field types/limits and idempotency-key encoding
+defined in the design's wire transport profile (`design.md` D10). The collector SHALL respond to a
+successful ingest with a `202`-class acknowledgement carrying the envelope's idempotency key, and to a
+rejection with a `4xx`-class response carrying a machine-readable `reason_code` drawn from a fixed enum
+and the same idempotency key for correlation. The collector SHALL advertise its supported
+`envelope_version` majors and request-batching mode at a capabilities endpoint.
+
+#### Scenario: acknowledgement correlates to the request
+
+- **WHEN** the collector accepts an envelope
+- **THEN** it SHALL respond with a `202`-class acknowledgement carrying that envelope's idempotency key
+
+#### Scenario: rejection carries a machine-readable reason code
+
+- **WHEN** the collector rejects an envelope
+- **THEN** it SHALL respond with a `4xx`-class response carrying a `reason_code` from a fixed enum and
+  the envelope's idempotency key
+
+#### Scenario: capabilities are advertised
+
+- **WHEN** a sender queries the collector's capabilities endpoint
+- **THEN** the response SHALL list the supported `envelope_version` majors and batching mode
+
 ### Requirement: Collector validates schemas and rejects malformed or unsupported envelopes
 
 The reference collector SHALL validate each received fleet envelope against the known envelope schema
