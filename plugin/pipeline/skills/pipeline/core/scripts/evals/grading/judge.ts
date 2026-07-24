@@ -6,6 +6,7 @@
 import * as path from "node:path";
 import { buildVerifierEvidenceArtifact } from "../trajectory/collect.ts";
 import { writeContentAddressedArtifact, type ArtifactStoreDeps } from "../trajectory/store.ts";
+import type { BoundCeilings } from "../trajectory/bound.ts";
 import type { GradeRecord, JudgeDisagreementRecord, JudgeRecord } from "./types.ts";
 
 export interface JudgeVerdict {
@@ -32,6 +33,10 @@ export interface JudgeDeps {
     verifiersDir: string;
     deps?: ArtifactStoreDeps;
   };
+  /** Configurable byte/event ceilings for judge verifier evidence artifacts
+   *  (#536). Defaults to `DEFAULT_TRAJECTORY_CEILINGS` when absent, mirroring
+   *  the deterministic grader's `verifierCeilings` (grade.ts). */
+  verifierCeilings?: BoundCeilings;
 }
 
 /** Whether a deterministic grade reads as a pass — used only to detect a
@@ -86,8 +91,12 @@ export async function runJudging(
           verifier_id: `${deps.judgeHarness}/${deps.judgeModel}`,
           verifier_version: deps.judgePromptVersion,
           inputs: { grade },
-          evidence_consulted: [],
+          // The deterministic grade is the evidence the judge verdict is
+          // compared against (`deterministicPass` below) — subject to
+          // `deps.verifierCeilings` like a grader's evidence_consulted.
+          evidence_consulted: [grade],
           final_result: verdict,
+          ceilings: deps.verifierCeilings,
         });
         const result = await writeContentAddressedArtifact(
           deps.artifactStore.repoDir,
