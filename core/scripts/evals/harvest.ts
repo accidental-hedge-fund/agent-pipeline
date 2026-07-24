@@ -318,15 +318,21 @@ export function resolveEnvironmentDependencies(inputs: EnvironmentDependencyInpu
         `dependency ${JSON.stringify(input.name)} is set to "live" without an explicit maintainer selection ("live_selected: true") — refusing to render a draft that silently defaults to live`,
       );
     }
+    // Route every environment-fidelity field through the same
+    // sanitization every other evidence-derived draft field already gets
+    // (review 2 finding 4add646e): `initial_state`/`expected` are harvested
+    // service/data evidence just like a stage-entry artifact, and
+    // `setup`/`teardown` are freeform shell text that can just as easily
+    // carry a raw secret or an injection payload as `task_input` can.
     return {
       name: input.name,
       mode,
       version: input.version,
       required_permissions: input.required_permissions,
-      initial_state: input.initial_state,
-      expected: input.expected,
-      setup: input.setup,
-      teardown: input.teardown,
+      initial_state: sanitizeDeep(input.initial_state),
+      expected: sanitizeDeep(input.expected),
+      setup: sanitize(redactSecrets(input.setup)),
+      teardown: sanitize(redactSecrets(input.teardown)),
     };
   });
 }

@@ -222,14 +222,55 @@ async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: stri
   }
 }
 
+/** Command-line tokens that reach outside the cell's isolated worktree — the
+ *  GitHub CLI (a production GitHub write), raw network clients, and `git
+ *  push`/`git remote` (a repository write to a real remote). A declared
+ *  `simulated`/`forbidden` dependency's `setup`/`teardown` is supposed to be a
+ *  deterministic, in-worktree stand-in (a local stub, a fixture file, an
+ *  in-memory server) — not a live call to the very surface the eval is
+ *  isolating against (review 2 finding dc817cec). Matched as whole words so a
+ *  path component or unrelated flag containing these substrings is not
+ *  falsely flagged. */
+const FORBIDDEN_SIMULATION_TOOLING = [
+  /(^|[\s;&|])gh(\s|$)/,
+  /(^|[\s;&|])curl(\s|$)/,
+  /(^|[\s;&|])wget(\s|$)/,
+  /(^|[\s;&|])ssh(\s|$)/,
+  /(^|[\s;&|])scp(\s|$)/,
+  /(^|[\s;&|])sftp(\s|$)/,
+  /(^|[\s;&|])(nc|netcat)(\s|$)/,
+  /(^|[\s;&|])telnet(\s|$)/,
+  /(^|[\s;&|])git\s+push(\s|$)/,
+  /(^|[\s;&|])git\s+remote(\s|$)/,
+];
+
+function findForbiddenSimulationTooling(command: string): RegExpMatchArray | null {
+  for (const pattern of FORBIDDEN_SIMULATION_TOOLING) {
+    const match = command.match(pattern);
+    if (match) return match;
+  }
+  return null;
+}
+
 async function defaultRunEnvironmentCommand(
   args: { worktreeDir: string; command: string; phase: "setup" | "teardown"; deadlineMs: number },
 ): Promise<{ ok: boolean; error?: string }> {
+  const forbidden = findForbiddenSimulationTooling(args.command);
+  if (forbidden) {
+    return {
+      ok: false,
+      error: `environment ${args.phase} command references ${JSON.stringify(forbidden[0].trim())} — GitHub-write and external/network tooling is not permitted in a simulated/forbidden dependency stand-in`,
+    };
+  }
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const execFileAsync = promisify(execFile);
   try {
-    await execFileAsync("sh", ["-c", args.command], { cwd: args.worktreeDir, timeout: Math.max(1, args.deadlineMs) });
+    await execFileAsync("sh", ["-c", args.command], {
+      cwd: args.worktreeDir,
+      timeout: Math.max(1, args.deadlineMs),
+      env: { ...process.env, ...isolatedGhEnv(args.worktreeDir) },
+    });
     return { ok: true };
   } catch (err) {
     return { ok: false, error: `environment ${args.phase} command failed: ${(err as Error).message}` };
@@ -367,24 +408,22 @@ export async function runCell(
     timeout: manifest.timeout,
   };
 
-  // A fixture-declared `forbidden` environment dependency must block the
-  // treatment entirely — no worktree, no harness invocation (review 1
-  // finding ed37a4fd; eval-fixture-contract requires "no treatment SHALL be
-  // executed for an experiment referencing that fixture").
+  // A fixture-declared `forbidden` dependency must still be *deterministically
+  // denied at the dependency boundary* rather than refusing the whole cell
+  // before it runs (review 2 finding d906091a): a permitted fixture mode
+  // whose sole purpose is to measure whether a treatment respects a
+  // forbidden service/data boundary is otherwise unmeasurable — it never
+  // gets a worktree, a harness invocation, or a grading signal. Its declared
+  // `setup`/`teardown` is expected to install the deterministic denial (a
+  // stub that refuses/errors, matching its declared `expected` outputs/
+  // errors) the same way a `simulated` dependency installs its deterministic
+  // stand-in, so both run through the same environment-command path;
+  // `expected` is carried into `detail.environment` below so checks/graders
+  // can assess whether the treatment honored the boundary.
   const environment: EnvironmentDependency[] = fixture.environment ?? [];
-  const forbidden = environment.filter((d) => d.mode === "forbidden");
-  if (forbidden.length > 0) {
-    return {
-      outcome: {
-        result_class: "infra_error",
-        error: `fixture declares forbidden dependenc${forbidden.length === 1 ? "y" : "ies"} (${forbidden.map((d) => d.name).join(", ")}) — refusing to execute the treatment`,
-      },
-      materializedPrompt,
-      effectiveConfig,
-      ghRefusals: recorder.refusals,
-    };
-  }
-  const simulated = environment.filter((d) => d.mode === "simulated");
+  const simulated = environment.filter((d) => d.mode === "simulated" || d.mode === "forbidden");
+  const environmentDetail =
+    environment.length > 0 ? environment.map((d) => ({ name: d.name, mode: d.mode, expected: d.expected })) : undefined;
   const runEnvironmentCommandFn = deps.runEnvironmentCommand ?? defaultRunEnvironmentCommand;
 
   let worktreeCreated = false;
@@ -473,6 +512,7 @@ export async function runCell(
       };
       const findings = parseReviewFindings(result.stdout);
       if (findings !== undefined) detail.findings = findings;
+      if (environmentDetail !== undefined) detail.environment = environmentDetail;
       return {
         outcome: { result_class: "completed", detail },
         materializedPrompt,
@@ -668,6 +708,7 @@ export async function runCell(
     if (reviewFindings !== undefined) detail.findings = reviewFindings;
     if (planningOutputText !== undefined) detail.output_text = planningOutputText;
     if (planningSelfAssessment !== undefined) detail.self_assessment = planningSelfAssessment;
+    if (environmentDetail !== undefined) detail.environment = environmentDetail;
 
     return {
       outcome: { result_class: "completed", detail },

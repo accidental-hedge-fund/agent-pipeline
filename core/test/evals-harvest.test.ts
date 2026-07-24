@@ -310,6 +310,42 @@ test("renderDraft: a live dependency without explicit selection is refused (neve
   );
 });
 
+// --- Environment-fidelity redaction (#535 review 2 finding 4add646e):
+// initial_state/expected/setup/teardown are exactly where harvested
+// service/data evidence carries a raw production payload or credential, so
+// they must be routed through the same sanitization every other
+// evidence-derived draft field already gets. ---
+
+test("resolveEnvironmentDependencies: a secret in initial_state/expected/setup/teardown is redacted", () => {
+  const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+  const [dep] = resolveEnvironmentDependencies([
+    completeEnvDep({
+      initial_state: { token: secret },
+      expected: { errors: [`unauthorized: ${secret}`] },
+      setup: `echo ${secret} > token.txt`,
+      teardown: `rm token.txt # ${secret}`,
+    }),
+  ]);
+  assert.ok(!JSON.stringify(dep).includes(secret));
+});
+
+test("renderDraft: a secret-bearing environment dependency never reaches the rendered draft's raw/stdout/promoted output", () => {
+  const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+  const draft = renderDraft(
+    draftInput({
+      environment: [
+        completeEnvDep({
+          initial_state: { token: secret },
+          expected: { outputs: [`ok ${secret}`] },
+          setup: `curl -H "Authorization: Bearer ${secret}"`,
+          teardown: `echo done ${secret}`,
+        }),
+      ],
+    }),
+  );
+  assert.ok(!JSON.stringify(draft.raw).includes(secret));
+});
+
 // ---------------------------------------------------------------------------
 // Draft rendering conforms to the #432/#433 fixture contract, and loads
 // ---------------------------------------------------------------------------

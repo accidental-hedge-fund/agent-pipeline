@@ -16,7 +16,7 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
-import { writeFileSync, readFileSync } from "node:fs";
+import { writeFileSync, readFileSync, realpathSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import { Command, Option } from "commander";
@@ -904,15 +904,53 @@ export async function runLoopCommand(
   process.exitCode = engineResult.result.stop || engineResult.result.holdOutstanding ? 1 : 0;
 }
 
+/** Whether `resolvedPath` resolves inside `repoDir` once symlinks are
+ *  followed (review 2 finding aa79c7b7) — a purely lexical `startsWith` check
+ *  passes for a repository-local symlink whose real target is outside the
+ *  repository. Walks up to the nearest ancestor that actually exists on disk
+ *  (the target itself, or a not-yet-created parent for a write destination),
+ *  resolves *that* ancestor's real path, then re-appends the not-yet-existing
+ *  remainder before comparing against the repository's own real path. When
+ *  neither the target nor any ancestor exists (e.g. in unit tests against a
+ *  nonexistent repo root), there is nothing to resolve, so this defers to the
+ *  caller's lexical check rather than failing closed on unrelated I/O errors. */
+function isPathWithinRealRoot(repoDir: string, resolvedPath: string): boolean {
+  let existingAncestor = resolvedPath;
+  const remainder: string[] = [];
+  for (;;) {
+    try {
+      const realAncestor = realpathSync(existingAncestor);
+      let repoReal: string;
+      try {
+        repoReal = realpathSync(repoDir);
+      } catch {
+        repoReal = repoDir;
+      }
+      const realTarget = remainder.length > 0 ? path.join(realAncestor, ...remainder) : realAncestor;
+      const repoRealRoot = repoReal.endsWith(path.sep) ? repoReal : `${repoReal}${path.sep}`;
+      return realTarget === repoReal || realTarget.startsWith(repoRealRoot);
+    } catch {
+      const parent = path.dirname(existingAncestor);
+      if (parent === existingAncestor) {
+        return true;
+      }
+      remainder.unshift(path.basename(existingAncestor));
+      existingAncestor = parent;
+    }
+  }
+}
+
 /** Resolve `pipeline evals harvest`'s `--out` path, or reject it (review 1
- *  finding a97dc21a). A repository write requires the explicit `--apply`
- *  approval action shared with roadmap/sweep/improve — `--out` without
- *  `--apply` is refused rather than silently writing an unreviewed file, and
- *  an approved `--out` path is constrained to resolve inside the repository
- *  rather than trusting an arbitrary (possibly absolute or `..`-escaping)
- *  caller-supplied path. Returns `{ path: undefined }` (print to stdout) when
- *  `--out` was not supplied at all. Pure and dependency-free so it is
- *  directly unit-testable without invoking the CLI. */
+ *  finding a97dc21a; review 2 finding aa79c7b7). A repository write requires
+ *  the explicit `--apply` approval action shared with roadmap/sweep/improve —
+ *  `--out` without `--apply` is refused rather than silently writing an
+ *  unreviewed file, and an approved `--out` path is constrained to resolve
+ *  inside the repository — both lexically and, after following symlinks, in
+ *  reality — rather than trusting an arbitrary (possibly absolute, `..`-
+ *  escaping, or symlink-escaping) caller-supplied path. Returns `{ path:
+ *  undefined }` (print to stdout) when `--out` was not supplied at all. Pure
+ *  and dependency-free so it is directly unit-testable without invoking the
+ *  CLI. */
 export function resolveHarvestOutPath(
   repoDir: string,
   outArg: string | undefined,
@@ -929,7 +967,30 @@ export function resolveHarvestOutPath(
   if (outPath !== repoDir && !outPath.startsWith(repoRoot)) {
     return { ok: false, error: `--out must resolve within the repository (${repoDir})` };
   }
+  if (!isPathWithinRealRoot(repoDir, outPath)) {
+    return { ok: false, error: `--out must resolve within the repository (${repoDir}) even after resolving symlinks` };
+  }
   return { ok: true, path: outPath };
+}
+
+/** Resolve `pipeline evals harvest --apply`'s promotion destination
+ *  (`--fixtures`), or reject it (review 2 finding aa79c7b7). Unlike
+ *  `--fixtures` for `plan`/`run`/`grade` (a read-only lookup), harvest
+ *  promotion *writes* a fixture file into this directory, so it is
+ *  constrained the same way `--out` is: it must resolve inside the
+ *  repository, both lexically and after following symlinks. */
+export function resolveHarvestFixturesDir(
+  repoDir: string,
+  fixturesDir: string,
+): { ok: true } | { ok: false; error: string } {
+  const repoRoot = repoDir.endsWith(path.sep) ? repoDir : `${repoDir}${path.sep}`;
+  if (fixturesDir !== repoDir && !fixturesDir.startsWith(repoRoot)) {
+    return { ok: false, error: `--fixtures must resolve within the repository (${repoDir}) to promote a fixture into it` };
+  }
+  if (!isPathWithinRealRoot(repoDir, fixturesDir)) {
+    return { ok: false, error: `--fixtures must resolve within the repository (${repoDir}) even after resolving symlinks` };
+  }
+  return { ok: true };
 }
 
 async function main(): Promise<void> {
@@ -1735,6 +1796,11 @@ async function main(): Promise<void> {
           console.log(draftJson);
         }
         if (opts.apply) {
+          const fixturesDirResolution = resolveHarvestFixturesDir(evalsCfg.repo_dir, fixturesDir);
+          if (!fixturesDirResolution.ok) {
+            console.error(`pipeline evals harvest: ${fixturesDirResolution.error}`);
+            process.exit(2);
+          }
           const result = await promoteDraft(draft, fixturesDir, { apply: true, planOnly: !!opts.planOnly });
           console.log(`pipeline evals harvest: promoted fixture "${draft.fixture.fixture_id}" to ${result.fixturePath}`);
           if (result.plan) {

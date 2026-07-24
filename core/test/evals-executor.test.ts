@@ -984,26 +984,41 @@ test("runCell: an API treatment's endpoint provenance is carried onto the cell d
 });
 
 // ---------------------------------------------------------------------------
-// Environment-fidelity enforcement (#535 review 1 finding ed37a4fd): a
-// declared `forbidden` dependency must block the treatment entirely, and a
-// declared `simulated` dependency must receive its declared setup/teardown.
+// Environment-fidelity enforcement (#535 review 1 finding ed37a4fd; review 2
+// finding d906091a): a declared `forbidden` dependency must be deterministically
+// denied at the dependency boundary — its setup/teardown stand-in runs like a
+// `simulated` dependency's, the treatment still executes, and the expected
+// denial is exposed to checks/graders via `detail.environment` — rather than
+// refusing the whole cell before a worktree even exists.
 // ---------------------------------------------------------------------------
 
-test("runCell: a forbidden environment dependency blocks the treatment — no worktree, no harness invocation", async () => {
+test("runCell: a forbidden environment dependency runs its deterministic denial and still executes the treatment", async () => {
   let worktreeCreated = false;
   let harnessInvoked = false;
+  const commands: Array<{ command: string; phase: string }> = [];
   const deps: CellExecutionDeps = {
     createWorktree: async (_c, o) => { worktreeCreated = true; return o; },
     removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
     invokeHarness: async () => { harnessInvoked = true; return successResult(); },
+    runEnvironmentCommand: async (args) => {
+      commands.push({ command: args.command, phase: args.phase });
+      return { ok: true };
+    },
   };
-  const fixture = makeFixture("f1", "review", [envDep({ name: "github-api", mode: "forbidden" })]);
+  const fixture = makeFixture("f1", "review", [
+    envDep({ name: "github-api", mode: "forbidden", expected: { errors: ["403 forbidden"] } }),
+  ]);
   const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
-  assert.equal(result.outcome.result_class, "infra_error");
-  assert.match(result.outcome.error ?? "", /forbidden/);
-  assert.match(result.outcome.error ?? "", /github-api/);
-  assert.equal(worktreeCreated, false, "a forbidden dependency must block before any worktree is created");
-  assert.equal(harnessInvoked, false, "a forbidden dependency must block before the harness is ever invoked");
+  assert.equal(result.outcome.result_class, "completed");
+  assert.equal(worktreeCreated, true, "a forbidden dependency's deterministic denial requires a worktree, like a simulated dependency's stand-in");
+  assert.equal(harnessInvoked, true, "a forbidden dependency must not block the treatment from executing");
+  assert.deepEqual(commands.map((c) => c.phase), ["setup", "teardown"]);
+  const environmentDetail = (result.outcome.detail as Record<string, unknown>)?.environment as Array<Record<string, unknown>>;
+  assert.equal(environmentDetail?.length, 1);
+  assert.equal(environmentDetail?.[0]?.name, "github-api");
+  assert.equal(environmentDetail?.[0]?.mode, "forbidden");
+  assert.deepEqual(environmentDetail?.[0]?.expected, { errors: ["403 forbidden"] });
 });
 
 test("runCell: a simulated environment dependency runs its declared setup before, and teardown after, the treatment", async () => {
@@ -1044,6 +1059,28 @@ test("runCell: a simulated dependency's setup failure classifies as infra_error 
   assert.equal(result.outcome.result_class, "infra_error");
   assert.match(result.outcome.error ?? "", /seed script exited 1/);
   assert.equal(harnessInvoked, false);
+});
+
+test("runCell: a simulated dependency's setup shelling out to gh is refused by the real default runner — no injected fake", async () => {
+  // Exercises `defaultRunEnvironmentCommand` for real (deps.runEnvironmentCommand
+  // is intentionally omitted) — review 2 finding dc817cec: a fixture-declared
+  // setup/teardown must never be able to shell out to GitHub-write or
+  // network tooling, even without a test double standing in for it.
+  let harnessInvoked = false;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => { harnessInvoked = true; return successResult(); },
+  };
+  const fixture = makeFixture("f1", "review", [
+    envDep({ name: "github-api", mode: "simulated", setup: "gh issue create --title x --body y" }),
+  ]);
+  const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /gh/);
+  assert.match(result.outcome.error ?? "", /not permitted/);
+  assert.equal(harnessInvoked, false, "a denied setup command must block the treatment, the same as any other setup failure");
 });
 
 test("runCell: a live environment dependency does not block or require a simulated stand-in", async () => {
