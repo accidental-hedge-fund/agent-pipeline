@@ -104,6 +104,63 @@ test("runExperiment: a completed cell's record carries a trajectory_artifact des
   void manifest;
 });
 
+test("runExperiment: the treatment trajectory artifact records each stage's materialized message, not just its output (review 1 finding bd71053b)", async () => {
+  const { deps, outFiles } = makeFakeFs(makeFixtureFile(), makeManifestFile());
+  const cellExecution: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "review output text", stderr: "", duration: 1 }),
+  };
+  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
+  const descriptor = executed[0].trajectory_artifact!;
+  const artifact = JSON.parse(outFiles.get(path.join(FAKE_CFG.repo_dir, descriptor.path))!);
+  assert.equal(artifact.stages.length, 1);
+  assert.ok(typeof artifact.stages[0].message === "string" && artifact.stages[0].message.length > 0);
+});
+
+test("runExperiment: a timeout cell's trajectory artifact carries the terminal result_class and error even when the stage's own stderr was empty (review 1 finding bb8858eb)", async () => {
+  const { deps, outFiles } = makeFakeFs(makeFixtureFile(), makeManifestFile());
+  const cellExecution: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({ success: false, timed_out: true, exit_code: 0, stdout: "", stderr: "", duration: 60 }),
+  };
+  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
+  assert.equal(executed[0].result_class, "timeout");
+  const descriptor = executed[0].trajectory_artifact!;
+  const artifact = JSON.parse(outFiles.get(path.join(FAKE_CFG.repo_dir, descriptor.path))!);
+  assert.equal(artifact.result_class, "timeout");
+  assert.ok(typeof artifact.error === "string" && artifact.error.length > 0);
+});
+
+test("runExperiment: an artifact collection failure is durably recorded on the cell record as trajectory_artifact_error, not only console.warn'd (review 1 finding 5ae0fa6e)", async () => {
+  const { deps } = makeFakeFs(makeFixtureFile(), makeManifestFile());
+  const cellExecution: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 }),
+  };
+  const failingDeps: RunExperimentDeps = {
+    ...deps,
+    cellExecution,
+    writeFile: async (p: string, content: string) => {
+      if (p.includes("trajectories")) throw new Error("disk full");
+      return deps.writeFile(p, content);
+    },
+  } as RunExperimentDeps;
+  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", failingDeps);
+  assert.equal(executed.length, 1);
+  assert.equal(executed[0].result_class, "completed", "a trajectory collection failure must never change result_class");
+  assert.equal(executed[0].trajectory_artifact, undefined);
+  assert.ok(
+    typeof executed[0].trajectory_artifact_error === "string" && executed[0].trajectory_artifact_error.length > 0,
+    "expected a durable trajectory_artifact_error when artifact collection failed",
+  );
+});
+
 test("runExperiment: an API-executor cell also emits a trajectory artifact recording the invocation", async () => {
   const { deps } = makeFakeFs(
     makeFixtureFile({ stage_entry_artifacts: { review: { x: 1 } }, grader_refs: [{ grader: "review", version: "1" }] }),
@@ -405,6 +462,24 @@ test("generateSummary: linking enabled adds linked_artifacts for a failed cell a
   const grades: GradeRecord[] = [
     { cell_id: "c1", experiment_id: "exp1", fixture_id: "f1", treatment_id: "baseline", replicate: 1, graders: [{ grader: "review", version: "1" }], payload: { kind: "review", grade: { true_positives: 1, false_positives: 0, false_negatives: 0, precision: 1, recall: 1, f1: 1, severity_calibration: [] } } },
     { cell_id: "c2", experiment_id: "exp1", fixture_id: "f1", treatment_id: "candidate", replicate: 1, graders: [{ grader: "review", version: "1" }], payload: { kind: "review", grade: { true_positives: 0, false_positives: 0, false_negatives: 1, precision: null, recall: 0, f1: 0, severity_calibration: [] } }, verifier_artifact: { path: "v2", content_hash: "vh2", schema_version: 1, byte_count: 1, truncation_status: "none" } },
+    {
+      cell_id: "c4",
+      experiment_id: "exp1",
+      fixture_id: "f1",
+      treatment_id: "candidate",
+      replicate: 1,
+      graders: [{ grader: "review", version: "1" }, { grader: "planning", version: "1" }],
+      payload: {
+        kind: "composite",
+        grades: [
+          { kind: "review", grade: { true_positives: 0, false_positives: 0, false_negatives: 1, precision: null, recall: 0, f1: 0, severity_calibration: [] } },
+        ],
+      },
+      verifier_artifacts: [
+        { grader: "review", version: "1", artifact: { path: "cv-review", content_hash: "cvh-review", schema_version: 1, byte_count: 1, truncation_status: "none" } },
+        { grader: "planning", version: "1", artifact: { path: "cv-planning", content_hash: "cvh-planning", schema_version: 1, byte_count: 1, truncation_status: "none" } },
+      ],
+    },
   ];
 
   const disabled = generateSummary(manifest, plan, runs, failures, grades, new Map(), { baselineTreatmentId: "baseline" });
@@ -426,6 +501,14 @@ test("generateSummary: linking enabled adds linked_artifacts for a failed cell a
   assert.ok(c2, "the false-negative cell must be flagged");
   assert.ok(c2!.reasons.includes("false_positive_or_negative"));
   assert.equal(c2!.verifier_artifacts[0]?.path, "v2");
+
+  // A composite grade's per-sub-grader artifacts (review 1 finding c7218eb4)
+  // are linked too, not just a single-grader payload's verifier_artifact.
+  const c4 = byCellId.get("c4");
+  assert.ok(c4, "the composite grade's false-negative cell must be flagged");
+  assert.ok(c4!.reasons.includes("false_positive_or_negative"));
+  const c4Paths = c4!.verifier_artifacts.map((a) => a.path).sort();
+  assert.deepEqual(c4Paths, ["cv-planning", "cv-review"]);
 });
 
 test("generateSummary: summarizing the same grades twice with linking enabled is byte-identical", () => {

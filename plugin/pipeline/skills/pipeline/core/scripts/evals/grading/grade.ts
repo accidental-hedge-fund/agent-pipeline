@@ -93,9 +93,11 @@ export async function gradeExperiment(
   // Emit and content-address this grade's verifier evidence artifact (#536
   // task 4.1). `evidenceConsulted` is where verifier-only material (hidden
   // checks, seeded-defect ground truth) is permitted to live — it never
-  // leaks into the treatment trajectory (task 5). Best-effort/non-fatal:
-  // a write failure leaves the grade record without a descriptor rather
-  // than failing the grading pass.
+  // leaks into the treatment trajectory (task 5). Best-effort/non-fatal: a
+  // build/collision/write failure leaves the grade record without a
+  // descriptor, but is returned as `error` so the caller can durably record
+  // it on the grade record rather than only console.warn'ing it (review 1
+  // finding 5ae0fa6e).
   async function emitVerifierArtifact(
     identity: CellIdentity,
     verifierId: string,
@@ -103,7 +105,7 @@ export async function gradeExperiment(
     inputs: unknown,
     evidenceConsulted: unknown[],
     finalResult: unknown,
-  ): Promise<ArtifactDescriptor | undefined> {
+  ): Promise<{ descriptor?: ArtifactDescriptor; error?: string }> {
     try {
       const artifact = buildVerifierEvidenceArtifact({
         cell_id: identity.cell_id,
@@ -124,13 +126,14 @@ export async function gradeExperiment(
         deps,
       );
       if (result.status === "written" || result.status === "deduped") {
-        return result.descriptor;
+        return { descriptor: result.descriptor };
       }
       console.warn(`[pipeline] evals: verifier artifact for cell ${identity.cell_id} not recorded (non-fatal): ${result.error}`);
-      return undefined;
+      return { error: result.error };
     } catch (err) {
-      console.warn(`[pipeline] evals: verifier artifact collection for cell ${identity.cell_id} failed (non-fatal): ${(err as Error).message}`);
-      return undefined;
+      const error = (err as Error).message;
+      console.warn(`[pipeline] evals: verifier artifact collection for cell ${identity.cell_id} failed (non-fatal): ${error}`);
+      return { error };
     }
   }
 
@@ -183,45 +186,63 @@ export async function gradeExperiment(
       const detailForComposite = record.detail ?? {};
       const compositeGrades: CompositeSubGradePayload[] = [];
       const compositeGraders: GraderVersion[] = [];
+      // Each sub-grader gets its own verifier evidence artifact (review 1
+      // finding c7218eb4) — collapsing every composite sub-grade into a
+      // single "composite" artifact made it impossible to independently
+      // address which grader produced a given piece of evidence.
+      const compositeVerifierArtifacts: NonNullable<GradeRecord["verifier_artifacts"]> = [];
+      const compositeVerifierArtifactErrors: NonNullable<GradeRecord["verifier_artifact_errors"]> = [];
       if (detailForComposite.findings !== undefined) {
         const reviewRef = fixture.grader_refs.find((r) => r.grader === "review");
         if (reviewRef) {
           const findings = parseReportedFindings(detailForComposite.findings as unknown[] | undefined);
-          compositeGrades.push({ kind: "review", grade: gradeReview(fixture, findings) });
+          const grade = gradeReview(fixture, findings);
+          compositeGrades.push({ kind: "review", grade });
           compositeGraders.push({ grader: reviewRef.grader, version: reviewRef.version });
+          const { descriptor, error } = await emitVerifierArtifact(
+            identity,
+            reviewRef.grader,
+            reviewRef.version,
+            { reported_findings: findings },
+            fixture.seeded_defects ?? [],
+            grade,
+          );
+          if (descriptor) compositeVerifierArtifacts.push({ grader: reviewRef.grader, version: reviewRef.version, artifact: descriptor });
+          if (error) compositeVerifierArtifactErrors.push({ grader: reviewRef.grader, version: reviewRef.version, error });
         }
       }
       if (detailForComposite.output_text !== undefined) {
         const planningRef = fixture.grader_refs.find((r) => r.grader === "planning");
         if (planningRef) {
           const outputText = (detailForComposite.output_text as string) ?? "";
+          const grade = gradePlanning(fixture, outputText);
           compositeGrades.push({
             kind: "planning",
-            grade: gradePlanning(fixture, outputText),
+            grade,
             self_assessment_observed: detailForComposite.self_assessment,
           });
           compositeGraders.push({ grader: planningRef.grader, version: planningRef.version });
+          const { descriptor, error } = await emitVerifierArtifact(
+            identity,
+            planningRef.grader,
+            planningRef.version,
+            { output_text: outputText },
+            fixture.acceptance_criteria ?? [],
+            grade,
+          );
+          if (descriptor) compositeVerifierArtifacts.push({ grader: planningRef.grader, version: planningRef.version, artifact: descriptor });
+          if (error) compositeVerifierArtifactErrors.push({ grader: planningRef.grader, version: planningRef.version, error });
         }
       }
       if (compositeGrades.length === 0) {
         skipped.push({ ...identity, reason: `manifest mode "${manifest.mode}" has no applicable grader` });
       } else {
-        const verifierArtifact = await emitVerifierArtifact(
-          identity,
-          "composite",
-          compositeGraders.map((g) => `${g.grader}@${g.version}`).join("+"),
-          { detail: detailForComposite },
-          [
-            ...(fixture.seeded_defects ?? []),
-            ...(fixture.acceptance_criteria ?? []),
-          ],
-          compositeGrades,
-        );
         grades.push({
           ...identity,
           graders: compositeGraders,
           payload: { kind: "composite", grades: compositeGrades },
-          ...(verifierArtifact ? { verifier_artifact: verifierArtifact } : {}),
+          ...(compositeVerifierArtifacts.length > 0 ? { verifier_artifacts: compositeVerifierArtifacts } : {}),
+          ...(compositeVerifierArtifactErrors.length > 0 ? { verifier_artifact_errors: compositeVerifierArtifactErrors } : {}),
         });
       }
       continue;
@@ -246,7 +267,7 @@ export async function gradeExperiment(
       }
       const changedPaths = detail.changed_paths as string[] | undefined;
       const grade = gradeImplementationFix(fixture, candidateChecks, baseline, changedPaths);
-      const verifierArtifact = await emitVerifierArtifact(
+      const { descriptor: verifierArtifact, error: verifierArtifactError } = await emitVerifierArtifact(
         identity,
         ref.grader,
         ref.version,
@@ -259,11 +280,12 @@ export async function gradeExperiment(
         graders: [{ grader: ref.grader, version: ref.version }],
         payload: { kind: "implementation-fix", grade },
         ...(verifierArtifact ? { verifier_artifact: verifierArtifact } : {}),
+        ...(verifierArtifactError ? { verifier_artifact_error: verifierArtifactError } : {}),
       });
     } else if (graderId === "review") {
       const findings = parseReportedFindings(detail.findings as unknown[] | undefined);
       const grade = gradeReview(fixture, findings);
-      const verifierArtifact = await emitVerifierArtifact(
+      const { descriptor: verifierArtifact, error: verifierArtifactError } = await emitVerifierArtifact(
         identity,
         ref.grader,
         ref.version,
@@ -276,11 +298,12 @@ export async function gradeExperiment(
         graders: [{ grader: ref.grader, version: ref.version }],
         payload: { kind: "review", grade },
         ...(verifierArtifact ? { verifier_artifact: verifierArtifact } : {}),
+        ...(verifierArtifactError ? { verifier_artifact_error: verifierArtifactError } : {}),
       });
     } else if (graderId === "planning") {
       const outputText = (detail.output_text as string) ?? "";
       const grade = gradePlanning(fixture, outputText);
-      const verifierArtifact = await emitVerifierArtifact(
+      const { descriptor: verifierArtifact, error: verifierArtifactError } = await emitVerifierArtifact(
         identity,
         ref.grader,
         ref.version,
@@ -293,6 +316,7 @@ export async function gradeExperiment(
         graders: [{ grader: ref.grader, version: ref.version }],
         payload: { kind: "planning", grade, self_assessment_observed: detail.self_assessment },
         ...(verifierArtifact ? { verifier_artifact: verifierArtifact } : {}),
+        ...(verifierArtifactError ? { verifier_artifact_error: verifierArtifactError } : {}),
       });
     }
   }

@@ -71,8 +71,12 @@ export async function runJudging(
 
     // Verifier evidence artifact for this judge invocation (#536 task 4.2),
     // independently addressable from the deterministic grader's own artifact
-    // for the same cell — best-effort/non-fatal, mirroring grade.ts.
+    // for the same cell — best-effort/non-fatal, mirroring grade.ts. A
+    // build/collision/write failure is durably recorded on the judge and
+    // disagreement records via `verifier_artifact_error` (review 1 finding
+    // 5ae0fa6e), not only console.warn'd.
     let verifierArtifact: JudgeRecord["verifier_artifact"];
+    let verifierArtifactError: string | undefined;
     if (deps.artifactStore) {
       try {
         const artifact = buildVerifierEvidenceArtifact({
@@ -95,10 +99,12 @@ export async function runJudging(
         if (result.status === "written" || result.status === "deduped") {
           verifierArtifact = result.descriptor;
         } else {
+          verifierArtifactError = result.error;
           console.warn(`[pipeline] evals: judge verifier artifact for cell ${grade.cell_id} not recorded (non-fatal): ${result.error}`);
         }
       } catch (err) {
-        console.warn(`[pipeline] evals: judge verifier artifact collection for cell ${grade.cell_id} failed (non-fatal): ${(err as Error).message}`);
+        verifierArtifactError = (err as Error).message;
+        console.warn(`[pipeline] evals: judge verifier artifact collection for cell ${grade.cell_id} failed (non-fatal): ${verifierArtifactError}`);
       }
     }
 
@@ -113,6 +119,7 @@ export async function runJudging(
       judge_prompt_version: deps.judgePromptVersion,
       verdict,
       ...(verifierArtifact ? { verifier_artifact: verifierArtifact } : {}),
+      ...(verifierArtifactError ? { verifier_artifact_error: verifierArtifactError } : {}),
     });
     if (verdict.pass !== deterministicPass(grade)) {
       disagreements.push({
@@ -124,6 +131,7 @@ export async function runJudging(
         judge_prompt_version: deps.judgePromptVersion,
         note: `judge verdict pass=${verdict.pass} disagrees with deterministic grade pass=${deterministicPass(grade)}`,
         ...(verifierArtifact ? { verifier_artifact: verifierArtifact } : {}),
+        ...(verifierArtifactError ? { verifier_artifact_error: verifierArtifactError } : {}),
       });
     }
   }

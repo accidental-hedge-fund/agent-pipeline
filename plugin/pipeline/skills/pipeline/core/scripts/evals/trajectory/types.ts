@@ -6,7 +6,7 @@
 // evidence artifact per grader/judge that scored it. Every persisted shape
 // carries a top-level schema_version (run-artifact-conventions).
 
-import type { CellExecutionClass } from "../types.ts";
+import type { CellExecutionClass, CellResultClass } from "../types.ts";
 
 export const TRAJECTORY_SCHEMA_VERSION = 1;
 
@@ -46,11 +46,16 @@ export interface ToolEvent {
   error?: string;
 }
 
-/** One stage's bounded output — never chain-of-thought, only the harness's
+/** One stage's bounded output — never chain-of-thought, only the treatment-
+ *  visible materialized message/prompt supplied to the stage, the harness's
  *  structured/plain-text stdout, its error text (if any), timing, and whether
  *  the invocation itself succeeded. */
 export interface TrajectoryStageEntry {
   stage: string;
+  /** The materialized stage prompt/message the treatment was given — never
+   *  verifier-only material (hidden checks, golden answers, seeded-defect
+   *  ground truth never appear here). */
+  message: string;
   output: string;
   error?: string;
   duration_ms?: number;
@@ -86,6 +91,13 @@ export interface TreatmentTrajectoryArtifact {
   tool_events: { availability: ChannelAvailability; items: ToolEvent[] };
   /** Repository-relative paths the treatment changed in its own worktree. */
   produced_artifacts: ProducedArtifactRef[];
+  /** The cell's terminal result classification — always present, so a
+   *  timeout/infra_error/auth_error cell's trajectory is diagnosable even
+   *  when the failing stage's own stdout/stderr was empty. */
+  result_class: CellResultClass;
+  /** The cell outcome's structured error, when `result_class` is not
+   *  `"completed"` (bounded/sanitized like stage output). */
+  error?: string;
   /** Merged truncation accounting across every bounded channel above. */
   truncation: TruncationInfo;
 }

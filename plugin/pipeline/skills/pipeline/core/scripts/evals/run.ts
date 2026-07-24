@@ -130,8 +130,12 @@ export async function runExperiment(
 
     // Treatment trajectory artifact (#536): best-effort and non-fatal — a
     // collection/write failure is logged and leaves the cell's result_class
-    // untouched (task 3.2); the record simply carries no descriptor.
+    // untouched (task 3.2), but is durably recorded on the cell record itself
+    // (review 1 finding 5ae0fa6e) rather than only console.warn'd, so a
+    // consumer of runs.jsonl can distinguish "collection failed" from
+    // "collection was never attempted / produced nothing".
     let trajectoryArtifact: CellRecord["trajectory_artifact"];
+    let trajectoryArtifactError: string | undefined;
     try {
       const artifact = buildTreatmentTrajectoryArtifact({ ...trajectory, ceilings: deps.trajectoryCeilings });
       const trajectoriesDir = path.join(experimentDir(outputDir, manifest.experiment_id), "trajectories");
@@ -145,9 +149,11 @@ export async function runExperiment(
       if (result.status === "written" || result.status === "deduped") {
         trajectoryArtifact = result.descriptor;
       } else {
+        trajectoryArtifactError = result.error;
         console.warn(`[pipeline] evals: trajectory artifact for cell ${cell.cell_id} not recorded (non-fatal): ${result.error}`);
       }
     } catch (err) {
+      trajectoryArtifactError = (err as Error).message;
       console.warn(`[pipeline] evals: trajectory artifact collection for cell ${cell.cell_id} failed (non-fatal): ${(err as Error).message}`);
     }
 
@@ -165,6 +171,7 @@ export async function runExperiment(
       detail: outcome.detail,
       error: outcome.error,
       ...(trajectoryArtifact ? { trajectory_artifact: trajectoryArtifact } : {}),
+      ...(trajectoryArtifactError ? { trajectory_artifact_error: trajectoryArtifactError } : {}),
     };
     const persisted = await appendCellRecord(outputDir, record, deps);
     if (persisted) {

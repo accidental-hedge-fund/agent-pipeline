@@ -11,7 +11,8 @@ test("buildTreatmentTrajectoryArtifact: captures per-stage output, timing, and s
     cell_id: "exp1/fx/harness=claude/1",
     experiment_id: "exp1",
     execution_class: "local-cli",
-    stages: [{ stage: "implementing", output: "did the thing", duration_ms: 1234, success: true }],
+    result_class: "completed",
+    stages: [{ stage: "implementing", message: "stage message", output: "did the thing", duration_ms: 1234, success: true }],
     actions: ["invoked stage implementing"],
     toolEvents: { availability: { available: false, reason: "harness does not expose tool-call telemetry" } },
     producedArtifacts: ["src/foo.ts"],
@@ -23,6 +24,23 @@ test("buildTreatmentTrajectoryArtifact: captures per-stage output, timing, and s
   assert.equal(artifact.stages[0].duration_ms, 1234);
   assert.equal(artifact.stages[0].success, true);
   assert.deepEqual(artifact.produced_artifacts, [{ path: "src/foo.ts" }]);
+  assert.equal(artifact.stages[0].message, "stage message");
+});
+
+test("buildTreatmentTrajectoryArtifact: records the terminal result_class and error, independent of any stage's own stderr (review 1 finding bb8858eb)", () => {
+  const artifact = buildTreatmentTrajectoryArtifact({
+    cell_id: "c1",
+    experiment_id: "exp1",
+    execution_class: "local-cli",
+    result_class: "timeout",
+    error: 'stage "implementing" exceeded the per-cell timeout',
+    stages: [{ stage: "implementing", message: "do the thing", output: "", success: false }],
+    actions: ["invoked stage implementing"],
+    toolEvents: { availability: { available: false, reason: "n/a" } },
+    producedArtifacts: [],
+  });
+  assert.equal(artifact.result_class, "timeout");
+  assert.equal(artifact.error, 'stage "implementing" exceeded the per-cell timeout');
 });
 
 test("buildTreatmentTrajectoryArtifact: unavailable tool-call telemetry is marked unavailable with a reason, not an empty successful channel", () => {
@@ -30,6 +48,7 @@ test("buildTreatmentTrajectoryArtifact: unavailable tool-call telemetry is marke
     cell_id: "c1",
     experiment_id: "exp1",
     execution_class: "local-cli",
+    result_class: "completed",
     stages: [],
     actions: [],
     toolEvents: { availability: { available: false, reason: "CLI harness exposes only plain-text stdout" } },
@@ -45,6 +64,7 @@ test("buildTreatmentTrajectoryArtifact: an available tool-events channel carries
     cell_id: "c1",
     experiment_id: "exp1",
     execution_class: "api-key",
+    result_class: "completed",
     stages: [],
     actions: [],
     toolEvents: {
@@ -62,7 +82,8 @@ test("buildTreatmentTrajectoryArtifact: no chain-of-thought field exists — str
     cell_id: "c1",
     experiment_id: "exp1",
     execution_class: "local-cli",
-    stages: [{ stage: "planning", output: "plan text" }],
+    result_class: "completed",
+    stages: [{ stage: "planning", message: "stage message", output: "plan text" }],
     actions: ["invoked stage planning"],
     toolEvents: { availability: { available: false, reason: "n/a" } },
     producedArtifacts: [],
@@ -77,7 +98,8 @@ test("buildTreatmentTrajectoryArtifact: a secret in stage output is redacted bef
     cell_id: "c1",
     experiment_id: "exp1",
     execution_class: "local-cli",
-    stages: [{ stage: "implementing", output: 'export GH_TOKEN="ghp_1234567890abcdef1234567890abcdef1234"' }],
+    result_class: "completed",
+    stages: [{ stage: "implementing", message: "stage message", output: 'export GH_TOKEN="ghp_1234567890abcdef1234567890abcdef1234"' }],
     actions: [],
     toolEvents: { availability: { available: false, reason: "n/a" } },
     producedArtifacts: [],
@@ -92,7 +114,8 @@ test("buildTreatmentTrajectoryArtifact: over-ceiling stage output is truncated d
       cell_id: "c1",
       experiment_id: "exp1",
       execution_class: "local-cli",
-      stages: [{ stage: "implementing", output: bigOutput }],
+      result_class: "completed",
+      stages: [{ stage: "implementing", message: "stage message", output: bigOutput }],
       actions: [],
       toolEvents: { availability: { available: false, reason: "n/a" } },
       producedArtifacts: [],
@@ -110,7 +133,8 @@ test("buildTreatmentTrajectoryArtifact: within-ceiling content is untruncated", 
     cell_id: "c1",
     experiment_id: "exp1",
     execution_class: "local-cli",
-    stages: [{ stage: "implementing", output: "short" }],
+    result_class: "completed",
+    stages: [{ stage: "implementing", message: "stage message", output: "short" }],
     actions: ["a"],
     toolEvents: { availability: { available: false, reason: "n/a" } },
     producedArtifacts: [],
@@ -130,7 +154,8 @@ test("buildTreatmentTrajectoryArtifact: no hidden-check body, seeded-defect grou
     cell_id: "c1",
     experiment_id: "exp1",
     execution_class: "local-cli",
-    stages: [{ stage: "implementing", output: "normal harness output, no check bodies referenced" }],
+    result_class: "completed",
+    stages: [{ stage: "implementing", message: "stage message", output: "normal harness output, no check bodies referenced" }],
     actions: [],
     toolEvents: { availability: { available: false, reason: "n/a" } },
     producedArtifacts: [],
@@ -174,7 +199,8 @@ test("buildVerifierEvidenceArtifact: independently addressable content from a tr
     cell_id: "c1",
     experiment_id: "exp1",
     execution_class: "local-cli",
-    stages: [{ stage: "review", output: "ok" }],
+    result_class: "completed",
+    stages: [{ stage: "review", message: "stage message", output: "ok" }],
     actions: [],
     toolEvents: { availability: { available: false, reason: "n/a" } },
     producedArtifacts: [],

@@ -18,7 +18,7 @@ import {
   type TruncationInfo,
   type VerifierEvidenceArtifact,
 } from "./types.ts";
-import type { CellExecutionClass } from "../types.ts";
+import type { CellExecutionClass, CellResultClass } from "../types.ts";
 
 function clean(text: string): string {
   return sanitize(redactSecrets(text));
@@ -26,6 +26,9 @@ function clean(text: string): string {
 
 export interface RawStageEntry {
   stage: string;
+  /** The materialized stage prompt/message supplied to the treatment —
+   *  treatment-visible input only, never verifier-only material. */
+  message: string;
   output: string;
   error?: string;
   duration_ms?: number;
@@ -44,6 +47,12 @@ export interface BuildTreatmentTrajectoryInput {
    *  channel, so callers pass `{ available: false, reason: "..." }` today. */
   toolEvents: { availability: ChannelAvailability; items?: ToolEvent[] };
   producedArtifacts: string[];
+  /** The cell's terminal result classification and, when not `"completed"`,
+   *  its structured error — captured independently of any stage's own
+   *  stdout/stderr so a timeout/infra_error/auth_error cell is diagnosable
+   *  even when the failing stage produced no stderr. */
+  result_class: CellResultClass;
+  error?: string;
   ceilings?: BoundCeilings;
 }
 
@@ -54,6 +63,8 @@ export function buildTreatmentTrajectoryArtifact(
   const truncations: TruncationInfo[] = [];
 
   const sanitizedStages: TrajectoryStageEntry[] = input.stages.map((s) => {
+    const boundedMessage = boundText(clean(s.message), ceilings.maxBytes);
+    truncations.push(boundedMessage.truncation);
     const boundedOutput = boundText(clean(s.output), ceilings.maxBytes);
     truncations.push(boundedOutput.truncation);
     let error: string | undefined;
@@ -64,6 +75,7 @@ export function buildTreatmentTrajectoryArtifact(
     }
     return {
       stage: s.stage,
+      message: boundedMessage.text,
       output: boundedOutput.text,
       ...(error !== undefined ? { error } : {}),
       ...(s.duration_ms !== undefined ? { duration_ms: s.duration_ms } : {}),
@@ -83,6 +95,13 @@ export function buildTreatmentTrajectoryArtifact(
 
   const producedArtifacts: ProducedArtifactRef[] = input.producedArtifacts.map((p) => ({ path: p }));
 
+  let boundedError: string | undefined;
+  if (input.error !== undefined) {
+    const bounded = boundText(clean(input.error), ceilings.maxBytes);
+    truncations.push(bounded.truncation);
+    boundedError = bounded.text;
+  }
+
   return {
     schema_version: TRAJECTORY_SCHEMA_VERSION,
     cell_id: input.cell_id,
@@ -92,6 +111,8 @@ export function buildTreatmentTrajectoryArtifact(
     actions: boundedActions.items,
     tool_events: { availability: input.toolEvents.availability, items: boundedToolEvents.items },
     produced_artifacts: producedArtifacts,
+    result_class: input.result_class,
+    ...(boundedError !== undefined ? { error: boundedError } : {}),
     truncation: mergeTruncations(truncations),
   };
 }

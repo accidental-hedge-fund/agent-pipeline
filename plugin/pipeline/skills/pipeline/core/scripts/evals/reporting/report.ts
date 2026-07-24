@@ -113,13 +113,24 @@ function computeLinkedArtifacts(
 
   const reasonsByCell = new Map<string, Set<string>>();
   const verifierArtifactsByCell = new Map<string, ArtifactDescriptor[]>();
-  function flag(cellId: string, reason: string, verifierArtifact?: ArtifactDescriptor): void {
+  function flag(cellId: string, reason: string, verifierArtifacts: ArtifactDescriptor[] = []): void {
     if (!reasonsByCell.has(cellId)) reasonsByCell.set(cellId, new Set());
     reasonsByCell.get(cellId)!.add(reason);
-    if (verifierArtifact) {
+    if (verifierArtifacts.length > 0) {
       if (!verifierArtifactsByCell.has(cellId)) verifierArtifactsByCell.set(cellId, []);
-      verifierArtifactsByCell.get(cellId)!.push(verifierArtifact);
+      verifierArtifactsByCell.get(cellId)!.push(...verifierArtifacts);
     }
+  }
+
+  // A `composite` grade carries its per-sub-grader artifacts under
+  // `verifier_artifacts`, not the singular `verifier_artifact` other payload
+  // kinds use (review 1 finding c7218eb4) — flatten either shape to a list.
+  function verifierArtifactsOf(grade: GradeRecord | undefined): ArtifactDescriptor[] {
+    if (!grade) return [];
+    if (grade.payload.kind === "composite") {
+      return (grade.verifier_artifacts ?? []).map((v) => v.artifact);
+    }
+    return grade.verifier_artifact ? [grade.verifier_artifact] : [];
   }
 
   for (const f of failures) {
@@ -137,7 +148,7 @@ function computeLinkedArtifacts(
   for (const grade of grades) {
     const review = reviewGradeOf(grade);
     if (review && (review.false_positives > 0 || review.false_negatives > 0)) {
-      flag(grade.cell_id, "false_positive_or_negative", grade.verifier_artifact);
+      flag(grade.cell_id, "false_positive_or_negative", verifierArtifactsOf(grade));
     }
   }
 
@@ -149,13 +160,13 @@ function computeLinkedArtifacts(
     for (const entry of entries) {
       const z = Math.abs((entry.score - mean) / sd);
       if (z > OUTLIER_Z_SCORE_THRESHOLD) {
-        flag(entry.cell_id, "outlier", gradeByCell.get(entry.cell_id)?.verifier_artifact);
+        flag(entry.cell_id, "outlier", verifierArtifactsOf(gradeByCell.get(entry.cell_id)));
       }
     }
   }
 
   for (const d of disagreements) {
-    flag(d.cell_id, "judge_disagreement", d.verifier_artifact);
+    flag(d.cell_id, "judge_disagreement", d.verifier_artifact ? [d.verifier_artifact] : []);
   }
 
   return [...reasonsByCell.entries()]

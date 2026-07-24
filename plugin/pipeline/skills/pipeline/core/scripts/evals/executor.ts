@@ -442,6 +442,8 @@ export async function runCell(
         actions: trajectoryActions,
         toolEvents: TOOL_EVENTS_UNAVAILABLE,
         producedArtifacts: (outcome.detail?.changed_paths as string[] | undefined) ?? [],
+        result_class: outcome.result_class,
+        error: outcome.error,
       },
     };
   }
@@ -530,6 +532,7 @@ export async function runCell(
       const result = invoked.result;
       trajectoryStages.push({
         stage: pipelineStage,
+        message: prompts[0],
         output: result.stdout,
         error: result.success ? undefined : result.stderr,
         duration_ms: Math.round(result.duration * 1000),
@@ -620,6 +623,7 @@ export async function runCell(
       // maintainer needs to see in the trajectory (#536).
       trajectoryStages.push({
         stage,
+        message: prompt,
         output: result.stdout,
         error: result.success ? undefined : result.stderr,
         duration_ms: Math.round(result.duration * 1000),

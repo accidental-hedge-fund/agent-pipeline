@@ -262,4 +262,9 @@ export interface CellRecord {
    *  collection succeeded. Absent when collection failed or produced no
    *  artifact — never a stand-in for an empty trajectory. */
   trajectory_artifact?: ArtifactDescriptor;
+  /** Durable record of why `trajectory_artifact` is absent despite the cell
+   *  having run (#536, review 1 finding 5ae0fa6e) — a build failure, a
+   *  content-address collision, or a write failure. Absent when collection
+   *  succeeded. Never affects `result_class`: collection is diagnostic-only. */
+  trajectory_artifact_error?: string;
 }

@@ -90,8 +90,24 @@ export interface GradeRecord extends CellIdentity {
   payload: StageGradePayload;
   /** Descriptor for this grade's verifier evidence artifact (#536), when
    *  emission succeeded. Independently addressable from the cell's treatment
-   *  trajectory artifact — never a reference into it. */
+   *  trajectory artifact — never a reference into it. Populated only for a
+   *  single-grader `payload.kind` (`implementation-fix`, `review`,
+   *  `planning`); a `composite` grade uses `verifier_artifacts` instead. */
   verifier_artifact?: ArtifactDescriptor;
+  /** Per-sub-grader verifier evidence artifact descriptors for a `composite`
+   *  grade (#536) — one entry per deterministic grader folded into the
+   *  composite, each independently addressable, so evidence from one
+   *  sub-grader is never conflated with another's (review 1 finding
+   *  c7218eb4). Populated only when `payload.kind === "composite"`. */
+  verifier_artifacts?: Array<{ grader: string; version: string; artifact: ArtifactDescriptor }>;
+  /** Durable record of why `verifier_artifact` is absent for a single-grader
+   *  `payload.kind` (#536, review 1 finding 5ae0fa6e) — a build, collision,
+   *  or write failure. Never affects the grade itself. */
+  verifier_artifact_error?: string;
+  /** Durable per-sub-grader record of why that grader's entry is missing
+   *  from `verifier_artifacts` for a `composite` grade — same failure
+   *  reasons as `verifier_artifact_error`, one per grader. */
+  verifier_artifact_errors?: Array<{ grader: string; version: string; error: string }>;
 }
 
 /** A reason a completed cell produced no grade record — never silent, always
@@ -110,6 +126,9 @@ export interface JudgeRecord extends CellIdentity {
   /** Descriptor for this judge invocation's verifier evidence artifact
    *  (#536) — separate from the deterministic grader's own artifact. */
   verifier_artifact?: ArtifactDescriptor;
+  /** Durable record of why `verifier_artifact` is absent (#536, review 1
+   *  finding 5ae0fa6e) — a build, collision, or write failure. */
+  verifier_artifact_error?: string;
 }
 
 /** A recorded disagreement between a judge verdict and the deterministic
@@ -121,6 +140,9 @@ export interface JudgeDisagreementRecord extends CellIdentity {
    *  lets a maintainer inspect the judge side without conflating it with the
    *  deterministic grader's artifact. */
   verifier_artifact?: ArtifactDescriptor;
+  /** Durable record of why `verifier_artifact` is absent (#536, review 1
+   *  finding 5ae0fa6e) — a build, collision, or write failure. */
+  verifier_artifact_error?: string;
 }
 
 /** A blinded human adjudication record. `opaque_key` is derived from
