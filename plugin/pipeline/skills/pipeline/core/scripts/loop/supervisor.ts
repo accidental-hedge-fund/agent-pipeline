@@ -43,7 +43,7 @@ import { reconcile, transitionItem, type ReconcileObserveDeps } from "./reconcil
 import { blockItem, classifyAndBlockItem } from "./recovery.ts";
 import { computeExternalDependencyStatuses, detectDependencyDeadlock, propagateSkips } from "./dependencies.ts";
 import { detectChangedFileOverlap, selectSchedulableSet } from "./schedule.ts";
-import { buildPreconditionExclusion, classifyPreconditionExclusions, excludeContractItems, isPrePipelineStage, pipelineStageFromLabels } from "./precondition.ts";
+import { buildPreconditionExclusion, classifyPreconditionExclusions, excludeContractItems, hasNewLabelEvent, isPrePipelineStage, pipelineStageFromLabels } from "./precondition.ts";
 import {
   LOOP_EXECUTION_CONTRACT_SCHEMA,
   normalizeLoopOutcome,
@@ -392,13 +392,22 @@ export async function runSupervisorCycle(
     done_definition: contract.done_definition,
     run_id: runId,
   });
-  // Captured before dispatch so the zero-transition safety net below (#568
-  // review 2 finding 8bb189a0) can query the issue's label-add history for
-  // anything that happened *during* this dispatch, rather than inferring
-  // "zero transitions" from equal before/after stage snapshots — a
-  // round-trip (e.g. backlog -> ready -> backlog) defeats snapshot equality
-  // but never predates this timestamp.
-  const dispatchStartedAt = deps.observe.now();
+  // Captured before dispatch so the zero-transition safety net below (#568 review 2 finding
+  // 8bb189a0) can diff the issue's GitHub-authored label-add history across the dispatch window,
+  // rather than inferring "zero transitions" from equal before/after stage snapshots — a
+  // round-trip (e.g. backlog -> ready -> backlog) defeats snapshot equality. A failed fetch here
+  // leaves this item with no baseline; the safety net below then cannot prove a no-op and falls
+  // through to genuine-defect classification rather than risk masking a real dispatch (#568
+  // review 1 finding f09d500c: comparing GitHub-authored event times against the supervisor
+  // host's local clock is unsound under clock skew, so both snapshots here are GitHub-authored —
+  // never compared against `deps.observe.now()`).
+  const labelEventsBeforeDispatchByItem = new Map<string, { label: string; createdAt: string }[]>();
+  await Promise.allSettled(
+    activeItemIds.map(async (itemId) => {
+      const events = await deps.observe.getLabelEvents(Number(itemId));
+      labelEventsBeforeDispatchByItem.set(itemId, events);
+    }),
+  );
   const settled = await Promise.allSettled(activeItemIds.map((itemId) => deps.dispatchItem(buildRequest(itemId))));
 
   // With exactly one active item — the serialized default — a rejection is rethrown synchronously
@@ -556,17 +565,18 @@ export async function runSupervisorCycle(
         try {
           const issue = await deps.observe.getIssueStateAndLabels(Number(itemId));
           const observedStage = pipelineStageFromLabels(issue?.labels ?? []);
-          // Zero-transition check (#568 review 2, finding 8bb189a0): a pre-pipeline outcome is
-          // only a genuine no-op when the dispatch made zero stage transitions. Comparing only
-          // the before/after stage snapshots is insufficient — a dispatch that round-trips
-          // (e.g. backlog -> ready -> backlog) before failing would show equal endpoints despite
-          // a real transition occurring. Instead, query the issue's authoritative label-add
-          // history and require it contain nothing at or after `dispatchStartedAt` — the moment
-          // this cycle's dispatch call was issued.
-          const labelEvents = await deps.observe.getLabelEvents(Number(itemId));
-          const zeroTransitions = labelEvents.every(
-            (event) => new Date(event.createdAt).getTime() < dispatchStartedAt.getTime(),
-          );
+          // Zero-transition check (#568 review 2, finding 8bb189a0; review 1 finding f09d500c): a
+          // pre-pipeline outcome is only a genuine no-op when the dispatch made zero stage
+          // transitions. Comparing only the before/after stage snapshots is insufficient — a
+          // dispatch that round-trips (e.g. backlog -> ready -> backlog) before failing would show
+          // equal endpoints despite a real transition occurring. Diff the issue's authoritative
+          // label-add history against the pre-dispatch snapshot captured above instead of a local
+          // clock cutoff — both sides of the comparison are GitHub-authored, so host/GitHub clock
+          // skew cannot misclassify a real round-trip as a no-op. A missing pre-dispatch baseline
+          // (that fetch failed) can never prove zero transitions, so it falls through below.
+          const labelEventsBefore = labelEventsBeforeDispatchByItem.get(itemId);
+          const labelEventsAfter = await deps.observe.getLabelEvents(Number(itemId));
+          const zeroTransitions = labelEventsBefore !== undefined && !hasNewLabelEvent(labelEventsBefore, labelEventsAfter);
           if (isPrePipelineStage(observedStage) && zeroTransitions) {
             preconditionNoOp = true;
             const exclusion = buildPreconditionExclusion(itemId, observedStage);

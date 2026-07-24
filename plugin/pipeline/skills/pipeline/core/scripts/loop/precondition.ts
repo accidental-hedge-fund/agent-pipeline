@@ -72,6 +72,35 @@ export function classifyPreconditionExclusions(
   return exclusions;
 }
 
+/** True when `after` contains a pipeline-label-add event not present in `before` — the
+ *  GitHub-authoritative zero-transition check the dispatch-outcome safety net (loop/supervisor.ts
+ *  Pass 2, design.md decision 3) uses to tell a genuine dispatch-window transition apart from a
+ *  pre-pipeline no-op. Both `before` and `after` are GitHub-authored label-add histories
+ *  (`ReconcileObserveDeps.getLabelEvents`), snapshotted immediately before and after dispatch —
+ *  comparing them to each other, never to the supervisor host's local clock, means clock skew
+ *  between the host and GitHub cannot mask a real round-trip transition as a no-op (#568 review 1
+ *  finding f09d500c: a local `deps.observe.now()` cutoff compared against GitHub-authored
+ *  `createdAt` values misclassifies a real dispatch under ordinary host/GitHub clock skew).
+ *  Compares as a multiset (label, createdAt) so a duplicate `before` event is never mistaken for
+ *  a new one in `after`. */
+export function hasNewLabelEvent(
+  before: readonly { label: string; createdAt: string }[],
+  after: readonly { label: string; createdAt: string }[],
+): boolean {
+  const remaining = new Map<string, number>();
+  for (const event of before) {
+    const key = `${event.label}|${event.createdAt}`;
+    remaining.set(key, (remaining.get(key) ?? 0) + 1);
+  }
+  for (const event of after) {
+    const key = `${event.label}|${event.createdAt}`;
+    const count = remaining.get(key) ?? 0;
+    if (count === 0) return true;
+    remaining.set(key, count - 1);
+  }
+  return false;
+}
+
 /** Returns a shallow contract copy with every item named in `excludedItemIds` removed from
  *  `items` — the pruned view the scheduler (`selectSchedulableSet`, loop/schedule.ts) evaluates,
  *  so a precondition-excluded item is never admitted to the frontier. Every other field

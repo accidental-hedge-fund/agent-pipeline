@@ -1380,12 +1380,18 @@ test("regression (#568 review 1, finding eb82a1de): a dispatch whose label was m
     async baseBranchContainsSha() {
       return null;
     },
-    async getLabelEvents() {
-      // A real transition happened during the dispatch window (ready -> backlog), even though
-      // the observed stage snapshots below already differ — the authoritative signal this test
-      // proves matters is the label-add history, not the snapshot comparison.
-      return [{ label: "pipeline:backlog", createdAt: "2026-07-23T00:00:01.000Z" }];
-    },
+    getLabelEvents: (() => {
+      let labelEventCalls = 0;
+      return async () => {
+        labelEventCalls++;
+        // First call is the pre-dispatch baseline snapshot (nothing has happened yet); the
+        // second is the post-dispatch read, which observes the real ready -> backlog transition
+        // that happened during the dispatch window — even though the observed stage snapshots
+        // below already differ, the authoritative signal this test proves matters is the diff
+        // against the label-add history, not the snapshot comparison.
+        return labelEventCalls === 1 ? [] : [{ label: "pipeline:backlog", createdAt: "2026-07-23T00:00:01.000Z" }];
+      };
+    })(),
     now: () => new Date("2026-07-23T00:00:00.000Z"),
   };
   const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
@@ -1438,14 +1444,21 @@ test("regression (#568 review 2, finding 8bb189a0): a round-trip dispatch (backl
     async baseBranchContainsSha() {
       return null;
     },
-    async getLabelEvents() {
-      // The round trip: promoted to ready, then moved back to backlog, both strictly after this
-      // cycle's dispatch was issued (dispatchStartedAt is fixed at 2026-07-23T00:00:00.000Z below).
-      return [
-        { label: "pipeline:ready", createdAt: "2026-07-23T00:00:01.000Z" },
-        { label: "pipeline:backlog", createdAt: "2026-07-23T00:00:02.000Z" },
-      ];
-    },
+    getLabelEvents: (() => {
+      let labelEventCalls = 0;
+      return async () => {
+        labelEventCalls++;
+        // First call is the pre-dispatch baseline (still at backlog, no round trip yet). The
+        // second is the post-dispatch read, which observes the full round trip: promoted to
+        // ready, then moved back to backlog, both during the dispatch window.
+        return labelEventCalls === 1
+          ? []
+          : [
+              { label: "pipeline:ready", createdAt: "2026-07-23T00:00:01.000Z" },
+              { label: "pipeline:backlog", createdAt: "2026-07-23T00:00:02.000Z" },
+            ];
+      };
+    })(),
     now: () => new Date("2026-07-23T00:00:00.000Z"),
   };
   const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
@@ -1460,6 +1473,74 @@ test("regression (#568 review 2, finding 8bb189a0): a round-trip dispatch (backl
   const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
 
   assert.equal(cycle.stop?.reason, "run_fatal", "a round-trip transition must never be masked as a zero-transition no-op");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked");
+  assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
+  const events = await readEvents(deps, "run-1");
+  assert.ok(!events.find((e: any) => e.kind === "loop_item_precondition_excluded"), "must not be recorded as a precondition exclusion");
+});
+
+test("regression (#568 review 1, finding f09d500c): a real round-trip transition is never masked as a zero-transition no-op when the supervisor host's clock is far ahead of GitHub's event timestamps", async () => {
+  // The old zero-transition check compared GitHub-authored `createdAt` values against
+  // `deps.observe.now()` (the supervisor host's local clock). If the host clock is ahead of
+  // GitHub — simulated here with `now()` fixed far in the future — every label-add event from a
+  // real dispatch-window round trip would compare as earlier than the cutoff, so
+  // `zeroTransitions` would wrongly become true and this genuine engine defect would be excluded
+  // as a non-fatal precondition no-op instead of recorded as `workflow-engine-defect`. The fix
+  // diffs the pre-dispatch and post-dispatch label-add snapshots against each other — both
+  // GitHub-authored — so this host/GitHub clock skew must no longer be able to mask the
+  // transition.
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "in_progress") });
+  const { deps } = await setup(contract, ledger);
+
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:backlog"] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    getLabelEvents: (() => {
+      let labelEventCalls = 0;
+      return async () => {
+        labelEventCalls++;
+        return labelEventCalls === 1
+          ? []
+          : [
+              { label: "pipeline:ready", createdAt: "2026-07-23T00:00:01.000Z" },
+              { label: "pipeline:backlog", createdAt: "2026-07-23T00:00:02.000Z" },
+            ];
+      };
+    })(),
+    // The host clock is decades ahead of the GitHub event timestamps above — under the old
+    // local-clock cutoff this alone would make `zeroTransitions` true.
+    now: () => new Date("2099-01-01T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "failed",
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+  });
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.equal(cycle.stop?.reason, "run_fatal", "clock skew must never mask a real round-trip transition as a zero-transition no-op");
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
   assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");

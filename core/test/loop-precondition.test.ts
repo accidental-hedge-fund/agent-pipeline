@@ -10,6 +10,7 @@ import {
   buildPreconditionExclusion,
   classifyPreconditionExclusions,
   excludeContractItems,
+  hasNewLabelEvent,
   isPrePipelineStage,
   pipelineStageFromLabels,
 } from "../scripts/loop/precondition.ts";
@@ -213,4 +214,36 @@ test("excludeContractItems: removes only the named items, preserving every other
   assert.deepEqual(pruned.items.map((i) => i.id), ["200"]);
   assert.equal(pruned.run_id, contract.run_id);
   assert.equal(pruned.canonical_hash, contract.canonical_hash);
+});
+
+// ---------------------------------------------------------------------------
+// hasNewLabelEvent (#568 review 1, finding f09d500c)
+// ---------------------------------------------------------------------------
+
+test("hasNewLabelEvent: false when after is identical to before", () => {
+  const before = [{ label: "pipeline:backlog", createdAt: "2026-07-23T00:00:00.000Z" }];
+  const after = [{ label: "pipeline:backlog", createdAt: "2026-07-23T00:00:00.000Z" }];
+  assert.equal(hasNewLabelEvent(before, after), false);
+});
+
+test("hasNewLabelEvent: false when both are empty", () => {
+  assert.equal(hasNewLabelEvent([], []), false);
+});
+
+test("hasNewLabelEvent: true when after contains an event not present in before, regardless of what any local clock says", () => {
+  const before: { label: string; createdAt: string }[] = [];
+  const after = [
+    { label: "pipeline:ready", createdAt: "2026-07-23T00:00:01.000Z" },
+    { label: "pipeline:backlog", createdAt: "2026-07-23T00:00:02.000Z" },
+  ];
+  assert.equal(hasNewLabelEvent(before, after), true);
+});
+
+test("hasNewLabelEvent: a duplicate event already present in before is not counted as new", () => {
+  const before = [{ label: "pipeline:backlog", createdAt: "2026-07-23T00:00:00.000Z" }];
+  const after = [
+    { label: "pipeline:backlog", createdAt: "2026-07-23T00:00:00.000Z" },
+    { label: "pipeline:backlog", createdAt: "2026-07-23T00:00:00.000Z" },
+  ];
+  assert.equal(hasNewLabelEvent(before, after), true, "a second occurrence of the same (label, createdAt) pair is a genuinely new event");
 });
