@@ -338,6 +338,13 @@ type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
     appendEvent?: typeof appendEvent;
     /** Overrides `openspec.isInitialized` for unit tests that cannot set up a real worktree. */
     openspecIsInitialized?: (path: string) => boolean;
+    /**
+     * Injectable salvage-uncommitted-work seam for the implement stage's
+     * harness failure/timeout path (#547). Defaults to `trySalvageUncommittedWork`
+     * from salvage-harness-work.ts. Tests inject a fake to exercise the salvage
+     * fallback without a real git subprocess.
+     */
+    trySalvageUncommittedWork?: typeof trySalvageUncommittedWork;
   };
 
 interface PlanningLifecycle {
@@ -470,6 +477,7 @@ export async function runPlanningPhases(
   const doInvokeReviewer = deps.invokeReviewer ?? invokeReviewer;
   const doHasCommitsAhead = deps.hasCommitsAhead ?? hasCommitsAhead;
   const doGitInWorktree = deps.gitInWorktree ?? gitInWorktree;
+  const doTrySalvage = deps.trySalvageUncommittedWork ?? trySalvageUncommittedWork;
 
   const primary: Harness = cfg.harnesses.implementer;
   const reviewer: string = cfg.harnesses.reviewer;
@@ -712,15 +720,37 @@ export async function runPlanningPhases(
     const reason = result.timed_out
       ? `timed out after ${result.duration.toFixed(0)}s`
       : `exit ${result.exit_code}`;
-    await doSetBlocked(
-      cfg,
-      issueNumber,
-      `Implementation harness (${primary}) failed: ${reason}`,
-      "implementing",
-      "harness-failure",
+
+    // Salvage (#547): before blocking, attempt to recover uncommitted implement
+    // harness work — mirroring the fix stage's crash-retry salvage (#486). A
+    // crashed/timed-out implement harness may still have left a complete diff
+    // uncommitted; a successful salvage falls through to the normal downstream
+    // verification (commit checks, test gate) below instead of discarding it.
+    const { salvaged, failureReason: crashSalvageFailure } = await salvageIfNoNewCommit(
+      wt.path, issueNumber, pipelineRunId, "implement (crash/timeout)", implHeadBefore,
+      undefined, doGitInWorktree, doTrySalvage,
     );
-    await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-    return { advanced: false, status: "blocked", reason };
+
+    if (!salvaged) {
+      // #521: disclose why nothing was salvaged so the operator can see that
+      // recoverable work may still exist without reading terminal.log.
+      const salvageNote = crashSalvageFailure
+        ? ` Salvage of uncommitted work also failed: ${crashSalvageFailure}`
+        : "";
+      await doSetBlocked(
+        cfg,
+        issueNumber,
+        `Implementation harness (${primary}) failed: ${reason}.${salvageNote}`,
+        "implementing",
+        "harness-failure",
+      );
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+      return { advanced: false, status: "blocked", reason };
+    }
+    console.log(
+      `[pipeline] #${issueNumber}: implementation harness (${primary}) failed (${reason}) but left ` +
+        `salvageable work — salvaged into a commit, proceeding to normal verification`,
+    );
   }
 
   console.log(
@@ -1543,21 +1573,28 @@ export async function dispatchResume(
  * Returns the salvage outcome (including a `failureReason` when a salvage
  * attempt's git operation failed) so callers can disclose it in a no-commit
  * blocker comment (#521).
+ *
+ * `gitFn`/`salvageFn` default to the real `gitInWorktree`/`trySalvageUncommittedWork`
+ * (unchanged behavior for existing callers); the implement stage's crash/timeout
+ * salvage call site (#547) passes the caller's injected `deps` seams so tests can
+ * exercise it without a real git subprocess. Exported for direct unit testing.
  */
-async function salvageIfNoNewCommit(
+export async function salvageIfNoNewCommit(
   wtPath: string,
   issueNumber: number,
   pipelineRunId: string,
   stageLabel: string,
   headBefore: string,
   scope?: string,
+  gitFn: typeof gitInWorktree = gitInWorktree,
+  salvageFn: typeof trySalvageUncommittedWork = trySalvageUncommittedWork,
 ): Promise<{ salvaged: boolean; failureReason?: string }> {
   if (!headBefore) return { salvaged: false };
   const headAfter = (
-    await gitInWorktree(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })
+    await gitFn(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
   if (headAfter && headAfter === headBefore) {
-    return trySalvageUncommittedWork(wtPath, issueNumber, pipelineRunId, stageLabel, {}, scope);
+    return salvageFn(wtPath, issueNumber, pipelineRunId, stageLabel, {}, scope);
   }
   return { salvaged: false };
 }

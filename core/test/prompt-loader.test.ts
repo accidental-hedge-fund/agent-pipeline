@@ -1671,6 +1671,93 @@ test("implementing prompt: declares the invocation single-turn and forbids defer
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
 });
 
+// #547: single-turn-harness-discipline drift guard extended to the gate-fix
+// prompts — each runs a repository gate command the harness could otherwise
+// background into the same "wait for a notification that never arrives"
+// deadlock the #486 guard closes for implementing.md/fix.md.
+
+test("test_fix prompt: declares the invocation single-turn, forbids backgrounding the gate command (#547)", () => {
+  const out = buildTestFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 15,
+    command: "pnpm run test",
+    attempt: 1,
+    maxAttempts: 3,
+    output: "fail",
+    pipelineRunId: "15/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /single-turn/i, "test_fix prompt must state the invocation is single-turn");
+  assert.match(
+    out,
+    /background task/i,
+    "test_fix prompt must forbid ending the turn with a commit pending on a background task",
+  );
+  assert.match(
+    out,
+    /wait synchronously/i,
+    "test_fix prompt must direct the harness to wait synchronously for the gate command",
+  );
+  assert.match(out, /foreground/i, "test_fix prompt must instruct the gate command to run in the foreground");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("eval_fix prompt: declares the invocation single-turn, forbids backgrounding the gate command (#547)", () => {
+  const out = buildEvalFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 15,
+    command: "pnpm evals",
+    attempt: 1,
+    maxAttempts: 2,
+    output: "fail",
+    pipelineRunId: "15/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /single-turn/i, "eval_fix prompt must state the invocation is single-turn");
+  assert.match(
+    out,
+    /background task/i,
+    "eval_fix prompt must forbid ending the turn with a commit pending on a background task",
+  );
+  assert.match(
+    out,
+    /wait synchronously/i,
+    "eval_fix prompt must direct the harness to wait synchronously for the gate command",
+  );
+  assert.match(out, /foreground/i, "eval_fix prompt must instruct the gate command to run in the foreground");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("visual_fix prompt: declares the invocation single-turn, forbids backgrounding the gate command (#547)", () => {
+  const out = buildVisualFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 15,
+    command: "npx playwright test",
+    attempt: 1,
+    maxAttempts: 3,
+    output: "fail",
+    artifacts: "none",
+    pipelineRunId: "15/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /single-turn/i, "visual_fix prompt must state the invocation is single-turn");
+  assert.match(
+    out,
+    /background task/i,
+    "visual_fix prompt must forbid ending the turn with a commit pending on a background task",
+  );
+  assert.match(
+    out,
+    /wait synchronously/i,
+    "visual_fix prompt must direct the harness to wait synchronously for the gate command",
+  );
+  assert.match(out, /foreground/i, "visual_fix prompt must instruct the gate command to run in the foreground");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+// Bite check (#547): the discipline paragraph is a distinct addition on top of
+// the existing instructions block — the assertions above only pass because
+// each template's new "## Single-Turn Invocation" section exists; removing it
+// leaves the rendered prompt without "single-turn"/"background task"/"wait
+// synchronously"/"foreground" text and these tests fail.
+
 test("fix prompt: rendered prompt contains no unfilled {{placeholder}} on either path (#235)", () => {
   const withSpec = buildFixPrompt({
     cfg: dummyConfig(),
