@@ -369,14 +369,20 @@ export async function performPreMergeAutoFix(
     await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
   const hasNewCommitHarness = Boolean(headAfterHarness && headBefore && headAfterHarness !== headBefore);
+  // Confirmed-no-new-commit requires both reads to have actually succeeded and
+  // matched — an unreadable/empty post-harness HEAD must NOT be treated as
+  // "no new commit" (#547 review 1 finding 1), since a harness that did commit
+  // could then have its commit salvaged-over. Fail closed (existing rollback)
+  // when we can't prove HEAD is unchanged.
+  const confirmedNoNewCommit = Boolean(headBefore && headAfterHarness && headAfterHarness === headBefore);
 
-  // Salvage (#547): attempt only when the harness left no new commit — whether
-  // it crashed/timed out or reported success without committing. A commit that
-  // exists alongside extra leftover dirt (checked below) is an ambiguous case
-  // out of scope (design decision 2) and keeps the existing fail-closed
-  // rollback unchanged.
+  // Salvage (#547): attempt only when we've confirmed the harness left no new
+  // commit — whether it crashed/timed out or reported success without
+  // committing. A commit that exists alongside extra leftover dirt (checked
+  // below) is an ambiguous case out of scope (design decision 2) and keeps the
+  // existing fail-closed rollback unchanged.
   let salvaged = false;
-  if (!hasNewCommitHarness) {
+  if (confirmedNoNewCommit) {
     const salvageResult = await salvageFn(
       wt.path, issueNumber, pipelineRunId, PRE_MERGE_AUTOFIX_SALVAGE_LABEL,
     );

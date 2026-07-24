@@ -1565,6 +1565,48 @@ test("performPreMergeAutoFix #547: harness committed AND left extra dirt → amb
   assert.ok(resetCall, "git reset --hard must still be called for the ambiguous commit+dirt case");
 });
 
+test("performPreMergeAutoFix R1-F1: post-harness HEAD read fails/empty → fail-closed rollback, salvage NOT called", async () => {
+  const { fn: gitFn, calls } = makeSeqGitFn([
+    // rev-parse HEAD (headBefore)
+    { code: 0, stdout: "sha1" },
+    // status --porcelain (pre-fix: clean)
+    { code: 0, stdout: "" },
+    // checkout -B <branch> (reattach succeeds)
+    { code: 0, stdout: "" },
+    // rev-parse HEAD (headAfterHarness — read fails/empty: cannot prove no new commit)
+    { code: 1, stdout: "" },
+    // reset --hard sha1 (rollback)
+    { code: 0, stdout: "" },
+    // clean -fd (rollback)
+    { code: 0, stdout: "" },
+  ]);
+  const { fn: salvageFn, calls: salvageCalls } = makeSalvageFn({ salvaged: true });
+
+  const result = await performPreMergeAutoFix(
+    autoFixCfg,
+    42,
+    "run-id",
+    "finding: need fix",
+    "Test issue",
+    autoFixWt,
+    gitFn,
+    makeSucceedInvoke(),
+    salvageFn,
+  );
+
+  assert.deepEqual(
+    result,
+    { status: "error" },
+    "an unreadable/empty post-harness HEAD must NOT be treated as no-new-commit — fail closed",
+  );
+  assert.equal(
+    salvageCalls.length, 0,
+    "salvage must NOT be attempted when we cannot prove HEAD is unchanged",
+  );
+  const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
+  assert.ok(resetCall, "git reset --hard must still be called when the HEAD read is inconclusive");
+});
+
 // Bite check: without the #547 salvage wiring (i.e. the pre-change code),
 // the "harness times out with a dirty worktree" scenario above would instead
 // hit the unconditional `!result.success` rollback (never calling salvageFn,
