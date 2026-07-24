@@ -3,6 +3,8 @@
 // (design.md decision 1) — these types describe what grading.ts writes to
 // grades.jsonl, never what the runner writes.
 
+import type { ArtifactDescriptor } from "../trajectory/types.ts";
+
 /** The identity a grade record shares with its source CellRecord — the join
  *  key back to runs.jsonl, plan.json, and manifest.json. */
 export interface CellIdentity {
@@ -86,6 +88,10 @@ export type StageGradePayload =
 export interface GradeRecord extends CellIdentity {
   graders: GraderVersion[];
   payload: StageGradePayload;
+  /** Descriptor for this grade's verifier evidence artifact (#536), when
+   *  emission succeeded. Independently addressable from the cell's treatment
+   *  trajectory artifact — never a reference into it. */
+  verifier_artifact?: ArtifactDescriptor;
 }
 
 /** A reason a completed cell produced no grade record — never silent, always
@@ -101,6 +107,9 @@ export interface JudgeRecord extends CellIdentity {
   judge_model: string;
   judge_prompt_version: string;
   verdict: unknown;
+  /** Descriptor for this judge invocation's verifier evidence artifact
+   *  (#536) — separate from the deterministic grader's own artifact. */
+  verifier_artifact?: ArtifactDescriptor;
 }
 
 /** A recorded disagreement between a judge verdict and the deterministic
@@ -108,6 +117,10 @@ export interface JudgeRecord extends CellIdentity {
 export interface JudgeDisagreementRecord extends CellIdentity {
   judge_prompt_version: string;
   note: string;
+  /** The judge's verifier evidence artifact for this disagreement (#536) —
+   *  lets a maintainer inspect the judge side without conflating it with the
+   *  deterministic grader's artifact. */
+  verifier_artifact?: ArtifactDescriptor;
 }
 
 /** A blinded human adjudication record. `opaque_key` is derived from

@@ -408,6 +408,9 @@ export function buildCmd(): Command {
     .option("--judge", "evals grade: opt in to the optional model judge (disabled by default; recorded separately from deterministic grades)")
     .option("--out <path>", "evals harvest: write the rendered draft JSON to this path instead of stdout")
     .option("--plan-only", "evals harvest --apply: additionally prove the promoted draft expands into an executable cell plan (no live model call, no production GitHub write)")
+    .option("--trajectory-max-events <n>", "evals run/grade: max events retained per bounded trajectory/verifier channel before deterministic head/tail truncation (default: 200)", Number)
+    .option("--trajectory-max-bytes <n>", "evals run/grade: max serialized bytes retained per bounded trajectory/verifier channel before deterministic head/tail truncation (default: 200000)", Number)
+    .option("--link-artifacts", "evals report: opt in to linking trajectory/verifier artifact references for flagged cells (outliers, judge disagreements, false positives/negatives, failed cells); default output is unchanged")
     .option("--top <n>", "improve: emit top-N clusters in the report (default: 5)", Number)
     .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, 2 for the correction category; requires --apply)", Number)
     .option("--interventions", "improve: print an intervention summary as JSON instead of the cluster report")
@@ -1753,9 +1756,9 @@ async function main(): Promise<void> {
     if (evalsSub !== "plan" && evalsSub !== "run" && evalsSub !== "grade" && evalsSub !== "report" && evalsSub !== "harvest") {
       console.error(
         'pipeline evals: expected a subcommand — "plan", "run", "grade", "report", or "harvest".\n' +
-          "  Usage: pipeline evals <plan|run> <manifest.json>\n" +
-          "         pipeline evals grade <experiment-dir> [--judge]\n" +
-          "         pipeline evals report <experiment-dir> --baseline <treatment_id>\n" +
+          "  Usage: pipeline evals <plan|run> <manifest.json> [--trajectory-max-events <n>] [--trajectory-max-bytes <n>]\n" +
+          "         pipeline evals grade <experiment-dir> [--judge] [--trajectory-max-events <n>] [--trajectory-max-bytes <n>]\n" +
+          "         pipeline evals report <experiment-dir> --baseline <treatment_id> [--link-artifacts]\n" +
           "         pipeline evals harvest <harvest-request.json> [--out <path>] [--apply] [--plan-only]",
       );
       process.exit(2);
@@ -1816,6 +1819,14 @@ async function main(): Promise<void> {
       return;
     }
 
+    const trajectoryCeilings =
+      opts.trajectoryMaxEvents !== undefined || opts.trajectoryMaxBytes !== undefined
+        ? {
+            maxEvents: opts.trajectoryMaxEvents ?? 200,
+            maxBytes: opts.trajectoryMaxBytes ?? 200_000,
+          }
+        : undefined;
+
     try {
       if (evalsSub === "plan" || evalsSub === "run") {
         const manifestPath = path.resolve(evalsCfg.repo_dir, pathArg);
@@ -1824,7 +1835,7 @@ async function main(): Promise<void> {
           const { manifest, plan } = await planExperiment(evalsCfg, manifestPath, fixturesDir);
           console.log(`pipeline evals plan: ${plan.cells.length} cell(s) for experiment "${manifest.experiment_id}"`);
         } else {
-          const { manifest, executed } = await runExperiment(evalsCfg, manifestPath, fixturesDir);
+          const { manifest, executed } = await runExperiment(evalsCfg, manifestPath, fixturesDir, { trajectoryCeilings });
           console.log(`pipeline evals run: executed ${executed.length} cell(s) for experiment "${manifest.experiment_id}"`);
         }
         return;
@@ -1838,7 +1849,7 @@ async function main(): Promise<void> {
 
       if (evalsSub === "grade") {
         const { gradeExperiment } = await import("./evals/grading/grade.ts");
-        const { grades, skipped } = await gradeExperiment(evalsCfg, outputDir, experimentId, fixtures);
+        const { grades, skipped } = await gradeExperiment(evalsCfg, outputDir, experimentId, fixtures, { verifierCeilings: trajectoryCeilings });
         console.log(`pipeline evals grade: wrote ${grades.length} grade(s) for experiment "${experimentId}" (${skipped.length} cell(s) skipped)`);
         if (opts.judge) {
           console.warn(
@@ -1851,7 +1862,10 @@ async function main(): Promise<void> {
           process.exit(2);
         }
         const { reportExperiment } = await import("./evals/reporting/report.ts");
-        const summary = await reportExperiment(outputDir, experimentId, fixtures, { baselineTreatmentId: opts.baseline });
+        const summary = await reportExperiment(outputDir, experimentId, fixtures, {
+          baselineTreatmentId: opts.baseline,
+          linkArtifacts: !!opts.linkArtifacts,
+        });
         console.log(`pipeline evals report: wrote summary.json for experiment "${experimentId}" (${summary.treatments.length} treatment(s), baseline "${opts.baseline}")`);
       }
     } catch (err) {

@@ -89,7 +89,9 @@ $pipeline scoreboard --html <path>       write a self-contained, offline HTML ex
 $pipeline evals plan experiment.json     expand + persist an experiment's run plan; invokes no harness, creates no worktree
 $pipeline evals run experiment.json      execute an experiment's cells (resumable); never writes to production GitHub
 $pipeline evals grade experiment.json/exp1   grade a completed experiment's cells; writes grades.jsonl (never gates a PR)
+$pipeline evals run experiment.json --trajectory-max-events <n> --trajectory-max-bytes <n>  override the default trajectory/verifier artifact bounding ceilings (default: 200 events / 200000 bytes)
 $pipeline evals report experiment.json/exp1 --baseline <treatment_id>  paired comparative summary.json
+$pipeline evals report experiment.json/exp1 --baseline <treatment_id> --link-artifacts  additionally link trajectory/verifier artifacts for flagged cells (opt-in; default output unchanged)
 $pipeline evals harvest request.json     draft an eval fixture from sanitized run/correction evidence; --apply [--plan-only] to promote (never writes GitHub)
 $pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
@@ -317,6 +319,34 @@ never zeroed.
 exercising every grader; the grading/reporting tests run entirely against
 checked-in synthetic fixtures and recorded cell records — no live model
 call, network request, real git operation, or subprocess spawn.
+
+### Treatment trajectory and verifier evidence artifacts (#536)
+
+Diagnostic evidence for one cell — **never** a gating input — lives in two
+kinds of immutable, content-addressed artifacts, referenced by descriptor
+(`{path, content_hash, schema_version, byte_count, truncation_status}`)
+rather than embedded inline: a **treatment trajectory artifact** (`evals
+run`, referenced as `trajectory_artifact` on `runs.jsonl`/`failures.jsonl`) —
+bounded per-stage output/error/timing/success, produced-artifact paths, and
+a capability-aware `tool_events` channel marked `unavailable` with a reason
+for every harness/executor this engine currently drives; and a **verifier
+evidence artifact** per deterministic grader and per optional judge (`evals
+grade`, referenced as `verifier_artifact` on the grade/judge/disagreement
+record) — inputs, checks/evidence consulted (hidden checks, seeded-defect
+ground truth, and golden answers belong here, never in a treatment
+trajectory), identity/version, and final result. Raw chain-of-thought is
+neither requested nor required.
+
+Both kinds are sanitized (secret-redaction/injection-denylist) and bounded
+(deterministic head/tail retention, overridable via `--trajectory-max-events`/
+`--trajectory-max-bytes`) before being content-addressed and written;
+failures are logged, never fatal. Artifacts are immutable — resume/regrade
+never rewrite one; identical content dedupes, a differing-content collision
+at the same address is surfaced, never overwritten. `evals report
+--link-artifacts` (opt-in; default output byte-identical) additionally
+attaches these references for flagged cells (outliers, judge disagreements,
+review false positives/negatives, failed cells) as `linked_artifacts`,
+without changing any aggregate.
 
 ### Trace-to-fixture harvesting (`evals harvest`, #535)
 

@@ -18,7 +18,11 @@ import { runBaselineChecks, type CheckRunnerDeps } from "./checks.ts";
 import { gradeImplementationFix } from "./graders/implementation.ts";
 import { parseReportedFindings, gradeReview } from "./graders/review.ts";
 import { gradePlanning } from "./graders/planning.ts";
+import { buildVerifierEvidenceArtifact } from "../trajectory/collect.ts";
+import { writeContentAddressedArtifact, type ArtifactStoreDeps } from "../trajectory/store.ts";
 import type { CellRecord, EvalMode, ExperimentManifest, Fixture } from "../types.ts";
+import type { BoundCeilings } from "../trajectory/bound.ts";
+import type { ArtifactDescriptor } from "../trajectory/types.ts";
 import type { PipelineConfig } from "../../types.ts";
 import type { CellIdentity, CompositeSubGradePayload, GradeRecord, GraderVersion, SkippedCell } from "./types.ts";
 
@@ -27,8 +31,11 @@ export interface GradeIODeps {
   writeFile?: (filePath: string, content: string) => Promise<void>;
 }
 
-export interface GradeExperimentDeps extends GradeIODeps {
+export interface GradeExperimentDeps extends GradeIODeps, ArtifactStoreDeps {
   checkRunner?: CheckRunnerDeps;
+  /** Configurable byte/event ceilings for verifier evidence artifacts (#536
+   *  task 7.1). Defaults to `DEFAULT_TRAJECTORY_CEILINGS` when absent. */
+  verifierCeilings?: BoundCeilings;
 }
 
 async function defaultReadFile(filePath: string): Promise<string | null> {
@@ -81,6 +88,51 @@ export async function gradeExperiment(
   const readFileFn = deps.readFile ?? defaultReadFile;
   const writeFileFn = deps.writeFile ?? defaultWriteFile;
   const dir = experimentDir(outputDir, experimentId);
+  const verifiersDir = path.join(dir, "verifiers");
+
+  // Emit and content-address this grade's verifier evidence artifact (#536
+  // task 4.1). `evidenceConsulted` is where verifier-only material (hidden
+  // checks, seeded-defect ground truth) is permitted to live — it never
+  // leaks into the treatment trajectory (task 5). Best-effort/non-fatal:
+  // a write failure leaves the grade record without a descriptor rather
+  // than failing the grading pass.
+  async function emitVerifierArtifact(
+    identity: CellIdentity,
+    verifierId: string,
+    verifierVersion: string,
+    inputs: unknown,
+    evidenceConsulted: unknown[],
+    finalResult: unknown,
+  ): Promise<ArtifactDescriptor | undefined> {
+    try {
+      const artifact = buildVerifierEvidenceArtifact({
+        cell_id: identity.cell_id,
+        experiment_id: identity.experiment_id,
+        verifier_kind: "grader",
+        verifier_id: verifierId,
+        verifier_version: verifierVersion,
+        inputs,
+        evidence_consulted: evidenceConsulted,
+        final_result: finalResult,
+        ceilings: deps.verifierCeilings,
+      });
+      const result = await writeContentAddressedArtifact(
+        cfg.repo_dir,
+        verifiersDir,
+        artifact as unknown as Record<string, unknown>,
+        { truncationStatus: artifact.truncation.status },
+        deps,
+      );
+      if (result.status === "written" || result.status === "deduped") {
+        return result.descriptor;
+      }
+      console.warn(`[pipeline] evals: verifier artifact for cell ${identity.cell_id} not recorded (non-fatal): ${result.error}`);
+      return undefined;
+    } catch (err) {
+      console.warn(`[pipeline] evals: verifier artifact collection for cell ${identity.cell_id} failed (non-fatal): ${(err as Error).message}`);
+      return undefined;
+    }
+  }
 
   const manifestText = await readFileFn(path.join(dir, "manifest.json"));
   if (!manifestText) {
@@ -154,7 +206,23 @@ export async function gradeExperiment(
       if (compositeGrades.length === 0) {
         skipped.push({ ...identity, reason: `manifest mode "${manifest.mode}" has no applicable grader` });
       } else {
-        grades.push({ ...identity, graders: compositeGraders, payload: { kind: "composite", grades: compositeGrades } });
+        const verifierArtifact = await emitVerifierArtifact(
+          identity,
+          "composite",
+          compositeGraders.map((g) => `${g.grader}@${g.version}`).join("+"),
+          { detail: detailForComposite },
+          [
+            ...(fixture.seeded_defects ?? []),
+            ...(fixture.acceptance_criteria ?? []),
+          ],
+          compositeGrades,
+        );
+        grades.push({
+          ...identity,
+          graders: compositeGraders,
+          payload: { kind: "composite", grades: compositeGrades },
+          ...(verifierArtifact ? { verifier_artifact: verifierArtifact } : {}),
+        });
       }
       continue;
     }
@@ -178,18 +246,53 @@ export async function gradeExperiment(
       }
       const changedPaths = detail.changed_paths as string[] | undefined;
       const grade = gradeImplementationFix(fixture, candidateChecks, baseline, changedPaths);
-      grades.push({ ...identity, graders: [{ grader: ref.grader, version: ref.version }], payload: { kind: "implementation-fix", grade } });
+      const verifierArtifact = await emitVerifierArtifact(
+        identity,
+        ref.grader,
+        ref.version,
+        { candidateChecks, changedPaths, allowed_change_paths: fixture.allowed_change_paths },
+        [{ public_checks: fixture.public_checks, hidden_checks: fixture.hidden_checks ?? [], baseline, acceptance_criteria: fixture.acceptance_criteria ?? [] }],
+        grade,
+      );
+      grades.push({
+        ...identity,
+        graders: [{ grader: ref.grader, version: ref.version }],
+        payload: { kind: "implementation-fix", grade },
+        ...(verifierArtifact ? { verifier_artifact: verifierArtifact } : {}),
+      });
     } else if (graderId === "review") {
       const findings = parseReportedFindings(detail.findings as unknown[] | undefined);
       const grade = gradeReview(fixture, findings);
-      grades.push({ ...identity, graders: [{ grader: ref.grader, version: ref.version }], payload: { kind: "review", grade } });
+      const verifierArtifact = await emitVerifierArtifact(
+        identity,
+        ref.grader,
+        ref.version,
+        { reported_findings: findings },
+        fixture.seeded_defects ?? [],
+        grade,
+      );
+      grades.push({
+        ...identity,
+        graders: [{ grader: ref.grader, version: ref.version }],
+        payload: { kind: "review", grade },
+        ...(verifierArtifact ? { verifier_artifact: verifierArtifact } : {}),
+      });
     } else if (graderId === "planning") {
       const outputText = (detail.output_text as string) ?? "";
       const grade = gradePlanning(fixture, outputText);
+      const verifierArtifact = await emitVerifierArtifact(
+        identity,
+        ref.grader,
+        ref.version,
+        { output_text: outputText },
+        fixture.acceptance_criteria ?? [],
+        grade,
+      );
       grades.push({
         ...identity,
         graders: [{ grader: ref.grader, version: ref.version }],
         payload: { kind: "planning", grade, self_assessment_observed: detail.self_assessment },
+        ...(verifierArtifact ? { verifier_artifact: verifierArtifact } : {}),
       });
     }
   }
