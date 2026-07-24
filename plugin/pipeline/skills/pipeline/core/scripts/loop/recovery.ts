@@ -15,6 +15,7 @@ import {
   DURABLE_BLOCKER_CLASSES,
   isDurableBlockerClass,
   isRecoveryRecipe,
+  outstandingReadyItemIds,
   type DurableBlockerClass,
   type ExternalDependencyStatus,
   type RecoveryPolicy,
@@ -298,7 +299,12 @@ export async function recordNeedsHumanClassificationStop(
   if (!ledger.items[itemId]) {
     throw new LoopError("validation", `item "${itemId}" not found in run "${runId}"`);
   }
-  ledger.stop = { reason: "needs_human_classification", time: deps.now().toISOString(), item_id: itemId };
+  ledger.stop = {
+    reason: "needs_human_classification",
+    time: deps.now().toISOString(),
+    item_id: itemId,
+    outstanding_ready: outstandingReadyItemIds(ledger),
+  };
   await writeLedger(deps, ledger, token);
   await appendEvent(deps, runId, token, "loop_run_stopped", { reason: ledger.stop.reason, item_id: itemId, detail });
   return ledger;
@@ -402,7 +408,7 @@ export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract
   const stopAlreadyRecorded = !!ledger.stop;
   if (!ledger.stop) {
     if (policyEntry.terminal_outcome === "human_authority") {
-      ledger.stop = { reason: "human_authority", time, item_id: input.itemId, theme: blockerClass };
+      ledger.stop = { reason: "human_authority", time, item_id: input.itemId, theme: blockerClass, outstanding_ready: outstandingReadyItemIds(ledger) };
     } else if (repeatedCount >= policyEntry.repeated_evidence_limit) {
       ledger.stop = {
         reason: "repeated_no_progress",
@@ -410,9 +416,10 @@ export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract
         item_id: input.itemId,
         theme: blockerClass,
         fingerprint,
+        outstanding_ready: outstandingReadyItemIds(ledger),
       };
     } else if (policyEntry.run_fatal) {
-      ledger.stop = { reason: "run_fatal", time, item_id: input.itemId, theme: blockerClass };
+      ledger.stop = { reason: "run_fatal", time, item_id: input.itemId, theme: blockerClass, outstanding_ready: outstandingReadyItemIds(ledger) };
     }
   }
 
@@ -530,7 +537,7 @@ export async function recoverItem(deps: LoopStoreDeps, contractInput: LoopContra
     const remaining = item.recovery_budgets_remaining[blockerClass] ?? policyEntry.retry_budget;
     if (remaining <= 0) {
       outcome = "exhausted";
-      ledger.stop = { reason: "recovery_exhausted", time, item_id: input.itemId, theme: blockerClass };
+      ledger.stop = { reason: "recovery_exhausted", time, item_id: input.itemId, theme: blockerClass, outstanding_ready: outstandingReadyItemIds(ledger) };
     } else if (!input.succeeded) {
       outcome = "failed";
     } else {

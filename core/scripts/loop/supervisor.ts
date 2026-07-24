@@ -13,6 +13,7 @@ import {
   LOOP_CONTRACT_SCHEMA,
   LOOP_LEDGER_SCHEMA,
   LoopError,
+  outstandingReadyItemIds,
   type LoopContract,
   type LoopEngineName,
   type LoopItemLedgerEntry,
@@ -40,7 +41,8 @@ import {
   type LoopStoreDeps,
 } from "./store.ts";
 import { reconcile, transitionItem, type ReconcileObserveDeps } from "./reconcile.ts";
-import { blockItem, classifyAndBlockItem } from "./recovery.ts";
+import { blockItem } from "./recovery.ts";
+import { waitItem } from "./pause.ts";
 import { computeExternalDependencyStatuses, detectDependencyDeadlock, propagateSkips } from "./dependencies.ts";
 import { detectChangedFileOverlap, selectSchedulableSet } from "./schedule.ts";
 import { buildPreconditionExclusion, classifyPreconditionExclusions, excludeContractItems, hasNewLabelEvent, isPrePipelineStage, pipelineStageFromLabels } from "./precondition.ts";
@@ -353,7 +355,12 @@ export async function runSupervisorCycle(
     const deadlockChain = detectDependencyDeadlock(schedulableContract, ledger, externalStatuses);
     if (deadlockChain) {
       const time = deps.store.now().toISOString();
-      const stop: LoopStopRecord = { reason: "dependency_deadlock", time, deadlock_chain: deadlockChain };
+      const stop: LoopStopRecord = {
+        reason: "dependency_deadlock",
+        time,
+        deadlock_chain: deadlockChain,
+        outstanding_ready: outstandingReadyItemIds(ledger),
+      };
       const newLedger: LoopLedger = { ...ledger, stop };
       await writeLedger(deps.store, newLedger, token);
       await appendEvent(deps.store, runId, token, "loop_run_stopped", { reason: "dependency_deadlock", deadlock_chain: deadlockChain });
@@ -523,11 +530,14 @@ export async function runSupervisorCycle(
   // rather than overwriting it — instead of being refused and left `in_progress` (which would make
   // it eligible for duplicate dispatch on a later recovery/resume). A stopped run never dispatches
   // again once this cycle returns, so classifying every sibling here causes no duplicate work.
+  let holdOutstanding = false;
+
   for (const itemId of activeItemIds) {
     const outcome = outcomeByItem.get(itemId)!;
     if (!parkedItemIds.has(itemId) && (outcome === "ready_to_deploy" || outcome === "abandoned")) continue;
 
     const nextAction = ledger.last_reconciliation?.next_actions[itemId] ?? null;
+    let evidenceOutcome: string = parkedItemIds.has(itemId) ? "parked_for_replan" : outcome;
 
     if (parkedItemIds.has(itemId)) {
       ledger = await blockItem(deps.store, contract, {
@@ -542,25 +552,38 @@ export async function runSupervisorCycle(
         allowAlreadyStopped: true,
       });
     } else if (outcome === "blocked_needs_human") {
-      ledger = await classifyAndBlockItem(deps.store, contract, {
+      // A needs-human pipeline blocker (#570, capability `loop-needs-human-blocker-disposition`):
+      // the standard operator remediation is a one-line unblock + re-run, not an engine defect.
+      // Routed to the non-terminal paused/waiting hold — never `missing-authority` /
+      // `workflow-engine-defect` — so the run pauses with `hold_outstanding=true` and every
+      // sibling item's state (including one already `ready`) is preserved.
+      ledger = await waitItem(deps.store, {
         runId,
         token,
         itemId,
         engine,
-        candidateClasses: ["missing-authority"],
-        evidence: `pipeline/loop-execution@1 reported blocked_needs_human for item ${itemId}`,
-        allowAlreadyStopped: true,
+        request: {
+          kind: "answer",
+          prompt: `pipeline/loop-execution@1 reported blocked_needs_human for item ${itemId} — needs a human answer/unblock before this item can resume`,
+        },
+        note: "needs-human pipeline blocker (capability loop-needs-human-blocker-disposition)",
       });
+      holdOutstanding = true;
     } else {
       // "failed" — either reported directly, a rejected dispatch, or normalized from an outcome
       // outside the defined terminal set (LOOP_TERMINAL_OUTCOMES). Before classifying this as a
-      // genuine engine defect, check the dispatch-outcome safety net (#568, capability
-      // `loop-precondition-stage-gate`, design.md decision 3): the frontier gate above is the
-      // primary defense, but a pre-pipeline item could in principle still reach dispatch (e.g. a
-      // race where an operator flips the label back). A rejected/crashed dispatch never has a
-      // live issue response to check, so it always remains a genuine defect below.
+      // genuine engine defect, check two dispatch-outcome safety nets — the precondition no-op net
+      // (#568, capability `loop-precondition-stage-gate`, design.md decision 3) and the
+      // needs-human blocker-disposition net (#570, capability
+      // `loop-needs-human-blocker-disposition`): the frontier gate above is the primary defense
+      // for the former, but a pre-pipeline item could in principle still reach dispatch (e.g. a
+      // race where an operator flips the label back), and a plan-review/format blocker can report
+      // `failed` instead of `blocked_needs_human` depending on how the dispatch seam surfaces it.
+      // A rejected/crashed dispatch never has a live issue response to check, so it always remains
+      // a genuine defect below.
       const dispatchError = dispatchErrorByItem.get(itemId);
       let preconditionNoOp = false;
+      let needsHumanBlockerNoOp = false;
       if (!dispatchError) {
         try {
           const issue = await deps.observe.getIssueStateAndLabels(Number(itemId));
@@ -589,6 +612,25 @@ export async function runSupervisorCycle(
               progress: "progress",
               worktree_root: worktreeRootByItem.get(itemId) ?? null,
             });
+          } else if (observedStage === "blocked") {
+            // A `failed` outcome whose live issue nonetheless carries `pipeline:blocked` is a
+            // recoverable, human-unblockable pipeline blocker — not a genuine dispatch crash or
+            // rejection — so it is routed to the same needs-human hold as a direct
+            // `blocked_needs_human` outcome, never `workflow-engine-defect`.
+            needsHumanBlockerNoOp = true;
+            ledger = await waitItem(deps.store, {
+              runId,
+              token,
+              itemId,
+              engine,
+              request: {
+                kind: "answer",
+                prompt: `pipeline/loop-execution@1 reported outcome "${String(rawOutcomeByItem.get(itemId))}" for item ${itemId}, and the live issue carries pipeline:blocked — needs a human answer/unblock before this item can resume`,
+              },
+              note: "needs-human pipeline blocker safety net (capability loop-needs-human-blocker-disposition)",
+            });
+            holdOutstanding = true;
+            evidenceOutcome = "blocked_needs_human";
           }
         } catch {
           // The live observation itself failed — fall through to the genuine-defect
@@ -597,33 +639,35 @@ export async function runSupervisorCycle(
       }
       if (preconditionNoOp) continue;
 
-      // A genuine engine defect: recorded as a blocked item under the workflow-engine-defect
-      // class so it is never silently re-dispatched — that class's default policy is run_fatal,
-      // stopping the run immediately.
-      ledger = await blockItem(deps.store, contract, {
-        runId,
-        token,
-        itemId,
-        engine,
-        blockerClass: "workflow-engine-defect",
-        evidence: dispatchError
-          ? `pipeline/loop-execution@1 dispatch rejected for item ${itemId}: ${dispatchError}`
-          : `pipeline/loop-execution@1 reported outcome "${String(rawOutcomeByItem.get(itemId))}" for item ${itemId}, normalized to failed`,
-        allowAlreadyStopped: true,
-      });
+      if (!needsHumanBlockerNoOp) {
+        // A genuine engine defect: recorded as a blocked item under the workflow-engine-defect
+        // class so it is never silently re-dispatched — that class's default policy is run_fatal,
+        // stopping the run immediately.
+        ledger = await blockItem(deps.store, contract, {
+          runId,
+          token,
+          itemId,
+          engine,
+          blockerClass: "workflow-engine-defect",
+          evidence: dispatchError
+            ? `pipeline/loop-execution@1 dispatch rejected for item ${itemId}: ${dispatchError}`
+            : `pipeline/loop-execution@1 reported outcome "${String(rawOutcomeByItem.get(itemId))}" for item ${itemId}, normalized to failed`,
+          allowAlreadyStopped: true,
+        });
+      }
     }
 
     await appendActionEvidence(deps.store, runId, token, {
       item_id: itemId,
       action: "dispatch_item",
-      outcome: parkedItemIds.has(itemId) ? "parked_for_replan" : outcome,
+      outcome: evidenceOutcome,
       next_action: nextAction,
       progress: "progress",
       worktree_root: worktreeRootByItem.get(itemId) ?? null,
     });
   }
 
-  return { progress: true, stop: ledger.stop, holdOutstanding: false, allDone: false };
+  return { progress: true, stop: ledger.stop, holdOutstanding, allDone: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -802,7 +846,10 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
       if (record.consecutive_no_progress >= limit) {
         const time = deps.store.now().toISOString();
         const ledger = await readLedger(deps.store, input.runId);
-        const newLedger: LoopLedger = { ...ledger, stop: { reason: "supervisor_no_progress", time } };
+        const newLedger: LoopLedger = {
+          ...ledger,
+          stop: { reason: "supervisor_no_progress", time, outstanding_ready: outstandingReadyItemIds(ledger) },
+        };
         await writeLedger(deps.store, newLedger, token);
         await appendEvent(deps.store, input.runId, token, "loop_run_stopped", { reason: "supervisor_no_progress" });
         await appendActionEvidence(deps.store, input.runId, token, {
@@ -820,7 +867,10 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
     if (!stop && !holdOutstanding && !allDone && cycles >= cyclesSafetyCap) {
       const time = deps.store.now().toISOString();
       const ledger = await readLedger(deps.store, input.runId);
-      const newLedger: LoopLedger = { ...ledger, stop: { reason: "supervisor_cycle_cap", time, limit: cyclesSafetyCap } };
+      const newLedger: LoopLedger = {
+        ...ledger,
+        stop: { reason: "supervisor_cycle_cap", time, limit: cyclesSafetyCap, outstanding_ready: outstandingReadyItemIds(ledger) },
+      };
       await writeLedger(deps.store, newLedger, token);
       await appendEvent(deps.store, input.runId, token, "loop_run_stopped", { reason: "supervisor_cycle_cap" });
       await appendActionEvidence(deps.store, input.runId, token, {

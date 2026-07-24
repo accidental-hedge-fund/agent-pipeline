@@ -111,6 +111,63 @@ test("runLoopCommand — success drives the supervisor and prints its result as 
   assert.equal(parsed.stop, null);
 });
 
+test("runLoopCommand — a stop carrying outstanding_ready names the stranded item on stderr and in the JSON (#570, capability loop-needs-human-blocker-disposition)", async () => {
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async () =>
+      ({
+        ok: true,
+        args: { selector: { type: "work-list", value: ["100", "200"] }, resumeRunId: undefined, audit: false },
+      }) satisfies LoopPreflightOutcome,
+    runLoopEngine: async () => ({
+      kind: "drive",
+      result: {
+        runId: "loop-abc123",
+        cycles: 3,
+        stop: { reason: "run_fatal", time: "2026-07-24T00:00:00.000Z", item_id: "200", outstanding_ready: ["100"] },
+        holdOutstanding: false,
+        allDone: false,
+        resumed: false,
+      },
+    }),
+  };
+  process.exitCode = undefined;
+  const { out, err } = await withCapturedConsole(() =>
+    runLoopCommand({ milestone: "v2", profile: "claude" } as CliOpts, [], deps),
+  );
+  assert.equal(process.exitCode, 1);
+  assert.match(err.join("\n"), /stranded at ready-to-deploy/);
+  assert.match(err.join("\n"), /100/);
+  const parsed = JSON.parse(out[0]);
+  assert.deepEqual(parsed.stop.outstanding_ready, ["100"]);
+});
+
+test("runLoopCommand — a stop with no outstanding ready item prints no stranded-item stderr line", async () => {
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async () =>
+      ({
+        ok: true,
+        args: { selector: { type: "work-list", value: ["100"] }, resumeRunId: undefined, audit: false },
+      }) satisfies LoopPreflightOutcome,
+    runLoopEngine: async () => ({
+      kind: "drive",
+      result: {
+        runId: "loop-abc123",
+        cycles: 1,
+        stop: { reason: "run_fatal", time: "2026-07-24T00:00:00.000Z", item_id: "100", outstanding_ready: [] },
+        holdOutstanding: false,
+        allDone: false,
+        resumed: false,
+      },
+    }),
+  };
+  process.exitCode = undefined;
+  const { err } = await withCapturedConsole(() =>
+    runLoopCommand({ milestone: "v2", profile: "claude" } as CliOpts, [], deps),
+  );
+  assert.equal(process.exitCode, 1);
+  assert.ok(!err.join("\n").includes("stranded"), "no ready item outstanding — no stranded-item disclosure line");
+});
+
 test("runLoopCommand — a run-engine error (e.g. an unsupported selector type) exits non-zero", async () => {
   const deps: LoopCliDeps = {
     runLoopPreflight: async () =>

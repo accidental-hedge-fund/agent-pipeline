@@ -1547,3 +1547,234 @@ test("regression (#568 review 1, finding f09d500c): a real round-trip transition
   const events = await readEvents(deps, "run-1");
   assert.ok(!events.find((e: any) => e.kind === "loop_item_precondition_excluded"), "must not be recorded as a precondition exclusion");
 });
+
+// ---------------------------------------------------------------------------
+// Needs-human blocker disposition (#570, capability
+// `loop-needs-human-blocker-disposition`) — regression for run
+// `loop-07d05fcd68f7db98`: a plan-review/format blocker (the well-known
+// retryable "missing required ## Feedback Incorporated section" failure) was
+// misclassified `workflow-engine-defect`/`run_fatal`, terminally stopping the
+// whole run while a sibling item sat unreported at `ready`.
+// ---------------------------------------------------------------------------
+
+test("regression (#570): a direct blocked_needs_human outcome enters a needs-human hold, never a human_authority/workflow-engine-defect stop, and a ready sibling is preserved", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+
+  const dispatched = new Set<string>();
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels(issueNumber) {
+      const id = String(issueNumber);
+      return { state: "open", labels: dispatched.has(id) ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue(issueNumber) {
+      return dispatched.has(String(issueNumber)) ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/x-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatched.add(request.item_id);
+    const outcome = request.item_id === "200" ? "blocked_needs_human" : "ready_to_deploy";
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: outcome as LoopExecutionResponse["outcome"],
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(result.stop, null, "a needs-human pipeline blocker must never record a terminal run stop");
+  assert.equal(result.holdOutstanding, true, "the run reports hold_outstanding=true and pauses");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.stop, null);
+  assert.equal(finalLedger.items["200"].state, "waiting", "the blocked item enters a paused/waiting hold");
+  assert.equal(finalLedger.items["200"].hold_request?.kind, "answer");
+  assert.notEqual(finalLedger.items["200"].blocked_theme, "missing-authority", "never classified missing-authority");
+  assert.equal(
+    finalLedger.items["100"].state,
+    "ready",
+    "the ready sibling's state must survive the hold, not be stranded/discarded",
+  );
+});
+
+test("needs-human blocker-disposition safety net (#570): a failed outcome observed at pipeline:blocked is routed to the hold, not workflow-engine-defect", async () => {
+  // Item "100" is dispatched, its harness reports the well-known retryable plan-review format
+  // failure normalized to "failed" (LOOP_TERMINAL_OUTCOMES has no such literal outcome), and the
+  // live issue is nonetheless observed carrying `pipeline:blocked` — a recoverable,
+  // human-unblockable disposition, not a genuine dispatch crash/rejection.
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+
+  let calls = 0;
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      calls++;
+      return calls === 1 ? { state: "open", labels: ["pipeline:ready"] } : { state: "open", labels: ["pipeline:blocked"] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked at plan-review: Plan revision output is missing required ## Feedback Incorporated section" as unknown as LoopExecutionResponse["outcome"],
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+  });
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(result.stop, null, "a plan-review format blocker must never be classified workflow-engine-defect / run_fatal");
+  assert.equal(result.holdOutstanding, true);
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.stop, null);
+  assert.equal(finalLedger.items["100"].state, "waiting");
+  assert.notEqual(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
+});
+
+test("regression (#570): a run stop while a sibling is ready discloses the outstanding ready item on the stop record", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+
+  const dispatched = new Set<string>();
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels(issueNumber) {
+      const id = String(issueNumber);
+      if (id === "200") return { state: "open", labels: ["pipeline:review-1"] };
+      return { state: "open", labels: dispatched.has(id) ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue(issueNumber) {
+      const id = String(issueNumber);
+      return id !== "200" && dispatched.has(id) ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/x-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatched.add(request.item_id);
+    const outcome = request.item_id === "200" ? "some-unrecognized-outcome" : "ready_to_deploy";
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: outcome as unknown as LoopExecutionResponse["outcome"],
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(result.stop?.reason, "run_fatal", "item 200 is a genuine engine defect — unaffected by the needs-human disposition change");
+  assert.deepEqual(result.stop?.outstanding_ready, ["100"], "the stranded ready sibling must be named on the stop record");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "ready", "the ready sibling's state is preserved, not discarded, by the stop");
+  assert.equal(finalLedger.items["200"].blocked_theme, "workflow-engine-defect");
+});
+
+test("a stop recorded with no ready item discloses an empty outstanding_ready set", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:review-1"] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "some-unrecognized-outcome" as unknown as LoopExecutionResponse["outcome"],
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+  });
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(result.stop?.reason, "run_fatal");
+  assert.deepEqual(result.stop?.outstanding_ready, [], "no item is ready at stop time, so the disclosure is an empty set");
+});

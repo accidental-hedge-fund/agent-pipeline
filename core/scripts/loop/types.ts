@@ -550,6 +550,24 @@ export interface LoopStopRecord {
   /** Set when `reason === "dependency_deadlock"` — for each stuck item, the dependency (in-run
    *  or external) it waits on and that dependency's observed state. */
   deadlock_chain?: LoopDeadlockChainEntry[];
+  /** Every item id in the `ready` state (`pipeline:ready-to-deploy`, awaiting the human merge
+   *  the pipeline never performs) at the moment this stop was recorded — capability
+   *  `loop-needs-human-blocker-disposition`. Additive disclosure only: it never alters the stop
+   *  `reason` or which items are considered done. Always present (empty when no item is
+   *  `ready`) on a stop recorded after this capability landed; see
+   *  {@link outstandingReadyItemIds}. */
+  outstanding_ready: string[];
+}
+
+/** Pure projection of every `ready` item id in `ledger` — the disclosure a terminal stop
+ *  carries via {@link LoopStopRecord.outstanding_ready} (capability
+ *  `loop-needs-human-blocker-disposition`) so an operator is never left unaware that a
+ *  ready-to-deploy PR is stranded when a run stops. Sorted for a deterministic stop record. */
+export function outstandingReadyItemIds(ledger: LoopLedger): string[] {
+  return Object.values(ledger.items)
+    .filter((item) => item.state === "ready")
+    .map((item) => item.id)
+    .sort();
 }
 
 /** One stuck item's entry in a {@link LoopStopRecord.deadlock_chain} — capability
