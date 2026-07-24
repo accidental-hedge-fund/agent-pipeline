@@ -1129,6 +1129,7 @@ test("findLiveRunLocks: a stale (dead) PID does not block", () => {
     listLocks: () => ["/tmp/pipeline-lyric-utils-420.lock"],
     readLock: () => "99999",
     isPidLive: () => false,
+    removeLock: () => {},
   });
   assert.deepEqual(live, []);
 });
@@ -1139,9 +1140,75 @@ test("findLiveRunLocks: unparseable lock contents are treated as stale, not live
     listLocks: () => ["/tmp/pipeline-lyric-utils-420.lock"],
     readLock: () => "not-a-pid",
     isPidLive: () => { liveCalled = true; return true; },
+    removeLock: () => {},
   });
   assert.deepEqual(live, []);
   assert.equal(liveCalled, false, "isPidLive must not be consulted for unparseable contents");
+});
+
+// ---------------------------------------------------------------------------
+// Stale-lock sweep (#567) — findLiveRunLocks unlinks a provably-dead
+// (ESRCH) or unparseable lock as a side effect of the scan; a live lock and
+// an EPERM (unsignalable, conservatively-live) lock are never swept.
+// ---------------------------------------------------------------------------
+
+test("findLiveRunLocks: sweeps a dead-PID lock (fakes only, no real I/O)", () => {
+  const removed = [];
+  const live = findLiveRunLocks({
+    listLocks: () => ["/tmp/pipeline-lyric-utils-420.lock"],
+    readLock: () => "99999",
+    isPidLive: () => false,
+    removeLock: (p) => removed.push(p),
+  });
+  assert.deepEqual(live, []);
+  assert.deepEqual(removed, ["/tmp/pipeline-lyric-utils-420.lock"], "a dead-PID lock must be swept");
+});
+
+test("findLiveRunLocks: sweeps a lock with unparseable contents", () => {
+  const removed = [];
+  findLiveRunLocks({
+    listLocks: () => ["/tmp/pipeline-lyric-utils-420.lock"],
+    readLock: () => "not-a-pid",
+    isPidLive: () => true,
+    removeLock: (p) => removed.push(p),
+  });
+  assert.deepEqual(removed, ["/tmp/pipeline-lyric-utils-420.lock"], "an unparseable lock must be swept as stale");
+});
+
+test("findLiveRunLocks: never sweeps a live lock", () => {
+  const removed = [];
+  const live = findLiveRunLocks({
+    listLocks: () => ["/tmp/pipeline-lyric-utils-420.lock"],
+    readLock: () => "12345",
+    isPidLive: () => true,
+    removeLock: (p) => removed.push(p),
+  });
+  assert.deepEqual(live, [{ path: "/tmp/pipeline-lyric-utils-420.lock", pid: 12345 }]);
+  assert.deepEqual(removed, [], "a live lock must never be swept");
+});
+
+test("findLiveRunLocks: never sweeps an EPERM (conservatively-live) lock", () => {
+  const removed = [];
+  const live = findLiveRunLocks({
+    listLocks: () => ["/tmp/pipeline-lyric-utils-420.lock"],
+    readLock: () => "12345",
+    isPidLive: () => true, // isPidLiveDefault reports EPERM as live
+    removeLock: (p) => removed.push(p),
+  });
+  assert.equal(live.length, 1, "an EPERM lock is treated as live and still blocks");
+  assert.deepEqual(removed, [], "an EPERM lock must never be swept");
+});
+
+test("findLiveRunLocks: an unreadable lock file is left in place, not swept", () => {
+  const removed = [];
+  const live = findLiveRunLocks({
+    listLocks: () => ["/tmp/pipeline-lyric-utils-420.lock"],
+    readLock: () => null,
+    isPidLive: () => true,
+    removeLock: (p) => removed.push(p),
+  });
+  assert.deepEqual(live, []);
+  assert.deepEqual(removed, [], "an unreadable lock is left alone, not swept — its cause is unknown");
 });
 
 test("findLiveRunLocks: an unreadable lock file is treated as stale", () => {
@@ -1267,7 +1334,7 @@ test("install update --force: proceeds despite a live lock and warns about it", 
   }
 });
 
-test("install update: a stale lock (dead PID) does not block the update", () => {
+test("install update: a stale lock (dead PID) does not block the update, and is swept off disk", () => {
   const claudeTmp = makeTmp();
   const lockTmp = makeTmp();
   try {
@@ -1275,7 +1342,8 @@ test("install update: a stale lock (dead PID) does not block the update", () => 
     // Spawn and immediately reap a short-lived child so its PID is guaranteed dead.
     const dead = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
     const deadPid = dead.pid;
-    writeFileSync(join(lockTmp, "pipeline-lyric-utils-420.lock"), String(deadPid));
+    const lockPath = join(lockTmp, "pipeline-lyric-utils-420.lock");
+    writeFileSync(lockPath, String(deadPid));
 
     const result = runInstaller(["update", "--host", "claude"], {
       CLAUDE_CONFIG_DIR: claudeTmp,
@@ -1285,6 +1353,7 @@ test("install update: a stale lock (dead PID) does not block the update", () => 
     });
 
     assert.equal(result.status, 0, `a stale lock must not block the update: ${result.stderr}`);
+    assert.equal(existsSync(lockPath), false, "the installer's scan must sweep the dead-PID lock (#567)");
   } finally {
     cleanup(claudeTmp);
     cleanup(lockTmp);

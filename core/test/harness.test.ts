@@ -872,6 +872,50 @@ test("runCapped: a capture stream erroring mid-run resolves with capture_error, 
   assert.equal(result.spawn_error ?? false, false, "a capture-stream error is distinct from a spawn error");
 });
 
+test("runCapped: a capture-stream error arriving during timeout escalation does not cancel the pending SIGKILL (#567 review 1)", async () => {
+  // Regression: settle() used to clear reapTimer/reapFollowupTimer on ANY
+  // resolution path. If a capture-stream error resolves the promise after the
+  // SIGTERM timer has fired but before the SIGKILL grace period elapses, the
+  // reap chain must still run to completion — otherwise a descendant that
+  // outlived SIGTERM is never force-killed, even though runCapped already
+  // returned.
+  const killSignals: string[] = [];
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999999,
+    kill: (signal: string) => {
+      killSignals.push(signal);
+      return true;
+    },
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+
+  // timeoutSec fires at 50ms; killGraceSec (300ms) then arms the SIGKILL reap
+  // timer for ~350ms. hardDeadlineSec is generous so the sibling failsafe timer
+  // (armed at killGraceSec + hardDeadlineSec) cannot interfere with this test.
+  setTimeout(() => fakeChild.stdout.emit("error", new Error("EPIPE (simulated, mid-escalation)")), 100);
+
+  const result = await runCapped("unused", [], tmpRoot, 0.05, false, "test", {
+    spawnFn,
+    killGraceSec: 0.3,
+    hardDeadlineSec: 5,
+  });
+
+  assert.equal(result.capture_error, true, "the capture-stream error settles the promise first");
+  assert.ok(
+    !killSignals.includes("SIGKILL"),
+    `SIGKILL must not have been sent yet at settle time, got: ${JSON.stringify(killSignals)}`,
+  );
+
+  // Wait past the SIGKILL grace period to prove the reap chain still fires.
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.ok(
+    killSignals.includes("SIGKILL"),
+    `the SIGKILL reap timer must still fire after an early settle during timeout escalation, got: ${JSON.stringify(killSignals)}`,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // synchronous spawn() throw (#393) — node:child_process spawn() throws
 // SYNCHRONOUSLY (not via the async child.on("error") path) for certain argv

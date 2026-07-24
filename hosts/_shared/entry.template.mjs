@@ -25,6 +25,19 @@ const PROFILE = "__PROFILE__";
 const UPDATE_LOCK_PATH = join(tmpdir(), ".pipeline-installer-update.lock");
 const STARTING_LOCK_PATH = join(tmpdir(), `pipeline-starting-${process.pid}.lock`);
 
+// Read-only commands are explicitly allowlisted (fail-safe default: anything
+// not listed here is treated as run-mutating and reserves a slot). `logs`
+// (list form and `--follow`), `status`, and `summary` only read run artifacts
+// — a file swap during an install can't corrupt a process that just tails
+// terminal.log/events.jsonl — so they must not hold a run-liveness lock for
+// their (potentially hours-long, `--follow`) lifetime, or they block every
+// `install.mjs update` behind them (#567).
+const READ_ONLY_COMMANDS = new Set(["logs", "status", "summary"]);
+
+function isReadOnlyCommand(argv0) {
+  return READ_ONLY_COMMANDS.has(argv0);
+}
+
 function updateInProgress() {
   return existsSync(UPDATE_LOCK_PATH);
 }
@@ -184,12 +197,27 @@ if (!existsSync(join(coreDir, "node_modules"))) {
   }
 }
 
-if (!reserveRunSlot()) {
+// Read-only commands never reserve or hold the run-liveness slot (#567) — they
+// only need the cheap, non-held courtesy check so they can decline to start
+// into an update that's already in progress.
+const readOnly = isReadOnlyCommand(rawArgs[0]);
+let reserved = false;
+if (readOnly) {
+  if (updateInProgress()) {
+    console.error(
+      "pipeline: an install/update is in progress — starting now risks loading a mixed " +
+        "old/new engine. Retry in a moment.",
+    );
+    process.exit(1);
+  }
+} else if (!reserveRunSlot()) {
   console.error(
     "pipeline: an install/update is in progress — starting now risks loading a mixed " +
       "old/new engine. Retry in a moment.",
   );
   process.exit(1);
+} else {
+  reserved = true;
 }
 
 const passthrough = process.argv.slice(2);
@@ -197,5 +225,5 @@ const args = ["--experimental-strip-types", entry, ...passthrough];
 if (!passthrough.includes("--profile")) args.push("--profile", PROFILE);
 
 const run = spawnSync(process.execPath, args, { stdio: "inherit" });
-releaseRunSlot();
+if (reserved) releaseRunSlot();
 process.exit(run.status ?? 1);
