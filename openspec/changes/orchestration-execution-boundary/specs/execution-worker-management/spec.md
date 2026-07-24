@@ -25,6 +25,28 @@ refused.
 - **THEN** a subsequent assignment claim bearing that credential SHALL be refused
 - **AND** the refusal SHALL carry a machine-readable revocation diagnostic
 
+### Requirement: Revocation invalidates active leases and is checked on every inbound envelope
+
+Credential revocation SHALL be a durable, linearizable management-state transition that, in the same
+transaction, invalidates all of the worker's active leases and supersedes their fencing tokens — not
+only a refusal applied to future assignment claims. The control plane SHALL validate revocation state
+for every inbound envelope (`ProgressEvent`, `ArtifactManifest`, `WorkResult`) from an already-connected
+worker, including one whose session predates the revocation, as part of the same acceptance/advancement
+transaction used for the current lease and fencing-token check. Work orphaned by a revocation-triggered
+lease invalidation SHALL be cancelled or safely re-assigned under a new attempt.
+
+#### Scenario: Revocation supersedes an active lease and fencing token
+
+- **WHEN** a worker's credential is revoked while it holds an active lease
+- **THEN** the revocation SHALL invalidate that lease and supersede its fencing token in the same transaction
+- **AND** the affected assignment SHALL be cancelled or re-assigned under a new attempt
+
+#### Scenario: Pre-existing session is still checked for revocation
+
+- **WHEN** a worker with an already-established outbound session submits a `WorkResult` after its credential was revoked
+- **THEN** the control plane SHALL validate revocation state for that envelope in the same transaction as the lease/fencing-token check
+- **AND** it SHALL refuse to advance run/stage state on that result
+
 ### Requirement: Capability and authorization gating before assignment
 
 The management plane SHALL enforce a worker's declared capabilities and repository/environment

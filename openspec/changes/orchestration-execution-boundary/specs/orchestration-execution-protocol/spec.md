@@ -76,6 +76,37 @@ from that authority before accepting or advancing any result.
 - **THEN** the new process SHALL rehydrate assignment ownership, fencing token, and cancellation state solely from the durable assignment-state authority
 - **AND** it SHALL NOT accept or advance a result based on any in-memory record of "current" that predates the restart or failover
 
+### Requirement: Execution-side effects are fenced, not just result acceptance
+
+Fencing SHALL bound the effects a worker is authorized to produce, not merely which results the
+control plane advances on. Each assignment attempt SHALL bind a worker to attempt-owned repository
+resources (a dedicated worktree/branch namespace) and to write credentials that are lease-scoped and
+revocable independently of the worker's session. The control plane SHALL invalidate an attempt's write
+credentials at lease expiry or cancellation, and a worker SHALL treat loss of lease validity as a
+requirement to stop before any irreversible external effect (a push, an external API call, or any other
+action outside its attempt-owned resources) rather than proceeding on stale authorization. Before
+re-assigning an attempt whose prior effects are unknown, the control plane SHALL reconcile: confirm the
+prior attempt's write credentials are invalidated and its attempt-owned resources are not reused by the
+new attempt.
+
+#### Scenario: Lease expiry invalidates write credentials, not just result acceptance
+
+- **WHEN** an assignment's lease expires
+- **THEN** the control plane SHALL invalidate that attempt's write credentials at expiry, independent of whether a result was ever submitted
+- **AND** a worker holding those credentials SHALL be unable to complete a new irreversible external effect using them after expiry
+
+#### Scenario: Worker stops before an irreversible effect under an invalid lease
+
+- **WHEN** a worker cannot confirm its lease is still valid before performing an irreversible external effect
+- **THEN** it SHALL stop and park rather than perform the effect
+- **AND** it SHALL report the parked state so the control plane can reconcile before re-assigning
+
+#### Scenario: Re-assignment reconciles unknown prior effects
+
+- **WHEN** the control plane re-assigns work whose prior attempt's effects are unknown
+- **THEN** it SHALL confirm the prior attempt's write credentials are invalidated before dispatching the new attempt
+- **AND** the new attempt SHALL use attempt-owned resources distinct from the prior attempt's
+
 ### Requirement: Versioned control-to-worker cancellation directive
 
 The protocol SHALL define a `CancellationDirective` envelope (control→worker) as the sole mechanism by
@@ -163,6 +194,35 @@ cancellation SHALL be honored such that a cancelled assignment cannot later adva
 - **WHEN** an `ArtifactManifest` references artifacts whose digests do not match the transferred bytes
 - **THEN** the control plane SHALL treat the result as incomplete and refuse to accept it as terminal
 - **AND** it SHALL emit a machine-readable partial-transfer diagnostic
+
+### Requirement: Assignment-bound artifact transfer contract
+
+An `ArtifactManifest` SHALL reference artifacts only through an assignment/attempt-bound transfer
+contract: either a control-plane-issued opaque upload/read handle, or a customer-configured allowlisted
+artifact store. The control plane SHALL NOT dereference a worker-supplied arbitrary URI or location
+outside that contract. Every reference SHALL carry a canonical digest algorithm, the digest, and a byte
+range or size, and SHALL be rejected if it exceeds a configured size bound. A manifest entry outside the
+contract (an unrecognized scheme, an unauthorized store, or a reference not bound to the assignment)
+SHALL be rejected with a machine-readable diagnostic and never dereferenced.
+
+#### Scenario: Control plane never dereferences an arbitrary worker-supplied location
+
+- **WHEN** an `ArtifactManifest` references a location outside the assignment-bound transfer contract
+- **THEN** the control plane SHALL reject the reference without dereferencing it
+- **AND** it SHALL emit a machine-readable diagnostic identifying the contract violation
+
+#### Scenario: Oversized artifact reference is rejected
+
+- **WHEN** an artifact reference's declared size or byte range exceeds the configured size bound
+- **THEN** the control plane SHALL reject the manifest entry
+- **AND** it SHALL NOT retrieve the artifact bytes
+
+#### Scenario: Malicious artifact metadata is deterministically rejected
+
+- **WHEN** a worker submits an `ArtifactManifest` with an artifact reference outside the transfer
+  contract's allowed schemes, stores, or assignment binding
+- **THEN** the control plane SHALL apply this requirement's rejection rule and refuse the reference
+- **AND** the rejection SHALL be recorded as evidence without treating the manifest as terminal
 
 ### Requirement: Auditable evidence lineage across the boundary
 

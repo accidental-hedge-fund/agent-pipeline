@@ -41,6 +41,13 @@
       recovery — each biting.
 - [ ] 3.4 Map every boundary failure mode to one deterministic outcome + machine-readable diagnostic
       (disconnect/reconnect, lease expiry, worker loss, protocol skew, partial artifact upload).
+- [ ] 3.5 Fence execution-side effects, not just result acceptance: attempt-owned worktree/branch
+      resources, lease-scoped revocable write credentials invalidated at expiry/cancellation, and a
+      stop-before-irreversible-effect rule when lease validity can't be confirmed; reconcile prior-attempt
+      credential invalidation before re-assigning.
+- [ ] 3.6 Implement the assignment-bound artifact transfer contract (control-plane-issued handles or a
+      customer-allowlisted store, canonical digest + size bound); reject any manifest reference outside
+      the contract without dereferencing it (test).
 
 ## 4. Execution-worker runtime contract
 
@@ -62,6 +69,9 @@
 - [ ] 5.3 Pools, drain, health, quotas, version/policy attachment; drain stops new assignments while
       in-flight ones complete or re-assign.
 - [ ] 5.4 Feed sanitized read-only health/delivery telemetry to #503 without exposing a command channel.
+- [ ] 5.5 Make revocation a durable, linearizable transition that invalidates the worker's active
+      leases/fencing tokens in the same transaction, and validate revocation state on every inbound
+      envelope from an already-connected worker, not only on new assignment claims (test).
 
 ## 6. Trust boundary and evidence lineage
 
