@@ -10,7 +10,7 @@
 // implements. Every function here is pure (no gh, git, fs, clock, or store access).
 
 import { evaluateConflict, normalizeOwnership } from "./ownership.ts";
-import { eligibleIndependentItems } from "./recovery.ts";
+import { DONE_STATES, eligibleIndependentItems } from "./recovery.ts";
 import {
   type ExternalDependencyStatus,
   type LoopContract,
@@ -59,6 +59,39 @@ function hasDependencyPath(itemsById: ReadonlyMap<string, LoopContractItem>, a: 
   return dependsTransitively(itemsById, a, b) || dependsTransitively(itemsById, b, a);
 }
 
+/** Records a `dependency_path` rationale entry for every `pending` item excluded from the
+ *  frontier by {@link eligibleIndependentItems}, naming every not-yet-done dependency counterpart
+ *  reachable over the item's **declared dependency graph** — transitive edges included, not just
+ *  the item's own `depends_on` list (#528 pre-merge delta finding 043b3c36). The frontier's safety
+ *  check ({@link hasDependencyPath}) is transitive, so for a chain a <- b <- c the scheduler
+ *  serializes pair c:a as well as c:b — and the durable evidence must name both, or the
+ *  parallelization ledger under-reports why a dependency-linked pair never ran concurrently.
+ *  These items never reach the frontier's own pairwise `dependency_path` check (a defense-in-depth
+ *  guard against a case the pre-filter already rules out — see {@link hasDependencyPath}'s
+ *  docstring), so without this the run-scoped parallelization ledger would have no entry at all
+ *  for a dependency-linked pair. Breadth-first over contract-declared edges keeps the emission
+ *  order deterministic; the `visited` set deduplicates diamond-shaped graphs. */
+function dependencyBlockedRationale(contract: LoopContract, ledger: LoopLedger): ScheduleRationale[] {
+  const itemsById = new Map(contract.items.map((item) => [item.id, item]));
+  const rationale: ScheduleRationale[] = [];
+  for (const item of contract.items) {
+    if (ledger.items[item.id]?.state !== "pending") continue;
+    const queue = [...(item.depends_on ?? [])];
+    const visited = new Set<string>();
+    while (queue.length > 0) {
+      const dep = queue.shift()!;
+      if (visited.has(dep)) continue;
+      visited.add(dep);
+      const depEntry = ledger.items[dep];
+      if (depEntry === undefined || !DONE_STATES.has(depEntry.state)) {
+        rationale.push({ item_id: item.id, disposition: "dependency_path", counterpart_item_id: dep });
+      }
+      queue.push(...(itemsById.get(dep)?.depends_on ?? []));
+    }
+  }
+  return rationale;
+}
+
 /** Selects a deterministic, concurrency-bounded, provably-independent set of items to admit into
  *  `in_progress` from the eligible-item frontier. Absent a `concurrency` policy, or a budget of
  *  one, this ever admits at most one item — the same item {@link eligibleIndependentItems} would
@@ -68,21 +101,27 @@ function hasDependencyPath(itemsById: ReadonlyMap<string, LoopContractItem>, a: 
  *  its documented order, admitting each candidate only when it is independent — by the fixed
  *  precedence dependency-path, then conflict-edge/unknown-ownership (ownership.ts's own internal
  *  precedence decides between those two), then unresolved reconciliation drift, then the budget —
- *  of every already-admitted item. Every candidate receives exactly one {@link ScheduleRationale}
- *  entry; this function itself starts, merges, or serializes nothing. */
+ *  of every already-admitted item. Every frontier candidate receives exactly one {@link
+ *  ScheduleRationale} entry, and every `pending` item the frontier excluded for its own unmet
+ *  `depends_on` edge receives a `dependency_path` entry too (see {@link
+ *  dependencyBlockedRationale}), so the run-scoped parallelization ledger has a durable entry for
+ *  every dependency-linked pair, not just every frontier-evaluated one. This function itself
+ *  starts, merges, or serializes nothing. */
 export function selectSchedulableSet(input: ScheduleInput): ScheduleDecision {
   const { contract, ledger } = input;
   const externalStatuses = input.externalStatuses ?? {};
 
   const frontier = eligibleIndependentItems(contract, ledger, externalStatuses);
+  const dependencyBlocked = dependencyBlockedRationale(contract, ledger);
+
   if (frontier.length === 0) {
-    return { selected: [], rationale: [] };
+    return { selected: [], rationale: dependencyBlocked };
   }
 
   if (ledger.merge_barrier) {
     return {
       selected: [],
-      rationale: frontier.map((itemId) => ({ item_id: itemId, disposition: "merge_barrier" as const })),
+      rationale: [...frontier.map((itemId) => ({ item_id: itemId, disposition: "merge_barrier" as const })), ...dependencyBlocked],
     };
   }
 
@@ -150,7 +189,7 @@ export function selectSchedulableSet(input: ScheduleInput): ScheduleDecision {
     rationale.push({ item_id: candidateId, disposition: "admitted" });
   }
 
-  return { selected, rationale };
+  return { selected, rationale: [...rationale, ...dependencyBlocked] };
 }
 
 // ---------------------------------------------------------------------------

@@ -12,7 +12,8 @@
 // Acquires no lock, writes no ledger, appends no event.
 
 import { readActionEvidence, readEvents, readLedger, type LoopStoreDeps } from "./store.ts";
-import type { LoopLedger, OwnershipEvidencePair } from "./types.ts";
+import type { LoopLedger, LoopParallelizationLedgerEntry, OwnershipEvidencePair } from "./types.ts";
+import { parallelizationLedgerFromEvents } from "./parallelization-ledger.ts";
 
 export interface LoopEvidenceBundle {
   runId: string;
@@ -23,6 +24,10 @@ export interface LoopEvidenceBundle {
   mergeBarrierCleared: { item_id: string; merged_sha: string } | null;
   terminalOutcomes: Record<string, string>;
   stop: LoopLedger["stop"];
+  /** The run-scoped parallelization decision ledger (#528, capability
+   *  `conflict-aware-parallel-execution`) — every pairwise parallelize-or-serialize decision the
+   *  run's scheduling passes made, reconstructed from the durable event log alone. */
+  parallelizationLedger: LoopParallelizationLedgerEntry[];
 }
 
 /** Projects a run's durable state into a {@link LoopEvidenceBundle}. */
@@ -72,5 +77,6 @@ export async function buildLoopEvidenceBundle(
     mergeBarrierCleared,
     terminalOutcomes: Object.fromEntries(Object.entries(ledger.items).map(([id, i]) => [id, i.state])),
     stop: ledger.stop,
+    parallelizationLedger: parallelizationLedgerFromEvents(events),
   };
 }
