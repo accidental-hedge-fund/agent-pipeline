@@ -29,7 +29,7 @@
       each envelope (`(tenant, installation, run_id, seq)` or content digest), bounded retry/backoff, and
       per-envelope acknowledgements — including batch requests, where each envelope in a batch retires
       independently from its own result in the `207 Multi-Status` response.
-- [ ] 2.4 Define explicit, bounded spool-overflow behavior (documented drop-oldest or back-pressure,
+- [ ] 2.4 Define explicit, bounded spool-overflow behavior (documented reject-new or back-pressure,
       never unbounded) that emits a diagnostic when it engages; under back-pressure, bound the admission
       delay with a configured `admission_timeout` and drop the new envelope as accounted pre-admission
       loss if it elapses.

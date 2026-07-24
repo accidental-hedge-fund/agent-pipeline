@@ -89,18 +89,21 @@ deletion of already-admitted ones.
 ### Requirement: Delivery has bounded retry/backoff and explicit, accounted overflow behavior
 
 Fleet delivery SHALL retry failed deliveries with bounded backoff and SHALL bound the local spool with
-an explicit overflow policy — documented drop-oldest or back-pressure — that SHALL NOT allow unbounded
-spool growth. A customer SHALL select the overflow policy via the `fleet` config; the pipeline SHALL NOT
-silently mix the two. When the overflow policy engages, delivery SHALL emit a machine-readable
-diagnostic identifying the affected envelope(s) (at minimum `run_id` and `seq`) and a running
-overflow-drop count, exposed through the delivery-health diagnostics (see below) as accounted telemetry
-loss rather than silent data loss. Under `drop-oldest`, the dropped envelope is always the
-oldest-`seq`-per-run entry currently in the spool. Under `back-pressure`, admission of a new envelope
-into a full spool SHALL be delayed, bounded by a configured `admission_timeout`, applied only to the
-fleet-delivery producer call (never to the Pipeline stage itself, consistent with the non-fatal
-requirement below); if the timeout elapses before spool space frees, the new envelope SHALL be dropped
-as accounted pre-admission loss — identified by `run_id`/`seq` and counted in the same overflow-drop
-count — rather than growing the spool or blocking the stage.
+an explicit **admission-control** overflow policy — documented `reject-new` or `back-pressure` — that
+SHALL NOT allow unbounded spool growth and SHALL NOT evict an already-admitted, unacknowledged envelope
+(consistent with the once-admitted at-least-once guarantee above). A customer SHALL select the overflow
+policy via the `fleet` config; the pipeline SHALL NOT silently mix the two. When the overflow policy
+engages, delivery SHALL emit a machine-readable diagnostic identifying the affected (refused) envelope
+(at minimum `run_id` and `seq`) and a running overflow-drop count, exposed through the delivery-health
+diagnostics (see below) as accounted telemetry loss rather than silent data loss. Under `reject-new`,
+when the spool is at its configured bound the **newly produced** envelope is refused admission and
+accounted as pre-admission loss; every already-admitted envelope is retained until its own acknowledgement
+or terminal-rejection retirement. Under `back-pressure`, admission of a new envelope into a full spool
+SHALL be delayed, bounded by a configured `admission_timeout`, applied only to the fleet-delivery producer
+call (never to the Pipeline stage itself, consistent with the non-fatal requirement below); if the timeout
+elapses before spool space frees, the new envelope SHALL be dropped as accounted pre-admission loss —
+identified by `run_id`/`seq` and counted in the same overflow-drop count — rather than growing the spool,
+evicting an admitted envelope, or blocking the stage.
 
 #### Scenario: failed delivery retries with bounded backoff
 
@@ -110,9 +113,10 @@ count — rather than growing the spool or blocking the stage.
 
 #### Scenario: spool overflow is explicit and observable
 
-- **WHEN** the spool reaches its configured bound under `drop-oldest`
-- **THEN** the oldest spooled envelope SHALL be dropped rather than the spool growing without bound
-- **AND** a machine-readable diagnostic SHALL identify the dropped envelope's `run_id`/`seq` and
+- **WHEN** the spool reaches its configured bound under `reject-new`
+- **THEN** the newly produced envelope SHALL be refused admission rather than the spool growing without
+  bound or an already-admitted envelope being evicted
+- **AND** a machine-readable diagnostic SHALL identify the refused envelope's `run_id`/`seq` and
   increment the delivery-health drop count
 
 #### Scenario: back-pressure overflow delays admission within a bounded timeout

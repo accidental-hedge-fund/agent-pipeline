@@ -65,16 +65,19 @@ Delivery treats the network as at-least-once **for any envelope successfully adm
 local spool**: it is written to the spool first, then delivered with bounded retry/backoff, and retired
 from the spool only on a collector acknowledgement. This guarantee is deliberately scoped to
 spool-admitted envelopes rather than unconditional, because the spool has an **explicit, bounded**
-overflow policy (customer-selected `drop-oldest` or `back-pressure`, never unbounded growth): under
-`drop-oldest`, an overflow-dropped envelope is accounted telemetry loss, not a silent violation of
-at-least-once — it is dropped by identified `run_id`/`seq`, counted in the drop count, and surfaced
-through delivery-health diagnostics. Under `back-pressure`, admission of a new envelope into a full spool
+overflow policy (customer-selected `reject-new` or `back-pressure`, never unbounded growth) that is
+strictly **admission-control** and never evicts an already-admitted, unacknowledged envelope: under
+`reject-new`, when the spool is full the newly produced envelope is refused admission — accounted
+telemetry loss at admission, not a silent violation of at-least-once — dropped by identified
+`run_id`/`seq`, counted in the drop count, and surfaced through delivery-health diagnostics, while every
+admitted envelope is retained until acknowledgement or terminal-rejection retirement. Under
+`back-pressure`, admission of a new envelope into a full spool
 is delayed, but only up to a configured, bounded `admission_timeout`; the delay is applied to the
 fleet-delivery producer call (which is already asynchronous/non-blocking relative to the Pipeline stage,
 per the #343 non-fatal contract), never to the stage itself, so no stage outcome is ever changed or
 blocked. If the timeout elapses before spool space frees (via delivery/retirement), the new envelope is
 dropped as **accounted pre-admission loss** — identified by `run_id`/`seq`, counted in the same drop
-count, and surfaced through delivery-health diagnostics exactly like a `drop-oldest` drop. This resolves
+count, and surfaced through delivery-health diagnostics exactly like a `reject-new` refusal. This resolves
 the three constraints (bounded spool, no silent loss, no stage impact) without requiring any of them to
 be unconditional: the spool never grows past its bound, every loss is accounted and observable, and the
 bound is enforced by dropping an admission candidate rather than by blocking the run. A sink outage never
@@ -199,16 +202,25 @@ decision fixes that contract, symmetric to D10's ingest profile:
   lineage requirement) without embedding full event payloads in the response. `next_cursor` is `null`
   once the last page has been returned; the caller pages by resubmitting the same request with
   `page.cursor` set to the previous `next_cursor`.
-- **Snapshot-consistent pagination.** The first request of a paginated report SHALL establish a read
-  snapshot bound to (a) the resolved tenant, (b) a fingerprint of the query's `time_window`, `filter`,
-  and `group_by`, and (c) an ingest high-water mark captured at that instant. `next_cursor` opaquely
-  encodes that snapshot, and every subsequent page SHALL be served against the same snapshot/high-water
-  mark, so events ingested, expired, or deleted between pages never change the report's dataset
-  mid-pagination. The collector SHALL reject a cursor whose encoded snapshot has expired or whose query
-  fingerprint does not match the resubmitted body with a `409` bearing the D10 rejection envelope
-  (`reason_code: "cursor_expired"` or `"cursor_query_mismatch"`), rather than silently paging over a
-  different dataset. A report's metrics and lineage therefore always describe one snapshot, or the query
-  fails explicitly.
+- **Snapshot-consistent pagination (concurrent-ingestion only; deletion/retention wins).** The first
+  request of a paginated report SHALL establish a read snapshot bound to (a) the resolved tenant, (b) a
+  fingerprint of the query's `time_window`, `filter`, and `group_by`, and (c) an ingest high-water mark
+  captured at that instant. `next_cursor` opaquely encodes that snapshot, and every subsequent page SHALL
+  be served against the same high-water mark **so that concurrent ingestion** (events arriving after the
+  first page) never changes the report's dataset mid-pagination. Snapshot consistency is deliberately
+  scoped to concurrent ingestion only: a **deletion or retention-expiry** of contributing telemetry
+  always wins over pagination continuity — the governance contract's requirement that deleted/expired
+  telemetry no longer appear in any query or report takes precedence, so a snapshot SHALL NOT serve data
+  after it has been deleted or expired. When a deletion/retention event affects an in-flight pagination,
+  the collector SHALL invalidate the affected cursor and, on the next page request, return a `409`
+  bearing the D10-shaped rejection envelope with `reason_code: "cursor_invalidated"`; the caller restarts
+  the report to obtain a fresh, deletion-consistent snapshot. The collector SHALL likewise `409` a cursor
+  whose encoded snapshot has expired (`cursor_expired`) or whose query fingerprint does not match the
+  resubmitted body (`cursor_query_mismatch`), rather than silently paging over a different dataset. These
+  three query-side codes — `cursor_invalidated`, `cursor_expired`, `cursor_query_mismatch` — form a
+  fixed **query-error enum** distinct from D10's ingest `reason_code` enum; the query endpoint advertises
+  it at `/fleet/v1/capabilities`. A report's metrics and lineage therefore always describe one
+  deletion-consistent snapshot, or the query fails explicitly.
 - **Cross-tenant refusal.** If the request's `filter` names an `installation_id` outside the credential's
   bound tenant, the collector responds `403` with the same rejection envelope as D10
   (`{"status": "rejected", "reason_code": "cross_tenant_scope", "detail": "<human string>"}`) and returns
