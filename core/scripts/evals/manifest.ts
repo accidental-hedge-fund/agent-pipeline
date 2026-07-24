@@ -243,7 +243,10 @@ export function expandPlan(manifest: ExperimentManifest, fixtures: Map<string, F
   };
 }
 
-function stableStringify(value: unknown): string {
+/** Deterministic JSON stringification, stable regardless of object key order —
+ *  shared by hash derivations across the eval layer (manifest config_hash,
+ *  fixture env_surface_hash) so identical inputs always hash identically. */
+export function stableStringify(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map(stableStringify).join(",")}]`;
   }

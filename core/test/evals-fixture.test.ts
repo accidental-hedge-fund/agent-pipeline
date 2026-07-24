@@ -4,6 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  computeEnvSurfaceHash,
   FixtureValidationError,
   loadFixture,
   validateFixture,
@@ -234,4 +235,103 @@ test("validateFixture: allowed_change_paths is accepted when declared", () => {
     "f1.json",
   );
   assert.deepEqual(fixture.allowed_change_paths, ["core/scripts/gh.ts"]);
+});
+
+// --- environment-fidelity contract (eval-fixture-contract, #535) ---
+
+function validEnvDep(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    name: "github-api",
+    mode: "simulated",
+    version: "1",
+    required_permissions: [],
+    initial_state: { issues: [] },
+    expected: { outputs: "an issue list" },
+    setup: "seed a fake issues.json",
+    teardown: "none",
+    ...overrides,
+  };
+}
+
+test("validateFixture: a fixture declaring no environment entries stays valid", () => {
+  const fixture = validateFixture(validFixtureRaw(), "f1.json");
+  assert.equal(fixture.environment, undefined);
+  assert.equal(typeof fixture.env_surface_hash, "string");
+  assert.ok(fixture.env_surface_hash.length > 0);
+});
+
+test("validateFixture: a complete environment dependency is accepted and its mode exposed", () => {
+  const fixture = validateFixture(validFixtureRaw({ environment: [validEnvDep()] }), "f1.json");
+  assert.equal(fixture.environment?.[0].name, "github-api");
+  assert.equal(fixture.environment?.[0].mode, "simulated");
+});
+
+test("validateFixture: an unknown environment dependency mode is rejected by name", () => {
+  assert.throws(
+    () => validateFixture(validFixtureRaw({ environment: [validEnvDep({ mode: "made-up" })] }), "f1.json"),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /github-api/.test((err as Error).message) &&
+      /mode/.test((err as Error).message),
+  );
+});
+
+for (const missingField of ["version", "required_permissions", "initial_state", "expected", "setup", "teardown"]) {
+  test(`validateFixture: an environment dependency missing "${missingField}" is rejected naming the fixture and field`, () => {
+    const dep = validEnvDep();
+    delete dep[missingField];
+    assert.throws(
+      () => validateFixture(validFixtureRaw({ environment: [dep] }), "f1.json"),
+      (err: unknown) =>
+        err instanceof FixtureValidationError &&
+        /github-api/.test((err as Error).message) &&
+        new RegExp(missingField).test((err as Error).message),
+    );
+  });
+}
+
+test("validateFixture: a capability_surface snapshot is accepted when complete", () => {
+  const fixture = validateFixture(
+    validFixtureRaw({
+      capability_surface: {
+        stage: "review",
+        materialized_prompts: ["review this diff"],
+        harness_config: { harness: "claude" },
+        tools_hooks: ["Read"],
+        repo_paths: ["core/scripts/evals/fixture.ts"],
+        services_data: ["github-api"],
+      },
+    }),
+    "f1.json",
+  );
+  assert.equal(fixture.capability_surface?.stage, "review");
+});
+
+test("validateFixture: an incomplete capability_surface is rejected", () => {
+  assert.throws(
+    () => validateFixture(validFixtureRaw({ capability_surface: { stage: "review" } }), "f1.json"),
+    FixtureValidationError,
+  );
+});
+
+test("computeEnvSurfaceHash: identical environment + surface hash identically", () => {
+  const env = [validEnvDep()] as Parameters<typeof computeEnvSurfaceHash>[0];
+  const surface = { stage: "review", materialized_prompts: [], harness_config: {}, tools_hooks: [], repo_paths: [], services_data: [] } as Parameters<typeof computeEnvSurfaceHash>[1];
+  assert.equal(computeEnvSurfaceHash(env, surface), computeEnvSurfaceHash(env, surface));
+});
+
+test("computeEnvSurfaceHash: a single dependency mode change changes the hash", () => {
+  const hashA = computeEnvSurfaceHash([validEnvDep() as any], undefined);
+  const hashB = computeEnvSurfaceHash([validEnvDep({ mode: "live" }) as any], undefined);
+  assert.notEqual(hashA, hashB);
+});
+
+test("computeEnvSurfaceHash: both fixtures absent environment/surface hash identically (stable baseline)", () => {
+  assert.equal(computeEnvSurfaceHash(undefined, undefined), computeEnvSurfaceHash(undefined, undefined));
+});
+
+test("validateFixture: two fixtures identical except one dependency's mode produce different env_surface_hash", () => {
+  const f1 = validateFixture(validFixtureRaw({ environment: [validEnvDep()] }), "f1.json");
+  const f2 = validateFixture(validFixtureRaw({ environment: [validEnvDep({ mode: "live" })] }), "f1.json");
+  assert.notEqual(f1.env_surface_hash, f2.env_surface_hash);
 });

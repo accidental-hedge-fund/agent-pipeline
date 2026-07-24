@@ -289,9 +289,12 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
   // it replays frozen fixtures offline. `pipeline evals plan|run <manifest>`;
   // `pipeline evals grade|report <experiment-dir>` (#433) grade/report only
   // read/write files under the experiment dir — never a pipeline gate.
+  // `pipeline evals harvest <request.json>` (#535) is draft-only by default;
+  // `--apply`/`--plan-only`/`--out` gate/steer the harvest workflow's own
+  // repo-local fixture write — never a GitHub write.
   evals: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "base", "profile", "fixtures", "baseline", "judge"]),
+    allowedFlags: new Set(["repoPath", "base", "profile", "fixtures", "baseline", "judge", "apply", "planOnly", "out"]),
     needsConfig: true,
     needsGhAuth: false,
     mutatesGitHub: false,

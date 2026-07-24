@@ -4,16 +4,21 @@
 // real runtime check, not a compile-time one.
 
 import * as fs from "node:fs";
+import { createHash } from "node:crypto";
 import {
+  ENVIRONMENT_DEPENDENCY_MODES,
   EVAL_STAGE_NAMES,
   SUPPORTED_FIXTURE_SCHEMA_VERSIONS,
   SUPPORTED_GRADER_VERSIONS,
   type AcceptanceCriterion,
+  type CapabilitySurfaceInventory,
+  type EnvironmentDependency,
   type EvalStageName,
   type Fixture,
   type GraderRef,
   type SeededDefect,
 } from "./types.ts";
+import { stableStringify } from "./manifest.ts";
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
 
@@ -273,6 +278,21 @@ export function validateFixture(raw: unknown, sourcePath: string): Fixture {
     );
   }
 
+  const environmentRaw = obj.environment;
+  let environment: EnvironmentDependency[] | undefined;
+  if (environmentRaw !== undefined) {
+    if (!Array.isArray(environmentRaw)) {
+      throw new FixtureValidationError(fixtureId, "environment", "must be an array when present");
+    }
+    environment = environmentRaw.map((raw, idx) => validateEnvironmentDependency(fixtureId, raw, idx));
+  }
+
+  const capabilitySurfaceRaw = obj.capability_surface;
+  let capabilitySurface: CapabilitySurfaceInventory | undefined;
+  if (capabilitySurfaceRaw !== undefined) {
+    capabilitySurface = validateCapabilitySurface(fixtureId, capabilitySurfaceRaw);
+  }
+
   return {
     fixture_id: fixtureId,
     schema_version: schemaVersion,
@@ -288,7 +308,105 @@ export function validateFixture(raw: unknown, sourcePath: string): Fixture {
     category: obj.category as string,
     risk: obj.risk as string,
     provenance,
+    environment,
+    capability_surface: capabilitySurface,
+    env_surface_hash: computeEnvSurfaceHash(environment, capabilitySurface),
   };
+}
+
+/** Validate one `environment` dependency entry, rejecting an unknown `mode`
+ *  or a missing required field by name (eval-fixture-contract #535) —
+ *  mirroring the existing seeded-defect/acceptance-criterion rejection style. */
+function validateEnvironmentDependency(fixtureId: string, raw: unknown, idx: number): EnvironmentDependency {
+  if (typeof raw !== "object" || raw === null) {
+    throw new FixtureValidationError(fixtureId, "environment", `entry ${idx} must be an object`);
+  }
+  const d = raw as Record<string, unknown>;
+  const name = d.name;
+  if (typeof name !== "string" || name.length === 0) {
+    throw new FixtureValidationError(fixtureId, "environment", `entry ${idx} is missing "name"`);
+  }
+  const fail = (field: string, detail: string): never => {
+    throw new FixtureValidationError(fixtureId, "environment", `dependency ${JSON.stringify(name)} ${detail} (field "${field}")`);
+  };
+  const mode = d.mode;
+  if (typeof mode !== "string" || !(ENVIRONMENT_DEPENDENCY_MODES as readonly string[]).includes(mode)) {
+    fail("mode", `has an unknown mode ${JSON.stringify(mode)} (expected one of: ${ENVIRONMENT_DEPENDENCY_MODES.join(", ")})`);
+  }
+  if (typeof d.version !== "string" || d.version.length === 0) {
+    fail("version", 'is missing a required non-empty "version"');
+  }
+  if (!Array.isArray(d.required_permissions) || d.required_permissions.some((p) => typeof p !== "string")) {
+    fail("required_permissions", 'is missing a required string[] "required_permissions"');
+  }
+  if (!("initial_state" in d)) {
+    fail("initial_state", 'is missing a required "initial_state"');
+  }
+  if (typeof d.expected !== "object" || d.expected === null || Array.isArray(d.expected)) {
+    fail("expected", 'is missing a required "expected" object');
+  }
+  if (typeof d.setup !== "string" || d.setup.length === 0) {
+    fail("setup", 'is missing a required non-empty "setup"');
+  }
+  if (typeof d.teardown !== "string" || d.teardown.length === 0) {
+    fail("teardown", 'is missing a required non-empty "teardown"');
+  }
+  return {
+    name,
+    mode: mode as EnvironmentDependency["mode"],
+    version: d.version as string,
+    required_permissions: d.required_permissions as string[],
+    initial_state: d.initial_state,
+    expected: d.expected as { outputs?: unknown; errors?: unknown },
+    setup: d.setup as string,
+    teardown: d.teardown as string,
+  };
+}
+
+/** Validate an (optional) resolved capability-surface snapshot embedded on a
+ *  harvested fixture (eval-fixture-harvest #535). */
+function validateCapabilitySurface(fixtureId: string, raw: unknown): CapabilitySurfaceInventory {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new FixtureValidationError(fixtureId, "capability_surface", "must be an object when present");
+  }
+  const s = raw as Record<string, unknown>;
+  const requireStringArrayField = (field: string): string[] => {
+    const v = s[field];
+    if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) {
+      throw new FixtureValidationError(fixtureId, "capability_surface", `is missing a required string[] "${field}"`);
+    }
+    return v;
+  };
+  if (typeof s.stage !== "string" || s.stage.length === 0) {
+    throw new FixtureValidationError(fixtureId, "capability_surface", 'is missing a required non-empty "stage"');
+  }
+  const materializedPrompts = requireStringArrayField("materialized_prompts");
+  if (typeof s.harness_config !== "object" || s.harness_config === null || Array.isArray(s.harness_config)) {
+    throw new FixtureValidationError(fixtureId, "capability_surface", 'is missing a required object "harness_config"');
+  }
+  const toolsHooks = requireStringArrayField("tools_hooks");
+  const repoPaths = requireStringArrayField("repo_paths");
+  const servicesData = requireStringArrayField("services_data");
+  return {
+    stage: s.stage,
+    materialized_prompts: materializedPrompts,
+    harness_config: s.harness_config as Record<string, unknown>,
+    tools_hooks: toolsHooks,
+    repo_paths: repoPaths,
+    services_data: servicesData,
+  };
+}
+
+/** Provenance hash over the resolved environment-fidelity contract plus the
+ *  resolved capability-surface inventory (eval-fixture-contract #535).
+ *  Identical inputs (including "both absent") hash identically; a single
+ *  dependency-mode or surface difference changes the hash. */
+export function computeEnvSurfaceHash(
+  environment: EnvironmentDependency[] | undefined,
+  capabilitySurface: CapabilitySurfaceInventory | undefined,
+): string {
+  const basis = stableStringify({ environment: environment ?? [], capability_surface: capabilitySurface ?? null });
+  return createHash("sha256").update(basis).digest("hex");
 }
 
 /** Validate that a fixture declares stage-entry artifacts for the given stage.

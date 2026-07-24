@@ -16,7 +16,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildCmd, type CliOpts } from "../scripts/pipeline.ts";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { buildCmd, resolveHarvestOutPath, resolveHarvestFixturesDir, type CliOpts } from "../scripts/pipeline.ts";
 import { lookupCommand, validateFlags, COMMAND_REGISTRY } from "../scripts/command-registry.ts";
 
 // ---------------------------------------------------------------------------
@@ -462,4 +465,114 @@ test("pipeline-cli: lookupCommand('papercut') resolves to the registry entry", (
 
 test("pipeline-cli: papercut with an unsupported flag → validateFlags returns the offending key", () => {
   assert.deepEqual(roundTrip(["papercut", "--run", "419-x", "-m", "note", "--dry-run"]), ["dryRun"]);
+});
+
+// --- evals harvest (#535): 'evals <subcommand> <path>' is 3 positionals ---
+
+test("pipeline-cli: 'evals harvest request.json' parses all three positionals (evals, harvest, path)", () => {
+  const { numArg, numArg0 } = parseCli(["evals", "harvest", "request.json"]);
+  assert.equal(numArg, "evals");
+  assert.equal(numArg0, "evals");
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "evals", "harvest", "request.json"]);
+  assert.deepEqual(cmd.args, ["evals", "harvest", "request.json"]);
+});
+
+test("pipeline-cli: 'evals harvest request.json --apply --plan-only --out draft.json' parses options", () => {
+  const { opts } = parseCli(["evals", "harvest", "request.json", "--apply", "--plan-only", "--out", "draft.json"]);
+  assert.equal(opts.apply, true);
+  assert.equal((opts as unknown as { planOnly?: boolean }).planOnly, true);
+  assert.equal((opts as unknown as { out?: string }).out, "draft.json");
+});
+
+// --- resolveHarvestOutPath (#535 review 1 finding a97dc21a): --out is a
+// repository write and must require the explicit --apply approval action ---
+
+test("resolveHarvestOutPath: no --out prints to stdout regardless of --apply", () => {
+  assert.deepEqual(resolveHarvestOutPath("/repo", undefined, false), { ok: true });
+  assert.deepEqual(resolveHarvestOutPath("/repo", undefined, true), { ok: true });
+});
+
+test("resolveHarvestOutPath: --out without --apply is refused — never writes without approval", () => {
+  const result = resolveHarvestOutPath("/repo", "draft.json", false);
+  assert.equal(result.ok, false);
+  assert.match((result as { error: string }).error, /--apply/);
+});
+
+test("resolveHarvestOutPath: --out with --apply resolves within the repository", () => {
+  const result = resolveHarvestOutPath("/repo", "draft.json", true);
+  assert.deepEqual(result, { ok: true, path: "/repo/draft.json" });
+});
+
+test("resolveHarvestOutPath: an absolute --out path escaping the repository is refused even with --apply", () => {
+  const result = resolveHarvestOutPath("/repo", "/etc/passwd", true);
+  assert.equal(result.ok, false);
+  assert.match((result as { error: string }).error, /within the repository/);
+});
+
+test("resolveHarvestOutPath: a '..'-escaping --out path is refused even with --apply", () => {
+  const result = resolveHarvestOutPath("/repo", "../../etc/passwd", true);
+  assert.equal(result.ok, false);
+  assert.match((result as { error: string }).error, /within the repository/);
+});
+
+// --- symlink-escape containment (#535 review 2 finding aa79c7b7): a
+// lexically-inside path can still real-resolve outside the repository via a
+// repository-local symlink. Uses a real temp directory tree so realpathSync
+// actually has something to resolve. ---
+
+function makeRepoWithEscapingSymlink(): { repoDir: string; outsideDir: string; cleanup: () => void } {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-harvest-symlink-"));
+  const repoDir = fs.realpathSync(fs.mkdtempSync(path.join(root, "repo-")));
+  const outsideDir = fs.realpathSync(fs.mkdtempSync(path.join(root, "outside-")));
+  fs.symlinkSync(outsideDir, path.join(repoDir, "escape-link"));
+  return { repoDir, outsideDir, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
+}
+
+test("resolveHarvestOutPath: a repository-local symlink escaping the repository is refused even with --apply", () => {
+  const { repoDir, cleanup } = makeRepoWithEscapingSymlink();
+  try {
+    const result = resolveHarvestOutPath(repoDir, "escape-link/draft.json", true);
+    assert.equal(result.ok, false);
+    assert.match((result as { error: string }).error, /within the repository/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("resolveHarvestOutPath: a non-symlinked path within a real repository directory is still accepted", () => {
+  const { repoDir, cleanup } = makeRepoWithEscapingSymlink();
+  try {
+    const result = resolveHarvestOutPath(repoDir, "draft.json", true);
+    assert.deepEqual(result, { ok: true, path: path.join(repoDir, "draft.json") });
+  } finally {
+    cleanup();
+  }
+});
+
+// --- resolveHarvestFixturesDir (#535 review 2 finding aa79c7b7): harvest
+// promotion's write destination must be constrained the same way --out is —
+// an absolute/escaping/symlink-escaping --fixtures must never be a valid
+// promotion target. ---
+
+test("resolveHarvestFixturesDir: a fixtures dir within the repository is accepted", () => {
+  const result = resolveHarvestFixturesDir("/repo", "/repo/core/evals/fixtures");
+  assert.deepEqual(result, { ok: true });
+});
+
+test("resolveHarvestFixturesDir: an absolute fixtures dir outside the repository is refused", () => {
+  const result = resolveHarvestFixturesDir("/repo", "/etc/fixtures");
+  assert.equal(result.ok, false);
+  assert.match((result as { error: string }).error, /within the repository/);
+});
+
+test("resolveHarvestFixturesDir: a repository-local symlink escaping the repository is refused", () => {
+  const { repoDir, cleanup } = makeRepoWithEscapingSymlink();
+  try {
+    const result = resolveHarvestFixturesDir(repoDir, path.join(repoDir, "escape-link", "fixtures"));
+    assert.equal(result.ok, false);
+    assert.match((result as { error: string }).error, /within the repository/);
+  } finally {
+    cleanup();
+  }
 });
