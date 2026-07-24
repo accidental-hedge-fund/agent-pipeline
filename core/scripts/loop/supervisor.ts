@@ -392,6 +392,13 @@ export async function runSupervisorCycle(
     done_definition: contract.done_definition,
     run_id: runId,
   });
+  // Captured before dispatch so the zero-transition safety net below (#568
+  // review 2 finding 8bb189a0) can query the issue's label-add history for
+  // anything that happened *during* this dispatch, rather than inferring
+  // "zero transitions" from equal before/after stage snapshots — a
+  // round-trip (e.g. backlog -> ready -> backlog) defeats snapshot equality
+  // but never predates this timestamp.
+  const dispatchStartedAt = deps.observe.now();
   const settled = await Promise.allSettled(activeItemIds.map((itemId) => deps.dispatchItem(buildRequest(itemId))));
 
   // With exactly one active item — the serialized default — a rejection is rethrown synchronously
@@ -549,14 +556,17 @@ export async function runSupervisorCycle(
         try {
           const issue = await deps.observe.getIssueStateAndLabels(Number(itemId));
           const observedStage = pipelineStageFromLabels(issue?.labels ?? []);
-          // Zero-transition check (#568 review 1, finding eb82a1de): a pre-pipeline outcome is
-          // only a genuine no-op when the dispatch made zero stage transitions — the stage
-          // observed by *this cycle's* reconciliation (captured before dispatch, above) must
-          // match the stage observed just now (after dispatch). A dispatch that progressed and
-          // then failed, or whose label was moved back to backlog mid-dispatch, differs between
-          // the two and must remain a genuine `workflow-engine-defect` below.
-          const preDispatchStage = ledger.last_reconciliation?.observed[itemId]?.pipeline_stage ?? undefined;
-          const zeroTransitions = preDispatchStage !== undefined && preDispatchStage === observedStage;
+          // Zero-transition check (#568 review 2, finding 8bb189a0): a pre-pipeline outcome is
+          // only a genuine no-op when the dispatch made zero stage transitions. Comparing only
+          // the before/after stage snapshots is insufficient — a dispatch that round-trips
+          // (e.g. backlog -> ready -> backlog) before failing would show equal endpoints despite
+          // a real transition occurring. Instead, query the issue's authoritative label-add
+          // history and require it contain nothing at or after `dispatchStartedAt` — the moment
+          // this cycle's dispatch call was issued.
+          const labelEvents = await deps.observe.getLabelEvents(Number(itemId));
+          const zeroTransitions = labelEvents.every(
+            (event) => new Date(event.createdAt).getTime() < dispatchStartedAt.getTime(),
+          );
           if (isPrePipelineStage(observedStage) && zeroTransitions) {
             preconditionNoOp = true;
             const exclusion = buildPreconditionExclusion(itemId, observedStage);

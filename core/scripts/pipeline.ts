@@ -136,6 +136,7 @@ import { auditSupervisor, driveSupervisor, type SupervisorDeps } from "./loop/su
 import {
   defaultLoopStoreDeps,
   markRunSuperseded,
+  readContract,
   readLedger,
   resolveSupersessionChainHead,
   runExists as loopRunExists,
@@ -761,6 +762,53 @@ export function decideNewRunSupersession(
   return { kind: "mint", newRunId: `${canonicalRunId}-s${chainLength + 1}` };
 }
 
+export interface SupersessionMintPlan {
+  /** Initialize the replacement run directory — only when it does not already exist. */
+  initNewRun: boolean;
+  /** Write the retired run's `superseded_by` pointer — only when it is not already correctly set. */
+  markSuperseded: boolean;
+}
+
+export type SupersessionMintRepairDecision =
+  | { kind: "plan"; plan: SupersessionMintPlan }
+  | { kind: "conflict"; message: string };
+
+/** Pure decision step for `--new-run`'s mint retry (#568 review 2, finding d4cbf5eb): a crash
+ *  between initializing the replacement run and writing the retired run's `superseded_by`
+ *  pointer must self-heal on the next `--new-run` invocation rather than wedge the chain
+ *  forever. Live state is read once by the caller and passed in here so this decision — same
+ *  pattern as {@link decideNewRunSupersession} — stays a pure function with no I/O of its own:
+ *  every branch is driven only by what already exists, never re-derived from a fresh read. */
+export function planSupersessionMintRepair(input: {
+  headRunId: string;
+  newRunId: string;
+  newRunExists: boolean;
+  /** The existing replacement run's `contract.supersedes`, when `newRunExists` is true. */
+  existingNewRunSupersedes: string | undefined;
+  /** The retired run's current ledger `superseded_by` pointer, if any. */
+  headSupersededBy: string | undefined;
+}): SupersessionMintRepairDecision {
+  if (input.newRunExists && input.existingNewRunSupersedes !== input.headRunId) {
+    return {
+      kind: "conflict",
+      message: `--new-run: existing run "${input.newRunId}" supersedes "${input.existingNewRunSupersedes}", not "${input.headRunId}" — supersession chain conflict`,
+    };
+  }
+  if (input.headSupersededBy && input.headSupersededBy !== input.newRunId) {
+    return {
+      kind: "conflict",
+      message: `--new-run: run "${input.headRunId}" is already superseded by "${input.headSupersededBy}", not "${input.newRunId}" — supersession chain conflict`,
+    };
+  }
+  return {
+    kind: "plan",
+    plan: {
+      initNewRun: !input.newRunExists,
+      markSuperseded: !input.headSupersededBy,
+    },
+  };
+}
+
 /** Drives (or audits) the in-repo supervisor for an already-passed preflight —
  *  the replacement for the former external-skill delegation payload (#512).
  *  `--audit` performs zero durable writes (it never resolves gh config); a
@@ -825,10 +873,31 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
         runId = headRunId;
       } else {
         const newRunId = decision.newRunId;
-        if (!(await loopRunExists(store, newRunId))) {
+        // Re-derive the repair plan from live state on every mint attempt — including a retry
+        // where `newRunId` already exists — rather than gating the reverse-pointer write on
+        // `newRunId` not yet existing (#568 review 2 finding d4cbf5eb): a crash between
+        // initializing the replacement and writing the retired run's `superseded_by` pointer
+        // would otherwise wedge the chain forever, since resolveSupersessionChainHead only
+        // trusts the retired ledger's own pointer.
+        const newRunExists = await loopRunExists(store, newRunId);
+        const existingNewRunSupersedes = newRunExists ? (await readContract(store, newRunId)).supersedes : undefined;
+        const headLedgerNow = await readLedger(store, headRunId);
+        const repair = planSupersessionMintRepair({
+          headRunId,
+          newRunId,
+          newRunExists,
+          existingNewRunSupersedes,
+          headSupersededBy: headLedgerNow.superseded_by,
+        });
+        if (repair.kind === "conflict") {
+          return { kind: "error", message: repair.message };
+        }
+        if (repair.plan.initNewRun) {
           const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, newRunId);
           contract.supersedes = headRunId;
           await initRecoverableRun(store, contract, ledger);
+        }
+        if (repair.plan.markSuperseded) {
           await markRunSuperseded(store, headRunId, newRunId);
         }
         runId = newRunId;

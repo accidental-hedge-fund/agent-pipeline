@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { runLoopCommand, buildCmd, decideNewRunSupersession, type CliOpts, type LoopCliDeps } from "../scripts/pipeline.ts";
+import { runLoopCommand, buildCmd, decideNewRunSupersession, planSupersessionMintRepair, type CliOpts, type LoopCliDeps } from "../scripts/pipeline.ts";
 import { runLoopPreflight as realRunLoopPreflight, type LoopPreflightOutcome } from "../scripts/loop-preflight.ts";
 import type { DoctorDeps } from "../scripts/stages/doctor.ts";
 import { COMMAND_REGISTRY } from "../scripts/command-registry.ts";
@@ -272,4 +272,66 @@ test("regression (#568 review 1, finding b9472740): re-invoking --new-run agains
 test("decideNewRunSupersession — a genuinely active canonical run with no prior supersession is refused, not resumed or minted", () => {
   const decision = decideNewRunSupersession("run-1", 0, false);
   assert.deepEqual(decision, { kind: "refuse" });
+});
+
+// ---------------------------------------------------------------------------
+// planSupersessionMintRepair (#568 review 2, finding d4cbf5eb): a crash between
+// initializing the replacement run and writing the retired run's superseded_by
+// pointer must self-heal on the next --new-run invocation instead of wedging
+// the supersession chain forever.
+// ---------------------------------------------------------------------------
+
+test("planSupersessionMintRepair — a fresh mint plans to both initialize the replacement and link the retired run", () => {
+  const decision = planSupersessionMintRepair({
+    headRunId: "run-1",
+    newRunId: "run-1-s1",
+    newRunExists: false,
+    existingNewRunSupersedes: undefined,
+    headSupersededBy: undefined,
+  });
+  assert.deepEqual(decision, { kind: "plan", plan: { initNewRun: true, markSuperseded: true } });
+});
+
+test("regression (#568 review 2, finding d4cbf5eb): a retry after the replacement was initialized but the reverse pointer write was interrupted repairs the pointer without re-initializing", () => {
+  const decision = planSupersessionMintRepair({
+    headRunId: "run-1",
+    newRunId: "run-1-s1",
+    newRunExists: true,
+    existingNewRunSupersedes: "run-1",
+    headSupersededBy: undefined,
+  });
+  assert.deepEqual(decision, { kind: "plan", plan: { initNewRun: false, markSuperseded: true } });
+});
+
+test("planSupersessionMintRepair — a fully completed mint retried again is a pure no-op", () => {
+  const decision = planSupersessionMintRepair({
+    headRunId: "run-1",
+    newRunId: "run-1-s1",
+    newRunExists: true,
+    existingNewRunSupersedes: "run-1",
+    headSupersededBy: "run-1-s1",
+  });
+  assert.deepEqual(decision, { kind: "plan", plan: { initNewRun: false, markSuperseded: false } });
+});
+
+test("planSupersessionMintRepair — an existing replacement run that supersedes a different head is a conflict, never silently overwritten", () => {
+  const decision = planSupersessionMintRepair({
+    headRunId: "run-1",
+    newRunId: "run-1-s1",
+    newRunExists: true,
+    existingNewRunSupersedes: "run-0",
+    headSupersededBy: undefined,
+  });
+  assert.equal(decision.kind, "conflict");
+});
+
+test("planSupersessionMintRepair — a retired run already superseded by a different run is a conflict, never silently overwritten", () => {
+  const decision = planSupersessionMintRepair({
+    headRunId: "run-1",
+    newRunId: "run-1-s2",
+    newRunExists: false,
+    existingNewRunSupersedes: undefined,
+    headSupersededBy: "run-1-s1",
+  });
+  assert.equal(decision.kind, "conflict");
 });
