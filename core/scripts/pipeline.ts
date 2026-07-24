@@ -406,6 +406,8 @@ export function buildCmd(): Command {
     .option("--fixtures <dir>", "evals: directory of fixture JSON files (default: core/evals/fixtures)")
     .option("--baseline <treatment_id>", "evals report: the treatment_id every paired delta is computed against (required)")
     .option("--judge", "evals grade: opt in to the optional model judge (disabled by default; recorded separately from deterministic grades)")
+    .option("--out <path>", "evals harvest: write the rendered draft JSON to this path instead of stdout")
+    .option("--plan-only", "evals harvest --apply: additionally prove the promoted draft expands into an executable cell plan (no live model call, no production GitHub write)")
     .option("--top <n>", "improve: emit top-N clusters in the report (default: 5)", Number)
     .option("--min-occurrences <n>", "improve: only create issues for clusters with at least this many occurrences (default: 3, 2 for the correction category; requires --apply)", Number)
     .option("--interventions", "improve: print an intervention summary as JSON instead of the cluster report")
@@ -1253,7 +1255,8 @@ async function main(): Promise<void> {
   // already returned above. `sweep` is a bulk command with no issue number —
   // extra positionals are always a mistake. Catches e.g. "pipeline 123 config validate" (#156).
   // `status <N>` takes two positionals; `unblock <N> "<answer>"` and
-  // `override <N> "<spec>"` take three.
+  // `override <N> "<spec>"` take three, as does `evals <subcommand>
+  // <manifest.json|experiment-dir|harvest-request.json>` (#535).
   const maxPositionals =
     cmd.args[0] === "run" ||
     cmd.args[0] === "release" ||
@@ -1264,7 +1267,7 @@ async function main(): Promise<void> {
     cmd.args[0] === "papercut" ||
     cmd.args[0] === "correction"
       ? 2
-      : cmd.args[0] === "unblock" || cmd.args[0] === "override"
+      : cmd.args[0] === "unblock" || cmd.args[0] === "override" || cmd.args[0] === "evals"
       ? 3
       : 1; // refine-spec takes only flags (no extra positionals)
   if (cmd.args.length > maxPositionals) {
@@ -1658,17 +1661,18 @@ async function main(): Promise<void> {
   if (numArg === "evals") {
     const evalsSub = cmd.args[1];
     const pathArg = cmd.args[2];
-    if (evalsSub !== "plan" && evalsSub !== "run" && evalsSub !== "grade" && evalsSub !== "report") {
+    if (evalsSub !== "plan" && evalsSub !== "run" && evalsSub !== "grade" && evalsSub !== "report" && evalsSub !== "harvest") {
       console.error(
-        'pipeline evals: expected a subcommand — "plan", "run", "grade", or "report".\n' +
+        'pipeline evals: expected a subcommand — "plan", "run", "grade", "report", or "harvest".\n' +
           "  Usage: pipeline evals <plan|run> <manifest.json>\n" +
           "         pipeline evals grade <experiment-dir> [--judge]\n" +
-          "         pipeline evals report <experiment-dir> --baseline <treatment_id>",
+          "         pipeline evals report <experiment-dir> --baseline <treatment_id>\n" +
+          "         pipeline evals harvest <harvest-request.json> [--out <path>] [--apply] [--plan-only]",
       );
       process.exit(2);
     }
     if (!pathArg) {
-      const argName = evalsSub === "grade" || evalsSub === "report" ? "<experiment-dir>" : "<manifest.json>";
+      const argName = evalsSub === "grade" || evalsSub === "report" ? "<experiment-dir>" : evalsSub === "harvest" ? "<harvest-request.json>" : "<manifest.json>";
       console.error(`pipeline evals ${evalsSub}: a ${argName} argument is required.`);
       process.exit(2);
     }
@@ -1680,6 +1684,39 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     const fixturesDir = path.resolve(evalsCfg.repo_dir, opts.fixtures ?? "core/evals/fixtures");
+
+    // `pipeline evals harvest` (#535): draft-only by default — never queues,
+    // advances, overrides, merges, or deploys, and makes no GitHub call of
+    // any kind (harvest.ts imports no gh.ts function). A repository write
+    // requires the explicit --apply flag shared with roadmap/sweep/improve.
+    if (evalsSub === "harvest") {
+      try {
+        const requestPath = path.resolve(evalsCfg.repo_dir, pathArg);
+        const request = JSON.parse(readFileSync(requestPath, "utf8"));
+        const { renderDraft, promoteDraft } = await import("./evals/harvest.ts");
+        const draft = renderDraft(request);
+        const draftJson = `${JSON.stringify({ fixture: draft.raw, ability: draft.ability, surface: draft.surface }, null, 2)}\n`;
+        if (opts.out) {
+          writeFileSync(path.resolve(evalsCfg.repo_dir, opts.out), draftJson);
+        } else {
+          console.log(draftJson);
+        }
+        if (opts.apply) {
+          const result = await promoteDraft(draft, fixturesDir, { apply: true, planOnly: !!opts.planOnly });
+          console.log(`pipeline evals harvest: promoted fixture "${draft.fixture.fixture_id}" to ${result.fixturePath}`);
+          if (result.plan) {
+            console.log(`pipeline evals harvest: plan-only proof expanded ${result.plan.cells.length} cell(s) — no live model call, no production GitHub write`);
+          }
+        } else {
+          console.log(`pipeline evals harvest: draft-only (pass --apply to promote fixture "${draft.fixture.fixture_id}" into ${fixturesDir})`);
+        }
+      } catch (err) {
+        console.error(`pipeline evals harvest: ${(err as Error).message}`);
+        process.exit(1);
+      }
+      return;
+    }
+
     try {
       if (evalsSub === "plan" || evalsSub === "run") {
         const manifestPath = path.resolve(evalsCfg.repo_dir, pathArg);

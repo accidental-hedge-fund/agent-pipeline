@@ -102,7 +102,7 @@ test("runExperiment: executes the full matrix, writes join keys, and performs ze
     assert.equal(executed.length, 2, `mode=${mode}`);
     for (const record of executed) {
       assert.equal(record.result_class, "completed");
-      for (const key of ["experiment_id", "fixture_id", "treatment_id", "replicate", "prompt_hash", "config_hash", "base_sha"]) {
+      for (const key of ["experiment_id", "fixture_id", "treatment_id", "replicate", "prompt_hash", "config_hash", "base_sha", "env_surface_hash"]) {
         assert.ok(key in record, `mode=${mode}: record missing ${key}`);
       }
     }
@@ -112,6 +112,50 @@ test("runExperiment: executes the full matrix, writes join keys, and performs ze
     assert.ok(!outFiles.has(path.join(dir, "failures.jsonl")), `mode=${mode}: no failures expected`);
     void refusalCounts;
   }
+});
+
+test("runExperiment: cell records carry the fixture's env_surface_hash, which differs when a dependency mode differs (#535)", async () => {
+  const fixtureWithEnv = (mode: string) =>
+    JSON.stringify({
+      fixture_id: "f1",
+      schema_version: 1,
+      base_commit: SHA,
+      task_input: "task",
+      stage_entry_artifacts: { review: { x: 1 } },
+      public_checks: [],
+      grader_refs: [],
+      category: "c",
+      risk: "low",
+      provenance: "synthetic",
+      environment: [
+        {
+          name: "github-api",
+          mode,
+          version: "1",
+          required_permissions: [],
+          initial_state: {},
+          expected: {},
+          setup: "seed",
+          teardown: "none",
+        },
+      ],
+    });
+  const cellExecution: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 }),
+  };
+  const manifest = makeManifestFile({ treatments: { harness: ["claude"] } });
+
+  const { deps: depsSimulated } = makeHarness({ f1: fixtureWithEnv("simulated") }, manifest);
+  const { executed: executedSimulated } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...depsSimulated, cellExecution });
+
+  const { deps: depsLive } = makeHarness({ f1: fixtureWithEnv("live") }, manifest);
+  const { executed: executedLive } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...depsLive, cellExecution });
+
+  assert.equal(typeof executedSimulated[0].env_surface_hash, "string");
+  assert.notEqual(executedSimulated[0].env_surface_hash, executedLive[0].env_surface_hash);
 });
 
 test("runExperiment: resume executes only cells without a completed record, and never rewrites existing lines", async () => {

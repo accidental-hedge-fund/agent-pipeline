@@ -90,6 +90,7 @@ $pipeline evals plan experiment.json     expand + persist an experiment's run pl
 $pipeline evals run experiment.json      execute an experiment's cells (resumable); never writes to production GitHub
 $pipeline evals grade experiment.json/exp1   grade a completed experiment's cells; writes grades.jsonl (never gates a PR)
 $pipeline evals report experiment.json/exp1 --baseline <treatment_id>  paired comparative summary.json
+$pipeline evals harvest request.json     draft an eval fixture from sanitized run/correction evidence; --apply [--plan-only] to promote (never writes GitHub)
 $pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 
@@ -252,8 +253,9 @@ Results land under `<output_dir>/<experiment-id>/`: `manifest.json`,
 `plan.json`, `runs.jsonl` (append-only, `completed` cells only), and
 `failures.jsonl` (append-only, `infra_error` / `auth_error` / `timeout`
 cells). Every record carries `experiment_id`, `fixture_id`, `treatment_id`,
-`replicate`, `prompt_hash`, `config_hash`, and `base_sha` so a cell can be
-joined to ordinary run evidence.
+`replicate`, `prompt_hash`, `config_hash`, `base_sha`, and `env_surface_hash`
+(the fixture's environment-and-surface provenance hash, #535) so a cell can
+be joined to ordinary run evidence.
 
 ### Objective grading and comparative reporting
 
@@ -315,6 +317,32 @@ never zeroed.
 exercising every grader; the grading/reporting tests run entirely against
 checked-in synthetic fixtures and recorded cell records — no live model
 call, network request, real git operation, or subprocess spawn.
+
+### Trace-to-fixture harvesting (`evals harvest`, #535)
+
+`evals harvest <request.json>` turns sanitized evidence (a run-artifact
+excerpt, a `pipeline improve` cluster, or a `correction_event`/control
+proposal) into a **reviewable eval fixture draft**, draft-only by default —
+`--apply` promotes; `--apply --plan-only` additionally proves the promoted
+fixture expands into an executable cell plan. It is human-approved
+authoring, not autonomous test-writing: it never queues, advances,
+overrides, merges, or deploys, and makes no GitHub call at all. It resolves
+a capability-surface inventory (stage, materialized prompts, harness/model
+config, tools/hooks, repo paths, services/data), proposes exactly one
+bounded ability/failure mode (never batching evidence spanning more than
+one), and records why an eval is the right control level. Every evidence
+excerpt is sanitized (secret redaction + injection denylist) before it can
+reach a draft.
+
+Fixtures may declare `environment` dependencies (`live | simulated |
+forbidden` mode, versioned, with required permissions, initial state,
+expected outputs/errors, and deterministic setup/teardown) — default is
+`simulated`/`forbidden`; `live` requires an explicit maintainer selection
+and is never proposed by default. The resolved `environment` + capability
+surface are hashed into `env_surface_hash`, exposed off the fixture and
+carried onto every derived cell record. A maintainer can iteratively revise
+a draft before promoting; promotion always re-validates with the same
+fixture loader (an invalid draft is rejected naming the offending field).
 
 ## Setup (zero install after first run)
 

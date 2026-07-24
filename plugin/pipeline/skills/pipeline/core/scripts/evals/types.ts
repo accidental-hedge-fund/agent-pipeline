@@ -21,6 +21,41 @@ export type EvalMode = EvalStageName | "end-to-end";
 
 export type FixtureProvenance = "synthetic" | "harvested";
 
+/** The three permitted environment-fidelity modes for an external dependency
+ *  (eval-fixture-contract, eval-fixture-harvest #535). `live` is never a
+ *  default — see fixture.ts's default-mode rule and harvest.ts's explicit
+ *  maintainer-selection requirement. */
+export const ENVIRONMENT_DEPENDENCY_MODES = ["live", "simulated", "forbidden"] as const;
+export type EnvironmentDependencyMode = (typeof ENVIRONMENT_DEPENDENCY_MODES)[number];
+
+/** One external tool/service/data dependency a fixture's task may touch
+ *  (eval-fixture-contract #535). `version` is a mode identifier, not a
+ *  semver — it only needs to change when the simulation/mode itself changes,
+ *  so a mode change is detectable via `env_surface_hash`. */
+export interface EnvironmentDependency {
+  name: string;
+  mode: EnvironmentDependencyMode;
+  version: string;
+  required_permissions: string[];
+  initial_state: unknown;
+  expected: { outputs?: unknown; errors?: unknown };
+  setup: string;
+  teardown: string;
+}
+
+/** A resolved snapshot of the agent surface a candidate exercises
+ *  (eval-fixture-harvest #535) — not a free-text guess. Embedded on a
+ *  harvested fixture so `env_surface_hash` can be derived deterministically
+ *  from the fixture alone, without re-resolving live repo/git state. */
+export interface CapabilitySurfaceInventory {
+  stage: string;
+  materialized_prompts: string[];
+  harness_config: Record<string, unknown>;
+  tools_hooks: string[];
+  repo_paths: string[];
+  services_data: string[];
+}
+
 /** A seeded, ground-truth defect on a review fixture (eval-fixture-contract). */
 export interface SeededDefect {
   /** Stable, unique-within-fixture identifier. */
@@ -81,6 +116,16 @@ export interface Fixture {
   category: string;
   risk: string;
   provenance: FixtureProvenance;
+  /** Optional external tool/service/data dependencies (eval-fixture-contract
+   *  #535). Absent/empty stays valid — the common `synthetic` case. */
+  environment?: EnvironmentDependency[];
+  /** Optional resolved capability-surface snapshot (eval-fixture-harvest
+   *  #535), embedded by the harvest workflow. */
+  capability_surface?: CapabilitySurfaceInventory;
+  /** Provenance hash over the resolved `environment` + `capability_surface`
+   *  (eval-fixture-contract #535) — always computed at fixture-load time,
+   *  even for a fixture declaring neither (a stable baseline hash). */
+  env_surface_hash: string;
 }
 
 export const SUPPORTED_FIXTURE_SCHEMA_VERSIONS = [1] as const;
@@ -205,6 +250,10 @@ export interface CellRecord {
   prompt_hash: string;
   config_hash: string;
   base_sha: string;
+  /** Carried from the fixture's `env_surface_hash` (eval-fixture-contract
+   *  #535) — detects an environment/agent-surface difference between
+   *  experiment populations, alongside prompt_hash/config_hash/base_sha. */
+  env_surface_hash: string;
   result_class: CellResultClass;
   detail?: Record<string, unknown>;
   error?: string;

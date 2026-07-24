@@ -463,3 +463,21 @@ test("pipeline-cli: lookupCommand('papercut') resolves to the registry entry", (
 test("pipeline-cli: papercut with an unsupported flag → validateFlags returns the offending key", () => {
   assert.deepEqual(roundTrip(["papercut", "--run", "419-x", "-m", "note", "--dry-run"]), ["dryRun"]);
 });
+
+// --- evals harvest (#535): 'evals <subcommand> <path>' is 3 positionals ---
+
+test("pipeline-cli: 'evals harvest request.json' parses all three positionals (evals, harvest, path)", () => {
+  const { numArg, numArg0 } = parseCli(["evals", "harvest", "request.json"]);
+  assert.equal(numArg, "evals");
+  assert.equal(numArg0, "evals");
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "evals", "harvest", "request.json"]);
+  assert.deepEqual(cmd.args, ["evals", "harvest", "request.json"]);
+});
+
+test("pipeline-cli: 'evals harvest request.json --apply --plan-only --out draft.json' parses options", () => {
+  const { opts } = parseCli(["evals", "harvest", "request.json", "--apply", "--plan-only", "--out", "draft.json"]);
+  assert.equal(opts.apply, true);
+  assert.equal((opts as unknown as { planOnly?: boolean }).planOnly, true);
+  assert.equal((opts as unknown as { out?: string }).out, "draft.json");
+});

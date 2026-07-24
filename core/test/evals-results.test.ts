@@ -50,6 +50,7 @@ function makeRecord(overrides: Partial<CellRecord> = {}): CellRecord {
     prompt_hash: "hash-p",
     config_hash: "hash-c",
     base_sha: "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+    env_surface_hash: "hash-e",
     result_class: "completed",
     ...overrides,
   };
@@ -104,12 +105,12 @@ test("appendCellRecord: append-only — an existing line is never rewritten by a
   assert.ok(afterSecond.startsWith(firstLine), "the first record's bytes must be an unmodified prefix");
 });
 
-test("appendCellRecord: every record carries all seven join keys", async () => {
+test("appendCellRecord: every record carries all eight join keys", async () => {
   const { deps, files } = makeInMemoryFs();
   await appendCellRecord("/out", makeRecord(), deps);
   const dir = experimentDir("/out", "exp1");
   const parsed = JSON.parse(files.get(path.join(dir, "runs.jsonl"))!.trim());
-  for (const key of ["experiment_id", "fixture_id", "treatment_id", "replicate", "prompt_hash", "config_hash", "base_sha"]) {
+  for (const key of ["experiment_id", "fixture_id", "treatment_id", "replicate", "prompt_hash", "config_hash", "base_sha", "env_surface_hash"]) {
     assert.ok(key in parsed, `record must contain ${key}`);
   }
 });

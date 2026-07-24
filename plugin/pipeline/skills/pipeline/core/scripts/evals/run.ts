@@ -130,6 +130,7 @@ export async function runExperiment(
       prompt_hash: computePromptHash(materializedPrompt),
       config_hash: computeConfigHash(effectiveConfig),
       base_sha: cell.base_sha,
+      env_surface_hash: fixture.env_surface_hash,
       result_class: outcome.result_class,
       detail: outcome.detail,
       error: outcome.error,

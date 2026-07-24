@@ -99,6 +99,8 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline evals run <manifest.json> --fixtures <dir>  override the fixtures directory (default: core/evals/fixtures)
 /pipeline evals grade <experiment-dir>   grade a completed experiment's cells; writes grades.jsonl (never gates a PR)
 /pipeline evals report <experiment-dir> --baseline <treatment_id>  paired comparative summary.json
+/pipeline evals harvest <request.json>   draft an eval fixture from sanitized run/correction evidence (never writes; prints/writes the draft)
+/pipeline evals harvest <request.json> --apply [--plan-only]  promote a validated draft into the fixtures dir; --plan-only also proves it's executable (no live model call, no GitHub write)
 /pipeline --version                      print the package version, then exit (no number; -V alias)
 ```
 
@@ -340,8 +342,9 @@ resolved manifest as executed), `plan.json`, `runs.jsonl` (append-only,
 `completed` cells only), and `failures.jsonl` (append-only, `infra_error` /
 `auth_error` / `timeout` cells — infrastructure and auth failures are never
 counted as a treatment outcome). Every record carries `experiment_id`,
-`fixture_id`, `treatment_id`, `replicate`, `prompt_hash`, `config_hash`, and
-`base_sha` so a cell can be joined to ordinary run evidence.
+`fixture_id`, `treatment_id`, `replicate`, `prompt_hash`, `config_hash`,
+`base_sha`, and `env_surface_hash` (the fixture's environment-and-surface
+provenance hash, #535) so a cell can be joined to ordinary run evidence.
 
 Out of scope for this command: installing or authenticating provider CLIs,
 and choosing a production model/effort policy from the results — those are
@@ -436,6 +439,53 @@ exercising every grader (`fix-graded-null-guard.json`,
 the grading/reporting test suite runs entirely against checked-in synthetic
 fixtures and recorded cell records — no live model call, network request,
 real git operation, or subprocess spawn.
+
+### Trace-to-fixture harvesting (`evals harvest`, #535)
+
+`evals harvest` closes the authoring gap between recurring evidence and the
+fixture contract above: it turns sanitized evidence into a **reviewable eval
+fixture draft**, and stops there until a maintainer explicitly promotes it.
+It is a human-approved authoring workflow, not an autonomous test-writer — it
+never queues, advances, overrides, merges, or deploys anything, and makes no
+GitHub call of any kind (`harvest.ts` calls no `gh.ts` function).
+
+```bash
+/pipeline evals harvest request.json                  # draft-only (default): prints the rendered draft
+/pipeline evals harvest request.json --out draft.json # write the draft to a file instead of stdout
+/pipeline evals harvest request.json --apply           # promote: loader-validate + write into --fixtures
+/pipeline evals harvest request.json --apply --plan-only  # also prove the draft is executable (no live model, no GitHub write)
+```
+
+A **harvest request** (JSON) supplies one or more sanitized `evidence`
+entries — a normal run-artifact excerpt, a `pipeline improve` cluster, or a
+`correction_event`/control proposal (#499/#500) — plus the fixture material
+(`base_commit`, `stage_entry_artifacts`, `grader_refs`, `category`, `risk`,
+optional `environment` dependencies). The workflow resolves a
+**capability-surface inventory** (stage, materialized prompts, harness/model
+config, tools/hooks, repo paths, services/data), proposes **exactly one**
+bounded ability or failure mode (refusing to batch evidence spanning more
+than one), and records why an eval — rather than a lower/higher control
+rung — is the right control level. Every evidence excerpt is routed through
+the existing secret-redaction/injection-denylist pipeline before it can
+reach a draft.
+
+The fixture contract's `environment` field declares each external
+tool/service/data dependency with a `live | simulated | forbidden` mode: the
+default is `simulated`/`forbidden`, never `live` — setting `live` requires
+an explicit maintainer selection, and rendering refuses a draft that would
+otherwise silently default to it. The resolved `environment` +
+capability-surface inventory are hashed into an `env_surface_hash` exposed
+off the fixture and carried onto every cell record derived from it, so an
+environment or agent-surface drift is visible as a hash difference between
+experiment populations, alongside `prompt_hash`/`config_hash`/`base_sha`.
+
+A maintainer can iteratively revise the proposed ability, task, dependency
+modes, checks, or grader before promoting — each revision re-renders a
+consistent, loadable draft. Promotion always re-validates with the same
+fixture loader a hand-authored fixture goes through (an invalid draft is
+rejected naming the offending field) and, with `--plan-only`, additionally
+expands the promoted fixture into an executable cell plan to prove it works
+— reusing the pure, no-harness `plan` expansion above.
 
 ## Setup (zero install after first run)
 
