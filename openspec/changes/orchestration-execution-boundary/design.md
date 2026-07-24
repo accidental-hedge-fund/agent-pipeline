@@ -39,12 +39,22 @@ management plane is distinct from control because fleet identity and lifecycle (
 drain) evolve independently of any single run, and distinct from #503 because #503 is read-only
 observability, not a command channel.
 
-### D2 — Four envelopes, structured end-to-end
-`WorkAssignment` (control→worker), `ProgressEvent` and `ArtifactManifest` (worker→control, streaming),
-`WorkResult` (worker→control, terminal). No terminal-prose scraping: the control plane consumes typed
-fields and digests only. Each envelope carries explicit `protocolVersion` and `schemaVersion`. This
-mirrors the repo's existing preference for typed contracts over prose parsing (cf. the review verdict
-JSON schema single-source).
+### D2 — Five envelopes, structured end-to-end
+`WorkAssignment` and `CancellationDirective` (control→worker), `ProgressEvent` and `ArtifactManifest`
+(worker→control, streaming), `WorkResult` (worker→control, terminal). No terminal-prose scraping: the
+control plane consumes typed fields and digests only. Each envelope carries explicit `protocolVersion`
+and `schemaVersion`. This mirrors the repo's existing preference for typed contracts over prose parsing
+(cf. the review verdict JSON schema single-source).
+
+`CancellationDirective` is the control plane's only way to tell a worker that an in-flight assignment
+is cancelled after dispatch. It is bound to the same `assignmentId`/attempt identity and fencing token
+as the `WorkAssignment` it cancels, so a worker can never honor a directive for an assignment it no
+longer holds the lease for. A worker SHALL acknowledge receipt (or return the directive in its next
+`ProgressEvent`/`WorkResult` if it has no separate control channel to acknowledge over), and the
+control plane retries delivery until acknowledged or the lease expires. If a `WorkResult` and a
+`CancellationDirective` race, D4's fencing rule already decides the outcome: a result is only
+state-advancing while it bears the current fencing token, and the control plane marks the fencing token
+superseded as part of issuing the cancellation, so a racing terminal result cannot advance state.
 
 ### D3 — Identity is the spine of every envelope
 Every envelope carries stable `tenant / installation / run / stage / attempt` identity plus the
@@ -59,6 +69,17 @@ for a deadline; on expiry the control plane may re-assign under a **new attempt*
 The prior worker's late result is accepted only for evidence, never for advancement. This avoids the
 distributed-systems fantasy of exactly-once and matches the conservative "unknown ⇒ don't advance"
 posture used elsewhere in the engine.
+
+### D4a — Durable atomic assignment-state authority
+Fencing tokens only prevent double-advancement when their comparison and the resulting state
+transition share a single durable atomic commit boundary. The control plane therefore requires one
+durable assignment-state authority — not per-process memory — that atomically compares and commits
+assignment ownership, attempt, lease-holder, fencing token, cancellation state, and accepted
+idempotency keys together with the lifecycle transition they gate. A restarted control-plane process
+or a failed-over controller instance rehydrates exclusively from this authority before accepting or
+advancing any result; it never reconstructs "current" from in-memory state. This closes the gap a bare
+fencing-token comparison leaves open across restart/failover, where two processes could otherwise each
+believe their comparison is authoritative.
 
 ### D5 — Outbound-only, data-minimized trust boundary
 Workers initiate authenticated outbound connections; no inbound listener into customer networks is

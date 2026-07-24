@@ -2,11 +2,11 @@
 
 ### Requirement: Versioned control-to-execution envelopes
 
-The pipeline SHALL define four versioned envelopes for the control↔execution boundary —
-`WorkAssignment` (control→worker), `ProgressEvent` and `ArtifactManifest` (worker→control, streaming),
-and `WorkResult` (worker→control, terminal). Each envelope SHALL carry an explicit `protocolVersion`
-and `schemaVersion`, and the control plane SHALL consume results from typed fields and content digests
-only, never by scraping terminal prose.
+The pipeline SHALL define five versioned envelopes for the control↔execution boundary —
+`WorkAssignment` and `CancellationDirective` (control→worker), `ProgressEvent` and `ArtifactManifest`
+(worker→control, streaming), and `WorkResult` (worker→control, terminal). Each envelope SHALL carry an
+explicit `protocolVersion` and `schemaVersion`, and the control plane SHALL consume results from typed
+fields and content digests only, never by scraping terminal prose.
 
 #### Scenario: Assignment carries a stable protocol version
 
@@ -46,7 +46,11 @@ The protocol SHALL treat delivery and execution as at-least-once. Each assignmen
 idempotency key of `(assignmentId, attempt)`, a lease with a deadline, and a monotonically increasing
 fencing token issued with the lease. The control plane SHALL accept a state-advancing result only from
 the current lease holder bearing the current fencing token, and SHALL refuse any duplicate, stale, or
-superseded result for advancement while still retaining it as evidence.
+superseded result for advancement while still retaining it as evidence. Assignment ownership, accepted
+idempotency keys, cancellation state, and the fencing token SHALL be recorded in one durable assignment-
+state authority via an atomic compare-and-commit operation that also records the lifecycle transition
+each result gates; a restarted or failed-over control-plane process SHALL rehydrate "current" solely
+from that authority before accepting or advancing any result.
 
 #### Scenario: Duplicate delivery does not double-advance
 
@@ -65,6 +69,34 @@ superseded result for advancement while still retaining it as evidence.
 - **WHEN** two workers attempt to claim the same assignment concurrently
 - **THEN** at most one SHALL hold the active lease and its fencing token
 - **AND** the other's subsequent state-advancing result SHALL be refused
+
+#### Scenario: Control-plane restart or failover rehydrates from durable authority
+
+- **WHEN** a control-plane process restarts or a controller fails over to a new instance
+- **THEN** the new process SHALL rehydrate assignment ownership, fencing token, and cancellation state solely from the durable assignment-state authority
+- **AND** it SHALL NOT accept or advance a result based on any in-memory record of "current" that predates the restart or failover
+
+### Requirement: Versioned control-to-worker cancellation directive
+
+The protocol SHALL define a `CancellationDirective` envelope (control→worker) as the sole mechanism by
+which the control plane tells a worker that an already-dispatched assignment is cancelled. The
+directive SHALL be bound to the assignment's `assignmentId`, attempt identity, and fencing token. The
+control plane SHALL retry delivery of an unacknowledged directive until the worker acknowledges it (via
+a direct acknowledgement or by reflecting the directive in its next `ProgressEvent`/`WorkResult`) or the
+assignment's lease expires, and SHALL mark the assignment's fencing token superseded at the moment it
+issues the directive so a racing in-flight `WorkResult` cannot advance run state.
+
+#### Scenario: Worker learns of cancellation after dispatch
+
+- **WHEN** the control plane cancels an assignment that has already been dispatched to a worker
+- **THEN** it SHALL deliver a `CancellationDirective` bound to that assignment's `assignmentId`, attempt, and fencing token
+- **AND** it SHALL retry delivery until the worker acknowledges the directive or the lease expires
+
+#### Scenario: Cancellation directive supersedes a racing terminal result
+
+- **WHEN** the control plane issues a `CancellationDirective` for an assignment
+- **THEN** it SHALL mark that assignment's fencing token superseded at the same time
+- **AND** any `WorkResult` submitted under the prior fencing token SHALL NOT advance run/stage state
 
 ### Requirement: Capability negotiation and compatibility rules
 

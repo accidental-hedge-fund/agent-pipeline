@@ -18,11 +18,14 @@ remote transports, or any change to the current local-first default or the human
 
 ## What Changes
 
-- **A versioned control↔execution protocol seam.** Define four envelopes — `WorkAssignment`,
-  `ProgressEvent`, `ArtifactManifest`, and `WorkResult` — carrying stable
-  tenant/installation/run/stage/attempt identity, required capabilities, authorization scope, lease /
-  deadline / cancellation / idempotency / fencing metadata, input & evidence digests, and explicit
-  protocol/schema versions. Consumption of results is structured — no terminal-prose scraping.
+- **A versioned control↔execution protocol seam.** Define five envelopes — `WorkAssignment` and
+  `CancellationDirective` (control→worker), `ProgressEvent`, `ArtifactManifest`, and `WorkResult`
+  (worker→control) — carrying stable tenant/installation/run/stage/attempt identity, required
+  capabilities, authorization scope, lease / deadline / cancellation / idempotency / fencing metadata,
+  input & evidence digests, and explicit protocol/schema versions. `CancellationDirective` is the
+  defined delivery path for telling a worker an already-dispatched assignment is cancelled, bound to
+  the same assignment/attempt/fencing identity and retried until acknowledged or lease expiry.
+  Consumption of results is structured — no terminal-prose scraping.
 - **At-least-once delivery made safe.** Assignments carry idempotency keys, attempt identity, leases,
   and fencing tokens so duplicate delivery, worker failover, stale workers, and late results cannot
   double-advance or corrupt a run. Disconnect, lease expiry, worker loss, cancellation races, late
@@ -154,6 +157,15 @@ and local-adapter migration design are accepted"), the implementation is
 decomposed into these tracked follow-up issues, to be started only after this
 change merges:
 
-- **#589** — Implement the local execution adapter (reference in-process worker) to the protocol.
-- **#590** — Add the remote-VM execution worker transport (depends on #589).
-- **#591** — Add the Kubernetes worker-pool execution backend (depends on #590).
+- **#589** — Implement the local execution adapter (reference in-process worker) to the protocol
+  (`tasks.md` §1–§2: protocol envelopes and identity, default local adapter).
+- **#590** — Add the remote-VM execution worker transport. Depends on #589 **and** SHALL NOT enable any
+  remote execution path until it has itself implemented and shipped, with passing tests, the
+  prerequisite safety work this design requires before a worker can run outside the local process:
+  `tasks.md` §3 (durable atomic assignment-state authority, leases, fencing, and
+  `CancellationDirective` delivery), §4 (execution-worker runtime boundary enforcement), §5
+  (management-plane registration/authentication/capability gating), and §6 (outbound-only trust
+  boundary and data-minimization defaults). #590's own review gate blocks on those sections being
+  complete, not merely on #589 existing.
+- **#591** — Add the Kubernetes worker-pool execution backend (depends on #590, including the
+  prerequisite work #590 completes per the above).

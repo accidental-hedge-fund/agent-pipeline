@@ -6,9 +6,11 @@
 
 ## 1. Protocol envelopes and identity (control↔execution seam)
 
-- [ ] 1.1 Define the `WorkAssignment`, `ProgressEvent`, `ArtifactManifest`, and `WorkResult` envelope
-      types with explicit `protocolVersion`/`schemaVersion` and stable
+- [ ] 1.1 Define the `WorkAssignment`, `CancellationDirective`, `ProgressEvent`, `ArtifactManifest`, and
+      `WorkResult` envelope types with explicit `protocolVersion`/`schemaVersion` and stable
       `tenant`/`installation`/`run`/`stage`/`attempt`/`assignmentId` identity.
+- [ ] 1.5 Implement `CancellationDirective` delivery, retry-until-acknowledged, and the fencing-token
+      supersession that resolves a race against an in-flight `WorkResult`.
 - [ ] 1.2 Specify required capabilities, repository/environment authorization scope, and input/evidence
       digests on `WorkAssignment`.
 - [ ] 1.3 Single-source the envelope schemas (mirroring the review-verdict schema pattern) and add a
@@ -27,12 +29,16 @@
 
 ## 3. Control-plane delivery safety (idempotency, leases, fencing)
 
-- [ ] 3.1 Implement `(assignmentId, attempt)` idempotency, lease issuance with deadlines, and
-      monotonically increasing fencing tokens.
+- [ ] 3.1 Implement a durable assignment-state authority (atomic compare-and-commit) that records
+      assignment ownership, `(assignmentId, attempt)` idempotency, lease issuance with deadlines,
+      monotonically increasing fencing tokens, and cancellation state together with the lifecycle
+      transition each gates.
 - [ ] 3.2 Enforce "advance only from current lease holder with current fencing token"; retain
-      duplicate/stale/superseded results as evidence without re-advancing.
+      duplicate/stale/superseded results as evidence without re-advancing. On control-plane restart or
+      controller failover, rehydrate "current" solely from the durable authority.
 - [ ] 3.3 Tests: duplicate assignment, stale fencing token, concurrent claim, retry after partial
-      execution, late result after lease expiry, cancellation race — each biting.
+      execution, late result after lease expiry, cancellation race, control-plane restart/failover
+      recovery — each biting.
 - [ ] 3.4 Map every boundary failure mode to one deterministic outcome + machine-readable diagnostic
       (disconnect/reconnect, lease expiry, worker loss, protocol skew, partial artifact upload).
 
