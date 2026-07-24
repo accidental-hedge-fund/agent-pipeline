@@ -109,6 +109,10 @@ function draftInput(overrides: Partial<HarvestDraftInput> = {}): HarvestDraftInp
     grader_refs: [{ grader: "review", version: "1" }],
     category: "harness-reliability",
     risk: "medium",
+    surface_hints: {
+      materialized_prompts: ["review this diff for correctness"],
+      repo_paths: ["core/scripts/evals/harvest.ts"],
+    },
     ...overrides,
   };
 }
@@ -156,6 +160,33 @@ test("proposeAbility: a single harvest does not batch evidence spanning distinct
   );
 });
 
+test("proposeAbility: two distinct run-artifact failures in the same stage are not conflated into one signal", () => {
+  assert.throws(
+    () =>
+      proposeAbility([
+        runArtifactEvidence({ stage: "review", excerpt: "review harness crashed with an out-of-memory error", run_id: "run-1" }),
+        runArtifactEvidence({ stage: "review", excerpt: "review harness produced malformed JSON output", run_id: "run-2" }),
+      ]),
+    (err: unknown) => err instanceof HarvestValidationError && /distinct/.test((err as Error).message),
+  );
+});
+
+test("proposeAbility: recurrences of the identical excerpt in the same stage still group into one ability", () => {
+  const proposal = proposeAbility([
+    runArtifactEvidence({ stage: "review", run_id: "run-1", affected_items: ["run-1"] }),
+    runArtifactEvidence({ stage: "review", run_id: "run-2", affected_items: ["run-2"] }),
+  ]);
+  assert.deepEqual(proposal.affected_items.sort(), ["run-1", "run-2"]);
+});
+
+test("proposeAbility/renderDraft: evidence naming a non-eval control level is refused rather than rendered as an eval fixture", () => {
+  assert.equal(proposeAbility([correctionEventEvidence({ proposed_control: "instruction" })]).control_level, "instruction");
+  assert.throws(
+    () => renderDraft(draftInput({ evidence: [correctionEventEvidence({ proposed_control: "instruction" })] })),
+    (err: unknown) => err instanceof HarvestValidationError && /control_level/.test((err as Error).message),
+  );
+});
+
 test("sanitizeEvidence: a secret-bearing run-artifact excerpt yields only a redacted excerpt", () => {
   const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
   const evidence = runArtifactEvidence({ excerpt: `token leaked in log: ${secret}` });
@@ -174,6 +205,27 @@ test("sanitizeEvidence: an injection phrase in a correction_event's correction t
 test("renderDraft: a secret in the excerpt never reaches the rendered draft's task_input", () => {
   const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
   const draft = renderDraft(draftInput({ evidence: [runArtifactEvidence({ excerpt: `key is ${secret}` })] }));
+  assert.ok(!JSON.stringify(draft.raw).includes(secret));
+});
+
+test("renderDraft: a secret in stage_entry_artifacts is redacted at render time, before promotion or stdout", () => {
+  const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+  const draft = renderDraft(
+    draftInput({ stage_entry_artifacts: { review: { diff: `token in diff: ${secret}` } } }),
+  );
+  assert.ok(!JSON.stringify(draft.raw).includes(secret));
+  assert.match(JSON.stringify(draft.raw.stage_entry_artifacts), /\[REDACTED\]/);
+});
+
+test("renderDraft: a secret in public/hidden checks or acceptance criteria is redacted at render time", () => {
+  const secret = "sk-abcdefghijklmnopqrstuvwx0123456789";
+  const draft = renderDraft(
+    draftInput({
+      public_checks: [`curl -H "Authorization: Bearer ${secret}"`],
+      hidden_checks: [`echo ${secret}`],
+      acceptance_criteria: [{ id: "a1", statement: `must not leak ${secret}` }],
+    }),
+  );
   assert.ok(!JSON.stringify(draft.raw).includes(secret));
 });
 
@@ -200,6 +252,27 @@ test("resolveCapabilitySurface: covers all required surface dimensions", () => {
 test("resolveCapabilitySurface: throws when no stage can be resolved", () => {
   assert.throws(
     () => resolveCapabilitySurface([correctionEventEvidence({ stage: null })]),
+    HarvestValidationError,
+  );
+});
+
+test("resolveCapabilitySurface: throws rather than silently defaulting an unresolved surface when no hints are supplied", () => {
+  assert.throws(
+    () => resolveCapabilitySurface([runArtifactEvidence()]),
+    (err: unknown) => err instanceof HarvestValidationError && /materialized_prompts/.test((err as Error).message),
+  );
+});
+
+test("resolveCapabilitySurface: throws when materialized_prompts is supplied but repo_paths is omitted", () => {
+  assert.throws(
+    () => resolveCapabilitySurface([runArtifactEvidence()], { materialized_prompts: ["reproduce the failure"] }),
+    (err: unknown) => err instanceof HarvestValidationError && /repo_paths/.test((err as Error).message),
+  );
+});
+
+test("renderDraft: throws rather than silently defaulting an unresolved capability surface", () => {
+  assert.throws(
+    () => renderDraft(draftInput({ surface_hints: undefined })),
     HarvestValidationError,
   );
 });

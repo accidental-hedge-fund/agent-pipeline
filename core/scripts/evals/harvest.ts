@@ -91,10 +91,17 @@ export function sanitizeEvidence(evidence: HarvestEvidence): HarvestEvidence {
   }
 }
 
+/** Short, stable content signature so two distinct run-artifact excerpts in
+ *  the same stage are never conflated into one evidence signal (review 1
+ *  finding 0a961a53) — stage alone previously grouped unrelated failures. */
+function excerptSignature(excerpt: string): string {
+  return createHash("sha1").update(excerpt).digest("hex").slice(0, 12);
+}
+
 function evidenceSignal(evidence: HarvestEvidence): string {
   switch (evidence.kind) {
     case "run-artifact":
-      return `run-artifact:${evidence.stage}`;
+      return `run-artifact:${evidence.stage}:${excerptSignature(evidence.excerpt)}`;
     case "improve-cluster":
       return `improve-cluster:${evidence.cluster.category}:${evidence.cluster.signal}`;
     case "correction-event":
@@ -190,6 +197,23 @@ export function resolveCapabilitySurface(
     throw new HarvestValidationError(
       "stage",
       "could not be resolved from the supplied evidence or surface_hints — a capability-surface inventory requires a stage",
+    );
+  }
+  // Reject a harvest that never resolved the required agent surface rather
+  // than hashing an empty placeholder inventory (review 1 finding 22ff7d0b):
+  // the materialized prompt and the repository paths touched are the two
+  // dimensions every real candidate has, so a caller supplying neither has
+  // not actually resolved this candidate's surface.
+  if (!hints.materialized_prompts || hints.materialized_prompts.length === 0) {
+    throw new HarvestValidationError(
+      "surface_hints.materialized_prompts",
+      "must be a non-empty array of the candidate's materialized prompt(s) — omitting it silently defaults to an unresolved empty surface",
+    );
+  }
+  if (!hints.repo_paths || hints.repo_paths.length === 0) {
+    throw new HarvestValidationError(
+      "surface_hints.repo_paths",
+      "must be a non-empty array of the repository paths the candidate touched — omitting it silently defaults to an unresolved empty surface",
     );
   }
   return sanitizeDeep({
@@ -352,20 +376,37 @@ export function renderDraft(input: HarvestDraftInput): HarvestDraft {
     throw new HarvestMissingEvidenceError();
   }
   const ability = proposeAbility(input.evidence);
+  if (ability.control_level !== "eval") {
+    throw new HarvestValidationError(
+      "control_level",
+      `evidence names "${ability.control_level}" (not "eval") as the appropriate next control level — refusing to render an eval fixture for evidence that does not warrant one (review 1 finding a0f0770d)`,
+    );
+  }
   const surface = resolveCapabilitySurface(input.evidence, input.surface_hints);
   const environment = input.environment ? resolveEnvironmentDependencies(input.environment) : undefined;
   const taskInput = sanitize(redactSecrets(input.task_input ?? `Reproduce and resolve: ${ability.ability}`));
   const fixtureId = input.fixture_id ?? deriveFixtureId(ability, input.base_commit);
+
+  // Every stage-entry artifact and check is evidence-derived and can carry a
+  // secret or raw production payload (review 1 finding 349ec0b4) — route them
+  // through the same sanitization the task input already gets, at render
+  // time, so `raw` (printed to stdout, written via --out, and promoted) is
+  // sanitized before it is ever stored or emitted, not only inside
+  // `promoteDraft`'s belt-and-suspenders pass.
+  const stageEntryArtifacts = sanitizeDeep(input.stage_entry_artifacts);
+  const publicChecks = sanitizeDeep(input.public_checks ?? []);
+  const hiddenChecks = input.hidden_checks ? sanitizeDeep(input.hidden_checks) : undefined;
+  const acceptanceCriteria = input.acceptance_criteria ? sanitizeDeep(input.acceptance_criteria) : undefined;
 
   const raw: Record<string, unknown> = {
     fixture_id: fixtureId,
     schema_version: 1,
     base_commit: input.base_commit,
     task_input: taskInput,
-    stage_entry_artifacts: input.stage_entry_artifacts,
-    public_checks: input.public_checks ?? [],
-    ...(input.hidden_checks ? { hidden_checks: input.hidden_checks } : {}),
-    ...(input.acceptance_criteria ? { acceptance_criteria: input.acceptance_criteria } : {}),
+    stage_entry_artifacts: stageEntryArtifacts,
+    public_checks: publicChecks,
+    ...(hiddenChecks ? { hidden_checks: hiddenChecks } : {}),
+    ...(acceptanceCriteria ? { acceptance_criteria: acceptanceCriteria } : {}),
     ...(input.allowed_change_paths ? { allowed_change_paths: input.allowed_change_paths } : {}),
     grader_refs: input.grader_refs,
     category: input.category,

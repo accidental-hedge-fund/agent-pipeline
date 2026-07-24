@@ -16,7 +16,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildCmd, type CliOpts } from "../scripts/pipeline.ts";
+import { buildCmd, resolveHarvestOutPath, type CliOpts } from "../scripts/pipeline.ts";
 import { lookupCommand, validateFlags, COMMAND_REGISTRY } from "../scripts/command-registry.ts";
 
 // ---------------------------------------------------------------------------
@@ -480,4 +480,35 @@ test("pipeline-cli: 'evals harvest request.json --apply --plan-only --out draft.
   assert.equal(opts.apply, true);
   assert.equal((opts as unknown as { planOnly?: boolean }).planOnly, true);
   assert.equal((opts as unknown as { out?: string }).out, "draft.json");
+});
+
+// --- resolveHarvestOutPath (#535 review 1 finding a97dc21a): --out is a
+// repository write and must require the explicit --apply approval action ---
+
+test("resolveHarvestOutPath: no --out prints to stdout regardless of --apply", () => {
+  assert.deepEqual(resolveHarvestOutPath("/repo", undefined, false), { ok: true });
+  assert.deepEqual(resolveHarvestOutPath("/repo", undefined, true), { ok: true });
+});
+
+test("resolveHarvestOutPath: --out without --apply is refused — never writes without approval", () => {
+  const result = resolveHarvestOutPath("/repo", "draft.json", false);
+  assert.equal(result.ok, false);
+  assert.match((result as { error: string }).error, /--apply/);
+});
+
+test("resolveHarvestOutPath: --out with --apply resolves within the repository", () => {
+  const result = resolveHarvestOutPath("/repo", "draft.json", true);
+  assert.deepEqual(result, { ok: true, path: "/repo/draft.json" });
+});
+
+test("resolveHarvestOutPath: an absolute --out path escaping the repository is refused even with --apply", () => {
+  const result = resolveHarvestOutPath("/repo", "/etc/passwd", true);
+  assert.equal(result.ok, false);
+  assert.match((result as { error: string }).error, /within the repository/);
+});
+
+test("resolveHarvestOutPath: a '..'-escaping --out path is refused even with --apply", () => {
+  const result = resolveHarvestOutPath("/repo", "../../etc/passwd", true);
+  assert.equal(result.ok, false);
+  assert.match((result as { error: string }).error, /within the repository/);
 });

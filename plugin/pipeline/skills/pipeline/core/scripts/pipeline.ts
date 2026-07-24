@@ -904,6 +904,34 @@ export async function runLoopCommand(
   process.exitCode = engineResult.result.stop || engineResult.result.holdOutstanding ? 1 : 0;
 }
 
+/** Resolve `pipeline evals harvest`'s `--out` path, or reject it (review 1
+ *  finding a97dc21a). A repository write requires the explicit `--apply`
+ *  approval action shared with roadmap/sweep/improve — `--out` without
+ *  `--apply` is refused rather than silently writing an unreviewed file, and
+ *  an approved `--out` path is constrained to resolve inside the repository
+ *  rather than trusting an arbitrary (possibly absolute or `..`-escaping)
+ *  caller-supplied path. Returns `{ path: undefined }` (print to stdout) when
+ *  `--out` was not supplied at all. Pure and dependency-free so it is
+ *  directly unit-testable without invoking the CLI. */
+export function resolveHarvestOutPath(
+  repoDir: string,
+  outArg: string | undefined,
+  apply: boolean,
+): { ok: true; path?: string } | { ok: false; error: string } {
+  if (!outArg) {
+    return { ok: true };
+  }
+  if (!apply) {
+    return { ok: false, error: "--out requires --apply — draft-only mode (the default) only prints to stdout" };
+  }
+  const outPath = path.resolve(repoDir, outArg);
+  const repoRoot = repoDir.endsWith(path.sep) ? repoDir : `${repoDir}${path.sep}`;
+  if (outPath !== repoDir && !outPath.startsWith(repoRoot)) {
+    return { ok: false, error: `--out must resolve within the repository (${repoDir})` };
+  }
+  return { ok: true, path: outPath };
+}
+
 async function main(): Promise<void> {
   // Pre-intercept `pipeline refine-spec --help` before Commander processes the
   // global --help flag. Commander exits 0 on --help before dispatch runs, so
@@ -1696,8 +1724,13 @@ async function main(): Promise<void> {
         const { renderDraft, promoteDraft } = await import("./evals/harvest.ts");
         const draft = renderDraft(request);
         const draftJson = `${JSON.stringify({ fixture: draft.raw, ability: draft.ability, surface: draft.surface }, null, 2)}\n`;
-        if (opts.out) {
-          writeFileSync(path.resolve(evalsCfg.repo_dir, opts.out), draftJson);
+        const outResolution = resolveHarvestOutPath(evalsCfg.repo_dir, opts.out, !!opts.apply);
+        if (!outResolution.ok) {
+          console.error(`pipeline evals harvest: ${outResolution.error}`);
+          process.exit(2);
+        }
+        if (outResolution.path) {
+          writeFileSync(outResolution.path, draftJson);
         } else {
           console.log(draftJson);
         }

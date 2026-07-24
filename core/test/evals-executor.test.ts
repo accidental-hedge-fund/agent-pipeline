@@ -29,7 +29,7 @@ const MANIFEST = validateManifest(
   new Set(["f1"]),
 );
 
-function makeFixture(id = "f1", stage = "review"): Fixture {
+function makeFixture(id = "f1", stage = "review", environment?: unknown[]): Fixture {
   return validateFixture(
     {
       fixture_id: id,
@@ -42,9 +42,24 @@ function makeFixture(id = "f1", stage = "review"): Fixture {
       category: "c",
       risk: "low",
       provenance: "synthetic",
+      ...(environment ? { environment } : {}),
     },
     `${id}.json`,
   );
+}
+
+function envDep(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    name: "github-api",
+    mode: "forbidden",
+    version: "1",
+    required_permissions: [],
+    initial_state: {},
+    expected: {},
+    setup: "echo setup",
+    teardown: "echo teardown",
+    ...overrides,
+  };
 }
 
 function makeCell(overrides: Partial<Cell> = {}): Cell {
@@ -966,4 +981,79 @@ test("runCell: an API treatment's endpoint provenance is carried onto the cell d
   };
   const result = await runCell(apiCfg(), apiCell(), makeFixture(), MANIFEST, deps);
   assert.deepEqual((result.outcome.detail as Record<string, unknown>)?.executor_provenance, provenance);
+});
+
+// ---------------------------------------------------------------------------
+// Environment-fidelity enforcement (#535 review 1 finding ed37a4fd): a
+// declared `forbidden` dependency must block the treatment entirely, and a
+// declared `simulated` dependency must receive its declared setup/teardown.
+// ---------------------------------------------------------------------------
+
+test("runCell: a forbidden environment dependency blocks the treatment — no worktree, no harness invocation", async () => {
+  let worktreeCreated = false;
+  let harnessInvoked = false;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => { worktreeCreated = true; return o; },
+    removeWorktree: async () => {},
+    invokeHarness: async () => { harnessInvoked = true; return successResult(); },
+  };
+  const fixture = makeFixture("f1", "review", [envDep({ name: "github-api", mode: "forbidden" })]);
+  const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /forbidden/);
+  assert.match(result.outcome.error ?? "", /github-api/);
+  assert.equal(worktreeCreated, false, "a forbidden dependency must block before any worktree is created");
+  assert.equal(harnessInvoked, false, "a forbidden dependency must block before the harness is ever invoked");
+});
+
+test("runCell: a simulated environment dependency runs its declared setup before, and teardown after, the treatment", async () => {
+  const commands: Array<{ command: string; phase: string }> = [];
+  let harnessInvokedAt = -1;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => { harnessInvokedAt = commands.length; return successResult(); },
+    runEnvironmentCommand: async (args) => {
+      commands.push({ command: args.command, phase: args.phase });
+      return { ok: true };
+    },
+  };
+  const fixture = makeFixture("f1", "review", [
+    envDep({ name: "github-api", mode: "simulated", setup: "seed fixtures.json", teardown: "rm fixtures.json" }),
+  ]);
+  const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.deepEqual(commands.map((c) => c.phase), ["setup", "teardown"]);
+  assert.equal(commands[0].command, "seed fixtures.json");
+  assert.equal(commands[1].command, "rm fixtures.json");
+  assert.equal(harnessInvokedAt, 1, "the harness must run only after the simulated dependency's setup completes");
+});
+
+test("runCell: a simulated dependency's setup failure classifies as infra_error and never invokes the harness", async () => {
+  let harnessInvoked = false;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => { harnessInvoked = true; return successResult(); },
+    runEnvironmentCommand: async () => ({ ok: false, error: "seed script exited 1" }),
+  };
+  const fixture = makeFixture("f1", "review", [envDep({ name: "github-api", mode: "simulated" })]);
+  const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /seed script exited 1/);
+  assert.equal(harnessInvoked, false);
+});
+
+test("runCell: a live environment dependency does not block or require a simulated stand-in", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => successResult(),
+  };
+  const fixture = makeFixture("f1", "review", [envDep({ name: "github-api", mode: "live" })]);
+  const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
 });

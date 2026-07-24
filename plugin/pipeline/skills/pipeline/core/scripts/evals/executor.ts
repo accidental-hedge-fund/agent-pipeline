@@ -21,7 +21,7 @@ import {
   type GhRefusalRecord,
 } from "./gh-eval-surface.ts";
 import { materializeStagePrompt, stagesForMode } from "./stage-adapters.ts";
-import type { Cell, CellExecutionClass, CellOutcome, EvalStageName, ExperimentManifest, Fixture, Treatment } from "./types.ts";
+import type { Cell, CellExecutionClass, CellOutcome, EnvironmentDependency, EvalStageName, ExperimentManifest, Fixture, Treatment } from "./types.ts";
 
 function sanitizeForPath(cellId: string): string {
   return cellId.replace(/[^a-zA-Z0-9._-]/g, "-");
@@ -175,6 +175,12 @@ export interface CellExecutionDeps {
    *  (#434 task 6). Only invoked when the cell's treatment declares
    *  `executor`. */
   invokeExecutor?: (args: ExecutorInvokeArgs) => Promise<{ ok: true; result: HarnessResult } | { ok: false; error: string }>;
+  /** Run a declared `simulated` environment dependency's deterministic
+   *  `setup`/`teardown` shell command in the cell's worktree (review 1
+   *  finding ed37a4fd) — only invoked when the fixture declares at least one
+   *  `simulated` dependency. `phase` distinguishes setup (run before the
+   *  treatment) from teardown (run after, best-effort). */
+  runEnvironmentCommand?: (args: { worktreeDir: string; command: string; phase: "setup" | "teardown"; deadlineMs: number }) => Promise<{ ok: boolean; error?: string }>;
 }
 
 async function defaultRunChecks(
@@ -213,6 +219,20 @@ async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: stri
     return stdout.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
   } catch {
     return [];
+  }
+}
+
+async function defaultRunEnvironmentCommand(
+  args: { worktreeDir: string; command: string; phase: "setup" | "teardown"; deadlineMs: number },
+): Promise<{ ok: boolean; error?: string }> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileAsync = promisify(execFile);
+  try {
+    await execFileAsync("sh", ["-c", args.command], { cwd: args.worktreeDir, timeout: Math.max(1, args.deadlineMs) });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: `environment ${args.phase} command failed: ${(err as Error).message}` };
   }
 }
 
@@ -347,6 +367,26 @@ export async function runCell(
     timeout: manifest.timeout,
   };
 
+  // A fixture-declared `forbidden` environment dependency must block the
+  // treatment entirely — no worktree, no harness invocation (review 1
+  // finding ed37a4fd; eval-fixture-contract requires "no treatment SHALL be
+  // executed for an experiment referencing that fixture").
+  const environment: EnvironmentDependency[] = fixture.environment ?? [];
+  const forbidden = environment.filter((d) => d.mode === "forbidden");
+  if (forbidden.length > 0) {
+    return {
+      outcome: {
+        result_class: "infra_error",
+        error: `fixture declares forbidden dependenc${forbidden.length === 1 ? "y" : "ies"} (${forbidden.map((d) => d.name).join(", ")}) — refusing to execute the treatment`,
+      },
+      materializedPrompt,
+      effectiveConfig,
+      ghRefusals: recorder.refusals,
+    };
+  }
+  const simulated = environment.filter((d) => d.mode === "simulated");
+  const runEnvironmentCommandFn = deps.runEnvironmentCommand ?? defaultRunEnvironmentCommand;
+
   let worktreeCreated = false;
   try {
     await createWorktreeFn(cfg, {
@@ -365,6 +405,27 @@ export async function runCell(
   }
 
   try {
+    // Each declared `simulated` dependency's deterministic stand-in must be
+    // in place before the treatment runs (review 1 finding ed37a4fd) — its
+    // teardown runs in the `finally` below, before worktree removal.
+    for (const dep of simulated) {
+      const setupDeadlineMs = Math.max(1000, manifest.timeout * 1000);
+      const result = await runEnvironmentCommandFn({
+        worktreeDir: identity.worktreePath,
+        command: dep.setup,
+        phase: "setup",
+        deadlineMs: setupDeadlineMs,
+      });
+      if (!result.ok) {
+        return {
+          outcome: { result_class: "infra_error", error: `simulated dependency ${JSON.stringify(dep.name)} ${result.error}` },
+          materializedPrompt,
+          effectiveConfig,
+          ghRefusals: recorder.refusals,
+        };
+      }
+    }
+
     // API treatment path (#434 task 6): the cell binds to a named
     // model-endpoint executor instead of a local CLI harness. Kept entirely
     // separate from the harness path below — a model-endpoint executor is
@@ -620,6 +681,22 @@ export async function runCell(
     // strand the worktree rather than throw. Matches results.ts's
     // non-fatal-write convention.
     if (worktreeCreated) {
+      // Each simulated dependency's declared teardown runs best-effort,
+      // before the worktree itself is removed (review 1 finding ed37a4fd) —
+      // a teardown failure is logged, not thrown, matching the worktree
+      // removal convention just below.
+      for (const dep of simulated) {
+        try {
+          await runEnvironmentCommandFn({
+            worktreeDir: identity.worktreePath,
+            command: dep.teardown,
+            phase: "teardown",
+            deadlineMs: 30_000,
+          });
+        } catch (err) {
+          console.warn(`[pipeline] evals: simulated dependency ${JSON.stringify(dep.name)} teardown failed (non-fatal): ${(err as Error).message}`);
+        }
+      }
       try {
         await removeWorktreeFn(cfg, { path: identity.worktreePath, branch: identity.branch });
       } catch (err) {
