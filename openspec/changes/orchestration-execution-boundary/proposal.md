@@ -145,3 +145,15 @@ inference into or out of customer infrastructure.
   pipeline runs through the local adapter exactly as today. Coordinates with #459 (identity/leases),
   reuses #153–#161 evidence contracts, and feeds sanitized telemetry to #503. No auto-merge /
   auto-release / auto-deploy; model hosting is unchanged.
+
+## Deferred implementation (tracked follow-ups)
+
+This change is design/specs only — no engine code changes. Per #505's scope
+("implementation should be decomposed only after the protocol, trust boundary,
+and local-adapter migration design are accepted"), the implementation is
+decomposed into these tracked follow-up issues, to be started only after this
+change merges:
+
+- **#589** — Implement the local execution adapter (reference in-process worker) to the protocol.
+- **#590** — Add the remote-VM execution worker transport (depends on #589).
+- **#591** — Add the Kubernetes worker-pool execution backend (depends on #590).
