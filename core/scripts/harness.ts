@@ -714,8 +714,17 @@ export async function runCapped(
       settled = true;
       clearTimeout(timer);
       clearTimeout(failsafeTimer);
-      clearTimeout(reapTimer);
-      clearTimeout(reapFollowupTimer);
+      // While a timeout escalation is in flight, some other path (e.g. a
+      // capture-stream error) can resolve the promise before the SIGKILL grace
+      // period elapses. Do NOT cancel reapTimer/reapFollowupTimer in that case —
+      // they must still fire and force-kill the process group, or a descendant
+      // that outlived SIGTERM is left running forever even though runCapped has
+      // already returned. Only clear them on a non-timeout settle, where they
+      // were never armed anyway.
+      if (!timedOut) {
+        clearTimeout(reapTimer);
+        clearTimeout(reapFollowupTimer);
+      }
       if (killProcessGroup) {
         process.removeListener("SIGINT", sigintHandler);
         process.removeListener("SIGTERM", sigtermHandler);
