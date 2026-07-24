@@ -2704,6 +2704,57 @@ export async function maybeArchiveOpenspec(
     return { advanced: false, status: "blocked", reason: blockedReason };
   }
 
+  // ---- Archive-base sync guard (#579) ----
+  // The archive commit must be built on the reviewed/pushed PR head, never a stale
+  // local worktree base — a fix pushed from a different checkout (#547) can leave
+  // this worktree behind `origin/<branch>`. Fetch + fast-forward to the remote
+  // branch before archiving. A non-fast-forward gap here is a block signal, never
+  // a cue to force-push over the reviewed head (#579). Runs after the cleanliness
+  // guard above so the fast-forward always operates on a known-clean tree.
+  const branch = branchName(issueNumber, wt.slug);
+  // Fetch with an explicit refspec so `refs/remotes/origin/<branch>` itself is updated —
+  // `git fetch origin <branch>` with no destination only populates FETCH_HEAD, leaving the
+  // tracking ref (and the `rev-parse origin/<branch>` read below) stale (#579 review 1).
+  const fetch = await gitFn(wt.path, ["fetch", "origin", `${branch}:refs/remotes/origin/${branch}`], {
+    ignoreFailure: true,
+  });
+  if (fetch.code !== 0) {
+    const detail = (fetch.stderr || fetch.stdout || "(no output)").trim();
+    const reason =
+      `Cannot sync worktree for #${issueNumber} to origin/${branch} before archiving — ` +
+      `\`git fetch origin ${branch}:refs/remotes/origin/${branch}\` failed (exit ${fetch.code}): ${detail}`;
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+    await recordDecision("fail", "fetch failed before archive");
+    return { advanced: false, status: "blocked", reason: "fetch failed before archive" };
+  }
+  const localHeadBefore = await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
+  const reviewedHeadRes = await gitFn(wt.path, ["rev-parse", `origin/${branch}`], { ignoreFailure: true });
+  if (localHeadBefore.code !== 0 || reviewedHeadRes.code !== 0) {
+    const detail = (reviewedHeadRes.stderr || localHeadBefore.stderr || "(no output)").trim();
+    const reason =
+      `Cannot resolve worktree HEAD or origin/${branch} before archiving OpenSpec change(s) ` +
+      `for #${issueNumber}: ${detail}`;
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+    await recordDecision("fail", "rev-parse failed before archive");
+    return { advanced: false, status: "blocked", reason: "rev-parse failed before archive" };
+  }
+  const reviewedHead = reviewedHeadRes.stdout.trim();
+  let archiveBase = localHeadBefore.stdout.trim();
+  if (archiveBase !== reviewedHead) {
+    // Fast-forward only — never a merge/rebase that could rewrite history. If the
+    // fast-forward is impossible (true divergence), archiveBase stays stale and the
+    // equality check below blocks; the archive step never force-pushes to reconcile it.
+    await gitFn(wt.path, ["merge", "--ff-only", `origin/${branch}`], { ignoreFailure: true });
+    const afterFf = await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
+    archiveBase = afterFf.code === 0 ? afterFf.stdout.trim() : archiveBase;
+  }
+  if (archiveBase !== reviewedHead) {
+    const reason = `archive base \`${archiveBase}\` != reviewed head \`${reviewedHead}\``;
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
+    await recordDecision("fail", reason);
+    return { advanced: false, status: "blocked", reason };
+  }
+
   console.log(`[pipeline] #${issueNumber}: archiving OpenSpec change(s): ${candidates.join(", ")}`);
   for (const id of candidates) {
     const res = await archiveFn(wt.path, id);
@@ -2755,8 +2806,11 @@ export async function maybeArchiveOpenspec(
     await recordDecision("fail", "archive commit failed");
     return { advanced: false, status: "blocked", reason: "archive commit failed" };
   }
-  const pushBranch = branchName(issueNumber, wt.slug);
-  const push = await gitFn(wt.path, ["push", "origin", pushBranch], {
+  // Plain push, deliberately never `--force`/`--force-with-lease` (#579): a
+  // non-fast-forward rejection here means the remote moved again since the
+  // sync guard above ran, and that is a block signal, not a cue to overwrite
+  // the reviewed head.
+  const push = await gitFn(wt.path, ["push", "origin", branch], {
     ignoreFailure: true,
   });
   if (stateDir) {
@@ -2765,7 +2819,7 @@ export async function maybeArchiveOpenspec(
       issueNumber,
       "pre-merge",
       makeCommandRecord(
-        `git push origin ${pushBranch}`,
+        `git push origin ${branch}`,
         push.code,
         0,
         push.code !== 0 ? push.stderr.trim() : "OpenSpec archive pushed; CI will re-run",
