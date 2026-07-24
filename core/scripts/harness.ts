@@ -669,6 +669,14 @@ export async function runCapped(
     let timedOut = false;
     let lastExitCode: number | null = null;
     let settled = false;
+    // Nested timers armed by the timeout escalation chain below — tracked so
+    // settle() can clear them once any path resolves. Left dangling, an armed
+    // but never-fired timer keeps the event loop (and the process) alive for
+    // up to killGraceSec + hardDeadlineSec seconds after the promise has
+    // already settled.
+    let failsafeTimer: NodeJS.Timeout | undefined;
+    let reapTimer: NodeJS.Timeout | undefined;
+    let reapFollowupTimer: NodeJS.Timeout | undefined;
 
     // Downstream forward failures — OUR stdout/stderr breaking (terminal-log
     // tee, event-sink socket), not the child's streams — are diagnostics,
@@ -704,6 +712,10 @@ export async function runCapped(
     const settle = (result: HarnessResult) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
+      clearTimeout(failsafeTimer);
+      clearTimeout(reapTimer);
+      clearTimeout(reapFollowupTimer);
       if (killProcessGroup) {
         process.removeListener("SIGINT", sigintHandler);
         process.removeListener("SIGTERM", sigtermHandler);
@@ -785,7 +797,7 @@ export async function runCapped(
       // `close`). settle()'s single-resolution guard makes this a no-op once the
       // escalation chain below has already settled, which is the common case, so
       // clean timeouts see no added latency.
-      setTimeout(() => {
+      failsafeTimer = setTimeout(() => {
         const duration = (Date.now() - start) / 1000;
         settle({
           success: false,
@@ -800,9 +812,9 @@ export async function runCapped(
       // After the grace period, force-kill any remaining group members and only then
       // resolve — so all descendants are absent from the OS process table before
       // runCapped returns, even if a grandchild ignored SIGTERM.
-      setTimeout(() => {
+      reapTimer = setTimeout(() => {
         killGroup("SIGKILL");
-        setTimeout(() => {
+        reapFollowupTimer = setTimeout(() => {
           const duration = (Date.now() - start) / 1000;
           settle({
             success: false,
