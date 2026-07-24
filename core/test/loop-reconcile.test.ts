@@ -256,6 +256,51 @@ test("observeExternalIdentity: no PR yet falls back to the local worktree head",
   assert.equal(identity.head_sha, "local-sha");
 });
 
+// ---------------------------------------------------------------------------
+// pipeline_stage (#568, capability `loop-precondition-stage-gate`) — the
+// precondition stage gate's input, derived from the same live label read.
+// ---------------------------------------------------------------------------
+
+test("observeExternalIdentity: pipeline_stage is null when the issue carries no pipeline:* label", async () => {
+  const { deps } = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["bug", "priority:high"] };
+    },
+  });
+  const identity = await observeExternalIdentity(deps, "100");
+  assert.equal(identity.pipeline_stage, null);
+});
+
+test("observeExternalIdentity: pipeline_stage is the label suffix for a pre-pipeline backlog issue", async () => {
+  const { deps } = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:backlog"] };
+    },
+  });
+  const identity = await observeExternalIdentity(deps, "100");
+  assert.equal(identity.pipeline_stage, "backlog");
+});
+
+test("observeExternalIdentity: pipeline_stage tracks an in-flight advance-loop stage", async () => {
+  const { deps } = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:review-1"] };
+    },
+  });
+  const identity = await observeExternalIdentity(deps, "100");
+  assert.equal(identity.pipeline_stage, "review-1");
+});
+
+test("observeExternalIdentity: pipeline_stage is null when the issue is not found (no observation at all)", async () => {
+  const { deps } = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return null;
+    },
+  });
+  const identity = await observeExternalIdentity(deps, "100");
+  assert.equal(identity.pipeline_stage, null);
+});
+
 test("parseItemIssueNumber: a non-numeric item id is refused, not guessed", () => {
   assert.throws(() => parseItemIssueNumber("not-a-number"), (err: unknown) => {
     assert.ok(err instanceof LoopError);

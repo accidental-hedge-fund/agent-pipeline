@@ -27,6 +27,12 @@ import {
 import { LOOP_EXECUTION_CONTRACT_SCHEMA, type LoopExecutionRequest, type LoopExecutionResponse } from "../scripts/loop-execution-contract.ts";
 
 const READY_LABEL = "pipeline:ready-to-deploy";
+// The precondition stage gate (#568, capability `loop-precondition-stage-gate`) excludes a
+// pending item whose observed `pipeline:*` label is `backlog` or absent — every fake below
+// defaults an item to `pipeline:ready` so the scheduling/dispatch behavior under test here (which
+// predates and is orthogonal to the precondition gate) is unaffected; tests of the gate itself
+// override this explicitly.
+const PIPELINE_READY_LABEL = "pipeline:ready";
 
 // ---------------------------------------------------------------------------
 // In-memory fakes (mirrors loop-reconcile.test.ts's fakeDeps/fakeObserveDeps).
@@ -101,7 +107,7 @@ function fakeObserveDeps(overrides: Partial<ReconcileObserveDeps> = {}): { deps:
   const deps: ReconcileObserveDeps = {
     async getIssueStateAndLabels(issueNumber) {
       calls.push(`getIssueStateAndLabels:${issueNumber}`);
-      return { state: "open", labels: [] };
+      return { state: "open", labels: [PIPELINE_READY_LABEL] };
     },
     async findPrForIssue(issueNumber) {
       calls.push(`findPrForIssue:${issueNumber}`);
@@ -123,6 +129,10 @@ function fakeObserveDeps(overrides: Partial<ReconcileObserveDeps> = {}): { deps:
       calls.push(`baseBranchContainsSha:${sha}`);
       return null;
     },
+    async getLabelEvents(issueNumber) {
+      calls.push(`getLabelEvents:${issueNumber}`);
+      return [];
+    },
     now: () => new Date("2026-07-23T00:00:00.000Z"),
     ...overrides,
   };
@@ -141,7 +151,7 @@ function coordinatedFakes(outcomeFor: (itemId: string) => LoopExecutionResponse[
   const calls: LoopExecutionRequest[] = [];
   const observe: ReconcileObserveDeps = {
     async getIssueStateAndLabels(issueNumber) {
-      return { state: "open", labels: dispatched.has(String(issueNumber)) ? [READY_LABEL] : [] };
+      return { state: "open", labels: dispatched.has(String(issueNumber)) ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
     },
     async findPrForIssue(issueNumber) {
       return dispatched.has(String(issueNumber)) ? 12 : null;
@@ -157,6 +167,9 @@ function coordinatedFakes(outcomeFor: (itemId: string) => LoopExecutionResponse[
     },
     async baseBranchContainsSha() {
       return null;
+    },
+    async getLabelEvents() {
+      return [];
     },
     now: () => new Date("2026-07-23T00:00:00.000Z"),
   };
@@ -1049,4 +1062,488 @@ test("runSupervisorCycle: a rejected changed-file observation for one item does 
   const replan = events.find((e: any) => e.kind === "loop_replan_requested") as any;
   assert.ok(replan, "a durable replan-request record is written for the observation failure");
   assert.ok(replan.data.reason.includes("observation failed"));
+});
+
+// ---------------------------------------------------------------------------
+// Precondition stage gate (#568, capability `loop-precondition-stage-gate`) —
+// regression for run `loop-07d05fcd68f7db98`: a milestone selector admitted a
+// `pipeline:backlog` item, the advance loop made 0 transitions, and the
+// dispatch-outcome mapping durably stopped the whole run as a
+// `workflow-engine-defect`/`run_fatal` engine defect. Neither should happen.
+// ---------------------------------------------------------------------------
+
+/** Item "100" is permanently `pipeline:backlog` — /pipeline refuses to start work on it, so
+ *  dispatching it (were the frontier gate ever bypassed) always makes 0 transitions. Item "200"
+ *  behaves like `coordinatedFakes`: `pipeline:ready` until dispatched, then reports
+ *  `ready_to_deploy`. */
+function backlogAndReadyFakes() {
+  const dispatched = new Set<string>();
+  const calls: LoopExecutionRequest[] = [];
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels(issueNumber) {
+      const id = String(issueNumber);
+      if (id === "100") return { state: "open", labels: ["pipeline:backlog"] };
+      return { state: "open", labels: dispatched.has(id) ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue(issueNumber) {
+      const id = String(issueNumber);
+      return id !== "100" && dispatched.has(id) ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/x-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    dispatched.add(request.item_id);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  return { observe, dispatchItem, calls };
+}
+
+test("regression (#568): a backlog item alongside a ready item advances the ready item, excludes the backlog item with a precondition rationale, and the run does not stop", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem, calls } = backlogAndReadyFakes();
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(result.stop, null, "a pre-pipeline exclusion must never record a run stop");
+  assert.equal(result.allDone, true, "the run reaches a normal terminal condition — all_items_done_or_excluded");
+  assert.deepEqual(calls.map((c) => c.item_id), ["200"], "the backlog item must never be dispatched at all — the frontier gate is the primary defense");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["200"].state, "ready");
+  assert.equal(finalLedger.items["100"].state, "pending", "the excluded item is left pending, never blocked or abandoned");
+  assert.equal(finalLedger.items["100"].blocked_theme, undefined, "never classified as a blocker");
+  assert.equal(finalLedger.stop, null);
+
+  const events = await readEvents(deps, "run-1");
+  const excluded = events.find((e: any) => e.kind === "loop_item_precondition_excluded") as any;
+  assert.ok(excluded, "a durable precondition-exclusion event must be recorded");
+  assert.deepEqual(excluded.data, { item_id: "100", required_stage: "pipeline:ready", observed_stage: "pipeline:backlog" });
+});
+
+test("regression (#568): a run whose only remaining item is at pipeline:backlog completes (all_items_done_or_excluded) without ever dispatching it", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem, calls } = backlogAndReadyFakes();
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(result.stop, null);
+  assert.equal(result.allDone, true);
+  assert.equal(result.cycles, 1, "the exclusion is structural, not a no-progress accident — it completes on the first cycle");
+  assert.deepEqual(calls, [], "a permanently pre-pipeline item is never dispatched");
+});
+
+test("an item excluded at pipeline:backlog is admitted once triaged to pipeline:ready mid-run, with no run restart", async () => {
+  // "200" is pinned `blocked` under a non-run-fatal class (upstream-dependency) for the whole
+  // test — it never resolves and never stops the run — purely so the run has a second, permanent
+  // non-terminal item and does not immediately reach the "all excluded" completion after cycle 1,
+  // giving the mid-run triage on "100" a later cycle to actually land on.
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({
+    "100": itemEntry("100", "pending"),
+    "200": { ...itemEntry("200", "blocked"), blocked_theme: "upstream-dependency" },
+  });
+  const { deps } = await setup(contract, ledger);
+
+  let stage = "backlog";
+  const dispatched = new Set<string>();
+  const calls: LoopExecutionRequest[] = [];
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels(issueNumber) {
+      const id = String(issueNumber);
+      if (id === "200") return { state: "open", labels: ["pipeline:review-1"] };
+      if (dispatched.has(id)) return { state: "open", labels: [READY_LABEL] };
+      return { state: "open", labels: [`pipeline:${stage}`] };
+    },
+    async findPrForIssue(issueNumber) {
+      return dispatched.has(String(issueNumber)) ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-x", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    dispatched.add(request.item_id);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle1 = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+  assert.equal(cycle1.allDone, false);
+  assert.deepEqual(calls, [], "still backlog — never dispatched");
+  const midLedger = await readLedger(deps, "run-1");
+  assert.equal(midLedger.items["100"].state, "pending");
+
+  // Operator triages the item mid-run — the gate is re-evaluated against live truth, not frozen.
+  stage = "ready";
+
+  const cycle2 = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+  assert.equal(cycle2.stop, null);
+  assert.deepEqual(calls.map((c) => c.item_id), ["100"], "the item is admitted and dispatched on the very next cycle — no restart required");
+});
+
+test("a genuine engine defect (mid-flight non-terminal label, zero transitions) is still classified workflow-engine-defect / run_fatal", async () => {
+  // Item "100" is stuck at a non-terminal, non-pre-pipeline stage (e.g. "review-1") after
+  // dispatch — never backlog, never absent a pipeline:* label — so the precondition safety net
+  // must NOT reclassify it; this is exactly the genuine-defect case decision 3 must still catch.
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+
+  // A genuine defect: the dispatch response itself is outside the terminal outcome set, and the
+  // live post-dispatch label ("review-1") is neither backlog nor absent. `calls` distinguishes
+  // reconciliation's own observation (call 1, admissible) from Pass 2's fresh safety-net read
+  // (call 2, mid-flight).
+  let calls = 0;
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      calls++;
+      return calls === 1 ? { state: "open", labels: ["pipeline:ready"] } : { state: "open", labels: ["pipeline:review-1"] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "some-unrecognized-outcome" as unknown as LoopExecutionResponse["outcome"],
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+  });
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(result.stop?.reason, "run_fatal");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked");
+  assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
+});
+
+test("dispatch-outcome safety net (decision 3): a genuine 0-transition backlog dispatch is recorded as a non-fatal precondition exclusion, never workflow-engine-defect", async () => {
+  // Item "100" is already `in_progress` from a prior cycle (so the pending-only frontier gate
+  // never evaluates it) and was already at pipeline:backlog *before this cycle's dispatch* —
+  // reconciliation observes backlog, and Pass 2's post-dispatch read observes the same backlog:
+  // zero stage transitions, a genuine pre-pipeline no-op (#568 review 1, finding eb82a1de).
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "in_progress") });
+  const { deps } = await setup(contract, ledger);
+
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      // Both reconciliation (pre-dispatch) and Pass 2's safety-net read (post-dispatch) observe
+      // the same stage — the dispatch made zero transitions.
+      return { state: "open", labels: ["pipeline:backlog"] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      // No label-add history at all during the dispatch window — the authoritative
+      // zero-transition signal (#568 review 2, finding 8bb189a0).
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "failed",
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+  });
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.equal(cycle.stop, null, "never a run_fatal stop for a pre-pipeline no-op");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "pending", "reverted to pending, not blocked or abandoned");
+  assert.equal(finalLedger.items["100"].blocked_theme, undefined);
+  const events = await readEvents(deps, "run-1");
+  const excluded = events.find((e: any) => e.kind === "loop_item_precondition_excluded") as any;
+  assert.ok(excluded, "a durable precondition-exclusion event must be recorded");
+  assert.deepEqual(excluded.data, { item_id: "100", required_stage: "pipeline:ready", observed_stage: "pipeline:backlog" });
+});
+
+test("regression (#568 review 1, finding eb82a1de): a dispatch whose label was moved back to backlog mid-dispatch (nonzero transitions) remains workflow-engine-defect / run_fatal, not a precondition exclusion", async () => {
+  // Item "100" is admissible at this cycle's reconciliation (pipeline:ready) but Pass 2's
+  // post-dispatch read observes it flipped back to pipeline:backlog — a real transition
+  // happened (ready -> backlog) during dispatch, not a zero-transition no-op, so it must NOT be
+  // converted into a non-fatal precondition exclusion (that would mask a genuine engine
+  // failure).
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+
+  let calls = 0;
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      calls++;
+      return calls === 1 ? { state: "open", labels: ["pipeline:ready"] } : { state: "open", labels: ["pipeline:backlog"] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    getLabelEvents: (() => {
+      let labelEventCalls = 0;
+      return async () => {
+        labelEventCalls++;
+        // First call is the pre-dispatch baseline snapshot (nothing has happened yet); the
+        // second is the post-dispatch read, which observes the real ready -> backlog transition
+        // that happened during the dispatch window — even though the observed stage snapshots
+        // below already differ, the authoritative signal this test proves matters is the diff
+        // against the label-add history, not the snapshot comparison.
+        return labelEventCalls === 1 ? [] : [{ label: "pipeline:backlog", createdAt: "2026-07-23T00:00:01.000Z" }];
+      };
+    })(),
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "failed",
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+  });
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(result.stop?.reason, "run_fatal");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked");
+  assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
+  const events = await readEvents(deps, "run-1");
+  assert.ok(!events.find((e: any) => e.kind === "loop_item_precondition_excluded"), "must not be recorded as a precondition exclusion");
+});
+
+test("regression (#568 review 2, finding 8bb189a0): a round-trip dispatch (backlog -> ready -> backlog) that fails remains workflow-engine-defect / run_fatal, even though before/after stage snapshots match", async () => {
+  // Item "100" is observed at pipeline:backlog both before dispatch (reconciliation) and after
+  // dispatch (Pass 2's safety-net read) — identical snapshots would falsely look like a
+  // zero-transition no-op under snapshot-equality alone. But the label-add history shows the item
+  // was actually promoted to pipeline:ready and moved back to pipeline:backlog during the dispatch
+  // window — a genuine transition occurred, so this must remain a run-fatal engine defect, not a
+  // non-fatal precondition exclusion.
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "in_progress") });
+  const { deps } = await setup(contract, ledger);
+
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      // Both reconciliation (pre-dispatch) and Pass 2's safety-net read (post-dispatch) observe
+      // the same stage label — a naive before/after comparison would wrongly call this a no-op.
+      return { state: "open", labels: ["pipeline:backlog"] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    getLabelEvents: (() => {
+      let labelEventCalls = 0;
+      return async () => {
+        labelEventCalls++;
+        // First call is the pre-dispatch baseline (still at backlog, no round trip yet). The
+        // second is the post-dispatch read, which observes the full round trip: promoted to
+        // ready, then moved back to backlog, both during the dispatch window.
+        return labelEventCalls === 1
+          ? []
+          : [
+              { label: "pipeline:ready", createdAt: "2026-07-23T00:00:01.000Z" },
+              { label: "pipeline:backlog", createdAt: "2026-07-23T00:00:02.000Z" },
+            ];
+      };
+    })(),
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "failed",
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+  });
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.equal(cycle.stop?.reason, "run_fatal", "a round-trip transition must never be masked as a zero-transition no-op");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked");
+  assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
+  const events = await readEvents(deps, "run-1");
+  assert.ok(!events.find((e: any) => e.kind === "loop_item_precondition_excluded"), "must not be recorded as a precondition exclusion");
+});
+
+test("regression (#568 review 1, finding f09d500c): a real round-trip transition is never masked as a zero-transition no-op when the supervisor host's clock is far ahead of GitHub's event timestamps", async () => {
+  // The old zero-transition check compared GitHub-authored `createdAt` values against
+  // `deps.observe.now()` (the supervisor host's local clock). If the host clock is ahead of
+  // GitHub — simulated here with `now()` fixed far in the future — every label-add event from a
+  // real dispatch-window round trip would compare as earlier than the cutoff, so
+  // `zeroTransitions` would wrongly become true and this genuine engine defect would be excluded
+  // as a non-fatal precondition no-op instead of recorded as `workflow-engine-defect`. The fix
+  // diffs the pre-dispatch and post-dispatch label-add snapshots against each other — both
+  // GitHub-authored — so this host/GitHub clock skew must no longer be able to mask the
+  // transition.
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "in_progress") });
+  const { deps } = await setup(contract, ledger);
+
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:backlog"] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    getLabelEvents: (() => {
+      let labelEventCalls = 0;
+      return async () => {
+        labelEventCalls++;
+        return labelEventCalls === 1
+          ? []
+          : [
+              { label: "pipeline:ready", createdAt: "2026-07-23T00:00:01.000Z" },
+              { label: "pipeline:backlog", createdAt: "2026-07-23T00:00:02.000Z" },
+            ];
+      };
+    })(),
+    // The host clock is decades ahead of the GitHub event timestamps above — under the old
+    // local-clock cutoff this alone would make `zeroTransitions` true.
+    now: () => new Date("2099-01-01T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "failed",
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+  });
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.equal(cycle.stop?.reason, "run_fatal", "clock skew must never mask a real round-trip transition as a zero-transition no-op");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked");
+  assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
+  const events = await readEvents(deps, "run-1");
+  assert.ok(!events.find((e: any) => e.kind === "loop_item_precondition_excluded"), "must not be recorded as a precondition exclusion");
 });

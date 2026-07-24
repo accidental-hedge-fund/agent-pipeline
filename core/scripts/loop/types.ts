@@ -364,6 +364,10 @@ export interface LoopContract {
    *  goal-loop run — names the schema id the run originated from. Absent for
    *  natively-compiled contracts. */
   imported_from_schema?: string;
+  /** Present only when this run was created via `pipeline loop --new-run` to supersede a
+   *  terminally-stopped canonical run for the same selector (#568, capability
+   *  `loop-run-supersession`) — names the retired run id. Absent for every other run. */
+  supersedes?: string;
   /** Additive, optional run policy governing the scheduler's concurrency budget (#530, capability
    *  `durable-run-independent-scheduler`). Absent, or `max_concurrent: 1`, keeps the run's
    *  observable behavior identical to the pre-#530 serialized single-active-item invariant —
@@ -590,6 +594,12 @@ export interface LoopExternalIdentity {
   head_sha: string;
   merge_commit_sha: string | null;
   checks_conclusion: "success" | "failure" | "pending" | "none";
+  /** The issue's current `pipeline:*` stage label, minus the prefix (e.g. `"backlog"`,
+   *  `"ready"`, `"review-1"`) — `null` when the issue carries no `pipeline:*` label at all.
+   *  Feeds the precondition stage gate (#568, capability `loop-precondition-stage-gate`); see
+   *  loop/precondition.ts. When more than one `pipeline:*` label is present (not expected in
+   *  normal operation), the first one observed is recorded. */
+  pipeline_stage: string | null;
   observed_at: string;
 }
 
@@ -632,6 +642,25 @@ export interface LoopDrift {
   class: LoopDriftClass;
 }
 
+// ---------------------------------------------------------------------------
+// Precondition stage gate (#568, capability `loop-precondition-stage-gate`).
+// See loop/precondition.ts.
+// ---------------------------------------------------------------------------
+
+/** A durable, non-fatal record excluding one work-list item from the executable frontier this
+ *  cycle because it has not yet reached the `pipeline:ready` precondition — still carrying
+ *  `pipeline:backlog`, or no `pipeline:*` label at all. Never a `blocked` transition, never
+ *  counted toward recovery budget, never a run stop. Re-evaluated against live truth every
+ *  reconciliation pass — see {@link classifyPreconditionExclusions} in loop/precondition.ts. */
+export interface LoopPreconditionExclusion {
+  item_id: string;
+  /** The pipeline stage label required for admission — always `"pipeline:ready"`. */
+  required_stage: string;
+  /** The observed pre-pipeline stage label, or `"none"` when the item carries no `pipeline:*`
+   *  label at all. */
+  observed_stage: string;
+}
+
 export interface LoopReconciliation {
   sequence: number;
   time: string;
@@ -660,6 +689,11 @@ export interface LoopLedger {
    *  transition (on this or a resumed process) can check it. A pre-#510 ledger has no such
    *  field; see {@link upgradeLedgerForPauseAuthority} in loop/pause.ts. */
   authority_amendments: LoopAuthorityAmendment[];
+  /** Present only once this terminally-stopped run has been superseded via `pipeline loop
+   *  --new-run` (#568, capability `loop-run-supersession`) — names the fresh run that replaced
+   *  it. Set by a narrow, token-free administrative write ({@link markRunSuperseded},
+   *  loop/store.ts) since a terminally-stopped run holds no lock. Absent otherwise. */
+  superseded_by?: string;
 }
 
 export interface LoopLockRecord {
@@ -744,6 +778,10 @@ export const LOOP_SUPERVISOR_ACTIONS = [
   "resume",
   "stop",
   "noop",
+  /** A pending item was excluded from the executable frontier this cycle because it has not yet
+   *  reached the `pipeline:ready` precondition (#568, capability `loop-precondition-stage-gate`)
+   *  — never a `blocked` transition, never run-fatal. See loop/precondition.ts. */
+  "exclude_item",
 ] as const;
 
 export type LoopSupervisorAction = (typeof LOOP_SUPERVISOR_ACTIONS)[number];

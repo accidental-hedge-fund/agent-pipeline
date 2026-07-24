@@ -17,6 +17,7 @@ import {
   type LoopEngineName,
   type LoopItemLedgerEntry,
   type LoopLedger,
+  type LoopPreconditionExclusion,
   type LoopStopRecord,
   type LoopSupervisorProcess,
 } from "./types.ts";
@@ -42,6 +43,7 @@ import { reconcile, transitionItem, type ReconcileObserveDeps } from "./reconcil
 import { blockItem, classifyAndBlockItem } from "./recovery.ts";
 import { computeExternalDependencyStatuses, detectDependencyDeadlock, propagateSkips } from "./dependencies.ts";
 import { detectChangedFileOverlap, selectSchedulableSet } from "./schedule.ts";
+import { buildPreconditionExclusion, classifyPreconditionExclusions, excludeContractItems, hasNewLabelEvent, isPrePipelineStage, pipelineStageFromLabels } from "./precondition.ts";
 import {
   LOOP_EXECUTION_CONTRACT_SCHEMA,
   normalizeLoopOutcome,
@@ -147,6 +149,45 @@ async function abandonInProgressItem(
   return newLedger;
 }
 
+/** Reverts a dispatched item that turned out to still be pre-pipeline back to `pending`, instead
+ *  of the terminal `abandoned`/`blocked` families — the dispatch-outcome safety net (#568,
+ *  capability `loop-precondition-stage-gate`, design.md decision 3). Deliberately skips the
+ *  "already stopped" guard `transitionItem`/`blockItem` enforce (mirroring `startItem`/
+ *  `abandonInProgressItem` above): Pass 2 must still durably classify every dispatched item even
+ *  after an earlier sibling in the same pass recorded a genuine-defect run stop. */
+async function excludeInProgressItem(
+  store: LoopStoreDeps,
+  input: { runId: string; token: string; itemId: string; engine: LoopEngineName; exclusion: LoopPreconditionExclusion },
+): Promise<LoopLedger> {
+  const ledger = await readLedger(store, input.runId);
+  const item = ledger.items[input.itemId];
+  if (!item || item.state !== "in_progress") {
+    throw new LoopError(
+      "validation",
+      `item "${input.itemId}" cannot be precondition-excluded from state "${item?.state}" — only an in_progress item may revert this way`,
+    );
+  }
+  const time = store.now().toISOString();
+  const updated: LoopItemLedgerEntry = {
+    ...item,
+    state: "pending",
+    history: [
+      ...item.history,
+      {
+        time,
+        from: "in_progress",
+        to: "pending",
+        engine: input.engine,
+        note: `precondition exclusion: required ${input.exclusion.required_stage}, observed ${input.exclusion.observed_stage}`,
+      },
+    ],
+  };
+  const newLedger: LoopLedger = { ...ledger, items: { ...ledger.items, [input.itemId]: updated } };
+  await writeLedger(store, newLedger, input.token);
+  await appendEvent(store, input.runId, input.token, "loop_item_precondition_excluded", input.exclusion);
+  return newLedger;
+}
+
 const DONE_OR_ABANDONED = new Set(["ready", "merged", "released", "deployed", "abandoned", "skipped"]);
 
 // ---------------------------------------------------------------------------
@@ -246,12 +287,41 @@ export async function runSupervisorCycle(
   }
   const propagated = propagation.skippedItemIds.length > 0;
 
-  const allDone = contract.items.every((i) => DONE_OR_ABANDONED.has(ledger.items[i.id]?.state ?? ""));
+  // Precondition stage gate (#568, capability `loop-precondition-stage-gate`): a pending item
+  // not yet at the `pipeline:ready` precondition (still `pipeline:backlog`, or no `pipeline:*`
+  // label) is excluded from the executable frontier every cycle, re-evaluated against the fresh
+  // reconciliation observation above — never frozen, never a `blocked` transition, never
+  // run-fatal. See loop/precondition.ts.
+  const preconditionExclusions = classifyPreconditionExclusions(contract, ledger);
+  const preconditionExcludedIds = new Set(preconditionExclusions.map((e) => e.item_id));
+  for (const exclusion of preconditionExclusions) {
+    await appendEvent(deps.store, runId, token, "loop_item_precondition_excluded", exclusion);
+    await appendActionEvidence(deps.store, runId, token, {
+      item_id: exclusion.item_id,
+      action: "exclude_item",
+      outcome: `precondition:required=${exclusion.required_stage},observed=${exclusion.observed_stage}`,
+      next_action: ledger.last_reconciliation?.next_actions[exclusion.item_id] ?? null,
+      progress: "no_progress",
+    });
+  }
+  // The scheduling-input view every eligibility/dependency computation below consults instead of
+  // `contract` — a precondition-excluded item is never admitted to the frontier and never
+  // considered a dependency-deadlock participant in its own right (ledger reads for *other*
+  // items' `depends_on` edges are unaffected: they read `ledger.items`, not `contract.items`).
+  const schedulableContract = excludeContractItems(contract, preconditionExcludedIds);
+
+  // A run is fully resolved once every item is done/abandoned OR precondition-excluded — an
+  // all-backlog (or all-excluded) work list completes with an all-excluded report instead of
+  // spinning toward the no-progress watchdog (design.md decision 1's stated trade-off).
+  const allDone = contract.items.every((i) => {
+    const state = ledger.items[i.id]?.state ?? "";
+    return DONE_OR_ABANDONED.has(state) || preconditionExcludedIds.has(i.id);
+  });
   if (allDone) {
     await appendActionEvidence(deps.store, runId, token, {
       item_id: null,
       action: "noop",
-      outcome: "all_items_done",
+      outcome: preconditionExcludedIds.size > 0 ? "all_items_done_or_excluded" : "all_items_done",
       next_action: null,
       progress: drifted || propagated ? "progress" : "no_progress",
     });
@@ -266,7 +336,7 @@ export async function runSupervisorCycle(
     // of one) it still ever admits at most one item — the same item `eligible[0]` would have
     // picked pre-#530 — so the serialized default's observable selection is unchanged; it
     // additionally now records a durable allow/deny rationale for every eligible candidate.
-    const decision = selectSchedulableSet({ contract, ledger, externalStatuses });
+    const decision = selectSchedulableSet({ contract: schedulableContract, ledger, externalStatuses });
     if (decision.rationale.length > 0) {
       // This durable event is the sole source the run-scoped parallelization decision ledger
       // (#528, loop/parallelization-ledger.ts) accumulates from — it adds no second write path;
@@ -280,7 +350,7 @@ export async function runSupervisorCycle(
   }
 
   if (activeItemIds.length === 0) {
-    const deadlockChain = detectDependencyDeadlock(contract, ledger, externalStatuses);
+    const deadlockChain = detectDependencyDeadlock(schedulableContract, ledger, externalStatuses);
     if (deadlockChain) {
       const time = deps.store.now().toISOString();
       const stop: LoopStopRecord = { reason: "dependency_deadlock", time, deadlock_chain: deadlockChain };
@@ -322,6 +392,22 @@ export async function runSupervisorCycle(
     done_definition: contract.done_definition,
     run_id: runId,
   });
+  // Captured before dispatch so the zero-transition safety net below (#568 review 2 finding
+  // 8bb189a0) can diff the issue's GitHub-authored label-add history across the dispatch window,
+  // rather than inferring "zero transitions" from equal before/after stage snapshots — a
+  // round-trip (e.g. backlog -> ready -> backlog) defeats snapshot equality. A failed fetch here
+  // leaves this item with no baseline; the safety net below then cannot prove a no-op and falls
+  // through to genuine-defect classification rather than risk masking a real dispatch (#568
+  // review 1 finding f09d500c: comparing GitHub-authored event times against the supervisor
+  // host's local clock is unsound under clock skew, so both snapshots here are GitHub-authored —
+  // never compared against `deps.observe.now()`).
+  const labelEventsBeforeDispatchByItem = new Map<string, { label: string; createdAt: string }[]>();
+  await Promise.allSettled(
+    activeItemIds.map(async (itemId) => {
+      const events = await deps.observe.getLabelEvents(Number(itemId));
+      labelEventsBeforeDispatchByItem.set(itemId, events);
+    }),
+  );
   const settled = await Promise.allSettled(activeItemIds.map((itemId) => deps.dispatchItem(buildRequest(itemId))));
 
   // With exactly one active item — the serialized default — a rejection is rethrown synchronously
@@ -467,10 +553,53 @@ export async function runSupervisorCycle(
       });
     } else {
       // "failed" — either reported directly, a rejected dispatch, or normalized from an outcome
-      // outside the defined terminal set (LOOP_TERMINAL_OUTCOMES). Recorded as a blocked item
-      // under the workflow-engine-defect class so it is never silently re-dispatched: that
-      // class's default policy is run_fatal, stopping the run immediately.
+      // outside the defined terminal set (LOOP_TERMINAL_OUTCOMES). Before classifying this as a
+      // genuine engine defect, check the dispatch-outcome safety net (#568, capability
+      // `loop-precondition-stage-gate`, design.md decision 3): the frontier gate above is the
+      // primary defense, but a pre-pipeline item could in principle still reach dispatch (e.g. a
+      // race where an operator flips the label back). A rejected/crashed dispatch never has a
+      // live issue response to check, so it always remains a genuine defect below.
       const dispatchError = dispatchErrorByItem.get(itemId);
+      let preconditionNoOp = false;
+      if (!dispatchError) {
+        try {
+          const issue = await deps.observe.getIssueStateAndLabels(Number(itemId));
+          const observedStage = pipelineStageFromLabels(issue?.labels ?? []);
+          // Zero-transition check (#568 review 2, finding 8bb189a0; review 1 finding f09d500c): a
+          // pre-pipeline outcome is only a genuine no-op when the dispatch made zero stage
+          // transitions. Comparing only the before/after stage snapshots is insufficient — a
+          // dispatch that round-trips (e.g. backlog -> ready -> backlog) before failing would show
+          // equal endpoints despite a real transition occurring. Diff the issue's authoritative
+          // label-add history against the pre-dispatch snapshot captured above instead of a local
+          // clock cutoff — both sides of the comparison are GitHub-authored, so host/GitHub clock
+          // skew cannot misclassify a real round-trip as a no-op. A missing pre-dispatch baseline
+          // (that fetch failed) can never prove zero transitions, so it falls through below.
+          const labelEventsBefore = labelEventsBeforeDispatchByItem.get(itemId);
+          const labelEventsAfter = await deps.observe.getLabelEvents(Number(itemId));
+          const zeroTransitions = labelEventsBefore !== undefined && !hasNewLabelEvent(labelEventsBefore, labelEventsAfter);
+          if (isPrePipelineStage(observedStage) && zeroTransitions) {
+            preconditionNoOp = true;
+            const exclusion = buildPreconditionExclusion(itemId, observedStage);
+            ledger = await excludeInProgressItem(deps.store, { runId, token, itemId, engine, exclusion });
+            await appendActionEvidence(deps.store, runId, token, {
+              item_id: itemId,
+              action: "exclude_item",
+              outcome: `precondition:required=${exclusion.required_stage},observed=${exclusion.observed_stage}`,
+              next_action: nextAction,
+              progress: "progress",
+              worktree_root: worktreeRootByItem.get(itemId) ?? null,
+            });
+          }
+        } catch {
+          // The live observation itself failed — fall through to the genuine-defect
+          // classification below rather than silently swallowing a real dispatch failure.
+        }
+      }
+      if (preconditionNoOp) continue;
+
+      // A genuine engine defect: recorded as a blocked item under the workflow-engine-defect
+      // class so it is never silently re-dispatched — that class's default policy is run_fatal,
+      // stopping the run immediately.
       ledger = await blockItem(deps.store, contract, {
         runId,
         token,

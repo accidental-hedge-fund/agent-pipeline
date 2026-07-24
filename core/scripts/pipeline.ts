@@ -133,7 +133,14 @@ import {
 } from "./stages/doctor.ts";
 import { runLoopPreflight, type LoopEngine, type LoopPreflightOutcome, type LoopSelector, type RawLoopArgs, type NativeGoalAttestation } from "./loop-preflight.ts";
 import { auditSupervisor, driveSupervisor, type SupervisorDeps } from "./loop/supervisor.ts";
-import { defaultLoopStoreDeps, runExists as loopRunExists } from "./loop/store.ts";
+import {
+  defaultLoopStoreDeps,
+  markRunSuperseded,
+  readContract,
+  readLedger,
+  resolveSupersessionChainHead,
+  runExists as loopRunExists,
+} from "./loop/store.ts";
 import { initRecoverableRun } from "./loop/recovery.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
 import { compileContractItems } from "./loop/dependencies.ts";
@@ -291,6 +298,8 @@ export interface CliOpts {
   resume?: string;
   /** loop: read-only report for the run instead of starting/resuming. */
   audit?: boolean;
+  /** loop: start a fresh run superseding a terminally-stopped canonical run for the same selector. */
+  newRun?: boolean;
   /** correction record: issue number to record the correction against. */
   issue?: number;
   /** correction record: bounded source kind (override|rejection|retry|repair|unblock|manual). */
@@ -390,6 +399,7 @@ export function buildCmd(): Command {
     .option("--roadmap-slice <slice>", "loop: named roadmap slice selector")
     .option("--resume <run-id>", "loop: resume an existing durable run by id, regardless of which engine created it")
     .option("--audit", "loop: read-only report for the run instead of starting/resuming")
+    .option("--new-run", "loop: start a fresh run superseding a terminally-stopped canonical run for the same selector")
     // papercut (#419) is agent-facing, not human-facing: registered and directly invocable
     // (see command-registry.ts + the dispatch block below) but deliberately absent from the
     // `[number]` argument's subcommand description above and from these two options'
@@ -719,6 +729,9 @@ export interface RunLoopEngineInput {
   selector?: LoopSelector;
   resumeRunId?: string;
   audit: boolean;
+  /** `--new-run` (#568, capability `loop-run-supersession`): only ever true alongside `selector`
+   *  — {@link normalizeLoopArgs} refuses it with `--resume` or with no selector present. */
+  newRun?: boolean;
   repoDir: string;
 }
 
@@ -726,6 +739,75 @@ export type LoopEngineResult =
   | { kind: "audit"; report: Awaited<ReturnType<typeof auditSupervisor>> }
   | { kind: "drive"; result: Awaited<ReturnType<typeof driveSupervisor>> }
   | { kind: "error"; message: string };
+
+export type NewRunSupersessionDecision =
+  | { kind: "resume-existing" }
+  | { kind: "mint"; newRunId: string }
+  | { kind: "refuse" };
+
+/** Pure decision step for `--new-run` (#568 review 1, finding b9472740): distinguishes
+ *  re-invoking `--new-run` against an already-minted, not-yet-resumed replacement run
+ *  (`chainLength > 0` and the head hasn't terminally stopped — resume it, don't mint a
+ *  duplicate) from a genuinely active canonical run with no prior supersession (refuse, per
+ *  the "resume, don't supersede, an active run" requirement) and from a terminally-stopped
+ *  head that is ready to be superseded (mint the next deterministic run id). */
+export function decideNewRunSupersession(
+  canonicalRunId: string,
+  chainLength: number,
+  headStopped: boolean,
+): NewRunSupersessionDecision {
+  if (!headStopped) {
+    return chainLength > 0 ? { kind: "resume-existing" } : { kind: "refuse" };
+  }
+  return { kind: "mint", newRunId: `${canonicalRunId}-s${chainLength + 1}` };
+}
+
+export interface SupersessionMintPlan {
+  /** Initialize the replacement run directory — only when it does not already exist. */
+  initNewRun: boolean;
+  /** Write the retired run's `superseded_by` pointer — only when it is not already correctly set. */
+  markSuperseded: boolean;
+}
+
+export type SupersessionMintRepairDecision =
+  | { kind: "plan"; plan: SupersessionMintPlan }
+  | { kind: "conflict"; message: string };
+
+/** Pure decision step for `--new-run`'s mint retry (#568 review 2, finding d4cbf5eb): a crash
+ *  between initializing the replacement run and writing the retired run's `superseded_by`
+ *  pointer must self-heal on the next `--new-run` invocation rather than wedge the chain
+ *  forever. Live state is read once by the caller and passed in here so this decision — same
+ *  pattern as {@link decideNewRunSupersession} — stays a pure function with no I/O of its own:
+ *  every branch is driven only by what already exists, never re-derived from a fresh read. */
+export function planSupersessionMintRepair(input: {
+  headRunId: string;
+  newRunId: string;
+  newRunExists: boolean;
+  /** The existing replacement run's `contract.supersedes`, when `newRunExists` is true. */
+  existingNewRunSupersedes: string | undefined;
+  /** The retired run's current ledger `superseded_by` pointer, if any. */
+  headSupersededBy: string | undefined;
+}): SupersessionMintRepairDecision {
+  if (input.newRunExists && input.existingNewRunSupersedes !== input.headRunId) {
+    return {
+      kind: "conflict",
+      message: `--new-run: existing run "${input.newRunId}" supersedes "${input.existingNewRunSupersedes}", not "${input.headRunId}" — supersession chain conflict`,
+    };
+  }
+  if (input.headSupersededBy && input.headSupersededBy !== input.newRunId) {
+    return {
+      kind: "conflict",
+      message: `--new-run: run "${input.headRunId}" is already superseded by "${input.headSupersededBy}", not "${input.newRunId}" — supersession chain conflict`,
+    };
+  }
+  return {
+    kind: "plan",
+    plan: {
+      initNewRun: !input.newRunExists,
+      markSuperseded: !input.headSupersededBy,
+    },
+  };
+}
 
 /** Drives (or audits) the in-repo supervisor for an already-passed preflight —
  *  the replacement for the former external-skill delegation payload (#512).
@@ -769,10 +851,63 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     } catch (err) {
       return { kind: "error", message: `selector resolution failed: ${(err as Error).message}` };
     }
-    runId = workListRunId(cfg.repo, input.engine, issues);
-    if (!(await loopRunExists(store, runId))) {
-      const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, runId);
-      await initRecoverableRun(store, contract, ledger);
+    const canonicalRunId = workListRunId(cfg.repo, input.engine, issues);
+
+    if (input.newRun) {
+      if (!(await loopRunExists(store, canonicalRunId))) {
+        return {
+          kind: "error",
+          message: `--new-run: no existing run found for this selector (canonical run "${canonicalRunId}") — nothing to supersede`,
+        };
+      }
+      const { headRunId, chainLength } = await resolveSupersessionChainHead(store, canonicalRunId);
+      const headLedger = await readLedger(store, headRunId);
+      const decision = decideNewRunSupersession(canonicalRunId, chainLength, !!headLedger.stop);
+      if (decision.kind === "refuse") {
+        return {
+          kind: "error",
+          message: `--new-run: run "${headRunId}" for this selector is not terminally stopped — resume it instead (--resume ${headRunId})`,
+        };
+      }
+      if (decision.kind === "resume-existing") {
+        runId = headRunId;
+      } else {
+        const newRunId = decision.newRunId;
+        // Re-derive the repair plan from live state on every mint attempt — including a retry
+        // where `newRunId` already exists — rather than gating the reverse-pointer write on
+        // `newRunId` not yet existing (#568 review 2 finding d4cbf5eb): a crash between
+        // initializing the replacement and writing the retired run's `superseded_by` pointer
+        // would otherwise wedge the chain forever, since resolveSupersessionChainHead only
+        // trusts the retired ledger's own pointer.
+        const newRunExists = await loopRunExists(store, newRunId);
+        const existingNewRunSupersedes = newRunExists ? (await readContract(store, newRunId)).supersedes : undefined;
+        const headLedgerNow = await readLedger(store, headRunId);
+        const repair = planSupersessionMintRepair({
+          headRunId,
+          newRunId,
+          newRunExists,
+          existingNewRunSupersedes,
+          headSupersededBy: headLedgerNow.superseded_by,
+        });
+        if (repair.kind === "conflict") {
+          return { kind: "error", message: repair.message };
+        }
+        if (repair.plan.initNewRun) {
+          const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, newRunId);
+          contract.supersedes = headRunId;
+          await initRecoverableRun(store, contract, ledger);
+        }
+        if (repair.plan.markSuperseded) {
+          await markRunSuperseded(store, headRunId, newRunId);
+        }
+        runId = newRunId;
+      }
+    } else {
+      runId = canonicalRunId;
+      if (!(await loopRunExists(store, runId))) {
+        const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, runId);
+        await initRecoverableRun(store, contract, ledger);
+      }
     }
   } else {
     return { kind: "error", message: "no selector or --resume run id was provided" };
@@ -848,6 +983,7 @@ export async function runLoopCommand(
     issues: positionalIssues,
     resume: opts.resume,
     audit: opts.audit,
+    newRun: opts.newRun,
   };
 
   // Read only the loop.native_goal_attestation key, gh-free (design.md
@@ -877,6 +1013,7 @@ export async function runLoopCommand(
     selector: outcome.args.selector,
     resumeRunId: outcome.args.resumeRunId,
     audit: outcome.args.audit,
+    newRun: outcome.args.newRun,
     repoDir,
   });
 

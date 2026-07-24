@@ -21,6 +21,7 @@ import { promisify } from "node:util";
 import { LABEL_PREFIX, type PipelineConfig } from "../types.ts";
 import {
   getIssueCloseState,
+  getIssueLabelEvents,
   getIssueStateAndLabels,
   getPrChecks,
   getPrDetail,
@@ -28,6 +29,7 @@ import {
   parseChecksAggregate,
 } from "../gh.ts";
 import { getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
+import { pipelineStageFromLabels } from "./precondition.ts";
 import {
   LoopError,
   isLoopAuthorityGate,
@@ -96,6 +98,13 @@ export interface ReconcileObserveDeps {
   getExternalDependencyIssueState(
     issueNumber: number,
   ): Promise<{ state: "open" | "closed"; stateReason: "completed" | "not_planned" | "reopened" | null } | null>;
+  /** The issue's `pipeline:*` label-add history, ordered by GitHub's timeline
+   *  (#568 review 2 finding 8bb189a0): an authoritative record of every stage
+   *  transition, used to prove *zero* transitions occurred during a dispatch
+   *  window rather than inferring it from equal before/after stage snapshots
+   *  — a round-trip (e.g. backlog -> ready -> backlog) defeats snapshot
+   *  equality but still shows up here. */
+  getLabelEvents(issueNumber: number): Promise<{ label: string; createdAt: string }[]>;
   now(): Date;
 }
 
@@ -168,6 +177,9 @@ export function defaultReconcileObserveDeps(cfg: PipelineConfig): ReconcileObser
     async getExternalDependencyIssueState(issueNumber) {
       return getIssueCloseState(cfg, issueNumber);
     },
+    async getLabelEvents(issueNumber) {
+      return getIssueLabelEvents(cfg, issueNumber);
+    },
     now: () => new Date(),
   };
 }
@@ -200,6 +212,7 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
   const issue = await deps.getIssueStateAndLabels(issueNumber);
   const issue_open = issue?.state === "open";
   const ready_label_present = issue?.labels.includes(READY_LABEL) ?? false;
+  const pipeline_stage = pipelineStageFromLabels(issue?.labels ?? []);
 
   let pr_number: number | null = null;
   let pr_state: LoopExternalIdentity["pr_state"] = null;
@@ -240,6 +253,7 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
     head_sha,
     merge_commit_sha,
     checks_conclusion,
+    pipeline_stage,
     observed_at: deps.now().toISOString(),
   };
 }

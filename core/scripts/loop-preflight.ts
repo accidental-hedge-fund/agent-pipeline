@@ -333,6 +333,10 @@ export interface LoopArgs {
   selector?: LoopSelector;
   resumeRunId?: string;
   audit: boolean;
+  /** `--new-run` (#568, capability `loop-run-supersession`): start a fresh run superseding the
+   *  canonical run for `selector` once it is terminally stopped. Always paired with a selector —
+   *  {@link normalizeLoopArgs} refuses it alongside `--resume` or with no selector present. */
+  newRun: boolean;
 }
 
 export class LoopArgError extends Error {}
@@ -349,6 +353,7 @@ export interface RawLoopArgs {
   issues?: string[];
   resume?: string;
   audit?: boolean;
+  newRun?: boolean;
 }
 
 const RANGE_RE = /^(\d+)-(\d+)$/;
@@ -431,11 +436,20 @@ export function normalizeLoopArgs(raw: RawLoopArgs): LoopArgs {
       "pipeline:loop requires a selector (--milestone, --label, --range, --roadmap-slice, or an issue list), --resume <run-id>, or --audit",
     );
   }
+  if (raw.newRun && raw.resume) {
+    throw new LoopArgError("pipeline:loop --new-run cannot be combined with --resume");
+  }
+  if (raw.newRun && present.length === 0) {
+    throw new LoopArgError(
+      "pipeline:loop --new-run requires a selector (--milestone, --label, --range, --roadmap-slice, or an issue list) naming the run to supersede",
+    );
+  }
 
   return {
     selector: present[0]?.[1],
     resumeRunId: raw.resume,
     audit: !!raw.audit,
+    newRun: !!raw.newRun,
   };
 }
 
