@@ -388,6 +388,12 @@ export async function isCommitOnRemote(wtPath: string, branch: string, sha: stri
  * new, or the branch diverged) is ignored: that is exactly the
  * "harness ran but left nothing recoverable" case the disclosure elsewhere
  * already handles.
+ *
+ * Merges `FETCH_HEAD`, not `origin/<branch>` (#553 review-1 finding fa9d001a):
+ * `git fetch origin <branch>` populates `FETCH_HEAD` but does not reliably
+ * update the `refs/remotes/origin/<branch>` tracking ref, so merging the
+ * tracking ref could silently merge a stale pre-fetch SHA and leave `wt.path`
+ * behind the executor's actual push.
  */
 export async function syncWorktreeToDelegatedExecutorResult(
   wtPath: string,
@@ -396,7 +402,7 @@ export async function syncWorktreeToDelegatedExecutorResult(
 ): Promise<void> {
   const fetch = await gitFn(wtPath, ["fetch", "origin", branch], { ignoreFailure: true });
   if (fetch.code !== 0) return;
-  await gitFn(wtPath, ["merge", "--ff-only", `origin/${branch}`], { ignoreFailure: true });
+  await gitFn(wtPath, ["merge", "--ff-only", "FETCH_HEAD"], { ignoreFailure: true });
 }
 
 export async function advanceFix(

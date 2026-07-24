@@ -814,6 +814,21 @@ test("syncWorktreeToDelegatedExecutorResult: no push happened → local HEAD unc
   }
 });
 
+test("syncWorktreeToDelegatedExecutorResult: merges FETCH_HEAD, not the origin/<branch> tracking ref (#553 review-1 finding fa9d001a)", async () => {
+  // `git fetch origin <branch>` populates FETCH_HEAD but does not reliably
+  // update refs/remotes/origin/<branch>. A fake gitFn proves the merge call
+  // targets FETCH_HEAD directly rather than the tracking ref, which could be
+  // stale and leave the worktree behind the executor's actual push.
+  const calls = [];
+  const fakeGit = async (wtPath, args) => {
+    calls.push(args);
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  await syncWorktreeToDelegatedExecutorResult("/fake/wt", "main", fakeGit);
+  assert.deepEqual(calls[0], ["fetch", "origin", "main"]);
+  assert.deepEqual(calls[1], ["merge", "--ff-only", "FETCH_HEAD"]);
+});
+
 test("advanceFix source pin: a delegated executor result triggers the worktree sync before any local git state is read", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
   const retryIdx = src.indexOf("const result = retryResult.finalResult;");
