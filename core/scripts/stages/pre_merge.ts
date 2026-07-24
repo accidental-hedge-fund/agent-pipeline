@@ -142,10 +142,15 @@ export const PRE_MERGE_AUTOFIX_PREFIX = "fix: pre-merge auto-fix";
  *                   window immediately after the push.
  * "error"         — harness failure, dirty worktree, push failure, or no
  *                   commit produced. Worktree rolled back to pre-fix HEAD.
+ *                   `diagnostic` is set specifically for the #553 disclosed
+ *                   case: the harness ran and the inspected worktree ended
+ *                   clean with no new commit (nothing recoverable) — it names
+ *                   the worktree path so the operator can tell that outcome
+ *                   apart from every other rollback reason.
  */
 export type PreMergeAutoFixResult =
   | { status: "fix-committed"; headSha: string }
-  | { status: "error" };
+  | { status: "error"; diagnostic?: string };
 
 /**
  * Injectable seam for the bounded pre-merge auto-fix attempt (#359).
@@ -382,20 +387,36 @@ export async function performPreMergeAutoFix(
   // below) is an ambiguous case out of scope (design decision 2) and keeps the
   // existing fail-closed rollback unchanged.
   let salvaged = false;
+  let salvageFoundNothing = false;
   if (confirmedNoNewCommit) {
     const salvageResult = await salvageFn(
       wt.path, issueNumber, pipelineRunId, PRE_MERGE_AUTOFIX_SALVAGE_LABEL,
     );
     salvaged = salvageResult.salvaged;
+    // "Nothing to salvage" (as opposed to an attempted-but-failed salvage,
+    // signalled by `failureReason`) means the worktree was genuinely clean —
+    // the #553 disclosed case below.
+    salvageFoundNothing = !salvaged && !salvageResult.failureReason;
   }
 
   if (!salvaged) {
+    // #553: the harness ran (we already invoked it above) and left the
+    // inspected worktree clean with no new commit — nothing for salvage to
+    // recover. Name the worktree so the operator can tell this apart from a
+    // silent no-op instead of a bare "0 transitions / nothing to salvage".
+    const cleanNoRecoverableWork = confirmedNoNewCommit && salvageFoundNothing;
+    const diagnostic = cleanNoRecoverableWork
+      ? `pre-merge fix harness for #${issueNumber} ran but left worktree ${wt.path} ` +
+        `clean with no new commit — no recoverable work was found there`
+      : undefined;
+
     if (!result.success) {
+      if (diagnostic) console.error(`[pipeline] ${diagnostic}`);
       if (headBefore) {
         await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
         await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
       }
-      return { status: "error" };
+      return diagnostic ? { status: "error", diagnostic } : { status: "error" };
     }
 
     const statusAfter = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
@@ -407,11 +428,13 @@ export async function performPreMergeAutoFix(
     // state indicates the harness exited early or its pre-commit self-check withheld the
     // commit, and we must not push a partial or self-check-rejected fix.
     if (hasUncommitted || !hasNewCommitHarness) {
+      const finalDiagnostic = diagnostic && !hasUncommitted ? diagnostic : undefined;
+      if (finalDiagnostic) console.error(`[pipeline] ${finalDiagnostic}`);
       if (headBefore) {
         await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
         await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
       }
-      return { status: "error" };
+      return finalDiagnostic ? { status: "error", diagnostic: finalDiagnostic } : { status: "error" };
     }
   }
 
@@ -1992,6 +2015,10 @@ export async function enforceReviewShaGate(
       // below was produced against — `targetHead` unless an auto-fix re-review
       // supersedes it (#481 review 2 finding 1).
       let finalBlockingHead = targetHead;
+      // #553: names the inspected worktree when the auto-fix harness ran but
+      // left it clean with no recoverable work, so the block reason discloses
+      // that outcome instead of a bare "findings; fix required" message.
+      let autoFixDiagnostic: string | undefined;
       const attemptAutoFixFn = deps.attemptPreMergeAutoFix;
       if (attemptAutoFixFn && allBlockingAutoFixable(partition.blocking)) {
         // One-attempt bound (crash-safe): detect a prior auto-fix commit by
@@ -2225,6 +2252,9 @@ export async function enforceReviewShaGate(
             // Re-review still blocks or returned unparseable output: fall through to block below.
           }
           // fixRes.status === "error": fall through to block below.
+          if (fixRes.status === "error" && fixRes.diagnostic) {
+            autoFixDiagnostic = fixRes.diagnostic;
+          }
         }
         // Prior auto-fix attempt detected: fall through to block below.
       }
@@ -2254,7 +2284,9 @@ export async function enforceReviewShaGate(
       await setBlockedFn(
         cfg,
         issueNumber,
-        "Pre-merge delta review found blocking findings; fix required before merging.",
+        autoFixDiagnostic
+          ? `Pre-merge delta review found blocking findings; fix required before merging. ${autoFixDiagnostic}`
+          : "Pre-merge delta review found blocking findings; fix required before merging.",
         "pre-merge",
         "needs-human",
       );

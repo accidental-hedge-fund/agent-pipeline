@@ -33,6 +33,7 @@ import {
   parseFindingSummaries,
   parseHumanDecisionDeclarations,
   resolveFixCommitGateMode,
+  syncWorktreeToDelegatedExecutorResult,
 } from "../scripts/stages/fix.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 
@@ -754,6 +755,97 @@ test("isCommitOnRemote: fetch failure with stale tracking ref containing the sha
   } finally {
     await cleanup();
   }
+});
+
+// ---------------------------------------------------------------------------
+// #553: an external stage executor (invokeStageExecutor) is a bare HTTP call
+// with no cwd/worktree concept — it cannot commit into wt.path directly. When
+// it pushes work, `syncWorktreeToDelegatedExecutorResult` must fast-forward
+// the local checkout to that push before the pipeline inspects local git
+// state for new-commit/salvage detection.
+// ---------------------------------------------------------------------------
+
+test("syncWorktreeToDelegatedExecutorResult: fast-forwards the worktree to a commit pushed by a delegated executor", async () => {
+  const { remoteDir, cloneDir, cleanup } = await makeRemoteAndClone();
+  try {
+    const { stdout: before } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    const shaBefore = before.trim();
+
+    // Simulate the external executor: a separate clone pushes a new commit to
+    // origin/main independently of `cloneDir` (our stand-in for wt.path) —
+    // exactly what an agent-system executor with no cwd of its own would do.
+    const executorClone = join(remoteDir, "..", "executor-clone");
+    await execFileAsync("git", ["clone", remoteDir, executorClone]);
+    await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: executorClone });
+    await execFileAsync("git", ["config", "user.name", "Test"], { cwd: executorClone });
+    await execFileAsync("git", ["commit", "--allow-empty", "-m", "executor fix"], { cwd: executorClone });
+    await execFileAsync("git", ["push", "origin", "main"], { cwd: executorClone });
+    const { stdout: pushed } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: executorClone });
+    const shaPushed = pushed.trim();
+    assert.notEqual(shaPushed, shaBefore, "sanity: the executor's push must move the remote tip");
+
+    // Bite check: without syncing, the local checkout never sees the push the
+    // executor made — exactly the clean-worktree-with-no-visible-commit
+    // signature reported on lyric-utils run 648/2026-07-23.
+    const { stdout: staleHead } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    assert.equal(staleHead.trim(), shaBefore, "bite check: local HEAD is stale before syncing");
+
+    await syncWorktreeToDelegatedExecutorResult(cloneDir, "main");
+
+    const { stdout: after } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    assert.equal(
+      after.trim(), shaPushed,
+      "the worktree must be fast-forwarded to the commit the delegated executor actually pushed",
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("syncWorktreeToDelegatedExecutorResult: no push happened → local HEAD unchanged (nothing to sync)", async () => {
+  const { cloneDir, cleanup } = await makeRemoteAndClone();
+  try {
+    const { stdout: before } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    await syncWorktreeToDelegatedExecutorResult(cloneDir, "main");
+    const { stdout: after } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: cloneDir });
+    assert.equal(after.trim(), before.trim(), "no remote change means the local checkout stays as-is");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("syncWorktreeToDelegatedExecutorResult: merges FETCH_HEAD, not the origin/<branch> tracking ref (#553 review-1 finding fa9d001a)", async () => {
+  // `git fetch origin <branch>` populates FETCH_HEAD but does not reliably
+  // update refs/remotes/origin/<branch>. A fake gitFn proves the merge call
+  // targets FETCH_HEAD directly rather than the tracking ref, which could be
+  // stale and leave the worktree behind the executor's actual push.
+  const calls = [];
+  const fakeGit = async (wtPath, args) => {
+    calls.push(args);
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  await syncWorktreeToDelegatedExecutorResult("/fake/wt", "main", fakeGit);
+  assert.deepEqual(calls[0], ["fetch", "origin", "main"]);
+  assert.deepEqual(calls[1], ["merge", "--ff-only", "FETCH_HEAD"]);
+});
+
+test("advanceFix source pin: a delegated executor result triggers the worktree sync before any local git state is read", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  const retryIdx = src.indexOf("const result = retryResult.finalResult;");
+  const syncIdx = src.indexOf("await syncWorktreeToDelegatedExecutorResult(wt.path,", retryIdx);
+  const headAfterIdx = src.indexOf(
+    'let headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"]',
+    retryIdx,
+  );
+  assert.ok(retryIdx !== -1 && syncIdx !== -1 && headAfterIdx !== -1);
+  assert.ok(retryIdx < syncIdx, "the sync must run after the harness result is known");
+  assert.ok(syncIdx < headAfterIdx, "the sync must run before local HEAD is read for new-commit detection");
+  const guardSlice = src.slice(retryIdx, syncIdx);
+  assert.match(
+    guardSlice,
+    /if\s*\(result\.executor_name\)\s*\{/,
+    "the sync must be gated on the result having come from an external executor",
+  );
 });
 
 // ---------------------------------------------------------------------------
