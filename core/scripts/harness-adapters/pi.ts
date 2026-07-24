@@ -1,4 +1,4 @@
-// pi adapter — Pi Coding Agent CLI (`@mariozechner/pi-coding-agent`, #431
+// pi adapter — Pi Coding Agent CLI (`@earendil-works/pi-coding-agent`, #431
 // task 4). Argv verified via the project's README.md at
 // github.com/badlogic/pi-mono (design.md decision 4):
 //
@@ -91,7 +91,7 @@ export const piAdapter: HarnessAdapter = {
       return {
         ok: false,
         failure: "missing-cli",
-        message: "pi CLI not found on PATH — install `@mariozechner/pi-coding-agent` and complete /login once interactively.",
+        message: "pi CLI not found on PATH — install `@earendil-works/pi-coding-agent` and complete /login once interactively.",
       };
     }
     if (req.sandbox) {

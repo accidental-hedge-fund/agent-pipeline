@@ -185,6 +185,17 @@ test("opencode preflight: a requested sandbox mode is rejected as unsupported, n
   assert.equal(opencodeAdapter.capabilities.sandbox, false);
 });
 
+// --- #571: missing-cli guidance must name the maintained npm package ---
+
+test("pi preflight: missing-cli guidance names the maintained package, not the deprecated one", async () => {
+  const deps = fakeDeps({ execCheck: () => false });
+  const result = await piAdapter.preflight(deps, {});
+  assert.equal(result.ok, false);
+  assert.equal(result.failure, "missing-cli");
+  assert.match(result.message ?? "", /@earendil-works\/pi-coding-agent/);
+  assert.doesNotMatch(result.message ?? "", /@mariozechner\/pi-coding-agent/);
+});
+
 test("pi/opencode buildInvocation still always passes their unattended auto-approve flag", () => {
   const piInv = piAdapter.buildInvocation({ prompt: "p", worktreeDir: "/tmp/w", sandbox: true });
   assert.ok(piInv.args.includes("-a"));
