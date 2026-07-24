@@ -18,6 +18,7 @@ import {
   makeOpenspecPlanningHooks,
   revisedPlanHeader,
   runPlanningPhases,
+  salvageIfNoNewCommit,
   sanitizeBodyForResearch,
   sanitizeBriefForPrompt,
   validateHumanFeedbackAck,
@@ -28,6 +29,9 @@ import {
 } from "../scripts/stages/planning.ts";
 import type { BriefResult } from "../scripts/last30days.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
+import type { TrySalvageResult } from "../scripts/salvage-harness-work.ts";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import type { OpenIssue } from "../scripts/gh.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -903,6 +907,97 @@ test("runPlanningPhases — blocker equivalence: implementation harness failure"
   assert.equal(o?.stage, f?.stage, "openspec stage matches freeform");
   assert.ok(f?.reason.startsWith("Implementation harness"), `freeform reason: ${f?.reason}`);
   assert.ok(o?.reason.startsWith("Implementation harness"), `openspec reason: ${o?.reason}`);
+});
+
+// ---------------------------------------------------------------------------
+// #547: implement-stage harness failure/timeout path attempts salvage before
+// blocking, mirroring the fix stage's crash-retry salvage (#486).
+// ---------------------------------------------------------------------------
+
+test("salvageIfNoNewCommit: headBefore empty → salvaged false, injected gitFn never called", async () => {
+  let gitCalls = 0;
+  const gitFn = async () => { gitCalls++; return { stdout: "sha1", stderr: "", code: 0 }; };
+  const salvageFn = async (): Promise<TrySalvageResult> => ({ salvaged: true });
+  const result = await salvageIfNoNewCommit(
+    "/fake/wt", 42, "run-42", "implement (crash/timeout)", "", undefined, gitFn, salvageFn,
+  );
+  assert.deepEqual(result, { salvaged: false });
+  assert.equal(gitCalls, 0, "no headBefore means nothing to compare — git must not be consulted");
+});
+
+test("salvageIfNoNewCommit: a new commit exists (headAfter !== headBefore) → salvaged false, salvageFn never called", async () => {
+  const gitFn = async () => ({ stdout: "sha2", stderr: "", code: 0 });
+  let salvageCalls = 0;
+  const salvageFn = async (): Promise<TrySalvageResult> => { salvageCalls++; return { salvaged: true }; };
+  const result = await salvageIfNoNewCommit(
+    "/fake/wt", 42, "run-42", "implement (crash/timeout)", "sha1", undefined, gitFn, salvageFn,
+  );
+  assert.deepEqual(result, { salvaged: false });
+  assert.equal(salvageCalls, 0, "a new commit means nothing to salvage — the salvage seam must not run");
+});
+
+test("salvageIfNoNewCommit: no new commit (headAfter === headBefore) → salvageFn invoked, result passed through", async () => {
+  const gitFn = async () => ({ stdout: "sha1", stderr: "", code: 0 });
+  const salvageFn = async (): Promise<TrySalvageResult> => ({ salvaged: true });
+  const result = await salvageIfNoNewCommit(
+    "/fake/wt", 42, "run-42", "implement (crash/timeout)", "sha1", undefined, gitFn, salvageFn,
+  );
+  assert.deepEqual(result, { salvaged: true });
+});
+
+test("salvageIfNoNewCommit: a failed salvage attempt's failureReason is passed through", async () => {
+  const gitFn = async () => ({ stdout: "sha1", stderr: "", code: 0 });
+  const salvageFn = async (): Promise<TrySalvageResult> => ({ salvaged: false, failureReason: "git add failed: disk full" });
+  const result = await salvageIfNoNewCommit(
+    "/fake/wt", 42, "run-42", "implement (crash/timeout)", "sha1", undefined, gitFn, salvageFn,
+  );
+  assert.deepEqual(result, { salvaged: false, failureReason: "git add failed: disk full" });
+});
+
+test("runPlanningPhases #547: implement harness fails, salvage also fails → block comment discloses the salvage failure reason", async () => {
+  let callCount = 0;
+  const failOnSecondCall = {
+    invoke: async () => {
+      callCount++;
+      return callCount >= 2 ? harnessFailure : revisionOkResult;
+    },
+    // Non-empty, stable HEAD so implHeadBefore is truthy and salvageIfNoNewCommit
+    // is actually consulted (rather than short-circuiting on an empty headBefore
+    // as the base fake does).
+    gitInWorktree: async () => ({ stdout: "deadbeef", stderr: "", code: 0 }),
+    trySalvageUncommittedWork: async (): Promise<TrySalvageResult> =>
+      ({ salvaged: false, failureReason: "git add failed: disk full" }),
+  };
+  callCount = 0;
+  const f = await runAndCapture(freeformHooks(), failOnSecondCall);
+  assert.equal(f?.tag, "harness-failure", "salvage failure must fall through to the existing harness-failure block");
+  assert.equal(f?.stage, "implementing");
+  assert.ok(
+    f?.reason.includes("Salvage of uncommitted work also failed: git add failed: disk full"),
+    `block comment must disclose the salvage failure reason, got: ${f?.reason}`,
+  );
+});
+
+// Bite check: without the #547 salvage wiring, the implement-failure block
+// path never calls trySalvageUncommittedWork at all, so the injected fake
+// above would never run and this assertion would have nothing to prove
+// against — the reason string would just be the bare harness-failure message
+// with no salvage disclosure. The assertion above only holds because the fix
+// threads `crashSalvageFailure` into the block comment.
+test("planning.ts source pin #547: implement-failure path attempts salvage before the terminal harness-failure block", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/planning.ts", import.meta.url)), "utf8");
+  const resultCheckIdx = src.indexOf("if (!result.success) {");
+  const salvageIdx = src.indexOf(
+    "const { salvaged, failureReason: crashSalvageFailure } = await salvageIfNoNewCommit(",
+    resultCheckIdx,
+  );
+  const blockIdx = src.indexOf(
+    '"implementing",\n        "harness-failure",\n      );',
+    resultCheckIdx,
+  );
+  assert.ok(resultCheckIdx !== -1 && salvageIdx !== -1 && blockIdx !== -1);
+  assert.ok(resultCheckIdx < salvageIdx, "salvage must be attempted inside the harness-failure branch");
+  assert.ok(salvageIdx < blockIdx, "salvage must be attempted before the terminal harness-failure block");
 });
 
 test("runPlanningPhases — blocker equivalence: no-commits", async () => {

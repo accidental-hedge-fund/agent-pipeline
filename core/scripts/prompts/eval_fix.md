@@ -35,3 +35,6 @@ This is eval-fix attempt {{attempt}} of {{max_attempts}} total eval-gate attempt
 5. If the failure genuinely cannot be resolved (it needs a product decision, or
    the eval command itself is misconfigured), explain the blocker clearly in your
    output instead of guessing.
+
+## Single-Turn Invocation (required)
+This invocation is single-turn: there is no later turn in which deferred work can complete. Run `{{command}}` synchronously in the foreground — do NOT launch it in the background and end your turn waiting for a notification; no notification will ever arrive in this environment. Do NOT end your turn while committing still depends on a background task — wait synchronously for the command to finish, then commit, before ending the turn.

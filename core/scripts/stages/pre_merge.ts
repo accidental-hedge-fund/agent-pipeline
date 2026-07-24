@@ -31,7 +31,7 @@ import {
   transition,
 } from "../gh.ts";
 import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
-import { PIPELINE_INTERNAL_MARKER_FILES } from "../salvage-harness-work.ts";
+import { PIPELINE_INTERNAL_MARKER_FILES, trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import {
   attestPipelineComment,
@@ -285,6 +285,14 @@ export function allBlockingAutoFixable(blocking: ReviewFinding[]): boolean {
 }
 
 /**
+ * Stage label for a salvaged pre-merge auto-fix commit. The salvage commit is
+ * amended to `PRE_MERGE_AUTOFIX_PREFIX` immediately afterward (see below), so
+ * this label only ever surfaces if the amend itself fails and the run is
+ * rolled back — kept descriptive for that diagnostic case.
+ */
+const PRE_MERGE_AUTOFIX_SALVAGE_LABEL = "pre-merge auto-fix";
+
+/**
  * Perform one bounded pre-merge auto-fix attempt (#359).
  *
  * Invokes the implementer harness with the surgical-fix prompt (`buildFixPrompt`),
@@ -296,6 +304,17 @@ export function allBlockingAutoFixable(blocking: ReviewFinding[]): boolean {
  * worktree back to the pre-fix HEAD over a clean tree and returns "error".
  * The surgical-fix discipline (#235) — minimal diff, destructive-operation guard,
  * pre-commit self-check — applies via `buildFixPrompt` unchanged.
+ *
+ * Salvage (#547): when the harness exits — whether it reported success without
+ * committing, or crashed/timed out (`!result.success`) — leaving **no new
+ * commit** (`headAfter === headBefore`) but genuine uncommitted work in the
+ * worktree, that work is salvaged into a commit instead of discarded via
+ * `git reset --hard` + `git clean -fd`. The salvaged commit is then handled
+ * exactly like a harness-authored fix: amended to `PRE_MERGE_AUTOFIX_PREFIX`,
+ * pushed, and re-reviewed by the pre-merge delta gate — salvage never bypasses
+ * review. A commit that exists alongside *extra* leftover dirt
+ * (`hasNewCommit && hasUncommitted`) stays out of scope and keeps the existing
+ * fail-closed rollback, as does a genuinely clean no-commit worktree.
  */
 export async function performPreMergeAutoFix(
   cfg: PipelineConfig,
@@ -306,6 +325,7 @@ export async function performPreMergeAutoFix(
   wt: { path: string; slug: string },
   gitFn: typeof gitInWorktree,
   invokeFn: InvokeFn,
+  salvageFn: typeof trySalvageUncommittedWork = trySalvageUncommittedWork,
 ): Promise<PreMergeAutoFixResult> {
   const harness = cfg.harnesses?.implementer;
   if (!harness) return { status: "error" };
@@ -341,36 +361,63 @@ export async function performPreMergeAutoFix(
     sandbox: cfg.harness_sandbox,
   });
 
-  if (!result.success) {
-    if (headBefore) {
-      await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
-      await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-    }
-    return { status: "error" };
-  }
-
-  const headAfter = (
+  // Determine whether the harness left a new commit, regardless of whether it
+  // reported success or crashed/timed out (#547) — a crashed/timed-out harness
+  // may still have left no commit but genuine uncommitted work worth
+  // salvaging, exactly like the success-without-committing case below.
+  const headAfterHarness = (
     await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
-  const statusAfter = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
-  // Fail closed when status exits non-zero: we cannot prove the worktree is clean (#359 R2 F4).
-  const hasUncommitted = statusAfter.code !== 0 || statusAfter.stdout.trim() !== "";
-  const hasNewCommit = headAfter && headBefore && headAfter !== headBefore;
+  const hasNewCommitHarness = Boolean(headAfterHarness && headBefore && headAfterHarness !== headBefore);
+  // Confirmed-no-new-commit requires both reads to have actually succeeded and
+  // matched — an unreadable/empty post-harness HEAD must NOT be treated as
+  // "no new commit" (#547 review 1 finding 1), since a harness that did commit
+  // could then have its commit salvaged-over. Fail closed (existing rollback)
+  // when we can't prove HEAD is unchanged.
+  const confirmedNoNewCommit = Boolean(headBefore && headAfterHarness && headAfterHarness === headBefore);
 
-  // Spec (#359): a dirty post-harness worktree (uncommitted changes remaining) or
-  // no new commit is a failure — roll back. The harness MUST commit cleanly; a dirty
-  // state indicates the harness exited early or its pre-commit self-check withheld the
-  // commit, and we must not push a partial or self-check-rejected fix.
-  if (hasUncommitted || !hasNewCommit) {
-    if (headBefore) {
-      await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
-      await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-    }
-    return { status: "error" };
+  // Salvage (#547): attempt only when we've confirmed the harness left no new
+  // commit — whether it crashed/timed out or reported success without
+  // committing. A commit that exists alongside extra leftover dirt (checked
+  // below) is an ambiguous case out of scope (design decision 2) and keeps the
+  // existing fail-closed rollback unchanged.
+  let salvaged = false;
+  if (confirmedNoNewCommit) {
+    const salvageResult = await salvageFn(
+      wt.path, issueNumber, pipelineRunId, PRE_MERGE_AUTOFIX_SALVAGE_LABEL,
+    );
+    salvaged = salvageResult.salvaged;
   }
 
-  // Harness committed cleanly; amend to set the canonical subject so the
-  // one-attempt bound can detect this commit by subject prefix.
+  if (!salvaged) {
+    if (!result.success) {
+      if (headBefore) {
+        await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+        await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+      }
+      return { status: "error" };
+    }
+
+    const statusAfter = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+    // Fail closed when status exits non-zero: we cannot prove the worktree is clean (#359 R2 F4).
+    const hasUncommitted = statusAfter.code !== 0 || statusAfter.stdout.trim() !== "";
+
+    // Spec (#359): a dirty post-harness worktree (uncommitted changes remaining) or
+    // no new commit is a failure — roll back. The harness MUST commit cleanly; a dirty
+    // state indicates the harness exited early or its pre-commit self-check withheld the
+    // commit, and we must not push a partial or self-check-rejected fix.
+    if (hasUncommitted || !hasNewCommitHarness) {
+      if (headBefore) {
+        await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+        await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+      }
+      return { status: "error" };
+    }
+  }
+
+  // Harness committed cleanly, or its uncommitted work was salvaged into a
+  // commit (#547); amend to set the canonical subject so the one-attempt
+  // bound can detect this commit by subject prefix.
   const autoFixMsg = withTrailers(
     `${PRE_MERGE_AUTOFIX_PREFIX} for #${issueNumber}`,
     issueNumber,
@@ -497,6 +544,13 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
    */
   openspecValidateItem?: ValidateFn;
   /**
+   * Injectable salvage-uncommitted-work seam for the pre-merge bounded
+   * auto-fix path (#547). Defaults to `trySalvageUncommittedWork` from
+   * salvage-harness-work.ts. Tests inject a fake to exercise the salvage
+   * fallback without a real git subprocess.
+   */
+  trySalvageUncommittedWork?: typeof trySalvageUncommittedWork;
+  /**
    * GitHub login of the pipeline actor used to filter review comments to
    * trusted-authored entries before extracting spec-divergence signals (#356
    * finding 1). When absent, `maybeArchiveOpenspec` resolves it via `getGhActor()`
@@ -615,6 +669,7 @@ export async function advance(
   const gitFnForAutoFix = deps.gitInWorktree ?? gitInWorktree;
   const invokeFnForAutoFix = deps.invokeFn ?? invoke;
   const getForIssueForAutoFix = deps.getForIssue ?? getOnDiskForIssue;
+  const salvageFnForAutoFix = deps.trySalvageUncommittedWork ?? trySalvageUncommittedWork;
   const preAutoFixFn: ShaGateDeps["attemptPreMergeAutoFix"] =
     deps.attemptPreMergeAutoFix ??
     (cfg.harnesses?.implementer
@@ -630,6 +685,7 @@ export async function advance(
             wt,
             gitFnForAutoFix,
             invokeFnForAutoFix,
+            salvageFnForAutoFix,
           );
         }
       : undefined);
