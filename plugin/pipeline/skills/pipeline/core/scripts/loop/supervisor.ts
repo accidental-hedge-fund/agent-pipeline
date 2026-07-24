@@ -549,7 +549,15 @@ export async function runSupervisorCycle(
         try {
           const issue = await deps.observe.getIssueStateAndLabels(Number(itemId));
           const observedStage = pipelineStageFromLabels(issue?.labels ?? []);
-          if (isPrePipelineStage(observedStage)) {
+          // Zero-transition check (#568 review 1, finding eb82a1de): a pre-pipeline outcome is
+          // only a genuine no-op when the dispatch made zero stage transitions — the stage
+          // observed by *this cycle's* reconciliation (captured before dispatch, above) must
+          // match the stage observed just now (after dispatch). A dispatch that progressed and
+          // then failed, or whose label was moved back to backlog mid-dispatch, differs between
+          // the two and must remain a genuine `workflow-engine-defect` below.
+          const preDispatchStage = ledger.last_reconciliation?.observed[itemId]?.pipeline_stage ?? undefined;
+          const zeroTransitions = preDispatchStage !== undefined && preDispatchStage === observedStage;
+          if (isPrePipelineStage(observedStage) && zeroTransitions) {
             preconditionNoOp = true;
             const exclusion = buildPreconditionExclusion(itemId, observedStage);
             ledger = await excludeInProgressItem(deps.store, { runId, token, itemId, engine, exclusion });

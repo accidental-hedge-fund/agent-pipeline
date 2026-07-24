@@ -739,6 +739,28 @@ export type LoopEngineResult =
   | { kind: "drive"; result: Awaited<ReturnType<typeof driveSupervisor>> }
   | { kind: "error"; message: string };
 
+export type NewRunSupersessionDecision =
+  | { kind: "resume-existing" }
+  | { kind: "mint"; newRunId: string }
+  | { kind: "refuse" };
+
+/** Pure decision step for `--new-run` (#568 review 1, finding b9472740): distinguishes
+ *  re-invoking `--new-run` against an already-minted, not-yet-resumed replacement run
+ *  (`chainLength > 0` and the head hasn't terminally stopped — resume it, don't mint a
+ *  duplicate) from a genuinely active canonical run with no prior supersession (refuse, per
+ *  the "resume, don't supersede, an active run" requirement) and from a terminally-stopped
+ *  head that is ready to be superseded (mint the next deterministic run id). */
+export function decideNewRunSupersession(
+  canonicalRunId: string,
+  chainLength: number,
+  headStopped: boolean,
+): NewRunSupersessionDecision {
+  if (!headStopped) {
+    return chainLength > 0 ? { kind: "resume-existing" } : { kind: "refuse" };
+  }
+  return { kind: "mint", newRunId: `${canonicalRunId}-s${chainLength + 1}` };
+}
+
 /** Drives (or audits) the in-repo supervisor for an already-passed preflight —
  *  the replacement for the former external-skill delegation payload (#512).
  *  `--audit` performs zero durable writes (it never resolves gh config); a
@@ -792,20 +814,25 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
       }
       const { headRunId, chainLength } = await resolveSupersessionChainHead(store, canonicalRunId);
       const headLedger = await readLedger(store, headRunId);
-      if (!headLedger.stop) {
+      const decision = decideNewRunSupersession(canonicalRunId, chainLength, !!headLedger.stop);
+      if (decision.kind === "refuse") {
         return {
           kind: "error",
           message: `--new-run: run "${headRunId}" for this selector is not terminally stopped — resume it instead (--resume ${headRunId})`,
         };
       }
-      const newRunId = `${canonicalRunId}-s${chainLength + 1}`;
-      if (!(await loopRunExists(store, newRunId))) {
-        const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, newRunId);
-        contract.supersedes = headRunId;
-        await initRecoverableRun(store, contract, ledger);
-        await markRunSuperseded(store, headRunId, newRunId);
+      if (decision.kind === "resume-existing") {
+        runId = headRunId;
+      } else {
+        const newRunId = decision.newRunId;
+        if (!(await loopRunExists(store, newRunId))) {
+          const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, newRunId);
+          contract.supersedes = headRunId;
+          await initRecoverableRun(store, contract, ledger);
+          await markRunSuperseded(store, headRunId, newRunId);
+        }
+        runId = newRunId;
       }
-      runId = newRunId;
     } else {
       runId = canonicalRunId;
       if (!(await loopRunExists(store, runId))) {
