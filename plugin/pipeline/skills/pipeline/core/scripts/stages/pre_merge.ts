@@ -2712,12 +2712,17 @@ export async function maybeArchiveOpenspec(
   // a cue to force-push over the reviewed head (#579). Runs after the cleanliness
   // guard above so the fast-forward always operates on a known-clean tree.
   const branch = branchName(issueNumber, wt.slug);
-  const fetch = await gitFn(wt.path, ["fetch", "origin", branch], { ignoreFailure: true });
+  // Fetch with an explicit refspec so `refs/remotes/origin/<branch>` itself is updated —
+  // `git fetch origin <branch>` with no destination only populates FETCH_HEAD, leaving the
+  // tracking ref (and the `rev-parse origin/<branch>` read below) stale (#579 review 1).
+  const fetch = await gitFn(wt.path, ["fetch", "origin", `${branch}:refs/remotes/origin/${branch}`], {
+    ignoreFailure: true,
+  });
   if (fetch.code !== 0) {
     const detail = (fetch.stderr || fetch.stdout || "(no output)").trim();
     const reason =
       `Cannot sync worktree for #${issueNumber} to origin/${branch} before archiving — ` +
-      `\`git fetch origin ${branch}\` failed (exit ${fetch.code}): ${detail}`;
+      `\`git fetch origin ${branch}:refs/remotes/origin/${branch}\` failed (exit ${fetch.code}): ${detail}`;
     await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
     await recordDecision("fail", "fetch failed before archive");
     return { advanced: false, status: "blocked", reason: "fetch failed before archive" };

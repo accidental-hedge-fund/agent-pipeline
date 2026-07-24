@@ -92,8 +92,10 @@ test("maybeArchiveOpenspec: worktree behind origin/<branch> is fast-forwarded be
   });
 
   assert.ok(
-    gitCalls.some((a) => a[0] === "fetch" && a[1] === "origin" && a[2] === BRANCH),
-    "must fetch origin/<branch> before archiving",
+    gitCalls.some(
+      (a) => a[0] === "fetch" && a[1] === "origin" && a[2] === `${BRANCH}:refs/remotes/origin/${BRANCH}`,
+    ),
+    "must fetch into refs/remotes/origin/<branch> explicitly so the tracking ref itself is refreshed",
   );
   assert.ok(
     gitCalls.some((a) => a[0] === "merge" && a[1] === "--ff-only" && a[2] === `origin/${BRANCH}`),
@@ -156,6 +158,66 @@ test("maybeArchiveOpenspec: true divergence from origin/<branch> blocks with a S
     !gitCalls.some((a) => a.includes("--force") || a.includes("--force-with-lease")),
     "no git call may ever include --force or --force-with-lease",
   );
+});
+
+test("maybeArchiveOpenspec: fetch must update the origin/<branch> tracking ref itself, not just FETCH_HEAD (#579 review 1)", async (t) => {
+  // Models real `git fetch` semantics: a bare `git fetch origin <branch>` (no destination
+  // refspec) only populates FETCH_HEAD and leaves refs/remotes/origin/<branch> stale. This
+  // fake only advances the tracking ref when the fetch call carries the explicit
+  // `<branch>:refs/remotes/origin/<branch>` destination — the same way a real repo would.
+  const gitCalls: string[][] = [];
+  const pushCalls: string[][] = [];
+  const archiveCalls: string[] = [];
+  let trackingRefUpdated = false;
+  let ffApplied = false;
+  let archived = false;
+
+  const gitInWorktree = (async (_p: string, args: string[]) => {
+    gitCalls.push([...args]);
+    if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
+    if (args[0] === "status") {
+      return { stdout: archived ? " M openspec/specs/x/spec.md" : "", stderr: "", code: 0 };
+    }
+    if (args[0] === "fetch") {
+      if (args[2] === `${BRANCH}:refs/remotes/origin/${BRANCH}`) trackingRefUpdated = true;
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "rev-parse") {
+      if (args[1] === "HEAD") return { stdout: ffApplied ? REVIEWED_HEAD : OLD_HEAD, stderr: "", code: 0 };
+      if (args[1] === `origin/${BRANCH}`) {
+        return { stdout: trackingRefUpdated ? REVIEWED_HEAD : OLD_HEAD, stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "merge" && args[1] === "--ff-only") {
+      ffApplied = true;
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "add") return { stdout: "", stderr: "", code: 0 };
+    if (args[0] === "commit") return { stdout: "", stderr: "", code: 0 };
+    if (args[0] === "push") {
+      pushCalls.push([...args]);
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    return { stdout: "", stderr: "", code: 0 };
+  }) as AdvancePreMergeDeps["gitInWorktree"];
+
+  const deps = baseDeps(gitInWorktree);
+  deps.openspecArchive = (async (_w: string, id: string) => {
+    archiveCalls.push(id);
+    archived = true;
+    return { success: true, unavailable: false, output: "" };
+  }) as AdvancePreMergeDeps["openspecArchive"];
+
+  let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
+  await quiet(t, async () => {
+    out = await maybeArchiveOpenspec(cfg, ISSUE, "run-1", deps);
+  });
+
+  assert.ok(trackingRefUpdated, "fetch must carry the explicit refspec that updates the tracking ref");
+  assert.deepEqual(archiveCalls, [CHANGE_ID], "archive must proceed once the tracking ref reflects the reviewed head");
+  assert.equal(pushCalls.length, 1, "push must be attempted exactly once");
+  assert.equal((out as { status: string })?.status, "waiting", "sync + archive must succeed once the tracking ref is current");
 });
 
 test("maybeArchiveOpenspec: worktree already at origin/<branch> archives unchanged (regression guard) (#579)", async (t) => {
