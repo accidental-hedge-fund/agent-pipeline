@@ -374,6 +374,31 @@ export async function isCommitOnRemote(wtPath: string, branch: string, sha: stri
   return check.code === 0;
 }
 
+/**
+ * #553: an external stage executor (`invokeStageExecutor`) is a bare HTTP
+ * call — `{stage, prompt}` over the wire, per `executors.ts` — with no cwd or
+ * worktree concept at all, so it cannot commit into the local `wt.path`
+ * checkout the pipeline inspects for new-commit/salvage/test-gate detection.
+ * When an executor served the fix-harness call (`result.executor_name` set),
+ * any real work it did can only have reached the repo by being pushed to the
+ * branch it was told to operate on. Fetch and fast-forward `wt.path` to that
+ * branch tip so the pipeline's downstream inspection reflects the executor's
+ * actual result instead of a stale local checkout that never saw the push —
+ * the concrete checkout-mismatch this closes. A fetch/merge failure (nothing
+ * new, or the branch diverged) is ignored: that is exactly the
+ * "harness ran but left nothing recoverable" case the disclosure elsewhere
+ * already handles.
+ */
+export async function syncWorktreeToDelegatedExecutorResult(
+  wtPath: string,
+  branch: string,
+  gitFn: typeof gitInWorktree = gitInWorktree,
+): Promise<void> {
+  const fetch = await gitFn(wtPath, ["fetch", "origin", branch], { ignoreFailure: true });
+  if (fetch.code !== 0) return;
+  await gitFn(wtPath, ["merge", "--ff-only", `origin/${branch}`], { ignoreFailure: true });
+}
+
 export async function advanceFix(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -646,6 +671,15 @@ export async function advanceFix(
   });
   const result = retryResult.finalResult;
 
+  // #553: the final attempt was served by an external stage executor with no
+  // cwd of its own — sync `wt.path` to whatever it may have pushed to the
+  // issue branch before any local git state (HEAD, status, salvage) is read
+  // below, so the executor's real result and the pipeline's inspection can
+  // never diverge.
+  if (result.executor_name) {
+    await syncWorktreeToDelegatedExecutorResult(wt.path, branchName(issueNumber, wt.slug));
+  }
+
   // Retries exhausted (cap reached, or remaining budget fell at/below the
   // usable floor). Before the terminal block, attempt salvage of whatever
   // uncommitted work the crashed attempts left behind (#486) — the same
@@ -671,9 +705,11 @@ export async function advanceFix(
         : "";
       // #521: disclose why nothing was salvaged so the operator can see that
       // recoverable work may still exist without reading terminal.log.
+      // #553: a genuinely clean worktree (no salvage failure) is named
+      // explicitly — the harness ran but left nothing recoverable there.
       const salvageNote = crashSalvageFailure
         ? ` Salvage of uncommitted work also failed: ${crashSalvageFailure}`
-        : "";
+        : ` Worktree ${wt.path} is clean; no recoverable work was found there.`;
       const baseReason = `Fix harness (${harness}) failed${attemptsNote}: ${finalReason}.${budgetNote}${salvageNote}`;
       const reason = await appendWorktreeStateDisclosure(wt.path, baseReason);
       await setBlocked(cfg, issueNumber, reason, stage, "harness-failure");
@@ -844,10 +880,16 @@ export async function advanceFix(
         }
         // #521: disclose why nothing was salvaged so the operator can see that
         // recoverable work may still exist without reading terminal.log.
+        // #553: when the worktree is genuinely clean (no salvage failure — just
+        // nothing there), name the inspected worktree explicitly so this reads
+        // as a disclosed "harness ran, nothing recoverable" outcome rather than
+        // a silent no-op — `appendWorktreeStateDisclosure` below adds nothing
+        // extra for a clean worktree, so the path must be named here.
         const noCommitsMsg = noCommitSalvageFailure
           ? `${stage} reported success but produced no new commits. ` +
             `Salvage of uncommitted work also failed: ${noCommitSalvageFailure}`
-          : `${stage} reported success but produced no new commits.`;
+          : `${stage} reported success but produced no new commits; the fix harness ran ` +
+            `but left worktree ${wt.path} clean with no recoverable work found there.`;
         const noCommitsReason = await appendWorktreeStateDisclosure(wt.path, noCommitsMsg);
         await setBlocked(cfg, issueNumber, noCommitsReason, stage, "no-commits");
         return { advanced: false, status: "blocked", reason: noCommitsMsg, blockerKind: "no-commits" };

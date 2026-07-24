@@ -417,6 +417,31 @@ test("pre-merge auto-fix 5.6: auto-fix returns error → blocked, no partial pus
   assert.equal(rec.comments.length, 1, "only the initial delta comment; no re-review comment");
 });
 
+test("pre-merge auto-fix #553: auto-fix returns error with a diagnostic → block reason surfaces it", async (t) => {
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("correctness")],
+    reReviewFindings: [],
+    autoFixResult: "error",
+  });
+  deps.attemptPreMergeAutoFix = async () => ({
+    status: "error",
+    diagnostic:
+      "pre-merge fix harness for #16 ran but left worktree /fake/worktree clean with no new " +
+      "commit — no recoverable work was found there",
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out.status, "blocked");
+  assert.equal(rec.blocked.length, 1, "blocked after error");
+  assert.match(
+    rec.blocked[0].reason,
+    /\/fake\/worktree/,
+    "the #553 diagnostic naming the inspected worktree must reach the block reason, not just the internal result",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // one-attempt bound: fix committed but re-review still blocks → blocked, no 2nd attempt
 // ---------------------------------------------------------------------------
@@ -639,6 +664,45 @@ test("performPreMergeAutoFix finding-1 (bite): clean commit path → fix-committ
   );
   const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
   assert.equal(resetCall, undefined, "clean path must NOT call reset --hard");
+});
+
+test("performPreMergeAutoFix #553: harness cwd equals the salvage-inspected worktree path (worktree-locality invariant)", async () => {
+  const { fn: gitFn } = makeSeqGitFn([
+    // rev-parse HEAD (headBefore)
+    { code: 0, stdout: "sha1" },
+    // status --porcelain (pre-fix: clean)
+    { code: 0, stdout: "" },
+    // checkout -B <branch> (reattach succeeds)
+    { code: 0, stdout: "" },
+    // rev-parse HEAD (headAfterHarness — SAME as headBefore: no new commit)
+    { code: 0, stdout: "sha1" },
+    // reset --hard sha1 (rollback, since salvage found nothing)
+    { code: 0, stdout: "" },
+    // clean -fd (rollback)
+    { code: 0, stdout: "" },
+  ]);
+
+  let invokeCwd: string | undefined;
+  const invokeFn: InvokeFn = async (_harness, cwd) => {
+    invokeCwd = cwd;
+    return { success: false, stdout: "", stderr: "", exit_code: 1, duration: 1, timed_out: false };
+  };
+  let salvageCwd: string | undefined;
+  const salvageFn = async (wtPath: string) => {
+    salvageCwd = wtPath;
+    return { salvaged: false } as TrySalvageResult;
+  };
+
+  await performPreMergeAutoFix(
+    autoFixCfg, 42, "run-id", "finding: need fix", "Test issue", autoFixWt, gitFn, invokeFn, salvageFn,
+  );
+
+  assert.equal(invokeCwd, autoFixWt.path, "the fix harness must be invoked with the issue's managed worktree path");
+  assert.equal(salvageCwd, autoFixWt.path, "salvage must inspect the exact same worktree path the harness ran in");
+  assert.equal(
+    invokeCwd, salvageCwd,
+    "worktree-locality invariant: harness cwd and salvage-inspected path must never diverge",
+  );
 });
 
 // Finding 3 regression: reattach failure → "error" (harness never invoked)
@@ -1511,14 +1575,58 @@ test("performPreMergeAutoFix #547: genuinely clean worktree (nothing to salvage)
     salvageFn,
   );
 
-  assert.deepEqual(
-    result,
-    { status: "error" },
-    "a clean worktree (nothing salvageable) must keep the existing fail-closed rollback",
+  assert.equal(result.status, "error", "a clean worktree (nothing salvageable) must keep the existing fail-closed rollback");
+  // #553: the disclosed clean/no-commit escalation names the inspected
+  // worktree so the operator can tell "harness ran, nothing recoverable"
+  // apart from a silent no-op.
+  assert.match(
+    (result as { diagnostic?: string }).diagnostic ?? "",
+    /\/fake\/worktree/,
+    "the #553 disclosure must name the inspected worktree path",
   );
   assert.equal(salvageCalls.length, 1, "salvage is attempted (and finds nothing) before rollback");
   const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
   assert.ok(resetCall, "git reset --hard must still be called when nothing was salvaged");
+});
+
+test("performPreMergeAutoFix #553: harness reports success with a genuinely clean worktree (no commit) → disclosed escalation names the worktree", async () => {
+  const { fn: gitFn } = makeSeqGitFn([
+    // rev-parse HEAD (headBefore)
+    { code: 0, stdout: "sha1" },
+    // status --porcelain (pre-fix: clean)
+    { code: 0, stdout: "" },
+    // checkout -B <branch> (reattach succeeds)
+    { code: 0, stdout: "" },
+    // rev-parse HEAD (headAfterHarness — SAME as headBefore: no new commit)
+    { code: 0, stdout: "sha1" },
+    // status --porcelain (post-harness: also clean)
+    { code: 0, stdout: "" },
+    // reset --hard sha1 (rollback, since salvage found nothing)
+    { code: 0, stdout: "" },
+    // clean -fd (rollback)
+    { code: 0, stdout: "" },
+  ]);
+  const { fn: salvageFn, calls: salvageCalls } = makeSalvageFn({ salvaged: false });
+
+  const result = await performPreMergeAutoFix(
+    autoFixCfg,
+    42,
+    "run-id",
+    "finding: need fix",
+    "Test issue",
+    autoFixWt,
+    gitFn,
+    makeSucceedInvoke(),
+    salvageFn,
+  );
+
+  assert.equal(result.status, "error", "a clean worktree (nothing salvageable) must keep the existing fail-closed rollback");
+  assert.match(
+    (result as { diagnostic?: string }).diagnostic ?? "",
+    /\/fake\/worktree/,
+    "a harness that reports success but leaves the worktree clean must still disclose the inspected worktree path",
+  );
+  assert.equal(salvageCalls.length, 1, "salvage is attempted (and finds nothing) before rollback");
 });
 
 test("performPreMergeAutoFix #547: harness committed AND left extra dirt → ambiguous case stays out of scope, existing rollback unchanged", async () => {
