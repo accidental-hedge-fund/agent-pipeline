@@ -57,6 +57,7 @@ test("classifyAndEmitDispatchCrash: an engine-owned crash (TypeError) records a 
     pipelineVersion: "1.2.3",
     hostAdapter: "claude",
     runStoreDeps: deps,
+    productFaultEnabled: true,
   });
   const lines = (fs.files["/repo/.agent-pipeline/runs/1-x/events.jsonl"] ?? "").trim().split("\n");
   assert.equal(lines.length, 1, "exactly one product_fault event must be recorded");
@@ -75,6 +76,29 @@ test("classifyAndEmitDispatchCrash: a target-repo/gh/harness failure (plain Erro
     pipelineVersion: "1.2.3",
     hostAdapter: "claude",
     runStoreDeps: deps,
+    productFaultEnabled: true,
   });
   assert.equal(fs.files["/repo/.agent-pipeline/runs/1-x/events.jsonl"], undefined);
+});
+
+// #502 review 2 finding 66919abae5b98e38: an installation with no (or a
+// disabled) product_fault config must stay fully inert for this feature —
+// even a genuine engine-owned crash must record no event and deliver nothing
+// to any configured external sink.
+test("classifyAndEmitDispatchCrash: disabled product_fault config records nothing, even for an engine-owned crash", async () => {
+  const fs: FakeFs = { files: {} };
+  const deps = makeRunStoreDeps(fs);
+  await classifyAndEmitDispatchCrash(new TypeError("Cannot read properties of undefined"), {
+    runDir: "/repo/.agent-pipeline/runs/1-x",
+    stage: "planning",
+    pipelineVersion: "1.2.3",
+    hostAdapter: "claude",
+    runStoreDeps: deps,
+    productFaultEnabled: false,
+  });
+  assert.equal(
+    fs.files["/repo/.agent-pipeline/runs/1-x/events.jsonl"],
+    undefined,
+    "no events.jsonl artifact must be created when product_fault reporting is disabled",
+  );
 });

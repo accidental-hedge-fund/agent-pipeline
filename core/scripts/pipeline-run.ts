@@ -60,7 +60,7 @@ import {
 } from "./engine-identity.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { parseOverrideArg } from "./review-policy.ts";
-import { classifyProductFault, emitProductFault } from "./product-fault.ts";
+import { classifyProductFault, emitProductFault, resolveHostAdapter, resolveProductFaultConfig } from "./product-fault.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
 import { autoFileCorrections, autoFilePapercuts, realAutoFileDeps } from "./stages/papercut.ts";
 import * as planningStage from "./stages/planning.ts";
@@ -323,8 +323,18 @@ export function isEngineOwnedCrash(err: unknown): boolean {
  */
 export async function classifyAndEmitDispatchCrash(
   err: unknown,
-  ctx: { runDir: string; stage: string; pipelineVersion: string; hostAdapter: string; runStoreDeps: RunStoreDeps },
+  ctx: {
+    runDir: string;
+    stage: string;
+    pipelineVersion: string;
+    hostAdapter: string;
+    runStoreDeps: RunStoreDeps;
+    /** Resolved `product_fault.enabled` — absent/disabled config must produce
+     *  no event and no external delivery (default-inert requirement). */
+    productFaultEnabled: boolean;
+  },
 ): Promise<void> {
+  if (!ctx.productFaultEnabled) return;
   if (!isEngineOwnedCrash(err)) return;
   const errorClass = (err as Error).name || "Error";
   const classification = classifyProductFault({
@@ -897,14 +907,20 @@ export async function runAdvance(
         // #502: a stage crash with a native JS error type (never intentionally
         // thrown for a gh/git/harness/target-repo failure — see
         // isEngineOwnedCrash) is a probable Agent Pipeline defect, distinct
-        // from every other evidence class recorded above.
+        // from every other evidence class recorded above. Gated on the
+        // resolved product_fault config so an installation with no (or a
+        // disabled) product_fault block stays fully inert — no new
+        // events.jsonl artifact and no delivery to any configured external
+        // event sink.
         if (runDir) {
+          const productFaultConfig = await resolveProductFaultConfig(cfg.repo_dir, runStoreDeps);
           await classifyAndEmitDispatchCrash(err, {
             runDir,
             stage: auditStage,
             pipelineVersion: pinnedEngine?.version ?? "",
-            hostAdapter: process.env.PIPELINE_HARNESS ?? "unknown",
+            hostAdapter: resolveHostAdapter(),
             runStoreDeps,
+            productFaultEnabled: productFaultConfig.enabled,
           });
         }
         throw err;

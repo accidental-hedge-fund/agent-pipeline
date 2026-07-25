@@ -218,6 +218,9 @@ export async function emitProductFault(
   deps: RunStoreDeps = defaultRunStoreDeps,
 ): Promise<void> {
   try {
+    if (!isValidHostAdapter(payload.hostAdapter)) {
+      throw new Error(`emitProductFault: invalid host adapter "${payload.hostAdapter}"`);
+    }
     const clean = (s: string): string => sanitize(redactSecrets(s));
     const event: ProductFaultEvent = {
       schema_version: RUN_SCHEMA_VERSION,
@@ -228,7 +231,7 @@ export async function emitProductFault(
       rationale: clean(payload.classification.rationale),
       fingerprint: payload.classification.fingerprint,
       pipeline_version: clean(payload.pipelineVersion),
-      host_adapter: clean(payload.hostAdapter),
+      host_adapter: payload.hostAdapter,
       stage: clean(payload.stage),
       error_class: clean(payload.errorClass),
       exit_state: payload.classification.exitState,
@@ -274,6 +277,30 @@ const VALID_EXIT_STATE_VALUES: readonly ProductFaultExitState[] = [
   "unknown",
 ];
 
+/** Closed vocabulary for `host_adapter` — the engine's own built-in harness
+ *  identities (`Harness` in types.ts) plus the fallback used when the running
+ *  process cannot determine which one is active. Never an arbitrary
+ *  environment-variable value: a raw `PIPELINE_HARNESS` reading that isn't one
+ *  of these exact strings is not a bounded adapter identity and must be
+ *  rejected rather than sanitized and carried through. */
+const VALID_HOST_ADAPTER_VALUES = ["claude", "codex", "unknown"] as const;
+
+/** True when `value` is one of the closed set of known host-adapter
+ *  identities, rather than an arbitrary environment-variable value. */
+export function isValidHostAdapter(value: string): boolean {
+  return (VALID_HOST_ADAPTER_VALUES as readonly string[]).includes(value);
+}
+
+/** Resolve the current process's host-adapter identity from the closed
+ *  `Harness` vocabulary, never from the raw `PIPELINE_HARNESS` environment
+ *  value: only an exact match against a known adapter name is accepted, so an
+ *  unrelated or attacker-controlled environment string can never reach the
+ *  diagnostic payload — it collapses to the bounded `"unknown"` fallback. */
+export function resolveHostAdapter(env: NodeJS.ProcessEnv = process.env): string {
+  const raw = env.PIPELINE_HARNESS;
+  return raw === "claude" || raw === "codex" ? raw : "unknown";
+}
+
 /**
  * Full-shape validation for a `product_fault` event read back from a
  * persisted `events.jsonl` — the boundary a tampered or corrupted artifact
@@ -287,7 +314,7 @@ export function isValidProductFaultEvent(event: ProductFaultEvent): boolean {
     (VALID_CONFIDENCE_VALUES as readonly string[]).includes(event.confidence) &&
     (VALID_EXIT_STATE_VALUES as readonly string[]).includes(event.exit_state) &&
     typeof event.pipeline_version === "string" &&
-    typeof event.host_adapter === "string" &&
+    isValidHostAdapter(event.host_adapter) &&
     typeof event.stage === "string" &&
     typeof event.error_class === "string" &&
     typeof event.rationale === "string" &&
@@ -319,12 +346,15 @@ export function buildProductFaultPayload(input: {
   if (!isValidProductFaultFingerprint(input.fingerprint)) {
     throw new Error(`buildProductFaultPayload: invalid fingerprint "${input.fingerprint}"`);
   }
+  if (!isValidHostAdapter(input.hostAdapter)) {
+    throw new Error(`buildProductFaultPayload: invalid host adapter "${input.hostAdapter}"`);
+  }
   const clean = (s: string): string => sanitize(redactSecrets(s));
   return {
     payload_schema_version: PRODUCT_FAULT_PAYLOAD_SCHEMA_VERSION,
     run_schema_version: RUN_SCHEMA_VERSION,
     pipeline_version: clean(input.pipelineVersion),
-    host_adapter: clean(input.hostAdapter),
+    host_adapter: input.hostAdapter,
     stage: clean(input.stage),
     error_class: clean(input.errorClass),
     fingerprint: input.fingerprint,
@@ -351,26 +381,27 @@ export interface ProductFaultConfigBlock {
   intake_auth_env?: string;
 }
 
-/** Env-var names that name a GitHub credential — refused as an intake
- *  credential source so a `GITHUB_TOKEN`/`GH_TOKEN` (or any `GH_*`/`GITHUB_*`
- *  variable) can never be forwarded to a third-party intake endpoint. */
-const GITHUB_CREDENTIAL_ENV_NAME_RE = /^(GH|GITHUB)_/i;
+/** Fixed audience segment bound into every valid intake credential — the
+ *  intake service issues tokens scoped to this one purpose only. Binding a
+ *  required audience into the credential shape (rather than blocklisting
+ *  GitHub-shaped values by name or pattern) means no arbitrary environment
+ *  variable — a GitHub token, an AWS/npm/cloud secret, or anything else an
+ *  operator's environment happens to hold — can ever satisfy the check,
+ *  regardless of the env-var's name or the secret's own shape. */
+const PRODUCT_FAULT_INTAKE_AUDIENCE = "product-fault-intake";
 
-/** GitHub personal-access-token value shapes — refused even when the env-var
- *  name itself looks unrelated, since the credential *type* matters, not just
- *  its variable name. */
-const GITHUB_TOKEN_VALUE_RE = /^(ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{10,}$/;
+/** Required shape for a submission-scoped intake credential: a versioned,
+ *  audience-bound capability token issued by the intake service — never a
+ *  reused, general-purpose secret from the operator's environment. */
+const PRODUCT_FAULT_INTAKE_CREDENTIAL_RE = new RegExp(
+  `^pfic_v1\\.${PRODUCT_FAULT_INTAKE_AUDIENCE}\\.[A-Za-z0-9_-]{24,}$`,
+);
 
-/** True when `name` is disallowed as an `intake_auth_env` source — it names a
- *  GitHub credential variable rather than a dedicated submission credential. */
-export function isDisallowedIntakeAuthEnvName(name: string): boolean {
-  return GITHUB_CREDENTIAL_ENV_NAME_RE.test(name);
-}
-
-/** True when `value` is shaped like a GitHub token, regardless of which env
- *  var it came from. */
-export function isGithubTokenShaped(value: string): boolean {
-  return GITHUB_TOKEN_VALUE_RE.test(value.trim());
+/** True when `value` is a valid submission-scoped intake credential — a
+ *  versioned token bound to the `product-fault-intake` audience — rather than
+ *  an arbitrary environment variable's value forwarded by name. */
+export function isValidIntakeSubmissionCredential(value: string): boolean {
+  return PRODUCT_FAULT_INTAKE_CREDENTIAL_RE.test(value.trim());
 }
 
 /** Best-effort, gh-free check of the `product_fault` config block in
@@ -640,17 +671,19 @@ export async function runProductFaultReport(
     return { outcome: "manual-fallback", payload, draftUrl: draft.url };
   }
 
-  if (!config.intake_auth_env || isDisallowedIntakeAuthEnvName(config.intake_auth_env)) {
+  if (!config.intake_auth_env) {
     deps.log(
-      "Refusing to submit: intake_auth_env is absent or names a GitHub credential variable — " +
-        "endpoint submissions require a dedicated, non-GitHub submission credential.",
+      "Refusing to submit: intake_auth_env is absent — endpoint submissions require a dedicated " +
+        "submission-scoped intake credential.",
     );
     return { outcome: "auth-rejected", payload };
   }
   const authToken = process.env[config.intake_auth_env];
-  if (!authToken || isGithubTokenShaped(authToken)) {
+  if (!authToken || !isValidIntakeSubmissionCredential(authToken)) {
     deps.log(
-      "Refusing to submit: the credential named by intake_auth_env is absent or GitHub-token-shaped.",
+      "Refusing to submit: the credential named by intake_auth_env is absent or is not a valid " +
+        "submission-scoped intake credential (expected format: pfic_v1.product-fault-intake.<token>) — " +
+        "an arbitrary environment-variable value (a GitHub token or any other secret) can never satisfy this check.",
     );
     return { outcome: "auth-rejected", payload };
   }

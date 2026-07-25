@@ -25,6 +25,9 @@ import {
   productFaultAuditLogPath,
   isValidProductFaultEvent,
   isValidProductFaultFingerprint,
+  isValidIntakeSubmissionCredential,
+  isValidHostAdapter,
+  resolveHostAdapter,
   PRODUCT_FAULT_PAYLOAD_SCHEMA_VERSION,
   type ProductFaultEvent,
   type ProductFaultReportDeps,
@@ -484,7 +487,7 @@ test("runProductFaultReport: no product_fault event found -> nothing to report, 
  *  the submission tests below — set/restored around each test so the fake
  *  submission path has a valid credential to read via `process.env`. */
 const INTAKE_AUTH_ENV_NAME = "PIPELINE_REPORT_TOKEN";
-const INTAKE_AUTH_ENV_VALUE = "dedicated-submission-credential-value";
+const INTAKE_AUTH_ENV_VALUE = "pfic_v1.product-fault-intake.dedicatedsubmissioncredentialvalue";
 
 function withIntakeAuthEnv(fn: () => Promise<void>): Promise<void> {
   const prior = process.env[INTAKE_AUTH_ENV_NAME];
@@ -598,6 +601,71 @@ test("runProductFaultReport: refuses submission when intake_auth_env is absent",
   const result = await runProductFaultReport({ repoDir: "/repo" }, deps);
   assert.equal(result.outcome, "auth-rejected");
   assert.equal(deps.submitCalls.length, 0);
+});
+
+// #502 review 2 finding c6a3fc0131788ba7: a non-GitHub, non-token-shaped
+// privileged environment variable (an AWS/npm/etc. secret) must still be
+// refused — only a versioned, audience-bound intake credential is accepted,
+// never an arbitrary environment variable's value.
+test("isValidIntakeSubmissionCredential: rejects arbitrary high-value secrets that aren't GitHub-shaped", () => {
+  assert.equal(isValidIntakeSubmissionCredential("AKIAABCDEFGHIJKLMNOP"), false);
+  assert.equal(isValidIntakeSubmissionCredential("npm_1234567890abcdefghijklmnopqrstuvwxyz"), false);
+  assert.equal(isValidIntakeSubmissionCredential("just-some-arbitrary-secret-value"), false);
+});
+
+test("isValidIntakeSubmissionCredential: accepts only the versioned, audience-bound intake credential shape", () => {
+  assert.equal(isValidIntakeSubmissionCredential(INTAKE_AUTH_ENV_VALUE), true);
+  assert.equal(isValidIntakeSubmissionCredential("pfic_v1.other-audience.abcdefghijklmnopqrstuvwx"), false);
+  assert.equal(isValidIntakeSubmissionCredential("pfic_v1.product-fault-intake.tooshort"), false);
+});
+
+test("runProductFaultReport: refuses submission when intake_auth_env names an arbitrary non-GitHub secret (e.g. an AWS/npm credential)", async () => {
+  const fs = repoWithFault();
+  fs.files["/repo/.github/pipeline.yml"] +=
+    '  intake_endpoint: "https://intake.example.com"\n  intake_auth_env: "AWS_SECRET_ACCESS_KEY"\n';
+  const priorAws = process.env.AWS_SECRET_ACCESS_KEY;
+  process.env.AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+  try {
+    const deps = makeReportDeps({ fs, confirmResult: true });
+    const result = await runProductFaultReport({ repoDir: "/repo" }, deps);
+    assert.equal(result.outcome, "auth-rejected");
+    assert.equal(deps.submitCalls.length, 0, "must never forward an arbitrary environment secret to the intake endpoint");
+  } finally {
+    if (priorAws === undefined) delete process.env.AWS_SECRET_ACCESS_KEY;
+    else process.env.AWS_SECRET_ACCESS_KEY = priorAws;
+  }
+});
+
+// #502 review 2 finding d38aeff56469cef8: host_adapter must be derived from
+// the closed engine-harness vocabulary, never carried through from an
+// arbitrary environment value.
+test("isValidHostAdapter: accepts only the closed vocabulary", () => {
+  assert.equal(isValidHostAdapter("claude"), true);
+  assert.equal(isValidHostAdapter("codex"), true);
+  assert.equal(isValidHostAdapter("unknown"), true);
+  assert.equal(isValidHostAdapter("/Users/operator/secret-repo-name"), false);
+  assert.equal(isValidHostAdapter("some-other-value"), false);
+});
+
+test("resolveHostAdapter: collapses an unrecognized PIPELINE_HARNESS value to the bounded 'unknown' fallback", () => {
+  assert.equal(resolveHostAdapter({ PIPELINE_HARNESS: "claude" }), "claude");
+  assert.equal(resolveHostAdapter({ PIPELINE_HARNESS: "codex" }), "codex");
+  assert.equal(resolveHostAdapter({ PIPELINE_HARNESS: "/private/repo-name" }), "unknown");
+  assert.equal(resolveHostAdapter({}), "unknown");
+});
+
+test("buildProductFaultPayload: rejects a host adapter outside the closed vocabulary", () => {
+  assert.throws(() =>
+    buildProductFaultPayload({
+      pipelineVersion: "1.2.3",
+      hostAdapter: "/private/some/repo-path",
+      stage: "planning",
+      errorClass: "TypeError",
+      fingerprint: "abc123def4567890",
+      exitState: "crash",
+      confidence: "high",
+    }),
+  );
 });
 
 test("runProductFaultReport: no intake configured -> manual fallback draft, no auto-created issue, audit record written", async () => {
