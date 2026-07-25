@@ -45,7 +45,7 @@ import { blockItem } from "./recovery.ts";
 import { waitItem } from "./pause.ts";
 import { computeExternalDependencyStatuses, detectDependencyDeadlock, propagateSkips } from "./dependencies.ts";
 import { detectChangedFileOverlap, selectSchedulableSet } from "./schedule.ts";
-import { buildPreconditionExclusion, classifyPreconditionExclusions, excludeContractItems, hasNewLabelEvent, isPrePipelineStage, pipelineStageFromLabels } from "./precondition.ts";
+import { buildPreconditionExclusion, classifyPreconditionExclusions, excludeContractItems, hasNewLabelEvent, isBlockedInLabels, isPrePipelineStage, pipelineStageFromLabels } from "./precondition.ts";
 import {
   LOOP_EXECUTION_CONTRACT_SCHEMA,
   normalizeLoopOutcome,
@@ -192,6 +192,24 @@ async function excludeInProgressItem(
 
 const DONE_OR_ABANDONED = new Set(["ready", "merged", "released", "deployed", "abandoned", "skipped"]);
 
+/** Every item currently held (`paused`/`waiting`) in `ledger`, sorted for deterministic
+ *  reporting (#581, capability `loop-blocked-item-hold-continuation`). */
+function heldItemIdsFromLedger(ledger: LoopLedger): string[] {
+  return Object.values(ledger.items)
+    .filter((i) => i.state === "paused" || i.state === "waiting")
+    .map((i) => i.id)
+    .sort();
+}
+
+/** True when at least one `pending` item remains in `contract` — i.e. there is still work a
+ *  future cycle could pick up. Used to tell "an item just entered a hold, but siblings are still
+ *  queued" apart from "nothing is left to try but a hold" (#581). A `pending` item permanently
+ *  excluded by a dependency on a non-run-fatal blocked item is intentionally still counted here —
+ *  that dependency deadlock is the pre-existing no-progress watchdog's concern, not this check's. */
+function hasSchedulableWorkRemaining(contract: LoopContract, ledger: LoopLedger): boolean {
+  return contract.items.some((item) => ledger.items[item.id]?.state === "pending");
+}
+
 // ---------------------------------------------------------------------------
 // One drive cycle.
 // ---------------------------------------------------------------------------
@@ -203,6 +221,10 @@ export interface SupervisorCycleResult {
   stop: LoopStopRecord | null;
   holdOutstanding: boolean;
   allDone: boolean;
+  /** Every item currently held (`paused`/`waiting`) this cycle — populated whenever at least one
+   *  item is held, regardless of whether `holdOutstanding` is the terminal condition this cycle
+   *  (capability `loop-blocked-item-hold-continuation`, #581). Empty when no item is held. */
+  heldItemIds: string[];
 }
 
 /** Runs exactly one supervisor cycle: reconcile -> select at most one
@@ -227,19 +249,7 @@ export async function runSupervisorCycle(
       next_action: null,
       progress: "no_progress",
     });
-    return { progress: false, stop: ledger.stop, holdOutstanding: false, allDone: false };
-  }
-
-  const held = Object.values(ledger.items).find((i) => i.state === "paused" || i.state === "waiting");
-  if (held) {
-    await appendActionEvidence(deps.store, runId, token, {
-      item_id: held.id,
-      action: "noop",
-      outcome: `hold:${held.state}`,
-      next_action: "hold-for-human",
-      progress: "no_progress",
-    });
-    return { progress: false, stop: null, holdOutstanding: true, allDone: false };
+    return { progress: false, stop: ledger.stop, holdOutstanding: false, allDone: false, heldItemIds: heldItemIdsFromLedger(ledger) };
   }
 
   let drifted = false;
@@ -256,7 +266,7 @@ export async function runSupervisorCycle(
         next_action: null,
         progress: "no_progress",
       });
-      return { progress: false, stop: ledger.stop, holdOutstanding: false, allDone: false };
+      return { progress: false, stop: ledger.stop, holdOutstanding: false, allDone: false, heldItemIds: heldItemIdsFromLedger(ledger) };
     }
     throw err;
   }
@@ -270,7 +280,7 @@ export async function runSupervisorCycle(
       next_action: null,
       progress: "progress",
     });
-    return { progress: true, stop: ledger.stop, holdOutstanding: false, allDone: false };
+    return { progress: true, stop: ledger.stop, holdOutstanding: false, allDone: false, heldItemIds: heldItemIdsFromLedger(ledger) };
   }
 
   // Dependency integrity (#513, capability `durable-run-dependency-integrity`): verify every
@@ -312,6 +322,15 @@ export async function runSupervisorCycle(
   // items' `depends_on` edges are unaffected: they read `ledger.items`, not `contract.items`).
   const schedulableContract = excludeContractItems(contract, preconditionExcludedIds);
 
+  // Needs-human hold continuation (#581, capability `loop-blocked-item-hold-continuation`): a
+  // held (`paused`/`waiting`) item — whether entered on an earlier cycle or by this cycle's own
+  // Pass 2 below — is re-derived fresh from the ledger every cycle, so a hold cleared out-of-band
+  // between cycles naturally drops out of this set and the item rejoins the frontier. A held item
+  // is never itself a terminal condition while another item can still make progress: it is only
+  // excluded from the `pending` frontier `eligibleIndependentItems` already applies (a
+  // paused/waiting item is never `pending`), never carved out of `contract`/`schedulableContract`.
+  const heldItemIds = heldItemIdsFromLedger(ledger);
+
   // A run is fully resolved once every item is done/abandoned OR precondition-excluded — an
   // all-backlog (or all-excluded) work list completes with an all-excluded report instead of
   // spinning toward the no-progress watchdog (design.md decision 1's stated trade-off).
@@ -327,7 +346,7 @@ export async function runSupervisorCycle(
       next_action: null,
       progress: drifted || propagated ? "progress" : "no_progress",
     });
-    return { progress: drifted || propagated, stop: null, holdOutstanding: false, allDone: true };
+    return { progress: drifted || propagated, stop: null, holdOutstanding: false, allDone: true, heldItemIds };
   }
 
   let activeItemIds = Object.values(ledger.items).filter((i) => i.state === "in_progress").map((i) => i.id);
@@ -371,7 +390,24 @@ export async function runSupervisorCycle(
         next_action: null,
         progress: "progress",
       });
-      return { progress: true, stop, holdOutstanding: false, allDone: false };
+      return { progress: true, stop, holdOutstanding: false, allDone: false, heldItemIds };
+    }
+
+    // Terminal outstanding-hold condition (#581, capability `loop-blocked-item-hold-continuation`):
+    // reached only once the scheduler above already found nothing dispatchable this cycle (no
+    // `pending` item is currently eligible — dependency-blocked pending items fall through to the
+    // `no_eligible_item` no-op below unaffected) AND at least one item is held. A hold never halts
+    // the run on its own while a sibling is still schedulable — that case dispatches below instead
+    // of reaching this branch at all.
+    if (heldItemIds.length > 0) {
+      await appendActionEvidence(deps.store, runId, token, {
+        item_id: null,
+        action: "noop",
+        outcome: `hold_outstanding:${heldItemIds.join(",")}`,
+        next_action: "hold-for-human",
+        progress: "no_progress",
+      });
+      return { progress: drifted || propagated, stop: null, holdOutstanding: true, allDone: false, heldItemIds };
     }
 
     await appendActionEvidence(deps.store, runId, token, {
@@ -381,7 +417,7 @@ export async function runSupervisorCycle(
       next_action: null,
       progress: drifted || propagated ? "progress" : "no_progress",
     });
-    return { progress: drifted || propagated, stop: null, holdOutstanding: false, allDone: false };
+    return { progress: drifted || propagated, stop: null, holdOutstanding: false, allDone: false, heldItemIds };
   }
 
   // Dispatch every admitted item concurrently through the unchanged, per-item
@@ -530,8 +566,6 @@ export async function runSupervisorCycle(
   // rather than overwriting it — instead of being refused and left `in_progress` (which would make
   // it eligible for duplicate dispatch on a later recovery/resume). A stopped run never dispatches
   // again once this cycle returns, so classifying every sibling here causes no duplicate work.
-  let holdOutstanding = false;
-
   for (const itemId of activeItemIds) {
     const outcome = outcomeByItem.get(itemId)!;
     if (!parkedItemIds.has(itemId) && (outcome === "ready_to_deploy" || outcome === "abandoned")) continue;
@@ -568,7 +602,6 @@ export async function runSupervisorCycle(
         },
         note: "needs-human pipeline blocker (capability loop-needs-human-blocker-disposition)",
       });
-      holdOutstanding = true;
     } else {
       // "failed" — either reported directly, a rejected dispatch, or normalized from an outcome
       // outside the defined terminal set (LOOP_TERMINAL_OUTCOMES). Before classifying this as a
@@ -612,11 +645,15 @@ export async function runSupervisorCycle(
               progress: "progress",
               worktree_root: worktreeRootByItem.get(itemId) ?? null,
             });
-          } else if (observedStage === "blocked") {
+          } else if (isBlockedInLabels(issue?.labels ?? [])) {
             // A `failed` outcome whose live issue nonetheless carries `pipeline:blocked` is a
             // recoverable, human-unblockable pipeline blocker — not a genuine dispatch crash or
             // rejection — so it is routed to the same needs-human hold as a direct
-            // `blocked_needs_human` outcome, never `workflow-engine-defect`.
+            // `blocked_needs_human` outcome, never `workflow-engine-defect`. Detected by the
+            // label's presence, not by `observedStage` (the single `pipeline:*` stage-winner
+            // `pipelineStageFromLabels` derives) — a `pipeline:blocked` label co-present with
+            // another `pipeline:*` stage label must still be caught here (#581, capability
+            // `loop-blocked-item-hold-continuation`).
             needsHumanBlockerNoOp = true;
             ledger = await waitItem(deps.store, {
               runId,
@@ -629,7 +666,6 @@ export async function runSupervisorCycle(
               },
               note: "needs-human pipeline blocker safety net (capability loop-needs-human-blocker-disposition)",
             });
-            holdOutstanding = true;
             evidenceOutcome = "blocked_needs_human";
           }
         } catch {
@@ -667,7 +703,23 @@ export async function runSupervisorCycle(
     });
   }
 
-  return { progress: true, stop: ledger.stop, holdOutstanding, allDone: false };
+  // A hold entered this pass (or still outstanding from an earlier cycle) only becomes the run's
+  // terminal outstanding-hold condition once nothing else remains schedulable — while any sibling
+  // is still `pending`, a fresh dispatch this cycle already counts as progress, and the next cycle
+  // re-evaluates the frontier rather than halting here (#581, capability
+  // `loop-blocked-item-hold-continuation`).
+  const finalHeldItemIds = heldItemIdsFromLedger(ledger);
+  const terminalHold = !ledger.stop && finalHeldItemIds.length > 0 && !hasSchedulableWorkRemaining(contract, ledger);
+  if (terminalHold) {
+    await appendActionEvidence(deps.store, runId, token, {
+      item_id: null,
+      action: "noop",
+      outcome: `hold_outstanding:${finalHeldItemIds.join(",")}`,
+      next_action: "hold-for-human",
+      progress: "progress",
+    });
+  }
+  return { progress: true, stop: ledger.stop, holdOutstanding: terminalHold, allDone: false, heldItemIds: finalHeldItemIds };
 }
 
 // ---------------------------------------------------------------------------
@@ -774,6 +826,11 @@ export interface DriveSupervisorResult {
   holdOutstanding: boolean;
   allDone: boolean;
   resumed: boolean;
+  /** Every item held (`paused`/`waiting`) as of the last cycle driven — populated whenever
+   *  `holdOutstanding` is the terminal condition, so an operator sees exactly which items await a
+   *  human (capability `loop-blocked-item-hold-continuation`, #581). Empty when the run stopped or
+   *  completed with no outstanding hold. */
+  heldItemIds: string[];
 }
 
 /** Attaches (or resumes) and drives a run to a terminal condition: every item
@@ -814,6 +871,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
     let stop: LoopStopRecord | null = null;
     let holdOutstanding = false;
     let allDone = false;
+    let heldItemIds: string[] = [];
 
     while (cycles < cyclesSafetyCap) {
       cycles++;
@@ -832,6 +890,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
       }
       if (result.holdOutstanding) {
         holdOutstanding = true;
+        heldItemIds = result.heldItemIds;
         break;
       }
       if (result.allDone) {
@@ -883,7 +942,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
       stop = newLedger.stop;
     }
 
-    const result: DriveSupervisorResult = { runId: input.runId, cycles, stop, holdOutstanding, allDone, resumed: attach.resumed };
+    const result: DriveSupervisorResult = { runId: input.runId, cycles, stop, holdOutstanding, allDone, resumed: attach.resumed, heldItemIds };
     if ((stop || allDone) && deps.onDriveEnd) {
       try {
         await deps.onDriveEnd(result);

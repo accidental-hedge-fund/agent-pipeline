@@ -11,6 +11,7 @@ import {
   classifyPreconditionExclusions,
   excludeContractItems,
   hasNewLabelEvent,
+  isBlockedInLabels,
   isPrePipelineStage,
   pipelineStageFromLabels,
 } from "../scripts/loop/precondition.ts";
@@ -118,6 +119,27 @@ test("pipelineStageFromLabels: no pipeline:* label -> null", () => {
 test("pipelineStageFromLabels: extracts the suffix after the pipeline: prefix", () => {
   assert.equal(pipelineStageFromLabels(["pipeline:backlog"]), "backlog");
   assert.equal(pipelineStageFromLabels(["some-other-label", "pipeline:ready"]), "ready");
+});
+
+// ---------------------------------------------------------------------------
+// isBlockedInLabels (#581, capability `loop-blocked-item-hold-continuation`)
+// ---------------------------------------------------------------------------
+
+test("isBlockedInLabels: false when pipeline:blocked is absent", () => {
+  assert.equal(isBlockedInLabels([]), false);
+  assert.equal(isBlockedInLabels(["bug", "pipeline:ready"]), false);
+});
+
+test("isBlockedInLabels: true when pipeline:blocked is present alone", () => {
+  assert.equal(isBlockedInLabels(["pipeline:blocked"]), true);
+});
+
+test("isBlockedInLabels: true when pipeline:blocked is co-present with another pipeline:* stage label, regardless of label order — presence, not the single stage-winner", () => {
+  assert.equal(isBlockedInLabels(["pipeline:review-1", "pipeline:blocked"]), true);
+  assert.equal(isBlockedInLabels(["pipeline:blocked", "pipeline:review-1"]), true);
+  // pipelineStageFromLabels would return "review-1" here (the first pipeline:* label in list
+  // order) — isBlockedInLabels must not be fooled by that stage-winner into missing the blocker.
+  assert.equal(pipelineStageFromLabels(["pipeline:review-1", "pipeline:blocked"]), "review-1");
 });
 
 // ---------------------------------------------------------------------------

@@ -1778,3 +1778,138 @@ test("a stop recorded with no ready item discloses an empty outstanding_ready se
   assert.equal(result.stop?.reason, "run_fatal");
   assert.deepEqual(result.stop?.outstanding_ready, [], "no item is ready at stop time, so the disclosure is an empty set");
 });
+
+// ---------------------------------------------------------------------------
+// #581 — a dispatched item already carrying a stale pipeline:blocked label holds per-item and
+// the run continues on the remaining schedulable items, capability
+// `loop-blocked-item-hold-continuation`.
+// ---------------------------------------------------------------------------
+
+test("regression (#581): one already-blocked item co-present with a stage label + N clean items — the N clean items dispatch to their outcomes, the blocked item holds, and the run never run_fatals", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+      { id: "300", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({
+    "100": itemEntry("100", "pending"),
+    "200": itemEntry("200", "pending"),
+    "300": itemEntry("300", "pending"),
+  });
+  const { deps } = await setup(contract, ledger);
+
+  const dispatched = new Set<string>();
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels(issueNumber) {
+      const id = String(issueNumber);
+      if (id === "100") {
+        // A stale, reason-less blocker co-present with a mid-flight stage label —
+        // pipelineStageFromLabels's single stage-winner would return "review-1" here, not
+        // "blocked", so detection must be presence-based to catch it.
+        return { state: "open", labels: ["pipeline:review-1", "pipeline:blocked"] };
+      }
+      return { state: "open", labels: dispatched.has(id) ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue(issueNumber) {
+      const id = String(issueNumber);
+      return id !== "100" && dispatched.has(id) ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/x-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatched.add(request.item_id);
+    const outcome = request.item_id === "100" ? "failed" : "ready_to_deploy";
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: outcome as LoopExecutionResponse["outcome"],
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(result.stop, null, "an already-blocked dispatched item must never record a run_fatal stop");
+  assert.equal(result.holdOutstanding, true, "the run reaches the terminal outstanding-hold condition once nothing else is schedulable");
+  assert.deepEqual(result.heldItemIds, ["100"], "the terminal report enumerates the held item");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "waiting", "the already-blocked item is held, never a workflow-engine-defect");
+  assert.notEqual(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
+  assert.equal(finalLedger.items["200"].state, "ready", "a clean sibling still dispatches to its outcome despite the blocked item");
+  assert.equal(finalLedger.items["300"].state, "ready", "a clean sibling still dispatches to its outcome despite the blocked item");
+});
+
+test("continuation (#581): a held item alongside two schedulable siblings does not pause the run — the first sibling is dispatched and a second remains queued", async () => {
+  // Item "100" already entered a needs-human hold on an earlier cycle; items "200" and "300" are
+  // still pending, so there is more schedulable work after this cycle dispatches one of them.
+  // Pre-fix, the cycle-start `held` short-circuit would halt the run the moment ANY item is held,
+  // before ever trying "200" or "300".
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+      { id: "300", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({
+    "100": { id: "100", state: "waiting", history: [], recovery_budgets_remaining: { default: 3 } },
+    "200": itemEntry("200", "pending"),
+    "300": itemEntry("300", "pending"),
+  });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem, calls } = coordinatedFakes();
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const result = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.deepEqual(calls.map((c) => c.item_id), ["200"], "the schedulable sibling is dispatched despite the outstanding hold");
+  assert.equal(result.holdOutstanding, false, "a hold with schedulable work still queued is not itself the terminal condition");
+  assert.equal(result.stop, null);
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "waiting", "the held item is left untouched, re-evaluated next cycle");
+  assert.equal(finalLedger.items["200"].state, "ready", "the sibling reaches its outcome");
+  assert.equal(finalLedger.items["300"].state, "pending", "the second sibling is still queued for a later cycle");
+});
+
+test("terminal hold (#581): once every remaining item is held, the run reaches the terminal outstanding-hold condition and enumerates every held item id", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({
+    "100": { id: "100", state: "waiting", history: [], recovery_budgets_remaining: { default: 3 } },
+    "200": { id: "200", state: "paused", history: [], recovery_budgets_remaining: { default: 3 } },
+  });
+  const { deps } = await setup(contract, ledger);
+  const { deps: observe } = fakeObserveDeps();
+  const { dispatchItem, calls } = coordinatedFakes();
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(calls.length, 0, "neither held item is dispatched — both are excluded from the frontier");
+  assert.equal(result.stop, null, "an outstanding hold is never itself a run_fatal stop");
+  assert.equal(result.holdOutstanding, true);
+  assert.deepEqual(result.heldItemIds, ["100", "200"], "the terminal report names every held item, sorted");
+});

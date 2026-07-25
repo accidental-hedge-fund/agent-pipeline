@@ -1048,6 +1048,16 @@ export async function runLoopCommand(
     );
   }
 
+  // The terminal outstanding-hold condition names every held item so an operator sees exactly
+  // which items await a human (#581, capability `loop-blocked-item-hold-continuation`) — a hold
+  // alongside still-schedulable work never reaches this point (the run keeps cycling instead).
+  const heldItemIds = engineResult.result.heldItemIds ?? [];
+  if (engineResult.result.holdOutstanding && heldItemIds.length > 0) {
+    console.error(
+      `pipeline loop: paused with ${heldItemIds.length} item(s) held for a human: ${heldItemIds.join(", ")}`,
+    );
+  }
+
   console.log(
     JSON.stringify({
       schema_version: "1",
@@ -1056,6 +1066,7 @@ export async function runLoopCommand(
       cycles: engineResult.result.cycles,
       stop: engineResult.result.stop,
       hold_outstanding: engineResult.result.holdOutstanding,
+      held_item_ids: heldItemIds,
       all_done: engineResult.result.allDone,
       resumed: engineResult.result.resumed,
     }),
