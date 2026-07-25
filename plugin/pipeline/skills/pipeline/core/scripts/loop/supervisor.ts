@@ -647,6 +647,22 @@ export async function runSupervisorCycle(
       // Routed to the non-terminal paused/waiting hold — never `missing-authority` /
       // `workflow-engine-defect` — so the run pauses with `hold_outstanding=true` and every
       // sibling item's state (including one already `ready`) is preserved.
+      //
+      // `source: "pipeline_blocked_label"` is only set once a live-label read confirms
+      // `pipeline:blocked` is actually present — that discriminator is what
+      // `reopenClearedBlockedHolds` uses to auto-reopen the hold once the label clears. A generic
+      // `blocked_needs_human` outcome (a plan/user-input blocker with no live blocked label) must
+      // NOT carry that discriminator, or the very next cycle would read "no blocked label" and
+      // re-admit it to `pending` for redispatch instead of leaving it held for a human (#581 review
+      // 1, finding fcb03bcd04fc9b04).
+      let liveBlockedLabel = false;
+      try {
+        const issue = await deps.observe.getIssueStateAndLabels(Number(itemId));
+        liveBlockedLabel = isBlockedInLabels(issue?.labels ?? []);
+      } catch {
+        // Live observation failed — leave `liveBlockedLabel` false so the hold stays
+        // human-resume-only rather than guessing the label is present.
+      }
       ledger = await waitItem(deps.store, {
         runId,
         token,
@@ -655,7 +671,7 @@ export async function runSupervisorCycle(
         request: {
           kind: "answer",
           prompt: `pipeline/loop-execution@1 reported blocked_needs_human for item ${itemId} — needs a human answer/unblock before this item can resume`,
-          source: "pipeline_blocked_label",
+          ...(liveBlockedLabel ? { source: "pipeline_blocked_label" as const } : {}),
         },
         note: "needs-human pipeline blocker (capability loop-needs-human-blocker-disposition)",
       });

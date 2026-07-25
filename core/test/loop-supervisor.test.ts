@@ -1622,6 +1622,72 @@ test("regression (#570): a direct blocked_needs_human outcome enters a needs-hum
   );
 });
 
+test("regression (#581 review 1, finding fcb03bcd04fc9b04): a direct blocked_needs_human outcome with no live blocked label is held without the pipeline_blocked_label discriminator and is never auto-reopened for redispatch", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+
+  // The live issue never carries `pipeline:blocked` — this is a generic needs-human blocker
+  // (e.g. a plan/user-input blocker), not a pipeline-blocked-label hold.
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  let dispatchCount = 0;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked_needs_human" as LoopExecutionResponse["outcome"],
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(result.stop, null);
+  assert.equal(result.holdOutstanding, true);
+  assert.equal(dispatchCount, 1, "the item is dispatched exactly once by the initial cycle");
+
+  let finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "waiting");
+  assert.equal(
+    finalLedger.items["100"].hold_request?.source,
+    undefined,
+    "a generic blocked_needs_human hold with no live blocked label must not carry the pipeline_blocked_label discriminator",
+  );
+
+  // A subsequent cycle must never auto-reopen this hold (it has no live label to have cleared)
+  // and must never redispatch the held item.
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+  finalLedger = await readLedger(deps, "run-1");
+  assert.equal(dispatchCount, 1, "the held item is never redispatched on a later cycle");
+  assert.equal(finalLedger.items["100"].state, "waiting", "the hold remains outstanding, awaiting a human resume");
+});
+
 test("needs-human blocker-disposition safety net (#570): a failed outcome observed at pipeline:blocked is routed to the hold, not workflow-engine-defect", async () => {
   // Item "100" is dispatched, its harness reports the well-known retryable plan-review format
   // failure normalized to "failed" (LOOP_TERMINAL_OUTCOMES has no such literal outcome), and the
