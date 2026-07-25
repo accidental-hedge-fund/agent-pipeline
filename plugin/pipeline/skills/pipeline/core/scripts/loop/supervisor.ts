@@ -210,6 +210,59 @@ function hasSchedulableWorkRemaining(contract: LoopContract, ledger: LoopLedger)
   return contract.items.some((item) => ledger.items[item.id]?.state === "pending");
 }
 
+/** Reconciliation-driven re-admission for a cleared pipeline-blocked hold (#581 review 2, finding
+ *  016d467e9d176c6f). A held (`paused`/`waiting`) item whose hold was entered for the
+ *  `pipeline_blocked_label` disposition (see `LoopHumanInputRequest.source`) is checked against a
+ *  fresh live-label read every cycle; once `pipeline:blocked` is no longer present the item
+ *  transitions back to `pending` and rejoins the executable frontier this same cycle. A hold
+ *  entered for any other reason (no discriminator) is left untouched — only a human resume can
+ *  clear it. */
+async function reopenClearedBlockedHolds(
+  deps: SupervisorDeps,
+  runId: string,
+  token: string,
+  engine: LoopEngineName,
+  ledger: LoopLedger,
+): Promise<LoopLedger> {
+  const candidates = Object.values(ledger.items).filter(
+    (i) => (i.state === "waiting" || i.state === "paused") && i.hold_request?.source === "pipeline_blocked_label",
+  );
+  for (const item of candidates) {
+    let labels: string[];
+    try {
+      const issue = await deps.observe.getIssueStateAndLabels(Number(item.id));
+      labels = issue?.labels ?? [];
+    } catch {
+      // The live observation failed — leave the hold in place rather than guessing it cleared.
+      continue;
+    }
+    if (isBlockedInLabels(labels)) continue;
+
+    const current = ledger.items[item.id];
+    if (!current || (current.state !== "waiting" && current.state !== "paused")) continue;
+    const time = deps.store.now().toISOString();
+    const updated: LoopItemLedgerEntry = {
+      ...current,
+      state: "pending",
+      hold_request: undefined,
+      history: [
+        ...current.history,
+        {
+          time,
+          from: current.state,
+          to: "pending",
+          engine,
+          note: "pipeline:blocked label cleared — hold re-admitted to the executable frontier (capability loop-blocked-item-hold-continuation)",
+        },
+      ],
+    };
+    ledger = { ...ledger, items: { ...ledger.items, [item.id]: updated } };
+    await writeLedger(deps.store, ledger, token);
+    await appendEvent(deps.store, runId, token, "loop_item_hold_cleared", { item_id: item.id });
+  }
+  return ledger;
+}
+
 // ---------------------------------------------------------------------------
 // One drive cycle.
 // ---------------------------------------------------------------------------
@@ -323,12 +376,15 @@ export async function runSupervisorCycle(
   const schedulableContract = excludeContractItems(contract, preconditionExcludedIds);
 
   // Needs-human hold continuation (#581, capability `loop-blocked-item-hold-continuation`): a
-  // held (`paused`/`waiting`) item — whether entered on an earlier cycle or by this cycle's own
-  // Pass 2 below — is re-derived fresh from the ledger every cycle, so a hold cleared out-of-band
-  // between cycles naturally drops out of this set and the item rejoins the frontier. A held item
-  // is never itself a terminal condition while another item can still make progress: it is only
-  // excluded from the `pending` frontier `eligibleIndependentItems` already applies (a
-  // paused/waiting item is never `pending`), never carved out of `contract`/`schedulableContract`.
+  // pipeline-blocked hold (`hold_request.source === "pipeline_blocked_label"`) is re-admitted to
+  // `pending` here, against this cycle's fresh live-label read, the moment the `pipeline:blocked`
+  // label is no longer present — so a hold a human clears out-of-band between cycles rejoins the
+  // frontier instead of remaining excluded forever (review 2, finding 016d467e9d176c6f). A hold
+  // entered for any other reason is left untouched and stays outside the `pending` frontier
+  // `eligibleIndependentItems` already applies (a paused/waiting item is never `pending`), never
+  // carved out of `contract`/`schedulableContract`, and never itself a terminal condition while
+  // another item can still make progress.
+  ledger = await reopenClearedBlockedHolds(deps, runId, token, engine, ledger);
   const heldItemIds = heldItemIdsFromLedger(ledger);
 
   // A run is fully resolved once every item is done/abandoned OR precondition-excluded — an
@@ -599,6 +655,7 @@ export async function runSupervisorCycle(
         request: {
           kind: "answer",
           prompt: `pipeline/loop-execution@1 reported blocked_needs_human for item ${itemId} — needs a human answer/unblock before this item can resume`,
+          source: "pipeline_blocked_label",
         },
         note: "needs-human pipeline blocker (capability loop-needs-human-blocker-disposition)",
       });
@@ -663,6 +720,7 @@ export async function runSupervisorCycle(
               request: {
                 kind: "answer",
                 prompt: `pipeline/loop-execution@1 reported outcome "${String(rawOutcomeByItem.get(itemId))}" for item ${itemId}, and the live issue carries pipeline:blocked — needs a human answer/unblock before this item can resume`,
+                source: "pipeline_blocked_label",
               },
               note: "needs-human pipeline blocker safety net (capability loop-needs-human-blocker-disposition)",
             });

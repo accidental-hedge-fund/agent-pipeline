@@ -1913,3 +1913,74 @@ test("terminal hold (#581): once every remaining item is held, the run reaches t
   assert.equal(result.holdOutstanding, true);
   assert.deepEqual(result.heldItemIds, ["100", "200"], "the terminal report names every held item, sorted");
 });
+
+test("re-admission (#581 review 2, finding 016d467e9d176c6f): a held item whose pipeline:blocked label is cleared between cycles re-enters the frontier and dispatches to completion", async () => {
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+  });
+  const ledger = testLedger({
+    "100": {
+      id: "100",
+      state: "waiting",
+      history: [],
+      recovery_budgets_remaining: { default: 3 },
+      hold_request: {
+        request_id: "req-1",
+        item_id: "100",
+        kind: "answer",
+        prompt: "needs a human answer/unblock",
+        requested_by_engine: "claude",
+        requested_at: "2026-07-23T00:00:00.000Z",
+        source: "pipeline_blocked_label",
+      },
+    },
+  });
+  const { deps } = await setup(contract, ledger);
+  // The live label no longer carries pipeline:blocked by the time this cycle observes it — the
+  // human already cleared it out-of-band between cycles.
+  const { observe, dispatchItem, calls } = coordinatedFakes();
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.deepEqual(calls.map((c) => c.item_id), ["100"], "the cleared hold is re-admitted and dispatched, not left stranded");
+  assert.equal(result.stop, null);
+  assert.equal(result.holdOutstanding, false, "the run completes rather than reporting an outstanding hold");
+  assert.equal(result.allDone, true);
+  assert.deepEqual(result.heldItemIds, [], "no item remains held once the cleared hold is re-admitted");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "ready", "the re-admitted item reaches its dispatched outcome");
+});
+
+test("re-admission gated by discriminator (#581 review 2, finding 016d467e9d176c6f): a held item with no pipeline_blocked_label source is never auto-reopened even once its labels show no blocker", async () => {
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+  });
+  const ledger = testLedger({
+    "100": {
+      id: "100",
+      state: "waiting",
+      history: [],
+      recovery_budgets_remaining: { default: 3 },
+      hold_request: {
+        request_id: "req-1",
+        item_id: "100",
+        kind: "answer",
+        prompt: "an operator-initiated hold unrelated to a pipeline:blocked label",
+        requested_by_engine: "claude",
+        requested_at: "2026-07-23T00:00:00.000Z",
+      },
+    },
+  });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem, calls } = coordinatedFakes();
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(calls.length, 0, "a hold with no pipeline_blocked_label discriminator is never auto-reopened");
+  assert.equal(result.holdOutstanding, true);
+  assert.deepEqual(result.heldItemIds, ["100"]);
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "waiting", "the hold remains outstanding, awaiting a human resume");
+});

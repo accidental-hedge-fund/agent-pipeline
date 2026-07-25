@@ -103,6 +103,7 @@ export interface WaitRequestInput {
   kind: unknown;
   prompt: unknown;
   permitted_responses?: unknown;
+  source?: "pipeline_blocked_label";
 }
 
 export interface EnterWaitingInput extends EnterHoldInput {
@@ -154,6 +155,7 @@ function buildHumanInputRequest(
     permitted_responses: permitted,
     requested_by_engine: engine,
     requested_at: deps.now().toISOString(),
+    source: req.source,
   };
 }
 
