@@ -45,6 +45,19 @@ export function pipelineStageFromLabels(labels: readonly string[]): string | nul
   return label ? label.slice(LABEL_PREFIX.length) : null;
 }
 
+/** The full `pipeline:blocked` label. */
+const BLOCKED_LABEL = `${LABEL_PREFIX}blocked`;
+
+/** True when `labels` carries `pipeline:blocked`, checked by **presence** rather than by
+ *  {@link pipelineStageFromLabels}'s single stage-winner (#581, capability
+ *  `loop-blocked-item-hold-continuation`). `pipelineStageFromLabels` returns only the first
+ *  `pipeline:*` label it finds in list order, so an item carrying `pipeline:blocked` alongside
+ *  another `pipeline:*` stage label can have that other label win the single-stage derivation —
+ *  this predicate exists so detection of "is this item blocked" never depends on label order. */
+export function isBlockedInLabels(labels: readonly string[]): boolean {
+  return labels.includes(BLOCKED_LABEL);
+}
+
 /** Builds the durable exclusion record for `itemId` at the given observed `pipeline_stage`. */
 export function buildPreconditionExclusion(itemId: string, stage: string | null): LoopPreconditionExclusion {
   return { item_id: itemId, required_stage: PRECONDITION_REQUIRED_STAGE, observed_stage: describeObservedStage(stage) };

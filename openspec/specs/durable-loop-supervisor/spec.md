@@ -11,10 +11,14 @@ reconciliation pass over live truth, select the next dependency-ready active ite
 contract's `max_active_items: 1`, dispatch that item, and record its outcome through the durable
 engine's transition, recovery, and pause paths. The supervisor SHALL continue until the run reaches
 a terminal condition — every item done or abandoned, a recorded stop, an outstanding paused/waiting
-hold, or a watchdog stop — and SHALL NOT invoke, discover, read, or depend on an externally
-installed goal-loop skill on any execution path. The supervisor SHALL NOT create a second ledger,
-lock, run-id namespace, or run directory; every durable write it makes SHALL be issued through the
-engine into the single authoritative run directory.
+hold **while no other item can make progress**, or a watchdog stop — and SHALL NOT invoke,
+discover, read, or depend on an externally installed goal-loop skill on any execution path. An
+outstanding paused/waiting hold SHALL be a terminal condition **only when no non-done item can make
+progress**: while at least one other item is schedulable, the supervisor SHALL exclude each held
+item from the executable frontier and continue dispatching the remaining schedulable items rather
+than halting the run. The supervisor SHALL NOT create a second ledger, lock, run-id namespace, or
+run directory; every durable write it makes SHALL be issued through the engine into the single
+authoritative run directory.
 
 #### Scenario: A locked run advances to completion in-repo
 
@@ -25,18 +29,24 @@ engine into the single authoritative run directory.
 
 #### Scenario: The run halts at the first terminal condition
 
-- **WHEN** a cycle records a stop, an outstanding paused/waiting hold, or leaves no active item
-  remaining
+- **WHEN** a cycle records a stop, or leaves no active item remaining and no schedulable item, or
+  reaches an outstanding paused/waiting hold while no other item can make progress
 - **THEN** the supervisor SHALL stop cycling and report the terminal condition
 - **AND** it SHALL NOT create a second ledger, lock, run-id, or run directory
+
+#### Scenario: A hold alongside a schedulable item does not halt the run
+
+- **WHEN** a cycle leaves one item in an outstanding paused/waiting hold while another item is
+  still schedulable
+- **THEN** the supervisor SHALL exclude the held item from the executable frontier and continue
+  dispatching the schedulable item
+- **AND** it SHALL NOT treat the hold as a terminal condition for the run
 
 #### Scenario: Only one item is active at a time
 
 - **WHEN** the supervisor selects work for a cycle from a contract whose `max_active_items` is one
 - **THEN** it SHALL dispatch at most one item in that cycle
 - **AND** it SHALL respect the contract's dependency ordering when choosing which item
-
----
 
 ### Requirement: The supervisor SHALL hand off whole items and never own a pipeline stage
 

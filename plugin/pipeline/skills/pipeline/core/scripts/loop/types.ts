@@ -67,6 +67,12 @@ export interface LoopHumanInputRequest {
   permitted_responses?: string[];
   requested_by_engine: LoopEngineName;
   requested_at: string;
+  /** Set when this hold was entered because the dispatched item was observed carrying a live
+   *  `pipeline:blocked` label (#581, capability `loop-blocked-item-hold-continuation`) — the
+   *  discriminator the supervisor's reconciliation-driven re-admission checks before
+   *  auto-reopening a cleared hold back to `pending`. A hold entered for any other reason (no
+   *  `source`, or a different value) is never auto-reopened this way. */
+  source?: "pipeline_blocked_label";
 }
 
 /** A scoped, audited widening of exactly one authority gate, narrowed to exactly one item — a

@@ -168,6 +168,38 @@ test("runLoopCommand — a stop with no outstanding ready item prints no strande
   assert.ok(!err.join("\n").includes("stranded"), "no ready item outstanding — no stranded-item disclosure line");
 });
 
+test("runLoopCommand — a terminal outstanding hold names every held item on stderr and in the JSON (#581, capability loop-blocked-item-hold-continuation)", async () => {
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async () =>
+      ({
+        ok: true,
+        args: { selector: { type: "work-list", value: ["100", "200"] }, resumeRunId: undefined, audit: false },
+      }) satisfies LoopPreflightOutcome,
+    runLoopEngine: async () => ({
+      kind: "drive",
+      result: {
+        runId: "loop-abc123",
+        cycles: 3,
+        stop: null,
+        holdOutstanding: true,
+        heldItemIds: ["100", "200"],
+        allDone: false,
+        resumed: false,
+      },
+    }),
+  };
+  process.exitCode = undefined;
+  const { out, err } = await withCapturedConsole(() =>
+    runLoopCommand({ milestone: "v2", profile: "claude" } as CliOpts, [], deps),
+  );
+  assert.equal(process.exitCode, 1);
+  assert.match(err.join("\n"), /paused with 2 item\(s\) held for a human/);
+  assert.match(err.join("\n"), /100, 200/);
+  const parsed = JSON.parse(out[0]);
+  assert.equal(parsed.hold_outstanding, true);
+  assert.deepEqual(parsed.held_item_ids, ["100", "200"]);
+});
+
 test("runLoopCommand — a run-engine error (e.g. an unsupported selector type) exits non-zero", async () => {
   const deps: LoopCliDeps = {
     runLoopPreflight: async () =>

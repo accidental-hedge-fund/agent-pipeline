@@ -1,8 +1,5 @@
-# loop-needs-human-blocker-disposition Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change loop-needs-human-blocker-disposition. Update Purpose after archive.
-## Requirements
 ### Requirement: A needs-human pipeline blocker SHALL be recorded as a non-terminal hold, never as a run-fatal engine defect
 
 The supervisor SHALL treat a per-item pipeline blocker whose disposition is "needs human
@@ -84,38 +81,3 @@ drives it with no real network, git, or subprocess call.
   still schedulable
 - **THEN** the run SHALL continue dispatching the schedulable sibling rather than pausing
 - **AND** the held item SHALL be re-evaluated each cycle and remain a non-terminal hold
-
-### Requirement: A terminal run stop SHALL disclose every outstanding ready-to-deploy item
-
-A terminal run stop SHALL enumerate every outstanding `ready` item. When the supervisor
-records any terminal run stop while one or more items are in the `ready` state
-(`pipeline:ready-to-deploy`, awaiting the human merge the pipeline never performs), the
-durable stop record SHALL enumerate the ids of those outstanding `ready` items, and the
-`pipeline loop` command output SHALL name them. A stop SHALL NEVER be
-recorded or reported in a way that silently discards an outstanding ready-to-deploy hold.
-The disclosure SHALL be additive metadata on the stop — it SHALL NOT introduce a new
-terminal condition, alter the stop reason, or change which items are considered done. When
-no item is in the `ready` state at stop time, the enumerated set SHALL be empty and the
-existing stop output SHALL be otherwise unchanged.
-
-#### Scenario: A stop names the stranded ready item
-
-- **WHEN** the supervisor records a terminal stop while one item is at `ready` and another
-  item caused the stop
-- **THEN** the durable stop record SHALL enumerate the `ready` item's id as outstanding
-- **AND** the `pipeline loop` output SHALL name that `ready` item
-
-#### Scenario: A stop with no ready item discloses an empty set
-
-- **WHEN** the supervisor records a terminal stop while no item is at `ready`
-- **THEN** the stop record's outstanding-ready set SHALL be empty
-- **AND** the stop reason and the rest of the stop output SHALL be unchanged from the
-  pre-change behavior
-
-#### Scenario: Disclosure does not change the terminal condition
-
-- **WHEN** a stop is recorded alongside one or more outstanding `ready` items
-- **THEN** the stop reason and the run's terminal condition SHALL be exactly what they would
-  have been without the disclosure
-- **AND** the outstanding-ready enumeration SHALL be the only added information
-
