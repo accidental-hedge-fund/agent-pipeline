@@ -899,6 +899,17 @@ export interface PipelineConfig {
     command: string;
     mode: "additive" | "exclusive";
   };
+  // Privacy-safe upstream product-fault reporting (#502). Opt-in and default-
+  // absent: absent (or `enabled: false`) leaves `pipeline report` fully inert
+  // (no network I/O, no `gh` write). `intake_endpoint` is the maintainer-
+  // controlled intake service URL; `intake_auth_env` names an environment
+  // variable holding a submission-scoped credential — never a GitHub token,
+  // and the credential value itself is never stored in this config.
+  product_fault?: {
+    enabled: boolean;
+    intake_endpoint?: string;
+    intake_auth_env?: string;
+  };
   // External stage executors (#314). Named executor definitions ("executors:")
   // that operators may assign per model-invoking stage ("stage_executors:").
   // Both default to {} — a repo with neither key configured behaves exactly as

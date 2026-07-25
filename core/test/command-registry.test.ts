@@ -30,7 +30,7 @@ const DISPATCH_KEYWORDS = [
   "init", "doctor", "status", "unblock", "override", "cleanup",
   "release", "intake", "sweep", "triage", "merge",
   "refine-spec", "logs", "summary", "path", "config", "run", "improve",
-  "scoreboard", "roadmap", "loop", "correction",
+  "scoreboard", "roadmap", "loop", "correction", "report",
 ];
 
 test("command-registry: every recognized dispatch keyword has a registry entry", () => {

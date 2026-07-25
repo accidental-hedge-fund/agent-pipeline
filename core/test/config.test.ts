@@ -2853,6 +2853,85 @@ test("syncConfig: event_sink is preserved through sync --apply", () => {
   assert.match(synced, /mode: exclusive/);
 });
 
+// ---- product_fault (#502) ----
+
+test("resolveConfig: no product_fault configured → product_fault is undefined (absent → identical to pre-feature behavior)", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/pf0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.product_fault, undefined);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: product_fault.enabled: false from pipeline.yml resolves through unchanged", async () => {
+  const repo = makeFakeRepo(`product_fault:\n  enabled: false\n`);
+  const binDir = makeFakeGh("acme/pf1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.product_fault, { enabled: false });
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: product_fault.enabled/intake_endpoint/intake_auth_env from pipeline.yml resolve through", async () => {
+  const repo = makeFakeRepo(
+    `product_fault:\n  enabled: true\n  intake_endpoint: "https://intake.example.com/product-fault"\n  intake_auth_env: "PRODUCT_FAULT_INTAKE_TOKEN"\n`,
+  );
+  const binDir = makeFakeGh("acme/pf2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.product_fault, {
+      enabled: true,
+      intake_endpoint: "https://intake.example.com/product-fault",
+      intake_auth_env: "PRODUCT_FAULT_INTAKE_TOKEN",
+    });
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: product_fault unknown sub-key is rejected (strict schema)", async () => {
+  const repo = makeFakeRepo(`product_fault:\n  enabled: true\n  webhook_secret: "shh"\n`);
+  const binDir = makeFakeGh("acme/pf3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("product_fault"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("syncConfig: product_fault is preserved through sync --apply", () => {
+  const repo = makeFakeRepo(
+    `product_fault:\n  enabled: true\n  intake_endpoint: "https://intake.example.com/product-fault"\n`,
+  );
+  const result = syncConfig(repo, { apply: true });
+  assert.equal(result.ok, true);
+  const synced = fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8");
+  assert.match(synced, /^product_fault:/m, "product_fault block must be present after sync");
+  assert.match(synced, /enabled: true/);
+  assert.match(synced, /intake_endpoint: .*intake\.example\.com/);
+});
+
 test("syncConfig: visual_gate is preserved through sync --apply", () => {
   const repo = makeFakeRepo(
     `visual_gate:\n  enabled: true\n  command: "npx playwright test"\n  mode: advisory\n  timeout: 600\n  max_attempts: 3\n  artifacts_dir: ".e2e-out"\n`,

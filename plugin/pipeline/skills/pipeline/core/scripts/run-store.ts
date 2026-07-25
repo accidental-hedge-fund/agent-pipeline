@@ -24,6 +24,7 @@ import { stageDurationMs } from "./evidence-bundle.ts";
 import type { GhMetricsSummary } from "./gh.ts";
 import type { HumanInterventionEvent } from "./intervention.ts";
 import { validateCorrectionEvent, type CorrectionEvent } from "./correction.ts";
+import type { ProductFaultEvent } from "./product-fault.ts";
 import { accountingSummary, sanitizeStageAccountingRecord } from "./accounting.ts";
 import { RUNS_ARTIFACT, HISTORY_ARTIFACT, artifactSubdir } from "./artifact-ignore.ts";
 
@@ -290,6 +291,7 @@ export interface SettledSurfaceUnverifiedEvent extends RunEventBase {
 
 export type { HumanInterventionEvent };
 export type { CorrectionEvent };
+export type { ProductFaultEvent };
 
 export type RunEvent =
   | RunStartEvent
@@ -318,7 +320,8 @@ export type RunEvent =
   | DeltaChurnSuspectedEvent
   | EngineDriftEvent
   | HumanInterventionEvent
-  | CorrectionEvent;
+  | CorrectionEvent
+  | ProductFaultEvent;
 
 // ---------------------------------------------------------------------------
 // Deps — injectable I/O seam; unit tests inject in-memory fakes
