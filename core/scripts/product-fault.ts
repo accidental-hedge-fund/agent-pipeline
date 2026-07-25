@@ -257,6 +257,44 @@ export interface ProductFaultPayload {
   confidence: ProductFaultConfidence;
 }
 
+/** The `fingerprint` is always a `computeProductFaultFingerprint` output — a
+ *  fixed-length lowercase hex truncation — never free-form text. */
+const FINGERPRINT_RE = /^[0-9a-f]{16}$/;
+
+/** True when `value` is a fixed-length hex `product_fault` fingerprint. */
+export function isValidProductFaultFingerprint(value: string): boolean {
+  return FINGERPRINT_RE.test(value);
+}
+
+const VALID_CONFIDENCE_VALUES: readonly ProductFaultConfidence[] = ["low", "medium", "high"];
+const VALID_EXIT_STATE_VALUES: readonly ProductFaultExitState[] = [
+  "crash",
+  "invariant_violation",
+  "schema_mismatch",
+  "unknown",
+];
+
+/**
+ * Full-shape validation for a `product_fault` event read back from a
+ * persisted `events.jsonl` — the boundary a tampered or corrupted artifact
+ * would cross before reaching the report command. Enforces the bounded
+ * vocabularies (`confidence`, `exit_state`) and the fixed hex `fingerprint`
+ * format; a record failing any check is rejected rather than reported.
+ */
+export function isValidProductFaultEvent(event: ProductFaultEvent): boolean {
+  return (
+    isValidProductFaultFingerprint(event.fingerprint) &&
+    (VALID_CONFIDENCE_VALUES as readonly string[]).includes(event.confidence) &&
+    (VALID_EXIT_STATE_VALUES as readonly string[]).includes(event.exit_state) &&
+    typeof event.pipeline_version === "string" &&
+    typeof event.host_adapter === "string" &&
+    typeof event.stage === "string" &&
+    typeof event.error_class === "string" &&
+    typeof event.rationale === "string" &&
+    event.rationale.length > 0
+  );
+}
+
 /**
  * Build the report payload from ONLY the fixed allowlist of bounded fields —
  * Pipeline version, host adapter, stage, error class, fingerprint, exit
@@ -264,7 +302,10 @@ export interface ProductFaultPayload {
  * for a raw message/stack/output: a caller cannot leak one through this
  * function because it has no input slot for it. Every string field is passed
  * through the existing injection screen + secret redaction as defense in
- * depth, even though these fields are expected to already be bounded.
+ * depth, even though these fields are expected to already be bounded. The
+ * `fingerprint` is validated against its fixed hex format and rejected
+ * (thrown) rather than copied through unscreened, since it is otherwise never
+ * passed through `clean()`.
  */
 export function buildProductFaultPayload(input: {
   pipelineVersion: string;
@@ -275,6 +316,9 @@ export function buildProductFaultPayload(input: {
   exitState: ProductFaultExitState;
   confidence: ProductFaultConfidence;
 }): ProductFaultPayload {
+  if (!isValidProductFaultFingerprint(input.fingerprint)) {
+    throw new Error(`buildProductFaultPayload: invalid fingerprint "${input.fingerprint}"`);
+  }
   const clean = (s: string): string => sanitize(redactSecrets(s));
   return {
     payload_schema_version: PRODUCT_FAULT_PAYLOAD_SCHEMA_VERSION,
@@ -305,6 +349,28 @@ export interface ProductFaultConfigBlock {
   /** Name of an environment variable holding the submission-scoped intake
    *  credential — never the credential value itself, and never a GitHub token. */
   intake_auth_env?: string;
+}
+
+/** Env-var names that name a GitHub credential — refused as an intake
+ *  credential source so a `GITHUB_TOKEN`/`GH_TOKEN` (or any `GH_*`/`GITHUB_*`
+ *  variable) can never be forwarded to a third-party intake endpoint. */
+const GITHUB_CREDENTIAL_ENV_NAME_RE = /^(GH|GITHUB)_/i;
+
+/** GitHub personal-access-token value shapes — refused even when the env-var
+ *  name itself looks unrelated, since the credential *type* matters, not just
+ *  its variable name. */
+const GITHUB_TOKEN_VALUE_RE = /^(ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{10,}$/;
+
+/** True when `name` is disallowed as an `intake_auth_env` source — it names a
+ *  GitHub credential variable rather than a dedicated submission credential. */
+export function isDisallowedIntakeAuthEnvName(name: string): boolean {
+  return GITHUB_CREDENTIAL_ENV_NAME_RE.test(name);
+}
+
+/** True when `value` is shaped like a GitHub token, regardless of which env
+ *  var it came from. */
+export function isGithubTokenShaped(value: string): boolean {
+  return GITHUB_TOKEN_VALUE_RE.test(value.trim());
 }
 
 /** Best-effort, gh-free check of the `product_fault` config block in
@@ -365,7 +431,9 @@ export async function findLatestProductFault(
     } catch {
       continue;
     }
-    const faults = events.filter((e): e is ProductFaultEvent => e.type === "product_fault");
+    const faults = events
+      .filter((e): e is ProductFaultEvent => e.type === "product_fault")
+      .filter(isValidProductFaultEvent);
     if (faults.length > 0) return faults[faults.length - 1];
   }
   return null;
@@ -497,6 +565,7 @@ export type RunProductFaultReportResult =
   | { outcome: "disabled" }
   | { outcome: "no-fault-found" }
   | { outcome: "declined"; payload: ProductFaultPayload }
+  | { outcome: "auth-rejected"; payload: ProductFaultPayload }
   | { outcome: "manual-fallback"; payload: ProductFaultPayload; draftUrl: string }
   | { outcome: "submitted"; payload: ProductFaultPayload; ok: boolean; status: number };
 
@@ -571,7 +640,20 @@ export async function runProductFaultReport(
     return { outcome: "manual-fallback", payload, draftUrl: draft.url };
   }
 
-  const authToken = config.intake_auth_env ? process.env[config.intake_auth_env] : undefined;
+  if (!config.intake_auth_env || isDisallowedIntakeAuthEnvName(config.intake_auth_env)) {
+    deps.log(
+      "Refusing to submit: intake_auth_env is absent or names a GitHub credential variable — " +
+        "endpoint submissions require a dedicated, non-GitHub submission credential.",
+    );
+    return { outcome: "auth-rejected", payload };
+  }
+  const authToken = process.env[config.intake_auth_env];
+  if (!authToken || isGithubTokenShaped(authToken)) {
+    deps.log(
+      "Refusing to submit: the credential named by intake_auth_env is absent or GitHub-token-shaped.",
+    );
+    return { outcome: "auth-rejected", payload };
+  }
   const result = await deps.submit(config.intake_endpoint, authToken, preview);
   await writeProductFaultAuditRecord(
     opts.repoDir,

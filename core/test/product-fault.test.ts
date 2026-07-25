@@ -23,6 +23,8 @@ import {
   buildManualFallbackDraft,
   writeProductFaultAuditRecord,
   productFaultAuditLogPath,
+  isValidProductFaultEvent,
+  isValidProductFaultFingerprint,
   PRODUCT_FAULT_PAYLOAD_SCHEMA_VERSION,
   type ProductFaultEvent,
   type ProductFaultReportDeps,
@@ -265,7 +267,7 @@ test("redaction: buildProductFaultPayload has no parameter slot for a raw messag
     hostAdapter: "claude",
     stage: "planning",
     errorClass: "TypeError",
-    fingerprint: "abc123",
+    fingerprint: "abc123def4567890",
     exitState: "crash",
     confidence: "high",
   });
@@ -282,7 +284,7 @@ test("redaction: a secret token embedded in an allowlisted field (error_class) i
     hostAdapter: "claude",
     stage: "planning",
     errorClass: `TypeError ghp_abcdefghij1234567890`,
-    fingerprint: "abc123",
+    fingerprint: "abc123def4567890",
     exitState: "crash",
     confidence: "high",
   });
@@ -295,11 +297,32 @@ test("redaction: a KEY=value credential pair embedded in an allowlisted field is
     hostAdapter: "claude",
     stage: "planning",
     errorClass: "TypeError",
-    fingerprint: "abc123",
+    fingerprint: "abc123def4567890",
     exitState: "crash",
     confidence: "high",
   });
   assert.ok(!payload.pipeline_version.includes("hunter2"));
+});
+
+test("buildProductFaultPayload: rejects a fingerprint that is not a fixed-length hex string (#502 review 1, a219b412)", () => {
+  assert.throws(() => {
+    buildProductFaultPayload({
+      pipelineVersion: "1.2.3",
+      hostAdapter: "claude",
+      stage: "planning",
+      errorClass: "TypeError",
+      fingerprint: "not-a-fingerprint",
+      exitState: "crash",
+      confidence: "high",
+    });
+  });
+});
+
+test("isValidProductFaultFingerprint: accepts only fixed-length lowercase hex", () => {
+  assert.equal(isValidProductFaultFingerprint("abc123def4567890"), true);
+  assert.equal(isValidProductFaultFingerprint("abc123"), false, "too short");
+  assert.equal(isValidProductFaultFingerprint("ABC123DEF4567890"), false, "uppercase");
+  assert.equal(isValidProductFaultFingerprint("../../etc/passwd"), false, "not hex");
 });
 
 // ---------------------------------------------------------------------------
@@ -457,50 +480,124 @@ test("runProductFaultReport: no product_fault event found -> nothing to report, 
   assert.equal(deps.submitCalls.length, 0);
 });
 
+/** A dedicated, non-GitHub intake credential env-var name/value used across
+ *  the submission tests below — set/restored around each test so the fake
+ *  submission path has a valid credential to read via `process.env`. */
+const INTAKE_AUTH_ENV_NAME = "PIPELINE_REPORT_TOKEN";
+const INTAKE_AUTH_ENV_VALUE = "dedicated-submission-credential-value";
+
+function withIntakeAuthEnv(fn: () => Promise<void>): Promise<void> {
+  const prior = process.env[INTAKE_AUTH_ENV_NAME];
+  process.env[INTAKE_AUTH_ENV_NAME] = INTAKE_AUTH_ENV_VALUE;
+  return fn().finally(() => {
+    if (prior === undefined) delete process.env[INTAKE_AUTH_ENV_NAME];
+    else process.env[INTAKE_AUTH_ENV_NAME] = prior;
+  });
+}
+
+function withIntake(fs: FakeFs): FakeFs {
+  fs.files["/repo/.github/pipeline.yml"] +=
+    `  intake_endpoint: "https://intake.example.com"\n  intake_auth_env: "${INTAKE_AUTH_ENV_NAME}"\n`;
+  return fs;
+}
+
 test("runProductFaultReport: preview is byte-identical to the submitted payload", async () => {
-  const fs = repoWithFault();
-  fs.files["/repo/.github/pipeline.yml"] += "  intake_endpoint: \"https://intake.example.com\"\n";
-  const deps = makeReportDeps({ fs, confirmResult: true });
-  const result = await runProductFaultReport({ repoDir: "/repo" }, deps);
-  assert.equal(result.outcome, "submitted");
-  assert.equal(deps.submitCalls.length, 1);
-  const submittedBody = deps.submitCalls[0].body;
-  assert.equal(submittedBody, renderProductFaultPreview(result.payload));
-  const previewLogged = deps.logLines.some((l) => l === submittedBody);
-  assert.ok(previewLogged, "the previewed line must equal the exact submitted body");
+  await withIntakeAuthEnv(async () => {
+    const fs = withIntake(repoWithFault());
+    const deps = makeReportDeps({ fs, confirmResult: true });
+    const result = await runProductFaultReport({ repoDir: "/repo" }, deps);
+    assert.equal(result.outcome, "submitted");
+    assert.equal(deps.submitCalls.length, 1);
+    const submittedBody = deps.submitCalls[0].body;
+    assert.equal(submittedBody, renderProductFaultPreview(result.payload));
+    const previewLogged = deps.logLines.some((l) => l === submittedBody);
+    assert.ok(previewLogged, "the previewed line must equal the exact submitted body");
+  });
 });
 
 test("runProductFaultReport: no confirmation -> no transmission", async () => {
-  const fs = repoWithFault();
-  fs.files["/repo/.github/pipeline.yml"] += "  intake_endpoint: \"https://intake.example.com\"\n";
-  const deps = makeReportDeps({ fs, confirmResult: false });
-  const result = await runProductFaultReport({ repoDir: "/repo" }, deps);
-  assert.equal(result.outcome, "declined");
-  assert.equal(deps.submitCalls.length, 0);
+  await withIntakeAuthEnv(async () => {
+    const fs = withIntake(repoWithFault());
+    const deps = makeReportDeps({ fs, confirmResult: false });
+    const result = await runProductFaultReport({ repoDir: "/repo" }, deps);
+    assert.equal(result.outcome, "declined");
+    assert.equal(deps.submitCalls.length, 0);
+  });
 });
 
 test("runProductFaultReport: --yes bypasses the interactive prompt and is treated as explicit confirmation", async () => {
-  const fs = repoWithFault();
-  fs.files["/repo/.github/pipeline.yml"] += "  intake_endpoint: \"https://intake.example.com\"\n";
-  const deps = makeReportDeps({ fs, confirmResult: false });
-  const result = await runProductFaultReport({ repoDir: "/repo", assumeYes: true }, deps);
-  assert.equal(result.outcome, "submitted");
-  assert.equal(deps.submitCalls.length, 1);
+  await withIntakeAuthEnv(async () => {
+    const fs = withIntake(repoWithFault());
+    const deps = makeReportDeps({ fs, confirmResult: false });
+    const result = await runProductFaultReport({ repoDir: "/repo", assumeYes: true }, deps);
+    assert.equal(result.outcome, "submitted");
+    assert.equal(deps.submitCalls.length, 1);
+  });
 });
 
 test("runProductFaultReport: submission writes a local audit record with payload hash, destination, timestamp, confirmation", async () => {
+  await withIntakeAuthEnv(async () => {
+    const fs = withIntake(repoWithFault());
+    const deps = makeReportDeps({ fs, confirmResult: true });
+    await runProductFaultReport({ repoDir: "/repo" }, deps);
+    const auditPath = productFaultAuditLogPath("/repo");
+    const lines = (fs.files[auditPath] ?? "").trim().split("\n");
+    assert.equal(lines.length, 1);
+    const record = JSON.parse(lines[0]);
+    assert.equal(record.confirmed, true);
+    assert.equal(record.destination, "https://intake.example.com");
+    assert.ok(record.payload_hash.length > 0);
+    assert.ok(record.at.length > 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Intake credential boundary (#502 review 1, finding de283aae): reject a
+// GitHub credential variable name, a GitHub-token-shaped value, and a missing
+// credential — never forward a GitHub token to a third-party intake endpoint.
+// ---------------------------------------------------------------------------
+
+test("runProductFaultReport: refuses submission when intake_auth_env names a GitHub credential variable", async () => {
   const fs = repoWithFault();
-  fs.files["/repo/.github/pipeline.yml"] += "  intake_endpoint: \"https://intake.example.com\"\n";
+  fs.files["/repo/.github/pipeline.yml"] +=
+    '  intake_endpoint: "https://intake.example.com"\n  intake_auth_env: "GITHUB_TOKEN"\n';
+  const priorGhToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "ghp_realgithubcredential1234567890";
+  try {
+    const deps = makeReportDeps({ fs, confirmResult: true });
+    const result = await runProductFaultReport({ repoDir: "/repo" }, deps);
+    assert.equal(result.outcome, "auth-rejected");
+    assert.equal(deps.submitCalls.length, 0, "must never forward a GitHub credential to the intake endpoint");
+  } finally {
+    if (priorGhToken === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = priorGhToken;
+  }
+});
+
+test("runProductFaultReport: refuses submission when the intake credential value is GitHub-token-shaped", async () => {
+  const fs = repoWithFault();
+  fs.files["/repo/.github/pipeline.yml"] +=
+    `  intake_endpoint: "https://intake.example.com"\n  intake_auth_env: "${INTAKE_AUTH_ENV_NAME}"\n`;
+  const prior = process.env[INTAKE_AUTH_ENV_NAME];
+  process.env[INTAKE_AUTH_ENV_NAME] = "ghp_abcdefghij1234567890";
+  try {
+    const deps = makeReportDeps({ fs, confirmResult: true });
+    const result = await runProductFaultReport({ repoDir: "/repo" }, deps);
+    assert.equal(result.outcome, "auth-rejected");
+    assert.equal(deps.submitCalls.length, 0);
+  } finally {
+    if (prior === undefined) delete process.env[INTAKE_AUTH_ENV_NAME];
+    else process.env[INTAKE_AUTH_ENV_NAME] = prior;
+  }
+});
+
+test("runProductFaultReport: refuses submission when intake_auth_env is absent", async () => {
+  const fs = repoWithFault();
+  fs.files["/repo/.github/pipeline.yml"] += '  intake_endpoint: "https://intake.example.com"\n';
   const deps = makeReportDeps({ fs, confirmResult: true });
-  await runProductFaultReport({ repoDir: "/repo" }, deps);
-  const auditPath = productFaultAuditLogPath("/repo");
-  const lines = (fs.files[auditPath] ?? "").trim().split("\n");
-  assert.equal(lines.length, 1);
-  const record = JSON.parse(lines[0]);
-  assert.equal(record.confirmed, true);
-  assert.equal(record.destination, "https://intake.example.com");
-  assert.ok(record.payload_hash.length > 0);
-  assert.ok(record.at.length > 0);
+  const result = await runProductFaultReport({ repoDir: "/repo" }, deps);
+  assert.equal(result.outcome, "auth-rejected");
+  assert.equal(deps.submitCalls.length, 0);
 });
 
 test("runProductFaultReport: no intake configured -> manual fallback draft, no auto-created issue, audit record written", async () => {
@@ -579,4 +676,33 @@ test("findLatestProductFault: finds the event when present", async () => {
   assert.ok(found);
   assert.equal(found!.type, "product_fault");
   assert.equal(found!.fingerprint, "abc123def4567890");
+});
+
+test("isValidProductFaultEvent: rejects a tampered fingerprint, confidence, or exit_state", () => {
+  const valid: ProductFaultEvent = {
+    schema_version: 1,
+    type: "product_fault",
+    at: "2026-07-24T00:00:00Z",
+    payload_schema_version: PRODUCT_FAULT_PAYLOAD_SCHEMA_VERSION,
+    confidence: "high",
+    rationale: "Agent Pipeline crashed with an uncaught TypeError.",
+    fingerprint: "abc123def4567890",
+    pipeline_version: "1.2.3",
+    host_adapter: "claude",
+    stage: "planning",
+    error_class: "TypeError",
+    exit_state: "crash",
+  };
+  assert.equal(isValidProductFaultEvent(valid), true);
+  assert.equal(isValidProductFaultEvent({ ...valid, fingerprint: "not-hex" }), false);
+  assert.equal(isValidProductFaultEvent({ ...valid, confidence: "critical" as never }), false);
+  assert.equal(isValidProductFaultEvent({ ...valid, exit_state: "arbitrary" as never }), false);
+  assert.equal(isValidProductFaultEvent({ ...valid, rationale: "" }), false);
+});
+
+test("findLatestProductFault: a tampered/malformed persisted event (invalid fingerprint) is rejected rather than reported (#502 review 1, a219b412)", async () => {
+  const fs = repoWithFault({ fingerprint: "../../../etc/passwd" });
+  const deps = makeReportDeps({ fs });
+  const found = await findLatestProductFault("/repo", deps);
+  assert.equal(found, null, "a malformed event must never be surfaced for reporting");
 });

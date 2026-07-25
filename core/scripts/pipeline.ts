@@ -1861,7 +1861,8 @@ async function main(): Promise<void> {
       { repoDir, assumeYes: opts.yes },
       realProductFaultReportDeps(),
     );
-    process.exitCode = result.outcome === "submitted" && !result.ok ? 1 : 0;
+    process.exitCode =
+      (result.outcome === "submitted" && !result.ok) || result.outcome === "auth-rejected" ? 1 : 0;
     return;
   }
 
