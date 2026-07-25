@@ -1149,6 +1149,78 @@ test("regression (#568): a backlog item alongside a ready item advances the read
   assert.deepEqual(excluded.data, { item_id: "100", required_stage: "pipeline:ready", observed_stage: "pipeline:backlog" });
 });
 
+test("regression (#581, pre-merge 20713d3b): a precondition-excluded sibling that becomes ready during the cycle is not stranded by a terminal hold", async () => {
+  // Item "100" is `pipeline:backlog` when this cycle's reconcile observes it (so it is
+  // precondition-excluded from the frontier), but becomes `pipeline:ready` before the cycle ends —
+  // modeled here as "ready once 200 has been dispatched". Item "200" dispatches to a needs-human
+  // hold. Concluding a terminal hold on the cycle-start (stale) frontier would stop the run with
+  // 100 never dispatched; the terminal-hold decision must re-observe the excluded item's live label
+  // and continue, so 100 is still dispatched on a subsequent cycle rather than stranded.
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+
+  const dispatched = new Set<string>();
+  const calls: LoopExecutionRequest[] = [];
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels(issueNumber) {
+      const id = String(issueNumber);
+      // "100" is backlog only until "200" has been dispatched (i.e. until after this cycle's
+      // dispatch); it then becomes ready, and READY_LABEL once itself dispatched.
+      if (id === "100" && !dispatched.has("100") && !dispatched.has("200")) {
+        return { state: "open", labels: ["pipeline:backlog"] };
+      }
+      return { state: "open", labels: dispatched.has(id) ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue(issueNumber) {
+      return dispatched.has(String(issueNumber)) ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/x-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    dispatched.add(request.item_id);
+    const outcome = request.item_id === "200" ? "blocked_needs_human" : "ready_to_deploy";
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: outcome as LoopExecutionResponse["outcome"],
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  // The core guarantee of the fix: the run does not conclude a terminal hold on the stale
+  // cycle-start frontier and strand a sibling that became ready mid-cycle.
+  assert.equal(result.stop, null, "the run must not stop while a now-ready sibling can still make progress");
+  assert.ok(
+    calls.map((c) => c.item_id).includes("100"),
+    "the sibling that became ready mid-cycle must be dispatched, not stranded by a premature terminal hold",
+  );
+});
+
 test("regression (#568): a run whose only remaining item is at pipeline:backlog completes (all_items_done_or_excluded) without ever dispatching it", async () => {
   const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
   const ledger = testLedger({ "100": itemEntry("100", "pending") });

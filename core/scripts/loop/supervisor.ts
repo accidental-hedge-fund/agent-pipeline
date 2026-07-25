@@ -786,8 +786,32 @@ export async function runSupervisorCycle(
   // is still `pending`, a fresh dispatch this cycle already counts as progress, and the next cycle
   // re-evaluates the frontier rather than halting here (#581, capability
   // `loop-blocked-item-hold-continuation`).
+  // A hold only becomes the run's terminal outstanding-hold condition when nothing else can make
+  // progress. The cycle-start `schedulableContract` is a pre-dispatch snapshot: between precondition
+  // classification and here, a precondition-excluded sibling (e.g. `pipeline:backlog`) may have become
+  // `pipeline:ready` while a dispatched item turned into a hold. Concluding a terminal hold on that
+  // stale snapshot would stop a run that can still make progress (pre-merge finding 20713d3b). So when
+  // the stale frontier looks empty, re-observe live labels for the precondition-excluded *pending*
+  // items (a read only — no reconcile, no state transition, so a hold is never disturbed): if any has
+  // advanced out of the pre-pipeline stage and is not blocked, it is schedulable next cycle and this is
+  // not a terminal hold.
+  let terminalHold = !ledger.stop && heldItemIdsFromLedger(ledger).length > 0 && !hasSchedulableWorkRemaining(schedulableContract, ledger);
+  if (terminalHold && preconditionExcludedIds.size > 0) {
+    for (const item of contract.items) {
+      if (!preconditionExcludedIds.has(item.id) || ledger.items[item.id]?.state !== "pending") continue;
+      let observed: Awaited<ReturnType<typeof deps.observe.getIssueStateAndLabels>> = null;
+      try {
+        observed = await deps.observe.getIssueStateAndLabels(Number(item.id));
+      } catch {
+        continue; // a transient observation failure keeps the conservative (stale-snapshot) verdict
+      }
+      if (observed && observed.state === "open" && !isPrePipelineStage(pipelineStageFromLabels(observed.labels)) && !isBlockedInLabels(observed.labels)) {
+        terminalHold = false; // now at `pipeline:ready` (or a live stage) — schedulable next cycle
+        break;
+      }
+    }
+  }
   const finalHeldItemIds = heldItemIdsFromLedger(ledger);
-  const terminalHold = !ledger.stop && finalHeldItemIds.length > 0 && !hasSchedulableWorkRemaining(schedulableContract, ledger);
   if (terminalHold) {
     await appendActionEvidence(deps.store, runId, token, {
       item_id: null,
