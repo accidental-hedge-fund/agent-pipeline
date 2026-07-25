@@ -122,6 +122,7 @@ import {
   type ControlAttributionDisposition,
   type EvidenceRefKind,
 } from "./correction.ts";
+import { runProductFaultReport, realProductFaultReportDeps } from "./product-fault.ts";
 import {
   formatDoctorJson,
   formatDoctorSummary,
@@ -340,6 +341,8 @@ export interface CliOpts {
   note?: string;
   /** scoreboard: group correction/recurrence metrics by a single correction dimension. */
   correctionsBy?: string[];
+  /** report: skip the interactive confirmation prompt (-y/--yes). */
+  yes?: boolean;
 }
 
 /**
@@ -356,7 +359,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill | evals | loop | correction")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -463,7 +466,12 @@ export function buildCmd(): Command {
     .option("--effective-at <iso>", "correction attribute: the ISO timestamp the control actually became effective — required when --disposition is implemented, or superseded with --effective-commit/--effective-release")
     .option("--supersedes <attribution-id>", "correction attribute: optional — the attribution_id this record supersedes")
     .option("--note <text>", "correction attribute: optional bounded free-text note")
-    .option("--corrections-by <dimension>", "scoreboard: group correction/recurrence metrics by repo|stage|harness|model|source_kind|failure_class|proposed_control|implemented_control; repeatable (to detect a duplicate flag)", collectRepeatable, []);
+    .option("--corrections-by <dimension>", "scoreboard: group correction/recurrence metrics by repo|stage|harness|model|source_kind|failure_class|proposed_control|implemented_control; repeatable (to detect a duplicate flag)", collectRepeatable, [])
+    // report (#502): privacy-safe upstream product-fault reporting. Disabled
+    // by default (product_fault.enabled absent/false in .github/pipeline.yml)
+    // — see `runProductFaultReport`. --yes supplies the explicit confirmation
+    // on the command line instead of an interactive y/N prompt.
+    .option("-y, --yes", "report: skip the interactive confirmation prompt (explicit operator confirmation given on the command line)");
   // Note: `--json` is defined once above; it serves --status, the doctor command,
   // `pipeline path`, and `pipeline config validate/sync` (path/config are exempted from
   // the --status-only check). `allowExcessArguments(true)` (above) permits the
@@ -1835,6 +1843,26 @@ async function main(): Promise<void> {
       return;
     }
     process.exitCode = 0;
+    return;
+  }
+
+  // Early `pipeline report` dispatch (#502) — privacy-safe upstream
+  // product-fault reporting. Reads the `product_fault` config block directly
+  // (gh-free) rather than via resolveConfig, so the command stays inert and
+  // works unauthenticated when reporting is disabled or absent — matching
+  // the feature's default-inert contract. On success its only side effects
+  // are (a) an explicitly-confirmed network submission or a printed manual
+  // fallback draft, and (b) one appended local consent/audit record; it never
+  // calls `gh` and never creates a GitHub issue itself.
+  if (numArg === "report") {
+    const reportStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(reportStart) ?? reportStart;
+    const result = await runProductFaultReport(
+      { repoDir, assumeYes: opts.yes },
+      realProductFaultReportDeps(),
+    );
+    process.exitCode =
+      (result.outcome === "submitted" && !result.ok) || result.outcome === "auth-rejected" ? 1 : 0;
     return;
   }
 

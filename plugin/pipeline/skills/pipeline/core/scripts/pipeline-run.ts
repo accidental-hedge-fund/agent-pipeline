@@ -60,6 +60,7 @@ import {
 } from "./engine-identity.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { parseOverrideArg } from "./review-policy.ts";
+import { classifyProductFault, emitProductFault, resolveHostAdapter, resolveProductFaultConfig } from "./product-fault.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
 import { autoFileCorrections, autoFilePapercuts, realAutoFileDeps } from "./stages/papercut.ts";
 import * as planningStage from "./stages/planning.ts";
@@ -299,6 +300,59 @@ function evidenceStageName(stage: Stage): string {
  *  lifecycle, so the outer loop must not wrap it in a single synthetic stage. */
 function dispatchOwnsStageLifecycle(stage: Stage): boolean {
   return stage === "ready";
+}
+
+/** #502: true only for JS's own runtime error types (TypeError, RangeError,
+ *  ReferenceError) — Agent Pipeline never intentionally throws these for an
+ *  operational failure (a `gh`/git/harness/target-repo failure always throws
+ *  a plain `Error` with a descriptive message). Their presence at this
+ *  boundary reliably indicates a bug in the engine's own code, not an
+ *  external failure, so this is the one signal safe to classify as an
+ *  `engineCrash` without risking misclassifying target-repo/environment
+ *  failures as product faults (see product-fault.ts). */
+export function isEngineOwnedCrash(err: unknown): boolean {
+  return err instanceof TypeError || err instanceof RangeError || err instanceof ReferenceError;
+}
+
+/**
+ * #502: classify and (when it qualifies) emit a `product_fault` event for a
+ * dispatch-stage crash. Extracted from the dispatch catch site below so it is
+ * independently unit-testable without driving the whole `runAdvance` loop —
+ * a target-repo/gh/harness failure (a plain `Error`) never reaches
+ * `classifyProductFault`, only `isEngineOwnedCrash` errors do.
+ */
+export async function classifyAndEmitDispatchCrash(
+  err: unknown,
+  ctx: {
+    runDir: string;
+    stage: string;
+    pipelineVersion: string;
+    hostAdapter: string;
+    runStoreDeps: RunStoreDeps;
+    /** Resolved `product_fault.enabled` — absent/disabled config must produce
+     *  no event and no external delivery (default-inert requirement). */
+    productFaultEnabled: boolean;
+  },
+): Promise<void> {
+  if (!ctx.productFaultEnabled) return;
+  if (!isEngineOwnedCrash(err)) return;
+  const errorClass = (err as Error).name || "Error";
+  const classification = classifyProductFault({
+    errorClass,
+    errorMessage: (err as Error).message ?? String(err),
+    stage: ctx.stage,
+    pipelineVersion: ctx.pipelineVersion,
+    hostAdapter: ctx.hostAdapter,
+    signal: { engineCrash: true },
+  });
+  if (!classification) return;
+  await emitProductFault(ctx.runDir, {
+    classification,
+    pipelineVersion: ctx.pipelineVersion,
+    hostAdapter: ctx.hostAdapter,
+    stage: ctx.stage,
+    errorClass,
+  }, ctx.runStoreDeps);
 }
 
 /** ISO 8601 timestamp at seconds precision (matches the CLI's other stamps). */
@@ -849,6 +903,25 @@ export async function runAdvance(
         }
         if (!dispatchOwnsLifecycle && runDir) {
           await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: errAt, stage: auditStage, outcome: "error", commits: [] }, runStoreDeps).catch(() => {});
+        }
+        // #502: a stage crash with a native JS error type (never intentionally
+        // thrown for a gh/git/harness/target-repo failure — see
+        // isEngineOwnedCrash) is a probable Agent Pipeline defect, distinct
+        // from every other evidence class recorded above. Gated on the
+        // resolved product_fault config so an installation with no (or a
+        // disabled) product_fault block stays fully inert — no new
+        // events.jsonl artifact and no delivery to any configured external
+        // event sink.
+        if (runDir) {
+          const productFaultConfig = await resolveProductFaultConfig(cfg.repo_dir, runStoreDeps);
+          await classifyAndEmitDispatchCrash(err, {
+            runDir,
+            stage: auditStage,
+            pipelineVersion: pinnedEngine?.version ?? "",
+            hostAdapter: resolveHostAdapter(),
+            runStoreDeps,
+            productFaultEnabled: productFaultConfig.enabled,
+          });
         }
         throw err;
       }

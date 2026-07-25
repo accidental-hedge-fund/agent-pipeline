@@ -339,6 +339,23 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     mutatesGitHub: false,
     supportsJson: false,
   },
+
+  // report (#502): operator-facing `pipeline report` — builds a sanitized
+  // product-fault payload, previews it, and (only after explicit operator
+  // confirmation) submits it to the configured intake service, or prepares a
+  // manual GitHub issue draft when no intake is configured. Reads the
+  // `product_fault` config block directly (gh-free) rather than via
+  // resolveConfig, so it stays inert and works unauthenticated when reporting
+  // is disabled or absent. needsGhAuth/mutatesGitHub are both false: the
+  // client itself never calls `gh` and never creates an upstream issue.
+  report: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "yes"]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: false,
+  },
 };
 
 /**

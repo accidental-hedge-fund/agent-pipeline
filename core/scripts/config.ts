@@ -407,6 +407,21 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Optional external event sink for run events (#343)."),
+  // Privacy-safe upstream product-fault reporting (#502). Opt-in and default-
+  // absent: absent, or `enabled: false`, leaves `pipeline report` fully inert
+  // — no network reporting, no `gh` write, no GitHub issue. `intake_endpoint`
+  // is the maintainer-controlled intake service URL; `intake_auth_env` names
+  // an environment variable holding a submission-scoped credential (never a
+  // GitHub token, never stored in this config file itself).
+  product_fault: z
+    .object({
+      enabled: z.boolean().optional().describe("When true, `pipeline report` builds and may submit a sanitized product-fault payload; absent/false leaves reporting fully inert."),
+      intake_endpoint: z.string().optional().describe("Maintainer-controlled intake service URL that receives submitted product-fault reports."),
+      intake_auth_env: z.string().optional().describe("Name of an environment variable holding the submission-scoped intake credential (never a GitHub token)."),
+    })
+    .strict()
+    .optional()
+    .describe("Opt-in, default-absent privacy-safe product-fault reporting settings (#502)."),
   // Opt-in agent-logged friction capture (#419). When enabled, the engine adds
   // identity env vars to harness child processes and injects a prompt
   // instruction telling the agent to log minor friction via `pipeline
@@ -1064,6 +1079,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       depended_on_by: fileConfig.repo_map?.depended_on_by ?? DEFAULT_CONFIG.repo_map.depended_on_by,
     },
     event_sink: eventSink,
+    product_fault: fileConfig.product_fault,
     executors: fileConfig.executors ?? DEFAULT_CONFIG.executors,
     stage_executors: fileConfig.stage_executors ?? DEFAULT_CONFIG.stage_executors,
   };
@@ -2219,6 +2235,15 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         "#   mode: additive # additive (default): write events.jsonl AND deliver to the sink | exclusive: sink only (events.jsonl is not written)",
         "#   Env overrides: PIPELINE_EVENT_SINK_COMMAND, PIPELINE_EVENT_SINK_MODE (win over file config). Delivery failures are non-fatal.",
       ].join("\n"),
+    "",
+    config.product_fault !== undefined
+      ? `product_fault: # privacy-safe upstream product-fault reporting (#502) — opt in to let 'pipeline report' build/submit a sanitized diagnostic. SECURITY: when enabled, an explicitly-confirmed 'pipeline report' invocation sends the sanitized payload to intake_endpoint — treat it as a trusted destination. Absent/false: fully inert (no network, no gh write).\n${yamlBlock(config.product_fault, 2)}`
+      : [
+        "# product_fault: # privacy-safe upstream product-fault reporting (#502) — uncomment to enable 'pipeline report'. SECURITY: when enabled, an explicitly-confirmed report sends the sanitized payload to intake_endpoint — treat it as a trusted destination. Absent (default): fully inert — no network reporting, no GitHub issue.",
+        "#   enabled: false # set true to let 'pipeline report' build and (after explicit confirmation) submit a sanitized product-fault payload",
+        "#   intake_endpoint: \"https://intake.example.com/product-fault\" # maintainer-controlled intake service URL; absent -> pipeline report prepares a manual GitHub issue draft instead of submitting",
+        "#   intake_auth_env: \"PRODUCT_FAULT_INTAKE_TOKEN\" # name of an env var holding a submission-scoped credential — never a GitHub token, never stored here",
+      ].join("\n"),
     config.roadmap !== undefined
       ? `\nroadmap: # backlog roadmap engine overrides (#171)\n${yamlBlock(config.roadmap, 2)}`
       : [
@@ -2397,6 +2422,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     context_snapshot: config.context_snapshot,
     repo_map: config.repo_map,
     event_sink: config.event_sink,
+    product_fault: config.product_fault,
     executors: config.executors,
     stage_executors: config.stage_executors,
   };

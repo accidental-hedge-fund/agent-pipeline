@@ -37,6 +37,7 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 - [Troubleshooting](#troubleshooting)
   - [Evidence bundle](#evidence-bundle)
   - [External event sink](#external-event-sink-optional)
+  - [Privacy-safe product-fault reporting](#privacy-safe-product-fault-reporting-pipeline-report-optional-off-by-default)
   - [Machine-readable artifact conventions](#machine-readable-artifact-conventions)
 - [Advanced topics](#advanced-topics)
   - [Configurable steps](#configurable-steps)
@@ -1372,6 +1373,59 @@ event_sink:
 - Delivery is best-effort and non-fatal: an unreachable sink, a forwarder that exits non-zero, or a slow command never aborts the run or (in additive mode) affects the local write — a warning is logged and the run continues.
 - No schema change: the lines delivered to the sink are byte-identical to the ones written to `events.jsonl` — already screened by the injection denylist and secret redaction, `schema_version` unchanged.
 - When `event_sink` is unset (the default), behavior is exactly what it was before this feature existed.
+
+### Privacy-safe product-fault reporting (`pipeline report`, optional, off by default)
+
+When Agent Pipeline detects a probable defect **in itself** — as distinct from a target-repo test
+failure, a dependency/auth problem, or an operator correction — it records a `product_fault` run
+event locally. `pipeline report` lets you explicitly review and (optionally) submit a sanitized
+diagnostic to help maintainers spot recurring defects across installations. Nothing here runs
+automatically: the classifier only ever writes a local event, and `pipeline report` itself is inert
+unless you both enable it in config **and** invoke it.
+
+**What's collected.** The event and the submitted payload are built from a fixed allowlist only:
+Agent Pipeline version, host adapter (`claude`/`codex`), stage name, error class, a bounded
+`fingerprint` hash, exit state, confidence, and schema versions. Raw error messages and stack traces
+are never copied verbatim — they are reduced to the `fingerprint` (a normalized, path-/token-/digit-
+stripped signature, hashed and truncated), so a defect that recurs across different installations
+produces the same fingerprint without carrying any installation-identifying text.
+
+**What's excluded.** Repository name/identity, filesystem paths, issue/PR text, prompts or model
+output, source-code snippets, environment variable values, and secret-shaped tokens (`ghp_…`,
+`AWS…`, `KEY=value` pairs, private keys) can never enter the payload — there is no allowlist slot
+for them, and every allowlisted field is additionally passed through the existing injection/secret
+screen as defense in depth.
+
+**Consent and preview.** Enable reporting explicitly in `.github/pipeline.yml`:
+
+```yaml
+product_fault:
+  enabled: true
+  intake_endpoint: "https://intake.example.com/product-fault"  # maintainer-run intake service (optional)
+  intake_auth_env: "PRODUCT_FAULT_INTAKE_TOKEN"                 # env var holding a submission-scoped credential (optional)
+```
+
+Then run `pipeline report`. It builds the payload from the most recent local `product_fault` event,
+prints the **exact** sanitized payload that would be sent, and asks for explicit `y/N` confirmation
+(or pass `-y`/`--yes` to confirm non-interactively) before doing anything else. Declining prints the
+preview and exits — nothing is sent. Confirming appends one local consent/audit record (payload
+hash, destination, timestamp, confirmation) to `.agent-pipeline/product-fault-reports.jsonl`.
+
+- Absent `product_fault` config, or `enabled: false` → `pipeline report` performs no network I/O and
+  creates no GitHub issue; it prints that reporting is disabled and exits.
+- With `intake_endpoint` set, a confirmed report is submitted there, authenticated by the
+  submission-scoped credential named in `intake_auth_env` (never a GitHub token — the client itself
+  never holds GitHub write access for this feature).
+- Without `intake_endpoint`, a confirmed report instead prepares a **prefilled GitHub issue draft
+  URL** — you still have to open it and click submit yourself; the client never creates the issue.
+- **Retention/deletion** of anything actually submitted is enforced by the maintainer-run intake
+  service, not the client — see that service's own policy.
+- **Disable at any time** by removing the `product_fault` block or setting `enabled: false`; nothing
+  is reported in the background regardless — this is a later, precision-gated phase, not implemented
+  here.
+- **Inspect what was sent**: read `.agent-pipeline/product-fault-reports.jsonl` (one JSON line per
+  confirmed report attempt) alongside the `product_fault` events in the relevant run's
+  `events.jsonl`.
 
 ### Machine-readable artifact conventions
 

@@ -56,6 +56,17 @@ export const CONTROL_ATTRIBUTIONS_ARTIFACT: ArtifactContractEntry = {
   isFile: true,
 };
 
+/** Durable append-only consent/audit ledger (#502) for `pipeline report`: one
+ *  record per operator-confirmed product-fault submission attempt (payload
+ *  hash, destination, timestamp, confirmation, and delivery outcome). A
+ *  single file, not a per-run directory — mirrors
+ *  `CONTROL_ATTRIBUTIONS_ARTIFACT`. Local-only, never committed. */
+export const PRODUCT_FAULT_REPORTS_ARTIFACT: ArtifactContractEntry = {
+  name: "product-fault-reports.jsonl",
+  comment: "Local consent/audit ledger written by `pipeline report`; local-only, never committed.",
+  isFile: true,
+};
+
 /** Ordered contract of every `.agent-pipeline/` directory (or file) the
  *  engine writes. No other module SHALL independently define an
  *  `.agent-pipeline/` artifact path — derive it from an entry here instead. */
@@ -65,6 +76,7 @@ export const ARTIFACT_CONTRACT: readonly ArtifactContractEntry[] = [
   HISTORY_ARTIFACT,
   EVALS_ARTIFACT,
   CONTROL_ATTRIBUTIONS_ARTIFACT,
+  PRODUCT_FAULT_REPORTS_ARTIFACT,
 ];
 
 /** Resolve `<repoDir>/.agent-pipeline/<entry.name>` for a contract entry. */
