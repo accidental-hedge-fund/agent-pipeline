@@ -2050,3 +2050,74 @@ test("re-admission gated by discriminator (#581 review 2, finding 016d467e9d176c
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "waiting", "the hold remains outstanding, awaiting a human resume");
 });
+
+test("regression (#581 review 2, finding b38ac1b0566a5373): a needs-human hold plus a precondition-excluded pending sibling reaches the terminal outstanding-hold condition, not the one-cycle watchdog", async () => {
+  // "100" dispatches and is observed carrying a stale pipeline:blocked label — a needs-human
+  // hold. "200" is permanently pipeline:backlog — precondition-excluded from `schedulableContract`
+  // — but its ledger entry is still raw `pending`. Pre-fix, `hasSchedulableWorkRemaining` counted
+  // "200" from the unfiltered `contract`, so `terminalHold` was false and the one-cycle safety cap
+  // fell through to a `supervisor_cycle_cap` watchdog stop instead of the required outstanding
+  // hold.
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({
+    "100": itemEntry("100", "pending"),
+    "200": itemEntry("200", "pending"),
+  });
+  const { deps } = await setup(contract, ledger);
+
+  const dispatched = new Set<string>();
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels(issueNumber) {
+      const id = String(issueNumber);
+      if (id === "100") return { state: "open", labels: ["pipeline:blocked"] };
+      return { state: "open", labels: ["pipeline:backlog"] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/x-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatched.add(request.item_id);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "failed",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem },
+    { runId: "run-1", engine: "claude", maxCyclesSafety: 1 },
+  );
+
+  assert.equal(result.stop, null, "the one-cycle safety cap must not be consumed by a precondition-excluded pending sibling");
+  assert.equal(result.holdOutstanding, true, "the run reaches the terminal outstanding-hold condition instead of the watchdog");
+  assert.deepEqual(result.heldItemIds, ["100"], "the terminal report enumerates the held item");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "waiting");
+  assert.equal(finalLedger.items["200"].state, "pending", "the excluded sibling is left pending, never dispatched");
+});

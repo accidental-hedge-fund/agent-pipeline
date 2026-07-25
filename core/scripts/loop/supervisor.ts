@@ -201,13 +201,17 @@ function heldItemIdsFromLedger(ledger: LoopLedger): string[] {
     .sort();
 }
 
-/** True when at least one `pending` item remains in `contract` — i.e. there is still work a
- *  future cycle could pick up. Used to tell "an item just entered a hold, but siblings are still
- *  queued" apart from "nothing is left to try but a hold" (#581). A `pending` item permanently
- *  excluded by a dependency on a non-run-fatal blocked item is intentionally still counted here —
- *  that dependency deadlock is the pre-existing no-progress watchdog's concern, not this check's. */
-function hasSchedulableWorkRemaining(contract: LoopContract, ledger: LoopLedger): boolean {
-  return contract.items.some((item) => ledger.items[item.id]?.state === "pending");
+/** True when at least one `pending` item remains in `schedulableContract` — the post-precondition
+ *  eligible frontier scheduling itself already consults — i.e. there is still work a future cycle
+ *  could pick up. Used to tell "an item just entered a hold, but siblings are still queued" apart
+ *  from "nothing is left to try but a hold" (#581). `schedulableContract` has precondition-excluded
+ *  items already carved out, so such a sibling — still `pending` in the raw ledger but unreachable
+ *  by the scheduler — correctly does not suppress the terminal hold (review 2, finding b38ac1b0566a5373).
+ *  A `pending` item permanently excluded by a dependency on a non-run-fatal blocked item is
+ *  intentionally still counted here — that dependency deadlock is the pre-existing no-progress
+ *  watchdog's concern, not this check's. */
+function hasSchedulableWorkRemaining(schedulableContract: LoopContract, ledger: LoopLedger): boolean {
+  return schedulableContract.items.some((item) => ledger.items[item.id]?.state === "pending");
 }
 
 /** Reconciliation-driven re-admission for a cleared pipeline-blocked hold (#581 review 2, finding
@@ -783,7 +787,7 @@ export async function runSupervisorCycle(
   // re-evaluates the frontier rather than halting here (#581, capability
   // `loop-blocked-item-hold-continuation`).
   const finalHeldItemIds = heldItemIdsFromLedger(ledger);
-  const terminalHold = !ledger.stop && finalHeldItemIds.length > 0 && !hasSchedulableWorkRemaining(contract, ledger);
+  const terminalHold = !ledger.stop && finalHeldItemIds.length > 0 && !hasSchedulableWorkRemaining(schedulableContract, ledger);
   if (terminalHold) {
     await appendActionEvidence(deps.store, runId, token, {
       item_id: null,
