@@ -95,12 +95,24 @@ test("runLoopCommand — success drives the supervisor and prints its result as 
       assert.deepEqual(input.selector, { type: "work-list", value: ["100"] });
       return {
         kind: "drive",
-        result: { runId: "loop-abc123", cycles: 2, stop: null, holdOutstanding: false, allDone: true, resumed: false },
+        result: {
+          runId: "loop-abc123",
+          cycles: 2,
+          stop: null,
+          holdOutstanding: false,
+          allDone: true,
+          resumed: false,
+          heldItemIds: [],
+          dispatched: 1,
+          excludedItemIds: [],
+          exclusionReason: null,
+          completion: "all_done",
+        },
       };
     },
   };
   process.exitCode = undefined;
-  const { out } = await withCapturedConsole(() =>
+  const { out, err } = await withCapturedConsole(() =>
     runLoopCommand({ milestone: "v2", profile: "claude" } as CliOpts, [], deps),
   );
   assert.equal(process.exitCode, 0);
@@ -108,7 +120,90 @@ test("runLoopCommand — success drives the supervisor and prints its result as 
   assert.equal(parsed.engine, "claude");
   assert.equal(parsed.run_id, "loop-abc123");
   assert.equal(parsed.all_done, true);
+  assert.equal(parsed.completion, "all_done");
+  assert.equal(parsed.dispatched, 1);
+  assert.equal(parsed.excluded, 0);
+  assert.deepEqual(parsed.excluded_item_ids, []);
+  assert.equal(parsed.exclusion_reason, null);
   assert.equal(parsed.stop, null);
+  assert.ok(!err.join("\n").includes("excluded"), "a genuinely all-done run prints no excluded-count line (#614)");
+});
+
+test("runLoopCommand — a run resolved none_dispatchable (every item precondition-excluded) is not reported all_done, prints the excluded-count line without --audit, and exits 2 (#614, capability loop-terminal-exclusion-disclosure)", async () => {
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async () =>
+      ({
+        ok: true,
+        args: { selector: { type: "work-list", value: ["607", "608"] }, resumeRunId: undefined, audit: false },
+      }) satisfies LoopPreflightOutcome,
+    runLoopEngine: async () => ({
+      kind: "drive",
+      result: {
+        runId: "loop-abc123",
+        cycles: 1,
+        stop: null,
+        holdOutstanding: false,
+        allDone: false,
+        resumed: false,
+        heldItemIds: [],
+        dispatched: 0,
+        excludedItemIds: ["607", "608"],
+        exclusionReason: "precondition:required=pipeline:ready,observed=none",
+        completion: "none_dispatchable",
+      },
+    }),
+  };
+  process.exitCode = undefined;
+  const { out, err } = await withCapturedConsole(() =>
+    runLoopCommand({ milestone: "v2", profile: "claude" } as CliOpts, [], deps),
+  );
+  assert.equal(process.exitCode, 2, "none_dispatchable is distinct from both success (0) and stop/hold failure (1)");
+  assert.match(err.join("\n"), /0 of 2 item\(s\) dispatchable/);
+  assert.match(err.join("\n"), /2 excluded: need pipeline:ready/);
+  assert.match(err.join("\n"), /#607, #608/);
+  const parsed = JSON.parse(out[0]);
+  assert.equal(parsed.all_done, false);
+  assert.equal(parsed.completion, "none_dispatchable");
+  assert.equal(parsed.dispatched, 0);
+  assert.equal(parsed.excluded, 2);
+  assert.deepEqual(parsed.excluded_item_ids, ["607", "608"]);
+  assert.equal(parsed.exclusion_reason, "precondition:required=pipeline:ready,observed=none");
+});
+
+test("runLoopCommand — a partial_excluded run (some dispatched, some excluded) still exits 0 but discloses the excluded items (#614)", async () => {
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async () =>
+      ({
+        ok: true,
+        args: { selector: { type: "work-list", value: ["100", "200"] }, resumeRunId: undefined, audit: false },
+      }) satisfies LoopPreflightOutcome,
+    runLoopEngine: async () => ({
+      kind: "drive",
+      result: {
+        runId: "loop-abc123",
+        cycles: 1,
+        stop: null,
+        holdOutstanding: false,
+        allDone: false,
+        resumed: false,
+        heldItemIds: [],
+        dispatched: 1,
+        excludedItemIds: ["100"],
+        exclusionReason: "precondition:required=pipeline:ready,observed=pipeline:backlog",
+        completion: "partial_excluded",
+      },
+    }),
+  };
+  process.exitCode = undefined;
+  const { out, err } = await withCapturedConsole(() =>
+    runLoopCommand({ milestone: "v2", profile: "claude" } as CliOpts, [], deps),
+  );
+  assert.equal(process.exitCode, 0, "work happened and the run resolved — a mixed result is not a failure exit");
+  assert.match(err.join("\n"), /1 of 2 item\(s\) dispatchable/);
+  assert.match(err.join("\n"), /1 excluded: need pipeline:ready \(#100\)/);
+  const parsed = JSON.parse(out[0]);
+  assert.equal(parsed.all_done, false);
+  assert.equal(parsed.completion, "partial_excluded");
 });
 
 test("runLoopCommand — a stop carrying outstanding_ready names the stranded item on stderr and in the JSON (#570, capability loop-needs-human-blocker-disposition)", async () => {
@@ -127,6 +222,11 @@ test("runLoopCommand — a stop carrying outstanding_ready names the stranded it
         holdOutstanding: false,
         allDone: false,
         resumed: false,
+        heldItemIds: [],
+        dispatched: 0,
+        excludedItemIds: [],
+        exclusionReason: null,
+        completion: null,
       },
     }),
   };
@@ -139,6 +239,7 @@ test("runLoopCommand — a stop carrying outstanding_ready names the stranded it
   assert.match(err.join("\n"), /100/);
   const parsed = JSON.parse(out[0]);
   assert.deepEqual(parsed.stop.outstanding_ready, ["100"]);
+  assert.equal(parsed.completion, null, "a recorded stop leaves completion null (#614)");
 });
 
 test("runLoopCommand — a stop with no outstanding ready item prints no stranded-item stderr line", async () => {
@@ -157,6 +258,11 @@ test("runLoopCommand — a stop with no outstanding ready item prints no strande
         holdOutstanding: false,
         allDone: false,
         resumed: false,
+        heldItemIds: [],
+        dispatched: 0,
+        excludedItemIds: [],
+        exclusionReason: null,
+        completion: null,
       },
     }),
   };
@@ -185,6 +291,10 @@ test("runLoopCommand — a terminal outstanding hold names every held item on st
         heldItemIds: ["100", "200"],
         allDone: false,
         resumed: false,
+        dispatched: 0,
+        excludedItemIds: [],
+        exclusionReason: null,
+        completion: null,
       },
     }),
   };
@@ -198,6 +308,7 @@ test("runLoopCommand — a terminal outstanding hold names every held item on st
   const parsed = JSON.parse(out[0]);
   assert.equal(parsed.hold_outstanding, true);
   assert.deepEqual(parsed.held_item_ids, ["100", "200"]);
+  assert.equal(parsed.completion, null, "an outstanding hold leaves completion null (#614)");
 });
 
 test("runLoopCommand — a run-engine error (e.g. an unsupported selector type) exits non-zero", async () => {
@@ -298,7 +409,19 @@ test("runLoopCommand — a host with no goal-loop skill installed at any root st
       assert.deepEqual(input.selector, { type: "work-list", value: ["100"] });
       return {
         kind: "drive",
-        result: { runId: "loop-noskill", cycles: 1, stop: null, holdOutstanding: false, allDone: true, resumed: false },
+        result: {
+          runId: "loop-noskill",
+          cycles: 1,
+          stop: null,
+          holdOutstanding: false,
+          allDone: true,
+          resumed: false,
+          heldItemIds: [],
+          dispatched: 1,
+          excludedItemIds: [],
+          exclusionReason: null,
+          completion: "all_done",
+        },
       };
     },
   };

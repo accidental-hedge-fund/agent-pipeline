@@ -1063,6 +1063,21 @@ export async function runLoopCommand(
     );
   }
 
+  // A resolved run with ≥1 precondition-excluded item is named on the CLI's own output, not only
+  // recoverable via `--audit` (#614, capability `loop-terminal-exclusion-disclosure`) — the same
+  // "all_done: true masked nothing ran" gap #570/#581 already closed for stops and holds.
+  const excludedItemIds = engineResult.result.excludedItemIds ?? [];
+  if (excludedItemIds.length > 0) {
+    const dispatched = engineResult.result.dispatched;
+    const total = dispatched + excludedItemIds.length;
+    const reason = humanizeExclusionReason(engineResult.result.exclusionReason);
+    console.error(
+      `pipeline loop: ${dispatched} of ${total} item(s) dispatchable — ${excludedItemIds.length} excluded: ${reason} (${excludedItemIds
+        .map((id) => `#${id}`)
+        .join(", ")})`,
+    );
+  }
+
   console.log(
     JSON.stringify({
       schema_version: "1",
@@ -1074,9 +1089,28 @@ export async function runLoopCommand(
       held_item_ids: heldItemIds,
       all_done: engineResult.result.allDone,
       resumed: engineResult.result.resumed,
+      dispatched: engineResult.result.dispatched,
+      excluded: excludedItemIds.length,
+      excluded_item_ids: excludedItemIds,
+      exclusion_reason: engineResult.result.exclusionReason,
+      completion: engineResult.result.completion,
     }),
   );
-  process.exitCode = engineResult.result.stop || engineResult.result.holdOutstanding ? 1 : 0;
+  process.exitCode = engineResult.result.stop || engineResult.result.holdOutstanding
+    ? 1
+    : engineResult.result.completion === "none_dispatchable"
+      ? 2
+      : 0;
+}
+
+/** Renders a machine-readable `precondition:required=<stage>,observed=<stage>` exclusion reason
+ *  (see `loop/supervisor.ts` `formatExclusionReason`) into the short human form the CLI disclosure
+ *  line uses (#614, design.md decision 3), e.g. `"need pipeline:ready"`. Falls back to the raw
+ *  reason string for any shape this pattern doesn't recognize, and to `"unknown"` when absent. */
+function humanizeExclusionReason(reason: string | null): string {
+  if (!reason) return "unknown";
+  const match = /^precondition:required=([^,]+),observed=/.exec(reason);
+  return match ? `need ${match[1]}` : reason;
 }
 
 /** Whether `resolvedPath` resolves inside `repoDir` once symlinks are

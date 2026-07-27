@@ -11,6 +11,7 @@ import {
   DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT,
   attachSupervisor,
   auditSupervisor,
+  dominantExclusionReason,
   driveSupervisor,
   runSupervisorCycle,
   type SupervisorDeps,
@@ -610,6 +611,11 @@ test("driveSupervisor releases the lock once the run reaches a terminal conditio
     { runId: "run-1", engine: "codex" },
   );
   assert.equal(secondDrive.allDone, true);
+  assert.equal(
+    secondDrive.dispatched,
+    1,
+    "the item reached its terminal-successful state in the FIRST drive, before this drive ran any cycles — dispatched is derived from the ledger, not an in-process counter (#614)",
+  );
 });
 
 test("driveSupervisor releases the lock on a dependency_deadlock stop", async () => {
@@ -1120,6 +1126,40 @@ function backlogAndReadyFakes() {
   return { observe, dispatchItem, calls };
 }
 
+// ---------------------------------------------------------------------------
+// dominantExclusionReason (#614, capability loop-terminal-exclusion-disclosure) — pure helper,
+// no gh/git/fs/clock/store access.
+// ---------------------------------------------------------------------------
+
+test("dominantExclusionReason: no exclusions -> null", () => {
+  assert.equal(dominantExclusionReason([]), null);
+});
+
+test("dominantExclusionReason: a single exclusion's reason wins outright", () => {
+  const reason = dominantExclusionReason([{ item_id: "100", required_stage: "pipeline:ready", observed_stage: "none" }]);
+  assert.equal(reason, "precondition:required=pipeline:ready,observed=none");
+});
+
+test("dominantExclusionReason: the most frequent reason wins over a less-frequent one", () => {
+  const reason = dominantExclusionReason([
+    { item_id: "100", required_stage: "pipeline:ready", observed_stage: "none" },
+    { item_id: "200", required_stage: "pipeline:ready", observed_stage: "none" },
+    { item_id: "300", required_stage: "pipeline:ready", observed_stage: "pipeline:backlog" },
+  ]);
+  assert.equal(reason, "precondition:required=pipeline:ready,observed=none");
+});
+
+test("dominantExclusionReason: a tie is broken lexicographically by the reason string, deterministically", () => {
+  const exclusions = [
+    { item_id: "100", required_stage: "pipeline:ready", observed_stage: "pipeline:backlog" },
+    { item_id: "200", required_stage: "pipeline:ready", observed_stage: "none" },
+  ];
+  const forward = dominantExclusionReason(exclusions);
+  const reversed = dominantExclusionReason([...exclusions].reverse());
+  assert.equal(forward, "precondition:required=pipeline:ready,observed=none", "'observed=none' sorts before 'observed=pipeline:backlog'");
+  assert.equal(reversed, forward, "the same tie always resolves the same way regardless of input order");
+});
+
 test("regression (#568): a backlog item alongside a ready item advances the ready item, excludes the backlog item with a precondition rationale, and the run does not stop", async () => {
   const contract = testContract({
     items: [
@@ -1134,7 +1174,15 @@ test("regression (#568): a backlog item alongside a ready item advances the read
   const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
 
   assert.equal(result.stop, null, "a pre-pipeline exclusion must never record a run stop");
-  assert.equal(result.allDone, true, "the run reaches a normal terminal condition — all_items_done_or_excluded");
+  assert.equal(
+    result.allDone,
+    false,
+    "the excluded item means the run is not genuinely all-done (#614) — one item was merely excluded, not completed",
+  );
+  assert.equal(result.completion, "partial_excluded", "200 dispatched to a terminal-successful state, 100 excluded (#614)");
+  assert.equal(result.dispatched, 1);
+  assert.deepEqual(result.excludedItemIds, ["100"]);
+  assert.equal(result.exclusionReason, "precondition:required=pipeline:ready,observed=pipeline:backlog");
   assert.deepEqual(calls.map((c) => c.item_id), ["200"], "the backlog item must never be dispatched at all — the frontier gate is the primary defense");
 
   const finalLedger = await readLedger(deps, "run-1");
@@ -1230,7 +1278,15 @@ test("regression (#568): a run whose only remaining item is at pipeline:backlog 
   const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
 
   assert.equal(result.stop, null);
-  assert.equal(result.allDone, true);
+  assert.equal(
+    result.allDone,
+    false,
+    "zero items dispatched, one excluded — this is 'nothing ran', not all_done (#614 regression: previously reported all_done: true)",
+  );
+  assert.equal(result.completion, "none_dispatchable");
+  assert.equal(result.dispatched, 0);
+  assert.deepEqual(result.excludedItemIds, ["100"]);
+  assert.equal(result.exclusionReason, "precondition:required=pipeline:ready,observed=pipeline:backlog");
   assert.equal(result.cycles, 1, "the exclusion is structural, not a no-progress accident — it completes on the first cycle");
   assert.deepEqual(calls, [], "a permanently pre-pipeline item is never dispatched");
 });
@@ -2190,6 +2246,12 @@ test("regression (#581 review 2, finding b38ac1b0566a5373): a needs-human hold p
   assert.equal(result.stop, null, "the one-cycle safety cap must not be consumed by a precondition-excluded pending sibling");
   assert.equal(result.holdOutstanding, true, "the run reaches the terminal outstanding-hold condition instead of the watchdog");
   assert.deepEqual(result.heldItemIds, ["100"], "the terminal report enumerates the held item");
+  assert.equal(result.completion, null, "an outstanding hold is not a resolution — completion stays null (#614)");
+  assert.deepEqual(
+    result.excludedItemIds,
+    ["200"],
+    "the precondition-excluded sibling is reported excluded, but the held item ('100') must never also appear here (#614)",
+  );
 
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "waiting");
