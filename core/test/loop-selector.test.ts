@@ -8,13 +8,43 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  classifyDispatchOutcome,
   dispatchItemChildArgs,
   extractRoadmapSliceIssues,
   resolveSelectorIssues,
   type SelectorOpenIssue,
   type SelectorResolveDeps,
 } from "../scripts/pipeline.ts";
+import { BLOCKED_LABEL } from "../scripts/types.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+
+// ---------------------------------------------------------------------------
+// classifyDispatchOutcome — the per-item advance's label/state → outcome mapping
+// (realDispatchItem). Regression for #616: a real `blocked`-labeled item must map to
+// `blocked_needs_human`, never `failed`, so the supervisor holds it instead of
+// classifying it as workflow-engine-defect and run_fataling the whole run.
+// ---------------------------------------------------------------------------
+
+test("classifyDispatchOutcome: a real 'blocked'-labeled item maps to blocked_needs_human, not failed (#616)", () => {
+  // The exact live shape observed in #616: the canonical BLOCKED_LABEL co-present with a stage label.
+  assert.equal(BLOCKED_LABEL, "blocked");
+  assert.equal(classifyDispatchOutcome({ labels: [BLOCKED_LABEL, "pipeline:fix-2"], state: "open" }), "blocked_needs_human");
+  assert.equal(classifyDispatchOutcome({ labels: ["blocked"], state: "open" }), "blocked_needs_human");
+});
+
+test("classifyDispatchOutcome: the phantom 'pipeline:blocked' label is NOT a blocker — it falls through to failed (#616)", () => {
+  // Pre-fix this site checked `${LABEL_PREFIX}blocked` ("pipeline:blocked"), a label the pipeline
+  // never writes. A `pipeline:blocked`-only item must NOT be treated as blocked here.
+  assert.equal(classifyDispatchOutcome({ labels: ["pipeline:blocked"], state: "open" }), "failed");
+});
+
+test("classifyDispatchOutcome: ready-to-deploy, closed, and generic-failure mappings are unchanged", () => {
+  assert.equal(classifyDispatchOutcome({ labels: ["pipeline:ready-to-deploy"], state: "open" }), "ready_to_deploy");
+  assert.equal(classifyDispatchOutcome({ labels: ["pipeline:fix-1"], state: "closed" }), "abandoned");
+  assert.equal(classifyDispatchOutcome({ labels: ["pipeline:review-1"], state: "open" }), "failed");
+  // ready-to-deploy wins over a co-present blocked label (checked first).
+  assert.equal(classifyDispatchOutcome({ labels: ["pipeline:ready-to-deploy", "blocked"], state: "open" }), "ready_to_deploy");
+});
 
 function fakeCfg(): PipelineConfig {
   return { repo: "acme/widget", repo_dir: "/tmp/does-not-exist" } as unknown as PipelineConfig;

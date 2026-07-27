@@ -1699,7 +1699,7 @@ test("regression (#581 review 1, finding fcb03bcd04fc9b04): a direct blocked_nee
   const ledger = testLedger({ "100": itemEntry("100", "pending") });
   const { deps } = await setup(contract, ledger);
 
-  // The live issue never carries `pipeline:blocked` — this is a generic needs-human blocker
+  // The live issue never carries `blocked` — this is a generic needs-human blocker
   // (e.g. a plan/user-input blocker), not a pipeline-blocked-label hold.
   const observe: ReconcileObserveDeps = {
     async getIssueStateAndLabels() {
@@ -1760,10 +1760,10 @@ test("regression (#581 review 1, finding fcb03bcd04fc9b04): a direct blocked_nee
   assert.equal(finalLedger.items["100"].state, "waiting", "the hold remains outstanding, awaiting a human resume");
 });
 
-test("needs-human blocker-disposition safety net (#570): a failed outcome observed at pipeline:blocked is routed to the hold, not workflow-engine-defect", async () => {
+test("needs-human blocker-disposition safety net (#570): a failed outcome observed carrying the blocked label is routed to the hold, not workflow-engine-defect", async () => {
   // Item "100" is dispatched, its harness reports the well-known retryable plan-review format
   // failure normalized to "failed" (LOOP_TERMINAL_OUTCOMES has no such literal outcome), and the
-  // live issue is nonetheless observed carrying `pipeline:blocked` — a recoverable,
+  // live issue is nonetheless observed carrying `blocked` — a recoverable,
   // human-unblockable disposition, not a genuine dispatch crash/rejection.
   const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
   const ledger = testLedger({ "100": itemEntry("100", "pending") });
@@ -1773,7 +1773,9 @@ test("needs-human blocker-disposition safety net (#570): a failed outcome observ
   const observe: ReconcileObserveDeps = {
     async getIssueStateAndLabels() {
       calls++;
-      return calls === 1 ? { state: "open", labels: ["pipeline:ready"] } : { state: "open", labels: ["pipeline:blocked"] };
+      // Real blocked shape: the `blocked` label is added alongside the retained stage label
+      // (e.g. #616: ["blocked", "pipeline:fix-2"]) — never bare, which would look pre-pipeline.
+      return calls === 1 ? { state: "open", labels: ["pipeline:ready"] } : { state: "open", labels: ["blocked", "pipeline:fix-1"] };
     },
     async findPrForIssue() {
       return null;
@@ -1918,7 +1920,7 @@ test("a stop recorded with no ready item discloses an empty outstanding_ready se
 });
 
 // ---------------------------------------------------------------------------
-// #581 — a dispatched item already carrying a stale pipeline:blocked label holds per-item and
+// #581 — a dispatched item already carrying a stale blocked label holds per-item and
 // the run continues on the remaining schedulable items, capability
 // `loop-blocked-item-hold-continuation`.
 // ---------------------------------------------------------------------------
@@ -1946,7 +1948,7 @@ test("regression (#581): one already-blocked item co-present with a stage label 
         // A stale, reason-less blocker co-present with a mid-flight stage label —
         // pipelineStageFromLabels's single stage-winner would return "review-1" here, not
         // "blocked", so detection must be presence-based to catch it.
-        return { state: "open", labels: ["pipeline:review-1", "pipeline:blocked"] };
+        return { state: "open", labels: ["pipeline:review-1", "blocked"] };
       }
       return { state: "open", labels: dispatched.has(id) ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
     },
@@ -2052,7 +2054,7 @@ test("terminal hold (#581): once every remaining item is held, the run reaches t
   assert.deepEqual(result.heldItemIds, ["100", "200"], "the terminal report names every held item, sorted");
 });
 
-test("re-admission (#581 review 2, finding 016d467e9d176c6f): a held item whose pipeline:blocked label is cleared between cycles re-enters the frontier and dispatches to completion", async () => {
+test("re-admission (#581 review 2, finding 016d467e9d176c6f): a held item whose blocked label is cleared between cycles re-enters the frontier and dispatches to completion", async () => {
   const contract = testContract({
     items: [{ id: "100", depends_on: [] }],
   });
@@ -2074,7 +2076,7 @@ test("re-admission (#581 review 2, finding 016d467e9d176c6f): a held item whose 
     },
   });
   const { deps } = await setup(contract, ledger);
-  // The live label no longer carries pipeline:blocked by the time this cycle observes it — the
+  // The live label no longer carries blocked by the time this cycle observes it — the
   // human already cleared it out-of-band between cycles.
   const { observe, dispatchItem, calls } = coordinatedFakes();
 
@@ -2104,7 +2106,7 @@ test("re-admission gated by discriminator (#581 review 2, finding 016d467e9d176c
         request_id: "req-1",
         item_id: "100",
         kind: "answer",
-        prompt: "an operator-initiated hold unrelated to a pipeline:blocked label",
+        prompt: "an operator-initiated hold unrelated to a blocked label",
         requested_by_engine: "claude",
         requested_at: "2026-07-23T00:00:00.000Z",
       },
@@ -2124,7 +2126,7 @@ test("re-admission gated by discriminator (#581 review 2, finding 016d467e9d176c
 });
 
 test("regression (#581 review 2, finding b38ac1b0566a5373): a needs-human hold plus a precondition-excluded pending sibling reaches the terminal outstanding-hold condition, not the one-cycle watchdog", async () => {
-  // "100" dispatches and is observed carrying a stale pipeline:blocked label — a needs-human
+  // "100" dispatches and is observed carrying a stale blocked label — a needs-human
   // hold. "200" is permanently pipeline:backlog — precondition-excluded from `schedulableContract`
   // — but its ledger entry is still raw `pending`. Pre-fix, `hasSchedulableWorkRemaining` counted
   // "200" from the unfiltered `contract`, so `terminalHold` was false and the one-cycle safety cap
@@ -2146,7 +2148,7 @@ test("regression (#581 review 2, finding b38ac1b0566a5373): a needs-human hold p
   const observe: ReconcileObserveDeps = {
     async getIssueStateAndLabels(issueNumber) {
       const id = String(issueNumber);
-      if (id === "100") return { state: "open", labels: ["pipeline:blocked"] };
+      if (id === "100") return { state: "open", labels: ["blocked", "pipeline:fix-1"] };
       return { state: "open", labels: ["pipeline:backlog"] };
     },
     async findPrForIssue() {

@@ -112,7 +112,7 @@ export function buildAuditRepairBlockedComment(runId: string): string {
       `> **Note**: The original block reason could not be recovered — the blocker comment was not recorded.`,
       ``,
       `### How to unblock`,
-      `Remove the \`pipeline:blocked\` label and re-apply the active stage label (e.g. \`pipeline:fix-1\`) to resume the pipeline.`,
+      `Remove the \`blocked\` label and re-apply the active stage label (e.g. \`pipeline:fix-1\`) to resume the pipeline.`,
       ``,
       buildAuditSentinel(runId, "blocked"),
       ``,
