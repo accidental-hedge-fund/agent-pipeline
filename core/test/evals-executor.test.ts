@@ -4,10 +4,44 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { allocateCellIdentity, deriveModelEndpointOverride, runCell, type CellExecutionDeps } from "../scripts/evals/executor.ts";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as nodePath from "node:path";
+import { allocateCellIdentity, defaultContractIO, deriveModelEndpointOverride, runCell as runCellReal, type CellExecutionDeps } from "../scripts/evals/executor.ts";
 import { validateFixture } from "../scripts/evals/fixture.ts";
 import { validateManifest } from "../scripts/evals/manifest.ts";
 import type { Cell, Fixture } from "../scripts/evals/types.ts";
+
+// #607 eval-agent-isolation-boundary added a real-fs contract install/restore
+// and a real command-boundary shim to every runCell() call. Every test in
+// this file uses a fake `createWorktree` that never creates a real
+// directory (CLAUDE.md's injectable-dep rule — no real fs/subprocess in
+// these tests), so the production defaults for those two features would
+// fail against a nonexistent path. This local `runCell` wrapper injects
+// harmless in-memory fakes for both by default, so every pre-existing test
+// below is unaffected; a test that specifically exercises contract/boundary
+// behavior overrides the relevant key(s) explicitly (object spread below
+// puts `...deps` last, so an explicit key — including `undefined`, which
+// opts back into the real default via `??` inside runCell itself — always
+// wins).
+function fakeContractIO(): NonNullable<CellExecutionDeps["contractIO"]> {
+  const files = new Map<string, string>();
+  return {
+    readFile: (p) => (files.has(p) ? files.get(p)! : null),
+    writeFile: (p, c) => { files.set(p, c); },
+    removeFile: (p) => { files.delete(p); },
+  };
+}
+
+async function runCell(...args: Parameters<typeof runCellReal>): ReturnType<typeof runCellReal> {
+  const [cfg, cell, fixture, manifest, deps = {}] = args;
+  return runCellReal(cfg, cell, fixture, manifest, {
+    contractIO: fakeContractIO(),
+    installBoundaryShim: (worktreeDir: string) => `${worktreeDir}/.eval-boundary-shim`,
+    readBoundaryDenials: () => [],
+    ...deps,
+  });
+}
 
 const SHA = "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd";
 
@@ -1081,6 +1115,375 @@ test("runCell: a simulated dependency's setup shelling out to gh is refused by t
   assert.match(result.outcome.error ?? "", /gh/);
   assert.match(result.outcome.error ?? "", /not permitted/);
   assert.equal(harnessInvoked, false, "a denied setup command must block the treatment, the same as any other setup failure");
+});
+
+// ---------------------------------------------------------------------------
+// #607 eval-agent-isolation-boundary — eval agent contract install/restore,
+// process-level command boundary wiring, and the declared sandbox mode.
+// ---------------------------------------------------------------------------
+
+test("runCell: installs the eval agent contract before the first harness invocation, and restores it after", async () => {
+  const agentsMdContent = new Map<string, string>();
+  let contentSeenByHarness: string | undefined;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    contractIO: {
+      readFile: (p) => (p.endsWith("AGENTS.md") ? (agentsMdContent.get(p) ?? "prior agents content") : null),
+      writeFile: (p, c) => { agentsMdContent.set(p, c); },
+      removeFile: (p) => { agentsMdContent.delete(p); },
+    },
+    invokeHarness: async () => {
+      // Snapshot the AGENTS.md content the harness would actually see —
+      // must already be the contract, not the repo's prior content.
+      contentSeenByHarness = [...agentsMdContent.values()][0];
+      return successResult();
+    },
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.match(contentSeenByHarness ?? "", /Evaluation cell — root instruction contract/);
+  // After the cell completes, the path must be restored to its prior content.
+  assert.deepEqual([...agentsMdContent.values()], ["prior agents content"]);
+});
+
+test("runCell: restores each root-instruction path's prior content (or removes it if none existed)", async () => {
+  const writes: Array<{ path: string; content: string }> = [];
+  const removed: string[] = [];
+  let phase: "install" | "restore" = "install";
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    contractIO: {
+      readFile: (p) => (p.endsWith("AGENTS.md") ? "prior agents content" : null),
+      writeFile: (p, c) => {
+        writes.push({ path: p, content: c });
+      },
+      removeFile: (p) => {
+        removed.push(p);
+      },
+    },
+    invokeHarness: async () => {
+      phase = "restore";
+      return successResult();
+    },
+  };
+  await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(phase, "restore");
+  const agentsWrites = writes.filter((w) => w.path.endsWith("AGENTS.md"));
+  assert.equal(agentsWrites[agentsWrites.length - 1].content, "prior agents content", "AGENTS.md must be restored to its prior content");
+  assert.ok(removed.some((p) => p.endsWith("CLAUDE.md")), "CLAUDE.md had no prior content and must be removed on restore");
+});
+
+test("defaultContractIO.readFile: a genuinely-absent file is null, but a non-ENOENT read failure (EISDIR) propagates — never mistaken for absence (finding e3e72127)", () => {
+  const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "eval-contract-io-read-"));
+  try {
+    // A missing file is "no prior content".
+    assert.equal(defaultContractIO.readFile(nodePath.join(dir, "absent.md")), null);
+    // Reading a *directory* fails with EISDIR (not ENOENT) — this MUST throw, not
+    // return null. Pre-fix it returned null, so restore would have deleted the
+    // "absent" path, destroying content it merely could not read.
+    assert.throws(() => defaultContractIO.readFile(dir), (err: NodeJS.ErrnoException) => err.code !== "ENOENT");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("defaultContractIO.removeFile: an already-absent file is a no-op, but a non-ENOENT unlink failure propagates — never silently swallowed (finding e3e72127)", () => {
+  const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "eval-contract-io-remove-"));
+  try {
+    // Removing an absent file is a no-op (restoring "no prior file").
+    assert.doesNotThrow(() => defaultContractIO.removeFile(nodePath.join(dir, "absent.md")));
+    // Unlinking a non-empty directory fails with EISDIR/EPERM (not ENOENT) — this
+    // MUST throw so it surfaces as a restore_failure, not be swallowed as success.
+    fs.writeFileSync(nodePath.join(dir, "child.txt"), "x");
+    assert.throws(() => defaultContractIO.removeFile(dir), (err: NodeJS.ErrnoException) => err.code !== "ENOENT");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runCell: a partial contract install (a later path's write fails) still restores the already-modified earlier path (finding e3e72127)", async () => {
+  // EVAL_AGENT_CONTRACT_PATHS install order is ["AGENTS.md", "CLAUDE.md"]. AGENTS.md
+  // is written successfully; CLAUDE.md's write throws. Pre-fix, installEvalContract
+  // discarded the captured prior on failure, so finish() had nothing to restore and
+  // AGENTS.md was left holding the contract text. The fix retains the partial prior.
+  const content = new Map<string, string>();
+  let harnessInvoked = false;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    contractIO: {
+      readFile: (p) => (p.endsWith("AGENTS.md") ? "prior agents content" : null),
+      writeFile: (p, c) => {
+        if (p.endsWith("CLAUDE.md")) throw new Error("disk full");
+        content.set(p, c);
+      },
+      removeFile: (p) => { content.delete(p); },
+    },
+    invokeHarness: async () => { harnessInvoked = true; return successResult(); },
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.equal(harnessInvoked, false, "a failed install never invokes the harness");
+  const agentsEntry = [...content.entries()].find(([p]) => p.endsWith("AGENTS.md"));
+  assert.ok(agentsEntry, "AGENTS.md was written during the partial install and must still be present after restore");
+  assert.equal(agentsEntry[1], "prior agents content", "the already-modified AGENTS.md must be restored to its prior content, not left holding the contract");
+});
+
+test("runCell: contract installation failure is an infra_error and the harness is never invoked", async () => {
+  let harnessInvoked = false;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    contractIO: {
+      readFile: () => null,
+      writeFile: () => { throw new Error("disk full"); },
+      removeFile: () => {},
+    },
+    invokeHarness: async () => { harnessInvoked = true; return successResult(); },
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /disk full/);
+  assert.equal(harnessInvoked, false);
+});
+
+test("runCell: contract is restored even after a harness timeout", async () => {
+  const removed: string[] = [];
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    contractIO: {
+      readFile: () => null,
+      writeFile: () => {},
+      removeFile: (p) => { removed.push(p); },
+    },
+    invokeHarness: async () => ({ success: false, timed_out: true, exit_code: -1, stdout: "", stderr: "", duration: 60 }),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "timeout");
+  assert.equal(removed.length, 2, "both root-instruction paths must be restored even after a timeout");
+});
+
+test("runCell: contract paths never appear in changed_paths, even if the real diff would include them", async () => {
+  const fixture = validateFixture(
+    {
+      fixture_id: "f1",
+      schema_version: 1,
+      base_commit: SHA,
+      task_input: "t",
+      stage_entry_artifacts: { review: { diff: "..." } },
+      public_checks: [],
+      allowed_change_paths: ["core/scripts/gh.ts"],
+      grader_refs: [],
+      category: "c",
+      risk: "low",
+      provenance: "synthetic",
+    },
+    "f1.json",
+  );
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => successResult(),
+    getChangedPaths: async () => ["core/scripts/gh.ts", "AGENTS.md", "CLAUDE.md"],
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
+  assert.deepEqual(result.outcome.detail?.changed_paths, ["core/scripts/gh.ts"]);
+});
+
+test("runCell: installs the process-level command boundary shim before the first harness invocation", async () => {
+  let shimInstalledFor: string | undefined;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    installBoundaryShim: (worktreeDir) => { shimInstalledFor = worktreeDir; return `${worktreeDir}/.shim`; },
+    invokeHarness: async () => {
+      assert.ok(shimInstalledFor, "the boundary shim must be installed before the harness is invoked");
+      return successResult();
+    },
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+});
+
+test("runCell: boundary shim installation failure is an infra_error and the harness is never invoked", async () => {
+  let harnessInvoked = false;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    installBoundaryShim: () => { throw new Error("could not write shim"); },
+    invokeHarness: async () => { harnessInvoked = true; return successResult(); },
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /could not write shim/);
+  assert.equal(harnessInvoked, false);
+});
+
+test("runCell: a process-boundary denial is surfaced as boundaryEvidence and does not change result_class", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => successResult(),
+    readBoundaryDenials: () => [
+      { command: "git", argv: ["worktree", "add", "../nested"], category: "nested-worktree", at: "2026-01-01T00:00:00.000Z" },
+    ],
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.equal(result.boundaryEvidence?.denials.length, 1);
+  assert.equal(result.boundaryEvidence?.denials[0].category, "nested-worktree");
+});
+
+test("runCell: a process-boundary denial is recorded on the trajectory's diagnostic actions list, not just boundaryEvidence", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async (args) => {
+      await assert.rejects(() => args.gh.addLabel(1, "pipeline:ready-to-deploy"));
+      return successResult();
+    },
+    readBoundaryDenials: () => [
+      { command: "git", argv: ["worktree", "add", "../nested"], category: "nested-worktree", at: "2026-01-01T00:00:00.000Z" },
+    ],
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.ok(
+    result.trajectory.actions.some((a) => a.includes("nested-worktree")),
+    "the process-boundary denial must be recorded on the trajectory's diagnostic actions list",
+  );
+  assert.ok(
+    result.trajectory.actions.some((a) => a.includes("addLabel")),
+    "the gh-surface refusal must be recorded on the trajectory's diagnostic actions list",
+  );
+});
+
+test("runCell: no denials and no gh refusals → boundaryEvidence is absent, not an empty object", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => successResult(),
+    readBoundaryDenials: () => [],
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.boundaryEvidence, undefined);
+});
+
+test("runCell: a gh refusal reaches boundaryEvidence.gh_refusals alongside any process denials", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async (args) => {
+      await assert.rejects(() => args.gh.addLabel(1, "pipeline:ready-to-deploy"));
+      return successResult();
+    },
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.boundaryEvidence?.gh_refusals.length, 1);
+  assert.equal(result.boundaryEvidence?.gh_refusals[0].operation, "addLabel");
+});
+
+test("runCell: a boundary-evidence collection failure is reported distinctly, never as 'no denials'", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => successResult(),
+    readBoundaryDenials: () => { throw new Error("denial log unreadable"); },
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.equal(result.boundaryEvidence, undefined);
+  assert.match(result.boundaryEvidenceError ?? "", /denial log unreadable/);
+});
+
+test("runCell: the manifest's resolved sandbox_mode reaches the harness invocation and effectiveConfig", async () => {
+  const manifest = validateManifest(
+    {
+      schema_version: 1,
+      experiment_id: "exp1",
+      fixture_ids: ["f1"],
+      mode: "review",
+      treatments: { harness: ["codex"] },
+      replicates: 1,
+      seed: 1,
+      concurrency: 1,
+      timeout: 60,
+      output_dir: ".agent-pipeline/evals",
+      sandbox_mode: "external-bypass",
+    },
+    new Set(["f1"]),
+  );
+  let seenSandboxMode: string | undefined;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async (args) => { seenSandboxMode = args.sandboxMode; return successResult(); },
+  };
+  const result = await runCell(FAKE_CFG, makeCell({ treatment: { harness: "codex" } }), makeFixture(), manifest, deps);
+  assert.equal(seenSandboxMode, "external-bypass");
+  assert.equal(result.effectiveConfig.sandbox_mode, "external-bypass");
+});
+
+test("runCell: a treatment shelling out to a nested worktree/pipeline advance is denied by the real default boundary — no injected fake", async () => {
+  // Exercises the real installBoundaryShim + boundaryEnv + readBoundaryDenials
+  // path end-to-end — a fake standing in for the boundary itself would prove
+  // nothing about whether a real child process is actually denied. Uses a
+  // real, disposable tmp directory as the cell worktree (rather than the
+  // shared FAKE_CFG's nonexistent path) since a real `git`/`pipeline` spawn
+  // needs a real cwd to run in; contractIO stays a harmless in-memory fake
+  // since contract behavior is not this test's focus.
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const execFileAsync = promisify(execFile);
+  const tmpRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-eval-boundary-"));
+  const cfg = { repo_dir: tmpRepoDir } as unknown as import("../scripts/types.ts").PipelineConfig;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => { fs.mkdirSync(o.path, { recursive: true }); return o; },
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    installBoundaryShim: undefined,
+    readBoundaryDenials: undefined,
+    invokeHarness: async (args) => {
+      let denied = false;
+      try {
+        await execFileAsync("git", ["worktree", "add", "../nested"], { cwd: args.worktreeDir, env: args.env });
+      } catch {
+        denied = true;
+      }
+      assert.equal(denied, true, "git worktree add must be denied inside the cell");
+      try {
+        await execFileAsync("pipeline", ["advance", "607"], { cwd: args.worktreeDir, env: args.env });
+        assert.fail("pipeline advance must be denied inside the cell");
+      } catch {
+        // expected
+      }
+      return successResult();
+    },
+  };
+  const result = await runCell(cfg, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.ok(result.boundaryEvidence, "the denied attempts must be recorded as boundary evidence");
+  const categories = result.boundaryEvidence?.denials.map((d) => d.category).sort();
+  assert.deepEqual(categories, ["nested-worktree", "pipeline-advance"]);
 });
 
 test("runCell: a live environment dependency does not block or require a simulated stand-in", async () => {

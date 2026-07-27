@@ -58,6 +58,40 @@ test("validateManifest: a complete manifest is accepted", () => {
   assert.equal(manifest.mode, "review");
 });
 
+// ---------------------------------------------------------------------------
+// sandbox_mode (#607 — eval-agent-isolation-boundary)
+// ---------------------------------------------------------------------------
+
+test("validateManifest: sandbox_mode omitted defaults to 'managed'", () => {
+  const raw = validManifestRaw();
+  delete raw.sandbox_mode;
+  const manifest = validateManifest(raw, new Set(["f1"]));
+  assert.equal(manifest.sandbox_mode, "managed");
+});
+
+test("validateManifest: an explicit supported sandbox_mode is accepted", () => {
+  const manifest = validateManifest(validManifestRaw({ sandbox_mode: "external-bypass" }), new Set(["f1"]));
+  assert.equal(manifest.sandbox_mode, "external-bypass");
+});
+
+test("validateManifest: an unsupported sandbox_mode is rejected naming the field", () => {
+  assert.throws(
+    () => validateManifest(validManifestRaw({ sandbox_mode: "unsandboxed" }), new Set(["f1"])),
+    (err: unknown) => {
+      assert.ok(err instanceof ManifestValidationError);
+      assert.match((err as Error).message, /"sandbox_mode"/);
+      assert.match((err as Error).message, /unsandboxed/);
+      return true;
+    },
+  );
+});
+
+test("computeConfigHash: two cells differing only by sandbox_mode produce different config hashes", () => {
+  const managed = computeConfigHash({ mode: "review", treatment: { harness: "claude" }, timeout: 300, sandbox_mode: "managed" });
+  const bypass = computeConfigHash({ mode: "review", treatment: { harness: "claude" }, timeout: 300, sandbox_mode: "external-bypass" });
+  assert.notEqual(managed, bypass);
+});
+
 test("validateManifest: missing required field is rejected by name", () => {
   const raw = validManifestRaw();
   delete raw.seed;

@@ -36,6 +36,7 @@ const MANIFEST: ExperimentManifest = {
   concurrency: 1,
   timeout: 60,
   output_dir: ".agent-pipeline/evals",
+  sandbox_mode: "managed",
 };
 
 const PLAN: RunPlan = { schema_version: 1, experiment_id: "exp1", seed: 1, cells: [] };
@@ -51,6 +52,7 @@ function makeRecord(overrides: Partial<CellRecord> = {}): CellRecord {
     config_hash: "hash-c",
     base_sha: "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
     env_surface_hash: "hash-e",
+    sandbox_mode: "managed",
     result_class: "completed",
     ...overrides,
   };

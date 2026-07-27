@@ -6,7 +6,9 @@
 //        (the trailing `-` sentinel; prompt delivered on stdin, not as a
 //        positional)
 //        PIPELINE_CODEX_NO_SANDBOX=1 swaps --full-auto for
-//        --dangerously-bypass-approvals-and-sandbox.
+//        --dangerously-bypass-approvals-and-sandbox. #607: a caller-supplied
+//        `ctx.sandboxMode` takes precedence over that ambient env var — see
+//        AdapterInvocationContext.sandboxMode.
 //
 // #492: `codex exec --help` documents the prompt argument: "If not provided
 // as an argument (or if `-` is used), instructions are read from stdin" — the
@@ -99,7 +101,9 @@ export const codexAdapter: HarnessAdapter = {
 
   buildInvocation(ctx: AdapterInvocationContext): AdapterInvocation {
     const telemetryMode = harnessTelemetryEnabled();
-    const noSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX === "1";
+    const noSandbox = ctx.sandboxMode !== undefined
+      ? ctx.sandboxMode === "external-bypass"
+      : process.env.PIPELINE_CODEX_NO_SANDBOX === "1";
     const args = ["exec"];
     if (telemetryMode) args.push("--json");
     args.push(noSandbox ? "--dangerously-bypass-approvals-and-sandbox" : "--full-auto", "-C", ctx.worktreeDir);

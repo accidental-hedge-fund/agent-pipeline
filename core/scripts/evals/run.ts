@@ -126,7 +126,8 @@ export async function runExperiment(
   const executed: CellRecord[] = [];
   await runPool(remaining, manifest.concurrency, async (cell: Cell) => {
     const fixture = fixtures.get(cell.fixture_id)!;
-    const { outcome, materializedPrompt, effectiveConfig, trajectory } = await runCell(cfg, cell, fixture, manifest, deps.cellExecution);
+    const { outcome, materializedPrompt, effectiveConfig, boundaryEvidence, boundaryEvidenceError, trajectory } =
+      await runCell(cfg, cell, fixture, manifest, deps.cellExecution);
 
     // Treatment trajectory artifact (#536): best-effort and non-fatal — a
     // collection/write failure is logged and leaves the cell's result_class
@@ -167,11 +168,19 @@ export async function runExperiment(
       config_hash: computeConfigHash(effectiveConfig),
       base_sha: cell.base_sha,
       env_surface_hash: fixture.env_surface_hash,
+      sandbox_mode: manifest.sandbox_mode,
       result_class: outcome.result_class,
       detail: outcome.detail,
       error: outcome.error,
       ...(trajectoryArtifact ? { trajectory_artifact: trajectoryArtifact } : {}),
       ...(trajectoryArtifactError ? { trajectory_artifact_error: trajectoryArtifactError } : {}),
+      // Isolation-boundary evidence (#607) — process-level command-boundary
+      // denials and gh-eval-surface refusals, carried onto the durable cell
+      // record. Absent `boundary_evidence` means no denial occurred;
+      // `boundary_evidence_error` (mutually exclusive) means collection
+      // itself failed — distinguishable, matching trajectory_artifact_error.
+      ...(boundaryEvidence ? { boundary_evidence: boundaryEvidence } : {}),
+      ...(boundaryEvidenceError ? { boundary_evidence_error: boundaryEvidenceError } : {}),
     };
     const persisted = await appendCellRecord(outputDir, record, deps);
     if (persisted) {

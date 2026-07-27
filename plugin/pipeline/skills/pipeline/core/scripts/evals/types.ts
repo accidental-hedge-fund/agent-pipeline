@@ -5,7 +5,37 @@
 // (openspec/changes/stage-eval-runner/design.md).
 
 import type { ModelEndpointParams } from "../types.ts";
+import type { ExternalSandboxMode } from "../harness-adapters/types.ts";
 import type { ArtifactDescriptor } from "./trajectory/types.ts";
+import type { GhRefusalRecord } from "./gh-eval-surface.ts";
+
+/** The eval runner's declared execution sandbox mode — re-exported from
+ *  harness-adapters/types.ts (single-sourced there) so the manifest and cell
+ *  record never define their own, possibly-drifting, copy of the supported
+ *  values (#607). */
+export type SandboxMode = ExternalSandboxMode;
+export { EXTERNAL_SANDBOX_MODES as SANDBOX_MODES } from "../harness-adapters/types.ts";
+
+/** One command denied at the process boundary of an eval cell's harness
+ *  child process (#607 — eval-agent-isolation-boundary). */
+export interface BoundaryDenial {
+  command: string;
+  argv: string[];
+  category: string;
+  at: string;
+}
+
+/** Durable isolation-boundary evidence for a cell: every process-level
+ *  denial plus every mutating-GitHub-operation refusal recorded by the
+ *  eval-mode `gh` surface. Classified apart from `result_class`/correctness —
+ *  no grader reads this field (#607). */
+export interface BoundaryEvidence {
+  denials: BoundaryDenial[];
+  gh_refusals: GhRefusalRecord[];
+  /** Present only when restoring the eval instruction contract failed —
+   *  never fatal to the cell's primary outcome. */
+  restore_failures?: string[];
+}
 
 /** The six independently-invocable stage entry points, plus the end-to-end mode. */
 export const EVAL_STAGE_NAMES = [
@@ -189,6 +219,11 @@ export interface ExperimentManifest {
   /** Per-cell timeout, in seconds. */
   timeout: number;
   output_dir: string;
+  /** The execution sandbox mode every cell in this experiment runs under
+   *  (#607). Always resolved by manifest.ts's validation — defaults to
+   *  `"managed"` when the raw manifest omits the field, so an existing
+   *  manifest stays valid and unchanged in behavior. */
+  sandbox_mode: SandboxMode;
 }
 
 export type CellResultClass = "completed" | "infra_error" | "auth_error" | "timeout";
@@ -255,6 +290,10 @@ export interface CellRecord {
    *  #535) — detects an environment/agent-surface difference between
    *  experiment populations, alongside prompt_hash/config_hash/base_sha. */
   env_surface_hash: string;
+  /** The resolved execution sandbox mode this cell ran under (#607) — carried
+   *  from the manifest so two cells differing only by sandbox mode are never
+   *  pooled as identically configured (also folded into `config_hash`). */
+  sandbox_mode: SandboxMode;
   result_class: CellResultClass;
   detail?: Record<string, unknown>;
   error?: string;
@@ -267,4 +306,14 @@ export interface CellRecord {
    *  content-address collision, or a write failure. Absent when collection
    *  succeeded. Never affects `result_class`: collection is diagnostic-only. */
   trajectory_artifact_error?: string;
+  /** Isolation-boundary evidence for this cell (#607) — present only when at
+   *  least one process-level denial, `gh`-surface refusal, or contract
+   *  restore failure occurred. Absent means no denial occurred, never "not
+   *  collected" (see `boundary_evidence_error`). Never read by a grader and
+   *  never changes `result_class`. */
+  boundary_evidence?: BoundaryEvidence;
+  /** Present only when collecting boundary evidence itself failed —
+   *  distinguishable from "no denials occurred" (absent `boundary_evidence`),
+   *  mirroring `trajectory_artifact_error`. */
+  boundary_evidence_error?: string;
 }

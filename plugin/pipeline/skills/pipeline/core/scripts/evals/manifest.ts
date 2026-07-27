@@ -5,12 +5,14 @@ import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import {
   EVAL_STAGE_NAMES,
+  SANDBOX_MODES,
   SUPPORTED_MANIFEST_SCHEMA_VERSIONS,
   type Cell,
   type EvalMode,
   type ExperimentManifest,
   type Fixture,
   type RunPlan,
+  type SandboxMode,
   type Treatment,
   type TreatmentAxes,
 } from "./types.ts";
@@ -142,6 +144,21 @@ export function validateManifest(raw: unknown, knownFixtureIds: Set<string>): Ex
   }
   const outputDir = requireString("output_dir");
 
+  // Execution sandbox mode (#607 — eval-agent-isolation-boundary): optional,
+  // defaulting to "managed" so an existing manifest that omits the field
+  // stays valid and unchanged in behavior. An unsupported value is rejected
+  // naming the field, before any treatment executes.
+  let sandboxMode: SandboxMode = "managed";
+  if (obj.sandbox_mode !== undefined) {
+    if (typeof obj.sandbox_mode !== "string" || !(SANDBOX_MODES as readonly string[]).includes(obj.sandbox_mode)) {
+      throw new ManifestValidationError(
+        "sandbox_mode",
+        `must be one of: ${SANDBOX_MODES.join(", ")} — got ${JSON.stringify(obj.sandbox_mode)}`,
+      );
+    }
+    sandboxMode = obj.sandbox_mode as SandboxMode;
+  }
+
   return {
     schema_version: schemaVersion,
     experiment_id: experimentId,
@@ -153,6 +170,7 @@ export function validateManifest(raw: unknown, knownFixtureIds: Set<string>): Ex
     concurrency,
     timeout,
     output_dir: outputDir,
+    sandbox_mode: sandboxMode,
   };
 }
 

@@ -7,6 +7,7 @@
 // / harness-adapters, but tests never touch git, the filesystem, or a
 // subprocess (CLAUDE.md's injectable-dep rule).
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { createWorktreeAt, removeWorktreeAt } from "../worktree.ts";
 import { invoke as harnessInvoke } from "../harness.ts";
@@ -20,9 +21,28 @@ import {
   type EvalGhSurface,
   type GhRefusalRecord,
 } from "./gh-eval-surface.ts";
+import { EVAL_AGENT_CONTRACT_PATHS, EVAL_AGENT_CONTRACT_TEXT } from "./agent-contract.ts";
+import {
+  boundaryEnv,
+  installBoundaryShim as installBoundaryShimReal,
+  readBoundaryDenials as readBoundaryDenialsReal,
+  removeBoundaryShim as removeBoundaryShimReal,
+} from "./boundary-shim.ts";
 import { materializeStagePrompt, stagesForMode } from "./stage-adapters.ts";
 import type { BuildTreatmentTrajectoryInput, RawStageEntry } from "./trajectory/collect.ts";
-import type { Cell, CellExecutionClass, CellOutcome, EnvironmentDependency, EvalStageName, ExperimentManifest, Fixture, Treatment } from "./types.ts";
+import type {
+  BoundaryDenial,
+  BoundaryEvidence,
+  Cell,
+  CellExecutionClass,
+  CellOutcome,
+  EnvironmentDependency,
+  EvalStageName,
+  ExperimentManifest,
+  Fixture,
+  SandboxMode,
+  Treatment,
+} from "./types.ts";
 
 function sanitizeForPath(cellId: string): string {
   return cellId.replace(/[^a-zA-Z0-9._-]/g, "-");
@@ -100,6 +120,100 @@ function isolatedGhEnv(worktreeDir: string): NodeJS.ProcessEnv {
   };
 }
 
+/** Full env override for a cell's harness child process (#607): the existing
+ *  GitHub/git credential-stripping (`isolatedGhEnv`) composed with the
+ *  process-level command boundary's PATH shim + denial-log location
+ *  (`boundaryEnv`). Both are cell-scoped; neither affects any other cell,
+ *  the evaluator process, or an ordinary (non-eval) pipeline run. */
+function evalIsolationEnv(worktreeDir: string): NodeJS.ProcessEnv {
+  return { ...isolatedGhEnv(worktreeDir), ...boundaryEnv(worktreeDir) };
+}
+
+/** Injectable I/O for reading/writing/removing the eval agent contract's
+ *  root-instruction files (#607) — no real fs call from a unit test. */
+export interface ContractIO {
+  readFile: (filePath: string) => string | null;
+  writeFile: (filePath: string, content: string) => void;
+  removeFile: (filePath: string) => void;
+}
+
+export const defaultContractIO: ContractIO = {
+  readFile: (filePath) => {
+    try {
+      return fs.readFileSync(filePath, "utf8");
+    } catch (err) {
+      // Only a genuinely-absent file is "no prior content" (`null`). Any other
+      // read failure (EACCES, EISDIR, …) must propagate, never be silently
+      // mistaken for absence — otherwise restore would DELETE a file whose
+      // original content merely could not be read (review 2, finding e3e72127).
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  },
+  writeFile: (filePath, content) => fs.writeFileSync(filePath, content, "utf8"),
+  removeFile: (filePath) => {
+    try {
+      fs.unlinkSync(filePath);
+    } catch (err) {
+      // Already absent — restoring "no prior file" is a no-op. Any other unlink
+      // failure (EACCES, EISDIR, …) must propagate so it surfaces as a
+      // restore_failure, never be silently swallowed as success (finding e3e72127).
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw err;
+    }
+  },
+};
+
+/** Install the eval agent contract at every root-instruction path (#607),
+ *  capturing each path's prior content (or `null` if it didn't exist) so it
+ *  can be restored exactly. Never throws — a read/write failure is reported as
+ *  `{ ok: false }` so the caller can classify the cell as an infra error
+ *  without invoking the harness. The captured `prior` is returned on **both**
+ *  paths: a partial install (an earlier path written, a later one failing) must
+ *  still restore the already-modified paths, so the caller retains this prior
+ *  and restores it rather than leaving the contract behind (review 2, finding
+ *  e3e72127). `prior` is populated entry-by-entry as each path is captured, so
+ *  on failure it holds exactly the paths that may have been modified. */
+export function installEvalContract(
+  worktreeDir: string,
+  io: ContractIO,
+):
+  | { ok: true; prior: Record<string, string | null> }
+  | { ok: false; error: string; prior: Record<string, string | null> } {
+  const prior: Record<string, string | null> = {};
+  try {
+    for (const rel of EVAL_AGENT_CONTRACT_PATHS) {
+      const full = path.join(worktreeDir, rel);
+      prior[rel] = io.readFile(full);
+      io.writeFile(full, EVAL_AGENT_CONTRACT_TEXT);
+    }
+    return { ok: true, prior };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message, prior };
+  }
+}
+
+/** Restore every root-instruction path to its captured prior content —
+ *  removing the file when no prior content existed. Never throws; a failure
+ *  is reported as `{ ok: false }` boundary evidence, never fatal to the
+ *  cell's primary outcome. */
+export function restoreEvalContract(
+  worktreeDir: string,
+  prior: Record<string, string | null>,
+  io: ContractIO,
+): { ok: true } | { ok: false; error: string } {
+  try {
+    for (const [rel, content] of Object.entries(prior)) {
+      const full = path.join(worktreeDir, rel);
+      if (content === null) io.removeFile(full);
+      else io.writeFile(full, content);
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+}
+
 export interface CellIdentity {
   worktreePath: string;
   branch: string;
@@ -130,6 +244,10 @@ export interface HarnessInvokeArgs {
   /** Env overrides merged on top of the child process's environment —
    *  used to strip GitHub/git write credentials (see `isolatedGhEnv`). */
   env?: NodeJS.ProcessEnv;
+  /** Explicit execution sandbox mode for this invocation (#607) — the eval
+   *  path always supplies this from the resolved manifest field; it never
+   *  reads `PIPELINE_CODEX_NO_SANDBOX`. */
+  sandboxMode?: SandboxMode;
 }
 
 export interface HarnessInvokeResultLike {
@@ -182,6 +300,25 @@ export interface CellExecutionDeps {
    *  `simulated` dependency. `phase` distinguishes setup (run before the
    *  treatment) from teardown (run after, best-effort). */
   runEnvironmentCommand?: (args: { worktreeDir: string; command: string; phase: "setup" | "teardown"; deadlineMs: number }) => Promise<{ ok: boolean; error?: string }>;
+  /** Injectable read/write/remove seam for the eval agent contract's
+   *  root-instruction files (#607). Defaults to real fs I/O. */
+  contractIO?: ContractIO;
+  /** Materialize the cell-scoped command-boundary deny-shim directory and
+   *  return its path (#607). Defaults to the real shim writer
+   *  (boundary-shim.ts); thrown errors are classified as an infra error
+   *  before the harness is ever invoked, same as a contract install
+   *  failure. */
+  installBoundaryShim?: (worktreeDir: string) => string;
+  /** Read and parse the cell's process-boundary denial log (#607). Defaults
+   *  to the real reader; an absent log means no denial occurred. A genuine
+   *  collection failure throws rather than returning `[]`. */
+  readBoundaryDenials?: (worktreeDir: string) => BoundaryDenial[];
+  /** Remove the cell's boundary control directory (#607) — it lives outside
+   *  the cell worktree (a sibling, not a subdirectory), so worktree removal
+   *  does not clean it up; this must be called separately during teardown.
+   *  Defaults to the real remover. Best-effort: failures are logged, not
+   *  thrown, matching the worktree-removal convention below. */
+  removeBoundaryShim?: (worktreeDir: string) => void;
 }
 
 async function defaultRunChecks(
@@ -307,6 +444,7 @@ async function realInvokeHarness(args: HarnessInvokeArgs): Promise<HarnessInvoke
     effort: args.effort,
     stream: false,
     env: args.env,
+    sandboxMode: args.sandboxMode,
   });
   return result;
 }
@@ -378,6 +516,13 @@ export interface CellExecutionResult {
   materializedPrompt: string;
   effectiveConfig: Record<string, unknown>;
   ghRefusals: GhRefusalRecord[];
+  /** Isolation-boundary evidence for this cell (#607) — present only when at
+   *  least one process-level denial, `gh`-surface refusal, or contract
+   *  restore failure occurred. Absent means no denial occurred. */
+  boundaryEvidence?: BoundaryEvidence;
+  /** Present only when collecting boundary evidence itself failed —
+   *  distinguishable from "no denials occurred". */
+  boundaryEvidenceError?: string;
   /** Raw (pre-sanitize, pre-bound) treatment trajectory input (#536) — the
    *  caller (run.ts) builds and persists the artifact from this via
    *  trajectory/collect.ts + trajectory/store.ts. Collected best-effort for
@@ -413,7 +558,26 @@ export async function runCell(
     mode: cell.mode,
     treatment: cell.treatment,
     timeout: manifest.timeout,
+    sandbox_mode: manifest.sandbox_mode,
   };
+
+  // Isolation-boundary state (#607): the eval agent contract's captured
+  // prior root-instruction content (set once install succeeds, cleared once
+  // restored) and any restore failures, surfaced as boundary evidence rather
+  // than thrown.
+  let contractPrior: Record<string, string | null> | undefined;
+  const restoreFailures: string[] = [];
+  const contractIO = deps.contractIO ?? defaultContractIO;
+  const installBoundaryShimFn = deps.installBoundaryShim ?? installBoundaryShimReal;
+  const readBoundaryDenialsFn = deps.readBoundaryDenials ?? readBoundaryDenialsReal;
+  const removeBoundaryShimFn = deps.removeBoundaryShim ?? removeBoundaryShimReal;
+
+  function restoreContractIfNeeded(): void {
+    if (!contractPrior) return;
+    const result = restoreEvalContract(identity.worktreePath, contractPrior, contractIO);
+    if (!result.ok) restoreFailures.push(result.error);
+    contractPrior = undefined;
+  }
 
   // Treatment trajectory collection (#536): best-effort, capability-aware.
   // No harness/executor this engine drives exposes structured tool-call
@@ -429,11 +593,47 @@ export async function runCell(
     availability: { available: false, reason: "harness/executor does not expose structured tool-call telemetry" },
   };
   function finish(outcome: CellOutcome): CellExecutionResult {
+    // Restore the eval contract before this result is ever returned — every
+    // exit path funnels through `finish()`, so this guarantees restoration
+    // (and any restore-failure evidence) happens before the caller sees the
+    // result, not after (a `finally` block runs too late: its side effects
+    // land after the `return finish(...)` expression has already been
+    // evaluated). Idempotent — a no-op once already restored.
+    restoreContractIfNeeded();
+    let boundaryEvidence: BoundaryEvidence | undefined;
+    let boundaryEvidenceError: string | undefined;
+    if (worktreeCreated) {
+      try {
+        const denials = readBoundaryDenialsFn(identity.worktreePath);
+        const ghRefusals = recorder.refusals;
+        if (denials.length > 0 || ghRefusals.length > 0 || restoreFailures.length > 0) {
+          boundaryEvidence = {
+            denials,
+            gh_refusals: ghRefusals,
+            ...(restoreFailures.length > 0 ? { restore_failures: [...restoreFailures] } : {}),
+          };
+          // Recorded on the trajectory for diagnosis, kept out of grading
+          // input (#607, consistent with #536's hidden-material containment
+          // — the trajectory's `actions` list is diagnostic-only, never read
+          // by a grader).
+          for (const d of denials) {
+            trajectoryActions.push(`isolation boundary denied ${d.command} ${d.argv.join(" ")} (category: ${d.category})`);
+          }
+          for (const r of ghRefusals) {
+            trajectoryActions.push(`isolation boundary refused gh operation "${r.operation}"`);
+          }
+        }
+      } catch (err) {
+        boundaryEvidenceError = (err as Error).message;
+      }
+    }
     return {
       outcome,
       materializedPrompt,
       effectiveConfig,
       ghRefusals: recorder.refusals,
+      boundaryEvidence,
+      boundaryEvidenceError,
       trajectory: {
         cell_id: cell.cell_id,
         experiment_id: cell.experiment_id,
@@ -478,6 +678,31 @@ export async function runCell(
   } catch (err) {
     trajectoryActions.push(`worktree creation failed: ${(err as Error).message}`);
     return finish({ result_class: "infra_error", error: `worktree creation failed: ${(err as Error).message}` });
+  }
+
+  // Install the eval agent contract and the process-level command boundary
+  // (#607) before any prompt reaches the harness. Neither may fail silently
+  // into an uncontracted/unbounded invocation — an install failure is an
+  // infra error and the harness is never invoked for this cell.
+  try {
+    const contractResult = installEvalContract(identity.worktreePath, contractIO);
+    // Retain the captured prior on BOTH paths: a partial install (an earlier
+    // path written before a later one failed) must still have its already-
+    // modified paths restored by `finish()` → `restoreContractIfNeeded()`,
+    // rather than leaving the contract behind (finding e3e72127).
+    contractPrior = contractResult.prior;
+    if (!contractResult.ok) {
+      const error = `eval agent contract installation failed: ${contractResult.error}`;
+      trajectoryActions.push(error);
+      return finish({ result_class: "infra_error", error });
+    }
+    trajectoryActions.push("installed eval agent contract");
+    installBoundaryShimFn(identity.worktreePath);
+    trajectoryActions.push("installed process-level command boundary");
+  } catch (err) {
+    const error = `eval isolation boundary installation failed: ${(err as Error).message}`;
+    trajectoryActions.push(error);
+    return finish({ result_class: "infra_error", error });
   }
 
   try {
@@ -610,7 +835,8 @@ export async function runCell(
           model: resolvedModel.model,
           effort: cell.treatment.effort,
           gh: ghSurface,
-          env: isolatedGhEnv(identity.worktreePath),
+          env: evalIsolationEnv(identity.worktreePath),
+          sandboxMode: manifest.sandbox_mode,
         });
       } catch (err) {
         const error = `harness invocation failed: ${(err as Error).message}`;
@@ -672,6 +898,12 @@ export async function runCell(
       }
     }
 
+    // Restore the eval agent contract's root-instruction paths to their
+    // base_commit content before checks run and before changed-path
+    // evidence is collected (#607) — the contract must never be scored as a
+    // treatment-produced change. Idempotent: a no-op if already restored.
+    restoreContractIfNeeded();
+
     const cliExecutionClass: CellExecutionClass = "local-cli";
     const detail: Record<string, unknown> = { stages: stageDetails, execution_class: cliExecutionClass };
     const allChecks = [...fixture.public_checks, ...(fixture.hidden_checks ?? [])];
@@ -705,7 +937,17 @@ export async function runCell(
     }
     if (fixture.allowed_change_paths !== undefined) {
       const getChangedPathsFn = deps.getChangedPaths ?? defaultGetChangedPaths;
-      detail.changed_paths = await getChangedPathsFn({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
+      const changedPaths = await getChangedPathsFn({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
+      // The eval agent contract is written by the evaluator itself, not the
+      // treatment — it must never be attributed to it as an out-of-scope
+      // change (#607). Restoration above already removes its on-disk trace;
+      // this filter is the belt-and-suspenders backstop for a restore that
+      // failed. The command-boundary shim/denial-log need no such filter:
+      // they live in a sibling control directory outside `worktreeDir`
+      // (review 1 finding 759fe7a3), so `git diff` inside the worktree can
+      // never surface them.
+      const excludedFromChangedPaths = new Set<string>(EVAL_AGENT_CONTRACT_PATHS);
+      detail.changed_paths = changedPaths.filter((p) => !excludedFromChangedPaths.has(p));
     }
     if (reviewFindings !== undefined) detail.findings = reviewFindings;
     if (planningOutputText !== undefined) detail.output_text = planningOutputText;
@@ -719,6 +961,9 @@ export async function runCell(
     // strand the worktree rather than throw. Matches results.ts's
     // non-fatal-write convention.
     if (worktreeCreated) {
+      // The eval contract is already restored by this point — every return
+      // path funnels through `finish()`, which restores it before building
+      // the result (#607) — so no restore call is needed here.
       // Each simulated dependency's declared teardown runs best-effort,
       // before the worktree itself is removed (review 1 finding ed37a4fd) —
       // a teardown failure is logged, not thrown, matching the worktree
@@ -740,6 +985,18 @@ export async function runCell(
       } catch (err) {
         console.warn(
           `[pipeline] evals: worktree removal failed (non-fatal, worktree may be stranded at ${identity.worktreePath}): ${(err as Error).message}`,
+        );
+      }
+      // The boundary control directory (shim + denial log) lives outside the
+      // worktree (#607, review 1 finding 759fe7a3) — worktree removal above
+      // does not touch it, so it must be cleaned up separately. Denials were
+      // already read into `finish()`'s result before this `finally` runs, so
+      // removing it now never loses evidence.
+      try {
+        removeBoundaryShimFn(identity.worktreePath);
+      } catch (err) {
+        console.warn(
+          `[pipeline] evals: boundary control directory removal failed (non-fatal, may be stranded): ${(err as Error).message}`,
         );
       }
     }
