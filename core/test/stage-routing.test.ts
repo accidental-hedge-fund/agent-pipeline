@@ -22,23 +22,23 @@ test("resolveAuto: mechanical/iterative stages fork model by harness (fix)", () 
   assert.deepEqual(resolveAuto("fix", "codex"), { model: "gpt-5.5", effort: "low" });
 });
 
-test("resolveAuto: analytical/iterative (planning) resolves opus regardless of harness", () => {
+test("resolveAuto: analytical/iterative (planning) resolves opus for claude, but opus is claude-only so codex resolves no model (#608 review-2)", () => {
   assert.deepEqual(resolveAuto("planning", "claude"), { model: "opus", effort: "medium" });
-  assert.deepEqual(resolveAuto("planning", "codex"), { model: "opus", effort: "medium" });
+  assert.deepEqual(resolveAuto("planning", "codex"), { model: "", effort: "medium" });
 });
 
-test("resolveAuto: analytical/ephemeral (intake, sweep) resolves sonnet/low regardless of harness", () => {
+test("resolveAuto: analytical/ephemeral (intake, sweep) resolves sonnet for claude, but sonnet is claude-only so codex resolves no model (#608 review-2)", () => {
   assert.deepEqual(resolveAuto("intake", "claude"), { model: "sonnet", effort: "low" });
-  assert.deepEqual(resolveAuto("intake", "codex"), { model: "sonnet", effort: "low" });
+  assert.deepEqual(resolveAuto("intake", "codex"), { model: "", effort: "low" });
   assert.deepEqual(resolveAuto("sweep", "claude"), { model: "sonnet", effort: "low" });
 });
 
-test("resolveAuto: adversarial stages always resolve claude-fable-5, regardless of harness (#366 profile-independence)", () => {
+test("resolveAuto: adversarial stages resolve claude-fable-5 for claude, but codex cannot run that claude-only alias so it resolves no model (#608 review-2 finding 465f9695)", () => {
   for (const stage of ["plan-review", "review-1", "review-2"] as const) {
     const viaClaude = resolveAuto(stage, "claude");
     const viaCodex = resolveAuto(stage, "codex");
     assert.equal(viaClaude.model, "claude-fable-5", `${stage} via claude`);
-    assert.equal(viaCodex.model, "claude-fable-5", `${stage} via codex`);
+    assert.equal(viaCodex.model, "", `${stage} via codex must not receive the claude-only alias`);
     assert.notEqual(viaClaude.model, "fable-5", `${stage} must not use the short alias`);
   }
 });

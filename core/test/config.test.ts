@@ -125,6 +125,38 @@ test("resolveConfig: an unknown key inside harnesses is rejected naming the key 
   }
 });
 
+test("resolveConfig: an empty harnesses.implementer value is rejected at parse time before any stage runs (#608 review-2 finding 78a08490)", async () => {
+  const repo = makeFakeRepo(`harnesses:\n  implementer: ""\n`);
+  const binDir = makeFakeGh("acme/dead1d");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) => /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("harnesses.implementer"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: an empty harnesses.reviewer value is rejected at parse time rather than reaching a stage invocation as a custom CLI (#608 review-2 finding 78a08490)", async () => {
+  const repo = makeFakeRepo(`harnesses:\n  reviewer: ""\n`);
+  const binDir = makeFakeGh("acme/dead1e");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) => /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("harnesses.reviewer"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 test("resolveConfig: an implementer naming no registered adapter is rejected naming the key, value, and registry (#608)", async () => {
   const repo = makeFakeRepo(`harnesses:\n  implementer: grock\n`);
   const binDir = makeFakeGh("acme/dead1c");
@@ -3356,18 +3388,19 @@ test("resolveConfig: effort.implementing 'auto' resolves to low regardless of ha
   }
 });
 
-test("resolveConfig: models.review 'auto' resolves to claude-fable-5 under both profiles (profile-independent) and never the short alias", async () => {
+test("resolveConfig: models.review 'auto' resolves to claude-fable-5 for a claude reviewer, but a codex reviewer cannot run that claude-only alias so it resolves no model (#608 review-2 finding 465f9695)", async () => {
   const repo = makeFakeRepo(`models:\n  review: auto\n`);
   const binDir = makeFakeGh("acme/auto4");
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
   try {
     const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    // claude profile → reviewer=codex; codex profile → reviewer=claude
     const claudeCfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
     const codexCfg = cfgMod.resolveConfig({ repoPath: repo, profile: "codex" });
-    assert.equal(claudeCfg.models.review, "claude-fable-5");
+    assert.equal(claudeCfg.models.review, "", "codex reviewer cannot run the claude-only auto alias");
     assert.equal(codexCfg.models.review, "claude-fable-5");
-    assert.notEqual(claudeCfg.models.review, "fable-5");
+    assert.notEqual(codexCfg.models.review, "fable-5");
   } finally {
     process.env.PATH = oldPath;
   }

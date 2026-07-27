@@ -240,8 +240,8 @@ const PartialConfigSchema = z.object({
   // a typo'd key (e.g. `reviewr`) is rejected rather than silently ignored.
   harnesses: z
     .object({
-      implementer: z.string().optional().describe("Primary harness that performs planning, implementation, and fixes. Must name a registered harness adapter (claude, codex, grok, opencode, pi). Falls back to the active profile's implementer when omitted."),
-      reviewer: z.string().optional().describe("Secondary harness that performs review. May name a registered adapter or an arbitrary custom reviewer CLI. Falls back to the active profile's reviewer (or review_harness, when set) when omitted."),
+      implementer: z.string().min(1, "harnesses.implementer must not be empty").optional().describe("Primary harness that performs planning, implementation, and fixes. Must name a registered harness adapter (claude, codex, grok, opencode, pi). Falls back to the active profile's implementer when omitted."),
+      reviewer: z.string().min(1, "harnesses.reviewer must not be empty").optional().describe("Secondary harness that performs review. May name a registered adapter or an arbitrary custom reviewer CLI. Falls back to the active profile's reviewer (or review_harness, when set) when omitted."),
     })
     .strict()
     .optional()
