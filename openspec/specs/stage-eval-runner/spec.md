@@ -9,12 +9,14 @@ The runner SHALL accept a versioned, repo-local experiment manifest declaring: `
 a stable `experiment_id`; the set of `fixture_ids` under test; an execution `mode` that is either
 a single named stage or `end-to-end`; the treatment axes (`harness`, `provider`, `model`,
 `effort`); a `replicates` count; a randomization `seed`; a `concurrency` bound; a per-cell
-`timeout`; and an `output_dir`.
+`timeout`; an `output_dir`; and the execution sandbox mode its cells run under. The sandbox mode
+SHALL be optional with a default that preserves the harness's own managed sandbox, so an existing
+manifest that omits it stays valid and unchanged in behavior.
 
 Manifest validation SHALL occur before any treatment is executed. A manifest that omits a
-required field, names an unknown execution mode, references an unknown fixture, or declares an
-unsupported `schema_version` SHALL be rejected with a message naming the offending field, and no
-treatment SHALL be executed.
+required field, names an unknown execution mode, names an unsupported sandbox mode, references an
+unknown fixture, or declares an unsupported `schema_version` SHALL be rejected with a message
+naming the offending field, and no treatment SHALL be executed.
 
 #### Scenario: Complete manifest is accepted
 
@@ -34,6 +36,18 @@ treatment SHALL be executed.
   `end-to-end`, or references a `fixture_id` that does not resolve to a fixture
 - **THEN** loading SHALL fail naming the unknown value
 - **AND** no treatment SHALL be executed
+
+#### Scenario: Manifest naming an unsupported sandbox mode is rejected
+
+- **WHEN** a manifest declares an execution sandbox mode that is not a supported value
+- **THEN** loading SHALL fail naming the offending field
+- **AND** no treatment SHALL be executed
+
+#### Scenario: Manifest omitting the sandbox mode keeps the managed-sandbox default
+
+- **WHEN** a manifest declares no execution sandbox mode
+- **THEN** it SHALL be accepted
+- **AND** its cells SHALL run under the harness's own managed sandbox
 
 ---
 
@@ -143,6 +157,12 @@ branch, and SHALL NOT transition any real issue's authoritative pipeline state. 
 SHALL be enforced by the evaluation-mode GitHub surface refusing mutating operations, rather than
 relying on individual call sites to check a mode flag.
 
+Because a local CLI harness can shell out directly rather than through that surface, evaluation
+mode SHALL additionally deny mutating GitHub operations, pushes, and remote mutations at the
+harness child process boundary. Every refusal by the evaluation-mode GitHub surface and every
+denial at the process boundary SHALL be recorded in the cell's durable evidence, not only returned
+in memory or written to the console.
+
 #### Scenario: No mutating GitHub call occurs during an experiment
 
 - **WHEN** a full experiment matrix is executed in either stage mode or end-to-end mode
@@ -155,6 +175,18 @@ relying on individual call sites to check a mode flag.
 - **THEN** the evaluation-mode GitHub surface SHALL refuse the operation
 - **AND** the cell SHALL record the refusal rather than silently completing as if the write had
   succeeded
+
+#### Scenario: A harness shelling out directly is denied at the process boundary
+
+- **WHEN** a treatment invokes the GitHub CLI or a push directly, bypassing the evaluation-mode
+  GitHub surface
+- **THEN** the attempt SHALL be denied at the harness child process boundary
+- **AND** no production GitHub or remote state SHALL change
+
+#### Scenario: Refusals and denials are durably recorded on the cell
+
+- **WHEN** a cell records a GitHub-surface refusal or a process-boundary denial
+- **THEN** that record SHALL be present in the cell's persisted record in the experiment output
 
 #### Scenario: No real issue changes authoritative state
 
@@ -232,24 +264,32 @@ outcomes.
 ### Requirement: Every cell record SHALL carry the identity keys needed to join it to normal run evidence
 
 Every cell record SHALL include `experiment_id`, `fixture_id`, `treatment_id`, `replicate`,
-`prompt_hash`, `config_hash`, `base_sha`, and the fixture's `env_surface_hash` (the
-environment-and-surface provenance hash). `prompt_hash` SHALL be computed over the materialized
-prompt text used for that cell, `config_hash` over the effective configuration for that cell, and
-`env_surface_hash` SHALL be carried from the fixture's resolved environment-fidelity contract and
-resolved capability surface — so that a prompt-template change, a configuration change, or an
-environment/surface change is each detectable as a difference between populations.
+`prompt_hash`, `config_hash`, `base_sha`, the fixture's `env_surface_hash` (the
+environment-and-surface provenance hash), and the resolved execution sandbox mode under which the
+cell ran. `prompt_hash` SHALL be computed over the materialized prompt text used for that cell,
+`config_hash` over the effective configuration for that cell — which SHALL include the resolved
+sandbox mode — and `env_surface_hash` SHALL be carried from the fixture's resolved
+environment-fidelity contract and resolved capability surface, so that a prompt-template change, a
+configuration change, a sandbox-mode change, or an environment/surface change is each detectable as
+a difference between populations.
 
 #### Scenario: Identity keys are present on every record
 
 - **WHEN** any cell record is read from the experiment output
 - **THEN** it SHALL contain `experiment_id`, `fixture_id`, `treatment_id`, `replicate`,
-  `prompt_hash`, `config_hash`, `base_sha`, and `env_surface_hash`
+  `prompt_hash`, `config_hash`, `base_sha`, `env_surface_hash`, and the resolved sandbox mode
 
 #### Scenario: Prompt and config changes are visible as hash differences
 
 - **WHEN** two cells are executed with the same fixture and treatment but a different
   materialized prompt or a different effective configuration
 - **THEN** their `prompt_hash` or `config_hash` values SHALL differ
+
+#### Scenario: A sandbox-mode change is visible as a config-hash difference
+
+- **WHEN** two cells are executed with the same fixture and treatment but different resolved
+  execution sandbox modes
+- **THEN** their `config_hash` values SHALL differ
 
 #### Scenario: An environment or surface change is visible as a hash difference
 
