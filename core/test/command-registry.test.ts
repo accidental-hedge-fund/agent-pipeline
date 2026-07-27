@@ -178,6 +178,37 @@ test("command-registry: every attribute name in every allowedFlags Set exists in
 });
 
 // ---------------------------------------------------------------------------
+// 2.7b  loop: --new-run is accepted by flag validation (#610); bidirectional
+// sync guard so a registered `loop:`-namespaced option can never again drift
+// out of the loop allowlist unnoticed (the one-directional 2.7 cross-check
+// above only catches a stale allowlist entry, not a missing one).
+// ---------------------------------------------------------------------------
+
+test("command-registry: loop.allowedFlags includes newRun (#610)", () => {
+  const entry = COMMAND_REGISTRY.loop;
+  assert.ok((entry.allowedFlags as Set<string>).has("newRun"));
+  const cmd = fakeCmdWithCliFlag("newRun");
+  assert.deepEqual(validateFlags(entry, cmd), []);
+});
+
+test("command-registry: every 'loop:'-namespaced registered option is in the loop allowlist", () => {
+  const cmd = buildCmd();
+  const loopOptions = cmd.options.filter((o) => (o as { description?: string }).description?.startsWith("loop:"));
+  assert.ok(loopOptions.length > 0, "expected at least one 'loop:'-namespaced option to be registered");
+
+  const allowed = COMMAND_REGISTRY.loop.allowedFlags as Set<string>;
+  const missing = loopOptions
+    .map((o) => o.attributeName())
+    .filter((attr) => !allowed.has(attr));
+
+  assert.deepEqual(
+    missing,
+    [],
+    `'loop:'-namespaced options missing from COMMAND_REGISTRY.loop.allowedFlags: ${JSON.stringify(missing)}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
 // 2.8  needsIssueNumber: advance and run require an issue number; named sub-commands do not
 // ---------------------------------------------------------------------------
 
