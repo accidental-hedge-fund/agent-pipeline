@@ -925,40 +925,6 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     }
   }
 
-  // Reviewer-model alias guard (#454): a Claude-only reviewer model alias
-  // (`models.review` or `review_harness.model`) against a codex reviewer must
-  // be rejected here, at config-parse time — #441 made the reviewer alias
-  // load-bearing (passed through to `codex exec -m <model>`), so a config that
-  // pre-#441 harmlessly carried a Claude alias against codex (previously
-  // inert) now 400s mid-run instead. Runs before the review_harness
-  // destructuring below so a tolerated violation is stripped from fileConfig
-  // before it's read into reviewerCommand/reviewerModelRaw.
-  {
-    const violation = findReviewerModelAliasViolation(fileConfig, resolvedRoles.reviewer);
-    if (violation) {
-      const message = reviewerModelAliasErrorMessage(violation.path, violation.value, resolvedRoles.reviewer);
-      if (opts.tolerateInvalidConfig) {
-        if (!opts.quiet) {
-          console.warn(
-            `[pipeline] init: ${configPath} has validation errors — using defaults. Fix the file to apply custom settings.\n  ${message}`,
-          );
-        }
-        fileConfig =
-          violation.path === "models.review"
-            ? { ...fileConfig, models: { ...fileConfig.models, review: undefined } }
-            : {
-                ...fileConfig,
-                review_harness:
-                  typeof fileConfig.review_harness === "object"
-                    ? { ...fileConfig.review_harness, model: undefined }
-                    : fileConfig.review_harness,
-              };
-      } else {
-        throw new Error(`Invalid ${configPath}: ${message}`);
-      }
-    }
-  }
-
   // review_harness (#40, #366): either a bare command string, or a structured
   // { command, model?, effort? } form that additionally targets the reviewer's
   // own model/effort. The string form leaves reviewerModel/reviewerEffort
@@ -1204,49 +1170,6 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     warnInertEffort(fileConfig.effort, merged.harnesses);
   }
   return merged;
-}
-
-/**
- * Find a Claude-only reviewer model alias configured against a codex reviewer
- * (#454). Checks both reviewer model sources — `models.review` and the
- * structured `review_harness.model` — against the same effective
- * `reviewerHarness` (the caller resolves `review_harness.command` overriding
- * the profile default, exactly as `resolveConfig()`'s `merged.harnesses.reviewer`
- * does). Only an explicit (non-`"auto"`) value is a violation: `"auto"`
- * resolves through its own claude-only-alias guard at the reviewer call site
- * (`resolveReviewerModelForHarness` in stage-routing.ts), never reaching codex.
- * `review_harness.model` is checked first since, when both are set, it is the
- * value that actually reaches the reviewer invocation.
- *
- * Scoped to registered adapters other than `claude` (only `claude` recognizes
- * claude-only aliases) — an unregistered custom reviewer CLI's contract is
- * unconstrained (#40), so it is never subject to this hard error, only the
- * advisory `warnInertModelAliases` below.
- */
-function findReviewerModelAliasViolation(
-  fileConfig: z.infer<typeof PartialConfigSchema>,
-  reviewerHarness: string,
-): { path: "review_harness.model" | "models.review"; value: string } | undefined {
-  if (reviewerHarness === "claude" || resolveAdapter(reviewerHarness) === null) return undefined;
-  const reviewHarnessCfg = fileConfig.review_harness;
-  const reviewerModelRaw = typeof reviewHarnessCfg === "object" ? reviewHarnessCfg.model : undefined;
-  if (reviewerModelRaw !== undefined && reviewerModelRaw !== "auto" && isClaudeOnlyModelAlias(reviewerModelRaw)) {
-    return { path: "review_harness.model", value: reviewerModelRaw };
-  }
-  const reviewModelRaw = fileConfig.models?.review;
-  if (reviewModelRaw !== undefined && reviewModelRaw !== "auto" && isClaudeOnlyModelAlias(reviewModelRaw)) {
-    return { path: "models.review", value: reviewModelRaw };
-  }
-  return undefined;
-}
-
-function reviewerModelAliasErrorMessage(path: string, value: string, harness: string): string {
-  return (
-    `${path} is set to "${value}", a Claude-only model alias, but the reviewer harness is "${harness}" — ` +
-    `it does not support Claude model aliases and will reject it mid-run. Use a model id "${harness}" ` +
-    `actually supports, or "auto" to let the pipeline resolve a compatible default (falling back to the ` +
-    `harness's own configured default model).`
-  );
 }
 
 // Each `models.*` alias is honored by exactly one harness role. `models.review`
@@ -1818,21 +1741,6 @@ export function validateConfig(
         });
       }
       const harnesses = resolvedRoles ?? { implementer: profileHarnesses.implementer, reviewer: profileHarnesses.reviewer };
-      // Reviewer-model alias guard (#454): severity error, not the inert-alias
-      // warning below — a Claude-only alias against a non-claude registered
-      // reviewer is no longer inert (#441 passes it through, e.g. to
-      // `codex exec -m`), so `config validate` must exit 1 rather than merely
-      // warn. The MODEL_ALIAS_ROLES loop below never also warns for this
-      // combination (its reviewer isInert check already excludes any
-      // registered adapter), so no contradictory diagnostic is emitted.
-      const violation = findReviewerModelAliasViolation(fileConfig, harnesses.reviewer);
-      if (violation) {
-        diagnostics.push({
-          severity: "error",
-          path: violation.path,
-          message: reviewerModelAliasErrorMessage(violation.path, violation.value, harnesses.reviewer),
-        });
-      }
       if (fileConfig.models) {
         for (const { key, role } of MODEL_ALIAS_ROLES) {
           const value = fileConfig.models[key];

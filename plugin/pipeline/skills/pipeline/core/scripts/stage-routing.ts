@@ -89,20 +89,24 @@ export interface ResolvedAuto {
 
 /**
  * Resolve the model a routing cell yields for `harness` (#608). Mechanical
- * cells are the only ones that fork by harness (`gpt-5.5` codex vs. `sonnet`
- * claude); every Analytical/Adversarial cell has `claudeModel === codexModel`
- * and is harness-invariant by construction, so any harness gets that same
- * value. For a Mechanical cell, a harness that is neither `claude` nor
- * `codex` has no known runnable model in this table — `undefined` signals
- * that explicitly, rather than defaulting to either built-in column (which
- * would hand a `grok`/`opencode`/`pi` primary a claude- or codex-exclusive
- * alias it cannot run).
+ * cells fork by harness (`gpt-5.5` codex vs. `sonnet` claude); every
+ * Analytical/Adversarial cell has `claudeModel === codexModel` and is
+ * harness-invariant *for the two built-in harnesses*, which both recognize
+ * that shared value (a claude alias, forwarded to codex under the existing
+ * inert-alias advisory rather than blocked). For any other registered
+ * harness (`grok`, `opencode`, `pi`, ...) that shared value is still a
+ * claude-only alias it cannot run — `isClaudeOnlyModelAlias` catches that so
+ * such a harness gets `undefined` (no known runnable model in this table)
+ * instead of a claude- or codex-exclusive alias.
  */
 function modelForHarness(cell: RoutingCell, harness: Harness): string | undefined {
-  if (cell.claudeModel === cell.codexModel) return cell.claudeModel;
-  if (harness === "claude") return cell.claudeModel;
-  if (harness === "codex") return cell.codexModel;
-  return undefined;
+  if (cell.claudeModel !== cell.codexModel) {
+    if (harness === "claude") return cell.claudeModel;
+    if (harness === "codex") return cell.codexModel;
+    return undefined;
+  }
+  if (harness === "claude" || harness === "codex") return cell.claudeModel;
+  return isClaudeOnlyModelAlias(cell.claudeModel) ? undefined : cell.claudeModel;
 }
 
 /**

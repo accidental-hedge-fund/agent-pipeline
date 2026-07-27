@@ -67,9 +67,10 @@ test("resolveAuto: a non-built-in primary (grok) resolves no model for a Mechani
   assert.equal(effort, "low", "effort is never remapped by harness");
 });
 
-test("resolveAuto: a non-built-in primary (grok) still resolves the harness-invariant Analytical/Adversarial cells", () => {
-  assert.deepEqual(resolveAuto("planning", "grok"), { model: "opus", effort: "medium" });
-  assert.equal(resolveAuto("plan-review", "grok").model, "claude-fable-5");
+test("resolveAuto: a non-built-in primary (grok) resolves no model for Analytical/Adversarial cells either, since their shared value is a claude-only alias", () => {
+  assert.equal(resolveAuto("planning", "grok").model, "", "opus is claude-only — grok must not receive it");
+  assert.equal(resolveAuto("planning", "grok").effort, "medium", "effort is never remapped by harness");
+  assert.equal(resolveAuto("plan-review", "grok").model, "", "claude-fable-5 is claude-only — grok must not receive it");
 });
 
 test("expandAutoModel: 'auto' with no known runnable model resolves to '' (falsy — no --model flag), not the DEFAULT_CONFIG claude alias", () => {
