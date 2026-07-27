@@ -58,6 +58,25 @@ test("resolveAuto: never returns the unrecognized short alias 'fable-5' for any 
   }
 });
 
+// ---- #608: a non-built-in resolved role harness (grok) never receives a
+// claude- or codex-exclusive alias ----
+
+test("resolveAuto: a non-built-in primary (grok) resolves no model for a Mechanical cell, not sonnet or gpt-5.5", () => {
+  const { model, effort } = resolveAuto("implementing", "grok");
+  assert.equal(model, "", "no known runnable model for grok in the routing table — empty, not another harness's alias");
+  assert.equal(effort, "low", "effort is never remapped by harness");
+});
+
+test("resolveAuto: a non-built-in primary (grok) still resolves the harness-invariant Analytical/Adversarial cells", () => {
+  assert.deepEqual(resolveAuto("planning", "grok"), { model: "opus", effort: "medium" });
+  assert.equal(resolveAuto("plan-review", "grok").model, "claude-fable-5");
+});
+
+test("expandAutoModel: 'auto' with no known runnable model resolves to '' (falsy — no --model flag), not the DEFAULT_CONFIG claude alias", () => {
+  assert.equal(expandAutoModel("auto", "implementing", "grok"), "");
+  assert.equal(expandAutoModel(undefined, "implementing", "grok"), undefined, "an absent key stays undefined so the caller's ?? DEFAULT_CONFIG applies");
+});
+
 test("expandAutoModel: 'auto' routes through resolveAuto; other values pass through; undefined stays undefined", () => {
   assert.equal(expandAutoModel("auto", "implementing", "codex"), "gpt-5.5");
   assert.equal(expandAutoModel("haiku", "implementing", "codex"), "haiku");

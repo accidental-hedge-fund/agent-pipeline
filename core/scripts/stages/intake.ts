@@ -110,6 +110,7 @@ export function realIntakeDeps(
   repoDir: string,
   model: string = DEFAULT_CONFIG.models.intake,
   reasoningEffort?: string,
+  implementerHarness: string = "claude",
 ): IntakeDeps {
   return {
     runHarness: async (prompt, timeoutSec) => {
@@ -117,7 +118,7 @@ export function realIntakeDeps(
       // all needed context, so pin a fast model and run lean (no built-in tools, no
       // MCP) to stop the call from cold-starting MCP servers or burning agentic
       // turns exploring the repo. See harness.ts InvokeOptions.lean.
-      const result = await invoke("claude", repoDir, prompt, { stream: true, model, lean: true, timeoutSec, reasoningEffort });
+      const result = await invoke(implementerHarness, repoDir, prompt, { stream: true, model, lean: true, timeoutSec, reasoningEffort });
       return { success: result.success, output: result.stdout, timed_out: result.timed_out };
     },
     createIssue: async (title, body, labels) => {

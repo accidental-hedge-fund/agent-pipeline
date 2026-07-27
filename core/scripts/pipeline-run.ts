@@ -704,6 +704,12 @@ export async function runAdvance(
         pr: bundlePr,
         branch: bundleBranch,
         harnesses,
+        roles: {
+          implementer: cfg.harnesses.implementer,
+          implementerSource: cfg.harnesses.implementerSource,
+          reviewer: cfg.harnesses.reviewer,
+          reviewerSource: cfg.harnesses.reviewerSource,
+        },
       }).catch(() => {});
       // An override supplied on THIS invocation carries the full human reason. The
       // review stage applies it deterministically; record it here, where the reason

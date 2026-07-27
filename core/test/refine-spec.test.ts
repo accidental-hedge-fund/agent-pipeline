@@ -7,10 +7,14 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   runRefineSpec,
   validateRefineSpecResult,
   validateRefineSpecBody,
+  realRefineSpecDeps,
   type RefineSpecDeps,
   type RefineSpecOpts,
 } from "../scripts/stages/refine-spec.ts";
@@ -474,4 +478,24 @@ test("refine-spec: buildCmd() registers --title and --body options with refine-s
     bodyOpt?.description?.includes("refine-spec"),
     `--body description must mention refine-spec; got: ${bodyOpt?.description}`,
   );
+});
+
+// ---- #608: realRefineSpecDeps routes through the resolved implementer, not
+// a hard-coded "claude" ----
+
+test("refine-spec: realRefineSpecDeps.runHarness targets the resolved implementer (grok) when configured, never claude", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "refine-spec-wt-"));
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "refine-spec-grok-"));
+  const cli = path.join(binDir, "grok");
+  fs.writeFileSync(cli, `#!/usr/bin/env bash\ncat "$3"\n`);
+  fs.chmodSync(cli, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const result = await realRefineSpecDeps(tmp, "grok-4.5", "grok").runHarness("GROK-REFINE-PROMPT");
+    assert.equal(result.success, true);
+    assert.equal(result.output, "GROK-REFINE-PROMPT", "the grok adapter, not claude, must have received the prompt");
+  } finally {
+    process.env.PATH = oldPath;
+  }
 });

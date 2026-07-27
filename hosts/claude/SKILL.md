@@ -570,13 +570,23 @@ domain_name: lyric-utils
 domain_description: a quantitative finance Python library
 ```
 
-If absent, defaults from `core/scripts/types.ts:DEFAULT_CONFIG` apply. The Claude-side pipeline is harness-relative: Claude Code is always primary for planning, implementation (documentation updates included, when `steps.docs` is on), and fixes; Codex is always secondary for review/adversarial review. Harness roles come from the install profile — a `harnesses:` key in `.github/pipeline.yml` is rejected at config-parse time, so repo config cannot invert a Claude-invoked pipeline run. The reviewer harness MAY be overridden via the optional `review_harness` key:
+If absent, defaults from `core/scripts/types.ts:DEFAULT_CONFIG` apply. By default the pipeline is harness-relative: the invoking host's profile supplies both roles (Claude Code primary + Codex secondary under the `claude` profile, and the reverse under `codex`). A repository can pin its own primary (implementer) and secondary (reviewer) harness pair, overriding the profile, via the optional `harnesses:` block:
+
+```yaml
+harnesses:
+  implementer: grok   # primary: planning, implementation, fixes, pre-merge repair, intake, sweep
+  reviewer: codex      # secondary: plan review, review rounds, pre-merge delta review, shipcheck, design gate
+```
+
+Either key may be omitted — an omitted role keeps the active profile's default for that role only. `implementer` must name a harness with a registered adapter (`claude`, `codex`, `grok`, `opencode`, `pi`); an unregistered name is rejected at config-parse time, naming the key, the value, and the registered adapter names, before any worktree is created. `reviewer` may additionally name an arbitrary custom reviewer CLI, same as the older `review_harness` key below.
+
+The reviewer role MAY also be set (or overridden) via the optional `review_harness` key:
 
 ```yaml
 review_harness: my-reviewer   # use a custom CLI as the reviewer instead of the profile default
 ```
 
-When `review_harness` is set, the pipeline spawns `<value> "<prompt>"` and expects a JSON verdict on stdout (same schema as the built-in reviewers). If the CLI cannot be spawned, the item is blocked with an error naming the CLI explicitly, and the implementing harness is tried as a self-review fallback (established by #39). The `harnesses.implementer` is never overridable by repo config.
+When `review_harness` is set, the pipeline spawns `<value> "<prompt>"` and expects a JSON verdict on stdout (same schema as the built-in reviewers). If the CLI cannot be spawned, the item is blocked with an error naming the CLI explicitly, and the implementing harness is tried as a self-review fallback (established by #39). When both `harnesses.reviewer` and `review_harness` are set, they must agree — naming the same command is accepted (and `review_harness`'s structured model/effort/prompt-delivery settings still apply); naming different commands is rejected at config-parse time, naming both keys and both values.
 
 `review_harness` also accepts a structured form for independent reviewer model/effort control, each accepting `"auto"` (resolved round-aware — plan-review/review-2 as Definitive, review-1 as Iterative):
 

@@ -28,7 +28,18 @@ export const LABEL_PREFIX = "pipeline:";
 export const BLOCKED_LABEL = "blocked";
 export const HARNESS_LABEL_PREFIX = "harness:";
 
-export type Harness = "claude" | "codex";
+// A registered harness-adapter name (see `harness-adapters/index.ts`'s
+// `REGISTRY`), validated at config-resolve time rather than narrowed by the
+// type system — the engine strips types, so a two-member union bought no
+// runtime guarantee. Kept as `string` for the same reason the reviewer role
+// always was.
+export type Harness = string;
+
+// Where a resolved role's value came from (#608): the repository's strict
+// `harnesses:` block, the reviewer-only `review_harness` key, or the active
+// profile's default. Recorded alongside each resolved role so a run's
+// pairing is auditable after the fact.
+export type HarnessRoleSource = "repo-config" | "review_harness" | "profile";
 
 // ---------------------------------------------------------------------------
 // External stage executors (#314) — named executor definitions that operators
@@ -595,7 +606,11 @@ export interface PipelineConfig {
   // into `invoke()`'s `InvokeOptions.promptDelivery`. `resolveConfig()`
   // always sets it explicitly; call sites still treat absent as "argv" (the
   // pre-#492 default) since there is no `tsc` step to enforce presence.
-  harnesses: { implementer: Harness; reviewer: string; reviewerModel?: string; reviewerModelWasAuto?: boolean; reviewerEffort?: string; reviewerPromptDelivery?: "argv" | "stdin" };
+  // `implementerSource`/`reviewerSource` (#608) record which layer supplied
+  // each resolved role — the repository's `harnesses:` block, the reviewer-
+  // only `review_harness` key, or the active profile default — for evidence
+  // and diagnostics.
+  harnesses: { implementer: Harness; reviewer: string; reviewerModel?: string; reviewerModelWasAuto?: boolean; reviewerEffort?: string; reviewerPromptDelivery?: "argv" | "stdin"; implementerSource: HarnessRoleSource; reviewerSource: HarnessRoleSource };
   // `reviewWasAuto` mirrors `reviewerModelWasAuto` for the `models.review`
   // fallback slot (#441): true when the file config explicitly set
   // `models.review: auto`, so reviewer call sites can distinguish an
@@ -1447,6 +1462,16 @@ export interface EvidenceBundle {
   pr: number | null;
   branch: string | null;
   harnesses: string[];
+  /** Resolved implementer/reviewer harness roles and each role's source
+   *  (#608), recorded once at run identity alongside `harnesses`. Absent for
+   *  pre-#608 bundles — additive and optional, consumers that do not
+   *  recognize it SHALL ignore it. */
+  roles?: {
+    implementer: string;
+    implementerSource: HarnessRoleSource;
+    reviewer: string;
+    reviewerSource: HarnessRoleSource;
+  };
   stages: StageRecord[];
   reviews: ReviewRecord[];
   overrides: OverrideRecord[];

@@ -20,6 +20,7 @@ import {
   type CommandRecord,
   type EngineDriftRecord,
   type EvidenceBundle,
+  type HarnessRoleSource,
   type OverrideRecord,
   type PromptRecord,
   type RecoveryRecord,
@@ -153,6 +154,16 @@ export interface CreateBundleArgs {
   pr: number | null;
   branch: string | null;
   harnesses: string[];
+  /** Resolved implementer/reviewer roles and their sources (#608). Optional
+   *  so existing callers/tests that construct args without it keep working;
+   *  omitted entirely from the written bundle (not recorded as unknown) when
+   *  absent, since `roles` itself is optional on `EvidenceBundle`. */
+  roles?: {
+    implementer: string;
+    implementerSource: HarnessRoleSource;
+    reviewer: string;
+    reviewerSource: HarnessRoleSource;
+  };
 }
 
 /** Create (or overwrite) the run's bundle with its identity fields. A new run on
@@ -170,6 +181,7 @@ export async function createBundle(
     pr: args.pr,
     branch: args.branch,
     harnesses: args.harnesses,
+    ...(args.roles ? { roles: args.roles } : {}),
     stages: [],
     reviews: [],
     overrides: [],
@@ -567,6 +579,12 @@ export function formatSummary(bundle: EvidenceBundle): string {
   lines.push(`  PR:          ${bundle.pr !== null ? `#${bundle.pr}` : "(none)"}`);
   lines.push(`  Branch:      ${bundle.branch ?? "(none)"}`);
   lines.push(`  Harnesses:   ${bundle.harnesses.length ? bundle.harnesses.join(", ") : "(none)"}`);
+  if (bundle.roles) {
+    lines.push(
+      `  Roles:       implementer=${bundle.roles.implementer} (${bundle.roles.implementerSource}), ` +
+        `reviewer=${bundle.roles.reviewer} (${bundle.roles.reviewerSource})`,
+    );
+  }
   lines.push(
     `  Final state: ${bundle.finalState ?? "(partial run — not finalized)"}` +
       (bundle.finalizedAt ? ` (finalized ${bundle.finalizedAt})` : ""),

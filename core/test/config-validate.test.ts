@@ -328,8 +328,8 @@ test("validateConfig: models.review set while reviewer=claude → no warning (no
 
 test("validateConfig: warning-only run has valid:true and exit-0 semantics", () => {
   const deps = makeDeps(
-    'models:\n  planning: haiku\n',
-    { implementer: "codex", reviewer: "claude" }, // implementer=codex → models.planning is inert
+    'review_harness: my-reviewer\nmodels:\n  review: haiku\n',
+    { implementer: "codex", reviewer: "claude" }, // review_harness=my-reviewer (custom CLI) → models.review is inert
   );
   const result = validateConfig("/fake-repo", deps);
   assert.equal(result.valid, true);

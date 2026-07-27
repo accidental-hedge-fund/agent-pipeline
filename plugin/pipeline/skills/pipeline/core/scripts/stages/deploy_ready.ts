@@ -23,8 +23,8 @@ export function buildPipelineCompleteComment(
     "",
     `- **Issue**: #${issueNumber} — ${title}`,
     `- **${prRef}**: ready to merge`,
-    `- **Implementer**: ${cfg.harnesses.implementer}`,
-    `- **Reviewer**: ${cfg.harnesses.reviewer}`,
+    `- **Implementer**: ${cfg.harnesses.implementer} (${cfg.harnesses.implementerSource})`,
+    `- **Reviewer**: ${cfg.harnesses.reviewer} (${cfg.harnesses.reviewerSource})`,
     `- **CI**: passing`,
     `- **Conflicts**: none`,
     ...(advisoryRounds
