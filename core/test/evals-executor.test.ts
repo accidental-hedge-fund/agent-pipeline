@@ -1211,7 +1211,7 @@ test("runCell: contract is restored even after a harness timeout", async () => {
   assert.equal(removed.length, 2, "both root-instruction paths must be restored even after a timeout");
 });
 
-test("runCell: contract/denial-log paths never appear in changed_paths, even if the real diff would include them", async () => {
+test("runCell: contract paths never appear in changed_paths, even if the real diff would include them", async () => {
   const fixture = validateFixture(
     {
       fixture_id: "f1",
@@ -1233,7 +1233,7 @@ test("runCell: contract/denial-log paths never appear in changed_paths, even if 
     removeWorktree: async () => {},
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => successResult(),
-    getChangedPaths: async () => ["core/scripts/gh.ts", "AGENTS.md", "CLAUDE.md", ".eval-boundary-shim/gh", ".eval-boundary-denials.jsonl"],
+    getChangedPaths: async () => ["core/scripts/gh.ts", "AGENTS.md", "CLAUDE.md"],
   };
   const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
   assert.deepEqual(result.outcome.detail?.changed_paths, ["core/scripts/gh.ts"]);

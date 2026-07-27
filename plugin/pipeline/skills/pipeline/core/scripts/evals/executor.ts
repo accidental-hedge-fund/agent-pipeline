@@ -23,11 +23,10 @@ import {
 } from "./gh-eval-surface.ts";
 import { EVAL_AGENT_CONTRACT_PATHS, EVAL_AGENT_CONTRACT_TEXT } from "./agent-contract.ts";
 import {
-  BOUNDARY_SHIM_DIR_NAME,
-  BOUNDARY_SHIM_PATHS,
   boundaryEnv,
   installBoundaryShim as installBoundaryShimReal,
   readBoundaryDenials as readBoundaryDenialsReal,
+  removeBoundaryShim as removeBoundaryShimReal,
 } from "./boundary-shim.ts";
 import { materializeStagePrompt, stagesForMode } from "./stage-adapters.ts";
 import type { BuildTreatmentTrajectoryInput, RawStageEntry } from "./trajectory/collect.ts";
@@ -295,8 +294,15 @@ export interface CellExecutionDeps {
    *  failure. */
   installBoundaryShim?: (worktreeDir: string) => string;
   /** Read and parse the cell's process-boundary denial log (#607). Defaults
-   *  to the real reader; an absent log means no denial occurred. */
+   *  to the real reader; an absent log means no denial occurred. A genuine
+   *  collection failure throws rather than returning `[]`. */
   readBoundaryDenials?: (worktreeDir: string) => BoundaryDenial[];
+  /** Remove the cell's boundary control directory (#607) — it lives outside
+   *  the cell worktree (a sibling, not a subdirectory), so worktree removal
+   *  does not clean it up; this must be called separately during teardown.
+   *  Defaults to the real remover. Best-effort: failures are logged, not
+   *  thrown, matching the worktree-removal convention below. */
+  removeBoundaryShim?: (worktreeDir: string) => void;
 }
 
 async function defaultRunChecks(
@@ -548,6 +554,7 @@ export async function runCell(
   const contractIO = deps.contractIO ?? defaultContractIO;
   const installBoundaryShimFn = deps.installBoundaryShim ?? installBoundaryShimReal;
   const readBoundaryDenialsFn = deps.readBoundaryDenials ?? readBoundaryDenialsReal;
+  const removeBoundaryShimFn = deps.removeBoundaryShim ?? removeBoundaryShimReal;
 
   function restoreContractIfNeeded(): void {
     if (!contractPrior) return;
@@ -911,15 +918,16 @@ export async function runCell(
     if (fixture.allowed_change_paths !== undefined) {
       const getChangedPathsFn = deps.getChangedPaths ?? defaultGetChangedPaths;
       const changedPaths = await getChangedPathsFn({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
-      // The eval agent contract and the command-boundary shim/denial-log are
-      // written by the evaluator itself, not the treatment — they must never
-      // be attributed to it as an out-of-scope change (#607). Restoration
-      // above already removes the contract's on-disk trace; this filter is
-      // the belt-and-suspenders backstop for a restore that failed, and for
-      // the shim/log paths restoration never touches.
-      const excludedFromChangedPaths = new Set<string>([...EVAL_AGENT_CONTRACT_PATHS, ...BOUNDARY_SHIM_PATHS]);
-      const shimDirPrefix = `${BOUNDARY_SHIM_DIR_NAME}/`;
-      detail.changed_paths = changedPaths.filter((p) => !excludedFromChangedPaths.has(p) && !p.startsWith(shimDirPrefix));
+      // The eval agent contract is written by the evaluator itself, not the
+      // treatment — it must never be attributed to it as an out-of-scope
+      // change (#607). Restoration above already removes its on-disk trace;
+      // this filter is the belt-and-suspenders backstop for a restore that
+      // failed. The command-boundary shim/denial-log need no such filter:
+      // they live in a sibling control directory outside `worktreeDir`
+      // (review 1 finding 759fe7a3), so `git diff` inside the worktree can
+      // never surface them.
+      const excludedFromChangedPaths = new Set<string>(EVAL_AGENT_CONTRACT_PATHS);
+      detail.changed_paths = changedPaths.filter((p) => !excludedFromChangedPaths.has(p));
     }
     if (reviewFindings !== undefined) detail.findings = reviewFindings;
     if (planningOutputText !== undefined) detail.output_text = planningOutputText;
@@ -957,6 +965,18 @@ export async function runCell(
       } catch (err) {
         console.warn(
           `[pipeline] evals: worktree removal failed (non-fatal, worktree may be stranded at ${identity.worktreePath}): ${(err as Error).message}`,
+        );
+      }
+      // The boundary control directory (shim + denial log) lives outside the
+      // worktree (#607, review 1 finding 759fe7a3) — worktree removal above
+      // does not touch it, so it must be cleaned up separately. Denials were
+      // already read into `finish()`'s result before this `finally` runs, so
+      // removing it now never loses evidence.
+      try {
+        removeBoundaryShimFn(identity.worktreePath);
+      } catch (err) {
+        console.warn(
+          `[pipeline] evals: boundary control directory removal failed (non-fatal, may be stranded): ${(err as Error).message}`,
         );
       }
     }

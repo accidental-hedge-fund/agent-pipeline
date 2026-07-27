@@ -20,6 +20,7 @@ import {
   boundaryShimDir,
   installBoundaryShim,
   readBoundaryDenials,
+  removeBoundaryShim,
 } from "../scripts/evals/boundary-shim.ts";
 
 const execFileAsync = promisify(execFile);
@@ -104,6 +105,62 @@ test("readBoundaryDenials: an absent log means no denial occurred, not a collect
   const worktreeDir = mkWorktree();
   const denials = readBoundaryDenials(worktreeDir);
   assert.deepEqual(denials, []);
+});
+
+test("readBoundaryDenials: a genuine read failure propagates rather than being folded into an empty array", () => {
+  const worktreeDir = mkWorktree();
+  const failingIO = {
+    readFile: () => {
+      throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+    },
+  };
+  assert.throws(() => readBoundaryDenials(worktreeDir, failingIO), /permission denied/);
+});
+
+test("git shim: global options placed before the subcommand do not bypass denial (review 1 finding 47b5f59b)", async () => {
+  const worktreeDir = mkWorktree();
+  await execFileAsync("git", ["init", "-q"], { cwd: worktreeDir });
+  installBoundaryShim(worktreeDir);
+  const env = { ...process.env, ...boundaryEnv(worktreeDir) };
+  const cases: Array<[string[], string]> = [
+    [["-C", ".", "push"], "push"],
+    [["-c", "foo.bar=baz", "commit", "-m", "x"], "commit"],
+    [["--no-pager", "worktree", "add", "../nested"], "nested-worktree"],
+  ];
+  for (const [args, category] of cases) {
+    const result = await run("git", args, env, worktreeDir);
+    assert.notEqual(result.code, 0, `git ${args.join(" ")} must still be denied`);
+  }
+  const denials = readBoundaryDenials(worktreeDir);
+  assert.deepEqual(denials.map((d) => d.category), cases.map(([, category]) => category));
+});
+
+test("boundary control directory lives outside the cell worktree, not as a path inside it", () => {
+  const worktreeDir = mkWorktree();
+  const dir = boundaryShimDir(worktreeDir);
+  const logPath = boundaryDenialLogPath(worktreeDir);
+  assert.ok(!dir.startsWith(`${worktreeDir}${path.sep}`), "shim dir must not be nested inside the worktree");
+  assert.ok(!logPath.startsWith(`${worktreeDir}${path.sep}`), "denial log must not be nested inside the worktree");
+});
+
+test("a treatment that wipes its own worktree does not destroy already-recorded boundary evidence (review 1 finding 759fe7a3)", async () => {
+  const worktreeDir = mkWorktree();
+  installBoundaryShim(worktreeDir);
+  const env = { ...process.env, ...boundaryEnv(worktreeDir) };
+  await run("gh", ["pr", "create", "--title", "x"], env, worktreeDir);
+  assert.equal(readBoundaryDenials(worktreeDir).length, 1);
+  // Simulate a treatment nuking its entire working tree.
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+  const denials = readBoundaryDenials(worktreeDir);
+  assert.equal(denials.length, 1, "evidence recorded outside the worktree must survive the worktree being wiped");
+});
+
+test("removeBoundaryShim: removes the sibling control directory", () => {
+  const worktreeDir = mkWorktree();
+  installBoundaryShim(worktreeDir);
+  assert.ok(fs.existsSync(boundaryShimDir(worktreeDir)));
+  removeBoundaryShim(worktreeDir);
+  assert.ok(!fs.existsSync(boundaryShimDir(worktreeDir)));
 });
 
 test("boundaryEnv: is scoped to the given worktree's shim dir and denial log path", () => {
