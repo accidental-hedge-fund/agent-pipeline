@@ -138,7 +138,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
   // own on any path.
   loop: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["profile", "milestone", "label", "range", "roadmapSlice", "resume", "audit"]),
+    allowedFlags: new Set(["profile", "milestone", "label", "range", "roadmapSlice", "resume", "audit", "newRun"]),
     needsConfig: false,
     needsGhAuth: false,
     mutatesGitHub: false,
