@@ -201,6 +201,36 @@ function heldItemIdsFromLedger(ledger: LoopLedger): string[] {
     .sort();
 }
 
+/** Renders a {@link LoopPreconditionExclusion} into the reason string carried on the terminal
+ *  summary — the same `precondition:required=<stage>,observed=<stage>` form the action-evidence
+ *  entry already records (capability `loop-terminal-exclusion-disclosure`, #614). */
+function formatExclusionReason(exclusion: LoopPreconditionExclusion): string {
+  return `precondition:required=${exclusion.required_stage},observed=${exclusion.observed_stage}`;
+}
+
+/** The exclusion reason recorded for the greatest number of `exclusions`, ties broken
+ *  lexicographically by the reason string (design.md decision 3, #614) — a pure function of the
+ *  exclusion set so identical run state always renders an identical summary. Null when
+ *  `exclusions` is empty. */
+export function dominantExclusionReason(exclusions: readonly LoopPreconditionExclusion[]): string | null {
+  if (exclusions.length === 0) return null;
+  const counts = new Map<string, number>();
+  for (const exclusion of exclusions) {
+    const reason = formatExclusionReason(exclusion);
+    counts.set(reason, (counts.get(reason) ?? 0) + 1);
+  }
+  let best: string | null = null;
+  let bestCount = -1;
+  for (const reason of [...counts.keys()].sort()) {
+    const count = counts.get(reason)!;
+    if (count > bestCount) {
+      best = reason;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
 /** True when at least one `pending` item remains in `schedulableContract` — the post-precondition
  *  eligible frontier scheduling itself already consults — i.e. there is still work a future cycle
  *  could pick up. Used to tell "an item just entered a hold, but siblings are still queued" apart
@@ -921,11 +951,20 @@ export interface DriveSupervisorInput {
   maxCycles?: number;
 }
 
+/** Names which of the three resolved shapes a run ended in (capability
+ *  `loop-terminal-exclusion-disclosure`, #614, design.md decision 1) — `null` for a non-resolved
+ *  terminal condition (a recorded stop or an outstanding hold), which keeps its own `stop` /
+ *  `holdOutstanding` disclosure instead. */
+export type LoopCompletion = "all_done" | "partial_excluded" | "none_dispatchable" | null;
+
 export interface DriveSupervisorResult {
   runId: string;
   cycles: number;
   stop: LoopStopRecord | null;
   holdOutstanding: boolean;
+  /** True only when every work-list item reached a terminal-successful (done/abandoned) state
+   *  with zero items precondition-excluded (#614) — narrower than "the run resolved," which also
+   *  includes a resolution where every item was merely excluded. */
   allDone: boolean;
   resumed: boolean;
   /** Every item held (`paused`/`waiting`) as of the last cycle driven — populated whenever
@@ -933,6 +972,20 @@ export interface DriveSupervisorResult {
    *  human (capability `loop-blocked-item-hold-continuation`, #581). Empty when the run stopped or
    *  completed with no outstanding hold. */
   heldItemIds: string[];
+  /** Count of contract items in a terminal-successful (done/abandoned) ledger state as of
+   *  resolution — derived from the ledger rather than an in-process counter, so a resumed run
+   *  reports the whole run's accounting (#614, design.md decision 2). */
+  dispatched: number;
+  /** Item ids precondition-excluded per the ledger's last reconciliation as of resolution — a
+   *  function of live truth, not an accumulator across cycles, so an item excluded early and later
+   *  triaged into the frontier is reported as dispatched, not excluded (#614, design.md decision 2). */
+  excludedItemIds: string[];
+  /** The exclusion reason recorded for the greatest number of `excludedItemIds`, ties broken
+   *  lexicographically (#614, design.md decision 3); null when no item was excluded. */
+  exclusionReason: string | null;
+  /** `null` for a recorded stop or an outstanding hold; otherwise names the resolved shape
+   *  (#614, design.md decision 1). */
+  completion: LoopCompletion;
 }
 
 /** Attaches (or resumes) and drives a run to a terminal condition: every item
@@ -972,7 +1025,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
     let cycles = 0;
     let stop: LoopStopRecord | null = null;
     let holdOutstanding = false;
-    let allDone = false;
+    let resolved = false;
     let heldItemIds: string[] = [];
 
     while (cycles < cyclesSafetyCap) {
@@ -996,7 +1049,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
         break;
       }
       if (result.allDone) {
-        allDone = true;
+        resolved = true;
         break;
       }
 
@@ -1025,7 +1078,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
       }
     }
 
-    if (!stop && !holdOutstanding && !allDone && cycles >= cyclesSafetyCap) {
+    if (!stop && !holdOutstanding && !resolved && cycles >= cyclesSafetyCap) {
       const time = deps.store.now().toISOString();
       const ledger = await readLedger(deps.store, input.runId);
       const newLedger: LoopLedger = {
@@ -1044,8 +1097,39 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
       stop = newLedger.stop;
     }
 
-    const result: DriveSupervisorResult = { runId: input.runId, cycles, stop, holdOutstanding, allDone, resumed: attach.resumed, heldItemIds };
-    if ((stop || allDone) && deps.onDriveEnd) {
+    // Accounting derived from the final ledger, not an in-process counter, so a resumed run
+    // reports the whole run's dispatch/exclusion picture (#614, design.md decision 2) — including
+    // for a stop or an outstanding hold, whose summary stays as informative as before (design.md
+    // edge cases).
+    const finalLedger = await readLedger(deps.store, input.runId);
+    const finalExclusions = classifyPreconditionExclusions(contract, finalLedger);
+    const excludedItemIds = finalExclusions.map((e) => e.item_id).sort();
+    const exclusionReason = dominantExclusionReason(finalExclusions);
+    const dispatched = contract.items.filter((i) => DONE_OR_ABANDONED.has(finalLedger.items[i.id]?.state ?? "")).length;
+    const completion: LoopCompletion =
+      stop || holdOutstanding
+        ? null
+        : excludedItemIds.length === 0
+          ? "all_done"
+          : dispatched === 0
+            ? "none_dispatchable"
+            : "partial_excluded";
+    const allDone = completion === "all_done";
+
+    const result: DriveSupervisorResult = {
+      runId: input.runId,
+      cycles,
+      stop,
+      holdOutstanding,
+      allDone,
+      resumed: attach.resumed,
+      heldItemIds,
+      dispatched,
+      excludedItemIds,
+      exclusionReason,
+      completion,
+    };
+    if ((stop || resolved) && deps.onDriveEnd) {
       try {
         await deps.onDriveEnd(result);
       } catch {
