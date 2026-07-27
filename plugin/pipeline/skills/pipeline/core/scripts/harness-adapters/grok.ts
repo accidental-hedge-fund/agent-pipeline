@@ -1,7 +1,7 @@
 // grok adapter — Grok Build CLI (#431 task 3). Argv verified on-machine
 // against an installed `grok 0.2.93 (f00f9631)` (design.md decision 4):
 //
-//   grok --prompt-file <PATH> --cwd <CWD> --output-format plain --verbatim
+//   grok --no-auto-update --prompt-file <PATH> --cwd <CWD> --output-format plain --verbatim
 //        --permission-mode <mode> [-m <model>] [--reasoning-effort <effort>]
 //
 // `--output-format json/streaming-json` exist but their payload SCHEMA is not
@@ -51,6 +51,10 @@ export const grokAdapter: HarnessAdapter = {
     // materializes it before spawn and removes exactly this file afterward.
     const promptFilePath = path.join(ctx.worktreeDir, `.pipeline-prompt-${randomUUID()}.txt`);
     const args = [
+      // Headless pipeline runs should never spend a stage checking for or
+      // applying a CLI update. Updates belong to the operator's maintenance
+      // window, not a reproducible task worktree invocation.
+      "--no-auto-update",
       "--prompt-file",
       promptFilePath,
       "--cwd",

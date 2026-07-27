@@ -1,5 +1,25 @@
 # README state-machine diagram
 
+# Grok Build Configuration Hardening
+
+## Plan
+
+- [x] Add the stable `--no-auto-update` flag to Agent Pipeline's Grok adapter and cover its invocation shape.
+- [x] Add dotfiles-managed Grok configuration and a native global rule that reuses the shared operating contract without duplicating Claude-specific instructions.
+- [x] Add deterministic dotfiles verification for the effective Grok rule source.
+- [x] Verify focused tests, the generated plugin mirror, the dotfiles configuration render, and repository diffs.
+
+## Scope
+
+- This change makes the existing Grok adapter more stable for headless pipeline runs and makes workstation Grok setup reproducible.
+- It deliberately does not introduce a first-class `grok` Agent Pipeline host profile; that needs separate routing and packaging design.
+
+## Review
+
+- Agent Pipeline: `node --test --experimental-strip-types test/harness.test.ts`, `node scripts/build.mjs`, and full `npm run ci` passed. The generated `plugin/` mirror includes the adapter change.
+- Dotfiles: `bash -n scripts/verify.sh`, a targeted chezmoi dry-run, and `scripts/verify.sh --agent` passed. The two Grok files were applied to this workstation; `grok inspect --json` reports the native global contract and marks the discovered Claude global file `disabled`.
+
+
 ## Plan
 
 - [x] Inspect the README structure and decide where the diagram-equivalent belongs.
