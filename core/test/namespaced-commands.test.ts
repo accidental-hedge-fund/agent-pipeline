@@ -125,6 +125,48 @@ test("namespaced-commands 7.5b2: renderCodexCommand produces entries for every C
 });
 
 // ---------------------------------------------------------------------------
+// 7.5b3  The `loop` wrapper describes the in-repo supervisor — never external
+//        goal-loop delegation (regression for the v1.26.0 internalization, #512).
+//        The stale wrapper told the invoking agent to "delegate to the installed
+//        goal-loop skill", contradicting the shipped in-repo supervisor and
+//        causing a wrong external-skill invocation.
+// ---------------------------------------------------------------------------
+
+test("namespaced-commands 7.5b3: loop wrapper drives in-repo, never delegates to an external goal-loop skill", async () => {
+  const buildMjs = await import("../../scripts/build.mjs");
+  const { OPERATION_SURFACE, renderClaudeCommand, renderCodexCommand } = buildMjs;
+
+  const loopOp = OPERATION_SURFACE.find((op: { name: string }) => op.name === "loop");
+  assert.ok(loopOp, "OPERATION_SURFACE is missing the `loop` operation");
+
+  const claude = renderClaudeCommand(loopOp, "~/.claude/skills/pipeline");
+  const codex = renderCodexCommand(loopOp);
+
+  for (const [surface, content] of [["claude", claude], ["codex", codex]] as const) {
+    // The run is driven in-repo; no wrapper may instruct external delegation.
+    assert.ok(
+      !/goal-loop/i.test(content),
+      `loop ${surface} wrapper references an external goal-loop skill (internalized in #512): ${content}`,
+    );
+    assert.ok(
+      !/delegate/i.test(content),
+      `loop ${surface} wrapper still instructs delegation — the loop runs in-repo: ${content}`,
+    );
+    // And it must never miscite the run-start preflight check name.
+    assert.ok(
+      !/loop:contract-coherence/.test(content),
+      `loop ${surface} wrapper miscites the run-start check; it is loop:store-schema-compatibility: ${content}`,
+    );
+  }
+
+  // The Claude wrapper must positively describe in-repo supervisor execution.
+  assert.ok(
+    /in-repo/i.test(claude) && /supervisor/i.test(claude),
+    `loop Claude wrapper should describe the in-repo loop supervisor: ${claude}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
 // 7.5c  Each command file starts with YAML front-matter referencing its operation name
 // ---------------------------------------------------------------------------
 
