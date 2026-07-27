@@ -161,6 +161,63 @@ test("runCell: missing-cli preflight classifies as infra_error, not auth_error",
   assert.equal(result.outcome.result_class, "infra_error");
 });
 
+// ---------------------------------------------------------------------------
+// declared-effort deliverability (#621) — a cell whose treatment declares an
+// effort against a harness that cannot express one must fail before the
+// harness is ever invoked, and must never be recorded as a completed
+// treatment carrying an effort coordinate that was never delivered.
+// ---------------------------------------------------------------------------
+
+test("runCell: a declared effort against a harness with no adapter (custom CLI) is infra_error and never invokes the harness (#621)", async () => {
+  let invoked = false;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => { invoked = true; return successResult(); },
+  };
+  const cell = makeCell({
+    treatment: { harness: "review_harness_custom", effort: "high" },
+    treatment_id: "harness=review_harness_custom,effort=high",
+  });
+  const result = await runCell(FAKE_CFG, cell, makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /review_harness_custom/, "error must name the harness");
+  assert.match(result.outcome.error ?? "", /high/, "error must name the requested effort");
+  assert.equal(invoked, false, "the harness must never be invoked when its declared effort is undeliverable");
+});
+
+test("runCell: no declared effort against a harness with no adapter still executes normally (#621)", async () => {
+  let invoked = false;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => { invoked = true; return successResult(); },
+  };
+  const cell = makeCell({
+    treatment: { harness: "review_harness_custom" },
+    treatment_id: "harness=review_harness_custom",
+  });
+  const result = await runCell(FAKE_CFG, cell, makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.equal(invoked, true, "a cell with no declared effort must still execute against a custom harness");
+});
+
+test("runCell: two cells differing only in declared effort send different effort values to the harness (#621)", async () => {
+  const seenEfforts: (string | undefined)[] = [];
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async (args) => { seenEfforts.push(args.effort); return successResult(); },
+  };
+  await runCell(FAKE_CFG, makeCell({ treatment: { harness: "claude", effort: "low" } }), makeFixture(), MANIFEST, deps);
+  await runCell(FAKE_CFG, makeCell({ treatment: { harness: "claude", effort: "high" } }), makeFixture(), MANIFEST, deps);
+  assert.deepEqual(seenEfforts, ["low", "high"]);
+  assert.notEqual(seenEfforts[0], seenEfforts[1]);
+});
+
 test("runCell: a harness timeout classifies as timeout, not completed or infra_error", async () => {
   const deps: CellExecutionDeps = {
     createWorktree: async (_c, o) => o,

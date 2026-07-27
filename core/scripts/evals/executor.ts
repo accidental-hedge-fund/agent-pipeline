@@ -437,11 +437,17 @@ async function realPreflight(
   return { ok: result.ok, failure: result.failure, message: result.message };
 }
 
-async function realInvokeHarness(args: HarnessInvokeArgs): Promise<HarnessInvokeResultLike> {
+/** The real `invokeHarness` dep (#621) — maps the eval domain's `effort` axis
+ *  onto `InvokeOptions.reasoningEffort`, the only field `invoke()` reads.
+ *  `HarnessInvokeArgs.effort` and `InvokeOptions.reasoningEffort` are two
+ *  names for the same coordinate; passing `effort` straight through (as a key
+ *  named `effort`) is silently discarded since there is no `tsc` step to
+ *  catch the mismatch — see `harness.test.ts`'s eval-path argv tests (#621). */
+export async function realInvokeHarness(args: HarnessInvokeArgs): Promise<HarnessInvokeResultLike> {
   const result = await harnessInvoke(args.harness, args.worktreeDir, args.prompt, {
     timeoutSec: args.timeoutSec,
     model: args.model,
-    effort: args.effort,
+    reasoningEffort: args.effort,
     stream: false,
     env: args.env,
     sandboxMode: args.sandboxMode,
@@ -782,6 +788,20 @@ export async function runCell(
     if (!resolvedModel.ok) {
       trajectoryActions.push(resolvedModel.error);
       return finish({ result_class: "infra_error", error: resolvedModel.error });
+    }
+
+    // A declared effort must be deliverable, never silently dropped and
+    // recorded as a completed treatment at an effort that never reached the
+    // harness (#621). An unregistered custom-reviewer CLI (#40) has no
+    // adapter at all; a registered adapter may explicitly declare no
+    // reasoning-effort control.
+    if (cell.treatment.effort !== undefined) {
+      const adapter = resolveAdapter(effectiveHarness);
+      if (!adapter || !adapter.capabilities.effort) {
+        const error = `harness "${effectiveHarness}" has no reasoning-effort control — cannot deliver declared effort "${cell.treatment.effort}"`;
+        trajectoryActions.push(error);
+        return finish({ result_class: "infra_error", error });
+      }
     }
 
     if (harness) {
