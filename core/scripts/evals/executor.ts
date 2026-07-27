@@ -137,33 +137,49 @@ export interface ContractIO {
   removeFile: (filePath: string) => void;
 }
 
-const defaultContractIO: ContractIO = {
+export const defaultContractIO: ContractIO = {
   readFile: (filePath) => {
     try {
       return fs.readFileSync(filePath, "utf8");
-    } catch {
-      return null;
+    } catch (err) {
+      // Only a genuinely-absent file is "no prior content" (`null`). Any other
+      // read failure (EACCES, EISDIR, …) must propagate, never be silently
+      // mistaken for absence — otherwise restore would DELETE a file whose
+      // original content merely could not be read (review 2, finding e3e72127).
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
     }
   },
   writeFile: (filePath, content) => fs.writeFileSync(filePath, content, "utf8"),
   removeFile: (filePath) => {
     try {
       fs.unlinkSync(filePath);
-    } catch {
-      // Already absent — restoring "no prior file" is a no-op.
+    } catch (err) {
+      // Already absent — restoring "no prior file" is a no-op. Any other unlink
+      // failure (EACCES, EISDIR, …) must propagate so it surfaces as a
+      // restore_failure, never be silently swallowed as success (finding e3e72127).
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw err;
     }
   },
 };
 
 /** Install the eval agent contract at every root-instruction path (#607),
  *  capturing each path's prior content (or `null` if it didn't exist) so it
- *  can be restored exactly. Never throws — a write failure is reported as
+ *  can be restored exactly. Never throws — a read/write failure is reported as
  *  `{ ok: false }` so the caller can classify the cell as an infra error
- *  without invoking the harness. */
-function installEvalContract(
+ *  without invoking the harness. The captured `prior` is returned on **both**
+ *  paths: a partial install (an earlier path written, a later one failing) must
+ *  still restore the already-modified paths, so the caller retains this prior
+ *  and restores it rather than leaving the contract behind (review 2, finding
+ *  e3e72127). `prior` is populated entry-by-entry as each path is captured, so
+ *  on failure it holds exactly the paths that may have been modified. */
+export function installEvalContract(
   worktreeDir: string,
   io: ContractIO,
-): { ok: true; prior: Record<string, string | null> } | { ok: false; error: string } {
+):
+  | { ok: true; prior: Record<string, string | null> }
+  | { ok: false; error: string; prior: Record<string, string | null> } {
   const prior: Record<string, string | null> = {};
   try {
     for (const rel of EVAL_AGENT_CONTRACT_PATHS) {
@@ -173,7 +189,7 @@ function installEvalContract(
     }
     return { ok: true, prior };
   } catch (err) {
-    return { ok: false, error: (err as Error).message };
+    return { ok: false, error: (err as Error).message, prior };
   }
 }
 
@@ -181,7 +197,7 @@ function installEvalContract(
  *  removing the file when no prior content existed. Never throws; a failure
  *  is reported as `{ ok: false }` boundary evidence, never fatal to the
  *  cell's primary outcome. */
-function restoreEvalContract(
+export function restoreEvalContract(
   worktreeDir: string,
   prior: Record<string, string | null>,
   io: ContractIO,
@@ -670,12 +686,16 @@ export async function runCell(
   // infra error and the harness is never invoked for this cell.
   try {
     const contractResult = installEvalContract(identity.worktreePath, contractIO);
+    // Retain the captured prior on BOTH paths: a partial install (an earlier
+    // path written before a later one failed) must still have its already-
+    // modified paths restored by `finish()` → `restoreContractIfNeeded()`,
+    // rather than leaving the contract behind (finding e3e72127).
+    contractPrior = contractResult.prior;
     if (!contractResult.ok) {
       const error = `eval agent contract installation failed: ${contractResult.error}`;
       trajectoryActions.push(error);
       return finish({ result_class: "infra_error", error });
     }
-    contractPrior = contractResult.prior;
     trajectoryActions.push("installed eval agent contract");
     installBoundaryShimFn(identity.worktreePath);
     trajectoryActions.push("installed process-level command boundary");

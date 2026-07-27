@@ -4,7 +4,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { allocateCellIdentity, deriveModelEndpointOverride, runCell as runCellReal, type CellExecutionDeps } from "../scripts/evals/executor.ts";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as nodePath from "node:path";
+import { allocateCellIdentity, defaultContractIO, deriveModelEndpointOverride, runCell as runCellReal, type CellExecutionDeps } from "../scripts/evals/executor.ts";
 import { validateFixture } from "../scripts/evals/fixture.ts";
 import { validateManifest } from "../scripts/evals/manifest.ts";
 import type { Cell, Fixture } from "../scripts/evals/types.ts";
@@ -1172,6 +1175,63 @@ test("runCell: restores each root-instruction path's prior content (or removes i
   const agentsWrites = writes.filter((w) => w.path.endsWith("AGENTS.md"));
   assert.equal(agentsWrites[agentsWrites.length - 1].content, "prior agents content", "AGENTS.md must be restored to its prior content");
   assert.ok(removed.some((p) => p.endsWith("CLAUDE.md")), "CLAUDE.md had no prior content and must be removed on restore");
+});
+
+test("defaultContractIO.readFile: a genuinely-absent file is null, but a non-ENOENT read failure (EISDIR) propagates — never mistaken for absence (finding e3e72127)", () => {
+  const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "eval-contract-io-read-"));
+  try {
+    // A missing file is "no prior content".
+    assert.equal(defaultContractIO.readFile(nodePath.join(dir, "absent.md")), null);
+    // Reading a *directory* fails with EISDIR (not ENOENT) — this MUST throw, not
+    // return null. Pre-fix it returned null, so restore would have deleted the
+    // "absent" path, destroying content it merely could not read.
+    assert.throws(() => defaultContractIO.readFile(dir), (err: NodeJS.ErrnoException) => err.code !== "ENOENT");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("defaultContractIO.removeFile: an already-absent file is a no-op, but a non-ENOENT unlink failure propagates — never silently swallowed (finding e3e72127)", () => {
+  const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "eval-contract-io-remove-"));
+  try {
+    // Removing an absent file is a no-op (restoring "no prior file").
+    assert.doesNotThrow(() => defaultContractIO.removeFile(nodePath.join(dir, "absent.md")));
+    // Unlinking a non-empty directory fails with EISDIR/EPERM (not ENOENT) — this
+    // MUST throw so it surfaces as a restore_failure, not be swallowed as success.
+    fs.writeFileSync(nodePath.join(dir, "child.txt"), "x");
+    assert.throws(() => defaultContractIO.removeFile(dir), (err: NodeJS.ErrnoException) => err.code !== "ENOENT");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runCell: a partial contract install (a later path's write fails) still restores the already-modified earlier path (finding e3e72127)", async () => {
+  // EVAL_AGENT_CONTRACT_PATHS install order is ["AGENTS.md", "CLAUDE.md"]. AGENTS.md
+  // is written successfully; CLAUDE.md's write throws. Pre-fix, installEvalContract
+  // discarded the captured prior on failure, so finish() had nothing to restore and
+  // AGENTS.md was left holding the contract text. The fix retains the partial prior.
+  const content = new Map<string, string>();
+  let harnessInvoked = false;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    contractIO: {
+      readFile: (p) => (p.endsWith("AGENTS.md") ? "prior agents content" : null),
+      writeFile: (p, c) => {
+        if (p.endsWith("CLAUDE.md")) throw new Error("disk full");
+        content.set(p, c);
+      },
+      removeFile: (p) => { content.delete(p); },
+    },
+    invokeHarness: async () => { harnessInvoked = true; return successResult(); },
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.equal(harnessInvoked, false, "a failed install never invokes the harness");
+  const agentsEntry = [...content.entries()].find(([p]) => p.endsWith("AGENTS.md"));
+  assert.ok(agentsEntry, "AGENTS.md was written during the partial install and must still be present after restore");
+  assert.equal(agentsEntry[1], "prior agents content", "the already-modified AGENTS.md must be restored to its prior content, not left holding the contract");
 });
 
 test("runCell: contract installation failure is an infra_error and the harness is never invoked", async () => {
