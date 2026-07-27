@@ -39,21 +39,6 @@ The pipeline SHALL never merge automatically: there is no merge stage and no mer
 - **WHEN** `.github/pipeline.yml` sets `auto_merge: true`
 - **THEN** `resolveConfig()` SHALL throw with a parse error identifying `auto_merge` as an unknown key
 
-### Requirement: Harness roles come from the active profile, not file config
-The `harnesses` (`implementer`/`reviewer`) SHALL be taken from the active profile (`profile.harnesses`). The `harnesses` key SHALL be absent from `PartialConfigSchema`; a repo that sets it SHALL receive a strict-schema parse error. The implementer harness SHALL NOT be overridable by file config. The reviewer harness MAY be overridden by the optional `review_harness` key (see `configurable-review-harness`); when `review_harness` is absent, the profile's reviewer is used unchanged.
-
-#### Scenario: harnesses key rejected
-- **WHEN** `.github/pipeline.yml` sets a `harnesses:` block
-- **THEN** `resolveConfig()` SHALL throw with a parse error identifying `harnesses` as an unknown key
-
-#### Scenario: reviewer overridden via review_harness
-- **WHEN** `.github/pipeline.yml` sets `review_harness: my-reviewer`
-- **THEN** `cfg.harnesses.reviewer` SHALL be `"my-reviewer"` and `cfg.harnesses.implementer` SHALL remain as the profile's default implementer
-
-#### Scenario: implementer cannot be overridden by file config
-- **WHEN** `.github/pipeline.yml` sets only `review_harness`
-- **THEN** `cfg.harnesses.implementer` SHALL equal the profile's implementer, unchanged by any file config key
-
 ### Requirement: Protected steps cannot be disabled via config
 The `steps:` block SHALL accept only the four toggleable keys (`plan_review`, `standard_review`, `adversarial_review`, `docs`); any other key (e.g. an attempt to disable a structural step) SHALL be rejected at validation time.
 
@@ -62,11 +47,15 @@ The `steps:` block SHALL accept only the four toggleable keys (`plan_review`, `s
 - **THEN** validation SHALL fail and `resolveConfig()` SHALL throw
 
 ### Requirement: Inert models.* aliases produce a diagnostic warning at config-resolve time
-`resolveConfig()` SHALL detect and warn about `models.*` aliases that are explicitly set in `.github/pipeline.yml` but will be silently ignored because the backing harness role is `codex`. This requirement augments the existing config-loading contract without changing validation, precedence, or the never-auto-merge safety floor. See the `config-inert-models-warn` capability for full requirements and scenarios.
+`resolveConfig()` SHALL detect and warn about `models.*` aliases that are explicitly set in `.github/pipeline.yml` but will be silently ignored because the harness backing that role cannot honor a model selection. Whether a role's harness can honor a model selection SHALL be determined from that harness adapter's declared capabilities, not from a hard-coded harness name. A role whose harness adapter declares a model capability SHALL NOT produce the warning. This requirement augments the existing config-loading contract without changing validation, precedence, or the never-auto-merge safety floor. See the `config-inert-models-warn` capability for full requirements and scenarios.
 
 #### Scenario: explicit inert alias detected and warned
-- **WHEN** `.github/pipeline.yml` explicitly sets one or more `models.*` keys and the backing harness role for each is `codex`
+- **WHEN** `.github/pipeline.yml` explicitly sets one or more `models.*` keys and the harness backing that role declares no model capability
 - **THEN** `resolveConfig()` SHALL emit a non-blocking `console.warn` for each affected key before returning the resolved config
+
+#### Scenario: capable harness produces no warning
+- **WHEN** `.github/pipeline.yml` explicitly sets an implementer-role `models.*` key and the resolved implementer's adapter declares a model capability
+- **THEN** `resolveConfig()` SHALL NOT emit an inert-alias warning for that key
 
 ### Requirement: Config SHALL accept an optional `doctor` block controlling preflight behavior
 
@@ -731,4 +720,39 @@ The pipeline configuration SHALL accept `review_policy.max_delta_rounds`: a posi
 - **WHEN** the configuration key allowlist and the machine-readable config schema output are inspected
 - **THEN** both SHALL include `review_policy.max_delta_rounds`
 - **AND** a misspelling of the key in a repository configuration SHALL be reported as an unknown key
+
+### Requirement: Harness roles SHALL come from repository config when declared, otherwise the active profile
+
+The `harnesses` (`implementer`/`reviewer`) roles SHALL be resolved per role: from the repository's
+optional strict `harnesses:` block in `.github/pipeline.yml` when that role is declared there, and from
+the active profile (`profile.harnesses`) when it is not. `PartialConfigSchema` SHALL accept the
+`harnesses` block with exactly the optional keys `implementer` and `reviewer`; any other key inside it
+SHALL be a strict-schema parse error. The reviewer role MAY additionally be supplied by the optional
+`review_harness` key (see `configurable-harness-roles` and `configurable-review-harness` for the
+precedence rules between the two). See the `configurable-harness-roles` capability for the full role
+resolution, routing, validation, and evidence requirements.
+
+#### Scenario: harnesses block accepted and applied
+
+- **WHEN** `.github/pipeline.yml` sets `harnesses:` with `implementer: grok` and `reviewer: codex`
+- **THEN** `resolveConfig()` SHALL set `cfg.harnesses.implementer` to `"grok"` and
+  `cfg.harnesses.reviewer` to `"codex"` regardless of the active profile
+
+#### Scenario: unknown key inside harnesses rejected
+
+- **WHEN** `.github/pipeline.yml` sets a `harnesses:` block containing a key other than `implementer` or
+  `reviewer`
+- **THEN** `resolveConfig()` SHALL throw with a parse error identifying that key
+
+#### Scenario: absent block falls back to the profile
+
+- **WHEN** `.github/pipeline.yml` sets no `harnesses:` block and no `review_harness` key
+- **THEN** `cfg.harnesses.implementer` and `cfg.harnesses.reviewer` SHALL equal the active profile's
+  roles, unchanged from the pre-change behavior
+
+#### Scenario: implementer declared, reviewer omitted
+
+- **WHEN** `.github/pipeline.yml` sets `harnesses:` with only `implementer: grok`
+- **THEN** `cfg.harnesses.implementer` SHALL be `"grok"` and `cfg.harnesses.reviewer` SHALL equal the
+  active profile's reviewer
 

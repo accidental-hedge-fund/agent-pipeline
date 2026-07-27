@@ -5,7 +5,9 @@ TBD - created by archiving change configurable-review-harness. Update Purpose af
 ## Requirements
 ### Requirement: review_harness config key overrides the profile reviewer
 
-`PartialConfigSchema` SHALL accept an optional `review_harness` key that is either a bare `string` (the command shorthand) or a strict object `{ command: string, model?: string | "auto", effort?: string | "auto" }`. When present in either form, `resolveConfig()` SHALL use the command as `cfg.harnesses.reviewer` in place of the profile's default reviewer harness, applied after the profile/file/CLI merge step. For the object form, `resolveConfig()` SHALL additionally set `cfg.harnesses.reviewerModel` from `model` and `cfg.harnesses.reviewerEffort` from `effort`; for the string form, both SHALL remain unset. The `harnesses:` block SHALL remain absent from `PartialConfigSchema` and SHALL continue to be rejected by strict validation. When `review_harness` is absent, the profile's reviewer is used unchanged and `reviewerModel`/`reviewerEffort` are unset.
+`PartialConfigSchema` SHALL accept an optional `review_harness` key that is either a bare `string` (the command shorthand) or a strict object `{ command: string, model?: string | "auto", effort?: string | "auto" }`. When present in either form, `resolveConfig()` SHALL use the command as `cfg.harnesses.reviewer` in place of the profile's default reviewer harness, applied after the profile/file/CLI merge step. For the object form, `resolveConfig()` SHALL additionally set `cfg.harnesses.reviewerModel` from `model` and `cfg.harnesses.reviewerEffort` from `effort`; for the string form, both SHALL remain unset. When `review_harness` is absent, the reviewer resolves from the repository `harnesses.reviewer` key when present and otherwise from the profile, and `reviewerModel`/`reviewerEffort` SHALL remain unset.
+
+`PartialConfigSchema` SHALL also accept the strict repository `harnesses` role block (see `configurable-harness-roles`); a `harnesses:` block is no longer rejected outright, though a key inside it other than `implementer` or `reviewer` SHALL still be rejected by strict validation. When both `review_harness` and `harnesses.reviewer` are present, they SHALL agree: naming the same command is accepted and the structured `review_harness` model/effort/prompt-delivery settings continue to apply, while naming different commands SHALL be rejected with a message naming both keys and both values rather than silently selecting one.
 
 #### Scenario: review_harness string form present
 
@@ -19,13 +21,28 @@ TBD - created by archiving change configurable-review-harness. Update Purpose af
 
 #### Scenario: review_harness key absent
 
-- **WHEN** `.github/pipeline.yml` does not include a `review_harness` key
+- **WHEN** `.github/pipeline.yml` does not include a `review_harness` key and no `harnesses` block
 - **THEN** `cfg.harnesses.reviewer` SHALL equal the profile's default reviewer harness with no warning or change in behavior, and `reviewerModel`/`reviewerEffort` SHALL be unset
 
 #### Scenario: review_harness key absent under claude profile
 
-- **WHEN** the `claude` profile is active and `.github/pipeline.yml` has no `review_harness` key
+- **WHEN** the `claude` profile is active and `.github/pipeline.yml` has no `review_harness` key and no `harnesses` block
 - **THEN** `cfg.harnesses.reviewer` SHALL be `"codex"` (the profile's cross-harness default)
+
+#### Scenario: harnesses.reviewer supplies the reviewer when review_harness is absent
+
+- **WHEN** `.github/pipeline.yml` sets `harnesses: { reviewer: codex }` and no `review_harness` key
+- **THEN** `cfg.harnesses.reviewer` SHALL be `"codex"` and `reviewerModel`/`reviewerEffort` SHALL be unset
+
+#### Scenario: agreeing review_harness and harnesses.reviewer
+
+- **WHEN** `.github/pipeline.yml` sets `harnesses: { reviewer: codex }` and `review_harness: { command: codex, model: gpt-5.6-terra }`
+- **THEN** `cfg.harnesses.reviewer` SHALL be `"codex"` and `cfg.harnesses.reviewerModel` SHALL be `"gpt-5.6-terra"`
+
+#### Scenario: conflicting review_harness and harnesses.reviewer
+
+- **WHEN** `.github/pipeline.yml` sets `harnesses: { reviewer: codex }` and `review_harness: claude`
+- **THEN** `resolveConfig()` SHALL fail with a message naming both keys and both values, and no stage SHALL run
 
 ### Requirement: invoke() accepts an arbitrary string harness name
 
@@ -68,7 +85,7 @@ When the configured reviewer CLI (from `cfg.harnesses.reviewer`) cannot be spawn
 
 The review routing SHALL pass the reviewer model as `cfg.harnesses.reviewerModel ?? cfg.models.review` and the reviewer effort as `cfg.harnesses.reviewerEffort ?? cfg.effort.review` to each `invokeReviewer` call. When either resolved value is `"auto"`, it SHALL be resolved using the classification of the concrete review round: `review-1` as Adversarial/Iterative and `review-2` as Adversarial/Definitive. The plan-review round SHALL resolve `auto` as Adversarial/Definitive.
 
-The resolved reviewer **model** SHALL be validated against the effective reviewer command before it reaches the harness invocation: when the reviewer command is `codex` and the resolved model is a claude-only alias (an alias the claude CLI recognizes but codex does not, e.g. `claude-fable-5`, `sonnet`, `opus`), the review routing SHALL pass no model to the invocation (so `codex exec` receives no `-m` flag and uses its configured default) rather than forwarding the claude-only alias. An explicit (non-`auto`) reviewer model SHALL be forwarded verbatim to the reviewer command regardless of harness.
+The resolved reviewer **model** SHALL be validated against the effective reviewer command before it reaches the harness invocation: when the resolved model is an alias the effective reviewer harness cannot run — determined from that harness adapter's capabilities and recognized aliases rather than a hard-coded pair of harness names, e.g. a claude-only alias such as `claude-fable-5`, `sonnet`, or `opus` reaching a `codex` reviewer — the review routing SHALL pass no model to the invocation (so the reviewer CLI receives no model flag and uses its configured default) rather than forwarding the unrunnable alias. An explicit (non-`auto`) reviewer model SHALL be forwarded verbatim to the reviewer command regardless of harness.
 
 #### Scenario: reviewer override wins over config fallback
 
@@ -89,6 +106,12 @@ The resolved reviewer **model** SHALL be validated against the effective reviewe
 #### Scenario: codex reviewer with auto model resolves to no model flag
 
 - **WHEN** the effective reviewer command is `codex` and the resolved reviewer model comes from the `"auto"` sentinel (which yields the claude-only alias `claude-fable-5` for every Adversarial round)
+- **THEN** review routing SHALL NOT forward a claude-only alias to codex
+- **AND** the `codex exec` invocation SHALL omit the `-m` flag
+
+#### Scenario: codex reviewer configured through the harnesses block behaves identically
+
+- **WHEN** the reviewer is resolved from `harnesses: { reviewer: codex }` rather than `review_harness`, and `models.review` is `"auto"`
 - **THEN** review routing SHALL NOT forward a claude-only alias to codex
 - **AND** the `codex exec` invocation SHALL omit the `-m` flag
 
