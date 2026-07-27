@@ -739,7 +739,7 @@ export async function runSupervisorCycle(
               engine,
               request: {
                 kind: "answer",
-                prompt: `pipeline/loop-execution@1 reported outcome "${String(rawOutcomeByItem.get(itemId))}" for item ${itemId}, and the live issue carries pipeline:blocked — needs a human answer/unblock before this item can resume`,
+                prompt: `pipeline/loop-execution@1 reported outcome "${String(rawOutcomeByItem.get(itemId))}" for item ${itemId}, and the live issue carries the blocked label — needs a human answer/unblock before this item can resume`,
                 source: "pipeline_blocked_label",
               },
               note: "needs-human pipeline blocker safety net (capability loop-needs-human-blocker-disposition)",

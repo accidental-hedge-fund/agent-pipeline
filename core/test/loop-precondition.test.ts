@@ -16,6 +16,7 @@ import {
   pipelineStageFromLabels,
 } from "../scripts/loop/precondition.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopContract, type LoopExternalIdentity, type LoopLedger } from "../scripts/loop/types.ts";
+import { BLOCKED_LABEL } from "../scripts/types.ts";
 
 function identity(overrides: Partial<LoopExternalIdentity> = {}): LoopExternalIdentity {
   return {
@@ -125,21 +126,28 @@ test("pipelineStageFromLabels: extracts the suffix after the pipeline: prefix", 
 // isBlockedInLabels (#581, capability `loop-blocked-item-hold-continuation`)
 // ---------------------------------------------------------------------------
 
-test("isBlockedInLabels: false when pipeline:blocked is absent", () => {
+test("isBlockedInLabels: false when the blocked label is absent", () => {
   assert.equal(isBlockedInLabels([]), false);
   assert.equal(isBlockedInLabels(["bug", "pipeline:ready"]), false);
 });
 
-test("isBlockedInLabels: true when pipeline:blocked is present alone", () => {
-  assert.equal(isBlockedInLabels(["pipeline:blocked"]), true);
+test("isBlockedInLabels: recognizes the real BLOCKED_LABEL ('blocked'), NOT the phantom 'pipeline:blocked' (#616)", () => {
+  // The pipeline applies the canonical BLOCKED_LABEL = "blocked" (gh.ts). A `pipeline:`-prefixed
+  // variant is NEVER written, so it must NOT be treated as a blocker — the reverse of that
+  // (checking for `pipeline:blocked`) is exactly the bug that run_fataled a whole run in #616.
+  assert.equal(BLOCKED_LABEL, "blocked");
+  assert.equal(isBlockedInLabels([BLOCKED_LABEL]), true);
+  assert.equal(isBlockedInLabels(["blocked"]), true);
+  assert.equal(isBlockedInLabels(["pipeline:blocked"]), false);
 });
 
-test("isBlockedInLabels: true when pipeline:blocked is co-present with another pipeline:* stage label, regardless of label order — presence, not the single stage-winner", () => {
-  assert.equal(isBlockedInLabels(["pipeline:review-1", "pipeline:blocked"]), true);
-  assert.equal(isBlockedInLabels(["pipeline:blocked", "pipeline:review-1"]), true);
+test("isBlockedInLabels: true when 'blocked' is co-present with another pipeline:* stage label, regardless of label order — presence, not the single stage-winner", () => {
+  // Mirrors the real live shape of a blocked item (e.g. #616: ["blocked", "pipeline:fix-2"]).
+  assert.equal(isBlockedInLabels(["pipeline:review-1", "blocked"]), true);
+  assert.equal(isBlockedInLabels(["blocked", "pipeline:review-1"]), true);
   // pipelineStageFromLabels would return "review-1" here (the first pipeline:* label in list
   // order) — isBlockedInLabels must not be fooled by that stage-winner into missing the blocker.
-  assert.equal(pipelineStageFromLabels(["pipeline:review-1", "pipeline:blocked"]), "review-1");
+  assert.equal(pipelineStageFromLabels(["pipeline:review-1", "blocked"]), "review-1");
 });
 
 // ---------------------------------------------------------------------------

@@ -12,7 +12,7 @@
 // auto-promotion) evaluated against live truth each reconciliation pass, never frozen into the
 // compiled contract or the run's identity. Pure — no gh, git, fs, clock, or store access.
 
-import { LABEL_PREFIX } from "../types.ts";
+import { BLOCKED_LABEL, LABEL_PREFIX } from "../types.ts";
 import type { LoopContract, LoopLedger, LoopPreconditionExclusion } from "./types.ts";
 
 /** The pipeline stage label required for a work-list item to be admissible. */
@@ -45,13 +45,12 @@ export function pipelineStageFromLabels(labels: readonly string[]): string | nul
   return label ? label.slice(LABEL_PREFIX.length) : null;
 }
 
-/** The full `pipeline:blocked` label. */
-const BLOCKED_LABEL = `${LABEL_PREFIX}blocked`;
-
-/** True when `labels` carries `pipeline:blocked`, checked by **presence** rather than by
+/** True when `labels` carries the pipeline's `blocked` label (the canonical
+ *  {@link BLOCKED_LABEL} = `"blocked"`, the exact string `gh.ts` applies — NOT a
+ *  `pipeline:`-prefixed variant, which is never written), checked by **presence** rather than by
  *  {@link pipelineStageFromLabels}'s single stage-winner (#581, capability
  *  `loop-blocked-item-hold-continuation`). `pipelineStageFromLabels` returns only the first
- *  `pipeline:*` label it finds in list order, so an item carrying `pipeline:blocked` alongside
+ *  `pipeline:*` label it finds in list order, so an item carrying `blocked` alongside
  *  another `pipeline:*` stage label can have that other label win the single-stage derivation —
  *  this predicate exists so detection of "is this item blocked" never depends on label order. */
 export function isBlockedInLabels(labels: readonly string[]): boolean {

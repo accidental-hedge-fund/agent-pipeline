@@ -149,6 +149,7 @@ import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type Loo
 import { LOOP_EXECUTION_CONTRACT_SCHEMA, normalizeLoopOutcome, type LoopExecutionRequest, type LoopExecutionResponse } from "./loop-execution-contract.ts";
 import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
+  BLOCKED_LABEL,
   LABEL_PREFIX,
   reviewStageSkipTarget,
   type EvidenceBundle,
@@ -553,6 +554,20 @@ export function dispatchItemChildArgs(scriptPath: string, issueNumber: number, e
   return [scriptPath, String(issueNumber), "--profile", engine, "--repo-path", repoDir];
 }
 
+/** Pure classifier for the per-item advance's terminal label/state → dispatch outcome,
+ *  extracted from {@link realDispatchItem} so the mapping is unit-testable without a real
+ *  child process. The blocker discriminator is the canonical `BLOCKED_LABEL` (`"blocked"`, the
+ *  exact string `gh.ts` applies) — NOT `${LABEL_PREFIX}blocked`, which is never written. The
+ *  old wrong name here mapped a real needs-human block to `failed`, which the supervisor then
+ *  classified as workflow-engine-defect and run_fataled the whole run (#616). */
+export function classifyDispatchOutcome(detail: { labels: readonly string[]; state: string }): LoopExecutionResponse["outcome"] {
+  const readyLabel = `${LABEL_PREFIX}ready-to-deploy`;
+  if (detail.labels.includes(readyLabel)) return "ready_to_deploy";
+  if (detail.labels.includes(BLOCKED_LABEL)) return "blocked_needs_human";
+  if (detail.state === "closed") return "abandoned";
+  return "failed";
+}
+
 export function realDispatchItem(cfg: PipelineConfig, engine: LoopEngine): SupervisorDeps["dispatchItem"] {
   return async (request: LoopExecutionRequest): Promise<LoopExecutionResponse> => {
     const issueNumber = Number(request.item_id);
@@ -570,17 +585,7 @@ export function realDispatchItem(cfg: PipelineConfig, engine: LoopEngine): Super
     let prNumber: number | null = null;
     try {
       const detail = await getIssueDetail(cfg, issueNumber);
-      const readyLabel = `${LABEL_PREFIX}ready-to-deploy`;
-      const blockedLabel = `${LABEL_PREFIX}blocked`;
-      if (detail.labels.includes(readyLabel)) {
-        outcome = "ready_to_deploy";
-      } else if (detail.labels.includes(blockedLabel)) {
-        outcome = "blocked_needs_human";
-      } else if (detail.state === "closed") {
-        outcome = "abandoned";
-      } else {
-        outcome = "failed";
-      }
+      outcome = classifyDispatchOutcome(detail);
       const pr = await getPrForIssue(cfg, issueNumber).catch(() => null);
       prNumber = pr ?? null;
     } catch {
