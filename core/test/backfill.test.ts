@@ -4,10 +4,14 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   classifyCoverage,
   nonOpenspecPaths,
   runBackfill,
+  realBackfillDeps,
   type BackfillCandidate,
   type BackfillDeps,
 } from "../scripts/stages/backfill.ts";
@@ -600,4 +604,24 @@ test("runBackfill: apply — unknown evidence grade does not enter missing-cover
     () => runBackfill({ apply: true }, cfg, deps),
     /no missing-coverage candidates/,
   );
+});
+
+// ---- #608: realBackfillDeps routes through the resolved implementer, not a
+// hard-coded "claude" ----
+
+test("backfill: realBackfillDeps.runHarness targets the resolved implementer (grok) when configured, never claude", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-wt-"));
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-grok-"));
+  const cli = path.join(binDir, "grok");
+  fs.writeFileSync(cli, `#!/usr/bin/env bash\ncat "$3"\n`);
+  fs.chmodSync(cli, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const result = await realBackfillDeps(tmp, "grok-4.5", "grok").runHarness("GROK-BACKFILL-PROMPT", 600);
+    assert.equal(result.success, true);
+    assert.equal(result.output, "GROK-BACKFILL-PROMPT", "the grok adapter, not claude, must have received the prompt");
+  } finally {
+    process.env.PATH = oldPath;
+  }
 });

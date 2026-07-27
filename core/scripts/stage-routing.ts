@@ -6,17 +6,15 @@
 // stage's task NATURE (how mechanical vs. judgment-heavy the work is) and
 // output PERMANENCE (how consequential/hard-to-revisit the result is).
 //
-// Model selection is harness-aware only for Mechanical stages, where
-// `gpt-5.5` (codex-only) vs `sonnet` (claude-only) is a real fork. Analytical
-// and Adversarial stages resolve to the same model regardless of which
-// harness backs them — an Analytical stage backed by codex (e.g. `planning`
-// under the `claude` profile, where the reviewer is codex... no, planning is
-// always the implementer) still resolves to a claude-only alias; if that
-// alias is inert for the active harness, the existing inert-alias advisory
-// (`warnInertModelAliases`) already covers it, exactly as it would for an
-// explicit (non-auto) override.
+// Model selection is harness-aware for Mechanical stages, where `gpt-5.5`
+// (codex-only) vs `sonnet` (claude-only) is a real fork. Analytical and
+// Adversarial stages share one routing-table model (`claude-fable-5`) across
+// every cell; for any non-claude harness (codex included, #608 review-2) that
+// value is a claude-only alias the harness cannot run, so `modelForHarness`
+// resolves it to no model rather than forwarding an unrunnable flag.
 
 import type { Harness, PipelineConfig } from "./types.ts";
+import { resolveAdapter } from "./harness-adapters/index.ts";
 
 export type StageNature = "mechanical" | "analytical" | "adversarial";
 export type StagePermanence = "ephemeral" | "iterative" | "definitive";
@@ -87,19 +85,43 @@ export interface ResolvedAuto {
 }
 
 /**
+ * Resolve the model a routing cell yields for `harness` (#608, review-2:
+ * finding 465f9695). Mechanical cells fork by harness (`gpt-5.5` codex vs.
+ * `sonnet` claude). Every Analytical/Adversarial cell has
+ * `claudeModel === codexModel`, a claude-only alias (e.g. `claude-fable-5`) —
+ * runnable as-is only by the `claude` adapter. For every other harness,
+ * including codex, `isClaudeOnlyModelAlias` catches that so the harness gets
+ * `undefined` (no known runnable model in this table) instead of an
+ * unrunnable claude-exclusive alias reaching its CLI as an invalid model flag.
+ */
+function modelForHarness(cell: RoutingCell, harness: Harness): string | undefined {
+  if (cell.claudeModel !== cell.codexModel) {
+    if (harness === "claude") return cell.claudeModel;
+    if (harness === "codex") return cell.codexModel;
+    return undefined;
+  }
+  if (harness === "claude") return cell.claudeModel;
+  return isClaudeOnlyModelAlias(cell.claudeModel) ? undefined : cell.claudeModel;
+}
+
+/**
  * Expand the `"auto"` sentinel for `stage` into a concrete `(model, effort)`
- * pair. `harness` is the concrete harness backing the stage under the active
- * profile — only consulted for Mechanical stages, where it forks the model
- * between `gpt-5.5` (codex) and `sonnet` (claude). Adversarial stages always
- * resolve `claude-fable-5` (the full id — never the unrecognized `fable-5`
- * alias) regardless of harness, so alternative-harness routing is
- * profile-independent by construction.
+ * pair. `harness` is the resolved role harness backing the stage (#608).
+ * Mechanical stages fork the model between `gpt-5.5` (codex) and `sonnet`
+ * (claude). Analytical/Adversarial stages route through the shared
+ * `claude-fable-5` cell (the full id — never the unrecognized `fable-5`
+ * alias), which only the `claude` adapter can run. A harness with no known
+ * runnable model for a cell resolves to `""` (no model) rather than another
+ * harness's alias — the empty string is falsy everywhere a resolved model
+ * reaches an adapter's `if (ctx.model) args.push(...)` check, so no
+ * `--model`-equivalent flag is emitted and the harness's own configured
+ * default applies. Effort is never remapped by harness.
  */
 export function resolveAuto(stage: RoutingStage, harness: Harness): ResolvedAuto {
   const { nature, permanence } = STAGE_ROUTING[stage];
   const cell = ROUTING_MATRIX[nature][permanence];
   return {
-    model: harness === "codex" ? cell.codexModel : cell.claudeModel,
+    model: modelForHarness(cell, harness) ?? "",
     effort: cell.effort,
   };
 }
@@ -137,18 +159,23 @@ export function isClaudeOnlyModelAlias(model: string): boolean {
 }
 
 /**
- * Reviewer-role model resolution guard (#441): an `auto`-resolved reviewer
- * model that is a claude-only alias must never reach a codex reviewer
- * invocation — codex has no equivalent and would reject it, and every
- * Adversarial routing cell resolves `auto` to the same claude-only
- * `claude-fable-5`. When `reviewerHarness` is `"codex"`, `model` is a
- * claude-only alias, AND `wasAuto` is true, this returns `undefined` so the
- * invocation omits `-m` (codex uses its configured default). An *explicit*
- * (non-`auto`) reviewer model — even one that happens to be a claude-only
- * alias like `sonnet` — is always forwarded verbatim so codex can surface its
- * own invalid-model error rather than silently falling back. Single-sourced
- * so every reviewer call site (review-routing, plan-review, pre_merge,
- * roadmap-deps, auto_merge_eligibility, shipcheck) applies the same rule.
+ * Reviewer-role model resolution guard (#441, generalized #608): an
+ * `auto`-resolved reviewer model that is a claude-only alias must never reach
+ * a registered non-claude reviewer invocation — only the `claude` adapter
+ * recognizes those aliases, and every Adversarial routing cell resolves
+ * `auto` to the same claude-only `claude-fable-5`. When `reviewerHarness`
+ * names a registered adapter other than `claude` (codex, grok, opencode, pi),
+ * `model` is a claude-only alias, AND `wasAuto` is true, this returns
+ * `undefined` so the invocation omits its model flag (the reviewer harness
+ * uses its own configured default). Scoped to registered adapters: an
+ * unregistered custom reviewer CLI's contract is unconstrained (#40) and
+ * `invoke()` forwards the model to it verbatim regardless, so this guard
+ * leaves it alone. An *explicit* (non-`auto`) reviewer model — even one that
+ * happens to be a claude-only alias like `sonnet` — is always forwarded
+ * verbatim so the reviewer CLI can surface its own invalid-model error rather
+ * than silently falling back. Single-sourced so every reviewer call site
+ * (review-routing, plan-review, pre_merge, roadmap-deps,
+ * auto_merge_eligibility, shipcheck) applies the same rule.
  */
 export function resolveReviewerModelForHarness(
   model: string | undefined,
@@ -156,7 +183,8 @@ export function resolveReviewerModelForHarness(
   wasAuto: boolean,
 ): string | undefined {
   if (model === undefined) return undefined;
-  if (wasAuto && reviewerHarness === "codex" && isClaudeOnlyModelAlias(model)) return undefined;
+  const isRegisteredNonClaude = reviewerHarness !== "claude" && resolveAdapter(reviewerHarness) !== null;
+  if (wasAuto && isRegisteredNonClaude && isClaudeOnlyModelAlias(model)) return undefined;
   return model;
 }
 

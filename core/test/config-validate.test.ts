@@ -328,8 +328,8 @@ test("validateConfig: models.review set while reviewer=claude → no warning (no
 
 test("validateConfig: warning-only run has valid:true and exit-0 semantics", () => {
   const deps = makeDeps(
-    'models:\n  planning: haiku\n',
-    { implementer: "codex", reviewer: "claude" }, // implementer=codex → models.planning is inert
+    'review_harness: my-reviewer\nmodels:\n  review: haiku\n',
+    { implementer: "codex", reviewer: "claude" }, // review_harness=my-reviewer (custom CLI) → models.review is inert
   );
   const result = validateConfig("/fake-repo", deps);
   assert.equal(result.valid, true);
@@ -562,37 +562,30 @@ test("validateConfig: review_harness overrides profile reviewer — no warning w
 });
 
 // ---------------------------------------------------------------------------
-// 5.14 validateConfig: reviewer-model alias guard (#454) — error, not warning
+// 5.14 validateConfig: explicit reviewer-model aliases forward verbatim
+// (#454, superseded by #608 — see configurable-review-harness/spec.md)
 // ---------------------------------------------------------------------------
 
-test("validateConfig: models.review Claude alias + codex reviewer is a severity-error diagnostic, not a warning, and exits invalid", () => {
+test("validateConfig: models.review Claude alias + codex reviewer produces no error diagnostic — forwarded verbatim", () => {
   const deps = makeDeps(
     "models:\n  review: sonnet\n",
     { implementer: "codex", reviewer: "codex" },
   );
   const result = validateConfig("/fake-repo", deps);
-  assert.equal(result.valid, false);
-  const d = result.diagnostics.find((x) => x.path === "models.review");
-  assert.ok(d, `expected an error diagnostic for models.review, got: ${JSON.stringify(result.diagnostics)}`);
-  assert.equal(d!.severity, "error");
-  assert.match(d!.message, /sonnet/);
-  assert.match(d!.message, /codex/);
-  assert.match(d!.message, /auto/);
-  const warnings = result.diagnostics.filter((x) => x.path === "models.review" && x.severity === "warning");
-  assert.deepEqual(warnings, [], "the same key must not also carry a contradictory inert-alias warning");
+  assert.equal(result.valid, true);
+  const errors = result.diagnostics.filter((x) => x.path === "models.review" && x.severity === "error");
+  assert.deepEqual(errors, [], "an explicit reviewer model alias must forward verbatim, not error");
 });
 
-test("validateConfig: review_harness.model Claude alias + codex reviewer command is a severity-error diagnostic on review_harness.model", () => {
+test("validateConfig: review_harness.model Claude alias + codex reviewer command produces no error diagnostic — forwarded verbatim", () => {
   const deps = makeDeps(
     "review_harness:\n  command: codex\n  model: opus\n",
     { implementer: "codex", reviewer: "claude" },
   );
   const result = validateConfig("/fake-repo", deps);
-  assert.equal(result.valid, false);
-  const d = result.diagnostics.find((x) => x.path === "review_harness.model");
-  assert.ok(d, `expected an error diagnostic for review_harness.model, got: ${JSON.stringify(result.diagnostics)}`);
-  assert.equal(d!.severity, "error");
-  assert.match(d!.message, /opus/);
+  assert.equal(result.valid, true);
+  const errors = result.diagnostics.filter((x) => x.path === "review_harness.model" && x.severity === "error");
+  assert.deepEqual(errors, [], "an explicit reviewer model alias must forward verbatim, not error");
 });
 
 test("validateConfig: models.review 'auto' + codex reviewer produces no diagnostic and exits valid", () => {

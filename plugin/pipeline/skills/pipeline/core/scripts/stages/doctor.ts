@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import type { PipelineConfig } from "../types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "../artifact-sanitize.ts";
 import { checkLoopContractCoherence } from "../loop-preflight.ts";
+import { resolveAdapter } from "../harness-adapters/index.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -392,27 +393,45 @@ export function buildPreflightChecks(
     },
   });
 
-  // 5. Harness availability — every distinct harness binary declared in config.
+  // 5. Harness availability — every distinct resolved-role harness (#608:
+  // implementer and reviewer, which may now name any registered adapter, not
+  // only claude/codex).
   //
-  // Built-in harnesses (claude, codex) are probed with --version, which validates
-  // both presence and basic invocability. Custom reviewer CLIs (review_harness, #40)
-  // only guarantee `<bin> "<prompt>"` as their contract — they are NOT required to
-  // support --version, and running them could invoke a model. For those we do a
-  // PATH-only check via `which` to stay model-free and avoid unintended execution.
-  const BUILT_IN_HARNESSES = new Set(["claude", "codex"]);
-  const harnessBins = [...new Set([config.harnesses.implementer, config.harnesses.reviewer])];
-  for (const bin of harnessBins) {
-    const isBuiltIn = BUILT_IN_HARNESSES.has(bin);
+  // A registered adapter (claude, codex, grok, opencode, pi) is checked with
+  // its own `preflight()`, which distinguishes missing-CLI from
+  // unauthenticated (e.g. `grok login`) — closing the pre-#608 gap where any
+  // non-built-in harness only got a PATH-only `which` probe. A custom
+  // reviewer CLI (review_harness, #40) has no registered adapter and no
+  // documented non-interactive login-state probe — it only guarantees
+  // `<bin> "<prompt>"` as its contract, and running it could invoke a model —
+  // so it keeps the PATH-only `which` check to stay model-free.
+  const harnessRoleBins = [...new Set([config.harnesses.implementer, config.harnesses.reviewer])];
+  for (const bin of harnessRoleBins) {
+    const adapter = resolveAdapter(bin);
     checks.push({
       id: `harness:${bin}`,
-      description: `Configured harness \`${bin}\` is installed and on PATH`,
-      run: async (deps) =>
-        (isBuiltIn ? await deps.execCheck(bin, ["--version"]) : await deps.execCheck("which", [bin]))
-          ? pass(`\`${bin}\` is available`)
-          : fail(
-              `configured harness \`${bin}\` was not found on PATH`,
-              `Install the \`${bin}\` CLI and ensure it is on your PATH — it is a configured pipeline harness for this profile.`,
-            ),
+      description: `Configured harness \`${bin}\` is installed and authenticated`,
+      run: async (deps) => {
+        if (!adapter) {
+          return (await deps.execCheck("which", [bin]))
+            ? pass(`\`${bin}\` is available`)
+            : fail(
+                `configured harness \`${bin}\` was not found on PATH`,
+                `Install the \`${bin}\` CLI and ensure it is on your PATH — it is a configured pipeline harness for this profile.`,
+              );
+        }
+        const result = await adapter.preflight(deps, {});
+        if (result.ok) {
+          return pass(`\`${bin}\` is available and authenticated`);
+        }
+        const remediation =
+          result.failure === "missing-cli"
+            ? `Install the \`${bin}\` CLI and ensure it is on your PATH — it is a configured pipeline harness for this profile.`
+            : result.failure === "unauthenticated"
+              ? `Authenticate the \`${bin}\` CLI — it is a configured pipeline harness for this profile.`
+              : `Resolve the \`${bin}\` CLI readiness issue — it is a configured pipeline harness for this profile.`;
+        return fail(result.message ?? `configured harness \`${bin}\` failed readiness preflight (${result.failure ?? "unknown"})`, remediation);
+      },
     });
   }
 

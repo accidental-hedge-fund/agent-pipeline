@@ -1047,6 +1047,28 @@ test("intake: realIntakeDeps defaults the model to DEFAULT_CONFIG.models.intake 
   }
 });
 
+// ---- #608: realIntakeDeps routes through the resolved implementer, not a
+// hard-coded "claude" ----
+
+test("intake: realIntakeDeps.runHarness targets the resolved implementer (grok) when configured, never claude", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "intake-wt-"));
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "intake-grok-"));
+  // A fake `grok` that proves it was invoked (`--no-auto-update ... --prompt-file <path>`)
+  // by echoing the prompt file's content — the same shape harness.test.ts uses.
+  const cli = path.join(binDir, "grok");
+  fs.writeFileSync(cli, `#!/usr/bin/env bash\ncat "$3"\n`);
+  fs.chmodSync(cli, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const result = await realIntakeDeps(tmp, "grok-4.5", undefined, "grok").runHarness("GROK-INTAKE-PROMPT");
+    assert.equal(result.success, true);
+    assert.equal(result.output, "GROK-INTAKE-PROMPT", "the grok adapter, not claude, must have received the prompt");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Label create-only: never clobber existing label metadata (#158 review-2)
 // ---------------------------------------------------------------------------

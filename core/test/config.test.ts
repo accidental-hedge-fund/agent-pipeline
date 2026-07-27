@@ -58,7 +58,7 @@ test("resolveConfig: defaults apply when no .github/pipeline.yml exists", async 
     assert.equal(cfg.base_branch, DEFAULT_CONFIG.base_branch);
     assert.equal(cfg.worktree_root, DEFAULT_CONFIG.worktree_root);
     assert.equal(cfg.max_concurrent_worktrees, DEFAULT_CONFIG.max_concurrent_worktrees);
-    assert.deepEqual(cfg.harnesses, { implementer: "codex", reviewer: "claude", reviewerModel: undefined, reviewerModelWasAuto: false, reviewerEffort: undefined, reviewerPromptDelivery: "argv" });
+    assert.deepEqual(cfg.harnesses, { implementer: "codex", reviewer: "claude", reviewerModel: undefined, reviewerModelWasAuto: false, reviewerEffort: undefined, reviewerPromptDelivery: "argv", implementerSource: "profile", reviewerSource: "profile" });
     assert.deepEqual(cfg.steps, { plan_review: true, standard_review: true, adversarial_review: true, docs: true });
   } finally {
     process.env.PATH = oldPath;
@@ -91,9 +91,26 @@ models:
 
 // ---- dead-surface keys removed in #93: strict schema rejects them outright ----
 
-test("resolveConfig: a harnesses block is rejected with an error naming the key", async () => {
+test("resolveConfig: a harnesses block with both roles resolves under any profile (#608)", async () => {
   const repo = makeFakeRepo(`harnesses:\n  implementer: claude\n  reviewer: codex\n`);
   const binDir = makeFakeGh("acme/dead1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "codex" });
+    assert.equal(cfg.harnesses.implementer, "claude");
+    assert.equal(cfg.harnesses.reviewer, "codex");
+    assert.equal(cfg.harnesses.implementerSource, "repo-config");
+    assert.equal(cfg.harnesses.reviewerSource, "repo-config");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: an unknown key inside harnesses is rejected naming the key (#608)", async () => {
+  const repo = makeFakeRepo(`harnesses:\n  implementr: claude\n`);
+  const binDir = makeFakeGh("acme/dead1b");
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
   try {
@@ -101,8 +118,127 @@ test("resolveConfig: a harnesses block is rejected with an error naming the key"
     assert.throws(
       () => cfgMod.resolveConfig({ repoPath: repo }),
       (err: Error) =>
-        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("harnesses"),
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("implementr"),
     );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: an empty harnesses.implementer value is rejected at parse time before any stage runs (#608 review-2 finding 78a08490)", async () => {
+  const repo = makeFakeRepo(`harnesses:\n  implementer: ""\n`);
+  const binDir = makeFakeGh("acme/dead1d");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) => /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("harnesses.implementer"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: an empty harnesses.reviewer value is rejected at parse time rather than reaching a stage invocation as a custom CLI (#608 review-2 finding 78a08490)", async () => {
+  const repo = makeFakeRepo(`harnesses:\n  reviewer: ""\n`);
+  const binDir = makeFakeGh("acme/dead1e");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) => /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("harnesses.reviewer"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: an implementer naming no registered adapter is rejected naming the key, value, and registry (#608)", async () => {
+  const repo = makeFakeRepo(`harnesses:\n  implementer: grock\n`);
+  const binDir = makeFakeGh("acme/dead1c");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        err.message.includes("harnesses.implementer") && err.message.includes("grock") && err.message.includes("claude"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: a partial harnesses block sets only implementer, reviewer falls back to the profile", async () => {
+  const repo = makeFakeRepo(`harnesses:\n  implementer: grok\n`);
+  const binDir = makeFakeGh("acme/dead1d");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "codex" });
+    assert.equal(cfg.harnesses.implementer, "grok");
+    assert.equal(cfg.harnesses.implementerSource, "repo-config");
+    assert.equal(cfg.harnesses.reviewer, "claude", "reviewer falls back to the codex profile's default");
+    assert.equal(cfg.harnesses.reviewerSource, "profile");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: conflicting harnesses.reviewer and review_harness are rejected naming both keys and values", async () => {
+  const repo = makeFakeRepo(`harnesses:\n  reviewer: codex\nreview_harness: claude\n`);
+  const binDir = makeFakeGh("acme/dead1e");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        err.message.includes("harnesses.reviewer") &&
+        err.message.includes("review_harness") &&
+        err.message.includes("codex") &&
+        err.message.includes("claude"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: agreeing harnesses.reviewer and structured review_harness keep the structured model/effort", async () => {
+  const repo = makeFakeRepo(
+    `harnesses:\n  reviewer: codex\nreview_harness:\n  command: codex\n  model: gpt-5.6-terra\n  effort: high\n`,
+  );
+  const binDir = makeFakeGh("acme/dead1f");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harnesses.reviewer, "codex");
+    assert.equal(cfg.harnesses.reviewerModel, "gpt-5.6-terra");
+    assert.equal(cfg.harnesses.reviewerEffort, "high");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: grok implementer + models.implementing:auto never resolves to sonnet or gpt-5.5 (#608)", async () => {
+  const repo = makeFakeRepo(`harnesses:\n  implementer: grok\nmodels:\n  implementing: auto\n`);
+  const binDir = makeFakeGh("acme/grok1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.notEqual(cfg.models.implementing, "sonnet");
+    assert.notEqual(cfg.models.implementing, "gpt-5.5");
   } finally {
     process.env.PATH = oldPath;
   }
@@ -687,50 +823,44 @@ test("resolveConfig: a non-string review_harness is rejected (strict schema)", a
   }
 });
 
-// ---- reviewer-model alias guard (#454) ----
+// ---- reviewer-model alias guard (#454, superseded by #608) ----
 //
 // Before v1.15.2, a Claude-only `models.review`/`review_harness.model` alias
 // against a codex reviewer was documented as inert. #441 made the reviewer
-// alias load-bearing (passed through to `codex exec -m <model>`), so that
-// same pre-existing config now 400s mid-run instead of silently no-op'ing.
-// These regressions move the rejection to config-parse time.
+// alias load-bearing (passed through to `codex exec -m <model>`), and a
+// config-parse-time hard error was briefly added to reject it. #608's spec
+// (configurable-review-harness) supersedes that: an explicit (non-"auto")
+// reviewer model now SHALL be forwarded verbatim to the reviewer command
+// regardless of harness, so the reviewer CLI itself can surface its own
+// invalid-model error — matching `resolveReviewerModelForHarness` in
+// stage-routing.ts, which already forwards explicit aliases verbatim.
 
-test("resolveConfig: models.review set to a Claude alias + reviewer=codex throws at parse time, naming key/value/harness/alternatives (#454)", async () => {
+test("resolveConfig: models.review set to a Claude alias + reviewer=codex forwards it verbatim, no throw (#454, #608)", async () => {
   const repo = makeFakeRepo(`models:\n  review: sonnet\n`);
   const binDir = makeFakeGh("acme/alias-guard1");
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
   try {
     const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
-    assert.throws(
-      // claude profile → reviewer=codex
-      () => cfgMod.resolveConfig({ repoPath: repo, profile: "claude" }),
-      (err: Error) =>
-        /Invalid .*pipeline\.yml/.test(err.message) &&
-        err.message.includes("models.review") &&
-        err.message.includes("sonnet") &&
-        err.message.includes("codex") &&
-        err.message.includes("auto"),
-    );
+    // claude profile → reviewer=codex
+    const cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
+    assert.equal(cfg.harnesses.reviewer, "codex");
+    assert.equal(cfg.models.review, "sonnet");
   } finally {
     process.env.PATH = oldPath;
   }
 });
 
-test("resolveConfig: review_harness.model set to a Claude alias + command=codex throws at parse time, naming review_harness.model (#454)", async () => {
+test("resolveConfig: review_harness.model set to a Claude alias + command=codex forwards it verbatim via reviewerModel, no throw (#454, #608)", async () => {
   const repo = makeFakeRepo(`review_harness:\n  command: codex\n  model: opus\n`);
   const binDir = makeFakeGh("acme/alias-guard2");
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
   try {
     const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
-    assert.throws(
-      () => cfgMod.resolveConfig({ repoPath: repo }),
-      (err: Error) =>
-        /Invalid .*pipeline\.yml/.test(err.message) &&
-        err.message.includes("review_harness.model") &&
-        err.message.includes("opus"),
-    );
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.harnesses.reviewer, "codex");
+    assert.equal(cfg.harnesses.reviewerModel, "opus");
   } finally {
     process.env.PATH = oldPath;
   }
@@ -775,44 +905,6 @@ test("resolveConfig: models.review set to a Claude alias + reviewer=claude resol
     const cfg = cfgMod.resolveConfig({ repoPath: repo });
     assert.equal(cfg.harnesses.reviewer, "claude");
     assert.equal(cfg.models.review, "sonnet");
-  } finally {
-    process.env.PATH = oldPath;
-  }
-});
-
-test("resolveConfig: tolerateInvalidConfig warns and falls back to the default reviewer model instead of throwing (#454)", async () => {
-  const repo = makeFakeRepo(`models:\n  review: sonnet\n`);
-  const binDir = makeFakeGh("acme/alias-guard6");
-  const oldPath = process.env.PATH;
-  process.env.PATH = `${binDir}:${oldPath}`;
-  try {
-    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
-    let cfg: any;
-    const warnings = await captureWarnings(() => {
-      // claude profile → reviewer=codex
-      cfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude", tolerateInvalidConfig: true });
-    });
-    assert.equal(cfg.harnesses.reviewer, "codex");
-    assert.notEqual(cfg.models.review, "sonnet");
-    const hit = warnings.find((w) => w.includes("models.review"));
-    assert.ok(hit, `expected a warning naming models.review, got: ${JSON.stringify(warnings)}`);
-    assert.match(hit!, /sonnet/);
-  } finally {
-    process.env.PATH = oldPath;
-  }
-});
-
-test("resolveConfig: tolerateInvalidConfig + quiet emits no warning for a rejected reviewer alias (#454)", async () => {
-  const repo = makeFakeRepo(`models:\n  review: sonnet\n`);
-  const binDir = makeFakeGh("acme/alias-guard7");
-  const oldPath = process.env.PATH;
-  process.env.PATH = `${binDir}:${oldPath}`;
-  try {
-    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
-    const warnings = await captureWarnings(() => {
-      cfgMod.resolveConfig({ repoPath: repo, profile: "claude", tolerateInvalidConfig: true, quiet: true });
-    });
-    assert.deepEqual(warnings, []);
   } finally {
     process.env.PATH = oldPath;
   }
@@ -880,7 +972,7 @@ test("resolveConfig: models.review set + custom reviewer CLI warns it is inert",
   }
 });
 
-test("resolveConfig: models.planning set + implementer=codex warns it is inert", async () => {
+test("resolveConfig: models.planning set + implementer=codex does NOT warn (#608 — codex declares model capability)", async () => {
   const repo = makeFakeRepo(`models:\n  planning: sonnet\n`);
   const binDir = makeFakeGh("acme/im2");
   const oldPath = process.env.PATH;
@@ -888,20 +980,19 @@ test("resolveConfig: models.planning set + implementer=codex warns it is inert",
   try {
     const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
     const warnings = await captureWarnings(() => {
-      // codex profile (default) → implementer=codex
+      // codex profile (default) → implementer=codex, which honors --model (#431).
+      // This is the corrected false positive: codex's adapter declares model
+      // capability, so no inert-alias warning fires.
       cfgMod.resolveConfig({ repoPath: repo });
     });
     const hit = warnings.find((w) => w.includes("models.planning"));
-    assert.ok(hit, `expected a warning for models.planning, got: ${JSON.stringify(warnings)}`);
-    assert.match(hit!, /sonnet/);
-    assert.match(hit!, /codex/);
-    assert.match(hit!, /ignored/);
+    assert.equal(hit, undefined, `expected no warning for models.planning, got: ${JSON.stringify(warnings)}`);
   } finally {
     process.env.PATH = oldPath;
   }
 });
 
-test("resolveConfig: models.fix set + implementer=codex warns it is inert", async () => {
+test("resolveConfig: models.fix set + implementer=codex does NOT warn (#608 — codex declares model capability)", async () => {
   const repo = makeFakeRepo(`models:\n  fix: haiku\n`);
   const binDir = makeFakeGh("acme/im3");
   const oldPath = process.env.PATH;
@@ -912,9 +1003,7 @@ test("resolveConfig: models.fix set + implementer=codex warns it is inert", asyn
       cfgMod.resolveConfig({ repoPath: repo });
     });
     const hit = warnings.find((w) => w.includes("models.fix"));
-    assert.ok(hit, `expected a warning for models.fix, got: ${JSON.stringify(warnings)}`);
-    assert.match(hit!, /haiku/);
-    assert.match(hit!, /ignored/);
+    assert.equal(hit, undefined, `expected no warning for models.fix, got: ${JSON.stringify(warnings)}`);
   } finally {
     process.env.PATH = oldPath;
   }
@@ -1002,9 +1091,10 @@ test("resolveConfig: partial models block (review only) warns per-key, not for a
 });
 
 test("resolveConfig: inert warning is non-blocking — config unchanged, alias preserved", async () => {
-  // codex profile, models.planning inert (implementer=codex). The warning must
-  // not throw or mutate the resolved config: the alias stays in cfg.models.
-  const repo = makeFakeRepo(`models:\n  planning: haiku\n`);
+  // A custom (unregistered) reviewer CLI declares no model capability (#608),
+  // so models.review is genuinely inert here. The warning must not throw or
+  // mutate the resolved config: the alias stays in cfg.models.
+  const repo = makeFakeRepo(`review_harness: my-reviewer\nmodels:\n  review: haiku\n`);
   const binDir = makeFakeGh("acme/im8");
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
@@ -1014,10 +1104,10 @@ test("resolveConfig: inert warning is non-blocking — config unchanged, alias p
     const warnings = await captureWarnings(() => {
       cfg = cfgMod.resolveConfig({ repoPath: repo });
     });
-    assert.ok(warnings.some((w) => w.includes("models.planning")));
+    assert.ok(warnings.some((w) => w.includes("models.review")));
     // Alias preserved despite being inert; siblings keep defaults.
-    assert.equal(cfg.models.planning, "haiku");
-    assert.equal(cfg.models.review, DEFAULT_CONFIG.models.review);
+    assert.equal(cfg.models.review, "haiku");
+    assert.equal(cfg.models.planning, DEFAULT_CONFIG.models.planning);
     assert.equal(cfg.models.fix, DEFAULT_CONFIG.models.fix);
   } finally {
     process.env.PATH = oldPath;
@@ -1126,7 +1216,7 @@ test("resolveConfig: a models block omitting implementing keeps the default + no
   }
 });
 
-test("resolveConfig: models.implementing set + implementer=codex warns it is inert (#70)", async () => {
+test("resolveConfig: models.implementing set + implementer=codex does NOT warn (#70, #608 — codex declares model capability)", async () => {
   const repo = makeFakeRepo(`models:\n  implementing: haiku\n`);
   const binDir = makeFakeGh("acme/impl-slot4");
   const oldPath = process.env.PATH;
@@ -1139,11 +1229,7 @@ test("resolveConfig: models.implementing set + implementer=codex warns it is ine
       cfg = cfgMod.resolveConfig({ repoPath: repo });
     });
     const hit = warnings.find((w) => w.includes("models.implementing"));
-    assert.ok(hit, `expected a warning for models.implementing, got: ${JSON.stringify(warnings)}`);
-    assert.match(hit!, /haiku/);
-    assert.match(hit!, /codex/);
-    assert.match(hit!, /ignored/);
-    // Non-blocking: the inert alias is still preserved in the resolved config.
+    assert.equal(hit, undefined, `expected no warning for models.implementing, got: ${JSON.stringify(warnings)}`);
     assert.equal(cfg.models.implementing, "haiku");
   } finally {
     process.env.PATH = oldPath;
@@ -2366,10 +2452,10 @@ test("resolveLoopNativeGoalAttestation: defaults to 'auto' when absent, parses a
 
 // #154 regression: `doctor --is-ok` is a zero-output 0/1 polling gate, but config
 // resolution runs first and can emit non-fatal warnings (e.g. an inert models.*
-// alias under the default codex implementer). resolveConfig({ quiet: true }) must
+// alias against a custom reviewer CLI). resolveConfig({ quiet: true }) must
 // suppress those warnings so the gate stays silent.
 test("resolveConfig: quiet suppresses inert-model-alias config warnings (#154)", async () => {
-  const repo = makeFakeRepo("models:\n  planning: sonnet\n");
+  const repo = makeFakeRepo("review_harness: my-reviewer\nmodels:\n  review: sonnet\n");
   const binDir = makeFakeGh("acme/widget");
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
@@ -2378,12 +2464,13 @@ test("resolveConfig: quiet suppresses inert-model-alias config warnings (#154)",
   console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
   try {
     const { resolveConfig } = await import("../scripts/config.ts");
-    // Default profile → implementer is codex, so models.planning is an inert alias
-    // that normally warns. Without quiet the warning fires (proves the bite)…
+    // A custom reviewer CLI declares no model capability (#608), so
+    // models.review is an inert alias that normally warns. Without quiet the
+    // warning fires (proves the bite)…
     warnings.length = 0;
     resolveConfig({ repoPath: repo });
     assert.ok(
-      warnings.some((w) => w.includes("models.planning")),
+      warnings.some((w) => w.includes("models.review")),
       `expected an inert-alias warning without quiet; got: ${JSON.stringify(warnings)}`,
     );
     // …with quiet:true (the doctor --is-ok path), no warning may reach stderr.
@@ -3301,18 +3388,19 @@ test("resolveConfig: effort.implementing 'auto' resolves to low regardless of ha
   }
 });
 
-test("resolveConfig: models.review 'auto' resolves to claude-fable-5 under both profiles (profile-independent) and never the short alias", async () => {
+test("resolveConfig: models.review 'auto' resolves to claude-fable-5 for a claude reviewer, but a codex reviewer cannot run that claude-only alias so it resolves no model (#608 review-2 finding 465f9695)", async () => {
   const repo = makeFakeRepo(`models:\n  review: auto\n`);
   const binDir = makeFakeGh("acme/auto4");
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
   try {
     const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    // claude profile → reviewer=codex; codex profile → reviewer=claude
     const claudeCfg = cfgMod.resolveConfig({ repoPath: repo, profile: "claude" });
     const codexCfg = cfgMod.resolveConfig({ repoPath: repo, profile: "codex" });
-    assert.equal(claudeCfg.models.review, "claude-fable-5");
+    assert.equal(claudeCfg.models.review, "", "codex reviewer cannot run the claude-only auto alias");
     assert.equal(codexCfg.models.review, "claude-fable-5");
-    assert.notEqual(claudeCfg.models.review, "fable-5");
+    assert.notEqual(codexCfg.models.review, "fable-5");
   } finally {
     process.env.PATH = oldPath;
   }

@@ -1094,6 +1094,26 @@ test("sweep: realSweepDeps defaults the model to DEFAULT_CONFIG.models.sweep whe
   }
 });
 
+// ---- #608: realSweepDeps routes through the resolved implementer, not a
+// hard-coded "claude" ----
+
+test("sweep: realSweepDeps.runHarness targets the resolved implementer (grok) when configured, never claude", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-wt-"));
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-grok-"));
+  const cli = path.join(binDir, "grok");
+  fs.writeFileSync(cli, `#!/usr/bin/env bash\ncat "$3"\n`);
+  fs.chmodSync(cli, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const result = await realSweepDeps(tmp, "grok-4.5", undefined, "grok").runHarness("GROK-SWEEP-PROMPT");
+    assert.equal(result.success, true);
+    assert.equal(result.output, "GROK-SWEEP-PROMPT", "the grok adapter, not claude, must have received the prompt");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // sweep_timeout forwarding (#248)
 // ---------------------------------------------------------------------------

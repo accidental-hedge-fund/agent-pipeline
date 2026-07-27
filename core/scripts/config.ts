@@ -16,12 +16,14 @@ import {
   MODEL_ENDPOINT_RESERVED_HEADERS,
   DESIGN_GATE_TRIGGER_CLASSES,
   type Harness,
+  type HarnessRoleSource,
   type PipelineConfig,
   type ModelEndpointDialect,
   type ModelEndpointParams,
 } from "./types.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
 import { expandAutoEffort, expandAutoModel, isClaudeOnlyModelAlias } from "./stage-routing.ts";
+import { resolveAdapter, registeredAdapterNames } from "./harness-adapters/index.ts";
 
 // A `models.*`/`effort.*` value: an arbitrary alias/effort string, or the
 // "auto" sentinel (#366) resolved via stage-routing.ts at config-load time.
@@ -229,6 +231,21 @@ const PartialConfigSchema = z.object({
   ci_poll_interval: z.number().int().positive().optional().describe("Seconds between CI status polls."),
   ci_no_run_grace_s: z.number().int().min(0).optional().describe("Seconds to wait before checking for zero check-runs when CI is pending. Default 60; set to 0 to check immediately."),
   ci_mode: z.enum(["github", "local"]).optional().describe("Source of pre-merge CI verification: github (default) waits on gh pr checks; local relies on the current run's local test-gate result and skips the GitHub Actions wait."),
+  // Repository-configurable primary/secondary harness roles (#608). Both keys
+  // are optional and independently fall back to the active profile's default
+  // when omitted — a repo can pin one role without the other. `implementer`
+  // must name a registered harness adapter (validated in resolveConfig, not
+  // here, since the registry is a runtime lookup); `reviewer` may additionally
+  // name an arbitrary custom reviewer CLI, same as `review_harness`. Strict so
+  // a typo'd key (e.g. `reviewr`) is rejected rather than silently ignored.
+  harnesses: z
+    .object({
+      implementer: z.string().min(1, "harnesses.implementer must not be empty").optional().describe("Primary harness that performs planning, implementation, and fixes. Must name a registered harness adapter (claude, codex, grok, opencode, pi). Falls back to the active profile's implementer when omitted."),
+      reviewer: z.string().min(1, "harnesses.reviewer must not be empty").optional().describe("Secondary harness that performs review. May name a registered adapter or an arbitrary custom reviewer CLI. Falls back to the active profile's reviewer (or review_harness, when set) when omitted."),
+    })
+    .strict()
+    .optional()
+    .describe("Repository-declared primary (implementer) and secondary (reviewer) harness roles. Either key may be omitted to keep the profile default for that role."),
   // Each alias is independently optional so a partial `models:` block (e.g.
   // only `review:`) is valid — resolveConfig fills the rest from DEFAULT_CONFIG
   // and the inert-alias warning keys off which sub-keys were explicitly set.
@@ -238,12 +255,12 @@ const PartialConfigSchema = z.object({
       implementing: modelOrAuto.optional().describe("Model alias for the implementing phase (implementer harness), or \"auto\"."),
       review: modelOrAuto.optional().describe("Model alias for the review phase (reviewer harness), or \"auto\"."),
       fix: modelOrAuto.optional().describe("Model alias for the fix phase (implementer harness), or \"auto\"."),
-      intake: modelOrAuto.optional().describe("Model alias for the intake spec-generation step (always the claude harness, regardless of profile — never inert), or \"auto\"."),
-      sweep: modelOrAuto.optional().describe("Model alias for the sweep spec-generation step (always the claude harness, regardless of profile — never inert), or \"auto\"."),
+      intake: modelOrAuto.optional().describe("Model alias for the intake spec-generation step (implementer harness), or \"auto\"."),
+      sweep: modelOrAuto.optional().describe("Model alias for the sweep spec-generation step (implementer harness), or \"auto\"."),
     })
     .strict()
     .optional()
-    .describe("Per-phase model aliases. review is honored by both the claude and codex reviewer harnesses; planning/implementing/fix are honored only by the claude implementer harness (codex ignores them). Each key also accepts \"auto\" (#366)."),
+    .describe("Per-phase model aliases. review is honored by the resolved reviewer harness when its adapter supports model selection; planning/implementing/fix/intake/sweep are honored by the resolved implementer harness under the same condition. Each key also accepts \"auto\" (#366)."),
   // Per-stage reasoning-effort overrides (#366), parallel to `models`. Each key
   // is independently optional; an absent key emits no effort flag so the
   // operator's global effort setting applies. Also accepts "auto".
@@ -253,12 +270,12 @@ const PartialConfigSchema = z.object({
       implementing: modelOrAuto.optional().describe("Reasoning effort for the implementing phase (implementer harness), or \"auto\"."),
       review: modelOrAuto.optional().describe("Reasoning effort for the review phase (reviewer harness), or \"auto\". Resolved round-aware (review-1 vs. review-2)."),
       fix: modelOrAuto.optional().describe("Reasoning effort for the fix phase (implementer harness), or \"auto\"."),
-      intake: modelOrAuto.optional().describe("Reasoning effort for the intake spec-generation step (always the claude harness), or \"auto\"."),
-      sweep: modelOrAuto.optional().describe("Reasoning effort for the sweep spec-generation step (always the claude harness), or \"auto\"."),
+      intake: modelOrAuto.optional().describe("Reasoning effort for the intake spec-generation step (implementer harness), or \"auto\"."),
+      sweep: modelOrAuto.optional().describe("Reasoning effort for the sweep spec-generation step (implementer harness), or \"auto\"."),
     })
     .strict()
     .optional()
-    .describe("Per-phase reasoning-effort overrides: codex via -c model_reasoning_effort, claude via --effort (#366)."),
+    .describe("Per-phase reasoning-effort overrides, honored by any resolved role harness whose adapter declares effort capability (#366, #608)."),
   openspec: z
     .object({
       enabled: z.enum(["auto", "on", "off"]).optional().describe("Whether to require OpenSpec: auto=only when openspec/ exists, on=always, off=never."),
@@ -474,9 +491,10 @@ const PartialConfigSchema = z.object({
   // step invokes this CLI instead of the profile's default reviewer. An arbitrary
   // string (not an enum) because a custom reviewer CLI name is unconstrained;
   // whether it actually exists is a runtime check (like test_gate/eval_gate
-  // `command`). The implementer harness remains profile-only — there is no
-  // companion `implementer`/`harnesses` key, and the deleted `harnesses:` block
-  // stays rejected by the strict schema.
+  // `command`). The `harnesses.reviewer` key (#608) is an equivalent, more
+  // discoverable way to declare the same override; the two must agree when
+  // both are set (see `resolveHarnessRoles`) — see also `harnesses.implementer`
+  // for the primary role, which review_harness never touches.
   // Structured form (#366) adds independent model/effort control for the
   // alternative reviewer harness, alongside the original string shorthand.
   // The string form leaves reviewerModel/reviewerEffort unset so review
@@ -691,6 +709,74 @@ function validateStageExecutorAssignments(fileConfig: PartialConfig): void {
   }
 }
 
+export interface ResolvedHarnessRoles {
+  implementer: string;
+  reviewer: string;
+  implementerSource: HarnessRoleSource;
+  reviewerSource: HarnessRoleSource;
+}
+
+/**
+ * Resolve the implementer/reviewer harness roles (#608): the repository's
+ * strict `harnesses:` block wins per-role over the active profile, and
+ * `review_harness` may additionally supply the reviewer (agreeing with
+ * `harnesses.reviewer` when both are set). Disagreement between
+ * `harnesses.reviewer` and `review_harness` is a config bug the operator must
+ * see, not a silent precedence pick — see design.md decision 3 of
+ * `repo-configurable-harness-roles`.
+ */
+function resolveHarnessRoles(
+  fileConfig: Pick<PartialConfig, "harnesses" | "review_harness">,
+  profileHarnesses: { implementer: string; reviewer: string },
+): ResolvedHarnessRoles {
+  const repoImplementer = fileConfig.harnesses?.implementer;
+  const repoReviewer = fileConfig.harnesses?.reviewer;
+  const reviewHarnessCfg = fileConfig.review_harness;
+  const reviewHarnessCommand = typeof reviewHarnessCfg === "string" ? reviewHarnessCfg : reviewHarnessCfg?.command;
+
+  let reviewer: string;
+  let reviewerSource: HarnessRoleSource;
+  if (repoReviewer !== undefined && reviewHarnessCommand !== undefined) {
+    if (repoReviewer !== reviewHarnessCommand) {
+      throw new Error(
+        `harnesses.reviewer ("${repoReviewer}") and review_harness ("${reviewHarnessCommand}") name different reviewer commands. Set them to the same command, or configure only one.`,
+      );
+    }
+    reviewer = repoReviewer;
+    reviewerSource = "repo-config";
+  } else if (repoReviewer !== undefined) {
+    reviewer = repoReviewer;
+    reviewerSource = "repo-config";
+  } else if (reviewHarnessCommand !== undefined) {
+    reviewer = reviewHarnessCommand;
+    reviewerSource = "review_harness";
+  } else {
+    reviewer = profileHarnesses.reviewer;
+    reviewerSource = "profile";
+  }
+
+  const implementer = repoImplementer ?? profileHarnesses.implementer;
+  const implementerSource: HarnessRoleSource = repoImplementer !== undefined ? "repo-config" : "profile";
+
+  return { implementer, reviewer, implementerSource, reviewerSource };
+}
+
+/**
+ * The implementer role has no custom-CLI escape hatch (unlike the reviewer,
+ * which may name an arbitrary command via `review_harness`/`harnesses.reviewer`)
+ * — it must always resolve to a registered harness adapter. Validated here,
+ * at config-resolve time, rather than left to fail at first spawn, so a typo
+ * (`harnesses: { implementer: grock }`) is reported before a worktree is
+ * created and names the offending key, value, and the registered names.
+ */
+function validateImplementerHarness(implementer: string, source: HarnessRoleSource): void {
+  if (resolveAdapter(implementer) !== null) return;
+  const key = source === "repo-config" ? "harnesses.implementer" : "profile.harnesses.implementer";
+  throw new Error(
+    `${key} names "${implementer}", which has no registered harness adapter. Registered adapters: ${registeredAdapterNames().join(", ")}.`,
+  );
+}
+
 export interface ResolveOptions {
   repoPath?: string;        // path to the target repo's working tree
   domainOverride?: string;  // --domain X (used as the "domain" name in logs)
@@ -810,41 +896,32 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       }
     : undefined;
 
-  // Reviewer-model alias guard (#454): a Claude-only reviewer model alias
-  // (`models.review` or `review_harness.model`) against a codex reviewer must
-  // be rejected here, at config-parse time — #441 made the reviewer alias
-  // load-bearing (passed through to `codex exec -m <model>`), so a config that
-  // pre-#441 harmlessly carried a Claude alias against codex (previously
-  // inert) now 400s mid-run instead. Runs before the review_harness
-  // destructuring below so a tolerated violation is stripped from fileConfig
-  // before it's read into reviewerCommand/reviewerModelRaw.
-  {
-    const reviewHarnessCfgForGuard = fileConfig.review_harness;
-    const reviewerCommandForGuard =
-      typeof reviewHarnessCfgForGuard === "string" ? reviewHarnessCfgForGuard : reviewHarnessCfgForGuard?.command;
-    const effectiveReviewerHarness = reviewerCommandForGuard ?? profile.harnesses.reviewer;
-    const violation = findReviewerModelAliasViolation(fileConfig, effectiveReviewerHarness);
-    if (violation) {
-      const message = reviewerModelAliasErrorMessage(violation.path, violation.value, effectiveReviewerHarness);
-      if (opts.tolerateInvalidConfig) {
-        if (!opts.quiet) {
-          console.warn(
-            `[pipeline] init: ${configPath} has validation errors — using defaults. Fix the file to apply custom settings.\n  ${message}`,
-          );
-        }
-        fileConfig =
-          violation.path === "models.review"
-            ? { ...fileConfig, models: { ...fileConfig.models, review: undefined } }
-            : {
-                ...fileConfig,
-                review_harness:
-                  typeof fileConfig.review_harness === "object"
-                    ? { ...fileConfig.review_harness, model: undefined }
-                    : fileConfig.review_harness,
-              };
-      } else {
-        throw new Error(`Invalid ${configPath}: ${message}`);
+  // Harness role resolution (#608): repo `harnesses:` block wins per-role over
+  // the active profile; `review_harness` may additionally supply the reviewer
+  // (agreeing with `harnesses.reviewer` when both are set). A conflicting
+  // reviewer declaration or an implementer naming no registered adapter fails
+  // here, at config-resolve time, same as every other structural config error
+  // in this function — tolerated (warn + fall back to the profile pair) only
+  // when the caller opted into tolerateInvalidConfig.
+  let resolvedRoles: ResolvedHarnessRoles;
+  try {
+    resolvedRoles = resolveHarnessRoles(fileConfig, profile.harnesses);
+    validateImplementerHarness(resolvedRoles.implementer, resolvedRoles.implementerSource);
+  } catch (err) {
+    if (opts.tolerateInvalidConfig) {
+      if (!opts.quiet) {
+        console.warn(
+          `[pipeline] init: ${configPath} has validation errors — using defaults. Fix the file to apply custom settings.\n  ${(err as Error).message}`,
+        );
       }
+      resolvedRoles = {
+        implementer: profile.harnesses.implementer,
+        reviewer: profile.harnesses.reviewer,
+        implementerSource: "profile",
+        reviewerSource: "profile",
+      };
+    } else {
+      throw new Error(`Invalid ${configPath}: ${(err as Error).message}`);
     }
   }
 
@@ -853,13 +930,13 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
   // own model/effort. The string form leaves reviewerModel/reviewerEffort
   // unset, so review-routing/plan-review fall back to models.review/effort.review.
   const reviewHarnessCfg = fileConfig.review_harness;
-  const reviewerCommand = typeof reviewHarnessCfg === "string" ? reviewHarnessCfg : reviewHarnessCfg?.command;
   const reviewerModelRaw = typeof reviewHarnessCfg === "object" ? reviewHarnessCfg.model : undefined;
   const reviewerEffortRaw = typeof reviewHarnessCfg === "object" ? reviewHarnessCfg.effort : undefined;
   // #492: defaults to "argv" — the pre-#492 `<cmd> <prompt>` positional shape.
   const reviewerPromptDelivery =
     typeof reviewHarnessCfg === "object" ? (reviewHarnessCfg.prompt_delivery ?? "argv") : "argv";
-  const implementerHarness = profile.harnesses.implementer;
+  const implementerHarness = resolvedRoles.implementer;
+  const reviewerHarness = resolvedRoles.reviewer;
 
   const merged: PipelineConfig = {
     profile_name: profile.name,
@@ -888,26 +965,30 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     ci_poll_interval: fileConfig.ci_poll_interval ?? DEFAULT_CONFIG.ci_poll_interval,
     ci_no_run_grace_s: fileConfig.ci_no_run_grace_s ?? DEFAULT_CONFIG.ci_no_run_grace_s,
     ci_mode: fileConfig.ci_mode ?? DEFAULT_CONFIG.ci_mode,
-    // Harness roles are profile-relative; the implementer can never be set by
-    // repo config (the strict schema rejects a `harnesses:` key outright). The
-    // reviewer defaults to the profile's value but is overridden here by the
-    // optional `review_harness` key (#40) when present, so all stage code can
-    // keep reading only `cfg.harnesses.reviewer`. reviewerModel is fully
-    // resolved (Adversarial `auto` is model-invariant across rounds);
-    // reviewerEffort is left as-authored (possibly "auto") since its
-    // resolution is round-aware and happens at each reviewer call site.
+    // Harness roles are resolved per-role (#608): the repository's
+    // `harnesses:` block wins over the active profile for each of
+    // implementer/reviewer independently; `review_harness` may additionally
+    // supply the reviewer. `resolvedRoles` above already folds in that
+    // precedence (and rejects a conflicting `review_harness`/
+    // `harnesses.reviewer` pair), so every stage keeps reading only
+    // `cfg.harnesses.{implementer,reviewer}` with no profile awareness.
+    // reviewerModel is fully resolved (Adversarial `auto` is model-invariant
+    // across rounds); reviewerEffort is left as-authored (possibly "auto")
+    // since its resolution is round-aware and happens at each reviewer call site.
     harnesses: {
       implementer: implementerHarness,
-      reviewer: reviewerCommand ?? profile.harnesses.reviewer,
-      reviewerModel: expandAutoModel(reviewerModelRaw, "review-2", "claude"),
+      reviewer: reviewerHarness,
+      reviewerModel: expandAutoModel(reviewerModelRaw, "review-2", reviewerHarness),
       reviewerModelWasAuto: reviewerModelRaw === "auto",
       reviewerEffort: reviewerEffortRaw,
       reviewerPromptDelivery,
+      implementerSource: resolvedRoles.implementerSource,
+      reviewerSource: resolvedRoles.reviewerSource,
     },
     models: {
       planning: expandAutoModel(fileConfig.models?.planning, "planning", implementerHarness) ?? DEFAULT_CONFIG.models.planning,
       implementing: expandAutoModel(fileConfig.models?.implementing, "implementing", implementerHarness) ?? DEFAULT_CONFIG.models.implementing,
-      review: expandAutoModel(fileConfig.models?.review, "review-2", "claude") ?? DEFAULT_CONFIG.models.review,
+      review: expandAutoModel(fileConfig.models?.review, "review-2", reviewerHarness) ?? DEFAULT_CONFIG.models.review,
       // Undefined (no `models.review` in file config) resolves to the same
       // claude-fable-5 default as an explicit `"auto"`, and must be treated
       // identically by the reviewer-model guard (#441 finding 3e79bbb5):
@@ -915,8 +996,8 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       // fall back to its own default rather than receive a claude-only alias.
       reviewWasAuto: fileConfig.models?.review === "auto" || fileConfig.models?.review === undefined,
       fix: expandAutoModel(fileConfig.models?.fix, "fix", implementerHarness) ?? DEFAULT_CONFIG.models.fix,
-      intake: expandAutoModel(fileConfig.models?.intake, "intake", "claude") ?? DEFAULT_CONFIG.models.intake,
-      sweep: expandAutoModel(fileConfig.models?.sweep, "sweep", "claude") ?? DEFAULT_CONFIG.models.sweep,
+      intake: expandAutoModel(fileConfig.models?.intake, "intake", implementerHarness) ?? DEFAULT_CONFIG.models.intake,
+      sweep: expandAutoModel(fileConfig.models?.sweep, "sweep", implementerHarness) ?? DEFAULT_CONFIG.models.sweep,
     },
     // effort.review is deliberately left as-authored (possibly "auto"): it
     // backs review-1 (Iterative) and review-2 (Definitive), which resolve
@@ -927,14 +1008,15 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       implementing: expandAutoEffort(fileConfig.effort?.implementing, "implementing", implementerHarness),
       review: fileConfig.effort?.review,
       fix: expandAutoEffort(fileConfig.effort?.fix, "fix", implementerHarness),
-      intake: expandAutoEffort(fileConfig.effort?.intake, "intake", "claude"),
-      sweep: expandAutoEffort(fileConfig.effort?.sweep, "sweep", "claude"),
+      intake: expandAutoEffort(fileConfig.effort?.intake, "intake", implementerHarness),
+      sweep: expandAutoEffort(fileConfig.effort?.sweep, "sweep", implementerHarness),
     },
     // Plan-review's own resolved effort: same `effort.planning` config key as
     // above, but classified Adversarial/Definitive (not Analytical/Iterative
-    // like the `planning` stage itself) — see stage-routing.ts. Defaults to
-    // "medium" when effort.planning is unset, preserving the prior hardcoded cap.
-    plan_review_effort: expandAutoEffort(fileConfig.effort?.planning, "plan-review", "claude") ?? DEFAULT_CONFIG.plan_review_effort,
+    // like the `planning` stage itself) — see stage-routing.ts. Plan review is
+    // performed by the reviewer role. Defaults to "medium" when effort.planning
+    // is unset, preserving the prior hardcoded cap.
+    plan_review_effort: expandAutoEffort(fileConfig.effort?.planning, "plan-review", reviewerHarness) ?? DEFAULT_CONFIG.plan_review_effort,
     openspec: {
       enabled: fileConfig.openspec?.enabled ?? DEFAULT_CONFIG.openspec.enabled,
       bootstrap: fileConfig.openspec?.bootstrap ?? DEFAULT_CONFIG.openspec.bootstrap,
@@ -1090,64 +1172,36 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
   return merged;
 }
 
-/**
- * Find a Claude-only reviewer model alias configured against a codex reviewer
- * (#454). Checks both reviewer model sources — `models.review` and the
- * structured `review_harness.model` — against the same effective
- * `reviewerHarness` (the caller resolves `review_harness.command` overriding
- * the profile default, exactly as `resolveConfig()`'s `merged.harnesses.reviewer`
- * does). Only an explicit (non-`"auto"`) value is a violation: `"auto"`
- * resolves through its own claude-only-alias guard at the reviewer call site
- * (`resolveReviewerModelForHarness` in stage-routing.ts), never reaching codex.
- * `review_harness.model` is checked first since, when both are set, it is the
- * value that actually reaches the reviewer invocation.
- */
-function findReviewerModelAliasViolation(
-  fileConfig: z.infer<typeof PartialConfigSchema>,
-  reviewerHarness: string,
-): { path: "review_harness.model" | "models.review"; value: string } | undefined {
-  if (reviewerHarness !== "codex") return undefined;
-  const reviewHarnessCfg = fileConfig.review_harness;
-  const reviewerModelRaw = typeof reviewHarnessCfg === "object" ? reviewHarnessCfg.model : undefined;
-  if (reviewerModelRaw !== undefined && reviewerModelRaw !== "auto" && isClaudeOnlyModelAlias(reviewerModelRaw)) {
-    return { path: "review_harness.model", value: reviewerModelRaw };
-  }
-  const reviewModelRaw = fileConfig.models?.review;
-  if (reviewModelRaw !== undefined && reviewModelRaw !== "auto" && isClaudeOnlyModelAlias(reviewModelRaw)) {
-    return { path: "models.review", value: reviewModelRaw };
-  }
-  return undefined;
-}
-
-function reviewerModelAliasErrorMessage(path: string, value: string, harness: string): string {
-  return (
-    `${path} is set to "${value}", a Claude-only model alias, but the reviewer harness is "${harness}" — ` +
-    `codex does not support Claude model aliases and will reject it mid-run. Use an account-supported ` +
-    `OpenAI model id (e.g. "gpt-5.6-terra" or a "gpt-5.x-codex" model), or "auto" to let the pipeline ` +
-    `resolve a codex-appropriate default (falling back to your ~/.codex/config.toml default model).`
-  );
-}
-
 // Each `models.*` alias is honored by exactly one harness role. `models.review`
-// drives the reviewer; `models.planning`/`models.implementing`/`models.fix` drive
-// the implementer.
+// drives the reviewer; `models.planning`/`models.implementing`/`models.fix`/
+// `models.intake`/`models.sweep` drive the implementer.
 const MODEL_ALIAS_ROLES = [
   { key: "review", role: "reviewer" },
   { key: "planning", role: "implementer" },
   { key: "implementing", role: "implementer" },
   { key: "fix", role: "implementer" },
+  { key: "intake", role: "implementer" },
+  { key: "sweep", role: "implementer" },
 ] as const;
+
+/** Whether `harness` can honor a model/effort selection at all — driven by
+ *  the registered adapter's declared `AdapterCapabilities` (#608) rather than
+ *  a hard-coded harness-name test. An unregistered name (a custom reviewer
+ *  CLI, #40) is conservatively treated as incapable of either, matching its
+ *  pre-#608 "neither claude nor codex" inert classification. */
+function harnessCapable(harness: string, capability: "model" | "effort"): boolean {
+  return resolveAdapter(harness)?.capabilities[capability] ?? false;
+}
 
 /**
  * Warn (non-blocking) about `models.*` aliases that were explicitly set in
- * `.github/pipeline.yml` but are silently inert because the backing harness
- * ignores model aliases for that role:
- * - implementer-role keys (`planning`/`implementing`/`fix`): inert when the
- *   implementer harness is `codex` (implementer model passthrough is not
- *   implemented — `harness.ts` passes `--model` only on the `claude` branch).
- * - the reviewer-role key (`review`): inert only when the reviewer is a
- *   **custom** CLI (neither `claude` nor `codex`) — the codex reviewer now
- *   honors the model via `codex exec -m <model>`.
+ * `.github/pipeline.yml` but are silently inert because the backing role
+ * harness's adapter declares no model capability (#608) — e.g. a custom
+ * reviewer CLI. Every registered adapter (claude, codex, grok, opencode, pi)
+ * declares `model: true`, so no registered role harness ever warns here; this
+ * corrects the pre-#608 false positive that fired whenever the implementer
+ * was `codex` (implementer model passthrough was already implemented via
+ * `invoke()`/`AdapterInvocationContext`, the advisory just hadn't caught up).
  * Advisory only: no throw, no fallback, and the resolved config is unchanged
  * (the inert alias is preserved in `config.models`). Keys absent from
  * `fileConfig.models` take their value from DEFAULT_CONFIG and never warn —
@@ -1162,8 +1216,7 @@ function warnInertModelAliases(
     const value = fileModels[key];
     if (value === undefined) continue;
     const harness = harnesses[role];
-    const isInert = role === "reviewer" ? harness !== "claude" && harness !== "codex" : harness === "codex";
-    if (!isInert) continue;
+    if (harnessCapable(harness, "model")) continue;
     console.warn(
       `[pipeline] config warning: models.${key} is set to "${value}" but the ${role} harness is "${harness}" — model aliases are not honored by that harness. The setting is ignored.`,
     );
@@ -1171,12 +1224,11 @@ function warnInertModelAliases(
 }
 
 /**
- * Warn (non-blocking) about `effort.review` when the effective reviewer is a
- * custom CLI (`review_harness` set to something other than "claude" or
- * "codex"), which honors neither `--model` nor `--effort`. Both built-in
- * harnesses honor per-stage effort (claude via `--effort`, codex via
- * `-c model_reasoning_effort`), so `effort.planning`/`implementing`/`fix`/
- * `intake`/`sweep` can never be inert — only a custom reviewer CLI backing
+ * Warn (non-blocking) about `effort.review` when the resolved reviewer's
+ * adapter declares no effort capability (#608) — e.g. a custom reviewer CLI.
+ * Every registered adapter honors per-stage effort, so `effort.planning`/
+ * `implementing`/`fix`/`intake`/`sweep` (always implementer-role, always a
+ * registered adapter) can never be inert — only a custom reviewer CLI backing
  * `effort.review` can be. Advisory only: no throw, and the resolved config is
  * unchanged (the inert value is preserved in `config.effort.review`).
  */
@@ -1186,7 +1238,7 @@ function warnInertEffort(
 ): void {
   const value = fileEffort?.review;
   if (value === undefined) return;
-  if (harnesses.reviewer === "claude" || harnesses.reviewer === "codex") return;
+  if (harnessCapable(harnesses.reviewer, "effort")) return;
   console.warn(
     `[pipeline] config warning: effort.review is set to "${value}" but the reviewer is the custom CLI "${harnesses.reviewer}" — it accepts neither a --model nor an --effort flag, so per-stage effort is ignored.`,
   );
@@ -1215,16 +1267,21 @@ export function findGitRoot(start: string): string | null {
 export function resolveReleaseConfig(
   repoDir: string,
   baseBranchOverride?: string,
-): { repo_dir: string; repo: string; base_branch: string; release_model?: 'semver' | 'continuous'; intake_model: string; intake_effort?: string; intake_timeout: number } {
+  profileName?: string,
+): { repo_dir: string; repo: string; base_branch: string; release_model?: 'semver' | 'continuous'; intake_model: string; intake_effort?: string; intake_timeout: number; implementer_harness: string } {
   let baseBranch = DEFAULT_CONFIG.base_branch;
   let releaseModel: 'semver' | 'continuous' | undefined;
-  // Intake always runs through the claude harness (see stages/intake.ts), so this
-  // alias is never inert; default it here and let pipeline.yml's models.intake override.
   let intakeModel: string = DEFAULT_CONFIG.models.intake;
-  // effort.intake likewise always reaches the claude harness; unset by default so no
-  // --effort flag is emitted (#366 review-1 finding: previously accepted but dropped).
+  // effort.intake reaches whichever harness resolves as the implementer; unset
+  // by default so no effort flag is emitted (#366 review-1 finding: previously
+  // accepted but dropped).
   let intakeEffort: string | undefined;
   let intakeTimeout: number = DEFAULT_CONFIG.intake_timeout;
+  // Resolve the implementer harness locally (#608) — no `gh` call, mirroring
+  // this function's gh-free contract. Profile loading is a local file read,
+  // not network I/O, so it is safe here.
+  const profile = loadProfile(profileName ?? process.env.PIPELINE_PROFILE ?? "codex");
+  let repoImplementer: string | undefined;
   const configPath = path.join(repoDir, ".github", "pipeline.yml");
   if (fs.existsSync(configPath)) {
     const text = fs.readFileSync(configPath, "utf8");
@@ -1244,17 +1301,21 @@ export function resolveReleaseConfig(
       if (result.data.roadmap?.release_model) {
         releaseModel = result.data.roadmap.release_model;
       }
+      repoImplementer = result.data.harnesses?.implementer;
+      const implementerForModel = repoImplementer ?? profile.harnesses.implementer;
       if (result.data.models?.intake) {
-        intakeModel = expandAutoModel(result.data.models.intake, "intake", "claude") ?? intakeModel;
+        intakeModel = expandAutoModel(result.data.models.intake, "intake", implementerForModel) ?? intakeModel;
       }
       if (result.data.effort?.intake) {
-        intakeEffort = expandAutoEffort(result.data.effort.intake, "intake", "claude");
+        intakeEffort = expandAutoEffort(result.data.effort.intake, "intake", implementerForModel);
       }
       if (typeof result.data.intake_timeout === "number") {
         intakeTimeout = result.data.intake_timeout;
       }
     }
   }
+  const intakeHarness = repoImplementer ?? profile.harnesses.implementer;
+  validateImplementerHarness(intakeHarness, repoImplementer !== undefined ? "repo-config" : "profile");
   return {
     repo_dir: repoDir,
     repo: "",
@@ -1263,6 +1324,7 @@ export function resolveReleaseConfig(
     intake_model: intakeModel,
     intake_effort: intakeEffort,
     intake_timeout: intakeTimeout,
+    implementer_harness: intakeHarness,
   };
 }
 
@@ -1653,65 +1715,52 @@ export function validateConfig(
     return { valid: false, diagnostics };
   }
 
-  // 6. Inert-model / inert-effort alias detection
+  // 6. Harness role resolution + inert-model / inert-effort alias detection
   const fileConfig = result.data;
   {
-    let harnesses = deps.harnesses;
-    if (!harnesses) {
+    let profileHarnesses = deps.harnesses;
+    if (!profileHarnesses) {
       try {
         const profileName = deps.profile ?? process.env.PIPELINE_PROFILE ?? "codex";
-        harnesses = loadProfile(profileName).harnesses;
+        profileHarnesses = loadProfile(profileName).harnesses;
       } catch {
-        // Profile unavailable — skip inert warnings rather than failing
-        harnesses = undefined;
+        // Profile unavailable — skip role resolution and inert warnings rather than failing.
+        profileHarnesses = undefined;
       }
     }
-    // Apply review_harness from the file config (same override resolveConfig applies),
-    // so inert-alias detection reflects the actual effective reviewer at runtime.
-    // review_harness may be the string shorthand or the structured { command, ... } form.
-    const reviewerCommand =
-      typeof fileConfig.review_harness === "string"
-        ? fileConfig.review_harness
-        : fileConfig.review_harness?.command;
-    if (harnesses && reviewerCommand) {
-      harnesses = { ...harnesses, reviewer: reviewerCommand };
-    }
-    // Reviewer-model alias guard (#454): severity error, not the inert-alias
-    // warning below — a Claude-only alias against a codex reviewer is no
-    // longer inert (#441 passes it through to `codex exec -m`), so
-    // `config validate` must exit 1 rather than merely warn. The MODEL_ALIAS_ROLES
-    // loop below never also warns for this combination (its reviewer isInert
-    // check already excludes "codex"), so no contradictory diagnostic is emitted.
-    if (harnesses) {
-      const violation = findReviewerModelAliasViolation(fileConfig, harnesses.reviewer);
-      if (violation) {
+    if (profileHarnesses) {
+      let resolvedRoles: ResolvedHarnessRoles | undefined;
+      try {
+        resolvedRoles = resolveHarnessRoles(fileConfig, profileHarnesses);
+        validateImplementerHarness(resolvedRoles.implementer, resolvedRoles.implementerSource);
+      } catch (err) {
         diagnostics.push({
           severity: "error",
-          path: violation.path,
-          message: reviewerModelAliasErrorMessage(violation.path, violation.value, harnesses.reviewer),
+          path: "harnesses",
+          message: (err as Error).message,
         });
       }
-    }
-    if (harnesses && fileConfig.models) {
-      for (const { key, role } of MODEL_ALIAS_ROLES) {
-        const value = fileConfig.models[key];
-        if (value === undefined) continue;
-        const harness = harnesses[role];
-        const isInert = role === "reviewer" ? harness !== "claude" && harness !== "codex" : harness === "codex";
-        if (!isInert) continue;
+      const harnesses = resolvedRoles ?? { implementer: profileHarnesses.implementer, reviewer: profileHarnesses.reviewer };
+      if (fileConfig.models) {
+        for (const { key, role } of MODEL_ALIAS_ROLES) {
+          const value = fileConfig.models[key];
+          if (value === undefined) continue;
+          const harness = harnesses[role];
+          if (harnessCapable(harness, "model")) continue;
+          diagnostics.push({
+            severity: "warning",
+            path: `models.${key}`,
+            message: `models.${key} is set to "${value}" but the ${role} harness is "${harness}" — model aliases are not honored by that harness. The setting is ignored at runtime.`,
+          });
+        }
+      }
+      if (fileConfig.effort?.review !== undefined && !harnessCapable(harnesses.reviewer, "effort")) {
         diagnostics.push({
           severity: "warning",
-          path: `models.${key}`,
-          message: `models.${key} is set to "${value}" but the ${role} harness is "${harness}" — model aliases are not honored by that harness. The setting is ignored at runtime.`,
+          path: "effort.review",
+          message: `effort.review is set to "${fileConfig.effort.review}" but the reviewer is the custom CLI "${harnesses.reviewer}" — it accepts neither a --model nor an --effort flag, so per-stage effort is ignored at runtime.`,
         });
       }
-    }
-    if (harnesses && fileConfig.effort?.review !== undefined && harnesses.reviewer !== "claude" && harnesses.reviewer !== "codex") {
-      diagnostics.push({
-        severity: "warning",
-        path: "effort.review",
-        message: `effort.review is set to "${fileConfig.effort.review}" but the reviewer is the custom CLI "${harnesses.reviewer}" — it accepts neither a --model nor an --effort flag, so per-stage effort is ignored at runtime.`,
-      });
     }
   }
 
@@ -1901,6 +1950,36 @@ function renderEffortLines(effort: PartialConfig["effort"]): string {
   ].join("\n");
 }
 
+/** Render the `harnesses:` role block (#608) — implementer/reviewer, each
+ *  independently active or commented-out, so a repo can pin one role while
+ *  leaving the other at the profile default. Documented-inactive commentary
+ *  when the block is entirely absent from the config, matching the pattern
+ *  every other optional block in this template follows. */
+function renderHarnessesBlock(harnesses: PartialConfig["harnesses"]): string {
+  const topDescription = sd("harnesses", "Repository-declared primary (implementer) and secondary (reviewer) harness roles.");
+  const implementerDesc = sd("harnesses.implementer", "Primary harness that performs planning, implementation, and fixes.");
+  const reviewerDesc = sd("harnesses.reviewer", "Secondary harness that performs review.");
+  if (harnesses === undefined) {
+    return [
+      `# harnesses: # ${topDescription}`,
+      `#   implementer: grok # ${implementerDesc} Falls back to the active profile's implementer when omitted.`,
+      `#   reviewer: codex # ${reviewerDesc} Falls back to the active profile's reviewer (or review_harness) when omitted.`,
+    ].join("\n");
+  }
+  const lines = [`harnesses: # ${topDescription}`];
+  lines.push(
+    harnesses.implementer !== undefined
+      ? `  implementer: ${yamlScalar(harnesses.implementer)} # ${implementerDesc}`
+      : `  # implementer: grok # ${implementerDesc} Falls back to the active profile's implementer when omitted.`,
+  );
+  lines.push(
+    harnesses.reviewer !== undefined
+      ? `  reviewer: ${yamlScalar(harnesses.reviewer)} # ${reviewerDesc}`
+      : `  # reviewer: codex # ${reviewerDesc} Falls back to the active profile's reviewer (or review_harness) when omitted.`,
+  );
+  return lines.join("\n");
+}
+
 /** Render the `review_harness:` block for either the string shorthand or the
  *  structured `{ command, model?, effort? }` form (#366). */
 function renderReviewHarnessBlock(reviewHarness: PartialConfig["review_harness"]): string {
@@ -2025,6 +2104,8 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     renderModelLines(config.models),
     "",
     renderEffortLines(config.effort),
+    "",
+    renderHarnessesBlock(config.harnesses),
     "",
     renderReviewHarnessBlock(config.review_harness),
     "",

@@ -105,7 +105,13 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
   return {
     exec: async (f, a) => {
       o.onCall?.(f, a);
-      return o.exec ? o.exec(f, a) : { ok: true, stdout: "", stderr: "" };
+      if (o.exec) return o.exec(f, a);
+      // Default all-pass environment (#608): the claude adapter's preflight
+      // parses `claude auth status --json` as `{ loggedIn: true }` — an empty
+      // stdout would fail JSON.parse and report unauthenticated even though
+      // this fake's contract is "every command succeeds". codex/grok's own
+      // preflight only checks `ok`, so this default is harmless for them.
+      return { ok: true, stdout: '{"loggedIn":true}', stderr: "" };
     },
     execCheck: async (f, a) => {
       o.onCall?.(f, a);
@@ -309,6 +315,38 @@ test("check harness:my-reviewer (custom) — fails with remediation when not on 
   const failR = await getCheck(cfg, "harness:my-reviewer").run(fakeDeps({ execCheck: () => false }));
   assertFailWithRemediation(failR);
   assert.match(failR.remediation!, /my-reviewer/);
+});
+
+// ---- #608: a non-built-in resolved role harness (grok) goes through its own
+// adapter preflight, distinguishing missing-CLI from unauthenticated — not a
+// bare `which` PATH probe. ----
+
+test("check harness:grok — passes when installed and authenticated", async () => {
+  const cfg = makeConfig({ harnesses: { implementer: "grok", reviewer: "codex" } });
+  const r = await getCheck(cfg, "harness:grok").run(fakeDeps({ execCheck: () => true, exec: () => ({ ok: true, stdout: "", stderr: "" }) }));
+  assert.equal(r.status, "pass");
+});
+
+test("check harness:grok — missing CLI fails distinctly from unauthenticated", async () => {
+  const cfg = makeConfig({ harnesses: { implementer: "grok", reviewer: "codex" } });
+  const failR = await getCheck(cfg, "harness:grok").run(fakeDeps({ execCheck: () => false }));
+  assertFailWithRemediation(failR);
+  assert.match(failR.remediation!, /Install/);
+});
+
+test("check harness:grok — installed but unauthenticated (`grok models` fails) reports a distinct auth remediation, not a bare PATH probe", async () => {
+  const cfg = makeConfig({ harnesses: { implementer: "grok", reviewer: "codex" } });
+  const calls: Array<{ file: string; args: string[] }> = [];
+  const failR = await getCheck(cfg, "harness:grok").run(
+    fakeDeps({
+      execCheck: (f, a) => { calls.push({ file: f, args: a }); return true; },
+      exec: () => ({ ok: false, stdout: "", stderr: "not logged in" }),
+    }),
+  );
+  assertFailWithRemediation(failR);
+  assert.match(failR.remediation!, /Authenticate/);
+  // Proves this is a real adapter readiness probe, not the old `which`-only path.
+  assert.ok(calls.every((c) => c.file !== "which"), "grok must not fall back to a bare `which` probe");
 });
 
 // ---------------------------------------------------------------------------
@@ -705,7 +743,8 @@ function releaseDeps(tagName: string | null, o: FakeOverrides = {}): DoctorDeps 
           ? { ok: false, stdout: "", stderr: "gh: could not resolve to a Repository" }
           : { ok: true, stdout: JSON.stringify({ tagName }), stderr: "" };
       }
-      return o.exec ? o.exec(f, a) : { ok: true, stdout: "", stderr: "" };
+      if (o.exec) return o.exec(f, a);
+      return { ok: true, stdout: '{"loggedIn":true}', stderr: "" };
     },
     ...o,
   });
@@ -875,9 +914,16 @@ test("runPreflight — never invokes a language model (no harness model call)", 
     // A model invocation would look like `claude --print …` or `codex exec --full-auto …`.
     assert.ok(!(file === "claude" && args.includes("--print")), `model call detected: ${file} ${args.join(" ")}`);
     assert.ok(!(file === "codex" && args.includes("exec")), `model call detected: ${file} ${args.join(" ")}`);
-    // Harness binaries are only ever probed with --version.
+    // Harness binaries are probed for presence (--version) and login state
+    // (claude: `auth status --json`, codex: `login status`, #608) — never a
+    // model-invoking flag.
     if (file === "claude" || file === "codex") {
-      assert.deepEqual(args, ["--version"], `harness must only be version-probed; got ${args.join(" ")}`);
+      assert.ok(
+        (args.length === 1 && args[0] === "--version") ||
+          (file === "claude" && args.join(" ") === "auth status --json") ||
+          (file === "codex" && args.join(" ") === "login status"),
+        `harness must only be version/auth-probed; got ${args.join(" ")}`,
+      );
     }
   }
 });

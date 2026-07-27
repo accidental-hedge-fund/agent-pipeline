@@ -109,6 +109,31 @@ test("createBundle: writes initial shape with schema_version 1, schemaVersion 1,
   assert.deepEqual(onDisk.recoveries, []);
 });
 
+test("createBundle: records resolved roles and their sources (#608)", async () => {
+  const { files, deps } = memFs();
+  await createBundle(
+    STATE,
+    {
+      runId: "r",
+      issue: ISSUE,
+      pr: null,
+      branch: null,
+      harnesses: ["grok", "codex"],
+      roles: { implementer: "grok", implementerSource: "repo-config", reviewer: "codex", reviewerSource: "profile" },
+    },
+    deps,
+  );
+  const onDisk = readState(files);
+  assert.deepEqual(onDisk.roles, { implementer: "grok", implementerSource: "repo-config", reviewer: "codex", reviewerSource: "profile" });
+});
+
+test("createBundle: roles is absent from the persisted bundle when not supplied", async () => {
+  const { files, deps } = memFs();
+  await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: ["claude"] }, deps);
+  const onDisk = readState(files);
+  assert.equal(onDisk.roles, undefined);
+});
+
 test("createBundle: pr null when no PR exists", async () => {
   const { files, deps } = memFs();
   await createBundle(STATE, { runId: "r", issue: ISSUE, pr: null, branch: null, harnesses: ["claude"] }, deps);
@@ -470,6 +495,25 @@ test("formatSummary: contains identity, stage names, verdicts, and final state",
   assert.match(out, /no-commits/); // recovery
   assert.match(out, /ready-to-deploy/);
   assert.match(out, /4m15s/); // computed stage duration
+});
+
+test("formatSummary: renders resolved roles and sources when present (#608)", async () => {
+  const { files, deps } = memFs();
+  await createBundle(
+    STATE,
+    {
+      runId: "r",
+      issue: ISSUE,
+      pr: null,
+      branch: null,
+      harnesses: ["grok", "codex"],
+      roles: { implementer: "grok", implementerSource: "repo-config", reviewer: "codex", reviewerSource: "profile" },
+    },
+    deps,
+  );
+  const out = formatSummary(readState(files));
+  assert.match(out, /implementer=grok \(repo-config\)/);
+  assert.match(out, /reviewer=codex \(profile\)/);
 });
 
 test("formatSummary: partial run (no finalState) is labeled as such", () => {

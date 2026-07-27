@@ -104,6 +104,7 @@ export function realSweepDeps(
   repoDir: string,
   model: string = DEFAULT_CONFIG.models.sweep,
   reasoningEffort?: string,
+  implementerHarness: string = "claude",
 ): SweepDeps {
   return {
     listIssues: async (repo) => {
@@ -152,7 +153,7 @@ export function realSweepDeps(
       // Sweep re-specs thin issues from their existing title/body injected into the
       // prompt — a self-contained transform like intake. Pin a fast model and run
       // lean (no built-in tools, no MCP). See harness.ts InvokeOptions.lean.
-      const result = await invoke("claude", repoDir, prompt, { stream: true, model, lean: true, timeoutSec, reasoningEffort });
+      const result = await invoke(implementerHarness, repoDir, prompt, { stream: true, model, lean: true, timeoutSec, reasoningEffort });
       return { success: result.success, output: result.stdout, timed_out: result.timed_out };
     },
     readFile: (p) => fs.readFileSync(p, "utf8"),

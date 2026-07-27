@@ -39,10 +39,11 @@ export interface RefineSpecDeps {
 export function realRefineSpecDeps(
   repoDir: string,
   model: string = DEFAULT_CONFIG.models.intake,
+  implementerHarness: string = "claude",
 ): RefineSpecDeps {
   return {
     runHarness: async (prompt) => {
-      const result = await invoke("claude", repoDir, prompt, {
+      const result = await invoke(implementerHarness, repoDir, prompt, {
         stream: false,
         model,
         lean: true,

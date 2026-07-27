@@ -97,10 +97,11 @@ export interface BackfillDeps {
 export function realBackfillDeps(
   repoDir: string,
   model = "claude-sonnet-4-5",
+  implementerHarness: string = "claude",
 ): BackfillDeps {
   return {
     runHarness: async (prompt, timeoutSec) => {
-      const result = await invoke("claude", repoDir, prompt, {
+      const result = await invoke(implementerHarness, repoDir, prompt, {
         stream: true,
         model,
         lean: true,

@@ -15,6 +15,8 @@ import { claudeAdapter } from "../scripts/harness-adapters/claude.ts";
 import { codexAdapter } from "../scripts/harness-adapters/codex.ts";
 import { piAdapter } from "../scripts/harness-adapters/pi.ts";
 import { opencodeAdapter } from "../scripts/harness-adapters/opencode.ts";
+import { grokAdapter } from "../scripts/harness-adapters/grok.ts";
+import { resolveAdapter, registeredAdapterNames, allAdapters } from "../scripts/harness-adapters/index.ts";
 import type { AdapterPreflightDeps } from "../scripts/harness-adapters/types.ts";
 
 interface FakeOverrides {
@@ -201,4 +203,26 @@ test("pi/opencode buildInvocation still always passes their unattended auto-appr
   assert.ok(piInv.args.includes("-a"));
   const ocInv = opencodeAdapter.buildInvocation({ prompt: "p", worktreeDir: "/tmp/w", sandbox: true });
   assert.ok(ocInv.args.includes("--auto"));
+});
+
+// --- #608: the registry is the single source of truth `resolveConfig`'s
+// role validation and `pipeline doctor`'s harness readiness checks rely on ---
+
+test("registeredAdapterNames: matches the registry's actual adapters exactly (runtime-checked, no tsc step)", () => {
+  const names = registeredAdapterNames();
+  assert.deepEqual(new Set(names), new Set(["claude", "codex", "grok", "opencode", "pi"]));
+  assert.equal(names.length, allAdapters().length, "registeredAdapterNames() and allAdapters() must stay in lockstep");
+});
+
+test("resolveAdapter: resolves every registered name to its adapter instance", () => {
+  assert.equal(resolveAdapter("claude"), claudeAdapter);
+  assert.equal(resolveAdapter("codex"), codexAdapter);
+  assert.equal(resolveAdapter("grok"), grokAdapter);
+  assert.equal(resolveAdapter("opencode"), opencodeAdapter);
+  assert.equal(resolveAdapter("pi"), piAdapter);
+});
+
+test("resolveAdapter: returns null for an unregistered name (custom reviewer CLI escape hatch, #40)", () => {
+  assert.equal(resolveAdapter("my-reviewer"), null);
+  assert.equal(resolveAdapter("grock"), null, "a typo of a registered name must not fuzzy-match");
 });

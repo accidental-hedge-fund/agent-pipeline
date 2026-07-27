@@ -1552,7 +1552,7 @@ async function main(): Promise<void> {
       );
       process.exit(2);
     }
-    const localCfg = resolveReleaseConfig(repoDir, opts.base);
+    const localCfg = resolveReleaseConfig(repoDir, opts.base, opts.profile);
     const versionArg = cmd.args[1] as string;
     try {
       await runRelease(versionArg, { dryRun: opts.dryRun, noEdit: opts.edit === false }, localCfg);
@@ -1575,14 +1575,14 @@ async function main(): Promise<void> {
       );
       process.exit(2);
     }
-    const intakeCfg = resolveReleaseConfig(repoDir, opts.base);
+    const intakeCfg = resolveReleaseConfig(repoDir, opts.base, opts.profile);
     // Description: prefer --description flag, fall back to the second positional arg.
     const descriptionArg = opts.description ?? cmd.args[1];
     try {
       await runIntake(
         { description: descriptionArg ?? "", release: opts.release, dryRun: opts.dryRun },
         intakeCfg,
-        realIntakeDeps(repoDir, intakeCfg.intake_model, intakeCfg.intake_effort),
+        realIntakeDeps(repoDir, intakeCfg.intake_model, intakeCfg.intake_effort, intakeCfg.implementer_harness),
       );
     } catch (err) {
       console.error(`pipeline intake: ${(err as Error).message}`);
@@ -1591,14 +1591,18 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Early refine-spec dispatch — no issue number, no config resolution required.
+  // Early refine-spec dispatch — no issue number, no `gh` call. Still resolves
+  // the implementer role locally (repo `harnesses:` block / profile, #608) so
+  // the harness invocation below routes through the same role every other
+  // implementer-role path uses — resolveReleaseConfig makes no network call.
   // Non-mutating: no GitHub writes, no git writes, no filesystem writes.
   if (isRefineSpecCommand) {
     const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
     const repoDir = findGitRoot(startDir) ?? startDir;
+    const refineSpecCfg = resolveReleaseConfig(repoDir, opts.base, opts.profile);
     await runRefineSpec(
       { title: opts.title ?? "", body: opts.body ?? "" },
-      realRefineSpecDeps(repoDir),
+      realRefineSpecDeps(repoDir, refineSpecCfg.intake_model, refineSpecCfg.implementer_harness),
     );
     return;
   }
@@ -2180,7 +2184,7 @@ async function main(): Promise<void> {
         { apply: !!opts.apply, repo: opts.repo },
         { repo_dir: sweepCfg.repo_dir, repo: sweepCfg.repo, base_branch: sweepCfg.base_branch, sweep_timeout: sweepCfg.sweep_timeout },
         sweepConfig,
-        realSweepDeps(sweepCfg.repo_dir, sweepCfg.models.sweep, sweepCfg.effort.sweep),
+        realSweepDeps(sweepCfg.repo_dir, sweepCfg.models.sweep, sweepCfg.effort.sweep, sweepCfg.harnesses.implementer),
       );
     } catch (err) {
       console.error(`pipeline sweep: ${(err as Error).message}`);
@@ -2204,7 +2208,7 @@ async function main(): Promise<void> {
       await runBackfill(
         { apply: !!opts.apply, capability: opts.capability },
         { repo_dir: backfillCfg.repo_dir, repo: backfillCfg.repo, base_branch: backfillCfg.base_branch },
-        realBackfillDeps(backfillCfg.repo_dir),
+        realBackfillDeps(backfillCfg.repo_dir, undefined, backfillCfg.harnesses.implementer),
       );
     } catch (err) {
       console.error(`pipeline backfill: ${(err as Error).message}`);
