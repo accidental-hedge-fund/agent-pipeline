@@ -129,11 +129,13 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
-  // loop (#451) is a delegating entry, not a CLI forward: it runs the
-  // deterministic loop preflight (argument normalization, loop:contract-coherence,
-  // native-/goal capability) and then hands off to the installed goal-loop skill.
-  // It never touches gh or the repo config, and performs no external mutation
-  // of its own on any path.
+  // loop (#451, internalized #512): a self-contained durable run, not an
+  // external hand-off. It runs the deterministic loop preflight (argument
+  // normalization, loop:store-schema-compatibility, native-/goal capability),
+  // then drives the run entirely in-repo through this skill's own loop
+  // supervisor — never an externally installed goal-loop skill. It never
+  // touches gh or the repo config, and performs no external mutation of its
+  // own on any path.
   loop: {
     needsIssueNumber: false,
     allowedFlags: new Set(["profile", "milestone", "label", "range", "roadmapSlice", "resume", "audit"]),
