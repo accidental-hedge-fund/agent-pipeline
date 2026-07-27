@@ -781,8 +781,11 @@ test("runCapped: a stdin prompt-file materialization failure surfaces as spawn_e
   assert.equal(result.stdin_error, true);
 });
 
-test("invoke(): the grok adapter materializes the prompt file, references it via --prompt-file, and removes exactly that file afterward (#492)", async () => {
-  const cli = makeScript("grok", `cat "$2"`); // --prompt-file <path> is argv[0]/argv[1]
+test("invoke(): the grok adapter disables updates, materializes the prompt file, and removes exactly that file afterward (#492)", async () => {
+  const cli = makeScript(
+    "grok",
+    `found_no_auto_update=false\nfor arg in "$@"; do\n  if [ "$arg" = "--no-auto-update" ]; then found_no_auto_update=true; fi\ndone\n[ "$found_no_auto_update" = true ] || exit 2\ncat "$3"`,
+  ); // --no-auto-update precedes --prompt-file <path>, so the path is argv[2].
   const oldPath = process.env.PATH;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
   try {
