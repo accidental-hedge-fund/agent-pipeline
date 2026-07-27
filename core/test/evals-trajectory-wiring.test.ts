@@ -19,6 +19,30 @@ import type { GradeRecord } from "../scripts/evals/grading/types.ts";
 const SHA = "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd";
 const FAKE_CFG = { repo_dir: "/fake/repo" } as import("../scripts/types.ts").PipelineConfig;
 
+// #607 eval-agent-isolation-boundary added a real-fs contract install/restore
+// and a real command-boundary shim to every runCell() invocation inside
+// runExperiment(). This file's `cellExecution` fakes never create a real
+// worktree directory, so the production defaults for those two features
+// would fail against a nonexistent path. `baseCellExecution` merges harmless
+// in-memory/no-op fakes for both underneath each test's own overrides.
+function fakeContractIO(): NonNullable<CellExecutionDeps["contractIO"]> {
+  const files = new Map<string, string>();
+  return {
+    readFile: (p) => (files.has(p) ? files.get(p)! : null),
+    writeFile: (p, c) => { files.set(p, c); },
+    removeFile: (p) => { files.delete(p); },
+  };
+}
+
+function baseCellExecution(overrides: CellExecutionDeps): CellExecutionDeps {
+  return {
+    contractIO: fakeContractIO(),
+    installBoundaryShim: (worktreeDir: string) => `${worktreeDir}/.eval-boundary-shim`,
+    readBoundaryDenials: () => [],
+    ...overrides,
+  };
+}
+
 function makeFixtureFile(overrides: Record<string, unknown> = {}) {
   return JSON.stringify({
     fixture_id: "f1",
@@ -78,12 +102,12 @@ function makeFakeFs(fixtureText: string, manifestText: string) {
 
 test("runExperiment: a completed cell's record carries a trajectory_artifact descriptor, and the artifact file is written", async () => {
   const { deps, outFiles } = makeFakeFs(makeFixtureFile(), makeManifestFile());
-  const cellExecution: CellExecutionDeps = {
+  const cellExecution = baseCellExecution({
     createWorktree: async (_c, o) => o,
     removeWorktree: async () => {},
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "review output text", stderr: "", duration: 1 }),
-  };
+  });
   const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
   assert.equal(executed.length, 1);
   const record = executed[0];
@@ -106,12 +130,12 @@ test("runExperiment: a completed cell's record carries a trajectory_artifact des
 
 test("runExperiment: the treatment trajectory artifact records each stage's materialized message, not just its output (review 1 finding bd71053b)", async () => {
   const { deps, outFiles } = makeFakeFs(makeFixtureFile(), makeManifestFile());
-  const cellExecution: CellExecutionDeps = {
+  const cellExecution = baseCellExecution({
     createWorktree: async (_c, o) => o,
     removeWorktree: async () => {},
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "review output text", stderr: "", duration: 1 }),
-  };
+  });
   const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
   const descriptor = executed[0].trajectory_artifact!;
   const artifact = JSON.parse(outFiles.get(path.join(FAKE_CFG.repo_dir, descriptor.path))!);
@@ -121,12 +145,12 @@ test("runExperiment: the treatment trajectory artifact records each stage's mate
 
 test("runExperiment: a timeout cell's trajectory artifact carries the terminal result_class and error even when the stage's own stderr was empty (review 1 finding bb8858eb)", async () => {
   const { deps, outFiles } = makeFakeFs(makeFixtureFile(), makeManifestFile());
-  const cellExecution: CellExecutionDeps = {
+  const cellExecution = baseCellExecution({
     createWorktree: async (_c, o) => o,
     removeWorktree: async () => {},
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: false, timed_out: true, exit_code: 0, stdout: "", stderr: "", duration: 60 }),
-  };
+  });
   const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
   assert.equal(executed[0].result_class, "timeout");
   const descriptor = executed[0].trajectory_artifact!;
@@ -137,12 +161,12 @@ test("runExperiment: a timeout cell's trajectory artifact carries the terminal r
 
 test("runExperiment: an artifact collection failure is durably recorded on the cell record as trajectory_artifact_error, not only console.warn'd (review 1 finding 5ae0fa6e)", async () => {
   const { deps } = makeFakeFs(makeFixtureFile(), makeManifestFile());
-  const cellExecution: CellExecutionDeps = {
+  const cellExecution = baseCellExecution({
     createWorktree: async (_c, o) => o,
     removeWorktree: async () => {},
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 }),
-  };
+  });
   const failingDeps: RunExperimentDeps = {
     ...deps,
     cellExecution,
@@ -166,14 +190,14 @@ test("runExperiment: an API-executor cell also emits a trajectory artifact recor
     makeFixtureFile({ stage_entry_artifacts: { review: { x: 1 } }, grader_refs: [{ grader: "review", version: "1" }] }),
     makeManifestFile({ mode: "review", treatments: { executor: ["ep1"] } }),
   );
-  const cellExecution: CellExecutionDeps = {
+  const cellExecution = baseCellExecution({
     createWorktree: async (_c, o) => o,
     removeWorktree: async () => {},
     invokeExecutor: async () => ({
       ok: true,
       result: { success: true, timed_out: false, exit_code: 0, stdout: "api output", stderr: "", duration: 0.5 },
     }),
-  };
+  });
   const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
   assert.equal(executed.length, 1);
   assert.equal(executed[0].detail?.execution_class, "api-key");
@@ -182,9 +206,9 @@ test("runExperiment: an API-executor cell also emits a trajectory artifact recor
 
 test("runExperiment: an infra_error cell (never reaches a harness) still gets a best-effort trajectory artifact", async () => {
   const { deps } = makeFakeFs(makeFixtureFile(), makeManifestFile());
-  const cellExecution: CellExecutionDeps = {
+  const cellExecution = baseCellExecution({
     createWorktree: async () => { throw new Error("git worktree add failed"); },
-  };
+  });
   const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
   assert.equal(executed.length, 1);
   assert.equal(executed[0].result_class, "infra_error");
@@ -193,12 +217,12 @@ test("runExperiment: an infra_error cell (never reaches a harness) still gets a 
 
 test("runExperiment: tool-call telemetry is always marked unavailable (no harness driven by this engine exposes it) — never empty-successful", async () => {
   const { deps, outFiles } = makeFakeFs(makeFixtureFile(), makeManifestFile());
-  const cellExecution: CellExecutionDeps = {
+  const cellExecution = baseCellExecution({
     createWorktree: async (_c, o) => o,
     removeWorktree: async () => {},
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 }),
-  };
+  });
   const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
   const descriptor = executed[0].trajectory_artifact!;
   const artifact = JSON.parse(outFiles.get(path.join(FAKE_CFG.repo_dir, descriptor.path))!);
@@ -214,13 +238,13 @@ test("runExperiment: hidden checks and seeded-defect ground truth never appear i
     seeded_defects: [{ defect_id: "d1", path: "src/thing.ts", line_start: 1, line_end: 2, expected_severity: "high" }],
   });
   const { deps, outFiles } = makeFakeFs(fixtureText, makeManifestFile());
-  const cellExecution: CellExecutionDeps = {
+  const cellExecution = baseCellExecution({
     createWorktree: async (_c, o) => o,
     removeWorktree: async () => {},
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "no hidden material referenced here", stderr: "", duration: 1 }),
     runChecks: async () => ({ true: true, "grep -q SEEDED_DEFECT_MARKER src/thing.ts": true }),
-  };
+  });
   const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
   const descriptor = executed[0].trajectory_artifact!;
   const raw = outFiles.get(path.join(FAKE_CFG.repo_dir, descriptor.path))!;
@@ -234,12 +258,12 @@ test("runExperiment: hidden checks and seeded-defect ground truth never appear i
 
 test("runExperiment: resume never rewrites an existing trajectory artifact", async () => {
   const { deps, outFiles } = makeFakeFs(makeFixtureFile(), makeManifestFile());
-  const cellExecution: CellExecutionDeps = {
+  const cellExecution = baseCellExecution({
     createWorktree: async (_c, o) => o,
     removeWorktree: async () => {},
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "stable output", stderr: "", duration: 1 }),
-  };
+  });
   const first = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
   const descriptor = first.executed[0].trajectory_artifact!;
   const absPath = path.join(FAKE_CFG.repo_dir, descriptor.path);

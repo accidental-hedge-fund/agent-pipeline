@@ -242,6 +242,77 @@ test("invoke(): PIPELINE_CODEX_NO_SANDBOX=1 switches codex to explicit no-sandbo
 });
 
 // ---------------------------------------------------------------------------
+// sandboxMode (#607 — eval-agent-isolation-boundary): an explicit
+// InvokeOptions.sandboxMode decides the sandbox-selecting argument alone,
+// taking precedence over the ambient PIPELINE_CODEX_NO_SANDBOX env var. The
+// two tests above (no sandboxMode supplied) must keep passing unchanged —
+// they pin the pre-#607 ambient-only behavior.
+// ---------------------------------------------------------------------------
+
+test("invoke(): sandboxMode 'external-bypass' selects the bypass argument, with the rest of argv unchanged", async () => {
+  const cli = makeScript("codex", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  const oldNoSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  delete process.env.PIPELINE_CODEX_NO_SANDBOX;
+  try {
+    const [managed, bypass] = await Promise.all([
+      invoke("codex", tmpRoot, "test-prompt", { stream: false, sandboxMode: "managed" }),
+      invoke("codex", tmpRoot, "test-prompt", { stream: false, sandboxMode: "external-bypass" }),
+    ]);
+    assert.match(managed.stdout, /--full-auto/);
+    assert.doesNotMatch(managed.stdout, /--dangerously-bypass-approvals-and-sandbox/);
+    assert.match(bypass.stdout, /--dangerously-bypass-approvals-and-sandbox/);
+    assert.doesNotMatch(bypass.stdout, /--full-auto/);
+    const managedArgs = managed.stdout.split("\n").filter((l) => l !== "--full-auto" && l !== "");
+    const bypassArgs = bypass.stdout.split("\n").filter((l) => l !== "--dangerously-bypass-approvals-and-sandbox" && l !== "");
+    assert.deepEqual(managedArgs, bypassArgs, "the two sandbox modes must differ only in the sandbox-selecting argument");
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
+    else process.env.PIPELINE_CODEX_NO_SANDBOX = oldNoSandbox;
+  }
+});
+
+test("invoke(): an explicit sandboxMode 'managed' overrides an ambient PIPELINE_CODEX_NO_SANDBOX=1", async () => {
+  const cli = makeScript("codex", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  const oldNoSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  process.env.PIPELINE_CODEX_NO_SANDBOX = "1";
+  try {
+    const result = await invoke("codex", tmpRoot, "test-prompt", { stream: false, sandboxMode: "managed" });
+    assert.match(result.stdout, /--full-auto/, "explicit managed mode must win over the ambient bypass env var");
+    assert.doesNotMatch(result.stdout, /--dangerously-bypass-approvals-and-sandbox/);
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
+    else process.env.PIPELINE_CODEX_NO_SANDBOX = oldNoSandbox;
+  }
+});
+
+test("invoke(): no caller-supplied sandboxMode reproduces the ambient-only PIPELINE_CODEX_NO_SANDBOX behavior exactly", async () => {
+  const cli = makeScript("codex", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  const oldNoSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    process.env.PIPELINE_CODEX_NO_SANDBOX = "1";
+    const withEnvBypass = await invoke("codex", tmpRoot, "test-prompt", { stream: false });
+    assert.match(withEnvBypass.stdout, /--dangerously-bypass-approvals-and-sandbox/);
+
+    delete process.env.PIPELINE_CODEX_NO_SANDBOX;
+    const withoutEnvBypass = await invoke("codex", tmpRoot, "test-prompt", { stream: false });
+    assert.match(withoutEnvBypass.stdout, /--full-auto/);
+    assert.doesNotMatch(withoutEnvBypass.stdout, /--dangerously-bypass-approvals-and-sandbox/);
+  } finally {
+    process.env.PATH = oldPath;
+    if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
+    else process.env.PIPELINE_CODEX_NO_SANDBOX = oldNoSandbox;
+  }
+});
+
+// ---------------------------------------------------------------------------
 // lean flag (#220) — single-shot, tool-free, no-MCP generation for the claude
 // harness. Used by self-contained spec-generation stages (intake/sweep) so the
 // call cannot cold-start MCP servers or spend agentic turns exploring the repo.

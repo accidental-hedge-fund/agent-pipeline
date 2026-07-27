@@ -7,6 +7,9 @@
 //          Set PIPELINE_CODEX_NO_SANDBOX=1 to use Codex's explicit
 //          --dangerously-bypass-approvals-and-sandbox mode on externally
 //          sandboxed runners where Codex's bubblewrap/userns sandbox cannot start.
+//          #607: InvokeOptions.sandboxMode, when supplied, decides this instead
+//          of the ambient env var — the eval runner always supplies it explicitly
+//          rather than reading PIPELINE_CODEX_NO_SANDBOX.
 //          Set PIPELINE_HARNESS_TELEMETRY=off to restore the pre-#429 plain-text
 //          argv (`--output-format text` / no `--json`) for both built-in harnesses.
 // custom:  <name> <prompt>   (#40 — a user-configured reviewer CLI)
@@ -38,7 +41,7 @@ import { buildStageAccountingRecord } from "./accounting.ts";
 import { resolveAdapter } from "./harness-adapters/index.ts";
 import { makeClaudeForwardTransform } from "./harness-adapters/claude.ts";
 import { makeCodexForwardTransform } from "./harness-adapters/codex.ts";
-import { MAX_ARG_STRLEN, type AdapterProbe } from "./harness-adapters/types.ts";
+import { MAX_ARG_STRLEN, type AdapterProbe, type ExternalSandboxMode } from "./harness-adapters/types.ts";
 import { RUN_SCHEMA_VERSION, appendEvent, emitStageAccounting, type RunStoreDeps } from "./run-store.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
@@ -257,6 +260,13 @@ export interface InvokeOptions {
    *  `pipeline papercut --run <id> ...` can resolve identity without the agent
    *  fabricating it). Absent by default: no env change from pre-#419 behavior. */
   env?: NodeJS.ProcessEnv;
+  /** Explicit execution sandbox mode for this invocation (#607 —
+   *  eval-agent-isolation-boundary). Consulted only by the codex adapter;
+   *  when supplied it alone decides `--dangerously-bypass-approvals-and-sandbox`
+   *  vs `--full-auto`. When absent, the codex adapter falls back to the
+   *  ambient `PIPELINE_CODEX_NO_SANDBOX` environment variable — every
+   *  existing call site (which supplies no value) is byte-identical. */
+  sandboxMode?: ExternalSandboxMode;
 }
 
 export async function invoke(
@@ -289,6 +299,7 @@ export async function invoke(
       sandbox: opts.sandbox,
       lean: opts.lean,
       env: opts.env,
+      sandboxMode: opts.sandboxMode,
     });
     cmd = inv.cmd;
     args = inv.args;

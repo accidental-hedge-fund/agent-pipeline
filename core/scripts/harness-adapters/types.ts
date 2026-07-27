@@ -10,6 +10,15 @@
 // (`harness-adapters.test.ts`) that iterates the registry and asserts every
 // adapter actually implements every member below with the right kind.
 
+/** The execution sandbox mode a harness invocation runs under (#607 —
+ *  eval-agent-isolation-boundary). `"managed"` is the harness's own sandbox
+ *  (codex's `--full-auto`); `"external-bypass"` is the explicit bypass mode
+ *  codex offers for a runner whose own sandbox (bubblewrap/userns) cannot
+ *  start. Single-sourced here so the eval manifest and adapter invocation
+ *  shaping never drift on the set of supported values. */
+export const EXTERNAL_SANDBOX_MODES = ["managed", "external-bypass"] as const;
+export type ExternalSandboxMode = (typeof EXTERNAL_SANDBOX_MODES)[number];
+
 /** What a harness CLI's headless interface supports (design.md decision 2). */
 export interface AdapterCapabilities {
   /** Supports selecting a model via a CLI flag. */
@@ -46,6 +55,12 @@ export interface AdapterInvocationContext extends AdapterRequest {
   lean?: boolean;
   /** Additional env vars merged into the child process's environment. */
   env?: NodeJS.ProcessEnv;
+  /** Explicit execution sandbox mode for this invocation (#607). When
+   *  supplied, it alone decides the sandbox-selecting argument — consulted
+   *  only by the codex adapter today. When absent, the codex adapter falls
+   *  back to the ambient `PIPELINE_CODEX_NO_SANDBOX` environment variable,
+   *  preserving pre-#607 behavior for every caller that supplies no value. */
+  sandboxMode?: ExternalSandboxMode;
 }
 
 /** How a prompt reaches its CLI (#492 — MAX_ARG_STRLEN spawn failures on
