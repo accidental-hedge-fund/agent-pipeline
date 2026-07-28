@@ -89,29 +89,29 @@ not fail any test when the strict parser was not updated.
 
 ## Acceptance Criteria
 
-- [ ] `parseStrictVerdict`, given a verdict whose finding carries
+- [x] `parseStrictVerdict`, given a verdict whose finding carries
       `prior_round_acknowledgment: "<text>"`, returns a finding with that exact
       string value (not `undefined`).
-- [ ] `parseStrictVerdict`, given a verdict whose finding carries
+- [x] `parseStrictVerdict`, given a verdict whose finding carries
       `rejected_alternatives: ["alt-a", "alt-b"]`, returns a finding with that exact
       array (not `undefined`).
-- [ ] For every field name in `REVIEW_SCHEMA_FIELDS.finding`, a test asserts the
+- [x] For every field name in `REVIEW_SCHEMA_FIELDS.finding`, a test asserts the
       field survives `parseStrictVerdict` when present in the input — the assertion is
       driven by the manifest, so a newly-added finding field is automatically covered.
-- [ ] The same manifest-driven assertion also covers `parseStructuredVerdict`, so the
+- [x] The same manifest-driven assertion also covers `parseStructuredVerdict`, so the
       two parsers cannot diverge on which finding fields they carry.
-- [ ] A finding with `prior_round_acknowledgment` of a non-string type, or
+- [x] A finding with `prior_round_acknowledgment` of a non-string type, or
       `rejected_alternatives` that is not an array of strings, is rejected by
       `parseStrictVerdict` (returns `null` for the whole verdict), consistent with the
       validator's existing fail-closed handling of malformed optional fields.
-- [ ] A verdict that omits both fields entirely still parses successfully on both
+- [x] A verdict that omits both fields entirely still parses successfully on both
       paths, with both fields absent — no behavior change for reviewers that do not
       emit them.
-- [ ] With a delegated (`executor_name`-bearing) review result whose finding
+- [x] With a delegated (`executor_name`-bearing) review result whose finding
       re-raises a settled surface **with** a non-empty `prior_round_acknowledgment`,
       the finding is NOT demoted with reason `reversal-unacknowledged` — proving the
       round-trip reaches the guard, not just the parser.
-- [ ] Each new test is proven to bite: it fails against the pre-fix
+- [x] Each new test is proven to bite: it fails against the pre-fix
       `validateStrictFinding` and passes after.
-- [ ] `npm run ci` passes from the repo root, including `build.mjs --check` with the
+- [x] `npm run ci` passes from the repo root, including `build.mjs --check` with the
       regenerated `plugin/` mirror committed alongside `core/`.
