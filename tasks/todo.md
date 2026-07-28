@@ -243,7 +243,7 @@
 - [x] Regenerate the plugin mirror and run focused plus full verification.
 - [x] Identify the exact valid campaign manifests/evidence to stage; exclude
   obsolete diagnostics and the accidental root lockfile.
-- [ ] Commit, push, open a PR against `main`, and monitor CI.
+- [x] Commit, push, open PR #656 against `main`, and monitor CI.
 
 ## Review Results
 
@@ -261,3 +261,5 @@
   198 OpenSpec items, and 115 repository-script tests.
 - GitHub roadmap created/updated: #600–#604, #637, #653–#655, and milestone
   `v1.35.0 — Evaluation Campaign Automation`.
+- Pull request: https://github.com/accidental-hedge-fund/agent-pipeline/pull/656
+  (`v1.29.0`); GitHub Actions completed successfully.
