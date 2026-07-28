@@ -248,6 +248,14 @@ export interface RunPlan {
   cells: Cell[];
 }
 
+/** Distinguishes how a `review`-stage treatment's stdout was parsed into
+ *  `detail.findings` (#606): `strict` satisfied the full production verdict
+ *  contract (`parseStrictVerdict`); `tolerant` recovered a verdict that was
+ *  parsed from JSON but did not satisfy the full contract (e.g. a finding
+ *  missing an optional field); `unparseable` means no verdict JSON could be
+ *  found — prose or empty output, `detail.findings` is absent. */
+export type ReviewVerdictParseProvenance = "strict" | "tolerant" | "unparseable";
+
 /** One executed cell's outcome, before the join keys/result_class are attached.
  *
  *  `detail` is an opaque blob to the runner, but for a `completed` cell the
@@ -262,7 +270,11 @@ export interface RunPlan {
  *      from `base_sha` in the cell's worktree. Present only when the fixture
  *      declares `allowed_change_paths` (out-of-scope detection needs it).
  *    - `findings`: review-mode only — `ReviewFinding[]` parsed from the
- *      harness's review-verdict JSON output, best-effort.
+ *      harness's review-verdict JSON output via the production verdict
+ *      parsers, present only when a verdict was parsed.
+ *    - `review_verdict_parse`: review-mode only — a `ReviewVerdictParseProvenance`
+ *      disclosing whether the treatment satisfied the structured verdict
+ *      contract, was tolerantly recovered, or was unparseable.
  *    - `output_text`: planning-mode only — the harness's raw stdout, used by
  *      the planning rubric's deterministic keyword coverage check.
  *    - `self_assessment`: planning-mode only — a self-score/confidence value

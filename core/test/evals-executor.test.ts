@@ -8,9 +8,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as nodePath from "node:path";
 import { allocateCellIdentity, defaultContractIO, deriveModelEndpointOverride, runCell as runCellReal, type CellExecutionDeps } from "../scripts/evals/executor.ts";
+import { materializeStagePrompt } from "../scripts/evals/stage-adapters.ts";
 import { validateFixture } from "../scripts/evals/fixture.ts";
 import { validateManifest } from "../scripts/evals/manifest.ts";
 import type { Cell, Fixture } from "../scripts/evals/types.ts";
+import { parseReportedFindings, gradeReview } from "../scripts/evals/grading/graders/review.ts";
+import { REVIEW_VERDICT_SCHEMA_BLOCK } from "../scripts/review-schema.ts";
 
 // #607 eval-agent-isolation-boundary added a real-fs contract install/restore
 // and a real command-boundary shim to every runCell() call. Every test in
@@ -818,7 +821,7 @@ test("runCell: changed_paths is recorded only when the fixture declares an allow
   assert.equal(withoutBoundary.outcome.detail?.changed_paths, undefined);
 });
 
-test("runCell: review-mode findings are parsed from harness stdout into detail.findings", async () => {
+test("runCell: review-mode findings are parsed from harness stdout into detail.findings (bare verdict object, tolerant — missing summary/next_steps)", async () => {
   const deps: CellExecutionDeps = {
     createWorktree: async (_c, o) => o,
     removeWorktree: async () => {},
@@ -833,7 +836,433 @@ test("runCell: review-mode findings are parsed from harness stdout into detail.f
     }),
   };
   const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
-  assert.deepEqual(result.outcome.detail?.findings, [{ file: "a.ts", severity: "high" }]);
+  const findings = result.outcome.detail?.findings as Array<Record<string, unknown>>;
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].file, "a.ts");
+  assert.equal(findings[0].severity, "high");
+  assert.equal(result.outcome.detail?.review_verdict_parse, "tolerant");
+});
+
+test("runCell: review-mode findings satisfying the full verdict contract are recorded with provenance 'strict'", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      success: true,
+      timed_out: false,
+      exit_code: 0,
+      stdout: JSON.stringify({
+        verdict: "needs-attention",
+        summary: "one issue found",
+        findings: [
+          {
+            severity: "high",
+            title: "bug",
+            body: "explanation",
+            file: "a.ts",
+            line_start: 1,
+            line_end: 2,
+            confidence: 0.9,
+            recommendation: "fix it",
+          },
+        ],
+        next_steps: [],
+      }),
+      stderr: "",
+      duration: 1,
+    }),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  const findings = result.outcome.detail?.findings as Array<Record<string, unknown>>;
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].file, "a.ts");
+  assert.equal(findings[0].line_start, 1);
+  assert.equal(findings[0].line_end, 2);
+  assert.equal(findings[0].severity, "high");
+  assert.equal(result.outcome.detail?.review_verdict_parse, "strict");
+});
+
+test("runCell: a review-mode verdict inside a fenced json block with surrounding prose is parsed into detail.findings", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      success: true,
+      timed_out: false,
+      exit_code: 0,
+      stdout:
+        "Here is my review:\n\n```json\n" +
+        JSON.stringify({
+          verdict: "needs-attention",
+          summary: "one issue found",
+          findings: [
+            {
+              severity: "high",
+              title: "bug",
+              body: "explanation",
+              file: "a.ts",
+              line_start: 1,
+              line_end: 2,
+              confidence: 0.9,
+              recommendation: "fix it",
+            },
+          ],
+          next_steps: [],
+        }) +
+        "\n```\n\nThanks!",
+      stderr: "",
+      duration: 1,
+    }),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  const findings = result.outcome.detail?.findings as Array<Record<string, unknown>>;
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].file, "a.ts");
+  assert.equal(result.outcome.detail?.review_verdict_parse, "strict");
+});
+
+test("runCell: an inline (unfenced) verdict object surrounded by other text is parsed into detail.findings", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      success: true,
+      timed_out: false,
+      exit_code: 0,
+      stdout:
+        "My review: " +
+        JSON.stringify({
+          verdict: "needs-attention",
+          summary: "one issue found",
+          findings: [
+            {
+              severity: "high",
+              title: "bug",
+              body: "explanation",
+              file: "a.ts",
+              line_start: 1,
+              line_end: 2,
+              confidence: 0.9,
+              recommendation: "fix it",
+            },
+          ],
+          next_steps: [],
+        }) +
+        " — end of review.",
+      stderr: "",
+      duration: 1,
+    }),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  const findings = result.outcome.detail?.findings as Array<Record<string, unknown>>;
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].file, "a.ts");
+  assert.equal(result.outcome.detail?.review_verdict_parse, "strict");
+});
+
+test("runCell: a parsed finding retains every REVIEW_SCHEMA_FIELDS.finding field the harness emitted, including optional ones", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      success: true,
+      timed_out: false,
+      exit_code: 0,
+      stdout: JSON.stringify({
+        verdict: "needs-attention",
+        summary: "one issue found",
+        findings: [
+          {
+            severity: "high",
+            title: "bug",
+            body: "explanation",
+            file: "a.ts",
+            line_start: 1,
+            line_end: 2,
+            confidence: 0.9,
+            recommendation: "fix it",
+            category: "correctness",
+            blocking: true,
+            spec_divergence_direction: "code-behind-spec",
+            prior_round_acknowledgment: "round 2: still applies",
+            rejected_alternatives: ["ignore it"],
+          },
+        ],
+        next_steps: [],
+      }),
+      stderr: "",
+      duration: 1,
+    }),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  const finding = (result.outcome.detail?.findings as Array<Record<string, unknown>>)[0];
+  assert.equal(finding.file, "a.ts");
+  assert.equal(finding.line_start, 1);
+  assert.equal(finding.line_end, 2);
+  assert.equal(finding.severity, "high");
+  assert.equal(finding.category, "correctness");
+  assert.equal(finding.blocking, true);
+  assert.equal(finding.spec_divergence_direction, "code-behind-spec");
+  assert.equal(finding.prior_round_acknowledgment, "round 2: still applies");
+  assert.deepEqual(finding.rejected_alternatives, ["ignore it"]);
+});
+
+test("runCell: prose-only review-mode output is recorded as unparseable, not as a verdict with zero findings", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      success: true,
+      timed_out: false,
+      exit_code: 0,
+      stdout: "This diff looks fine to me, no issues found.",
+      stderr: "",
+      duration: 1,
+    }),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.detail?.findings, undefined);
+  assert.equal(result.outcome.detail?.review_verdict_parse, "unparseable");
+  assert.equal(result.outcome.result_class, "completed");
+});
+
+test("runCell: empty review-mode stdout is recorded as unparseable", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      success: true,
+      timed_out: false,
+      exit_code: 0,
+      stdout: "",
+      stderr: "",
+      duration: 1,
+    }),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.detail?.findings, undefined);
+  assert.equal(result.outcome.detail?.review_verdict_parse, "unparseable");
+});
+
+// ---------------------------------------------------------------------------
+// #606 eval-review-verdict-contract — the materialized review-mode prompt
+// states the production structured verdict contract, and a review cell's
+// parsed findings reach the review grader end-to-end.
+// ---------------------------------------------------------------------------
+
+function fixtureReviewWithDefect(): Fixture {
+  return validateFixture(
+    {
+      fixture_id: "f1",
+      schema_version: 1,
+      base_commit: SHA,
+      task_input: "Review this.",
+      stage_entry_artifacts: { review: { diff: "..." } },
+      public_checks: [],
+      seeded_defects: [
+        { defect_id: "d1", path: "a.ts", line_start: 10, line_end: 12, expected_severity: "high" },
+      ],
+      grader_refs: [{ grader: "review", version: "1" }],
+      category: "c",
+      risk: "medium",
+      provenance: "synthetic",
+    },
+    "f1.json",
+  );
+}
+
+test("materializeStagePrompt: the review-stage prompt contains the exact REVIEW_VERDICT_SCHEMA_BLOCK text and a JSON-only instruction, with no unsubstituted {{...}} token", () => {
+  const prompt = materializeStagePrompt("review", makeFixture());
+  assert.ok(prompt.includes(REVIEW_VERDICT_SCHEMA_BLOCK), "prompt must contain the exact schema block text");
+  assert.match(prompt, /Return ONLY valid JSON/i);
+  assert.doesNotMatch(prompt, /\{\{[a-zA-Z_]+\}\}/, "no unsubstituted {{...}} placeholder may reach the harness");
+});
+
+test("materializeStagePrompt: non-review stages are byte-identical to their pre-#606 materialization and never contain the review schema block", () => {
+  const fixture = validateFixture(
+    {
+      fixture_id: "f1",
+      schema_version: 1,
+      base_commit: SHA,
+      task_input: "Do the thing.",
+      stage_entry_artifacts: {
+        planning: { a: 1 },
+        "plan-review": { b: 2 },
+        implementing: { c: 3 },
+        fix: { d: 4 },
+        shipcheck: { e: 5 },
+      },
+      public_checks: [],
+      grader_refs: [],
+      category: "c",
+      risk: "low",
+      provenance: "synthetic",
+    },
+    "f1.json",
+  );
+  const expected: Record<string, string> = {
+    planning: "Produce an implementation plan for the following issue.\n\n## Task\nDo the thing.\n\n## Stage input\n" + JSON.stringify({ a: 1 }, null, 2),
+    "plan-review": "Review the following implementation plan for correctness and completeness.\n\n## Task\nDo the thing.\n\n## Stage input\n" + JSON.stringify({ b: 2 }, null, 2),
+    implementing: "Implement the following plan in this repository.\n\n## Task\nDo the thing.\n\n## Stage input\n" + JSON.stringify({ c: 3 }, null, 2),
+    fix: "Resolve the following review finding with a minimal, surgical diff.\n\n## Task\nDo the thing.\n\n## Stage input\n" + JSON.stringify({ d: 4 }, null, 2),
+    shipcheck: "Verify the following change is ready to ship: re-run checks and confirm no regressions.\n\n## Task\nDo the thing.\n\n## Stage input\n" + JSON.stringify({ e: 5 }, null, 2),
+  };
+  for (const [stage, expectedPrompt] of Object.entries(expected)) {
+    const prompt = materializeStagePrompt(stage as Parameters<typeof materializeStagePrompt>[0], fixture);
+    assert.equal(prompt, expectedPrompt, `stage "${stage}" prompt must be byte-identical to pre-#606 materialization`);
+    assert.doesNotMatch(prompt, /"findings":/, `stage "${stage}" prompt must not contain the review schema block`);
+  }
+});
+
+test("runCell: a review cell's parsed findings reach the review grader end-to-end — a valid verdict naming the seeded defect yields true_positives > 0 and recall === 1", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      success: true,
+      timed_out: false,
+      exit_code: 0,
+      stdout: JSON.stringify({
+        verdict: "needs-attention",
+        summary: "found the seeded defect",
+        findings: [
+          {
+            severity: "high",
+            title: "bug",
+            body: "explanation",
+            file: "a.ts",
+            line_start: 11,
+            line_end: 11,
+            confidence: 0.9,
+            recommendation: "fix it",
+          },
+        ],
+        next_steps: [],
+      }),
+      stderr: "",
+      duration: 1,
+    }),
+  };
+  const fixture = fixtureReviewWithDefect();
+  const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.equal(result.outcome.detail?.review_verdict_parse, "strict");
+  const findings = parseReportedFindings(result.outcome.detail?.findings as unknown[] | undefined);
+  const grade = gradeReview(fixture, findings);
+  assert.equal(grade.true_positives, 1, "the parsed finding must reach the grader as a true positive");
+  assert.equal(grade.recall, 1);
+});
+
+test("runCell: prose review-mode output records review_verdict_parse: unparseable, not a verdict with zero findings — the grader reports the seeded defect as a false negative, not an infra error", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      success: true,
+      timed_out: false,
+      exit_code: 0,
+      stdout: "This diff looks fine to me, no issues found.",
+      stderr: "",
+      duration: 1,
+    }),
+  };
+  const fixture = fixtureReviewWithDefect();
+  const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.equal(result.outcome.detail?.review_verdict_parse, "unparseable");
+  assert.equal(result.outcome.detail?.findings, undefined);
+  const findings = parseReportedFindings(result.outcome.detail?.findings as unknown[] | undefined);
+  const grade = gradeReview(fixture, findings);
+  assert.equal(grade.true_positives, 0);
+  assert.equal(grade.false_negatives, 1);
+  assert.equal(grade.recall, 0);
+});
+
+test("runCell: a review stage inside an end-to-end cell receives the contract-bearing prompt and its findings are captured with provenance", async () => {
+  const fixture = validateFixture(
+    {
+      fixture_id: "f1",
+      schema_version: 1,
+      base_commit: SHA,
+      task_input: "t",
+      stage_entry_artifacts: { planning: { a: 1 }, review: { diff: "..." } },
+      public_checks: [],
+      seeded_defects: [
+        { defect_id: "d1", path: "a.ts", line_start: 10, line_end: 12, expected_severity: "high" },
+      ],
+      grader_refs: [],
+      category: "c",
+      risk: "low",
+      provenance: "synthetic",
+    },
+    "f1.json",
+  );
+  const manifest = validateManifest(
+    {
+      schema_version: 1,
+      experiment_id: "exp1",
+      fixture_ids: ["f1"],
+      mode: "end-to-end",
+      treatments: { harness: ["claude"] },
+      replicates: 1,
+      seed: 1,
+      concurrency: 1,
+      timeout: 60,
+      output_dir: ".agent-pipeline/evals",
+    },
+    new Set(["f1"]),
+  );
+  const promptsSeen: string[] = [];
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async (args) => {
+      promptsSeen.push(args.prompt);
+      if (args.prompt.includes("Review the following diff")) {
+        return {
+          success: true,
+          timed_out: false,
+          exit_code: 0,
+          stdout: JSON.stringify({
+            verdict: "needs-attention",
+            summary: "found it",
+            findings: [
+              {
+                severity: "high",
+                title: "bug",
+                body: "explanation",
+                file: "a.ts",
+                line_start: 11,
+                line_end: 11,
+                confidence: 0.9,
+                recommendation: "fix it",
+              },
+            ],
+            next_steps: [],
+          }),
+          stderr: "",
+          duration: 1,
+        };
+      }
+      return successResult();
+    },
+  };
+  const result = await runCell(FAKE_CFG, makeCell({ mode: "end-to-end", cell_id: "exp1/f1/harness=claude/1" }), fixture, manifest, deps);
+  const reviewPrompt = promptsSeen.find((p) => p.includes("Review the following diff"));
+  assert.ok(reviewPrompt?.includes(REVIEW_VERDICT_SCHEMA_BLOCK), "the review stage inside end-to-end mode must receive the contract-bearing prompt");
+  assert.equal(result.outcome.detail?.review_verdict_parse, "strict");
+  const findings = parseReportedFindings(result.outcome.detail?.findings as unknown[] | undefined);
+  const grade = gradeReview(fixture, findings);
+  assert.equal(grade.true_positives, 1);
 });
 
 // ---------------------------------------------------------------------------

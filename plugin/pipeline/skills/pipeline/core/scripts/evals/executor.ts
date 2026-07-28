@@ -29,6 +29,7 @@ import {
   removeBoundaryShim as removeBoundaryShimReal,
 } from "./boundary-shim.ts";
 import { materializeStagePrompt, stagesForMode } from "./stage-adapters.ts";
+import { parseStrictVerdict, parseStructuredVerdict } from "../stages/review-parsing.ts";
 import type { BuildTreatmentTrajectoryInput, RawStageEntry } from "./trajectory/collect.ts";
 import type {
   BoundaryDenial,
@@ -40,6 +41,7 @@ import type {
   EvalStageName,
   ExperimentManifest,
   Fixture,
+  ReviewVerdictParseProvenance,
   SandboxMode,
   Treatment,
 } from "./types.ts";
@@ -775,8 +777,13 @@ export async function runCell(
         execution_class: executionClass,
         executor_provenance: result.executor_provenance ?? null,
       };
-      const findings = parseReviewFindings(result.stdout);
+      const { findings, provenance } = parseReviewFindings(result.stdout);
       if (findings !== undefined) detail.findings = findings;
+      // Provenance is disclosed for a `review`-stage cell only (#606) —
+      // `plan-review`'s own output contract is out of scope for this change
+      // (design.md D4), so its findings capture is unchanged: still
+      // best-effort, unparseable exactly as today, with no provenance value.
+      if (stages[0] === "review") detail.review_verdict_parse = provenance;
       if (environmentDetail !== undefined) detail.environment = environmentDetail;
       return finish({ result_class: "completed", detail });
     }
@@ -833,6 +840,7 @@ export async function runCell(
 
     const stageDetails: Record<string, unknown>[] = [];
     let reviewFindings: unknown[] | undefined;
+    let reviewVerdictParse: ReviewVerdictParseProvenance | undefined;
     let planningOutputText: string | undefined;
     let planningSelfAssessment: unknown;
     for (let i = 0; i < stages.length; i++) {
@@ -909,8 +917,9 @@ export async function runCell(
       // harness's review-verdict JSON, best-effort) and planning-mode output
       // text / self-assessment.
       if (stage === "review") {
-        const findings = parseReviewFindings(result.stdout);
+        const { findings, provenance } = parseReviewFindings(result.stdout);
         if (findings !== undefined) reviewFindings = findings;
+        reviewVerdictParse = provenance;
       }
       if (stage === "planning") {
         planningOutputText = result.stdout;
@@ -970,6 +979,7 @@ export async function runCell(
       detail.changed_paths = changedPaths.filter((p) => !excludedFromChangedPaths.has(p));
     }
     if (reviewFindings !== undefined) detail.findings = reviewFindings;
+    if (reviewVerdictParse !== undefined) detail.review_verdict_parse = reviewVerdictParse;
     if (planningOutputText !== undefined) detail.output_text = planningOutputText;
     if (planningSelfAssessment !== undefined) detail.self_assessment = planningSelfAssessment;
     if (environmentDetail !== undefined) detail.environment = environmentDetail;
@@ -1023,21 +1033,28 @@ export async function runCell(
   }
 }
 
-/** Best-effort extraction of `findings` from a review-mode harness's stdout,
- *  which is expected to be the review-verdict JSON (review-schema.ts) when
- *  the harness followed the prompt. Returns `undefined` — not a grading
- *  failure — when stdout is not that shape; the review grader then reports
- *  every seeded defect as an unmatched false negative rather than throwing. */
-function parseReviewFindings(stdout: string): unknown[] | undefined {
-  try {
-    const parsed = JSON.parse(stdout);
-    if (parsed && typeof parsed === "object" && Array.isArray((parsed as Record<string, unknown>).findings)) {
-      return (parsed as Record<string, unknown>).findings as unknown[];
-    }
-  } catch {
-    // Not JSON — leave undefined.
+/** Parse `findings` from a review-mode harness's stdout using the same
+ *  strict-then-tolerant verdict parsers production review uses (#606,
+ *  design.md D2), so a verdict a production reviewer would have parsed is a
+ *  verdict the eval parses too:
+ *    1. `parseStrictVerdict` — the treatment satisfied the full contract.
+ *    2. `parseStructuredVerdict` — recovers a verdict parsed from JSON (fenced
+ *       or inline) that did not satisfy the full contract. Its prose/text
+ *       fallback (identifiable by the `_raw` field it attaches) is NOT
+ *       treated as a verdict — that fallback returns `findings: []` for
+ *       arbitrary text, which is exactly the "silently zero findings"
+ *       outcome this parser exists to distinguish from a genuine miss.
+ *    3. Otherwise `unparseable` — `findings` stays `undefined`, never `[]`. */
+function parseReviewFindings(stdout: string): { findings?: unknown[]; provenance: ReviewVerdictParseProvenance } {
+  const strict = parseStrictVerdict(stdout);
+  if (strict) {
+    return { findings: strict.findings, provenance: "strict" };
   }
-  return undefined;
+  const structured = parseStructuredVerdict(stdout);
+  if (structured._raw === undefined) {
+    return { findings: structured.findings, provenance: "tolerant" };
+  }
+  return { provenance: "unparseable" };
 }
 
 /** Best-effort extraction of a treatment-emitted self-assessment from

@@ -9,6 +9,7 @@
 // stage-entry artifact by materializing a prompt and invoking the harness in
 // the cell's isolated worktree — which by construction never touches gh.
 
+import { REVIEW_VERDICT_SCHEMA_BLOCK } from "../review-schema.ts";
 import { EVAL_STAGE_NAMES, type EvalMode, type EvalStageName, type Fixture } from "./types.ts";
 
 const STAGE_INSTRUCTIONS: Record<EvalStageName, string> = {
@@ -19,6 +20,21 @@ const STAGE_INSTRUCTIONS: Record<EvalStageName, string> = {
   fix: "Resolve the following review finding with a minimal, surgical diff.",
   shipcheck: "Verify the following change is ready to ship: re-run checks and confirm no regressions.",
 };
+
+// The production reviewer prompts (`review_standard.md`, `review_adversarial.md`)
+// state the structured verdict contract by substituting `REVIEW_VERDICT_SCHEMA_BLOCK`
+// for `{{schema_block}}` plus this exact JSON-only instruction (#606). Without it,
+// an eval reviewer is asked for a review but never told the output contract, so a
+// compliant harness returns prose the eval's parser cannot read. Populated for the
+// `review` stage only — every other stage's materialized text is unchanged.
+const REVIEW_OUTPUT_CONTRACT = [
+  "",
+  "Return ONLY valid JSON matching this schema (no markdown fences, no commentary outside the JSON):",
+  "",
+  "```",
+  REVIEW_VERDICT_SCHEMA_BLOCK,
+  "```",
+].join("\n");
 
 /** Materialize the exact prompt text sent to the harness for one stage,
  *  from the fixture's frozen inputs alone. */
@@ -32,6 +48,9 @@ export function materializeStagePrompt(stage: EvalStageName, fixture: Fixture): 
   ];
   if (artifact !== undefined) {
     parts.push("", `## Stage input`, JSON.stringify(artifact, null, 2));
+  }
+  if (stage === "review") {
+    parts.push(REVIEW_OUTPUT_CONTRACT);
   }
   return parts.join("\n");
 }
