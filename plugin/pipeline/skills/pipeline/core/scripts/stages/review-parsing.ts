@@ -704,7 +704,13 @@ export function parseStructuredVerdict(
         return {
           verdict: data.verdict,
           summary: data.summary ?? "",
-          findings: Array.isArray(data.findings) ? (data.findings as ReviewFinding[]) : [],
+          findings: Array.isArray(data.findings)
+            ? data.findings.map((raw) =>
+                typeof raw === "object" && raw !== null
+                  ? projectReviewFinding(raw as Record<string, unknown>)
+                  : (raw as ReviewFinding),
+              )
+            : [],
           next_steps: Array.isArray(data.next_steps) ? data.next_steps as string[] : [],
           commitSha,
         };
@@ -732,6 +738,32 @@ export function parseStructuredVerdict(
 
 const STRICT_FINDING_SEVERITIES = new Set(["critical", "high", "medium", "low"]);
 
+/** Single field projection for a parsed `ReviewFinding` (#620), shared by both
+ *  verdict parsers. Copies every field named in `REVIEW_SCHEMA_FIELDS.finding` /
+ *  declared on `ReviewFinding` — including the cross-round fields
+ *  `prior_round_acknowledgment` (#389) and `rejected_alternatives` (#483) — so the
+ *  delegated (`parseStrictVerdict`) and local (`parseStructuredVerdict`) paths
+ *  cannot silently diverge on which fields survive parsing. This performs NO type
+ *  validation; callers that need to reject malformed input (see
+ *  `validateStrictFinding`) must check types before projecting. */
+function projectReviewFinding(f: Record<string, unknown>): ReviewFinding {
+  return {
+    severity: f.severity as ReviewFinding["severity"],
+    title: f.title as string,
+    body: f.body as string,
+    file: f.file as string | undefined,
+    line_start: f.line_start as number | undefined,
+    line_end: f.line_end as number | undefined,
+    confidence: f.confidence as number,
+    recommendation: f.recommendation as string,
+    category: f.category as string | undefined,
+    spec_divergence_direction: f.spec_divergence_direction as ReviewFinding["spec_divergence_direction"],
+    blocking: f.blocking as boolean | undefined,
+    prior_round_acknowledgment: f.prior_round_acknowledgment as string | undefined,
+    rejected_alternatives: f.rejected_alternatives as string[] | undefined,
+  };
+}
+
 /** Validate a single candidate finding against the full `ReviewFinding` contract.
  *  Required fields must have the correct type; optional fields, if present,
  *  must also have the correct type. Returns null on any mismatch. */
@@ -757,19 +789,16 @@ function validateStrictFinding(candidate: unknown): ReviewFinding | null {
     return null;
   }
   if (f.blocking !== undefined && typeof f.blocking !== "boolean") return null;
-  return {
-    severity: f.severity as ReviewFinding["severity"],
-    title: f.title,
-    body: f.body,
-    file: f.file as string | undefined,
-    line_start: f.line_start as number | undefined,
-    line_end: f.line_end as number | undefined,
-    confidence: f.confidence,
-    recommendation: f.recommendation,
-    category: f.category as string | undefined,
-    spec_divergence_direction: f.spec_divergence_direction as ReviewFinding["spec_divergence_direction"],
-    blocking: f.blocking as boolean | undefined,
-  };
+  if (f.prior_round_acknowledgment !== undefined && typeof f.prior_round_acknowledgment !== "string") {
+    return null;
+  }
+  if (
+    f.rejected_alternatives !== undefined &&
+    (!Array.isArray(f.rejected_alternatives) || !f.rejected_alternatives.every((a) => typeof a === "string"))
+  ) {
+    return null;
+  }
+  return projectReviewFinding(f);
 }
 
 /**

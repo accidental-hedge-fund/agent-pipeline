@@ -30,6 +30,7 @@ import {
   extractReviewArtifact,
   extractReviewedSha,
   formatReviewComment,
+  parseStrictVerdict,
   parseStructuredVerdict,
   reviewCeilingComment,
   reviewCeilingDemotionComment,
@@ -39,7 +40,8 @@ import { openspecContextFromDiff } from "../scripts/openspec.ts";
 import { buildUnblockedComment } from "../scripts/pipeline.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 import { REVIEW_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
-import { extractBlockingSurfacesFromComment, extractOverrides, findingKey, findingPayloadFingerprint, formatBlockingSurfacesMarker, nonReproducingDispositionComment, overrideComment, scopedOverrideComment, severityRank, surfaceKey } from "../scripts/review-policy.ts";
+import { extractBlockingSurfacesFromComment, extractOverrides, findingKey, findingPayloadFingerprint, formatBlockingSurfacesMarker, nonReproducingDispositionComment, overrideComment, partitionFindings, scopedOverrideComment, severityRank, surfaceKey } from "../scripts/review-policy.ts";
+import type { SettledFinding } from "../scripts/review-history.ts";
 import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
 
@@ -123,6 +125,215 @@ test("parser drift guard: parseStructuredVerdict carries every REVIEW_SCHEMA_FIE
   }
   // The findings array must survive as structured objects, not be flattened away.
   assert.ok(Array.isArray(parsed.findings) && (parsed.findings as unknown[]).length === 1);
+});
+
+// ---------------------------------------------------------------------------
+// Finding-level parser drift guard (#620) — parseStrictVerdict drops
+// cross-round finding fields
+//
+// The #56 guard above only iterates REVIEW_SCHEMA_FIELDS.verdict (top-level
+// fields). Nothing exercised REVIEW_SCHEMA_FIELDS.finding, which is exactly
+// why prior_round_acknowledgment (#389) and rejected_alternatives (#483) were
+// added to ReviewFinding/the schema block without the strict parser's
+// hand-written per-field reconstruction (validateStrictFinding) ever being
+// taught about them: they were silently dropped on the delegated
+// stage_executors path while the local-harness blind-cast path kept them by
+// accident.
+// ---------------------------------------------------------------------------
+
+// One type-correct sample value per REVIEW_SCHEMA_FIELDS.finding entry. A
+// field with no mapped sample fails the guard below loudly (task 3.4) rather
+// than being silently skipped.
+const FINDING_FIELD_SAMPLES: Record<string, unknown> = {
+  severity: "high",
+  title: "sample finding title",
+  body: "sample finding body",
+  file: "src/sample.ts",
+  line_start: 10,
+  line_end: 12,
+  confidence: 0.75,
+  recommendation: "sample recommendation",
+  category: "correctness",
+  spec_divergence_direction: "code-behind-spec",
+  blocking: true,
+  prior_round_acknowledgment: "sample prior-round acknowledgment",
+  rejected_alternatives: ["alt-a", "alt-b"],
+};
+
+test("parser drift guard: both parseStrictVerdict and parseStructuredVerdict carry every REVIEW_SCHEMA_FIELDS.finding field (#620)", () => {
+  const sampleFinding: Record<string, unknown> = {};
+  for (const field of REVIEW_SCHEMA_FIELDS.finding) {
+    assert.ok(
+      field in FINDING_FIELD_SAMPLES,
+      `no type-correct sample value mapped for finding field "${field}" in FINDING_FIELD_SAMPLES — ` +
+        `add one so this drift guard can exercise it instead of silently skipping it.`,
+    );
+    sampleFinding[field] = FINDING_FIELD_SAMPLES[field];
+  }
+  const verdictJson = JSON.stringify({
+    verdict: "needs-attention",
+    summary: "s",
+    findings: [sampleFinding],
+    next_steps: [],
+  });
+
+  const strict = parseStrictVerdict(verdictJson, "a".repeat(40));
+  assert.ok(strict, "parseStrictVerdict must accept a fully type-correct sample finding");
+  assert.equal(
+    strict!.findings.length,
+    1,
+    "guard must not pass vacuously — the sample finding must actually parse",
+  );
+
+  const structured = parseStructuredVerdict(verdictJson, "a".repeat(40));
+  assert.equal(
+    structured.findings.length,
+    1,
+    "guard must not pass vacuously — the sample finding must actually parse",
+  );
+
+  for (const field of REVIEW_SCHEMA_FIELDS.finding) {
+    const expected = FINDING_FIELD_SAMPLES[field];
+    assert.deepEqual(
+      (strict!.findings[0] as unknown as Record<string, unknown>)[field],
+      expected,
+      `parseStrictVerdict dropped or mangled finding field "${field}"`,
+    );
+    assert.deepEqual(
+      (structured.findings[0] as unknown as Record<string, unknown>)[field],
+      expected,
+      `parseStructuredVerdict dropped or mangled finding field "${field}"`,
+    );
+  }
+});
+
+test("parseStrictVerdict: retains prior_round_acknowledgment and rejected_alternatives on a delegated-shape verdict (#620)", () => {
+  const body =
+    '{"verdict":"needs-attention","summary":"s","findings":[' +
+    '{"severity":"high","title":"t","body":"b","confidence":0.9,"recommendation":"r",' +
+    '"prior_round_acknowledgment":"Round 2 accepted no cap for burst traffic, but this removed rate limiting entirely.",' +
+    '"rejected_alternatives":["token-bucket","fixed-window"]}],"next_steps":[]}';
+  const v = parseStrictVerdict(body, "a".repeat(40));
+  assert.ok(v);
+  assert.equal(v!.findings.length, 1);
+  assert.equal(
+    v!.findings[0].prior_round_acknowledgment,
+    "Round 2 accepted no cap for burst traffic, but this removed rate limiting entirely.",
+  );
+  assert.deepEqual(v!.findings[0].rejected_alternatives, ["token-bucket", "fixed-window"]);
+});
+
+test("parseStrictVerdict: a verdict omitting the cross-round fields parses successfully with both fields absent (#620)", () => {
+  const body =
+    '{"verdict":"needs-attention","summary":"s","findings":[' +
+    '{"severity":"high","title":"t","body":"b","confidence":0.9,"recommendation":"r"}],"next_steps":[]}';
+  const v = parseStrictVerdict(body, "a".repeat(40));
+  assert.ok(v);
+  assert.equal(v!.findings.length, 1);
+  assert.equal(v!.findings[0].prior_round_acknowledgment, undefined);
+  assert.equal(v!.findings[0].rejected_alternatives, undefined);
+});
+
+test("parseStructuredVerdict: a verdict omitting the cross-round fields parses successfully with both fields absent (#620)", () => {
+  const body =
+    '{"verdict":"needs-attention","summary":"s","findings":[' +
+    '{"severity":"high","title":"t","body":"b","confidence":0.9,"recommendation":"r"}],"next_steps":[]}';
+  const v = parseStructuredVerdict(body, "a".repeat(40));
+  assert.equal(v.findings.length, 1);
+  assert.equal(v.findings[0].prior_round_acknowledgment, undefined);
+  assert.equal(v.findings[0].rejected_alternatives, undefined);
+});
+
+test("parseStrictVerdict: non-string prior_round_acknowledgment is a contract violation — returns null (#620)", () => {
+  const body =
+    '{"verdict":"needs-attention","summary":"s","findings":[' +
+    '{"severity":"high","title":"t","body":"b","confidence":0.9,"recommendation":"r",' +
+    '"prior_round_acknowledgment":123}],"next_steps":[]}';
+  assert.equal(parseStrictVerdict(body, "a".repeat(40)), null);
+});
+
+test("parseStrictVerdict: rejected_alternatives containing a non-string element is a contract violation — returns null (#620)", () => {
+  const body =
+    '{"verdict":"needs-attention","summary":"s","findings":[' +
+    '{"severity":"high","title":"t","body":"b","confidence":0.9,"recommendation":"r",' +
+    '"rejected_alternatives":["alt-a",42]}],"next_steps":[]}';
+  assert.equal(parseStrictVerdict(body, "a".repeat(40)), null);
+});
+
+test("parseStrictVerdict: rejected_alternatives that is not an array is a contract violation — returns null (#620)", () => {
+  const body =
+    '{"verdict":"needs-attention","summary":"s","findings":[' +
+    '{"severity":"high","title":"t","body":"b","confidence":0.9,"recommendation":"r",' +
+    '"rejected_alternatives":"token-bucket"}],"next_steps":[]}';
+  assert.equal(parseStrictVerdict(body, "a".repeat(40)), null);
+});
+
+// Prove the round-trip reaches the guards, not just the parser (#389/#483 via #620).
+
+test("cross-round memory (#620): an acknowledged re-raise parsed by parseStrictVerdict on the delegated path is NOT demoted with reason reversal-unacknowledged", () => {
+  const settledSource: ReviewFinding = {
+    severity: "high", title: "cap missing", file: "src/limiter.ts", category: "correctness",
+    body: "b", confidence: 0.9, recommendation: "r",
+  };
+  const settled: SettledFinding[] = [
+    { key: findingKey(settledSource), surface: surfaceKey(settledSource), title: settledSource.title, round: 1, rejectedAlternatives: [] },
+  ];
+  const body =
+    '{"verdict":"needs-attention","summary":"s","findings":[' +
+    '{"severity":"high","title":"cap missing","body":"b","file":"src/limiter.ts","category":"correctness",' +
+    '"confidence":0.9,"recommendation":"r",' +
+    '"prior_round_acknowledgment":"Round 1 accepted no cap for burst traffic, but this change removed rate limiting entirely."}],' +
+    '"next_steps":[]}';
+  const verdict = parseStrictVerdict(body, "a".repeat(40));
+  assert.ok(verdict);
+  const p = partitionFindings(
+    verdict!.findings,
+    { block_threshold: "low", min_confidence: 0 },
+    new Map(), [], new Map(), null, settled,
+  );
+  assert.equal(
+    p.blocking.length, 1,
+    "an acknowledged reversal parsed via parseStrictVerdict must block — the round-trip reaches the guard, not just the parser",
+  );
+  assert.equal(p.advisory.filter((a) => a.reason === "reversal-unacknowledged").length, 0);
+});
+
+test("cross-round memory (#620): an unacknowledged re-raise parsed by parseStrictVerdict on the delegated path is still demoted to advisory (guard semantics unchanged)", () => {
+  const settledSource: ReviewFinding = {
+    severity: "high", title: "cap missing", file: "src/limiter.ts", category: "correctness",
+    body: "b", confidence: 0.9, recommendation: "r",
+  };
+  const settled: SettledFinding[] = [
+    { key: findingKey(settledSource), surface: surfaceKey(settledSource), title: settledSource.title, round: 1, rejectedAlternatives: [] },
+  ];
+  const body =
+    '{"verdict":"needs-attention","summary":"s","findings":[' +
+    '{"severity":"high","title":"cap missing","body":"b","file":"src/limiter.ts","category":"correctness",' +
+    '"confidence":0.9,"recommendation":"r"}],"next_steps":[]}';
+  const verdict = parseStrictVerdict(body, "a".repeat(40));
+  assert.ok(verdict);
+  const p = partitionFindings(
+    verdict!.findings,
+    { block_threshold: "low", min_confidence: 0 },
+    new Map(), [], new Map(), null, settled,
+  );
+  assert.equal(p.blocking.length, 0, "an unacknowledged reversal must still be demoted, exactly as on the local path");
+  assert.equal(p.advisory[0]?.reason, "reversal-unacknowledged");
+});
+
+test("cross-round memory (#620): rejected_alternatives parsed by parseStrictVerdict on the delegated path reaches the durable blockingFindings artifact entry", () => {
+  const body =
+    '{"verdict":"needs-attention","summary":"s","findings":[' +
+    '{"severity":"high","title":"cap missing","body":"b","file":"src/limiter.ts","category":"correctness",' +
+    '"confidence":0.9,"recommendation":"r","rejected_alternatives":["token-bucket","fixed-window"]}],' +
+    '"next_steps":[]}';
+  const verdict = parseStrictVerdict(body, SHA_A);
+  assert.ok(verdict);
+  const key = findingKey(verdict!.findings[0]);
+  const rendered = formatReviewComment(cfgSurface, verdict!, 2, "codex", new Set([key]));
+  const artifact = extractReviewArtifact(rendered);
+  assert.ok(artifact?.blockingFindings, "artifact must carry blockingFindings");
+  assert.deepEqual(artifact!.blockingFindings![0].rejectedAlternatives, ["token-bucket", "fixed-window"]);
 });
 
 // parseProseReview — Codex Markdown review (#50). Codex's standard `/codex:review`
