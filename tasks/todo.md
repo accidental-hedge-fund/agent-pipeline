@@ -122,3 +122,20 @@
 - OpenSpec validation passed: `npx openspec validate --all`.
 - Whitespace check passed: `git diff --check`.
 - Full CI passed: `npm run ci`.
+# Grok Primary / Codex Reviewer Configuration
+
+## Plan
+
+- [x] Create a dedicated worktree from `origin/main`.
+- [x] Configure Grok 4.5/high for planning, implementation, and fixes.
+- [x] Configure Codex GPT-5.6 Terra/high for review.
+- [x] Validate resolved routing and run repository CI.
+- [ ] Commit, push, open a PR against `main`, and monitor CI.
+
+## Review Results
+
+- Resolver check confirmed Grok / `grok-4.5` / high for planning,
+  implementation, and fixes, plus Codex / `gpt-5.6-terra` / high for review.
+- Focused config and scaffold coverage passed (257 tests).
+- Full repository CI passed: `npm run ci`.
+- Whitespace validation passed: `git diff --check`.
