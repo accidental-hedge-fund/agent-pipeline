@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "experiment_id": "release-smoke-grok-20260728",
+  "fixture_ids": ["implementing-scoreboard-filter"],
+  "mode": "implementing",
+  "treatments": {
+    "harness": ["grok"],
+    "model": ["grok-4.5"],
+    "effort": ["high"]
+  },
+  "replicates": 1,
+  "seed": 20260728,
+  "concurrency": 1,
+  "timeout": 1200,
+  "output_dir": ".agent-pipeline/evals",
+  "sandbox_mode": "external-bypass"
+}

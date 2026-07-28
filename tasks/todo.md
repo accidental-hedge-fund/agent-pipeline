@@ -58,6 +58,14 @@
 - Whitespace check passed: `git diff --check`.
 - Full CI passed: `npm run ci`.
 
+# Harness Evaluation — v1.28.1 Rerun
+
+- [x] Verify v1.28.1 includes #607 evaluator isolation and #608 repository-configured harness roles.
+- [ ] Run a two-cell release smoke: Codex and Grok as isolated primary implementers on the same frozen fixture.
+- [ ] Carry the paired primary → reviewer evaluator forward onto v1.28.1.
+- [ ] Run and grade the expanded paired corpus across valid primary/reviewer, model, and effort coordinates.
+- [ ] Publish a decision-grade comparison with limitations and a recommended default.
+
 # Config Sync Implementation Plan
 
 ## Checklist
