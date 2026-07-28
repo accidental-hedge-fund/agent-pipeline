@@ -29,7 +29,7 @@ import {
   removeBoundaryShim as removeBoundaryShimReal,
 } from "./boundary-shim.ts";
 import { materializeStagePrompt, stagesForMode } from "./stage-adapters.ts";
-import { parseStrictVerdict, parseStructuredVerdict } from "../stages/review-parsing.ts";
+import { isJsonVerdictShaped, parseProseReview, parseStrictVerdict, parseStructuredVerdict } from "../stages/review-parsing.ts";
 import type { BuildTreatmentTrajectoryInput, RawStageEntry } from "./trajectory/collect.ts";
 import type {
   BoundaryDenial,
@@ -1039,11 +1039,16 @@ export async function runCell(
  *  verdict the eval parses too:
  *    1. `parseStrictVerdict` — the treatment satisfied the full contract.
  *    2. `parseStructuredVerdict` — recovers a verdict parsed from JSON (fenced
- *       or inline) that did not satisfy the full contract. Its prose/text
- *       fallback (identifiable by the `_raw` field it attaches) is NOT
- *       treated as a verdict — that fallback returns `findings: []` for
- *       arbitrary text, which is exactly the "silently zero findings"
- *       outcome this parser exists to distinguish from a genuine miss.
+ *       or inline) that did not satisfy the full contract, or a Codex-style
+ *       prose review. Its prose/text fallback (identifiable by the `_raw`
+ *       field it attaches) is NOT treated as a verdict — that fallback
+ *       returns `findings: []` for arbitrary text, which is exactly the
+ *       "silently zero findings" outcome this parser exists to distinguish
+ *       from a genuine miss. A JSON recovery is only trusted when
+ *       `isJsonVerdictShaped` confirms the extracted JSON actually carries a
+ *       verdict discriminator and a findings array — an unrelated JSON blob
+ *       that merely contains the substring `"verdict"` (review 1 finding
+ *       e74066d5) does not satisfy this and falls through to unparseable.
  *    3. Otherwise `unparseable` — `findings` stays `undefined`, never `[]`. */
 function parseReviewFindings(stdout: string): { findings?: unknown[]; provenance: ReviewVerdictParseProvenance } {
   const strict = parseStrictVerdict(stdout);
@@ -1051,7 +1056,7 @@ function parseReviewFindings(stdout: string): { findings?: unknown[]; provenance
     return { findings: strict.findings, provenance: "strict" };
   }
   const structured = parseStructuredVerdict(stdout);
-  if (structured._raw === undefined) {
+  if (structured._raw === undefined && (isJsonVerdictShaped(stdout) || parseProseReview(stdout) !== null)) {
     return { findings: structured.findings, provenance: "tolerant" };
   }
   return { provenance: "unparseable" };

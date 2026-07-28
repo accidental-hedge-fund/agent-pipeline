@@ -687,6 +687,36 @@ export function tagCeilingFindingLines(
 // Verdict parsers
 // ---------------------------------------------------------------------------
 
+/** Whether `output` contains a JSON object that is genuinely verdict-shaped —
+ *  a valid `verdict` discriminator AND a `findings` array — as opposed to an
+ *  arbitrary JSON object that merely contains the substring `"verdict"`
+ *  somewhere (e.g. `{"message": "review unavailable"}` does not match; a
+ *  well-formed but incomplete verdict like `{"verdict": "approve",
+ *  "findings": []}` does). Callers that need to distinguish a recovered
+ *  verdict from `parseStructuredVerdict`'s prose/text fallback (identifiable
+ *  by its `_raw` field) from a genuinely JSON-parsed one can use this to
+ *  reject the arbitrary-JSON case before trusting the tolerant result (#606
+ *  review 1 finding e74066d5). */
+export function isJsonVerdictShaped(output: string): boolean {
+  const fenceMatch = output.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
+  const candidates: string[] = [];
+  if (fenceMatch) candidates.push(fenceMatch[1]);
+  const inlineMatch = output.match(/\{[\s\S]*"verdict"[\s\S]*\}/);
+  if (inlineMatch) candidates.push(inlineMatch[0]);
+
+  for (const candidate of candidates) {
+    try {
+      const data = JSON.parse(candidate) as Partial<ReviewVerdict>;
+      if ((data.verdict === "approve" || data.verdict === "needs-attention") && Array.isArray(data.findings)) {
+        return true;
+      }
+    } catch {
+      // try the next candidate
+    }
+  }
+  return false;
+}
+
 export function parseStructuredVerdict(
   output: string,
   commitSha = "",

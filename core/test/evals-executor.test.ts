@@ -1031,6 +1031,28 @@ test("runCell: prose-only review-mode output is recorded as unparseable, not as 
   assert.equal(result.outcome.result_class, "completed");
 });
 
+test("runCell: a verdict-field-only JSON object with no findings array is recorded as unparseable, not a verdict with zero findings", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      success: true,
+      timed_out: false,
+      exit_code: 0,
+      // No `findings` key at all — not verdict-shaped enough to trust as a
+      // recovered review (#606 review 1 finding e74066d5).
+      stdout: JSON.stringify({ verdict: "approve" }),
+      stderr: "",
+      duration: 1,
+    }),
+  };
+  const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
+  assert.equal(result.outcome.detail?.findings, undefined);
+  assert.equal(result.outcome.detail?.review_verdict_parse, "unparseable");
+  assert.equal(result.outcome.result_class, "completed");
+});
+
 test("runCell: empty review-mode stdout is recorded as unparseable", async () => {
   const deps: CellExecutionDeps = {
     createWorktree: async (_c, o) => o,
