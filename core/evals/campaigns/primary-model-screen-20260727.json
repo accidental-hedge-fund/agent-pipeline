@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "experiment_id": "primary-model-screen-20260727b",
+  "fixture_ids": [
+    "paired-create-issue-positive-number",
+    "paired-scoreboard-duplicate-cost",
+    "paired-release-non-pr-suffix",
+    "paired-plan-revision-fenced-feedback",
+    "paired-linked-checkout-worktree-discovery"
+  ],
+  "mode": "implementing",
+  "named_treatments": [
+    { "id": "grok-4-5", "primary": { "harness": "grok", "model": "grok-4.5" } },
+    { "id": "codex-gpt-5-6-terra-low", "primary": { "harness": "codex", "model": "gpt-5.6-terra", "effort": "low" } },
+    { "id": "codex-gpt-5-6-terra-high", "primary": { "harness": "codex", "model": "gpt-5.6-terra", "effort": "high" } },
+    { "id": "codex-gpt-5-4-high", "primary": { "harness": "codex", "model": "gpt-5.4", "effort": "high" } },
+    { "id": "codex-gpt-5-5-high", "primary": { "harness": "codex", "model": "gpt-5.5", "effort": "high" } },
+    { "id": "codex-gpt-5-3-codex-spark-medium", "primary": { "harness": "codex", "model": "gpt-5.3-codex-spark", "effort": "medium" } }
+  ],
+  "replicates": 1,
+  "seed": 20260727,
+  "concurrency": 1,
+  "timeout": 900,
+  "output_dir": ".agent-pipeline/evals"
+}

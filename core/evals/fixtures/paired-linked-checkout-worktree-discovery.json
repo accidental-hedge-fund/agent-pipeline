@@ -1,0 +1,25 @@
+{
+  "fixture_id": "paired-linked-checkout-worktree-discovery",
+  "schema_version": 1,
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Harden managed worktree discovery for linked Git checkouts. `git worktree list --porcelain` is common-dir-wide, but the configured relative worktree root must be resolved from every registered checkout, not only the invoking checkout. Add a pure resolver for the managed-root set and let porcelain parsing recognize a detached pipeline worktree below any of those roots. Preserve the single-root API behavior and add focused tests.",
+  "stage_entry_artifacts": {
+    "implementing": {
+      "plan": "Derive the de-duplicated managed roots from porcelain worktree records, accept either a legacy single root or the derived root set in porcelain parsing, classify detached pipeline worktrees below any managed root, and add linked-checkout regression coverage."
+    }
+  },
+  "public_checks": ["node --test test/worktree.test.ts"],
+  "hidden_checks": ["node --experimental-strip-types --input-type=module -e \"import assert from 'node:assert/strict'; import { parseWorktreePorcelain, resolveManagedRoots } from './core/scripts/worktree.ts'; const porcelain=['worktree /repo/main','HEAD 1','branch refs/heads/main','','worktree /repo/linked','HEAD 2','branch refs/heads/feature','','worktree /repo/linked/.worktrees/pipeline-42-linked','HEAD 3','detached',''].join('\\n'); const roots=resolveManagedRoots(porcelain,'.worktrees'); assert.deepEqual(roots.sort(),['/repo/linked/.worktrees','/repo/main/.worktrees']); const records=parseWorktreePorcelain(porcelain,roots); assert.ok(records.some(r=>r.issueNumber===42&&r.slug==='linked'&&r.underManagedRoot===true));\""] ,
+  "acceptance_criteria": [
+    {
+      "id": "recognizes-linked-checkout-managed-worktree",
+      "statement": "A detached pipeline worktree under a linked checkout's configured root is discovered as managed.",
+      "check_names": ["node --experimental-strip-types --input-type=module -e \"import assert from 'node:assert/strict'; import { parseWorktreePorcelain, resolveManagedRoots } from './core/scripts/worktree.ts'; const porcelain=['worktree /repo/main','HEAD 1','branch refs/heads/main','','worktree /repo/linked','HEAD 2','branch refs/heads/feature','','worktree /repo/linked/.worktrees/pipeline-42-linked','HEAD 3','detached',''].join('\\n'); const roots=resolveManagedRoots(porcelain,'.worktrees'); assert.deepEqual(roots.sort(),['/repo/linked/.worktrees','/repo/main/.worktrees']); const records=parseWorktreePorcelain(porcelain,roots); assert.ok(records.some(r=>r.issueNumber===42&&r.slug==='linked'&&r.underManagedRoot===true));\""]
+    }
+  ],
+  "allowed_change_paths": ["core/scripts/worktree.ts", "core/test/worktree.test.ts"],
+  "grader_refs": [{ "grader": "implementation-fix", "version": "1" }],
+  "category": "worktree-discovery",
+  "risk": "high",
+  "provenance": "synthetic"
+}

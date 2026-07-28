@@ -899,6 +899,44 @@ stage_executors:                     # optional: assign an executors: name to a 
   review-2: local-ollama
 ```
 
+### Harness-pair evaluations
+
+`pipeline evals` is separate from the production label-driven pipeline. It runs frozen tasks in disposable worktrees and never writes GitHub state, so use it to choose a primary implementer and an independent reviewer before changing a production profile.
+
+For a real primary → reviewer comparison, use explicit `named_treatments` rather than Cartesian `treatments`. Each pair preserves only valid harness-specific model/effort coordinates and executes implementation → review of the produced diff → optional fix → re-review under one cell timeout.
+
+```json
+{
+  "schema_version": 1,
+  "experiment_id": "harness-pair-pilot",
+  "fixture_ids": ["paired-create-issue-positive-number"],
+  "mode": "paired",
+  "named_treatments": [
+    {
+      "id": "codex-default__grok-4-5",
+      "primary": { "harness": "codex" },
+      "reviewer": { "harness": "grok", "model": "grok-4.5" }
+    }
+  ],
+  "replicates": 2,
+  "seed": 20260727,
+  "concurrency": 1,
+  "timeout": 900,
+  "output_dir": ".agent-pipeline/evals"
+}
+```
+
+Plan before spending model calls, then run, deterministically grade final worktree checks, and compare every candidate to the current production pair:
+
+```bash
+pipeline evals plan core/evals/campaigns/harness-pair-pilot.json --profile claude
+pipeline evals run core/evals/campaigns/harness-pair-pilot.json --profile claude
+pipeline evals grade .agent-pipeline/evals/harness-pair-pilot
+pipeline evals report .agent-pipeline/evals/harness-pair-pilot --baseline claude-sonnet__codex-default
+```
+
+The report keeps pair direction, phase duration, reliability, deterministic correctness, changed-path scope, and review convergence (initial/final blocking findings, malformed verdicts, and whether a fix was needed). It does **not** claim reviewer precision or recall from a primary-generated diff; use the seeded review fixtures for that independent measurement. Start with one replicate for capability and cost screening, then repeat only the viable pairs over a balanced deterministic corpus before changing production routing.
+
 ### Custom reviewer harness (`review_harness`)
 
 By default the review step runs on the profile's cross-harness reviewer (`codex` under `/pipeline`, `claude` under `$pipeline`). Set `review_harness` to point review at a different reviewer CLI instead — the implementer harness is unaffected and stays profile-owned:

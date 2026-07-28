@@ -1,0 +1,25 @@
+{
+  "fixture_id": "paired-scoreboard-duplicate-cost",
+  "schema_version": 1,
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Harden core/scripts/scoreboard.ts parseEstimateCosts so duplicate harness entries are rejected instead of silently letting the last value win. Preserve valid distinct estimates and add a focused regression test.",
+  "stage_entry_artifacts": {
+    "implementing": {
+      "plan": "Detect a repeated normalized harness name while parsing --estimate-cost entries, throw the existing user-facing validation error, and add a unit test covering duplicate values."
+    }
+  },
+  "public_checks": ["npm run ci"],
+  "hidden_checks": ["node --experimental-strip-types --input-type=module -e \"import { parseEstimateCosts } from './core/scripts/scoreboard.ts'; try { parseEstimateCosts(['codex=1','codex=2']); process.exit(1); } catch { process.exit(0); }\""],
+  "acceptance_criteria": [
+    {
+      "id": "rejects-duplicate-estimate-harness",
+      "statement": "parseEstimateCosts rejects duplicate harness entries rather than overwriting the first estimate.",
+      "check_names": ["node --experimental-strip-types --input-type=module -e \"import { parseEstimateCosts } from './core/scripts/scoreboard.ts'; try { parseEstimateCosts(['codex=1','codex=2']); process.exit(1); } catch { process.exit(0); }\""]
+    }
+  ],
+  "allowed_change_paths": ["core/scripts/scoreboard.ts", "core/test/scoreboard.test.ts"],
+  "grader_refs": [{ "grader": "implementation-fix", "version": "1" }],
+  "category": "input-validation",
+  "risk": "medium",
+  "provenance": "synthetic"
+}

@@ -71,5 +71,39 @@ export function stagesForMode(mode: EvalMode, fixture: Fixture): EvalStageName[]
   if (mode === "end-to-end") {
     return materializeEndToEndPrompts(fixture).map((p) => p.stage);
   }
+  if (mode === "paired") return [];
   return [mode];
+}
+
+/** Prompt a paired evaluator's reviewer with the exact diff produced in its
+ * own isolated worktree. The verdict shape is the production review schema,
+ * so paired results can use the same conservative finding parser. */
+export function materializePairedReviewPrompt(fixture: Fixture, diff: string, round: 1 | 2): string {
+  return [
+    `You are the ${round === 1 ? "first" : "final"} independent reviewer for this implementation.`,
+    "Review the actual diff below for correctness, safety, and adherence to the task.",
+    "Return JSON only, matching this schema. Do not claim approval when the diff is empty or the task is not met.",
+    REVIEW_VERDICT_SCHEMA_BLOCK,
+    "",
+    "## Task",
+    fixture.task_input,
+    "",
+    "## Actual diff",
+    diff || "(no changes)",
+  ].join("\n");
+}
+
+/** Give the primary only the reviewer findings it must address, not hidden
+ * grader checks or any production-state affordance. */
+export function materializePairedFixPrompt(fixture: Fixture, findings: unknown[]): string {
+  return [
+    "Address the blocking review findings with a minimal, surgical fix in the current worktree.",
+    "Do not discard unrelated existing work.",
+    "",
+    "## Task",
+    fixture.task_input,
+    "",
+    "## Blocking findings",
+    JSON.stringify(findings, null, 2),
+  ].join("\n");
 }

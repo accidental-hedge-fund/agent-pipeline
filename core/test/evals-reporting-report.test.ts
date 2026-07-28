@@ -150,6 +150,41 @@ test("reportExperiment: baseline is named, non-baseline treatment carries a pair
   assert.equal(codex.excluded_fixtures.length, 0);
 });
 
+test("reportExperiment: a named paired treatment retains ordered coordinates and convergence evidence", async () => {
+  const pairedManifest = {
+    ...manifest(),
+    mode: "paired",
+    treatments: undefined,
+    named_treatments: [{ id: "codex-grok", primary: { harness: "codex" }, reviewer: { harness: "grok", model: "grok-4.5" } }],
+  };
+  const pairedPlan = {
+    schema_version: 1,
+    experiment_id: "exp1",
+    seed: 5,
+    cells: [{ cell_id: "p1", experiment_id: "exp1", fixture_id: "f1", treatment_id: "codex-grok", treatment: { id: "codex-grok", primary: { harness: "codex" }, reviewer: { harness: "grok", model: "grok-4.5" } }, replicate: 1, mode: "paired", base_sha: SHA }],
+  };
+  const files = {
+    "/out/exp1/manifest.json": JSON.stringify(pairedManifest),
+    "/out/exp1/plan.json": JSON.stringify(pairedPlan),
+    "/out/exp1/runs.jsonl": JSON.stringify({ cell_id: "p1", experiment_id: "exp1", fixture_id: "f1", treatment_id: "codex-grok", replicate: 1, prompt_hash: "h", config_hash: "c", base_sha: SHA, result_class: "completed", detail: { stages: [], paired: { initial_blocking_findings: 2, final_blocking_findings: 1, fix_invoked: true, initial_review_malformed: false, final_review_malformed: true } } }) + "\n",
+    "/out/exp1/failures.jsonl": "",
+    "/out/exp1/grades.jsonl": JSON.stringify(reviewGrade("p1", "codex-grok", "f1", 1)) + "\n",
+  };
+  const deps = makeDeps(files);
+  const summary = await reportExperiment("/out", "exp1", new Map([["f1", fixture("f1")]]), { baselineTreatmentId: "codex-grok" }, deps);
+  assert.deepEqual(summary.treatments[0].paired, {
+    primary: { harness: "codex" },
+    reviewer: { harness: "grok", model: "grok-4.5" },
+    completed_cells: 1,
+    fix_invoked_cells: 1,
+    initial_blocking_findings: 2,
+    final_blocking_findings: 1,
+    resolved_blocking_findings: 1,
+    malformed_initial_reviews: 0,
+    malformed_final_reviews: 1,
+  });
+});
+
 test("reportExperiment: an infra_error cell counts toward reliability, not quality", async () => {
   const runRecords = [
     { cell_id: "c1", experiment_id: "exp1", fixture_id: "f1", treatment_id: "harness=claude", replicate: 1, prompt_hash: "h", config_hash: "c", base_sha: SHA, result_class: "completed", detail: { stages: [] } },

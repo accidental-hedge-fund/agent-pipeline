@@ -16,7 +16,7 @@ import { costFromDetail, summarizeCost } from "./cost.ts";
 import type { CellRecord, ExperimentManifest, Fixture, RunPlan } from "../types.ts";
 import type { ArtifactDescriptor } from "../trajectory/types.ts";
 import type { GradeRecord, JudgeDisagreementRecord, ReviewGrade } from "../grading/types.ts";
-import type { GroupDimension, LinkedArtifactEntry, ReliabilityRates, Summary, TreatmentSummary } from "./types.ts";
+import type { GroupDimension, LinkedArtifactEntry, PairedConvergenceSummary, ReliabilityRates, Summary, TreatmentSummary } from "./types.ts";
 import { SUMMARY_SCHEMA_VERSION } from "./types.ts";
 
 const GROUP_DIMENSIONS: GroupDimension[] = ["stage", "harness", "provider", "model", "effort", "category", "risk"];
@@ -247,6 +247,30 @@ export function generateSummary(
     return durations.length === 0 ? null : durations.reduce((a, b) => a + b, 0) / durations.length;
   }
 
+  function pairedConvergenceFor(treatmentId: string): PairedConvergenceSummary | undefined {
+    const treatment = plan.cells.find((cell) => cell.treatment_id === treatmentId)?.treatment;
+    if (!treatment?.primary || !treatment.reviewer) return undefined;
+    const paired = runs
+      .filter((record) => record.treatment_id === treatmentId)
+      .map((record) => record.detail?.paired)
+      .filter((value): value is Record<string, unknown> => typeof value === "object" && value !== null);
+    const numberField = (name: string) => paired.reduce((sum, value) => sum + (typeof value[name] === "number" ? value[name] as number : 0), 0);
+    const trueField = (name: string) => paired.filter((value) => value[name] === true).length;
+    const initial = numberField("initial_blocking_findings");
+    const final = numberField("final_blocking_findings");
+    return {
+      primary: treatment.primary,
+      reviewer: treatment.reviewer,
+      completed_cells: paired.length,
+      fix_invoked_cells: trueField("fix_invoked"),
+      initial_blocking_findings: initial,
+      final_blocking_findings: final,
+      resolved_blocking_findings: Math.max(0, initial - final),
+      malformed_initial_reviews: trueField("initial_review_malformed"),
+      malformed_final_reviews: trueField("final_review_malformed"),
+    };
+  }
+
   const baselineValues = qualityByTreatmentFixture.get(opts.baselineTreatmentId) ?? new Map();
 
   const treatments: TreatmentSummary[] = treatmentIds.map((treatmentId) => {
@@ -259,6 +283,7 @@ export function generateSummary(
       qualityDelta = bootstrapEffect(pairing.deltas, intervalMethod, underpoweredThreshold);
       excludedFixtures = pairing.excludedFixtures;
     }
+    const paired = pairedConvergenceFor(treatmentId);
     return {
       treatment_id: treatmentId,
       reliability: reliabilityFor(treatmentId),
@@ -266,6 +291,7 @@ export function generateSummary(
       excluded_fixtures: excludedFixtures,
       mean_duration_sec: meanDurationFor(treatmentId),
       cost: costFor(treatmentId),
+      ...(paired ? { paired } : {}),
     };
   });
 

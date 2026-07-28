@@ -9,6 +9,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { createWorktreeAt, removeWorktreeAt } from "../worktree.ts";
 import { invoke as harnessInvoke } from "../harness.ts";
 import { resolveAdapter } from "../harness-adapters/index.ts";
@@ -28,7 +29,7 @@ import {
   readBoundaryDenials as readBoundaryDenialsReal,
   removeBoundaryShim as removeBoundaryShimReal,
 } from "./boundary-shim.ts";
-import { materializeStagePrompt, stagesForMode } from "./stage-adapters.ts";
+import { materializePairedFixPrompt, materializePairedReviewPrompt, materializeStagePrompt, stagesForMode } from "./stage-adapters.ts";
 import { isJsonVerdictShaped, parseProseReview, parseStrictVerdict, parseStructuredVerdict } from "../stages/review-parsing.ts";
 import type { BuildTreatmentTrajectoryInput, RawStageEntry } from "./trajectory/collect.ts";
 import type {
@@ -44,6 +45,7 @@ import type {
   ReviewVerdictParseProvenance,
   SandboxMode,
   Treatment,
+  HarnessCoordinate,
 } from "./types.ts";
 
 function sanitizeForPath(cellId: string): string {
@@ -292,6 +294,8 @@ export interface CellExecutionDeps {
    *  given worktree. Only invoked when the fixture declares
    *  `allowed_change_paths` (out-of-scope-change grading needs it). */
   getChangedPaths?: (args: { worktreeDir: string; baseSha: string }) => Promise<string[]>;
+  /** Return the current cell diff from its immutable fixture base. */
+  getDiff?: (args: { worktreeDir: string; baseSha: string }) => Promise<string>;
   /** Dispatch an API treatment through a named `model-endpoint` executor
    *  (#434 task 6). Only invoked when the cell's treatment declares
    *  `executor`. */
@@ -359,6 +363,18 @@ async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: stri
     return stdout.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
   } catch {
     return [];
+  }
+}
+
+async function defaultGetDiff(args: { worktreeDir: string; baseSha: string }): Promise<string> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileAsync = promisify(execFile);
+  try {
+    const { stdout } = await execFileAsync("git", ["diff", "--no-ext-diff", args.baseSha], { cwd: args.worktreeDir, timeout: 30_000 });
+    return stdout;
+  } catch {
+    return "";
   }
 }
 
@@ -561,7 +577,9 @@ export async function runCell(
 
   const stages: EvalStageName[] = stagesForMode(cell.mode, fixture);
   const prompts = stages.map((stage) => materializeStagePrompt(stage, fixture));
-  const materializedPrompt = prompts.join("\n\n---\n\n");
+  const materializedPrompt = cell.mode === "paired"
+    ? `${materializeStagePrompt("implementing", fixture)}\n\n--- paired reviewer/fix prompts derive from this cell's actual diff ---`
+    : prompts.join("\n\n---\n\n");
   const effectiveConfig: Record<string, unknown> = {
     mode: cell.mode,
     treatment: cell.treatment,
@@ -731,6 +749,121 @@ export async function runCell(
         return finish({ result_class: "infra_error", error });
       }
       trajectoryActions.push(`ran setup for simulated dependency ${JSON.stringify(dep.name)}`);
+    }
+
+    if (cell.mode === "paired") {
+      const primary = cell.treatment.primary;
+      const reviewer = cell.treatment.reviewer;
+      if (!primary || !reviewer) {
+        return finish({ result_class: "infra_error", error: "paired cell is missing primary or reviewer treatment coordinates" });
+      }
+      const coordinates: Array<["primary" | "reviewer", HarnessCoordinate]> = [["primary", primary], ["reviewer", reviewer]];
+      for (const [role, coordinate] of coordinates) {
+        let preflight: PreflightResultLike;
+        try {
+          preflight = await preflightFn(coordinate.harness, { model: coordinate.model, effort: coordinate.effort });
+        } catch (err) {
+          return finish({ result_class: "infra_error", error: `${role} preflight failed: ${(err as Error).message}` });
+        }
+        if (!preflight.ok) {
+          const resultClass = preflight.failure === "unauthenticated" ? "auth_error" : "infra_error";
+          return finish({ result_class: resultClass, error: `${role} preflight failed: ${preflight.message ?? preflight.failure}` });
+        }
+        trajectoryActions.push(`preflight passed for ${role} harness "${coordinate.harness}"`);
+      }
+
+      const deadline = Date.now() + manifest.timeout * 1000;
+      const phaseDetails: Record<string, unknown>[] = [];
+      const invokePairPhase = async (
+        phase: "implementing" | "review-1" | "fix" | "review-2",
+        role: "primary" | "reviewer",
+        coordinate: HarnessCoordinate,
+        prompt: string,
+      ): Promise<{ result?: HarnessInvokeResultLike; outcome?: CellOutcome }> => {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) return { outcome: { result_class: "timeout", error: `paired cell exceeded its ${manifest.timeout}s deadline before ${phase}` } };
+        let result: HarnessInvokeResultLike;
+        try {
+          result = await invokeHarnessFn({
+            harness: coordinate.harness,
+            worktreeDir: identity.worktreePath,
+            prompt,
+            timeoutSec: Math.max(1, Math.ceil(remainingMs / 1000)),
+            model: coordinate.model,
+            effort: coordinate.effort,
+            gh: ghSurface,
+            env: isolatedGhEnv(identity.worktreePath),
+          });
+        } catch (err) {
+          return { outcome: { result_class: "infra_error", error: `${phase} harness invocation failed: ${(err as Error).message}` } };
+        }
+        trajectoryStages.push({ stage: phase, message: prompt, output: result.stdout, error: result.success ? undefined : result.stderr, duration_ms: Math.round(result.duration * 1000), success: result.success });
+        phaseDetails.push({ phase, role, harness: coordinate.harness, model: coordinate.model ?? null, effort: coordinate.effort ?? null, success: result.success, exit_code: result.exit_code, duration: result.duration });
+        if (result.timed_out) return { outcome: { result_class: "timeout", error: `${phase} exceeded the paired cell deadline` } };
+        if (result.spawn_error) return { outcome: { result_class: "infra_error", error: `${phase} failed to spawn the ${coordinate.harness} harness` } };
+        if (!result.success) {
+          const authFailure = await classifyPostInvocationFailure(result, preflightFn, coordinate.harness, { model: coordinate.model, effort: coordinate.effort });
+          if (authFailure) return { outcome: { result_class: "auth_error", error: `${phase} ${authFailure}` } };
+        }
+        trajectoryActions.push(`invoked ${phase} via ${role} harness "${coordinate.harness}" (${result.success ? "success" : "failure"})`);
+        return { result };
+      };
+
+      const implementation = await invokePairPhase("implementing", "primary", primary, materializeStagePrompt("implementing", fixture));
+      if (implementation.outcome) return finish(implementation.outcome);
+      const getDiffFn = deps.getDiff ?? defaultGetDiff;
+      const initialDiff = await getDiffFn({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
+      const initialReview = await invokePairPhase("review-1", "reviewer", reviewer, materializePairedReviewPrompt(fixture, initialDiff, 1));
+      if (initialReview.outcome) return finish(initialReview.outcome);
+      const initialFindings = parseReviewFindings(initialReview.result!.stdout);
+      const isBlockingFinding = (entry: unknown): boolean => {
+        if (typeof entry !== "object" || entry === null) return false;
+        const finding = entry as Record<string, unknown>;
+        const severity = finding.severity;
+        const confidence = finding.confidence;
+        const threshold = cfg.review_policy?.block_threshold ?? "high";
+        const rank: Record<string, number> = { low: 1, medium: 2, high: 3, critical: 4 };
+        return (finding.blocking === true || (typeof severity === "string" && (rank[severity] ?? 0) >= (rank[threshold] ?? 3))) &&
+          (typeof confidence !== "number" || confidence >= (cfg.review_policy?.min_confidence ?? 0.7));
+      };
+      const blockingFindings = (initialFindings ?? []).filter(isBlockingFinding);
+      let fixInvoked = false;
+      if (blockingFindings.length > 0) {
+        fixInvoked = true;
+        const fix = await invokePairPhase("fix", "primary", primary, materializePairedFixPrompt(fixture, blockingFindings));
+        if (fix.outcome) return finish(fix.outcome);
+      }
+      const finalDiff = await getDiffFn({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
+      const finalReview = await invokePairPhase("review-2", "reviewer", reviewer, materializePairedReviewPrompt(fixture, finalDiff, 2));
+      if (finalReview.outcome) return finish(finalReview.outcome);
+      const finalFindings = parseReviewFindings(finalReview.result!.stdout);
+      const allChecks = [...fixture.public_checks, ...(fixture.hidden_checks ?? [])];
+      const detail: Record<string, unknown> = {
+        stages: phaseDetails,
+        execution_class: "local-cli",
+        paired: {
+          primary,
+          reviewer,
+          initial_diff_hash: createHash("sha256").update(initialDiff).digest("hex"),
+          final_diff_hash: createHash("sha256").update(finalDiff).digest("hex"),
+          initial_review_malformed: initialFindings === undefined,
+          final_review_malformed: finalFindings === undefined,
+          initial_findings: initialFindings ?? [],
+          final_findings: finalFindings ?? [],
+          initial_blocking_findings: blockingFindings.length,
+          final_blocking_findings: (finalFindings ?? []).filter(isBlockingFinding).length,
+          fix_invoked: fixInvoked,
+        },
+      };
+      if (allChecks.length > 0) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) return finish({ result_class: "timeout", error: `paired cell exceeded its ${manifest.timeout}s deadline before checks` });
+        detail.checks = await (deps.runChecks ?? defaultRunChecks)({ worktreeDir: identity.worktreePath, checks: allChecks, deadlineMs: remainingMs });
+        if (Date.now() > deadline) return finish({ result_class: "timeout", error: `paired cell exceeded its ${manifest.timeout}s deadline while running checks` });
+      }
+      if (fixture.allowed_change_paths !== undefined) detail.changed_paths = await (deps.getChangedPaths ?? defaultGetChangedPaths)({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
+      if (environmentDetail !== undefined) detail.environment = environmentDetail;
+      return finish({ result_class: "completed", detail });
     }
 
     // API treatment path (#434 task 6): the cell binds to a named

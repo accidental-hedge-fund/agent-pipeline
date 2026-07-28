@@ -11,6 +11,8 @@ import {
   type EvalMode,
   type ExperimentManifest,
   type Fixture,
+  type HarnessCoordinate,
+  type NamedTreatment,
   type RunPlan,
   type SandboxMode,
   type Treatment,
@@ -80,54 +82,72 @@ export function validateManifest(raw: unknown, knownFixtureIds: Set<string>): Ex
   }
 
   const mode = obj.mode;
-  if (typeof mode !== "string" || (mode !== "end-to-end" && !(EVAL_STAGE_NAMES as readonly string[]).includes(mode))) {
+  if (typeof mode !== "string" || (mode !== "end-to-end" && mode !== "paired" && !(EVAL_STAGE_NAMES as readonly string[]).includes(mode))) {
     throw new ManifestValidationError(
       "mode",
-      `must be "end-to-end" or one of: ${EVAL_STAGE_NAMES.join(", ")} — got ${JSON.stringify(mode)}`,
+      `must be "end-to-end", "paired", or one of: ${EVAL_STAGE_NAMES.join(", ")} — got ${JSON.stringify(mode)}`,
     );
   }
 
   const treatmentsRaw = obj.treatments;
-  if (typeof treatmentsRaw !== "object" || treatmentsRaw === null || Array.isArray(treatmentsRaw)) {
-    throw new ManifestValidationError("treatments", "required object field (treatment axes) is missing");
+  const namedRaw = obj.named_treatments;
+  if (treatmentsRaw !== undefined && namedRaw !== undefined) {
+    throw new ManifestValidationError("treatments", "must not be declared together with named_treatments");
   }
-  const treatmentsObj = treatmentsRaw as Record<string, unknown>;
-  const treatments: TreatmentAxes = {};
-  let hasAnyAxis = false;
-  for (const key of Object.keys(treatmentsObj)) {
-    if (!(AXIS_KEYS as readonly string[]).includes(key)) {
-      throw new ManifestValidationError("treatments", `unknown treatment axis "${key}"`);
+  let treatments: TreatmentAxes | undefined;
+  let namedTreatments: NamedTreatment[] | undefined;
+  if (treatmentsRaw !== undefined) {
+    if (typeof treatmentsRaw !== "object" || treatmentsRaw === null || Array.isArray(treatmentsRaw)) {
+      throw new ManifestValidationError("treatments", "must be an object when present");
     }
-    const values = treatmentsObj[key];
-    if (!Array.isArray(values) || values.length === 0 || values.some((v) => typeof v !== "string")) {
-      throw new ManifestValidationError("treatments", `axis "${key}" must be a non-empty string[]`);
-    }
-    if (key === "params") {
-      // Each entry is a JSON-encoded ModelEndpointParams object, validated
-      // against the same allowlist a committed executor's `params:` uses
-      // (#434 task 6.1) — an invalid entry fails manifest load, before any
-      // cell is produced or request sent.
-      for (const raw of values as string[]) {
+    const treatmentsObj = treatmentsRaw as Record<string, unknown>;
+    treatments = {};
+    let hasAnyAxis = false;
+    for (const key of Object.keys(treatmentsObj)) {
+      if (!(AXIS_KEYS as readonly string[]).includes(key)) throw new ManifestValidationError("treatments", `unknown treatment axis "${key}"`);
+      const values = treatmentsObj[key];
+      if (!Array.isArray(values) || values.length === 0 || values.some((v) => typeof v !== "string")) throw new ManifestValidationError("treatments", `axis "${key}" must be a non-empty string[]`);
+      if (key === "params") for (const raw of values as string[]) {
         let parsed: unknown;
-        try {
-          parsed = JSON.parse(raw);
-        } catch (err) {
-          throw new ManifestValidationError("treatments", `axis "params" entry ${JSON.stringify(raw)} is not valid JSON: ${(err as Error).message}`);
-        }
+        try { parsed = JSON.parse(raw); } catch (err) { throw new ManifestValidationError("treatments", `axis "params" entry ${JSON.stringify(raw)} is not valid JSON: ${(err as Error).message}`); }
         const result = ModelEndpointParamsSchema.safeParse(parsed);
         if (!result.success) {
           const issue = result.error.issues[0];
-          const field = issue?.path?.join(".") || "<params>";
-          throw new ManifestValidationError("treatments", `axis "params" entry ${JSON.stringify(raw)} is invalid: ${field}: ${issue?.message ?? "invalid value"}`);
+          throw new ManifestValidationError("treatments", `axis "params" entry ${JSON.stringify(raw)} is invalid: ${issue?.path?.join(".") || "<params>"}: ${issue?.message ?? "invalid value"}`);
         }
       }
+      treatments[key as keyof TreatmentAxes] = values as string[];
+      hasAnyAxis = true;
     }
-    treatments[key as keyof TreatmentAxes] = values as string[];
-    hasAnyAxis = true;
+    if (!hasAnyAxis) throw new ManifestValidationError("treatments", "at least one treatment axis is required");
+  } else if (namedRaw !== undefined) {
+    if (!Array.isArray(namedRaw) || namedRaw.length === 0) throw new ManifestValidationError("named_treatments", "must be a non-empty array when present");
+    const coordinate = (raw: unknown, field: string): HarnessCoordinate => {
+      if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new ManifestValidationError(field, "must be an object");
+      const value = raw as Record<string, unknown>;
+      if (Object.keys(value).some((k) => !["harness", "model", "effort"].includes(k))) throw new ManifestValidationError(field, "contains an unknown coordinate field");
+      if (typeof value.harness !== "string" || value.harness.length === 0) throw new ManifestValidationError(field, "requires a non-empty harness");
+      if (value.model !== undefined && typeof value.model !== "string") throw new ManifestValidationError(field, "model must be a string when present");
+      if (value.effort !== undefined && typeof value.effort !== "string") throw new ManifestValidationError(field, "effort must be a string when present");
+      return { harness: value.harness, ...(typeof value.model === "string" ? { model: value.model } : {}), ...(typeof value.effort === "string" ? { effort: value.effort } : {}) };
+    };
+    const seen = new Set<string>();
+    namedTreatments = namedRaw.map((raw, index) => {
+      if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new ManifestValidationError(`named_treatments[${index}]`, "must be an object");
+      const value = raw as Record<string, unknown>;
+      if (Object.keys(value).some((k) => !["id", "primary", "reviewer"].includes(k))) throw new ManifestValidationError(`named_treatments[${index}]`, "contains an unknown field");
+      if (typeof value.id !== "string" || !/^[A-Za-z0-9_-]+$/.test(value.id)) throw new ManifestValidationError(`named_treatments[${index}].id`, "must be a path-safe identifier");
+      if (seen.has(value.id)) throw new ManifestValidationError("named_treatments", `duplicates id "${value.id}"`);
+      seen.add(value.id);
+      const primary = coordinate(value.primary, `named_treatments[${index}].primary`);
+      const reviewer = value.reviewer === undefined ? undefined : coordinate(value.reviewer, `named_treatments[${index}].reviewer`);
+      if (mode === "paired" && !reviewer) throw new ManifestValidationError(`named_treatments[${index}].reviewer`, "is required for paired mode");
+      return { id: value.id, primary, ...(reviewer ? { reviewer } : {}) };
+    });
+  } else {
+    throw new ManifestValidationError("treatments", "either treatments or named_treatments is required");
   }
-  if (!hasAnyAxis) {
-    throw new ManifestValidationError("treatments", "at least one treatment axis is required");
-  }
+  if (mode === "paired" && !namedTreatments) throw new ManifestValidationError("named_treatments", "is required for paired mode");
 
   const replicates = requireNumber("replicates");
   if (!Number.isInteger(replicates) || replicates < 1) {
@@ -164,7 +184,8 @@ export function validateManifest(raw: unknown, knownFixtureIds: Set<string>): Ex
     experiment_id: experimentId,
     fixture_ids: fixtureIds as string[],
     mode: mode as EvalMode,
-    treatments,
+    ...(treatments ? { treatments } : {}),
+    ...(namedTreatments ? { named_treatments: namedTreatments } : {}),
     replicates,
     seed,
     concurrency,
@@ -199,6 +220,7 @@ export function loadManifest(
  *  object rather than a string, so it is stringified deterministically
  *  (sorted keys) rather than relying on default object-to-string coercion. */
 export function treatmentId(treatment: Treatment): string {
+  if (treatment.id) return treatment.id;
   return AXIS_KEYS
     .filter((k) => treatment[k] !== undefined)
     .map((k) => `${k}=${k === "params" ? stableStringify(treatment.params) : treatment[k]}`)
@@ -231,7 +253,11 @@ function cartesianTreatments(axes: TreatmentAxes): Treatment[] {
  *  produce the same plan (design.md decision 1/2). */
 export function expandPlan(manifest: ExperimentManifest, fixtures: Map<string, Fixture>): RunPlan {
   const cells: Cell[] = [];
-  const treatments = cartesianTreatments(manifest.treatments);
+  const treatments = manifest.named_treatments
+    ? manifest.named_treatments.map((t) => manifest.mode === "paired"
+      ? ({ id: t.id, primary: t.primary, ...(t.reviewer ? { reviewer: t.reviewer } : {}) })
+      : ({ id: t.id, harness: t.primary.harness, ...(t.primary.model ? { model: t.primary.model } : {}), ...(t.primary.effort ? { effort: t.primary.effort } : {}) }))
+    : cartesianTreatments(manifest.treatments!);
   for (const fixtureId of manifest.fixture_ids) {
     const fixture = fixtures.get(fixtureId);
     if (!fixture) {

@@ -97,6 +97,18 @@ test("expandExperiment: invalid fixture fails the experiment before execution, n
   assert.throws(() => expandExperiment("/manifest.json", "/fixtures", deps), /f1/);
 });
 
+test("expandExperiment: paired mode requires an implementing entry artifact before execution", () => {
+  const { deps } = makeHarness(
+    { f1: makeFixtureFile("f1", "review") },
+    makeManifestFile({
+      mode: "paired",
+      treatments: undefined,
+      named_treatments: [{ id: "codex-grok", primary: { harness: "codex" }, reviewer: { harness: "grok" } }],
+    }),
+  );
+  assert.throws(() => expandExperiment("/manifest.json", "/fixtures", deps), /implementing/);
+});
+
 test("planExperiment: writes manifest.json and plan.json before any cell runs, invokes no harness and creates no worktree", async () => {
   const { deps, outFiles } = makeHarness({ f1: makeFixtureFile("f1") }, makeManifestFile());
   const { manifest, plan } = await planExperiment(FAKE_CFG, "/manifest.json", "/fixtures", deps);

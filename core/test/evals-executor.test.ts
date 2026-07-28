@@ -117,6 +117,22 @@ function successResult() {
   return { success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 };
 }
 
+const PAIRED_MANIFEST = validateManifest(
+  {
+    schema_version: 1,
+    experiment_id: "exp1",
+    fixture_ids: ["f1"],
+    mode: "paired",
+    named_treatments: [{ id: "codex-grok", primary: { harness: "codex" }, reviewer: { harness: "grok", model: "grok-4.5" } }],
+    replicates: 1,
+    seed: 1,
+    concurrency: 1,
+    timeout: 60,
+    output_dir: ".agent-pipeline/evals",
+  },
+  new Set(["f1"]),
+);
+
 test("allocateCellIdentity: distinct cell_ids never collide on path, branch, or session", () => {
   const cellA = makeCell({ cell_id: "exp1/f1/harness=claude/1" });
   const cellB = makeCell({ cell_id: "exp1/f1/harness=claude/2", replicate: 2 });
@@ -2004,4 +2020,109 @@ test("runCell: a live environment dependency does not block or require a simulat
   const fixture = makeFixture("f1", "review", [envDep({ name: "github-api", mode: "live" })]);
   const result = await runCell(FAKE_CFG, makeCell(), fixture, MANIFEST, deps);
   assert.equal(result.outcome.result_class, "completed");
+});
+
+test("runCell: paired mode hands the actual diff to a distinct reviewer and skips fix without blocking findings", async () => {
+  const prompts: Array<{ harness: string; prompt: string }> = [];
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    getDiff: async () => "diff --git a/x.ts b/x.ts\n+added line",
+    invokeHarness: async (args) => {
+      prompts.push({ harness: args.harness, prompt: args.prompt });
+      if (args.harness === "grok") return { ...successResult(), stdout: JSON.stringify({ verdict: "approve", findings: [], next_steps: [] }) };
+      return successResult();
+    },
+  };
+  const cell = makeCell({
+    cell_id: "exp1/f1/codex-grok/1",
+    treatment_id: "codex-grok",
+    treatment: { id: "codex-grok", primary: { harness: "codex" }, reviewer: { harness: "grok", model: "grok-4.5" } },
+    mode: "paired",
+  });
+  const result = await runCell(FAKE_CFG, cell, makeFixture("f1", "implementing"), PAIRED_MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.deepEqual(prompts.map((p) => p.harness), ["codex", "grok", "grok"]);
+  assert.match(prompts[1].prompt, /diff --git a\/x\.ts b\/x\.ts/);
+  assert.equal((result.outcome.detail!.paired as Record<string, unknown>).fix_invoked, false);
+  assert.deepEqual(result.ghRefusals, []);
+});
+
+test("runCell: paired mode stops before implementation when the reviewer preflight is unauthenticated", async () => {
+  let invoked = false;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async (harness) => harness === "grok"
+      ? { ok: false, failure: "unauthenticated", message: "grok login expired" }
+      : { ok: true },
+    invokeHarness: async () => { invoked = true; return successResult(); },
+  };
+  const cell = makeCell({
+    treatment_id: "codex-grok",
+    treatment: { id: "codex-grok", primary: { harness: "codex" }, reviewer: { harness: "grok" } },
+    mode: "paired",
+  });
+  const result = await runCell(FAKE_CFG, cell, makeFixture("f1", "implementing"), PAIRED_MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "auth_error");
+  assert.match(result.outcome.error ?? "", /reviewer preflight.*grok login expired/);
+  assert.equal(invoked, false);
+});
+
+test("runCell: paired mode returns blocking findings to the primary, then re-reviews its changed diff", async () => {
+  const prompts: Array<{ harness: string; prompt: string }> = [];
+  let reviewCount = 0;
+  let diffCount = 0;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    getDiff: async () => ++diffCount === 1 ? "diff --git a/x.ts b/x.ts\n+broken" : "diff --git a/x.ts b/x.ts\n+fixed",
+    invokeHarness: async (args) => {
+      prompts.push({ harness: args.harness, prompt: args.prompt });
+      if (args.harness !== "grok") return successResult();
+      reviewCount++;
+      return {
+        ...successResult(),
+        stdout: reviewCount === 1
+          ? "```json\n{\"verdict\":\"request_changes\",\"findings\":[{\"blocking\":true,\"severity\":\"high\",\"confidence\":0.9}],\"next_steps\":[]}\n```"
+          : JSON.stringify({ verdict: "approve", findings: [], next_steps: [] }),
+      };
+    },
+  };
+  const cell = makeCell({
+    cell_id: "exp1/f1/codex-grok/1",
+    treatment_id: "codex-grok",
+    treatment: { id: "codex-grok", primary: { harness: "codex" }, reviewer: { harness: "grok", model: "grok-4.5" } },
+    mode: "paired",
+  });
+  const result = await runCell(FAKE_CFG, cell, makeFixture("f1", "implementing"), PAIRED_MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.deepEqual(prompts.map((p) => p.harness), ["codex", "grok", "codex", "grok"]);
+  assert.match(prompts[2].prompt, /blocking findings/i);
+  assert.match(prompts[3].prompt, /\+fixed/);
+  const paired = result.outcome.detail!.paired as Record<string, unknown>;
+  assert.equal(paired.fix_invoked, true);
+  assert.equal(paired.initial_blocking_findings, 1);
+  assert.equal(paired.final_blocking_findings, 0);
+});
+
+test("runCell: paired mode records malformed reviewer output without treating it as approval", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async (args) => args.harness === "grok" ? { ...successResult(), stdout: "not a verdict" } : successResult(),
+  };
+  const cell = makeCell({
+    treatment_id: "codex-grok",
+    treatment: { id: "codex-grok", primary: { harness: "codex" }, reviewer: { harness: "grok" } },
+    mode: "paired",
+  });
+  const result = await runCell(FAKE_CFG, cell, makeFixture("f1", "implementing"), PAIRED_MANIFEST, deps);
+  const paired = result.outcome.detail!.paired as Record<string, unknown>;
+  assert.equal(paired.initial_review_malformed, true);
+  assert.equal(paired.final_review_malformed, true);
+  assert.equal(paired.fix_invoked, false);
 });

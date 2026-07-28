@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "experiment_id": "reviewer-screen-20260727b",
+  "fixture_ids": ["review-graded-seeded-defects"],
+  "mode": "review",
+  "named_treatments": [
+    { "id": "codex-default", "primary": { "harness": "codex" } },
+    { "id": "grok-4-5", "primary": { "harness": "grok", "model": "grok-4.5" } }
+  ],
+  "replicates": 2,
+  "seed": 20260727,
+  "concurrency": 1,
+  "timeout": 300,
+  "output_dir": ".agent-pipeline/evals"
+}

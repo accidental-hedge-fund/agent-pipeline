@@ -1,0 +1,25 @@
+{
+  "fixture_id": "paired-release-non-pr-suffix",
+  "schema_version": 1,
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Harden core/scripts/stages/release.ts discoverShippedPRs so a commit subject ending in a single `(#N)` is not automatically treated as a shipped pull request. Preserve genuine squash-merge and merge-commit detection. For a suffix-only candidate, classify it through the existing injected release dependency: exclude it with a warning when GitHub says it is not a pull request, but retain it when classification itself fails. Add focused regression tests.",
+  "stage_entry_artifacts": {
+    "implementing": {
+      "plan": "Separate unambiguous merge-commit PR numbers from suffix-only candidates, classify only the suffix candidates through an injected dependency, retain genuine PRs and classification-error candidates, and add a regression test for a docs commit ending in an issue reference."
+    }
+  },
+  "public_checks": ["node --test test/release.test.ts"],
+  "hidden_checks": ["node --experimental-strip-types --input-type=module -e \"import assert from 'node:assert/strict'; import { discoverShippedPRs } from './core/scripts/stages/release.ts'; const warnings=[]; const deps={runCommand:()=>({code:0,stdout:'docs: release note (#451)\\nfeat: shipped feature (#203)',stderr:''}),fetchPRTitle:async n=>'PR #'+n,classifyPR:async n=>n===451?{kind:'not-a-pr'}:{kind:'pr'},stderr:m=>warnings.push(m)}; const prs=await discoverShippedPRs('v1.20.0','.',deps); assert.deepEqual(prs,[{number:203,title:'PR #203'}]); assert.ok(warnings.some(m=>m.includes('#451')&&m.includes('not a pull request')));\""] ,
+  "acceptance_criteria": [
+    {
+      "id": "excludes-confirmed-non-pr-suffix",
+      "statement": "A suffix-only candidate that GitHub classifies as not a pull request is excluded and produces a warning.",
+      "check_names": ["node --experimental-strip-types --input-type=module -e \"import assert from 'node:assert/strict'; import { discoverShippedPRs } from './core/scripts/stages/release.ts'; const warnings=[]; const deps={runCommand:()=>({code:0,stdout:'docs: release note (#451)\\nfeat: shipped feature (#203)',stderr:''}),fetchPRTitle:async n=>'PR #'+n,classifyPR:async n=>n===451?{kind:'not-a-pr'}:{kind:'pr'},stderr:m=>warnings.push(m)}; const prs=await discoverShippedPRs('v1.20.0','.',deps); assert.deepEqual(prs,[{number:203,title:'PR #203'}]); assert.ok(warnings.some(m=>m.includes('#451')&&m.includes('not a pull request')));\""]
+    }
+  ],
+  "allowed_change_paths": ["core/scripts/stages/release.ts", "core/test/release.test.ts"],
+  "grader_refs": [{ "grader": "implementation-fix", "version": "1" }],
+  "category": "release-safety",
+  "risk": "high",
+  "provenance": "synthetic"
+}

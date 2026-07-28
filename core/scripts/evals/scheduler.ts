@@ -36,7 +36,9 @@ export function scheduleCells(cells: Cell[], seed: number): Cell[] {
   const bucketOrder: string[] = [];
   const buckets = new Map<string, Cell[]>();
   for (const cell of shuffled) {
-    const key = cell.treatment.harness ?? "_no-harness-axis";
+    const key = cell.treatment.primary
+      ? `${cell.treatment.primary.harness}:${cell.treatment.reviewer?.harness ?? ""}`
+      : cell.treatment.harness ?? "_no-harness-axis";
     if (!buckets.has(key)) {
       buckets.set(key, []);
       bucketOrder.push(key);

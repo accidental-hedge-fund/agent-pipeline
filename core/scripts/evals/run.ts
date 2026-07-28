@@ -57,7 +57,14 @@ export function expandExperiment(
   const fixtures = loadFixturesFromDir(fixturesDir, deps);
   const manifest = loadManifest(manifestPath, new Set(fixtures.keys()), deps);
 
-  if (manifest.mode !== "end-to-end") {
+  if (manifest.mode === "paired") {
+    // A paired run always starts with an implementation. Review/fix inputs
+    // are deliberately derived from the primary's real diff, rather than
+    // being supplied as independent fixture artifacts.
+    for (const fixtureId of manifest.fixture_ids) {
+      validateFixtureEntersStage(fixtures.get(fixtureId)!, "implementing");
+    }
+  } else if (manifest.mode !== "end-to-end") {
     for (const fixtureId of manifest.fixture_ids) {
       validateFixtureEntersStage(fixtures.get(fixtureId)!, manifest.mode);
     }

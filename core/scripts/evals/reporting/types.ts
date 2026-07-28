@@ -38,6 +38,21 @@ export interface CostSummary {
   n_with_cost: number;
 }
 
+/** Outcome of the primary -> reviewer -> (optional) primary-fix handoff for
+ *  an explicit paired treatment. Counts, rather than rates, preserve the
+ *  evidence needed to compare small experimental populations. */
+export interface PairedConvergenceSummary {
+  primary: { harness: string; model?: string; effort?: string };
+  reviewer: { harness: string; model?: string; effort?: string };
+  completed_cells: number;
+  fix_invoked_cells: number;
+  initial_blocking_findings: number;
+  final_blocking_findings: number;
+  resolved_blocking_findings: number;
+  malformed_initial_reviews: number;
+  malformed_final_reviews: number;
+}
+
 export interface TreatmentSummary {
   treatment_id: string;
   reliability: ReliabilityRates;
@@ -46,6 +61,9 @@ export interface TreatmentSummary {
   excluded_fixtures: string[];
   mean_duration_sec: number | null;
   cost: CostSummary | null;
+  /** Present only for a named paired treatment; keeps the ordered primary /
+   *  reviewer identity and review-convergence evidence in summary.json. */
+  paired?: PairedConvergenceSummary;
 }
 
 export interface ParetoFrontiers {

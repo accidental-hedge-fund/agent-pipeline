@@ -144,6 +144,30 @@ test("validateManifest: end-to-end mode is accepted", () => {
   assert.equal(manifest.mode, "end-to-end");
 });
 
+test("validateManifest: named paired treatments preserve valid harness-specific coordinates", () => {
+  const manifest = validateManifest(validManifestRaw({
+    mode: "paired",
+    treatments: undefined,
+    named_treatments: [{
+      id: "codex-grok",
+      primary: { harness: "codex", model: "gpt-5.5", effort: "high" },
+      reviewer: { harness: "grok", model: "grok-4.5", effort: "high" },
+    }],
+  }), new Set(["f1"]));
+  assert.equal(manifest.named_treatments![0].id, "codex-grok");
+  const plan = expandPlan(manifest, new Map([["f1", makeFixture("f1", SHA_A, "implementing")]]));
+  assert.equal(plan.cells.length, 1);
+  assert.equal(plan.cells[0].treatment_id, "codex-grok");
+  assert.equal(plan.cells[0].treatment.reviewer!.model, "grok-4.5");
+});
+
+test("validateManifest: named treatments reject mixed forms, duplicate ids, and a missing paired reviewer", () => {
+  const named = [{ id: "pair", primary: { harness: "codex" }, reviewer: { harness: "grok" } }];
+  assert.throws(() => validateManifest(validManifestRaw({ mode: "paired", named_treatments: named }), new Set(["f1"])), /must not be declared together/);
+  assert.throws(() => validateManifest(validManifestRaw({ mode: "paired", treatments: undefined, named_treatments: [named[0], named[0]] }), new Set(["f1"])), /duplicates id/);
+  assert.throws(() => validateManifest(validManifestRaw({ mode: "paired", treatments: undefined, named_treatments: [{ id: "pair", primary: { harness: "codex" } }] }), new Set(["f1"])), /reviewer/);
+});
+
 test("validateManifest: unknown treatment axis is rejected", () => {
   const raw = validManifestRaw({ treatments: { language: ["ts"] } });
   assert.throws(() => validateManifest(raw, new Set(["f1"])), /unknown treatment axis/);

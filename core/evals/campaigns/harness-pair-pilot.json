@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "experiment_id": "harness-pair-pilot-20260727b",
+  "fixture_ids": ["paired-create-issue-positive-number", "paired-scoreboard-duplicate-cost"],
+  "mode": "paired",
+  "named_treatments": [
+    { "id": "claude-sonnet__codex-default", "primary": { "harness": "claude", "model": "sonnet" }, "reviewer": { "harness": "codex" } },
+    { "id": "codex-default__grok-4-5", "primary": { "harness": "codex" }, "reviewer": { "harness": "grok", "model": "grok-4.5" } },
+    { "id": "grok-4-5__codex-default", "primary": { "harness": "grok", "model": "grok-4.5" }, "reviewer": { "harness": "codex" } },
+    { "id": "codex-default__codex-default", "primary": { "harness": "codex" }, "reviewer": { "harness": "codex" } },
+    { "id": "grok-4-5__grok-4-5", "primary": { "harness": "grok", "model": "grok-4.5" }, "reviewer": { "harness": "grok", "model": "grok-4.5" } }
+  ],
+  "replicates": 1,
+  "seed": 20260727,
+  "concurrency": 1,
+  "timeout": 900,
+  "output_dir": ".agent-pipeline/evals"
+}

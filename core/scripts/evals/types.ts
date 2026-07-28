@@ -48,7 +48,7 @@ export const EVAL_STAGE_NAMES = [
 ] as const;
 export type EvalStageName = (typeof EVAL_STAGE_NAMES)[number];
 
-export type EvalMode = EvalStageName | "end-to-end";
+export type EvalMode = EvalStageName | "end-to-end" | "paired";
 
 export type FixtureProvenance = "synthetic" | "harvested";
 
@@ -192,6 +192,8 @@ export interface TreatmentAxes {
 
 /** One concrete point in the treatment matrix, after expansion. */
 export interface Treatment {
+  /** Explicit named-treatment id. When present it is the stable treatment id. */
+  id?: string;
   harness?: string;
   provider?: string;
   model?: string;
@@ -199,6 +201,23 @@ export interface Treatment {
   executor?: string;
   /** Parsed from the manifest's JSON-encoded `params` axis value (#434 task 6.1). */
   params?: ModelEndpointParams;
+  /** Additive primary/reviewer coordinates used only by paired mode. */
+  primary?: HarnessCoordinate;
+  reviewer?: HarnessCoordinate;
+}
+
+/** One local CLI coordinate in an explicit treatment. */
+export interface HarnessCoordinate {
+  harness: string;
+  model?: string;
+  effort?: string;
+}
+
+/** A manifest-declared, non-Cartesian treatment. */
+export interface NamedTreatment {
+  id: string;
+  primary: HarnessCoordinate;
+  reviewer?: HarnessCoordinate;
 }
 
 /** Execution/auth class recorded on a cell (#434 api-executor-response-provenance
@@ -212,7 +231,10 @@ export interface ExperimentManifest {
   experiment_id: string;
   fixture_ids: string[];
   mode: EvalMode;
-  treatments: TreatmentAxes;
+  /** Existing Cartesian treatment axes. Mutually exclusive with named_treatments. */
+  treatments?: TreatmentAxes;
+  /** Explicit valid treatment coordinates, required by paired mode. */
+  named_treatments?: NamedTreatment[];
   replicates: number;
   seed: number;
   concurrency: number;
