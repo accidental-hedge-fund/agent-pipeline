@@ -111,6 +111,30 @@ test("grouping: a missing dimension value lands in an explicit unknown group, no
   assert.deepEqual(grouped, [{ value: "unknown", n: 1, mean_quality: 0.8, completion_rate: 1 }]);
 });
 
+test("grouping: named pipeline treatments use resolved coordinates instead of parsing arbitrary ids", () => {
+  const treatment = {
+    id: "candidate-a",
+    primary: { harness: "grok" },
+    reviewer: { harness: "codex" },
+    policy: {
+      models: { planning: "grok-4.5", implementing: "grok-4.5", review: "gpt-5.6-terra", fix: "grok-4.5" },
+      effort: { planning: "high", implementing: "high", review: "high", fix: "high" },
+    },
+  };
+  const entries = [{
+    treatment_id: "candidate-a",
+    treatment,
+    stage: "pipeline-paired",
+    category: "c",
+    risk: "high",
+    quality: 0.9,
+    completed: true,
+  }];
+  assert.equal(groupBy(entries, "harness")[0]?.value, "grok->codex");
+  assert.match(groupBy(entries, "model")[0]?.value ?? "", /planning:grok-4\.5/);
+  assert.match(groupBy(entries, "model")[0]?.value ?? "", /review:gpt-5\.6-terra/);
+});
+
 test("cost: unknown cost source is excluded rather than zeroed", () => {
   const summary = summarizeCost([
     { cost_source: "actual", cost_usd: 1 },

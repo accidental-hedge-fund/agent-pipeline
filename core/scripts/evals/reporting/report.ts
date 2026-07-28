@@ -252,22 +252,47 @@ export function generateSummary(
     if (!treatment?.primary || !treatment.reviewer) return undefined;
     const paired = runs
       .filter((record) => record.treatment_id === treatmentId)
-      .map((record) => record.detail?.paired)
+      .map((record) => record.detail?.paired ?? record.detail?.pipeline_paired)
       .filter((value): value is Record<string, unknown> => typeof value === "object" && value !== null);
     const numberField = (name: string) => paired.reduce((sum, value) => sum + (typeof value[name] === "number" ? value[name] as number : 0), 0);
     const trueField = (name: string) => paired.filter((value) => value[name] === true).length;
+    const parseCounts = (primaryName: string, legacyName?: string) => {
+      const counts = { strict: 0, tolerant: 0, unparseable: 0 };
+      for (const value of paired) {
+        const provenance = value[primaryName] ?? (legacyName ? value[legacyName] : undefined);
+        if (provenance === "strict" || provenance === "tolerant" || provenance === "unparseable") {
+          counts[provenance]++;
+        }
+      }
+      return counts;
+    };
     const initial = numberField("initial_blocking_findings");
-    const final = numberField("final_blocking_findings");
+    const review2 = paired.reduce((sum, value) => {
+      const count = value.review_2_blocking_findings ?? value.final_blocking_findings;
+      return sum + (typeof count === "number" ? count : 0);
+    }, 0);
     return {
       primary: treatment.primary,
       reviewer: treatment.reviewer,
+      ...(treatment.policy ? { policy: treatment.policy } : {}),
       completed_cells: paired.length,
+      stage_failure_cells: paired.filter((value) =>
+        typeof value.stage_failure === "object" && value.stage_failure !== null
+      ).length,
+      contract_failure_cells: paired.filter((value) =>
+        typeof value.contract_failure === "object" && value.contract_failure !== null
+      ).length,
       fix_invoked_cells: trueField("fix_invoked"),
+      fix_2_invoked_cells: trueField("fix_2_invoked"),
       initial_blocking_findings: initial,
-      final_blocking_findings: final,
-      resolved_blocking_findings: Math.max(0, initial - final),
+      review_2_blocking_findings: review2,
+      resolved_before_review_2: Math.max(0, initial - review2),
       malformed_initial_reviews: trueField("initial_review_malformed"),
-      malformed_final_reviews: trueField("final_review_malformed"),
+      malformed_review_2_reviews: paired.filter((value) =>
+        value.review_2_malformed === true || value.final_review_malformed === true
+      ).length,
+      review_1_verdict_parse: parseCounts("initial_review_verdict_parse"),
+      review_2_verdict_parse: parseCounts("review_2_verdict_parse", "final_review_verdict_parse"),
     };
   }
 
@@ -317,8 +342,10 @@ export function generateSummary(
       const grade = gradeByCell.get(r.cell_id);
       if (!grade) return null;
       const fixture = fixtures.get(r.fixture_id);
+      const treatment = plan.cells.find((cell) => cell.cell_id === r.cell_id)?.treatment;
       return {
         treatment_id: r.treatment_id,
+        ...(treatment ? { treatment } : {}),
         stage: manifest.mode,
         category: fixture?.category ?? "unknown",
         risk: fixture?.risk ?? "unknown",

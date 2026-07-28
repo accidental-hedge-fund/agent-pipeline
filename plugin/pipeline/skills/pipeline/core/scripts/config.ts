@@ -1904,7 +1904,7 @@ function renderModelLines(models: PartialConfig["models"]): string {
   const comment = (key: typeof keys[number]) => sd(`models.${key}`, key);
   const baseHeader = sd(
     "models",
-    "Per-phase model aliases. review is honored by both the claude and codex reviewer harnesses; planning/implementing/fix are honored only by the claude implementer harness (codex ignores them).",
+    "Per-phase model aliases. Each phase is honored by its resolved harness when that harness adapter supports model selection.",
   );
   // Renderer-owned addendum (#504 finding 1): behavioral nuance not captured
   // by the schema's one-line `.describe()` — a Claude alias against a codex
@@ -1988,7 +1988,7 @@ function renderReviewHarnessBlock(reviewHarness: PartialConfig["review_harness"]
     "Override the reviewer CLI for the review step (profile default when absent).",
   );
   if (reviewHarness === undefined) {
-    return `# review_harness: my-reviewer # ${topDescription} The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.\n#   Or a structured form for independent reviewer model/effort/prompt-delivery control:\n# review_harness:\n#   command: my-reviewer\n#   model: auto # or an explicit alias\n#   effort: auto # or an explicit level (round-aware: review-1 Iterative, review-2/plan-review Definitive)\n#   prompt_delivery: argv # or \"stdin\" if the CLI reads its prompt from standard input (avoids the OS per-argument size limit)`;
+    return `# review_harness: my-reviewer # ${topDescription} The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. Configure the implementer independently with harnesses.implementer.\n#   Or a structured form for independent reviewer model/effort/prompt-delivery control:\n# review_harness:\n#   command: my-reviewer\n#   model: auto # or an explicit alias\n#   effort: auto # or an explicit level (round-aware: review-1 Iterative, review-2/plan-review Definitive)\n#   prompt_delivery: argv # or \"stdin\" if the CLI reads its prompt from standard input (avoids the OS per-argument size limit)`;
   }
   if (typeof reviewHarness === "string") {
     return `review_harness: ${yamlScalar(reviewHarness)} # ${topDescription}`;

@@ -168,6 +168,27 @@ test("validateManifest: named treatments reject mixed forms, duplicate ids, and 
   assert.throws(() => validateManifest(validManifestRaw({ mode: "paired", treatments: undefined, named_treatments: [{ id: "pair", primary: { harness: "codex" } }] }), new Set(["f1"])), /reviewer/);
 });
 
+test("validateManifest: pipeline-paired accepts a complete policy and structured reviewer overrides", () => {
+  const raw = validManifestRaw({
+    mode: "pipeline-paired",
+    treatments: undefined,
+    named_treatments: [{
+      id: "grok-codex",
+      primary: { harness: "grok" },
+      reviewer: { harness: "codex", model: "gpt-5.6-terra", effort: "high" },
+      policy: {
+        models: { planning: "grok-4.5", implementing: "grok-4.5", review: "gpt-5.6-terra", fix: "grok-4.5" },
+        effort: { planning: "high", implementing: "high", review: "high", fix: "high" },
+      },
+    }],
+  });
+  const manifest = validateManifest(raw, new Set(["f1"]));
+  assert.equal(manifest.named_treatments![0].policy!.models.review, "gpt-5.6-terra");
+  assert.equal(manifest.named_treatments![0].reviewer!.effort, "high");
+  assert.throws(() => validateManifest({ ...raw, named_treatments: [{ ...raw.named_treatments[0], policy: { models: {}, effort: {} } }] }, new Set(["f1"])), /requires non-empty planning/);
+  assert.throws(() => validateManifest({ ...raw, named_treatments: [{ ...raw.named_treatments[0], primary: { harness: "grok", model: "grok-4.5" } }] }, new Set(["f1"])), /only in policy/);
+});
+
 test("validateManifest: unknown treatment axis is rejected", () => {
   const raw = validManifestRaw({ treatments: { language: ["ts"] } });
   assert.throws(() => validateManifest(raw, new Set(["f1"])), /unknown treatment axis/);

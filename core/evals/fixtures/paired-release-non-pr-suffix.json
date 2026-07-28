@@ -8,7 +8,7 @@
       "plan": "Separate unambiguous merge-commit PR numbers from suffix-only candidates, classify only the suffix candidates through an injected dependency, retain genuine PRs and classification-error candidates, and add a regression test for a docs commit ending in an issue reference."
     }
   },
-  "public_checks": ["node --test test/release.test.ts"],
+  "public_checks": ["npm run ci"],
   "hidden_checks": ["node --experimental-strip-types --input-type=module -e \"import assert from 'node:assert/strict'; import { discoverShippedPRs } from './core/scripts/stages/release.ts'; const warnings=[]; const deps={runCommand:()=>({code:0,stdout:'docs: release note (#451)\\nfeat: shipped feature (#203)',stderr:''}),fetchPRTitle:async n=>'PR #'+n,classifyPR:async n=>n===451?{kind:'not-a-pr'}:{kind:'pr'},stderr:m=>warnings.push(m)}; const prs=await discoverShippedPRs('v1.20.0','.',deps); assert.deepEqual(prs,[{number:203,title:'PR #203'}]); assert.ok(warnings.some(m=>m.includes('#451')&&m.includes('not a pull request')));\""] ,
   "acceptance_criteria": [
     {
@@ -17,7 +17,7 @@
       "check_names": ["node --experimental-strip-types --input-type=module -e \"import assert from 'node:assert/strict'; import { discoverShippedPRs } from './core/scripts/stages/release.ts'; const warnings=[]; const deps={runCommand:()=>({code:0,stdout:'docs: release note (#451)\\nfeat: shipped feature (#203)',stderr:''}),fetchPRTitle:async n=>'PR #'+n,classifyPR:async n=>n===451?{kind:'not-a-pr'}:{kind:'pr'},stderr:m=>warnings.push(m)}; const prs=await discoverShippedPRs('v1.20.0','.',deps); assert.deepEqual(prs,[{number:203,title:'PR #203'}]); assert.ok(warnings.some(m=>m.includes('#451')&&m.includes('not a pull request')));\""]
     }
   ],
-  "allowed_change_paths": ["core/scripts/stages/release.ts", "core/test/release.test.ts"],
+  "allowed_change_paths": ["core/scripts/stages/release.ts", "plugin/pipeline/skills/pipeline/core/scripts/stages/release.ts", "core/test/release.test.ts"],
   "grader_refs": [{ "grader": "implementation-fix", "version": "1" }],
   "category": "release-safety",
   "risk": "high",

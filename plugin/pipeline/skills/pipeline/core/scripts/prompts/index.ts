@@ -220,11 +220,16 @@ export interface BuildImplementingArgs extends BuildPlanArgs {
   docsEnabled?: boolean;
   /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
   specContext?: string;
+  /**
+   * Evaluation cells exercise the production semantic contract without
+   * publishing commits. The default remains byte-for-byte production mode.
+   */
+  executionMode?: "production" | "evaluation";
 }
 
 export function buildImplementingPrompt(a: BuildImplementingArgs): string {
   const dc = domainContext(a.cfg);
-  return substitute(loadTemplate("implementing"), {
+  const prompt = substitute(loadTemplate("implementing"), {
     domain_name: dc.name,
     domain_description: dc.description,
     conventions: readConventions(a.cfg),
@@ -238,6 +243,7 @@ export function buildImplementingPrompt(a: BuildImplementingArgs): string {
     papercut_instruction: papercutInstructionSection(a.cfg),
     design_gate_instruction: designGateInstructionSection(a.cfg),
   });
+  return a.executionMode === "evaluation" ? appendEvaluationExecutionOverride(prompt) : prompt;
 }
 
 /**
@@ -472,10 +478,15 @@ export interface BuildFixArgs {
    * exercise the declaration instruction.
    */
   reviewedSha?: string;
+  /**
+   * Evaluation cells exercise the production semantic contract without
+   * publishing commits. The default remains byte-for-byte production mode.
+   */
+  executionMode?: "production" | "evaluation";
 }
 
 export function buildFixPrompt(a: BuildFixArgs): string {
-  return substitute(loadTemplate("fix"), {
+  const prompt = substitute(loadTemplate("fix"), {
     conventions: readConventions(a.cfg),
     issue_number: String(a.issueNumber),
     title: a.title,
@@ -489,6 +500,25 @@ export function buildFixPrompt(a: BuildFixArgs): string {
     reviewed_sha: a.reviewedSha ?? "(unknown — no reviewed SHA supplied)",
     papercut_instruction: papercutInstructionSection(a.cfg),
   });
+  return a.executionMode === "evaluation" ? appendEvaluationExecutionOverride(prompt) : prompt;
+}
+
+/**
+ * Preserve the exact production prompt while making its operational
+ * commit/push instructions explicitly inert inside an isolated eval cell.
+ * The root eval contract independently enforces the same boundary.
+ */
+function appendEvaluationExecutionOverride(prompt: string): string {
+  return `${prompt}
+
+## Evaluation Execution Override (required)
+
+This invocation is running in an isolated evaluation cell. Exercise the
+implementation or fix instructions above, but do not create commits, push,
+or perform GitHub operations. Leave the validated file changes uncommitted
+in the current worktree so the evaluator can inspect and grade the diff.
+This section overrides only the production publishing/commit instructions;
+all task, quality, review, safety, and validation requirements still apply.`;
 }
 
 export interface BuildTestFixArgs {

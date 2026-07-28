@@ -14,6 +14,8 @@ import { validateManifest } from "../scripts/evals/manifest.ts";
 import type { Cell, Fixture } from "../scripts/evals/types.ts";
 import { parseReportedFindings, gradeReview } from "../scripts/evals/grading/graders/review.ts";
 import { REVIEW_VERDICT_SCHEMA_BLOCK } from "../scripts/review-schema.ts";
+import { EVAL_AGENT_CONTRACT_TEXT } from "../scripts/evals/agent-contract.ts";
+import { DEFAULT_CONFIG } from "../scripts/types.ts";
 
 // #607 eval-agent-isolation-boundary added a real-fs contract install/restore
 // and a real command-boundary shim to every runCell() call. Every test in
@@ -48,7 +50,18 @@ async function runCell(...args: Parameters<typeof runCellReal>): ReturnType<type
 
 const SHA = "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd";
 
-const FAKE_CFG = { repo_dir: "/fake/repo" } as import("../scripts/types.ts").PipelineConfig;
+const FAKE_CFG = {
+  ...DEFAULT_CONFIG,
+  profile_name: "test",
+  invocation: "test",
+  review_mode: "prompt-harness",
+  marker_footer: "",
+  implementation_ready_message: "",
+  conventions_default: "AGENTS.md",
+  domain: "agent-pipeline",
+  repo: "owner/agent-pipeline",
+  repo_dir: "/fake/repo",
+} as import("../scripts/types.ts").PipelineConfig;
 
 const MANIFEST = validateManifest(
   {
@@ -124,6 +137,30 @@ const PAIRED_MANIFEST = validateManifest(
     fixture_ids: ["f1"],
     mode: "paired",
     named_treatments: [{ id: "codex-grok", primary: { harness: "codex" }, reviewer: { harness: "grok", model: "grok-4.5" } }],
+    replicates: 1,
+    seed: 1,
+    concurrency: 1,
+    timeout: 60,
+    output_dir: ".agent-pipeline/evals",
+  },
+  new Set(["f1"]),
+);
+
+const PIPELINE_PAIRED_MANIFEST = validateManifest(
+  {
+    schema_version: 1,
+    experiment_id: "exp1",
+    fixture_ids: ["f1"],
+    mode: "pipeline-paired",
+    named_treatments: [{
+      id: "grok-codex",
+      primary: { harness: "grok" },
+      reviewer: { harness: "codex" },
+      policy: {
+        models: { planning: "grok-4.5", implementing: "grok-4.5", review: "gpt-5.6-terra", fix: "grok-4.5" },
+        effort: { planning: "high", implementing: "medium", review: "xhigh", fix: "low" },
+      },
+    }],
     replicates: 1,
     seed: 1,
     concurrency: 1,
@@ -2024,6 +2061,7 @@ test("runCell: a live environment dependency does not block or require a simulat
 
 test("runCell: paired mode hands the actual diff to a distinct reviewer and skips fix without blocking findings", async () => {
   const prompts: Array<{ harness: string; prompt: string }> = [];
+  const sandboxModes: Array<string | undefined> = [];
   const deps: CellExecutionDeps = {
     createWorktree: async (_c, o) => o,
     removeWorktree: async () => {},
@@ -2031,6 +2069,7 @@ test("runCell: paired mode hands the actual diff to a distinct reviewer and skip
     getDiff: async () => "diff --git a/x.ts b/x.ts\n+added line",
     invokeHarness: async (args) => {
       prompts.push({ harness: args.harness, prompt: args.prompt });
+      sandboxModes.push(args.sandboxMode);
       if (args.harness === "grok") return { ...successResult(), stdout: JSON.stringify({ verdict: "approve", findings: [], next_steps: [] }) };
       return successResult();
     },
@@ -2046,6 +2085,7 @@ test("runCell: paired mode hands the actual diff to a distinct reviewer and skip
   assert.deepEqual(prompts.map((p) => p.harness), ["codex", "grok", "grok"]);
   assert.match(prompts[1].prompt, /diff --git a\/x\.ts b\/x\.ts/);
   assert.equal((result.outcome.detail!.paired as Record<string, unknown>).fix_invoked, false);
+  assert.deepEqual(sandboxModes, ["managed", "managed", "managed"]);
   assert.deepEqual(result.ghRefusals, []);
 });
 
@@ -2086,7 +2126,7 @@ test("runCell: paired mode returns blocking findings to the primary, then re-rev
       return {
         ...successResult(),
         stdout: reviewCount === 1
-          ? "```json\n{\"verdict\":\"request_changes\",\"findings\":[{\"blocking\":true,\"severity\":\"high\",\"confidence\":0.9}],\"next_steps\":[]}\n```"
+          ? "```json\n{\"verdict\":\"needs-attention\",\"summary\":\"fix required\",\"findings\":[{\"blocking\":true,\"severity\":\"high\",\"confidence\":0.9}],\"next_steps\":[]}\n```"
           : JSON.stringify({ verdict: "approve", findings: [], next_steps: [] }),
       };
     },
@@ -2125,4 +2165,209 @@ test("runCell: paired mode records malformed reviewer output without treating it
   assert.equal(paired.initial_review_malformed, true);
   assert.equal(paired.final_review_malformed, true);
   assert.equal(paired.fix_invoked, false);
+});
+
+test("runCell: pipeline-paired executes the deployable YAML policy with live plan, feedback, and diff handoffs", async () => {
+  const calls: Array<{ harness: string; model?: string; effort?: string; prompt: string }> = [];
+  let codexCalls = 0;
+  let diffCalls = 0;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    getDiff: async () => ++diffCalls === 1 ? "diff --git a/x.ts b/x.ts\n+broken" : "diff --git a/x.ts b/x.ts\n+fixed",
+    invokeHarness: async (args) => {
+      calls.push({ harness: args.harness, model: args.model, effort: args.effort, prompt: args.prompt });
+      if (args.harness === "grok") {
+        if (calls.length === 1) return { ...successResult(), stdout: "generated plan" };
+        if (calls.length === 3) {
+          return {
+            ...successResult(),
+            stdout: "## Feedback Incorporated\n- [ADDRESSED] Revised validation.\n\n## Revised Plan\nrevised plan",
+          };
+        }
+        return successResult();
+      }
+      codexCalls++;
+      if (codexCalls === 1) return { ...successResult(), stdout: "## Plan Review Verdict\nRevise validation." };
+      if (codexCalls === 2) return { ...successResult(), stdout: JSON.stringify({ verdict: "needs-attention", findings: [{ blocking: true, severity: "high", confidence: 0.9 }], next_steps: [] }) };
+      return { ...successResult(), stdout: JSON.stringify({ verdict: "needs-attention", findings: [{ blocking: true, severity: "high", confidence: 0.9 }], next_steps: [] }) };
+    },
+  };
+  const cell = makeCell({
+    cell_id: "exp1/f1/grok-codex/1",
+    treatment_id: "grok-codex",
+    treatment: PIPELINE_PAIRED_MANIFEST.named_treatments![0]!,
+    mode: "pipeline-paired",
+  });
+  const result = await runCell(FAKE_CFG, cell, makeFixture("f1", "review"), PIPELINE_PAIRED_MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.deepEqual(calls.map((call) => call.harness), ["grok", "codex", "grok", "grok", "codex", "grok", "codex", "grok"]);
+  assert.deepEqual(calls.map((call) => [call.model, call.effort]), [
+    ["grok-4.5", "high"], ["gpt-5.6-terra", "high"], ["grok-4.5", "high"], ["grok-4.5", "medium"],
+    ["gpt-5.6-terra", "xhigh"], ["grok-4.5", "low"], ["gpt-5.6-terra", "xhigh"], ["grok-4.5", "low"],
+  ]);
+  assert.match(calls[1].prompt, /generated plan/);
+  assert.match(calls[2].prompt, /Revise validation/);
+  assert.match(calls[3].prompt, /revised plan/);
+  assert.match(calls[4].prompt, /\+broken/);
+  assert.match(calls[6].prompt, /\+fixed/);
+  assert.match(calls[7].prompt, /Review Findings/i);
+  const detail = result.outcome.detail!.pipeline_paired as Record<string, unknown>;
+  assert.equal(detail.fix_invoked, true);
+  assert.equal(detail.initial_blocking_findings, 1);
+  assert.equal(detail.review_2_blocking_findings, 1);
+  assert.equal(detail.fix_2_invoked, true);
+});
+
+test("runCell: a non-auth pipeline stage failure is a completed treatment outcome, not infrastructure", async () => {
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      ...successResult(),
+      success: false,
+      exit_code: 1,
+      stderr: "model declined the task",
+    }),
+  };
+  const cell = makeCell({
+    cell_id: "exp1/f1/pipeline-stage-failure/1",
+    treatment_id: "pipeline-stage-failure",
+    treatment: PIPELINE_PAIRED_MANIFEST.named_treatments![0]!,
+    mode: "pipeline-paired",
+  });
+  const result = await runCell(FAKE_CFG, cell, makeFixture("f1", "review"), PIPELINE_PAIRED_MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.deepEqual(
+    (result.outcome.detail!.pipeline_paired as Record<string, unknown>).stage_failure,
+    { phase: "planning", exit_code: 1 },
+  );
+});
+
+test("runCell: pipeline-paired honors structured reviewer model and effort overrides", async () => {
+  const calls: Array<{ harness: string; model?: string; effort?: string }> = [];
+  const manifest = validateManifest(
+    {
+      schema_version: 1,
+      experiment_id: "reviewer-override",
+      fixture_ids: ["f1"],
+      mode: "pipeline-paired",
+      named_treatments: [{
+        id: "codex-grok",
+        primary: { harness: "codex" },
+        reviewer: { harness: "grok", model: "grok-4.5", effort: "high" },
+        policy: {
+          models: { planning: "gpt-5.6-sol", implementing: "gpt-5.6-sol", review: "gpt-5.6-terra", fix: "gpt-5.6-sol" },
+          effort: { planning: "max", implementing: "max", review: "max", fix: "max" },
+        },
+      }],
+      replicates: 1,
+      seed: 1,
+      concurrency: 1,
+      timeout: 60,
+      output_dir: ".agent-pipeline/evals",
+    },
+    new Set(["f1"]),
+  );
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    getDiff: async () => "diff --git a/x.ts b/x.ts\n+fixed",
+    invokeHarness: async (args) => {
+      calls.push({ harness: args.harness, model: args.model, effort: args.effort });
+      if (args.harness === "grok" && args.prompt.includes("## Plan Review Verdict")) {
+        return { ...successResult(), stdout: "## Plan Review Verdict\nApproved." };
+      }
+      if (args.harness === "grok") {
+        return { ...successResult(), stdout: JSON.stringify({ verdict: "approve", findings: [], next_steps: [] }) };
+      }
+      const codexInvocation = calls.filter((call) => call.harness === "codex").length;
+      if (codexInvocation === 1) return { ...successResult(), stdout: "generated plan" };
+      if (codexInvocation === 2) {
+        return {
+          ...successResult(),
+          stdout: "## Feedback Incorporated\n- [ADDRESSED] Approved plan retained.\n\n## Revised Plan\nrevised plan",
+        };
+      }
+      return successResult();
+    },
+  };
+  const cell = makeCell({
+    cell_id: "reviewer-override/f1/codex-grok/1",
+    experiment_id: "reviewer-override",
+    treatment_id: "codex-grok",
+    treatment: manifest.named_treatments![0]!,
+    mode: "pipeline-paired",
+  });
+  const result = await runCell(FAKE_CFG, cell, makeFixture("f1", "review"), manifest, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.deepEqual(calls.filter((call) => call.harness === "grok").map((call) => [call.model, call.effort]), [
+    ["grok-4.5", "high"],
+    ["grok-4.5", "high"],
+    ["grok-4.5", "high"],
+  ]);
+  assert.ok(calls.filter((call) => call.harness === "codex").every((call) => call.model === "gpt-5.6-sol" && call.effort === "max"));
+});
+
+test("runCell: pipeline-paired keeps reviewer diffs clean while every reviewer remains under the eval contract", async () => {
+  const files = new Map<string, string | undefined>();
+  const reviewInputs: string[] = [];
+  let reviewerContractChecks = 0;
+  let diffCalls = 0;
+  let primaryCalls = 0;
+  const deps: CellExecutionDeps = {
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    contractIO: {
+      readFile: (file) => file.endsWith("AGENTS.md") ? "real project instructions" : null,
+      writeFile: (file, content) => { files.set(file, content); },
+      removeFile: (file) => { files.delete(file); },
+    },
+    getDiff: async () => {
+      const agentFile = [...files.entries()].find(([file]) => file.endsWith("AGENTS.md"));
+      assert.equal(agentFile?.[1], "real project instructions", "review diff must be built after evaluator contract restoration");
+      diffCalls++;
+      return "diff --git a/core/scripts/scoreboard.ts b/core/scripts/scoreboard.ts\n+duplicate guard";
+    },
+    invokeHarness: async (args) => {
+      if (args.prompt.includes("standard code review") || args.prompt.includes("adversarial software review")) {
+        const agentFile = [...files.entries()].find(([file]) => file.endsWith("AGENTS.md"));
+        assert.equal(agentFile?.[1], EVAL_AGENT_CONTRACT_TEXT, "reviewer must run under the eval contract");
+        reviewerContractChecks++;
+        reviewInputs.push(args.prompt);
+        return { ...successResult(), stdout: JSON.stringify({ verdict: "approve", findings: [], next_steps: [] }) };
+      }
+      if (args.harness === "codex" && args.prompt.includes("## Plan Review Verdict")) {
+        const agentFile = [...files.entries()].find(([file]) => file.endsWith("AGENTS.md"));
+        assert.equal(agentFile?.[1], EVAL_AGENT_CONTRACT_TEXT, "plan reviewer must run under the eval contract");
+        reviewerContractChecks++;
+        return { ...successResult(), stdout: "## Plan Review Verdict\nApproved." };
+      }
+      primaryCalls++;
+      if (primaryCalls === 1) return { ...successResult(), stdout: "generated plan" };
+      if (primaryCalls === 2) {
+        return {
+          ...successResult(),
+          stdout: "## Feedback Incorporated\n- [ADDRESSED] Approved plan retained.\n\n## Revised Plan\nrevised plan",
+        };
+      }
+      return successResult();
+    },
+  };
+  const cell = makeCell({
+    cell_id: "exp1/f1/grok-codex-contract-restore/1",
+    treatment_id: "grok-codex-contract-restore",
+    treatment: PIPELINE_PAIRED_MANIFEST.named_treatments![0]!,
+    mode: "pipeline-paired",
+  });
+  const result = await runCell(FAKE_CFG, cell, makeFixture("f1", "review"), PIPELINE_PAIRED_MANIFEST, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.equal(diffCalls, 2);
+  assert.equal(reviewInputs.length, 2);
+  assert.equal(reviewerContractChecks, 3);
+  assert.ok(reviewInputs.every((prompt) => !prompt.includes("AGENTS.md")), "review prompts must not contain evaluator-owned instruction-file diffs");
 });

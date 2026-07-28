@@ -48,7 +48,7 @@ export const EVAL_STAGE_NAMES = [
 ] as const;
 export type EvalStageName = (typeof EVAL_STAGE_NAMES)[number];
 
-export type EvalMode = EvalStageName | "end-to-end" | "paired";
+export type EvalMode = EvalStageName | "end-to-end" | "paired" | "pipeline-paired";
 
 export type FixtureProvenance = "synthetic" | "harvested";
 
@@ -204,6 +204,8 @@ export interface Treatment {
   /** Additive primary/reviewer coordinates used only by paired mode. */
   primary?: HarnessCoordinate;
   reviewer?: HarnessCoordinate;
+  /** YAML-shaped model/effort policy used only by pipeline-paired mode. */
+  policy?: PipelinePolicy;
 }
 
 /** One local CLI coordinate in an explicit treatment. */
@@ -213,11 +215,34 @@ export interface HarnessCoordinate {
   effort?: string;
 }
 
+/** The stage model-selection surface a repository can actually express in
+ * `.github/pipeline.yml`. `planning` effort also drives plan-review and the
+ * `review` model covers plan-review plus both code-review rounds unless the
+ * treatment's reviewer coordinate supplies the structured
+ * `review_harness.model` / `review_harness.effort` override. */
+export interface PipelinePolicy {
+  models: {
+    planning: string;
+    implementing: string;
+    review: string;
+    fix: string;
+  };
+  effort: {
+    planning: string;
+    implementing: string;
+    review: string;
+    fix: string;
+  };
+}
+
 /** A manifest-declared, non-Cartesian treatment. */
 export interface NamedTreatment {
   id: string;
   primary: HarnessCoordinate;
   reviewer?: HarnessCoordinate;
+  /** Required by `pipeline-paired`.  This is deliberately a YAML-shaped
+   * policy rather than independently selectable runtime-stage coordinates. */
+  policy?: PipelinePolicy;
 }
 
 /** Execution/auth class recorded on a cell (#434 api-executor-response-provenance

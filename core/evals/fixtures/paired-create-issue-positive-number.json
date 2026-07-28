@@ -17,7 +17,7 @@
       "check_names": ["node --experimental-strip-types --input-type=module -e \"import { createIssue } from './core/scripts/gh.ts'; const cfg={repo:'owner/repo'}; await createIssue(cfg,'title','body',[],async()=> 'https://github.com/owner/repo/issues/0').then(()=>process.exit(1),()=>process.exit(0));\""]
     }
   ],
-  "allowed_change_paths": ["core/scripts/gh.ts", "core/test/gh.test.ts"],
+  "allowed_change_paths": ["core/scripts/gh.ts", "plugin/pipeline/skills/pipeline/core/scripts/gh.ts", "core/test/gh.test.ts"],
   "grader_refs": [{ "grader": "implementation-fix", "version": "1" }],
   "category": "input-validation",
   "risk": "medium",

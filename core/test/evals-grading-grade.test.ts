@@ -80,6 +80,7 @@ test("graderIdForMode maps modes to their grader, or none", () => {
   assert.equal(graderIdForMode("review"), "review");
   assert.equal(graderIdForMode("planning"), "planning");
   assert.equal(graderIdForMode("paired"), "implementation-fix");
+  assert.equal(graderIdForMode("pipeline-paired"), "implementation-fix");
   assert.equal(graderIdForMode("shipcheck"), null);
   assert.equal(graderIdForMode("plan-review"), null);
   assert.equal(graderIdForMode("end-to-end"), null);

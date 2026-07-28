@@ -322,6 +322,14 @@ test("scaffoldDefaultConfig: scaffolded models: comment documents passthrough + 
   );
 });
 
+test("scaffoldDefaultConfig: review_harness guidance points to the independently configurable implementer role", async () => {
+  const repo = makeTempRepo();
+  await scaffoldDefaultConfig(repo);
+  const content = fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8");
+  assert.match(content, /Configure the implementer independently with harnesses\.implementer/);
+  assert.doesNotMatch(content, /implementer harness is not configurable/);
+});
+
 test("scaffoldDefaultConfig: scaffolded file round-trips with repo_map at empty-list defaults", async () => {
   const repo = makeTempRepo();
   const binDir = makeFakeGhBin({ repoSlug: "acme/scaffold-rm" });

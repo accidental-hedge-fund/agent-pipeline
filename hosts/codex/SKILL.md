@@ -228,15 +228,30 @@ state machine.
 
 An **experiment manifest** (JSON) declares `schema_version`, `experiment_id`,
 `fixture_ids`, `mode` (one of `planning`, `plan-review`, `implementing`,
-`review`, `fix`, `shipcheck`, or `end-to-end`), `treatments` (`harness` /
-`provider` / `model` / `effort` axes, each a string array), `replicates`,
-`seed`, `concurrency`, `timeout` (seconds, per cell), and `output_dir`
-(default `.agent-pipeline/evals`). A **fixture** (JSON, one per frozen task)
+`review`, `fix`, `shipcheck`, `end-to-end`, `paired`, or
+`pipeline-paired`), either Cartesian `treatments` (`harness` / `provider` /
+`model` / `effort` axes, each a string array) or explicit
+`named_treatments`, `replicates`, `seed`, `concurrency`, `timeout` (seconds,
+per cell), and `output_dir` (default `.agent-pipeline/evals`). A **fixture**
+(JSON, one per frozen task)
 declares `fixture_id`, `schema_version`, a full 40-char `base_commit`,
 `task_input`, `stage_entry_artifacts` (frozen inputs keyed by the stages it
 supports entering directly — see `core/evals/fixtures/` for one example per
 stage), `public_checks`, `grader_refs`, `category`, `risk`, and `provenance`
 (`synthetic` or `harvested`).
+
+Use explicit named treatments for primary/reviewer comparisons. `paired`
+executes implementation → review-1 → optional fix-1 → review-2.
+`pipeline-paired` additionally requires a complete deployable
+`policy.models` / `policy.effort` object and executes planning → plan-review
+→ plan revision → implementation → review-1/fix-1 → review-2/fix-2, passing
+the actual plan, feedback, and worktree diffs between roles. A reviewer
+coordinate's optional model/effort represents the structured
+`review_harness` override and applies to plan-review plus both review rounds.
+The mode reuses production prompt/output/review-policy contracts with an
+evaluation-only no-commit/no-push override. Review-2 evidence is pre-fix-2;
+the final post-fix-2 diff is not treated as a third review. Planning is
+currently the freeform production variant, not OpenSpec planning.
 
 `evals plan <manifest>` expands the Cartesian fixture × treatment × replicate
 matrix deterministically and writes `plan.json` **before** touching a harness

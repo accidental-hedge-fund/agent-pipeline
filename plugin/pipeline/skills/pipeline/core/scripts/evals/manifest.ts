@@ -13,6 +13,7 @@ import {
   type Fixture,
   type HarnessCoordinate,
   type NamedTreatment,
+  type PipelinePolicy,
   type RunPlan,
   type SandboxMode,
   type Treatment,
@@ -82,10 +83,10 @@ export function validateManifest(raw: unknown, knownFixtureIds: Set<string>): Ex
   }
 
   const mode = obj.mode;
-  if (typeof mode !== "string" || (mode !== "end-to-end" && mode !== "paired" && !(EVAL_STAGE_NAMES as readonly string[]).includes(mode))) {
+  if (typeof mode !== "string" || (mode !== "end-to-end" && mode !== "paired" && mode !== "pipeline-paired" && !(EVAL_STAGE_NAMES as readonly string[]).includes(mode))) {
     throw new ManifestValidationError(
       "mode",
-      `must be "end-to-end", "paired", or one of: ${EVAL_STAGE_NAMES.join(", ")} — got ${JSON.stringify(mode)}`,
+      `must be "end-to-end", "paired", "pipeline-paired", or one of: ${EVAL_STAGE_NAMES.join(", ")} — got ${JSON.stringify(mode)}`,
     );
   }
 
@@ -135,19 +136,42 @@ export function validateManifest(raw: unknown, knownFixtureIds: Set<string>): Ex
     namedTreatments = namedRaw.map((raw, index) => {
       if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new ManifestValidationError(`named_treatments[${index}]`, "must be an object");
       const value = raw as Record<string, unknown>;
-      if (Object.keys(value).some((k) => !["id", "primary", "reviewer"].includes(k))) throw new ManifestValidationError(`named_treatments[${index}]`, "contains an unknown field");
+      if (Object.keys(value).some((k) => !["id", "primary", "reviewer", "policy"].includes(k))) throw new ManifestValidationError(`named_treatments[${index}]`, "contains an unknown field");
       if (typeof value.id !== "string" || !/^[A-Za-z0-9_-]+$/.test(value.id)) throw new ManifestValidationError(`named_treatments[${index}].id`, "must be a path-safe identifier");
       if (seen.has(value.id)) throw new ManifestValidationError("named_treatments", `duplicates id "${value.id}"`);
       seen.add(value.id);
       const primary = coordinate(value.primary, `named_treatments[${index}].primary`);
       const reviewer = value.reviewer === undefined ? undefined : coordinate(value.reviewer, `named_treatments[${index}].reviewer`);
-      if (mode === "paired" && !reviewer) throw new ManifestValidationError(`named_treatments[${index}].reviewer`, "is required for paired mode");
-      return { id: value.id, primary, ...(reviewer ? { reviewer } : {}) };
+      if ((mode === "paired" || mode === "pipeline-paired") && !reviewer) throw new ManifestValidationError(`named_treatments[${index}].reviewer`, "is required for paired modes");
+      let policy: PipelinePolicy | undefined;
+      if (value.policy !== undefined) {
+        if (typeof value.policy !== "object" || value.policy === null || Array.isArray(value.policy)) throw new ManifestValidationError(`named_treatments[${index}].policy`, "must be an object");
+        const rawPolicy = value.policy as Record<string, unknown>;
+        if (Object.keys(rawPolicy).some((k) => k !== "models" && k !== "effort")) throw new ManifestValidationError(`named_treatments[${index}].policy`, "contains an unknown field");
+        const slots = (key: "models" | "effort") => {
+          const slotsRaw = rawPolicy[key];
+          if (typeof slotsRaw !== "object" || slotsRaw === null || Array.isArray(slotsRaw)) throw new ManifestValidationError(`named_treatments[${index}].policy.${key}`, "must be an object");
+          const slotsObject = slotsRaw as Record<string, unknown>;
+          const required = ["planning", "implementing", "review", "fix"] as const;
+          if (Object.keys(slotsObject).some((slot) => !required.includes(slot as typeof required[number])) || required.some((slot) => typeof slotsObject[slot] !== "string" || !(slotsObject[slot] as string).trim())) {
+            throw new ManifestValidationError(`named_treatments[${index}].policy.${key}`, "requires non-empty planning, implementing, review, and fix strings only");
+          }
+          return Object.fromEntries(required.map((slot) => [slot, slotsObject[slot]])) as PipelinePolicy[typeof key];
+        };
+        policy = { models: slots("models"), effort: slots("effort") };
+      }
+      if (mode === "pipeline-paired") {
+        if (!policy) throw new ManifestValidationError(`named_treatments[${index}].policy`, "is required for pipeline-paired mode");
+        if (primary.model !== undefined || primary.effort !== undefined) {
+          throw new ManifestValidationError(`named_treatments[${index}].primary`, "pipeline-paired primary model and effort must be declared only in policy.models and policy.effort");
+        }
+      }
+      return { id: value.id, primary, ...(reviewer ? { reviewer } : {}), ...(policy ? { policy } : {}) };
     });
   } else {
     throw new ManifestValidationError("treatments", "either treatments or named_treatments is required");
   }
-  if (mode === "paired" && !namedTreatments) throw new ManifestValidationError("named_treatments", "is required for paired mode");
+  if ((mode === "paired" || mode === "pipeline-paired") && !namedTreatments) throw new ManifestValidationError("named_treatments", "is required for paired modes");
 
   const replicates = requireNumber("replicates");
   if (!Number.isInteger(replicates) || replicates < 1) {
@@ -254,8 +278,8 @@ function cartesianTreatments(axes: TreatmentAxes): Treatment[] {
 export function expandPlan(manifest: ExperimentManifest, fixtures: Map<string, Fixture>): RunPlan {
   const cells: Cell[] = [];
   const treatments = manifest.named_treatments
-    ? manifest.named_treatments.map((t) => manifest.mode === "paired"
-      ? ({ id: t.id, primary: t.primary, ...(t.reviewer ? { reviewer: t.reviewer } : {}) })
+    ? manifest.named_treatments.map((t) => (manifest.mode === "paired" || manifest.mode === "pipeline-paired")
+      ? ({ id: t.id, primary: t.primary, ...(t.reviewer ? { reviewer: t.reviewer } : {}), ...(t.policy ? { policy: t.policy } : {}) })
       : ({ id: t.id, harness: t.primary.harness, ...(t.primary.model ? { model: t.primary.model } : {}), ...(t.primary.effort ? { effort: t.primary.effort } : {}) }))
     : cartesianTreatments(manifest.treatments!);
   for (const fixtureId of manifest.fixture_ids) {

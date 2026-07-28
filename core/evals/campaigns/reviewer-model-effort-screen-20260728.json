@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "experiment_id": "reviewer-model-effort-screen-20260728",
+  "fixture_ids": [
+    "review-graded-seeded-defects"
+  ],
+  "mode": "review",
+  "named_treatments": [
+    {
+      "id": "grok-4-5-high",
+      "primary": {
+        "harness": "grok",
+        "model": "grok-4.5",
+        "effort": "high"
+      }
+    },
+    {
+      "id": "codex-sol-low",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "low"
+      }
+    },
+    {
+      "id": "codex-sol-medium",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "medium"
+      }
+    },
+    {
+      "id": "codex-sol-high",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "high"
+      }
+    },
+    {
+      "id": "codex-sol-xhigh",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "xhigh"
+      }
+    },
+    {
+      "id": "codex-sol-max",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "max"
+      }
+    },
+    {
+      "id": "codex-sol-ultra",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-sol",
+        "effort": "ultra"
+      }
+    },
+    {
+      "id": "codex-terra-low",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-terra",
+        "effort": "low"
+      }
+    },
+    {
+      "id": "codex-terra-medium",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-terra",
+        "effort": "medium"
+      }
+    },
+    {
+      "id": "codex-terra-high",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-terra",
+        "effort": "high"
+      }
+    },
+    {
+      "id": "codex-terra-xhigh",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-terra",
+        "effort": "xhigh"
+      }
+    },
+    {
+      "id": "codex-terra-max",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-terra",
+        "effort": "max"
+      }
+    },
+    {
+      "id": "codex-terra-ultra",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-terra",
+        "effort": "ultra"
+      }
+    },
+    {
+      "id": "codex-luna-low",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-luna",
+        "effort": "low"
+      }
+    },
+    {
+      "id": "codex-luna-medium",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-luna",
+        "effort": "medium"
+      }
+    },
+    {
+      "id": "codex-luna-high",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-luna",
+        "effort": "high"
+      }
+    },
+    {
+      "id": "codex-luna-xhigh",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-luna",
+        "effort": "xhigh"
+      }
+    },
+    {
+      "id": "codex-luna-max",
+      "primary": {
+        "harness": "codex",
+        "model": "gpt-5.6-luna",
+        "effort": "max"
+      }
+    }
+  ],
+  "replicates": 3,
+  "seed": 20260728,
+  "concurrency": 12,
+  "timeout": 600,
+  "output_dir": ".agent-pipeline/evals",
+  "sandbox_mode": "external-bypass"
+}

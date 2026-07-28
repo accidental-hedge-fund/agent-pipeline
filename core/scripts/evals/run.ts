@@ -64,6 +64,13 @@ export function expandExperiment(
     for (const fixtureId of manifest.fixture_ids) {
       validateFixtureEntersStage(fixtures.get(fixtureId)!, "implementing");
     }
+  } else if (manifest.mode === "pipeline-paired") {
+    // The dynamic pipeline trajectory begins from the task itself; all plan,
+    // review, and diff artifacts are produced inside the isolated cell.
+    for (const fixtureId of manifest.fixture_ids) {
+      const fixture = fixtures.get(fixtureId)!;
+      if (!fixture.task_input.trim()) throw new Error(`fixture "${fixtureId}" requires task_input for pipeline-paired mode`);
+    }
   } else if (manifest.mode !== "end-to-end") {
     for (const fixtureId of manifest.fixture_ids) {
       validateFixtureEntersStage(fixtures.get(fixtureId)!, manifest.mode);

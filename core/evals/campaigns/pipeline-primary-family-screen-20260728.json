@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "experiment_id": "pipeline-primary-family-screen-20260728",
+  "fixture_ids": ["paired-create-issue-positive-number", "paired-scoreboard-duplicate-cost", "paired-release-non-pr-suffix", "paired-plan-revision-fenced-feedback", "paired-linked-checkout-worktree-discovery"],
+  "mode": "pipeline-paired",
+  "named_treatments": [
+    {"id":"grok-4-5-high__codex-terra-high","primary":{"harness":"grok"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"grok-4.5","implementing":"grok-4.5","review":"gpt-5.6-terra","fix":"grok-4.5"},"effort":{"planning":"high","implementing":"high","review":"high","fix":"high"}}},
+    {"id":"codex-sol-low__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-sol","implementing":"gpt-5.6-sol","review":"gpt-5.6-terra","fix":"gpt-5.6-sol"},"effort":{"planning":"low","implementing":"low","review":"high","fix":"low"}}},
+    {"id":"codex-sol-medium__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-sol","implementing":"gpt-5.6-sol","review":"gpt-5.6-terra","fix":"gpt-5.6-sol"},"effort":{"planning":"medium","implementing":"medium","review":"high","fix":"medium"}}},
+    {"id":"codex-sol-high__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-sol","implementing":"gpt-5.6-sol","review":"gpt-5.6-terra","fix":"gpt-5.6-sol"},"effort":{"planning":"high","implementing":"high","review":"high","fix":"high"}}},
+    {"id":"codex-sol-xhigh__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-sol","implementing":"gpt-5.6-sol","review":"gpt-5.6-terra","fix":"gpt-5.6-sol"},"effort":{"planning":"xhigh","implementing":"xhigh","review":"high","fix":"xhigh"}}},
+    {"id":"codex-sol-max__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-sol","implementing":"gpt-5.6-sol","review":"gpt-5.6-terra","fix":"gpt-5.6-sol"},"effort":{"planning":"max","implementing":"max","review":"high","fix":"max"}}},
+    {"id":"codex-sol-ultra__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-sol","implementing":"gpt-5.6-sol","review":"gpt-5.6-terra","fix":"gpt-5.6-sol"},"effort":{"planning":"ultra","implementing":"ultra","review":"high","fix":"ultra"}}},
+    {"id":"codex-terra-low__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-terra","implementing":"gpt-5.6-terra","review":"gpt-5.6-terra","fix":"gpt-5.6-terra"},"effort":{"planning":"low","implementing":"low","review":"high","fix":"low"}}},
+    {"id":"codex-terra-medium__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-terra","implementing":"gpt-5.6-terra","review":"gpt-5.6-terra","fix":"gpt-5.6-terra"},"effort":{"planning":"medium","implementing":"medium","review":"high","fix":"medium"}}},
+    {"id":"codex-terra-high__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-terra","implementing":"gpt-5.6-terra","review":"gpt-5.6-terra","fix":"gpt-5.6-terra"},"effort":{"planning":"high","implementing":"high","review":"high","fix":"high"}}},
+    {"id":"codex-terra-xhigh__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-terra","implementing":"gpt-5.6-terra","review":"gpt-5.6-terra","fix":"gpt-5.6-terra"},"effort":{"planning":"xhigh","implementing":"xhigh","review":"high","fix":"xhigh"}}},
+    {"id":"codex-terra-max__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-terra","implementing":"gpt-5.6-terra","review":"gpt-5.6-terra","fix":"gpt-5.6-terra"},"effort":{"planning":"max","implementing":"max","review":"high","fix":"max"}}},
+    {"id":"codex-terra-ultra__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-terra","implementing":"gpt-5.6-terra","review":"gpt-5.6-terra","fix":"gpt-5.6-terra"},"effort":{"planning":"ultra","implementing":"ultra","review":"high","fix":"ultra"}}},
+    {"id":"codex-luna-low__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-luna","implementing":"gpt-5.6-luna","review":"gpt-5.6-terra","fix":"gpt-5.6-luna"},"effort":{"planning":"low","implementing":"low","review":"high","fix":"low"}}},
+    {"id":"codex-luna-medium__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-luna","implementing":"gpt-5.6-luna","review":"gpt-5.6-terra","fix":"gpt-5.6-luna"},"effort":{"planning":"medium","implementing":"medium","review":"high","fix":"medium"}}},
+    {"id":"codex-luna-high__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-luna","implementing":"gpt-5.6-luna","review":"gpt-5.6-terra","fix":"gpt-5.6-luna"},"effort":{"planning":"high","implementing":"high","review":"high","fix":"high"}}},
+    {"id":"codex-luna-xhigh__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-luna","implementing":"gpt-5.6-luna","review":"gpt-5.6-terra","fix":"gpt-5.6-luna"},"effort":{"planning":"xhigh","implementing":"xhigh","review":"high","fix":"xhigh"}}},
+    {"id":"codex-luna-max__codex-terra-high","primary":{"harness":"codex"},"reviewer":{"harness":"codex"},"policy":{"models":{"planning":"gpt-5.6-luna","implementing":"gpt-5.6-luna","review":"gpt-5.6-terra","fix":"gpt-5.6-luna"},"effort":{"planning":"max","implementing":"max","review":"high","fix":"max"}}}
+  ],
+  "replicates": 1,
+  "seed": 20260728,
+  "concurrency": 12,
+  "timeout": 2400,
+  "output_dir": ".agent-pipeline/evals",
+  "sandbox_mode": "external-bypass"
+}

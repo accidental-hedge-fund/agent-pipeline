@@ -61,10 +61,33 @@
 # Harness Evaluation — v1.28.1 Rerun
 
 - [x] Verify v1.28.1 includes #607 evaluator isolation and #608 repository-configured harness roles.
-- [ ] Run a two-cell release smoke: Codex and Grok as isolated primary implementers on the same frozen fixture.
-- [ ] Carry the paired primary → reviewer evaluator forward onto v1.28.1.
-- [ ] Run and grade the expanded paired corpus across valid primary/reviewer, model, and effort coordinates.
+- [x] Run a two-cell release smoke: Codex and Grok as isolated primary implementers on the same frozen fixture.
+- [x] Carry the paired primary → reviewer evaluator forward onto v1.28.1.
+- [x] Verify the reconciliation with focused evaluator tests, OpenSpec validation, plugin-mirror check, and full CI.
+- [ ] Repair and prove the expanded corpus's per-cell check prerequisites at the frozen base.
+- [ ] Define a fully explicit baseline: harness, model, and effort for every model-driven stage. Do not reuse the old Claude→Codex pilot as a quantitative baseline because its Codex reviewer coordinate was unrecorded.
+- [ ] Build balanced screens for every model-driven stage, but score and select only deployable `pipeline.yml` policies: `models`/`effort` slots for planning, implementing, review, and fix plus the two harness roles. Plan-review shares the reviewer model slot; review-1/review-2 share the review model slot; fix-1/fix-2 share the fix slot. Use stage results to grade a policy's consequences, never to recommend an unconfigurable per-stage split.
+- [x] Extend the paired evaluator to execute the actual model-routing graph: primary plan -> secondary plan-review -> mandatory primary plan revision -> primary implementation using the resulting plan -> secondary review-1 -> primary fix-1 when needed -> secondary review-2 -> primary fix-2 when needed. Record deployable policy slots, requested harness/model/effort, artifact hashes, and objective outcomes at every call; reverify after the fix-2, interpreter-boundary, and reviewer-diff contract-restoration corrections.
+- [x] Present the complete evaluation design for operator approval before running any further model calls.
+- [ ] Run and grade the approved stage screens and dynamic full-pipeline matrix across the selected Grok and complete GPT-5.6 family treatments. The clean four-direction routing smoke is complete; the five-fixture, full GPT-5.6 family screen remains.
 - [ ] Publish a decision-grade comparison with limitations and a recommended default.
+
+## Evaluation Log
+
+- 2026-07-28: v1.28.1 release smoke passed for Codex 5.6-terra/high (145s) and Grok 4.5/high (192s); both completed the same frozen fixture with `npm run ci` green. Codex used the manifest's explicit `external-bypass` sandbox mode, so the former Bubblewrap failure is resolved.
+- 2026-07-28: Stopped the first expanded primary-screen attempt after two cells because three fixtures invoked root-level `test/...` files that do not exist at frozen base `b63d9…` (the tests live under `core/test/...` and dependencies are not preinstalled per cell). The two recorded cells are excluded diagnostics, not model scores. Updated the affected fixtures to use `npm run ci` before their hidden probes.
+- 2026-07-28: Proved the repaired corpus at frozen base `b63d9…`: public `npm run ci` passes, and each of the five hidden regression probes fails before implementation. Requoted the plan-revision probe so shell expansion cannot fabricate its result. The valid rerun uses experiment id `primary-model-screen-v1281-20260728b`.
+- 2026-07-28: The initial model screen sampled only `gpt-5.6-terra` low/high efforts. This is insufficient for an effort recommendation. Add a complete four-level 5.6-terra matrix (low/medium/high/ultra) against the same five fixtures; do not extrapolate from endpoints.
+- 2026-07-28: Operator narrowed the candidate set: do not test GPT-5.5, GPT-5.4, or GPT-5.3-Codex-Spark. Stopped the mixed-model screen and discarded its remaining in-flight 5.5/5.3 worktrees. The replacement compares only Grok 4.5/high to all four GPT-5.6-terra effort levels.
+- 2026-07-28: Corrected the scope again after checking the installed model registry: GPT-5.6 is a three-variant family, not Terra alone. The valid campaign must include Sol (six supported efforts), Terra (six), and Luna (five), plus the Grok 4.5/high control.
+- 2026-07-28: Stopped the 90-cell implementation-only GPT-5.6 family run after five records. It cannot establish a pipeline recommendation because the current paired evaluator bypasses planning and the current end-to-end evaluator does not dynamically hand off the primary's real plan to implementation. All records from that run are excluded diagnostics.
+- 2026-07-28: The evaluator plan also omitted plan-review, which is a distinct secondary/adversarial stage before implementation. The configured stage graph, including both convergence loops, is the mandatory source of truth for an evaluation design; a stage subset may only be called a diagnostic screen, never a pipeline evaluation.
+- 2026-07-28: A valid evaluation treatment is a deployable `pipeline.yml` policy, not merely a list of independently optimal stage coordinates. Preserve configuration coupling in the design: the secondary model is shared by plan-review/review-1/review-2, fixes share their slot, and efforts follow their documented shared/round-aware controls.
+- 2026-07-28: Added `pipeline-paired` mode with a complete YAML-shaped policy (`models` and `effort` for planning, implementing, review, and fix), live plan/review/revision/diff handoffs, implementation grading, and pair-report provenance. Core test suite passed (5,349 tests); a four-direction live routing smoke is running before the screened corpus.
+- 2026-07-28: Stopped the first dynamic smoke while its first cell was in implementation. The evaluator omitted production's conditional fix-2 after review-2, so its output is excluded. Added the missing fix-2 path and regression coverage; no smoke result will be reported from the stopped run.
+- 2026-07-28: Stopped the replacement dynamic smoke after the reviewer invoked `node core/scripts/pipeline.ts …`, which bypassed the existing PATH `pipeline` shim and attempted release/sweep/merge commands. Killed the cell and removed its disposable worktree; no record was graded or reported. Added an interpreter-level `node` shim that denies the pipeline TypeScript entrypoint and a real-process regression test. The evaluator remains a same-uid boundary, so absolute-runtime tampering is a documented residual limitation; no live rerun starts until full verification passes.
+- 2026-07-28: Stopped and excluded the subsequent four-direction smoke after three completed cells exposed evaluator-owned `AGENTS.md`/`CLAUDE.md` contract text in reviewer diffs. The pipeline-paired branch restored that contract only at `finish()`, unlike the generic branch. Restore before every reviewer-facing diff, reinstall only for primary fix-1/fix-2, and prove the behavior with a focused regression before a fresh experiment id is run.
+- 2026-07-28: Fresh smoke `pipeline-routing-smoke-20260728c` completed 4/4 clean cells after the contract-restoration repair. All completed calls used explicit Grok 4.5/high or Codex GPT-5.6 Terra/high policy slots; no boundary denial, auth failure, or timeout occurred. Grok→Grok and Grok→Codex passed public CI and hidden checks; Codex→Grok missed the generated plugin mirror and failed CI, while Codex→Codex exercised both fix rounds but still failed CI after a final `__proto__` duplicate-key finding. The report is deliberately underpowered (one fixture/replicate) and establishes evaluator routing safety/fidelity only, not a production model recommendation.
 
 # Config Sync Implementation Plan
 
@@ -139,9 +162,9 @@
 - [x] Inventory the frozen Agent Pipeline fixtures, grading coverage, harness adapters, and comparative reporting contract.
 - [x] Verify that the native evaluator cannot represent distinct primary and secondary harnesses in one treatment cell.
 - [x] Snapshot `B0`, the current Claude-primary → Codex-reviewer configuration: resolved config, CLI versions, available model IDs, and historical run-store metrics (no comparable historical eval-run store exists in this checkout).
-- [ ] Build and validate a balanced frozen corpus: two deterministic implementation fixtures now exist, but historical evidence is unavailable in this checkout and at least four further independent fixtures are required.
-- [ ] Run native role-screening experiments: compare the current Claude primary against Codex and Grok primary candidates; compare the current Codex reviewer against Grok reviewer candidates. Vary only valid, explicitly recorded model/effort settings.
-- [ ] Select Pareto-optimal primary and reviewer candidates; do not carry dominated model/effort settings into the paired trial.
+- [x] Build and validate a five-fixture frozen implementation corpus with deterministic hidden checks.
+- [x] Run role-screening experiments across Grok 4.5/high and every supported GPT-5.6 Sol/Terra/Luna effort coordinate.
+- [x] Select Pareto-optimal primary and reviewer candidates and carry only finalists into replicated paired validation.
 - [x] Create an OpenSpec change for a paired evaluator whose cell runs implementation → review of the produced diff → fix → re-review, with separate primary/reviewer harness, model, and effort coordinates.
 - [x] Implement, test, document, and regenerate the plugin mirror for that paired evaluator.
 - [x] Run the paired matrix against `B0`: Claude→Codex, Codex→Grok, Grok→Codex, Codex→Codex, and Grok→Grok (one replicate × two fixtures; deliberately underpowered pilot).
@@ -195,3 +218,46 @@
 - 2026-07-27: Filed #607 for enforced local-harness eval isolation (instruction replacement/restoration, command boundary, recorded denial, explicit Codex external-sandbox capability, and regression tests). Initial issue creation failed because the repository has no `backlog` label; retried with its existing `bug` label only: https://github.com/accidental-hedge-fund/agent-pipeline/issues/607.
 - 2026-07-27: Created milestone `v1.28.1` (GitHub milestone #26; it did not previously exist), filed #608 for repository-configured primary/secondary harness roles, and assigned both #607 and #608 to `v1.28.1`.
 - 2026-07-27: Audited the earlier paired-pilot trajectories after the evaluator failures. The manifest did explicitly select each primary/reviewer harness (the Codex host session did not choose treatments), but all four Codex-primary implementation trajectories contain the same pre-command Bubblewrap failure. Therefore Codex-primary failures and the former Grok→Codex provisional-finalist recommendation are invalidated; only narrow Grok/Claude implementation evidence remains, pending #607 and rerun.
+- 2026-07-28: After v1.28.1, completed the clean 90-cell primary-family screen, 6-cell reviewer-harness screen, and 54-cell reviewer model/effort screen with zero provider rate-limit errors.
+- 2026-07-28: Completed 135-cell replicated final validation. Fifteen Sol/max→Grok cells exposed that pipeline-paired ignored the deployable structured reviewer effort override; six Sol/max→Terra/max cells exceeded the initial 30-minute ceiling. Neither class was counted as model quality.
+- 2026-07-28: Added reviewer model/effort override fidelity plus regression tests (118 focused tests pass), then completed a 30-cell recovery experiment under a 60-minute ceiling: 30/30 completed, zero infra/auth/timeout/rate-limit failures.
+- 2026-07-28: Final recommendation is Grok 4.5/high primary → Codex GPT-5.6 Terra/high secondary. It averaged 0.817 deterministic quality in 460 s; Grok→Grok averaged 0.850 in 505 s, a small +0.033 quality delta that does not outweigh slower execution and loss of cross-provider independence. Terra/max was slower and worse. The evidence report is `docs/harness-model-evaluation-2026-07-28.md`.
+
+## Review Results
+
+- Final/recovery evidence is fully graded: 114 original completed cells plus 30 clean recovery cells. Failure-class cells were never converted into quality scores.
+- Reviewer override regression suite passed: 118/118 focused manifest/executor tests.
+- Plugin regeneration and `node scripts/build.mjs --check` passed.
+- Strict OpenSpec validation passed: 198/198 items.
+- `git diff --check` passed.
+- Full `npm run ci` passed: 5,351 core tests, install/launcher smokes, OpenSpec CI, and 115 repository-script tests.
+- No evaluation phase observed a provider rate-limit or authentication error.
+
+# Pipeline-Paired Reconciliation and PR
+
+## Plan
+
+- [x] Audit the existing evaluator commits and uncommitted correction set against `origin/main`.
+- [x] Reconcile the OpenSpec design/tasks with the delivered full pipeline-paired graph.
+- [x] Update host guidance and generated config guidance for paired modes and repository-owned harness roles.
+- [x] Regenerate the plugin mirror and run focused plus full verification.
+- [x] Identify the exact valid campaign manifests/evidence to stage; exclude
+  obsolete diagnostics and the accidental root lockfile.
+- [ ] Commit, push, open a PR against `main`, and monitor CI.
+
+## Review Results
+
+- Pipeline-paired now reuses all eight production prompt builders, enforces
+  production plan/revision/review-policy gates, and keeps reviewer invocations
+  under the isolated eval contract.
+- Review-2/pre-fix-2 evidence is distinct from the post-fix-2 final diff;
+  strict/tolerant/unparseable counts and named-treatment grouping are explicit.
+- Fixture boundaries permit generator-owned plugin mirrors required by repo CI.
+- The evidence report now discloses that the completed campaign used the prior
+  prompt fingerprint and that OpenSpec planning remains a separate dimension.
+- Focused reconciliation coverage passed: 251 tests.
+- Plugin generation/check and strict OpenSpec validation passed.
+- Full repository CI passed: 5,356 core tests, install/launcher smokes,
+  198 OpenSpec items, and 115 repository-script tests.
+- GitHub roadmap created/updated: #600–#604, #637, #653–#655, and milestone
+  `v1.35.0 — Evaluation Campaign Automation`.

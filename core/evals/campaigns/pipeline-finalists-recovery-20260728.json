@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "experiment_id": "pipeline-finalists-recovery-20260728",
+  "fixture_ids": [
+    "paired-create-issue-positive-number",
+    "paired-linked-checkout-worktree-discovery",
+    "paired-plan-revision-fenced-feedback",
+    "paired-release-non-pr-suffix",
+    "paired-scoreboard-duplicate-cost"
+  ],
+  "mode": "pipeline-paired",
+  "named_treatments": [
+    {
+      "id": "codex-sol-max__grok-high",
+      "primary": { "harness": "codex" },
+      "reviewer": {
+        "harness": "grok",
+        "model": "grok-4.5",
+        "effort": "high"
+      },
+      "policy": {
+        "models": {
+          "planning": "gpt-5.6-sol",
+          "implementing": "gpt-5.6-sol",
+          "review": "grok-4.5",
+          "fix": "gpt-5.6-sol"
+        },
+        "effort": {
+          "planning": "max",
+          "implementing": "max",
+          "review": "high",
+          "fix": "max"
+        }
+      }
+    },
+    {
+      "id": "codex-sol-max__codex-terra-max",
+      "primary": { "harness": "codex" },
+      "reviewer": { "harness": "codex" },
+      "policy": {
+        "models": {
+          "planning": "gpt-5.6-sol",
+          "implementing": "gpt-5.6-sol",
+          "review": "gpt-5.6-terra",
+          "fix": "gpt-5.6-sol"
+        },
+        "effort": {
+          "planning": "max",
+          "implementing": "max",
+          "review": "max",
+          "fix": "max"
+        }
+      }
+    }
+  ],
+  "replicates": 3,
+  "seed": 20260728,
+  "concurrency": 12,
+  "timeout": 3600,
+  "output_dir": ".agent-pipeline/evals",
+  "sandbox_mode": "external-bypass"
+}

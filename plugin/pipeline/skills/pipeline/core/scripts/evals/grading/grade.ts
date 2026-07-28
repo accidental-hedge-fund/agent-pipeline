@@ -67,7 +67,7 @@ function parseJsonl<T>(text: string): T[] {
  *  ultimately an implementation/fix outcome. `plan-review`, `shipcheck`,
  *  and `end-to-end` have no single grader defined by this change. */
 export function graderIdForMode(mode: EvalMode): string | null {
-  if (mode === "implementing" || mode === "fix" || mode === "paired") return "implementation-fix";
+  if (mode === "implementing" || mode === "fix" || mode === "paired" || mode === "pipeline-paired") return "implementation-fix";
   if (mode === "review") return "review";
   if (mode === "planning") return "planning";
   return null;

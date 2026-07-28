@@ -39,11 +39,11 @@ async function run(cmd: string, args: string[], env: NodeJS.ProcessEnv, cwd: str
   }
 }
 
-test("installBoundaryShim: writes gh, pipeline, and git interceptors into the shim dir", () => {
+test("installBoundaryShim: writes gh, pipeline, git, and node interceptors into the shim dir", () => {
   const worktreeDir = mkWorktree();
   const dir = installBoundaryShim(worktreeDir);
   assert.equal(dir, boundaryShimDir(worktreeDir));
-  assert.deepEqual(fs.readdirSync(dir).sort(), ["gh", "git", "pipeline"]);
+  assert.deepEqual(fs.readdirSync(dir).sort(), ["gh", "git", "node", "pipeline"]);
 });
 
 test("gh shim: denies every invocation, exits non-zero, and records a structured denial", async () => {
@@ -69,6 +69,22 @@ test("pipeline shim: denies every invocation and records the pipeline-advance ca
   const denials = readBoundaryDenials(worktreeDir);
   assert.equal(denials.length, 1);
   assert.equal(denials[0].command, "pipeline");
+  assert.equal(denials[0].category, "pipeline-advance");
+});
+
+test("node shim: denies direct execution of the pipeline entrypoint but passes ordinary node commands", async () => {
+  const worktreeDir = mkWorktree();
+  installBoundaryShim(worktreeDir);
+  const env = { ...process.env, ...boundaryEnv(worktreeDir) };
+  const denied = await run("node", ["--experimental-strip-types", "core/scripts/pipeline.ts", "sweep", "--apply"], env, worktreeDir);
+  assert.notEqual(denied.code, 0);
+  assert.match(denied.stderr, /pipeline\.ts is denied/);
+  const permitted = await run("node", ["-e", "process.stdout.write('ok')"], env, worktreeDir);
+  assert.equal(permitted.code, 0);
+  assert.equal(permitted.stdout, "ok");
+  const denials = readBoundaryDenials(worktreeDir);
+  assert.equal(denials.length, 1);
+  assert.equal(denials[0].command, "node");
   assert.equal(denials[0].category, "pipeline-advance");
 });
 

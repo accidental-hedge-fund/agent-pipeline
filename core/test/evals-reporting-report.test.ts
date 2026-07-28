@@ -166,7 +166,7 @@ test("reportExperiment: a named paired treatment retains ordered coordinates and
   const files = {
     "/out/exp1/manifest.json": JSON.stringify(pairedManifest),
     "/out/exp1/plan.json": JSON.stringify(pairedPlan),
-    "/out/exp1/runs.jsonl": JSON.stringify({ cell_id: "p1", experiment_id: "exp1", fixture_id: "f1", treatment_id: "codex-grok", replicate: 1, prompt_hash: "h", config_hash: "c", base_sha: SHA, result_class: "completed", detail: { stages: [], paired: { initial_blocking_findings: 2, final_blocking_findings: 1, fix_invoked: true, initial_review_malformed: false, final_review_malformed: true } } }) + "\n",
+    "/out/exp1/runs.jsonl": JSON.stringify({ cell_id: "p1", experiment_id: "exp1", fixture_id: "f1", treatment_id: "codex-grok", replicate: 1, prompt_hash: "h", config_hash: "c", base_sha: SHA, result_class: "completed", detail: { stages: [], paired: { initial_blocking_findings: 2, final_blocking_findings: 1, fix_invoked: true, initial_review_malformed: false, final_review_malformed: true, initial_review_verdict_parse: "strict", final_review_verdict_parse: "unparseable" } } }) + "\n",
     "/out/exp1/failures.jsonl": "",
     "/out/exp1/grades.jsonl": JSON.stringify(reviewGrade("p1", "codex-grok", "f1", 1)) + "\n",
   };
@@ -176,12 +176,17 @@ test("reportExperiment: a named paired treatment retains ordered coordinates and
     primary: { harness: "codex" },
     reviewer: { harness: "grok", model: "grok-4.5" },
     completed_cells: 1,
+    stage_failure_cells: 0,
+    contract_failure_cells: 0,
     fix_invoked_cells: 1,
+    fix_2_invoked_cells: 0,
     initial_blocking_findings: 2,
-    final_blocking_findings: 1,
-    resolved_blocking_findings: 1,
+    review_2_blocking_findings: 1,
+    resolved_before_review_2: 1,
     malformed_initial_reviews: 0,
-    malformed_final_reviews: 1,
+    malformed_review_2_reviews: 1,
+    review_1_verdict_parse: { strict: 1, tolerant: 0, unparseable: 0 },
+    review_2_verdict_parse: { strict: 0, tolerant: 0, unparseable: 1 },
   });
 });
 

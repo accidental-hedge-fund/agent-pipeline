@@ -3,6 +3,7 @@
 // never mutating them (report.ts).
 
 import type { ArtifactDescriptor } from "../trajectory/types.ts";
+import type { PipelinePolicy } from "../types.ts";
 
 export interface IntervalMethod {
   name: "bootstrap-percentile";
@@ -44,13 +45,29 @@ export interface CostSummary {
 export interface PairedConvergenceSummary {
   primary: { harness: string; model?: string; effort?: string };
   reviewer: { harness: string; model?: string; effort?: string };
+  /** Present for a pipeline-paired treatment, preserving the exact deployable
+   * `pipeline.yml` model/effort slots that produced the observation. */
+  policy?: PipelinePolicy;
   completed_cells: number;
+  stage_failure_cells: number;
+  contract_failure_cells: number;
   fix_invoked_cells: number;
+  fix_2_invoked_cells: number;
   initial_blocking_findings: number;
-  final_blocking_findings: number;
-  resolved_blocking_findings: number;
+  /** Findings raised by review-2, before any fix-2 invocation. */
+  review_2_blocking_findings: number;
+  /** Reduction from review-1 to review-2; does not claim fix-2 convergence. */
+  resolved_before_review_2: number;
   malformed_initial_reviews: number;
-  malformed_final_reviews: number;
+  malformed_review_2_reviews: number;
+  review_1_verdict_parse: VerdictParseCounts;
+  review_2_verdict_parse: VerdictParseCounts;
+}
+
+export interface VerdictParseCounts {
+  strict: number;
+  tolerant: number;
+  unparseable: number;
 }
 
 export interface TreatmentSummary {

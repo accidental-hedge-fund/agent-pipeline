@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "experiment_id": "pipeline-routing-smoke-20260728c",
+  "fixture_ids": ["paired-scoreboard-duplicate-cost"],
+  "mode": "pipeline-paired",
+  "named_treatments": [
+    {
+      "id": "grok-primary__codex-secondary",
+      "primary": { "harness": "grok" },
+      "reviewer": { "harness": "codex" },
+      "policy": {
+        "models": { "planning": "grok-4.5", "implementing": "grok-4.5", "review": "gpt-5.6-terra", "fix": "grok-4.5" },
+        "effort": { "planning": "high", "implementing": "high", "review": "high", "fix": "high" }
+      }
+    },
+    {
+      "id": "codex-primary__grok-secondary",
+      "primary": { "harness": "codex" },
+      "reviewer": { "harness": "grok" },
+      "policy": {
+        "models": { "planning": "gpt-5.6-terra", "implementing": "gpt-5.6-terra", "review": "grok-4.5", "fix": "gpt-5.6-terra" },
+        "effort": { "planning": "high", "implementing": "high", "review": "high", "fix": "high" }
+      }
+    },
+    {
+      "id": "grok-primary__grok-secondary",
+      "primary": { "harness": "grok" },
+      "reviewer": { "harness": "grok" },
+      "policy": {
+        "models": { "planning": "grok-4.5", "implementing": "grok-4.5", "review": "grok-4.5", "fix": "grok-4.5" },
+        "effort": { "planning": "high", "implementing": "high", "review": "high", "fix": "high" }
+      }
+    },
+    {
+      "id": "codex-primary__codex-secondary",
+      "primary": { "harness": "codex" },
+      "reviewer": { "harness": "codex" },
+      "policy": {
+        "models": { "planning": "gpt-5.6-terra", "implementing": "gpt-5.6-terra", "review": "gpt-5.6-terra", "fix": "gpt-5.6-terra" },
+        "effort": { "planning": "high", "implementing": "high", "review": "high", "fix": "high" }
+      }
+    }
+  ],
+  "replicates": 1,
+  "seed": 20260728,
+  "concurrency": 1,
+  "timeout": 2400,
+  "output_dir": ".agent-pipeline/evals",
+  "sandbox_mode": "external-bypass"
+}

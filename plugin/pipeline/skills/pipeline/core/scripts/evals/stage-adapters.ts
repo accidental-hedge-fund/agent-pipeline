@@ -10,7 +10,17 @@
 // the cell's isolated worktree — which by construction never touches gh.
 
 import { REVIEW_VERDICT_SCHEMA_BLOCK } from "../review-schema.ts";
-import { EVAL_STAGE_NAMES, type EvalMode, type EvalStageName, type Fixture } from "./types.ts";
+import {
+  buildFixPrompt,
+  buildImplementingPrompt,
+  buildPlanningPrompt,
+  buildPlanReviewPrompt,
+  buildPlanRevisionPrompt,
+  buildReviewAdversarialPrompt,
+  buildReviewStandardPrompt,
+} from "../prompts/index.ts";
+import type { PipelineConfig } from "../types.ts";
+import { EVAL_STAGE_NAMES, type EvalMode, type EvalStageName, type Fixture, type HarnessCoordinate } from "./types.ts";
 
 const STAGE_INSTRUCTIONS: Record<EvalStageName, string> = {
   planning: "Produce an implementation plan for the following issue.",
@@ -71,5 +81,136 @@ export function stagesForMode(mode: EvalMode, fixture: Fixture): EvalStageName[]
   if (mode === "end-to-end") {
     return materializeEndToEndPrompts(fixture).map((p) => p.stage);
   }
+  if (mode === "paired" || mode === "pipeline-paired") return [];
   return [mode];
+}
+
+/** Prompt a paired evaluator's reviewer with the exact diff produced in its
+ * own isolated worktree. The verdict shape is the production review schema,
+ * so paired results can use the same conservative finding parser. */
+export function materializePairedReviewPrompt(fixture: Fixture, diff: string, round: 1 | 2): string {
+  return [
+    `You are the ${round === 1 ? "first" : "final"} independent reviewer for this implementation.`,
+    "Review the actual diff below for correctness, safety, and adherence to the task.",
+    "Return JSON only, matching this schema. Do not claim approval when the diff is empty or the task is not met.",
+    REVIEW_VERDICT_SCHEMA_BLOCK,
+    "",
+    "## Task",
+    fixture.task_input,
+    "",
+    "## Actual diff",
+    diff || "(no changes)",
+  ].join("\n");
+}
+
+/** Give the primary only the reviewer findings it must address, not hidden
+ * grader checks or any production-state affordance. */
+export function materializePairedFixPrompt(fixture: Fixture, findings: unknown[]): string {
+  return [
+    "Address the blocking review findings with a minimal, surgical fix in the current worktree.",
+    "Do not discard unrelated existing work.",
+    "",
+    "## Task",
+    fixture.task_input,
+    "",
+    "## Blocking findings",
+    JSON.stringify(findings, null, 2),
+  ].join("\n");
+}
+
+interface PipelinePromptBase {
+  cfg: PipelineConfig;
+  fixture: Fixture;
+  primary: HarnessCoordinate;
+  reviewer: HarnessCoordinate;
+}
+
+function productionBase(input: PipelinePromptBase) {
+  return {
+    cfg: input.cfg,
+    issueNumber: 0,
+    title: input.fixture.fixture_id,
+    body: input.fixture.task_input,
+  };
+}
+
+/**
+ * Pipeline-paired uses the same pure prompt builders as live production
+ * routing. It deliberately does not call stage orchestrators, which require
+ * GitHub labels/comments/commits and other live predecessor state.
+ */
+export function materializePipelinePlanningPrompt(input: PipelinePromptBase): string {
+  return buildPlanningPrompt(productionBase(input));
+}
+
+export function materializePipelinePlanReviewPrompt(input: PipelinePromptBase & { plan: string }): string {
+  return buildPlanReviewPrompt({
+    ...productionBase(input),
+    plan: input.plan,
+    reviewer: input.reviewer.harness,
+    implementer: input.primary.harness,
+  });
+}
+
+export function materializePipelinePlanRevisionPrompt(
+  input: PipelinePromptBase & { plan: string; feedback: string },
+): string {
+  return buildPlanRevisionPrompt({
+    ...productionBase(input),
+    plan: input.plan,
+    feedback: input.feedback,
+    reviewer: input.reviewer.harness,
+    implementer: input.primary.harness,
+  });
+}
+
+export function materializePipelineImplementationPrompt(
+  input: PipelinePromptBase & { plan: string; pipelineRunId: string },
+): string {
+  return buildImplementingPrompt({
+    ...productionBase(input),
+    plan: input.plan,
+    pipelineRunId: input.pipelineRunId,
+    executionMode: "evaluation",
+  });
+}
+
+export function materializePipelineReview1Prompt(input: PipelinePromptBase & { plan: string; diff: string }): string {
+  return buildReviewStandardPrompt({
+    ...productionBase(input),
+    plan: input.plan,
+    diff: input.diff,
+  });
+}
+
+export function materializePipelineReview2Prompt(
+  input: PipelinePromptBase & { diff: string; review1Summary: string },
+): string {
+  return buildReviewAdversarialPrompt({
+    ...productionBase(input),
+    diff: input.diff,
+    review1Summary: input.review1Summary,
+  });
+}
+
+export function materializePipelineFixPrompt(
+  input: PipelinePromptBase & {
+    reviewFindings: string;
+    priorReviewHistory?: string;
+    fixRound: 1 | 2;
+    pipelineRunId: string;
+    reviewedSha: string;
+  },
+): string {
+  return buildFixPrompt({
+    cfg: input.cfg,
+    issueNumber: 0,
+    title: input.fixture.fixture_id,
+    reviewFindings: input.reviewFindings,
+    priorReviewHistory: input.priorReviewHistory,
+    fixRound: input.fixRound,
+    pipelineRunId: input.pipelineRunId,
+    reviewedSha: input.reviewedSha,
+    executionMode: "evaluation",
+  });
 }

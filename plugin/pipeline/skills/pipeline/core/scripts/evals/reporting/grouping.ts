@@ -24,6 +24,9 @@ export function parseTreatmentId(treatmentId: string): Treatment {
 
 export interface GroupableEntry {
   treatment_id: string;
+  /** Resolved plan treatment; named treatments cannot be reconstructed from
+   * their arbitrary stable id. */
+  treatment?: Treatment;
   stage: string;
   category: string;
   risk: string;
@@ -35,7 +38,20 @@ function valueForDimension(entry: GroupableEntry, dimension: GroupDimension): st
   if (dimension === "stage") return entry.stage;
   if (dimension === "category") return entry.category;
   if (dimension === "risk") return entry.risk;
-  const treatment = parseTreatmentId(entry.treatment_id);
+  const treatment = entry.treatment ?? parseTreatmentId(entry.treatment_id);
+  if (dimension === "harness" && treatment.primary) {
+    return treatment.reviewer
+      ? `${treatment.primary.harness}->${treatment.reviewer.harness}`
+      : treatment.primary.harness;
+  }
+  if (dimension === "model" && treatment.policy) {
+    const models = treatment.policy.models;
+    return `planning:${models.planning}|implementing:${models.implementing}|review:${models.review}|fix:${models.fix}`;
+  }
+  if (dimension === "effort" && treatment.policy) {
+    const effort = treatment.policy.effort;
+    return `planning:${effort.planning}|implementing:${effort.implementing}|review:${effort.review}|fix:${effort.fix}`;
+  }
   return treatment[dimension] ?? UNKNOWN_GROUP;
 }
 

@@ -8,12 +8,17 @@ The current evaluator has a single `harness` treatment axis. Its end-to-end mode
 
 - Make valid named treatments first-class and preserve current axis expansion unchanged.
 - Execute an isolated implementation → review → fix → re-review trajectory with distinct primary and reviewer coordinates.
+- Execute a deployable full-pipeline policy through planning → plan-review → plan revision → implementation → both review/fix rounds.
 - Supply the reviewer with the actual current worktree diff, never a static fixture diff.
 - Preserve no-production-write, timeout, resume, trajectory, and deterministic-grading guarantees.
 
 **Non-Goals:**
 
-- Simulating every production stage, GitHub issue comment, or PR lifecycle.
+- Simulating GitHub issue comments, labels, PR mutation, CI, merge, or deployment.
+- Evaluating the OpenSpec planning variant. `pipeline-paired` currently
+  exercises the production freeform planning contract; OpenSpec planning must
+  be added as an explicit corpus/treatment dimension before results can be
+  generalized to that path.
 - Declaring reviewer precision/recall from primary-generated findings; seeded review fixtures remain the authoritative measurement for that role metric.
 - Changing a production profile, routing live traffic, or auto-selecting a winner.
 
@@ -41,19 +46,59 @@ The paired reviewer prompt requires the existing review-verdict JSON shape. The 
 
 Paired cells reuse the existing per-cell worktree, evaluation GitHub refusal surface, stripped credential environment, deadline, and cleanup path. The scheduler interleaves by a stable treatment identity derived from both pair members. A named treatment preflight checks each distinct harness before invoking it.
 
+### 5. Pipeline-paired treatments preserve deployable policy coupling
+
+`pipeline-paired` adds a complete `policy.models` and `policy.effort` object
+with the same planning, implementing, review, and fix slots a repository can
+configure. The primary coordinate selects the implementer harness; the
+reviewer coordinate selects the reviewer harness and may carry the structured
+`review_harness.model` / `review_harness.effort` override. The runner passes
+the produced plan, plan-review feedback, revised plan, and worktree diffs
+between stages rather than substituting frozen downstream artifacts.
+
+The mode intentionally preserves shared production slots: review model/effort
+feed plan-review and both review rounds unless the reviewer override applies,
+and the fix slot feeds both fix rounds. Treatments that cannot be represented
+by this policy shape are rejected before execution.
+
+### 6. Production prompt and policy contracts are shared, not approximated
+
+`pipeline-paired` calls the pure production builders for planning,
+plan-review, plan revision, implementation, standard review, adversarial
+review, and both fixes. Implementation/fix builders accept an additive
+evaluation execution mode that appends a final no-commit/no-push override;
+their default production output remains byte-identical.
+
+The executor embeds the installed eval contract from the cell worktree,
+enforces the production plan-review and plan-revision output gates, formats
+review-1 context for adversarial review-2, and partitions blocking findings
+with the production review policy. It still avoids the live stage
+orchestrators because those require GitHub comments, labels, commits, and PR
+state that an isolated evaluation cell must never create.
+
+Review-2 happens before optional fix-2. Evidence therefore calls its finding
+count `review_2_blocking_findings`; `final_diff_hash` describes the post-fix-2
+worktree but does not imply a third review occurred. Reports preserve strict,
+tolerant, and unparseable verdict counts per round and read named-treatment
+dimensions from the resolved plan treatment rather than its arbitrary id.
+
 ## Risks / Trade-offs
 
 - **Dynamic primary diffs lack a fixed review oracle.** → Report final deterministic correctness and convergence here; retain seeded review fixtures for precision/recall.
 - **Paired cells cost more than single-stage cells.** → One shared timeout, explicit plan-before-run, bounded concurrency, and screening before paired trials.
 - **A model CLI may not reveal its resolved default.** → Persist requested model (or `null` for a default) and CLI version; never infer an unavailable resolved ID.
 - **A reviewer finds no blocking issue.** → Skip fix, still perform final review accounting and deterministic checks.
+- **OpenSpec planning can differ materially from freeform planning.** → State
+  the current freeform-only boundary in reports and add OpenSpec as an
+  explicit future evaluation dimension rather than silently pooling it.
 
 ## Migration Plan
 
 1. Add validation, expansion, execution, grading, reporting, fixtures, and unit tests behind the new mode.
-2. Regenerate the plugin mirror and pass the full CI gate.
-3. Run plan-only manifests, then a bounded baseline-versus-candidate experiment in local eval output.
-4. Roll back by omitting `named_treatments` and `mode: "paired"`; all prior manifests remain valid.
+2. Extend the mode with deployable `pipeline-paired` policy validation and the full dynamic stage graph.
+3. Regenerate the plugin mirror and pass the full CI gate.
+4. Run plan-only manifests, then bounded screens and replicated baseline-versus-candidate experiments in local eval output.
+5. Roll back by omitting `named_treatments` and the paired modes; all prior manifests remain valid.
 
 ## Open Questions
 

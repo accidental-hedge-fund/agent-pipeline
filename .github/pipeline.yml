@@ -20,7 +20,7 @@ ci_timeout: 900 # seconds to wait for CI at pre-merge
 ci_poll_interval: 30 # seconds between CI status polls
 ci_no_run_grace_s: 60 # seconds to wait before checking for zero check-runs when CI appears pending; set to 0 to check immediately
 
-models: # per-phase model alias — only honored when the role's harness is claude; codex ignores it (setting an inert one prints a warning). Each key also accepts "auto" (#366).
+models: # per-phase model alias — honored when the resolved role's harness supports model selection (Claude, Codex, and Grok do). Each key also accepts "auto" (#366, #608).
   planning: opus # implementer harness
   implementing: sonnet # implementer harness
   review: auto # reviewer harness
@@ -36,7 +36,7 @@ models: # per-phase model alias — only honored when the role's harness is clau
 #   intake: low # intake spec-generation — always the claude harness
 #   sweep: low # sweep spec-generation — always the claude harness
 
-# review_harness: my-reviewer # override the reviewer CLI for the review step (default: the profile's reviewer). The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.
+# review_harness: my-reviewer # override the reviewer CLI for the review step (default: the profile's reviewer). The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. Configure the implementer role with harnesses.implementer.
 #   Or a structured form for independent reviewer model/effort control:
 # review_harness:
 #   command: my-reviewer

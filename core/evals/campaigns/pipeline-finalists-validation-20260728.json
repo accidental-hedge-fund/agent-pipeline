@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "experiment_id": "pipeline-finalists-validation-20260728",
+  "fixture_ids": [
+    "paired-create-issue-positive-number",
+    "paired-linked-checkout-worktree-discovery",
+    "paired-plan-revision-fenced-feedback",
+    "paired-release-non-pr-suffix",
+    "paired-scoreboard-duplicate-cost"
+  ],
+  "mode": "pipeline-paired",
+  "named_treatments": [
+    {
+      "id": "grok-high__codex-terra-high",
+      "primary": { "harness": "grok" },
+      "reviewer": { "harness": "codex" },
+      "policy": {
+        "models": {
+          "planning": "grok-4.5",
+          "implementing": "grok-4.5",
+          "review": "gpt-5.6-terra",
+          "fix": "grok-4.5"
+        },
+        "effort": {
+          "planning": "high",
+          "implementing": "high",
+          "review": "high",
+          "fix": "high"
+        }
+      }
+    },
+    {
+      "id": "grok-high__codex-terra-max",
+      "primary": { "harness": "grok" },
+      "reviewer": { "harness": "codex" },
+      "policy": {
+        "models": {
+          "planning": "grok-4.5",
+          "implementing": "grok-4.5",
+          "review": "gpt-5.6-terra",
+          "fix": "grok-4.5"
+        },
+        "effort": {
+          "planning": "high",
+          "implementing": "high",
+          "review": "max",
+          "fix": "high"
+        }
+      }
+    },
+    {
+      "id": "grok-high__grok-high",
+      "primary": { "harness": "grok" },
+      "reviewer": { "harness": "grok" },
+      "policy": {
+        "models": {
+          "planning": "grok-4.5",
+          "implementing": "grok-4.5",
+          "review": "grok-4.5",
+          "fix": "grok-4.5"
+        },
+        "effort": {
+          "planning": "high",
+          "implementing": "high",
+          "review": "high",
+          "fix": "high"
+        }
+      }
+    },
+    {
+      "id": "codex-sol-max__codex-terra-high",
+      "primary": { "harness": "codex" },
+      "reviewer": { "harness": "codex" },
+      "policy": {
+        "models": {
+          "planning": "gpt-5.6-sol",
+          "implementing": "gpt-5.6-sol",
+          "review": "gpt-5.6-terra",
+          "fix": "gpt-5.6-sol"
+        },
+        "effort": {
+          "planning": "max",
+          "implementing": "max",
+          "review": "high",
+          "fix": "max"
+        }
+      }
+    },
+    {
+      "id": "codex-sol-max__codex-terra-max",
+      "primary": { "harness": "codex" },
+      "reviewer": { "harness": "codex" },
+      "policy": {
+        "models": {
+          "planning": "gpt-5.6-sol",
+          "implementing": "gpt-5.6-sol",
+          "review": "gpt-5.6-terra",
+          "fix": "gpt-5.6-sol"
+        },
+        "effort": {
+          "planning": "max",
+          "implementing": "max",
+          "review": "max",
+          "fix": "max"
+        }
+      }
+    },
+    {
+      "id": "codex-sol-max__grok-high",
+      "primary": { "harness": "codex" },
+      "reviewer": { "harness": "grok" },
+      "policy": {
+        "models": {
+          "planning": "gpt-5.6-sol",
+          "implementing": "gpt-5.6-sol",
+          "review": "grok-4.5",
+          "fix": "gpt-5.6-sol"
+        },
+        "effort": {
+          "planning": "max",
+          "implementing": "max",
+          "review": "high",
+          "fix": "max"
+        }
+      }
+    },
+    {
+      "id": "codex-luna-low__codex-terra-high",
+      "primary": { "harness": "codex" },
+      "reviewer": { "harness": "codex" },
+      "policy": {
+        "models": {
+          "planning": "gpt-5.6-luna",
+          "implementing": "gpt-5.6-luna",
+          "review": "gpt-5.6-terra",
+          "fix": "gpt-5.6-luna"
+        },
+        "effort": {
+          "planning": "low",
+          "implementing": "low",
+          "review": "high",
+          "fix": "low"
+        }
+      }
+    },
+    {
+      "id": "codex-luna-low__codex-terra-max",
+      "primary": { "harness": "codex" },
+      "reviewer": { "harness": "codex" },
+      "policy": {
+        "models": {
+          "planning": "gpt-5.6-luna",
+          "implementing": "gpt-5.6-luna",
+          "review": "gpt-5.6-terra",
+          "fix": "gpt-5.6-luna"
+        },
+        "effort": {
+          "planning": "low",
+          "implementing": "low",
+          "review": "max",
+          "fix": "low"
+        }
+      }
+    },
+    {
+      "id": "codex-luna-low__grok-high",
+      "primary": { "harness": "codex" },
+      "reviewer": { "harness": "grok" },
+      "policy": {
+        "models": {
+          "planning": "gpt-5.6-luna",
+          "implementing": "gpt-5.6-luna",
+          "review": "grok-4.5",
+          "fix": "gpt-5.6-luna"
+        },
+        "effort": {
+          "planning": "low",
+          "implementing": "low",
+          "review": "high",
+          "fix": "low"
+        }
+      }
+    }
+  ],
+  "replicates": 3,
+  "seed": 20260728,
+  "concurrency": 12,
+  "timeout": 1800,
+  "output_dir": ".agent-pipeline/evals",
+  "sandbox_mode": "external-bypass"
+}

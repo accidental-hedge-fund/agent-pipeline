@@ -781,7 +781,7 @@ ci_mode: github                    # github (default): wait for GitHub Actions c
 intake_timeout: 600                # seconds for the intake spec-generation harness (fail-fast on a hung call)
 sweep_timeout: 600                 # seconds for each sweep issue re-spec harness
 models:                            # per-phase model alias. Each key also accepts "auto" (see "Auto model/effort routing").
-  planning: sonnet                 # planning / implementing / fix → implementer harness (only the claude implementer honors these; codex ignores them)
+  planning: sonnet                 # planning / implementing / fix → resolved implementer harness when its adapter supports model selection
   implementing: sonnet
   review: claude-fable-5           # review → reviewer harness (default) — honored by both the claude and codex reviewer (codex via `-m <model>`)
   fix: sonnet
@@ -905,6 +905,23 @@ stage_executors:                     # optional: assign an executors: name to a 
 
 For a real primary → reviewer comparison, use explicit `named_treatments` rather than Cartesian `treatments`. Each pair preserves only valid harness-specific model/effort coordinates and executes implementation → review of the produced diff → optional fix → re-review under one cell timeout.
 
+Use `mode: "pipeline-paired"` when the decision includes planning and plan-review. Its `policy` is intentionally shaped like the deployable YAML surface: all four `models` and `effort` slots are explicit, `models.review` is shared by plan-review/review-1/review-2, `effort.planning` also drives plan-review, and `fix` is shared by both fix rounds. A reviewer coordinate may additionally set `model` or `effort`; these model the structured `review_harness.model` / `review_harness.effort` overrides and take precedence for plan-review plus both code-review rounds. The evaluator dynamically executes planning → plan-review → plan revision → implementation → review-1 → optional fix-1 → review-2 → optional fix-2 with the actual plan and diffs, using the same pure prompt builders, plan-output gates, and review-policy partitioning as production. Implementation/fix append only an evaluation execution override that leaves changes uncommitted and unpublished. Review-2 findings describe the pre-fix-2 state; the post-fix-2 `final_diff_hash` is recorded separately and is not presented as if a third review occurred. This mode currently exercises freeform planning, not the OpenSpec planning variant. It will reject an unexpressible policy rather than reporting a recommendation that `pipeline.yml` cannot deploy.
+
+```json
+{
+  "mode": "pipeline-paired",
+  "named_treatments": [{
+    "id": "grok-primary__codex-secondary",
+    "primary": { "harness": "grok" },
+    "reviewer": { "harness": "codex", "model": "gpt-5.6-terra", "effort": "high" },
+    "policy": {
+      "models": { "planning": "grok-4.5", "implementing": "grok-4.5", "review": "gpt-5.6-terra", "fix": "grok-4.5" },
+      "effort": { "planning": "high", "implementing": "high", "review": "high", "fix": "high" }
+    }
+  }]
+}
+```
+
 ```json
 {
   "schema_version": 1,
@@ -939,7 +956,7 @@ The report keeps pair direction, phase duration, reliability, deterministic corr
 
 ### Custom reviewer harness (`review_harness`)
 
-By default the review step runs on the profile's cross-harness reviewer (`codex` under `/pipeline`, `claude` under `$pipeline`). Set `review_harness` to point review at a different reviewer CLI instead — the implementer harness is unaffected and stays profile-owned:
+By default the review step runs on the profile's cross-harness reviewer (`codex` under `/pipeline`, `claude` under `$pipeline`). Set `review_harness` to point review at a different reviewer CLI instead. Configure the implementer independently with `harnesses.implementer`; an explicit repository role overrides the invoking profile:
 
 ```yaml
 review_harness: my-reviewer          # any CLI on your PATH

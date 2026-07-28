@@ -47,7 +47,7 @@ export function boundaryDenialLogPath(worktreeDir: string): string {
 }
 
 function denyAllScript(command: string, category: string): string {
-  return `#!/usr/bin/env node
+  return `#!${process.execPath}
 const fs = require("fs");
 const argv = process.argv.slice(2);
 const entry = { command: ${JSON.stringify(command)}, argv, category: ${JSON.stringify(category)}, at: new Date().toISOString() };
@@ -71,7 +71,7 @@ process.exit(1);
  *  skipping recognized global flags (and the separate value some of them
  *  take) until it finds the first non-option token. */
 function gitShimScript(): string {
-  return `#!/usr/bin/env node
+  return `#!${process.execPath}
 const fs = require("fs");
 const { spawnSync } = require("child_process");
 const argv = process.argv.slice(2);
@@ -104,6 +104,36 @@ process.exit(result.status === null || result.status === undefined ? 1 : result.
 `;
 }
 
+/** A treatment can bypass the `pipeline` PATH shim by invoking the TypeScript
+ * entrypoint through Node directly (`node core/scripts/pipeline.ts …`). Node
+ * itself remains usable for tests and local tooling; this interceptor denies
+ * only an argv that names that entrypoint. The other shim scripts use the
+ * absolute current Node executable in their shebangs so this shim cannot
+ * recurse through `/usr/bin/env node`. */
+function nodeShimScript(): string {
+  return `#!${process.execPath}
+const fs = require("fs");
+const { spawnSync } = require("child_process");
+const argv = process.argv.slice(2);
+const isPipelineEntrypoint = argv.some((arg) => {
+  if (typeof arg !== "string" || arg.startsWith("-")) return false;
+  const normalized = arg.replace(/\\\\/g, "/");
+  return normalized === "core/scripts/pipeline.ts" || normalized.endsWith("/core/scripts/pipeline.ts");
+});
+if (isPipelineEntrypoint) {
+  const entry = { command: "node", argv, category: "pipeline-advance", at: new Date().toISOString() };
+  const logPath = process.env.EVAL_BOUNDARY_DENIAL_LOG;
+  if (logPath) { try { fs.appendFileSync(logPath, JSON.stringify(entry) + "\\n"); } catch {} }
+  process.stderr.write("eval-boundary: node execution of core/scripts/pipeline.ts is denied inside an evaluation cell (category: pipeline-advance)\\n");
+  process.exit(1);
+}
+const shimDir = __dirname;
+const restPath = (process.env.PATH || "").split(":").filter((p) => p && p !== shimDir).join(":");
+const result = spawnSync("node", argv, { stdio: "inherit", env: Object.assign({}, process.env, { PATH: restPath }) });
+process.exit(result.status === null || result.status === undefined ? 1 : result.status);
+`;
+}
+
 export interface BoundaryShimIO {
   mkdir: (dir: string) => void;
   writeFile: (filePath: string, content: string) => void;
@@ -129,6 +159,7 @@ export function installBoundaryShim(worktreeDir: string, io: BoundaryShimIO = de
     gh: denyAllScript("gh", "github-write"),
     pipeline: denyAllScript("pipeline", "pipeline-advance"),
     git: gitShimScript(),
+    node: nodeShimScript(),
   };
   for (const [name, content] of Object.entries(files)) {
     const filePath = path.join(dir, name);

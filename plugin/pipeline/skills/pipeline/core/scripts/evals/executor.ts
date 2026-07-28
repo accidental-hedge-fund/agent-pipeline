@@ -9,12 +9,13 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { createWorktreeAt, removeWorktreeAt } from "../worktree.ts";
 import { invoke as harnessInvoke } from "../harness.ts";
 import { resolveAdapter } from "../harness-adapters/index.ts";
 import { preflightExecutor, invokeExternalExecutor, type ExecutorAssignment } from "../executors.ts";
 import type { HarnessResult } from "../harness.ts";
-import type { ModelEndpointOverride, ModelInvokingStage, PipelineConfig } from "../types.ts";
+import type { ModelEndpointOverride, ModelInvokingStage, PipelineConfig, ReviewFinding, ReviewVerdict } from "../types.ts";
 import {
   createEvalGhSurface,
   createRecordingRefusalRecorder,
@@ -28,8 +29,29 @@ import {
   readBoundaryDenials as readBoundaryDenialsReal,
   removeBoundaryShim as removeBoundaryShimReal,
 } from "./boundary-shim.ts";
-import { materializeStagePrompt, stagesForMode } from "./stage-adapters.ts";
-import { isJsonVerdictShaped, parseProseReview, parseStrictVerdict, parseStructuredVerdict } from "../stages/review-parsing.ts";
+import {
+  materializePairedFixPrompt,
+  materializePairedReviewPrompt,
+  materializePipelineImplementationPrompt,
+  materializePipelineFixPrompt,
+  materializePipelinePlanReviewPrompt,
+  materializePipelinePlanRevisionPrompt,
+  materializePipelinePlanningPrompt,
+  materializePipelineReview1Prompt,
+  materializePipelineReview2Prompt,
+  materializeStagePrompt,
+  stagesForMode,
+} from "./stage-adapters.ts";
+import {
+  classifyReview1Risk,
+  isJsonVerdictShaped,
+  parseProseReview,
+  parseStrictVerdict,
+  parseStructuredVerdict,
+} from "../stages/review-parsing.ts";
+import { formatReviewComment } from "../stages/review-rendering.ts";
+import { effectiveReviewPolicy, partitionFindings } from "../review-policy.ts";
+import { verifyPlanRevisionOutput } from "../verify-harness-commits.ts";
 import type { BuildTreatmentTrajectoryInput, RawStageEntry } from "./trajectory/collect.ts";
 import type {
   BoundaryDenial,
@@ -44,6 +66,7 @@ import type {
   ReviewVerdictParseProvenance,
   SandboxMode,
   Treatment,
+  HarnessCoordinate,
 } from "./types.ts";
 
 function sanitizeForPath(cellId: string): string {
@@ -292,6 +315,8 @@ export interface CellExecutionDeps {
    *  given worktree. Only invoked when the fixture declares
    *  `allowed_change_paths` (out-of-scope-change grading needs it). */
   getChangedPaths?: (args: { worktreeDir: string; baseSha: string }) => Promise<string[]>;
+  /** Return the current cell diff from its immutable fixture base. */
+  getDiff?: (args: { worktreeDir: string; baseSha: string }) => Promise<string>;
   /** Dispatch an API treatment through a named `model-endpoint` executor
    *  (#434 task 6). Only invoked when the cell's treatment declares
    *  `executor`. */
@@ -359,6 +384,18 @@ async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: stri
     return stdout.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
   } catch {
     return [];
+  }
+}
+
+async function defaultGetDiff(args: { worktreeDir: string; baseSha: string }): Promise<string> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileAsync = promisify(execFile);
+  try {
+    const { stdout } = await execFileAsync("git", ["diff", "--no-ext-diff", args.baseSha], { cwd: args.worktreeDir, timeout: 30_000 });
+    return stdout;
+  } catch {
+    return "";
   }
 }
 
@@ -561,7 +598,11 @@ export async function runCell(
 
   const stages: EvalStageName[] = stagesForMode(cell.mode, fixture);
   const prompts = stages.map((stage) => materializeStagePrompt(stage, fixture));
-  const materializedPrompt = prompts.join("\n\n---\n\n");
+  let materializedPrompt = cell.mode === "paired"
+    ? `${materializeStagePrompt("implementing", fixture)}\n\n--- paired reviewer/fix prompts derive from this cell's actual diff ---`
+    : cell.mode === "pipeline-paired"
+      ? `pipeline-paired:${fixture.fixture_id}\n\n--- production prompts materialize after the eval contract is installed and carry live handoffs ---`
+    : prompts.join("\n\n---\n\n");
   const effectiveConfig: Record<string, unknown> = {
     mode: cell.mode,
     treatment: cell.treatment,
@@ -585,6 +626,20 @@ export async function runCell(
     const result = restoreEvalContract(identity.worktreePath, contractPrior, contractIO);
     if (!result.ok) restoreFailures.push(result.error);
     contractPrior = undefined;
+  }
+
+  /** Reinstall the root instruction contract after a reviewer-facing diff has
+   * temporarily restored the repository's real guidance. A reviewer must
+   * never see the evaluator's own AGENTS.md/CLAUDE.md replacement as a
+   * treatment change, while a subsequent primary fix still needs the same
+   * isolation contract as implementation. */
+  function installContractIfNeeded(): { ok: true } | { ok: false; error: string } {
+    if (contractPrior) return { ok: true };
+    const result = installEvalContract(identity.worktreePath, contractIO);
+    contractPrior = result.prior;
+    if (!result.ok) return { ok: false, error: result.error };
+    trajectoryActions.push("installed eval agent contract");
+    return { ok: true };
   }
 
   // Treatment trajectory collection (#536): best-effort, capability-aware.
@@ -693,18 +748,12 @@ export async function runCell(
   // into an uncontracted/unbounded invocation — an install failure is an
   // infra error and the harness is never invoked for this cell.
   try {
-    const contractResult = installEvalContract(identity.worktreePath, contractIO);
-    // Retain the captured prior on BOTH paths: a partial install (an earlier
-    // path written before a later one failed) must still have its already-
-    // modified paths restored by `finish()` → `restoreContractIfNeeded()`,
-    // rather than leaving the contract behind (finding e3e72127).
-    contractPrior = contractResult.prior;
+    const contractResult = installContractIfNeeded();
     if (!contractResult.ok) {
       const error = `eval agent contract installation failed: ${contractResult.error}`;
       trajectoryActions.push(error);
       return finish({ result_class: "infra_error", error });
     }
-    trajectoryActions.push("installed eval agent contract");
     installBoundaryShimFn(identity.worktreePath);
     trajectoryActions.push("installed process-level command boundary");
   } catch (err) {
@@ -731,6 +780,409 @@ export async function runCell(
         return finish({ result_class: "infra_error", error });
       }
       trajectoryActions.push(`ran setup for simulated dependency ${JSON.stringify(dep.name)}`);
+    }
+
+    if (cell.mode === "pipeline-paired") {
+      const primary = cell.treatment.primary;
+      const reviewer = cell.treatment.reviewer;
+      const policy = cell.treatment.policy;
+      if (!primary || !reviewer || !policy) {
+        return finish({ result_class: "infra_error", error: "pipeline-paired cell is missing primary, reviewer, or deployable policy coordinates" });
+      }
+
+      const planningCoordinate: HarnessCoordinate = { harness: primary.harness, model: policy.models.planning, effort: policy.effort.planning };
+      const implementingCoordinate: HarnessCoordinate = { harness: primary.harness, model: policy.models.implementing, effort: policy.effort.implementing };
+      const fixCoordinate: HarnessCoordinate = { harness: primary.harness, model: policy.models.fix, effort: policy.effort.fix };
+      // A structured review_harness model/effort overrides the stage policy
+      // for every reviewer invocation in production config. Preserve that
+      // distinction here so a reviewer with a narrower effort vocabulary
+      // (for example Grok) can review a primary's max/ultra planning run.
+      const planReviewCoordinate: HarnessCoordinate = {
+        harness: reviewer.harness,
+        model: reviewer.model ?? policy.models.review,
+        effort: reviewer.effort ?? policy.effort.planning,
+      };
+      const reviewCoordinate: HarnessCoordinate = {
+        harness: reviewer.harness,
+        model: reviewer.model ?? policy.models.review,
+        effort: reviewer.effort ?? policy.effort.review,
+      };
+      const evalCfg: PipelineConfig = {
+        ...cfg,
+        repo_dir: identity.worktreePath,
+        conventions_default: "AGENTS.md",
+        conventions_md_path: "AGENTS.md",
+      };
+      const promptBase = { cfg: evalCfg, fixture, primary, reviewer };
+      const pipelinePrompts: string[] = [];
+      const coordinates = [planningCoordinate, implementingCoordinate, fixCoordinate, planReviewCoordinate, reviewCoordinate];
+      const seenCoordinates = new Set<string>();
+      for (const coordinate of coordinates) {
+        const key = `${coordinate.harness}\u0000${coordinate.model}\u0000${coordinate.effort}`;
+        if (seenCoordinates.has(key)) continue;
+        seenCoordinates.add(key);
+        let preflight: PreflightResultLike;
+        try {
+          preflight = await preflightFn(coordinate.harness, { model: coordinate.model, effort: coordinate.effort });
+        } catch (err) {
+          return finish({ result_class: "infra_error", error: `pipeline-paired preflight failed: ${(err as Error).message}` });
+        }
+        if (!preflight.ok) {
+          const resultClass = preflight.failure === "unauthenticated" ? "auth_error" : "infra_error";
+          return finish({ result_class: resultClass, error: `pipeline-paired preflight failed for ${coordinate.harness}: ${preflight.message ?? preflight.failure}` });
+        }
+      }
+
+      const deadline = Date.now() + manifest.timeout * 1000;
+      const phaseDetails: Record<string, unknown>[] = [];
+      const invokePipelinePhase = async (
+        phase: string,
+        role: "primary" | "reviewer",
+        coordinate: HarnessCoordinate,
+        prompt: string,
+      ): Promise<{ result?: HarnessInvokeResultLike; outcome?: CellOutcome }> => {
+        pipelinePrompts.push(prompt);
+        materializedPrompt = pipelinePrompts.join("\n\n--- pipeline stage handoff ---\n\n");
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) return { outcome: { result_class: "timeout", error: `pipeline-paired cell exceeded its ${manifest.timeout}s deadline before ${phase}` } };
+        let result: HarnessInvokeResultLike;
+        try {
+          result = await invokeHarnessFn({
+            harness: coordinate.harness,
+            worktreeDir: identity.worktreePath,
+            prompt,
+            timeoutSec: Math.max(1, Math.ceil(remainingMs / 1000)),
+            model: coordinate.model,
+            effort: coordinate.effort,
+            gh: ghSurface,
+            env: evalIsolationEnv(identity.worktreePath),
+            sandboxMode: manifest.sandbox_mode,
+          });
+        } catch (err) {
+          return { outcome: { result_class: "infra_error", error: `${phase} harness invocation failed: ${(err as Error).message}` } };
+        }
+        trajectoryStages.push({ stage: phase, message: prompt, output: result.stdout, error: result.success ? undefined : result.stderr, duration_ms: Math.round(result.duration * 1000), success: result.success });
+        phaseDetails.push({ phase, role, harness: coordinate.harness, model: coordinate.model, effort: coordinate.effort, success: result.success, exit_code: result.exit_code, duration: result.duration });
+        if (result.timed_out) return { outcome: { result_class: "timeout", error: `${phase} exceeded the pipeline-paired cell deadline` } };
+        if (result.spawn_error) return { outcome: { result_class: "infra_error", error: `${phase} failed to spawn the ${coordinate.harness} harness` } };
+        if (!result.success) {
+          const authFailure = await classifyPostInvocationFailure(result, preflightFn, coordinate.harness, { model: coordinate.model, effort: coordinate.effort });
+          if (authFailure) return { outcome: { result_class: "auth_error", error: `${phase} ${authFailure}` } };
+          return {
+            outcome: {
+              result_class: "completed",
+              detail: {
+                stages: phaseDetails,
+                execution_class: "local-cli",
+                pipeline_paired: {
+                  primary,
+                  reviewer,
+                  policy,
+                  stage_failure: { phase, exit_code: result.exit_code },
+                },
+              },
+            },
+          };
+        }
+        trajectoryActions.push(`invoked ${phase} via ${role} harness "${coordinate.harness}"`);
+        return { result };
+      };
+      const contractFailure = (phase: string, reason: string): CellExecutionResult => {
+        trajectoryActions.push(`${phase} production contract failed: ${reason}`);
+        return finish({
+          result_class: "completed",
+          detail: {
+            stages: phaseDetails,
+            execution_class: "local-cli",
+            pipeline_paired: { primary, reviewer, policy, contract_failure: { phase, reason } },
+          },
+        });
+      };
+
+      const planning = await invokePipelinePhase(
+        "planning",
+        "primary",
+        planningCoordinate,
+        materializePipelinePlanningPrompt(promptBase),
+      );
+      if (planning.outcome) return finish(planning.outcome);
+      const plan = planning.result!.stdout;
+      if (!plan.trim()) return contractFailure("planning", "empty planning output");
+      const planReview = await invokePipelinePhase(
+        "plan-review",
+        "reviewer",
+        planReviewCoordinate,
+        materializePipelinePlanReviewPrompt({ ...promptBase, plan }),
+      );
+      if (planReview.outcome) return finish(planReview.outcome);
+      const planReviewOutput = planReview.result!.stdout;
+      if (!/^## Plan Review Verdict\b/m.test(planReviewOutput)) {
+        return contractFailure("plan-review", 'output is missing the required "## Plan Review Verdict" heading');
+      }
+      const revisedPlan = await invokePipelinePhase(
+        "plan-revision",
+        "primary",
+        planningCoordinate,
+        materializePipelinePlanRevisionPrompt({ ...promptBase, plan, feedback: planReviewOutput }),
+      );
+      if (revisedPlan.outcome) return finish(revisedPlan.outcome);
+      const revisedPlanOutput = revisedPlan.result!.stdout;
+      const revisionVerification = verifyPlanRevisionOutput(revisedPlanOutput, planReviewOutput);
+      if (!revisionVerification.ok) {
+        return contractFailure("plan-revision", revisionVerification.reason);
+      }
+      const pipelineRunId = `eval-${sanitizeForPath(cell.cell_id)}`;
+      const implementation = await invokePipelinePhase(
+        "implementing",
+        "primary",
+        implementingCoordinate,
+        materializePipelineImplementationPrompt({
+          ...promptBase,
+          plan: revisedPlanOutput,
+          pipelineRunId,
+        }),
+      );
+      if (implementation.outcome) return finish(implementation.outcome);
+
+      // The contract is evaluator-owned state, not an implementation change.
+      // Restore it while calculating each reviewer-facing diff, then reinstall
+      // it before invoking the reviewer. This keeps the diff clean without
+      // exposing the reviewer to the repository's normal workflow
+      // instructions. Primary fixes reuse the installed contract.
+      restoreContractIfNeeded();
+      const getDiffFn = deps.getDiff ?? defaultGetDiff;
+      const initialDiff = await getDiffFn({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
+      const initialReviewContract = installContractIfNeeded();
+      if (!initialReviewContract.ok) return finish({ result_class: "infra_error", error: `eval agent contract reinstallation failed before review-1: ${initialReviewContract.error}` });
+      const initialReview = await invokePipelinePhase(
+        "review-1",
+        "reviewer",
+        reviewCoordinate,
+        materializePipelineReview1Prompt({ ...promptBase, plan: revisedPlanOutput, diff: initialDiff }),
+      );
+      if (initialReview.outcome) return finish(initialReview.outcome);
+      const initialReviewVerdict = parseReviewFindings(initialReview.result!.stdout);
+      if (!initialReviewVerdict.verdict) {
+        return contractFailure("review-1", "review verdict was unparseable");
+      }
+      const review1Risk = classifyReview1Risk(initialReviewVerdict.verdict);
+      const review1Policy = effectiveReviewPolicy(cfg.review_policy, { round: 1, review1Risk });
+      const blockingFindings = partitionFindings(initialReviewVerdict.verdict.findings, review1Policy).blocking;
+      const review1Comment = formatReviewComment(initialReviewVerdict.verdict, 1, reviewer.harness);
+      let fixInvoked = false;
+      if (blockingFindings.length > 0) {
+        fixInvoked = true;
+        const fixVerdict: ReviewVerdict = { ...initialReviewVerdict.verdict, findings: blockingFindings };
+        const fix = await invokePipelinePhase(
+          "fix-1",
+          "primary",
+          fixCoordinate,
+          materializePipelineFixPrompt({
+            ...promptBase,
+            reviewFindings: formatReviewComment(fixVerdict, 1, reviewer.harness),
+            fixRound: 1,
+            pipelineRunId,
+            reviewedSha: cell.base_sha,
+          }),
+        );
+        if (fix.outcome) return finish(fix.outcome);
+      }
+      restoreContractIfNeeded();
+      const review2Diff = await getDiffFn({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
+      const finalReviewContract = installContractIfNeeded();
+      if (!finalReviewContract.ok) return finish({ result_class: "infra_error", error: `eval agent contract reinstallation failed before review-2: ${finalReviewContract.error}` });
+      const finalReview = await invokePipelinePhase(
+        "review-2",
+        "reviewer",
+        reviewCoordinate,
+        materializePipelineReview2Prompt({ ...promptBase, diff: review2Diff, review1Summary: review1Comment }),
+      );
+      if (finalReview.outcome) return finish(finalReview.outcome);
+      const finalReviewVerdict = parseReviewFindings(finalReview.result!.stdout);
+      if (!finalReviewVerdict.verdict) {
+        return contractFailure("review-2", "review verdict was unparseable");
+      }
+      const review2Policy = effectiveReviewPolicy(cfg.review_policy, { round: 2, review1Risk });
+      const review2BlockingFindings = partitionFindings(finalReviewVerdict.verdict.findings, review2Policy).blocking;
+      let fix2Invoked = false;
+      let completedDiff = review2Diff;
+      if (review2BlockingFindings.length > 0) {
+        fix2Invoked = true;
+        const fix2Verdict: ReviewVerdict = { ...finalReviewVerdict.verdict, findings: review2BlockingFindings };
+        const fix2 = await invokePipelinePhase(
+          "fix-2",
+          "primary",
+          fixCoordinate,
+          materializePipelineFixPrompt({
+            ...promptBase,
+            reviewFindings: formatReviewComment(fix2Verdict, 2, reviewer.harness),
+            priorReviewHistory: review1Comment,
+            fixRound: 2,
+            pipelineRunId,
+            reviewedSha: cell.base_sha,
+          }),
+        );
+        if (fix2.outcome) return finish(fix2.outcome);
+        restoreContractIfNeeded();
+        completedDiff = await getDiffFn({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
+      } else {
+        restoreContractIfNeeded();
+      }
+      const allChecks = [...fixture.public_checks, ...(fixture.hidden_checks ?? [])];
+      const detail: Record<string, unknown> = {
+        stages: phaseDetails,
+        execution_class: "local-cli",
+        pipeline_paired: {
+          primary,
+          reviewer,
+          policy,
+          plan_hash: createHash("sha256").update(plan).digest("hex"),
+          plan_review_hash: createHash("sha256").update(planReviewOutput).digest("hex"),
+          revised_plan_hash: createHash("sha256").update(revisedPlanOutput).digest("hex"),
+          initial_diff_hash: createHash("sha256").update(initialDiff).digest("hex"),
+          review_2_diff_hash: createHash("sha256").update(review2Diff).digest("hex"),
+          final_diff_hash: createHash("sha256").update(completedDiff).digest("hex"),
+          initial_review_malformed: initialReviewVerdict.provenance === "unparseable",
+          review_2_malformed: finalReviewVerdict.provenance === "unparseable",
+          initial_findings: initialReviewVerdict.verdict.findings,
+          review_2_findings: finalReviewVerdict.verdict.findings,
+          initial_review_verdict_parse: initialReviewVerdict.provenance,
+          review_2_verdict_parse: finalReviewVerdict.provenance,
+          initial_blocking_findings: blockingFindings.length,
+          review_2_blocking_findings: review2BlockingFindings.length,
+          fix_invoked: fixInvoked,
+          fix_2_invoked: fix2Invoked,
+        },
+      };
+      if (allChecks.length > 0) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) return finish({ result_class: "timeout", error: `pipeline-paired cell exceeded its ${manifest.timeout}s deadline before checks` });
+        detail.checks = await (deps.runChecks ?? defaultRunChecks)({ worktreeDir: identity.worktreePath, checks: allChecks, deadlineMs: remainingMs });
+        if (Date.now() > deadline) return finish({ result_class: "timeout", error: `pipeline-paired cell exceeded its ${manifest.timeout}s deadline while running checks` });
+      }
+      if (fixture.allowed_change_paths !== undefined) detail.changed_paths = await (deps.getChangedPaths ?? defaultGetChangedPaths)({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
+      if (environmentDetail !== undefined) detail.environment = environmentDetail;
+      return finish({ result_class: "completed", detail });
+    }
+
+    if (cell.mode === "paired") {
+      const primary = cell.treatment.primary;
+      const reviewer = cell.treatment.reviewer;
+      if (!primary || !reviewer) {
+        return finish({ result_class: "infra_error", error: "paired cell is missing primary or reviewer treatment coordinates" });
+      }
+      const coordinates: Array<["primary" | "reviewer", HarnessCoordinate]> = [["primary", primary], ["reviewer", reviewer]];
+      for (const [role, coordinate] of coordinates) {
+        let preflight: PreflightResultLike;
+        try {
+          preflight = await preflightFn(coordinate.harness, { model: coordinate.model, effort: coordinate.effort });
+        } catch (err) {
+          return finish({ result_class: "infra_error", error: `${role} preflight failed: ${(err as Error).message}` });
+        }
+        if (!preflight.ok) {
+          const resultClass = preflight.failure === "unauthenticated" ? "auth_error" : "infra_error";
+          return finish({ result_class: resultClass, error: `${role} preflight failed: ${preflight.message ?? preflight.failure}` });
+        }
+        trajectoryActions.push(`preflight passed for ${role} harness "${coordinate.harness}"`);
+      }
+
+      const deadline = Date.now() + manifest.timeout * 1000;
+      const phaseDetails: Record<string, unknown>[] = [];
+      const invokePairPhase = async (
+        phase: "implementing" | "review-1" | "fix" | "review-2",
+        role: "primary" | "reviewer",
+        coordinate: HarnessCoordinate,
+        prompt: string,
+      ): Promise<{ result?: HarnessInvokeResultLike; outcome?: CellOutcome }> => {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) return { outcome: { result_class: "timeout", error: `paired cell exceeded its ${manifest.timeout}s deadline before ${phase}` } };
+        let result: HarnessInvokeResultLike;
+        try {
+          result = await invokeHarnessFn({
+            harness: coordinate.harness,
+            worktreeDir: identity.worktreePath,
+            prompt,
+            timeoutSec: Math.max(1, Math.ceil(remainingMs / 1000)),
+            model: coordinate.model,
+            effort: coordinate.effort,
+            gh: ghSurface,
+            env: evalIsolationEnv(identity.worktreePath),
+            sandboxMode: manifest.sandbox_mode,
+          });
+        } catch (err) {
+          return { outcome: { result_class: "infra_error", error: `${phase} harness invocation failed: ${(err as Error).message}` } };
+        }
+        trajectoryStages.push({ stage: phase, message: prompt, output: result.stdout, error: result.success ? undefined : result.stderr, duration_ms: Math.round(result.duration * 1000), success: result.success });
+        phaseDetails.push({ phase, role, harness: coordinate.harness, model: coordinate.model ?? null, effort: coordinate.effort ?? null, success: result.success, exit_code: result.exit_code, duration: result.duration });
+        if (result.timed_out) return { outcome: { result_class: "timeout", error: `${phase} exceeded the paired cell deadline` } };
+        if (result.spawn_error) return { outcome: { result_class: "infra_error", error: `${phase} failed to spawn the ${coordinate.harness} harness` } };
+        if (!result.success) {
+          const authFailure = await classifyPostInvocationFailure(result, preflightFn, coordinate.harness, { model: coordinate.model, effort: coordinate.effort });
+          if (authFailure) return { outcome: { result_class: "auth_error", error: `${phase} ${authFailure}` } };
+        }
+        trajectoryActions.push(`invoked ${phase} via ${role} harness "${coordinate.harness}" (${result.success ? "success" : "failure"})`);
+        return { result };
+      };
+
+      const implementation = await invokePairPhase("implementing", "primary", primary, materializeStagePrompt("implementing", fixture));
+      if (implementation.outcome) return finish(implementation.outcome);
+      const getDiffFn = deps.getDiff ?? defaultGetDiff;
+      const initialDiff = await getDiffFn({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
+      const initialReview = await invokePairPhase("review-1", "reviewer", reviewer, materializePairedReviewPrompt(fixture, initialDiff, 1));
+      if (initialReview.outcome) return finish(initialReview.outcome);
+      const initialReviewVerdict = parseReviewFindings(initialReview.result!.stdout);
+      const initialFindings = initialReviewVerdict.findings;
+      const isBlockingFinding = (entry: unknown): boolean => {
+        if (typeof entry !== "object" || entry === null) return false;
+        const finding = entry as Record<string, unknown>;
+        const severity = finding.severity;
+        const confidence = finding.confidence;
+        const threshold = cfg.review_policy?.block_threshold ?? "high";
+        const rank: Record<string, number> = { low: 1, medium: 2, high: 3, critical: 4 };
+        return (finding.blocking === true || (typeof severity === "string" && (rank[severity] ?? 0) >= (rank[threshold] ?? 3))) &&
+          (typeof confidence !== "number" || confidence >= (cfg.review_policy?.min_confidence ?? 0.7));
+      };
+      const blockingFindings = (initialFindings ?? []).filter(isBlockingFinding);
+      let fixInvoked = false;
+      if (blockingFindings.length > 0) {
+        fixInvoked = true;
+        const fix = await invokePairPhase("fix", "primary", primary, materializePairedFixPrompt(fixture, blockingFindings));
+        if (fix.outcome) return finish(fix.outcome);
+      }
+      const finalDiff = await getDiffFn({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
+      const finalReview = await invokePairPhase("review-2", "reviewer", reviewer, materializePairedReviewPrompt(fixture, finalDiff, 2));
+      if (finalReview.outcome) return finish(finalReview.outcome);
+      const finalReviewVerdict = parseReviewFindings(finalReview.result!.stdout);
+      const finalFindings = finalReviewVerdict.findings;
+      const allChecks = [...fixture.public_checks, ...(fixture.hidden_checks ?? [])];
+      const detail: Record<string, unknown> = {
+        stages: phaseDetails,
+        execution_class: "local-cli",
+        paired: {
+          primary,
+          reviewer,
+          initial_diff_hash: createHash("sha256").update(initialDiff).digest("hex"),
+          final_diff_hash: createHash("sha256").update(finalDiff).digest("hex"),
+          initial_review_malformed: initialReviewVerdict.provenance === "unparseable",
+          final_review_malformed: finalReviewVerdict.provenance === "unparseable",
+          initial_findings: initialFindings ?? [],
+          final_findings: finalFindings ?? [],
+          initial_review_verdict_parse: initialReviewVerdict.provenance,
+          final_review_verdict_parse: finalReviewVerdict.provenance,
+          initial_blocking_findings: blockingFindings.length,
+          final_blocking_findings: (finalFindings ?? []).filter(isBlockingFinding).length,
+          fix_invoked: fixInvoked,
+        },
+      };
+      if (allChecks.length > 0) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) return finish({ result_class: "timeout", error: `paired cell exceeded its ${manifest.timeout}s deadline before checks` });
+        detail.checks = await (deps.runChecks ?? defaultRunChecks)({ worktreeDir: identity.worktreePath, checks: allChecks, deadlineMs: remainingMs });
+        if (Date.now() > deadline) return finish({ result_class: "timeout", error: `paired cell exceeded its ${manifest.timeout}s deadline while running checks` });
+      }
+      if (fixture.allowed_change_paths !== undefined) detail.changed_paths = await (deps.getChangedPaths ?? defaultGetChangedPaths)({ worktreeDir: identity.worktreePath, baseSha: cell.base_sha });
+      if (environmentDetail !== undefined) detail.environment = environmentDetail;
+      return finish({ result_class: "completed", detail });
     }
 
     // API treatment path (#434 task 6): the cell binds to a named
@@ -1050,14 +1502,18 @@ export async function runCell(
  *       that merely contains the substring `"verdict"` (review 1 finding
  *       e74066d5) does not satisfy this and falls through to unparseable.
  *    3. Otherwise `unparseable` — `findings` stays `undefined`, never `[]`. */
-function parseReviewFindings(stdout: string): { findings?: unknown[]; provenance: ReviewVerdictParseProvenance } {
+function parseReviewFindings(stdout: string): {
+  verdict?: ReviewVerdict;
+  findings?: ReviewFinding[];
+  provenance: ReviewVerdictParseProvenance;
+} {
   const strict = parseStrictVerdict(stdout);
   if (strict) {
-    return { findings: strict.findings, provenance: "strict" };
+    return { verdict: strict, findings: strict.findings, provenance: "strict" };
   }
   const structured = parseStructuredVerdict(stdout);
   if (structured._raw === undefined && (isJsonVerdictShaped(stdout) || parseProseReview(stdout) !== null)) {
-    return { findings: structured.findings, provenance: "tolerant" };
+    return { verdict: structured, findings: structured.findings, provenance: "tolerant" };
   }
   return { provenance: "unparseable" };
 }

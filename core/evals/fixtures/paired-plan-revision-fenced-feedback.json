@@ -8,16 +8,16 @@
       "plan": "Normalize fence delimiters before locating acknowledgement headings, tolerate duplicate headings without truncating the tagged items, preserve the fail-closed missing/untagged behavior, and add direct parser regression tests."
     }
   },
-  "public_checks": ["node --test test/verify-harness-commits.test.ts"],
-  "hidden_checks": ["node --experimental-strip-types --input-type=module -e \"import assert from 'node:assert/strict'; import { verifyPlanRevisionOutput } from './core/scripts/verify-harness-commits.ts'; const output=['## Feedback Incorporated','```','## Feedback Incorporated','- [ADDRESSED] Corrected the validation','```','','## Revised Plan'].join('\\n'); assert.deepEqual(verifyPlanRevisionOutput(output),{ok:true});\""] ,
+  "public_checks": ["npm run ci"],
+  "hidden_checks": ["node --experimental-strip-types --input-type=module -e 'import assert from \"node:assert/strict\"; import { verifyPlanRevisionOutput } from \"./core/scripts/verify-harness-commits.ts\"; const output=[\"## Feedback Incorporated\",\"```\",\"## Feedback Incorporated\",\"- [ADDRESSED] Corrected the validation\",\"```\",\"\",\"## Revised Plan\"].join(\"\\n\"); assert.deepEqual(verifyPlanRevisionOutput(output),{ok:true});'"],
   "acceptance_criteria": [
     {
       "id": "accepts-fenced-duplicated-acknowledgement",
       "statement": "A duplicated acknowledgement heading inside a fence does not hide a valid tagged acknowledgement bullet.",
-      "check_names": ["node --experimental-strip-types --input-type=module -e \"import assert from 'node:assert/strict'; import { verifyPlanRevisionOutput } from './core/scripts/verify-harness-commits.ts'; const output=['## Feedback Incorporated','```','## Feedback Incorporated','- [ADDRESSED] Corrected the validation','```','','## Revised Plan'].join('\\n'); assert.deepEqual(verifyPlanRevisionOutput(output),{ok:true});\""]
+      "check_names": ["node --experimental-strip-types --input-type=module -e 'import assert from \"node:assert/strict\"; import { verifyPlanRevisionOutput } from \"./core/scripts/verify-harness-commits.ts\"; const output=[\"## Feedback Incorporated\",\"```\",\"## Feedback Incorporated\",\"- [ADDRESSED] Corrected the validation\",\"```\",\"\",\"## Revised Plan\"].join(\"\\n\"); assert.deepEqual(verifyPlanRevisionOutput(output),{ok:true});'"]
     }
   ],
-  "allowed_change_paths": ["core/scripts/verify-harness-commits.ts", "core/test/verify-harness-commits.test.ts"],
+  "allowed_change_paths": ["core/scripts/verify-harness-commits.ts", "plugin/pipeline/skills/pipeline/core/scripts/verify-harness-commits.ts", "core/test/verify-harness-commits.test.ts"],
   "grader_refs": [{ "grader": "implementation-fix", "version": "1" }],
   "category": "output-contract",
   "risk": "medium",
