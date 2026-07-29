@@ -322,7 +322,7 @@ test("maybeArchiveOpenspec: pre-existing dirty tracked file outside openspec/ �
 // by the commit-failure rollback (`git restore .` + `git clean -fd openspec/`).
 test("maybeArchiveOpenspec: pre-existing dirty openspec/ file → blocked (rollback would discard it)", async () => {
   const archiveCalls: string[] = [];
-  const blocked: string[] = [];
+  const blocked: Array<{ reason: string; kind: string }> = [];
 
   const fakeGit = (async (_wt: string, args: string[]) => {
     if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
@@ -343,8 +343,8 @@ test("maybeArchiveOpenspec: pre-existing dirty openspec/ file → blocked (rollb
     changeDirExists: () => true,
     branchDeveloperCommits: async () => [],
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
-    setBlocked: (async (_c, _n, reason: string) => {
-      blocked.push(reason);
+    setBlocked: (async (_c, _n, reason: string, _stage: string, kind: string) => {
+      blocked.push({ reason, kind });
     }) as AdvancePreMergeDeps["setBlocked"],
     openspecArchive: (async (_w: string, id: string) => {
       archiveCalls.push(id);
@@ -359,7 +359,14 @@ test("maybeArchiveOpenspec: pre-existing dirty openspec/ file → blocked (rollb
     `expected blocked outcome; got: ${JSON.stringify(out)}`);
   assert.deepEqual(archiveCalls, [], "archive must NOT run when an openspec/ file is dirty");
   assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
-  assert.match(blocked[0], /dirty/i, "block reason must mention dirty state");
+  assert.match(blocked[0].reason, /dirty/i, "block reason must mention dirty state");
+  // #683: dirty openspec/ is still workspace failure, not openspec-invalid (same as outside-openspec path)
+  assert.equal(blocked[0].kind, "needs-human");
+  assert.equal(out.blockerKind, "needs-human");
+  assert.equal(
+    toPreMergeOfframpClass({ blockerKind: out.blockerKind, pathTag: out.offrampPathTag }),
+    "other",
+  );
 });
 
 // Regression (#255 review): a porcelain rename/copy record has a destination outside
@@ -367,7 +374,7 @@ test("maybeArchiveOpenspec: pre-existing dirty openspec/ file → blocked (rollb
 // conservative guard blocks on any non-empty status, so it is covered.
 test("maybeArchiveOpenspec: rename record with destination outside openspec/ → blocked", async () => {
   const archiveCalls: string[] = [];
-  const blocked: string[] = [];
+  const blocked: Array<{ reason: string; kind: string }> = [];
 
   const fakeGit = (async (_wt: string, args: string[]) => {
     if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
@@ -386,8 +393,8 @@ test("maybeArchiveOpenspec: rename record with destination outside openspec/ →
     changeDirExists: () => true,
     branchDeveloperCommits: async () => [],
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
-    setBlocked: (async (_c, _n, reason: string) => {
-      blocked.push(reason);
+    setBlocked: (async (_c, _n, reason: string, _stage: string, kind: string) => {
+      blocked.push({ reason, kind });
     }) as AdvancePreMergeDeps["setBlocked"],
     openspecArchive: (async (_w: string, id: string) => {
       archiveCalls.push(id);
@@ -401,6 +408,13 @@ test("maybeArchiveOpenspec: rename record with destination outside openspec/ →
     `expected blocked outcome; got: ${JSON.stringify(out)}`);
   assert.deepEqual(archiveCalls, [], "archive must NOT run on a rename record touching paths outside openspec/");
   assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
+  // #683: any pre-archive dirty porcelain (including renames) → needs-human residual other
+  assert.equal(blocked[0].kind, "needs-human");
+  assert.equal(out.blockerKind, "needs-human");
+  assert.equal(
+    toPreMergeOfframpClass({ blockerKind: out.blockerKind, pathTag: out.offrampPathTag }),
+    "other",
+  );
 });
 
 // Regression (#255 review-2): if `git status` itself FAILS before archive (non-zero exit,
