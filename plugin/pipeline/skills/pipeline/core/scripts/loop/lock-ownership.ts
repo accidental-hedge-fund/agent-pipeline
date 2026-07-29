@@ -68,7 +68,7 @@ export function isLockPidOwnedByLauncher(
 /**
  * True when `pid` still names the same process instance that was observed at
  * launch: `getStartTime(pid)` must equal `expectedStartTime` (e.g. Linux
- * `/proc/<pid>/stat` starttime in clock ticks).
+ * `/proc/<pid>/stat` starttime in clock ticks, or Darwin `ps -o lstart=`).
  *
  * Without this, a poll loop that only does `kill -0 $LOOP_PID` can continue
  * after the launcher exits if the kernel reuses that PID for another process,

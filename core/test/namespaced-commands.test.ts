@@ -282,6 +282,10 @@ test("namespaced-commands 7.5b5: host loop skill ownership is exact PID, not gre
       /LOOP_START|starttime|launcher_instance_alive|PID reuse/i.test(body),
       `${path} should bind discovery to process starttime against PID reuse (#668)`,
     );
+    assert.ok(
+      /lstart|Darwin|macOS|portable/i.test(body) && /proc/i.test(body),
+      `${path} should document Linux /proc and Darwin/portable starttime backends (#668)`,
+    );
   }
 });
 

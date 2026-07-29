@@ -868,13 +868,21 @@ node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop --milestone
 # or: ... loop --resume <run-id> ...
 # or: ... loop <N> <N> ...
 LOOP_PID=$!
-# Process-instance identity (Linux): /proc/<pid>/stat starttime. Required so a
-# recycled PID after launcher exit cannot keep the discovery loop alive (#668).
+# Process-instance identity so a recycled PID after launcher exit cannot keep
+# discovery alive (#668). Platform backends:
+#   Linux: /proc/<pid>/stat starttime (clock ticks)
+#   Darwin/other: ps -o lstart= (stable for the process lifetime)
 process_starttime() {
-  node -e 'const fs=require("fs");const pid=process.argv[1];let s;try{s=fs.readFileSync("/proc/"+pid+"/stat","utf8");}catch{process.exit(1)}
+  local pid="$1" out
+  if [ -r "/proc/$pid/stat" ]; then
+    out=$(node -e 'const fs=require("fs");const pid=process.argv[1];let s;try{s=fs.readFileSync("/proc/"+pid+"/stat","utf8");}catch{process.exit(1)}
 const i=s.lastIndexOf(")"); if(i<0)process.exit(1); const f=s.slice(i+2).trim().split(/\s+/);
 // field 22 overall = index 19 after pid+comm removed (man 5 proc)
-if(!f[19])process.exit(1); process.stdout.write(f[19]);' "$1" 2>/dev/null
+if(!f[19])process.exit(1); process.stdout.write(f[19]);' "$pid" 2>/dev/null) && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+  fi
+  # Darwin / portable fallback — do not require /proc
+  out=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  [ -n "$out" ] && printf '%s' "$out"
 }
 LOOP_START=$(process_starttime "$LOOP_PID") || { echo "failed to capture launcher starttime"; wait "$LOOP_PID"; exit 1; }
 ```
@@ -914,12 +922,17 @@ starttime changes — PID reuse) before a run directory is mapped, read
 # NEVER trust kill -0 alone (PID reuse after launcher exit).
 
 process_starttime() {
-  node -e 'const fs=require("fs");const pid=process.argv[1];let s;try{s=fs.readFileSync("/proc/"+pid+"/stat","utf8");}catch{process.exit(1)}
+  local pid="$1" out
+  if [ -r "/proc/$pid/stat" ]; then
+    out=$(node -e 'const fs=require("fs");const pid=process.argv[1];let s;try{s=fs.readFileSync("/proc/"+pid+"/stat","utf8");}catch{process.exit(1)}
 const i=s.lastIndexOf(")"); if(i<0)process.exit(1); const f=s.slice(i+2).trim().split(/\s+/);
-if(!f[19])process.exit(1); process.stdout.write(f[19]);' "$1" 2>/dev/null
+if(!f[19])process.exit(1); process.stdout.write(f[19]);' "$pid" 2>/dev/null) && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+  fi
+  out=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  [ -n "$out" ] && printf '%s' "$out"
 }
 
-# Still the same OS process we launched (pid + starttime).
+# Still the same OS process we launched (pid + starttime). Works on Linux and Darwin.
 launcher_instance_alive() {
   kill -0 "$LOOP_PID" 2>/dev/null || return 1
   cur=$(process_starttime "$LOOP_PID") || return 1
