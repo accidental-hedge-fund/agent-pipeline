@@ -584,6 +584,242 @@ node ~/.codex/skills/pipeline/scripts/pipeline.mjs summary <run-id>
 Include starting stage, ending stage, transitions made, wall-clock elapsed, PR
 URL if one was opened, and the terminal state.
 
+### 4b. Orchestration pattern for `$pipeline:loop` (multi-item durable drive/resume)
+
+Multi-item drive and resume via `$pipeline:loop` is **long-running** (minutes to
+hours). It is **not** a seconds-only synchronous command. Do **not** treat it as
+fire-and-forget without event following — use the same spirit as single-issue
+advance (§4), against the loop event stream.
+
+**Critical:** the terminal result JSON is printed only when the durable supervisor
+**exits**. It is a final-summary surface, **not** a mid-flight handoff for a newly
+started drive. For in-flight event following you need `run_id` **before**
+completion — via early handoff (#665 when present), `--resume <run-id>`, or the
+race-safe state-home discovery below.
+
+#### a. Resolve state-home, then start or resume non-blocking
+
+**State-home resolution order** (first set wins):
+
+1. Explicit override: `AGENT_PIPELINE_STATE_HOME` (preferred) or legacy
+   `PIPELINE_STATE_HOME`
+2. `$XDG_STATE_HOME/agent-pipeline/loop` when `XDG_STATE_HOME` is set
+3. Default: `~/.local/state/agent-pipeline/loop`
+
+The loop CLI has no `--detach` yet. Until early handoff (#665) publishes
+`run_id`/events path on stdout, start the supervisor **non-blocking** so the
+harness can discover the run directory and follow events while it runs:
+
+```bash
+cd <repo_dir>
+STATE_HOME="${AGENT_PIPELINE_STATE_HOME:-${PIPELINE_STATE_HOME:-${XDG_STATE_HOME:+$XDG_STATE_HOME/agent-pipeline/loop}}}"
+STATE_HOME="${STATE_HOME:-$HOME/.local/state/agent-pipeline/loop}"
+RUNS="$STATE_HOME/runs"
+mkdir -p "$RUNS"
+# Snapshot basenames already present (ignore staging dirs like *.init-*).
+BEFORE=$(ls -1 "$RUNS" 2>/dev/null | grep -v '\.init-' || true)
+
+# Prefer --resume when the operator already knows the id (no discovery needed).
+# Otherwise start a new/continued drive. Use a unique result dir per invocation
+# (mktemp) so concurrent loops never share stdout/stderr paths (#668).
+LOOP_RESULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pipeline-loop.XXXXXX")
+LOOP_OUT="$LOOP_RESULT_DIR/out.json"
+LOOP_ERR="$LOOP_RESULT_DIR/err.txt"
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --milestone <name> \
+  >"$LOOP_OUT" 2>"$LOOP_ERR" &
+# or: ... loop --resume <run-id> ...
+# or: ... loop <N> <N> ...
+LOOP_PID=$!
+# Process-instance identity so a recycled PID after launcher exit cannot keep
+# discovery alive (#668). Platform backends:
+#   Linux: /proc/<pid>/stat starttime (clock ticks)
+#   Darwin/other: ps -o lstart= (stable for the process lifetime)
+process_starttime() {
+  local pid="$1" out
+  if [ -r "/proc/$pid/stat" ]; then
+    out=$(node -e 'const fs=require("fs");const pid=process.argv[1];let s;try{s=fs.readFileSync("/proc/"+pid+"/stat","utf8");}catch{process.exit(1)}
+const i=s.lastIndexOf(")"); if(i<0)process.exit(1); const f=s.slice(i+2).trim().split(/\s+/);
+if(!f[19])process.exit(1); process.stdout.write(f[19]);' "$pid" 2>/dev/null) && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+  fi
+  out=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  [ -n "$out" ] && printf '%s' "$out"
+}
+LOOP_START=$(process_starttime "$LOOP_PID") || { echo "failed to capture launcher starttime"; wait "$LOOP_PID"; exit 1; }
+```
+
+On a preflight failure the process exits quickly with printed remediation on
+stderr — do not start any substitute loop. If `$LOOP_PID` exits (or its
+starttime changes — PID reuse) before a run directory is mapped, read
+`$LOOP_ERR` and stop. Do not leave a live supervisor unobserved when the Codex
+turn ends without an event-follow plan.
+
+#### b. Obtain `run_id` + loop events path (before completion)
+
+**Order of preference:**
+
+1. **Early handoff** when present (stdout/JSON carrying at least `run_id` and a
+   loop events path — #665). Prefer this over filesystem discovery.
+2. **`--resume <run-id>`** (or an operator-known id): use that `run_id`
+   immediately; begin following before or right after launching.
+3. **Race-safe state-home discovery** for a newly started or selector-continued
+   drive (no early handoff, no resume arg). Snapshot `$BEFORE` so concurrent
+   publishes are visible, then **scan every candidate** under `$RUNS/` each poll
+   (ignore `.init-*` staging). Select **only** a directory that has both
+   `contract.json` and `events.jsonl` **and** a live `lock.json` whose `pid`
+   is **exactly** `$LOOP_PID` as an integer, **or** a process-tree **descendant**
+   of `$LOOP_PID` (walk parents of the lock pid until match), **and** the
+   launcher is still the **same process instance** captured at launch
+   (`$LOOP_PID` + `$LOOP_START` starttime — not merely `kill -0`, which is
+   true after PID reuse). Ownership is **numeric identity only** — never
+   string/grep prefix matching (`123` must **not** match lock pid `12345`).
+   **Never** break on the first newly published basename (glob order is not
+   ownership). If one or more new directories exist without a lock owned by
+   this launch, keep polling until a lock match appears or the launcher
+   instance is gone (exit or PID reuse).
+
+```bash
+# Pseudocode — poll until mapped or THIS launch instance is gone.
+# NEVER unanchored grep of "$LOOP_PID" (prefix false match).
+# NEVER trust kill -0 alone (PID reuse after launcher exit).
+
+process_starttime() {
+  local pid="$1" out
+  if [ -r "/proc/$pid/stat" ]; then
+    out=$(node -e 'const fs=require("fs");const pid=process.argv[1];let s;try{s=fs.readFileSync("/proc/"+pid+"/stat","utf8");}catch{process.exit(1)}
+const i=s.lastIndexOf(")"); if(i<0)process.exit(1); const f=s.slice(i+2).trim().split(/\s+/);
+if(!f[19])process.exit(1); process.stdout.write(f[19]);' "$pid" 2>/dev/null) && [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+  fi
+  out=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  [ -n "$out" ] && printf '%s' "$out"
+}
+
+# Still the same OS process we launched (pid + starttime). Works on Linux and Darwin.
+launcher_instance_alive() {
+  kill -0 "$LOOP_PID" 2>/dev/null || return 1
+  cur=$(process_starttime "$LOOP_PID") || return 1
+  [ "$cur" = "$LOOP_START" ]
+}
+
+lock_pid_from_json() {
+  node -e 'const fs=require("fs");let j;try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));}catch{process.exit(2)}
+const p=j&&j.pid; if(typeof p==="number"&&Number.isInteger(p)&&p>0){process.stdout.write(String(p));process.exit(0)}
+if(typeof p==="string"&&/^\d+$/.test(p)){process.stdout.write(p);process.exit(0)} process.exit(1)' "$1" 2>/dev/null \
+  || sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" | head -1
+}
+
+lock_owned_by_launcher() {
+  local lock_pid="$1" launcher="$2" cur parent
+  case "$lock_pid" in ''|*[!0-9]*) return 1 ;; esac
+  case "$launcher" in ''|*[!0-9]*) return 1 ;; esac
+  cur=$lock_pid
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32; do
+    [ "$cur" -eq "$launcher" ] 2>/dev/null && return 0
+    [ "$cur" -le 1 ] 2>/dev/null && return 1
+    parent=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')
+    case "$parent" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$parent" -eq "$cur" ] 2>/dev/null && return 1
+    cur=$parent
+  done
+  return 1
+}
+
+RUN_ID=""
+while launcher_instance_alive; do
+  for d in "$RUNS"/*; do
+    [ -d "$d" ] || continue
+    base=$(basename "$d")
+    case "$base" in *.init-*) continue ;; esac
+    [ -f "$d/contract.json" ] && [ -f "$d/events.jsonl" ] || continue
+    [ -f "$d/lock.json" ] || continue
+    lock_pid=$(lock_pid_from_json "$d/lock.json") || continue
+    case "$lock_pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$lock_pid" 2>/dev/null || continue
+    launcher_instance_alive || break
+    if lock_owned_by_launcher "$lock_pid" "$LOOP_PID"; then
+      RUN_ID=$base
+      break
+    fi
+  done
+  [ -n "$RUN_ID" ] && break
+  sleep 0.5
+done
+```
+
+4. **Terminal result JSON** (`$LOOP_OUT` after process exit) —
+   use only for the **final summary**, not as the sole mid-flight source of
+   `run_id` for a new drive.
+
+Then resolve the events file:
+
+```text
+<state-home>/runs/<run_id>/events.jsonl
+```
+
+#### c. Follow the loop event stream
+
+Poll or tail the loop events file **as soon as** `run_id` is known (step b) —
+do not wait for supervisor exit — and summarize material lifecycle records:
+
+```bash
+# Interim path until a dedicated loop logs-follow CLI is universal (#666).
+# Prefer that CLI when available; keep this file path as a valid fallback.
+tail -F "<state-home>/runs/<run_id>/events.jsonl"
+```
+
+Never forbid background following or event streaming for drive/resume while
+waiting for a future CLI.
+
+#### d. Optional: follow active item advance events when published
+
+When an item's advance `run_id` is published on a loop event (dispatch→advance
+linkage), optionally follow that item's single-issue stream with the §4
+material kinds:
+
+```bash
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <advance-run-id> --events --follow
+```
+
+If no advance `run_id` is published yet, still follow the **loop** event stream
+above — do not require a non-existent linkage field.
+
+#### e. User-visible progress on material loop events
+
+**Must surface** (chat update):
+
+- `loop_item_started`
+- `loop_item_transitioned`
+- `loop_item_blocked`
+- `loop_run_stopped`
+
+**Should surface** when present (not spam):
+
+- `loop_schedule_evaluated` — only on a **decision change**, not every identical
+  poll in a burst
+- `loop_reconciled` / `loop_merge_barrier_cleared`
+- `loop_item_paused` / `loop_item_waiting` / `loop_item_resumed`
+- `loop_item_abandoned` / `loop_item_skipped` / `loop_item_precondition_excluded`
+- `loop_recovery_attempt`
+- `loop_run_superseded`
+
+**Suppress:** pure heartbeats and repeated identical schedule/reconcile
+evaluations in the same burst (same spirit as suppressing
+`pre_merge.advancePolling` in §4).
+
+#### f. Stop following
+
+Stop polling/tailing when a terminal loop outcome appears — especially
+`loop_run_stopped` — or when the supervisor process exits.
+
+#### g. Final summary / audit
+
+Surface the run's terminal state. Prefer the printed JSON result; for a
+read-only process/timeline report:
+
+```bash
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --audit
+# or with an explicit run: ... loop --resume <run-id> --audit
+```
+
 ### 5. Modes that DON'T need this orchestration
 
 - `--status` — read-only, completes in seconds
@@ -594,8 +830,14 @@ URL if one was opened, and the terminal state.
 - `config sync` — previews/applies a validated `.github/pipeline.yml` scaffold refresh, completes in seconds
 - `config repo-map <add|remove|list>` — mutates/lists `repo_map` entries, completes in seconds
 - `doctor` — deterministic preflight, no model calls, completes in seconds
+- `$pipeline:loop --audit` — read-only report for a durable run; synchronous, no event-follow
 
 Run those synchronously without the PTY/log-polling orchestration.
+
+**Not in this list:** multi-item `$pipeline:loop` drive or resume (with or without
+`--milestone` / issue lists / `--resume`) — those use §4b long-running
+orchestration. Do not apply the seconds-only / no-follow rule to drive/resume
+just because `--audit` is fast.
 
 `--once` still needs the orchestration because a single heavy stage
 (planning especially) can hit its 20-minute timeout. Use the same PTY/log

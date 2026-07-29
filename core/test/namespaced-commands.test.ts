@@ -181,6 +181,137 @@ test("namespaced-commands 7.5b3: loop wrapper drives in-repo, never delegates to
 });
 
 // ---------------------------------------------------------------------------
+// 7.5b4  Loop packaging is long-running + event-followed — never the shared
+//        fast template that claims "completes in seconds" and forbids Monitor
+//        (#668 / loop-skill-event-orchestration).
+// ---------------------------------------------------------------------------
+
+test("namespaced-commands 7.5b4: loop Claude command is long-running, not seconds/no-Monitor", async () => {
+  const buildMjs = await import("../../scripts/build.mjs");
+  const { OPERATION_SURFACE, renderClaudeCommand } = buildMjs;
+
+  const loopOp = OPERATION_SURFACE.find(
+    (op: { name: string; fast?: boolean; inRepoLoop?: boolean }) => op.name === "loop",
+  ) as { name: string; fast?: boolean; inRepoLoop?: boolean } | undefined;
+  assert.ok(loopOp, "OPERATION_SURFACE is missing the `loop` operation");
+  assert.equal(loopOp.fast, false, "loop must not be classified as the shared fast template (#668)");
+  assert.equal(loopOp.inRepoLoop, true, "loop must keep inRepoLoop packaging");
+
+  const claude = renderClaudeCommand(loopOp, "~/.claude/skills/pipeline");
+
+  // Forbidden fast-path falsehoods (case-insensitive substring match).
+  assert.ok(
+    !/completes in seconds/i.test(claude),
+    `loop Claude command must not claim "completes in seconds": ${claude}`,
+  );
+  assert.ok(
+    !/no background process or monitor needed/i.test(claude),
+    `loop Claude command must not forbid Monitor/background process: ${claude}`,
+  );
+
+  // Positive long-running / event-follow orchestration signals.
+  assert.ok(
+    /long-running/i.test(claude),
+    `loop Claude command should state multi-item drive/resume is long-running: ${claude}`,
+  );
+  assert.ok(
+    /event/i.test(claude) && (/follow/i.test(claude) || /Monitor/i.test(claude)),
+    `loop Claude command should instruct event following / Monitor: ${claude}`,
+  );
+  assert.ok(
+    /run_id/i.test(claude),
+    `loop Claude command should mention run_id handoff: ${claude}`,
+  );
+  // --audit may remain documented as synchronous; must not redefine drive/resume.
+  assert.ok(
+    /--audit/i.test(claude),
+    `loop Claude command should still note --audit as a short/sync mode: ${claude}`,
+  );
+
+  // Generated plugin mirror must match the same classification after build.
+  const pluginLoopPath = join(COMMANDS_DIR, "pipeline:loop.md");
+  let pluginBody: string;
+  try {
+    pluginBody = readFileSync(pluginLoopPath, "utf8");
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    assert.fail(
+      `plugin/pipeline/commands/pipeline:loop.md missing — run \`node scripts/build.mjs\` (${e.message})`,
+    );
+  }
+  assert.ok(
+    !/completes in seconds/i.test(pluginBody),
+    `plugin pipeline:loop.md must not claim "completes in seconds": ${pluginBody}`,
+  );
+  assert.ok(
+    !/no background process or monitor needed/i.test(pluginBody),
+    `plugin pipeline:loop.md must not forbid Monitor: ${pluginBody}`,
+  );
+  assert.ok(
+    /long-running/i.test(pluginBody) || /event/i.test(pluginBody),
+    `plugin pipeline:loop.md should describe long-running / event-follow orchestration: ${pluginBody}`,
+  );
+});
+
+test("namespaced-commands 7.5b4b: true-fast peers may still use the shared seconds/no-Monitor template", async () => {
+  const buildMjs = await import("../../scripts/build.mjs");
+  const { OPERATION_SURFACE, renderClaudeCommand } = buildMjs;
+
+  for (const name of ["status", "doctor"] as const) {
+    const op = OPERATION_SURFACE.find((o: { name: string }) => o.name === name);
+    assert.ok(op, `OPERATION_SURFACE is missing \`${name}\``);
+    const body = renderClaudeCommand(op, "~/.claude/skills/pipeline");
+    assert.ok(
+      /completes in seconds/i.test(body),
+      `${name} should still use the shared fast template (seconds): ${body}`,
+    );
+    assert.ok(
+      /no background process or monitor needed/i.test(body),
+      `${name} should still use the shared fast template (no Monitor): ${body}`,
+    );
+  }
+});
+
+// #668 pre-merge: skill lock discovery must not use unanchored grep of $LOOP_PID
+// (pid 123 matching lock pid 12345).
+test("namespaced-commands 7.5b5: host loop skill ownership is exact PID, not grepped prefix", () => {
+  const repoRoot = join(__dirname, "..", "..");
+  const hostSkills = [
+    join(repoRoot, "hosts", "claude", "SKILL.md"),
+    join(repoRoot, "hosts", "codex", "SKILL.md"),
+  ];
+  // Forbidden: grep matching "\"pid\":$LOOP_PID" which prefix-matches 12345 when LOOP_PID=123.
+  const badGrep = /grep\s+-q\s+"\\"pid\\"[^"]*\$LOOP_PID/;
+  for (const path of hostSkills) {
+    const body = readFileSync(path, "utf8");
+    assert.ok(
+      !badGrep.test(body),
+      `${path} must not use unanchored grep of $LOOP_PID against lock.json (#668)`,
+    );
+    assert.ok(
+      /lock_owned_by_launcher|numeric identity only|exact integer/i.test(body),
+      `${path} should document exact/numeric lock ownership (#668)`,
+    );
+    assert.ok(
+      /LOOP_START|starttime|launcher_instance_alive|PID reuse/i.test(body),
+      `${path} should bind discovery to process starttime against PID reuse (#668)`,
+    );
+    assert.ok(
+      /lstart|Darwin|macOS|portable/i.test(body) && /proc/i.test(body),
+      `${path} should document Linux /proc and Darwin/portable starttime backends (#668)`,
+    );
+    assert.ok(
+      /mktemp/i.test(body),
+      `${path} should use mktemp for per-invocation loop result files (#668)`,
+    );
+    assert.ok(
+      !/pipeline-loop-\$\.out|pipeline-loop-\$\.err|pipeline-loop-\$\$\.out/i.test(body),
+      `${path} must not use colliding /tmp/pipeline-loop-$ paths (#668)`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
 // 7.5c  Each command file starts with YAML front-matter referencing its operation name
 // ---------------------------------------------------------------------------
 

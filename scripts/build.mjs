@@ -171,8 +171,9 @@ export const OPERATION_SURFACE = [
     desc: "Durable multi-item run — driven in-repo by the pipeline's own loop supervisor",
     argHint: "[--milestone <name>] [--label <label>] [--range <spec>] [--roadmap-slice <slice>] [<N> ...] [--resume <run-id>] [--audit]",
     cliArgs: "loop $ARGUMENTS",
-    // Multi-item durable drive is long-running; do not use the "completes in
-    // seconds / No Monitor" orch note. Packaging text is specialized via inRepoLoop.
+    // Multi-item drive/resume is long-running (minutes–hours). Do NOT use the
+    // shared fast template ("completes in seconds" / "no Monitor") — #668.
+    // Specialized packaging via inRepoLoop (early handoff #665 + event follow).
     fast: false,
     inRepoLoop: true,
   },
@@ -182,6 +183,26 @@ function renderShim(profile) {
   const tmpl = readFileSync(join(REPO_ROOT, "hosts", "_shared", "entry.template.mjs"), "utf8");
   return tmpl.replaceAll("__PROFILE__", profile);
 }
+
+// Shared fast-path orch note for true seconds-long commands (status, doctor, …).
+// loop deliberately does not use this — multi-item drive/resume is long-running (#668).
+const FAST_ORCH_NOTE =
+  "Run synchronously (completes in seconds). No background process or Monitor needed.";
+
+// Loop-specific orch note: long-running drive/resume + event follow; --audit stays sync.
+// Mid-flight follow needs run_id before supervisor exit — early handoff (#665), --resume,
+// or race-safe state-home discovery; terminal printed JSON is final summary only (#668).
+const LOOP_ORCH_NOTE =
+  "Multi-item drive or resume is long-running (minutes to hours) and requires event following. " +
+  "Start or resume the loop non-blocking, obtain `run_id` and the loop events path before " +
+  "completion (early handoff when present; else `--resume` / known id; else race-safe " +
+  "state-home discovery of a newly published or lock-held run directory — do not rely solely " +
+  "on the terminal result JSON for mid-flight follow), follow the loop event stream with a " +
+  "persistent Monitor or host-equivalent, optionally follow an active item's advance events " +
+  "when that advance `run_id` is published, stop on a terminal loop outcome " +
+  "(`loop_run_stopped`) or supervisor process exit, then print a summary / `--audit`. " +
+  "See the pipeline SKILL.md loop orchestration section for material event kinds and the interim " +
+  "`events.jsonl` follow path. `--audit` alone is read-only and synchronous (no Monitor).";
 
 // Generate a Claude command markdown file for one operation entry.
 // `skillPath` is the path prefix used in the Invoke line (differs between
@@ -195,16 +216,13 @@ export function renderClaudeCommand(op, skillPath) {
     : op.argHint
     ? `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``
     : `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``;
-  // Durable multi-item loop drives can run for tens of minutes; advertise the
-  // early handoff rather than claiming "completes in seconds / No Monitor" (#665).
+  // inRepoLoop takes priority over fast: multi-item loop drive/resume is not the
+  // shared seconds/no-Monitor template (#668). LOOP_ORCH_NOTE covers early handoff
+  // (#665) plus long-running event-follow orchestration.
   const orchNote = op.inRepoLoop
-    ? "Runs in the foreground for the wall-clock duration of the multi-item drive. " +
-      "On successful create/resume and exclusive lock, emits an early machine-readable stdout JSON " +
-      'line (`kind: "loop_run_handoff"`) with `run_id` and absolute `events` path so a harness can ' +
-      "follow structured progress; the terminal summary JSON is printed when the supervisor finishes. " +
-      "`--audit` remains short-lived and read-only."
+    ? LOOP_ORCH_NOTE
     : op.fast
-    ? "Run synchronously (completes in seconds). No background process or Monitor needed."
+    ? FAST_ORCH_NOTE
     : "See the pipeline SKILL.md for orchestration instructions when this command runs a model harness.";
   const specialNote = op.specialCli
     ? "\nNote: pass the issue number as the sole argument. `$1` is expanded to that number by this command."
