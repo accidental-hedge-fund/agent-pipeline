@@ -7,9 +7,10 @@ The scripts unit-test entry point SHALL invoke Node's test runner such that a gr
 `Unable to deserialize cloned data due to invalid or unsupported version` originating from
 `node:internal/test_runner/runner`. This applies to `ci:scripts` and to the scripts half of
 `npm test` when it runs the same suite. The invocation SHALL use a structural isolation
-approach (for example, one top-level `node --test` process per test file, or an equivalent
-runner configuration proven to avoid that IPC decode path) rather than time-based sleep
-retries as the primary mitigation.
+approach: one top-level `node --test --test-isolation=none <file>` process per test file
+(cross-file isolation via separate top-level processes; no process-isolation IPC within
+each file) or an equivalent runner configuration proven to avoid that IPC decode path —
+rather than time-based sleep retries as the primary mitigation.
 
 #### Scenario: Full scripts suite completes without runner deserialize error
 
@@ -22,8 +23,10 @@ retries as the primary mitigation.
 #### Scenario: Structural invocation, not sleep-retry, is the primary mitigation
 
 - **WHEN** the `ci:scripts` implementation is inspected
-- **THEN** it SHALL implement process or file isolation (or an equivalent structural runner
-  configuration) that avoids the multi-file parent IPC deserialize path implicated in the flake
+- **THEN** it SHALL implement one top-level process per test file with
+  `--test-isolation=none` on each invocation (or an equivalent structural runner
+  configuration) that avoids both the multi-file parent IPC deserialize path and the
+  default process-isolation IPC path for large single files
 - **AND** SHALL NOT rely on a fixed sleep or blind whole-suite retry loop as the sole
   mitigation for that deserialize failure class
 

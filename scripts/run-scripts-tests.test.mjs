@@ -117,7 +117,7 @@ test("listScriptsTestFiles discovers install.test.mjs (sorted, deterministic)", 
   }
 });
 
-test("runScriptsTests spawns one top-level node --test process per file", () => {
+test("runScriptsTests spawns one top-level node --test --test-isolation=none process per file", () => {
   const tmp = mkdtempSync(join(tmpdir(), "run-scripts-tests-"));
   try {
     writeFileSync(join(tmp, "a.test.mjs"), "import { test } from 'node:test';\ntest('a', () => {});\n");
@@ -147,8 +147,18 @@ test("runScriptsTests spawns one top-level node --test process per file", () => 
     for (const call of calls) {
       assert.equal(call.cmd, NODE);
       assert.equal(call.args[0], "--test");
-      assert.equal(call.args.length, 2, "one file only — not multi-file parent aggregation");
-      assert.ok(call.args[1].endsWith(".test.mjs"));
+      // Load-bearing: isolation=none avoids process-isolation IPC deserialize
+      // for large files (install.test.mjs). Default isolation is `process`.
+      assert.ok(
+        call.args.includes("--test-isolation=none"),
+        `per-file spawn must pass --test-isolation=none; got: ${call.args.join(" ")}`,
+      );
+      const fileArgs = call.args.filter((a) => a.endsWith(".test.mjs"));
+      assert.equal(
+        fileArgs.length,
+        1,
+        "one file only — not multi-file parent aggregation",
+      );
       assert.equal(
         call.opts.env?.NODE_TEST_CONTEXT,
         undefined,
@@ -157,8 +167,8 @@ test("runScriptsTests spawns one top-level node --test process per file", () => 
       assert.equal(call.opts.env?.NODE_TEST_WORKER_ID, undefined);
     }
     // Sorted order: a then b
-    assert.ok(calls[0].args[1].endsWith("a.test.mjs"));
-    assert.ok(calls[1].args[1].endsWith("b.test.mjs"));
+    assert.ok(calls[0].args.some((a) => a.endsWith("a.test.mjs")));
+    assert.ok(calls[1].args.some((a) => a.endsWith("b.test.mjs")));
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -186,8 +196,8 @@ test("runScriptsTests returns non-zero when any file's process fails", () => {
     let n = 0;
     const fakeSpawn = (_cmd, args) => {
       n += 1;
-      // Fail the second file
-      const file = args[1] ?? "";
+      // Fail the second file (args include --test, --test-isolation=none, file)
+      const file = args.find((a) => a.endsWith(".test.mjs")) ?? "";
       return { status: file.endsWith("ok.test.mjs") ? 0 : 1 };
     };
 

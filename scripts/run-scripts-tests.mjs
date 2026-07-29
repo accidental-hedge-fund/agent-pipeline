@@ -8,9 +8,12 @@
 // That is a test-runner *host* error, not a product assertion failure. Pre-merge
 // treats any CI red as a hard block, so the flake becomes a human gate.
 //
-// Fix: run each scripts/*.test.mjs as its own top-level `node --test <file>`
-// process (sorted, deterministic). Product failures still exit non-zero and print
-// normal runner output; the multi-file parent IPC aggregation path is not used.
+// Fix: run each scripts/*.test.mjs as its own top-level
+// `node --test --test-isolation=none <file>` process (sorted, deterministic).
+// One process per file preserves cross-file state isolation; isolation=none
+// avoids the per-file process-isolation IPC deserialize path
+// (`#processRawBuffer`) that can still fail for large files like install.test.mjs.
+// Product failures still exit non-zero and print normal runner output.
 //
 // Wired from package.json as `ci:scripts` and the scripts half of `npm test`.
 // Override the scripts directory with RUN_SCRIPTS_TESTS_DIR for unit tests.
@@ -50,7 +53,8 @@ export function childTestEnv(base = process.env) {
 }
 
 /**
- * Run each discovered test file as its own top-level `node --test <file>` process.
+ * Run each discovered test file as its own top-level
+ * `node --test --test-isolation=none <file>` process.
  * @param {{
  *   scriptsDir: string,
  *   nodePath?: string,
@@ -83,13 +87,19 @@ export function runScriptsTests(opts) {
   let failed = 0;
   for (const file of files) {
     // One top-level process per file — do not pass multiple files to a single
-    // `node --test` parent (that is the flake-prone multi-file IPC path).
-    const result = spawn(nodePath, ["--test", file], {
-      cwd,
-      env: childEnv,
-      stdio,
-      shell: false,
-    });
+    // `node --test` parent (multi-file parent IPC aggregation).
+    // --test-isolation=none: default isolation is `process`, which still starts
+    // a runner child and deserializes results over IPC for that single file.
+    const result = spawn(
+      nodePath,
+      ["--test", "--test-isolation=none", file],
+      {
+        cwd,
+        env: childEnv,
+        stdio,
+        shell: false,
+      },
+    );
     if (result.error) {
       console.error(
         `run-scripts-tests: failed to spawn node --test for ${file}: ${result.error.message}`,
