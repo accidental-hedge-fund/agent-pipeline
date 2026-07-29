@@ -519,6 +519,12 @@ export interface PreMergePollingContext {
 
 /** Durable on-disk shape for CI recovery markers (#679). */
 export interface CiRecoveryMarkers {
+  /**
+   * PR head SHA captured before the OpenSpec archive commit. Required after
+   * process restart so archive-only + prior-green recovery can still evaluate
+   * `preArchiveSha..head` and surface pre-archive green evidence on escalate.
+   */
+  preArchiveSha?: string;
   ciRerunAttemptedForSha?: string;
   ciArchiveFailRecoveryAttemptedForSha?: string;
   ciAssertionFixAttemptedForSha?: string;
@@ -586,6 +592,11 @@ export function hydrateCiRecoveryMarkers(
   runDir: string | undefined,
 ): void {
   const disk = loadCiRecoveryMarkers(runDir);
+  // Restore preArchiveSha before any capture path can overwrite it with the
+  // current (post-archive) head after a process restart (#679 review 2).
+  if (!ctx.preArchiveSha && disk.preArchiveSha) {
+    ctx.preArchiveSha = disk.preArchiveSha;
+  }
   if (!ctx.ciRerunAttemptedForSha && disk.ciRerunAttemptedForSha) {
     ctx.ciRerunAttemptedForSha = disk.ciRerunAttemptedForSha;
   }
@@ -602,6 +613,7 @@ function persistCtxCiMarkers(
   runDir: string | undefined,
 ): SaveCiRecoveryMarkersResult {
   return saveCiRecoveryMarkers(runDir, {
+    preArchiveSha: ctx.preArchiveSha,
     ciRerunAttemptedForSha: ctx.ciRerunAttemptedForSha,
     ciArchiveFailRecoveryAttemptedForSha: ctx.ciArchiveFailRecoveryAttemptedForSha,
     ciAssertionFixAttemptedForSha: ctx.ciAssertionFixAttemptedForSha,
@@ -867,17 +879,24 @@ export async function advance(
   );
   if (shaGate) return shaGate;
 
-  // ---- Capture pre-archive SHA for the no-run recovery path (#281) ----
-  // Done once per polling session (when pollingCtx exists and preArchiveSha is not
-  // yet set). Captures the current PR head — the developer's last commit — before
-  // maybeArchiveOpenspec potentially pushes an archive commit that moves HEAD.
-  // Subsequent polls find preArchiveSha already set and skip this fetch.
-  if (opts.pollingCtx && !opts.pollingCtx.preArchiveSha) {
-    try {
-      const preArchiveDetail = await getPrDetailFn(cfg, prNumber);
-      opts.pollingCtx.preArchiveSha = preArchiveDetail.head_sha;
-    } catch {
-      // Fetch failed; no-run recovery will use the non-archive fallback path.
+  // ---- Capture pre-archive SHA for the no-run / archive-only recovery path (#281, #679) ----
+  // Hydrate durable markers first so a restarted process restores preArchiveSha
+  // before this capture can overwrite it with the current (post-archive) head.
+  // Capture runs once per session when still unset: the developer's last commit
+  // before maybeArchiveOpenspec may push an archive commit that moves HEAD.
+  if (opts.pollingCtx) {
+    hydrateCiRecoveryMarkers(opts.pollingCtx, opts.runDir);
+    if (!opts.pollingCtx.preArchiveSha) {
+      try {
+        const preArchiveDetail = await getPrDetailFn(cfg, prNumber);
+        opts.pollingCtx.preArchiveSha = preArchiveDetail.head_sha;
+        // Best-effort: flush baseline early so later recovery markers include it.
+        // Budget-consuming side-effects still require a successful persist of their
+        // own markers via persistCtxCiMarkers before returning waiting.
+        persistCtxCiMarkers(opts.pollingCtx, opts.runDir);
+      } catch {
+        // Fetch failed; no-run recovery will use the non-archive fallback path.
+      }
     }
   }
 

@@ -377,6 +377,75 @@ test("archive-only + prior green after re-run exhausted — one close+reopen the
   });
 });
 
+// Restart after re-run must still see archive-only prior-green (preArchiveSha durable).
+// Without hydrating preArchiveSha, a second process would re-capture the current head
+// and skip close+reopen, escalating without pre-archive green evidence (#679 review 2).
+test("archive-only prior-green: restart after re-run still close+reopens; escalate retains pre-archive SHA", async (t) => {
+  await withRunDir(async (runDir) => {
+    const { deps, rec } = baseDeps({
+      getDiffFilePaths: async (_cfg, base, head) => {
+        // Only the true pre-archive baseline yields openspec-only paths.
+        if (base === SHA_PRE && head === SHA_HEAD) {
+          return ["openspec/changes/archive/x.md"];
+        }
+        return ["core/scripts/stages/pre_merge.ts"];
+      },
+      // Seam is (cfg, sha) — match production signature so prior-green is real.
+      getSuccessfulCheckRunCount: async (_cfg, sha) => (sha === SHA_PRE ? 2 : 0),
+    });
+
+    // Process 1: archive-only + prior green + infra → re-run; baseline + re-run marker on disk.
+    const ctx1: PreMergePollingContext = { preArchiveSha: SHA_PRE };
+    let first;
+    await quiet(t, async () => {
+      first = await advance(cfg, ISSUE, { pollingCtx: ctx1, runDir }, deps);
+    });
+    assert.equal(first!.status, "waiting");
+    assert.equal(rec.reruns, 1);
+    assert.equal(rec.closeCalls, 0);
+    const diskAfterRerun = loadCiRecoveryMarkers(runDir);
+    assert.equal(diskAfterRerun.ciRerunAttemptedForSha, SHA_HEAD);
+    assert.equal(
+      diskAfterRerun.preArchiveSha,
+      SHA_PRE,
+      "preArchiveSha must be durable alongside re-run marker",
+    );
+
+    // Process 2: empty in-memory ctx (simulated restart). Must hydrate preArchiveSha
+    // and take close+reopen — not re-run again, not premature escalate.
+    const ctx2: PreMergePollingContext = {};
+    let second;
+    await quiet(t, async () => {
+      second = await advance(cfg, ISSUE, { pollingCtx: ctx2, runDir }, deps);
+    });
+    assert.equal(second!.status, "waiting");
+    assert.match(second!.reason ?? "", /closed and reopened/i);
+    assert.equal(rec.reruns, 1, "restart must not re-consume re-run budget");
+    assert.equal(rec.closeCalls, 1, "archive close+reopen after re-run on restart");
+    assert.equal(rec.reopenCalls, 1);
+    assert.equal(rec.blocked.length, 0);
+    assert.equal(ctx2.preArchiveSha, SHA_PRE, "hydrated preArchiveSha after restart");
+    assert.equal(ctx2.ciArchiveFailRecoveryAttemptedForSha, SHA_HEAD);
+
+    // Process 3: still red, budget exhausted → escalate with pre-archive green evidence.
+    const ctx3: PreMergePollingContext = {};
+    let third;
+    await quiet(t, async () => {
+      third = await advance(cfg, ISSUE, { pollingCtx: ctx3, runDir }, deps);
+    });
+    assert.equal(third!.status, "blocked");
+    assert.equal(rec.closeCalls, 1, "must not thrash close+reopen after restart");
+    assert.equal(rec.reruns, 1);
+    assert.equal(rec.blocked.length, 1);
+    assert.equal(rec.blocked[0].kind, "ci-exhausted");
+    assert.ok(
+      rec.blocked[0].reason.includes(SHA_PRE),
+      "escalation reason must retain pre-archive green SHA after restart",
+    );
+    assert.ok(rec.blocked[0].reason.includes(SHA_HEAD));
+  });
+});
+
 test("archive close succeeds reopen fails — retry reopen; escalate with PR closed guidance", async (t) => {
   await withRunDir(async (runDir) => {
     let reopenAttempts = 0;
