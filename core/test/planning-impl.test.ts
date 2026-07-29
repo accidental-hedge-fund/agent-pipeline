@@ -402,6 +402,16 @@ test("plan-revision ack: item with lowercase tag accepted (case-insensitive)", (
   assert.deepEqual(verifyPlanRevisionOutput(stdout), { ok: true });
 });
 
+test("plan-revision ack: mid-line preamble-glued header + tagged items → proceeds (#658)", () => {
+  const stdout = [
+    "Inspecting paths so the revision stays surgical.## Feedback Incorporated",
+    "- [ADDRESSED] done",
+    "## Plan",
+    "...",
+  ].join("\n");
+  assert.deepEqual(verifyPlanRevisionOutput(stdout), { ok: true });
+});
+
 // ---------------------------------------------------------------------------
 // OpenSpec change singularity gate (finding 3)
 // ---------------------------------------------------------------------------
