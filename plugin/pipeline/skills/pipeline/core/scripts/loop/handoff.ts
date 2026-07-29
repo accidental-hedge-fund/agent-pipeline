@@ -59,20 +59,34 @@ export function formatLoopRunHandoff(ctx: LoopRunReadyContext): string {
 }
 
 /**
- * Write one line to stdout and flush so a piped consumer can parse the handoff
- * while the supervisor is still running. Injectable for unit tests.
+ * Write one line to stdout and wait for the write completion callback so a
+ * piped consumer can observe the handoff before this process continues (and
+ * before first item dispatch). Injectable for unit tests.
  *
- * Prefer `write` of the line including trailing newline; when `write` returns
- * false (backpressure), wait on `drain` before returning.
+ * `stream.write()` returning true only means the user-space buffer is below
+ * highWaterMark — it does **not** mean the async pipe write finished. Always
+ * wait for the write callback (for both true and false returns) and reject on
+ * write errors so the caller can surface failure and release the run lock.
  */
 export function writeFlushedStdoutLine(
   line: string,
   stream: NodeJS.WritableStream = process.stdout,
-): void | Promise<void> {
+): Promise<void> {
   const data = line.endsWith("\n") ? line : `${line}\n`;
-  const ok = stream.write(data);
-  if (ok) return;
-  return new Promise<void>((resolve) => {
-    stream.once("drain", () => resolve());
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const settle = (err?: Error | null) => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err);
+      else resolve();
+    };
+    try {
+      // Callback fires when this chunk is flushed (or on error). Do not treat
+      // a true return from write() as completion — that only signals buffer room.
+      stream.write(data, (err?: Error | null) => settle(err));
+    } catch (err) {
+      settle(err as Error);
+    }
   });
 }

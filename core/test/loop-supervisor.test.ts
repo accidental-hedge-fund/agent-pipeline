@@ -369,6 +369,32 @@ test("driveSupervisor does not fire onRunReady when lock acquisition fails (#665
   assert.equal(readyCalls, 0);
 });
 
+test("driveSupervisor releases the exclusive lock when onRunReady throws (#665)", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem, calls } = coordinatedFakes();
+
+  await assert.rejects(
+    () =>
+      driveSupervisor(
+        { store: deps, observe, dispatchItem },
+        {
+          runId: "run-1",
+          engine: "claude",
+          onRunReady: async () => {
+            throw new Error("EPIPE: broken pipe");
+          },
+        },
+      ),
+    /EPIPE: broken pipe/,
+  );
+  assert.equal(calls.length, 0, "dispatch must not run after handoff failure");
+  // Lock must be free so a subsequent process can acquire without takeover.
+  const lock = await readLock(deps, "run-1");
+  assert.equal(lock, null, "exclusive lock must be released when onRunReady throws");
+});
+
 // ---------------------------------------------------------------------------
 // 6.2 — process-identity test.
 // ---------------------------------------------------------------------------

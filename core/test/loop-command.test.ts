@@ -14,6 +14,7 @@ import { runLoopPreflight as realRunLoopPreflight, type LoopPreflightOutcome } f
 import {
   formatLoopRunHandoff,
   LOOP_RUN_HANDOFF_KIND,
+  writeFlushedStdoutLine,
 } from "../scripts/loop/handoff.ts";
 import type { DoctorDeps } from "../scripts/stages/doctor.ts";
 import { COMMAND_REGISTRY } from "../scripts/command-registry.ts";
@@ -833,4 +834,191 @@ test("runLoopCommand — regression: only terminal run_id after completion fails
     ["handoff", "dispatch"],
     "regression fixture: without onRunReady invocation, order is only dispatch",
   );
+});
+
+// ---------------------------------------------------------------------------
+// writeFlushedStdoutLine — completion-callback barrier (#665 review fix)
+// ---------------------------------------------------------------------------
+
+/** Fake writable: write() returns true (buffer ok) but completes only via async callback. */
+function makeAsyncCompleteStream(opts: {
+  writeReturns?: boolean;
+  failWith?: Error;
+  onWrite?: (chunk: string) => void;
+}): { stream: NodeJS.WritableStream; complete: () => void; pending: () => boolean } {
+  let writeCb: ((err?: Error | null) => void) | null = null;
+  let pending = false;
+  const stream = {
+    write(
+      chunk: string | Buffer,
+      encodingOrCb?: BufferEncoding | ((err?: Error | null) => void),
+      maybeCb?: (err?: Error | null) => void,
+    ): boolean {
+      const cb = typeof encodingOrCb === "function" ? encodingOrCb : maybeCb;
+      const data = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      opts.onWrite?.(data);
+      pending = true;
+      writeCb = (err) => {
+        pending = false;
+        cb?.(err);
+      };
+      // If failWith is set for sync-fail-via-callback path later via complete().
+      return opts.writeReturns ?? true;
+    },
+    once() {
+      // drain not used by the fixed writeFlushedStdoutLine; present for Writable shape.
+    },
+  } as unknown as NodeJS.WritableStream;
+  return {
+    stream,
+    pending: () => pending,
+    complete: () => {
+      if (!writeCb) throw new Error("no pending write");
+      const cb = writeCb;
+      writeCb = null;
+      if (opts.failWith) cb(opts.failWith);
+      else cb(null);
+    },
+  };
+}
+
+test("writeFlushedStdoutLine waits for write callback even when write() returns true (#665)", async () => {
+  const order: string[] = [];
+  const chunks: string[] = [];
+  const fake = makeAsyncCompleteStream({
+    writeReturns: true,
+    onWrite: (c) => chunks.push(c),
+  });
+
+  const done = writeFlushedStdoutLine('{"kind":"loop_run_handoff"}', fake.stream).then(() => {
+    order.push("write-complete");
+  });
+  // write() returned true immediately, but the handoff promise must not settle yet.
+  order.push("after-call");
+  assert.equal(fake.pending(), true);
+  assert.deepEqual(order, ["after-call"]);
+  assert.equal(chunks[0], '{"kind":"loop_run_handoff"}\n');
+
+  fake.complete();
+  await done;
+  assert.deepEqual(order, ["after-call", "write-complete"]);
+});
+
+test("writeFlushedStdoutLine rejects when the write callback reports an error (#665)", async () => {
+  const fake = makeAsyncCompleteStream({
+    writeReturns: true,
+    failWith: new Error("EPIPE: broken pipe"),
+  });
+  const pending = writeFlushedStdoutLine("line", fake.stream);
+  fake.complete();
+  await assert.rejects(() => pending, /EPIPE: broken pipe/);
+});
+
+test("runLoopCommand — async writeStdoutLine completion is a barrier before first dispatch (#665)", async () => {
+  const order: string[] = [];
+  let resolveWrite: (() => void) | null = null;
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async () =>
+      ({
+        ok: true,
+        args: { selector: { type: "work-list", value: ["100"] }, resumeRunId: undefined, audit: false },
+      }) satisfies LoopPreflightOutcome,
+    writeStdoutLine: () =>
+      new Promise<void>((resolve) => {
+        order.push("write-started");
+        resolveWrite = () => {
+          order.push("handoff");
+          resolve();
+        };
+      }),
+    runLoopEngine: async (input) => {
+      const ready = input.onRunReady!({
+        runId: "loop-async-write",
+        runDir: "/tmp/loop-state/runs/loop-async-write",
+        events: "/tmp/loop-state/runs/loop-async-write/events.jsonl",
+        engine: "claude",
+        resumed: false,
+        selector: input.selector ?? null,
+      });
+      // Handoff write still pending — dispatch must not run yet.
+      order.push("after-onRunReady-scheduled");
+      assert.ok(resolveWrite, "write must have been scheduled");
+      assert.deepEqual(order, ["write-started", "after-onRunReady-scheduled"]);
+      resolveWrite!();
+      await ready;
+      order.push("dispatch");
+      return {
+        kind: "drive",
+        result: {
+          runId: "loop-async-write",
+          cycles: 1,
+          stop: null,
+          holdOutstanding: false,
+          allDone: true,
+          resumed: false,
+          heldItemIds: [],
+          dispatched: 1,
+          excludedItemIds: [],
+          exclusionReason: null,
+          completion: "all_done",
+        },
+      };
+    },
+  };
+  process.exitCode = undefined;
+  await withCapturedConsole(() => runLoopCommand({ profile: "claude" } as CliOpts, ["100"], deps));
+  assert.equal(process.exitCode, 0);
+  assert.deepEqual(order, ["write-started", "after-onRunReady-scheduled", "handoff", "dispatch"]);
+});
+
+test("runLoopCommand — writeStdoutLine failure surfaces as non-zero exit without terminal summary (#665)", async () => {
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async () =>
+      ({
+        ok: true,
+        args: { selector: { type: "work-list", value: ["100"] }, resumeRunId: undefined, audit: false },
+      }) satisfies LoopPreflightOutcome,
+    writeStdoutLine: async () => {
+      throw new Error("EPIPE: broken pipe");
+    },
+    runLoopEngine: async (input) => {
+      try {
+        await input.onRunReady!({
+          runId: "loop-write-fail",
+          runDir: "/tmp/loop-state/runs/loop-write-fail",
+          events: "/tmp/loop-state/runs/loop-write-fail/events.jsonl",
+          engine: "claude",
+          resumed: false,
+          selector: input.selector ?? null,
+        });
+        return {
+          kind: "drive",
+          result: {
+            runId: "loop-write-fail",
+            cycles: 0,
+            stop: null,
+            holdOutstanding: false,
+            allDone: false,
+            resumed: false,
+            heldItemIds: [],
+            dispatched: 0,
+            excludedItemIds: [],
+            exclusionReason: null,
+            completion: null,
+          },
+        };
+      } catch (err) {
+        // Mirrors defaultRunLoopEngine: handoff throw becomes engine error.
+        return { kind: "error", message: (err as Error).message };
+      }
+    },
+  };
+  process.exitCode = undefined;
+  const { out, err } = await withCapturedConsole(() =>
+    runLoopCommand({ profile: "claude" } as CliOpts, ["100"], deps),
+  );
+  assert.equal(process.exitCode, 1);
+  assert.equal(out.length, 0, "no terminal drive summary after handoff write failure");
+  assert.match(err.join("\n"), /EPIPE: broken pipe/);
+  process.exitCode = 0;
 });

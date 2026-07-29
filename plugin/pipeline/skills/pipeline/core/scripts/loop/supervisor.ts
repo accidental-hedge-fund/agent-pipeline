@@ -1017,18 +1017,19 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
   const limit = input.consecutiveNoProgressLimit ?? contract.consecutive_no_progress_limit ?? DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT;
   const cyclesSafetyCap = input.maxCyclesSafety ?? MAX_CYCLES_SAFETY;
 
-  // Advertise identity after exclusive lock, before any dispatch can block (#665).
-  if (input.onRunReady) {
-    await input.onRunReady({
-      runId: input.runId,
-      runDir: runDir(deps.store, input.runId),
-      events: runEventsPath(deps.store, input.runId),
-      engine: input.engine,
-      resumed: attach.resumed,
-    });
-  }
-
   try {
+    // Advertise identity after exclusive lock, before any dispatch can block (#665).
+    // Inside try so a handoff write failure still releases the exclusive lock.
+    if (input.onRunReady) {
+      await input.onRunReady({
+        runId: input.runId,
+        runDir: runDir(deps.store, input.runId),
+        events: runEventsPath(deps.store, input.runId),
+        engine: input.engine,
+        resumed: attach.resumed,
+      });
+    }
+
     if (attach.resumed) {
       try {
         await reconcile(deps.store, deps.observe, { runId: input.runId, token, engine: input.engine });
