@@ -26,11 +26,19 @@ Each issue SHALL get a worktree at `<repo>/<cfg.worktree_root>/pipeline-<issueN>
 - **THEN** no `gh` call SHALL be issued to determine whether that or any other worktree is active
 
 ### Requirement: Worktree created off the latest base; stale path reclaimed
-`createWorktree` SHALL fetch and branch off the latest `origin/<base_branch>`. If a directory already exists at the target path it SHALL be removed first. After the git worktree is created, the pipeline SHALL: (1) write the `node_modules` staging exclusion to `.git/info/exclude` inside the worktree, (2) remove any pre-existing `node_modules` symlink at the worktree root and log the removal, and (3) execute the dependency install step (as specified in `worktree-dependency-install`) before control returns to the caller, so that every worktree is fully bootstrapped and runnable from the moment it is created.
+`createWorktree` SHALL fetch and branch off the latest `origin/<base_branch>`. Before creating the new worktree, the pipeline SHALL reclaim same-issue managed worktrees and clear a colliding directory at the target path **only when reclaim safety checks pass** (see Requirement: Create-time reclaim SHALL share operator remove safety). When reclaim is refused, `createWorktree` SHALL abort without creating a new worktree and without destroying the existing worktree or branch. After a git worktree is successfully created, the pipeline SHALL: (1) write the `node_modules` staging exclusion to `.git/info/exclude` inside the worktree, (2) remove any pre-existing `node_modules` symlink at the worktree root and log the removal, and (3) execute the dependency install step (as specified in `worktree-dependency-install`) before control returns to the caller, so that every worktree is fully bootstrapped and runnable from the moment it is created.
 
-#### Scenario: stale path
+#### Scenario: clean stale path is reclaimed
 - **WHEN** a directory already exists at the target worktree path
+- **AND** the candidate is a managed worktree (or path collision under the managed root) with a clean workdir and no local-only commits
 - **THEN** it SHALL be removed before the new worktree is created off `origin/<base_branch>`
+
+#### Scenario: dirty stale path is not force-reclaimed
+- **WHEN** a managed worktree already exists for the same issue (or at the target path)
+- **AND** `git status --porcelain` in that worktree returns non-empty output
+- **THEN** `createWorktree` SHALL NOT remove the worktree or delete its local branch
+- **AND** SHALL abort with an error naming the dirty condition
+- **AND** no new worktree SHALL be created at the target path for this call
 
 #### Scenario: node_modules local exclude written during bootstrap
 - **WHEN** a worktree is freshly created for an issue
@@ -76,4 +84,68 @@ When the file `/tmp/pipeline-<domain>.disabled` exists, the pipeline SHALL exit 
 #### Scenario: labels ensured
 - **WHEN** `ensurePipelineLabels` runs against a repo missing some pipeline labels
 - **THEN** the missing labels SHALL be created and already-present labels SHALL be left unchanged
+
+### Requirement: Create-time reclaim SHALL share operator remove safety
+Before `createWorktree` destroys any same-issue managed worktree (retry, title/slug change, multi-stale accumulation) or clears a colliding path at the computed target, the pipeline SHALL apply the same safety policy as `removeWorktreeForIssue` / `worktree-per-run-removal` **without force**: (1) when the path is on disk, treat a dirty workdir as blocking; (2) evaluate local-only (unpushed) commits with the same tier results (`true` / `"unverifiable"` / `null` / clean); (3) refuse reclaim on any blocking result and leave the worktree and local branch intact. Reclaim SHALL NOT pass an implicit force flag that discards dirty work or bypasses local-only verification failure. Clean candidates with no local-only commits MAY be removed so create can proceed. Records with `underManagedRoot === false` SHALL continue to be skipped (never force-reclaimed). The safety policy SHALL be single-sourced with operator remove so the two paths cannot silently diverge.
+
+Reclaim SHALL preflight **every** same-issue managed candidate and target-path collision candidate with the safety policy **before** invoking any worktree or branch deletion for any candidate. If any candidate fails preflight, `createWorktree` SHALL abort with no reclaim mutations on any candidate (including earlier candidates that would have passed in isolation).
+
+Automatic reclaim mutation SHALL be race-safe relative to the preflight verdict: (1) worktree deletion SHALL use non-force `git worktree remove` so a workdir that becomes dirty after preflight refuses deletion; (2) local branch deletion SHALL be conditioned on the branch tip OID captured at preflight (compare-and-delete, e.g. `git update-ref -d`), not an unconditional `git branch -D`; (3) a changed branch tip or failed non-force remove SHALL be treated as a reclaim refusal. Reclaim SHALL NOT use `git worktree remove --force` for automatic create-time reclaim.
+
+#### Scenario: Dirty managed worktree blocks reclaim on retry
+- **WHEN** issue N already has a managed active worktree with uncommitted changes
+- **AND** `createWorktree` runs again for issue N (retry / re-run)
+- **THEN** the pipeline SHALL NOT invoke `git worktree remove` or branch deletion for that worktree
+- **AND** `createWorktree` SHALL fail with an error that identifies the dirty condition and the issue or path
+- **AND** the existing worktree directory and branch SHALL remain
+
+#### Scenario: Local-only commits block reclaim on slug change
+- **WHEN** issue N has a managed worktree on branch `pipeline/N-<old-slug>` with commits not pushed to the remote
+- **AND** the issue title changes so the new slug differs
+- **AND** `createWorktree` runs for issue N with the new slug
+- **THEN** reclaim of the old-slug worktree SHALL be refused
+- **AND** no `git worktree remove` / branch deletion SHALL run for that branch
+- **AND** `createWorktree` SHALL fail with an error naming the local-only condition
+
+#### Scenario: Unverifiable local-only state blocks reclaim
+- **WHEN** local-only commit verification for a reclaim candidate returns `"unverifiable"` (or a hard verification failure / `null`)
+- **THEN** reclaim SHALL refuse without mutating the worktree or branch
+- **AND** `createWorktree` SHALL fail with an error naming the verification condition
+
+#### Scenario: Clean managed worktree is reclaimed so create proceeds
+- **WHEN** issue N has a managed active worktree that is clean and has no local-only commits
+- **AND** `createWorktree` runs for issue N
+- **THEN** the pipeline MAY remove that worktree and its local branch
+- **AND** SHALL create a fresh worktree off `origin/<base_branch>` at the current slug path
+
+#### Scenario: Out-of-managed-root worktree is never reclaimed
+- **WHEN** a Git-registered worktree shares issue N's pipeline branch name but has `underManagedRoot === false`
+- **AND** `createWorktree` runs for issue N
+- **THEN** that worktree SHALL NOT be removed or branch-deleted by reclaim
+
+#### Scenario: Safety policy is shared with operator remove
+- **WHEN** the dirty or local-only tier outcomes are defined for `removeWorktreeForIssue`
+- **THEN** create-time reclaim SHALL apply the same blocking outcomes as operator remove without `--force`
+- **AND** a unit test suite SHALL fail if reclaim can call the destructive remove seam while dirty or local-only checks would block
+
+#### Scenario: Later unsafe candidate does not destroy earlier clean candidates
+- **WHEN** issue N has two managed active worktrees
+- **AND** the first candidate is clean with no local-only commits
+- **AND** the second candidate is dirty, local-only, unverifiable, or otherwise blocking
+- **AND** `createWorktree` runs for issue N
+- **THEN** reclaim preflight SHALL fail on the blocking candidate
+- **AND** the pipeline SHALL NOT remove the earlier clean worktree or delete its branch
+- **AND** `createWorktree` SHALL abort without creating a new worktree
+
+#### Scenario: Late dirty workdir refuses race-safe reclaim
+- **WHEN** a reclaim candidate passed preflight as clean
+- **AND** non-force `git worktree remove` fails because the workdir became dirty after preflight
+- **THEN** reclaim SHALL abort with an error naming the refused remove
+- **AND** SHALL NOT delete the local branch as part of that reclaim attempt
+
+#### Scenario: Branch tip change refuses race-safe branch delete
+- **WHEN** a reclaim candidate's branch tip OID was captured at preflight
+- **AND** the tip differs when mutation would run (or compare-and-delete fails)
+- **THEN** reclaim SHALL refuse without unconditional `git branch -D`
+- **AND** `createWorktree` SHALL fail with an error naming the tip-change condition
 
