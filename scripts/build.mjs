@@ -173,6 +173,7 @@ export const OPERATION_SURFACE = [
     cliArgs: "loop $ARGUMENTS",
     // Multi-item drive/resume is long-running (minutes–hours). Do NOT use the
     // shared fast template ("completes in seconds" / "no Monitor") — #668.
+    // Specialized packaging via inRepoLoop (early handoff #665 + event follow).
     fast: false,
     inRepoLoop: true,
   },
@@ -216,7 +217,8 @@ export function renderClaudeCommand(op, skillPath) {
     ? `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``
     : `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``;
   // inRepoLoop takes priority over fast: multi-item loop drive/resume is not the
-  // shared seconds/no-Monitor template (#668).
+  // shared seconds/no-Monitor template (#668). LOOP_ORCH_NOTE covers early handoff
+  // (#665) plus long-running event-follow orchestration.
   const orchNote = op.inRepoLoop
     ? LOOP_ORCH_NOTE
     : op.fast
@@ -230,8 +232,10 @@ export function renderClaudeCommand(op, skillPath) {
       "normalization, loop:store-schema-compatibility, native-/goal capability), then this skill's own " +
       "durable loop supervisor (contract, ledger, lock, recovery, reconciliation, resume), executing each " +
       "selected item through the pipeline's own state machine and evidence gates. It invokes no external " +
-      "orchestrator skill and never merges. The command prints the run result as JSON. On a preflight " +
-      "failure it stops and reports the printed remediation; do not start any substitute loop."
+      "orchestrator skill and never merges. After lock acquisition it prints an early `loop_run_handoff` " +
+      "JSON object (`run_id` + absolute `events` path) for progress follow, then the terminal run result " +
+      "as JSON when the supervisor returns. On a preflight failure it stops and reports the printed " +
+      "remediation; do not start any substitute loop."
     : "";
 
   return [

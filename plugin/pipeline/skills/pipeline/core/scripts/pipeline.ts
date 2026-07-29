@@ -16,7 +16,7 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
-import { writeFileSync, readFileSync, realpathSync } from "node:fs";
+import { writeFileSync, readFileSync, realpathSync, existsSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import { Command, Option } from "commander";
@@ -142,11 +142,23 @@ import {
   resolveSupersessionChainHead,
   runExists as loopRunExists,
 } from "./loop/store.ts";
+import { runLoopLogs } from "./loop/logs.ts";
 import { initRecoverableRun } from "./loop/recovery.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
 import { compileContractItems } from "./loop/dependencies.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type LoopLedger } from "./loop/types.ts";
-import { LOOP_EXECUTION_CONTRACT_SCHEMA, normalizeLoopOutcome, type LoopExecutionRequest, type LoopExecutionResponse } from "./loop-execution-contract.ts";
+import {
+  formatLoopRunHandoff,
+  writeFlushedStdoutLine,
+  type LoopRunReadyContext,
+} from "./loop/handoff.ts";
+import {
+  LOOP_EXECUTION_CONTRACT_SCHEMA,
+  normalizeLoopOutcome,
+  type LoopEvidencePointer,
+  type LoopExecutionRequest,
+  type LoopExecutionResponse,
+} from "./loop-execution-contract.ts";
 import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
   BLOCKED_LABEL,
@@ -382,8 +394,8 @@ export function buildCmd(): Command {
     .option("--model <model>", "override the review/fix model when supported by the selected harness")
     .option("--profile <name>", "shared-core profile to use: codex or claude", process.env.PIPELINE_PROFILE ?? "codex")
     .option("--json-events", "stream lifecycle events to stdout as JSON lines (in addition to human-readable output)")
-    .option("-f, --follow", "follow mode for 'pipeline logs <run-id> --follow': stream new output as appended")
-    .option("--events", "logs mode: read/follow events.jsonl instead of terminal.log")
+    .option("-f, --follow", "follow mode for 'pipeline logs' / 'pipeline loop logs': stream new output until interrupt (SIGINT/SIGTERM); does not auto-exit on terminal stop events")
+    .option("--events", "logs mode: read/follow events.jsonl (required selection for advance logs; always selected for 'pipeline loop logs')")
     // `pipeline run <N> --detach` options
     .option("--detach", "run the pipeline in a detached background process (survives launcher exit)")
     .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
@@ -548,10 +560,142 @@ export function compileWorkListRun(
  *  Deliberately omits `--once`: the child must run its normal advance loop
  *  to completion (a defined `pipeline/loop-execution@1` terminal outcome —
  *  ready-to-deploy, blocked, or closed), not stop after a single stage (#512
- *  review 1, finding 57fe63fa). Exported as a pure function so this contract
- *  is unit-testable without spawning a real process. */
-export function dispatchItemChildArgs(scriptPath: string, issueNumber: number, engine: LoopEngine, repoDir: string): string[] {
-  return [scriptPath, String(issueNumber), "--profile", engine, "--repo-path", repoDir];
+ *  review 1, finding 57fe63fa). Optional `runId` pins the child's
+ *  `.agent-pipeline/runs/<run-id>/` via the same internal `--run-id` flag
+ *  detached launch already uses (#667). Exported as a pure function so this
+ *  contract is unit-testable without spawning a real process. */
+export function dispatchItemChildArgs(
+  scriptPath: string,
+  issueNumber: number,
+  engine: LoopEngine,
+  repoDir: string,
+  opts?: { runId?: string },
+): string[] {
+  const args = [scriptPath, String(issueNumber), "--profile", engine, "--repo-path", repoDir];
+  if (opts?.runId) args.push("--run-id", opts.runId);
+  return args;
+}
+
+// ---------------------------------------------------------------------------
+// Loop dispatch ↔ advance run-store linkage helpers (#667).
+// ---------------------------------------------------------------------------
+
+/** Pinned advance run-store identity for one per-item hand-off. */
+export interface AdvanceRunPin {
+  /** Basename under `.agent-pipeline/runs/<run-id>/`. */
+  pipeline_run_id: string;
+  /** Absolute path of the advance run directory. */
+  run_dir: string;
+  /** Absolute path of that run's `events.jsonl`. */
+  events_path: string;
+}
+
+/** Durable start-linkage payload written on the loop run event trail. */
+export interface AdvanceStartLinkage {
+  item_id: string;
+  pipeline_run_id: string;
+  events: string;
+}
+
+/** Durable terminal-linkage payload written on the loop run event trail. */
+export interface AdvanceTerminalLinkage {
+  item_id: string;
+  pipeline_run_id: string;
+  outcome: LoopExecutionResponse["outcome"];
+  /** Absolute events path when a real pin was known; omitted when none. */
+  events?: string;
+}
+
+/** Compute a pinned advance run id + absolute paths for a repo root + issue. */
+export function pinAdvanceRunIdentity(repoDir: string, issueNumber: number, startedAt: Date): AdvanceRunPin {
+  const pipeline_run_id = runIdFor(issueNumber, startedAt);
+  const run_dir = runDirPath(repoDir, pipeline_run_id);
+  return {
+    pipeline_run_id,
+    run_dir,
+    events_path: path.join(run_dir, "events.jsonl"),
+  };
+}
+
+/** Last-resort synthetic join key when no advance run store can be established. */
+export function syntheticLoopEvidencePipelineRunId(loopRunId: string, itemId: string): string {
+  return `pipeline-loop-${loopRunId}-${itemId}`;
+}
+
+/** True when `pipeline_run_id` is the synthetic-only form (not a real store basename). */
+export function isSyntheticLoopEvidencePipelineRunId(pipelineRunId: string): boolean {
+  return pipelineRunId.startsWith("pipeline-loop-");
+}
+
+/** Map a known pin (or synthetic fallback) into a truthful evidence pointer.
+ *  When `events_path_known` is false (spawn/init failure before a live store),
+ *  retain the intended pin id for traceability but omit `events_path` so we
+ *  never advertise a non-existent `events.jsonl` as live. */
+export function buildLoopEvidencePointer(opts: {
+  pr_number: number | null;
+  item_id: string;
+  loop_run_id: string;
+  pin?: AdvanceRunPin | null;
+  /** Default true when a pin is present. Pass false when the store was never live. */
+  events_path_known?: boolean;
+  worktree_root?: string | null;
+}): LoopEvidencePointer {
+  if (opts.pin) {
+    const eventsKnown = opts.events_path_known !== false;
+    return {
+      pr_number: opts.pr_number,
+      pipeline_run_id: opts.pin.pipeline_run_id,
+      ...(eventsKnown ? { events_path: opts.pin.events_path } : {}),
+      ...(opts.worktree_root !== undefined ? { worktree_root: opts.worktree_root } : {}),
+    };
+  }
+  return {
+    pr_number: opts.pr_number,
+    pipeline_run_id: syntheticLoopEvidencePipelineRunId(opts.loop_run_id, opts.item_id),
+    ...(opts.worktree_root !== undefined ? { worktree_root: opts.worktree_root } : {}),
+  };
+}
+
+/** Start-linkage event payload for the loop run trail. */
+export function buildStartLinkagePayload(itemId: string, pin: AdvanceRunPin): AdvanceStartLinkage {
+  return {
+    item_id: itemId,
+    pipeline_run_id: pin.pipeline_run_id,
+    events: pin.events_path,
+  };
+}
+
+/** Terminal-linkage event payload. When `pin` is null/absent, falls back to a
+ *  synthetic id for traceability and omits `events` so we never claim a live
+ *  join to a non-existent path. */
+export function buildTerminalLinkagePayload(
+  itemId: string,
+  outcome: LoopExecutionResponse["outcome"],
+  opts: { pin?: AdvanceRunPin | null; loop_run_id: string; events_path?: string | null },
+): AdvanceTerminalLinkage {
+  if (opts.pin) {
+    return {
+      item_id: itemId,
+      pipeline_run_id: opts.pin.pipeline_run_id,
+      outcome,
+      events: opts.pin.events_path,
+    };
+  }
+  if (opts.events_path) {
+    // Evidence carried a real path/id without a local pin object (e.g. fake dispatch).
+    const basename = path.basename(path.dirname(opts.events_path));
+    return {
+      item_id: itemId,
+      pipeline_run_id: basename,
+      outcome,
+      events: opts.events_path,
+    };
+  }
+  return {
+    item_id: itemId,
+    pipeline_run_id: syntheticLoopEvidencePipelineRunId(opts.loop_run_id, itemId),
+    outcome,
+  };
 }
 
 /** Pure classifier for the per-item advance's terminal label/state → dispatch outcome,
@@ -568,25 +712,138 @@ export function classifyDispatchOutcome(detail: { labels: readonly string[]; sta
   return "failed";
 }
 
-export function realDispatchItem(cfg: PipelineConfig, engine: LoopEngine): SupervisorDeps["dispatchItem"] {
-  return async (request: LoopExecutionRequest): Promise<LoopExecutionResponse> => {
+/** Injectable deps for {@link realDispatchItem} — unit tests never spawn a real
+ *  process or touch live gh (#667). */
+export interface RealDispatchItemDeps {
+  spawn?: typeof spawn;
+  now?: () => Date;
+  getIssueDetail?: typeof getIssueDetail;
+  getPrForIssue?: typeof getPrForIssue;
+  scriptPath?: string;
+  execPath?: string;
+  /**
+   * True when the pinned advance `events.jsonl` has been created (store init).
+   * Defaults to `existsSync`. Injected so unit tests never touch the real FS.
+   */
+  eventsPathExists?: (eventsPath: string) => boolean;
+  /** Poll interval (ms) while waiting for store init during the child wait. */
+  storeReadyPollMs?: number;
+}
+
+export function realDispatchItem(
+  cfg: PipelineConfig,
+  engine: LoopEngine,
+  deps: RealDispatchItemDeps = {},
+): SupervisorDeps["dispatchItem"] {
+  const spawnFn = deps.spawn ?? spawn;
+  const nowFn = deps.now ?? (() => new Date());
+  const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
+  const getPrForIssueFn = deps.getPrForIssue ?? getPrForIssue;
+  const scriptPath = deps.scriptPath ?? fileURLToPath(import.meta.url);
+  const execPath = deps.execPath ?? process.execPath;
+  const eventsPathExistsFn = deps.eventsPathExists ?? ((p: string) => existsSync(p));
+  const storeReadyPollMs = deps.storeReadyPollMs ?? 50;
+
+  return async (request, hooks): Promise<LoopExecutionResponse> => {
     const issueNumber = Number(request.item_id);
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(
-        process.execPath,
-        dispatchItemChildArgs(fileURLToPath(import.meta.url), issueNumber, engine, cfg.repo_dir),
-        { stdio: "inherit" },
-      );
-      child.on("error", reject);
-      child.on("exit", () => resolve());
-    });
+    // Pin before spawn so the child uses the same `.agent-pipeline/runs/<run-id>/`
+    // (detached-launch pattern). Start linkage + live events_path are published
+    // only after the pinned run store is confirmed initialized — never on bare
+    // `spawn` (which only proves the OS launched the executable) or on exit
+    // before initRunDir.
+    const pin =
+      Number.isFinite(issueNumber) && issueNumber > 0
+        ? pinAdvanceRunIdentity(cfg.repo_dir, issueNumber, nowFn())
+        : null;
+
+    let startLinkage: Promise<void> = Promise.resolve();
+    let storeReady = false;
+    const confirmStoreReady = (): boolean => {
+      if (!pin || storeReady) return storeReady;
+      if (!eventsPathExistsFn(pin.events_path)) return false;
+      storeReady = true;
+      if (hooks?.onAdvanceLinked) {
+        startLinkage = Promise.resolve(
+          hooks.onAdvanceLinked(buildStartLinkagePayload(request.item_id, pin)),
+        ).then(() => undefined);
+      }
+      return true;
+    };
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const child = spawnFn(
+          execPath,
+          dispatchItemChildArgs(scriptPath, issueNumber, engine, cfg.repo_dir, pin ? { runId: pin.pipeline_run_id } : undefined),
+          { stdio: "inherit" },
+        );
+        let pollTimer: ReturnType<typeof setInterval> | undefined;
+        let settled = false;
+        const stopPoll = () => {
+          if (pollTimer !== undefined) {
+            clearInterval(pollTimer);
+            pollTimer = undefined;
+          }
+        };
+        const startPoll = () => {
+          if (!pin || storeReady || pollTimer !== undefined) return;
+          // Immediate check, then bounded poll while the child is alive so
+          // harnesses can follow the advance trail mid-wait once init succeeds.
+          confirmStoreReady();
+          if (!storeReady) {
+            pollTimer = setInterval(() => {
+              if (confirmStoreReady()) stopPoll();
+            }, storeReadyPollMs);
+          }
+        };
+        child.on("spawn", startPoll);
+        child.on("error", (err) => {
+          stopPoll();
+          if (!settled) {
+            settled = true;
+            reject(err);
+          }
+        });
+        child.on("exit", () => {
+          stopPoll();
+          // Final confirmation: child may have created the store just before exit,
+          // or fakes may only emit `exit` (no `spawn`). Never publish start
+          // linkage / events_path without this check.
+          confirmStoreReady();
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        });
+      });
+    } catch {
+      // Spawn failure: retain the intended pin id for traceability when known,
+      // but omit events_path — no child created the run store. Start linkage
+      // was not published.
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "failed",
+        evidence: buildLoopEvidencePointer({
+          pr_number: null,
+          item_id: request.item_id,
+          loop_run_id: request.run_id,
+          pin,
+          events_path_known: false,
+        }),
+      };
+    }
+    // Linkage write errors must surface separately from spawn failure — when
+    // the store was confirmed, a failed append is not a "no store" path.
+    await startLinkage;
 
     let outcome: LoopExecutionResponse["outcome"] = "failed";
     let prNumber: number | null = null;
     try {
-      const detail = await getIssueDetail(cfg, issueNumber);
+      const detail = await getIssueDetailFn(cfg, issueNumber);
       outcome = classifyDispatchOutcome(detail);
-      const pr = await getPrForIssue(cfg, issueNumber).catch(() => null);
+      const pr = await getPrForIssueFn(cfg, issueNumber).catch(() => null);
       prNumber = pr ?? null;
     } catch {
       outcome = "failed";
@@ -597,7 +854,14 @@ export function realDispatchItem(cfg: PipelineConfig, engine: LoopEngine): Super
       item_id: request.item_id,
       run_id: request.run_id,
       outcome: normalizeLoopOutcome(outcome),
-      evidence: { pr_number: prNumber, pipeline_run_id: `pipeline-loop-${request.run_id}-${request.item_id}` },
+      evidence: buildLoopEvidencePointer({
+        pr_number: prNumber,
+        item_id: request.item_id,
+        loop_run_id: request.run_id,
+        pin,
+        // Only advertise a live events path when the store was confirmed.
+        events_path_known: storeReady,
+      }),
     };
   };
 }
@@ -746,6 +1010,12 @@ export interface RunLoopEngineInput {
    *  — {@link normalizeLoopArgs} refuses it with `--resume` or with no selector present. */
   newRun?: boolean;
   repoDir: string;
+  /**
+   * Early run-ready hook (#665): invoked once after exclusive lock and before
+   * first item dispatch. Not invoked for `--audit` or failure paths. The engine
+   * enriches supervisor context with the selector (null on bare `--resume`).
+   */
+  onRunReady?: (ctx: LoopRunReadyContext) => void | Promise<void>;
 }
 
 export type LoopEngineResult =
@@ -956,6 +1226,15 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
       runId,
       engine: input.engine as LoopEngineName,
       resume: !!input.resumeRunId,
+      onRunReady: input.onRunReady
+        ? async (ctx) => {
+            // Selector is known only at the engine/CLI layer; bare --resume has none.
+            await input.onRunReady!({
+              ...ctx,
+              selector: input.resumeRunId ? null : (input.selector ?? null),
+            });
+          }
+        : undefined,
     });
     return { kind: "drive", result };
   } catch (err) {
@@ -971,6 +1250,11 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
 export interface LoopCliDeps {
   runLoopPreflight: typeof runLoopPreflight;
   runLoopEngine: (input: RunLoopEngineInput) => Promise<LoopEngineResult>;
+  /**
+   * Write+flush a single stdout line (early handoff). Defaults to
+   * {@link writeFlushedStdoutLine}; tests inject a capture sink.
+   */
+  writeStdoutLine?: (line: string) => void | Promise<void>;
 }
 
 const defaultLoopCliDeps: LoopCliDeps = { runLoopPreflight, runLoopEngine: defaultRunLoopEngine };
@@ -1021,6 +1305,7 @@ export async function runLoopCommand(
     return;
   }
 
+  const writeLine = deps.writeStdoutLine ?? writeFlushedStdoutLine;
   const engineResult = await deps.runLoopEngine({
     engine,
     selector: outcome.args.selector,
@@ -1028,6 +1313,19 @@ export async function runLoopCommand(
     audit: outcome.args.audit,
     newRun: outcome.args.newRun,
     repoDir,
+    // Early handoff (#665): emit only on successful drive attach+lock, before
+    // first dispatch. Audit and preflight/engine failure paths never set this
+    // callback (audit short-circuits inside the engine before attach).
+    onRunReady: outcome.args.audit
+      ? undefined
+      : async (ctx) => {
+          const line = formatLoopRunHandoff(ctx);
+          await writeLine(line);
+          // Operator aid only — machine contract is the stdout JSON line above.
+          console.error(
+            `pipeline loop: run ready ${ctx.runId}; events ${ctx.events}`,
+          );
+        },
   });
 
   if (engineResult.kind === "error") {
@@ -1328,6 +1626,23 @@ async function main(): Promise<void> {
         ? logsArg
         : undefined;
     await runLogs(repoDir, logsRunId, !!opts.follow, !!opts.events);
+    return;
+  }
+
+  // `pipeline loop logs [<run-id>] [--events] [--follow|-f]` (#666): observe a
+  // durable loop run's events.jsonl under the loop state home. Nested `logs`
+  // must never enter loop preflight or the supervisor drive path. Dispatched
+  // before flag validation / config / gh — same offline discipline as advance
+  // `pipeline logs`. Follow stops on interrupt only (not on terminal stop events).
+  if (numArg === "loop" && cmd.args[1] === "logs") {
+    const loopLogsArg = cmd.args[2];
+    const loopLogsRunId =
+      typeof loopLogsArg === "string" && loopLogsArg.length > 0 && !loopLogsArg.startsWith("-")
+        ? loopLogsArg
+        : undefined;
+    // `--events` is accepted for parity with advance logs but the selected
+    // artifact is always events.jsonl (loop store has no terminal.log).
+    await runLoopLogs(loopLogsRunId, !!opts.follow);
     return;
   }
 

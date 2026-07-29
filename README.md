@@ -718,6 +718,16 @@ action-evidence timeline, and its watchdog/no-progress state with zero durable w
 no ledger write, no lock, no GitHub mutation. A pre-existing run created by a legacy
 goal-loop invocation remains addressable by `--resume <run-id>` (read-only import).
 
+**Early run handoff (#665).** A successful multi-item drive stays in the foreground for
+the whole wall-clock of the run, but as soon as the durable run is created/resumed and
+exclusively locked — and **before** the first item dispatch can block for minutes — the
+CLI prints one machine-readable stdout JSON line with `kind: "loop_run_handoff"`, the
+durable `run_id`, and absolute `run_dir` / `events` paths under the loop state home. A
+harness can parse that line (without scraping prose) and follow `events.jsonl` while the
+supervisor continues. The existing terminal summary JSON is still printed when the
+supervisor finishes; it does not use `kind: "loop_run_handoff"`. Preflight / lock failure
+and `--audit` emit no handoff.
+
 **Pre-pipeline items are excluded, not fatal.** A selected item still carrying
 `pipeline:backlog` (or no `pipeline:*` label at all) is excluded from dispatch every
 cycle with a durable, non-fatal `precondition` rationale naming the required stage
@@ -1349,6 +1359,20 @@ $pipeline logs
 Use `--events` for stage/lifecycle monitoring. It reads the canonical run-store
 `events.jsonl`; no separate transitions log or grep-filtered terminal output is
 required.
+
+Durable multi-item loop runs store events under the loop state home (not
+`.agent-pipeline/runs/`). Observe them with the nested logs sub-verb:
+
+```bash
+# print a durable loop run's events.jsonl
+$pipeline loop logs <loop-run-id> --events
+
+# follow until interrupt (SIGINT/SIGTERM) — does not auto-exit on loop_run_stopped
+$pipeline loop logs <loop-run-id> --events --follow
+
+# list available durable loop run ids (most recent first)
+$pipeline loop logs
+```
 
 Stream lifecycle events to stdout as JSON lines alongside normal output (for orchestrators like Pipeline Desk):
 

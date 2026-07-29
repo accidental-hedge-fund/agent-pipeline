@@ -7,8 +7,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as path from "node:path";
 import {
   DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT,
+  LOOP_ITEM_ADVANCE_FINISHED,
+  LOOP_ITEM_ADVANCE_LINKED,
   attachSupervisor,
   auditSupervisor,
   dominantExclusionReason,
@@ -16,7 +19,17 @@ import {
   runSupervisorCycle,
   type SupervisorDeps,
 } from "../scripts/loop/supervisor.ts";
-import { acquireLock, initRun, readEvents, readLedger, readLock, writeLedger, type LoopStoreDeps } from "../scripts/loop/store.ts";
+import {
+  acquireLock,
+  initRun,
+  readEvents,
+  readLedger,
+  readLock,
+  runDir,
+  runEventsPath,
+  writeLedger,
+  type LoopStoreDeps,
+} from "../scripts/loop/store.ts";
 import { DEFAULT_RECOVERY_POLICY } from "../scripts/loop/recovery.ts";
 import type { ReconcileObserveDeps } from "../scripts/loop/reconcile.ts";
 import {
@@ -263,6 +276,125 @@ test("driveSupervisor executes dependency-ordered items to a terminal condition 
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "ready");
   assert.equal(finalLedger.items["200"].state, "ready");
+});
+
+// ---------------------------------------------------------------------------
+// Early run handoff seam (#665): onRunReady after lock, before first dispatch.
+// ---------------------------------------------------------------------------
+
+test("driveSupervisor fires onRunReady once after lock and before any dispatchItem (#665)", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const order: string[] = [];
+  const { observe, dispatchItem, calls } = coordinatedFakes();
+  const wrappedDispatch: SupervisorDeps["dispatchItem"] = async (request) => {
+    order.push("dispatch");
+    return dispatchItem(request);
+  };
+  let readyCtx: Awaited<Parameters<NonNullable<Parameters<typeof driveSupervisor>[1]["onRunReady"]>>[0]> | null = null;
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem: wrappedDispatch },
+    {
+      runId: "run-1",
+      engine: "claude",
+      onRunReady: async (ctx) => {
+        order.push("onRunReady");
+        readyCtx = ctx;
+      },
+    },
+  );
+
+  assert.equal(result.allDone, true);
+  assert.deepEqual(order, ["onRunReady", "dispatch"]);
+  assert.equal(calls.length, 1);
+  assert.ok(readyCtx);
+  assert.equal(readyCtx!.runId, "run-1");
+  assert.equal(readyCtx!.engine, "claude");
+  assert.equal(readyCtx!.resumed, false);
+  assert.equal(readyCtx!.runDir, runDir(deps, "run-1"));
+  assert.equal(readyCtx!.events, runEventsPath(deps, "run-1"));
+  assert.ok(path.isAbsolute(readyCtx!.runDir));
+  assert.ok(path.isAbsolute(readyCtx!.events));
+  assert.ok(readyCtx!.events.endsWith("/events.jsonl"));
+});
+
+test("driveSupervisor onRunReady reports resumed:true under --resume (#665)", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  // Item already done so resume attaches, fires onRunReady, and exits without dispatch.
+  const ledger = testLedger({ "100": itemEntry("100", "ready") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem, calls } = coordinatedFakes();
+  let resumed: boolean | null = null;
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem },
+    {
+      runId: "run-1",
+      engine: "claude",
+      resume: true,
+      onRunReady: async (ctx) => {
+        resumed = ctx.resumed;
+      },
+    },
+  );
+
+  assert.equal(result.resumed, true);
+  assert.equal(resumed, true);
+  assert.equal(calls.length, 0, "already-done run should not dispatch");
+});
+
+test("driveSupervisor does not fire onRunReady when lock acquisition fails (#665)", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  // Hold the lock as a live process so non-resume attach fails.
+  await acquireLock(deps, "run-1", "codex");
+  let readyCalls = 0;
+  const { observe, dispatchItem } = coordinatedFakes();
+
+  await assert.rejects(
+    () =>
+      driveSupervisor(
+        { store: deps, observe, dispatchItem },
+        {
+          runId: "run-1",
+          engine: "claude",
+          onRunReady: async () => {
+            readyCalls++;
+          },
+        },
+      ),
+    /already locked/,
+  );
+  assert.equal(readyCalls, 0);
+});
+
+test("driveSupervisor releases the exclusive lock when onRunReady throws (#665)", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem, calls } = coordinatedFakes();
+
+  await assert.rejects(
+    () =>
+      driveSupervisor(
+        { store: deps, observe, dispatchItem },
+        {
+          runId: "run-1",
+          engine: "claude",
+          onRunReady: async () => {
+            throw new Error("EPIPE: broken pipe");
+          },
+        },
+      ),
+    /EPIPE: broken pipe/,
+  );
+  assert.equal(calls.length, 0, "dispatch must not run after handoff failure");
+  // Lock must be free so a subsequent process can acquire without takeover.
+  const lock = await readLock(deps, "run-1");
+  assert.equal(lock, null, "exclusive lock must be released when onRunReady throws");
 });
 
 // ---------------------------------------------------------------------------
@@ -2256,4 +2388,114 @@ test("regression (#581 review 2, finding b38ac1b0566a5373): a needs-human hold p
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "waiting");
   assert.equal(finalLedger.items["200"].state, "pending", "the excluded sibling is left pending, never dispatched");
+});
+
+// ---------------------------------------------------------------------------
+// Advance run-store linkage events (#667).
+// ---------------------------------------------------------------------------
+
+test("supervisor records start + terminal advance linkage with real run ids (#667)", async () => {
+  const contract = testContract({ items: [{ id: "623", depends_on: [] }] });
+  const ledger = testLedger({ "623": itemEntry("623", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem: baseDispatch } = coordinatedFakes();
+
+  const realRunId = "623-2026-07-29T13-49-56-421Z";
+  const eventsPath = `/repo/.agent-pipeline/runs/${realRunId}/events.jsonl`;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request, hooks) => {
+    await hooks?.onAdvanceLinked?.({
+      item_id: request.item_id,
+      pipeline_run_id: realRunId,
+      events: eventsPath,
+    });
+    const base = await baseDispatch(request);
+    return {
+      ...base,
+      evidence: {
+        pr_number: 7,
+        pipeline_run_id: realRunId,
+        events_path: eventsPath,
+      },
+    };
+  };
+
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  const events = await readEvents(deps, "run-1");
+  const start = events.find((e: { kind: string }) => e.kind === LOOP_ITEM_ADVANCE_LINKED) as
+    | { kind: string; data: { item_id: string; pipeline_run_id: string; events: string } }
+    | undefined;
+  const terminal = events.find((e: { kind: string }) => e.kind === LOOP_ITEM_ADVANCE_FINISHED) as
+    | { kind: string; data: { item_id: string; pipeline_run_id: string; events?: string; outcome: string } }
+    | undefined;
+
+  assert.ok(start, "start-linkage event must be durable on the loop run");
+  assert.equal(start!.data.item_id, "623");
+  assert.equal(start!.data.pipeline_run_id, realRunId);
+  assert.equal(start!.data.events, eventsPath);
+  assert.ok(!String(start!.data.pipeline_run_id).startsWith("pipeline-loop-"), "must not be synthetic-only");
+
+  assert.ok(terminal, "terminal-linkage event must be durable on the loop run");
+  assert.equal(terminal!.data.item_id, "623");
+  assert.equal(terminal!.data.pipeline_run_id, realRunId);
+  assert.equal(terminal!.data.events, eventsPath);
+  assert.equal(terminal!.data.outcome, "ready_to_deploy");
+
+  // Ordering: start before terminal for the same attempt.
+  const startIdx = events.findIndex((e: { kind: string }) => e.kind === LOOP_ITEM_ADVANCE_LINKED);
+  const endIdx = events.findIndex((e: { kind: string }) => e.kind === LOOP_ITEM_ADVANCE_FINISHED);
+  assert.ok(startIdx >= 0 && endIdx > startIdx, "start linkage must precede terminal linkage");
+});
+
+test("supervisor terminal linkage on rejected dispatch omits fabricated events path when no start pin (#667)", async () => {
+  // Concurrency + independent ownership so both items dispatch in one cycle; a single rejection
+  // is reclassified rather than rethrown (serialized default rethrows).
+  const contract = testContract({
+    concurrency: { max_concurrent: 2 },
+    items: [
+      { id: "100", depends_on: [], ownership: { exclusive: ["src/one/**"] } },
+      { id: "200", depends_on: [], ownership: { exclusive: ["src/two/**"] } },
+    ],
+  });
+  const ledger = testLedger({
+    "100": itemEntry("100", "pending"),
+    "200": itemEntry("200", "pending"),
+  });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem: baseDispatch } = coordinatedFakes();
+
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request, hooks) => {
+    if (request.item_id === "100") throw new Error("spawn failed before pin");
+    // baseDispatch marks the observe fake so transition to ready is supported.
+    await baseDispatch(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: {
+        pr_number: null,
+        pipeline_run_id: "200-2026-07-29T00-00-00-000Z",
+        events_path: "/repo/.agent-pipeline/runs/200-2026-07-29T00-00-00-000Z/events.jsonl",
+      },
+    };
+  };
+
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  const events = await readEvents(deps, "run-1");
+  const terminals = events.filter((e: { kind: string }) => e.kind === LOOP_ITEM_ADVANCE_FINISHED) as Array<{
+    data: { item_id: string; outcome: string; events?: string; pipeline_run_id?: string };
+  }>;
+  const failed = terminals.find((e) => e.data.item_id === "100");
+  assert.ok(failed, "rejected item still gets terminal linkage");
+  assert.equal(failed!.data.outcome, "failed");
+  assert.equal(failed!.data.events, undefined, "must not invent a live events path when no store was known");
+
+  const ok = terminals.find((e) => e.data.item_id === "200");
+  assert.ok(ok);
+  assert.equal(ok!.data.pipeline_run_id, "200-2026-07-29T00-00-00-000Z");
+  assert.equal(ok!.data.outcome, "ready_to_deploy");
 });

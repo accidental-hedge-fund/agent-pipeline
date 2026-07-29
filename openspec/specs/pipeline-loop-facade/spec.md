@@ -336,6 +336,94 @@ run directory, and SHALL NOT reimplement any part of the engine inside the comma
 - **AND** no second durable store SHALL be consulted except the documented read-only legacy
   import path
 
+### Requirement: The loop-execution evidence pointer SHALL name the real advance run store when one exists
+
+The `pipeline/loop-execution@1` evidence pointer returned after per-item execution SHALL
+set `pipeline_run_id` to Agent Pipeline's real per-item advance run-store identifier
+(the directory basename under `.agent-pipeline/runs/`) when that run store was pinned or
+created for the hand-off. The pointer SHALL NOT report a synthetic
+`pipeline-loop-<orchestrator-run-id>-<item-id>` string as the only `pipeline_run_id` when
+a real advance run store exists. When the absolute path to the advance `events.jsonl` is
+known, the evidence pointer SHALL carry that path in an optional absolute events field so
+orchestrators and harnesses can follow stage-level progress without re-deriving layout.
+The contract SHALL remain a whole-item hand-off: it SHALL NOT expose any per-stage verb.
+
+#### Scenario: Evidence pointer uses the real run-store id
+
+- **WHEN** per-item execution completes and the advance run store exists at
+  `.agent-pipeline/runs/<issue>-<timestamp>/`
+- **THEN** the response evidence `pipeline_run_id` SHALL equal that directory's basename
+- **AND** SHALL NOT be only a synthetic `pipeline-loop-…` identifier
+
+#### Scenario: Evidence pointer includes absolute events path when known
+
+- **WHEN** per-item execution knows the absolute filesystem path of the advance
+  `events.jsonl`
+- **THEN** the evidence pointer SHALL include that absolute path
+- **AND** a consumer SHALL be able to open the file from the pointer alone
+
+#### Scenario: Contract remains whole-item only
+
+- **WHEN** the `pipeline/loop-execution@1` contract is inspected after this change
+- **THEN** it SHALL still contain no operation that advances a single pipeline stage
+- **AND** terminal outcomes SHALL remain exactly `ready_to_deploy`,
+  `blocked_needs_human`, `failed`, and `abandoned`
+
+### Requirement: `pipeline loop` SHALL surface an early run handoff on the facade drive path
+
+The `pipeline loop` / `pipeline:loop` facade SHALL surface the early machine-readable run
+handoff defined by capability `loop-early-run-handoff` on the drive path after a successful
+preflight and a successful create-or-resume plus exclusive lock of the durable run, and
+before the first item dispatch of that process. The facade SHALL NOT delay that handoff
+until the supervisor terminal condition. The facade SHALL continue to emit the existing
+terminal drive summary when the supervisor returns, and SHALL continue to refuse preflight
+failures with non-zero exit, remediation, and zero external mutation. `--audit` SHALL remain
+read-only and SHALL NOT emit the drive handoff.
+
+#### Scenario: Facade drive path exposes handoff before dispatch
+
+- **WHEN** `/pipeline:loop` or `$pipeline:loop` (or `pipeline loop`) successfully starts or
+  resumes a durable multi-item run
+- **THEN** the facade's CLI process SHALL emit the early `loop_run_handoff` JSON on stdout
+  before the first per-item dispatch
+- **AND** the same process SHALL still emit the terminal drive summary when the run reaches
+  a terminal condition
+
+#### Scenario: Facade failure path still mutates nothing and emits no handoff
+
+- **WHEN** the facade preflight fails
+- **THEN** the command SHALL exit non-zero with remediation
+- **AND** it SHALL emit no `loop_run_handoff`
+- **AND** it SHALL leave no lock, ledger write, or GitHub mutation attributable to a drive
+
+---
+
+### Requirement: Host packaging for `pipeline:loop` SHALL NOT claim multi-item runs complete in seconds without progress follow
+
+Host packaging for `pipeline:loop` SHALL NOT claim that a multi-item durable loop drive
+“completes in seconds” or that “No Monitor” / no progress follow is needed for that drive.
+The claim applies to Claude and Codex command surfaces generated from the shared operation
+list. Packaging SHALL state that a successful drive emits an early machine-readable handoff
+containing `run_id` and the absolute `events` path so an operator or harness can follow
+structured progress for the wall-clock duration of the run. Short-lived modes that remain
+short-lived (`--audit` when it only prints a report) MAY still be described as fast,
+provided they are not conflated with the multi-item drive path.
+
+#### Scenario: Command surface no longer denies progress follow for multi-item drive
+
+- **WHEN** the generated `pipeline:loop` command documentation on either host is inspected
+- **THEN** it SHALL NOT claim that multi-item durable drive completes in seconds with no
+  Monitor or progress follow needed
+- **AND** it SHALL mention the early handoff's `run_id` and events path as the way to
+  follow progress
+
+#### Scenario: Both hosts stay aligned
+
+- **WHEN** the Claude and Codex packaging for `pipeline:loop` are compared after the change
+- **THEN** neither host SHALL reintroduce the false “completes in seconds / No Monitor
+  needed” claim for multi-item durable drive
+- **AND** both SHALL describe the same early-handoff progress-follow contract
+
 ### Requirement: Host packaging for `pipeline:loop` SHALL describe durable runs as long-running and event-followed
 
 The facade’s host packaging (generated `pipeline:loop` command docs and host skill guidance for Claude and Codex) SHALL describe multi-item durable drive and resume as long-running work that harnesses follow via the loop event stream. The packaging SHALL NOT instruct harnesses to treat drive/resume as a seconds-only synchronous command that needs no Monitor. This requirement is packaging and operator-orchestration only; it does not change preflight order, contract compilation, per-item execution through `pipeline/loop-execution@1`, or the facade’s refusal to merge.
@@ -354,4 +442,3 @@ The facade’s host packaging (generated `pipeline:loop` command docs and host s
 - **THEN** selected items SHALL still execute through the unmodified Pipeline
   state machine and evidence gates
 - **AND** the facade SHALL still perform no merge
-

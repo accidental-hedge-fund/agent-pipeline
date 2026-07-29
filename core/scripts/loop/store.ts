@@ -118,6 +118,11 @@ export function runDir(deps: Pick<LoopStoreDeps, "env" | "hostname">, runId: str
   return dir;
 }
 
+/** Absolute path to a run's `events.jsonl` under the resolved state home (#665). */
+export function runEventsPath(deps: Pick<LoopStoreDeps, "env" | "hostname">, runId: string): string {
+  return path.join(runDir(deps, runId), "events.jsonl");
+}
+
 function contractPath(dir: string): string {
   return path.join(dir, "contract.json");
 }

@@ -260,6 +260,20 @@ test("pipeline-cli: logs --events --follow is valid", () => {
   assert.deepEqual(roundTrip(["logs", "42-2026-06-16T00-00-00Z", "--events", "--follow"]), []);
 });
 
+test("pipeline-cli: loop logs --events --follow is valid on the loop allowlist (#666)", () => {
+  assert.deepEqual(roundTrip(["loop", "logs", "loop-abc", "--events", "--follow"]), []);
+});
+
+test("pipeline-cli: loop logs parses nested logs sub-verb before issue args", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "loop", "logs", "loop-abc", "--events", "--follow"]);
+  assert.equal(cmd.args[0], "loop");
+  assert.equal(cmd.args[1], "logs");
+  assert.equal(cmd.args[2], "loop-abc");
+  assert.equal(cmd.opts().events, true);
+  assert.equal(cmd.opts().follow, true);
+});
+
 test("pipeline-cli 5.8h: 'summary run-123 --dry-run' → summary entry, validateFlags returns ['dryRun']", () => {
   assert.deepEqual(roundTrip(["summary", "run-123", "--dry-run"]), ["dryRun"]);
 });

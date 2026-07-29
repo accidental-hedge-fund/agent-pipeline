@@ -35,11 +35,14 @@ import {
   readSupervisorProcess,
   recoverLock,
   releaseLock,
+  runDir,
+  runEventsPath,
   writeLedger,
   writeSupervisorProcess,
   type LoopStatus,
   type LoopStoreDeps,
 } from "./store.ts";
+import type { LoopRunReadyContext } from "./handoff.ts";
 import { reconcile, transitionItem, type ReconcileObserveDeps } from "./reconcile.ts";
 import { blockItem } from "./recovery.ts";
 import { waitItem } from "./pause.ts";
@@ -51,7 +54,54 @@ import {
   normalizeLoopOutcome,
   type LoopExecutionRequest,
   type LoopExecutionResponse,
+  type LoopTerminalOutcome,
 } from "../loop-execution-contract.ts";
+
+/** Optional hooks the production dispatch seam (or a test fake) may invoke
+ *  during a whole-item hand-off. `onAdvanceLinked` fires when the advance
+ *  run-store id is known — before or at the start of the child wait — so the
+ *  supervisor can record durable start linkage mid-flight (#667). */
+export interface DispatchItemHooks {
+  onAdvanceLinked?(linkage: {
+    item_id: string;
+    pipeline_run_id: string;
+    events: string;
+  }): void | Promise<void>;
+}
+
+/** Loop event kinds for durable advance-run join keys (#667). Kept as
+ *  module-local constants so harness consumers have stable strings without
+ *  depending on pipeline.ts. */
+export const LOOP_ITEM_ADVANCE_LINKED = "loop_item_advance_linked";
+export const LOOP_ITEM_ADVANCE_FINISHED = "loop_item_advance_finished";
+
+/** Terminal linkage payload from a successful contract response. Prefer the
+ *  real evidence ids; never invent an events path when the response omitted one. */
+export function buildTerminalLinkageFromResponse(
+  itemId: string,
+  outcome: LoopTerminalOutcome,
+  response: LoopExecutionResponse,
+): {
+  item_id: string;
+  pipeline_run_id: string;
+  outcome: LoopTerminalOutcome;
+  events?: string;
+} {
+  const payload: {
+    item_id: string;
+    pipeline_run_id: string;
+    outcome: LoopTerminalOutcome;
+    events?: string;
+  } = {
+    item_id: itemId,
+    pipeline_run_id: response.evidence.pipeline_run_id,
+    outcome,
+  };
+  if (response.evidence.events_path) {
+    payload.events = response.evidence.events_path;
+  }
+  return payload;
+}
 
 /** The default run-level cycle watchdog bound (design.md decision 2),
  *  applied when a contract predates this capability or omits the field. */
@@ -74,7 +124,13 @@ const MAX_CYCLES_SAFETY = 10_000;
 export interface SupervisorDeps {
   store: LoopStoreDeps;
   observe: ReconcileObserveDeps;
-  dispatchItem(request: LoopExecutionRequest): Promise<LoopExecutionResponse>;
+  /**
+   * Whole-item hand-off only — never a per-stage verb. The optional second
+   * `hooks` argument lets the production dispatch seam announce a pinned
+   * advance run-store id before/at the child wait so the supervisor can append
+   * start-linkage on the loop run trail (#667). Existing fakes may ignore it.
+   */
+  dispatchItem(request: LoopExecutionRequest, hooks?: DispatchItemHooks): Promise<LoopExecutionResponse>;
   /** The live changed-file-overlap seam (#530, capability
    *  `durable-run-independent-scheduler`): returns the paths an item's managed worktree actually
    *  changed versus base. Consulted only when more than one item is dispatched in the same cycle
@@ -541,7 +597,49 @@ export async function runSupervisorCycle(
       labelEventsBeforeDispatchByItem.set(itemId, events);
     }),
   );
-  const settled = await Promise.allSettled(activeItemIds.map((itemId) => deps.dispatchItem(buildRequest(itemId))));
+  // Per-item dispatch with durable advance-run linkage (#667): start linkage
+  // via `onAdvanceLinked` (before/at child wait when the run id is known),
+  // terminal linkage after the response (or rejection) settles. Both writes
+  // go through the store's `appendEvent` seam — never a second ledger.
+  const settled = await Promise.allSettled(
+    activeItemIds.map(async (itemId) => {
+      let startLinkage: { item_id: string; pipeline_run_id: string; events: string } | null = null;
+      try {
+        const response = await deps.dispatchItem(buildRequest(itemId), {
+          onAdvanceLinked: async (linkage) => {
+            startLinkage = linkage;
+            await appendEvent(deps.store, runId, token, LOOP_ITEM_ADVANCE_LINKED, {
+              item_id: linkage.item_id,
+              pipeline_run_id: linkage.pipeline_run_id,
+              events: linkage.events,
+            });
+          },
+        });
+        const outcome = normalizeLoopOutcome(response.outcome);
+        await appendEvent(deps.store, runId, token, LOOP_ITEM_ADVANCE_FINISHED, buildTerminalLinkageFromResponse(itemId, outcome, response));
+        return response;
+      } catch (err) {
+        // Rejection path: still record terminal failure linkage. When start
+        // linkage fired, echo the same ids; otherwise omit events/path so we
+        // never invent a live join to a non-existent store.
+        const terminal: {
+          item_id: string;
+          outcome: LoopTerminalOutcome;
+          pipeline_run_id?: string;
+          events?: string;
+        } = {
+          item_id: itemId,
+          outcome: "failed",
+        };
+        if (startLinkage) {
+          terminal.pipeline_run_id = startLinkage.pipeline_run_id;
+          terminal.events = startLinkage.events;
+        }
+        await appendEvent(deps.store, runId, token, LOOP_ITEM_ADVANCE_FINISHED, terminal);
+        throw err;
+      }
+    }),
+  );
 
   // With exactly one active item — the serialized default — a rejection is rethrown synchronously
   // rather than durably reclassified "failed": the durable-run-independent-scheduler spec requires
@@ -949,6 +1047,14 @@ export interface DriveSupervisorInput {
    *  true })` entry point, e.g. to inspect intermediate state between two
    *  live cycles). */
   maxCycles?: number;
+  /**
+   * Early run-ready hook (#665): fired once after exclusive lock acquisition
+   * and before any `dispatchItem` call of this process. Used by the CLI to
+   * emit a machine-readable handoff (`run_id` + absolute events path). Not
+   * invoked on attach/lock failure. Selector is left for the caller to attach
+   * — the supervisor only knows run identity.
+   */
+  onRunReady?(ctx: LoopRunReadyContext): void | Promise<void>;
 }
 
 /** Names which of the three resolved shapes a run ended in (capability
@@ -1007,6 +1113,18 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
   const cyclesSafetyCap = input.maxCyclesSafety ?? MAX_CYCLES_SAFETY;
 
   try {
+    // Advertise identity after exclusive lock, before any dispatch can block (#665).
+    // Inside try so a handoff write failure still releases the exclusive lock.
+    if (input.onRunReady) {
+      await input.onRunReady({
+        runId: input.runId,
+        runDir: runDir(deps.store, input.runId),
+        events: runEventsPath(deps.store, input.runId),
+        engine: input.engine,
+        resumed: attach.resumed,
+      });
+    }
+
     if (attach.resumed) {
       try {
         await reconcile(deps.store, deps.observe, { runId: input.runId, token, engine: input.engine });
