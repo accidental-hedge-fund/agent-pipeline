@@ -1020,18 +1020,59 @@ Set `persistent: true` and a generous `timeout_ms` (re-arm if needed). Never
 forbid Monitor or background following for drive/resume while waiting for a
 future CLI.
 
-#### d. Optional: follow active item advance events when published
+#### d. Dual-follow: MUST arm advance events after linkage (mandatory until #611)
 
-When an item's advance `run_id` is published on a loop event (dispatch→advance
-linkage), optionally follow that item's single-issue stream with the §4
-material kinds:
+When a loop event of kind `loop_item_advance_linked` (or equivalent start
+linkage) publishes an active item's advance `pipeline_run_id` and/or absolute
+advance `events` path, the harness **SHALL** arm a follow on that advance event
+stream **in addition to** the loop stream (dual-follow). This is **not**
+optional: mid-item stage progress (planning → implement → review → pre-merge)
+lives on the **advance** `events.jsonl`, not on the sparse loop stream, until
+first-class stage progress is mirrored onto the loop stream (#611; pre-merge
+density #682).
+
+**Preferred follow target** (when `pipeline_run_id` is known):
 
 ```bash
 node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs logs <advance-run-id> --events --follow
 ```
 
-If no advance `run_id` is published yet, still follow the **loop** event stream
-above — do not require a non-existent linkage field.
+The absolute `events` path from the linkage record is an acceptable alternative
+target (e.g. Monitor / `tail -F` on that file).
+
+**Before linkage exists:** continue loop-only follow — do **not** require a
+non-existent advance-linkage field.
+
+**Follow lifecycle:**
+
+1. **Arm** advance follow when linkage publishes `pipeline_run_id` / `events`.
+2. On a **new item's** advance linkage, **switch or add** follow for the new
+   advance run; **stop** the prior item's advance follow on that item's terminal
+   advance outcome (e.g. `run_complete`) rather than leaving stale follows open.
+3. Keep the **loop** event stream follow active across item boundaries until a
+   terminal loop outcome or supervisor process exit.
+
+**Material advance kinds** to surface (same spirit as single-issue §4):
+
+- `stage_start`
+- `stage_complete`
+- `pr_created`
+- `review_verdict`
+- `gate_result`
+- `blocker_set`
+- `run_complete`
+
+**Suppress** pure CI poll spam — including repeated identical
+`pre_merge.advancePolling`-style updates in the same burst (surface the first
+material stage/gate event; wait for the eventual advance/block outcome).
+
+**Loop-only follow** remains valid for schedule, hold, and terminal **loop**
+kinds (`loop_schedule_evaluated`, holds, `loop_run_stopped`, …), but is
+**insufficient alone** for mid-item stage progress until #611 ships. When #611
+makes the loop stream carry first-class stage progress, this dual-follow
+mandate **MAY** be demoted to optional / “recommended for full fidelity” in
+that same PR (with host skill + living-spec updates together). Do **not** demote
+solely for quieter notifications while the loop stream is still sparse.
 
 #### e. Push notification on material loop events
 
@@ -1058,8 +1099,11 @@ evaluations in the same burst (same spirit as suppressing
 
 #### f. Stop following
 
-Stop the Monitor when a terminal loop outcome appears — especially
-`loop_run_stopped` — or when the supervisor process exits.
+Stop the loop Monitor when a terminal loop outcome appears — especially
+`loop_run_stopped` — or when the supervisor process exits. Stop (or replace) the
+active item's advance follow on that item's terminal advance outcome when
+switching items or when the advance run completes; do not leave unbounded stale
+advance follows open.
 
 #### g. Final summary / audit
 
