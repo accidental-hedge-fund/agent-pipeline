@@ -224,9 +224,10 @@ test("realDispatchItem pins --run-id, fires start linkage, returns truthful evid
   assert.ok(!isSyntheticLoopEvidencePipelineRunId(response.evidence.pipeline_run_id));
 });
 
-test("realDispatchItem spawn failure still returns pin-based evidence when known (#667)", async () => {
+test("realDispatchItem spawn failure keeps pin id but omits live events_path (#667)", async () => {
   const fixedNow = new Date("2026-07-29T13:49:56.421Z");
   const expectedPin = pinAdvanceRunIdentity("/repo", 623, fixedNow);
+  const linked: unknown[] = [];
   const dispatch = realDispatchItem(
     { repo_dir: "/repo" } as PipelineConfig,
     "claude",
@@ -241,18 +242,40 @@ test("realDispatchItem spawn failure still returns pin-based evidence when known
       }) as typeof import("node:child_process").spawn,
     },
   );
-  const response = await dispatch({
-    schema: "pipeline/loop-execution@1",
-    item_id: "623",
-    repo: { name: "acme/w", base_branch: "main" },
-    engine: "claude",
-    worktree_policy: "default",
-    done_definition: "pipeline:ready-to-deploy",
-    run_id: "loop-run-xyz",
-  });
+  const response = await dispatch(
+    {
+      schema: "pipeline/loop-execution@1",
+      item_id: "623",
+      repo: { name: "acme/w", base_branch: "main" },
+      engine: "claude",
+      worktree_policy: "default",
+      done_definition: "pipeline:ready-to-deploy",
+      run_id: "loop-run-xyz",
+    },
+    {
+      onAdvanceLinked: async (linkage) => {
+        linked.push(linkage);
+      },
+    },
+  );
   assert.equal(response.outcome, "failed");
+  // Intended pin id is useful for traceability; must not advertise a live stream.
   assert.equal(response.evidence.pipeline_run_id, expectedPin.pipeline_run_id);
-  assert.equal(response.evidence.events_path, expectedPin.events_path);
+  assert.equal(response.evidence.events_path, undefined);
+  assert.equal(linked.length, 0, "must not publish start linkage that presents a non-existent path as live");
+});
+
+test("buildLoopEvidencePointer omits events_path when events_path_known is false (#667)", () => {
+  const pin = pinAdvanceRunIdentity("/repo", 623, new Date("2026-07-29T13:49:56.421Z"));
+  const evidence = buildLoopEvidencePointer({
+    pr_number: null,
+    item_id: "623",
+    loop_run_id: "loop-run-1",
+    pin,
+    events_path_known: false,
+  });
+  assert.equal(evidence.pipeline_run_id, pin.pipeline_run_id);
+  assert.equal(evidence.events_path, undefined);
 });
 
 // ---------------------------------------------------------------------------

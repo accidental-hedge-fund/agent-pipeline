@@ -621,19 +621,25 @@ export function isSyntheticLoopEvidencePipelineRunId(pipelineRunId: string): boo
   return pipelineRunId.startsWith("pipeline-loop-");
 }
 
-/** Map a known pin (or synthetic fallback) into a truthful evidence pointer. */
+/** Map a known pin (or synthetic fallback) into a truthful evidence pointer.
+ *  When `events_path_known` is false (spawn/init failure before a live store),
+ *  retain the intended pin id for traceability but omit `events_path` so we
+ *  never advertise a non-existent `events.jsonl` as live. */
 export function buildLoopEvidencePointer(opts: {
   pr_number: number | null;
   item_id: string;
   loop_run_id: string;
   pin?: AdvanceRunPin | null;
+  /** Default true when a pin is present. Pass false when the store was never live. */
+  events_path_known?: boolean;
   worktree_root?: string | null;
 }): LoopEvidencePointer {
   if (opts.pin) {
+    const eventsKnown = opts.events_path_known !== false;
     return {
       pr_number: opts.pr_number,
       pipeline_run_id: opts.pin.pipeline_run_id,
-      events_path: opts.pin.events_path,
+      ...(eventsKnown ? { events_path: opts.pin.events_path } : {}),
       ...(opts.worktree_root !== undefined ? { worktree_root: opts.worktree_root } : {}),
     };
   }
@@ -725,17 +731,16 @@ export function realDispatchItem(
 
   return async (request, hooks): Promise<LoopExecutionResponse> => {
     const issueNumber = Number(request.item_id);
-    // Pin before spawn so the supervisor can emit start linkage mid-wait and the
-    // child uses the same `.agent-pipeline/runs/<run-id>/` (detached-launch pattern).
+    // Pin before spawn so the child uses the same `.agent-pipeline/runs/<run-id>/`
+    // (detached-launch pattern). Start linkage is published only after the child
+    // has actually started — never on spawn/init failure with a fabricated live path.
     const pin =
       Number.isFinite(issueNumber) && issueNumber > 0
         ? pinAdvanceRunIdentity(cfg.repo_dir, issueNumber, nowFn())
         : null;
 
-    if (pin) {
-      await hooks?.onAdvanceLinked?.(buildStartLinkagePayload(request.item_id, pin));
-    }
-
+    let startLinkage: Promise<void> = Promise.resolve();
+    let childStarted = false;
     try {
       await new Promise<void>((resolve, reject) => {
         const child = spawnFn(
@@ -743,13 +748,30 @@ export function realDispatchItem(
           dispatchItemChildArgs(scriptPath, issueNumber, engine, cfg.repo_dir, pin ? { runId: pin.pipeline_run_id } : undefined),
           { stdio: "inherit" },
         );
+        const publishStartLinkage = () => {
+          if (childStarted) return;
+          childStarted = true;
+          if (pin && hooks?.onAdvanceLinked) {
+            startLinkage = Promise.resolve(
+              hooks.onAdvanceLinked(buildStartLinkagePayload(request.item_id, pin)),
+            ).then(() => undefined);
+          }
+        };
+        // Real children: 'spawn' means the process started; fire start linkage
+        // so harnesses can follow the advance trail mid-wait.
+        child.on("spawn", publishStartLinkage);
         child.on("error", reject);
-        child.on("exit", () => resolve());
+        child.on("exit", () => {
+          // Test fakes (and rare hosts) may only emit exit — treat that as
+          // started so successful waits still get start linkage + live evidence.
+          publishStartLinkage();
+          resolve();
+        });
       });
     } catch {
-      // Spawn/init failure: still return a terminal contract response with the
-      // intended pin (when known) so terminal linkage can join, without inventing
-      // a live path when no pin was possible.
+      // Spawn/init failure: retain the intended pin id for traceability when
+      // known, but omit events_path — no child created the run store. Start
+      // linkage was not published (child never started).
       return {
         schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
         item_id: request.item_id,
@@ -760,9 +782,13 @@ export function realDispatchItem(
           item_id: request.item_id,
           loop_run_id: request.run_id,
           pin,
+          events_path_known: false,
         }),
       };
     }
+    // Linkage write errors must surface separately from spawn failure — the
+    // child did start, so a failed append is not a "no store" path.
+    await startLinkage;
 
     let outcome: LoopExecutionResponse["outcome"] = "failed";
     let prNumber: number | null = null;
