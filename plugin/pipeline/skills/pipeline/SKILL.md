@@ -1022,9 +1022,15 @@ future CLI.
 
 #### d. Optional: follow active item advance events when published
 
-When an item's advance `run_id` is published on a loop event (dispatch→advance
-linkage), optionally follow that item's single-issue stream with the §4
-material kinds:
+When an item's advance run is linked (`loop_item_advance_linked` carries
+`item_id`, `pipeline_run_id`, and an absolute `events` path), **material
+pre-merge gate outcomes are already mirrored onto the loop stream** as
+`loop_item_progress` (CI waiting/pass/fail, OpenSpec archive, delta review,
+auto-fix, terminal blocked/advanced) while linkage is active — hosts do
+**not** need advance-only follow solely to learn those gate results (#682).
+
+Optionally still follow the linked advance `events.jsonl` for full-fidelity
+stage/harness detail (accounting, raw review findings, etc.):
 
 ```bash
 node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs logs <advance-run-id> --events --follow
@@ -1044,6 +1050,12 @@ above — do not require a non-existent linkage field.
 
 **Should notify** when present (not spam):
 
+- `loop_item_progress` — shared progress kind; for `domain: "pre_merge"`, notify
+  on definitive outcomes (`pass`, `fail`, `approve`, `needs_attention`,
+  `attempted`, `success`, `exhausted`, `blocked`, `advanced`) and the **first**
+  `waiting` for a CI stretch. Material pre-merge gate sub-steps (CI, OpenSpec
+  archive, delta review, auto-fix, terminal) appear on the **loop** stream
+  while the item is advance-linked — do not require advance-only logs for those.
 - `loop_schedule_evaluated` — only on a **decision change**, not every identical
   poll in a burst
 - `loop_reconciled` / `loop_merge_barrier_cleared`
@@ -1054,7 +1066,8 @@ above — do not require a non-existent linkage field.
 
 **Suppress:** pure heartbeats and repeated identical schedule/reconcile
 evaluations in the same burst (same spirit as suppressing
-`pre_merge.advancePolling` in §4).
+`pre_merge.advancePolling` in §4). Do not re-push every identical
+`loop_item_progress` CI waiting poll after the first for a stretch.
 
 #### f. Stop following
 

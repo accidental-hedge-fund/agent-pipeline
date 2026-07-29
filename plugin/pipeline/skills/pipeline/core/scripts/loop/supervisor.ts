@@ -9,6 +9,7 @@
 // SupervisorDeps seam — no real filesystem, process, network, or subprocess
 // access in unit tests.
 
+import { readFile as defaultReadFile } from "node:fs/promises";
 import {
   LOOP_CONTRACT_SCHEMA,
   LOOP_LEDGER_SCHEMA,
@@ -56,6 +57,12 @@ import {
   type LoopExecutionResponse,
   type LoopTerminalOutcome,
 } from "../loop-execution-contract.ts";
+import {
+  armProgressMirror,
+  LOOP_ITEM_PROGRESS,
+  type LoopItemProgressPayload,
+  type ProgressMirrorDeps,
+} from "./pre-merge-progress.ts";
 
 /** Optional hooks the production dispatch seam (or a test fake) may invoke
  *  during a whole-item hand-off. `onAdvanceLinked` fires when the advance
@@ -74,6 +81,9 @@ export interface DispatchItemHooks {
  *  depending on pipeline.ts. */
 export const LOOP_ITEM_ADVANCE_LINKED = "loop_item_advance_linked";
 export const LOOP_ITEM_ADVANCE_FINISHED = "loop_item_advance_finished";
+/** Shared progress kind for pre-merge gate sub-steps (#682) and future stage
+ *  progress (#611). Re-exported from the mirror module for a single name. */
+export { LOOP_ITEM_PROGRESS };
 
 /** Terminal linkage payload from a successful contract response. Prefer the
  *  real evidence ids; never invent an events path when the response omitted one. */
@@ -145,6 +155,23 @@ export interface SupervisorDeps {
    *  default — this module stays config/gh-free; the caller (e.g. `pipeline.ts`)
    *  supplies the actual auto-file behavior. */
   onDriveEnd?(result: DriveSupervisorResult): Promise<void>;
+  /**
+   * Optional pre-merge progress mirror seams (#682). When absent, production
+   * uses `fs.readFile` for the advance events path and a short poll interval.
+   * Unit tests inject a fake reader / short sleep without real FS or timers.
+   */
+  readAdvanceEventsFile?(eventsPath: string): Promise<string>;
+  progressMirrorPollMs?: number;
+  /** Override sleep used by the progress mirror (tests inject a no-op or immediate). */
+  progressMirrorSleep?(ms: number): Promise<void>;
+  /**
+   * Full override of the progress-mirror arm (tests that feed sequenced advance
+   * events without a background poll). When set, replaces `armProgressMirror`.
+   */
+  armProgressMirror?(
+    linkage: { item_id: string; pipeline_run_id: string; events?: string },
+    deps: ProgressMirrorDeps,
+  ): { stop: () => Promise<void> };
 }
 
 // ---------------------------------------------------------------------------
@@ -601,9 +628,22 @@ export async function runSupervisorCycle(
   // via `onAdvanceLinked` (before/at child wait when the run id is known),
   // terminal linkage after the response (or rejection) settles. Both writes
   // go through the store's `appendEvent` seam — never a second ledger.
+  // While linkage is active, optionally mirror material pre-merge gate
+  // outcomes onto the loop trail as `loop_item_progress` (#682).
   const settled = await Promise.allSettled(
     activeItemIds.map(async (itemId) => {
       let startLinkage: { item_id: string; pipeline_run_id: string; events: string } | null = null;
+      let progressMirror: { stop: () => Promise<void> } | null = null;
+      const stopMirror = async (): Promise<void> => {
+        if (!progressMirror) return;
+        const m = progressMirror;
+        progressMirror = null;
+        try {
+          await m.stop();
+        } catch {
+          // best-effort — never fail the advance child for mirror I/O
+        }
+      };
       try {
         const response = await deps.dispatchItem(buildRequest(itemId), {
           onAdvanceLinked: async (linkage) => {
@@ -613,12 +653,51 @@ export async function runSupervisorCycle(
               pipeline_run_id: linkage.pipeline_run_id,
               events: linkage.events,
             });
+            // Arm pre-merge progress mirror against the absolute advance events
+            // path. Append failures are non-fatal (same spirit as appendEvent).
+            if (linkage.events) {
+              const appendProgress = async (payload: LoopItemProgressPayload): Promise<void> => {
+                try {
+                  await appendEvent(deps.store, runId, token, LOOP_ITEM_PROGRESS, payload);
+                } catch {
+                  // non-fatal
+                }
+              };
+              const mirrorDeps: ProgressMirrorDeps = {
+                readAdvanceEventsFile:
+                  deps.readAdvanceEventsFile ??
+                  (async (eventsPath: string) => {
+                    try {
+                      return await defaultReadFile(eventsPath, "utf8");
+                    } catch (err) {
+                      if ((err as NodeJS.ErrnoException).code === "ENOENT") return "";
+                      throw err;
+                    }
+                  }),
+                appendProgress,
+                sleep:
+                  deps.progressMirrorSleep ??
+                  ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))),
+                pollIntervalMs: deps.progressMirrorPollMs,
+              };
+              const arm = deps.armProgressMirror ?? armProgressMirror;
+              progressMirror = arm(
+                {
+                  item_id: linkage.item_id,
+                  pipeline_run_id: linkage.pipeline_run_id,
+                  events: linkage.events,
+                },
+                mirrorDeps,
+              );
+            }
           },
         });
+        await stopMirror();
         const outcome = normalizeLoopOutcome(response.outcome);
         await appendEvent(deps.store, runId, token, LOOP_ITEM_ADVANCE_FINISHED, buildTerminalLinkageFromResponse(itemId, outcome, response));
         return response;
       } catch (err) {
+        await stopMirror();
         // Rejection path: still record terminal failure linkage. When start
         // linkage fired, echo the same ids; otherwise omit events/path so we
         // never invent a live join to a non-existent store.
