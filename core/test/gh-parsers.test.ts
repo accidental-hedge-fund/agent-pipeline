@@ -1053,3 +1053,55 @@ test("getPrForIssue: safety page bound fails visibly instead of silent null afte
     /safety bound|refusing to resolve after truncation/i,
   );
 });
+
+// #623 review-2: GraphQL error / partial envelopes must fail closed — never
+// look like an authoritative "no open PR" null (duplicate-PR / wrong-handoff).
+test("getPrForIssue: top-level GraphQL errors reject instead of returning null", async () => {
+  const run: GhApiRunner = async () =>
+    JSON.stringify({
+      data: null,
+      errors: [
+        { message: "Something went wrong while executing your query." },
+        { message: "API rate limit exceeded" },
+      ],
+    });
+  await assert.rejects(
+    () => getPrForIssue(OPEN_PR_CFG, 623, run),
+    (err: Error) => {
+      assert.match(err.message, /GraphQL errors/i);
+      assert.match(err.message, /rate limit exceeded/i);
+      return true;
+    },
+  );
+});
+
+test("getPrForIssue: null repository.pullRequests rejects instead of returning null", async () => {
+  // Access failure / missing field often yields data.repository null (or no
+  // pullRequests) without a successful empty-nodes page — must not mean "no PR".
+  const run: GhApiRunner = async () =>
+    JSON.stringify({ data: { repository: null } });
+  await assert.rejects(
+    () => getPrForIssue(OPEN_PR_CFG, 623, run),
+    /missing repository\.pullRequests|not an authoritative empty/i,
+  );
+});
+
+test("getPrForIssue: GraphQL errors with partial data still reject (fail closed)", async () => {
+  // GitHub may return partial data alongside errors; still not authoritative.
+  const run: GhApiRunner = async () =>
+    JSON.stringify({
+      data: {
+        repository: {
+          pullRequests: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: [openPrNode(9, "pipeline/623-partial")],
+          },
+        },
+      },
+      errors: [{ message: "Field 'closingIssuesReferences' resolution failed" }],
+    });
+  await assert.rejects(
+    () => getPrForIssue(OPEN_PR_CFG, 623, run),
+    /GraphQL errors/i,
+  );
+});

@@ -1294,11 +1294,29 @@ export async function getPrForIssue(
     ];
     if (after) args.push("-F", `after=${after}`);
     const stdout = await run(args);
-    const data = JSON.parse(stdout) as {
-      data: { repository: { pullRequests: OpenPrsPage } | null };
+    // Fail closed on GraphQL errors / missing connection: callers treat null as
+    // "no open PR" and may create a duplicate or hand off incorrectly (#623
+    // review-2). Partial envelopes with `errors` must not look like an
+    // exhausted open-PR set.
+    const envelope = JSON.parse(stdout) as {
+      data?: { repository?: { pullRequests?: OpenPrsPage } | null } | null;
+      errors?: Array<{ message?: string }>;
     };
-    const pullRequests = data.data.repository?.pullRequests;
-    if (!pullRequests) return null;
+    if (Array.isArray(envelope.errors) && envelope.errors.length > 0) {
+      const messages = envelope.errors
+        .map((e) => (typeof e.message === "string" && e.message ? e.message : "unknown"))
+        .join("; ");
+      throw new Error(
+        `getPrForIssue: GraphQL errors for ${cfg.repo}: ${messages}`,
+      );
+    }
+    const pullRequests = envelope.data?.repository?.pullRequests;
+    if (!pullRequests) {
+      throw new Error(
+        `getPrForIssue: GraphQL response for ${cfg.repo} missing repository.pullRequests ` +
+          `(null repository or connection — not an authoritative empty open-PR set)`,
+      );
+    }
     candidates.push(...mapOpenPrGraphQlNodes(pullRequests.nodes));
     if (!pullRequests.pageInfo.hasNextPage) {
       return resolvePrForIssue(candidates, issueNumber, cfg.repo);
