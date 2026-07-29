@@ -4,7 +4,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  isLiveOwnedLoopLock,
   isLockPidOwnedByLauncher,
+  isSameProcessInstance,
   parseLockPid,
 } from "../scripts/loop/lock-ownership.ts";
 
@@ -83,5 +85,68 @@ test("isLockPidOwnedByLauncher: cycle in parentOf does not hang", () => {
   assert.equal(
     isLockPidOwnedByLauncher(10, 99, (p) => parents.get(p) ?? null),
     false,
+  );
+});
+
+test("isSameProcessInstance: matching starttime", () => {
+  assert.equal(
+    isSameProcessInstance(42, "999", (p) => (p === 42 ? "999" : null)),
+    true,
+  );
+});
+
+test("isSameProcessInstance: PID reuse — same pid, different starttime → false", () => {
+  // Launcher had starttime 100; after exit PID 42 is reused with starttime 200.
+  assert.equal(
+    isSameProcessInstance(42, "100", (p) => (p === 42 ? "200" : null)),
+    false,
+  );
+});
+
+test("isSameProcessInstance: dead/missing process → false", () => {
+  assert.equal(isSameProcessInstance(42, "100", () => null), false);
+});
+
+test("isLiveOwnedLoopLock: accepts descendant while launcher instance is stable", () => {
+  const parents = new Map<number, number>([
+    [300, 100],
+    [100, 1],
+  ]);
+  const start = new Map<number, string>([
+    [100, "birth-A"],
+    [300, "birth-child"],
+  ]);
+  assert.equal(
+    isLiveOwnedLoopLock({
+      lockPid: 300,
+      launcherPid: 100,
+      launcherStartTime: "birth-A",
+      parentOf: (p) => parents.get(p) ?? null,
+      getStartTime: (p) => start.get(p) ?? null,
+    }),
+    true,
+  );
+});
+
+test("isLiveOwnedLoopLock: PID reuse of launcher rejects even if lock parent chain looks ok", () => {
+  // Original launcher 100 / birth-A exited; PID 100 reused as birth-B; lock held by 300→100.
+  const parents = new Map<number, number>([
+    [300, 100],
+    [100, 1],
+  ]);
+  const start = new Map<number, string>([
+    [100, "birth-B"], // reused
+    [300, "birth-child"],
+  ]);
+  assert.equal(
+    isLiveOwnedLoopLock({
+      lockPid: 300,
+      launcherPid: 100,
+      launcherStartTime: "birth-A", // captured at real launch
+      parentOf: (p) => parents.get(p) ?? null,
+      getStartTime: (p) => start.get(p) ?? null,
+    }),
+    false,
+    "must not attach after launcher PID was recycled",
   );
 });

@@ -1,7 +1,9 @@
 // Pure lock-ownership helpers for harness-side discovery of a live loop
-// supervisor (#668 pre-merge finding: unanchored PID grep can attach to the
-// wrong run; "child of LOOP_PID" must be a real parent-chain walk, not a
-// substring match).
+// supervisor (#668):
+// - unanchored PID grep can attach to the wrong run (prefix match)
+// - "child of LOOP_PID" must be a real parent-chain walk, not a substring match
+// - PID alone is not process-instance identity: after exit, a recycled PID can
+//   make kill -0 succeed for a different process (PID reuse)
 
 /**
  * Parse the numeric `pid` field from a loop `lock.json` document.
@@ -61,4 +63,46 @@ export function isLockPidOwnedByLauncher(
     cur = parent;
   }
   return false;
+}
+
+/**
+ * True when `pid` still names the same process instance that was observed at
+ * launch: `getStartTime(pid)` must equal `expectedStartTime` (e.g. Linux
+ * `/proc/<pid>/stat` starttime in clock ticks).
+ *
+ * Without this, a poll loop that only does `kill -0 $LOOP_PID` can continue
+ * after the launcher exits if the kernel reuses that PID for another process,
+ * and then attach discovery to a different loop supervisor.
+ */
+export function isSameProcessInstance(
+  pid: number,
+  expectedStartTime: string | number,
+  getStartTime: (pid: number) => string | number | null | undefined,
+): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  const expected = String(expectedStartTime);
+  if (expected === "") return false;
+  const actual = getStartTime(pid);
+  if (actual == null || actual === "") return false;
+  return String(actual) === expected;
+}
+
+/**
+ * Combined discovery guard: lock holder is the launcher or its descendant
+ * **and** the launcher process is still the same instance (pid + starttime).
+ * Use this as the sole accept criterion when polling for a loop run directory.
+ */
+export function isLiveOwnedLoopLock(opts: {
+  lockPid: number;
+  launcherPid: number;
+  launcherStartTime: string | number;
+  parentOf: (pid: number) => number | null | undefined;
+  getStartTime: (pid: number) => string | number | null | undefined;
+}): boolean {
+  if (
+    !isSameProcessInstance(opts.launcherPid, opts.launcherStartTime, opts.getStartTime)
+  ) {
+    return false;
+  }
+  return isLockPidOwnedByLauncher(opts.lockPid, opts.launcherPid, opts.parentOf);
 }

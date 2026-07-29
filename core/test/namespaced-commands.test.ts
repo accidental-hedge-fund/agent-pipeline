@@ -278,6 +278,10 @@ test("namespaced-commands 7.5b5: host loop skill ownership is exact PID, not gre
       /lock_owned_by_launcher|numeric identity only|exact integer/i.test(body),
       `${path} should document exact/numeric lock ownership (#668)`,
     );
+    assert.ok(
+      /LOOP_START|starttime|launcher_instance_alive|PID reuse/i.test(body),
+      `${path} should bind discovery to process starttime against PID reuse (#668)`,
+    );
   }
 });
 

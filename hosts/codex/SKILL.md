@@ -619,12 +619,21 @@ node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --milestone <name> \
 # or: ... loop --resume <run-id> ...
 # or: ... loop <N> <N> ...
 LOOP_PID=$!
+# Process-instance identity (Linux): /proc/<pid>/stat starttime. Required so a
+# recycled PID after launcher exit cannot keep the discovery loop alive (#668).
+process_starttime() {
+  node -e 'const fs=require("fs");const pid=process.argv[1];let s;try{s=fs.readFileSync("/proc/"+pid+"/stat","utf8");}catch{process.exit(1)}
+const i=s.lastIndexOf(")"); if(i<0)process.exit(1); const f=s.slice(i+2).trim().split(/\s+/);
+if(!f[19])process.exit(1); process.stdout.write(f[19]);' "$1" 2>/dev/null
+}
+LOOP_START=$(process_starttime "$LOOP_PID") || { echo "failed to capture launcher starttime"; wait "$LOOP_PID"; exit 1; }
 ```
 
 On a preflight failure the process exits quickly with printed remediation on
-stderr — do not start any substitute loop. If `$LOOP_PID` exits before a run
-directory is mapped, read `/tmp/pipeline-loop-$$.err` and stop. Do not leave a
-live supervisor unobserved when the Codex turn ends without an event-follow plan.
+stderr — do not start any substitute loop. If `$LOOP_PID` exits (or its
+starttime changes — PID reuse) before a run directory is mapped, read
+`/tmp/pipeline-loop-$$.err` and stop. Do not leave a live supervisor unobserved
+when the Codex turn ends without an event-follow plan.
 
 #### b. Obtain `run_id` + loop events path (before completion)
 
@@ -640,19 +649,32 @@ live supervisor unobserved when the Codex turn ends without an event-follow plan
    (ignore `.init-*` staging). Select **only** a directory that has both
    `contract.json` and `events.jsonl` **and** a live `lock.json` whose `pid`
    is **exactly** `$LOOP_PID` as an integer, **or** a process-tree **descendant**
-   of `$LOOP_PID` (walk parents of the lock pid until match). Ownership is
-   **numeric identity only** — never string/grep prefix matching (`123` must
-   **not** match lock pid `12345`). That single rule covers a newly published
-   run and selector re-drive of an already-initialized canonical run.
+   of `$LOOP_PID` (walk parents of the lock pid until match), **and** the
+   launcher is still the **same process instance** captured at launch
+   (`$LOOP_PID` + `$LOOP_START` starttime — not merely `kill -0`, which is
+   true after PID reuse). Ownership is **numeric identity only** — never
+   string/grep prefix matching (`123` must **not** match lock pid `12345`).
    **Never** break on the first newly published basename (glob order is not
    ownership). If one or more new directories exist without a lock owned by
-   `$LOOP_PID`, keep polling until a lock match appears or `$LOOP_PID` exits.
+   this launch, keep polling until a lock match appears or the launcher
+   instance is gone (exit or PID reuse).
 
 ```bash
-# Pseudocode — poll briefly (seconds, not the full run) until mapped or LOOP_PID exits.
-# Scan ALL candidates; select ONLY a run with a live lock owned by $LOOP_PID.
-# Ownership: exact integer pid equality, or lock pid is a descendant of LOOP_PID
-# (parent-chain walk). NEVER unanchored grep of "$LOOP_PID" (prefix false match).
+# Pseudocode — poll until mapped or THIS launch instance is gone.
+# NEVER unanchored grep of "$LOOP_PID" (prefix false match).
+# NEVER trust kill -0 alone (PID reuse after launcher exit).
+
+process_starttime() {
+  node -e 'const fs=require("fs");const pid=process.argv[1];let s;try{s=fs.readFileSync("/proc/"+pid+"/stat","utf8");}catch{process.exit(1)}
+const i=s.lastIndexOf(")"); if(i<0)process.exit(1); const f=s.slice(i+2).trim().split(/\s+/);
+if(!f[19])process.exit(1); process.stdout.write(f[19]);' "$1" 2>/dev/null
+}
+
+launcher_instance_alive() {
+  kill -0 "$LOOP_PID" 2>/dev/null || return 1
+  cur=$(process_starttime "$LOOP_PID") || return 1
+  [ "$cur" = "$LOOP_START" ]
+}
 
 lock_pid_from_json() {
   node -e 'const fs=require("fs");let j;try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));}catch{process.exit(2)}
@@ -678,7 +700,7 @@ lock_owned_by_launcher() {
 }
 
 RUN_ID=""
-while kill -0 "$LOOP_PID" 2>/dev/null; do
+while launcher_instance_alive; do
   for d in "$RUNS"/*; do
     [ -d "$d" ] || continue
     base=$(basename "$d")
@@ -688,6 +710,7 @@ while kill -0 "$LOOP_PID" 2>/dev/null; do
     lock_pid=$(lock_pid_from_json "$d/lock.json") || continue
     case "$lock_pid" in ''|*[!0-9]*) continue ;; esac
     kill -0 "$lock_pid" 2>/dev/null || continue
+    launcher_instance_alive || break
     if lock_owned_by_launcher "$lock_pid" "$LOOP_PID"; then
       RUN_ID=$base
       break
