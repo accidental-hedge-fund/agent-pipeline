@@ -511,6 +511,15 @@ export interface CreateWorktreeDeps {
   unlinkPath?: (p: string) => Promise<void>;
   /** Stamp the worktree as pipeline-owned (see {@link writeManagedMarker}). */
   writeManagedMarker?: (worktreePath: string) => Promise<void>;
+  /** Dirty-workdir check used before create-time reclaim (#622). */
+  hasDirtyWorkdir?: (worktreePath: string) => Promise<boolean>;
+  /** Local-only (unpushed) commit check used before create-time reclaim (#622).
+   *  Same tier results as {@link RemoveWorktreeDeps.hasLocalOnlyCommits}. */
+  hasLocalOnlyCommits?: (
+    cfg: PipelineConfig,
+    worktreePath: string | null,
+    branch: string,
+  ) => Promise<boolean | "unverifiable" | null>;
 }
 
 export async function realWriteNodeModulesExclude(worktreePath: string): Promise<void> {
@@ -651,9 +660,29 @@ export async function createWorktree(
   const lstatPathFn = deps.lstatPath ?? realLstatPath;
   const unlinkPathFn = deps.unlinkPath ?? realUnlinkPath;
   const writeManagedMarkerFn = deps.writeManagedMarker ?? writeManagedMarker;
+  const dirtyFn = deps.hasDirtyWorkdir ?? hasDirtyWorkdir;
+  const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
 
   const wtPath = worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
+
+  /** Apply operator-remove safety without force before any reclaim mutation (#622).
+   *  Throws a clear error and never calls removeFn on a blocking result. */
+  async function assertReclaimSafe(candidatePath: string, candidateBranch: string): Promise<void> {
+    const pathOnDisk = existsFn(candidatePath);
+    let dirty = false;
+    if (pathOnDisk) {
+      dirty = await dirtyFn(candidatePath);
+    }
+    const localOnly = await localOnlyFn(cfg, pathOnDisk ? candidatePath : null, candidateBranch);
+    const safety = evaluateRemoveSafety({ dirty, localOnly, force: false });
+    if (!safety.ok) {
+      throw new Error(
+        `Cannot reclaim worktree for issue #${issueNumber} at ${candidatePath} ` +
+          `(branch ${candidateBranch}): ${safety.error}`,
+      );
+    }
+  }
 
   // Reclaim this issue's existing worktree(s) BEFORE the capacity check so they
   // never block its own retry. Two interacting rules, both keyed by ISSUE
@@ -672,6 +701,10 @@ export async function createWorktree(
   // Together these close the review-2 capacity-deadlock class (stale reclaim
   // keyed to mutable slug / reclaim removes only one worktree): setup-throw,
   // setup-success-then-block, title/slug change, and multi-stale accumulation.
+  //
+  // Reclaim is never silent force-delete (#622): dirty workdirs and blocking
+  // local-only tiers refuse with a clear error (same ladder as operator remove
+  // without --force). Clean candidates may still be removed so create proceeds.
   const active = await listActiveFn(cfg);
   const mine = active.filter((r) => r.issueNumber === issueNumber && r.slug);
   for (const rec of mine) {
@@ -684,14 +717,17 @@ export async function createWorktree(
       console.log(`[pipeline] #${issueNumber}: skipping reclaim of out-of-managed-root worktree ${rec.path}`);
       continue;
     }
+    const recBranch = rec.branch ?? branchName(issueNumber, rec.slug!);
+    await assertReclaimSafe(rec.path, recBranch);
     // Pass rec.path so removal targets the discovered path directly, not a path
     // recomputed from cfg.repo_dir (which is wrong when launched from a linked worktree).
     await removeFn(cfg, issueNumber, rec.slug!, rec.path);
   }
   // Also clear any directory left at the *current* slug path that listActive did
   // not classify as active (e.g. a closed/terminal lookup) so the
-  // `git worktree add` below cannot collide with it.
+  // `git worktree add` below cannot collide with it. Same safety gates as above.
   if (existsFn(wtPath) && !mine.some((r) => r.slug === slug)) {
+    await assertReclaimSafe(wtPath, branch);
     await removeFn(cfg, issueNumber, slug);
   }
 
@@ -1003,8 +1039,75 @@ export async function hasCommitsAhead(cwd: string, baseBranch: string): Promise<
 }
 
 // ---------------------------------------------------------------------------
-// Per-issue worktree removal (#296)
+// Per-issue worktree removal (#296) + shared pre-remove safety (#622)
 // ---------------------------------------------------------------------------
+
+/** Local-only (unpushed) commit verification tier — shared by operator remove
+ *  and create-time reclaim. */
+export type LocalOnlyCommitResult = boolean | "unverifiable" | null;
+
+export type RemoveSafetyInput = {
+  /** Whether the workdir is dirty (ignored when path is not on disk). */
+  dirty: boolean;
+  /** Result of local-only commit verification. */
+  localOnly: LocalOnlyCommitResult;
+  /** Operator `--force`. Reclaim always passes false. */
+  force: boolean;
+};
+
+export type RemoveSafetyResult =
+  | { ok: true }
+  | { ok: false; error: string; blockReason: "local-only" | "unverifiable" | "verification-failed" | "dirty" };
+
+/**
+ * Pure pre-remove safety ladder shared by `removeWorktreeForIssue` and
+ * create-time reclaim (#622). Encodes the operator remove tier table once so
+ * the two paths cannot drift:
+ *
+ *  - localOnly `true` → always block (even with force)
+ *  - localOnly `"unverifiable"` → block without force; allow with force
+ *  - localOnly `null` → always block (verification hard-failure)
+ *  - dirty without force → block
+ *  - otherwise → ok to remove
+ *
+ * Free of git/network side effects: consumes already-computed inputs only.
+ * Order matches operator remove: local-only is evaluated before dirty so dirty
+ * state does not hide unpushed commits.
+ */
+export function evaluateRemoveSafety(input: RemoveSafetyInput): RemoveSafetyResult {
+  const { dirty, localOnly, force } = input;
+  if (localOnly === true) {
+    return {
+      ok: false,
+      error: "branch has local-only commits not pushed to remote; push first",
+      blockReason: "local-only",
+    };
+  }
+  if (localOnly === "unverifiable" && !force) {
+    return {
+      ok: false,
+      error:
+        "cannot verify all commits are merged (remote branch deleted, commits not reachable from base); " +
+        "use --force to proceed if work was squash-merged",
+      blockReason: "unverifiable",
+    };
+  }
+  if (localOnly === null) {
+    return {
+      ok: false,
+      error: "commit verification failed (git/network/auth error); check connectivity and retry",
+      blockReason: "verification-failed",
+    };
+  }
+  if (dirty && !force) {
+    return {
+      ok: false,
+      error: "uncommitted changes; use --force to discard",
+      blockReason: "dirty",
+    };
+  }
+  return { ok: true };
+}
 
 export interface RemoveWorktreeResult {
   removed: boolean;
@@ -1247,52 +1350,19 @@ export async function removeWorktreeForIssue(
     dirty = await dirtyFn(worktreeP);
   }
 
-  // Guard against silently losing local-only commits. Runs always — before the
-  // dirty early-return so dirty state does not hide unpushed commits.
-  // Two tiers:
-  //   true  → definitively has unpushed commits; blocked even with --force.
-  //   null  → cannot verify (e.g. stale remote, squash-merge); blocked without
-  //            --force, allowed with --force (user takes explicit responsibility).
+  // Shared pre-remove safety ladder (#622): local-only tiers + dirty/force.
   // Pass null when path is absent so the impl uses the branch-ref fallback.
+  // Local-only is evaluated before dirty so dirty state does not hide unpushed
+  // commits (see evaluateRemoveSafety).
   const localOnly = await localOnlyFn(cfg, pathOnDisk ? worktreeP : null, branch);
-  if (localOnly === true) {
+  const safety = evaluateRemoveSafety({ dirty, localOnly, force: !!opts.force });
+  if (!safety.ok) {
     return {
       removed: false,
-      dirty,
+      dirty: safety.blockReason === "dirty" ? true : dirty,
       branch,
       worktree: worktreeP,
-      error: "branch has local-only commits not pushed to remote; push first",
-    };
-  }
-  if (localOnly === "unverifiable" && !opts.force) {
-    // Remote branch deleted + commits not in base branch (squash-merge ambiguity).
-    // Blocked without --force; with --force the user takes explicit responsibility.
-    return {
-      removed: false,
-      dirty,
-      branch,
-      worktree: worktreeP,
-      error: "cannot verify all commits are merged (remote branch deleted, commits not reachable from base); use --force to proceed if work was squash-merged",
-    };
-  }
-  if (localOnly === null) {
-    // Hard failure: network/auth/stale-ref/git error — blocked even with --force.
-    return {
-      removed: false,
-      dirty,
-      branch,
-      worktree: worktreeP,
-      error: "commit verification failed (git/network/auth error); check connectivity and retry",
-    };
-  }
-
-  if (dirty && !opts.force) {
-    return {
-      removed: false,
-      dirty: true,
-      branch,
-      worktree: worktreeP,
-      error: "uncommitted changes; use --force to discard",
+      error: safety.error,
     };
   }
 
