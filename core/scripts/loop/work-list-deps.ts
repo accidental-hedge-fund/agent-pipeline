@@ -232,11 +232,27 @@ async function loadRoadmapEdges(
   }
 }
 
+/** Page size for GraphQL `Issue.blockedBy` (GitHub connection default max is 100). */
+const BLOCKED_BY_PAGE_SIZE = 100;
+/**
+ * Safety bound only — 50 pages × 100 = 5000 native blockers per issue, far above
+ * realistic dependency fan-in. Hitting the bound without exhausting pages fails
+ * visibly rather than treating a truncated list as authoritative (#615).
+ */
+const BLOCKED_BY_MAX_PAGES = 50;
+
 const ISSUE_DEP_SOURCES_QUERY =
-  "query($owner:String!,$repo:String!,$n:Int!){" +
+  "query($owner:String!,$repo:String!,$n:Int!,$after:String){" +
   "repository(owner:$owner,name:$repo){issue(number:$n){" +
-  "title body blockedBy(first:100){nodes{... on Issue{number}}}" +
-  "}}}";
+  "title body " +
+  `blockedBy(first:${BLOCKED_BY_PAGE_SIZE},after:$after){` +
+  "pageInfo{hasNextPage endCursor}nodes{... on Issue{number}}" +
+  "}}}}";
+
+interface BlockedByPage {
+  pageInfo?: { hasNextPage?: boolean; endCursor?: string | null } | null;
+  nodes?: Array<{ number?: number } | null> | null;
+}
 
 interface IssueDepSourcesPayload {
   data?: {
@@ -244,18 +260,32 @@ interface IssueDepSourcesPayload {
       issue?: {
         title?: string | null;
         body?: string | null;
-        blockedBy?: { nodes?: Array<{ number?: number } | null> | null } | null;
+        blockedBy?: BlockedByPage | null;
       } | null;
     } | null;
   };
   errors?: unknown[];
 }
 
+/** Collect valid positive issue numbers from a blockedBy page, first-seen order. */
+export function collectBlockedByIssueNumbers(
+  nodes: BlockedByPage["nodes"],
+  seen: Set<number>,
+  out: number[],
+): void {
+  for (const node of nodes ?? []) {
+    const n = node?.number;
+    if (typeof n !== "number" || n <= 0 || seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+}
+
 /**
  * Production discovery seam: loads title/body + native blockedBy via GraphQL
- * (one request per issue, cached). Falls back to REST `getIssueDetail` for text
- * when GraphQL is unavailable. Roadmap edges default to none unless the caller
- * injects `getRoadmapDeclaredEdges`.
+ * (paginated `blockedBy` until exhausted, cached). Falls back to REST
+ * `getIssueDetail` for text when GraphQL is unavailable. Roadmap edges default
+ * to none unless the caller injects `getRoadmapDeclaredEdges`.
  */
 export function realWorkListDependencyDiscoverDeps(
   cfg: PipelineConfig,
@@ -281,7 +311,33 @@ export function realWorkListDependencyDiscoverDeps(
     }
 
     try {
-      const stdout = await runGhApi([
+      const cached = await loadViaGraphql(owner, repoName, issueNumber);
+      cache.set(issueNumber, cached);
+      return cached;
+    } catch (err) {
+      // Truncation / incomplete discovery must not become "empty blockedBy".
+      if (err instanceof Error && err.message.includes("blockedBy pagination")) {
+        throw err;
+      }
+      const fallback = await loadViaRest(issueNumber);
+      cache.set(issueNumber, fallback);
+      return fallback;
+    }
+  }
+
+  async function loadViaGraphql(
+    owner: string,
+    repoName: string,
+    issueNumber: number,
+  ): Promise<Cached | null> {
+    const blockedBy: number[] = [];
+    const seen = new Set<number>();
+    let after: string | null = null;
+    let title = "";
+    let body = "";
+
+    for (let page = 0; page < BLOCKED_BY_MAX_PAGES; page++) {
+      const args = [
         "api",
         "graphql",
         "-f",
@@ -292,34 +348,44 @@ export function realWorkListDependencyDiscoverDeps(
         `repo=${repoName}`,
         "-F",
         `n=${issueNumber}`,
-      ]);
+      ];
+      if (after) args.push("-F", `after=${after}`);
+
+      const stdout = await runGhApi(args);
       const payload = JSON.parse(stdout) as IssueDepSourcesPayload;
       if (payload.errors && Array.isArray(payload.errors) && payload.errors.length > 0) {
-        // Fall back to REST for text only.
-        const fallback = await loadViaRest(issueNumber);
-        cache.set(issueNumber, fallback);
-        return fallback;
+        // GraphQL unavailable for this issue — fall back to REST for text only.
+        // Throw so the outer catch can REST-fallback without caching a partial page.
+        throw new Error(
+          `GraphQL errors loading issue #${issueNumber} dependency sources`,
+        );
       }
       const issue = payload.data?.repository?.issue;
       if (!issue) {
-        cache.set(issueNumber, null);
         return null;
       }
-      const blockedBy = (issue.blockedBy?.nodes ?? [])
-        .map((n) => n?.number)
-        .filter((n): n is number => typeof n === "number" && n > 0);
-      const cached: Cached = {
-        title: issue.title ?? "",
-        body: issue.body ?? "",
-        blockedBy,
-      };
-      cache.set(issueNumber, cached);
-      return cached;
-    } catch {
-      const fallback = await loadViaRest(issueNumber);
-      cache.set(issueNumber, fallback);
-      return fallback;
+      if (page === 0) {
+        title = issue.title ?? "";
+        body = issue.body ?? "";
+      }
+      const connection = issue.blockedBy;
+      collectBlockedByIssueNumbers(connection?.nodes, seen, blockedBy);
+      if (!connection?.pageInfo?.hasNextPage) {
+        return { title, body, blockedBy };
+      }
+      after = connection.pageInfo.endCursor ?? null;
+      if (!after) {
+        // hasNextPage without a cursor is not an authoritative full set.
+        throw new Error(
+          `blockedBy pagination for issue #${issueNumber}: hasNextPage without endCursor`,
+        );
+      }
     }
+
+    throw new Error(
+      `blockedBy pagination for issue #${issueNumber} exceeded safety bound ` +
+        `(${BLOCKED_BY_MAX_PAGES} pages × ${BLOCKED_BY_PAGE_SIZE}); refusing truncated result`,
+    );
   }
 
   async function loadViaRest(issueNumber: number): Promise<Cached | null> {

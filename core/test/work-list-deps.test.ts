@@ -6,9 +6,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { compileContractItems } from "../scripts/loop/dependencies.ts";
 import {
+  collectBlockedByIssueNumbers,
   discoverDeclaredDependencies,
   extractRoadmapDeclaredEdges,
   parseDeclaredDependencyIds,
+  realWorkListDependencyDiscoverDeps,
   type WorkListDependencyDiscoverDeps,
 } from "../scripts/loop/work-list-deps.ts";
 import { LoopError } from "../scripts/loop/types.ts";
@@ -482,4 +484,112 @@ test("production-path compile: roadmap-only edge becomes depends_on (no body/nat
   assert.ok(
     contract.items.findIndex((i) => i.id === "607") < contract.items.findIndex((i) => i.id === "608"),
   );
+});
+
+// ---------------------------------------------------------------------------
+// Production GraphQL blockedBy pagination (#615 / finding 623ee5cb)
+// ---------------------------------------------------------------------------
+
+function blockedByGraphqlPage(opts: {
+  title?: string;
+  body?: string;
+  numbers: number[];
+  hasNextPage: boolean;
+  endCursor: string | null;
+}): string {
+  return JSON.stringify({
+    data: {
+      repository: {
+        issue: {
+          title: opts.title ?? "depender",
+          body: opts.body ?? "",
+          blockedBy: {
+            pageInfo: { hasNextPage: opts.hasNextPage, endCursor: opts.endCursor },
+            nodes: opts.numbers.map((number) => ({ number })),
+          },
+        },
+      },
+    },
+  });
+}
+
+test("collectBlockedByIssueNumbers: dedupes and skips invalid nodes", () => {
+  const seen = new Set<number>();
+  const out: number[] = [];
+  collectBlockedByIssueNumbers(
+    [{ number: 1 }, { number: 2 }, { number: 1 }, null, { number: 0 }, { number: -3 }, {}],
+    seen,
+    out,
+  );
+  assert.deepEqual(out, [1, 2]);
+});
+
+test("realWorkListDependencyDiscoverDeps: paginates blockedBy past first 100 (623ee5cb)", async () => {
+  // First page: 100 blockers; second page carries #101 — a first-page-only
+  // query would silently drop 101 and treat the partial list as complete.
+  const page1Numbers = Array.from({ length: 100 }, (_, i) => i + 1);
+  const calls: string[][] = [];
+  const runGhApi = async (args: string[]): Promise<string> => {
+    calls.push([...args]);
+    // Parse after= from args (only present on page 2+).
+    let after: string | undefined;
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] === "-F" && args[i + 1]!.startsWith("after=")) {
+        after = args[i + 1]!.slice("after=".length);
+      }
+    }
+    if (!after) {
+      return blockedByGraphqlPage({
+        numbers: page1Numbers,
+        hasNextPage: true,
+        endCursor: "cursor-page-1",
+      });
+    }
+    assert.equal(after, "cursor-page-1");
+    return blockedByGraphqlPage({
+      numbers: [101, 50], // 50 already on page 1 — must dedupe
+      hasNextPage: false,
+      endCursor: "cursor-page-2",
+    });
+  };
+
+  const deps = realWorkListDependencyDiscoverDeps(fakeCfg(), { runGhApi });
+  const blockedBy = await deps.getBlockedByIssueNumbers(608);
+  assert.ok(blockedBy);
+  assert.equal(blockedBy.length, 101, "must include the blocker beyond the first page");
+  assert.equal(blockedBy[0], 1);
+  assert.equal(blockedBy[99], 100);
+  assert.equal(blockedBy[100], 101);
+  assert.ok(!blockedBy.includes(50) || blockedBy.filter((n) => n === 50).length === 1);
+  assert.equal(calls.length, 2, "must issue a follow-up cursor query");
+
+  // Discovery union path also sees the beyond-first-page id.
+  const raw = await discoverDeclaredDependencies(["608"], deps);
+  assert.ok(raw[0]!.depends_on.includes("101"));
+  assert.ok(raw[0]!.depends_on.includes("1"));
+});
+
+test("realWorkListDependencyDiscoverDeps: single-page blockedBy needs no after cursor", async () => {
+  let calls = 0;
+  const runGhApi = async (args: string[]): Promise<string> => {
+    calls += 1;
+    for (let i = 0; i < args.length - 1; i++) {
+      assert.ok(
+        !(args[i] === "-F" && args[i + 1]!.startsWith("after=")),
+        "first/only page must not send after=",
+      );
+    }
+    return blockedByGraphqlPage({
+      title: "x",
+      body: "Depends on #1.", // lexical still parsed separately; native is 7
+      numbers: [7],
+      hasNextPage: false,
+      endCursor: null,
+    });
+  };
+  const deps = realWorkListDependencyDiscoverDeps(fakeCfg(), { runGhApi });
+  assert.deepEqual(await deps.getBlockedByIssueNumbers(9), [7]);
+  const text = await deps.getIssueTitleBody(9);
+  assert.deepEqual(text, { title: "x", body: "Depends on #1." });
+  assert.equal(calls, 1);
 });
