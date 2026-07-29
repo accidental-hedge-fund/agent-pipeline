@@ -22,6 +22,7 @@
 - [x] 4.2 Unit tests for dispatch seam with injected fakes: start callback fires with real ids; terminal response evidence is truthful
 - [x] 4.3 Supervisor unit tests with fake `dispatchItem` / store: start and end linkage events appear with matching ids and outcome
 - [x] 4.4 Prove the regression bites: without the fix, at least one assertion on real `pipeline_run_id` fails against synthetic `pipeline-loop-…` evidence
+- [x] 4.5 Regression: spawn then exit before store init omits start linkage and live `events_path`; mid-wait store ready publishes start linkage once confirmed
 
 ## 5. Mirror, CI, and validation
 

@@ -5,22 +5,26 @@
 The durable loop SHALL record a durable, machine-readable advance-run linkage on the
 loop run's event trail (or an equivalent durable handoff field in the loop run
 directory) when it dispatches an item through `pipeline/loop-execution@1` and the
-per-item advance run-store identity is known (including when the parent pins the run id
-before spawn). That record SHALL be written before or at the start of the child wait
+per-item advance run-store identity is known **and the advance run store has been
+confirmed initialized** (including when the parent pins the run id before spawn and
+later observes the pinned `events.jsonl`). That record SHALL be written during the
+child wait once the store is confirmed (or at exit if confirmation only lands then)
 and SHALL include at least: `item_id`, the real advance `pipeline_run_id` (the basename
 of `.agent-pipeline/runs/<run-id>/`), and the absolute path to that run's
 `events.jsonl` when the path is known. The record SHALL NOT use a synthetic
 `pipeline-loop-<loop-run-id>-<item-id>` string as the only join key when a real run
-store id is known.
+store id is known. Bare OS-level process spawn SHALL NOT be treated as proof that the
+run store exists.
 
 #### Scenario: Start linkage carries real run id and events path
 
-- **WHEN** the loop dispatches item `623` and pins or otherwise knows advance run id
+- **WHEN** the loop dispatches item `623` and pins advance run id
   `623-2026-07-29T13-49-56-421Z` under the resolved repo root
-- **THEN** a durable loop-run record SHALL exist before or at the start of the child wait
-  with `item_id` equal to the dispatched item, `pipeline_run_id` equal to
-  `623-2026-07-29T13-49-56-421Z`, and an absolute `events` path ending in that run's
-  `events.jsonl`
+- **AND** the pinned advance run store is confirmed initialized (its `events.jsonl` exists)
+- **THEN** a durable loop-run record SHALL exist during the child wait (or at exit if
+  confirmation only lands then) with `item_id` equal to the dispatched item,
+  `pipeline_run_id` equal to `623-2026-07-29T13-49-56-421Z`, and an absolute `events`
+  path ending in that run's `events.jsonl`
 - **AND** that `pipeline_run_id` SHALL NOT be only a synthetic `pipeline-loop-…` string
 
 #### Scenario: A harness discovers the advance events path from loop events alone
@@ -31,11 +35,14 @@ store id is known.
   start-linkage record without parsing terminal prose and without scanning every
   `.agent-pipeline/runs/*` directory by mtime
 
-#### Scenario: Start linkage is omitted only when no run store can be known yet
+#### Scenario: Start linkage is omitted when no live run store is confirmed
 
 - **WHEN** dispatch fails before any advance run-store id can be pinned or discovered
+- **OR WHEN** a pin is computed but the child exits before initializing the
+  advance run store (`events.jsonl` never appears)
 - **THEN** the loop SHALL NOT invent an absolute events path that points at a
   non-existent directory as live proof
+- **AND** the loop SHALL NOT emit start linkage that presents that path as live
 - **AND** terminal failure linkage (see end-linkage requirement) SHALL still be
   recordable without a fabricated live path
 

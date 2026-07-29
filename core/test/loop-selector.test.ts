@@ -175,6 +175,8 @@ test("realDispatchItem pins --run-id, fires start linkage, returns truthful evid
       now: () => fixedNow,
       scriptPath: "/path/to/pipeline.ts",
       execPath: "/usr/bin/node",
+      // Store confirmed initialized — required for start linkage + live events_path.
+      eventsPathExists: (p) => p === expectedPin.events_path,
       spawn: ((cmd: string, args: readonly string[]) => {
         spawned.push({ cmd, args: [...args] });
         return fakeSpawnChild();
@@ -235,6 +237,7 @@ test("realDispatchItem spawn failure keeps pin id but omits live events_path (#6
       now: () => fixedNow,
       scriptPath: "/path/to/pipeline.ts",
       execPath: "/usr/bin/node",
+      eventsPathExists: () => false,
       spawn: (() => {
         const ee = new EventEmitter() as ChildProcess;
         queueMicrotask(() => ee.emit("error", new Error("spawn ENOENT")));
@@ -263,6 +266,118 @@ test("realDispatchItem spawn failure keeps pin id but omits live events_path (#6
   assert.equal(response.evidence.pipeline_run_id, expectedPin.pipeline_run_id);
   assert.equal(response.evidence.events_path, undefined);
   assert.equal(linked.length, 0, "must not publish start linkage that presents a non-existent path as live");
+});
+
+test("realDispatchItem spawn-then-exit without store omits start linkage and events_path (#667)", async () => {
+  // Regression (review 2): Node `spawn` only proves the OS launched the binary —
+  // not that initRunDir / events.jsonl succeeded. Publishing linkage on bare
+  // spawn (or exit-only) advertises a nonexistent stream.
+  const fixedNow = new Date("2026-07-29T13:49:56.421Z");
+  const expectedPin = pinAdvanceRunIdentity("/repo", 623, fixedNow);
+  const linked: unknown[] = [];
+  const dispatch = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      scriptPath: "/path/to/pipeline.ts",
+      execPath: "/usr/bin/node",
+      eventsPathExists: () => false,
+      storeReadyPollMs: 5,
+      spawn: (() => {
+        const ee = new EventEmitter() as ChildProcess;
+        queueMicrotask(() => {
+          ee.emit("spawn");
+          // Child exits before creating the run store (startup/config failure).
+          ee.emit("exit", 1, null);
+        });
+        return ee;
+      }) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () => ({ labels: [], state: "open" }) as never,
+      getPrForIssue: async () => null,
+    },
+  );
+  const response = await dispatch(
+    {
+      schema: "pipeline/loop-execution@1",
+      item_id: "623",
+      repo: { name: "acme/w", base_branch: "main" },
+      engine: "claude",
+      worktree_policy: "default",
+      done_definition: "pipeline:ready-to-deploy",
+      run_id: "loop-run-xyz",
+    },
+    {
+      onAdvanceLinked: async (linkage) => {
+        linked.push(linkage);
+      },
+    },
+  );
+  assert.equal(response.outcome, "failed");
+  assert.equal(response.evidence.pipeline_run_id, expectedPin.pipeline_run_id);
+  assert.equal(response.evidence.events_path, undefined, "must not advertise a non-existent events.jsonl as live");
+  assert.equal(linked.length, 0, "must not publish start linkage before store confirmation");
+});
+
+test("realDispatchItem publishes start linkage only after store becomes ready mid-wait (#667)", async () => {
+  const fixedNow = new Date("2026-07-29T13:49:56.421Z");
+  const expectedPin = pinAdvanceRunIdentity("/repo", 623, fixedNow);
+  const linked: { item_id: string; pipeline_run_id: string; events: string }[] = [];
+  let storeReady = false;
+  let sawStartBeforeExit = false;
+
+  const dispatch = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      scriptPath: "/path/to/pipeline.ts",
+      execPath: "/usr/bin/node",
+      eventsPathExists: () => storeReady,
+      storeReadyPollMs: 5,
+      spawn: (() => {
+        const ee = new EventEmitter() as ChildProcess;
+        queueMicrotask(() => {
+          ee.emit("spawn");
+          // Store appears mid-wait (after spawn, before exit).
+          setTimeout(() => {
+            storeReady = true;
+          }, 15);
+          setTimeout(() => {
+            sawStartBeforeExit = linked.length === 1;
+            ee.emit("exit", 0, null);
+          }, 40);
+        });
+        return ee;
+      }) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () => ({ labels: ["pipeline:ready-to-deploy"], state: "open" }) as never,
+      getPrForIssue: async () => 11,
+    },
+  );
+
+  const response = await dispatch(
+    {
+      schema: "pipeline/loop-execution@1",
+      item_id: "623",
+      repo: { name: "acme/w", base_branch: "main" },
+      engine: "claude",
+      worktree_policy: "default",
+      done_definition: "pipeline:ready-to-deploy",
+      run_id: "loop-run-xyz",
+    },
+    {
+      onAdvanceLinked: async (linkage) => {
+        linked.push(linkage);
+      },
+    },
+  );
+
+  assert.equal(linked.length, 1);
+  assert.equal(linked[0].pipeline_run_id, expectedPin.pipeline_run_id);
+  assert.equal(linked[0].events, expectedPin.events_path);
+  assert.equal(sawStartBeforeExit, true, "start linkage must fire mid-wait once the store exists");
+  assert.equal(response.evidence.events_path, expectedPin.events_path);
+  assert.equal(response.outcome, "ready_to_deploy");
 });
 
 test("buildLoopEvidencePointer omits events_path when events_path_known is false (#667)", () => {

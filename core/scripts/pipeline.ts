@@ -16,7 +16,7 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
-import { writeFileSync, readFileSync, realpathSync } from "node:fs";
+import { writeFileSync, readFileSync, realpathSync, existsSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import { Command, Option } from "commander";
@@ -715,6 +715,13 @@ export interface RealDispatchItemDeps {
   getPrForIssue?: typeof getPrForIssue;
   scriptPath?: string;
   execPath?: string;
+  /**
+   * True when the pinned advance `events.jsonl` has been created (store init).
+   * Defaults to `existsSync`. Injected so unit tests never touch the real FS.
+   */
+  eventsPathExists?: (eventsPath: string) => boolean;
+  /** Poll interval (ms) while waiting for store init during the child wait. */
+  storeReadyPollMs?: number;
 }
 
 export function realDispatchItem(
@@ -728,19 +735,35 @@ export function realDispatchItem(
   const getPrForIssueFn = deps.getPrForIssue ?? getPrForIssue;
   const scriptPath = deps.scriptPath ?? fileURLToPath(import.meta.url);
   const execPath = deps.execPath ?? process.execPath;
+  const eventsPathExistsFn = deps.eventsPathExists ?? ((p: string) => existsSync(p));
+  const storeReadyPollMs = deps.storeReadyPollMs ?? 50;
 
   return async (request, hooks): Promise<LoopExecutionResponse> => {
     const issueNumber = Number(request.item_id);
     // Pin before spawn so the child uses the same `.agent-pipeline/runs/<run-id>/`
-    // (detached-launch pattern). Start linkage is published only after the child
-    // has actually started — never on spawn/init failure with a fabricated live path.
+    // (detached-launch pattern). Start linkage + live events_path are published
+    // only after the pinned run store is confirmed initialized — never on bare
+    // `spawn` (which only proves the OS launched the executable) or on exit
+    // before initRunDir.
     const pin =
       Number.isFinite(issueNumber) && issueNumber > 0
         ? pinAdvanceRunIdentity(cfg.repo_dir, issueNumber, nowFn())
         : null;
 
     let startLinkage: Promise<void> = Promise.resolve();
-    let childStarted = false;
+    let storeReady = false;
+    const confirmStoreReady = (): boolean => {
+      if (!pin || storeReady) return storeReady;
+      if (!eventsPathExistsFn(pin.events_path)) return false;
+      storeReady = true;
+      if (hooks?.onAdvanceLinked) {
+        startLinkage = Promise.resolve(
+          hooks.onAdvanceLinked(buildStartLinkagePayload(request.item_id, pin)),
+        ).then(() => undefined);
+      }
+      return true;
+    };
+
     try {
       await new Promise<void>((resolve, reject) => {
         const child = spawnFn(
@@ -748,30 +771,49 @@ export function realDispatchItem(
           dispatchItemChildArgs(scriptPath, issueNumber, engine, cfg.repo_dir, pin ? { runId: pin.pipeline_run_id } : undefined),
           { stdio: "inherit" },
         );
-        const publishStartLinkage = () => {
-          if (childStarted) return;
-          childStarted = true;
-          if (pin && hooks?.onAdvanceLinked) {
-            startLinkage = Promise.resolve(
-              hooks.onAdvanceLinked(buildStartLinkagePayload(request.item_id, pin)),
-            ).then(() => undefined);
+        let pollTimer: ReturnType<typeof setInterval> | undefined;
+        let settled = false;
+        const stopPoll = () => {
+          if (pollTimer !== undefined) {
+            clearInterval(pollTimer);
+            pollTimer = undefined;
           }
         };
-        // Real children: 'spawn' means the process started; fire start linkage
-        // so harnesses can follow the advance trail mid-wait.
-        child.on("spawn", publishStartLinkage);
-        child.on("error", reject);
+        const startPoll = () => {
+          if (!pin || storeReady || pollTimer !== undefined) return;
+          // Immediate check, then bounded poll while the child is alive so
+          // harnesses can follow the advance trail mid-wait once init succeeds.
+          confirmStoreReady();
+          if (!storeReady) {
+            pollTimer = setInterval(() => {
+              if (confirmStoreReady()) stopPoll();
+            }, storeReadyPollMs);
+          }
+        };
+        child.on("spawn", startPoll);
+        child.on("error", (err) => {
+          stopPoll();
+          if (!settled) {
+            settled = true;
+            reject(err);
+          }
+        });
         child.on("exit", () => {
-          // Test fakes (and rare hosts) may only emit exit — treat that as
-          // started so successful waits still get start linkage + live evidence.
-          publishStartLinkage();
-          resolve();
+          stopPoll();
+          // Final confirmation: child may have created the store just before exit,
+          // or fakes may only emit `exit` (no `spawn`). Never publish start
+          // linkage / events_path without this check.
+          confirmStoreReady();
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
         });
       });
     } catch {
-      // Spawn/init failure: retain the intended pin id for traceability when
-      // known, but omit events_path — no child created the run store. Start
-      // linkage was not published (child never started).
+      // Spawn failure: retain the intended pin id for traceability when known,
+      // but omit events_path — no child created the run store. Start linkage
+      // was not published.
       return {
         schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
         item_id: request.item_id,
@@ -786,8 +828,8 @@ export function realDispatchItem(
         }),
       };
     }
-    // Linkage write errors must surface separately from spawn failure — the
-    // child did start, so a failed append is not a "no store" path.
+    // Linkage write errors must surface separately from spawn failure — when
+    // the store was confirmed, a failed append is not a "no store" path.
     await startLinkage;
 
     let outcome: LoopExecutionResponse["outcome"] = "failed";
@@ -811,6 +853,8 @@ export function realDispatchItem(
         item_id: request.item_id,
         loop_run_id: request.run_id,
         pin,
+        // Only advertise a live events path when the store was confirmed.
+        events_path_known: storeReady,
       }),
     };
   };
