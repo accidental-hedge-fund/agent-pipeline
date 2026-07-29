@@ -1018,14 +1018,13 @@ node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop logs <run_i
 ```
 
 If you arm a host Monitor instead of (or around) that CLI, do **not** leave it
-`persistent: true` past terminal — §4b.f requires same-turn teardown. A raw
-file fallback is still valid:
+`persistent: true` past terminal — §4b.f requires same-turn teardown.
 
-```bash
-# Fallback only — prefer `pipeline loop logs … --follow` (auto-exits on terminal).
-# Dual-follow / multi-stream scripts MUST exit 0 after loop_run_stopped (see §4b.f).
-tail -F "<state-home>/runs/<run_id>/events.jsonl"
-```
+**Do not** use a bare `tail -F` on `events.jsonl` as a follow fallback: it never
+exits after `loop_run_stopped`, prints no final summary, and leaves zombie
+follows. Prefer the CLI above. A raw dual-follow / multi-stream script is only
+valid when it owns and terminates its tail child, prints a final summary line,
+and **`exit 0`** after `loop_run_stopped`.
 
 Never forbid Monitor or background following for drive/resume.
 
@@ -1033,6 +1032,23 @@ Never forbid Monitor or background following for drive/resume.
 script observes `loop_run_stopped` on the loop stream, print a final summary
 line (include terminal reason when present) and **`exit 0`**. Do **not** print
 `TERMINAL` inside `while true` and keep looping — that leaves zombie follows.
+Example terminal-aware raw fallback (owns tail via process substitution; prefer
+the CLI):
+
+```bash
+# Prefer: pipeline loop logs <run_id> --events --follow  (auto-exits on terminal)
+EVENTS="<state-home>/runs/<run_id>/events.jsonl"
+while IFS= read -r line; do
+  printf '%s\n' "$line"
+  case "$line" in
+    *'"kind":"loop_run_stopped"'*|*'"kind": "loop_run_stopped"'*)
+      reason=$(printf '%s' "$line" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      echo "TERMINAL reason=${reason:-stopped}; follows stopped"
+      exit 0
+      ;;
+  esac
+done < <(tail -n +1 -F "$EVENTS")
+```
 
 #### d. Optional: follow active item advance events when published
 

@@ -275,6 +275,8 @@ test("namespaced-commands 7.5b4b: true-fast peers may still use the shared secon
 // #699: host loop orchestration must stop run-scoped follows on terminal in the
 // same turn; dual-follow must exit; one-liners must not claim unconditional
 // "no auto-exit on terminal" without documenting until-terminal default.
+// Bare `tail -F …events.jsonl` is forbidden as a documented follow command —
+// it never exits on loop_run_stopped (zombie-follow failure mode).
 test("namespaced-commands 7.5b6: host loop skill stop-on-terminal + dual-follow exit (#699)", () => {
   const repoRoot = join(__dirname, "..", "..");
   const hostSkills = [
@@ -287,9 +289,13 @@ test("namespaced-commands 7.5b6: host loop skill stop-on-terminal + dual-follow 
       /loop_run_stopped/i.test(body),
       `${skillPath} must mention loop_run_stopped`,
     );
+    // Orchestration semantics: same-turn stop of run-scoped follows on terminal
+    // (loop_run_stopped and/or supervisor exit) — not unscoped "same turn" alone.
     assert.ok(
-      /same turn|in the same harness turn|same-turn/i.test(body),
-      `${skillPath} must require same-turn stop of run-scoped follows (#699)`,
+      /(?:loop_run_stopped|supervisor(?: process)? exit)[\s\S]{0,500}(?:same turn|same-turn|in the same harness turn)|(?:same turn|same-turn|in the same harness turn)[\s\S]{0,500}(?:loop_run_stopped|supervisor)/i.test(
+        body,
+      ),
+      `${skillPath} must require same-turn stop of run-scoped follows on loop_run_stopped / supervisor exit (#699)`,
     );
     assert.ok(
       /follows stopped|follow.*stopped/i.test(body),
@@ -314,6 +320,39 @@ test("namespaced-commands 7.5b6: host loop skill stop-on-terminal + dual-follow 
     assert.ok(
       /until-terminal|exits on loop_run_stopped|exit.*loop_run_stopped/i.test(body),
       `${skillPath} must document until-terminal / exit-on-loop_run_stopped for loop logs follow (#699)`,
+    );
+    // Forbidden: bare `tail -F` on events.jsonl as a standalone follow command.
+    // Allowed only when nested in a terminal-aware wrapper (while/read + exit 0
+    // on loop_run_stopped) that owns the tail process.
+    const lines = body.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!/^\s*tail\s+(?:-n\s+\+1\s+)?-F\s+/.test(line) || !/events\.jsonl/.test(line)) {
+        continue;
+      }
+      // Standalone fence line: the whole code-fence command is only `tail -F …`
+      // (no while/read ownership on surrounding lines of the same fence).
+      let fenceStart = i;
+      while (fenceStart > 0 && !/^```/.test(lines[fenceStart - 1]!)) fenceStart--;
+      let fenceEnd = i;
+      while (fenceEnd < lines.length - 1 && !/^```/.test(lines[fenceEnd + 1]!)) fenceEnd++;
+      const fence = lines.slice(fenceStart, fenceEnd + 1).join("\n");
+      const terminalAware =
+        /\bexit 0\b/.test(fence) &&
+        (/\bwhile\b/.test(fence) || /\bread\b/.test(fence)) &&
+        /loop_run_stopped/.test(fence);
+      if (!terminalAware) {
+        assert.fail(
+          `${skillPath} documents bare tail -F on events.jsonl without terminal-aware ownership (must exit 0 after loop_run_stopped): ${line}`,
+        );
+      }
+    }
+    // Must explicitly forbid bare tail or document terminal-aware ownership.
+    assert.ok(
+      /bare `?tail -F`?|do \*\*not\*\* use a bare `?tail|owns and terminates its tail|terminal-aware/i.test(
+        body,
+      ),
+      `${skillPath} must forbid bare tail -F or require terminal-aware tail ownership (#699)`,
     );
   }
 

@@ -767,13 +767,27 @@ node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events -
 # interrupt-only dashboards: add --no-until-terminal
 ```
 
-A raw file fallback remains valid; dual-follow / multi-stream scripts **must
+**Do not** use a bare `tail -F` on `events.jsonl` as a follow fallback: it never
+exits after `loop_run_stopped`, prints no final summary, and leaves zombie
+follows. Prefer the CLI above. Dual-follow / multi-stream scripts **must
 `exit 0`** after observing `loop_run_stopped` and printing a final summary line
-(do not print `TERMINAL` inside `while true` and keep looping):
+(do not print `TERMINAL` inside `while true` and keep looping). Any raw tail
+must own and terminate its tail child on terminal. Example terminal-aware raw
+fallback (owns tail via process substitution; prefer the CLI):
 
 ```bash
-# Fallback only — prefer `pipeline loop logs … --follow` (auto-exits on terminal).
-tail -F "<state-home>/runs/<run_id>/events.jsonl"
+# Prefer: pipeline loop logs <run_id> --events --follow  (auto-exits on terminal)
+EVENTS="<state-home>/runs/<run_id>/events.jsonl"
+while IFS= read -r line; do
+  printf '%s\n' "$line"
+  case "$line" in
+    *'"kind":"loop_run_stopped"'*|*'"kind": "loop_run_stopped"'*)
+      reason=$(printf '%s' "$line" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      echo "TERMINAL reason=${reason:-stopped}; follows stopped"
+      exit 0
+      ;;
+  esac
+done < <(tail -n +1 -F "$EVENTS")
 ```
 
 Never forbid background following or event streaming for drive/resume.
