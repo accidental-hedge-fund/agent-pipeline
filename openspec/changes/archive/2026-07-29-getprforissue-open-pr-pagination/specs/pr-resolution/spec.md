@@ -1,8 +1,5 @@
-# pr-resolution Specification
+## MODIFIED Requirements
 
-## Purpose
-Authoritative issue→PR resolution shared by every pipeline stage: `getPrForIssue` maps an issue to the open PR that actually belongs to it — via pipeline branch naming or GitHub closing references — never via body-text mention.
-## Requirements
 ### Requirement: PR resolution uses branch prefix and closing references only
 `getPrForIssue` SHALL resolve the PR for an issue using exactly two strategies, in order:
 1. Head branch starts with `pipeline/<N>-` (branch-prefix match) AND the PR is not from a fork — a fork PR's head branch name can spoof the prefix.
@@ -46,6 +43,8 @@ Resolution SHALL be served from a complete open-PR candidate set that carries th
 - **WHEN** `getPrForIssue` is called from any of: status display, planning, review, pre-merge, or deploy-ready
 - **THEN** all callers SHALL receive the same authoritative resolution (branch-prefix or closing-references), never a body-text false positive
 
+## ADDED Requirements
+
 ### Requirement: Open PR resolution SHALL NOT silently truncate the open candidate set
 `getPrForIssue` SHALL NOT resolve against a silently truncated open-PR list. When more open PRs exist than fit a single list page or a fixed 100-item window, the open path SHALL continue enumerating (paginate, issue-scoped GraphQL equivalent, or a complete head/`pipeline/<N>-*` query path that still applies dual-strategy resolution) until either a matching open PR is found under the living dual strategies or open candidates are exhausted. Returning `null` solely because the matching open PR fell outside the first page or first 100 open PRs of a repo-wide scan is forbidden. Unit tests SHALL cover the beyond-first-page / beyond-100-window case via injected list or API deps (no real network).
 
@@ -64,4 +63,3 @@ Resolution SHALL be served from a complete open-PR candidate set that carries th
 #### Scenario: exhausted open candidates with no match still return null
 - **WHEN** complete open enumeration finds no branch-prefix or target-repo closing-reference match for the issue
 - **THEN** `getPrForIssue` SHALL return `null`
-
