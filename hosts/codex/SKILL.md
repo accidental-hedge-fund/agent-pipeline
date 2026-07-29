@@ -121,12 +121,18 @@ sets a stage label or merges itself; every selected item still executes
 through this skill's own state machine and evidence gates via the
 `pipeline/loop-execution@1` hand-off contract. It refuses to start (with zero
 durable writes) when Codex's built-in autonomous `/goal` mode is unavailable —
-there is no non-durable fallback loop. `--resume <run-id>` takes over a run
-whose prior supervisor is provably gone; a run whose supervisor is still alive
-is refused rather than double-driven. `--audit` renders the run's process
-identity, action-evidence timeline, and watchdog/no-progress state with zero
-durable writes. A pre-existing run created by a legacy goal-loop invocation
-remains addressable by `--resume <run-id>` (read-only import).
+there is no non-durable fallback loop. Multi-item drive is **long-running**
+(foreground for the whole wall-clock of the run): on successful create/resume
+and exclusive lock, before the first item dispatch, the CLI emits an early
+machine-readable stdout JSON line (`kind: "loop_run_handoff"`) with `run_id`
+and the absolute `events` path so a harness can follow structured progress; a
+terminal summary JSON is printed when the supervisor finishes. `--resume
+<run-id>` takes over a run whose prior supervisor is provably gone; a run
+whose supervisor is still alive is refused rather than double-driven.
+`--audit` renders the run's process identity, action-evidence timeline, and
+watchdog/no-progress state with zero durable writes (no drive handoff). A
+pre-existing run created by a legacy goal-loop invocation remains addressable
+by `--resume <run-id>` (read-only import).
 
 The native-`/goal` check never treats an absent marker in `codex --help` as
 evidence the capability is missing (a native goal mode is a slash command, not

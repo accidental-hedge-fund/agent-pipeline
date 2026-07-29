@@ -146,6 +146,11 @@ import { initRecoverableRun } from "./loop/recovery.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
 import { compileContractItems } from "./loop/dependencies.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type LoopLedger } from "./loop/types.ts";
+import {
+  formatLoopRunHandoff,
+  writeFlushedStdoutLine,
+  type LoopRunReadyContext,
+} from "./loop/handoff.ts";
 import { LOOP_EXECUTION_CONTRACT_SCHEMA, normalizeLoopOutcome, type LoopExecutionRequest, type LoopExecutionResponse } from "./loop-execution-contract.ts";
 import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
@@ -746,6 +751,12 @@ export interface RunLoopEngineInput {
    *  — {@link normalizeLoopArgs} refuses it with `--resume` or with no selector present. */
   newRun?: boolean;
   repoDir: string;
+  /**
+   * Early run-ready hook (#665): invoked once after exclusive lock and before
+   * first item dispatch. Not invoked for `--audit` or failure paths. The engine
+   * enriches supervisor context with the selector (null on bare `--resume`).
+   */
+  onRunReady?: (ctx: LoopRunReadyContext) => void | Promise<void>;
 }
 
 export type LoopEngineResult =
@@ -956,6 +967,15 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
       runId,
       engine: input.engine as LoopEngineName,
       resume: !!input.resumeRunId,
+      onRunReady: input.onRunReady
+        ? async (ctx) => {
+            // Selector is known only at the engine/CLI layer; bare --resume has none.
+            await input.onRunReady!({
+              ...ctx,
+              selector: input.resumeRunId ? null : (input.selector ?? null),
+            });
+          }
+        : undefined,
     });
     return { kind: "drive", result };
   } catch (err) {
@@ -971,6 +991,11 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
 export interface LoopCliDeps {
   runLoopPreflight: typeof runLoopPreflight;
   runLoopEngine: (input: RunLoopEngineInput) => Promise<LoopEngineResult>;
+  /**
+   * Write+flush a single stdout line (early handoff). Defaults to
+   * {@link writeFlushedStdoutLine}; tests inject a capture sink.
+   */
+  writeStdoutLine?: (line: string) => void | Promise<void>;
 }
 
 const defaultLoopCliDeps: LoopCliDeps = { runLoopPreflight, runLoopEngine: defaultRunLoopEngine };
@@ -1021,6 +1046,7 @@ export async function runLoopCommand(
     return;
   }
 
+  const writeLine = deps.writeStdoutLine ?? writeFlushedStdoutLine;
   const engineResult = await deps.runLoopEngine({
     engine,
     selector: outcome.args.selector,
@@ -1028,6 +1054,19 @@ export async function runLoopCommand(
     audit: outcome.args.audit,
     newRun: outcome.args.newRun,
     repoDir,
+    // Early handoff (#665): emit only on successful drive attach+lock, before
+    // first dispatch. Audit and preflight/engine failure paths never set this
+    // callback (audit short-circuits inside the engine before attach).
+    onRunReady: outcome.args.audit
+      ? undefined
+      : async (ctx) => {
+          const line = formatLoopRunHandoff(ctx);
+          await writeLine(line);
+          // Operator aid only — machine contract is the stdout JSON line above.
+          console.error(
+            `pipeline loop: run ready ${ctx.runId}; events ${ctx.events}`,
+          );
+        },
   });
 
   if (engineResult.kind === "error") {

@@ -35,11 +35,14 @@ import {
   readSupervisorProcess,
   recoverLock,
   releaseLock,
+  runDir,
+  runEventsPath,
   writeLedger,
   writeSupervisorProcess,
   type LoopStatus,
   type LoopStoreDeps,
 } from "./store.ts";
+import type { LoopRunReadyContext } from "./handoff.ts";
 import { reconcile, transitionItem, type ReconcileObserveDeps } from "./reconcile.ts";
 import { blockItem } from "./recovery.ts";
 import { waitItem } from "./pause.ts";
@@ -949,6 +952,14 @@ export interface DriveSupervisorInput {
    *  true })` entry point, e.g. to inspect intermediate state between two
    *  live cycles). */
   maxCycles?: number;
+  /**
+   * Early run-ready hook (#665): fired once after exclusive lock acquisition
+   * and before any `dispatchItem` call of this process. Used by the CLI to
+   * emit a machine-readable handoff (`run_id` + absolute events path). Not
+   * invoked on attach/lock failure. Selector is left for the caller to attach
+   * — the supervisor only knows run identity.
+   */
+  onRunReady?(ctx: LoopRunReadyContext): void | Promise<void>;
 }
 
 /** Names which of the three resolved shapes a run ended in (capability
@@ -1007,6 +1018,18 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
   const cyclesSafetyCap = input.maxCyclesSafety ?? MAX_CYCLES_SAFETY;
 
   try {
+    // Advertise identity after exclusive lock, before any dispatch can block (#665).
+    // Inside try so a handoff write failure still releases the exclusive lock.
+    if (input.onRunReady) {
+      await input.onRunReady({
+        runId: input.runId,
+        runDir: runDir(deps.store, input.runId),
+        events: runEventsPath(deps.store, input.runId),
+        engine: input.engine,
+        resumed: attach.resumed,
+      });
+    }
+
     if (attach.resumed) {
       try {
         await reconcile(deps.store, deps.observe, { runId: input.runId, token, engine: input.engine });
