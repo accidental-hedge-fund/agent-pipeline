@@ -9,6 +9,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT,
+  LOOP_ITEM_ADVANCE_FINISHED,
+  LOOP_ITEM_ADVANCE_LINKED,
   attachSupervisor,
   auditSupervisor,
   dominantExclusionReason,
@@ -2256,4 +2258,114 @@ test("regression (#581 review 2, finding b38ac1b0566a5373): a needs-human hold p
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "waiting");
   assert.equal(finalLedger.items["200"].state, "pending", "the excluded sibling is left pending, never dispatched");
+});
+
+// ---------------------------------------------------------------------------
+// Advance run-store linkage events (#667).
+// ---------------------------------------------------------------------------
+
+test("supervisor records start + terminal advance linkage with real run ids (#667)", async () => {
+  const contract = testContract({ items: [{ id: "623", depends_on: [] }] });
+  const ledger = testLedger({ "623": itemEntry("623", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem: baseDispatch } = coordinatedFakes();
+
+  const realRunId = "623-2026-07-29T13-49-56-421Z";
+  const eventsPath = `/repo/.agent-pipeline/runs/${realRunId}/events.jsonl`;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request, hooks) => {
+    await hooks?.onAdvanceLinked?.({
+      item_id: request.item_id,
+      pipeline_run_id: realRunId,
+      events: eventsPath,
+    });
+    const base = await baseDispatch(request);
+    return {
+      ...base,
+      evidence: {
+        pr_number: 7,
+        pipeline_run_id: realRunId,
+        events_path: eventsPath,
+      },
+    };
+  };
+
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  const events = await readEvents(deps, "run-1");
+  const start = events.find((e: { kind: string }) => e.kind === LOOP_ITEM_ADVANCE_LINKED) as
+    | { kind: string; data: { item_id: string; pipeline_run_id: string; events: string } }
+    | undefined;
+  const terminal = events.find((e: { kind: string }) => e.kind === LOOP_ITEM_ADVANCE_FINISHED) as
+    | { kind: string; data: { item_id: string; pipeline_run_id: string; events?: string; outcome: string } }
+    | undefined;
+
+  assert.ok(start, "start-linkage event must be durable on the loop run");
+  assert.equal(start!.data.item_id, "623");
+  assert.equal(start!.data.pipeline_run_id, realRunId);
+  assert.equal(start!.data.events, eventsPath);
+  assert.ok(!String(start!.data.pipeline_run_id).startsWith("pipeline-loop-"), "must not be synthetic-only");
+
+  assert.ok(terminal, "terminal-linkage event must be durable on the loop run");
+  assert.equal(terminal!.data.item_id, "623");
+  assert.equal(terminal!.data.pipeline_run_id, realRunId);
+  assert.equal(terminal!.data.events, eventsPath);
+  assert.equal(terminal!.data.outcome, "ready_to_deploy");
+
+  // Ordering: start before terminal for the same attempt.
+  const startIdx = events.findIndex((e: { kind: string }) => e.kind === LOOP_ITEM_ADVANCE_LINKED);
+  const endIdx = events.findIndex((e: { kind: string }) => e.kind === LOOP_ITEM_ADVANCE_FINISHED);
+  assert.ok(startIdx >= 0 && endIdx > startIdx, "start linkage must precede terminal linkage");
+});
+
+test("supervisor terminal linkage on rejected dispatch omits fabricated events path when no start pin (#667)", async () => {
+  // Concurrency + independent ownership so both items dispatch in one cycle; a single rejection
+  // is reclassified rather than rethrown (serialized default rethrows).
+  const contract = testContract({
+    concurrency: { max_concurrent: 2 },
+    items: [
+      { id: "100", depends_on: [], ownership: { exclusive: ["src/one/**"] } },
+      { id: "200", depends_on: [], ownership: { exclusive: ["src/two/**"] } },
+    ],
+  });
+  const ledger = testLedger({
+    "100": itemEntry("100", "pending"),
+    "200": itemEntry("200", "pending"),
+  });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem: baseDispatch } = coordinatedFakes();
+
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request, hooks) => {
+    if (request.item_id === "100") throw new Error("spawn failed before pin");
+    // baseDispatch marks the observe fake so transition to ready is supported.
+    await baseDispatch(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: {
+        pr_number: null,
+        pipeline_run_id: "200-2026-07-29T00-00-00-000Z",
+        events_path: "/repo/.agent-pipeline/runs/200-2026-07-29T00-00-00-000Z/events.jsonl",
+      },
+    };
+  };
+
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  const events = await readEvents(deps, "run-1");
+  const terminals = events.filter((e: { kind: string }) => e.kind === LOOP_ITEM_ADVANCE_FINISHED) as Array<{
+    data: { item_id: string; outcome: string; events?: string; pipeline_run_id?: string };
+  }>;
+  const failed = terminals.find((e) => e.data.item_id === "100");
+  assert.ok(failed, "rejected item still gets terminal linkage");
+  assert.equal(failed!.data.outcome, "failed");
+  assert.equal(failed!.data.events, undefined, "must not invent a live events path when no store was known");
+
+  const ok = terminals.find((e) => e.data.item_id === "200");
+  assert.ok(ok);
+  assert.equal(ok!.data.pipeline_run_id, "200-2026-07-29T00-00-00-000Z");
+  assert.equal(ok!.data.outcome, "ready_to_deploy");
 });

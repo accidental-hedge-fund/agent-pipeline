@@ -64,8 +64,18 @@ export function isLoopTerminalOutcome(value: unknown): value is LoopTerminalOutc
 export interface LoopEvidencePointer {
   /** PR number, when one exists for this item. */
   pr_number: number | null;
-  /** Agent Pipeline's own run id (`.agent-pipeline/runs/<run-id>`) for this item. */
+  /**
+   * Agent Pipeline's own advance run-store id for this item — the directory
+   * basename under `.agent-pipeline/runs/<run-id>/` when that store was pinned
+   * or created for the hand-off. When a real run store exists this MUST be that
+   * basename, not a synthetic `pipeline-loop-<orchestrator-run-id>-<item-id>`
+   * string. A synthetic id is last-resort only when no store can be established.
+   */
   pipeline_run_id: string;
+  /** Absolute path to this item's advance `events.jsonl` when known (host-local
+   *  observability). Optional so existing callers keep validating; production
+   *  dispatch sets it when the run store is pinned/known. */
+  events_path?: string | null;
   /** The managed worktree root this item's execution ran in, when the engine reports one.
    *  Optional so existing callers that predate per-item worktree reporting keep validating. */
   worktree_root?: string | null;

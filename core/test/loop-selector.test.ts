@@ -8,15 +8,24 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildLoopEvidencePointer,
+  buildStartLinkagePayload,
+  buildTerminalLinkagePayload,
   classifyDispatchOutcome,
   dispatchItemChildArgs,
   extractRoadmapSliceIssues,
+  isSyntheticLoopEvidencePipelineRunId,
+  pinAdvanceRunIdentity,
+  realDispatchItem,
   resolveSelectorIssues,
+  syntheticLoopEvidencePipelineRunId,
   type SelectorOpenIssue,
   type SelectorResolveDeps,
 } from "../scripts/pipeline.ts";
 import { BLOCKED_LABEL } from "../scripts/types.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+import { EventEmitter } from "node:events";
+import type { ChildProcess } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // classifyDispatchOutcome — the per-item advance's label/state → outcome mapping
@@ -65,6 +74,185 @@ test("dispatchItemChildArgs never passes --once: the per-item hand-off must run 
   const args = dispatchItemChildArgs("/path/to/pipeline.ts", 100, "claude", "/repo");
   assert.deepEqual(args, ["/path/to/pipeline.ts", "100", "--profile", "claude", "--repo-path", "/repo"]);
   assert.ok(!args.includes("--once"), "child argv must not contain --once");
+});
+
+test("dispatchItemChildArgs includes pinned --run-id when provided (#667)", () => {
+  const args = dispatchItemChildArgs("/path/to/pipeline.ts", 623, "codex", "/repo", {
+    runId: "623-2026-07-29T13-49-56-421Z",
+  });
+  assert.ok(!args.includes("--once"), "child argv must not contain --once");
+  const runIdIdx = args.indexOf("--run-id");
+  assert.ok(runIdIdx >= 0, "must pass --run-id when pinned");
+  assert.equal(args[runIdIdx + 1], "623-2026-07-29T13-49-56-421Z");
+});
+
+// ---------------------------------------------------------------------------
+// Advance run-store pin + evidence pointer (#667).
+// ---------------------------------------------------------------------------
+
+test("pinAdvanceRunIdentity computes real run-store basename and absolute events path", () => {
+  const pin = pinAdvanceRunIdentity("/repo/root", 623, new Date("2026-07-29T13:49:56.421Z"));
+  assert.equal(pin.pipeline_run_id, "623-2026-07-29T13-49-56-421Z");
+  assert.ok(pin.run_dir.endsWith("/.agent-pipeline/runs/623-2026-07-29T13-49-56-421Z"));
+  assert.equal(pin.events_path, `${pin.run_dir}/events.jsonl`);
+  assert.ok(!isSyntheticLoopEvidencePipelineRunId(pin.pipeline_run_id));
+});
+
+test("buildLoopEvidencePointer uses real store id when pin exists — not synthetic-only (#667)", () => {
+  const pin = pinAdvanceRunIdentity("/repo", 623, new Date("2026-07-29T13:49:56.421Z"));
+  const evidence = buildLoopEvidencePointer({
+    pr_number: 42,
+    item_id: "623",
+    loop_run_id: "loop-run-1",
+    pin,
+  });
+  assert.equal(evidence.pipeline_run_id, pin.pipeline_run_id);
+  assert.equal(evidence.events_path, pin.events_path);
+  assert.ok(!isSyntheticLoopEvidencePipelineRunId(evidence.pipeline_run_id));
+  assert.notEqual(evidence.pipeline_run_id, syntheticLoopEvidencePipelineRunId("loop-run-1", "623"));
+});
+
+test("buildLoopEvidencePointer falls back to synthetic only when no pin (#667)", () => {
+  const evidence = buildLoopEvidencePointer({
+    pr_number: null,
+    item_id: "623",
+    loop_run_id: "loop-run-1",
+    pin: null,
+  });
+  assert.equal(evidence.pipeline_run_id, "pipeline-loop-loop-run-1-623");
+  assert.equal(evidence.events_path, undefined);
+  assert.ok(isSyntheticLoopEvidencePipelineRunId(evidence.pipeline_run_id));
+});
+
+test("buildStartLinkagePayload and buildTerminalLinkagePayload carry matching ids + outcome", () => {
+  const pin = pinAdvanceRunIdentity("/repo", 623, new Date("2026-07-29T13:49:56.421Z"));
+  const start = buildStartLinkagePayload("623", pin);
+  assert.deepEqual(start, {
+    item_id: "623",
+    pipeline_run_id: pin.pipeline_run_id,
+    events: pin.events_path,
+  });
+  const terminal = buildTerminalLinkagePayload("623", "ready_to_deploy", {
+    pin,
+    loop_run_id: "loop-run-1",
+  });
+  assert.equal(terminal.item_id, "623");
+  assert.equal(terminal.pipeline_run_id, pin.pipeline_run_id);
+  assert.equal(terminal.events, pin.events_path);
+  assert.equal(terminal.outcome, "ready_to_deploy");
+});
+
+test("buildTerminalLinkagePayload without pin omits events and uses synthetic id", () => {
+  const terminal = buildTerminalLinkagePayload("623", "failed", {
+    pin: null,
+    loop_run_id: "loop-run-1",
+  });
+  assert.equal(terminal.pipeline_run_id, "pipeline-loop-loop-run-1-623");
+  assert.equal(terminal.events, undefined);
+  assert.equal(terminal.outcome, "failed");
+});
+
+// ---------------------------------------------------------------------------
+// realDispatchItem with injected spawn/gh seams (#667).
+// ---------------------------------------------------------------------------
+
+function fakeSpawnChild(): ChildProcess {
+  const ee = new EventEmitter() as ChildProcess;
+  queueMicrotask(() => ee.emit("exit", 0, null));
+  return ee;
+}
+
+test("realDispatchItem pins --run-id, fires start linkage, returns truthful evidence (#667)", async () => {
+  const spawned: { cmd: string; args: string[] }[] = [];
+  const linked: { item_id: string; pipeline_run_id: string; events: string }[] = [];
+  const fixedNow = new Date("2026-07-29T13:49:56.421Z");
+  const expectedPin = pinAdvanceRunIdentity("/repo", 623, fixedNow);
+
+  const dispatch = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      scriptPath: "/path/to/pipeline.ts",
+      execPath: "/usr/bin/node",
+      spawn: ((cmd: string, args: readonly string[]) => {
+        spawned.push({ cmd, args: [...args] });
+        return fakeSpawnChild();
+      }) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () => ({ labels: ["pipeline:ready-to-deploy"], state: "open" }) as never,
+      getPrForIssue: async () => 99,
+    },
+  );
+
+  const response = await dispatch(
+    {
+      schema: "pipeline/loop-execution@1",
+      item_id: "623",
+      repo: { name: "acme/w", base_branch: "main" },
+      engine: "claude",
+      worktree_policy: "default",
+      done_definition: "pipeline:ready-to-deploy",
+      run_id: "loop-run-xyz",
+    },
+    {
+      onAdvanceLinked: async (linkage) => {
+        linked.push(linkage);
+      },
+    },
+  );
+
+  assert.equal(spawned.length, 1);
+  assert.ok(spawned[0].args.includes("--run-id"));
+  assert.equal(spawned[0].args[spawned[0].args.indexOf("--run-id") + 1], expectedPin.pipeline_run_id);
+  assert.ok(!spawned[0].args.includes("--once"));
+
+  assert.equal(linked.length, 1);
+  assert.equal(linked[0].item_id, "623");
+  assert.equal(linked[0].pipeline_run_id, expectedPin.pipeline_run_id);
+  assert.equal(linked[0].events, expectedPin.events_path);
+
+  assert.equal(response.outcome, "ready_to_deploy");
+  assert.equal(response.evidence.pipeline_run_id, expectedPin.pipeline_run_id);
+  assert.equal(response.evidence.events_path, expectedPin.events_path);
+  assert.equal(response.evidence.pr_number, 99);
+  // Regression that bites synthetic-only evidence without the fix:
+  assert.notEqual(
+    response.evidence.pipeline_run_id,
+    syntheticLoopEvidencePipelineRunId("loop-run-xyz", "623"),
+    "evidence.pipeline_run_id must be the real store id when a pin exists, not pipeline-loop-…",
+  );
+  assert.ok(!isSyntheticLoopEvidencePipelineRunId(response.evidence.pipeline_run_id));
+});
+
+test("realDispatchItem spawn failure still returns pin-based evidence when known (#667)", async () => {
+  const fixedNow = new Date("2026-07-29T13:49:56.421Z");
+  const expectedPin = pinAdvanceRunIdentity("/repo", 623, fixedNow);
+  const dispatch = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      scriptPath: "/path/to/pipeline.ts",
+      execPath: "/usr/bin/node",
+      spawn: (() => {
+        const ee = new EventEmitter() as ChildProcess;
+        queueMicrotask(() => ee.emit("error", new Error("spawn ENOENT")));
+        return ee;
+      }) as typeof import("node:child_process").spawn,
+    },
+  );
+  const response = await dispatch({
+    schema: "pipeline/loop-execution@1",
+    item_id: "623",
+    repo: { name: "acme/w", base_branch: "main" },
+    engine: "claude",
+    worktree_policy: "default",
+    done_definition: "pipeline:ready-to-deploy",
+    run_id: "loop-run-xyz",
+  });
+  assert.equal(response.outcome, "failed");
+  assert.equal(response.evidence.pipeline_run_id, expectedPin.pipeline_run_id);
+  assert.equal(response.evidence.events_path, expectedPin.events_path);
 });
 
 // ---------------------------------------------------------------------------

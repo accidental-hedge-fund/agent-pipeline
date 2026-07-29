@@ -146,7 +146,13 @@ import { initRecoverableRun } from "./loop/recovery.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
 import { compileContractItems } from "./loop/dependencies.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type LoopLedger } from "./loop/types.ts";
-import { LOOP_EXECUTION_CONTRACT_SCHEMA, normalizeLoopOutcome, type LoopExecutionRequest, type LoopExecutionResponse } from "./loop-execution-contract.ts";
+import {
+  LOOP_EXECUTION_CONTRACT_SCHEMA,
+  normalizeLoopOutcome,
+  type LoopEvidencePointer,
+  type LoopExecutionRequest,
+  type LoopExecutionResponse,
+} from "./loop-execution-contract.ts";
 import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
   BLOCKED_LABEL,
@@ -548,10 +554,136 @@ export function compileWorkListRun(
  *  Deliberately omits `--once`: the child must run its normal advance loop
  *  to completion (a defined `pipeline/loop-execution@1` terminal outcome —
  *  ready-to-deploy, blocked, or closed), not stop after a single stage (#512
- *  review 1, finding 57fe63fa). Exported as a pure function so this contract
- *  is unit-testable without spawning a real process. */
-export function dispatchItemChildArgs(scriptPath: string, issueNumber: number, engine: LoopEngine, repoDir: string): string[] {
-  return [scriptPath, String(issueNumber), "--profile", engine, "--repo-path", repoDir];
+ *  review 1, finding 57fe63fa). Optional `runId` pins the child's
+ *  `.agent-pipeline/runs/<run-id>/` via the same internal `--run-id` flag
+ *  detached launch already uses (#667). Exported as a pure function so this
+ *  contract is unit-testable without spawning a real process. */
+export function dispatchItemChildArgs(
+  scriptPath: string,
+  issueNumber: number,
+  engine: LoopEngine,
+  repoDir: string,
+  opts?: { runId?: string },
+): string[] {
+  const args = [scriptPath, String(issueNumber), "--profile", engine, "--repo-path", repoDir];
+  if (opts?.runId) args.push("--run-id", opts.runId);
+  return args;
+}
+
+// ---------------------------------------------------------------------------
+// Loop dispatch ↔ advance run-store linkage helpers (#667).
+// ---------------------------------------------------------------------------
+
+/** Pinned advance run-store identity for one per-item hand-off. */
+export interface AdvanceRunPin {
+  /** Basename under `.agent-pipeline/runs/<run-id>/`. */
+  pipeline_run_id: string;
+  /** Absolute path of the advance run directory. */
+  run_dir: string;
+  /** Absolute path of that run's `events.jsonl`. */
+  events_path: string;
+}
+
+/** Durable start-linkage payload written on the loop run event trail. */
+export interface AdvanceStartLinkage {
+  item_id: string;
+  pipeline_run_id: string;
+  events: string;
+}
+
+/** Durable terminal-linkage payload written on the loop run event trail. */
+export interface AdvanceTerminalLinkage {
+  item_id: string;
+  pipeline_run_id: string;
+  outcome: LoopExecutionResponse["outcome"];
+  /** Absolute events path when a real pin was known; omitted when none. */
+  events?: string;
+}
+
+/** Compute a pinned advance run id + absolute paths for a repo root + issue. */
+export function pinAdvanceRunIdentity(repoDir: string, issueNumber: number, startedAt: Date): AdvanceRunPin {
+  const pipeline_run_id = runIdFor(issueNumber, startedAt);
+  const run_dir = runDirPath(repoDir, pipeline_run_id);
+  return {
+    pipeline_run_id,
+    run_dir,
+    events_path: path.join(run_dir, "events.jsonl"),
+  };
+}
+
+/** Last-resort synthetic join key when no advance run store can be established. */
+export function syntheticLoopEvidencePipelineRunId(loopRunId: string, itemId: string): string {
+  return `pipeline-loop-${loopRunId}-${itemId}`;
+}
+
+/** True when `pipeline_run_id` is the synthetic-only form (not a real store basename). */
+export function isSyntheticLoopEvidencePipelineRunId(pipelineRunId: string): boolean {
+  return pipelineRunId.startsWith("pipeline-loop-");
+}
+
+/** Map a known pin (or synthetic fallback) into a truthful evidence pointer. */
+export function buildLoopEvidencePointer(opts: {
+  pr_number: number | null;
+  item_id: string;
+  loop_run_id: string;
+  pin?: AdvanceRunPin | null;
+  worktree_root?: string | null;
+}): LoopEvidencePointer {
+  if (opts.pin) {
+    return {
+      pr_number: opts.pr_number,
+      pipeline_run_id: opts.pin.pipeline_run_id,
+      events_path: opts.pin.events_path,
+      ...(opts.worktree_root !== undefined ? { worktree_root: opts.worktree_root } : {}),
+    };
+  }
+  return {
+    pr_number: opts.pr_number,
+    pipeline_run_id: syntheticLoopEvidencePipelineRunId(opts.loop_run_id, opts.item_id),
+    ...(opts.worktree_root !== undefined ? { worktree_root: opts.worktree_root } : {}),
+  };
+}
+
+/** Start-linkage event payload for the loop run trail. */
+export function buildStartLinkagePayload(itemId: string, pin: AdvanceRunPin): AdvanceStartLinkage {
+  return {
+    item_id: itemId,
+    pipeline_run_id: pin.pipeline_run_id,
+    events: pin.events_path,
+  };
+}
+
+/** Terminal-linkage event payload. When `pin` is null/absent, falls back to a
+ *  synthetic id for traceability and omits `events` so we never claim a live
+ *  join to a non-existent path. */
+export function buildTerminalLinkagePayload(
+  itemId: string,
+  outcome: LoopExecutionResponse["outcome"],
+  opts: { pin?: AdvanceRunPin | null; loop_run_id: string; events_path?: string | null },
+): AdvanceTerminalLinkage {
+  if (opts.pin) {
+    return {
+      item_id: itemId,
+      pipeline_run_id: opts.pin.pipeline_run_id,
+      outcome,
+      events: opts.pin.events_path,
+    };
+  }
+  if (opts.events_path) {
+    // Evidence carried a real path/id without a local pin object (e.g. fake dispatch).
+    const basename = path.basename(path.dirname(opts.events_path));
+    return {
+      item_id: itemId,
+      pipeline_run_id: basename,
+      outcome,
+      events: opts.events_path,
+    };
+  }
+  return {
+    item_id: itemId,
+    pipeline_run_id: syntheticLoopEvidencePipelineRunId(opts.loop_run_id, itemId),
+    outcome,
+  };
 }
 
 /** Pure classifier for the per-item advance's terminal label/state → dispatch outcome,
@@ -568,25 +700,76 @@ export function classifyDispatchOutcome(detail: { labels: readonly string[]; sta
   return "failed";
 }
 
-export function realDispatchItem(cfg: PipelineConfig, engine: LoopEngine): SupervisorDeps["dispatchItem"] {
-  return async (request: LoopExecutionRequest): Promise<LoopExecutionResponse> => {
+/** Injectable deps for {@link realDispatchItem} — unit tests never spawn a real
+ *  process or touch live gh (#667). */
+export interface RealDispatchItemDeps {
+  spawn?: typeof spawn;
+  now?: () => Date;
+  getIssueDetail?: typeof getIssueDetail;
+  getPrForIssue?: typeof getPrForIssue;
+  scriptPath?: string;
+  execPath?: string;
+}
+
+export function realDispatchItem(
+  cfg: PipelineConfig,
+  engine: LoopEngine,
+  deps: RealDispatchItemDeps = {},
+): SupervisorDeps["dispatchItem"] {
+  const spawnFn = deps.spawn ?? spawn;
+  const nowFn = deps.now ?? (() => new Date());
+  const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
+  const getPrForIssueFn = deps.getPrForIssue ?? getPrForIssue;
+  const scriptPath = deps.scriptPath ?? fileURLToPath(import.meta.url);
+  const execPath = deps.execPath ?? process.execPath;
+
+  return async (request, hooks): Promise<LoopExecutionResponse> => {
     const issueNumber = Number(request.item_id);
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(
-        process.execPath,
-        dispatchItemChildArgs(fileURLToPath(import.meta.url), issueNumber, engine, cfg.repo_dir),
-        { stdio: "inherit" },
-      );
-      child.on("error", reject);
-      child.on("exit", () => resolve());
-    });
+    // Pin before spawn so the supervisor can emit start linkage mid-wait and the
+    // child uses the same `.agent-pipeline/runs/<run-id>/` (detached-launch pattern).
+    const pin =
+      Number.isFinite(issueNumber) && issueNumber > 0
+        ? pinAdvanceRunIdentity(cfg.repo_dir, issueNumber, nowFn())
+        : null;
+
+    if (pin) {
+      await hooks?.onAdvanceLinked?.(buildStartLinkagePayload(request.item_id, pin));
+    }
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const child = spawnFn(
+          execPath,
+          dispatchItemChildArgs(scriptPath, issueNumber, engine, cfg.repo_dir, pin ? { runId: pin.pipeline_run_id } : undefined),
+          { stdio: "inherit" },
+        );
+        child.on("error", reject);
+        child.on("exit", () => resolve());
+      });
+    } catch {
+      // Spawn/init failure: still return a terminal contract response with the
+      // intended pin (when known) so terminal linkage can join, without inventing
+      // a live path when no pin was possible.
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "failed",
+        evidence: buildLoopEvidencePointer({
+          pr_number: null,
+          item_id: request.item_id,
+          loop_run_id: request.run_id,
+          pin,
+        }),
+      };
+    }
 
     let outcome: LoopExecutionResponse["outcome"] = "failed";
     let prNumber: number | null = null;
     try {
-      const detail = await getIssueDetail(cfg, issueNumber);
+      const detail = await getIssueDetailFn(cfg, issueNumber);
       outcome = classifyDispatchOutcome(detail);
-      const pr = await getPrForIssue(cfg, issueNumber).catch(() => null);
+      const pr = await getPrForIssueFn(cfg, issueNumber).catch(() => null);
       prNumber = pr ?? null;
     } catch {
       outcome = "failed";
@@ -597,7 +780,12 @@ export function realDispatchItem(cfg: PipelineConfig, engine: LoopEngine): Super
       item_id: request.item_id,
       run_id: request.run_id,
       outcome: normalizeLoopOutcome(outcome),
-      evidence: { pr_number: prNumber, pipeline_run_id: `pipeline-loop-${request.run_id}-${request.item_id}` },
+      evidence: buildLoopEvidencePointer({
+        pr_number: prNumber,
+        item_id: request.item_id,
+        loop_run_id: request.run_id,
+        pin,
+      }),
     };
   };
 }
