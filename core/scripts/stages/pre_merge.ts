@@ -2810,17 +2810,20 @@ export async function maybeArchiveOpenspec(
       preArchiveStatus.code !== 0
         ? `git status --porcelain failed (exit ${preArchiveStatus.code}): ${(preArchiveStatus.stderr || preArchiveStatus.stdout || "(no output)").trim()}`
         : `pre-existing dirty paths:\n${preArchiveStatus.stdout.trim()}`;
+    // Workspace/git failures — not OpenSpec structural validation. Use needs-human
+    // with no finer path tag so scoreboard offramp_class maps to residual `other`
+    // (#683 review 1: dirty/status must not inflate openspec-invalid).
     await setBlockedFn(
       cfg,
       issueNumber,
       `Cannot verify a clean worktree before the OpenSpec archive, so a failed archive commit's destructive rollback could discard pre-existing work — ${detail}. Commit/stash changes (or fix the git error) and re-run.`,
       "pre-merge",
-      "openspec-invalid",
+      "needs-human",
     );
     const blockedReason =
       preArchiveStatus.code !== 0 ? "pre-archive git status failed" : "worktree dirty before archive";
     await recordDecision("fail", blockedReason);
-    return preMergeBlocked(blockedReason, "openspec-invalid");
+    return preMergeBlocked(blockedReason, "needs-human");
   }
 
   // ---- Archive-base sync guard (#579) ----

@@ -14,6 +14,7 @@ import {
   type FixCommit,
   type SpecConsistencyDeps,
 } from "../scripts/stages/pre_merge.ts";
+import { toPreMergeOfframpClass } from "../scripts/pre-merge-offramp.ts";
 import { SPEC_DIVERGENCE_CATEGORY, categoryMarker, directionMarker } from "../scripts/review-policy.ts";
 import { DELTA_REVIEW_MARKER_PREFIX } from "../scripts/stages/review.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
@@ -264,7 +265,7 @@ test("maybeArchiveOpenspec: archive succeeds but git commit fails → blocked, n
 
 test("maybeArchiveOpenspec: pre-existing dirty tracked file outside openspec/ → blocked before archive is called", async () => {
   const archiveCalls: string[] = [];
-  const blocked: string[] = [];
+  const blocked: Array<{ reason: string; kind: string }> = [];
 
   const fakeGit = (async (_wt: string, args: string[]) => {
     if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
@@ -284,8 +285,8 @@ test("maybeArchiveOpenspec: pre-existing dirty tracked file outside openspec/ �
     changeDirExists: () => true,
     branchDeveloperCommits: async () => [],
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
-    setBlocked: (async (_c, _n, reason: string) => {
-      blocked.push(reason);
+    setBlocked: (async (_c, _n, reason: string, _stage: string, kind: string) => {
+      blocked.push({ reason, kind });
     }) as AdvancePreMergeDeps["setBlocked"],
     openspecArchive: (async (_w: string, id: string) => {
       archiveCalls.push(id);
@@ -300,7 +301,14 @@ test("maybeArchiveOpenspec: pre-existing dirty tracked file outside openspec/ �
     `expected blocked outcome; got: ${JSON.stringify(out)}`);
   assert.deepEqual(archiveCalls, [], "archive must NOT run when worktree is dirty outside openspec/");
   assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
-  assert.match(blocked[0], /dirty/i, "block reason must mention dirty state");
+  assert.match(blocked[0].reason, /dirty/i, "block reason must mention dirty state");
+  // #683 review 1: dirty worktree is workspace failure, not OpenSpec-invalid → residual other
+  assert.equal(blocked[0].kind, "needs-human");
+  assert.equal(out.blockerKind, "needs-human");
+  assert.equal(
+    toPreMergeOfframpClass({ blockerKind: out.blockerKind, pathTag: out.offrampPathTag }),
+    "other",
+  );
 });
 
 // Regression (#255 review): the guard must block on ANY pre-existing dirty state,
@@ -392,9 +400,10 @@ test("maybeArchiveOpenspec: rename record with destination outside openspec/ →
 // Regression (#255 review-2): if `git status` itself FAILS before archive (non-zero exit,
 // often with empty stdout), the guard must fail CLOSED (block) — treating empty stdout as a
 // clean tree would let the destructive rollback run over unproven state.
+// #683 review 1: classify as needs-human → offramp other (not openspec-invalid).
 test("maybeArchiveOpenspec: failed pre-archive git status (non-zero exit, empty stdout) → blocked (fail closed)", async () => {
   const archiveCalls: string[] = [];
-  const blocked: string[] = [];
+  const blocked: Array<{ reason: string; kind: string }> = [];
 
   const fakeGit = (async (_wt: string, args: string[]) => {
     if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
@@ -415,8 +424,8 @@ test("maybeArchiveOpenspec: failed pre-archive git status (non-zero exit, empty 
     changeDirExists: () => true,
     branchDeveloperCommits: async () => [],
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
-    setBlocked: (async (_c, _n, reason: string) => {
-      blocked.push(reason);
+    setBlocked: (async (_c, _n, reason: string, _stage: string, kind: string) => {
+      blocked.push({ reason, kind });
     }) as AdvancePreMergeDeps["setBlocked"],
     openspecArchive: (async (_w: string, id: string) => {
       archiveCalls.push(id);
@@ -431,7 +440,13 @@ test("maybeArchiveOpenspec: failed pre-archive git status (non-zero exit, empty 
     `expected blocked outcome; got: ${JSON.stringify(out)}`);
   assert.deepEqual(archiveCalls, [], "archive must NOT run when the pre-archive status check itself failed");
   assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
-  assert.match(blocked[0], /git status|clean worktree/i, "block reason must mention the failed status check");
+  assert.match(blocked[0].reason, /git status|clean worktree/i, "block reason must mention the failed status check");
+  assert.equal(blocked[0].kind, "needs-human");
+  assert.equal(out.blockerKind, "needs-human");
+  assert.equal(
+    toPreMergeOfframpClass({ blockerKind: out.blockerKind, pathTag: out.offrampPathTag }),
+    "other",
+  );
 });
 
 // ---- maybeArchiveOpenspec end-to-end: the guard prevents the archive ----
