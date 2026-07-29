@@ -221,6 +221,11 @@ export interface CliOpts {
   jsonEvents?: boolean;
   /** Follow mode for `pipeline logs <run-id> --follow` (-f). */
   follow?: boolean;
+  /**
+   * Loop logs `--follow`: exit 0 after `loop_run_stopped` (default true).
+   * Commander `--no-until-terminal` sets this false for interrupt-only follow (#699).
+   */
+  untilTerminal?: boolean;
   /** Read/follow events.jsonl instead of terminal.log in `pipeline logs`. */
   events?: boolean;
   // `pipeline run <N> --detach` options
@@ -394,7 +399,13 @@ export function buildCmd(): Command {
     .option("--model <model>", "override the review/fix model when supported by the selected harness")
     .option("--profile <name>", "shared-core profile to use: codex or claude", process.env.PIPELINE_PROFILE ?? "codex")
     .option("--json-events", "stream lifecycle events to stdout as JSON lines (in addition to human-readable output)")
-    .option("-f, --follow", "follow mode for 'pipeline logs' / 'pipeline loop logs': stream new output until interrupt (SIGINT/SIGTERM); does not auto-exit on terminal stop events")
+    .option("-f, --follow", "follow mode for 'pipeline logs' / 'pipeline loop logs': stream new output as it is written")
+    // Commander `--no-until-terminal` pattern (same as `--no-edit`): attribute is
+    // `untilTerminal`, default true, CLI flag sets false for interrupt-only follow (#699).
+    .option(
+      "--no-until-terminal",
+      "loop logs --follow: keep streaming until interrupt only (default: exit 0 after a loop_run_stopped event is printed)",
+    )
     .option("--events", "logs mode: read/follow events.jsonl (required selection for advance logs; always selected for 'pipeline loop logs')")
     // `pipeline run <N> --detach` options
     .option("--detach", "run the pipeline in a detached background process (survives launcher exit)")
@@ -1629,11 +1640,12 @@ async function main(): Promise<void> {
     return;
   }
 
-  // `pipeline loop logs [<run-id>] [--events] [--follow|-f]` (#666): observe a
-  // durable loop run's events.jsonl under the loop state home. Nested `logs`
-  // must never enter loop preflight or the supervisor drive path. Dispatched
-  // before flag validation / config / gh — same offline discipline as advance
-  // `pipeline logs`. Follow stops on interrupt only (not on terminal stop events).
+  // `pipeline loop logs [<run-id>] [--events] [--follow|-f] [--until-terminal|--no-until-terminal]`
+  // (#666 / #699): observe a durable loop run's events.jsonl under the loop
+  // state home. Nested `logs` must never enter loop preflight or the supervisor
+  // drive path. Dispatched before flag validation / config / gh — same offline
+  // discipline as advance `pipeline logs`. Default follow exits 0 on
+  // loop_run_stopped; --no-until-terminal restores interrupt-only.
   if (numArg === "loop" && cmd.args[1] === "logs") {
     const loopLogsArg = cmd.args[2];
     const loopLogsRunId =
@@ -1642,7 +1654,10 @@ async function main(): Promise<void> {
         : undefined;
     // `--events` is accepted for parity with advance logs but the selected
     // artifact is always events.jsonl (loop store has no terminal.log).
-    await runLoopLogs(loopLogsRunId, !!opts.follow);
+    // Commander default for --until-terminal is true; --no-until-terminal → false.
+    await runLoopLogs(loopLogsRunId, !!opts.follow, undefined, {
+      untilTerminal: opts.untilTerminal !== false,
+    });
     return;
   }
 

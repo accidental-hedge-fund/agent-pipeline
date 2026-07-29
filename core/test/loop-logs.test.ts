@@ -1,15 +1,21 @@
-// Unit tests for `pipeline loop logs` (#666, capability `loop-logs-follow`).
-// Path resolution, dump/list/follow contracts, and error diagnostics — all
-// via injected LoopLogsDeps (no real network, git, or live supervisor).
+// Unit tests for `pipeline loop logs` (#666 / #699, capability `loop-logs-follow`).
+// Path resolution, dump/list/follow contracts, until-terminal exit, and error
+// diagnostics — all via injected LoopLogsDeps (no real network, git, or live
+// supervisor).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import {
+  appendFollowChunk,
+  followEventsWithTerminalExit,
   followFileWithSignalCleanup,
+  isLoopRunStoppedLine,
   listLoopRunIds,
   loopEventsPath,
+  LOOP_RUN_STOPPED_KIND,
   runLoopLogs,
+  type FollowEventsIo,
   type FollowFileProcess,
   type FollowFileSpawn,
   type LoopLogsDeps,
@@ -23,17 +29,22 @@ function makeDeps(opts: {
   dirs?: Set<string>;
   mtimes?: Map<string, number>;
   followCalls?: string[];
+  followOptsSeen?: Array<{ untilTerminal?: boolean } | undefined>;
   followExit?: number | null;
+  /** When set, followFile simulates line-aware until-terminal using this content. */
+  followContent?: string;
 }): {
   deps: LoopLogsDeps;
   out: string[];
   err: string[];
   followCalls: string[];
+  followOptsSeen: Array<{ untilTerminal?: boolean } | undefined>;
 } {
   const files = opts.files ?? new Map<string, string>();
   const dirs = opts.dirs ?? new Set<string>();
   const mtimes = opts.mtimes ?? new Map<string, number>();
   const followCalls = opts.followCalls ?? [];
+  const followOptsSeen = opts.followOptsSeen ?? [];
   const out: string[] = [];
   const err: string[] = [];
 
@@ -83,8 +94,25 @@ function makeDeps(opts: {
     async mtimeMs(p) {
       return mtimes.has(p) ? mtimes.get(p)! : null;
     },
-    async followFile(logFile) {
+    async followFile(logFile, followOpts) {
       followCalls.push(logFile);
+      followOptsSeen.push(followOpts);
+      if (opts.followContent !== undefined) {
+        // Minimal until-terminal simulation: print content and exit 0 if a
+        // terminal line is present and untilTerminal is on; otherwise hang is
+        // represented by returning followExit (tests that need non-exit use
+        // followEventsWithTerminalExit directly).
+        const untilTerminal = followOpts?.untilTerminal !== false;
+        let pending = "";
+        let sawTerminal = false;
+        const result = appendFollowChunk(pending, opts.followContent, (line) => {
+          out.push(line);
+        });
+        pending = result.pending;
+        sawTerminal = result.sawTerminal;
+        if (untilTerminal && sawTerminal) return 0;
+        return opts.followExit === undefined ? 0 : opts.followExit;
+      }
       return opts.followExit === undefined ? 0 : opts.followExit;
     },
     stdoutWrite(s) {
@@ -95,7 +123,7 @@ function makeDeps(opts: {
     },
   };
 
-  return { deps, out, err, followCalls };
+  return { deps, out, err, followCalls, followOptsSeen };
 }
 
 const HOME = "/state/loop-home";
@@ -299,7 +327,7 @@ test("listLoopRunIds: returns [] for empty home", async () => {
 
 test("loop-logs: follow invokes follow seam with resolved absolute events path", async () => {
   const ep = eventsPathFor(RUN_A);
-  const { deps, followCalls } = makeDeps({
+  const { deps, followCalls, followOptsSeen } = makeDeps({
     env: { [PIPELINE_STATE_HOME_ENV]: HOME },
     files: new Map([[ep, '{"kind":"x"}\n']]),
     dirs: new Set([runDirFor(RUN_A)]),
@@ -308,6 +336,8 @@ test("loop-logs: follow invokes follow seam with resolved absolute events path",
   await runLoopLogs(RUN_A, true, deps);
   assert.deepEqual(followCalls, [ep]);
   assert.ok(path.isAbsolute(followCalls[0]!));
+  // Default until-terminal is on when follow is set (#699).
+  assert.equal(followOptsSeen[0]?.untilTerminal, true);
   process.exitCode = 0;
 });
 
@@ -321,6 +351,10 @@ test("loop-logs: follow fails non-zero when events.jsonl is absent", async () =>
   assert.equal(process.exitCode, 1);
   assert.equal(followCalls.length, 0, "must not start follow when file is missing");
   assert.ok(err.some((e) => e.includes("events.jsonl")), err.join(""));
+  assert.ok(
+    err.some((e) => e.includes("loop_run_stopped") || e.includes("until-terminal") || e.includes("--no-until-terminal")),
+    `error should document until-terminal default: ${err.join("")}`,
+  );
   process.exitCode = 0;
 });
 
@@ -336,6 +370,180 @@ test("loop-logs: follow propagates non-zero exit from follow seam", async () => 
   await runLoopLogs(RUN_A, true, deps);
   assert.equal(process.exitCode, 2);
   process.exitCode = 0;
+});
+
+// ---------------------------------------------------------------------------
+// Until-terminal follow (#699)
+// ---------------------------------------------------------------------------
+
+test("isLoopRunStoppedLine: matches store-shaped kind field only", () => {
+  assert.equal(
+    isLoopRunStoppedLine(
+      JSON.stringify({ seq: 1, time: "t", kind: LOOP_RUN_STOPPED_KIND, data: { reason: "supervisor_no_progress" } }),
+    ),
+    true,
+  );
+  assert.equal(isLoopRunStoppedLine('{"kind":"loop_item_started"}'), false);
+  assert.equal(isLoopRunStoppedLine("not-json"), false);
+  assert.equal(isLoopRunStoppedLine(""), false);
+  assert.equal(isLoopRunStoppedLine('{"type":"loop_run_stopped"}'), false, "must use kind, not type");
+});
+
+test("appendFollowChunk: buffers incomplete lines; detects terminal on complete line", () => {
+  const lines: string[] = [];
+  let r = appendFollowChunk("", '{"kind":"loop_item_started"}\n{"kind":"loop_run_', (l) => lines.push(l));
+  assert.equal(r.sawTerminal, false);
+  assert.equal(r.pending, '{"kind":"loop_run_');
+  assert.deepEqual(lines, ['{"kind":"loop_item_started"}\n']);
+
+  r = appendFollowChunk(r.pending, 'stopped"}\n', (l) => lines.push(l));
+  assert.equal(r.sawTerminal, true);
+  assert.equal(r.pending, "");
+  assert.equal(lines[1], '{"kind":"loop_run_stopped"}\n');
+});
+
+test("loop-logs: default follow exits 0 when loop_run_stopped is delivered (#699)", async () => {
+  const ep = eventsPathFor(RUN_A);
+  const content =
+    '{"seq":1,"time":"t","kind":"loop_item_started","data":{}}\n' +
+    '{"seq":2,"time":"t","kind":"loop_run_stopped","data":{"reason":"supervisor_no_progress"}}\n';
+  const { deps, out, followOptsSeen } = makeDeps({
+    env: { [PIPELINE_STATE_HOME_ENV]: HOME },
+    files: new Map([[ep, content]]),
+    dirs: new Set([runDirFor(RUN_A)]),
+    followContent: content,
+  });
+  process.exitCode = undefined;
+  await runLoopLogs(RUN_A, true, deps); // default untilTerminal
+  assert.equal(process.exitCode === undefined || process.exitCode === 0, true);
+  assert.equal(followOptsSeen[0]?.untilTerminal, true);
+  assert.ok(out.join("").includes(LOOP_RUN_STOPPED_KIND), out.join(""));
+  process.exitCode = 0;
+});
+
+test("loop-logs: historical loop_run_stopped ends follow without hang (#699)", async () => {
+  // Content already contains terminal — follow seam must process and return 0
+  // (not leave follow open waiting for new appends).
+  const ep = eventsPathFor(RUN_A);
+  const content = '{"kind":"loop_run_stopped","data":{"reason":"done"}}\n';
+  const { deps, out } = makeDeps({
+    env: { [PIPELINE_STATE_HOME_ENV]: HOME },
+    files: new Map([[ep, content]]),
+    dirs: new Set([runDirFor(RUN_A)]),
+    followContent: content,
+    // If until-terminal were ignored, a hang would be represented by non-zero
+    // only when followExit is set — we assert exit stays 0 with terminal present.
+    followExit: 99,
+  });
+  process.exitCode = undefined;
+  await runLoopLogs(RUN_A, true, deps, { untilTerminal: true });
+  assert.equal(process.exitCode === undefined || process.exitCode === 0, true);
+  assert.ok(out.join("").includes("loop_run_stopped"));
+  process.exitCode = 0;
+});
+
+test("loop-logs: --no-until-terminal does not exit solely on loop_run_stopped (#699)", async () => {
+  const ep = eventsPathFor(RUN_A);
+  const content = '{"kind":"loop_run_stopped","data":{}}\n';
+  const { deps, followOptsSeen } = makeDeps({
+    env: { [PIPELINE_STATE_HOME_ENV]: HOME },
+    files: new Map([[ep, content]]),
+    dirs: new Set([runDirFor(RUN_A)]),
+    followContent: content,
+    // Without until-terminal exit, follow seam falls through to followExit.
+    followExit: 0,
+  });
+  process.exitCode = undefined;
+  await runLoopLogs(RUN_A, true, deps, { untilTerminal: false });
+  assert.equal(followOptsSeen[0]?.untilTerminal, false);
+  // Seam was invoked; terminal content alone did not force a special path
+  // beyond whatever followExit returned (0 here).
+  assert.equal(process.exitCode === undefined || process.exitCode === 0, true);
+  process.exitCode = 0;
+});
+
+test("followEventsWithTerminalExit: exits 0 on terminal with injectable stream", async () => {
+  const lines = [
+    '{"kind":"loop_item_started"}\n',
+    '{"kind":"loop_run_stopped","data":{"reason":"x"}}\n',
+  ];
+  let idx = 0;
+  const out: string[] = [];
+  const listeners = new Map<"SIGINT" | "SIGTERM", () => void>();
+  const io: FollowEventsIo = {
+    async readFrom(_p, offset) {
+      if (idx >= lines.length) return { data: "", nextOffset: offset };
+      const data = lines[idx++]!;
+      return { data, nextOffset: offset + data.length };
+    },
+    async waitForMore(_p, signal) {
+      if (signal.aborted) throw new Error("aborted");
+      // After all lines delivered, wait would hang forever in production;
+      // tests should have already exited on terminal.
+      throw new Error("should not wait after terminal");
+    },
+    stdoutWrite(s) {
+      out.push(s);
+    },
+    stderrWrite() {},
+    process: {
+      on(event, listener) {
+        listeners.set(event, listener);
+      },
+      removeListener(event, listener) {
+        if (listeners.get(event) === listener) listeners.delete(event);
+      },
+      stderr: { write() {} },
+    },
+  };
+  const code = await followEventsWithTerminalExit("/fake/events.jsonl", { untilTerminal: true }, io);
+  assert.equal(code, 0);
+  assert.equal(out.join(""), lines.join(""));
+  assert.deepEqual([...listeners.keys()], [], "signal handlers cleaned up");
+});
+
+test("followEventsWithTerminalExit: --no-until-terminal keeps reading past terminal", async () => {
+  const chunks = [
+    '{"kind":"loop_run_stopped"}\n',
+    '{"kind":"loop_item_started"}\n',
+  ];
+  let idx = 0;
+  let waits = 0;
+  const out: string[] = [];
+  const listeners = new Map<"SIGINT" | "SIGTERM", () => void>();
+  const io: FollowEventsIo = {
+    async readFrom(_p, offset) {
+      if (idx >= chunks.length) return { data: "", nextOffset: offset };
+      const data = chunks[idx++]!;
+      return { data, nextOffset: offset + data.length };
+    },
+    async waitForMore(_p, signal) {
+      waits++;
+      if (waits >= 2) {
+        // Simulate interrupt after observing content past terminal.
+        listeners.get("SIGINT")?.();
+        throw new Error("aborted");
+      }
+      if (signal.aborted) throw new Error("aborted");
+    },
+    stdoutWrite(s) {
+      out.push(s);
+    },
+    stderrWrite() {},
+    process: {
+      on(event, listener) {
+        listeners.set(event, listener);
+      },
+      removeListener(event, listener) {
+        if (listeners.get(event) === listener) listeners.delete(event);
+      },
+      stderr: { write() {} },
+    },
+  };
+  const code = await followEventsWithTerminalExit("/fake/events.jsonl", { untilTerminal: false }, io);
+  assert.equal(code, 130, "interrupt ends interrupt-only follow");
+  assert.ok(out.join("").includes("loop_run_stopped"));
+  assert.ok(out.join("").includes("loop_item_started"), "must not stop solely on terminal");
 });
 
 // ---------------------------------------------------------------------------

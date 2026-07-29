@@ -1,7 +1,11 @@
-// `pipeline loop logs` (#666, capability `loop-logs-follow`): read-only dump
-// or follow of a durable loop run's append-only events.jsonl under the loop
-// state home. Path resolution is single-sourced with the durable loop store
-// (`resolveStateHome` / `runDir`); no lock, ledger write, or GitHub call.
+// `pipeline loop logs` (#666 / #699, capability `loop-logs-follow`): read-only
+// dump or follow of a durable loop run's append-only events.jsonl under the
+// loop state home. Path resolution is single-sourced with the durable loop
+// store (`resolveStateHome` / `runDir`); no lock, ledger write, or GitHub call.
+//
+// Follow default (#699): exit successfully after printing a `loop_run_stopped`
+// event (until-terminal). Opt out with `--no-until-terminal` for interrupt-only
+// dashboards.
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
@@ -14,6 +18,20 @@ import {
   type LoopStoreDeps,
 } from "./store.ts";
 
+/** Event kind written by the durable loop supervisor when a run stops. */
+export const LOOP_RUN_STOPPED_KIND = "loop_run_stopped";
+
+/** Options for {@link runLoopLogs} follow mode. */
+export interface LoopLogsFollowOptions {
+  /**
+   * When true (default with `--follow`), exit 0 after a complete JSONL line
+   * whose event kind is `loop_run_stopped` is printed. When false
+   * (`--no-until-terminal`), remain open until interrupt / follow failure.
+   * Ignored when follow is false.
+   */
+  untilTerminal?: boolean;
+}
+
 /** Injectable I/O seam for {@link runLoopLogs}. Unit tests inject fakes; no
  *  real filesystem, network, git, or `tail` process is required. */
 export interface LoopLogsDeps {
@@ -24,11 +42,15 @@ export interface LoopLogsDeps {
   /** mtime ms for list ordering; `null` when the path is unstatable. */
   mtimeMs(p: string): Promise<number | null>;
   /**
-   * Follow `logFile` (tail semantics). Resolves with the child exit code when
-   * follow ends (interrupt, error, or child exit). Must not hang forever when
-   * the file is absent or the starter fails — fail closed with a non-zero code.
+   * Follow `logFile` (line-streaming semantics). Resolves with the child/follow
+   * exit code when follow ends (terminal event when untilTerminal, interrupt,
+   * error, or child exit). Must not hang forever when the file is absent or
+   * the starter fails — fail closed with a non-zero code.
    */
-  followFile(logFile: string): Promise<number | null>;
+  followFile(
+    logFile: string,
+    opts?: { untilTerminal?: boolean },
+  ): Promise<number | null>;
   stdoutWrite(s: string): void;
   stderrWrite(s: string): void;
 }
@@ -71,14 +93,58 @@ export async function listLoopRunIds(deps: LoopLogsDeps): Promise<string[]> {
 }
 
 /**
+ * True when `line` is a complete JSONL record whose event kind is
+ * `loop_run_stopped`. Malformed / non-JSON / wrong-kind lines return false
+ * (callers keep streaming). Matches store writers: `{ seq, time, kind, data }`.
+ */
+export function isLoopRunStoppedLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  try {
+    const obj = JSON.parse(trimmed) as { kind?: unknown };
+    return obj != null && typeof obj === "object" && obj.kind === LOOP_RUN_STOPPED_KIND;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Append a follow chunk to a line buffer. Invokes `onLine` for each complete
+ * newline-terminated line (including the trailing `\n`). Incomplete trailing
+ * bytes remain in `pending`. Returns whether any complete line was a
+ * `loop_run_stopped` event.
+ */
+export function appendFollowChunk(
+  pending: string,
+  chunk: string,
+  onLine: (line: string) => void,
+): { pending: string; sawTerminal: boolean } {
+  let buf = pending + chunk;
+  let sawTerminal = false;
+  for (;;) {
+    const nl = buf.indexOf("\n");
+    if (nl < 0) break;
+    const line = buf.slice(0, nl + 1);
+    buf = buf.slice(nl + 1);
+    onLine(line);
+    // Strip trailing newline for kind detection (JSON.parse of "…\n" fails).
+    if (isLoopRunStoppedLine(line.endsWith("\n") ? line.slice(0, -1) : line)) {
+      sawTerminal = true;
+    }
+  }
+  return { pending: buf, sawTerminal };
+}
+
+/**
  * Dump or follow a durable loop run's events.jsonl.
  *
  * - No run-id → list available loop run ids (exit 0; empty home is friendly).
  * - One-shot → print full current events.jsonl (always events.jsonl; `--events`
  *   is accepted for parity but does not change the selected artifact).
- * - `--follow` → stream new lines until interrupt (SIGINT/SIGTERM) or follow
- *   failure. Does **not** auto-exit on a terminal stop event (matches advance
- *   `pipeline logs --follow`).
+ * - `--follow` → stream lines (existing + newly appended). **Default**
+ *   until-terminal: exit 0 after printing a `loop_run_stopped` line (historical
+ *   or live). `--no-until-terminal` restores interrupt-only follow.
+ *   SIGINT/SIGTERM remain valid stop conditions in both modes.
  *
  * Read-only: acquires no durable loop lock and writes no run artifacts.
  */
@@ -86,8 +152,11 @@ export async function runLoopLogs(
   runId: string | undefined,
   follow: boolean,
   deps: LoopLogsDeps = defaultLoopLogsDeps(),
+  followOpts: LoopLogsFollowOptions = {},
 ): Promise<void> {
   const home = resolveStateHome({ env: deps.env, hostname: () => "unused" });
+  // Default until-terminal ON whenever follow is requested (#699).
+  const untilTerminal = followOpts.untilTerminal !== false;
 
   if (runId === undefined) {
     const ids = await listLoopRunIds(deps);
@@ -139,15 +208,14 @@ export async function runLoopLogs(
     deps.stderrWrite(
       `pipeline loop logs: events.jsonl not yet written for run '${runId}'\n` +
         `  Path: ${eventsFile}\n` +
-        `  Follow mode streams until interrupt (SIGINT/SIGTERM); it does not ` +
-        `auto-exit on terminal stop events.\n`,
+        `  Follow mode streams event lines; by default it exits 0 after ` +
+        `loop_run_stopped (use --no-until-terminal for interrupt-only).\n`,
     );
     process.exitCode = 1;
     return;
   }
 
-  // Follow stops on interrupt or follow failure — not on loop_run_stopped.
-  const code = await deps.followFile(eventsFile);
+  const code = await deps.followFile(eventsFile, { untilTerminal });
   if (code !== null && code !== 0) {
     process.exitCode = code;
   }
@@ -159,6 +227,10 @@ export async function runLoopLogs(
  * Handlers are one-shot and removed when follow settles (child exit, error,
  * or interrupt). Resolves with conventional shell status 130 (SIGINT) /
  * 143 (SIGTERM) when interrupted; otherwise the child exit code.
+ *
+ * Used for interrupt-only follow (`--no-until-terminal`). The default
+ * until-terminal path uses {@link followEventsWithTerminalExit} instead so
+ * lines can be inspected for `loop_run_stopped`.
  *
  * `io.spawn` / `io.process` are injectable for unit tests — no real process
  * or signal is required.
@@ -264,8 +336,157 @@ export function followFileWithSignalCleanup(
   });
 }
 
-/** Real-filesystem + `tail -f` defaults. Follow inherits stdio so operators see
- *  lines as they are appended; the process remains open until interrupt. */
+/** Injectable I/O for {@link followEventsWithTerminalExit} (unit tests). */
+export type FollowEventsIo = {
+  /** Read next available bytes from `offset`; empty string when nothing new. */
+  readFrom(path: string, offset: number): Promise<{ data: string; nextOffset: number }>;
+  /** Wait until the file may have grown, or until aborted. */
+  waitForMore(path: string, signal: AbortSignal): Promise<void>;
+  stdoutWrite(s: string): void;
+  stderrWrite(s: string): void;
+  process: FollowFileProcess;
+};
+
+/**
+ * Line-aware follow: print complete lines, optionally exit 0 on
+ * `loop_run_stopped`. Reads existing content from offset 0 first (historical
+ * terminal ends follow without hanging). Incomplete trailing bytes are
+ * buffered until a newline arrives.
+ */
+export async function followEventsWithTerminalExit(
+  logFile: string,
+  opts: { untilTerminal: boolean },
+  io: FollowEventsIo,
+): Promise<number | null> {
+  const proc = io.process;
+  const ac = new AbortController();
+  let interrupted: NodeJS.Signals | null = null;
+  let onSigint: () => void = () => {};
+  let onSigterm: () => void = () => {};
+
+  const interruptStatus = (sig: NodeJS.Signals): number =>
+    sig === "SIGINT" ? 130 : 143;
+
+  const cleanup = () => {
+    ac.abort();
+    proc.removeListener("SIGINT", onSigint);
+    proc.removeListener("SIGTERM", onSigterm);
+  };
+
+  onSigint = () => {
+    if (interrupted) return;
+    interrupted = "SIGINT";
+    ac.abort();
+  };
+  onSigterm = () => {
+    if (interrupted) return;
+    interrupted = "SIGTERM";
+    ac.abort();
+  };
+  proc.on("SIGINT", onSigint);
+  proc.on("SIGTERM", onSigterm);
+
+  let offset = 0;
+  let pending = "";
+
+  try {
+    for (;;) {
+      if (interrupted) return interruptStatus(interrupted);
+
+      let batch: { data: string; nextOffset: number };
+      try {
+        batch = await io.readFrom(logFile, offset);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        io.stderrWrite(`pipeline loop logs: failed to read events: ${msg}\n`);
+        return 1;
+      }
+
+      if (batch.data.length > 0) {
+        offset = batch.nextOffset;
+        const result = appendFollowChunk(pending, batch.data, (line) => {
+          io.stdoutWrite(line);
+        });
+        pending = result.pending;
+        if (opts.untilTerminal && result.sawTerminal) {
+          return 0;
+        }
+      }
+
+      if (interrupted) return interruptStatus(interrupted);
+
+      try {
+        await io.waitForMore(logFile, ac.signal);
+      } catch {
+        // Aborted via signal — loop re-checks interrupted.
+      }
+    }
+  } finally {
+    cleanup();
+  }
+}
+
+/** Production read/poll I/O for {@link followEventsWithTerminalExit}. */
+export function defaultFollowEventsIo(
+  env: {
+    stdoutWrite?: (s: string) => void;
+    stderrWrite?: (s: string) => void;
+    process?: FollowFileProcess;
+    pollMs?: number;
+  } = {},
+): FollowEventsIo {
+  const pollMs = env.pollMs ?? 100;
+  const proc: FollowFileProcess = env.process ?? process;
+  return {
+    async readFrom(filePath, offset) {
+      let fd: number | undefined;
+      try {
+        fd = fs.openSync(filePath, "r");
+        const st = fs.fstatSync(fd);
+        if (st.size <= offset) {
+          return { data: "", nextOffset: offset };
+        }
+        const len = st.size - offset;
+        const buf = Buffer.alloc(len);
+        const n = fs.readSync(fd, buf, 0, len, offset);
+        return {
+          data: buf.subarray(0, n).toString("utf8"),
+          nextOffset: offset + n,
+        };
+      } finally {
+        if (fd !== undefined) {
+          try {
+            fs.closeSync(fd);
+          } catch {
+            // ignore close errors
+          }
+        }
+      }
+    },
+    waitForMore(_path, signal) {
+      return new Promise<void>((resolve, reject) => {
+        if (signal.aborted) {
+          reject(new Error("aborted"));
+          return;
+        }
+        const t = setTimeout(() => {
+          signal.removeEventListener("abort", onAbort);
+          resolve();
+        }, pollMs);
+        const onAbort = () => {
+          clearTimeout(t);
+          reject(new Error("aborted"));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+    },
+    stdoutWrite: env.stdoutWrite ?? ((s) => process.stdout.write(s)),
+    stderrWrite: env.stderrWrite ?? ((s) => process.stderr.write(s)),
+    process: proc,
+  };
+}
+
+/** Real-filesystem defaults. Follow is line-aware; until-terminal is default. */
 export function defaultLoopLogsDeps(env: NodeJS.ProcessEnv = process.env): LoopLogsDeps {
   return {
     env,
@@ -296,8 +517,17 @@ export function defaultLoopLogsDeps(env: NodeJS.ProcessEnv = process.env): LoopL
         return null;
       }
     },
-    followFile(logFile) {
-      return followFileWithSignalCleanup(logFile);
+    followFile(logFile, opts) {
+      const untilTerminal = opts?.untilTerminal !== false;
+      if (!untilTerminal) {
+        // Interrupt-only: pure tail -f (no line inspection required).
+        return followFileWithSignalCleanup(logFile);
+      }
+      return followEventsWithTerminalExit(
+        logFile,
+        { untilTerminal: true },
+        defaultFollowEventsIo(),
+      );
     },
     stdoutWrite(s) {
       process.stdout.write(s);

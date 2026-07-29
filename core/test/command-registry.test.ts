@@ -191,13 +191,15 @@ test("command-registry: loop.allowedFlags includes newRun (#610)", () => {
   assert.deepEqual(validateFlags(entry, cmd), []);
 });
 
-test("command-registry: loop.allowedFlags includes follow and events for nested loop logs (#666)", () => {
+test("command-registry: loop.allowedFlags includes follow, events, untilTerminal for nested loop logs (#666/#699)", () => {
   const entry = COMMAND_REGISTRY.loop;
   const flags = entry.allowedFlags as Set<string>;
   assert.ok(flags.has("follow"));
   assert.ok(flags.has("events"));
+  assert.ok(flags.has("untilTerminal"), "until-terminal / --no-until-terminal (#699)");
   assert.deepEqual(validateFlags(entry, fakeCmdWithCliFlag("follow")), []);
   assert.deepEqual(validateFlags(entry, fakeCmdWithCliFlag("events")), []);
+  assert.deepEqual(validateFlags(entry, fakeCmdWithCliFlag("untilTerminal")), []);
 });
 
 test("command-registry: every 'loop:'-namespaced registered option is in the loop allowlist", () => {

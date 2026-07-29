@@ -94,7 +94,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor
 /pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
 /pipeline:loop --audit                   read-only report for the run; no writes
-/pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (interrupt stops follow; no auto-exit on terminal)
+/pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (default: exit 0 on loop_run_stopped; --no-until-terminal for interrupt-only)
 /pipeline evals plan <manifest.json>     expand + persist an experiment's run plan; invokes no harness, creates no worktree
 /pipeline evals run <manifest.json>      execute an experiment's cells (resumable); never writes to production GitHub
 /pipeline evals run <manifest.json> --fixtures <dir>  override the fixtures directory (default: core/evals/fixtures)
@@ -1007,18 +1007,32 @@ Then resolve the events file:
 
 #### c. Follow the loop event stream
 
-Arm a persistent Monitor (or host-equivalent follow) on the loop events file
-**as soon as** `run_id` is known (step b) — do not wait for supervisor exit:
+Arm a follow on the loop events file **as soon as** `run_id` is known (step b)
+— do not wait for supervisor exit. Prefer the first-class CLI (exits 0 on
+`loop_run_stopped` by default):
 
 ```bash
-# Interim path until a dedicated loop logs-follow CLI is universal (#666).
-# Prefer that CLI when available; keep this file path as a valid fallback.
+node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow
+# default until-terminal: process exits 0 after loop_run_stopped
+# interrupt-only dashboards: add --no-until-terminal
+```
+
+If you arm a host Monitor instead of (or around) that CLI, do **not** leave it
+`persistent: true` past terminal — §4b.f requires same-turn teardown. A raw
+file fallback is still valid:
+
+```bash
+# Fallback only — prefer `pipeline loop logs … --follow` (auto-exits on terminal).
+# Dual-follow / multi-stream scripts MUST exit 0 after loop_run_stopped (see §4b.f).
 tail -F "<state-home>/runs/<run_id>/events.jsonl"
 ```
 
-Set `persistent: true` and a generous `timeout_ms` (re-arm if needed). Never
-forbid Monitor or background following for drive/resume while waiting for a
-future CLI.
+Never forbid Monitor or background following for drive/resume.
+
+**Dual-follow / multi-stream pattern** (loop + optional advance): when the
+script observes `loop_run_stopped` on the loop stream, print a final summary
+line (include terminal reason when present) and **`exit 0`**. Do **not** print
+`TERMINAL` inside `while true` and keep looping — that leaves zombie follows.
 
 #### d. Optional: follow active item advance events when published
 
@@ -1056,10 +1070,18 @@ above — do not require a non-existent linkage field.
 evaluations in the same burst (same spirit as suppressing
 `pre_merge.advancePolling` in §4).
 
-#### f. Stop following
+#### f. Stop following (same turn — mandatory)
 
-Stop the Monitor when a terminal loop outcome appears — especially
-`loop_run_stopped` — or when the supervisor process exits.
+When a material **`loop_run_stopped`** event is observed for the followed
+`run_id`, **or** when the supervisor process for that run exits: **in the same
+harness turn**, stop **all** loop event Monitors/follows **and** all advance
+event Monitors/follows started for that loop run (including dual-follow /
+multi-stream tails). Do **not** leave those follows running until the operator
+asks to kill them. Do **not** kill Monitors for other issues, other run ids, or
+session tools unrelated to that loop `run_id` / its published advance run ids.
+
+Documented dual-follow scripts **exit 0** after `loop_run_stopped` and a final
+summary line — they must not continue an infinite follow loop after terminal.
 
 #### g. Final summary / audit
 
@@ -1070,6 +1092,11 @@ read-only process/timeline report:
 node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop --audit
 # or with an explicit run: ... loop --resume <run-id> --audit
 ```
+
+The final operator summary **must** include (1) the run's **terminal reason**
+(or equivalent stop reason from the terminal event / result JSON) and (2)
+explicit confirmation that run-scoped follows were stopped (e.g. **follows
+stopped**).
 
 ### 5. Modes that DON'T need this orchestration
 

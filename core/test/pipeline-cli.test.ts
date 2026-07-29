@@ -264,6 +264,13 @@ test("pipeline-cli: loop logs --events --follow is valid on the loop allowlist (
   assert.deepEqual(roundTrip(["loop", "logs", "loop-abc", "--events", "--follow"]), []);
 });
 
+test("pipeline-cli: loop logs --follow --no-until-terminal is valid (#699)", () => {
+  assert.deepEqual(
+    roundTrip(["loop", "logs", "loop-abc", "--events", "--follow", "--no-until-terminal"]),
+    [],
+  );
+});
+
 test("pipeline-cli: loop logs parses nested logs sub-verb before issue args", () => {
   const cmd = buildCmd();
   cmd.parse(["node", "pipeline", "loop", "logs", "loop-abc", "--events", "--follow"]);
@@ -272,6 +279,23 @@ test("pipeline-cli: loop logs parses nested logs sub-verb before issue args", ()
   assert.equal(cmd.args[2], "loop-abc");
   assert.equal(cmd.opts().events, true);
   assert.equal(cmd.opts().follow, true);
+  // until-terminal defaults on (#699)
+  assert.equal(cmd.opts().untilTerminal, true);
+});
+
+test("pipeline-cli: loop logs --no-until-terminal sets untilTerminal false (#699)", () => {
+  const cmd = buildCmd();
+  cmd.parse([
+    "node",
+    "pipeline",
+    "loop",
+    "logs",
+    "loop-abc",
+    "--follow",
+    "--no-until-terminal",
+  ]);
+  assert.equal(cmd.opts().follow, true);
+  assert.equal(cmd.opts().untilTerminal, false);
 });
 
 test("pipeline-cli 5.8h: 'summary run-123 --dry-run' → summary entry, validateFlags returns ['dryRun']", () => {

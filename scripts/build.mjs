@@ -198,11 +198,14 @@ const LOOP_ORCH_NOTE =
   "completion (early handoff when present; else `--resume` / known id; else race-safe " +
   "state-home discovery of a newly published or lock-held run directory — do not rely solely " +
   "on the terminal result JSON for mid-flight follow), follow the loop event stream with a " +
-  "persistent Monitor or host-equivalent, optionally follow an active item's advance events " +
-  "when that advance `run_id` is published, stop on a terminal loop outcome " +
-  "(`loop_run_stopped`) or supervisor process exit, then print a summary / `--audit`. " +
-  "See the pipeline SKILL.md loop orchestration section for material event kinds and the interim " +
-  "`events.jsonl` follow path. `--audit` alone is read-only and synchronous (no Monitor).";
+  "Monitor or host-equivalent (`pipeline loop logs <run_id> --events --follow` exits 0 on " +
+  "`loop_run_stopped` by default), optionally follow an active item's advance events " +
+  "when that advance `run_id` is published, and on `loop_run_stopped` or supervisor process " +
+  "exit stop all run-scoped loop and advance follows in the same turn (do not wait for an " +
+  "operator kill; dual-follow scripts exit 0 after a final summary line). Then print a " +
+  "summary / `--audit` that includes the terminal reason and that follows stopped. " +
+  "See the pipeline SKILL.md loop orchestration section for material event kinds. " +
+  "`--audit` alone is read-only and synchronous (no Monitor).";
 
 // Generate a Claude command markdown file for one operation entry.
 // `skillPath` is the path prefix used in the Invoke line (differs between

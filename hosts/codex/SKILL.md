@@ -80,7 +80,7 @@ $pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
 $pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor
 $pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
 $pipeline:loop --audit                   read-only report for the run; no writes
-$pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (interrupt stops follow; no auto-exit on terminal)
+$pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (default: exit 0 on loop_run_stopped; --no-until-terminal for interrupt-only)
 $pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent)
 $pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
 $pipeline scoreboard --bucket day|week   add a chronological day/week time-series to the scoreboard report
@@ -757,17 +757,26 @@ Then resolve the events file:
 
 #### c. Follow the loop event stream
 
-Poll or tail the loop events file **as soon as** `run_id` is known (step b) —
-do not wait for supervisor exit — and summarize material lifecycle records:
+Poll or follow the loop events file **as soon as** `run_id` is known (step b) —
+do not wait for supervisor exit — and summarize material lifecycle records.
+Prefer the first-class CLI (exits 0 on `loop_run_stopped` by default):
 
 ```bash
-# Interim path until a dedicated loop logs-follow CLI is universal (#666).
-# Prefer that CLI when available; keep this file path as a valid fallback.
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow
+# default until-terminal: process exits 0 after loop_run_stopped
+# interrupt-only dashboards: add --no-until-terminal
+```
+
+A raw file fallback remains valid; dual-follow / multi-stream scripts **must
+`exit 0`** after observing `loop_run_stopped` and printing a final summary line
+(do not print `TERMINAL` inside `while true` and keep looping):
+
+```bash
+# Fallback only — prefer `pipeline loop logs … --follow` (auto-exits on terminal).
 tail -F "<state-home>/runs/<run_id>/events.jsonl"
 ```
 
-Never forbid background following or event streaming for drive/resume while
-waiting for a future CLI.
+Never forbid background following or event streaming for drive/resume.
 
 #### d. Optional: follow active item advance events when published
 
@@ -805,10 +814,18 @@ above — do not require a non-existent linkage field.
 evaluations in the same burst (same spirit as suppressing
 `pre_merge.advancePolling` in §4).
 
-#### f. Stop following
+#### f. Stop following (same turn — mandatory)
 
-Stop polling/tailing when a terminal loop outcome appears — especially
-`loop_run_stopped` — or when the supervisor process exits.
+When a material **`loop_run_stopped`** event is observed for the followed
+`run_id`, **or** when the supervisor process for that run exits: **in the same
+harness turn**, stop **all** loop event follows/tails **and** all advance event
+follows started for that loop run (including dual-follow / multi-stream tails).
+Do **not** leave those follows running until the operator asks to kill them.
+Do **not** kill follows for other issues, other run ids, or session tools
+unrelated to that loop `run_id` / its published advance run ids.
+
+Documented dual-follow scripts **exit 0** after `loop_run_stopped` and a final
+summary line — they must not continue an infinite follow loop after terminal.
 
 #### g. Final summary / audit
 
@@ -819,6 +836,11 @@ read-only process/timeline report:
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --audit
 # or with an explicit run: ... loop --resume <run-id> --audit
 ```
+
+The final operator summary **must** include (1) the run's **terminal reason**
+(or equivalent stop reason from the terminal event / result JSON) and (2)
+explicit confirmation that run-scoped follows were stopped (e.g. **follows
+stopped**).
 
 ### 5. Modes that DON'T need this orchestration
 

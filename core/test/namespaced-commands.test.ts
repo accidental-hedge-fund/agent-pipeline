@@ -272,6 +272,71 @@ test("namespaced-commands 7.5b4b: true-fast peers may still use the shared secon
   }
 });
 
+// #699: host loop orchestration must stop run-scoped follows on terminal in the
+// same turn; dual-follow must exit; one-liners must not claim unconditional
+// "no auto-exit on terminal" without documenting until-terminal default.
+test("namespaced-commands 7.5b6: host loop skill stop-on-terminal + dual-follow exit (#699)", () => {
+  const repoRoot = join(__dirname, "..", "..");
+  const hostSkills = [
+    join(repoRoot, "hosts", "claude", "SKILL.md"),
+    join(repoRoot, "hosts", "codex", "SKILL.md"),
+  ];
+  for (const skillPath of hostSkills) {
+    const body = readFileSync(skillPath, "utf8");
+    assert.ok(
+      /loop_run_stopped/i.test(body),
+      `${skillPath} must mention loop_run_stopped`,
+    );
+    assert.ok(
+      /same turn|in the same harness turn|same-turn/i.test(body),
+      `${skillPath} must require same-turn stop of run-scoped follows (#699)`,
+    );
+    assert.ok(
+      /follows stopped|follow.*stopped/i.test(body),
+      `${skillPath} final summary must include follows-stopped confirmation (#699)`,
+    );
+    assert.ok(
+      /exit 0|exit with code 0|exits 0/i.test(body),
+      `${skillPath} dual-follow / multi-stream guidance must exit 0 on terminal (#699)`,
+    );
+    // Forbidden: primary one-liner that claims unconditional no-auto-exit without
+    // documenting until-terminal default-on.
+    const oneLiners = body
+      .split("\n")
+      .filter((l) => /loop logs/.test(l) && /--follow|-f\b/.test(l));
+    for (const line of oneLiners) {
+      if (/no auto-exit on terminal/i.test(line) && !/until-terminal/i.test(line)) {
+        assert.fail(
+          `${skillPath} loop logs one-liner claims unconditional no auto-exit without until-terminal docs: ${line}`,
+        );
+      }
+    }
+    assert.ok(
+      /until-terminal|exits on loop_run_stopped|exit.*loop_run_stopped/i.test(body),
+      `${skillPath} must document until-terminal / exit-on-loop_run_stopped for loop logs follow (#699)`,
+    );
+  }
+
+  // LOOP_ORCH_NOTE (command packaging) must also require same-turn stop language.
+  // Checked via rendered Claude command after import of build.mjs.
+});
+
+test("namespaced-commands 7.5b6b: LOOP_ORCH_NOTE requires same-turn stop + follows stopped (#699)", async () => {
+  const buildMjs = await import("../../scripts/build.mjs");
+  const { OPERATION_SURFACE, renderClaudeCommand } = buildMjs;
+  const loopOp = OPERATION_SURFACE.find((op: { name: string }) => op.name === "loop");
+  assert.ok(loopOp);
+  const claude = renderClaudeCommand(loopOp, "~/.claude/skills/pipeline");
+  assert.ok(
+    /loop_run_stopped/i.test(claude),
+    `loop command packaging must mention loop_run_stopped: ${claude}`,
+  );
+  assert.ok(
+    /same turn|same-turn|in the same/i.test(claude) || /stop.*follow/i.test(claude),
+    `loop command packaging must instruct stop of follows on terminal: ${claude}`,
+  );
+});
+
 // #668 pre-merge: skill lock discovery must not use unanchored grep of $LOOP_PID
 // (pid 123 matching lock pid 12345).
 test("namespaced-commands 7.5b5: host loop skill ownership is exact PID, not grepped prefix", () => {
