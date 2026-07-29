@@ -647,7 +647,9 @@ export async function createWorktree(
   deps: CreateWorktreeDeps = {},
 ): Promise<{ path: string; branch: string }> {
   const existsFn = deps.existsSync ?? fs.existsSync;
-  const removeFn = deps.removeWorktree ?? removeWorktree;
+  // Injected remove seam (tests) OR race-safe default — never the force-delete
+  // removeWorktree used by terminal deploy/auto_recover paths (#622 review-2).
+  const removeFn = deps.removeWorktree;
   const listActiveFn = deps.listActive ?? listActive;
   const mkdirFn = deps.mkdirSync ?? ((p: string, opts: { recursive: boolean }) => { fs.mkdirSync(p, opts); });
   const gitFn = deps.gitCmd ?? git;
@@ -666,8 +668,18 @@ export async function createWorktree(
   const wtPath = worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
 
+  type ReclaimCandidate = {
+    path: string;
+    branch: string;
+    slug: string;
+    /** Discovered path for linked-launch remove; undefined for collision-only. */
+    resolvedPath?: string;
+    /** Branch tip captured at preflight; null when no local branch ref exists. */
+    expectedBranchOid: string | null;
+  };
+
   /** Apply operator-remove safety without force before any reclaim mutation (#622).
-   *  Throws a clear error and never calls removeFn on a blocking result. */
+   *  Throws a clear error and never mutates on a blocking result. */
   async function assertReclaimSafe(candidatePath: string, candidateBranch: string): Promise<void> {
     const pathOnDisk = existsFn(candidatePath);
     let dirty = false;
@@ -681,6 +693,81 @@ export async function createWorktree(
         `Cannot reclaim worktree for issue #${issueNumber} at ${candidatePath} ` +
           `(branch ${candidateBranch}): ${safety.error}`,
       );
+    }
+  }
+
+  /** Resolve local branch tip OID, or null when the ref is missing. */
+  async function resolveBranchOid(candidateBranch: string): Promise<string | null> {
+    const r = await gitFn(
+      cfg,
+      cfg.repo_dir,
+      ["rev-parse", "--verify", `refs/heads/${candidateBranch}`],
+      { ignoreFailure: true },
+    );
+    if (r.code !== 0) return null;
+    const oid = r.stdout.trim();
+    return oid.length > 0 ? oid : null;
+  }
+
+  /**
+   * Race-safe reclaim mutation (#622 review-2 finding c0028d2d):
+   *  - non-force `git worktree remove` so a late dirty edit refuses deletion
+   *  - compare-and-delete branch via `git update-ref -d` with the preflight OID
+   *    so a tip that moved after safety checks is not force-deleted
+   * Throws on any failure so a refused reclaim does not silently discard work.
+   */
+  async function raceSafeReclaimRemove(candidate: ReclaimCandidate): Promise<void> {
+    const candidatePath = candidate.resolvedPath ?? candidate.path;
+    if (existsFn(candidatePath)) {
+      const rm = await gitFn(
+        cfg,
+        cfg.repo_dir,
+        ["worktree", "remove", candidatePath],
+        { ignoreFailure: true },
+      );
+      if (rm.code !== 0) {
+        throw new Error(
+          `Cannot reclaim worktree for issue #${issueNumber} at ${candidatePath} ` +
+            `(branch ${candidate.branch}): worktree remove refused ` +
+            `(possible late dirty changes): ${rm.stderr.trim()}`,
+        );
+      }
+    }
+    if (candidate.expectedBranchOid !== null) {
+      const del = await gitFn(
+        cfg,
+        cfg.repo_dir,
+        ["update-ref", "-d", `refs/heads/${candidate.branch}`, candidate.expectedBranchOid],
+        { ignoreFailure: true },
+      );
+      if (del.code !== 0) {
+        throw new Error(
+          `Cannot reclaim worktree for issue #${issueNumber} at ${candidatePath} ` +
+            `(branch ${candidate.branch}): branch tip changed since safety check ` +
+            `(refusing branch delete): ${del.stderr.trim()}`,
+        );
+      }
+    }
+  }
+
+  async function performReclaim(candidate: ReclaimCandidate): Promise<void> {
+    // Revalidate immediately before mutation so a stale preflight verdict cannot
+    // authorize force-like discard of work created after the check.
+    await assertReclaimSafe(candidate.path, candidate.branch);
+    if (candidate.expectedBranchOid !== null) {
+      const currentOid = await resolveBranchOid(candidate.branch);
+      if (currentOid !== candidate.expectedBranchOid) {
+        throw new Error(
+          `Cannot reclaim worktree for issue #${issueNumber} at ${candidate.path} ` +
+            `(branch ${candidate.branch}): branch tip changed since safety check ` +
+            `(refusing reclaim)`,
+        );
+      }
+    }
+    if (removeFn) {
+      await removeFn(cfg, issueNumber, candidate.slug, candidate.resolvedPath);
+    } else {
+      await raceSafeReclaimRemove(candidate);
     }
   }
 
@@ -705,8 +792,14 @@ export async function createWorktree(
   // Reclaim is never silent force-delete (#622): dirty workdirs and blocking
   // local-only tiers refuse with a clear error (same ladder as operator remove
   // without --force). Clean candidates may still be removed so create proceeds.
+  //
+  // Preflight ALL candidates before ANY mutation (#622 review-2 finding 37cc1885)
+  // so a later unsafe candidate cannot leave earlier clean worktrees already
+  // destroyed. Mutation uses non-force remove + OID-gated branch delete.
   const active = await listActiveFn(cfg);
   const mine = active.filter((r) => r.issueNumber === issueNumber && r.slug);
+
+  const reclaimCandidates: ReclaimCandidate[] = [];
   for (const rec of mine) {
     // Only reclaim worktrees explicitly under the managed root. A record with
     // underManagedRoot === false is a developer checkout that shares the pipeline
@@ -721,14 +814,30 @@ export async function createWorktree(
     await assertReclaimSafe(rec.path, recBranch);
     // Pass rec.path so removal targets the discovered path directly, not a path
     // recomputed from cfg.repo_dir (which is wrong when launched from a linked worktree).
-    await removeFn(cfg, issueNumber, rec.slug!, rec.path);
+    reclaimCandidates.push({
+      path: rec.path,
+      branch: recBranch,
+      slug: rec.slug!,
+      resolvedPath: rec.path,
+      expectedBranchOid: await resolveBranchOid(recBranch),
+    });
   }
   // Also clear any directory left at the *current* slug path that listActive did
   // not classify as active (e.g. a closed/terminal lookup) so the
   // `git worktree add` below cannot collide with it. Same safety gates as above.
   if (existsFn(wtPath) && !mine.some((r) => r.slug === slug)) {
     await assertReclaimSafe(wtPath, branch);
-    await removeFn(cfg, issueNumber, slug);
+    reclaimCandidates.push({
+      path: wtPath,
+      branch,
+      slug,
+      expectedBranchOid: await resolveBranchOid(branch),
+    });
+  }
+
+  // Mutations only after every candidate passed preflight.
+  for (const candidate of reclaimCandidates) {
+    await performReclaim(candidate);
   }
 
   const otherActive = active.filter((r) => r.issueNumber !== issueNumber).length;

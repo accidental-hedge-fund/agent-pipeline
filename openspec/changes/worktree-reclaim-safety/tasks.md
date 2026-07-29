@@ -11,6 +11,8 @@
 - [x] 2.3 On any blocking result, throw a clear error naming issue, path/branch, and condition (dirty vs local-only vs verification failure); do not call the remove dep.
 - [x] 2.4 On pass, call the existing `removeWorktree` dep as today so clean self-reclaim / slug-change / capacity paths continue.
 - [x] 2.5 Preserve `underManagedRoot === false` skip (never reclaim developer checkouts outside managed roots).
+- [x] 2.6 Preflight **all** reclaim candidates (same-issue managed + collision) before any mutation; abort with zero removals if any candidate fails (#622 review-2 37cc1885).
+- [x] 2.7 Race-safe mutation: non-force `git worktree remove` + OID-gated `update-ref -d` (no `--force`, no unconditional `branch -D`); revalidate before delete (#622 review-2 c0028d2d).
 
 ## 3. Regression tests
 
@@ -20,6 +22,8 @@
 - [x] 3.4 Add unit test for clean reclaim: remove dep called; create proceeds (existing happy path still green).
 - [x] 3.5 Prove bite: temporarily drop the reclaim gate and confirm dirty / local-only tests fail (document or run once while implementing).
 - [x] 3.6 Re-run existing `worktree-remove.test.ts` (and any create-worktree tests) to confirm operator remove tiers unchanged.
+- [x] 3.7 Preflight multi-candidate: later dirty/local-only/collision failure leaves earlier clean candidates unmutated.
+- [x] 3.8 Race-safe path: non-force remove + update-ref OID args; late remove refusal skips branch delete; tip change aborts before mutation.
 
 ## 4. Ship
 

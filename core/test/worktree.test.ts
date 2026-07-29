@@ -2134,6 +2134,228 @@ test("createWorktree: dirty path-collision cleanup blocks reclaim — remove not
 });
 
 // ---------------------------------------------------------------------------
+// create-time reclaim preflight + race-safe mutation (#622 review-2)
+//
+// Finding 37cc1885: check-then-remove per candidate destroyed earlier clean
+// worktrees when a later candidate failed safety. Fix: preflight ALL candidates
+// before ANY remove.
+// Finding c0028d2d: force remove after a stale safety verdict could discard
+// late dirty/local work. Fix: non-force worktree remove + update-ref OID gate.
+// ---------------------------------------------------------------------------
+
+test("createWorktree: preflight refuses later dirty candidate without removing earlier clean (#622 review-2 37cc1885)", async () => {
+  const cfg = makeCreateCfg();
+  const clean = makeRec(42, "clean-slug");
+  const dirty = makeRec(42, "dirty-slug");
+  const removed: string[] = [];
+
+  const deps = makeReclaimSafetyDeps({
+    listActive: async () => [clean, dirty],
+    existsSync: (p) => p === clean.path || p === dirty.path,
+    hasDirtyWorkdir: async (p) => p === dirty.path,
+    hasLocalOnlyCommits: async () => false,
+    removeWorktree: async (_cfg, _n, slug) => {
+      removed.push(slug);
+    },
+  });
+
+  await assert.rejects(
+    () => createWorktree(cfg, 42, "new-slug", deps),
+    (err: Error) => {
+      assert.match(err.message, /Cannot reclaim worktree for issue #42/);
+      assert.match(err.message, /uncommitted changes/i);
+      assert.match(err.message, /dirty-slug|pipeline-42-dirty-slug/);
+      return true;
+    },
+  );
+  assert.deepEqual(
+    removed,
+    [],
+    "no candidate may be removed when a later same-issue candidate fails preflight",
+  );
+});
+
+test("createWorktree: preflight refuses later local-only candidate without removing earlier clean (#622 review-2 37cc1885)", async () => {
+  const cfg = makeCreateCfg();
+  const clean = makeRec(42, "clean-slug");
+  const localOnly = makeRec(42, "local-slug");
+  const removed: string[] = [];
+
+  const deps = makeReclaimSafetyDeps({
+    listActive: async () => [clean, localOnly],
+    existsSync: (p) => p === clean.path || p === localOnly.path,
+    hasDirtyWorkdir: async () => false,
+    hasLocalOnlyCommits: async (_cfg, _path, branch) =>
+      branch.includes("local-slug") ? true : false,
+    removeWorktree: async (_cfg, _n, slug) => {
+      removed.push(slug);
+    },
+  });
+
+  await assert.rejects(
+    () => createWorktree(cfg, 42, "new-slug", deps),
+    /Cannot reclaim.*local-only commits/i,
+  );
+  assert.deepEqual(removed, [], "earlier clean worktree must remain when later candidate is local-only");
+});
+
+test("createWorktree: preflight refuses dirty collision after clean active without mutation (#622 review-2 37cc1885)", async () => {
+  // Active clean record preflights OK; target-path collision is dirty → abort
+  // with zero removals (collision is part of the same preflight batch).
+  const cfg = makeCreateCfg();
+  const clean = makeRec(42, "old-slug");
+  const collisionPath = "/repo/.worktrees/pipeline-42-new-slug";
+  const removed: string[] = [];
+
+  const deps = makeReclaimSafetyDeps({
+    listActive: async () => [clean],
+    existsSync: (p) => p === clean.path || p === collisionPath,
+    hasDirtyWorkdir: async (p) => p === collisionPath,
+    hasLocalOnlyCommits: async () => false,
+    removeWorktree: async (_cfg, _n, slug) => {
+      removed.push(slug);
+    },
+  });
+
+  await assert.rejects(
+    () => createWorktree(cfg, 42, "new-slug", deps),
+    /Cannot reclaim.*uncommitted changes/i,
+  );
+  assert.deepEqual(removed, [], "clean active worktree must not be removed when collision preflight fails");
+});
+
+test("createWorktree: race-safe reclaim uses non-force worktree remove + update-ref OID (#622 review-2 c0028d2d)", async () => {
+  const cfg = makeCreateCfg();
+  const rec = makeRec(42, "slug");
+  const oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const gitArgs: string[][] = [];
+
+  // No removeWorktree inject — production race-safe path via gitCmd.
+  const deps = makeReclaimSafetyDeps({
+    listActive: async () => [rec],
+    existsSync: (p) => p === rec.path,
+    hasDirtyWorkdir: async () => false,
+    hasLocalOnlyCommits: async () => false,
+    gitCmd: async (_cfg, _cwd, args) => {
+      gitArgs.push(args);
+      if (args[0] === "rev-parse" && args[1] === "--verify") {
+        return { code: 0, stdout: `${oid}\n`, stderr: "" };
+      }
+      if (args[0] === "worktree" && args[1] === "remove") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "update-ref") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      // fetch / worktree add / branch -D pre-add cleanup
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  // Explicitly omit removeWorktree so race-safe default runs.
+  delete (deps as { removeWorktree?: unknown }).removeWorktree;
+
+  await createWorktree(cfg, 42, "slug", deps);
+
+  const worktreeRemove = gitArgs.find((a) => a[0] === "worktree" && a[1] === "remove");
+  assert.ok(worktreeRemove, "must invoke git worktree remove");
+  assert.equal(
+    worktreeRemove!.includes("--force"),
+    false,
+    "reclaim must NOT pass --force (late dirty must be able to refuse)",
+  );
+  assert.equal(worktreeRemove![2], rec.path);
+
+  const updateRef = gitArgs.find((a) => a[0] === "update-ref" && a[1] === "-d");
+  assert.ok(updateRef, "must compare-and-delete branch via update-ref -d");
+  assert.equal(updateRef![2], `refs/heads/pipeline/42-slug`);
+  assert.equal(updateRef![3], oid, "update-ref must pass the preflight branch OID");
+
+  // Reclaim itself must not use branch -D; create may still branch -D later when
+  // preparing the fresh worktree add (after reclaim completed).
+  const updateRefIdx = gitArgs.indexOf(updateRef!);
+  const worktreeRemoveIdx = gitArgs.indexOf(worktreeRemove!);
+  const reclaimBranchD = gitArgs.some((a, i) =>
+    i <= Math.max(updateRefIdx, worktreeRemoveIdx) &&
+    a[0] === "branch" && a[1] === "-D" && a[2] === "pipeline/42-slug",
+  );
+  assert.equal(reclaimBranchD, false, "reclaim mutation must not use unconditional git branch -D");
+});
+
+test("createWorktree: late dirty worktree remove refusal aborts without branch delete (#622 review-2 c0028d2d)", async () => {
+  const cfg = makeCreateCfg();
+  const rec = makeRec(42, "slug");
+  const oid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const gitArgs: string[][] = [];
+
+  const deps = makeReclaimSafetyDeps({
+    listActive: async () => [rec],
+    existsSync: (p) => p === rec.path,
+    hasDirtyWorkdir: async () => false,
+    hasLocalOnlyCommits: async () => false,
+    gitCmd: async (_cfg, _cwd, args) => {
+      gitArgs.push(args);
+      if (args[0] === "rev-parse" && args[1] === "--verify") {
+        return { code: 0, stdout: `${oid}\n`, stderr: "" };
+      }
+      if (args[0] === "worktree" && args[1] === "remove") {
+        return {
+          code: 1,
+          stdout: "",
+          stderr: "fatal: working trees contain modified or untracked files, use --force to delete them",
+        };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  delete (deps as { removeWorktree?: unknown }).removeWorktree;
+
+  await assert.rejects(
+    () => createWorktree(cfg, 42, "slug", deps),
+    /worktree remove refused.*late dirty/i,
+  );
+
+  const updateRef = gitArgs.find((a) => a[0] === "update-ref");
+  assert.equal(updateRef, undefined, "branch must not be deleted when worktree remove refuses");
+});
+
+test("createWorktree: branch tip change after preflight refuses reclaim (#622 review-2 c0028d2d)", async () => {
+  const cfg = makeCreateCfg();
+  const rec = makeRec(42, "slug");
+  const preflightOid = "cccccccccccccccccccccccccccccccccccccccc";
+  const movedOid = "dddddddddddddddddddddddddddddddddddddddd";
+  let revParseCount = 0;
+  const gitArgs: string[][] = [];
+
+  const deps = makeReclaimSafetyDeps({
+    listActive: async () => [rec],
+    existsSync: (p) => p === rec.path,
+    hasDirtyWorkdir: async () => false,
+    hasLocalOnlyCommits: async () => false,
+    gitCmd: async (_cfg, _cwd, args) => {
+      gitArgs.push(args);
+      if (args[0] === "rev-parse" && args[1] === "--verify") {
+        revParseCount++;
+        // Preflight capture vs performReclaim revalidation
+        const oid = revParseCount === 1 ? preflightOid : movedOid;
+        return { code: 0, stdout: `${oid}\n`, stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  delete (deps as { removeWorktree?: unknown }).removeWorktree;
+
+  await assert.rejects(
+    () => createWorktree(cfg, 42, "slug", deps),
+    /branch tip changed since safety check/i,
+  );
+
+  const worktreeRemove = gitArgs.find((a) => a[0] === "worktree" && a[1] === "remove");
+  assert.equal(worktreeRemove, undefined, "must not remove worktree after tip moved");
+  const updateRef = gitArgs.find((a) => a[0] === "update-ref");
+  assert.equal(updateRef, undefined, "must not delete branch after tip moved");
+});
+
+// ---------------------------------------------------------------------------
 // review-2 finding 2: reattachIfDetached helper (#223)
 //
 // Regression: when the review stage checks out a specific SHA inside the
