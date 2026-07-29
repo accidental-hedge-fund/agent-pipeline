@@ -833,30 +833,13 @@ hours). It is **not** a seconds-only synchronous command. Do **not** treat it as
 Monitor-free fire-and-forget — follow the same spirit as single-issue advance
 (§4), using the loop event stream.
 
-#### a. Start or resume the loop
+**Critical:** the terminal result JSON is printed only when the durable supervisor
+**exits**. It is a final-summary surface, **not** a mid-flight handoff for a newly
+started drive. For in-flight event following you need `run_id` **before**
+completion — via early handoff (#665 when present), `--resume <run-id>`, or the
+race-safe state-home discovery below.
 
-```bash
-cd <repo_dir>
-node ~/.claude/skills/pipeline/scripts/pipeline.mjs loop --milestone <name>
-# or: ... loop --resume <run-id>
-# or: ... loop <N> <N> ...
-```
-
-On a preflight failure the command stops with printed remediation — do not start
-any substitute loop.
-
-#### b. Obtain `run_id` + loop events path
-
-Parse an early handoff when present (stdout/JSON carrying at least `run_id` and
-a loop events path). Otherwise:
-
-1. Take `run_id` from the printed run result JSON, the `--resume` argument, or
-   the operator's known run id.
-2. Resolve the loop **state-home**, then the events file:
-
-```text
-<state-home>/runs/<run_id>/events.jsonl
-```
+#### a. Resolve state-home, then start or resume non-blocking
 
 **State-home resolution order** (first set wins):
 
@@ -865,9 +848,90 @@ a loop events path). Otherwise:
 2. `$XDG_STATE_HOME/agent-pipeline/loop` when `XDG_STATE_HOME` is set
 3. Default: `~/.local/state/agent-pipeline/loop`
 
+The loop CLI has no `--detach` yet. Until early handoff (#665) publishes
+`run_id`/events path on stdout, start the supervisor **non-blocking** so the
+harness can discover the run directory and follow events while it runs:
+
+```bash
+cd <repo_dir>
+STATE_HOME="${AGENT_PIPELINE_STATE_HOME:-${PIPELINE_STATE_HOME:-${XDG_STATE_HOME:+$XDG_STATE_HOME/agent-pipeline/loop}}}"
+STATE_HOME="${STATE_HOME:-$HOME/.local/state/agent-pipeline/loop}"
+RUNS="$STATE_HOME/runs"
+mkdir -p "$RUNS"
+# Snapshot basenames already present (ignore staging dirs like *.init-*).
+BEFORE=$(ls -1 "$RUNS" 2>/dev/null | grep -v '\.init-' || true)
+
+# Prefer --resume when the operator already knows the id (no discovery needed).
+# Otherwise start a new/continued drive. Redirect stdout for the eventual result JSON.
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs loop --milestone <name> \
+  >"/tmp/pipeline-loop-$$.out" 2>"/tmp/pipeline-loop-$$.err" &
+# or: ... loop --resume <run-id> ...
+# or: ... loop <N> <N> ...
+LOOP_PID=$!
+```
+
+On a preflight failure the process exits quickly with printed remediation on
+stderr — do not start any substitute loop. If `$LOOP_PID` exits before a run
+directory is mapped, read `/tmp/pipeline-loop-$$.err` and stop.
+
+#### b. Obtain `run_id` + loop events path (before completion)
+
+**Order of preference:**
+
+1. **Early handoff** when present (stdout/JSON carrying at least `run_id` and a
+   loop events path — #665). Prefer this over filesystem discovery.
+2. **`--resume <run-id>`** (or an operator-known id): use that `run_id`
+   immediately; arm the Monitor before or right after launching.
+3. **Race-safe state-home discovery** for a newly started or selector-continued
+   drive (no early handoff, no resume arg). Poll until one of these holds:
+
+   - A **newly published** run directory under `$RUNS/` whose basename was **not**
+     in `$BEFORE`, with both `contract.json` and `events.jsonl` present.
+     (`initRun` publishes via exclusive rename — staging dirs use a `.init-*`
+     suffix and must be ignored.)
+   - Or an **existing** run directory that acquires a live `lock.json` whose
+     `pid` equals `$LOOP_PID` (or a child of it) after launch — covers
+     selector re-drive of an already-initialized canonical run without a new
+     directory appearing.
+
+```bash
+# Pseudocode — poll briefly (seconds, not the full run) until mapped or LOOP_PID exits.
+RUN_ID=""
+while kill -0 "$LOOP_PID" 2>/dev/null; do
+  for d in "$RUNS"/*; do
+    [ -d "$d" ] || continue
+    base=$(basename "$d")
+    case "$base" in *.init-*) continue ;; esac
+    [ -f "$d/contract.json" ] && [ -f "$d/events.jsonl" ] || continue
+    if ! printf '%s\n' "$BEFORE" | grep -qxF "$base"; then
+      RUN_ID=$base; break
+    fi
+    if [ -f "$d/lock.json" ] && grep -q "\"pid\"[[:space:]]*:[[:space:]]*$LOOP_PID" "$d/lock.json"; then
+      RUN_ID=$base; break
+    fi
+  done
+  [ -n "$RUN_ID" ] && break
+  sleep 0.5
+done
+```
+
+If multiple new directories appear (rare on a single host), prefer the one whose
+`lock.json` pid matches `$LOOP_PID`.
+
+4. **Terminal result JSON** (`/tmp/pipeline-loop-$$.out` after process exit) —
+   use only for the **final summary**, not as the sole mid-flight source of
+   `run_id` for a new drive.
+
+Then resolve the events file:
+
+```text
+<state-home>/runs/<run_id>/events.jsonl
+```
+
 #### c. Follow the loop event stream
 
-Arm a persistent Monitor (or host-equivalent follow) on the loop events file:
+Arm a persistent Monitor (or host-equivalent follow) on the loop events file
+**as soon as** `run_id` is known (step b) — do not wait for supervisor exit:
 
 ```bash
 # Interim path until a dedicated loop logs-follow CLI is universal (#666).

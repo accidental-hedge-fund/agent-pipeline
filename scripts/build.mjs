@@ -189,12 +189,16 @@ const FAST_ORCH_NOTE =
   "Run synchronously (completes in seconds). No background process or Monitor needed.";
 
 // Loop-specific orch note: long-running drive/resume + event follow; --audit stays sync.
+// Mid-flight follow needs run_id before supervisor exit — early handoff (#665), --resume,
+// or race-safe state-home discovery; terminal printed JSON is final summary only (#668).
 const LOOP_ORCH_NOTE =
   "Multi-item drive or resume is long-running (minutes to hours) and requires event following. " +
-  "Start or resume the loop, parse an early handoff for `run_id` and the loop events path when " +
-  "present (else resolve `run_id` from printed JSON / args and the loop state-home layout), follow " +
-  "the loop event stream with a persistent Monitor or host-equivalent, optionally follow an active " +
-  "item's advance events when that advance `run_id` is published, stop on a terminal loop outcome " +
+  "Start or resume the loop non-blocking, obtain `run_id` and the loop events path before " +
+  "completion (early handoff when present; else `--resume` / known id; else race-safe " +
+  "state-home discovery of a newly published or lock-held run directory — do not rely solely " +
+  "on the terminal result JSON for mid-flight follow), follow the loop event stream with a " +
+  "persistent Monitor or host-equivalent, optionally follow an active item's advance events " +
+  "when that advance `run_id` is published, stop on a terminal loop outcome " +
   "(`loop_run_stopped`) or supervisor process exit, then print a summary / `--audit`. " +
   "See the pipeline SKILL.md loop orchestration section for material event kinds and the interim " +
   "`events.jsonl` follow path. `--audit` alone is read-only and synchronous (no Monitor).";

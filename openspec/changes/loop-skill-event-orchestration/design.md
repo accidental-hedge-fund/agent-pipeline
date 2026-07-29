@@ -186,7 +186,7 @@ rewrite the facade’s execution, preflight, or merge-refusal requirements.
 |------|------------|
 | Harnesses block the session waiting for full loop completion after reclassification | Orchestration docs parallel advance: start + follow, do not require a single foreground bash with multi-hour timeout |
 | Interim `tail -F` on state-home is host-specific / path-dependent | Document state-home resolution order; prefer CLI when #666 lands |
-| Early handoff not yet available (#665) | Docs allow parsing run id from printed JSON / resume arg / state-home listing; “parse early handoff when present” |
+| Early handoff not yet available (#665) | Non-blocking start + race-safe state-home discovery (new published run dir or lock held by supervisor pid); resume arg / early handoff preferred; terminal JSON is final summary only |
 | Notification spam on schedule/reconcile | Material vs suppress lists; suppress identical burst repeats |
 | Operators confuse `--audit` with drive | Explicitly keep audit synchronous and Monitor-free |
 | Spec overreaches into engine event schema | Spec mandates docs + packaging + drift-guard only; does not change event emitters |
