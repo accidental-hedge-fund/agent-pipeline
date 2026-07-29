@@ -153,6 +153,117 @@ export async function runLoopLogs(
   }
 }
 
+/**
+ * Spawn `tail -f` and keep the child wired to parent SIGINT/SIGTERM so a
+ * direct signal to the Node CLI does not orphan the follower (#666 review).
+ * Handlers are one-shot and removed when follow settles (child exit, error,
+ * or interrupt). Resolves with conventional shell status 130 (SIGINT) /
+ * 143 (SIGTERM) when interrupted; otherwise the child exit code.
+ *
+ * `io.spawn` / `io.process` are injectable for unit tests — no real process
+ * or signal is required.
+ */
+export type FollowFileSpawn = (
+  command: string,
+  args: readonly string[],
+  options: { stdio: "inherit" },
+) => {
+  kill(signal?: NodeJS.Signals): boolean;
+  on(event: "error", listener: (err: Error) => void): void;
+  on(
+    event: "exit",
+    listener: (code: number | null, signal: NodeJS.Signals | null) => void,
+  ): void;
+};
+
+export type FollowFileProcess = {
+  on(event: "SIGINT" | "SIGTERM", listener: () => void): void;
+  removeListener(event: "SIGINT" | "SIGTERM", listener: () => void): void;
+  stderr: { write(s: string): void };
+};
+
+export function followFileWithSignalCleanup(
+  logFile: string,
+  io: {
+    spawn?: FollowFileSpawn;
+    process?: FollowFileProcess;
+  } = {},
+): Promise<number | null> {
+  const doSpawn: FollowFileSpawn =
+    io.spawn ??
+    ((command, args, options) =>
+      spawn(command, [...args], options) as ReturnType<FollowFileSpawn>);
+  const proc: FollowFileProcess = io.process ?? process;
+
+  return new Promise<number | null>((resolve) => {
+    let settled = false;
+    let interrupted: NodeJS.Signals | null = null;
+    // Populated before any signal can fire (handlers installed after spawn).
+    let onSigint: () => void = () => {};
+    let onSigterm: () => void = () => {};
+
+    const settle = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      proc.removeListener("SIGINT", onSigint);
+      proc.removeListener("SIGTERM", onSigterm);
+      resolve(code);
+    };
+
+    const interruptStatus = (sig: NodeJS.Signals): number =>
+      sig === "SIGINT" ? 130 : 143;
+
+    let tail: ReturnType<FollowFileSpawn>;
+    try {
+      tail = doSpawn("tail", ["-f", logFile], { stdio: "inherit" });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      proc.stderr.write(`pipeline loop logs: failed to start tail: ${msg}\n`);
+      settle(1);
+      return;
+    }
+
+    const onParentSignal = (sig: NodeJS.Signals) => {
+      if (settled || interrupted) return;
+      interrupted = sig;
+      // One-shot: do not re-enter; exit path settles after the child dies.
+      proc.removeListener("SIGINT", onSigint);
+      proc.removeListener("SIGTERM", onSigterm);
+      try {
+        tail.kill(sig);
+      } catch {
+        // Child already gone — still report interrupted status.
+        settle(interruptStatus(sig));
+      }
+    };
+    onSigint = () => onParentSignal("SIGINT");
+    onSigterm = () => onParentSignal("SIGTERM");
+
+    proc.on("SIGINT", onSigint);
+    proc.on("SIGTERM", onSigterm);
+
+    tail.on("error", (err) => {
+      proc.stderr.write(`pipeline loop logs: failed to start tail: ${err.message}\n`);
+      settle(1);
+    });
+    tail.on("exit", (code, signal) => {
+      if (interrupted) {
+        settle(interruptStatus(interrupted));
+        return;
+      }
+      if (signal === "SIGINT") {
+        settle(130);
+        return;
+      }
+      if (signal === "SIGTERM") {
+        settle(143);
+        return;
+      }
+      settle(code);
+    });
+  });
+}
+
 /** Real-filesystem + `tail -f` defaults. Follow inherits stdio so operators see
  *  lines as they are appended; the process remains open until interrupt. */
 export function defaultLoopLogsDeps(env: NodeJS.ProcessEnv = process.env): LoopLogsDeps {
@@ -186,17 +297,7 @@ export function defaultLoopLogsDeps(env: NodeJS.ProcessEnv = process.env): LoopL
       }
     },
     followFile(logFile) {
-      return new Promise<number | null>((resolve) => {
-        const tail = spawn("tail", ["-f", logFile], { stdio: "inherit" });
-        tail.on("error", (err) => {
-          process.stderr.write(`pipeline loop logs: failed to start tail: ${err.message}\n`);
-          process.exitCode = 1;
-          resolve(1);
-        });
-        tail.on("exit", (code) => {
-          resolve(code);
-        });
-      });
+      return followFileWithSignalCleanup(logFile);
     },
     stdoutWrite(s) {
       process.stdout.write(s);

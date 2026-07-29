@@ -6,9 +6,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import {
+  followFileWithSignalCleanup,
   listLoopRunIds,
   loopEventsPath,
   runLoopLogs,
+  type FollowFileProcess,
+  type FollowFileSpawn,
   type LoopLogsDeps,
   PIPELINE_STATE_HOME_ENV,
 } from "../scripts/loop/logs.ts";
@@ -333,6 +336,127 @@ test("loop-logs: follow propagates non-zero exit from follow seam", async () => 
   await runLoopLogs(RUN_A, true, deps);
   assert.equal(process.exitCode, 2);
   process.exitCode = 0;
+});
+
+// ---------------------------------------------------------------------------
+// followFileWithSignalCleanup — SIGTERM/SIGINT must not orphan tail (#666)
+// ---------------------------------------------------------------------------
+
+function makeFakeFollowIo(): {
+  spawn: FollowFileSpawn;
+  process: FollowFileProcess;
+  killSignals: NodeJS.Signals[];
+  fireSignal(sig: "SIGINT" | "SIGTERM"): void;
+  emitExit(code: number | null, signal: NodeJS.Signals | null): void;
+  emitError(err: Error): void;
+  handlersInstalled(): { sigint: boolean; sigterm: boolean };
+} {
+  const killSignals: NodeJS.Signals[] = [];
+  let onExit: ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined;
+  let onError: ((err: Error) => void) | undefined;
+  const listeners = new Map<"SIGINT" | "SIGTERM", () => void>();
+
+  const spawn: FollowFileSpawn = (_command, _args, _options) => ({
+    kill(signal) {
+      if (signal) killSignals.push(signal);
+      return true;
+    },
+    on(event, listener) {
+      if (event === "error") onError = listener as (err: Error) => void;
+      if (event === "exit") {
+        onExit = listener as (code: number | null, signal: NodeJS.Signals | null) => void;
+      }
+    },
+  });
+
+  const proc: FollowFileProcess = {
+    on(event, listener) {
+      listeners.set(event, listener);
+    },
+    removeListener(event, listener) {
+      if (listeners.get(event) === listener) listeners.delete(event);
+    },
+    stderr: { write() {} },
+  };
+
+  return {
+    spawn,
+    process: proc,
+    killSignals,
+    fireSignal(sig) {
+      const h = listeners.get(sig);
+      assert.ok(h, `expected ${sig} handler to be installed`);
+      h();
+    },
+    emitExit(code, signal) {
+      assert.ok(onExit, "expected exit listener");
+      onExit(code, signal);
+    },
+    emitError(err) {
+      assert.ok(onError, "expected error listener");
+      onError(err);
+    },
+    handlersInstalled() {
+      return { sigint: listeners.has("SIGINT"), sigterm: listeners.has("SIGTERM") };
+    },
+  };
+}
+
+test("followFileWithSignalCleanup: SIGTERM kills tail child and resolves interrupted status", async () => {
+  const io = makeFakeFollowIo();
+  const done = followFileWithSignalCleanup("/tmp/events.jsonl", {
+    spawn: io.spawn,
+    process: io.process,
+  });
+  assert.deepEqual(io.handlersInstalled(), { sigint: true, sigterm: true });
+
+  io.fireSignal("SIGTERM");
+  assert.deepEqual(io.killSignals, ["SIGTERM"], "parent SIGTERM must be forwarded to tail");
+  assert.deepEqual(
+    io.handlersInstalled(),
+    { sigint: false, sigterm: false },
+    "handlers are one-shot and removed on interrupt",
+  );
+
+  // Child exits after receiving the forwarded signal (await before settle).
+  io.emitExit(null, "SIGTERM");
+  assert.equal(await done, 143);
+});
+
+test("followFileWithSignalCleanup: SIGINT kills tail child and resolves 130", async () => {
+  const io = makeFakeFollowIo();
+  const done = followFileWithSignalCleanup("/tmp/events.jsonl", {
+    spawn: io.spawn,
+    process: io.process,
+  });
+  io.fireSignal("SIGINT");
+  assert.deepEqual(io.killSignals, ["SIGINT"]);
+  io.emitExit(null, "SIGINT");
+  assert.equal(await done, 130);
+  assert.deepEqual(io.handlersInstalled(), { sigint: false, sigterm: false });
+});
+
+test("followFileWithSignalCleanup: child exit removes signal handlers without interrupt", async () => {
+  const io = makeFakeFollowIo();
+  const done = followFileWithSignalCleanup("/tmp/events.jsonl", {
+    spawn: io.spawn,
+    process: io.process,
+  });
+  io.emitExit(0, null);
+  assert.equal(await done, 0);
+  assert.equal(io.killSignals.length, 0);
+  assert.deepEqual(io.handlersInstalled(), { sigint: false, sigterm: false });
+});
+
+test("followFileWithSignalCleanup: spawn error settles non-zero and removes handlers", async () => {
+  const io = makeFakeFollowIo();
+  const done = followFileWithSignalCleanup("/tmp/events.jsonl", {
+    spawn: io.spawn,
+    process: io.process,
+  });
+  io.emitError(new Error("tail not found"));
+  assert.equal(await done, 1);
+  assert.deepEqual(io.handlersInstalled(), { sigint: false, sigterm: false });
 });
 
 // ---------------------------------------------------------------------------
