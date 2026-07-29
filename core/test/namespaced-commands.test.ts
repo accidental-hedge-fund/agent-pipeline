@@ -164,6 +164,20 @@ test("namespaced-commands 7.5b3: loop wrapper drives in-repo, never delegates to
     /in-repo/i.test(claude) && /supervisor/i.test(claude),
     `loop Claude wrapper should describe the in-repo loop supervisor: ${claude}`,
   );
+
+  // #665: multi-item durable drive must not claim "completes in seconds" / "No Monitor".
+  assert.ok(
+    !/completes in seconds/i.test(claude),
+    `loop Claude wrapper must not claim multi-item drive completes in seconds: ${claude}`,
+  );
+  assert.ok(
+    !/No Monitor needed/i.test(claude),
+    `loop Claude wrapper must not claim No Monitor is needed for multi-item drive: ${claude}`,
+  );
+  assert.ok(
+    /loop_run_handoff/.test(claude) && /events/.test(claude),
+    `loop Claude wrapper should document early handoff run_id + events path: ${claude}`,
+  );
 });
 
 // ---------------------------------------------------------------------------

@@ -171,7 +171,9 @@ export const OPERATION_SURFACE = [
     desc: "Durable multi-item run — driven in-repo by the pipeline's own loop supervisor",
     argHint: "[--milestone <name>] [--label <label>] [--range <spec>] [--roadmap-slice <slice>] [<N> ...] [--resume <run-id>] [--audit]",
     cliArgs: "loop $ARGUMENTS",
-    fast: true,
+    // Multi-item durable drive is long-running; do not use the "completes in
+    // seconds / No Monitor" orch note. Packaging text is specialized via inRepoLoop.
+    fast: false,
     inRepoLoop: true,
   },
 ];
@@ -193,7 +195,15 @@ export function renderClaudeCommand(op, skillPath) {
     : op.argHint
     ? `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``
     : `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``;
-  const orchNote = op.fast
+  // Durable multi-item loop drives can run for tens of minutes; advertise the
+  // early handoff rather than claiming "completes in seconds / No Monitor" (#665).
+  const orchNote = op.inRepoLoop
+    ? "Runs in the foreground for the wall-clock duration of the multi-item drive. " +
+      "On successful create/resume and exclusive lock, emits an early machine-readable stdout JSON " +
+      'line (`kind: "loop_run_handoff"`) with `run_id` and absolute `events` path so a harness can ' +
+      "follow structured progress; the terminal summary JSON is printed when the supervisor finishes. " +
+      "`--audit` remains short-lived and read-only."
+    : op.fast
     ? "Run synchronously (completes in seconds). No background process or Monitor needed."
     : "See the pipeline SKILL.md for orchestration instructions when this command runs a model harness.";
   const specialNote = op.specialCli
@@ -204,8 +214,10 @@ export function renderClaudeCommand(op, skillPath) {
       "normalization, loop:store-schema-compatibility, native-/goal capability), then this skill's own " +
       "durable loop supervisor (contract, ledger, lock, recovery, reconciliation, resume), executing each " +
       "selected item through the pipeline's own state machine and evidence gates. It invokes no external " +
-      "orchestrator skill and never merges. The command prints the run result as JSON. On a preflight " +
-      "failure it stops and reports the printed remediation; do not start any substitute loop."
+      "orchestrator skill and never merges. After lock acquisition it prints an early `loop_run_handoff` " +
+      "JSON object (`run_id` + absolute `events` path) for progress follow, then the terminal run result " +
+      "as JSON when the supervisor returns. On a preflight failure it stops and reports the printed " +
+      "remediation; do not start any substitute loop."
     : "";
 
   return [

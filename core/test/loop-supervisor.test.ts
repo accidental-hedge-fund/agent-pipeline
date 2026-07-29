@@ -7,6 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as path from "node:path";
 import {
   DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT,
   attachSupervisor,
@@ -16,7 +17,17 @@ import {
   runSupervisorCycle,
   type SupervisorDeps,
 } from "../scripts/loop/supervisor.ts";
-import { acquireLock, initRun, readEvents, readLedger, readLock, writeLedger, type LoopStoreDeps } from "../scripts/loop/store.ts";
+import {
+  acquireLock,
+  initRun,
+  readEvents,
+  readLedger,
+  readLock,
+  runDir,
+  runEventsPath,
+  writeLedger,
+  type LoopStoreDeps,
+} from "../scripts/loop/store.ts";
 import { DEFAULT_RECOVERY_POLICY } from "../scripts/loop/recovery.ts";
 import type { ReconcileObserveDeps } from "../scripts/loop/reconcile.ts";
 import {
@@ -263,6 +274,99 @@ test("driveSupervisor executes dependency-ordered items to a terminal condition 
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "ready");
   assert.equal(finalLedger.items["200"].state, "ready");
+});
+
+// ---------------------------------------------------------------------------
+// Early run handoff seam (#665): onRunReady after lock, before first dispatch.
+// ---------------------------------------------------------------------------
+
+test("driveSupervisor fires onRunReady once after lock and before any dispatchItem (#665)", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const order: string[] = [];
+  const { observe, dispatchItem, calls } = coordinatedFakes();
+  const wrappedDispatch: SupervisorDeps["dispatchItem"] = async (request) => {
+    order.push("dispatch");
+    return dispatchItem(request);
+  };
+  let readyCtx: Awaited<Parameters<NonNullable<Parameters<typeof driveSupervisor>[1]["onRunReady"]>>[0]> | null = null;
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem: wrappedDispatch },
+    {
+      runId: "run-1",
+      engine: "claude",
+      onRunReady: async (ctx) => {
+        order.push("onRunReady");
+        readyCtx = ctx;
+      },
+    },
+  );
+
+  assert.equal(result.allDone, true);
+  assert.deepEqual(order, ["onRunReady", "dispatch"]);
+  assert.equal(calls.length, 1);
+  assert.ok(readyCtx);
+  assert.equal(readyCtx!.runId, "run-1");
+  assert.equal(readyCtx!.engine, "claude");
+  assert.equal(readyCtx!.resumed, false);
+  assert.equal(readyCtx!.runDir, runDir(deps, "run-1"));
+  assert.equal(readyCtx!.events, runEventsPath(deps, "run-1"));
+  assert.ok(path.isAbsolute(readyCtx!.runDir));
+  assert.ok(path.isAbsolute(readyCtx!.events));
+  assert.ok(readyCtx!.events.endsWith("/events.jsonl"));
+});
+
+test("driveSupervisor onRunReady reports resumed:true under --resume (#665)", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  // Item already done so resume attaches, fires onRunReady, and exits without dispatch.
+  const ledger = testLedger({ "100": itemEntry("100", "ready") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem, calls } = coordinatedFakes();
+  let resumed: boolean | null = null;
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem },
+    {
+      runId: "run-1",
+      engine: "claude",
+      resume: true,
+      onRunReady: async (ctx) => {
+        resumed = ctx.resumed;
+      },
+    },
+  );
+
+  assert.equal(result.resumed, true);
+  assert.equal(resumed, true);
+  assert.equal(calls.length, 0, "already-done run should not dispatch");
+});
+
+test("driveSupervisor does not fire onRunReady when lock acquisition fails (#665)", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  // Hold the lock as a live process so non-resume attach fails.
+  await acquireLock(deps, "run-1", "codex");
+  let readyCalls = 0;
+  const { observe, dispatchItem } = coordinatedFakes();
+
+  await assert.rejects(
+    () =>
+      driveSupervisor(
+        { store: deps, observe, dispatchItem },
+        {
+          runId: "run-1",
+          engine: "claude",
+          onRunReady: async () => {
+            readyCalls++;
+          },
+        },
+      ),
+    /already locked/,
+  );
+  assert.equal(readyCalls, 0);
 });
 
 // ---------------------------------------------------------------------------
