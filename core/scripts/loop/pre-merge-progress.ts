@@ -84,7 +84,10 @@ export interface ProgressMirrorState {
   emitted: Set<string>;
   /** True after a ci/waiting was emitted for the current wait stretch. */
   ciWaitingOpen: boolean;
-  /** Lines already consumed from the advance file (for offset-based tailing). */
+  /**
+   * Complete (newline-terminated) non-empty lines already consumed from the
+   * advance file. Unterminated trailing fragments are never counted here.
+   */
   linesConsumed: number;
 }
 
@@ -356,27 +359,34 @@ export function parseAdvanceEventsJsonl(raw: string): Record<string, unknown>[] 
 
 /**
  * Consume newly appended advance events since `state.linesConsumed` and map
- * them to progress payloads. Updates `linesConsumed` to the full line count.
+ * them to progress payloads. Updates `linesConsumed` to the count of complete
+ * (newline-terminated) non-empty records only.
+ *
+ * An unterminated trailing fragment — e.g. a concurrent append still in flight —
+ * is never counted as consumed. The next poll re-reads the full file and
+ * processes that record once a terminating newline appears. Counting partial
+ * tails would permanently skip the completed gate outcome on the subsequent poll.
  */
 export function mapNewAdvanceLinesToProgress(
   linkage: ProgressLinkage,
   rawJsonl: string,
   state: ProgressMirrorState,
 ): { payloads: LoopItemProgressPayload[]; state: ProgressMirrorState } {
-  const lines = rawJsonl.split("\n");
-  // Drop a trailing empty segment from a final newline so line counts match
-  // non-empty records; still include partial last lines for parseAdvanceEventsJsonl.
-  const nonemptyIndices: number[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim()) nonemptyIndices.push(i);
+  // Only newline-terminated records are complete. Content after the last `\n`
+  // (or the entire body when no newline exists) is an incomplete tail.
+  const lastNl = rawJsonl.lastIndexOf("\n");
+  const completeBody = lastNl === -1 ? "" : rawJsonl.slice(0, lastNl + 1);
+  const nonemptyComplete: string[] = [];
+  for (const line of completeBody.split("\n")) {
+    if (line.trim()) nonemptyComplete.push(line);
   }
-  const startIdx = Math.min(state.linesConsumed, nonemptyIndices.length);
-  const newLines = nonemptyIndices.slice(startIdx).map((i) => lines[i]);
+  const startIdx = Math.min(state.linesConsumed, nonemptyComplete.length);
+  const newLines = nonemptyComplete.slice(startIdx);
   const newEvents = parseAdvanceEventsJsonl(newLines.join("\n"));
   const mapped = mapAdvanceEventsToProgress(linkage, newEvents, state);
   return {
     payloads: mapped.payloads,
-    state: { ...mapped.state, linesConsumed: nonemptyIndices.length },
+    state: { ...mapped.state, linesConsumed: nonemptyComplete.length },
   };
 }
 

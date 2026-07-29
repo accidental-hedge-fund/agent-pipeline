@@ -265,6 +265,43 @@ test("regression: re-read identical waiting via mapNewAdvanceLinesToProgress is 
   assert.equal(waiting.length, 1);
 });
 
+test("regression: partial JSONL tail is not permanently skipped (#682 ac434766)", () => {
+  const fullEvent = gate("openspec-archive", "pass", "change-id");
+  const fullLine = JSON.stringify(fullEvent);
+  // Mid-append: truncated JSON without a terminating newline.
+  const partial = fullLine.slice(0, Math.floor(fullLine.length / 2));
+  let state = createProgressMirrorState();
+  const a = mapNewAdvanceLinesToProgress(LINKAGE, partial, state);
+  state = a.state;
+  assert.equal(a.payloads.length, 0);
+  assert.equal(
+    state.linesConsumed,
+    0,
+    "unterminated partial tail must not advance the consume cursor",
+  );
+
+  // Writer finishes the record; next poll must mirror the gate outcome.
+  const b = mapNewAdvanceLinesToProgress(LINKAGE, `${fullLine}\n`, state);
+  assert.deepEqual(steps(b.payloads), ["openspec_archive/pass"]);
+  assert.equal(b.state.linesConsumed, 1);
+});
+
+test("regression: partial gate_result after complete lines is deferred then mirrored", () => {
+  const waitingLine = JSON.stringify(gate("ci", "partial", "CI still running"));
+  const failFull = JSON.stringify(gate("ci", "fail", "CI failed"));
+  const failPartial = failFull.slice(0, 24);
+  let state = createProgressMirrorState();
+  const a = mapNewAdvanceLinesToProgress(LINKAGE, `${waitingLine}\n${failPartial}`, state);
+  state = a.state;
+  assert.deepEqual(steps(a.payloads), ["ci/waiting"]);
+  assert.equal(state.linesConsumed, 1, "only the complete waiting line is consumed");
+
+  const b = mapNewAdvanceLinesToProgress(LINKAGE, `${waitingLine}\n${failFull}\n`, state);
+  assert.deepEqual(steps(b.payloads), ["ci/fail"]);
+  assert.equal(b.payloads[0].detail?.classification, "ci_failed");
+  assert.equal(b.state.linesConsumed, 2);
+});
+
 test("classifyCiBlockerReason maps stable tokens", () => {
   assert.equal(classifyCiBlockerReason("CI failed"), "ci_failed");
   assert.equal(classifyCiBlockerReason("ci_mode: local — inline test gate failed"), "ci_mode_local");
@@ -378,13 +415,16 @@ test("supervisor: progress events join on the same item_id + pipeline_run_id as 
 
   const realRunId = "554-2026-07-29T17-23-40-332Z";
   const eventsPath = `/repo/.agent-pipeline/runs/${realRunId}/events.jsonl`;
-  const advanceBody = [
-    gate("openspec-archive", "pass", "loop-positional"),
-    gate("ci", "fail", "CI failed"),
-    { type: "stage_complete", stage: "pre-merge", outcome: "blocked" },
-  ]
-    .map((e) => JSON.stringify(e))
-    .join("\n");
+  // Trailing newline required: mirror only consumes newline-terminated records
+  // (production appendEvent writes `${JSON.stringify(event)}\n`).
+  const advanceBody =
+    [
+      gate("openspec-archive", "pass", "loop-positional"),
+      gate("ci", "fail", "CI failed"),
+      { type: "stage_complete", stage: "pre-merge", outcome: "blocked" },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join("\n") + "\n";
 
   // Coordinated observe: ready labels only after dispatch (same pattern as loop-supervisor tests).
   const dispatched = new Set<string>();
