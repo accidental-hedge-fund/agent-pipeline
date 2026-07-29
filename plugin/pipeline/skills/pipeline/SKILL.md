@@ -887,8 +887,11 @@ directory is mapped, read `/tmp/pipeline-loop-$$.err` and stop.
    publishes are visible, then **scan every candidate** under `$RUNS/` each poll
    (ignore `.init-*` staging). Select **only** a directory that has both
    `contract.json` and `events.jsonl` **and** a live `lock.json` whose `pid`
-   equals `$LOOP_PID` (or a child of it). That single rule covers a newly
-   published run and selector re-drive of an already-initialized canonical run.
+   is **exactly** `$LOOP_PID` as an integer, **or** a process-tree **descendant**
+   of `$LOOP_PID` (walk parents of the lock pid until match). Ownership is
+   **numeric identity only** — never string/grep prefix matching (`123` must
+   **not** match lock pid `12345`). That single rule covers a newly published
+   run and selector re-drive of an already-initialized canonical run.
    **Never** break on the first newly published basename (glob order is not
    ownership). If one or more new directories exist without a lock owned by
    `$LOOP_PID`, keep polling until a lock match appears or `$LOOP_PID` exits.
@@ -896,6 +899,36 @@ directory is mapped, read `/tmp/pipeline-loop-$$.err` and stop.
 ```bash
 # Pseudocode — poll briefly (seconds, not the full run) until mapped or LOOP_PID exits.
 # Scan ALL candidates; select ONLY a run with a live lock owned by $LOOP_PID.
+# Ownership: exact integer pid equality, or lock pid is a descendant of LOOP_PID
+# (parent-chain walk). NEVER unanchored grep of "$LOOP_PID" (prefix false match).
+
+# Extract lock.pid as a whole non-negative integer field (JSON number or digits).
+lock_pid_from_json() {
+  # Prefer node for exact JSON; falls back to a whole-field sed capture (digits only).
+  node -e 'const fs=require("fs");let j;try{j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));}catch{process.exit(2)}
+const p=j&&j.pid; if(typeof p==="number"&&Number.isInteger(p)&&p>0){process.stdout.write(String(p));process.exit(0)}
+if(typeof p==="string"&&/^\d+$/.test(p)){process.stdout.write(p);process.exit(0)} process.exit(1)' "$1" 2>/dev/null \
+  || sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" | head -1
+}
+
+# True if $1 is exactly $2, or $1's parent chain reaches $2 (descendant of launcher).
+lock_owned_by_launcher() {
+  local lock_pid="$1" launcher="$2" cur parent
+  case "$lock_pid" in ''|*[!0-9]*) return 1 ;; esac
+  case "$launcher" in ''|*[!0-9]*) return 1 ;; esac
+  cur=$lock_pid
+  # Bound the walk to avoid cycles; require integer comparisons only.
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32; do
+    [ "$cur" -eq "$launcher" ] 2>/dev/null && return 0
+    [ "$cur" -le 1 ] 2>/dev/null && return 1
+    parent=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')
+    case "$parent" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$parent" -eq "$cur" ] 2>/dev/null && return 1
+    cur=$parent
+  done
+  return 1
+}
+
 RUN_ID=""
 while kill -0 "$LOOP_PID" 2>/dev/null; do
   for d in "$RUNS"/*; do
@@ -903,7 +936,12 @@ while kill -0 "$LOOP_PID" 2>/dev/null; do
     base=$(basename "$d")
     case "$base" in *.init-*) continue ;; esac
     [ -f "$d/contract.json" ] && [ -f "$d/events.jsonl" ] || continue
-    if [ -f "$d/lock.json" ] && grep -q "\"pid\"[[:space:]]*:[[:space:]]*$LOOP_PID" "$d/lock.json"; then
+    [ -f "$d/lock.json" ] || continue
+    lock_pid=$(lock_pid_from_json "$d/lock.json") || continue
+    case "$lock_pid" in ''|*[!0-9]*) continue ;; esac
+    # Live lock holder (not merely a stale file).
+    kill -0 "$lock_pid" 2>/dev/null || continue
+    if lock_owned_by_launcher "$lock_pid" "$LOOP_PID"; then
       RUN_ID=$base
       break
     fi

@@ -258,6 +258,29 @@ test("namespaced-commands 7.5b4b: true-fast peers may still use the shared secon
   }
 });
 
+// #668 pre-merge: skill lock discovery must not use unanchored grep of $LOOP_PID
+// (pid 123 matching lock pid 12345).
+test("namespaced-commands 7.5b5: host loop skill ownership is exact PID, not grepped prefix", () => {
+  const repoRoot = join(__dirname, "..", "..");
+  const hostSkills = [
+    join(repoRoot, "hosts", "claude", "SKILL.md"),
+    join(repoRoot, "hosts", "codex", "SKILL.md"),
+  ];
+  // Forbidden: grep matching "\"pid\":$LOOP_PID" which prefix-matches 12345 when LOOP_PID=123.
+  const badGrep = /grep\s+-q\s+"\\"pid\\"[^"]*\$LOOP_PID/;
+  for (const path of hostSkills) {
+    const body = readFileSync(path, "utf8");
+    assert.ok(
+      !badGrep.test(body),
+      `${path} must not use unanchored grep of $LOOP_PID against lock.json (#668)`,
+    );
+    assert.ok(
+      /lock_owned_by_launcher|numeric identity only|exact integer/i.test(body),
+      `${path} should document exact/numeric lock ownership (#668)`,
+    );
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 7.5c  Each command file starts with YAML front-matter referencing its operation name
 // ---------------------------------------------------------------------------
