@@ -1023,31 +1023,49 @@ If you arm a host Monitor instead of (or around) that CLI, do **not** leave it
 **Do not** use a bare `tail -F` on `events.jsonl` as a follow fallback: it never
 exits after `loop_run_stopped`, prints no final summary, and leaves zombie
 follows. Prefer the CLI above. A raw dual-follow / multi-stream script is only
-valid when it owns and terminates its tail child, prints a final summary line,
-and **`exit 0`** after `loop_run_stopped`.
+valid when it **explicitly tracks** its tail child PID, **TERM/KILL**s that child
+before exit (process substitution + bare `exit 0` orphans `tail -F`), prints a
+final summary line, and **`exit 0`** after `loop_run_stopped`.
 
 Never forbid Monitor or background following for drive/resume.
 
 **Dual-follow / multi-stream pattern** (loop + optional advance): when the
 script observes `loop_run_stopped` on the loop stream, print a final summary
-line (include terminal reason when present) and **`exit 0`**. Do **not** print
-`TERMINAL` inside `while true` and keep looping — that leaves zombie follows.
-Example terminal-aware raw fallback (owns tail via process substitution; prefer
-the CLI):
+line (include terminal reason when present), **terminate the tracked tail
+child**, and **`exit 0`**. Do **not** print `TERMINAL` inside `while true` and
+keep looping — that leaves zombie follows. Example terminal-aware raw fallback
+(explicit child teardown; prefer the CLI):
 
 ```bash
 # Prefer: pipeline loop logs <run_id> --events --follow  (auto-exits on terminal)
 EVENTS="<state-home>/runs/<run_id>/events.jsonl"
+# Process substitution alone does NOT kill tail -F on exit — track + TERM/KILL.
+FIFO=$(mktemp -u)
+mkfifo "$FIFO"
+tail -n +1 -F "$EVENTS" >"$FIFO" &
+TAIL_PID=$!
+stop_tail() {
+  [ -n "${TAIL_PID:-}" ] || return 0
+  kill -TERM "$TAIL_PID" 2>/dev/null || true
+  sleep 0.1
+  kill -KILL "$TAIL_PID" 2>/dev/null || true
+  wait "$TAIL_PID" 2>/dev/null || true
+  TAIL_PID=""
+  rm -f "$FIFO"
+}
+trap stop_tail EXIT INT TERM
 while IFS= read -r line; do
   printf '%s\n' "$line"
   case "$line" in
     *'"kind":"loop_run_stopped"'*|*'"kind": "loop_run_stopped"'*)
       reason=$(printf '%s' "$line" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
       echo "TERMINAL reason=${reason:-stopped}; follows stopped"
+      stop_tail
+      trap - EXIT INT TERM
       exit 0
       ;;
   esac
-done < <(tail -n +1 -F "$EVENTS")
+done <"$FIFO"
 ```
 
 #### d. Optional: follow active item advance events when published

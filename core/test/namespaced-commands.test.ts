@@ -322,8 +322,9 @@ test("namespaced-commands 7.5b6: host loop skill stop-on-terminal + dual-follow 
       `${skillPath} must document until-terminal / exit-on-loop_run_stopped for loop logs follow (#699)`,
     );
     // Forbidden: bare `tail -F` on events.jsonl as a standalone follow command.
-    // Allowed only when nested in a terminal-aware wrapper (while/read + exit 0
-    // on loop_run_stopped) that owns the tail process.
+    // Allowed only when nested in a terminal-aware wrapper that (1) exit 0s on
+    // loop_run_stopped AND (2) explicitly tracks + TERM/KILLs the tail child.
+    // Process substitution + bare exit 0 orphans tail -F (zombie follow).
     const lines = body.split("\n");
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
@@ -337,22 +338,37 @@ test("namespaced-commands 7.5b6: host loop skill stop-on-terminal + dual-follow 
       let fenceEnd = i;
       while (fenceEnd < lines.length - 1 && !/^```/.test(lines[fenceEnd + 1]!)) fenceEnd++;
       const fence = lines.slice(fenceStart, fenceEnd + 1).join("\n");
-      const terminalAware =
+      const hasExit =
         /\bexit 0\b/.test(fence) &&
         (/\bwhile\b/.test(fence) || /\bread\b/.test(fence)) &&
         /loop_run_stopped/.test(fence);
-      if (!terminalAware) {
+      // Child teardown: tracked PID + kill -TERM / kill -KILL (not process-sub alone).
+      const hasChildTeardown =
+        /TAIL_PID|tail_pid/.test(fence) &&
+        /kill\s+-TERM|kill\s+-KILL|kill\s+-\$?TERM|kill\s+-\$?KILL/.test(fence);
+      // Process-sub alone is explicitly insufficient (#699 review-2 f7ea742f).
+      const processSubOnly =
+        /<\s*<\s*\(\s*tail\b/.test(fence) && !hasChildTeardown;
+      if (!hasExit || !hasChildTeardown || processSubOnly) {
         assert.fail(
-          `${skillPath} documents bare tail -F on events.jsonl without terminal-aware ownership (must exit 0 after loop_run_stopped): ${line}`,
+          `${skillPath} documents tail -F on events.jsonl without explicit child teardown ` +
+            `(must track TAIL_PID, kill -TERM/-KILL, and exit 0 after loop_run_stopped; ` +
+            `process substitution + exit 0 alone is not enough): ${line}`,
         );
       }
     }
-    // Must explicitly forbid bare tail or document terminal-aware ownership.
+    // Must explicitly forbid bare tail or document terminal-aware ownership with
+    // child teardown (not process-sub / exit-0-only).
     assert.ok(
-      /bare `?tail -F`?|do \*\*not\*\* use a bare `?tail|owns and terminates its tail|terminal-aware/i.test(
+      /bare `?tail -F`?|do \*\*not\*\* use a bare `?tail|TERM\/KILL|kill -TERM|explicit(?:ly)? track|child teardown|terminal-aware/i.test(
         body,
       ),
-      `${skillPath} must forbid bare tail -F or require terminal-aware tail ownership (#699)`,
+      `${skillPath} must forbid bare tail -F or require explicit tail child teardown (#699)`,
+    );
+    // Guard: process-sub + exit 0 alone must not be presented as sufficient ownership.
+    assert.ok(
+      !/owns tail via process substitution/i.test(body),
+      `${skillPath} must not claim process substitution owns/terminates tail (#699 f7ea742f)`,
     );
   }
 
