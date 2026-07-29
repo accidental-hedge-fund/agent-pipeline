@@ -613,9 +613,13 @@ mkdir -p "$RUNS"
 BEFORE=$(ls -1 "$RUNS" 2>/dev/null | grep -v '\.init-' || true)
 
 # Prefer --resume when the operator already knows the id (no discovery needed).
-# Otherwise start a new/continued drive. Redirect stdout for the eventual result JSON.
+# Otherwise start a new/continued drive. Use a unique result dir per invocation
+# (mktemp) so concurrent loops never share stdout/stderr paths (#668).
+LOOP_RESULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pipeline-loop.XXXXXX")
+LOOP_OUT="$LOOP_RESULT_DIR/out.json"
+LOOP_ERR="$LOOP_RESULT_DIR/err.txt"
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --milestone <name> \
-  >"/tmp/pipeline-loop-$$.out" 2>"/tmp/pipeline-loop-$$.err" &
+  >"$LOOP_OUT" 2>"$LOOP_ERR" &
 # or: ... loop --resume <run-id> ...
 # or: ... loop <N> <N> ...
 LOOP_PID=$!
@@ -639,8 +643,8 @@ LOOP_START=$(process_starttime "$LOOP_PID") || { echo "failed to capture launche
 On a preflight failure the process exits quickly with printed remediation on
 stderr — do not start any substitute loop. If `$LOOP_PID` exits (or its
 starttime changes — PID reuse) before a run directory is mapped, read
-`/tmp/pipeline-loop-$$.err` and stop. Do not leave a live supervisor unobserved
-when the Codex turn ends without an event-follow plan.
+`$LOOP_ERR` and stop. Do not leave a live supervisor unobserved when the Codex
+turn ends without an event-follow plan.
 
 #### b. Obtain `run_id` + loop events path (before completion)
 
@@ -734,7 +738,7 @@ while launcher_instance_alive; do
 done
 ```
 
-4. **Terminal result JSON** (`/tmp/pipeline-loop-$$.out` after process exit) —
+4. **Terminal result JSON** (`$LOOP_OUT` after process exit) —
    use only for the **final summary**, not as the sole mid-flight source of
    `run_id` for a new drive.
 

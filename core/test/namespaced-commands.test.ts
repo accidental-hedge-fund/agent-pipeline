@@ -286,6 +286,14 @@ test("namespaced-commands 7.5b5: host loop skill ownership is exact PID, not gre
       /lstart|Darwin|macOS|portable/i.test(body) && /proc/i.test(body),
       `${path} should document Linux /proc and Darwin/portable starttime backends (#668)`,
     );
+    assert.ok(
+      /mktemp/i.test(body),
+      `${path} should use mktemp for per-invocation loop result files (#668)`,
+    );
+    assert.ok(
+      !/pipeline-loop-\$\.out|pipeline-loop-\$\.err|pipeline-loop-\$\$\.out/i.test(body),
+      `${path} must not use colliding /tmp/pipeline-loop-$ paths (#668)`,
+    );
   }
 });
 
