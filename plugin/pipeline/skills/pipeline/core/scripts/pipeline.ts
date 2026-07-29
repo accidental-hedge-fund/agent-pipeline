@@ -148,7 +148,9 @@ import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
 import { compileContractItems, type RawContractItem } from "./loop/dependencies.ts";
 import {
   discoverDeclaredDependencies,
+  extractRoadmapDeclaredEdges,
   realWorkListDependencyDiscoverDeps,
+  type RoadmapDeclaredEdge,
   type WorkListDependencyDiscoverDeps,
 } from "./loop/work-list-deps.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type LoopLedger } from "./loop/types.ts";
@@ -999,16 +1001,42 @@ export function extractRoadmapSliceIssues(roadmapText: string, slice: string): n
   return [...issues].sort((a, b) => a - b);
 }
 
-/** Resolves any {@link LoopSelector} into an explicit, ordered issue-number
- *  work list — the shared compilation step `defaultRunLoopEngine` uses for
- *  every selector type so milestone/label/roadmap-slice selectors reach the
- *  supervisor the same way an explicit issue list already did (#512). */
-export async function resolveSelectorIssues(
+/** Result of resolving a loop selector for fresh work-list compile: issue ids
+ *  plus any declared roadmap/slice edges available from the compile context. */
+export interface ResolvedSelectorWorkList {
+  issues: string[];
+  /** Declared issue-level edges from ROADMAP.md / slice graph when available. */
+  roadmapDeclaredEdges: readonly RoadmapDeclaredEdge[];
+}
+
+async function tryLoadRoadmapDeclaredEdges(
+  cfg: PipelineConfig,
+  deps: SelectorResolveDeps,
+  /** When the caller already has roadmap text (roadmap-slice), reuse it. */
+  knownRoadmapText?: string,
+): Promise<readonly RoadmapDeclaredEdge[]> {
+  try {
+    const text = knownRoadmapText ?? (await deps.readRoadmap(cfg));
+    return extractRoadmapDeclaredEdges(text);
+  } catch {
+    // Fail closed: missing/unreadable ROADMAP contributes no edges.
+    return [];
+  }
+}
+
+/** Resolves any {@link LoopSelector} into issue ids + optional roadmap edges
+ *  for declared-dependency population at fresh compile (#615). */
+export async function resolveSelectorWorkList(
   cfg: PipelineConfig,
   selector: LoopSelector,
   deps: SelectorResolveDeps,
-): Promise<string[]> {
-  if (selector.type === "work-list") return selector.value;
+): Promise<ResolvedSelectorWorkList> {
+  if (selector.type === "work-list") {
+    return {
+      issues: selector.value,
+      roadmapDeclaredEdges: await tryLoadRoadmapDeclaredEdges(cfg, deps),
+    };
+  }
 
   if (selector.type === "milestone" || selector.type === "label") {
     const issues = await deps.listOpenIssues(cfg);
@@ -1019,7 +1047,10 @@ export async function resolveSelectorIssues(
     if (matches.length === 0) {
       throw new Error(`no open issues found for ${selector.type} "${selector.value}"`);
     }
-    return matches.map(String);
+    return {
+      issues: matches.map(String),
+      roadmapDeclaredEdges: await tryLoadRoadmapDeclaredEdges(cfg, deps),
+    };
   }
 
   const roadmapText = await deps.readRoadmap(cfg);
@@ -1027,7 +1058,34 @@ export async function resolveSelectorIssues(
   if (matches.length === 0) {
     throw new Error(`roadmap slice "${selector.value}" was not found in ROADMAP.md, or references no issues`);
   }
-  return matches.map(String);
+  return {
+    issues: matches.map(String),
+    roadmapDeclaredEdges: await tryLoadRoadmapDeclaredEdges(cfg, deps, roadmapText),
+  };
+}
+
+/** Resolves any {@link LoopSelector} into an explicit, ordered issue-number
+ *  work list — the shared compilation step `defaultRunLoopEngine` uses for
+ *  every selector type so milestone/label/roadmap-slice selectors reach the
+ *  supervisor the same way an explicit issue list already did (#512). */
+export async function resolveSelectorIssues(
+  cfg: PipelineConfig,
+  selector: LoopSelector,
+  deps: SelectorResolveDeps,
+): Promise<string[]> {
+  return (await resolveSelectorWorkList(cfg, selector, deps)).issues;
+}
+
+/** Production discovery seam for a fresh work-list compile: body/native reads
+ *  via GraphQL/REST, plus any roadmap/slice edges carried from selector
+ *  resolution (#615 review finding 2e0c6562). */
+export function workListDiscoverDepsForCompile(
+  cfg: PipelineConfig,
+  roadmapDeclaredEdges: readonly RoadmapDeclaredEdge[] = [],
+): WorkListDependencyDiscoverDeps {
+  return realWorkListDependencyDiscoverDeps(cfg, {
+    getRoadmapDeclaredEdges: async () => roadmapDeclaredEdges,
+  });
 }
 
 export interface RunLoopEngineInput {
@@ -1158,11 +1216,17 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     runId = input.resumeRunId;
   } else if (input.selector) {
     let issues: string[];
+    let roadmapDeclaredEdges: readonly RoadmapDeclaredEdge[];
     try {
-      issues = await resolveSelectorIssues(cfg, input.selector, realSelectorResolveDeps());
+      const resolved = await resolveSelectorWorkList(cfg, input.selector, realSelectorResolveDeps());
+      issues = resolved.issues;
+      roadmapDeclaredEdges = resolved.roadmapDeclaredEdges;
     } catch (err) {
       return { kind: "error", message: `selector resolution failed: ${(err as Error).message}` };
     }
+    // Carry roadmap/slice edges from selector resolution into discovery so an
+    // edge declared only in ROADMAP is not dropped on the production path (#615).
+    const discoverDeps = workListDiscoverDepsForCompile(cfg, roadmapDeclaredEdges);
     const canonicalRunId = workListRunId(cfg.repo, input.engine, issues);
 
     if (input.newRun) {
@@ -1207,7 +1271,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
         if (repair.plan.initNewRun) {
           let compiled: Awaited<ReturnType<typeof compileWorkListRunFresh>>;
           try {
-            compiled = await compileWorkListRunFresh(cfg, input.engine, issues, newRunId);
+            compiled = await compileWorkListRunFresh(cfg, input.engine, issues, newRunId, discoverDeps);
           } catch (err) {
             return {
               kind: "error",
@@ -1228,7 +1292,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
       if (!(await loopRunExists(store, runId))) {
         let compiled: Awaited<ReturnType<typeof compileWorkListRunFresh>>;
         try {
-          compiled = await compileWorkListRunFresh(cfg, input.engine, issues, runId);
+          compiled = await compileWorkListRunFresh(cfg, input.engine, issues, runId, discoverDeps);
         } catch (err) {
           return {
             kind: "error",

@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { compileContractItems } from "../scripts/loop/dependencies.ts";
 import {
   discoverDeclaredDependencies,
+  extractRoadmapDeclaredEdges,
   parseDeclaredDependencyIds,
   type WorkListDependencyDiscoverDeps,
 } from "../scripts/loop/work-list-deps.ts";
@@ -14,7 +15,10 @@ import { LoopError } from "../scripts/loop/types.ts";
 import {
   compileWorkListRun,
   compileWorkListRunFresh,
+  resolveSelectorWorkList,
+  workListDiscoverDepsForCompile,
   workListRunId,
+  type SelectorResolveDeps,
 } from "../scripts/pipeline.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -72,6 +76,38 @@ test("parseDeclaredDependencyIds: empty input", () => {
 test("parseDeclaredDependencyIds: dedupes and preserves first-seen order", () => {
   const text = "Depends on #2. Requires #1. Depends on #2 again.\n## Dependency\n#1 #3";
   assert.deepEqual(parseDeclaredDependencyIds(text), ["2", "1", "3"]);
+});
+
+// ---------------------------------------------------------------------------
+// Roadmap / slice declared-edge extraction (pure)
+// ---------------------------------------------------------------------------
+
+test("extractRoadmapDeclaredEdges: writeback _(blocked by #N)_ and table phrase forms", () => {
+  const roadmap = [
+    "### dependency-unlock",
+    "",
+    "- **RM-608** #608 — harness roles _(blocked by #607)_",
+    "- **RM-607** #607 — eval isolation",
+    "",
+    "**v1.28.1 — Slice:**",
+    "| # | What | Why |",
+    "|---|------|-----|",
+    "| #610 | Feature B | depends on #609 for the base |",
+    "| #609 | Feature A | independent |",
+    "| #611 | Mentions #609 in prose only | no phrase — must not invent |",
+  ].join("\n");
+  assert.deepEqual(extractRoadmapDeclaredEdges(roadmap), [
+    { depender: "608", prerequisite: "607" },
+    { depender: "610", prerequisite: "609" },
+  ]);
+});
+
+test("extractRoadmapDeclaredEdges: empty / no declarations", () => {
+  assert.deepEqual(extractRoadmapDeclaredEdges(""), []);
+  assert.deepEqual(
+    extractRoadmapDeclaredEdges("| #100 | Title | rationale |\n| #200 | Other | rationale |"),
+    [],
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -365,5 +401,85 @@ test("compileContractItems still partitions when fed discovered raw items direct
       { id: "607", depends_on: [], external_depends_on: [] },
       { id: "608", depends_on: ["607"], external_depends_on: [] },
     ],
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Production path: selector resolution → roadmap edges → compile (#615 2e0c6562)
+// ---------------------------------------------------------------------------
+
+test("resolveSelectorWorkList: roadmap-slice carries declared edges from ROADMAP.md", async () => {
+  const roadmap = [
+    "**v9.1.0 — Test slice:**",
+    "",
+    "| # | What | Why |",
+    "|---|------|-----|",
+    "| #608 | Depender | _(blocked by #607)_ |",
+    "| #607 | Prerequisite | independent |",
+  ].join("\n");
+  const deps: SelectorResolveDeps = {
+    listOpenIssues: async () => {
+      throw new Error("listOpenIssues must not be called for roadmap-slice");
+    },
+    readRoadmap: async () => roadmap,
+  };
+  const resolved = await resolveSelectorWorkList(
+    fakeCfg(),
+    { type: "roadmap-slice", value: "v9.1.0" },
+    deps,
+  );
+  assert.deepEqual(resolved.issues, ["607", "608"]);
+  assert.deepEqual(resolved.roadmapDeclaredEdges, [
+    { depender: "608", prerequisite: "607" },
+  ]);
+});
+
+test("production-path compile: roadmap-only edge becomes depends_on (no body/native)", async () => {
+  // Edge exists ONLY in the roadmap graph — bodies empty, blockedBy empty.
+  // Bites if production omit getRoadmapDeclaredEdges (finding 2e0c6562).
+  const roadmap = [
+    "**v2.0.0 — Slice:**",
+    "| # | What | Why |",
+    "|---|------|-----|",
+    "| #608 | Config | blocked by #607 |",
+    "| #607 | Isolation | none |",
+  ].join("\n");
+  const selectorDeps: SelectorResolveDeps = {
+    listOpenIssues: async () => [],
+    readRoadmap: async () => roadmap,
+  };
+  const resolved = await resolveSelectorWorkList(
+    fakeCfg(),
+    { type: "roadmap-slice", value: "v2.0.0" },
+    selectorDeps,
+  );
+  // Production wires edges through workListDiscoverDepsForCompile; here we
+  // inject body/native fakes so the test stays network-free while still using
+  // the same roadmap-edge plumbing as the production factory.
+  const discoverDeps: WorkListDependencyDiscoverDeps = {
+    getIssueTitleBody: async () => ({ title: "", body: "" }),
+    getBlockedByIssueNumbers: async () => [],
+    getRoadmapDeclaredEdges: async () => resolved.roadmapDeclaredEdges,
+  };
+  // Sanity: factory returns a seam that exposes the same edges.
+  const factoryDeps = workListDiscoverDepsForCompile(fakeCfg(), resolved.roadmapDeclaredEdges);
+  assert.deepEqual(await factoryDeps.getRoadmapDeclaredEdges!(), resolved.roadmapDeclaredEdges);
+
+  const { contract } = await compileWorkListRunFresh(
+    fakeCfg(),
+    "claude",
+    resolved.issues,
+    "run-roadmap-only",
+    discoverDeps,
+  );
+  const item608 = contract.items.find((i) => i.id === "608")!;
+  assert.deepEqual(
+    item608.depends_on,
+    ["607"],
+    "roadmap-only declared edge must land on in-snapshot depends_on",
+  );
+  assert.deepEqual(item608.external_depends_on, []);
+  assert.ok(
+    contract.items.findIndex((i) => i.id === "607") < contract.items.findIndex((i) => i.id === "608"),
   );
 });

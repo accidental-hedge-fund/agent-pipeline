@@ -99,6 +99,44 @@ export interface RoadmapDeclaredEdge {
 }
 
 /**
+ * Extracts issue-level declared dependency edges from ROADMAP.md (or equivalent
+ * roadmap/slice markdown) when present. Pure and network-free.
+ *
+ * Per line, the first `#N` is treated as the depender; prerequisite ids are
+ * taken from the same lexical dependency conventions as issue bodies
+ * (`depends on` / `requires` / `blocked by` / `needs` + `#M`, including the
+ * roadmap writeback annotation `_(blocked by #M)_`). Self-references and
+ * non-canonical ids are ignored. List order alone never invents an edge.
+ */
+export function extractRoadmapDeclaredEdges(roadmapText: string): RoadmapDeclaredEdge[] {
+  if (!roadmapText) return [];
+
+  const out: RoadmapDeclaredEdge[] = [];
+  const seen = new Set<string>();
+
+  for (const rawLine of roadmapText.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    const firstRef = /#(\d+)/.exec(line);
+    if (!firstRef || firstRef[1] === undefined) continue;
+    const depender = firstRef[1];
+    if (!CANONICAL_ISSUE_ID_RE.test(depender)) continue;
+
+    // Phrases after the depender id (writeback annotations + freeform table cells).
+    const rest = line.slice(firstRef.index! + firstRef[0].length);
+    for (const prerequisite of parseDeclaredDependencyIds(rest, depender)) {
+      const key = `${depender}:${prerequisite}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ depender, prerequisite });
+    }
+  }
+
+  return out;
+}
+
+/**
  * Injectable discovery seam for work-list dependency population.
  * Unit tests inject fakes — production uses {@link realWorkListDependencyDiscoverDeps}.
  */
