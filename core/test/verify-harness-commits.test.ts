@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import {
   isDocumentationFile,
   parseDirtyFiles,
+  pathHasNodeModulesSegment,
   verifyHarnessCommits,
   verifyPlanRevisionOutput,
   type VerifyDeps,
@@ -778,4 +779,64 @@ test("node_modules scan: node_modules diagnostic is returned even when commit-me
     "reason" in result && result.reason.includes(sha),
     `sha must appear in diagnostic; got: ${JSON.stringify(result)}`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// pathHasNodeModulesSegment + nested monorepo scan (#624)
+// ---------------------------------------------------------------------------
+
+test("pathHasNodeModulesSegment: root and nested segments hit; substring components do not", () => {
+  assert.equal(pathHasNodeModulesSegment("node_modules"), true);
+  assert.equal(pathHasNodeModulesSegment("node_modules/foo"), true);
+  assert.equal(pathHasNodeModulesSegment("apps/web/node_modules/.pnpm/lodash@4/index.js"), true);
+  assert.equal(pathHasNodeModulesSegment("src/foo.ts"), false);
+  assert.equal(pathHasNodeModulesSegment("src/node_modules_backup/x.ts"), false);
+  assert.equal(pathHasNodeModulesSegment("docs/avoiding-node_modules.md"), false);
+});
+
+test("node_modules scan: nested monorepo path blocks and legacy root-only check would miss it (#624)", async () => {
+  const nested = "apps/web/node_modules/.pnpm/lodash@4/index.js";
+  // Bite: the pre-#624 root-only check only inspects the leading component.
+  assert.equal(
+    nested.split("/")[0] === "node_modules",
+    false,
+    "legacy root-only check must not flag nested monorepo paths",
+  );
+  assert.equal(
+    pathHasNodeModulesSegment(nested),
+    true,
+    "segment-aware check must flag nested monorepo paths",
+  );
+
+  const sha = "nestednm624deadbeef";
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 624 }, {
+    gitMessages: async () => ["implement feature (#624)\n\nIssue: #624"],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [sha],
+    gitDiffTreeFiles: async () => [nested, "src/foo.ts"],
+  });
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes(nested), `nested path in reason: ${JSON.stringify(result)}`);
+  assert.ok("reason" in result && result.reason.includes(sha), `sha in reason: ${JSON.stringify(result)}`);
+  assert.ok(
+    "reason" in result && result.reason.includes("must not be committed"),
+    `diagnostic text: ${JSON.stringify(result)}`,
+  );
+});
+
+test("node_modules scan: path with node_modules only as substring of a component → passes (#624)", async () => {
+  const sha = "substrnm624cafebabe";
+  const result = await verifyHarnessCommits("/wt", "base", { issueNumber: 624 }, {
+    gitMessages: async () => ["implement feature (#624)\n\nIssue: #624"],
+    gitDiffFiles: async () => [],
+    gitDirtyFiles: async () => [],
+    gitCommitShas: async () => [sha],
+    gitDiffTreeFiles: async () => [
+      "src/node_modules_backup/x.ts",
+      "docs/avoiding-node_modules.md",
+      "src/foo.ts",
+    ],
+  });
+  assert.equal(result.ok, true);
 });
