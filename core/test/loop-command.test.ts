@@ -61,6 +61,15 @@ function fakeAuditReport(runId: string) {
     consecutive_no_progress: 0,
     stop: null,
     status: { run_id: runId } as unknown,
+    stage_progress: [
+      {
+        item_id: "607",
+        state: "in_progress",
+        stage_presentation: "implementing",
+        advance_run_id: "607-2026-07-27T19-31-29-328Z",
+        has_projection: true,
+      },
+    ],
   };
 }
 
@@ -385,7 +394,9 @@ test("runLoopCommand — engine defaults to codex when --profile is absent (matc
   const { out } = await withCapturedConsole(() =>
     runLoopCommand({ resume: "run-1", audit: true } as CliOpts, [], deps),
   );
-  const parsed = JSON.parse(out[0]);
+  const jsonLine = out.find((l) => l.trimStart().startsWith("{"));
+  assert.ok(jsonLine, "audit must print a JSON report line after the stage table");
+  const parsed = JSON.parse(jsonLine!);
   assert.equal(parsed.engine, "codex");
   assert.equal(parsed.run_id, "run-1");
 });
@@ -762,7 +773,10 @@ test("runLoopCommand — --audit emits no loop_run_handoff and does not wire onR
   let sawOnRunReady: unknown = "unset";
   const deps: LoopCliDeps = {
     runLoopPreflight: async () =>
-      ({ ok: true, args: { selector: undefined, resumeRunId: "run-1", audit: true } }) satisfies LoopPreflightOutcome,
+      ({
+        ok: true,
+        args: { selector: undefined, resumeRunId: "run-1", audit: true, follow: false, newRun: false },
+      }) satisfies LoopPreflightOutcome,
     writeStdoutLine: (line) => lines.push(line),
     runLoopEngine: async (input) => {
       sawOnRunReady = input.onRunReady;
@@ -776,9 +790,17 @@ test("runLoopCommand — --audit emits no loop_run_handoff and does not wire onR
   assert.equal(process.exitCode, 0);
   assert.equal(sawOnRunReady, undefined, "audit must not wire onRunReady");
   assert.equal(lines.length, 0);
-  const parsed = JSON.parse(out[0]);
+  // Stage table lines precede the JSON report (#611).
+  const jsonLine = out.find((l) => l.trimStart().startsWith("{"));
+  assert.ok(jsonLine, "audit must still print a JSON report line");
+  const parsed = JSON.parse(jsonLine!);
   assert.notEqual(parsed.kind, LOOP_RUN_HANDOFF_KIND);
   assert.equal(parsed.run_id, "run-1");
+  const joined = out.join("\n");
+  assert.match(joined, /Stage progress:/);
+  assert.match(joined, /#607/);
+  assert.match(joined, /implementing/);
+  assert.match(joined, /607-2026-07-27T19-31-29-328Z/);
 });
 
 test("runLoopCommand — regression: only terminal run_id after completion fails the before-first-dispatch assertion (#665)", async () => {

@@ -133,6 +133,17 @@ test("isReadOnlyCommand: classifies logs/status/summary read-only, everything el
   assert.equal(isReadOnlyCommand(["loop", "--resume", "run-1"]), false);
   assert.equal(isReadOnlyCommand(["loop", "logs"]), true, "nested loop logs is read-only (#666)");
   assert.equal(isReadOnlyCommand(["loop", "logs", "loop-abc", "--events", "--follow"]), true);
+  assert.equal(isReadOnlyCommand(["loop", "--audit"]), true, "loop --audit is read-only (#611)");
+  assert.equal(
+    isReadOnlyCommand(["loop", "--resume", "run-1", "--audit", "--follow"]),
+    true,
+    "loop --audit --follow is read-only stage-progress follow (#611)",
+  );
+  assert.equal(
+    isReadOnlyCommand(["loop", "--resume", "run-1"]),
+    false,
+    "mutating resume without --audit remains run-mutating",
+  );
   assert.equal(isReadOnlyCommand("queue"), false);
   assert.equal(isReadOnlyCommand("improve"), false);
   assert.equal(isReadOnlyCommand(undefined), false, "fail-safe default: unknown/absent command reserves");
