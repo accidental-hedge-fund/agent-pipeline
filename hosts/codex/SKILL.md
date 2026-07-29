@@ -577,6 +577,110 @@ node ~/.codex/skills/pipeline/scripts/pipeline.mjs summary <run-id>
 Include starting stage, ending stage, transitions made, wall-clock elapsed, PR
 URL if one was opened, and the terminal state.
 
+### 4b. Orchestration pattern for `$pipeline:loop` (multi-item durable drive/resume)
+
+Multi-item drive and resume via `$pipeline:loop` is **long-running** (minutes to
+hours). It is **not** a seconds-only synchronous command. Do **not** treat it as
+fire-and-forget without event following — use the same spirit as single-issue
+advance (§4), against the loop event stream.
+
+#### a. Start or resume the loop
+
+```bash
+cd <repo_dir>
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --milestone <name>
+# or: ... loop --resume <run-id>
+# or: ... loop <N> <N> ...
+```
+
+On a preflight failure the command stops with printed remediation — do not start
+any substitute loop. Do not leave a live supervisor unobserved when the Codex
+turn ends without an event-follow plan.
+
+#### b. Obtain `run_id` + loop events path
+
+Parse an early handoff when present (stdout/JSON carrying at least `run_id` and
+a loop events path). Otherwise:
+
+1. Take `run_id` from the printed run result JSON, the `--resume` argument, or
+   the operator's known run id.
+2. Resolve the loop **state-home**, then the events file:
+
+```text
+<state-home>/runs/<run_id>/events.jsonl
+```
+
+**State-home resolution order** (first set wins):
+
+1. Explicit override: `AGENT_PIPELINE_STATE_HOME` (preferred) or legacy
+   `PIPELINE_STATE_HOME`
+2. `$XDG_STATE_HOME/agent-pipeline/loop` when `XDG_STATE_HOME` is set
+3. Default: `~/.local/state/agent-pipeline/loop`
+
+#### c. Follow the loop event stream
+
+Poll or tail the loop events file and summarize material lifecycle records:
+
+```bash
+# Interim path until a dedicated loop logs-follow CLI is universal (#666).
+# Prefer that CLI when available; keep this file path as a valid fallback.
+tail -F "<state-home>/runs/<run_id>/events.jsonl"
+```
+
+Never forbid background following or event streaming for drive/resume while
+waiting for a future CLI.
+
+#### d. Optional: follow active item advance events when published
+
+When an item's advance `run_id` is published on a loop event (dispatch→advance
+linkage), optionally follow that item's single-issue stream with the §4
+material kinds:
+
+```bash
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <advance-run-id> --events --follow
+```
+
+If no advance `run_id` is published yet, still follow the **loop** event stream
+above — do not require a non-existent linkage field.
+
+#### e. User-visible progress on material loop events
+
+**Must surface** (chat update):
+
+- `loop_item_started`
+- `loop_item_transitioned`
+- `loop_item_blocked`
+- `loop_run_stopped`
+
+**Should surface** when present (not spam):
+
+- `loop_schedule_evaluated` — only on a **decision change**, not every identical
+  poll in a burst
+- `loop_reconciled` / `loop_merge_barrier_cleared`
+- `loop_item_paused` / `loop_item_waiting` / `loop_item_resumed`
+- `loop_item_abandoned` / `loop_item_skipped` / `loop_item_precondition_excluded`
+- `loop_recovery_attempt`
+- `loop_run_superseded`
+
+**Suppress:** pure heartbeats and repeated identical schedule/reconcile
+evaluations in the same burst (same spirit as suppressing
+`pre_merge.advancePolling` in §4).
+
+#### f. Stop following
+
+Stop polling/tailing when a terminal loop outcome appears — especially
+`loop_run_stopped` — or when the supervisor process exits.
+
+#### g. Final summary / audit
+
+Surface the run's terminal state. Prefer the printed JSON result; for a
+read-only process/timeline report:
+
+```bash
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --audit
+# or with an explicit run: ... loop --resume <run-id> --audit
+```
+
 ### 5. Modes that DON'T need this orchestration
 
 - `--status` — read-only, completes in seconds
@@ -587,8 +691,14 @@ URL if one was opened, and the terminal state.
 - `config sync` — previews/applies a validated `.github/pipeline.yml` scaffold refresh, completes in seconds
 - `config repo-map <add|remove|list>` — mutates/lists `repo_map` entries, completes in seconds
 - `doctor` — deterministic preflight, no model calls, completes in seconds
+- `$pipeline:loop --audit` — read-only report for a durable run; synchronous, no event-follow
 
 Run those synchronously without the PTY/log-polling orchestration.
+
+**Not in this list:** multi-item `$pipeline:loop` drive or resume (with or without
+`--milestone` / issue lists / `--resume`) — those use §4b long-running
+orchestration. Do not apply the seconds-only / no-follow rule to drive/resume
+just because `--audit` is fast.
 
 `--once` still needs the orchestration because a single heavy stage
 (planning especially) can hit its 20-minute timeout. Use the same PTY/log
