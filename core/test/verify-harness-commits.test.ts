@@ -628,6 +628,63 @@ test("verifyPlanRevisionOutput: duplicated three-item acknowledgement reports co
 });
 
 // ---------------------------------------------------------------------------
+// verifyPlanRevisionOutput — mid-line / preamble-glued header (#658 / #622)
+// ---------------------------------------------------------------------------
+
+test("verifyPlanRevisionOutput: preamble-glued mid-line ## Feedback Incorporated + tagged items → ok (#658)", () => {
+  // Exact Grok shape from agent-pipeline #622 / #658: header stuck on the same
+  // line as the implementer's preamble sentence; tagged bullets are correct.
+  const stdout = [
+    "I'll revise the plan so it matches the real code and the reviewer's required changes.## Feedback Incorporated",
+    "",
+    "- [ADDRESSED] Preflight all reclaim candidates before any removal",
+    "- [ADDRESSED] Target-path collision handling defined explicitly",
+    "",
+    "## Revised Plan",
+    "Do the thing.",
+  ].join("\n");
+  assert.deepEqual(verifyPlanRevisionOutput(stdout), { ok: true });
+});
+
+test("verifyPlanRevisionOutput: mid-line header with no tagged items → no-items failure (#658)", () => {
+  const stdout = [
+    "Preamble.## Feedback Incorporated",
+    "",
+    "I considered the feedback carefully.",
+    "",
+    "## Plan",
+    "...",
+  ].join("\n");
+  const result = verifyPlanRevisionOutput(stdout);
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("[ADDRESSED]"));
+});
+
+test("verifyPlanRevisionOutput: mid-line ### Feedback Incorporated is not promoted to a valid header (#658)", () => {
+  // Only level-2 ## is the contract marker; level-3 must not pass solely via promotion.
+  const stdout = [
+    "Preamble.### Feedback Incorporated",
+    "",
+    "- [ADDRESSED] would not count without a real ## header",
+    "",
+    "## Plan",
+    "...",
+  ].join("\n");
+  const result = verifyPlanRevisionOutput(stdout);
+  assert.equal(result.ok, false);
+  assert.ok(
+    "reason" in result && result.reason.includes("## Feedback Incorporated"),
+    `expected missing-section reason, got: ${JSON.stringify(result)}`,
+  );
+});
+
+test("verifyPlanRevisionOutput: truly absent section still blocked after normalisation (#658)", () => {
+  const result = verifyPlanRevisionOutput("## Revised Plan\n\nNo acknowledgement here.");
+  assert.equal(result.ok, false);
+  assert.ok("reason" in result && result.reason.includes("## Feedback Incorporated"));
+});
+
+// ---------------------------------------------------------------------------
 // verifyHarnessCommits — node_modules commit scan (#180)
 // ---------------------------------------------------------------------------
 

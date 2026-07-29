@@ -72,6 +72,19 @@ import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store
 import { recordStage } from "../evidence-bundle.ts";
 import { INJECTION_PATTERNS } from "../artifact-sanitize.ts";
 
+/**
+ * Appended once when plan-revision stdout fails the acknowledgement shape gate
+ * after mid-line normalisation (#658). One automatic re-prompt only; exhausted
+ * failures still terminal-block as needs-human.
+ */
+export const PLAN_REVISION_FORMAT_REPAIR_ADDENDUM = [
+  "FORMAT REPAIR (required — previous output failed the machine-checkable acknowledgement contract):",
+  "- Emit `## Feedback Incorporated` exactly once as a **line-start** level-2 heading (never glued to preamble text on the same line).",
+  "- Under it, list each feedback item as a line-start bullet: `- [ADDRESSED] …` or `- [DEFERRED] … — reason: …`.",
+  "- Do not wrap that section only inside a code fence.",
+  "- Then re-emit the complete revised plan (not only the acknowledgement fragment).",
+].join("\n");
+
 // ---------------------------------------------------------------------------
 // OpenSpec project-config commit — exported for unit testing (#352)
 // ---------------------------------------------------------------------------
@@ -646,10 +659,16 @@ export async function runPlanningPhases(
     );
 
     const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext });
-    const revisionResult = hooks.invokeRevision
-      ? await hooks.invokeRevision(primary, wt, revisionPrompt, cfg, opts, deps, issueNumber)
-      : await invokePlanStep(primary, wt.path, revisionPrompt, cfg, opts, { invoke: deps.invoke }, { issue: issueNumber, stage: "plan-review" });
-    if (!revisionResult.success || !revisionResult.stdout.trim()) {
+    const invokeRevisionOnce = async (prompt: string) =>
+      hooks.invokeRevision
+        ? await hooks.invokeRevision(primary, wt, prompt, cfg, opts, deps, issueNumber)
+        : await invokePlanStep(primary, wt.path, prompt, cfg, opts, { invoke: deps.invoke }, { issue: issueNumber, stage: "plan-review" });
+
+    let revisionResult = await invokeRevisionOnce(revisionPrompt);
+    // Only treat unsuccessful/timed-out invocations as harness-failure. Exit-0
+    // empty/whitespace stdout is an output-contract failure: route it through
+    // verifyPlanRevisionOutput so the format-repair retry can still run (#658).
+    if (!revisionResult.success) {
       const reason = revisionResult.timed_out
         ? `Plan revision timed out after ${revisionResult.duration.toFixed(0)}s`
         : `Plan revision failed (exit ${revisionResult.exit_code})`;
@@ -658,7 +677,29 @@ export async function runPlanningPhases(
       return { advanced: false, status: "blocked", reason };
     }
     // Verify the plan-revision output includes the required acknowledgement section (#68).
-    const ackCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
+    // Mid-line headers are normalised inside verifyPlanRevisionOutput (#658). Pure
+    // output-contract failures (including empty stdout) get one format-repair
+    // re-prompt before needs-human.
+    let ackCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
+    if (!ackCheck.ok) {
+      console.warn(
+        `[pipeline] #${issueNumber}: plan-revision ack contract failed (${ackCheck.reason}); attempting one format-repair re-prompt`,
+      );
+      const repairPrompt = `${revisionPrompt}\n\n${PLAN_REVISION_FORMAT_REPAIR_ADDENDUM}`;
+      const repairResult = await invokeRevisionOnce(repairPrompt);
+      // Same rule as the initial invoke: only unsuccessful repair is harness-failure.
+      // Successful empty repair falls through to the exhausted-contract needs-human path.
+      if (!repairResult.success) {
+        const reason = repairResult.timed_out
+          ? `Plan revision format-repair timed out after ${repairResult.duration.toFixed(0)}s`
+          : `Plan revision format-repair failed (exit ${repairResult.exit_code})`;
+        await doSetBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review", "harness-failure");
+        await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+        return { advanced: false, status: "blocked", reason };
+      }
+      revisionResult = repairResult;
+      ackCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
+    }
     if (!ackCheck.ok) {
       await doSetBlocked(cfg, issueNumber, ackCheck.reason, "plan-review", "needs-human");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);

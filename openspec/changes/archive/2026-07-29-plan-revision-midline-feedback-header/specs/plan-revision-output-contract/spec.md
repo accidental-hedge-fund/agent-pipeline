@@ -1,8 +1,5 @@
-# plan-revision-output-contract Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change plan-revision-fenced-section-tolerance. Update Purpose after archive.
-## Requirements
 ### Requirement: The plan-revision prompt SHALL specify an unfenced, single-header acknowledgement section
 
 The `plan_revision` prompt template SHALL instruct the harness that the `## Feedback
@@ -37,4 +34,3 @@ fenced block, while still showing the `[ADDRESSED]` / `[DEFERRED]` tag shape.
 
 - **WHEN** the acknowledgement-format wording (including the line-start constraint) is removed from the `plan_revision` template
 - **THEN** the prompt output-contract test suite SHALL fail
-

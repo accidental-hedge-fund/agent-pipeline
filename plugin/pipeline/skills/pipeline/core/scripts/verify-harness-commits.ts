@@ -275,6 +275,21 @@ export async function verifyHarnessCommits(
 // ---------------------------------------------------------------------------
 
 /**
+ * Promote mid-line / preamble-glued level-2 `## Feedback Incorporated` headers
+ * to line-start so the existing line-anchored section extractor can find them
+ * (#658 / #622 Grok implementer shape: `…required changes.## Feedback Incorporated`).
+ *
+ * Only `##` (exactly two hashes) is promoted — `### Feedback Incorporated` stays
+ * non-matching. Already line-start headers are unchanged.
+ */
+export function promoteMidlineFeedbackIncorporatedHeaders(text: string): string {
+  // Insert a newline before a mid-line `## Feedback Incorporated` token.
+  // Preceded by a non-newline, non-`#` char so we never split `###` into a
+  // false level-2 header and never touch a genuine line-start `##`.
+  return text.replace(/([^\n#])(##\s+Feedback\s+Incorporated\b)/gi, "$1\n$2");
+}
+
+/**
  * Verify that the plan-revision harness output includes a machine-readable
  * `## Feedback Incorporated` section with tagged bullet items, and optionally
  * that the number of tagged items covers the count of feedback items given.
@@ -289,7 +304,11 @@ export function verifyPlanRevisionOutput(stdout: string, feedback?: string): Ver
   //    ordinary text — models routinely wrap the acknowledgement section (and,
   //    when copying the prompt's format example verbatim, a *duplicated*
   //    header) inside a code fence.
-  const cleaned = stdout.replace(/^[ \t]{0,3}(`{3,}|~{3,}).*$/gm, "");
+  // 0b. Promote mid-line / preamble-glued level-2 headers to line-start (#658)
+  //    before the line-anchored matchAll below.
+  const cleaned = promoteMidlineFeedbackIncorporatedHeaders(
+    stdout.replace(/^[ \t]{0,3}(`{3,}|~{3,}).*$/gm, ""),
+  );
 
   // 1. Locate every ## Feedback Incorporated header occurrence — not just the
   //    first — since a duplicated header inside a fence would otherwise be

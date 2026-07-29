@@ -287,6 +287,11 @@ test("plan_revision prompt: acknowledgement section is unfenced, single-header (
     /MUST appear exactly once/i,
     "prompt must instruct that the ## Feedback Incorporated header appears exactly once",
   );
+  assert.match(
+    out,
+    /start of a line/i,
+    "prompt must instruct that the ## Feedback Incorporated header appears at the start of a line (#658)",
+  );
   // No fenced code block in the template's raw source contains the header.
   const templatePath = path.join(
     import.meta.dirname,
