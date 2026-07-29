@@ -289,6 +289,22 @@ export interface SettledSurfaceUnverifiedEvent extends RunEventBase {
   settling_round: number;
 }
 
+/** A delta-review finding was demoted to advisory because it re-raises a
+ *  prior-round advisory finding (same surface or stable key) without citing
+ *  HEAD-state evidence of a new/worsened defect (#680). Distinct from
+ *  `settled_surface_unverified` (which keys off resolved-by-fix / overridden
+ *  settled findings). Never blocks by itself — the finding is still recorded
+ *  and posted, tagged `ADVISORY-CARRY-FORWARD`; this event is purely an audit
+ *  record. */
+export interface AdvisoryCarryForwardEvent extends RunEventBase {
+  type: "advisory_carry_forward";
+  finding_key: string;
+  surface: string;
+  prior_advisory_key: string;
+  prior_round: number;
+  matched_by: "surface" | "key";
+}
+
 export type { HumanInterventionEvent };
 export type { CorrectionEvent };
 export type { ProductFaultEvent };
@@ -315,6 +331,7 @@ export type RunEvent =
   | ReversalUnacknowledgedEvent
   | SettledAlternativeReinstatedEvent
   | SettledSurfaceUnverifiedEvent
+  | AdvisoryCarryForwardEvent
   | DeltaRoundEvent
   | DeltaRoundCeilingEvent
   | DeltaChurnSuspectedEvent
