@@ -1972,33 +1972,64 @@ function resolvePreMergeOfframpClass(event: JsonRecord): PreMergeOfframpClass {
 
 /**
  * Collect pre-merge blocked/needs-human off-ramp classes from durable events.
- * Prefers `blocker_set` with stage pre-merge; falls back to pre-merge
- * `human_intervention` events when no matching blocker_set class signal
- * exists for historical runs (counted under residual `other` unless a kind
- * maps). One class per off-ramp event (no de-dupe across genuine re-entries).
+ *
+ * Per pre-merge stage entry (events between `stage_start` pre-merge markers):
+ * 1. Count every pre-merge `blocker_set` in the entry.
+ * 2. Count pre-merge `human_intervention` only when it is not paired with a
+ *    `blocker_set` in that same entry:
+ *    - Shared `offramp_id` (new dual-write): skip the intervention with the
+ *      matching id; unpaired interventions still count.
+ *    - No `offramp_id` on either side (legacy dual-write within the entry):
+ *      if the entry already has a `blocker_set`, skip un-id'd interventions so
+ *      the pair is not double-counted; if the entry has no `blocker_set`,
+ *      count intervention-only residual under `other`.
+ *
+ * Run-global suppression of interventions whenever *any* pre-merge blocker_set
+ * exists is intentionally avoided (#683 review 2): an older intervention-only
+ * entry followed by a later enriched re-entry must count both off-ramps.
  */
 function collectPreMergeOfframpClasses(run: IncludedRun): PreMergeOfframpClass[] {
-  const classes: PreMergeOfframpClass[] = [];
-  let sawPreMergeBlockerSet = false;
+  // Partition into stage-entry windows keyed by pre-merge stage_start index.
+  // Events before the first pre-merge stage_start still form an entry so
+  // historical streams without stage_start are not dropped.
+  type Entry = { blockers: JsonRecord[]; interventions: JsonRecord[] };
+  const entries: Entry[] = [{ blockers: [], interventions: [] }];
+  let current = entries[0];
 
   for (const event of run.events) {
-    if (event["type"] !== "blocker_set") continue;
+    if (event["type"] === "stage_start" && stringField(event, "stage") === "pre-merge") {
+      current = { blockers: [], interventions: [] };
+      entries.push(current);
+      continue;
+    }
     if (stringField(event, "stage") !== "pre-merge") continue;
-    sawPreMergeBlockerSet = true;
-    classes.push(resolvePreMergeOfframpClass(event));
-  }
-
-  // Historical residual: pre-merge human_intervention with no enriched
-  // blocker_set in this run still counts under residual other (or mapped kind
-  // if intervention carries none — we never free-text parse detail).
-  if (!sawPreMergeBlockerSet) {
-    for (const event of run.events) {
-      if (event["type"] !== "human_intervention") continue;
-      if (stringField(event, "stage") !== "pre-merge") continue;
-      classes.push("other");
+    if (event["type"] === "blocker_set") {
+      current.blockers.push(event);
+    } else if (event["type"] === "human_intervention") {
+      current.interventions.push(event);
     }
   }
 
+  const classes: PreMergeOfframpClass[] = [];
+  for (const entry of entries) {
+    const pairedIds = new Set<string>();
+    for (const blocker of entry.blockers) {
+      classes.push(resolvePreMergeOfframpClass(blocker));
+      const id = stringField(blocker, "offramp_id");
+      if (id) pairedIds.add(id);
+    }
+    for (const intervention of entry.interventions) {
+      const id = stringField(intervention, "offramp_id");
+      if (id && pairedIds.has(id)) continue; // paired fresh dual-write
+      if (!id && entry.blockers.length > 0) {
+        // Legacy dual-write in the same stage entry: intervention co-emitted
+        // without offramp_id alongside a blocker_set — count the blocker only.
+        continue;
+      }
+      // Intervention-only residual (historical or unpaired) → other.
+      classes.push("other");
+    }
+  }
   return classes;
 }
 

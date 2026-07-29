@@ -158,6 +158,13 @@ export interface BlockerSetEvent extends RunEventBase {
    * members of `PreMergeOfframpClass` (`pre-merge-offramp.ts`).
    */
   offramp_class?: string;
+  /**
+   * Shared id pairing this `blocker_set` with the co-emitted `human_intervention`
+   * for the same off-ramp (#683 review 2). Additive optional — scoreboard
+   * dedupes only the matching pair so mixed historical/new streams still count
+   * every distinct off-ramp.
+   */
+  offramp_id?: string;
 }
 export interface BlockerClearedEvent extends RunEventBase {
   type: "blocker_cleared";

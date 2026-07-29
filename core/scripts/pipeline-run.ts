@@ -6,6 +6,7 @@
 // auto-loop helpers and AdvanceDeps so existing import paths continue to work.
 
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import {
   GhMetricsCollector,
   buildAuditSentinel,
@@ -1040,13 +1041,16 @@ export async function runAdvance(
           // Not eligible or no rounds spent: stop as today.
           if (out.status === "blocked" && runDir) {
             // Enrich blocker_set with stage/kind/class (#683). Additive fields
-            // keep schema_version 1; offramp_class only for pre-merge. Event
-            // write is best-effort — never masks the blocked stage outcome.
+            // keep schema_version 1; offramp_class only for pre-merge. Shared
+            // offramp_id pairs this blocker_set with the co-emitted intervention
+            // so scoreboard dedupes only that pair (#683 review 2). Event write
+            // is best-effort — never masks the blocked stage outcome.
             const blockerKind = out.blockerKind ?? "needs-human";
             const pathTag =
               out.status === "blocked" && "offrampPathTag" in out
                 ? out.offrampPathTag
                 : undefined;
+            const offrampId = randomUUID();
             const blockerEvent: {
               schema_version: typeof RUN_SCHEMA_VERSION;
               type: "blocker_set";
@@ -1055,6 +1059,7 @@ export async function runAdvance(
               stage: string;
               blocker_kind: string;
               offramp_class?: string;
+              offramp_id?: string;
             } = {
               schema_version: RUN_SCHEMA_VERSION,
               type: "blocker_set",
@@ -1062,6 +1067,7 @@ export async function runAdvance(
               reason: out.reason,
               stage: auditStage,
               blocker_kind: blockerKind,
+              offramp_id: offrampId,
             };
             if (auditStage === "pre-merge") {
               blockerEvent.offramp_class = toPreMergeOfframpClass({
@@ -1075,6 +1081,7 @@ export async function runAdvance(
               stage: auditStage,
               issue: issueNumber,
               detail: out.reason,
+              offramp_id: offrampId,
             }, runStoreDeps).catch(() => {});
           }
         }

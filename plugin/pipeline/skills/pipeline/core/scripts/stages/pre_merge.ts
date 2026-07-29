@@ -832,6 +832,9 @@ export async function advance(
       // current worktree so recovery is deterministic rather than a re-run dead-end.
       const localWt = await getForIssueFn(cfg, issueNumber);
       if (!localWt) {
+        // Operational precondition (no worktree) — not a CI/local gate failure.
+        // Residual `other` (needs-human, no ci-failed path tag) so scoreboard
+        // does not inflate the ci-failed rate (#683 review 2).
         await setBlockedFn(
           cfg,
           issueNumber,
@@ -840,7 +843,7 @@ export async function advance(
           "pre-merge",
           "needs-human",
         );
-        return preMergeBlocked("ci_mode: local — no worktree for inline gate", "needs-human", "ci-failed");
+        return preMergeBlocked("ci_mode: local — no worktree for inline gate", "needs-human");
       }
       const inlineResult = await runTestGateFn(
         cfg,
@@ -853,8 +856,8 @@ export async function advance(
         opts.runDir,
       );
       if (inlineResult.skipped) {
-        // Fail-closed: skipped means the test gate is disabled or no command was detected.
-        // ci_mode: local must not advance without a verified local exit-0 result.
+        // Fail-closed operational/config precondition (gate disabled / no command) —
+        // not an actual CI or local test failure. Residual `other` (#683 review 2).
         await setBlockedFn(
           cfg,
           issueNumber,
@@ -867,7 +870,6 @@ export async function advance(
         return preMergeBlocked(
           "ci_mode: local — inline test gate skipped (fail-closed)",
           "needs-human",
-          "ci-failed",
         );
       }
       if (!inlineResult.passed) {
@@ -2841,24 +2843,28 @@ export async function maybeArchiveOpenspec(
     ignoreFailure: true,
   });
   if (fetch.code !== 0) {
+    // Git/network infrastructure failure — not OpenSpec structural validation.
+    // Residual `other` via needs-human so scoreboard does not mis-bucket as
+    // openspec-invalid (#683 review 2).
     const detail = (fetch.stderr || fetch.stdout || "(no output)").trim();
     const reason =
       `Cannot sync worktree for #${issueNumber} to origin/${branch} before archiving — ` +
       `\`git fetch origin ${branch}:refs/remotes/origin/${branch}\` failed (exit ${fetch.code}): ${detail}`;
-    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
     await recordDecision("fail", "fetch failed before archive");
-    return preMergeBlocked("fetch failed before archive", "openspec-invalid");
+    return preMergeBlocked("fetch failed before archive", "needs-human");
   }
   const localHeadBefore = await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
   const reviewedHeadRes = await gitFn(wt.path, ["rev-parse", `origin/${branch}`], { ignoreFailure: true });
   if (localHeadBefore.code !== 0 || reviewedHeadRes.code !== 0) {
+    // Rev resolution failure is git tooling — residual other, not openspec-invalid.
     const detail = (reviewedHeadRes.stderr || localHeadBefore.stderr || "(no output)").trim();
     const reason =
       `Cannot resolve worktree HEAD or origin/${branch} before archiving OpenSpec change(s) ` +
       `for #${issueNumber}: ${detail}`;
-    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
     await recordDecision("fail", "rev-parse failed before archive");
-    return preMergeBlocked("rev-parse failed before archive", "openspec-invalid");
+    return preMergeBlocked("rev-parse failed before archive", "needs-human");
   }
   const reviewedHead = reviewedHeadRes.stdout.trim();
   let archiveBase = localHeadBefore.stdout.trim();
@@ -2881,10 +2887,12 @@ export async function maybeArchiveOpenspec(
   for (const id of candidates) {
     const res = await archiveFn(wt.path, id);
     if (res.unavailable) {
+      // CLI missing is tooling/env — not structural OpenSpec validation failure.
+      // Residual other via needs-human (#683 review 2).
       const reason = `openspec CLI unavailable — cannot archive change '${id}'. Install the openspec CLI and re-run.`;
-      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
       await recordDecision("fail", `openspec CLI unavailable (${id})`);
-      return preMergeBlocked(`openspec CLI unavailable (${id})`, "openspec-invalid");
+      return preMergeBlocked(`openspec CLI unavailable (${id})`, "needs-human");
     }
     if (!res.success) {
       // Surface the CLI output verbatim (#467) — e.g. a "header not found" error from a
@@ -2918,6 +2926,8 @@ export async function maybeArchiveOpenspec(
     await gitFn(wt.path, ["restore", "--staged", "."], { ignoreFailure: true });
     await gitFn(wt.path, ["restore", "."], { ignoreFailure: true });
     await gitFn(wt.path, ["clean", "-fd", "openspec/"], { ignoreFailure: true });
+    // Align outcome with setBlocked kind (push-failed → residual other, not
+    // openspec-invalid) so enriched events match GitHub blocker (#683 review 2).
     await setBlockedFn(
       cfg,
       issueNumber,
@@ -2926,7 +2936,7 @@ export async function maybeArchiveOpenspec(
       "push-failed",
     );
     await recordDecision("fail", "archive commit failed");
-    return preMergeBlocked("archive commit failed", "openspec-invalid");
+    return preMergeBlocked("archive commit failed", "push-failed");
   }
   // Plain push, deliberately never `--force`/`--force-with-lease` (#579): a
   // non-fast-forward rejection here means the remote moved again since the

@@ -205,8 +205,8 @@ test("computeBranchDeveloperCommits (via guard): auto-format commit changing imp
 
 // ---- maybeArchiveOpenspec: archive commit failure blocks and prevents push (#255) ----
 
-test("maybeArchiveOpenspec: archive succeeds but git commit fails → blocked, no push attempted", async () => {
-  const blocked: string[] = [];
+test("maybeArchiveOpenspec: archive succeeds but git commit fails → blocked push-failed (aligned outcome), no push (#255 / #683 review 2)", async () => {
+  const blocked: Array<{ reason: string; kind: string }> = [];
   let pushCalled = false;
   let archived = false;
   const COMMIT_STDERR = "pre-commit hook rejected: lint failed";
@@ -244,8 +244,8 @@ test("maybeArchiveOpenspec: archive succeeds but git commit fails → blocked, n
     changeDirExists: () => true,
     branchDeveloperCommits: async () => [], // no stale-delta condition
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
-    setBlocked: (async (_c, _n, reason: string) => {
-      blocked.push(reason);
+    setBlocked: (async (_c, _n, reason: string, _stage: string, kind: string) => {
+      blocked.push({ reason, kind });
     }) as AdvancePreMergeDeps["setBlocked"],
     openspecArchive: (async () => { archived = true; return { success: true, unavailable: false, output: "" }; }) as AdvancePreMergeDeps["openspecArchive"],
     trustedReviewAuthor: "test-actor",
@@ -256,8 +256,14 @@ test("maybeArchiveOpenspec: archive succeeds but git commit fails → blocked, n
   assert.ok(out && !out.advanced && out.status === "blocked",
     `expected blocked outcome; got: ${JSON.stringify(out)}`);
   assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
-  assert.match(blocked[0], /archive commit failed/i, "block reason must mention archive commit failure");
-  assert.match(blocked[0], new RegExp(COMMIT_STDERR), "block reason must include the commit stderr");
+  assert.match(blocked[0].reason, /archive commit failed/i, "block reason must mention archive commit failure");
+  assert.match(blocked[0].reason, new RegExp(COMMIT_STDERR), "block reason must include the commit stderr");
+  assert.equal(blocked[0].kind, "push-failed", "GitHub blocker kind is push-failed");
+  assert.equal(out.blockerKind, "push-failed", "outcome kind must match setBlocked (not openspec-invalid)");
+  assert.equal(
+    toPreMergeOfframpClass({ blockerKind: out.blockerKind, pathTag: out.offrampPathTag }),
+    "other",
+  );
   assert.equal(pushCalled, false, "git push must NOT be called when commit fails");
 });
 

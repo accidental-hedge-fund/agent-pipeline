@@ -2076,3 +2076,106 @@ test("CLI: pipeline scoreboard --help documents dogfood-day pre-merge class quer
   assert.equal(result.status, 0, `stderr:\n${result.stderr}`);
   assert.match(result.stdout, /pre-merge needs-human|--days 1|pre_merge_needs_human/i);
 });
+
+test("buildScoreboardReport: mixed historical intervention + enriched re-entry counts both off-ramps (#683 review 2)", async () => {
+  // One durable run re-enters pre-merge twice:
+  // 1) historical intervention-only off-ramp
+  // 2) newer enriched blocker_set + paired intervention (same offramp_id)
+  // Must count 2 off-ramps (other + ci-failed), not suppress the first.
+  const files: Record<string, string> = {};
+  addRun(files, "mixed-2026-06-10T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-10T00:00:00Z", issue: 1 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-10T00:00:00Z", issue: 1, repo: "owner/repo" },
+      // Entry 1 — historical intervention-only
+      { schema_version: 1, type: "stage_start", at: "2026-06-10T00:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "human_intervention",
+        at: "2026-06-10T00:01:00Z",
+        kind: "product-judgment-required",
+        stage: "pre-merge",
+        issue: 1,
+        detail: "legacy pre-enrichment block",
+      },
+      // Entry 2 — enriched dual-write with shared offramp_id
+      { schema_version: 1, type: "stage_start", at: "2026-06-10T01:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-10T01:01:00Z",
+        reason: "CI checks failed",
+        stage: "pre-merge",
+        blocker_kind: "needs-human",
+        offramp_class: "ci-failed",
+        offramp_id: "pair-abc",
+      },
+      {
+        schema_version: 1,
+        type: "human_intervention",
+        at: "2026-06-10T01:01:01Z",
+        kind: "product-judgment-required",
+        stage: "pre-merge",
+        issue: 1,
+        detail: "CI checks failed",
+        offramp_id: "pair-abc",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T01:02:00Z", final_state: "blocked", elapsed_ms: 3720000 },
+    ],
+    summary: { issue: 1, pr: 101, finalState: "blocked", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" },
+    memDeps(files),
+  );
+  const pm = report.metrics.pre_merge_needs_human;
+  assert.equal(pm.pre_merge_entries, 2);
+  assert.equal(pm.pre_merge_needs_human_count, 2, "both historical and enriched off-ramps count");
+  assert.equal(pm.by_class.other.count, 1, "historical intervention-only residual");
+  assert.equal(pm.by_class["ci-failed"].count, 1, "enriched blocker_set");
+  // Paired intervention must not double-count with its blocker_set
+  let sum = 0;
+  for (const entry of Object.values(pm.by_class)) sum += entry.count;
+  assert.equal(sum, 2);
+});
+
+test("buildScoreboardReport: legacy dual-write without offramp_id in one entry does not double-count (#683 review 2)", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "legacy-dual-2026-06-10T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-10T00:00:00Z", issue: 1 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-10T00:00:00Z", issue: 1, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-10T00:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-10T00:01:00Z",
+        reason: "merge conflict",
+        stage: "pre-merge",
+        blocker_kind: "merge-conflict",
+        offramp_class: "merge-conflict",
+      },
+      {
+        schema_version: 1,
+        type: "human_intervention",
+        at: "2026-06-10T00:01:01Z",
+        kind: "product-judgment-required",
+        stage: "pre-merge",
+        issue: 1,
+        detail: "merge conflict",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T00:02:00Z", final_state: "blocked", elapsed_ms: 120000 },
+    ],
+    summary: { issue: 1, pr: 1, finalState: "blocked", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" },
+    memDeps(files),
+  );
+  const pm = report.metrics.pre_merge_needs_human;
+  assert.equal(pm.pre_merge_needs_human_count, 1);
+  assert.equal(pm.by_class["merge-conflict"].count, 1);
+  assert.equal(pm.by_class.other.count, 0);
+});

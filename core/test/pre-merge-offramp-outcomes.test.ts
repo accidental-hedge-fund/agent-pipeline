@@ -180,3 +180,38 @@ test("pre-merge waiting path does not produce a blocked class (#683)", async (t)
   assert.equal(out.status, "waiting");
   assert.equal(outcomeClass(out), null);
 });
+
+test("pre-merge local no-worktree precondition maps to residual other, not ci-failed (#683 review 2)", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const deps = makeBaseDeps({
+    readRunEvents: async () => [] as never,
+    getForIssue: async () => null,
+  });
+  const out = await advance(makeCfg("local"), 683, { runDir: "/fake/run/dir" }, deps);
+  assert.equal(out.advanced, false);
+  assert.equal(out.status, "blocked");
+  assert.equal(out.blockerKind, "needs-human");
+  assert.equal(out.offrampPathTag, undefined);
+  assert.equal(outcomeClass(out), "other");
+});
+
+test("pre-merge local skipped inline gate maps to residual other, not ci-failed (#683 review 2)", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const deps = makeBaseDeps({
+    readRunEvents: async () => [] as never,
+    getForIssue: async () =>
+      ({ path: "/fake/wt", slug: "slug" }) as Awaited<
+        ReturnType<NonNullable<AdvancePreMergeDeps["getForIssue"]>>
+      >,
+    runTestGate: async () =>
+      ({ skipped: true, passed: false, attempts: 0 }) as Awaited<
+        ReturnType<NonNullable<AdvancePreMergeDeps["runTestGate"]>>
+      >,
+  });
+  const out = await advance(makeCfg("local"), 683, { runDir: "/fake/run/dir" }, deps);
+  assert.equal(out.advanced, false);
+  assert.equal(out.status, "blocked");
+  assert.equal(out.blockerKind, "needs-human");
+  assert.equal(out.offrampPathTag, undefined);
+  assert.equal(outcomeClass(out), "other");
+});

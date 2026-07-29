@@ -42,6 +42,12 @@ export interface HumanInterventionEvent {
   issue: number;
   detail: string;
   ref?: string | null;
+  /**
+   * Shared id pairing this intervention with a co-emitted `blocker_set` for the
+   * same off-ramp (#683 review 2). Additive optional — absent on pre-pair
+   * historical events.
+   */
+  offramp_id?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +83,8 @@ export async function emitHumanIntervention(
     issue: number;
     detail: string;
     ref?: string | null;
+    /** Shared pair id with co-emitted blocker_set (#683 review 2). */
+    offramp_id?: string;
   },
   deps: EmitInterventionDeps = defaultEmitDeps,
 ): Promise<void> {
@@ -92,6 +100,9 @@ export async function emitHumanIntervention(
       detail: sanitize(redactSecrets(payload.detail)),
       ...(payload.ref != null
         ? { ref: sanitize(redactSecrets(String(payload.ref))) }
+        : {}),
+      ...(payload.offramp_id != null && payload.offramp_id !== ""
+        ? { offramp_id: payload.offramp_id }
         : {}),
     };
     const line = `${JSON.stringify(event)}\n`;
