@@ -969,6 +969,86 @@ test("runPlanningPhases — missing ack still blocked needs-human after exhauste
   }
 });
 
+// Exit-0 empty stdout is an output-contract failure, not harness-failure: it must
+// still get the format-repair re-prompt, and exhausted empty repair must terminal
+// as needs-human with the missing-section reason (#658 review finding 121084d7).
+const revisionEmptyStdout: HarnessResult = {
+  success: true,
+  stdout: "",
+  stderr: "",
+  exit_code: 0,
+  duration: 1,
+  timed_out: false,
+};
+
+const revisionWhitespaceStdout: HarnessResult = {
+  success: true,
+  stdout: "   \n\t  \n",
+  stderr: "",
+  exit_code: 0,
+  duration: 1,
+  timed_out: false,
+};
+
+test("runPlanningPhases — exit-0 empty revision stdout retries format-repair then proceeds (#658)", async () => {
+  for (const hooks of [freeformHooks(), openspecHooks()]) {
+    let revisionCalls = 0;
+    const prompts: string[] = [];
+    let postedRevised = false;
+    const captured = await runAndCapture(hooks, {
+      invoke: async (_h: unknown, _cwd: unknown, prompt: string) => {
+        if (typeof prompt === "string" && prompt.includes("Revise the implementation plan")) {
+          revisionCalls++;
+          prompts.push(prompt);
+          if (revisionCalls === 1) return revisionEmptyStdout;
+          return revisionOkResult;
+        }
+        return harnessOk;
+      },
+      postComment: async (_cfg: unknown, _n: unknown, body: string) => {
+        if (typeof body === "string" && body.includes("## Revised Implementation Plan")) {
+          postedRevised = true;
+        }
+      },
+    });
+    assert.equal(captured, undefined, `must not block after successful repair; got ${JSON.stringify(captured)}`);
+    assert.equal(revisionCalls, 2, "empty initial stdout must still trigger one format-repair re-prompt");
+    assert.ok(prompts[1]?.includes("FORMAT REPAIR"), "second revision prompt must include format-repair addendum");
+    assert.equal(postedRevised, true, "revised plan must be posted after repair success");
+  }
+});
+
+test("runPlanningPhases — exit-0 empty stdout on initial+repair ends needs-human not harness-failure (#658)", async () => {
+  for (const empty of [revisionEmptyStdout, revisionWhitespaceStdout]) {
+    for (const hooks of [freeformHooks(), openspecHooks()]) {
+      let revisionCalls = 0;
+      let postedRevised = false;
+      const captured = await runAndCapture(hooks, {
+        invoke: async (_h: unknown, _cwd: unknown, prompt: string) => {
+          if (typeof prompt === "string" && prompt.includes("Revise the implementation plan")) {
+            revisionCalls++;
+            return empty;
+          }
+          return harnessOk;
+        },
+        postComment: async (_cfg: unknown, _n: unknown, body: string) => {
+          if (typeof body === "string" && body.includes("## Revised Implementation Plan")) {
+            postedRevised = true;
+          }
+        },
+      });
+      assert.equal(captured?.tag, "needs-human", `tag must be needs-human not harness-failure; got ${captured?.tag}`);
+      assert.equal(captured?.stage, "plan-review");
+      assert.ok(
+        captured?.reason.includes("missing required ## Feedback Incorporated section"),
+        `reason: ${captured?.reason}`,
+      );
+      assert.equal(revisionCalls, 2, "original + one repair, then terminal contract block");
+      assert.equal(postedRevised, false, "must not post revised plan after exhausted empty repair");
+    }
+  }
+});
+
 test("runPlanningPhases — blocker equivalence: human-feedback-ack failure", async () => {
   // revalidateArtifact returns plan text WITHOUT the ack section.
   const noAckRevalidate: Partial<PlanningPhaseHooks> = {

@@ -665,7 +665,10 @@ export async function runPlanningPhases(
         : await invokePlanStep(primary, wt.path, prompt, cfg, opts, { invoke: deps.invoke }, { issue: issueNumber, stage: "plan-review" });
 
     let revisionResult = await invokeRevisionOnce(revisionPrompt);
-    if (!revisionResult.success || !revisionResult.stdout.trim()) {
+    // Only treat unsuccessful/timed-out invocations as harness-failure. Exit-0
+    // empty/whitespace stdout is an output-contract failure: route it through
+    // verifyPlanRevisionOutput so the format-repair retry can still run (#658).
+    if (!revisionResult.success) {
       const reason = revisionResult.timed_out
         ? `Plan revision timed out after ${revisionResult.duration.toFixed(0)}s`
         : `Plan revision failed (exit ${revisionResult.exit_code})`;
@@ -675,7 +678,8 @@ export async function runPlanningPhases(
     }
     // Verify the plan-revision output includes the required acknowledgement section (#68).
     // Mid-line headers are normalised inside verifyPlanRevisionOutput (#658). Pure
-    // output-contract failures get one format-repair re-prompt before needs-human.
+    // output-contract failures (including empty stdout) get one format-repair
+    // re-prompt before needs-human.
     let ackCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
     if (!ackCheck.ok) {
       console.warn(
@@ -683,7 +687,9 @@ export async function runPlanningPhases(
       );
       const repairPrompt = `${revisionPrompt}\n\n${PLAN_REVISION_FORMAT_REPAIR_ADDENDUM}`;
       const repairResult = await invokeRevisionOnce(repairPrompt);
-      if (!repairResult.success || !repairResult.stdout.trim()) {
+      // Same rule as the initial invoke: only unsuccessful repair is harness-failure.
+      // Successful empty repair falls through to the exhausted-contract needs-human path.
+      if (!repairResult.success) {
         const reason = repairResult.timed_out
           ? `Plan revision format-repair timed out after ${repairResult.duration.toFixed(0)}s`
           : `Plan revision format-repair failed (exit ${repairResult.exit_code})`;
