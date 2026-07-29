@@ -62,6 +62,7 @@ import { makePipelineRunId } from "./traceability.ts";
 import { parseOverrideArg } from "./review-policy.ts";
 import { classifyProductFault, emitProductFault, resolveHostAdapter, resolveProductFaultConfig } from "./product-fault.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
+import { toPreMergeOfframpClass } from "./pre-merge-offramp.ts";
 import { autoFileCorrections, autoFilePapercuts, realAutoFileDeps } from "./stages/papercut.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
@@ -1038,9 +1039,39 @@ export async function runAdvance(
         } else {
           // Not eligible or no rounds spent: stop as today.
           if (out.status === "blocked" && runDir) {
-            await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "blocker_set", at: evidenceTimestamp(), reason: out.reason }, runStoreDeps).catch(() => {});
+            // Enrich blocker_set with stage/kind/class (#683). Additive fields
+            // keep schema_version 1; offramp_class only for pre-merge. Event
+            // write is best-effort — never masks the blocked stage outcome.
+            const blockerKind = out.blockerKind ?? "needs-human";
+            const pathTag =
+              out.status === "blocked" && "offrampPathTag" in out
+                ? out.offrampPathTag
+                : undefined;
+            const blockerEvent: {
+              schema_version: typeof RUN_SCHEMA_VERSION;
+              type: "blocker_set";
+              at: string;
+              reason: string;
+              stage: string;
+              blocker_kind: string;
+              offramp_class?: string;
+            } = {
+              schema_version: RUN_SCHEMA_VERSION,
+              type: "blocker_set",
+              at: evidenceTimestamp(),
+              reason: out.reason,
+              stage: auditStage,
+              blocker_kind: blockerKind,
+            };
+            if (auditStage === "pre-merge") {
+              blockerEvent.offramp_class = toPreMergeOfframpClass({
+                blockerKind,
+                pathTag: pathTag ?? null,
+              });
+            }
+            await appendEvent(runDir, blockerEvent, runStoreDeps).catch(() => {});
             await emitHumanIntervention(runDir, {
-              kind: blockerKindToInterventionKind(out.blockerKind ?? "needs-human"),
+              kind: blockerKindToInterventionKind(blockerKind),
               stage: auditStage,
               issue: issueNumber,
               detail: out.reason,

@@ -1374,6 +1374,19 @@ function htmlFixtureReport(): ScoreboardReport {
       },
     },
     needs_human_rate: { numerator: 1, denominator: 8, ratio: 0.125 },
+    pre_merge_needs_human: {
+      pre_merge_entries: 4,
+      pre_merge_needs_human_count: 2,
+      rate: { numerator: 2, denominator: 4, ratio: 0.5 },
+      by_class: {
+        "ci-failed": { count: 1, rate: { numerator: 1, denominator: 4, ratio: 0.25 } },
+        "delta-review": { count: 0, rate: { numerator: 0, denominator: 4, ratio: 0 } },
+        "merge-conflict": { count: 1, rate: { numerator: 1, denominator: 4, ratio: 0.25 } },
+        "openspec-invalid": { count: 0, rate: { numerator: 0, denominator: 4, ratio: 0 } },
+        "openspec-stale-delta": { count: 0, rate: { numerator: 0, denominator: 4, ratio: 0 } },
+        other: { count: 0, rate: { numerator: 0, denominator: 4, ratio: 0 } },
+      },
+    },
     same_harness_fallback_rate: { numerator: 0, denominator: 0, ratio: null },
     gate_pass_rates: {
       test: { pass_rate: { numerator: 4, denominator: 4, ratio: 1 }, passed: 4, failed: 0, skipped: 0 },
@@ -1756,4 +1769,310 @@ test("CLI: pipeline scoreboard --help documents --html <path> (#427)", () => {
   );
   assert.equal(result.status, 0, `stderr:\n${result.stderr}`);
   assert.match(result.stdout, /--html <path>/);
+});
+
+// ---------------------------------------------------------------------------
+// Pre-merge needs-human by class (#683)
+// ---------------------------------------------------------------------------
+
+test("buildScoreboardReport: pre-merge needs-human rate and class breakdown from durable events (#683)", async () => {
+  const files: Record<string, string> = {};
+  // Run A: entered pre-merge, blocked ci-failed
+  addRun(files, "a-2026-06-10T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-10T00:00:00Z", issue: 1 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-10T00:00:00Z", issue: 1, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-10T00:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-10T00:01:00Z",
+        reason: "CI checks failed",
+        stage: "pre-merge",
+        blocker_kind: "needs-human",
+        offramp_class: "ci-failed",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T00:02:00Z", final_state: "blocked", elapsed_ms: 120000 },
+    ],
+    summary: { issue: 1, pr: 101, finalState: "blocked", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+  // Run B: entered pre-merge, blocked merge-conflict
+  addRun(files, "b-2026-06-11T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-11T00:00:00Z", issue: 2 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-11T00:00:00Z", issue: 2, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-11T00:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-11T00:01:00Z",
+        reason: "merge conflict",
+        stage: "pre-merge",
+        blocker_kind: "merge-conflict",
+        offramp_class: "merge-conflict",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-11T00:02:00Z", final_state: "blocked", elapsed_ms: 120000 },
+    ],
+    summary: { issue: 2, pr: 102, finalState: "blocked", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+  // Run C: entered pre-merge, advanced successfully (no off-ramp)
+  addRun(files, "c-2026-06-12T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-12T00:00:00Z", issue: 3 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-12T00:00:00Z", issue: 3, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-12T00:00:10Z", stage: "pre-merge" },
+      { schema_version: 1, type: "stage_complete", at: "2026-06-12T00:01:00Z", stage: "pre-merge", outcome: "advanced" },
+      { schema_version: 1, type: "run_complete", at: "2026-06-12T00:02:00Z", final_state: "ready-to-deploy", elapsed_ms: 120000 },
+    ],
+    summary: { issue: 3, pr: 103, finalState: "ready-to-deploy", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" },
+    memDeps(files),
+  );
+
+  const pm = report.metrics.pre_merge_needs_human;
+  assert.equal(pm.pre_merge_entries, 3, "denominator is pre-merge entries not all runs");
+  assert.equal(pm.pre_merge_needs_human_count, 2);
+  assert.deepEqual(pm.rate, { numerator: 2, denominator: 3, ratio: 2 / 3 });
+  assert.equal(pm.by_class["ci-failed"].count, 1);
+  assert.equal(pm.by_class["merge-conflict"].count, 1);
+  assert.equal(pm.by_class["delta-review"].count, 0);
+  // Class counts sum to total numerator
+  let sum = 0;
+  for (const entry of Object.values(pm.by_class)) sum += entry.count;
+  assert.equal(sum, pm.pre_merge_needs_human_count);
+  // Same denominator on class rates
+  assert.equal(pm.by_class["ci-failed"].rate.denominator, 3);
+  assert.equal(pm.by_class["merge-conflict"].rate.denominator, 3);
+});
+
+test("buildScoreboardReport: zero pre-merge entries yields null rates (#683)", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "no-pm-2026-06-10T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-10T00:00:00Z", issue: 1 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-10T00:00:00Z", issue: 1, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-10T00:00:10Z", stage: "review-1" },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T00:02:00Z", final_state: "needs-human", elapsed_ms: 120000 },
+    ],
+    summary: { issue: 1, pr: null, finalState: "needs-human", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" },
+    memDeps(files),
+  );
+  const pm = report.metrics.pre_merge_needs_human;
+  assert.equal(pm.pre_merge_entries, 0);
+  assert.equal(pm.pre_merge_needs_human_count, 0);
+  assert.equal(pm.rate.ratio, null);
+  for (const entry of Object.values(pm.by_class)) {
+    assert.equal(entry.rate.ratio, null);
+  }
+});
+
+test("buildScoreboardReport: historical blocker_set without offramp_class still counts via kind or residual (#683)", async () => {
+  const files: Record<string, string> = {};
+  // Historical: stage + blocker_kind only (no offramp_class)
+  addRun(files, "hist-kind-2026-06-10T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-10T00:00:00Z", issue: 1 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-10T00:00:00Z", issue: 1, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-10T00:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-10T00:01:00Z",
+        reason: "old merge conflict",
+        stage: "pre-merge",
+        blocker_kind: "merge-conflict",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T00:02:00Z", final_state: "blocked", elapsed_ms: 120000 },
+    ],
+    summary: { issue: 1, pr: 1, finalState: "blocked", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+  // Historical: stage only, no kind, no class → other
+  addRun(files, "hist-other-2026-06-11T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-11T00:00:00Z", issue: 2 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-11T00:00:00Z", issue: 2, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-11T00:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-11T00:01:00Z",
+        reason: "something blocked",
+        stage: "pre-merge",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-11T00:02:00Z", final_state: "blocked", elapsed_ms: 120000 },
+    ],
+    summary: { issue: 2, pr: 2, finalState: "blocked", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+  // Historical: only human_intervention at pre-merge (pre-enrichment)
+  addRun(files, "hist-interv-2026-06-12T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-12T00:00:00Z", issue: 3 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-12T00:00:00Z", issue: 3, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-12T00:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "human_intervention",
+        at: "2026-06-12T00:01:00Z",
+        kind: "product-judgment-required",
+        stage: "pre-merge",
+        issue: 3,
+        detail: "legacy block",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-12T00:02:00Z", final_state: "needs-human", elapsed_ms: 120000 },
+    ],
+    summary: { issue: 3, pr: 3, finalState: "needs-human", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" },
+    memDeps(files),
+  );
+  const pm = report.metrics.pre_merge_needs_human;
+  assert.equal(pm.pre_merge_entries, 3);
+  assert.equal(pm.pre_merge_needs_human_count, 3);
+  assert.equal(pm.by_class["merge-conflict"].count, 1);
+  assert.equal(pm.by_class.other.count, 2);
+  let sum = 0;
+  for (const entry of Object.values(pm.by_class)) sum += entry.count;
+  assert.equal(sum, 3);
+});
+
+test("buildScoreboardReport: day bucket splits pre-merge classes; full window unchanged with/without --bucket (#683)", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "d1-2026-06-10T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-10T12:00:00Z", issue: 1 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-10T12:00:00Z", issue: 1, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-10T12:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-10T12:01:00Z",
+        reason: "CI failed",
+        stage: "pre-merge",
+        offramp_class: "ci-failed",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T12:02:00Z", final_state: "blocked", elapsed_ms: 120000 },
+    ],
+    summary: { issue: 1, pr: 1, finalState: "blocked", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+  addRun(files, "d2-2026-06-11T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-11T12:00:00Z", issue: 2 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-11T12:00:00Z", issue: 2, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-11T12:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-11T12:01:00Z",
+        reason: "delta",
+        stage: "pre-merge",
+        offramp_class: "delta-review",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-11T12:02:00Z", final_state: "blocked", elapsed_ms: 120000 },
+    ],
+    summary: { issue: 2, pr: 2, finalState: "blocked", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+
+  const opts = { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" };
+  const plain = await buildScoreboardReport(opts, memDeps(files));
+  const bucketed = await buildScoreboardReport({ ...opts, bucket: "day" }, memDeps(files));
+
+  assert.deepEqual(plain.metrics.pre_merge_needs_human, bucketed.metrics.pre_merge_needs_human);
+  assert.ok(bucketed.series && bucketed.series.length >= 2);
+
+  const d1 = bucketed.series!.find((p) => p.start.startsWith("2026-06-10"));
+  const d2 = bucketed.series!.find((p) => p.start.startsWith("2026-06-11"));
+  assert.ok(d1, "day1 period present");
+  assert.ok(d2, "day2 period present");
+  assert.equal(d1!.metrics.pre_merge_needs_human.by_class["ci-failed"].count, 1);
+  assert.equal(d1!.metrics.pre_merge_needs_human.by_class["delta-review"].count, 0);
+  assert.equal(d2!.metrics.pre_merge_needs_human.by_class["delta-review"].count, 1);
+  assert.equal(d2!.metrics.pre_merge_needs_human.by_class["ci-failed"].count, 0);
+
+  // Full-window by-class counts equal sum of period counts
+  for (const cls of ["ci-failed", "delta-review", "merge-conflict", "openspec-invalid", "openspec-stale-delta", "other"] as const) {
+    let periodSum = 0;
+    for (const period of bucketed.series!) {
+      periodSum += period.metrics.pre_merge_needs_human.by_class[cls].count;
+    }
+    assert.equal(periodSum, plain.metrics.pre_merge_needs_human.by_class[cls].count, cls);
+  }
+});
+
+test("buildScoreboardReport: pre-merge aggregation does not invoke gh (read-only local deps only) (#683)", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "local-only-2026-06-10T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-10T00:00:00Z", issue: 1 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-10T00:00:00Z", issue: 1, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-10T00:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-10T00:01:00Z",
+        reason: "CI failed",
+        stage: "pre-merge",
+        offramp_class: "ci-failed",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T00:02:00Z", final_state: "blocked", elapsed_ms: 120000 },
+    ],
+    summary: { issue: 1, pr: 1, finalState: "blocked", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+  const deps = memDeps(files);
+  // ScoreboardDeps only has readFile/readdir — no gh seam; prove only run-store paths are read.
+  await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" },
+    deps,
+  );
+  assert.ok(deps.reads.every((p) => p.includes(".agent-pipeline") || p.includes("runs")), "only local run artifacts");
+  assert.ok(!deps.reads.some((p) => p.includes("terminal.log")));
+});
+
+test("formatScoreboardHuman: includes pre-merge needs-human rate and class (#683)", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "human-2026-06-10T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-10T00:00:00Z", issue: 1 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-10T00:00:00Z", issue: 1, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-10T00:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-10T00:01:00Z",
+        reason: "CI failed",
+        stage: "pre-merge",
+        offramp_class: "ci-failed",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T00:02:00Z", final_state: "blocked", elapsed_ms: 120000 },
+    ],
+    summary: { issue: 1, pr: 1, finalState: "blocked", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" },
+    memDeps(files),
+  );
+  const human = formatScoreboardHuman(report);
+  assert.match(human, /Pre-merge needs-human rate:/);
+  assert.match(human, /ci-failed:/);
+  const html = renderScoreboardHtml(report);
+  assert.match(html, /Pre-merge needs-human rate/);
+  assert.match(html, /ci-failed/);
+});
+
+test("CLI: pipeline scoreboard --help documents dogfood-day pre-merge class query (#683)", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "scoreboard", "--help"],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}`);
+  assert.match(result.stdout, /pre-merge needs-human|--days 1|pre_merge_needs_human/i);
 });

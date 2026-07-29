@@ -1546,7 +1546,12 @@ async function main(): Promise<void> {
     process.stdout.write(
       "Usage: pipeline scoreboard [--since <date>] [--until <date>] [--days <n>] [--estimate-cost <harness=usd>] [--bucket <unit>] [--by <dimension>] [--corrections-by <dimension>] [--html <path>] [--json]\n\n" +
       "Read-only factory report: scans .agent-pipeline/runs/*/{run.json,events.jsonl,summary.json}\n" +
-      "and prints throughput, autonomy, cost, duration, retry, blocker, fallback, and gate metrics.\n\n" +
+      "and prints throughput, autonomy, cost, duration, retry, blocker, fallback, and gate metrics.\n" +
+      "Includes pre-merge needs-human rate and by-class breakdown (ci-failed, delta-review,\n" +
+      "merge-conflict, OpenSpec, other) derived from durable run events — never issue comments.\n\n" +
+      "Dogfood-day query (one-day class breakdown as JSON):\n" +
+      "  pipeline scoreboard --days 1 --json\n" +
+      "  # → .metrics.pre_merge_needs_human  (rate + by_class)\n\n" +
       "Options:\n" +
       "  --since <date>              window start (ISO-8601)\n" +
       "  --until <date>              window end (ISO-8601)\n" +
