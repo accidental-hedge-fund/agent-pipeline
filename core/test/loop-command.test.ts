@@ -6,8 +6,6 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -616,37 +614,103 @@ test("runLoopCommand — non-numeric trailing positional fails in loop normaliza
   assert.doesNotMatch(err.join("\n"), /unexpected argument/i);
 });
 
-const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
+// Pure end-to-end wiring for #554 (no live pipeline subprocess): Commander
+// parse → shared maxPositionalsFor guard → runLoopCommand handoff slice.
+// Mirrors main()'s arity check and `cmd.args.slice(1)` without invoking
+// production preflight or the drive engine.
 
-test("CLI: `pipeline loop 649 551 541 334` is not rejected as unexpected positionals (#554)", () => {
-  const r = spawnSync(
-    process.execPath,
-    ["--experimental-strip-types", PIPELINE_SCRIPT, "loop", "649", "551", "541", "334"],
-    { encoding: "utf8" },
+test("CLI wiring: multi-issue loop positionals pass the arity guard and hand off to runLoopCommand (#554)", async () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "loop", "649", "551", "541", "334"]);
+  assert.deepEqual(cmd.args, ["loop", "649", "551", "541", "334"]);
+  // Same predicate main() uses before dispatching runLoopCommand.
+  assert.ok(
+    cmd.args.length <= maxPositionalsFor(cmd.args[0]),
+    "shared positional guard must accept a multi-issue loop list",
   );
-  // Preflight/engine may still fail on this host; the regression is that the
-  // top-level arity guard must not fire on a valid multi-issue list.
-  assert.doesNotMatch(
-    r.stderr,
-    /unexpected argument\(s\):\s*649,\s*551,\s*541,\s*334/i,
-    `multi-issue loop list must reach loop preflight; stderr:\n${r.stderr}`,
-  );
-  assert.doesNotMatch(
-    r.stderr,
-    /unexpected argument\(s\):\s*551,\s*541,\s*334/i,
-    `multi-issue loop list must not strip only the first issue; stderr:\n${r.stderr}`,
-  );
+  const handedOff = cmd.args.slice(1);
+  assert.deepEqual(handedOff, ["649", "551", "541", "334"]);
+
+  let seenIssues: string[] | undefined;
+  let seenSelector: unknown;
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async (raw) => {
+      seenIssues = raw.issues;
+      return realRunLoopPreflight(
+        raw,
+        "claude",
+        {
+          exec: async () => ({ ok: true, stdout: "/goal autonomous mode", stderr: "" }),
+          execCheck: async () => true,
+          fsExists: async () => false,
+          fileMtime: async () => 1000,
+          readTextFile: async () => null,
+        },
+        [],
+        "auto",
+      );
+    },
+    runLoopEngine: async (input) => {
+      seenSelector = input.selector;
+      return {
+        kind: "drive",
+        result: {
+          runId: "loop-wiring-multi",
+          cycles: 1,
+          stop: null,
+          holdOutstanding: false,
+          allDone: true,
+          resumed: false,
+          heldItemIds: [],
+          dispatched: 4,
+          excludedItemIds: [],
+          exclusionReason: null,
+          completion: "all_done",
+        },
+      };
+    },
+  };
+  process.exitCode = undefined;
+  await withCapturedConsole(() => runLoopCommand({ profile: "claude" } as CliOpts, handedOff, deps));
+  assert.deepEqual(seenIssues, ["649", "551", "541", "334"]);
+  assert.deepEqual(seenSelector, { type: "work-list", value: ["649", "551", "541", "334"] });
+  assert.equal(process.exitCode, 0);
 });
 
-test("CLI: `pipeline loop 649 not-an-issue` fails with a loop issue-number error (#554)", () => {
-  const r = spawnSync(
-    process.execPath,
-    ["--experimental-strip-types", PIPELINE_SCRIPT, "loop", "649", "not-an-issue"],
-    { encoding: "utf8" },
+test("CLI wiring: non-numeric trailing loop positional passes the arity guard then fails in loop normalization (#554)", async () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "loop", "649", "not-an-issue"]);
+  assert.deepEqual(cmd.args, ["loop", "649", "not-an-issue"]);
+  assert.ok(
+    cmd.args.length <= maxPositionalsFor(cmd.args[0]),
+    "arity guard must not reject before loop-owned token validation",
   );
-  assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /expected an issue number.*not-an-issue/i);
-  assert.doesNotMatch(r.stderr, /unexpected argument/i);
+  const handedOff = cmd.args.slice(1);
+
+  const deps: LoopCliDeps = {
+    runLoopPreflight: (raw, engine, _deps, roots, attestation) =>
+      realRunLoopPreflight(
+        raw,
+        engine,
+        {
+          exec: async () => ({ ok: true, stdout: "/goal autonomous mode", stderr: "" }),
+          execCheck: async () => true,
+          fsExists: async () => false,
+          fileMtime: async () => 1000,
+          readTextFile: async () => null,
+        },
+        roots,
+        attestation,
+      ),
+    runLoopEngine: NEVER_CALLED_ENGINE,
+  };
+  process.exitCode = undefined;
+  const { err } = await withCapturedConsole(() =>
+    runLoopCommand({ profile: "claude" } as CliOpts, handedOff, deps),
+  );
+  assert.equal(process.exitCode, 1);
+  assert.match(err.join("\n"), /expected an issue number.*not-an-issue/i);
+  assert.doesNotMatch(err.join("\n"), /unexpected argument/i);
 });
 
 // ---------------------------------------------------------------------------
