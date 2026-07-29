@@ -43,12 +43,15 @@ Host skill guidance for `pipeline:loop` drive and resume (Claude and Codex) SHAL
 2. Obtain `run_id` and the loop events path **before supervisor completion**, in
    this order of preference: (a) early handoff carrying at least `run_id` and a
    loop events path when present; (b) `--resume <run-id>` or an operator-known id;
-   (c) race-safe state-home discovery — snapshot `<state-home>/runs/`, then map
-   either a newly published run directory (`contract.json` + `events.jsonl`,
-   ignoring `.init-*` staging) or an existing directory that acquires a live lock
-   held by the started supervisor pid. The terminal printed result JSON SHALL be
-   documented as a final-summary surface only, not as the sole mid-flight source
-   of `run_id` for a newly started drive.
+   (c) race-safe state-home discovery — snapshot `<state-home>/runs/`, then scan
+   every candidate directory (ignore `.init-*` staging) and select **only** a run
+   that has `contract.json` + `events.jsonl` and a live lock held by the started
+   supervisor pid (covers newly published and pre-existing re-drive). Do **not**
+   select the first newly published directory by glob order when lock ownership
+   is unknown; keep polling until a lock-owned match appears or the supervisor
+   exits. The terminal printed result JSON SHALL be documented as a
+   final-summary surface only, not as the sole mid-flight source of `run_id` for
+   a newly started drive.
 3. Follow the loop event stream (persistent Monitor or host-equivalent follow).
 4. Optionally follow an active item’s advance event stream when that advance
    `run_id` is published.

@@ -635,19 +635,19 @@ live supervisor unobserved when the Codex turn ends without an event-follow plan
 2. **`--resume <run-id>`** (or an operator-known id): use that `run_id`
    immediately; begin following before or right after launching.
 3. **Race-safe state-home discovery** for a newly started or selector-continued
-   drive (no early handoff, no resume arg). Poll until one of these holds:
-
-   - A **newly published** run directory under `$RUNS/` whose basename was **not**
-     in `$BEFORE`, with both `contract.json` and `events.jsonl` present.
-     (`initRun` publishes via exclusive rename — staging dirs use a `.init-*`
-     suffix and must be ignored.)
-   - Or an **existing** run directory that acquires a live `lock.json` whose
-     `pid` equals `$LOOP_PID` (or a child of it) after launch — covers
-     selector re-drive of an already-initialized canonical run without a new
-     directory appearing.
+   drive (no early handoff, no resume arg). Snapshot `$BEFORE` so concurrent
+   publishes are visible, then **scan every candidate** under `$RUNS/` each poll
+   (ignore `.init-*` staging). Select **only** a directory that has both
+   `contract.json` and `events.jsonl` **and** a live `lock.json` whose `pid`
+   equals `$LOOP_PID` (or a child of it). That single rule covers a newly
+   published run and selector re-drive of an already-initialized canonical run.
+   **Never** break on the first newly published basename (glob order is not
+   ownership). If one or more new directories exist without a lock owned by
+   `$LOOP_PID`, keep polling until a lock match appears or `$LOOP_PID` exits.
 
 ```bash
 # Pseudocode — poll briefly (seconds, not the full run) until mapped or LOOP_PID exits.
+# Scan ALL candidates; select ONLY a run with a live lock owned by $LOOP_PID.
 RUN_ID=""
 while kill -0 "$LOOP_PID" 2>/dev/null; do
   for d in "$RUNS"/*; do
@@ -655,20 +655,15 @@ while kill -0 "$LOOP_PID" 2>/dev/null; do
     base=$(basename "$d")
     case "$base" in *.init-*) continue ;; esac
     [ -f "$d/contract.json" ] && [ -f "$d/events.jsonl" ] || continue
-    if ! printf '%s\n' "$BEFORE" | grep -qxF "$base"; then
-      RUN_ID=$base; break
-    fi
     if [ -f "$d/lock.json" ] && grep -q "\"pid\"[[:space:]]*:[[:space:]]*$LOOP_PID" "$d/lock.json"; then
-      RUN_ID=$base; break
+      RUN_ID=$base
+      break
     fi
   done
   [ -n "$RUN_ID" ] && break
   sleep 0.5
 done
 ```
-
-If multiple new directories appear (rare on a single host), prefer the one whose
-`lock.json` pid matches `$LOOP_PID`.
 
 4. **Terminal result JSON** (`/tmp/pipeline-loop-$$.out` after process exit) —
    use only for the **final summary**, not as the sole mid-flight source of
