@@ -1350,6 +1350,20 @@ Use `--events` for stage/lifecycle monitoring. It reads the canonical run-store
 `events.jsonl`; no separate transitions log or grep-filtered terminal output is
 required.
 
+Durable multi-item loop runs store events under the loop state home (not
+`.agent-pipeline/runs/`). Observe them with the nested logs sub-verb:
+
+```bash
+# print a durable loop run's events.jsonl
+$pipeline loop logs <loop-run-id> --events
+
+# follow until interrupt (SIGINT/SIGTERM) — does not auto-exit on loop_run_stopped
+$pipeline loop logs <loop-run-id> --events --follow
+
+# list available durable loop run ids (most recent first)
+$pipeline loop logs
+```
+
 Stream lifecycle events to stdout as JSON lines alongside normal output (for orchestrators like Pipeline Desk):
 
 ```bash

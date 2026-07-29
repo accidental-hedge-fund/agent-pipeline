@@ -94,6 +94,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor
 /pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
 /pipeline:loop --audit                   read-only report for the run; no writes
+/pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (interrupt stops follow; no auto-exit on terminal)
 /pipeline evals plan <manifest.json>     expand + persist an experiment's run plan; invokes no harness, creates no worktree
 /pipeline evals run <manifest.json>      execute an experiment's cells (resumable); never writes to production GitHub
 /pipeline evals run <manifest.json> --fixtures <dir>  override the fixtures directory (default: core/evals/fixtures)

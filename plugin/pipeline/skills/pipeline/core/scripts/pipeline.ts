@@ -142,6 +142,7 @@ import {
   resolveSupersessionChainHead,
   runExists as loopRunExists,
 } from "./loop/store.ts";
+import { runLoopLogs } from "./loop/logs.ts";
 import { initRecoverableRun } from "./loop/recovery.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
 import { compileContractItems } from "./loop/dependencies.ts";
@@ -382,8 +383,8 @@ export function buildCmd(): Command {
     .option("--model <model>", "override the review/fix model when supported by the selected harness")
     .option("--profile <name>", "shared-core profile to use: codex or claude", process.env.PIPELINE_PROFILE ?? "codex")
     .option("--json-events", "stream lifecycle events to stdout as JSON lines (in addition to human-readable output)")
-    .option("-f, --follow", "follow mode for 'pipeline logs <run-id> --follow': stream new output as appended")
-    .option("--events", "logs mode: read/follow events.jsonl instead of terminal.log")
+    .option("-f, --follow", "follow mode for 'pipeline logs' / 'pipeline loop logs': stream new output until interrupt (SIGINT/SIGTERM); does not auto-exit on terminal stop events")
+    .option("--events", "logs mode: read/follow events.jsonl (required selection for advance logs; always selected for 'pipeline loop logs')")
     // `pipeline run <N> --detach` options
     .option("--detach", "run the pipeline in a detached background process (survives launcher exit)")
     .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
@@ -1328,6 +1329,23 @@ async function main(): Promise<void> {
         ? logsArg
         : undefined;
     await runLogs(repoDir, logsRunId, !!opts.follow, !!opts.events);
+    return;
+  }
+
+  // `pipeline loop logs [<run-id>] [--events] [--follow|-f]` (#666): observe a
+  // durable loop run's events.jsonl under the loop state home. Nested `logs`
+  // must never enter loop preflight or the supervisor drive path. Dispatched
+  // before flag validation / config / gh — same offline discipline as advance
+  // `pipeline logs`. Follow stops on interrupt only (not on terminal stop events).
+  if (numArg === "loop" && cmd.args[1] === "logs") {
+    const loopLogsArg = cmd.args[2];
+    const loopLogsRunId =
+      typeof loopLogsArg === "string" && loopLogsArg.length > 0 && !loopLogsArg.startsWith("-")
+        ? loopLogsArg
+        : undefined;
+    // `--events` is accepted for parity with advance logs but the selected
+    // artifact is always events.jsonl (loop store has no terminal.log).
+    await runLoopLogs(loopLogsRunId, !!opts.follow);
     return;
   }
 
