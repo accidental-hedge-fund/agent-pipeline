@@ -31,11 +31,21 @@ const STARTING_LOCK_PATH = join(tmpdir(), `pipeline-starting-${process.pid}.lock
 // — a file swap during an install can't corrupt a process that just tails
 // terminal.log/events.jsonl — so they must not hold a run-liveness lock for
 // their (potentially hours-long, `--follow`) lifetime, or they block every
-// `install.mjs update` behind them (#567).
+// `install.mjs update` behind them (#567). Nested `loop logs` (#666) is the
+// same class of observation against the durable loop store and must likewise
+// reserve no slot, while bare `loop` (start/resume) remains run-mutating.
 const READ_ONLY_COMMANDS = new Set(["logs", "status", "summary"]);
 
-function isReadOnlyCommand(argv0) {
-  return READ_ONLY_COMMANDS.has(argv0);
+/** Pure classifier of command argv (tokens after `pipeline`). Accepts a full
+ *  argv array or a single first-token string for back-compat. No filesystem,
+ *  process-signal, or subprocess call. */
+function isReadOnlyCommand(argv) {
+  const tokens = Array.isArray(argv) ? argv : argv === undefined || argv === null ? [] : [argv];
+  const cmd = tokens[0];
+  if (READ_ONLY_COMMANDS.has(cmd)) return true;
+  // Nested: `pipeline loop logs …` — observation only (#666).
+  if (cmd === "loop" && tokens[1] === "logs") return true;
+  return false;
 }
 
 function updateInProgress() {
@@ -200,7 +210,7 @@ if (!existsSync(join(coreDir, "node_modules"))) {
 // Read-only commands never reserve or hold the run-liveness slot (#567) — they
 // only need the cheap, non-held courtesy check so they can decline to start
 // into an update that's already in progress.
-const readOnly = isReadOnlyCommand(rawArgs[0]);
+const readOnly = isReadOnlyCommand(rawArgs);
 let reserved = false;
 if (readOnly) {
   if (updateInProgress()) {

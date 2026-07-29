@@ -94,6 +94,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor
 /pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
 /pipeline:loop --audit                   read-only report for the run; no writes
+/pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (interrupt stops follow; no auto-exit on terminal)
 /pipeline evals plan <manifest.json>     expand + persist an experiment's run plan; invokes no harness, creates no worktree
 /pipeline evals run <manifest.json>      execute an experiment's cells (resumable); never writes to production GitHub
 /pipeline evals run <manifest.json> --fixtures <dir>  override the fixtures directory (default: core/evals/fixtures)
@@ -131,13 +132,18 @@ sets a stage label or merges itself; every selected item still executes
 through this skill's own state machine and evidence gates via the
 `pipeline/loop-execution@1` hand-off contract. It refuses to start (with zero
 durable writes) when the engine's built-in autonomous `/goal` mode is
-unavailable — there is no non-durable fallback loop. `--resume <run-id>`
-takes over a run whose prior supervisor is provably gone; a run whose
-supervisor is still alive is refused rather than double-driven. `--audit`
-renders the run's process identity, action-evidence timeline, and
-watchdog/no-progress state with zero durable writes. A pre-existing run
-created by a legacy goal-loop invocation remains addressable by `--resume
-<run-id>` (read-only import).
+unavailable — there is no non-durable fallback loop. Multi-item drive is
+**long-running** (foreground for the whole wall-clock of the run): on
+successful create/resume and exclusive lock, before the first item dispatch,
+the CLI emits an early machine-readable stdout JSON line
+(`kind: "loop_run_handoff"`) with `run_id` and the absolute `events` path so a
+harness can follow structured progress; a terminal summary JSON is printed
+when the supervisor finishes. `--resume <run-id>` takes over a run whose prior
+supervisor is provably gone; a run whose supervisor is still alive is refused
+rather than double-driven. `--audit` renders the run's process identity,
+action-evidence timeline, and watchdog/no-progress state with zero durable
+writes (no drive handoff). A pre-existing run created by a legacy goal-loop
+invocation remains addressable by `--resume <run-id>` (read-only import).
 
 The native-`/goal` check never treats an absent marker in `claude --help` as
 evidence the capability is missing (`/goal` is a slash command, not a CLI

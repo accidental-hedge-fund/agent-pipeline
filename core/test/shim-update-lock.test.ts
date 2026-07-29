@@ -111,7 +111,7 @@ test("shim: refuses to start the engine while the installer's update lock is hel
  *  template and evaluate it in an isolated vm context — proves the classifier
  *  itself is a pure function with no real filesystem/process-signal/subprocess
  *  call, independent of the rest of the shim (which does touch the filesystem). */
-function loadIsReadOnlyCommand(): (argv0: string | undefined) => boolean {
+function loadIsReadOnlyCommand(): (argv: string | string[] | undefined) => boolean {
   const src = fs.readFileSync(TEMPLATE_PATH, "utf8");
   const start = src.indexOf("const READ_ONLY_COMMANDS");
   const end = src.indexOf("function updateInProgress");
@@ -126,11 +126,17 @@ test("isReadOnlyCommand: classifies logs/status/summary read-only, everything el
   assert.equal(isReadOnlyCommand("logs"), true);
   assert.equal(isReadOnlyCommand("status"), true);
   assert.equal(isReadOnlyCommand("summary"), true);
+  assert.equal(isReadOnlyCommand(["logs", "42", "--events", "--follow"]), true);
   assert.equal(isReadOnlyCommand("advance"), false);
   assert.equal(isReadOnlyCommand("loop"), false);
+  assert.equal(isReadOnlyCommand(["loop"]), false, "bare loop start/resume remains run-mutating");
+  assert.equal(isReadOnlyCommand(["loop", "--resume", "run-1"]), false);
+  assert.equal(isReadOnlyCommand(["loop", "logs"]), true, "nested loop logs is read-only (#666)");
+  assert.equal(isReadOnlyCommand(["loop", "logs", "loop-abc", "--events", "--follow"]), true);
   assert.equal(isReadOnlyCommand("queue"), false);
   assert.equal(isReadOnlyCommand("improve"), false);
   assert.equal(isReadOnlyCommand(undefined), false, "fail-safe default: unknown/absent command reserves");
+  assert.equal(isReadOnlyCommand([]), false);
 });
 
 test("shim: a logs-shaped invocation reserves no pipeline-starting-<pid>.lock, even under --follow", () => {

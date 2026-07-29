@@ -136,9 +136,14 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
   // supervisor — never an externally installed goal-loop skill. It never
   // touches gh or the repo config, and performs no external mutation of its
   // own on any path.
+  // loop (#451/#512): start/resume/audit a durable multi-item run. Nested
+  // `pipeline loop logs` (#666) is an observation-only sub-verb that reuses the
+  // root `--events`/`--follow` flags; those are allowlisted here so a nested
+  // logs invocation that still hits flag validation is not rejected. The logs
+  // path itself is dispatched before preflight/supervisor (see pipeline.ts).
   loop: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["profile", "milestone", "label", "range", "roadmapSlice", "resume", "audit", "newRun"]),
+    allowedFlags: new Set(["profile", "milestone", "label", "range", "roadmapSlice", "resume", "audit", "newRun", "follow", "events"]),
     needsConfig: false,
     needsGhAuth: false,
     mutatesGitHub: false,

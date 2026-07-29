@@ -10,7 +10,7 @@ Authoritative issue→PR resolution shared by every pipeline stage: `getPrForIss
 
 It SHALL return `null` when neither strategy matches. It SHALL NOT use body-text search, title search, or keyword patterns (`Closes #N`, `Fixes #N`, `#N`, etc.) to match a PR.
 
-Resolution SHALL be served from a single `gh pr list` query carrying the branch name, fork flag, and closing references of every candidate — no per-PR `gh pr view` fan-out.
+Resolution SHALL be served from a complete open-PR candidate set that carries the branch name, fork flag, and closing references of every open candidate needed for those strategies — no per-PR `gh pr view` fan-out. The candidate set SHALL NOT be a fixed first-page-only / hard `-L 100` (or equivalent) truncation of the repository's open PRs; when the open list does not fit a single page, the resolver SHALL paginate (or use an issue-scoped / head-query equivalent that cannot omit a matching open PR solely for list-window reasons).
 
 #### Scenario: branch-prefix match returns the correct PR
 - **WHEN** an open same-repo PR has head branch `pipeline/42-my-feature`
@@ -45,4 +45,23 @@ Resolution SHALL be served from a single `gh pr list` query carrying the branch 
 #### Scenario: all pipeline stages use the same resolver
 - **WHEN** `getPrForIssue` is called from any of: status display, planning, review, pre-merge, or deploy-ready
 - **THEN** all callers SHALL receive the same authoritative resolution (branch-prefix or closing-references), never a body-text false positive
+
+### Requirement: Open PR resolution SHALL NOT silently truncate the open candidate set
+`getPrForIssue` SHALL NOT resolve against a silently truncated open-PR list. When more open PRs exist than fit a single list page or a fixed 100-item window, the open path SHALL continue enumerating (paginate, issue-scoped GraphQL equivalent, or a complete head/`pipeline/<N>-*` query path that still applies dual-strategy resolution) until either a matching open PR is found under the living dual strategies or open candidates are exhausted. Returning `null` solely because the matching open PR fell outside the first page or first 100 open PRs of a repo-wide scan is forbidden. Unit tests SHALL cover the beyond-first-page / beyond-100-window case via injected list or API deps (no real network).
+
+#### Scenario: matching open PR beyond the first 100 open PRs is still resolved
+- **WHEN** the repository has more than 100 open PRs
+- **AND** the only PR that matches issue N (branch-prefix or target-repo closing reference) would not appear in a single `gh pr list --state open -L 100` window
+- **AND** `getPrForIssue` is called for issue N
+- **THEN** it SHALL return that PR's number
+- **AND** SHALL NOT return `null` due to the open-list window alone
+
+#### Scenario: multi-page open enumeration is exercised under test
+- **WHEN** unit tests inject a multi-page open-PR list (or equivalent multi-call API runner) where the match appears only on a later page
+- **THEN** `getPrForIssue` SHALL return the matching PR number
+- **AND** the test setup SHALL fail if the production open path stops after one capped page without consulting later pages
+
+#### Scenario: exhausted open candidates with no match still return null
+- **WHEN** complete open enumeration finds no branch-prefix or target-repo closing-reference match for the issue
+- **THEN** `getPrForIssue` SHALL return `null`
 

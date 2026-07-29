@@ -142,10 +142,16 @@ import {
   resolveSupersessionChainHead,
   runExists as loopRunExists,
 } from "./loop/store.ts";
+import { runLoopLogs } from "./loop/logs.ts";
 import { initRecoverableRun } from "./loop/recovery.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
 import { compileContractItems } from "./loop/dependencies.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type LoopLedger } from "./loop/types.ts";
+import {
+  formatLoopRunHandoff,
+  writeFlushedStdoutLine,
+  type LoopRunReadyContext,
+} from "./loop/handoff.ts";
 import {
   LOOP_EXECUTION_CONTRACT_SCHEMA,
   normalizeLoopOutcome,
@@ -388,8 +394,8 @@ export function buildCmd(): Command {
     .option("--model <model>", "override the review/fix model when supported by the selected harness")
     .option("--profile <name>", "shared-core profile to use: codex or claude", process.env.PIPELINE_PROFILE ?? "codex")
     .option("--json-events", "stream lifecycle events to stdout as JSON lines (in addition to human-readable output)")
-    .option("-f, --follow", "follow mode for 'pipeline logs <run-id> --follow': stream new output as appended")
-    .option("--events", "logs mode: read/follow events.jsonl instead of terminal.log")
+    .option("-f, --follow", "follow mode for 'pipeline logs' / 'pipeline loop logs': stream new output until interrupt (SIGINT/SIGTERM); does not auto-exit on terminal stop events")
+    .option("--events", "logs mode: read/follow events.jsonl (required selection for advance logs; always selected for 'pipeline loop logs')")
     // `pipeline run <N> --detach` options
     .option("--detach", "run the pipeline in a detached background process (survives launcher exit)")
     .option("--timeout <seconds>", "watchdog: kill the detached run after this many seconds and write a non-zero sentinel", Number)
@@ -1004,6 +1010,12 @@ export interface RunLoopEngineInput {
    *  — {@link normalizeLoopArgs} refuses it with `--resume` or with no selector present. */
   newRun?: boolean;
   repoDir: string;
+  /**
+   * Early run-ready hook (#665): invoked once after exclusive lock and before
+   * first item dispatch. Not invoked for `--audit` or failure paths. The engine
+   * enriches supervisor context with the selector (null on bare `--resume`).
+   */
+  onRunReady?: (ctx: LoopRunReadyContext) => void | Promise<void>;
 }
 
 export type LoopEngineResult =
@@ -1214,6 +1226,15 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
       runId,
       engine: input.engine as LoopEngineName,
       resume: !!input.resumeRunId,
+      onRunReady: input.onRunReady
+        ? async (ctx) => {
+            // Selector is known only at the engine/CLI layer; bare --resume has none.
+            await input.onRunReady!({
+              ...ctx,
+              selector: input.resumeRunId ? null : (input.selector ?? null),
+            });
+          }
+        : undefined,
     });
     return { kind: "drive", result };
   } catch (err) {
@@ -1229,6 +1250,11 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
 export interface LoopCliDeps {
   runLoopPreflight: typeof runLoopPreflight;
   runLoopEngine: (input: RunLoopEngineInput) => Promise<LoopEngineResult>;
+  /**
+   * Write+flush a single stdout line (early handoff). Defaults to
+   * {@link writeFlushedStdoutLine}; tests inject a capture sink.
+   */
+  writeStdoutLine?: (line: string) => void | Promise<void>;
 }
 
 const defaultLoopCliDeps: LoopCliDeps = { runLoopPreflight, runLoopEngine: defaultRunLoopEngine };
@@ -1279,6 +1305,7 @@ export async function runLoopCommand(
     return;
   }
 
+  const writeLine = deps.writeStdoutLine ?? writeFlushedStdoutLine;
   const engineResult = await deps.runLoopEngine({
     engine,
     selector: outcome.args.selector,
@@ -1286,6 +1313,19 @@ export async function runLoopCommand(
     audit: outcome.args.audit,
     newRun: outcome.args.newRun,
     repoDir,
+    // Early handoff (#665): emit only on successful drive attach+lock, before
+    // first dispatch. Audit and preflight/engine failure paths never set this
+    // callback (audit short-circuits inside the engine before attach).
+    onRunReady: outcome.args.audit
+      ? undefined
+      : async (ctx) => {
+          const line = formatLoopRunHandoff(ctx);
+          await writeLine(line);
+          // Operator aid only — machine contract is the stdout JSON line above.
+          console.error(
+            `pipeline loop: run ready ${ctx.runId}; events ${ctx.events}`,
+          );
+        },
   });
 
   if (engineResult.kind === "error") {
@@ -1586,6 +1626,23 @@ async function main(): Promise<void> {
         ? logsArg
         : undefined;
     await runLogs(repoDir, logsRunId, !!opts.follow, !!opts.events);
+    return;
+  }
+
+  // `pipeline loop logs [<run-id>] [--events] [--follow|-f]` (#666): observe a
+  // durable loop run's events.jsonl under the loop state home. Nested `logs`
+  // must never enter loop preflight or the supervisor drive path. Dispatched
+  // before flag validation / config / gh — same offline discipline as advance
+  // `pipeline logs`. Follow stops on interrupt only (not on terminal stop events).
+  if (numArg === "loop" && cmd.args[1] === "logs") {
+    const loopLogsArg = cmd.args[2];
+    const loopLogsRunId =
+      typeof loopLogsArg === "string" && loopLogsArg.length > 0 && !loopLogsArg.startsWith("-")
+        ? loopLogsArg
+        : undefined;
+    // `--events` is accepted for parity with advance logs but the selected
+    // artifact is always events.jsonl (loop store has no terminal.log).
+    await runLoopLogs(loopLogsRunId, !!opts.follow);
     return;
   }
 
