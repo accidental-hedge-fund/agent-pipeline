@@ -1,0 +1,121 @@
+#!/usr/bin/env node
+// Structural runner for scripts/*.test.mjs (#681).
+//
+// Root cause / hypothesis: Node's multi-file `node --test a.mjs b.mjs …` parent
+// aggregates child results over IPC (`#processRawBuffer`). Under Node 24 that path
+// intermittently fails with:
+//   Error: Unable to deserialize cloned data due to invalid or unsupported version.
+// That is a test-runner *host* error, not a product assertion failure. Pre-merge
+// treats any CI red as a hard block, so the flake becomes a human gate.
+//
+// Fix: run each scripts/*.test.mjs as its own top-level `node --test <file>`
+// process (sorted, deterministic). Product failures still exit non-zero and print
+// normal runner output; the multi-file parent IPC aggregation path is not used.
+//
+// Wired from package.json as `ci:scripts` and the scripts half of `npm test`.
+// Override the scripts directory with RUN_SCRIPTS_TESTS_DIR for unit tests.
+
+import { readdirSync } from "node:fs";
+import { join, resolve, dirname } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
+
+/** @typedef {(command: string, args: string[], options: object) => { status: number | null, error?: Error, signal?: string | null, stdout?: string | Buffer | null, stderr?: string | Buffer | null }} SpawnFn */
+
+/**
+ * Discover scripts unit-test files under `scriptsDir` (sorted by basename).
+ * @param {string} scriptsDir
+ * @returns {string[]} absolute paths
+ */
+export function listScriptsTestFiles(scriptsDir) {
+  const names = readdirSync(scriptsDir)
+    .filter((name) => name.endsWith(".test.mjs"))
+    .sort();
+  return names.map((name) => join(scriptsDir, name));
+}
+
+/**
+ * Env for a top-level `node --test` child. Strip parent test-runner context so
+ * nested invocations (e.g. regression tests that spawn this wrapper under
+ * `node --test`) do not hit "run() is being called recursively … skipping
+ * running files" and silently exit 0.
+ * @param {NodeJS.ProcessEnv} [base]
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function childTestEnv(base = process.env) {
+  const env = { ...base };
+  delete env.NODE_TEST_CONTEXT;
+  delete env.NODE_TEST_WORKER_ID;
+  return env;
+}
+
+/**
+ * Run each discovered test file as its own top-level `node --test <file>` process.
+ * @param {{
+ *   scriptsDir: string,
+ *   nodePath?: string,
+ *   spawn?: SpawnFn,
+ *   stdio?: 'inherit' | 'pipe' | 'ignore' | Array,
+ *   cwd?: string,
+ *   env?: NodeJS.ProcessEnv,
+ * }} opts
+ * @returns {number} 0 if every file exits 0; 1 otherwise
+ */
+export function runScriptsTests(opts) {
+  const {
+    scriptsDir,
+    nodePath = process.execPath,
+    spawn = spawnSync,
+    stdio = "inherit",
+    cwd = resolve(scriptsDir, ".."),
+    env = process.env,
+  } = opts;
+
+  const files = listScriptsTestFiles(scriptsDir);
+  if (files.length === 0) {
+    console.error(
+      `run-scripts-tests: no *.test.mjs files found under ${scriptsDir}`,
+    );
+    return 1;
+  }
+
+  const childEnv = childTestEnv(env);
+  let failed = 0;
+  for (const file of files) {
+    // One top-level process per file — do not pass multiple files to a single
+    // `node --test` parent (that is the flake-prone multi-file IPC path).
+    const result = spawn(nodePath, ["--test", file], {
+      cwd,
+      env: childEnv,
+      stdio,
+      shell: false,
+    });
+    if (result.error) {
+      console.error(
+        `run-scripts-tests: failed to spawn node --test for ${file}: ${result.error.message}`,
+      );
+      failed += 1;
+      continue;
+    }
+    if (result.status !== 0) {
+      failed += 1;
+    }
+  }
+  return failed === 0 ? 0 : 1;
+}
+
+function isMainModule() {
+  if (!process.argv[1]) return false;
+  try {
+    return import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  const scriptsDir =
+    process.env.RUN_SCRIPTS_TESTS_DIR ??
+    dirname(fileURLToPath(import.meta.url));
+  process.exitCode = runScriptsTests({ scriptsDir });
+}
