@@ -6,11 +6,13 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { runLoopCommand, buildCmd, decideNewRunSupersession, planSupersessionMintRepair, type CliOpts, type LoopCliDeps } from "../scripts/pipeline.ts";
-import { runLoopPreflight as realRunLoopPreflight, type LoopPreflightOutcome } from "../scripts/loop-preflight.ts";
+import { runLoopCommand, buildCmd, maxPositionalsFor, decideNewRunSupersession, planSupersessionMintRepair, type CliOpts, type LoopCliDeps } from "../scripts/pipeline.ts";
+import { runLoopPreflight as realRunLoopPreflight, MAX_RANGE_SPAN, type LoopPreflightOutcome } from "../scripts/loop-preflight.ts";
 import {
   formatLoopRunHandoff,
   LOOP_RUN_HANDOFF_KIND,
@@ -461,6 +463,190 @@ test("COMMAND_REGISTRY.loop — needs no config, no gh auth, and mutates nothing
   assert.equal(loopEntry.needsConfig, false);
   assert.equal(loopEntry.needsGhAuth, false);
   assert.equal(loopEntry.mutatesGitHub, false);
+});
+
+// ---------------------------------------------------------------------------
+// Explicit issue-list positionals (#554): the top-level extra-positionals
+// guard must allow `pipeline loop 649 551 541 334` through to runLoopCommand /
+// normalizeLoopArgs as a work-list, not reject trailing issue numbers as
+// "unexpected argument(s)".
+// ---------------------------------------------------------------------------
+
+test("maxPositionalsFor — loop accepts keyword + up to MAX_RANGE_SPAN issue numbers (#554)", () => {
+  assert.equal(maxPositionalsFor("loop"), 1 + MAX_RANGE_SPAN);
+  // Multi-issue list from the filed bug must fit under the cap.
+  const multi = ["loop", "649", "551", "541", "334"];
+  assert.ok(multi.length <= maxPositionalsFor("loop"));
+  // Single-issue form must also fit (was rejected when the default cap was 1).
+  assert.ok(["loop", "649"].length <= maxPositionalsFor("loop"));
+});
+
+test("maxPositionalsFor — other commands keep their existing positional caps (#554)", () => {
+  assert.equal(maxPositionalsFor("run"), 2);
+  assert.equal(maxPositionalsFor("release"), 2);
+  assert.equal(maxPositionalsFor("status"), 2);
+  assert.equal(maxPositionalsFor("papercut"), 2);
+  assert.equal(maxPositionalsFor("correction"), 2);
+  assert.equal(maxPositionalsFor("unblock"), 3);
+  assert.equal(maxPositionalsFor("override"), 3);
+  assert.equal(maxPositionalsFor("evals"), 3);
+  assert.equal(maxPositionalsFor("doctor"), 1);
+  assert.equal(maxPositionalsFor("sweep"), 1);
+  assert.equal(maxPositionalsFor(undefined), 1);
+  // A non-loop multi-positional shape still exceeds the default cap.
+  assert.ok(["doctor", "extra", "more"].length > maxPositionalsFor("doctor"));
+});
+
+test("runLoopCommand — multi-issue positionals normalize to a work-list selector (#554)", async () => {
+  let seenIssues: string[] | undefined;
+  let seenSelector: unknown;
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async (raw) => {
+      seenIssues = raw.issues;
+      return realRunLoopPreflight(
+        raw,
+        "claude",
+        {
+          exec: async () => ({ ok: true, stdout: "/goal autonomous mode", stderr: "" }),
+          execCheck: async () => true,
+          fsExists: async () => false,
+          fileMtime: async () => 1000,
+          readTextFile: async () => null,
+        },
+        [],
+        "auto",
+      );
+    },
+    runLoopEngine: async (input) => {
+      seenSelector = input.selector;
+      return {
+        kind: "drive",
+        result: {
+          runId: "loop-multi-issues",
+          cycles: 1,
+          stop: null,
+          holdOutstanding: false,
+          allDone: true,
+          resumed: false,
+          heldItemIds: [],
+          dispatched: 4,
+          excludedItemIds: [],
+          exclusionReason: null,
+          completion: "all_done",
+        },
+      };
+    },
+  };
+  process.exitCode = undefined;
+  await withCapturedConsole(() =>
+    runLoopCommand({ profile: "claude" } as CliOpts, ["649", "551", "541", "334"], deps),
+  );
+  assert.deepEqual(seenIssues, ["649", "551", "541", "334"]);
+  assert.deepEqual(seenSelector, { type: "work-list", value: ["649", "551", "541", "334"] });
+  assert.equal(process.exitCode, 0);
+});
+
+test("runLoopCommand — a single issue positional is a one-element work-list (#554)", async () => {
+  let seenSelector: unknown;
+  const deps: LoopCliDeps = {
+    runLoopPreflight: (raw, engine, _deps, roots, attestation) =>
+      realRunLoopPreflight(
+        raw,
+        engine,
+        {
+          exec: async () => ({ ok: true, stdout: "/goal autonomous mode", stderr: "" }),
+          execCheck: async () => true,
+          fsExists: async () => false,
+          fileMtime: async () => 1000,
+          readTextFile: async () => null,
+        },
+        roots,
+        attestation,
+      ),
+    runLoopEngine: async (input) => {
+      seenSelector = input.selector;
+      return {
+        kind: "drive",
+        result: {
+          runId: "loop-one-issue",
+          cycles: 1,
+          stop: null,
+          holdOutstanding: false,
+          allDone: true,
+          resumed: false,
+          heldItemIds: [],
+          dispatched: 1,
+          excludedItemIds: [],
+          exclusionReason: null,
+          completion: "all_done",
+        },
+      };
+    },
+  };
+  process.exitCode = undefined;
+  await withCapturedConsole(() => runLoopCommand({ profile: "claude" } as CliOpts, ["649"], deps));
+  assert.deepEqual(seenSelector, { type: "work-list", value: ["649"] });
+  assert.equal(process.exitCode, 0);
+});
+
+test("runLoopCommand — non-numeric trailing positional fails in loop normalization (#554)", async () => {
+  const deps: LoopCliDeps = {
+    runLoopPreflight: (raw, engine, _deps, roots, attestation) =>
+      realRunLoopPreflight(
+        raw,
+        engine,
+        {
+          exec: async () => ({ ok: true, stdout: "/goal autonomous mode", stderr: "" }),
+          execCheck: async () => true,
+          fsExists: async () => false,
+          fileMtime: async () => 1000,
+          readTextFile: async () => null,
+        },
+        roots,
+        attestation,
+      ),
+    runLoopEngine: NEVER_CALLED_ENGINE,
+  };
+  process.exitCode = undefined;
+  const { err } = await withCapturedConsole(() =>
+    runLoopCommand({ profile: "claude" } as CliOpts, ["649", "not-an-issue"], deps),
+  );
+  assert.equal(process.exitCode, 1);
+  assert.match(err.join("\n"), /expected an issue number.*not-an-issue/i);
+  assert.doesNotMatch(err.join("\n"), /unexpected argument/i);
+});
+
+const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
+
+test("CLI: `pipeline loop 649 551 541 334` is not rejected as unexpected positionals (#554)", () => {
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "loop", "649", "551", "541", "334"],
+    { encoding: "utf8" },
+  );
+  // Preflight/engine may still fail on this host; the regression is that the
+  // top-level arity guard must not fire on a valid multi-issue list.
+  assert.doesNotMatch(
+    r.stderr,
+    /unexpected argument\(s\):\s*649,\s*551,\s*541,\s*334/i,
+    `multi-issue loop list must reach loop preflight; stderr:\n${r.stderr}`,
+  );
+  assert.doesNotMatch(
+    r.stderr,
+    /unexpected argument\(s\):\s*551,\s*541,\s*334/i,
+    `multi-issue loop list must not strip only the first issue; stderr:\n${r.stderr}`,
+  );
+});
+
+test("CLI: `pipeline loop 649 not-an-issue` fails with a loop issue-number error (#554)", () => {
+  const r = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "loop", "649", "not-an-issue"],
+    { encoding: "utf8" },
+  );
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /expected an issue number.*not-an-issue/i);
+  assert.doesNotMatch(r.stderr, /unexpected argument/i);
 });
 
 // ---------------------------------------------------------------------------
