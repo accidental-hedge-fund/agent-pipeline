@@ -8,10 +8,12 @@ import {
   extractHumanPlanComments,
   getHarnessLabel,
   getIssueLabelEvents,
+  getPrForIssue,
   getPrForIssueAnyState,
   isBlocked,
   mapRawIssue,
   mapApiIssue,
+  mapOpenPrGraphQlNodes,
   type GhApiIssueRaw,
   normalizeClosingRefs,
   parseChecksAggregate,
@@ -892,4 +894,162 @@ test("getPrForIssueAnyState: returns null once the timeline is exhausted with no
   const run: GhApiRunner = async () => timelinePageResponse([], { hasPreviousPage: false, startCursor: null });
   const result = await getPrForIssueAnyState(TIMELINE_CFG, 154, run);
   assert.equal(result, null);
+});
+
+// ---------------------------------------------------------------------------
+// getPrForIssue open-list completeness (#623)
+//
+// The bug: open resolution used `gh pr list --state open -L 100` — a
+// repository-wide scan bounded to the first 100 open PRs. On a busy repo the
+// issue's open PR can fall outside that window → null → wrong status,
+// duplicate PR create, or broken review handoff. Historical any-state was
+// fixed after #511; the open path was left capped. The fix paginates open PRs
+// via GraphQL (branch + fork flag + closing refs per node) and still feeds
+// resolvePrForIssue.
+// ---------------------------------------------------------------------------
+
+const OPEN_PR_CFG = { repo: "owner/repo" } as PipelineConfig;
+
+function openPrNode(
+  number: number,
+  headRefName: string,
+  opts: { fork?: boolean; closes?: { number: number; owner: string; name: string }[] } = {},
+) {
+  return {
+    number,
+    headRefName,
+    isCrossRepository: opts.fork ?? false,
+    closingIssuesReferences: {
+      nodes: (opts.closes ?? []).map((c) => ({
+        number: c.number,
+        repository: { name: c.name, owner: { login: c.owner } },
+      })),
+    },
+  };
+}
+
+function openPrsPageResponse(
+  nodes: ReturnType<typeof openPrNode>[],
+  pageInfo: { hasNextPage: boolean; endCursor: string | null } = {
+    hasNextPage: false,
+    endCursor: null,
+  },
+): string {
+  return JSON.stringify({
+    data: { repository: { pullRequests: { pageInfo, nodes } } },
+  });
+}
+
+test("mapOpenPrGraphQlNodes: maps GraphQL open-PR nodes into PrCandidate shape", () => {
+  const prs = mapOpenPrGraphQlNodes([
+    openPrNode(96, "pipeline/76-fix", {
+      closes: [{ number: 76, owner: "owner", name: "repo" }],
+    }),
+    openPrNode(7, "feat/x", { fork: true }),
+  ]);
+  assert.equal(prs.length, 2);
+  assert.deepEqual(prs[0], {
+    number: 96,
+    headRefName: "pipeline/76-fix",
+    isCrossRepository: false,
+    closingIssues: [{ number: 76, nameWithOwner: "owner/repo" }],
+  });
+  assert.equal(prs[1].isCrossRepository, true);
+  assert.deepEqual(prs[1].closingIssues, []);
+});
+
+test("getPrForIssue: resolves via paginated GraphQL open PRs, not a hard -L 100 pr list scan", async () => {
+  let captured: string[] = [];
+  const run: GhApiRunner = async (args) => {
+    captured = args;
+    return openPrsPageResponse([
+      openPrNode(9, "pipeline/42-my-feature"),
+    ]);
+  };
+  const result = await getPrForIssue(OPEN_PR_CFG, 42, run);
+  assert.equal(result, 9);
+  const joined = captured.join(" ");
+  assert.ok(captured.includes("graphql"), "must call the GraphQL endpoint");
+  assert.ok(joined.includes("pullRequests"), "must query open repository pullRequests");
+  assert.ok(!joined.includes("pr list") && !captured.includes("pr"), "must not use gh pr list");
+  assert.ok(!joined.includes("-L"), "must not hard-cap with -L");
+});
+
+test("getPrForIssue: matching open PR beyond the first 100-open window is still resolved", async () => {
+  // Page 1: 100 unrelated open PRs (would be the entire old -L 100 window).
+  // Page 2: the only PR that matches issue #42 via branch prefix.
+  let calls = 0;
+  const run: GhApiRunner = async () => {
+    calls++;
+    if (calls === 1) {
+      const filler = Array.from({ length: 100 }, (_, i) =>
+        openPrNode(1000 + i, `feat/unrelated-${i}`),
+      );
+      return openPrsPageResponse(filler, { hasNextPage: true, endCursor: "cursor-page-1" });
+    }
+    return openPrsPageResponse(
+      [openPrNode(42, "pipeline/623-open-pagination")],
+      { hasNextPage: false, endCursor: "cursor-page-2" },
+    );
+  };
+  const result = await getPrForIssue(OPEN_PR_CFG, 623, run);
+  assert.equal(result, 42);
+  assert.equal(calls, 2, "must page past the first 100 open PRs instead of stopping at page 1");
+});
+
+test("getPrForIssue: closing-ref match only on a later page is still resolved", async () => {
+  let calls = 0;
+  const run: GhApiRunner = async () => {
+    calls++;
+    if (calls === 1) {
+      return openPrsPageResponse(
+        [openPrNode(1, "feat/noise")],
+        { hasNextPage: true, endCursor: "c1" },
+      );
+    }
+    return openPrsPageResponse(
+      [
+        openPrNode(88, "fix/manual-link", {
+          closes: [{ number: 623, owner: "owner", name: "repo" }],
+        }),
+      ],
+      { hasNextPage: false, endCursor: "c2" },
+    );
+  };
+  const result = await getPrForIssue(OPEN_PR_CFG, 623, run);
+  assert.equal(result, 88);
+  assert.equal(calls, 2);
+});
+
+test("getPrForIssue: exhausted open pages with no match returns null", async () => {
+  let calls = 0;
+  const run: GhApiRunner = async () => {
+    calls++;
+    if (calls === 1) {
+      return openPrsPageResponse(
+        [openPrNode(1, "feat/a"), openPrNode(2, "feat/b")],
+        { hasNextPage: true, endCursor: "c1" },
+      );
+    }
+    return openPrsPageResponse(
+      [openPrNode(3, "feat/c")],
+      { hasNextPage: false, endCursor: "c2" },
+    );
+  };
+  const result = await getPrForIssue(OPEN_PR_CFG, 623, run);
+  assert.equal(result, null);
+  assert.equal(calls, 2, "must exhaust pages before returning null");
+});
+
+test("getPrForIssue: safety page bound fails visibly instead of silent null after truncation", async () => {
+  // Every page reports hasNextPage: true with filler only — never exhausts.
+  const run: GhApiRunner = async () =>
+    openPrsPageResponse([openPrNode(1, "feat/forever")], {
+      hasNextPage: true,
+      endCursor: "cursor-more",
+    });
+  await assert.rejects(
+    () => getPrForIssue(OPEN_PR_CFG, 623, run),
+    /safety bound|refusing to resolve after truncation/i,
+  );
 });

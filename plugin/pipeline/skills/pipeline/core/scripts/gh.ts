@@ -1224,26 +1224,94 @@ export function resolvePrForIssue(
   return null;
 }
 
+/** One page of open repository PRs from the GraphQL query in
+ *  {@link getPrForIssue}. Field shape verified against live `gh api graphql`
+ *  (number, headRefName, isCrossRepository, closingIssuesReferences.nodes with
+ *  repository.name + owner.login — same nested repo shape as `gh pr list --json`). */
+interface OpenPrsPage {
+  pageInfo: { hasNextPage: boolean; endCursor: string | null };
+  nodes: {
+    number: number;
+    headRefName: string;
+    isCrossRepository?: boolean;
+    closingIssuesReferences?: {
+      nodes: {
+        number: number;
+        repository?: { name: string; owner: { login: string } };
+      }[];
+    };
+  }[];
+}
+
+const OPEN_PRS_PAGE_SIZE = 100;
+/** Safety bound only — 50 pages × 100 = 5000 open PRs, far above realistic
+ *  open-PR volume. Hitting the bound without exhausting pages fails visibly
+ *  (never silent `null` after mid-list truncation) — #623 / design Decision 3. */
+const OPEN_PRS_MAX_PAGES = 50;
+
+const OPEN_PRS_QUERY =
+  "query($owner:String!,$repo:String!,$after:String){repository(owner:$owner,name:$repo)" +
+  `{pullRequests(first:${OPEN_PRS_PAGE_SIZE},states:OPEN,after:$after)` +
+  "{pageInfo{hasNextPage endCursor}nodes{number headRefName isCrossRepository " +
+  "closingIssuesReferences(first:50){nodes{number repository{name owner{login}}}}}}}}";
+
+/** Map GraphQL open-PR nodes into {@link PrCandidate}[]. Exported for tests. */
+export function mapOpenPrGraphQlNodes(nodes: OpenPrsPage["nodes"]): PrCandidate[] {
+  return nodes.map((pr) => ({
+    number: pr.number,
+    headRefName: pr.headRefName,
+    isCrossRepository: pr.isCrossRepository ?? false,
+    closingIssues: normalizeClosingRefs(pr.closingIssuesReferences?.nodes),
+  }));
+}
+
+/** Resolve the open PR for an issue via dual strategy ({@link resolvePrForIssue}).
+ *
+ *  Enumerates **all** open PR candidates via paginated GraphQL (number + branch
+ *  + fork flag + closing refs per node) so resolution never fans out to one
+ *  `gh pr view` per open PR (#97) and never silently drops a match past a
+ *  fixed first-page / `-L 100` window (#623 — same truncation class as #511's
+ *  historical path). Optional {@link GhApiRunner} injects fakes for unit tests. */
 export async function getPrForIssue(
   cfg: PipelineConfig,
   issueNumber: number,
+  run: GhApiRunner = (args) => ghRun(args),
 ): Promise<number | null> {
-  // A single list query carries number + branch + fork flag + closing refs, so
-  // resolution never fans out to one `gh pr view` per open PR (#97). A transient
-  // failure on an unrelated PR can no longer abort the shared resolver.
-  const stdout = await ghRun([
-    "pr",
-    "list",
-    "--json",
-    "number,headRefName,isCrossRepository,closingIssuesReferences",
-    "--state",
-    "open",
-    "-L",
-    "100",
-    "-R",
-    cfg.repo,
-  ]);
-  return resolvePrForIssue(parsePrList(stdout), issueNumber, cfg.repo);
+  const [owner, repo] = cfg.repo.split("/");
+  const candidates: PrCandidate[] = [];
+  let after: string | null = null;
+
+  for (let page = 0; page < OPEN_PRS_MAX_PAGES; page++) {
+    const args = [
+      "api",
+      "graphql",
+      "-f",
+      `query=${OPEN_PRS_QUERY}`,
+      "-F",
+      `owner=${owner}`,
+      "-F",
+      `repo=${repo}`,
+    ];
+    if (after) args.push("-F", `after=${after}`);
+    const stdout = await run(args);
+    const data = JSON.parse(stdout) as {
+      data: { repository: { pullRequests: OpenPrsPage } | null };
+    };
+    const pullRequests = data.data.repository?.pullRequests;
+    if (!pullRequests) return null;
+    candidates.push(...mapOpenPrGraphQlNodes(pullRequests.nodes));
+    if (!pullRequests.pageInfo.hasNextPage) {
+      return resolvePrForIssue(candidates, issueNumber, cfg.repo);
+    }
+    after = pullRequests.pageInfo.endCursor;
+  }
+
+  // Safety bound hit with more open PRs remaining — fail visibly rather than
+  // return null as if the issue had no open PR (#623).
+  throw new Error(
+    `getPrForIssue: open PR list for ${cfg.repo} exceeded safety bound ` +
+      `(${OPEN_PRS_MAX_PAGES} pages × ${OPEN_PRS_PAGE_SIZE}); refusing to resolve after truncation`,
+  );
 }
 
 /** One page of an issue's `CONNECTED_EVENT`/`CROSS_REFERENCED_EVENT` timeline,
