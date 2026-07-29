@@ -85,6 +85,13 @@ export interface ProgressMirrorState {
   /** True after a ci/waiting was emitted for the current wait stretch. */
   ciWaitingOpen: boolean;
   /**
+   * Generation for the current CI wait/attempt stretch. Bumped when a new
+   * waiting stretch opens so a later definitive pass/fail after rebase is not
+   * collapsed into the prior stretch's permanent fingerprint (#682 ca081002).
+   * Starts at 0; a direct pass/fail with no prior waiting uses gen 0.
+   */
+  ciStretchGen: number;
+  /**
    * Complete (newline-terminated) non-empty lines already consumed from the
    * advance file. Unterminated trailing fragments are never counted here.
    */
@@ -92,7 +99,7 @@ export interface ProgressMirrorState {
 }
 
 export function createProgressMirrorState(): ProgressMirrorState {
-  return { emitted: new Set(), ciWaitingOpen: false, linesConsumed: 0 };
+  return { emitted: new Set(), ciWaitingOpen: false, ciStretchGen: 0, linesConsumed: 0 };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -186,6 +193,7 @@ export function mapAdvanceEventsToProgress(
   const next: ProgressMirrorState = {
     emitted: new Set(state.emitted),
     ciWaitingOpen: state.ciWaitingOpen,
+    ciStretchGen: state.ciStretchGen,
     linesConsumed: state.linesConsumed,
   };
 
@@ -201,11 +209,14 @@ export function mapAdvanceEventsToProgress(
 
       if (gate === "ci") {
         if (result === "partial") {
-          // One waiting per continuous stretch: fingerprint is fixed for the
-          // stretch; reopen after a definitive pass/fail.
+          // One waiting per continuous stretch: bump stretch gen when a new
+          // wait opens so later pass/fail fingerprints are distinct across
+          // rebase-triggered reruns, while re-reads of the same stretch stay
+          // idempotent (#682 ca081002).
           if (!next.ciWaitingOpen) {
+            next.ciStretchGen += 1;
             tryEmit(next, linkage, "ci", "waiting", out, {
-              fingerprintExtra: "stretch",
+              fingerprintExtra: String(next.ciStretchGen),
               detail: {
                 ...(reason ? { classification: reason } : {}),
                 source_advance_type: "gate_result",
@@ -215,17 +226,15 @@ export function mapAdvanceEventsToProgress(
           }
         } else if (result === "pass") {
           next.ciWaitingOpen = false;
-          // Allow a later waiting stretch to re-emit waiting.
-          next.emitted.delete(fingerprint("ci", "waiting", "stretch"));
           tryEmit(next, linkage, "ci", "pass", out, {
+            fingerprintExtra: String(next.ciStretchGen),
             detail: { source_advance_type: "gate_result" },
           });
         } else if (result === "fail") {
           next.ciWaitingOpen = false;
-          next.emitted.delete(fingerprint("ci", "waiting", "stretch"));
           const classification = reason ? classifyCiBlockerReason(reason) : "ci_failure";
           tryEmit(next, linkage, "ci", "fail", out, {
-            fingerprintExtra: classification,
+            fingerprintExtra: `${next.ciStretchGen}|${classification}`,
             detail: {
               classification,
               ...(reason ? { reason } : {}),
@@ -300,10 +309,9 @@ export function mapAdvanceEventsToProgress(
       const reason = typeof raw.reason === "string" ? raw.reason : "";
       if (reason && isCiShapedBlockerReason(reason)) {
         next.ciWaitingOpen = false;
-        next.emitted.delete(fingerprint("ci", "waiting", "stretch"));
         const classification = classifyCiBlockerReason(reason);
         tryEmit(next, linkage, "ci", "fail", out, {
-          fingerprintExtra: classification,
+          fingerprintExtra: `${next.ciStretchGen}|${classification}`,
           detail: {
             classification,
             reason,

@@ -222,6 +222,66 @@ test("pre-merge auto-fix 5.1: all-correctness blocks → auto-fix → re-review 
 });
 
 // ---------------------------------------------------------------------------
+// #682 9b5d8c51: post-auto-fix re-review approval must also emit delta-review/pass
+// ---------------------------------------------------------------------------
+
+test("pre-merge auto-fix #682: approving re-review records delta-review pass gate_result after autofix pass", async (t) => {
+  const appended: string[] = [];
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("correctness")],
+    reReviewFindings: [],
+    autoFixResult: "fix-committed",
+  });
+  deps.runDir = "/runs/682-autofix";
+  deps.runStoreDeps = {
+    readFile: async () => "",
+    writeFile: async () => {},
+    appendFile: async (_p, data) => {
+      appended.push(data);
+    },
+    rename: async () => {},
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async () => ({ mtime: new Date(0) }),
+  };
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out, null, "auto-fix + re-review approved → pre-merge proceeds");
+  assert.equal(rec.autoFixCalls, 1);
+
+  const gateResults = appended
+    .map((line) => JSON.parse(line) as { type?: string; gate?: string; result?: string })
+    .filter((e) => e.type === "gate_result")
+    .map((e) => `${e.gate}/${e.result}`);
+  // Initial delta blocks, autofix is attempted and lands, then the approving
+  // re-review must append delta-review/pass — not only pre-merge-autofix/pass.
+  assert.ok(
+    gateResults.includes("delta-review/fail"),
+    `expected initial delta fail; got ${gateResults.join(",")}`,
+  );
+  assert.ok(
+    gateResults.includes("pre-merge-autofix/partial"),
+    `expected autofix attempted; got ${gateResults.join(",")}`,
+  );
+  assert.ok(
+    gateResults.includes("pre-merge-autofix/pass"),
+    `expected autofix pass; got ${gateResults.join(",")}`,
+  );
+  assert.ok(
+    gateResults.includes("delta-review/pass"),
+    `expected delta-review pass after autofix re-review approval (#682 9b5d8c51); got ${gateResults.join(",")}`,
+  );
+  const autofixPassIdx = gateResults.lastIndexOf("pre-merge-autofix/pass");
+  const deltaPassIdx = gateResults.lastIndexOf("delta-review/pass");
+  assert.ok(
+    deltaPassIdx > autofixPassIdx,
+    "delta-review/pass must be recorded after pre-merge-autofix/pass on the approve path",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // #389 review 1 finding 3: post-auto-fix re-review must rebuild the digest
 // from freshly fetched comments (including the just-posted initial delta
 // review), not reuse the pre-review snapshot.

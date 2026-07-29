@@ -247,6 +247,51 @@ test("regression: re-read same openspec gate_result does not duplicate", () => {
   assert.equal(second.payloads.length, 0);
 });
 
+test("regression: CI pass → rebase waiting → pass emits a second pass (#682 ca081002)", () => {
+  // A successful rebase starts a new CI waiting stretch; the next definitive
+  // pass must not be suppressed by the permanent fingerprint of the first pass.
+  let state = createProgressMirrorState();
+  const all: LoopItemProgressPayload[] = [];
+  const seq = [
+    gate("ci", "partial", "CI still running"),
+    gate("ci", "pass"),
+    gate("ci", "partial", "rebased; CI re-running"),
+    gate("ci", "partial", "CI still running"), // spam within stretch
+    gate("ci", "pass"),
+  ];
+  for (const ev of seq) {
+    const r = mapAdvanceEventsToProgress(LINKAGE, [ev], state);
+    all.push(...r.payloads);
+    state = r.state;
+  }
+  assert.deepEqual(steps(all), [
+    "ci/waiting",
+    "ci/pass",
+    "ci/waiting",
+    "ci/pass",
+  ]);
+  // Re-read of the final pass remains idempotent.
+  const reread = mapAdvanceEventsToProgress(LINKAGE, [gate("ci", "pass")], state);
+  assert.equal(reread.payloads.length, 0);
+});
+
+test("regression: autofix success + delta-review pass maps approve after needs_attention (#682 9b5d8c51)", () => {
+  // Advance-side sequence after a successful auto-fix re-review: initial
+  // delta fail, autofix attempt/pass, then the approving delta-review gate_result.
+  const { payloads } = mapAdvanceEventsToProgress(LINKAGE, [
+    gate("delta-review", "fail", "blocking_count=1"),
+    gate("pre-merge-autofix", "partial", "attempted"),
+    gate("pre-merge-autofix", "pass"),
+    gate("delta-review", "pass"),
+  ]);
+  assert.deepEqual(steps(payloads), [
+    "delta_review/needs_attention",
+    "autofix/attempted",
+    "autofix/success",
+    "delta_review/approve",
+  ]);
+});
+
 test("regression: re-read identical waiting via mapNewAdvanceLinesToProgress is once", () => {
   const line = JSON.stringify(gate("ci", "partial", "CI still running"));
   // Three poll observations of the same file growing with duplicate lines.

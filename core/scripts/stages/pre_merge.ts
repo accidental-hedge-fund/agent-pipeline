@@ -2344,6 +2344,15 @@ export async function enforceReviewShaGate(
                 "pre-merge-autofix",
                 "pass",
               );
+              // Mirror the initial-approval path: the post-fix re-review is the
+              // approving delta-review verdict that completed the gate (#682 9b5d8c51).
+              // Without this, the loop stream shows needs-attention + autofix
+              // success but never the delta-review approve outcome.
+              await recordPreMergeGateResult(
+                { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+                "delta-review",
+                "pass",
+              );
               return null;
             }
             // Re-review still blocks or returned unparseable output: fall through to block below.
