@@ -278,8 +278,22 @@ export function terminalStageForOutcome(outcome: string): string | null {
 }
 
 /**
+ * Per-run serialization of stage-progress ledger RMW + event append.
+ *
+ * Concurrent per-item observers (Promise.allSettled dispatch in the supervisor)
+ * otherwise race on whole-ledger writes and drop sibling item projections
+ * (#611 review finding d9543320). Same shape as store.ts appendQueues: a
+ * per-process chain under the single-engine lock-holder invariant.
+ */
+const stageProgressQueues = new Map<string, Promise<unknown>>();
+
+/**
  * Apply a material stage projection to the ledger and append a structured
  * loop event. No-op when the delta is not material. Returns the updated ledger.
+ *
+ * Concurrent callers for the same run are serialized so each mutation re-reads
+ * the latest ledger, merges only its item, and writes — preserving sibling
+ * projections that landed while this call was waiting.
  */
 export async function recordItemStageProgress(
   store: LoopStoreDeps,
@@ -290,31 +304,37 @@ export async function recordItemStageProgress(
     projection: ItemStageProjection;
   },
 ): Promise<LoopLedger> {
-  const ledger = await readLedger(store, input.runId);
-  const item = ledger.items[input.itemId];
-  if (!item) return ledger;
+  const prior = stageProgressQueues.get(input.runId) ?? Promise.resolve();
+  const task = prior.catch(() => {}).then(async (): Promise<LoopLedger> => {
+    // Always re-read inside the critical section so we merge into the latest ledger.
+    const ledger = await readLedger(store, input.runId);
+    const item = ledger.items[input.itemId];
+    if (!item) return ledger;
 
-  const previous = projectionFromItem(item);
-  if (!isMaterialStageChange(previous, input.projection)) return ledger;
+    const previous = projectionFromItem(item);
+    if (!isMaterialStageChange(previous, input.projection)) return ledger;
 
-  const updatedItem = withStageProjection(item, input.projection);
-  const newLedger: LoopLedger = {
-    ...ledger,
-    items: { ...ledger.items, [input.itemId]: updatedItem },
-  };
-  await writeLedger(store, newLedger, input.token);
+    const updatedItem = withStageProjection(item, input.projection);
+    const newLedger: LoopLedger = {
+      ...ledger,
+      items: { ...ledger.items, [input.itemId]: updatedItem },
+    };
+    await writeLedger(store, newLedger, input.token);
 
-  const eventData: StageProgressEventData = {
-    item_id: input.itemId,
-    stage: input.projection.current_stage,
-    at: input.projection.current_stage_updated_at,
-    ...(input.projection.current_stage_round !== undefined
-      ? { round: input.projection.current_stage_round }
-      : {}),
-    ...(input.projection.advance_run_id ? { advance_run_id: input.projection.advance_run_id } : {}),
-  };
-  await appendEvent(store, input.runId, input.token, LOOP_ITEM_STAGE_PROGRESS, eventData);
-  return newLedger;
+    const eventData: StageProgressEventData = {
+      item_id: input.itemId,
+      stage: input.projection.current_stage,
+      at: input.projection.current_stage_updated_at,
+      ...(input.projection.current_stage_round !== undefined
+        ? { round: input.projection.current_stage_round }
+        : {}),
+      ...(input.projection.advance_run_id ? { advance_run_id: input.projection.advance_run_id } : {}),
+    };
+    await appendEvent(store, input.runId, input.token, LOOP_ITEM_STAGE_PROGRESS, eventData);
+    return newLedger;
+  });
+  stageProgressQueues.set(input.runId, task);
+  return task as Promise<LoopLedger>;
 }
 
 /**

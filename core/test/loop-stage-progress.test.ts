@@ -267,6 +267,83 @@ test("recordItemStageProgress: writes projection and structured loop event; coar
   assert.equal((progress[0].data as { advance_run_id: string }).advance_run_id, "607-2026-07-27T19-31-29-328Z");
 });
 
+// Regression for #611 review finding d9543320: concurrent observers must not
+// clobber each other's whole-ledger writes. Without per-run serialization the
+// delayed first write loses the second item's projection (last-write-wins).
+test("recordItemStageProgress: concurrent updates for two items both persist projections", async () => {
+  const contract = testContract({
+    max_active_items: 2,
+    items: [
+      { id: "607", depends_on: [], external_depends_on: [] },
+      { id: "608", depends_on: [], external_depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({
+    "607": itemEntry("607", "in_progress"),
+    "608": itemEntry("608", "in_progress"),
+  });
+  const { deps } = fakeDeps();
+  await initRun(deps, contract, ledger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  // Stretch ledger writes so concurrent RMW without a queue would both read the
+  // pre-update ledger and the later write would drop the earlier item's stage.
+  let ledgerWrites = 0;
+  const baseWrite = deps.writeFileAtomic.bind(deps);
+  deps.writeFileAtomic = async (p, content) => {
+    if (p.endsWith("/ledger.json") || p.endsWith("ledger.json")) {
+      ledgerWrites++;
+      // Yield so a second concurrent caller can interleave its read before we commit.
+      await new Promise<void>((r) => setTimeout(r, 25));
+    }
+    await baseWrite(p, content);
+  };
+
+  await Promise.all([
+    recordItemStageProgress(deps, {
+      runId: "run-1",
+      token,
+      itemId: "607",
+      projection: {
+        current_stage: "implementing",
+        current_stage_updated_at: "2026-07-27T19:31:00Z",
+        advance_run_id: "607-2026-07-27T19-31-29-328Z",
+      },
+    }),
+    recordItemStageProgress(deps, {
+      runId: "run-1",
+      token,
+      itemId: "608",
+      projection: {
+        current_stage: "planning",
+        current_stage_updated_at: "2026-07-27T19:31:01Z",
+        advance_run_id: "608-2026-07-27T19-32-00-000Z",
+      },
+    }),
+  ]);
+
+  const after = await readLedger(deps, "run-1");
+  assert.equal(after.items["607"].current_stage, "implementing", "item 607 projection must survive concurrent sibling write");
+  assert.equal(after.items["607"].advance_run_id, "607-2026-07-27T19-31-29-328Z");
+  assert.equal(after.items["608"].current_stage, "planning", "item 608 projection must survive concurrent sibling write");
+  assert.equal(after.items["608"].advance_run_id, "608-2026-07-27T19-32-00-000Z");
+  assert.equal(after.items["607"].state, "in_progress");
+  assert.equal(after.items["608"].state, "in_progress");
+  assert.ok(ledgerWrites >= 2, "both items must have performed a ledger write");
+
+  const events = await readEvents(deps, "run-1");
+  const progress = events.filter((e) => e.kind === LOOP_ITEM_STAGE_PROGRESS);
+  assert.equal(progress.length, 2, "both stage-progress events must be on the trail");
+  const stages = new Set(
+    progress.map((e) => {
+      const d = e.data as { item_id: string; stage: string };
+      return `${d.item_id}:${d.stage}`;
+    }),
+  );
+  assert.ok(stages.has("607:implementing"));
+  assert.ok(stages.has("608:planning"));
+});
+
 test("applyAdvanceEventsToStageProgress: injected fake advance events update projection mid-advance", async () => {
   const contract = testContract();
   const ledger = testLedger({
