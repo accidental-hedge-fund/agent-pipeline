@@ -389,13 +389,23 @@ export function settledFindingsSurfaceFiles(entries: SettledFindingVerification[
 
 /**
  * Prior-round advisory findings for carry-forward at pre-merge delta (#680).
- * Deduplicated by finding key — the LATEST round that recorded a given key wins
- * — ordered ascending by key for deterministic tests. Pure: no I/O. Empty when
- * no review artifact carried `advisoryFindings` (legacy comments fail closed).
+ * Deduplicated by finding key — the LATEST **eligible** round that recorded a
+ * given key wins — ordered ascending by key for deterministic tests. Pure: no
+ * I/O. Empty when no review artifact carried `advisoryFindings` (legacy
+ * comments fail closed).
+ *
+ * Eligibility: only rounds the issue **advanced past** contribute. A round is
+ * eligible when its blocking partition is empty at comment time
+ * (`entries.length === 0` — approve or advisory-only advance under policy).
+ * Advisories co-located with blockers on a failed/blocked review or delta
+ * comment are excluded: those were never an accepted disposition, so they
+ * must not demote a later blocking finding on the same surface.
  */
 export function priorAdvisoryFindings(digest: PriorRoundDigest): PriorAdvisoryFinding[] {
   const latestByKey = new Map<string, PriorAdvisoryFinding>();
   for (const r of digest.rounds) {
+    // Non-empty blocking partition ⇒ review did not advance; skip its advisories.
+    if (r.entries.length > 0) continue;
     for (const e of r.advisoryEntries ?? []) {
       latestByKey.set(e.key, {
         key: e.key,

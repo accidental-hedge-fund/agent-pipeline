@@ -81,6 +81,19 @@ The pipeline SHALL treat a same-fingerprint or same-surface reappearance of a pr
 - **AND** partition behavior for that surface SHALL match the pre-change baseline aside from other
   settled-finding rules
 
+#### Scenario: Advisories from a non-advancing review do not carry forward
+
+- **WHEN** a prior review or delta comment recorded one or more blocking findings (the issue did
+  not advance past that review) alongside one or more advisory findings
+- **AND** a later pre-merge delta review raises a blocking finding on a surface or fingerprint that
+  matches only those non-advancing-review advisories
+- **THEN** the pipeline SHALL NOT treat those advisories as carry-forward candidates
+- **AND** the later finding SHALL remain subject to normal severity and confidence policy (not
+  demoted solely by advisory carry-forward)
+- **AND** eligibility SHALL be derived from the prior-round digest (empty blocking partition at
+  comment time = advanced; non-empty blocking partition = non-advancing) without a separate durable
+  store
+
 #### Scenario: Carry-forward coordinates with resolved-finding verification
 
 - **WHEN** a surface has both a prior settled (`resolved-by-fix` / `overridden`) entry and a prior

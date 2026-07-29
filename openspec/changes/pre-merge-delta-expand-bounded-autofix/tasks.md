@@ -37,6 +37,10 @@
 - [x] 4.3 Keep verified regressions blocking; route remaining blockers through the expanded allowlist
 - [x] 4.4 Unit tests: advisory reappears without head evidence → demoted; with head evidence → still
   blocks; no prior advisory history → no carry-forward demotion
+- [x] 4.5 Restrict carry-forward candidates to rounds the issue advanced past (empty blocking
+  partition at comment time); exclude advisories from failed/blocked review or delta comments;
+  regression: non-advancing review advisory on same surface as later HIGH delta finding remains
+  blocking
 
 ## 5. Mirror, docs, and gate
 
