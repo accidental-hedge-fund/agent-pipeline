@@ -9,6 +9,9 @@
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   advance,
   archiveAlreadyDone,
@@ -224,6 +227,7 @@ test("advance(): CI failure + rebaseAlreadyAttempted=false + tryRebaseAndPush=fa
   const blockedCalls: Array<{ reason: string; label: string }> = [];
   const reviewComment = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`;
   let rerunCalls = 0;
+  const runDir = await mkdtemp(join(tmpdir(), "pre-merge-conv-"));
 
   const deps: AdvancePreMergeDeps = {
     getPrForIssue: async () => PR,
@@ -258,17 +262,21 @@ test("advance(): CI failure + rebaseAlreadyAttempted=false + tryRebaseAndPush=fa
     getPrDiff: async () => "",
   };
 
-  let out;
-  await quiet(t, async () => {
-    out = await advance(cfg, ISSUE, { pollingCtx: {} }, deps);
-  });
+  try {
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { pollingCtx: {}, runDir }, deps);
+    });
 
-  // Rebase failed, but unknown/infra re-run still applies → waiting, not instant block.
-  assert.equal(out!.advanced, false);
-  assert.equal(out!.status, "waiting", "must continue recovery ladder after rebase failure (#679)");
-  assert.match(out!.reason ?? "", /re-triggered|CI re/i);
-  assert.equal(blockedCalls.length, 0, "must not setBlocked on first recovery step");
-  assert.equal(rerunCalls, 1, "must attempt one re-run after rebase failure");
+    // Rebase failed, but unknown/infra re-run still applies → waiting, not instant block.
+    assert.equal(out!.advanced, false);
+    assert.equal(out!.status, "waiting", "must continue recovery ladder after rebase failure (#679)");
+    assert.match(out!.reason ?? "", /re-triggered|CI re/i);
+    assert.equal(blockedCalls.length, 0, "must not setBlocked on first recovery step");
+    assert.equal(rerunCalls, 1, "must attempt one re-run after rebase failure");
+  } finally {
+    await rm(runDir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

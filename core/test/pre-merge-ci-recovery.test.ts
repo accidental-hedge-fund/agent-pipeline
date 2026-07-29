@@ -3,13 +3,14 @@
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   advance,
   buildCiExhaustedBlockReason,
   loadCiRecoveryMarkers,
+  saveCiRecoveryMarkers,
   type AdvancePreMergeDeps,
   type PreMergePollingContext,
 } from "../scripts/stages/pre_merge.ts";
@@ -38,16 +39,33 @@ async function quiet(t: TestContext, fn: () => Promise<void>): Promise<void> {
   await fn();
 }
 
+/** Durable runDir is required before recovery can return waiting (#679). */
+async function withRunDir<T>(fn: (runDir: string) => Promise<T>): Promise<T> {
+  const runDir = await mkdtemp(join(tmpdir(), "ci-recovery-"));
+  try {
+    return await fn(runDir);
+  } finally {
+    await rm(runDir, { recursive: true, force: true });
+  }
+}
+
 function baseDeps(overrides: Partial<AdvancePreMergeDeps> = {}): {
   deps: AdvancePreMergeDeps;
   rec: {
     blocked: Array<{ reason: string; kind: string }>;
     reruns: number;
-    closeReopen: number;
+    closeCalls: number;
+    reopenCalls: number;
     assertionFix: number;
   };
 } {
-  const rec = { blocked: [] as Array<{ reason: string; kind: string }>, reruns: 0, closeReopen: 0, assertionFix: 0 };
+  const rec = {
+    blocked: [] as Array<{ reason: string; kind: string }>,
+    reruns: 0,
+    closeCalls: 0,
+    reopenCalls: 0,
+    assertionFix: 0,
+  };
   const deps: AdvancePreMergeDeps = {
     getPrForIssue: async () => PR,
     getIssueDetail: (async () => ({
@@ -76,10 +94,10 @@ function baseDeps(overrides: Partial<AdvancePreMergeDeps> = {}): {
       return { attempted: true, runIds: ["30476223443"] };
     },
     closePr: async () => {
-      rec.closeReopen++;
+      rec.closeCalls++;
     },
     reopenPr: async () => {
-      rec.closeReopen++;
+      rec.reopenCalls++;
     },
     getSuccessfulCheckRunCount: async () => 0,
     getDiffFilePaths: async () => [],
@@ -139,39 +157,66 @@ test("buildCiExhaustedBlockReason includes URL, SHA, classification, recipe cues
   assert.match(reason, /re-run budget/i);
 });
 
+test("buildCiExhaustedBlockReason surfaces closed PR reopen step", () => {
+  const reason = buildCiExhaustedBlockReason({
+    failedChecks: [{ name: "test", bucket: "fail", link: RUN_URL }],
+    headSha: SHA_HEAD,
+    classification: "infra",
+    logExcerpt: null,
+    rerunAttempted: true,
+    archiveFailRecoveryAttempted: true,
+    assertionFixAttempted: false,
+    assertionFixEnabled: false,
+    rerunEnabled: true,
+    prLeftClosed: { prNumber: PR },
+    closeReopenError: "close succeeded; reopen failed",
+  });
+  assert.match(reason, /CRITICAL: PR #678 is still CLOSED/i);
+  assert.match(reason, /gh pr reopen 678/);
+  assert.match(reason, /reopen PR #678/i);
+});
+
+test("saveCiRecoveryMarkers fails closed without runDir", () => {
+  const result = saveCiRecoveryMarkers(undefined, { ciRerunAttemptedForSha: SHA_HEAD });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.reason, /runDir unavailable/);
+});
+
 // ---------------------------------------------------------------------------
 // 6.1 flake → re-run → green advances without setBlocked
 // ---------------------------------------------------------------------------
 
 test("flake fail → re-run → green advances without needs-human", async (t) => {
-  let poll = 0;
-  const { deps, rec } = baseDeps({
-    getPrChecks: async () => {
-      poll++;
-      if (poll === 1) {
-        return [{ name: "test", bucket: "fail", link: RUN_URL } as CheckRun];
-      }
-      return [{ name: "test", bucket: "pass" } as CheckRun];
-    },
-  });
-  const pollingCtx: PreMergePollingContext = {};
+  await withRunDir(async (runDir) => {
+    let poll = 0;
+    const { deps, rec } = baseDeps({
+      getPrChecks: async () => {
+        poll++;
+        if (poll === 1) {
+          return [{ name: "test", bucket: "fail", link: RUN_URL } as CheckRun];
+        }
+        return [{ name: "test", bucket: "pass" } as CheckRun];
+      },
+    });
+    const pollingCtx: PreMergePollingContext = {};
 
-  let first;
-  await quiet(t, async () => {
-    first = await advance(cfg, ISSUE, { pollingCtx }, deps);
-  });
-  assert.equal(first!.status, "waiting");
-  assert.equal(rec.reruns, 1);
-  assert.equal(rec.blocked.length, 0);
-  assert.equal(pollingCtx.ciRerunAttemptedForSha, SHA_HEAD);
+    let first;
+    await quiet(t, async () => {
+      first = await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(first!.status, "waiting");
+    assert.equal(rec.reruns, 1);
+    assert.equal(rec.blocked.length, 0);
+    assert.equal(pollingCtx.ciRerunAttemptedForSha, SHA_HEAD);
 
-  let second;
-  await quiet(t, async () => {
-    second = await advance(cfg, ISSUE, { pollingCtx }, deps);
+    let second;
+    await quiet(t, async () => {
+      second = await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(second!.advanced, true, "green after re-run must advance");
+    assert.equal(rec.blocked.length, 0, "must never setBlocked for CI on this path");
+    assert.equal(rec.reruns, 1, "must not re-run again after green");
   });
-  assert.equal(second!.advanced, true, "green after re-run must advance");
-  assert.equal(rec.blocked.length, 0, "must never setBlocked for CI on this path");
-  assert.equal(rec.reruns, 1, "must not re-run again after green");
 });
 
 // ---------------------------------------------------------------------------
@@ -179,28 +224,30 @@ test("flake fail → re-run → green advances without needs-human", async (t) =
 // ---------------------------------------------------------------------------
 
 test("double fail after re-run → single ci-exhausted block; re-run not called twice", async (t) => {
-  const { deps, rec } = baseDeps();
-  const pollingCtx: PreMergePollingContext = {};
+  await withRunDir(async (runDir) => {
+    const { deps, rec } = baseDeps();
+    const pollingCtx: PreMergePollingContext = {};
 
-  let first;
-  await quiet(t, async () => {
-    first = await advance(cfg, ISSUE, { pollingCtx }, deps);
-  });
-  assert.equal(first!.status, "waiting");
-  assert.equal(rec.reruns, 1);
+    let first;
+    await quiet(t, async () => {
+      first = await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(first!.status, "waiting");
+    assert.equal(rec.reruns, 1);
 
-  let second;
-  await quiet(t, async () => {
-    second = await advance(cfg, ISSUE, { pollingCtx }, deps);
+    let second;
+    await quiet(t, async () => {
+      second = await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(second!.status, "blocked");
+    assert.equal(second!.reason, "CI failed");
+    assert.equal(rec.blocked.length, 1);
+    assert.equal(rec.blocked[0].kind, "ci-exhausted");
+    assert.match(rec.blocked[0].reason, /classification: infra/);
+    assert.ok(rec.blocked[0].reason.includes(RUN_URL));
+    assert.ok(rec.blocked[0].reason.includes(SHA_HEAD));
+    assert.equal(rec.reruns, 1, "re-run seam not called twice for same SHA");
   });
-  assert.equal(second!.status, "blocked");
-  assert.equal(second!.reason, "CI failed");
-  assert.equal(rec.blocked.length, 1);
-  assert.equal(rec.blocked[0].kind, "ci-exhausted");
-  assert.match(rec.blocked[0].reason, /classification: infra/);
-  assert.ok(rec.blocked[0].reason.includes(RUN_URL));
-  assert.ok(rec.blocked[0].reason.includes(SHA_HEAD));
-  assert.equal(rec.reruns, 1, "re-run seam not called twice for same SHA");
 });
 
 // ---------------------------------------------------------------------------
@@ -208,8 +255,7 @@ test("double fail after re-run → single ci-exhausted block; re-run not called 
 // ---------------------------------------------------------------------------
 
 test("durable marker after simulated restart skips second re-run", async (t) => {
-  const runDir = await mkdtemp(join(tmpdir(), "ci-recovery-"));
-  try {
+  await withRunDir(async (runDir) => {
     const { deps, rec } = baseDeps();
 
     // Process 1: first red → re-run, markers flushed to runDir.
@@ -232,9 +278,54 @@ test("durable marker after simulated restart skips second re-run", async (t) => 
     assert.equal(out!.status, "blocked");
     assert.equal(rec.reruns, 1, "restart must not re-consume re-run budget");
     assert.equal(rec.blocked[0].kind, "ci-exhausted");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6.3b marker-write failure cannot re-consume recovery after restart (#679)
+// ---------------------------------------------------------------------------
+
+test("marker-write failure refuses re-run and restart cannot re-consume budget side-effect", async (t) => {
+  // runDir path is a regular file → mkdir/write inside it fails.
+  const parent = await mkdtemp(join(tmpdir(), "ci-recovery-bad-"));
+  const badRunDir = join(parent, "not-a-dir");
+  await writeFile(badRunDir, "not a directory\n");
+  try {
+    const { deps, rec } = baseDeps();
+    const ctx1: PreMergePollingContext = {};
+    let first;
+    await quiet(t, async () => {
+      first = await advance(cfg, ISSUE, { pollingCtx: ctx1, runDir: badRunDir }, deps);
+    });
+    assert.equal(first!.status, "blocked", "must escalate when markers cannot be persisted");
+    assert.equal(rec.reruns, 0, "must not re-run without durable marker");
+    assert.equal(rec.blocked[0].kind, "ci-exhausted");
+    assert.match(rec.blocked[0].reason, /Durable recovery marker persistence failed/i);
+
+    // Simulated restart: empty ctx, same bad runDir — still no re-run (side-effect never taken).
+    const ctx2: PreMergePollingContext = {};
+    rec.blocked.length = 0;
+    let second;
+    await quiet(t, async () => {
+      second = await advance(cfg, ISSUE, { pollingCtx: ctx2, runDir: badRunDir }, deps);
+    });
+    assert.equal(second!.status, "blocked");
+    assert.equal(rec.reruns, 0, "restart must not re-run when markers never persisted");
   } finally {
-    await rm(runDir, { recursive: true, force: true });
+    await rm(parent, { recursive: true, force: true });
   }
+});
+
+test("absent runDir refuses re-run and escalates (no waiting without durable state)", async (t) => {
+  const { deps, rec } = baseDeps();
+  let out;
+  await quiet(t, async () => {
+    out = await advance(cfg, ISSUE, { pollingCtx: {} }, deps);
+  });
+  assert.equal(out!.status, "blocked");
+  assert.equal(rec.reruns, 0, "must not re-run without runDir");
+  assert.equal(rec.blocked[0].kind, "ci-exhausted");
+  assert.match(rec.blocked[0].reason, /runDir unavailable|persistence failed/i);
 });
 
 // ---------------------------------------------------------------------------
@@ -242,60 +333,128 @@ test("durable marker after simulated restart skips second re-run", async (t) => 
 // ---------------------------------------------------------------------------
 
 test("archive-only + prior green + infra — re-run before block", async (t) => {
-  const { deps, rec } = baseDeps({
-    getDiffFilePaths: async () => ["openspec/specs/x/spec.md"],
-    getSuccessfulCheckRunCount: async (sha) => (sha === SHA_PRE ? 2 : 0),
-  });
-  const pollingCtx: PreMergePollingContext = { preArchiveSha: SHA_PRE };
+  await withRunDir(async (runDir) => {
+    const { deps, rec } = baseDeps({
+      getDiffFilePaths: async () => ["openspec/specs/x/spec.md"],
+      getSuccessfulCheckRunCount: async (sha) => (sha === SHA_PRE ? 2 : 0),
+    });
+    const pollingCtx: PreMergePollingContext = { preArchiveSha: SHA_PRE };
 
-  let out;
-  await quiet(t, async () => {
-    out = await advance(cfg, ISSUE, { pollingCtx }, deps);
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(out!.status, "waiting");
+    assert.equal(rec.reruns, 1);
+    assert.equal(rec.closeCalls, 0, "re-run first; no close+reopen yet");
+    assert.equal(rec.reopenCalls, 0);
+    assert.equal(rec.blocked.length, 0);
   });
-  assert.equal(out!.status, "waiting");
-  assert.equal(rec.reruns, 1);
-  assert.equal(rec.closeReopen, 0, "re-run first; no close+reopen yet");
-  assert.equal(rec.blocked.length, 0);
 });
 
 test("archive-only + prior green after re-run exhausted — one close+reopen then wait", async (t) => {
-  const { deps, rec } = baseDeps({
-    getDiffFilePaths: async () => ["openspec/changes/archive/x.md"],
-    getSuccessfulCheckRunCount: async () => 1,
-  });
-  const pollingCtx: PreMergePollingContext = {
-    preArchiveSha: SHA_PRE,
-    ciRerunAttemptedForSha: SHA_HEAD,
-  };
+  await withRunDir(async (runDir) => {
+    const { deps, rec } = baseDeps({
+      getDiffFilePaths: async () => ["openspec/changes/archive/x.md"],
+      getSuccessfulCheckRunCount: async () => 1,
+    });
+    const pollingCtx: PreMergePollingContext = {
+      preArchiveSha: SHA_PRE,
+      ciRerunAttemptedForSha: SHA_HEAD,
+    };
 
-  let out;
-  await quiet(t, async () => {
-    out = await advance(cfg, ISSUE, { pollingCtx }, deps);
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(out!.status, "waiting");
+    assert.match(out!.reason ?? "", /closed and reopened/i);
+    assert.equal(rec.closeCalls, 1, "close once");
+    assert.equal(rec.reopenCalls, 1, "reopen once");
+    assert.equal(rec.reruns, 0);
+    assert.equal(rec.blocked.length, 0);
+    assert.equal(pollingCtx.ciArchiveFailRecoveryAttemptedForSha, SHA_HEAD);
   });
-  assert.equal(out!.status, "waiting");
-  assert.match(out!.reason ?? "", /closed and reopened/i);
-  assert.equal(rec.closeReopen, 2, "close + reopen once each");
-  assert.equal(rec.reruns, 0);
-  assert.equal(rec.blocked.length, 0);
-  assert.equal(pollingCtx.ciArchiveFailRecoveryAttemptedForSha, SHA_HEAD);
+});
+
+test("archive close succeeds reopen fails — retry reopen; escalate with PR closed guidance", async (t) => {
+  await withRunDir(async (runDir) => {
+    let reopenAttempts = 0;
+    const { deps, rec } = baseDeps({
+      getDiffFilePaths: async () => ["openspec/changes/archive/x.md"],
+      getSuccessfulCheckRunCount: async () => 1,
+      reopenPr: async () => {
+        reopenAttempts++;
+        rec.reopenCalls++;
+        throw new Error(`gh: reopen failed attempt ${reopenAttempts}`);
+      },
+    });
+    const pollingCtx: PreMergePollingContext = {
+      preArchiveSha: SHA_PRE,
+      ciRerunAttemptedForSha: SHA_HEAD,
+    };
+
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(out!.status, "blocked");
+    assert.equal(rec.closeCalls, 1, "close once");
+    assert.equal(reopenAttempts, 2, "reopen retried once after initial failure");
+    assert.equal(rec.blocked[0].kind, "ci-exhausted");
+    assert.match(rec.blocked[0].reason, /still CLOSED/i);
+    assert.match(rec.blocked[0].reason, /gh pr reopen 678/);
+    assert.match(rec.blocked[0].reason, /close succeeded; reopen failed/i);
+    assert.equal(pollingCtx.ciArchiveFailRecoveryAttemptedForSha, SHA_HEAD);
+  });
+});
+
+test("archive close succeeds reopen recovers on retry → waiting", async (t) => {
+  await withRunDir(async (runDir) => {
+    let reopenAttempts = 0;
+    const { deps, rec } = baseDeps({
+      getDiffFilePaths: async () => ["openspec/changes/archive/x.md"],
+      getSuccessfulCheckRunCount: async () => 1,
+      reopenPr: async () => {
+        reopenAttempts++;
+        rec.reopenCalls++;
+        if (reopenAttempts === 1) throw new Error("transient reopen failure");
+      },
+    });
+    const pollingCtx: PreMergePollingContext = {
+      preArchiveSha: SHA_PRE,
+      ciRerunAttemptedForSha: SHA_HEAD,
+    };
+
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(out!.status, "waiting");
+    assert.equal(reopenAttempts, 2);
+    assert.equal(rec.closeCalls, 1);
+    assert.equal(rec.blocked.length, 0);
+  });
 });
 
 test("archive-only assertion failure does not close+reopen to hide product red", async (t) => {
-  const { deps, rec } = baseDeps({
-    fetchCheckLogExcerpt: async () => "AssertionError: expected 1 to equal 2",
-    getDiffFilePaths: async () => ["openspec/specs/x/spec.md"],
-    getSuccessfulCheckRunCount: async () => 1,
-  });
-  const pollingCtx: PreMergePollingContext = { preArchiveSha: SHA_PRE };
+  await withRunDir(async (runDir) => {
+    const { deps, rec } = baseDeps({
+      fetchCheckLogExcerpt: async () => "AssertionError: expected 1 to equal 2",
+      getDiffFilePaths: async () => ["openspec/specs/x/spec.md"],
+      getSuccessfulCheckRunCount: async () => 1,
+    });
+    const pollingCtx: PreMergePollingContext = { preArchiveSha: SHA_PRE };
 
-  let out;
-  await quiet(t, async () => {
-    out = await advance(cfg, ISSUE, { pollingCtx }, deps);
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(out!.status, "blocked");
+    assert.equal(rec.blocked[0].kind, "ci-exhausted");
+    assert.equal(rec.closeCalls, 0, "must not close+reopen for assertion archive-only");
+    assert.equal(rec.reruns, 0, "assertion does not take infra re-run path");
   });
-  assert.equal(out!.status, "blocked");
-  assert.equal(rec.blocked[0].kind, "ci-exhausted");
-  assert.equal(rec.closeReopen, 0, "must not close+reopen for assertion archive-only");
-  assert.equal(rec.reruns, 0, "assertion does not take infra re-run path");
 });
 
 // ---------------------------------------------------------------------------
@@ -322,35 +481,37 @@ test("assertion fix disabled escalates without auto-fix", async (t) => {
 });
 
 test("assertion fix enabled runs once then stops", async (t) => {
-  let fixCalls = 0;
-  const cfgFix = {
-    ...cfg,
-    pre_merge_ci_assertion_fix: true,
-  } as unknown as PipelineConfig;
-  const { deps, rec } = baseDeps({
-    fetchCheckLogExcerpt: async () => "AssertionError: boom",
-    runCiAssertionFix: async () => {
-      fixCalls++;
-      return { ok: true };
-    },
-  });
-  const pollingCtx: PreMergePollingContext = {};
+  await withRunDir(async (runDir) => {
+    let fixCalls = 0;
+    const cfgFix = {
+      ...cfg,
+      pre_merge_ci_assertion_fix: true,
+    } as unknown as PipelineConfig;
+    const { deps, rec } = baseDeps({
+      fetchCheckLogExcerpt: async () => "AssertionError: boom",
+      runCiAssertionFix: async () => {
+        fixCalls++;
+        return { ok: true };
+      },
+    });
+    const pollingCtx: PreMergePollingContext = {};
 
-  let first;
-  await quiet(t, async () => {
-    first = await advance(cfgFix, ISSUE, { pollingCtx }, deps);
-  });
-  assert.equal(first!.status, "waiting");
-  assert.equal(fixCalls, 1);
-  assert.equal(pollingCtx.ciAssertionFixAttemptedForSha, SHA_HEAD);
+    let first;
+    await quiet(t, async () => {
+      first = await advance(cfgFix, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(first!.status, "waiting");
+    assert.equal(fixCalls, 1);
+    assert.equal(pollingCtx.ciAssertionFixAttemptedForSha, SHA_HEAD);
 
-  let second;
-  await quiet(t, async () => {
-    second = await advance(cfgFix, ISSUE, { pollingCtx }, deps);
+    let second;
+    await quiet(t, async () => {
+      second = await advance(cfgFix, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(second!.status, "blocked");
+    assert.equal(fixCalls, 1, "must not invoke assertion fix twice");
+    assert.equal(rec.blocked[0].kind, "ci-exhausted");
   });
-  assert.equal(second!.status, "blocked");
-  assert.equal(fixCalls, 1, "must not invoke assertion fix twice");
-  assert.equal(rec.blocked[0].kind, "ci-exhausted");
 });
 
 // ---------------------------------------------------------------------------
@@ -376,42 +537,44 @@ test("#181 non-regression: budget exhausted returns blocked not waiting", async 
 });
 
 test("new head SHA resets re-run budget", async (t) => {
-  const SHA2 = "cccccccccccccccccccccccccccccccccccccccc";
-  let head = SHA_HEAD;
-  const { deps, rec } = baseDeps({
-    getPrDetail: (async () => ({
-      head_sha: head,
-      mergeable: true,
-      mergeable_state: "CLEAN",
-    })) as AdvancePreMergeDeps["getPrDetail"],
+  await withRunDir(async (runDir) => {
+    const SHA2 = "cccccccccccccccccccccccccccccccccccccccc";
+    let head = SHA_HEAD;
+    const { deps, rec } = baseDeps({
+      getPrDetail: (async () => ({
+        head_sha: head,
+        mergeable: true,
+        mergeable_state: "CLEAN",
+      })) as AdvancePreMergeDeps["getPrDetail"],
+    });
+    // Force a review comment that matches whatever head we use.
+    deps.getIssueDetail = (async () => ({
+      comments: [{ body: `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${head} -->` }],
+    })) as AdvancePreMergeDeps["getIssueDetail"];
+
+    const pollingCtx: PreMergePollingContext = { ciRerunAttemptedForSha: SHA_HEAD };
+
+    // Still on SHA_HEAD with marker → no re-run, escalate (no archive path).
+    let first;
+    await quiet(t, async () => {
+      first = await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(first!.status, "blocked");
+    assert.equal(rec.reruns, 0);
+
+    // Advance to new head → fresh re-run budget.
+    head = SHA2;
+    deps.getIssueDetail = (async () => ({
+      comments: [{ body: `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA2} -->` }],
+    })) as AdvancePreMergeDeps["getIssueDetail"];
+    rec.blocked.length = 0;
+
+    let second;
+    await quiet(t, async () => {
+      second = await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(second!.status, "waiting");
+    assert.equal(rec.reruns, 1);
+    assert.equal(pollingCtx.ciRerunAttemptedForSha, SHA2);
   });
-  // Force a review comment that matches whatever head we use.
-  deps.getIssueDetail = (async () => ({
-    comments: [{ body: `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${head} -->` }],
-  })) as AdvancePreMergeDeps["getIssueDetail"];
-
-  const pollingCtx: PreMergePollingContext = { ciRerunAttemptedForSha: SHA_HEAD };
-
-  // Still on SHA_HEAD with marker → no re-run, escalate (no archive path).
-  let first;
-  await quiet(t, async () => {
-    first = await advance(cfg, ISSUE, { pollingCtx }, deps);
-  });
-  assert.equal(first!.status, "blocked");
-  assert.equal(rec.reruns, 0);
-
-  // Advance to new head → fresh re-run budget.
-  head = SHA2;
-  deps.getIssueDetail = (async () => ({
-    comments: [{ body: `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA2} -->` }],
-  })) as AdvancePreMergeDeps["getIssueDetail"];
-  rec.blocked.length = 0;
-
-  let second;
-  await quiet(t, async () => {
-    second = await advance(cfg, ISSUE, { pollingCtx }, deps);
-  });
-  assert.equal(second!.status, "waiting");
-  assert.equal(rec.reruns, 1);
-  assert.equal(pollingCtx.ciRerunAttemptedForSha, SHA2);
 });

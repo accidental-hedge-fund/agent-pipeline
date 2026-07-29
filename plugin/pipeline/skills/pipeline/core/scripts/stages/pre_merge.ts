@@ -530,6 +530,11 @@ export function ciRecoveryMarkersPath(runDir: string): string {
   return path.join(runDir, CI_RECOVERY_MARKERS_FILE);
 }
 
+/** Result of attempting to persist CI recovery markers (#679 durability). */
+export type SaveCiRecoveryMarkersResult =
+  | { ok: true }
+  | { ok: false; reason: string };
+
 /** Load durable CI recovery markers from the run directory (best-effort). */
 export function loadCiRecoveryMarkers(runDir: string | undefined): CiRecoveryMarkers {
   if (!runDir) return {};
@@ -542,14 +547,36 @@ export function loadCiRecoveryMarkers(runDir: string | undefined): CiRecoveryMar
   }
 }
 
-/** Persist CI recovery markers (best-effort; never throws). */
-export function saveCiRecoveryMarkers(runDir: string | undefined, markers: CiRecoveryMarkers): void {
-  if (!runDir) return;
+/**
+ * Persist CI recovery markers to the run directory.
+ * Returns ok:false when runDir is missing or the write/read-back fails — callers
+ * MUST NOT return `waiting` after consuming recovery budget without ok:true
+ * (otherwise a restarted process can re-consume the budget; #679 / #181).
+ */
+export function saveCiRecoveryMarkers(
+  runDir: string | undefined,
+  markers: CiRecoveryMarkers,
+): SaveCiRecoveryMarkersResult {
+  if (!runDir) {
+    return {
+      ok: false,
+      reason: "runDir unavailable; cannot persist CI recovery markers",
+    };
+  }
   try {
     fs.mkdirSync(runDir, { recursive: true });
-    fs.writeFileSync(ciRecoveryMarkersPath(runDir), JSON.stringify(markers, null, 2) + "\n");
-  } catch {
-    // best-effort
+    const filePath = ciRecoveryMarkersPath(runDir);
+    fs.writeFileSync(filePath, JSON.stringify(markers, null, 2) + "\n");
+    // Read-back so a write that appears to succeed but is not durable fails closed.
+    const raw = fs.readFileSync(filePath, "utf8");
+    const parsed = JSON.parse(raw) as CiRecoveryMarkers;
+    if (!parsed || typeof parsed !== "object") {
+      return { ok: false, reason: "CI recovery marker read-back was not an object" };
+    }
+    return { ok: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason: `failed to persist CI recovery markers: ${msg}` };
   }
 }
 
@@ -570,8 +597,11 @@ export function hydrateCiRecoveryMarkers(
   }
 }
 
-function persistCtxCiMarkers(ctx: PreMergePollingContext, runDir: string | undefined): void {
-  saveCiRecoveryMarkers(runDir, {
+function persistCtxCiMarkers(
+  ctx: PreMergePollingContext,
+  runDir: string | undefined,
+): SaveCiRecoveryMarkersResult {
+  return saveCiRecoveryMarkers(runDir, {
     ciRerunAttemptedForSha: ctx.ciRerunAttemptedForSha,
     ciArchiveFailRecoveryAttemptedForSha: ctx.ciArchiveFailRecoveryAttemptedForSha,
     ciAssertionFixAttemptedForSha: ctx.ciAssertionFixAttemptedForSha,
@@ -3142,42 +3172,57 @@ async function handleDefinitiveCiFailure(
   let rerunAttempted = ctx.ciRerunAttemptedForSha === headSha;
   let archiveFailRecoveryAttempted = ctx.ciArchiveFailRecoveryAttemptedForSha === headSha;
   let assertionFixAttempted = ctx.ciAssertionFixAttemptedForSha === headSha;
+  /** Set when a recovery side-effect could not be paired with durable markers. */
+  let durablePersistFailure: string | undefined;
+  /** Set when archive close succeeded but reopen did not — operator must reopen. */
+  let prLeftClosed: { prNumber: number } | undefined;
+  let closeReopenError: string | undefined;
 
   // 3. Infra / unknown → one automatic re-run.
+  // Persist the per-head marker BEFORE the re-run side-effect so a restart cannot
+  // re-consume the budget when the write fails (#679 durability / #181).
   if (
     (classification === "infra" || classification === "unknown") &&
     rerunEnabled &&
     !rerunAttempted
   ) {
-    let result: RerunFailedWorkflowsResult;
-    try {
-      result = await fns.rerunFailedWorkflowsFn(cfg, failedChecks);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      result = { attempted: false, runIds: [], reason: msg };
-    }
-    // Record the attempt whether re-run succeeded or was unavailable — so we
-    // never spin re-running the same head forever (#181 non-regression).
+    const prevRerunSha = ctx.ciRerunAttemptedForSha;
     ctx.ciRerunAttemptedForSha = headSha;
-    rerunAttempted = true;
-    persistCtxCiMarkers(ctx, opts.runDir);
-    if (opts.pollingCtx) {
-      opts.pollingCtx.ciRerunAttemptedForSha = headSha;
-    }
-    if (result.attempted) {
+    const persist = persistCtxCiMarkers(ctx, opts.runDir);
+    if (!persist.ok) {
+      // Roll back in-memory so a later run can retry once durability is restored.
+      ctx.ciRerunAttemptedForSha = prevRerunSha;
+      durablePersistFailure = persist.reason;
       console.log(
-        `[pipeline] #${issueNumber}: CI ${classification} failure; re-ran workflow(s) ${result.runIds.join(", ")} for head ${headSha.slice(0, 7)}`,
+        `[pipeline] #${issueNumber}: refusing CI re-run for ${headSha.slice(0, 7)} — ${persist.reason}`,
       );
-      return {
-        advanced: false,
-        status: "waiting",
-        reason: `CI re-triggered (${classification}); waiting for checks`,
-      };
+    } else {
+      rerunAttempted = true;
+      if (opts.pollingCtx) {
+        opts.pollingCtx.ciRerunAttemptedForSha = headSha;
+      }
+      let result: RerunFailedWorkflowsResult;
+      try {
+        result = await fns.rerunFailedWorkflowsFn(cfg, failedChecks);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        result = { attempted: false, runIds: [], reason: msg };
+      }
+      if (result.attempted) {
+        console.log(
+          `[pipeline] #${issueNumber}: CI ${classification} failure; re-ran workflow(s) ${result.runIds.join(", ")} for head ${headSha.slice(0, 7)}`,
+        );
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: `CI re-triggered (${classification}); waiting for checks`,
+        };
+      }
+      // Re-run unavailable → fall through to remaining budget steps.
+      console.log(
+        `[pipeline] #${issueNumber}: CI re-run unavailable for ${headSha.slice(0, 7)}: ${result.reason ?? "unknown"}`,
+      );
     }
-    // Re-run unavailable → fall through to remaining budget steps.
-    console.log(
-      `[pipeline] #${issueNumber}: CI re-run unavailable for ${headSha.slice(0, 7)}: ${result.reason ?? "unknown"}`,
-    );
   }
 
   // 4. Archive-only + prior green + infra/unknown → one close+reopen after re-run exhausted/unavailable.
@@ -3197,76 +3242,120 @@ async function handleDefinitiveCiFailure(
       // (or re-run disabled). When re-run just marked attempted but was unavailable,
       // this path still applies on the same tick.
       if (rerunAttempted || !rerunEnabled) {
-        try {
-          await fns.closePrFn(cfg, prNumber);
-          await fns.reopenPrFn(cfg, prNumber);
-          ctx.ciArchiveFailRecoveryAttemptedForSha = headSha;
+        // Persist one-shot marker before close so restart cannot re-close thrash.
+        // If persist fails, skip the side-effect and escalate (do not leave PR closed).
+        const prevArchiveSha = ctx.ciArchiveFailRecoveryAttemptedForSha;
+        ctx.ciArchiveFailRecoveryAttemptedForSha = headSha;
+        const persistBefore = persistCtxCiMarkers(ctx, opts.runDir);
+        if (!persistBefore.ok) {
+          ctx.ciArchiveFailRecoveryAttemptedForSha = prevArchiveSha;
+          durablePersistFailure = durablePersistFailure ?? persistBefore.reason;
+          console.log(
+            `[pipeline] #${issueNumber}: refusing archive close+reopen for ${headSha.slice(0, 7)} — ${persistBefore.reason}`,
+          );
+        } else {
           archiveFailRecoveryAttempted = true;
-          persistCtxCiMarkers(ctx, opts.runDir);
           if (opts.pollingCtx) {
             opts.pollingCtx.ciArchiveFailRecoveryAttemptedForSha = headSha;
           }
-          console.log(
-            `[pipeline] #${issueNumber}: archive-only CI ${classification} failure; closed+reopened PR #${prNumber} for head ${headSha.slice(0, 7)}`,
-          );
-          return {
-            advanced: false,
-            status: "waiting",
-            reason: "archive-only CI red; closed and reopened PR to re-fire CI",
-          };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          // Record attempt so we do not thrash close+reopen, then escalate.
-          ctx.ciArchiveFailRecoveryAttemptedForSha = headSha;
-          archiveFailRecoveryAttempted = true;
-          persistCtxCiMarkers(ctx, opts.runDir);
-          if (opts.pollingCtx) {
-            opts.pollingCtx.ciArchiveFailRecoveryAttemptedForSha = headSha;
+
+          let closed = false;
+          let reopened = false;
+          try {
+            await fns.closePrFn(cfg, prNumber);
+            closed = true;
+            await fns.reopenPrFn(cfg, prNumber);
+            reopened = true;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            closeReopenError = msg;
+            // If close succeeded but reopen failed, retry reopen once so we do not
+            // strand the PR closed (#679 close+reopen safety).
+            if (closed && !reopened) {
+              try {
+                await fns.reopenPrFn(cfg, prNumber);
+                reopened = true;
+                closeReopenError = undefined;
+                console.log(
+                  `[pipeline] #${issueNumber}: archive-only reopen recovered on retry for PR #${prNumber}`,
+                );
+              } catch (retryErr) {
+                const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+                closeReopenError = `close succeeded; reopen failed (initial: ${msg}; retry: ${retryMsg})`;
+                prLeftClosed = { prNumber };
+                console.log(
+                  `[pipeline] #${issueNumber}: archive-only close+reopen left PR #${prNumber} CLOSED: ${closeReopenError}`,
+                );
+              }
+            } else {
+              console.log(
+                `[pipeline] #${issueNumber}: archive-only close+reopen failed: ${msg}`,
+              );
+            }
           }
-          console.log(
-            `[pipeline] #${issueNumber}: archive-only close+reopen failed: ${msg}`,
-          );
+
+          if (reopened) {
+            console.log(
+              `[pipeline] #${issueNumber}: archive-only CI ${classification} failure; closed+reopened PR #${prNumber} for head ${headSha.slice(0, 7)}`,
+            );
+            return {
+              advanced: false,
+              status: "waiting",
+              reason: "archive-only CI red; closed and reopened PR to re-fire CI",
+            };
+          }
+          // Partial or total failure → fall through to escalate with evidence.
         }
       }
     }
   }
 
   // 5. Optional assertion auto-fix (config-capped, one shot).
+  // Persist marker before dispatch so restart cannot re-invoke the fix loop.
   if (classification === "assertion" && assertionFixEnabled && !assertionFixAttempted) {
+    const prevFixSha = ctx.ciAssertionFixAttemptedForSha;
     ctx.ciAssertionFixAttemptedForSha = headSha;
-    assertionFixAttempted = true;
-    persistCtxCiMarkers(ctx, opts.runDir);
-    if (opts.pollingCtx) {
-      opts.pollingCtx.ciAssertionFixAttemptedForSha = headSha;
-    }
-    if (fns.runCiAssertionFixFn) {
-      let fixResult: { ok: boolean; reason?: string };
-      try {
-        fixResult = await fns.runCiAssertionFixFn(cfg, issueNumber, {
-          prNumber,
-          headSha,
-          failedChecks,
-          classification,
-          logExcerpt,
-        });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        fixResult = { ok: false, reason: msg };
-      }
-      if (fixResult.ok) {
-        console.log(
-          `[pipeline] #${issueNumber}: CI assertion auto-fix dispatched for head ${headSha.slice(0, 7)}`,
-        );
-        return {
-          advanced: false,
-          status: "waiting",
-          reason: "CI assertion auto-fix attempted; waiting for checks",
-        };
-      }
+    const persist = persistCtxCiMarkers(ctx, opts.runDir);
+    if (!persist.ok) {
+      ctx.ciAssertionFixAttemptedForSha = prevFixSha;
+      durablePersistFailure = durablePersistFailure ?? persist.reason;
       console.log(
-        `[pipeline] #${issueNumber}: CI assertion auto-fix failed: ${fixResult.reason ?? "unknown"}`,
+        `[pipeline] #${issueNumber}: refusing CI assertion auto-fix for ${headSha.slice(0, 7)} — ${persist.reason}`,
       );
-      // Fall through to escalate on same tick when dispatch failed.
+    } else {
+      assertionFixAttempted = true;
+      if (opts.pollingCtx) {
+        opts.pollingCtx.ciAssertionFixAttemptedForSha = headSha;
+      }
+      if (fns.runCiAssertionFixFn) {
+        let fixResult: { ok: boolean; reason?: string };
+        try {
+          fixResult = await fns.runCiAssertionFixFn(cfg, issueNumber, {
+            prNumber,
+            headSha,
+            failedChecks,
+            classification,
+            logExcerpt,
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          fixResult = { ok: false, reason: msg };
+        }
+        if (fixResult.ok) {
+          console.log(
+            `[pipeline] #${issueNumber}: CI assertion auto-fix dispatched for head ${headSha.slice(0, 7)}`,
+          );
+          return {
+            advanced: false,
+            status: "waiting",
+            reason: "CI assertion auto-fix attempted; waiting for checks",
+          };
+        }
+        console.log(
+          `[pipeline] #${issueNumber}: CI assertion auto-fix failed: ${fixResult.reason ?? "unknown"}`,
+        );
+        // Fall through to escalate on same tick when dispatch failed.
+      }
     }
   }
 
@@ -3290,6 +3379,9 @@ async function handleDefinitiveCiFailure(
     assertionFixAttempted,
     assertionFixEnabled,
     rerunEnabled,
+    prLeftClosed,
+    closeReopenError,
+    durablePersistFailure,
   });
   await fns.setBlockedFn(cfg, issueNumber, reason, "pre-merge", "ci-exhausted");
   return { advanced: false, status: "blocked", reason: "CI failed" };
@@ -3330,6 +3422,12 @@ export function buildCiExhaustedBlockReason(input: {
   assertionFixAttempted: boolean;
   assertionFixEnabled: boolean;
   rerunEnabled: boolean;
+  /** When archive close+reopen left the PR closed after reopen failure. */
+  prLeftClosed?: { prNumber: number };
+  /** Detail from close+reopen failure (including reopen retry). */
+  closeReopenError?: string;
+  /** When durable marker persistence blocked or failed recovery. */
+  durablePersistFailure?: string;
 }): string {
   const lines: string[] = [
     `CI checks failed after recovery budget exhausted (classification: ${input.classification}).`,
@@ -3348,6 +3446,25 @@ export function buildCiExhaustedBlockReason(input: {
   if (input.logExcerpt) {
     lines.push("", "Log excerpt:", "```", input.logExcerpt, "```");
   }
+  if (input.prLeftClosed) {
+    lines.push(
+      "",
+      `CRITICAL: PR #${input.prLeftClosed.prNumber} is still CLOSED after archive close+reopen recovery failed.`,
+      `Reopen it first: \`gh pr reopen ${input.prLeftClosed.prNumber}\` (or the GitHub UI), then re-fire CI if needed.`,
+    );
+    if (input.closeReopenError) {
+      lines.push(`Close+reopen error: ${input.closeReopenError}`);
+    }
+  } else if (input.closeReopenError) {
+    lines.push("", `Archive close+reopen error: ${input.closeReopenError}`);
+  }
+  if (input.durablePersistFailure) {
+    lines.push(
+      "",
+      `Durable recovery marker persistence failed: ${input.durablePersistFailure}`,
+      "Automatic recovery was not safely consumable without durable state; fix run-store writability if this persists.",
+    );
+  }
   lines.push(
     "",
     "Recovery already attempted:",
@@ -3355,7 +3472,11 @@ export function buildCiExhaustedBlockReason(input: {
     `- archive failed-run close+reopen: ${input.archiveFailRecoveryAttempted ? "yes" : "no"}`,
     `- assertion auto-fix: ${input.assertionFixEnabled ? (input.assertionFixAttempted ? "yes" : "no") : "disabled"}`,
     "",
-    "Next steps: inspect the check URL(s) and classification above; fix product " +
+    "Next steps: " +
+      (input.prLeftClosed
+        ? `reopen PR #${input.prLeftClosed.prNumber}; `
+        : "") +
+      "inspect the check URL(s) and classification above; fix product " +
       "test/build failures or remaining infrastructure issues; push any code fix " +
       "to the PR head; remove the `blocked` label; re-run the pipeline. " +
       (input.rerunAttempted

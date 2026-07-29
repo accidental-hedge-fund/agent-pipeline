@@ -89,6 +89,8 @@ When `getPrChecks` reports one or more definitive failures (not pending), the ga
 
 For each PR head SHA observed with definitive CI failures, the gate SHALL track recovery steps already consumed in durable run state that survives process restart. The budget SHALL include, in order and as applicable: the existing one-shot rebase (when not yet attempted), at most one automatic failed-workflow re-run for `infra` or `unknown`, at most one archive-only failed-run recovery step when archive-only and prior-green conditions hold, and at most one assertion auto-fix attempt when that feature is enabled and classification is `assertion`. After the applicable budget is exhausted, the gate SHALL escalate once and SHALL NOT re-attempt the same recovery step for the same head SHA. The budget SHALL NOT reintroduce infinite wait or re-archive loops (#181).
 
+Before returning `waiting` after a budget-consuming recovery side-effect (re-run, archive close+reopen, assertion fix), the gate SHALL successfully persist the corresponding durable marker (canonical run directory / run-store path). When the run directory is absent or marker persistence fails, the gate SHALL NOT perform the recovery side-effect when it has not yet occurred, SHALL NOT return `waiting` solely on in-memory markers, and SHALL escalate with `ci-exhausted` naming the persistence failure so a restarted process cannot re-consume the budget unboundedly.
+
 #### Scenario: durable markers prevent re-run after process restart
 
 - **WHEN** a re-run was already recorded as attempted for head SHA `H` in durable run state
@@ -108,6 +110,14 @@ For each PR head SHA observed with definitive CI failures, the gate SHALL track 
 - **THEN** the gate SHALL call `setBlocked` and return `blocked`
 - **AND** SHALL NOT return `{ status: "waiting", reason: "CI still running" }` solely because checks are red
 - **AND** SHALL NOT push another OpenSpec archive solely to re-poll CI
+
+#### Scenario: marker persistence failure refuses recovery side-effect and escalates
+
+- **WHEN** definitive failures classify as eligible for re-run (or archive close+reopen / assertion fix)
+- **AND** durable marker persistence fails or the run directory is unavailable
+- **THEN** the gate SHALL NOT call the corresponding recovery side-effect seam
+- **AND** SHALL NOT return `waiting`
+- **AND** SHALL call `setBlocked` with kind `ci-exhausted` and a reason that names the persistence failure
 
 ### Requirement: Infra or unknown classification SHALL trigger at most one automatic failed-workflow re-run
 
@@ -160,6 +170,16 @@ When definitive failures are observed, the diff from `preArchiveSha` to the curr
 - **THEN** the gate SHALL call `closePr` then `reopenPr` once
 - **AND** SHALL return `waiting`
 - **AND** SHALL NOT call `setBlocked` on that tick
+
+#### Scenario: archive close succeeds but reopen fails — reopen retry then escalate with closed-PR guidance
+
+- **WHEN** archive close+reopen recovery is selected for the head SHA
+- **AND** `closePr` succeeds
+- **AND** the first `reopenPr` fails
+- **THEN** the gate SHALL retry `reopenPr` once
+- **AND** when reopen still fails, SHALL call `setBlocked` with kind `ci-exhausted`
+- **AND** the block reason SHALL state that the PR is still closed and direct the operator to reopen it
+- **AND** SHALL record the archive failed-run recovery marker so close+reopen is not thrashed
 
 #### Scenario: archive-only assertion failure does not close+reopen to hide product red
 
