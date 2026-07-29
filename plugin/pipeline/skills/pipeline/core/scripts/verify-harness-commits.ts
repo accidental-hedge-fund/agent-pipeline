@@ -118,6 +118,16 @@ export function parseDirtyFiles(statusOutput: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * True when `filePath` contains a full `node_modules` path segment at any depth
+ * (root or nested monorepo). Equivalent to `/(^|\/)node_modules(\/|$)/` on
+ * forward-slash git paths. Substring components like `node_modules_backup` are
+ * not hits. Exported for tests (#624).
+ */
+export function pathHasNodeModulesSegment(filePath: string): boolean {
+  return /(^|\/)node_modules(\/|$)/.test(filePath);
+}
+
 // ---------------------------------------------------------------------------
 // Documentation allow-list (docs-only check)
 // ---------------------------------------------------------------------------
@@ -173,7 +183,9 @@ export async function verifyHarnessCommits(
   for (const sha of shas) {
     const files = await getDiffTreeFiles(wtPath, sha);
     for (const file of files) {
-      if (file.split("/")[0] === "node_modules") {
+      // Depth-agnostic: block root `node_modules/...` and nested monorepo paths
+      // like `apps/web/node_modules/...` (#624; salvage parity with #521).
+      if (pathHasNodeModulesSegment(file)) {
         return {
           ok: false,
           reason: `Commit ${sha} adds a node_modules entry (${file}); node_modules must not be committed`,
