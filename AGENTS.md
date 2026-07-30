@@ -13,7 +13,9 @@ conventions. Keep it in sync with `CLAUDE.md`.
 2. **`npm run ci` must pass before a change is done.** It runs: `ci:core`
    (`cd core && npm ci && npm test`) → `build.mjs --check` (mirror in sync) →
    `ci:install-smoke` → `ci:openspec` (`openspec validate --all` when an
-   `openspec/` directory is present). Treat a red `ci` as not-done.
+   `openspec/` directory is present) → and, when `scripts/generate-docs.mjs` is
+   present, **docs freshness** (`docs:check` / `generate-docs --check`). Green
+   unit tests alone do not mask stale generated docs. Treat a red `ci` as not-done.
 3. **Rigor over latency.** Do not disable or default-demote review steps.
 4. **The pipeline never merges.** No auto-merge path; no `auto_merge` config key.
 5. **Verify external shapes; never guess.** Confirm `gh --json` field names with
@@ -33,6 +35,9 @@ Full gate from repo root: `npm run ci`.
 
 `npm run ci` also runs `openspec validate --all` when an `openspec/` directory is
 present. A structurally invalid living spec or active change fails the gate.
+When the docs generator is present, the same full gate includes docs freshness
+so stale generated docs fail before PR open — the same way a stale `plugin/`
+mirror fails `build.mjs --check`.
 
 New features need unit tests; bug fixes need a regression test that would have
 caught the bug. Tests inject I/O via `deps`/`Deps` seams — no real network, git,
