@@ -1069,6 +1069,8 @@ test("checkLoopCoherence: goal-loop absent → ok:true (optional, not blocking)"
   try {
     const result = await checkLoopCoherence();
     assert.equal(result.ok, true);
+    // Must not claim loop is unavailable without external goal-loop (#627)
+    assert.equal(result.message, undefined);
   } finally {
     delete process.env.CLAUDE_CONFIG_DIR;
     delete process.env.CODEX_HOME;
