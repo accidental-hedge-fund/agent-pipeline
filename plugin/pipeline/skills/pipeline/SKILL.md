@@ -97,7 +97,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (default: exit 0 on loop_run_stopped; --no-until-terminal for interrupt-only)
 /pipeline:loop --audit                   read-only report (process identity, action evidence, per-item stage table); no writes
 /pipeline:loop --resume <run-id> --audit --follow  stream whole-run stage-progress lines (not harness stdout)
-/pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (interrupt stops follow; no auto-exit on terminal)
+/pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run\'s events.jsonl (default: exit 0 on loop_run_stopped; --no-until-terminal for interrupt-only)
 /pipeline evals plan <manifest.json>     expand + persist an experiment's run plan; invokes no harness, creates no worktree
 /pipeline evals run <manifest.json>      execute an experiment's cells (resumable); never writes to production GitHub
 /pipeline evals run <manifest.json> --fixtures <dir>  override the fixtures directory (default: core/evals/fixtures)
