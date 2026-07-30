@@ -149,11 +149,12 @@ test("checkLoopContractCoherence — supported install passes, detail includes v
   assert.match(r.detail, /goal-loop\/contract@2/);
 });
 
-test("checkLoopContractCoherence — goal-loop absent fails with install remediation", async () => {
+test("checkLoopContractCoherence — goal-loop absent skips (optional/legacy, not fail)", async () => {
   const r = await checkLoopContractCoherence(fakeDeps(), ROOTS);
-  assert.equal(r.status, "fail");
-  assert.match(r.remediation ?? "", /install/i);
-  assert.match(r.remediation ?? "", /goal-loop/i);
+  assert.equal(r.status, "skip");
+  assert.notEqual(r.status, "fail");
+  assert.match(r.detail, /optional|legacy/i);
+  assert.match(r.detail, /not required|pipeline:loop|in-repo/i);
 });
 
 test("checkLoopContractCoherence — unsupported (older) contract schema fails naming both sides", async () => {

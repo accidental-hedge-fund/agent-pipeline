@@ -98,12 +98,12 @@ delegating entry.
   pre-existing `pipeline summary <run-id>` exact-run selector SHALL remain
   available and unchanged for run-id selection
 
-#### Scenario: The loop entry delegates instead of forwarding
+#### Scenario: merge-queue host entry forwards to the CLI keyword
 
-- **WHEN** `/pipeline:loop --milestone v2` is invoked
-- **THEN** the deterministic loop preflight SHALL run in the pipeline CLI
-- **AND** durable orchestration SHALL be carried out by the installed goal-loop skill,
-  not by a `pipeline loop` keyword sub-command owning its own state
+- **WHEN** `/pipeline:merge-queue --milestone "v1.28.2"` (or the Codex equivalent)
+  is invoked
+- **THEN** it SHALL forward to `pipeline merge-queue` with the same arguments
+- **AND** SHALL NOT perform a merge solely by virtue of the host entry being used
 
 ### Requirement: The advance loop SHALL remain the default invocation, unchanged
 
@@ -238,4 +238,15 @@ SHALL continue to use that template.
   `status` or `doctor`
 - **THEN** the result MAY still include the shared seconds-only / no-Monitor
   template
+
+### Requirement: The merge-queue host entry SHALL document dry-run default and human authority
+The `pipeline:merge-queue` host command description SHALL state that the command
+plans an ordered ready-to-deploy merge queue under explicit operator invocation,
+defaults to dry-run, and is never called by the advance loop. It SHALL NOT
+describe autonomous or background merging.
+
+#### Scenario: Host one-liner states dry-run and non-advance
+- **WHEN** the host command description for `pipeline:merge-queue` is inspected
+- **THEN** it SHALL mention dry-run (or default non-mutating plan) behavior
+- **AND** SHALL NOT claim the advance loop merges via this command
 

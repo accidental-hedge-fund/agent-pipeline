@@ -406,6 +406,7 @@ export function maxPositionalsFor(command: string | undefined): number {
     command === "intake" ||
     command === "triage" ||
     command === "merge" ||
+    command === "merge-queue" ||
     command === "status" ||
     command === "papercut" ||
     command === "correction"
@@ -514,7 +515,7 @@ export function buildCmd(): Command {
     .option("--concurrency <C>", "queue: maximum simultaneous pipeline runs (default: 1)", Number)
     .option("--max-failure-rate <R>", "queue: halt new launches when failure rate meets this threshold 0.0–1.0 (default: 1.0)", Number)
     .option("--label <L>", "queue: filter eligible issues to those carrying this label (repeatable)", collectRepeatable, [])
-    .option("--milestone <M>", "queue/merge-queue: filter eligible issues to those belonging to this milestone title")
+    .option("--milestone <M>", "queue / merge-queue / loop: filter issues to this milestone title")
     .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)")
     .option(
       "--release-when-complete",
@@ -1934,6 +1935,11 @@ async function main(): Promise<void> {
         console.error(
           `pipeline: 'pipeline merge' does not support ${flags}. ` +
             `'pipeline merge <pr>' is a human-invoked squash merge; only --repo-path, --base, and --profile apply.`,
+        );
+      } else if (isMergeQueueCommand) {
+        console.error(
+          `pipeline: 'pipeline merge-queue' does not support ${flags}. ` +
+            `Allowed: --milestone, --dry-run, --repo-path, --base, --profile. Drive/apply is not implemented (#674).`,
         );
       } else if (opts.removeWorktree && isNumericOrAbsent) {
         console.error(`pipeline: '--remove-worktree' mode does not support ${flags}. These are separate modes.`);

@@ -284,6 +284,39 @@ test("command-registry: lookupCommand('cleanup') returns cleanup entry with need
   assert.equal(entry.needsIssueNumber, false);
 });
 
+test("command-registry: merge-queue entry is human-gated sequential merge surface (#676)", () => {
+  const entry = COMMAND_REGISTRY["merge-queue"];
+  assert.ok(entry, "merge-queue must be registered");
+  assert.equal(entry.needsIssueNumber, false);
+  // mutatesGitHub true: --apply performs sequential merges; dry-run is default but not exclusive.
+  assert.equal(entry.mutatesGitHub, true);
+  assert.equal(entry.needsConfig, true);
+  assert.equal(entry.needsGhAuth, true);
+  assert.notEqual(entry.allowedFlags, "all");
+  const flags = entry.allowedFlags as Set<string>;
+  for (const required of [
+    "milestone",
+    "dryRun",
+    "repoPath",
+    "base",
+    "profile",
+    "apply",
+    "releaseWhenComplete",
+    "releaseVersion",
+  ]) {
+    assert.ok(flags.has(required), `merge-queue.allowedFlags must include ${required}`);
+  }
+  assert.equal(lookupCommand("merge-queue"), entry);
+});
+
+test("command-registry: merge-queue rejects unsupported flags via validateFlags", () => {
+  const entry = COMMAND_REGISTRY["merge-queue"];
+  const offending = validateFlags(entry, fakeCmdWithCliFlag("jsonEvents"));
+  assert.deepEqual(offending, ["jsonEvents"]);
+  assert.deepEqual(validateFlags(entry, fakeCmdWithCliFlag("milestone")), []);
+  assert.deepEqual(validateFlags(entry, fakeCmdWithCliFlag("dryRun")), []);
+});
+
 // ---------------------------------------------------------------------------
 // 2.10  UNIVERSAL_FLAGS: host-injected --profile tolerated on every command (#383)
 // ---------------------------------------------------------------------------

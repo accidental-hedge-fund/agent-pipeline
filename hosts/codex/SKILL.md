@@ -1015,7 +1015,7 @@ When the loop ends, the skill prints:
 
 ## What this skill never does
 
-- Auto-merge PRs autonomously — the advance loop never merges and there is no `auto_merge` config key. The human-invoked `$pipeline merge <pr>` command is the controlled, explicit surface for merging after `pipeline:ready-to-deploy`; it is never called by the advance loop.
+- Auto-merge PRs autonomously — the advance loop never merges and there is no `auto_merge` config key. The human-invoked `$pipeline merge <pr>` command is the controlled, explicit surface for merging after `pipeline:ready-to-deploy`; it is never called by the advance loop. `$pipeline:merge-queue --milestone <m>` is a dry-run planner only (ordered R2D candidates); it never merges and is never called by advance.
 - Bypass the `pipeline:*` opt-in label gate.
 - Run more than one transition under `--once`.
 - Touch the GitHub repo in `--dry-run` mode.

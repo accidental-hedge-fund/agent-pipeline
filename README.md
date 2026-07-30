@@ -12,7 +12,7 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 
 | Band | What happens |
 | --- | --- |
-| Spec before code | `planning` writes the implementation plan/spec, and `plan-review` is the human sign-off before implementation starts. OpenSpec-backed repos reconcile and archive specs during `pre-merge`. |
+| Spec before code | `planning` writes the implementation plan/spec; when enabled, `plan-review` is **independent agent plan review** of that plan (or a labeled same-harness self-review if the reviewer CLI is missing — see [Prerequisites](#prerequisites)) plus an optional **human feedback window** before implementation — not human sign-off. OpenSpec-backed repos reconcile and archive specs during `pre-merge`. |
 | Structured review | Reviewers emit findings with severity, confidence, and file/line context. The same review input should lead to the same advance/block decision, not a model coin flip. |
 | Bounded convergence | Review/fix rounds are capped by policy and guarded against recurring findings. If the run cannot converge cleanly, it stops with evidence instead of looping indefinitely. |
 | Surgical fixes | `fix-1` and `fix-2` are scoped to reviewer findings. No opportunistic refactors, no scope creep, no destructive cleanup. |
@@ -76,14 +76,14 @@ The installer prints a prerequisite checklist during install (warnings do not bl
 **Step 1 — Install**
 
 ```bash
-# Pinned to a released version (reproducible — recommended):
-npx -y github:accidental-hedge-fund/agent-pipeline#v1.2.1 install
-
-# Or track the latest default branch:
+# Track the latest default branch:
 npx github:accidental-hedge-fund/agent-pipeline install
+
+# Or pin a released tag for a reproducible install (recommended for prod):
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.28.4 install
 ```
 
-This detects which of `~/.claude` and `~/.codex` exist and installs to each. After installing for Codex, **restart Codex** to pick up the skill. Pin to a tag (`#v1.2.1`) for a reproducible install; the bare form tracks the latest default branch — see [Install a specific version](#install-a-specific-version).
+This detects which of `~/.claude` and `~/.codex` exist and installs to each. After installing for Codex, **restart Codex** to pick up the skill. Pin to a released tag (see [GitHub Releases](https://github.com/accidental-hedge-fund/agent-pipeline/releases)) for a reproducible install; the bare form tracks the latest default branch — see [Install a specific version](#install-a-specific-version).
 
 **Step 2 — Label an issue and run**
 
@@ -124,10 +124,10 @@ npx github:accidental-hedge-fund/agent-pipeline install --host claude
 npx github:accidental-hedge-fund/agent-pipeline install --host codex
 ```
 
-For a reproducible, non-interactive install — pin the released tag (`#v1.2.1`) and auto-accept the optional-dependency prompts with `--yes-deps`:
+For a reproducible, non-interactive install — pin a released tag and auto-accept the optional-dependency prompts with `--yes-deps`:
 
 ```bash
-npx -y github:accidental-hedge-fund/agent-pipeline#v1.2.1 install --host claude --yes-deps
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.28.4 install --host claude --yes-deps
 ```
 
 The bare commands above always track the **latest** default branch; add `#<tag>` to pin a release (see [Install a specific version](#install-a-specific-version)). The pipeline is **cross-harness** regardless of which host you install — `--host claude` only controls where the skill lands; the *other* harness's CLI (`codex`) is still required for review.
@@ -188,15 +188,15 @@ This installs the same skill as a plugin (`/pipeline`, shown as `pipeline:pipeli
 The bare `npx github:…` commands above install the **latest** code (the default branch). To install a specific released version instead, pin the git ref with `#<tag>` — released versions are tagged `vMAJOR.MINOR.PATCH` (see the [tags](https://github.com/accidental-hedge-fund/agent-pipeline/tags)):
 
 ```bash
-# Install exactly v1.2.1 (any host flag works the same way)
-npx -y github:accidental-hedge-fund/agent-pipeline#v1.2.1 install --host claude
+# Install exactly v1.28.4 (any host flag works the same way; pick a tag from Releases)
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.28.4 install --host claude
 ```
 
-Everything else is identical to the latest-version commands — `#v1.2.1` just tells `npx` to fetch that tag rather than the default branch. Or clone and check out the tag directly:
+Everything else is identical to the latest-version commands — `#v1.28.4` (or any other released `vMAJOR.MINOR.PATCH` tag) just tells `npx` to fetch that tag rather than the default branch. Or clone and check out the tag directly:
 
 ```bash
 gh repo clone accidental-hedge-fund/agent-pipeline
-cd agent-pipeline && git checkout v1.2.1
+cd agent-pipeline && git checkout v1.28.4
 node scripts/install.mjs install --host claude
 ```
 
@@ -1097,7 +1097,7 @@ The checks (each emits one sentence of remediation text on failure or warning):
 | `package-install` | `node_modules` exists and is not older than `package-lock.json` | the repo root has no `package-lock.json` |
 | `openspec-cli` | the `openspec` CLI is on `PATH` | OpenSpec is not active (`openspec.enabled: off`, or `auto` with no `openspec/` dir) |
 | `eval-command` | the configured eval command's binary resolves on `PATH` | the eval gate is off or has no `command` |
-| `loop:contract-coherence` | an installed [goal-loop](https://github.com/comamitc/goal-loop) skill is discovered whose contract/ledger schema ids are within Pipeline's supported set (reported by `pipeline doctor` and the installer only — `pipeline:loop` itself no longer requires this; see [`pipeline:loop`](#durable-multi-item-runs-pipelineloop)) | — (fails, naming both sides, when goal-loop is absent or its schema ids are outside the supported set) |
+| `loop:contract-coherence` | a discovered legacy [goal-loop](https://github.com/comamitc/goal-loop) install (if any) has contract/ledger schema ids within Pipeline's supported set (doctor + installer only; [`pipeline:loop`](#durable-multi-item-runs-pipelineloop) uses the in-repo durable loop and does **not** require external goal-loop) | no external goal-loop install is discovered (**skip** — optional/legacy; not a doctor failure). Hard-fails only when a discovered install is unreadable or its schema ids are outside the supported set (detail names both sides) |
 
 **Stale-install warning (#385).** `install:version-freshness` compares the installed engine against the latest `accidental-hedge-fund/agent-pipeline` GitHub release tag. A behind install reports `warn` — loud but **non-blocking**: it never fails the preflight, never sets a non-zero exit code, and never aborts a `--doctor` / `doctor.runOnStart` run. The remediation names the [update command](#updating-an-npxclone-install). The check only reports; it never updates anything itself.
 
@@ -1529,9 +1529,15 @@ Review verdicts are also pinned to the commit they evaluated. Every review comme
 
 ### Human plan feedback
 
-When `plan_review` is on, the pipeline posts the plan as an `## Implementation Plan` issue comment and runs the reviewer harness against it. **Comments you leave on that plan before the revision step are folded into the revision** alongside the reviewer's feedback — so a human reading the plan can steer it without waiting for a separate approval gate. Any comment posted after the plan that doesn't start with a pipeline header (`## Implementation Plan`, `## Plan Review`, `## Pipeline:`, …) is treated as human input; the practical window is the reviewer-harness run (comments that land after the revision starts are picked up on the next trigger).
+When `plan_review` is on, the pipeline posts the plan as an `## Implementation Plan` issue comment and runs agent plan review via the configured reviewer / secondary harness. When that reviewer is available, this is **independent agent plan review** — the plan-review control when the step is enabled, agent evidence, **not** human approval or human sign-off. If the reviewer CLI is missing or unspawnable, the [same-harness fallback](#prerequisites) applies instead: the implementing harness reviews its own plan, and the posted `## Plan Review` is **prominently labeled as a same-harness self-review**. That degraded path is still plan-review evidence and still advances (the pipeline never merges), but it is **not** independent agent plan review — do not treat a self-review label as cross-harness control.
 
-The revised plan comment attributes contributors with a `**Human feedback from**: @login, …` line, and the revision **must** end with a `## Human Feedback Acknowledgement` section listing each commenter as `addressed — <reason>` or `declined — <reason>` — a revision missing it is **blocked**. With no human comments present, behavior is byte-for-byte identical to before (no extra section, no attribution line). The feature is a no-op when `plan_review` is disabled.
+During the **human feedback window** after the plan is posted, comments you leave before the revision step are optional steering: they are folded into the revision alongside the reviewer's feedback. Any comment posted after the plan that doesn't start with a pipeline header (`## Implementation Plan`, `## Plan Review`, `## Pipeline:`, …) is treated as human input; the practical window is the reviewer-harness run (comments that land after the revision starts are picked up on the next trigger).
+
+When the feedback window ends with **no** human comments, plan revision proceeds from agent plan-review feedback only (independent reviewer or labeled same-harness self-review, whichever ran): missing human input does **not** block the advance and is **not** recorded as human approval. With no human comments, behavior is byte-for-byte identical to the agent-only path (no extra section, no attribution line).
+
+When human comments are present, the revised plan comment attributes contributors with a `**Human feedback from**: @login, …` line, and the revision **must** end with a `## Human Feedback Acknowledgement` section listing each commenter as `addressed — <reason>` or `declined — <reason>` — a revision missing it is **blocked**. That acknowledgement means the reviser addressed or declined each feedback item; it is not a substitute for separate **human approval** controls (for example the human-owned merge at `ready-to-deploy`). The feature is a no-op when `plan_review` is disabled.
+
+**Authority boundary:** when the reviewer harness runs, independent agent plan review is the plan-review control; when same-harness fallback applies, the labeled self-review is the plan-review evidence and is **not** independent; the human feedback window is optional steering; **human attestation** (pipeline output markers / operator capability attestations) is provenance, not plan sign-off; **human approval / sign-off** remains the merge button at `ready-to-deploy` (and other true human-approval gates such as `needs-human` dispositions).
 
 ### Commit traceability trailers (always on)
 
