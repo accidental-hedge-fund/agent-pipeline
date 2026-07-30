@@ -61,6 +61,7 @@ import {
   type DeltaCeilingFinding,
 } from "./review.ts";
 import {
+  applyAdvisoryCarryForwardRule,
   applySettledSurfaceEvidenceRule,
   buildTrustedOverrideComments,
   extractOverrides,
@@ -70,6 +71,7 @@ import {
   partitionFindings,
   severityRank,
   surfaceKey,
+  type AdvisoryCarryForwardMatch,
   type AlternativeReinstatementMatch,
   type ReversalMatch,
   type UnverifiedSettledSurfaceMatch,
@@ -78,6 +80,8 @@ import {
   buildPriorRoundDigest,
   countDeltaRounds,
   detectSuspectedChurn,
+  priorAdvisoryFindings,
+  priorAdvisorySurfaceFiles,
   settledFindings,
   settledFindingsSurfaceFiles,
   settledFindingsVerification,
@@ -277,13 +281,45 @@ export function supersededDeltaReviewNotice(reviewedSha: string, headSha: string
 }
 
 /**
+ * Pre-merge auto-fix category allowlist (#359, expanded #680).
+ *
+ * Single source of truth for `isAutoFixableFinding` / `allBlockingAutoFixable`
+ * and unit tests — keep this set aligned with the living category matrix in
+ * `openspec/specs/pre-merge-fix-round/spec.md` (and the active change delta
+ * while #680 is in flight).
+ *
+ * Allowlisted (surgical implementer fix needs no product judgment):
+ *   - correctness   — mechanical code defect
+ *   - missing-dep   — wiring/import/package omission
+ *   - concurrency   — race / lock ownership / PID identity / ordering / probe
+ *                     defects (#668 dogfood class)
+ *
+ * Excluded (escalate without auto-fix):
+ *   - security, scope, product-judgment-required, spec-divergence, data-loss,
+ *     observability, and any absent/empty/unrecognized token (fail-closed)
+ */
+export const PRE_MERGE_AUTOFIX_CATEGORIES = [
+  "correctness",
+  "missing-dep",
+  "concurrency",
+] as const;
+
+export type PreMergeAutofixCategory = (typeof PRE_MERGE_AUTOFIX_CATEGORIES)[number];
+
+/** Runtime set backed by {@link PRE_MERGE_AUTOFIX_CATEGORIES}. */
+export const PRE_MERGE_AUTOFIX_CATEGORY_SET: ReadonlySet<string> = new Set(
+  PRE_MERGE_AUTOFIX_CATEGORIES,
+);
+
+/**
  * True iff a blocking finding's category is in the auto-fix allowlist
- * `{ correctness, missing-dep }`. Absent/empty/unknown category → false
- * (fail-closed: auto-fix only on positive signal). (#359)
+ * {@link PRE_MERGE_AUTOFIX_CATEGORIES} (`correctness`, `missing-dep`,
+ * `concurrency`). Absent/empty/unknown category → false (fail-closed: auto-fix
+ * only on positive allowlisted signal). (#359, #680)
  */
 export function isAutoFixableFinding(f: ReviewFinding): boolean {
   const cat = (f.category ?? "").toLowerCase().trim();
-  return cat === "correctness" || cat === "missing-dep";
+  return PRE_MERGE_AUTOFIX_CATEGORY_SET.has(cat);
 }
 
 /**
@@ -1972,14 +2008,22 @@ export async function enforceReviewShaGate(
         priorRoundsDigest = buildPriorRoundDigest(detail.comments, {
           actor, trustedOverrideActors: cfg.trusted_override_actors,
         });
-        // Resolved-finding verification context (#496): the settled findings
-        // from the digest, plus their surfaces' HEAD content, so the delta
-        // reviewer can verify a claimed resolution instead of assuming
-        // persistence. Absent settled history => no read, no context (design.md
-        // Decision 5) — the delta prompt stays byte-identical to before #496.
+        // Resolved-finding verification context (#496) + prior-round advisory
+        // surfaces for carry-forward evidence (#680): the settled findings from
+        // the digest, plus HEAD content for settled and prior-advisory surfaces,
+        // so the delta reviewer (and post-partition demotion) can verify a
+        // claimed resolution / re-raise. Absent both histories => no read, no
+        // context (design.md Decision 5 for #496; fail-closed for #680).
         settledVerification = settledFindingsVerification(priorRoundsDigest);
-        headFiles = settledVerification.length > 0
-          ? await readHeadFilesFn(deltaWorktreePath, targetHead, settledFindingsSurfaceFiles(settledVerification))
+        const priorAdvisoriesForRead = priorAdvisoryFindings(priorRoundsDigest);
+        const headFilePaths = [
+          ...new Set([
+            ...settledFindingsSurfaceFiles(settledVerification),
+            ...priorAdvisorySurfaceFiles(priorAdvisoriesForRead),
+          ]),
+        ].sort();
+        headFiles = headFilePaths.length > 0
+          ? await readHeadFilesFn(deltaWorktreePath, targetHead, headFilePaths)
           : [];
         deltaResult = await runDeltaReviewFn(
           cfg, issueNumber, detail, deltaDiff, deltaWorktreePath, deltaSpecContext,
@@ -2084,6 +2128,30 @@ export async function enforceReviewShaGate(
         }
       }
 
+      // Prior-round advisory carry-forward (#680): a still-blocking finding that
+      // re-raises a prior-round advisory (same surface or stable key) without
+      // citing HEAD-state evidence is demoted rather than fully re-litigated.
+      // Runs AFTER settled-surface demotion so the same unverified re-assertion
+      // is not double-blocked; verified regressions (body cites head) stay
+      // blocking and follow the auto-fix allowlist path.
+      const advisoryCarryForwardDemotions = new Map<string, AdvisoryCarryForwardMatch>();
+      const priorAdvisories = priorAdvisoryFindings(priorRoundsDigest);
+      const carryForwardResult = applyAdvisoryCarryForwardRule(partition.blocking, priorAdvisories, headFiles);
+      partition.blocking = carryForwardResult.blocking;
+      for (const { finding, match } of carryForwardResult.demoted) {
+        partition.advisory.push({ finding, reason: "advisory-carry-forward", advisoryCarryForwardMatch: match });
+        advisoryCarryForwardDemotions.set(findingKey(finding), match);
+        if (deps.runDir) {
+          const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+          await appendEvent(deps.runDir, {
+            schema_version: RUN_SCHEMA_VERSION, type: "advisory_carry_forward", at,
+            finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
+            prior_advisory_key: match.priorKey, prior_round: match.priorRound,
+            matched_by: match.matchedBy,
+          }, deps.runStoreDeps).catch(() => {});
+        }
+      }
+
       // Confidence-trend churn detector (#483): audit-only — labels the posted
       // comment and emits one event, never alters the blocking partition above.
       const churn = detectSuspectedChurn(partition.blocking, priorRoundsDigest);
@@ -2126,6 +2194,7 @@ export async function enforceReviewShaGate(
         alternativeDemotions,
         churn,
         unverifiedSurfaceDemotions,
+        advisoryCarryForwardDemotions,
       );
       // Place the banner AFTER the heading so isDeltaReviewComment (startsWith check)
       // still recognizes the comment on the next pre-merge re-entry (#228 Finding 5).
@@ -2240,8 +2309,15 @@ export async function enforceReviewShaGate(
             });
             const reSettled = settledFindings(reReviewDigest);
             const reSettledVerification = settledFindingsVerification(reReviewDigest);
-            const reHeadFiles = reSettledVerification.length > 0
-              ? await readHeadFilesFn(deltaWorktreePath, newPrHead, settledFindingsSurfaceFiles(reSettledVerification))
+            const rePriorAdvisories = priorAdvisoryFindings(reReviewDigest);
+            const reHeadFilePaths = [
+              ...new Set([
+                ...settledFindingsSurfaceFiles(reSettledVerification),
+                ...priorAdvisorySurfaceFiles(rePriorAdvisories),
+              ]),
+            ].sort();
+            const reHeadFiles = reHeadFilePaths.length > 0
+              ? await readHeadFilesFn(deltaWorktreePath, newPrHead, reHeadFilePaths)
               : [];
             const reResult = await runDeltaReviewFn(
               cfg, issueNumber, detail, reReviewDiff, deltaWorktreePath, deltaSpecContext,
@@ -2266,6 +2342,25 @@ export async function enforceReviewShaGate(
                   schema_version: RUN_SCHEMA_VERSION, type: "settled_surface_unverified", at,
                   finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
                   settled_finding_key: match.settledKey, settling_round: match.settledRound,
+                }, deps.runStoreDeps).catch(() => {});
+              }
+            }
+            // Prior-round advisory carry-forward (#680), mirroring the primary path.
+            const reAdvisoryCarryForwardDemotions = new Map<string, AdvisoryCarryForwardMatch>();
+            const reCarryForwardResult = applyAdvisoryCarryForwardRule(
+              rePartition.blocking, rePriorAdvisories, reHeadFiles,
+            );
+            rePartition.blocking = reCarryForwardResult.blocking;
+            for (const { finding, match } of reCarryForwardResult.demoted) {
+              rePartition.advisory.push({ finding, reason: "advisory-carry-forward", advisoryCarryForwardMatch: match });
+              reAdvisoryCarryForwardDemotions.set(findingKey(finding), match);
+              if (deps.runDir) {
+                const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+                await appendEvent(deps.runDir, {
+                  schema_version: RUN_SCHEMA_VERSION, type: "advisory_carry_forward", at,
+                  finding_key: findingKey(finding), surface: surfaceKey(finding) ?? "",
+                  prior_advisory_key: match.priorKey, prior_round: match.priorRound,
+                  matched_by: match.matchedBy,
                 }, deps.runStoreDeps).catch(() => {});
               }
             }
@@ -2314,6 +2409,7 @@ export async function enforceReviewShaGate(
               undefined,
               undefined,
               reUnverifiedSurfaceDemotions,
+              reAdvisoryCarryForwardDemotions,
             );
             const reComment = reSelfReview
               ? (() => {

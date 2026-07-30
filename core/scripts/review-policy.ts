@@ -25,6 +25,7 @@ import {
   matchSettledFinding,
   type HeadFileState,
   type MatchBasis,
+  type PriorAdvisoryFinding,
   type SettledFinding,
   type SettledFindingVerification,
 } from "./review-history.ts";
@@ -345,6 +346,17 @@ export interface UnverifiedSettledSurfaceMatch {
 }
 
 /**
+ * Audit detail for an `advisory-carry-forward` demotion (#680): which prior-round
+ * advisory finding the demoted finding re-raises, how it matched (`surface` or
+ * stable finding `key`), and the round that recorded the advisory.
+ */
+export interface AdvisoryCarryForwardMatch {
+  priorKey: string;
+  priorRound: number;
+  matchedBy: "surface" | "key";
+}
+
+/**
  * Decides whether `finding`'s surface matches ANY entry in `settled` (#496),
  * independent of key/title (unlike {@link matchSettledFinding}, which requires
  * the SAME defect — key or title-similarity — on top of surface identity).
@@ -474,14 +486,90 @@ export function applySettledSurfaceEvidenceRule(
   return { blocking: stillBlocking, demoted };
 }
 
+/**
+ * Match a still-blocking finding against prior-round **advisory** dispositions
+ * (#680). Prefers same-surface identity; falls back to stable finding key.
+ * When multiple priors match, the most recent round wins. Pure: no I/O.
+ */
+export function matchPriorAdvisory(
+  finding: Pick<ReviewFinding, "file" | "category" | "severity" | "title" | "line_start">,
+  priors: PriorAdvisoryFinding[],
+): AdvisoryCarryForwardMatch | null {
+  if (priors.length === 0) return null;
+  const fSurface = surfaceKey(finding);
+  const fKey = findingKey(finding);
+  let best: { prior: PriorAdvisoryFinding; matchedBy: "surface" | "key" } | null = null;
+  for (const prior of priors) {
+    let matchedBy: "surface" | "key" | null = null;
+    if (fSurface !== null && prior.surface !== null && prior.surface === fSurface) {
+      matchedBy = "surface";
+    } else if (prior.key === fKey) {
+      matchedBy = "key";
+    }
+    if (matchedBy === null) continue;
+    if (best === null || prior.round > best.prior.round) {
+      best = { prior, matchedBy };
+    }
+  }
+  return best === null
+    ? null
+    : { priorKey: best.prior.key, priorRound: best.prior.round, matchedBy: best.matchedBy };
+}
+
+/** One finding demoted by {@link applyAdvisoryCarryForwardRule}. */
+export interface AdvisoryCarryForwardDemotion {
+  finding: ReviewFinding;
+  match: AdvisoryCarryForwardMatch;
+}
+
+/**
+ * Prior-round advisory carry-forward (#680): moves any still-blocking finding
+ * that re-raises a prior-round advisory (same surface or stable key) and cites
+ * no HEAD-state evidence out of `blocking`. Reuses the same evidence bar as
+ * {@link applySettledSurfaceEvidenceRule}. A no-op when `priors` is empty.
+ * Called AFTER settled-surface demotion so a finding already demoted there is
+ * not reconsidered; does not auto-dismiss by category alone (security that
+ * still has head evidence remains blocking and follows the allowlist path).
+ */
+export function applyAdvisoryCarryForwardRule(
+  blocking: ReviewFinding[],
+  priors: PriorAdvisoryFinding[],
+  headFiles: HeadFileState[],
+): { blocking: ReviewFinding[]; demoted: AdvisoryCarryForwardDemotion[] } {
+  if (priors.length === 0) return { blocking, demoted: [] };
+  const stillBlocking: ReviewFinding[] = [];
+  const demoted: AdvisoryCarryForwardDemotion[] = [];
+  for (const f of blocking) {
+    const match = matchPriorAdvisory(f, priors);
+    if (!match) {
+      stillBlocking.push(f);
+      continue;
+    }
+    if (citesHeadFileEvidence(f.body ?? "", headFiles, f.file ?? "") || citesAbsentHeadFile(f, headFiles)) {
+      stillBlocking.push(f);
+      continue;
+    }
+    demoted.push({ finding: f, match });
+  }
+  return { blocking: stillBlocking, demoted };
+}
+
 export interface PartitionResult {
   /** Findings that block: at/above threshold, at/above confidence, not overridden. */
   blocking: ReviewFinding[];
   /** Below the severity threshold or confidence floor — recorded, not blocking.
    *  `reversalMatch` is present iff `reason === "reversal-unacknowledged"`.
    *  `alternativeMatch` is present iff `reason === "settled-alternative-reinstated"`.
-   *  `unverifiedSurfaceMatch` is present iff `reason === "settled-surface-unverified"`. */
-  advisory: { finding: ReviewFinding; reason: string; reversalMatch?: ReversalMatch; alternativeMatch?: AlternativeReinstatementMatch; unverifiedSurfaceMatch?: UnverifiedSettledSurfaceMatch }[];
+   *  `unverifiedSurfaceMatch` is present iff `reason === "settled-surface-unverified"`.
+   *  `advisoryCarryForwardMatch` is present iff `reason === "advisory-carry-forward"`. */
+  advisory: {
+    finding: ReviewFinding;
+    reason: string;
+    reversalMatch?: ReversalMatch;
+    alternativeMatch?: AlternativeReinstatementMatch;
+    unverifiedSurfaceMatch?: UnverifiedSettledSurfaceMatch;
+    advisoryCarryForwardMatch?: AdvisoryCarryForwardMatch;
+  }[];
   /** Operator-dispositioned via a `pipeline-override` or `pipeline-override-scope`
    *  sentinel — not blocking. Discriminated by `kind`. */
   overridden: OverriddenEntry[];
