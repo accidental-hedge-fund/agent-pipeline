@@ -48,8 +48,14 @@ export interface MergeQueueOpts {
   /**
    * When true, perform merges. When false (default), dry-run: plan only.
    * Commander `--apply` sets this true; bare dry-run is the safe default.
+   * Superseded when `dryRun` is true (explicit `--dry-run` forces plan-only).
    */
   apply: boolean;
+  /**
+   * Explicit CLI `--dry-run`. When true, forces plan-only mode even if
+   * `apply` is also true — dry-run always wins over apply.
+   */
+  dryRun?: boolean;
   /** CLI `--release-when-complete` flag. */
   releaseWhenComplete?: boolean;
   /** CLI `--release-version` (major|minor|patch|X.Y.Z). */
@@ -108,7 +114,10 @@ export interface MergeQueueResult {
 const R2D_LABEL = "pipeline:ready-to-deploy";
 
 /**
- * Resolve the open same-repo PR number that closes `issueNumber`, or null.
+ * Resolve the open same-repo PR number that closes `issueNumber`, or null when
+ * the issue has no open closing PR. Lookup / parse failures throw so callers
+ * fail closed rather than treating an R2D issue as a non-candidate (which would
+ * falsely empty the queue for release-when-complete completeness).
  * Uses `gh pr list --search "closing:N"` shape already used elsewhere.
  */
 function resolveOpenPrForIssue(
@@ -134,12 +143,20 @@ function resolveOpenPrForIssue(
     ],
     { encoding: "utf8", stdio: "pipe", cwd: repoDir },
   );
-  if (result.status !== 0) return null;
+  if (result.status !== 0) {
+    throw new Error(
+      `[merge-queue] gh pr list failed for issue #${issueNumber} ` +
+        `(exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+    );
+  }
   try {
     const items = JSON.parse(result.stdout.trim() || "[]") as Array<{ number: number }>;
     return items.length > 0 ? items[0].number : null;
-  } catch {
-    return null;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `[merge-queue] failed to parse gh pr list for issue #${issueNumber}: ${detail}`,
+    );
   }
 }
 
@@ -263,7 +280,8 @@ export async function runMergeQueue(
     opts.releaseWhenComplete,
     opts.releaseWhenCompleteConfig,
   );
-  const dryRun = !opts.apply;
+  // Explicit --dry-run forces plan-only even when --apply is also present.
+  const dryRun = opts.dryRun === true || !opts.apply;
 
   // Usage gate before any merge or release mutation.
   if (enabled && (!opts.releaseVersion || opts.releaseVersion.trim() === "")) {

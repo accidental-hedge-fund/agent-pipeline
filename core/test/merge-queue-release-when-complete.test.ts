@@ -528,3 +528,107 @@ test("runMergeQueue: hook does not expose tag/npm/merge-release operations", asy
   assert.equal(deps.releaseCalls[0]?.opts.noEdit, true);
 });
 
+// ---------------------------------------------------------------------------
+// Review 1 regressions (#676): dry-run overrides apply; PR lookup fail-closed
+// ---------------------------------------------------------------------------
+
+test("runMergeQueue: --apply + --dry-run forces dry-run (no merges, no release)", async () => {
+  // Finding 4df8287d: dry-run must win over apply so operators who pass both
+  // never perform live sequential merges or release prepare.
+  const deps = makeMergeQueueDeps({
+    candidates: [{ issueNumber: 1, prNumber: 10, title: "would merge" }],
+    remainingAfterApply: [],
+  });
+  const result = await runMergeQueue(
+    {
+      ...baseOpts,
+      apply: true,
+      dryRun: true,
+      releaseWhenComplete: true,
+      releaseVersion: "minor",
+    },
+    deps,
+  );
+  assert.equal(result.mode, "dry-run");
+  assert.equal(deps.mergeCalls.length, 0, "must not merge when dryRun is set");
+  assert.equal(deps.releaseCalls.length, 0, "must not call runRelease when dryRun is set");
+  // Non-empty current queue → would-not-prepare (dry-run uses current state).
+  assert.equal(result.release.status, "skipped");
+  assert.ok(result.release.skipReason?.includes("remaining"));
+});
+
+test("runMergeQueue: --apply + --dry-run on already-complete queue still does not prepare", async () => {
+  const deps = makeMergeQueueDeps({
+    candidates: [],
+    remainingAfterApply: [],
+  });
+  const result = await runMergeQueue(
+    {
+      ...baseOpts,
+      apply: true,
+      dryRun: true,
+      releaseWhenComplete: true,
+      releaseVersion: "1.2.3",
+    },
+    deps,
+  );
+  assert.equal(result.mode, "dry-run");
+  assert.equal(deps.mergeCalls.length, 0);
+  assert.equal(deps.releaseCalls.length, 0, "would_prepare must not invoke runRelease");
+  assert.equal(result.release.status, "would_prepare");
+});
+
+test("runMergeQueue: PR discovery failure during completion re-query skips release prepare", async () => {
+  // Finding 7254b2e7: a failed PR lookup must not empty the remaining-candidate
+  // set and falsely mark the queue complete (which would prepare a release).
+  const mergeCalls: MergeQueueCandidate[] = [];
+  const releaseCalls: Array<{ version: string; opts: { dryRun?: boolean; noEdit?: boolean } }> = [];
+  const logs: string[] = [];
+  const errors: string[] = [];
+  let listCount = 0;
+  const deps: MergeQueueDeps = {
+    async listR2dCandidates() {
+      listCount += 1;
+      if (listCount === 1) {
+        return [{ issueNumber: 7, prNumber: 70, title: "merged then re-query fails" }];
+      }
+      // Simulate gh pr list failure during post-drive completeness re-query.
+      throw new Error(
+        "[merge-queue] gh pr list failed for issue #7 (exit 1): API rate limit",
+      );
+    },
+    async listOpenNonCandidates() {
+      return [];
+    },
+    async mergeCandidate(c) {
+      mergeCalls.push(c);
+    },
+    async runRelease(version, opts) {
+      releaseCalls.push({ version, opts });
+    },
+    log(msg) {
+      logs.push(msg);
+    },
+    error(msg) {
+      errors.push(msg);
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      runMergeQueue(
+        {
+          ...baseOpts,
+          apply: true,
+          releaseWhenComplete: true,
+          releaseVersion: "minor",
+        },
+        deps,
+      ),
+    /gh pr list failed for issue #7/,
+  );
+  assert.equal(mergeCalls.length, 1, "merge already performed must remain done");
+  assert.equal(releaseCalls.length, 0, "must not prepare release when re-query fails");
+  assert.equal(listCount, 2, "re-query must have been attempted");
+});
+

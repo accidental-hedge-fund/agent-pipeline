@@ -2900,6 +2900,8 @@ async function main(): Promise<void> {
         {
           milestone: String(opts.milestone).trim(),
           apply: !!opts.apply,
+          // Explicit --dry-run forces plan-only even when combined with --apply.
+          dryRun: !!opts.dryRun,
           releaseWhenComplete: !!opts.releaseWhenComplete,
           releaseVersion: opts.releaseVersion,
           releaseWhenCompleteConfig: mqCfg.merge_queue?.release_when_complete ?? false,
