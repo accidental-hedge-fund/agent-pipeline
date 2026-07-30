@@ -376,10 +376,12 @@ test("pre-merge auto-fix #680: concurrency with prior auto-fix commit → exhaus
   await quiet(t, async () => {
     out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
   });
-  assert.deepEqual(
-    out,
-    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
-  );
+  assert.equal(out?.advanced, false);
+  assert.equal(out?.status, "blocked");
+  assert.equal(out?.reason, "pre-merge delta review: blocking findings");
+  // #683 attaches blockerKind / offrampPathTag for scoreboard offramp_class
+  assert.equal(out?.blockerKind, "needs-human");
+  assert.equal(out?.offrampPathTag, "delta-review");
   assert.equal(rec.autoFixCalls, 0, "one-attempt bound: no second concurrency auto-fix");
   assert.equal(rec.blocked.length, 1);
 });
