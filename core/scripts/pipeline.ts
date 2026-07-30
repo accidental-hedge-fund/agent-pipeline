@@ -802,13 +802,43 @@ export function buildTerminalLinkagePayload(
  *  child process. The blocker discriminator is the canonical `BLOCKED_LABEL` (`"blocked"`, the
  *  exact string `gh.ts` applies) — NOT `${LABEL_PREFIX}blocked`, which is never written. The
  *  old wrong name here mapped a real needs-human block to `failed`, which the supervisor then
- *  classified as workflow-engine-defect and run_fataled the whole run (#616). */
-export function classifyDispatchOutcome(detail: { labels: readonly string[]; state: string }): LoopExecutionResponse["outcome"] {
+ *  classified as workflow-engine-defect and run_fataled the whole run (#616).
+ *
+ *  Optional `lastBlockerKind` (from the advance `blocker_set` event) distinguishes pure
+ *  worktree capacity (#718) from product needs-human when both carry the `blocked` label. */
+export function classifyDispatchOutcome(
+  detail: { labels: readonly string[]; state: string },
+  lastBlockerKind?: string | null,
+): LoopExecutionResponse["outcome"] {
   const readyLabel = `${LABEL_PREFIX}ready-to-deploy`;
   if (detail.labels.includes(readyLabel)) return "ready_to_deploy";
-  if (detail.labels.includes(BLOCKED_LABEL)) return "blocked_needs_human";
+  if (detail.labels.includes(BLOCKED_LABEL)) {
+    if (lastBlockerKind === "worktree-capacity") return "capacity_wait";
+    return "blocked_needs_human";
+  }
   if (detail.state === "closed") return "abandoned";
   return "failed";
+}
+
+/**
+ * Read the last `blocker_kind` from an advance events.jsonl body (#718).
+ * Pure over the raw text so unit tests need no filesystem.
+ */
+export function lastBlockerKindFromEventsJsonl(eventsText: string): string | null {
+  let last: string | null = null;
+  for (const line of eventsText.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const ev = JSON.parse(trimmed) as { type?: string; blocker_kind?: string };
+      if (ev.type === "blocker_set" && typeof ev.blocker_kind === "string" && ev.blocker_kind.length > 0) {
+        last = ev.blocker_kind;
+      }
+    } catch {
+      /* skip malformed lines */
+    }
+  }
+  return last;
 }
 
 /** Injectable deps for {@link realDispatchItem} — unit tests never spawn a real
@@ -818,6 +848,11 @@ export interface RealDispatchItemDeps {
   now?: () => Date;
   getIssueDetail?: typeof getIssueDetail;
   getPrForIssue?: typeof getPrForIssue;
+  /**
+   * Clear the product `blocked` label after a pure capacity disposition so the
+   * issue is re-admissible once a slot frees (#718). Injected for unit tests.
+   */
+  clearBlocked?: typeof clearBlocked;
   scriptPath?: string;
   execPath?: string;
   /**
@@ -825,6 +860,11 @@ export interface RealDispatchItemDeps {
    * Defaults to `existsSync`. Injected so unit tests never touch the real FS.
    */
   eventsPathExists?: (eventsPath: string) => boolean;
+  /**
+   * Read advance events.jsonl text for capacity-vs-product disposition (#718).
+   * Defaults to fs.readFileSync when the path exists.
+   */
+  readEventsText?: (eventsPath: string) => string | null;
   /** Poll interval (ms) while waiting for store init during the child wait. */
   storeReadyPollMs?: number;
 }
@@ -838,9 +878,19 @@ export function realDispatchItem(
   const nowFn = deps.now ?? (() => new Date());
   const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
   const getPrForIssueFn = deps.getPrForIssue ?? getPrForIssue;
+  const clearBlockedFn = deps.clearBlocked ?? clearBlocked;
   const scriptPath = deps.scriptPath ?? fileURLToPath(import.meta.url);
   const execPath = deps.execPath ?? process.execPath;
   const eventsPathExistsFn = deps.eventsPathExists ?? ((p: string) => existsSync(p));
+  const readEventsTextFn =
+    deps.readEventsText ??
+    ((p: string): string | null => {
+      try {
+        return readFileSync(p, "utf8");
+      } catch {
+        return null;
+      }
+    });
   const storeReadyPollMs = deps.storeReadyPollMs ?? 50;
 
   return async (request, hooks): Promise<LoopExecutionResponse> => {
@@ -941,7 +991,20 @@ export function realDispatchItem(
     let prNumber: number | null = null;
     try {
       const detail = await getIssueDetailFn(cfg, issueNumber);
-      outcome = classifyDispatchOutcome(detail);
+      // Prefer the advance run's last blocker_kind so pure capacity (#718) is
+      // not classified as product needs-human when the blocked label is set.
+      let lastKind: string | null = null;
+      if (pin && storeReady) {
+        const text = readEventsTextFn(pin.events_path);
+        if (text !== null) lastKind = lastBlockerKindFromEventsJsonl(text);
+      }
+      outcome = classifyDispatchOutcome(detail, lastKind);
+      // Pure capacity is ops admission, not a product block: clear the label so
+      // re-admission after a slot frees does not thrash on an already-blocked
+      // early-exit (#718). The capacity recipe remains on the issue comment.
+      if (outcome === "capacity_wait") {
+        await clearBlockedFn(cfg, issueNumber).catch(() => {});
+      }
       const pr = await getPrForIssueFn(cfg, issueNumber).catch(() => null);
       prNumber = pr ?? null;
     } catch {

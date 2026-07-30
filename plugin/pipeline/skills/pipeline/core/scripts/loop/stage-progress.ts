@@ -267,6 +267,7 @@ export function terminalStageForOutcome(outcome: string): string | null {
     case "ready_to_deploy":
       return "ready-to-deploy";
     case "blocked_needs_human":
+    case "capacity_wait":
       return "blocked";
     case "abandoned":
       return "abandoned";

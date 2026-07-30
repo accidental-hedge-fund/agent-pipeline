@@ -640,6 +640,53 @@ async function realUnlinkPath(p: string): Promise<void> {
   await fs.promises.unlink(p);
 }
 
+// ---------------------------------------------------------------------------
+// Worktree capacity error (#718) — machine-distinguishable admission failure
+// ---------------------------------------------------------------------------
+
+/** Stable identity string for pure worktree capacity refusals. */
+export const WORKTREE_CAPACITY_ERROR_CODE = "worktree-capacity" as const;
+
+/** Message prefix thrown by {@link createWorktree} when other-active worktrees
+ *  are at `max_concurrent_worktrees`. Distinct from dirty-reclaim and git-add
+ *  failures so admission disposition can route capacity as ops, not product. */
+export const WORKTREE_CAPACITY_MESSAGE_PREFIX = "At worktree capacity";
+
+/**
+ * Typed capacity refusal from {@link createWorktree}. Prefer
+ * {@link isWorktreeCapacityError} over free-text scraping.
+ */
+export class WorktreeCapacityError extends Error {
+  readonly code = WORKTREE_CAPACITY_ERROR_CODE;
+  readonly otherActive: number;
+  readonly maxConcurrent: number;
+
+  constructor(otherActive: number, maxConcurrent: number) {
+    super(
+      `${WORKTREE_CAPACITY_MESSAGE_PREFIX} (${otherActive}/${maxConcurrent}). ` +
+        "Wait for an issue to complete before starting new work.",
+    );
+    this.name = "WorktreeCapacityError";
+    this.otherActive = otherActive;
+    this.maxConcurrent = maxConcurrent;
+  }
+}
+
+/** True when `err` is a pure worktree capacity admission failure (#718). */
+export function isWorktreeCapacityError(err: unknown): err is WorktreeCapacityError {
+  if (err instanceof WorktreeCapacityError) return true;
+  if (err !== null && typeof err === "object" && "code" in err) {
+    const code = (err as { code?: unknown }).code;
+    if (code === WORKTREE_CAPACITY_ERROR_CODE) return true;
+  }
+  // Message-prefix fallback for deps/fakes that throw plain Errors with the
+  // stable prefix (tests and older call sites).
+  if (err instanceof Error && err.message.startsWith(WORKTREE_CAPACITY_MESSAGE_PREFIX)) {
+    return true;
+  }
+  return false;
+}
+
 export async function createWorktree(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -842,10 +889,7 @@ export async function createWorktree(
 
   const otherActive = active.filter((r) => r.issueNumber !== issueNumber).length;
   if (otherActive >= cfg.max_concurrent_worktrees) {
-    throw new Error(
-      `At worktree capacity (${otherActive}/${cfg.max_concurrent_worktrees}). ` +
-        "Wait for an issue to complete before starting new work.",
-    );
+    throw new WorktreeCapacityError(otherActive, cfg.max_concurrent_worktrees);
   }
 
   // Ensure the worktree root exists.
@@ -918,6 +962,30 @@ export async function createWorktree(
       throw new Error(`git fetch origin ${cfg.base_branch} failed: ${lastFetchStderr.trim()}`);
     }
 
+    // Prefer an existing remote tip for this pipeline branch when present so
+    // resume after park-release (#718) recreates the worktree at the pushed
+    // head rather than discarding remote commits by branching from base.
+    const lsRemote = await gitFn(
+      cfg,
+      cfg.repo_dir,
+      ["ls-remote", "origin", `refs/heads/${branch}`],
+      { ignoreFailure: true },
+    );
+    const remoteTip =
+      lsRemote.code === 0 && (lsRemote.stdout.trim().split(/\s+/)[0] ?? "").length > 0
+        ? lsRemote.stdout.trim().split(/\s+/)[0]!
+        : null;
+    if (remoteTip) {
+      // Populate the remote-tracking ref so worktree add can start from it.
+      await gitFn(
+        cfg,
+        cfg.repo_dir,
+        ["fetch", "origin", `${branch}:refs/remotes/origin/${branch}`],
+        { ignoreFailure: true },
+      );
+    }
+    const startPoint = remoteTip ? `origin/${branch}` : `origin/${cfg.base_branch}`;
+
     // If the branch exists from a prior failed attempt, delete it.
     await gitFn(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
 
@@ -936,7 +1004,7 @@ export async function createWorktree(
       const { code, stderr } = await gitFn(
         cfg,
         cfg.repo_dir,
-        ["worktree", "add", wtPath, "-b", branch, `origin/${cfg.base_branch}`],
+        ["worktree", "add", wtPath, "-b", branch, startPoint],
         { ignoreFailure: true },
       );
       if (code === 0) {
@@ -1493,6 +1561,225 @@ export async function removeWorktreeForIssue(
     branch,
     worktree: worktreeP,
     error: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Park-release for durable holds (#718)
+// ---------------------------------------------------------------------------
+
+export type ParkReleaseAction = "released" | "retained" | "absent";
+
+export interface ParkReleaseResult {
+  action: ParkReleaseAction;
+  /** Human-readable retain/release reason for operators (log / hold text). */
+  reason: string;
+  branch: string | null;
+  worktree: string | null;
+}
+
+export interface ParkReleaseDeps {
+  listOnDisk?: (cfg: PipelineConfig) => Promise<WorktreeRecord[]>;
+  hasDirtyWorkdir?: (worktreePath: string) => Promise<boolean>;
+  hasLocalOnlyCommits?: (
+    cfg: PipelineConfig,
+    worktreePath: string | null,
+    branch: string,
+  ) => Promise<LocalOnlyCommitResult>;
+  pathExists?: (p: string) => boolean;
+  /** True when branch tip is present on the remote (ls-remote). */
+  hasRemoteBranchTip?: (cfg: PipelineConfig, branch: string) => Promise<boolean>;
+  /** True when an open PR exists for the pipeline head branch. */
+  hasOpenPrForBranch?: (cfg: PipelineConfig, branch: string) => Promise<boolean>;
+  /**
+   * Perform the on-disk remove. Defaults to non-force operator remove path
+   * (worktree remove + local branch delete). Never deletes remote branch/PR.
+   */
+  removeWorktree?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    slug: string,
+    pathOnDisk: boolean,
+    resolvedPath?: string,
+    force?: boolean,
+  ) => Promise<void>;
+}
+
+async function realHasRemoteBranchTip(cfg: PipelineConfig, branch: string): Promise<boolean> {
+  const lsR = await git(cfg, cfg.repo_dir, ["ls-remote", "origin", `refs/heads/${branch}`], {
+    ignoreFailure: true,
+  });
+  if (lsR.code !== 0) return false;
+  const sha = lsR.stdout.trim().split(/\s+/)[0] ?? "";
+  return sha.length > 0;
+}
+
+async function realHasOpenPrForBranch(cfg: PipelineConfig, branch: string): Promise<boolean> {
+  // Lazy import avoids circular init with gh.ts (which imports worktree helpers).
+  const { getPrForBranch } = await import("./gh.ts");
+  try {
+    const prNumber = await getPrForBranch(cfg, branch);
+    return prNumber !== null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * On durable park/hold, release a managed worktree when safe so
+ * `max_concurrent_worktrees` capacity frees for other items (#718 Policy A).
+ *
+ * Safety (fail-closed): under managed root, clean workdir, no definitive
+ * local-only commits, and remote tip **or** open PR for recoverability.
+ * Dirty / local-only / unverifiable / missing-remote parks retain the tree
+ * with a visible reason. Idempotent when no managed worktree is on disk.
+ * Never deletes the remote branch or open PR.
+ */
+export async function releaseWorktreeForParkedIssue(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  deps: ParkReleaseDeps = {},
+): Promise<ParkReleaseResult> {
+  const listFn = deps.listOnDisk ?? listOnDisk;
+  const dirtyFn = deps.hasDirtyWorkdir ?? hasDirtyWorkdir;
+  const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
+  const existsFn = deps.pathExists ?? fs.existsSync;
+  const remoteTipFn = deps.hasRemoteBranchTip ?? realHasRemoteBranchTip;
+  const openPrFn = deps.hasOpenPrForBranch ?? realHasOpenPrForBranch;
+  const removeFn = deps.removeWorktree ?? realRemoveWorktreeOp;
+
+  const records = await listFn(cfg);
+  const legacyRoot = path.resolve(cfg.repo_dir, cfg.worktree_root);
+  const isManaged = (r: WorktreeRecord): boolean =>
+    r.underManagedRoot !== undefined
+      ? r.underManagedRoot
+      : r.path === legacyRoot || r.path.startsWith(legacyRoot + path.sep);
+
+  const matches = records.filter((r) => r.issueNumber === issueNumber && !!r.slug && isManaged(r));
+  if (matches.length === 0) {
+    return {
+      action: "absent",
+      reason: `no managed worktree on disk for issue #${issueNumber}`,
+      branch: null,
+      worktree: null,
+    };
+  }
+  if (matches.length > 1) {
+    const candidates = matches.map((r) => r.path).join(", ");
+    return {
+      action: "retained",
+      reason:
+        `ambiguous: multiple managed worktrees for issue #${issueNumber} (${candidates}); ` +
+        "refusing automatic park-release",
+      branch: null,
+      worktree: null,
+    };
+  }
+
+  const rec = matches[0]!;
+  // Out-of-managed-root records are filtered by isManaged above, but also
+  // refuse explicit underManagedRoot === false if a caller injects raw list.
+  if (rec.underManagedRoot === false) {
+    return {
+      action: "retained",
+      reason: `worktree ${rec.path} is outside the managed root; park-release never auto-removes it`,
+      branch: rec.branch ?? branchName(issueNumber, rec.slug!),
+      worktree: rec.path,
+    };
+  }
+
+  const branch = rec.branch ?? branchName(issueNumber, rec.slug!);
+  const worktreeP = rec.path;
+  const pathOnDisk = existsFn(worktreeP);
+
+  let dirty = false;
+  if (pathOnDisk) {
+    dirty = await dirtyFn(worktreeP);
+  }
+  if (dirty) {
+    return {
+      action: "retained",
+      reason: `dirty worktree at ${worktreeP}; park-release retains uncommitted work`,
+      branch,
+      worktree: worktreeP,
+    };
+  }
+
+  const localOnly = await localOnlyFn(cfg, pathOnDisk ? worktreeP : null, branch);
+  if (localOnly === true) {
+    return {
+      action: "retained",
+      reason: `local-only (unpushed) commits on ${branch}; park-release retains the worktree`,
+      branch,
+      worktree: worktreeP,
+    };
+  }
+  if (localOnly === null) {
+    return {
+      action: "retained",
+      reason:
+        `cannot verify local-only state for ${branch} (git/network/auth); ` +
+        "park-release retains the worktree",
+      branch,
+      worktree: worktreeP,
+    };
+  }
+
+  const hasRemoteTip = await remoteTipFn(cfg, branch);
+  const hasOpenPr = hasRemoteTip ? false : await openPrFn(cfg, branch);
+  // Open PR is an alternate recoverability path when remote-tip verification is
+  // marginal (e.g. unverifiable after squash ambiguity) — still require no
+  // definitive local-only commits (handled above).
+  if (localOnly === "unverifiable" && !hasOpenPr && !hasRemoteTip) {
+    return {
+      action: "retained",
+      reason:
+        `local-only verification unverifiable for ${branch} and no open PR; ` +
+        "park-release retains the worktree",
+      branch,
+      worktree: worktreeP,
+    };
+  }
+  if (!hasRemoteTip && !hasOpenPr) {
+    return {
+      action: "retained",
+      reason:
+        `no remote branch tip and no open PR for ${branch}; ` +
+        "park-release retains the worktree (missing remote recoverability)",
+      branch,
+      worktree: worktreeP,
+    };
+  }
+
+  // Same non-force safety ladder as operator remove / reclaim.
+  const safety = evaluateRemoveSafety({ dirty: false, localOnly, force: false });
+  if (!safety.ok) {
+    return {
+      action: "retained",
+      reason: safety.error,
+      branch,
+      worktree: worktreeP,
+    };
+  }
+
+  try {
+    await removeFn(cfg, issueNumber, rec.slug!, pathOnDisk, worktreeP, false);
+  } catch (err) {
+    return {
+      action: "retained",
+      reason: `park-release remove failed: ${(err as Error).message}`,
+      branch,
+      worktree: worktreeP,
+    };
+  }
+
+  return {
+    action: "released",
+    reason: hasRemoteTip
+      ? `released managed worktree for #${issueNumber} (clean + remote tip on ${branch})`
+      : `released managed worktree for #${issueNumber} (clean + open PR for ${branch})`,
+    branch,
+    worktree: worktreeP,
   };
 }
 

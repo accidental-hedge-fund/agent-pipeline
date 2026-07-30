@@ -294,6 +294,46 @@ async function excludeInProgressItem(
   return newLedger;
 }
 
+/**
+ * Revert a pure worktree-capacity dispatch (#718) from `in_progress` back to
+ * `pending` without a product needs-human hold. The item stays schedulable once
+ * capacity frees (park-release of siblings or active work completing).
+ */
+async function revertCapacityWaitItem(
+  store: LoopStoreDeps,
+  input: { runId: string; token: string; itemId: string; engine: LoopEngineName },
+): Promise<LoopLedger> {
+  const ledger = await readLedger(store, input.runId);
+  const item = ledger.items[input.itemId];
+  if (!item || item.state !== "in_progress") {
+    throw new LoopError(
+      "validation",
+      `item "${input.itemId}" cannot capacity-revert from state "${item?.state}" — only an in_progress item may revert this way`,
+    );
+  }
+  const time = store.now().toISOString();
+  const updated: LoopItemLedgerEntry = {
+    ...item,
+    state: "pending",
+    history: [
+      ...item.history,
+      {
+        time,
+        from: "in_progress",
+        to: "pending",
+        engine: input.engine,
+        note: "worktree capacity admission wait — reverted to pending (no product needs-human hold)",
+      },
+    ],
+  };
+  const newLedger: LoopLedger = { ...ledger, items: { ...ledger.items, [input.itemId]: updated } };
+  await writeLedger(store, newLedger, input.token);
+  await appendEvent(store, input.runId, input.token, "loop_item_capacity_wait", {
+    item_id: input.itemId,
+  });
+  return newLedger;
+}
+
 const DONE_OR_ABANDONED = new Set(["ready", "merged", "released", "deployed", "abandoned", "skipped"]);
 
 /** Every item currently held (`paused`/`waiting`) in `ledger`, sorted for deterministic
@@ -913,13 +953,15 @@ export async function runSupervisorCycle(
     });
   }
 
-  // Pass 2 — items requiring a block-family mutation (parked, blocked_needs_human, failed), which
-  // may record a terminal run stop. A prior item in this pass may already have recorded one; every
-  // subsequent block/classify call below passes `allowAlreadyStopped: true` (#530 review 2 finding
-  // a7abc98c) so it still durably classifies its own item — preserving the first-cause stop record
-  // rather than overwriting it — instead of being refused and left `in_progress` (which would make
-  // it eligible for duplicate dispatch on a later recovery/resume). A stopped run never dispatches
-  // again once this cycle returns, so classifying every sibling here causes no duplicate work.
+  // Pass 2 — items requiring a block-family mutation (parked, blocked_needs_human, capacity_wait,
+  // failed), which may record a terminal run stop. A prior item in this pass may already have
+  // recorded one; every subsequent block/classify call below passes `allowAlreadyStopped: true`
+  // (#530 review 2 finding a7abc98c) so it still durably classifies its own item — preserving the
+  // first-cause stop record rather than overwriting it — instead of being refused and left
+  // `in_progress` (which would make it eligible for duplicate dispatch on a later recovery/resume).
+  // A stopped run never dispatches again once this cycle returns, so classifying every sibling
+  // here causes no duplicate work.
+  const capacityWaitItemIds: string[] = [];
   for (const itemId of activeItemIds) {
     const outcome = outcomeByItem.get(itemId)!;
     if (!parkedItemIds.has(itemId) && (outcome === "ready_to_deploy" || outcome === "abandoned")) continue;
@@ -939,6 +981,13 @@ export async function runSupervisorCycle(
           : "parked for replan: observed changed-file overlap with a concurrently-run item",
         allowAlreadyStopped: true,
       });
+    } else if (outcome === "capacity_wait") {
+      // Pure worktree capacity (#718): ops admission, not product needs-human.
+      // Revert the item to pending and (after this pass) stop admission with
+      // worktree_capacity so remaining pending items are not cascade-labeled.
+      ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });
+      capacityWaitItemIds.push(itemId);
+      evidenceOutcome = "capacity_wait";
     } else if (outcome === "blocked_needs_human") {
       // A needs-human pipeline blocker (#570, capability `loop-needs-human-blocker-disposition`):
       // the standard operator remediation is a one-line unblock + re-run, not an engine defect.
@@ -1073,6 +1122,40 @@ export async function runSupervisorCycle(
       progress: "progress",
       worktree_root: worktreeRootByItem.get(itemId) ?? null,
     });
+  }
+
+  // Residual worktree capacity (#718): one or more dispatches hit pure capacity.
+  // Items were reverted to pending (no product needs-human holds). Stop admitting
+  // further starts with a run-level capacity reason so the loop does not cascade
+  // N sequential capacity human-blocks on every remaining pending item.
+  if (!ledger.stop && capacityWaitItemIds.length > 0) {
+    const time = deps.store.now().toISOString();
+    const stop: LoopStopRecord = {
+      reason: "worktree_capacity",
+      time,
+      item_id: capacityWaitItemIds[0],
+      outstanding_ready: outstandingReadyItemIds(ledger),
+    };
+    ledger = { ...ledger, stop };
+    await writeLedger(deps.store, ledger, token);
+    await appendEvent(deps.store, runId, token, "loop_run_stopped", {
+      reason: "worktree_capacity",
+      capacity_wait_item_ids: capacityWaitItemIds,
+    });
+    await appendActionEvidence(deps.store, runId, token, {
+      item_id: null,
+      action: "stop",
+      outcome: "worktree_capacity",
+      next_action: null,
+      progress: "progress",
+    });
+    return {
+      progress: true,
+      stop,
+      holdOutstanding: false,
+      allDone: false,
+      heldItemIds: heldItemIdsFromLedger(ledger),
+    };
   }
 
   // A hold entered this pass (or still outstanding from an earlier cycle) only becomes the run's

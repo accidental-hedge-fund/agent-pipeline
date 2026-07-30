@@ -24,7 +24,14 @@ import {
   setGhRunId,
   transition,
 } from "./gh.ts";
-import { getOnDiskForIssue, gitInWorktree, branchName } from "./worktree.ts";
+import {
+  getOnDiskForIssue,
+  gitInWorktree,
+  branchName,
+  releaseWorktreeForParkedIssue,
+  type ParkReleaseDeps,
+  type ParkReleaseResult,
+} from "./worktree.ts";
 import { withLock, runStateDir, isLivePlanningActive, tryAcquireLivePlanningMarker } from "./lock.ts";
 import {
   bundlePath,
@@ -208,7 +215,12 @@ export function isAutoLoopRecoverable(out: Outcome): boolean {
   // Missing blockerKind is treated as non-recoverable (same as needs-human):
   // the pipeline cannot determine a recovery recipe for an unannotated blocker.
   if (!out.blockerKind) return false;
-  return out.blockerKind !== "needs-human";
+  // Capacity is an ops admission wait — re-driving the auto-loop cannot free
+  // slots and would only thrash (#718). Product needs-human also stays out.
+  if (out.blockerKind === "needs-human" || out.blockerKind === "worktree-capacity") {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -257,6 +269,61 @@ export interface AdvanceDeps {
   /** Seam over `probeEngineIdentity` (#450) — re-read at each stage boundary
    *  and compared against the pinned identity to detect mid-run drift. */
   probeEngineIdentity?: () => EngineIdentity | null;
+  /**
+   * Park-release hook (#718): free a safe managed worktree when the advance
+   * durable-parks so capacity is not stranded. Injected for unit tests.
+   */
+  releaseParkedWorktree?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    parkDeps?: ParkReleaseDeps,
+  ) => Promise<ParkReleaseResult>;
+}
+
+/**
+ * Whether a non-advancing outcome is a durable park that should attempt
+ * park-release (#718). Transient auto-loop-eligible waits/blocks that will
+ * re-enter the harness in-process must not release.
+ */
+export function isDurableParkOutcome(out: Outcome): boolean {
+  if (out.advanced) return false;
+  if (out.status === "blocked") return true;
+  if (out.status === "finalized") {
+    // needs-human terminal and ready-to-deploy both finalize; deploy_ready
+    // already removes the worktree, and release is idempotent when absent.
+    return true;
+  }
+  // waiting / no-op / error: waiting may be mid-process CI or cross-domain
+  // planning contention — do not release; error is not a deliberate park.
+  return false;
+}
+
+/** Best-effort park-release; never throws into the advance loop. */
+export async function maybeReleaseWorktreeOnPark(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  out: Outcome,
+  dryRun: boolean,
+  deps: AdvanceDeps = {},
+): Promise<ParkReleaseResult | null> {
+  if (dryRun || !isDurableParkOutcome(out)) return null;
+  // Capacity-only blocks never created a worktree; release is a no-op absent.
+  // Still safe to call for other blocked kinds that may hold a tree.
+  const releaseFn = deps.releaseParkedWorktree ?? releaseWorktreeForParkedIssue;
+  try {
+    const result = await releaseFn(cfg, issueNumber);
+    if (result.action === "released") {
+      console.log(`[pipeline] #${issueNumber}: park-release: ${result.reason}`);
+    } else if (result.action === "retained") {
+      console.log(`[pipeline] #${issueNumber}: park-release retained: ${result.reason}`);
+    }
+    return result;
+  } catch (err) {
+    console.log(
+      `[pipeline] #${issueNumber}: park-release failed (non-fatal): ${(err as Error).message}`,
+    );
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +882,14 @@ export async function runAdvance(
             `or fix the residual findings and relabel pipeline:needs-human → ${resumeLabel} to resume.`,
         );
         if (ceiling) console.log(ceiling.body);
+        // Already parked: free capacity when the managed worktree is safe (#718).
+        await maybeReleaseWorktreeOnPark(
+          cfg,
+          issueNumber,
+          { advanced: false, status: "finalized", reason: "needs-human" },
+          !!opts.dryRun,
+          deps,
+        );
         break;
       }
 
@@ -839,6 +914,14 @@ export async function runAdvance(
         }
         console.log(
           `[pipeline] #${issueNumber}: follow the "### How to unblock" steps in the comment above to resume.`,
+        );
+        // Already blocked: free capacity when the managed worktree is safe (#718).
+        await maybeReleaseWorktreeOnPark(
+          cfg,
+          issueNumber,
+          { advanced: false, status: "blocked", reason: "already blocked" },
+          !!opts.dryRun,
+          deps,
         );
         break;
       }
@@ -1087,6 +1170,10 @@ export async function runAdvance(
             }, runStoreDeps).catch(() => {});
           }
         }
+        // Durable park sink (#718): free a safe managed worktree so capacity is
+        // not stranded while this issue waits. Mid-process auto-loop continues
+        // above never reach this path.
+        await maybeReleaseWorktreeOnPark(cfg, issueNumber, out, !!opts.dryRun, deps);
         break;
       }
 
