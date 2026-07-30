@@ -213,11 +213,13 @@ export function isAutoLoopRecoverable(out: Outcome): boolean {
 
 /**
  * Decide whether the auto-loop should continue past this outcome at this stage.
- * `plan-review` and `shipcheck-gate` are human-judgment checkpoints and are never
- * eligible even when allowlisted: plan-review's `waiting` return means "a human
- * must review the plan", and a shipcheck verdict failure must not be silently
- * re-run on reviewer nondeterminism (#302) — a failed shipcheck requires a human
- * disposition, not an automatic retry that could flip to pass on a later pass.
+ * `plan-review` and `shipcheck-gate` are never auto-loop eligible even when
+ * allowlisted. Plan-review is an independent-agent review step with an optional
+ * human feedback window — not a recovery-retry surface and not a human sign-off
+ * gate — so the auto-loop must not re-drive it. A shipcheck verdict failure must
+ * not be silently re-run on reviewer nondeterminism (#302): a failed shipcheck
+ * requires a human disposition, not an automatic retry that could flip to pass
+ * on a later pass.
  */
 export function isAutoLoopEligible(
   out: Outcome,
