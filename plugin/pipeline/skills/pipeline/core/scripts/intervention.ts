@@ -183,6 +183,7 @@ export function summarizeInterventions(
 export function blockerKindToInterventionKind(kind: BlockerKind): HumanInterventionKind {
   switch (kind) {
     case "test-gate-exhausted":
+    case "ci-exhausted":
     case "no-commits":
     case "push-failed":
     case "build-failed":
