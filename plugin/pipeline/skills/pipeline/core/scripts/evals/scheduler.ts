@@ -36,7 +36,12 @@ export function scheduleCells(cells: Cell[], seed: number): Cell[] {
   const bucketOrder: string[] = [];
   const buckets = new Map<string, Cell[]>();
   for (const cell of shuffled) {
-    const key = cell.treatment.harness ?? "_no-harness-axis";
+    // Named-pair cells surface primary.harness (and copy it onto treatment.harness
+    // at expansion); prefer primary when present so pair cells still affinity-group.
+    const key =
+      cell.treatment.primary?.harness ??
+      cell.treatment.harness ??
+      "_no-harness-axis";
     if (!buckets.has(key)) {
       buckets.set(key, []);
       bucketOrder.push(key);

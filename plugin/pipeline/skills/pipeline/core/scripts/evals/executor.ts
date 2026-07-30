@@ -29,21 +29,23 @@ import {
   removeBoundaryShim as removeBoundaryShimReal,
 } from "./boundary-shim.ts";
 import { materializeStagePrompt, stagesForMode } from "./stage-adapters.ts";
+import { runPairedCellLoop } from "./paired-loop.ts";
 import { isJsonVerdictShaped, parseProseReview, parseStrictVerdict, parseStructuredVerdict } from "../stages/review-parsing.ts";
 import type { BuildTreatmentTrajectoryInput, RawStageEntry } from "./trajectory/collect.ts";
-import type {
-  BoundaryDenial,
-  BoundaryEvidence,
-  Cell,
-  CellExecutionClass,
-  CellOutcome,
-  EnvironmentDependency,
-  EvalStageName,
-  ExperimentManifest,
-  Fixture,
-  ReviewVerdictParseProvenance,
-  SandboxMode,
-  Treatment,
+import {
+  isPairedEvalMode,
+  type BoundaryDenial,
+  type BoundaryEvidence,
+  type Cell,
+  type CellExecutionClass,
+  type CellOutcome,
+  type EnvironmentDependency,
+  type EvalStageName,
+  type ExperimentManifest,
+  type Fixture,
+  type ReviewVerdictParseProvenance,
+  type SandboxMode,
+  type Treatment,
 } from "./types.ts";
 
 function sanitizeForPath(cellId: string): string {
@@ -292,6 +294,9 @@ export interface CellExecutionDeps {
    *  given worktree. Only invoked when the fixture declares
    *  `allowed_change_paths` (out-of-scope-change grading needs it). */
   getChangedPaths?: (args: { worktreeDir: string; baseSha: string }) => Promise<string[]>;
+  /** Full unified diff text for the worktree vs baseSha — used by paired modes
+   *  so the reviewer sees the actual primary implementation (#601). */
+  getDiff?: (args: { worktreeDir: string; baseSha: string }) => Promise<string>;
   /** Dispatch an API treatment through a named `model-endpoint` executor
    *  (#434 task 6). Only invoked when the cell's treatment declares
    *  `executor`. */
@@ -359,6 +364,49 @@ async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: stri
     return stdout.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
   } catch {
     return [];
+  }
+}
+
+async function defaultGetDiff(args: { worktreeDir: string; baseSha: string }): Promise<string> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileAsync = promisify(execFile);
+  try {
+    // Include unstaged/untracked worktree edits the primary made without committing
+    // (paired implement/fix prompts forbid commits).
+    const { stdout: tracked } = await execFileAsync("git", ["diff", args.baseSha], {
+      cwd: args.worktreeDir,
+      timeout: 30_000,
+      maxBuffer: 20 * 1024 * 1024,
+    });
+    let untracked = "";
+    try {
+      const { stdout: names } = await execFileAsync(
+        "git",
+        ["ls-files", "--others", "--exclude-standard"],
+        { cwd: args.worktreeDir, timeout: 30_000 },
+      );
+      const files = names.split("\n").map((l) => l.trim()).filter(Boolean);
+      for (const file of files.slice(0, 50)) {
+        try {
+          const { stdout: content } = await execFileAsync("git", ["diff", "--no-index", "--", "/dev/null", file], {
+            cwd: args.worktreeDir,
+            timeout: 10_000,
+            maxBuffer: 2 * 1024 * 1024,
+          });
+          untracked += content;
+        } catch (err) {
+          // git diff --no-index exits 1 when files differ — stdout still holds the diff.
+          const e = err as { stdout?: string };
+          if (e.stdout) untracked += e.stdout;
+        }
+      }
+    } catch {
+      // Best-effort untracked inclusion.
+    }
+    return `${tracked}${untracked}`;
+  } catch {
+    return "";
   }
 }
 
@@ -561,7 +609,10 @@ export async function runCell(
 
   const stages: EvalStageName[] = stagesForMode(cell.mode, fixture);
   const prompts = stages.map((stage) => materializeStagePrompt(stage, fixture));
-  const materializedPrompt = prompts.join("\n\n---\n\n");
+  // Paired modes materialize live prompts during the loop; placeholder for hash until then.
+  let materializedPrompt = isPairedEvalMode(cell.mode)
+    ? `paired:${cell.mode}:${cell.treatment_id}`
+    : prompts.join("\n\n---\n\n");
   const effectiveConfig: Record<string, unknown> = {
     mode: cell.mode,
     treatment: cell.treatment,
@@ -731,6 +782,74 @@ export async function runCell(
         return finish({ result_class: "infra_error", error });
       }
       trajectoryActions.push(`ran setup for simulated dependency ${JSON.stringify(dep.name)}`);
+    }
+
+    // Paired multi-role graphs (#601): keep the eval contract + command boundary
+    // installed across every primary/reviewer invocation; restore only after
+    // the loop returns (below), for clean checks/changed-path collection.
+    if (isPairedEvalMode(cell.mode)) {
+      const cellDeadlineMs = Date.now() + manifest.timeout * 1000;
+      const getDiffFn = deps.getDiff ?? defaultGetDiff;
+      const paired = await runPairedCellLoop({
+        cfg,
+        cell,
+        fixture,
+        manifest,
+        worktreeDir: identity.worktreePath,
+        gh: ghSurface,
+        cellDeadlineMs,
+        trajectoryActions,
+        trajectoryStages,
+        deps: {
+          invokeHarness: invokeHarnessFn,
+          preflight: preflightFn,
+          getDiff: getDiffFn,
+          isolationEnv: evalIsolationEnv,
+          classifyPostInvocationFailure: (result, harness, req) =>
+            classifyPostInvocationFailure(result, preflightFn, harness, req),
+        },
+      });
+      materializedPrompt = paired.materializedPrompt || materializedPrompt;
+      if (paired.outcome.result_class !== "completed") {
+        return finish(paired.outcome);
+      }
+
+      // Restore contract only after the last harness invocation for clean evidence.
+      restoreContractIfNeeded();
+
+      const detail: Record<string, unknown> = { ...(paired.outcome.detail ?? {}), execution_class: "local-cli" as CellExecutionClass };
+      const allChecks = [...fixture.public_checks, ...(fixture.hidden_checks ?? [])];
+      if (allChecks.length > 0) {
+        const remainingForChecks = cellDeadlineMs - Date.now();
+        if (remainingForChecks <= 0) {
+          const error = `cell exceeded its ${manifest.timeout}s per-cell timeout before checks could start`;
+          trajectoryActions.push(error);
+          return finish({ result_class: "timeout", error, detail });
+        }
+        const runChecksFn = deps.runChecks ?? defaultRunChecks;
+        detail.checks = await runChecksFn({
+          worktreeDir: identity.worktreePath,
+          checks: allChecks,
+          deadlineMs: remainingForChecks,
+        });
+        trajectoryActions.push(`ran ${allChecks.length} check(s) in the cell's worktree`);
+        if (Date.now() > cellDeadlineMs) {
+          const error = `cell exceeded its ${manifest.timeout}s per-cell timeout while running checks`;
+          trajectoryActions.push(error);
+          return finish({ result_class: "timeout", error, detail });
+        }
+      }
+      if (fixture.allowed_change_paths !== undefined) {
+        const getChangedPathsFn = deps.getChangedPaths ?? defaultGetChangedPaths;
+        const changedPaths = await getChangedPathsFn({
+          worktreeDir: identity.worktreePath,
+          baseSha: cell.base_sha,
+        });
+        const excludedFromChangedPaths = new Set<string>(EVAL_AGENT_CONTRACT_PATHS);
+        detail.changed_paths = changedPaths.filter((p) => !excludedFromChangedPaths.has(p));
+      }
+      if (environmentDetail !== undefined) detail.environment = environmentDetail;
+      return finish({ result_class: "completed", detail });
     }
 
     // API treatment path (#434 task 6): the cell binds to a named
