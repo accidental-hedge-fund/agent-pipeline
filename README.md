@@ -1,6 +1,6 @@
 # agent-pipeline
 
-**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 16-stage state machine — backlog → ready → planning → plan-review → implementing → design-gate → review → fix → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy, with `needs-human` as a terminal off-ramp. It does **not** auto-merge; you own the merge button.
+**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 16-stage state machine — backlog → ready → planning → plan-review → implementing → design-gate → review-1 → fix-1 → review-2 → fix-2 → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy, with `needs-human` as a terminal off-ramp. It does **not** auto-merge; you own the merge button.
 
 It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)** from a single shared TypeScript core. **Both harnesses are required for every run**: one implements, and the other cross-reviews. By default, `/pipeline` uses Claude to implement and Codex to review; `$pipeline` inverts this. The pipeline is cross-harness by design — you cannot skip the reviewer install.
 

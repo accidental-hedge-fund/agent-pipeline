@@ -148,11 +148,21 @@ test("hosts/codex/SKILL.md inventory covers STAGES and count language", () => {
   assertSkillCoversAllStages(skillStateMachineSection(source, "codex"), "hosts/codex/SKILL.md");
 });
 
-test("README.md primary stage-count language matches STAGES.length", () => {
+test("README.md primary inventory blurb matches STAGES count and stage tokens", () => {
   const source = read(README);
   // Primary inventory blurb is the opening paragraph under # agent-pipeline.
   const firstParagraph = source.split(/\n\n/)[1] ?? source.slice(0, 800);
   assertStageCountLanguage(firstParagraph, "README.md primary inventory blurb");
+  // When the blurb enumerates stages (arrow list), every STAGES member must appear
+  // by exact token — abbreviated "review"/"fix" must not stand in for review-1/fix-1/…
+  if (/→/.test(firstParagraph)) {
+    for (const stage of STAGES) {
+      assert.ok(
+        hasStageToken(firstParagraph, stage),
+        `README.md primary inventory blurb missing stage "${stage}" from STAGES`,
+      );
+    }
+  }
 });
 
 test("openspec/project.md purpose blurb stage-count matches STAGES.length", () => {

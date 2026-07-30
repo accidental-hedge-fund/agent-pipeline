@@ -26,11 +26,15 @@ The authored source of truth for the pipeline stage inventory SHALL be the order
 - **THEN** N SHALL equal `STAGES.length`
 
 ### Requirement: README and openspec project.md stage-count language SHALL match STAGES
-`README.md` and `openspec/project.md` SHALL NOT claim a stage count that differs from `STAGES.length`. Inventory intro language on those surfaces SHALL be consistent with the code stage list (including awareness that `needs-human` is a terminal off-ramp in `STAGES` / `TERMINAL_STAGES`).
+`README.md` and `openspec/project.md` SHALL NOT claim a stage count that differs from `STAGES.length`. Inventory intro language on those surfaces SHALL be consistent with the code stage list (including awareness that `needs-human` is a terminal off-ramp in `STAGES` / `TERMINAL_STAGES`). When the README primary inventory blurb enumerates stages, it SHALL name every `STAGES` member using its exact stage token (e.g. `review-1`, `fix-1`, `review-2`, `fix-2` — not a collapsed `review` / `fix` abbreviation).
 
 #### Scenario: README inventory count matches code
 - **WHEN** `README.md` states a numeric stage-machine size in its primary inventory blurb
 - **THEN** that number SHALL equal `STAGES.length`
+
+#### Scenario: README inventory stage list names every STAGES member
+- **WHEN** the README primary inventory blurb contains an arrow-separated stage list
+- **THEN** that list SHALL include every member of `STAGES` by exact stage name in a form the drift guard can token-match
 
 #### Scenario: project.md inventory count matches code
 - **WHEN** `openspec/project.md` states a numeric stage-machine size in its purpose blurb
@@ -49,7 +53,7 @@ The living `pipeline-state-machine` specification's STAGES-order scenario SHALL 
 - **AND** it SHALL NOT claim that `TERMINAL_STAGES` contains exactly `ready-to-deploy` alone
 
 ### Requirement: Drift-guard test fails on inventory divergence
-A unit test in the core test suite SHALL compare code `STAGES` / `TERMINAL_STAGES` against the guarded inventory surfaces and fail when any surface diverges. Guarded surfaces SHALL include at least: the living `pipeline-state-machine` STAGES-order scenario text, the living terminal-stage membership claim, `hosts/claude/SKILL.md` and `hosts/codex/SKILL.md` stage-name coverage and stage-count language, `README.md` primary stage-count language, and `openspec/project.md` primary stage-count language.
+A unit test in the core test suite SHALL compare code `STAGES` / `TERMINAL_STAGES` against the guarded inventory surfaces and fail when any surface diverges. Guarded surfaces SHALL include at least: the living `pipeline-state-machine` STAGES-order scenario text, the living terminal-stage membership claim, `hosts/claude/SKILL.md` and `hosts/codex/SKILL.md` stage-name coverage and stage-count language, `README.md` primary stage-count language and stage-token coverage when the primary inventory blurb lists stages, and `openspec/project.md` primary stage-count language.
 
 #### Scenario: In-sync surfaces pass
 - **WHEN** every guarded surface matches `STAGES` / `TERMINAL_STAGES`
@@ -58,6 +62,10 @@ A unit test in the core test suite SHALL compare code `STAGES` / `TERMINAL_STAGE
 #### Scenario: Missing stage in a host SKILL diagram fails
 - **WHEN** a stage name present in `STAGES` is absent from a host SKILL state-machine inventory
 - **THEN** the drift-guard test SHALL fail and identify the host file and missing stage
+
+#### Scenario: Missing stage in README inventory list fails
+- **WHEN** the README primary inventory blurb contains a stage list that omits a `STAGES` member (or uses a non-exact abbreviation such as bare `review` / `fix`)
+- **THEN** the drift-guard test SHALL fail and identify the missing stage
 
 #### Scenario: Wrong stage-count language fails
 - **WHEN** README, `openspec/project.md`, or a host SKILL claims a stage count other than `STAGES.length`
