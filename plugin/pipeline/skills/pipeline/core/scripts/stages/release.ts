@@ -1,18 +1,26 @@
 // Release sub-command (#170): prepares a release PR by:
 // 1. Resolving the version (alias → semver)
-// 2. Bumping both package.json files
-// 3. Regenerating the plugin/ mirror (node scripts/build.mjs)
-// 4. Running the CI gate (npm run ci)
-// 5. Scaffolding ROADMAP.md at four mutation sites
-// 6. Opening $EDITOR for human confirmation (skipped under --no-edit / --dry-run)
-// 7. Committing on a new branch and opening a release PR
+// 2. Requiring a Factory Reliability Gate pass for that version (#723)
+// 3. Bumping both package.json files
+// 4. Regenerating the plugin/ mirror (node scripts/build.mjs)
+// 5. Running the CI gate (npm run ci)
+// 6. Scaffolding ROADMAP.md at four mutation sites
+// 7. Opening $EDITOR for human confirmation (skipped under --no-edit / --dry-run)
+// 8. Committing on a new branch and opening a release PR (body includes FRG run_id)
 //
 // Stops at the open PR — does not tag, merge, or publish (the post-merge
-// release.yml workflow handles those after a human merges).
+// release.yml workflow handles those after a human merges). FRG check also
+// never merges or tags.
 
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { spawnSync } from "node:child_process";
+import {
+  formatFrgPrSection,
+  requireFrgPassForRelease,
+  type FrgEvidence,
+  type FrgFsDeps,
+} from "../factory-reliability-gate.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -74,6 +82,13 @@ export interface ReleaseDeps {
   today(): string;
   stdout(msg: string): void;
   stderr(msg: string): void;
+  /**
+   * Factory Reliability Gate lookup for the resolved version (#723).
+   * Defaults to reading `.agent-pipeline/frg/<version>/latest.json` via
+   * {@link requireFrgPassForRelease}. Tests inject a fake that returns a pass
+   * artifact (or throws) without touching the filesystem.
+   */
+  requireFrgPass?(repoDir: string, version: string): Promise<FrgEvidence>;
 }
 
 // ---------------------------------------------------------------------------
@@ -806,13 +821,19 @@ export function scaffoldRoadmap(
 // PR body
 // ---------------------------------------------------------------------------
 
-export function buildPRBody(ctx: ReleaseContext, lastTag: string): string {
+export function buildPRBody(
+  ctx: ReleaseContext,
+  lastTag: string,
+  frg?: FrgEvidence | null,
+): string {
   const { version, theme, date, shippedPRs } = ctx;
   const since = lastTag ? `\`${lastTag}\`` : "the beginning";
   const prLines =
     shippedPRs.length > 0
       ? shippedPRs.map((pr) => `- #${pr.number} — ${pr.title}`).join("\n")
       : "_(no merged PRs detected — fill in manually)_";
+
+  const frgSection = frg ? ["", formatFrgPrSection(frg), ""] : [];
 
   return [
     `## Release: v${version} — ${theme}`,
@@ -822,7 +843,7 @@ export function buildPRBody(ctx: ReleaseContext, lastTag: string): string {
     `### Included since ${since}`,
     "",
     prLines,
-    "",
+    ...frgSection,
     "---",
     "",
     "**Merging this PR is the final step.** It auto-tags the merge commit " +
@@ -907,6 +928,32 @@ export async function runRelease(
   const resolvedVersion = resolveVersion(versionArg, previousVersion);
   d.stdout(`[pipeline release] resolved version: ${resolvedVersion}`);
 
+  // 2b. Factory Reliability Gate (#723) — fail closed before any mutation when
+  // evidence is missing, unparsable, or pass:false. Additive to npm run ci.
+  // Does not merge or tag. Dry-run still checks so operators learn early.
+  d.stdout(`[pipeline release] checking Factory Reliability Gate for ${resolvedVersion}...`);
+  const frgRequire =
+    d.requireFrgPass ??
+    ((dir: string, ver: string) => {
+      const fsDeps: FrgFsDeps = {
+        readFile: async (p) => d.readFile(p),
+        writeFile: async () => {},
+        mkdir: async () => {},
+        rename: async () => {},
+      };
+      return requireFrgPassForRelease(dir, ver, fsDeps);
+    });
+  const frgEvidence = await frgRequire(repoDir, resolvedVersion);
+  if (!frgEvidence.pass || !frgEvidence.run_id.trim()) {
+    throw new Error(
+      `[pipeline release] Factory Reliability Gate for ${resolvedVersion} lacks a usable pass run_id — refusing release preparation.`,
+    );
+  }
+  d.stdout(
+    `[pipeline release] FRG pass: run_id=${frgEvidence.run_id}` +
+      (frgEvidence.loop_run_id ? ` loop_run_id=${frgEvidence.loop_run_id}` : ""),
+  );
+
   // 3. Find last git tag for git-log range (local git call, safe in all modes).
   const tagResult = d.runCommand("git", ["describe", "--tags", "--abbrev=0"], { cwd: repoDir });
   const lastTag = tagResult.code === 0 ? tagResult.stdout.trim() : "";
@@ -944,7 +991,7 @@ export async function runRelease(
     const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx);
     const roadmapDiff = computeUnifiedDiff(roadmapText, patchedRoadmap, "a/ROADMAP.md", "b/ROADMAP.md");
 
-    const prBody = buildPRBody(ctx, lastTag);
+    const prBody = buildPRBody(ctx, lastTag, frgEvidence);
 
     d.stdout(`\n=== Resolved version: ${resolvedVersion} ===\n`);
     d.stdout(`=== package.json diff ===`);
@@ -1094,7 +1141,7 @@ export async function runRelease(
       shippedPRs, shippedIssueNumbers,
     };
     const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx, (msg) => d.stderr(msg));
-    prBody = buildPRBody(ctx, lastTag);
+    prBody = buildPRBody(ctx, lastTag, frgEvidence);
 
     // 12. Write scaffolded ROADMAP to disk.
     d.stdout("[pipeline release] writing scaffolded ROADMAP.md...");

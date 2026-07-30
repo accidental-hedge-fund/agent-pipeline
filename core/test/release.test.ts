@@ -35,6 +35,34 @@ const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.m
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Default FRG pass used by release tests so FRG (#723) does not block unrelated cases. */
+function defaultFrgPass(version = "1.6.0") {
+  return {
+    schema_version: 1,
+    version,
+    run_id: "frg-test-pass",
+    pass: true as const,
+    scenarios: [],
+    scoreboard: {
+      item_count: 2,
+      ready_clean_count: 2,
+      engine_class_count: 0,
+      product_class_count: 0,
+      human_authority_count: 0,
+      engine_class_rate: null,
+      per_item: [],
+    },
+    thresholds: {
+      min_clean_ready_to_deploy: 2,
+      capacity_stress_n: 2,
+      max_engine_class_rate: 0.25,
+    },
+    loop_run_id: "loop-test",
+    created_at: "2026-07-30T00:00:00Z",
+    notes: [],
+  };
+}
+
 function makeDeps(overrides: Partial<ReleaseDeps> = {}): ReleaseDeps {
   const written: Record<string, string> = {};
   const editorCalls: string[] = [];
@@ -51,6 +79,8 @@ function makeDeps(overrides: Partial<ReleaseDeps> = {}): ReleaseDeps {
     today: () => "2026-06-16",
     stdout: (msg) => { stdoutLines.push(msg); },
     stderr: (msg) => { stderrLines.push(msg); },
+    // FRG pass by default so existing release tests stay focused on release logic.
+    requireFrgPass: async (_dir, version) => defaultFrgPass(version),
     ...overrides,
   };
   // Expose collected state via non-standard properties for test inspection.
@@ -1477,4 +1507,109 @@ test("runRelease: a post-bump abort (CI failure) restores the bumped files (#170
   // The bumped files are reverted by `git checkout -- ...` from HEAD (build.mjs is not
   // re-run), so a retry reads the original previousVersion.
   assert.ok(restoreInvoked(commands), "git checkout rollback issued after CI abort");
+});
+
+// ---------------------------------------------------------------------------
+// Factory Reliability Gate (#723)
+// ---------------------------------------------------------------------------
+
+test("buildPRBody: includes FRG run_id and pass when evidence provided", () => {
+  const frg = defaultFrgPass("1.6.0");
+  const body = buildPRBody(SAMPLE_CTX, "v1.5.0", frg);
+  assert.match(body, /Factory Reliability Gate/);
+  assert.match(body, /frg-test-pass/);
+  assert.match(body, /pass/);
+  assert.match(body, /1\.6\.0/);
+});
+
+test("runRelease: missing FRG pass aborts before package.json mutation", async () => {
+  const written: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => {
+      written.push(p);
+    },
+    requireFrgPass: async () => {
+      throw new Error(
+        "[pipeline release] Factory Reliability Gate pass missing for version 1.6.0 " +
+          "(expected /repo/.agent-pipeline/frg/1.6.0/latest.json). " +
+          "Unit CI alone is not sufficient. Run: pipeline factory-gate --for 1.6.0",
+      );
+    },
+  });
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /Factory Reliability Gate pass missing for version 1\.6\.0/,
+  );
+  assert.equal(written.length, 0, "must not write package files when FRG is missing");
+});
+
+test("runRelease: failed FRG aborts and is distinguishable from missing", async () => {
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    requireFrgPass: async () => {
+      throw new Error(
+        "[pipeline release] Factory Reliability Gate FAILED for version 1.6.0 (run_id=frg-bad). " +
+          "See docs/factory-reliability-gate-runbook.md",
+      );
+    },
+  });
+  await assert.rejects(
+    () => runRelease("1.6.0", { dryRun: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /Gate FAILED for version 1\.6\.0/,
+  );
+});
+
+test("runRelease: FRG pass attaches run_id to PR body (live path)", async () => {
+  let prBody = "";
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "create") {
+        const bodyIdx = args.indexOf("--body");
+        prBody = bodyIdx >= 0 ? args[bodyIdx + 1]! : "";
+        return { code: 0, stdout: "https://github.com/org/repo/pull/999", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    requireFrgPass: async (_d, version) => defaultFrgPass(version),
+  });
+  await runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+  assert.match(prBody, /Factory Reliability Gate/);
+  assert.match(prBody, /frg-test-pass/);
+  assert.match(prBody, /pass/);
+});
+
+test("runRelease: FRG check does not invoke merge or tag commands", async () => {
+  const commands: string[][] = [];
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
+    runCommand: (cmd, args) => {
+      commands.push([cmd, ...args]);
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr") return { code: 0, stdout: "https://github.com/org/repo/pull/999", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  await runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+  assert.ok(!commands.some((c) => c[0] === "git" && c[1] === "tag"), "must not tag because FRG passed");
+  assert.ok(
+    !commands.some((c) => c[0] === "gh" && c[1] === "pr" && c.includes("merge")),
+    "must not merge because FRG passed",
+  );
 });

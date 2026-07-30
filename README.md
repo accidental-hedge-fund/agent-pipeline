@@ -555,6 +555,18 @@ pipeline merge-queue --milestone v1.28.0 --apply --release-when-complete --relea
 
 **Release-when-complete (#676):** opt-in only (CLI `--release-when-complete` and/or config `merge_queue.release_when_complete: false` default). When enabled and the queue is **complete** after the drive — no remaining open R2D candidates for the selector and no held items — the command invokes the shared `pipeline release` prepare path non-interactively (`noEdit`) and opens a release PR for human review. It **never** tags, publishes to npm, or merges the release PR. Open non-R2D issues on the milestone do not block prepare (they are reported as a warning). If prepare fails after successful merges, merges stay done and the command exits non-zero with a clear error. Dry-run with the flag reports would-prepare / would-not + reason against **current** completeness and creates no PR.
 
+## Factory Reliability Gate (release precondition)
+
+**Every release** (patch, minor, major) requires a recorded **Factory Reliability Gate (FRG)** pass for that version in addition to green `npm run ci`. See [`docs/factory-reliability-gate-runbook.md`](docs/factory-reliability-gate-runbook.md).
+
+```bash
+# After a multi-item durable loop against the factory-gate pack:
+pipeline factory-gate --for 1.29.1 --from-run <loop-run-id> [--json]
+pipeline release 1.29.1   # refuses without FRG pass evidence for 1.29.1
+```
+
+Evidence is written under `.agent-pipeline/frg/<version>/`. The release PR body includes the FRG `run_id` and pass summary. FRG never merges PRs or creates tags.
+
 ## Improve sub-command
 
 `pipeline improve` is a **read-only** batch analyzer that reads `.agent-pipeline/runs/**/events.jsonl` and `summary.json`, clusters recurring failure patterns (review findings, blockers, flaky gates, token waste), agent-reported friction (papercuts), and recurring expert corrections (`correction_event` records, #499/#500), and prints a dry-run report. It never modifies pipeline labels, branches, PRs, worktrees, or repo files.

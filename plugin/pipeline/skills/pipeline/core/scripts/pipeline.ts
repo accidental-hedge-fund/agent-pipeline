@@ -282,6 +282,10 @@ export interface CliOpts {
   force?: boolean;
   /** improve: restrict analysis to runs on or after this ISO date. */
   since?: string;
+  /** factory-gate: target release version X.Y.Z (#723). Commander maps --for → for. */
+  for?: string;
+  /** factory-gate: durable loop run id to score (#723). */
+  fromRun?: string;
   /** scoreboard: restrict analysis to runs on or before this ISO date. */
   until?: string;
   /** scoreboard: use a relative N-day window. */
@@ -433,7 +437,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | factory-gate | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -489,6 +493,8 @@ export function buildCmd(): Command {
     // descriptions/visibility, so it never appears anywhere in --help output.
     .addOption(new Option("--run <run-id>", "run-store run id to record an event against, or scope a report to").hideHelp())
     .addOption(new Option("-m, --message <text>", "free-text friction message to record").hideHelp())
+    .option("--for <version>", "factory-gate: target release version X.Y.Z (required)", undefined)
+    .option("--from-run <run-id>", "factory-gate: score an existing durable loop run id")
     .option("--since <date>", "improve/scoreboard: restrict analysis to runs on or after this ISO date (e.g. 2026-06-01)")
     .option("--until <date>", "scoreboard: restrict analysis to runs on or before this ISO date (e.g. 2026-06-15)")
     .option("--days <n>", "scoreboard: analyze the last N days (default: 30)", Number)
@@ -1972,7 +1978,7 @@ async function main(): Promise<void> {
   // `pipeline path --json`, `pipeline config validate/sync --json`, `pipeline refine-spec --json`,
   // `pipeline improve --json`, `pipeline scoreboard --json`, `pipeline status <N> --json`, and
   // `--remove-worktree --json` legitimately emit JSON — exempt from the status-only guard.
-  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard" && numArg !== "status" && numArg !== "papercut") {
+  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard" && numArg !== "status" && numArg !== "papercut" && numArg !== "factory-gate") {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
   }
@@ -2495,6 +2501,52 @@ async function main(): Promise<void> {
     return;
   }
 
+  // `pipeline factory-gate --for <version> [--from-run <id>] [--json]` (#723).
+  // Scores a durable loop (or refuses without --from-run) and writes FRG evidence.
+  // No GitHub mutation; never merges or tags.
+  if (numArg === "factory-gate") {
+    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(startDir) ?? startDir;
+    const versionArg = opts.for ?? (cmd.args[1] as string | undefined);
+    if (!versionArg) {
+      console.error(
+        "pipeline factory-gate: --for <X.Y.Z> is required.\n" +
+          "  Usage: pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> [--json]\n" +
+          "  See docs/factory-reliability-gate-runbook.md",
+      );
+      process.exit(2);
+    }
+    const { runFactoryGate } = await import("./factory-reliability-gate.ts");
+    const { defaultLoopStoreDeps, readLedger, readContract } = await import("./loop/store.ts");
+    try {
+      const storeDeps = defaultLoopStoreDeps();
+      // Always inject ledger/contract loaders so scoring reuses the durable loop
+      // store (no second ledger). Operator starts the pack with `pipeline loop`
+      // (shipped runtime), then scores with --from-run.
+      const result = await runFactoryGate({
+        version: versionArg,
+        repoDir,
+        fromRun: opts.fromRun,
+        label: opts.label,
+        milestone: opts.milestone,
+        json: !!opts.json,
+        loadLedger: async (runId) => readLedger(storeDeps, runId),
+        loadContract: async (runId) => {
+          try {
+            return await readContract(storeDeps, runId);
+          } catch {
+            return null;
+          }
+        },
+      });
+      if (result.exitCode !== 0) process.exitCode = result.exitCode;
+    } catch (err) {
+      console.error(`pipeline factory-gate: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Early scoreboard dispatch — no issue number, no config resolution, no GitHub calls.
   // It reads only existing run artifacts under .agent-pipeline/runs.
   if (numArg === "scoreboard") {
@@ -2932,7 +2984,7 @@ async function main(): Promise<void> {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "release", "intake", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "factory-gate", "queue", "backfill", "evals",
       "loop",
     ];
     if (!recognized.includes(numArg)) {

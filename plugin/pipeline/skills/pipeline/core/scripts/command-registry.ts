@@ -73,6 +73,27 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
+  // Factory Reliability Gate (#723): score a durable loop / fixture pack and
+  // write immutable evidence under .agent-pipeline/frg/<version>/. Never merges
+  // or tags. --from-run scores an existing loop; no gh required for scoring.
+  "factory-gate": {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "profile",
+      "json",
+      "for",
+      "fromRun",
+      "label",
+      "milestone",
+    ]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
   intake: {
     needsIssueNumber: false,
     allowedFlags: new Set(["repoPath", "base", "dryRun", "description", "release"]),
