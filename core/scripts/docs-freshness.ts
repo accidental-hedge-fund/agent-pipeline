@@ -76,20 +76,28 @@ function scriptCommandSegments(scriptValue: string): string[] {
 
 /**
  * True when a script body is a real **check-mode** docs freshness invocation —
- * generator contract **and** an explicit `--check` flag on the **same** shell
- * command segment as the generator. Write-mode generator scripts
- * (`node scripts/generate-docs.mjs` without `--check`) do not count, nor do
- * compound scripts that only mention `--check` elsewhere
- * (`node scripts/generate-docs.mjs && echo --check`): they can exit 0 after
- * writing files and leave a stale committed HEAD.
+ * at least one shell segment invokes the generator with an explicit `--check`
+ * flag on **that same segment**, and **every** generator-invoking segment is
+ * check-mode.
+ *
+ * Rejected patterns (can exit 0 after writing / leave a stale committed HEAD):
+ * - write-mode only: `node scripts/generate-docs.mjs`
+ * - `--check` only elsewhere: `node scripts/generate-docs.mjs && echo --check`
+ * - check-then-write fallback: `… --check || node scripts/generate-docs.mjs`
+ *   (a red check is masked by a mutating write segment)
  */
 export function scriptIsDocsFreshnessCheck(scriptValue: string | undefined): boolean {
   if (!scriptValue) return false;
-  // --check must be an argument of the generate-docs invocation itself, not a
-  // later compound-script segment.
-  return scriptCommandSegments(scriptValue).some(
-    (seg) => scriptInvokesDocsGenerator(seg) && /--check\b/.test(seg),
-  );
+  const segments = scriptCommandSegments(scriptValue);
+  let sawCheckModeGenerator = false;
+  for (const seg of segments) {
+    if (!scriptInvokesDocsGenerator(seg)) continue;
+    // Every generator-invoking segment must be check-mode. A write-mode sibling
+    // (e.g. `--check || write`) can mask a red check and exit 0 after mutate.
+    if (!/--check\b/.test(seg)) return false;
+    sawCheckModeGenerator = true;
+  }
+  return sawCheckModeGenerator;
 }
 
 /**

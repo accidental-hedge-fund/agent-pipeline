@@ -168,6 +168,35 @@ test("scriptIsDocsFreshnessCheck: compound script with --check elsewhere is writ
   );
 });
 
+test("scriptIsDocsFreshnessCheck: check-then-write fallback is not a freshness check (#716)", () => {
+  // A red --check can be masked by a write-mode generator fallback that exits 0.
+  assert.equal(
+    scriptIsDocsFreshnessCheck(
+      "node scripts/generate-docs.mjs --check || node scripts/generate-docs.mjs",
+    ),
+    false,
+  );
+  assert.equal(
+    scriptIsDocsFreshnessCheck(
+      "node scripts/generate-docs.mjs --check; node scripts/generate-docs.mjs",
+    ),
+    false,
+  );
+  assert.equal(
+    scriptIsDocsFreshnessCheck(
+      "node scripts/generate-docs.mjs --check && node scripts/generate-docs.mjs",
+    ),
+    false,
+  );
+  // All generator segments check-mode remains accepted.
+  assert.equal(
+    scriptIsDocsFreshnessCheck(
+      "node scripts/generate-docs.mjs --check || node scripts/generate-docs.mjs --check",
+    ),
+    true,
+  );
+});
+
 test("detectDocsGenerator: absent when no file and no generator docs:check", () => {
   const surface = detectDocsGenerator("/wt", {
     fileExists: () => false,
@@ -233,6 +262,40 @@ test("detectDocsGenerator: write-mode docs:check is not selected as check comman
     );
     assert.notEqual(surface.checkCommand, "npm run docs:check");
   }
+});
+
+test("detectDocsGenerator: check-then-write docs:check is not selected as check command (#716)", () => {
+  const surface = detectDocsGenerator("/wt", {
+    fileExists: (p) => p.replace(/\\/g, "/").endsWith("scripts/generate-docs.mjs"),
+    readPackageJson: () => ({
+      scripts: {
+        "docs:check":
+          "node scripts/generate-docs.mjs --check || node scripts/generate-docs.mjs",
+        "docs:generate": "node scripts/generate-docs.mjs",
+      },
+    }),
+  });
+  assert.equal(surface.present, true);
+  if (surface.present) {
+    assert.equal(
+      surface.checkCommand,
+      "node scripts/generate-docs.mjs --check",
+      "must not use check-then-write npm run docs:check as the freshness check",
+    );
+    assert.notEqual(surface.checkCommand, "npm run docs:check");
+  }
+});
+
+test("ciScriptReachesDocsFreshness: false when docs:check is check-then-write fallback (#716)", () => {
+  assert.equal(
+    ciScriptReachesDocsFreshness({
+      ci: "npm run ci:core && npm run docs:check",
+      "ci:core": "node --test",
+      "docs:check":
+        "node scripts/generate-docs.mjs --check || node scripts/generate-docs.mjs",
+    }),
+    false,
+  );
 });
 
 test("detectDocsGenerator: compound write-mode docs:check is not selected as check command (#716)", () => {
