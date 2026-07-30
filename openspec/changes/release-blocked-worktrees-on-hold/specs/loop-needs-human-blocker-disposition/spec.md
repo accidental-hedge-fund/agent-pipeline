@@ -16,3 +16,11 @@ The supervisor's needs-human hold path (per-item `paused`/`waiting` holds for pr
 - **WHEN** an item carries `pipeline:blocked` for a product or review reason unrelated to capacity
 - **THEN** the supervisor SHALL still record a needs-human hold per existing requirements
 - **AND** SHALL NOT reclassify that hold as capacity admission solely because capacity is also tight in the fleet
+
+#### Scenario: Stale authentic capacity comment does not clear a later product hold
+
+- **WHEN** an issue has a prior trusted attested capacity blocker comment from an earlier hold
+- **AND** the current `blocked` label application is a later product or human hold whose own blocker comment is absent or unavailable
+- **AND** advance events lack a fresh `blocker_set` (event-less redispatch)
+- **THEN** the pipeline SHALL NOT reclassify the issue as capacity admission from the stale capacity comment alone
+- **AND** SHALL NOT clear the current `blocked` label solely on the basis of that stale authentic capacity marker

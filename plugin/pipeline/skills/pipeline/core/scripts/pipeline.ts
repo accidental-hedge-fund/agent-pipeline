@@ -33,6 +33,7 @@ import {
   getIssueDetail,
   getIssueLabelEvents,
   getItemKind,
+  getLatestBlockedLabeledAt,
   getPrForIssue,
   getPrLinkedIssue,
   isBlocked,
@@ -861,6 +862,15 @@ export interface RealDispatchItemDeps {
    * call live `gh api user` from tests.
    */
   getGhActor?: () => Promise<string | null>;
+  /**
+   * Latest `blocked` label application time for comment-fallback incarnation
+   * binding (#718 69894186). Injected for unit tests — never call live
+   * timeline GraphQL from tests.
+   */
+  getLatestBlockedLabeledAt?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+  ) => Promise<string | null>;
   scriptPath?: string;
   execPath?: string;
   /**
@@ -888,6 +898,8 @@ export function realDispatchItem(
   const getPrForIssueFn = deps.getPrForIssue ?? getPrForIssue;
   const clearBlockedFn = deps.clearBlocked ?? clearBlocked;
   const getGhActorFn = deps.getGhActor ?? getGhActor;
+  const getLatestBlockedLabeledAtFn =
+    deps.getLatestBlockedLabeledAt ?? getLatestBlockedLabeledAt;
   const scriptPath = deps.scriptPath ?? fileURLToPath(import.meta.url);
   const execPath = deps.execPath ?? process.execPath;
   const eventsPathExistsFn = deps.eventsPathExists ?? ((p: string) => existsSync(p));
@@ -1010,11 +1022,20 @@ export function realDispatchItem(
         if (text !== null) lastKind = lastBlockerKindFromEventsJsonl(text);
       }
       if (!lastKind && Array.isArray(detail.comments)) {
-        // Fail closed without a trusted actor: unauthenticated marker bodies
-        // must not reclassify product holds as capacity (#718 b5108544).
+        // Fail closed without a trusted actor or without binding the comment to
+        // the current blocked-label incarnation: unauthenticated or stale
+        // authentic capacity markers must not reclassify a later product hold
+        // (#718 b5108544 / 69894186).
         const actor = await getGhActorFn();
+        let blockedLabeledAt: string | null = null;
+        try {
+          blockedLabeledAt = await getLatestBlockedLabeledAtFn(cfg, issueNumber);
+        } catch {
+          blockedLabeledAt = null;
+        }
         lastKind = lastBlockerKindFromComments(detail.comments, {
           trustedAuthor: actor,
+          blockedLabeledAt,
         });
       }
       outcome = classifyDispatchOutcome(detail, lastKind);

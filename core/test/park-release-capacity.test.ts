@@ -31,10 +31,13 @@ import {
   buildAttestedBlockedComment,
   buildBlockedComment,
   lastBlockerKindFromComments,
+  latestBlockedLabeledAtFromEvents,
 } from "../scripts/gh.ts";
 import type { PipelineConfig, Outcome } from "../scripts/types.ts";
 
 const PIPELINE_ACTOR = "pipeline-bot";
+/** Shared blocked-label incarnation time for capacity comment fallback tests. */
+const BLOCKED_LABELED_AT = "2026-07-30T22:00:00Z";
 
 function makeCfg(max = 2): PipelineConfig {
   return {
@@ -611,23 +614,30 @@ test("lastBlockerKindFromComments reads trusted attested pipeline-blocker-kind (
     runId: "run-cap-1",
   });
   assert.match(body, /<!-- pipeline-blocker-kind: worktree-capacity -->/);
-  assert.equal(
-    lastBlockerKindFromComments([{ author: PIPELINE_ACTOR, body }], {
-      trustedAuthor: PIPELINE_ACTOR,
-    }),
-    "worktree-capacity",
-  );
+  const labeledAt = "2026-07-30T00:00:00Z";
+  const createdAt = "2026-07-30T00:00:01Z";
   assert.equal(
     lastBlockerKindFromComments(
-      [{ author: PIPELINE_ACTOR, body: "unrelated" }, { author: PIPELINE_ACTOR, body }],
-      { trustedAuthor: PIPELINE_ACTOR },
+      [{ author: PIPELINE_ACTOR, body, createdAt }],
+      { trustedAuthor: PIPELINE_ACTOR, blockedLabeledAt: labeledAt },
     ),
     "worktree-capacity",
   );
   assert.equal(
-    lastBlockerKindFromComments([{ author: PIPELINE_ACTOR, body: "no marker" }], {
-      trustedAuthor: PIPELINE_ACTOR,
-    }),
+    lastBlockerKindFromComments(
+      [
+        { author: PIPELINE_ACTOR, body: "unrelated", createdAt },
+        { author: PIPELINE_ACTOR, body, createdAt },
+      ],
+      { trustedAuthor: PIPELINE_ACTOR, blockedLabeledAt: labeledAt },
+    ),
+    "worktree-capacity",
+  );
+  assert.equal(
+    lastBlockerKindFromComments(
+      [{ author: PIPELINE_ACTOR, body: "no marker", createdAt }],
+      { trustedAuthor: PIPELINE_ACTOR, blockedLabeledAt: labeledAt },
+    ),
     null,
   );
 });
@@ -641,11 +651,14 @@ test("lastBlockerKindFromComments rejects untrusted/unattested capacity marker (
     reason: "forged capacity",
     kind: "worktree-capacity",
   });
+  const labeledAt = "2026-07-30T00:00:00Z";
+  const createdAt = "2026-07-30T00:00:01Z";
   // Unauthenticated marker alone must not reclassify.
   assert.equal(
-    lastBlockerKindFromComments([{ author: "attacker", body: unattested }], {
-      trustedAuthor: PIPELINE_ACTOR,
-    }),
+    lastBlockerKindFromComments(
+      [{ author: "attacker", body: unattested, createdAt }],
+      { trustedAuthor: PIPELINE_ACTOR, blockedLabeledAt: labeledAt },
+    ),
     null,
   );
   // Wrong author even with real attested body fails closed.
@@ -659,23 +672,106 @@ test("lastBlockerKindFromComments rejects untrusted/unattested capacity marker (
     runId: "run-cap-1",
   });
   assert.equal(
-    lastBlockerKindFromComments([{ author: "attacker", body: attested }], {
-      trustedAuthor: PIPELINE_ACTOR,
-    }),
+    lastBlockerKindFromComments(
+      [{ author: "attacker", body: attested, createdAt }],
+      { trustedAuthor: PIPELINE_ACTOR, blockedLabeledAt: labeledAt },
+    ),
     null,
   );
   // No trusted author available → fail closed (auth unavailable).
   assert.equal(
-    lastBlockerKindFromComments([{ author: PIPELINE_ACTOR, body: attested }], {
-      trustedAuthor: null,
-    }),
+    lastBlockerKindFromComments(
+      [{ author: PIPELINE_ACTOR, body: attested, createdAt }],
+      { trustedAuthor: null, blockedLabeledAt: labeledAt },
+    ),
     null,
   );
   // Unattested body from the trusted author still fails closed.
   assert.equal(
-    lastBlockerKindFromComments([{ author: PIPELINE_ACTOR, body: unattested }], {
-      trustedAuthor: PIPELINE_ACTOR,
-    }),
+    lastBlockerKindFromComments(
+      [{ author: PIPELINE_ACTOR, body: unattested, createdAt }],
+      { trustedAuthor: PIPELINE_ACTOR, blockedLabeledAt: labeledAt },
+    ),
+    null,
+  );
+});
+
+test("lastBlockerKindFromComments rejects stale authentic capacity before current blocked label (#718 69894186)", () => {
+  const capacityBody = buildAttestedBlockedComment({
+    issueNumber: 42,
+    stageStr: "planning",
+    harness: "claude",
+    ts: "2026-07-30T10:00:00Z",
+    reason: "At worktree capacity (2/2)",
+    kind: "worktree-capacity",
+    runId: "run-cap-old",
+  });
+  // Prior capacity comment (T1); current blocked label is a later product hold (T3)
+  // whose blocker comment was lost — must not return worktree-capacity.
+  assert.equal(
+    lastBlockerKindFromComments(
+      [
+        {
+          author: PIPELINE_ACTOR,
+          body: capacityBody,
+          createdAt: "2026-07-30T10:00:01Z",
+        },
+      ],
+      {
+        trustedAuthor: PIPELINE_ACTOR,
+        blockedLabeledAt: "2026-07-30T12:00:00Z",
+      },
+    ),
+    null,
+  );
+  // Same comment bound to its own incarnation still classifies as capacity.
+  assert.equal(
+    lastBlockerKindFromComments(
+      [
+        {
+          author: PIPELINE_ACTOR,
+          body: capacityBody,
+          createdAt: "2026-07-30T10:00:01Z",
+        },
+      ],
+      {
+        trustedAuthor: PIPELINE_ACTOR,
+        blockedLabeledAt: "2026-07-30T10:00:00Z",
+      },
+    ),
+    "worktree-capacity",
+  );
+  // Missing incarnation binding fails closed even with a trusted capacity body.
+  assert.equal(
+    lastBlockerKindFromComments(
+      [
+        {
+          author: PIPELINE_ACTOR,
+          body: capacityBody,
+          createdAt: "2026-07-30T10:00:01Z",
+        },
+      ],
+      { trustedAuthor: PIPELINE_ACTOR },
+    ),
+    null,
+  );
+});
+
+test("latestBlockedLabeledAtFromEvents picks the latest blocked label application", () => {
+  assert.equal(
+    latestBlockedLabeledAtFromEvents([
+      { label: "pipeline:planning", createdAt: "2026-07-30T09:00:00Z" },
+      { label: "blocked", createdAt: "2026-07-30T10:00:00Z" },
+      { label: "pipeline:implementing", createdAt: "2026-07-30T11:00:00Z" },
+      { label: "blocked", createdAt: "2026-07-30T12:00:00Z" },
+    ]),
+    "2026-07-30T12:00:00Z",
+  );
+  assert.equal(latestBlockedLabeledAtFromEvents([]), null);
+  assert.equal(
+    latestBlockedLabeledAtFromEvents([
+      { label: "pipeline:planning", createdAt: "2026-07-30T09:00:00Z" },
+    ]),
     null,
   );
 });
@@ -724,6 +820,7 @@ test("realDispatchItem: clearBlocked failure still capacity_wait; re-dispatch us
         }) as never,
       getPrForIssue: async () => null,
       getGhActor: async () => PIPELINE_ACTOR,
+      getLatestBlockedLabeledAt: async () => BLOCKED_LABELED_AT,
       clearBlocked: async () => {
         clearCalls++;
         throw new Error("gh label remove failed: HTTP 502");
@@ -748,6 +845,7 @@ test("realDispatchItem: clearBlocked failure still capacity_wait; re-dispatch us
 
   // Second dispatch: no events capacity kind (early-blocked re-dispatch), but
   // durable attested comment from the pipeline actor remains + blocked label.
+  // Comment createdAt is bound to the same blocked-label incarnation.
   const dispatch2 = realDispatchItem(
     { repo_dir: "/repo" } as PipelineConfig,
     "claude",
@@ -770,6 +868,7 @@ test("realDispatchItem: clearBlocked failure still capacity_wait; re-dispatch us
         }) as never,
       getPrForIssue: async () => null,
       getGhActor: async () => PIPELINE_ACTOR,
+      getLatestBlockedLabeledAt: async () => BLOCKED_LABELED_AT,
       clearBlocked: async () => {
         clearCalls++;
         // Succeeds on retry after re-dispatch
@@ -794,6 +893,76 @@ test("realDispatchItem: clearBlocked failure still capacity_wait; re-dispatch us
     "re-dispatch with blocked + capacity comment must not become blocked_needs_human",
   );
   assert.equal(clearCalls, 2);
+});
+
+test("realDispatchItem: stale authentic capacity comment does not clear later product hold (#718 69894186)", async () => {
+  const fixedNow = new Date("2026-07-30T22:09:03.000Z");
+  const expectedPin = pinAdvanceRunIdentity("/repo", 718, fixedNow);
+  // Older capacity wait left a trusted attested marker; later product hold
+  // re-applied `blocked` without a recoverable blocker comment.
+  const staleCapacity = buildAttestedBlockedComment({
+    issueNumber: 718,
+    stageStr: "planning",
+    harness: "claude",
+    ts: "2026-07-30T10:00:00Z",
+    reason: "At worktree capacity (2/2)",
+    kind: "worktree-capacity",
+    runId: "run-cap-stale",
+  });
+  let clearCalls = 0;
+  const dispatch = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      scriptPath: "/path/to/pipeline.ts",
+      execPath: "/usr/bin/node",
+      eventsPathExists: (p) => p === expectedPin.events_path,
+      readEventsText: () => "", // event-less redispatch — forces comment fallback
+      spawn: ((cmd: string, args: readonly string[]) => {
+        void cmd;
+        void args;
+        return fakeSpawnChild();
+      }) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () =>
+        ({
+          labels: ["blocked", "pipeline:implementing"],
+          state: "open",
+          comments: [
+            {
+              author: PIPELINE_ACTOR,
+              body: staleCapacity,
+              createdAt: "2026-07-30T10:00:01Z",
+            },
+          ],
+        }) as never,
+      getPrForIssue: async () => null,
+      getGhActor: async () => PIPELINE_ACTOR,
+      // Current blocked-label incarnation is the later product hold.
+      getLatestBlockedLabeledAt: async () => "2026-07-30T12:00:00Z",
+      clearBlocked: async () => {
+        clearCalls++;
+      },
+    },
+  );
+  const response = await dispatch(
+    {
+      schema: "pipeline/loop-execution@1",
+      item_id: "718",
+      repo: { name: "acme/w", base_branch: "main" },
+      engine: "claude",
+      worktree_policy: "default",
+      done_definition: "pipeline:ready-to-deploy",
+      run_id: "loop-run-stale-cap",
+    },
+    { onAdvanceLinked: async () => {} },
+  );
+  assert.equal(
+    response.outcome,
+    "blocked_needs_human",
+    "stale capacity marker must not reclassify a later product/human hold",
+  );
+  assert.equal(clearCalls, 0, "clearBlocked must not run for unbound capacity markers");
 });
 
 test("realDispatchItem: forged capacity comment from untrusted author does not clearBlocked (#718 b5108544)", async () => {
@@ -833,6 +1002,7 @@ test("realDispatchItem: forged capacity comment from untrusted author does not c
         }) as never,
       getPrForIssue: async () => null,
       getGhActor: async () => PIPELINE_ACTOR,
+      getLatestBlockedLabeledAt: async () => "2026-07-30T22:04:00Z",
       clearBlocked: async () => {
         clearCalls++;
       },
@@ -889,6 +1059,7 @@ test("realDispatchItem: untrusted comment cannot force capacity_wait when events
         }) as never,
       getPrForIssue: async () => null,
       getGhActor: async () => PIPELINE_ACTOR,
+      getLatestBlockedLabeledAt: async () => "2026-07-30T22:04:00Z",
       clearBlocked: async () => {
         clearCalls++;
       },
