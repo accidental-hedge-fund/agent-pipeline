@@ -63,9 +63,23 @@ export function scriptInvokesDocsGenerator(scriptValue: string | undefined): boo
 }
 
 /**
+ * True when a script body is a real **check-mode** docs freshness invocation —
+ * generator contract **and** an explicit `--check` flag. Write-mode generator
+ * scripts (`node scripts/generate-docs.mjs` without `--check`) do not count:
+ * they can exit 0 after writing files and leave a stale committed HEAD.
+ */
+export function scriptIsDocsFreshnessCheck(scriptValue: string | undefined): boolean {
+  return scriptInvokesDocsGenerator(scriptValue) && /--check\b/.test(scriptValue ?? "");
+}
+
+/**
  * Walk an npm scripts map starting from `ci` (and transitively via `npm run X`
  * references) and return true when the graph reaches a docs freshness step.
  * Pure — used by the structural drift-guard and unit tests.
+ *
+ * Only **check-mode** edges count (`generate-docs … --check`, or a `docs:check`
+ * script whose body is itself check-mode). A write-mode `docs:check` that merely
+ * invokes the generator does **not** satisfy CI freshness parity.
  */
 export function ciScriptReachesDocsFreshness(scripts: Record<string, string>): boolean {
   const visited = new Set<string>();
@@ -76,12 +90,11 @@ export function ciScriptReachesDocsFreshness(scripts: Record<string, string>): b
     visited.add(name);
     const body = scripts[name];
     if (typeof body !== "string") continue;
-    if (scriptInvokesDocsGenerator(body) && /--check\b/.test(body)) return true;
+    if (scriptIsDocsFreshnessCheck(body)) return true;
     if (/\bdocs:check\b/.test(body)) {
-      // Direct reference in the chain — if docs:check script itself is the
-      // generator contract, that counts; otherwise keep walking.
+      // Direct reference — only accept when docs:check is itself check-mode.
       const docsCheckBody = scripts["docs:check"];
-      if (scriptInvokesDocsGenerator(docsCheckBody)) return true;
+      if (scriptIsDocsFreshnessCheck(docsCheckBody)) return true;
       if (docsCheckBody) queue.push("docs:check");
     }
     // Collect `npm run <name>` / `npm run <name> --` targets.
@@ -112,18 +125,20 @@ export function detectDocsGenerator(wtPath: string, deps: DocsFreshnessDeps = {}
   const docsCheckScript = scripts["docs:check"];
   const docsGenerateScript = scripts["docs:generate"];
   const checkInvokes = scriptInvokesDocsGenerator(docsCheckScript);
+  // Check command must be check-mode; write-mode docs:check is not a freshness check.
+  const docsCheckIsCheckMode = scriptIsDocsFreshnessCheck(docsCheckScript);
 
   if (!hasGeneratorFile && !checkInvokes) {
     return { present: false };
   }
 
-  // Prefer npm script wrappers when they invoke the generator contract.
+  // Prefer npm docs:check only when its body is real check-mode. Otherwise use
+  // the generator entry point with --check (even if docs:check is miswired as
+  // write-mode) so the pipeline never treats a write pass as freshness green.
   const checkCommand =
-    checkInvokes && docsCheckScript
+    docsCheckIsCheckMode
       ? "npm run docs:check"
-      : hasGeneratorFile
-        ? "node scripts/generate-docs.mjs --check"
-        : "npm run docs:check"; // script claims generator but file missing — still run npm path
+      : "node scripts/generate-docs.mjs --check";
 
   const generateInvokes = scriptInvokesDocsGenerator(docsGenerateScript);
   const generateCommand =
@@ -174,11 +189,41 @@ export type DocsFreshnessResult =
   | { ok: false; ran: true; reason: string; stalePaths: string[] };
 
 /**
+ * Check-only docs freshness verification (no auto-heal).
+ *
+ * Used after post-heal format/test convergence so a gate commit that dirties
+ * generated docs cannot push a red-docs HEAD. Also safe for any final-HEAD
+ * verification where a second heal would violate the one-shot heal bound.
+ */
+export async function checkDocsFreshness(
+  wtPath: string,
+  deps: DocsFreshnessDeps = {},
+): Promise<DocsFreshnessResult> {
+  const surface = detectDocsGenerator(wtPath, deps);
+  if (!surface.present) {
+    return { ok: true, ran: false };
+  }
+
+  const runFn = deps.runDocsCommand ?? defaultRunDocsCommand;
+  const checkRes = await runFn(wtPath, surface.checkCommand);
+  if (checkRes.code === 0) {
+    return { ok: true, ran: true, healed: false };
+  }
+  return failClosed(
+    "docs freshness check failed on the final HEAD before push. " +
+      "PR open/update withheld for docs freshness.",
+    checkRes.output,
+  );
+}
+
+/**
  * Enforce docs freshness on a worktree HEAD that is about to be pushed / PR'd.
  *
  * Order: detect → check → (optional one-shot auto-heal) → re-check.
  * Does **not** re-run format/test gates — the caller does that when
- * `healed: true` so gate deps stay on the stage surface.
+ * `healed: true` so gate deps stay on the stage surface. After those gates,
+ * the caller MUST re-verify with {@link checkDocsFreshness} (check-only) so
+ * post-heal format/test commits cannot re-stale generated docs before push.
  */
 export async function enforceDocsFreshness(
   wtPath: string,

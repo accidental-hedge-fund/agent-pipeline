@@ -23,7 +23,7 @@ The pipeline SHALL treat a worktree as **docs-generator-present** when it contai
 
 ### Requirement: Pre-PR docs freshness has one explicit owner and ordering
 
-When the worktree is docs-generator-present, the shared post-implementation path (first open and resume; and the fix path that may push an updated head) SHALL enforce docs freshness **after** implement/fix commits are finalized and format/test gates have converged, and **before** advertising implement success and **before** `git push` / `createPr` / treating an existing-PR resume as gate-passed. The ordered docs step SHALL be: run docs check → optional auto-heal (at most one bounded attempt) → re-run docs check → when a heal commit landed, re-run the normal format+test gates on the new HEAD → only then push and create-or-reuse PR. A non-zero docs check on the HEAD that would be pushed SHALL prevent both new-PR creation and successful push/update advance.
+When the worktree is docs-generator-present, the shared post-implementation path (first open and resume; and the fix path that may push an updated head) SHALL enforce docs freshness **after** implement/fix commits are finalized and format/test gates have converged, and **before** advertising implement success and **before** `git push` / `createPr` / treating an existing-PR resume as gate-passed. The ordered docs step SHALL be: run docs check → optional auto-heal (at most one bounded attempt) → re-run docs check → when a heal commit landed, re-run the normal format+test gates on the new HEAD → **re-run docs check in check-only mode (no second auto-heal) on the resulting HEAD** → only then push and create-or-reuse PR. A non-zero docs check on the HEAD that would be pushed SHALL prevent both new-PR creation and successful push/update advance.
 
 #### Scenario: Stale generated docs blocks before PR create and push
 
@@ -53,12 +53,22 @@ When the worktree is docs-generator-present, the shared post-implementation path
 - **WHEN** auto-heal commits regenerated docs outputs
 - **AND** the re-check exits 0
 - **THEN** the path SHALL re-run format+test gates on the new HEAD before push or PR create/reuse
+- **AND** SHALL re-run docs check in check-only mode on the post-gate HEAD before push or PR create/reuse
+- **AND** SHALL NOT perform a second auto-heal on that final check
+
+#### Scenario: Post-heal gate commit that re-stales docs blocks push
+
+- **WHEN** auto-heal commits regenerated docs outputs and the re-check exits 0
+- **AND** the subsequent format+test gates converge with a new HEAD whose docs freshness check is non-zero
+- **THEN** the path SHALL block
+- **AND** SHALL NOT call `createPr`
+- **AND** SHALL NOT push that red-docs head as a successful implement/fix outcome
 
 ### Requirement: On docs-check failure the stage SHALL auto-heal or fail closed with real diagnostics
 
 When docs-generator-present and the docs freshness check fails, the implement/test-gate path SHALL either:
 
-1. **Auto-heal (at most one attempt):** require a clean worktree immediately before generate; run the generator in write mode (`npm run docs:generate` or `node scripts/generate-docs.mjs`); commit only dirt attributable to that generate (same clean-tree precondition class as build-artifact fold) with a conventional docs-regenerate commit message that references the issue number; re-run the freshness check; if green and a commit landed, re-run format+test gates on the new HEAD; **or**
+1. **Auto-heal (at most one attempt):** require a clean worktree immediately before generate; run the generator in write mode (`npm run docs:generate` or `node scripts/generate-docs.mjs`); commit only dirt attributable to that generate (same clean-tree precondition class as build-artifact fold) with a conventional docs-regenerate commit message that references the issue number; re-run the freshness check; if green and a commit landed, re-run format+test gates on the new HEAD and then re-run docs check in check-only mode (no second auto-heal) on the resulting HEAD; **or**
 2. **Fail closed:** block with a reason that preserves check/generate stdout/stderr and, when the output lists stale paths, names those stale file(s) (e.g. `CHANGELOG.md`); when the failure is not a parseable stale-output report, report the command failure clearly without inventing file names.
 
 The path SHALL NOT open or update a PR while the docs freshness check is red. The path SHALL NOT auto-commit when the worktree was dirty before generate, when generate produces no change, or when generate itself fails.
@@ -70,7 +80,9 @@ The path SHALL NOT open or update a PR while the docs freshness check is red. Th
 - **AND** running the generator in write mode updates that file
 - **THEN** the stage SHALL commit the regenerated outputs
 - **AND** re-run the docs freshness check
-- **AND** when the re-check exits 0, SHALL re-run format+test gates on the new HEAD and then allow the post-implementation path to continue (subject to those gates)
+- **AND** when the re-check exits 0, SHALL re-run format+test gates on the new HEAD
+- **AND** SHALL re-run docs check in check-only mode on the post-gate HEAD
+- **AND** when that final check exits 0, SHALL allow the post-implementation path to continue (subject to those gates)
 
 #### Scenario: Dirty worktree prevents auto-commit of unrelated dirt
 

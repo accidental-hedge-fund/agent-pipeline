@@ -56,6 +56,7 @@ import { includeLockfileSideEffects, type LockfileSideEffectsDeps } from "../loc
 import { buildFailureBlockReason, includeBuildArtifacts, type BuildSideEffectsDeps } from "../build-side-effects.ts";
 import {
   enforceDocsFreshness,
+  checkDocsFreshness,
   type DocsFreshnessDeps,
 } from "../docs-freshness.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -102,7 +103,12 @@ export interface AdvanceFixDeps {
   _runFormatAndTestGates?: typeof runFormatAndTestGates;
   /** Docs freshness enforcement (#716); injectable for tests. */
   enforceDocsFreshness?: typeof enforceDocsFreshness;
-  /** Deps forwarded into the default enforceDocsFreshness implementation. */
+  /**
+   * Check-only docs freshness (#716 finding: post-heal gate commits).
+   * Defaults to checkDocsFreshness; injectable for tests.
+   */
+  checkDocsFreshness?: typeof checkDocsFreshness;
+  /** Deps forwarded into the default enforceDocsFreshness / checkDocsFreshness implementations. */
   docsFreshness?: DocsFreshnessDeps;
   /**
    * Injectable harness invoker for the internal bounded-repair closure (#356).
@@ -1019,6 +1025,8 @@ export async function advanceFix(
   // ---- Docs freshness (#716): after format/test, before push ----
   // Same pre-PR contract as resumeFromImplementing so a fix that dirties
   // generated docs cannot push a red-docs head as a successful gate pass.
+  // After a heal commit + post-heal gates, re-verify check-only so gate
+  // commits cannot re-stale generated docs on the HEAD that would be pushed.
   const docsEnforce = deps.enforceDocsFreshness ?? enforceDocsFreshness;
   const docsResult = await docsEnforce(wt.path, issueNumber, deps.docsFreshness ?? {});
   if (!docsResult.ok) {
@@ -1039,6 +1047,12 @@ export async function advanceFix(
         postHealGates.source === "test" ? "test-gate-exhausted" : postHealGates.source === "build" ? "build-failed" : "needs-human");
       return { advanced: false, status: "blocked", reason: postHealGates.reason,
         blockerKind: postHealGates.source === "test" ? "test-gate-exhausted" : postHealGates.source === "build" ? "build-failed" : "needs-human" };
+    }
+    const docsCheckOnly = deps.checkDocsFreshness ?? checkDocsFreshness;
+    const finalDocs = await docsCheckOnly(wt.path, deps.docsFreshness ?? {});
+    if (!finalDocs.ok) {
+      await setBlocked(cfg, issueNumber, finalDocs.reason, stage, "needs-human");
+      return { advanced: false, status: "blocked", reason: finalDocs.reason, blockerKind: "needs-human" };
     }
   }
 

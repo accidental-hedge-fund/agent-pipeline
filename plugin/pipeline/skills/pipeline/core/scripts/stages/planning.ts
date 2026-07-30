@@ -74,6 +74,7 @@ import { INJECTION_PATTERNS } from "../artifact-sanitize.ts";
 import {
   detectDocsGenerator,
   enforceDocsFreshness,
+  checkDocsFreshness,
   type DocsFreshnessDeps,
 } from "../docs-freshness.ts";
 
@@ -1403,7 +1404,12 @@ export interface ResumeFromImplementingDeps {
   _runFormatAndTestGates?: typeof runFormatAndTestGates;
   /** Docs freshness enforcement (#716); injectable for tests (no real generate-docs). */
   enforceDocsFreshness?: typeof enforceDocsFreshness;
-  /** Deps forwarded into the default enforceDocsFreshness implementation. */
+  /**
+   * Check-only docs freshness (#716 finding: post-heal gate commits).
+   * Defaults to checkDocsFreshness; injectable for tests.
+   */
+  checkDocsFreshness?: typeof checkDocsFreshness;
+  /** Deps forwarded into the default enforceDocsFreshness / checkDocsFreshness implementations. */
   docsFreshness?: DocsFreshnessDeps;
 }
 
@@ -1469,7 +1475,9 @@ export async function resumeFromImplementing(
 
   // ---- Docs freshness (#716): after format/test, before push / createPr ----
   // Generator-absent worktrees are inert. When present: check → optional one-shot
-  // auto-heal → re-check; a heal commit re-runs format+test on the new HEAD.
+  // auto-heal → re-check; a heal commit re-runs format+test on the new HEAD, then
+  // a final check-only docs verify (no second heal) so gate commits cannot re-stale
+  // generated docs on the HEAD that would be pushed.
   const docsResult = await docsEnforce(wt.path, issueNumber, deps.docsFreshness ?? {});
   if (!docsResult.ok) {
     await blocker(cfg, issueNumber, docsResult.reason, "implementing", "needs-human");
@@ -1490,6 +1498,12 @@ export async function resumeFromImplementing(
         postHealGates.source === "test" ? "test-gate-exhausted" : "needs-human",
       );
       return { advanced: false, status: "blocked", reason: postHealGates.reason };
+    }
+    const docsCheckOnly = deps.checkDocsFreshness ?? checkDocsFreshness;
+    const finalDocs = await docsCheckOnly(wt.path, deps.docsFreshness ?? {});
+    if (!finalDocs.ok) {
+      await blocker(cfg, issueNumber, finalDocs.reason, "implementing", "needs-human");
+      return { advanced: false, status: "blocked", reason: finalDocs.reason };
     }
   }
 

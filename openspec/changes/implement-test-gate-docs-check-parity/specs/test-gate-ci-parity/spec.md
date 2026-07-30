@@ -8,8 +8,14 @@ When this repository includes the docs generator entry point (`scripts/generate-
 
 - **WHEN** `scripts/generate-docs.mjs` is present in the repository (or `package.json` defines `docs:check` for that generator)
 - **AND** the `ci` npm script in root `package.json` is inspected via structural parse (JSON `scripts` map / transitive script targets, not solely a whole-file substring)
-- **THEN** the `ci` script SHALL reach the docs freshness step (`docs:check` or `generate-docs.mjs --check`)
+- **THEN** the `ci` script SHALL reach a **check-mode** docs freshness step (`docs:check` whose body invokes the generator with `--check`, or a direct `generate-docs.mjs --check` invocation)
 - **AND** a drift-guard test SHALL fail if that step is removed while the generator remains
+
+#### Scenario: write-mode docs:check does not satisfy CI freshness wiring
+
+- **WHEN** `package.json` defines `docs:check` as a generator write-mode invocation without `--check` (e.g. `node scripts/generate-docs.mjs`)
+- **AND** the `ci` graph only reaches that write-mode script (no separate `--check` edge)
+- **THEN** structural inspection SHALL NOT report that `ci` reaches docs freshness
 
 #### Scenario: stale generated docs fail the local test gate via npm run ci
 

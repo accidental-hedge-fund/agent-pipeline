@@ -8,12 +8,14 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  checkDocsFreshness,
   ciScriptReachesDocsFreshness,
   detectDocsGenerator,
   docsRegenerateCommitMessage,
   enforceDocsFreshness,
   extractStalePaths,
   scriptInvokesDocsGenerator,
+  scriptIsDocsFreshnessCheck,
   type DocsFreshnessDeps,
 } from "../scripts/docs-freshness.ts";
 import {
@@ -138,6 +140,13 @@ test("scriptInvokesDocsGenerator: matches generator contract only", () => {
   assert.equal(scriptInvokesDocsGenerator(undefined), false);
 });
 
+test("scriptIsDocsFreshnessCheck: requires generator + --check (not write-mode)", () => {
+  assert.equal(scriptIsDocsFreshnessCheck("node scripts/generate-docs.mjs --check"), true);
+  assert.equal(scriptIsDocsFreshnessCheck("node scripts/generate-docs.mjs"), false);
+  assert.equal(scriptIsDocsFreshnessCheck("markdownlint docs/"), false);
+  assert.equal(scriptIsDocsFreshnessCheck(undefined), false);
+});
+
 test("detectDocsGenerator: absent when no file and no generator docs:check", () => {
   const surface = detectDocsGenerator("/wt", {
     fileExists: () => false,
@@ -180,6 +189,28 @@ test("detectDocsGenerator: docs:check script invoking generator activates withou
   if (surface.present) {
     assert.equal(surface.checkCommand, "npm run docs:check");
     assert.equal(surface.generateCommand, "npm run docs:generate");
+  }
+});
+
+test("detectDocsGenerator: write-mode docs:check is not selected as check command (#716)", () => {
+  const surface = detectDocsGenerator("/wt", {
+    fileExists: (p) => p.replace(/\\/g, "/").endsWith("scripts/generate-docs.mjs"),
+    readPackageJson: () => ({
+      scripts: {
+        // Miswired: docs:check writes instead of checking.
+        "docs:check": "node scripts/generate-docs.mjs",
+        "docs:generate": "node scripts/generate-docs.mjs",
+      },
+    }),
+  });
+  assert.equal(surface.present, true);
+  if (surface.present) {
+    assert.equal(
+      surface.checkCommand,
+      "node scripts/generate-docs.mjs --check",
+      "must not use write-mode npm run docs:check as the freshness check",
+    );
+    assert.notEqual(surface.checkCommand, "npm run docs:check");
   }
 });
 
@@ -227,6 +258,18 @@ test("ciScriptReachesDocsFreshness: false when docs:check is unrelated", () => {
     ciScriptReachesDocsFreshness({
       ci: "npm run docs:check",
       "docs:check": "markdownlint docs/",
+    }),
+    false,
+  );
+});
+
+test("ciScriptReachesDocsFreshness: false when docs:check is write-mode generator (#716)", () => {
+  assert.equal(
+    ciScriptReachesDocsFreshness({
+      ci: "npm run ci:core && npm run docs:check",
+      "ci:core": "npm test",
+      // Invokes generator but without --check — not a freshness edge.
+      "docs:check": "node scripts/generate-docs.mjs",
     }),
     false,
   );
@@ -351,6 +394,28 @@ test("enforceDocsFreshness: re-check still red after heal → fail closed with s
     assert.ok(result.stalePaths.includes("CHANGELOG.md"));
   }
   assert.equal(commits.length, 1, "heal commit was attempted");
+});
+
+test("checkDocsFreshness: green check-only → ok without heal", async () => {
+  const { deps, log, commits } = makeEnforceDeps({ checkCodes: [0] });
+  const result = await checkDocsFreshness("/wt", deps);
+  assert.equal(result.ok, true);
+  assert.equal(result.ran, true);
+  if (result.ok && result.ran) assert.equal(result.healed, false);
+  assert.equal(log.length, 1);
+  assert.deepEqual(commits, []);
+});
+
+test("checkDocsFreshness: red check-only → fail closed, no generate", async () => {
+  const { deps, log, commits } = makeEnforceDeps({ checkCodes: [1] });
+  const result = await checkDocsFreshness("/wt", deps);
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.match(result.reason, /final HEAD before push/i);
+    assert.ok(result.stalePaths.includes("CHANGELOG.md"));
+  }
+  assert.equal(log.length, 1, "only check ran — no generate");
+  assert.deepEqual(commits, []);
 });
 
 // ---------------------------------------------------------------------------
@@ -517,7 +582,7 @@ test("resumeFromImplementing: existing-PR resume also fails closed on red docs",
   assert.ok(!transitionCalled, "must not advance past implement verification");
 });
 
-test("resumeFromImplementing: auto-heal re-runs format+test gates before push", async () => {
+test("resumeFromImplementing: auto-heal re-runs format+test gates then final docs check before push", async () => {
   const callLog: string[] = [];
   let gateRounds = 0;
 
@@ -530,6 +595,10 @@ test("resumeFromImplementing: auto-heal re-runs format+test gates before push", 
     enforceDocsFreshness: async () => {
       callLog.push("docs-heal");
       return { ok: true, ran: true, healed: true, paths: ["CHANGELOG.md"] };
+    },
+    checkDocsFreshness: async () => {
+      callLog.push("docs-final-check");
+      return { ok: true, ran: true, healed: false };
     },
     getPrForBranch: async () => null,
     createPr: async () => {
@@ -562,10 +631,72 @@ test("resumeFromImplementing: auto-heal re-runs format+test gates before push", 
   assert.equal(result.advanced, true);
   assert.equal(gateRounds, 2, "format+test must re-run after heal");
   assert.deepEqual(
-    callLog.slice(0, 4),
-    ["gates-1", "docs-heal", "gates-2", "push"],
+    callLog.slice(0, 5),
+    ["gates-1", "docs-heal", "gates-2", "docs-final-check", "push"],
   );
   assert.ok(callLog.includes("createPr"));
+});
+
+test("resumeFromImplementing: post-heal final docs check red blocks push/createPr (#716)", async () => {
+  let createPrCalled = false;
+  let pushCalled = false;
+  let blockedReason = "";
+
+  const deps: ResumeFromImplementingDeps = {
+    _runFormatAndTestGates: async () => ({ ok: true, gate: passedGate() }),
+    enforceDocsFreshness: async () => ({
+      ok: true,
+      ran: true,
+      healed: true,
+      paths: ["CHANGELOG.md"],
+    }),
+    // Format/test after heal re-staled generated docs — check-only must fail closed.
+    checkDocsFreshness: async () => ({
+      ok: false,
+      ran: true,
+      reason:
+        "docs freshness check failed on the final HEAD before push. " +
+        "PR open/update withheld for docs freshness.\n\n" +
+        "Stale generated file(s): CHANGELOG.md\n\n```\n" +
+        staleCheckOutput() +
+        "\n```",
+      stalePaths: ["CHANGELOG.md"],
+    }),
+    getPrForBranch: async () => null,
+    createPr: async () => {
+      createPrCalled = true;
+      return 0;
+    },
+    gitInWorktree: async (_p, args) => {
+      if (args[0] === "push") pushCalled = true;
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    setBlocked: async (_cfg, _n, reason) => {
+      blockedReason = reason;
+    },
+    transition: async () => {
+      assert.fail("transition must not run when final docs check is red");
+    },
+  };
+
+  const result = await resumeFromImplementing(
+    makeCfg(),
+    716,
+    { path: "/fake/wt", branch: "pipeline/716-docs" },
+    {
+      prTitle: "t",
+      prBody: "b",
+      transitionMessage: () => "m",
+      pipelineRunId: "run-1",
+    },
+    deps,
+  );
+
+  assert.equal(result.advanced, false);
+  if (!result.advanced) assert.equal(result.status, "blocked");
+  assert.ok(!createPrCalled, "createPr must NOT run when post-heal final docs check is red");
+  assert.ok(!pushCalled, "push must NOT run when post-heal final docs check is red");
+  assert.match(blockedReason, /final HEAD before push|CHANGELOG\.md/i);
 });
 
 test("bite: removing pre-PR docs enforcement would allow createPr on red docs", async () => {
@@ -624,6 +755,19 @@ test("bite: removing pre-PR docs enforcement would allow createPr on red docs", 
   const fixPushIdx = fixSrc.indexOf('["push", "origin", branch]');
   assert.ok(fixDocsIdx > 0, "fix.ts must call docsEnforce on the post-gate path");
   assert.ok(fixPushIdx > fixDocsIdx, "docsEnforce must appear before push in fix.ts");
+
+  // Post-heal path must re-verify check-only before push (planning + fix).
+  for (const [label, src] of [
+    ["planning.ts", planningSrc],
+    ["fix.ts", fixSrc],
+  ] as const) {
+    const healBlock = src.indexOf("docsResult.ran && docsResult.healed");
+    assert.ok(healBlock > 0, `${label} must have post-heal branch`);
+    const finalCheckIdx = src.indexOf("docsCheckOnly(", healBlock);
+    const pushAfterHeal = src.indexOf("push", finalCheckIdx > 0 ? finalCheckIdx : healBlock);
+    assert.ok(finalCheckIdx > healBlock, `${label} must call docsCheckOnly after heal`);
+    assert.ok(pushAfterHeal > finalCheckIdx, `${label}: final docs check before push`);
+  }
 });
 
 // ---------------------------------------------------------------------------
