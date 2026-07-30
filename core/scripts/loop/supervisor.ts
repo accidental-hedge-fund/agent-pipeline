@@ -56,6 +56,13 @@ import {
   type LoopExecutionResponse,
   type LoopTerminalOutcome,
 } from "../loop-execution-contract.ts";
+import {
+  applyAdvanceEventsToStageProgress,
+  buildStageProgressTable,
+  reconcileTerminalStageProgress,
+  type AdvanceStageEvent,
+  type StageProgressTableRow,
+} from "./stage-progress.ts";
 
 /** Optional hooks the production dispatch seam (or a test fake) may invoke
  *  during a whole-item hand-off. `onAdvanceLinked` fires when the advance
@@ -145,7 +152,21 @@ export interface SupervisorDeps {
    *  default — this module stays config/gh-free; the caller (e.g. `pipeline.ts`)
    *  supplies the actual auto-file behavior. */
   onDriveEnd?(result: DriveSupervisorResult): Promise<void>;
+  /**
+   * Read advance run-store events for stage-progress observation (#611).
+   * Injected so unit tests never touch the real FS or a live child process.
+   * When absent, mid-wait stage projection is not updated (terminal reconcile
+   * still runs when a real advance_run_id is known from linkage).
+   */
+  readAdvanceEvents?(eventsPath: string): Promise<AdvanceStageEvent[]>;
+  /** Poll interval (ms) while observing advance stage events during dispatch wait. */
+  stageProgressPollMs?: number;
+  /** Injectable sleep for stage-progress polling (tests inject a no-op / immediate). */
+  sleep?(ms: number): Promise<void>;
 }
+
+/** Default poll interval while observing a linked advance events.jsonl mid-wait. */
+export const DEFAULT_STAGE_PROGRESS_POLL_MS = 250;
 
 // ---------------------------------------------------------------------------
 // Internal ledger mutations not already exposed by recovery.ts/pause.ts —
@@ -597,13 +618,56 @@ export async function runSupervisorCycle(
       labelEventsBeforeDispatchByItem.set(itemId, events);
     }),
   );
-  // Per-item dispatch with durable advance-run linkage (#667): start linkage
-  // via `onAdvanceLinked` (before/at child wait when the run id is known),
-  // terminal linkage after the response (or rejection) settles. Both writes
-  // go through the store's `appendEvent` seam — never a second ledger.
+  // Per-item dispatch with durable advance-run linkage (#667) and mid-wait
+  // stage-progress observation (#611): start linkage via `onAdvanceLinked`,
+  // poll the confirmed advance events.jsonl for material stage/round changes,
+  // terminal linkage after the response (or rejection) settles. Stage
+  // projection writes go through the store's ledger/event seams — never a
+  // GitHub stage-label write or per-stage verb.
   const settled = await Promise.allSettled(
     activeItemIds.map(async (itemId) => {
       let startLinkage: { item_id: string; pipeline_run_id: string; events: string } | null = null;
+      let stopObserve = false;
+      let observePromise: Promise<void> = Promise.resolve();
+      let eventOffset = 0;
+
+      const drainAdvanceEvents = async () => {
+        if (!startLinkage || !deps.readAdvanceEvents) return;
+        try {
+          const events = await deps.readAdvanceEvents(startLinkage.events);
+          if (events.length <= eventOffset) return;
+          const result = await applyAdvanceEventsToStageProgress(deps.store, {
+            runId,
+            token,
+            itemId,
+            advance_run_id: startLinkage.pipeline_run_id,
+            events,
+            fromIndex: eventOffset,
+          });
+          eventOffset = result.nextIndex;
+        } catch {
+          // Observation is best-effort: a read/parse failure must never fail the dispatch.
+        }
+      };
+
+      const startObserver = () => {
+        if (!deps.readAdvanceEvents || !startLinkage) return;
+        const pollMs = deps.stageProgressPollMs ?? DEFAULT_STAGE_PROGRESS_POLL_MS;
+        const sleepFn =
+          deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+        observePromise = (async () => {
+          // Immediate drain, then poll until the child wait ends.
+          await drainAdvanceEvents();
+          while (!stopObserve) {
+            await sleepFn(pollMs);
+            if (stopObserve) break;
+            await drainAdvanceEvents();
+          }
+          // Final drain after stop so events that landed at exit are not lost.
+          await drainAdvanceEvents();
+        })();
+      };
+
       try {
         const response = await deps.dispatchItem(buildRequest(itemId), {
           onAdvanceLinked: async (linkage) => {
@@ -613,12 +677,31 @@ export async function runSupervisorCycle(
               pipeline_run_id: linkage.pipeline_run_id,
               events: linkage.events,
             });
+            // Observe only after the real advance store is confirmed (events path known).
+            startObserver();
           },
         });
+        stopObserve = true;
+        await observePromise.catch(() => {});
         const outcome = normalizeLoopOutcome(response.outcome);
         await appendEvent(deps.store, runId, token, LOOP_ITEM_ADVANCE_FINISHED, buildTerminalLinkageFromResponse(itemId, outcome, response));
+        // Terminal stage presentation reconcilable with coarse state mapping.
+        const advanceRunId =
+          response.evidence.pipeline_run_id &&
+          !String(response.evidence.pipeline_run_id).startsWith("pipeline-loop-")
+            ? response.evidence.pipeline_run_id
+            : startLinkage?.pipeline_run_id;
+        await reconcileTerminalStageProgress(deps.store, {
+          runId,
+          token,
+          itemId,
+          outcome,
+          ...(advanceRunId ? { advance_run_id: advanceRunId } : {}),
+        }).catch(() => {});
         return response;
       } catch (err) {
+        stopObserve = true;
+        await observePromise.catch(() => {});
         // Rejection path: still record terminal failure linkage. When start
         // linkage fired, echo the same ids; otherwise omit events/path so we
         // never invent a live join to a non-existent store.
@@ -636,6 +719,13 @@ export async function runSupervisorCycle(
           terminal.events = startLinkage.events;
         }
         await appendEvent(deps.store, runId, token, LOOP_ITEM_ADVANCE_FINISHED, terminal);
+        await reconcileTerminalStageProgress(deps.store, {
+          runId,
+          token,
+          itemId,
+          outcome: "failed",
+          ...(startLinkage ? { advance_run_id: startLinkage.pipeline_run_id } : {}),
+        }).catch(() => {});
         throw err;
       }
     }),
@@ -1271,17 +1361,24 @@ export interface SupervisorAuditReport {
   consecutive_no_progress: number;
   stop: LoopStopRecord | null;
   status: LoopStatus;
+  /**
+   * Per-item stage-progress table (#611) — derived from durable ledger
+   * projections (and coarse state when projection is absent). Never invents a
+   * live advance run-id for queued items.
+   */
+  stage_progress: StageProgressTableRow[];
 }
 
 /** Renders the process identity, the action-evidence timeline, the watchdog
- *  state, and the run's current position — zero durable writes: no ledger
- *  write, no lock acquisition, no `supervisor.json` write, no GitHub
- *  mutation. A run with no `supervisor.json` yet audits with the process
- *  identity reported absent. */
+ *  state, the per-item stage-progress table (#611), and the run's current
+ *  position — zero durable writes: no ledger write, no lock acquisition, no
+ *  `supervisor.json` write, no GitHub mutation. A run with no `supervisor.json`
+ *  yet audits with the process identity reported absent. */
 export async function auditSupervisor(store: LoopStoreDeps, runId: string): Promise<SupervisorAuditReport> {
   const status = await getStatus(store, runId);
   const process = await readSupervisorProcess(store, runId);
   const action_evidence = await readActionEvidence(store, runId);
+  const ledger = await readLedger(store, runId);
   return {
     run_id: runId,
     process,
@@ -1289,5 +1386,6 @@ export async function auditSupervisor(store: LoopStoreDeps, runId: string): Prom
     consecutive_no_progress: process?.consecutive_no_progress ?? 0,
     stop: status.stop,
     status,
+    stage_progress: buildStageProgressTable(ledger),
   };
 }

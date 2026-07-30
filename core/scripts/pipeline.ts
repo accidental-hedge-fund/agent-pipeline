@@ -16,7 +16,7 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
-import { writeFileSync, readFileSync, realpathSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, realpathSync, existsSync, promises as fsPromises } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import { Command, Option } from "commander";
@@ -140,9 +140,15 @@ import {
   readContract,
   readLedger,
   resolveSupersessionChainHead,
+  runDir as loopRunDir,
   runExists as loopRunExists,
 } from "./loop/store.ts";
 import { runLoopLogs } from "./loop/logs.ts";
+import {
+  followLoopStageProgress,
+  formatAuditStageTableRow,
+  parseAdvanceEventsJsonl,
+} from "./loop/stage-progress.ts";
 import { initRecoverableRun } from "./loop/recovery.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
 import { compileContractItems } from "./loop/dependencies.ts";
@@ -424,7 +430,7 @@ export function buildCmd(): Command {
     .option("--model <model>", "override the review/fix model when supported by the selected harness")
     .option("--profile <name>", "shared-core profile to use: codex or claude", process.env.PIPELINE_PROFILE ?? "codex")
     .option("--json-events", "stream lifecycle events to stdout as JSON lines (in addition to human-readable output)")
-    .option("-f, --follow", "follow mode for 'pipeline logs' / 'pipeline loop logs': stream new output until interrupt (SIGINT/SIGTERM); does not auto-exit on terminal stop events")
+    .option("-f, --follow", "follow mode: stream new output until interrupt (SIGINT/SIGTERM) for 'pipeline logs' / 'pipeline loop logs'; with 'pipeline loop --audit --follow', stream whole-run stage-progress lines (not harness stdout)")
     .option("--events", "logs mode: read/follow events.jsonl (required selection for advance logs; always selected for 'pipeline loop logs')")
     // `pipeline run <N> --detach` options
     .option("--detach", "run the pipeline in a detached background process (survives launcher exit)")
@@ -444,7 +450,7 @@ export function buildCmd(): Command {
     .option("--range <spec>", "loop: issue-number range selector, e.g. 400-420")
     .option("--roadmap-slice <slice>", "loop: named roadmap slice selector")
     .option("--resume <run-id>", "loop: resume an existing durable run by id, regardless of which engine created it")
-    .option("--audit", "loop: read-only report for the run instead of starting/resuming")
+    .option("--audit", "loop: read-only report for the run (process identity, action evidence, per-item stage table); combine with --follow for stage-progress streaming")
     .option("--new-run", "loop: start a fresh run superseding a terminally-stopped canonical run for the same selector")
     // papercut (#419) is agent-facing, not human-facing: registered and directly invocable
     // (see command-registry.ts + the dispatch block below) but deliberately absent from the
@@ -1039,6 +1045,11 @@ export interface RunLoopEngineInput {
   /** `--new-run` (#568, capability `loop-run-supersession`): only ever true alongside `selector`
    *  — {@link normalizeLoopArgs} refuses it with `--resume` or with no selector present. */
   newRun?: boolean;
+  /**
+   * `--audit --follow` (#611): read-only whole-run stage-progress stream.
+   * Requires `audit: true` (enforced by normalizeLoopArgs).
+   */
+  follow?: boolean;
   repoDir: string;
   /**
    * Early run-ready hook (#665): invoked once after exclusive lock and before
@@ -1050,6 +1061,12 @@ export interface RunLoopEngineInput {
 
 export type LoopEngineResult =
   | { kind: "audit"; report: Awaited<ReturnType<typeof auditSupervisor>> }
+  | {
+      kind: "audit_follow";
+      report: Awaited<ReturnType<typeof auditSupervisor>>;
+      /** Absolute path of the loop run events.jsonl used for stage follow. */
+      events_path: string;
+    }
   | { kind: "drive"; result: Awaited<ReturnType<typeof driveSupervisor>> }
   | { kind: "error"; message: string };
 
@@ -1141,6 +1158,14 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     }
     try {
       const report = await auditSupervisor(store, input.resumeRunId);
+      if (input.follow) {
+        const dir = loopRunDir(store, input.resumeRunId);
+        return {
+          kind: "audit_follow",
+          report,
+          events_path: path.join(dir, "events.jsonl"),
+        };
+      }
       return { kind: "audit", report };
     } catch (err) {
       return { kind: "error", message: (err as Error).message };
@@ -1231,6 +1256,16 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     observe: defaultReconcileObserveDeps(cfg),
     dispatchItem: realDispatchItem(cfg, input.engine),
     getChangedFiles: realGetChangedFiles(cfg),
+    // Mid-advance stage-progress observation (#611): read the linked advance
+    // events.jsonl while waiting on the child. Injectable for unit tests.
+    readAdvanceEvents: async (eventsPath) => {
+      try {
+        const text = await fsPromises.readFile(eventsPath, "utf8");
+        return parseAdvanceEventsJsonl(text);
+      } catch {
+        return [];
+      }
+    },
     // Opt-in durable-run-blocker auto-file (#538): best-effort, gated on
     // resolved config, wrapped so a failure here can never alter the drive
     // result (driveSupervisor's own onDriveEnd call site already swallows any
@@ -1311,6 +1346,7 @@ export async function runLoopCommand(
     resume: opts.resume,
     audit: opts.audit,
     newRun: opts.newRun,
+    follow: opts.follow,
   };
 
   // Read only the loop.native_goal_attestation key, gh-free (design.md
@@ -1342,6 +1378,7 @@ export async function runLoopCommand(
     resumeRunId: outcome.args.resumeRunId,
     audit: outcome.args.audit,
     newRun: outcome.args.newRun,
+    follow: outcome.args.follow,
     repoDir,
     // Early handoff (#665): emit only on successful drive attach+lock, before
     // first dispatch. Audit and preflight/engine failure paths never set this
@@ -1364,8 +1401,26 @@ export async function runLoopCommand(
     return;
   }
 
-  if (engineResult.kind === "audit") {
+  if (engineResult.kind === "audit" || engineResult.kind === "audit_follow") {
+    // Human-readable per-item stage table (#611) — operators can pass advance
+    // run ids to `pipeline logs <id> --follow` without grepping harness stdout.
+    const stageRows = engineResult.report.stage_progress ?? [];
+    if (stageRows.length > 0) {
+      console.log("Stage progress:");
+      for (const row of stageRows) {
+        console.log(formatAuditStageTableRow(row));
+      }
+    }
     console.log(JSON.stringify({ schema_version: "1", engine, ...engineResult.report }));
+    if (engineResult.kind === "audit") {
+      process.exitCode = 0;
+      return;
+    }
+    // Read-only stage-progress follow: stream clean one-line stage transitions
+    // from durable loop events — never per-item harness terminal.log.
+    await followLoopStageProgress(engineResult.report.run_id, {
+      store: defaultLoopStoreDeps(),
+    });
     process.exitCode = 0;
     return;
   }
