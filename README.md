@@ -263,7 +263,8 @@ or `$pipeline:<command>` (Codex) entry. The advance loop has no sub-command.
 /pipeline:logs [<run-id>] [-f]               list or stream pipeline run logs
 /pipeline:loop --milestone v2  $pipeline:loop --milestone v2   canonical durable multi-item run (driven in-repo by Pipeline's own supervisor)
 /pipeline:loop --resume <run-id>              resume an existing durable run by id, on either engine
-/pipeline:loop --audit                        read-only report for the run; no writes
+/pipeline:loop --audit                        read-only report for the run (process identity, action evidence, per-item stage table); no writes
+/pipeline:loop --resume <run-id> --audit --follow  stream whole-run stage-progress lines (not harness stdout)
 /pipeline:loop --milestone v2 --new-run       start a fresh run superseding a terminally-stopped canonical run for the same selector
 /pipeline improve                             read run artifacts; print dry-run cluster report (read-only)
 /pipeline improve --apply                     same, then create GitHub issues for top-N recurring patterns
@@ -571,7 +572,18 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 
 ## Scoreboard sub-command
 
-`pipeline scoreboard` is a **read-only** factory-control report over `.agent-pipeline/runs/*/run.json`, `events.jsonl`, and `summary.json`. It summarizes ready-to-deploy autonomy, cost per ready PR, stage accounting by issue/stage/harness/model/outcome, prompt size, run and stage durations, harness calls, fix rounds, blocker kinds, `pipeline:needs-human`, same-harness fallback, and test/eval/shipcheck pass rates. It never reads `terminal.log` and never modifies GitHub labels/comments, worktrees, config, or run artifacts.
+`pipeline scoreboard` is a **read-only** factory-control report over `.agent-pipeline/runs/*/run.json`, `events.jsonl`, and `summary.json`. It summarizes ready-to-deploy autonomy, cost per ready PR, stage accounting by issue/stage/harness/model/outcome, prompt size, run and stage durations, harness calls, fix rounds, blocker kinds, `pipeline:needs-human`, **pre-merge needs-human rate and by-class breakdown** (`ci-failed`, `delta-review`, `merge-conflict`, OpenSpec, residual `other` — from durable run events only, not issue comments), same-harness fallback, and test/eval/shipcheck pass rates. It never reads `terminal.log` and never modifies GitHub labels/comments, worktrees, config, or run artifacts.
+
+**Dogfood-day pre-merge class breakdown (#683):** for a single-day (or custom-window) machine-readable aggregate:
+
+```bash
+pipeline scoreboard --days 1 --json
+# → .metrics.pre_merge_needs_human
+#    .rate  { numerator, denominator, ratio }   # off-ramps / pre-merge entries
+#    .by_class.<class>.{ count, rate }          # same denominator; class counts sum to numerator
+```
+
+Classification is taken from enriched `blocker_set` events (`stage`, `offramp_class`, `blocker_kind`) written when pre-merge blocks; historical events without those fields still count under a residual bucket. Papercut auto-file thresholds by class rate are an explicit follow-up (out of scope for this metric).
 
 **Repeat-correction and control-attribution recurrence (#501):** the report additionally reads `correction_event` records (deduped by `correction_id`) and reports total corrections, distinct correction classes (distinct `correction_key`), the repeated-class count/rate, and corrections per ready-to-deploy item. It joins each class to `.agent-pipeline/control-attributions.jsonl` — the durable, explicit attribution ledger written only by `pipeline correction attribute` (never inferred from a closed issue or merged PR) — and reports the attributed `control_type`, `time-to-control`, and post-control recurrence classified as `recurred`, `no_recurrence_observed`, or `insufficient_post_control_evidence` (measured only over included runs that started after the control's `effective_at` and exercised the class's stage — zero such runs is never reported as "no recurrence"). Supersession and rollback are surfaced rather than hidden, and the report states only temporal attribution and recurrence evidence, never a causal claim. `--corrections-by <dimension>` (`repo`, `stage`, `harness`, `model`, `source_kind`, `failure_class`, `proposed_control`, or `implemented_control`; exactly one) adds an additive grouping section, and a top-still-recurring-classes list with sanitized evidence pointers is always included.
 
@@ -579,6 +591,7 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 /pipeline scoreboard
 /pipeline scoreboard --since 2026-06-01T00:00:00Z --until 2026-06-15T00:00:00Z
 /pipeline scoreboard --days 7
+/pipeline scoreboard --days 1 --json   # dogfood day: pre-merge needs-human by class
 /pipeline scoreboard --json
 /pipeline scoreboard --estimate-cost codex=0.75 --estimate-cost claude=1.00
 ```
@@ -696,7 +709,8 @@ never sets a stage label itself and never merges.
 /pipeline:loop --roadmap-slice next  select a named roadmap slice
 /pipeline:loop 418 419 420           select an explicit issue list
 /pipeline:loop --resume <run-id>     resume an existing run — on either engine, by run id
-/pipeline:loop --audit               read-only report for a run; performs no write
+/pipeline:loop --audit               read-only report for a run (includes per-item stage table); performs no write
+/pipeline:loop --resume <run-id> --audit --follow  stream whole-run stage-progress lines until interrupt
 /pipeline:loop --milestone v2 --new-run   supersede a terminally-stopped canonical run for the same selector with a fresh run
 ```
 
@@ -714,9 +728,15 @@ holder is provably gone — a released lock, or a same-host dead-pid lock recove
 through the store's provably-dead path; a run whose supervisor is still alive (or whose
 holder is on a different, unverifiable host) is refused with zero writes rather than
 double-driven. `--audit` renders the run's process identity, its append-only
-action-evidence timeline, and its watchdog/no-progress state with zero durable writes —
-no ledger write, no lock, no GitHub mutation. A pre-existing run created by a legacy
-goal-loop invocation remains addressable by `--resume <run-id>` (read-only import).
+action-evidence timeline, its watchdog/no-progress state, and a **per-item stage-progress
+table** (pipeline stage + optional review/fix round + advance run-id for
+`pipeline logs <advance-run-id> --follow`) with zero durable writes — no ledger write, no
+lock, no GitHub mutation. Mid-advance stage is projected from the linked advance run's
+`events.jsonl` onto the durable ledger (distinct from coarse item `state`). Combine with
+`--follow` (`pipeline loop --resume <run-id> --audit --follow`) to stream clean one-line
+stage transitions for the whole run — not interleaved harness stdout. A pre-existing run
+created by a legacy goal-loop invocation remains addressable by `--resume <run-id>`
+(read-only import).
 
 **Early run handoff (#665).** A successful multi-item drive stays in the foreground for
 the whole wall-clock of the run, but as soon as the durable run is created/resumed and
@@ -1375,6 +1395,10 @@ $pipeline loop logs <loop-run-id> --events --follow --no-until-terminal
 
 # list available durable loop run ids (most recent first)
 $pipeline loop logs
+
+# per-item stage table + optional whole-run stage-progress follow (not harness stdout)
+$pipeline loop --resume <loop-run-id> --audit
+$pipeline loop --resume <loop-run-id> --audit --follow
 ```
 
 Stream lifecycle events to stdout as JSON lines alongside normal output (for orchestrators like Pipeline Desk):

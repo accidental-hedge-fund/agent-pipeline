@@ -395,6 +395,7 @@ test("blockerKindToInterventionKind: specific mappings are stable", () => {
   assert.equal(blockerKindToInterventionKind("push-failed"), "test-build-failure");
   assert.equal(blockerKindToInterventionKind("no-commits"), "test-build-failure");
   assert.equal(blockerKindToInterventionKind("build-failed"), "test-build-failure");
+  assert.equal(blockerKindToInterventionKind("ci-exhausted"), "test-build-failure");
   assert.equal(blockerKindToInterventionKind("human-decision-required"), "product-judgment-required");
 });
 

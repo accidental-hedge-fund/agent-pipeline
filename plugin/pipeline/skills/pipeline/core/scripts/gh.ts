@@ -1060,6 +1060,112 @@ export async function reopenPr(cfg: PipelineConfig, prNumber: number): Promise<v
 }
 
 // ---------------------------------------------------------------------------
+// Pre-merge CI recovery helpers (#679)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract a GitHub Actions workflow run id from a check `link` URL.
+ * Accepts forms like:
+ *   https://github.com/o/r/actions/runs/123456789
+ *   https://github.com/o/r/actions/runs/123456789/job/987
+ * Returns null when the link is missing or not an actions run URL.
+ */
+export function extractWorkflowRunId(link: string | undefined | null): string | null {
+  if (!link) return null;
+  const m = link.match(/\/actions\/runs\/(\d+)/);
+  return m?.[1] ?? null;
+}
+
+export interface RerunFailedWorkflowsResult {
+  /** True when at least one re-run was successfully requested. */
+  attempted: boolean;
+  /** Run ids we attempted to re-run. */
+  runIds: string[];
+  /** Human-readable note when no re-run could be requested. */
+  reason?: string;
+}
+
+/**
+ * Re-run failed jobs for the workflow run(s) associated with definitive failed
+ * checks (`gh run rerun <id> --failed`). Dedupes by run id. Returns
+ * `{ attempted: false }` when no run id can be resolved or every re-run call fails —
+ * callers must treat that as "re-run unavailable" and continue the recovery ladder
+ * without spinning.
+ */
+export async function rerunFailedWorkflows(
+  cfg: PipelineConfig,
+  failedChecks: CheckRun[],
+): Promise<RerunFailedWorkflowsResult> {
+  const runIds = new Set<string>();
+  for (const c of failedChecks) {
+    const id = extractWorkflowRunId(c.link);
+    if (id) runIds.add(id);
+  }
+  if (runIds.size === 0) {
+    return { attempted: false, runIds: [], reason: "no workflow run id in check links" };
+  }
+  const attemptedIds: string[] = [];
+  const errors: string[] = [];
+  for (const id of runIds) {
+    try {
+      await ghRun(["run", "rerun", id, "--failed", "-R", cfg.repo], { retries: 1 });
+      attemptedIds.push(id);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errors.push(`${id}: ${msg}`);
+    }
+  }
+  if (attemptedIds.length === 0) {
+    return {
+      attempted: false,
+      runIds: [...runIds],
+      reason: `re-run failed: ${errors.join("; ")}`,
+    };
+  }
+  return { attempted: true, runIds: attemptedIds };
+}
+
+const LOG_EXCERPT_MAX_CHARS = 2500;
+const LOG_EXCERPT_MAX_LINES = 40;
+
+/**
+ * Fetch a bounded log excerpt for a failed check via `gh run view --log-failed`.
+ * Returns null on any failure (best-effort; never invents content).
+ */
+export async function fetchCheckLogExcerpt(
+  cfg: PipelineConfig,
+  check: CheckRun,
+): Promise<string | null> {
+  const runId = extractWorkflowRunId(check.link);
+  if (!runId) return null;
+  try {
+    const stdout = await ghRun(
+      ["run", "view", runId, "--log-failed", "-R", cfg.repo],
+      { retries: 1, timeoutMs: 60_000 },
+    );
+    return trimLogExcerpt(stdout);
+  } catch {
+    return null;
+  }
+}
+
+/** Keep the last meaningful lines of a CI log, hard-capped by lines and chars. */
+export function trimLogExcerpt(raw: string, maxLines = LOG_EXCERPT_MAX_LINES, maxChars = LOG_EXCERPT_MAX_CHARS): string | null {
+  if (!raw || !raw.trim()) return null;
+  const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return null;
+  const tail = lines.slice(-maxLines);
+  let text = tail.join("\n");
+  if (text.length > maxChars) {
+    text = text.slice(text.length - maxChars);
+    // Drop a partial first line after char truncation.
+    const nl = text.indexOf("\n");
+    if (nl > 0 && nl < 200) text = text.slice(nl + 1);
+  }
+  return text.trim() || null;
+}
+
+// ---------------------------------------------------------------------------
 // Worktree cleanup: merged-PR detection
 // ---------------------------------------------------------------------------
 

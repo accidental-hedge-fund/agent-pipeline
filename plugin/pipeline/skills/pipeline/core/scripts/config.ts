@@ -231,6 +231,8 @@ const PartialConfigSchema = z.object({
   ci_poll_interval: z.number().int().positive().optional().describe("Seconds between CI status polls."),
   ci_no_run_grace_s: z.number().int().min(0).optional().describe("Seconds to wait before checking for zero check-runs when CI is pending. Default 60; set to 0 to check immediately."),
   ci_mode: z.enum(["github", "local"]).optional().describe("Source of pre-merge CI verification: github (default) waits on gh pr checks; local relies on the current run's local test-gate result and skips the GitHub Actions wait."),
+  pre_merge_ci_assertion_fix: z.boolean().optional().describe("When true, allow one surgical implementer fix attempt per head SHA for assertion-classified pre-merge CI failures. Default false (opt-in)."),
+  pre_merge_ci_rerun_enabled: z.boolean().optional().describe("When true (default), allow one automatic failed-workflow re-run per head SHA for infra/unknown pre-merge CI failures."),
   // Repository-configurable primary/secondary harness roles (#608). Both keys
   // are optional and independently fall back to the active profile's default
   // when omitted — a repo can pin one role without the other. `implementer`
@@ -965,6 +967,10 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     ci_poll_interval: fileConfig.ci_poll_interval ?? DEFAULT_CONFIG.ci_poll_interval,
     ci_no_run_grace_s: fileConfig.ci_no_run_grace_s ?? DEFAULT_CONFIG.ci_no_run_grace_s,
     ci_mode: fileConfig.ci_mode ?? DEFAULT_CONFIG.ci_mode,
+    pre_merge_ci_assertion_fix:
+      fileConfig.pre_merge_ci_assertion_fix ?? DEFAULT_CONFIG.pre_merge_ci_assertion_fix,
+    pre_merge_ci_rerun_enabled:
+      fileConfig.pre_merge_ci_rerun_enabled ?? DEFAULT_CONFIG.pre_merge_ci_rerun_enabled,
     // Harness roles are resolved per-role (#608): the repository's
     // `harnesses:` block wins over the active profile for each of
     // implementer/reviewer independently; `review_harness` may additionally
@@ -2100,6 +2106,8 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     `ci_poll_interval: ${yamlScalar(config.ci_poll_interval ?? d.ci_poll_interval)} # ${sd("ci_poll_interval", "seconds between CI status polls")}`,
     `ci_no_run_grace_s: ${yamlScalar(config.ci_no_run_grace_s ?? d.ci_no_run_grace_s)} # ${sd("ci_no_run_grace_s", "seconds to wait before checking for zero check-runs when CI appears pending; set to 0 to check immediately")}`,
     `ci_mode: ${yamlScalar(config.ci_mode ?? d.ci_mode)} # ${sd("ci_mode", "github (default): wait for GitHub Actions check-runs; local: rely on the current run's local test-gate result and skip the GitHub Actions wait")}`,
+    `pre_merge_ci_assertion_fix: ${yamlScalar(config.pre_merge_ci_assertion_fix ?? d.pre_merge_ci_assertion_fix)} # ${sd("pre_merge_ci_assertion_fix", "opt-in: one surgical fix attempt per head SHA for assertion-classified pre-merge CI failures (default false)")}`,
+    `pre_merge_ci_rerun_enabled: ${yamlScalar(config.pre_merge_ci_rerun_enabled ?? d.pre_merge_ci_rerun_enabled)} # ${sd("pre_merge_ci_rerun_enabled", "allow one automatic failed-workflow re-run per head SHA for infra/unknown CI failures (default true)")}`,
     "",
     renderModelLines(config.models),
     "",
@@ -2466,6 +2474,8 @@ function normalizeForSync(config: PartialConfig): unknown {
     ci_poll_interval: config.ci_poll_interval ?? d.ci_poll_interval,
     ci_no_run_grace_s: config.ci_no_run_grace_s ?? d.ci_no_run_grace_s,
     ci_mode: config.ci_mode ?? d.ci_mode,
+    pre_merge_ci_assertion_fix: config.pre_merge_ci_assertion_fix ?? d.pre_merge_ci_assertion_fix,
+    pre_merge_ci_rerun_enabled: config.pre_merge_ci_rerun_enabled ?? d.pre_merge_ci_rerun_enabled,
     models: { ...d.models, ...config.models },
     openspec: { ...d.openspec, ...config.openspec },
     last30days: { ...d.last30days, ...config.last30days },

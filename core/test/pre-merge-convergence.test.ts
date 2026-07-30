@@ -9,6 +9,9 @@
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   advance,
   archiveAlreadyDone,
@@ -152,12 +155,13 @@ test("maybeArchiveOpenspec: proceeds to archive when prior archive commit exists
 });
 
 // ---------------------------------------------------------------------------
-// 3. advance(): CI failure + rebase already attempted → needs-human (3.3)
+// 3. advance(): CI failure + recovery budget exhausted → ci-exhausted (#679 / #181)
 // ---------------------------------------------------------------------------
 
-test("advance(): CI failure + rebaseAlreadyAttempted=true → setBlocked needs-human, returns blocked", async (t) => {
+test("advance(): CI failure + rebaseAlreadyAttempted + re-run budget exhausted → setBlocked ci-exhausted", async (t) => {
   const blockedCalls: Array<{ reason: string; label: string }> = [];
   const reviewComment = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`;
+  let rerunCalls = 0;
 
   const deps: AdvancePreMergeDeps = {
     getPrForIssue: async () => PR,
@@ -171,16 +175,22 @@ test("advance(): CI failure + rebaseAlreadyAttempted=true → setBlocked needs-h
     })) as AdvancePreMergeDeps["getPrDetail"],
     getPrCommits: async () => [],
     getPrChecks: (async () => [
-      { name: "clippy", bucket: "fail" },
-      { name: "test", bucket: "fail" },
+      { name: "clippy", bucket: "fail", link: "https://github.com/acme/x/actions/runs/1" },
+      { name: "test", bucket: "fail", link: "https://github.com/acme/x/actions/runs/1" },
     ]) as AdvancePreMergeDeps["getPrChecks"],
     getForIssue: (async () => ({ path: "/wt", slug: "s" })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => false,
     rebaseAlreadyAttempted: () => true,
     tryRebaseAndPush: async () => { throw new Error("must not be called"); },
     markRebaseAttempted: () => {},
+    // Budget already consumed for this head (#679): no second re-run.
+    rerunFailedWorkflows: async () => {
+      rerunCalls++;
+      throw new Error("must not re-run when marker set");
+    },
+    fetchCheckLogExcerpt: async () => null,
     setBlocked: (async (_cfg, _n, reason, _stage, label) => {
-      blockedCalls.push({ reason, label });
+      blockedCalls.push({ reason, label: label ?? "" });
     }) as AdvancePreMergeDeps["setBlocked"],
     transition: async () => {},
     postComment: async () => {},
@@ -190,25 +200,34 @@ test("advance(): CI failure + rebaseAlreadyAttempted=true → setBlocked needs-h
 
   let out;
   await quiet(t, async () => {
-    out = await advance(cfg, ISSUE, {}, deps);
+    out = await advance(
+      cfg,
+      ISSUE,
+      { pollingCtx: { ciRerunAttemptedForSha: SHA_HEAD } },
+      deps,
+    );
   });
 
   assert.equal(out!.advanced, false);
   assert.equal(out!.status, "blocked");
   assert.equal(out!.reason, "CI failed");
   assert.equal(blockedCalls.length, 1, "setBlocked must be called exactly once");
-  assert.equal(blockedCalls[0].label, "needs-human", "label must be needs-human, not test-gate-exhausted");
+  assert.equal(blockedCalls[0].label, "ci-exhausted", "label must be ci-exhausted after budget exhaustion (#679)");
   assert.match(blockedCalls[0].reason, /clippy/, "failing check name must appear in reason");
   assert.match(blockedCalls[0].reason, /test/, "all failing check names must appear");
+  assert.match(blockedCalls[0].reason, /classification/i, "classification must appear in reason");
+  assert.equal(rerunCalls, 0, "must not re-run when budget already consumed");
 });
 
 // ---------------------------------------------------------------------------
-// 4. advance(): CI failure + rebaseAlreadyAttempted=false + rebase fails → needs-human (3.4)
+// 4. advance(): CI failure + rebase fails → continue ladder (re-run or escalate)
 // ---------------------------------------------------------------------------
 
-test("advance(): CI failure + rebaseAlreadyAttempted=false + tryRebaseAndPush=false → setBlocked needs-human", async (t) => {
+test("advance(): CI failure + rebaseAlreadyAttempted=false + tryRebaseAndPush=false → continues recovery (not instant needs-human)", async (t) => {
   const blockedCalls: Array<{ reason: string; label: string }> = [];
   const reviewComment = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${SHA_HEAD} -->`;
+  let rerunCalls = 0;
+  const runDir = await mkdtemp(join(tmpdir(), "pre-merge-conv-"));
 
   const deps: AdvancePreMergeDeps = {
     getPrForIssue: async () => PR,
@@ -222,15 +241,20 @@ test("advance(): CI failure + rebaseAlreadyAttempted=false + tryRebaseAndPush=fa
     })) as AdvancePreMergeDeps["getPrDetail"],
     getPrCommits: async () => [],
     getPrChecks: (async () => [
-      { name: "clippy", bucket: "fail" },
+      { name: "clippy", bucket: "fail", link: "https://github.com/acme/x/actions/runs/42" },
     ]) as AdvancePreMergeDeps["getPrChecks"],
     getForIssue: (async () => ({ path: "/wt", slug: "s" })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => false,
     rebaseAlreadyAttempted: () => false,
     tryRebaseAndPush: async () => false,
     markRebaseAttempted: () => {},
+    rerunFailedWorkflows: async () => {
+      rerunCalls++;
+      return { attempted: true, runIds: ["42"] };
+    },
+    fetchCheckLogExcerpt: async () => null,
     setBlocked: (async (_cfg, _n, reason, _stage, label) => {
-      blockedCalls.push({ reason, label });
+      blockedCalls.push({ reason, label: label ?? "" });
     }) as AdvancePreMergeDeps["setBlocked"],
     transition: async () => {},
     postComment: async () => {},
@@ -238,17 +262,21 @@ test("advance(): CI failure + rebaseAlreadyAttempted=false + tryRebaseAndPush=fa
     getPrDiff: async () => "",
   };
 
-  let out;
-  await quiet(t, async () => {
-    out = await advance(cfg, ISSUE, {}, deps);
-  });
+  try {
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { pollingCtx: {}, runDir }, deps);
+    });
 
-  assert.equal(out!.advanced, false);
-  assert.equal(out!.status, "blocked");
-  assert.equal(out!.reason, "CI failed");
-  assert.equal(blockedCalls.length, 1, "setBlocked must be called exactly once");
-  assert.equal(blockedCalls[0].label, "needs-human", "label must be needs-human");
-  assert.match(blockedCalls[0].reason, /clippy/, "failing check name must appear in reason");
+    // Rebase failed, but unknown/infra re-run still applies → waiting, not instant block.
+    assert.equal(out!.advanced, false);
+    assert.equal(out!.status, "waiting", "must continue recovery ladder after rebase failure (#679)");
+    assert.match(out!.reason ?? "", /re-triggered|CI re/i);
+    assert.equal(blockedCalls.length, 0, "must not setBlocked on first recovery step");
+    assert.equal(rerunCalls, 1, "must attempt one re-run after rebase failure");
+  } finally {
+    await rm(runDir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -343,10 +371,12 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
 // 6. maybeArchiveOpenspec: CLI unavailable with active candidates → blocked (#308)
 // ---------------------------------------------------------------------------
 
-test("maybeArchiveOpenspec: CLI unavailable with active candidate → blocks with openspec-invalid", async (t) => {
+test("maybeArchiveOpenspec: CLI unavailable with active candidate → blocks residual other, not openspec-invalid (#308 / #683 review 2)", async (t) => {
   // Regression for #308: when openspec archive returns { unavailable: true } and
   // there is at least one active change candidate, the step must block rather than
   // return null (which would silently skip the archive and ship an orphaned change dir).
+  // #683 review 2: CLI unavailability is tooling/env, not structural OpenSpec invalid —
+  // kind/outcome must be needs-human (residual other) so scoreboard does not mis-bucket.
   const CHANGE_ID = "some-active-change";
   const CHANGE_PATH = `openspec/changes/${CHANGE_ID}/proposal.md`;
 
@@ -384,7 +414,8 @@ test("maybeArchiveOpenspec: CLI unavailable with active candidate → blocks wit
   assert.equal((out as Awaited<ReturnType<typeof maybeArchiveOpenspec>>)?.advanced, false);
   assert.equal(blockedCalls.length, 1, "setBlocked must be called exactly once");
   assert.equal(blockedCalls[0].stage, "pre-merge");
-  assert.equal(blockedCalls[0].label, "openspec-invalid");
+  assert.equal(blockedCalls[0].label, "needs-human");
+  assert.equal((out as { blockerKind?: string }).blockerKind, "needs-human");
   assert.match(blockedCalls[0].reason, /openspec/, "reason must mention openspec CLI");
   assert.match(blockedCalls[0].reason, new RegExp(CHANGE_ID), "reason must name the change id");
 });

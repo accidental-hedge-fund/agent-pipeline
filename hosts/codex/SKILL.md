@@ -81,6 +81,9 @@ $pipeline:loop --milestone v2            canonical durable multi-item run — dr
 $pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
 $pipeline:loop --audit                   read-only report for the run; no writes
 $pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (default: exit 0 on loop_run_stopped; --no-until-terminal for interrupt-only)
+$pipeline:loop --audit                   read-only report (process identity, action evidence, per-item stage table); no writes
+$pipeline:loop --resume <run-id> --audit --follow  stream whole-run stage-progress lines (not harness stdout)
+$pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (interrupt stops follow; no auto-exit on terminal)
 $pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent)
 $pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
 $pipeline scoreboard --bucket day|week   add a chronological day/week time-series to the scoreboard report
@@ -130,10 +133,13 @@ and the absolute `events` path so a harness can follow structured progress; a
 terminal summary JSON is printed when the supervisor finishes. `--resume
 <run-id>` takes over a run whose prior supervisor is provably gone; a run
 whose supervisor is still alive is refused rather than double-driven.
-`--audit` renders the run's process identity, action-evidence timeline, and
-watchdog/no-progress state with zero durable writes (no drive handoff). A
-pre-existing run created by a legacy goal-loop invocation remains addressable
-by `--resume <run-id>` (read-only import).
+`--audit` renders the run's process identity, action-evidence timeline,
+watchdog/no-progress state, and a **per-item stage-progress table** (stage +
+optional round + advance run-id drill-down) with zero durable writes (no drive
+handoff). Combine with `--follow` (`--resume <run-id> --audit --follow`) to
+stream clean one-line stage transitions for the whole run — not interleaved
+harness stdout. A pre-existing run created by a legacy goal-loop invocation
+remains addressable by `--resume <run-id>` (read-only import).
 
 The native-`/goal` check never treats an absent marker in `codex --help` as
 evidence the capability is missing (a native goal mode is a slash command, not
@@ -813,18 +819,68 @@ done <"$FIFO"
 
 Never forbid background following or event streaming for drive/resume.
 
-#### d. Optional: follow active item advance events when published
+#### d. Dual-follow: MUST arm advance events after linkage (mandatory until #611)
 
-When an item's advance `run_id` is published on a loop event (dispatch→advance
-linkage), optionally follow that item's single-issue stream with the §4
-material kinds:
+When a loop event of kind `loop_item_advance_linked` (or equivalent start
+linkage) publishes an active item's advance `pipeline_run_id` and/or absolute
+advance `events` path, the harness **SHALL** arm a follow on that advance event
+stream **in addition to** the loop stream (dual-follow). This is **not**
+optional: mid-item stage progress (planning → implement → review → pre-merge)
+lives on the **advance** `events.jsonl`, not on the sparse loop stream, until
+first-class stage progress is mirrored onto the loop stream (#611; pre-merge
+density #682).
+
+**Preferred follow target** (when `pipeline_run_id` is known):
+When an item's advance run is linked (`loop_item_advance_linked` carries
+`item_id`, `pipeline_run_id`, and an absolute `events` path), **material
+pre-merge gate outcomes are already mirrored onto the loop stream** as
+`loop_item_progress` (CI waiting/pass/fail, OpenSpec archive, delta review,
+auto-fix, terminal blocked/advanced) while linkage is active — hosts do
+**not** need advance-only follow solely to learn those gate results (#682).
+
+Optionally still follow the linked advance `events.jsonl` for full-fidelity
+stage/harness detail (accounting, raw review findings, etc.):
 
 ```bash
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <advance-run-id> --events --follow
 ```
 
-If no advance `run_id` is published yet, still follow the **loop** event stream
-above — do not require a non-existent linkage field.
+The absolute `events` path from the linkage record is an acceptable alternative
+target (e.g. `tail -F` or host-equivalent follow on that file).
+
+**Before linkage exists:** continue loop-only follow — do **not** require a
+non-existent advance-linkage field.
+
+**Follow lifecycle:**
+
+1. **Arm** advance follow when linkage publishes `pipeline_run_id` / `events`.
+2. On a **new item's** advance linkage, **switch or add** follow for the new
+   advance run; **stop** the prior item's advance follow on that item's terminal
+   advance outcome (e.g. `run_complete`) rather than leaving stale follows open.
+3. Keep the **loop** event stream follow active across item boundaries until a
+   terminal loop outcome or supervisor process exit.
+
+**Material advance kinds** to surface (same spirit as single-issue §4):
+
+- `stage_start`
+- `stage_complete`
+- `pr_created`
+- `review_verdict`
+- `gate_result`
+- `blocker_set`
+- `run_complete`
+
+**Suppress** pure CI poll spam — including repeated identical
+`pre_merge.advancePolling`-style updates in the same burst (surface the first
+material stage/gate event; wait for the eventual advance/block outcome).
+
+**Loop-only follow** remains valid for schedule, hold, and terminal **loop**
+kinds (`loop_schedule_evaluated`, holds, `loop_run_stopped`, …), but is
+**insufficient alone** for mid-item stage progress until #611 ships. When #611
+makes the loop stream carry first-class stage progress, this dual-follow
+mandate **MAY** be demoted to optional / “recommended for full fidelity” in
+that same PR (with host skill + living-spec updates together). Do **not** demote
+solely for quieter notifications while the loop stream is still sparse.
 
 #### e. User-visible progress on material loop events
 
@@ -837,6 +893,12 @@ above — do not require a non-existent linkage field.
 
 **Should surface** when present (not spam):
 
+- `loop_item_progress` — shared progress kind; for `domain: "pre_merge"`, notify
+  on definitive outcomes (`pass`, `fail`, `approve`, `needs_attention`,
+  `attempted`, `success`, `exhausted`, `blocked`, `advanced`) and the **first**
+  `waiting` for a CI stretch. Material pre-merge gate sub-steps (CI, OpenSpec
+  archive, delta review, auto-fix, terminal) appear on the **loop** stream
+  while the item is advance-linked — do not require advance-only logs for those.
 - `loop_schedule_evaluated` — only on a **decision change**, not every identical
   poll in a burst
 - `loop_reconciled` / `loop_merge_barrier_cleared`
@@ -847,7 +909,8 @@ above — do not require a non-existent linkage field.
 
 **Suppress:** pure heartbeats and repeated identical schedule/reconcile
 evaluations in the same burst (same spirit as suppressing
-`pre_merge.advancePolling` in §4).
+`pre_merge.advancePolling` in §4). Do not re-surface every identical
+`loop_item_progress` CI waiting poll after the first for a stretch.
 
 #### f. Stop following (same turn — mandatory)
 
@@ -861,6 +924,11 @@ unrelated to that loop `run_id` / its published advance run ids.
 
 Documented dual-follow scripts **exit 0** after `loop_run_stopped` and a final
 summary line — they must not continue an infinite follow loop after terminal.
+Stop polling/tailing the loop stream when a terminal loop outcome appears —
+especially `loop_run_stopped` — or when the supervisor process exits. Stop (or
+replace) the active item's advance follow on that item's terminal advance
+outcome when switching items or when the advance run completes; do not leave
+unbounded stale advance follows open.
 
 #### g. Final summary / audit
 
@@ -868,8 +936,9 @@ Surface the run's terminal state. Prefer the printed JSON result; for a
 read-only process/timeline report:
 
 ```bash
-node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --audit
-# or with an explicit run: ... loop --resume <run-id> --audit
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audit
+# stage table + optional whole-run stage-progress follow (not harness stdout):
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audit --follow
 ```
 
 The final operator summary **must** include (1) the run's **terminal reason**
@@ -887,7 +956,8 @@ stopped**).
 - `config sync` — previews/applies a validated `.github/pipeline.yml` scaffold refresh, completes in seconds
 - `config repo-map <add|remove|list>` — mutates/lists `repo_map` entries, completes in seconds
 - `doctor` — deterministic preflight, no model calls, completes in seconds
-- `$pipeline:loop --audit` — read-only report for a durable run; synchronous, no event-follow
+- `$pipeline:loop --audit` — read-only report (stage table) for a durable run; synchronous, no event-follow
+- `$pipeline:loop --resume <run-id> --audit --follow` — read-only stage-progress stream; no run-liveness lock
 
 Run those synchronously without the PTY/log-polling orchestration.
 

@@ -16,7 +16,7 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import * as path from "node:path";
-import { writeFileSync, readFileSync, realpathSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, realpathSync, existsSync, promises as fsPromises } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import * as crypto from "node:crypto";
 import { Command, Option } from "commander";
@@ -132,7 +132,7 @@ import {
   storePreflightResult,
   type PreflightResult,
 } from "./stages/doctor.ts";
-import { runLoopPreflight, type LoopEngine, type LoopPreflightOutcome, type LoopSelector, type RawLoopArgs, type NativeGoalAttestation } from "./loop-preflight.ts";
+import { runLoopPreflight, MAX_RANGE_SPAN, type LoopEngine, type LoopPreflightOutcome, type LoopSelector, type RawLoopArgs, type NativeGoalAttestation } from "./loop-preflight.ts";
 import { auditSupervisor, driveSupervisor, type SupervisorDeps } from "./loop/supervisor.ts";
 import {
   defaultLoopStoreDeps,
@@ -140,12 +140,25 @@ import {
   readContract,
   readLedger,
   resolveSupersessionChainHead,
+  runDir as loopRunDir,
   runExists as loopRunExists,
 } from "./loop/store.ts";
 import { runLoopLogs } from "./loop/logs.ts";
+import {
+  followLoopStageProgress,
+  formatAuditStageTableRow,
+  parseAdvanceEventsJsonl,
+} from "./loop/stage-progress.ts";
 import { initRecoverableRun } from "./loop/recovery.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
-import { compileContractItems } from "./loop/dependencies.ts";
+import { compileContractItems, type RawContractItem } from "./loop/dependencies.ts";
+import {
+  discoverDeclaredDependencies,
+  extractRoadmapDeclaredEdges,
+  realWorkListDependencyDiscoverDeps,
+  type RoadmapDeclaredEdge,
+  type WorkListDependencyDiscoverDeps,
+} from "./loop/work-list-deps.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type LoopLedger } from "./loop/types.ts";
 import {
   formatLoopRunHandoff,
@@ -367,6 +380,36 @@ export interface CliOpts {
  * Build and return the configured Commander program (without parsing).
  * Exported so tests can parse synthetic argv slices and verify CLI behaviour.
  */
+/**
+ * Max positional args (including the command keyword) accepted by the shared
+ * extra-positionals guard in main. `loop` accepts the command plus up to
+ * {@link MAX_RANGE_SPAN} issue numbers so an explicit issue-list selector can
+ * reach {@link normalizeLoopArgs} instead of dying as "unexpected argument(s)"
+ * (#554). Other commands keep their pre-existing caps.
+ */
+export function maxPositionalsFor(command: string | undefined): number {
+  if (
+    command === "run" ||
+    command === "release" ||
+    command === "intake" ||
+    command === "triage" ||
+    command === "merge" ||
+    command === "status" ||
+    command === "papercut" ||
+    command === "correction"
+  ) {
+    return 2;
+  }
+  if (command === "unblock" || command === "override" || command === "evals") {
+    return 3;
+  }
+  // loop keyword + up to MAX_RANGE_SPAN issue numbers (same ceiling as --range).
+  if (command === "loop") {
+    return 1 + MAX_RANGE_SPAN;
+  }
+  return 1; // refine-spec and plain advance take only the keyword / issue number
+}
+
 export function buildCmd(): Command {
   const cmd = new Command();
   const collectRepeatable = (value: string, previous: string[] = []): string[] => [...previous, value];
@@ -425,7 +468,7 @@ export function buildCmd(): Command {
     .option("--range <spec>", "loop: issue-number range selector, e.g. 400-420")
     .option("--roadmap-slice <slice>", "loop: named roadmap slice selector")
     .option("--resume <run-id>", "loop: resume an existing durable run by id, regardless of which engine created it")
-    .option("--audit", "loop: read-only report for the run instead of starting/resuming")
+    .option("--audit", "loop: read-only report for the run (process identity, action evidence, per-item stage table); combine with --follow for stage-progress streaming")
     .option("--new-run", "loop: start a fresh run superseding a terminally-stopped canonical run for the same selector")
     // papercut (#419) is agent-facing, not human-facing: registered and directly invocable
     // (see command-registry.ts + the dispatch block below) but deliberately absent from the
@@ -514,15 +557,20 @@ export function workListRunId(repo: string, engine: LoopEngine, issues: readonly
 }
 
 /** Compiles a `LoopContractInit` + seeded `LoopLedger` for an already-resolved
- *  issue-number list — each item independent (no fabricated dependencies),
- *  executed in list order by the supervisor's single-active-item invariant.
- *  Milestone/label/roadmap-slice selectors are resolved into this same
- *  explicit list by {@link resolveSelectorIssues} before compilation. */
+ *  issue-number list. `rawItems` carries **declared** per-item dependencies
+ *  (from {@link discoverDeclaredDependencies} / {@link compileWorkListRunFresh});
+ *  when omitted, every item is independent (`depends_on: []`) — used only by
+ *  pure unit tests that intentionally skip discovery. Production fresh init
+ *  always passes discovered raw items so body/native/roadmap edges feed
+ *  `compileContractItems` (capability `work-list-declared-dependency-population`,
+ *  #615). Milestone/label/roadmap-slice/explicit-list selectors all resolve into
+ *  this same compile entrypoint via {@link resolveSelectorIssues}. */
 export function compileWorkListRun(
   cfg: PipelineConfig,
   engine: LoopEngine,
   issues: readonly string[],
   runId: string,
+  rawItems?: readonly RawContractItem[],
 ): { contract: import("./loop/recovery.ts").LoopContractInit; ledger: LoopLedger } {
   const contract: import("./loop/recovery.ts").LoopContractInit = {
     schema: LOOP_CONTRACT_SCHEMA,
@@ -541,7 +589,9 @@ export function compileWorkListRun(
     ordering: "dependency_sequential",
     max_active_items: 1,
     concurrency_model: "exclusive_lock_single_engine",
-    items: compileContractItems(issues.map((id) => ({ id, depends_on: [] }))),
+    items: compileContractItems(
+      rawItems ?? issues.map((id) => ({ id, depends_on: [] as string[] })),
+    ),
     canonical_hash: runId,
   };
   const ledger: LoopLedger = {
@@ -560,6 +610,23 @@ export function compileWorkListRun(
     authority_amendments: [],
   };
   return { contract, ledger };
+}
+
+/**
+ * Fresh work-list run compile: discover declared dependencies, then compile.
+ * Resume paths must NOT call this — they keep the on-disk contract (no silent
+ * re-discover overwrite). Run id remains {@link workListRunId} of the issue
+ * list only (deps do not change run identity).
+ */
+export async function compileWorkListRunFresh(
+  cfg: PipelineConfig,
+  engine: LoopEngine,
+  issues: readonly string[],
+  runId: string,
+  discoverDeps: WorkListDependencyDiscoverDeps = realWorkListDependencyDiscoverDeps(cfg),
+): Promise<{ contract: import("./loop/recovery.ts").LoopContractInit; ledger: LoopLedger }> {
+  const rawItems = await discoverDeclaredDependencies(issues, discoverDeps);
+  return compileWorkListRun(cfg, engine, issues, runId, rawItems);
 }
 
 /** The real `pipeline/loop-execution@1` dispatch seam: runs the per-item
@@ -981,16 +1048,42 @@ export function extractRoadmapSliceIssues(roadmapText: string, slice: string): n
   return [...issues].sort((a, b) => a - b);
 }
 
-/** Resolves any {@link LoopSelector} into an explicit, ordered issue-number
- *  work list — the shared compilation step `defaultRunLoopEngine` uses for
- *  every selector type so milestone/label/roadmap-slice selectors reach the
- *  supervisor the same way an explicit issue list already did (#512). */
-export async function resolveSelectorIssues(
+/** Result of resolving a loop selector for fresh work-list compile: issue ids
+ *  plus any declared roadmap/slice edges available from the compile context. */
+export interface ResolvedSelectorWorkList {
+  issues: string[];
+  /** Declared issue-level edges from ROADMAP.md / slice graph when available. */
+  roadmapDeclaredEdges: readonly RoadmapDeclaredEdge[];
+}
+
+async function tryLoadRoadmapDeclaredEdges(
+  cfg: PipelineConfig,
+  deps: SelectorResolveDeps,
+  /** When the caller already has roadmap text (roadmap-slice), reuse it. */
+  knownRoadmapText?: string,
+): Promise<readonly RoadmapDeclaredEdge[]> {
+  try {
+    const text = knownRoadmapText ?? (await deps.readRoadmap(cfg));
+    return extractRoadmapDeclaredEdges(text);
+  } catch {
+    // Fail closed: missing/unreadable ROADMAP contributes no edges.
+    return [];
+  }
+}
+
+/** Resolves any {@link LoopSelector} into issue ids + optional roadmap edges
+ *  for declared-dependency population at fresh compile (#615). */
+export async function resolveSelectorWorkList(
   cfg: PipelineConfig,
   selector: LoopSelector,
   deps: SelectorResolveDeps,
-): Promise<string[]> {
-  if (selector.type === "work-list") return selector.value;
+): Promise<ResolvedSelectorWorkList> {
+  if (selector.type === "work-list") {
+    return {
+      issues: selector.value,
+      roadmapDeclaredEdges: await tryLoadRoadmapDeclaredEdges(cfg, deps),
+    };
+  }
 
   if (selector.type === "milestone" || selector.type === "label") {
     const issues = await deps.listOpenIssues(cfg);
@@ -1001,7 +1094,10 @@ export async function resolveSelectorIssues(
     if (matches.length === 0) {
       throw new Error(`no open issues found for ${selector.type} "${selector.value}"`);
     }
-    return matches.map(String);
+    return {
+      issues: matches.map(String),
+      roadmapDeclaredEdges: await tryLoadRoadmapDeclaredEdges(cfg, deps),
+    };
   }
 
   const roadmapText = await deps.readRoadmap(cfg);
@@ -1009,7 +1105,34 @@ export async function resolveSelectorIssues(
   if (matches.length === 0) {
     throw new Error(`roadmap slice "${selector.value}" was not found in ROADMAP.md, or references no issues`);
   }
-  return matches.map(String);
+  return {
+    issues: matches.map(String),
+    roadmapDeclaredEdges: await tryLoadRoadmapDeclaredEdges(cfg, deps, roadmapText),
+  };
+}
+
+/** Resolves any {@link LoopSelector} into an explicit, ordered issue-number
+ *  work list — the shared compilation step `defaultRunLoopEngine` uses for
+ *  every selector type so milestone/label/roadmap-slice selectors reach the
+ *  supervisor the same way an explicit issue list already did (#512). */
+export async function resolveSelectorIssues(
+  cfg: PipelineConfig,
+  selector: LoopSelector,
+  deps: SelectorResolveDeps,
+): Promise<string[]> {
+  return (await resolveSelectorWorkList(cfg, selector, deps)).issues;
+}
+
+/** Production discovery seam for a fresh work-list compile: body/native reads
+ *  via GraphQL/REST, plus any roadmap/slice edges carried from selector
+ *  resolution (#615 review finding 2e0c6562). */
+export function workListDiscoverDepsForCompile(
+  cfg: PipelineConfig,
+  roadmapDeclaredEdges: readonly RoadmapDeclaredEdge[] = [],
+): WorkListDependencyDiscoverDeps {
+  return realWorkListDependencyDiscoverDeps(cfg, {
+    getRoadmapDeclaredEdges: async () => roadmapDeclaredEdges,
+  });
 }
 
 export interface RunLoopEngineInput {
@@ -1020,6 +1143,11 @@ export interface RunLoopEngineInput {
   /** `--new-run` (#568, capability `loop-run-supersession`): only ever true alongside `selector`
    *  — {@link normalizeLoopArgs} refuses it with `--resume` or with no selector present. */
   newRun?: boolean;
+  /**
+   * `--audit --follow` (#611): read-only whole-run stage-progress stream.
+   * Requires `audit: true` (enforced by normalizeLoopArgs).
+   */
+  follow?: boolean;
   repoDir: string;
   /**
    * Early run-ready hook (#665): invoked once after exclusive lock and before
@@ -1031,6 +1159,12 @@ export interface RunLoopEngineInput {
 
 export type LoopEngineResult =
   | { kind: "audit"; report: Awaited<ReturnType<typeof auditSupervisor>> }
+  | {
+      kind: "audit_follow";
+      report: Awaited<ReturnType<typeof auditSupervisor>>;
+      /** Absolute path of the loop run events.jsonl used for stage follow. */
+      events_path: string;
+    }
   | { kind: "drive"; result: Awaited<ReturnType<typeof driveSupervisor>> }
   | { kind: "error"; message: string };
 
@@ -1122,6 +1256,14 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     }
     try {
       const report = await auditSupervisor(store, input.resumeRunId);
+      if (input.follow) {
+        const dir = loopRunDir(store, input.resumeRunId);
+        return {
+          kind: "audit_follow",
+          report,
+          events_path: path.join(dir, "events.jsonl"),
+        };
+      }
       return { kind: "audit", report };
     } catch (err) {
       return { kind: "error", message: (err as Error).message };
@@ -1140,11 +1282,17 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     runId = input.resumeRunId;
   } else if (input.selector) {
     let issues: string[];
+    let roadmapDeclaredEdges: readonly RoadmapDeclaredEdge[];
     try {
-      issues = await resolveSelectorIssues(cfg, input.selector, realSelectorResolveDeps());
+      const resolved = await resolveSelectorWorkList(cfg, input.selector, realSelectorResolveDeps());
+      issues = resolved.issues;
+      roadmapDeclaredEdges = resolved.roadmapDeclaredEdges;
     } catch (err) {
       return { kind: "error", message: `selector resolution failed: ${(err as Error).message}` };
     }
+    // Carry roadmap/slice edges from selector resolution into discovery so an
+    // edge declared only in ROADMAP is not dropped on the production path (#615).
+    const discoverDeps = workListDiscoverDepsForCompile(cfg, roadmapDeclaredEdges);
     const canonicalRunId = workListRunId(cfg.repo, input.engine, issues);
 
     if (input.newRun) {
@@ -1187,7 +1335,16 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
           return { kind: "error", message: repair.message };
         }
         if (repair.plan.initNewRun) {
-          const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, newRunId);
+          let compiled: Awaited<ReturnType<typeof compileWorkListRunFresh>>;
+          try {
+            compiled = await compileWorkListRunFresh(cfg, input.engine, issues, newRunId, discoverDeps);
+          } catch (err) {
+            return {
+              kind: "error",
+              message: `work-list compile failed: ${(err as Error).message}`,
+            };
+          }
+          const { contract, ledger } = compiled;
           contract.supersedes = headRunId;
           await initRecoverableRun(store, contract, ledger);
         }
@@ -1199,7 +1356,16 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     } else {
       runId = canonicalRunId;
       if (!(await loopRunExists(store, runId))) {
-        const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, runId);
+        let compiled: Awaited<ReturnType<typeof compileWorkListRunFresh>>;
+        try {
+          compiled = await compileWorkListRunFresh(cfg, input.engine, issues, runId, discoverDeps);
+        } catch (err) {
+          return {
+            kind: "error",
+            message: `work-list compile failed: ${(err as Error).message}`,
+          };
+        }
+        const { contract, ledger } = compiled;
         await initRecoverableRun(store, contract, ledger);
       }
     }
@@ -1212,6 +1378,16 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     observe: defaultReconcileObserveDeps(cfg),
     dispatchItem: realDispatchItem(cfg, input.engine),
     getChangedFiles: realGetChangedFiles(cfg),
+    // Mid-advance stage-progress observation (#611): read the linked advance
+    // events.jsonl while waiting on the child. Injectable for unit tests.
+    readAdvanceEvents: async (eventsPath) => {
+      try {
+        const text = await fsPromises.readFile(eventsPath, "utf8");
+        return parseAdvanceEventsJsonl(text);
+      } catch {
+        return [];
+      }
+    },
     // Opt-in durable-run-blocker auto-file (#538): best-effort, gated on
     // resolved config, wrapped so a failure here can never alter the drive
     // result (driveSupervisor's own onDriveEnd call site already swallows any
@@ -1292,6 +1468,7 @@ export async function runLoopCommand(
     resume: opts.resume,
     audit: opts.audit,
     newRun: opts.newRun,
+    follow: opts.follow,
   };
 
   // Read only the loop.native_goal_attestation key, gh-free (design.md
@@ -1323,6 +1500,7 @@ export async function runLoopCommand(
     resumeRunId: outcome.args.resumeRunId,
     audit: outcome.args.audit,
     newRun: outcome.args.newRun,
+    follow: outcome.args.follow,
     repoDir,
     // Early handoff (#665): emit only on successful drive attach+lock, before
     // first dispatch. Audit and preflight/engine failure paths never set this
@@ -1345,8 +1523,26 @@ export async function runLoopCommand(
     return;
   }
 
-  if (engineResult.kind === "audit") {
+  if (engineResult.kind === "audit" || engineResult.kind === "audit_follow") {
+    // Human-readable per-item stage table (#611) — operators can pass advance
+    // run ids to `pipeline logs <id> --follow` without grepping harness stdout.
+    const stageRows = engineResult.report.stage_progress ?? [];
+    if (stageRows.length > 0) {
+      console.log("Stage progress:");
+      for (const row of stageRows) {
+        console.log(formatAuditStageTableRow(row));
+      }
+    }
     console.log(JSON.stringify({ schema_version: "1", engine, ...engineResult.report }));
+    if (engineResult.kind === "audit") {
+      process.exitCode = 0;
+      return;
+    }
+    // Read-only stage-progress follow: stream clean one-line stage transitions
+    // from durable loop events — never per-item harness terminal.log.
+    await followLoopStageProgress(engineResult.report.run_id, {
+      store: defaultLoopStoreDeps(),
+    });
     process.exitCode = 0;
     return;
   }
@@ -1557,7 +1753,12 @@ async function main(): Promise<void> {
     process.stdout.write(
       "Usage: pipeline scoreboard [--since <date>] [--until <date>] [--days <n>] [--estimate-cost <harness=usd>] [--bucket <unit>] [--by <dimension>] [--corrections-by <dimension>] [--html <path>] [--json]\n\n" +
       "Read-only factory report: scans .agent-pipeline/runs/*/{run.json,events.jsonl,summary.json}\n" +
-      "and prints throughput, autonomy, cost, duration, retry, blocker, fallback, and gate metrics.\n\n" +
+      "and prints throughput, autonomy, cost, duration, retry, blocker, fallback, and gate metrics.\n" +
+      "Includes pre-merge needs-human rate and by-class breakdown (ci-failed, delta-review,\n" +
+      "merge-conflict, OpenSpec, other) derived from durable run events — never issue comments.\n\n" +
+      "Dogfood-day query (one-day class breakdown as JSON):\n" +
+      "  pipeline scoreboard --days 1 --json\n" +
+      "  # → .metrics.pre_merge_needs_human  (rate + by_class)\n\n" +
       "Options:\n" +
       "  --since <date>              window start (ISO-8601)\n" +
       "  --until <date>              window end (ISO-8601)\n" +
@@ -1885,19 +2086,9 @@ async function main(): Promise<void> {
   // `status <N>` takes two positionals; `unblock <N> "<answer>"` and
   // `override <N> "<spec>"` take three, as does `evals <subcommand>
   // <manifest.json|experiment-dir|harvest-request.json>` (#535).
-  const maxPositionals =
-    cmd.args[0] === "run" ||
-    cmd.args[0] === "release" ||
-    cmd.args[0] === "intake" ||
-    cmd.args[0] === "triage" ||
-    cmd.args[0] === "merge" ||
-    cmd.args[0] === "status" ||
-    cmd.args[0] === "papercut" ||
-    cmd.args[0] === "correction"
-      ? 2
-      : cmd.args[0] === "unblock" || cmd.args[0] === "override" || cmd.args[0] === "evals"
-      ? 3
-      : 1; // refine-spec takes only flags (no extra positionals)
+  // `loop` accepts the keyword plus up to MAX_RANGE_SPAN issue numbers so an
+  // explicit issue-list selector reaches normalizeLoopArgs (#554).
+  const maxPositionals = maxPositionalsFor(cmd.args[0]);
   if (cmd.args.length > maxPositionals) {
     const extra = cmd.args.slice(maxPositionals).join(", ");
     console.error(`pipeline: unexpected argument(s): ${extra}`);

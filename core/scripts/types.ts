@@ -275,6 +275,7 @@ export const BLOCKER_KINDS = [
   "build-failed",
   "design-gate-failed",
   "human-decision-required",
+  "ci-exhausted",
 ] as const;
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
 
@@ -403,6 +404,14 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     '`$pipeline {{N}} --override "<finding-key>: <reason>"` to advance past ' +
     "it (the key comes from the review comment; `--override` clears the " +
     "label and resumes automatically).",
+  "ci-exhausted":
+    "Pre-merge GitHub CI recovery budget for this head SHA is exhausted " +
+    "(automatic re-run / archive-aware recovery / optional assertion fix may " +
+    "already have been consumed — a pure re-run without a fix may not be " +
+    "enough). Inspect the failing check URL(s) and classification in the " +
+    "block reason above, fix product test/build failures or remaining " +
+    "infrastructure issues, push any code fix to the PR head, remove the " +
+    "`blocked` label, then re-run `$pipeline {{N}}`.",
 };
 
 // ---------------------------------------------------------------------------
@@ -586,6 +595,17 @@ export interface PipelineConfig {
   // Only enable "local" when the local gate is identical to full CI and branch
   // protection is operator-managed.
   ci_mode: "github" | "local";
+  /**
+   * Pre-merge GitHub CI: when true, allow one surgical assertion-fix attempt
+   * per head SHA after infra/unknown re-run budget does not apply. Default
+   * false (opt-in) — wrong auto-fix burns rounds (#679).
+   */
+  pre_merge_ci_assertion_fix: boolean;
+  /**
+   * Pre-merge GitHub CI: when true (default), allow one automatic failed-
+   * workflow re-run per head SHA for infra/unknown classifications (#679).
+   */
+  pre_merge_ci_rerun_enabled: boolean;
   // Harness roles + models. The implementer is always taken from the active
   // profile (repo config cannot set it). The reviewer defaults to the profile's
   // value but MAY be overridden per-repo by the `review_harness` config key
@@ -969,6 +989,8 @@ export const DEFAULT_CONFIG: Omit<
   ci_poll_interval: 30,
   ci_no_run_grace_s: 60,
   ci_mode: "github",
+  pre_merge_ci_assertion_fix: false,
+  pre_merge_ci_rerun_enabled: true,
   // review defaults to claude-fable-5 (#366): it is the auto-routed choice for
   // every Adversarial stage, so aligning the default with that routing
   // strengthens review rigor. Only honored when the reviewer harness is claude
@@ -1057,9 +1079,28 @@ export function reviewStageSkipTarget(cfg: Pick<PipelineConfig, "steps">, stage:
 }
 
 // One transition outcome from a stage advance call.
+//
+// `offrampPathTag` (#683): optional pre-merge path classification when
+// `blockerKind` alone is too coarse for scoreboard aggregation (e.g. CI failure
+// and delta-review both use needs-human for the recipe surface). Consumed only
+// by the orchestrator `blocker_set` emission when the stage is pre-merge; other
+// stages may omit it. Values are PreMergeOfframpClass path tags (not residual
+// `other`) — see `pre-merge-offramp.ts`.
 export type Outcome =
   | { advanced: true; from: Stage; to: Stage; summary: string }
-  | { advanced: false; status: "blocked"; reason: string; blockerKind?: BlockerKind }
+  | {
+      advanced: false;
+      status: "blocked";
+      reason: string;
+      blockerKind?: BlockerKind;
+      /** Pre-merge-only path tag for offramp_class mapping (#683). */
+      offrampPathTag?:
+        | "ci-failed"
+        | "delta-review"
+        | "merge-conflict"
+        | "openspec-invalid"
+        | "openspec-stale-delta";
+    }
   | { advanced: false; status: "waiting"; reason: string }
   | { advanced: false; status: "no-op"; reason: string }
   | { advanced: false; status: "finalized"; reason: string }
