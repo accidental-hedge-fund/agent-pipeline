@@ -79,9 +79,11 @@ $pipeline:release <version>              prepare a release PR for the given vers
 $pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
 $pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor
 $pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
+$pipeline:loop --audit                   read-only report for the run; no writes
+$pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (default: exit 0 on loop_run_stopped; --no-until-terminal for interrupt-only)
 $pipeline:loop --audit                   read-only report (process identity, action evidence, per-item stage table); no writes
 $pipeline:loop --resume <run-id> --audit --follow  stream whole-run stage-progress lines (not harness stdout)
-$pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (interrupt stops follow; no auto-exit on terminal)
+$pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run\'s events.jsonl (default: exit 0 on loop_run_stopped; --no-until-terminal for interrupt-only)
 $pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent)
 $pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
 $pipeline scoreboard --bucket day|week   add a chronological day/week time-series to the scoreboard report
@@ -761,17 +763,61 @@ Then resolve the events file:
 
 #### c. Follow the loop event stream
 
-Poll or tail the loop events file **as soon as** `run_id` is known (step b) —
-do not wait for supervisor exit — and summarize material lifecycle records:
+Poll or follow the loop events file **as soon as** `run_id` is known (step b) —
+do not wait for supervisor exit — and summarize material lifecycle records.
+Prefer the first-class CLI (exits 0 on `loop_run_stopped` by default):
 
 ```bash
-# Interim path until a dedicated loop logs-follow CLI is universal (#666).
-# Prefer that CLI when available; keep this file path as a valid fallback.
-tail -F "<state-home>/runs/<run_id>/events.jsonl"
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow
+# default until-terminal: process exits 0 after loop_run_stopped
+# interrupt-only dashboards: add --no-until-terminal
 ```
 
-Never forbid background following or event streaming for drive/resume while
-waiting for a future CLI.
+**Do not** use a bare `tail -F` on `events.jsonl` as a follow fallback: it never
+exits after `loop_run_stopped`, prints no final summary, and leaves zombie
+follows. Prefer the CLI above. Dual-follow / multi-stream scripts **must
+`exit 0`** after observing `loop_run_stopped` and printing a final summary line
+(do not print `TERMINAL` inside `while true` and keep looping). Any raw tail
+must **explicitly track** its tail child PID and **TERM/KILL** that child on
+terminal — process substitution + bare `exit 0` orphans `tail -F`. Example
+terminal-aware raw fallback (explicit child teardown; prefer the CLI):
+
+```bash
+# Prefer: pipeline loop logs <run_id> --events --follow  (auto-exits on terminal)
+EVENTS="<state-home>/runs/<run_id>/events.jsonl"
+# Process substitution alone does NOT kill tail -F on exit — track + TERM/KILL.
+# Private dir + FIFO inside it (never mktemp -u: TOCTOU clobber hazard).
+FIFO_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pipeline-loop-follow.XXXXXX") || exit 1
+FIFO="$FIFO_DIR/events.fifo"
+mkfifo "$FIFO" || { rmdir "$FIFO_DIR" 2>/dev/null; exit 1; }
+tail -n +1 -F "$EVENTS" >"$FIFO" &
+TAIL_PID=$!
+stop_tail() {
+  [ -n "${TAIL_PID:-}" ] || return 0
+  kill -TERM "$TAIL_PID" 2>/dev/null || true
+  sleep 0.1
+  kill -KILL "$TAIL_PID" 2>/dev/null || true
+  wait "$TAIL_PID" 2>/dev/null || true
+  TAIL_PID=""
+  rm -f "$FIFO"
+  rmdir "$FIFO_DIR" 2>/dev/null || true
+}
+trap stop_tail EXIT INT TERM
+while IFS= read -r line; do
+  printf '%s\n' "$line"
+  case "$line" in
+    *'"kind":"loop_run_stopped"'*|*'"kind": "loop_run_stopped"'*)
+      reason=$(printf '%s' "$line" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      echo "TERMINAL reason=${reason:-stopped}; follows stopped"
+      stop_tail
+      trap - EXIT INT TERM
+      exit 0
+      ;;
+  esac
+done <"$FIFO"
+```
+
+Never forbid background following or event streaming for drive/resume.
 
 #### d. Dual-follow: MUST arm advance events after linkage (mandatory until #611)
 
@@ -866,8 +912,18 @@ evaluations in the same burst (same spirit as suppressing
 `pre_merge.advancePolling` in §4). Do not re-surface every identical
 `loop_item_progress` CI waiting poll after the first for a stretch.
 
-#### f. Stop following
+#### f. Stop following (same turn — mandatory)
 
+When a material **`loop_run_stopped`** event is observed for the followed
+`run_id`, **or** when the supervisor process for that run exits: **in the same
+harness turn**, stop **all** loop event follows/tails **and** all advance event
+follows started for that loop run (including dual-follow / multi-stream tails).
+Do **not** leave those follows running until the operator asks to kill them.
+Do **not** kill follows for other issues, other run ids, or session tools
+unrelated to that loop `run_id` / its published advance run ids.
+
+Documented dual-follow scripts **exit 0** after `loop_run_stopped` and a final
+summary line — they must not continue an infinite follow loop after terminal.
 Stop polling/tailing the loop stream when a terminal loop outcome appears —
 especially `loop_run_stopped` — or when the supervisor process exits. Stop (or
 replace) the active item's advance follow on that item's terminal advance
@@ -884,6 +940,11 @@ node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audi
 # stage table + optional whole-run stage-progress follow (not harness stdout):
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audit --follow
 ```
+
+The final operator summary **must** include (1) the run's **terminal reason**
+(or equivalent stop reason from the terminal event / result JSON) and (2)
+explicit confirmation that run-scoped follows were stopped (e.g. **follows
+stopped**).
 
 ### 5. Modes that DON'T need this orchestration
 

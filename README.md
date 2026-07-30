@@ -1387,8 +1387,11 @@ Durable multi-item loop runs store events under the loop state home (not
 # print a durable loop run's events.jsonl
 $pipeline loop logs <loop-run-id> --events
 
-# follow until interrupt (SIGINT/SIGTERM) — does not auto-exit on loop_run_stopped
+# follow until loop_run_stopped (default; exit 0) — use --no-until-terminal for interrupt-only
 $pipeline loop logs <loop-run-id> --events --follow
+
+# long-lived dashboard: keep streaming past terminal until SIGINT/SIGTERM
+$pipeline loop logs <loop-run-id> --events --follow --no-until-terminal
 
 # list available durable loop run ids (most recent first)
 $pipeline loop logs
