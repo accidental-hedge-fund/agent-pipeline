@@ -13,9 +13,9 @@ description: |
 # pipeline
 
 Self-contained TypeScript skill that advances a GitHub issue (or PR's linked
-issue) through a 13-stage label-driven state machine, ending at
-`pipeline:ready-to-deploy`. The pipeline does NOT auto-merge — the user owns
-the merge button.
+issue) through a 16-stage label-driven state machine, ending at
+`pipeline:ready-to-deploy` (or parking at `pipeline:needs-human`). The pipeline
+does NOT auto-merge — the user owns the merge button.
 
 ## Developing this skill itself (core/ → plugin/ mirror)
 
@@ -29,9 +29,10 @@ of `core/` (+ `hosts/claude`). After editing any file under `core/`, run
 ## State machine
 
 ```
-backlog → ready → planning → implementing
+backlog → ready → planning → plan-review → implementing → design-gate
               → review-1 → fix-1 → review-2 → fix-2
-              → pre-merge → eval-gate → shipcheck-gate → ready-to-deploy
+              → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy
+              (terminal off-ramp: needs-human)
 ```
 
 Each item carries one `pipeline:<stage>` label and at most one `blocked`
