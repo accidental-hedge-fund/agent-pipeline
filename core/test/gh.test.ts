@@ -3,7 +3,29 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isTransientGhError } from "../scripts/gh.ts";
+import { activeChangeIdsFromContentsEntries, isTransientGhError } from "../scripts/gh.ts";
+
+// ---------------------------------------------------------------------------
+// activeChangeIdsFromContentsEntries — pure tip-tree listing parser (#714)
+// ---------------------------------------------------------------------------
+
+test("activeChangeIdsFromContentsEntries: dirs only, excludes archive", () => {
+  assert.deepEqual(
+    activeChangeIdsFromContentsEntries([
+      { name: ".gitkeep", type: "file" },
+      { name: "archive", type: "dir" },
+      { name: "foo", type: "dir" },
+      { name: "bar", type: "dir" },
+    ]),
+    ["bar", "foo"],
+  );
+});
+
+test("activeChangeIdsFromContentsEntries: empty / non-array → []", () => {
+  assert.deepEqual(activeChangeIdsFromContentsEntries([]), []);
+  assert.deepEqual(activeChangeIdsFromContentsEntries({ type: "file" }), []);
+  assert.deepEqual(activeChangeIdsFromContentsEntries(null), []);
+});
 
 // ---------------------------------------------------------------------------
 // isTransientGhError — pure classification

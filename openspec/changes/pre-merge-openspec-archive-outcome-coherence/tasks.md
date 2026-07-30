@@ -18,6 +18,7 @@
 - [x] 3.2 Fixture/test: two active changes where archive succeeds for only one — assert no `pass` listing both ids; assert coherent block or residual naming for the leftover (foreign/stacked shape).
 - [x] 3.3 Fixture/test: worktree behind reviewed head that introduces an extra active change — after sync path, id is a candidate (not silent `no-candidates`).
 - [x] 3.4 Keep existing pre-merge archive tests green (base sync, CLI unavailable, commit failure, true empty skip).
+- [x] 3.5 Fixture/test: missing worktree + archive-then-reintroduce tip tree (reintroduced active id present on PR-head tree while cumulative path subtraction is empty) — archive and residual both fail closed naming the id; never `skipped`/`no-candidates` (#714 review 2).
 
 ## 4. Mirror, validate, gate
 

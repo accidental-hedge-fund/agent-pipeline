@@ -58,12 +58,23 @@ When the pre-merge archive step records a successful archive decision (`gate_res
 
 Before finalizing the shared active-change set used to drive archive attempts, the archive step SHALL complete the existing archive-base sync (fetch and fast-forward the worktree to the reviewed `origin/<branch>` head when a worktree is used). Candidate membership for archive attempts SHALL NOT be frozen solely from a pre-sync stale worktree view that omits active changes present on the reviewed head. When the worktree cannot be synced to the reviewed head, the step SHALL keep the existing fail-closed base-sync block and SHALL NOT emit `no-candidates` for that failure.
 
+When no on-disk worktree is available for the issue, the pipeline SHALL resolve the shared active-change set from the reviewed PR-head tree (for example via the GitHub repository contents/tree API at the PR head SHA) and SHALL NOT treat cumulative PR changed-file path subtraction (active paths minus archive paths) as proof that no active change remains. If tip-tree membership cannot be resolved, the step SHALL fail closed rather than emit `no-candidates`.
+
 #### Scenario: stacked change present only after fast-forward is still a candidate
 
 - **WHEN** the local worktree is behind `origin/<branch>`
 - **AND** the reviewed head introduces an active OpenSpec change id not present on the stale local HEAD
 - **THEN** after archive-base sync succeeds, that id SHALL appear in the shared active-change set used for archive attempts
 - **AND** the step SHALL NOT skip with `no-candidates` solely because the pre-sync worktree lacked the change
+
+#### Scenario: missing worktree archive-then-reintroduce is not masked by path subtraction
+
+- **WHEN** no on-disk worktree exists for the issue
+- **AND** the reviewed PR head tree still has active path `openspec/changes/foo/`
+- **AND** the cumulative PR changed-file list also includes an archive path for `foo` (so active-minus-archive subtraction would be empty)
+- **THEN** the shared active-change set SHALL include `foo`
+- **AND** the archive step SHALL NOT record `skipped` with reason `no-candidates`
+- **AND** the residual still-active guard SHALL NOT treat the head as free of active OpenSpec changes
 
 ### Requirement: Residual active-change blocker text SHALL name each id and the archive remedy
 

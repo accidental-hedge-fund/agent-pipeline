@@ -98,6 +98,7 @@ function makeDeps(opts: {
     transition: async (_cfg, _n, from, to) => { rec.transitions.push({ from, to }); },
     setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     getGhActor: async () => TEST_ACTOR,
     createIssue: async (title: string, body: string) => {
       rec.createIssueCalls.push({ title, body });
@@ -298,6 +299,7 @@ test("fuseiq-core#95 replay: at the default cap, the fifth delta round is never 
     transition: async () => {},
     setBlocked: async () => {},
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     getGhActor: async () => TEST_ACTOR,
     runDeltaReview,
   };

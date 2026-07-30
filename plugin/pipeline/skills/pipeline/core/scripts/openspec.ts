@@ -277,8 +277,8 @@ export function changeIdFromArchiveFolderName(folder: string): string {
 }
 
 /**
- * Worktree-independent residual probe from a cumulative PR changed-file list
- * (#467 / #714). Pure over path strings.
+ * Residual probe from a cumulative PR changed-file list (#467 / #714). Pure
+ * over path strings.
  *
  * - `activeIds` = ids appearing as `openspec/changes/<id>/…` (id ≠ `archive`)
  * - `archivedIds` = ids from `openspec/changes/archive/<folder>/…`, with
@@ -287,11 +287,11 @@ export function changeIdFromArchiveFolderName(folder: string): string {
  *
  * **Limitation:** a cumulative PR file list can list both an archive path and a
  * later-reintroduced `openspec/changes/<id>/` for the same id; subtraction then
- * wrongly yields empty. When a synchronized worktree (or other tip-tree view) is
- * available, pre-merge MUST derive membership from that tip tree
- * (`listChangeDirs` / post-sync HEAD) instead of this helper — see #714 review
- * finding on archive-path masking. This helper remains the missing-worktree /
- * path-only fallback for the residual guard and archive step.
+ * wrongly yields empty. Pre-merge MUST NOT use this helper as proof that no
+ * active change remains on the reviewed tip — membership comes from tip-tree
+ * views only: on-disk `listChangeDirs` when a worktree exists, or
+ * `listPrHeadChangeDirs` (PR-head Contents API) when it does not (#714 review 2).
+ * Kept for pure unit tests and any diagnostic path that accepts the limitation.
  */
 export function unarchivedChangeIdsFromPrFiles(paths: string[]): string[] {
   const active = new Set<string>();

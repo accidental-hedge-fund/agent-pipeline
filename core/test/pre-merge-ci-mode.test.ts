@@ -92,6 +92,7 @@ function makeBaseDeps(overrides: Partial<AdvancePreMergeDeps> = {}): AdvancePreM
       >,
     getPrCommits: async () => [],
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     // Default: throw to catch accidental inline gate invocations in tests that
     // don't provide a worktree (getForIssue → null blocks before this is reached).
     runTestGate: async () => { throw new Error("runTestGate should not be called in this test"); },

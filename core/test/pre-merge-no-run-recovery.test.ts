@@ -51,6 +51,7 @@ function baseDeps(): AdvancePreMergeDeps {
     getPrCommits: async () => [],
     getPrDiff: async () => "diff",
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     postComment: async () => {},
     transition: async () => {},
     setBlocked: async () => {},

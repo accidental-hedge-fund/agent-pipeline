@@ -102,11 +102,12 @@ test("maybeArchiveOpenspec: candidate probe (git diff) exits non-zero → blocke
 // 2. Worktree missing while the PR still introduces an active change (3.2)
 // ---------------------------------------------------------------------------
 
-test("maybeArchiveOpenspec: worktree missing + PR file list still carries an active change → blocked needs-human", async (t) => {
+test("maybeArchiveOpenspec: worktree missing + PR-head tip tree still carries an active change → blocked needs-human", async (t) => {
   const blockedCalls: Array<{ reason: string; label: string }> = [];
   const deps: AdvancePreMergeDeps = {
     getForIssue: async () => null,
-    getPrDiff: async () => "diff --git a/openspec/changes/foo/proposal.md b/openspec/changes/foo/proposal.md\n",
+    // Tip-tree membership (not cumulative path subtraction) drives missing-worktree (#714).
+    listPrHeadChangeDirs: async () => ["foo"],
     setBlocked: (async (_cfg, _n, reason, _stage, label) => {
       blockedCalls.push({ reason, label });
     }) as AdvancePreMergeDeps["setBlocked"],
@@ -124,11 +125,11 @@ test("maybeArchiveOpenspec: worktree missing + PR file list still carries an act
   assert.match(blockedCalls[0].reason, /foo/);
 });
 
-test("maybeArchiveOpenspec: worktree missing + PR file list has no OpenSpec paths → returns null (unchanged)", async (t) => {
+test("maybeArchiveOpenspec: worktree missing + empty PR-head tip tree → returns null (unchanged)", async (t) => {
   const blockedCalls: string[] = [];
   const deps: AdvancePreMergeDeps = {
     getForIssue: async () => null,
-    getPrDiff: async () => "diff --git a/src/index.ts b/src/index.ts\n",
+    listPrHeadChangeDirs: async () => [],
     setBlocked: async (_cfg, _n, reason) => { blockedCalls.push(reason); },
   };
 
@@ -138,19 +139,19 @@ test("maybeArchiveOpenspec: worktree missing + PR file list has no OpenSpec path
   assert.deepEqual(blockedCalls, []);
 });
 
-test("maybeArchiveOpenspec: worktree missing + openspec.enabled off → returns null without fetching the PR diff", async (t) => {
-  let prDiffCalled = false;
+test("maybeArchiveOpenspec: worktree missing + openspec.enabled off → returns null without listing tip tree", async (t) => {
+  let tipListed = false;
   const cfgOff = { ...cfg, openspec: { enabled: "off" } } as unknown as PipelineConfig;
   const deps: AdvancePreMergeDeps = {
     getForIssue: async () => null,
-    getPrDiff: async () => { prDiffCalled = true; return ""; },
+    listPrHeadChangeDirs: async () => { tipListed = true; return []; },
     setBlocked: async () => {},
   };
 
   const out = await maybeArchiveOpenspec(cfgOff, ISSUE, "run-1", deps, undefined, PR);
 
   assert.equal(out, null);
-  assert.equal(prDiffCalled, false, "openspec.enabled: off must skip the guard entirely");
+  assert.equal(tipListed, false, "openspec.enabled: off must skip the tip-tree probe entirely");
 });
 
 // ---------------------------------------------------------------------------
@@ -209,9 +210,9 @@ test("unarchivedChangeIdsFromPrFiles: pure helper matches the guard's own semant
 test("enforceOpenspecActiveChangeGuard: PR still introduces an unarchived change → blocks naming it", async (t) => {
   const blockedCalls: Array<{ reason: string; label: string }> = [];
   const deps: AdvancePreMergeDeps = {
-    // Force path-list fallback (no on-disk worktree for this residual probe).
+    // Force remote tip-tree probe (no on-disk worktree for this residual probe).
     getForIssue: (async () => null) as AdvancePreMergeDeps["getForIssue"],
-    getPrDiff: async () => "diff --git a/openspec/changes/foo/proposal.md b/openspec/changes/foo/proposal.md\n",
+    listPrHeadChangeDirs: async () => ["foo"],
     setBlocked: (async (_cfg, _n, reason, _stage, label) => {
       blockedCalls.push({ reason, label });
     }) as AdvancePreMergeDeps["setBlocked"],
@@ -232,8 +233,8 @@ test("enforceOpenspecActiveChangeGuard: PR still introduces an unarchived change
 test("enforceOpenspecActiveChangeGuard: change was archived on the branch → inert", async (t) => {
   const deps: AdvancePreMergeDeps = {
     getForIssue: (async () => null) as AdvancePreMergeDeps["getForIssue"],
-    getPrDiff: async () =>
-      "diff --git a/openspec/changes/archive/foo/proposal.md b/openspec/changes/archive/foo/proposal.md\n",
+    // Tip tree has no active dirs (only archive on head).
+    listPrHeadChangeDirs: async () => [],
     setBlocked: async () => { throw new Error("must not be called"); },
   };
 
@@ -244,7 +245,7 @@ test("enforceOpenspecActiveChangeGuard: change was archived on the branch → in
 test("enforceOpenspecActiveChangeGuard: PR touches no OpenSpec changes → inert", async (t) => {
   const deps: AdvancePreMergeDeps = {
     getForIssue: (async () => null) as AdvancePreMergeDeps["getForIssue"],
-    getPrDiff: async () => "diff --git a/src/index.ts b/src/index.ts\n",
+    listPrHeadChangeDirs: async () => [],
     setBlocked: async () => { throw new Error("must not be called"); },
   };
 
@@ -277,11 +278,11 @@ test("enforceOpenspecActiveChangeGuard: tip-tree active dir blocks even when PR 
   assert.match(blockedCalls[0].reason, /foo/);
 });
 
-test("enforceOpenspecActiveChangeGuard: PR diff fetch fails → fails closed (blocked, not a thrown exception)", async (t) => {
+test("enforceOpenspecActiveChangeGuard: PR-head tip-tree list fails → fails closed (blocked, not a thrown exception)", async (t) => {
   const blockedCalls: Array<{ reason: string; label: string }> = [];
   const deps: AdvancePreMergeDeps = {
     getForIssue: (async () => null) as AdvancePreMergeDeps["getForIssue"],
-    getPrDiff: async () => { throw new Error("gh: authentication required"); },
+    listPrHeadChangeDirs: async () => { throw new Error("gh: authentication required"); },
     setBlocked: (async (_cfg, _n, reason, _stage, label) => {
       blockedCalls.push({ reason, label });
     }) as AdvancePreMergeDeps["setBlocked"],
@@ -296,6 +297,82 @@ test("enforceOpenspecActiveChangeGuard: PR diff fetch fails → fails closed (bl
   assert.equal((out as { status: string })?.status, "blocked");
   assert.equal(blockedCalls[0].label, "needs-human");
   assert.match(blockedCalls[0].reason, /authentication required/);
+});
+
+// ---------------------------------------------------------------------------
+// #714 review 2: missing-worktree must not trust path subtraction for reintro
+// ---------------------------------------------------------------------------
+
+test("maybeArchiveOpenspec: missing worktree + archive-then-reintroduce tip tree blocks (not no-candidates) (#714 5e98a850)", async (t) => {
+  // Cumulative PR paths would include both archive/…-foo/ and reintroduced
+  // openspec/changes/foo/ → sharedActiveChangeIdsFromPaths yields []. Tip tree
+  // still has foo — must block needs-human, never skip/no-candidates.
+  const blockedCalls: Array<{ reason: string; label: string }> = [];
+  const appended: string[] = [];
+  let pathProbeCalled = false;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => ["foo"],
+    getPrDiff: async () => {
+      pathProbeCalled = true;
+      return (
+        "diff --git a/openspec/changes/foo/proposal.md b/openspec/changes/foo/proposal.md\n" +
+        "diff --git a/openspec/changes/archive/2026-07-30-foo/proposal.md b/openspec/changes/archive/2026-07-30-foo/proposal.md\n"
+      );
+    },
+    setBlocked: (async (_cfg, _n, reason, _stage, label) => {
+      blockedCalls.push({ reason, label });
+    }) as AdvancePreMergeDeps["setBlocked"],
+    runDir: "/runs/714-missing-wt-reintro",
+    runStoreDeps: appendOnlyRunStore(appended),
+  };
+
+  let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
+  await quiet(t, async () => {
+    out = await maybeArchiveOpenspec(cfg, ISSUE, "run-1", deps, undefined, PR);
+  });
+
+  assert.equal(pathProbeCalled, false, "missing-worktree must not use cumulative PR path subtraction");
+  assert.notEqual(out, null);
+  assert.equal((out as { status: string })?.status, "blocked");
+  assert.equal(blockedCalls[0]?.label, "needs-human");
+  assert.match(blockedCalls[0]?.reason ?? "", /foo/);
+  const events = appendedEvents(appended).filter((e) => e.type === "gate_result" && e.gate === "openspec-archive");
+  assert.equal(events.length, 1);
+  assert.equal(events[0].result, "fail");
+  assert.notEqual(events[0].reason, "no-candidates");
+});
+
+test("enforceOpenspecActiveChangeGuard: missing worktree + reintroduced tip dir blocks despite archive paths (#714 5e98a850)", async (t) => {
+  const blockedCalls: Array<{ reason: string; label: string }> = [];
+  let pathProbeCalled = false;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => null) as AdvancePreMergeDeps["getForIssue"],
+    listPrHeadChangeDirs: async () => ["foo"],
+    getPrDiff: async () => {
+      pathProbeCalled = true;
+      return (
+        "diff --git a/openspec/changes/foo/proposal.md b/openspec/changes/foo/proposal.md\n" +
+        "diff --git a/openspec/changes/archive/2026-07-30-foo/proposal.md b/openspec/changes/archive/2026-07-30-foo/proposal.md\n"
+      );
+    },
+    setBlocked: (async (_cfg, _n, reason, _stage, label) => {
+      blockedCalls.push({ reason, label });
+    }) as AdvancePreMergeDeps["setBlocked"],
+  };
+
+  let out: Awaited<ReturnType<typeof enforceOpenspecActiveChangeGuard>> = null;
+  await quiet(t, async () => {
+    out = await enforceOpenspecActiveChangeGuard(cfg, ISSUE, PR, deps);
+  });
+
+  assert.equal(pathProbeCalled, false, "residual guard must not use path subtraction when tip tree is available");
+  assert.notEqual(out, null);
+  assert.equal((out as { status: string })?.status, "blocked");
+  assert.equal(blockedCalls[0]?.label, "openspec-invalid");
+  assert.match(blockedCalls[0]?.reason ?? "", /foo/);
 });
 
 // ---------------------------------------------------------------------------

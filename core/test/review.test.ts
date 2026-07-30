@@ -714,6 +714,7 @@ function makeDeps(
         comments: [],
       }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     postComment: async (_cfg, _n, body) => {
       rec.comments.push(body);
     },
@@ -4004,6 +4005,7 @@ function makeDelegationDeps(): { deps: AdvanceReviewDeps; rec: Recorder } {
         url: "https://example.test/1", labels: [], comments: [],
       }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
     postPrComment: async (_cfg, _pr, body) => { rec.prComments.push(body); },
     transition: async (_cfg, _n, _from, to) => { rec.transitions.push({ to }); },

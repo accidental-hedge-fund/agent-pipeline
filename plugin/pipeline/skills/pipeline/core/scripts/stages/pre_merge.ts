@@ -23,6 +23,7 @@ import {
   getPrDetail,
   getPrDiff,
   getPrForIssue,
+  listPrHeadChangeDirs,
   parseChecksAggregate,
   clearBlocked,
   postComment,
@@ -932,6 +933,13 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   changeDirExists?: typeof openspec.changeDirExists;
   /** Tip-tree listing of active change dirs (`openspec/changes/<id>/`, excl. archive). */
   listChangeDirs?: typeof openspec.listChangeDirs;
+  /**
+   * Tip-tree listing of active OpenSpec change ids on the reviewed PR head when
+   * no on-disk worktree is available (#714 review 2). Production default uses the
+   * GitHub Contents API at the PR head SHA. Must not use cumulative PR path
+   * subtraction (archive-then-reintroduce masking).
+   */
+  listPrHeadChangeDirs?: typeof listPrHeadChangeDirs;
   openspecArchive?: typeof openspec.archive;
   /** Per-commit paths for all non-pipeline-internal branch commits (guard input). */
   branchDeveloperCommits?: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
@@ -3263,9 +3271,10 @@ export async function archiveAlreadyDone(
  * Prefer tip-tree membership from the on-disk worktree (`listChangeDirs`) when
  * available — same source as archive candidates after base sync — so a prior
  * archive path in the cumulative PR diff cannot mask a reintroduced active dir.
- * When no worktree is on disk, fall back to the pure PR changed-file helper
- * (`sharedActiveChangeIdsFromPaths`) so the guard still works after the worktree
- * has been removed. Returns `null` to continue when nothing remains active.
+ * When no worktree is on disk, resolve tip membership via the PR-head tree
+ * (`listPrHeadChangeDirs` / GitHub Contents API) — never cumulative PR path
+ * subtraction, which masks archive-then-reintroduce (#714 review 2). Returns
+ * `null` to continue when nothing remains active.
  */
 export async function enforceOpenspecActiveChangeGuard(
   cfg: PipelineConfig,
@@ -3273,14 +3282,13 @@ export async function enforceOpenspecActiveChangeGuard(
   prNumber: number,
   deps: AdvancePreMergeDeps = {},
 ): Promise<Outcome | null> {
-  const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
   const getForIssueFn = deps.getForIssue ?? getOnDiskForIssue;
   const listChangeDirsFn = deps.listChangeDirs ?? openspec.listChangeDirs;
+  const listPrHeadChangeDirsFn = deps.listPrHeadChangeDirs ?? listPrHeadChangeDirs;
 
   // Tip-tree first when a worktree exists (authoritative final head state).
-  // Lookup failures fall through to the PR path helper — do not fail open/closed
-  // solely on bookkeeping errors when the path-list probe can still run.
+  // Lookup failures fall through to the remote PR-head tree probe.
   let wt: { path: string; slug: string } | null = null;
   try {
     wt = await getForIssueFn(cfg, issueNumber);
@@ -3297,20 +3305,18 @@ export async function enforceOpenspecActiveChangeGuard(
     return preMergeBlocked(reason, "openspec-invalid");
   }
 
-  let diff: string;
+  // Missing-worktree: PR-head tree only — not cumulative path subtraction (#714 review 2).
+  let remaining: string[];
   try {
-    diff = await getPrDiffFn(cfg, prNumber);
+    remaining = [...(await listPrHeadChangeDirsFn(cfg, prNumber))].sort();
   } catch (err) {
-    // Fail closed (#467): cannot prove the PR carries no active OpenSpec change,
-    // so do not let a fetch failure silently pass the guard.
+    // Fail closed (#467): cannot prove the PR carries no active OpenSpec change.
     const reason =
-      `Pre-merge cannot verify the OpenSpec active-change guard — fetching the PR diff failed ` +
-      `(${(err as Error).message}). Check gh auth/network and re-run.`;
+      `Pre-merge cannot verify the OpenSpec active-change guard — listing PR-head OpenSpec ` +
+      `change dirs failed (${(err as Error).message}). Check gh auth/network and re-run.`;
     await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
     return preMergeBlocked(reason, "needs-human");
   }
-  // Missing-worktree fallback only — path-list subtraction can mask reintroduction.
-  const remaining = openspec.sharedActiveChangeIdsFromPaths(diffFilePaths(diff));
   if (remaining.length === 0) return null;
 
   const reason =
@@ -3352,6 +3358,7 @@ export async function maybeArchiveOpenspec(
   const isActiveFn = deps.openspecIsActive ?? openspec.isActive;
   const changeDirExistsFn = deps.changeDirExists ?? openspec.changeDirExists;
   const listChangeDirsFn = deps.listChangeDirs ?? openspec.listChangeDirs;
+  const listPrHeadChangeDirsFn = deps.listPrHeadChangeDirs ?? listPrHeadChangeDirs;
   const archiveFn = deps.openspecArchive ?? openspec.archive;
   const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
   const branchDeveloperCommitsFn =
@@ -3390,27 +3397,27 @@ export async function maybeArchiveOpenspec(
 
   const wt = await getForIssueFn(cfg, issueNumber);
   if (!wt) {
-    // Worktree missing: fall back to the head-side PR file list (worktree-independent)
-    // rather than assuming there is nothing to archive (#467). `openspec.enabled: off`
-    // disables the integration outright regardless of file contents.
+    // Worktree missing: resolve active membership from the reviewed PR-head tree
+    // (GitHub Contents API), never cumulative PR path subtraction — the latter
+    // masks archive-then-reintroduce (#467 / #714 review 2). `openspec.enabled: off`
+    // disables the integration outright regardless of tip contents.
     const mode = cfg.openspec?.enabled ?? "auto";
     if (mode === "off" || prNumber === undefined) {
       await recordDecision("skipped", "openspec-inactive");
       return null;
     }
-    let prPaths: string[];
+    let remaining: string[];
     try {
-      prPaths = diffFilePaths(await getPrDiffFn(cfg, prNumber));
+      remaining = [...(await listPrHeadChangeDirsFn(cfg, prNumber))].sort();
     } catch (err) {
       const reason =
-        `Worktree for #${issueNumber} not found on disk and the PR diff fetch failed ` +
-        `(${(err as Error).message}), so it cannot be confirmed there is no active OpenSpec ` +
-        `change to archive. Restore the worktree (or gh auth) and re-run.`;
+        `Worktree for #${issueNumber} not found on disk and listing PR-head OpenSpec change ` +
+        `dirs failed (${(err as Error).message}), so it cannot be confirmed there is no active ` +
+        `OpenSpec change to archive. Restore the worktree (or gh auth) and re-run.`;
       await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
       await recordDecision("fail", reason);
       return preMergeBlocked(reason, "needs-human");
     }
-    const remaining = openspec.sharedActiveChangeIdsFromPaths(prPaths);
     if (remaining.length > 0) {
       const reason =
         `OpenSpec worktree for #${issueNumber} not found on disk, and the pull request still ` +

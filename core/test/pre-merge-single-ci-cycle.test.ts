@@ -56,7 +56,7 @@ function makeDeps(): { deps: AdvancePreMergeDeps; rec: Rec } {
         ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>
       >;
     },
-    getForIssue: async () => null, // no worktree → archive + spec gates skip
+    getForIssue: async () => null, listPrHeadChangeDirs: async () => [], // no worktree → archive + spec gates skip
     postComment: async () => {},
     transition: async (_cfg, _n, from, to) => {
       rec.transitions.push({ from, to });
@@ -165,7 +165,7 @@ test("pre-merge: CI check result recorded in evidence bundle when stateDir provi
       getPrDetail: async () => ({ head_sha: SHA, mergeable: true, mergeable_state: "CLEAN" }) as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>>,
       getPrCommits: async () => [],
       getPrChecks: async () => [{ name: "ci", bucket: "pass" }] as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>>,
-      getForIssue: async () => null, // no worktree → archive + spec gates skip
+      getForIssue: async () => null, listPrHeadChangeDirs: async () => [], // no worktree → archive + spec gates skip
       postComment: async () => {},
       transition: async () => {},
       setBlocked: async () => {},
@@ -213,6 +213,7 @@ test("pre-merge: eval_gate disabled + shipcheck_gate enabled → still routes to
     getPrCommits: async () => [],
     getPrChecks: async () => [{ name: "ci", bucket: "pass" }] as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>>,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     postComment: async () => {},
     transition: async () => {},
     setBlocked: async () => {},
@@ -249,6 +250,7 @@ test("pre-merge: eval_gate disabled + shipcheck_gate disabled → still routes t
     getPrCommits: async () => [],
     getPrChecks: async () => [{ name: "ci", bucket: "pass" }] as Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>>,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     postComment: async () => {},
     transition: async () => {},
     setBlocked: async () => {},

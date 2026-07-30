@@ -551,6 +551,65 @@ export async function getPrDiff(cfg: PipelineConfig, prNumber: number): Promise<
 }
 
 /**
+ * Parse a GitHub Contents API listing of `openspec/changes/` into active change
+ * ids (directories only; excludes `archive`). Pure; exported for unit tests.
+ * Used by {@link listPrHeadChangeDirs} for tip-tree membership (#714).
+ */
+export function activeChangeIdsFromContentsEntries(entries: unknown): string[] {
+  if (!Array.isArray(entries)) return [];
+  const ids: string[] = [];
+  for (const raw of entries) {
+    if (!raw || typeof raw !== "object") continue;
+    const e = raw as { name?: unknown; type?: unknown };
+    if (e.type === "dir" && typeof e.name === "string" && e.name !== "archive" && e.name.length > 0) {
+      ids.push(e.name);
+    }
+  }
+  return ids.sort();
+}
+
+/**
+ * Active OpenSpec change ids present on the reviewed PR head tree (tip membership).
+ *
+ * Lists `openspec/changes/` via the GitHub Contents API at the PR head SHA — the
+ * authoritative final tree, not a cumulative PR changed-file list. Archive-path
+ * subtraction on cumulative paths can mask a reintroduced `openspec/changes/<id>/`
+ * when both path families appear in the PR (#714 review 2). 404 (path missing on
+ * tip) → []. Other API/auth failures throw so callers fail closed.
+ */
+export async function listPrHeadChangeDirs(
+  cfg: PipelineConfig,
+  prNumber: number,
+): Promise<string[]> {
+  const detail = await getPrDetail(cfg, prNumber);
+  const ref = detail.head_sha;
+  if (!ref) {
+    throw new Error(`PR #${prNumber} has no head SHA — cannot list OpenSpec tip-tree change dirs`);
+  }
+  let stdout: string;
+  try {
+    stdout = await ghRun(
+      ["api", `repos/${cfg.repo}/contents/openspec/changes?ref=${encodeURIComponent(ref)}`],
+      { retries: 1 },
+    );
+  } catch (err) {
+    const msg = ((err as Error).message ?? "").toLowerCase();
+    // Missing openspec/changes on the tip is an empty active set, not a probe failure.
+    if (msg.includes("404") || msg.includes("not found")) return [];
+    throw err;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error(
+      `listPrHeadChangeDirs: invalid JSON from contents API for PR #${prNumber}`,
+    );
+  }
+  return activeChangeIdsFromContentsEntries(parsed);
+}
+
+/**
  * The PR's commits, oldest-first (base → head). Used by the pre-merge review-SHA
  * gate (#16) to classify the commits that landed since a review verdict: a
  * developer commit invalidates the verdict, pipeline-internal commits (docs /
