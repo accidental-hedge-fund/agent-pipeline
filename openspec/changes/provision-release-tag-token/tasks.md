@@ -1,3 +1,25 @@
+## Implementation status (2026-07-30)
+
+**Blocked on human-only credential minting.** Agent run verified:
+
+- `GET /repos/accidental-hedge-fund/agent-pipeline/actions/secrets` →
+  `total_count: 0` (no `RELEASE_TAG_TOKEN`).
+- Authenticated actor `comamitc` has repo **admin** and can encrypt/store
+  secrets (`actions/secrets/public-key` readable; `gh secret set` is available).
+- Fine-grained PAT creation has **no** usable API/CLI surface (GitHub does not
+  support programmatic mint of personal access tokens). Tasks 1.x cannot be
+  completed by an unattended agent.
+- Did **not** store the interactive `gh` classic PAT as `RELEASE_TAG_TOKEN`
+  (would violate least-privilege Contents-only scope and couple Actions to a
+  session credential).
+- Did **not** edit workflow YAML, engine code, or introduce a `GITHUB_TOKEN`
+  tag-push fallback (task 4.2 intent held during this attempt).
+- OpenSpec change validates: `openspec validate provision-release-tag-token`.
+
+**Resume:** a trusted maintainer completes §1–§2, then §3 on the next release
+merge. After `gh secret list` shows `RELEASE_TAG_TOKEN`, re-run `/pipeline 449`
+(or `/pipeline:unblock 449` with the secret-list evidence if blocked).
+
 ## 1. Mint the credential (human-only)
 
 - [ ] 1.1 Open https://github.com/settings/personal-access-tokens/new as a trusted maintainer
@@ -27,4 +49,5 @@
 ## 4. Close-out
 
 - [ ] 4.1 Record verification evidence (secret list output name-only, auto-tag run URL, release.yml run URL) on issue #449
-- [ ] 4.2 Confirm no application code, workflow YAML, or `GITHUB_TOKEN` fallback was introduced under this change
+- [x] 4.2 Confirm no application code, workflow YAML, or `GITHUB_TOKEN` fallback was introduced under this change
+      (verified in implementation attempt: only this tasks status note under `openspec/changes/`)
