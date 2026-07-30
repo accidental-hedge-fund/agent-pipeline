@@ -226,8 +226,9 @@ test("isAutoLoopEligible: shipcheck-gate is a hard stop even with a recoverable-
   // A shipcheck verdict failure now carries the dedicated "shipcheck-failed"
   // blockerKind so it records as eval-shipcheck-failure in the taxonomy. That
   // kind is non-needs-human, so isAutoLoopRecoverable treats it as recoverable —
-  // but shipcheck-gate is a human-judgment checkpoint (like plan-review) and the
-  // stage-level hard stop must prevent a silent re-run on reviewer nondeterminism.
+  // but shipcheck-gate is hard-stopped from auto-loop eligibility (like
+  // plan-review: not a recovery-retry surface) and the stage-level hard stop
+  // must prevent a silent re-run on reviewer nondeterminism.
   const al = makeAutoLoop({ stages: ["shipcheck-gate"] });
   const blockedShipcheck: Outcome = {
     advanced: false,
