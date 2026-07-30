@@ -51,7 +51,12 @@ import {
   releaseUpdateLock,
   verifyUpdateLockOwnership,
 } from "./install.mjs";
-import { OPERATION_SURFACE, renderClaudeCommand, shellSingleQuote } from "./build.mjs";
+import {
+  OPERATION_SURFACE,
+  pluginifyCommandFile,
+  renderClaudeCommand,
+  shellSingleQuote,
+} from "./build.mjs";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1683,6 +1688,33 @@ test("renderClaudeCommand: quotes the full script path in the Invoke line", () =
   assert.ok(
     !body.includes(`node ${skillPath}/scripts/pipeline.mjs`),
     "unquoted space-split path must not appear as the node target",
+  );
+});
+
+test("pluginifyCommandFile: double-quotes plugin-root path so ${CLAUDE_PLUGIN_ROOT} expands (#635)", () => {
+  const op = OPERATION_SURFACE[0];
+  const personal = renderClaudeCommand(op, "~/.claude/skills/pipeline");
+  // Personal install keeps single quotes (literal path).
+  assert.ok(
+    personal.includes("node '~/.claude/skills/pipeline/scripts/pipeline.mjs'"),
+    `personal Invoke must single-quote the literal skill path: ${personal}`,
+  );
+  const plugin = pluginifyCommandFile(personal);
+  assert.ok(
+    plugin.includes(
+      'node "${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs"',
+    ),
+    `plugin Invoke must double-quote so \${CLAUDE_PLUGIN_ROOT} expands: ${plugin}`,
+  );
+  assert.ok(
+    !plugin.includes(
+      "node '${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs'",
+    ),
+    "plugin Invoke must not single-quote the plugin-root path (suppresses expansion)",
+  );
+  assert.ok(
+    !plugin.includes("~/.claude/skills/pipeline"),
+    "pluginify must rewrite the personal path placeholder",
   );
 });
 

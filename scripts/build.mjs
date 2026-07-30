@@ -281,8 +281,19 @@ export function renderCodexCommand(op) {
 }
 
 // Rewrite personal-skill paths in a command file to the plugin runtime path.
-function pluginifyCommandFile(content) {
-  return content.replaceAll("~/.claude/skills/pipeline", "${CLAUDE_PLUGIN_ROOT}/skills/pipeline");
+// renderClaudeCommand single-quotes the script path for personal installs (literal
+// paths). After substitution that becomes '${CLAUDE_PLUGIN_ROOT}/…', which POSIX
+// shells do not expand — re-quote with double quotes so the variable expands while
+// the path remains a single token (#635 review finding).
+export function pluginifyCommandFile(content) {
+  const withPluginRoot = content.replaceAll(
+    "~/.claude/skills/pipeline",
+    "${CLAUDE_PLUGIN_ROOT}/skills/pipeline",
+  );
+  return withPluginRoot.replaceAll(
+    "'${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs'",
+    '"${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs"',
+  );
 }
 
 // Rewrite the personal-skill paths in the Claude overlay to the plugin runtime

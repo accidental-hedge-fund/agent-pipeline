@@ -98,6 +98,38 @@ test("namespaced-commands 7.5b: no pipeline:run.md command file exists", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 7.5b1  Plugin Invoke lines must double-quote ${CLAUDE_PLUGIN_ROOT} so the
+//        shell expands it. Single quotes suppress expansion and break every
+//        /pipeline:* plugin command (#635 review finding).
+// ---------------------------------------------------------------------------
+
+test("namespaced-commands 7.5b1: plugin Invoke double-quotes CLAUDE_PLUGIN_ROOT for expansion", () => {
+  const doubleQuoted =
+    'node "${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs"';
+  const singleQuoted =
+    "node '${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs'";
+  for (const name of EXPECTED_OPERATIONS) {
+    let body: string;
+    try {
+      body = readFileSync(join(COMMANDS_DIR, `pipeline:${name}.md`), "utf8");
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      assert.fail(
+        `plugin/pipeline/commands/pipeline:${name}.md missing — run \`node scripts/build.mjs\` (${e.message})`,
+      );
+    }
+    assert.ok(
+      body.includes(doubleQuoted),
+      `pipeline:${name}.md must double-quote plugin-root path so \${CLAUDE_PLUGIN_ROOT} expands`,
+    );
+    assert.ok(
+      !body.includes(singleQuoted),
+      `pipeline:${name}.md must not single-quote plugin-root path (suppresses expansion)`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
 // 7.5b2  Codex and Claude operation sets are symmetric (both from OPERATION_SURFACE)
 // ---------------------------------------------------------------------------
 
