@@ -18,7 +18,7 @@ import { runCell, type CellExecutionDeps } from "./executor.ts";
 import { buildTreatmentTrajectoryArtifact } from "./trajectory/collect.ts";
 import { writeContentAddressedArtifact, type ArtifactStoreDeps } from "./trajectory/store.ts";
 import type { BoundCeilings } from "./trajectory/bound.ts";
-import type { Cell, CellRecord, ExperimentManifest, Fixture, RunPlan } from "./types.ts";
+import { isPairedEvalMode, type Cell, type CellRecord, type ExperimentManifest, type Fixture, type RunPlan } from "./types.ts";
 
 export interface FixtureLoaderDeps extends LoadFixtureDeps {
   listFixtureFiles?: (dir: string) => string[];
@@ -57,9 +57,19 @@ export function expandExperiment(
   const fixtures = loadFixturesFromDir(fixturesDir, deps);
   const manifest = loadManifest(manifestPath, new Set(fixtures.keys()), deps);
 
-  if (manifest.mode !== "end-to-end") {
+  // Paired modes start from task_input + first-stage artifacts (planning or
+  // implementing) with live handoffs thereafter — not a single frozen stage.
+  if (manifest.mode !== "end-to-end" && !isPairedEvalMode(manifest.mode)) {
     for (const fixtureId of manifest.fixture_ids) {
       validateFixtureEntersStage(fixtures.get(fixtureId)!, manifest.mode);
+    }
+  } else if (manifest.mode === "implementing-paired") {
+    for (const fixtureId of manifest.fixture_ids) {
+      validateFixtureEntersStage(fixtures.get(fixtureId)!, "implementing");
+    }
+  } else if (manifest.mode === "pipeline-paired") {
+    for (const fixtureId of manifest.fixture_ids) {
+      validateFixtureEntersStage(fixtures.get(fixtureId)!, "planning");
     }
   }
 

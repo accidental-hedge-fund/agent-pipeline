@@ -48,7 +48,17 @@ export const EVAL_STAGE_NAMES = [
 ] as const;
 export type EvalStageName = (typeof EVAL_STAGE_NAMES)[number];
 
-export type EvalMode = EvalStageName | "end-to-end";
+/** Multi-role pair modes (#601): ordered primary→reviewer graphs with live
+ *  handoffs. Mutually exclusive with single-role Cartesian modes. */
+export const PAIRED_EVAL_MODES = ["implementing-paired", "pipeline-paired"] as const;
+export type PairedEvalMode = (typeof PAIRED_EVAL_MODES)[number];
+
+export type EvalMode = EvalStageName | "end-to-end" | PairedEvalMode;
+
+/** True when `mode` is a multi-role pair graph (not a single Cartesian stage). */
+export function isPairedEvalMode(mode: EvalMode): mode is PairedEvalMode {
+  return (PAIRED_EVAL_MODES as readonly string[]).includes(mode);
+}
 
 export type FixtureProvenance = "synthetic" | "harvested";
 
@@ -190,7 +200,9 @@ export interface TreatmentAxes {
   params?: string[];
 }
 
-/** One concrete point in the treatment matrix, after expansion. */
+/** One concrete point in the treatment matrix, after expansion.
+ *  Cartesian cells carry single-role axis values. Named-pair cells carry
+ *  `id` + `primary` + `reviewer` role coordinates (#601). */
 export interface Treatment {
   harness?: string;
   provider?: string;
@@ -199,6 +211,55 @@ export interface Treatment {
   executor?: string;
   /** Parsed from the manifest's JSON-encoded `params` axis value (#434 task 6.1). */
   params?: ModelEndpointParams;
+  /** Named-pair treatment id (equals the pair's declared `id`). */
+  id?: string;
+  /** Primary (implementer) role coordinates for a named-pair treatment. */
+  primary?: RoleCoordinate;
+  /** Reviewer role coordinates for a named-pair treatment. */
+  reviewer?: RoleCoordinate;
+}
+
+/**
+ * Allowlisted fields on a named-pair role coordinate (#601).
+ *
+ * `provider`, `executor`, and `params` are intentionally NOT allowlisted:
+ * paired-loop execution only dispatches local CLI harnesses with harness /
+ * model / effort. Accepting API-executor or provider coordinates would
+ * advertise a treatment the pair loop cannot execute (review 2 f7df46b5).
+ * Re-add only when paired phases share Cartesian's model-endpoint path.
+ */
+export const ROLE_COORDINATE_FIELDS = [
+  "harness",
+  "model",
+  "effort",
+] as const;
+
+/** One role's coordinates in a named ordered primary/reviewer pair. */
+export interface RoleCoordinate {
+  harness: string;
+  model?: string;
+  effort?: string;
+}
+
+/** One named ordered primary→reviewer pair treatment. */
+export interface NamedPair {
+  id: string;
+  primary: RoleCoordinate;
+  reviewer: RoleCoordinate;
+}
+
+/** Discriminated named-pairs treatment form on the manifest `treatments` field.
+ *  Mutually exclusive with Cartesian axis form (eval-paired-treatments #601). */
+export interface NamedPairsTreatments {
+  form: "named-pairs";
+  pairs: NamedPair[];
+}
+
+/** True when `treatments` is the named-pairs form rather than Cartesian axes. */
+export function isNamedPairsTreatments(
+  treatments: TreatmentAxes | NamedPairsTreatments,
+): treatments is NamedPairsTreatments {
+  return (treatments as NamedPairsTreatments).form === "named-pairs";
 }
 
 /** Execution/auth class recorded on a cell (#434 api-executor-response-provenance
@@ -207,12 +268,16 @@ export interface Treatment {
  *  invocations write onto the underlying stage accounting record. */
 export type CellExecutionClass = "api-key" | "local-cli";
 
+/** Role that failed preflight/auth in a paired cell (#601). */
+export type FailedRole = "primary" | "reviewer";
+
 export interface ExperimentManifest {
   schema_version: number;
   experiment_id: string;
   fixture_ids: string[];
   mode: EvalMode;
-  treatments: TreatmentAxes;
+  /** Exactly one of Cartesian axes or named-pairs form — never both (#601). */
+  treatments: TreatmentAxes | NamedPairsTreatments;
   replicates: number;
   seed: number;
   concurrency: number;

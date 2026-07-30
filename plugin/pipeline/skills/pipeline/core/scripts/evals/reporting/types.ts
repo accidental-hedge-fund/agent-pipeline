@@ -38,6 +38,18 @@ export interface CostSummary {
   n_with_cost: number;
 }
 
+/** Pair-loop diagnostics for named ordered-pair treatments (#601). */
+export interface PairedTreatmentDiagnostics {
+  pair_id: string;
+  primary?: { harness?: string | null; model?: string | null; effort?: string | null };
+  reviewer?: { harness?: string | null; model?: string | null; effort?: string | null };
+  completed_cells: number;
+  fix_invoked_cells: number;
+  blocking_findings_before: number;
+  blocking_findings_after: number;
+  malformed_review_count: number;
+}
+
 export interface TreatmentSummary {
   treatment_id: string;
   reliability: ReliabilityRates;
@@ -46,6 +58,8 @@ export interface TreatmentSummary {
   excluded_fixtures: string[];
   mean_duration_sec: number | null;
   cost: CostSummary | null;
+  /** Present for named-pair treatments that recorded pair-loop evidence (#601). */
+  pair?: PairedTreatmentDiagnostics;
 }
 
 export interface ParetoFrontiers {

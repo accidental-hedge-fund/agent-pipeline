@@ -1,22 +1,29 @@
 // Experiment manifest loading/validation and deterministic matrix expansion
-// (openspec/changes/stage-eval-runner).
+// (openspec/changes/stage-eval-runner, eval-ordered-primary-reviewer-pairs #601).
 
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import {
   EVAL_STAGE_NAMES,
+  PAIRED_EVAL_MODES,
+  ROLE_COORDINATE_FIELDS,
   SANDBOX_MODES,
   SUPPORTED_MANIFEST_SCHEMA_VERSIONS,
+  isPairedEvalMode,
   type Cell,
   type EvalMode,
   type ExperimentManifest,
   type Fixture,
+  type NamedPair,
+  type NamedPairsTreatments,
+  type RoleCoordinate,
   type RunPlan,
   type SandboxMode,
   type Treatment,
   type TreatmentAxes,
 } from "./types.ts";
 import { ModelEndpointParamsSchema } from "../config.ts";
+import type { ModelEndpointParams } from "../types.ts";
 
 export class ManifestValidationError extends Error {
   constructor(field: string, detail: string) {
@@ -26,6 +33,161 @@ export class ManifestValidationError extends Error {
 }
 
 const AXIS_KEYS = ["harness", "provider", "model", "effort", "executor", "params"] as const;
+
+const PAIRED_MODE_LIST = PAIRED_EVAL_MODES.join(", ");
+
+function isSupportedMode(mode: unknown): mode is EvalMode {
+  if (typeof mode !== "string") return false;
+  if (mode === "end-to-end") return true;
+  if ((PAIRED_EVAL_MODES as readonly string[]).includes(mode)) return true;
+  return (EVAL_STAGE_NAMES as readonly string[]).includes(mode);
+}
+
+function parseParamsAxisEntry(raw: string, field: string): ModelEndpointParams {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new ManifestValidationError(field, `params value ${JSON.stringify(raw)} is not valid JSON: ${(err as Error).message}`);
+  }
+  const result = ModelEndpointParamsSchema.safeParse(parsed);
+  if (!result.success) {
+    const issue = result.error.issues[0];
+    const path = issue?.path?.join(".") || "<params>";
+    throw new ManifestValidationError(field, `params value ${JSON.stringify(raw)} is invalid: ${path}: ${issue?.message ?? "invalid value"}`);
+  }
+  return result.data;
+}
+
+/** Validate one role coordinate object (primary or reviewer). */
+function validateRoleCoordinate(raw: unknown, field: string): RoleCoordinate {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new ManifestValidationError(field, "must be an object");
+  }
+  const obj = raw as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    if (!(ROLE_COORDINATE_FIELDS as readonly string[]).includes(key)) {
+      throw new ManifestValidationError(field, `unknown role field "${key}"`);
+    }
+  }
+  if (typeof obj.harness !== "string" || obj.harness.length === 0) {
+    throw new ManifestValidationError(field, 'required non-empty string field "harness" is missing');
+  }
+  const coord: RoleCoordinate = { harness: obj.harness };
+  // Only model/effort are optional role fields until paired execution can
+  // honor provider / executor / params the way Cartesian cells do (#601 f7df46b5).
+  for (const optional of ["model", "effort"] as const) {
+    if (obj[optional] !== undefined) {
+      if (typeof obj[optional] !== "string" || (obj[optional] as string).length === 0) {
+        throw new ManifestValidationError(`${field}.${optional}`, "must be a non-empty string when present");
+      }
+      coord[optional] = obj[optional] as string;
+    }
+  }
+  return coord;
+}
+
+/** Validate the named-pairs form of `treatments`. */
+function validateNamedPairsTreatments(raw: Record<string, unknown>, mode: EvalMode): NamedPairsTreatments {
+  // Reject mixes: named-pairs form must not also carry Cartesian axis arrays.
+  for (const key of Object.keys(raw)) {
+    if (key !== "form" && key !== "pairs") {
+      throw new ManifestValidationError(
+        "treatments",
+        `named-pairs form must not include Cartesian axis "${key}" (or any field other than "form" and "pairs")`,
+      );
+    }
+  }
+  const pairsRaw = raw.pairs;
+  if (!Array.isArray(pairsRaw) || pairsRaw.length === 0) {
+    throw new ManifestValidationError("treatments.pairs", "must be a non-empty array of named pairs");
+  }
+  const seenIds = new Set<string>();
+  const pairs: NamedPair[] = pairsRaw.map((entry, index) => {
+    const field = `treatments.pairs[${index}]`;
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new ManifestValidationError(field, "must be an object");
+    }
+    const p = entry as Record<string, unknown>;
+    for (const key of Object.keys(p)) {
+      if (key !== "id" && key !== "primary" && key !== "reviewer") {
+        throw new ManifestValidationError(field, `unknown pair field "${key}"`);
+      }
+    }
+    if (typeof p.id !== "string" || p.id.length === 0) {
+      throw new ManifestValidationError(`${field}.id`, "required non-empty string pair id is missing");
+    }
+    if (/[/\\]/.test(p.id) || p.id.includes("..")) {
+      throw new ManifestValidationError(`${field}.id`, "must be a single path-safe segment (no path separators or '..')");
+    }
+    if (seenIds.has(p.id)) {
+      throw new ManifestValidationError("treatments.pairs", `duplicate pair id "${p.id}"`);
+    }
+    seenIds.add(p.id);
+    if (!("primary" in p)) {
+      throw new ManifestValidationError(`${field}.primary`, "required role is missing");
+    }
+    if (!("reviewer" in p)) {
+      throw new ManifestValidationError(`${field}.reviewer`, "required role is missing");
+    }
+    return {
+      id: p.id,
+      primary: validateRoleCoordinate(p.primary, `${field}.primary`),
+      reviewer: validateRoleCoordinate(p.reviewer, `${field}.reviewer`),
+    };
+  });
+
+  if (!isPairedEvalMode(mode)) {
+    throw new ManifestValidationError(
+      "treatments",
+      `named-pairs form requires mode "implementing-paired" or "pipeline-paired" — got ${JSON.stringify(mode)}`,
+    );
+  }
+
+  return { form: "named-pairs", pairs };
+}
+
+/** Validate the Cartesian axes form of `treatments`. */
+function validateCartesianTreatments(raw: Record<string, unknown>, mode: EvalMode): TreatmentAxes {
+  if (raw.form !== undefined || raw.pairs !== undefined) {
+    // Mixing form discriminant / pairs list with axis arrays is forbidden.
+    const axisKeysPresent = Object.keys(raw).filter((k) => (AXIS_KEYS as readonly string[]).includes(k));
+    if (axisKeysPresent.length > 0 || raw.form !== undefined) {
+      throw new ManifestValidationError(
+        "treatments",
+        "must not mix Cartesian axis arrays with named-pairs form fields (form/pairs)",
+      );
+    }
+  }
+  const treatments: TreatmentAxes = {};
+  let hasAnyAxis = false;
+  for (const key of Object.keys(raw)) {
+    if (!(AXIS_KEYS as readonly string[]).includes(key)) {
+      throw new ManifestValidationError("treatments", `unknown treatment axis "${key}"`);
+    }
+    const values = raw[key];
+    if (!Array.isArray(values) || values.length === 0 || values.some((v) => typeof v !== "string")) {
+      throw new ManifestValidationError("treatments", `axis "${key}" must be a non-empty string[]`);
+    }
+    if (key === "params") {
+      for (const entry of values as string[]) {
+        parseParamsAxisEntry(entry, "treatments");
+      }
+    }
+    treatments[key as keyof TreatmentAxes] = values as string[];
+    hasAnyAxis = true;
+  }
+  if (!hasAnyAxis) {
+    throw new ManifestValidationError("treatments", "at least one treatment axis is required");
+  }
+  if (isPairedEvalMode(mode)) {
+    throw new ManifestValidationError(
+      "treatments",
+      `mode "${mode}" requires named-pairs treatments (form: "named-pairs"), not Cartesian axes`,
+    );
+  }
+  return treatments;
+}
 
 /** Validate a raw parsed manifest object against the known fixture ids.
  *  Throws ManifestValidationError naming the offending field on the first
@@ -80,54 +242,22 @@ export function validateManifest(raw: unknown, knownFixtureIds: Set<string>): Ex
   }
 
   const mode = obj.mode;
-  if (typeof mode !== "string" || (mode !== "end-to-end" && !(EVAL_STAGE_NAMES as readonly string[]).includes(mode))) {
+  if (!isSupportedMode(mode)) {
     throw new ManifestValidationError(
       "mode",
-      `must be "end-to-end" or one of: ${EVAL_STAGE_NAMES.join(", ")} — got ${JSON.stringify(mode)}`,
+      `must be "end-to-end", one of ${PAIRED_MODE_LIST}, or one of: ${EVAL_STAGE_NAMES.join(", ")} — got ${JSON.stringify(mode)}`,
     );
   }
 
   const treatmentsRaw = obj.treatments;
   if (typeof treatmentsRaw !== "object" || treatmentsRaw === null || Array.isArray(treatmentsRaw)) {
-    throw new ManifestValidationError("treatments", "required object field (treatment axes) is missing");
+    throw new ManifestValidationError("treatments", "required object field (treatment axes or named-pairs) is missing");
   }
   const treatmentsObj = treatmentsRaw as Record<string, unknown>;
-  const treatments: TreatmentAxes = {};
-  let hasAnyAxis = false;
-  for (const key of Object.keys(treatmentsObj)) {
-    if (!(AXIS_KEYS as readonly string[]).includes(key)) {
-      throw new ManifestValidationError("treatments", `unknown treatment axis "${key}"`);
-    }
-    const values = treatmentsObj[key];
-    if (!Array.isArray(values) || values.length === 0 || values.some((v) => typeof v !== "string")) {
-      throw new ManifestValidationError("treatments", `axis "${key}" must be a non-empty string[]`);
-    }
-    if (key === "params") {
-      // Each entry is a JSON-encoded ModelEndpointParams object, validated
-      // against the same allowlist a committed executor's `params:` uses
-      // (#434 task 6.1) — an invalid entry fails manifest load, before any
-      // cell is produced or request sent.
-      for (const raw of values as string[]) {
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(raw);
-        } catch (err) {
-          throw new ManifestValidationError("treatments", `axis "params" entry ${JSON.stringify(raw)} is not valid JSON: ${(err as Error).message}`);
-        }
-        const result = ModelEndpointParamsSchema.safeParse(parsed);
-        if (!result.success) {
-          const issue = result.error.issues[0];
-          const field = issue?.path?.join(".") || "<params>";
-          throw new ManifestValidationError("treatments", `axis "params" entry ${JSON.stringify(raw)} is invalid: ${field}: ${issue?.message ?? "invalid value"}`);
-        }
-      }
-    }
-    treatments[key as keyof TreatmentAxes] = values as string[];
-    hasAnyAxis = true;
-  }
-  if (!hasAnyAxis) {
-    throw new ManifestValidationError("treatments", "at least one treatment axis is required");
-  }
+  const treatments: TreatmentAxes | NamedPairsTreatments =
+    treatmentsObj.form === "named-pairs"
+      ? validateNamedPairsTreatments(treatmentsObj, mode)
+      : validateCartesianTreatments(treatmentsObj, mode);
 
   const replicates = requireNumber("replicates");
   if (!Number.isInteger(replicates) || replicates < 1) {
@@ -163,7 +293,7 @@ export function validateManifest(raw: unknown, knownFixtureIds: Set<string>): Ex
     schema_version: schemaVersion,
     experiment_id: experimentId,
     fixture_ids: fixtureIds as string[],
-    mode: mode as EvalMode,
+    mode,
     treatments,
     replicates,
     seed,
@@ -197,8 +327,10 @@ export function loadManifest(
 /** Deterministic slug over the treatment axes, stable regardless of key order
  *  in the manifest — always emitted in AXIS_KEYS order. `params` is a parsed
  *  object rather than a string, so it is stringified deterministically
- *  (sorted keys) rather than relying on default object-to-string coercion. */
+ *  (sorted keys) rather than relying on default object-to-string coercion.
+ *  Named-pair treatments use the pair's declared `id` as treatment_id. */
 export function treatmentId(treatment: Treatment): string {
+  if (treatment.id) return treatment.id;
   return AXIS_KEYS
     .filter((k) => treatment[k] !== undefined)
     .map((k) => `${k}=${k === "params" ? stableStringify(treatment.params) : treatment[k]}`)
@@ -225,13 +357,26 @@ function cartesianTreatments(axes: TreatmentAxes): Treatment[] {
   return combos;
 }
 
+function namedPairTreatments(pairs: NamedPair[]): Treatment[] {
+  return pairs.map((pair) => ({
+    id: pair.id,
+    primary: { ...pair.primary },
+    reviewer: { ...pair.reviewer },
+    // Surface primary harness for scheduler affinity (scheduler keys on harness).
+    harness: pair.primary.harness,
+  }));
+}
+
 /** Pure expansion of a manifest + its referenced fixtures into an explicit run
  *  plan. Deterministic: fixtures in manifest order, treatments in Cartesian
- *  axis order, replicates 1..N — the same manifest and fixtures always
- *  produce the same plan (design.md decision 1/2). */
+ *  axis order (or declared pair order), replicates 1..N — the same manifest
+ *  and fixtures always produce the same plan (design.md decision 1/2). */
 export function expandPlan(manifest: ExperimentManifest, fixtures: Map<string, Fixture>): RunPlan {
   const cells: Cell[] = [];
-  const treatments = cartesianTreatments(manifest.treatments);
+  const treatments =
+    (manifest.treatments as NamedPairsTreatments).form === "named-pairs"
+      ? namedPairTreatments((manifest.treatments as NamedPairsTreatments).pairs)
+      : cartesianTreatments(manifest.treatments as TreatmentAxes);
   for (const fixtureId of manifest.fixture_ids) {
     const fixture = fixtures.get(fixtureId);
     if (!fixture) {

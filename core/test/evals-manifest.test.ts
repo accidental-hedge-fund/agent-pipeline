@@ -288,3 +288,261 @@ test("computeConfigHash: differing effective config produces differing hashes, k
   assert.equal(h1, h2);
   assert.notEqual(h1, h3);
 });
+
+// ---------------------------------------------------------------------------
+// #601 named ordered-pair treatments
+// ---------------------------------------------------------------------------
+
+function validPairedManifestRaw(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    experiment_id: "pair-exp",
+    fixture_ids: ["f1"],
+    mode: "implementing-paired",
+    treatments: {
+      form: "named-pairs",
+      pairs: [
+        {
+          id: "claude-primary-codex-review",
+          primary: { harness: "claude", model: "sonnet", effort: "high" },
+          reviewer: { harness: "codex", model: "gpt-5", effort: "medium" },
+        },
+      ],
+    },
+    replicates: 1,
+    seed: 7,
+    concurrency: 1,
+    timeout: 600,
+    output_dir: ".agent-pipeline/evals",
+    ...overrides,
+  };
+}
+
+test("validateManifest: complete named-pair implementing-paired manifest is accepted", () => {
+  const manifest = validateManifest(validPairedManifestRaw(), new Set(["f1"]));
+  assert.equal(manifest.mode, "implementing-paired");
+  assert.equal((manifest.treatments as { form: string }).form, "named-pairs");
+});
+
+test("validateManifest: pipeline-paired mode with named pairs is accepted", () => {
+  const manifest = validateManifest(validPairedManifestRaw({ mode: "pipeline-paired" }), new Set(["f1"]));
+  assert.equal(manifest.mode, "pipeline-paired");
+});
+
+test("validateManifest: mixed Cartesian axes and named-pairs form is rejected", () => {
+  assert.throws(
+    () =>
+      validateManifest(
+        validPairedManifestRaw({
+          treatments: {
+            form: "named-pairs",
+            pairs: [
+              {
+                id: "p1",
+                primary: { harness: "claude" },
+                reviewer: { harness: "codex" },
+              },
+            ],
+            harness: ["claude"],
+          },
+        }),
+        new Set(["f1"]),
+      ),
+    (err: unknown) => {
+      assert.ok(err instanceof ManifestValidationError);
+      assert.match((err as Error).message, /"treatments"/);
+      return true;
+    },
+  );
+});
+
+test("validateManifest: paired mode with Cartesian axes only is rejected", () => {
+  assert.throws(
+    () =>
+      validateManifest(
+        validManifestRaw({ mode: "implementing-paired", treatments: { harness: ["claude"] } }),
+        new Set(["f1"]),
+      ),
+    /named-pairs/,
+  );
+});
+
+test("validateManifest: named pairs without a paired mode is rejected", () => {
+  assert.throws(
+    () => validateManifest(validPairedManifestRaw({ mode: "review" }), new Set(["f1"])),
+    /named-pairs form requires mode/,
+  );
+});
+
+test("validateManifest: duplicate pair ids are rejected", () => {
+  assert.throws(
+    () =>
+      validateManifest(
+        validPairedManifestRaw({
+          treatments: {
+            form: "named-pairs",
+            pairs: [
+              { id: "same", primary: { harness: "claude" }, reviewer: { harness: "codex" } },
+              { id: "same", primary: { harness: "codex" }, reviewer: { harness: "claude" } },
+            ],
+          },
+        }),
+        new Set(["f1"]),
+      ),
+    /duplicate pair id "same"/,
+  );
+});
+
+test("validateManifest: missing primary role is rejected", () => {
+  assert.throws(
+    () =>
+      validateManifest(
+        validPairedManifestRaw({
+          treatments: {
+            form: "named-pairs",
+            pairs: [{ id: "p1", reviewer: { harness: "codex" } }],
+          },
+        }),
+        new Set(["f1"]),
+      ),
+    /primary/,
+  );
+});
+
+test("validateManifest: missing reviewer role is rejected", () => {
+  assert.throws(
+    () =>
+      validateManifest(
+        validPairedManifestRaw({
+          treatments: {
+            form: "named-pairs",
+            pairs: [{ id: "p1", primary: { harness: "claude" } }],
+          },
+        }),
+        new Set(["f1"]),
+      ),
+    /reviewer/,
+  );
+});
+
+test("validateManifest: unknown role field is rejected", () => {
+  assert.throws(
+    () =>
+      validateManifest(
+        validPairedManifestRaw({
+          treatments: {
+            form: "named-pairs",
+            pairs: [
+              {
+                id: "p1",
+                primary: { harness: "claude", temperature: 0.2 },
+                reviewer: { harness: "codex" },
+              },
+            ],
+          },
+        }),
+        new Set(["f1"]),
+      ),
+    /unknown role field "temperature"/,
+  );
+});
+
+// #601 review 2 f7df46b5 — paired loop only invokes local CLI harnesses with
+// harness/model/effort. Accepting provider/executor/params would advertise a
+// treatment the pair loop never executes (silent local-harness fallback).
+for (const unsupported of ["provider", "executor", "params"] as const) {
+  test(`validateManifest: named-pair role ${unsupported} is rejected until paired execution supports it`, () => {
+    const roleFieldValue =
+      unsupported === "params"
+        ? { temperature: 0 }
+        : unsupported === "provider"
+          ? "openrouter"
+          : "openrouter-review";
+    assert.throws(
+      () =>
+        validateManifest(
+          validPairedManifestRaw({
+            treatments: {
+              form: "named-pairs",
+              pairs: [
+                {
+                  id: "p1",
+                  primary: { harness: "claude", [unsupported]: roleFieldValue },
+                  reviewer: { harness: "codex" },
+                },
+              ],
+            },
+          }),
+          new Set(["f1"]),
+        ),
+      new RegExp(`unknown role field "${unsupported}"`),
+    );
+  });
+}
+
+test("validateManifest: empty pairs array is rejected", () => {
+  assert.throws(
+    () =>
+      validateManifest(
+        validPairedManifestRaw({
+          treatments: { form: "named-pairs", pairs: [] },
+        }),
+        new Set(["f1"]),
+      ),
+    /pairs/,
+  );
+});
+
+test("expandPlan: named-pair plan preserves id and exact per-role coordinates", () => {
+  const fixtures = new Map([["f1", makeFixture("f1", SHA_A, "implementing")]]);
+  const manifest = validateManifest(validPairedManifestRaw({ replicates: 2 }), new Set(["f1"]));
+  const plan = expandPlan(manifest, fixtures);
+  assert.equal(plan.cells.length, 2);
+  for (const cell of plan.cells) {
+    assert.equal(cell.treatment_id, "claude-primary-codex-review");
+    assert.equal(cell.treatment.id, "claude-primary-codex-review");
+    assert.deepEqual(cell.treatment.primary, {
+      harness: "claude",
+      model: "sonnet",
+      effort: "high",
+    });
+    assert.deepEqual(cell.treatment.reviewer, {
+      harness: "codex",
+      model: "gpt-5",
+      effort: "medium",
+    });
+    assert.equal(cell.mode, "implementing-paired");
+  }
+  const plan2 = expandPlan(manifest, fixtures);
+  assert.equal(JSON.stringify(plan), JSON.stringify(plan2));
+});
+
+test("expandPlan: named pairs are not a Cartesian cross of role models", () => {
+  const fixtures = new Map([["f1", makeFixture("f1", SHA_A, "implementing")]]);
+  const manifest = validateManifest(
+    validPairedManifestRaw({
+      treatments: {
+        form: "named-pairs",
+        pairs: [
+          {
+            id: "pair-a",
+            primary: { harness: "claude", model: "sonnet" },
+            reviewer: { harness: "codex", model: "gpt-5" },
+          },
+          {
+            id: "pair-b",
+            primary: { harness: "codex", model: "gpt-5" },
+            reviewer: { harness: "claude", model: "sonnet" },
+          },
+        ],
+      },
+    }),
+    new Set(["f1"]),
+  );
+  const plan = expandPlan(manifest, fixtures);
+  assert.equal(plan.cells.length, 2);
+  assert.deepEqual(
+    plan.cells.map((c) => c.treatment_id).sort(),
+    ["pair-a", "pair-b"],
+  );
+});

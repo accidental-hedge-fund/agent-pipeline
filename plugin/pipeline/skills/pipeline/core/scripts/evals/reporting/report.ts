@@ -16,7 +16,14 @@ import { costFromDetail, summarizeCost } from "./cost.ts";
 import type { CellRecord, ExperimentManifest, Fixture, RunPlan } from "../types.ts";
 import type { ArtifactDescriptor } from "../trajectory/types.ts";
 import type { GradeRecord, JudgeDisagreementRecord, ReviewGrade } from "../grading/types.ts";
-import type { GroupDimension, LinkedArtifactEntry, ReliabilityRates, Summary, TreatmentSummary } from "./types.ts";
+import type {
+  GroupDimension,
+  LinkedArtifactEntry,
+  PairedTreatmentDiagnostics,
+  ReliabilityRates,
+  Summary,
+  TreatmentSummary,
+} from "./types.ts";
 import { SUMMARY_SCHEMA_VERSION } from "./types.ts";
 
 const GROUP_DIMENSIONS: GroupDimension[] = ["stage", "harness", "provider", "model", "effort", "category", "risk"];
@@ -247,6 +254,34 @@ export function generateSummary(
     return durations.length === 0 ? null : durations.reduce((a, b) => a + b, 0) / durations.length;
   }
 
+  /** Aggregate pair-loop diagnostics from completed cell detail (#601). */
+  function pairDiagnosticsFor(treatmentId: string): PairedTreatmentDiagnostics | undefined {
+    const treatmentRuns = runs.filter((r) => r.treatment_id === treatmentId);
+    const pairDetails = treatmentRuns
+      .map((r) => r.detail)
+      .filter((d): d is Record<string, unknown> => typeof d === "object" && d !== null && d.pair_id !== undefined);
+    if (pairDetails.length === 0) return undefined;
+    const num = (d: Record<string, unknown>, key: string): number =>
+      typeof d[key] === "number" ? (d[key] as number) : 0;
+    const boolCount = (key: string) => pairDetails.filter((d) => d[key] === true).length;
+    const first = pairDetails[0];
+    const primary = first.primary as PairedTreatmentDiagnostics["primary"] | undefined;
+    const reviewer = first.reviewer as PairedTreatmentDiagnostics["reviewer"] | undefined;
+    return {
+      pair_id: String(first.pair_id ?? treatmentId),
+      primary,
+      reviewer,
+      completed_cells: pairDetails.length,
+      fix_invoked_cells: boolCount("fix_invoked"),
+      blocking_findings_before: pairDetails.reduce((s, d) => s + num(d, "blocking_findings_before"), 0),
+      blocking_findings_after: pairDetails.reduce(
+        (s, d) => s + (typeof d.blocking_findings_after === "number" ? (d.blocking_findings_after as number) : num(d, "blocking_findings_after_fix_1")),
+        0,
+      ),
+      malformed_review_count: pairDetails.reduce((s, d) => s + num(d, "malformed_review_count"), 0),
+    };
+  }
+
   const baselineValues = qualityByTreatmentFixture.get(opts.baselineTreatmentId) ?? new Map();
 
   const treatments: TreatmentSummary[] = treatmentIds.map((treatmentId) => {
@@ -259,6 +294,7 @@ export function generateSummary(
       qualityDelta = bootstrapEffect(pairing.deltas, intervalMethod, underpoweredThreshold);
       excludedFixtures = pairing.excludedFixtures;
     }
+    const pair = pairDiagnosticsFor(treatmentId);
     return {
       treatment_id: treatmentId,
       reliability: reliabilityFor(treatmentId),
@@ -266,6 +302,7 @@ export function generateSummary(
       excluded_fixtures: excludedFixtures,
       mean_duration_sec: meanDurationFor(treatmentId),
       cost: costFor(treatmentId),
+      ...(pair ? { pair } : {}),
     };
   });
 

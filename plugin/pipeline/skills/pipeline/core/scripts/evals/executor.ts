@@ -29,21 +29,23 @@ import {
   removeBoundaryShim as removeBoundaryShimReal,
 } from "./boundary-shim.ts";
 import { materializeStagePrompt, stagesForMode } from "./stage-adapters.ts";
+import { runPairedCellLoop } from "./paired-loop.ts";
 import { isJsonVerdictShaped, parseProseReview, parseStrictVerdict, parseStructuredVerdict } from "../stages/review-parsing.ts";
 import type { BuildTreatmentTrajectoryInput, RawStageEntry } from "./trajectory/collect.ts";
-import type {
-  BoundaryDenial,
-  BoundaryEvidence,
-  Cell,
-  CellExecutionClass,
-  CellOutcome,
-  EnvironmentDependency,
-  EvalStageName,
-  ExperimentManifest,
-  Fixture,
-  ReviewVerdictParseProvenance,
-  SandboxMode,
-  Treatment,
+import {
+  isPairedEvalMode,
+  type BoundaryDenial,
+  type BoundaryEvidence,
+  type Cell,
+  type CellExecutionClass,
+  type CellOutcome,
+  type EnvironmentDependency,
+  type EvalStageName,
+  type ExperimentManifest,
+  type Fixture,
+  type ReviewVerdictParseProvenance,
+  type SandboxMode,
+  type Treatment,
 } from "./types.ts";
 
 function sanitizeForPath(cellId: string): string {
@@ -292,6 +294,9 @@ export interface CellExecutionDeps {
    *  given worktree. Only invoked when the fixture declares
    *  `allowed_change_paths` (out-of-scope-change grading needs it). */
   getChangedPaths?: (args: { worktreeDir: string; baseSha: string }) => Promise<string[]>;
+  /** Full unified diff text for the worktree vs baseSha — used by paired modes
+   *  so the reviewer sees the actual primary implementation (#601). */
+  getDiff?: (args: { worktreeDir: string; baseSha: string }) => Promise<string>;
   /** Dispatch an API treatment through a named `model-endpoint` executor
    *  (#434 task 6). Only invoked when the cell's treatment declares
    *  `executor`. */
@@ -361,6 +366,163 @@ async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: stri
     return [];
   }
 }
+
+/** Hard cap on total reviewable paired-mode diff size (tracked + untracked).
+ *  Exceeding this fails closed as infra_error rather than silently truncating
+ *  reviewer input (#601 review 2 8c015b1f). */
+export const PAIRED_DIFF_MAX_BYTES = 20 * 1024 * 1024;
+
+/** Injectable execFile seam for {@link collectPairedWorktreeDiff} tests. */
+export type CollectPairedDiffExec = (
+  file: string,
+  args: readonly string[],
+  options?: { cwd?: string; timeout?: number; maxBuffer?: number },
+) => Promise<{ stdout: string; stderr?: string }>;
+
+/**
+ * Collect the full unified diff of the worktree vs baseSha for paired-mode review.
+ * Includes every untracked (non-ignored) path — never silently truncates the
+ * untracked list. Throws when a complete reviewable diff cannot be collected
+ * (tracked failure, untracked listing failure, per-file failure without
+ * stdout, or total size over {@link PAIRED_DIFF_MAX_BYTES}) so the pair loop
+ * records infra_error rather than grading a partial review body
+ * (#601 review 1/2 8c015b1f). A legitimate empty worktree returns "".
+ *
+ * Tracked `git diff <baseSha>` (no `--exit-code`) MUST exit 0 for a complete
+ * result. Nonzero exit is a collection failure even when stdout is nonempty —
+ * partial stdout after a mid-stream error must not be graded as the full diff.
+ * Untracked paths still use `git diff --no-index`, which exits 1 when files
+ * differ and is the only documented complete-output nonzero case here.
+ */
+export async function collectPairedWorktreeDiff(args: {
+  worktreeDir: string;
+  baseSha: string;
+  /** Test seam — defaults to promisified child_process.execFile. */
+  execFile?: CollectPairedDiffExec;
+}): Promise<string> {
+  let execFileAsync = args.execFile;
+  if (!execFileAsync) {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    execFileAsync = promisify(execFile) as CollectPairedDiffExec;
+  }
+  let tracked: string;
+  try {
+    // Include unstaged/untracked worktree edits the primary made without committing
+    // (paired implement/fix prompts forbid commits).
+    const result = await execFileAsync("git", ["diff", args.baseSha], {
+      cwd: args.worktreeDir,
+      timeout: 30_000,
+      maxBuffer: PAIRED_DIFF_MAX_BYTES,
+    });
+    tracked = result.stdout;
+  } catch (err) {
+    const e = err as {
+      message?: string;
+      code?: string | number;
+      killed?: boolean;
+      signal?: string;
+      stdout?: string;
+    };
+    // Plain `git diff <base>` without --exit-code exits 0 on success (even when
+    // files differ). Any rejected invocation is incomplete review input —
+    // never accept partial stdout (#601 review 8c015b1f).
+    throw new Error(
+      `failed to collect tracked worktree diff vs ${args.baseSha}` +
+        (e.code !== undefined ? ` (code=${e.code})` : "") +
+        (e.killed ? " (killed)" : "") +
+        (e.signal ? ` (signal=${e.signal})` : "") +
+        (typeof e.stdout === "string" && e.stdout.length > 0
+          ? " (partial stdout discarded)"
+          : "") +
+        `: ${e.message ?? String(err)}`,
+    );
+  }
+
+  let namesOut: string;
+  try {
+    const { stdout: names } = await execFileAsync(
+      "git",
+      ["ls-files", "--others", "--exclude-standard"],
+      { cwd: args.worktreeDir, timeout: 30_000 },
+    );
+    namesOut = names;
+  } catch (err) {
+    const e = err as { message?: string };
+    throw new Error(
+      `failed to list untracked worktree paths for paired review diff: ${e.message ?? String(err)}`,
+    );
+  }
+
+  const files = namesOut.split("\n").map((l) => l.trim()).filter(Boolean);
+  let totalBytes = Buffer.byteLength(tracked, "utf8");
+  if (totalBytes > PAIRED_DIFF_MAX_BYTES) {
+    throw new Error(
+      `worktree diff exceeds ${PAIRED_DIFF_MAX_BYTES} byte limit ` +
+        `(tracked alone is ${totalBytes} bytes) — cannot collect a complete reviewable diff`,
+    );
+  }
+
+  let untracked = "";
+  for (const file of files) {
+    let content: string;
+    try {
+      const { stdout } = await execFileAsync(
+        "git",
+        ["diff", "--no-index", "--", "/dev/null", file],
+        {
+          cwd: args.worktreeDir,
+          timeout: 10_000,
+          maxBuffer: Math.min(2 * 1024 * 1024, PAIRED_DIFF_MAX_BYTES),
+        },
+      );
+      content = stdout;
+    } catch (err) {
+      // git diff --no-index exits 1 when files differ — stdout still holds the diff.
+      // maxBuffer / kill / signal means the diff is incomplete — fail closed.
+      const e = err as {
+        stdout?: string;
+        message?: string;
+        code?: string | number;
+        killed?: boolean;
+        signal?: string;
+      };
+      const incomplete =
+        e.killed ||
+        e.signal ||
+        e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ||
+        (typeof e.message === "string" && /maxBuffer|ENOBUFS/i.test(e.message));
+      if (
+        !incomplete &&
+        typeof e.stdout === "string" &&
+        e.stdout.length > 0
+      ) {
+        content = e.stdout;
+      } else {
+        throw new Error(
+          `failed to collect untracked diff for ${JSON.stringify(file)}` +
+            (e.code !== undefined ? ` (code=${e.code})` : "") +
+            (e.killed ? " (killed)" : "") +
+            (e.signal ? ` (signal=${e.signal})` : "") +
+            `: ${e.message ?? String(err)} — cannot collect a complete reviewable diff`,
+        );
+      }
+    }
+    const nextBytes = totalBytes + Buffer.byteLength(content, "utf8");
+    if (nextBytes > PAIRED_DIFF_MAX_BYTES) {
+      throw new Error(
+        `worktree diff exceeds ${PAIRED_DIFF_MAX_BYTES} byte limit after including ` +
+          `untracked path ${JSON.stringify(file)} (${files.length} untracked paths total) — ` +
+          `cannot collect a complete reviewable diff`,
+      );
+    }
+    untracked += content;
+    totalBytes = nextBytes;
+  }
+  return `${tracked}${untracked}`;
+}
+
+const defaultGetDiff = collectPairedWorktreeDiff;
 
 /** Command-line tokens that reach outside the cell's isolated worktree — the
  *  GitHub CLI (a production GitHub write), raw network clients, and `git
@@ -561,7 +723,10 @@ export async function runCell(
 
   const stages: EvalStageName[] = stagesForMode(cell.mode, fixture);
   const prompts = stages.map((stage) => materializeStagePrompt(stage, fixture));
-  const materializedPrompt = prompts.join("\n\n---\n\n");
+  // Paired modes materialize live prompts during the loop; placeholder for hash until then.
+  let materializedPrompt = isPairedEvalMode(cell.mode)
+    ? `paired:${cell.mode}:${cell.treatment_id}`
+    : prompts.join("\n\n---\n\n");
   const effectiveConfig: Record<string, unknown> = {
     mode: cell.mode,
     treatment: cell.treatment,
@@ -731,6 +896,74 @@ export async function runCell(
         return finish({ result_class: "infra_error", error });
       }
       trajectoryActions.push(`ran setup for simulated dependency ${JSON.stringify(dep.name)}`);
+    }
+
+    // Paired multi-role graphs (#601): keep the eval contract + command boundary
+    // installed across every primary/reviewer invocation; restore only after
+    // the loop returns (below), for clean checks/changed-path collection.
+    if (isPairedEvalMode(cell.mode)) {
+      const cellDeadlineMs = Date.now() + manifest.timeout * 1000;
+      const getDiffFn = deps.getDiff ?? defaultGetDiff;
+      const paired = await runPairedCellLoop({
+        cfg,
+        cell,
+        fixture,
+        manifest,
+        worktreeDir: identity.worktreePath,
+        gh: ghSurface,
+        cellDeadlineMs,
+        trajectoryActions,
+        trajectoryStages,
+        deps: {
+          invokeHarness: invokeHarnessFn,
+          preflight: preflightFn,
+          getDiff: getDiffFn,
+          isolationEnv: evalIsolationEnv,
+          classifyPostInvocationFailure: (result, harness, req) =>
+            classifyPostInvocationFailure(result, preflightFn, harness, req),
+        },
+      });
+      materializedPrompt = paired.materializedPrompt || materializedPrompt;
+      if (paired.outcome.result_class !== "completed") {
+        return finish(paired.outcome);
+      }
+
+      // Restore contract only after the last harness invocation for clean evidence.
+      restoreContractIfNeeded();
+
+      const detail: Record<string, unknown> = { ...(paired.outcome.detail ?? {}), execution_class: "local-cli" as CellExecutionClass };
+      const allChecks = [...fixture.public_checks, ...(fixture.hidden_checks ?? [])];
+      if (allChecks.length > 0) {
+        const remainingForChecks = cellDeadlineMs - Date.now();
+        if (remainingForChecks <= 0) {
+          const error = `cell exceeded its ${manifest.timeout}s per-cell timeout before checks could start`;
+          trajectoryActions.push(error);
+          return finish({ result_class: "timeout", error, detail });
+        }
+        const runChecksFn = deps.runChecks ?? defaultRunChecks;
+        detail.checks = await runChecksFn({
+          worktreeDir: identity.worktreePath,
+          checks: allChecks,
+          deadlineMs: remainingForChecks,
+        });
+        trajectoryActions.push(`ran ${allChecks.length} check(s) in the cell's worktree`);
+        if (Date.now() > cellDeadlineMs) {
+          const error = `cell exceeded its ${manifest.timeout}s per-cell timeout while running checks`;
+          trajectoryActions.push(error);
+          return finish({ result_class: "timeout", error, detail });
+        }
+      }
+      if (fixture.allowed_change_paths !== undefined) {
+        const getChangedPathsFn = deps.getChangedPaths ?? defaultGetChangedPaths;
+        const changedPaths = await getChangedPathsFn({
+          worktreeDir: identity.worktreePath,
+          baseSha: cell.base_sha,
+        });
+        const excludedFromChangedPaths = new Set<string>(EVAL_AGENT_CONTRACT_PATHS);
+        detail.changed_paths = changedPaths.filter((p) => !excludedFromChangedPaths.has(p));
+      }
+      if (environmentDetail !== undefined) detail.environment = environmentDetail;
+      return finish({ result_class: "completed", detail });
     }
 
     // API treatment path (#434 task 6): the cell binds to a named
