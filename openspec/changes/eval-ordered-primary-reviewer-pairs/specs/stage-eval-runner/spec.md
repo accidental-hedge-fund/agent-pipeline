@@ -201,3 +201,9 @@ id and SHALL prevent any cell from executing.
 - **WHEN** a role coordinate includes a field that is not in the allowlisted role fields
 - **THEN** loading SHALL fail naming that field
 - **AND** no treatment SHALL be executed
+
+#### Scenario: Provider executor and params role fields are rejected until paired execution supports them
+
+- **WHEN** a role coordinate includes `provider`, `executor`, or `params`
+- **THEN** loading SHALL fail naming that field
+- **AND** no treatment SHALL be executed

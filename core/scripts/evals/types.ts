@@ -219,25 +219,26 @@ export interface Treatment {
   reviewer?: RoleCoordinate;
 }
 
-/** Allowlisted fields on a named-pair role coordinate (#601). */
+/**
+ * Allowlisted fields on a named-pair role coordinate (#601).
+ *
+ * `provider`, `executor`, and `params` are intentionally NOT allowlisted:
+ * paired-loop execution only dispatches local CLI harnesses with harness /
+ * model / effort. Accepting API-executor or provider coordinates would
+ * advertise a treatment the pair loop cannot execute (review 2 f7df46b5).
+ * Re-add only when paired phases share Cartesian's model-endpoint path.
+ */
 export const ROLE_COORDINATE_FIELDS = [
   "harness",
-  "provider",
   "model",
   "effort",
-  "executor",
-  "params",
 ] as const;
 
 /** One role's coordinates in a named ordered primary/reviewer pair. */
 export interface RoleCoordinate {
   harness: string;
-  provider?: string;
   model?: string;
   effort?: string;
-  executor?: string;
-  /** Parsed ModelEndpointParams when the role is bound to an API executor. */
-  params?: ModelEndpointParams;
 }
 
 /** One named ordered primary→reviewer pair treatment. */

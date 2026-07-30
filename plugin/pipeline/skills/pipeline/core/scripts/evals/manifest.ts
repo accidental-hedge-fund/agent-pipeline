@@ -74,27 +74,14 @@ function validateRoleCoordinate(raw: unknown, field: string): RoleCoordinate {
     throw new ManifestValidationError(field, 'required non-empty string field "harness" is missing');
   }
   const coord: RoleCoordinate = { harness: obj.harness };
-  for (const optional of ["provider", "model", "effort", "executor"] as const) {
+  // Only model/effort are optional role fields until paired execution can
+  // honor provider / executor / params the way Cartesian cells do (#601 f7df46b5).
+  for (const optional of ["model", "effort"] as const) {
     if (obj[optional] !== undefined) {
       if (typeof obj[optional] !== "string" || (obj[optional] as string).length === 0) {
         throw new ManifestValidationError(`${field}.${optional}`, "must be a non-empty string when present");
       }
       coord[optional] = obj[optional] as string;
-    }
-  }
-  if (obj.params !== undefined) {
-    if (typeof obj.params === "string") {
-      coord.params = parseParamsAxisEntry(obj.params, `${field}.params`);
-    } else if (typeof obj.params === "object" && obj.params !== null && !Array.isArray(obj.params)) {
-      const result = ModelEndpointParamsSchema.safeParse(obj.params);
-      if (!result.success) {
-        const issue = result.error.issues[0];
-        const path = issue?.path?.join(".") || "<params>";
-        throw new ManifestValidationError(`${field}.params`, `invalid: ${path}: ${issue?.message ?? "invalid value"}`);
-      }
-      coord.params = result.data;
-    } else {
-      throw new ManifestValidationError(`${field}.params`, "must be a JSON object or JSON-encoded string when present");
     }
   }
   return coord;

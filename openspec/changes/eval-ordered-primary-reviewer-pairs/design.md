@@ -56,8 +56,9 @@ A manifest's `treatments` value is either:
 2. **Named-pairs form** (new): an object with a discriminant (e.g. `form: "named-pairs"`)
    and a `pairs` array. Each pair has a stable unique `id` and role objects `primary` and
    `reviewer`, each carrying role-local coordinates (`harness`, optional `model`,
-   optional `effort`, and other allowlisted role fields such as `executor` / `params`
-   when needed).
+   optional `effort`). Provider / executor / params are not allowlisted on pair roles
+   until paired execution dispatches them the same way Cartesian model-endpoint
+   treatments do (fail closed rather than silent local-harness fallback).
 
 Validation rules (fail closed, name the field):
 

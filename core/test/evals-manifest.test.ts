@@ -447,6 +447,39 @@ test("validateManifest: unknown role field is rejected", () => {
   );
 });
 
+// #601 review 2 f7df46b5 — paired loop only invokes local CLI harnesses with
+// harness/model/effort. Accepting provider/executor/params would advertise a
+// treatment the pair loop never executes (silent local-harness fallback).
+for (const unsupported of ["provider", "executor", "params"] as const) {
+  test(`validateManifest: named-pair role ${unsupported} is rejected until paired execution supports it`, () => {
+    const roleFieldValue =
+      unsupported === "params"
+        ? { temperature: 0 }
+        : unsupported === "provider"
+          ? "openrouter"
+          : "openrouter-review";
+    assert.throws(
+      () =>
+        validateManifest(
+          validPairedManifestRaw({
+            treatments: {
+              form: "named-pairs",
+              pairs: [
+                {
+                  id: "p1",
+                  primary: { harness: "claude", [unsupported]: roleFieldValue },
+                  reviewer: { harness: "codex" },
+                },
+              ],
+            },
+          }),
+          new Set(["f1"]),
+        ),
+      new RegExp(`unknown role field "${unsupported}"`),
+    );
+  });
+}
+
 test("validateManifest: empty pairs array is rejected", () => {
   assert.throws(
     () =>

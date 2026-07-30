@@ -5,9 +5,12 @@
 The evaluation system SHALL support a named-pair treatment form in which each treatment is
 an ordered pair with a stable unique `id`, a `primary` role coordinate set, and a
 `reviewer` role coordinate set. Each role coordinate set SHALL declare a `harness` and MAY
-declare role-local `model` and `effort` (and other allowlisted role-local fields). The pair
-identity and the exact per-role coordinates SHALL be preserved through plan expansion and
-on every cell and grade record derived from that treatment.
+declare role-local `model` and `effort`. Role coordinates SHALL NOT accept fields the paired
+execution path cannot honor — including `provider`, `executor`, and `params` — until paired
+phases dispatch those coordinates the same way Cartesian model-endpoint treatments do.
+Validation SHALL reject such fields rather than accepting them and silently running a local
+CLI harness. The pair identity and the exact per-role coordinates SHALL be preserved through
+plan expansion and on every cell and grade record derived from that treatment.
 
 #### Scenario: A complete named pair is accepted
 
