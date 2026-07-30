@@ -159,6 +159,15 @@ test("defaults-parity: auto_merge_eligibility commented defaults match DEFAULT_C
   assert.match(template, new RegExp(`#\\s*min_confidence: ${d.min_confidence} #`));
 });
 
+test("defaults-parity: merge_queue commented defaults match DEFAULT_CONFIG.merge_queue", () => {
+  const template = buildConfigTemplate();
+  const d = DEFAULT_CONFIG.merge_queue;
+  assert.match(
+    template,
+    new RegExp(`#\\s*release_when_complete: ${d.release_when_complete} #`),
+  );
+});
+
 test("defaults-parity: context_snapshot documented absence-default matches the real runtime constant", () => {
   const template = buildConfigTemplate();
   assert.match(
@@ -290,6 +299,7 @@ const ADDED_KEYS = [
   "queue",
   "trusted_override_actors",
   "auto_merge_eligibility",
+  "merge_queue",
   "context_snapshot",
 ];
 

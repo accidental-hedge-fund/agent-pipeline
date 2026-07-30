@@ -141,10 +141,10 @@ export const OPERATION_SURFACE = [
   },
   {
     name: "merge-queue",
-    desc: "Dry-run ordered merge plan for ready-to-deploy PRs in a milestone (never called by advance; human owns merge)",
-    argHint: '--milestone "<title>" [--dry-run]',
+    desc: "Human-gated sequential merge of ready-to-deploy PRs; optional prepare-only release-when-complete",
+    argHint: "--milestone <title> [--apply] [--release-when-complete --release-version <v>]",
     cliArgs: "merge-queue $ARGUMENTS",
-    fast: true,
+    fast: false,
   },
   {
     name: "release",

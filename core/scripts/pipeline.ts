@@ -97,7 +97,7 @@ import {
 import { runSweep, realSweepDeps } from "./stages/sweep.ts";
 import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
 import { mergePr, realMergeDeps } from "./stages/merge.ts";
-import { runMergeQueueDryRun, realMergeQueueDeps } from "./stages/merge_queue.ts";
+import { runMergeQueue, realMergeQueueDeps } from "./stages/merge-queue.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -315,10 +315,21 @@ export interface CliOpts {
   maxFailureRate?: number;
   /** queue: filter eligible issues to those carrying all specified labels (repeatable). */
   label?: string[];
-  /** queue: filter eligible issues to those belonging to this milestone title. */
+  /** queue / merge-queue: filter eligible issues to those belonging to this milestone title. */
   milestone?: string;
   /** queue: filter eligible issues to those at or below this risk level (low|medium|high). */
   risk?: string;
+  /**
+   * merge-queue (#676): after a complete drive, prepare a release PR via the
+   * existing release path (prepare-only; never tags/publishes/merges). Default off.
+   * Requires --release-version. CLI ORs with config merge_queue.release_when_complete.
+   */
+  releaseWhenComplete?: boolean;
+  /**
+   * merge-queue (#676): version for release-when-complete (major|minor|patch|X.Y.Z).
+   * Required when release-when-complete is enabled.
+   */
+  releaseVersion?: string;
   /** backfill: scope the apply slice to a named capability. */
   capability?: string;
   /** config repo-map add/remove: target relationship list (default: depends_on). */
@@ -506,6 +517,14 @@ export function buildCmd(): Command {
     .option("--label <L>", "queue: filter eligible issues to those carrying this label (repeatable)", collectRepeatable, [])
     .option("--milestone <M>", "queue / merge-queue / loop: filter issues to this milestone title")
     .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)")
+    .option(
+      "--release-when-complete",
+      "merge-queue: after a complete drive, prepare a release PR for human review (opt-in; never tags, publishes, or merges the release)",
+    )
+    .option(
+      "--release-version <version>",
+      "merge-queue: version for --release-when-complete (major|minor|patch|X.Y.Z); required when release-when-complete is enabled",
+    )
     // backfill options (#327)
     .option("--capability <name>", "backfill: scope the apply slice to a named capability")
     .option("--rel <relation>", "config repo-map add/remove: depends_on or depended_on_by (default: depends_on)")
@@ -1819,7 +1838,7 @@ async function main(): Promise<void> {
   const isTriageCommand = numArg === "triage";
   // `pipeline merge <pr>` — human-invoked squash merge of a ready-to-deploy PR.
   const isMergeCommand = numArg === "merge";
-  // `pipeline merge-queue --milestone <m>` — human-invoked dry-run queue plan (#673).
+  // `pipeline merge-queue --milestone <m> [--apply] [--release-when-complete] …` (#676).
   const isMergeQueueCommand = numArg === "merge-queue";
   // `pipeline loop ...` (#451) — deterministic preflight + delegation to goal-loop.
   // Needs no PipelineConfig and calls no gh at all (see command-registry.ts).
@@ -2861,33 +2880,45 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Early merge-queue dispatch — human-invoked dry-run plan of R2D PRs (#673).
-  // Default is dry-run; never merges. Advance loop never reaches here.
+  // Early merge-queue dispatch — human-gated sequential R2D merges + optional
+  // release-when-complete prepare (#676). Never tags/publishes/merges a release.
   if (isMergeQueueCommand) {
-    let mergeQueueCfg: import("./types.ts").PipelineConfig;
+    if (!opts.milestone || String(opts.milestone).trim() === "") {
+      console.error(
+        "pipeline merge-queue: --milestone <title> is required.\n" +
+          "  Usage: pipeline merge-queue --milestone <title> [--apply] [--dry-run]\n" +
+          "         [--release-when-complete --release-version <major|minor|patch|X.Y.Z>]\n" +
+          "  Default is dry-run (no merges). --apply performs sequential merges via the\n" +
+          "  existing merge surface. --release-when-complete is opt-in prepare-only:\n" +
+          "  never tags, publishes to npm, or merges the release PR.",
+      );
+      process.exit(2);
+    }
+    let mqCfg: import("./types.ts").PipelineConfig;
     try {
-      mergeQueueCfg = resolveConfig({
-        repoPath: opts.repoPath,
-        baseBranch: opts.base,
-        profile: opts.profile,
-      });
+      mqCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
     } catch (err) {
       console.error(`pipeline merge-queue: config error: ${(err as Error).message}`);
       process.exit(1);
     }
     try {
-      const code = await runMergeQueueDryRun(
+      const result = await runMergeQueue(
         {
-          milestone: opts.milestone,
-          dryRun: opts.dryRun,
-          apply: opts.apply,
-          baseBranch: mergeQueueCfg.base_branch,
+          milestone: String(opts.milestone).trim(),
+          apply: !!opts.apply,
+          // Explicit --dry-run forces plan-only even when combined with --apply.
+          dryRun: !!opts.dryRun,
+          releaseWhenComplete: !!opts.releaseWhenComplete,
+          releaseVersion: opts.releaseVersion,
+          releaseWhenCompleteConfig: mqCfg.merge_queue?.release_when_complete ?? false,
+          repoDir: mqCfg.repo_dir,
+          repo: mqCfg.repo,
+          baseBranch: mqCfg.base_branch,
+          releaseModel: mqCfg.roadmap?.release_model,
         },
-        realMergeQueueDeps(mergeQueueCfg.repo),
-        console.log,
-        mergeQueueCfg.repo,
+        realMergeQueueDeps(mqCfg.repo_dir, mqCfg.repo),
       );
-      process.exit(code);
+      if (result.exitCode !== 0) process.exit(result.exitCode);
     } catch (err) {
       console.error(`pipeline merge-queue: ${(err as Error).message}`);
       process.exit(1);

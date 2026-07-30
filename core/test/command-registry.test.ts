@@ -284,16 +284,26 @@ test("command-registry: lookupCommand('cleanup') returns cleanup entry with need
   assert.equal(entry.needsIssueNumber, false);
 });
 
-test("command-registry: merge-queue entry is dry-run-safe (non-mutating, no issue number)", () => {
+test("command-registry: merge-queue entry is human-gated sequential merge surface (#676)", () => {
   const entry = COMMAND_REGISTRY["merge-queue"];
   assert.ok(entry, "merge-queue must be registered");
   assert.equal(entry.needsIssueNumber, false);
-  assert.equal(entry.mutatesGitHub, false);
+  // mutatesGitHub true: --apply performs sequential merges; dry-run is default but not exclusive.
+  assert.equal(entry.mutatesGitHub, true);
   assert.equal(entry.needsConfig, true);
   assert.equal(entry.needsGhAuth, true);
   assert.notEqual(entry.allowedFlags, "all");
   const flags = entry.allowedFlags as Set<string>;
-  for (const required of ["milestone", "dryRun", "repoPath", "base", "profile"]) {
+  for (const required of [
+    "milestone",
+    "dryRun",
+    "repoPath",
+    "base",
+    "profile",
+    "apply",
+    "releaseWhenComplete",
+    "releaseVersion",
+  ]) {
     assert.ok(flags.has(required), `merge-queue.allowedFlags must include ${required}`);
   }
   assert.equal(lookupCommand("merge-queue"), entry);
