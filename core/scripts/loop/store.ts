@@ -619,12 +619,22 @@ export async function recoverLock(
 // Status projection — read-only, zero writes.
 // ---------------------------------------------------------------------------
 
+/** Per-item status row: coarse state plus optional current-stage projection (#611). */
+export interface LoopStatusItem {
+  state: string;
+  /** Observability-only pipeline stage when recorded — distinct from `state`. */
+  current_stage?: string;
+  current_stage_round?: number;
+  /** Real advance run-store basename when known. */
+  advance_run_id?: string;
+}
+
 export interface LoopStatus {
   run_id: string;
   engine: string;
   repo: LoopContract["repo"];
   canonical_hash: string;
-  items: Record<string, { state: string }>;
+  items: Record<string, LoopStatusItem>;
   active_items: string[];
   recovery_budgets_remaining: LoopLedger["items"][string]["recovery_budgets_remaining"] | null;
   consecutive_blocked: number;
@@ -664,11 +674,25 @@ export async function getStatus(deps: LoopStoreDeps, runId: string): Promise<Loo
   const supervisor = await readSupervisorProcess(deps, runId);
   const action_evidence = await readActionEvidence(deps, runId);
 
-  const items: Record<string, { state: string }> = {};
+  const items: Record<string, LoopStatusItem> = {};
   const active: string[] = [];
   const outstanding_requests: Record<string, LoopHumanInputRequest> = {};
   for (const [id, entry] of Object.entries(ledger.items)) {
-    items[id] = { state: entry.state };
+    // Stage projection is additive observability (#611) — never substitutes for coarse state.
+    const row: LoopStatusItem = { state: entry.state };
+    if (typeof entry.current_stage === "string" && entry.current_stage.length > 0) {
+      row.current_stage = entry.current_stage;
+      if (typeof entry.current_stage_round === "number" && Number.isFinite(entry.current_stage_round)) {
+        row.current_stage_round = entry.current_stage_round;
+      }
+      if (typeof entry.advance_run_id === "string" && entry.advance_run_id.length > 0) {
+        row.advance_run_id = entry.advance_run_id;
+      }
+    } else if (typeof entry.advance_run_id === "string" && entry.advance_run_id.length > 0) {
+      // Mirror last-known real advance id even without a stage name (e.g. pre-stage pin).
+      row.advance_run_id = entry.advance_run_id;
+    }
+    items[id] = row;
     if (ACTIVE_STATES.has(entry.state)) active.push(id);
     if (entry.hold_request) outstanding_requests[id] = entry.hold_request;
   }

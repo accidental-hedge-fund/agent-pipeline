@@ -263,7 +263,8 @@ or `$pipeline:<command>` (Codex) entry. The advance loop has no sub-command.
 /pipeline:logs [<run-id>] [-f]               list or stream pipeline run logs
 /pipeline:loop --milestone v2  $pipeline:loop --milestone v2   canonical durable multi-item run (driven in-repo by Pipeline's own supervisor)
 /pipeline:loop --resume <run-id>              resume an existing durable run by id, on either engine
-/pipeline:loop --audit                        read-only report for the run; no writes
+/pipeline:loop --audit                        read-only report for the run (process identity, action evidence, per-item stage table); no writes
+/pipeline:loop --resume <run-id> --audit --follow  stream whole-run stage-progress lines (not harness stdout)
 /pipeline:loop --milestone v2 --new-run       start a fresh run superseding a terminally-stopped canonical run for the same selector
 /pipeline improve                             read run artifacts; print dry-run cluster report (read-only)
 /pipeline improve --apply                     same, then create GitHub issues for top-N recurring patterns
@@ -708,7 +709,8 @@ never sets a stage label itself and never merges.
 /pipeline:loop --roadmap-slice next  select a named roadmap slice
 /pipeline:loop 418 419 420           select an explicit issue list
 /pipeline:loop --resume <run-id>     resume an existing run — on either engine, by run id
-/pipeline:loop --audit               read-only report for a run; performs no write
+/pipeline:loop --audit               read-only report for a run (includes per-item stage table); performs no write
+/pipeline:loop --resume <run-id> --audit --follow  stream whole-run stage-progress lines until interrupt
 /pipeline:loop --milestone v2 --new-run   supersede a terminally-stopped canonical run for the same selector with a fresh run
 ```
 
@@ -726,9 +728,15 @@ holder is provably gone — a released lock, or a same-host dead-pid lock recove
 through the store's provably-dead path; a run whose supervisor is still alive (or whose
 holder is on a different, unverifiable host) is refused with zero writes rather than
 double-driven. `--audit` renders the run's process identity, its append-only
-action-evidence timeline, and its watchdog/no-progress state with zero durable writes —
-no ledger write, no lock, no GitHub mutation. A pre-existing run created by a legacy
-goal-loop invocation remains addressable by `--resume <run-id>` (read-only import).
+action-evidence timeline, its watchdog/no-progress state, and a **per-item stage-progress
+table** (pipeline stage + optional review/fix round + advance run-id for
+`pipeline logs <advance-run-id> --follow`) with zero durable writes — no ledger write, no
+lock, no GitHub mutation. Mid-advance stage is projected from the linked advance run's
+`events.jsonl` onto the durable ledger (distinct from coarse item `state`). Combine with
+`--follow` (`pipeline loop --resume <run-id> --audit --follow`) to stream clean one-line
+stage transitions for the whole run — not interleaved harness stdout. A pre-existing run
+created by a legacy goal-loop invocation remains addressable by `--resume <run-id>`
+(read-only import).
 
 **Early run handoff (#665).** A successful multi-item drive stays in the foreground for
 the whole wall-clock of the run, but as soon as the durable run is created/resumed and
@@ -1384,6 +1392,10 @@ $pipeline loop logs <loop-run-id> --events --follow
 
 # list available durable loop run ids (most recent first)
 $pipeline loop logs
+
+# per-item stage table + optional whole-run stage-progress follow (not harness stdout)
+$pipeline loop --resume <loop-run-id> --audit
+$pipeline loop --resume <loop-run-id> --audit --follow
 ```
 
 Stream lifecycle events to stdout as JSON lines alongside normal output (for orchestrators like Pipeline Desk):

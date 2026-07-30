@@ -9,8 +9,8 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { runLoopCommand, buildCmd, decideNewRunSupersession, planSupersessionMintRepair, type CliOpts, type LoopCliDeps } from "../scripts/pipeline.ts";
-import { runLoopPreflight as realRunLoopPreflight, type LoopPreflightOutcome } from "../scripts/loop-preflight.ts";
+import { runLoopCommand, buildCmd, maxPositionalsFor, decideNewRunSupersession, planSupersessionMintRepair, type CliOpts, type LoopCliDeps } from "../scripts/pipeline.ts";
+import { runLoopPreflight as realRunLoopPreflight, MAX_RANGE_SPAN, type LoopPreflightOutcome } from "../scripts/loop-preflight.ts";
 import {
   formatLoopRunHandoff,
   LOOP_RUN_HANDOFF_KIND,
@@ -61,6 +61,15 @@ function fakeAuditReport(runId: string) {
     consecutive_no_progress: 0,
     stop: null,
     status: { run_id: runId } as unknown,
+    stage_progress: [
+      {
+        item_id: "607",
+        state: "in_progress",
+        stage_presentation: "implementing",
+        advance_run_id: "607-2026-07-27T19-31-29-328Z",
+        has_projection: true,
+      },
+    ],
   };
 }
 
@@ -385,7 +394,9 @@ test("runLoopCommand — engine defaults to codex when --profile is absent (matc
   const { out } = await withCapturedConsole(() =>
     runLoopCommand({ resume: "run-1", audit: true } as CliOpts, [], deps),
   );
-  const parsed = JSON.parse(out[0]);
+  const jsonLine = out.find((l) => l.trimStart().startsWith("{"));
+  assert.ok(jsonLine, "audit must print a JSON report line after the stage table");
+  const parsed = JSON.parse(jsonLine!);
   assert.equal(parsed.engine, "codex");
   assert.equal(parsed.run_id, "run-1");
 });
@@ -461,6 +472,256 @@ test("COMMAND_REGISTRY.loop — needs no config, no gh auth, and mutates nothing
   assert.equal(loopEntry.needsConfig, false);
   assert.equal(loopEntry.needsGhAuth, false);
   assert.equal(loopEntry.mutatesGitHub, false);
+});
+
+// ---------------------------------------------------------------------------
+// Explicit issue-list positionals (#554): the top-level extra-positionals
+// guard must allow `pipeline loop 649 551 541 334` through to runLoopCommand /
+// normalizeLoopArgs as a work-list, not reject trailing issue numbers as
+// "unexpected argument(s)".
+// ---------------------------------------------------------------------------
+
+test("maxPositionalsFor — loop accepts keyword + up to MAX_RANGE_SPAN issue numbers (#554)", () => {
+  assert.equal(maxPositionalsFor("loop"), 1 + MAX_RANGE_SPAN);
+  // Multi-issue list from the filed bug must fit under the cap.
+  const multi = ["loop", "649", "551", "541", "334"];
+  assert.ok(multi.length <= maxPositionalsFor("loop"));
+  // Single-issue form must also fit (was rejected when the default cap was 1).
+  assert.ok(["loop", "649"].length <= maxPositionalsFor("loop"));
+});
+
+test("maxPositionalsFor — other commands keep their existing positional caps (#554)", () => {
+  assert.equal(maxPositionalsFor("run"), 2);
+  assert.equal(maxPositionalsFor("release"), 2);
+  assert.equal(maxPositionalsFor("status"), 2);
+  assert.equal(maxPositionalsFor("papercut"), 2);
+  assert.equal(maxPositionalsFor("correction"), 2);
+  assert.equal(maxPositionalsFor("unblock"), 3);
+  assert.equal(maxPositionalsFor("override"), 3);
+  assert.equal(maxPositionalsFor("evals"), 3);
+  assert.equal(maxPositionalsFor("doctor"), 1);
+  assert.equal(maxPositionalsFor("sweep"), 1);
+  assert.equal(maxPositionalsFor(undefined), 1);
+  // A non-loop multi-positional shape still exceeds the default cap.
+  assert.ok(["doctor", "extra", "more"].length > maxPositionalsFor("doctor"));
+});
+
+test("runLoopCommand — multi-issue positionals normalize to a work-list selector (#554)", async () => {
+  let seenIssues: string[] | undefined;
+  let seenSelector: unknown;
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async (raw) => {
+      seenIssues = raw.issues;
+      return realRunLoopPreflight(
+        raw,
+        "claude",
+        {
+          exec: async () => ({ ok: true, stdout: "/goal autonomous mode", stderr: "" }),
+          execCheck: async () => true,
+          fsExists: async () => false,
+          fileMtime: async () => 1000,
+          readTextFile: async () => null,
+        },
+        [],
+        "auto",
+      );
+    },
+    runLoopEngine: async (input) => {
+      seenSelector = input.selector;
+      return {
+        kind: "drive",
+        result: {
+          runId: "loop-multi-issues",
+          cycles: 1,
+          stop: null,
+          holdOutstanding: false,
+          allDone: true,
+          resumed: false,
+          heldItemIds: [],
+          dispatched: 4,
+          excludedItemIds: [],
+          exclusionReason: null,
+          completion: "all_done",
+        },
+      };
+    },
+  };
+  process.exitCode = undefined;
+  await withCapturedConsole(() =>
+    runLoopCommand({ profile: "claude" } as CliOpts, ["649", "551", "541", "334"], deps),
+  );
+  assert.deepEqual(seenIssues, ["649", "551", "541", "334"]);
+  assert.deepEqual(seenSelector, { type: "work-list", value: ["649", "551", "541", "334"] });
+  assert.equal(process.exitCode, 0);
+});
+
+test("runLoopCommand — a single issue positional is a one-element work-list (#554)", async () => {
+  let seenSelector: unknown;
+  const deps: LoopCliDeps = {
+    runLoopPreflight: (raw, engine, _deps, roots, attestation) =>
+      realRunLoopPreflight(
+        raw,
+        engine,
+        {
+          exec: async () => ({ ok: true, stdout: "/goal autonomous mode", stderr: "" }),
+          execCheck: async () => true,
+          fsExists: async () => false,
+          fileMtime: async () => 1000,
+          readTextFile: async () => null,
+        },
+        roots,
+        attestation,
+      ),
+    runLoopEngine: async (input) => {
+      seenSelector = input.selector;
+      return {
+        kind: "drive",
+        result: {
+          runId: "loop-one-issue",
+          cycles: 1,
+          stop: null,
+          holdOutstanding: false,
+          allDone: true,
+          resumed: false,
+          heldItemIds: [],
+          dispatched: 1,
+          excludedItemIds: [],
+          exclusionReason: null,
+          completion: "all_done",
+        },
+      };
+    },
+  };
+  process.exitCode = undefined;
+  await withCapturedConsole(() => runLoopCommand({ profile: "claude" } as CliOpts, ["649"], deps));
+  assert.deepEqual(seenSelector, { type: "work-list", value: ["649"] });
+  assert.equal(process.exitCode, 0);
+});
+
+test("runLoopCommand — non-numeric trailing positional fails in loop normalization (#554)", async () => {
+  const deps: LoopCliDeps = {
+    runLoopPreflight: (raw, engine, _deps, roots, attestation) =>
+      realRunLoopPreflight(
+        raw,
+        engine,
+        {
+          exec: async () => ({ ok: true, stdout: "/goal autonomous mode", stderr: "" }),
+          execCheck: async () => true,
+          fsExists: async () => false,
+          fileMtime: async () => 1000,
+          readTextFile: async () => null,
+        },
+        roots,
+        attestation,
+      ),
+    runLoopEngine: NEVER_CALLED_ENGINE,
+  };
+  process.exitCode = undefined;
+  const { err } = await withCapturedConsole(() =>
+    runLoopCommand({ profile: "claude" } as CliOpts, ["649", "not-an-issue"], deps),
+  );
+  assert.equal(process.exitCode, 1);
+  assert.match(err.join("\n"), /expected an issue number.*not-an-issue/i);
+  assert.doesNotMatch(err.join("\n"), /unexpected argument/i);
+});
+
+// Pure end-to-end wiring for #554 (no live pipeline subprocess): Commander
+// parse → shared maxPositionalsFor guard → runLoopCommand handoff slice.
+// Mirrors main()'s arity check and `cmd.args.slice(1)` without invoking
+// production preflight or the drive engine.
+
+test("CLI wiring: multi-issue loop positionals pass the arity guard and hand off to runLoopCommand (#554)", async () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "loop", "649", "551", "541", "334"]);
+  assert.deepEqual(cmd.args, ["loop", "649", "551", "541", "334"]);
+  // Same predicate main() uses before dispatching runLoopCommand.
+  assert.ok(
+    cmd.args.length <= maxPositionalsFor(cmd.args[0]),
+    "shared positional guard must accept a multi-issue loop list",
+  );
+  const handedOff = cmd.args.slice(1);
+  assert.deepEqual(handedOff, ["649", "551", "541", "334"]);
+
+  let seenIssues: string[] | undefined;
+  let seenSelector: unknown;
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async (raw) => {
+      seenIssues = raw.issues;
+      return realRunLoopPreflight(
+        raw,
+        "claude",
+        {
+          exec: async () => ({ ok: true, stdout: "/goal autonomous mode", stderr: "" }),
+          execCheck: async () => true,
+          fsExists: async () => false,
+          fileMtime: async () => 1000,
+          readTextFile: async () => null,
+        },
+        [],
+        "auto",
+      );
+    },
+    runLoopEngine: async (input) => {
+      seenSelector = input.selector;
+      return {
+        kind: "drive",
+        result: {
+          runId: "loop-wiring-multi",
+          cycles: 1,
+          stop: null,
+          holdOutstanding: false,
+          allDone: true,
+          resumed: false,
+          heldItemIds: [],
+          dispatched: 4,
+          excludedItemIds: [],
+          exclusionReason: null,
+          completion: "all_done",
+        },
+      };
+    },
+  };
+  process.exitCode = undefined;
+  await withCapturedConsole(() => runLoopCommand({ profile: "claude" } as CliOpts, handedOff, deps));
+  assert.deepEqual(seenIssues, ["649", "551", "541", "334"]);
+  assert.deepEqual(seenSelector, { type: "work-list", value: ["649", "551", "541", "334"] });
+  assert.equal(process.exitCode, 0);
+});
+
+test("CLI wiring: non-numeric trailing loop positional passes the arity guard then fails in loop normalization (#554)", async () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "loop", "649", "not-an-issue"]);
+  assert.deepEqual(cmd.args, ["loop", "649", "not-an-issue"]);
+  assert.ok(
+    cmd.args.length <= maxPositionalsFor(cmd.args[0]),
+    "arity guard must not reject before loop-owned token validation",
+  );
+  const handedOff = cmd.args.slice(1);
+
+  const deps: LoopCliDeps = {
+    runLoopPreflight: (raw, engine, _deps, roots, attestation) =>
+      realRunLoopPreflight(
+        raw,
+        engine,
+        {
+          exec: async () => ({ ok: true, stdout: "/goal autonomous mode", stderr: "" }),
+          execCheck: async () => true,
+          fsExists: async () => false,
+          fileMtime: async () => 1000,
+          readTextFile: async () => null,
+        },
+        roots,
+        attestation,
+      ),
+    runLoopEngine: NEVER_CALLED_ENGINE,
+  };
+  process.exitCode = undefined;
+  const { err } = await withCapturedConsole(() =>
+    runLoopCommand({ profile: "claude" } as CliOpts, handedOff, deps),
+  );
+  assert.equal(process.exitCode, 1);
+  assert.match(err.join("\n"), /expected an issue number.*not-an-issue/i);
+  assert.doesNotMatch(err.join("\n"), /unexpected argument/i);
 });
 
 // ---------------------------------------------------------------------------
@@ -762,7 +1023,10 @@ test("runLoopCommand — --audit emits no loop_run_handoff and does not wire onR
   let sawOnRunReady: unknown = "unset";
   const deps: LoopCliDeps = {
     runLoopPreflight: async () =>
-      ({ ok: true, args: { selector: undefined, resumeRunId: "run-1", audit: true } }) satisfies LoopPreflightOutcome,
+      ({
+        ok: true,
+        args: { selector: undefined, resumeRunId: "run-1", audit: true, follow: false, newRun: false },
+      }) satisfies LoopPreflightOutcome,
     writeStdoutLine: (line) => lines.push(line),
     runLoopEngine: async (input) => {
       sawOnRunReady = input.onRunReady;
@@ -776,9 +1040,17 @@ test("runLoopCommand — --audit emits no loop_run_handoff and does not wire onR
   assert.equal(process.exitCode, 0);
   assert.equal(sawOnRunReady, undefined, "audit must not wire onRunReady");
   assert.equal(lines.length, 0);
-  const parsed = JSON.parse(out[0]);
+  // Stage table lines precede the JSON report (#611).
+  const jsonLine = out.find((l) => l.trimStart().startsWith("{"));
+  assert.ok(jsonLine, "audit must still print a JSON report line");
+  const parsed = JSON.parse(jsonLine!);
   assert.notEqual(parsed.kind, LOOP_RUN_HANDOFF_KIND);
   assert.equal(parsed.run_id, "run-1");
+  const joined = out.join("\n");
+  assert.match(joined, /Stage progress:/);
+  assert.match(joined, /#607/);
+  assert.match(joined, /implementing/);
+  assert.match(joined, /607-2026-07-27T19-31-29-328Z/);
 });
 
 test("runLoopCommand — regression: only terminal run_id after completion fails the before-first-dispatch assertion (#665)", async () => {
