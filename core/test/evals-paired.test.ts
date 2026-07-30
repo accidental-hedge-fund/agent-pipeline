@@ -868,6 +868,169 @@ test("paired: getDiff failure is infra_error — never empty review body (#601 8
   assert.deepEqual(harnesses, ["claude"], "reviewer must not run when primary diff collection fails");
 });
 
+test("paired: successful phase after wall-clock deadline is timeout not completed (#601 c77be66e)", async () => {
+  const fixture = makeFixture();
+  const manifest = validateManifest(
+    {
+      schema_version: 1,
+      experiment_id: "pair-exp",
+      fixture_ids: ["f1"],
+      mode: "implementing-paired",
+      treatments: {
+        form: "named-pairs",
+        pairs: [
+          {
+            id: "claude__codex",
+            primary: { harness: "claude" },
+            reviewer: { harness: "codex" },
+          },
+        ],
+      },
+      replicates: 1,
+      seed: 1,
+      concurrency: 1,
+      timeout: 1,
+      output_dir: ".agent-pipeline/evals",
+    },
+    new Set(["f1"]),
+  );
+  const cell = makeCell();
+  let call = 0;
+  const seenTimeouts: number[] = [];
+
+  const result = await runCell(FAKE_CFG, cell, fixture, manifest, {
+    createWorktree: async () => ({ path: "/fake/wt", branch: "b" }),
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    getDiff: async () => "diff --git a/x\n+ok\n",
+    invokeHarness: async (args) => {
+      call += 1;
+      seenTimeouts.push(args.timeoutSec);
+      if (call === 1) {
+        // Burn most of the 1s cell budget; leave a sub-second remainder.
+        await new Promise((r) => setTimeout(r, 700));
+        return success("implemented");
+      }
+      // Injected harness ignores timeoutSec and finishes after the absolute
+      // cell deadline while reporting success — the loop must still timeout.
+      await new Promise((r) => setTimeout(r, 400));
+      return success(approveVerdict([]));
+    },
+  });
+
+  assert.equal(result.outcome.result_class, "timeout");
+  assert.match(result.outcome.error ?? "", /deadline|timeout/i);
+  // Sub-second remainder must not be rounded up to a full 1s overrun allowance.
+  assert.equal(seenTimeouts.length, 2);
+  assert.ok(
+    seenTimeouts[1]! < 1,
+    `remaining budget must not ceil to 1s, got timeoutSec=${seenTimeouts[1]}`,
+  );
+  assert.ok(seenTimeouts[1]! > 0, "remaining budget before second invoke must be positive");
+  // Failed terminal path still carries pair diagnostics.
+  const detail = result.outcome.detail!;
+  assert.equal(detail.pair_id, "claude__codex");
+  assert.ok(Array.isArray(detail.stages));
+  assert.ok((detail.stages as unknown[]).length >= 1);
+});
+
+test("paired: failed cell retains accumulated pair-loop diagnostics (#601 36a6a954)", async () => {
+  const fixture = makeFixture();
+  const manifest = pairedManifest();
+  const cell = makeCell();
+  const harnesses: string[] = [];
+
+  const result = await runCell(FAKE_CFG, cell, fixture, manifest, {
+    createWorktree: async () => ({ path: "/fake/wt", branch: "b" }),
+    removeWorktree: async () => {},
+    preflight: async (harness) => {
+      if (harness === "codex") {
+        return { ok: false, failure: "unauthenticated", message: "codex auth missing" };
+      }
+      return { ok: true };
+    },
+    getDiff: async () => "diff --git a/core/scripts/foo.ts\n+ok\n",
+    invokeHarness: async (args) => {
+      harnesses.push(args.harness);
+      return success("implemented");
+    },
+  });
+
+  assert.equal(result.outcome.result_class, "auth_error");
+  assert.deepEqual(harnesses, ["claude"]);
+  const detail = result.outcome.detail!;
+  assert.equal(detail.failed_role, "reviewer");
+  assert.equal(detail.pair_id, "claude__codex");
+  assert.deepEqual(detail.primary, { harness: "claude", model: "sonnet", effort: null });
+  // Reviewer effort falls through from pipeline.yml structured settings when the pair omits it.
+  assert.deepEqual(detail.reviewer, { harness: "codex", model: "gpt-5", effort: "xhigh" });
+  assert.equal(detail.fix_1_invoked, false);
+  assert.equal(detail.fix_2_invoked, false);
+  assert.equal(detail.malformed_review_count, 0);
+  assert.ok(Array.isArray(detail.stages), "phaseDetails must be present on failed cells");
+  assert.equal((detail.stages as { phase: string }[]).length, 1);
+  assert.equal((detail.stages as { phase: string }[])[0]!.phase, "implementing");
+  assert.ok(detail.pair_loop);
+  assert.equal((detail.pair_loop as { mode: string }).mode, "implementing-paired");
+  assert.equal(typeof detail.duration_sec, "number");
+});
+
+test("collectPairedWorktreeDiff: includes >50 untracked files and fails closed on size (#601 8c015b1f)", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileAsync = promisify(execFile);
+  const { collectPairedWorktreeDiff, PAIRED_DIFF_MAX_BYTES } = await import(
+    "../scripts/evals/executor.ts"
+  );
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "paired-diff-"));
+  try {
+    await execFileAsync("git", ["init"], { cwd: dir });
+    await execFileAsync("git", ["config", "user.email", "eval@test"], { cwd: dir });
+    await execFileAsync("git", ["config", "user.name", "eval"], { cwd: dir });
+    fs.writeFileSync(path.join(dir, "tracked.txt"), "base\n");
+    await execFileAsync("git", ["add", "tracked.txt"], { cwd: dir });
+    await execFileAsync("git", ["commit", "-m", "base"], { cwd: dir });
+    const { stdout: baseSha } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: dir });
+    const sha = baseSha.trim();
+
+    // 60 untracked files — old code only included the first 50.
+    for (let i = 0; i < 60; i++) {
+      const name = `untracked-${String(i).padStart(3, "0")}.txt`;
+      fs.writeFileSync(path.join(dir, name), `content-${i}\n`);
+    }
+    // One late untracked source file that must not be dropped.
+    fs.writeFileSync(path.join(dir, "core-scripts-foo.ts"), "export const x = 1;\n");
+
+    const diff = await collectPairedWorktreeDiff({ worktreeDir: dir, baseSha: sha });
+    assert.match(diff, /untracked-000\.txt/);
+    assert.match(diff, /untracked-059\.txt/, "must include untracked files past the old 50-file cap");
+    assert.match(diff, /core-scripts-foo\.ts/, "late untracked source must be included");
+
+    // Size-limit fail-closed: a huge *text* untracked file makes the unified
+    // diff exceed PAIRED_DIFF_MAX_BYTES (binary files only emit a short marker).
+    const huge = path.join(dir, "huge.txt");
+    const line = "x".repeat(1024) + "\n"; // 1 KiB line
+    const fd = fs.openSync(huge, "w");
+    try {
+      // ~21 MiB of text → unified diff body exceeds 20 MiB cap.
+      const lines = Math.ceil((PAIRED_DIFF_MAX_BYTES + 1024 * 1024) / line.length);
+      for (let i = 0; i < lines; i++) fs.writeSync(fd, line);
+    } finally {
+      fs.closeSync(fd);
+    }
+    await assert.rejects(
+      () => collectPairedWorktreeDiff({ worktreeDir: dir, baseSha: sha }),
+      /exceeds .* byte limit|complete reviewable diff|maxBuffer|ENOBUFS/i,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("fixture allows generator-owned plugin/ paths in allowed_change_paths", () => {
   const fixture = validateFixture(
     {

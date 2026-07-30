@@ -216,11 +216,105 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
   const phaseDetails: Record<string, unknown>[] = [];
   const preflighted = new Set<RoleName>();
 
+  // Evidence shared by both modes — mutated as the loop advances; always
+  // merged into terminal outcomes so failed cells keep reconstructable
+  // pair-loop diagnostics (#601 review 2 36a6a954).
+  let planText = "";
+  let planRevisionInvoked = false;
+  let fix1Invoked = false;
+  let fix2Invoked = false;
+  let review1Parse: ReviewVerdictParseProvenance | undefined;
+  let review2Parse: ReviewVerdictParseProvenance | undefined;
+  let reReviewParse: ReviewVerdictParseProvenance | undefined;
+  let blockingBeforeFix1 = 0;
+  let blockingAfterFix1 = 0;
+  let blockingBeforeFix2 = 0;
+  let review2Findings: ReviewFinding[] | undefined;
+  let review2Unparseable = false;
+  let malformedReviewCount = 0;
+  let finalDiff = "";
+
+  /** Absolute wall-clock deadline check — used before preflight/diff/harness
+   *  and immediately after every successful phase (#601 review 2 c77be66e). */
+  const deadlineExceeded = (when: string, role: FailedRole): CellOutcome => ({
+    result_class: "timeout",
+    error: `paired cell exceeded its ${manifest.timeout}s deadline ${when}`,
+    detail: { failed_role: role },
+  });
+
+  const checkDeadline = (when: string, role: FailedRole): CellOutcome | null => {
+    if (Date.now() >= cellDeadlineMs) return deadlineExceeded(when, role);
+    return null;
+  };
+
+  /** Merge accumulated pair-loop evidence into every terminal outcome. */
+  const terminate = (outcome: CellOutcome): PairedLoopResult => {
+    const durationSec = phaseDetails.reduce(
+      (sum, p) => sum + (typeof p.duration === "number" ? p.duration : 0),
+      0,
+    );
+    const baseDetail: Record<string, unknown> = {
+      stages: phaseDetails,
+      execution_class: "local-cli",
+      pair_id: cell.treatment_id,
+      primary: {
+        harness: primary.harness,
+        model: primary.model ?? null,
+        effort: primary.effort ?? null,
+      },
+      reviewer: {
+        harness: reviewer.harness,
+        model: reviewer.model ?? null,
+        effort: reviewer.effort ?? null,
+      },
+      fix_invoked: fix1Invoked || fix2Invoked,
+      fix_1_invoked: fix1Invoked,
+      fix_2_invoked: fix2Invoked,
+      plan_revision_invoked: planRevisionInvoked,
+      blocking_findings_before: blockingBeforeFix1,
+      blocking_findings_after: mode === "implementing-paired" ? blockingAfterFix1 : undefined,
+      blocking_findings_before_fix_1: blockingBeforeFix1,
+      // Both modes record post-fix-1 blocking; pipeline-paired uses adversarial
+      // review as that observation (#601 review 1 6d63e02e).
+      blocking_findings_after_fix_1: blockingAfterFix1,
+      blocking_findings_before_fix_2: mode === "pipeline-paired" ? blockingBeforeFix2 : undefined,
+      // Review-2 / pre-fix-2 findings labeled separately from final post-fix-2 state.
+      review_2_findings: mode === "pipeline-paired" ? (review2Findings ?? null) : undefined,
+      review_2_unparseable: mode === "pipeline-paired" ? review2Unparseable : undefined,
+      post_fix_2_diff_present: mode === "pipeline-paired" ? fix2Invoked : undefined,
+      final_diff_bytes: finalDiff.length,
+      review_verdict_parse: review1Parse,
+      review_1_verdict_parse: review1Parse,
+      review_2_verdict_parse: mode === "implementing-paired" ? reReviewParse : review2Parse,
+      re_review_verdict_parse: reReviewParse,
+      malformed_review_count: malformedReviewCount,
+      duration_sec: durationSec,
+      pair_loop: {
+        mode,
+        plan_revision_invoked: planRevisionInvoked,
+        fix_1_invoked: fix1Invoked,
+        fix_2_invoked: fix2Invoked,
+        blocking_before_fix_1: blockingBeforeFix1,
+        blocking_after_fix_1: blockingAfterFix1,
+        blocking_before_fix_2: mode === "pipeline-paired" ? blockingBeforeFix2 : null,
+        malformed_review_count: malformedReviewCount,
+      },
+    };
+    // Outcome-specific fields (failed_role, final_review_disposition, …) win.
+    const detail = { ...baseDetail, ...(outcome.detail ?? {}) };
+    return {
+      outcome: { ...outcome, detail },
+      materializedPrompt: promptsSent.join("\n\n---\n\n"),
+    };
+  };
+
   /** Preflight a role on first use so primary can implement before reviewer auth is checked. */
   const ensurePreflight = async (
     resolved: ResolvedRole,
   ): Promise<CellOutcome | null> => {
     if (preflighted.has(resolved.role)) return null;
+    const before = checkDeadline(`before ${resolved.role} preflight`, resolved.role);
+    if (before) return before;
     if (resolved.effort !== undefined) {
       const adapter = resolveAdapter(resolved.harness);
       if (!adapter || !adapter.capabilities.effort) {
@@ -244,6 +338,8 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
         detail: { failed_role: resolved.role },
       };
     }
+    const after = checkDeadline(`during ${resolved.role} preflight`, resolved.role);
+    if (after) return after;
     if (!preflight.ok) {
       const resultClass = preflight.failure === "unauthenticated" ? "auth_error" : "infra_error";
       return {
@@ -255,6 +351,27 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
     preflighted.add(resolved.role);
     trajectoryActions.push(`preflight passed for ${resolved.role} harness "${resolved.harness}"`);
     return null;
+  };
+
+  const collectDiff = async (
+    when: string,
+  ): Promise<{ diff?: string; outcome?: CellOutcome }> => {
+    const before = checkDeadline(`before ${when}`, "primary");
+    if (before) return { outcome: before };
+    try {
+      const diff = await deps.getDiff({ worktreeDir, baseSha: cell.base_sha });
+      const after = checkDeadline(`during ${when}`, "primary");
+      if (after) return { outcome: after };
+      return { diff };
+    } catch (err) {
+      return {
+        outcome: {
+          result_class: "infra_error",
+          error: `failed to collect ${when}: ${(err as Error).message}`,
+          detail: { failed_role: "primary" satisfies FailedRole },
+        },
+      };
+    }
   };
 
   const invokePhase = async (
@@ -269,20 +386,21 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
     const remainingMs = cellDeadlineMs - Date.now();
     if (remainingMs <= 0) {
       return {
-        outcome: {
-          result_class: "timeout",
-          error: `paired cell exceeded its ${manifest.timeout}s deadline before ${phase}`,
-          detail: { failed_role: resolved.role },
-        },
+        outcome: deadlineExceeded(`before ${phase}`, resolved.role),
       };
     }
+    // Pass the exact remaining budget — do NOT ceil to whole seconds, which
+    // would grant a sub-second remainder a full extra second of overrun
+    // allowance (#601 review 2 c77be66e). Fractional seconds are honored by
+    // harness runCapped (timeoutSec * 1000).
+    const timeoutSec = remainingMs / 1000;
     let result: PairedHarnessResult;
     try {
       result = await deps.invokeHarness({
         harness: resolved.harness,
         worktreeDir,
         prompt,
-        timeoutSec: Math.max(1, Math.ceil(remainingMs / 1000)),
+        timeoutSec,
         model: resolved.model,
         effort: resolved.effort,
         gh,
@@ -365,27 +483,21 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
         },
       };
     }
+    // Successful harness output is only usable if the shared wall-clock budget
+    // has not already elapsed (final phase has no later invoke to recheck).
+    if (Date.now() >= cellDeadlineMs) {
+      trajectoryActions.push(
+        `invoked ${phase} via ${resolved.role} harness "${resolved.harness}" (success after deadline → timeout)`,
+      );
+      return {
+        outcome: deadlineExceeded(`after ${phase}`, resolved.role),
+      };
+    }
     trajectoryActions.push(
       `invoked ${phase} via ${resolved.role} harness "${resolved.harness}" (success)`,
     );
     return { result };
   };
-
-  // Evidence shared by both modes.
-  let planText = "";
-  let planRevisionInvoked = false;
-  let fix1Invoked = false;
-  let fix2Invoked = false;
-  let review1Parse: ReviewVerdictParseProvenance | undefined;
-  let review2Parse: ReviewVerdictParseProvenance | undefined;
-  let reReviewParse: ReviewVerdictParseProvenance | undefined;
-  let blockingBeforeFix1 = 0;
-  let blockingAfterFix1 = 0;
-  let blockingBeforeFix2 = 0;
-  let review2Findings: ReviewFinding[] | undefined;
-  let review2Unparseable = false;
-  let malformedReviewCount = 0;
-  let finalDiff = "";
 
   if (mode === "pipeline-paired") {
     // planning → plan-review → (optional) plan revision → implement → review → fix-1 → adversarial → fix-2
@@ -394,7 +506,7 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
       primary,
       materializePairedPlanningPrompt(promptCtx),
     );
-    if (planning.outcome) return { outcome: planning.outcome, materializedPrompt: promptsSent.join("\n\n---\n\n") };
+    if (planning.outcome) return terminate(planning.outcome);
     planText = planning.result!.stdout || "";
 
     const planReview = await invokePhase(
@@ -402,7 +514,7 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
       reviewer,
       materializePairedPlanReviewPrompt(promptCtx, planText),
     );
-    if (planReview.outcome) return { outcome: planReview.outcome, materializedPrompt: promptsSent.join("\n\n---\n\n") };
+    if (planReview.outcome) return terminate(planReview.outcome);
     const planReviewParsed = parseReviewFindings(planReview.result!.stdout);
     const planBlocking = partitionBlockingFindings(cfg, planReviewParsed.findings, planReviewParsed.provenance);
     if (planReviewParsed.provenance === "unparseable") malformedReviewCount += 1;
@@ -418,7 +530,7 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
         primary,
         materializePairedPlanRevisionPrompt(promptCtx, planText, feedback),
       );
-      if (revision.outcome) return { outcome: revision.outcome, materializedPrompt: promptsSent.join("\n\n---\n\n") };
+      if (revision.outcome) return terminate(revision.outcome);
       planText = revision.result!.stdout || planText;
     }
   } else {
@@ -440,27 +552,18 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
     primary,
     materializePairedImplementPrompt(promptCtx, planText),
   );
-  if (implement.outcome) return { outcome: implement.outcome, materializedPrompt: promptsSent.join("\n\n---\n\n") };
+  if (implement.outcome) return terminate(implement.outcome);
 
-  let initialDiff: string;
-  try {
-    initialDiff = await deps.getDiff({ worktreeDir, baseSha: cell.base_sha });
-  } catch (err) {
-    return {
-      outcome: {
-        result_class: "infra_error",
-        error: `failed to collect primary implementation diff for review: ${(err as Error).message}`,
-        detail: { failed_role: "primary" satisfies FailedRole },
-      },
-      materializedPrompt: promptsSent.join("\n\n---\n\n"),
-    };
-  }
+  const initialDiffResult = await collectDiff("primary implementation diff for review");
+  if (initialDiffResult.outcome) return terminate(initialDiffResult.outcome);
+  const initialDiff = initialDiffResult.diff!;
+
   const review1 = await invokePhase(
     "review-1",
     reviewer,
     materializePairedStandardReviewPrompt(promptCtx, planText, initialDiff),
   );
-  if (review1.outcome) return { outcome: review1.outcome, materializedPrompt: promptsSent.join("\n\n---\n\n") };
+  if (review1.outcome) return terminate(review1.outcome);
   const review1Parsed = parseReviewFindings(review1.result!.stdout);
   review1Parse = review1Parsed.provenance;
   if (review1Parse === "unparseable") malformedReviewCount += 1;
@@ -478,21 +581,12 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
         1,
       ),
     );
-    if (fix1.outcome) return { outcome: fix1.outcome, materializedPrompt: promptsSent.join("\n\n---\n\n") };
+    if (fix1.outcome) return terminate(fix1.outcome);
   }
 
-  try {
-    finalDiff = await deps.getDiff({ worktreeDir, baseSha: cell.base_sha });
-  } catch (err) {
-    return {
-      outcome: {
-        result_class: "infra_error",
-        error: `failed to collect post-fix-1 worktree diff for review: ${(err as Error).message}`,
-        detail: { failed_role: "primary" satisfies FailedRole },
-      },
-      materializedPrompt: promptsSent.join("\n\n---\n\n"),
-    };
-  }
+  const postFix1Diff = await collectDiff("post-fix-1 worktree diff for review");
+  if (postFix1Diff.outcome) return terminate(postFix1Diff.outcome);
+  finalDiff = postFix1Diff.diff!;
 
   // Final re-review remaining-blocking / unparseable disposition (implementing-paired only).
   let finalReviewUnresolved = false;
@@ -506,7 +600,7 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
         reviewer,
         materializePairedStandardReviewPrompt(promptCtx, planText, finalDiff),
       );
-      if (reReview.outcome) return { outcome: reReview.outcome, materializedPrompt: promptsSent.join("\n\n---\n\n") };
+      if (reReview.outcome) return terminate(reReview.outcome);
       const reParsed = parseReviewFindings(reReview.result!.stdout);
       reReviewParse = reParsed.provenance;
       if (reReviewParse === "unparseable") malformedReviewCount += 1;
@@ -532,7 +626,7 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
       reviewer,
       materializePairedAdversarialReviewPrompt(promptCtx, finalDiff, review1Summary),
     );
-    if (adv.outcome) return { outcome: adv.outcome, materializedPrompt: promptsSent.join("\n\n---\n\n") };
+    if (adv.outcome) return terminate(adv.outcome);
     const advParsed = parseReviewFindings(adv.result!.stdout);
     review2Parse = advParsed.provenance;
     if (review2Parse === "unparseable") malformedReviewCount += 1;
@@ -556,97 +650,41 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
           review1Summary,
         ),
       );
-      if (fix2.outcome) return { outcome: fix2.outcome, materializedPrompt: promptsSent.join("\n\n---\n\n") };
+      if (fix2.outcome) return terminate(fix2.outcome);
       // No third review after fix-2. Capture final post-fix-2 worktree state separately.
-      try {
-        finalDiff = await deps.getDiff({ worktreeDir, baseSha: cell.base_sha });
-      } catch (err) {
-        return {
-          outcome: {
-            result_class: "infra_error",
-            error: `failed to collect post-fix-2 worktree diff: ${(err as Error).message}`,
-            detail: { failed_role: "primary" satisfies FailedRole },
-          },
-          materializedPrompt: promptsSent.join("\n\n---\n\n"),
-        };
-      }
+      const postFix2Diff = await collectDiff("post-fix-2 worktree diff");
+      if (postFix2Diff.outcome) return terminate(postFix2Diff.outcome);
+      finalDiff = postFix2Diff.diff!;
     }
   }
 
-  const durationSec = phaseDetails.reduce((sum, p) => sum + (typeof p.duration === "number" ? p.duration : 0), 0);
-
-  const detail: Record<string, unknown> = {
-    stages: phaseDetails,
-    execution_class: "local-cli",
-    pair_id: cell.treatment_id,
-    primary: {
-      harness: primary.harness,
-      model: primary.model ?? null,
-      effort: primary.effort ?? null,
-    },
-    reviewer: {
-      harness: reviewer.harness,
-      model: reviewer.model ?? null,
-      effort: reviewer.effort ?? null,
-    },
-    fix_invoked: fix1Invoked || fix2Invoked,
-    fix_1_invoked: fix1Invoked,
-    fix_2_invoked: fix2Invoked,
-    plan_revision_invoked: planRevisionInvoked,
-    blocking_findings_before: blockingBeforeFix1,
-    blocking_findings_after: mode === "implementing-paired" ? blockingAfterFix1 : undefined,
-    blocking_findings_before_fix_1: blockingBeforeFix1,
-    // Both modes record post-fix-1 blocking; pipeline-paired uses adversarial review
-    // as that observation (#601 review 1 6d63e02e).
-    blocking_findings_after_fix_1: blockingAfterFix1,
-    blocking_findings_before_fix_2: mode === "pipeline-paired" ? blockingBeforeFix2 : undefined,
-    // Review-2 / pre-fix-2 findings labeled separately from final post-fix-2 state.
-    review_2_findings: mode === "pipeline-paired" ? (review2Findings ?? null) : undefined,
-    review_2_unparseable: mode === "pipeline-paired" ? review2Unparseable : undefined,
-    post_fix_2_diff_present: mode === "pipeline-paired" ? fix2Invoked : undefined,
-    final_diff_bytes: finalDiff.length,
-    review_verdict_parse: review1Parse,
-    review_1_verdict_parse: review1Parse,
-    review_2_verdict_parse: mode === "implementing-paired" ? reReviewParse : review2Parse,
-    re_review_verdict_parse: reReviewParse,
-    malformed_review_count: malformedReviewCount,
-    duration_sec: durationSec,
-    pair_loop: {
-      mode,
-      plan_revision_invoked: planRevisionInvoked,
-      fix_1_invoked: fix1Invoked,
-      fix_2_invoked: fix2Invoked,
-      blocking_before_fix_1: blockingBeforeFix1,
-      blocking_after_fix_1: blockingAfterFix1,
-      blocking_before_fix_2: mode === "pipeline-paired" ? blockingBeforeFix2 : null,
-      malformed_review_count: malformedReviewCount,
-    },
-  };
+  // Final absolute deadline gate before completing (covers modes that end
+  // without a harness phase after the last successful step).
+  const finalDeadline = checkDeadline("before completing pair loop", "primary");
+  if (finalDeadline) return terminate(finalDeadline);
 
   // implementing-paired: unresolved final re-review is not a completed treatment
   // outcome — exclude from quality grading and completion reliability while
   // preserving parse provenance and loop diagnostics in detail.
   if (mode === "implementing-paired") {
     if (finalReviewUnresolved) {
-      detail.final_review_disposition = finalReviewUnparseable
-        ? "unresolved_unparseable"
-        : "unresolved_blocking";
-      return {
-        outcome: {
-          result_class: "infra_error",
-          error: finalReviewUnparseable
-            ? "implementing-paired final re-review was unparseable (not approval) — not a completed treatment outcome"
-            : "implementing-paired final re-review still has blocking findings — not a completed treatment outcome",
-          detail,
+      return terminate({
+        result_class: "infra_error",
+        error: finalReviewUnparseable
+          ? "implementing-paired final re-review was unparseable (not approval) — not a completed treatment outcome"
+          : "implementing-paired final re-review still has blocking findings — not a completed treatment outcome",
+        detail: {
+          final_review_disposition: finalReviewUnparseable
+            ? "unresolved_unparseable"
+            : "unresolved_blocking",
         },
-        materializedPrompt: promptsSent.join("\n\n---\n\n"),
-      };
+      });
     }
-    detail.final_review_disposition = "approved";
+    return terminate({
+      result_class: "completed",
+      detail: { final_review_disposition: "approved" },
+    });
   }
 
-  return {
-    outcome: { result_class: "completed", detail },
-    materializedPrompt: promptsSent.join("\n\n---\n\n"),
-  };
+  return terminate({ result_class: "completed" });
 }

@@ -367,13 +367,24 @@ async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: stri
   }
 }
 
+/** Hard cap on total reviewable paired-mode diff size (tracked + untracked).
+ *  Exceeding this fails closed as infra_error rather than silently truncating
+ *  reviewer input (#601 review 2 8c015b1f). */
+export const PAIRED_DIFF_MAX_BYTES = 20 * 1024 * 1024;
+
 /**
  * Collect the full unified diff of the worktree vs baseSha for paired-mode review.
- * Throws on tracked-diff collection failure so the pair loop can record an
- * infra_error rather than substituting an empty review body (#601 review 1 8c015b1f).
- * A legitimate empty worktree (no changes) still returns an empty string.
+ * Includes every untracked (non-ignored) path — never silently truncates the
+ * untracked list. Throws when a complete reviewable diff cannot be collected
+ * (tracked failure, untracked listing failure, per-file failure without
+ * stdout, or total size over {@link PAIRED_DIFF_MAX_BYTES}) so the pair loop
+ * records infra_error rather than grading a partial review body
+ * (#601 review 1/2 8c015b1f). A legitimate empty worktree returns "".
  */
-async function defaultGetDiff(args: { worktreeDir: string; baseSha: string }): Promise<string> {
+export async function collectPairedWorktreeDiff(args: {
+  worktreeDir: string;
+  baseSha: string;
+}): Promise<string> {
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const execFileAsync = promisify(execFile);
@@ -384,46 +395,110 @@ async function defaultGetDiff(args: { worktreeDir: string; baseSha: string }): P
     const result = await execFileAsync("git", ["diff", args.baseSha], {
       cwd: args.worktreeDir,
       timeout: 30_000,
-      maxBuffer: 20 * 1024 * 1024,
+      maxBuffer: PAIRED_DIFF_MAX_BYTES,
     });
     tracked = result.stdout;
   } catch (err) {
-    const e = err as { message?: string; code?: string; killed?: boolean; signal?: string };
-    throw new Error(
-      `failed to collect tracked worktree diff vs ${args.baseSha}` +
-        (e.code ? ` (code=${e.code})` : "") +
-        (e.killed ? " (killed)" : "") +
-        (e.signal ? ` (signal=${e.signal})` : "") +
-        `: ${e.message ?? String(err)}`,
-    );
+    const e = err as { message?: string; code?: string; killed?: boolean; signal?: string; stdout?: string };
+    // git diff can exit non-zero for rare cases; only accept when stdout is present
+    // and the process was not killed for size/time.
+    if (typeof e.stdout === "string" && e.stdout.length > 0 && !e.killed && !e.signal) {
+      tracked = e.stdout;
+    } else {
+      throw new Error(
+        `failed to collect tracked worktree diff vs ${args.baseSha}` +
+          (e.code ? ` (code=${e.code})` : "") +
+          (e.killed ? " (killed)" : "") +
+          (e.signal ? ` (signal=${e.signal})` : "") +
+          `: ${e.message ?? String(err)}`,
+      );
+    }
   }
-  let untracked = "";
+
+  let namesOut: string;
   try {
     const { stdout: names } = await execFileAsync(
       "git",
       ["ls-files", "--others", "--exclude-standard"],
       { cwd: args.worktreeDir, timeout: 30_000 },
     );
-    const files = names.split("\n").map((l) => l.trim()).filter(Boolean);
-    for (const file of files.slice(0, 50)) {
-      try {
-        const { stdout: content } = await execFileAsync("git", ["diff", "--no-index", "--", "/dev/null", file], {
+    namesOut = names;
+  } catch (err) {
+    const e = err as { message?: string };
+    throw new Error(
+      `failed to list untracked worktree paths for paired review diff: ${e.message ?? String(err)}`,
+    );
+  }
+
+  const files = namesOut.split("\n").map((l) => l.trim()).filter(Boolean);
+  let totalBytes = Buffer.byteLength(tracked, "utf8");
+  if (totalBytes > PAIRED_DIFF_MAX_BYTES) {
+    throw new Error(
+      `worktree diff exceeds ${PAIRED_DIFF_MAX_BYTES} byte limit ` +
+        `(tracked alone is ${totalBytes} bytes) — cannot collect a complete reviewable diff`,
+    );
+  }
+
+  let untracked = "";
+  for (const file of files) {
+    let content: string;
+    try {
+      const { stdout } = await execFileAsync(
+        "git",
+        ["diff", "--no-index", "--", "/dev/null", file],
+        {
           cwd: args.worktreeDir,
           timeout: 10_000,
-          maxBuffer: 2 * 1024 * 1024,
-        });
-        untracked += content;
-      } catch (err) {
-        // git diff --no-index exits 1 when files differ — stdout still holds the diff.
-        const e = err as { stdout?: string };
-        if (e.stdout) untracked += e.stdout;
+          maxBuffer: Math.min(2 * 1024 * 1024, PAIRED_DIFF_MAX_BYTES),
+        },
+      );
+      content = stdout;
+    } catch (err) {
+      // git diff --no-index exits 1 when files differ — stdout still holds the diff.
+      // maxBuffer / kill / signal means the diff is incomplete — fail closed.
+      const e = err as {
+        stdout?: string;
+        message?: string;
+        code?: string | number;
+        killed?: boolean;
+        signal?: string;
+      };
+      const incomplete =
+        e.killed ||
+        e.signal ||
+        e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ||
+        (typeof e.message === "string" && /maxBuffer|ENOBUFS/i.test(e.message));
+      if (
+        !incomplete &&
+        typeof e.stdout === "string" &&
+        e.stdout.length > 0
+      ) {
+        content = e.stdout;
+      } else {
+        throw new Error(
+          `failed to collect untracked diff for ${JSON.stringify(file)}` +
+            (e.code !== undefined ? ` (code=${e.code})` : "") +
+            (e.killed ? " (killed)" : "") +
+            (e.signal ? ` (signal=${e.signal})` : "") +
+            `: ${e.message ?? String(err)} — cannot collect a complete reviewable diff`,
+        );
       }
     }
-  } catch {
-    // Best-effort untracked inclusion — tracked diff is the review contract.
+    const nextBytes = totalBytes + Buffer.byteLength(content, "utf8");
+    if (nextBytes > PAIRED_DIFF_MAX_BYTES) {
+      throw new Error(
+        `worktree diff exceeds ${PAIRED_DIFF_MAX_BYTES} byte limit after including ` +
+          `untracked path ${JSON.stringify(file)} (${files.length} untracked paths total) — ` +
+          `cannot collect a complete reviewable diff`,
+      );
+    }
+    untracked += content;
+    totalBytes = nextBytes;
   }
   return `${tracked}${untracked}`;
 }
+
+const defaultGetDiff = collectPairedWorktreeDiff;
 
 /** Command-line tokens that reach outside the cell's isolated worktree — the
  *  GitHub CLI (a production GitHub write), raw network clients, and `git
