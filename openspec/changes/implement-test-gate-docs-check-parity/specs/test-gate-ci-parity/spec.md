@@ -13,8 +13,8 @@ When this repository includes the docs generator entry point (`scripts/generate-
 
 #### Scenario: write-mode docs:check does not satisfy CI freshness wiring
 
-- **WHEN** `package.json` defines `docs:check` as a generator write-mode invocation without `--check` (e.g. `node scripts/generate-docs.mjs`)
-- **AND** the `ci` graph only reaches that write-mode script (no separate `--check` edge)
+- **WHEN** `package.json` defines `docs:check` as a generator write-mode invocation without `--check` as an argument of the generator invocation itself (e.g. `node scripts/generate-docs.mjs`, or a compound script such as `node scripts/generate-docs.mjs && echo --check` where `--check` is not on the generator segment)
+- **AND** the `ci` graph only reaches that write-mode script (no separate real check-mode edge)
 - **THEN** structural inspection SHALL NOT report that `ci` reaches docs freshness
 
 #### Scenario: stale generated docs fail the local test gate via npm run ci

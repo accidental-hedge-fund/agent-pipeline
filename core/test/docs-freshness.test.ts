@@ -147,6 +147,27 @@ test("scriptIsDocsFreshnessCheck: requires generator + --check (not write-mode)"
   assert.equal(scriptIsDocsFreshnessCheck(undefined), false);
 });
 
+test("scriptIsDocsFreshnessCheck: compound script with --check elsewhere is write-mode (#716)", () => {
+  // --check must be an arg of generate-docs itself, not a later segment.
+  assert.equal(
+    scriptIsDocsFreshnessCheck("node scripts/generate-docs.mjs && echo --check"),
+    false,
+  );
+  assert.equal(
+    scriptIsDocsFreshnessCheck("node scripts/generate-docs.mjs || echo --check"),
+    false,
+  );
+  assert.equal(
+    scriptIsDocsFreshnessCheck("node scripts/generate-docs.mjs; echo --check"),
+    false,
+  );
+  // Still true when --check is on the generator segment (even with a trailing step).
+  assert.equal(
+    scriptIsDocsFreshnessCheck("node scripts/generate-docs.mjs --check && echo ok"),
+    true,
+  );
+});
+
 test("detectDocsGenerator: absent when no file and no generator docs:check", () => {
   const surface = detectDocsGenerator("/wt", {
     fileExists: () => false,
@@ -214,6 +235,28 @@ test("detectDocsGenerator: write-mode docs:check is not selected as check comman
   }
 });
 
+test("detectDocsGenerator: compound write-mode docs:check is not selected as check command (#716)", () => {
+  // --check only appears in a later segment — still write-mode for the generator.
+  const surface = detectDocsGenerator("/wt", {
+    fileExists: (p) => p.replace(/\\/g, "/").endsWith("scripts/generate-docs.mjs"),
+    readPackageJson: () => ({
+      scripts: {
+        "docs:check": "node scripts/generate-docs.mjs && echo --check",
+        "docs:generate": "node scripts/generate-docs.mjs",
+      },
+    }),
+  });
+  assert.equal(surface.present, true);
+  if (surface.present) {
+    assert.equal(
+      surface.checkCommand,
+      "node scripts/generate-docs.mjs --check",
+      "must not use compound write-mode npm run docs:check as the freshness check",
+    );
+    assert.notEqual(surface.checkCommand, "npm run docs:check");
+  }
+});
+
 test("extractStalePaths: parses known generator output; does not invent names", () => {
   assert.deepEqual(
     extractStalePaths(staleCheckOutput(["CHANGELOG.md", "docs/cli.md"])),
@@ -270,6 +313,18 @@ test("ciScriptReachesDocsFreshness: false when docs:check is write-mode generato
       "ci:core": "npm test",
       // Invokes generator but without --check — not a freshness edge.
       "docs:check": "node scripts/generate-docs.mjs",
+    }),
+    false,
+  );
+});
+
+test("ciScriptReachesDocsFreshness: false when docs:check is compound write-mode (#716)", () => {
+  // --check only in a later segment must not certify the ci graph as freshness-wired.
+  assert.equal(
+    ciScriptReachesDocsFreshness({
+      ci: "npm run ci:core && npm run docs:check",
+      "ci:core": "npm test",
+      "docs:check": "node scripts/generate-docs.mjs && echo --check",
     }),
     false,
   );

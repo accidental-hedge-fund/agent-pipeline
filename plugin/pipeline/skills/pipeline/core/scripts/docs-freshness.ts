@@ -63,13 +63,33 @@ export function scriptInvokesDocsGenerator(scriptValue: string | undefined): boo
 }
 
 /**
+ * Split a package.json script body into top-level shell command segments.
+ * Operators `&&`, `||`, `|`, and `;` separate segments so a later `echo --check`
+ * cannot certify a write-mode generator invocation as check-mode.
+ */
+function scriptCommandSegments(scriptValue: string): string[] {
+  return scriptValue
+    .split(/(?:&&|\|\||[;|])/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
  * True when a script body is a real **check-mode** docs freshness invocation —
- * generator contract **and** an explicit `--check` flag. Write-mode generator
- * scripts (`node scripts/generate-docs.mjs` without `--check`) do not count:
- * they can exit 0 after writing files and leave a stale committed HEAD.
+ * generator contract **and** an explicit `--check` flag on the **same** shell
+ * command segment as the generator. Write-mode generator scripts
+ * (`node scripts/generate-docs.mjs` without `--check`) do not count, nor do
+ * compound scripts that only mention `--check` elsewhere
+ * (`node scripts/generate-docs.mjs && echo --check`): they can exit 0 after
+ * writing files and leave a stale committed HEAD.
  */
 export function scriptIsDocsFreshnessCheck(scriptValue: string | undefined): boolean {
-  return scriptInvokesDocsGenerator(scriptValue) && /--check\b/.test(scriptValue ?? "");
+  if (!scriptValue) return false;
+  // --check must be an argument of the generate-docs invocation itself, not a
+  // later compound-script segment.
+  return scriptCommandSegments(scriptValue).some(
+    (seg) => scriptInvokesDocsGenerator(seg) && /--check\b/.test(seg),
+  );
 }
 
 /**
