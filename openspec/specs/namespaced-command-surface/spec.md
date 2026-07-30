@@ -9,7 +9,7 @@ The host packaging SHALL expose each in-scope pipeline operation as its own
 discoverable `pipeline:<command>` command entry, rather than as a flag on a single
 `/pipeline` command. The in-scope operation set SHALL be exactly: `status`,
 `unblock`, `override`, `summary`, `doctor`, `init`, `cleanup`, `intake`, `sweep`,
-`triage`, `merge`, `release`, `roadmap`, `logs`, `loop`. On the Claude host these
+`triage`, `merge`, `merge-queue`, `release`, `roadmap`, `logs`, `loop`. On the Claude host these
 entries SHALL be invocable as `/pipeline:<command>`; on the Codex host they SHALL be
 invocable as `$pipeline:<command>`. Each entry SHALL appear in that host's
 command/skill discovery surface.
@@ -20,8 +20,8 @@ command/skill discovery surface.
 - **THEN** it SHALL contain a `pipeline:status`, `pipeline:unblock`,
   `pipeline:override`, `pipeline:summary`, `pipeline:doctor`, `pipeline:init`,
   `pipeline:cleanup`, `pipeline:intake`, `pipeline:sweep`, `pipeline:triage`,
-  `pipeline:merge`, `pipeline:release`, `pipeline:roadmap`, `pipeline:logs`, and
-  `pipeline:loop` entry
+  `pipeline:merge`, `pipeline:merge-queue`, `pipeline:release`, `pipeline:roadmap`,
+  `pipeline:logs`, and `pipeline:loop` entry
 - **AND** no in-scope operation SHALL be reachable only as a flag on the base
   `/pipeline` command
 
@@ -74,7 +74,7 @@ output. The mapping SHALL be: `pipeline:status <N>` → the read-only status mod
 <N> "<spec>"` → disposition-and-resume; `pipeline:summary <N>` → issue N's
 evidence-bundle dump; `pipeline:doctor` → standalone preflight; `pipeline:init` →
 label-ensure + config scaffold; `pipeline:cleanup` → merged-worktree sweep; and
-`pipeline:<intake|sweep|triage|merge|release|roadmap|logs>` → the existing
+`pipeline:<intake|sweep|triage|merge|merge-queue|release|roadmap|logs>` → the existing
 identically-named keyword sub-command.
 
 `pipeline:loop` is the single documented exception: it is a **delegating** entry
@@ -98,12 +98,12 @@ delegating entry.
   pre-existing `pipeline summary <run-id>` exact-run selector SHALL remain
   available and unchanged for run-id selection
 
-#### Scenario: The loop entry delegates instead of forwarding
+#### Scenario: merge-queue host entry forwards to the CLI keyword
 
-- **WHEN** `/pipeline:loop --milestone v2` is invoked
-- **THEN** the deterministic loop preflight SHALL run in the pipeline CLI
-- **AND** durable orchestration SHALL be carried out by the installed goal-loop skill,
-  not by a `pipeline loop` keyword sub-command owning its own state
+- **WHEN** `/pipeline:merge-queue --milestone "v1.28.2"` (or the Codex equivalent)
+  is invoked
+- **THEN** it SHALL forward to `pipeline merge-queue` with the same arguments
+- **AND** SHALL NOT perform a merge solely by virtue of the host entry being used
 
 ### Requirement: The advance loop SHALL remain the default invocation, unchanged
 
@@ -238,4 +238,15 @@ SHALL continue to use that template.
   `status` or `doctor`
 - **THEN** the result MAY still include the shared seconds-only / no-Monitor
   template
+
+### Requirement: The merge-queue host entry SHALL document dry-run default and human authority
+The `pipeline:merge-queue` host command description SHALL state that the command
+plans an ordered ready-to-deploy merge queue under explicit operator invocation,
+defaults to dry-run, and is never called by the advance loop. It SHALL NOT
+describe autonomous or background merging.
+
+#### Scenario: Host one-liner states dry-run and non-advance
+- **WHEN** the host command description for `pipeline:merge-queue` is inspected
+- **THEN** it SHALL mention dry-run (or default non-mutating plan) behavior
+- **AND** SHALL NOT claim the advance loop merges via this command
 
