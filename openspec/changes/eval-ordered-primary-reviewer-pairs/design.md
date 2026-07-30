@@ -149,11 +149,14 @@ unset.
 - Auth/preflight failure on a primary invocation → `auth_error` (or infra for pure
   preflight config) with `detail.failed_role: "primary"`.
 - Same for reviewer with `failed_role: "reviewer"`.
-- Malformed review output: cell may still be `completed` with explicit
-  `review_verdict_parse: "unparseable"` for that review step; it is **not** approval and
-  does not clear blocking findings. Blocking disposition for "unparseable" follows
+- Malformed review output: intermediate unparseable steps (e.g. review-1) still trigger
+  fix with explicit `review_verdict_parse: "unparseable"`; they are **not** approval and
+  do not clear blocking findings. Blocking disposition for "unparseable" follows
   production: treat as non-approval / blocking contract failure, never as empty findings
-  pass.
+  pass. For `implementing-paired`, if the **final** re-review remains unparseable or
+  still has blocking findings, the cell is **not** `completed` — it is recorded as
+  `infra_error` with an explicit non-approved final-review disposition and full loop
+  evidence, so it is excluded from quality grading and completion reliability.
 
 ### D8. Isolation boundary lifecycle for multi-invocation cells
 

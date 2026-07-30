@@ -129,6 +129,13 @@ review step, SHALL NOT treat the result as an empty-findings approval, and SHALL
 blocking disposition. Strict, tolerant, and unparseable parse outcomes SHALL be reported
 separately for each review invocation in the cell record.
 
+In `implementing-paired` mode, when the final re-review (after fix-1) remains unparseable
+or still has blocking findings under production policy, the runner SHALL NOT record the
+cell as `result_class` `completed`. The cell SHALL use a non-quality result class
+(`infra_error`) with an explicit non-approved final-review disposition in cell evidence,
+SHALL preserve parse provenance and pair-loop diagnostics, and SHALL NOT contribute to
+treatment quality grading or completion reliability as a completed outcome.
+
 #### Scenario: Unparseable review is not approval
 
 - **WHEN** a reviewer returns prose that is not a parseable verdict
@@ -139,6 +146,15 @@ separately for each review invocation in the cell record.
 
 - **WHEN** one review step parses strictly and another parses only under the tolerant path
 - **THEN** the cell record SHALL report distinct provenance values for those two steps
+
+#### Scenario: Unresolved final re-review is not a completed treatment outcome
+
+- **WHEN** an `implementing-paired` cell runs fix-1 and the final re-review is unparseable
+  or still has one or more blocking findings
+- **THEN** the cell SHALL NOT be recorded as `result_class` `completed`
+- **AND** the cell record SHALL retain parse provenance and blocking counts for that
+  re-review
+- **AND** the grading layer SHALL NOT write a treatment quality grade for that cell
 
 ---
 
@@ -206,15 +222,25 @@ treatment outcome.
 Every completed or failed paired cell record SHALL include evidence sufficient to
 reconstruct the pair loop: pair identity, primary and reviewer coordinates as executed,
 whether each fix round was invoked, blocking finding counts before and after each
-applicable fix, per-review parse provenance, duration, and any failed role. Summary output
-derived from paired experiments SHALL surface pair identity, fix invocation, blocking
-findings before/after, malformed review counts, quality, duration, and reliability.
+applicable fix, per-review parse provenance, duration, and any failed role. In
+`pipeline-paired` mode, the adversarial review's blocking count SHALL be recorded as both
+the post-fix-1 and pre-fix-2 blocking observation (labeled separately from the final
+post-fix-2 worktree state). Summary output derived from paired experiments SHALL surface
+pair identity, fix invocation, blocking findings before/after, malformed review counts,
+quality, duration, and reliability.
 
 #### Scenario: Completed pair cell carries loop evidence
 
 - **WHEN** an `implementing-paired` cell completes after a fix-and-re-review path
 - **THEN** its record SHALL include pair identity, `fix_invoked` true, blocking counts
   before and after fix, and parse provenance for each review step
+
+#### Scenario: Pipeline-paired records post-fix-1 blocking from adversarial review
+
+- **WHEN** a `pipeline-paired` cell runs adversarial review after the fix-1 path
+- **THEN** the cell record SHALL include `blocking_findings_after_fix_1` equal to the
+  adversarial review's blocking count
+- **AND** SHALL also record that count as the pre-fix-2 blocking observation
 
 #### Scenario: Summary includes pair diagnostics
 

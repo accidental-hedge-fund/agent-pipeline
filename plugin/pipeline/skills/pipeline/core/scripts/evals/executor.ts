@@ -367,47 +367,62 @@ async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: stri
   }
 }
 
+/**
+ * Collect the full unified diff of the worktree vs baseSha for paired-mode review.
+ * Throws on tracked-diff collection failure so the pair loop can record an
+ * infra_error rather than substituting an empty review body (#601 review 1 8c015b1f).
+ * A legitimate empty worktree (no changes) still returns an empty string.
+ */
 async function defaultGetDiff(args: { worktreeDir: string; baseSha: string }): Promise<string> {
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const execFileAsync = promisify(execFile);
+  let tracked: string;
   try {
     // Include unstaged/untracked worktree edits the primary made without committing
     // (paired implement/fix prompts forbid commits).
-    const { stdout: tracked } = await execFileAsync("git", ["diff", args.baseSha], {
+    const result = await execFileAsync("git", ["diff", args.baseSha], {
       cwd: args.worktreeDir,
       timeout: 30_000,
       maxBuffer: 20 * 1024 * 1024,
     });
-    let untracked = "";
-    try {
-      const { stdout: names } = await execFileAsync(
-        "git",
-        ["ls-files", "--others", "--exclude-standard"],
-        { cwd: args.worktreeDir, timeout: 30_000 },
-      );
-      const files = names.split("\n").map((l) => l.trim()).filter(Boolean);
-      for (const file of files.slice(0, 50)) {
-        try {
-          const { stdout: content } = await execFileAsync("git", ["diff", "--no-index", "--", "/dev/null", file], {
-            cwd: args.worktreeDir,
-            timeout: 10_000,
-            maxBuffer: 2 * 1024 * 1024,
-          });
-          untracked += content;
-        } catch (err) {
-          // git diff --no-index exits 1 when files differ — stdout still holds the diff.
-          const e = err as { stdout?: string };
-          if (e.stdout) untracked += e.stdout;
-        }
-      }
-    } catch {
-      // Best-effort untracked inclusion.
-    }
-    return `${tracked}${untracked}`;
-  } catch {
-    return "";
+    tracked = result.stdout;
+  } catch (err) {
+    const e = err as { message?: string; code?: string; killed?: boolean; signal?: string };
+    throw new Error(
+      `failed to collect tracked worktree diff vs ${args.baseSha}` +
+        (e.code ? ` (code=${e.code})` : "") +
+        (e.killed ? " (killed)" : "") +
+        (e.signal ? ` (signal=${e.signal})` : "") +
+        `: ${e.message ?? String(err)}`,
+    );
   }
+  let untracked = "";
+  try {
+    const { stdout: names } = await execFileAsync(
+      "git",
+      ["ls-files", "--others", "--exclude-standard"],
+      { cwd: args.worktreeDir, timeout: 30_000 },
+    );
+    const files = names.split("\n").map((l) => l.trim()).filter(Boolean);
+    for (const file of files.slice(0, 50)) {
+      try {
+        const { stdout: content } = await execFileAsync("git", ["diff", "--no-index", "--", "/dev/null", file], {
+          cwd: args.worktreeDir,
+          timeout: 10_000,
+          maxBuffer: 2 * 1024 * 1024,
+        });
+        untracked += content;
+      } catch (err) {
+        // git diff --no-index exits 1 when files differ — stdout still holds the diff.
+        const e = err as { stdout?: string };
+        if (e.stdout) untracked += e.stdout;
+      }
+    }
+  } catch {
+    // Best-effort untracked inclusion — tracked diff is the review contract.
+  }
+  return `${tracked}${untracked}`;
 }
 
 /** Command-line tokens that reach outside the cell's isolated worktree — the

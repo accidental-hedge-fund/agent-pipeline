@@ -712,6 +712,162 @@ test("summary includes pair identity, fix invocation, blocking, malformed, quali
   assert.ok(t.mean_duration_sec !== null);
 });
 
+test("implementing-paired: unsuccessful harness result is infra_error and does not advance (#601 031e981b)", async () => {
+  const fixture = makeFixture();
+  const manifest = pairedManifest();
+  const cell = makeCell();
+  const harnesses: string[] = [];
+
+  const result = await runCell(FAKE_CFG, cell, fixture, manifest, {
+    createWorktree: async () => ({ path: "/fake/wt", branch: "b" }),
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    getDiff: async () => "diff",
+    invokeHarness: async (args) => {
+      harnesses.push(args.harness);
+      if (args.harness === "claude") {
+        return {
+          success: false,
+          timed_out: false,
+          exit_code: 1,
+          stdout: "",
+          stderr: "implementation crashed",
+          duration: 0.5,
+        };
+      }
+      return success(approveVerdict([]));
+    },
+  });
+
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.equal(result.outcome.detail?.failed_role, "primary");
+  assert.match(result.outcome.error ?? "", /implementing|exited unsuccessfully/i);
+  assert.deepEqual(harnesses, ["claude"], "reviewer must not run after failed primary implementation");
+});
+
+test("implementing-paired: unresolved final re-review is not completed (#601 14b9a887)", async () => {
+  const fixture = makeFixture();
+  const manifest = pairedManifest();
+  const cell = makeCell();
+  let reviewRound = 0;
+
+  const result = await runCell(FAKE_CFG, cell, fixture, manifest, {
+    createWorktree: async () => ({ path: "/fake/wt", branch: "b" }),
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    getDiff: async () => "diff --git a/x\n+still-broken\n",
+    invokeHarness: async (args) => {
+      if (args.harness === "claude") return success("impl-or-fix");
+      reviewRound += 1;
+      // Both reviews remain blocking — final re-review never clears.
+      return success(approveVerdict([blockingFinding(`still-open-${reviewRound}`)]));
+    },
+  });
+
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /still has blocking findings|not a completed/i);
+  const detail = result.outcome.detail!;
+  assert.equal(detail.final_review_disposition, "unresolved_blocking");
+  assert.equal(detail.fix_1_invoked, true);
+  assert.equal(detail.blocking_findings_after, 1);
+  assert.equal(detail.review_1_verdict_parse, "strict");
+  assert.equal(detail.re_review_verdict_parse, "strict");
+  assert.equal(reviewRound, 2);
+});
+
+test("implementing-paired: unparseable final re-review is not completed (#601 14b9a887)", async () => {
+  const fixture = makeFixture();
+  const manifest = pairedManifest();
+  const cell = makeCell();
+  let reviewRound = 0;
+
+  const result = await runCell(FAKE_CFG, cell, fixture, manifest, {
+    createWorktree: async () => ({ path: "/fake/wt", branch: "b" }),
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    getDiff: async () => "diff",
+    invokeHarness: async (args) => {
+      if (args.harness === "claude") return success("impl-or-fix");
+      reviewRound += 1;
+      if (reviewRound === 1) return success(approveVerdict([blockingFinding()]));
+      return success("still not a verdict JSON after fix");
+    },
+  });
+
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /unparseable|not a completed/i);
+  const detail = result.outcome.detail!;
+  assert.equal(detail.final_review_disposition, "unresolved_unparseable");
+  assert.equal(detail.re_review_verdict_parse, "unparseable");
+  assert.ok((detail.malformed_review_count as number) >= 1);
+  assert.equal(detail.blocking_findings_after, 1);
+});
+
+test("pipeline-paired: adversarial blocking count is recorded as post-fix-1 (#601 6d63e02e)", async () => {
+  const fixture = makeFixture("planning");
+  const manifest = pairedManifest("pipeline-paired");
+  const cell = makeCell("pipeline-paired");
+  let codexCount = 0;
+  let claudeCount = 0;
+
+  const result = await runCell(FAKE_CFG, cell, fixture, manifest, {
+    createWorktree: async () => ({ path: "/fake/wt", branch: "b" }),
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    getDiff: async () => "diff",
+    getChangedPaths: async () => ["core/scripts/foo.ts"],
+    invokeHarness: async (args) => {
+      if (args.harness === "claude") {
+        claudeCount += 1;
+        if (claudeCount === 1) return success("# Plan");
+        return success("work");
+      }
+      codexCount += 1;
+      // plan-review clean, review-1 clean, adversarial (review-2) two blocking findings
+      if (codexCount === 1) return success(approveVerdict([]));
+      if (codexCount === 2) return success(approveVerdict([]));
+      return success(approveVerdict([blockingFinding("a"), blockingFinding("b")]));
+    },
+  });
+
+  assert.equal(result.outcome.result_class, "completed");
+  const detail = result.outcome.detail!;
+  assert.equal(detail.fix_1_invoked, false);
+  assert.equal(detail.fix_2_invoked, true);
+  assert.equal(detail.blocking_findings_after_fix_1, 2);
+  assert.equal(detail.blocking_findings_before_fix_2, 2);
+  const pairLoop = detail.pair_loop as Record<string, unknown>;
+  assert.equal(pairLoop.blocking_after_fix_1, 2);
+  assert.equal(pairLoop.blocking_before_fix_2, 2);
+  // review-2 findings remain separately labeled
+  assert.ok(Array.isArray(detail.review_2_findings));
+  assert.equal((detail.review_2_findings as unknown[]).length, 2);
+});
+
+test("paired: getDiff failure is infra_error — never empty review body (#601 8c015b1f)", async () => {
+  const fixture = makeFixture();
+  const manifest = pairedManifest();
+  const cell = makeCell();
+  const harnesses: string[] = [];
+
+  const result = await runCell(FAKE_CFG, cell, fixture, manifest, {
+    createWorktree: async () => ({ path: "/fake/wt", branch: "b" }),
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    getDiff: async () => {
+      throw new Error("maxBuffer exceeded collecting tracked worktree diff");
+    },
+    invokeHarness: async (args) => {
+      harnesses.push(args.harness);
+      return success("implemented");
+    },
+  });
+
+  assert.equal(result.outcome.result_class, "infra_error");
+  assert.match(result.outcome.error ?? "", /diff|maxBuffer/i);
+  assert.deepEqual(harnesses, ["claude"], "reviewer must not run when primary diff collection fails");
+});
+
 test("fixture allows generator-owned plugin/ paths in allowed_change_paths", () => {
   const fixture = validateFixture(
     {
