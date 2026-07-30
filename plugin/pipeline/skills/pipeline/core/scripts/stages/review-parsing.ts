@@ -90,6 +90,23 @@ export interface ReviewArtifact {
     confidence?: number;
     rejectedAlternatives?: string[];
   }>;
+  /**
+   * Structured record of this round's **advisory** (non-blocking) findings
+   * (#680): findings present in the verdict but not in the blocking partition
+   * (below policy threshold, `blocking: false`, or otherwise demoted). Lets
+   * pre-merge delta apply prior-round advisory carry-forward without scraping
+   * markdown. Optional for backward compat with artifacts encoded before this
+   * field existed — absent on legacy comments yields no carry-forward candidates
+   * (fail-closed). Same entry shape as `blockingFindings`.
+   */
+  advisoryFindings?: Array<{
+    key: string;
+    surface: string | null;
+    severity: string;
+    title: string;
+    confidence?: number;
+    rejectedAlternatives?: string[];
+  }>;
 }
 
 /**
@@ -197,7 +214,8 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
       !obj.blockingKeys.every((k: unknown) => typeof k === "string") ||
       (obj.review1Risk !== null && obj.review1Risk !== "low" && obj.review1Risk !== "standard") ||
       (obj.bodyHash !== undefined && typeof obj.bodyHash !== "string") ||
-      (obj.blockingFindings !== undefined && !isValidBlockingFindings(obj.blockingFindings))
+      (obj.blockingFindings !== undefined && !isValidBlockingFindings(obj.blockingFindings)) ||
+      (obj.advisoryFindings !== undefined && !isValidBlockingFindings(obj.advisoryFindings))
     ) {
       return null;
     }
@@ -211,6 +229,9 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
     if (typeof obj.bodyHash === "string") artifact.bodyHash = obj.bodyHash;
     if (isValidBlockingFindings(obj.blockingFindings)) {
       artifact.blockingFindings = obj.blockingFindings;
+    }
+    if (isValidBlockingFindings(obj.advisoryFindings)) {
+      artifact.advisoryFindings = obj.advisoryFindings;
     }
     return artifact;
   } catch {

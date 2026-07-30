@@ -11,6 +11,8 @@ import {
   isAutoFixableFinding,
   isPipelineInternalCommit,
   performPreMergeAutoFix,
+  PRE_MERGE_AUTOFIX_CATEGORIES,
+  PRE_MERGE_AUTOFIX_CATEGORY_SET,
   PRE_MERGE_AUTOFIX_PREFIX,
   type AttemptPreMergeAutoFixFn,
   type DeltaReviewResult,
@@ -170,30 +172,58 @@ test("isPipelineInternalCommit: PRE_MERGE_AUTOFIX_PREFIX subject → false (deve
 // isAutoFixableFinding + allBlockingAutoFixable (pure helpers)
 // ---------------------------------------------------------------------------
 
-test("isAutoFixableFinding: correctness and missing-dep → true; others → false", () => {
+test("PRE_MERGE_AUTOFIX_CATEGORIES is the single-sourced matrix allowlist (#680)", () => {
+  assert.deepEqual([...PRE_MERGE_AUTOFIX_CATEGORIES].sort(), [
+    "concurrency",
+    "correctness",
+    "missing-dep",
+  ]);
+  for (const cat of PRE_MERGE_AUTOFIX_CATEGORIES) {
+    assert.equal(PRE_MERGE_AUTOFIX_CATEGORY_SET.has(cat), true);
+    assert.equal(isAutoFixableFinding({ category: cat } as ReviewFinding), true);
+  }
+});
+
+test("isAutoFixableFinding: correctness, missing-dep, concurrency → true; others → false (#680)", () => {
   assert.equal(isAutoFixableFinding({ category: "correctness" } as ReviewFinding), true);
   assert.equal(isAutoFixableFinding({ category: "Correctness" } as ReviewFinding), true); // case-insensitive
   assert.equal(isAutoFixableFinding({ category: "missing-dep" } as ReviewFinding), true);
+  assert.equal(isAutoFixableFinding({ category: "concurrency" } as ReviewFinding), true);
+  assert.equal(isAutoFixableFinding({ category: "Concurrency" } as ReviewFinding), true);
+  assert.equal(isAutoFixableFinding({ category: "  concurrency  " } as ReviewFinding), true);
   assert.equal(isAutoFixableFinding({ category: "security" } as ReviewFinding), false);
   assert.equal(isAutoFixableFinding({ category: "scope" } as ReviewFinding), false);
   assert.equal(isAutoFixableFinding({ category: "product-judgment-required" } as ReviewFinding), false);
   assert.equal(isAutoFixableFinding({ category: "spec-divergence" } as ReviewFinding), false);
+  assert.equal(isAutoFixableFinding({ category: "data-loss" } as ReviewFinding), false);
+  assert.equal(isAutoFixableFinding({ category: "observability" } as ReviewFinding), false);
   assert.equal(isAutoFixableFinding({ category: "" } as ReviewFinding), false);
   assert.equal(isAutoFixableFinding({ category: undefined } as ReviewFinding), false);
   assert.equal(isAutoFixableFinding({} as ReviewFinding), false);
 });
 
-test("allBlockingAutoFixable: non-empty all-correctness → true; mixed or empty → false", () => {
+test("allBlockingAutoFixable: allowlisted sets → true; mixed security / empty → false (#680)", () => {
   assert.equal(allBlockingAutoFixable([blockingFinding("correctness")]), true);
   assert.equal(allBlockingAutoFixable([blockingFinding("missing-dep")]), true);
+  assert.equal(allBlockingAutoFixable([blockingFinding("concurrency")]), true);
   assert.equal(
     allBlockingAutoFixable([blockingFinding("correctness"), blockingFinding("missing-dep")]),
     true,
   );
   assert.equal(
+    allBlockingAutoFixable([blockingFinding("concurrency"), blockingFinding("correctness")]),
+    true,
+    "mixed allowlisted → true",
+  );
+  assert.equal(
     allBlockingAutoFixable([blockingFinding("correctness"), blockingFinding("security")]),
     false,
     "mixed with security → false",
+  );
+  assert.equal(
+    allBlockingAutoFixable([blockingFinding("concurrency"), blockingFinding("security")]),
+    false,
+    "concurrency + security → false",
   );
   assert.equal(allBlockingAutoFixable([]), false, "empty → false");
   assert.equal(allBlockingAutoFixable([blockingFinding("product-judgment-required")]), false);
@@ -279,6 +309,79 @@ test("pre-merge auto-fix #682: approving re-review records delta-review pass gat
     deltaPassIdx > autofixPassIdx,
     "delta-review/pass must be recorded after pre-merge-autofix/pass on the approve path",
   );
+});
+
+// ---------------------------------------------------------------------------
+// #680: concurrency-only (and mixed allowlisted) → auto-fix once, not first-hop needs-human
+// ---------------------------------------------------------------------------
+
+test("pre-merge auto-fix #680: concurrency-only blocks → auto-fix once → re-review approves → return null", async (t) => {
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("concurrency", "Lock ownership race on PID probe")],
+    reReviewFindings: [],
+    autoFixResult: "fix-committed",
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out, null, "#668-class concurrency findings must auto-fix + re-review, not first-hop needs-human");
+  assert.equal(rec.autoFixCalls, 1, "auto-fix seam called exactly once");
+  assert.equal(rec.deltaReviewCalls, 2, "initial delta + post-fix re-review");
+  assert.deepEqual(rec.blocked, [], "setBlocked must NOT be called on successful fix path");
+});
+
+test("pre-merge auto-fix #680: mixed concurrency + correctness → auto-fix once", async (t) => {
+  const { deps, rec } = makeDeps({
+    findings: [
+      blockingFinding("concurrency", "Race on lock ownership"),
+      blockingFinding("correctness", "Off-by-one in probe"),
+    ],
+    reReviewFindings: [],
+    autoFixResult: "fix-committed",
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out, null);
+  assert.equal(rec.autoFixCalls, 1);
+  assert.deepEqual(rec.blocked, []);
+});
+
+test("pre-merge auto-fix #680: concurrency + security → escalate without auto-fix", async (t) => {
+  const { deps, rec } = makeDeps({
+    findings: [
+      blockingFinding("concurrency"),
+      blockingFinding("security"),
+    ],
+    reReviewFindings: [],
+    autoFixResult: "fix-committed",
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(rec.autoFixCalls, 0, "security in the set must veto auto-fix");
+  assert.equal(rec.blocked.length, 1);
+});
+
+test("pre-merge auto-fix #680: concurrency with prior auto-fix commit → exhausted, no second attempt", async (t) => {
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("concurrency", "Lock ownership still races")],
+    reReviewFindings: [blockingFinding("concurrency")],
+    autoFixResult: "fix-committed",
+    priorAutoFixCommit: true,
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.deepEqual(
+    out,
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+  );
+  assert.equal(rec.autoFixCalls, 0, "one-attempt bound: no second concurrency auto-fix");
+  assert.equal(rec.blocked.length, 1);
 });
 
 // ---------------------------------------------------------------------------

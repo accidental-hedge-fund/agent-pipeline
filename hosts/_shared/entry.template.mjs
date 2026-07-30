@@ -31,9 +31,10 @@ const STARTING_LOCK_PATH = join(tmpdir(), `pipeline-starting-${process.pid}.lock
 // — a file swap during an install can't corrupt a process that just tails
 // terminal.log/events.jsonl — so they must not hold a run-liveness lock for
 // their (potentially hours-long, `--follow`) lifetime, or they block every
-// `install.mjs update` behind them (#567). Nested `loop logs` (#666) is the
-// same class of observation against the durable loop store and must likewise
-// reserve no slot, while bare `loop` (start/resume) remains run-mutating.
+// `install.mjs update` behind them (#567). Nested `loop logs` (#666) and
+// `loop --audit` / `loop --audit --follow` (#611) are the same class of
+// observation against the durable loop store and must likewise reserve no
+// slot, while bare `loop` (start/resume) remains run-mutating.
 const READ_ONLY_COMMANDS = new Set(["logs", "status", "summary"]);
 
 /** Pure classifier of command argv (tokens after `pipeline`). Accepts a full
@@ -45,6 +46,9 @@ function isReadOnlyCommand(argv) {
   if (READ_ONLY_COMMANDS.has(cmd)) return true;
   // Nested: `pipeline loop logs …` — observation only (#666).
   if (cmd === "loop" && tokens[1] === "logs") return true;
+  // `pipeline loop --audit` / `--audit --follow` — read-only stage table +
+  // stage-progress follow (#611). Mutating resume without --audit stays live.
+  if (cmd === "loop" && tokens.includes("--audit")) return true;
   return false;
 }
 

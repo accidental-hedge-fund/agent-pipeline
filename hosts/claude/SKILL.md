@@ -93,7 +93,8 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline queue                          batch factory: dispatch all pipeline:ready issues up to limits
 /pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor
 /pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
-/pipeline:loop --audit                   read-only report for the run; no writes
+/pipeline:loop --audit                   read-only report (process identity, action evidence, per-item stage table); no writes
+/pipeline:loop --resume <run-id> --audit --follow  stream whole-run stage-progress lines (not harness stdout)
 /pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (interrupt stops follow; no auto-exit on terminal)
 /pipeline evals plan <manifest.json>     expand + persist an experiment's run plan; invokes no harness, creates no worktree
 /pipeline evals run <manifest.json>      execute an experiment's cells (resumable); never writes to production GitHub
@@ -141,9 +142,13 @@ harness can follow structured progress; a terminal summary JSON is printed
 when the supervisor finishes. `--resume <run-id>` takes over a run whose prior
 supervisor is provably gone; a run whose supervisor is still alive is refused
 rather than double-driven. `--audit` renders the run's process identity,
-action-evidence timeline, and watchdog/no-progress state with zero durable
-writes (no drive handoff). A pre-existing run created by a legacy goal-loop
-invocation remains addressable by `--resume <run-id>` (read-only import).
+action-evidence timeline, watchdog/no-progress state, and a **per-item
+stage-progress table** (stage + optional round + advance run-id drill-down)
+with zero durable writes (no drive handoff). Combine with `--follow`
+(`--resume <run-id> --audit --follow`) to stream clean one-line stage
+transitions for the whole run — not interleaved harness stdout. A pre-existing
+run created by a legacy goal-loop invocation remains addressable by
+`--resume <run-id>` (read-only import).
 
 The native-`/goal` check never treats an absent marker in `claude --help` as
 evidence the capability is missing (`/goal` is a slash command, not a CLI
@@ -1080,8 +1085,9 @@ Surface the run's terminal state. Prefer the printed JSON result; for a
 read-only process/timeline report:
 
 ```bash
-node ~/.claude/skills/pipeline/scripts/pipeline.mjs loop --audit
-# or with an explicit run: ... loop --resume <run-id> --audit
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audit
+# stage table + optional whole-run stage-progress follow (not harness stdout):
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audit --follow
 ```
 
 ### 5. Modes that DON'T need this orchestration
@@ -1094,9 +1100,10 @@ node ~/.claude/skills/pipeline/scripts/pipeline.mjs loop --audit
 - `config sync` — previews/applies a validated `.github/pipeline.yml` scaffold refresh, completes in seconds
 - `config repo-map <add|remove|list>` — mutates/lists `repo_map` entries, completes in seconds
 - `doctor` — deterministic preflight, no model calls, completes in seconds
-- `/pipeline:loop --audit` — read-only report for a durable run; synchronous, no Monitor
+- `/pipeline:loop --audit` — read-only report (stage table) for a durable run; synchronous, no Monitor
+- `/pipeline:loop --resume <run-id> --audit --follow` — read-only stage-progress stream; no run-liveness lock
 
-Run those synchronously, no Monitor, no background, no Push.
+Run those synchronously, no Monitor, no background, no Push (except follow, which streams until interrupt).
 
 **Not in this list:** multi-item `/pipeline:loop` drive or resume (with or without
 `--milestone` / issue lists / `--resume`) — those use §4b long-running

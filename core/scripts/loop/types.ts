@@ -511,6 +511,24 @@ export interface LoopItemLedgerEntry {
    *  observation against to detect `identity-mismatch` drift (e.g. the bound PR/head SHA changed
    *  out from under an already-proven state). Absent for an item that has never been verified. */
   last_verified_identity?: LoopExternalIdentity;
+  /**
+   * Observability-only current pipeline stage projection (#611, capability
+   * `loop-item-stage-progress`). Distinct from coarse {@link state}: scheduling
+   * and recovery continue to consult `state` only. Updated from the linked
+   * advance run store's stage events while mid-advance. Additive/optional so
+   * pre-#611 ledgers still load.
+   */
+  current_stage?: string;
+  /** Review/fix round when the advance evidence supplies one. */
+  current_stage_round?: number;
+  /** ISO timestamp of the last material stage/round update. */
+  current_stage_updated_at?: string;
+  /**
+   * Real advance run-store directory basename (e.g. `607-2026-07-27T19-31-29-328Z`)
+   * when known from start linkage (#667). Never a synthetic-only
+   * `pipeline-loop-…` string as the sole drill-down when a real id is known.
+   */
+  advance_run_id?: string;
 }
 
 export interface LoopMergeBarrier {

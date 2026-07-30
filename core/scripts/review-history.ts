@@ -63,6 +63,30 @@ export interface DigestRound {
   reviewedSha: string | null;
   /** Blocking findings recorded in this round. Advisory findings are excluded. */
   entries: DigestEntry[];
+  /**
+   * Non-blocking (advisory) findings recorded in this round (#680), derived from
+   * `ReviewArtifact.advisoryFindings` when present. Empty on legacy comments
+   * without that extension. Used only for prior-round advisory carry-forward at
+   * pre-merge delta — not part of settled-finding resolution.
+   */
+  advisoryEntries: Array<{
+    key: string;
+    surface: string | null;
+    severity: string;
+    title: string;
+  }>;
+}
+
+/**
+ * One prior-round advisory finding available for carry-forward demotion at
+ * pre-merge delta (#680). Deduplicated by key (latest round wins) via
+ * {@link priorAdvisoryFindings}.
+ */
+export interface PriorAdvisoryFinding {
+  key: string;
+  surface: string | null;
+  title: string;
+  round: number;
 }
 
 export interface PriorRoundDigest {
@@ -135,6 +159,20 @@ function extractRoundEntries(body: string, artifact: ReturnType<typeof extractRe
     }));
 }
 
+/** Extract structured advisory findings from a review artifact (#680). Empty
+ *  when the extension is absent (legacy comments) — fail-closed for carry-forward. */
+function extractAdvisoryEntries(
+  artifact: ReturnType<typeof extractReviewArtifact>,
+): DigestRound["advisoryEntries"] {
+  if (artifact?.advisoryFindings === undefined) return [];
+  return artifact.advisoryFindings.map((f) => ({
+    key: f.key,
+    surface: f.surface,
+    severity: f.severity,
+    title: f.title,
+  }));
+}
+
 function isReviewShapedComment(body: string): boolean {
   return (
     body.startsWith(REVIEW_MARKER_PREFIX_R1) ||
@@ -175,6 +213,7 @@ export function buildPriorRoundDigest(
         round: roundCounter,
         reviewedSha,
         entries: extractRoundEntries(c.body, artifact),
+        advisoryEntries: extractAdvisoryEntries(artifact),
       });
       continue;
     }
@@ -338,6 +377,53 @@ export function settledFindingsVerification(digest: PriorRoundDigest): SettledFi
  * surface (or a surface without a file component) contribute nothing.
  */
 export function settledFindingsSurfaceFiles(entries: SettledFindingVerification[]): string[] {
+  const files = new Set<string>();
+  for (const e of entries) {
+    if (e.surface === null) continue;
+    const sep = e.surface.indexOf("|");
+    const file = sep >= 0 ? e.surface.slice(0, sep) : e.surface;
+    if (file) files.add(file);
+  }
+  return [...files].sort();
+}
+
+/**
+ * Prior-round advisory findings for carry-forward at pre-merge delta (#680).
+ * Deduplicated by finding key — the LATEST **eligible** round that recorded a
+ * given key wins — ordered ascending by key for deterministic tests. Pure: no
+ * I/O. Empty when no review artifact carried `advisoryFindings` (legacy
+ * comments fail closed).
+ *
+ * Eligibility: only rounds the issue **advanced past** contribute. A round is
+ * eligible when its blocking partition is empty at comment time
+ * (`entries.length === 0` — approve or advisory-only advance under policy).
+ * Advisories co-located with blockers on a failed/blocked review or delta
+ * comment are excluded: those were never an accepted disposition, so they
+ * must not demote a later blocking finding on the same surface.
+ */
+export function priorAdvisoryFindings(digest: PriorRoundDigest): PriorAdvisoryFinding[] {
+  const latestByKey = new Map<string, PriorAdvisoryFinding>();
+  for (const r of digest.rounds) {
+    // Non-empty blocking partition ⇒ review did not advance; skip its advisories.
+    if (r.entries.length > 0) continue;
+    for (const e of r.advisoryEntries ?? []) {
+      latestByKey.set(e.key, {
+        key: e.key,
+        surface: e.surface,
+        title: e.title,
+        round: r.round,
+      });
+    }
+  }
+  return [...latestByKey.values()].sort((a, b) => a.key.localeCompare(b.key));
+}
+
+/**
+ * Distinct file paths named by prior advisory surfaces (#680), ascending and
+ * deduplicated — merged into the delta reviewer's HEAD file-state read list
+ * alongside settled surfaces so carry-forward can apply the same evidence bar.
+ */
+export function priorAdvisorySurfaceFiles(entries: PriorAdvisoryFinding[]): string[] {
   const files = new Set<string>();
   for (const e of entries) {
     if (e.surface === null) continue;
