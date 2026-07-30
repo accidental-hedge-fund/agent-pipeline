@@ -30,6 +30,7 @@ const EXPECTED_OPERATIONS = new Set([
   "sweep",
   "triage",
   "merge",
+  "merge-queue",
   "release",
   "roadmap",
   "logs",
