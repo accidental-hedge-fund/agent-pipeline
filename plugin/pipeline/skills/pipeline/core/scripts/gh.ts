@@ -1054,16 +1054,34 @@ export function buildBlockedComment(args: {
 }
 
 /**
- * Read the latest `<!-- pipeline-blocker-kind: … -->` from issue comments
- * (most recent "## Pipeline: Blocked" body). Pure; used when advance events
- * lack a `blocker_set` (early-blocked re-dispatch after capacity clear failure).
+ * Read the latest trusted `<!-- pipeline-blocker-kind: … -->` from issue
+ * comments (most recent verified pipeline "## Pipeline: Blocked" body).
+ * Pure; used when advance events lack a `blocker_set` (early-blocked
+ * re-dispatch after capacity clear failure).
+ *
+ * Trust model (#718 review b5108544): only a comment that (1) is authored by
+ * the pipeline actor (`trustedAuthor`), and (2) carries a verified
+ * `pipeline-attest` marker with kind `blocked`, may authorize capacity
+ * reclassification / `clearBlocked`. An unauthenticated body that merely
+ * contains the kind marker fails closed (returns null → product needs-human).
+ * When `trustedAuthor` is null/empty (auth unavailable), fail closed.
  */
 export function lastBlockerKindFromComments(
-  comments: readonly { body: string }[],
+  comments: readonly { body: string; author?: string | null }[],
+  opts?: { trustedAuthor?: string | null },
 ): string | null {
+  const trustedAuthor = opts?.trustedAuthor;
+  if (trustedAuthor == null || trustedAuthor === "") return null;
+
   for (let i = comments.length - 1; i >= 0; i--) {
-    const body = comments[i]?.body ?? "";
+    const c = comments[i];
+    if (!c) continue;
+    if (c.author !== trustedAuthor) continue;
+    const body = c.body ?? "";
     if (!body.includes("## Pipeline: Blocked")) continue;
+    const attestation = extractPipelineAttestation(body);
+    if (attestation === null || attestation.kind !== "blocked") continue;
+    if (!isVerifiedPipelineAttestation(body)) continue;
     const m = body.match(/<!--\s*pipeline-blocker-kind:\s*([a-z0-9-]+)\s*-->/i);
     if (m?.[1]) return m[1];
   }

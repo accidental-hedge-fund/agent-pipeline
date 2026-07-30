@@ -990,13 +990,34 @@ export async function createWorktree(
         : null;
     let startPoint = `origin/${cfg.base_branch}`;
     if (remoteTip) {
-      // Populate the remote-tracking ref so worktree add can start from it.
-      await gitFn(
+      // Populate the remote-tracking ref so worktree add can start from the
+      // verified ls-remote tip. Fetch MUST succeed and origin/<branch> MUST
+      // resolve to that tip — a failed fetch must not fall through to a
+      // pre-existing stale remote-tracking ref (#718 review 9ab37b7c).
+      const fetchBranch = await gitFn(
         cfg,
         cfg.repo_dir,
         ["fetch", "origin", `${branch}:refs/remotes/origin/${branch}`],
         { ignoreFailure: true },
       );
+      if (fetchBranch.code !== 0) {
+        throw new Error(
+          `git fetch origin ${branch} failed (cannot recreate worktree at verified remote tip): ${fetchBranch.stderr.trim()}`,
+        );
+      }
+      const localRef = await gitFn(
+        cfg,
+        cfg.repo_dir,
+        ["rev-parse", `refs/remotes/origin/${branch}`],
+        { ignoreFailure: true },
+      );
+      const localSha = localRef.stdout.trim();
+      if (localRef.code !== 0 || localSha !== remoteTip) {
+        throw new Error(
+          `origin/${branch} does not match remote tip ${remoteTip} after fetch ` +
+            `(got ${localSha || "missing"}); refusing stale startPoint for worktree recreate`,
+        );
+      }
       startPoint = `origin/${branch}`;
     } else {
       const prHead = await resolveOpenPrHeadFn(cfg, branch);

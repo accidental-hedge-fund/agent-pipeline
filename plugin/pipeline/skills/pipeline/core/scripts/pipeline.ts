@@ -29,6 +29,7 @@ import {
   buildAuditSentinel,
   clearBlocked,
   ensurePipelineLabels,
+  getGhActor,
   getIssueDetail,
   getIssueLabelEvents,
   getItemKind,
@@ -854,6 +855,12 @@ export interface RealDispatchItemDeps {
    * issue is re-admissible once a slot frees (#718). Injected for unit tests.
    */
   clearBlocked?: typeof clearBlocked;
+  /**
+   * Authenticated gh actor login used to trust-filter the durable blocker-kind
+   * comment fallback (#718 review b5108544). Injected for unit tests — never
+   * call live `gh api user` from tests.
+   */
+  getGhActor?: () => Promise<string | null>;
   scriptPath?: string;
   execPath?: string;
   /**
@@ -880,6 +887,7 @@ export function realDispatchItem(
   const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
   const getPrForIssueFn = deps.getPrForIssue ?? getPrForIssue;
   const clearBlockedFn = deps.clearBlocked ?? clearBlocked;
+  const getGhActorFn = deps.getGhActor ?? getGhActor;
   const scriptPath = deps.scriptPath ?? fileURLToPath(import.meta.url);
   const execPath = deps.execPath ?? process.execPath;
   const eventsPathExistsFn = deps.eventsPathExists ?? ((p: string) => existsSync(p));
@@ -1002,7 +1010,12 @@ export function realDispatchItem(
         if (text !== null) lastKind = lastBlockerKindFromEventsJsonl(text);
       }
       if (!lastKind && Array.isArray(detail.comments)) {
-        lastKind = lastBlockerKindFromComments(detail.comments);
+        // Fail closed without a trusted actor: unauthenticated marker bodies
+        // must not reclassify product holds as capacity (#718 b5108544).
+        const actor = await getGhActorFn();
+        lastKind = lastBlockerKindFromComments(detail.comments, {
+          trustedAuthor: actor,
+        });
       }
       outcome = classifyDispatchOutcome(detail, lastKind);
       // Pure capacity is ops admission, not a product block: clear the label so
