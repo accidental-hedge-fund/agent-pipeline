@@ -151,7 +151,14 @@ import {
 } from "./loop/stage-progress.ts";
 import { initRecoverableRun } from "./loop/recovery.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
-import { compileContractItems } from "./loop/dependencies.ts";
+import { compileContractItems, type RawContractItem } from "./loop/dependencies.ts";
+import {
+  discoverDeclaredDependencies,
+  extractRoadmapDeclaredEdges,
+  realWorkListDependencyDiscoverDeps,
+  type RoadmapDeclaredEdge,
+  type WorkListDependencyDiscoverDeps,
+} from "./loop/work-list-deps.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type LoopLedger } from "./loop/types.ts";
 import {
   formatLoopRunHandoff,
@@ -539,15 +546,20 @@ export function workListRunId(repo: string, engine: LoopEngine, issues: readonly
 }
 
 /** Compiles a `LoopContractInit` + seeded `LoopLedger` for an already-resolved
- *  issue-number list — each item independent (no fabricated dependencies),
- *  executed in list order by the supervisor's single-active-item invariant.
- *  Milestone/label/roadmap-slice selectors are resolved into this same
- *  explicit list by {@link resolveSelectorIssues} before compilation. */
+ *  issue-number list. `rawItems` carries **declared** per-item dependencies
+ *  (from {@link discoverDeclaredDependencies} / {@link compileWorkListRunFresh});
+ *  when omitted, every item is independent (`depends_on: []`) — used only by
+ *  pure unit tests that intentionally skip discovery. Production fresh init
+ *  always passes discovered raw items so body/native/roadmap edges feed
+ *  `compileContractItems` (capability `work-list-declared-dependency-population`,
+ *  #615). Milestone/label/roadmap-slice/explicit-list selectors all resolve into
+ *  this same compile entrypoint via {@link resolveSelectorIssues}. */
 export function compileWorkListRun(
   cfg: PipelineConfig,
   engine: LoopEngine,
   issues: readonly string[],
   runId: string,
+  rawItems?: readonly RawContractItem[],
 ): { contract: import("./loop/recovery.ts").LoopContractInit; ledger: LoopLedger } {
   const contract: import("./loop/recovery.ts").LoopContractInit = {
     schema: LOOP_CONTRACT_SCHEMA,
@@ -566,7 +578,9 @@ export function compileWorkListRun(
     ordering: "dependency_sequential",
     max_active_items: 1,
     concurrency_model: "exclusive_lock_single_engine",
-    items: compileContractItems(issues.map((id) => ({ id, depends_on: [] }))),
+    items: compileContractItems(
+      rawItems ?? issues.map((id) => ({ id, depends_on: [] as string[] })),
+    ),
     canonical_hash: runId,
   };
   const ledger: LoopLedger = {
@@ -585,6 +599,23 @@ export function compileWorkListRun(
     authority_amendments: [],
   };
   return { contract, ledger };
+}
+
+/**
+ * Fresh work-list run compile: discover declared dependencies, then compile.
+ * Resume paths must NOT call this — they keep the on-disk contract (no silent
+ * re-discover overwrite). Run id remains {@link workListRunId} of the issue
+ * list only (deps do not change run identity).
+ */
+export async function compileWorkListRunFresh(
+  cfg: PipelineConfig,
+  engine: LoopEngine,
+  issues: readonly string[],
+  runId: string,
+  discoverDeps: WorkListDependencyDiscoverDeps = realWorkListDependencyDiscoverDeps(cfg),
+): Promise<{ contract: import("./loop/recovery.ts").LoopContractInit; ledger: LoopLedger }> {
+  const rawItems = await discoverDeclaredDependencies(issues, discoverDeps);
+  return compileWorkListRun(cfg, engine, issues, runId, rawItems);
 }
 
 /** The real `pipeline/loop-execution@1` dispatch seam: runs the per-item
@@ -1006,16 +1037,42 @@ export function extractRoadmapSliceIssues(roadmapText: string, slice: string): n
   return [...issues].sort((a, b) => a - b);
 }
 
-/** Resolves any {@link LoopSelector} into an explicit, ordered issue-number
- *  work list — the shared compilation step `defaultRunLoopEngine` uses for
- *  every selector type so milestone/label/roadmap-slice selectors reach the
- *  supervisor the same way an explicit issue list already did (#512). */
-export async function resolveSelectorIssues(
+/** Result of resolving a loop selector for fresh work-list compile: issue ids
+ *  plus any declared roadmap/slice edges available from the compile context. */
+export interface ResolvedSelectorWorkList {
+  issues: string[];
+  /** Declared issue-level edges from ROADMAP.md / slice graph when available. */
+  roadmapDeclaredEdges: readonly RoadmapDeclaredEdge[];
+}
+
+async function tryLoadRoadmapDeclaredEdges(
+  cfg: PipelineConfig,
+  deps: SelectorResolveDeps,
+  /** When the caller already has roadmap text (roadmap-slice), reuse it. */
+  knownRoadmapText?: string,
+): Promise<readonly RoadmapDeclaredEdge[]> {
+  try {
+    const text = knownRoadmapText ?? (await deps.readRoadmap(cfg));
+    return extractRoadmapDeclaredEdges(text);
+  } catch {
+    // Fail closed: missing/unreadable ROADMAP contributes no edges.
+    return [];
+  }
+}
+
+/** Resolves any {@link LoopSelector} into issue ids + optional roadmap edges
+ *  for declared-dependency population at fresh compile (#615). */
+export async function resolveSelectorWorkList(
   cfg: PipelineConfig,
   selector: LoopSelector,
   deps: SelectorResolveDeps,
-): Promise<string[]> {
-  if (selector.type === "work-list") return selector.value;
+): Promise<ResolvedSelectorWorkList> {
+  if (selector.type === "work-list") {
+    return {
+      issues: selector.value,
+      roadmapDeclaredEdges: await tryLoadRoadmapDeclaredEdges(cfg, deps),
+    };
+  }
 
   if (selector.type === "milestone" || selector.type === "label") {
     const issues = await deps.listOpenIssues(cfg);
@@ -1026,7 +1083,10 @@ export async function resolveSelectorIssues(
     if (matches.length === 0) {
       throw new Error(`no open issues found for ${selector.type} "${selector.value}"`);
     }
-    return matches.map(String);
+    return {
+      issues: matches.map(String),
+      roadmapDeclaredEdges: await tryLoadRoadmapDeclaredEdges(cfg, deps),
+    };
   }
 
   const roadmapText = await deps.readRoadmap(cfg);
@@ -1034,7 +1094,34 @@ export async function resolveSelectorIssues(
   if (matches.length === 0) {
     throw new Error(`roadmap slice "${selector.value}" was not found in ROADMAP.md, or references no issues`);
   }
-  return matches.map(String);
+  return {
+    issues: matches.map(String),
+    roadmapDeclaredEdges: await tryLoadRoadmapDeclaredEdges(cfg, deps, roadmapText),
+  };
+}
+
+/** Resolves any {@link LoopSelector} into an explicit, ordered issue-number
+ *  work list — the shared compilation step `defaultRunLoopEngine` uses for
+ *  every selector type so milestone/label/roadmap-slice selectors reach the
+ *  supervisor the same way an explicit issue list already did (#512). */
+export async function resolveSelectorIssues(
+  cfg: PipelineConfig,
+  selector: LoopSelector,
+  deps: SelectorResolveDeps,
+): Promise<string[]> {
+  return (await resolveSelectorWorkList(cfg, selector, deps)).issues;
+}
+
+/** Production discovery seam for a fresh work-list compile: body/native reads
+ *  via GraphQL/REST, plus any roadmap/slice edges carried from selector
+ *  resolution (#615 review finding 2e0c6562). */
+export function workListDiscoverDepsForCompile(
+  cfg: PipelineConfig,
+  roadmapDeclaredEdges: readonly RoadmapDeclaredEdge[] = [],
+): WorkListDependencyDiscoverDeps {
+  return realWorkListDependencyDiscoverDeps(cfg, {
+    getRoadmapDeclaredEdges: async () => roadmapDeclaredEdges,
+  });
 }
 
 export interface RunLoopEngineInput {
@@ -1184,11 +1271,17 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     runId = input.resumeRunId;
   } else if (input.selector) {
     let issues: string[];
+    let roadmapDeclaredEdges: readonly RoadmapDeclaredEdge[];
     try {
-      issues = await resolveSelectorIssues(cfg, input.selector, realSelectorResolveDeps());
+      const resolved = await resolveSelectorWorkList(cfg, input.selector, realSelectorResolveDeps());
+      issues = resolved.issues;
+      roadmapDeclaredEdges = resolved.roadmapDeclaredEdges;
     } catch (err) {
       return { kind: "error", message: `selector resolution failed: ${(err as Error).message}` };
     }
+    // Carry roadmap/slice edges from selector resolution into discovery so an
+    // edge declared only in ROADMAP is not dropped on the production path (#615).
+    const discoverDeps = workListDiscoverDepsForCompile(cfg, roadmapDeclaredEdges);
     const canonicalRunId = workListRunId(cfg.repo, input.engine, issues);
 
     if (input.newRun) {
@@ -1231,7 +1324,16 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
           return { kind: "error", message: repair.message };
         }
         if (repair.plan.initNewRun) {
-          const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, newRunId);
+          let compiled: Awaited<ReturnType<typeof compileWorkListRunFresh>>;
+          try {
+            compiled = await compileWorkListRunFresh(cfg, input.engine, issues, newRunId, discoverDeps);
+          } catch (err) {
+            return {
+              kind: "error",
+              message: `work-list compile failed: ${(err as Error).message}`,
+            };
+          }
+          const { contract, ledger } = compiled;
           contract.supersedes = headRunId;
           await initRecoverableRun(store, contract, ledger);
         }
@@ -1243,7 +1345,16 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     } else {
       runId = canonicalRunId;
       if (!(await loopRunExists(store, runId))) {
-        const { contract, ledger } = compileWorkListRun(cfg, input.engine, issues, runId);
+        let compiled: Awaited<ReturnType<typeof compileWorkListRunFresh>>;
+        try {
+          compiled = await compileWorkListRunFresh(cfg, input.engine, issues, runId, discoverDeps);
+        } catch (err) {
+          return {
+            kind: "error",
+            message: `work-list compile failed: ${(err as Error).message}`,
+          };
+        }
+        const { contract, ledger } = compiled;
         await initRecoverableRun(store, contract, ledger);
       }
     }
