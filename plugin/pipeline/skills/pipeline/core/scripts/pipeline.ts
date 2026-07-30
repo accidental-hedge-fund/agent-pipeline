@@ -132,7 +132,7 @@ import {
   storePreflightResult,
   type PreflightResult,
 } from "./stages/doctor.ts";
-import { runLoopPreflight, type LoopEngine, type LoopPreflightOutcome, type LoopSelector, type RawLoopArgs, type NativeGoalAttestation } from "./loop-preflight.ts";
+import { runLoopPreflight, MAX_RANGE_SPAN, type LoopEngine, type LoopPreflightOutcome, type LoopSelector, type RawLoopArgs, type NativeGoalAttestation } from "./loop-preflight.ts";
 import { auditSupervisor, driveSupervisor, type SupervisorDeps } from "./loop/supervisor.ts";
 import {
   defaultLoopStoreDeps,
@@ -362,6 +362,36 @@ export interface CliOpts {
  * Build and return the configured Commander program (without parsing).
  * Exported so tests can parse synthetic argv slices and verify CLI behaviour.
  */
+/**
+ * Max positional args (including the command keyword) accepted by the shared
+ * extra-positionals guard in main. `loop` accepts the command plus up to
+ * {@link MAX_RANGE_SPAN} issue numbers so an explicit issue-list selector can
+ * reach {@link normalizeLoopArgs} instead of dying as "unexpected argument(s)"
+ * (#554). Other commands keep their pre-existing caps.
+ */
+export function maxPositionalsFor(command: string | undefined): number {
+  if (
+    command === "run" ||
+    command === "release" ||
+    command === "intake" ||
+    command === "triage" ||
+    command === "merge" ||
+    command === "status" ||
+    command === "papercut" ||
+    command === "correction"
+  ) {
+    return 2;
+  }
+  if (command === "unblock" || command === "override" || command === "evals") {
+    return 3;
+  }
+  // loop keyword + up to MAX_RANGE_SPAN issue numbers (same ceiling as --range).
+  if (command === "loop") {
+    return 1 + MAX_RANGE_SPAN;
+  }
+  return 1; // refine-spec and plain advance take only the keyword / issue number
+}
+
 export function buildCmd(): Command {
   const cmd = new Command();
   const collectRepeatable = (value: string, previous: string[] = []): string[] => [...previous, value];
@@ -1870,19 +1900,9 @@ async function main(): Promise<void> {
   // `status <N>` takes two positionals; `unblock <N> "<answer>"` and
   // `override <N> "<spec>"` take three, as does `evals <subcommand>
   // <manifest.json|experiment-dir|harvest-request.json>` (#535).
-  const maxPositionals =
-    cmd.args[0] === "run" ||
-    cmd.args[0] === "release" ||
-    cmd.args[0] === "intake" ||
-    cmd.args[0] === "triage" ||
-    cmd.args[0] === "merge" ||
-    cmd.args[0] === "status" ||
-    cmd.args[0] === "papercut" ||
-    cmd.args[0] === "correction"
-      ? 2
-      : cmd.args[0] === "unblock" || cmd.args[0] === "override" || cmd.args[0] === "evals"
-      ? 3
-      : 1; // refine-spec takes only flags (no extra positionals)
+  // `loop` accepts the keyword plus up to MAX_RANGE_SPAN issue numbers so an
+  // explicit issue-list selector reaches normalizeLoopArgs (#554).
+  const maxPositionals = maxPositionalsFor(cmd.args[0]);
   if (cmd.args.length > maxPositionals) {
     const extra = cmd.args.slice(maxPositionals).join(", ");
     console.error(`pipeline: unexpected argument(s): ${extra}`);
