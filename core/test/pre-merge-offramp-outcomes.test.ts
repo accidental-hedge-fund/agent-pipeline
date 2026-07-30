@@ -71,7 +71,8 @@ test("pre-merge CI failure outcome maps to ci-failed class (#683)", async (t) =>
   assert.equal(out.advanced, false);
   assert.equal(out.status, "blocked");
   assert.equal(out.reason, "CI failed");
-  assert.equal(out.blockerKind, "needs-human");
+  // Post-#679 permanent CI failure uses ci-exhausted label + #683 ci-failed path tag.
+  assert.equal(out.blockerKind, "ci-exhausted");
   assert.equal(out.offrampPathTag, "ci-failed");
   assert.equal(outcomeClass(out), "ci-failed");
 });

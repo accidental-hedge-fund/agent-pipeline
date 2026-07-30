@@ -62,7 +62,8 @@ export function toPreMergeOfframpClass(input: ToPreMergeOfframpClassInput = {}):
       return "openspec-stale-delta";
     case "test-gate-exhausted":
     case "build-failed":
-      // Local test/build exhaustion at pre-merge is a CI-class failure for metrics.
+    case "ci-exhausted":
+      // Local test/build exhaustion and post-#679 CI recovery exhaustion map to ci-failed.
       return "ci-failed";
     default:
       return "other";

@@ -3675,7 +3675,9 @@ async function handleDefinitiveCiFailure(
     durablePersistFailure,
   });
   await fns.setBlockedFn(cfg, issueNumber, reason, "pre-merge", "ci-exhausted");
-  return { advanced: false, status: "blocked", reason: "CI failed" };
+  // #683: attach offramp path tag so scoreboard maps permanent CI failure to ci-failed
+  // (blockerKind alone is the durable label; pathTag is the finer metric class).
+  return preMergeBlocked("CI failed", "ci-exhausted", "ci-failed");
 }
 
 async function evaluateArchiveOnlyPriorGreen(
