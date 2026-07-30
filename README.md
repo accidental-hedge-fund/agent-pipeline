@@ -259,6 +259,7 @@ or `$pipeline:<command>` (Codex) entry. The advance loop has no sub-command.
 /pipeline:roadmap --apply                     same, applying hygiene write-backs and opening a roadmap.md PR
 /pipeline:roadmap --next <N>                  read existing plan.json, emit top-N dependency-safe issues (no re-run)
 /pipeline:merge <pr>                          human-invoked squash-merge of a ready-to-deploy PR (no advance loop)
+/pipeline:merge-queue --milestone <m>         dry-run ordered plan of ready-to-deploy PRs in a milestone (no merges; never called by advance)
 /pipeline:release <version>                   prepare a release PR for the given version
 /pipeline:logs [<run-id>] [-f]               list or stream pipeline run logs
 /pipeline:loop --milestone v2  $pipeline:loop --milestone v2   canonical durable multi-item run (driven in-repo by Pipeline's own supervisor)

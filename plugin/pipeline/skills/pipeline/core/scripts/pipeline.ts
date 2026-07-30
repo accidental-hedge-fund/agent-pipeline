@@ -97,6 +97,7 @@ import {
 import { runSweep, realSweepDeps } from "./stages/sweep.ts";
 import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
 import { mergePr, realMergeDeps } from "./stages/merge.ts";
+import { runMergeQueueDryRun, realMergeQueueDeps } from "./stages/merge_queue.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -394,6 +395,7 @@ export function maxPositionalsFor(command: string | undefined): number {
     command === "intake" ||
     command === "triage" ||
     command === "merge" ||
+    command === "merge-queue" ||
     command === "status" ||
     command === "papercut" ||
     command === "correction"
@@ -420,7 +422,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -502,7 +504,7 @@ export function buildCmd(): Command {
     .option("--concurrency <C>", "queue: maximum simultaneous pipeline runs (default: 1)", Number)
     .option("--max-failure-rate <R>", "queue: halt new launches when failure rate meets this threshold 0.0–1.0 (default: 1.0)", Number)
     .option("--label <L>", "queue: filter eligible issues to those carrying this label (repeatable)", collectRepeatable, [])
-    .option("--milestone <M>", "queue: filter eligible issues to those belonging to this milestone title")
+    .option("--milestone <M>", "queue / merge-queue / loop: filter issues to this milestone title")
     .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)")
     // backfill options (#327)
     .option("--capability <name>", "backfill: scope the apply slice to a named capability")
@@ -1817,6 +1819,8 @@ async function main(): Promise<void> {
   const isTriageCommand = numArg === "triage";
   // `pipeline merge <pr>` — human-invoked squash merge of a ready-to-deploy PR.
   const isMergeCommand = numArg === "merge";
+  // `pipeline merge-queue --milestone <m>` — human-invoked dry-run queue plan (#673).
+  const isMergeQueueCommand = numArg === "merge-queue";
   // `pipeline loop ...` (#451) — deterministic preflight + delegation to goal-loop.
   // Needs no PipelineConfig and calls no gh at all (see command-registry.ts).
   const isLoopCommand = numArg === "loop";
@@ -1912,6 +1916,11 @@ async function main(): Promise<void> {
         console.error(
           `pipeline: 'pipeline merge' does not support ${flags}. ` +
             `'pipeline merge <pr>' is a human-invoked squash merge; only --repo-path, --base, and --profile apply.`,
+        );
+      } else if (isMergeQueueCommand) {
+        console.error(
+          `pipeline: 'pipeline merge-queue' does not support ${flags}. ` +
+            `Allowed: --milestone, --dry-run, --repo-path, --base, --profile. Drive/apply is not implemented (#674).`,
         );
       } else if (opts.removeWorktree && isNumericOrAbsent) {
         console.error(`pipeline: '--remove-worktree' mode does not support ${flags}. These are separate modes.`);
@@ -2852,13 +2861,47 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early merge-queue dispatch — human-invoked dry-run plan of R2D PRs (#673).
+  // Default is dry-run; never merges. Advance loop never reaches here.
+  if (isMergeQueueCommand) {
+    let mergeQueueCfg: import("./types.ts").PipelineConfig;
+    try {
+      mergeQueueCfg = resolveConfig({
+        repoPath: opts.repoPath,
+        baseBranch: opts.base,
+        profile: opts.profile,
+      });
+    } catch (err) {
+      console.error(`pipeline merge-queue: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    try {
+      const code = await runMergeQueueDryRun(
+        {
+          milestone: opts.milestone,
+          dryRun: opts.dryRun,
+          apply: opts.apply,
+          baseBranch: mergeQueueCfg.base_branch,
+        },
+        realMergeQueueDeps(mergeQueueCfg.repo),
+        console.log,
+        mergeQueueCfg.repo,
+      );
+      process.exit(code);
+    } catch (err) {
+      console.error(`pipeline merge-queue: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "release", "intake", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "queue", "backfill", "evals",
       "loop",
     ];
     if (!recognized.includes(numArg)) {

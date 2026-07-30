@@ -102,6 +102,19 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
+  // merge-queue (#673): human-invoked dry-run planner for ready-to-deploy PRs.
+  // mutatesGitHub:false — this change implements dry-run only; drive is #674.
+  // `apply` is allowlisted only so premature --apply can fail closed with a
+  // clear "drive not implemented" message rather than a generic allowlist error.
+  "merge-queue": {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["milestone", "dryRun", "repoPath", "base", "profile", "apply"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: false,
+    supportsJson: false,
+  },
+
   sweep: {
     needsIssueNumber: false,
     allowedFlags: new Set(["repoPath", "base", "profile", "apply", "repo", "dryRun"]),

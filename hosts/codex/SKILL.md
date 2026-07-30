@@ -75,6 +75,7 @@ $pipeline:sweep --apply                  same, with write-backs applied
 $pipeline:roadmap                        dependency-aware scored roadmap for the backlog (dry-run)
 $pipeline:roadmap --apply                same, with write-backs applied
 $pipeline:merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
+$pipeline:merge-queue --milestone <m>    dry-run ordered plan of ready-to-deploy PRs in a milestone (no merges; never called by advance)
 $pipeline:release <version>              prepare a release PR for the given version
 $pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
 $pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor
@@ -1011,7 +1012,7 @@ When the loop ends, the skill prints:
 
 ## What this skill never does
 
-- Auto-merge PRs autonomously — the advance loop never merges and there is no `auto_merge` config key. The human-invoked `$pipeline merge <pr>` command is the controlled, explicit surface for merging after `pipeline:ready-to-deploy`; it is never called by the advance loop.
+- Auto-merge PRs autonomously — the advance loop never merges and there is no `auto_merge` config key. The human-invoked `$pipeline merge <pr>` command is the controlled, explicit surface for merging after `pipeline:ready-to-deploy`; it is never called by the advance loop. `$pipeline:merge-queue --milestone <m>` is a dry-run planner only (ordered R2D candidates); it never merges and is never called by advance.
 - Bypass the `pipeline:*` opt-in label gate.
 - Run more than one transition under `--once`.
 - Touch the GitHub repo in `--dry-run` mode.

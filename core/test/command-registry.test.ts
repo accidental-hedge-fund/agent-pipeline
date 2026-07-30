@@ -28,7 +28,7 @@ import { buildCmd } from "../scripts/pipeline.ts";
 // These are the named keywords the dispatch block in pipeline.ts recognizes.
 const DISPATCH_KEYWORDS = [
   "init", "doctor", "status", "unblock", "override", "cleanup",
-  "release", "intake", "sweep", "triage", "merge",
+  "release", "intake", "sweep", "triage", "merge", "merge-queue",
   "refine-spec", "logs", "summary", "path", "config", "run", "improve",
   "scoreboard", "roadmap", "loop", "correction", "report",
 ];
@@ -235,7 +235,7 @@ test("command-registry: needsIssueNumber is false for named sub-commands that op
   // Commands that act on the repo/environment, not a specific issue.
   const issueAgnosticKeys = [
     "init", "doctor", "cleanup", "release", "intake", "sweep",
-    "triage", "merge", "refine-spec", "logs", "summary", "path",
+    "triage", "merge", "merge-queue", "refine-spec", "logs", "summary", "path",
     "config", "improve", "scoreboard", "roadmap", "correction",
   ];
   for (const key of issueAgnosticKeys) {
@@ -282,6 +282,29 @@ test("command-registry: lookupCommand('cleanup') returns cleanup entry with need
   assert.ok(entry !== null);
   assert.equal(entry, COMMAND_REGISTRY.cleanup);
   assert.equal(entry.needsIssueNumber, false);
+});
+
+test("command-registry: merge-queue entry is dry-run-safe (non-mutating, no issue number)", () => {
+  const entry = COMMAND_REGISTRY["merge-queue"];
+  assert.ok(entry, "merge-queue must be registered");
+  assert.equal(entry.needsIssueNumber, false);
+  assert.equal(entry.mutatesGitHub, false);
+  assert.equal(entry.needsConfig, true);
+  assert.equal(entry.needsGhAuth, true);
+  assert.notEqual(entry.allowedFlags, "all");
+  const flags = entry.allowedFlags as Set<string>;
+  for (const required of ["milestone", "dryRun", "repoPath", "base", "profile"]) {
+    assert.ok(flags.has(required), `merge-queue.allowedFlags must include ${required}`);
+  }
+  assert.equal(lookupCommand("merge-queue"), entry);
+});
+
+test("command-registry: merge-queue rejects unsupported flags via validateFlags", () => {
+  const entry = COMMAND_REGISTRY["merge-queue"];
+  const offending = validateFlags(entry, fakeCmdWithCliFlag("jsonEvents"));
+  assert.deepEqual(offending, ["jsonEvents"]);
+  assert.deepEqual(validateFlags(entry, fakeCmdWithCliFlag("milestone")), []);
+  assert.deepEqual(validateFlags(entry, fakeCmdWithCliFlag("dryRun")), []);
 });
 
 // ---------------------------------------------------------------------------
