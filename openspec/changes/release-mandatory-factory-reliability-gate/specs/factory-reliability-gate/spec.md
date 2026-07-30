@@ -19,11 +19,19 @@ FRG driver and produce a conforming FRG evidence artifact for that version.
 
 #### Scenario: Recorded FRG pass satisfies the precondition for that version only
 
-- **WHEN** an FRG evidence artifact exists with `version: 1.29.1`, `pass: true`, and a non-empty
-  `run_id`
+- **WHEN** an FRG evidence artifact exists with `version: 1.29.1`, `pass: true`, a non-empty
+  `run_id`, a non-empty durable `loop_run_id`, and validated fixed-pack provenance (`pack_id`)
 - **THEN** the FRG precondition for version `1.29.1` SHALL be satisfied
 - **AND** the FRG precondition for a different version `1.30.0` SHALL remain unsatisfied until a
   separate pass artifact for `1.30.0` exists
+
+#### Scenario: Offline score without live loop is not release-eligible
+
+- **WHEN** an operator or test scores FRG fixtures offline (for example `scoreInput`) without a
+  non-empty durable `loop_run_id` and validated fixed-pack `pack_id`
+- **THEN** the driver SHALL NOT treat the result as release-eligible `pass: true` evidence
+- **AND** runtime validation SHALL reject `pass: true` artifacts that omit live-loop provenance
+- **AND** offline scoring SHALL NOT persist evidence by default
 
 ---
 
@@ -84,6 +92,21 @@ numbers and SHALL be checked by the FRG driver.
 - **THEN** the report SHALL set overall `pass: false`
 - **AND** SHALL NOT treat throughput-only success as a release-usable FRG pass
 - **AND** `not_observed` SHALL be reserved for reports that cannot be used as release evidence
+
+#### Scenario: Required scenarios cannot be skipped without failing the gate
+
+- **WHEN** a required pack scenario is recorded with status `skip`
+- **THEN** the driver SHALL treat that scenario as failing overall pass
+- **AND** SHALL NOT accept caller status overrides of `skip` as pass-permitting for Layer B
+  required scenarios
+
+#### Scenario: Capacity stress N is machine-validated from observations
+
+- **WHEN** scenario `capacity-blocked-retain` claims status `pass`
+- **AND** its observed blocked-retain count is missing or strictly less than threshold N
+  (`capacity_stress_n`)
+- **THEN** the driver SHALL set that scenario to `fail` (or refuse overall `pass: true`)
+- **AND** SHALL NOT accept a bare status override as proof that capacity stress was exercised
 
 #### Scenario: Non-pack durable loop is refused as FRG evidence
 
@@ -150,7 +173,8 @@ intentionally injected product-class holds defined by the pack.
 
 - **WHEN** an FRG evidence artifact claims `pass: true` but omits the required named scenario
   inventory, numeric thresholds, scoreboard metrics, or timestamps, or declares `pass: true` while
-  any scenario is `fail` or `not_observed`
+  any scenario is `fail`, `not_observed`, or `skip`, or omits a non-empty durable `loop_run_id` or
+  validated fixed-pack `pack_id`, or claims capacity pass without observed ≥ N
 - **THEN** runtime validation SHALL reject the artifact as unparsable against the expected FRG schema
 - **AND** the release FRG precondition SHALL remain unsatisfied
 

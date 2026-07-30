@@ -27,24 +27,31 @@ import {
   frgRequiredObservationOverrides,
   validateFrgPackContract,
   isAllowedFrgPackSelector,
+  enforceRequiredScenarioCriteria,
+  isReleaseEligibleFrgPass,
   type FrgEvidence,
   type FrgFsDeps,
 } from "../scripts/factory-reliability-gate.ts";
 import type { LoopContract, LoopLedger } from "../scripts/loop/types.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
 
-/** Minimal full-pack pass scoring input (all scenarios observed; K met). */
+/** Minimal full-pack pass scoring input (all scenarios observed; K met; live loop provenance). */
 function fullPackPassInput(
   overrides: {
     version?: string;
     run_id?: string;
     loop_run_id?: string | null;
+    pack_id?: string | null;
   } = {},
 ) {
   return {
     version: overrides.version ?? "1.29.1",
     run_id: overrides.run_id ?? "frg-full-pass",
-    loop_run_id: overrides.loop_run_id ?? null,
+    // Release-eligible pass requires durable loop + fixed-pack provenance.
+    loop_run_id:
+      overrides.loop_run_id === undefined ? "loop-full-pass" : overrides.loop_run_id,
+    pack_id:
+      overrides.pack_id === undefined ? FRG_PACK_MANIFEST.pack_id : overrides.pack_id,
     items: [
       { item_id: "1", state: "ready" as const, ready_clean: true },
       { item_id: "2", state: "ready" as const, ready_clean: true },
@@ -134,6 +141,8 @@ test("computeFrgEvidence: green unit-shaped pass with K clean ready items + full
   const evidence = computeFrgEvidence({
     version: "1.29.1",
     run_id: "frg-test-1",
+    loop_run_id: "loop-test-1",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
     items: [
       { item_id: "1", state: "ready", ready_clean: true },
       { item_id: "2", state: "ready", ready_clean: true },
@@ -146,11 +155,115 @@ test("computeFrgEvidence: green unit-shaped pass with K clean ready items + full
   assert.equal(evidence.version, "1.29.1");
   assert.equal(evidence.run_id, "frg-test-1");
   assert.equal(evidence.pass, true);
+  assert.equal(evidence.loop_run_id, "loop-test-1");
+  assert.equal(evidence.pack_id, FRG_PACK_MANIFEST.pack_id);
   assert.equal(evidence.scoreboard.ready_clean_count, 2);
   assert.equal(evidence.thresholds.min_clean_ready_to_deploy, DEFAULT_FRG_THRESHOLDS.min_clean_ready_to_deploy);
   const throughput = evidence.scenarios.find((s) => s.id === "clean-item-throughput");
   assert.equal(throughput?.status, "pass");
+  const capacity = evidence.scenarios.find((s) => s.id === "capacity-blocked-retain");
+  assert.equal(capacity?.status, "pass");
+  assert.ok((capacity?.observed ?? 0) >= DEFAULT_FRG_THRESHOLDS.capacity_stress_n);
   assert.ok(evidence.scenarios.every((s) => s.status !== "not_observed"));
+});
+
+test("computeFrgEvidence: offline score without loop_run_id cannot yield release pass", () => {
+  const evidence = computeFrgEvidence({
+    version: "1.29.1",
+    run_id: "frg-offline",
+    loop_run_id: null,
+    pack_id: null,
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+  });
+  assert.equal(evidence.pass, false, "no live loop → not release-eligible");
+  assert.equal(evidence.loop_run_id, null);
+  assert.equal(evidence.pack_id, null);
+  // Scenario criteria alone may be green; pass still false without provenance.
+  assert.ok(evidence.scenarios.every((s) => s.status !== "not_observed"));
+});
+
+test("computeFrgEvidence: capacity pass override without observed≥N is coerced to fail", () => {
+  const evidence = computeFrgEvidence({
+    version: "1.29.1",
+    run_id: "frg-cap-fake",
+    loop_run_id: "loop-cap",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    scenario_overrides: frgRequiredObservationOverrides("pass").map((o) =>
+      o.id === "capacity-blocked-retain"
+        ? {
+            id: "capacity-blocked-retain" as const,
+            status: "pass" as const,
+            detail: "claimed pass without capacity stress",
+            observed: 0,
+            threshold: DEFAULT_FRG_THRESHOLDS.capacity_stress_n,
+          }
+        : o,
+    ),
+  });
+  assert.equal(evidence.pass, false);
+  const capacity = evidence.scenarios.find((s) => s.id === "capacity-blocked-retain");
+  assert.equal(capacity?.status, "fail");
+  assert.equal(capacity?.observed, 0);
+});
+
+test("computeFrgEvidence: skip on required scenario fails overall pass", () => {
+  const evidence = computeFrgEvidence({
+    version: "1.29.1",
+    run_id: "frg-skip",
+    loop_run_id: "loop-skip",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    scenario_overrides: frgRequiredObservationOverrides("pass").map((o) =>
+      o.id === "resume-mid-flight"
+        ? {
+            id: "resume-mid-flight" as const,
+            status: "skip" as const,
+            detail: "skipped",
+            observed: null,
+            threshold: null,
+          }
+        : o,
+    ),
+  });
+  assert.equal(evidence.pass, false);
+  const resume = evidence.scenarios.find((s) => s.id === "resume-mid-flight");
+  assert.equal(resume?.status, "fail");
+  assert.match(resume?.detail ?? "", /cannot be skipped/);
+});
+
+test("enforceRequiredScenarioCriteria + isReleaseEligibleFrgPass: capacity N and live loop", () => {
+  const thresholds = DEFAULT_FRG_THRESHOLDS;
+  const bad = enforceRequiredScenarioCriteria(
+    [
+      {
+        id: "capacity-blocked-retain",
+        status: "pass",
+        detail: "fake",
+        observed: 0,
+        threshold: thresholds.capacity_stress_n,
+      },
+    ],
+    thresholds,
+  );
+  assert.equal(bad[0]?.status, "fail");
+
+  const full = computeFrgEvidence(fullPackPassInput());
+  assert.equal(full.pass, true);
+  assert.equal(isReleaseEligibleFrgPass(full), true);
+  assert.equal(isReleaseEligibleFrgPass({ ...full, loop_run_id: null }), false);
+  assert.equal(isReleaseEligibleFrgPass({ ...full, pack_id: null }), false);
+  assert.equal(isReleaseEligibleFrgPass({ ...full, pass: false }), false);
 });
 
 test("computeFrgEvidence: unobserved mandatory scenarios fail overall pass (not release evidence)", () => {
@@ -269,6 +382,8 @@ test("parseFrgEvidence rejects pass:true with not_observed scenarios", () => {
   const scored = computeFrgEvidence({
     version: "1.29.1",
     run_id: "frg-inconsistent",
+    loop_run_id: "loop-x",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
     items: [
       { item_id: "1", state: "ready", ready_clean: true },
       { item_id: "2", state: "ready", ready_clean: true },
@@ -278,7 +393,47 @@ test("parseFrgEvidence rejects pass:true with not_observed scenarios", () => {
   // Force pass:true while keeping not_observed statuses — must reject.
   assert.throws(
     () => parseFrgEvidence({ ...scored, pass: true }),
-    /pass is true but scenarios include fail or not_observed/,
+    /not release-eligible|fail or not_observed/,
+  );
+});
+
+test("parseFrgEvidence rejects pass:true without live loop_run_id (offline not release-eligible)", () => {
+  const scored = computeFrgEvidence(
+    fullPackPassInput({ run_id: "frg-no-loop", loop_run_id: "loop-ok" }),
+  );
+  assert.equal(scored.pass, true);
+  assert.throws(
+    () =>
+      parseFrgEvidence({
+        ...scored,
+        loop_run_id: null,
+        pack_id: FRG_PACK_MANIFEST.pack_id,
+        pass: true,
+      }),
+    /not release-eligible|loop_run_id/,
+  );
+  assert.throws(
+    () =>
+      parseFrgEvidence({
+        ...scored,
+        loop_run_id: "loop-ok",
+        pack_id: null,
+        pass: true,
+      }),
+    /not release-eligible|pack_id/,
+  );
+});
+
+test("parseFrgEvidence rejects pass:true capacity with observed below N", () => {
+  const scored = computeFrgEvidence(fullPackPassInput({ run_id: "frg-cap-parse" }));
+  const scenarios = scored.scenarios.map((s) =>
+    s.id === "capacity-blocked-retain"
+      ? { ...s, status: "pass", observed: 0, detail: "forged" }
+      : s,
+  );
+  assert.throws(
+    () => parseFrgEvidence({ ...scored, scenarios, pass: true }),
+    /not release-eligible|capacity/,
   );
 });
 
@@ -287,6 +442,8 @@ test("parseFrgEvidence accepts complete computeFrgEvidence output", () => {
   const parsed = parseFrgEvidence(JSON.parse(JSON.stringify(evidence)));
   assert.equal(parsed.pass, true);
   assert.equal(parsed.run_id, "frg-roundtrip");
+  assert.equal(parsed.loop_run_id, "loop-full-pass");
+  assert.equal(parsed.pack_id, FRG_PACK_MANIFEST.pack_id);
   assert.equal(parsed.scenarios.length, FRG_SCENARIO_IDS.length);
 });
 
@@ -416,7 +573,7 @@ test("formatFrgPrSection includes run_id and pass for release PR surface", () =>
 // Driver
 // ---------------------------------------------------------------------------
 
-test("runFactoryGate: scoreInput path writes evidence and exits 0 on pass", async () => {
+test("runFactoryGate: scoreInput path does not persist evidence by default", async () => {
   const fs = memFs();
   const lines: string[] = [];
   const result = await runFactoryGate(
@@ -432,10 +589,57 @@ test("runFactoryGate: scoreInput path writes evidence and exits 0 on pass", asyn
   );
   assert.equal(result.exitCode, 0);
   assert.equal(result.evidence.pass, true);
-  assert.ok(result.evidencePath?.includes("frg-driver-1"));
-  assert.ok(result.latestPath?.includes("latest.json"));
+  assert.equal(result.evidencePath, null, "offline scoreInput must not write by default");
+  assert.equal(result.latestPath, null);
+  assert.equal(fs.files.size, 0);
   const parsed = parseFrgEvidenceJson(lines.join("\n"));
   assert.equal(parsed.run_id, "frg-driver-1");
+});
+
+test("runFactoryGate: scoreInput without loop_run_id cannot produce release pass even if written", async () => {
+  const fs = memFs();
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/repo",
+      writeEvidence: true,
+      scoreInput: fullPackPassInput({
+        run_id: "frg-offline-write",
+        loop_run_id: null,
+        pack_id: null,
+      }),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.evidence.pass, false);
+  // Even if a fail report is written, release lookup must not treat it as pass.
+  if (result.evidencePath) {
+    const look = await lookupFrgPass("/repo", "1.29.1", fs);
+    assert.notEqual(look.kind, "pass");
+  }
+});
+
+test("runFactoryGate: scoreInput with explicit writeEvidence + live provenance can persist", async () => {
+  const fs = memFs();
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/repo",
+      writeEvidence: true,
+      scoreInput: fullPackPassInput({ run_id: "frg-explicit-write" }),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.evidence.pass, true);
+  assert.ok(result.evidencePath?.includes("frg-explicit-write"));
+  const look = await lookupFrgPass("/repo", "1.29.1", fs);
+  assert.equal(look.kind, "pass");
 });
 
 test("runFactoryGate: fail exits non-zero", async () => {
@@ -444,6 +648,7 @@ test("runFactoryGate: fail exits non-zero", async () => {
     {
       version: "1.29.1",
       repoDir: "/repo",
+      writeEvidence: true,
       scoreInput: {
         version: "1.29.1",
         run_id: "frg-driver-fail",
@@ -465,6 +670,7 @@ test("runFactoryGate: does not merge or tag (no side-effect hooks)", async () =>
     {
       version: "1.0.0",
       repoDir: "/repo",
+      writeEvidence: true,
       scoreInput: fullPackPassInput({ version: "1.0.0", run_id: "frg-no-merge" }),
       stdout: () => {},
       stderr: () => {},
@@ -553,9 +759,13 @@ test("runFactoryGate --from-run: accepts factory-gate label pack and scores", as
   assert.equal(result.exitCode, 0);
   assert.equal(result.evidence.pass, true);
   assert.equal(result.evidence.loop_run_id, "loop-frg");
+  assert.equal(result.evidence.pack_id, FRG_PACK_MANIFEST.pack_id);
   assert.ok(
     result.evidence.notes.some((n) => n.includes(FRG_PACK_MANIFEST.pack_id)),
   );
+  const capacity = result.evidence.scenarios.find((s) => s.id === "capacity-blocked-retain");
+  assert.equal(capacity?.status, "pass");
+  assert.ok((capacity?.observed ?? 0) >= DEFAULT_FRG_THRESHOLDS.capacity_stress_n);
 });
 
 test("runFactoryGate --from-run: requires loadContract (pack validation seam)", async () => {

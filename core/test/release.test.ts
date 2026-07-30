@@ -58,6 +58,7 @@ function defaultFrgPass(version = "1.6.0") {
       max_engine_class_rate: 0.25,
     },
     loop_run_id: "loop-test",
+    pack_id: "factory-gate-v1",
     created_at: "2026-07-30T00:00:00Z",
     notes: [],
   };

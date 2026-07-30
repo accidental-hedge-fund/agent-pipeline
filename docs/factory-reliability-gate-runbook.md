@@ -78,7 +78,8 @@ Machine-readable JSON (`schema_version: 1`):
 | `scenarios` | array | Per-scenario `{ id, status, detail, observed?, threshold? }` |
 | `scoreboard` | object | `item_count`, `ready_clean_count`, `engine_class_*`, `product_class_count`, `human_authority_count`, `engine_class_rate`, `per_item[]` |
 | `thresholds` | object | K, N, max engine-class rate applied |
-| `loop_run_id` | string \| null | Durable loop run id when projected from a real loop |
+| `loop_run_id` | string \| null | Durable loop run id; **required non-empty for release-eligible `pass: true`** |
+| `pack_id` | string \| null | Fixed pack identity (must be `factory-gate-v1` for release-eligible pass) |
 | `created_at` | string | ISO-8601 |
 | `notes` | string[] | Pack selection / warnings |
 
@@ -110,8 +111,14 @@ pipeline factory-gate --for 1.29.1 --from-run <loop-run-id> [--json]
   `factory-gate` / `frg-pack` / `reliability-pack`, and ≥2 items). Unrelated successful loops are
   refused and do not write release evidence.
 - **Observation required:** overall `pass: true` requires every named pack scenario to be
-  observed (`pass` / `warn` / `skip`); `not_observed` or `fail` fails the gate. Incomplete
-  evidence (empty scenarios, missing thresholds/scoreboard) is rejected by release lookup.
+  observed with machine-checked criteria; `not_observed`, `fail`, or `skip` fails the gate.
+  `capacity-blocked-retain` pass requires `observed ≥ N` (`capacity_stress_n`). `warn` is
+  pass-permitting only for documented honesty outcomes (e.g. `empty-depends-on-stack-honesty`).
+- **Live loop + pack provenance:** release-eligible `pass: true` also requires non-empty
+  `loop_run_id` and `pack_id=factory-gate-v1`. Offline/fixture scoring does not write evidence
+  by default and cannot mint release-usable pass artifacts without that provenance.
+- Incomplete evidence (empty scenarios, missing thresholds/scoreboard) is rejected by release
+  lookup.
 
 ### Start the pack (operator procedure)
 

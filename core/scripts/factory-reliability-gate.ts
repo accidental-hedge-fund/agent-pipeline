@@ -126,10 +126,21 @@ export function classifyFrgBlocker(theme: string | null | undefined): FrgBlocker
 
 export type FrgScenarioStatus = "pass" | "fail" | "warn" | "skip" | "not_observed";
 
-/** Scenario statuses that fail overall FRG pass when present. */
+/**
+ * Scenario statuses that always fail overall FRG pass when present.
+ * `skip` is also non-passing for every required pack scenario (Layer B mandatory).
+ * `warn` is pass-permitting only for documented honesty scenarios (see
+ * {@link frgScenariosPermitPass}).
+ */
 const FRG_FAILING_SCENARIO_STATUSES: ReadonlySet<FrgScenarioStatus> = new Set([
   "fail",
   "not_observed",
+  "skip",
+]);
+
+/** Scenarios where `warn` may still permit overall pass (documented process honesty). */
+const FRG_WARN_PERMITTED_SCENARIO_IDS: ReadonlySet<FrgScenarioId> = new Set([
+  "empty-depends-on-stack-honesty",
 ]);
 
 const FRG_VALID_SCENARIO_STATUSES: ReadonlySet<FrgScenarioStatus> = new Set([
@@ -176,8 +187,18 @@ export interface FrgEvidence {
   scenarios: FrgScenarioOutcome[];
   scoreboard: FrgScoreboard;
   thresholds: FrgThresholds;
-  /** Durable loop run id when evidence is projected from a real loop. */
+  /**
+   * Durable loop run id when evidence is projected from a real loop.
+   * Required non-empty for release-eligible `pass: true` evidence.
+   */
   loop_run_id: string | null;
+  /**
+   * Fixed FRG pack identity (`FRG_PACK_MANIFEST.pack_id`) when the durable loop
+   * was validated as the versioned factory-gate pack. Required to match the
+   * current manifest pack_id for release-eligible `pass: true` evidence.
+   * Offline/scoreInput reports without pack validation leave this null.
+   */
+  pack_id: string | null;
   created_at: string;
   /** Optional notes (warnings, pack selection). */
   notes: string[];
@@ -404,9 +425,122 @@ function parseFrgScoreboard(raw: unknown): FrgScoreboard {
   };
 }
 
-/** True when scenario statuses alone permit overall pass (no fail / not_observed). */
+/**
+ * True when scenario statuses alone permit overall pass:
+ * - no fail / not_observed / skip
+ * - warn only on documented honesty scenarios (stack-honesty)
+ */
 export function frgScenariosPermitPass(scenarios: readonly FrgScenarioOutcome[]): boolean {
-  return !scenarios.some((s) => FRG_FAILING_SCENARIO_STATUSES.has(s.status));
+  for (const s of scenarios) {
+    if (FRG_FAILING_SCENARIO_STATUSES.has(s.status)) return false;
+    if (s.status === "warn" && !FRG_WARN_PERMITTED_SCENARIO_IDS.has(s.id)) return false;
+  }
+  return true;
+}
+
+/**
+ * Release-eligible pass requires scenario criteria + live durable loop provenance
+ * (non-empty loop_run_id) + validated fixed-pack identity.
+ */
+export function isReleaseEligibleFrgPass(evidence: {
+  pass: boolean;
+  scenarios: readonly FrgScenarioOutcome[];
+  loop_run_id: string | null;
+  pack_id: string | null;
+  thresholds: FrgThresholds;
+}): boolean {
+  if (!evidence.pass) return false;
+  if (!frgScenariosPermitPass(evidence.scenarios)) return false;
+  if (typeof evidence.loop_run_id !== "string" || evidence.loop_run_id.trim() === "") {
+    return false;
+  }
+  if (evidence.pack_id !== FRG_PACK_MANIFEST.pack_id) return false;
+  if (!capacityScenarioMeetsNumericCriterion(evidence.scenarios, evidence.thresholds)) {
+    return false;
+  }
+  return true;
+}
+
+/** capacity-blocked-retain pass requires observed blocked-retain count ≥ N. */
+export function capacityScenarioMeetsNumericCriterion(
+  scenarios: readonly FrgScenarioOutcome[],
+  thresholds: FrgThresholds,
+): boolean {
+  const cap = scenarios.find((s) => s.id === "capacity-blocked-retain");
+  if (!cap) return false;
+  if (cap.status !== "pass") {
+    // fail / not_observed / skip already handled by frgScenariosPermitPass;
+    // warn is not permitted for capacity.
+    return cap.status === "warn" ? false : true;
+  }
+  const n = thresholds.capacity_stress_n;
+  return typeof cap.observed === "number" && Number.isFinite(cap.observed) && cap.observed >= n;
+}
+
+/**
+ * Enforce machine-checked criteria on scenario outcomes (overrides are not
+ * authoritative for numeric / skip rules). Mutates statuses to fail when
+ * claims are not proven.
+ */
+export function enforceRequiredScenarioCriteria(
+  scenarios: readonly FrgScenarioOutcome[],
+  thresholds: FrgThresholds,
+): FrgScenarioOutcome[] {
+  return scenarios.map((s) => {
+    // Required Layer-B pack scenarios cannot be skipped.
+    if (s.status === "skip") {
+      return {
+        ...s,
+        status: "fail" as const,
+        detail: `required FRG scenario ${s.id} cannot be skipped; live observation required`,
+      };
+    }
+
+    if (s.id === "capacity-blocked-retain") {
+      const n = thresholds.capacity_stress_n;
+      if (s.status === "pass" || s.status === "warn") {
+        const obs = s.observed;
+        if (typeof obs !== "number" || !Number.isFinite(obs) || obs < n) {
+          return {
+            ...s,
+            status: "fail" as const,
+            detail:
+              `capacity-blocked-retain requires observed blocked-retain count ≥ N=${n} ` +
+              `(got ${obs === null || obs === undefined ? "null" : String(obs)})`,
+            observed: typeof obs === "number" ? obs : null,
+            threshold: n,
+          };
+        }
+        // Capacity may only pass (not warn) when N is proven.
+        if (s.status === "warn") {
+          return {
+            ...s,
+            status: "pass" as const,
+            detail:
+              s.detail ||
+              `capacity stress observed=${obs} ≥ N=${n}; no false needs-human cascade`,
+            observed: obs,
+            threshold: n,
+          };
+        }
+        return { ...s, observed: obs, threshold: n };
+      }
+      return { ...s, threshold: s.threshold ?? n };
+    }
+
+    // Unauthorized warn on required scenarios is not pass-permitting proof.
+    if (s.status === "warn" && !FRG_WARN_PERMITTED_SCENARIO_IDS.has(s.id)) {
+      return {
+        ...s,
+        status: "fail" as const,
+        detail:
+          `required scenario ${s.id} status=warn is not a documented pass-permitting outcome ` +
+          `(only ${[...FRG_WARN_PERMITTED_SCENARIO_IDS].join(", ")} may warn)`,
+      };
+    }
+
+    return s;
+  });
 }
 
 /** Parse and validate a machine-readable FRG evidence object (full expected schema). */
@@ -453,6 +587,20 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
   if (o.loop_run_id !== null && typeof o.loop_run_id !== "string") {
     throw new Error("FRG evidence.loop_run_id must be a string or null");
   }
+  // pack_id: null | string; omit → null (pre-provenance artifacts)
+  if (
+    o.pack_id !== undefined &&
+    o.pack_id !== null &&
+    typeof o.pack_id !== "string"
+  ) {
+    throw new Error("FRG evidence.pack_id must be a string or null");
+  }
+  const packId =
+    o.pack_id === undefined || o.pack_id === null
+      ? null
+      : (o.pack_id as string).trim() === ""
+        ? null
+        : (o.pack_id as string).trim();
   if (typeof o.created_at !== "string" || o.created_at.trim() === "") {
     throw new Error("FRG evidence.created_at must be a non-empty string");
   }
@@ -460,16 +608,34 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
     throw new Error("FRG evidence.notes must be an array of strings");
   }
 
-  const scenariosOk = frgScenariosPermitPass(scenarios);
-  if (o.pass === true && !scenariosOk) {
+  // Re-apply numeric/skip criteria so forged overrides cannot parse as pass.
+  const enforced = enforceRequiredScenarioCriteria(scenarios, thresholds);
+  const scenariosOk = frgScenariosPermitPass(enforced);
+  const loopRunId =
+    o.loop_run_id === null || o.loop_run_id === undefined
+      ? null
+      : typeof o.loop_run_id === "string" && o.loop_run_id.trim() !== ""
+        ? o.loop_run_id.trim()
+        : null;
+  const releaseEligible = isReleaseEligibleFrgPass({
+    pass: true, // evaluate eligibility of the scenario/provenance fields
+    scenarios: enforced,
+    loop_run_id: loopRunId,
+    pack_id: packId,
+    thresholds,
+  });
+
+  if (o.pass === true && !releaseEligible) {
     throw new Error(
-      "FRG evidence.pass is true but scenarios include fail or not_observed " +
-        "(incomplete or inconsistent release evidence)",
+      "FRG evidence.pass is true but is not release-eligible " +
+        "(require observed non-fail scenarios including capacity observed≥N, " +
+        `non-empty loop_run_id, and pack_id=${FRG_PACK_MANIFEST.pack_id}; ` +
+        "offline scoreInput reports are not release evidence)",
     );
   }
-  if (o.pass === false && scenariosOk) {
+  if (o.pass === false && releaseEligible) {
     throw new Error(
-      "FRG evidence.pass is false but all scenarios are observed non-fail " +
+      "FRG evidence.pass is false but evidence is release-eligible " +
         "(inconsistent evidence)",
     );
   }
@@ -479,10 +645,11 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
     version: o.version,
     run_id: o.run_id.trim(),
     pass: o.pass,
-    scenarios,
+    scenarios: enforced,
     scoreboard,
     thresholds,
-    loop_run_id: o.loop_run_id as string | null,
+    loop_run_id: loopRunId,
+    pack_id: packId,
     created_at: o.created_at,
     notes: o.notes as string[],
   };
@@ -657,31 +824,70 @@ export interface FrgScenarioOverride {
 /**
  * Fixture helper: mark every non-auto-scored pack scenario as observed.
  * Use with items that already satisfy K / engine-rate so overall pass can be true.
+ * Capacity always carries `observed ≥ capacity_stress_n` when status is pass.
  * Live Layer B must still supply real observations (or pack automation); this is for
- * hermetic scoring tests only.
+ * hermetic scoring tests only. Offline scoreInput still needs `loop_run_id` +
+ * `pack_id` for release-eligible `pass: true`.
  */
 export function frgRequiredObservationOverrides(
   status: Exclude<FrgScenarioStatus, "not_observed"> = "pass",
+  thresholds: FrgThresholds = DEFAULT_FRG_THRESHOLDS,
 ): FrgScenarioOverride[] {
   const auto = new Set<string>(FRG_AUTO_SCORED_SCENARIO_IDS);
-  return FRG_SCENARIO_IDS.filter((id) => !auto.has(id)).map((id) => ({
-    id,
-    status,
-    detail:
-      status === "pass"
-        ? `observed pass: ${id}`
-        : status === "warn"
-          ? `observed warn: ${id}`
-          : `observed ${status}: ${id}`,
-    observed: null,
-    threshold: null,
-  }));
+  return FRG_SCENARIO_IDS.filter((id) => !auto.has(id)).map((id) => {
+    if (id === "capacity-blocked-retain") {
+      const n = thresholds.capacity_stress_n;
+      if (status === "pass") {
+        return {
+          id,
+          status,
+          detail: `capacity stress observed=${n} ≥ N=${n}; no false needs-human cascade`,
+          observed: n,
+          threshold: n,
+        };
+      }
+      if (status === "skip" || status === "fail") {
+        return {
+          id,
+          status,
+          detail: `observed ${status}: ${id}`,
+          observed: status === "fail" ? 0 : null,
+          threshold: n,
+        };
+      }
+      // warn is not pass-permitting for capacity — still attach N for clarity
+      return {
+        id,
+        status,
+        detail: `observed warn: ${id}`,
+        observed: n,
+        threshold: n,
+      };
+    }
+    return {
+      id,
+      status,
+      detail:
+        status === "pass"
+          ? `observed pass: ${id}`
+          : status === "warn"
+            ? `observed warn: ${id}`
+            : `observed ${status}: ${id}`,
+      observed: null,
+      threshold: null,
+    };
+  });
 }
 
 export interface ComputeFrgInput {
   version: string;
   run_id?: string;
   loop_run_id?: string | null;
+  /**
+   * Fixed pack id after validateFrgPackContract. Required equal to
+   * FRG_PACK_MANIFEST.pack_id for release-eligible pass.
+   */
+  pack_id?: string | null;
   items: FrgItemInput[];
   thresholds?: FrgThresholds;
   /** Pack-specific scenario outcomes (capacity, resume, …). */
@@ -732,7 +938,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
     (input.scenario_overrides ?? []).map((s) => [s.id, s] as const),
   );
 
-  const scenarios: FrgScenarioOutcome[] = FRG_SCENARIO_IDS.map((id) => {
+  const rawScenarios: FrgScenarioOutcome[] = FRG_SCENARIO_IDS.map((id) => {
     if (overrideById.has(id)) {
       const o = overrideById.get(id)!;
       return {
@@ -780,11 +986,27 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
     };
   });
 
-  // Fail closed: explicit fail OR required scenario not_observed fails the gate.
-  // Reserve not_observed for non-release reports — it must never produce pass:true
-  // usable as release evidence. Throughput + taxonomy are always computed above;
-  // all other pack scenarios need verifiable observation (override or pack automation).
-  const pass = frgScenariosPermitPass(scenarios);
+  // Overrides are not authoritative for numeric/skip rules — re-validate.
+  const scenarios = enforceRequiredScenarioCriteria(rawScenarios, thresholds);
+
+  const loopRunId =
+    typeof input.loop_run_id === "string" && input.loop_run_id.trim() !== ""
+      ? input.loop_run_id.trim()
+      : null;
+  const packId =
+    typeof input.pack_id === "string" && input.pack_id.trim() !== ""
+      ? input.pack_id.trim()
+      : null;
+
+  // Fail closed: scenario criteria + live loop + fixed-pack provenance.
+  // Offline scoreInput without loop_run_id/pack_id can never yield release pass.
+  const pass = isReleaseEligibleFrgPass({
+    pass: true,
+    scenarios,
+    loop_run_id: loopRunId,
+    pack_id: packId,
+    thresholds,
+  });
 
   return {
     schema_version: FRG_SCHEMA_VERSION,
@@ -802,7 +1024,8 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       per_item: perItem,
     },
     thresholds,
-    loop_run_id: input.loop_run_id ?? null,
+    loop_run_id: loopRunId,
+    pack_id: packId,
     created_at: now().toISOString().replace(/\.\d{3}Z$/, "Z"),
     notes: input.notes ?? [],
   };
@@ -901,10 +1124,16 @@ export interface FactoryGateOpts {
   json?: boolean;
   /**
    * When set, skip live loop I/O and score this pre-built input (tests / offline
-   * fixture scoring). Still writes evidence when `writeEvidence` is true.
+   * fixture scoring). Offline reports are **not** release-eligible unless the
+   * input includes a non-empty `loop_run_id` and validated `pack_id`. By default
+   * scoreInput does **not** persist evidence (`writeEvidence` defaults false).
    */
   scoreInput?: ComputeFrgInput;
-  /** Persist evidence under the repo (default true). */
+  /**
+   * Persist evidence under the repo. Default: true for live/from-run paths;
+   * false for offline `scoreInput` (so offline scoring cannot silently mint
+   * release-eligible latest.json without an explicit write).
+   */
   writeEvidence?: boolean;
   /**
    * Start a durable loop for the pack (production path). Injected so unit tests
@@ -947,7 +1176,13 @@ export async function runFactoryGate(
   const version = normalizeFrgVersion(opts.version);
   const stdout = opts.stdout ?? ((m) => process.stdout.write(`${m}\n`));
   const stderr = opts.stderr ?? ((m) => process.stderr.write(`${m}\n`));
-  const writeEvidence = opts.writeEvidence !== false;
+  // Offline scoreInput must not default-write release evidence (e5da5fc8).
+  const writeEvidence =
+    opts.writeEvidence !== undefined
+      ? opts.writeEvidence
+      : opts.scoreInput
+        ? false
+        : true;
 
   let computeInput: ComputeFrgInput;
 
@@ -999,6 +1234,7 @@ export async function runFactoryGate(
     computeInput = {
       version,
       loop_run_id: opts.fromRun,
+      pack_id: FRG_PACK_MANIFEST.pack_id,
       items,
       scenario_overrides: overrides,
       notes,
@@ -1067,6 +1303,7 @@ export async function runFactoryGate(
     computeInput = {
       version,
       loop_run_id,
+      pack_id: FRG_PACK_MANIFEST.pack_id,
       items: itemsFromLoopLedger(ledger),
       scenario_overrides: overrides,
       notes,

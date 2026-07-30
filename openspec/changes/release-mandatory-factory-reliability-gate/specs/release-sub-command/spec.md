@@ -29,13 +29,20 @@ NOT merge any pull request and SHALL NOT create the release tag by itself.
 
 #### Scenario: FRG pass allows release preparation to continue past the FRG check
 
-- **WHEN** an FRG evidence artifact for the resolved version exists with `pass: true` and a
-  non-empty `run_id`
+- **WHEN** an FRG evidence artifact for the resolved version exists with `pass: true`, a
+  non-empty `run_id`, a non-empty durable `loop_run_id`, and validated fixed-pack provenance
 - **AND** the existing `npm run ci` gate also succeeds (when that gate is reached in the release
   sequence)
 - **THEN** the FRG check SHALL not block the release path
 - **AND** the release preparation MAY proceed to subsequent steps defined by existing release
   requirements
+
+#### Scenario: Offline or loop-less FRG claim does not unblock release
+
+- **WHEN** an FRG artifact claims `pass: true` for the resolved version but lacks a usable
+  durable `loop_run_id` or fixed-pack `pack_id`
+- **THEN** `pipeline release` SHALL exit non-zero (unparsable or not release-eligible)
+- **AND** SHALL NOT treat offline/fixture scoring as a substitute for a live Layer B pack run
 
 #### Scenario: FRG check does not auto-merge or auto-tag
 

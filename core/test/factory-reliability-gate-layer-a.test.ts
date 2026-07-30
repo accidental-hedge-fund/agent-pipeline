@@ -386,6 +386,8 @@ test("FRG Layer A clean-item-throughput + blocker-taxonomy: thresholds are numer
   const pass = computeFrgEvidence({
     version: "1.29.1",
     run_id: "layer-a-pass",
+    loop_run_id: "loop-layer-a",
+    pack_id: "factory-gate-v1",
     items: [
       { item_id: "1", state: "ready", ready_clean: true },
       { item_id: "2", state: "ready", ready_clean: true },
