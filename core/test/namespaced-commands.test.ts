@@ -370,6 +370,41 @@ test("namespaced-commands 7.5b6: host loop skill stop-on-terminal + dual-follow 
       !/owns tail via process substitution/i.test(body),
       `${skillPath} must not claim process substitution owns/terminates tail (#699 f7ea742f)`,
     );
+    // Forbidden: mktemp -u as a live shell command for FIFO paths (TOCTOU
+    // clobber / data-loss hazard). Comments that name the ban are fine.
+    // Safe pattern: mktemp -d private dir, mkfifo inside it, abort if mkfifo fails.
+    for (const codeLine of body.split("\n")) {
+      const trimmed = codeLine.trim();
+      if (trimmed.startsWith("#")) continue; // prose / shell comment
+      if (/\bmktemp\s+-u\b/.test(trimmed)) {
+        assert.fail(
+          `${skillPath} documents mktemp -u as live code (TOCTOU FIFO clobber hazard; use mktemp -d + mkfifo inside) (#699 de4df498): ${trimmed}`,
+        );
+      }
+    }
+    // When a raw dual-follow fence uses mkfifo, require private-dir + fail-closed mkfifo.
+    const skillLines = body.split("\n");
+    for (let i = 0; i < skillLines.length; i++) {
+      const line = skillLines[i]!;
+      if (!/\bmkfifo\b/.test(line)) continue;
+      let fenceStart = i;
+      while (fenceStart > 0 && !/^```/.test(skillLines[fenceStart - 1]!)) fenceStart--;
+      let fenceEnd = i;
+      while (fenceEnd < skillLines.length - 1 && !/^```/.test(skillLines[fenceEnd + 1]!)) {
+        fenceEnd++;
+      }
+      const fence = skillLines.slice(fenceStart, fenceEnd + 1).join("\n");
+      const hasPrivateDir = /\bmktemp\s+-d\b/.test(fence);
+      const abortsOnMkfifoFail =
+        /mkfifo\s+"?\$[A-Za-z_][A-Za-z0-9_]*"?\s*\|\|/.test(fence) ||
+        /mkfifo[^\n]*\|\|\s*\{/.test(fence) ||
+        /mkfifo[^\n]*\|\|\s*exit/.test(fence);
+      if (!hasPrivateDir || !abortsOnMkfifoFail) {
+        assert.fail(
+          `${skillPath} raw-follow mkfifo fence must use mktemp -d and abort if mkfifo fails (#699 de4df498): ${line}`,
+        );
+      }
+    }
   }
 
   // LOOP_ORCH_NOTE (command packaging) must also require same-turn stop language.

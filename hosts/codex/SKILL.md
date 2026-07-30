@@ -780,8 +780,10 @@ terminal-aware raw fallback (explicit child teardown; prefer the CLI):
 # Prefer: pipeline loop logs <run_id> --events --follow  (auto-exits on terminal)
 EVENTS="<state-home>/runs/<run_id>/events.jsonl"
 # Process substitution alone does NOT kill tail -F on exit — track + TERM/KILL.
-FIFO=$(mktemp -u)
-mkfifo "$FIFO"
+# Private dir + FIFO inside it (never mktemp -u: TOCTOU clobber hazard).
+FIFO_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pipeline-loop-follow.XXXXXX") || exit 1
+FIFO="$FIFO_DIR/events.fifo"
+mkfifo "$FIFO" || { rmdir "$FIFO_DIR" 2>/dev/null; exit 1; }
 tail -n +1 -F "$EVENTS" >"$FIFO" &
 TAIL_PID=$!
 stop_tail() {
@@ -792,6 +794,7 @@ stop_tail() {
   wait "$TAIL_PID" 2>/dev/null || true
   TAIL_PID=""
   rm -f "$FIFO"
+  rmdir "$FIFO_DIR" 2>/dev/null || true
 }
 trap stop_tail EXIT INT TERM
 while IFS= read -r line; do
