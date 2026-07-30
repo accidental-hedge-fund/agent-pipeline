@@ -618,13 +618,16 @@ export function buildPreflightChecks(
     },
   });
 
-  // 10. Loop contract coherence (#451) — verifies the installed goal-loop
-  //     skill's contract/ledger schema ids are within Pipeline's supported
-  //     set. Shared verbatim with the installer and the `pipeline:loop`
-  //     run-start preflight (design.md decision 4) — one implementation.
+  // 10. Loop contract coherence (#451 / #627) — when a legacy external
+  //     goal-loop skill is discovered, verifies its contract/ledger schema
+  //     ids are within Pipeline's supported set. Absence is skip (optional
+  //     /legacy; not required for pipeline:loop). Shared with the installer
+  //     so discovery semantics cannot diverge; run-start uses the in-repo
+  //     store-schema check instead (#512).
   checks.push({
     id: "loop:contract-coherence",
-    description: "Installed goal-loop contract/ledger schema ids are within Pipeline's supported set",
+    description:
+      "Legacy external goal-loop (if installed) has contract/ledger schema ids within Pipeline's supported set; absence is skip",
     run: async (deps) => checkLoopContractCoherence(deps),
   });
 

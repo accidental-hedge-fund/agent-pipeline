@@ -76,14 +76,14 @@ The installer prints a prerequisite checklist during install (warnings do not bl
 **Step 1 — Install**
 
 ```bash
-# Pinned to a released version (reproducible — recommended):
-npx -y github:accidental-hedge-fund/agent-pipeline#v1.2.1 install
-
-# Or track the latest default branch:
+# Track the latest default branch:
 npx github:accidental-hedge-fund/agent-pipeline install
+
+# Or pin a released tag for a reproducible install (recommended for prod):
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.28.4 install
 ```
 
-This detects which of `~/.claude` and `~/.codex` exist and installs to each. After installing for Codex, **restart Codex** to pick up the skill. Pin to a tag (`#v1.2.1`) for a reproducible install; the bare form tracks the latest default branch — see [Install a specific version](#install-a-specific-version).
+This detects which of `~/.claude` and `~/.codex` exist and installs to each. After installing for Codex, **restart Codex** to pick up the skill. Pin to a released tag (see [GitHub Releases](https://github.com/accidental-hedge-fund/agent-pipeline/releases)) for a reproducible install; the bare form tracks the latest default branch — see [Install a specific version](#install-a-specific-version).
 
 **Step 2 — Label an issue and run**
 
@@ -124,10 +124,10 @@ npx github:accidental-hedge-fund/agent-pipeline install --host claude
 npx github:accidental-hedge-fund/agent-pipeline install --host codex
 ```
 
-For a reproducible, non-interactive install — pin the released tag (`#v1.2.1`) and auto-accept the optional-dependency prompts with `--yes-deps`:
+For a reproducible, non-interactive install — pin a released tag and auto-accept the optional-dependency prompts with `--yes-deps`:
 
 ```bash
-npx -y github:accidental-hedge-fund/agent-pipeline#v1.2.1 install --host claude --yes-deps
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.28.4 install --host claude --yes-deps
 ```
 
 The bare commands above always track the **latest** default branch; add `#<tag>` to pin a release (see [Install a specific version](#install-a-specific-version)). The pipeline is **cross-harness** regardless of which host you install — `--host claude` only controls where the skill lands; the *other* harness's CLI (`codex`) is still required for review.
@@ -188,15 +188,15 @@ This installs the same skill as a plugin (`/pipeline`, shown as `pipeline:pipeli
 The bare `npx github:…` commands above install the **latest** code (the default branch). To install a specific released version instead, pin the git ref with `#<tag>` — released versions are tagged `vMAJOR.MINOR.PATCH` (see the [tags](https://github.com/accidental-hedge-fund/agent-pipeline/tags)):
 
 ```bash
-# Install exactly v1.2.1 (any host flag works the same way)
-npx -y github:accidental-hedge-fund/agent-pipeline#v1.2.1 install --host claude
+# Install exactly v1.28.4 (any host flag works the same way; pick a tag from Releases)
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.28.4 install --host claude
 ```
 
-Everything else is identical to the latest-version commands — `#v1.2.1` just tells `npx` to fetch that tag rather than the default branch. Or clone and check out the tag directly:
+Everything else is identical to the latest-version commands — `#v1.28.4` (or any other released `vMAJOR.MINOR.PATCH` tag) just tells `npx` to fetch that tag rather than the default branch. Or clone and check out the tag directly:
 
 ```bash
 gh repo clone accidental-hedge-fund/agent-pipeline
-cd agent-pipeline && git checkout v1.2.1
+cd agent-pipeline && git checkout v1.28.4
 node scripts/install.mjs install --host claude
 ```
 
@@ -1081,7 +1081,7 @@ The checks (each emits one sentence of remediation text on failure or warning):
 | `package-install` | `node_modules` exists and is not older than `package-lock.json` | the repo root has no `package-lock.json` |
 | `openspec-cli` | the `openspec` CLI is on `PATH` | OpenSpec is not active (`openspec.enabled: off`, or `auto` with no `openspec/` dir) |
 | `eval-command` | the configured eval command's binary resolves on `PATH` | the eval gate is off or has no `command` |
-| `loop:contract-coherence` | an installed [goal-loop](https://github.com/comamitc/goal-loop) skill is discovered whose contract/ledger schema ids are within Pipeline's supported set (reported by `pipeline doctor` and the installer only — `pipeline:loop` itself no longer requires this; see [`pipeline:loop`](#durable-multi-item-runs-pipelineloop)) | — (fails, naming both sides, when goal-loop is absent or its schema ids are outside the supported set) |
+| `loop:contract-coherence` | a discovered legacy [goal-loop](https://github.com/comamitc/goal-loop) install (if any) has contract/ledger schema ids within Pipeline's supported set (doctor + installer only; [`pipeline:loop`](#durable-multi-item-runs-pipelineloop) uses the in-repo durable loop and does **not** require external goal-loop) | no external goal-loop install is discovered (**skip** — optional/legacy; not a doctor failure). Hard-fails only when a discovered install is unreadable or its schema ids are outside the supported set (detail names both sides) |
 
 **Stale-install warning (#385).** `install:version-freshness` compares the installed engine against the latest `accidental-hedge-fund/agent-pipeline` GitHub release tag. A behind install reports `warn` — loud but **non-blocking**: it never fails the preflight, never sets a non-zero exit code, and never aborts a `--doctor` / `doctor.runOnStart` run. The remediation names the [update command](#updating-an-npxclone-install). The check only reports; it never updates anything itself.
 

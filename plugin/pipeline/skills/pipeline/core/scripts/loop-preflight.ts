@@ -1,18 +1,20 @@
-// pipeline:loop deterministic preflight (#451).
+// pipeline:loop deterministic preflight (#451 / #512 / #627).
 //
-// Two read-only checks, shared verbatim by `pipeline doctor`, the installer,
-// and the `pipeline:loop` run-start preflight (design.md decision 4 — "refuse
-// before mutating"):
+// External-skill checks used by `pipeline doctor` and the installer:
 //
-//   - `loop:contract-coherence` — discover the installed goal-loop skill and
-//     verify its contract/ledger schema ids are within Pipeline's supported
-//     set.
+//   - `loop:contract-coherence` — when a legacy external goal-loop skill is
+//     discovered, verify its contract/ledger schema ids are within Pipeline's
+//     supported set. Absence is skip (optional/legacy); incompatible discovery
+//     fails. Not required for `pipeline:loop` run-start.
+//
+// In-repo loop run-start uses store-schema compatibility + native `/goal`
+// (below), not external goal-loop discovery.
+//
 //   - native-`/goal` capability — verify the active engine's built-in
 //     autonomous goal mode is available.
 //
-// Both reuse the existing `DoctorDeps` seam (core/scripts/stages/doctor.ts) so
-// there is exactly one injectable-I/O contract across doctor, the installer,
-// and the CLI — no divergent copies (design.md decision 4; tasks.md #4.3).
+// External coherence reuses the `DoctorDeps` seam (core/scripts/stages/doctor.ts)
+// so doctor and the installer share one injectable-I/O contract (#627).
 //
 // Also implements pure argument normalization for `pipeline:loop` — parsing
 // the selector/mode arguments with no I/O at all.
@@ -116,22 +118,24 @@ export async function discoverGoalLoop(
 // ---------------------------------------------------------------------------
 
 const pass = (detail: string): CheckResult => ({ status: "pass", detail });
+const skip = (detail: string): CheckResult => ({ status: "skip", detail });
 const fail = (detail: string, remediation: string): CheckResult => ({ status: "fail", detail, remediation });
 
-/** `loop:contract-coherence`: the one check shared by `pipeline doctor`, the
- *  installer, and the `pipeline:loop` run-start preflight. Fails when no
- *  goal-loop install is discoverable, when its manifest/schema ids cannot be
- *  read, or when either schema id is outside Pipeline's supported set
- *  (including a schema id newer than any supported id). */
+/** `loop:contract-coherence`: shared by `pipeline doctor` and the installer.
+ *  When a legacy external goal-loop skill is discovered, verifies its
+ *  contract/ledger schema ids are within Pipeline's supported set (including
+ *  failing a schema id newer than any supported id). When no install is
+ *  discoverable, returns **skip** — external goal-loop is optional/legacy and
+ *  is not required for `pipeline:loop` (in-repo durable loop; #512 / #627).
+ *  Unreadable discovered installs and out-of-set schema ids still fail. */
 export async function checkLoopContractCoherence(
   deps: DoctorDeps,
   roots: string[] = goalLoopDiscoveryRoots(),
 ): Promise<CheckResult> {
   const discovered = await discoverGoalLoop(deps, roots);
   if (!discovered) {
-    return fail(
-      "no installed goal-loop skill could be discovered",
-      "Install goal-loop before running pipeline:loop — see https://github.com/comamitc/goal-loop.",
+    return skip(
+      "external goal-loop skill not installed (optional/legacy) — not required for pipeline:loop / the in-repo durable loop",
     );
   }
 

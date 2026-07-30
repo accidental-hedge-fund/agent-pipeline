@@ -167,16 +167,15 @@ function preflight() {
   log("");
 }
 
-// loop:contract-coherence (#451) — runs the SAME check function `pipeline doctor`
-// and the `pipeline:loop` run-start preflight use (core/scripts/loop-preflight.ts),
-// so the three surfaces cannot diverge (design.md decision 4). Unlike doctor (which
-// treats a missing goal-loop install as a hard failure — it IS one, for the purpose
-// of that diagnostic), the installer only refuses to complete an INCOMPATIBLE
-// pairing: goal-loop is optional for a standalone Pipeline install, so its absence
-// is reported as info, not a blocker. Runs before any host install (external
-// mutation) begins. Returns { ok, message? } rather than calling fail() itself,
-// so it stays unit-testable (fail() calls process.exit); main() calls fail()
-// on an ok:false result.
+// loop:contract-coherence (#451 / #627) — runs the SAME check function
+// `pipeline doctor` uses (core/scripts/loop-preflight.ts), so doctor and the
+// installer cannot diverge on external goal-loop discovery. External goal-loop
+// is optional/legacy after the in-repo durable loop (#512): absence is skip
+// (info), not a blocker; only an INCOMPATIBLE *discovered* pairing fails.
+// Durable loop (`/pipeline:loop` / `$pipeline:loop`) does not require the
+// external skill. Runs before any host install (external mutation) begins.
+// Returns { ok, message? } rather than calling fail() itself, so it stays
+// unit-testable (fail() calls process.exit); main() calls fail() on ok:false.
 async function checkLoopCoherence() {
   let loopPreflight;
   let doctor;
@@ -189,19 +188,16 @@ async function checkLoopCoherence() {
     return { ok: true };
   }
   const deps = doctor.realDoctorDeps();
-  const discovered = await loopPreflight.discoverGoalLoop(deps);
-  if (!discovered) {
-    log(
-      "  ℹ goal-loop not installed (optional) — /pipeline:loop and $pipeline:loop will be " +
-        "unavailable until it is: https://github.com/comamitc/goal-loop",
-    );
-    return { ok: true };
-  }
   const result = await loopPreflight.checkLoopContractCoherence(deps);
   if (result.status === "fail") {
     return { ok: false, message: `loop:contract-coherence: ${result.detail}\n  → ${result.remediation}` };
   }
-  log(`  ✓ loop:contract-coherence: ${result.detail}`);
+  if (result.status === "pass") {
+    log(`  ✓ loop:contract-coherence: ${result.detail}`);
+  } else if (result.status === "skip" || result.status === "warn") {
+    // Optional/legacy external skill — do not claim loop is unavailable without it.
+    log(`  ℹ loop:contract-coherence: ${result.detail}`);
+  }
   return { ok: true };
 }
 
