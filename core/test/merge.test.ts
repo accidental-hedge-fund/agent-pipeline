@@ -748,7 +748,12 @@ test("merge: loop-isolation — no stage handler imports from merge.ts", () => {
   const stageFiles = fs.readdirSync(STAGES_DIR).filter((f) => f.endsWith(".ts"));
   // merge.ts itself is excluded — it IS the module; checking it for self-references
   // would trivially pass and is not meaningful.
-  const checkFiles = stageFiles.filter((f) => f !== "merge.ts");
+  // merge-queue.ts is a human-gated CLI surface (#676) that intentionally calls
+  // mergePr via the same merge authority model as `pipeline merge` — not part of
+  // the autonomous advance loop. Its release-when-complete path is prepare-only.
+  const checkFiles = stageFiles.filter(
+    (f) => f !== "merge.ts" && f !== "merge-queue.ts" && f !== "merge-queue-release-when-complete.ts",
+  );
 
   for (const file of checkFiles) {
     const content = fs.readFileSync(path.join(STAGES_DIR, file), "utf8");

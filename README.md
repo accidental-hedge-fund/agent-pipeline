@@ -259,6 +259,10 @@ or `$pipeline:<command>` (Codex) entry. The advance loop has no sub-command.
 /pipeline:roadmap --apply                     same, applying hygiene write-backs and opening a roadmap.md PR
 /pipeline:roadmap --next <N>                  read existing plan.json, emit top-N dependency-safe issues (no re-run)
 /pipeline:merge <pr>                          human-invoked squash-merge of a ready-to-deploy PR (no advance loop)
+/pipeline:merge-queue --milestone <title>     dry-run ordered R2D merges for a milestone (no merges)
+/pipeline:merge-queue --milestone <title> --apply  sequential merges via the existing merge surface
+/pipeline:merge-queue --milestone <title> --apply --release-when-complete --release-version minor
+                                              after a complete queue, prepare a release PR (never tags/merges/publishes)
 /pipeline:release <version>                   prepare a release PR for the given version
 /pipeline:logs [<run-id>] [-f]               list or stream pipeline run logs
 /pipeline:loop --milestone v2  $pipeline:loop --milestone v2   canonical durable multi-item run (driven in-repo by Pipeline's own supervisor)
@@ -538,6 +542,18 @@ $pipeline merge 42
 If any gate fails the command exits non-zero with a clear, actionable message identifying the specific blocker — no merge is attempted.
 
 **Invariant:** no `auto_merge` config key exists and the autonomous `advance` loop never invokes this handler. A unit test asserts the loop-isolation guarantee.
+
+## Merge-queue sub-command
+
+`pipeline merge-queue` is a **human-gated** walker over `pipeline:ready-to-deploy` PRs for a milestone. Default is dry-run (plan only). `--apply` merges candidates one at a time through the existing `pipeline merge` surface.
+
+```bash
+pipeline merge-queue --milestone v1.28.0
+pipeline merge-queue --milestone v1.28.0 --apply
+pipeline merge-queue --milestone v1.28.0 --apply --release-when-complete --release-version minor
+```
+
+**Release-when-complete (#676):** opt-in only (CLI `--release-when-complete` and/or config `merge_queue.release_when_complete: false` default). When enabled and the queue is **complete** after the drive — no remaining open R2D candidates for the selector and no held items — the command invokes the shared `pipeline release` prepare path non-interactively (`noEdit`) and opens a release PR for human review. It **never** tags, publishes to npm, or merges the release PR. Open non-R2D issues on the milestone do not block prepare (they are reported as a warning). If prepare fails after successful merges, merges stay done and the command exits non-zero with a clear error. Dry-run with the flag reports would-prepare / would-not + reason against **current** completeness and creates no PR.
 
 ## Improve sub-command
 

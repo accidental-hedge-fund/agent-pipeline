@@ -140,6 +140,13 @@ export const OPERATION_SURFACE = [
     fast: true,
   },
   {
+    name: "merge-queue",
+    desc: "Human-gated sequential merge of ready-to-deploy PRs; optional prepare-only release-when-complete",
+    argHint: "--milestone <title> [--apply] [--release-when-complete --release-version <v>]",
+    cliArgs: "merge-queue $ARGUMENTS",
+    fast: false,
+  },
+  {
     name: "release",
     desc: "Prepare a release PR for the given version",
     argHint: "<version | major | minor | patch>",

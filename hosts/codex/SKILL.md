@@ -75,6 +75,10 @@ $pipeline:sweep --apply                  same, with write-backs applied
 $pipeline:roadmap                        dependency-aware scored roadmap for the backlog (dry-run)
 $pipeline:roadmap --apply                same, with write-backs applied
 $pipeline:merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
+$pipeline:merge-queue --milestone <m>    dry-run ordered R2D merges for a milestone (no merges)
+$pipeline:merge-queue --milestone <m> --apply  sequential merges via existing merge surface
+$pipeline:merge-queue --milestone <m> --apply --release-when-complete --release-version minor
+                                         after a complete queue, prepare a release PR (never tags/merges/publishes)
 $pipeline:release <version>              prepare a release PR for the given version
 $pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
 $pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor

@@ -9,10 +9,10 @@ The host packaging SHALL expose each in-scope pipeline operation as its own
 discoverable `pipeline:<command>` command entry, rather than as a flag on a single
 `/pipeline` command. The in-scope operation set SHALL be exactly: `status`,
 `unblock`, `override`, `summary`, `doctor`, `init`, `cleanup`, `intake`, `sweep`,
-`triage`, `merge`, `release`, `roadmap`, `logs`, `loop`. On the Claude host these
-entries SHALL be invocable as `/pipeline:<command>`; on the Codex host they SHALL be
-invocable as `$pipeline:<command>`. Each entry SHALL appear in that host's
-command/skill discovery surface.
+`triage`, `merge`, `merge-queue`, `release`, `roadmap`, `logs`, `loop`. On the
+Claude host these entries SHALL be invocable as `/pipeline:<command>`; on the
+Codex host they SHALL be invocable as `$pipeline:<command>`. Each entry SHALL
+appear in that host's command/skill discovery surface.
 
 #### Scenario: Every in-scope operation has a host command entry
 
@@ -20,8 +20,8 @@ command/skill discovery surface.
 - **THEN** it SHALL contain a `pipeline:status`, `pipeline:unblock`,
   `pipeline:override`, `pipeline:summary`, `pipeline:doctor`, `pipeline:init`,
   `pipeline:cleanup`, `pipeline:intake`, `pipeline:sweep`, `pipeline:triage`,
-  `pipeline:merge`, `pipeline:release`, `pipeline:roadmap`, `pipeline:logs`, and
-  `pipeline:loop` entry
+  `pipeline:merge`, `pipeline:merge-queue`, `pipeline:release`, `pipeline:roadmap`,
+  `pipeline:logs`, and `pipeline:loop` entry
 - **AND** no in-scope operation SHALL be reachable only as a flag on the base
   `/pipeline` command
 
@@ -74,8 +74,8 @@ output. The mapping SHALL be: `pipeline:status <N>` → the read-only status mod
 <N> "<spec>"` → disposition-and-resume; `pipeline:summary <N>` → issue N's
 evidence-bundle dump; `pipeline:doctor` → standalone preflight; `pipeline:init` →
 label-ensure + config scaffold; `pipeline:cleanup` → merged-worktree sweep; and
-`pipeline:<intake|sweep|triage|merge|release|roadmap|logs>` → the existing
-identically-named keyword sub-command.
+`pipeline:<intake|sweep|triage|merge|merge-queue|release|roadmap|logs>` → the
+existing identically-named keyword sub-command.
 
 `pipeline:loop` is the single documented exception: it is a **delegating** entry
 rather than a CLI forward. It SHALL normalize its arguments and run the deterministic

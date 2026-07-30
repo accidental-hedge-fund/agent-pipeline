@@ -634,6 +634,20 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Auto-merge eligibility gate: classifies PRs as auto-merge-eligible or needs-human after deterministic policy checks and LLM judge evaluation (#306)."),
+  // Human-gated merge-queue defaults (#676). release_when_complete is prepare-only
+  // and default false — never tags/publishes/merges a release. No auto_merge key.
+  merge_queue: z
+    .object({
+      release_when_complete: z
+        .boolean()
+        .optional()
+        .describe(
+          "When true, merge-queue may prepare a release PR after a complete drive (still requires --release-version). Default false. Prepare-only: never tags, publishes, or merges the release.",
+        ),
+    })
+    .strict()
+    .optional()
+    .describe("Human-gated merge-queue defaults (#676). Opt-in release-when-complete only; no auto_merge."),
   // Stage-aware issue context snapshots (#318). Optional per-repo override for
   // the character cap on the human-comment context snapshot injected into
   // planning, review, and shipcheck prompts. Absent → default (8000) applies.
@@ -1161,6 +1175,11 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       deny_paths: fileConfig.auto_merge_eligibility?.deny_paths ?? DEFAULT_CONFIG.auto_merge_eligibility.deny_paths,
       allow_paths: fileConfig.auto_merge_eligibility?.allow_paths ?? DEFAULT_CONFIG.auto_merge_eligibility.allow_paths,
       min_confidence: fileConfig.auto_merge_eligibility?.min_confidence ?? DEFAULT_CONFIG.auto_merge_eligibility.min_confidence,
+    },
+    merge_queue: {
+      release_when_complete:
+        fileConfig.merge_queue?.release_when_complete ??
+        DEFAULT_CONFIG.merge_queue.release_when_complete,
     },
     repo_map: {
       depends_on: fileConfig.repo_map?.depends_on ?? DEFAULT_CONFIG.repo_map.depends_on,
@@ -2403,6 +2422,11 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         `#   allow_paths: [] # ${sd("auto_merge_eligibility.allow_paths", "when non-empty, any changed file not covered by this list triggers needs-human (default [])")}`,
         `#   min_confidence: ${yamlScalar(d.auto_merge_eligibility.min_confidence)} # ${sd("auto_merge_eligibility.min_confidence", "LLM judge confidence floor (0-1); outputs below this route to needs-human (default 0.8)")}`,
       ].join("\n"),
+    [
+      "",
+      "# merge_queue: # human-gated merge-queue defaults (#676) — prepare-only release-when-complete; never tags/publishes/merges",
+      `#   release_when_complete: ${yamlScalar(d.merge_queue.release_when_complete)} # ${sd("merge_queue.release_when_complete", "when true, merge-queue may prepare a release PR after a complete drive (still requires --release-version); default false")}`,
+    ].join("\n"),
     config.context_snapshot !== undefined
       ? `\ncontext_snapshot: # stage-aware issue context snapshot cap override (#318)\n${yamlBlock(config.context_snapshot, 2)}`
       : [

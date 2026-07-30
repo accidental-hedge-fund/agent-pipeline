@@ -908,6 +908,14 @@ export interface PipelineConfig {
     allow_paths: string[];
     min_confidence: number;
   };
+  /**
+   * Human-gated merge-queue defaults (#676). Opt-in release-when-complete only
+   * — prepare a release PR after a complete drive; never tags/publishes/merges.
+   * Default: release_when_complete false. No `auto_merge` key.
+   */
+  merge_queue: {
+    release_when_complete: boolean;
+  };
   // Stage-aware issue context snapshots (#318). When set, `max_chars` caps the
   // total character count of human comments included in the context snapshot
   // (oldest entries dropped first). When absent, the default (8000) applies.
@@ -1058,6 +1066,9 @@ export const DEFAULT_CONFIG: Omit<
     deny_paths: [] as string[],
     allow_paths: [] as string[],
     min_confidence: 0.8,
+  },
+  merge_queue: {
+    release_when_complete: false,
   },
   repo_map: { depends_on: [] as string[], depended_on_by: [] as string[] },
   executors: {} as Record<string, ExecutorDefinition>,

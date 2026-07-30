@@ -79,6 +79,10 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline:roadmap --apply                same, applying hygiene write-backs + opening a roadmap.md PR
 /pipeline:roadmap --next <N>             read existing plan.json, emit top-N dependency-safe issues (no re-run)
 /pipeline:merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
+/pipeline:merge-queue --milestone <m>    dry-run ordered R2D merges for a milestone (no merges)
+/pipeline:merge-queue --milestone <m> --apply  sequential merges via existing merge surface
+/pipeline:merge-queue --milestone <m> --apply --release-when-complete --release-version minor
+                                         after a complete queue, prepare a release PR (never tags/merges/publishes)
 /pipeline:release <version>              prepare a release PR for the given version
 /pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
 /pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent, no issue number)

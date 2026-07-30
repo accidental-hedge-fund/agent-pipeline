@@ -102,6 +102,27 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
+  // Human-gated merge-queue (#676): sequential R2D merges + optional prepare-only
+  // release-when-complete. Allowlist keeps merge/release flags explicit; never
+  // auto_merge. mutatesGitHub true when --apply (merges) or release prepare runs.
+  "merge-queue": {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "profile",
+      "milestone",
+      "apply",
+      "dryRun",
+      "releaseWhenComplete",
+      "releaseVersion",
+    ]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
   sweep: {
     needsIssueNumber: false,
     allowedFlags: new Set(["repoPath", "base", "profile", "apply", "repo", "dryRun"]),

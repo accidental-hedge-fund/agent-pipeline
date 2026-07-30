@@ -97,6 +97,7 @@ import {
 import { runSweep, realSweepDeps } from "./stages/sweep.ts";
 import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
 import { mergePr, realMergeDeps } from "./stages/merge.ts";
+import { runMergeQueue, realMergeQueueDeps } from "./stages/merge-queue.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -314,10 +315,21 @@ export interface CliOpts {
   maxFailureRate?: number;
   /** queue: filter eligible issues to those carrying all specified labels (repeatable). */
   label?: string[];
-  /** queue: filter eligible issues to those belonging to this milestone title. */
+  /** queue / merge-queue: filter eligible issues to those belonging to this milestone title. */
   milestone?: string;
   /** queue: filter eligible issues to those at or below this risk level (low|medium|high). */
   risk?: string;
+  /**
+   * merge-queue (#676): after a complete drive, prepare a release PR via the
+   * existing release path (prepare-only; never tags/publishes/merges). Default off.
+   * Requires --release-version. CLI ORs with config merge_queue.release_when_complete.
+   */
+  releaseWhenComplete?: boolean;
+  /**
+   * merge-queue (#676): version for release-when-complete (major|minor|patch|X.Y.Z).
+   * Required when release-when-complete is enabled.
+   */
+  releaseVersion?: string;
   /** backfill: scope the apply slice to a named capability. */
   capability?: string;
   /** config repo-map add/remove: target relationship list (default: depends_on). */
@@ -420,7 +432,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -502,8 +514,16 @@ export function buildCmd(): Command {
     .option("--concurrency <C>", "queue: maximum simultaneous pipeline runs (default: 1)", Number)
     .option("--max-failure-rate <R>", "queue: halt new launches when failure rate meets this threshold 0.0–1.0 (default: 1.0)", Number)
     .option("--label <L>", "queue: filter eligible issues to those carrying this label (repeatable)", collectRepeatable, [])
-    .option("--milestone <M>", "queue: filter eligible issues to those belonging to this milestone title")
+    .option("--milestone <M>", "queue/merge-queue: filter eligible issues to those belonging to this milestone title")
     .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)")
+    .option(
+      "--release-when-complete",
+      "merge-queue: after a complete drive, prepare a release PR for human review (opt-in; never tags, publishes, or merges the release)",
+    )
+    .option(
+      "--release-version <version>",
+      "merge-queue: version for --release-when-complete (major|minor|patch|X.Y.Z); required when release-when-complete is enabled",
+    )
     // backfill options (#327)
     .option("--capability <name>", "backfill: scope the apply slice to a named capability")
     .option("--rel <relation>", "config repo-map add/remove: depends_on or depended_on_by (default: depends_on)")
@@ -1817,6 +1837,8 @@ async function main(): Promise<void> {
   const isTriageCommand = numArg === "triage";
   // `pipeline merge <pr>` — human-invoked squash merge of a ready-to-deploy PR.
   const isMergeCommand = numArg === "merge";
+  // `pipeline merge-queue --milestone <m> [--apply] [--release-when-complete] …` (#676).
+  const isMergeQueueCommand = numArg === "merge-queue";
   // `pipeline loop ...` (#451) — deterministic preflight + delegation to goal-loop.
   // Needs no PipelineConfig and calls no gh at all (see command-registry.ts).
   const isLoopCommand = numArg === "loop";
@@ -2852,13 +2874,57 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early merge-queue dispatch — human-gated sequential R2D merges + optional
+  // release-when-complete prepare (#676). Never tags/publishes/merges a release.
+  if (isMergeQueueCommand) {
+    if (!opts.milestone || String(opts.milestone).trim() === "") {
+      console.error(
+        "pipeline merge-queue: --milestone <title> is required.\n" +
+          "  Usage: pipeline merge-queue --milestone <title> [--apply] [--dry-run]\n" +
+          "         [--release-when-complete --release-version <major|minor|patch|X.Y.Z>]\n" +
+          "  Default is dry-run (no merges). --apply performs sequential merges via the\n" +
+          "  existing merge surface. --release-when-complete is opt-in prepare-only:\n" +
+          "  never tags, publishes to npm, or merges the release PR.",
+      );
+      process.exit(2);
+    }
+    let mqCfg: import("./types.ts").PipelineConfig;
+    try {
+      mqCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
+    } catch (err) {
+      console.error(`pipeline merge-queue: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    try {
+      const result = await runMergeQueue(
+        {
+          milestone: String(opts.milestone).trim(),
+          apply: !!opts.apply,
+          releaseWhenComplete: !!opts.releaseWhenComplete,
+          releaseVersion: opts.releaseVersion,
+          releaseWhenCompleteConfig: mqCfg.merge_queue?.release_when_complete ?? false,
+          repoDir: mqCfg.repo_dir,
+          repo: mqCfg.repo,
+          baseBranch: mqCfg.base_branch,
+          releaseModel: mqCfg.roadmap?.release_model,
+        },
+        realMergeQueueDeps(mqCfg.repo_dir, mqCfg.repo),
+      );
+      if (result.exitCode !== 0) process.exit(result.exitCode);
+    } catch (err) {
+      console.error(`pipeline merge-queue: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "release", "intake", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "summary", "improve", "scoreboard", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "queue", "backfill", "evals",
       "loop",
     ];
     if (!recognized.includes(numArg)) {
