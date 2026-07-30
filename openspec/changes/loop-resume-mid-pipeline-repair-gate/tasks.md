@@ -18,6 +18,7 @@
 - [x] 3.2 Heal must not apply when stage is `ready-to-deploy` / `needs-human` / non-mid-flight, or when PR is merged / ready label present (those use ready/merged catch-up)
 - [x] 3.3 Idempotence: second reconcile with same identity leaves `in_progress` without oscillating back to `pr_opened` or emitting duplicate heal spam
 - [x] 3.4 After heal (or gate), mid-flight continuity must not depend solely on non-consuming `next_actions.advance` on `pr_opened`
+- [x] 3.5 Heal must not be gated on `!driftClass`: stranded `pr_opened` with stale `last_verified_identity` (head SHA / checks churn → `identity-mismatch` or `checks-regressed`) still restores to `in_progress`; drift remains recorded; identity is updated
 
 ## 4. Supervisor resume re-dispatch (execution-trace tests)
 

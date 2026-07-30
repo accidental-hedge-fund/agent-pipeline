@@ -937,6 +937,66 @@ test("reconcile: stranded pr_opened + mid-flight open PR heals to in_progress (#
   assert.notEqual(ledger.last_reconciliation?.next_actions["100"], "advance");
 });
 
+// Pre-fix stranded rows normally retain last_verified_identity. If the PR head
+// moved (or checks churned) before resume, classifyDrift returns a non-null
+// class (identity-mismatch / checks-regressed). The heal MUST still restore
+// pr_opened → in_progress; gating on !driftClass left these permanently stranded.
+test("reconcile: stranded pr_opened heals despite stale last_verified_identity head SHA (#712)", async () => {
+  const staleIdentity = openPrIdentity({
+    head_sha: "old-sha-before-fix",
+    checks_conclusion: "success",
+    pipeline_stage: "fix-1",
+  });
+  const liveIdentity = openPrIdentity({
+    head_sha: "new-sha-after-push",
+    checks_conclusion: "success",
+    pipeline_stage: "fix-2",
+  });
+  // Bite: without the heal ignoring non-forward drift, this pair yields
+  // identity-mismatch and the pre-fix !driftClass gate would skip restore.
+  assert.equal(classifyDrift("pr_opened", liveIdentity, staleIdentity), "identity-mismatch");
+
+  const { deps, token } = await setup("pr_opened", {}, {
+    items: {
+      "100": {
+        id: "100",
+        state: "pr_opened",
+        history: [],
+        recovery_budgets_remaining: { default: 3 },
+        last_verified_identity: staleIdentity,
+      },
+    },
+  });
+  const observeDeps = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:fix-2"] };
+    },
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return {
+        state: "open",
+        head_ref: "pipeline/100-fix",
+        head_sha: "new-sha-after-push",
+        merge_commit_sha: null,
+      };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+  }).deps;
+
+  const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "in_progress", "heal must restore despite identity-mismatch drift");
+  assert.equal(ledger.items["100"].last_verified_identity?.head_sha, "new-sha-after-push");
+  assert.equal(ledger.items["100"].history.at(-1)?.from, "pr_opened");
+  assert.equal(ledger.items["100"].history.at(-1)?.to, "in_progress");
+  // Observed drift is still recorded for audit; it must not block the heal.
+  assert.equal(result.drift.find((d) => d.item_id === "100")?.class, "identity-mismatch");
+});
+
 test("reconcile: mid-flight heal is idempotent across repeated passes (#712)", async () => {
   const { deps, token } = await setup("pr_opened");
   const observeDeps = openPrObserveDeps({ stage: "review-2" });

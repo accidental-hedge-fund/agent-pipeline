@@ -463,10 +463,14 @@ export async function reconcile(
     } else if (
       // Required legacy heal (#712 Decision 4): stranded `pr_opened` with a still
       // mid-flight open PR is restored to dispatchable `in_progress` so the
-      // supervisor re-drives it. Only runs when forward catch-up (merged/ready)
-      // did not already apply — those win via ledger-behind above. Heals only
-      // from `pr_opened`, so a second pass with the same identity is a no-op.
-      !driftClass &&
+      // supervisor re-drives it. Runs only when forward catch-up (merged/ready)
+      // did not already apply — those win via ledger-behind above. Non-forward
+      // identity drift (head SHA / PR-number mismatch, checks regression) MUST
+      // NOT suppress this heal: a pre-fix stranded row almost always carries
+      // `last_verified_identity`, and ordinary mid-flight commit/check churn
+      // would otherwise leave the item permanently non-dispatchable. Observed
+      // drift is still recorded above; heal updates `last_verified_identity`.
+      // Heals only from `pr_opened`, so a second pass is a no-op once restored.
       entry.state === "pr_opened" &&
       identity.pr_number !== null &&
       identity.pr_state === "open" &&

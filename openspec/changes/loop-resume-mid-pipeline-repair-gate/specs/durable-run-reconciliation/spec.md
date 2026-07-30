@@ -80,7 +80,7 @@ When an item's ledger state is a local non-remote-proving state and the verified
 
 ### Requirement: Reconciliation SHALL heal stranded pr_opened mid-flight items back to in_progress
 
-When the ledger state is already `pr_opened` (including rows stranded by pre-fix over-repair) and the verified identity reports an open PR with mid-flight `pipeline_stage`, and neither merged-PR nor ready-to-deploy catch-up applies, reconciliation SHALL restore the item to `in_progress` via an audited ledger history entry (and event) so the supervisor can re-dispatch it. The heal SHALL be idempotent: a subsequent reconcile with the same mid-flight open-PR identity SHALL leave the item at `in_progress` without oscillating back to `pr_opened`. The heal SHALL NOT apply when `pipeline_stage` is not mid-flight, when the PR is merged, or when `ready_label_present` is true.
+When the ledger state is already `pr_opened` (including rows stranded by pre-fix over-repair) and the verified identity reports an open PR with mid-flight `pipeline_stage`, and neither merged-PR nor ready-to-deploy catch-up applies, reconciliation SHALL restore the item to `in_progress` via an audited ledger history entry (and event) so the supervisor can re-dispatch it. The heal SHALL apply regardless of non-forward identity drift on the stranded row — including `identity-mismatch` from a changed PR head SHA or PR number, and `checks-regressed` — because pre-fix stranded rows normally retain `last_verified_identity` and ordinary mid-flight commit or check churn MUST NOT leave the item permanently non-dispatchable. Observed non-forward drift SHALL still be recorded on the reconciliation result, and the heal SHALL update `last_verified_identity` to the freshly observed identity. The heal SHALL be idempotent: a subsequent reconcile with the same mid-flight open-PR identity SHALL leave the item at `in_progress` without oscillating back to `pr_opened`. The heal SHALL NOT apply when `pipeline_stage` is not mid-flight, when the PR is merged, or when `ready_label_present` is true.
 
 #### Scenario: Stranded pr_opened at fix-2 heals to in_progress
 
@@ -88,6 +88,15 @@ When the ledger state is already `pr_opened` (including rows stranded by pre-fix
 - **THEN** reconciliation SHALL restore the item to `in_progress`
 - **AND** SHALL append a history note that records the mid-flight restore
 - **AND** the item SHALL NOT remain stranded at `pr_opened` with only non-consuming `advance`
+
+#### Scenario: Heal applies despite stale last_verified_identity head SHA
+
+- **WHEN** the ledger records `pr_opened` with a prior `last_verified_identity` whose `head_sha` differs from the freshly observed open-PR identity
+- **AND** the observed identity reports mid-flight `pipeline_stage` and no ready-to-deploy label
+- **AND** `classifyDrift` would return a non-forward class such as `identity-mismatch`
+- **THEN** reconciliation SHALL still restore the item to `in_progress`
+- **AND** SHALL update `last_verified_identity` to the observed identity
+- **AND** SHALL still record the observed non-forward drift on the reconciliation result
 
 #### Scenario: Heal is idempotent across repeated resumes
 
