@@ -9,6 +9,7 @@
 // SupervisorDeps seam — no real filesystem, process, network, or subprocess
 // access in unit tests.
 
+import { readFile as defaultReadFile } from "node:fs/promises";
 import {
   LOOP_CONTRACT_SCHEMA,
   LOOP_LEDGER_SCHEMA,
@@ -57,6 +58,12 @@ import {
   type LoopTerminalOutcome,
 } from "../loop-execution-contract.ts";
 import {
+  armProgressMirror,
+  LOOP_ITEM_PROGRESS,
+  type LoopItemProgressPayload,
+  type ProgressMirrorDeps,
+} from "./pre-merge-progress.ts";
+import {
   applyAdvanceEventsToStageProgress,
   buildStageProgressTable,
   reconcileTerminalStageProgress,
@@ -81,6 +88,9 @@ export interface DispatchItemHooks {
  *  depending on pipeline.ts. */
 export const LOOP_ITEM_ADVANCE_LINKED = "loop_item_advance_linked";
 export const LOOP_ITEM_ADVANCE_FINISHED = "loop_item_advance_finished";
+/** Shared progress kind for pre-merge gate sub-steps (#682) and future stage
+ *  progress (#611). Re-exported from the mirror module for a single name. */
+export { LOOP_ITEM_PROGRESS };
 
 /** Terminal linkage payload from a successful contract response. Prefer the
  *  real evidence ids; never invent an events path when the response omitted one. */
@@ -152,6 +162,23 @@ export interface SupervisorDeps {
    *  default — this module stays config/gh-free; the caller (e.g. `pipeline.ts`)
    *  supplies the actual auto-file behavior. */
   onDriveEnd?(result: DriveSupervisorResult): Promise<void>;
+  /**
+   * Optional pre-merge progress mirror seams (#682). When absent, production
+   * uses `fs.readFile` for the advance events path and a short poll interval.
+   * Unit tests inject a fake reader / short sleep without real FS or timers.
+   */
+  readAdvanceEventsFile?(eventsPath: string): Promise<string>;
+  progressMirrorPollMs?: number;
+  /** Override sleep used by the progress mirror (tests inject a no-op or immediate). */
+  progressMirrorSleep?(ms: number): Promise<void>;
+  /**
+   * Full override of the progress-mirror arm (tests that feed sequenced advance
+   * events without a background poll). When set, replaces `armProgressMirror`.
+   */
+  armProgressMirror?(
+    linkage: { item_id: string; pipeline_run_id: string; events?: string },
+    deps: ProgressMirrorDeps,
+  ): { stop: () => Promise<void> };
   /**
    * Read advance run-store events for stage-progress observation (#611).
    * Injected so unit tests never touch the real FS or a live child process.
@@ -618,15 +645,25 @@ export async function runSupervisorCycle(
       labelEventsBeforeDispatchByItem.set(itemId, events);
     }),
   );
-  // Per-item dispatch with durable advance-run linkage (#667) and mid-wait
-  // stage-progress observation (#611): start linkage via `onAdvanceLinked`,
-  // poll the confirmed advance events.jsonl for material stage/round changes,
-  // terminal linkage after the response (or rejection) settles. Stage
-  // projection writes go through the store's ledger/event seams — never a
-  // GitHub stage-label write or per-stage verb.
+  // Per-item dispatch with durable advance-run linkage (#667), mid-wait
+  // stage-progress observation (#611), and optional pre-merge progress mirror
+  // (#682): start linkage via `onAdvanceLinked`, poll advance events for stage
+  // changes, mirror material pre-merge gate outcomes as `loop_item_progress`,
+  // terminal linkage after the response (or rejection) settles.
   const settled = await Promise.allSettled(
     activeItemIds.map(async (itemId) => {
       let startLinkage: { item_id: string; pipeline_run_id: string; events: string } | null = null;
+      let progressMirror: { stop: () => Promise<void> } | null = null;
+      const stopMirror = async (): Promise<void> => {
+        if (!progressMirror) return;
+        const m = progressMirror;
+        progressMirror = null;
+        try {
+          await m.stop();
+        } catch {
+          // best-effort — never fail the advance child for mirror I/O
+        }
+      };
       let stopObserve = false;
       let observePromise: Promise<void> = Promise.resolve();
       let eventOffset = 0;
@@ -677,10 +714,48 @@ export async function runSupervisorCycle(
               pipeline_run_id: linkage.pipeline_run_id,
               events: linkage.events,
             });
-            // Observe only after the real advance store is confirmed (events path known).
+            // Arm pre-merge progress mirror against the absolute advance events
+            // path. Append failures are non-fatal (same spirit as appendEvent).
+            if (linkage.events) {
+              const appendProgress = async (payload: LoopItemProgressPayload): Promise<void> => {
+                try {
+                  await appendEvent(deps.store, runId, token, LOOP_ITEM_PROGRESS, payload);
+                } catch {
+                  // non-fatal
+                }
+              };
+              const mirrorDeps: ProgressMirrorDeps = {
+                readAdvanceEventsFile:
+                  deps.readAdvanceEventsFile ??
+                  (async (eventsPath: string) => {
+                    try {
+                      return await defaultReadFile(eventsPath, "utf8");
+                    } catch (err) {
+                      if ((err as NodeJS.ErrnoException).code === "ENOENT") return "";
+                      throw err;
+                    }
+                  }),
+                appendProgress,
+                sleep:
+                  deps.progressMirrorSleep ??
+                  ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))),
+                pollIntervalMs: deps.progressMirrorPollMs,
+              };
+              const arm = deps.armProgressMirror ?? armProgressMirror;
+              progressMirror = arm(
+                {
+                  item_id: linkage.item_id,
+                  pipeline_run_id: linkage.pipeline_run_id,
+                  events: linkage.events,
+                },
+                mirrorDeps,
+              );
+            }
+            // Observe stage progress only after the real advance store is confirmed.
             startObserver();
           },
         });
+        await stopMirror();
         stopObserve = true;
         await observePromise.catch(() => {});
         const outcome = normalizeLoopOutcome(response.outcome);
@@ -700,6 +775,7 @@ export async function runSupervisorCycle(
         }).catch(() => {});
         return response;
       } catch (err) {
+        await stopMirror();
         stopObserve = true;
         await observePromise.catch(() => {});
         // Rejection path: still record terminal failure linkage. When start

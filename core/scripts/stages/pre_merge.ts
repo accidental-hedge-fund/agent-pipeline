@@ -114,8 +114,33 @@ import { VISUAL_PUBLISH_COMMIT_PREFIX } from "./visual.ts";
 import type { CheckRun, Outcome, PipelineConfig, ReviewFinding, Stage } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import { readEvents } from "../run-store.ts";
-import type { RunStoreDeps, StageAccountingEvent } from "../run-store.ts";
+import type { GateResultEvent, RunStoreDeps, StageAccountingEvent } from "../run-store.ts";
 import { runTestGate } from "../testgate.ts";
+
+/**
+ * Best-effort `gate_result` append for pre-merge observability (#682). Never
+ * throws; never changes gate decisions. Used so the loop progress mirror can
+ * map CI / delta / auto-fix outcomes without inventing event shapes.
+ */
+async function recordPreMergeGateResult(
+  deps: { runDir?: string; runStoreDeps?: RunStoreDeps },
+  gate: string,
+  result: GateResultEvent["result"],
+  reason?: string,
+  extra?: { mode?: string },
+): Promise<void> {
+  if (!deps.runDir) return;
+  const event: GateResultEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "gate_result",
+    at: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+    gate,
+    result,
+    ...(reason !== undefined ? { reason } : {}),
+    ...(extra?.mode !== undefined ? { mode: extra.mode } : {}),
+  };
+  await appendEvent(deps.runDir, event, deps.runStoreDeps).catch(() => {});
+}
 
 const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
 
@@ -545,6 +570,13 @@ export interface PreMergePollingContext {
    *  compute the archive-only diff. Captured once at the start of the first
    *  poll that reaches the archive step. */
   preArchiveSha?: string;
+  /**
+   * True after a `gate_result` with `gate: "ci"` / `result: "partial"` was
+   * written for the current CI waiting stretch (#682). Prevents per-poll
+   * waiting spam on the advance event stream (and therefore on the loop
+   * progress mirror).
+   */
+  ciWaitingGateRecorded?: boolean;
   /** Head SHA for which an automatic failed-workflow re-run was already attempted (#679). */
   ciRerunAttemptedForSha?: string;
   /** Head SHA for which archive-only failed-run close+reopen recovery was attempted (#679). */
@@ -1114,6 +1146,13 @@ export async function advance(
     console.log(
       `[pipeline] #${issueNumber}: ci_mode: local — local test gate passed; skipping GitHub Actions wait`,
     );
+    // Observability (#682): local green is a definitive CI pass for the mirror.
+    await recordPreMergeGateResult(
+      { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+      "ci",
+      "pass",
+      "ci_mode: local",
+    );
     // Local test gate passed: fall through to Step 2 (mergeability) and Step 2.5 (OpenSpec).
     // Do NOT return early — the downstream gates must still run.
   } else {
@@ -1165,6 +1204,17 @@ export async function advance(
           }
         }
       }
+      // Observability (#682): at most one ci/waiting gate_result per continuous
+      // wait stretch so loop mirrors are not spammed by CI poll ticks.
+      if (!ctx?.ciWaitingGateRecorded) {
+        if (ctx) ctx.ciWaitingGateRecorded = true;
+        await recordPreMergeGateResult(
+          { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+          "ci",
+          "partial",
+          "CI still running",
+        );
+      }
       return { advanced: false, status: "waiting", reason: "CI still running" };
     }
 
@@ -1174,7 +1224,7 @@ export async function advance(
         const b = (c.bucket ?? "").toLowerCase();
         return b === "fail" || b === "cancel";
       });
-      return handleDefinitiveCiFailure(cfg, issueNumber, prNumber, prDetail.head_sha, failedChecks, opts, {
+      const recoveryOut = await handleDefinitiveCiFailure(cfg, issueNumber, prNumber, prDetail.head_sha, failedChecks, opts, {
         getForIssueFn,
         setBlockedFn,
         tryRebaseAndPushFn,
@@ -1189,7 +1239,36 @@ export async function advance(
         runCiAssertionFixFn,
         stateDir: opts.stateDir,
       });
+      // Observability for the loop progress mirror (#682).
+      if (recoveryOut.status === "blocked") {
+        await recordPreMergeGateResult(
+          { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+          "ci",
+          "fail",
+          recoveryOut.reason ?? "CI failed",
+        );
+        if (opts.pollingCtx) opts.pollingCtx.ciWaitingGateRecorded = false;
+      } else if (recoveryOut.status === "waiting") {
+        // New waiting stretch after a recovery attempt: allow another ci/waiting event.
+        if (opts.pollingCtx) opts.pollingCtx.ciWaitingGateRecorded = false;
+        await recordPreMergeGateResult(
+          { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+          "ci",
+          "partial",
+          recoveryOut.reason ?? "CI recovery in progress",
+        );
+        if (opts.pollingCtx) opts.pollingCtx.ciWaitingGateRecorded = true;
+      }
+      return recoveryOut;
     }
+
+    // Definitive green CI (github mode) — observability for the loop mirror (#682).
+    await recordPreMergeGateResult(
+      { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+      "ci",
+      "pass",
+    );
+    if (opts.pollingCtx) opts.pollingCtx.ciWaitingGateRecorded = false;
   }
 
   // ---- Step 2: mergeability ----
@@ -2225,6 +2304,11 @@ export async function enforceReviewShaGate(
         }
         // Delta review approves (or findings all below policy): pre-merge proceeds.
         console.log(`[pipeline] #${issueNumber}: pre-merge delta review approved; proceeding`);
+        await recordPreMergeGateResult(
+          { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+          "delta-review",
+          "pass",
+        );
         return null;
       }
 
@@ -2238,6 +2322,13 @@ export async function enforceReviewShaGate(
       // left it clean with no recoverable work, so the block reason discloses
       // that outcome instead of a bare "findings; fix required" message.
       let autoFixDiagnostic: string | undefined;
+      // Observability (#682): needs-attention with blocking count for the loop mirror.
+      await recordPreMergeGateResult(
+        { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+        "delta-review",
+        "fail",
+        `blocking_count=${partition.blocking.length}`,
+      );
       const attemptAutoFixFn = deps.attemptPreMergeAutoFix;
       if (attemptAutoFixFn && allBlockingAutoFixable(partition.blocking)) {
         // One-attempt bound (crash-safe): detect a prior auto-fix commit by
@@ -2260,6 +2351,12 @@ export async function enforceReviewShaGate(
         }
 
         if (!priorAutoFix) {
+          await recordPreMergeGateResult(
+            { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+            "pre-merge-autofix",
+            "partial",
+            "attempted",
+          );
           // Scope the fix prompt to blocking findings only — not the full delta
           // comment which may include advisory/non-blocking findings (#359 R2 F3).
           const blockingOnlyBody = formatDeltaReviewComment(
@@ -2493,16 +2590,50 @@ export async function enforceReviewShaGate(
               console.log(
                 `[pipeline] #${issueNumber}: pre-merge auto-fix re-review approved; proceeding`,
               );
+              await recordPreMergeGateResult(
+                { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+                "pre-merge-autofix",
+                "pass",
+              );
+              // Mirror the initial-approval path: the post-fix re-review is the
+              // approving delta-review verdict that completed the gate (#682 9b5d8c51).
+              // Without this, the loop stream shows needs-attention + autofix
+              // success but never the delta-review approve outcome.
+              await recordPreMergeGateResult(
+                { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+                "delta-review",
+                "pass",
+              );
               return null;
             }
             // Re-review still blocks or returned unparseable output: fall through to block below.
+            await recordPreMergeGateResult(
+              { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+              "pre-merge-autofix",
+              "fail",
+              "exhausted",
+            );
+          } else {
+            // fixRes.status === "error": fall through to block below.
+            await recordPreMergeGateResult(
+              { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+              "pre-merge-autofix",
+              "fail",
+              "exhausted",
+            );
           }
-          // fixRes.status === "error": fall through to block below.
           if (fixRes.status === "error" && fixRes.diagnostic) {
             autoFixDiagnostic = fixRes.diagnostic;
           }
+        } else {
+          // Prior auto-fix attempt detected: bound exhausted.
+          await recordPreMergeGateResult(
+            { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+            "pre-merge-autofix",
+            "fail",
+            "exhausted",
+          );
         }
-        // Prior auto-fix attempt detected: fall through to block below.
       }
 
       // Re-validate HEAD one last time before granting blocking authority (#481
