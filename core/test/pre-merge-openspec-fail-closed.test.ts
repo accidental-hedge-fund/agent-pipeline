@@ -209,6 +209,8 @@ test("unarchivedChangeIdsFromPrFiles: pure helper matches the guard's own semant
 test("enforceOpenspecActiveChangeGuard: PR still introduces an unarchived change → blocks naming it", async (t) => {
   const blockedCalls: Array<{ reason: string; label: string }> = [];
   const deps: AdvancePreMergeDeps = {
+    // Force path-list fallback (no on-disk worktree for this residual probe).
+    getForIssue: (async () => null) as AdvancePreMergeDeps["getForIssue"],
     getPrDiff: async () => "diff --git a/openspec/changes/foo/proposal.md b/openspec/changes/foo/proposal.md\n",
     setBlocked: (async (_cfg, _n, reason, _stage, label) => {
       blockedCalls.push({ reason, label });
@@ -229,6 +231,7 @@ test("enforceOpenspecActiveChangeGuard: PR still introduces an unarchived change
 
 test("enforceOpenspecActiveChangeGuard: change was archived on the branch → inert", async (t) => {
   const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => null) as AdvancePreMergeDeps["getForIssue"],
     getPrDiff: async () =>
       "diff --git a/openspec/changes/archive/foo/proposal.md b/openspec/changes/archive/foo/proposal.md\n",
     setBlocked: async () => { throw new Error("must not be called"); },
@@ -240,6 +243,7 @@ test("enforceOpenspecActiveChangeGuard: change was archived on the branch → in
 
 test("enforceOpenspecActiveChangeGuard: PR touches no OpenSpec changes → inert", async (t) => {
   const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => null) as AdvancePreMergeDeps["getForIssue"],
     getPrDiff: async () => "diff --git a/src/index.ts b/src/index.ts\n",
     setBlocked: async () => { throw new Error("must not be called"); },
   };
@@ -248,9 +252,35 @@ test("enforceOpenspecActiveChangeGuard: PR touches no OpenSpec changes → inert
   assert.equal(out, null);
 });
 
+test("enforceOpenspecActiveChangeGuard: tip-tree active dir blocks even when PR paths also list archive (#714 cb86b57e)", async (t) => {
+  const blockedCalls: Array<{ reason: string; label: string }> = [];
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    listChangeDirs: () => ["foo"],
+    // Path-subtraction alone would clear foo; tip tree must win.
+    getPrDiff: async () =>
+      "diff --git a/openspec/changes/foo/proposal.md b/openspec/changes/foo/proposal.md\n" +
+      "diff --git a/openspec/changes/archive/2026-07-30-foo/proposal.md b/openspec/changes/archive/2026-07-30-foo/proposal.md\n",
+    setBlocked: (async (_cfg, _n, reason, _stage, label) => {
+      blockedCalls.push({ reason, label });
+    }) as AdvancePreMergeDeps["setBlocked"],
+  };
+
+  let out: Awaited<ReturnType<typeof enforceOpenspecActiveChangeGuard>> = null;
+  await quiet(t, async () => {
+    out = await enforceOpenspecActiveChangeGuard(cfg, ISSUE, PR, deps);
+  });
+
+  assert.notEqual(out, null);
+  assert.equal((out as { status: string })?.status, "blocked");
+  assert.equal(blockedCalls[0].label, "openspec-invalid");
+  assert.match(blockedCalls[0].reason, /foo/);
+});
+
 test("enforceOpenspecActiveChangeGuard: PR diff fetch fails → fails closed (blocked, not a thrown exception)", async (t) => {
   const blockedCalls: Array<{ reason: string; label: string }> = [];
   const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => null) as AdvancePreMergeDeps["getForIssue"],
     getPrDiff: async () => { throw new Error("gh: authentication required"); },
     setBlocked: (async (_cfg, _n, reason, _stage, label) => {
       blockedCalls.push({ reason, label });
@@ -289,8 +319,10 @@ test("advance(): #464 shape — worktree misreports OpenSpec inactive but the PR
     // guards against — whichever silent-skip condition fired for #464).
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => false,
-    // The PR's own file list (head-side, worktree-independent) still shows the
-    // change #464 introduced, unarchived.
+    // Tip-tree still has the active change dir (#714: residual uses listChangeDirs
+    // when a worktree is present).
+    listChangeDirs: () => ["finding-level-reversal-matching"],
+    // The PR's own file list still shows the change #464 introduced, unarchived.
     getPrDiff: async () =>
       "diff --git a/openspec/changes/finding-level-reversal-matching/proposal.md " +
       "b/openspec/changes/finding-level-reversal-matching/proposal.md\n",

@@ -277,19 +277,21 @@ export function changeIdFromArchiveFolderName(folder: string): string {
 }
 
 /**
- * Shared active-change set for a PR head path list (#714 / #467).
- *
- * Single source of truth for both pre-merge archive candidate discovery and the
- * residual still-active guard: pure over path strings, never the local worktree.
+ * Worktree-independent residual probe from a cumulative PR changed-file list
+ * (#467 / #714). Pure over path strings.
  *
  * - `activeIds` = ids appearing as `openspec/changes/<id>/…` (id ≠ `archive`)
  * - `archivedIds` = ids from `openspec/changes/archive/<folder>/…`, with
  *   date-prefixed folders (`YYYY-MM-DD-<id>`) normalized to bare `<id>`
  * - returns `activeIds \ archivedIds` (stable sort for deterministic reasons)
  *
- * Dual-outcome fingerprints this helper is meant to end (see #714):
- * - #626 skip→block: worktree candidate probe empty while this set is non-empty
- * - #675 partial multi-pass: pass listed ids not cleared from this residual set
+ * **Limitation:** a cumulative PR file list can list both an archive path and a
+ * later-reintroduced `openspec/changes/<id>/` for the same id; subtraction then
+ * wrongly yields empty. When a synchronized worktree (or other tip-tree view) is
+ * available, pre-merge MUST derive membership from that tip tree
+ * (`listChangeDirs` / post-sync HEAD) instead of this helper — see #714 review
+ * finding on archive-path masking. This helper remains the missing-worktree /
+ * path-only fallback for the residual guard and archive step.
  */
 export function unarchivedChangeIdsFromPrFiles(paths: string[]): string[] {
   const active = new Set<string>();
@@ -311,8 +313,8 @@ export function unarchivedChangeIdsFromPrFiles(paths: string[]): string[] {
 }
 
 /**
- * Alias for the shared active-change set helper (#714). Prefer this name at
- * call sites that drive archive candidates or residual membership together.
+ * Alias for the path-list residual helper. Prefer tip-tree membership
+ * (`listChangeDirs` on the reviewed head) when a synchronized worktree exists.
  */
 export const sharedActiveChangeIdsFromPaths = unarchivedChangeIdsFromPrFiles;
 

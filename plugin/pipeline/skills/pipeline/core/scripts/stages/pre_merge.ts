@@ -930,6 +930,8 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   gitInWorktree?: typeof gitInWorktree;
   openspecIsActive?: typeof openspec.isActive;
   changeDirExists?: typeof openspec.changeDirExists;
+  /** Tip-tree listing of active change dirs (`openspec/changes/<id>/`, excl. archive). */
+  listChangeDirs?: typeof openspec.listChangeDirs;
   openspecArchive?: typeof openspec.archive;
   /** Per-commit paths for all non-pipeline-internal branch commits (guard input). */
   branchDeveloperCommits?: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
@@ -3255,14 +3257,15 @@ export async function archiveAlreadyDone(
 }
 
 /**
- * Head-side postcondition (#467, design D1): before pre-merge advances, block
- * while the PR's own changed-file list still carries an `openspec/changes/<id>/`
- * path (id ≠ `archive`) not matched by a corresponding
- * `openspec/changes/archive/<id>/` path in that same file list. Computed purely
- * from `getPrDiff` → `diffFilePaths` — never the local worktree filesystem — so
- * it behaves identically on a first run, an override-resumed run, a fresh
- * process, or after the worktree has been removed. Returns `null` to continue
- * when nothing remains active.
+ * Head-side postcondition (#467 / #714): before pre-merge advances, block while
+ * any OpenSpec change remains active on the reviewed PR tip.
+ *
+ * Prefer tip-tree membership from the on-disk worktree (`listChangeDirs`) when
+ * available — same source as archive candidates after base sync — so a prior
+ * archive path in the cumulative PR diff cannot mask a reintroduced active dir.
+ * When no worktree is on disk, fall back to the pure PR changed-file helper
+ * (`sharedActiveChangeIdsFromPaths`) so the guard still works after the worktree
+ * has been removed. Returns `null` to continue when nothing remains active.
  */
 export async function enforceOpenspecActiveChangeGuard(
   cfg: PipelineConfig,
@@ -3272,6 +3275,27 @@ export async function enforceOpenspecActiveChangeGuard(
 ): Promise<Outcome | null> {
   const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
+  const getForIssueFn = deps.getForIssue ?? getOnDiskForIssue;
+  const listChangeDirsFn = deps.listChangeDirs ?? openspec.listChangeDirs;
+
+  // Tip-tree first when a worktree exists (authoritative final head state).
+  // Lookup failures fall through to the PR path helper — do not fail open/closed
+  // solely on bookkeeping errors when the path-list probe can still run.
+  let wt: { path: string; slug: string } | null = null;
+  try {
+    wt = await getForIssueFn(cfg, issueNumber);
+  } catch {
+    wt = null;
+  }
+  if (wt) {
+    const remaining = [...listChangeDirsFn(wt.path)].sort();
+    if (remaining.length === 0) return null;
+    const reason =
+      `Pre-merge cannot advance: OpenSpec change(s) still active on this PR: ${remaining.join(", ")}. ` +
+      `Run \`openspec archive <id>\` for each and push before pre-merge can continue.`;
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+    return preMergeBlocked(reason, "openspec-invalid");
+  }
 
   let diff: string;
   try {
@@ -3285,7 +3309,7 @@ export async function enforceOpenspecActiveChangeGuard(
     await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
     return preMergeBlocked(reason, "needs-human");
   }
-  // Same pure helper as maybeArchiveOpenspec candidate membership (#714).
+  // Missing-worktree fallback only — path-list subtraction can mask reintroduction.
   const remaining = openspec.sharedActiveChangeIdsFromPaths(diffFilePaths(diff));
   if (remaining.length === 0) return null;
 
@@ -3327,6 +3351,7 @@ export async function maybeArchiveOpenspec(
   const gitFn = deps.gitInWorktree ?? gitInWorktree;
   const isActiveFn = deps.openspecIsActive ?? openspec.isActive;
   const changeDirExistsFn = deps.changeDirExists ?? openspec.changeDirExists;
+  const listChangeDirsFn = deps.listChangeDirs ?? openspec.listChangeDirs;
   const archiveFn = deps.openspecArchive ?? openspec.archive;
   const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
   const branchDeveloperCommitsFn =
@@ -3403,31 +3428,10 @@ export async function maybeArchiveOpenspec(
     return null;
   }
 
-  // ---- Shared active-change set (#714) ----
-  // Prefer the PR tip path list (same helper as enforceOpenspecActiveChangeGuard)
-  // so archive candidates cannot disagree with the residual still-active check for
-  // the same head evaluation. Without a PR number (tests / edge), fall back to a
-  // local git diff after archive-base sync below.
-  let sharedActiveFromPr: string[] | null = null;
-  if (prNumber !== undefined) {
-    let prPaths: string[];
-    try {
-      prPaths = diffFilePaths(await getPrDiffFn(cfg, prNumber));
-    } catch (err) {
-      const reason =
-        `Cannot determine active OpenSpec change candidates — fetching the PR diff failed ` +
-        `(${(err as Error).message}). Check gh auth/network and re-run.`;
-      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
-      await recordDecision("fail", reason);
-      return preMergeBlocked(reason, "needs-human");
-    }
-    sharedActiveFromPr = openspec.sharedActiveChangeIdsFromPaths(prPaths);
-    // True empty shared set: skip before cleanliness/sync (nothing to archive).
-    if (sharedActiveFromPr.length === 0) {
-      await recordDecision("skipped", "no-candidates");
-      return null;
-    }
-  }
+  // Shared active-change set is finalized ONLY after archive-base sync below
+  // (#714). Do not emit `no-candidates` from a pre-sync PR path probe — an empty
+  // cumulative PR diff must not bypass the required fail-closed base sync, and
+  // tip-tree membership (not archive-path subtraction) is the membership rule.
 
   // Pre-archive cleanliness guard: the commit-failure rollback below is destructive
   // (`git restore .` + `git clean -fd openspec/`), so it is provably lossless ONLY when
@@ -3521,49 +3525,64 @@ export async function maybeArchiveOpenspec(
   }
 
   // ---- Final candidates after sync (#714) ----
-  // Shared set = PR tip membership (when available). Fall back to post-sync git
-  // diff only when no PR number was supplied (unit-test / edge path).
-  let sharedActive: string[];
-  if (sharedActiveFromPr !== null) {
-    sharedActive = sharedActiveFromPr;
-  } else {
-    const diff = await gitFn(
-      wt.path,
-      ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
-      { ignoreFailure: true },
-    );
-    if (diff.code !== 0) {
-      // Fail closed (#467): a failed probe must never be read as "no candidates" —
-      // `ignoreFailure: true` only suppresses the throw, not the meaning of a non-zero exit.
-      const detail = (diff.stderr || diff.stdout || "(no output)").trim();
-      const reason =
-        `Cannot determine active OpenSpec change candidates — ` +
-        `\`git diff --name-only origin/${cfg.base_branch}...HEAD\` failed (exit ${diff.code}): ${detail}`;
-      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
-      await recordDecision("fail", reason);
-      return preMergeBlocked(reason, "openspec-invalid");
+  // Shared active-change set = active change dirs on the synchronized reviewed
+  // head tree. Never subtract archive-folder ids from a cumulative PR changed-file
+  // list: a branch that archived `foo` then reintroduced `openspec/changes/foo/`
+  // still has both path families in the PR diff, which would mask the reintroduced
+  // id (#714 review 1 / cb86b57e).
+  let sharedActive = [...listChangeDirsFn(wt.path)].sort();
+
+  // Injectable-test / empty-listing fallback: when the tip-tree listing is empty,
+  // allow path hints ∩ changeDirExists so unit tests that only stub path probes
+  // and changeDirExists still exercise the archive path. Path hints use
+  // changeIdsFromPaths (active paths only — no archive-folder subtraction).
+  if (sharedActive.length === 0) {
+    let pathHints: string[] = [];
+    if (prNumber !== undefined) {
+      try {
+        pathHints = openspec.changeIdsFromPaths(diffFilePaths(await getPrDiffFn(cfg, prNumber)));
+      } catch (err) {
+        const reason =
+          `Cannot determine active OpenSpec change candidates — fetching the PR diff failed ` +
+          `(${(err as Error).message}). Check gh auth/network and re-run.`;
+        await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
+        await recordDecision("fail", reason);
+        return preMergeBlocked(reason, "needs-human");
+      }
+    } else {
+      const diff = await gitFn(
+        wt.path,
+        ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
+        { ignoreFailure: true },
+      );
+      if (diff.code !== 0) {
+        // Fail closed (#467): a failed probe must never be read as "no candidates".
+        const detail = (diff.stderr || diff.stdout || "(no output)").trim();
+        const reason =
+          `Cannot determine active OpenSpec change candidates — ` +
+          `\`git diff --name-only origin/${cfg.base_branch}...HEAD\` failed (exit ${diff.code}): ${detail}`;
+        await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+        await recordDecision("fail", reason);
+        return preMergeBlocked(reason, "openspec-invalid");
+      }
+      pathHints = openspec.changeIdsFromPaths(
+        diff.stdout.split("\n").map((s) => s.trim()).filter(Boolean),
+      );
     }
-    // Worktree path list has no archive-folder subtraction; active ids that still
-    // have a dir are the candidates (shared set for this fallback).
-    sharedActive = openspec
-      .changeIdsFromPaths(diff.stdout.split("\n").map((s) => s.trim()).filter(Boolean))
-      .filter((id) => changeDirExistsFn(wt.path, id))
-      .sort();
-    if (sharedActive.length === 0) {
-      await recordDecision("skipped", "no-candidates");
-      return null;
-    }
+    sharedActive = pathHints.filter((id) => changeDirExistsFn(wt.path, id)).sort();
   }
 
-  // Intersect PR-active ids with post-sync worktree dirs. Missing dir for a
-  // PR-active id fails closed — never silent no-candidates (#714 / #626).
+  if (sharedActive.length === 0) {
+    await recordDecision("skipped", "no-candidates");
+    return null;
+  }
+
+  // Tip-tree membership already implies dirs exist; keep the filter for the
+  // path-hint fallback and any concurrent dir removal.
   const candidates = sharedActive.filter((id) => changeDirExistsFn(wt.path, id));
   if (candidates.length === 0) {
     return blockResidualActive(sharedActive);
   }
-  // If the PR shared set is a strict superset of on-disk candidates, still try
-  // the dirs we have — residual after archive (or the head-side guard) names the rest.
-  // Prefer archiving what we can; fail closed on leftovers after attempts.
 
   // ---- Consistency guard (#106): never archive a delta the code outgrew ----
   // OpenSpec deltas are frozen at planning; fix rounds only edit code. If a

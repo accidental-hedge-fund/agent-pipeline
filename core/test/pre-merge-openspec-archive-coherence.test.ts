@@ -150,25 +150,32 @@ test("maybeArchiveOpenspec #626: PR-active id with empty worktree diff archives 
   assert.equal(blocked.length, 0, "must not residual-block after a successful archive of the only id");
 });
 
-test("maybeArchiveOpenspec #626: PR-active id with no on-disk dir blocks once (no skip/no-candidates)", async (t) => {
+test("maybeArchiveOpenspec #626: PR path claim without tip-tree dir → no-candidates after sync (tip is truth)", async (t) => {
+  // Cumulative PR paths can still list a deleted active path; tip-tree membership
+  // (listChangeDirs / changeDirExists) is authoritative after base sync (#714).
   const CHANGE_ID = "single-source-stages-docs";
   const appended: string[] = [];
   const archiveCalls: string[] = [];
-  const blocked: Array<{ reason: string; kind?: string }> = [];
+  const gitCalls: string[][] = [];
+  const baseGit = syncedGitFake({})!;
 
   const deps: AdvancePreMergeDeps = {
     getForIssue: (async () => ({ path: "/wt", slug: SLUG, branch: BRANCH })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => true,
     getPrDiff: async () => prDiffFor(CHANGE_ID),
-    gitInWorktree: syncedGitFake({}),
+    gitInWorktree: (async (p, args) => {
+      gitCalls.push([...args]);
+      return baseGit(p, args);
+    }) as AdvancePreMergeDeps["gitInWorktree"],
+    listChangeDirs: () => [],
     changeDirExists: () => false,
     openspecArchive: (async (_w, id) => {
       archiveCalls.push(id);
       return { success: true, unavailable: false, output: "" };
     }) as AdvancePreMergeDeps["openspecArchive"],
-    setBlocked: (async (_c, _n, reason, _s, kind) => {
-      blocked.push({ reason, kind });
-    }) as AdvancePreMergeDeps["setBlocked"],
+    setBlocked: async () => {
+      throw new Error("must not block when tip tree has no active dirs");
+    },
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
     branchDeveloperCommits: async () => [],
     trustedReviewAuthor: "test-actor",
@@ -183,13 +190,14 @@ test("maybeArchiveOpenspec #626: PR-active id with no on-disk dir blocks once (n
 
   const events = gateResults(appended);
   assert.equal(events.length, 1);
-  assert.equal(events[0].result, "fail");
-  assert.notEqual(events[0].reason, "no-candidates");
+  assert.equal(events[0].result, "skipped");
+  assert.equal(events[0].reason, "no-candidates");
   assert.deepEqual(archiveCalls, [], "no archive attempt without an on-disk dir");
-  assert.equal((out as { status: string })?.status, "blocked");
-  assert.equal(blocked[0]?.kind, "openspec-invalid");
-  assert.match(blocked[0]?.reason ?? "", new RegExp(CHANGE_ID));
-  assert.match(blocked[0]?.reason ?? "", /openspec archive/);
+  assert.equal(out, null);
+  assert.ok(
+    gitCalls.some((a) => a[0] === "fetch"),
+    "empty tip decision must still complete archive-base sync first (#714 / 50c7af06)",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -328,6 +336,111 @@ test("maybeArchiveOpenspec: stacked id only on PR tip is archived after base syn
 // ---------------------------------------------------------------------------
 // Archive no-op with non-empty shared set must not skip as no-candidates
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// #714 review 1: reintroduced active after prior archive must not be masked
+// ---------------------------------------------------------------------------
+
+test("maybeArchiveOpenspec: prior archive path in PR diff does not mask reintroduced active dir (#714 cb86b57e)", async (t) => {
+  // Cumulative PR list has both archive/…-foo/ and reintroduced openspec/changes/foo/.
+  // Path-subtraction helper yields []; tip-tree membership must still archive foo.
+  const CHANGE_ID = "foo";
+  const archiveCalls: string[] = [];
+  const activeDirs = new Set([CHANGE_ID]);
+  const appended: string[] = [];
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: SLUG, branch: BRANCH })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    getPrDiff: async () =>
+      `diff --git a/openspec/changes/${CHANGE_ID}/proposal.md b/openspec/changes/${CHANGE_ID}/proposal.md\n` +
+      `diff --git a/openspec/changes/archive/2026-07-30-${CHANGE_ID}/proposal.md b/openspec/changes/archive/2026-07-30-${CHANGE_ID}/proposal.md\n`,
+    gitInWorktree: syncedGitFake({
+      archived: () => archiveCalls.length > 0,
+    }),
+    listChangeDirs: () => [...activeDirs],
+    changeDirExists: (_d, id) => activeDirs.has(id),
+    openspecArchive: (async (_w, id) => {
+      archiveCalls.push(id);
+      activeDirs.delete(id);
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+    setBlocked: async () => {
+      throw new Error("must not block when reintroduced active dir is present on tip");
+    },
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    branchDeveloperCommits: async () => [],
+    trustedReviewAuthor: "test-actor",
+    runDir: "/runs/714-reintro",
+    runStoreDeps: appendOnlyRunStore(appended),
+  };
+
+  let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
+  await quiet(t, async () => {
+    out = await maybeArchiveOpenspec(cfg, ISSUE, "run-1", deps, undefined, PR);
+  });
+
+  const events = gateResults(appended);
+  assert.equal(events.length, 1);
+  assert.notEqual(events[0].result, "skipped", "must not skip/no-candidates when tip has reintroduced active dir");
+  assert.notEqual(events[0].reason, "no-candidates");
+  assert.deepEqual(archiveCalls, [CHANGE_ID]);
+  assert.equal(events[0].result, "pass");
+  assert.equal(events[0].reason, CHANGE_ID);
+  assert.equal((out as { status: string })?.status, "waiting");
+});
+
+// ---------------------------------------------------------------------------
+// #714 review 1: empty PR path list must not skip before archive-base sync
+// ---------------------------------------------------------------------------
+
+test("maybeArchiveOpenspec: empty PR paths still sync; sync failure blocks (not no-candidates) (#714 50c7af06)", async (t) => {
+  const appended: string[] = [];
+  const blocked: Array<{ reason: string; kind?: string }> = [];
+  let fetchCalled = false;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: SLUG, branch: BRANCH })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    // Empty cumulative PR file list — old code skipped before sync.
+    getPrDiff: async () => "",
+    gitInWorktree: (async (_p, args) => {
+      if (args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+      if (args[0] === "fetch") {
+        fetchCalled = true;
+        return { stdout: "", stderr: "network unreachable", code: 128 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"],
+    listChangeDirs: () => [],
+    changeDirExists: () => false,
+    openspecArchive: async () => {
+      throw new Error("must not archive");
+    },
+    setBlocked: (async (_c, _n, reason, _s, kind) => {
+      blocked.push({ reason, kind });
+    }) as AdvancePreMergeDeps["setBlocked"],
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    branchDeveloperCommits: async () => [],
+    trustedReviewAuthor: "test-actor",
+    runDir: "/runs/714-empty-presync",
+    runStoreDeps: appendOnlyRunStore(appended),
+  };
+
+  let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
+  await quiet(t, async () => {
+    out = await maybeArchiveOpenspec(cfg, ISSUE, "run-1", deps, undefined, PR);
+  });
+
+  assert.equal(fetchCalled, true, "must attempt archive-base fetch even when PR paths are empty");
+  const events = gateResults(appended);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].result, "fail");
+  assert.notEqual(events[0].reason, "no-candidates");
+  assert.equal((out as { status: string })?.status, "blocked");
+  assert.equal(blocked[0]?.kind, "needs-human");
+  assert.match(blocked[0]?.reason ?? "", /fetch|sync|origin/i);
+});
 
 test("maybeArchiveOpenspec: clean status after non-empty archive set fails closed (not no-candidates)", async (t) => {
   const CHANGE_ID = "noop-change";
