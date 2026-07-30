@@ -572,7 +572,18 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 
 ## Scoreboard sub-command
 
-`pipeline scoreboard` is a **read-only** factory-control report over `.agent-pipeline/runs/*/run.json`, `events.jsonl`, and `summary.json`. It summarizes ready-to-deploy autonomy, cost per ready PR, stage accounting by issue/stage/harness/model/outcome, prompt size, run and stage durations, harness calls, fix rounds, blocker kinds, `pipeline:needs-human`, same-harness fallback, and test/eval/shipcheck pass rates. It never reads `terminal.log` and never modifies GitHub labels/comments, worktrees, config, or run artifacts.
+`pipeline scoreboard` is a **read-only** factory-control report over `.agent-pipeline/runs/*/run.json`, `events.jsonl`, and `summary.json`. It summarizes ready-to-deploy autonomy, cost per ready PR, stage accounting by issue/stage/harness/model/outcome, prompt size, run and stage durations, harness calls, fix rounds, blocker kinds, `pipeline:needs-human`, **pre-merge needs-human rate and by-class breakdown** (`ci-failed`, `delta-review`, `merge-conflict`, OpenSpec, residual `other` — from durable run events only, not issue comments), same-harness fallback, and test/eval/shipcheck pass rates. It never reads `terminal.log` and never modifies GitHub labels/comments, worktrees, config, or run artifacts.
+
+**Dogfood-day pre-merge class breakdown (#683):** for a single-day (or custom-window) machine-readable aggregate:
+
+```bash
+pipeline scoreboard --days 1 --json
+# → .metrics.pre_merge_needs_human
+#    .rate  { numerator, denominator, ratio }   # off-ramps / pre-merge entries
+#    .by_class.<class>.{ count, rate }          # same denominator; class counts sum to numerator
+```
+
+Classification is taken from enriched `blocker_set` events (`stage`, `offramp_class`, `blocker_kind`) written when pre-merge blocks; historical events without those fields still count under a residual bucket. Papercut auto-file thresholds by class rate are an explicit follow-up (out of scope for this metric).
 
 **Repeat-correction and control-attribution recurrence (#501):** the report additionally reads `correction_event` records (deduped by `correction_id`) and reports total corrections, distinct correction classes (distinct `correction_key`), the repeated-class count/rate, and corrections per ready-to-deploy item. It joins each class to `.agent-pipeline/control-attributions.jsonl` — the durable, explicit attribution ledger written only by `pipeline correction attribute` (never inferred from a closed issue or merged PR) — and reports the attributed `control_type`, `time-to-control`, and post-control recurrence classified as `recurred`, `no_recurrence_observed`, or `insufficient_post_control_evidence` (measured only over included runs that started after the control's `effective_at` and exercised the class's stage — zero such runs is never reported as "no recurrence"). Supersession and rollback are surfaced rather than hidden, and the report states only temporal attribution and recurrence evidence, never a causal claim. `--corrections-by <dimension>` (`repo`, `stage`, `harness`, `model`, `source_kind`, `failure_class`, `proposed_control`, or `implemented_control`; exactly one) adds an additive grouping section, and a top-still-recurring-classes list with sanitized evidence pointers is always included.
 
@@ -580,6 +591,7 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 /pipeline scoreboard
 /pipeline scoreboard --since 2026-06-01T00:00:00Z --until 2026-06-15T00:00:00Z
 /pipeline scoreboard --days 7
+/pipeline scoreboard --days 1 --json   # dogfood day: pre-merge needs-human by class
 /pipeline scoreboard --json
 /pipeline scoreboard --estimate-cost codex=0.75 --estimate-cost claude=1.00
 ```

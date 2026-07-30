@@ -422,7 +422,7 @@ test("enforceReviewShaGate: SHA mismatch, diff changed, delta review blocks → 
   });
   assert.deepEqual(
     out,
-    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings", blockerKind: "needs-human", offrampPathTag: "delta-review" },
     "returns blocked Outcome",
   );
   assert.deepEqual(rec.transitions, [], "must NOT route to review-2");
@@ -1598,7 +1598,7 @@ test("enforceReviewShaGate: control — verdict recorded at the current head wit
   });
   assert.deepEqual(
     out,
-    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings", blockerKind: "needs-human", offrampPathTag: "delta-review" },
   );
   assert.equal(rec.blocked.length, 1, "verdict at the head still blocks pre-merge");
   assert.deepEqual(rec.transitions, [], "must not route to a full review round");

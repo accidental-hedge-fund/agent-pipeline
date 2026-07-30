@@ -113,6 +113,8 @@ import { reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import { VISUAL_PUBLISH_COMMIT_PREFIX } from "./visual.ts";
 import type { CheckRun, Outcome, PipelineConfig, ReviewFinding, Stage } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
+import type { BlockerKind } from "../types.ts";
+import type { PreMergeOfframpPathTag } from "../pre-merge-offramp.ts";
 import { readEvents } from "../run-store.ts";
 import type { GateResultEvent, RunStoreDeps, StageAccountingEvent } from "../run-store.ts";
 import { runTestGate } from "../testgate.ts";
@@ -156,6 +158,25 @@ const VISUAL_PUBLISH_COMMIT_PATTERN = new RegExp(
   `^${VISUAL_PUBLISH_COMMIT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d+$`,
 );
 export const REBASE_MARKER_FILE = PIPELINE_INTERNAL_MARKER_FILES[0];
+
+/**
+ * Build a pre-merge blocked Outcome with explicit kind (+ optional path tag for
+ * scoreboard offramp_class mapping when kind alone is too coarse — #683).
+ */
+function preMergeBlocked(
+  reason: string,
+  kind: BlockerKind,
+  pathTag?: PreMergeOfframpPathTag,
+): Extract<Outcome, { status: "blocked" }> {
+  return {
+    advanced: false,
+    status: "blocked",
+    reason,
+    blockerKind: kind,
+    ...(pathTag !== undefined ? { offrampPathTag: pathTag } : {}),
+  };
+}
+
 
 /**
  * Commit-subject prefix for the pre-merge bounded auto-fix round (#359).
@@ -890,7 +911,7 @@ export async function advance(
   const prNumber = await getPrForIssueFn(cfg, issueNumber);
   if (!prNumber) {
     await setBlockedFn(cfg, issueNumber, "No pull request found for pre-merge gate.", "pre-merge", "needs-human");
-    return { advanced: false, status: "blocked", reason: "no PR" };
+    return preMergeBlocked("no PR", "needs-human");
   }
 
   if (opts.dryRun) {
@@ -1040,6 +1061,9 @@ export async function advance(
       // current worktree so recovery is deterministic rather than a re-run dead-end.
       const localWt = await getForIssueFn(cfg, issueNumber);
       if (!localWt) {
+        // Operational precondition (no worktree) — not a CI/local gate failure.
+        // Residual `other` (needs-human, no ci-failed path tag) so scoreboard
+        // does not inflate the ci-failed rate (#683 review 2).
         await setBlockedFn(
           cfg,
           issueNumber,
@@ -1048,7 +1072,7 @@ export async function advance(
           "pre-merge",
           "needs-human",
         );
-        return { advanced: false, status: "blocked", reason: "ci_mode: local — no worktree for inline gate" };
+        return preMergeBlocked("ci_mode: local — no worktree for inline gate", "needs-human");
       }
       const inlineResult = await runTestGateFn(
         cfg,
@@ -1061,8 +1085,8 @@ export async function advance(
         opts.runDir,
       );
       if (inlineResult.skipped) {
-        // Fail-closed: skipped means the test gate is disabled or no command was detected.
-        // ci_mode: local must not advance without a verified local exit-0 result.
+        // Fail-closed operational/config precondition (gate disabled / no command) —
+        // not an actual CI or local test failure. Residual `other` (#683 review 2).
         await setBlockedFn(
           cfg,
           issueNumber,
@@ -1072,7 +1096,10 @@ export async function advance(
           "pre-merge",
           "needs-human",
         );
-        return { advanced: false, status: "blocked", reason: "ci_mode: local — inline test gate skipped (fail-closed)" };
+        return preMergeBlocked(
+          "ci_mode: local — inline test gate skipped (fail-closed)",
+          "needs-human",
+        );
       }
       if (!inlineResult.passed) {
         await setBlockedFn(
@@ -1083,7 +1110,7 @@ export async function advance(
           "pre-merge",
           "needs-human",
         );
-        return { advanced: false, status: "blocked", reason: "ci_mode: local — inline test gate failed" };
+        return preMergeBlocked("ci_mode: local — inline test gate failed", "needs-human", "ci-failed");
       }
       if ((inlineResult.attempts ?? 0) > 0) {
         // The test gate invoked the implementer harness (test-and-fix mode) and may
@@ -1101,7 +1128,11 @@ export async function advance(
           "pre-merge",
           "needs-human",
         );
-        return { advanced: false, status: "blocked", reason: "ci_mode: local — inline gate created fix commits; push required" };
+        return preMergeBlocked(
+          "ci_mode: local — inline gate created fix commits; push required",
+          "needs-human",
+          "ci-failed",
+        );
       }
       // Verify the actual worktree HEAD matches the remote PR head. A prior inline
       // gate run may have created fix commits (attempts > 0) and blocked; if the user
@@ -1122,7 +1153,11 @@ export async function advance(
           "pre-merge",
           "needs-human",
         );
-        return { advanced: false, status: "blocked", reason: "ci_mode: local — worktree ahead of PR head; push required" };
+        return preMergeBlocked(
+          "ci_mode: local — worktree ahead of PR head; push required",
+          "needs-human",
+          "ci-failed",
+        );
       }
       localTestedSha = prDetail.head_sha;
     } else if (tgResult.outcome !== "success") {
@@ -1134,11 +1169,7 @@ export async function advance(
         "pre-merge",
         "needs-human",
       );
-      return {
-        advanced: false,
-        status: "blocked",
-        reason: "ci_mode: local — local test gate failed",
-      };
+      return preMergeBlocked("ci_mode: local — local test gate failed", "needs-human", "ci-failed");
     } else {
       localTestedSha = tgResult.prHeadSha!;
     }
@@ -1299,7 +1330,11 @@ export async function advance(
       "pre-merge",
       "needs-human",
     );
-    return { advanced: false, status: "blocked", reason: "ci_mode: local — PR head moved after SHA re-check" };
+    return preMergeBlocked(
+      "ci_mode: local — PR head moved after SHA re-check",
+      "needs-human",
+      "ci-failed",
+    );
   }
   const freshState = (freshPrDetail.mergeable_state ?? "").toUpperCase();
   const isFreshConflict = freshPrDetail.mergeable === false || freshState === "DIRTY";
@@ -1336,7 +1371,7 @@ export async function advance(
     }
     const mergeConflictMsg = "PR branch is behind the base branch and could not be automatically updated — manual rebase or update needed.";
     await setBlockedFn(cfg, issueNumber, mergeConflictMsg, "pre-merge", "merge-conflict");
-    return { advanced: false, status: "blocked", reason: mergeConflictMsg, blockerKind: "merge-conflict" };
+    return preMergeBlocked(mergeConflictMsg, "merge-conflict");
   }
   if (freshState === "BLOCKED") {
     return { advanced: false, status: "waiting", reason: "GitHub mergeability: blocked" };
@@ -1367,7 +1402,7 @@ export async function advance(
         "pre-merge",
         "openspec-invalid",
       );
-      return { advanced: false, status: "blocked", reason: "openspec validation failed" };
+      return preMergeBlocked("openspec validation failed", "openspec-invalid");
     } else {
       console.log(`[pipeline] #${issueNumber}: openspec validation passed`);
     }
@@ -1647,11 +1682,10 @@ export async function enforceReviewShaGate(
       "pre-merge",
       "needs-human",
     );
-    return {
-      advanced: false,
-      status: "blocked",
-      reason: "pre-merge: actor lookup failed — cannot verify review provenance",
-    };
+    return preMergeBlocked(
+      "pre-merge: actor lookup failed — cannot verify review provenance",
+      "needs-human",
+    );
   }
   // SHA extraction uses actor-only trust: allowlisted actors must NOT be trusted
   // for review verdict comments as any allowlisted identity could otherwise post a
@@ -1727,11 +1761,11 @@ export async function enforceReviewShaGate(
                   "pre-merge",
                   "needs-human",
                 );
-                return {
-                  advanced: false,
-                  status: "blocked",
-                  reason: `pre-merge: ${unresolved.length} unresolved blocking finding(s) from prior allowlisted runner (reviews disabled)`,
-                };
+                return preMergeBlocked(
+                  `pre-merge: ${unresolved.length} unresolved blocking finding(s) from prior allowlisted runner (reviews disabled)`,
+                  "needs-human",
+                  "delta-review",
+                );
               }
             }
           }
@@ -1804,11 +1838,11 @@ export async function enforceReviewShaGate(
       "pre-merge",
       "needs-human",
     );
-    return {
-      advanced: false,
-      status: "blocked",
-      reason: `pre-merge: ${unresolved.length} unresolved blocking finding(s) at reviewed HEAD${via}`,
-    };
+    return preMergeBlocked(
+      `pre-merge: ${unresolved.length} unresolved blocking finding(s) at reviewed HEAD${via}`,
+      "needs-human",
+      "delta-review",
+    );
   };
 
   // Exact match → the verdict still covers HEAD, but only as an approval when no
@@ -1991,11 +2025,11 @@ export async function enforceReviewShaGate(
               `unresolved blocking finding(s).`,
             "pre-merge", "needs-human",
           );
-          return {
-            advanced: false,
-            status: "blocked",
-            reason: `pre-merge delta-round ceiling: ${outstanding.length} unresolved blocking finding(s)`,
-          };
+          return preMergeBlocked(
+            `pre-merge delta-round ceiling: ${outstanding.length} unresolved blocking finding(s)`,
+            "needs-human",
+            "delta-review",
+          );
         }
 
         const existingFollowup = extractCeilingFollowupNumber(detail.comments, actor);
@@ -2690,11 +2724,11 @@ export async function enforceReviewShaGate(
           `stale block cleared — falling back to conservative re-review`,
         );
       }
-      return {
-        advanced: false,
-        status: "blocked",
-        reason: "pre-merge delta review: blocking findings",
-      };
+      return preMergeBlocked(
+        "pre-merge delta review: blocking findings",
+        "needs-human",
+        "delta-review",
+      );
     } catch (err) {
       // Diff fetch or delta review failed → fall through to full re-review (conservative).
       console.warn(
@@ -2936,7 +2970,7 @@ export async function enforceOpenspecActiveChangeGuard(
       `Pre-merge cannot verify the OpenSpec active-change guard — fetching the PR diff failed ` +
       `(${(err as Error).message}). Check gh auth/network and re-run.`;
     await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
-    return { advanced: false, status: "blocked", reason };
+    return preMergeBlocked(reason, "needs-human");
   }
   const remaining = openspec.unarchivedChangeIdsFromPrFiles(diffFilePaths(diff));
   if (remaining.length === 0) return null;
@@ -2945,7 +2979,7 @@ export async function enforceOpenspecActiveChangeGuard(
     `Pre-merge cannot advance: OpenSpec change(s) still active on this PR: ${remaining.join(", ")}. ` +
     `Run \`openspec archive <id>\` for each and push before pre-merge can continue.`;
   await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
-  return { advanced: false, status: "blocked", reason };
+  return preMergeBlocked(reason, "openspec-invalid");
 }
 
 /**
@@ -3022,7 +3056,7 @@ export async function maybeArchiveOpenspec(
         `change to archive. Restore the worktree (or gh auth) and re-run.`;
       await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
       await recordDecision("fail", reason);
-      return { advanced: false, status: "blocked", reason };
+      return preMergeBlocked(reason, "needs-human");
     }
     const remaining = openspec.unarchivedChangeIdsFromPrFiles(prPaths);
     if (remaining.length > 0) {
@@ -3032,7 +3066,7 @@ export async function maybeArchiveOpenspec(
         `(or re-run planning) so the archive step can run, then re-run the pipeline.`;
       await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
       await recordDecision("fail", reason);
-      return { advanced: false, status: "blocked", reason };
+      return preMergeBlocked(reason, "needs-human");
     }
     await recordDecision("skipped", "no-candidates");
     return null;
@@ -3057,7 +3091,7 @@ export async function maybeArchiveOpenspec(
       `\`git diff --name-only origin/${cfg.base_branch}...HEAD\` failed (exit ${diff.code}): ${detail}`;
     await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
     await recordDecision("fail", reason);
-    return { advanced: false, status: "blocked", reason };
+    return preMergeBlocked(reason, "openspec-invalid");
   }
   const candidates = openspec
     .changeIdsFromPaths(diff.stdout.split("\n").map((s) => s.trim()).filter(Boolean))
@@ -3121,7 +3155,7 @@ export async function maybeArchiveOpenspec(
         "trusted review-comment filtering requires a known actor; check `gh auth status`";
       await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
       await recordDecision("fail", reason);
-      return { advanced: false, status: "blocked", reason, blockerKind: "needs-human" };
+      return preMergeBlocked(reason, "needs-human");
     }
   }
   const guard = await enforceSpecConsistencyGuard(cfg, issueNumber, wt.path, candidates, {
@@ -3156,17 +3190,20 @@ export async function maybeArchiveOpenspec(
       preArchiveStatus.code !== 0
         ? `git status --porcelain failed (exit ${preArchiveStatus.code}): ${(preArchiveStatus.stderr || preArchiveStatus.stdout || "(no output)").trim()}`
         : `pre-existing dirty paths:\n${preArchiveStatus.stdout.trim()}`;
+    // Workspace/git failures — not OpenSpec structural validation. Use needs-human
+    // with no finer path tag so scoreboard offramp_class maps to residual `other`
+    // (#683 review 1: dirty/status must not inflate openspec-invalid).
     await setBlockedFn(
       cfg,
       issueNumber,
       `Cannot verify a clean worktree before the OpenSpec archive, so a failed archive commit's destructive rollback could discard pre-existing work — ${detail}. Commit/stash changes (or fix the git error) and re-run.`,
       "pre-merge",
-      "openspec-invalid",
+      "needs-human",
     );
     const blockedReason =
       preArchiveStatus.code !== 0 ? "pre-archive git status failed" : "worktree dirty before archive";
     await recordDecision("fail", blockedReason);
-    return { advanced: false, status: "blocked", reason: blockedReason };
+    return preMergeBlocked(blockedReason, "needs-human");
   }
 
   // ---- Archive-base sync guard (#579) ----
@@ -3184,24 +3221,28 @@ export async function maybeArchiveOpenspec(
     ignoreFailure: true,
   });
   if (fetch.code !== 0) {
+    // Git/network infrastructure failure — not OpenSpec structural validation.
+    // Residual `other` via needs-human so scoreboard does not mis-bucket as
+    // openspec-invalid (#683 review 2).
     const detail = (fetch.stderr || fetch.stdout || "(no output)").trim();
     const reason =
       `Cannot sync worktree for #${issueNumber} to origin/${branch} before archiving — ` +
       `\`git fetch origin ${branch}:refs/remotes/origin/${branch}\` failed (exit ${fetch.code}): ${detail}`;
-    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
     await recordDecision("fail", "fetch failed before archive");
-    return { advanced: false, status: "blocked", reason: "fetch failed before archive" };
+    return preMergeBlocked("fetch failed before archive", "needs-human");
   }
   const localHeadBefore = await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
   const reviewedHeadRes = await gitFn(wt.path, ["rev-parse", `origin/${branch}`], { ignoreFailure: true });
   if (localHeadBefore.code !== 0 || reviewedHeadRes.code !== 0) {
+    // Rev resolution failure is git tooling — residual other, not openspec-invalid.
     const detail = (reviewedHeadRes.stderr || localHeadBefore.stderr || "(no output)").trim();
     const reason =
       `Cannot resolve worktree HEAD or origin/${branch} before archiving OpenSpec change(s) ` +
       `for #${issueNumber}: ${detail}`;
-    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
     await recordDecision("fail", "rev-parse failed before archive");
-    return { advanced: false, status: "blocked", reason: "rev-parse failed before archive" };
+    return preMergeBlocked("rev-parse failed before archive", "needs-human");
   }
   const reviewedHead = reviewedHeadRes.stdout.trim();
   let archiveBase = localHeadBefore.stdout.trim();
@@ -3217,17 +3258,19 @@ export async function maybeArchiveOpenspec(
     const reason = `archive base \`${archiveBase}\` != reviewed head \`${reviewedHead}\``;
     await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
     await recordDecision("fail", reason);
-    return { advanced: false, status: "blocked", reason };
+    return preMergeBlocked(reason, "needs-human");
   }
 
   console.log(`[pipeline] #${issueNumber}: archiving OpenSpec change(s): ${candidates.join(", ")}`);
   for (const id of candidates) {
     const res = await archiveFn(wt.path, id);
     if (res.unavailable) {
+      // CLI missing is tooling/env — not structural OpenSpec validation failure.
+      // Residual other via needs-human (#683 review 2).
       const reason = `openspec CLI unavailable — cannot archive change '${id}'. Install the openspec CLI and re-run.`;
-      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
       await recordDecision("fail", `openspec CLI unavailable (${id})`);
-      return { advanced: false, status: "blocked", reason: `openspec CLI unavailable (${id})` };
+      return preMergeBlocked(`openspec CLI unavailable (${id})`, "needs-human");
     }
     if (!res.success) {
       // Surface the CLI output verbatim (#467) — e.g. a "header not found" error from a
@@ -3235,7 +3278,7 @@ export async function maybeArchiveOpenspec(
       const reason = `openspec archive ${id} failed:\n${res.output}`;
       await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
       await recordDecision("fail", reason);
-      return { advanced: false, status: "blocked", reason };
+      return preMergeBlocked(reason, "openspec-invalid");
     }
   }
 
@@ -3261,6 +3304,8 @@ export async function maybeArchiveOpenspec(
     await gitFn(wt.path, ["restore", "--staged", "."], { ignoreFailure: true });
     await gitFn(wt.path, ["restore", "."], { ignoreFailure: true });
     await gitFn(wt.path, ["clean", "-fd", "openspec/"], { ignoreFailure: true });
+    // Align outcome with setBlocked kind (push-failed → residual other, not
+    // openspec-invalid) so enriched events match GitHub blocker (#683 review 2).
     await setBlockedFn(
       cfg,
       issueNumber,
@@ -3269,7 +3314,7 @@ export async function maybeArchiveOpenspec(
       "push-failed",
     );
     await recordDecision("fail", "archive commit failed");
-    return { advanced: false, status: "blocked", reason: "archive commit failed" };
+    return preMergeBlocked("archive commit failed", "push-failed");
   }
   // Plain push, deliberately never `--force`/`--force-with-lease` (#579): a
   // non-fast-forward rejection here means the remote moved again since the
@@ -3300,7 +3345,7 @@ export async function maybeArchiveOpenspec(
       "push-failed",
     );
     await recordDecision("fail", "push failed after archive");
-    return { advanced: false, status: "blocked", reason: "push failed after archive" };
+    return preMergeBlocked("push failed after archive", "push-failed");
   }
   console.log(`[pipeline] #${issueNumber}: OpenSpec change(s) archived; CI will re-run`);
   await recordDecision("pass", candidates.join(", "));
@@ -3630,7 +3675,9 @@ async function handleDefinitiveCiFailure(
     durablePersistFailure,
   });
   await fns.setBlockedFn(cfg, issueNumber, reason, "pre-merge", "ci-exhausted");
-  return { advanced: false, status: "blocked", reason: "CI failed" };
+  // #683: attach offramp path tag so scoreboard maps permanent CI failure to ci-failed
+  // (blockerKind alone is the durable label; pathTag is the finer metric class).
+  return preMergeBlocked("CI failed", "ci-exhausted", "ci-failed");
 }
 
 async function evaluateArchiveOnlyPriorGreen(
@@ -3771,7 +3818,7 @@ async function handleZeroRunRecovery(
       "pre-merge",
       "needs-human",
     );
-    return { advanced: false, status: "blocked", reason: `no CI run after recovery for ${headSha.slice(0, 7)}` };
+    return preMergeBlocked(`no CI run after recovery for ${headSha.slice(0, 7)}`, "needs-human", "ci-failed");
   }
 
   const preArchiveSha = ctx.preArchiveSha;
@@ -3804,7 +3851,7 @@ async function handleZeroRunRecovery(
         "pre-merge",
         "needs-human",
       );
-      return { advanced: false, status: "blocked", reason: `no CI run; close+reopen failed: ${msg}` };
+      return preMergeBlocked(`no CI run; close+reopen failed: ${msg}`, "needs-human", "ci-failed");
     }
     ctx.noRunRecoveryAttemptedForSha = headSha;
     console.log(
@@ -3825,7 +3872,7 @@ async function handleZeroRunRecovery(
     "pre-merge",
     "needs-human",
   );
-  return { advanced: false, status: "blocked", reason: `no CI run detected for head SHA ${headSha.slice(0, 7)}` };
+  return preMergeBlocked(`no CI run detected for head SHA ${headSha.slice(0, 7)}`, "needs-human", "ci-failed");
 }
 
 /** Default implementation of the `getDiffFilePaths` seam. */
@@ -3898,7 +3945,7 @@ async function recoverFromMergeConflict(
     "pre-merge",
     "merge-conflict",
   );
-  return { advanced: false, status: "blocked", reason: "merge conflict" };
+  return preMergeBlocked("merge conflict", "merge-conflict");
 }
 
 function rebaseAlreadyAttempted(wtPath: string): boolean {

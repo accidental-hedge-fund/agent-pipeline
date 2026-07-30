@@ -371,10 +371,12 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
 // 6. maybeArchiveOpenspec: CLI unavailable with active candidates → blocked (#308)
 // ---------------------------------------------------------------------------
 
-test("maybeArchiveOpenspec: CLI unavailable with active candidate → blocks with openspec-invalid", async (t) => {
+test("maybeArchiveOpenspec: CLI unavailable with active candidate → blocks residual other, not openspec-invalid (#308 / #683 review 2)", async (t) => {
   // Regression for #308: when openspec archive returns { unavailable: true } and
   // there is at least one active change candidate, the step must block rather than
   // return null (which would silently skip the archive and ship an orphaned change dir).
+  // #683 review 2: CLI unavailability is tooling/env, not structural OpenSpec invalid —
+  // kind/outcome must be needs-human (residual other) so scoreboard does not mis-bucket.
   const CHANGE_ID = "some-active-change";
   const CHANGE_PATH = `openspec/changes/${CHANGE_ID}/proposal.md`;
 
@@ -412,7 +414,8 @@ test("maybeArchiveOpenspec: CLI unavailable with active candidate → blocks wit
   assert.equal((out as Awaited<ReturnType<typeof maybeArchiveOpenspec>>)?.advanced, false);
   assert.equal(blockedCalls.length, 1, "setBlocked must be called exactly once");
   assert.equal(blockedCalls[0].stage, "pre-merge");
-  assert.equal(blockedCalls[0].label, "openspec-invalid");
+  assert.equal(blockedCalls[0].label, "needs-human");
+  assert.equal((out as { blockerKind?: string }).blockerKind, "needs-human");
   assert.match(blockedCalls[0].reason, /openspec/, "reason must mention openspec CLI");
   assert.match(blockedCalls[0].reason, new RegExp(CHANGE_ID), "reason must name the change id");
 });

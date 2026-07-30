@@ -146,6 +146,8 @@ test("enforceReviewShaGate: ceiling_action park routes to needs-human with the u
   assert.deepEqual(out, {
     advanced: false, status: "blocked",
     reason: "pre-merge delta-round ceiling: 1 unresolved blocking finding(s)",
+    blockerKind: "needs-human",
+    offrampPathTag: "delta-review",
   });
   assert.equal(rec.blocked.length, 1);
   assert.match(rec.blocked[0].reason, /4-round ceiling/);

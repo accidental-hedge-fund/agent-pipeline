@@ -140,6 +140,31 @@ export interface GateResultEvent extends RunEventBase {
 export interface BlockerSetEvent extends RunEventBase {
   type: "blocker_set";
   reason: string;
+  /**
+   * Pipeline stage that produced the block (#683). Additive optional — absent
+   * on pre-#683 events. Scoreboard pre-merge aggregates filter on
+   * `stage === "pre-merge"`.
+   */
+  stage?: string;
+  /**
+   * Structural `BlockerKind` when known (#683). Additive optional — absent on
+   * pre-#683 events. Used as a fallback class signal when `offramp_class` is
+   * missing.
+   */
+  blocker_kind?: string;
+  /**
+   * Closed pre-merge off-ramp class when stage is pre-merge (#683). Additive
+   * optional — absent on non-pre-merge blocks and pre-#683 events. Values are
+   * members of `PreMergeOfframpClass` (`pre-merge-offramp.ts`).
+   */
+  offramp_class?: string;
+  /**
+   * Shared id pairing this `blocker_set` with the co-emitted `human_intervention`
+   * for the same off-ramp (#683 review 2). Additive optional — scoreboard
+   * dedupes only the matching pair so mixed historical/new streams still count
+   * every distinct off-ramp.
+   */
+  offramp_id?: string;
 }
 export interface BlockerClearedEvent extends RunEventBase {
   type: "blocker_cleared";

@@ -103,7 +103,7 @@ test("CONFLICTING PR with rebase already attempted blocks, no second rebase (#95
   await quiet(t, async () => {
     out = await advance(makeCfg(), ISSUE, {}, deps);
   });
-  assert.deepEqual(out, { advanced: false, status: "blocked", reason: "merge conflict" });
+  assert.deepEqual(out, { advanced: false, status: "blocked", reason: "merge conflict", blockerKind: "merge-conflict" });
   assert.equal(rec.ciPolls, 0, "CI checks must never be polled for a conflicting PR");
   assert.equal(rec.rebaseCalls, 0, "no second rebase attempt once the marker is set");
   assert.equal(rec.blocked.length, 1);
@@ -121,7 +121,7 @@ test("CONFLICTING PR whose rebase fails blocks with a conflict-specific reason (
   await quiet(t, async () => {
     out = await advance(makeCfg(), ISSUE, {}, deps);
   });
-  assert.deepEqual(out, { advanced: false, status: "blocked", reason: "merge conflict" });
+  assert.deepEqual(out, { advanced: false, status: "blocked", reason: "merge conflict", blockerKind: "merge-conflict" });
   assert.equal(rec.ciPolls, 0, "CI checks must never be polled for a conflicting PR");
   assert.equal(rec.rebaseCalls, 1);
   assert.deepEqual(rec.marked, [], "a failed rebase is not marked as attempted");

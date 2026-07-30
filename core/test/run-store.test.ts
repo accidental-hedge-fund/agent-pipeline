@@ -354,6 +354,27 @@ test("appendEvent: appends JSON line to events.jsonl", async () => {
   assert.equal(parsed.schema_version, 1);
 });
 
+test("appendEvent: blocker_set preserves additive stage/blocker_kind/offramp_class (#683)", async () => {
+  const { deps, readFile } = memRunStore();
+  const event: RunEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "blocker_set",
+    at: STARTED_AT_ISO,
+    reason: "CI checks failed",
+    stage: "pre-merge",
+    blocker_kind: "needs-human",
+    offramp_class: "ci-failed",
+  };
+  await appendEvent(RUN_DIR, event, deps);
+  const parsed = JSON.parse(readFile(EVENTS_JSONL).trim());
+  assert.equal(parsed.type, "blocker_set");
+  assert.equal(parsed.schema_version, 1);
+  assert.equal(parsed.stage, "pre-merge");
+  assert.equal(parsed.blocker_kind, "needs-human");
+  assert.equal(parsed.offramp_class, "ci-failed");
+  assert.equal(parsed.reason, "CI checks failed");
+});
+
 test("appendEvent: writes to stdoutWrite when set (--json-events mode)", async () => {
   const { deps, stdoutLines } = memRunStore();
   const event: RunEvent = { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: STARTED_AT_ISO, stage: "review-1", outcome: "advanced" };

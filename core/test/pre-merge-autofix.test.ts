@@ -376,10 +376,12 @@ test("pre-merge auto-fix #680: concurrency with prior auto-fix commit → exhaus
   await quiet(t, async () => {
     out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
   });
-  assert.deepEqual(
-    out,
-    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
-  );
+  assert.equal(out?.advanced, false);
+  assert.equal(out?.status, "blocked");
+  assert.equal(out?.reason, "pre-merge delta review: blocking findings");
+  // #683 attaches blockerKind / offrampPathTag for scoreboard offramp_class
+  assert.equal(out?.blockerKind, "needs-human");
+  assert.equal(out?.offrampPathTag, "delta-review");
   assert.equal(rec.autoFixCalls, 0, "one-attempt bound: no second concurrency auto-fix");
   assert.equal(rec.blocked.length, 1);
 });
@@ -473,7 +475,7 @@ test("pre-merge auto-fix 5.2: product-judgment-required finding → escalate wit
   });
   assert.deepEqual(
     out,
-    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings", blockerKind: "needs-human", offrampPathTag: "delta-review" },
   );
   assert.equal(rec.autoFixCalls, 0, "auto-fix seam must NOT be called for product-judgment-required");
   assert.equal(rec.blocked.length, 1, "setBlocked called once");
@@ -551,7 +553,7 @@ test("pre-merge auto-fix 5.5: prior auto-fix commit in branch → needs-human, s
   });
   assert.deepEqual(
     out,
-    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings", blockerKind: "needs-human", offrampPathTag: "delta-review" },
   );
   assert.equal(rec.autoFixCalls, 0, "one-attempt bound: seam must NOT be called when prior attempt detected");
   assert.equal(rec.blocked.length, 1);
@@ -573,7 +575,7 @@ test("pre-merge auto-fix 5.6: auto-fix returns error → blocked, no partial pus
   });
   assert.deepEqual(
     out,
-    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings", blockerKind: "needs-human", offrampPathTag: "delta-review" },
   );
   assert.equal(rec.autoFixCalls, 1, "seam was called");
   assert.equal(rec.blocked.length, 1, "blocked after error");
@@ -622,7 +624,7 @@ test("pre-merge auto-fix: fix committed, re-review still blocks → needs-human,
   });
   assert.deepEqual(
     out,
-    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings", blockerKind: "needs-human", offrampPathTag: "delta-review" },
   );
   assert.equal(rec.autoFixCalls, 1, "seam called exactly once");
   assert.equal(rec.blocked.length, 1, "blocked after re-review still blocks");
@@ -698,7 +700,7 @@ test("pre-merge auto-fix 5.9 (bite check): without auto-fix seam, correctness fi
   });
   assert.deepEqual(
     out,
-    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings", blockerKind: "needs-human", offrampPathTag: "delta-review" },
     "without the auto-fix seam, correctness findings must block (proves 5.1 bites when seam is absent)",
   );
   assert.equal(rec.blocked.length, 1);
@@ -938,7 +940,7 @@ test("pre-merge auto-fix finding-4: getPrCommits throws → fail closed, no auto
 
   assert.deepEqual(
     out,
-    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings", blockerKind: "needs-human", offrampPathTag: "delta-review" },
     "getPrCommits failure must block, not attempt auto-fix",
   );
   assert.equal(rec.autoFixCalls, 0, "auto-fix seam must NOT be called when commit scan fails");
@@ -1006,7 +1008,7 @@ test("pre-merge auto-fix finding-2: re-review needs-attention + zero findings �
 
   assert.deepEqual(
     out,
-    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings" },
+    { advanced: false, status: "blocked", reason: "pre-merge delta review: blocking findings", blockerKind: "needs-human", offrampPathTag: "delta-review" },
     "re-review needs-attention with zero findings must block, not approve",
   );
   assert.equal(rec.autoFixCalls, 1, "auto-fix was attempted once");

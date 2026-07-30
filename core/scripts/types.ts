@@ -1079,9 +1079,28 @@ export function reviewStageSkipTarget(cfg: Pick<PipelineConfig, "steps">, stage:
 }
 
 // One transition outcome from a stage advance call.
+//
+// `offrampPathTag` (#683): optional pre-merge path classification when
+// `blockerKind` alone is too coarse for scoreboard aggregation (e.g. CI failure
+// and delta-review both use needs-human for the recipe surface). Consumed only
+// by the orchestrator `blocker_set` emission when the stage is pre-merge; other
+// stages may omit it. Values are PreMergeOfframpClass path tags (not residual
+// `other`) — see `pre-merge-offramp.ts`.
 export type Outcome =
   | { advanced: true; from: Stage; to: Stage; summary: string }
-  | { advanced: false; status: "blocked"; reason: string; blockerKind?: BlockerKind }
+  | {
+      advanced: false;
+      status: "blocked";
+      reason: string;
+      blockerKind?: BlockerKind;
+      /** Pre-merge-only path tag for offramp_class mapping (#683). */
+      offrampPathTag?:
+        | "ci-failed"
+        | "delta-review"
+        | "merge-conflict"
+        | "openspec-invalid"
+        | "openspec-stale-delta";
+    }
   | { advanced: false; status: "waiting"; reason: string }
   | { advanced: false; status: "no-op"; reason: string }
   | { advanced: false; status: "finalized"; reason: string }
