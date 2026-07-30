@@ -57,16 +57,20 @@ import {
   findLatestReviewCommentBody,
   formatDeltaReviewComment,
   extractReviewedSha,
+  isVerifiedPipelineAttestation,
   parseStructuredVerdict,
   type DeltaCeilingFinding,
 } from "./review.ts";
 import {
   applyAdvisoryCarryForwardRule,
+  applyNoopHeadClassificationEvidenceRule,
+  HEAD_ALREADY_IMPLEMENTS_RECOMMENDATION,
   applySettledSurfaceEvidenceRule,
   buildTrustedOverrideComments,
   extractOverrides,
   extractScopedOverrides,
   findingKey,
+  normalizeFile,
   overrideComment,
   partitionFindings,
   severityRank,
@@ -188,7 +192,30 @@ function preMergeBlocked(
 export const PRE_MERGE_AUTOFIX_PREFIX = "fix: pre-merge auto-fix";
 
 /**
- * Result of a pre-merge bounded auto-fix attempt (#359).
+ * Heading + HTML-comment sentinel for a durable pre-merge auto-fix clean
+ * no-op attempt (#698). There is no `PRE_MERGE_AUTOFIX_PREFIX` commit when the
+ * harness leaves a clean tree, so the one-attempt bound scans trusted
+ * pipeline-attested comments for this sentinel anchored to the head SHA.
+ */
+export const PRE_MERGE_AUTOFIX_NOOP_HEADING = "## Pipeline: Pre-merge auto-fix no-op";
+/** Machine sentinel: `<!-- pipeline-pre-merge-autofix-noop: <40-hex-sha> -->`. */
+export const PRE_MERGE_AUTOFIX_NOOP_RE =
+  /^<!-- pipeline-pre-merge-autofix-noop: ([0-9a-fA-F]{40}) -->$/m;
+
+/**
+ * Durable attempt-started marker posted **before** the harness is invoked
+ * (#698 review-2). Guarantees the one-attempt bound even when the post-noop
+ * completion marker fails to persist (or the process crashes mid-harness):
+ * a later pre-merge entry at the same head recognizes this sentinel and does
+ * not start a second auto-fix.
+ */
+export const PRE_MERGE_AUTOFIX_ATTEMPT_HEADING = "## Pipeline: Pre-merge auto-fix attempt";
+/** Machine sentinel: `<!-- pipeline-pre-merge-autofix-attempt: <40-hex-sha> -->`. */
+export const PRE_MERGE_AUTOFIX_ATTEMPT_RE =
+  /^<!-- pipeline-pre-merge-autofix-attempt: ([0-9a-fA-F]{40}) -->$/m;
+
+/**
+ * Result of a pre-merge bounded auto-fix attempt (#359 / #698).
  * "fix-committed" — harness committed a fix and pushed it to the PR head.
  *                   Caller should re-run the delta review exactly once,
  *                   evaluated against `headSha` — the authoritative post-fix
@@ -196,16 +223,19 @@ export const PRE_MERGE_AUTOFIX_PREFIX = "fix: pre-merge auto-fix";
  *                   NOT re-derive the post-fix head from a GitHub-API PR-head
  *                   read, which can still return the pre-fix head in the
  *                   window immediately after the push.
- * "error"         — harness failure, dirty worktree, push failure, or no
- *                   commit produced. Worktree rolled back to pre-fix HEAD.
- *                   `diagnostic` is set specifically for the #553 disclosed
- *                   case: the harness ran and the inspected worktree ended
- *                   clean with no new commit (nothing recoverable) — it names
- *                   the worktree path so the operator can tell that outcome
- *                   apart from every other rollback reason.
+ * "noop-clean"    — harness ran, HEAD unchanged, worktree clean, nothing
+ *                   salvageable (#553 disclosure in `diagnostic`). Caller
+ *                   SHALL re-verify blocking findings against `headSha` (the
+ *                   unchanged pre-fix head) once; MUST NOT hard-block solely
+ *                   because no commit was produced (#698).
+ * "error"         — harness failure with dirty/unsalvaged state, push failure,
+ *                   unreadable HEAD, or pre-dirty worktree. Worktree rolled
+ *                   back to pre-fix HEAD when applicable. Not eligible for the
+ *                   clean-noop re-verify path.
  */
 export type PreMergeAutoFixResult =
   | { status: "fix-committed"; headSha: string }
+  | { status: "noop-clean"; headSha: string; diagnostic: string }
   | { status: "error"; diagnostic?: string };
 
 /**
@@ -213,13 +243,151 @@ export type PreMergeAutoFixResult =
  * Parameters: the blocking ReviewFinding objects, the issue title (for the
  * fix prompt), and the delta review comment body (as reviewFindings text).
  * Called by `enforceReviewShaGate` only when (a) all blocking findings pass
- * `allBlockingAutoFixable` and (b) no prior auto-fix commit is present.
+ * `allBlockingAutoFixable` and (b) no prior auto-fix commit / durable
+ * noop-clean marker is present.
  */
 export type AttemptPreMergeAutoFixFn = (
   blockingFindings: ReviewFinding[],
   issueTitle: string,
   reviewComment: string,
 ) => Promise<PreMergeAutoFixResult>;
+
+/**
+ * Trusted durable audit comment recording a pre-merge auto-fix clean no-op
+ * at `headSha` (#698). Survives process restart and host switch so the
+ * one-attempt bound can detect the prior attempt without a fix commit.
+ */
+export function preMergeAutofixNoopComment(args: {
+  issueNumber: number;
+  headSha: string;
+  diagnostic: string;
+  timestamp?: string;
+}): string {
+  const { issueNumber, headSha, diagnostic, timestamp } = args;
+  const when = timestamp ?? new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  const rendered = [
+    PRE_MERGE_AUTOFIX_NOOP_HEADING,
+    "",
+    `Pre-merge bounded auto-fix for #${issueNumber} left a clean worktree with no new commit at \`${headSha}\`.`,
+    "",
+    diagnostic,
+    "",
+    `**Recorded at**: ${when}`,
+    "",
+    "This is a durable one-attempt marker: a later pre-merge entry at the same head will not re-run auto-fix.",
+    "The pipeline re-verifies blocking findings against this head before any needs-human escalation.",
+    "",
+    `<!-- pipeline-pre-merge-autofix-noop: ${headSha} -->`,
+  ].join("\n");
+  return attestPipelineComment("pre-merge-autofix-noop", rendered);
+}
+
+/**
+ * Trusted durable attempt-started marker posted before the harness runs
+ * (#698 review-2). Anchored to `headSha` so a later entry exhausts the
+ * one-attempt bound even if the noop completion marker never persists.
+ */
+export function preMergeAutofixAttemptComment(args: {
+  issueNumber: number;
+  headSha: string;
+  timestamp?: string;
+}): string {
+  const { issueNumber, headSha, timestamp } = args;
+  const when = timestamp ?? new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  const rendered = [
+    PRE_MERGE_AUTOFIX_ATTEMPT_HEADING,
+    "",
+    `Pre-merge bounded auto-fix for #${issueNumber} is starting at head \`${headSha}\`.`,
+    "",
+    `**Recorded at**: ${when}`,
+    "",
+    "This is a durable one-attempt guard: once posted, a later pre-merge entry at the same head will not start another auto-fix, even if the harness or the post-noop completion marker fails to record.",
+    "",
+    `<!-- pipeline-pre-merge-autofix-attempt: ${headSha} -->`,
+  ].join("\n");
+  return attestPipelineComment("pre-merge-autofix-attempt", rendered);
+}
+
+/**
+ * True when a trusted pipeline-attested comment records a pre-merge auto-fix
+ * noop-clean attempt at `headSha` (#698 one-attempt bound).
+ */
+export function hasPreMergeAutofixNoopAtHead(
+  comments: Array<{ author: string; body: string }>,
+  headSha: string,
+  actor: string,
+): boolean {
+  const want = headSha.toLowerCase();
+  for (const c of comments) {
+    if (c.author !== actor) continue;
+    if (!isVerifiedPipelineAttestation(c.body)) continue;
+    const m = PRE_MERGE_AUTOFIX_NOOP_RE.exec(c.body);
+    if (m && m[1].toLowerCase() === want) return true;
+  }
+  return false;
+}
+
+/**
+ * True when a trusted pipeline-attested comment records that a pre-merge
+ * auto-fix attempt was **started** at `headSha` (#698 review-2 one-attempt
+ * crash-safety). Distinct from the noop completion marker: this fires even
+ * when the harness never reaches a recorded noop-clean outcome.
+ */
+export function hasPreMergeAutofixAttemptAtHead(
+  comments: Array<{ author: string; body: string }>,
+  headSha: string,
+  actor: string,
+): boolean {
+  const want = headSha.toLowerCase();
+  for (const c of comments) {
+    if (c.author !== actor) continue;
+    if (!isVerifiedPipelineAttestation(c.body)) continue;
+    const m = PRE_MERGE_AUTOFIX_ATTEMPT_RE.exec(c.body);
+    if (m && m[1].toLowerCase() === want) return true;
+  }
+  return false;
+}
+
+/**
+ * True when either the attempt-started or noop-clean durable marker is
+ * present for `headSha` — the full crash-safe one-attempt bound (#698).
+ */
+export function hasPreMergeAutofixBoundMarkerAtHead(
+  comments: Array<{ author: string; body: string }>,
+  headSha: string,
+  actor: string,
+): boolean {
+  return (
+    hasPreMergeAutofixAttemptAtHead(comments, headSha, actor) ||
+    hasPreMergeAutofixNoopAtHead(comments, headSha, actor)
+  );
+}
+
+/**
+ * Operator-facing block reason when auto-fix ends noop-clean and re-verify
+ * still reports blocking findings (#698).
+ */
+export function formatNoopStillBrokenReason(
+  findings: ReviewFinding[],
+  diagnostic?: string,
+): string {
+  const paths = [
+    ...new Set(
+      findings
+        .map((f) => f.file)
+        .filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+        .map((p) => p.trim()),
+    ),
+  ];
+  const pathPart =
+    paths.length > 0
+      ? `finding still present at ${paths.map((p) => `\`${p}\``).join(", ")}`
+      : "finding still present";
+  const base =
+    `Pre-merge delta review found blocking findings; auto-fix made no diff; ` +
+    `${pathPart} — human fix required.`;
+  return diagnostic ? `${base} ${diagnostic}` : base;
+}
 
 /**
  * True when a commit was authored by the pipeline itself in pre-merge (an
@@ -393,8 +561,12 @@ const PRE_MERGE_AUTOFIX_SALVAGE_LABEL = "pre-merge auto-fix";
  * (the durable crash-safe one-attempt marker), and pushes to the PR head.
  *
  * Pre-conditions: worktree must be clean (fail closed otherwise).
- * On any failure (harness error, no commit produced, push error): rolls the
- * worktree back to the pre-fix HEAD over a clean tree and returns "error".
+ * On dirty/unsalvaged harness failure, ambiguous partial state, or push error:
+ * rolls the worktree back to the pre-fix HEAD over a clean tree and returns
+ * "error". A confirmed clean no-commit (`headAfter === headBefore`, worktree
+ * clean, nothing salvageable) returns **"noop-clean"** with the #553 diagnostic
+ * so the caller can re-verify findings against HEAD (#698) rather than
+ * hard-blocking solely because no commit was produced.
  * The surgical-fix discipline (#235) — minimal diff, destructive-operation guard,
  * pre-commit self-check — applies via `buildFixPrompt` unchanged.
  *
@@ -407,7 +579,7 @@ const PRE_MERGE_AUTOFIX_SALVAGE_LABEL = "pre-merge auto-fix";
  * pushed, and re-reviewed by the pre-merge delta gate — salvage never bypasses
  * review. A commit that exists alongside *extra* leftover dirt
  * (`hasNewCommit && hasUncommitted`) stays out of scope and keeps the existing
- * fail-closed rollback, as does a genuinely clean no-commit worktree.
+ * fail-closed rollback.
  */
 export async function performPreMergeAutoFix(
   cfg: PipelineConfig,
@@ -488,10 +660,11 @@ export async function performPreMergeAutoFix(
   }
 
   if (!salvaged) {
-    // #553: the harness ran (we already invoked it above) and left the
-    // inspected worktree clean with no new commit — nothing for salvage to
-    // recover. Name the worktree so the operator can tell this apart from a
-    // silent no-op instead of a bare "0 transitions / nothing to salvage".
+    // #553 / #698: the harness ran and left the inspected worktree clean with
+    // no new commit — nothing for salvage to recover. Name the worktree so the
+    // operator can tell this apart from a silent no-op; return **noop-clean**
+    // (not a generic error) so the SHA gate re-verifies findings against HEAD
+    // rather than hard-blocking solely because no commit was produced.
     const cleanNoRecoverableWork = confirmedNoNewCommit && salvageFoundNothing;
     const diagnostic = cleanNoRecoverableWork
       ? `pre-merge fix harness for #${issueNumber} ran but left worktree ${wt.path} ` +
@@ -504,17 +677,22 @@ export async function performPreMergeAutoFix(
         await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
         await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
       }
-      return diagnostic ? { status: "error", diagnostic } : { status: "error" };
+      // Confirmed clean no-commit after harness failure/timeout still enters
+      // the re-verify path (#698 / harness-uncommitted-salvage): the tree is
+      // unambiguous and salvage found nothing. Dirty/unreadable cases remain error.
+      if (diagnostic && headBefore) {
+        return { status: "noop-clean", headSha: headBefore, diagnostic };
+      }
+      return { status: "error" };
     }
 
     const statusAfter = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
     // Fail closed when status exits non-zero: we cannot prove the worktree is clean (#359 R2 F4).
     const hasUncommitted = statusAfter.code !== 0 || statusAfter.stdout.trim() !== "";
 
-    // Spec (#359): a dirty post-harness worktree (uncommitted changes remaining) or
-    // no new commit is a failure — roll back. The harness MUST commit cleanly; a dirty
-    // state indicates the harness exited early or its pre-commit self-check withheld the
-    // commit, and we must not push a partial or self-check-rejected fix.
+    // Spec (#359 / #698): a dirty post-harness worktree (uncommitted changes remaining)
+    // is a failure — roll back. A confirmed clean no-commit is **noop-clean** so the
+    // caller re-verifies rather than hard-blocking. Ambiguous partial state stays error.
     if (hasUncommitted || !hasNewCommitHarness) {
       const finalDiagnostic = diagnostic && !hasUncommitted ? diagnostic : undefined;
       if (finalDiagnostic) console.error(`[pipeline] ${finalDiagnostic}`);
@@ -522,7 +700,10 @@ export async function performPreMergeAutoFix(
         await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
         await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
       }
-      return finalDiagnostic ? { status: "error", diagnostic: finalDiagnostic } : { status: "error" };
+      if (finalDiagnostic && headBefore) {
+        return { status: "noop-clean", headSha: headBefore, diagnostic: finalDiagnostic };
+      }
+      return { status: "error" };
     }
   }
 
@@ -2352,10 +2533,11 @@ export async function enforceReviewShaGate(
       // below was produced against — `targetHead` unless an auto-fix re-review
       // supersedes it (#481 review 2 finding 1).
       let finalBlockingHead = targetHead;
-      // #553: names the inspected worktree when the auto-fix harness ran but
-      // left it clean with no recoverable work, so the block reason discloses
-      // that outcome instead of a bare "findings; fix required" message.
+      // #553 / #698: diagnostic or still-broken recipe for the block reason.
+      // When set to a full block reason (noop still-broken recipe), used as-is;
+      // otherwise appended to the generic "fix required" message.
       let autoFixDiagnostic: string | undefined;
+      let autoFixBlockReason: string | undefined;
       // Observability (#682): needs-attention with blocking count for the loop mirror.
       await recordPreMergeGateResult(
         { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
@@ -2366,7 +2548,10 @@ export async function enforceReviewShaGate(
       const attemptAutoFixFn = deps.attemptPreMergeAutoFix;
       if (attemptAutoFixFn && allBlockingAutoFixable(partition.blocking)) {
         // One-attempt bound (crash-safe): detect a prior auto-fix commit by
-        // scanning PR commits since the reviewed SHA for the PREFIX subject.
+        // scanning PR commits since the reviewed SHA for the PREFIX subject,
+        // OR a durable attempt-started / noop-clean marker at the current head
+        // (#698, review-2: attempt-started is posted before the harness so a
+        // failed post-noop completion marker cannot allow a second attempt).
         let priorAutoFix = false;
         try {
           const prCommits = await getPrCommitsFn(cfg, prNumber);
@@ -2377,6 +2562,20 @@ export async function enforceReviewShaGate(
           priorAutoFix = since.some((c) =>
             c.messageHeadline.startsWith(PRE_MERGE_AUTOFIX_PREFIX),
           );
+          if (!priorAutoFix) {
+            // Re-read comments so a marker posted earlier in this process (or by
+            // another host) is visible; fall back to the issue detail we already have.
+            let commentsForMarker = trustedComments;
+            try {
+              const latest = await getIssueDetailFn(cfg, issueNumber);
+              commentsForMarker = latest.comments.filter((c) => c.author === actor);
+            } catch {
+              // Use the in-memory trusted comments from gate entry.
+            }
+            priorAutoFix = hasPreMergeAutofixBoundMarkerAtHead(
+              commentsForMarker, targetHead, actor,
+            );
+          }
         } catch {
           // Cannot determine prior attempt — fail closed (#359): skipping the
           // auto-fix is safer than risking a second attempt when the durable
@@ -2400,17 +2599,81 @@ export async function enforceReviewShaGate(
             blockingKeysSet.size > 0 ? blockingKeysSet : undefined,
             newHash,
           );
-          const fixRes = await attemptAutoFixFn(
-            partition.blocking, detail.title, blockingOnlyBody,
-          );
-          if (fixRes.status === "fix-committed") {
+          // Crash-safe one-attempt guard (#698 review-2): persist attempt-started
+          // BEFORE invoking the harness. If this post fails, do not run the
+          // harness — fail closed so a later entry can retry the marker rather
+          // than leave an unbound attempt. Once posted, a later entry at the
+          // same head will not start a second auto-fix even if the noop
+          // completion marker never lands.
+          let attemptMarkerPosted = false;
+          try {
+            await postCommentFn(
+              cfg,
+              issueNumber,
+              preMergeAutofixAttemptComment({
+                issueNumber,
+                headSha: targetHead,
+              }),
+            );
+            attemptMarkerPosted = true;
+          } catch (err) {
+            autoFixDiagnostic =
+              `failed to record durable pre-merge auto-fix attempt marker at ` +
+              `${targetHead.slice(0, 7)} before harness invoke: ` +
+              `${(err as Error).message ?? String(err)}`;
+            console.warn(
+              `[pipeline] #${issueNumber}: ${autoFixDiagnostic}; escalating without auto-fix`,
+            );
+            // Fall through to setBlocked below without calling the harness.
+            // Do not set priorAutoFix — there is no durable marker; a later
+            // entry may retry the attempt-started post (still no double harness).
+          }
+          const fixRes = attemptMarkerPosted
+            ? await attemptAutoFixFn(
+                partition.blocking, detail.title, blockingOnlyBody,
+              )
+            : null;
+          // fix-committed → re-review at new head; noop-clean → re-verify at
+          // unchanged head (#698). Both share the single re-review path; neither
+          // counts as a second auto-fix attempt.
+          if (fixRes && (fixRes.status === "fix-committed" || fixRes.status === "noop-clean")) {
+            const wasNoopClean = fixRes.status === "noop-clean";
+            if (wasNoopClean) {
+              // Completion evidence marker (in addition to attempt-started).
+              // Failure here must not allow a second harness invoke: the
+              // attempt-started marker already exhausts the bound. Continue to
+              // re-verify rather than treating a marker-post failure as
+              // approval or as an unbound retry path.
+              try {
+                await postCommentFn(
+                  cfg,
+                  issueNumber,
+                  preMergeAutofixNoopComment({
+                    issueNumber,
+                    headSha: fixRes.headSha,
+                    diagnostic: fixRes.diagnostic,
+                  }),
+                );
+              } catch (err) {
+                console.warn(
+                  `[pipeline] #${issueNumber}: failed to post noop-clean completion ` +
+                    `marker at ${fixRes.headSha.slice(0, 7)} ` +
+                    `(${(err as Error).message ?? String(err)}); ` +
+                    `attempt-started marker already holds the one-attempt bound — continuing re-verify`,
+                );
+              }
+              autoFixDiagnostic = fixRes.diagnostic;
+              console.log(
+                `[pipeline] #${issueNumber}: pre-merge auto-fix noop-clean at ` +
+                  `${fixRes.headSha.slice(0, 7)}; re-verifying findings against HEAD`,
+              );
+            }
             // Re-run the delta review exactly once (does NOT consume a review-2
             // ceiling slot, consistent with the delta-review budget rule, #359).
-            // Anchor to the auto-fix's authoritative post-fix head from local git
-            // state (#371) — NOT a GitHub-API PR-head read, which can still return
-            // the pre-fix head in the window immediately after the push and would
-            // silently re-review the pre-fix diff (byte-identical to the first
-            // review), re-emitting the finding the auto-fix just resolved.
+            // Anchor to the auto-fix's authoritative head from local git state
+            // (#371 / #698) — for fix-committed this is the post-fix SHA; for
+            // noop-clean it is the unchanged pre-fix head. NOT a GitHub-API
+            // PR-head read, which can lag after a push.
             const newPrHead = fixRes.headSha;
             // Do NOT fall back to the pre-fix `currentDiff` if the post-fix diff
             // cannot be obtained (#359 R2 F1), including when `reviewed.sha` itself
@@ -2493,6 +2756,45 @@ export async function enforceReviewShaGate(
                   prior_advisory_key: match.priorKey, prior_round: match.priorRound,
                   matched_by: match.matchedBy,
                 }, deps.runStoreDeps).catch(() => {});
+              }
+            }
+
+// Post-noop re-verify: demote pure classification/control-flow claims
+            // when HEAD already implements the recommended behavior and the
+            // finding cites no contradictory current-file or executable evidence
+            // (#698 / dogfood #683). Settled-surface demotion alone does not
+            // cover first-time delta findings with empty settled history.
+            if (wasNoopClean && rePartition.blocking.length > 0) {
+              const classifFiles = [
+                ...new Set(
+                  rePartition.blocking
+                    .map((f) => f.file)
+                    .filter((p): p is string => typeof p === "string" && p.length > 0),
+                ),
+              ];
+              const alreadyRead = new Map(
+                reHeadFiles.map((h) => [normalizeFile(h.path), h] as const),
+              );
+              const missing = classifFiles.filter((p) => !alreadyRead.has(normalizeFile(p)));
+              let headForClassif = reHeadFiles;
+              if (missing.length > 0) {
+                const extra = await readHeadFilesFn(deltaWorktreePath, newPrHead, missing);
+                headForClassif = [...reHeadFiles, ...extra];
+              }
+              const classResult = applyNoopHeadClassificationEvidenceRule(
+                rePartition.blocking,
+                headForClassif,
+              );
+              rePartition.blocking = classResult.blocking;
+              for (const { finding, reason } of classResult.demoted) {
+                rePartition.advisory.push({ finding, reason });
+              }
+              if (classResult.demoted.length > 0) {
+                console.log(
+                  `[pipeline] #${issueNumber}: noop re-verify demoted ` +
+                    `${classResult.demoted.length} classification finding(s) — ` +
+                    `HEAD already implements recommended behavior (${HEAD_ALREADY_IMPLEMENTS_RECOMMENDATION})`,
+                );
               }
             }
             // Mirror the initial delta review guard (#228): needs-attention with zero
@@ -2588,19 +2890,18 @@ export async function enforceReviewShaGate(
             if (rePartition.blocking.length === 0 && !reIsUnparseable) {
               // Re-validate HEAD, but do not let a single stale GitHub-API
               // PR-head read veto an approving post-fix re-review (#371 review
-              // 2). `newPrHead` is the authoritative post-fix head we already
-              // confirmed was pushed (performPreMergeAutoFix only returns
-              // "fix-committed" after `git push` succeeds); the GitHub API's
-              // PR-head field can still echo the pre-fix `head`, or even echo
-              // `newPrHead` itself, for a short window after a *further*
-              // concurrent push lands. Neither a read matching the pre-fix
-              // `head` nor one matching `newPrHead` is proof of mere staleness
-              // (#371 delta review, keys 8ad8b7f0 and 9943b2af): both can mask
-              // a concurrent push that landed during the re-review. Disambiguate
-              // via the live remote ref (`git ls-remote`) whenever the API read
-              // is consistent with either of those two known SHAs, and fail
-              // closed to the SHA gate when it does not confirm the auto-fix
-              // head. A read reporting some THIRD, different SHA is an
+              // 2). `newPrHead` is the authoritative head we already confirmed
+              // (post-fix after push, or unchanged head on noop-clean); the
+              // GitHub API's PR-head field can still echo the pre-fix `head`,
+              // or even echo `newPrHead` itself, for a short window after a
+              // *further* concurrent push lands. Neither a read matching the
+              // pre-fix `head` nor one matching `newPrHead` is proof of mere
+              // staleness (#371 delta review, keys 8ad8b7f0 and 9943b2af): both
+              // can mask a concurrent push that landed during the re-review.
+              // Disambiguate via the live remote ref (`git ls-remote`) whenever
+              // the API read is consistent with either of those two known SHAs,
+              // and fail closed to the SHA gate when it does not confirm the
+              // re-review head. A read reporting some THIRD, different SHA is an
               // unambiguous signal of a newer concurrent push on its own.
               const postFixPr = await getPrDetailFn(cfg, prNumber);
               const postFixHead = postFixPr.head_sha;
@@ -2622,7 +2923,10 @@ export async function enforceReviewShaGate(
                 );
               }
               console.log(
-                `[pipeline] #${issueNumber}: pre-merge auto-fix re-review approved; proceeding`,
+                wasNoopClean
+                  ? `[pipeline] #${issueNumber}: pre-merge auto-fix noop re-verify approved ` +
+                    `(already fixed / false positive); proceeding`
+                  : `[pipeline] #${issueNumber}: pre-merge auto-fix re-review approved; proceeding`,
               );
               await recordPreMergeGateResult(
                 { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
@@ -2640,7 +2944,13 @@ export async function enforceReviewShaGate(
               );
               return null;
             }
-            // Re-review still blocks or returned unparseable output: fall through to block below.
+            // Re-review still blocks or returned unparseable output.
+            if (wasNoopClean && rePartition.blocking.length > 0 && !reIsUnparseable) {
+              autoFixBlockReason = formatNoopStillBrokenReason(
+                rePartition.blocking,
+                fixRes.status === "noop-clean" ? fixRes.diagnostic : autoFixDiagnostic,
+              );
+            }
             await recordPreMergeGateResult(
               { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
               "pre-merge-autofix",
@@ -2648,7 +2958,7 @@ export async function enforceReviewShaGate(
               "exhausted",
             );
           } else {
-            // fixRes.status === "error": fall through to block below.
+            // fixRes.status === "error" (or attempt marker failed → fixRes null).
             await recordPreMergeGateResult(
               { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
               "pre-merge-autofix",
@@ -2656,7 +2966,7 @@ export async function enforceReviewShaGate(
               "exhausted",
             );
           }
-          if (fixRes.status === "error" && fixRes.diagnostic) {
+          if (fixRes?.status === "error" && fixRes.diagnostic) {
             autoFixDiagnostic = fixRes.diagnostic;
           }
         } else {
@@ -2692,12 +3002,15 @@ export async function enforceReviewShaGate(
 
       // Non-auto-fixable category, no seam, or fix round exhausted:
       // block pre-merge without routing to review-2.
+      const blockReason =
+        autoFixBlockReason ??
+        (autoFixDiagnostic
+          ? `Pre-merge delta review found blocking findings; fix required before merging. ${autoFixDiagnostic}`
+          : "Pre-merge delta review found blocking findings; fix required before merging.");
       await setBlockedFn(
         cfg,
         issueNumber,
-        autoFixDiagnostic
-          ? `Pre-merge delta review found blocking findings; fix required before merging. ${autoFixDiagnostic}`
-          : "Pre-merge delta review found blocking findings; fix required before merging.",
+        blockReason,
         "pre-merge",
         "needs-human",
       );

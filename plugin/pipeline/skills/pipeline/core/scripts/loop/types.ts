@@ -630,6 +630,14 @@ export interface LoopExternalIdentity {
   issue_number: number;
   issue_open: boolean;
   ready_label_present: boolean;
+  /**
+   * True when live labels include the pipeline blocked label (`blocked`),
+   * including when a stage label co-presents (#698 /
+   * `loop-blocked-item-hold-continuation`). Presence-based — not the single
+   * `pipeline_stage` winner — so schedule next_actions can hold instead of
+   * advertising actionable `advance` while GitHub still shows blocked.
+   */
+  blocked_label_present: boolean;
   pr_number: number | null;
   pr_state: "open" | "closed" | "merged" | null;
   head_branch: string;

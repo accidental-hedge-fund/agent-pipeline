@@ -59,6 +59,8 @@ import {
 } from "../scripts/stages/review-rendering.ts";
 import {
   diffUnchangedNotice,
+  preMergeAutofixAttemptComment,
+  preMergeAutofixNoopComment,
   preMergeRerunIdentityNotice,
   preMergeRerunScopeNotice,
   staleReviewNotice,
@@ -271,6 +273,19 @@ const KIND_RENDERERS: Record<string, () => string> = {
   "pre-merge-rerun-scope": () => preMergeRerunScopeNotice(2),
   "pre-merge-diff-unchanged": () => diffUnchangedNotice("a".repeat(40), "b".repeat(40)),
   "pre-merge-stale-review": () => staleReviewNotice("a".repeat(40), "b".repeat(40)),
+  "pre-merge-autofix-noop": () =>
+    preMergeAutofixNoopComment({
+      issueNumber: 698,
+      headSha: "a".repeat(40),
+      diagnostic: "worktree clean; no new commit",
+      timestamp: ts(0),
+    }),
+  "pre-merge-autofix-attempt": () =>
+    preMergeAutofixAttemptComment({
+      issueNumber: 698,
+      headSha: "a".repeat(40),
+      timestamp: ts(0),
+    }),
   "finding-does-not-reproduce": () =>
     nonReproducingDispositionComment({
       key: "abcd1234",

@@ -8,9 +8,17 @@ import * as os from "node:os";
 import {
   allBlockingAutoFixable,
   enforceReviewShaGate,
+  formatNoopStillBrokenReason,
+  hasPreMergeAutofixAttemptAtHead,
+  hasPreMergeAutofixBoundMarkerAtHead,
+  hasPreMergeAutofixNoopAtHead,
   isAutoFixableFinding,
   isPipelineInternalCommit,
   performPreMergeAutoFix,
+  preMergeAutofixAttemptComment,
+  preMergeAutofixNoopComment,
+  PRE_MERGE_AUTOFIX_ATTEMPT_HEADING,
+  PRE_MERGE_AUTOFIX_NOOP_HEADING,
   PRE_MERGE_AUTOFIX_CATEGORIES,
   PRE_MERGE_AUTOFIX_CATEGORY_SET,
   PRE_MERGE_AUTOFIX_PREFIX,
@@ -19,10 +27,20 @@ import {
   type RunDeltaReviewFn,
   type ShaGateDeps,
 } from "../scripts/stages/pre_merge.ts";
-import { computeDiffHash, DELTA_REVIEW_MARKER_PREFIX } from "../scripts/stages/review.ts";
+import {
+  applyNoopHeadClassificationEvidenceRule,
+  citesExecutableFailureEvidence,
+  citedRegionContent,
+  extractClassificationTokens,
+  extractKnownPipelineClassificationTokens,
+  HEAD_ALREADY_IMPLEMENTS_RECOMMENDATION,
+  headImplementsRecommendedClassification,
+  isClassificationOrControlFlowClaim,
+} from "../scripts/review-policy.ts";
+import { computeDiffHash, DELTA_REVIEW_MARKER_PREFIX, isVerifiedPipelineAttestation } from "../scripts/stages/review.ts";
 import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
 import type { InvokeFn } from "../scripts/openspec-consistency.ts";
-import type { PriorRoundDigest } from "../scripts/review-history.ts";
+import type { HeadFileState, PriorRoundDigest } from "../scripts/review-history.ts";
 import type { TrySalvageResult } from "../scripts/salvage-harness-work.ts";
 
 // ---------------------------------------------------------------------------
@@ -76,10 +94,32 @@ interface Rec {
 function makeDeps(opts: {
   findings: ReviewFinding[];
   reReviewFindings: ReviewFinding[];
-  autoFixResult: "fix-committed" | "error";
+  autoFixResult: "fix-committed" | "error" | "noop-clean";
   priorAutoFixCommit?: boolean;
+  /** Prior durable noop-clean marker at SHA_HEAD (#698). */
+  priorNoopCleanMarker?: boolean;
+  /** Prior durable attempt-started marker at SHA_HEAD (#698 review-2). */
+  priorAttemptMarker?: boolean;
+  /**
+   * When true, `postComment` throws on the first attempt to post a
+   * pre-merge-autofix-noop completion marker (after harness). Attempt-started
+   * posts still succeed so the one-attempt bound remains durable.
+   */
+  failNoopCompletionMarker?: boolean;
+  /**
+   * When true, `postComment` throws when posting the attempt-started marker
+   * (before harness). Harness must not run.
+   */
+  failAttemptMarker?: boolean;
   reReviewPrHead?: string;
   extraCommitsBefore?: { oid: string; messageHeadline: string }[];
+  /** Diagnostic attached to noop-clean / error outcomes. */
+  diagnostic?: string;
+  /**
+   * HEAD file states returned by the injectable `readHeadFiles` seam.
+   * Used by the post-noop classification demotion rule (#698/#683).
+   */
+  headFiles?: HeadFileState[];
 }): { deps: ShaGateDeps; rec: Rec } {
   const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0 };
 
@@ -87,12 +127,20 @@ function makeDeps(opts: {
   // must match what `getPrDetail` below reports post-fix so the post-approval
   // HEAD re-validation guard doesn't spuriously fire in these tests.
   const postFixHeadSha = opts.reReviewPrHead ?? SHA_AFTER_FIX;
+  const noopDiagnostic =
+    opts.diagnostic ??
+    "pre-merge fix harness for #16 ran but left worktree /fake/worktree clean with no new " +
+      "commit — no recoverable work was found there";
 
   const autoFix: AttemptPreMergeAutoFixFn = async () => {
     rec.autoFixCalls++;
-    return opts.autoFixResult === "fix-committed"
-      ? { status: "fix-committed", headSha: postFixHeadSha }
-      : { status: "error" };
+    if (opts.autoFixResult === "fix-committed") {
+      return { status: "fix-committed", headSha: postFixHeadSha };
+    }
+    if (opts.autoFixResult === "noop-clean") {
+      return { status: "noop-clean", headSha: SHA_HEAD, diagnostic: noopDiagnostic };
+    }
+    return { status: "error" };
   };
 
   let deltaCallCount = 0;
@@ -118,33 +166,98 @@ function makeDeps(opts: {
     { oid: SHA_HEAD, messageHeadline: "fix: address review 2 findings (#16)" },
   ];
 
+  const initialComments: { author: string; body: string }[] = [
+    { body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash), author: TEST_ACTOR },
+  ];
+  if (opts.priorNoopCleanMarker) {
+    initialComments.push({
+      author: TEST_ACTOR,
+      body: preMergeAutofixNoopComment({
+        issueNumber: 16,
+        headSha: SHA_HEAD,
+        diagnostic: noopDiagnostic,
+        timestamp: "2026-07-29T00:00:00Z",
+      }),
+    });
+  }
+  if (opts.priorAttemptMarker) {
+    initialComments.push({
+      author: TEST_ACTOR,
+      body: preMergeAutofixAttemptComment({
+        issueNumber: 16,
+        headSha: SHA_HEAD,
+        timestamp: "2026-07-29T00:00:00Z",
+      }),
+    });
+  }
+
   const deps: ShaGateDeps = {
     getIssueDetail: async () =>
       ({
         title: "Test issue",
         body: "Body",
-        comments: [{ body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash), author: TEST_ACTOR }],
+        // Include comments posted during the gate so the durable marker scan
+        // and re-review digest see them (mirrors production postComment → issue).
+        comments: [
+          ...initialComments,
+          ...rec.comments.map((body) => ({ author: TEST_ACTOR, body })),
+        ],
       }) as any,
     getPrDetail: async () => {
-      // After a successful fix push, return the new head. An errored auto-fix
-      // attempt makes no push, so the head must stay unchanged (#481 review 2).
+      // After a successful fix push, return the new head. noop-clean / error
+      // make no push, so the head must stay unchanged (#481 review 2 / #698).
       const fixPushed = opts.autoFixResult === "fix-committed" && rec.autoFixCalls > 0;
-      return { head_sha: fixPushed ? (opts.reReviewPrHead ?? SHA_AFTER_FIX) : SHA_HEAD } as any;
+      return {
+        head_sha: fixPushed ? (opts.reReviewPrHead ?? SHA_AFTER_FIX) : SHA_HEAD,
+        head_ref: "pipeline/16-test",
+      } as any;
     },
     getPrCommits: async () => commits as any,
     getPrDiff: async () => NEW_DIFF,
     getCommitDeltaDiff: async () => NEW_DIFF,
     runDeltaReview,
-    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    postComment: async (_cfg, _n, body) => {
+      if (
+        opts.failAttemptMarker &&
+        body.startsWith(PRE_MERGE_AUTOFIX_ATTEMPT_HEADING)
+      ) {
+        throw new Error("simulated GitHub failure posting attempt marker");
+      }
+      if (
+        opts.failNoopCompletionMarker &&
+        body.startsWith(PRE_MERGE_AUTOFIX_NOOP_HEADING)
+      ) {
+        throw new Error("simulated GitHub failure posting noop completion marker");
+      }
+      rec.comments.push(body);
+    },
     transition: async () => {},
     setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
     getForIssue: async () => null,
     getGhActor: async () => TEST_ACTOR,
     attemptPreMergeAutoFix: autoFix,
-    // The live remote ref confirms the auto-fix head, as it would in the
-    // real one-attempt happy path (#371 review 1 finding 1: the ls-remote
-    // confirmation now always runs after an approving re-review).
-    getRemoteHead: async () => postFixHeadSha,
+    // The live remote ref confirms the re-review head (#371 / #698).
+    getRemoteHead: async () =>
+      opts.autoFixResult === "fix-committed" ? postFixHeadSha : SHA_HEAD,
+    // HEAD content for post-noop classification demotion (#698/#683).
+    readHeadFiles: async (_worktree, _sha, paths) => {
+      const supplied = opts.headFiles ?? [];
+      return paths.map((p) => {
+        const hit = supplied.find(
+          (h) => h.path.toLowerCase() === p.toLowerCase(),
+        );
+        return (
+          hit ??
+          ({
+            path: p,
+            content: "",
+            truncated: false,
+            present: false,
+            absenceReason: "not-found",
+          } satisfies HeadFileState)
+        );
+      });
+    },
   };
   return { deps, rec };
 }
@@ -246,9 +359,14 @@ test("pre-merge auto-fix 5.1: all-correctness blocks → auto-fix → re-review 
   assert.equal(out, null, "auto-fix + re-review approved → pre-merge proceeds");
   assert.equal(rec.autoFixCalls, 1, "fix seam called exactly once");
   assert.deepEqual(rec.blocked, [], "setBlocked must NOT be called");
-  assert.equal(rec.comments.length, 2, "initial delta comment + re-review delta comment both posted");
-  assert.match(rec.comments[1], /reviewed-sha:/, "re-review comment embeds new reviewed-sha");
-  assert.match(rec.comments[1], /verdict-diff-hash:/, "re-review comment embeds diff-hash");
+  const deltaComments = rec.comments.filter((c) => c.startsWith(DELTA_REVIEW_MARKER_PREFIX));
+  assert.equal(deltaComments.length, 2, "initial delta comment + re-review delta comment both posted");
+  assert.ok(
+    rec.comments.some((c) => c.startsWith(PRE_MERGE_AUTOFIX_ATTEMPT_HEADING)),
+    "attempt-started durable marker posted before harness",
+  );
+  assert.match(deltaComments[1], /reviewed-sha:/, "re-review comment embeds new reviewed-sha");
+  assert.match(deltaComments[1], /verdict-diff-hash:/, "re-review comment embeds diff-hash");
 });
 
 // ---------------------------------------------------------------------------
@@ -579,10 +697,17 @@ test("pre-merge auto-fix 5.6: auto-fix returns error → blocked, no partial pus
   );
   assert.equal(rec.autoFixCalls, 1, "seam was called");
   assert.equal(rec.blocked.length, 1, "blocked after error");
-  assert.equal(rec.comments.length, 1, "only the initial delta comment; no re-review comment");
+  const deltaComments = rec.comments.filter((c) => c.startsWith(DELTA_REVIEW_MARKER_PREFIX));
+  assert.equal(deltaComments.length, 1, "only the initial delta comment; no re-review comment");
+  assert.ok(
+    rec.comments.some((c) => c.startsWith(PRE_MERGE_AUTOFIX_ATTEMPT_HEADING)),
+    "attempt-started marker still posted before the failed harness",
+  );
 });
 
-test("pre-merge auto-fix #553: auto-fix returns error with a diagnostic → block reason surfaces it", async (t) => {
+test("pre-merge auto-fix #553/#698: non-noop error with a diagnostic still surfaces it on hard block", async (t) => {
+  // Generic error (dirty/timeout/unsalvaged) still hard-blocks with disclosure.
+  // Clean no-commit is noop-clean and re-verifies (#698) — covered separately.
   const { deps, rec } = makeDeps({
     findings: [blockingFinding("correctness")],
     reReviewFindings: [],
@@ -591,8 +716,7 @@ test("pre-merge auto-fix #553: auto-fix returns error with a diagnostic → bloc
   deps.attemptPreMergeAutoFix = async () => ({
     status: "error",
     diagnostic:
-      "pre-merge fix harness for #16 ran but left worktree /fake/worktree clean with no new " +
-      "commit — no recoverable work was found there",
+      "pre-merge fix harness for #16 left worktree /fake/worktree in an unrecoverable dirty state",
   });
   let out: any;
   await quiet(t, async () => {
@@ -603,7 +727,7 @@ test("pre-merge auto-fix #553: auto-fix returns error with a diagnostic → bloc
   assert.match(
     rec.blocked[0].reason,
     /\/fake\/worktree/,
-    "the #553 diagnostic naming the inspected worktree must reach the block reason, not just the internal result",
+    "the diagnostic naming the inspected worktree must reach the block reason",
   );
 });
 
@@ -612,9 +736,17 @@ test("pre-merge auto-fix #553: auto-fix returns error with a diagnostic → bloc
 // ---------------------------------------------------------------------------
 
 test("pre-merge auto-fix: fix committed, re-review still blocks → needs-human, no second attempt", async (t) => {
+  // Distinct title/file from the initial finding so re-review is not demoted as
+  // an unacknowledged reversal of the just-posted delta (#389). A same-key
+  // re-assert would become advisory and the gate would proceed.
+  const residual: ReviewFinding = {
+    ...blockingFinding("correctness", "Residual after fix"),
+    file: "core/scripts/stages/other.ts",
+    body: "A different residual defect that the auto-fix did not address",
+  } as ReviewFinding;
   const { deps, rec } = makeDeps({
     findings: [blockingFinding("correctness")],
-    reReviewFindings: [blockingFinding("correctness")], // still blocking after fix
+    reReviewFindings: [residual],
     autoFixResult: "fix-committed",
     priorAutoFixCommit: false,
   });
@@ -628,7 +760,12 @@ test("pre-merge auto-fix: fix committed, re-review still blocks → needs-human,
   );
   assert.equal(rec.autoFixCalls, 1, "seam called exactly once");
   assert.equal(rec.blocked.length, 1, "blocked after re-review still blocks");
-  assert.equal(rec.comments.length, 2, "both initial and re-review delta comments posted");
+  // Initial delta + re-review delta (both use DELTA_REVIEW_MARKER_PREFIX).
+  assert.equal(
+    rec.comments.filter((c) => c.startsWith(DELTA_REVIEW_MARKER_PREFIX)).length,
+    2,
+    "both initial and re-review delta comments posted",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -644,10 +781,11 @@ test("pre-merge auto-fix 5.8: re-review comment uses delta marker prefix, not re
   await quiet(t, async () => {
     await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
   });
-  assert.equal(rec.comments.length, 2, "two delta comments posted");
-  // Both comments must use the delta review marker prefix (not "## Review 2") so
+  const deltaComments = rec.comments.filter((c) => c.startsWith(DELTA_REVIEW_MARKER_PREFIX));
+  assert.equal(deltaComments.length, 2, "two delta comments posted");
+  // Both delta comments must use the delta review marker prefix (not "## Review 2") so
   // countPriorRounds does not count them against the max_adversarial_rounds ceiling.
-  for (const c of rec.comments) {
+  for (const c of deltaComments) {
     assert.ok(
       c.startsWith(DELTA_REVIEW_MARKER_PREFIX),
       `comment must start with DELTA_REVIEW_MARKER_PREFIX, got: ${c.slice(0, 60)}`,
@@ -1016,9 +1154,10 @@ test("pre-merge auto-fix finding-2: re-review needs-attention + zero findings �
   assert.equal(rec.blocked.length, 1, "must block on unparseable re-review output");
   // R2 Finding 2: the re-review comment must NOT embed a reviewed-sha sentinel when unparseable,
   // so the reuse path cannot treat it as a clean approval on the next re-entry.
-  assert.equal(rec.comments.length, 2, "initial + re-review comments both posted");
+  const deltaComments = rec.comments.filter((c) => c.startsWith(DELTA_REVIEW_MARKER_PREFIX));
+  assert.equal(deltaComments.length, 2, "initial + re-review comments both posted");
   assert.ok(
-    !rec.comments[1].includes("<!-- reviewed-sha:"),
+    !deltaComments[1].includes("<!-- reviewed-sha:"),
     "re-review comment for unparseable output must NOT embed reviewed-sha sentinel",
   );
 });
@@ -1306,14 +1445,15 @@ test(
       "the re-review must evaluate the post-fix diff (reviewed-sha...auto-fix-commit-sha), " +
         "not the pre-fix diff a stale GitHub-API PR-head read would produce",
     );
-    assert.equal(comments.length, 2, "initial + re-review delta comments both posted");
+    const deltaComments = comments.filter((c) => c.startsWith(DELTA_REVIEW_MARKER_PREFIX));
+    assert.equal(deltaComments.length, 2, "initial + re-review delta comments both posted");
     assert.match(
-      comments[1]!,
+      deltaComments[1]!,
       new RegExp(`reviewed-sha: ${SHA_AFTER_FIX}`),
       "re-review comment's reviewed-sha must equal the post-fix head (auto-fix commit SHA)",
     );
     assert.ok(
-      !comments[1]!.includes(`reviewed-sha: ${SHA_HEAD}`),
+      !deltaComments[1]!.includes(`reviewed-sha: ${SHA_HEAD}`),
       "re-review comment must NOT anchor reviewed-sha to the pre-fix head",
     );
 
@@ -1711,7 +1851,7 @@ test("performPreMergeAutoFix #547: harness reports success without committing, w
   assert.equal(resetCall, undefined, "a successful salvage must NOT roll back the worktree");
 });
 
-test("performPreMergeAutoFix #547: genuinely clean worktree (nothing to salvage) → existing fail-closed rollback unchanged", async () => {
+test("performPreMergeAutoFix #547/#698: genuinely clean worktree (nothing to salvage) → noop-clean with #553 disclosure", async () => {
   const { fn: gitFn, calls } = makeSeqGitFn([
     // rev-parse HEAD (headBefore)
     { code: 0, stdout: "sha1" },
@@ -1721,9 +1861,9 @@ test("performPreMergeAutoFix #547: genuinely clean worktree (nothing to salvage)
     { code: 0, stdout: "" },
     // rev-parse HEAD (headAfterHarness — SAME as headBefore: no new commit)
     { code: 0, stdout: "sha1" },
-    // reset --hard sha1 (rollback, since salvage found nothing)
+    // reset --hard sha1 (no-op rollback after clean tree)
     { code: 0, stdout: "" },
-    // clean -fd (rollback)
+    // clean -fd
     { code: 0, stdout: "" },
   ]);
   const { fn: salvageFn, calls: salvageCalls } = makeSalvageFn({ salvaged: false });
@@ -1740,8 +1880,12 @@ test("performPreMergeAutoFix #547: genuinely clean worktree (nothing to salvage)
     salvageFn,
   );
 
-  assert.equal(result.status, "error", "a clean worktree (nothing salvageable) must keep the existing fail-closed rollback");
-  // #553: the disclosed clean/no-commit escalation names the inspected
+  assert.equal(
+    result.status,
+    "noop-clean",
+    "a clean worktree (nothing salvageable) is noop-clean for re-verify, not an immediate hard-block error",
+  );
+  // #553: the disclosed clean/no-commit outcome names the inspected
   // worktree so the operator can tell "harness ran, nothing recoverable"
   // apart from a silent no-op.
   assert.match(
@@ -1749,12 +1893,17 @@ test("performPreMergeAutoFix #547: genuinely clean worktree (nothing to salvage)
     /\/fake\/worktree/,
     "the #553 disclosure must name the inspected worktree path",
   );
+  assert.equal(
+    (result as { headSha?: string }).headSha,
+    "sha1",
+    "noop-clean carries the unchanged head for re-verify",
+  );
   assert.equal(salvageCalls.length, 1, "salvage is attempted (and finds nothing) before rollback");
   const resetCall = calls.find((a) => a[0] === "reset" && a[1] === "--hard");
   assert.ok(resetCall, "git reset --hard must still be called when nothing was salvaged");
 });
 
-test("performPreMergeAutoFix #553: harness reports success with a genuinely clean worktree (no commit) → disclosed escalation names the worktree", async () => {
+test("performPreMergeAutoFix #553/#698: harness reports success with a genuinely clean worktree (no commit) → noop-clean names the worktree", async () => {
   const { fn: gitFn } = makeSeqGitFn([
     // rev-parse HEAD (headBefore)
     { code: 0, stdout: "sha1" },
@@ -1766,9 +1915,9 @@ test("performPreMergeAutoFix #553: harness reports success with a genuinely clea
     { code: 0, stdout: "sha1" },
     // status --porcelain (post-harness: also clean)
     { code: 0, stdout: "" },
-    // reset --hard sha1 (rollback, since salvage found nothing)
+    // reset --hard sha1 (no-op rollback)
     { code: 0, stdout: "" },
-    // clean -fd (rollback)
+    // clean -fd
     { code: 0, stdout: "" },
   ]);
   const { fn: salvageFn, calls: salvageCalls } = makeSalvageFn({ salvaged: false });
@@ -1785,7 +1934,7 @@ test("performPreMergeAutoFix #553: harness reports success with a genuinely clea
     salvageFn,
   );
 
-  assert.equal(result.status, "error", "a clean worktree (nothing salvageable) must keep the existing fail-closed rollback");
+  assert.equal(result.status, "noop-clean", "clean no-commit is noop-clean for re-verify (#698)");
   assert.match(
     (result as { diagnostic?: string }).diagnostic ?? "",
     /\/fake\/worktree/,
@@ -1889,3 +2038,631 @@ test("performPreMergeAutoFix R1-F1: post-harness HEAD read fails/empty → fail-
 // only holds because the fix calls `salvageFn` before rolling back on the
 // crash path, and `result.status === "fix-committed"` only holds because a
 // successful salvage is no longer discarded.
+
+// ---------------------------------------------------------------------------
+// #698: clean no-op auto-fix → re-verify against HEAD (not immediate hard block)
+// ---------------------------------------------------------------------------
+
+test("preMergeAutofixNoopComment: attested durable marker at head SHA", () => {
+  const body = preMergeAutofixNoopComment({
+    issueNumber: 16,
+    headSha: SHA_HEAD,
+    diagnostic: "worktree /fake clean",
+    timestamp: "2026-07-29T00:00:00Z",
+  });
+  assert.ok(body.startsWith(PRE_MERGE_AUTOFIX_NOOP_HEADING));
+  assert.ok(isVerifiedPipelineAttestation(body), "marker must carry a verified pipeline attestation");
+  assert.equal(
+    hasPreMergeAutofixNoopAtHead(
+      [{ author: TEST_ACTOR, body }],
+      SHA_HEAD,
+      TEST_ACTOR,
+    ),
+    true,
+  );
+  assert.equal(
+    hasPreMergeAutofixNoopAtHead(
+      [{ author: TEST_ACTOR, body }],
+      SHA_AFTER_FIX,
+      TEST_ACTOR,
+    ),
+    false,
+    "marker is head-SHA specific",
+  );
+  assert.equal(
+    hasPreMergeAutofixNoopAtHead(
+      [{ author: "attacker", body }],
+      SHA_HEAD,
+      TEST_ACTOR,
+    ),
+    false,
+    "untrusted author must not satisfy the durable marker",
+  );
+});
+
+test("formatNoopStillBrokenReason: names path and no-diff recipe", () => {
+  const reason = formatNoopStillBrokenReason(
+    [blockingFinding("correctness", "stale class"), {
+      ...blockingFinding("correctness"),
+      file: "core/scripts/stages/pre_merge.ts",
+      title: "misclassified off-ramp",
+    } as ReviewFinding],
+    "worktree /x clean",
+  );
+  assert.match(reason, /auto-fix made no diff/);
+  assert.match(reason, /core\/scripts\/stages\/pre_merge\.ts/);
+  assert.match(reason, /human fix required/);
+  assert.match(reason, /worktree \/x clean/);
+});
+
+test("pre-merge auto-fix #698: noop-clean → re-verify approve → proceeds (no setBlocked)", async (t) => {
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("correctness")],
+    reReviewFindings: [], // re-verify clean: finding gone / already fixed
+    autoFixResult: "noop-clean",
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out, null, "noop-clean + re-verify approve → pre-merge proceeds");
+  assert.equal(rec.autoFixCalls, 1, "auto-fix seam called exactly once");
+  assert.equal(rec.deltaReviewCalls, 2, "initial delta + re-verify both ran (bites if re-verify skipped)");
+  assert.deepEqual(rec.blocked, [], "setBlocked must NOT be called on re-verify clean");
+  // Durable marker + re-verify delta comment (and initial delta).
+  assert.ok(
+    rec.comments.some((c) => c.startsWith(PRE_MERGE_AUTOFIX_NOOP_HEADING)),
+    "must post durable noop-clean marker",
+  );
+  assert.ok(
+    rec.comments.filter((c) => c.startsWith(DELTA_REVIEW_MARKER_PREFIX)).length >= 2,
+    "initial + re-verify delta comments",
+  );
+});
+
+test("pre-merge auto-fix #698: noop-clean → re-verify still blocks → needs-human once with recipe", async (t) => {
+  // Distinct residual finding (not a same-key re-assert) so it stays blocking
+  // under the #389 reversal demotion rules — models a true still-broken case.
+  const stillBroken: ReviewFinding = {
+    ...blockingFinding("correctness", "Still broken after noop"),
+    file: "core/scripts/stages/pre_merge.ts",
+    body: "HEAD still implements the incorrect control-flow for this off-ramp",
+  } as ReviewFinding;
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("correctness")],
+    reReviewFindings: [stillBroken],
+    autoFixResult: "noop-clean",
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out?.advanced, false);
+  assert.equal(out?.status, "blocked");
+  assert.equal(out?.reason, "pre-merge delta review: blocking findings");
+  assert.equal(out?.blockerKind, "needs-human");
+  assert.equal(out?.offrampPathTag, "delta-review");
+  assert.equal(rec.autoFixCalls, 1, "exactly one auto-fix attempt");
+  assert.equal(rec.deltaReviewCalls, 2, "initial + re-verify; no second fix");
+  assert.equal(rec.blocked.length, 1, "exactly one needs-human");
+  assert.match(rec.blocked[0].reason, /auto-fix made no diff/);
+  assert.match(rec.blocked[0].reason, /core\/scripts\/stages\/pre_merge\.ts/);
+  assert.match(rec.blocked[0].reason, /\/fake\/worktree/);
+});
+
+test("pre-merge auto-fix #698: prior durable noop-clean marker exhausts attempt without second harness invoke", async (t) => {
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("correctness")],
+    reReviewFindings: [],
+    autoFixResult: "noop-clean", // would re-verify if called — must NOT be called
+    priorNoopCleanMarker: true,
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out.status, "blocked");
+  assert.equal(rec.autoFixCalls, 0, "prior noop-clean marker must prevent a second auto-fix");
+  assert.equal(rec.deltaReviewCalls, 1, "only the initial delta review; no re-verify after skipped fix");
+  assert.equal(rec.blocked.length, 1);
+});
+
+test("pre-merge auto-fix #698 review-2: prior attempt-started marker exhausts attempt without second harness invoke", async (t) => {
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("correctness")],
+    reReviewFindings: [],
+    autoFixResult: "noop-clean",
+    priorAttemptMarker: true,
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out.status, "blocked");
+  assert.equal(rec.autoFixCalls, 0, "prior attempt-started marker must prevent a second auto-fix");
+  assert.equal(rec.blocked.length, 1);
+});
+
+test("pre-merge auto-fix #698 review-2: noop completion marker post fails — re-verify continues; second entry does not re-invoke harness", async (t) => {
+  // Entry 1: harness runs, noop-clean, completion marker post fails, re-verify
+  // still blocks. Attempt-started was posted first so the bound is durable.
+  const residual: ReviewFinding = {
+    ...blockingFinding("correctness", "Still broken after noop"),
+    file: "core/scripts/stages/pre_merge.ts",
+  } as ReviewFinding;
+  const first = makeDeps({
+    findings: [blockingFinding("correctness")],
+    reReviewFindings: [residual],
+    autoFixResult: "noop-clean",
+    failNoopCompletionMarker: true,
+  });
+  let out1: any;
+  await quiet(t, async () => {
+    out1 = await enforceReviewShaGate(cfgWithPolicy, 16, 99, first.deps);
+  });
+  assert.equal(out1.status, "blocked");
+  assert.equal(first.rec.autoFixCalls, 1, "first entry runs harness once");
+  assert.equal(first.rec.deltaReviewCalls, 2, "re-verify still runs despite completion-marker failure");
+  assert.ok(
+    first.rec.comments.some((c) => c.startsWith(PRE_MERGE_AUTOFIX_ATTEMPT_HEADING)),
+    "attempt-started marker must be posted",
+  );
+  assert.ok(
+    !first.rec.comments.some((c) => c.startsWith(PRE_MERGE_AUTOFIX_NOOP_HEADING)),
+    "noop completion marker must not be present when post fails",
+  );
+
+  // Entry 2: only the attempt-started marker is durable — must NOT re-invoke harness.
+  const second = makeDeps({
+    findings: [blockingFinding("correctness")],
+    reReviewFindings: [],
+    autoFixResult: "noop-clean",
+    priorAttemptMarker: true,
+  });
+  let out2: any;
+  await quiet(t, async () => {
+    out2 = await enforceReviewShaGate(cfgWithPolicy, 16, 99, second.deps);
+  });
+  assert.equal(out2.status, "blocked");
+  assert.equal(
+    second.rec.autoFixCalls,
+    0,
+    "second entry must not re-invoke auto-fix when attempt-started marker is present",
+  );
+});
+
+test("pre-merge auto-fix #698 review-2: attempt-started marker post fails — harness not invoked", async (t) => {
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("correctness")],
+    reReviewFindings: [],
+    autoFixResult: "noop-clean",
+    failAttemptMarker: true,
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out.status, "blocked");
+  assert.equal(rec.autoFixCalls, 0, "must not invoke harness when attempt marker cannot be recorded");
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0].reason, /attempt marker/i);
+});
+
+test("pre-merge auto-fix #698: #683-class stale classification already correct on HEAD does not hard-block", async (t) => {
+  // Models dogfood #683: delta claims openspec-invalid misclassification, but
+  // HEAD already routes that off-ramp to needs-human. Auto-fix correctly makes
+  // no commit; re-verify approves (finding not reproducible).
+  const staleClassification: ReviewFinding = {
+    severity: "high",
+    title: "dirty-worktree still classified as openspec-invalid",
+    body: "Archive cleanliness path should not inflate openspec-invalid",
+    confidence: 0.9,
+    recommendation: "Use needs-human for archive cleanliness failure",
+    category: "correctness",
+    file: "core/scripts/stages/pre_merge.ts",
+  } as ReviewFinding;
+  const { deps, rec } = makeDeps({
+    findings: [staleClassification],
+    reReviewFindings: [], // re-verify: not reproducible / already fixed on HEAD
+    autoFixResult: "noop-clean",
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out, null, "#683-class stale finding must not hard-block when re-verify is clean");
+  assert.deepEqual(rec.blocked, [], "no needs-human when HEAD already correct");
+  assert.equal(rec.autoFixCalls, 1);
+  assert.equal(rec.deltaReviewCalls, 2, "re-verify must run (would fail if hard-blocked on clean no-commit alone)");
+});
+
+test("pre-merge auto-fix #698: re-raised #683-class finding demoted when HEAD already implements recommendation", async (t) => {
+  // Failure mode the review required: after noop-clean, re-verify returns a
+  // *new* pure classification claim (distinct from the initial delta finding so
+  // #389/#496 settled-surface/reversal demotion cannot swallow it) asserting
+  // HEAD is still wrong, while the cited region already implements the
+  // recommended `needs-human` routing. Without the classification HEAD filter
+  // the finding stays blocking and needs-human strands the item.
+  const initialDeltaFinding = blockingFinding("correctness", "unrelated auto-fixable claim");
+  const staleClassification: ReviewFinding = {
+    severity: "high",
+    title: "dirty-worktree still classified as openspec-invalid",
+    body:
+      "Archive cleanliness path is still misclassified as openspec-invalid " +
+      "instead of the correct off-ramp.",
+    confidence: 0.94,
+    recommendation: "Use `needs-human` for archive cleanliness failure",
+    category: "correctness",
+    file: "core/scripts/stages/pre_merge.ts",
+    line_start: 1,
+    line_end: 5,
+  } as ReviewFinding;
+  const headAlreadyCorrect: HeadFileState = {
+    path: "core/scripts/stages/pre_merge.ts",
+    content:
+      "// archive cleanliness off-ramp\n" +
+      "if (archiveDirty) {\n" +
+      '  await setBlocked(cfg, n, reason, "pre-merge", "needs-human");\n' +
+      '  return { advanced: false, status: "blocked" };\n' +
+      "}\n",
+    truncated: false,
+    present: true,
+  };
+  const { deps, rec } = makeDeps({
+    findings: [initialDeltaFinding],
+    reReviewFindings: [staleClassification],
+    autoFixResult: "noop-clean",
+    headFiles: [headAlreadyCorrect],
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(
+    out,
+    null,
+    "unsupported classification claim against already-correct HEAD must not hard-block",
+  );
+  assert.deepEqual(rec.blocked, [], "must demote via HEAD classification filter, not setBlocked");
+  assert.equal(rec.autoFixCalls, 1, "exactly one auto-fix; demotion is not a second fix");
+  assert.equal(rec.deltaReviewCalls, 2, "initial delta + re-verify both ran");
+});
+
+test("pre-merge auto-fix #698: re-raised classification with current-file evidence stays blocking", async (t) => {
+  // When HEAD is still wrong and the finding quotes current file lines, demotion
+  // must NOT fire — still-broken with evidence remains needs-human. Distinct
+  // from the initial delta finding so reversal/settled-surface cannot demote it
+  // before the HEAD classification filter sees the evidence.
+  const stillWrongLine =
+    'return { status: "openspec-invalid", reason: "archive dirty" }; // still wrong off-ramp';
+  const withEvidence: ReviewFinding = {
+    severity: "high",
+    title: "dirty-worktree still classified as openspec-invalid",
+    body:
+      "HEAD still implements the incorrect classification. Current file shows:\n" +
+      stillWrongLine,
+    confidence: 0.94,
+    recommendation: "Use `needs-human` for archive cleanliness failure",
+    category: "correctness",
+    file: "core/scripts/stages/pre_merge.ts",
+    line_start: 1,
+    line_end: 3,
+  } as ReviewFinding;
+  const headStillWrong: HeadFileState = {
+    path: "core/scripts/stages/pre_merge.ts",
+    content:
+      "function classifyArchive(dirty: boolean) {\n" +
+      `  ${stillWrongLine}\n` +
+      "}\n",
+    truncated: false,
+    present: true,
+  };
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("correctness", "unrelated auto-fixable claim")],
+    reReviewFindings: [withEvidence],
+    autoFixResult: "noop-clean",
+    headFiles: [headStillWrong],
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out?.status, "blocked", "current-file evidence of still-wrong behavior must block");
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0].reason, /auto-fix made no diff/);
+});
+
+// ---------------------------------------------------------------------------
+// Pure helpers: post-noop classification HEAD evidence rule (#698/#683)
+// ---------------------------------------------------------------------------
+
+test("applyNoopHeadClassificationEvidenceRule: demotes pure claim when cited region has recommendation token", () => {
+  const f: ReviewFinding = {
+    severity: "high",
+    title: "misclassified as openspec-invalid",
+    body: "This off-ramp is still classified as openspec-invalid",
+    confidence: 0.9,
+    recommendation: "Route to `needs-human` instead",
+    category: "correctness",
+    file: "core/scripts/stages/pre_merge.ts",
+    line_start: 1,
+    line_end: 1,
+  } as ReviewFinding;
+  const headFiles: HeadFileState[] = [
+    {
+      path: "core/scripts/stages/pre_merge.ts",
+      content: 'await setBlocked(cfg, n, r, "pre-merge", "needs-human");\n',
+      truncated: false,
+      present: true,
+    },
+  ];
+  const result = applyNoopHeadClassificationEvidenceRule([f], headFiles);
+  assert.deepEqual(result.blocking, [], "must demote when cited region implements recommendation");
+  assert.equal(result.demoted.length, 1);
+  assert.equal(result.demoted[0].reason, HEAD_ALREADY_IMPLEMENTS_RECOMMENDATION);
+});
+
+test("applyNoopHeadClassificationEvidenceRule: keeps blocking when recommendation token is only outside cited region", () => {
+  // Review-2 finding: whole-file token match demoted a valid blocking claim on
+  // one branch because another branch elsewhere in the same file already had
+  // the recommended token.
+  const f: ReviewFinding = {
+    severity: "high",
+    title: "branch B still misclassified as openspec-invalid",
+    body: "The archive off-ramp on branch B is still classified as openspec-invalid",
+    confidence: 0.95,
+    recommendation: "Route branch B to `needs-human`",
+    category: "correctness",
+    file: "a.ts",
+    line_start: 5,
+    line_end: 7,
+  } as ReviewFinding;
+  const headFiles: HeadFileState[] = [
+    {
+      path: "a.ts",
+      content:
+        "// branch A (correct, unrelated)\n" +
+        'if (other) { return "needs-human"; }\n' +
+        "\n" +
+        "// branch B (still wrong — cited region)\n" +
+        "if (archiveDirty) {\n" +
+        '  return { status: "openspec-invalid" };\n' +
+        "}\n",
+      truncated: false,
+      present: true,
+    },
+  ];
+  const result = applyNoopHeadClassificationEvidenceRule([f], headFiles);
+  assert.deepEqual(
+    result.blocking,
+    [f],
+    "token elsewhere in the file must not demote a finding about a different cited region",
+  );
+  assert.equal(result.demoted.length, 0);
+});
+
+test("applyNoopHeadClassificationEvidenceRule: keeps blocking when line_start is absent (no region)", () => {
+  const f: ReviewFinding = {
+    severity: "high",
+    title: "misclassified as openspec-invalid",
+    body: "This off-ramp is still classified as openspec-invalid",
+    confidence: 0.9,
+    recommendation: "Route to `needs-human` instead",
+    category: "correctness",
+    file: "a.ts",
+    // no line_start — whole-file match is insufficient
+  } as ReviewFinding;
+  const headFiles: HeadFileState[] = [
+    {
+      path: "a.ts",
+      content: 'await setBlocked(..., "needs-human");\n',
+      truncated: false,
+      present: true,
+    },
+  ];
+  const result = applyNoopHeadClassificationEvidenceRule([f], headFiles);
+  assert.deepEqual(result.blocking, [f], "missing cited region fails closed to blocking");
+  assert.equal(result.demoted.length, 0);
+});
+
+test("applyNoopHeadClassificationEvidenceRule: keeps blocking when body quotes HEAD evidence", () => {
+  const quoted =
+    'return { status: "openspec-invalid", reason: "archive cleanliness failed" };';
+  const f: ReviewFinding = {
+    severity: "high",
+    title: "misclassified as openspec-invalid",
+    body: `Current HEAD still has the wrong control-flow:\n${quoted}`,
+    confidence: 0.9,
+    recommendation: "Use `needs-human`",
+    category: "correctness",
+    file: "a.ts",
+    line_start: 1,
+    line_end: 3,
+  } as ReviewFinding;
+  const headFiles: HeadFileState[] = [
+    {
+      path: "a.ts",
+      content: `${quoted}\n// also mentions needs-human elsewhere\nconst x = "needs-human";\n`,
+      truncated: false,
+      present: true,
+    },
+  ];
+  const result = applyNoopHeadClassificationEvidenceRule([f], headFiles);
+  assert.deepEqual(result.blocking, [f], "quoted HEAD evidence of still-wrong behavior stays blocking");
+  assert.equal(result.demoted.length, 0);
+});
+
+test("applyNoopHeadClassificationEvidenceRule: keeps non-classification findings blocking", () => {
+  const f: ReviewFinding = {
+    severity: "high",
+    title: "null deref in parser",
+    body: "Missing null check causes crash",
+    confidence: 0.9,
+    recommendation: "Add a null guard",
+    category: "correctness",
+    file: "parser.ts",
+    line_start: 1,
+  } as ReviewFinding;
+  const headFiles: HeadFileState[] = [
+    {
+      path: "parser.ts",
+      content: "export function parse(x) { return x.value; }\n",
+      truncated: false,
+      present: true,
+    },
+  ];
+  const result = applyNoopHeadClassificationEvidenceRule([f], headFiles);
+  assert.deepEqual(result.blocking, [f]);
+  assert.equal(result.demoted.length, 0);
+});
+
+test("applyNoopHeadClassificationEvidenceRule: keeps blocking when HEAD cannot prove recommendation", () => {
+  const f: ReviewFinding = {
+    severity: "high",
+    title: "misclassified as openspec-invalid",
+    body: "Off-ramp classification is wrong",
+    confidence: 0.9,
+    recommendation: "Use `needs-human`",
+    category: "correctness",
+    file: "a.ts",
+    line_start: 1,
+  } as ReviewFinding;
+  const headFiles: HeadFileState[] = [
+    {
+      path: "a.ts",
+      content: 'return { status: "openspec-invalid" };\n',
+      truncated: false,
+      present: true,
+    },
+  ];
+  const result = applyNoopHeadClassificationEvidenceRule([f], headFiles);
+  assert.deepEqual(result.blocking, [f], "cannot prove HEAD implements recommendation → keep blocking");
+});
+
+test("applyNoopHeadClassificationEvidenceRule: executable failure evidence keeps finding blocking", () => {
+  const f: ReviewFinding = {
+    severity: "high",
+    title: "misclassified as openspec-invalid",
+    body: "npm test still fails with exit code 1 when archive is dirty",
+    confidence: 0.9,
+    recommendation: "Use `needs-human`",
+    category: "correctness",
+    file: "a.ts",
+    line_start: 1,
+  } as ReviewFinding;
+  const headFiles: HeadFileState[] = [
+    {
+      path: "a.ts",
+      content: 'await setBlocked(..., "needs-human");\n',
+      truncated: false,
+      present: true,
+    },
+  ];
+  const result = applyNoopHeadClassificationEvidenceRule([f], headFiles);
+  assert.deepEqual(result.blocking, [f], "executable failure evidence must keep finding blocking");
+});
+
+test("isClassificationOrControlFlowClaim / extractClassificationTokens / headImplements helpers", () => {
+  assert.equal(
+    isClassificationOrControlFlowClaim({
+      title: "null deref",
+      body: "crash",
+      recommendation: "guard",
+    }),
+    false,
+  );
+  assert.equal(
+    isClassificationOrControlFlowClaim({
+      title: "misclassified off-ramp",
+      body: "classified as openspec-invalid",
+      recommendation: "Use needs-human",
+    }),
+    true,
+  );
+  // Arbitrary backticks in claim+recommendation are NOT enough without
+  // classification language + a known pipeline recommendation token.
+  assert.equal(
+    isClassificationOrControlFlowClaim({
+      title: "missing `parseFoo` call",
+      body: "Should invoke `parseFoo` here",
+      recommendation: "Call `parseFoo` first",
+    }),
+    false,
+    "arbitrary backticks must not classify a finding as pure classification",
+  );
+  assert.ok(extractClassificationTokens("Use `needs-human` please").includes("needs-human"));
+  assert.deepEqual(
+    extractKnownPipelineClassificationTokens("Use `parseFoo` and needs-human"),
+    ["needs-human"],
+    "known tokens only — ignore arbitrary backticks",
+  );
+  assert.equal(
+    citedRegionContent("a\nb\nc\n", 2, 3),
+    "b\nc",
+  );
+  assert.equal(citedRegionContent("a\nb\n", undefined, undefined), null);
+  assert.equal(
+    headImplementsRecommendedClassification(
+      { file: "a.ts", recommendation: "Use `needs-human`", line_start: 1, line_end: 1 },
+      [{ path: "a.ts", content: 'status: "needs-human"', truncated: false, present: true }],
+    ),
+    true,
+  );
+  assert.equal(
+    headImplementsRecommendedClassification(
+      { file: "a.ts", recommendation: "Use `needs-human`" }, // no line range
+      [{ path: "a.ts", content: 'status: "needs-human"', truncated: false, present: true }],
+    ),
+    false,
+    "whole-file presence without cited region must not prove recommendation",
+  );
+  assert.equal(citesExecutableFailureEvidence("assert.equal(x, y) failed"), true);
+  assert.equal(citesExecutableFailureEvidence("looks wrong to me"), false);
+});
+
+test("preMergeAutofixAttemptComment / hasPreMergeAutofixBoundMarkerAtHead", () => {
+  const body = preMergeAutofixAttemptComment({
+    issueNumber: 16,
+    headSha: SHA_HEAD,
+    timestamp: "2026-07-29T00:00:00Z",
+  });
+  assert.ok(body.startsWith(PRE_MERGE_AUTOFIX_ATTEMPT_HEADING));
+  assert.ok(isVerifiedPipelineAttestation(body));
+  assert.equal(
+    hasPreMergeAutofixAttemptAtHead([{ author: TEST_ACTOR, body }], SHA_HEAD, TEST_ACTOR),
+    true,
+  );
+  assert.equal(
+    hasPreMergeAutofixBoundMarkerAtHead([{ author: TEST_ACTOR, body }], SHA_HEAD, TEST_ACTOR),
+    true,
+  );
+  assert.equal(
+    hasPreMergeAutofixAttemptAtHead([{ author: TEST_ACTOR, body }], SHA_AFTER_FIX, TEST_ACTOR),
+    false,
+  );
+});
+
+test("pre-merge auto-fix #698 (bite): if re-verify skipped, noop-clean must not silently approve", async (t) => {
+  // Guard: a seam that returns noop-clean without the gate re-verifying would
+  // either hard-block (pre-#698) or wrongly proceed. Our path always re-verifies;
+  // this test locks that re-verify is invoked by asserting deltaReviewCalls === 2
+  // when re-verify itself still blocks (cannot be confused with "skip → block").
+  const residual: ReviewFinding = {
+    ...blockingFinding("correctness", "Residual bite"),
+    file: "core/scripts/stages/other.ts",
+  } as ReviewFinding;
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("correctness")],
+    reReviewFindings: [residual],
+    autoFixResult: "noop-clean",
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(
+    rec.deltaReviewCalls,
+    2,
+    "regression: removing the re-verify branch would leave deltaReviewCalls at 1",
+  );
+  assert.equal(rec.blocked.length, 1, "still-broken re-verify must escalate");
+});

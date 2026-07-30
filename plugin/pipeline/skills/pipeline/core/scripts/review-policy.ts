@@ -1276,3 +1276,193 @@ export function parseOverrideArg(
   }
   return { kind: "key", key, disposition: normalizeDisposition(reason), reason };
 }
+
+// ---------------------------------------------------------------------------
+// Post-noop re-verify: unsupported classification claims against correct HEAD
+// (#698 / dogfood #683). Complements #496 settled-surface demotion: the
+// clean-noop path can re-raise a pure classification/control-flow finding
+// with no prior settled history, so settled-surface never fires. When HEAD
+// already implements the recommended classification and the finding cites no
+// contradictory current-file or executable evidence, demote rather than
+// strand on a repeated false positive.
+// ---------------------------------------------------------------------------
+
+/** Advisory reason written when a noop re-verify finding is demoted because
+ *  HEAD already implements the recommended classification/control-flow. */
+export const HEAD_ALREADY_IMPLEMENTS_RECOMMENDATION =
+  "head-already-implements-recommendation" as const;
+
+/** Known pipeline classification / status tokens used for cheap HEAD matching. */
+const PIPELINE_CLASSIFICATION_TOKENS = [
+  "needs-human",
+  "openspec-invalid",
+  "pipeline:blocked",
+  "ready-to-deploy",
+  "noop-clean",
+  "fix-committed",
+] as const;
+
+const CLASSIFICATION_CLAIM_RE =
+  /\b(classif(?:y|ies|ied|ication)|misclassif|control[- ]?flow|off[- ]?ramp|routes?\s+to|routing\s+to|wrong\s+status|incorrect\s+(?:status|classif))\b/i;
+
+/** Mechanical proxy for a failing executable check cited in finding prose. */
+const EXECUTABLE_FAILURE_EVIDENCE_RE =
+  /\b(test\s+fail|failing\s+test|failed\s+test|exit\s+code\s*[:=]?\s*[1-9]|npm\s+test|node\s+--test|assert\.(?:equal|ok|strict|match|deep)|error\s+TS\d+|FAIL\s+\d+)\b/i;
+
+/**
+ * Extract classification identifiers from free text: backtick-quoted tokens
+ * plus known pipeline classification strings. Pure; used only as a cheap
+ * HEAD-content presence check — not semantic understanding.
+ *
+ * Prefer {@link extractKnownPipelineClassificationTokens} when deciding
+ * demotion eligibility: arbitrary backticks are noise, not classification ids.
+ */
+export function extractClassificationTokens(text: string): string[] {
+  const found = new Set<string>();
+  for (const m of text.matchAll(/`([^`\n]{2,64})`/g)) {
+    const t = m[1].trim().toLowerCase();
+    if (t) found.add(t);
+  }
+  const lower = text.toLowerCase();
+  for (const tok of PIPELINE_CLASSIFICATION_TOKENS) {
+    if (lower.includes(tok)) found.add(tok);
+  }
+  return [...found];
+}
+
+/**
+ * Known pipeline classification / status tokens present in `text` only.
+ * Does **not** treat arbitrary backtick identifiers as classification tokens
+ * (#698 review-2): `` `parseFoo` `` must not make a finding look like a
+ * classification claim or satisfy a HEAD recommendation match.
+ */
+export function extractKnownPipelineClassificationTokens(text: string): string[] {
+  const lower = text.toLowerCase();
+  const found: string[] = [];
+  for (const tok of PIPELINE_CLASSIFICATION_TOKENS) {
+    if (lower.includes(tok)) found.push(tok);
+  }
+  return found;
+}
+
+/**
+ * Slice HEAD file content to the finding's cited line range (1-indexed,
+ * inclusive). Returns null when `line_start` is absent or invalid — callers
+ * must fail closed rather than fall back to whole-file token presence.
+ */
+export function citedRegionContent(
+  content: string,
+  lineStart: number | undefined,
+  lineEnd: number | undefined,
+): string | null {
+  if (!lineStart || lineStart < 1) return null;
+  const lines = content.split("\n");
+  if (lineStart > lines.length) return null;
+  const end =
+    lineEnd && lineEnd >= lineStart
+      ? Math.min(lineEnd, lines.length)
+      : lineStart;
+  return lines.slice(lineStart - 1, end).join("\n");
+}
+
+/**
+ * True when the finding is an explicit pure classification / control-flow
+ * claim: prose must match the classification/control-flow shape, and the
+ * recommendation must name a known pipeline classification/status token.
+ * Arbitrary backticked identifiers alone are not sufficient (#698 review-2).
+ */
+export function isClassificationOrControlFlowClaim(
+  f: Pick<ReviewFinding, "title" | "body" | "recommendation" | "category">,
+): boolean {
+  const blob = [f.title, f.body, f.recommendation, f.category].filter(Boolean).join("\n");
+  if (!CLASSIFICATION_CLAIM_RE.test(blob)) return false;
+  // Recommendation must name a known pipeline classification/status — not an
+  // arbitrary identifier that happens to be backticked.
+  return extractKnownPipelineClassificationTokens(f.recommendation ?? "").length > 0;
+}
+
+/** True when the body cites a failing executable check (test/assert/exit code). */
+export function citesExecutableFailureEvidence(body: string): boolean {
+  return EXECUTABLE_FAILURE_EVIDENCE_RE.test(body);
+}
+
+/**
+ * True when the **cited line range** of the HEAD file already contains the
+ * recommended known pipeline classification token(s). Whole-file token
+ * presence is intentionally insufficient (#698 review-2): a correct branch
+ * elsewhere in the same file must not demote a finding about a different
+ * cited region. Requires `line_start` (and a present file); missing range
+ * fails closed to "not proven".
+ */
+export function headImplementsRecommendedClassification(
+  f: Pick<ReviewFinding, "file" | "recommendation" | "line_start" | "line_end">,
+  headFiles: HeadFileState[],
+): boolean {
+  const file = normalizeFile(f.file);
+  if (!file) return false;
+  const tokens = extractKnownPipelineClassificationTokens(f.recommendation ?? "");
+  if (tokens.length === 0) return false;
+  const head = headFiles.find((h) => h.present && normalizeFile(h.path) === file);
+  if (!head) return false;
+  const region = citedRegionContent(head.content, f.line_start, f.line_end);
+  if (region === null) return false;
+  const regionLower = region.toLowerCase();
+  return tokens.some((t) => regionLower.includes(t));
+}
+
+/** One finding demoted by {@link applyNoopHeadClassificationEvidenceRule}. */
+export interface NoopHeadClassificationDemotion {
+  finding: ReviewFinding;
+  reason: typeof HEAD_ALREADY_IMPLEMENTS_RECOMMENDATION;
+}
+
+/**
+ * Post-noop re-verify filter (#698 / #683): demote pure classification or
+ * control-flow findings that re-assert "HEAD is still wrong" when the **cited
+ * line range** of the file at HEAD already implements the recommended known
+ * pipeline classification/behavior and the finding body cites neither
+ * contradictory current-file-state evidence nor a contradictory failing
+ * executable check. Findings that are not pure classification claims, that
+ * lack a file or line range, whose cited region cannot prove the
+ * recommendation is present, or that supply current-file/executable evidence
+ * of still-wrong behavior remain blocking (cannot prove either way fails
+ * closed to the reviewer's block, not to silent approve). Whole-file token
+ * presence elsewhere in the file is not sufficient (#698 review-2).
+ *
+ * Pure: no I/O. Callers must supply HEAD file state via the `readHeadFiles`
+ * seam for the findings' cited paths.
+ */
+export function applyNoopHeadClassificationEvidenceRule(
+  blocking: ReviewFinding[],
+  headFiles: HeadFileState[],
+): { blocking: ReviewFinding[]; demoted: NoopHeadClassificationDemotion[] } {
+  const stillBlocking: ReviewFinding[] = [];
+  const demoted: NoopHeadClassificationDemotion[] = [];
+  for (const f of blocking) {
+    if (!isClassificationOrControlFlowClaim(f)) {
+      stillBlocking.push(f);
+      continue;
+    }
+    if (!normalizeFile(f.file)) {
+      stillBlocking.push(f);
+      continue;
+    }
+    // Contradictory current-file-state evidence keeps the finding blocking.
+    if (citesHeadFileEvidence(f.body ?? "", headFiles, f.file ?? "")) {
+      stillBlocking.push(f);
+      continue;
+    }
+    if (citesExecutableFailureEvidence(f.body ?? "")) {
+      stillBlocking.push(f);
+      continue;
+    }
+    if (headImplementsRecommendedClassification(f, headFiles)) {
+      demoted.push({ finding: f, reason: HEAD_ALREADY_IMPLEMENTS_RECOMMENDATION });
+      continue;
+    }
+    // Cannot prove HEAD implements the recommendation — keep blocking.
+    stillBlocking.push(f);
+  }
+  return { blocking: stillBlocking, demoted };
+}
+
