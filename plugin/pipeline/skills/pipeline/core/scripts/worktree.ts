@@ -520,6 +520,15 @@ export interface CreateWorktreeDeps {
     worktreePath: string | null,
     branch: string,
   ) => Promise<boolean | "unverifiable" | null>;
+  /**
+   * When the pipeline branch has no remote tip (e.g. remote branch deleted while
+   * an open PR remains), resolve that PR's head SHA so resume after park-release
+   * can recreate at the PR head rather than from base (#718 review ac32c448).
+   */
+  resolveOpenPrHeadForBranch?: (
+    cfg: PipelineConfig,
+    branch: string,
+  ) => Promise<{ prNumber: number; headSha: string } | null>;
 }
 
 export async function realWriteNodeModulesExclude(worktreePath: string): Promise<void> {
@@ -711,6 +720,7 @@ export async function createWorktree(
   const writeManagedMarkerFn = deps.writeManagedMarker ?? writeManagedMarker;
   const dirtyFn = deps.hasDirtyWorkdir ?? hasDirtyWorkdir;
   const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
+  const resolveOpenPrHeadFn = deps.resolveOpenPrHeadForBranch ?? realResolveOpenPrHeadForBranch;
 
   const wtPath = worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
@@ -965,6 +975,9 @@ export async function createWorktree(
     // Prefer an existing remote tip for this pipeline branch when present so
     // resume after park-release (#718) recreates the worktree at the pushed
     // head rather than discarding remote commits by branching from base.
+    // When the remote branch is gone but an open PR remains, recover from the
+    // PR head SHA (fetch pull/N/head) so park-release's open-PR recoverability
+    // is reconstructible at create time (#718 review ac32c448).
     const lsRemote = await gitFn(
       cfg,
       cfg.repo_dir,
@@ -975,6 +988,7 @@ export async function createWorktree(
       lsRemote.code === 0 && (lsRemote.stdout.trim().split(/\s+/)[0] ?? "").length > 0
         ? lsRemote.stdout.trim().split(/\s+/)[0]!
         : null;
+    let startPoint = `origin/${cfg.base_branch}`;
     if (remoteTip) {
       // Populate the remote-tracking ref so worktree add can start from it.
       await gitFn(
@@ -983,8 +997,29 @@ export async function createWorktree(
         ["fetch", "origin", `${branch}:refs/remotes/origin/${branch}`],
         { ignoreFailure: true },
       );
+      startPoint = `origin/${branch}`;
+    } else {
+      const prHead = await resolveOpenPrHeadFn(cfg, branch);
+      if (prHead && prHead.headSha.length > 0) {
+        // Fetch the PR head ref so the commit object is local even when the
+        // named branch was deleted on the remote.
+        const fetchPr = await gitFn(
+          cfg,
+          cfg.repo_dir,
+          ["fetch", "origin", `pull/${prHead.prNumber}/head:refs/remotes/origin/${branch}`],
+          { ignoreFailure: true },
+        );
+        if (fetchPr.code === 0) {
+          startPoint = `origin/${branch}`;
+        } else {
+          // Fallback: fetch by SHA (may already be reachable) and start there.
+          await gitFn(cfg, cfg.repo_dir, ["fetch", "origin", prHead.headSha], {
+            ignoreFailure: true,
+          });
+          startPoint = prHead.headSha;
+        }
+      }
     }
-    const startPoint = remoteTip ? `origin/${branch}` : `origin/${cfg.base_branch}`;
 
     // If the branch exists from a prior failed attempt, delete it.
     await gitFn(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
@@ -1589,8 +1624,15 @@ export interface ParkReleaseDeps {
   pathExists?: (p: string) => boolean;
   /** True when branch tip is present on the remote (ls-remote). */
   hasRemoteBranchTip?: (cfg: PipelineConfig, branch: string) => Promise<boolean>;
-  /** True when an open PR exists for the pipeline head branch. */
-  hasOpenPrForBranch?: (cfg: PipelineConfig, branch: string) => Promise<boolean>;
+  /**
+   * Open PR recoverability for park-release when remote tip is absent.
+   * Must return a non-empty head SHA so create can reconstruct from that commit
+   * (#718 review ac32c448). Boolean-only "PR exists" is insufficient.
+   */
+  resolveOpenPrHeadForBranch?: (
+    cfg: PipelineConfig,
+    branch: string,
+  ) => Promise<{ prNumber: number; headSha: string } | null>;
   /**
    * Perform the on-disk remove. Defaults to non-force operator remove path
    * (worktree remove + local branch delete). Never deletes remote branch/PR.
@@ -1614,14 +1656,22 @@ async function realHasRemoteBranchTip(cfg: PipelineConfig, branch: string): Prom
   return sha.length > 0;
 }
 
-async function realHasOpenPrForBranch(cfg: PipelineConfig, branch: string): Promise<boolean> {
+/** Resolve open same-repo PR head SHA for a branch (create + park-release). */
+async function realResolveOpenPrHeadForBranch(
+  cfg: PipelineConfig,
+  branch: string,
+): Promise<{ prNumber: number; headSha: string } | null> {
   // Lazy import avoids circular init with gh.ts (which imports worktree helpers).
-  const { getPrForBranch } = await import("./gh.ts");
+  const { getPrForBranch, getPrDetail } = await import("./gh.ts");
   try {
     const prNumber = await getPrForBranch(cfg, branch);
-    return prNumber !== null;
+    if (prNumber === null) return null;
+    const detail = await getPrDetail(cfg, prNumber);
+    const headSha = (detail.head_sha ?? "").trim();
+    if (!headSha) return null;
+    return { prNumber, headSha };
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -1645,7 +1695,7 @@ export async function releaseWorktreeForParkedIssue(
   const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
   const existsFn = deps.pathExists ?? fs.existsSync;
   const remoteTipFn = deps.hasRemoteBranchTip ?? realHasRemoteBranchTip;
-  const openPrFn = deps.hasOpenPrForBranch ?? realHasOpenPrForBranch;
+  const resolveOpenPrHeadFn = deps.resolveOpenPrHeadForBranch ?? realResolveOpenPrHeadForBranch;
   const removeFn = deps.removeWorktree ?? realRemoveWorktreeOp;
 
   const records = await listFn(cfg);
@@ -1726,25 +1776,29 @@ export async function releaseWorktreeForParkedIssue(
   }
 
   const hasRemoteTip = await remoteTipFn(cfg, branch);
-  const hasOpenPr = hasRemoteTip ? false : await openPrFn(cfg, branch);
+  // Open PR is an alternate recoverability path only when we can resolve a
+  // non-empty PR head SHA — createWorktree reconstructs from that head when
+  // the remote branch tip is absent (#718 review ac32c448).
+  const openPrHead = hasRemoteTip ? null : await resolveOpenPrHeadFn(cfg, branch);
+  const hasRecoverableOpenPr = openPrHead !== null && openPrHead.headSha.length > 0;
   // Open PR is an alternate recoverability path when remote-tip verification is
   // marginal (e.g. unverifiable after squash ambiguity) — still require no
   // definitive local-only commits (handled above).
-  if (localOnly === "unverifiable" && !hasOpenPr && !hasRemoteTip) {
+  if (localOnly === "unverifiable" && !hasRecoverableOpenPr && !hasRemoteTip) {
     return {
       action: "retained",
       reason:
-        `local-only verification unverifiable for ${branch} and no open PR; ` +
+        `local-only verification unverifiable for ${branch} and no open PR with resolvable head; ` +
         "park-release retains the worktree",
       branch,
       worktree: worktreeP,
     };
   }
-  if (!hasRemoteTip && !hasOpenPr) {
+  if (!hasRemoteTip && !hasRecoverableOpenPr) {
     return {
       action: "retained",
       reason:
-        `no remote branch tip and no open PR for ${branch}; ` +
+        `no remote branch tip and no open PR with resolvable head for ${branch}; ` +
         "park-release retains the worktree (missing remote recoverability)",
       branch,
       worktree: worktreeP,
@@ -1777,7 +1831,7 @@ export async function releaseWorktreeForParkedIssue(
     action: "released",
     reason: hasRemoteTip
       ? `released managed worktree for #${issueNumber} (clean + remote tip on ${branch})`
-      : `released managed worktree for #${issueNumber} (clean + open PR for ${branch})`,
+      : `released managed worktree for #${issueNumber} (clean + open PR #${openPrHead!.prNumber} head ${openPrHead!.headSha.slice(0, 8)} for ${branch})`,
     branch,
     worktree: worktreeP,
   };

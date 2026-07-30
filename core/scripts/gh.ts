@@ -1037,6 +1037,8 @@ export function buildBlockedComment(args: {
   reason: string;
   kind: BlockerKind;
 }): string {
+  // Machine-readable kind marker so capacity admission can re-classify after a
+  // failed clearBlocked + re-dispatch without a fresh blocker_set event (#718).
   return [
     `## Pipeline: Blocked at ${String(args.stageStr).replace(/-/g, " ")}`,
     "",
@@ -1048,7 +1050,24 @@ export function buildBlockedComment(args: {
     "",
     "### How to unblock",
     renderRecipe(args.kind, args.issueNumber),
-  ].join("\n") + COMMENT_FOOTER;
+  ].join("\n") + COMMENT_FOOTER + `\n<!-- pipeline-blocker-kind: ${args.kind} -->`;
+}
+
+/**
+ * Read the latest `<!-- pipeline-blocker-kind: … -->` from issue comments
+ * (most recent "## Pipeline: Blocked" body). Pure; used when advance events
+ * lack a `blocker_set` (early-blocked re-dispatch after capacity clear failure).
+ */
+export function lastBlockerKindFromComments(
+  comments: readonly { body: string }[],
+): string | null {
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const body = comments[i]?.body ?? "";
+    if (!body.includes("## Pipeline: Blocked")) continue;
+    const m = body.match(/<!--\s*pipeline-blocker-kind:\s*([a-z0-9-]+)\s*-->/i);
+    if (m?.[1]) return m[1];
+  }
+  return null;
 }
 
 /**

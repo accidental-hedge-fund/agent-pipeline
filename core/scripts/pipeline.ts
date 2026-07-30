@@ -35,6 +35,7 @@ import {
   getPrForIssue,
   getPrLinkedIssue,
   isBlocked,
+  lastBlockerKindFromComments,
   pickStage,
   postComment,
   silentTransition,
@@ -993,17 +994,40 @@ export function realDispatchItem(
       const detail = await getIssueDetailFn(cfg, issueNumber);
       // Prefer the advance run's last blocker_kind so pure capacity (#718) is
       // not classified as product needs-human when the blocked label is set.
+      // Fall back to the durable kind marker on the blocked comment when events
+      // lack blocker_set (early-blocked re-dispatch after a prior capacity hit).
       let lastKind: string | null = null;
       if (pin && storeReady) {
         const text = readEventsTextFn(pin.events_path);
         if (text !== null) lastKind = lastBlockerKindFromEventsJsonl(text);
       }
+      if (!lastKind && Array.isArray(detail.comments)) {
+        lastKind = lastBlockerKindFromComments(detail.comments);
+      }
       outcome = classifyDispatchOutcome(detail, lastKind);
       // Pure capacity is ops admission, not a product block: clear the label so
       // re-admission after a slot frees does not thrash on an already-blocked
-      // early-exit (#718). The capacity recipe remains on the issue comment.
+      // early-exit (#718). Clear MUST succeed before capacity_wait is safe for a
+      // later re-dispatch that lacks a fresh blocker_set — a pending revert with
+      // blocked still set used to become needs-human on the next early-exit
+      // (review 9873320c). We still emit capacity_wait on clear failure so THIS
+      // cycle keeps ops admission (not needs-human); the durable
+      // pipeline-blocker-kind marker on the blocked comment is the capacity
+      // discriminator that prevents the next-cycle cascade.
       if (outcome === "capacity_wait") {
-        await clearBlockedFn(cfg, issueNumber).catch(() => {});
+        try {
+          await clearBlockedFn(cfg, issueNumber);
+        } catch (clearErr) {
+          const msg = clearErr instanceof Error ? clearErr.message : String(clearErr);
+          console.error(
+            `[pipeline] #${issueNumber}: clearBlocked failed after capacity disposition: ${msg}; ` +
+              `emitting capacity_wait with blocked label still present — durable ` +
+              `blocker-kind on the issue comment must classify the next re-dispatch as capacity`,
+          );
+          // Do not convert to failed: supervisor maps failed+blocked → needs-human.
+          // capacity_wait keeps ops admission for this cycle; comment kind protects
+          // the next early-blocked re-dispatch (see lastBlockerKindFromComments).
+        }
       }
       const pr = await getPrForIssueFn(cfg, issueNumber).catch(() => null);
       prNumber = pr ?? null;

@@ -3,6 +3,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import type { ChildProcess } from "node:child_process";
 import {
   WorktreeCapacityError,
   WORKTREE_CAPACITY_ERROR_CODE,
@@ -22,7 +24,13 @@ import {
 import {
   classifyDispatchOutcome,
   lastBlockerKindFromEventsJsonl,
+  pinAdvanceRunIdentity,
+  realDispatchItem,
 } from "../scripts/pipeline.ts";
+import {
+  buildBlockedComment,
+  lastBlockerKindFromComments,
+} from "../scripts/gh.ts";
 import type { PipelineConfig, Outcome } from "../scripts/types.ts";
 
 function makeCfg(max = 2): PipelineConfig {
@@ -58,6 +66,7 @@ const noopCreateExtras: Pick<
   | "unlinkPath"
   | "hasDirtyWorkdir"
   | "hasLocalOnlyCommits"
+  | "resolveOpenPrHeadForBranch"
 > = {
   acquireMutex: () => {},
   releaseMutex: () => {},
@@ -68,6 +77,8 @@ const noopCreateExtras: Pick<
   unlinkPath: async () => {},
   hasDirtyWorkdir: async () => false,
   hasLocalOnlyCommits: async () => false,
+  // Default: no open PR head (tests that exercise PR recovery inject their own).
+  resolveOpenPrHeadForBranch: async () => null,
 };
 
 // ---------------------------------------------------------------------------
@@ -171,7 +182,7 @@ test("park-release: N clean parked worktrees release so issue N+1 can create (#7
       hasLocalOnlyCommits: async () => false,
       pathExists: () => true,
       hasRemoteBranchTip: async () => true,
-      hasOpenPrForBranch: async () => false,
+      resolveOpenPrHeadForBranch: async () => null,
       removeWorktree: async (_c, n) => {
         removed.push(n);
         onDisk.delete(n);
@@ -192,6 +203,7 @@ test("park-release: N clean parked worktrees release so issue N+1 can create (#7
       if (args[0] === "ls-remote") return { code: 0, stdout: "", stderr: "" };
       return { code: 0, stdout: "", stderr: "" };
     },
+    resolveOpenPrHeadForBranch: async () => null,
     ...noopCreateExtras,
   };
   const created = await createWorktree(cfg, 12, "new", createDeps);
@@ -243,7 +255,7 @@ test("park-release: missing remote and no open PR retains", async () => {
     hasLocalOnlyCommits: async () => false,
     pathExists: () => true,
     hasRemoteBranchTip: async () => false,
-    hasOpenPrForBranch: async () => false,
+    resolveOpenPrHeadForBranch: async () => null,
     removeWorktree: async () => {
       removeCalled = true;
     },
@@ -253,7 +265,7 @@ test("park-release: missing remote and no open PR retains", async () => {
   assert.equal(removeCalled, false);
 });
 
-test("park-release: open PR allows release when remote tip absent", async () => {
+test("park-release: open PR with resolvable head allows release when remote tip absent", async () => {
   const rec = makeRec(42, "feat");
   let removeCalled = false;
   const result = await releaseWorktreeForParkedIssue(makeCfg(), 42, {
@@ -262,13 +274,114 @@ test("park-release: open PR allows release when remote tip absent", async () => 
     hasLocalOnlyCommits: async () => false,
     pathExists: () => true,
     hasRemoteBranchTip: async () => false,
-    hasOpenPrForBranch: async () => true,
+    resolveOpenPrHeadForBranch: async () => ({
+      prNumber: 99,
+      headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }),
     removeWorktree: async () => {
       removeCalled = true;
     },
   });
   assert.equal(result.action, "released");
   assert.equal(removeCalled, true);
+});
+
+test("park-release: open PR without resolvable head retains (not reconstructible)", async () => {
+  const rec = makeRec(42, "feat");
+  let removeCalled = false;
+  const result = await releaseWorktreeForParkedIssue(makeCfg(), 42, {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    hasLocalOnlyCommits: async () => false,
+    pathExists: () => true,
+    hasRemoteBranchTip: async () => false,
+    // PR "exists" but head SHA unresolvable — must not release (#718 ac32c448).
+    resolveOpenPrHeadForBranch: async () => null,
+    removeWorktree: async () => {
+      removeCalled = true;
+    },
+  });
+  assert.equal(result.action, "retained");
+  assert.match(result.reason, /resolvable head|missing remote/i);
+  assert.equal(removeCalled, false);
+});
+
+test("createWorktree: open PR head used when remote branch tip absent (#718 ac32c448)", async () => {
+  const cfg = makeCfg(2);
+  const prHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const gitArgs: string[][] = [];
+  const created = await createWorktree(cfg, 42, "feat", {
+    ...noopCreateExtras,
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_c, _cwd, args) => {
+      gitArgs.push([...args]);
+      if (args[0] === "ls-remote") return { code: 0, stdout: "", stderr: "" };
+      if (args[0] === "fetch" && args.includes(`pull/7/head:refs/remotes/origin/pipeline/42-feat`)) {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "worktree" && args[1] === "add") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    resolveOpenPrHeadForBranch: async (_c, branch) => {
+      assert.equal(branch, "pipeline/42-feat");
+      return { prNumber: 7, headSha: prHead };
+    },
+  });
+  assert.ok(created.path.includes("pipeline-42"));
+  const add = gitArgs.find((a) => a[0] === "worktree" && a[1] === "add");
+  assert.ok(add, "worktree add must run");
+  // Must not start from base alone when PR head was recoverable.
+  assert.notEqual(add![add!.length - 1], "origin/main");
+  assert.ok(
+    add!.includes("origin/pipeline/42-feat") || add!.includes(prHead),
+    `startPoint should be PR-derived, got: ${add!.join(" ")}`,
+  );
+});
+
+test("regression: release then resume with no remote tip reconstructs from PR head", async () => {
+  const cfg = makeCfg(1);
+  const rec = makeRec(42, "feat");
+  const prHead = "cccccccccccccccccccccccccccccccccccccccc";
+  // 1) Park-release on open PR only (no remote tip).
+  const release = await releaseWorktreeForParkedIssue(cfg, 42, {
+    listOnDisk: async () => [rec],
+    hasDirtyWorkdir: async () => false,
+    hasLocalOnlyCommits: async () => false,
+    pathExists: () => true,
+    hasRemoteBranchTip: async () => false,
+    resolveOpenPrHeadForBranch: async () => ({ prNumber: 12, headSha: prHead }),
+    removeWorktree: async () => {},
+  });
+  assert.equal(release.action, "released");
+
+  // 2) Resume create with no remote tip — must use PR head, not base.
+  const startPoints: string[] = [];
+  await createWorktree(cfg, 42, "feat", {
+    ...noopCreateExtras,
+    listActive: async () => [],
+    existsSync: () => false,
+    removeWorktree: async () => {},
+    mkdirSync: () => {},
+    gitCmd: async (_c, _cwd, args) => {
+      if (args[0] === "ls-remote") return { code: 0, stdout: "", stderr: "" };
+      if (args[0] === "worktree" && args[1] === "add") {
+        startPoints.push(args[args.length - 1]!);
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    resolveOpenPrHeadForBranch: async () => ({ prNumber: 12, headSha: prHead }),
+  });
+  assert.equal(startPoints.length, 1);
+  assert.notEqual(startPoints[0], "origin/main");
+  assert.ok(
+    startPoints[0] === "origin/pipeline/42-feat" || startPoints[0] === prHead,
+    `expected PR-derived start, got ${startPoints[0]}`,
+  );
 });
 
 test("park-release: out-of-managed-root is never auto-released", async () => {
@@ -361,6 +474,140 @@ test("lastBlockerKindFromEventsJsonl reads last blocker_set kind", () => {
     JSON.stringify({ type: "blocker_set", blocker_kind: "worktree-capacity" }),
   ].join("\n");
   assert.equal(lastBlockerKindFromEventsJsonl(text), "worktree-capacity");
+});
+
+test("lastBlockerKindFromComments reads durable pipeline-blocker-kind marker (#718 9873320c)", () => {
+  const body = buildBlockedComment({
+    issueNumber: 42,
+    stageStr: "planning",
+    harness: "claude",
+    ts: "2026-07-30T00:00:00Z",
+    reason: "At worktree capacity (5/5)",
+    kind: "worktree-capacity",
+  });
+  assert.match(body, /<!-- pipeline-blocker-kind: worktree-capacity -->/);
+  assert.equal(
+    lastBlockerKindFromComments([{ body }]),
+    "worktree-capacity",
+  );
+  assert.equal(
+    lastBlockerKindFromComments([{ body: "unrelated" }, { body }]),
+    "worktree-capacity",
+  );
+  assert.equal(lastBlockerKindFromComments([{ body: "no marker" }]), null);
+});
+
+function fakeSpawnChild(): ChildProcess {
+  const ee = new EventEmitter() as ChildProcess;
+  queueMicrotask(() => ee.emit("exit", 0, null));
+  return ee;
+}
+
+test("realDispatchItem: clearBlocked failure still capacity_wait; re-dispatch uses comment kind (#718 9873320c)", async () => {
+  const fixedNow = new Date("2026-07-30T22:09:03.000Z");
+  const expectedPin = pinAdvanceRunIdentity("/repo", 718, fixedNow);
+  const capacityComment = buildBlockedComment({
+    issueNumber: 718,
+    stageStr: "planning",
+    harness: "claude",
+    ts: "2026-07-30T22:00:00Z",
+    reason: "At worktree capacity (2/2)",
+    kind: "worktree-capacity",
+  });
+  let clearCalls = 0;
+
+  // First dispatch: events have capacity kind; clear throws.
+  const dispatch1 = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      scriptPath: "/path/to/pipeline.ts",
+      execPath: "/usr/bin/node",
+      eventsPathExists: (p) => p === expectedPin.events_path,
+      readEventsText: () =>
+        JSON.stringify({ type: "blocker_set", blocker_kind: "worktree-capacity" }) + "\n",
+      spawn: ((cmd: string, args: readonly string[]) => {
+        void cmd;
+        void args;
+        return fakeSpawnChild();
+      }) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () =>
+        ({
+          labels: ["blocked", "pipeline:planning"],
+          state: "open",
+          comments: [{ author: "bot", body: capacityComment, createdAt: "2026-07-30T22:00:00Z" }],
+        }) as never,
+      getPrForIssue: async () => null,
+      clearBlocked: async () => {
+        clearCalls++;
+        throw new Error("gh label remove failed: HTTP 502");
+      },
+    },
+  );
+  const response1 = await dispatch1(
+    {
+      schema: "pipeline/loop-execution@1",
+      item_id: "718",
+      repo: { name: "acme/w", base_branch: "main" },
+      engine: "claude",
+      worktree_policy: "default",
+      done_definition: "pipeline:ready-to-deploy",
+      run_id: "loop-run-cap",
+    },
+    { onAdvanceLinked: async () => {} },
+  );
+  assert.equal(clearCalls, 1, "clearBlocked must be attempted (not silently skipped)");
+  // Ops capacity disposition for this cycle — not needs-human / not silent no-op.
+  assert.equal(response1.outcome, "capacity_wait");
+
+  // Second dispatch: no events capacity kind (early-blocked re-dispatch), but
+  // durable comment marker remains + blocked label still present.
+  const dispatch2 = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      scriptPath: "/path/to/pipeline.ts",
+      execPath: "/usr/bin/node",
+      eventsPathExists: (p) => p === expectedPin.events_path,
+      readEventsText: () => "", // no blocker_set — the cascade path without durable kind
+      spawn: ((cmd: string, args: readonly string[]) => {
+        void cmd;
+        void args;
+        return fakeSpawnChild();
+      }) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () =>
+        ({
+          labels: ["blocked", "pipeline:planning"],
+          state: "open",
+          comments: [{ author: "bot", body: capacityComment, createdAt: "2026-07-30T22:00:00Z" }],
+        }) as never,
+      getPrForIssue: async () => null,
+      clearBlocked: async () => {
+        clearCalls++;
+        // Succeeds on retry after re-dispatch
+      },
+    },
+  );
+  const response2 = await dispatch2(
+    {
+      schema: "pipeline/loop-execution@1",
+      item_id: "718",
+      repo: { name: "acme/w", base_branch: "main" },
+      engine: "claude",
+      worktree_policy: "default",
+      done_definition: "pipeline:ready-to-deploy",
+      run_id: "loop-run-cap-2",
+    },
+    { onAdvanceLinked: async () => {} },
+  );
+  assert.equal(
+    response2.outcome,
+    "capacity_wait",
+    "re-dispatch with blocked + capacity comment must not become blocked_needs_human",
+  );
+  assert.equal(clearCalls, 2);
 });
 
 test("isDurableParkOutcome: blocked and finalized park; waiting does not", () => {
