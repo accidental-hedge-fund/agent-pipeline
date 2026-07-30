@@ -575,11 +575,13 @@ export function activeChangeIdsFromContentsEntries(entries: unknown): string[] {
  */
 export function isHttp404Signal(stderr: string): boolean {
   const s = stderr.toLowerCase();
+  // Only explicit HTTP status syntax — never a bare "404" token.
+  // SHA/command fragments (e.g. ref a404b…, path …/404/…) must not
+  // classify a non-404 failure as path-missing (#714 review: aaa27d9c).
   return (
     s.includes("http 404") ||
     s.includes("status code: 404") ||
-    s.includes("status code 404") ||
-    /(?:^|[^0-9])404(?:[^0-9]|$)/.test(s)
+    s.includes("status code 404")
   );
 }
 
