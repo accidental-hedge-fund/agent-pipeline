@@ -218,6 +218,13 @@ export interface BuildImplementingArgs extends BuildPlanArgs {
    * inside the reviewed diff (#91). When false, no docs ask is included.
    */
   docsEnabled?: boolean;
+  /**
+   * When true and `docsEnabled`, extend the docs instruction with the
+   * regenerate+commit contract for the repository docs generator (#716).
+   * Determined pre-implement from worktree detection — not a post-hoc path
+   * diff. When false/omitted, keep the hand-maintained docs instruction only.
+   */
+  docsGeneratorPresent?: boolean;
   /** OpenSpec spec deltas for this change (empty/undefined when not applicable). */
   specContext?: string;
 }
@@ -233,7 +240,9 @@ export function buildImplementingPrompt(a: BuildImplementingArgs): string {
     body: a.body || "(no description)",
     plan: a.plan,
     pipeline_run_id: a.pipelineRunId,
-    docs_instruction: a.docsEnabled ? DOCS_INSTRUCTION_SECTION : "",
+    docs_instruction: a.docsEnabled
+      ? (a.docsGeneratorPresent ? DOCS_INSTRUCTION_WITH_GENERATOR : DOCS_INSTRUCTION_SECTION)
+      : "",
     spec_context: specContextSection(a.specContext),
     papercut_instruction: papercutInstructionSection(a.cfg),
     design_gate_instruction: designGateInstructionSection(a.cfg),
@@ -305,6 +314,35 @@ Documentation is part of this change — update it in the same commit(s) so revi
 - **Config docs and examples** — if config keys, flags, env vars, or setup steps were added or changed
 - **Docstrings/comments in the files you changed** — if they are now inaccurate
 - **Repo-local ops docs or runbooks** — if the change touches what they describe
+
+If no documentation is affected, change nothing — do not add boilerplate docs.
+`;
+
+/**
+ * Extended docs instruction when the worktree is docs-generator-present and
+ * `steps.docs` is on (#716). Requires regenerate+commit of all generator
+ * outputs in the same change, and names the check operators/CI use.
+ * Exported for prompt-loader drift-guard tests.
+ */
+export const DOCS_INSTRUCTION_WITH_GENERATOR = `
+## Documentation Updates
+
+Documentation is part of this change — update it in the same commit(s) so reviewers see code and docs together. Check and update where affected:
+- **README.md** — if user-visible setup, workflows, features, or operations changed
+- **Config docs and examples** — if config keys, flags, env vars, or setup steps were added or changed
+- **Docstrings/comments in the files you changed** — if they are now inaccurate
+- **Repo-local ops docs or runbooks** — if the change touches what they describe
+
+### Generated docs (required)
+
+This repository has a docs generator (\`scripts/generate-docs.mjs\`). If you change the generator, its templates, or any source that feeds generated outputs (CLI inventory, config schema, changelog sources, SKILL command tables, etc.), you MUST regenerate and commit **all** generator outputs in the same change as the source edits — never open a PR with stale generated docs.
+
+Run after regenerating (or to verify):
+
+    npm run docs:check
+    # equivalent: node scripts/generate-docs.mjs --check
+
+If check fails, run write mode (\`npm run docs:generate\` or \`node scripts/generate-docs.mjs\`), commit the outputs, and re-run check until green. Green unit tests alone do **not** satisfy this contract.
 
 If no documentation is affected, change nothing — do not add boilerplate docs.
 `;

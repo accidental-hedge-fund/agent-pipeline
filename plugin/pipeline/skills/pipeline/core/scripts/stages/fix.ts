@@ -54,6 +54,10 @@ import type { ValidateResult } from "../openspec.ts";
 import { makePromptRecord, recordPrompt, recordRecovery } from "../evidence-bundle.ts";
 import { includeLockfileSideEffects, type LockfileSideEffectsDeps } from "../lockfile-side-effects.ts";
 import { buildFailureBlockReason, includeBuildArtifacts, type BuildSideEffectsDeps } from "../build-side-effects.ts";
+import {
+  enforceDocsFreshness,
+  type DocsFreshnessDeps,
+} from "../docs-freshness.ts";
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 import { extractBlockingKeysMarker, extractReviewedSha } from "./review.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
@@ -96,6 +100,10 @@ export interface AdvanceFixDeps {
   runFormatGate?: typeof runFormatGate;
   /** Format+test gate runner (defaults to runFormatAndTestGates); injectable for tests. */
   _runFormatAndTestGates?: typeof runFormatAndTestGates;
+  /** Docs freshness enforcement (#716); injectable for tests. */
+  enforceDocsFreshness?: typeof enforceDocsFreshness;
+  /** Deps forwarded into the default enforceDocsFreshness implementation. */
+  docsFreshness?: DocsFreshnessDeps;
   /**
    * Injectable harness invoker for the internal bounded-repair closure (#356).
    * Defaults to `invoke` from harness.ts. Tests inject this to exercise the
@@ -1006,6 +1014,32 @@ export async function advanceFix(
       gates.source === "test" ? "test-gate-exhausted" : gates.source === "build" ? "build-failed" : "needs-human");
     return { advanced: false, status: "blocked", reason: gates.reason,
       blockerKind: gates.source === "test" ? "test-gate-exhausted" : gates.source === "build" ? "build-failed" : "needs-human" };
+  }
+
+  // ---- Docs freshness (#716): after format/test, before push ----
+  // Same pre-PR contract as resumeFromImplementing so a fix that dirties
+  // generated docs cannot push a red-docs head as a successful gate pass.
+  const docsEnforce = deps.enforceDocsFreshness ?? enforceDocsFreshness;
+  const docsResult = await docsEnforce(wt.path, issueNumber, deps.docsFreshness ?? {});
+  if (!docsResult.ok) {
+    await setBlocked(cfg, issueNumber, docsResult.reason, stage, "needs-human");
+    return { advanced: false, status: "blocked", reason: docsResult.reason, blockerKind: "needs-human" };
+  }
+  if (docsResult.ran && docsResult.healed) {
+    console.log(
+      `[pipeline] #${issueNumber}: docs freshness auto-heal committed: ${docsResult.paths.join(", ")}`,
+    );
+    const postHealGates = await gatesRunner(
+      cfg, issueNumber, wt.path, stage, pipelineRunId, opts.stateDir,
+      { runFormatGate: fmtGateFn, foldBuildArtifacts },
+      opts.runDir, opts.runStoreDeps,
+    );
+    if (!postHealGates.ok) {
+      await setBlocked(cfg, issueNumber, postHealGates.reason, stage,
+        postHealGates.source === "test" ? "test-gate-exhausted" : postHealGates.source === "build" ? "build-failed" : "needs-human");
+      return { advanced: false, status: "blocked", reason: postHealGates.reason,
+        blockerKind: postHealGates.source === "test" ? "test-gate-exhausted" : postHealGates.source === "build" ? "build-failed" : "needs-human" };
+    }
   }
 
   const postGateDiff = await gitInWorktree(

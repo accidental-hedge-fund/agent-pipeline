@@ -71,6 +71,11 @@ import type { Harness, Outcome, PipelineConfig, Stage, StageOutcome } from "../t
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import { recordStage } from "../evidence-bundle.ts";
 import { INJECTION_PATTERNS } from "../artifact-sanitize.ts";
+import {
+  detectDocsGenerator,
+  enforceDocsFreshness,
+  type DocsFreshnessDeps,
+} from "../docs-freshness.ts";
 
 /**
  * Appended once when plan-revision stdout fails the acknowledgement shape gate
@@ -751,7 +756,20 @@ export async function runPlanningPhases(
 
   // ---- Build implementation plan and invoke implementer harness ----
   const implPlan = await hooks.buildImplPlan(wt, revisedPlan);
-  const implPrompt = buildImplementingPrompt({ cfg, issueNumber, title, body, plan: implPlan, pipelineRunId, docsEnabled: cfg.steps.docs, specContext });
+  // Pre-implement detection (#716): generator presence + steps.docs drives the
+  // regenerate+commit prompt contract — not a post-implementation path diff.
+  const docsGeneratorPresent = detectDocsGenerator(wt.path).present;
+  const implPrompt = buildImplementingPrompt({
+    cfg,
+    issueNumber,
+    title,
+    body,
+    plan: implPlan,
+    pipelineRunId,
+    docsEnabled: cfg.steps.docs,
+    docsGeneratorPresent,
+    specContext,
+  });
   const implHeadBefore = (
     await doGitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
@@ -1381,6 +1399,12 @@ export interface ResumeFromImplementingDeps {
   setBlocked?: typeof setBlocked;
   transition?: typeof transition;
   runFormatGate?: typeof runFormatGate;
+  /** Format+test gate runner (defaults to runFormatAndTestGates); injectable for tests. */
+  _runFormatAndTestGates?: typeof runFormatAndTestGates;
+  /** Docs freshness enforcement (#716); injectable for tests (no real generate-docs). */
+  enforceDocsFreshness?: typeof enforceDocsFreshness;
+  /** Deps forwarded into the default enforceDocsFreshness implementation. */
+  docsFreshness?: DocsFreshnessDeps;
 }
 
 /**
@@ -1420,6 +1444,8 @@ export async function resumeFromImplementing(
   const blocker = deps.setBlocked ?? setBlocked;
   const trans = deps.transition ?? transition;
   const fmtGateFn = deps.runFormatGate ?? runFormatGate;
+  const gatesRunner = deps._runFormatAndTestGates ?? runFormatAndTestGates;
+  const docsEnforce = deps.enforceDocsFreshness ?? enforceDocsFreshness;
 
   const branch = wt.branch;
 
@@ -1428,7 +1454,7 @@ export async function resumeFromImplementing(
   // and both re-run until neither produces a new commit, so the pushed state is
   // simultaneously formatted and tested — no auto-format commit ships untested
   // and no test-fix commit ships unformatted.
-  const gates = await runFormatAndTestGates(
+  const gates = await gatesRunner(
     cfg, issueNumber, wt.path, "implementing", opts.pipelineRunId, opts.stateDir,
     { runFormatGate: fmtGateFn, runTestGate: gateRunner },
     opts.runDir, opts.runStoreDeps,
@@ -1439,6 +1465,32 @@ export async function resumeFromImplementing(
       gates.source === "test" ? "test-gate-exhausted" : "needs-human",
     );
     return { advanced: false, status: "blocked", reason: gates.reason };
+  }
+
+  // ---- Docs freshness (#716): after format/test, before push / createPr ----
+  // Generator-absent worktrees are inert. When present: check → optional one-shot
+  // auto-heal → re-check; a heal commit re-runs format+test on the new HEAD.
+  const docsResult = await docsEnforce(wt.path, issueNumber, deps.docsFreshness ?? {});
+  if (!docsResult.ok) {
+    await blocker(cfg, issueNumber, docsResult.reason, "implementing", "needs-human");
+    return { advanced: false, status: "blocked", reason: docsResult.reason };
+  }
+  if (docsResult.ran && docsResult.healed) {
+    console.log(
+      `[pipeline] #${issueNumber}: docs freshness auto-heal committed: ${docsResult.paths.join(", ")}`,
+    );
+    const postHealGates = await gatesRunner(
+      cfg, issueNumber, wt.path, "implementing", opts.pipelineRunId, opts.stateDir,
+      { runFormatGate: fmtGateFn, runTestGate: gateRunner },
+      opts.runDir, opts.runStoreDeps,
+    );
+    if (!postHealGates.ok) {
+      await blocker(
+        cfg, issueNumber, postHealGates.reason, "implementing",
+        postHealGates.source === "test" ? "test-gate-exhausted" : "needs-human",
+      );
+      return { advanced: false, status: "blocked", reason: postHealGates.reason };
+    }
   }
 
   // ---- Push ----
