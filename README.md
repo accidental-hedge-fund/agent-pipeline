@@ -12,7 +12,7 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 
 | Band | What happens |
 | --- | --- |
-| Spec before code | `planning` writes the implementation plan/spec; when enabled, `plan-review` is **independent agent plan review** of that plan plus an optional **human feedback window** before implementation — not human sign-off. OpenSpec-backed repos reconcile and archive specs during `pre-merge`. |
+| Spec before code | `planning` writes the implementation plan/spec; when enabled, `plan-review` is **independent agent plan review** of that plan (or a labeled same-harness self-review if the reviewer CLI is missing — see [Prerequisites](#prerequisites)) plus an optional **human feedback window** before implementation — not human sign-off. OpenSpec-backed repos reconcile and archive specs during `pre-merge`. |
 | Structured review | Reviewers emit findings with severity, confidence, and file/line context. The same review input should lead to the same advance/block decision, not a model coin flip. |
 | Bounded convergence | Review/fix rounds are capped by policy and guarded against recurring findings. If the run cannot converge cleanly, it stops with evidence instead of looping indefinitely. |
 | Surgical fixes | `fix-1` and `fix-2` are scoped to reviewer findings. No opportunistic refactors, no scope creep, no destructive cleanup. |
@@ -1513,15 +1513,15 @@ Review verdicts are also pinned to the commit they evaluated. Every review comme
 
 ### Human plan feedback
 
-When `plan_review` is on, the pipeline posts the plan as an `## Implementation Plan` issue comment and runs **independent agent plan review** (the configured reviewer / secondary harness) against it. That agent review is the plan-review control when the step is enabled — agent evidence, **not** human approval or human sign-off.
+When `plan_review` is on, the pipeline posts the plan as an `## Implementation Plan` issue comment and runs agent plan review via the configured reviewer / secondary harness. When that reviewer is available, this is **independent agent plan review** — the plan-review control when the step is enabled, agent evidence, **not** human approval or human sign-off. If the reviewer CLI is missing or unspawnable, the [same-harness fallback](#prerequisites) applies instead: the implementing harness reviews its own plan, and the posted `## Plan Review` is **prominently labeled as a same-harness self-review**. That degraded path is still plan-review evidence and still advances (the pipeline never merges), but it is **not** independent agent plan review — do not treat a self-review label as cross-harness control.
 
 During the **human feedback window** after the plan is posted, comments you leave before the revision step are optional steering: they are folded into the revision alongside the reviewer's feedback. Any comment posted after the plan that doesn't start with a pipeline header (`## Implementation Plan`, `## Plan Review`, `## Pipeline:`, …) is treated as human input; the practical window is the reviewer-harness run (comments that land after the revision starts are picked up on the next trigger).
 
-When the feedback window ends with **no** human comments, plan revision proceeds from independent agent plan-review feedback only: missing human input does **not** block the advance and is **not** recorded as human approval. With no human comments, behavior is byte-for-byte identical to the agent-only path (no extra section, no attribution line).
+When the feedback window ends with **no** human comments, plan revision proceeds from agent plan-review feedback only (independent reviewer or labeled same-harness self-review, whichever ran): missing human input does **not** block the advance and is **not** recorded as human approval. With no human comments, behavior is byte-for-byte identical to the agent-only path (no extra section, no attribution line).
 
 When human comments are present, the revised plan comment attributes contributors with a `**Human feedback from**: @login, …` line, and the revision **must** end with a `## Human Feedback Acknowledgement` section listing each commenter as `addressed — <reason>` or `declined — <reason>` — a revision missing it is **blocked**. That acknowledgement means the reviser addressed or declined each feedback item; it is not a substitute for separate **human approval** controls (for example the human-owned merge at `ready-to-deploy`). The feature is a no-op when `plan_review` is disabled.
 
-**Authority boundary:** independent agent plan review is required evidence when `steps.plan_review` is on; the human feedback window is optional steering; **human attestation** (pipeline output markers / operator capability attestations) is provenance, not plan sign-off; **human approval / sign-off** remains the merge button at `ready-to-deploy` (and other true human-approval gates such as `needs-human` dispositions).
+**Authority boundary:** when the reviewer harness runs, independent agent plan review is the plan-review control; when same-harness fallback applies, the labeled self-review is the plan-review evidence and is **not** independent; the human feedback window is optional steering; **human attestation** (pipeline output markers / operator capability attestations) is provenance, not plan sign-off; **human approval / sign-off** remains the merge button at `ready-to-deploy` (and other true human-approval gates such as `needs-human` dispositions).
 
 ### Commit traceability trailers (always on)
 

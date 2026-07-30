@@ -132,6 +132,12 @@ test("README Lifecycle band describes independent agent plan review + feedback w
     !/plan-review\s+is\s+the\s+human\s+sign-off/i.test(flattenDocs(lifecycle)),
     "Lifecycle must not claim plan-review is the human sign-off",
   );
+  // Do not claim unconditional independence: qualify or point at same-harness fallback.
+  assert.match(
+    flattenDocs(lifecycle),
+    /same-harness self-review|same-harness fallback|reviewer CLI is missing/i,
+    "Lifecycle must qualify independence with same-harness fallback when reviewer CLI is missing",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -170,6 +176,17 @@ test("README Human plan feedback states empty-window semantics and authority bou
     flat,
     /human attestation/i,
     "section must name human attestation as distinct from plan sign-off",
+  );
+  // Independence must not be overstated on the #39 reviewer-missing path.
+  assert.match(
+    flat,
+    /same-harness (?:fallback|self-review)/i,
+    "section must disclose same-harness fallback when asserting independent plan-review",
+  );
+  assert.ok(
+    /not\s+independent agent plan review/i.test(flat) ||
+      /is not independent/i.test(flat),
+    "section must state that labeled same-harness self-review is not independent agent plan review",
   );
 });
 

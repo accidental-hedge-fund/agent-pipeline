@@ -2,7 +2,7 @@
 
 ### Requirement: Human plan comments are optional feedback, not human approval
 
-Human comments captured after the `## Implementation Plan` comment when `steps.plan_review` is enabled SHALL be treated as optional human feedback inside the human feedback window, not as human approval or human sign-off. Presence of such comments SHALL NOT be required for plan-review to complete. Absence of such comments SHALL NOT block plan revision and SHALL NOT be recorded or described as human approval or human sign-off. Independent agent plan review remains the plan-review control; human comments only augment the revision prompt when present (per the existing human-feedback capture and acknowledgement requirements).
+Human comments captured after the `## Implementation Plan` comment when `steps.plan_review` is enabled SHALL be treated as optional human feedback inside the human feedback window, not as human approval or human sign-off. Presence of such comments SHALL NOT be required for plan-review to complete. Absence of such comments SHALL NOT block plan revision and SHALL NOT be recorded or described as human approval or human sign-off. Agent plan review remains the plan-review control (independent agent plan review when the configured reviewer ran; labeled same-harness self-review when that fallback applied); human comments only augment the revision prompt when present (per the existing human-feedback capture and acknowledgement requirements).
 
 #### Scenario: No human comments — revision proceeds without approval semantics
 
