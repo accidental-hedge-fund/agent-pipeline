@@ -2881,6 +2881,7 @@ async function main(): Promise<void> {
           milestone: opts.milestone,
           dryRun: opts.dryRun,
           apply: opts.apply,
+          baseBranch: mergeQueueCfg.base_branch,
         },
         realMergeQueueDeps(mergeQueueCfg.repo),
         console.log,

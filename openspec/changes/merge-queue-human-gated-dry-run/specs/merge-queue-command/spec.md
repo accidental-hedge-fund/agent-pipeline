@@ -74,15 +74,20 @@ hold:
 
 - the issue lacks `pipeline:ready-to-deploy`
 - no open linked PR is found
+- the PR's `baseRefName` does not match the configured integration base branch
+  (`base_branch` / `--base`)
 - `mergeable` is not `MERGEABLE` or `mergeStateStatus` is not `CLEAN`
 - the required-check gate equivalent to `pipeline merge` does not pass (any
   required check not in a non-blocking bucket; when the repository has no
   required checks, mirror the existing merge sub-command fallback policy rather
-  than inventing a looser rule)
+  than inventing a looser rule). Non-zero `gh pr checks` exits that still emit
+  check JSON on stdout (e.g. pending exit code 8) SHALL be treated as check
+  status data and classified under this gate, not as a fatal command failure.
 
 Excluded items SHALL still be reportable in the dry-run output as skipped with a
 stable reason code (at least: `not-ready-to-deploy` is not listed as a candidate
-because filtered earlier; `missing-pr`; `non-mergeable`; `checks-not-green`).
+because filtered earlier; `missing-pr`; `wrong-base`; `non-mergeable`;
+`checks-not-green`).
 
 #### Scenario: Only R2D issues become candidates
 - **WHEN** a milestone contains issue A with `pipeline:ready-to-deploy` and an
@@ -113,10 +118,24 @@ because filtered earlier; `missing-pr`; `non-mergeable`; `checks-not-green`).
 - **THEN** that PR SHALL NOT appear in the merge-candidate list
 - **AND** dry-run SHALL report it as skipped with reason `checks-not-green`
 
+#### Scenario: Pending gh pr checks non-zero exit is checks-not-green not fatal
+- **WHEN** `gh pr checks --required` exits non-zero because a required check is
+  pending (or fail/cancel) but still writes a JSON check array to stdout
+- **THEN** the dry-run SHALL NOT abort the entire plan as a command failure
+- **AND** that PR SHALL be reported as skipped with reason `checks-not-green`
+
+#### Scenario: Wrong base branch is excluded
+- **WHEN** an issue is in the milestone, carries `pipeline:ready-to-deploy`, and
+  has an open linked PR that is otherwise mergeable and check-green
+- **AND** the PR's `baseRefName` differs from the configured base branch
+- **THEN** that PR SHALL NOT appear in the merge-candidate list
+- **AND** dry-run SHALL report it as skipped with reason `wrong-base`
+
 #### Scenario: Clean mergeable R2D PR is a candidate
 - **WHEN** an issue is in the milestone, carries `pipeline:ready-to-deploy`, has
   an open linked PR with `mergeable: "MERGEABLE"` and `mergeStateStatus: "CLEAN"`,
-  and required checks pass under the merge check policy
+  base matching the configured base branch, and required checks pass under the
+  merge check policy
 - **THEN** that PR SHALL appear in the merge-candidate list
 
 ---

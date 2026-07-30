@@ -13,6 +13,8 @@ import {
   formatMergeQueuePlan,
   runMergeQueueDryRun,
   isMergeableClean,
+  evaluateChecksGate,
+  recoverGhPrChecksFromExecError,
   type MergeQueueDeps,
   type RequiredCheck,
   type MergeQueueIssue,
@@ -234,6 +236,101 @@ test("merge-queue: pending required check is skipped as checks-not-green", async
   ]);
   const plan = await planMergeQueue({ milestone: "v1" }, deps);
   assert.equal(plan.skips[0].reason, "checks-not-green");
+});
+
+test("merge-queue: recoverGhPrChecksFromExecError parses stdout from non-zero gh exit", () => {
+  const pendingJson = JSON.stringify([{ name: "ci", bucket: "pending" }]);
+  // Shape mirrors node:child_process execFile rejection (exit 8 = pending).
+  const err = Object.assign(new Error("Command failed: gh pr checks ... exit code 8"), {
+    code: 8,
+    stdout: pendingJson,
+    stderr: "",
+  });
+  const recovered = recoverGhPrChecksFromExecError(err);
+  assert.deepEqual(recovered, [{ name: "ci", bucket: "pending" }]);
+  assert.equal(recoverGhPrChecksFromExecError(new Error("network down")), null);
+  assert.equal(
+    recoverGhPrChecksFromExecError(Object.assign(new Error("bad"), { stdout: "not-json" })),
+    null,
+  );
+});
+
+test("merge-queue: evaluateChecksGate treats rejected-process pending checks as not green", async () => {
+  const pendingJson = JSON.stringify([
+    { name: "ci", bucket: "pass" },
+    { name: "slow", bucket: "pending" },
+  ]);
+  const deps = {
+    async ghPrChecksRequired() {
+      const err = Object.assign(new Error("Command failed with exit code 8"), {
+        code: 8,
+        stdout: pendingJson,
+        stderr: "",
+      });
+      throw err;
+    },
+    async ghPrChecksAll() {
+      throw new Error("should not call all when required recovered");
+    },
+  };
+  const result = await evaluateChecksGate(99, deps);
+  assert.equal(result.ok, false);
+  assert.ok(result.detail.includes("slow"));
+  assert.ok(result.detail.includes("pending"));
+});
+
+test("merge-queue: plan skips as checks-not-green when ghPrChecksRequired rejects with pending JSON stdout", async () => {
+  const pendingJson = JSON.stringify([{ name: "required-ci", bucket: "pending" }]);
+  const deps = makeDeps([
+    {
+      number: 42,
+      labels: ["pipeline:ready-to-deploy"],
+      pr: 420,
+      mergeable: "MERGEABLE",
+      mergeStateStatus: "CLEAN",
+      headRefOid: "pending-sha",
+    },
+  ]);
+  deps.ghPrChecksRequired = async () => {
+    throw Object.assign(new Error("Command failed with exit code 8"), {
+      code: 8,
+      stdout: pendingJson,
+      stderr: "",
+    });
+  };
+  const plan = await planMergeQueue({ milestone: "v1", baseBranch: "main" }, deps);
+  assert.equal(plan.candidates.length, 0);
+  assert.equal(plan.skips.length, 1);
+  assert.equal(plan.skips[0].reason, "checks-not-green");
+  assert.ok(plan.skips[0].detail.includes("required-ci"));
+});
+
+// ---------------------------------------------------------------------------
+// Base-branch gate
+// ---------------------------------------------------------------------------
+
+test("merge-queue: clean R2D PR targeting a different base is skipped as wrong-base", async () => {
+  const deps = makeDeps([
+    {
+      number: 60,
+      labels: ["pipeline:ready-to-deploy"],
+      pr: 600,
+      mergeable: "MERGEABLE",
+      mergeStateStatus: "CLEAN",
+      headRefOid: "release-sha",
+      baseRefName: "release/1.0",
+      requiredChecks: [{ name: "ci", bucket: "pass" }],
+    },
+    CLEAN_R2D(61, 610, "main-sha"), // base defaults to main
+  ]);
+  const plan = await planMergeQueue({ milestone: "v1", baseBranch: "main" }, deps);
+  assert.equal(plan.candidates.length, 1);
+  assert.equal(plan.candidates[0].issueNumber, 61);
+  assert.equal(plan.skips.length, 1);
+  assert.equal(plan.skips[0].issueNumber, 60);
+  assert.equal(plan.skips[0].reason, "wrong-base");
+  assert.ok(plan.skips[0].detail.includes("release/1.0"));
+  assert.ok(plan.skips[0].detail.includes("configured=main"));
 });
 
 // ---------------------------------------------------------------------------

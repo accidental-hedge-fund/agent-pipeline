@@ -20,6 +20,8 @@
 - [x] 3.2 Missing PR: resolver null excludes candidate; skip reason `missing-pr`
 - [x] 3.3 Non-mergeable / UNKNOWN: excluded with `non-mergeable` (or documented equivalent)
 - [x] 3.4 Checks not green: excluded with `checks-not-green`
+- [x] 3.4b Pending/fail `gh pr checks` non-zero exit with JSON stdout is recovered as `checks-not-green` (not fatal)
+- [x] 3.4c Wrong base branch: clean R2D PR against non-configured base is skipped with `wrong-base`
 - [x] 3.5 Happy path: clean MERGEABLE R2D PR is a candidate with would-merge action; order by issue number
 - [x] 3.6 Dry-run never invokes merge/write deps; idempotent plan on same fixtures
 - [x] 3.7 Advance/loop isolation: stage handlers and advance loop do not import merge-queue symbols

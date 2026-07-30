@@ -20,7 +20,8 @@ export type MergeQueueSkipReason =
   | "missing-pr"
   | "non-mergeable"
   | "checks-not-green"
-  | "empty-head-sha";
+  | "empty-head-sha"
+  | "wrong-base";
 
 export type MergeQueuePlannedAction = "would-merge";
 
@@ -77,6 +78,12 @@ export interface PlanMergeQueueOpts {
   milestone: string;
   /** Affirming default; reserved for future drive mode distinction. */
   dryRun?: boolean;
+  /**
+   * Configured integration base branch (from resolveConfig / --base).
+   * When set, PRs whose baseRefName does not match are skipped with reason
+   * `wrong-base` so release/backport targets never appear as would-merge.
+   */
+  baseBranch?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,21 +171,35 @@ export function realMergeQueueDeps(repo: string): MergeQueueDeps {
     },
 
     async ghPrChecksRequired(pr) {
-      const { stdout } = await execFileAsync(
-        "gh",
-        ["pr", "checks", String(pr), "--required", "--json", "name,bucket", "-R", repo],
-        { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 },
-      );
-      return JSON.parse(stdout) as RequiredCheck[];
+      try {
+        const { stdout } = await execFileAsync(
+          "gh",
+          ["pr", "checks", String(pr), "--required", "--json", "name,bucket", "-R", repo],
+          { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 },
+        );
+        return JSON.parse(stdout) as RequiredCheck[];
+      } catch (err) {
+        // gh exits non-zero (e.g. code 8) when required checks are pending/failing,
+        // but still writes the check JSON array to stdout. Recover that for the gate.
+        const recovered = recoverGhPrChecksFromExecError(err);
+        if (recovered) return recovered;
+        throw err;
+      }
     },
 
     async ghPrChecksAll(pr) {
-      const { stdout } = await execFileAsync(
-        "gh",
-        ["pr", "checks", String(pr), "--json", "name,bucket", "-R", repo],
-        { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 },
-      );
-      return JSON.parse(stdout) as RequiredCheck[];
+      try {
+        const { stdout } = await execFileAsync(
+          "gh",
+          ["pr", "checks", String(pr), "--json", "name,bucket", "-R", repo],
+          { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 },
+        );
+        return JSON.parse(stdout) as RequiredCheck[];
+      } catch (err) {
+        const recovered = recoverGhPrChecksFromExecError(err);
+        if (recovered) return recovered;
+        throw err;
+      }
     },
 
     log(msg) {
@@ -191,6 +212,29 @@ export function realMergeQueueDeps(repo: string): MergeQueueDeps {
 // Gates (mirror pipeline merge — see stages/merge.ts)
 // ---------------------------------------------------------------------------
 
+/**
+ * `gh pr checks` exits non-zero when any listed check is pending/fail/cancel
+ * (documented exit code 8 for pending). `execFile` rejects, but stdout still
+ * holds the JSON check array. Recover that so callers can classify as
+ * checks-not-green instead of aborting the whole dry-run.
+ *
+ * Returns null when stdout is missing or not a JSON array (genuine command/API
+ * failure — caller should rethrow).
+ */
+export function recoverGhPrChecksFromExecError(err: unknown): RequiredCheck[] | null {
+  const e = err as { stdout?: unknown };
+  if (typeof e.stdout !== "string") return null;
+  const out = e.stdout.trim();
+  if (!out) return null;
+  try {
+    const parsed: unknown = JSON.parse(out);
+    if (Array.isArray(parsed)) return parsed as RequiredCheck[];
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 /** True when mergeable/MERGEABLE and mergeStateStatus/CLEAN. */
 export function isMergeableClean(mergeable: string, mergeStateStatus: string): boolean {
   return mergeable === "MERGEABLE" && mergeStateStatus === "CLEAN";
@@ -201,6 +245,7 @@ export function isMergeableClean(mergeable: string, mergeStateStatus: string): b
  * - required list present: pass/skipping are non-blocking; fail/pending/cancel block
  * - no required checks configured ("no required checks reported"): fall back to all
  *   observable checks; fail/pending/cancel block; empty list is ok
+ * - non-zero `gh pr checks` with JSON stdout (pending/fail exit): treat as check data
  */
 export async function evaluateChecksGate(
   pr: number,
@@ -217,7 +262,14 @@ export async function evaluateChecksGate(
       noRequiredChecksConfigured = true;
       requiredChecks = [];
     } else {
-      throw err;
+      // Production deps recover pending/fail stdout themselves; also accept the
+      // rejected-process shape here so injected fakes and any raw exec error work.
+      const recovered = recoverGhPrChecksFromExecError(err);
+      if (recovered) {
+        requiredChecks = recovered;
+      } else {
+        throw err;
+      }
     }
   }
 
@@ -231,7 +283,12 @@ export async function evaluateChecksGate(
       if (errText.includes("no checks reported")) {
         allChecks = [];
       } else {
-        throw err;
+        const recovered = recoverGhPrChecksFromExecError(err);
+        if (recovered) {
+          allChecks = recovered;
+        } else {
+          throw err;
+        }
       }
     }
     const blocking: string[] = [];
@@ -331,6 +388,17 @@ export async function planMergeQueue(
     const mergeStateStatus = String(prData.mergeStateStatus ?? "UNKNOWN");
     const headRefOid = String(prData.headRefOid ?? "");
     const baseRefName = String(prData.baseRefName ?? "");
+    const configuredBase = (opts.baseBranch ?? "").trim();
+
+    if (configuredBase && baseRefName !== configuredBase) {
+      skips.push({
+        issueNumber: issue.number,
+        prNumber,
+        reason: "wrong-base",
+        detail: `baseRefName=${baseRefName || "(empty)"} configured=${configuredBase}`,
+      });
+      continue;
+    }
 
     if (!isMergeableClean(mergeable, mergeStateStatus)) {
       skips.push({
@@ -438,7 +506,13 @@ export function formatMergeQueuePlan(plan: MergeQueuePlan, repo?: string): strin
  * Returns process exit code (0 on successful plan, including empty).
  */
 export async function runMergeQueueDryRun(
-  opts: { milestone: string | undefined; dryRun?: boolean; apply?: boolean },
+  opts: {
+    milestone: string | undefined;
+    dryRun?: boolean;
+    apply?: boolean;
+    /** Configured base branch; forwarded to planMergeQueue for the base gate. */
+    baseBranch?: string;
+  },
   deps: MergeQueueDeps,
   print: (msg: string) => void = console.log,
   repo?: string,
@@ -463,7 +537,10 @@ export async function runMergeQueueDryRun(
     return 2;
   }
 
-  const plan = await planMergeQueue({ milestone: opts.milestone, dryRun: true }, deps);
+  const plan = await planMergeQueue(
+    { milestone: opts.milestone, dryRun: true, baseBranch: opts.baseBranch },
+    deps,
+  );
   print(formatMergeQueuePlan(plan, repo));
   return 0;
 }
