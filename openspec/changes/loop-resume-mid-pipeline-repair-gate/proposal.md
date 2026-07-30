@@ -4,24 +4,26 @@ After a durable-loop supervisor/advance crash mid-pipeline (e.g. during `fix-2` 
 
 ## What Changes
 
-- **Gate premature repair-forward out of local states when the live pipeline stage is still mid-flight.** When the ledger item is in a non-remote-proving state (`pending`, `in_progress`, `implemented`, and other local states) and the verified `LoopExternalIdentity.pipeline_stage` indicates active mid-pipeline work (`implementing`, `review-1` / `review-2`, `fix-1` / `fix-2`, `pre-merge`, `eval-gate`, `shipcheck-gate`, planning stages, etc.), reconciliation SHALL **not** classify the item as `ledger-behind` and SHALL **not** repair it to `pr_opened` merely because an open PR (with or without green checks) exists.
-- **Preserve true terminal catch-up.** Repair-forward to `ready` (ready-to-deploy label present) and to `merged` (PR merged) from local states remains allowed and audited — those are still externally proven terminal-ish advances, not mid-flight work.
-- **Resume keeps mid-pipeline items dispatchable.** After supervisor resume (including dead-holder lock recovery), an item that was `in_progress` and is still mid-pipeline on GitHub remains `in_progress` (or is otherwise re-admitted to a dispatch path) and is re-driven through `pipeline/loop-execution@1` from its live stage labels.
-- **Same rule for `pending` + open PR mid-pipeline.** A `pending` item whose live stage is already mid-pipeline SHALL NOT be jumped to stranded `pr_opened` (#601-class); it stays on a path the scheduler can admit (`pending` → start → `in_progress` → dispatch).
-- **`next_actions.advance` is not a dead advertisement for this class of item.** Either the item never enters the non-consuming `pr_opened` + `advance` combination for mid-flight work, or any residual `pr_opened` + mid-flight case is re-entered into a real dispatch path. No silent dead-end.
-- **Regression tests** prove: ledger `in_progress` + open PR + checks success + `pipeline_stage: fix-2` (or similar) remains dispatchable after reconcile; a sibling `pending` is not selected *in place of* the stranded item solely because reconcile demoted it; the regression fails without the fix.
+- **Gate premature repair-forward out of local states when the live pipeline stage is mid-flight.** When the ledger item is in a non-remote-proving local state and verified `pipeline_stage` is mid-flight (closed set derived from `STAGES` in `core/scripts/types.ts`), reconciliation SHALL NOT classify open-PR alone as `ledger-behind` and SHALL NOT repair to `pr_opened`. Checks conclusion does not override this gate.
+- **Required legacy heal:** already-stranded `pr_opened` + open PR + mid-flight stage is restored to `in_progress` with an audited history note (idempotent), then re-dispatched by the normal supervisor path.
+- **Preserve true terminal catch-up and #511:** `merged` and `ready_label_present` win over the mid-flight gate; open PR + **non-mid-flight / null** stage still repairs to `pr_opened` (crash-after-PR-open path).
+- **Resume re-dispatches mid-pipeline work** via existing `in_progress` re-drive through `pipeline/loop-execution@1` from live labels — not via non-consuming `next_actions.advance`.
+- **Regression tests** at pure reconcile and supervisor execution-trace levels; prove bite without the fix.
+- **OpenSpec deltas only** under this change during implementation (no direct living-spec edits until archive).
 - **No auto-merge; no review-policy changes; no attempt to prevent host/process death.**
 
 ## Acceptance criteria
 
 - [ ] Given ledger state `in_progress` and verified identity with open PR, checks `success`, and mid-flight `pipeline_stage` (e.g. `fix-2`), one reconciliation pass leaves the item **not** in `pr_opened` and still on a path the supervisor will re-dispatch (typically remains `in_progress`).
-- [ ] Given ledger state `pending` and the same mid-flight open-PR identity, reconciliation does **not** repair-forward to stranded `pr_opened`; the item remains schedulable as `pending` (or is otherwise driven) so the loop can continue it.
-- [ ] Given a local ledger state and verified identity with PR `merged`, reconciliation still repair-forwards to `merged` (true catch-up preserved).
-- [ ] Given a local ledger state and verified identity with open PR and `ready_label_present`, reconciliation still repair-forwards to `ready` (true catch-up preserved).
-- [ ] After `--resume <run_id>` recovers a dead lock and re-attaches the supervisor, a mid-pipeline item that was `in_progress` at crash is re-dispatched (or equivalently driven) so advance continues from the issue's current `pipeline:*` stage — not parked forever while siblings run.
-- [ ] For mid-flight work, the loop does not leave the only advertised action as non-consuming `next_actions.advance` on `pr_opened` while the scheduler only admits `pending` and the supervisor only re-drives `in_progress`.
-- [ ] Unit/pure tests with injected observe + store seams cover the `in_progress` + open PR + green checks + mid-flight stage case (and the merged / ready catch-up cases); at least one regression fails against today's unguarded `verifiedForwardTarget` / `classifyDrift` behavior without the fix.
-- [ ] `npm run ci` is green (core tests, `build.mjs --check` mirror in sync, install smoke, `openspec validate --all`).
+- [ ] Given ledger state `pending` and the same mid-flight open-PR identity, reconciliation does **not** repair-forward to stranded `pr_opened`; the item remains schedulable as `pending`.
+- [ ] Given a local ledger state and verified identity with PR `merged`, reconciliation still repair-forwards to `merged`.
+- [ ] Given a local ledger state and verified identity with open PR and `ready_label_present`, reconciliation still repair-forwards to `ready`.
+- [ ] Given a local ledger state and open PR with non-mid-flight / null stage, reconciliation still repair-forwards to `pr_opened` (#511 compatibility).
+- [ ] Given ledger state `pr_opened` with open PR and mid-flight stage, reconciliation heals to `in_progress` (audited, idempotent on repeated passes).
+- [ ] After `--resume <run_id>` recovers a dead lock, a mid-pipeline item that remains or is healed to `in_progress` is re-dispatched through `pipeline/loop-execution@1` (execution call trace), not parked while a pending sibling runs alone.
+- [ ] For mid-flight work, continuity does not depend solely on non-consuming `next_actions.advance` on `pr_opened`.
+- [ ] Unit/pure tests cover mid-flight gate, heal, merged/ready catch-up, #511 non-mid-flight path, checks matrix, and supervisor sibling dispatch ordering; at least one mid-flight regression fails without the fix.
+- [ ] `npm run ci` is green; OpenSpec change validates; living specs are not hand-edited during implementation.
 
 ## Capabilities
 
@@ -31,14 +33,14 @@ After a durable-loop supervisor/advance crash mid-pipeline (e.g. during `fix-2` 
 
 ### Modified Capabilities
 
-- `durable-run-reconciliation`: forward repair and drift classification for local ledger states MUST consult live `pipeline_stage` and MUST NOT repair mid-flight work to `pr_opened` on open-PR alone; true `ready` / `merged` catch-up remains; next-action computation MUST NOT strand mid-flight work behind a non-consuming `advance`.
-- `durable-loop-supervisor`: after resume/reconciliation, mid-pipeline items that remain (or are restored to) a dispatchable local state SHALL be re-dispatched; the supervisor MUST NOT treat a mid-flight open PR as reason to skip the item in favor of unrelated pending siblings.
+- `durable-run-reconciliation`: mid-flight predicate from `STAGES`; gate local → `pr_opened`; heal stranded mid-flight `pr_opened` → `in_progress`; preserve `ready` / `merged` and #511 non-mid-flight catch-up.
+- `durable-loop-supervisor`: after resume/reconciliation, mid-pipeline items that remain or are restored to `in_progress` SHALL be re-dispatched; supervisor MUST NOT strand them in favor of pending siblings.
 
 ## Impact
 
-- `core/scripts/loop/reconcile.ts` — `verifiedForwardTarget`, `classifyDrift`, and possibly `computeNextAction` / the reconcile repair branch; must use `LoopExternalIdentity.pipeline_stage` (already observed) to gate local → `pr_opened` repair.
-- `core/scripts/loop/supervisor.ts` — resume/cycle selection already re-drives `in_progress`; verify it still does after the gate, and add any residual path for already-stranded `pr_opened` + mid-flight if the design chooses a heal path.
-- `core/scripts/loop/types.ts` — no schema break expected; may document mid-flight stage set shared with precondition helpers.
-- `core/test/loop-reconcile.test.ts` (and supervisor tests if heal/re-dispatch is covered there) — extend #511 local+PR cases so mid-flight stages do not repair to `pr_opened`; keep merged/ready catch-up; prove regression bites.
-- Living specs: `openspec/specs/durable-run-reconciliation/`, `openspec/specs/durable-loop-supervisor/`.
-- No plugin hand-edit beyond mirror regen if `core/` changes at implement time; this proposal step is OpenSpec-only.
+- `core/scripts/loop/precondition.ts` (or adjacent) — pure `isMidFlightPipelineStage` from `STAGES`.
+- `core/scripts/loop/reconcile.ts` — `verifiedForwardTarget`, `classifyDrift`, reconcile heal branch.
+- `core/scripts/loop/supervisor.ts` — verify existing `in_progress` re-dispatch; no frontier change for `pr_opened` required if heal works.
+- `core/test/loop-reconcile.test.ts`, `core/test/loop-supervisor.test.ts` — gate, heal, #511 compat, execution-trace regressions.
+- Delta specs only under `openspec/changes/loop-resume-mid-pipeline-repair-gate/`.
+- Plugin mirror regen after `core/` edits.

@@ -17,111 +17,121 @@ Result: permanent strand until a human runs `/pipeline N` outside the loop. Evid
 **Goals:**
 
 - Stop demoting mid-flight local-state items to stranded `pr_opened` on open-PR alone.
-- Keep mid-pipeline items dispatchable across supervisor resume (typically stay `in_progress`, or stay `pending` until admitted).
-- Preserve true external catch-up to `ready` and `merged`.
-- Make `next_actions.advance` non-stranding for this class (no dead-end advertisement without a path).
-- Unit-test the regression with injected seams; prove the test bites without the fix.
+- Heal already-stranded `pr_opened` + mid-flight ledger rows back to dispatchable `in_progress` (idempotent, audited).
+- Keep mid-pipeline items dispatchable across supervisor resume (stay or restore `in_progress`, or stay `pending` until admitted).
+- Preserve true external catch-up to `ready` and `merged`, and preserve #511 crash-after-PR-open catch-up when stage is **not** mid-flight.
+- Make mid-flight continuity independent of non-consuming `next_actions.advance`.
+- Unit-test reconcile + supervisor paths with injected seams; prove regressions bite without the fix.
 
 **Non-Goals:**
 
 - Preventing host/process death or adding supervisor HA.
 - Auto-merge or any path past `pipeline:ready-to-deploy`.
 - Changing review policy, fix harness, or stage machine labels.
-- Building a general multi-action scheduler for every `LoopNextAction` value (only what is needed so mid-flight resume works).
+- Building a general multi-action scheduler for every `LoopNextAction` value (including a full `advance` dispatcher).
 - Cross-host lock recovery (host-local locks remain as today).
+- Editing living `openspec/specs/*` during implementation — only delta specs under this change.
 
 ## Decisions
 
-### Decision 1 — Prefer gate repair-forward (shape A), not a full `advance` dispatcher (shape B)
+### Decision 1 — Gate repair-forward (shape A) + required legacy heal; no `advance` dispatcher (shape B)
 
-**Choice:** Gate local-state → `pr_opened` repair using live `pipeline_stage` mid-flight detection. Leave the item in its local dispatchable state so existing supervisor paths re-drive it.
+**Choice:** Primary fix is gate local-state → `pr_opened` repair using live `pipeline_stage` mid-flight detection. Leave (or restore) the item in a local dispatchable state so existing supervisor paths re-drive it.
 
-**Why not B alone:** Implementing a consumer for `next_actions.advance` on `pr_opened` would re-enter advance, but it would also keep encoding "mid-pipeline work" as the remote-proving coarse state `pr_opened`, which is a poor model: happy-path supervisor transitions go `pending` → `in_progress` → `ready` (on `ready_to_deploy`), not through `pr_opened`. Shape A aligns resume with the happy path.
+**Legacy heal is in-scope and required (not optional):** ledger rows already stranded at `pr_opened` by pre-fix reconcile (#601 / #574 class) SHALL be restored to `in_progress` when identity still shows open PR + mid-flight stage, then re-dispatched by the normal supervisor path.
 
-**Why not both as primary:** A secondary heal for already-stranded ledger rows is optional (Decision 4); the primary bug is over-repair.
+**Why not B alone:** Implementing a consumer for `next_actions.advance` on `pr_opened` would re-enter advance but would keep encoding mid-pipeline work as coarse remote-proving `pr_opened`. Happy-path supervisor transitions go `pending` → `in_progress` → (terminal) `ready` on `ready_to_deploy`, not through `pr_opened`. Shape A + heal aligns resume with the happy path.
 
-### Decision 2 — Define mid-flight pipeline stages as "active advance work, not terminal catch-up"
+### Decision 2 — Mid-flight predicate from authoritative `STAGES` vocabulary
 
-**Mid-flight stages** (examples; implementation may share a pure helper with or adjacent to `loop/precondition.ts`):
+**Source of truth:** `STAGES` in `core/scripts/types.ts` (the pipeline state machine). Export a pure helper (e.g. `isMidFlightPipelineStage(stage: string | null): boolean`) colocated with `loop/precondition.ts` so reconcile and tests share one definition with the precondition helpers.
 
-- Planning arc: `planning`, `plan-review` (and any plan-revision variants if labeled)
-- Implementation and review/fix: `implementing`, `review-1`, `fix-1`, `review-2`, `fix-2`
-- Pre-merge / gates: `pre-merge`, `eval-gate`, `shipcheck-gate`
-- Any other non-terminal advance-loop stage that is neither pre-pipeline (`backlog` / null) nor terminal ready (`ready-to-deploy`)
+**Mid-flight stages** (active advance-loop work; open PR is expected and does **not** prove terminal catch-up):
 
-**Not mid-flight for this gate:**
-
-- `null` / `backlog` — pre-pipeline (precondition handles admission)
-- `ready` — precondition satisfied; open PR alone may still be rare here
-- `ready-to-deploy` — terminal for the loop's done definition; maps to ledger `ready` when `ready_label_present`
-
-**Rule for local ledger states** (`pending`, `in_progress`, `implemented`, `blocked`, `abandoned`, `paused`, `waiting`, and any other non-`REMOTE_PROVING` state):
-
-| Verified identity | Drift / repair |
+| Stage suffix | Notes |
 | --- | --- |
-| PR `merged` | `ledger-behind` → repair to `merged` (unchanged) |
-| Open PR + `ready_label_present` | `ledger-behind` → repair to `ready` (unchanged) |
-| Open PR + mid-flight `pipeline_stage` | **no** `ledger-behind` for open-PR alone; leave local state; no repair to `pr_opened` |
-| Open PR + non-mid-flight stage (e.g. null/`ready`) | Prefer **also not** repairing to `pr_opened` if that would strand; only repair to `ready`/`merged`. This tightens #511: open PR alone is not a remote-proving catch-up target from local states because `pr_opened` has no dispatch consumer. |
+| `planning`, `plan-review` | Planning arc |
+| `implementing`, `design-gate` | Implementation / design |
+| `review-1`, `fix-1`, `review-2`, `fix-2` | Review/fix rounds |
+| `pre-merge`, `visual-gate`, `eval-gate`, `shipcheck-gate` | Pre-merge / gates |
 
-**Clarification vs #511 test:** Today's test asserts `implemented` + open PR ⇒ `ledger-behind`. Under this design that becomes false when the intent is mid-pipeline continuity. Replace with: mid-flight open PR ⇒ no premature `pr_opened` repair; merged/ready still repair. Document in the regression that #511's crash-after-PR-open is recovered by **re-dispatching the local state**, not by parking at `pr_opened`.
+**Not mid-flight:**
 
-### Decision 3 — `computeNextAction` for residual `pr_opened`
+| Stage | Handling |
+| --- | --- |
+| `null` (missing / no `pipeline:*` label) | **Not** mid-flight → preserve #511 open-PR → `pr_opened` catch-up from local states |
+| `backlog` | Pre-pipeline; precondition gate owns admission; not mid-flight |
+| `ready` | Precondition satisfied only; not mid-flight → open PR may still #511-repair to `pr_opened` |
+| `ready-to-deploy` | Loop terminal for done-definition; catch-up via `ready_label_present` → `ready`, never heal to `in_progress` |
+| `needs-human` | Terminal off-ramp (`TERMINAL_STAGES`); not mid-flight; do **not** heal `pr_opened` → `in_progress` |
+| Unknown non-null string **not** in `STAGES` | Treat as **mid-flight** (defensive against vocabulary growth lag) so we do not strand future stages; unit-test this disposition |
 
-**Primary path:** After Decision 2, mid-flight items should not enter `pr_opened` via reconcile.
+Implement the predicate as membership in the closed mid-flight set derived from `STAGES` (exclude `backlog`, `ready`, `ready-to-deploy`, `needs-human`), plus unknown non-null → mid-flight. Do **not** use vague "etc." prose at call sites.
 
-**Residual / historical ledgers:** If an item is already `pr_opened` and identity shows mid-flight `pipeline_stage` and the PR is still open:
+### Decision 3 — Target precedence (merged / ready win over mid-flight gate and heal)
 
-- Prefer a **heal** (Decision 4) back to a dispatchable state, **or**
-- If heal is deferred, do **not** advertise non-consuming `advance` as if work will continue — prefer `noop` only if a heal is impossible; better to heal.
+When computing verified forward target / reconcile mutations, apply **strict precedence**:
 
-Do not expand the closed `LoopNextAction` set unless a new action is strictly required; prefer reusing dispatch via local state.
+1. `pr_state === "merged"` → target `merged` (`ledger-behind` repair). Mid-flight stage is irrelevant.
+2. Open PR + `ready_label_present` → target `ready`. Mid-flight stage is irrelevant.
+3. Else open PR + mid-flight `pipeline_stage` → **no** local → `pr_opened` repair (`verifiedForwardTarget` returns `null` for open-PR-only from local states in this case; `classifyDrift` does not emit `ledger-behind` for open-PR alone).
+4. Else open PR + **not** mid-flight (including `null` / `ready` / `backlog`) → target `pr_opened` (**#511 crash-after-PR-open path preserved**).
 
-### Decision 4 — Optional heal: `pr_opened` + mid-flight → `in_progress` (audited)
+Checks conclusion (`success` / `failure` / `pending` / absent) **must not** override the mid-flight gate: green checks must not force `pr_opened` for mid-flight local work.
 
-**Choice:** Implement a narrow, audited ledger transition (or reconcile-side repair that is **not** the forward remote-proving catch-up) when:
+**Already remote-proving `pr_opened` + mid-flight:** see Decision 4 (heal), not step 3/4 above.
+
+### Decision 4 — Required heal: stranded `pr_opened` + mid-flight → `in_progress`
+
+**When (all must hold):**
 
 - ledger state is `pr_opened`
-- identity has open PR
-- `pipeline_stage` is mid-flight
-- checks are not a contradiction class that already routes to human
+- identity `pr_state === "open"` and `pr_number !== null`
+- `isMidFlightPipelineStage(pipeline_stage)` is true
+- not superseded by Decision 3 steps 1–2 (merged / ready label win first)
 
-**Target state:** `in_progress` (supervisor already re-dispatches all `in_progress` items at the start of a cycle before selecting new pending work).
+**Action:** audited ledger transition `pr_opened` → `in_progress` with an explicit history note (e.g. `"reconciliation restored mid-flight item to in_progress for re-dispatch"`) and matching event. Not a remote-proving forward catch-up; a restore to a local dispatchable state.
 
-**Rationale:** Heals runs that already applied the buggy repair (e.g. #574 ledger already at `pr_opened`) without requiring a human `/pipeline N`. History note must make the heal explicit (e.g. "reconciliation restored mid-flight item to in_progress for re-dispatch").
+**Idempotence:**
 
-**Alternative rejected:** full `advance` next-action consumer — larger surface, duplicates `in_progress` dispatch.
+- After heal, item is `in_progress`; subsequent reconcile passes with the same mid-flight open-PR identity leave state `in_progress` (no oscillation, no duplicate heal history spam beyond one restore per stranding — prefer: only heal when `state === "pr_opened"`, so second pass is a no-op for heal).
+- Gate and heal must not fight: mid-flight local stays local; mid-flight `pr_opened` heals once to `in_progress` and stays.
 
-If implementation cost of heal is high, AC still pass with Decision 2 alone for **future** crashes; document residual heal as a follow-up only if tests prove Decision 2 alone meets resume AC for the in_progress crash path. Prefer including the heal in the same change when small.
+**Out of heal:** `ready-to-deploy` / `needs-human` / non-mid-flight / merged / ready label cases.
 
-### Decision 5 — Supervisor behavior stays "re-drive `in_progress`", no schedule-frontier change for `pr_opened`
+**`computeNextAction`:** after heal, state is `in_progress` → next action is not non-consuming `advance` on `pr_opened`. Residual pure `pr_opened` + non-mid-flight + green checks may still emit `advance` (pre-existing dead advertisement for non-mid-flight; out of scope to implement a consumer unless mid-flight path still depends on it — it must not).
 
-Do **not** admit `pr_opened` into the pending frontier. Keep the invariant: scheduler selects `pending`; supervisor re-dispatches existing `in_progress`. The fix makes mid-flight items stay (or return to) that model.
+### Decision 5 — Supervisor stays "re-drive `in_progress`"; no frontier change for `pr_opened`
 
-After resume: reconcile (gate + optional heal) → cycle sees `in_progress` → re-dispatch via `pipeline/loop-execution@1` → advance continues from live labels (existing per-item resume behavior).
+Do **not** admit `pr_opened` into the pending frontier. Keep: scheduler selects `pending`; supervisor re-dispatches existing `in_progress` (see `runSupervisorCycle` in `loop/supervisor.ts`: `activeItemIds` from `in_progress` before `selectSchedulableSet`).
 
-### Decision 6 — Pure helpers and test seams
+Resume path: attach (including dead-holder recovery) → reconcile (gate + heal) → cycle sees `in_progress` → `dispatchItem` / `pipeline/loop-execution@1` → advance continues from **fresh observed labels** (existing per-item advance resume; must not restart the pipeline from scratch).
 
-- Extract pure `isMidFlightPipelineStage(stage: string | null): boolean` (or equivalent) next to precondition helpers so classification stays unit-testable without I/O.
-- Keep `classifyDrift` / `verifiedForwardTarget` pure; pass full identity including `pipeline_stage`.
-- Tests inject `ReconcileObserveDeps` + `LoopStoreDeps` fakes only (existing pattern in `loop-reconcile.test.ts`).
+### Decision 6 — Pure helpers, test seams, and required tests
+
+- Pure `isMidFlightPipelineStage` next to precondition helpers; `classifyDrift` / `verifiedForwardTarget` remain pure and consult `identity.pipeline_stage`.
+- Tests inject `ReconcileObserveDeps` + `LoopStoreDeps` fakes only (pattern in `core/test/loop-reconcile.test.ts`).
+- Supervisor tests inject `SupervisorDeps.dispatchItem` and assert **call trace** (pattern in `core/test/loop-supervisor.test.ts`), not only final ledger state.
+- OpenSpec work stays under `openspec/changes/loop-resume-mid-pipeline-repair-gate/` delta specs; do not edit living `openspec/specs/` until pre-merge archive.
 
 ## Risks / Trade-offs
 
-- **[Risk] #511 open-PR catch-up to `pr_opened` is intentionally narrowed** → Mitigation: recover via re-dispatch of local state; preserve `ready`/`merged` catch-up; update tests so the old assertion is replaced by an explicit mid-flight continuity test.
-- **[Risk] Incomplete mid-flight stage set misses a label** → Mitigation: define mid-flight as "any stage that is not pre-pipeline and not ready-to-deploy" (positive list of terminals/exceptions) rather than a fragile allow-list of only known mid stages, if that is simpler and safer; document the closed set in code + tests.
-- **[Risk] Heal from `pr_opened` → `in_progress` could re-dispatch a truly finished PR-only row** → Mitigation: require mid-flight `pipeline_stage`; if stage is `ready-to-deploy`, use ready/merged paths instead.
-- **[Risk] `next_actions.advance` remains dead for non-mid-flight `pr_opened`** → Mitigation: out of scope unless we still emit that combination; Decision 2 avoids creating new stranded rows; optional follow-up to noop or implement advance for pure PR-open crash with null stage.
-- **[Risk] Parallel item selection** → Mitigation: unchanged concurrency rules; only which state the crashed item occupies changes.
+- **[Risk] #511 open-PR → `pr_opened` is narrowed for mid-flight only** → Mitigation: preserve for null/non-mid-flight; recover mid-flight via leave-local + heal; explicit compatibility tests.
+- **[Risk] Incomplete mid-flight set** → Mitigation: derive closed set from `STAGES` + unknown-non-null-as-mid-flight; unit-test membership table.
+- **[Risk] Heal re-dispatches a finished item** → Mitigation: require mid-flight stage; ready-to-deploy / merged / ready-label take precedence.
+- **[Risk] Oscillating heal vs forward repair** → Mitigation: heal only from `pr_opened`; gate never re-promotes mid-flight local to `pr_opened`; idempotence tests on repeated reconcile.
+- **[Risk] Checks edge cases bypass gate** → Mitigation: tests for success / failure / pending / absent on mid-flight local open PR.
+- **[Risk] Re-dispatch restarts pipeline** → Mitigation: assert path is existing `pipeline/loop-execution@1` with live labels (same as any `in_progress` re-drive); no new "start from ready" transition.
 
 ## Migration Plan
 
-1. Ship gate + tests; regenerate plugin mirror if `core/` changes.
-2. In-flight loop runs: on next reconcile/resume, mid-flight local items stop demoting; with heal, already-`pr_opened` mid-flight items return to `in_progress` and continue.
+1. Implement gate + heal + tests in `core/`; regenerate `plugin/` via `node scripts/build.mjs` in the same commit.
+2. In-flight loop runs: next reconcile/resume stops demoting mid-flight locals; heals already-`pr_opened` mid-flight items to `in_progress` and continues.
 3. Rollback: revert the change; prior over-repair behavior returns (no data migration).
 
 ## Open Questions
 
-- _(Resolved in Decision 2)_ Treat `pending` + mid-flight + open PR the same as `in_progress` for the gate — yes (#601).
-- _(Resolved in Decision 1/4)_ Shape A primary; optional heal for stranded `pr_opened`.
-- Exact mid-flight membership: implementers SHOULD prefer "not pre-pipeline and not ready-to-deploy" (or an explicit shared set) and lock it with tests; no further product decision required before coding.
+- _(Resolved)_ Shape A + required heal; no advance dispatcher.
+- _(Resolved)_ Mid-flight set from `STAGES` with explicit null/unknown/terminal handling.
+- _(Resolved)_ #511 preserved for non-mid-flight / absent stage.
+- _(Resolved)_ OpenSpec deltas only under the active change during implementation.

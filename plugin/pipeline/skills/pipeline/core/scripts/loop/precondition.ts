@@ -12,7 +12,7 @@
 // auto-promotion) evaluated against live truth each reconciliation pass, never frozen into the
 // compiled contract or the run's identity. Pure — no gh, git, fs, clock, or store access.
 
-import { BLOCKED_LABEL, LABEL_PREFIX } from "../types.ts";
+import { BLOCKED_LABEL, LABEL_PREFIX, STAGES } from "../types.ts";
 import type { LoopContract, LoopLedger, LoopPreconditionExclusion } from "./types.ts";
 
 /** The pipeline stage label required for a work-list item to be admissible. */
@@ -22,11 +22,41 @@ export const PRECONDITION_REQUIRED_STAGE = `${LABEL_PREFIX}ready`;
  *  that count as "not yet ready" — a deliberate operator hold, not a mid-pipeline stage. */
 const PRE_PIPELINE_STAGE_SUFFIXES = new Set(["backlog"]);
 
+/** Stage suffixes that are NOT mid-flight advance work: pre-pipeline, precondition-only,
+ *  and terminal off-ramps. Derived from the authoritative {@link STAGES} vocabulary; every
+ *  other known stage is mid-flight. Used by reconciliation's open-PR repair gate (#712). */
+const NON_MID_FLIGHT_STAGE_SUFFIXES = new Set(["backlog", "ready", "ready-to-deploy", "needs-human"]);
+
+/** Closed set of known mid-flight advance stages: every {@link STAGES} member except the
+ *  non-mid-flight set above. Kept as a Set so membership checks stay O(1) and the table is
+ *  single-sourced from `STAGES` (no hand-maintained duplicate list of advance stages). */
+const MID_FLIGHT_STAGE_SUFFIXES = new Set(
+  STAGES.filter((s) => !NON_MID_FLIGHT_STAGE_SUFFIXES.has(s)),
+);
+
 /** True when `stage` — a `LoopExternalIdentity.pipeline_stage` value — is pre-pipeline: still
  *  `pipeline:backlog`, or no `pipeline:*` label at all (`null`). Every other stage (`ready`, any
  *  mid-flight advance-loop stage, `ready-to-deploy`) is at-or-past the precondition. */
 export function isPrePipelineStage(stage: string | null): boolean {
   return stage === null || PRE_PIPELINE_STAGE_SUFFIXES.has(stage);
+}
+
+/** True when `stage` is mid-flight advance work — open PR alone must not repair-forward a
+ *  local ledger state to stranded `pr_opened` (#712, capability `durable-run-reconciliation`).
+ *
+ *  Membership (Decision 2 / loop-resume-mid-pipeline-repair-gate):
+ *  - Known active advance stages from {@link STAGES} (planning … shipcheck-gate) → mid-flight
+ *  - `null` / missing, `backlog`, `ready`, `ready-to-deploy`, `needs-human` → not mid-flight
+ *  - Unknown non-null string not in {@link STAGES} → mid-flight (defensive against vocabulary
+ *    growth lag so future stages are not stranded at `pr_opened`)
+ *
+ *  Pure — no I/O. */
+export function isMidFlightPipelineStage(stage: string | null): boolean {
+  if (stage == null) return false;
+  if (NON_MID_FLIGHT_STAGE_SUFFIXES.has(stage)) return false;
+  if (MID_FLIGHT_STAGE_SUFFIXES.has(stage)) return true;
+  // Unknown non-null: treat as mid-flight so a new stage cannot reintroduce stranding.
+  return true;
 }
 
 /** Renders a `LoopExternalIdentity.pipeline_stage` value into the label form

@@ -12,6 +12,7 @@ import {
   excludeContractItems,
   hasNewLabelEvent,
   isBlockedInLabels,
+  isMidFlightPipelineStage,
   isPrePipelineStage,
   pipelineStageFromLabels,
 } from "../scripts/loop/precondition.ts";
@@ -97,6 +98,39 @@ test("isPrePipelineStage: backlog is pre-pipeline", () => {
 
 test("isPrePipelineStage: ready is admissible", () => {
   assert.equal(isPrePipelineStage("ready"), false);
+});
+
+// ---------------------------------------------------------------------------
+// isMidFlightPipelineStage (#712 mid-flight open-PR repair gate)
+// ---------------------------------------------------------------------------
+
+test("isMidFlightPipelineStage: known advance stages are mid-flight", () => {
+  for (const stage of [
+    "planning",
+    "plan-review",
+    "implementing",
+    "design-gate",
+    "review-1",
+    "fix-1",
+    "review-2",
+    "fix-2",
+    "pre-merge",
+    "visual-gate",
+    "eval-gate",
+    "shipcheck-gate",
+  ]) {
+    assert.equal(isMidFlightPipelineStage(stage), true, `${stage} should be mid-flight`);
+  }
+});
+
+test("isMidFlightPipelineStage: null, backlog, ready, ready-to-deploy, needs-human are not mid-flight", () => {
+  for (const stage of [null, "backlog", "ready", "ready-to-deploy", "needs-human"] as const) {
+    assert.equal(isMidFlightPipelineStage(stage), false, `${stage} should not be mid-flight`);
+  }
+});
+
+test("isMidFlightPipelineStage: unknown non-null stage is treated as mid-flight", () => {
+  assert.equal(isMidFlightPipelineStage("future-stage-not-in-STAGES"), true);
 });
 
 test("isPrePipelineStage: an in-flight advance-loop stage is admissible", () => {
