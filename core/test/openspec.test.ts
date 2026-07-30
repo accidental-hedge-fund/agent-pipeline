@@ -7,6 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   changeDirExists,
+  changeIdFromArchiveFolderName,
   changeIdsFromPaths,
   isActive,
   isInitialized,
@@ -16,6 +17,7 @@ import {
   parseValidateResult,
   readChangeFile,
   readSpecDeltas,
+  sharedActiveChangeIdsFromPaths,
   shouldPlanWithOpenspec,
   unarchivedChangeIdsFromPrFiles,
 } from "../scripts/openspec.ts";
@@ -179,12 +181,43 @@ test("unarchivedChangeIdsFromPrFiles: nested paths and multiple ids", () => {
     "openspec/changes/bar/proposal.md",
     "openspec/changes/archive/bar/proposal.md",
   ];
-  assert.deepEqual(unarchivedChangeIdsFromPrFiles(paths).sort(), ["foo"]);
+  assert.deepEqual(unarchivedChangeIdsFromPrFiles(paths), ["foo"]);
 });
 
 test("unarchivedChangeIdsFromPrFiles: archive id itself excluded from active set", () => {
   const paths = ["openspec/changes/archive/proposal.md"];
   assert.deepEqual(unarchivedChangeIdsFromPrFiles(paths), []);
+});
+
+test("unarchivedChangeIdsFromPrFiles: date-prefixed archive folder clears bare active id (#714)", () => {
+  const paths = [
+    "openspec/changes/foo/proposal.md",
+    "openspec/changes/archive/2026-07-30-foo/proposal.md",
+  ];
+  assert.deepEqual(unarchivedChangeIdsFromPrFiles(paths), []);
+});
+
+test("unarchivedChangeIdsFromPrFiles: multi active + foreign/stacked id only as active path (#714)", () => {
+  const paths = [
+    "openspec/changes/own-change/tasks.md",
+    "openspec/changes/foreign-stacked/proposal.md",
+    "src/index.ts",
+  ];
+  assert.deepEqual(unarchivedChangeIdsFromPrFiles(paths), ["foreign-stacked", "own-change"]);
+});
+
+test("unarchivedChangeIdsFromPrFiles: empty set when no change paths", () => {
+  assert.deepEqual(unarchivedChangeIdsFromPrFiles([]), []);
+});
+
+test("changeIdFromArchiveFolderName: strips YYYY-MM-DD prefix", () => {
+  assert.equal(changeIdFromArchiveFolderName("2026-07-30-foo"), "foo");
+  assert.equal(changeIdFromArchiveFolderName("foo"), "foo");
+  assert.equal(changeIdFromArchiveFolderName("2026-07-30-multi-dash-id"), "multi-dash-id");
+});
+
+test("sharedActiveChangeIdsFromPaths is the same function as unarchivedChangeIdsFromPrFiles (#714)", () => {
+  assert.equal(sharedActiveChangeIdsFromPaths, unarchivedChangeIdsFromPrFiles);
 });
 
 test("shouldPlanWithOpenspec: off → false, on → true", () => {

@@ -196,6 +196,7 @@ function makeReviewDeps(
       >,
     getIssueDetail: (async () => detail) as NonNullable<AdvanceReviewDeps["getIssueDetail"]>,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     postComment: async (_cfg, _n, body) => {
       rec.comments.push(body);
       detail.comments.push({ author: "pipeline-bot", body, createdAt: "2026-06-12T02:00:00Z" });

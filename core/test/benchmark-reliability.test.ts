@@ -441,7 +441,7 @@ describe("benchmark-reliability-suite", () => {
       getPrCommits: async () => [],
       getPrDiff: async () => "diff --git a/src/foo.ts b/src/foo.ts\n+// change\n",
       getPrChecks: fakePrChecks,
-      getForIssue: async () => null, // no worktree → OpenSpec/rebase steps skip
+      getForIssue: async () => null, listPrHeadChangeDirs: async () => [], // no worktree → OpenSpec/rebase steps skip
       setBlocked: async () => {},
       transition: async () => {},
       openspecIsActive: () => false,

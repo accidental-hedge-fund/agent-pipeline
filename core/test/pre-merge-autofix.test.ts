@@ -234,6 +234,7 @@ function makeDeps(opts: {
     transition: async () => {},
     setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     getGhActor: async () => TEST_ACTOR,
     attemptPreMergeAutoFix: autoFix,
     // The live remote ref confirms the re-review head (#371 / #698).
@@ -547,6 +548,7 @@ test("pre-merge auto-fix / delta review: post-fix re-review digest is rebuilt fr
     transition: async () => {},
     setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     getGhActor: async () => TEST_ACTOR,
     attemptPreMergeAutoFix: async () => {
       rec.autoFixCalls++;
@@ -828,6 +830,7 @@ test("pre-merge auto-fix 5.9 (bite check): without auto-fix seam, correctness fi
     transition: async () => {},
     setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     getGhActor: async () => TEST_ACTOR,
     // No attemptPreMergeAutoFix seam.
   };
@@ -1064,6 +1067,7 @@ test("pre-merge auto-fix finding-4: getPrCommits throws → fail closed, no auto
     transition: async () => {},
     setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     getGhActor: async () => TEST_ACTOR,
     attemptPreMergeAutoFix: async () => {
       rec.autoFixCalls++;
@@ -1132,6 +1136,7 @@ test("pre-merge auto-fix finding-2: re-review needs-attention + zero findings �
     transition: async () => {},
     setBlocked: async (_cfg, _n, reason) => { rec.blocked.push({ reason }); },
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     getGhActor: async () => TEST_ACTOR,
     attemptPreMergeAutoFix: async () => {
       rec.autoFixCalls++;
@@ -1246,6 +1251,7 @@ test("pre-merge auto-fix R2-F1: getCommitDeltaDiff fails post-fix → full re-re
     transition: async (_cfg, _n, _from, to) => { transitions.push({ to: to as string }); },
     setBlocked: async () => {},
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     getGhActor: async () => TEST_ACTOR,
     attemptPreMergeAutoFix: async () => ({ status: "fix-committed", headSha: SHA_AFTER_FIX }),
   };
@@ -1319,6 +1325,7 @@ test("pre-merge auto-fix R2-F3: fix prompt scoped to blocking findings only, not
     transition: async () => {},
     setBlocked: async () => {},
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     getGhActor: async () => TEST_ACTOR,
     attemptPreMergeAutoFix: async (_blocking, _title, findingsText) => {
       capturedFindingsText = findingsText;
@@ -1418,6 +1425,7 @@ test(
       transition: async () => {},
       setBlocked: async () => {},
       getForIssue: async () => null,
+      listPrHeadChangeDirs: async () => [],
       getGhActor: async () => TEST_ACTOR,
       attemptPreMergeAutoFix: async () => {
         autoFixCalls++;
@@ -1524,6 +1532,7 @@ test(
       transition: async () => {},
       setBlocked: async () => {},
       getForIssue: async () => null,
+      listPrHeadChangeDirs: async () => [],
       getGhActor: async () => TEST_ACTOR,
       attemptPreMergeAutoFix: async () => {
         autoFixCalls++;
@@ -1619,6 +1628,7 @@ for (const [label, remoteHead] of [
         transition: async (_cfg, _n, from, to) => { transitions.push(`${from}->${to}`); },
         setBlocked: async () => {},
         getForIssue: async () => null,
+        listPrHeadChangeDirs: async () => [],
         getGhActor: async () => TEST_ACTOR,
         attemptPreMergeAutoFix: async () =>
           ({ status: "fix-committed", headSha: SHA_AFTER_FIX }) as any,
@@ -1701,6 +1711,7 @@ test(
       transition: async (_cfg, _n, from, to) => { transitions.push(`${from}->${to}`); },
       setBlocked: async () => {},
       getForIssue: async () => null,
+      listPrHeadChangeDirs: async () => [],
       getGhActor: async () => TEST_ACTOR,
       attemptPreMergeAutoFix: async () =>
         ({ status: "fix-committed", headSha: SHA_AFTER_FIX }) as any,

@@ -35,12 +35,17 @@ async function quiet(t: TestContext, fn: () => Promise<void>): Promise<void> {
 }
 
 function baseDeps(gitInWorktree: AdvancePreMergeDeps["gitInWorktree"]): AdvancePreMergeDeps {
+  // Track active dirs so post-archive verification (#714) sees them leave the tree.
+  const activeDirs = new Set([CHANGE_ID]);
   return {
     getForIssue: (async () => ({ path: "/wt", slug: SLUG, branch: BRANCH })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => true,
     gitInWorktree,
-    changeDirExists: () => true,
-    openspecArchive: undefined,
+    changeDirExists: (_d, id) => activeDirs.has(id),
+    openspecArchive: (async (_w, id) => {
+      activeDirs.delete(id);
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
     setBlocked: async () => {},
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
     branchDeveloperCommits: async () => [],
@@ -81,10 +86,11 @@ test("maybeArchiveOpenspec: worktree behind origin/<branch> is fast-forwarded be
   }) as AdvancePreMergeDeps["gitInWorktree"];
 
   const deps = baseDeps(gitInWorktree);
-  deps.openspecArchive = (async (_w: string, id: string) => {
+  const prevArchive = deps.openspecArchive!;
+  deps.openspecArchive = (async (w: string, id: string) => {
     archiveCalls.push(id);
     archived = true;
-    return { success: true, unavailable: false, output: "" };
+    return prevArchive(w, id);
   }) as AdvancePreMergeDeps["openspecArchive"];
 
   let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
@@ -204,10 +210,11 @@ test("maybeArchiveOpenspec: fetch must update the origin/<branch> tracking ref i
   }) as AdvancePreMergeDeps["gitInWorktree"];
 
   const deps = baseDeps(gitInWorktree);
-  deps.openspecArchive = (async (_w: string, id: string) => {
+  const prevArchiveTrack = deps.openspecArchive!;
+  deps.openspecArchive = (async (w: string, id: string) => {
     archiveCalls.push(id);
     archived = true;
-    return { success: true, unavailable: false, output: "" };
+    return prevArchiveTrack(w, id);
   }) as AdvancePreMergeDeps["openspecArchive"];
 
   let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
@@ -244,10 +251,11 @@ test("maybeArchiveOpenspec: worktree already at origin/<branch> archives unchang
   }) as AdvancePreMergeDeps["gitInWorktree"];
 
   const deps = baseDeps(gitInWorktree);
-  deps.openspecArchive = (async (_w: string, id: string) => {
+  const prevArchiveSync = deps.openspecArchive!;
+  deps.openspecArchive = (async (w: string, id: string) => {
     archiveCalls.push(id);
     archived = true;
-    return { success: true, unavailable: false, output: "" };
+    return prevArchiveSync(w, id);
   }) as AdvancePreMergeDeps["openspecArchive"];
 
   let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;

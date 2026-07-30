@@ -147,6 +147,7 @@ function makeDeps(
     getGhActor: async () => "pipeline-bot",
     getWorktreeHead: async () => STUB_PR_HEAD_SHA,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     gitDiffNames: async () => [],
     readEvidenceBundle: async () => null,
     postComment: async (_c, _n, body) => { log.comments.push(body); },
@@ -1038,6 +1039,7 @@ test("shipcheck-gate: disabled + auto_merge_eligibility.enabled → eligibility 
     ...makeDeps(log, ""),
     getPrForIssue: async () => 99,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     runEligibilityGateFn: async () => {
       eligibilityGateCalled = true;
       return {
@@ -1112,6 +1114,7 @@ test("shipcheck-gate: actual review verdict read from bundle, not synthetic appr
     ...makeDeps(log, fencedJson(PASS_VERDICT)),
     getPrForIssue: async () => 99,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     readEvidenceBundle: async () => ({
       schema_version: 1,
       schemaVersion: 1,
@@ -1171,6 +1174,7 @@ test("shipcheck-gate: actual review verdict from bundle reviews passed to eligib
     ...makeDeps(log, fencedJson(PASS_VERDICT)),
     getPrForIssue: async () => 99,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     readEvidenceBundle: async () => ({
       schema_version: 1,
       schemaVersion: 1,
@@ -1254,6 +1258,7 @@ test("shipcheck-gate: bundle pr:null → patchBundleIdentityFn called before eli
     ...makeDeps(log, fencedJson(PASS_VERDICT)),
     getPrForIssue: async () => 77,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     readEvidenceBundle: async () => ({
       schema_version: 1,
       schemaVersion: 1,
@@ -1321,6 +1326,7 @@ test("shipcheck-gate: bundle pr already set → patchBundleIdentityFn NOT called
     ...makeDeps(log, fencedJson(PASS_VERDICT)),
     getPrForIssue: async () => 77,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     readEvidenceBundle: async () => ({
       schema_version: 1,
       schemaVersion: 1,
@@ -1498,6 +1504,7 @@ test("shipcheck-gate #317 4.5: first entry (no prior comment) → proceeds; verd
     ...makeDeps(log, fencedJson(PASS_VERDICT)),
     getPrForIssue: async () => 42,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H1, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
     getWorktreeHead: async () => SHA_H1,
     getGhActor: async () => "pipeline-bot",
@@ -1530,7 +1537,7 @@ test("shipcheck-gate #317 4.6a: no worktree → worktree-head check skipped, no 
   const deps: ShipcheckDeps = {
     ...makeDeps(log, fencedJson(PASS_VERDICT)),
     getPrForIssue: async () => 42,
-    getForIssue: async () => null, // no worktree
+    getForIssue: async () => null, listPrHeadChangeDirs: async () => [], // no worktree
     getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "b", head_sha: SHA_H1, base_ref: "main", mergeable: null, mergeable_state: "", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
     getWorktreeHead: async (p) => { worktreeHeadCalled = true; return p; },
   };
@@ -1749,6 +1756,7 @@ test("shipcheck-gate #317 F2: PR head drifts during reviewer run → routes to p
     ...makeDeps(log, fencedJson(PASS_VERDICT)),
     getPrForIssue: async () => 42,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     // First call (pre-review): returns H2. Second call (post-review): returns H3.
     getPrDetail: async () => {
       getPrDetailCallCount++;
@@ -1783,6 +1791,7 @@ test("shipcheck-gate #317 F3: actor lookup returns null with PR linked → block
     ...makeDeps(log, fencedJson(PASS_VERDICT)),
     getPrForIssue: async () => 42,
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     getPrDetail: async () => ({ number: 42, title: "", body: "", state: "open", url: "", head_ref: "branch", head_sha: SHA_H2, base_ref: "main", mergeable: true, mergeable_state: "clean", draft: false, additions: 0, deletions: 0, changed_files: 0 }),
     getWorktreeHead: async () => SHA_H2,
     getGhActor: async () => null, // actor lookup fails

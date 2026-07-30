@@ -551,6 +551,141 @@ export async function getPrDiff(cfg: PipelineConfig, prNumber: number): Promise<
 }
 
 /**
+ * Parse a GitHub Contents API listing of `openspec/changes/` into active change
+ * ids (directories only; excludes `archive`). Pure; exported for unit tests.
+ * Used by {@link listPrHeadChangeDirs} for tip-tree membership (#714).
+ */
+export function activeChangeIdsFromContentsEntries(entries: unknown): string[] {
+  if (!Array.isArray(entries)) return [];
+  const ids: string[] = [];
+  for (const raw of entries) {
+    if (!raw || typeof raw !== "object") continue;
+    const e = raw as { name?: unknown; type?: unknown };
+    if (e.type === "dir" && typeof e.name === "string" && e.name !== "archive" && e.name.length > 0) {
+      ids.push(e.name);
+    }
+  }
+  return ids.sort();
+}
+
+/**
+ * True when stderr/message looks like an HTTP 404-class response (status signal).
+ * Pure; exported for unit tests. Does **not** by itself mean "path missing" —
+ * GitHub also 404s private resources when the token lacks access (#714 delta).
+ */
+export function isHttp404Signal(stderr: string): boolean {
+  const s = stderr.toLowerCase();
+  // Only explicit HTTP status syntax — never a bare "404" token.
+  // SHA/command fragments (e.g. ref a404b…, path …/404/…) must not
+  // classify a non-404 failure as path-missing (#714 review: aaa27d9c).
+  return (
+    s.includes("http 404") ||
+    s.includes("status code: 404") ||
+    s.includes("status code 404")
+  );
+}
+
+/**
+ * True when the error is clearly auth/permission rather than "path not on tip".
+ * Pure; exported for unit tests. Such errors must fail closed — never map to [].
+ */
+export function isGithubAuthOrPermissionError(stderr: string): boolean {
+  const s = stderr.toLowerCase();
+  return (
+    s.includes("http 401") ||
+    s.includes("http 403") ||
+    s.includes("status code: 401") ||
+    s.includes("status code: 403") ||
+    s.includes("bad credentials") ||
+    s.includes("resource not accessible") ||
+    s.includes("authentication") ||
+    s.includes("permission denied") ||
+    s.includes("must have push access") ||
+    s.includes("required scopes")
+  );
+}
+
+/**
+ * Whether a failed `openspec/changes` Contents list may be treated as empty.
+ * Only when the error is a 404-class signal, is **not** auth/permission-shaped,
+ * **and** a tip-root Contents probe already succeeded (proves the tip is listable
+ * with current credentials). Pure; exported for unit tests (#714 delta 4706fcc2).
+ */
+export function shouldTreatContents404AsEmpty(
+  openspecErrorMessage: string,
+  tipRootListSucceeded: boolean,
+): boolean {
+  if (!tipRootListSucceeded) return false;
+  if (isGithubAuthOrPermissionError(openspecErrorMessage)) return false;
+  return isHttp404Signal(openspecErrorMessage);
+}
+
+/**
+ * Active OpenSpec change ids present on the reviewed PR head tree (tip membership).
+ *
+ * Lists `openspec/changes/` via the GitHub Contents API at the PR head SHA — the
+ * authoritative final tree, not a cumulative PR changed-file list. Archive-path
+ * subtraction on cumulative paths can mask a reintroduced `openspec/changes/<id>/`
+ * when both path families appear in the PR (#714 review 2).
+ *
+ * Missing `openspec/changes` on a **readable** tip → []. Auth/permission failures
+ * and ambiguous 404s (tip root also unlistable) throw so callers fail closed —
+ * never invent an empty active set from a bare "404"/"not found" substring
+ * (#714 pre-merge delta override-key 4706fcc2).
+ */
+export async function listPrHeadChangeDirs(
+  cfg: PipelineConfig,
+  prNumber: number,
+): Promise<string[]> {
+  const detail = await getPrDetail(cfg, prNumber);
+  const ref = detail.head_sha;
+  if (!ref) {
+    throw new Error(`PR #${prNumber} has no head SHA — cannot list OpenSpec tip-tree change dirs`);
+  }
+  const refQ = encodeURIComponent(ref);
+  let stdout: string;
+  try {
+    stdout = await ghRun(
+      ["api", `repos/${cfg.repo}/contents/openspec/changes?ref=${refQ}`],
+      { retries: 1 },
+    );
+  } catch (err) {
+    const msg = (err as Error).message ?? "";
+    // Auth/permission: fail closed immediately (do not map to []).
+    if (isGithubAuthOrPermissionError(msg)) throw err;
+    // Only 404-class signals may mean "path absent on tip" — still confirm tip root.
+    if (!isHttp404Signal(msg)) throw err;
+    let tipRootOk = false;
+    try {
+      await ghRun(
+        ["api", `repos/${cfg.repo}/contents/?ref=${refQ}`],
+        { retries: 1 },
+      );
+      tipRootOk = true;
+    } catch (probeErr) {
+      const probeMsg = ((probeErr as Error).message ?? "").trim();
+      throw new Error(
+        `listPrHeadChangeDirs: openspec/changes unavailable for PR #${prNumber} ` +
+          `and tip root is not listable at ${ref.slice(0, 12)} — failing closed ` +
+          `(possible auth/permission obscuring 404). openspec: ${msg.trim()}; ` +
+          `tip-root: ${probeMsg || "unknown"}`,
+      );
+    }
+    if (shouldTreatContents404AsEmpty(msg, tipRootOk)) return [];
+    throw err;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error(
+      `listPrHeadChangeDirs: invalid JSON from contents API for PR #${prNumber}`,
+    );
+  }
+  return activeChangeIdsFromContentsEntries(parsed);
+}
+
+/**
  * The PR's commits, oldest-first (base → head). Used by the pre-merge review-SHA
  * gate (#16) to classify the commits that landed since a review verdict: a
  * developer commit invalidates the verdict, pipeline-internal commits (docs /

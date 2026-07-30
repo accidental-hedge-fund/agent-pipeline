@@ -23,6 +23,7 @@ import {
   getPrDetail,
   getPrDiff,
   getPrForIssue,
+  listPrHeadChangeDirs,
   parseChecksAggregate,
   clearBlocked,
   postComment,
@@ -930,6 +931,15 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   gitInWorktree?: typeof gitInWorktree;
   openspecIsActive?: typeof openspec.isActive;
   changeDirExists?: typeof openspec.changeDirExists;
+  /** Tip-tree listing of active change dirs (`openspec/changes/<id>/`, excl. archive). */
+  listChangeDirs?: typeof openspec.listChangeDirs;
+  /**
+   * Tip-tree listing of active OpenSpec change ids on the reviewed PR head when
+   * no on-disk worktree is available (#714 review 2). Production default uses the
+   * GitHub Contents API at the PR head SHA. Must not use cumulative PR path
+   * subtraction (archive-then-reintroduce masking).
+   */
+  listPrHeadChangeDirs?: typeof listPrHeadChangeDirs;
   openspecArchive?: typeof openspec.archive;
   /** Per-commit paths for all non-pipeline-internal branch commits (guard input). */
   branchDeveloperCommits?: (wtPath: string, baseBranch: string) => Promise<FixCommit[]>;
@@ -3255,14 +3265,16 @@ export async function archiveAlreadyDone(
 }
 
 /**
- * Head-side postcondition (#467, design D1): before pre-merge advances, block
- * while the PR's own changed-file list still carries an `openspec/changes/<id>/`
- * path (id ≠ `archive`) not matched by a corresponding
- * `openspec/changes/archive/<id>/` path in that same file list. Computed purely
- * from `getPrDiff` → `diffFilePaths` — never the local worktree filesystem — so
- * it behaves identically on a first run, an override-resumed run, a fresh
- * process, or after the worktree has been removed. Returns `null` to continue
- * when nothing remains active.
+ * Head-side postcondition (#467 / #714): before pre-merge advances, block while
+ * any OpenSpec change remains active on the reviewed PR tip.
+ *
+ * Prefer tip-tree membership from the on-disk worktree (`listChangeDirs`) when
+ * available — same source as archive candidates after base sync — so a prior
+ * archive path in the cumulative PR diff cannot mask a reintroduced active dir.
+ * When no worktree is on disk, resolve tip membership via the PR-head tree
+ * (`listPrHeadChangeDirs` / GitHub Contents API) — never cumulative PR path
+ * subtraction, which masks archive-then-reintroduce (#714 review 2). Returns
+ * `null` to continue when nothing remains active.
  */
 export async function enforceOpenspecActiveChangeGuard(
   cfg: PipelineConfig,
@@ -3270,22 +3282,41 @@ export async function enforceOpenspecActiveChangeGuard(
   prNumber: number,
   deps: AdvancePreMergeDeps = {},
 ): Promise<Outcome | null> {
-  const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
+  const getForIssueFn = deps.getForIssue ?? getOnDiskForIssue;
+  const listChangeDirsFn = deps.listChangeDirs ?? openspec.listChangeDirs;
+  const listPrHeadChangeDirsFn = deps.listPrHeadChangeDirs ?? listPrHeadChangeDirs;
 
-  let diff: string;
+  // Tip-tree first when a worktree exists (authoritative final head state).
+  // Lookup failures fall through to the remote PR-head tree probe.
+  let wt: { path: string; slug: string } | null = null;
   try {
-    diff = await getPrDiffFn(cfg, prNumber);
-  } catch (err) {
-    // Fail closed (#467): cannot prove the PR carries no active OpenSpec change,
-    // so do not let a fetch failure silently pass the guard.
+    wt = await getForIssueFn(cfg, issueNumber);
+  } catch {
+    wt = null;
+  }
+  if (wt) {
+    const remaining = [...listChangeDirsFn(wt.path)].sort();
+    if (remaining.length === 0) return null;
     const reason =
-      `Pre-merge cannot verify the OpenSpec active-change guard — fetching the PR diff failed ` +
-      `(${(err as Error).message}). Check gh auth/network and re-run.`;
+      `Pre-merge cannot advance: OpenSpec change(s) still active on this PR: ${remaining.join(", ")}. ` +
+      `Run \`openspec archive <id>\` for each and push before pre-merge can continue.`;
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+    return preMergeBlocked(reason, "openspec-invalid");
+  }
+
+  // Missing-worktree: PR-head tree only — not cumulative path subtraction (#714 review 2).
+  let remaining: string[];
+  try {
+    remaining = [...(await listPrHeadChangeDirsFn(cfg, prNumber))].sort();
+  } catch (err) {
+    // Fail closed (#467): cannot prove the PR carries no active OpenSpec change.
+    const reason =
+      `Pre-merge cannot verify the OpenSpec active-change guard — listing PR-head OpenSpec ` +
+      `change dirs failed (${(err as Error).message}). Check gh auth/network and re-run.`;
     await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
     return preMergeBlocked(reason, "needs-human");
   }
-  const remaining = openspec.unarchivedChangeIdsFromPrFiles(diffFilePaths(diff));
   if (remaining.length === 0) return null;
 
   const reason =
@@ -3302,12 +3333,15 @@ export async function enforceOpenspecActiveChangeGuard(
  * step entirely. Returns a `waiting` Outcome after pushing (CI must re-run), a
  * `blocked` Outcome on failure, or null when there is nothing to do (continue the gate).
  *
- * Fails closed (#467): a candidate probe that errors, or a missing worktree
+ * Fails closed (#467, #714): a candidate probe that errors, or a missing worktree
  * while the PR itself still carries an `openspec/changes/<id>/` path, blocks
  * rather than returning `null` — `null` is reserved for a positively
- * established "nothing to archive". Every decision (archived / skipped /
- * blocked) is recorded as a `gate_result` run event via `deps.runDir` so a
- * silent skip is diagnosable from `events.jsonl` alone.
+ * established "nothing to archive". Archive candidates and the residual
+ * still-active guard share one active-change set (PR tip when available) so a
+ * single evaluation cannot emit `skipped`/`no-candidates` then block on the same
+ * still-active id(s). Every decision (archived / skipped / blocked) is recorded
+ * as a `gate_result` run event via `deps.runDir` so a silent skip is diagnosable
+ * from `events.jsonl` alone.
  */
 export async function maybeArchiveOpenspec(
   cfg: PipelineConfig,
@@ -3323,6 +3357,8 @@ export async function maybeArchiveOpenspec(
   const gitFn = deps.gitInWorktree ?? gitInWorktree;
   const isActiveFn = deps.openspecIsActive ?? openspec.isActive;
   const changeDirExistsFn = deps.changeDirExists ?? openspec.changeDirExists;
+  const listChangeDirsFn = deps.listChangeDirs ?? openspec.listChangeDirs;
+  const listPrHeadChangeDirsFn = deps.listPrHeadChangeDirs ?? listPrHeadChangeDirs;
   const archiveFn = deps.openspecArchive ?? openspec.archive;
   const getPrDiffFn = deps.getPrDiff ?? getPrDiff;
   const branchDeveloperCommitsFn =
@@ -3349,29 +3385,39 @@ export async function maybeArchiveOpenspec(
     ).catch(() => {});
   };
 
+  /** Residual still-active block — same remedy text as enforceOpenspecActiveChangeGuard. */
+  const blockResidualActive = async (remaining: string[]): Promise<Outcome> => {
+    const reason =
+      `Pre-merge cannot advance: OpenSpec change(s) still active on this PR: ${remaining.join(", ")}. ` +
+      `Run \`openspec archive <id>\` for each and push before pre-merge can continue.`;
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+    await recordDecision("fail", reason);
+    return preMergeBlocked(reason, "openspec-invalid");
+  };
+
   const wt = await getForIssueFn(cfg, issueNumber);
   if (!wt) {
-    // Worktree missing: fall back to the head-side PR file list (worktree-independent)
-    // rather than assuming there is nothing to archive (#467). `openspec.enabled: off`
-    // disables the integration outright regardless of file contents.
+    // Worktree missing: resolve active membership from the reviewed PR-head tree
+    // (GitHub Contents API), never cumulative PR path subtraction — the latter
+    // masks archive-then-reintroduce (#467 / #714 review 2). `openspec.enabled: off`
+    // disables the integration outright regardless of tip contents.
     const mode = cfg.openspec?.enabled ?? "auto";
     if (mode === "off" || prNumber === undefined) {
       await recordDecision("skipped", "openspec-inactive");
       return null;
     }
-    let prPaths: string[];
+    let remaining: string[];
     try {
-      prPaths = diffFilePaths(await getPrDiffFn(cfg, prNumber));
+      remaining = [...(await listPrHeadChangeDirsFn(cfg, prNumber))].sort();
     } catch (err) {
       const reason =
-        `Worktree for #${issueNumber} not found on disk and the PR diff fetch failed ` +
-        `(${(err as Error).message}), so it cannot be confirmed there is no active OpenSpec ` +
-        `change to archive. Restore the worktree (or gh auth) and re-run.`;
+        `Worktree for #${issueNumber} not found on disk and listing PR-head OpenSpec change ` +
+        `dirs failed (${(err as Error).message}), so it cannot be confirmed there is no active ` +
+        `OpenSpec change to archive. Restore the worktree (or gh auth) and re-run.`;
       await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
       await recordDecision("fail", reason);
       return preMergeBlocked(reason, "needs-human");
     }
-    const remaining = openspec.unarchivedChangeIdsFromPrFiles(prPaths);
     if (remaining.length > 0) {
       const reason =
         `OpenSpec worktree for #${issueNumber} not found on disk, and the pull request still ` +
@@ -3389,45 +3435,168 @@ export async function maybeArchiveOpenspec(
     return null;
   }
 
-  // Changes this PR branch introduced, still active (not yet archived).
-  const diff = await gitFn(
-    wt.path,
-    ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
-    { ignoreFailure: true },
-  );
-  if (diff.code !== 0) {
-    // Fail closed (#467): a failed probe must never be read as "no candidates" —
-    // `ignoreFailure: true` only suppresses the throw, not the meaning of a non-zero exit.
-    const detail = (diff.stderr || diff.stdout || "(no output)").trim();
-    const reason =
-      `Cannot determine active OpenSpec change candidates — ` +
-      `\`git diff --name-only origin/${cfg.base_branch}...HEAD\` failed (exit ${diff.code}): ${detail}`;
-    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
-    await recordDecision("fail", reason);
-    return preMergeBlocked(reason, "openspec-invalid");
-  }
-  const candidates = openspec
-    .changeIdsFromPaths(diff.stdout.split("\n").map((s) => s.trim()).filter(Boolean))
-    .filter((id) => changeDirExistsFn(wt.path, id));
+  // Shared active-change set is finalized ONLY after archive-base sync below
+  // (#714). Do not emit `no-candidates` from a pre-sync PR path probe — an empty
+  // cumulative PR diff must not bypass the required fail-closed base sync, and
+  // tip-tree membership (not archive-path subtraction) is the membership rule.
 
-  // Idempotency guard (#181, fix 2): evaluate candidates *before* consulting commit
-  // history so a prior archive commit cannot mask re-introduced active change
-  // directories. If no candidates remain, there is nothing to archive.
-  if (candidates.length === 0) {
+  // Pre-archive cleanliness guard: the commit-failure rollback below is destructive
+  // (`git restore .` + `git clean -fd openspec/`), so it is provably lossless ONLY when
+  // the worktree is fully clean before archive. Block on ANY pre-existing dirty state —
+  // a path-prefix filter is unsafe two ways: a dirty tracked openspec/ file (e.g.
+  // `M  openspec/specs/x.md`) would be silently discarded by the rollback, and a porcelain
+  // rename/copy record (`R  openspec/a -> core/a`) has a destination outside openspec/ that
+  // matching only the first path misses. All planning/fix work is committed before pre-merge,
+  // so any non-empty status here is anomalous — fail safe rather than risk data loss.
+  // Fail CLOSED: only proceed when `git status` SUCCEEDS and reports a clean tree. If the
+  // status check itself errors (non-zero exit, often with empty stdout), we cannot prove the
+  // tree is clean — treating that as clean would let the destructive rollback run over
+  // unproven state, the very data-loss class this guard exists to close.
+  const preArchiveStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+  if (preArchiveStatus.code !== 0 || preArchiveStatus.stdout.trim() !== "") {
+    const detail =
+      preArchiveStatus.code !== 0
+        ? `git status --porcelain failed (exit ${preArchiveStatus.code}): ${(preArchiveStatus.stderr || preArchiveStatus.stdout || "(no output)").trim()}`
+        : `pre-existing dirty paths:\n${preArchiveStatus.stdout.trim()}`;
+    // Workspace/git failures — not OpenSpec structural validation. Use needs-human
+    // with no finer path tag so scoreboard offramp_class maps to residual `other`
+    // (#683 review 1: dirty/status must not inflate openspec-invalid).
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Cannot verify a clean worktree before the OpenSpec archive, so a failed archive commit's destructive rollback could discard pre-existing work — ${detail}. Commit/stash changes (or fix the git error) and re-run.`,
+      "pre-merge",
+      "needs-human",
+    );
+    const blockedReason =
+      preArchiveStatus.code !== 0 ? "pre-archive git status failed" : "worktree dirty before archive";
+    await recordDecision("fail", blockedReason);
+    return preMergeBlocked(blockedReason, "needs-human");
+  }
+
+  // ---- Archive-base sync guard (#579) ----
+  // The archive commit must be built on the reviewed/pushed PR head, never a stale
+  // local worktree base — a fix pushed from a different checkout (#547) can leave
+  // this worktree behind `origin/<branch>`. Fetch + fast-forward to the remote
+  // branch before archiving. A non-fast-forward gap here is a block signal, never
+  // a cue to force-push over the reviewed head (#579). Runs after the cleanliness
+  // guard above so the fast-forward always operates on a known-clean tree.
+  // Final candidate resolution (#714) happens only after this sync so a lagging
+  // worktree cannot omit stacked/foreign active changes present on the reviewed head.
+  const branch = branchName(issueNumber, wt.slug);
+  // Fetch with an explicit refspec so `refs/remotes/origin/<branch>` itself is updated —
+  // `git fetch origin <branch>` with no destination only populates FETCH_HEAD, leaving the
+  // tracking ref (and the `rev-parse origin/<branch>` read below) stale (#579 review 1).
+  const fetch = await gitFn(wt.path, ["fetch", "origin", `${branch}:refs/remotes/origin/${branch}`], {
+    ignoreFailure: true,
+  });
+  if (fetch.code !== 0) {
+    // Git/network infrastructure failure — not OpenSpec structural validation.
+    // Residual `other` via needs-human so scoreboard does not mis-bucket as
+    // openspec-invalid (#683 review 2).
+    const detail = (fetch.stderr || fetch.stdout || "(no output)").trim();
+    const reason =
+      `Cannot sync worktree for #${issueNumber} to origin/${branch} before archiving — ` +
+      `\`git fetch origin ${branch}:refs/remotes/origin/${branch}\` failed (exit ${fetch.code}): ${detail}`;
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
+    await recordDecision("fail", "fetch failed before archive");
+    return preMergeBlocked("fetch failed before archive", "needs-human");
+  }
+  const localHeadBefore = await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
+  const reviewedHeadRes = await gitFn(wt.path, ["rev-parse", `origin/${branch}`], { ignoreFailure: true });
+  if (localHeadBefore.code !== 0 || reviewedHeadRes.code !== 0) {
+    // Rev resolution failure is git tooling — residual other, not openspec-invalid.
+    const detail = (reviewedHeadRes.stderr || localHeadBefore.stderr || "(no output)").trim();
+    const reason =
+      `Cannot resolve worktree HEAD or origin/${branch} before archiving OpenSpec change(s) ` +
+      `for #${issueNumber}: ${detail}`;
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
+    await recordDecision("fail", "rev-parse failed before archive");
+    return preMergeBlocked("rev-parse failed before archive", "needs-human");
+  }
+  const reviewedHead = reviewedHeadRes.stdout.trim();
+  let archiveBase = localHeadBefore.stdout.trim();
+  if (archiveBase !== reviewedHead) {
+    // Fast-forward only — never a merge/rebase that could rewrite history. If the
+    // fast-forward is impossible (true divergence), archiveBase stays stale and the
+    // equality check below blocks; the archive step never force-pushes to reconcile it.
+    await gitFn(wt.path, ["merge", "--ff-only", `origin/${branch}`], { ignoreFailure: true });
+    const afterFf = await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
+    archiveBase = afterFf.code === 0 ? afterFf.stdout.trim() : archiveBase;
+  }
+  if (archiveBase !== reviewedHead) {
+    const reason = `archive base \`${archiveBase}\` != reviewed head \`${reviewedHead}\``;
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
+    await recordDecision("fail", reason);
+    return preMergeBlocked(reason, "needs-human");
+  }
+
+  // ---- Final candidates after sync (#714) ----
+  // Shared active-change set = active change dirs on the synchronized reviewed
+  // head tree. Never subtract archive-folder ids from a cumulative PR changed-file
+  // list: a branch that archived `foo` then reintroduced `openspec/changes/foo/`
+  // still has both path families in the PR diff, which would mask the reintroduced
+  // id (#714 review 1 / cb86b57e).
+  let sharedActive = [...listChangeDirsFn(wt.path)].sort();
+
+  // Injectable-test / empty-listing fallback: when the tip-tree listing is empty,
+  // allow path hints ∩ changeDirExists so unit tests that only stub path probes
+  // and changeDirExists still exercise the archive path. Path hints use
+  // changeIdsFromPaths (active paths only — no archive-folder subtraction).
+  if (sharedActive.length === 0) {
+    let pathHints: string[] = [];
+    if (prNumber !== undefined) {
+      try {
+        pathHints = openspec.changeIdsFromPaths(diffFilePaths(await getPrDiffFn(cfg, prNumber)));
+      } catch (err) {
+        const reason =
+          `Cannot determine active OpenSpec change candidates — fetching the PR diff failed ` +
+          `(${(err as Error).message}). Check gh auth/network and re-run.`;
+        await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
+        await recordDecision("fail", reason);
+        return preMergeBlocked(reason, "needs-human");
+      }
+    } else {
+      const diff = await gitFn(
+        wt.path,
+        ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
+        { ignoreFailure: true },
+      );
+      if (diff.code !== 0) {
+        // Fail closed (#467): a failed probe must never be read as "no candidates".
+        const detail = (diff.stderr || diff.stdout || "(no output)").trim();
+        const reason =
+          `Cannot determine active OpenSpec change candidates — ` +
+          `\`git diff --name-only origin/${cfg.base_branch}...HEAD\` failed (exit ${diff.code}): ${detail}`;
+        await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+        await recordDecision("fail", reason);
+        return preMergeBlocked(reason, "openspec-invalid");
+      }
+      pathHints = openspec.changeIdsFromPaths(
+        diff.stdout.split("\n").map((s) => s.trim()).filter(Boolean),
+      );
+    }
+    sharedActive = pathHints.filter((id) => changeDirExistsFn(wt.path, id)).sort();
+  }
+
+  if (sharedActive.length === 0) {
     await recordDecision("skipped", "no-candidates");
     return null;
+  }
+
+  // Tip-tree membership already implies dirs exist; keep the filter for the
+  // path-hint fallback and any concurrent dir removal.
+  const candidates = sharedActive.filter((id) => changeDirExistsFn(wt.path, id));
+  if (candidates.length === 0) {
+    return blockResidualActive(sharedActive);
   }
 
   // ---- Consistency guard (#106): never archive a delta the code outgrew ----
   // OpenSpec deltas are frozen at planning; fix rounds only edit code. If a
   // material fix moved the implementation but left the change's specs/** untouched
   // AND a review finding is tagged `category: spec-divergence`, archiving would
-  // fold a stale delta into the living specs (silent corruption) and re-review
-  // would keep re-anchoring on the wrong delta. Block and surface it instead.
-  //
-  // Wire the bounded repair dep (#356): when direction is `spec-behind-code` the
-  // guard calls this once before blocking. Only created when the harness is
-  // configured; tests inject deps.attemptBoundedRepair directly.
+  // fold a stale delta into the living specs (silent corruption). Runs only once
+  // we have post-sync candidates so empty shared-set skips stay free of gh actor I/O.
   let repairAttempted = false;
   const attemptRepairFn: SpecConsistencyDeps["attemptBoundedRepair"] =
     deps.attemptBoundedRepair ??
@@ -3485,95 +3654,6 @@ export async function maybeArchiveOpenspec(
     return guard;
   }
 
-  // Pre-archive cleanliness guard: the commit-failure rollback below is destructive
-  // (`git restore .` + `git clean -fd openspec/`), so it is provably lossless ONLY when
-  // the worktree is fully clean before archive. Block on ANY pre-existing dirty state —
-  // a path-prefix filter is unsafe two ways: a dirty tracked openspec/ file (e.g.
-  // `M  openspec/specs/x.md`) would be silently discarded by the rollback, and a porcelain
-  // rename/copy record (`R  openspec/a -> core/a`) has a destination outside openspec/ that
-  // matching only the first path misses. All planning/fix work is committed before pre-merge,
-  // so any non-empty status here is anomalous — fail safe rather than risk data loss.
-  // Fail CLOSED: only proceed when `git status` SUCCEEDS and reports a clean tree. If the
-  // status check itself errors (non-zero exit, often with empty stdout), we cannot prove the
-  // tree is clean — treating that as clean would let the destructive rollback run over
-  // unproven state, the very data-loss class this guard exists to close.
-  const preArchiveStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
-  if (preArchiveStatus.code !== 0 || preArchiveStatus.stdout.trim() !== "") {
-    const detail =
-      preArchiveStatus.code !== 0
-        ? `git status --porcelain failed (exit ${preArchiveStatus.code}): ${(preArchiveStatus.stderr || preArchiveStatus.stdout || "(no output)").trim()}`
-        : `pre-existing dirty paths:\n${preArchiveStatus.stdout.trim()}`;
-    // Workspace/git failures — not OpenSpec structural validation. Use needs-human
-    // with no finer path tag so scoreboard offramp_class maps to residual `other`
-    // (#683 review 1: dirty/status must not inflate openspec-invalid).
-    await setBlockedFn(
-      cfg,
-      issueNumber,
-      `Cannot verify a clean worktree before the OpenSpec archive, so a failed archive commit's destructive rollback could discard pre-existing work — ${detail}. Commit/stash changes (or fix the git error) and re-run.`,
-      "pre-merge",
-      "needs-human",
-    );
-    const blockedReason =
-      preArchiveStatus.code !== 0 ? "pre-archive git status failed" : "worktree dirty before archive";
-    await recordDecision("fail", blockedReason);
-    return preMergeBlocked(blockedReason, "needs-human");
-  }
-
-  // ---- Archive-base sync guard (#579) ----
-  // The archive commit must be built on the reviewed/pushed PR head, never a stale
-  // local worktree base — a fix pushed from a different checkout (#547) can leave
-  // this worktree behind `origin/<branch>`. Fetch + fast-forward to the remote
-  // branch before archiving. A non-fast-forward gap here is a block signal, never
-  // a cue to force-push over the reviewed head (#579). Runs after the cleanliness
-  // guard above so the fast-forward always operates on a known-clean tree.
-  const branch = branchName(issueNumber, wt.slug);
-  // Fetch with an explicit refspec so `refs/remotes/origin/<branch>` itself is updated —
-  // `git fetch origin <branch>` with no destination only populates FETCH_HEAD, leaving the
-  // tracking ref (and the `rev-parse origin/<branch>` read below) stale (#579 review 1).
-  const fetch = await gitFn(wt.path, ["fetch", "origin", `${branch}:refs/remotes/origin/${branch}`], {
-    ignoreFailure: true,
-  });
-  if (fetch.code !== 0) {
-    // Git/network infrastructure failure — not OpenSpec structural validation.
-    // Residual `other` via needs-human so scoreboard does not mis-bucket as
-    // openspec-invalid (#683 review 2).
-    const detail = (fetch.stderr || fetch.stdout || "(no output)").trim();
-    const reason =
-      `Cannot sync worktree for #${issueNumber} to origin/${branch} before archiving — ` +
-      `\`git fetch origin ${branch}:refs/remotes/origin/${branch}\` failed (exit ${fetch.code}): ${detail}`;
-    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
-    await recordDecision("fail", "fetch failed before archive");
-    return preMergeBlocked("fetch failed before archive", "needs-human");
-  }
-  const localHeadBefore = await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
-  const reviewedHeadRes = await gitFn(wt.path, ["rev-parse", `origin/${branch}`], { ignoreFailure: true });
-  if (localHeadBefore.code !== 0 || reviewedHeadRes.code !== 0) {
-    // Rev resolution failure is git tooling — residual other, not openspec-invalid.
-    const detail = (reviewedHeadRes.stderr || localHeadBefore.stderr || "(no output)").trim();
-    const reason =
-      `Cannot resolve worktree HEAD or origin/${branch} before archiving OpenSpec change(s) ` +
-      `for #${issueNumber}: ${detail}`;
-    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
-    await recordDecision("fail", "rev-parse failed before archive");
-    return preMergeBlocked("rev-parse failed before archive", "needs-human");
-  }
-  const reviewedHead = reviewedHeadRes.stdout.trim();
-  let archiveBase = localHeadBefore.stdout.trim();
-  if (archiveBase !== reviewedHead) {
-    // Fast-forward only — never a merge/rebase that could rewrite history. If the
-    // fast-forward is impossible (true divergence), archiveBase stays stale and the
-    // equality check below blocks; the archive step never force-pushes to reconcile it.
-    await gitFn(wt.path, ["merge", "--ff-only", `origin/${branch}`], { ignoreFailure: true });
-    const afterFf = await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
-    archiveBase = afterFf.code === 0 ? afterFf.stdout.trim() : archiveBase;
-  }
-  if (archiveBase !== reviewedHead) {
-    const reason = `archive base \`${archiveBase}\` != reviewed head \`${reviewedHead}\``;
-    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
-    await recordDecision("fail", reason);
-    return preMergeBlocked(reason, "needs-human");
-  }
-
   console.log(`[pipeline] #${issueNumber}: archiving OpenSpec change(s): ${candidates.join(", ")}`);
   for (const id of candidates) {
     const res = await archiveFn(wt.path, id);
@@ -3595,13 +3675,33 @@ export async function maybeArchiveOpenspec(
     }
   }
 
+  // Verify each shared-set id left the active tree before claiming success (#714 / #675).
+  // Pass reason lists only verified archived ids — never the full pre-archive list when
+  // residuals remain. Ids still on disk after CLI success, and PR-active ids that never
+  // had a dir (so they were not archive candidates), both fail closed here.
+  const residualActive = sharedActive.filter((id) => changeDirExistsFn(wt.path, id));
+  const archivedIds = candidates.filter((id) => !changeDirExistsFn(wt.path, id));
+  if (residualActive.length > 0) {
+    return blockResidualActive(residualActive);
+  }
+  const unclearedShared = sharedActive.filter((id) => !archivedIds.includes(id));
+  if (unclearedShared.length > 0) {
+    return blockResidualActive(unclearedShared);
+  }
+
   // Commit + push the archived specs so CI validates the finalized state.
   await gitFn(wt.path, ["add", "-A"], { ignoreFailure: true });
   const status = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
   if (!status.stdout.trim()) {
-    // archive produced no diff (unexpected) → continue
-    await recordDecision("skipped", "no-candidates");
-    return null;
+    // Archive claimed success and dirs are gone, but nothing to commit — fail closed
+    // rather than skipped/no-candidates when the pre-archive shared set was non-empty (#714).
+    const reason =
+      `Pre-merge cannot advance: OpenSpec archive produced no worktree changes for ` +
+      `change(s): ${archivedIds.join(", ")}. Run \`openspec archive <id>\` for each and push ` +
+      `before pre-merge can continue.`;
+    await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
+    await recordDecision("fail", reason);
+    return preMergeBlocked(reason, "openspec-invalid");
   }
   const commit = await gitFn(
     wt.path,
@@ -3661,7 +3761,8 @@ export async function maybeArchiveOpenspec(
     return preMergeBlocked("push failed after archive", "push-failed");
   }
   console.log(`[pipeline] #${issueNumber}: OpenSpec change(s) archived; CI will re-run`);
-  await recordDecision("pass", candidates.join(", "));
+  // Pass reason = verified archived ids only (#714 / #675).
+  await recordDecision("pass", archivedIds.join(", "));
   return { advanced: false, status: "waiting", reason: "openspec change archived; CI re-running" };
 }
 

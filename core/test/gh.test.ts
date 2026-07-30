@@ -3,7 +3,121 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isTransientGhError } from "../scripts/gh.ts";
+import {
+  activeChangeIdsFromContentsEntries,
+  isGithubAuthOrPermissionError,
+  isHttp404Signal,
+  isTransientGhError,
+  shouldTreatContents404AsEmpty,
+} from "../scripts/gh.ts";
+
+// ---------------------------------------------------------------------------
+// activeChangeIdsFromContentsEntries — pure tip-tree listing parser (#714)
+// ---------------------------------------------------------------------------
+
+test("activeChangeIdsFromContentsEntries: dirs only, excludes archive", () => {
+  assert.deepEqual(
+    activeChangeIdsFromContentsEntries([
+      { name: ".gitkeep", type: "file" },
+      { name: "archive", type: "dir" },
+      { name: "foo", type: "dir" },
+      { name: "bar", type: "dir" },
+    ]),
+    ["bar", "foo"],
+  );
+});
+
+test("activeChangeIdsFromContentsEntries: empty / non-array → []", () => {
+  assert.deepEqual(activeChangeIdsFromContentsEntries([]), []);
+  assert.deepEqual(activeChangeIdsFromContentsEntries({ type: "file" }), []);
+  assert.deepEqual(activeChangeIdsFromContentsEntries(null), []);
+});
+
+// ---------------------------------------------------------------------------
+// listPrHeadChangeDirs 404 fail-open guard (#714 delta 4706fcc2)
+// ---------------------------------------------------------------------------
+
+test("isHttp404Signal: only explicit HTTP/status 404 syntax", () => {
+  assert.equal(isHttp404Signal("HTTP 404: Not Found"), true);
+  assert.equal(isHttp404Signal("non-200 OK status code: 404"), true);
+  assert.equal(isHttp404Signal("gh api failed: {\"message\":\"Not Found\"}"), false); // no status
+  // SHA / command fragment containing "404" must NOT classify as HTTP 404 (#714 aaa27d9c)
+  assert.equal(
+    isHttp404Signal("gh api failed: HTTP 500 Internal Server Error ref=a404bcafe"),
+    false,
+  );
+  assert.equal(isHttp404Signal("timeout listing contents a404b"), false);
+});
+
+test("shouldTreatContents404AsEmpty: HTTP 500 with SHA fragment 404 fails closed", () => {
+  assert.equal(
+    shouldTreatContents404AsEmpty(
+      "gh api repos/x/y/contents/openspec/changes?ref=a404bcafe failed: HTTP 500",
+      true,
+    ),
+    false,
+  );
+});
+
+test("isHttp404Signal: bare 404 token / SHA fragment is not a status signal (#714 aaa27d9c)", () => {
+  // Standalone numeric token without HTTP/status-code wording
+  assert.equal(isHttp404Signal("404"), false);
+  assert.equal(isHttp404Signal("error: 404 Not Found"), false);
+  // HTTP 500 whose message embeds a SHA (or command/ref) containing "404"
+  assert.equal(
+    isHttp404Signal(
+      "HTTP 500: Internal Server Error for repos/acme/r/contents/openspec/changes?ref=a404b1c2d3e4f5",
+    ),
+    false,
+  );
+  assert.equal(
+    isHttp404Signal("gh api repos/acme/r/git/trees/a404beef -- failed: connection reset"),
+    false,
+  );
+  // Fail-closed path: tip root ok + non-404 that happens to contain "404" must not invent empty set
+  assert.equal(
+    shouldTreatContents404AsEmpty(
+      "HTTP 500: Internal Server Error (ref a404b1c2d3e4f5)",
+      true,
+    ),
+    false,
+  );
+});
+
+test("isGithubAuthOrPermissionError: 401/403/auth wording", () => {
+  assert.equal(isGithubAuthOrPermissionError("HTTP 401: Bad credentials"), true);
+  assert.equal(isGithubAuthOrPermissionError("HTTP 403: Resource not accessible by integration"), true);
+  assert.equal(isGithubAuthOrPermissionError("authentication required"), true);
+  assert.equal(isGithubAuthOrPermissionError("HTTP 404: Not Found"), false);
+});
+
+test("shouldTreatContents404AsEmpty: only when tip root ok and 404 not auth-shaped", () => {
+  // True path missing on readable tip
+  assert.equal(
+    shouldTreatContents404AsEmpty("gh api failed: HTTP 404: Not Found", true),
+    true,
+  );
+  // Tip root not listable → never invent empty set
+  assert.equal(
+    shouldTreatContents404AsEmpty("gh api failed: HTTP 404: Not Found", false),
+    false,
+  );
+  // Auth-shaped must not map to empty even if tipRootListSucceeded (belt + suspenders)
+  assert.equal(
+    shouldTreatContents404AsEmpty("HTTP 403: Resource not accessible by integration", true),
+    false,
+  );
+  // Non-404 must not map to empty
+  assert.equal(
+    shouldTreatContents404AsEmpty("HTTP 500: Internal Server Error", true),
+    false,
+  );
+  // Bare "not found" without 404 status must not map to empty (too broad / auth-obscured)
+  assert.equal(
+    shouldTreatContents404AsEmpty("gh: Not Found", true),
+    false,
+  );
+});
 
 // ---------------------------------------------------------------------------
 // isTransientGhError — pure classification

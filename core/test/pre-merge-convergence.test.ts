@@ -96,6 +96,8 @@ test("maybeArchiveOpenspec: returns null without calling archive when diff is em
     openspecIsActive: () => true,
     gitInWorktree: (async (_p: string, args: string[]) => {
       gitCalls.push(args);
+      // Clean + synced base so the empty shared-set probe can run after sync (#714).
+      if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
       return { stdout: "", stderr: "", code: 0 };
     }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => false,
@@ -112,9 +114,9 @@ test("maybeArchiveOpenspec: returns null without calling archive when diff is em
 
   assert.equal(out, null, "must return null (continue) when no active candidates");
   assert.deepEqual(archiveCalls, [], "openspecArchive must NOT be called");
-  // git add/commit/push must not be called (only diff is called, not write ops)
-  const nonDiffCalls = gitCalls.filter((a) => a[0] !== "diff");
-  assert.deepEqual(nonDiffCalls, [], "git add/commit/push must NOT be called");
+  // Archive write ops must not run; cleanliness/sync probes are allowed before the empty skip.
+  const writeOps = gitCalls.filter((a) => a[0] === "add" || a[0] === "commit" || a[0] === "push");
+  assert.deepEqual(writeOps, [], "git add/commit/push must NOT be called");
 });
 
 test("maybeArchiveOpenspec: proceeds to archive when prior archive commit exists but active candidates remain (#181 fix 2)", async (t) => {
@@ -125,6 +127,7 @@ test("maybeArchiveOpenspec: proceeds to archive when prior archive commit exists
   let archived = false;
   const CHANGE_ID = "pre-merge-gate-convergence";
   const CHANGE_PATH = `openspec/changes/${CHANGE_ID}/proposal.md`;
+  const activeDirs = new Set([CHANGE_ID]);
 
   const deps: AdvancePreMergeDeps = {
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
@@ -133,12 +136,14 @@ test("maybeArchiveOpenspec: proceeds to archive when prior archive commit exists
       if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
       // Clean before archive (passes the pre-archive cleanliness guard), dirty after.
       if (args[0] === "status") return { stdout: archived ? " M openspec/specs/x/spec.md" : "", stderr: "", code: 0 };
+      if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
       return { stdout: "", stderr: "", code: 0 };
     }) as AdvancePreMergeDeps["gitInWorktree"],
-    changeDirExists: () => true,
+    changeDirExists: (_d, id) => activeDirs.has(id),
     openspecArchive: (async (_w: string, id: string) => {
       archiveCalls.push(id);
       archived = true;
+      activeDirs.delete(id);
       return { success: true, unavailable: false, output: "" };
     }) as AdvancePreMergeDeps["openspecArchive"],
     setBlocked: async () => {},
@@ -295,6 +300,8 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
   // dirRestored tracks whether the fix performed the restoration that would let
   // changeDirExists return true on the retry run.
   let dirRestored = false;
+  // On-disk active dir: archive removes it; commit-failure restore brings it back (#714).
+  let dirExists = true;
   // archived models worktree state: clean before `openspec archive` runs (passes the
   // pre-archive cleanliness guard), dirty after (the archive's openspec/ changes to commit).
   let archived = false;
@@ -306,9 +313,11 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
       if (args[0] === "status") return { stdout: archived ? "M  openspec/specs/x.md" : "", stderr: "", code: 0 };
       if (args[0] === "commit") return { stdout: "", stderr: "pre-commit hook rejected", code: commitCode };
       if (args[0] === "push") return { stdout: "", stderr: "", code: 0 };
+      if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
       if (args[0] === "restore" || args[0] === "clean") {
         restorationCalls.push([...args]);
         dirRestored = true;
+        dirExists = true;
         return { stdout: "", stderr: "", code: 0 };
       }
       return { stdout: "", stderr: "", code: 0 };
@@ -322,8 +331,12 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
       getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
       openspecIsActive: () => true,
       gitInWorktree: makeGitFn(1),
-      changeDirExists: () => true,
-      openspecArchive: (async () => { archived = true; return { success: true, unavailable: false, output: "" }; }) as AdvancePreMergeDeps["openspecArchive"],
+      changeDirExists: () => dirExists,
+      openspecArchive: (async () => {
+        archived = true;
+        dirExists = false;
+        return { success: true, unavailable: false, output: "" };
+      }) as AdvancePreMergeDeps["openspecArchive"],
       setBlocked: async () => {},
       getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
       branchDeveloperCommits: async () => [],
@@ -349,10 +362,11 @@ test("maybeArchiveOpenspec: restores worktree after commit failure so a rerun ca
       getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
       openspecIsActive: () => true,
       gitInWorktree: makeGitFn(0),
-      changeDirExists: () => dirRestored, // true because run 1 restored the dir
+      changeDirExists: () => dirExists, // true because run 1 restored the dir
       openspecArchive: (async (_w: string, id: string) => {
         archiveCallsRun2.push(id);
         archived = true;
+        dirExists = false;
         return { success: true, unavailable: false, output: "" };
       }) as AdvancePreMergeDeps["openspecArchive"],
       setBlocked: async () => {},
@@ -389,6 +403,7 @@ test("maybeArchiveOpenspec: CLI unavailable with active candidate → blocks res
     gitInWorktree: (async (_p: string, args: string[]) => {
       if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
       if (args[0] === "status") return { stdout: "", stderr: "", code: 0 }; // clean
+      if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
       return { stdout: "", stderr: "", code: 0 };
     }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => true,
@@ -431,6 +446,7 @@ test("maybeArchiveOpenspec: CLI unavailable with no active candidates → return
     openspecIsActive: () => true,
     gitInWorktree: (async (_p: string, args: string[]) => {
       if (args[0] === "diff") return { stdout: "", stderr: "", code: 0 }; // no paths in diff
+      if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
       return { stdout: "", stderr: "", code: 0 };
     }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => false,

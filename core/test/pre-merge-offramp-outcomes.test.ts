@@ -40,6 +40,7 @@ function makeBaseDeps(overrides: Partial<AdvancePreMergeDeps> = {}): AdvancePreM
       >,
     getPrCommits: async () => [],
     getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
     postComment: async () => {},
     transition: async () => {},
     setBlocked: async () => {},
@@ -149,16 +150,10 @@ test("pre-merge merge-conflict blocks with merge-conflict class (#683)", async (
 
 test("pre-merge active OpenSpec change guard maps to openspec-invalid (#683)", async (t) => {
   t.mock.method(console, "log", () => {});
-  // Direct guard unit: PR still carries unarchived openspec/changes/<id>/ paths.
+  // Direct guard unit: PR-head tip tree still has unarchived openspec/changes/<id>/.
   const out = await enforceOpenspecActiveChangeGuard(makeCfg("github"), 683, PR_NUMBER, {
-    getPrDiff: async () =>
-      [
-        "diff --git a/openspec/changes/foo/proposal.md b/openspec/changes/foo/proposal.md",
-        "--- a/openspec/changes/foo/proposal.md",
-        "+++ b/openspec/changes/foo/proposal.md",
-        "@@ -0,0 +1 @@",
-        "+x",
-      ].join("\n"),
+    getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => ["foo"],
     setBlocked: async () => {},
   });
   assert.ok(out);
@@ -187,6 +182,7 @@ test("pre-merge local no-worktree precondition maps to residual other, not ci-fa
   const deps = makeBaseDeps({
     readRunEvents: async () => [] as never,
     getForIssue: async () => null,
+  listPrHeadChangeDirs: async () => [],
   });
   const out = await advance(makeCfg("local"), 683, { runDir: "/fake/run/dir" }, deps);
   assert.equal(out.advanced, false);

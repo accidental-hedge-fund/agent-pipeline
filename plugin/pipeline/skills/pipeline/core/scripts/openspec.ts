@@ -267,13 +267,31 @@ export function changeIdsFromPaths(paths: string[]): string[] {
 }
 
 /**
- * Change ids the PR still carries active (unarchived) at HEAD, computed purely
- * from the PR's changed-file list — never the local worktree filesystem (#467).
- * `activeIds` = ids appearing as `openspec/changes/<id>/…` (id ≠ `archive`);
- * `archivedIds` = ids appearing as `openspec/changes/archive/<id>/…`. Returns
- * `activeIds \ archivedIds`. Worktree-independent by construction: it holds
- * identically on a first run, an override-resumed run, a fresh process, or
- * after the worktree has been removed.
+ * Map an OpenSpec archive folder name to the change id it corresponds to.
+ * Real archives use date-prefixed dirs (`YYYY-MM-DD-<id>`); bare ids are kept.
+ * Pure; exported for tests.
+ */
+export function changeIdFromArchiveFolderName(folder: string): string {
+  const m = folder.match(/^\d{4}-\d{2}-\d{2}-(.+)$/);
+  return m ? m[1] : folder;
+}
+
+/**
+ * Residual probe from a cumulative PR changed-file list (#467 / #714). Pure
+ * over path strings.
+ *
+ * - `activeIds` = ids appearing as `openspec/changes/<id>/…` (id ≠ `archive`)
+ * - `archivedIds` = ids from `openspec/changes/archive/<folder>/…`, with
+ *   date-prefixed folders (`YYYY-MM-DD-<id>`) normalized to bare `<id>`
+ * - returns `activeIds \ archivedIds` (stable sort for deterministic reasons)
+ *
+ * **Limitation:** a cumulative PR file list can list both an archive path and a
+ * later-reintroduced `openspec/changes/<id>/` for the same id; subtraction then
+ * wrongly yields empty. Pre-merge MUST NOT use this helper as proof that no
+ * active change remains on the reviewed tip — membership comes from tip-tree
+ * views only: on-disk `listChangeDirs` when a worktree exists, or
+ * `listPrHeadChangeDirs` (PR-head Contents API) when it does not (#714 review 2).
+ * Kept for pure unit tests and any diagnostic path that accepts the limitation.
  */
 export function unarchivedChangeIdsFromPrFiles(paths: string[]): string[] {
   const active = new Set<string>();
@@ -282,14 +300,23 @@ export function unarchivedChangeIdsFromPrFiles(paths: string[]): string[] {
     const p = raw.replace(/\\/g, "/");
     const archivedMatch = p.match(/(?:^|\/)openspec\/changes\/archive\/([^/]+)\//);
     if (archivedMatch) {
+      // Record both the raw folder name and the date-stripped change id so
+      // `archive/foo/` and `archive/2026-07-30-foo/` both clear active `foo`.
       archived.add(archivedMatch[1]);
+      archived.add(changeIdFromArchiveFolderName(archivedMatch[1]));
       continue;
     }
     const activeMatch = p.match(/(?:^|\/)openspec\/changes\/([^/]+)\//);
     if (activeMatch && activeMatch[1] !== "archive") active.add(activeMatch[1]);
   }
-  return [...active].filter((id) => !archived.has(id));
+  return [...active].filter((id) => !archived.has(id)).sort();
 }
+
+/**
+ * Alias for the path-list residual helper. Prefer tip-tree membership
+ * (`listChangeDirs` on the reviewed head) when a synchronized worktree exists.
+ */
+export const sharedActiveChangeIdsFromPaths = unarchivedChangeIdsFromPrFiles;
 
 /**
  * Pure parser. Exit code is the source of truth for pass/fail (0 = valid). The

@@ -160,9 +160,9 @@ test("computeBranchDeveloperCommits (via guard): auto-format commit changing imp
   // gitInWorktree is called for: "diff --name-only" (candidates), "log" (commits), and
   // "diff --name-only sha^..sha" (per-commit paths). We discriminate by the args.
   const fakeGit = (async (_wt: string, args: string[]) => {
-    // 0. rev-parse HEAD for the SHA correlation check (#356 finding 2)
+    // 0. rev-parse HEAD for the SHA correlation check (#356 finding 2) and archive-base sync
     if (args[0] === "rev-parse") return { stdout: HEAD_SHA + "\n", stderr: "", code: 0 };
-    // 1. diff for candidates (three-dot form: origin/main...HEAD)
+    // 1. diff for candidates (three-dot form: origin/main...HEAD) — after sync (#714)
     if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
       return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
     }
@@ -176,6 +176,8 @@ test("computeBranchDeveloperCommits (via guard): auto-format commit changing imp
     if (args[0] === "diff" && args.some((a) => a.includes("^"))) {
       return { stdout: "core/scripts/foo.ts", stderr: "", code: 0 };
     }
+    // Clean worktree so we reach the consistency guard after base sync.
+    if (args[0] === "status") return { stdout: "", stderr: "", code: 0 };
     return { stdout: "", stderr: "", code: 0 };
   }) as typeof import("../scripts/worktree.ts").gitInWorktree;
 
@@ -209,6 +211,7 @@ test("maybeArchiveOpenspec: archive succeeds but git commit fails → blocked pu
   const blocked: Array<{ reason: string; kind: string }> = [];
   let pushCalled = false;
   let archived = false;
+  let dirExists = true;
   const COMMIT_STDERR = "pre-commit hook rejected: lint failed";
 
   const fakeGit = (async (_wt: string, args: string[]) => {
@@ -224,6 +227,9 @@ test("maybeArchiveOpenspec: archive succeeds but git commit fails → blocked pu
     // cleanliness guard), then non-empty AFTER archive so the commit is attempted (XY format).
     if (args[0] === "status") {
       return { stdout: archived ? "M  openspec/specs/openspec-integration/spec.md" : "", stderr: "", code: 0 };
+    }
+    if (args[0] === "rev-parse") {
+      return { stdout: "aaa", stderr: "", code: 0 };
     }
     // git commit: fail with a hook rejection
     if (args[0] === "commit") {
@@ -241,13 +247,17 @@ test("maybeArchiveOpenspec: archive succeeds but git commit fails → blocked pu
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => true,
     gitInWorktree: fakeGit,
-    changeDirExists: () => true,
+    changeDirExists: () => dirExists,
     branchDeveloperCommits: async () => [], // no stale-delta condition
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
     setBlocked: (async (_c, _n, reason: string, _stage: string, kind: string) => {
       blocked.push({ reason, kind });
     }) as AdvancePreMergeDeps["setBlocked"],
-    openspecArchive: (async () => { archived = true; return { success: true, unavailable: false, output: "" }; }) as AdvancePreMergeDeps["openspecArchive"],
+    openspecArchive: (async () => {
+      archived = true;
+      dirExists = false;
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
     trustedReviewAuthor: "test-actor",
   };
 
