@@ -105,6 +105,13 @@ pipeline factory-gate --for 1.29.1 --from-run <loop-run-id> [--json]
 - Exit non-zero when `pass: false` or evidence cannot be produced.
 - Writes evidence under `.agent-pipeline/frg/<version>/…`.
 - `--json` prints the full evidence object on stdout.
+- **Fixed-pack only:** `--from-run` validates the durable loop contract against the versioned
+  pack manifest (`pack_id=factory-gate-v1`: selector must be label `factory-gate` or milestone
+  `factory-gate` / `frg-pack` / `reliability-pack`, and ≥2 items). Unrelated successful loops are
+  refused and do not write release evidence.
+- **Observation required:** overall `pass: true` requires every named pack scenario to be
+  observed (`pass` / `warn` / `skip`); `not_observed` or `fail` fails the gate. Incomplete
+  evidence (empty scenarios, missing thresholds/scoreboard) is rejected by release lookup.
 
 ### Start the pack (operator procedure)
 

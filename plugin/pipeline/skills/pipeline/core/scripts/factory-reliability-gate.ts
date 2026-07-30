@@ -63,6 +63,37 @@ export const DEFAULT_FRG_THRESHOLDS: FrgThresholds = {
   max_engine_class_rate: 0.25,
 };
 
+/**
+ * Versioned fixed-pack manifest for Layer B live FRG runs.
+ * `--from-run` evidence is only accepted when the durable loop contract's
+ * selector matches this pack (label/milestone), so an unrelated successful
+ * loop cannot be recorded as FRG evidence for a release version.
+ */
+export const FRG_PACK_MANIFEST = {
+  pack_id: "factory-gate-v1",
+  pack_schema_version: 1,
+  /** Exact label selector values that identify the fixed FRG work-list. */
+  allowed_label_selectors: ["factory-gate"] as const,
+  /**
+   * Exact milestone selector values for a dedicated reliability pack
+   * (not product milestones — no substring matching).
+   */
+  allowed_milestone_selectors: [
+    "factory-gate",
+    "frg-pack",
+    "reliability-pack",
+  ] as const,
+  required_scenario_ids: FRG_SCENARIO_IDS,
+  /** Multi-item composition: pack must have at least this many items. */
+  min_item_count: 2,
+} as const;
+
+/** Scenarios always derived from ledger scoreboard (no operator override required). */
+export const FRG_AUTO_SCORED_SCENARIO_IDS: readonly FrgScenarioId[] = [
+  "clean-item-throughput",
+  "blocker-taxonomy",
+];
+
 /** Blocker taxonomy buckets for gate honesty. */
 export type FrgBlockerTaxonomy = "engine-class" | "product-class" | "human-authority";
 
@@ -94,6 +125,20 @@ export function classifyFrgBlocker(theme: string | null | undefined): FrgBlocker
 }
 
 export type FrgScenarioStatus = "pass" | "fail" | "warn" | "skip" | "not_observed";
+
+/** Scenario statuses that fail overall FRG pass when present. */
+const FRG_FAILING_SCENARIO_STATUSES: ReadonlySet<FrgScenarioStatus> = new Set([
+  "fail",
+  "not_observed",
+]);
+
+const FRG_VALID_SCENARIO_STATUSES: ReadonlySet<FrgScenarioStatus> = new Set([
+  "pass",
+  "fail",
+  "warn",
+  "skip",
+  "not_observed",
+]);
 
 export interface FrgScenarioOutcome {
   id: FrgScenarioId;
@@ -199,7 +244,172 @@ const defaultFsDeps: FrgFsDeps = {
   rename: (from, to) => fsp.rename(from, to),
 };
 
-/** Parse and validate a machine-readable FRG evidence object. */
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+function parseFrgScenarioOutcome(raw: unknown, index: number): FrgScenarioOutcome {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`FRG evidence.scenarios[${index}] must be an object`);
+  }
+  const s = raw as Record<string, unknown>;
+  if (typeof s.id !== "string" || !(FRG_SCENARIO_IDS as readonly string[]).includes(s.id)) {
+    throw new Error(
+      `FRG evidence.scenarios[${index}].id must be a known scenario id (got ${String(s.id)})`,
+    );
+  }
+  if (typeof s.status !== "string" || !FRG_VALID_SCENARIO_STATUSES.has(s.status as FrgScenarioStatus)) {
+    throw new Error(
+      `FRG evidence.scenarios[${index}].status must be pass|fail|warn|skip|not_observed (got ${String(s.status)})`,
+    );
+  }
+  if (typeof s.detail !== "string") {
+    throw new Error(`FRG evidence.scenarios[${index}].detail must be a string`);
+  }
+  const observed =
+    s.observed === undefined || s.observed === null
+      ? null
+      : isFiniteNumber(s.observed)
+        ? s.observed
+        : (() => {
+            throw new Error(`FRG evidence.scenarios[${index}].observed must be a number or null`);
+          })();
+  const threshold =
+    s.threshold === undefined || s.threshold === null
+      ? null
+      : isFiniteNumber(s.threshold)
+        ? s.threshold
+        : (() => {
+            throw new Error(`FRG evidence.scenarios[${index}].threshold must be a number or null`);
+          })();
+  return {
+    id: s.id as FrgScenarioId,
+    status: s.status as FrgScenarioStatus,
+    detail: s.detail,
+    observed,
+    threshold,
+  };
+}
+
+function parseFrgThresholds(raw: unknown): FrgThresholds {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("FRG evidence.thresholds must be an object");
+  }
+  const t = raw as Record<string, unknown>;
+  if (!isFiniteNumber(t.min_clean_ready_to_deploy) || t.min_clean_ready_to_deploy < 0) {
+    throw new Error("FRG evidence.thresholds.min_clean_ready_to_deploy must be a non-negative number");
+  }
+  if (!isFiniteNumber(t.capacity_stress_n) || t.capacity_stress_n < 0) {
+    throw new Error("FRG evidence.thresholds.capacity_stress_n must be a non-negative number");
+  }
+  if (
+    !isFiniteNumber(t.max_engine_class_rate) ||
+    t.max_engine_class_rate < 0 ||
+    t.max_engine_class_rate > 1
+  ) {
+    throw new Error("FRG evidence.thresholds.max_engine_class_rate must be a number in [0, 1]");
+  }
+  return {
+    min_clean_ready_to_deploy: t.min_clean_ready_to_deploy,
+    capacity_stress_n: t.capacity_stress_n,
+    max_engine_class_rate: t.max_engine_class_rate,
+  };
+}
+
+function parseFrgItemOutcome(raw: unknown, index: number): FrgItemOutcome {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`FRG evidence.scoreboard.per_item[${index}] must be an object`);
+  }
+  const it = raw as Record<string, unknown>;
+  if (typeof it.item_id !== "string" || it.item_id.trim() === "") {
+    throw new Error(`FRG evidence.scoreboard.per_item[${index}].item_id must be a non-empty string`);
+  }
+  if (typeof it.state !== "string") {
+    throw new Error(`FRG evidence.scoreboard.per_item[${index}].state must be a string`);
+  }
+  if (typeof it.ready_clean !== "boolean") {
+    throw new Error(`FRG evidence.scoreboard.per_item[${index}].ready_clean must be a boolean`);
+  }
+  const theme =
+    it.blocker_theme === undefined || it.blocker_theme === null
+      ? null
+      : typeof it.blocker_theme === "string"
+        ? it.blocker_theme
+        : (() => {
+            throw new Error(
+              `FRG evidence.scoreboard.per_item[${index}].blocker_theme must be a string or null`,
+            );
+          })();
+  const blockerClass =
+    it.blocker_class === undefined || it.blocker_class === null
+      ? null
+      : it.blocker_class === "engine-class" ||
+          it.blocker_class === "product-class" ||
+          it.blocker_class === "human-authority"
+        ? it.blocker_class
+        : (() => {
+            throw new Error(
+              `FRG evidence.scoreboard.per_item[${index}].blocker_class must be engine-class|product-class|human-authority|null`,
+            );
+          })();
+  return {
+    item_id: it.item_id,
+    state: it.state,
+    ready_clean: it.ready_clean,
+    blocker_theme: theme,
+    blocker_class: blockerClass,
+  };
+}
+
+function parseFrgScoreboard(raw: unknown): FrgScoreboard {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("FRG evidence.scoreboard must be an object");
+  }
+  const sb = raw as Record<string, unknown>;
+  for (const key of [
+    "item_count",
+    "ready_clean_count",
+    "engine_class_count",
+    "product_class_count",
+    "human_authority_count",
+  ] as const) {
+    if (!isFiniteNumber(sb[key]) || sb[key] < 0) {
+      throw new Error(`FRG evidence.scoreboard.${key} must be a non-negative number`);
+    }
+  }
+  const engineRate =
+    sb.engine_class_rate === null
+      ? null
+      : isFiniteNumber(sb.engine_class_rate) &&
+          sb.engine_class_rate >= 0 &&
+          sb.engine_class_rate <= 1
+        ? sb.engine_class_rate
+        : (() => {
+            throw new Error(
+              "FRG evidence.scoreboard.engine_class_rate must be a number in [0, 1] or null",
+            );
+          })();
+  if (!Array.isArray(sb.per_item)) {
+    throw new Error("FRG evidence.scoreboard.per_item must be an array");
+  }
+  const per_item = sb.per_item.map((it, i) => parseFrgItemOutcome(it, i));
+  return {
+    item_count: sb.item_count as number,
+    ready_clean_count: sb.ready_clean_count as number,
+    engine_class_count: sb.engine_class_count as number,
+    product_class_count: sb.product_class_count as number,
+    human_authority_count: sb.human_authority_count as number,
+    engine_class_rate: engineRate,
+    per_item,
+  };
+}
+
+/** True when scenario statuses alone permit overall pass (no fail / not_observed). */
+export function frgScenariosPermitPass(scenarios: readonly FrgScenarioOutcome[]): boolean {
+  return !scenarios.some((s) => FRG_FAILING_SCENARIO_STATUSES.has(s.status));
+}
+
+/** Parse and validate a machine-readable FRG evidence object (full expected schema). */
 export function parseFrgEvidence(raw: unknown): FrgEvidence {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("FRG evidence must be a JSON object");
@@ -222,13 +432,60 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
   if (!Array.isArray(o.scenarios)) {
     throw new Error("FRG evidence.scenarios must be an array");
   }
-  if (o.scoreboard === null || typeof o.scoreboard !== "object") {
-    throw new Error("FRG evidence.scoreboard must be an object");
+  if (o.scenarios.length !== FRG_SCENARIO_IDS.length) {
+    throw new Error(
+      `FRG evidence.scenarios must include exactly ${FRG_SCENARIO_IDS.length} named outcomes ` +
+        `(got ${o.scenarios.length})`,
+    );
   }
-  if (o.thresholds === null || typeof o.thresholds !== "object") {
-    throw new Error("FRG evidence.thresholds must be an object");
+  const scenarios = o.scenarios.map((s, i) => parseFrgScenarioOutcome(s, i));
+  const seen = new Set(scenarios.map((s) => s.id));
+  if (seen.size !== FRG_SCENARIO_IDS.length) {
+    throw new Error("FRG evidence.scenarios must not duplicate scenario ids");
   }
-  return o as unknown as FrgEvidence;
+  for (const id of FRG_SCENARIO_IDS) {
+    if (!seen.has(id)) {
+      throw new Error(`FRG evidence.scenarios missing required scenario id ${id}`);
+    }
+  }
+  const scoreboard = parseFrgScoreboard(o.scoreboard);
+  const thresholds = parseFrgThresholds(o.thresholds);
+  if (o.loop_run_id !== null && typeof o.loop_run_id !== "string") {
+    throw new Error("FRG evidence.loop_run_id must be a string or null");
+  }
+  if (typeof o.created_at !== "string" || o.created_at.trim() === "") {
+    throw new Error("FRG evidence.created_at must be a non-empty string");
+  }
+  if (!Array.isArray(o.notes) || !o.notes.every((n) => typeof n === "string")) {
+    throw new Error("FRG evidence.notes must be an array of strings");
+  }
+
+  const scenariosOk = frgScenariosPermitPass(scenarios);
+  if (o.pass === true && !scenariosOk) {
+    throw new Error(
+      "FRG evidence.pass is true but scenarios include fail or not_observed " +
+        "(incomplete or inconsistent release evidence)",
+    );
+  }
+  if (o.pass === false && scenariosOk) {
+    throw new Error(
+      "FRG evidence.pass is false but all scenarios are observed non-fail " +
+        "(inconsistent evidence)",
+    );
+  }
+
+  return {
+    schema_version: FRG_SCHEMA_VERSION,
+    version: o.version,
+    run_id: o.run_id.trim(),
+    pass: o.pass,
+    scenarios,
+    scoreboard,
+    thresholds,
+    loop_run_id: o.loop_run_id as string | null,
+    created_at: o.created_at,
+    notes: o.notes as string[],
+  };
 }
 
 /** Synchronous-style parse from a JSON string. */
@@ -397,6 +654,30 @@ export interface FrgScenarioOverride {
   threshold?: number | null;
 }
 
+/**
+ * Fixture helper: mark every non-auto-scored pack scenario as observed.
+ * Use with items that already satisfy K / engine-rate so overall pass can be true.
+ * Live Layer B must still supply real observations (or pack automation); this is for
+ * hermetic scoring tests only.
+ */
+export function frgRequiredObservationOverrides(
+  status: Exclude<FrgScenarioStatus, "not_observed"> = "pass",
+): FrgScenarioOverride[] {
+  const auto = new Set<string>(FRG_AUTO_SCORED_SCENARIO_IDS);
+  return FRG_SCENARIO_IDS.filter((id) => !auto.has(id)).map((id) => ({
+    id,
+    status,
+    detail:
+      status === "pass"
+        ? `observed pass: ${id}`
+        : status === "warn"
+          ? `observed warn: ${id}`
+          : `observed ${status}: ${id}`,
+    observed: null,
+    threshold: null,
+  }));
+}
+
 export interface ComputeFrgInput {
   version: string;
   run_id?: string;
@@ -499,10 +780,11 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
     };
   });
 
-  // Fail closed: any explicit fail scenario fails the gate; required core
-  // scenarios (throughput + taxonomy) always computed above.
-  const hardFail = scenarios.some((s) => s.status === "fail");
-  const pass = !hardFail;
+  // Fail closed: explicit fail OR required scenario not_observed fails the gate.
+  // Reserve not_observed for non-release reports — it must never produce pass:true
+  // usable as release evidence. Throughput + taxonomy are always computed above;
+  // all other pack scenarios need verifiable observation (override or pack automation).
+  const pass = frgScenariosPermitPass(scenarios);
 
   return {
     schema_version: FRG_SCHEMA_VERSION,
@@ -543,6 +825,62 @@ export function itemsFromLoopLedger(ledger: LoopLedger): FrgItemInput[] {
     });
   }
   return out;
+}
+
+/**
+ * Whether a durable-loop contract selector matches the versioned FRG fixed pack.
+ * Rejects product milestones and ad-hoc work-lists so arbitrary successful loops
+ * cannot be scored as FRG release evidence.
+ */
+export function isAllowedFrgPackSelector(selector: unknown): boolean {
+  if (selector === null || typeof selector !== "object" || Array.isArray(selector)) {
+    return false;
+  }
+  const s = selector as { type?: unknown; value?: unknown };
+  if (s.type === "label" && typeof s.value === "string") {
+    return (FRG_PACK_MANIFEST.allowed_label_selectors as readonly string[]).includes(s.value);
+  }
+  if (s.type === "milestone" && typeof s.value === "string") {
+    return (FRG_PACK_MANIFEST.allowed_milestone_selectors as readonly string[]).includes(
+      s.value,
+    );
+  }
+  return false;
+}
+
+export type FrgPackValidation =
+  | { ok: true }
+  | { ok: false; detail: string };
+
+/**
+ * Validate that a durable loop contract is the FRG fixed scenario pack
+ * (selector + multi-item inventory). Call before writing release evidence
+ * from `--from-run`.
+ */
+export function validateFrgPackContract(contract: LoopContract): FrgPackValidation {
+  if (!isAllowedFrgPackSelector(contract.selector)) {
+    return {
+      ok: false,
+      detail:
+        `contract.selector is not an FRG fixed-pack selector ` +
+        `(got ${JSON.stringify(contract.selector)}). ` +
+        `Expected label "${FRG_PACK_MANIFEST.allowed_label_selectors.join('"|"')}" ` +
+        `or milestone "${FRG_PACK_MANIFEST.allowed_milestone_selectors.join('"|"')}" ` +
+        `(pack_id=${FRG_PACK_MANIFEST.pack_id}). ` +
+        `Start the pack with: pipeline loop --label factory-gate`,
+    };
+  }
+  const items = contract.items ?? [];
+  if (items.length < FRG_PACK_MANIFEST.min_item_count) {
+    return {
+      ok: false,
+      detail:
+        `FRG fixed pack requires ≥${FRG_PACK_MANIFEST.min_item_count} items ` +
+        `(got ${items.length}); multi-item composition is mandatory ` +
+        `(pack_id=${FRG_PACK_MANIFEST.pack_id})`,
+    };
+  }
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -626,22 +964,38 @@ export async function runFactoryGate(
         "pipeline factory-gate: --from-run requires a ledger loader (internal: loadLedger dep)",
       );
     }
+    if (!opts.loadContract) {
+      throw new Error(
+        "pipeline factory-gate: --from-run requires a contract loader for fixed-pack validation " +
+          "(internal: loadContract dep)",
+      );
+    }
+    const contract = await opts.loadContract(opts.fromRun);
+    if (!contract) {
+      throw new Error(
+        `pipeline factory-gate: --from-run ${opts.fromRun} has no loadable loop contract; ` +
+          `cannot validate FRG fixed-pack membership (pack_id=${FRG_PACK_MANIFEST.pack_id})`,
+      );
+    }
+    const packCheck = validateFrgPackContract(contract);
+    if (!packCheck.ok) {
+      throw new Error(
+        `pipeline factory-gate: refused to score non-pack run ${opts.fromRun}: ${packCheck.detail}`,
+      );
+    }
     const ledger = await opts.loadLedger(opts.fromRun);
     const items = itemsFromLoopLedger(ledger);
     const notes: string[] = [
       `Projected from durable loop run ${opts.fromRun}`,
+      `FRG fixed pack validated: pack_id=${FRG_PACK_MANIFEST.pack_id} selector=${JSON.stringify(contract.selector)}`,
       "Scenario pack selection: reliability label/fixture pack (not full product milestone)",
     ];
     let overrides = [...(opts.scenarioOverrides ?? [])];
-    if (opts.loadContract) {
-      const contract = await opts.loadContract(opts.fromRun);
-      if (contract) {
-        const stackHonesty = detectEmptyDependsOnStackHonesty(contract, ledger);
-        if (stackHonesty) overrides = mergeScenarioOverride(overrides, stackHonesty);
-      }
-    }
-    // Default live scenarios that only the operator can assert fully may remain
-    // not_observed; throughput + taxonomy are always computed from the ledger.
+    const stackHonesty = detectEmptyDependsOnStackHonesty(contract, ledger);
+    if (stackHonesty) overrides = mergeScenarioOverride(overrides, stackHonesty);
+    // Unobserved required scenarios fail overall pass (not release evidence).
+    // Throughput + taxonomy are always computed from the ledger; other pack
+    // scenarios need scenarioOverrides / live observation.
     computeInput = {
       version,
       loop_run_id: opts.fromRun,
@@ -652,6 +1006,29 @@ export async function runFactoryGate(
       now: opts.now,
     };
   } else if (opts.startLoop) {
+    // Refuse non-pack selectors before starting a durable loop.
+    if (opts.milestone) {
+      if (
+        !(FRG_PACK_MANIFEST.allowed_milestone_selectors as readonly string[]).includes(
+          opts.milestone,
+        )
+      ) {
+        throw new Error(
+          `pipeline factory-gate: milestone "${opts.milestone}" is not an FRG fixed-pack selector ` +
+            `(allowed: ${FRG_PACK_MANIFEST.allowed_milestone_selectors.join(", ")})`,
+        );
+      }
+    } else {
+      const labels = opts.label ?? ["factory-gate"];
+      for (const lab of labels) {
+        if (!(FRG_PACK_MANIFEST.allowed_label_selectors as readonly string[]).includes(lab)) {
+          throw new Error(
+            `pipeline factory-gate: label "${lab}" is not an FRG fixed-pack selector ` +
+              `(allowed: ${FRG_PACK_MANIFEST.allowed_label_selectors.join(", ")})`,
+          );
+        }
+      }
+    }
     stderr(
       `[pipeline factory-gate] starting durable loop for FRG pack (version ${version})…`,
     );
@@ -666,15 +1043,33 @@ export async function runFactoryGate(
       );
     }
     const ledger = await opts.loadLedger(loop_run_id);
+    let overrides = [...(opts.scenarioOverrides ?? [])];
+    const notes = [
+      `Live FRG loop ${loop_run_id}`,
+      `Selector: label=${(opts.label ?? ["factory-gate"]).join(",")} milestone=${opts.milestone ?? "(none)"}`,
+    ];
+    if (opts.loadContract) {
+      const contract = await opts.loadContract(loop_run_id);
+      if (contract) {
+        const packCheck = validateFrgPackContract(contract);
+        if (!packCheck.ok) {
+          throw new Error(
+            `pipeline factory-gate: started loop ${loop_run_id} is not FRG fixed pack: ${packCheck.detail}`,
+          );
+        }
+        notes.push(
+          `FRG fixed pack validated: pack_id=${FRG_PACK_MANIFEST.pack_id} selector=${JSON.stringify(contract.selector)}`,
+        );
+        const stackHonesty = detectEmptyDependsOnStackHonesty(contract, ledger);
+        if (stackHonesty) overrides = mergeScenarioOverride(overrides, stackHonesty);
+      }
+    }
     computeInput = {
       version,
       loop_run_id,
       items: itemsFromLoopLedger(ledger),
-      scenario_overrides: opts.scenarioOverrides,
-      notes: [
-        `Live FRG loop ${loop_run_id}`,
-        `Selector: label=${(opts.label ?? ["factory-gate"]).join(",")} milestone=${opts.milestone ?? "(none)"}`,
-      ],
+      scenario_overrides: overrides,
+      notes,
       thresholds: opts.thresholds,
       now: opts.now,
     };

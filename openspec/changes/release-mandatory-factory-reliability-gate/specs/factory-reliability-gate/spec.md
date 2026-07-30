@@ -77,6 +77,21 @@ numbers and SHALL be checked by the FRG driver.
   `empty-depends-on-stack-honesty`
 - **AND** SHALL NOT silently omit that condition from the scoreboard
 
+#### Scenario: Unobserved required scenarios fail the gate
+
+- **WHEN** the FRG driver scores a run and any required pack scenario lacks verifiable evidence
+  (status `not_observed`)
+- **THEN** the report SHALL set overall `pass: false`
+- **AND** SHALL NOT treat throughput-only success as a release-usable FRG pass
+- **AND** `not_observed` SHALL be reserved for reports that cannot be used as release evidence
+
+#### Scenario: Non-pack durable loop is refused as FRG evidence
+
+- **WHEN** an operator runs the FRG driver with `--from-run` against a durable loop whose contract
+  selector is not the versioned FRG fixed pack (for example a product milestone or ad-hoc work-list)
+- **THEN** the driver SHALL refuse to write a passing FRG evidence artifact for a release version
+- **AND** SHALL surface that the run is not the fixed factory-gate pack
+
 ---
 
 ### Requirement: FRG Layer A hermetic scenarios SHALL run in CI without real I/O
@@ -130,6 +145,14 @@ intentionally injected product-class holds defined by the pack.
 - **THEN** it SHALL write evidence including `version: "1.29.1"`, a unique `run_id`, `pass: true`,
   per-scenario outcomes, and a scoreboard
 - **AND** `JSON.parse` of the machine-readable report SHALL succeed
+
+#### Scenario: Incomplete evidence schema is rejected
+
+- **WHEN** an FRG evidence artifact claims `pass: true` but omits the required named scenario
+  inventory, numeric thresholds, scoreboard metrics, or timestamps, or declares `pass: true` while
+  any scenario is `fail` or `not_observed`
+- **THEN** runtime validation SHALL reject the artifact as unparsable against the expected FRG schema
+- **AND** the release FRG precondition SHALL remain unsatisfied
 
 #### Scenario: Engine-class rate above threshold fails the gate
 

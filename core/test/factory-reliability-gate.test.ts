@@ -8,6 +8,7 @@ import {
   FRG_SCENARIO_IDS,
   FRG_LAYER_A_WAIVERS,
   FRG_SCENARIO_OWNERSHIP,
+  FRG_PACK_MANIFEST,
   DEFAULT_FRG_THRESHOLDS,
   classifyFrgBlocker,
   computeFrgEvidence,
@@ -23,11 +24,34 @@ import {
   runFactoryGate,
   itemsFromLoopLedger,
   detectEmptyDependsOnStackHonesty,
+  frgRequiredObservationOverrides,
+  validateFrgPackContract,
+  isAllowedFrgPackSelector,
   type FrgEvidence,
   type FrgFsDeps,
 } from "../scripts/factory-reliability-gate.ts";
 import type { LoopContract, LoopLedger } from "../scripts/loop/types.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
+
+/** Minimal full-pack pass scoring input (all scenarios observed; K met). */
+function fullPackPassInput(
+  overrides: {
+    version?: string;
+    run_id?: string;
+    loop_run_id?: string | null;
+  } = {},
+) {
+  return {
+    version: overrides.version ?? "1.29.1",
+    run_id: overrides.run_id ?? "frg-full-pass",
+    loop_run_id: overrides.loop_run_id ?? null,
+    items: [
+      { item_id: "1", state: "ready" as const, ready_clean: true },
+      { item_id: "2", state: "ready" as const, ready_clean: true },
+    ],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // In-memory fs
@@ -106,7 +130,7 @@ test("classifyFrgBlocker taxonomy buckets", () => {
 // Scoring
 // ---------------------------------------------------------------------------
 
-test("computeFrgEvidence: green unit-shaped pass with K clean ready items", () => {
+test("computeFrgEvidence: green unit-shaped pass with K clean ready items + full pack observation", () => {
   const evidence = computeFrgEvidence({
     version: "1.29.1",
     run_id: "frg-test-1",
@@ -115,6 +139,7 @@ test("computeFrgEvidence: green unit-shaped pass with K clean ready items", () =
       { item_id: "2", state: "ready", ready_clean: true },
       { item_id: "3", state: "waiting", blocker_theme: "missing-authority" },
     ],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
     now: () => new Date("2026-07-30T12:00:00.000Z"),
   });
   assert.equal(evidence.schema_version, FRG_SCHEMA_VERSION);
@@ -125,6 +150,28 @@ test("computeFrgEvidence: green unit-shaped pass with K clean ready items", () =
   assert.equal(evidence.thresholds.min_clean_ready_to_deploy, DEFAULT_FRG_THRESHOLDS.min_clean_ready_to_deploy);
   const throughput = evidence.scenarios.find((s) => s.id === "clean-item-throughput");
   assert.equal(throughput?.status, "pass");
+  assert.ok(evidence.scenarios.every((s) => s.status !== "not_observed"));
+});
+
+test("computeFrgEvidence: unobserved mandatory scenarios fail overall pass (not release evidence)", () => {
+  // Ordinary loop with K clean ready items but no pack scenario observations.
+  const evidence = computeFrgEvidence({
+    version: "1.29.1",
+    run_id: "frg-unobserved",
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+  });
+  assert.equal(evidence.pass, false, "not_observed required scenarios must not produce pass:true");
+  const unobserved = evidence.scenarios.filter((s) => s.status === "not_observed");
+  assert.ok(unobserved.length >= 1);
+  assert.ok(unobserved.some((s) => s.id === "capacity-blocked-retain"));
+  // Auto-scored scenarios still pass when thresholds are met.
+  assert.equal(
+    evidence.scenarios.find((s) => s.id === "clean-item-throughput")?.status,
+    "pass",
+  );
 });
 
 test("computeFrgEvidence: clean-item throughput below K fails the gate", () => {
@@ -163,14 +210,7 @@ test("computeFrgEvidence: engine-class rate above threshold fails the gate", () 
 });
 
 test("computeFrgEvidence: pass for one version does not imply another", () => {
-  const a = computeFrgEvidence({
-    version: "1.29.1",
-    run_id: "frg-a",
-    items: [
-      { item_id: "1", state: "ready", ready_clean: true },
-      { item_id: "2", state: "ready", ready_clean: true },
-    ],
-  });
+  const a = computeFrgEvidence(fullPackPassInput({ version: "1.29.1", run_id: "frg-a" }));
   assert.equal(a.pass, true);
   assert.equal(a.version, "1.29.1");
   // Different version requires its own artifact — scoring for 1.30.0 is independent.
@@ -178,6 +218,7 @@ test("computeFrgEvidence: pass for one version does not imply another", () => {
     version: "1.30.0",
     run_id: "frg-b",
     items: [{ item_id: "1", state: "blocked", blocker_theme: "workflow-engine-defect" }],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
   });
   assert.equal(b.version, "1.30.0");
   assert.notEqual(b.version, a.version);
@@ -204,6 +245,51 @@ test("parseFrgEvidence rejects bad shapes", () => {
   );
 });
 
+test("parseFrgEvidence rejects structurally incomplete pass artifacts (empty scenarios)", () => {
+  // A latest.json with matching version, pass:true, empty scenarios must NOT parse.
+  assert.throws(
+    () =>
+      parseFrgEvidence({
+        schema_version: 1,
+        version: "1.29.1",
+        run_id: "frg-fake-pass",
+        pass: true,
+        scenarios: [],
+        scoreboard: {},
+        thresholds: {},
+        loop_run_id: null,
+        created_at: "2026-07-30T00:00:00Z",
+        notes: [],
+      }),
+    /exactly 10 named outcomes|scenarios/,
+  );
+});
+
+test("parseFrgEvidence rejects pass:true with not_observed scenarios", () => {
+  const scored = computeFrgEvidence({
+    version: "1.29.1",
+    run_id: "frg-inconsistent",
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+  });
+  assert.equal(scored.pass, false);
+  // Force pass:true while keeping not_observed statuses — must reject.
+  assert.throws(
+    () => parseFrgEvidence({ ...scored, pass: true }),
+    /pass is true but scenarios include fail or not_observed/,
+  );
+});
+
+test("parseFrgEvidence accepts complete computeFrgEvidence output", () => {
+  const evidence = computeFrgEvidence(fullPackPassInput({ run_id: "frg-roundtrip" }));
+  const parsed = parseFrgEvidence(JSON.parse(JSON.stringify(evidence)));
+  assert.equal(parsed.pass, true);
+  assert.equal(parsed.run_id, "frg-roundtrip");
+  assert.equal(parsed.scenarios.length, FRG_SCENARIO_IDS.length);
+});
+
 // ---------------------------------------------------------------------------
 // Evidence I/O + lookup
 // ---------------------------------------------------------------------------
@@ -211,14 +297,7 @@ test("parseFrgEvidence rejects bad shapes", () => {
 test("writeFrgEvidence + lookupFrgPass: pass and fail distinguished from missing", async () => {
   const fs = memFs();
   const repo = "/repo";
-  const passEv = computeFrgEvidence({
-    version: "1.29.1",
-    run_id: "frg-pass-1",
-    items: [
-      { item_id: "1", state: "ready", ready_clean: true },
-      { item_id: "2", state: "ready", ready_clean: true },
-    ],
-  });
+  const passEv = computeFrgEvidence(fullPackPassInput({ version: "1.29.1", run_id: "frg-pass-1" }));
   await writeFrgEvidence(repo, passEv, fs);
   const look = await lookupFrgPass(repo, "1.29.1", fs);
   assert.equal(look.kind, "pass");
@@ -243,6 +322,28 @@ test("writeFrgEvidence + lookupFrgPass: pass and fail distinguished from missing
   await writeFrgEvidence(repo, failEv, fs);
   const lookFail = await lookupFrgPass(repo, "1.29.2", fs);
   assert.equal(lookFail.kind, "fail");
+});
+
+test("lookupFrgPass: incomplete pass:true latest.json is unparsable (does not unblock release)", async () => {
+  const fs = memFs();
+  await fs.writeFile(
+    frgLatestPath("/repo", "1.29.1"),
+    JSON.stringify({
+      schema_version: 1,
+      version: "1.29.1",
+      run_id: "frg-incomplete",
+      pass: true,
+      scenarios: [],
+      scoreboard: {},
+      thresholds: {},
+    }),
+  );
+  const look = await lookupFrgPass("/repo", "1.29.1", fs);
+  assert.equal(look.kind, "unparsable");
+  await assert.rejects(
+    () => requireFrgPassForRelease("/repo", "1.29.1", fs),
+    /unparsable|scenarios/,
+  );
 });
 
 test("lookupFrgPass: unparsable evidence is distinguishable", async () => {
@@ -271,14 +372,7 @@ test("requireFrgPassForRelease: missing / fail / empty run_id refuse; pass retur
     /Gate FAILED for version 1\.29\.1/,
   );
 
-  const passEv = computeFrgEvidence({
-    version: "1.29.1",
-    run_id: "frg-ok",
-    items: [
-      { item_id: "1", state: "ready", ready_clean: true },
-      { item_id: "2", state: "ready", ready_clean: true },
-    ],
-  });
+  const passEv = computeFrgEvidence(fullPackPassInput({ version: "1.29.1", run_id: "frg-ok" }));
   await writeFrgEvidence("/repo", passEv, fs);
   const ok = await requireFrgPassForRelease("/repo", "1.29.1", fs);
   assert.equal(ok.run_id, "frg-ok");
@@ -307,15 +401,9 @@ test("requireFrgPassForRelease: missing / fail / empty run_id refuse; pass retur
 });
 
 test("formatFrgPrSection includes run_id and pass for release PR surface", () => {
-  const evidence = computeFrgEvidence({
-    version: "1.29.1",
-    run_id: "frg-attach-1",
-    loop_run_id: "loop-abc",
-    items: [
-      { item_id: "1", state: "ready", ready_clean: true },
-      { item_id: "2", state: "ready", ready_clean: true },
-    ],
-  });
+  const evidence = computeFrgEvidence(
+    fullPackPassInput({ run_id: "frg-attach-1", loop_run_id: "loop-abc" }),
+  );
   const section = formatFrgPrSection(evidence);
   assert.match(section, /Factory Reliability Gate/);
   assert.match(section, /frg-attach-1/);
@@ -336,14 +424,7 @@ test("runFactoryGate: scoreInput path writes evidence and exits 0 on pass", asyn
       version: "1.29.1",
       repoDir: "/repo",
       json: true,
-      scoreInput: {
-        version: "1.29.1",
-        run_id: "frg-driver-1",
-        items: [
-          { item_id: "1", state: "ready", ready_clean: true },
-          { item_id: "2", state: "ready", ready_clean: true },
-        ],
-      },
+      scoreInput: fullPackPassInput({ run_id: "frg-driver-1" }),
       stdout: (m) => lines.push(m),
       stderr: () => {},
     },
@@ -384,14 +465,7 @@ test("runFactoryGate: does not merge or tag (no side-effect hooks)", async () =>
     {
       version: "1.0.0",
       repoDir: "/repo",
-      scoreInput: {
-        version: "1.0.0",
-        run_id: "frg-no-merge",
-        items: [
-          { item_id: "1", state: "ready", ready_clean: true },
-          { item_id: "2", state: "ready", ready_clean: true },
-        ],
-      },
+      scoreInput: fullPackPassInput({ version: "1.0.0", run_id: "frg-no-merge" }),
       stdout: () => {},
       stderr: () => {},
     },
@@ -401,6 +475,131 @@ test("runFactoryGate: does not merge or tag (no side-effect hooks)", async () =>
     assert.ok(key.includes(".agent-pipeline/frg"), `only FRG paths written: ${key}`);
     assert.ok(!key.includes("tag"), key);
   }
+});
+
+test("runFactoryGate --from-run: refuses unrelated durable loop (non-pack selector)", async () => {
+  const fs = memFs();
+  const productContract = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: "loop-product",
+    selector: { type: "milestone", value: "v2-product" },
+    items: [
+      { id: "1", depends_on: [], external_depends_on: [] },
+      { id: "2", depends_on: [], external_depends_on: [] },
+    ],
+  } as unknown as LoopContract;
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "loop-product",
+    items: {
+      "1": { state: "ready", history: [], recovery_attempts: [] },
+      "2": { state: "ready", history: [], recovery_attempts: [] },
+    },
+  } as unknown as LoopLedger;
+
+  await assert.rejects(
+    () =>
+      runFactoryGate(
+        {
+          version: "1.29.1",
+          repoDir: "/repo",
+          fromRun: "loop-product",
+          loadLedger: async () => ledger,
+          loadContract: async () => productContract,
+          scenarioOverrides: frgRequiredObservationOverrides("pass"),
+          stdout: () => {},
+          stderr: () => {},
+        },
+        fs,
+      ),
+    /refused to score non-pack run|not an FRG fixed-pack selector/,
+  );
+  assert.equal(fs.files.size, 0, "must not write FRG evidence for non-pack runs");
+});
+
+test("runFactoryGate --from-run: accepts factory-gate label pack and scores", async () => {
+  const fs = memFs();
+  const packContract = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: "loop-frg",
+    selector: { type: "label", value: "factory-gate" },
+    items: [
+      { id: "10", depends_on: [], external_depends_on: [] },
+      { id: "20", depends_on: [], external_depends_on: [] },
+    ],
+  } as unknown as LoopContract;
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "loop-frg",
+    items: {
+      "10": { state: "ready", history: [], recovery_attempts: [] },
+      "20": { state: "ready", history: [], recovery_attempts: [] },
+    },
+  } as unknown as LoopLedger;
+
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/repo",
+      fromRun: "loop-frg",
+      loadLedger: async () => ledger,
+      loadContract: async () => packContract,
+      scenarioOverrides: frgRequiredObservationOverrides("pass"),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.evidence.pass, true);
+  assert.equal(result.evidence.loop_run_id, "loop-frg");
+  assert.ok(
+    result.evidence.notes.some((n) => n.includes(FRG_PACK_MANIFEST.pack_id)),
+  );
+});
+
+test("runFactoryGate --from-run: requires loadContract (pack validation seam)", async () => {
+  await assert.rejects(
+    () =>
+      runFactoryGate({
+        version: "1.29.1",
+        repoDir: "/repo",
+        fromRun: "loop-x",
+        loadLedger: async () =>
+          ({
+            schema: LOOP_LEDGER_SCHEMA,
+            run_id: "loop-x",
+            items: {},
+          }) as unknown as LoopLedger,
+        stdout: () => {},
+        stderr: () => {},
+      }),
+    /requires a contract loader/,
+  );
+});
+
+test("validateFrgPackContract: fixed-pack manifest enforces selector + multi-item", () => {
+  assert.equal(isAllowedFrgPackSelector({ type: "label", value: "factory-gate" }), true);
+  assert.equal(isAllowedFrgPackSelector({ type: "milestone", value: "v2" }), false);
+  assert.equal(isAllowedFrgPackSelector({ type: "work-list", value: ["1", "2"] }), false);
+
+  const ok = validateFrgPackContract({
+    schema: LOOP_CONTRACT_SCHEMA,
+    selector: { type: "label", value: "factory-gate" },
+    items: [
+      { id: "1", depends_on: [], external_depends_on: [] },
+      { id: "2", depends_on: [], external_depends_on: [] },
+    ],
+  } as unknown as LoopContract);
+  assert.equal(ok.ok, true);
+
+  const single = validateFrgPackContract({
+    schema: LOOP_CONTRACT_SCHEMA,
+    selector: { type: "label", value: "factory-gate" },
+    items: [{ id: "1", depends_on: [], external_depends_on: [] }],
+  } as unknown as LoopContract);
+  assert.equal(single.ok, false);
+  if (!single.ok) assert.match(single.detail, /≥2 items/);
 });
 
 test("itemsFromLoopLedger projects ready/blocked themes", () => {

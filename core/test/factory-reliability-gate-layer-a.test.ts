@@ -378,7 +378,11 @@ test("FRG Layer A local-docs-parity: stale docs fail closed before PR (checkDocs
 // clean-item-throughput + blocker-taxonomy (scoring composition)
 // ---------------------------------------------------------------------------
 
-test("FRG Layer A clean-item-throughput + blocker-taxonomy: thresholds are numeric and biting", () => {
+test("FRG Layer A clean-item-throughput + blocker-taxonomy: thresholds are numeric and biting", async () => {
+  const { frgRequiredObservationOverrides } = await import(
+    "../scripts/factory-reliability-gate.ts"
+  );
+  const packObs = frgRequiredObservationOverrides("pass");
   const pass = computeFrgEvidence({
     version: "1.29.1",
     run_id: "layer-a-pass",
@@ -386,15 +390,25 @@ test("FRG Layer A clean-item-throughput + blocker-taxonomy: thresholds are numer
       { item_id: "1", state: "ready", ready_clean: true },
       { item_id: "2", state: "ready", ready_clean: true },
     ],
+    scenario_overrides: packObs,
   });
   assert.equal(pass.pass, true);
+  assert.equal(
+    pass.scenarios.find((s) => s.id === "clean-item-throughput")?.status,
+    "pass",
+  );
 
   const failK = computeFrgEvidence({
     version: "1.29.1",
     run_id: "layer-a-fail-k",
     items: [{ item_id: "1", state: "ready", ready_clean: true }],
+    scenario_overrides: packObs,
   });
   assert.equal(failK.pass, false);
+  assert.equal(
+    failK.scenarios.find((s) => s.id === "clean-item-throughput")?.status,
+    "fail",
+  );
 
   const failEngine = computeFrgEvidence({
     version: "1.29.1",
@@ -405,8 +419,13 @@ test("FRG Layer A clean-item-throughput + blocker-taxonomy: thresholds are numer
       { item_id: "3", state: "ready", ready_clean: true },
     ],
     thresholds: { ...DEFAULT_FRG_THRESHOLDS, max_engine_class_rate: 0.1 },
+    scenario_overrides: packObs,
   });
   assert.equal(failEngine.pass, false);
+  assert.equal(
+    failEngine.scenarios.find((s) => s.id === "blocker-taxonomy")?.status,
+    "fail",
+  );
 });
 
 // ---------------------------------------------------------------------------
