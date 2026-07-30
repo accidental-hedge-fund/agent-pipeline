@@ -514,7 +514,8 @@ async function offerRelocationWith(dest, base, dryRun, isTTY, promptFn = promptL
 
   if (dryRun) {
     warn(
-      `Personal install detected at ${dest} — would shadow the plugin's /pipeline.\n` +
+      `Personal pipeline skill detected at ${dest} — would overwrite it on install.\n` +
+        `  (dry-run) Intended backup path: ${backupPath}\n` +
         `  (dry-run) To relocate manually: ${relocateCmd}`,
     );
     return "proceed";
@@ -533,10 +534,10 @@ async function offerRelocationWith(dest, base, dryRun, isTTY, promptFn = promptL
     return "proceed";
   }
 
-  // Interactive TTY: prompt the user.
+  // Interactive TTY: prompt the user (host-neutral wording for Claude + Codex).
   warn(
     `A personal pipeline skill exists at:\n  ${dest}\n` +
-      `  The plugin installs to this same path, so installing here would overwrite it.`,
+      `  Installing here would overwrite it.`,
   );
   const answer = await promptFn(`  Relocate it to ${backupPath} first? [y/N] `);
   if (answer.toLowerCase() === "y") {
@@ -546,13 +547,11 @@ async function offerRelocationWith(dest, base, dryRun, isTTY, promptFn = promptL
   }
 
   // Declined: leave the personal install untouched and skip this host's install
-  // (proceeding would overwrite it). The duplicate-/pipeline consequence is real
-  // when a personal skill install coexists with the marketplace plugin.
+  // (proceeding would overwrite it). Other hosts in --host all still proceed.
   warn(
     `Personal install left in place at ${dest}.\n` +
       `  Skipped installing here to avoid overwriting it.\n` +
-      `  Note: a personal skill install alongside the marketplace plugin shows up as\n` +
-      `  duplicate /pipeline entries. To migrate, relocate it then re-run install:\n` +
+      `  To migrate, relocate it then re-run install:\n` +
       `    ${relocateCmd}`,
   );
   return "skip";
@@ -600,15 +599,18 @@ function stageInto(stagingDir, host) {
 
 // Install the namespaced pipeline:<command> command files for the Claude host (#273).
 // Each file is written to <claudeBase>/commands/pipeline:<name>.md.
+// skillPath is the resolved absolute install target so Invoke lines track
+// CLAUDE_CONFIG_DIR (not a hardcoded ~/.claude/skills/pipeline) (#635).
 function installClaudeCommands(claudeBaseDir, dryRun) {
   const commandsDir = join(claudeBaseDir, "commands");
+  const skillPath = join(claudeBaseDir, "skills", "pipeline");
   if (dryRun) {
     log(`  (dry-run) would write ${OPERATION_SURFACE.length} pipeline:<command> files to ${commandsDir}`);
     return;
   }
   mkdirSync(commandsDir, { recursive: true });
   for (const op of OPERATION_SURFACE) {
-    const content = renderClaudeCommand(op, "~/.claude/skills/pipeline");
+    const content = renderClaudeCommand(op, skillPath);
     writeFileSync(join(commandsDir, `pipeline:${op.name}.md`), content);
   }
   log(`  ✓ wrote ${OPERATION_SURFACE.length} pipeline:<command> files to ${commandsDir}`);
@@ -773,53 +775,75 @@ function installHost(host, dryRun) {
   log(`  ✓ installed. ${cfg.postInstall}`);
 }
 
+// Backup base for personal-skill relocation: parent of the host skills dir
+// (outside the skills scan path). Derived only from HOSTS[h].skillsDir() so
+// CLAUDE_CONFIG_DIR / CODEX_HOME overrides are honored without hardcoding
+// ~/.claude or ~/.codex (#635).
+function hostBackupBase(host) {
+  return dirname(HOSTS[host].skillsDir());
+}
+
 function uninstallHost(host, dryRun) {
   const cfg = HOSTS[host];
   const dest = join(cfg.skillsDir(), "pipeline");
   // pathPresent so a broken Grok symlink is still removable.
   if (!pathPresent(dest)) {
     log(`→ ${cfg.label}: nothing installed at ${dest}`);
-    return;
-  }
-  log(`→ ${cfg.label}: removing ${dest}`);
+  } else {
+    log(`→ ${cfg.label}: removing ${dest}`);
 
-  // symlink-claude (Grok): only unlink an installer-owned symlink. Never
-  // recursively delete a copy-based layout or personal directory.
-  if (cfg.installMode === "symlink-claude") {
-    let st;
-    try {
-      st = lstatSync(dest);
-    } catch (err) {
-      fail(
-        `Cannot inspect existing path at ${dest}: ${err.message}\n` +
-          `  Relocate or remove it manually if needed.`,
-      );
+    // symlink-claude (Grok): only unlink an installer-owned symlink. Never
+    // recursively delete a copy-based layout or personal directory.
+    if (cfg.installMode === "symlink-claude") {
+      let st;
+      try {
+        st = lstatSync(dest);
+      } catch (err) {
+        fail(
+          `Cannot inspect existing path at ${dest}: ${err.message}\n` +
+            `  Relocate or remove it manually if needed.`,
+        );
+      }
+      if (!st.isSymbolicLink()) {
+        fail(
+          `Refusing to delete non-symlink path at ${dest}.\n` +
+            `  This may be a copy-based Grok skill layout or personal content.\n` +
+            `  uninstall --host grok only unlinks an installer-created symlink; it will not recursively delete this path.\n` +
+            `  To keep the copy: no action needed (the copy layout is supported; it does not track Claude updates).\n` +
+            `  To remove it yourself after backup:\n` +
+            `    mv '${dest}' '${dest}.bak'`,
+        );
+      }
+      if (dryRun) {
+        log("  (dry-run) would unlink the Grok skill symlink");
+      } else {
+        unlinkSync(dest);
+        log("  ✓ removed");
+      }
+    } else if (dryRun) {
+      log("  (dry-run) would rm -rf the skill directory");
+    } else {
+      rmSync(dest, { recursive: true, force: true });
+      log("  ✓ removed skill directory");
     }
-    if (!st.isSymbolicLink()) {
-      fail(
-        `Refusing to delete non-symlink path at ${dest}.\n` +
-          `  This may be a copy-based Grok skill layout or personal content.\n` +
-          `  uninstall --host grok only unlinks an installer-created symlink; it will not recursively delete this path.\n` +
-          `  To keep the copy: no action needed (the copy layout is supported; it does not track Claude updates).\n` +
-          `  To remove it yourself after backup:\n` +
-          `    mv '${dest}' '${dest}.bak'`,
-      );
-    }
-    if (dryRun) {
-      log("  (dry-run) would unlink the Grok skill symlink");
-      return;
-    }
-    unlinkSync(dest);
-    log("  ✓ removed");
-    return;
   }
 
-  if (dryRun) {
-    log("  (dry-run) would rm -rf the skill directory");
-    return;
+  // Claude: always remove installer-written pipeline:<op>.md command files,
+  // independent of skill-directory presence (orphan cleanup after partial
+  // uninstalls). Filenames come only from OPERATION_SURFACE (#635).
+  if (host === "claude") {
+    const commandsDir = join(claudeBase(), "commands");
+    for (const op of OPERATION_SURFACE) {
+      const cmdPath = join(commandsDir, `pipeline:${op.name}.md`);
+      if (!existsSync(cmdPath)) continue;
+      if (dryRun) {
+        log(`  (dry-run) would remove command file ${cmdPath}`);
+      } else {
+        unlinkSync(cmdPath);
+        log(`  ✓ removed command file ${cmdPath}`);
+      }
+    }
   }
-  rmSync(dest, { recursive: true, force: true });
-  log("  ✓ removed");
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,14 +1250,17 @@ async function main() {
     try {
       log(`Installing agent-pipeline → [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
       for (const h of hosts) {
-        if (h === "claude") {
-          const { shadowing, dest } = detectPersonalSkill(h);
-          if (shadowing) {
-            const action = await offerRelocation(dest, claudeBase(), dryRun);
-            if (action === "skip") {
-              log(`  ↷ Skipped Claude Code install — relocate the personal install first, then re-run.`);
-              continue;
-            }
+        // Shadow detection for every selected host (Claude + Codex) (#635).
+        // Backup base is dirname(skillsDir) so CLAUDE_CONFIG_DIR / CODEX_HOME
+        // overrides are honored without hardcoding ~/.claude or ~/.codex.
+        const { shadowing, dest } = detectPersonalSkill(h);
+        if (shadowing) {
+          const action = await offerRelocation(dest, hostBackupBase(h), dryRun);
+          if (action === "skip") {
+            log(
+              `  ↷ Skipped ${HOSTS[h].label} install — relocate the personal install first, then re-run.`,
+            );
+            continue;
           }
         }
         installHost(h, dryRun);
@@ -1275,6 +1302,9 @@ export {
   uniqueBackupPath,
   relocatePersonalSkill,
   offerRelocationWith,
+  hostBackupBase,
+  installClaudeCommands,
+  uninstallHost,
   openspecPresent,
   last30daysPresent,
   detectDep,

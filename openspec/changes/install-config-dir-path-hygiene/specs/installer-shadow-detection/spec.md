@@ -86,3 +86,16 @@ Codex shadow detection and relocation paths SHALL honor `CODEX_HOME`. All paths 
 - **WHEN** `CODEX_HOME` is not set
 - **THEN** detection checks the installer’s resolved default Codex skills path for `pipeline`
 - **AND** relocation targets a unique backup under the parent of that skills directory
+
+### Requirement: Dry-run shadow handling is fully non-mutating
+
+When `--dry-run` is set, personal-skill shadow handling for Claude and Codex SHALL warn and MAY report the intended unique backup path, but SHALL NOT relocate/rename an unmanaged skill, write `.pipeline-installer-managed`, or overwrite/write skill or command install files for that host.
+
+#### Scenario: Dry-run with unmanaged Codex personal skill
+
+- **WHEN** an unmanaged Codex personal skill exists at `<codexSkillsDir>/pipeline`
+- **AND** `install --host codex --dry-run` is run
+- **THEN** a shadow warning is emitted (optionally naming the intended backup path)
+- **AND** the personal skill directory remains at its original path
+- **AND** no `.pipeline-installer-managed` marker is created at the install target
+- **AND** no Codex skill tree files are written under the install target

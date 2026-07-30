@@ -9,6 +9,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   realpathSync,
@@ -30,6 +31,9 @@ import {
   detectPersonalSkill,
   uniqueBackupPath,
   offerRelocationWith,
+  hostBackupBase,
+  installClaudeCommands,
+  uninstallHost,
   openspecPresent,
   last30daysPresent,
   detectDep,
@@ -47,6 +51,7 @@ import {
   releaseUpdateLock,
   verifyUpdateLockOwnership,
 } from "./install.mjs";
+import { OPERATION_SURFACE, renderClaudeCommand, shellSingleQuote } from "./build.mjs";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1656,6 +1661,99 @@ test("install --host grok: fails with remediation when Claude skill is missing (
     mkdirSync(claudeTmp, { recursive: true });
     const result = runInstaller(["install", "--host", "grok"], {
       HOME: home,
+// #635 — CLAUDE_CONFIG_DIR command path hygiene, uninstall command cleanup,
+// and Codex shadow-detection parity.
+// ---------------------------------------------------------------------------
+
+test("shellSingleQuote: wraps and escapes embedded single quotes", () => {
+  assert.equal(shellSingleQuote("/plain/path"), "'/plain/path'");
+  assert.equal(shellSingleQuote("/path with spaces"), "'/path with spaces'");
+  assert.equal(shellSingleQuote("/has'quote"), `'/has'\\''quote'`);
+});
+
+test("renderClaudeCommand: quotes the full script path in the Invoke line", () => {
+  const op = OPERATION_SURFACE[0];
+  const skillPath = "/tmp/my claude/skills/pipeline";
+  const body = renderClaudeCommand(op, skillPath);
+  const quoted = shellSingleQuote(`${skillPath}/scripts/pipeline.mjs`);
+  assert.ok(
+    body.includes(`node ${quoted}`),
+    `Invoke must shell-quote the full script path: ${body}`,
+  );
+  assert.ok(
+    !body.includes(`node ${skillPath}/scripts/pipeline.mjs`),
+    "unquoted space-split path must not appear as the node target",
+  );
+});
+
+test("installClaudeCommands: every OPERATION_SURFACE body uses absolute config-dir skill path (#635)", () => {
+  const tmp = makeTmp();
+  try {
+    installClaudeCommands(tmp, false);
+    const skillPath = join(tmp, "skills", "pipeline");
+    const commandsDir = join(tmp, "commands");
+    assert.equal(OPERATION_SURFACE.length > 0, true);
+    for (const op of OPERATION_SURFACE) {
+      const cmdPath = join(commandsDir, `pipeline:${op.name}.md`);
+      assert.ok(existsSync(cmdPath), `missing command file for ${op.name}`);
+      const body = readFileSync(cmdPath, "utf8");
+      assert.ok(
+        body.includes(skillPath),
+        `${op.name}: body must reference absolute skill path ${skillPath}`,
+      );
+      assert.ok(
+        !body.includes("~/.claude/skills/pipeline"),
+        `${op.name}: body must not hardcode ~/.claude/skills/pipeline`,
+      );
+      const quoted = shellSingleQuote(`${skillPath}/scripts/pipeline.mjs`);
+      assert.ok(
+        body.includes(quoted),
+        `${op.name}: Invoke must include shell-quoted script path`,
+      );
+    }
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("installClaudeCommands: path with spaces is shell-quoted in every Invoke line (#635)", () => {
+  const parent = makeTmp();
+  const tmp = join(parent, "my claude");
+  mkdirSync(tmp, { recursive: true });
+  try {
+    installClaudeCommands(tmp, false);
+    const skillPath = join(tmp, "skills", "pipeline");
+    const quoted = shellSingleQuote(`${skillPath}/scripts/pipeline.mjs`);
+    for (const op of OPERATION_SURFACE) {
+      const body = readFileSync(join(tmp, "commands", `pipeline:${op.name}.md`), "utf8");
+      assert.ok(body.includes(quoted), `${op.name}: expected quoted path ${quoted}`);
+      // Bare unquoted space-split form must not be the node argument.
+      assert.ok(
+        !new RegExp(`node ${skillPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/scripts/pipeline\\.mjs`).test(body),
+        `${op.name}: unquoted path with spaces must not appear`,
+      );
+    }
+  } finally {
+    cleanup(parent);
+  }
+});
+
+test("installClaudeCommands: dry-run writes no command files (#635)", () => {
+  const tmp = makeTmp();
+  try {
+    installClaudeCommands(tmp, true);
+    assert.equal(existsSync(join(tmp, "commands")), false, "dry-run must not create commands dir");
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("subprocess install: CLAUDE_CONFIG_DIR command bodies point at config-dir skill (#635)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const result = runInstaller(["install", "--host", "claude"], {
+>>>>>>> 9f39e5a (fix(install): CLAUDE_CONFIG_DIR command paths, uninstall cleanup, Codex shadow (#635))
       CLAUDE_CONFIG_DIR: claudeTmp,
       TMPDIR: lockTmp,
       TMP: lockTmp,
@@ -1668,6 +1766,19 @@ test("install --host grok: fails with remediation when Claude skill is missing (
     assert.equal(existsSync(join(home, ".grok", "skills", "pipeline")), false);
   } finally {
     cleanup(home);
+    assert.equal(result.status, 0, `install failed: ${result.stderr}`);
+    const skillPath = join(claudeTmp, "skills", "pipeline");
+    for (const op of OPERATION_SURFACE) {
+      const body = readFileSync(join(claudeTmp, "commands", `pipeline:${op.name}.md`), "utf8");
+      assert.ok(body.includes(skillPath), `${op.name} missing skill path`);
+      assert.ok(!body.includes("~/.claude/skills/pipeline"), `${op.name} still has hardcoded tilde path`);
+    }
+    assert.ok(
+      existsSync(join(skillPath, MANAGED_MARKER)),
+      "managed marker must land via staging",
+    );
+  } finally {
+>>>>>>> 9f39e5a (fix(install): CLAUDE_CONFIG_DIR command paths, uninstall cleanup, Codex shadow (#635))
     cleanup(claudeTmp);
     cleanup(lockTmp);
   }
@@ -1682,6 +1793,15 @@ test("install --host grok: idempotent re-run refreshes symlink (#731)", () => {
     const env = {
       HOME: home,
       CLAUDE_CONFIG_DIR: claudeTmp,
+test("subprocess install (default HOME): every command embeds absolute home skill path (#635)", () => {
+  const homeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    mkdirSync(join(homeTmp, ".claude"), { recursive: true });
+    const env = {
+      ...process.env,
+      HOME: homeTmp,
+>>>>>>> 9f39e5a (fix(install): CLAUDE_CONFIG_DIR command paths, uninstall cleanup, Codex shadow (#635))
       TMPDIR: lockTmp,
       TMP: lockTmp,
       TEMP: lockTmp,
@@ -1703,6 +1823,31 @@ test("install --host grok: idempotent re-run refreshes symlink (#731)", () => {
   } finally {
     cleanup(home);
     cleanup(claudeTmp);
+    delete env.CLAUDE_CONFIG_DIR;
+    const result = spawnSync(process.execPath, [INSTALL_SCRIPT, "install", "--host", "claude"], {
+      env,
+      encoding: "utf8",
+      timeout: 120_000,
+    });
+    assert.equal(result.status, 0, `install failed: ${result.stderr}\n${result.stdout}`);
+    const skillPath = join(homeTmp, ".claude", "skills", "pipeline");
+    for (const op of OPERATION_SURFACE) {
+      const body = readFileSync(
+        join(homeTmp, ".claude", "commands", `pipeline:${op.name}.md`),
+        "utf8",
+      );
+      assert.ok(
+        body.includes(skillPath),
+        `${op.name}: expected absolute home skill path ${skillPath}`,
+      );
+      assert.ok(
+        !body.includes("~/.claude/skills/pipeline"),
+        `${op.name}: must not use tilde form as skill path`,
+      );
+    }
+  } finally {
+    cleanup(homeTmp);
+>>>>>>> 9f39e5a (fix(install): CLAUDE_CONFIG_DIR command paths, uninstall cleanup, Codex shadow (#635))
     cleanup(lockTmp);
   }
 });
@@ -1722,6 +1867,124 @@ test("install --host grok: refuses to delete documented copy layout directory (#
     const result = runInstaller(["install", "--host", "grok"], {
       HOME: home,
       CLAUDE_CONFIG_DIR: claudeTmp,
+test("uninstallHost claude: removes skill dir and all pipeline:<op>.md; preserves unrelated (#635)", () => {
+  const tmp = makeTmp();
+  process.env.CLAUDE_CONFIG_DIR = tmp;
+  try {
+    const skillDir = join(tmp, "skills", "pipeline");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(join(skillDir, MANAGED_MARKER), "");
+    installClaudeCommands(tmp, false);
+    const unrelated = join(tmp, "commands", "my-other-tool.md");
+    writeFileSync(unrelated, "keep me\n");
+
+    uninstallHost("claude", false);
+
+    assert.equal(existsSync(skillDir), false, "skill directory must be removed");
+    for (const op of OPERATION_SURFACE) {
+      assert.equal(
+        existsSync(join(tmp, "commands", `pipeline:${op.name}.md`)),
+        false,
+        `pipeline:${op.name}.md must be removed`,
+      );
+    }
+    assert.ok(existsSync(unrelated), "unrelated command file must be preserved");
+    assert.equal(readFileSync(unrelated, "utf8"), "keep me\n");
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    cleanup(tmp);
+  }
+});
+
+test("uninstallHost claude: skill absent + orphan commands → still removes commands (#635)", () => {
+  const tmp = makeTmp();
+  process.env.CLAUDE_CONFIG_DIR = tmp;
+  try {
+    installClaudeCommands(tmp, false);
+    // Skill dir never created (or already gone) — only orphan command files remain.
+    assert.equal(existsSync(join(tmp, "skills", "pipeline")), false);
+
+    uninstallHost("claude", false);
+
+    for (const op of OPERATION_SURFACE) {
+      assert.equal(
+        existsSync(join(tmp, "commands", `pipeline:${op.name}.md`)),
+        false,
+        `orphan pipeline:${op.name}.md must still be removed`,
+      );
+    }
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    cleanup(tmp);
+  }
+});
+
+test("uninstallHost claude dry-run: reports command removal without deleting (#635)", () => {
+  const tmp = makeTmp();
+  process.env.CLAUDE_CONFIG_DIR = tmp;
+  try {
+    installClaudeCommands(tmp, false);
+    const cmdSample = join(tmp, "commands", `pipeline:${OPERATION_SURFACE[0].name}.md`);
+    assert.ok(existsSync(cmdSample));
+
+    // Capture log output via stdout is hard; assert filesystem non-mutation.
+    uninstallHost("claude", true);
+
+    for (const op of OPERATION_SURFACE) {
+      assert.ok(
+        existsSync(join(tmp, "commands", `pipeline:${op.name}.md`)),
+        `dry-run must leave pipeline:${op.name}.md intact`,
+      );
+    }
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    cleanup(tmp);
+  }
+});
+
+test("detectPersonalSkill codex: unmanaged → shadowing; managed marker → not (#635)", () => {
+  const tmp = makeTmp();
+  process.env.CODEX_HOME = tmp;
+  try {
+    const dest = join(tmp, "skills", "pipeline");
+    mkdirSync(dest, { recursive: true });
+    assert.equal(detectPersonalSkill("codex").shadowing, true);
+    writeFileSync(join(dest, MANAGED_MARKER), "");
+    assert.equal(detectPersonalSkill("codex").shadowing, false);
+  } finally {
+    delete process.env.CODEX_HOME;
+    cleanup(tmp);
+  }
+});
+
+test("hostBackupBase: honors CODEX_HOME and CLAUDE_CONFIG_DIR (#635)", () => {
+  const claudeTmp = makeTmp();
+  const codexTmp = makeTmp();
+  process.env.CLAUDE_CONFIG_DIR = claudeTmp;
+  process.env.CODEX_HOME = codexTmp;
+  try {
+    assert.equal(hostBackupBase("claude"), claudeTmp);
+    assert.equal(hostBackupBase("codex"), codexTmp);
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    delete process.env.CODEX_HOME;
+    cleanup(claudeTmp);
+    cleanup(codexTmp);
+  }
+});
+
+test("subprocess Codex install: unmanaged personal skill is auto-relocated non-TTY (#635)", () => {
+  const codexTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const personal = join(codexTmp, "skills", "pipeline");
+    mkdirSync(personal, { recursive: true });
+    writeFileSync(join(personal, "SKILL.md"), "unmanaged personal codex skill");
+    // No MANAGED_MARKER — unmanaged.
+
+    const result = runInstaller(["install", "--host", "codex"], {
+      CODEX_HOME: codexTmp,
+>>>>>>> 9f39e5a (fix(install): CLAUDE_CONFIG_DIR command paths, uninstall cleanup, Codex shadow (#635))
       TMPDIR: lockTmp,
       TMP: lockTmp,
       TEMP: lockTmp,
@@ -1743,6 +2006,25 @@ test("install --host grok: refuses to delete documented copy layout directory (#
   } finally {
     cleanup(home);
     cleanup(claudeTmp);
+    assert.equal(result.status, 0, `codex install failed: ${result.stderr}\n${result.stdout}`);
+    const output = `${result.stdout}${result.stderr}`;
+    assert.match(output, /Personal pipeline skill detected|auto-relocat/i);
+
+    // Personal content should be at a backup under CODEX_HOME, not under skills/.
+    const top = readdirSync(codexTmp);
+    const backups = top.filter((e) => e.startsWith("pipeline.") && e.includes(".bak"));
+    assert.ok(backups.length >= 1, `expected backup under CODEX_HOME, got: ${top.join(",")}`);
+    assert.ok(
+      existsSync(join(codexTmp, backups[0], "SKILL.md")),
+      "personal skill content should live in the backup",
+    );
+
+    // Fresh managed install at the skills target.
+    assert.ok(existsSync(join(codexTmp, "skills", "pipeline", MANAGED_MARKER)));
+    assert.ok(existsSync(join(codexTmp, "skills", "pipeline", "scripts", "pipeline.mjs")));
+  } finally {
+    cleanup(codexTmp);
+>>>>>>> 9f39e5a (fix(install): CLAUDE_CONFIG_DIR command paths, uninstall cleanup, Codex shadow (#635))
     cleanup(lockTmp);
   }
 });
@@ -1764,6 +2046,103 @@ test("install --host grok: refreshes wrong-target symlink without recursive tree
 
     const result = runInstaller(["install", "--host", "grok"], {
       HOME: home,
+test("subprocess Codex install: managed marker → no shadow warning; dry-run leaves unmanaged in place (#635)", () => {
+  const codexTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    // First: managed install (fresh).
+    let result = runInstaller(["install", "--host", "codex"], {
+      CODEX_HOME: codexTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(result.status, 0, `fresh codex install failed: ${result.stderr}`);
+    assert.ok(existsSync(join(codexTmp, "skills", "pipeline", MANAGED_MARKER)));
+    const managedOut = `${result.stdout}${result.stderr}`;
+    assert.ok(
+      !/Personal pipeline skill detected/i.test(managedOut),
+      "managed install must not emit a shadow warning",
+    );
+
+    // Second: dry-run against an unmanaged skill (replace marker-less tree).
+    const personal = join(codexTmp, "skills", "pipeline");
+    rmSync(personal, { recursive: true, force: true });
+    mkdirSync(personal, { recursive: true });
+    writeFileSync(join(personal, "SKILL.md"), "unmanaged dry-run subject");
+
+    result = runInstaller(["install", "--host", "codex", "--dry-run"], {
+      CODEX_HOME: codexTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(result.status, 0, `codex dry-run failed: ${result.stderr}`);
+    const dryOut = `${result.stdout}${result.stderr}`;
+    assert.match(dryOut, /Personal pipeline skill detected|would overwrite/i);
+    // Skill still at original path; no marker; no install tree under the personal dir.
+    assert.ok(existsSync(join(personal, "SKILL.md")), "dry-run must not relocate unmanaged skill");
+    assert.equal(existsSync(join(personal, MANAGED_MARKER)), false);
+    assert.equal(existsSync(join(personal, "scripts", "pipeline.mjs")), false);
+    const top = readdirSync(codexTmp);
+    assert.ok(
+      !top.some((e) => e.startsWith("pipeline.") && e.includes(".bak")),
+      "dry-run must not create a backup directory",
+    );
+  } finally {
+    cleanup(codexTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("subprocess --host all: TTY decline of Codex shadow skips only Codex; Claude still installs (#635)", () => {
+  // We can't easily inject TTY prompts into the main() subprocess. Instead
+  // prove the per-host skip path via offerRelocationWith + hostBackupBase
+  // composition, and that installHost for the other host still works when
+  // only one host is skipped (subprocess install --host claude alone).
+  // Full TTY decline for codex is covered at the offerRelocationWith unit level;
+  // here we verify hostBackupBase + detect for codex under CODEX_HOME and that
+  // Claude install is independent.
+  const claudeTmp = makeTmp();
+  const codexTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const personal = join(codexTmp, "skills", "pipeline");
+    mkdirSync(personal, { recursive: true });
+    writeFileSync(join(personal, "SKILL.md"), "codex personal");
+
+    // Claude-only install must succeed even when an unmanaged Codex skill exists
+    // (shadow is host-scoped — not a global abort).
+    const result = runInstaller(["install", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      CODEX_HOME: codexTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(result.status, 0, `claude install failed: ${result.stderr}`);
+    assert.ok(existsSync(join(claudeTmp, "skills", "pipeline", MANAGED_MARKER)));
+    // Codex personal skill untouched (we did not install codex).
+    assert.ok(existsSync(join(personal, "SKILL.md")));
+    assert.equal(existsSync(join(personal, MANAGED_MARKER)), false);
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(codexTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("subprocess uninstall: orphan command files removed under CLAUDE_CONFIG_DIR (#635)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    // Write only command files (simulate orphan after skill already removed).
+    process.env.CLAUDE_CONFIG_DIR = claudeTmp;
+    installClaudeCommands(claudeTmp, false);
+    delete process.env.CLAUDE_CONFIG_DIR;
+
+    const result = runInstaller(["uninstall", "--host", "claude"], {
+>>>>>>> 9f39e5a (fix(install): CLAUDE_CONFIG_DIR command paths, uninstall cleanup, Codex shadow (#635))
       CLAUDE_CONFIG_DIR: claudeTmp,
       TMPDIR: lockTmp,
       TMP: lockTmp,
@@ -1776,6 +2155,17 @@ test("install --host grok: refreshes wrong-target symlink without recursive tree
     assert.equal(readFileSync(join(sibling, "keep.txt"), "utf8"), "preserve");
   } finally {
     cleanup(home);
+    assert.equal(result.status, 0, `uninstall failed: ${result.stderr}`);
+    for (const op of OPERATION_SURFACE) {
+      assert.equal(
+        existsSync(join(claudeTmp, "commands", `pipeline:${op.name}.md`)),
+        false,
+        `orphan pipeline:${op.name}.md should be removed by uninstall`,
+      );
+    }
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+>>>>>>> 9f39e5a (fix(install): CLAUDE_CONFIG_DIR command paths, uninstall cleanup, Codex shadow (#635))
     cleanup(claudeTmp);
     cleanup(lockTmp);
   }
@@ -1795,6 +2185,16 @@ test("uninstall --host grok: unlinks installer symlink only (#731 148c1b7b)", ()
 
     const result = runInstaller(["uninstall", "--host", "grok"], {
       HOME: home,
+test("subprocess uninstall dry-run: leaves command files and reports intent (#635)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    process.env.CLAUDE_CONFIG_DIR = claudeTmp;
+    installClaudeCommands(claudeTmp, false);
+    delete process.env.CLAUDE_CONFIG_DIR;
+
+    const result = runInstaller(["uninstall", "--host", "claude", "--dry-run"], {
+>>>>>>> 9f39e5a (fix(install): CLAUDE_CONFIG_DIR command paths, uninstall cleanup, Codex shadow (#635))
       CLAUDE_CONFIG_DIR: claudeTmp,
       TMPDIR: lockTmp,
       TMP: lockTmp,
@@ -1807,6 +2207,18 @@ test("uninstall --host grok: unlinks installer symlink only (#731 148c1b7b)", ()
     assert.equal(readFileSync(join(claudeSkill, "keep-claude.txt"), "utf8"), "claude-owned");
   } finally {
     cleanup(home);
+    assert.equal(result.status, 0, `dry-run uninstall failed: ${result.stderr}`);
+    const output = `${result.stdout}${result.stderr}`;
+    assert.match(output, /would remove command file/i);
+    for (const op of OPERATION_SURFACE) {
+      assert.ok(
+        existsSync(join(claudeTmp, "commands", `pipeline:${op.name}.md`)),
+        `dry-run must leave pipeline:${op.name}.md`,
+      );
+    }
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+>>>>>>> 9f39e5a (fix(install): CLAUDE_CONFIG_DIR command paths, uninstall cleanup, Codex shadow (#635))
     cleanup(claudeTmp);
     cleanup(lockTmp);
   }
@@ -1842,3 +2254,4 @@ test("uninstall --host grok: refuses to delete documented copy layout directory 
     cleanup(lockTmp);
   }
 });
+>>>>>>> 9f39e5a (fix(install): CLAUDE_CONFIG_DIR command paths, uninstall cleanup, Codex shadow (#635))

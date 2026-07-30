@@ -10,7 +10,7 @@
 // install, `scripts/material-filter.mjs` must run against fixture JSONL and
 // emit material one-liners (the host skill preferred notify command).
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -126,6 +126,27 @@ try {
   run([shimScript, "--help"], env);
   // Documented host-skill material filter path must work from the installed tree.
   assertInstalledMaterialFilter(materialFilterScript, env);
+
+  // #635: command bodies must invoke the skill under the isolated config dir,
+  // not a hardcoded ~/.claude/skills/pipeline path.
+  const statusCmd = join(configDir, "commands", "pipeline:status.md");
+  if (!existsSync(statusCmd)) {
+    console.error(`ci-install-smoke: missing ${statusCmd}`);
+    process.exit(1);
+  }
+  const statusBody = readFileSync(statusCmd, "utf8");
+  const skillPath = join(configDir, "skills", "pipeline");
+  if (!statusBody.includes(skillPath)) {
+    console.error(
+      `ci-install-smoke: pipeline:status.md does not reference config-dir skill path ${skillPath}`,
+    );
+    process.exit(1);
+  }
+  if (statusBody.includes("~/.claude/skills/pipeline")) {
+    console.error("ci-install-smoke: pipeline:status.md still hardcodes ~/.claude/skills/pipeline");
+    process.exit(1);
+  }
+>>>>>>> 9f39e5a (fix(install): CLAUDE_CONFIG_DIR command paths, uninstall cleanup, Codex shadow (#635))
   // `update` refreshes the installed skill in place; running it twice must be
   // a net no-op (no error, shim still runs) — the documented remediation for
   // a stale install:version-freshness warning. --force: this smoke test's
@@ -139,6 +160,12 @@ try {
   run([installScript, "update", "--host", "claude", "--force"], env);
   run([shimScript, "--help"], env);
   run([installScript, "uninstall", "--host", "claude"], env);
+
+  // #635: uninstall must remove the command files it wrote, not only the skill dir.
+  if (existsSync(statusCmd)) {
+    console.error(`ci-install-smoke: uninstall left orphan command file ${statusCmd}`);
+    process.exit(1);
+  }
 } finally {
   rmSync(configDir, { recursive: true, force: true });
 }

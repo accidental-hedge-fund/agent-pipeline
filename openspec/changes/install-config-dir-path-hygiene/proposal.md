@@ -12,15 +12,19 @@ Three packaging footguns from the install audit leave non-default and Codex inst
 
 ## Acceptance criteria
 
-- [ ] With `CLAUDE_CONFIG_DIR=/custom/dir`, a Claude install writes each `pipeline:<op>.md` such that the skill path embedded in the command body is under `/custom/dir/skills/pipeline` (not `~/.claude/skills/pipeline`).
-- [ ] With `CLAUDE_CONFIG_DIR` unset, Claude install still writes command files under `~/.claude/commands/` that invoke the skill under `~/.claude/skills/pipeline` (or the absolute equivalent of that path).
+- [ ] With `CLAUDE_CONFIG_DIR=/custom/dir`, a Claude install writes **every** `pipeline:<op>.md` for `OPERATION_SURFACE` such that the skill path embedded in the command body is under `/custom/dir/skills/pipeline` (not `~/.claude/skills/pipeline`).
+- [ ] With `CLAUDE_CONFIG_DIR` unset, Claude install still writes command files under `~/.claude/commands/` that invoke the skill under the absolute home `.claude/skills/pipeline` path (tilde form not required).
+- [ ] When `CLAUDE_CONFIG_DIR` contains spaces/shell-significant characters, each command body’s `node …/pipeline.mjs` path is quoted/escaped so it remains a single path token.
 - [ ] After a Claude install that wrote `pipeline:*.md` command files, `uninstall --host claude` removes those command files from `<claudeBase>/commands/` and removes the skill directory.
-- [ ] Uninstall does not delete non-pipeline command files in `<claudeBase>/commands/`.
+- [ ] When the Claude skill directory is already absent but orphan `pipeline:<op>.md` files remain, uninstall still removes those command files and exits 0 (no early return).
+- [ ] Uninstall does not delete non-pipeline / non-`OPERATION_SURFACE` command files in `<claudeBase>/commands/`.
 - [ ] Dry-run uninstall reports that it would remove the Claude command files and does not delete them.
+- [ ] Dry-run install (Claude or Codex) with an unmanaged personal skill warns/reports intended relocation but does not rename the skill, write a marker, or write install files.
 - [ ] When an unmanaged Codex personal skill exists at the Codex install target (no `.pipeline-installer-managed` marker), install emits a shadow warning and offers/auto-relocates equivalently to Claude before overwriting.
-- [ ] When a Codex skill dir has the managed marker, install overwrites without a shadow warning.
-- [ ] Codex shadow paths honor `CODEX_HOME` (and existing Codex base resolution); no hardcoded `~/.codex` when the env override is set.
-- [ ] Regression tests cover config-dir command paths, uninstall cleanup, and Codex shadow detection; `npm run ci` is green.
+- [ ] When a Codex skill dir has the managed marker, install overwrites without a shadow warning; successful non-dry-run Codex install leaves the marker (staging-before-rename).
+- [ ] Codex shadow paths honor `CODEX_HOME` (and existing Codex base resolution via `dirname(skillsDir)`); no hardcoded `~/.codex` when the env override is set.
+- [ ] TTY decline of Codex relocation skips only the Codex host; non-TTY auto-relocates to a unique backup outside the skills scan path without overwriting an existing backup.
+- [ ] Regression tests cover the above; `node scripts/build.mjs --check` and `npm run ci` are green.
 
 ## Capabilities
 

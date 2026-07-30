@@ -214,18 +214,22 @@ const LOOP_ORCH_NOTE =
   "See the pipeline SKILL.md loop orchestration section for material event kinds. " +
   "`--audit` alone is read-only and synchronous (no Monitor).";
 
+/** POSIX single-quote a path so spaces and shell metacharacters stay one token. */
+export function shellSingleQuote(path) {
+  return `'${String(path).replace(/'/g, `'\\''`)}'`;
+}
+
 // Generate a Claude command markdown file for one operation entry.
 // `skillPath` is the path prefix used in the Invoke line (differs between
-// personal install and plugin install).
+// personal install and plugin install). The full script path is always
+// shell-single-quoted so CLAUDE_CONFIG_DIR values with spaces/metacharacters
+// remain a single argv token (#635).
 export function renderClaudeCommand(op, skillPath) {
   // Single-quote the argHint value so YAML parsers don't misinterpret [ or : characters.
   // None of the current argHint values contain single quotes, so '' escaping is not triggered.
   const argHintLine = op.argHint ? `argument-hint: '${op.argHint.replace(/'/g, "''")}'` : "";
-  const invocation = op.specialCli
-    ? `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``
-    : op.argHint
-    ? `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``
-    : `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``;
+  const scriptPath = shellSingleQuote(`${skillPath}/scripts/pipeline.mjs`);
+  const invocation = `\`node ${scriptPath} ${op.cliArgs}\``;
   // inRepoLoop takes priority over fast: multi-item loop drive/resume is not the
   // shared seconds/no-Monitor template (#668). LOOP_ORCH_NOTE covers early handoff
   // (#665) plus long-running event-follow orchestration.

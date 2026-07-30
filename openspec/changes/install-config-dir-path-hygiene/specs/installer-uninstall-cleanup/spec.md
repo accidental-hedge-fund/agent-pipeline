@@ -2,7 +2,7 @@
 
 ### Requirement: Claude uninstall removes installer-written command files
 
-Claude uninstall SHALL remove installer-written `pipeline:<name>.md` command files in addition to the skill directory. When `scripts/install.mjs uninstall --host claude` (or `--host all` when claude is included) runs, the uninstaller SHALL remove each `<claudeBase>/commands/pipeline:<name>.md` file corresponding to an operation in `OPERATION_SURFACE`, in addition to removing the skill directory `<claudeBase>/skills/pipeline` when present. Paths SHALL honor `CLAUDE_CONFIG_DIR` via the same `claudeBase` resolution used at install time. Missing individual command files SHALL NOT cause a non-zero exit (idempotent cleanup).
+Claude uninstall SHALL remove installer-written `pipeline:<name>.md` command files in addition to the skill directory. When `scripts/install.mjs uninstall --host claude` (or `--host all` when claude is included) runs, the uninstaller SHALL remove each `<claudeBase>/commands/pipeline:<name>.md` file corresponding to an operation in `OPERATION_SURFACE`, in addition to removing the skill directory `<claudeBase>/skills/pipeline` when present. Paths SHALL honor `CLAUDE_CONFIG_DIR` via the same `claudeBase` resolution used at install time. Missing individual command files SHALL NOT cause a non-zero exit (idempotent cleanup). Command cleanup SHALL run independently of skill-directory presence: the uninstaller MUST NOT return early solely because the skill directory is absent.
 
 #### Scenario: Uninstall after full Claude install
 
@@ -26,6 +26,7 @@ Claude uninstall SHALL remove installer-written `pipeline:<name>.md` command fil
 - **AND** `uninstall --host claude` is run (non-dry-run)
 - **THEN** those command files SHALL still be removed
 - **AND** the uninstall SHALL complete without a non-zero exit
+- **AND** the uninstaller SHALL NOT skip command cleanup because the skill directory was missing
 
 ### Requirement: Claude uninstall preserves non-pipeline command files
 
