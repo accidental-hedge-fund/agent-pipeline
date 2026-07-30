@@ -58,6 +58,10 @@ import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import { detectIgnoredArtifacts } from "../ignored-artifact-warning.ts";
+import {
+  includeLockfileSideEffects,
+  type LockfileSideEffectsDeps,
+} from "../lockfile-side-effects.ts";
 import * as openspec from "../openspec.ts";
 import * as last30days from "../last30days.ts";
 import { setLivePlanningMarker, clearLivePlanningMarker, isLivePlanningActive } from "../lock.ts";
@@ -1411,6 +1415,19 @@ export interface ResumeFromImplementingDeps {
   checkDocsFreshness?: typeof checkDocsFreshness;
   /** Deps forwarded into the default enforceDocsFreshness / checkDocsFreshness implementations. */
   docsFreshness?: DocsFreshnessDeps;
+  /**
+   * Lock-file side-effect inclusion deps (#722 / #358 parity). Folds uncommitted
+   * lock-file changes into HEAD before format/test gates so implement leftovers
+   * (`?? package-lock.json`, etc.) do not trip the pre-dirty check. When absent,
+   * the real implementation is used. Tests inject fakes so no real git runs.
+   */
+  lockfileSideEffects?: LockfileSideEffectsDeps;
+  /**
+   * Override for the lock-file fold call itself (order/call-site tests). Defaults
+   * to `includeLockfileSideEffects`. Prefer `lockfileSideEffects` for helper-level
+   * fakes; use this seam only when the test must assert invocation order.
+   */
+  includeLockfileSideEffects?: typeof includeLockfileSideEffects;
 }
 
 /**
@@ -1452,8 +1469,25 @@ export async function resumeFromImplementing(
   const fmtGateFn = deps.runFormatGate ?? runFormatGate;
   const gatesRunner = deps._runFormatAndTestGates ?? runFormatAndTestGates;
   const docsEnforce = deps.enforceDocsFreshness ?? enforceDocsFreshness;
+  const lockFold = deps.includeLockfileSideEffects ?? includeLockfileSideEffects;
 
   const branch = wt.branch;
+
+  // ---- Lock-file side-effect inclusion (#722 / #358 parity) ----
+  // After implement (or on resume with commits ahead) the worktree may still hold
+  // uncommitted lock-file side-effects (package-lock.json / yarn.lock /
+  // pnpm-lock.yaml). Fold them into HEAD before format/test gates so those
+  // gates see a clean worktree for locks. Not gated on this-process HEAD advance:
+  // resume may re-enter with leftover lock dirt and no recorded headBefore.
+  // No-op when no recognized lock is dirty (same helper as fix path).
+  {
+    const lockResult = await lockFold(wt.path, deps.lockfileSideEffects ?? {});
+    if (lockResult.included) {
+      console.log(
+        `[pipeline] #${issueNumber}: folded uncommitted lock file(s) into implement HEAD: ${lockResult.paths.join(", ")}`,
+      );
+    }
+  }
 
   // ---- Format + test gates to convergence (#182) ----
   // The format/lint gate runs BEFORE the test gate (so tests see formatted code)

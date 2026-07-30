@@ -67,6 +67,11 @@ export interface TestGateResult {
    *  wording, and by `runFormatAndTestGates` to map the block to the
    *  `build-failed` blocker kind instead of `test-gate-exhausted`. */
   buildFailure?: boolean;
+  /** True when `blockReason` reports a dirty-worktree trust refusal (pre-run or
+   *  post-run uncommitted changes) rather than a genuine test/build-command
+   *  failure (#722). Consumed by `testGateBlockReason` so dirty blocks are not
+   *  wrapped as "failed after N fix attempt(s)" / "command is still failing". */
+  dirtyWorktree?: boolean;
 }
 
 /** Signature of the harness `invoke` — injectable so the loop is unit-testable. */
@@ -334,6 +339,7 @@ export async function runTestGate(
       skipped: false,
       passed: false,
       attempts: 0,
+      dirtyWorktree: true,
       blockReason:
         "Worktree has uncommitted changes before the test gate ran. " +
         "All changes must be committed so test results can be trusted." +
@@ -366,6 +372,7 @@ export async function runTestGate(
         skipped: false,
         passed: false,
         attempts: 0,
+        dirtyWorktree: true,
         blockReason:
           "Test/build command left uncommitted changes in the working tree. " +
           "Commit any generated artifacts (snapshots, tsbuildinfo, lock-file updates) " +
@@ -444,6 +451,7 @@ export async function runTestGate(
         skipped: false,
         passed: false,
         attempts: attempt,
+        dirtyWorktree: true,
         blockReason: salvageFailureReason
           ? `${dirtyReason} Salvage of uncommitted work also failed: ${salvageFailureReason}`
           : dirtyReason,
@@ -515,6 +523,7 @@ export async function runTestGate(
           skipped: false,
           passed: false,
           attempts: attempt,
+          dirtyWorktree: true,
           blockReason:
             "Test/build command left uncommitted changes in the working tree. " +
             "Commit any generated artifacts (snapshots, tsbuildinfo, lock-file updates) " +
@@ -551,12 +560,13 @@ function toolingFailureBlockReason(output: string): string {
 }
 
 /** Format a gate failure into a markdown blocker comment body. Generic across
- *  the planning (pre-PR) and fix (pre-advance) seams. A tooling-failure block
- *  (#384) is already a fully-formed, self-describing message — returned as-is
- *  rather than wrapped in the ordinary test-failure wording, so the two stay
- *  distinguishable. */
+ *  the planning (pre-PR) and fix (pre-advance) seams. Tooling-failure (#384),
+ *  build-failure (#387), and dirty-worktree (#722) blocks are already fully-
+ *  formed, self-describing messages — returned as-is rather than wrapped in the
+ *  ordinary "failed after N fix attempt(s)" wording, so those causes stay
+ *  distinguishable from genuine test/build-command exhaustion. */
 export function testGateBlockReason(gate: TestGateResult): string {
-  if (gate.toolingFailure || gate.buildFailure) {
+  if (gate.toolingFailure || gate.buildFailure || gate.dirtyWorktree) {
     return gate.blockReason ?? "(no output captured)";
   }
   return (
