@@ -569,13 +569,67 @@ export function activeChangeIdsFromContentsEntries(entries: unknown): string[] {
 }
 
 /**
+ * True when stderr/message looks like an HTTP 404-class response (status signal).
+ * Pure; exported for unit tests. Does **not** by itself mean "path missing" —
+ * GitHub also 404s private resources when the token lacks access (#714 delta).
+ */
+export function isHttp404Signal(stderr: string): boolean {
+  const s = stderr.toLowerCase();
+  return (
+    s.includes("http 404") ||
+    s.includes("status code: 404") ||
+    s.includes("status code 404") ||
+    /(?:^|[^0-9])404(?:[^0-9]|$)/.test(s)
+  );
+}
+
+/**
+ * True when the error is clearly auth/permission rather than "path not on tip".
+ * Pure; exported for unit tests. Such errors must fail closed — never map to [].
+ */
+export function isGithubAuthOrPermissionError(stderr: string): boolean {
+  const s = stderr.toLowerCase();
+  return (
+    s.includes("http 401") ||
+    s.includes("http 403") ||
+    s.includes("status code: 401") ||
+    s.includes("status code: 403") ||
+    s.includes("bad credentials") ||
+    s.includes("resource not accessible") ||
+    s.includes("authentication") ||
+    s.includes("permission denied") ||
+    s.includes("must have push access") ||
+    s.includes("required scopes")
+  );
+}
+
+/**
+ * Whether a failed `openspec/changes` Contents list may be treated as empty.
+ * Only when the error is a 404-class signal, is **not** auth/permission-shaped,
+ * **and** a tip-root Contents probe already succeeded (proves the tip is listable
+ * with current credentials). Pure; exported for unit tests (#714 delta 4706fcc2).
+ */
+export function shouldTreatContents404AsEmpty(
+  openspecErrorMessage: string,
+  tipRootListSucceeded: boolean,
+): boolean {
+  if (!tipRootListSucceeded) return false;
+  if (isGithubAuthOrPermissionError(openspecErrorMessage)) return false;
+  return isHttp404Signal(openspecErrorMessage);
+}
+
+/**
  * Active OpenSpec change ids present on the reviewed PR head tree (tip membership).
  *
  * Lists `openspec/changes/` via the GitHub Contents API at the PR head SHA — the
  * authoritative final tree, not a cumulative PR changed-file list. Archive-path
  * subtraction on cumulative paths can mask a reintroduced `openspec/changes/<id>/`
- * when both path families appear in the PR (#714 review 2). 404 (path missing on
- * tip) → []. Other API/auth failures throw so callers fail closed.
+ * when both path families appear in the PR (#714 review 2).
+ *
+ * Missing `openspec/changes` on a **readable** tip → []. Auth/permission failures
+ * and ambiguous 404s (tip root also unlistable) throw so callers fail closed —
+ * never invent an empty active set from a bare "404"/"not found" substring
+ * (#714 pre-merge delta override-key 4706fcc2).
  */
 export async function listPrHeadChangeDirs(
   cfg: PipelineConfig,
@@ -586,16 +640,36 @@ export async function listPrHeadChangeDirs(
   if (!ref) {
     throw new Error(`PR #${prNumber} has no head SHA — cannot list OpenSpec tip-tree change dirs`);
   }
+  const refQ = encodeURIComponent(ref);
   let stdout: string;
   try {
     stdout = await ghRun(
-      ["api", `repos/${cfg.repo}/contents/openspec/changes?ref=${encodeURIComponent(ref)}`],
+      ["api", `repos/${cfg.repo}/contents/openspec/changes?ref=${refQ}`],
       { retries: 1 },
     );
   } catch (err) {
-    const msg = ((err as Error).message ?? "").toLowerCase();
-    // Missing openspec/changes on the tip is an empty active set, not a probe failure.
-    if (msg.includes("404") || msg.includes("not found")) return [];
+    const msg = (err as Error).message ?? "";
+    // Auth/permission: fail closed immediately (do not map to []).
+    if (isGithubAuthOrPermissionError(msg)) throw err;
+    // Only 404-class signals may mean "path absent on tip" — still confirm tip root.
+    if (!isHttp404Signal(msg)) throw err;
+    let tipRootOk = false;
+    try {
+      await ghRun(
+        ["api", `repos/${cfg.repo}/contents/?ref=${refQ}`],
+        { retries: 1 },
+      );
+      tipRootOk = true;
+    } catch (probeErr) {
+      const probeMsg = ((probeErr as Error).message ?? "").trim();
+      throw new Error(
+        `listPrHeadChangeDirs: openspec/changes unavailable for PR #${prNumber} ` +
+          `and tip root is not listable at ${ref.slice(0, 12)} — failing closed ` +
+          `(possible auth/permission obscuring 404). openspec: ${msg.trim()}; ` +
+          `tip-root: ${probeMsg || "unknown"}`,
+      );
+    }
+    if (shouldTreatContents404AsEmpty(msg, tipRootOk)) return [];
     throw err;
   }
   let parsed: unknown;
