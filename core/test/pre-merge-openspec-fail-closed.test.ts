@@ -68,8 +68,11 @@ test("maybeArchiveOpenspec: candidate probe (git diff) exits non-zero → blocke
   const deps: AdvancePreMergeDeps = {
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => true,
+    // Without prNumber, shared-set probe is post-sync git diff (#714). Cleanliness +
+    // base sync succeed; the probe itself fails closed.
     gitInWorktree: (async (_p: string, args: string[]) => {
       if (args[0] === "diff") return { stdout: "", stderr: "fatal: bad revision 'origin/main...HEAD'", code: 128 };
+      if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
       return { stdout: "", stderr: "", code: 0 };
     }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => false,
@@ -79,6 +82,7 @@ test("maybeArchiveOpenspec: candidate probe (git diff) exits non-zero → blocke
     }) as AdvancePreMergeDeps["setBlocked"],
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
     branchDeveloperCommits: async () => [],
+    trustedReviewAuthor: "test-actor",
   };
 
   let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
@@ -165,6 +169,7 @@ test("maybeArchiveOpenspec: openspec archive fails on a retitled MODIFIED header
     gitInWorktree: (async (_p: string, args: string[]) => {
       if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
       if (args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+      if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
       return { stdout: "", stderr: "", code: 0 };
     }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => true,
@@ -373,6 +378,7 @@ test("advance(): override-resumed pre-merge (blocking delta-review key overridde
   const archiveCalls: string[] = [];
   const pushed: string[][] = [];
   const transitions: Array<{ from: string; to: string }> = [];
+  const activeDirs = new Set([CHANGE_ID]);
 
   const deps: AdvancePreMergeDeps = {
     getPrForIssue: async () => PR,
@@ -385,6 +391,8 @@ test("advance(): override-resumed pre-merge (blocking delta-review key overridde
     getPrDetail: (async () => ({ head_sha: SHA_HEAD, mergeable: true, mergeable_state: "CLEAN" })) as AdvancePreMergeDeps["getPrDetail"],
     getPrCommits: async () => [],
     getPrChecks: (async () => [{ name: "ci", bucket: "pass" }]) as AdvancePreMergeDeps["getPrChecks"],
+    // Shared active-change set comes from PR tip (#714); must not hit network.
+    getPrDiff: async () => `diff --git a/${CHANGE_PATH} b/${CHANGE_PATH}\n`,
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => true,
     gitInWorktree: (() => {
@@ -399,13 +407,15 @@ test("advance(): override-resumed pre-merge (blocking delta-review key overridde
             ? { stdout: ` M openspec/specs/${CHANGE_ID}/spec.md`, stderr: "", code: 0 }
             : { stdout: "", stderr: "", code: 0 };
         }
+        if (args[0] === "rev-parse") return { stdout: SHA_HEAD, stderr: "", code: 0 };
         if (args[0] === "push") { pushed.push(args); return { stdout: "", stderr: "", code: 0 }; }
         return { stdout: "", stderr: "", code: 0 };
       }) as AdvancePreMergeDeps["gitInWorktree"];
     })(),
-    changeDirExists: () => true,
+    changeDirExists: (_d, id) => activeDirs.has(id),
     openspecArchive: (async (_w: string, id: string) => {
       archiveCalls.push(id);
+      activeDirs.delete(id);
       return { success: true, unavailable: false, output: "" };
     }) as AdvancePreMergeDeps["openspecArchive"],
     branchDeveloperCommits: async () => [],
@@ -437,7 +447,10 @@ test("maybeArchiveOpenspec: records a gate_result event when skipped (no-candida
   const deps: AdvancePreMergeDeps = {
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => true,
-    gitInWorktree: (async () => ({ stdout: "", stderr: "", code: 0 })) as AdvancePreMergeDeps["gitInWorktree"],
+    gitInWorktree: (async (_p: string, args: string[]) => {
+      if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => false,
     setBlocked: async () => {},
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
@@ -458,6 +471,7 @@ test("maybeArchiveOpenspec: records a gate_result event when archived", async (t
   const appended: string[] = [];
   const CHANGE_ID = "some-change";
   const CHANGE_PATH = `openspec/changes/${CHANGE_ID}/proposal.md`;
+  const activeDirs = new Set([CHANGE_ID]);
   const deps: AdvancePreMergeDeps = {
     getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
     openspecIsActive: () => true,
@@ -471,11 +485,15 @@ test("maybeArchiveOpenspec: records a gate_result event when archived", async (t
             ? { stdout: ` M openspec/specs/${CHANGE_ID}/spec.md`, stderr: "", code: 0 }
             : { stdout: "", stderr: "", code: 0 };
         }
+        if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
         return { stdout: "", stderr: "", code: 0 };
       }) as AdvancePreMergeDeps["gitInWorktree"];
     })(),
-    changeDirExists: () => true,
-    openspecArchive: (async () => ({ success: true, unavailable: false, output: "" })) as AdvancePreMergeDeps["openspecArchive"],
+    changeDirExists: (_d, id) => activeDirs.has(id),
+    openspecArchive: (async (_w, id) => {
+      activeDirs.delete(id);
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
     setBlocked: async () => {},
     getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
     branchDeveloperCommits: async () => [],
@@ -503,6 +521,7 @@ test("maybeArchiveOpenspec: records a gate_result event when blocked (archive CL
     openspecIsActive: () => true,
     gitInWorktree: (async (_p: string, args: string[]) => {
       if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
+      if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
       return { stdout: "", stderr: "", code: 0 };
     }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => true,

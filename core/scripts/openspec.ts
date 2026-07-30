@@ -267,13 +267,29 @@ export function changeIdsFromPaths(paths: string[]): string[] {
 }
 
 /**
- * Change ids the PR still carries active (unarchived) at HEAD, computed purely
- * from the PR's changed-file list — never the local worktree filesystem (#467).
- * `activeIds` = ids appearing as `openspec/changes/<id>/…` (id ≠ `archive`);
- * `archivedIds` = ids appearing as `openspec/changes/archive/<id>/…`. Returns
- * `activeIds \ archivedIds`. Worktree-independent by construction: it holds
- * identically on a first run, an override-resumed run, a fresh process, or
- * after the worktree has been removed.
+ * Map an OpenSpec archive folder name to the change id it corresponds to.
+ * Real archives use date-prefixed dirs (`YYYY-MM-DD-<id>`); bare ids are kept.
+ * Pure; exported for tests.
+ */
+export function changeIdFromArchiveFolderName(folder: string): string {
+  const m = folder.match(/^\d{4}-\d{2}-\d{2}-(.+)$/);
+  return m ? m[1] : folder;
+}
+
+/**
+ * Shared active-change set for a PR head path list (#714 / #467).
+ *
+ * Single source of truth for both pre-merge archive candidate discovery and the
+ * residual still-active guard: pure over path strings, never the local worktree.
+ *
+ * - `activeIds` = ids appearing as `openspec/changes/<id>/…` (id ≠ `archive`)
+ * - `archivedIds` = ids from `openspec/changes/archive/<folder>/…`, with
+ *   date-prefixed folders (`YYYY-MM-DD-<id>`) normalized to bare `<id>`
+ * - returns `activeIds \ archivedIds` (stable sort for deterministic reasons)
+ *
+ * Dual-outcome fingerprints this helper is meant to end (see #714):
+ * - #626 skip→block: worktree candidate probe empty while this set is non-empty
+ * - #675 partial multi-pass: pass listed ids not cleared from this residual set
  */
 export function unarchivedChangeIdsFromPrFiles(paths: string[]): string[] {
   const active = new Set<string>();
@@ -282,14 +298,23 @@ export function unarchivedChangeIdsFromPrFiles(paths: string[]): string[] {
     const p = raw.replace(/\\/g, "/");
     const archivedMatch = p.match(/(?:^|\/)openspec\/changes\/archive\/([^/]+)\//);
     if (archivedMatch) {
+      // Record both the raw folder name and the date-stripped change id so
+      // `archive/foo/` and `archive/2026-07-30-foo/` both clear active `foo`.
       archived.add(archivedMatch[1]);
+      archived.add(changeIdFromArchiveFolderName(archivedMatch[1]));
       continue;
     }
     const activeMatch = p.match(/(?:^|\/)openspec\/changes\/([^/]+)\//);
     if (activeMatch && activeMatch[1] !== "archive") active.add(activeMatch[1]);
   }
-  return [...active].filter((id) => !archived.has(id));
+  return [...active].filter((id) => !archived.has(id)).sort();
 }
+
+/**
+ * Alias for the shared active-change set helper (#714). Prefer this name at
+ * call sites that drive archive candidates or residual membership together.
+ */
+export const sharedActiveChangeIdsFromPaths = unarchivedChangeIdsFromPrFiles;
 
 /**
  * Pure parser. Exit code is the source of truth for pass/fail (0 = valid). The
