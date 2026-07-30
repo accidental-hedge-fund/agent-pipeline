@@ -1731,6 +1731,16 @@ export const PIPELINE_COMMENT_KINDS: readonly {
     verify: "pipeline-attest",
   },
   {
+    kind: "pre-merge-autofix-noop",
+    heading: "## Pipeline: Pre-merge auto-fix no-op",
+    verify: "pipeline-attest",
+  },
+  {
+    kind: "pre-merge-autofix-attempt",
+    heading: "## Pipeline: Pre-merge auto-fix attempt",
+    verify: "pipeline-attest",
+  },
+  {
     kind: "needs-human-decision",
     heading: "## Pipeline: Human decision required",
     verify: "pipeline-attest",

@@ -299,8 +299,9 @@ include the `Issue:`/`Pipeline-Run:` traceability trailers, it SHALL be pushed t
 SHALL be subjected to the pre-merge delta review-SHA gate (re-review). Salvage here SHALL reuse the
 shared salvage helper (staging the whole worktree minus `node_modules` and pipeline-internal marker
 files) and SHALL NOT bypass re-review. When the worktree is genuinely clean (nothing to salvage), the
-existing fail-closed rollback (`git reset --hard` + `git clean -fd`) and `error` return SHALL be
-unchanged.
+pipeline SHALL NOT create a salvage commit; it SHALL expose a distinct **noop-clean** outcome (after
+any no-op rollback) so the pre-merge stage can re-verify findings against HEAD rather than treating
+the clean tree as an immediate unrecoverable hard block.
 
 #### Scenario: Pre-merge auto-fix harness leaves uncommitted work — salvaged, pushed, re-reviewed
 
@@ -322,13 +323,14 @@ unchanged.
 - **THEN** the pipeline SHALL attempt salvage before any `git reset --hard` rollback
 - **AND** SHALL NOT discard the uncommitted work when salvage succeeds
 
-#### Scenario: Pre-merge auto-fix worktree is clean — existing fail-closed rollback unchanged
+#### Scenario: Pre-merge auto-fix worktree is clean — noop-clean for re-verify, no salvage commit
 
 - **WHEN** the pre-merge bounded auto-fix harness exits with no new commit
 - **AND** `git status --porcelain` reports the worktree is clean (nothing salvageable)
 - **THEN** the pipeline SHALL NOT create a salvage commit
-- **AND** SHALL follow the existing rollback (`git reset --hard <headBefore>` + `git clean -fd`) and
-  return `error` as today
+- **AND** SHALL expose a distinct noop-clean outcome (not a silent success)
+- **AND** SHALL NOT treat the clean no-commit alone as sufficient to set `blocked`/`needs-human`
+  without the pre-merge clean-noop re-verify path
 
 #### Scenario: Salvaged pre-merge fix respects the one-attempt bound
 
@@ -444,18 +446,22 @@ The pipeline SHALL NOT report a silent clean / no-op outcome (for example a bare
 harness exits (success, crash, or timeout) leaving the inspected worktree clean with no new
 commit (`headAfter === headBefore` and `git status --porcelain` empty). In that case the
 pipeline SHALL emit a diagnostic that names the inspected worktree path and states that the
-harness ran but no recoverable work was found there, and SHALL escalate the item to
-`needs-human`. The existing fail-closed rollback mechanics and the `#547` salvage behavior for a
-dirty worktree SHALL be unchanged; this requirement adds disclosure to the clean/no-commit
-escalation only and SHALL NOT extend salvage coverage.
+harness ran but no recoverable work was found there. That disclosure SHALL feed the pre-merge
+**clean-noop re-verify** path (`pre-merge-fix-round`): the pipeline SHALL re-verify blocking
+findings against the current head and SHALL escalate to `needs-human` only when re-verify still
+finds blocking defects (or re-verify is unavailable and fail-closed rules require escalation) —
+not solely because the worktree was clean. The existing fail-closed rollback mechanics and the
+`#547` salvage behavior for a dirty worktree SHALL be unchanged; this requirement preserves
+disclosure for the clean/no-commit case and defers terminal disposition to re-verify.
 
-#### Scenario: Harness ran but worktree is clean with no commit — loud escalation naming the worktree
+#### Scenario: Harness ran but worktree is clean with no commit — loud disclosure then re-verify
 
 - **WHEN** the pre-merge fix harness for issue N exits and the inspected worktree is clean with
   no new commit (nothing for salvage to recover)
 - **THEN** the pipeline SHALL emit a diagnostic that includes the inspected worktree path and
   states the harness produced no recoverable work in that worktree
-- **AND** the pipeline SHALL escalate the item to `needs-human`
+- **AND** the pipeline SHALL enter the clean-noop re-verify path rather than immediately
+  treating the clean tree as terminal `needs-human`
 - **AND** the pipeline SHALL NOT report a silent success / no-op outcome for the step
 
 #### Scenario: Dirty-worktree salvage and rollback mechanics are unchanged
@@ -468,8 +474,13 @@ escalation only and SHALL NOT extend salvage coverage.
 
 #### Scenario: Disclosure regression test bites
 
-- **WHEN** the disclosure is removed so the clean/no-commit pre-merge path escalates without
-  naming the inspected worktree (reverting to the silent no-op)
-- **THEN** the regression test asserting the escalation diagnostic contains the inspected
-  worktree path SHALL fail
+- **WHEN** the disclosure is removed so the clean/no-commit pre-merge path proceeds or escalates
+  without naming the inspected worktree (reverting to the silent no-op)
+- **THEN** the regression test asserting the diagnostic contains the inspected worktree path
+  SHALL fail
+
+#### Scenario: Immediate hard-block on clean no-commit without re-verify is a regression
+
+- **WHEN** the clean no-commit path sets `needs-human` without invoking re-verify
+- **THEN** the clean-noop re-verify regression tests in `pre-merge-fix-round` SHALL fail
 

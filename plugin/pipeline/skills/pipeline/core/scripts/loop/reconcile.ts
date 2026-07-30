@@ -29,7 +29,7 @@ import {
   parseChecksAggregate,
 } from "../gh.ts";
 import { getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
-import { pipelineStageFromLabels } from "./precondition.ts";
+import { isBlockedInLabels, pipelineStageFromLabels } from "./precondition.ts";
 import {
   LoopError,
   isLoopAuthorityGate,
@@ -212,6 +212,7 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
   const issue = await deps.getIssueStateAndLabels(issueNumber);
   const issue_open = issue?.state === "open";
   const ready_label_present = issue?.labels.includes(READY_LABEL) ?? false;
+  const blocked_label_present = isBlockedInLabels(issue?.labels ?? []);
   const pipeline_stage = pipelineStageFromLabels(issue?.labels ?? []);
 
   let pr_number: number | null = null;
@@ -247,6 +248,7 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
     issue_number: issueNumber,
     issue_open,
     ready_label_present,
+    blocked_label_present,
     pr_number,
     pr_state,
     head_branch,
@@ -362,6 +364,10 @@ export function computeNextAction(
   if (drift === "ledger-behind") return "repair-forward";
   if (drift === "ledger-ahead" || drift === "external-absent" || drift === "identity-mismatch") return "hold-for-human";
   if (drift === "checks-regressed") return identity.checks_conclusion === "pending" ? "await-checks" : "hold-for-human";
+  // Live GitHub blocked label (#698 / loop-blocked-item-hold-continuation): do
+  // not advertise actionable `advance` while the issue still carries `blocked`
+  // and no unblock path has cleared it. Hold until labels show clear.
+  if (identity.blocked_label_present) return "hold-for-human";
 
   switch (state) {
     case "pr_opened":
