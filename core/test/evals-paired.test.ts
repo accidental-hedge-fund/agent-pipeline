@@ -1031,6 +1031,42 @@ test("collectPairedWorktreeDiff: includes >50 untracked files and fails closed o
   }
 });
 
+test("collectPairedWorktreeDiff: tracked git-diff error rejects partial stdout (#601 8c015b1f)", async () => {
+  const { collectPairedWorktreeDiff } = await import("../scripts/evals/executor.ts");
+  const partial = "diff --git a/a.ts b/a.ts\n@@ -1 +1 @@\n-old\n+new\n";
+  const err = Object.assign(new Error("git diff textconv failed"), {
+    code: 128,
+    killed: false,
+    signal: undefined,
+    stdout: partial,
+  });
+
+  await assert.rejects(
+    () =>
+      collectPairedWorktreeDiff({
+        worktreeDir: "/fake/wt",
+        baseSha: "abc123",
+        execFile: async (_file, args) => {
+          // Tracked path is `git diff <baseSha>` (no --no-index).
+          if (args[0] === "diff" && !args.includes("--no-index")) {
+            throw err;
+          }
+          return { stdout: "" };
+        },
+      }),
+    (e: Error) => {
+      assert.match(e.message, /failed to collect tracked worktree diff/);
+      assert.match(e.message, /partial stdout discarded/);
+      assert.doesNotMatch(
+        e.message,
+        new RegExp(partial.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        "partial tracked stdout must not be treated as complete review input",
+      );
+      return true;
+    },
+  );
+});
+
 test("fixture allows generator-owned plugin/ paths in allowed_change_paths", () => {
   const fixture = validateFixture(
     {

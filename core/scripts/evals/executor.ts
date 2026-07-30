@@ -372,6 +372,13 @@ async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: stri
  *  reviewer input (#601 review 2 8c015b1f). */
 export const PAIRED_DIFF_MAX_BYTES = 20 * 1024 * 1024;
 
+/** Injectable execFile seam for {@link collectPairedWorktreeDiff} tests. */
+export type CollectPairedDiffExec = (
+  file: string,
+  args: readonly string[],
+  options?: { cwd?: string; timeout?: number; maxBuffer?: number },
+) => Promise<{ stdout: string; stderr?: string }>;
+
 /**
  * Collect the full unified diff of the worktree vs baseSha for paired-mode review.
  * Includes every untracked (non-ignored) path — never silently truncates the
@@ -380,14 +387,25 @@ export const PAIRED_DIFF_MAX_BYTES = 20 * 1024 * 1024;
  * stdout, or total size over {@link PAIRED_DIFF_MAX_BYTES}) so the pair loop
  * records infra_error rather than grading a partial review body
  * (#601 review 1/2 8c015b1f). A legitimate empty worktree returns "".
+ *
+ * Tracked `git diff <baseSha>` (no `--exit-code`) MUST exit 0 for a complete
+ * result. Nonzero exit is a collection failure even when stdout is nonempty —
+ * partial stdout after a mid-stream error must not be graded as the full diff.
+ * Untracked paths still use `git diff --no-index`, which exits 1 when files
+ * differ and is the only documented complete-output nonzero case here.
  */
 export async function collectPairedWorktreeDiff(args: {
   worktreeDir: string;
   baseSha: string;
+  /** Test seam — defaults to promisified child_process.execFile. */
+  execFile?: CollectPairedDiffExec;
 }): Promise<string> {
-  const { execFile } = await import("node:child_process");
-  const { promisify } = await import("node:util");
-  const execFileAsync = promisify(execFile);
+  let execFileAsync = args.execFile;
+  if (!execFileAsync) {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    execFileAsync = promisify(execFile) as CollectPairedDiffExec;
+  }
   let tracked: string;
   try {
     // Include unstaged/untracked worktree edits the primary made without committing
@@ -399,20 +417,26 @@ export async function collectPairedWorktreeDiff(args: {
     });
     tracked = result.stdout;
   } catch (err) {
-    const e = err as { message?: string; code?: string; killed?: boolean; signal?: string; stdout?: string };
-    // git diff can exit non-zero for rare cases; only accept when stdout is present
-    // and the process was not killed for size/time.
-    if (typeof e.stdout === "string" && e.stdout.length > 0 && !e.killed && !e.signal) {
-      tracked = e.stdout;
-    } else {
-      throw new Error(
-        `failed to collect tracked worktree diff vs ${args.baseSha}` +
-          (e.code ? ` (code=${e.code})` : "") +
-          (e.killed ? " (killed)" : "") +
-          (e.signal ? ` (signal=${e.signal})` : "") +
-          `: ${e.message ?? String(err)}`,
-      );
-    }
+    const e = err as {
+      message?: string;
+      code?: string | number;
+      killed?: boolean;
+      signal?: string;
+      stdout?: string;
+    };
+    // Plain `git diff <base>` without --exit-code exits 0 on success (even when
+    // files differ). Any rejected invocation is incomplete review input —
+    // never accept partial stdout (#601 review 8c015b1f).
+    throw new Error(
+      `failed to collect tracked worktree diff vs ${args.baseSha}` +
+        (e.code !== undefined ? ` (code=${e.code})` : "") +
+        (e.killed ? " (killed)" : "") +
+        (e.signal ? ` (signal=${e.signal})` : "") +
+        (typeof e.stdout === "string" && e.stdout.length > 0
+          ? " (partial stdout discarded)"
+          : "") +
+        `: ${e.message ?? String(err)}`,
+    );
   }
 
   let namesOut: string;
