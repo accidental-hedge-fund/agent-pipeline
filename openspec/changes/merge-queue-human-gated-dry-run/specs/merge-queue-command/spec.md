@@ -69,6 +69,13 @@ issue to an open PR via the authoritative issue→PR resolver (`getPrForIssue`
 semantics: branch-prefix or closing references, not body-text mention), and
 build the **merge-candidate** list from PRs that are mergeable and clean.
 
+Milestone-issue discovery and open-PR resolution SHALL be **exhaustive** (paginate
+to completion; no hard first-page / first-500 truncation). `missing-pr` SHALL be
+emitted only after a completed successful search finds no open linked PR.
+Command, API, authentication, and parse failures during discovery or resolution
+SHALL fail the dry-run (non-zero / thrown error) rather than masquerading as
+`missing-pr` or an empty successful plan.
+
 A PR SHALL be excluded from the merge-candidate list when any of the following
 hold:
 
@@ -97,9 +104,29 @@ because filtered earlier; `missing-pr`; `wrong-base`; `non-mergeable`;
 
 #### Scenario: Missing open PR is excluded
 - **WHEN** an issue carries `pipeline:ready-to-deploy` and matches the milestone
-- **AND** the authoritative resolver returns no open PR
+- **AND** the authoritative resolver returns no open PR after a completed
+  exhaustive search
 - **THEN** that issue SHALL NOT appear in the merge-candidate list
 - **AND** dry-run SHALL report it as skipped with reason `missing-pr`
+
+#### Scenario: Milestone issues beyond a first-page/500 cap are still discovered
+- **WHEN** a milestone has more than 500 open issues including an R2D issue past
+  the first 500
+- **THEN** discovery SHALL still include that issue in the selector-matched set
+- **AND** SHALL NOT truncate the list with a hard `--limit 500` (or equivalent)
+
+#### Scenario: Open PR beyond the first 100 open PRs is still resolved
+- **WHEN** an R2D issue's linked open PR falls outside the first 100 open PRs in
+  repository list order
+- **THEN** the authoritative paginated resolver SHALL still resolve that PR
+- **AND** the issue SHALL NOT be reported as `missing-pr` solely due to list truncation
+
+#### Scenario: Resolver or discovery failure fails closed
+- **WHEN** milestone listing or issue→PR resolution fails due to authentication,
+  rate limit, timeout, GraphQL/API error, or unparseable output
+- **THEN** the dry-run SHALL abort with a non-zero failure (propagated error)
+- **AND** SHALL NOT report the affected issues as `missing-pr`
+- **AND** SHALL NOT exit 0 with a trusted-looking incomplete plan
 
 #### Scenario: Non-mergeable PR is excluded
 - **WHEN** the linked open PR has `mergeable: "CONFLICTING"` or

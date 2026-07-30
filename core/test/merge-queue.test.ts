@@ -15,9 +15,15 @@ import {
   isMergeableClean,
   evaluateChecksGate,
   recoverGhPrChecksFromExecError,
+  listMilestonesApiArgs,
+  listMilestoneOpenIssuesApiArgs,
+  findMilestoneNumberByTitle,
+  parseMilestonesPages,
+  parseMilestoneIssuesPages,
   type MergeQueueDeps,
   type RequiredCheck,
   type MergeQueueIssue,
+  type MilestoneIssueApiRaw,
 } from "../scripts/stages/merge_queue.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -161,6 +167,106 @@ test("merge-queue: missing PR is skipped with reason missing-pr", async () => {
   assert.equal(plan.skips[0].reason, "missing-pr");
   assert.equal(plan.skips[0].issueNumber, 20);
   assert.equal(plan.skips[0].prNumber, null);
+});
+
+// ---------------------------------------------------------------------------
+// Exhaustive discovery + fail-closed resolver (#673 review-2)
+// ---------------------------------------------------------------------------
+
+test("merge-queue: milestone discovery args paginate without a hard 500-issue cap", () => {
+  const msArgs = listMilestonesApiArgs("owner/repo");
+  assert.ok(msArgs.includes("--paginate"), "milestones must paginate to completion");
+  assert.ok(msArgs.includes("--slurp"), "milestones must --slurp multi-page JSON");
+  assert.ok(!msArgs.includes("--limit"), "must not use gh issue list --limit");
+  assert.ok(!msArgs.some((a) => a === "500"), "must not hard-cap at 500");
+
+  const issueArgs = listMilestoneOpenIssuesApiArgs("owner/repo", 12);
+  assert.ok(issueArgs.includes("--paginate"), "milestone issues must paginate");
+  assert.ok(issueArgs.includes("--slurp"));
+  assert.ok(
+    issueArgs.some((a) => a.includes("milestone=12")),
+    "must filter by milestone number",
+  );
+  assert.ok(!issueArgs.includes("--limit"));
+  assert.ok(!issueArgs.some((a) => a === "500"));
+});
+
+test("merge-queue: parseMilestoneIssuesPages keeps issues beyond the first 500", () => {
+  // 6 pages × 100 = 600 open issues — the old `gh issue list --limit 500` would
+  // drop 501–600 and silently omit eligible R2D queue entries.
+  const pages: MilestoneIssueApiRaw[][] = Array.from({ length: 6 }, (_, pageIdx) =>
+    Array.from({ length: 100 }, (__, i) => {
+      const n = pageIdx * 100 + i + 1;
+      return {
+        number: n,
+        labels: [{ name: n === 501 ? "pipeline:ready-to-deploy" : "pipeline:pre-merge" }],
+      };
+    }),
+  );
+  const issues = parseMilestoneIssuesPages(pages);
+  assert.equal(issues.length, 600, "must retain every issue across pages");
+  const beyond = issues.find((i) => i.number === 501);
+  assert.ok(beyond, "issue #501 (beyond the old 500 cap) must survive");
+  assert.ok(beyond.labels.includes("pipeline:ready-to-deploy"));
+});
+
+test("merge-queue: plan includes R2D issue beyond position 500 when deps return it", async () => {
+  // Planner-side coverage: when discovery yields issue 501, it must not be dropped
+  // by selection (complements parseMilestoneIssuesPages above).
+  const deps = makeDeps([
+    CLEAN_R2D(501, 1501, "sha-beyond-500"),
+    CLEAN_R2D(3, 30, "sha-early"),
+  ]);
+  const plan = await planMergeQueue({ milestone: "v1", baseBranch: "main" }, deps);
+  assert.deepEqual(
+    plan.candidates.map((c) => c.issueNumber),
+    [3, 501],
+  );
+  assert.equal(plan.candidates[1].prNumber, 1501);
+});
+
+test("merge-queue: parseMilestonesPages + findMilestoneNumberByTitle resolve across pages", () => {
+  const pages = [
+    Array.from({ length: 100 }, (_, i) => ({ number: i + 1, title: `m-${i + 1}` })),
+    [{ number: 101, title: "v1.28.2" }],
+  ];
+  const all = parseMilestonesPages(pages);
+  assert.equal(all.length, 101);
+  assert.equal(findMilestoneNumberByTitle(all, "v1.28.2"), 101);
+  assert.equal(findMilestoneNumberByTitle(all, "missing"), null);
+});
+
+test("merge-queue: getPrForIssue rejection aborts planning instead of missing-pr", async () => {
+  const deps = makeDeps([CLEAN_R2D(77, 770)]);
+  deps.getPrForIssue = async () => {
+    throw new Error("gh auth failed: HTTP 401");
+  };
+  await assert.rejects(
+    () => planMergeQueue({ milestone: "v1" }, deps),
+    (err: Error) => {
+      assert.match(err.message, /auth failed|401/i);
+      return true;
+    },
+  );
+  // runMergeQueueDryRun must also surface the failure (not exit 0 with a plan).
+  await assert.rejects(
+    () => runMergeQueueDryRun({ milestone: "v1" }, deps, () => {}),
+    /auth failed|401/i,
+  );
+});
+
+test("merge-queue: open PR resolved beyond first-100 window is still a candidate", async () => {
+  // Production getPrForIssue delegates to gh.ts paginated GraphQL (#623); this
+  // proves the planner accepts a PR number that only exists past a -L 100 window
+  // (resolver fixture returns that number for the sole R2D issue).
+  const deps = makeDeps([
+    CLEAN_R2D(623, 9999, "sha-beyond-100-open"), // PR #9999 stands in for "past page 1"
+  ]);
+  const plan = await planMergeQueue({ milestone: "v1", baseBranch: "main" }, deps);
+  assert.equal(plan.candidates.length, 1);
+  assert.equal(plan.candidates[0].prNumber, 9999);
+  assert.equal(plan.candidates[0].issueNumber, 623);
+  assert.equal(plan.skips.length, 0);
 });
 
 // ---------------------------------------------------------------------------
