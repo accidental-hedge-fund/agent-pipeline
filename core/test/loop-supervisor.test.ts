@@ -2499,3 +2499,138 @@ test("supervisor terminal linkage on rejected dispatch omits fabricated events p
   assert.equal(ok!.data.pipeline_run_id, "200-2026-07-29T00-00-00-000Z");
   assert.equal(ok!.data.outcome, "ready_to_deploy");
 });
+
+// ---------------------------------------------------------------------------
+// #712 — resume re-dispatches mid-flight in_progress; heal then re-drive
+// ---------------------------------------------------------------------------
+
+/** Observe seam for a mid-flight open-PR item that must NOT demote to pr_opened. */
+function midFlightOpenPrObserve(stageByItem: Record<string, string>): ReconcileObserveDeps {
+  return {
+    async getIssueStateAndLabels(issueNumber) {
+      const stage = stageByItem[String(issueNumber)];
+      if (stage) return { state: "open", labels: [`pipeline:${stage}`] };
+      return { state: "open", labels: [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue(issueNumber) {
+      return stageByItem[String(issueNumber)] ? Number(issueNumber) + 600 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/mid-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    async getExternalDependencyIssueState() {
+      return null;
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+}
+
+test("runSupervisorCycle: mid-flight in_progress item is re-dispatched after reconcile (#712)", async () => {
+  // Resume-class: ledger still in_progress, live stage fix-2 with open PR + green checks.
+  // Pre-fix reconcile demoted to pr_opened; supervisor then never called dispatchItem.
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "in_progress") }));
+  const calls: LoopExecutionRequest[] = [];
+  const observe = midFlightOpenPrObserve({ "100": "fix-2" });
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked",
+      evidence: { pr_number: 710, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.equal(calls.length, 1, "dispatchItem must be invoked for the mid-flight in_progress item");
+  assert.equal(calls[0]!.item_id, "100");
+  assert.equal(calls[0]!.schema, LOOP_EXECUTION_CONTRACT_SCHEMA);
+  const ledger = await readLedger(deps, "run-1");
+  assert.notEqual(ledger.items["100"].state, "pr_opened", "must not strand at pr_opened");
+});
+
+test("runSupervisorCycle: active mid-flight in_progress is re-dispatched before pending sibling can displace it (#712)", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const { deps } = await setup(
+    contract,
+    testLedger({
+      "100": itemEntry("100", "in_progress"),
+      "200": itemEntry("200", "pending"),
+    }),
+  );
+  const calls: LoopExecutionRequest[] = [];
+  // Item 100 mid-flight with open PR; 200 is pending with no PR (pipeline:ready).
+  const observe = midFlightOpenPrObserve({ "100": "fix-2" });
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked",
+      evidence: { pr_number: request.item_id === "100" ? 710 : null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  // Existing in_progress path: re-drive A; do not demote A and only start B.
+  assert.ok(
+    calls.some((c) => c.item_id === "100"),
+    "execution call trace must include dispatch for mid-flight item A",
+  );
+  assert.equal(
+    calls.filter((c) => c.item_id === "200").length,
+    0,
+    "with max_active_items=1 and an active in_progress item, pending sibling must not be selected this cycle",
+  );
+  const ledger = await readLedger(deps, "run-1");
+  assert.notEqual(ledger.items["100"].state, "pr_opened");
+});
+
+test("runSupervisorCycle: healed pr_opened mid-flight item is re-dispatched via loop-execution (#712)", async () => {
+  // Stranded ledger row from a pre-fix over-repair; reconcile heals to in_progress,
+  // then this cycle's active-item path dispatches through pipeline/loop-execution@1.
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "pr_opened") }));
+  const calls: LoopExecutionRequest[] = [];
+  const observe = midFlightOpenPrObserve({ "100": "fix-2" });
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked",
+      evidence: { pr_number: 710, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.equal(calls.length, 1, "healed item must be re-dispatched in the same cycle after reconcile heal");
+  assert.equal(calls[0]!.item_id, "100");
+  assert.equal(calls[0]!.schema, LOOP_EXECUTION_CONTRACT_SCHEMA);
+  // Dispatch goes through existing loop-execution path (live labels), not a restart-from-ready transition.
+  assert.equal(calls[0]!.done_definition, "pipeline:ready-to-deploy");
+});

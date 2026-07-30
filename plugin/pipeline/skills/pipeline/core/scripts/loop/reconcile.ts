@@ -29,7 +29,7 @@ import {
   parseChecksAggregate,
 } from "../gh.ts";
 import { getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
-import { isBlockedInLabels, pipelineStageFromLabels } from "./precondition.ts";
+import { isBlockedInLabels, isMidFlightPipelineStage, pipelineStageFromLabels } from "./precondition.ts";
 import {
   LoopError,
   isLoopAuthorityGate,
@@ -269,13 +269,27 @@ function checksRegressed(bound: LoopExternalIdentity | null, identity: LoopExter
 }
 
 /** The furthest {@link LoopItemState} the verified `identity` alone supports —
- *  `null` when no PR exists yet. `LoopExternalIdentity` carries no
- *  release/deployment evidence, so `merged` is the furthest derivable target
- *  (mirrors `identitySupportsState`'s `released`/`deployed` refusal below). */
+ *  `null` when no PR exists yet, or when an open PR is mid-flight advance work
+ *  that must not catch-up to stranded `pr_opened` (#712). `LoopExternalIdentity`
+ *  carries no release/deployment evidence, so `merged` is the furthest
+ *  derivable target (mirrors `identitySupportsState`'s `released`/`deployed`
+ *  refusal below).
+ *
+ *  Precedence (Decision 3 / loop-resume-mid-pipeline-repair-gate):
+ *  1. merged PR → `merged` (mid-flight stage irrelevant)
+ *  2. open PR + ready-to-deploy label → `ready` (mid-flight stage irrelevant)
+ *  3. open PR + mid-flight stage → `null` (do not target `pr_opened`)
+ *  4. open PR + non-mid-flight / null stage → `pr_opened` (#511 crash-after-PR-open)
+ *
+ *  Checks conclusion never influences this target. */
 function verifiedForwardTarget(identity: LoopExternalIdentity): LoopItemState | null {
   if (identity.pr_state === "merged") return "merged";
   if (identity.pr_number !== null && identity.pr_state === "open") {
-    return identity.ready_label_present ? "ready" : "pr_opened";
+    if (identity.ready_label_present) return "ready";
+    // Mid-flight open PR is expected during advance; it is not remote proof that
+    // the ledger should leave a local dispatchable state for stranded `pr_opened`.
+    if (isMidFlightPipelineStage(identity.pipeline_stage)) return null;
+    return "pr_opened";
   }
   return null;
 }
@@ -303,8 +317,12 @@ export function classifyDrift(
   }
 
   // Forward catch-up always wins first: the external truth already reached a
-  // state strictly ahead of what the ledger claims.
+  // state strictly ahead of what the ledger claims. Merged and ready-label
+  // catch-up both win over the mid-flight open-PR gate (#712 Decision 3).
   if (state !== "merged" && state !== "released" && state !== "deployed" && identity.pr_state === "merged") {
+    return "ledger-behind";
+  }
+  if (state === "pr_opened" && identity.pr_state === "open" && identity.ready_label_present) {
     return "ledger-behind";
   }
 
@@ -442,6 +460,41 @@ export async function reconcile(
         ],
       };
       items[id] = repaired;
+    } else if (
+      // Required legacy heal (#712 Decision 4): stranded `pr_opened` with a still
+      // mid-flight open PR is restored to dispatchable `in_progress` so the
+      // supervisor re-drives it. Runs only when forward catch-up (merged/ready)
+      // did not already apply — those win via ledger-behind above. Non-forward
+      // identity drift (head SHA / PR-number mismatch, checks regression) MUST
+      // NOT suppress this heal: a pre-fix stranded row almost always carries
+      // `last_verified_identity`, and ordinary mid-flight commit/check churn
+      // would otherwise leave the item permanently non-dispatchable. Observed
+      // drift is still recorded above; heal updates `last_verified_identity`.
+      // Heals only from `pr_opened`, so a second pass is a no-op once restored.
+      entry.state === "pr_opened" &&
+      identity.pr_number !== null &&
+      identity.pr_state === "open" &&
+      !identity.ready_label_present &&
+      isMidFlightPipelineStage(identity.pipeline_stage)
+    ) {
+      const time = deps.now().toISOString();
+      const from = entry.state;
+      const healed: LoopItemLedgerEntry = {
+        ...entry,
+        state: "in_progress",
+        last_verified_identity: identity,
+        history: [
+          ...entry.history,
+          {
+            time,
+            from,
+            to: "in_progress",
+            engine: input.engine,
+            note: "reconciliation restored mid-flight item to in_progress for re-dispatch",
+          },
+        ],
+      };
+      items[id] = healed;
     } else if (!driftClass && (REMOTE_PROVING_STATES.has(entry.state) || identity.pr_number !== null)) {
       items[id] = { ...entry, last_verified_identity: identity };
     }

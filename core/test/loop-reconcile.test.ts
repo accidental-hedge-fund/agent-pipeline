@@ -195,15 +195,60 @@ function openPrIdentity(overrides: Partial<LoopExternalIdentity> = {}): LoopExte
     issue_number: 100,
     issue_open: true,
     ready_label_present: false,
+    blocked_label_present: false,
     pr_number: 12,
     pr_state: "open",
     head_branch: "pipeline/100-fix",
     head_sha: "abc123",
     merge_commit_sha: null,
     checks_conclusion: "success",
+    // Default null stage preserves #511 crash-after-PR-open catch-up when tests
+    // do not override. Mid-flight gate tests set pipeline_stage explicitly.
+    pipeline_stage: null,
     observed_at: "2026-07-23T00:00:00.000Z",
     ...overrides,
   };
+}
+
+/** Observe fake that reports an open PR at the given pipeline stage (and checks). */
+function openPrObserveDeps(opts: {
+  stage: string | null;
+  checks?: "success" | "failure" | "pending" | "none";
+  readyLabel?: boolean;
+  prState?: "open" | "merged";
+  issueNumber?: number;
+}): ReconcileObserveDeps {
+  const issueNumber = opts.issueNumber ?? 100;
+  const checks = opts.checks ?? "success";
+  const labels = [
+    ...(opts.stage ? [`pipeline:${opts.stage}`] : []),
+    ...(opts.readyLabel ? ["pipeline:ready-to-deploy"] : []),
+  ];
+  const checkBuckets =
+    checks === "success" ? [{ bucket: "pass" }] :
+    checks === "failure" ? [{ bucket: "fail" }] :
+    checks === "pending" ? [{ bucket: "pending" }] :
+    [];
+  return fakeObserveDeps({
+    async getIssueStateAndLabels(n) {
+      if (n !== issueNumber) return { state: "open", labels: ["pipeline:ready"] };
+      return { state: "open", labels };
+    },
+    async findPrForIssue(n) {
+      return n === issueNumber ? 12 : null;
+    },
+    async getPrDetail() {
+      return {
+        state: opts.prState ?? "open",
+        head_ref: `pipeline/${issueNumber}-fix`,
+        head_sha: "abc123",
+        merge_commit_sha: opts.prState === "merged" ? "mergesha" : null,
+      };
+    },
+    async getPrChecks() {
+      return checkBuckets;
+    },
+  }).deps;
 }
 
 // ---------------------------------------------------------------------------
@@ -354,8 +399,51 @@ test("classifyDrift: a local state (implemented) is ledger-behind when a PR is a
   // A worker that crashed after opening (or even merging) the PR but before
   // recording implemented -> pr_opened must be repaired forward, not treated
   // as aligned — the old behavior hard-returned null for every local state.
-  assert.equal(classifyDrift("implemented", openPrIdentity(), null), "ledger-behind");
+  // Null / non-mid-flight stage preserves this catch-up; mid-flight is gated (#712).
+  assert.equal(classifyDrift("implemented", openPrIdentity({ pipeline_stage: null }), null), "ledger-behind");
   assert.equal(classifyDrift("implemented", openPrIdentity({ pr_state: "merged" }), null), "ledger-behind");
+});
+
+test("classifyDrift: local + open PR + mid-flight stage is NOT ledger-behind (#712)", () => {
+  // Pre-fix unguarded behavior returned ledger-behind for any open PR. This
+  // regression fails without the mid-flight gate.
+  assert.equal(
+    classifyDrift("in_progress", openPrIdentity({ pipeline_stage: "fix-2", checks_conclusion: "success" }), null),
+    null,
+  );
+  assert.equal(
+    classifyDrift("pending", openPrIdentity({ pipeline_stage: "review-1" }), null),
+    null,
+  );
+  assert.equal(
+    classifyDrift("implemented", openPrIdentity({ pipeline_stage: "pre-merge" }), null),
+    null,
+  );
+});
+
+test("classifyDrift: mid-flight gate is independent of checks conclusion (#712)", () => {
+  for (const checks of ["success", "failure", "pending", "none"] as const) {
+    assert.equal(
+      classifyDrift("in_progress", openPrIdentity({ pipeline_stage: "fix-2", checks_conclusion: checks }), null),
+      null,
+      `checks=${checks} must not force ledger-behind for mid-flight local open PR`,
+    );
+  }
+});
+
+test("classifyDrift: merged and ready-label still win over mid-flight stage (#712)", () => {
+  assert.equal(
+    classifyDrift("in_progress", openPrIdentity({ pr_state: "merged", pipeline_stage: "fix-2" }), null),
+    "ledger-behind",
+  );
+  assert.equal(
+    classifyDrift("in_progress", openPrIdentity({ ready_label_present: true, pipeline_stage: "pre-merge" }), null),
+    "ledger-behind",
+  );
+  assert.equal(
+    classifyDrift("pr_opened", openPrIdentity({ ready_label_present: true, pipeline_stage: "fix-2" }), null),
+    "ledger-behind",
+  );
 });
 
 test("classifyDrift: every produced class is a member of the closed LoopDriftClass set", () => {
@@ -763,4 +851,230 @@ test("transitionItem: a remote-proving transition without the granted authority 
       return true;
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// #712 mid-flight open-PR repair gate + stranded pr_opened heal
+// ---------------------------------------------------------------------------
+
+test("reconcile: in_progress + open PR + green checks + fix-2 remains in_progress, not pr_opened (#712)", async () => {
+  const { deps, token } = await setup("in_progress");
+  const observeDeps = openPrObserveDeps({ stage: "fix-2", checks: "success" });
+  const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  assert.equal(result.drift.find((d) => d.item_id === "100")?.class, undefined);
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "in_progress");
+  // Continuity must not depend solely on non-consuming next_actions.advance on pr_opened.
+  assert.notEqual(ledger.items["100"].state, "pr_opened");
+  assert.notEqual(result.next_actions["100"], "advance");
+});
+
+test("reconcile: pending + open PR + mid-flight stage stays pending (#712)", async () => {
+  const { deps, token } = await setup("pending");
+  const observeDeps = openPrObserveDeps({ stage: "review-1" });
+  await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "pending");
+});
+
+test("reconcile: local + merged still repairs to merged even with mid-flight stage (#712)", async () => {
+  const { deps, token } = await setup("in_progress");
+  const observeDeps = openPrObserveDeps({ stage: "fix-2", prState: "merged" });
+  const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  assert.equal(result.drift[0]?.class, "ledger-behind");
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "merged");
+});
+
+test("reconcile: local + ready-to-deploy label still repairs to ready even with mid-flight stage (#712)", async () => {
+  const { deps, token } = await setup("in_progress");
+  const observeDeps = openPrObserveDeps({ stage: "pre-merge", readyLabel: true });
+  const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  assert.equal(result.drift[0]?.class, "ledger-behind");
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "ready");
+});
+
+test("reconcile: local + open PR + null stage still repairs to pr_opened (#511 compatibility)", async () => {
+  const { deps, token } = await setup("implemented");
+  const observeDeps = openPrObserveDeps({ stage: null });
+  const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  assert.equal(result.drift[0]?.class, "ledger-behind");
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "pr_opened");
+});
+
+test("reconcile: local + open PR + ready stage still repairs to pr_opened (#511 / non-mid-flight)", async () => {
+  const { deps, token } = await setup("in_progress");
+  const observeDeps = openPrObserveDeps({ stage: "ready" });
+  const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  assert.equal(result.drift[0]?.class, "ledger-behind");
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "pr_opened");
+});
+
+test("reconcile: mid-flight local open PR leaves local state across checks matrix (#712)", async () => {
+  for (const checks of ["success", "failure", "pending", "none"] as const) {
+    const { deps, token } = await setup("in_progress");
+    const observeDeps = openPrObserveDeps({ stage: "fix-2", checks });
+    await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+    const ledger = await readLedger(deps, "run-1");
+    assert.equal(ledger.items["100"].state, "in_progress", `checks=${checks}`);
+  }
+});
+
+test("reconcile: stranded pr_opened + mid-flight open PR heals to in_progress (#712)", async () => {
+  const { deps, token } = await setup("pr_opened");
+  const observeDeps = openPrObserveDeps({ stage: "fix-2", checks: "success" });
+  await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "in_progress");
+  const last = ledger.items["100"].history.at(-1);
+  assert.equal(last?.from, "pr_opened");
+  assert.equal(last?.to, "in_progress");
+  assert.match(last?.note ?? "", /mid-flight/);
+  // Not stranded with non-consuming advance.
+  assert.notEqual(ledger.last_reconciliation?.next_actions["100"], "advance");
+});
+
+// Pre-fix stranded rows normally retain last_verified_identity. If the PR head
+// moved (or checks churned) before resume, classifyDrift returns a non-null
+// class (identity-mismatch / checks-regressed). The heal MUST still restore
+// pr_opened → in_progress; gating on !driftClass left these permanently stranded.
+test("reconcile: stranded pr_opened heals despite stale last_verified_identity head SHA (#712)", async () => {
+  const staleIdentity = openPrIdentity({
+    head_sha: "old-sha-before-fix",
+    checks_conclusion: "success",
+    pipeline_stage: "fix-1",
+  });
+  const liveIdentity = openPrIdentity({
+    head_sha: "new-sha-after-push",
+    checks_conclusion: "success",
+    pipeline_stage: "fix-2",
+  });
+  // Bite: without the heal ignoring non-forward drift, this pair yields
+  // identity-mismatch and the pre-fix !driftClass gate would skip restore.
+  assert.equal(classifyDrift("pr_opened", liveIdentity, staleIdentity), "identity-mismatch");
+
+  const { deps, token } = await setup("pr_opened", {}, {
+    items: {
+      "100": {
+        id: "100",
+        state: "pr_opened",
+        history: [],
+        recovery_budgets_remaining: { default: 3 },
+        last_verified_identity: staleIdentity,
+      },
+    },
+  });
+  const observeDeps = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:fix-2"] };
+    },
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return {
+        state: "open",
+        head_ref: "pipeline/100-fix",
+        head_sha: "new-sha-after-push",
+        merge_commit_sha: null,
+      };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+  }).deps;
+
+  const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "in_progress", "heal must restore despite identity-mismatch drift");
+  assert.equal(ledger.items["100"].last_verified_identity?.head_sha, "new-sha-after-push");
+  assert.equal(ledger.items["100"].history.at(-1)?.from, "pr_opened");
+  assert.equal(ledger.items["100"].history.at(-1)?.to, "in_progress");
+  // Observed drift is still recorded for audit; it must not block the heal.
+  assert.equal(result.drift.find((d) => d.item_id === "100")?.class, "identity-mismatch");
+});
+
+test("reconcile: mid-flight heal is idempotent across repeated passes (#712)", async () => {
+  const { deps, token } = await setup("pr_opened");
+  const observeDeps = openPrObserveDeps({ stage: "review-2" });
+  await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  const afterHeal = await readLedger(deps, "run-1");
+  assert.equal(afterHeal.items["100"].state, "in_progress");
+  const historyLen = afterHeal.items["100"].history.length;
+
+  await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  const second = await readLedger(deps, "run-1");
+  assert.equal(second.items["100"].state, "in_progress");
+  // No re-promote to pr_opened and no duplicate heal history spam.
+  assert.equal(
+    second.items["100"].history.filter((h) => h.to === "in_progress" && (h.note ?? "").includes("mid-flight")).length,
+    1,
+  );
+  assert.ok(second.items["100"].history.length === historyLen || second.items["100"].history.at(-1)?.to !== "pr_opened");
+});
+
+test("reconcile: heal does not override ready or merged catch-up from pr_opened (#712)", async () => {
+  {
+    const { deps, token } = await setup("pr_opened");
+    const observeDeps = openPrObserveDeps({ stage: "fix-2", prState: "merged" });
+    await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+    const ledger = await readLedger(deps, "run-1");
+    assert.equal(ledger.items["100"].state, "merged");
+  }
+  {
+    const { deps, token } = await setup("pr_opened");
+    const observeDeps = openPrObserveDeps({ stage: "fix-2", readyLabel: true });
+    await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+    const ledger = await readLedger(deps, "run-1");
+    assert.equal(ledger.items["100"].state, "ready");
+  }
+});
+
+test("reconcile: multi-item mid-flight in_progress stays dispatchable while sibling stays pending (#712)", async () => {
+  const { deps, files } = fakeDeps();
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  await initRun(deps, contract, {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "run-1",
+    items: {
+      "100": { id: "100", state: "in_progress", history: [], recovery_budgets_remaining: { default: 3 } },
+      "200": { id: "200", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+    },
+    consecutive_blocked: 0,
+    merge_barrier: null,
+    stop: null,
+    last_native_goal_check: null,
+    last_reconciliation: null,
+    reconciliation_sequence: 0,
+    recovery_attempts: [],
+  });
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const { deps: observeDeps } = fakeObserveDeps({
+    async getIssueStateAndLabels(issueNumber) {
+      if (issueNumber === 100) return { state: "open", labels: ["pipeline:fix-2"] };
+      return { state: "open", labels: ["pipeline:ready"] };
+    },
+    async findPrForIssue(issueNumber) {
+      return issueNumber === 100 ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+  });
+  await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "in_progress", "mid-flight A must remain re-dispatchable");
+  assert.equal(ledger.items["200"].state, "pending");
+  void files;
 });
