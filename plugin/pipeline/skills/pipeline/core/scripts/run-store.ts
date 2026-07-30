@@ -140,6 +140,31 @@ export interface GateResultEvent extends RunEventBase {
 export interface BlockerSetEvent extends RunEventBase {
   type: "blocker_set";
   reason: string;
+  /**
+   * Pipeline stage that produced the block (#683). Additive optional — absent
+   * on pre-#683 events. Scoreboard pre-merge aggregates filter on
+   * `stage === "pre-merge"`.
+   */
+  stage?: string;
+  /**
+   * Structural `BlockerKind` when known (#683). Additive optional — absent on
+   * pre-#683 events. Used as a fallback class signal when `offramp_class` is
+   * missing.
+   */
+  blocker_kind?: string;
+  /**
+   * Closed pre-merge off-ramp class when stage is pre-merge (#683). Additive
+   * optional — absent on non-pre-merge blocks and pre-#683 events. Values are
+   * members of `PreMergeOfframpClass` (`pre-merge-offramp.ts`).
+   */
+  offramp_class?: string;
+  /**
+   * Shared id pairing this `blocker_set` with the co-emitted `human_intervention`
+   * for the same off-ramp (#683 review 2). Additive optional — scoreboard
+   * dedupes only the matching pair so mixed historical/new streams still count
+   * every distinct off-ramp.
+   */
+  offramp_id?: string;
 }
 export interface BlockerClearedEvent extends RunEventBase {
   type: "blocker_cleared";
@@ -289,6 +314,22 @@ export interface SettledSurfaceUnverifiedEvent extends RunEventBase {
   settling_round: number;
 }
 
+/** A delta-review finding was demoted to advisory because it re-raises a
+ *  prior-round advisory finding (same surface or stable key) without citing
+ *  HEAD-state evidence of a new/worsened defect (#680). Distinct from
+ *  `settled_surface_unverified` (which keys off resolved-by-fix / overridden
+ *  settled findings). Never blocks by itself — the finding is still recorded
+ *  and posted, tagged `ADVISORY-CARRY-FORWARD`; this event is purely an audit
+ *  record. */
+export interface AdvisoryCarryForwardEvent extends RunEventBase {
+  type: "advisory_carry_forward";
+  finding_key: string;
+  surface: string;
+  prior_advisory_key: string;
+  prior_round: number;
+  matched_by: "surface" | "key";
+}
+
 export type { HumanInterventionEvent };
 export type { CorrectionEvent };
 export type { ProductFaultEvent };
@@ -315,6 +356,7 @@ export type RunEvent =
   | ReversalUnacknowledgedEvent
   | SettledAlternativeReinstatedEvent
   | SettledSurfaceUnverifiedEvent
+  | AdvisoryCarryForwardEvent
   | DeltaRoundEvent
   | DeltaRoundCeilingEvent
   | DeltaChurnSuspectedEvent

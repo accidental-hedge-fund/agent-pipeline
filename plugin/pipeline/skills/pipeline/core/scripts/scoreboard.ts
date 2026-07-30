@@ -14,6 +14,13 @@ import {
   validateControlAttribution,
   type ControlAttribution,
 } from "./correction.ts";
+import {
+  PRE_MERGE_OFFRAMP_CLASSES,
+  isPreMergeOfframpClass,
+  toPreMergeOfframpClass,
+  zeroPreMergeOfframpClassCounts,
+  type PreMergeOfframpClass,
+} from "./pre-merge-offramp.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -226,6 +233,26 @@ export interface CorrectionMetrics extends CorrectionTotals {
   top_still_recurring: CorrectionClassSummary[];
 }
 
+/** Per-class slice of pre-merge needs-human off-ramps (#683). */
+export interface PreMergeNeedsHumanClassMetric {
+  count: number;
+  rate: RateValue;
+}
+
+/**
+ * Pre-merge needs-human aggregate (#683): rate of pre-merge entries that
+ * recorded a blocked/needs-human off-ramp, plus closed-set class breakdown.
+ * Classification reads durable run events only (never issue comments).
+ */
+export interface PreMergeNeedsHumanMetric {
+  /** Count of pre-merge stage entries (stage_start for pre-merge). */
+  pre_merge_entries: number;
+  /** Total pre-merge blocked/needs-human off-ramp events. */
+  pre_merge_needs_human_count: number;
+  rate: RateValue;
+  by_class: Record<PreMergeOfframpClass, PreMergeNeedsHumanClassMetric>;
+}
+
 export interface ScoreboardMetrics {
   ready_to_deploy_without_human_intervention: RateValue;
   cost_per_ready_pr_usd: CostMetric;
@@ -240,6 +267,8 @@ export interface ScoreboardMetrics {
     rates: Record<string, RateValue>;
   };
   needs_human_rate: RateValue;
+  /** Pre-merge needs-human rate + by-class breakdown (#683). Additive. */
+  pre_merge_needs_human: PreMergeNeedsHumanMetric;
   same_harness_fallback_rate: RateValue;
   gate_pass_rates: {
     test: GatePassMetric;
@@ -1349,6 +1378,9 @@ function reduceRunsCore(
   let needsHuman = 0;
   let reviewRounds = 0;
   let sameHarnessFallbacks = 0;
+  let preMergeEntries = 0;
+  let preMergeNeedsHumanCount = 0;
+  const preMergeClassCounts = zeroPreMergeOfframpClassCounts();
   const { costAccounting, grouping } = aggregateCostAccounting(runs, diagnostics, groupBy);
 
   for (const run of runs) {
@@ -1375,6 +1407,14 @@ function reduceRunsCore(
     }
 
     if (run.finalState === "needs-human") needsHuman++;
+
+    // Pre-merge needs-human by class (#683): denominator = stage_start count for
+    // pre-merge; numerator = blocker_set (or residual intervention) off-ramps.
+    preMergeEntries += countPreMergeEntries(run);
+    for (const cls of collectPreMergeOfframpClasses(run)) {
+      preMergeNeedsHumanCount++;
+      preMergeClassCounts[cls]++;
+    }
 
     for (const review of collectReviewRecords(run)) {
       reviewRounds++;
@@ -1465,6 +1505,15 @@ function reduceRunsCore(
       ? null
       : roundUsd(costTotal / successfulPrs);
 
+  const preMergeByClass = {} as Record<PreMergeOfframpClass, PreMergeNeedsHumanClassMetric>;
+  for (const cls of PRE_MERGE_OFFRAMP_CLASSES) {
+    const count = preMergeClassCounts[cls];
+    preMergeByClass[cls] = {
+      count,
+      rate: rate(count, preMergeEntries),
+    };
+  }
+
   const metrics: ScoreboardMetrics = {
     ready_to_deploy_without_human_intervention: rate(autonomousReadyPrs, successfulPrs),
     cost_per_ready_pr_usd: {
@@ -1488,6 +1537,12 @@ function reduceRunsCore(
       rates: blockerRates,
     },
     needs_human_rate: rate(needsHuman, runs.length),
+    pre_merge_needs_human: {
+      pre_merge_entries: preMergeEntries,
+      pre_merge_needs_human_count: preMergeNeedsHumanCount,
+      rate: rate(preMergeNeedsHumanCount, preMergeEntries),
+      by_class: preMergeByClass,
+    },
     same_harness_fallback_rate: rate(sameHarnessFallbacks, reviewRounds),
     gate_pass_rates: {
       test: gateMetric(gateCounts.test),
@@ -1880,6 +1935,102 @@ function collectHumanInterventions(run: IncludedRun): JsonRecord[] {
     addRecord(items, item, interventionKey(item));
   }
   return [...items.values()];
+}
+
+/**
+ * Denominator signal for pre-merge needs-human (#683): count of `stage_start`
+ * events with stage `pre-merge`. Pinned by scoreboard tests — not all runs,
+ * and not stage_complete alone (a blocked entry still has stage_start).
+ */
+function countPreMergeEntries(run: IncludedRun): number {
+  let count = 0;
+  for (const event of run.events) {
+    if (event["type"] !== "stage_start") continue;
+    if (stringField(event, "stage") === "pre-merge") count++;
+  }
+  return count;
+}
+
+/**
+ * Resolve one pre-merge off-ramp event to a closed class using priority:
+ * 1. offramp_class in the closed set
+ * 2. map blocker_kind
+ * 3. residual other
+ * Never parses free-text reason or issue comments.
+ */
+function resolvePreMergeOfframpClass(event: JsonRecord): PreMergeOfframpClass {
+  const rawClass = event["offramp_class"];
+  if (isPreMergeOfframpClass(rawClass)) return rawClass;
+  const kind =
+    typeof event["blocker_kind"] === "string"
+      ? event["blocker_kind"]
+      : typeof event["blockerKind"] === "string"
+        ? event["blockerKind"]
+        : null;
+  return toPreMergeOfframpClass({ blockerKind: kind });
+}
+
+/**
+ * Collect pre-merge blocked/needs-human off-ramp classes from durable events.
+ *
+ * Per pre-merge stage entry (events between `stage_start` pre-merge markers):
+ * 1. Count every pre-merge `blocker_set` in the entry.
+ * 2. Count pre-merge `human_intervention` only when it is not paired with a
+ *    `blocker_set` in that same entry:
+ *    - Shared `offramp_id` (new dual-write): skip the intervention with the
+ *      matching id; unpaired interventions still count.
+ *    - No `offramp_id` on either side (legacy dual-write within the entry):
+ *      if the entry already has a `blocker_set`, skip un-id'd interventions so
+ *      the pair is not double-counted; if the entry has no `blocker_set`,
+ *      count intervention-only residual under `other`.
+ *
+ * Run-global suppression of interventions whenever *any* pre-merge blocker_set
+ * exists is intentionally avoided (#683 review 2): an older intervention-only
+ * entry followed by a later enriched re-entry must count both off-ramps.
+ */
+function collectPreMergeOfframpClasses(run: IncludedRun): PreMergeOfframpClass[] {
+  // Partition into stage-entry windows keyed by pre-merge stage_start index.
+  // Events before the first pre-merge stage_start still form an entry so
+  // historical streams without stage_start are not dropped.
+  type Entry = { blockers: JsonRecord[]; interventions: JsonRecord[] };
+  const entries: Entry[] = [{ blockers: [], interventions: [] }];
+  let current = entries[0];
+
+  for (const event of run.events) {
+    if (event["type"] === "stage_start" && stringField(event, "stage") === "pre-merge") {
+      current = { blockers: [], interventions: [] };
+      entries.push(current);
+      continue;
+    }
+    if (stringField(event, "stage") !== "pre-merge") continue;
+    if (event["type"] === "blocker_set") {
+      current.blockers.push(event);
+    } else if (event["type"] === "human_intervention") {
+      current.interventions.push(event);
+    }
+  }
+
+  const classes: PreMergeOfframpClass[] = [];
+  for (const entry of entries) {
+    const pairedIds = new Set<string>();
+    for (const blocker of entry.blockers) {
+      classes.push(resolvePreMergeOfframpClass(blocker));
+      const id = stringField(blocker, "offramp_id");
+      if (id) pairedIds.add(id);
+    }
+    for (const intervention of entry.interventions) {
+      const id = stringField(intervention, "offramp_id");
+      if (id && pairedIds.has(id)) continue; // paired fresh dual-write
+      if (!id && entry.blockers.length > 0) {
+        // Legacy dual-write in the same stage entry: intervention co-emitted
+        // without offramp_id alongside a blocker_set — count the blocker only.
+        continue;
+      }
+      // Intervention-only residual (historical or unpaired) → other.
+      classes.push("other");
+    }
+  }
+  return classes;
 }
 
 function collectOverrides(run: IncludedRun): JsonRecord[] {
@@ -2291,6 +2442,7 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
     }
   }
   lines.push(`pipeline:needs-human rate: ${formatRate(report.metrics.needs_human_rate)}`);
+  appendPreMergeNeedsHumanSection(lines, report.metrics.pre_merge_needs_human);
   lines.push(`Same-harness fallback rate: ${formatRate(report.metrics.same_harness_fallback_rate)}`);
   lines.push(`Test pass rate: ${formatGate(report.metrics.gate_pass_rates.test)}`);
   lines.push(`Eval pass rate: ${formatGate(report.metrics.gate_pass_rates.eval)}`);
@@ -2329,6 +2481,7 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
       lines.push(`Harness calls per successful PR: ${formatRatioValue(period.metrics.harness_calls_per_successful_pr)}`);
       lines.push(`Retry/fix-round count per PR: ${formatRatioValue(period.metrics.retry_fix_rounds_per_pr)}`);
       lines.push(`pipeline:needs-human rate: ${formatRate(period.metrics.needs_human_rate)}`);
+      appendPreMergeNeedsHumanSection(lines, period.metrics.pre_merge_needs_human, "  ");
       lines.push(`Same-harness fallback rate: ${formatRate(period.metrics.same_harness_fallback_rate)}`);
       lines.push(`Test pass rate: ${formatGate(period.metrics.gate_pass_rates.test)}`);
       lines.push(`Eval pass rate: ${formatGate(period.metrics.gate_pass_rates.eval)}`);
@@ -2344,6 +2497,29 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
   }
 
   return lines.join("\n");
+}
+
+/** Human-readable pre-merge needs-human rate + class breakdown (#683). */
+function appendPreMergeNeedsHumanSection(
+  lines: string[],
+  metric: PreMergeNeedsHumanMetric,
+  indent = "",
+): void {
+  lines.push(
+    `${indent}Pre-merge needs-human rate: ${formatRate(metric.rate)} ` +
+      `(${metric.pre_merge_needs_human_count}/${metric.pre_merge_entries} entries)`,
+  );
+  lines.push(`${indent}Pre-merge needs-human by class:`);
+  let any = false;
+  for (const cls of PRE_MERGE_OFFRAMP_CLASSES) {
+    const entry = metric.by_class[cls];
+    if (!entry || entry.count === 0) continue;
+    any = true;
+    lines.push(`${indent}  ${cls}: ${entry.count} (${formatRate(entry.rate)})`);
+  }
+  if (!any) {
+    lines.push(`${indent}  (no pre-merge needs-human off-ramps recorded)`);
+  }
 }
 
 function formatCorrectionTotalsLine(totals: CorrectionTotals): string {
@@ -2589,6 +2765,7 @@ ${htmlRow("Full-run wall-clock duration", formatDuration(metrics.full_run_durati
 ${htmlRow("Harness calls per successful PR", formatRatioValue(metrics.harness_calls_per_successful_pr))}
 ${htmlRow("Retry/fix-round count per PR", formatRatioValue(metrics.retry_fix_rounds_per_pr))}
 ${htmlRow("pipeline:needs-human rate", formatRate(metrics.needs_human_rate))}
+${htmlRow("Pre-merge needs-human rate", formatPreMergeNeedsHumanRate(metrics.pre_merge_needs_human))}
 ${htmlRow("Same-harness fallback rate", formatRate(metrics.same_harness_fallback_rate))}
 ${htmlRow("Test pass rate", formatGate(metrics.gate_pass_rates.test))}
 ${htmlRow("Eval pass rate", formatGate(metrics.gate_pass_rates.eval))}
@@ -2606,7 +2783,26 @@ ${htmlListOrEmpty(
   blockerEntries.map(([kind, count]) => `${kind}: ${count} (${formatRate(metrics.blocker_rate_by_kind.rates[kind])})`),
   "(no human-intervention blockers recorded)",
 )}
+<h3>Pre-merge needs-human by class</h3>
+${htmlListOrEmpty(formatPreMergeClassLines(metrics.pre_merge_needs_human), "(no pre-merge needs-human off-ramps recorded)")}
 </section>`;
+}
+
+function formatPreMergeNeedsHumanRate(metric: PreMergeNeedsHumanMetric): string {
+  return (
+    `${formatRate(metric.rate)} ` +
+    `(${metric.pre_merge_needs_human_count}/${metric.pre_merge_entries} entries)`
+  );
+}
+
+function formatPreMergeClassLines(metric: PreMergeNeedsHumanMetric): string[] {
+  const lines: string[] = [];
+  for (const cls of PRE_MERGE_OFFRAMP_CLASSES) {
+    const entry = metric.by_class[cls];
+    if (!entry || entry.count === 0) continue;
+    lines.push(`${cls}: ${entry.count} (${formatRate(entry.rate)})`);
+  }
+  return lines;
 }
 
 function renderPeriodMetricsSection(period: ScoreboardPeriod): string {
@@ -2623,11 +2819,14 @@ ${htmlRow("Full-run wall-clock duration", formatDuration(metrics.full_run_durati
 ${htmlRow("Harness calls per successful PR", formatRatioValue(metrics.harness_calls_per_successful_pr))}
 ${htmlRow("Retry/fix-round count per PR", formatRatioValue(metrics.retry_fix_rounds_per_pr))}
 ${htmlRow("pipeline:needs-human rate", formatRate(metrics.needs_human_rate))}
+${htmlRow("Pre-merge needs-human rate", formatPreMergeNeedsHumanRate(metrics.pre_merge_needs_human))}
 ${htmlRow("Same-harness fallback rate", formatRate(metrics.same_harness_fallback_rate))}
 ${htmlRow("Test pass rate", formatGate(metrics.gate_pass_rates.test))}
 ${htmlRow("Eval pass rate", formatGate(metrics.gate_pass_rates.eval))}
 ${htmlRow("Shipcheck pass rate", formatGate(metrics.gate_pass_rates.shipcheck))}
 </table>
+<h4>Pre-merge needs-human by class</h4>
+${htmlListOrEmpty(formatPreMergeClassLines(metrics.pre_merge_needs_human), "(no pre-merge needs-human off-ramps recorded)")}
 ${period.by && period.grouping ? renderGroupingSection(period.by, period.grouping) : ""}
 ${period.corrections ? `<h3>Repeat corrections</h3><p>${escapeHtml(formatCorrectionTotalsLine(period.corrections))}</p>` : ""}
 </section>`;

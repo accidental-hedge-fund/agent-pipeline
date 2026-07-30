@@ -20,6 +20,7 @@ import {
   findingPayloadFingerprint,
   formatBlockingSurfacesMarker,
   surfaceKey,
+  type AdvisoryCarryForwardMatch,
   type AlternativeReinstatementMatch,
   type PartitionResult,
   type ReversalMatch,
@@ -41,14 +42,13 @@ function truncateTitleFor389(title: string): string {
   return title.length > 120 ? title.slice(0, 120) : title;
 }
 
-/** Build the `ReviewArtifact.blockingFindings` extension array (#389) from a
- *  round's blocking findings, keyed/surfaced identically to the existing
- *  `pipeline-blocking-surfaces` marker. Carries `confidence` and
- *  `rejectedAlternatives` (#483) when the reviewer supplied them, so a later
- *  round's digest can check a new recommendation against what THIS round
- *  required removed — omitted (not defaulted to 0/[]) when absent so the
- *  digest can tell "not reported" apart from "reported as empty". */
-function buildBlockingFindingsExtension(
+/** Build a `ReviewArtifact` findings extension array (#389 / #680) from a
+ *  round's findings, keyed/surfaced identically to the existing
+ *  `pipeline-blocking-surfaces` marker. Used for both `blockingFindings` and
+ *  `advisoryFindings`. Carries `confidence` and `rejectedAlternatives` (#483)
+ *  when the reviewer supplied them — omitted (not defaulted to 0/[]) when
+ *  absent so the digest can tell "not reported" apart from "reported as empty". */
+function buildFindingsExtension(
   findings: ReviewFinding[],
 ): Array<{ key: string; surface: string | null; severity: string; title: string; confidence?: number; rejectedAlternatives?: string[] }> {
   return findings.map((f) => {
@@ -63,6 +63,9 @@ function buildBlockingFindingsExtension(
     return entry;
   });
 }
+
+/** @deprecated alias — prefer {@link buildFindingsExtension} */
+const buildBlockingFindingsExtension = buildFindingsExtension;
 
 /**
  * Format a review comment for round 1 or 2. Accepts two calling conventions:
@@ -190,9 +193,15 @@ export function formatReviewComment(
       bodyHash,
     };
     if (blockingKeys !== undefined) {
-      artifact.blockingFindings = buildBlockingFindingsExtension(
+      artifact.blockingFindings = buildFindingsExtension(
         verdict.findings.filter((f) => blockingKeys.has(findingKey(f))),
       );
+      // Prior-round advisory carry-forward (#680): non-blocking findings from
+      // this round become carry-forward candidates for a later delta review.
+      const advisory = verdict.findings.filter((f) => !blockingKeys.has(findingKey(f)));
+      if (advisory.length > 0) {
+        artifact.advisoryFindings = buildFindingsExtension(advisory);
+      }
     }
     lines.push(encodeReviewArtifact(artifact));
   }
@@ -214,6 +223,7 @@ export function formatDeltaReviewComment(
   alternativeDemotions?: Map<string, AlternativeReinstatementMatch>,
   churn?: ChurnResult,
   unverifiedSurfaceDemotions?: Map<string, UnverifiedSettledSurfaceMatch>,
+  advisoryCarryForwardDemotions?: Map<string, AdvisoryCarryForwardMatch>,
 ): string {
   const shortSha = verdict.commitSha ? verdict.commitSha.slice(0, 7) : "";
   const heading = shortSha
@@ -257,7 +267,11 @@ export function formatDeltaReviewComment(
       const unverifiedTag = unverifiedMatch
         ? ` \`SETTLED-SURFACE-UNVERIFIED: shares surface with ${unverifiedMatch.settledKey} settled in round ${unverifiedMatch.settledRound} — no HEAD-state evidence cited\``
         : "";
-      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}${reversalTag}${alternativeTag}${unverifiedTag}`);
+      const carryForwardMatch = advisoryCarryForwardDemotions?.get(findingKey(f));
+      const carryForwardTag = carryForwardMatch
+        ? ` \`ADVISORY-CARRY-FORWARD: re-raises prior advisory ${carryForwardMatch.priorKey} from round ${carryForwardMatch.priorRound} (matched by ${carryForwardMatch.matchedBy}) — no HEAD-state evidence cited\``
+        : "";
+      lines.push("", `**${i + 1}. [${sev}] ${f.title}**${conf} \`override-key: ${findingKey(f)}\`${cat}${dir}${reversalTag}${alternativeTag}${unverifiedTag}${carryForwardTag}`);
       // Machine-readable payload fingerprint, emitted at render time from the
       // structured finding (#391 delta, keys 0fb96f45/b827b914): consumers
       // (fix-stage summaries, disposition matching) read it verbatim instead
@@ -299,9 +313,13 @@ export function formatDeltaReviewComment(
       bodyHash,
     };
     if (blockingKeys !== undefined) {
-      artifact.blockingFindings = buildBlockingFindingsExtension(
+      artifact.blockingFindings = buildFindingsExtension(
         verdict.findings.filter((f) => blockingKeys.has(findingKey(f))),
       );
+      const advisory = verdict.findings.filter((f) => !blockingKeys.has(findingKey(f)));
+      if (advisory.length > 0) {
+        artifact.advisoryFindings = buildFindingsExtension(advisory);
+      }
     }
     lines.push(encodeReviewArtifact(artifact));
   }

@@ -6,18 +6,24 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildPriorRoundDigest,
+  priorAdvisoryFindings,
+  priorAdvisorySurfaceFiles,
   renderResolvedFindingVerification,
   settledFindingsSurfaceFiles,
   settledFindingsVerification,
   type HeadFileState,
+  type PriorAdvisoryFinding,
   type PriorRoundDigest,
   type SettledFindingVerification,
 } from "../scripts/review-history.ts";
 import {
+  applyAdvisoryCarryForwardRule,
   applySettledSurfaceEvidenceRule,
   citesAbsentHeadFile,
   citesHeadFileEvidence,
   findingKey,
+  matchPriorAdvisory,
   matchSettledSurface,
   partitionFindings,
 } from "../scripts/review-policy.ts";
@@ -32,6 +38,7 @@ import {
 } from "../scripts/stages/pre_merge.ts";
 import { computeDiffHash } from "../scripts/stages/review.ts";
 import { formatReviewComment } from "../scripts/stages/review-rendering.ts";
+import { extractReviewArtifact } from "../scripts/stages/review-parsing.ts";
 import type { PipelineConfig, ReviewFinding, ReviewVerdict } from "../scripts/types.ts";
 import { mkdtemp, rm, writeFile, mkdir, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -663,4 +670,373 @@ test("enforceReviewShaGate: a settled finding re-asserted with narrow-delta rati
 
   assert.equal(out, null, "the re-assertion is demoted — the item proceeds instead of blocking");
   assert.ok(rec.some((c) => /SETTLED-SURFACE-UNVERIFIED/.test(c)), "posted comment names the demotion");
+});
+
+// ---------------------------------------------------------------------------
+// Prior-round advisory carry-forward (#680)
+// ---------------------------------------------------------------------------
+
+test("formatReviewComment: non-blocking findings are stored as advisoryFindings (#680)", () => {
+  const cfg = { marker_footer: "*footer*" } as unknown as PipelineConfig;
+  const advisory: ReviewFinding = {
+    severity: "medium", title: "Optional lock note", file: "lock.ts", category: "concurrency",
+    body: "Consider a tighter critical section.", confidence: 0.5, recommendation: "tighten",
+  };
+  const blocking: ReviewFinding = {
+    severity: "high", title: "Null deref", file: "main.ts", category: "correctness",
+    body: "x is null", confidence: 0.9, recommendation: "check null",
+  };
+  const body = formatReviewComment(
+    cfg,
+    {
+      verdict: "needs-attention",
+      summary: "one blocking, one advisory",
+      findings: [blocking, advisory],
+      next_steps: [],
+      commitSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    },
+    2,
+    "claude",
+    new Set([findingKey(blocking)]),
+    "0123456789abcdef",
+  );
+  const artifact = extractReviewArtifact(body);
+  assert.ok(artifact, "artifact must decode");
+  assert.equal(artifact!.blockingFindings?.length, 1);
+  assert.equal(artifact!.advisoryFindings?.length, 1);
+  assert.equal(artifact!.advisoryFindings![0].surface, "lock.ts|concurrency");
+});
+
+test("priorAdvisoryFindings: extracts advisory entries from digest; empty when absent (#680)", () => {
+  const cfg = { marker_footer: "*footer*" } as unknown as PipelineConfig;
+  const advisory: ReviewFinding = {
+    severity: "medium", title: "Advisory on lock", file: "lock.ts", category: "concurrency",
+    body: "note", confidence: 0.4, recommendation: "consider",
+  };
+  const reviewBody = formatReviewComment(
+    cfg,
+    {
+      verdict: "approve",
+      summary: "advances with advisory",
+      findings: [advisory],
+      next_steps: [],
+      commitSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    },
+    2,
+    "claude",
+    new Set(), // none blocking — whole set is advisory
+    "fedcba9876543210",
+  );
+  const digest = buildPriorRoundDigest(
+    [{ author: "pipeline-bot", body: reviewBody }],
+    { actor: "pipeline-bot" },
+  );
+  const priors = priorAdvisoryFindings(digest);
+  assert.equal(priors.length, 1);
+  assert.equal(priors[0].surface, "lock.ts|concurrency");
+  assert.equal(priors[0].round, 1);
+  assert.deepEqual(priorAdvisorySurfaceFiles(priors), ["lock.ts"]);
+
+  // No advisory history → empty
+  assert.deepEqual(priorAdvisoryFindings({ rounds: [] }), []);
+});
+
+test("priorAdvisoryFindings: excludes advisories from non-advancing (blocked) reviews (#680)", () => {
+  const cfg = { marker_footer: "*footer*" } as unknown as PipelineConfig;
+  const advisory: ReviewFinding = {
+    severity: "low", title: "Lock note", file: "lock.ts", category: "concurrency",
+    body: "optional tighten", confidence: 0.3, recommendation: "consider",
+  };
+  const blocker: ReviewFinding = {
+    severity: "high", title: "Null deref", file: "main.ts", category: "correctness",
+    body: "x is null", confidence: 0.95, recommendation: "check null",
+  };
+  // needs-attention with a real blocker + incidental advisory — issue did not advance.
+  const blockedReviewBody = formatReviewComment(
+    cfg,
+    {
+      verdict: "needs-attention",
+      summary: "blocks with unrelated correctness finding",
+      findings: [blocker, advisory],
+      next_steps: [],
+      commitSha: "cccccccccccccccccccccccccccccccccccccccc",
+    },
+    2,
+    "claude",
+    new Set([findingKey(blocker)]),
+    "0123456789abcdef",
+  );
+  const digest = buildPriorRoundDigest(
+    [{ author: "pipeline-bot", body: blockedReviewBody }],
+    { actor: "pipeline-bot" },
+  );
+  // Artifact still records the advisory, but carry-forward eligibility requires advancement.
+  assert.equal(digest.rounds[0].advisoryEntries.length, 1, "digest stores the advisory entry");
+  assert.ok(digest.rounds[0].entries.length > 0, "digest records the blocking partition");
+  assert.deepEqual(
+    priorAdvisoryFindings(digest),
+    [],
+    "non-advancing review advisories must not become carry-forward candidates",
+  );
+});
+
+test("applyAdvisoryCarryForwardRule: advisory reappears without head evidence → demoted (#680)", () => {
+  const priors: PriorAdvisoryFinding[] = [
+    { key: "deadbeef", surface: "lock.ts|concurrency", title: "Lock note", round: 1 },
+  ];
+  const reRaise: ReviewFinding = {
+    severity: "high", title: "Lock ownership race", file: "lock.ts", category: "concurrency",
+    body: "This still looks racy.", confidence: 0.95, recommendation: "fix ownership",
+  };
+  const headFiles: HeadFileState[] = [
+    { path: "lock.ts", content: "function acquire() {\n  return mutex.lock();\n}", truncated: false, present: true },
+  ];
+  const result = applyAdvisoryCarryForwardRule([reRaise], priors, headFiles);
+  assert.equal(result.blocking.length, 0, "unverified re-raise of prior advisory is demoted");
+  assert.equal(result.demoted.length, 1);
+  assert.equal(result.demoted[0].match.matchedBy, "surface");
+  assert.equal(result.demoted[0].match.priorRound, 1);
+});
+
+test("applyAdvisoryCarryForwardRule: verified regression with head evidence still blocks (#680)", () => {
+  const priors: PriorAdvisoryFinding[] = [
+    { key: "deadbeef", surface: "lock.ts|concurrency", title: "Lock note", round: 1 },
+  ];
+  const headLine = "if (ownerPid !== process.pid) throw new Error('stolen');";
+  const regression: ReviewFinding = {
+    severity: "high", title: "Lock ownership regressed", file: "lock.ts", category: "concurrency",
+    body: `The current head still has \`${headLine}\` which races on macOS.`,
+    confidence: 0.95, recommendation: "use a platform-safe owner identity",
+  };
+  const headFiles: HeadFileState[] = [
+    { path: "lock.ts", content: `function check() {\n  ${headLine}\n}`, truncated: false, present: true },
+  ];
+  const result = applyAdvisoryCarryForwardRule([regression], priors, headFiles);
+  assert.equal(result.blocking.length, 1, "head-cited regression must remain blocking");
+  assert.equal(result.demoted.length, 0);
+});
+
+test("applyAdvisoryCarryForwardRule: no prior advisory history → no demotion (#680)", () => {
+  const f: ReviewFinding = {
+    severity: "high", title: "Fresh bug", file: "x.ts", category: "correctness",
+    body: "b", confidence: 0.9, recommendation: "fix",
+  };
+  const result = applyAdvisoryCarryForwardRule([f], [], []);
+  assert.deepEqual(result.blocking, [f]);
+  assert.deepEqual(result.demoted, []);
+});
+
+test("matchPriorAdvisory: prefers surface, falls back to key (#680)", () => {
+  const priors: PriorAdvisoryFinding[] = [
+    { key: "aaaaaaaa", surface: "a.ts|correctness", title: "A", round: 1 },
+    { key: "bbbbbbbb", surface: null, title: "B", round: 2 },
+  ];
+  const bySurface = matchPriorAdvisory(
+    { file: "a.ts", category: "correctness", severity: "high", title: "X", line_start: 1 },
+    priors,
+  );
+  assert.equal(bySurface?.matchedBy, "surface");
+  assert.equal(bySurface?.priorKey, "aaaaaaaa");
+
+  // Key match when surface is null on the prior — use findingKey of a concrete finding.
+  const concrete: ReviewFinding = {
+    severity: "high", title: "Concrete", file: "z.ts", category: "scope",
+    body: "b", confidence: 0.9, recommendation: "r",
+  };
+  const key = findingKey(concrete);
+  const keyPriors: PriorAdvisoryFinding[] = [
+    { key, surface: null, title: "Concrete prior", round: 3 },
+  ];
+  const byKey = matchPriorAdvisory(concrete, keyPriors);
+  assert.equal(byKey?.matchedBy, "key");
+  assert.equal(byKey?.priorRound, 3);
+});
+
+test("enforceReviewShaGate: prior advisory re-raised without head evidence is demoted — not first-hop needs-human (#680)", async (t) => {
+  const SHA_REVIEWED = "1111111111111111111111111111111111111111";
+  const SHA_HEAD = "2222222222222222222222222222222222222222";
+  const TEST_ACTOR = "pipeline-bot";
+  const OLD_DIFF = "diff --git a/lock.ts b/lock.ts\n+const x = 1;";
+  const NEW_DIFF = "diff --git a/lock.ts b/lock.ts\n+const x = 2;";
+  const oldHash = computeDiffHash(OLD_DIFF);
+  const formatCfg = { marker_footer: "*footer*" } as unknown as PipelineConfig;
+
+  const priorAdvisory: ReviewFinding = {
+    severity: "medium", title: "Lock ownership note", file: "lock.ts", category: "concurrency",
+    body: "Consider tighter ownership checks.", confidence: 0.4, recommendation: "tighten",
+  };
+  // Review-2 advanced with only this advisory (empty blocking keys).
+  const priorReviewBody = formatReviewComment(
+    formatCfg,
+    {
+      verdict: "approve",
+      summary: "advances with advisory",
+      findings: [priorAdvisory],
+      next_steps: [],
+      commitSha: SHA_REVIEWED,
+    },
+    2,
+    "claude",
+    new Set(),
+    oldHash,
+  );
+
+  const deltaFinding: ReviewFinding = {
+    severity: "high", title: "Lock ownership race", file: "lock.ts", category: "concurrency",
+    body: "This still looks racy on the same surface.", confidence: 0.95, recommendation: "fix ownership",
+  };
+
+  const rec: { comments: string[]; blocked: string[] } = { comments: [], blocked: [] };
+  const runDeltaReview: RunDeltaReviewFn = async () =>
+    ({
+      verdict: "needs-attention",
+      findings: [deltaFinding],
+      summary: "re-raise advisory as HIGH",
+    }) as DeltaReviewResult;
+
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () =>
+      ({
+        title: "T",
+        body: "B",
+        comments: [{ author: TEST_ACTOR, body: priorReviewBody }],
+      }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+    getPrCommits: async () =>
+      ([
+        { oid: SHA_REVIEWED, messageHeadline: "feat: implement" },
+        { oid: SHA_HEAD, messageHeadline: "fix: minor" },
+      ]) as any,
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    getForIssue: async () => ({ path: "/fake/worktree" }) as any,
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async () => {},
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push(reason); },
+    runDeltaReview,
+    readHeadFiles: async () => [
+      { path: "lock.ts", content: "function acquire() {\n  return mutex.lock();\n}", truncated: false, present: true },
+    ],
+  };
+
+  const cfgWithPolicy = {
+    review_policy: { block_threshold: "low" as const, min_confidence: 0 },
+    harnesses: { reviewer: "claude", implementer: "claude" },
+  } as unknown as PipelineConfig;
+
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+
+  assert.equal(out, null, "carry-forward demotion must let pre-merge proceed");
+  assert.deepEqual(rec.blocked, [], "must not needs-human on unverified advisory re-raise");
+  assert.ok(
+    rec.comments.some((c) => /ADVISORY-CARRY-FORWARD/.test(c)),
+    "posted comment must name the carry-forward demotion",
+  );
+});
+
+test("enforceReviewShaGate: advisory from non-advancing review does not demote later HIGH on same surface (#680)", async (t) => {
+  // Failed review-2: unrelated blocker + low lock advisory. Issue never advanced past it.
+  // Later delta re-raises HIGH on the lock surface without head evidence — must stay blocking
+  // (not demoted by the non-advancing advisory).
+  const SHA_REVIEWED = "1111111111111111111111111111111111111111";
+  const SHA_HEAD = "2222222222222222222222222222222222222222";
+  const TEST_ACTOR = "pipeline-bot";
+  const OLD_DIFF = "diff --git a/lock.ts b/lock.ts\n+const x = 1;";
+  const NEW_DIFF = "diff --git a/lock.ts b/lock.ts\n+const x = 2;";
+  const oldHash = computeDiffHash(OLD_DIFF);
+  const formatCfg = { marker_footer: "*footer*" } as unknown as PipelineConfig;
+
+  const priorAdvisory: ReviewFinding = {
+    severity: "low", title: "Lock ownership note", file: "lock.ts", category: "concurrency",
+    body: "Consider tighter ownership checks.", confidence: 0.3, recommendation: "tighten",
+  };
+  const priorBlocker: ReviewFinding = {
+    severity: "high", title: "Null deref elsewhere", file: "main.ts", category: "correctness",
+    body: "x is null", confidence: 0.95, recommendation: "check null",
+  };
+  const priorReviewBody = formatReviewComment(
+    formatCfg,
+    {
+      verdict: "needs-attention",
+      summary: "blocks; also notes lock advisory",
+      findings: [priorBlocker, priorAdvisory],
+      next_steps: [],
+      commitSha: SHA_REVIEWED,
+    },
+    2,
+    "claude",
+    new Set([findingKey(priorBlocker)]),
+    oldHash,
+  );
+
+  const deltaFinding: ReviewFinding = {
+    severity: "high", title: "Lock ownership race", file: "lock.ts", category: "concurrency",
+    body: "This still looks racy on the same surface.", confidence: 0.95, recommendation: "fix ownership",
+  };
+
+  const rec: { comments: string[]; blocked: string[]; autoFixCalls: number } = {
+    comments: [], blocked: [], autoFixCalls: 0,
+  };
+  const runDeltaReview: RunDeltaReviewFn = async () =>
+    ({
+      verdict: "needs-attention",
+      findings: [deltaFinding],
+      summary: "HIGH on lock surface",
+    }) as DeltaReviewResult;
+
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () =>
+      ({
+        title: "T",
+        body: "B",
+        comments: [{ author: TEST_ACTOR, body: priorReviewBody }],
+      }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+    getPrCommits: async () =>
+      ([
+        { oid: SHA_REVIEWED, messageHeadline: "feat: implement" },
+        { oid: SHA_HEAD, messageHeadline: "fix: minor" },
+      ]) as any,
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    getForIssue: async () => ({ path: "/fake/worktree" }) as any,
+    getGhActor: async () => TEST_ACTOR,
+    postComment: async (_cfg, _n, body) => { rec.comments.push(body); },
+    transition: async () => {},
+    setBlocked: async (_cfg, _n, reason) => { rec.blocked.push(reason); },
+    runDeltaReview,
+    readHeadFiles: async () => [
+      { path: "lock.ts", content: "function acquire() {\n  return mutex.lock();\n}", truncated: false, present: true },
+    ],
+    // concurrency is allowlisted — if carry-forward wrongly demotes, we would not
+    // hit auto-fix or block; if it correctly stays blocking, auto-fix runs (or
+    // block if implementer missing). Provide implementer so the path is auto-fix.
+    attemptPreMergeAutoFix: async () => {
+      rec.autoFixCalls += 1;
+      // Fail the fix so we land on needs-human with evidence rather than looping.
+      return { status: "error" as const, diagnostic: "test stub: no commit" };
+    },
+  };
+
+  const cfgWithPolicy = {
+    review_policy: { block_threshold: "low" as const, min_confidence: 0 },
+    harnesses: { reviewer: "claude", implementer: "claude" },
+  } as unknown as PipelineConfig;
+
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+
+  assert.notEqual(out, null, "must not advance when HIGH finding is not demoted by non-advancing advisory");
+  assert.ok(rec.blocked.length > 0 || rec.autoFixCalls > 0,
+    "HIGH on lock must remain blocking: auto-fix path or needs-human, not silent advance");
+  assert.ok(
+    !rec.comments.some((c) => /ADVISORY-CARRY-FORWARD/.test(c)),
+    "must not tag ADVISORY-CARRY-FORWARD from a non-advancing review's advisory",
+  );
 });

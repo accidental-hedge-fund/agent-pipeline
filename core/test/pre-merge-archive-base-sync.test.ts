@@ -11,6 +11,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { maybeArchiveOpenspec, type AdvancePreMergeDeps } from "../scripts/stages/pre_merge.ts";
+import { toPreMergeOfframpClass } from "../scripts/pre-merge-offramp.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 const cfg = {
@@ -260,4 +261,73 @@ test("maybeArchiveOpenspec: worktree already at origin/<branch> archives unchang
   );
   assert.deepEqual(archiveCalls, [CHANGE_ID], "archive must still run when already at the reviewed head");
   assert.equal((out as { status: string })?.status, "waiting", "behavior is unchanged when already in sync");
+});
+
+test("maybeArchiveOpenspec: fetch failure maps to residual other, not openspec-invalid (#683 review 2)", async (t) => {
+  const blocked: Array<{ reason: string; kind: string }> = [];
+  const gitInWorktree = (async (_p: string, args: string[]) => {
+    if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
+    if (args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+    if (args[0] === "fetch") return { stdout: "", stderr: "fatal: could not read from remote", code: 128 };
+    return { stdout: "", stderr: "", code: 0 };
+  }) as AdvancePreMergeDeps["gitInWorktree"];
+
+  const deps = baseDeps(gitInWorktree);
+  deps.setBlocked = (async (_cfg, _n, reason, _stage, kind) => {
+    blocked.push({ reason, kind: kind ?? "needs-human" });
+  }) as AdvancePreMergeDeps["setBlocked"];
+  deps.openspecArchive = (async () => {
+    throw new Error("archive must not run when fetch fails");
+  }) as AdvancePreMergeDeps["openspecArchive"];
+
+  let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
+  await quiet(t, async () => {
+    out = await maybeArchiveOpenspec(cfg, ISSUE, "run-1", deps);
+  });
+
+  assert.equal((out as { status: string })?.status, "blocked");
+  assert.equal((out as { blockerKind?: string }).blockerKind, "needs-human");
+  assert.equal(blocked[0]?.kind, "needs-human");
+  assert.equal(
+    toPreMergeOfframpClass({
+      blockerKind: (out as { blockerKind?: string }).blockerKind,
+      pathTag: (out as { offrampPathTag?: string }).offrampPathTag,
+    }),
+    "other",
+  );
+});
+
+test("maybeArchiveOpenspec: rev-parse failure maps to residual other, not openspec-invalid (#683 review 2)", async (t) => {
+  const blocked: Array<{ reason: string; kind: string }> = [];
+  const gitInWorktree = (async (_p: string, args: string[]) => {
+    if (args[0] === "diff") return { stdout: CHANGE_PATH, stderr: "", code: 0 };
+    if (args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+    if (args[0] === "fetch") return { stdout: "", stderr: "", code: 0 };
+    if (args[0] === "rev-parse") return { stdout: "", stderr: "fatal: ambiguous argument", code: 128 };
+    return { stdout: "", stderr: "", code: 0 };
+  }) as AdvancePreMergeDeps["gitInWorktree"];
+
+  const deps = baseDeps(gitInWorktree);
+  deps.setBlocked = (async (_cfg, _n, reason, _stage, kind) => {
+    blocked.push({ reason, kind: kind ?? "needs-human" });
+  }) as AdvancePreMergeDeps["setBlocked"];
+  deps.openspecArchive = (async () => {
+    throw new Error("archive must not run when rev-parse fails");
+  }) as AdvancePreMergeDeps["openspecArchive"];
+
+  let out: Awaited<ReturnType<typeof maybeArchiveOpenspec>> = null;
+  await quiet(t, async () => {
+    out = await maybeArchiveOpenspec(cfg, ISSUE, "run-1", deps);
+  });
+
+  assert.equal((out as { status: string })?.status, "blocked");
+  assert.equal((out as { blockerKind?: string }).blockerKind, "needs-human");
+  assert.equal(blocked[0]?.kind, "needs-human");
+  assert.equal(
+    toPreMergeOfframpClass({
+      blockerKind: (out as { blockerKind?: string }).blockerKind,
+      pathTag: (out as { offrampPathTag?: string }).offrampPathTag,
+    }),
+    "other",
+  );
 });

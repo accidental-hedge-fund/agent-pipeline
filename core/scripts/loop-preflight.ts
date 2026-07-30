@@ -337,6 +337,11 @@ export interface LoopArgs {
    *  canonical run for `selector` once it is terminally stopped. Always paired with a selector —
    *  {@link normalizeLoopArgs} refuses it alongside `--resume` or with no selector present. */
   newRun: boolean;
+  /**
+   * `--follow` (#611): read-only stage-progress follow. Only valid with `--audit`
+   * (observation path). Mutating `--resume` without `--audit` remains drive-only.
+   */
+  follow: boolean;
 }
 
 export class LoopArgError extends Error {}
@@ -354,6 +359,8 @@ export interface RawLoopArgs {
   resume?: string;
   audit?: boolean;
   newRun?: boolean;
+  /** Stage-progress follow (#611); only with `--audit`. */
+  follow?: boolean;
 }
 
 const RANGE_RE = /^(\d+)-(\d+)$/;
@@ -444,12 +451,21 @@ export function normalizeLoopArgs(raw: RawLoopArgs): LoopArgs {
       "pipeline:loop --new-run requires a selector (--milestone, --label, --range, --roadmap-slice, or an issue list) naming the run to supersede",
     );
   }
+  // Stage-progress follow (#611): observation only with `--audit`. Never dual-purpose
+  // a mutating `--resume` as follow without `--audit` (resume remains drive).
+  if (raw.follow && !raw.audit) {
+    throw new LoopArgError(
+      "pipeline:loop --follow requires --audit (read-only stage-progress follow). " +
+        "Use: pipeline loop --resume <run-id> --audit --follow",
+    );
+  }
 
   return {
     selector: present[0]?.[1],
     resumeRunId: raw.resume,
     audit: !!raw.audit,
     newRun: !!raw.newRun,
+    follow: !!raw.follow,
   };
 }
 
@@ -487,10 +503,11 @@ export async function runLoopPreflight(
     };
   }
 
-  // Selector-free `--audit` is a read-only report on an existing canonical
-  // run: it starts and resumes nothing, so the native-goal capability gate
-  // does not apply — a cross-engine operator whose CLI lacks native /goal
-  // support must still be able to audit (#451 delta finding ac3bdbd2).
+  // Selector-free `--audit` (with or without `--follow`) is a read-only report
+  // on an existing canonical run: it starts and resumes nothing, so the
+  // native-goal capability gate does not apply — a cross-engine operator whose
+  // CLI lacks native /goal support must still be able to audit (#451 delta
+  // finding ac3bdbd2). Stage-progress follow (#611) is the same class.
   const auditOnly = args.audit && args.selector === undefined && args.resumeRunId === undefined;
   if (!auditOnly) {
     const nativeGoal = await checkNativeGoalCapability(deps, engine, attestation);

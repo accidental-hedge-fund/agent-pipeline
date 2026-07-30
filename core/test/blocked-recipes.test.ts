@@ -174,6 +174,14 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     '`$pipeline 7 --override "<finding-key>: <reason>"` to advance past ' +
     "it (the key comes from the review comment; `--override` clears the " +
     "label and resumes automatically).",
+  "ci-exhausted":
+    "Pre-merge GitHub CI recovery budget for this head SHA is exhausted " +
+    "(automatic re-run / archive-aware recovery / optional assertion fix may " +
+    "already have been consumed — a pure re-run without a fix may not be " +
+    "enough). Inspect the failing check URL(s) and classification in the " +
+    "block reason above, fix product test/build failures or remaining " +
+    "infrastructure issues, push any code fix to the PR head, remove the " +
+    "`blocked` label, then re-run `$pipeline 7`.",
 };
 
 test("each kind's rendered recipe matches its pinned snapshot", () => {
@@ -239,6 +247,18 @@ test("needs-human directs to fix-and-re-run OR --override, and mentions label cl
   assert.ok(body.includes("re-run `$pipeline 7`"));
   assert.ok(body.includes("--override"));
   assert.ok(body.includes("`blocked`"));
+});
+
+test("ci-exhausted directs to inspect checks/fix CI/push/clear label/re-run — not review --override as primary", () => {
+  const body = comment("ci-exhausted");
+  assert.ok(body.includes("CI recovery budget"), "must name CI recovery budget");
+  assert.ok(body.includes("`blocked`"), "must mention blocked label");
+  assert.ok(body.includes("re-run `$pipeline 7`"), "must mention re-run pipeline");
+  assert.ok(body.includes("classification") || body.includes("check URL"), "must mention classification or check URLs");
+  // --override may appear nowhere; if it does, it must not be the primary path.
+  // Recipe deliberately omits review --override as the primary unblock verb.
+  assert.ok(!body.includes("--override"), "ci-exhausted must not present review --override as primary");
+  assert.ok(!body.includes("--unblock"));
 });
 
 test("openspec-invalid directs to openspec validate, fix, commit, clear label, re-run", () => {
