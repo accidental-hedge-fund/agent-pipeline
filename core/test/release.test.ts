@@ -15,6 +15,16 @@ import {
   scaffoldRoadmap,
   patchIntroLine,
   patchReleasePlanRow,
+  ensureReleasePlanRow,
+  formatPlanRowIssues,
+  formatReleasePlanRow,
+  resolveReleaseTheme,
+  themeFromMilestoneTitle,
+  planRowScaffoldWhy,
+  versionBumpType,
+  RELEASE_PLAN_ROW_SHAPE,
+  PLAN_ROW_THEME_PLACEHOLDER,
+  PLAN_ROW_ISSUES_PLACEHOLDER,
   prependShippedBlock,
   stampPerIssueTable,
   countPerIssueRows,
@@ -256,6 +266,7 @@ Post-1.0 the open backlog is **entirely additive**.
 |---|---|---|---|---|
 | **v1.5.0** ✅ shipped | minor | Pipeline Desk desktop contracts | #153, #154, #155, #156, #161 | Shipped 2026-06-16. |
 | **v1.6.0** | minor | Intake & backlog automation | #158, #170 | Intake and release automation. |
+| *(none)* | | research / tracker | #13, #14 | not a release |
 
 Per-issue sem-ver detail:
 
@@ -332,7 +343,8 @@ test("patchReleasePlanRow: marks the release plan row as ✅ shipped", () => {
   );
 });
 
-test("patchReleasePlanRow: throws when release plan row is not found", () => {
+test("patchReleasePlanRow: throws when release plan row is not found (bite: no ensure)", () => {
+  // Pure ship-mark still aborts without ensure — proves pre-#730 behavior of this helper.
   const text = "# Roadmap\n\n| Release | Bump | Theme | Issues | Why |\n|---|---|---|---|---|\n| **v1.5.0** | patch | A | #1 | B |\n";
   assert.throws(
     () => patchReleasePlanRow(text, SAMPLE_CTX),
@@ -342,6 +354,191 @@ test("patchReleasePlanRow: throws when release plan row is not found", () => {
       return true;
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// ensureReleasePlanRow (#730)
+// ---------------------------------------------------------------------------
+
+/** ROADMAP with four anchors but no v1.6.0 plan row; includes insert sentinel. */
+const ROADMAP_MISSING_PLAN_ROW = SAMPLE_ROADMAP.replace(
+  "| **v1.6.0** | minor | Intake & backlog automation | #158, #170 | Intake and release automation. |\n",
+  "",
+);
+
+test("ensureReleasePlanRow: inserts unshipped row before *(none)* when missing", () => {
+  assert.ok(!ROADMAP_MISSING_PLAN_ROW.includes("| **v1.6.0**"), "fixture has no v1.6.0 row");
+  const result = ensureReleasePlanRow(ROADMAP_MISSING_PLAN_ROW, {
+    version: "1.6.0",
+    theme: "Factory reliability",
+    issues: "#730, #723",
+    why: planRowScaffoldWhy("1.6.0"),
+  });
+  const expected = formatReleasePlanRow(
+    "1.6.0",
+    "minor",
+    "Factory reliability",
+    "#730, #723",
+    planRowScaffoldWhy("1.6.0"),
+  );
+  assert.ok(result.includes(expected), `expected row missing:\n${expected}\n---\n${result}`);
+  const rowIdx = result.indexOf("| **v1.6.0**");
+  const noneIdx = result.indexOf("| *(none)* |");
+  assert.ok(rowIdx >= 0 && noneIdx > rowIdx, "scaffolded row precedes *(none)* sentinel");
+  assert.ok(!result.includes("✅ shipped") || !result.split("\n").find((l) => l.startsWith("| **v1.6.0**") && l.includes("✅ shipped")),
+    "scaffolded row must be unshipped");
+  const unshipped = result.split("\n").find((l) => l.startsWith("| **v1.6.0**"));
+  assert.ok(unshipped && !unshipped.includes("✅ shipped"), "unshipped only");
+});
+
+test("ensureReleasePlanRow: leaves existing unshipped row unchanged (no duplicate)", () => {
+  const result = ensureReleasePlanRow(SAMPLE_ROADMAP, {
+    version: "1.6.0",
+    theme: "SHOULD NOT APPEAR",
+    issues: "#999",
+  });
+  assert.equal(result, SAMPLE_ROADMAP, "must be a pure no-op when unshipped row exists");
+  assert.equal(
+    result.split("\n").filter((l) => l.startsWith("| **v1.6.0**")).length,
+    1,
+    "exactly one v1.6.0 plan row",
+  );
+});
+
+test("ensureReleasePlanRow: never overwrites or duplicates an already-shipped row", () => {
+  const shippedOnly = SAMPLE_ROADMAP.replace(
+    "| **v1.6.0** | minor | Intake & backlog automation | #158, #170 | Intake and release automation. |",
+    "| **v1.6.0** ✅ shipped | minor | Intake & backlog automation | #158, #170 | Shipped already. |",
+  );
+  const result = ensureReleasePlanRow(shippedOnly, {
+    version: "1.6.0",
+    theme: "wrong",
+    issues: "#1",
+  });
+  assert.equal(result, shippedOnly);
+  assert.ok(result.includes("| **v1.6.0** ✅ shipped |"), "shipped marker preserved");
+  assert.equal(
+    result.split("\n").filter((l) => l.startsWith("| **v1.6.0**")).length,
+    1,
+    "no second unshipped row",
+  );
+});
+
+test("ensureReleasePlanRow: impossible insert fails with doctor-grade remediation", () => {
+  const noSentinel = ROADMAP_MISSING_PLAN_ROW.replace("| *(none)* |", "| *(elsewhere)* |");
+  assert.throws(
+    () => ensureReleasePlanRow(noSentinel, { version: "1.6.0", theme: "T", issues: "#1" }),
+    (err: Error) => {
+      assert.ok(err.message.includes("release-plan-none-row"), `got: ${err.message}`);
+      assert.ok(err.message.includes("ROADMAP.md"), `got: ${err.message}`);
+      assert.ok(err.message.includes("| **v1.6.0** |"), `copy-paste row missing: ${err.message}`);
+      assert.ok(err.message.includes("| *(none)* |") || err.message.includes("sentinel"), `location: ${err.message}`);
+      assert.ok(err.message.includes(RELEASE_PLAN_ROW_SHAPE) || err.message.includes("Column shape"), `shape: ${err.message}`);
+      return true;
+    },
+  );
+});
+
+test("scaffoldRoadmap: missing unshipped plan row is scaffolded then ship-marked", () => {
+  const result = scaffoldRoadmap(ROADMAP_MISSING_PLAN_ROW, {
+    ...SAMPLE_CTX,
+    theme: "Factory reliability",
+    planIssueNumbers: [730],
+  });
+  assert.ok(result.includes("**v1.6.0** ✅ shipped"), "ship-mark after ensure");
+  assert.ok(result.includes("Factory reliability"), "theme from context on scaffolded path");
+  assert.ok(result.includes("**v1.6.0 shipped 2026-06-17**"), "intro still patched");
+});
+
+test("scaffoldRoadmap: shipped-only plan row is preserved (ship-mark no-op, no duplicate)", () => {
+  // Regression for #730 review-1 (eb3d985c): ensure + patchReleasePlanRow + full
+  // scaffold must not abort when only `| **v{version}** ✅ shipped |` exists.
+  // ensure is a no-op; ship-mark is idempotent; other sites still patch.
+  const shippedOnly = SAMPLE_ROADMAP.replace(
+    "| **v1.6.0** | minor | Intake & backlog automation | #158, #170 | Intake and release automation. |",
+    "| **v1.6.0** ✅ shipped | minor | Intake & backlog automation | #158, #170 | Shipped already. |",
+  );
+  assert.ok(
+    shippedOnly.split("\n").some((l) => l.startsWith("| **v1.6.0**") && l.includes("✅ shipped")),
+    "fixture has shipped-only v1.6.0 plan row",
+  );
+  assert.ok(
+    !shippedOnly.split("\n").some((l) => l.startsWith("| **v1.6.0**") && !l.includes("✅ shipped")),
+    "fixture has no unshipped v1.6.0 plan row",
+  );
+
+  // Direct ship-mark helper is already idempotent on shipped-only rows.
+  assert.equal(patchReleasePlanRow(shippedOnly, SAMPLE_CTX), shippedOnly);
+
+  const result = scaffoldRoadmap(shippedOnly, SAMPLE_CTX);
+  const planRows = result.split("\n").filter((l) => l.startsWith("| **v1.6.0**"));
+  assert.equal(planRows.length, 1, "exactly one v1.6.0 plan row (no unshipped duplicate)");
+  assert.ok(planRows[0].includes("✅ shipped"), "shipped marker preserved");
+  assert.ok(
+    planRows[0].includes("Shipped already."),
+    "original shipped why-column preserved (ship-mark no-op)",
+  );
+  assert.ok(result.includes("**v1.6.0 shipped 2026-06-17**"), "intro still patched");
+  assert.ok(
+    result.includes("**v1.6.0 — Intake & backlog automation (shipped 2026-06-17"),
+    "shipped section still prepended",
+  );
+});
+
+test("scaffoldRoadmap bite: without ensure, missing plan row still fails patchReleasePlanRow", () => {
+  // Documents that the regression is specifically ensure-before-mutate: calling
+  // patch alone on a missing row throws; scaffoldRoadmap with ensure does not.
+  assert.throws(
+    () => patchReleasePlanRow(ROADMAP_MISSING_PLAN_ROW, SAMPLE_CTX),
+    /release-plan-row/,
+  );
+  assert.doesNotThrow(() => scaffoldRoadmap(ROADMAP_MISSING_PLAN_ROW, SAMPLE_CTX));
+});
+
+test("resolveReleaseTheme: --theme overrides milestone and plan-row", () => {
+  assert.equal(
+    resolveReleaseTheme({
+      cliTheme: "Factory reliability",
+      roadmapText: SAMPLE_ROADMAP,
+      version: "1.6.0",
+      milestoneTitle: "v1.6.0 — from milestone",
+    }),
+    "Factory reliability",
+  );
+});
+
+test("resolveReleaseTheme: milestone title when no CLI theme and no plan row", () => {
+  assert.equal(
+    resolveReleaseTheme({
+      roadmapText: ROADMAP_MISSING_PLAN_ROW,
+      version: "1.6.0",
+      milestoneTitle: "v1.6.0 — Factory reliability",
+    }),
+    "Factory reliability",
+  );
+});
+
+test("resolveReleaseTheme: placeholder when nothing available", () => {
+  assert.equal(
+    resolveReleaseTheme({ roadmapText: ROADMAP_MISSING_PLAN_ROW, version: "1.6.0" }),
+    PLAN_ROW_THEME_PLACEHOLDER,
+  );
+});
+
+test("themeFromMilestoneTitle: strips version prefix", () => {
+  assert.equal(themeFromMilestoneTitle("v1.29.0 — Factory reliability", "1.29.0"), "Factory reliability");
+  assert.equal(themeFromMilestoneTitle("1.6.0: Intake", "1.6.0"), "Intake");
+});
+
+test("formatPlanRowIssues: never invents numbers; placeholder when empty", () => {
+  assert.equal(formatPlanRowIssues([]), PLAN_ROW_ISSUES_PLACEHOLDER);
+  assert.equal(formatPlanRowIssues([170, 158, 170]), "#158, #170");
+});
+
+test("versionBumpType: major/minor/patch from semver", () => {
+  assert.equal(versionBumpType("2.0.0"), "major");
+  assert.equal(versionBumpType("1.6.0"), "minor");
+  assert.equal(versionBumpType("1.6.1"), "patch");
 });
 
 test("prependShippedBlock: inserts new shipped block before the previous version's block", () => {
@@ -919,16 +1116,16 @@ test("runRelease live: CI failure aborts before any fetchPRClosingIssues call", 
   assert.ok(!closingCalled, "fetchPRClosingIssues must NOT be called when CI fails");
 });
 
-test("runRelease live: missing ROADMAP anchor aborts before any file write", async () => {
+test("runRelease live: impossible plan-row insert aborts before any file write with remediation", async () => {
   const writes: string[] = [];
-  // ROADMAP missing the release-plan row for v1.6.0
-  const roadmapMissingRow = SAMPLE_ROADMAP.replace("| **v1.6.0** |", "| **v1.7.0** |");
+  // Missing v1.6.0 plan row AND no insert sentinel → ensure cannot scaffold.
+  const roadmapBroken = ROADMAP_MISSING_PLAN_ROW.replace("| *(none)* |", "| *(gone)* |");
 
   const deps = makeDeps({
     readFile: (p) => {
       if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
       if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
-      if (p.endsWith("ROADMAP.md")) return roadmapMissingRow;
+      if (p.endsWith("ROADMAP.md")) return roadmapBroken;
       throw new Error(`unexpected read: ${p}`);
     },
     writeFile: (p) => { writes.push(p); },
@@ -940,9 +1137,183 @@ test("runRelease live: missing ROADMAP anchor aborts before any file write", asy
 
   await assert.rejects(
     () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
-    (err: Error) => err.message.includes("release-plan-row"),
+    (err: Error) => {
+      assert.ok(
+        err.message.includes("release-plan-none-row") || err.message.includes("cannot auto-scaffold"),
+        `got: ${err.message}`,
+      );
+      assert.ok(err.message.includes("ROADMAP.md"), `got: ${err.message}`);
+      assert.ok(err.message.includes("| **v1.6.0** |"), `got: ${err.message}`);
+      return true;
+    },
   );
-  assert.equal(writes.length, 0, "no files written when ROADMAP anchor is missing");
+  assert.equal(writes.length, 0, "no files written when plan-row insert is impossible");
+});
+
+test("runRelease live: missing plan row is scaffolded when *(none)* sentinel present (no abort)", async () => {
+  const writes: Record<string, string> = {};
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return ROADMAP_MISSING_PLAN_ROW;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p, c) => { writes[p] = c; },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "node") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "npm") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "checkout") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "add") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "commit") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "push") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "clean") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr") {
+        return { code: 0, stdout: "https://github.com/org/repo/pull/999", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchPRClosingIssues: async () => [],
+  });
+
+  await runRelease(
+    "1.6.0",
+    { noEdit: true, theme: "Factory reliability" },
+    { repo_dir: "/repo", repo: "org/repo" },
+    deps,
+  );
+
+  const roadmapPath = Object.keys(writes).find((p) => p.endsWith("ROADMAP.md"));
+  assert.ok(roadmapPath, "ROADMAP.md was written");
+  assert.ok(writes[roadmapPath].includes("**v1.6.0** ✅ shipped"), "scaffolded then ship-marked");
+  assert.ok(writes[roadmapPath].includes("Factory reliability"), "CLI theme on scaffolded row path");
+});
+
+test("runRelease dry-run: missing plan row appears in ROADMAP diff without writes", async () => {
+  const writes: string[] = [];
+  const stdout: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return ROADMAP_MISSING_PLAN_ROW;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => { writes.push(p); },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    stdout: (msg) => { stdout.push(msg); },
+  });
+
+  await runRelease(
+    "1.6.0",
+    { dryRun: true, theme: "Dry-run theme" },
+    { repo_dir: "/repo", repo: "org/repo" },
+    deps,
+  );
+
+  assert.equal(writes.length, 0, "dry-run must not write");
+  const combined = stdout.join("\n");
+  assert.ok(combined.includes("ROADMAP.md") || combined.includes("**v1.6.0**"), `got: ${combined.slice(0, 500)}`);
+  assert.ok(
+    combined.includes("| **v1.6.0**") || combined.includes("**v1.6.0** ✅ shipped") || combined.includes("+| **v1.6.0**"),
+    `scaffolded plan row should appear in dry-run diff: ${combined.slice(0, 1500)}`,
+  );
+});
+
+test("runRelease: --theme wins over milestone for scaffolded plan row", async () => {
+  let sawTheme = "";
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return ROADMAP_MISSING_PLAN_ROW;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p, c) => {
+      if (p.endsWith("ROADMAP.md")) sawTheme = c;
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "node" || cmd === "npm") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && (args[0] === "checkout" || args[0] === "add" || args[0] === "commit" || args[0] === "push" || args[0] === "clean")) {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "gh") return { code: 0, stdout: "https://github.com/org/repo/pull/1", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchMilestoneForVersion: async () => ({
+      title: "v1.6.0 — From milestone",
+      issueNumbers: [999],
+    }),
+    fetchPRClosingIssues: async () => [],
+  });
+
+  await runRelease(
+    "1.6.0",
+    { noEdit: true, theme: "CLI theme wins" },
+    { repo_dir: "/repo", repo: "org/repo" },
+    deps,
+  );
+  assert.ok(sawTheme.includes("CLI theme wins"), "CLI --theme overrides milestone");
+  assert.ok(!sawTheme.includes("From milestone"), "milestone theme must not win over CLI");
+});
+
+test("runRelease: milestone theme used when --theme absent and plan row missing", async () => {
+  let saw = "";
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return ROADMAP_MISSING_PLAN_ROW;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p, c) => {
+      if (p.endsWith("ROADMAP.md")) saw = c;
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "node" || cmd === "npm") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && (args[0] === "checkout" || args[0] === "add" || args[0] === "commit" || args[0] === "push" || args[0] === "clean")) {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "gh") return { code: 0, stdout: "https://github.com/org/repo/pull/1", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchMilestoneForVersion: async () => ({
+      title: "v1.6.0 — Milestone theme only",
+      issueNumbers: [730, 723],
+    }),
+    fetchPRClosingIssues: async () => [],
+  });
+
+  await runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+  assert.ok(saw.includes("Milestone theme only"), "milestone title used for theme");
+  // Issues from milestone should appear in the (now ship-marked) plan row history — why column is rewritten on ship-mark,
+  // but Issues column is preserved by patchReleasePlanRow (only release col + why change).
+  assert.ok(saw.includes("#723") || saw.includes("#730"), `milestone issues on plan row: ${saw.match(/\| \*\*v1\.6\.0\*\*[^\n]*/)?.[0]}`);
+});
+
+test("CLI: release usage documents unshipped plan-row shape", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "release"],
+    { encoding: "utf8", env: { ...process.env, PATH: "" } },
+  );
+  assert.notEqual(result.status, 0);
+  const combined = (result.stdout ?? "") + (result.stderr ?? "");
+  assert.ok(combined.includes("| **vX.Y.Z** |"), `got: ${combined}`);
+  assert.ok(combined.includes("scaffold") || combined.includes("auto-scaffold") || combined.includes("*(none)*"), `got: ${combined}`);
 });
 
 test("runRelease dry-run: fetchPRClosingIssues is never called", async () => {
@@ -1249,6 +1620,7 @@ test("CLI: 'pipeline release' with no version exits non-zero with usage message 
   assert.notEqual(result.status, 0, "should exit non-zero");
   const combined = (result.stdout ?? "") + (result.stderr ?? "");
   assert.ok(combined.includes("version argument is required"), `got: ${combined}`);
+  assert.ok(combined.includes("| **vX.Y.Z** |"), `usage should document plan-row shape: ${combined}`);
 });
 
 test("CLI: 'pipeline release 42' (numeric) exits non-zero with ambiguity message (early check, no config needed)", () => {
