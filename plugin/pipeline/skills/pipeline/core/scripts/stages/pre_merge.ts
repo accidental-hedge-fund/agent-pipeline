@@ -582,6 +582,11 @@ function formatFindingDispositionLabel(f: ReviewFinding): string {
  * Operator-facing block reason after a pre-merge delta blocking round that used
  * category partition (#747). Distinguishes residual human-required findings
  * from allowlisted findings that were (or were not) auto-fix attempted.
+ *
+ * When `noopStillBroken` is set (clean no-commit re-verify still blocks), the
+ * lead sentence uses the #698 no-op still-broken recipe while residual /
+ * allowlisted disposition labels are still appended (#747 review-2 / 826962b1).
+ * Diagnostic is appended once at the end (not double-nested into the recipe).
  */
 export function formatPartitionDispositionReason(args: {
   residual: ReviewFinding[];
@@ -594,12 +599,20 @@ export function formatPartitionDispositionReason(args: {
    */
   attempted: boolean;
   diagnostic?: string;
+  /**
+   * Still-blocking findings after a clean no-commit re-verify. When provided,
+   * lead with {@link formatNoopStillBrokenReason} (without diagnostic — see
+   * `diagnostic` above) instead of the generic "fix required" lead.
+   */
+  noopStillBroken?: ReviewFinding[];
 }): string {
-  const { residual, autoFixable, attempted, diagnostic } = args;
+  const { residual, autoFixable, attempted, diagnostic, noopStillBroken } = args;
   const residualLabels = residual.map(formatFindingDispositionLabel);
   const autoLabels = autoFixable.map(formatFindingDispositionLabel);
   const parts: string[] = [
-    "Pre-merge delta review found blocking findings; fix required before merging.",
+    noopStillBroken
+      ? formatNoopStillBrokenReason(noopStillBroken)
+      : "Pre-merge delta review found blocking findings; fix required before merging.",
   ];
   if (residualLabels.length > 0) {
     parts.push(
@@ -3062,10 +3075,19 @@ export async function enforceReviewShaGate(
               dispositionAutoFixable = categoryPartition.autoFixable;
             }
             if (wasNoopClean && rePartition.blocking.length > 0 && !reIsUnparseable) {
-              autoFixBlockReason = formatNoopStillBrokenReason(
-                rePartition.blocking,
-                fixRes.status === "noop-clean" ? fixRes.diagnostic : autoFixDiagnostic,
-              );
+              // Compose the #698 no-op still-broken recipe with partition
+              // disposition labels so residual human-required keys and the
+              // allowlisted attempt scope remain visible (#747 review-2 /
+              // 826962b1). Preferring formatNoopStillBrokenReason alone used
+              // to discard residual-vs-attempted naming on this path.
+              autoFixBlockReason = formatPartitionDispositionReason({
+                residual: dispositionResidual,
+                autoFixable: dispositionAutoFixable,
+                attempted: autoFixAttemptRecognized,
+                diagnostic:
+                  fixRes.status === "noop-clean" ? fixRes.diagnostic : autoFixDiagnostic,
+                noopStillBroken: rePartition.blocking,
+              });
             }
             await recordPreMergeGateResult(
               { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },

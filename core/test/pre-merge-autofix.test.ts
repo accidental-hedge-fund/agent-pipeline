@@ -421,6 +421,31 @@ test("formatPartitionDispositionReason: residual no-attempt vs attempted (#747)"
   assert.doesNotMatch(mixed, /no auto-fix attempt/);
 });
 
+test("formatPartitionDispositionReason: noop-still-broken lead keeps residual + attempted labels (#747 826962b1)", () => {
+  const residual = [
+    {
+      ...blockingFinding("spec-divergence", "Partial list"),
+      file: "core/scripts/stages/pre_merge.ts",
+    } as ReviewFinding,
+  ];
+  const auto = [blockingFinding("concurrency", "TOCTOU")];
+  const reason = formatPartitionDispositionReason({
+    residual,
+    autoFixable: auto,
+    attempted: true,
+    diagnostic: "worktree /x clean",
+    noopStillBroken: [...auto, ...residual],
+  });
+  assert.match(reason, /auto-fix made no diff/);
+  assert.match(reason, /core\/scripts\/stages\/pre_merge\.ts/);
+  assert.match(reason, /Human disposition required for residual non-allowlisted:/);
+  assert.match(reason, /spec-divergence/);
+  assert.match(reason, /Auto-fix attempted for allowlisted:/);
+  assert.match(reason, /concurrency/);
+  assert.match(reason, /worktree \/x clean/);
+  assert.doesNotMatch(reason, /no auto-fix attempt/);
+});
+
 // ---------------------------------------------------------------------------
 // 5.1: all-correctness → auto-fix → re-review approves → proceeds
 // ---------------------------------------------------------------------------
@@ -2484,6 +2509,57 @@ test("pre-merge auto-fix #698: noop-clean → re-verify still blocks → needs-h
   assert.match(rec.blocked[0].reason, /auto-fix made no diff/);
   assert.match(rec.blocked[0].reason, /core\/scripts\/stages\/pre_merge\.ts/);
   assert.match(rec.blocked[0].reason, /\/fake\/worktree/);
+});
+
+test("pre-merge auto-fix #747: mixed noop-clean re-verify still blocks keeps residual + attempted labels (826962b1)", async (t) => {
+  // Bite: autoFixBlockReason = formatNoopStillBrokenReason alone discarded
+  // partition disposition naming on the clean-noop re-verify block path.
+  const concurrency = blockingFinding("concurrency", "TOCTOU on shared marker");
+  const residualStill: ReviewFinding = {
+    ...reRaisedBlockingFinding(
+      blockingFinding("spec-divergence", "Partial list still unwired after noop"),
+    ),
+    file: "core/scripts/stages/pre_merge.ts",
+  } as ReviewFinding;
+  const allowlistedStill: ReviewFinding = {
+    ...reRaisedBlockingFinding(
+      blockingFinding("concurrency", "TOCTOU still races after noop"),
+    ),
+    file: "core/scripts/lock.ts",
+  } as ReviewFinding;
+  const { deps, rec } = makeDeps({
+    findings: [concurrency, blockingFinding("spec-divergence", "Partial list AC")],
+    reReviewFindings: [allowlistedStill, residualStill],
+    autoFixResult: "noop-clean",
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out?.status, "blocked");
+  assert.equal(rec.autoFixCalls, 1, "one bounded auto-fix on allowlisted subset");
+  assert.equal(rec.deltaReviewCalls, 2, "initial delta + post-noop re-verify");
+  assert.equal(rec.autoFixFindings.length, 1);
+  assert.equal(rec.autoFixFindings[0].category, "concurrency");
+  assert.equal(rec.blocked.length, 1);
+  // Noop recipe preserved.
+  assert.match(rec.blocked[0].reason, /auto-fix made no diff/);
+  assert.match(rec.blocked[0].reason, /human fix required/i);
+  // Partition disposition labels must survive the noop block-reason path.
+  assert.match(
+    rec.blocked[0].reason,
+    /Human disposition required for residual non-allowlisted:/,
+    "residual human-required subset must be named",
+  );
+  assert.match(rec.blocked[0].reason, /spec-divergence/);
+  assert.match(
+    rec.blocked[0].reason,
+    /Auto-fix attempted for allowlisted:/,
+    "allowlisted attempt scope must be named",
+  );
+  assert.match(rec.blocked[0].reason, /concurrency/);
+  assert.match(rec.blocked[0].reason, /\/fake\/worktree/);
+  assert.doesNotMatch(rec.blocked[0].reason, /no auto-fix attempt/);
 });
 
 test("pre-merge auto-fix #698: prior durable noop-clean marker exhausts attempt without second harness invoke", async (t) => {
