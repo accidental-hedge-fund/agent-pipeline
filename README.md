@@ -12,7 +12,7 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 
 | Band | What happens |
 | --- | --- |
-| Spec before code | `planning` writes the implementation plan/spec, and when enabled, `plan-review` is **independent agent plan review** plus an optional **human feedback window** — not human sign-off. OpenSpec-backed repos reconcile and archive specs during `pre-merge`. |
+| Spec before code | `planning` writes the implementation plan/spec; when enabled, `plan-review` is **independent agent plan review** (or a labeled **same-harness self-review** if the **reviewer CLI is missing** — see Prerequisites) plus an optional **human feedback window** — not human sign-off. OpenSpec-backed repos reconcile and archive specs during `pre-merge`. |
 | Structured review | Reviewers emit findings with severity, confidence, and file/line context. The same review input should lead to the same advance/block decision, not a model coin flip. |
 | Bounded convergence | Review/fix rounds are capped by policy and guarded against recurring findings. If the run cannot converge cleanly, it stops with evidence instead of looping indefinitely. |
 | Surgical fixes | `fix-1` and `fix-2` are scoped to reviewer findings. No opportunistic refactors, no scope creep, no destructive cleanup. |
@@ -30,6 +30,7 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 - [Quickstart](#quickstart)
 - [Install](#install)
 - [Where to go next](#where-to-go-next)
+- [Human plan feedback](#human-plan-feedback)
 - [Development](#development)
 - [License](#license)
 
@@ -205,6 +206,14 @@ Configuration reference: start at [docs/config.md](docs/config.md). Common entry
 ```
 
 The complete command inventory is in [docs/cli.md](docs/cli.md) — it is **not** hand-maintained in this README.
+
+### Human plan feedback
+
+When `plan_review` is on, the pipeline posts the plan and runs **independent agent plan review** via the configured reviewer. That is agent evidence, **not** human approval or sign-off. If the reviewer CLI is missing, the [same-harness fallback](#prerequisites) applies: the implementing harness reviews its own plan, and the posted review is **prominently labeled as a same-harness self-review**. That path still advances (the pipeline never merges), but it is **not** independent agent plan review.
+
+An optional **human feedback window** may follow. When the window ends with **no** human comments, plan revision proceeds from agent plan-review feedback only: missing human input **does not block the advance** and is **not recorded as human approval**.
+
+**Authority boundary:** independent agent plan review (or labeled same-harness self-review) is plan-review evidence; **human attestation** is provenance, not plan sign-off; **human approval** remains the merge button at `ready-to-deploy` (and other true human gates such as `needs-human` dispositions).
 
 ## Development
 
