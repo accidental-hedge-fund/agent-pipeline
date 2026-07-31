@@ -9,8 +9,15 @@
 // Also exercises the documented material-filter install path (#742): after
 // install, `scripts/material-filter.mjs` must run against fixture JSONL and
 // emit material one-liners (the host skill preferred notify command).
+//
+// TMPDIR is sandboxed under the smoke tree so installer/shim lock paths
+// (`.pipeline-installer-update.lock`, `pipeline-starting-<pid>.lock`) never
+// collide with concurrent host pipeline runs or sibling CI jobs. Without
+// that isolation, a concurrent installer's host-wide update lock makes the
+// post-install `shim --help` refuse with "install/update is in progress"
+// and flakes the test gate.
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -110,6 +117,10 @@ function assertInstalledMaterialFilter(filterScript, env) {
 }
 
 const configDir = mkdtempSync(join(tmpdir(), "pipeline-smoke-"));
+// Sandbox lock paths under the smoke tree (see file header). Nested so the
+// final rmSync of configDir cleans both skill files and locks.
+const lockTmpDir = join(configDir, "tmp");
+mkdirSync(lockTmpDir, { recursive: true });
 try {
   const installScript = join(REPO_ROOT, "scripts", "install.mjs");
   const shimScript = join(configDir, "skills", "pipeline", "scripts", "pipeline.mjs");
@@ -120,7 +131,7 @@ try {
     "scripts",
     "material-filter.mjs",
   );
-  const env = { CLAUDE_CONFIG_DIR: configDir };
+  const env = { CLAUDE_CONFIG_DIR: configDir, TMPDIR: lockTmpDir };
 
   run([installScript, "install", "--host", "claude"], env);
   run([shimScript, "--help"], env);
@@ -128,11 +139,9 @@ try {
   assertInstalledMaterialFilter(materialFilterScript, env);
   // `update` refreshes the installed skill in place; running it twice must be
   // a net no-op (no error, shim still runs) — the documented remediation for
-  // a stale install:version-freshness warning. --force: this smoke test's
-  // CLAUDE_CONFIG_DIR is an isolated sandbox, not a real install, but the
-  // live-run lock scan (#450) is host-wide (any /tmp/pipeline-*.lock), so it
-  // correctly — and, here, irrelevantly — sees this very CI/pipeline process's
-  // own lock. --force is the documented override for exactly that case.
+  // a stale install:version-freshness warning. --force remains the documented
+  // override when a live-run lock is present; with TMPDIR sandboxed, that scan
+  // only sees locks inside this smoke tree (not the host pipeline process).
   run([installScript, "update", "--host", "claude", "--force"], env);
   run([shimScript, "--help"], env);
   assertInstalledMaterialFilter(materialFilterScript, env);
