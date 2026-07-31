@@ -9,11 +9,13 @@ import {
   allBlockingAutoFixable,
   enforceReviewShaGate,
   formatNoopStillBrokenReason,
+  formatPartitionDispositionReason,
   hasPreMergeAutofixAttemptAtHead,
   hasPreMergeAutofixBoundMarkerAtHead,
   hasPreMergeAutofixNoopAtHead,
   isAutoFixableFinding,
   isPipelineInternalCommit,
+  partitionBlockingForAutofix,
   performPreMergeAutoFix,
   preMergeAutofixAttemptComment,
   preMergeAutofixNoopComment,
@@ -33,6 +35,7 @@ import {
   citedRegionContent,
   extractClassificationTokens,
   extractKnownPipelineClassificationTokens,
+  findingKey,
   HEAD_ALREADY_IMPLEMENTS_RECOMMENDATION,
   headImplementsRecommendedClassification,
   isClassificationOrControlFlowClaim,
@@ -79,11 +82,28 @@ function blockingFinding(category: string, title = "Finding"): ReviewFinding {
   } as ReviewFinding;
 }
 
+/**
+ * Same finding re-raised on post-auto-fix re-delta with a prior-round
+ * acknowledgment so the #389 reversal guard does not demote it to advisory.
+ * Use for residual-still-blocks fixtures after a partition auto-fix (#747).
+ */
+function reRaisedBlockingFinding(f: ReviewFinding): ReviewFinding {
+  return {
+    ...f,
+    prior_round_acknowledgment:
+      "Re-raised after auto-fix: residual category still requires human disposition.",
+  } as ReviewFinding;
+}
+
 interface Rec {
   comments: string[];
   blocked: Array<{ reason: string }>;
   autoFixCalls: number;
   deltaReviewCalls: number;
+  /** Findings passed into the auto-fix seam (allowlisted subset only, #747). */
+  autoFixFindings: ReviewFinding[];
+  /** Review comment body passed into the auto-fix seam. */
+  autoFixReviewComment: string | null;
 }
 
 /**
@@ -121,7 +141,14 @@ function makeDeps(opts: {
    */
   headFiles?: HeadFileState[];
 }): { deps: ShaGateDeps; rec: Rec } {
-  const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0 };
+  const rec: Rec = {
+    comments: [],
+    blocked: [],
+    autoFixCalls: 0,
+    deltaReviewCalls: 0,
+    autoFixFindings: [],
+    autoFixReviewComment: null,
+  };
 
   // The authoritative post-fix head the auto-fix seam carries back (#371) —
   // must match what `getPrDetail` below reports post-fix so the post-approval
@@ -132,8 +159,10 @@ function makeDeps(opts: {
     "pre-merge fix harness for #16 ran but left worktree /fake/worktree clean with no new " +
       "commit — no recoverable work was found there";
 
-  const autoFix: AttemptPreMergeAutoFixFn = async () => {
+  const autoFix: AttemptPreMergeAutoFixFn = async (findings, _title, reviewComment) => {
     rec.autoFixCalls++;
+    rec.autoFixFindings = findings;
+    rec.autoFixReviewComment = reviewComment;
     if (opts.autoFixResult === "fix-committed") {
       return { status: "fix-committed", headSha: postFixHeadSha };
     }
@@ -332,15 +361,89 @@ test("allBlockingAutoFixable: allowlisted sets → true; mixed security / empty 
   assert.equal(
     allBlockingAutoFixable([blockingFinding("correctness"), blockingFinding("security")]),
     false,
-    "mixed with security → false",
+    "mixed with security → false (all-or-nothing helper; attempt gate uses partition)",
   );
   assert.equal(
     allBlockingAutoFixable([blockingFinding("concurrency"), blockingFinding("security")]),
     false,
-    "concurrency + security → false",
+    "concurrency + security → false (all-or-nothing helper)",
   );
   assert.equal(allBlockingAutoFixable([]), false, "empty → false");
   assert.equal(allBlockingAutoFixable([blockingFinding("product-judgment-required")]), false);
+});
+
+// ---------------------------------------------------------------------------
+// #747: category partition helpers (not all-or-nothing veto)
+// ---------------------------------------------------------------------------
+
+test("partitionBlockingForAutofix: splits allowlisted vs residual (#747)", () => {
+  const concurrency = blockingFinding("concurrency", "TOCTOU on lock");
+  const correctness = blockingFinding("correctness", "Off-by-one");
+  const specDiv = blockingFinding("spec-divergence", "Partial list wiring");
+  const security = blockingFinding("security", "Auth gap");
+  const p = partitionBlockingForAutofix([concurrency, correctness, specDiv, security]);
+  assert.deepEqual(p.autoFixable, [concurrency, correctness]);
+  assert.deepEqual(p.residual, [specDiv, security]);
+  assert.equal(partitionBlockingForAutofix([]).autoFixable.length, 0);
+  assert.equal(partitionBlockingForAutofix([]).residual.length, 0);
+  assert.equal(
+    partitionBlockingForAutofix([specDiv, security]).autoFixable.length,
+    0,
+    "pure residual → empty autoFixable",
+  );
+  assert.equal(
+    partitionBlockingForAutofix([concurrency, correctness]).residual.length,
+    0,
+    "pure allowlisted → empty residual",
+  );
+});
+
+test("formatPartitionDispositionReason: residual no-attempt vs attempted (#747)", () => {
+  const residual = [blockingFinding("spec-divergence", "Partial list")];
+  const auto = [blockingFinding("concurrency", "TOCTOU")];
+  const noAttempt = formatPartitionDispositionReason({
+    residual,
+    autoFixable: [],
+    attempted: false,
+  });
+  assert.match(noAttempt, /no auto-fix attempt/);
+  assert.match(noAttempt, /spec-divergence/);
+  assert.doesNotMatch(noAttempt, /Auto-fix attempted/);
+
+  const mixed = formatPartitionDispositionReason({
+    residual,
+    autoFixable: auto,
+    attempted: true,
+  });
+  assert.match(mixed, /Human disposition required for residual non-allowlisted:/);
+  assert.match(mixed, /Auto-fix attempted for allowlisted:/);
+  assert.match(mixed, /concurrency/);
+  assert.doesNotMatch(mixed, /no auto-fix attempt/);
+});
+
+test("formatPartitionDispositionReason: noop-still-broken lead keeps residual + attempted labels (#747 826962b1)", () => {
+  const residual = [
+    {
+      ...blockingFinding("spec-divergence", "Partial list"),
+      file: "core/scripts/stages/pre_merge.ts",
+    } as ReviewFinding,
+  ];
+  const auto = [blockingFinding("concurrency", "TOCTOU")];
+  const reason = formatPartitionDispositionReason({
+    residual,
+    autoFixable: auto,
+    attempted: true,
+    diagnostic: "worktree /x clean",
+    noopStillBroken: [...auto, ...residual],
+  });
+  assert.match(reason, /auto-fix made no diff/);
+  assert.match(reason, /core\/scripts\/stages\/pre_merge\.ts/);
+  assert.match(reason, /Human disposition required for residual non-allowlisted:/);
+  assert.match(reason, /spec-divergence/);
+  assert.match(reason, /Auto-fix attempted for allowlisted:/);
+  assert.match(reason, /concurrency/);
+  assert.match(reason, /worktree \/x clean/);
+  assert.doesNotMatch(reason, /no auto-fix attempt/);
 });
 
 // ---------------------------------------------------------------------------
@@ -468,20 +571,30 @@ test("pre-merge auto-fix #680: mixed concurrency + correctness → auto-fix once
   assert.deepEqual(rec.blocked, []);
 });
 
-test("pre-merge auto-fix #680: concurrency + security → escalate without auto-fix", async (t) => {
+test("pre-merge auto-fix #747: concurrency + security → partition auto-fixes concurrency only", async (t) => {
+  const concurrency = blockingFinding("concurrency", "Lock race");
+  const security = blockingFinding("security", "Auth boundary");
   const { deps, rec } = makeDeps({
-    findings: [
-      blockingFinding("concurrency"),
-      blockingFinding("security"),
-    ],
-    reReviewFindings: [],
+    findings: [concurrency, security],
+    // Re-delta still blocks on residual security (allowlisted fixed).
+    reReviewFindings: [reRaisedBlockingFinding(security)],
     autoFixResult: "fix-committed",
   });
   await quiet(t, async () => {
     await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
   });
-  assert.equal(rec.autoFixCalls, 0, "security in the set must veto auto-fix");
-  assert.equal(rec.blocked.length, 1);
+  assert.equal(rec.autoFixCalls, 1, "security residual must NOT veto concurrency auto-fix (#747)");
+  assert.equal(rec.autoFixFindings.length, 1);
+  assert.equal(rec.autoFixFindings[0].category, "concurrency");
+  assert.equal(rec.autoFixFindings[0].title, "Lock race");
+  assert.ok(rec.autoFixReviewComment, "fix prompt body must be passed");
+  assert.match(rec.autoFixReviewComment!, /Lock race/);
+  assert.doesNotMatch(rec.autoFixReviewComment!, /Auth boundary/, "security residual excluded from prompt");
+  assert.equal(rec.blocked.length, 1, "residual security still needs human after re-delta");
+  assert.match(rec.blocked[0].reason, /Human disposition required for residual non-allowlisted/);
+  assert.match(rec.blocked[0].reason, /security/);
+  assert.match(rec.blocked[0].reason, /Auto-fix attempted for allowlisted/);
+  assert.match(rec.blocked[0].reason, /concurrency/);
 });
 
 test("pre-merge auto-fix #680: concurrency with prior auto-fix commit → exhausted, no second attempt", async (t) => {
@@ -515,7 +628,7 @@ test("pre-merge auto-fix / delta review: post-fix re-review digest is rebuilt fr
   const commentsList: { author: string; body: string }[] = [
     { body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash), author: TEST_ACTOR },
   ];
-  const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0 };
+  const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0, autoFixFindings: [], autoFixReviewComment: null };
   // The initial delta review and the post-fix re-review both surface the SAME
   // finding — the fix doesn't change the reviewer's mind, an unacknowledged
   // reversal against the initial round's own (just-posted) verdict.
@@ -639,12 +752,243 @@ test("pre-merge auto-fix 5.4: absent category → fail-closed, no auto-fix", asy
 });
 
 // ---------------------------------------------------------------------------
-// 5.4 variant: mixed correctness + non-allowlisted → no auto-fix
+// 5.4 variant / #747: mixed correctness + non-allowlisted → partition auto-fix
 // ---------------------------------------------------------------------------
 
-test("pre-merge auto-fix 5.4b: mixed correctness + scope → no auto-fix", async (t) => {
+test("pre-merge auto-fix 5.4b / #747: mixed correctness + scope → auto-fix correctness subset", async (t) => {
+  const correctness = blockingFinding("correctness", "Null deref");
+  const scope = blockingFinding("scope", "Out of plan");
   const { deps, rec } = makeDeps({
-    findings: [blockingFinding("correctness"), blockingFinding("scope")],
+    findings: [correctness, scope],
+    reReviewFindings: [reRaisedBlockingFinding(scope)],
+    autoFixResult: "fix-committed",
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(rec.autoFixCalls, 1, "mixed with scope still attempts auto-fix for correctness (#747)");
+  assert.equal(rec.autoFixFindings.length, 1);
+  assert.equal(rec.autoFixFindings[0].category, "correctness");
+  assert.doesNotMatch(rec.autoFixReviewComment ?? "", /Out of plan/);
+  assert.equal(out?.status, "blocked");
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0].reason, /scope/);
+  assert.match(rec.blocked[0].reason, /Auto-fix attempted/);
+});
+
+// ---------------------------------------------------------------------------
+// #747: mixed concurrency + spec-divergence partition (incl. #729-shaped)
+// ---------------------------------------------------------------------------
+
+test("pre-merge auto-fix #747: mixed concurrency + spec-divergence → auto-fix allowlisted subset", async (t) => {
+  const concurrency = blockingFinding("concurrency", "TOCTOU on shared marker");
+  const specDiv = blockingFinding("spec-divergence", "Partial-list AC unwired");
+  const { deps, rec } = makeDeps({
+    findings: [concurrency, specDiv],
+    reReviewFindings: [], // both cleared after fix (optimistic path)
+    autoFixResult: "fix-committed",
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out, null, "re-delta clean → proceed");
+  assert.equal(rec.autoFixCalls, 1);
+  assert.equal(rec.deltaReviewCalls, 2);
+  assert.deepEqual(
+    rec.autoFixFindings.map((f) => f.category),
+    ["concurrency"],
+  );
+  assert.match(rec.autoFixReviewComment ?? "", /TOCTOU on shared marker/);
+  assert.doesNotMatch(
+    rec.autoFixReviewComment ?? "",
+    /Partial-list AC unwired/,
+    "residual spec-divergence excluded from fix prompt",
+  );
+  assert.deepEqual(rec.blocked, []);
+});
+
+test("pre-merge auto-fix #747 / #729-shaped: HIGH concurrency + HIGH spec-divergence does not skip auto-fix", async (t) => {
+  // Dogfood #729: shared-style batch; old all-or-nothing gate would skip.
+  const concurrency = blockingFinding("concurrency", "TOCTOU race on PID probe");
+  const specDiv = blockingFinding("spec-divergence", "Partial list wiring for AC field");
+  // Prove the old all-or-nothing helper would have vetoed this batch:
+  assert.equal(
+    allBlockingAutoFixable([concurrency, specDiv]),
+    false,
+    "bite: old all-or-nothing eligibility would skip this #729-shaped batch",
+  );
+  const p = partitionBlockingForAutofix([concurrency, specDiv]);
+  assert.equal(p.autoFixable.length, 1);
+  assert.equal(p.autoFixable[0].category, "concurrency");
+  assert.equal(p.residual.length, 1);
+  assert.equal(p.residual[0].category, "spec-divergence");
+
+  const { deps, rec } = makeDeps({
+    findings: [concurrency, specDiv],
+    reReviewFindings: [reRaisedBlockingFinding(specDiv)], // residual still blocks after concurrency fix
+    autoFixResult: "fix-committed",
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(rec.autoFixCalls, 1, "must attempt auto-fix despite co-batched spec-divergence");
+  assert.equal(rec.autoFixFindings.length, 1);
+  assert.equal(rec.autoFixFindings[0].category, "concurrency");
+  assert.equal(rec.deltaReviewCalls, 2, "initial + post-fix re-delta");
+  assert.equal(out?.status, "blocked");
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0].reason, /Human disposition required for residual/);
+  assert.match(rec.blocked[0].reason, /spec-divergence/);
+  assert.match(rec.blocked[0].reason, /Auto-fix attempted for allowlisted/);
+  assert.match(rec.blocked[0].reason, /concurrency/);
+  // One attempt only — residual does not unlock a second harness call.
+  assert.equal(rec.autoFixCalls, 1);
+});
+
+test("pre-merge auto-fix #747: pure residual-only (spec-divergence) skips harness", async (t) => {
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("spec-divergence", "AC mismatch")],
+    reReviewFindings: [],
+    autoFixResult: "fix-committed",
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(rec.autoFixCalls, 0, "pure residual skips harness");
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0].reason, /no auto-fix attempt/);
+  assert.match(rec.blocked[0].reason, /spec-divergence/);
+  assert.doesNotMatch(rec.blocked[0].reason, /Auto-fix attempted/);
+});
+
+// ---------------------------------------------------------------------------
+// #747 review 1: disposition accounting (exhausted prior + final residual labels)
+// ---------------------------------------------------------------------------
+
+test("pre-merge auto-fix #747: mixed + prior attempt marker reports exhaustion, not no-attempt (5f4a751f)", async (t) => {
+  // Bite: without autoFixAttemptRecognized, prior marker suppression left
+  // attempted=false so residual text said "no auto-fix attempt".
+  const concurrency = blockingFinding("concurrency", "TOCTOU still races");
+  const specDiv = blockingFinding("spec-divergence", "Partial list still unwired");
+  const { deps, rec } = makeDeps({
+    findings: [concurrency, specDiv],
+    reReviewFindings: [specDiv],
+    autoFixResult: "fix-committed",
+    priorAttemptMarker: true,
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(rec.autoFixCalls, 0, "prior durable marker exhausts the one-attempt bound");
+  assert.equal(rec.deltaReviewCalls, 1, "no post-fix re-delta when harness is skipped");
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0].reason, /Human disposition required for residual non-allowlisted:/);
+  assert.match(rec.blocked[0].reason, /spec-divergence/);
+  assert.match(rec.blocked[0].reason, /Auto-fix attempted for allowlisted:/);
+  assert.match(rec.blocked[0].reason, /concurrency/);
+  assert.doesNotMatch(
+    rec.blocked[0].reason,
+    /no auto-fix attempt/,
+    "exhausted prior must not be mislabeled as unattempted",
+  );
+});
+
+test("pre-merge auto-fix #747: mixed + prior auto-fix commit reports exhaustion, not no-attempt (5f4a751f)", async (t) => {
+  const concurrency = blockingFinding("concurrency", "Lock ownership still races");
+  const security = blockingFinding("security", "Auth gap remains");
+  const { deps, rec } = makeDeps({
+    findings: [concurrency, security],
+    reReviewFindings: [security],
+    autoFixResult: "fix-committed",
+    priorAutoFixCommit: true,
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(rec.autoFixCalls, 0);
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0].reason, /security/);
+  assert.match(rec.blocked[0].reason, /Auto-fix attempted for allowlisted/);
+  assert.doesNotMatch(rec.blocked[0].reason, /no auto-fix attempt/);
+});
+
+test("pre-merge auto-fix #747: post-fix re-delta residual labels final blocking findings (3d396927)", async (t) => {
+  // Bite: categoryPartition retained from the initial delta meant the block
+  // reason named the original residual key even when re-delta returned a
+  // different residual finding that actually still blocks.
+  const concurrency = blockingFinding("concurrency", "TOCTOU on shared marker");
+  const originalResidual = blockingFinding("spec-divergence", "Original partial-list wiring");
+  const differentResidual = reRaisedBlockingFinding(
+    blockingFinding("spec-divergence", "Different residual after auto-fix"),
+  );
+  // Distinct finding keys: different titles without file/line → different findingKey.
+  assert.notEqual(
+    originalResidual.title,
+    differentResidual.title,
+    "fixture requires distinct residual titles so keys differ",
+  );
+  const { deps, rec } = makeDeps({
+    findings: [concurrency, originalResidual],
+    reReviewFindings: [differentResidual],
+    autoFixResult: "fix-committed",
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(rec.autoFixCalls, 1);
+  assert.equal(rec.deltaReviewCalls, 2);
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0].reason, /spec-divergence/);
+  // Disposition labels are `findingKey (category)` — assert the final residual
+  // key is present and the initial residual key is not retained after re-delta.
+  const finalKey = findingKey(differentResidual);
+  const originalKey = findingKey(originalResidual);
+  assert.notEqual(finalKey, originalKey, "fixture keys must differ");
+  assert.match(
+    rec.blocked[0].reason,
+    new RegExp(finalKey),
+    "block reason must name the final residual finding key, not only the initial partition",
+  );
+  assert.doesNotMatch(
+    rec.blocked[0].reason,
+    new RegExp(originalKey),
+    "stale initial residual key must not appear after re-delta replaced it",
+  );
+  assert.match(rec.blocked[0].reason, /Auto-fix attempted for allowlisted/);
+  assert.match(rec.blocked[0].reason, /concurrency/);
+});
+
+test("pre-merge auto-fix #747: after partition attempt, residual still blocking → no second attempt", async (t) => {
+  const concurrency = blockingFinding("concurrency", "Race remains");
+  const product = blockingFinding("product-judgment-required", "Product call");
+  const { deps, rec } = makeDeps({
+    findings: [concurrency, product],
+    reReviewFindings: [
+      reRaisedBlockingFinding(concurrency),
+      reRaisedBlockingFinding(product),
+    ],
+    autoFixResult: "fix-committed",
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(rec.autoFixCalls, 1, "exactly one attempt");
+  assert.equal(rec.deltaReviewCalls, 2);
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0].reason, /product-judgment-required/);
+  assert.match(rec.blocked[0].reason, /Auto-fix attempted for allowlisted/);
+});
+
+test("pre-merge auto-fix #747: all-allowlisted still attempts once (no regression)", async (t) => {
+  const { deps, rec } = makeDeps({
+    findings: [
+      blockingFinding("correctness", "Bug A"),
+      blockingFinding("missing-dep", "Missing import"),
+      blockingFinding("concurrency", "Race B"),
+    ],
     reReviewFindings: [],
     autoFixResult: "fix-committed",
   });
@@ -652,8 +996,14 @@ test("pre-merge auto-fix 5.4b: mixed correctness + scope → no auto-fix", async
   await quiet(t, async () => {
     out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
   });
-  assert.equal(rec.autoFixCalls, 0, "mixed with scope → no auto-fix");
-  assert.equal(rec.blocked.length, 1);
+  assert.equal(out, null);
+  assert.equal(rec.autoFixCalls, 1);
+  assert.equal(rec.autoFixFindings.length, 3);
+  assert.deepEqual(
+    rec.autoFixFindings.map((f) => f.category).sort(),
+    ["concurrency", "correctness", "missing-dep"],
+  );
+  assert.deepEqual(rec.blocked, []);
 });
 
 // ---------------------------------------------------------------------------
@@ -803,7 +1153,7 @@ test("pre-merge auto-fix 5.8: re-review comment uses delta marker prefix, not re
 test("pre-merge auto-fix 5.9 (bite check): without auto-fix seam, correctness findings → blocked not null", async (t) => {
   // Reproduces the 5.1 scenario but omits the attemptPreMergeAutoFix seam.
   // Without the auto-fix round, the gate returns blocked (not null).
-  const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0 };
+  const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0, autoFixFindings: [], autoFixReviewComment: null };
   const runDeltaReview: RunDeltaReviewFn = async () => ({
     verdict: "needs-attention",
     findings: [blockingFinding("correctness")],
@@ -1043,7 +1393,7 @@ test("performPreMergeAutoFix finding-3: reattach detached worktree fails → ret
 
 // Finding 4 regression: getPrCommits throws → fail closed (auto-fix NOT called)
 test("pre-merge auto-fix finding-4: getPrCommits throws → fail closed, no auto-fix attempted", async (t) => {
-  const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0 };
+  const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0, autoFixFindings: [], autoFixReviewComment: null };
 
   const runDeltaReview: RunDeltaReviewFn = async () => ({
     verdict: "needs-attention",
@@ -1091,7 +1441,7 @@ test("pre-merge auto-fix finding-4: getPrCommits throws → fail closed, no auto
 
 // Finding 2 regression: re-review returns needs-attention + zero findings → blocks
 test("pre-merge auto-fix finding-2: re-review needs-attention + zero findings → blocks (not approved)", async (t) => {
-  const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0 };
+  const rec: Rec = { comments: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0, autoFixFindings: [], autoFixReviewComment: null };
 
   let deltaCallCount = 0;
   const runDeltaReview: RunDeltaReviewFn = async () => {
@@ -2159,6 +2509,57 @@ test("pre-merge auto-fix #698: noop-clean → re-verify still blocks → needs-h
   assert.match(rec.blocked[0].reason, /auto-fix made no diff/);
   assert.match(rec.blocked[0].reason, /core\/scripts\/stages\/pre_merge\.ts/);
   assert.match(rec.blocked[0].reason, /\/fake\/worktree/);
+});
+
+test("pre-merge auto-fix #747: mixed noop-clean re-verify still blocks keeps residual + attempted labels (826962b1)", async (t) => {
+  // Bite: autoFixBlockReason = formatNoopStillBrokenReason alone discarded
+  // partition disposition naming on the clean-noop re-verify block path.
+  const concurrency = blockingFinding("concurrency", "TOCTOU on shared marker");
+  const residualStill: ReviewFinding = {
+    ...reRaisedBlockingFinding(
+      blockingFinding("spec-divergence", "Partial list still unwired after noop"),
+    ),
+    file: "core/scripts/stages/pre_merge.ts",
+  } as ReviewFinding;
+  const allowlistedStill: ReviewFinding = {
+    ...reRaisedBlockingFinding(
+      blockingFinding("concurrency", "TOCTOU still races after noop"),
+    ),
+    file: "core/scripts/lock.ts",
+  } as ReviewFinding;
+  const { deps, rec } = makeDeps({
+    findings: [concurrency, blockingFinding("spec-divergence", "Partial list AC")],
+    reReviewFindings: [allowlistedStill, residualStill],
+    autoFixResult: "noop-clean",
+  });
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out?.status, "blocked");
+  assert.equal(rec.autoFixCalls, 1, "one bounded auto-fix on allowlisted subset");
+  assert.equal(rec.deltaReviewCalls, 2, "initial delta + post-noop re-verify");
+  assert.equal(rec.autoFixFindings.length, 1);
+  assert.equal(rec.autoFixFindings[0].category, "concurrency");
+  assert.equal(rec.blocked.length, 1);
+  // Noop recipe preserved.
+  assert.match(rec.blocked[0].reason, /auto-fix made no diff/);
+  assert.match(rec.blocked[0].reason, /human fix required/i);
+  // Partition disposition labels must survive the noop block-reason path.
+  assert.match(
+    rec.blocked[0].reason,
+    /Human disposition required for residual non-allowlisted:/,
+    "residual human-required subset must be named",
+  );
+  assert.match(rec.blocked[0].reason, /spec-divergence/);
+  assert.match(
+    rec.blocked[0].reason,
+    /Auto-fix attempted for allowlisted:/,
+    "allowlisted attempt scope must be named",
+  );
+  assert.match(rec.blocked[0].reason, /concurrency/);
+  assert.match(rec.blocked[0].reason, /\/fake\/worktree/);
+  assert.doesNotMatch(rec.blocked[0].reason, /no auto-fix attempt/);
 });
 
 test("pre-merge auto-fix #698: prior durable noop-clean marker exhausts attempt without second harness invoke", async (t) => {

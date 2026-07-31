@@ -31,7 +31,7 @@ When `enforceReviewShaGate` detects that HEAD moved with non-pipeline-internal c
 
 ### Requirement: Pre-merge SHALL perform a focused adversarial delta review when the diff changed
 
-When `enforceReviewShaGate` determines that the diff has changed (diff-hash mismatch after the pipeline-internal check), the pipeline SHALL run a delta review: an adversarial (round-2 equivalent) review of only the unreviewed changes (`last-reviewed-sha...HEAD`), rather than routing the issue back to the `review-2` stage for a full PR diff re-review. The delta review SHALL NOT consume a review-2 ceiling slot. When the delta review returns blocking findings, the pipeline SHALL route them through the bounded pre-merge fix-round decision (see the `pre-merge-fix-round` capability) before escalating: it SHALL escalate to `needs-human` only when the fix round is skipped (a blocking finding falls outside the auto-fixable category allowlist), exhausted (an auto-fix has already been attempted for the entry, including a durable noop-clean attempt), the single post-fix or post-noop re-verify still blocks, or a non-noop auto-fix error path applies (dirty/timeout without successful salvage). A clean no-commit auto-fix outcome SHALL re-verify at HEAD before escalation and SHALL NOT hard-block solely because no commit was produced.
+When `enforceReviewShaGate` determines that the diff has changed (diff-hash mismatch after the pipeline-internal check), the pipeline SHALL run a delta review: an adversarial (round-2 equivalent) review of only the unreviewed changes (`last-reviewed-sha...HEAD`), rather than routing the issue back to the `review-2` stage for a full PR diff re-review. The delta review SHALL NOT consume a review-2 ceiling slot. When the delta review returns blocking findings, the pipeline SHALL route them through the bounded pre-merge fix-round decision (see the `pre-merge-fix-round` capability) before escalating: it SHALL escalate to `needs-human` only when the fix round is skipped (the auto-fixable category partition is empty — no allowlisted blocking findings), exhausted (an auto-fix has already been attempted for the entry, including a durable noop-clean attempt), the single post-fix or post-noop re-verify still blocks (including residual non-allowlisted findings that remain after a partition auto-fix), or a non-noop auto-fix error path applies (dirty/timeout without successful salvage). A non-empty allowlisted subset SHALL remain auto-fix eligible even when residual non-allowlisted findings are co-batched (partition, not all-or-nothing). A clean no-commit auto-fix outcome SHALL re-verify at HEAD before escalation and SHALL NOT hard-block solely because no commit was produced.
 
 #### Scenario: Delta review approves — pre-merge proceeds
 
@@ -43,9 +43,10 @@ When `enforceReviewShaGate` determines that the diff has changed (diff-hash mism
 #### Scenario: Delta review finds blocking findings — routed through the fix round
 
 - **WHEN** the pre-merge delta review completes with a `needs-attention` verdict containing findings that block under the active `review_policy`
-- **THEN** the pipeline SHALL evaluate the bounded auto-fix eligibility of the blocking findings before blocking
-- **AND** when all blocking findings are auto-fixable and no auto-fix has been attempted for the entry, the pipeline SHALL attempt one bounded auto-fix and re-run the delta review once (see the `pre-merge-fix-round` capability), including the clean-noop re-verify path when the attempt produces no commit
-- **AND** when the fix round is skipped (a non-allowlisted category) or exhausted (a prior auto-fix commit or durable noop-clean attempt exists) or the single re-review still blocks, the pipeline SHALL block pre-merge with the reason "Pre-merge delta review found blocking findings; fix required before merging." (or the more specific no-op still-broken recipe when that path applies)
+- **THEN** the pipeline SHALL evaluate the bounded auto-fix eligibility of the blocking findings via category partition before blocking
+- **AND** when the auto-fixable (allowlisted) subset is non-empty and no auto-fix has been attempted for the entry, the pipeline SHALL attempt one bounded auto-fix scoped to that subset and re-run the delta review once (see the `pre-merge-fix-round` capability), including the clean-noop re-verify path when the attempt produces no commit
+- **AND** residual non-allowlisted findings in the same batch SHALL NOT by themselves skip that attempt
+- **AND** when the fix round is skipped (empty auto-fixable subset) or exhausted (a prior auto-fix commit or durable noop-clean attempt exists) or the single re-review still blocks, the pipeline SHALL block pre-merge with a reason that supports human disposition of residual findings (and the more specific no-op still-broken recipe when that path applies)
 - **AND** SHALL NOT transition the issue to `review-2`
 - **AND** the blocking shall use the same `setBlocked` path as other pre-merge blocking conditions
 
@@ -56,6 +57,15 @@ When `enforceReviewShaGate` determines that the diff has changed (diff-hash mism
 - **AND** no prior auto-fix commit exists for the entry
 - **THEN** the pipeline SHALL attempt the bounded auto-fix rather than escalating to
   `needs-human` on the first hop
+
+#### Scenario: Mixed allowlisted + residual does not first-hop skip the fix round
+
+- **WHEN** after partition and demotion the remaining blocking findings include at least one
+  category in `{ correctness, missing-dep, concurrency }` and at least one residual
+  non-allowlisted category
+- **AND** no prior auto-fix commit exists for the entry
+- **THEN** the pipeline SHALL attempt the bounded auto-fix for the allowlisted subset rather
+  than escalating to `needs-human` on the first hop solely because residual findings are present
 
 #### Scenario: Delta review comment embeds updated sentinels
 
