@@ -434,14 +434,14 @@ async function reopenClearedBlockedHolds(
     // #770: do not re-admit while a host-local advance is still live (operator
     // resume / mid-flight detach). Clearing `pipeline:blocked` alone is not enough.
     const domain = deps.lockDomain ?? "agent-pipeline";
+    // Only lock/PID evidence for hold-clear (do not treat a stale advance_run_id
+    // as live without terminal proof — #770 review finding ce4794fb).
     const probe: LiveAdvanceProbeResult = deps.probeLiveAdvance
       ? await deps.probeLiveAdvance(item.id)
       : probeLiveAdvance({
           domain,
           issueNumber: Number(item.id),
-          knownLinkage: current.advance_run_id
-            ? { pipeline_run_id: current.advance_run_id }
-            : null,
+          knownLinkage: null,
         });
     if (probe.live) {
       await appendEvent(deps.store, runId, token, "loop_item_coexistence_deferred", {
@@ -696,14 +696,12 @@ export async function runSupervisorCycle(
     const kept: string[] = [];
     const domain = deps.lockDomain ?? "agent-pipeline";
     for (const itemId of activeItemIds) {
-      const item = ledger.items[itemId];
       const probe: LiveAdvanceProbeResult = deps.probeLiveAdvance
         ? await deps.probeLiveAdvance(itemId)
         : probeLiveAdvance({
             domain,
             issueNumber: Number(itemId),
-            // Do not treat this cycle's own just-started in_progress as linkage live —
-            // only an explicit non-self advance_run_id from a prior attach would count.
+            // Lock/PID only for pre-dispatch (no unproven linkage) — review 1 dcfb0878/ce4794fb.
             knownLinkage: null,
           });
       if (probe.live) {
@@ -720,10 +718,11 @@ export async function runSupervisorCycle(
           action: "dispatch_item",
           outcome: "coexistence_wait",
           next_action: "noop",
-          progress: "progress",
+          // #770 review bb394176: repeated coexistence waits must not reset the
+          // no-progress watchdog — treat as no_progress unless a real dispatch runs.
+          progress: "no_progress",
           worktree_root: null,
         });
-        void item;
         continue;
       }
       kept.push(itemId);
@@ -731,7 +730,7 @@ export async function runSupervisorCycle(
     activeItemIds = kept;
     if (activeItemIds.length === 0) {
       return {
-        progress: true,
+        progress: drifted || propagated,
         stop: null,
         holdOutstanding: heldItemIds.length > 0,
         allDone: false,

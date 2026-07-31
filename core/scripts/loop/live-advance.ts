@@ -37,9 +37,10 @@ export function isCoexistenceFailureEvidence(text: string | null | undefined): b
 }
 
 /**
- * Non-fatal mid-pipeline exit: advance ended without ready/blocked/closed, but
- * events show waiting-like or incomplete progress rather than a crash with no
- * store. Pure over events text + labels.
+ * Non-fatal coexistence exit evidence from events text only when explicit
+ * lock/already-running/install patterns appear (#770 review 1: bare
+ * `stage_complete` skipped/waiting must remain `failed` so genuine crashes
+ * still run_fatal).
  */
 export function isNonFatalMidStageExit(
   eventsText: string | null | undefined,
@@ -49,34 +50,8 @@ export function isNonFatalMidStageExit(
     return false;
   }
   if (labels.includes("blocked") || labels.includes("pipeline:ready-to-deploy")) return false;
-  if (!eventsText) return false;
-  if (isCoexistenceFailureEvidence(eventsText)) return true;
-
-  let lastStageComplete: { outcome?: string } | null = null;
-  let sawRunComplete = false;
-  for (const line of eventsText.split("\n")) {
-    const t = line.trim();
-    if (!t) continue;
-    try {
-      const ev = JSON.parse(t) as { type?: string; outcome?: string; reason?: string };
-      if (ev.type === "stage_complete") lastStageComplete = { outcome: ev.outcome };
-      if (ev.type === "run_complete") sawRunComplete = true;
-      if (ev.type === "gate_result" && typeof ev.reason === "string") {
-        if (/rebased; CI re-running|waiting for checks|CI re-triggered/i.test(ev.reason)) {
-          return true;
-        }
-      }
-    } catch {
-      /* skip */
-    }
-  }
-  if (lastStageComplete?.outcome === "skipped" || lastStageComplete?.outcome === "waiting") {
-    return true;
-  }
-  // Child exited mid-stage with only stage_start (no complete) — treat as
-  // non-fatal coexistence only when coexistence evidence was also present above.
-  void sawRunComplete;
-  return false;
+  // Only explicit coexistence evidence — not generic mid-stage outcomes.
+  return isCoexistenceFailureEvidence(eventsText);
 }
 
 /** Read a lock file path; live when PID is parseable and `process.kill(pid, 0)` succeeds. */

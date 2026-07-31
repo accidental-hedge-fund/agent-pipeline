@@ -21,34 +21,37 @@ test("isCoexistenceFailureEvidence: lock / already-running / install-in-progress
   assert.equal(isCoexistenceFailureEvidence(null), false);
 });
 
-test("isNonFatalMidStageExit: skipped pre-merge after CI rebase thrash", () => {
+test("isNonFatalMidStageExit: bare skipped/waiting is NOT coexistence (review 1 929fc0ac)", () => {
   const events = [
-    JSON.stringify({ type: "stage_start", stage: "pre-merge" }),
-    JSON.stringify({ type: "gate_result", gate: "ci", result: "partial", reason: "rebased; CI re-running" }),
     JSON.stringify({ type: "stage_complete", stage: "pre-merge", outcome: "skipped" }),
     JSON.stringify({ type: "run_complete", final_state: "pre-merge" }),
   ].join("\n");
   assert.equal(
     isNonFatalMidStageExit(events, ["pipeline:pre-merge"]),
-    true,
-  );
-  assert.equal(
-    isNonFatalMidStageExit(events, ["pipeline:ready-to-deploy"]),
     false,
+    "generic skipped must stay on failed/run_fatal path",
   );
 });
 
-test("classifyDispatchOutcome: mid-stage exit → coexistence_wait not failed (#770)", () => {
-  const events = [
-    JSON.stringify({ type: "stage_complete", stage: "pre-merge", outcome: "skipped" }),
-  ].join("\n");
+test("isNonFatalMidStageExit: explicit already-running in events → coexistence", () => {
+  const events = "pipeline: issue #675 is already running\n";
+  assert.equal(isNonFatalMidStageExit(events, ["pipeline:pre-merge"]), true);
+});
+
+test("classifyDispatchOutcome: already-running events → coexistence_wait (#770)", () => {
+  const events = "Error: Pipeline lock held by another process for #597\n";
   assert.equal(
     classifyDispatchOutcome({ labels: ["pipeline:pre-merge"], state: "open" }, null, events),
     "coexistence_wait",
   );
+  assert.equal(normalizeLoopOutcome("coexistence_wait"), "coexistence_wait");
+});
+
+test("classifyDispatchOutcome: bare skipped stage event stays failed (genuine defect path)", () => {
+  const events = JSON.stringify({ type: "stage_complete", stage: "pre-merge", outcome: "skipped" });
   assert.equal(
-    normalizeLoopOutcome("coexistence_wait"),
-    "coexistence_wait",
+    classifyDispatchOutcome({ labels: ["pipeline:pre-merge"], state: "open" }, null, events),
+    "failed",
   );
 });
 
