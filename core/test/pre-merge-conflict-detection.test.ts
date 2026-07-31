@@ -10,6 +10,7 @@ import { advance, type AdvancePreMergeDeps } from "../scripts/stages/pre_merge.t
 import type { PipelineConfig } from "../scripts/types.ts";
 
 const SHA_HEAD = "3333333333333333333333333333333333333333";
+const SHA_AFTER_REBASE = "4444444444444444444444444444444444444444";
 const PR_NUMBER = 83;
 const ISSUE = 95;
 // Path that does not exist on disk: openspec.isActive() auto-detection finds
@@ -33,16 +34,21 @@ type PrDetailFake = Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrDet
  * Deps where everything up to the conflict pre-check passes: PR found, no
  * prior review comment (SHA gate skips), worktree present, rebase marker
  * absent and rebase succeeding unless overridden.
+ *
+ * Default tryRebaseAndPush advances head_sha so #771 HEAD-moved rules allow
+ * `rebased; CI re-running` / `rebase-resolved; CI re-running`.
  */
-function makeDeps(prDetail: Partial<PrDetailFake>): { deps: AdvancePreMergeDeps; rec: Rec } {
+function makeDeps(prDetail: Partial<PrDetailFake>): { deps: AdvancePreMergeDeps; rec: Rec; headSha: { current: string } } {
   const rec: Rec = { ciPolls: 0, rebaseCalls: 0, marked: [], blocked: [] };
+  const headSha = { current: (prDetail.head_sha as string | undefined) ?? SHA_HEAD };
   const deps: AdvancePreMergeDeps = {
     getPrForIssue: async () => PR_NUMBER,
     getIssueDetail: async () =>
       ({ comments: [] }) as unknown as Awaited<
         ReturnType<NonNullable<AdvancePreMergeDeps["getIssueDetail"]>>
       >,
-    getPrDetail: async () => ({ head_sha: SHA_HEAD, ...prDetail }) as PrDetailFake,
+    getPrDetail: async () =>
+      ({ ...prDetail, head_sha: headSha.current } as PrDetailFake),
     getPrCommits: async () => [],
     getPrChecks: async () => {
       rec.ciPolls++;
@@ -58,6 +64,8 @@ function makeDeps(prDetail: Partial<PrDetailFake>): { deps: AdvancePreMergeDeps;
     },
     tryRebaseAndPush: async () => {
       rec.rebaseCalls++;
+      // Simulate authoritative PR head movement after a successful rebase (#771).
+      headSha.current = SHA_AFTER_REBASE;
       return true;
     },
     rebaseAlreadyAttempted: () => false,
@@ -71,7 +79,7 @@ function makeDeps(prDetail: Partial<PrDetailFake>): { deps: AdvancePreMergeDeps;
     // an empty diff means no openspec/changes/ path, so the guard is a no-op here.
     getPrDiff: async () => "",
   };
-  return { deps, rec };
+  return { deps, rec, headSha };
 }
 
 async function quiet(t: TestContext, fn: () => Promise<void>): Promise<void> {
@@ -124,7 +132,8 @@ test("CONFLICTING PR whose rebase fails blocks with a conflict-specific reason (
   assert.deepEqual(out, { advanced: false, status: "blocked", reason: "merge conflict", blockerKind: "merge-conflict" });
   assert.equal(rec.ciPolls, 0, "CI checks must never be polled for a conflicting PR");
   assert.equal(rec.rebaseCalls, 1);
-  assert.deepEqual(rec.marked, [], "a failed rebase is not marked as attempted");
+  // #771: consume one-shot budget on fail so the next poll does not thrash rebase.
+  assert.deepEqual(rec.marked, [WT_PATH], "failed conflict rebase still consumes the one-shot marker");
   assert.equal(rec.blocked.length, 1);
   assert.match(rec.blocked[0], /merge conflict/);
   assert.match(rec.blocked[0], /manual rebase needed/);
@@ -245,7 +254,8 @@ test("post-CI BEHIND invokes tryRebaseAndPush instead of returning waiting indef
   });
   assert.equal(rec.ciPolls, 1, "must still poll CI — BEHIND does not bypass early-conflict check");
   assert.equal(rec.rebaseCalls, 1, "BEHIND must invoke tryRebaseAndPush");
-  assert.deepEqual(rec.marked, [], "failed rebase must not mark as attempted");
+  // #771: consume one-shot budget on fail so the next poll does not thrash rebase.
+  assert.deepEqual(rec.marked, [WT_PATH], "failed BEHIND rebase still consumes the one-shot marker");
   const blockedOut2 = out as { advanced: false; status: "blocked"; reason: string; blockerKind: string };
   assert.equal(blockedOut2.status, "blocked");
   assert.match(blockedOut2.reason, /behind/);

@@ -930,15 +930,31 @@ export interface PreMergePollingContext {
    * progress mirror).
    */
   ciWaitingGateRecorded?: boolean;
-  /** Head SHA for which an automatic failed-workflow re-run was already attempted (#679). */
-  ciRerunAttemptedForSha?: string;
-  /** Head SHA for which archive-only failed-run close+reopen recovery was attempted (#679). */
-  ciArchiveFailRecoveryAttemptedForSha?: string;
-  /** Head SHA for which optional CI assertion auto-fix was attempted (#679). */
-  ciAssertionFixAttemptedForSha?: string;
+  /**
+   * Head SHAs for which the definitive-CI-failure one-shot rebase was already
+   * attempted (#771). Durable via `pre-merge-ci-recovery.json` as a set so
+   * H1→H2→H1 cannot re-open a consumed budget for H1 after worktree recreate.
+   */
+  ciRebaseAttemptedShas?: string[];
+  /** Head SHAs for which an automatic failed-workflow re-run was already attempted (#679). */
+  ciRerunAttemptedShas?: string[];
+  /** Head SHAs for which archive-only failed-run close+reopen recovery was attempted (#679). */
+  ciArchiveFailRecoveryAttemptedShas?: string[];
+  /** Head SHAs for which optional CI assertion auto-fix was attempted (#679). */
+  ciAssertionFixAttemptedShas?: string[];
+  /**
+   * Head SHAs for which a terminal `gate_result` `ci`/`fail` was already recorded
+   * after recovery budget exhaustion (#771). Pure re-polls must not spam another fail.
+   */
+  ciTerminalFailRecordedShas?: string[];
 }
 
-/** Durable on-disk shape for CI recovery markers (#679). */
+/**
+ * Durable on-disk shape for CI recovery markers (#679 / #771).
+ * Per-class budgets are stored as SHA sets so previously consumed heads are
+ * retained across H1→H2→H1 force-push cycles. Legacy scalar `*ForSha` fields
+ * are accepted on read for backward-compatible migration.
+ */
 export interface CiRecoveryMarkers {
   /**
    * PR head SHA captured before the OpenSpec archive commit. Required after
@@ -946,10 +962,41 @@ export interface CiRecoveryMarkers {
    * `preArchiveSha..head` and surface pre-archive green evidence on escalate.
    */
   preArchiveSha?: string;
+  /** One-shot rebase recovery SHAs for definitive CI failure (#771). */
+  ciRebaseAttemptedShas?: string[];
+  ciRerunAttemptedShas?: string[];
+  ciArchiveFailRecoveryAttemptedShas?: string[];
+  ciAssertionFixAttemptedShas?: string[];
+  /** Terminal ci/fail gate_result already emitted for these head SHAs (#771). */
+  ciTerminalFailRecordedShas?: string[];
+  /** @deprecated scalar form — migrated into `ciRebaseAttemptedShas` on load. */
+  ciRebaseAttemptedForSha?: string;
+  /** @deprecated scalar form — migrated into `ciRerunAttemptedShas` on load. */
   ciRerunAttemptedForSha?: string;
+  /** @deprecated scalar form — migrated into `ciArchiveFailRecoveryAttemptedShas` on load. */
   ciArchiveFailRecoveryAttemptedForSha?: string;
+  /** @deprecated scalar form — migrated into `ciAssertionFixAttemptedShas` on load. */
   ciAssertionFixAttemptedForSha?: string;
+  /** @deprecated scalar form — migrated into `ciTerminalFailRecordedShas` on load. */
+  ciTerminalFailRecordedForSha?: string;
 }
+
+/**
+ * Outcome of a rebase+push recovery side-effect with authoritative HEAD check (#771).
+ * `rebased; CI re-running` is valid only when `ok && verified && headMoved`.
+ * When the side-effect reports success but HEAD cannot be re-read, `verified: false`
+ * is distinct from a verified no-op — callers must re-evaluate without escalating
+ * on the pre-rebase SHA's failed checks.
+ */
+export type RebasePushResult =
+  | { ok: true; verified: true; headMoved: true; beforeSha: string; afterSha: string }
+  | { ok: true; verified: true; headMoved: false; beforeSha: string; afterSha: string }
+  | { ok: true; verified: false; beforeSha: string }
+  | { ok: false; reason: string; beforeSha?: string; afterSha?: string };
+
+/** Wait reason when rebase/push succeeded but post-rebase HEAD could not be verified. */
+export const REBASE_HEAD_UNVERIFIED_WAIT_REASON =
+  "rebase completed; re-evaluating PR head";
 
 const CI_RECOVERY_MARKERS_FILE = "pre-merge-ci-recovery.json";
 
@@ -962,15 +1009,113 @@ export type SaveCiRecoveryMarkersResult =
   | { ok: true }
   | { ok: false; reason: string };
 
-/** Load durable CI recovery markers from the run directory (best-effort). */
-export function loadCiRecoveryMarkers(runDir: string | undefined): CiRecoveryMarkers {
-  if (!runDir) return {};
+/** True when `sha` is present in a durable per-class SHA set. */
+export function ciRecoveryShaSetHas(shas: string[] | undefined, sha: string): boolean {
+  return Array.isArray(shas) && shas.includes(sha);
+}
+
+/** Return a new set with `sha` added (idempotent, preserves prior entries). */
+export function ciRecoveryShaSetAdd(shas: string[] | undefined, sha: string): string[] {
+  if (!Array.isArray(shas) || shas.length === 0) return [sha];
+  if (shas.includes(sha)) return shas;
+  return [...shas, sha];
+}
+
+/** Union two SHA sets (order: a then novel entries from b). */
+export function ciRecoveryShaSetUnion(
+  a: string[] | undefined,
+  b: string[] | undefined,
+): string[] | undefined {
+  if (!a?.length && !b?.length) return undefined;
+  const out: string[] = [];
+  for (const list of [a, b]) {
+    if (!list) continue;
+    for (const s of list) {
+      if (typeof s === "string" && s.length > 0 && !out.includes(s)) out.push(s);
+    }
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * Normalize disk/in-memory markers: migrate legacy scalar `*ForSha` into sets
+ * and drop non-string entries. Pure — does not mutate the input object.
+ */
+export function normalizeCiRecoveryMarkers(raw: CiRecoveryMarkers): CiRecoveryMarkers {
+  const asSet = (set: string[] | undefined, scalar: string | undefined): string[] | undefined => {
+    const fromSet = Array.isArray(set)
+      ? set.filter((s): s is string => typeof s === "string" && s.length > 0)
+      : [];
+    const merged = ciRecoveryShaSetUnion(
+      fromSet.length > 0 ? fromSet : undefined,
+      scalar && typeof scalar === "string" && scalar.length > 0 ? [scalar] : undefined,
+    );
+    return merged;
+  };
+  return {
+    preArchiveSha:
+      typeof raw.preArchiveSha === "string" && raw.preArchiveSha.length > 0
+        ? raw.preArchiveSha
+        : undefined,
+    ciRebaseAttemptedShas: asSet(raw.ciRebaseAttemptedShas, raw.ciRebaseAttemptedForSha),
+    ciRerunAttemptedShas: asSet(raw.ciRerunAttemptedShas, raw.ciRerunAttemptedForSha),
+    ciArchiveFailRecoveryAttemptedShas: asSet(
+      raw.ciArchiveFailRecoveryAttemptedShas,
+      raw.ciArchiveFailRecoveryAttemptedForSha,
+    ),
+    ciAssertionFixAttemptedShas: asSet(
+      raw.ciAssertionFixAttemptedShas,
+      raw.ciAssertionFixAttemptedForSha,
+    ),
+    ciTerminalFailRecordedShas: asSet(
+      raw.ciTerminalFailRecordedShas,
+      raw.ciTerminalFailRecordedForSha,
+    ),
+  };
+}
+
+/** Result of loading CI recovery markers (#771 fail-closed durability). */
+export type LoadCiRecoveryMarkersResult =
+  | { ok: true; markers: CiRecoveryMarkers }
+  | { ok: false; reason: string };
+
+/**
+ * Load durable CI recovery markers from the run directory.
+ * Missing file (never written) → empty markers. Corrupt / unreadable existing
+ * state → ok:false so callers fail closed rather than treating truncated JSON
+ * as an empty budget that re-opens already-consumed recovery (#771 r2).
+ */
+export function loadCiRecoveryMarkers(
+  runDir: string | undefined,
+): LoadCiRecoveryMarkersResult {
+  if (!runDir) return { ok: true, markers: {} };
+  const filePath = ciRecoveryMarkersPath(runDir);
+  let raw: string;
   try {
-    const raw = fs.readFileSync(ciRecoveryMarkersPath(runDir), "utf8");
+    raw = fs.readFileSync(filePath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { ok: true, markers: {} };
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason: `CI recovery markers unreadable: ${msg}` };
+  }
+  try {
     const parsed = JSON.parse(raw) as CiRecoveryMarkers;
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {
+        ok: false,
+        reason:
+          "CI recovery markers file is malformed (not a JSON object); refusing empty budget",
+      };
+    }
+    return { ok: true, markers: normalizeCiRecoveryMarkers(parsed) };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      reason: `CI recovery markers file is corrupt/unparseable: ${msg}`,
+    };
   }
 }
 
@@ -979,6 +1124,9 @@ export function loadCiRecoveryMarkers(runDir: string | undefined): CiRecoveryMar
  * Returns ok:false when runDir is missing or the write/read-back fails — callers
  * MUST NOT return `waiting` after consuming recovery budget without ok:true
  * (otherwise a restarted process can re-consume the budget; #679 / #181).
+ * Writes atomically (same-dir temp + rename) so a kill mid-write cannot leave a
+ * truncated marker file that would erase previously consumed SHA budgets (#771).
+ * Writes the set form only (legacy scalars are not re-emitted).
  */
 export function saveCiRecoveryMarkers(
   runDir: string | undefined,
@@ -990,55 +1138,164 @@ export function saveCiRecoveryMarkers(
       reason: "runDir unavailable; cannot persist CI recovery markers",
     };
   }
+  const filePath = ciRecoveryMarkersPath(runDir);
+  const tmpPath = path.join(
+    runDir,
+    `.${CI_RECOVERY_MARKERS_FILE}.${process.pid}.${Date.now()}.tmp`,
+  );
   try {
     fs.mkdirSync(runDir, { recursive: true });
-    const filePath = ciRecoveryMarkersPath(runDir);
-    fs.writeFileSync(filePath, JSON.stringify(markers, null, 2) + "\n");
+    const normalized = normalizeCiRecoveryMarkers(markers);
+    const content = JSON.stringify(normalized, null, 2) + "\n";
+    fs.writeFileSync(tmpPath, content, "utf8");
+    // Best-effort fsync of the temp file before rename so a crash cannot leave
+    // a zero-length target after rename on filesystems that reorder metadata.
+    try {
+      const fd = fs.openSync(tmpPath, "r");
+      try {
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      /* fsync optional; rename + read-back still apply */
+    }
+    fs.renameSync(tmpPath, filePath);
     // Read-back so a write that appears to succeed but is not durable fails closed.
     const raw = fs.readFileSync(filePath, "utf8");
     const parsed = JSON.parse(raw) as CiRecoveryMarkers;
-    if (!parsed || typeof parsed !== "object") {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return { ok: false, reason: "CI recovery marker read-back was not an object" };
     }
     return { ok: true };
   } catch (err) {
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      /* best-effort cleanup; original error is what matters */
+    }
     const msg = err instanceof Error ? err.message : String(err);
     return { ok: false, reason: `failed to persist CI recovery markers: ${msg}` };
   }
 }
 
-/** Merge durable file markers into a polling context (in-memory wins only when already set). */
+/**
+ * Merge durable file markers into a polling context.
+ * Per-class SHA sets are **unioned** so in-memory session state cannot drop
+ * previously consumed heads already on disk (#771 multi-SHA durability).
+ * Returns ok:false when existing on-disk state is corrupt/unreadable — callers
+ * must fail closed before recovery side-effects (#771 r2).
+ */
 export function hydrateCiRecoveryMarkers(
   ctx: PreMergePollingContext,
   runDir: string | undefined,
-): void {
-  const disk = loadCiRecoveryMarkers(runDir);
+): SaveCiRecoveryMarkersResult {
+  const loaded = loadCiRecoveryMarkers(runDir);
+  if (!loaded.ok) return loaded;
+  const disk = loaded.markers;
   // Restore preArchiveSha before any capture path can overwrite it with the
   // current (post-archive) head after a process restart (#679 review 2).
   if (!ctx.preArchiveSha && disk.preArchiveSha) {
     ctx.preArchiveSha = disk.preArchiveSha;
   }
-  if (!ctx.ciRerunAttemptedForSha && disk.ciRerunAttemptedForSha) {
-    ctx.ciRerunAttemptedForSha = disk.ciRerunAttemptedForSha;
-  }
-  if (!ctx.ciArchiveFailRecoveryAttemptedForSha && disk.ciArchiveFailRecoveryAttemptedForSha) {
-    ctx.ciArchiveFailRecoveryAttemptedForSha = disk.ciArchiveFailRecoveryAttemptedForSha;
-  }
-  if (!ctx.ciAssertionFixAttemptedForSha && disk.ciAssertionFixAttemptedForSha) {
-    ctx.ciAssertionFixAttemptedForSha = disk.ciAssertionFixAttemptedForSha;
-  }
+  ctx.ciRebaseAttemptedShas = ciRecoveryShaSetUnion(
+    ctx.ciRebaseAttemptedShas,
+    disk.ciRebaseAttemptedShas,
+  );
+  ctx.ciRerunAttemptedShas = ciRecoveryShaSetUnion(
+    ctx.ciRerunAttemptedShas,
+    disk.ciRerunAttemptedShas,
+  );
+  ctx.ciArchiveFailRecoveryAttemptedShas = ciRecoveryShaSetUnion(
+    ctx.ciArchiveFailRecoveryAttemptedShas,
+    disk.ciArchiveFailRecoveryAttemptedShas,
+  );
+  ctx.ciAssertionFixAttemptedShas = ciRecoveryShaSetUnion(
+    ctx.ciAssertionFixAttemptedShas,
+    disk.ciAssertionFixAttemptedShas,
+  );
+  ctx.ciTerminalFailRecordedShas = ciRecoveryShaSetUnion(
+    ctx.ciTerminalFailRecordedShas,
+    disk.ciTerminalFailRecordedShas,
+  );
+  return { ok: true };
 }
 
+/**
+ * Persist recovery markers, unioning with any disk state first so a partial
+ * in-memory context cannot erase previously consumed head budgets (#771).
+ * Fails closed when existing on-disk markers are corrupt/unreadable rather than
+ * rewriting from an incomplete in-memory view (#771 r2).
+ */
 function persistCtxCiMarkers(
   ctx: PreMergePollingContext,
   runDir: string | undefined,
 ): SaveCiRecoveryMarkersResult {
-  return saveCiRecoveryMarkers(runDir, {
-    preArchiveSha: ctx.preArchiveSha,
-    ciRerunAttemptedForSha: ctx.ciRerunAttemptedForSha,
-    ciArchiveFailRecoveryAttemptedForSha: ctx.ciArchiveFailRecoveryAttemptedForSha,
-    ciAssertionFixAttemptedForSha: ctx.ciAssertionFixAttemptedForSha,
-  });
+  const loaded = loadCiRecoveryMarkers(runDir);
+  if (!loaded.ok) return loaded;
+  const disk = loaded.markers;
+  const markers: CiRecoveryMarkers = {
+    preArchiveSha: ctx.preArchiveSha ?? disk.preArchiveSha,
+    ciRebaseAttemptedShas: ciRecoveryShaSetUnion(
+      ctx.ciRebaseAttemptedShas,
+      disk.ciRebaseAttemptedShas,
+    ),
+    ciRerunAttemptedShas: ciRecoveryShaSetUnion(
+      ctx.ciRerunAttemptedShas,
+      disk.ciRerunAttemptedShas,
+    ),
+    ciArchiveFailRecoveryAttemptedShas: ciRecoveryShaSetUnion(
+      ctx.ciArchiveFailRecoveryAttemptedShas,
+      disk.ciArchiveFailRecoveryAttemptedShas,
+    ),
+    ciAssertionFixAttemptedShas: ciRecoveryShaSetUnion(
+      ctx.ciAssertionFixAttemptedShas,
+      disk.ciAssertionFixAttemptedShas,
+    ),
+    ciTerminalFailRecordedShas: ciRecoveryShaSetUnion(
+      ctx.ciTerminalFailRecordedShas,
+      disk.ciTerminalFailRecordedShas,
+    ),
+  };
+  const result = saveCiRecoveryMarkers(runDir, markers);
+  if (result.ok) {
+    // Keep in-memory sets complete after a successful durable write.
+    if (markers.preArchiveSha) ctx.preArchiveSha = markers.preArchiveSha;
+    ctx.ciRebaseAttemptedShas = markers.ciRebaseAttemptedShas;
+    ctx.ciRerunAttemptedShas = markers.ciRerunAttemptedShas;
+    ctx.ciArchiveFailRecoveryAttemptedShas = markers.ciArchiveFailRecoveryAttemptedShas;
+    ctx.ciAssertionFixAttemptedShas = markers.ciAssertionFixAttemptedShas;
+    ctx.ciTerminalFailRecordedShas = markers.ciTerminalFailRecordedShas;
+  }
+  return result;
+}
+
+/**
+ * After a rebase/push side-effect, compare authoritative PR head SHA before/after
+ * so callers can claim `rebased; CI re-running` only when HEAD actually moved (#771).
+ * Unreadable post-rebase HEAD after a successful side-effect is **unverified**, not
+ * a verified no-op — callers must not escalate on the pre-push failed checks.
+ */
+export async function resolveRebasePushResult(
+  beforeSha: string,
+  gitOk: boolean,
+  afterSha: string | undefined,
+  gitFailReason = "rebase or push failed",
+): Promise<RebasePushResult> {
+  if (afterSha === undefined || afterSha === "") {
+    // Successful side-effect without a readable HEAD is unverified (may have moved).
+    // Failed side-effect without HEAD still fails closed without claiming movement.
+    return gitOk
+      ? { ok: true, verified: false, beforeSha }
+      : { ok: false, reason: "could not re-read PR head after rebase", beforeSha };
+  }
+  if (!gitOk) {
+    return { ok: false, reason: gitFailReason, beforeSha, afterSha };
+  }
+  if (beforeSha !== afterSha) {
+    return { ok: true, verified: true, headMoved: true, beforeSha, afterSha };
+  }
+  return { ok: true, verified: true, headMoved: false, beforeSha, afterSha };
 }
 
 export interface AdvancePreMergeOpts {
@@ -1371,7 +1628,7 @@ export async function advance(
     (prDetail.mergeable_state ?? "").toUpperCase() === "DIRTY";
   if (isEarlyConflict) {
     console.log(`[pipeline] #${issueNumber}: PR #${prNumber} is conflicting; skipping CI poll`);
-    return recoverFromMergeConflict(cfg, issueNumber, opts.stateDir, deps);
+    return recoverFromMergeConflict(cfg, issueNumber, opts.stateDir, deps, prNumber);
   }
 
   // ---- Step 1: CI ----
@@ -1591,16 +1848,44 @@ export async function advance(
     }
 
     if (agg.failed.length > 0) {
+      // Re-read PR head after the check poll and before definitive-failure
+      // recovery. A concurrent developer push while getPrChecks was in flight
+      // must not bind recovery budget / force-push rebase to the pre-poll SHA
+      // (#771 review: stale head after polling).
+      const polledHeadSha = prDetail.head_sha;
+      let settledHeadSha: string;
+      try {
+        settledHeadSha = (await getPrDetailFn(cfg, prNumber)).head_sha;
+      } catch (err) {
+        const e = err as Error;
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: `PR head re-read failed after checks: ${e.message}`,
+        };
+      }
+      if (settledHeadSha !== polledHeadSha) {
+        console.log(
+          `[pipeline] #${issueNumber}: PR head advanced during CI poll ` +
+            `(${polledHeadSha.slice(0, 7)} → ${settledHeadSha.slice(0, 7)}); re-evaluating without recovery`,
+        );
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: "PR head advanced; waiting for checks",
+        };
+      }
+
       // Full CheckRun objects (with link/description) for classification + URLs.
       const failedChecks = checks.filter((c) => {
         const b = (c.bucket ?? "").toLowerCase();
         return b === "fail" || b === "cancel";
       });
-      const recoveryOut = await handleDefinitiveCiFailure(cfg, issueNumber, prNumber, prDetail.head_sha, failedChecks, opts, {
+      const recoveryOut = await handleDefinitiveCiFailure(cfg, issueNumber, prNumber, settledHeadSha, failedChecks, opts, {
         getForIssueFn,
+        getPrDetailFn,
         setBlockedFn,
         tryRebaseAndPushFn,
-        rebaseAlreadyAttemptedFn,
         markRebaseAttemptedFn,
         getSuccessfulCheckRunCountFn,
         getDiffFilePathsFn,
@@ -1611,17 +1896,54 @@ export async function advance(
         runCiAssertionFixFn,
         stateDir: opts.stateDir,
       });
-      // Observability for the loop progress mirror (#682).
+      // Observability for the loop progress mirror (#682 / #771).
+      // Terminal ci/fail is idempotent per failed head SHA. Partial spam from
+      // false `rebased; CI re-running` is prevented by the ladder itself: pure
+      // re-polls of an unchanged red head escalate rather than re-wait.
+      // Effective recovery context: hydrate from runDir even when the caller
+      // omits pollingCtx so `{ runDir }`-only restarts stay idempotent (#771 r2).
+      // Durable claim of the per-head terminal slot happens BEFORE the event
+      // append so a crash/persist failure cannot re-append the same fail row
+      // on restart (#771 r2 adversarial: failure-atomic terminal recording).
       if (recoveryOut.status === "blocked") {
-        await recordPreMergeGateResult(
-          { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
-          "ci",
-          "fail",
-          recoveryOut.reason ?? "CI failed",
-        );
+        const failHead = settledHeadSha;
+        const recoveryCtx: PreMergePollingContext = opts.pollingCtx ?? {};
+        const hydrate = hydrateCiRecoveryMarkers(recoveryCtx, opts.runDir);
+        if (!hydrate.ok) {
+          console.log(
+            `[pipeline] #${issueNumber}: skipping terminal ci/fail event — ${hydrate.reason}`,
+          );
+        } else {
+          const alreadyTerminal = ciRecoveryShaSetHas(
+            recoveryCtx.ciTerminalFailRecordedShas,
+            failHead,
+          );
+          if (!alreadyTerminal) {
+            const prevTerminal = recoveryCtx.ciTerminalFailRecordedShas;
+            recoveryCtx.ciTerminalFailRecordedShas = ciRecoveryShaSetAdd(
+              recoveryCtx.ciTerminalFailRecordedShas,
+              failHead,
+            );
+            const claim = persistCtxCiMarkers(recoveryCtx, opts.runDir);
+            if (!claim.ok) {
+              recoveryCtx.ciTerminalFailRecordedShas = prevTerminal;
+              console.log(
+                `[pipeline] #${issueNumber}: skipping terminal ci/fail event — durable claim failed: ${claim.reason}`,
+              );
+            } else {
+              await recordPreMergeGateResult(
+                { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+                "ci",
+                "fail",
+                recoveryOut.reason ?? "CI failed",
+              );
+            }
+          }
+        }
         if (opts.pollingCtx) opts.pollingCtx.ciWaitingGateRecorded = false;
       } else if (recoveryOut.status === "waiting") {
-        // New waiting stretch after a recovery attempt: allow another ci/waiting event.
+        // Recovery side-effect just occurred → start a new wait stretch (allow
+        // one partial after prior "CI still running" stretch).
         if (opts.pollingCtx) opts.pollingCtx.ciWaitingGateRecorded = false;
         await recordPreMergeGateResult(
           { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
@@ -1680,7 +2002,7 @@ export async function advance(
   const freshState = (freshPrDetail.mergeable_state ?? "").toUpperCase();
   const isFreshConflict = freshPrDetail.mergeable === false || freshState === "DIRTY";
   if (isFreshConflict) {
-    return recoverFromMergeConflict(cfg, issueNumber, opts.stateDir, deps);
+    return recoverFromMergeConflict(cfg, issueNumber, opts.stateDir, deps, prNumber);
   }
   if (freshState === "BEHIND") {
     // BEHIND means the branch is out-of-date but has no code conflict.
@@ -1688,26 +2010,52 @@ export async function advance(
     // A second poll with the marker set blocks with a behind-specific reason,
     // not a conflict reason. BLOCKED (branch protection) is not updatable
     // by a rebase and stays as passive waiting.
+    // #771: `rebased; CI re-running` only when authoritative PR head moved.
     const behindWt = await getForIssueFn(cfg, issueNumber);
     const behindAlreadyRebased = behindWt ? rebaseAlreadyAttemptedFn(behindWt.path) : true;
     if (!behindAlreadyRebased && behindWt) {
-      const ok = await tryRebaseAndPushFn(cfg, issueNumber);
+      const beforeSha = freshPrDetail.head_sha;
+      const gitOk = await tryRebaseAndPushFn(cfg, issueNumber);
+      // Consume one-shot worktree budget whether HEAD moved or not.
+      markRebaseAttemptedFn(behindWt.path);
+      let afterSha: string | undefined;
+      try {
+        afterSha = (await getPrDetailFn(cfg, prNumber)).head_sha;
+      } catch {
+        afterSha = undefined;
+      }
+      const rebaseResult = await resolveRebasePushResult(beforeSha, gitOk, afterSha);
       if (opts.stateDir) {
+        const summary =
+          rebaseResult.ok && rebaseResult.verified && rebaseResult.headMoved
+            ? "rebase and push succeeded; HEAD moved; CI re-running"
+            : rebaseResult.ok && !rebaseResult.verified
+              ? "rebase and push reported success but PR head could not be re-read"
+              : rebaseResult.ok
+                ? "rebase and push reported success but HEAD unchanged"
+                : rebaseResult.reason;
         await recordCommand(
           opts.stateDir,
           issueNumber,
           "pre-merge",
           makeCommandRecord(
             `git rebase origin/${cfg.base_branch} && git push --force-with-lease`,
-            ok ? 0 : 1,
+            rebaseResult.ok && rebaseResult.verified && rebaseResult.headMoved ? 0 : 1,
             0,
-            ok ? "rebase and push succeeded; CI re-running" : "rebase or push failed",
+            summary,
           ),
         ).catch(() => {});
       }
-      if (ok) {
-        markRebaseAttemptedFn(behindWt.path);
+      if (rebaseResult.ok && rebaseResult.verified && rebaseResult.headMoved) {
         return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
+      }
+      // Successful side-effect with unverified HEAD: do not block on the old tip.
+      if (rebaseResult.ok && !rebaseResult.verified) {
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: REBASE_HEAD_UNVERIFIED_WAIT_REASON,
+        };
       }
     }
     const mergeConflictMsg = "PR branch is behind the base branch and could not be automatically updated — manual rebase or update needed.";
@@ -4088,9 +4436,9 @@ export async function maybeArchiveOpenspec(
 
 interface DefinitiveCiFailureFns {
   getForIssueFn: typeof getOnDiskForIssue;
+  getPrDetailFn: typeof getPrDetail;
   setBlockedFn: typeof setBlocked;
   tryRebaseAndPushFn: typeof tryRebaseAndPush;
-  rebaseAlreadyAttemptedFn: typeof rebaseAlreadyAttempted;
   markRebaseAttemptedFn: typeof markRebaseAttempted;
   getSuccessfulCheckRunCountFn: typeof getSuccessfulCheckRunCount;
   getDiffFilePathsFn: (cfg: PipelineConfig, baseSha: string, headSha: string) => Promise<string[]>;
@@ -4109,15 +4457,22 @@ interface DefinitiveCiFailureFns {
 }
 
 /**
- * Recovery ladder for definitive red CI (not pending):
- *   1. one-shot rebase (existing)
- *   2. classify failures
- *   3. infra/unknown → one re-run (when enabled + not yet attempted for head SHA)
- *   4. archive-only + prior green + infra/unknown → one close+reopen after re-run exhausted
- *   5. assertion + config opt-in → one assertion-fix attempt
- *   6. escalate with `ci-exhausted` + rich block reason
+ * Recovery ladder for definitive red CI (not pending) — one attempt **per class
+ * per head SHA**, finite ordered steps (#679 / #771):
+ *
+ * | Order | Class          | Budget key (SHA set)                    | On success side-effect                                      |
+ * |------:|----------------|-----------------------------------------|-------------------------------------------------------------|
+ * | 1     | rebase         | `ciRebaseAttemptedShas` (durable)       | verified HEAD moved → `waiting` `rebased; CI re-running`; unverified → re-eval wait; else continue |
+ * | 2     | classify       | n/a (pure)                              | drives steps 3–5                                            |
+ * | 3     | rerun          | `ciRerunAttemptedShas`                  | re-request → `waiting` `CI re-triggered (…)`                  |
+ * | 4     | archive_fail   | `ciArchiveFailRecoveryAttemptedShas`    | close+reopen → archive waiting reason                    |
+ * | 5     | assertion_fix | `ciAssertionFixAttemptedShas`           | fix ok → assertion waiting reason                           |
+ * | 6     | escalate       | n/a                                     | `setBlocked` `ci-exhausted` + offramp `ci-failed`           |
  *
  * Budget is durable per head SHA via pollingCtx + runDir markers (#679).
+ * Rebase budget is durable (not worktree-only) so worktree recreation cannot
+ * re-open unlimited rebase thrash (#771 / dogfood #597). Sets retain all
+ * previously consumed heads (H1→H2→H1 cannot re-open H1's budget).
  * Does NOT reintroduce #181 infinite wait/archive spin.
  */
 async function handleDefinitiveCiFailure(
@@ -4130,38 +4485,133 @@ async function handleDefinitiveCiFailure(
   fns: DefinitiveCiFailureFns,
 ): Promise<Outcome> {
   // Ensure a recovery context even on single-shot advance() (no polling loop).
+  // When pollingCtx is omitted, ephemeral ctx still hydrates from runDir so
+  // durable budgets and terminal-fail markers survive process restart (#771 r2).
   const ctx: PreMergePollingContext = opts.pollingCtx ?? {};
-  if (opts.pollingCtx === undefined) {
-    // Local ephemeral ctx still hydrates from disk for process-restart durability.
+  /** Set when a recovery side-effect could not be paired with durable markers. */
+  let durablePersistFailure: string | undefined;
+  const hydrate = hydrateCiRecoveryMarkers(ctx, opts.runDir);
+  if (!hydrate.ok) {
+    // Corrupt/unreadable marker store: fail closed — do not treat as empty budget
+    // that would re-open already-consumed recovery classes (#771 r2).
+    durablePersistFailure = hydrate.reason;
+    ctx.ciRebaseAttemptedShas = ciRecoveryShaSetAdd(ctx.ciRebaseAttemptedShas, headSha);
+    ctx.ciRerunAttemptedShas = ciRecoveryShaSetAdd(ctx.ciRerunAttemptedShas, headSha);
+    ctx.ciArchiveFailRecoveryAttemptedShas = ciRecoveryShaSetAdd(
+      ctx.ciArchiveFailRecoveryAttemptedShas,
+      headSha,
+    );
+    ctx.ciAssertionFixAttemptedShas = ciRecoveryShaSetAdd(
+      ctx.ciAssertionFixAttemptedShas,
+      headSha,
+    );
+    console.log(
+      `[pipeline] #${issueNumber}: CI recovery markers unusable — ${hydrate.reason}; escalating without recovery side-effects`,
+    );
   }
-  hydrateCiRecoveryMarkers(ctx, opts.runDir);
 
-  // 1. One-shot rebase (existing guard).
+  // 1. One-shot rebase — durable per head SHA (#771), not worktree-only.
+  // Authorization is durable-only: an unkeyed worktree marker left by H1 must not
+  // suppress H2's one-shot in the same worktree. After durable persist succeeds we
+  // still write the worktree marker so BEHIND/conflict same-session paths share awareness.
   const wt = await fns.getForIssueFn(cfg, issueNumber);
-  const alreadyRebased = wt ? fns.rebaseAlreadyAttemptedFn(wt.path) : true;
-  if (!alreadyRebased && wt) {
-    const ok = await fns.tryRebaseAndPushFn(cfg, issueNumber);
-    if (fns.stateDir) {
-      await recordCommand(
-        fns.stateDir,
-        issueNumber,
-        "pre-merge",
-        makeCommandRecord(
-          `git rebase origin/${cfg.base_branch} && git push --force-with-lease`,
-          ok ? 0 : 1,
-          0,
-          ok ? "rebase and push succeeded; CI re-running" : "rebase or push failed",
-        ),
-      ).catch(() => {});
-    }
-    if (ok) {
+  const durableRebaseDone = ciRecoveryShaSetHas(ctx.ciRebaseAttemptedShas, headSha);
+  if (!durableRebaseDone && wt) {
+    // Persist-before-side-effect: refuse rebase if markers cannot be durably stored.
+    const prevRebaseShas = ctx.ciRebaseAttemptedShas;
+    ctx.ciRebaseAttemptedShas = ciRecoveryShaSetAdd(ctx.ciRebaseAttemptedShas, headSha);
+    const persist = persistCtxCiMarkers(ctx, opts.runDir);
+    if (!persist.ok) {
+      ctx.ciRebaseAttemptedShas = prevRebaseShas;
+      durablePersistFailure = persist.reason;
+      console.log(
+        `[pipeline] #${issueNumber}: refusing CI rebase for ${headSha.slice(0, 7)} — ${persist.reason}`,
+      );
+      // Fall through to remaining ladder / escalate (fail-closed, no thrash wait).
+    } else {
+      // Worktree marker is informational for BEHIND/conflict — not CI auth.
       fns.markRebaseAttemptedFn(wt.path);
-      return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
+
+      const beforeSha = headSha;
+      let gitOk = false;
+      try {
+        gitOk = await fns.tryRebaseAndPushFn(cfg, issueNumber);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        gitOk = false;
+        console.log(
+          `[pipeline] #${issueNumber}: CI rebase side-effect threw for ${headSha.slice(0, 7)}: ${msg}`,
+        );
+      }
+
+      let afterSha: string | undefined;
+      try {
+        afterSha = (await fns.getPrDetailFn(cfg, prNumber)).head_sha;
+      } catch {
+        afterSha = undefined;
+      }
+      const rebaseResult = await resolveRebasePushResult(beforeSha, gitOk, afterSha);
+
+      if (fns.stateDir) {
+        const summary =
+          rebaseResult.ok && rebaseResult.verified && rebaseResult.headMoved
+            ? "rebase and push succeeded; HEAD moved; CI re-running"
+            : rebaseResult.ok && !rebaseResult.verified
+              ? "rebase and push reported success but PR head could not be re-read"
+              : rebaseResult.ok
+                ? "rebase and push reported success but HEAD unchanged"
+                : rebaseResult.reason;
+        await recordCommand(
+          fns.stateDir,
+          issueNumber,
+          "pre-merge",
+          makeCommandRecord(
+            `git rebase origin/${cfg.base_branch} && git push --force-with-lease`,
+            rebaseResult.ok && rebaseResult.verified && rebaseResult.headMoved ? 0 : 1,
+            0,
+            summary,
+          ),
+        ).catch(() => {});
+      }
+
+      if (rebaseResult.ok && rebaseResult.verified && rebaseResult.headMoved) {
+        return { advanced: false, status: "waiting", reason: "rebased; CI re-running" };
+      }
+      // Successful side-effect with unverified HEAD: budget for beforeSha is
+      // already consumed; re-evaluate next poll without escalating on old checks.
+      if (rebaseResult.ok && !rebaseResult.verified) {
+        console.log(
+          `[pipeline] #${issueNumber}: CI rebase side-effect succeeded but PR head could not be re-read after ${beforeSha.slice(0, 7)}; re-evaluating on next poll`,
+        );
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: REBASE_HEAD_UNVERIFIED_WAIT_REASON,
+        };
+      }
+      // External head advance without attributing success to a failed local rebase:
+      // durable budget for beforeSha is already consumed; next poll evaluates afterSha.
+      if (
+        !rebaseResult.ok &&
+        rebaseResult.afterSha &&
+        rebaseResult.afterSha !== beforeSha
+      ) {
+        console.log(
+          `[pipeline] #${issueNumber}: PR head advanced externally during rebase ` +
+            `(${beforeSha.slice(0, 7)} → ${rebaseResult.afterSha.slice(0, 7)}); re-evaluating on next poll`,
+        );
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: "PR head advanced; waiting for checks",
+        };
+      }
+      // No-op success or failed rebase without external head move → continue ladder.
     }
-    // Rebase failed → continue ladder (do not hard-block solely on rebase failure).
   }
 
   // Best-effort log excerpt from the first failed check that has a link.
+  // Log fetch failure must not prevent escalation or add recovery waits (#771).
   let logExcerpt: string | null = null;
   for (const check of failedChecks) {
     try {
@@ -4190,11 +4640,12 @@ async function handleDefinitiveCiFailure(
 
   const rerunEnabled = cfg.pre_merge_ci_rerun_enabled !== false;
   const assertionFixEnabled = cfg.pre_merge_ci_assertion_fix === true;
-  let rerunAttempted = ctx.ciRerunAttemptedForSha === headSha;
-  let archiveFailRecoveryAttempted = ctx.ciArchiveFailRecoveryAttemptedForSha === headSha;
-  let assertionFixAttempted = ctx.ciAssertionFixAttemptedForSha === headSha;
-  /** Set when a recovery side-effect could not be paired with durable markers. */
-  let durablePersistFailure: string | undefined;
+  let rerunAttempted = ciRecoveryShaSetHas(ctx.ciRerunAttemptedShas, headSha);
+  let archiveFailRecoveryAttempted = ciRecoveryShaSetHas(
+    ctx.ciArchiveFailRecoveryAttemptedShas,
+    headSha,
+  );
+  let assertionFixAttempted = ciRecoveryShaSetHas(ctx.ciAssertionFixAttemptedShas, headSha);
   /** Set when archive close succeeded but reopen did not — operator must reopen. */
   let prLeftClosed: { prNumber: number } | undefined;
   let closeReopenError: string | undefined;
@@ -4207,21 +4658,18 @@ async function handleDefinitiveCiFailure(
     rerunEnabled &&
     !rerunAttempted
   ) {
-    const prevRerunSha = ctx.ciRerunAttemptedForSha;
-    ctx.ciRerunAttemptedForSha = headSha;
+    const prevRerunShas = ctx.ciRerunAttemptedShas;
+    ctx.ciRerunAttemptedShas = ciRecoveryShaSetAdd(ctx.ciRerunAttemptedShas, headSha);
     const persist = persistCtxCiMarkers(ctx, opts.runDir);
     if (!persist.ok) {
       // Roll back in-memory so a later run can retry once durability is restored.
-      ctx.ciRerunAttemptedForSha = prevRerunSha;
+      ctx.ciRerunAttemptedShas = prevRerunShas;
       durablePersistFailure = persist.reason;
       console.log(
         `[pipeline] #${issueNumber}: refusing CI re-run for ${headSha.slice(0, 7)} — ${persist.reason}`,
       );
     } else {
       rerunAttempted = true;
-      if (opts.pollingCtx) {
-        opts.pollingCtx.ciRerunAttemptedForSha = headSha;
-      }
       let result: RerunFailedWorkflowsResult;
       try {
         result = await fns.rerunFailedWorkflowsFn(cfg, failedChecks);
@@ -4265,20 +4713,20 @@ async function handleDefinitiveCiFailure(
       if (rerunAttempted || !rerunEnabled) {
         // Persist one-shot marker before close so restart cannot re-close thrash.
         // If persist fails, skip the side-effect and escalate (do not leave PR closed).
-        const prevArchiveSha = ctx.ciArchiveFailRecoveryAttemptedForSha;
-        ctx.ciArchiveFailRecoveryAttemptedForSha = headSha;
+        const prevArchiveShas = ctx.ciArchiveFailRecoveryAttemptedShas;
+        ctx.ciArchiveFailRecoveryAttemptedShas = ciRecoveryShaSetAdd(
+          ctx.ciArchiveFailRecoveryAttemptedShas,
+          headSha,
+        );
         const persistBefore = persistCtxCiMarkers(ctx, opts.runDir);
         if (!persistBefore.ok) {
-          ctx.ciArchiveFailRecoveryAttemptedForSha = prevArchiveSha;
+          ctx.ciArchiveFailRecoveryAttemptedShas = prevArchiveShas;
           durablePersistFailure = durablePersistFailure ?? persistBefore.reason;
           console.log(
             `[pipeline] #${issueNumber}: refusing archive close+reopen for ${headSha.slice(0, 7)} — ${persistBefore.reason}`,
           );
         } else {
           archiveFailRecoveryAttempted = true;
-          if (opts.pollingCtx) {
-            opts.pollingCtx.ciArchiveFailRecoveryAttemptedForSha = headSha;
-          }
 
           let closed = false;
           let reopened = false;
@@ -4334,20 +4782,20 @@ async function handleDefinitiveCiFailure(
   // 5. Optional assertion auto-fix (config-capped, one shot).
   // Persist marker before dispatch so restart cannot re-invoke the fix loop.
   if (classification === "assertion" && assertionFixEnabled && !assertionFixAttempted) {
-    const prevFixSha = ctx.ciAssertionFixAttemptedForSha;
-    ctx.ciAssertionFixAttemptedForSha = headSha;
+    const prevFixShas = ctx.ciAssertionFixAttemptedShas;
+    ctx.ciAssertionFixAttemptedShas = ciRecoveryShaSetAdd(
+      ctx.ciAssertionFixAttemptedShas,
+      headSha,
+    );
     const persist = persistCtxCiMarkers(ctx, opts.runDir);
     if (!persist.ok) {
-      ctx.ciAssertionFixAttemptedForSha = prevFixSha;
+      ctx.ciAssertionFixAttemptedShas = prevFixShas;
       durablePersistFailure = durablePersistFailure ?? persist.reason;
       console.log(
         `[pipeline] #${issueNumber}: refusing CI assertion auto-fix for ${headSha.slice(0, 7)} — ${persist.reason}`,
       );
     } else {
       assertionFixAttempted = true;
-      if (opts.pollingCtx) {
-        opts.pollingCtx.ciAssertionFixAttemptedForSha = headSha;
-      }
       if (fns.runCiAssertionFixFn) {
         let fixResult: { ok: boolean; reason?: string };
         try {
@@ -4639,8 +5087,11 @@ async function recoverFromMergeConflict(
   issueNumber: number,
   stateDir?: string,
   deps: AdvancePreMergeDeps = {},
+  /** PR number for authoritative HEAD re-read after rebase (#771). */
+  prNumber?: number,
 ): Promise<Outcome> {
   const getForIssueFn = deps.getForIssue ?? getOnDiskForIssue;
+  const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
   const setBlockedFn = deps.setBlocked ?? setBlocked;
   const tryRebaseAndPushFn = deps.tryRebaseAndPush ?? tryRebaseAndPush;
   const rebaseAlreadyAttemptedFn = deps.rebaseAlreadyAttempted ?? rebaseAlreadyAttempted;
@@ -4649,23 +5100,88 @@ async function recoverFromMergeConflict(
   const wt = await getForIssueFn(cfg, issueNumber);
   const alreadyRebased = wt ? rebaseAlreadyAttemptedFn(wt.path) : true;
   if (!alreadyRebased && wt) {
-    const ok = await tryRebaseAndPushFn(cfg, issueNumber);
-    if (stateDir) {
-      await recordCommand(
-        stateDir,
-        issueNumber,
-        "pre-merge",
-        makeCommandRecord(
-          `git rebase origin/${cfg.base_branch} && git push --force-with-lease`,
-          ok ? 0 : 1,
-          0,
-          ok ? "conflict-recovery rebase succeeded; CI re-running" : "conflict-recovery rebase failed",
-        ),
-      ).catch(() => {});
+    let beforeSha: string | undefined;
+    if (prNumber !== undefined) {
+      try {
+        beforeSha = (await getPrDetailFn(cfg, prNumber)).head_sha;
+      } catch {
+        beforeSha = undefined;
+      }
     }
-    if (ok) {
+
+    const gitOk = await tryRebaseAndPushFn(cfg, issueNumber);
+
+    let afterSha: string | undefined;
+    if (prNumber !== undefined) {
+      try {
+        afterSha = (await getPrDetailFn(cfg, prNumber)).head_sha;
+      } catch {
+        afterSha = undefined;
+      }
+    }
+
+    // Prefer authoritative HEAD-moved truth when prNumber is available (#771).
+    // Without prNumber, fall back to git-ok alone (legacy single-arg call sites).
+    // Unverified post-rebase HEAD after success must wait to re-evaluate, not block
+    // as if the tip were still the pre-rebase conflicted SHA (#771 review 2).
+    if (beforeSha !== undefined && prNumber !== undefined) {
+      const rebaseResult = await resolveRebasePushResult(beforeSha, gitOk, afterSha);
+      if (stateDir) {
+        const summary =
+          rebaseResult.ok && rebaseResult.verified && rebaseResult.headMoved
+            ? "conflict-recovery rebase succeeded; CI re-running"
+            : rebaseResult.ok && !rebaseResult.verified
+              ? "conflict-recovery rebase reported success but PR head could not be re-read"
+              : rebaseResult.ok
+                ? "conflict-recovery rebase reported success but HEAD unchanged"
+                : "conflict-recovery rebase failed";
+        await recordCommand(
+          stateDir,
+          issueNumber,
+          "pre-merge",
+          makeCommandRecord(
+            `git rebase origin/${cfg.base_branch} && git push --force-with-lease`,
+            rebaseResult.ok && rebaseResult.verified && rebaseResult.headMoved ? 0 : 1,
+            0,
+            summary,
+          ),
+        ).catch(() => {});
+      }
       markRebaseAttemptedFn(wt.path);
-      return { advanced: false, status: "waiting", reason: "rebase-resolved; CI re-running" };
+      if (rebaseResult.ok && rebaseResult.verified && rebaseResult.headMoved) {
+        return { advanced: false, status: "waiting", reason: "rebase-resolved; CI re-running" };
+      }
+      if (rebaseResult.ok && !rebaseResult.verified) {
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: REBASE_HEAD_UNVERIFIED_WAIT_REASON,
+        };
+      }
+      // verified no-op or failed → fall through to block
+    } else {
+      const claimCiRerunning = gitOk;
+      if (stateDir) {
+        await recordCommand(
+          stateDir,
+          issueNumber,
+          "pre-merge",
+          makeCommandRecord(
+            `git rebase origin/${cfg.base_branch} && git push --force-with-lease`,
+            claimCiRerunning ? 0 : 1,
+            0,
+            claimCiRerunning
+              ? "conflict-recovery rebase succeeded; CI re-running"
+              : "conflict-recovery rebase failed",
+          ),
+        ).catch(() => {});
+      }
+      if (claimCiRerunning) {
+        markRebaseAttemptedFn(wt.path);
+        return { advanced: false, status: "waiting", reason: "rebase-resolved; CI re-running" };
+      }
+      // Failed: mark so we do not thrash rebase on the next poll (#771).
+      markRebaseAttemptedFn(wt.path);
     }
   }
   await setBlockedFn(

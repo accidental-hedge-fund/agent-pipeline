@@ -208,7 +208,7 @@ test("advance(): CI failure + rebaseAlreadyAttempted + re-run budget exhausted â
     out = await advance(
       cfg,
       ISSUE,
-      { pollingCtx: { ciRerunAttemptedForSha: SHA_HEAD } },
+      { pollingCtx: { ciRerunAttemptedShas: [SHA_HEAD] } },
       deps,
     );
   });
