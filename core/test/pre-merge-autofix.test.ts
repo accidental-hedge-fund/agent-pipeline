@@ -16,6 +16,7 @@ import {
   isAutoFixableFinding,
   isPipelineInternalCommit,
   partitionBlockingForAutofix,
+  reconstructFindingsForResidualAutofix,
   performPreMergeAutoFix,
   preMergeAutofixAttemptComment,
   preMergeAutofixNoopComment,
@@ -40,7 +41,12 @@ import {
   headImplementsRecommendedClassification,
   isClassificationOrControlFlowClaim,
 } from "../scripts/review-policy.ts";
-import { computeDiffHash, DELTA_REVIEW_MARKER_PREFIX, isVerifiedPipelineAttestation } from "../scripts/stages/review.ts";
+import {
+  computeDiffHash,
+  DELTA_REVIEW_MARKER_PREFIX,
+  encodeReviewArtifact,
+  isVerifiedPipelineAttestation,
+} from "../scripts/stages/review.ts";
 import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
 import type { InvokeFn } from "../scripts/openspec-consistency.ts";
 import type { HeadFileState, PriorRoundDigest } from "../scripts/review-history.ts";
@@ -406,6 +412,36 @@ test("partitionBlockingForAutofix: code-behind-spec joins allowlisted subset", (
   const p = partitionBlockingForAutofix([codeBehind, security]);
   assert.deepEqual(p.autoFixable, [codeBehind]);
   assert.deepEqual(p.residual, [security]);
+});
+
+test("reconstructFindingsForResidualAutofix: surface category + body direction → autofixable", () => {
+  // Minimal durable delta comment shape: markers + properly encoded artifact.
+  const artifactLine = encodeReviewArtifact({
+    round: 2,
+    reviewedSha: SHA_HEAD,
+    diffHash: "abcd",
+    blockingKeys: ["5284604a"],
+    review1Risk: null,
+    bodyHash: "00",
+    blockingFindings: [{
+      key: "5284604a",
+      surface: "core/scripts/gh.ts|spec-divergence",
+      severity: "high",
+      title: "Title/body issue references are never superseded",
+      confidence: 0.99,
+    }],
+  });
+  const body =
+    `## Pre-merge Delta Review — needs-attention\n\n` +
+    `**1. [HIGH] Title/body** \`override-key: 5284604a\` \`category: spec-divergence\` \`direction: code-behind-spec\`\n\n` +
+    `<!-- pipeline-blocking-keys: 5284604a -->\n` +
+    `${artifactLine}\n`;
+  const findings = reconstructFindingsForResidualAutofix(body);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0]!.category, "spec-divergence");
+  assert.equal(findings[0]!.spec_divergence_direction, "code-behind-spec");
+  assert.equal(isAutoFixableFinding(findings[0]!), true);
+  assert.equal(partitionBlockingForAutofix(findings).autoFixable.length, 1);
 });
 
 test("allBlockingAutoFixable: allowlisted sets → true; mixed security / empty → false (#680)", () => {

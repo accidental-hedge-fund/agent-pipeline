@@ -75,6 +75,7 @@ import {
   buildTrustedOverrideComments,
   extractOverrides,
   extractScopedOverrides,
+  extractSpecDivergenceDirection,
   findingKey,
   normalizeFile,
   overrideComment,
@@ -561,6 +562,47 @@ export function isAutoFixableFinding(f: ReviewFinding): boolean {
     return f.spec_divergence_direction === "code-behind-spec";
   }
   return false;
+}
+
+/**
+ * Reconstruct minimal {@link ReviewFinding} objects from a durable review /
+ * delta comment so residual re-entry can partition for auto-fix without a
+ * fresh reviewer invocation (#768). Uses the ReviewArtifact `blockingFindings`
+ * extension (surface = `path|category`) plus body-level direction markers.
+ * Does not invent severity below high when missing.
+ */
+export function reconstructFindingsForResidualAutofix(
+  commentBody: string,
+): ReviewFinding[] {
+  const artifact = extractReviewArtifact(commentBody);
+  if (!artifact?.blockingFindings?.length) return [];
+  const bodyDirection = extractSpecDivergenceDirection(commentBody);
+  return artifact.blockingFindings.map((bf) => {
+    const surface = bf.surface ?? "";
+    const pipe = surface.lastIndexOf("|");
+    const file = pipe >= 0 ? surface.slice(0, pipe) : surface || undefined;
+    const category = pipe >= 0 ? surface.slice(pipe + 1) : undefined;
+    const sevRaw = (bf.severity ?? "high").toLowerCase();
+    const severity =
+      sevRaw === "critical" || sevRaw === "high" || sevRaw === "medium" || sevRaw === "low"
+        ? sevRaw
+        : "high";
+    const f: ReviewFinding = {
+      severity,
+      title: bf.title || `Finding ${bf.key}`,
+      body:
+        `Reconstructed from durable pre-merge residual (key ${bf.key}) for ` +
+        `auto-fix re-entry. Original review comment is the source of truth.`,
+      confidence: typeof bf.confidence === "number" ? bf.confidence : 0.9,
+      recommendation: "Resolve per the recorded review finding.",
+      category,
+      file: file || undefined,
+    };
+    if (category === "spec-divergence" && bodyDirection) {
+      f.spec_divergence_direction = bodyDirection;
+    }
+    return f;
+  });
 }
 
 /**
@@ -2130,6 +2172,93 @@ export async function enforceReviewShaGate(
         summary: `re-review: scoped overrides may cover cached blockers`,
       };
     }
+
+    // Factory dogfood (#768 re-entry): clearing `blocked` and re-running pre-merge
+    // with the same HEAD used to park immediately via this reuse guard, even when
+    // the durable residual was never auto-fixed (pure residual first-hop, or
+    // allowlist expanded after the park). If the recorded verdict still has an
+    // auto-fixable subset and no bound autofix attempt exists at this head,
+    // attempt one implementer auto-fix before escalating to needs-human.
+    const attemptAutoFixFn = deps.attemptPreMergeAutoFix;
+    if (attemptAutoFixFn && commentBody) {
+      const reconstructed = reconstructFindingsForResidualAutofix(commentBody);
+      const { autoFixable } = partitionBlockingForAutofix(reconstructed);
+      if (autoFixable.length > 0) {
+        let priorAutoFix = false;
+        try {
+          const prCommits = await getPrCommitsFn(cfg, prNumber);
+          const revIdx = reviewed.sha
+            ? prCommits.findIndex((c) => c.oid === reviewed.sha)
+            : -1;
+          const since = revIdx !== -1 ? prCommits.slice(revIdx + 1) : prCommits;
+          priorAutoFix = since.some((c) =>
+            c.messageHeadline.startsWith(PRE_MERGE_AUTOFIX_PREFIX),
+          );
+          if (!priorAutoFix) {
+            priorAutoFix = hasPreMergeAutofixBoundMarkerAtHead(
+              trustedComments, head, actor,
+            );
+          }
+        } catch {
+          priorAutoFix = true; // fail closed: cannot prove no prior attempt
+        }
+        if (!priorAutoFix) {
+          let attemptMarkerPosted = false;
+          try {
+            await postCommentFn(
+              cfg,
+              issueNumber,
+              preMergeAutofixAttemptComment({ issueNumber, headSha: head }),
+            );
+            attemptMarkerPosted = true;
+          } catch (err) {
+            console.warn(
+              `[pipeline] #${issueNumber}: residual re-entry autofix marker post failed: ` +
+                `${(err as Error).message ?? String(err)}; escalating`,
+            );
+          }
+          if (attemptMarkerPosted) {
+            const fixRes = await attemptAutoFixFn(
+              autoFixable,
+              detail.title ?? `issue #${issueNumber}`,
+              commentBody,
+            );
+            if (fixRes.status === "fix-committed" || fixRes.status === "noop-clean") {
+              // HEAD may have moved (or re-verify is required). Bounce pre-merge
+              // so the SHA gate / delta path re-runs against the post-fix state.
+              console.log(
+                `[pipeline] #${issueNumber}: residual re-entry auto-fix ${fixRes.status} ` +
+                  `at ${fixRes.headSha.slice(0, 7)}; re-entering pre-merge`,
+              );
+              await recordPreMergeGateResult(
+                { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+                "pre-merge-autofix",
+                fixRes.status === "fix-committed" ? "pass" : "partial",
+                `residual-reentry:${fixRes.status}`,
+              );
+              return {
+                advanced: true,
+                from: "pre-merge",
+                to: "pre-merge",
+                summary: `residual re-entry auto-fix ${fixRes.status}; re-enter SHA gate`,
+              };
+            }
+            console.warn(
+              `[pipeline] #${issueNumber}: residual re-entry auto-fix ${fixRes.status}` +
+                (fixRes.diagnostic ? ` (${fixRes.diagnostic})` : "") +
+                "; escalating remaining blockers",
+            );
+            await recordPreMergeGateResult(
+              { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+              "pre-merge-autofix",
+              "fail",
+              `residual-reentry:${fixRes.status}`,
+            );
+          }
+        }
+      }
+    }
+
     await setBlockedFn(
       cfg,
       issueNumber,
