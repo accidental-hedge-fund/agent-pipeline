@@ -9,7 +9,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { RUNS_ARTIFACT, artifactSubdir } from "../artifact-ignore.ts";
-import { LOCK_ACQUIRED_FILE, issueRunsDir, lockFilePath } from "../detach.ts";
+import {
+  LOCK_ACQUIRED_FILE,
+  getProcessStartTime,
+  issueRunsDir,
+  lockFilePath,
+} from "../detach.ts";
+import { isSameProcessInstance } from "./lock-ownership.ts";
 
 export type LiveAdvanceEvidenceClass =
   | "lock_held"
@@ -110,6 +116,45 @@ export function parsePidText(raw: string | null | undefined): number | null {
   const pid = Number(raw.trim().split(/\s+/)[0]);
   if (!Number.isFinite(pid) || pid <= 0) return null;
   return pid;
+}
+
+/**
+ * Parse a detach identity marker (`pid starttime…`) into verifiable identity.
+ * Bare PID (no starttime token) returns null — identity cannot be verified
+ * against PID reuse (#770 review finding eff1796b).
+ */
+export function parseProcessIdentityText(
+  raw: string | null | undefined,
+): { pid: number; starttime: string } | null {
+  if (!raw) return null;
+  const parts = raw.trim().split(/\s+/);
+  if (parts.length < 2) return null;
+  const pid = Number(parts[0]);
+  if (!Number.isFinite(pid) || pid <= 0 || !Number.isInteger(pid)) return null;
+  // Remainder may contain spaces (Darwin `ps -o lstart=`).
+  const starttime = parts.slice(1).join(" ").trim();
+  if (!starttime) return null;
+  return { pid, starttime };
+}
+
+/**
+ * Live only when marker carries pid+starttime, the PID is alive, and host
+ * starttime still matches the recorded token. Unverifiable markers are non-live.
+ */
+export function livePidFromIdentityMarker(
+  raw: string | null | undefined,
+  opts?: {
+    isPidAlive?: (pid: number) => boolean;
+    getStartTime?: (pid: number) => string | number | null | undefined;
+  },
+): number | null {
+  const id = parseProcessIdentityText(raw);
+  if (!id) return null;
+  const alive = opts?.isPidAlive ?? isPidAlive;
+  const getStart = opts?.getStartTime ?? getProcessStartTime;
+  if (!alive(id.pid)) return null;
+  if (!isSameProcessInstance(id.pid, id.starttime, getStart)) return null;
+  return id.pid;
 }
 
 /** Read a lock file path; live when PID is parseable and `process.kill(pid, 0)` succeeds. */
@@ -228,9 +273,13 @@ export function findActiveRunStoreForIssue(
 
 /**
  * Production wrapper / process-identity lookup for an issue (#770 review 2
- * 956d20df). Host-local only — reads the detach issue lock and newest
- * non-sentinel run dirs' `.lock-acquired` under `~/.pipeline/runs/<issue>/`.
- * Returns a live PID or null. Injectable FS / liveness for unit tests.
+ * 956d20df / review finding eff1796b). Host-local only — reads the detach
+ * issue lock and newest non-sentinel run dirs' `.lock-acquired` under
+ * `~/.pipeline/runs/<issue>/`. Returns a live PID only when the marker's
+ * process-identity token (pid + starttime) still matches the host process
+ * table — bare PID liveness alone is not sufficient (PID reuse after a
+ * pre-sentinel crash must not suppress redispatch). Injectable FS / identity
+ * for unit tests.
  */
 export function findWrapperPidForIssue(
   issueNumber: number,
@@ -239,6 +288,7 @@ export function findWrapperPidForIssue(
     readdirSync?: (dir: string) => string[];
     readText?: (p: string) => string | null;
     isPidAlive?: (pid: number) => boolean;
+    getStartTime?: (pid: number) => string | number | null | undefined;
     statMtimeMs?: (p: string) => number;
   },
 ): number | null {
@@ -246,6 +296,7 @@ export function findWrapperPidForIssue(
   const readdir = opts?.readdirSync ?? ((dir: string) => fs.readdirSync(dir));
   const read = opts?.readText ?? tryReadTextFile;
   const alive = opts?.isPidAlive ?? isPidAlive;
+  const getStart = opts?.getStartTime ?? getProcessStartTime;
   const mtimeMs =
     opts?.statMtimeMs ??
     ((p: string) => {
@@ -255,15 +306,17 @@ export function findWrapperPidForIssue(
         return 0;
       }
     });
+  const liveFrom = (raw: string | null | undefined): number | null =>
+    livePidFromIdentityMarker(raw, { isPidAlive: alive, getStartTime: getStart });
 
   const issueDir = issueRunsDir(home, issueNumber);
 
   // 1. Detach issue-level advisory lock (`~/.pipeline/runs/<issue>/.lock`)
   const detachLock = lockFilePath(home, issueNumber);
-  const lockPid = parsePidText(read(detachLock));
-  if (lockPid != null && alive(lockPid)) return lockPid;
+  const lockPid = liveFrom(read(detachLock));
+  if (lockPid != null) return lockPid;
 
-  // 2. Newest non-terminal detach run dirs with a live `.lock-acquired` PID
+  // 2. Newest non-terminal detach run dirs with a verified `.lock-acquired`
   let names: string[];
   try {
     names = readdir(issueDir);
@@ -278,8 +331,8 @@ export function findWrapperPidForIssue(
     const dir = path.join(issueDir, name);
     // sentinel.json means the wrapper already exited — not live identity.
     if (read(path.join(dir, "sentinel.json")) !== null) continue;
-    const acquiredPid = parsePidText(read(path.join(dir, LOCK_ACQUIRED_FILE)));
-    if (acquiredPid != null && alive(acquiredPid)) return acquiredPid;
+    const acquiredPid = liveFrom(read(path.join(dir, LOCK_ACQUIRED_FILE)));
+    if (acquiredPid != null) return acquiredPid;
   }
   return null;
 }

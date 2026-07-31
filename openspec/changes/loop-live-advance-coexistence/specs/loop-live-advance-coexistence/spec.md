@@ -39,6 +39,14 @@ Before the durable loop dispatches a full per-item advance through `pipeline/loo
 - **THEN** the live-advance probe SHALL be able to observe a live wrapper/process identity for an issue
 - **AND** that observation SHALL prevent a second full dispatch without requiring a test-only injected full probe override
 
+#### Scenario: Stale detach marker with reused PID is not live wrapper identity
+
+- **WHEN** a host-local detach `.lock` or non-sentinel `.lock-acquired` marker records a numeric PID that currently exists
+- **AND** the marker does not carry a verifiable process-identity token that still matches that process (for example process starttime), or the token mismatches because the OS reused the PID after a pre-sentinel crash
+- **THEN** the production wrapper/process lookup SHALL treat that marker as not live
+- **AND** the live-advance probe SHALL NOT report `wrapper_pid` solely from bare PID liveness
+- **AND** a subsequent genuine redispatch for that item SHALL remain possible under normal coexistence and defect policy
+
 ---
 
 ### Requirement: Lock-held and already-running dispatch outcomes SHALL be non-fatal coexistence, never workflow-engine-defect run_fatal

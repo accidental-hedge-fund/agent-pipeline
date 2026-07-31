@@ -13,9 +13,11 @@ import {
   resolveLinkageTerminalState,
   findActiveRunStoreForIssue,
   findWrapperPidForIssue,
+  livePidFromIdentityMarker,
+  parseProcessIdentityText,
   probeLiveAdvance,
 } from "../scripts/loop/live-advance.ts";
-import { LOCK_ACQUIRED_FILE } from "../scripts/detach.ts";
+import { LOCK_ACQUIRED_FILE, formatProcessIdentityMarker } from "../scripts/detach.ts";
 import { classifyDispatchOutcome } from "../scripts/pipeline.ts";
 import { normalizeLoopOutcome } from "../scripts/loop-execution-contract.ts";
 
@@ -310,23 +312,66 @@ test("findActiveRunStoreForIssue: fresh non-terminal store is still active withi
   fs.rmSync(repo, { recursive: true, force: true });
 });
 
+test("parseProcessIdentityText / livePidFromIdentityMarker: require starttime", () => {
+  assert.deepEqual(parseProcessIdentityText("42 birth-A"), { pid: 42, starttime: "birth-A" });
+  assert.deepEqual(
+    parseProcessIdentityText("99 Wed Jul 31 12:00:00 2026"),
+    { pid: 99, starttime: "Wed Jul 31 12:00:00 2026" },
+  );
+  assert.equal(parseProcessIdentityText("42"), null, "bare PID is not verifiable identity");
+  assert.equal(parseProcessIdentityText(null), null);
+
+  assert.equal(
+    livePidFromIdentityMarker("42 birth-A", {
+      isPidAlive: (p) => p === 42,
+      getStartTime: (p) => (p === 42 ? "birth-A" : null),
+    }),
+    42,
+  );
+  assert.equal(
+    livePidFromIdentityMarker("42 birth-A", {
+      isPidAlive: (p) => p === 42,
+      getStartTime: (p) => (p === 42 ? "birth-B" : null),
+    }),
+    null,
+    "PID reuse (different starttime) must be non-live",
+  );
+  assert.equal(
+    livePidFromIdentityMarker("42", {
+      isPidAlive: () => true,
+      getStartTime: () => "anything",
+    }),
+    null,
+    "unsentinelled bare-PID marker must not count as live",
+  );
+});
+
 test("findWrapperPidForIssue: live .lock-acquired without sentinel (#770 956d20df)", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "live-adv-wrap-"));
   const issue = 675;
   const runDir = path.join(home, ".pipeline", "runs", String(issue), "2026-07-31_run1");
   fs.mkdirSync(runDir, { recursive: true });
-  fs.writeFileSync(path.join(runDir, LOCK_ACQUIRED_FILE), String(process.pid));
+  const start = "start-live-1";
+  fs.writeFileSync(
+    path.join(runDir, LOCK_ACQUIRED_FILE),
+    formatProcessIdentityMarker(process.pid, () => start),
+  );
 
   const pid = findWrapperPidForIssue(issue, {
     homedir: home,
     isPidAlive: (p) => p === process.pid,
+    getStartTime: (p) => (p === process.pid ? start : null),
   });
   assert.equal(pid, process.pid);
 
   // Completed detach (sentinel present) must not count.
   fs.writeFileSync(path.join(runDir, "sentinel.json"), JSON.stringify({ exitCode: 0 }));
   assert.equal(
-    findWrapperPidForIssue(issue, { homedir: home, isPidAlive: () => true }),
+    findWrapperPidForIssue(issue, {
+      homedir: home,
+      isPidAlive: () => true,
+      getStartTime: () => start,
+    }),
     null,
   );
 
@@ -338,12 +383,14 @@ test("findWrapperPidForIssue: live detach issue lock", () => {
   const issue = 42;
   const issueDir = path.join(home, ".pipeline", "runs", String(issue));
   fs.mkdirSync(issueDir, { recursive: true });
-  fs.writeFileSync(path.join(issueDir, ".lock"), String(process.pid));
+  const start = "start-lock-1";
+  fs.writeFileSync(path.join(issueDir, ".lock"), formatProcessIdentityMarker(process.pid, () => start));
 
   assert.equal(
     findWrapperPidForIssue(issue, {
       homedir: home,
       isPidAlive: (p) => p === process.pid,
+      getStartTime: (p) => (p === process.pid ? start : null),
     }),
     process.pid,
   );
@@ -351,9 +398,63 @@ test("findWrapperPidForIssue: live detach issue lock", () => {
     findWrapperPidForIssue(issue, {
       homedir: home,
       isPidAlive: () => false,
+      getStartTime: () => start,
     }),
     null,
     "dead lock PID must not count",
+  );
+
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("findWrapperPidForIssue: stale non-sentinel marker with reused PID is not live (#770 eff1796b)", () => {
+  // Wrapper killed before sentinel.json leaves .lock-acquired; OS reuses the PID
+  // for an unrelated process. Without starttime verification this would return
+  // wrapper_pid and strand redispatch until watchdog/pause.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "live-adv-reuse-"));
+  const issue = 770;
+  const runDir = path.join(home, ".pipeline", "runs", String(issue), "crashed-no-sentinel");
+  fs.mkdirSync(runDir, { recursive: true });
+  const recycledPid = 4242;
+  fs.writeFileSync(
+    path.join(runDir, LOCK_ACQUIRED_FILE),
+    formatProcessIdentityMarker(recycledPid, () => "birth-original"),
+  );
+
+  assert.equal(
+    findWrapperPidForIssue(issue, {
+      homedir: home,
+      isPidAlive: (p) => p === recycledPid, // kill -0 succeeds on the new process
+      getStartTime: (p) => (p === recycledPid ? "birth-reused" : null),
+    }),
+    null,
+    "reused PID with mismatched starttime must not suppress redispatch",
+  );
+
+  // Bare PID-only legacy/crash marker (no starttime token) is also non-live.
+  fs.writeFileSync(path.join(runDir, LOCK_ACQUIRED_FILE), String(recycledPid));
+  assert.equal(
+    findWrapperPidForIssue(issue, {
+      homedir: home,
+      isPidAlive: () => true,
+      getStartTime: () => "birth-reused",
+    }),
+    null,
+    "unverifiable bare-PID marker must not count as live identity",
+  );
+
+  // Matching starttime still counts as live (control).
+  fs.writeFileSync(
+    path.join(runDir, LOCK_ACQUIRED_FILE),
+    formatProcessIdentityMarker(recycledPid, () => "birth-original"),
+  );
+  assert.equal(
+    findWrapperPidForIssue(issue, {
+      homedir: home,
+      isPidAlive: (p) => p === recycledPid,
+      getStartTime: (p) => (p === recycledPid ? "birth-original" : null),
+    }),
+    recycledPid,
   );
 
   fs.rmSync(home, { recursive: true, force: true });
