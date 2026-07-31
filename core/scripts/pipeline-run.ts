@@ -190,11 +190,35 @@ export function buildAutoLoopExhaustedComment(
 // Module-level constants (local to this module)
 // ---------------------------------------------------------------------------
 
-const MAX_ITERATIONS = 12;
+/**
+ * Safety backstop on stage dispatches per advance invocation. Residual
+ * re-entry (pre-merge → review/fix → pre-merge) plus disabled skip stages can
+ * burn this budget on the transition *into* ready-to-deploy; terminal
+ * finalize is guaranteed separately via {@link shouldRunDeferredTerminalFinalize}
+ * so PR tagging / Pipeline Complete never depend on a free iteration slot (#773).
+ */
+export const MAX_ITERATIONS = 12;
 
 // Same string as pipeline.ts's REVIEW_CEILING_MARKER — kept in sync manually.
 // Defining a local copy avoids a runtime circular import with pipeline.ts.
 const REVIEW_CEILING_MARKER = "## Pipeline: Review ceiling reached";
+
+/**
+ * Whether this advance invocation must still run {@link deployReady.finalize}
+ * after the main loop exits. True when the run ended at ready-to-deploy without
+ * having entered the in-loop terminal branch (typical cause: {@link MAX_ITERATIONS}
+ * exhausted on the advance that labeled the issue R2D — #770/#773).
+ *
+ * Pure; exported for unit tests.
+ */
+export function shouldRunDeferredTerminalFinalize(args: {
+  dryRun: boolean;
+  alreadyFinalized: boolean;
+  finalStage: Stage | null | undefined;
+}): boolean {
+  if (args.dryRun || args.alreadyFinalized) return false;
+  return args.finalStage === "ready-to-deploy";
+}
 
 // ---------------------------------------------------------------------------
 // Bounded auto-loop helpers (#149) — pure functions, exported for unit tests.
@@ -812,6 +836,41 @@ export async function runAdvance(
     // Tracks the most recently seen branch so the finally block can patch bundle
     // identity even when deployReady.finalize() has already removed the worktree.
     let lastKnownBranch: string | null = null;
+    // Whether deploy_ready.finalize ran this invocation (#773). Residual re-entry
+    // can exhaust MAX_ITERATIONS on the advance that labels the issue R2D, leaving
+    // PR tagging / Pipeline Complete unrun unless we defer-finalize after the loop.
+    let deployReadyFinalized = false;
+
+    /** Run terminal finalize + lifecycle events. Shared by in-loop R2D branch and post-loop guarantee. */
+    async function runTerminalFinalize(reason: "in-loop" | "deferred"): Promise<Outcome> {
+      const rtdStage = evidenceStageName("ready-to-deploy");
+      const rtdEnteredAt = evidenceTimestamp();
+      if (reason === "deferred") {
+        tlog(
+          `[pipeline] #${issueNumber}: terminal finalize deferred past iteration budget ` +
+            `(MAX_ITERATIONS=${MAX_ITERATIONS}); running deploy_ready.finalize now`,
+        );
+      }
+      if (runDir) {
+        await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_start", at: rtdEnteredAt, stage: rtdStage }, runStoreDeps).catch(() => {});
+      }
+      let out: Outcome;
+      try {
+        out = await deployReady.finalize(cfg, issueNumber, runDir, runStoreDeps);
+      } catch (err) {
+        if (runDir) {
+          await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: evidenceTimestamp(), stage: rtdStage, outcome: "error", commits: [] }, runStoreDeps).catch(() => {});
+        }
+        throw err;
+      }
+      if (runDir) {
+        await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: evidenceTimestamp(), stage: rtdStage, outcome: evidenceOutcome(out), commits: [] }, runStoreDeps).catch(() => {});
+      }
+      deployReadyFinalized = true;
+      printOutcome(issueNumber, "ready-to-deploy", out, tlog);
+      return out;
+    }
+
     try {
     for (let i = 0; i < MAX_ITERATIONS; i++) {
       const detail = await getIssueDetail(cfg, issueNumber);
@@ -849,24 +908,7 @@ export async function runAdvance(
         // The terminal stage is handled outside the common dispatch block, so emit
         // its stage_start / stage_complete lifecycle events explicitly — otherwise a
         // consumer cannot reconstruct the full ordered timeline from events.jsonl (#155).
-        const rtdStage = evidenceStageName(stage);
-        const rtdEnteredAt = evidenceTimestamp();
-        if (runDir) {
-          await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_start", at: rtdEnteredAt, stage: rtdStage }, runStoreDeps).catch(() => {});
-        }
-        let out: Outcome;
-        try {
-          out = await deployReady.finalize(cfg, issueNumber, runDir, runStoreDeps);
-        } catch (err) {
-          if (runDir) {
-            await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: evidenceTimestamp(), stage: rtdStage, outcome: "error", commits: [] }, runStoreDeps).catch(() => {});
-          }
-          throw err;
-        }
-        if (runDir) {
-          await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: evidenceTimestamp(), stage: rtdStage, outcome: evidenceOutcome(out), commits: [] }, runStoreDeps).catch(() => {});
-        }
-        printOutcome(issueNumber, stage, out, tlog);
+        await runTerminalFinalize("in-loop");
         break;
       }
 
@@ -1178,6 +1220,21 @@ export async function runAdvance(
       }
 
       if (opts.once) break;
+    }
+
+    // Deferred terminal finalize (#773): residual re-entry can exhaust
+    // MAX_ITERATIONS on the stage that silent-transitions the issue to
+    // ready-to-deploy, leaving no free iteration for the in-loop R2D branch.
+    // deploy_ready.finalize is idempotent (summary comment + PR label + worktree
+    // removal); run it here so PR tagging never depends on spare budget.
+    if (
+      shouldRunDeferredTerminalFinalize({
+        dryRun: !!opts.dryRun,
+        alreadyFinalized: deployReadyFinalized,
+        finalStage,
+      })
+    ) {
+      await runTerminalFinalize("deferred");
     }
     } finally {
       // Finalize + notify however the loop ended — normal, blocked, or thrown.
