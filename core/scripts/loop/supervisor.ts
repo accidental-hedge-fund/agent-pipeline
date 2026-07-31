@@ -155,11 +155,17 @@ export interface SupervisorDeps {
   dispatchItem(request: LoopExecutionRequest, hooks?: DispatchItemHooks): Promise<LoopExecutionResponse>;
   /**
    * Host-local live-advance probe (#770). When omitted, production uses
-   * {@link probeLiveAdvance} against the per-issue lock path.
+   * {@link probeLiveAdvance} against the per-issue lock path, non-terminal
+   * run-store under `repoDir`, and terminal-aware loop linkage.
    */
   probeLiveAdvance?(itemId: string): Promise<LiveAdvanceProbeResult> | LiveAdvanceProbeResult;
   /** Domain used for per-issue lock paths (default agent-pipeline). */
   lockDomain?: string;
+  /**
+   * Repo root for production live-advance run-store discovery (#770).
+   * When omitted, the default probe still checks lock + provided linkage.
+   */
+  repoDir?: string;
   /** The live changed-file-overlap seam (#530, capability
    *  `durable-run-independent-scheduler`): returns the paths an item's managed worktree actually
    *  changed versus base. Consulted only when more than one item is dispatched in the same cycle
@@ -433,15 +439,19 @@ async function reopenClearedBlockedHolds(
 
     // #770: do not re-admit while a host-local advance is still live (operator
     // resume / mid-flight detach). Clearing `pipeline:blocked` alone is not enough.
+    // Linkage is only live when proven non-terminal (#770 review finding ce4794fb).
     const domain = deps.lockDomain ?? "agent-pipeline";
-    // Only lock/PID evidence for hold-clear (do not treat a stale advance_run_id
-    // as live without terminal proof — #770 review finding ce4794fb).
+    const knownLinkage =
+      current.advance_run_id && current.advance_run_id.length > 0
+        ? { pipeline_run_id: current.advance_run_id }
+        : null;
     const probe: LiveAdvanceProbeResult = deps.probeLiveAdvance
       ? await deps.probeLiveAdvance(item.id)
       : probeLiveAdvance({
           domain,
           issueNumber: Number(item.id),
-          knownLinkage: null,
+          repoDir: deps.repoDir,
+          knownLinkage,
         });
     if (probe.live) {
       await appendEvent(deps.store, runId, token, "loop_item_coexistence_deferred", {
@@ -690,19 +700,28 @@ export async function runSupervisorCycle(
     return { progress: drifted || propagated, stop: null, holdOutstanding: false, allDone: false, heldItemIds };
   }
 
-  // #770 pre-dispatch: if another host-local advance already holds the issue
-  // lock (operator `/pipeline N`), do not spawn a second full dispatch.
+  // #770 pre-dispatch: if another host-local advance is already live (lock,
+  // non-terminal run-store, wrapper PID, or non-terminal loop linkage), do not
+  // spawn a second full dispatch (#770 review finding dcfb0878).
   {
     const kept: string[] = [];
     const domain = deps.lockDomain ?? "agent-pipeline";
     for (const itemId of activeItemIds) {
+      const item = ledger.items[itemId];
+      // Non-terminal retained linkage (prior attach / mid-flight) counts as live.
+      // Terminal resolution happens inside probeLiveAdvance — a completed
+      // advance_run_id alone must not block dispatch.
+      const knownLinkage =
+        item?.advance_run_id && item.advance_run_id.length > 0
+          ? { pipeline_run_id: item.advance_run_id }
+          : null;
       const probe: LiveAdvanceProbeResult = deps.probeLiveAdvance
         ? await deps.probeLiveAdvance(itemId)
         : probeLiveAdvance({
             domain,
             issueNumber: Number(itemId),
-            // Lock/PID only for pre-dispatch (no unproven linkage) — review 1 dcfb0878/ce4794fb.
-            knownLinkage: null,
+            repoDir: deps.repoDir,
+            knownLinkage,
           });
       if (probe.live) {
         ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });
@@ -1074,8 +1093,8 @@ export async function runSupervisorCycle(
       capacityWaitItemIds.push(itemId);
       evidenceOutcome = "capacity_wait";
     } else if (outcome === "coexistence_wait") {
-      // #770: live host-local advance or non-fatal mid-stage exit — re-queue
-      // pending so siblings continue; never run_fatal.
+      // #770: live host-local advance or lock/already-running/install evidence —
+      // re-queue pending so siblings continue; never run_fatal.
       ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });
       evidenceOutcome = "coexistence_wait";
       await appendEvent(deps.store, runId, token, "loop_item_coexistence_wait", {
@@ -1191,14 +1210,24 @@ export async function runSupervisorCycle(
       if (preconditionNoOp) continue;
 
       // #770 Pass-2 coexistence safety net: lock / already-running / install-in-progress
-      // (or failed outcome with live lock probe) must never run_fatal.
+      // (or failed outcome with live lock/run-store/linkage probe) must never run_fatal.
       let coexistenceNoOp = false;
       if (!needsHumanBlockerNoOp) {
         const errText = dispatchError ?? String(rawOutcomeByItem.get(itemId) ?? "");
         const domain = deps.lockDomain ?? "agent-pipeline";
+        const itemEntry = ledger.items[itemId];
+        const knownLinkage =
+          itemEntry?.advance_run_id && itemEntry.advance_run_id.length > 0
+            ? { pipeline_run_id: itemEntry.advance_run_id }
+            : null;
         const probe: LiveAdvanceProbeResult = deps.probeLiveAdvance
           ? await deps.probeLiveAdvance(itemId)
-          : probeLiveAdvance({ domain, issueNumber: Number(itemId) });
+          : probeLiveAdvance({
+              domain,
+              issueNumber: Number(itemId),
+              repoDir: deps.repoDir,
+              knownLinkage,
+            });
         if (isCoexistenceFailureEvidence(errText) || probe.live) {
           coexistenceNoOp = true;
           ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });

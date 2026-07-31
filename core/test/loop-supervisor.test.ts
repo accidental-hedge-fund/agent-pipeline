@@ -2634,3 +2634,321 @@ test("runSupervisorCycle: healed pr_opened mid-flight item is re-dispatched via 
   // Dispatch goes through existing loop-execution path (live labels), not a restart-from-ready transition.
   assert.equal(calls[0]!.done_definition, "pipeline:ready-to-deploy");
 });
+
+// ---------------------------------------------------------------------------
+// #770 — loop live-advance coexistence (review 1 regressions)
+// ---------------------------------------------------------------------------
+
+test("regression (#770 929fc0ac / lock evidence): failed dispatch with already-running evidence is non-fatal coexistence, not workflow-engine-defect / run_fatal", async () => {
+  // Concurrent pair so a rejected/failed sibling is classified (serialized single-item
+  // rethrows rejections byte-identically to pre-#530). Lock text rides on the raw
+  // outcome string the way Pass-2 inspects dispatch evidence.
+  const contract = testContract({
+    concurrency: { max_concurrent: 2 },
+    items: [
+      { id: "675", depends_on: [], ownership: { exclusive: ["src/a/**"] } },
+      { id: "754", depends_on: [], ownership: { exclusive: ["src/b/**"] } },
+    ],
+  });
+  const ledger = testLedger({
+    "675": itemEntry("675", "pending"),
+    "754": itemEntry("754", "pending"),
+  });
+  const { deps } = await setup(contract, ledger);
+
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels(issueNumber) {
+      const id = String(issueNumber);
+      // Keep both items mid-pipeline-ready so the precondition gate admits them.
+      return { state: "open", labels: id === "754" ? [READY_LABEL, PIPELINE_READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue(issueNumber) {
+      return String(issueNumber) === "754" ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/x", head_sha: "abc", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    if (request.item_id === "675") {
+      // Failed outcome whose raw value carries already-running evidence (Pass-2 safety net).
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "pipeline: issue #675 is already running (.lock-failed)" as LoopExecutionResponse["outcome"],
+        evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+      };
+    }
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const cycle = await runSupervisorCycle(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      getChangedFiles: async () => [],
+      probeLiveAdvance: async () => ({ live: false as const }),
+    },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.notEqual(cycle.stop?.reason, "run_fatal", "lock collision must never run_fatal the multi-item run");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.notEqual(finalLedger.items["675"].blocked_theme, "workflow-engine-defect");
+  assert.equal(finalLedger.items["675"].state, "pending", "coexistence reverts item to pending for re-probe");
+  assert.equal(finalLedger.items["754"].state, "ready", "sibling must remain eligible and complete");
+  const events = await readEvents(deps, "run-1");
+  assert.ok(events.some((e) => e.kind === "loop_item_coexistence_wait"));
+});
+
+test("regression (#770 genuine defect): crash with no coexistence evidence still workflow-engine-defect / run_fatal", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      // Mid-flight stage label, not blocked — zero-transition safety nets do not apply.
+      return { state: "open", labels: [PIPELINE_READY_LABEL, "pipeline:review-1"] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      // Nonzero label history so precondition zero-transition no-op cannot fire.
+      return [{ label: "pipeline:review-1", createdAt: "2026-07-22T00:00:00.000Z" }];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      // Unrecognized terminal outside the defined set, no lock/already-running text.
+      outcome: "engine_internal_crash" as LoopExecutionResponse["outcome"],
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+
+  const result = await driveSupervisor(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      // Probe reports not live so Pass-2 does not reclassify as coexistence
+      probeLiveAdvance: async () => ({ live: false as const }),
+    },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(result.stop?.reason, "run_fatal");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
+});
+
+test("regression (#770 dcfb0878): pre-dispatch live probe prevents a second full dispatch", async () => {
+  const contract = testContract({ items: [{ id: "675", depends_on: [] }] });
+  const ledger = testLedger({ "675": itemEntry("675", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe } = coordinatedFakes();
+  const calls: string[] = [];
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request.item_id);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle = await runSupervisorCycle(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      probeLiveAdvance: async () => ({
+        live: true as const,
+        evidence: "lock_held" as const,
+        holder_pid: 4242,
+      }),
+    },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(calls.length, 0, "live advance must not start a second full dispatch");
+  assert.equal(cycle.stop, null, "coexistence must not run_fatal");
+  assert.equal(cycle.progress, false, "pre-dispatch wait is no_progress for the watchdog");
+
+  const events = await readEvents(deps, "run-1");
+  const coexistence = events.filter((e) => e.kind === "loop_item_coexistence_wait");
+  assert.ok(coexistence.length >= 1, "durable coexistence event required");
+  assert.equal((coexistence[0]!.data as { item_id: string }).item_id, "675");
+});
+
+test("regression (#770 ce4794fb / hold-clear): blocked cleared while live advance → no re-admit / no fatal double-dispatch", async () => {
+  const contract = testContract({ items: [{ id: "675", depends_on: [] }] });
+  const ledger = testLedger({
+    "675": {
+      id: "675",
+      state: "waiting",
+      history: [],
+      recovery_budgets_remaining: { default: 3 },
+      advance_run_id: "675-2026-07-31T16-00-00-000Z",
+      hold_request: {
+        request_id: "req-1",
+        item_id: "675",
+        kind: "answer",
+        prompt: "needs a human answer/unblock",
+        requested_by_engine: "claude",
+        requested_at: "2026-07-23T00:00:00.000Z",
+        source: "pipeline_blocked_label",
+      },
+    },
+  });
+  const { deps } = await setup(contract, ledger);
+  // Label cleared (no blocked), but probe reports live advance still running.
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:review-2"] };
+    },
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/x", head_sha: "abc", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const calls: string[] = [];
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request.item_id);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle = await runSupervisorCycle(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      probeLiveAdvance: async () => ({
+        live: true as const,
+        evidence: "loop_linkage" as const,
+        pipeline_run_id: "675-2026-07-31T16-00-00-000Z",
+      }),
+    },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(calls.length, 0, "must not re-admit for a second full dispatch while advance is live");
+  assert.equal(cycle.stop, null);
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["675"].state, "waiting", "item stays held/deferred, not pending for dispatch");
+  const events = await readEvents(deps, "run-1");
+  assert.ok(
+    events.some((e) => e.kind === "loop_item_coexistence_deferred"),
+    "durable deferred re-admission record required",
+  );
+});
+
+test("regression (#770 ce4794fb): hold-clear with terminal linkage (probe not live) re-admits and dispatches", async () => {
+  const contract = testContract({ items: [{ id: "675", depends_on: [] }] });
+  const ledger = testLedger({
+    "675": {
+      id: "675",
+      state: "waiting",
+      history: [],
+      recovery_budgets_remaining: { default: 3 },
+      // Retained after a prior terminal advance — must not block re-admission once probe says not live
+      advance_run_id: "675-2026-07-30T00-00-00-000Z",
+      hold_request: {
+        request_id: "req-1",
+        item_id: "675",
+        kind: "answer",
+        prompt: "needs a human answer/unblock",
+        requested_by_engine: "claude",
+        requested_at: "2026-07-23T00:00:00.000Z",
+        source: "pipeline_blocked_label",
+      },
+    },
+  });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem, calls } = coordinatedFakes();
+
+  const result = await driveSupervisor(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      // Terminal advance: probe reports not live despite retained advance_run_id
+      probeLiveAdvance: async () => ({ live: false as const }),
+    },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.deepEqual(calls.map((c) => c.item_id), ["675"]);
+  assert.equal(result.allDone, true);
+  assert.equal(result.stop, null);
+});

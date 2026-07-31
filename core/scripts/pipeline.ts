@@ -44,10 +44,7 @@ import {
   transition,
 } from "./gh.ts";
 import { isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
-import {
-  isCoexistenceFailureEvidence,
-  isNonFatalMidStageExit,
-} from "./loop/live-advance.ts";
+import { isCoexistenceFailureEvidence } from "./loop/live-advance.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import {
   attestPipelineComment,
@@ -856,7 +853,10 @@ export function classifyDispatchOutcome(
     return "blocked_needs_human";
   }
   if (detail.state === "closed") return "abandoned";
-  if (isCoexistenceFailureEvidence(eventsText) || isNonFatalMidStageExit(eventsText, detail.labels)) {
+  // Coexistence is only lock / already-running / install evidence — never bare
+  // mid-stage skipped/waiting events that can mask a genuine crash (#770 review
+  // finding 929fc0ac).
+  if (isCoexistenceFailureEvidence(eventsText)) {
     return "coexistence_wait";
   }
   return "failed";
@@ -1561,6 +1561,9 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     observe: defaultReconcileObserveDeps(cfg),
     dispatchItem: realDispatchItem(cfg, input.engine),
     getChangedFiles: realGetChangedFiles(cfg),
+    // Host-local live-advance probe scope (#770): run-store discovery + domain.
+    repoDir: cfg.repo_dir,
+    lockDomain: cfg.domain,
     // Mid-advance stage-progress observation (#611): read the linked advance
     // events.jsonl while waiting on the child. Injectable for unit tests.
     readAdvanceEvents: async (eventsPath) => {
