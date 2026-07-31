@@ -88,6 +88,47 @@ When the gate escalates from settled CI failure (budget exhausted), it SHALL rec
 - **AND** a poll performs no new recovery side-effect and escalates or remains blocked
 - **THEN** the run SHALL NOT append additional `gate_result` rows with `result: "partial"` and reason `rebased; CI re-running` for that re-poll
 
+#### Scenario: Terminal ci fail is idempotent per failed head SHA
+
+- **WHEN** the gate has already recorded a terminal `gate_result` `ci`/`fail` for head SHA `H`
+- **AND** a pure re-poll observes the same head still settled red with recovery budgets exhausted
+- **THEN** the gate SHALL NOT append another terminal `ci`/`fail` solely for that re-poll
+- **AND** SHALL still return `blocked` (not unbounded `waiting`)
+
+### Requirement: Settled-check aggregate SHALL be pending-first for the current PR head
+
+The pre-merge CI gate SHALL evaluate settlement using the checks returned for the PR at poll time against the **current** PR head SHA from `getPrDetail`. Any pending check (bucket not `pass`/`skipping`/`fail`/`cancel`) SHALL take precedence over failure: the gate SHALL return `waiting` and SHALL NOT enter definitive-failure recovery or `ci-exhausted` while pending remains. Neutral/skipped (`skipping`) checks SHALL NOT count as failure or pending.
+
+#### Scenario: Red plus pending waits without recovery
+
+- **WHEN** `getPrChecks` reports at least one failed check and at least one pending check for the current PR head
+- **THEN** the gate SHALL return `{ status: "waiting" }`
+- **AND** SHALL NOT call `tryRebaseAndPush` or other definitive-failure recovery side-effects on that tick
+- **AND** SHALL NOT call `setBlocked` with kind `ci-exhausted`
+
+### Requirement: CI recovery persistence failure SHALL fail closed
+
+When the durable CI recovery marker store cannot be written or read-back-verified before a recovery side-effect that would consume budget, the gate SHALL refuse that side-effect and SHALL escalate with `ci-exhausted` naming the persistence failure rather than returning unbounded `waiting` on in-memory-only state. This applies to rebase as well as re-run / archive / assertion classes.
+
+#### Scenario: Marker write failure refuses side-effect and blocks
+
+- **WHEN** settled failure would authorize a recovery class attempt for head `H`
+- **AND** persisting the per-class attempt marker fails or runDir is unavailable
+- **THEN** the gate SHALL NOT perform that recovery side-effect (or SHALL not claim a successful recovery wait after an undurable attempt)
+- **AND** SHALL escalate with `ci-exhausted` including a durable-persistence failure signal in the operator reason
+
+### Requirement: Escalation evidence SHALL include failing checks and optional capped logs
+
+When escalating settled CI failure, the block reason SHALL name each failing check. A log excerpt SHALL be included only when retrieval succeeds and SHALL be size-capped. Failure to fetch logs SHALL NOT prevent blocking and SHALL NOT cause additional recovery waits.
+
+#### Scenario: Log fetch failure still blocks with check names
+
+- **WHEN** recovery budget is exhausted for head `H` with settled failed checks
+- **AND** log excerpt retrieval returns null or throws
+- **THEN** the gate SHALL still call `setBlocked` with kind `ci-exhausted`
+- **AND** the reason SHALL list failing check names
+- **AND** SHALL return `blocked`
+
 ## MODIFIED Requirements
 
 ### Requirement: CI failure with rebase guard exhausted blocks to needs-human

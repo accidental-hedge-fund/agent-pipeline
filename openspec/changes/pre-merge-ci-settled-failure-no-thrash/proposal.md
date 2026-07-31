@@ -8,9 +8,10 @@ Dogfood **#597** pre-merge entered a **long poll thrash** after marker dirt was 
 
 - **Settled-failure settle rule:** When required checks are **settled failure** (conclusions such as `failure` / `cancelled` / equivalent — not `pending` / `queued` / `in_progress`), pre-merge SHALL NOT treat the same red tip as “rebase and wait again” in a tight loop.
 - **Truthful `rebased; CI re-running`:** That waiting reason is valid only when the rebase **actually moved HEAD** or workflows were **explicitly re-requested** and checks are still pending — not when the same red tip is re-polled with no new work.
-- **One-shot recovery per head SHA stays hard:** At most one automated recovery action for each allowlisted recovery class (existing ladder: one-shot rebase, infra/unknown re-run, archive-only close+reopen, optional assertion/docs-class fix when enabled) per head SHA; if still red after the applicable budget → **block** with `ci-exhausted` / offramp `ci-failed` and a log excerpt / failing check names.
-- **Durable thrash guards:** Rebase (and other recovery) consumption for a head SHA MUST be durable enough that worktree recreation or process restart cannot re-consume the same budget and re-emit unbounded `ci=partial` rows for the same failed SHA.
-- **Terminal observability:** On escalate, durable events MUST show a terminal `ci=fail` (or equivalent blocked gate result) rather than unbounded `ci=partial` for the same failed SHA.
+- **One attempt per recovery class per head SHA:** Finite ordered ladder (rebase → classify → re-run → archive close+reopen → optional assertion fix → escalate). Not a single global action; not multi-fire of the same class on the same SHA. If still red after applicable budgets → **block** with `ci-exhausted` / offramp `ci-failed` and failing check names (capped log excerpt when available).
+- **Explicit durable recovery-state model:** Run-scoped `pre-merge-ci-recovery.json` keys attempt state by recovery class + head SHA; persist-before-side-effect with write+read-back; fail-closed to `ci-exhausted` if markers cannot be read/written. Worktree-only rebase markers are not sufficient.
+- **Authoritative HEAD movement:** Rebase waiting reason requires pre/post `getPrDetail.head_sha` change, not bare push exit 0. External head advances re-evaluate the new SHA rather than attributing the move to a failed/no-op rebase.
+- **Terminal observability:** On escalate, durable events show terminal `ci=fail` **once per failed head SHA**; pure re-polls must not spam `ci=partial` / `rebased; CI re-running`.
 - **Tests:** Unit regressions for settled failure → block with no repeated rebase side-effect; pending → still waiting; second hop after one allowlisted recovery at head H → block.
 
 ## Capabilities

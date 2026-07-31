@@ -1,11 +1,13 @@
-# Factory: clear dumb escalations
+# #771 — pre-merge CI settled failure must not thrash
 
-## Goal
-Stop parking mechanical recoveries as needs-human: (1) pipeline-internal marker-only dirt before OpenSpec archive, (2) code-behind-spec residual treated as auto-fixable.
+## Status
+Implementation complete. OpenSpec tasks all checked; `npm run ci` green.
 
-## Tasks
-- [ ] Export porcelain strip helper from salvage; use in maybeArchiveOpenspec (marker-only = clean; optional unlink markers)
-- [ ] isAutoFixableFinding: spec-divergence + code-behind-spec → true
-- [ ] Tests for both
-- [ ] OpenSpec delta for pre-merge-fix-round + harness-uncommitted-salvage / archive dirty
-- [ ] build.mjs + npm test
+## Plan artifacts
+- `openspec/changes/pre-merge-ci-settled-failure-no-thrash/` (proposal, design, tasks, specs)
+
+## Done
+- Durable per-head rebase markers (`ciRebaseAttemptedForSha`) + terminal fail marker
+- HEAD-moved truthfulness for CI ladder, BEHIND, and conflict recovery
+- Thrash regressions in `core/test/pre-merge-ci-recovery.test.ts`
+- Regenerated `plugin/` mirror
