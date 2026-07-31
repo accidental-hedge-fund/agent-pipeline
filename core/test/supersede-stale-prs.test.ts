@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import type { PrCandidate } from "../scripts/gh.ts";
 import {
   buildSupersededComment,
+  electManagedPrWinner,
   selectSupersedeCandidates,
   supersedeStaleIssuePrs,
   type SupersedeStaleIssuePrsDeps,
@@ -150,6 +151,41 @@ test("buildSupersededComment: names managed PR, issue, and pipeline-superseded t
 });
 
 // ---------------------------------------------------------------------------
+// Managed-head election (cross-host concurrency #729)
+// ---------------------------------------------------------------------------
+
+test("electManagedPrWinner: highest open pipeline/<N>-* PR number wins", () => {
+  const winner = electManagedPrWinner(
+    [
+      cand(100, "pipeline/729-host-a"),
+      cand(101, "pipeline/729-host-b"),
+      cand(656, "eval/other", { closes: [729] }),
+    ],
+    {
+      issueNumber: 729,
+      managedPrNumber: 100,
+      managedBranch: "pipeline/729-host-a",
+      baseBranch: "main",
+    },
+  );
+  assert.deepEqual(winner, { prNumber: 101, branch: "pipeline/729-host-b" });
+});
+
+test("electManagedPrWinner: caller's managed identity is always in the election set", () => {
+  // Managed PR missing from the open list must still beat a lower peer.
+  const winner = electManagedPrWinner(
+    [cand(50, "pipeline/729-old")],
+    {
+      issueNumber: 729,
+      managedPrNumber: 200,
+      managedBranch: "pipeline/729-new",
+      baseBranch: "main",
+    },
+  );
+  assert.deepEqual(winner, { prNumber: 200, branch: "pipeline/729-new" });
+});
+
+// ---------------------------------------------------------------------------
 // Helper with injectable I/O
 // ---------------------------------------------------------------------------
 
@@ -183,6 +219,8 @@ test("supersedeStaleIssuePrs: default close mode comments then closes non-manage
   assert.equal(comments.length, 1);
   assert.match(comments[0].body, /pipeline-superseded/);
   assert.match(comments[0].body, /#726/);
+  assert.equal(result.wonElection, true);
+  assert.equal(result.electedPr, 726);
 });
 
 test("supersedeStaleIssuePrs: comment-only posts without close", async () => {
@@ -211,6 +249,7 @@ test("supersedeStaleIssuePrs: comment-only posts without close", async () => {
   assert.deepEqual(result.closed, []);
   assert.deepEqual(closed, []);
   assert.deepEqual(comments, [656]);
+  assert.equal(result.wonElection, true);
 });
 
 test("supersedeStaleIssuePrs: close failure on one candidate does not block others or throw", async () => {
@@ -238,6 +277,7 @@ test("supersedeStaleIssuePrs: close failure on one candidate does not block othe
   assert.deepEqual(result.closed, [101]);
   assert.ok(result.errors.some((e) => /#100/.test(e)));
   assert.deepEqual(closed, [101]);
+  assert.equal(result.wonElection, true);
 });
 
 test("supersedeStaleIssuePrs: list failure logs and returns without throw", async () => {
@@ -261,6 +301,108 @@ test("supersedeStaleIssuePrs: list failure logs and returns without throw", asyn
   );
   assert.deepEqual(result.candidates, []);
   assert.ok(result.errors.some((e) => /graphql unavailable/.test(e)));
+  // List failure is non-blocking for advance; treat as won so create path continues.
+  assert.equal(result.wonElection, true);
+});
+
+test("supersedeStaleIssuePrs: concurrent managed heads — only higher PR number closes the other", async () => {
+  // Two hosts each advanced the same issue on different managed branches.
+  // Host A (PR 100) and Host B (PR 101) both see the same open set.
+  const open = [
+    cand(100, "pipeline/729-host-a"),
+    cand(101, "pipeline/729-host-b"),
+  ];
+  const closedByA: number[] = [];
+  const closedByB: number[] = [];
+  const commentsByA: number[] = [];
+  const commentsByB: number[] = [];
+
+  const resultA = await supersedeStaleIssuePrs(
+    makeCfg(),
+    729,
+    { prNumber: 100, branch: "pipeline/729-host-a" },
+    {
+      listOpenPrs: async () => open,
+      postPrComment: async (_cfg, pr) => {
+        commentsByA.push(pr);
+      },
+      closePr: async (_cfg, pr) => {
+        closedByA.push(pr);
+      },
+      log: () => {},
+    },
+  );
+  const resultB = await supersedeStaleIssuePrs(
+    makeCfg(),
+    729,
+    { prNumber: 101, branch: "pipeline/729-host-b" },
+    {
+      listOpenPrs: async () => open,
+      postPrComment: async (_cfg, pr) => {
+        commentsByB.push(pr);
+      },
+      closePr: async (_cfg, pr) => {
+        closedByB.push(pr);
+      },
+      log: () => {},
+    },
+  );
+
+  // Loser must not close or comment on the winner (or anyone).
+  assert.equal(resultA.wonElection, false);
+  assert.equal(resultA.electedPr, 101);
+  assert.deepEqual(resultA.closed, []);
+  assert.deepEqual(resultA.commented, []);
+  assert.deepEqual(closedByA, []);
+  assert.deepEqual(commentsByA, []);
+
+  // Winner closes the losing managed PR only.
+  assert.equal(resultB.wonElection, true);
+  assert.equal(resultB.electedPr, 101);
+  assert.deepEqual(resultB.closed, [100]);
+  assert.deepEqual(resultB.commented, [100]);
+  assert.deepEqual(closedByB, [100]);
+  assert.ok(!closedByB.includes(101), "winner must not self-close");
+});
+
+test("supersedeStaleIssuePrs: revalidation before act — loses if higher managed PR appears", async () => {
+  // First list: only this managed PR (would win). Second list (revalidate): a
+  // higher concurrent managed PR is visible → must not close peers.
+  let listCalls = 0;
+  const closed: number[] = [];
+  const result = await supersedeStaleIssuePrs(
+    makeCfg(),
+    729,
+    { prNumber: 100, branch: "pipeline/729-host-a" },
+    {
+      listOpenPrs: async () => {
+        listCalls += 1;
+        if (listCalls === 1) {
+          return [
+            cand(100, "pipeline/729-host-a"),
+            cand(50, "pipeline/729-old"),
+          ];
+        }
+        return [
+          cand(100, "pipeline/729-host-a"),
+          cand(50, "pipeline/729-old"),
+          cand(200, "pipeline/729-host-b"),
+        ];
+      },
+      postPrComment: async () => {
+        throw new Error("should not comment after lost revalidation");
+      },
+      closePr: async (_cfg, pr) => {
+        closed.push(pr);
+      },
+      log: () => {},
+    },
+  );
+  assert.equal(result.wonElection, false);
+  assert.equal(result.electedPr, 200);
+  assert.deepEqual(result.closed, []);
+  assert.deepEqual(closed, []);
+  assert.ok(listCalls >= 2, "must re-list before acting");
 });
 
 // ---------------------------------------------------------------------------
@@ -291,7 +433,14 @@ test("resumeFromImplementing: create path runs supersede after createPr", async 
     supersedeStaleIssuePrs: async (_cfg, _n, managed) => {
       callLog.push("supersede");
       supersedeManaged = managed;
-      return { candidates: [], commented: [], closed: [], errors: [] };
+      return {
+        candidates: [],
+        commented: [],
+        closed: [],
+        errors: [],
+        wonElection: true,
+        electedPr: managed.prNumber,
+      };
     },
   };
 
@@ -337,7 +486,14 @@ test("resumeFromImplementing: exact-head reuse still runs supersede", async () =
     supersedeStaleIssuePrs: async (_cfg, _n, managed) => {
       supersedeCalled = true;
       assert.equal(managed.prNumber, 726);
-      return { candidates: [656], commented: [656], closed: [656], errors: [] };
+      return {
+        candidates: [656],
+        commented: [656],
+        closed: [656],
+        errors: [],
+        wonElection: true,
+        electedPr: 726,
+      };
     },
   };
 
@@ -411,6 +567,61 @@ test("resumeFromImplementing: multi-PR fixture closes only non-managed head via 
   assert.ok(!closed.includes(726), "managed PR must not be closed");
 });
 
+test("resumeFromImplementing: lost managed-head election stops without transition or setBlocked", async () => {
+  let transitioned = false;
+  let blocked = false;
+  const closed: number[] = [];
+
+  const deps: ResumeFromImplementingDeps = {
+    runTestGate: async () => passedGate(),
+    runFormatGate: async () => ({ status: "ok", committed: false }),
+    enforceDocsFreshness: async () => ({ ok: true, ran: false }),
+    getPrForBranch: async () => null,
+    createPr: async () => 100,
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    setBlocked: async () => {
+      blocked = true;
+    },
+    transition: async () => {
+      transitioned = true;
+    },
+    // Production helper: concurrent peer 101 wins; 100 must not close 101.
+    supersedeDeps: {
+      listOpenPrs: async () => [
+        cand(100, "pipeline/729-host-a"),
+        cand(101, "pipeline/729-host-b"),
+      ],
+      postPrComment: async () => {
+        throw new Error("loser must not comment");
+      },
+      closePr: async (_cfg, pr) => {
+        closed.push(pr);
+      },
+      log: () => {},
+    },
+  };
+
+  const result = await resumeFromImplementing(
+    makeCfg(),
+    729,
+    { path: "/fake/wt", branch: "pipeline/729-host-a" },
+    {
+      prTitle: "[Pipeline] #729",
+      prBody: "Closes #729",
+      transitionMessage: (n) => `PR #${n}`,
+      pipelineRunId: "run-loser",
+    },
+    deps,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(result.status, "waiting");
+  assert.match(result.reason ?? "", /#101/);
+  assert.equal(transitioned, false, "loser must not transition toward design-gate");
+  assert.equal(blocked, false, "loser must not setBlocked (would stall the winner)");
+  assert.deepEqual(closed, [], "loser must not close the winning managed PR");
+});
+
 test("bite: resumeFromImplementing source must call supersede after managed PR is known", () => {
   // Source-level bite: removing the supersede call from the post-implement path
   // fails this test even when unit tests inject a no-op.
@@ -423,9 +634,14 @@ test("bite: resumeFromImplementing source must call supersede after managed PR i
   // Call site (not only the import / type reference): look for the invocation after create.
   const callIdx = planningSrc.indexOf("const supersede = deps.supersedeStaleIssuePrs");
   const transitionIdx = planningSrc.indexOf('trans(cfg, issueNumber, "implementing", "design-gate"');
+  const electionGuardIdx = planningSrc.indexOf("wonElection === false");
   assert.ok(createIdx >= 0, "create path present");
   assert.ok(supersedeIdx >= 0, "supersede import/reference present");
   assert.ok(callIdx >= 0, "supersede call wiring present");
   assert.ok(callIdx > createIdx, "supersede after create");
   assert.ok(transitionIdx > callIdx, "transition after supersede");
+  assert.ok(
+    electionGuardIdx > callIdx && electionGuardIdx < transitionIdx,
+    "lost-election guard must sit between supersede and transition",
+  );
 });

@@ -15,3 +15,10 @@ When the shared post-implementation path (`resumeFromImplementing` or equivalent
 - **WHEN** the post-implement path reuses an existing PR for the managed head via exact-head match
 - **THEN** it SHALL run the supersession sweep for that issue and managed PR
 - **AND** SHALL NOT treat a different-head open issue-linked PR as the managed PR solely because dual-strategy resolution would prefer it
+
+#### Scenario: lost managed-head election stops post-implement advance
+
+- **WHEN** the supersession sweep reports that this managed PR lost the GitHub-authoritative managed-head election to another open `pipeline/<N>-*` PR
+- **THEN** the post-implement path SHALL NOT complete the stage transition away from `implementing`
+- **AND** SHALL NOT set `pipeline:blocked` on the issue
+- **AND** SHALL return a non-advancing waiting outcome

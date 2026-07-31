@@ -92,6 +92,7 @@ Reuse existing `closePr` / `postPrComment` wrappers; do not invent a second clos
 | Closing a PR an operator is actively landing | Default close is intentional product choice for “one live PR”; comment names superseder; operators can reopen. |
 | Close fails (permissions / already closed) | Per-PR try/catch; continue; log. |
 | Race: third party opens another PR after list | Best-effort single pass; next advance re-sweeps. |
+| Concurrent hosts each close the other's managed PR | Elect GitHub-authoritative winner (highest open same-base `pipeline/<N>-*` PR number); revalidate before act; loser does not close and stops without setBlocked. |
 | Divergence from issue AC body-text wording | Documented in proposal/design; safer and consistent with `pr-resolution`. |
 | Performance: full open-PR enumeration | Same cost class as `getPrForIssue`; rare at implement PR open time. |
 

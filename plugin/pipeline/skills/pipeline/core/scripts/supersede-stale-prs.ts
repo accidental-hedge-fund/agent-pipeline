@@ -4,6 +4,12 @@
 // on different heads stay OPEN (often CONFLICTING after later merges). This
 // helper lists dual-strategy issue-linked open PRs and either closes them with a
 // structured pipeline-superseded comment (default) or comment-flags only.
+//
+// Cross-host safety: before closing, elect a single GitHub-authoritative managed
+// winner among open same-base `pipeline/<N>-*` heads (highest PR number). Only
+// the winner may supersede; a losing concurrent host does not close peers and
+// signals lost election so the post-implement path stops rather than advancing
+// while believing a non-winning managed PR is live.
 
 import {
   closePr as defaultClosePr,
@@ -61,6 +67,52 @@ export function buildSupersededComment(args: {
 }
 
 /**
+ * True when a PR is a same-repo managed pipeline head for issue N on the
+ * integration base (`pipeline/<N>-*` non-fork, same base). Used for
+ * cross-host winner election (#729 concurrency).
+ */
+export function isManagedPipelineHead(
+  pr: PrCandidate,
+  opts: {
+    issueNumber: number;
+    baseBranch: string;
+  },
+): boolean {
+  if (pr.isCrossRepository) return false;
+  if (pr.baseRefName !== undefined && pr.baseRefName !== opts.baseBranch) return false;
+  return pr.headRefName.startsWith(`pipeline/${opts.issueNumber}-`);
+}
+
+/**
+ * Elect the GitHub-authoritative managed PR winner for issue N among open
+ * same-base `pipeline/<N>-*` heads. Highest PR number wins (newest open
+ * managed head). The caller's managed identity is always included so a
+ * truncated/stale list cannot elect a lower peer over an unlisted managed PR.
+ * Pure + exported for unit tests.
+ */
+export function electManagedPrWinner(
+  openPrs: PrCandidate[],
+  opts: {
+    issueNumber: number;
+    managedPrNumber: number;
+    managedBranch: string;
+    baseBranch: string;
+  },
+): ManagedPrIdentity {
+  let winner: ManagedPrIdentity = {
+    prNumber: opts.managedPrNumber,
+    branch: opts.managedBranch,
+  };
+  for (const pr of openPrs) {
+    if (!isManagedPipelineHead(pr, opts)) continue;
+    if (pr.number > winner.prNumber) {
+      winner = { prNumber: pr.number, branch: pr.headRefName };
+    }
+  }
+  return winner;
+}
+
+/**
  * Pure candidate filter for supersession (#729). A PR is a candidate when all
  * of: same-repo (not fork); dual-strategy issue-linked to N; head ≠ managed
  * branch; base === integration base; number ≠ managed PR.
@@ -95,15 +147,107 @@ export interface SupersedeStaleIssuePrsResult {
   closed: number[];
   /** Per-candidate diagnostic messages for partial failures. */
   errors: string[];
+  /**
+   * Whether this managed PR won the GitHub-authoritative managed-head election.
+   * When false, no candidates were acted on; the caller SHALL stop rather than
+   * advance treating this managed PR as the live head.
+   */
+  wonElection: boolean;
+  /** Elected managed PR number (equal to managed when won). */
+  electedPr: number;
+}
+
+function emptyResult(
+  managedPrNumber: number,
+  overrides: Partial<SupersedeStaleIssuePrsResult> = {},
+): SupersedeStaleIssuePrsResult {
+  return {
+    candidates: [],
+    commented: [],
+    closed: [],
+    errors: [],
+    wonElection: true,
+    electedPr: managedPrNumber,
+    ...overrides,
+  };
+}
+
+/**
+ * List open PRs, elect the managed winner, and select supersede candidates.
+ * Shared by the initial plan and the immediate pre-action revalidation so both
+ * use the same GitHub-authoritative rules.
+ */
+async function planSupersession(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  managed: ManagedPrIdentity,
+  listOpenPrs: (cfg: PipelineConfig) => Promise<PrCandidate[]>,
+  log: (msg: string) => void,
+): Promise<
+  | { ok: true; candidates: PrCandidate[] }
+  | { ok: false; result: SupersedeStaleIssuePrsResult }
+> {
+  let openPrs: PrCandidate[];
+  try {
+    openPrs = await listOpenPrs(cfg);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const diagnostic =
+      `[pipeline] #${issueNumber}: supersede sweep could not list open PRs ` +
+      `(non-blocking): ${msg}`;
+    log(diagnostic);
+    return {
+      ok: false,
+      result: emptyResult(managed.prNumber, { errors: [diagnostic] }),
+    };
+  }
+
+  const elected = electManagedPrWinner(openPrs, {
+    issueNumber,
+    managedPrNumber: managed.prNumber,
+    managedBranch: managed.branch,
+    baseBranch: cfg.base_branch,
+  });
+
+  if (elected.prNumber !== managed.prNumber) {
+    const diagnostic =
+      `[pipeline] #${issueNumber}: supersede lost managed-head election to PR ` +
+      `#${elected.prNumber} (this managed PR #${managed.prNumber} on ` +
+      `${managed.branch}); not closing peers`;
+    log(diagnostic);
+    return {
+      ok: false,
+      result: emptyResult(managed.prNumber, {
+        wonElection: false,
+        electedPr: elected.prNumber,
+        errors: [diagnostic],
+      }),
+    };
+  }
+
+  const candidates = selectSupersedeCandidates(openPrs, {
+    issueNumber,
+    managedPrNumber: managed.prNumber,
+    managedBranch: managed.branch,
+    targetRepo: cfg.repo,
+    baseBranch: cfg.base_branch,
+  });
+
+  return { ok: true, candidates };
 }
 
 /**
  * After the live managed PR for issue N is known (create or exact-head reuse),
  * supersede other open same-repo issue-linked PRs on different heads.
  *
- * Never throws in a way that aborts the managed PR advance path: list failures
- * and per-candidate close/comment errors are logged and returned. Partial
- * failure on one candidate does not skip remaining candidates.
+ * Cross-host safety (#729 review): elects a single managed winner by highest
+ * open `pipeline/<N>-*` PR number (GitHub-authoritative). Only the winner acts.
+ * Revalidates the election immediately before acting so two concurrent hosts
+ * cannot each close the other's managed PR.
+ *
+ * Never throws in a way that aborts the managed PR advance path for list or
+ * per-candidate errors: those are logged and returned. A lost election is also
+ * non-throwing but sets `wonElection: false` so the caller can stop advancing.
  */
 export async function supersedeStaleIssuePrs(
   cfg: PipelineConfig,
@@ -117,35 +261,18 @@ export async function supersedeStaleIssuePrs(
   const close = deps.closePr ?? defaultClosePr;
   const mode: SupersedeMode = cfg.supersede_mode ?? "close";
 
-  const empty: SupersedeStaleIssuePrsResult = {
-    candidates: [],
-    commented: [],
-    closed: [],
-    errors: [],
-  };
+  // Initial election + candidate selection.
+  const first = await planSupersession(cfg, issueNumber, managed, listOpenPrs, log);
+  if (!first.ok) return first.result;
 
-  let openPrs: PrCandidate[];
-  try {
-    openPrs = await listOpenPrs(cfg);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    const diagnostic =
-      `[pipeline] #${issueNumber}: supersede sweep could not list open PRs ` +
-      `(non-blocking): ${msg}`;
-    log(diagnostic);
-    return { ...empty, errors: [diagnostic] };
-  }
+  // Revalidate immediately before acting: concurrent hosts may have opened
+  // another managed head between the first list and close. Same election rules.
+  const second = await planSupersession(cfg, issueNumber, managed, listOpenPrs, log);
+  if (!second.ok) return second.result;
 
-  const candidates = selectSupersedeCandidates(openPrs, {
-    issueNumber,
-    managedPrNumber: managed.prNumber,
-    managedBranch: managed.branch,
-    targetRepo: cfg.repo,
-    baseBranch: cfg.base_branch,
-  });
-
+  const candidates = second.candidates;
   if (candidates.length === 0) {
-    return empty;
+    return emptyResult(managed.prNumber);
   }
 
   const result: SupersedeStaleIssuePrsResult = {
@@ -153,6 +280,8 @@ export async function supersedeStaleIssuePrs(
     commented: [],
     closed: [],
     errors: [],
+    wonElection: true,
+    electedPr: managed.prNumber,
   };
 
   const commentBody = buildSupersededComment({

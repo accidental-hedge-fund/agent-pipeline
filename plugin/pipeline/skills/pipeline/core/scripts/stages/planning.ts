@@ -1617,14 +1617,27 @@ export async function resumeFromImplementing(
   // ---- Supersede other open issue-linked PRs on different heads (#729) ----
   // Runs after the live managed PR number is known (create and exact-head reuse,
   // including create-race reuse) and after pr_created/pr_updated so the managed
-  // PR is already logged. Failures are non-blocking — never undo PR create.
+  // PR is already logged. Per-candidate failures are non-blocking — never undo
+  // PR create. A lost managed-head election (concurrent host with a higher
+  // open pipeline/<N>-* PR) is different: do not transition onward treating
+  // this PR as the live head (cross-host mutual-close prevention).
   const supersede = deps.supersedeStaleIssuePrs ?? supersedeStaleIssuePrs;
-  await supersede(
+  const supersedeResult = await supersede(
     cfg,
     issueNumber,
     { prNumber, branch },
     deps.supersedeDeps ?? {},
   );
+  if (supersedeResult.wonElection === false) {
+    const reason =
+      `concurrent managed PR #${supersedeResult.electedPr} won the GitHub-authoritative ` +
+      `supersession election for issue #${issueNumber}; this host's PR #${prNumber} is not ` +
+      `the live managed head — not advancing`;
+    console.log(`[pipeline] #${issueNumber}: ${reason}`);
+    // Do not setBlocked: that would stall the winning host on the same issue.
+    // Waiting is host-local; the winner continues advancing the issue.
+    return { advanced: false, status: "waiting", reason };
+  }
 
   // ---- implementing → design-gate ----
   // Always traversed (#436): the design-gate stage itself decides whether it

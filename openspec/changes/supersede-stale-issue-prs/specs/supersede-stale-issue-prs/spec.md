@@ -82,7 +82,7 @@ When `supersede_mode` is `comment-only`, for each supersede candidate the pipeli
 
 ### Requirement: Supersession sweep is covered by injectable-dep regression tests
 
-The repository test suite SHALL include regression coverage that constructs a fixture with two open issue-linked PRs for the same issue on different heads and asserts that after the post-implement create-or-reuse path (or the supersede helper invoked as that path does), only the managed PR remains open under default mode (or that comment-only posts without close). Tests SHALL inject dependency seams (no real network, git, or subprocess as the sole pass path) and SHALL fail if the supersede close/comment step is removed or skipped after managed PR create-or-reuse.
+The repository test suite SHALL include regression coverage that constructs a fixture with two open issue-linked PRs for the same issue on different heads and asserts that after the post-implement create-or-reuse path (or the supersede helper invoked as that path does), only the managed PR remains open under default mode (or that comment-only posts without close). Tests SHALL inject dependency seams (no real network, git, or subprocess as the sole pass path) and SHALL fail if the supersede close/comment step is removed or skipped after managed PR create-or-reuse. Tests SHALL also cover concurrent managed-head election: only the elected winner closes the peer, and a losing post-implement path does not transition onward.
 
 #### Scenario: multi-PR fixture closes only the non-managed head
 
@@ -95,3 +95,37 @@ The repository test suite SHALL include regression coverage that constructs a fi
 
 - **WHEN** unit tests run the supersede path with `supersede_mode` `comment-only`
 - **THEN** the test SHALL assert a superseded comment on A and no close of A
+
+#### Scenario: concurrent managed heads — only elected winner survives close
+
+- **WHEN** unit tests inject two open same-base managed heads `pipeline/<N>-*` for issue N with PR numbers A < B
+- **AND** both hosts run the supersede path against the same open set
+- **THEN** the host whose managed PR is A SHALL NOT close or comment on B
+- **AND** the host whose managed PR is B SHALL close A and SHALL NOT close B
+
+### Requirement: Concurrent managed heads SHALL elect one GitHub-authoritative winner before superseding
+
+Before applying any supersede comment or close for issue N, the supersession sweep SHALL elect a single managed winner among open same-repository, same-base pull requests whose head branch starts with `pipeline/<N>-` (non-fork). The election rule SHALL be highest PR number wins. The caller's managed PR identity SHALL always participate in the election even if it is missing from a partial open-PR list. The sweep SHALL revalidate this election from a fresh open-PR list immediately before acting. When the caller's managed PR is not the elected winner, the sweep SHALL NOT comment on or close any candidate (including the elected winner), SHALL report a lost-election outcome, and the post-implement path SHALL stop without transitioning away from `implementing` and without setting `pipeline:blocked` on the issue (so the winning host is not stalled). When the caller's managed PR is the elected winner, supersession of other candidates SHALL proceed under the configured `supersede_mode` as elsewhere in this capability.
+
+#### Scenario: lower-numbered concurrent managed PR does not close the higher-numbered peer
+
+- **WHEN** open managed PR A on `pipeline/N-host-a` and open managed PR B on `pipeline/N-host-b` both exist for issue N with A < B
+- **AND** the host whose managed PR is A runs the supersession sweep
+- **THEN** the sweep SHALL elect B as winner
+- **AND** SHALL NOT close or comment-flag PR B
+- **AND** SHALL NOT close or comment-flag any other candidate under that lost-election outcome
+
+#### Scenario: higher-numbered concurrent managed PR supersedes the lower-numbered peer
+
+- **WHEN** open managed PR A and open managed PR B exist for issue N with A < B
+- **AND** the host whose managed PR is B runs the supersession sweep in default close mode
+- **THEN** the sweep SHALL elect B as winner
+- **AND** SHALL close PR A with a `pipeline-superseded` comment naming B
+- **AND** SHALL leave PR B open
+
+#### Scenario: losing host stops without blocking the issue
+
+- **WHEN** the post-implement path's supersession sweep reports a lost managed-head election for issue N
+- **THEN** the path SHALL NOT transition `implementing → design-gate`
+- **AND** SHALL NOT set `pipeline:blocked` on issue N
+- **AND** SHALL return a non-advancing waiting outcome that names the elected winning PR

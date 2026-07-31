@@ -25,6 +25,8 @@
 - [x] 4.3 Fixture: body-only mention / different base / fork prefix spoof → not candidates.
 - [x] 4.4 Fixture: `comment-only` → comment without close.
 - [x] 4.5 Prove the multi-PR close test fails if the supersede call is removed from the post-implement path (or equivalent bite proof).
+- [x] 4.6 Concurrent managed heads: highest open `pipeline/<N>-*` PR number wins election; loser does not close winner; winner closes loser; revalidate before act.
+- [x] 4.7 Resume path: lost election returns waiting without transition or setBlocked.
 - [x] 4.6 Keep existing planning/resume PR create-or-reuse tests green.
 
 ## 5. Mirror, validate, gate
