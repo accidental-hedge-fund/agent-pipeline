@@ -21,6 +21,12 @@ import {
 /** Event kind written by the durable loop supervisor when a run stops. */
 export const LOOP_RUN_STOPPED_KIND = "loop_run_stopped";
 
+/**
+ * Advance run-store completion event type (writers in `run-store.ts` emit
+ * `{ type: "run_complete", ... }` — field is `type`, not loop's `kind`).
+ */
+export const ADVANCE_RUN_COMPLETE_TYPE = "run_complete";
+
 /** Options for {@link runLoopLogs} follow mode. */
 export interface LoopLogsFollowOptions {
   /**
@@ -109,15 +115,31 @@ export function isLoopRunStoppedLine(line: string): boolean {
 }
 
 /**
+ * True when `line` is a complete JSONL advance run-store event with
+ * `type: "run_complete"`. Malformed / non-JSON / wrong-type lines return false.
+ */
+export function isAdvanceRunCompleteLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  try {
+    const obj = JSON.parse(trimmed) as { type?: unknown };
+    return obj != null && typeof obj === "object" && obj.type === ADVANCE_RUN_COMPLETE_TYPE;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Append a follow chunk to a line buffer. Invokes `onLine` for each complete
  * newline-terminated line (including the trailing `\n`). Incomplete trailing
- * bytes remain in `pending`. Returns whether any complete line was a
- * `loop_run_stopped` event.
+ * bytes remain in `pending`. Returns whether any complete line matched
+ * `isTerminalLine` (default: loop `loop_run_stopped`).
  */
 export function appendFollowChunk(
   pending: string,
   chunk: string,
   onLine: (line: string) => void,
+  isTerminalLine: (line: string) => boolean = isLoopRunStoppedLine,
 ): { pending: string; sawTerminal: boolean } {
   let buf = pending + chunk;
   let sawTerminal = false;
@@ -127,8 +149,9 @@ export function appendFollowChunk(
     const line = buf.slice(0, nl + 1);
     buf = buf.slice(nl + 1);
     onLine(line);
-    // Strip trailing newline for kind detection (JSON.parse of "…\n" fails).
-    if (isLoopRunStoppedLine(line.endsWith("\n") ? line.slice(0, -1) : line)) {
+    // Strip trailing newline for detection (JSON.parse of "…\n" fails).
+    const forDetect = line.endsWith("\n") ? line.slice(0, -1) : line;
+    if (isTerminalLine(forDetect)) {
       sawTerminal = true;
     }
   }
@@ -348,14 +371,21 @@ export type FollowEventsIo = {
 };
 
 /**
- * Line-aware follow: print complete lines, optionally exit 0 on
- * `loop_run_stopped`. Reads existing content from offset 0 first (historical
- * terminal ends follow without hanging). Incomplete trailing bytes are
- * buffered until a newline arrives.
+ * Line-aware follow: print complete lines, optionally exit 0 when a line
+ * matches `isTerminalLine` (default: loop `loop_run_stopped`; advance
+ * `run_complete` via {@link isAdvanceRunCompleteLine}). Reads existing content
+ * from offset 0 first (historical terminal ends follow without hanging).
+ * Incomplete trailing bytes are buffered until a newline arrives.
  */
 export async function followEventsWithTerminalExit(
   logFile: string,
-  opts: { untilTerminal: boolean },
+  opts: {
+    untilTerminal: boolean;
+    /** Default: {@link isLoopRunStoppedLine}. */
+    isTerminalLine?: (line: string) => boolean;
+    /** Prefix for read-failure diagnostics (default: pipeline loop logs). */
+    errorLabel?: string;
+  },
   io: FollowEventsIo,
 ): Promise<number | null> {
   const proc = io.process;
@@ -363,6 +393,8 @@ export async function followEventsWithTerminalExit(
   let interrupted: NodeJS.Signals | null = null;
   let onSigint: () => void = () => {};
   let onSigterm: () => void = () => {};
+  const isTerminalLine = opts.isTerminalLine ?? isLoopRunStoppedLine;
+  const errorLabel = opts.errorLabel ?? "pipeline loop logs";
 
   const interruptStatus = (sig: NodeJS.Signals): number =>
     sig === "SIGINT" ? 130 : 143;
@@ -398,15 +430,20 @@ export async function followEventsWithTerminalExit(
         batch = await io.readFrom(logFile, offset);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        io.stderrWrite(`pipeline loop logs: failed to read events: ${msg}\n`);
+        io.stderrWrite(`${errorLabel}: failed to read events: ${msg}\n`);
         return 1;
       }
 
       if (batch.data.length > 0) {
         offset = batch.nextOffset;
-        const result = appendFollowChunk(pending, batch.data, (line) => {
-          io.stdoutWrite(line);
-        });
+        const result = appendFollowChunk(
+          pending,
+          batch.data,
+          (line) => {
+            io.stdoutWrite(line);
+          },
+          isTerminalLine,
+        );
         pending = result.pending;
         if (opts.untilTerminal && result.sawTerminal) {
           return 0;

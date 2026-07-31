@@ -1415,14 +1415,20 @@ Print or follow the terminal output of a run (works after the process exits, or 
 # print full terminal.log for a run
 $pipeline logs <run-id>
 
-# stream new output as it is written (like tail -f)
+# stream raw terminal output until interrupt (like tail -f)
 $pipeline logs <run-id> --follow
 
 # print structured events.jsonl for a run
 $pipeline logs <run-id> --events
 
-# follow structured lifecycle/event records without parsing terminal output
+# follow structured events until run_complete (default; exit 0) — use --no-until-terminal for interrupt-only
 $pipeline logs <run-id> --events --follow
+
+# long-lived dashboard: keep streaming past run_complete until SIGINT/SIGTERM
+$pipeline logs <run-id> --events --follow --no-until-terminal
+
+# supervise-until-terminal: wait for run_complete, then print the evidence bundle
+$pipeline logs <run-id> --events --follow && $pipeline summary <run-id>
 
 # list available run-ids (most recent first)
 $pipeline logs
@@ -1430,7 +1436,13 @@ $pipeline logs
 
 Use `--events` for stage/lifecycle monitoring. It reads the canonical run-store
 `events.jsonl`; no separate transitions log or grep-filtered terminal output is
-required.
+required. With `--events --follow`, the CLI exits 0 after printing a
+`run_complete` event by default (same spirit as loop logs / `loop_run_stopped`).
+Raw `terminal.log` follow remains interrupt-only.
+
+If a host follow is cancelled or lost before terminal, re-attach with
+`$pipeline status <N>`, `$pipeline logs <run-id> --events --follow`, then
+`$pipeline summary <run-id>` (run-store ids only — not `/tmp` scratch logs).
 
 Durable multi-item loop runs store events under the loop state home (not
 `.agent-pipeline/runs/`). Observe them with the nested logs sub-verb:

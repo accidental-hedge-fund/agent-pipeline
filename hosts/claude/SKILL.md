@@ -90,6 +90,9 @@ distinct `pipeline:<command>` entries in the skill/command menu.
                                          shipped `✅ shipped` rows are never overwritten; insert
                                          failure aborts before version bump with a copy-paste row)
 /pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
+
+/pipeline:release <version>              prepare a release PR for the given version
+/pipeline:logs [<run-id>] [--events] [-f]  list or stream run logs (events --follow exits 0 on run_complete; --no-until-terminal for interrupt-only)
 /pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent, no issue number)
 /pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
 /pipeline scoreboard --bucket day|week   add a chronological day/week time-series to the scoreboard report
@@ -742,12 +745,33 @@ Each iteration may block for up to ~20 minutes (heavy stages run
 implementer/reviewer harnesses against the full repo). Worst-case full
 path is 9 transitions, ~2 hours.
 
-### 4. Orchestration pattern (Claude-side, for default-mode advance)
+### 4. Orchestration pattern (host-side, for default-mode advance)
 
 A foreground bash invocation will be killed at the harness's 10-minute
 timeout — long before a planning stage finishes (~20 min cap each).
-For the default advance mode, Claude **must** orchestrate the run as
-follows:
+For the default advance mode, the harness **must** orchestrate the run as
+follows.
+
+#### Host notify map (material progress)
+
+On each **material** progress line (shared material filter — see §4.c),
+**must notify via the host map** below. Do not invent a pipeline push
+service; do not gate stages on delivery. `events.jsonl` remains the
+complete evidence stream.
+
+| Host | Follow / surface | Material path |
+| --- | --- | --- |
+| **Claude** | Monitor on material-filtered events; call `PushNotification` on each material one-liner | This file's §4.c–d |
+| **Grok** | Host `monitor` on the same material-filtered command (each stdout line = chat bubble). **Never** require Claude `PushNotification` | **Grok substitute** below |
+| **Codex** | Poll/follow material stream; concise chat/status updates (no Claude-only tools) | `hosts/codex/SKILL.md` |
+
+**Grok substitute** (when this Claude overlay is the installed/symlink path Grok
+loads — first-class `--host grok` is #731): use host **`monitor`** (or
+equivalent) on the material-filtered event stream. Do **not** call
+`PushNotification` on Grok; it does not exist there. Dual-follow still
+applies after linkage (§4b.d) with the material filter on **both** streams.
+Re-arm material follow after wait cancel until `run_complete` / `loop_run_stopped`
+(full re-attach semantics: #725). Dual-follow density demotion remains #611.
 
 #### a. Status pre-check (fast, synchronous)
 
@@ -772,25 +796,48 @@ This command returns quickly. `RUN_DIR` is a supervision wrapper under
 `.agent-pipeline/runs/<run-id>/` run store. Use that `run_store_run_id` for all
 log and summary commands below.
 
-#### c. Stream structured run events via Monitor
+#### c. Stream structured run events (material filter preferred)
 
-Arm a persistent Monitor on the run-store event stream:
+Arm a persistent Monitor / host follow on the run-store event stream
+(or wait on the CLI process, which exits 0 on terminal by default). Prefer the
+shared **events.jsonl material filter** so notify surfaces only skill-material
+one-liners (spam-suppressed). Unfiltered `events.jsonl` remains the complete
+evidence stream for diagnostics:
 
 ```bash
+# Preferred — material one-liners for host notify (Claude Monitor / Grok monitor)
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow \
+  | node ~/.claude/skills/pipeline/scripts/material-filter.mjs
+
+# Diagnostic fallback — full unfiltered events.jsonl
 node ~/.claude/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
+# default until-terminal: process exits 0 after a run_complete event is printed
+# interrupt-only dashboards: add --no-until-terminal
 ```
 
 `--events` follows `.agent-pipeline/runs/<run-id>/events.jsonl`, the canonical
 structured stream for lifecycle, gate, blocker, PR, review, accounting, and
 completion events. It is not a grep-filtered terminal log and it is not a
-separate `/tmp` transitions artifact.
+separate `/tmp` transitions artifact. The material filter is an observation
+layer only — it never rewrites the run store.
 
-Set `persistent: true`, `timeout_ms: 3600000` (1 hour — re-arm if
-needed). Each emitted line lands in Claude's notification stream.
+**Supervise-until-terminal (non-interactive):** wait on process exit, then
+summary (pipe material filter when notifying via host map):
+
+```bash
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow \
+  && node ~/.claude/skills/pipeline/scripts/pipeline.mjs summary <run-id>
+```
+
+Set `persistent: true`, `timeout_ms: 3600000` (1 hour). **Re-arm** material
+follow after wait cancel or monitor interruption until `run_complete` (full
+re-attach semantics remain #725). Each material line maps to the host notify
+surface (Claude: Monitor/`PushNotification`).
+
 
 **Fallback — raw terminal output:** If you need the full combined output
 (harness prose, CI stdout, stage output), follow `terminal.log` from the same
-run store:
+run store (interrupt-only — no auto-exit on `run_complete`):
 
 ```bash
 node ~/.claude/skills/pipeline/scripts/pipeline.mjs logs <run-id> --follow
@@ -800,43 +847,75 @@ Do not create or recommend extra `/tmp/pipeline-<domain>-<N>.log` files for
 normal monitoring. If a human manually redirects output for local debugging,
 that file is scratch output, not the pipeline evidence contract.
 
-#### d. Push notification on material event records
+#### d. Notify via host map on material event records
 
-For every material Monitor event (see suppression list below), call
-`PushNotification` with a short one-line message. The state machine has
-only a bounded number of stage transitions, so
-this caps at a small number of pushes per full run — coarse enough to not be spammy,
-fine enough that the user never wonders "is anything happening?" between
-major arrows.
+For every material filter line (see kinds below), **notify via the host map**
+(§4 host notify map). On **Claude**, that means call `PushNotification` with
+the short one-liner. On **Grok**, host `monitor` already surfaces each material
+stdout line — do not require `PushNotification`. On **Codex**, send a concise
+chat/status update. The state machine has only a bounded number of stage
+transitions, so this caps at a small number of bubbles per full run.
 
-Examples that DO push:
+Material advance kinds (aligned with `scripts/material-filter.mjs` → `core/scripts/material-filter.ts`):
 - `run_start`
 - `stage_start`
 - `stage_complete`
 - `pr_created` / `pr_updated`
 - `review_verdict`
-- `gate_result`
+- `gate_result` (filter suppresses repeated CI `partial` and OpenSpec `skipped` spam)
 - `blocker_set` / `blocker_cleared`
 - `run_complete`
 
-Examples that do NOT push:
-- **Repeated polling-loop sub-events** — `pre_merge.advancePolling`
-  re-enters the gate check every `ci_poll_interval` seconds (default 30s).
-  Push the first material stage/gate event per stage entry; suppress
-  subsequent identical polling updates in the same burst. The next material
-  event is the eventual advancing or blocked stage outcome.
+Suppressed by the shared filter (do not prefer dual raw unfiltered JSONL notify):
+- **Repeated polling-loop sub-events** — `pre_merge.advancePolling` and
+  identical CI `partial` / OpenSpec `skipped` bursts; first material gate event
+  per burst, then wait for definitive outcomes.
+- Heartbeats / accounting / non-listed kinds.
 
-The "err toward not sending" guidance in the PushNotification docs is
-about ambient noise — but `/pipeline N` is a foreground operation the
-user explicitly invoked, not background ambient state. They asked for
-this push stream; deliver it.
+On Claude only: the "err toward not sending" guidance in the PushNotification
+docs is about ambient noise — but `/pipeline N` is a foreground operation the
+user explicitly invoked. Deliver the Claude map entry.
 
-#### e. Stop the Monitor when the run completes
+#### e. Re-attach after cancelled or lost follow (mandatory — same turn)
 
-Stop the Monitor when a `run_complete` event appears, or when the wrapper
-`$RUN_DIR/sentinel.json` reports completion. Then surface the final summary.
+A cancelled, interrupted, timed-out, or lost follow/wait is **not** a terminal
+pipeline outcome and must **not** be treated as “stop watching.” Tool cancel,
+Monitor stop, wait timeout, and session pause do **not** mean the advance
+finished. Supervision ends only after confirmed `run_complete` / sentinel
+completion (or an explicit operator decision to abandon watching a still-live
+run, outside the default happy path).
 
-#### f. Final summary
+When a host follow/wait ends **before** `run_complete` / sentinel completion,
+act **in the same harness turn**:
+
+1. **Liveness** — check whether the detached run is still live or already
+   terminal via at least one of: wrapper `$RUN_DIR/sentinel.json`,
+   `run_complete` in events / finalized summary, `pipeline status <N>`, or
+   process liveness if you still hold the detach pid.
+2. **If already terminal** — skip re-follow; run `pipeline summary <run-id>`,
+   emit the final operator summary, and stop any remaining follows for that
+   run. Do not leave the operator without a terminal handoff.
+3. **If still live or not confirmed terminal** — re-arm
+   `pipeline logs <run-id> --events --follow` (same run-store `run_id`),
+   continue until `run_complete` / sentinel completion.
+4. **Then** emit the final summary and stop follows (step f).
+
+**Operator re-attach path** (run-store ids only — not `/tmp` scratch logs):
+
+```bash
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs status <N>
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs summary <run-id>
+```
+
+#### f. Stop the Monitor when the run completes (same turn)
+
+Stop the Monitor / events follow when a `run_complete` event appears, or when
+the wrapper `$RUN_DIR/sentinel.json` reports completion — including after one
+or more re-attach cycles. In the same harness turn, emit the final summary
+and stop that run’s follows. Do not leave follows open until the operator asks.
+
+#### g. Final summary
 
 Read the run-store summary and surface inline:
 
@@ -845,8 +924,10 @@ node ~/.claude/skills/pipeline/scripts/pipeline.mjs summary <run-id>
 ```
 
 Include starting stage, ending stage, transitions made, wall-clock elapsed, PR
-URL if one was opened, and the terminal state. Also send one final
-PushNotification with the terminal state.
+URL if one was opened, the terminal state, and the merge-next-step note that
+the pipeline does not auto-merge. Also send one final notify via the host map
+with the terminal state (Claude: `PushNotification`).
+
 
 ### 4b. Orchestration pattern for `/pipeline:loop` (multi-item durable drive/resume)
 
@@ -1025,16 +1106,24 @@ Then resolve the events file:
 
 Arm a follow on the loop events file **as soon as** `run_id` is known (step b)
 — do not wait for supervisor exit. Prefer the first-class CLI (exits 0 on
-`loop_run_stopped` by default):
+`loop_run_stopped` by default) **piped through the shared material filter**
+for host notify (raw unfiltered events remain available for diagnostics):
 
 ```bash
-node ~/.claude/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow
+# Preferred — material one-liners for host notify (dual-follow uses the same filter)
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow \
+  | node ~/.claude/skills/pipeline/scripts/material-filter.mjs
 # default until-terminal: process exits 0 after loop_run_stopped
 # interrupt-only dashboards: add --no-until-terminal
+
+# Diagnostic fallback — full unfiltered loop events.jsonl
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow
 ```
 
-If you arm a host Monitor instead of (or around) that CLI, do **not** leave it
-`persistent: true` past terminal — §4b.f requires same-turn teardown.
+If you arm a host Monitor / Grok `monitor` instead of (or around) that CLI, do
+**not** leave it `persistent: true` past terminal — §4b.f requires same-turn
+teardown. **Re-arm** material follow after wait cancel until `loop_run_stopped`
+(full re-attach: #725).
 
 **Do not** use a bare `tail -F` on `events.jsonl` as a follow fallback: it never
 exits after `loop_run_stopped`, prints no final summary, and leaves zombie
@@ -1106,15 +1195,18 @@ pre-merge gate outcomes are already mirrored onto the loop stream** as
 auto-fix, terminal blocked/advanced) while linkage is active — hosts do
 **not** need advance-only follow solely to learn those gate results (#682).
 
-Optionally still follow the linked advance `events.jsonl` for full-fidelity
-stage/harness detail (accounting, raw review findings, etc.):
+**Must** also arm material-filtered advance follow for mid-item stage progress
+(dual-follow). Prefer material filter on **both** streams over dual raw
+unfiltered JSONL:
 
 ```bash
-node ~/.claude/skills/pipeline/scripts/pipeline.mjs logs <advance-run-id> --events --follow
+node ~/.claude/skills/pipeline/scripts/pipeline.mjs logs <advance-run-id> --events --follow \
+  | node ~/.claude/skills/pipeline/scripts/material-filter.mjs
 ```
 
 The absolute `events` path from the linkage record is an acceptable alternative
-target (e.g. Monitor / `tail -F` on that file).
+target (e.g. Monitor / Grok `monitor` / `tail -F` on that file, still preferably
+through the material filter).
 
 **Before linkage exists:** continue loop-only follow — do **not** require a
 non-existent advance-linkage field.
@@ -1128,7 +1220,8 @@ non-existent advance-linkage field.
 3. Keep the **loop** event stream follow active across item boundaries until a
    terminal loop outcome or supervisor process exit.
 
-**Material advance kinds** to surface (same spirit as single-issue §4):
+**Material advance kinds** to surface via the host map (same spirit as
+single-issue §4; shared filter constant):
 
 - `stage_start`
 - `stage_complete`
@@ -1139,8 +1232,10 @@ non-existent advance-linkage field.
 - `run_complete`
 
 **Suppress** pure CI poll spam — including repeated identical
-`pre_merge.advancePolling`-style updates in the same burst (surface the first
-material stage/gate event; wait for the eventual advance/block outcome).
+`pre_merge.advancePolling`-style updates and repeated CI `partial` / OpenSpec
+`skipped` spam in the same burst (surface the first material stage/gate event;
+wait for the eventual advance/block outcome). The material filter enforces this
+deterministically.
 
 **Loop-only follow** remains valid for schedule, hold, and terminal **loop**
 kinds (`loop_schedule_evaluated`, holds, `loop_run_stopped`, …), but is
@@ -1148,18 +1243,23 @@ kinds (`loop_schedule_evaluated`, holds, `loop_run_stopped`, …), but is
 makes the loop stream carry first-class stage progress, this dual-follow
 mandate **MAY** be demoted to optional / “recommended for full fidelity” in
 that same PR (with host skill + living-spec updates together). Do **not** demote
-solely for quieter notifications while the loop stream is still sparse.
+solely for quieter notifications while the loop stream is still sparse. This
+notify packaging change (#742) does **not** replace #611 or #725.
 
-#### e. Push notification on material loop events
+#### e. Notify via host map on material loop events
 
-**Must notify** (PushNotification / chat):
+**Must notify** via the host map (Claude: `PushNotification`; Grok: host
+`monitor` material lines; Codex: chat/status — **not** a universal Claude-only
+tool):
 
 - `loop_item_started`
 - `loop_item_transitioned`
 - `loop_item_blocked`
+- `loop_item_advance_linked` / `loop_item_advance_finished`
+- `loop_item_stage_progress` (when present)
 - `loop_run_stopped`
 
-**Should notify** when present (not spam):
+**Should notify** when present (not spam; material filter applies):
 
 - `loop_item_progress` — shared progress kind; for `domain: "pre_merge"`, notify
   on definitive outcomes (`pass`, `fail`, `approve`, `needs_attention`,
@@ -1177,7 +1277,7 @@ solely for quieter notifications while the loop stream is still sparse.
 
 **Suppress:** pure heartbeats and repeated identical schedule/reconcile
 evaluations in the same burst (same spirit as suppressing
-`pre_merge.advancePolling` in §4). Do not re-push every identical
+`pre_merge.advancePolling` in §4). Do not re-notify every identical
 `loop_item_progress` CI waiting poll after the first for a stretch.
 
 #### f. Stop following (same turn — mandatory)
@@ -1227,7 +1327,8 @@ stopped**).
 - `/pipeline:loop --audit` — read-only report (stage table) for a durable run; synchronous, no Monitor
 - `/pipeline:loop --resume <run-id> --audit --follow` — read-only stage-progress stream; no run-liveness lock
 
-Run those synchronously, no Monitor, no background, no Push (except follow, which streams until interrupt).
+Run those synchronously, no Monitor, no background, no host-map notify (except
+follow, which streams until interrupt).
 
 **Not in this list:** multi-item `/pipeline:loop` drive or resume (with or without
 `--milestone` / issue lists / `--resume`) — those use §4b long-running
@@ -1236,8 +1337,8 @@ just because `--audit` is fast.
 
 `--once` still needs the orchestration because a single heavy stage
 (planning especially) can hit its 20-min timeout. Use the same
-background + Monitor + Push pattern as default mode; just expect at
-most one transition before the run exits.
+background + material follow + host-map notify pattern as default mode; just
+expect at most one transition before the run exits.
 
 ### 6. Optional HTML report artifact
 

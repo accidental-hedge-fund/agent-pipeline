@@ -164,7 +164,8 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   logs: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "follow", "events"]),
+    // untilTerminal: advance `logs … --events --follow` until-terminal (#725)
+    allowedFlags: new Set(["repoPath", "follow", "events", "untilTerminal"]),
     needsConfig: false,
     needsGhAuth: false,
     mutatesGitHub: false,

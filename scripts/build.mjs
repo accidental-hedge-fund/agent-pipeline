@@ -162,8 +162,8 @@ export const OPERATION_SURFACE = [
   },
   {
     name: "logs",
-    desc: "List or stream pipeline run logs",
-    argHint: "[<run-id>] [-f]",
+    desc: "List or stream pipeline run logs (events --follow exits 0 on run_complete; --no-until-terminal for interrupt-only)",
+    argHint: "[<run-id>] [--events] [-f]",
     cliArgs: "logs $ARGUMENTS",
     fast: true,
   },
@@ -311,6 +311,10 @@ function buildInto(root) {
   const shim = join(skillDir, "scripts", "pipeline.mjs");
   writeFileSync(shim, renderShim("claude"));
   chmodSync(shim, 0o755);
+  // Host-facing material filter launcher (#742) — same install surface as pipeline.mjs.
+  const materialFilter = join(skillDir, "scripts", "material-filter.mjs");
+  cpSync(join(REPO_ROOT, "hosts", "_shared", "material-filter.mjs"), materialFilter);
+  chmodSync(materialFilter, 0o755);
 
   // Namespaced command files: one `pipeline:<name>.md` per operation (#273).
   // Generated from OPERATION_SURFACE so Claude and Codex stay symmetric.

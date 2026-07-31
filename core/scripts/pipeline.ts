@@ -147,7 +147,13 @@ import {
   runDir as loopRunDir,
   runExists as loopRunExists,
 } from "./loop/store.ts";
-import { runLoopLogs } from "./loop/logs.ts";
+import {
+  defaultFollowEventsIo,
+  followEventsWithTerminalExit,
+  followFileWithSignalCleanup,
+  isAdvanceRunCompleteLine,
+  runLoopLogs,
+} from "./loop/logs.ts";
 import {
   followLoopStageProgress,
   formatAuditStageTableRow,
@@ -239,8 +245,10 @@ export interface CliOpts {
   /** Follow mode for `pipeline logs <run-id> --follow` (-f). */
   follow?: boolean;
   /**
-   * Loop logs `--follow`: exit 0 after `loop_run_stopped` (default true).
-   * Commander `--no-until-terminal` sets this false for interrupt-only follow (#699).
+   * Events follow until-terminal: exit 0 after terminal event (default true).
+   * Advance `pipeline logs … --events --follow` → `run_complete` (#725);
+   * loop `pipeline loop logs … --follow` → `loop_run_stopped` (#699).
+   * Commander `--no-until-terminal` sets this false for interrupt-only follow.
    */
   untilTerminal?: boolean;
   /** Read/follow events.jsonl instead of terminal.log in `pipeline logs`. */
@@ -466,10 +474,11 @@ export function buildCmd(): Command {
     .option("--json-events", "stream lifecycle events to stdout as JSON lines (in addition to human-readable output)")
     .option("-f, --follow", "follow mode for 'pipeline logs' / 'pipeline loop logs': stream new output as it is written")
     // Commander `--no-until-terminal` pattern (same as `--no-edit`): attribute is
-    // `untilTerminal`, default true, CLI flag sets false for interrupt-only follow (#699).
+    // `untilTerminal`, default true, CLI flag sets false for interrupt-only follow
+    // (#699 loop; #725 advance events).
     .option(
       "--no-until-terminal",
-      "loop logs --follow: keep streaming until interrupt only (default: exit 0 after a loop_run_stopped event is printed)",
+      "events --follow: keep streaming until interrupt only (default: exit 0 after run_complete for advance logs, or loop_run_stopped for loop logs)",
     )
     .option("--events", "logs mode: read/follow events.jsonl (required selection for advance logs; always selected for 'pipeline loop logs')")
     // `pipeline run <N> --detach` options
@@ -1993,7 +2002,11 @@ async function main(): Promise<void> {
       typeof logsArg === "string" && logsArg.length > 0 && !logsArg.startsWith("-")
         ? logsArg
         : undefined;
-    await runLogs(repoDir, logsRunId, !!opts.follow, !!opts.events);
+    // Advance events follow: until-terminal default on `run_complete` (#725);
+    // --no-until-terminal restores interrupt-only. terminal.log follow stays interrupt-only.
+    await runLogs(repoDir, logsRunId, !!opts.follow, !!opts.events, {
+      untilTerminal: opts.untilTerminal !== false,
+    });
     return;
   }
 
@@ -4136,15 +4149,73 @@ export async function runSummaryByRunId(
 }
 
 // ---------------------------------------------------------------------------
-// Logs mode (#155): print or follow a run's terminal.log independent of the
-// original pipeline process. Reads from .agent-pipeline/runs/<run-id>/.
+// Logs mode (#155 / #725): print or follow a run's terminal.log / events.jsonl
+// independent of the original pipeline process. Reads from
+// .agent-pipeline/runs/<run-id>/. With `--events --follow`, until-terminal is
+// the default (exit 0 on `run_complete`); `--no-until-terminal` is interrupt-only.
 // ---------------------------------------------------------------------------
+
+/** Options for {@link runLogs} follow mode. */
+export interface RunLogsFollowOptions {
+  /**
+   * When true (default for `--events --follow`), exit 0 after printing a
+   * complete JSONL line with advance event type `run_complete`. When false
+   * (`--no-until-terminal`), remain open until interrupt. Ignored without
+   * `--events --follow` (terminal.log follow stays interrupt-only).
+   */
+  untilTerminal?: boolean;
+}
+
+/**
+ * Injectable follow seam for {@link runLogs}. Unit tests inject fakes; production
+ * uses line-aware until-terminal for events and interrupt-only tail for terminal.log.
+ */
+export interface RunLogsDeps {
+  followFile(
+    logFile: string,
+    opts: {
+      untilTerminal: boolean;
+      events: boolean;
+    },
+  ): Promise<number | null>;
+  stdoutWrite(s: string): void;
+  stderrWrite(s: string): void;
+}
+
+export function defaultRunLogsDeps(): RunLogsDeps {
+  return {
+    followFile(logFile, opts) {
+      // Until-terminal only applies to structured events follow (#725).
+      if (opts.events && opts.untilTerminal) {
+        return followEventsWithTerminalExit(
+          logFile,
+          {
+            untilTerminal: true,
+            isTerminalLine: isAdvanceRunCompleteLine,
+            errorLabel: "pipeline logs",
+          },
+          defaultFollowEventsIo(),
+        );
+      }
+      // Interrupt-only: terminal.log, or events with --no-until-terminal.
+      return followFileWithSignalCleanup(logFile);
+    },
+    stdoutWrite(s) {
+      process.stdout.write(s);
+    },
+    stderrWrite(s) {
+      process.stderr.write(s);
+    },
+  };
+}
 
 export async function runLogs(
   repoDir: string,
   runId: string | undefined,
   follow: boolean,
   events = false,
+  followOpts: RunLogsFollowOptions = {},
+  deps: RunLogsDeps = defaultRunLogsDeps(),
 ): Promise<void> {
   // No run-id: list available runs, most recent first, then exit 0.
   if (runId === undefined) {
@@ -4160,6 +4231,8 @@ export async function runLogs(
   const dir = runDirPath(repoDir, runId);
   const fileName = events ? "events.jsonl" : "terminal.log";
   const logFile = path.join(dir, fileName);
+  // Default until-terminal ON for events follow only (#725).
+  const untilTerminal = events && follow && followOpts.untilTerminal !== false;
 
   // Check that the run directory exists.
   try {
@@ -4187,22 +4260,35 @@ export async function runLogs(
     return;
   }
 
-  // --follow: tail -f, independent of the original pipeline process. Resolve when
-  // the tail child exits or errors — including the case where the selected log does
-  // not exist yet — so a failed follow exits non-zero and releases the caller
-  // instead of awaiting an unresolvable promise forever (#155).
-  await new Promise<void>((resolve) => {
-    const tail = spawn("tail", ["-f", logFile], { stdio: "inherit" });
-    tail.on("error", (err) => {
-      console.error(`pipeline logs: failed to start tail: ${err.message}`);
+  // Pre-check so until-terminal follow fails closed when the stream cannot start
+  // (no hang waiting for a never-created file). Interrupt-only tail also fails
+  // non-zero on missing files via the follow seam (#155).
+  try {
+    await defaultRunStoreDeps.stat(logFile);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      const untilNote = events
+        ? ` Follow mode streams event lines; by default it exits 0 after ` +
+          `run_complete (use --no-until-terminal for interrupt-only).`
+        : "";
+      console.error(
+        `pipeline logs: ${fileName} not yet written for run '${runId}'.${untilNote}`,
+      );
       process.exitCode = 1;
-      resolve();
-    });
-    tail.on("exit", (code) => {
-      if (code !== null && code !== 0) process.exitCode = code;
-      resolve();
-    });
+      return;
+    }
+    throw err;
+  }
+
+  // --follow: independent of the original pipeline process. Events path defaults
+  // to until-terminal (exit 0 on run_complete); terminal.log stays interrupt-only.
+  const code = await deps.followFile(logFile, {
+    untilTerminal,
+    events,
   });
+  if (code !== null && code !== 0) {
+    process.exitCode = code;
+  }
 }
 
 // ---------------------------------------------------------------------------
