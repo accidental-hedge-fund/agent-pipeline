@@ -146,7 +146,6 @@ try {
     console.error("ci-install-smoke: pipeline:status.md still hardcodes ~/.claude/skills/pipeline");
     process.exit(1);
   }
->>>>>>> 9f39e5a (fix(install): CLAUDE_CONFIG_DIR command paths, uninstall cleanup, Codex shadow (#635))
   // `update` refreshes the installed skill in place; running it twice must be
   // a net no-op (no error, shim still runs) — the documented remediation for
   // a stale install:version-freshness warning. --force: this smoke test's
