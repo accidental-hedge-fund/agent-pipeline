@@ -240,12 +240,13 @@ export type PreMergeAutoFixResult =
   | { status: "error"; diagnostic?: string };
 
 /**
- * Injectable seam for the bounded pre-merge auto-fix attempt (#359).
- * Parameters: the blocking ReviewFinding objects, the issue title (for the
- * fix prompt), and the delta review comment body (as reviewFindings text).
- * Called by `enforceReviewShaGate` only when (a) all blocking findings pass
- * `allBlockingAutoFixable` and (b) no prior auto-fix commit / durable
- * noop-clean marker is present.
+ * Injectable seam for the bounded pre-merge auto-fix attempt (#359, #747).
+ * Parameters: the **auto-fixable** (allowlisted) ReviewFinding objects, the
+ * issue title (for the fix prompt), and the delta review comment body scoped
+ * to those findings. Called by `enforceReviewShaGate` only when (a) the
+ * category partition yields a non-empty auto-fixable subset and (b) no prior
+ * auto-fix commit / durable attempt or noop-clean marker is present.
+ * Residual non-allowlisted findings are never passed into this seam.
  */
 export type AttemptPreMergeAutoFixFn = (
   blockingFindings: ReviewFinding[],
@@ -496,12 +497,12 @@ export function supersededDeltaReviewNotice(reviewedSha: string, headSha: string
 }
 
 /**
- * Pre-merge auto-fix category allowlist (#359, expanded #680).
+ * Pre-merge auto-fix category allowlist (#359, expanded #680; partition #747).
  *
- * Single source of truth for `isAutoFixableFinding` / `allBlockingAutoFixable`
- * and unit tests — keep this set aligned with the living category matrix in
- * `openspec/specs/pre-merge-fix-round/spec.md` (and the active change delta
- * while #680 is in flight).
+ * Single source of truth for `isAutoFixableFinding` /
+ * `partitionBlockingForAutofix` and unit tests — keep this set aligned with
+ * the living category matrix in `openspec/specs/pre-merge-fix-round/spec.md`
+ * (and the active change delta while partition work is in flight).
  *
  * Allowlisted (surgical implementer fix needs no product judgment):
  *   - correctness   — mechanical code defect
@@ -509,9 +510,12 @@ export function supersededDeltaReviewNotice(reviewedSha: string, headSha: string
  *   - concurrency   — race / lock ownership / PID identity / ordering / probe
  *                     defects (#668 dogfood class)
  *
- * Excluded (escalate without auto-fix):
+ * Residual / excluded from the auto-fix prompt (human disposition):
  *   - security, scope, product-judgment-required, spec-divergence, data-loss,
- *     observability, and any absent/empty/unrecognized token (fail-closed)
+ *     observability, and any absent/empty/unrecognized token (fail-closed for
+ *     that finding). Co-batched residual findings do **not** veto auto-fix of
+ *     a non-empty allowlisted subset (#747 partition); pure residual-only
+ *     batches still skip the harness.
  */
 export const PRE_MERGE_AUTOFIX_CATEGORIES = [
   "correctness",
@@ -538,12 +542,76 @@ export function isAutoFixableFinding(f: ReviewFinding): boolean {
 }
 
 /**
+ * Partition blocking findings into allowlisted (auto-fixable) vs residual
+ * human-required subsets (#747). Eligibility for the bounded pre-merge auto-fix
+ * attempt is a **non-empty** `autoFixable` subset — residual co-batch does not
+ * veto. Pure residual (`autoFixable` empty) skips the harness.
+ */
+export function partitionBlockingForAutofix(blocking: ReviewFinding[]): {
+  autoFixable: ReviewFinding[];
+  residual: ReviewFinding[];
+} {
+  const autoFixable: ReviewFinding[] = [];
+  const residual: ReviewFinding[] = [];
+  for (const f of blocking) {
+    if (isAutoFixableFinding(f)) autoFixable.push(f);
+    else residual.push(f);
+  }
+  return { autoFixable, residual };
+}
+
+/**
  * True iff the blocking findings array is non-empty and every element
  * passes `isAutoFixableFinding`. Empty array → false (no findings to fix).
- * (#359)
+ * Kept for pure-all checks and tests; the attempt gate uses
+ * {@link partitionBlockingForAutofix} (non-empty allowlisted subset), not
+ * all-or-nothing veto. (#359, #747)
  */
 export function allBlockingAutoFixable(blocking: ReviewFinding[]): boolean {
   return blocking.length > 0 && blocking.every(isAutoFixableFinding);
+}
+
+/** Compact `key (category)` label for operator-facing disposition text (#747). */
+function formatFindingDispositionLabel(f: ReviewFinding): string {
+  const key = findingKey(f);
+  const cat = (f.category ?? "").toLowerCase().trim() || "(none)";
+  return `${key} (${cat})`;
+}
+
+/**
+ * Operator-facing block reason after a pre-merge delta blocking round that used
+ * category partition (#747). Distinguishes residual human-required findings
+ * from allowlisted findings that were (or were not) auto-fix attempted.
+ */
+export function formatPartitionDispositionReason(args: {
+  residual: ReviewFinding[];
+  autoFixable: ReviewFinding[];
+  /** True when the harness was invoked (or would have been after attempt marker). */
+  attempted: boolean;
+  diagnostic?: string;
+}): string {
+  const { residual, autoFixable, attempted, diagnostic } = args;
+  const residualLabels = residual.map(formatFindingDispositionLabel);
+  const autoLabels = autoFixable.map(formatFindingDispositionLabel);
+  const parts: string[] = [
+    "Pre-merge delta review found blocking findings; fix required before merging.",
+  ];
+  if (residualLabels.length > 0) {
+    parts.push(
+      attempted
+        ? `Human disposition required for residual non-allowlisted: ${residualLabels.join(", ")}.`
+        : `Human disposition required for residual non-allowlisted (no auto-fix attempt): ${residualLabels.join(", ")}.`,
+    );
+  }
+  if (autoLabels.length > 0) {
+    parts.push(
+      attempted
+        ? `Auto-fix attempted for allowlisted: ${autoLabels.join(", ")}.`
+        : `Allowlisted findings present but auto-fix not attempted (bound exhausted or marker unavailable): ${autoLabels.join(", ")}.`,
+    );
+  }
+  const base = parts.join(" ");
+  return diagnostic ? `${base} ${diagnostic}` : base;
 }
 
 /**
@@ -1784,10 +1852,12 @@ export interface ShaGateDeps {
   runDir?: string;
   runStoreDeps?: RunStoreDeps;
   /**
-   * Injectable seam for the bounded pre-merge auto-fix round (#359).
-   * When provided, called when (a) all blocking delta-review findings pass
-   * `allBlockingAutoFixable` and (b) no prior auto-fix commit is present in
-   * the branch since the reviewed SHA. Production default: wired in
+   * Injectable seam for the bounded pre-merge auto-fix round (#359, #747).
+   * When provided, called when (a) category partition yields a non-empty
+   * allowlisted subset (`partitionBlockingForAutofix`) and (b) no prior
+   * auto-fix commit / durable attempt marker is present since the reviewed
+   * SHA. Residual non-allowlisted findings do not veto the call; the seam
+   * receives only the allowlisted subset. Production default: wired in
    * `advance()` as a closure over the implementer harness and worktree.
    * Tests inject this directly to exercise the blocking-branch routing without
    * a real harness, git, or network.
@@ -2537,17 +2607,22 @@ export async function enforceReviewShaGate(
         return null;
       }
 
-      // Delta review found blocking findings. Attempt one bounded auto-fix
-      // before blocking when all findings are in the category allowlist (#359).
+      // Delta review found blocking findings. Partition by category allowlist
+      // (#359 / #747): attempt one bounded auto-fix when the allowlisted subset
+      // is non-empty — residual non-allowlisted findings do not veto the attempt
+      // but are excluded from the fix prompt and still need human disposition.
       // Tracks the head the verdict that will ultimately gate `setBlockedFn`
       // below was produced against — `targetHead` unless an auto-fix re-review
       // supersedes it (#481 review 2 finding 1).
       let finalBlockingHead = targetHead;
       // #553 / #698: diagnostic or still-broken recipe for the block reason.
-      // When set to a full block reason (noop still-broken recipe), used as-is;
-      // otherwise appended to the generic "fix required" message.
+      // When set to a full block reason (noop still-broken recipe / partition
+      // disposition), used as-is; otherwise appended to the generic message.
       let autoFixDiagnostic: string | undefined;
       let autoFixBlockReason: string | undefined;
+      const categoryPartition = partitionBlockingForAutofix(partition.blocking);
+      // Track attempt + partition for operator-facing disposition naming (#747).
+      let autoFixAttempted = false;
       // Observability (#682): needs-attention with blocking count for the loop mirror.
       await recordPreMergeGateResult(
         { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
@@ -2556,7 +2631,7 @@ export async function enforceReviewShaGate(
         `blocking_count=${partition.blocking.length}`,
       );
       const attemptAutoFixFn = deps.attemptPreMergeAutoFix;
-      if (attemptAutoFixFn && allBlockingAutoFixable(partition.blocking)) {
+      if (attemptAutoFixFn && categoryPartition.autoFixable.length > 0) {
         // One-attempt bound (crash-safe): detect a prior auto-fix commit by
         // scanning PR commits since the reviewed SHA for the PREFIX subject,
         // OR a durable attempt-started / noop-clean marker at the current head
@@ -2600,13 +2675,17 @@ export async function enforceReviewShaGate(
             "partial",
             "attempted",
           );
-          // Scope the fix prompt to blocking findings only — not the full delta
-          // comment which may include advisory/non-blocking findings (#359 R2 F3).
+          // Scope the fix prompt to the allowlisted subset only — not residual
+          // non-allowlisted findings (#747) and not advisory/non-blocking
+          // findings (#359 R2 F3).
+          const autoFixableKeys = new Set(
+            categoryPartition.autoFixable.map((f) => findingKey(f)),
+          );
           const blockingOnlyBody = formatDeltaReviewComment(
             cfg,
-            { ...deltaCommentVerdict, findings: partition.blocking },
+            { ...deltaCommentVerdict, findings: categoryPartition.autoFixable },
             `pre-merge delta review by ${deltaReviewerLabel}`,
-            blockingKeysSet.size > 0 ? blockingKeysSet : undefined,
+            autoFixableKeys.size > 0 ? autoFixableKeys : undefined,
             newHash,
           );
           // Crash-safe one-attempt guard (#698 review-2): persist attempt-started
@@ -2640,9 +2719,10 @@ export async function enforceReviewShaGate(
           }
           const fixRes = attemptMarkerPosted
             ? await attemptAutoFixFn(
-                partition.blocking, detail.title, blockingOnlyBody,
+                categoryPartition.autoFixable, detail.title, blockingOnlyBody,
               )
             : null;
+          if (attemptMarkerPosted) autoFixAttempted = true;
           // fix-committed → re-review at new head; noop-clean → re-verify at
           // unchanged head (#698). Both share the single re-review path; neither
           // counts as a second auto-fix attempt.
@@ -3010,13 +3090,24 @@ export async function enforceReviewShaGate(
         );
       }
 
-      // Non-auto-fixable category, no seam, or fix round exhausted:
-      // block pre-merge without routing to review-2.
+      // Empty allowlisted subset, no seam, residual human-required, or fix
+      // round exhausted: block pre-merge without routing to review-2.
+      // Prefer partition disposition naming when residual or a mixed batch was
+      // involved (#747); pure allowlisted exhausted paths keep the simpler
+      // diagnostic-appended message (or noop still-broken recipe).
       const blockReason =
         autoFixBlockReason ??
-        (autoFixDiagnostic
-          ? `Pre-merge delta review found blocking findings; fix required before merging. ${autoFixDiagnostic}`
-          : "Pre-merge delta review found blocking findings; fix required before merging.");
+        (categoryPartition.residual.length > 0 ||
+        (categoryPartition.autoFixable.length > 0 && autoFixAttempted)
+          ? formatPartitionDispositionReason({
+              residual: categoryPartition.residual,
+              autoFixable: categoryPartition.autoFixable,
+              attempted: autoFixAttempted,
+              diagnostic: autoFixDiagnostic,
+            })
+          : autoFixDiagnostic
+            ? `Pre-merge delta review found blocking findings; fix required before merging. ${autoFixDiagnostic}`
+            : "Pre-merge delta review found blocking findings; fix required before merging.");
       await setBlockedFn(
         cfg,
         issueNumber,
