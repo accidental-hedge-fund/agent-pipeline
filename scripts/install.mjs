@@ -639,6 +639,10 @@ function pathPresent(p) {
 /**
  * Materialize ~/.grok/skills/pipeline as a symlink to the Claude-managed skill.
  * Fail closed when Claude is missing — never silently create a divergent copy.
+ * Only replaces an existing path when it is already a symlink (unlink the link
+ * only). Never recursively deletes a directory/file — the documented copy
+ * layout and any personal content must be preserved until the operator
+ * relocates or removes it explicitly.
  * Exported for unit tests.
  */
 function installGrokHost(dryRun) {
@@ -663,35 +667,58 @@ function installGrokHost(dryRun) {
   // stays valid under CLAUDE_CONFIG_DIR overrides.
   const target = resolve(claudeDest);
 
+  if (pathPresent(dest)) {
+    let st;
+    try {
+      st = lstatSync(dest);
+    } catch (err) {
+      fail(
+        `Cannot inspect existing path at ${dest}: ${err.message}\n` +
+          `  Relocate or remove it, then re-run: node scripts/install.mjs install --host grok`,
+      );
+    }
+    if (st.isSymbolicLink()) {
+      let current;
+      try {
+        current = resolve(dirname(dest), readlinkSync(dest));
+      } catch {
+        current = null;
+      }
+      if (current === target) {
+        if (dryRun) {
+          log(`  (dry-run) already linked → ${target}`);
+          return;
+        }
+        log(`  ✓ already linked → ${target}. ${cfg.postInstall}`);
+        return;
+      }
+      // Stale/broken/wrong-target symlink only: unlink the link inode, never a tree.
+      if (dryRun) {
+        log(`  (dry-run) would replace symlink ${dest} → ${target}`);
+        return;
+      }
+      unlinkSync(dest);
+    } else {
+      // Directory or regular file — documented copy layout / personal content.
+      // Never rm -rf; require explicit operator action to convert to a symlink.
+      fail(
+        `Refusing to replace non-symlink path at ${dest}.\n` +
+          `  This may be a copy-based Grok skill layout or personal content.\n` +
+          `  install --host grok only creates/refreshes a symlink; it will not delete this path.\n` +
+          `  To keep the copy: no action needed (the copy layout is supported; it does not track Claude updates).\n` +
+          `  To switch to the preferred symlink layout, relocate the path first, then re-run:\n` +
+          `    mv '${dest}' '${dest}.bak'\n` +
+          `    node scripts/install.mjs install --host grok`,
+      );
+    }
+  }
+
   if (dryRun) {
     log(`  (dry-run) would symlink ${dest} → ${target}`);
     return;
   }
 
   mkdirSync(skillsDir, { recursive: true });
-
-  if (pathPresent(dest)) {
-    try {
-      const st = lstatSync(dest);
-      if (st.isSymbolicLink()) {
-        let current;
-        try {
-          current = resolve(dirname(dest), readlinkSync(dest));
-        } catch {
-          current = null;
-        }
-        if (current === target) {
-          log(`  ✓ already linked → ${target}. ${cfg.postInstall}`);
-          return;
-        }
-      }
-    } catch {
-      // fall through to replace
-    }
-    // Replace stale symlink, broken link, or divergent copy with the preferred layout.
-    rmSync(dest, { recursive: true, force: true });
-  }
-
   symlinkSync(target, dest);
   log(`  ✓ linked → ${target}. ${cfg.postInstall}`);
 }
