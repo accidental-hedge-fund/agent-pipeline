@@ -2,7 +2,7 @@
 
 ### Requirement: Loop dispatch SHALL not start a second full advance while a host-local advance is already live
 
-Before the durable loop dispatches a full per-item advance through `pipeline/loop-execution@1`, the supervisor SHALL probe host-local evidence for whether an advance is already live for that issue. Live evidence SHALL include any of: a per-issue advisory lock held by a live process, a **fresh** non-terminal advance run-store for that issue (activity within the host-local freshness bound; a stale non-terminal crash artifact without recent activity and without live lock/wrapper evidence SHALL NOT count as live), a live wrapper/process identity for that issue (production MUST wire a real host-local wrapper/process lookup into the default loop supervisor dependencies — unit tests inject the seam), or a non-terminal advance linkage already recorded on the loop run for that item. When live evidence is present, the loop SHALL attach to the existing advance, skip the dispatch cycle for that item, or wait and re-probe — and SHALL NOT spawn a second full advance that can collide on the lock. The multi-item run SHALL NOT record a `run_fatal` stop solely because that item already had a live advance. The probe and disposition SHALL be injectable so unit tests drive them with no real network, git, or subprocess call. Cross-host advance liveness is out of scope; host-local single-host concurrency remains the supported scope.
+Before the durable loop dispatches a full per-item advance through `pipeline/loop-execution@1`, the supervisor SHALL probe host-local evidence for whether an advance is already live for that issue. Live evidence SHALL include any of: a per-issue advisory lock held by a live process, a **fresh** non-terminal advance run-store for that issue (activity within the host-local freshness bound; a stale non-terminal crash artifact without recent activity and without live lock/wrapper evidence SHALL NOT count as live), a live wrapper/process identity for that issue (production MUST wire a real host-local wrapper/process lookup into the default loop supervisor dependencies — unit tests inject the seam), or a **fresh** non-terminal advance linkage already recorded on the loop run for that item (same freshness bound as active run-stores; aged non-terminal crash linkage SHALL NOT count as live). When live evidence is present, the loop SHALL attach to the existing advance, skip the dispatch cycle for that item, or wait and re-probe — and SHALL NOT spawn a second full advance that can collide on the lock. The multi-item run SHALL NOT record a `run_fatal` stop solely because that item already had a live advance. The probe and disposition SHALL be injectable so unit tests drive them with no real network, git, or subprocess call. Cross-host advance liveness is out of scope; host-local single-host concurrency remains the supported scope.
 
 #### Scenario: Live lock prevents a second full dispatch
 
@@ -16,8 +16,9 @@ Before the durable loop dispatches a full per-item advance through `pipeline/loo
 
 - **WHEN** the loop run already carries non-terminal start linkage for item `675` with a real advance `pipeline_run_id`
 - **AND** that advance is not proven terminal
-- **THEN** the supervisor SHALL treat the item as having a live advance
-- **AND** SHALL NOT dispatch a second full advance for the same item until the linked advance is proven terminal or the probe reports not live
+- **AND** the linked store activity is within the host-local freshness bound
+- **THEN** the supervisor SHALL treat the item as having a live advance for pre-dispatch / hold-clear
+- **AND** SHALL NOT dispatch a second full advance for the same item until the linked advance is proven terminal, ages past the freshness bound, or the probe reports not live
 
 #### Scenario: No live evidence allows normal dispatch
 
@@ -29,6 +30,14 @@ Before the durable loop dispatches a full per-item advance through `pipeline/loo
 
 - **WHEN** the only host-local run-store for an item is non-terminal
 - **AND** its activity is older than the host-local freshness bound
+- **AND** no live lock and no live wrapper/process identity exist for that item
+- **THEN** the live-advance probe SHALL report not live
+- **AND** a subsequent genuine engine defect for that item SHALL still be classifiable under existing `workflow-engine-defect` / `run_fatal` policy
+
+#### Scenario: Aged non-terminal loop linkage is not live evidence
+
+- **WHEN** the loop run retains non-terminal start linkage for an item
+- **AND** the linked store activity is older than the host-local freshness bound
 - **AND** no live lock and no live wrapper/process identity exist for that item
 - **THEN** the live-advance probe SHALL report not live
 - **AND** a subsequent genuine engine defect for that item SHALL still be classifiable under existing `workflow-engine-defect` / `run_fatal` policy
@@ -51,7 +60,7 @@ Before the durable loop dispatches a full per-item advance through `pipeline/loo
 
 ### Requirement: Lock-held and already-running dispatch outcomes SHALL be non-fatal coexistence, never workflow-engine-defect run_fatal
 
-When a dispatch returns an outcome that would otherwise normalize to `failed`, and the outcome or its evidence indicates host-local lock held, already running, or install in progress for that issue, the supervisor SHALL classify the result as **non-fatal coexistence** (retryable wait, hold, skip, or noop progress under loop recovery policy). That classification SHALL NEVER use the `workflow-engine-defect` blocker class and SHALL NEVER record a `run_fatal` (or equivalent whole-run stop) solely for that evidence. A genuine rejected or crashed dispatch, or an unrecognized terminal outcome, that carries **no** lock / already-running / install-in-progress evidence SHALL remain classified `workflow-engine-defect` with its existing `run_fatal` policy unchanged. Classification SHALL be a deterministic function of injected dispatch evidence so a unit test proves both the coexistence path and the genuine-defect path.
+When a dispatch returns an outcome that would otherwise normalize to `failed`, and the outcome or its evidence indicates host-local lock held, already running, or install in progress for that issue, the supervisor SHALL classify the result as **non-fatal coexistence** (retryable wait, hold, skip, or noop progress under loop recovery policy). That classification SHALL NEVER use the `workflow-engine-defect` blocker class and SHALL NEVER record a `run_fatal` (or equivalent whole-run stop) solely for that evidence. Pass-2 probe-based coexistence reclassification SHALL require a **concurrent holder** (live lock or live wrapper/process identity) or the structured lock/already-running/install text above — the failed attempt's own non-terminal linkage or fresh crash run-store alone SHALL NOT satisfy Pass-2 coexistence without that concurrent-holder or text evidence. A genuine rejected or crashed dispatch, or an unrecognized terminal outcome, that carries **no** lock / already-running / install-in-progress evidence and **no** concurrent holder SHALL remain classified `workflow-engine-defect` with its existing `run_fatal` policy unchanged. Classification SHALL be a deterministic function of injected dispatch evidence so a unit test proves both the coexistence path and the genuine-defect path.
 
 #### Scenario: Failed dispatch with already-running evidence does not stop the run
 
@@ -71,9 +80,18 @@ When a dispatch returns an outcome that would otherwise normalize to `failed`, a
 
 - **WHEN** a dispatch is rejected or crashes, or reports an outcome outside the defined terminal set
 - **AND** no lock-held, already-running, or install-in-progress evidence is present
+- **AND** no concurrent holder (live lock or wrapper/process identity) exists for the item
 - **AND** the item is not under a needs-human `pipeline:blocked` disposition covered by existing hold safety nets
 - **THEN** the outcome SHALL be classified `workflow-engine-defect`
 - **AND** its existing `run_fatal` policy SHALL apply unchanged
+
+#### Scenario: Fresh crash leaving own non-terminal linkage does not suppress run_fatal
+
+- **WHEN** a dispatch for item `100` records start linkage and then crashes with no lock/already-running text
+- **AND** the linked events file is non-terminal and still within the freshness bound
+- **AND** no live lock and no live wrapper/process identity exist for that item
+- **THEN** Pass-2 SHALL NOT reclassify the failure as coexistence solely from that own linkage/run-store
+- **AND** the outcome SHALL remain `workflow-engine-defect` with existing `run_fatal` policy
 
 ---
 

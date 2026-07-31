@@ -7,8 +7,10 @@ import * as path from "node:path";
 import {
   ACTIVE_RUN_STORE_MAX_AGE_MS,
   isCoexistenceFailureEvidence,
+  isConcurrentHolderEvidence,
   isNonFatalMidStageExit,
   isLockFileLive,
+  isNonTerminalLinkageFresh,
   eventsTextIsTerminal,
   resolveLinkageTerminalState,
   findActiveRunStoreForIssue,
@@ -147,13 +149,14 @@ test("probeLiveAdvance: dead PID lock → not live", () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("probeLiveAdvance: knownLinkage non-terminal → live loop_linkage (#770 dcfb0878)", () => {
+test("probeLiveAdvance: knownLinkage non-terminal + fresh → live loop_linkage (#770 dcfb0878)", () => {
   const r = probeLiveAdvance({
     domain: "test",
     issueNumber: 1,
     knownLinkage: { pipeline_run_id: "1-2026-01-01T00-00-00-000Z" },
     lockPathForTest: path.join(os.tmpdir(), "no-such-lock-770"),
     resolveLinkageTerminal: () => false,
+    isLinkageFresh: () => true,
   });
   assert.equal(r.live, true);
   if (r.live) assert.equal(r.evidence, "loop_linkage");
@@ -179,6 +182,41 @@ test("probeLiveAdvance: unresolvable linkage alone is not live", () => {
     resolveLinkageTerminal: () => null,
   });
   assert.equal(r.live, false);
+});
+
+test("probeLiveAdvance: aged non-terminal linkage is not live (#770 12e4c0fd)", () => {
+  const r = probeLiveAdvance({
+    domain: "test",
+    issueNumber: 1,
+    knownLinkage: { pipeline_run_id: "1-crash-old" },
+    lockPathForTest: path.join(os.tmpdir(), "no-such-lock-770-aged-link"),
+    resolveLinkageTerminal: () => false,
+    isLinkageFresh: () => false,
+  });
+  assert.equal(r.live, false, "stale crash linkage must not count as live forever");
+});
+
+test("probeLiveAdvance: ignored pipeline_run_id skips own linkage/store (#770 12e4c0fd)", () => {
+  const ownId = "675-just-crashed";
+  const r = probeLiveAdvance({
+    domain: "test",
+    issueNumber: 675,
+    knownLinkage: { pipeline_run_id: ownId },
+    lockPathForTest: path.join(os.tmpdir(), "no-such-lock-770-ignore"),
+    resolveLinkageTerminal: () => false,
+    isLinkageFresh: () => true,
+    findActiveRunStore: () => ({ pipeline_run_id: ownId, events_path: "/tmp/e.jsonl" }),
+    ignorePipelineRunIds: [ownId],
+  });
+  assert.equal(r.live, false, "failed attempt's own artifacts must not satisfy live probe alone");
+});
+
+test("isConcurrentHolderEvidence: only lock_held / wrapper_pid", () => {
+  assert.equal(isConcurrentHolderEvidence("lock_held"), true);
+  assert.equal(isConcurrentHolderEvidence("wrapper_pid"), true);
+  assert.equal(isConcurrentHolderEvidence("loop_linkage"), false);
+  assert.equal(isConcurrentHolderEvidence("active_run_store"), false);
+  assert.equal(isConcurrentHolderEvidence(undefined), false);
 });
 
 test("probeLiveAdvance: active_run_store evidence (#770 dcfb0878)", () => {
@@ -276,8 +314,75 @@ test("findActiveRunStoreForIssue / default probe: stale non-terminal crash store
     issueNumber: 770,
     repoDir: repo,
     lockPathForTest: path.join(os.tmpdir(), "no-such-lock-770-stale"),
+    nowMs: now,
   });
   assert.equal(r.live, false, "default probe must not treat stale crash store as live forever");
+
+  // Aged non-terminal linkage (same crash store) must also not be live.
+  const linked = probeLiveAdvance({
+    domain: "test",
+    issueNumber: 770,
+    repoDir: repo,
+    knownLinkage: { pipeline_run_id: crashId, events: eventsPath },
+    lockPathForTest: path.join(os.tmpdir(), "no-such-lock-770-stale-link"),
+    nowMs: now,
+  });
+  assert.equal(linked.live, false, "aged linked crash artifact must not be live");
+  assert.equal(
+    isNonTerminalLinkageFresh(
+      { pipeline_run_id: crashId, events: eventsPath },
+      { nowMs: now, statMtimeMs: () => old },
+    ),
+    false,
+  );
+
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test("default probe: fresh crashed linked advance ignored without concurrent holder (#770 12e4c0fd)", () => {
+  // Production-shaped: fresh non-terminal events + knownLinkage, no lock/wrapper.
+  // Pass-2 ignores the own run id so the crash artifact cannot force coexistence.
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "live-adv-fresh-crash-"));
+  const runs = path.join(repo, ".agent-pipeline", "runs");
+  const crashId = "770-fresh-crash";
+  fs.mkdirSync(path.join(runs, crashId), { recursive: true });
+  const eventsPath = path.join(runs, crashId, "events.jsonl");
+  fs.writeFileSync(
+    eventsPath,
+    JSON.stringify({ type: "stage_start", stage: "fix", at: "t" }) + "\n",
+  );
+  const now = Date.now();
+  fs.utimesSync(path.join(runs, crashId), now / 1000, now / 1000);
+  fs.utimesSync(eventsPath, now / 1000, now / 1000);
+
+  // Without ignore: fresh linkage still looks live (pre-dispatch attach path).
+  const withoutIgnore = probeLiveAdvance({
+    domain: "test",
+    issueNumber: 770,
+    repoDir: repo,
+    knownLinkage: { pipeline_run_id: crashId, events: eventsPath },
+    lockPathForTest: path.join(os.tmpdir(), "no-such-lock-770-fresh-crash"),
+    nowMs: now,
+  });
+  assert.equal(withoutIgnore.live, true);
+  if (withoutIgnore.live) assert.equal(withoutIgnore.evidence, "loop_linkage");
+
+  // Pass-2 shape: ignore the failed attempt's own run id → not live without lock/wrapper.
+  const pass2 = probeLiveAdvance({
+    domain: "test",
+    issueNumber: 770,
+    repoDir: repo,
+    knownLinkage: { pipeline_run_id: crashId, events: eventsPath },
+    lockPathForTest: path.join(os.tmpdir(), "no-such-lock-770-fresh-crash2"),
+    ignorePipelineRunIds: [crashId],
+    nowMs: now,
+  });
+  assert.equal(
+    pass2.live,
+    false,
+    "failed attempt's own fresh crash store must not satisfy Pass-2 coexistence alone",
+  );
+  assert.equal(isConcurrentHolderEvidence(pass2.live ? pass2.evidence : undefined), false);
 
   fs.rmSync(repo, { recursive: true, force: true });
 });

@@ -202,6 +202,78 @@ export function resolveLinkageTerminalState(
 }
 
 /**
+ * Host-local activity freshness for a path (events.jsonl or run dir).
+ * Used for both active run-store discovery and non-terminal loop linkage
+ * (#770 review 2 12e4c0fd) so crash artifacts age out.
+ */
+export function isActivityFresh(
+  activityMs: number,
+  opts?: { nowMs?: number; maxAgeMs?: number },
+): boolean {
+  if (!(activityMs > 0)) return false;
+  const now = opts?.nowMs ?? Date.now();
+  const maxAge = opts?.maxAgeMs ?? ACTIVE_RUN_STORE_MAX_AGE_MS;
+  return now - activityMs <= maxAge;
+}
+
+/** Resolve events path for a linkage row (explicit events or repoDir default). */
+export function linkageEventsPath(
+  linkage: { pipeline_run_id: string; events?: string },
+  repoDir?: string,
+): string | null {
+  return (
+    linkage.events ??
+    (repoDir ? advanceRunEventsPath(repoDir, linkage.pipeline_run_id) : null)
+  );
+}
+
+/**
+ * Whether a proven non-terminal linked store is still within the freshness
+ * bound. Stale non-terminal crash linkage must not count as live forever
+ * (#770 review 2 12e4c0fd). Missing path / unreadable mtime → not fresh.
+ */
+export function isNonTerminalLinkageFresh(
+  linkage: { pipeline_run_id: string; events?: string },
+  opts?: {
+    repoDir?: string;
+    statMtimeMs?: (p: string) => number;
+    nowMs?: number;
+    maxAgeMs?: number;
+  },
+): boolean {
+  const eventsPath = linkageEventsPath(linkage, opts?.repoDir);
+  if (!eventsPath) return false;
+  const mtimeMs =
+    opts?.statMtimeMs ??
+    ((p: string) => {
+      try {
+        return fs.statSync(p).mtimeMs;
+      } catch {
+        return 0;
+      }
+    });
+  let activityMs = mtimeMs(eventsPath);
+  if (!(activityMs > 0)) {
+    // Fall back to the run directory when events are absent but linkage points
+    // at a store that still exists (initialized, no events yet).
+    activityMs = mtimeMs(path.dirname(eventsPath));
+  }
+  return isActivityFresh(activityMs, { nowMs: opts?.nowMs, maxAgeMs: opts?.maxAgeMs });
+}
+
+/**
+ * Evidence classes that prove a **concurrent holder** still owns the issue —
+ * distinct from the just-failed dispatch's own non-terminal crash artifacts
+ * (loop_linkage / active_run_store). Pass-2 coexistence reclassification
+ * requires this or structured lock/already-running text (#770 12e4c0fd).
+ */
+export function isConcurrentHolderEvidence(
+  evidence: LiveAdvanceEvidenceClass | undefined,
+): boolean {
+  return evidence === "lock_held" || evidence === "wrapper_pid";
+}
+
+/**
  * Newest *fresh* non-terminal advance run-store for an issue under
  * `<repoDir>/.agent-pipeline/runs/<issue>-*`, or null when none.
  *
@@ -339,12 +411,20 @@ export function findWrapperPidForIssue(
 
 /**
  * Production probe: host-local lock PID, freshness-bounded non-terminal
- * run-store, optional wrapper PID, and terminal-aware loop linkage.
+ * run-store, optional wrapper PID, and terminal + freshness-aware loop linkage.
  *
- * Loop linkage is live only when proven non-terminal. A retained
- * `advance_run_id` whose run already completed MUST NOT block re-admission
- * (#770 review 1 finding ce4794fb). Unresolvable linkage alone is not live;
- * lock / active run-store / wrapper evidence still apply.
+ * Loop linkage is live only when proven non-terminal **and** the linked store
+ * is still within {@link ACTIVE_RUN_STORE_MAX_AGE_MS} (or injectable bound).
+ * A retained `advance_run_id` whose run already completed MUST NOT block
+ * re-admission (#770 review 1 finding ce4794fb). An aged non-terminal crash
+ * linkage MUST NOT count as live forever (#770 review 2 12e4c0fd).
+ * Unresolvable linkage alone is not live; lock / active run-store / wrapper
+ * evidence still apply.
+ *
+ * Optional `ignorePipelineRunIds` excludes those stores from linkage and
+ * active-run-store evidence (Pass-2 uses this so the just-failed dispatch's
+ * own crash artifacts cannot reclassify as coexistence without a concurrent
+ * lock/wrapper holder — #770 12e4c0fd).
  */
 export function probeLiveAdvance(input: {
   domain: string;
@@ -362,6 +442,14 @@ export function probeLiveAdvance(input: {
     pipeline_run_id: string;
     events?: string;
   }) => boolean | null;
+  /**
+   * Injectable freshness check for non-terminal linkage. Default uses events
+   * (or run-dir) mtime against {@link ACTIVE_RUN_STORE_MAX_AGE_MS}.
+   */
+  isLinkageFresh?: (linkage: {
+    pipeline_run_id: string;
+    events?: string;
+  }) => boolean;
   /** Injectable non-terminal active run-store for the issue. */
   findActiveRunStore?: (issueNumber: number) => {
     pipeline_run_id: string;
@@ -369,7 +457,19 @@ export function probeLiveAdvance(input: {
   } | null;
   /** Injectable live wrapper PID for the issue (null/absent = none). */
   findWrapperPid?: (issueNumber: number) => number | null;
+  /**
+   * Pipeline run ids that must not count as live store/linkage evidence
+   * (typically the just-failed dispatch attempt on Pass-2).
+   */
+  ignorePipelineRunIds?: readonly string[];
+  nowMs?: number;
+  maxAgeMs?: number;
+  statMtimeMs?: (p: string) => number;
 }): LiveAdvanceProbeResult {
+  const ignored = new Set(
+    (input.ignorePipelineRunIds ?? []).filter((id) => typeof id === "string" && id.length > 0),
+  );
+
   // 1. Per-issue advisory lock held by a live process
   const lockPath = input.lockPathForTest ?? issueLockPath(input.domain, input.issueNumber);
   const held = isLockFileLive(lockPath);
@@ -377,26 +477,40 @@ export function probeLiveAdvance(input: {
     return { live: true, evidence: "lock_held", holder_pid: held.pid };
   }
 
-  // 2. Non-terminal loop linkage (terminal-aware — never treat terminal linkage as live)
+  // 2. Non-terminal + fresh loop linkage (never terminal; never aged crash forever)
   if (input.knownLinkage?.pipeline_run_id) {
-    const terminal = input.resolveLinkageTerminal
-      ? input.resolveLinkageTerminal(input.knownLinkage)
-      : resolveLinkageTerminalState(input.knownLinkage, { repoDir: input.repoDir });
-    if (terminal === false) {
-      return {
-        live: true,
-        evidence: "loop_linkage",
-        pipeline_run_id: input.knownLinkage.pipeline_run_id,
-        events_path: input.knownLinkage.events,
-      };
+    const linkId = input.knownLinkage.pipeline_run_id;
+    if (!ignored.has(linkId)) {
+      const terminal = input.resolveLinkageTerminal
+        ? input.resolveLinkageTerminal(input.knownLinkage)
+        : resolveLinkageTerminalState(input.knownLinkage, { repoDir: input.repoDir });
+      if (terminal === false) {
+        const fresh = input.isLinkageFresh
+          ? input.isLinkageFresh(input.knownLinkage)
+          : isNonTerminalLinkageFresh(input.knownLinkage, {
+              repoDir: input.repoDir,
+              nowMs: input.nowMs,
+              maxAgeMs: input.maxAgeMs,
+              statMtimeMs: input.statMtimeMs,
+            });
+        if (fresh) {
+          return {
+            live: true,
+            evidence: "loop_linkage",
+            pipeline_run_id: linkId,
+            events_path: input.knownLinkage.events,
+          };
+        }
+        // Stale non-terminal crash linkage: fall through
+      }
+      // terminal === true or null: fall through to other evidence sources
     }
-    // terminal === true or null: fall through to other evidence sources
   }
 
   // 3. Active (fresh, non-terminal) advance run-store for this issue
   if (input.findActiveRunStore) {
     const active = input.findActiveRunStore(input.issueNumber);
-    if (active) {
+    if (active && !ignored.has(active.pipeline_run_id)) {
       return {
         live: true,
         evidence: "active_run_store",
@@ -405,8 +519,12 @@ export function probeLiveAdvance(input: {
       };
     }
   } else if (input.repoDir) {
-    const active = findActiveRunStoreForIssue(input.repoDir, input.issueNumber);
-    if (active) {
+    const active = findActiveRunStoreForIssue(input.repoDir, input.issueNumber, {
+      nowMs: input.nowMs,
+      maxAgeMs: input.maxAgeMs,
+      statMtimeMs: input.statMtimeMs,
+    });
+    if (active && !ignored.has(active.pipeline_run_id)) {
       return {
         live: true,
         evidence: "active_run_store",

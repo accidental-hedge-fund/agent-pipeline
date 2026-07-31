@@ -3032,6 +3032,229 @@ test("regression (#770 b48730b7): default probe with stale crash store does not 
   }
 });
 
+test("regression (#770 12e4c0fd): aged linked crash artifact still escalates genuine defect (default wiring)", async () => {
+  // Concurrent pair so a failed sibling is reclassified via Pass-2 (serialized single-item rethrows).
+  const contract = testContract({
+    concurrency: { max_concurrent: 2 },
+    items: [
+      { id: "100", depends_on: [], ownership: { exclusive: ["src/a/**"] } },
+      { id: "754", depends_on: [], ownership: { exclusive: ["src/b/**"] } },
+    ],
+  });
+  // Retained non-terminal linkage from a prior crashed advance (aged on disk).
+  const crashId = "100-aged-linked-crash";
+  const ledger = testLedger({
+    "100": { ...itemEntry("100", "pending"), advance_run_id: crashId },
+    "754": itemEntry("754", "pending"),
+  });
+  const { deps } = await setup(contract, ledger);
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels(issueNumber) {
+      const id = String(issueNumber);
+      return {
+        state: "open",
+        labels:
+          id === "754"
+            ? [READY_LABEL, PIPELINE_READY_LABEL]
+            : [PIPELINE_READY_LABEL, "pipeline:review-1"],
+      };
+    },
+    async findPrForIssue(issueNumber) {
+      return String(issueNumber) === "754" ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/x", head_sha: "abc", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents(issueNumber) {
+      return String(issueNumber) === "100"
+        ? [{ label: "pipeline:review-1", createdAt: "2026-07-22T00:00:00.000Z" }]
+        : [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    if (request.item_id === "100") {
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "engine_internal_crash" as LoopExecutionResponse["outcome"],
+        evidence: { pr_number: null, pipeline_run_id: crashId },
+      };
+    }
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "loop-aged-link-770-"));
+  const dir = path.join(repo, ".agent-pipeline", "runs", crashId);
+  fs.mkdirSync(dir, { recursive: true });
+  const eventsPath = path.join(dir, "events.jsonl");
+  fs.writeFileSync(eventsPath, JSON.stringify({ type: "stage_start", stage: "fix" }) + "\n");
+  const old = (Date.now() - ACTIVE_RUN_STORE_MAX_AGE_MS - 180_000) / 1000;
+  fs.utimesSync(dir, old, old);
+  fs.utimesSync(eventsPath, old, old);
+
+  try {
+    // Pre-dispatch must not treat aged linkage as live (would skip dispatch entirely).
+    // Pass-2 must not reclassify the crash as coexistence via stale linkage.
+    const result = await driveSupervisor(
+      {
+        store: deps,
+        observe,
+        dispatchItem,
+        repoDir: repo,
+        lockDomain: "agent-pipeline",
+        // No probeLiveAdvance override — production default path.
+      },
+      { runId: "run-1", engine: "claude" },
+    );
+
+    assert.equal(result.stop?.reason, "run_fatal", "aged linked crash must not suppress run_fatal");
+    const finalLedger = await readLedger(deps, "run-1");
+    assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("regression (#770 12e4c0fd): freshly crashed linked advance escalates genuine defect (default wiring)", async () => {
+  // Concurrent pair for Pass-2 reclassification path.
+  const contract = testContract({
+    concurrency: { max_concurrent: 2 },
+    items: [
+      { id: "100", depends_on: [], ownership: { exclusive: ["src/a/**"] } },
+      { id: "754", depends_on: [], ownership: { exclusive: ["src/b/**"] } },
+    ],
+  });
+  const crashId = "100-fresh-linked-crash";
+  // Start with no linkage and no on-disk store — create the crash artifact only
+  // when the dispatch itself links (so pre-dispatch does not treat it as live).
+  const ledger = testLedger({
+    "100": itemEntry("100", "pending"),
+    "754": itemEntry("754", "pending"),
+  });
+  const { deps } = await setup(contract, ledger);
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels(issueNumber) {
+      const id = String(issueNumber);
+      return {
+        state: "open",
+        labels:
+          id === "754"
+            ? [READY_LABEL, PIPELINE_READY_LABEL]
+            : [PIPELINE_READY_LABEL, "pipeline:review-1"],
+      };
+    },
+    async findPrForIssue(issueNumber) {
+      return String(issueNumber) === "754" ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/x", head_sha: "abc", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents(issueNumber) {
+      return String(issueNumber) === "100"
+        ? [{ label: "pipeline:review-1", createdAt: "2026-07-22T00:00:00.000Z" }]
+        : [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "loop-fresh-link-770-"));
+  // Ensure runs root exists but do not pre-create the crash store (would block pre-dispatch).
+  fs.mkdirSync(path.join(repo, ".agent-pipeline", "runs"), { recursive: true });
+  const eventsPath = path.join(repo, ".agent-pipeline", "runs", crashId, "events.jsonl");
+
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request, hooks) => {
+    if (request.item_id === "100") {
+      // Mid-dispatch: create non-terminal crash store + start linkage, then fail.
+      const dir = path.dirname(eventsPath);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(eventsPath, JSON.stringify({ type: "stage_start", stage: "fix" }) + "\n");
+      const nowSec = Date.now() / 1000;
+      fs.utimesSync(dir, nowSec, nowSec);
+      fs.utimesSync(eventsPath, nowSec, nowSec);
+      await hooks?.onAdvanceLinked?.({
+        item_id: request.item_id,
+        pipeline_run_id: crashId,
+        events: eventsPath,
+      });
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "engine_internal_crash" as LoopExecutionResponse["outcome"],
+        evidence: { pr_number: null, pipeline_run_id: crashId },
+      };
+    }
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+
+  try {
+    const result = await driveSupervisor(
+      {
+        store: deps,
+        observe,
+        dispatchItem,
+        repoDir: repo,
+        lockDomain: "agent-pipeline",
+        // Default probe path — Pass-2 must ignore the failed attempt's own fresh
+        // linkage/run-store and still escalate without lock/wrapper holder.
+      },
+      { runId: "run-1", engine: "claude" },
+    );
+
+    assert.equal(
+      result.stop?.reason,
+      "run_fatal",
+      "fresh own crash linkage must not indefinitely reclassify as coexistence",
+    );
+    const finalLedger = await readLedger(deps, "run-1");
+    assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
+    const events = await readEvents(deps, "run-1");
+    assert.ok(
+      !events.some(
+        (e) =>
+          e.kind === "loop_item_coexistence_wait" &&
+          (e.data as { item_id?: string; reason?: string }).item_id === "100" &&
+          (e.data as { reason?: string }).reason !== "pre_dispatch_live_advance",
+      ),
+      "Pass-2 must not emit coexistence_wait for the genuine crash",
+    );
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test("regression (#770 ce4794fb): hold-clear with terminal linkage (probe not live) re-admits and dispatches", async () => {
   const contract = testContract({ items: [{ id: "675", depends_on: [] }] });
   const ledger = testLedger({

@@ -73,6 +73,7 @@ import {
 import {
   isCoexistenceFailureEvidence,
   probeLiveAdvance,
+  isConcurrentHolderEvidence,
   type LiveAdvanceProbeResult,
 } from "./live-advance.ts";
 
@@ -1219,16 +1220,20 @@ export async function runSupervisorCycle(
       if (preconditionNoOp) continue;
 
       // #770 Pass-2 coexistence safety net: lock / already-running / install-in-progress
-      // (or failed outcome with live lock/run-store/linkage probe) must never run_fatal.
+      // text, or a **concurrent holder** (live lock / wrapper), must never run_fatal.
+      // The failed attempt's own non-terminal linkage / fresh crash run-store alone
+      // must NOT reclassify as coexistence (#770 review 2 12e4c0fd) — ignore that
+      // run id and require lock_held / wrapper_pid (or structured text) for probe.live.
       let coexistenceNoOp = false;
       if (!needsHumanBlockerNoOp) {
         const errText = dispatchError ?? String(rawOutcomeByItem.get(itemId) ?? "");
         const domain = deps.lockDomain ?? "agent-pipeline";
         const itemEntry = ledger.items[itemId];
-        const knownLinkage =
+        const ownRunId =
           itemEntry?.advance_run_id && itemEntry.advance_run_id.length > 0
-            ? { pipeline_run_id: itemEntry.advance_run_id }
+            ? itemEntry.advance_run_id
             : null;
+        const knownLinkage = ownRunId ? { pipeline_run_id: ownRunId } : null;
         const probe: LiveAdvanceProbeResult = deps.probeLiveAdvance
           ? await deps.probeLiveAdvance(itemId)
           : probeLiveAdvance({
@@ -1237,14 +1242,18 @@ export async function runSupervisorCycle(
               repoDir: deps.repoDir,
               knownLinkage,
               findWrapperPid: deps.findWrapperPid,
+              // Exclude the just-failed attempt's store from live store/linkage evidence.
+              ignorePipelineRunIds: ownRunId ? [ownRunId] : [],
             });
-        if (isCoexistenceFailureEvidence(errText) || probe.live) {
+        const concurrentHolder =
+          probe.live && isConcurrentHolderEvidence(probe.evidence);
+        if (isCoexistenceFailureEvidence(errText) || concurrentHolder) {
           coexistenceNoOp = true;
           ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });
           evidenceOutcome = "coexistence_wait";
           await appendEvent(deps.store, runId, token, "loop_item_coexistence_wait", {
             item_id: itemId,
-            evidence: probe.live ? probe.evidence : "dispatch_text",
+            evidence: concurrentHolder ? probe.evidence : "dispatch_text",
             raw_outcome: errText,
           }).catch(() => {});
         }
