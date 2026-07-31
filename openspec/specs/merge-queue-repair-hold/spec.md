@@ -203,6 +203,17 @@ treat the mismatch as a surgical-repair hold.
 - **AND** SHALL NOT call `mergePr` for that PR
 - **AND** SHALL NOT invoke surgical repair solely to "fix" the wrong base
 
+#### Scenario: Merge write binds expected base server-side against retarget-to-merge race
+
+- **WHEN** the drive calls `mergePr` with a configured expected base after gates pass
+- **THEN** `mergePr` SHALL pass that expected base into the merge write (`ghPrMerge` opts)
+- **AND** the production merge write SHALL land on the named expected base via a
+  server-enforced base-bound squash (explicit base ref update), not solely via
+  `gh pr merge` which only binds head SHA
+- **AND** a unit test SHALL demonstrate that a retarget of the PR base between the
+  gate read and the merge write cannot redirect the destination away from the
+  expected base
+
 ---
 
 ### Requirement: Repair budget SHALL be bounded and exhaustion leaves a human hold with evidence

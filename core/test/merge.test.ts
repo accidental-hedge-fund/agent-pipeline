@@ -10,7 +10,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { mergePr, type MergeDeps, type RequiredCheck } from "../scripts/stages/merge.ts";
+import {
+  mergePr,
+  gitHeadsRefApiPath,
+  type GhPrMergeOptions,
+  type MergeDeps,
+  type RequiredCheck,
+} from "../scripts/stages/merge.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STAGES_DIR = path.join(__dirname, "..", "scripts", "stages");
@@ -22,9 +28,9 @@ const PIPELINE_SCRIPT = path.join(__dirname, "..", "scripts", "pipeline.ts");
 // ---------------------------------------------------------------------------
 
 function makeDeps(overrides: Partial<MergeDeps> = {}): MergeDeps & {
-  mergeCalls: Array<{ pr: number; headRefOid: string }>;
+  mergeCalls: Array<{ pr: number; headRefOid: string; opts?: GhPrMergeOptions }>;
 } {
-  const mergeCalls: Array<{ pr: number; headRefOid: string }> = [];
+  const mergeCalls: Array<{ pr: number; headRefOid: string; opts?: GhPrMergeOptions }> = [];
   const base: MergeDeps = {
     async ghPrView(_pr, _fields) {
       return {
@@ -39,8 +45,8 @@ function makeDeps(overrides: Partial<MergeDeps> = {}): MergeDeps & {
     async ghPrChecksAll(_pr): Promise<RequiredCheck[]> {
       return [{ name: "ci", bucket: "pass" }];
     },
-    async ghPrMerge(pr, headRefOid) {
-      mergeCalls.push({ pr, headRefOid });
+    async ghPrMerge(pr, headRefOid, opts) {
+      mergeCalls.push({ pr, headRefOid, opts });
     },
     async getIssueLabels(_issueNumber) {
       return ["pipeline:ready-to-deploy"];
@@ -610,6 +616,103 @@ test("merge: empty headRefOid aborts before merge (guards against missing SHA)",
     },
   );
   assert.equal(deps.mergeCalls.length, 0, "ghPrMerge must not be called when headRefOid is empty");
+});
+
+// ---------------------------------------------------------------------------
+// 4.12b Base-bound merge: retarget-to-merge race (finding 3de99c1e / #675)
+//
+// Client-side baseRefName checks alone are TOCTOU: a PR can be retargeted after
+// the gate read without changing head SHA. When expectedBaseBranch is set,
+// mergePr MUST thread it into ghPrMerge so the production write binds the
+// destination server-side (named base ref), not the PR's live base at merge time.
+// ---------------------------------------------------------------------------
+
+test("merge: expectedBaseBranch is threaded into ghPrMerge for server-side base binding", async () => {
+  const deps = makeDeps({
+    expectedBaseBranch: "main",
+    async ghPrView(_pr, fields) {
+      assert.ok(fields.includes("baseRefName"), "gate must request baseRefName");
+      return {
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN",
+        headRefOid: "abc123def456",
+        baseRefName: "main",
+      };
+    },
+  });
+  await mergePr(42, deps);
+  assert.equal(deps.mergeCalls.length, 1);
+  assert.equal(
+    deps.mergeCalls[0].opts?.expectedBaseBranch,
+    "main",
+    "ghPrMerge must receive expectedBaseBranch so the write can bind destination",
+  );
+});
+
+test("merge: retarget between gate read and merge cannot redirect destination base", async () => {
+  // Simulate a concurrent retarget after the gate observes base=main: the live
+  // PR base becomes "staging", but the merge write must still be invoked with
+  // expectedBaseBranch=main (server-enforced destination), never liveBase.
+  let liveBase = "main";
+  const destinations: string[] = [];
+  const deps = makeDeps({
+    expectedBaseBranch: "main",
+    async ghPrView(_pr, _fields) {
+      return {
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN",
+        headRefOid: "abc123def456",
+        baseRefName: liveBase,
+      };
+    },
+    async ghPrMerge(_pr, _head, opts) {
+      // Retarget races in after the gate read and before the write body:
+      liveBase = "staging";
+      // Production base-bound path uses opts.expectedBaseBranch as the ref to
+      // update — not the PR's live baseRefName — so destination stays "main".
+      const dest = opts?.expectedBaseBranch;
+      if (!dest) {
+        throw new Error("expected base-bound merge opts; refusing live-base merge");
+      }
+      destinations.push(dest);
+    },
+  });
+  await mergePr(42, deps);
+  assert.deepEqual(
+    destinations,
+    ["main"],
+    "merge destination must remain the expected base despite mid-flight retarget",
+  );
+  assert.equal(liveBase, "staging", "retarget occurred; destination still bound to main");
+  assert.notEqual(
+    destinations[0],
+    liveBase,
+    "regression: destination must not follow the retargeted live PR base",
+  );
+});
+
+test("merge: without expectedBaseBranch, ghPrMerge is not given a base bind option", async () => {
+  const deps = makeDeps();
+  await mergePr(42, deps);
+  assert.equal(deps.mergeCalls.length, 1);
+  assert.equal(
+    deps.mergeCalls[0].opts?.expectedBaseBranch,
+    undefined,
+    "human pipeline merge path keeps head-only gh pr merge binding",
+  );
+});
+
+test("gitHeadsRefApiPath encodes nested branch segments", () => {
+  assert.equal(gitHeadsRefApiPath("main", false), "git/ref/heads/main");
+  assert.equal(gitHeadsRefApiPath("main", true), "git/refs/heads/main");
+  assert.equal(
+    gitHeadsRefApiPath("release/1.0", false),
+    "git/ref/heads/release/1.0",
+  );
+  assert.equal(
+    gitHeadsRefApiPath("feature/a b", true),
+    "git/refs/heads/feature/a%20b",
+  );
 });
 
 // ---------------------------------------------------------------------------

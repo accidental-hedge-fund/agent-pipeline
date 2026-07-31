@@ -89,10 +89,12 @@ After confirming checks pass, the handler SHALL resolve the GitHub issue linked 
 ---
 
 ### Requirement: The `merge` sub-command SHALL squash-merge and delete the branch on success
-When all gates pass, the handler SHALL invoke `gh pr merge <pr> --squash --delete-branch --match-head-commit <headRefOid>` where `headRefOid` is the PR head commit SHA fetched in the same `gh pr view` call used for the mergeability gate. The `--match-head-commit` flag binds the merge to the inspected head SHA and causes `gh` to abort if a new commit was pushed between gate inspection and merge execution, closing the TOCTOU race. The handler SHALL print a confirmation message on success and exit 0.
+When all gates pass and `MergeDeps.expectedBaseBranch` is **not** set, the handler SHALL invoke `gh pr merge <pr> --squash --delete-branch --match-head-commit <headRefOid>` where `headRefOid` is the PR head commit SHA fetched in the same `gh pr view` call used for the mergeability gate. The `--match-head-commit` flag binds the merge to the inspected head SHA and causes `gh` to abort if a new commit was pushed between gate inspection and merge execution, closing the head TOCTOU race. The handler SHALL print a confirmation message on success and exit 0.
+
+When `MergeDeps.expectedBaseBranch` **is** set (merge-queue drive), after the same gates pass (including an early refuse if live `baseRefName` does not match the expected base), the handler SHALL perform a **base-bound squash** onto that named base branch: create a squash commit whose tree is the inspected head and whose parent is the current tip of the expected base, then fast-forward-update only `refs/heads/<expectedBaseBranch>` (non-force). The irreversible write SHALL target the named expected base ref — not the PR's live `baseRefName` at merge time — so a PR retarget between the gate read and the write cannot land the merge on another base. The handler SHALL then best-effort close the PR and delete the head branch (parity with `--delete-branch`).
 
 #### Scenario: Successful squash merge
-- **WHEN** all three gates pass (mergeable, checks, issue stage)
+- **WHEN** all three gates pass (mergeable, checks, issue stage) and `expectedBaseBranch` is unset
 - **THEN** the handler invokes `gh pr merge <pr> --squash --delete-branch --match-head-commit <headRefOid>`
 - **AND** prints a confirmation message including the PR number
 - **AND** exits 0
@@ -108,6 +110,16 @@ When all gates pass, the handler SHALL invoke `gh pr merge <pr> --squash --delet
 #### Scenario: Merge API error is surfaced
 - **WHEN** `gh pr merge` exits non-zero for any reason other than branch already deleted
 - **THEN** the handler SHALL exit non-zero with the `gh` error output surfaced to the user
+
+#### Scenario: Expected base threads into base-bound merge write
+- **WHEN** `MergeDeps.expectedBaseBranch` is set and the PR's live base matches at the pre-merge gate
+- **THEN** the handler SHALL invoke `ghPrMerge` with `opts.expectedBaseBranch` equal to that expected base
+- **AND** the production write SHALL bind the destination to that named base ref server-side
+
+#### Scenario: Retarget after gate cannot redirect base-bound destination
+- **WHEN** `expectedBaseBranch` is set, the gate observed a matching `baseRefName`, and the PR is retargeted to another base before the merge write completes
+- **THEN** the base-bound write SHALL still update only `refs/heads/<expectedBaseBranch>`
+- **AND** SHALL NOT land the squash on the retargeted base
 
 ---
 

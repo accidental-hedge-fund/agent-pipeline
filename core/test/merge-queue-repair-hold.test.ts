@@ -1276,3 +1276,46 @@ test("realDriveDeps: threads expectedBaseBranch into mergePr gate", async () => 
     "merge gate must request baseRefName when expected base is set",
   );
 });
+
+test("realDriveDeps: matching base threads expectedBase into ghPrMerge opts (base-bound write)", async () => {
+  const mergeOpts: Array<{ expectedBaseBranch?: string } | undefined> = [];
+  const mergeDeps: MergeDeps = {
+    async ghPrView() {
+      return {
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN",
+        headRefOid: "head-sha",
+        baseRefName: "main",
+      };
+    },
+    async ghPrChecksRequired() {
+      return [{ name: "ci", bucket: "pass" }];
+    },
+    async ghPrChecksAll() {
+      return [{ name: "ci", bucket: "pass" }];
+    },
+    async ghPrMerge(_pr, _head, opts) {
+      mergeOpts.push(opts);
+    },
+    async getIssueLabels() {
+      return ["pipeline:ready-to-deploy"];
+    },
+    async getPrLinkedIssue() {
+      return 1;
+    },
+    async getPrForIssue() {
+      return 10;
+    },
+    log() {},
+  };
+  const drive = realDriveDeps("o/r", mergeDeps, undefined, {
+    expectedBaseBranch: "main",
+  });
+  await drive.mergePr(10);
+  assert.equal(mergeOpts.length, 1);
+  assert.equal(
+    mergeOpts[0]?.expectedBaseBranch,
+    "main",
+    "queue merge write must receive expectedBase for server-side base binding",
+  );
+});
