@@ -267,6 +267,11 @@ export interface CliOpts {
   /** Release: skip opening $EDITOR for ROADMAP review (commit scaffolded ROADMAP as-is).
    *  Commander's `--no-edit` sets `edit: false` here. */
   edit?: boolean;
+  /**
+   * factory-gate: post-pass pack auto-close (#754). Default true.
+   * Commander's `--no-close-pack` sets `closePack: false`.
+   */
+  closePack?: boolean;
   /** Intake: short free-text description to spec into a GitHub issue. */
   description?: string;
   /** refine-spec: existing issue title to refine. */
@@ -513,6 +518,10 @@ export function buildCmd(): Command {
     .addOption(new Option("-m, --message <text>", "free-text friction message to record").hideHelp())
     .option("--for <version>", "factory-gate: target release version X.Y.Z (required)", undefined)
     .option("--from-run <run-id>", "factory-gate: score an existing durable loop run id")
+    .option(
+      "--no-close-pack",
+      "factory-gate: skip auto-close of synthetic pack PRs/issues after a release-eligible pass",
+    )
     .option("--since <date>", "improve/scoreboard: restrict analysis to runs on or after this ISO date (e.g. 2026-06-01)")
     .option("--until <date>", "scoreboard: restrict analysis to runs on or before this ISO date (e.g. 2026-06-15)")
     .option("--days <n>", "scoreboard: analyze the last N days (default: 30)", Number)
@@ -2653,9 +2662,10 @@ async function main(): Promise<void> {
     return;
   }
 
-  // `pipeline factory-gate --for <version> [--from-run <id>] [--json]` (#723).
+  // `pipeline factory-gate --for <version> [--from-run <id>] [--json] [--no-close-pack]` (#723/#754).
   // Scores a durable loop (or refuses without --from-run) and writes FRG evidence.
-  // No GitHub mutation; never merges or tags.
+  // Never merges or tags. After a release-eligible pass, closes synthetic pack
+  // PRs/issues without merge unless --no-close-pack.
   if (numArg === "factory-gate") {
     const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
     const repoDir = findGitRoot(startDir) ?? startDir;
@@ -2663,18 +2673,38 @@ async function main(): Promise<void> {
     if (!versionArg) {
       console.error(
         "pipeline factory-gate: --for <X.Y.Z> is required.\n" +
-          "  Usage: pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> [--json]\n" +
+          "  Usage: pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> [--json] [--no-close-pack]\n" +
           "  See docs/factory-reliability-gate-runbook.md",
       );
       process.exit(2);
     }
     const { runFactoryGate } = await import("./factory-reliability-gate.ts");
     const { defaultLoopStoreDeps, readLedger, readContract } = await import("./loop/store.ts");
+    const {
+      getIssueStateAndLabels,
+      listOpenPrsForIssue,
+      closePr,
+      closeIssue,
+    } = await import("./gh.ts");
     try {
       const storeDeps = defaultLoopStoreDeps();
       // Always inject ledger/contract loaders so scoring reuses the durable loop
       // store (no second ledger). Operator starts the pack with `pipeline loop`
       // (shipped runtime), then scores with --from-run.
+      // Lazy cfg: only resolveConfig (gh) when post-pass close actually runs.
+      let packCfg: PipelineConfig | null = null;
+      const getPackCfg = (): PipelineConfig => {
+        if (!packCfg) {
+          packCfg = resolveConfig({
+            repoPath: opts.repoPath ?? repoDir,
+            baseBranch: opts.base,
+            profile: opts.profile,
+          });
+        }
+        return packCfg;
+      };
+      // Commander `--no-close-pack` sets closePack=false (same as --no-edit → edit).
+      const noClosePack = opts.closePack === false;
       const result = await runFactoryGate({
         version: versionArg,
         repoDir,
@@ -2682,6 +2712,20 @@ async function main(): Promise<void> {
         label: opts.label,
         milestone: opts.milestone,
         json: !!opts.json,
+        noClosePack,
+        packCloseDeps: noClosePack
+          ? undefined
+          : {
+              getIssueStateAndLabels: async (issueNumber) =>
+                getIssueStateAndLabels(getPackCfg(), issueNumber),
+              // All open associated PRs — not getPrForIssue singleton (#754 review-2).
+              findOpenPrsForIssue: async (issueNumber) =>
+                listOpenPrsForIssue(getPackCfg(), issueNumber),
+              closePr: async (prNumber, comment) =>
+                closePr(getPackCfg(), prNumber, comment),
+              closeIssue: async (issueNumber, comment) =>
+                closeIssue(getPackCfg(), issueNumber, comment),
+            },
         loadLedger: async (runId) => readLedger(storeDeps, runId),
         loadContract: async (runId) => {
           try {

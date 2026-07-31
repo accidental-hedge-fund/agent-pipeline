@@ -8,7 +8,8 @@
 // for the resolved version and fails closed when missing, unparsable, or failed.
 //
 // FRG observes and scores only — it never merges PRs, enables auto-merge, or
-// creates release tags (golden rule #4).
+// creates release tags (golden rule #4). After a release-eligible pass it MAY
+// close synthetic pack PRs/issues without merging as post-pass hygiene (#754).
 
 import * as crypto from "node:crypto";
 import * as fsp from "node:fs/promises";
@@ -1107,6 +1108,176 @@ export function validateFrgPackContract(contract: LoopContract): FrgPackValidati
 }
 
 // ---------------------------------------------------------------------------
+// Post-pass pack auto-close (#754)
+// ---------------------------------------------------------------------------
+
+/**
+ * Deterministic close comment for synthetic factory-gate pack PRs/issues after
+ * a release-eligible FRG pass. Auditable; no free-form LLM text.
+ */
+export function formatFrgPackCloseComment(version: string, runId: string): string {
+  return (
+    `FRG ${version} pass (run_id=${runId}): synthetic factory-gate pack item ` +
+    `scored ready-to-deploy; closing without merge.`
+  );
+}
+
+/** Parse a scoreboard `item_id` as a positive GitHub issue number, or null. */
+export function parseFrgItemIssueNumber(itemId: string): number | null {
+  const trimmed = itemId.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  if (!Number.isInteger(n) || n <= 0) return null;
+  return n;
+}
+
+/**
+ * Pack label required on an issue before auto-close. Label selectors use their
+ * value; milestone packs fall back to the primary allowed label (`factory-gate`)
+ * so product work is never closed by label-less coincidence.
+ */
+export function packLabelFromSelector(selector: unknown): string {
+  if (selector !== null && typeof selector === "object" && !Array.isArray(selector)) {
+    const s = selector as { type?: unknown; value?: unknown };
+    if (s.type === "label" && typeof s.value === "string" && s.value.trim() !== "") {
+      return s.value.trim();
+    }
+  }
+  return FRG_PACK_MANIFEST.allowed_label_selectors[0];
+}
+
+/**
+ * Scoreboard-only candidate set: `ready_clean` items with parseable issue ids.
+ * Does not hit GitHub; callers still filter by pack label and open state.
+ */
+export function selectReadyCleanPackIssueNumbers(
+  scoreboard: FrgScoreboard,
+): { item_id: string; issueNumber: number }[] {
+  const out: { item_id: string; issueNumber: number }[] = [];
+  for (const it of scoreboard.per_item) {
+    if (!it.ready_clean) continue;
+    const issueNumber = parseFrgItemIssueNumber(it.item_id);
+    if (issueNumber === null) continue;
+    out.push({ item_id: it.item_id, issueNumber });
+  }
+  return out;
+}
+
+/** Injectable GitHub seams for post-pass pack close (no merge APIs). */
+export interface FrgPackCloseDeps {
+  getIssueStateAndLabels(
+    issueNumber: number,
+  ): Promise<{ state: "open" | "closed"; labels: string[] } | null>;
+  /**
+   * Every open PR associated with the issue (pipeline branch and/or same-repo
+   * closing ref). Singleton resolvers leave abandoned drafts open (#754 review-2).
+   */
+  findOpenPrsForIssue(issueNumber: number): Promise<number[]>;
+  /** Close PR without merging; post the deterministic FRG comment. */
+  closePr(prNumber: number, comment: string): Promise<void>;
+  /** Close issue with the same deterministic FRG comment. */
+  closeIssue(issueNumber: number, comment: string): Promise<void>;
+}
+
+export interface FrgPackCloseResult {
+  closedPrs: number[];
+  closedIssues: number[];
+  skipped: { issueNumber: number; reason: string }[];
+  errors: string[];
+}
+
+/**
+ * Post-pass hygiene: close open PRs and linked open issues for ready_clean pack
+ * items that still carry the pack selector label. Fail-soft (errors reported,
+ * remaining candidates still attempted). Never merges.
+ *
+ * Call only after release-eligible `pass: true` evidence has been written.
+ */
+export async function closeFrgPackArtifacts(
+  evidence: FrgEvidence,
+  packLabel: string,
+  deps: FrgPackCloseDeps,
+  log: (msg: string) => void = () => {},
+): Promise<FrgPackCloseResult> {
+  const result: FrgPackCloseResult = {
+    closedPrs: [],
+    closedIssues: [],
+    skipped: [],
+    errors: [],
+  };
+  const comment = formatFrgPackCloseComment(evidence.version, evidence.run_id);
+  const candidates = selectReadyCleanPackIssueNumbers(evidence.scoreboard);
+
+  for (const { item_id, issueNumber } of candidates) {
+    let stateLabels: { state: "open" | "closed"; labels: string[] } | null;
+    try {
+      stateLabels = await deps.getIssueStateAndLabels(issueNumber);
+    } catch (err) {
+      const msg =
+        `issue #${issueNumber} (item ${item_id}): label/state lookup failed: ` +
+        `${(err as Error).message}`;
+      result.errors.push(msg);
+      log(`[pipeline factory-gate] pack close: ${msg}`);
+      continue;
+    }
+    if (!stateLabels) {
+      result.skipped.push({ issueNumber, reason: "issue not found" });
+      continue;
+    }
+    if (!stateLabels.labels.includes(packLabel)) {
+      result.skipped.push({
+        issueNumber,
+        reason: `missing pack label "${packLabel}"`,
+      });
+      continue;
+    }
+
+    let prNumbers: number[] = [];
+    try {
+      prNumbers = await deps.findOpenPrsForIssue(issueNumber);
+    } catch (err) {
+      const msg =
+        `issue #${issueNumber}: open PR lookup failed: ${(err as Error).message}`;
+      result.errors.push(msg);
+      log(`[pipeline factory-gate] pack close: ${msg}`);
+    }
+
+    // Close each open associated PR independently (fail-soft per PR). A
+    // singleton resolver leaves replacement/abandoned drafts open (#754).
+    for (const prNumber of prNumbers) {
+      try {
+        await deps.closePr(prNumber, comment);
+        result.closedPrs.push(prNumber);
+        log(
+          `[pipeline factory-gate] pack close: closed PR #${prNumber} (issue #${issueNumber})`,
+        );
+      } catch (err) {
+        const msg =
+          `PR #${prNumber} (issue #${issueNumber}): close failed: ${(err as Error).message}`;
+        result.errors.push(msg);
+        log(`[pipeline factory-gate] pack close: ${msg}`);
+      }
+    }
+
+    if (stateLabels.state === "closed") {
+      result.skipped.push({ issueNumber, reason: "issue already closed" });
+      continue;
+    }
+    try {
+      await deps.closeIssue(issueNumber, comment);
+      result.closedIssues.push(issueNumber);
+      log(`[pipeline factory-gate] pack close: closed issue #${issueNumber}`);
+    } catch (err) {
+      const msg = `issue #${issueNumber}: close failed: ${(err as Error).message}`;
+      result.errors.push(msg);
+      log(`[pipeline factory-gate] pack close: ${msg}`);
+    }
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Driver CLI
 // ---------------------------------------------------------------------------
 
@@ -1136,6 +1307,21 @@ export interface FactoryGateOpts {
    */
   writeEvidence?: boolean;
   /**
+   * Skip post-pass synthetic pack auto-close (#754). Default: false (close on
+   * release-eligible pass when {@link packCloseDeps} is provided).
+   */
+  noClosePack?: boolean;
+  /**
+   * Pack selector label required on issues before auto-close (default:
+   * `factory-gate` / value from the scored contract).
+   */
+  packSelectorLabel?: string;
+  /**
+   * Injectable GitHub close seams. When omitted, post-pass close is a no-op
+   * (unit tests without network). Production CLI injects real `gh` wrappers.
+   */
+  packCloseDeps?: FrgPackCloseDeps;
+  /**
    * Start a durable loop for the pack (production path). Injected so unit tests
    * never spawn a real loop. Returns the loop run id when complete.
    */
@@ -1163,11 +1349,14 @@ export interface FactoryGateResult {
   evidencePath: string | null;
   latestPath: string | null;
   exitCode: number;
+  /** Post-pass pack close summary, or null when close did not run. */
+  packClose: FrgPackCloseResult | null;
 }
 
 /**
  * Run the FRG driver: score (from ledger / fixture / started loop), write
- * evidence, return pass/fail. Does not merge or tag.
+ * evidence, return pass/fail. Does not merge or tag. After a release-eligible
+ * pass with evidence written, may close synthetic pack PRs/issues (#754).
  */
 export async function runFactoryGate(
   opts: FactoryGateOpts,
@@ -1185,6 +1374,9 @@ export async function runFactoryGate(
         : true;
 
   let computeInput: ComputeFrgInput;
+  /** Pack label for post-pass close filter; refined when a contract is loaded. */
+  let packSelectorLabel =
+    opts.packSelectorLabel ?? FRG_PACK_MANIFEST.allowed_label_selectors[0];
 
   if (opts.scoreInput) {
     computeInput = {
@@ -1217,6 +1409,9 @@ export async function runFactoryGate(
       throw new Error(
         `pipeline factory-gate: refused to score non-pack run ${opts.fromRun}: ${packCheck.detail}`,
       );
+    }
+    if (opts.packSelectorLabel === undefined) {
+      packSelectorLabel = packLabelFromSelector(contract.selector);
     }
     const ledger = await opts.loadLedger(opts.fromRun);
     const items = itemsFromLoopLedger(ledger);
@@ -1264,6 +1459,9 @@ export async function runFactoryGate(
           );
         }
       }
+      if (opts.packSelectorLabel === undefined && labels[0]) {
+        packSelectorLabel = labels[0];
+      }
     }
     stderr(
       `[pipeline factory-gate] starting durable loop for FRG pack (version ${version})…`,
@@ -1292,6 +1490,9 @@ export async function runFactoryGate(
           throw new Error(
             `pipeline factory-gate: started loop ${loop_run_id} is not FRG fixed pack: ${packCheck.detail}`,
           );
+        }
+        if (opts.packSelectorLabel === undefined) {
+          packSelectorLabel = packLabelFromSelector(contract.selector);
         }
         notes.push(
           `FRG fixed pack validated: pack_id=${FRG_PACK_MANIFEST.pack_id} selector=${JSON.stringify(contract.selector)}`,
@@ -1331,6 +1532,34 @@ export async function runFactoryGate(
     latestPath = written.latestPath;
   }
 
+  // Post-pass pack disposition (#754): only after durable evidence write on a
+  // release-eligible pass. Fail-soft; never flips pass or deletes evidence.
+  let packClose: FrgPackCloseResult | null = null;
+  const releaseEligible = isReleaseEligibleFrgPass(evidence);
+  if (
+    writeEvidence &&
+    evidence.pass &&
+    releaseEligible &&
+    !opts.noClosePack &&
+    opts.packCloseDeps
+  ) {
+    packClose = await closeFrgPackArtifacts(
+      evidence,
+      packSelectorLabel,
+      opts.packCloseDeps,
+      stderr,
+    );
+  } else if (
+    writeEvidence &&
+    evidence.pass &&
+    releaseEligible &&
+    opts.noClosePack
+  ) {
+    stderr(
+      "[pipeline factory-gate] --no-close-pack: skipping synthetic pack auto-close",
+    );
+  }
+
   if (opts.json) {
     stdout(JSON.stringify(evidence, null, 2));
   } else {
@@ -1349,11 +1578,25 @@ export async function runFactoryGate(
       stdout(`  scenario ${s.id}: ${s.status} — ${s.detail}`);
     }
     if (evidencePath) stdout(`  evidence: ${evidencePath}`);
+    if (packClose) {
+      stdout(
+        `  pack close: PRs closed=[${packClose.closedPrs.join(",") || "none"}] ` +
+          `issues closed=[${packClose.closedIssues.join(",") || "none"}]` +
+          (packClose.errors.length
+            ? ` errors=${packClose.errors.length} (pass unchanged)`
+            : ""),
+      );
+    }
   }
 
   if (!evidence.pass) {
     stderr(
       `[pipeline factory-gate] FAIL — see docs/factory-reliability-gate-runbook.md`,
+    );
+  } else if (packClose && packClose.errors.length > 0) {
+    stderr(
+      `[pipeline factory-gate] pack auto-close reported ${packClose.errors.length} error(s); ` +
+        `FRG pass=${evidence.pass} and evidence paths are unchanged`,
     );
   }
 
@@ -1362,6 +1605,7 @@ export async function runFactoryGate(
     evidencePath,
     latestPath,
     exitCode: evidence.pass ? 0 : 1,
+    packClose,
   };
 }
 

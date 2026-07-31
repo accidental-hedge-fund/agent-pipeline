@@ -29,8 +29,14 @@ import {
   isAllowedFrgPackSelector,
   enforceRequiredScenarioCriteria,
   isReleaseEligibleFrgPass,
+  formatFrgPackCloseComment,
+  parseFrgItemIssueNumber,
+  packLabelFromSelector,
+  selectReadyCleanPackIssueNumbers,
+  closeFrgPackArtifacts,
   type FrgEvidence,
   type FrgFsDeps,
+  type FrgPackCloseDeps,
 } from "../scripts/factory-reliability-gate.ts";
 import type { LoopContract, LoopLedger } from "../scripts/loop/types.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
@@ -861,4 +867,526 @@ test("paths are stable under .agent-pipeline/frg", () => {
     frgRunEvidencePath("/repo", "1.2.3", "frg-x"),
     "/repo/.agent-pipeline/frg/1.2.3/frg-x/evidence.json",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Post-pass pack auto-close (#754)
+// ---------------------------------------------------------------------------
+
+function fakePackCloseDeps(opts: {
+  issues?: Record<
+    number,
+    {
+      state: "open" | "closed";
+      labels: string[];
+      /** Single open PR (convenience); prefer `prs` when multiple. */
+      pr?: number | null;
+      /** All open associated PRs for the issue (#754 multi-PR disposition). */
+      prs?: number[];
+    }
+  >;
+  closePrImpl?: (pr: number, comment: string) => Promise<void>;
+  closeIssueImpl?: (issue: number, comment: string) => Promise<void>;
+}): FrgPackCloseDeps & {
+  closedPrs: { pr: number; comment: string }[];
+  closedIssues: { issue: number; comment: string }[];
+  mergeCalls: number;
+} {
+  const issues = opts.issues ?? {};
+  const closedPrs: { pr: number; comment: string }[] = [];
+  const closedIssues: { issue: number; comment: string }[] = [];
+  return {
+    closedPrs,
+    closedIssues,
+    mergeCalls: 0,
+    getIssueStateAndLabels: async (n) => {
+      const row = issues[n];
+      if (!row) return null;
+      return { state: row.state, labels: row.labels };
+    },
+    findOpenPrsForIssue: async (n) => {
+      const row = issues[n];
+      if (!row) return [];
+      if (row.prs !== undefined) return [...row.prs];
+      if (row.pr === undefined || row.pr === null) return [];
+      return [row.pr];
+    },
+    closePr: async (pr, comment) => {
+      if (opts.closePrImpl) return opts.closePrImpl(pr, comment);
+      closedPrs.push({ pr, comment });
+    },
+    closeIssue: async (issue, comment) => {
+      if (opts.closeIssueImpl) return opts.closeIssueImpl(issue, comment);
+      closedIssues.push({ issue, comment });
+    },
+  };
+}
+
+test("formatFrgPackCloseComment is deterministic and cites version + run_id", () => {
+  const c = formatFrgPackCloseComment("1.29.1", "frg-abc");
+  assert.match(c, /FRG 1\.29\.1 pass \(run_id=frg-abc\)/);
+  assert.match(c, /closing without merge/);
+  assert.equal(c, formatFrgPackCloseComment("1.29.1", "frg-abc"));
+});
+
+test("parseFrgItemIssueNumber accepts positive integers only", () => {
+  assert.equal(parseFrgItemIssueNumber("749"), 749);
+  assert.equal(parseFrgItemIssueNumber(" 10 "), 10);
+  assert.equal(parseFrgItemIssueNumber("0"), null);
+  assert.equal(parseFrgItemIssueNumber("-1"), null);
+  assert.equal(parseFrgItemIssueNumber("issue-10"), null);
+  assert.equal(parseFrgItemIssueNumber(""), null);
+});
+
+test("packLabelFromSelector uses label value or factory-gate default", () => {
+  assert.equal(packLabelFromSelector({ type: "label", value: "factory-gate" }), "factory-gate");
+  assert.equal(packLabelFromSelector({ type: "milestone", value: "frg-pack" }), "factory-gate");
+  assert.equal(packLabelFromSelector(null), "factory-gate");
+});
+
+test("selectReadyCleanPackIssueNumbers only includes ready_clean scored items", () => {
+  const selected = selectReadyCleanPackIssueNumbers({
+    item_count: 3,
+    ready_clean_count: 1,
+    engine_class_count: 0,
+    product_class_count: 0,
+    human_authority_count: 0,
+    engine_class_rate: null,
+    per_item: [
+      { item_id: "10", state: "ready", ready_clean: true, blocker_theme: null, blocker_class: null },
+      { item_id: "20", state: "blocked", ready_clean: false, blocker_theme: null, blocker_class: null },
+      { item_id: "not-a-number", state: "ready", ready_clean: true, blocker_theme: null, blocker_class: null },
+    ],
+  });
+  assert.deepEqual(selected, [{ item_id: "10", issueNumber: 10 }]);
+});
+
+test("closeFrgPackArtifacts: closes open pack PR+issue with standard comment", async () => {
+  const evidence = computeFrgEvidence(fullPackPassInput({ run_id: "frg-close-1" }));
+  assert.equal(evidence.pass, true);
+  const deps = fakePackCloseDeps({
+    issues: {
+      1: { state: "open", labels: ["factory-gate"], pr: 101 },
+      2: { state: "open", labels: ["factory-gate"], pr: 102 },
+    },
+  });
+  const result = await closeFrgPackArtifacts(evidence, "factory-gate", deps);
+  const comment = formatFrgPackCloseComment(evidence.version, evidence.run_id);
+  assert.deepEqual(result.closedPrs.sort((a, b) => a - b), [101, 102]);
+  assert.deepEqual(result.closedIssues.sort((a, b) => a - b), [1, 2]);
+  assert.equal(result.errors.length, 0);
+  assert.ok(deps.closedPrs.every((c) => c.comment === comment));
+  assert.ok(deps.closedIssues.every((c) => c.comment === comment));
+  assert.equal(deps.mergeCalls, 0);
+});
+
+test("closeFrgPackArtifacts: closes every open PR for one ready_clean issue (#754 multi-PR)", async () => {
+  // fullPackPassInput scores items 1 and 2 ready_clean; multi-PR only on #1.
+  const evidence = computeFrgEvidence(fullPackPassInput({ run_id: "frg-multi-pr" }));
+  assert.equal(evidence.pass, true);
+  const deps = fakePackCloseDeps({
+    issues: {
+      // Replacement PR + abandoned draft both still open for the same pack item.
+      1: { state: "open", labels: ["factory-gate"], prs: [201, 202] },
+      2: { state: "open", labels: ["factory-gate"], pr: 102 },
+    },
+  });
+  const result = await closeFrgPackArtifacts(evidence, "factory-gate", deps);
+  assert.deepEqual(result.closedPrs.sort((a, b) => a - b), [102, 201, 202]);
+  assert.deepEqual(result.closedIssues.sort((a, b) => a - b), [1, 2]);
+  assert.equal(result.errors.length, 0);
+  // Fail-soft still closes remaining PRs when one of several fails for the same issue.
+  const soft = fakePackCloseDeps({
+    issues: {
+      1: { state: "open", labels: ["factory-gate"], prs: [301, 302] },
+      2: { state: "open", labels: ["factory-gate"], pr: 102 },
+    },
+  });
+  soft.closePr = async (pr, comment) => {
+    if (pr === 301) throw new Error("simulated close of first of two PRs");
+    soft.closedPrs.push({ pr, comment });
+  };
+  const softResult = await closeFrgPackArtifacts(evidence, "factory-gate", soft);
+  assert.ok(softResult.errors.some((e) => /PR #301/.test(e)));
+  assert.deepEqual(softResult.closedPrs.sort((a, b) => a - b), [102, 302]);
+  assert.deepEqual(softResult.closedIssues.sort((a, b) => a - b), [1, 2]);
+});
+
+test("closeFrgPackArtifacts: skips issues missing pack label (product never closed)", async () => {
+  const evidence = computeFrgEvidence(fullPackPassInput());
+  const deps = fakePackCloseDeps({
+    issues: {
+      1: { state: "open", labels: ["factory-gate"], pr: 101 },
+      2: { state: "open", labels: ["pipeline:ready-to-deploy"], pr: 999 },
+    },
+  });
+  const result = await closeFrgPackArtifacts(evidence, "factory-gate", deps);
+  assert.deepEqual(result.closedPrs, [101]);
+  assert.deepEqual(result.closedIssues, [1]);
+  assert.ok(result.skipped.some((s) => s.issueNumber === 2 && /missing pack label/.test(s.reason)));
+  assert.equal(deps.closedPrs.some((c) => c.pr === 999), false);
+});
+
+test("closeFrgPackArtifacts: already-closed resources skip without error", async () => {
+  const evidence = computeFrgEvidence(fullPackPassInput());
+  const deps = fakePackCloseDeps({
+    issues: {
+      1: { state: "closed", labels: ["factory-gate"], pr: null },
+      2: { state: "open", labels: ["factory-gate"], pr: null },
+    },
+  });
+  const result = await closeFrgPackArtifacts(evidence, "factory-gate", deps);
+  assert.deepEqual(result.closedIssues, [2]);
+  assert.ok(result.skipped.some((s) => s.issueNumber === 1 && /already closed/.test(s.reason)));
+  assert.equal(result.errors.length, 0);
+});
+
+test("closeFrgPackArtifacts: close error is fail-soft (best-effort continues)", async () => {
+  const evidence = computeFrgEvidence(fullPackPassInput({ run_id: "frg-soft" }));
+  const deps = fakePackCloseDeps({
+    issues: {
+      1: { state: "open", labels: ["factory-gate"], pr: 101 },
+      2: { state: "open", labels: ["factory-gate"], pr: 102 },
+    },
+  });
+  deps.closePr = async (pr, comment) => {
+    if (pr === 101) throw new Error("simulated gh pr close failure");
+    deps.closedPrs.push({ pr, comment });
+  };
+  const result = await closeFrgPackArtifacts(evidence, "factory-gate", deps);
+  assert.ok(result.errors.some((e) => /PR #101/.test(e)));
+  assert.deepEqual(result.closedPrs, [102]);
+  assert.deepEqual(result.closedIssues.sort((a, b) => a - b), [1, 2]);
+});
+
+test("runFactoryGate: release-eligible pass closes pack artifacts via injected deps", async () => {
+  const fs = memFs();
+  const deps = fakePackCloseDeps({
+    issues: {
+      10: { state: "open", labels: ["factory-gate"], pr: 751 },
+      20: { state: "open", labels: ["factory-gate"], pr: 752 },
+    },
+  });
+  const packContract = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: "loop-close",
+    selector: { type: "label", value: "factory-gate" },
+    items: [
+      { id: "10", depends_on: [], external_depends_on: [] },
+      { id: "20", depends_on: [], external_depends_on: [] },
+    ],
+  } as unknown as LoopContract;
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "loop-close",
+    items: {
+      "10": { state: "ready", history: [], recovery_attempts: [] },
+      "20": { state: "ready", history: [], recovery_attempts: [] },
+    },
+  } as unknown as LoopLedger;
+
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/repo",
+      fromRun: "loop-close",
+      loadLedger: async () => ledger,
+      loadContract: async () => packContract,
+      scenarioOverrides: frgRequiredObservationOverrides("pass"),
+      packCloseDeps: deps,
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.evidence.pass, true);
+  assert.ok(result.evidencePath);
+  assert.ok(result.packClose);
+  assert.deepEqual(result.packClose!.closedPrs.sort((a, b) => a - b), [751, 752]);
+  assert.deepEqual(result.packClose!.closedIssues.sort((a, b) => a - b), [10, 20]);
+  const comment = formatFrgPackCloseComment(result.evidence.version, result.evidence.run_id);
+  assert.ok(deps.closedPrs.every((c) => c.comment === comment));
+  // Evidence still on disk with pass true
+  const latest = await fs.readFile(frgLatestPath("/repo", "1.29.1"));
+  assert.equal(JSON.parse(latest).pass, true);
+});
+
+test("runFactoryGate: pass:false does not close pack artifacts", async () => {
+  const fs = memFs();
+  const deps = fakePackCloseDeps({
+    issues: {
+      10: { state: "open", labels: ["factory-gate"], pr: 1 },
+      20: { state: "open", labels: ["factory-gate"], pr: 2 },
+    },
+  });
+  const packContract = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: "loop-fail",
+    selector: { type: "label", value: "factory-gate" },
+    items: [
+      { id: "10", depends_on: [], external_depends_on: [] },
+      { id: "20", depends_on: [], external_depends_on: [] },
+    ],
+  } as unknown as LoopContract;
+  // Only one ready item → clean-item-throughput fails K=2
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "loop-fail",
+    items: {
+      "10": { state: "ready", history: [], recovery_attempts: [] },
+      "20": { state: "blocked", blocked_theme: "implementation-ci", history: [], recovery_attempts: [] },
+    },
+  } as unknown as LoopLedger;
+
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/repo",
+      fromRun: "loop-fail",
+      loadLedger: async () => ledger,
+      loadContract: async () => packContract,
+      scenarioOverrides: frgRequiredObservationOverrides("pass"),
+      packCloseDeps: deps,
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.evidence.pass, false);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.packClose, null);
+  assert.equal(deps.closedPrs.length, 0);
+  assert.equal(deps.closedIssues.length, 0);
+});
+
+test("runFactoryGate: non-release-eligible offline score does not close", async () => {
+  const fs = memFs();
+  const deps = fakePackCloseDeps({
+    issues: {
+      1: { state: "open", labels: ["factory-gate"], pr: 9 },
+      2: { state: "open", labels: ["factory-gate"], pr: 10 },
+    },
+  });
+  // scoreInput without writeEvidence: pass is false without loop/pack provenance
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/repo",
+      scoreInput: {
+        version: "1.29.1",
+        run_id: "offline",
+        loop_run_id: null,
+        pack_id: null,
+        items: [
+          { item_id: "1", state: "ready", ready_clean: true },
+          { item_id: "2", state: "ready", ready_clean: true },
+        ],
+        scenario_overrides: frgRequiredObservationOverrides("pass"),
+      },
+      packCloseDeps: deps,
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.evidence.pass, false);
+  assert.equal(result.packClose, null);
+  assert.equal(deps.closedPrs.length, 0);
+});
+
+test("runFactoryGate: --no-close-pack skips closes while keeping pass", async () => {
+  const fs = memFs();
+  const deps = fakePackCloseDeps({
+    issues: {
+      10: { state: "open", labels: ["factory-gate"], pr: 751 },
+      20: { state: "open", labels: ["factory-gate"], pr: 752 },
+    },
+  });
+  const packContract = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: "loop-optout",
+    selector: { type: "label", value: "factory-gate" },
+    items: [
+      { id: "10", depends_on: [], external_depends_on: [] },
+      { id: "20", depends_on: [], external_depends_on: [] },
+    ],
+  } as unknown as LoopContract;
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "loop-optout",
+    items: {
+      "10": { state: "ready", history: [], recovery_attempts: [] },
+      "20": { state: "ready", history: [], recovery_attempts: [] },
+    },
+  } as unknown as LoopLedger;
+  const stderrLines: string[] = [];
+
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/repo",
+      fromRun: "loop-optout",
+      loadLedger: async () => ledger,
+      loadContract: async () => packContract,
+      scenarioOverrides: frgRequiredObservationOverrides("pass"),
+      noClosePack: true,
+      packCloseDeps: deps,
+      stdout: () => {},
+      stderr: (m) => stderrLines.push(m),
+    },
+    fs,
+  );
+  assert.equal(result.evidence.pass, true);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.packClose, null);
+  assert.equal(deps.closedPrs.length, 0);
+  assert.equal(deps.closedIssues.length, 0);
+  assert.ok(stderrLines.some((l) => /--no-close-pack/.test(l)));
+  assert.ok(fs.files.has(frgLatestPath("/repo", "1.29.1")));
+});
+
+test("runFactoryGate: close error leaves pass and evidence intact (fail-soft)", async () => {
+  const fs = memFs();
+  const deps = fakePackCloseDeps({
+    issues: {
+      10: { state: "open", labels: ["factory-gate"], pr: 751 },
+      20: { state: "open", labels: ["factory-gate"], pr: 752 },
+    },
+  });
+  deps.closePr = async () => {
+    throw new Error("github unavailable");
+  };
+  const packContract = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: "loop-soft",
+    selector: { type: "label", value: "factory-gate" },
+    items: [
+      { id: "10", depends_on: [], external_depends_on: [] },
+      { id: "20", depends_on: [], external_depends_on: [] },
+    ],
+  } as unknown as LoopContract;
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "loop-soft",
+    items: {
+      "10": { state: "ready", history: [], recovery_attempts: [] },
+      "20": { state: "ready", history: [], recovery_attempts: [] },
+    },
+  } as unknown as LoopLedger;
+
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/repo",
+      fromRun: "loop-soft",
+      loadLedger: async () => ledger,
+      loadContract: async () => packContract,
+      scenarioOverrides: frgRequiredObservationOverrides("pass"),
+      packCloseDeps: deps,
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.evidence.pass, true);
+  assert.equal(result.exitCode, 0);
+  assert.ok(result.packClose);
+  assert.ok(result.packClose!.errors.length >= 1);
+  // Issues still closed (PR close failed but issue path continues)
+  assert.deepEqual(result.packClose!.closedIssues.sort((a, b) => a - b), [10, 20]);
+  const onDisk = JSON.parse(await fs.readFile(result.evidencePath!));
+  assert.equal(onDisk.pass, true);
+  assert.equal(onDisk.run_id, result.evidence.run_id);
+});
+
+test("runFactoryGate: without packCloseDeps, release pass does not call network (no-op close)", async () => {
+  // Regression / bite: production hook is optional when deps omitted; pass still writes.
+  const fs = memFs();
+  const packContract = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: "loop-nodeps",
+    selector: { type: "label", value: "factory-gate" },
+    items: [
+      { id: "10", depends_on: [], external_depends_on: [] },
+      { id: "20", depends_on: [], external_depends_on: [] },
+    ],
+  } as unknown as LoopContract;
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "loop-nodeps",
+    items: {
+      "10": { state: "ready", history: [], recovery_attempts: [] },
+      "20": { state: "ready", history: [], recovery_attempts: [] },
+    },
+  } as unknown as LoopLedger;
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/repo",
+      fromRun: "loop-nodeps",
+      loadLedger: async () => ledger,
+      loadContract: async () => packContract,
+      scenarioOverrides: frgRequiredObservationOverrides("pass"),
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.evidence.pass, true);
+  assert.equal(result.packClose, null);
+});
+
+test("runFactoryGate: item absent from scoreboard never closed even if labeled factory-gate", async () => {
+  const fs = memFs();
+  // Scoreboard only has 10 and 20; issue 999 is labeled but not on the scored run.
+  const lookedUp: number[] = [];
+  const deps = fakePackCloseDeps({
+    issues: {
+      10: { state: "open", labels: ["factory-gate"], pr: 1 },
+      20: { state: "open", labels: ["factory-gate"], pr: 2 },
+      999: { state: "open", labels: ["factory-gate"], pr: 999 },
+    },
+  });
+  const baseLookup = deps.getIssueStateAndLabels;
+  deps.getIssueStateAndLabels = async (n) => {
+    lookedUp.push(n);
+    return baseLookup(n);
+  };
+  const packContract = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: "loop-scope",
+    selector: { type: "label", value: "factory-gate" },
+    items: [
+      { id: "10", depends_on: [], external_depends_on: [] },
+      { id: "20", depends_on: [], external_depends_on: [] },
+    ],
+  } as unknown as LoopContract;
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "loop-scope",
+    items: {
+      "10": { state: "ready", history: [], recovery_attempts: [] },
+      "20": { state: "ready", history: [], recovery_attempts: [] },
+    },
+  } as unknown as LoopLedger;
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/repo",
+      fromRun: "loop-scope",
+      loadLedger: async () => ledger,
+      loadContract: async () => packContract,
+      scenarioOverrides: frgRequiredObservationOverrides("pass"),
+      packCloseDeps: deps,
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.evidence.pass, true);
+  assert.ok(!result.packClose!.closedIssues.includes(999));
+  assert.ok(!result.packClose!.closedPrs.includes(999));
+  assert.ok(!lookedUp.includes(999), "must not repo-wide sweep factory-gate issues");
+  assert.deepEqual(result.packClose!.closedIssues.sort((a, b) => a - b), [10, 20]);
 });

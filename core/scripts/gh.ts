@@ -1306,8 +1306,32 @@ export async function getUnresolvedReviewThreadCount(
   return isNaN(n) ? 0 : n;
 }
 
-export async function closePr(cfg: PipelineConfig, prNumber: number): Promise<void> {
-  await ghRun(["pr", "close", String(prNumber), "-R", cfg.repo]);
+export async function closePr(
+  cfg: PipelineConfig,
+  prNumber: number,
+  comment?: string,
+): Promise<void> {
+  const args = ["pr", "close", String(prNumber), "-R", cfg.repo];
+  if (comment !== undefined && comment !== "") {
+    args.push("--comment", comment);
+  }
+  await ghRun(args);
+}
+
+/**
+ * Close a GitHub issue, optionally leaving a closing comment (`gh issue close --comment`).
+ * Does not merge PRs; issue-only disposition.
+ */
+export async function closeIssue(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  comment?: string,
+): Promise<void> {
+  const args = ["issue", "close", String(issueNumber), "-R", cfg.repo];
+  if (comment !== undefined && comment !== "") {
+    args.push("--comment", comment);
+  }
+  await ghRun(args);
 }
 
 export async function reopenPr(cfg: PipelineConfig, prNumber: number): Promise<void> {
@@ -1559,30 +1583,60 @@ export function parsePrList(stdout: string): PrCandidate[] {
  *  Returns null when neither matches. Deliberately NO body/title text search —
  *  a PR that merely mentions `#N` must not resolve as issue N's PR (#76).
  *  Cross-repo closing refs (OWNER/REPO#N targeting a different repo) are ignored.
- *  Pure and synchronous: resolution does no per-PR API calls (#97). */
+ *  Pure and synchronous: resolution does no per-PR API calls (#97).
+ *  When multiple open PRs match (replacement + abandoned draft), returns the
+ *  first under the branch-then-closing-ref order; callers that must dispose
+ *  every match should use {@link resolveOpenPrsForIssue}. */
 export function resolvePrForIssue(
   prs: PrCandidate[],
   issueNumber: number,
   targetRepo: string,
 ): number | null {
+  const all = resolveOpenPrsForIssue(prs, issueNumber, targetRepo);
+  return all.length === 0 ? null : all[0]!;
+}
+
+/**
+ * All open PRs associated with an issue under the same dual strategies as
+ * {@link resolvePrForIssue} (pipeline branch prefix, then same-repo closing
+ * refs). Order: list order, branch matches first (same preference as the
+ * singleton resolver), then closing-ref-only matches; each PR number once.
+ * Pure / synchronous (#97). Used by FRG pack auto-close (#754) so multiple
+ * open associated PRs are not silently left open.
+ */
+export function resolveOpenPrsForIssue(
+  prs: PrCandidate[],
+  issueNumber: number,
+  targetRepo: string,
+): number[] {
   const branchPrefix = `pipeline/${issueNumber}-`;
+  const target = targetRepo.toLowerCase();
+  const seen = new Set<number>();
+  const out: number[] = [];
+
   for (const pr of prs) {
     // A fork PR's headRefName is only the branch name and can spoof the prefix,
     // so the fast path trusts it only for same-repo (non-fork) PRs (#76).
-    if (!pr.isCrossRepository && pr.headRefName.startsWith(branchPrefix)) return pr.number;
+    if (!pr.isCrossRepository && pr.headRefName.startsWith(branchPrefix)) {
+      if (!seen.has(pr.number)) {
+        seen.add(pr.number);
+        out.push(pr.number);
+      }
+    }
   }
 
-  const target = targetRepo.toLowerCase();
   for (const pr of prs) {
+    if (seen.has(pr.number)) continue;
     if (
       pr.closingIssues.some(
         (r) => r.nameWithOwner.toLowerCase() === target && r.number === issueNumber,
       )
     ) {
-      return pr.number;
+      seen.add(pr.number);
+      out.push(pr.number);
     }
   }
-  return null;
+  return out;
 }
 
 /** One page of open repository PRs from the GraphQL query in
@@ -1626,18 +1680,16 @@ export function mapOpenPrGraphQlNodes(nodes: OpenPrsPage["nodes"]): PrCandidate[
   }));
 }
 
-/** Resolve the open PR for an issue via dual strategy ({@link resolvePrForIssue}).
- *
- *  Enumerates **all** open PR candidates via paginated GraphQL (number + branch
- *  + fork flag + closing refs per node) so resolution never fans out to one
- *  `gh pr view` per open PR (#97) and never silently drops a match past a
- *  fixed first-page / `-L 100` window (#623 — same truncation class as #511's
- *  historical path). Optional {@link GhApiRunner} injects fakes for unit tests. */
-export async function getPrForIssue(
+/**
+ * Enumerate all open PR candidates via paginated GraphQL (shared by
+ * {@link getPrForIssue} and {@link listOpenPrsForIssue}). Fail-closed on
+ * GraphQL errors / missing connection / page safety bound (#623).
+ */
+async function fetchOpenPrCandidates(
   cfg: PipelineConfig,
-  issueNumber: number,
-  run: GhApiRunner = (args) => ghRun(args),
-): Promise<number | null> {
+  run: GhApiRunner,
+  caller: string,
+): Promise<PrCandidate[]> {
   const [owner, repo] = cfg.repo.split("/");
   const candidates: PrCandidate[] = [];
   let after: string | null = null;
@@ -1667,20 +1719,18 @@ export async function getPrForIssue(
       const messages = envelope.errors
         .map((e) => (typeof e.message === "string" && e.message ? e.message : "unknown"))
         .join("; ");
-      throw new Error(
-        `getPrForIssue: GraphQL errors for ${cfg.repo}: ${messages}`,
-      );
+      throw new Error(`${caller}: GraphQL errors for ${cfg.repo}: ${messages}`);
     }
     const pullRequests = envelope.data?.repository?.pullRequests;
     if (!pullRequests) {
       throw new Error(
-        `getPrForIssue: GraphQL response for ${cfg.repo} missing repository.pullRequests ` +
+        `${caller}: GraphQL response for ${cfg.repo} missing repository.pullRequests ` +
           `(null repository or connection — not an authoritative empty open-PR set)`,
       );
     }
     candidates.push(...mapOpenPrGraphQlNodes(pullRequests.nodes));
     if (!pullRequests.pageInfo.hasNextPage) {
-      return resolvePrForIssue(candidates, issueNumber, cfg.repo);
+      return candidates;
     }
     after = pullRequests.pageInfo.endCursor;
   }
@@ -1688,9 +1738,39 @@ export async function getPrForIssue(
   // Safety bound hit with more open PRs remaining — fail visibly rather than
   // return null as if the issue had no open PR (#623).
   throw new Error(
-    `getPrForIssue: open PR list for ${cfg.repo} exceeded safety bound ` +
+    `${caller}: open PR list for ${cfg.repo} exceeded safety bound ` +
       `(${OPEN_PRS_MAX_PAGES} pages × ${OPEN_PRS_PAGE_SIZE}); refusing to resolve after truncation`,
   );
+}
+
+/** Resolve the open PR for an issue via dual strategy ({@link resolvePrForIssue}).
+ *
+ *  Enumerates **all** open PR candidates via paginated GraphQL (number + branch
+ *  + fork flag + closing refs per node) so resolution never fans out to one
+ *  `gh pr view` per open PR (#97) and never silently drops a match past a
+ *  fixed first-page / `-L 100` window (#623 — same truncation class as #511's
+ *  historical path). Optional {@link GhApiRunner} injects fakes for unit tests. */
+export async function getPrForIssue(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  run: GhApiRunner = (args) => ghRun(args),
+): Promise<number | null> {
+  const candidates = await fetchOpenPrCandidates(cfg, run, "getPrForIssue");
+  return resolvePrForIssue(candidates, issueNumber, cfg.repo);
+}
+
+/**
+ * All open PRs associated with an issue (same dual strategies and open-list
+ * completeness as {@link getPrForIssue}). Used by FRG post-pass pack close so
+ * every open associated PR is disposed, not only the singleton match (#754).
+ */
+export async function listOpenPrsForIssue(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  run: GhApiRunner = (args) => ghRun(args),
+): Promise<number[]> {
+  const candidates = await fetchOpenPrCandidates(cfg, run, "listOpenPrsForIssue");
+  return resolveOpenPrsForIssue(candidates, issueNumber, cfg.repo);
 }
 
 /** One page of an issue's `CONNECTED_EVENT`/`CROSS_REFERENCED_EVENT` timeline,
