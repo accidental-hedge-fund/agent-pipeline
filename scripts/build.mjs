@@ -162,8 +162,8 @@ export const OPERATION_SURFACE = [
   },
   {
     name: "logs",
-    desc: "List or stream pipeline run logs",
-    argHint: "[<run-id>] [-f]",
+    desc: "List or stream pipeline run logs (events --follow exits 0 on run_complete; --no-until-terminal for interrupt-only)",
+    argHint: "[<run-id>] [--events] [-f]",
     cliArgs: "logs $ARGUMENTS",
     fast: true,
   },

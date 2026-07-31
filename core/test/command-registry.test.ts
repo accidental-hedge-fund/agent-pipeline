@@ -202,6 +202,15 @@ test("command-registry: loop.allowedFlags includes follow, events, untilTerminal
   assert.deepEqual(validateFlags(entry, fakeCmdWithCliFlag("untilTerminal")), []);
 });
 
+test("command-registry: logs.allowedFlags includes untilTerminal for advance events follow (#725)", () => {
+  const entry = COMMAND_REGISTRY.logs;
+  const flags = entry.allowedFlags as Set<string>;
+  assert.ok(flags.has("follow"));
+  assert.ok(flags.has("events"));
+  assert.ok(flags.has("untilTerminal"), "until-terminal / --no-until-terminal on advance logs (#725)");
+  assert.deepEqual(validateFlags(entry, fakeCmdWithCliFlag("untilTerminal")), []);
+});
+
 test("command-registry: every 'loop:'-namespaced registered option is in the loop allowlist", () => {
   const cmd = buildCmd();
   const loopOptions = cmd.options.filter((o) => (o as { description?: string }).description?.startsWith("loop:"));

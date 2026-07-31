@@ -260,6 +260,35 @@ test("pipeline-cli: logs --events --follow is valid", () => {
   assert.deepEqual(roundTrip(["logs", "42-2026-06-16T00-00-00Z", "--events", "--follow"]), []);
 });
 
+test("pipeline-cli: logs --events --follow --no-until-terminal is valid (#725)", () => {
+  assert.deepEqual(
+    roundTrip(["logs", "42-2026-06-16T00-00-00Z", "--events", "--follow", "--no-until-terminal"]),
+    [],
+  );
+});
+
+test("pipeline-cli: logs --no-until-terminal sets untilTerminal false (#725)", () => {
+  const cmd = buildCmd();
+  cmd.parse([
+    "node",
+    "pipeline",
+    "logs",
+    "42-2026-06-16T00-00-00Z",
+    "--events",
+    "--follow",
+    "--no-until-terminal",
+  ]);
+  assert.equal(cmd.opts().events, true);
+  assert.equal(cmd.opts().follow, true);
+  assert.equal(cmd.opts().untilTerminal, false);
+});
+
+test("pipeline-cli: logs --events --follow defaults untilTerminal true (#725)", () => {
+  const cmd = buildCmd();
+  cmd.parse(["node", "pipeline", "logs", "42-2026-06-16T00-00-00Z", "--events", "--follow"]);
+  assert.equal(cmd.opts().untilTerminal, true);
+});
+
 test("pipeline-cli: loop logs --events --follow is valid on the loop allowlist (#666)", () => {
   assert.deepEqual(roundTrip(["loop", "logs", "loop-abc", "--events", "--follow"]), []);
 });
