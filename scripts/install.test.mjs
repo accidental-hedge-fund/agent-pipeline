@@ -6,14 +6,17 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -21,6 +24,8 @@ import { spawnSync } from "node:child_process";
 import {
   MANAGED_MARKER,
   DEPS,
+  HOSTS,
+  VALID_HOSTS,
   checkLoopCoherence,
   detectPersonalSkill,
   uniqueBackupPath,
@@ -1569,5 +1574,271 @@ test("releaseUpdateLock: refuses to release a lock owned by another process (#45
     assert.equal(existsSync(lockPath), false, "an owned lock must be released");
   } finally {
     cleanup(dir);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Grok skill path (#731) — --host grok symlink materialization + help text
+// ---------------------------------------------------------------------------
+
+test("VALID_HOSTS and HOSTS include grok alongside claude and codex (#731)", () => {
+  assert.deepEqual(VALID_HOSTS, ["claude", "codex", "grok", "all"]);
+  assert.ok(HOSTS.grok, "HOSTS.grok must exist");
+  assert.equal(HOSTS.grok.installMode, "symlink-claude");
+  assert.equal(HOSTS.claude.installMode, "tree");
+  assert.equal(HOSTS.codex.installMode, "tree");
+  // No hosts/grok overlay is required for this path target.
+  assert.equal(HOSTS.grok.overlayFiles.length, 0);
+});
+
+test("usage header documents --host grok among implemented hosts (#731)", () => {
+  const src = readFileSync(fileURLToPath(new URL("./install.mjs", import.meta.url)), "utf8");
+  assert.match(src, /--host claude\|codex\|grok\|all/);
+  assert.match(src, /Grok Build/);
+  assert.match(src, /~\/\.grok\/skills\/pipeline/);
+  // Header must not claim a hosts/grok SKILL.md fork.
+  assert.match(src, /no separate hosts\/grok SKILL\.md overlay/i);
+});
+
+test("unknown --host error lists grok and points at Grok skill path (#731)", () => {
+  const home = makeTmp();
+  try {
+    const result = runInstaller(["install", "--host", "not-a-host"], {
+      // Isolate from the real home so we do not touch user installs if parse somehow proceeds.
+      HOME: home,
+    });
+    assert.notEqual(result.status, 0);
+    const out = `${result.stdout}${result.stderr}`;
+    assert.match(out, /Unknown --host 'not-a-host'/);
+    assert.match(out, /claude, codex, grok, or all/);
+    assert.match(out, /~\/\.grok\/skills\/pipeline|Grok Build skill path/);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test("install --host grok: creates symlink to Claude skill when Claude is present (#731)", () => {
+  const home = makeTmp();
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const claudeSkill = stubExistingCoreInstall(claudeTmp);
+    const result = runInstaller(["install", "--host", "grok"], {
+      HOME: home,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      // Isolate live-run lock scan from the host /tmp (other pipeline runs).
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(result.status, 0, `stderr=${result.stderr}\nstdout=${result.stdout}`);
+    const dest = join(home, ".grok", "skills", "pipeline");
+    assert.ok(existsSync(dest), "Grok skill path must exist");
+    const st = lstatSync(dest);
+    assert.ok(st.isSymbolicLink(), "Grok path must be a symlink");
+    const target = resolve(join(dest, ".."), readlinkSync(dest));
+    // Prefer comparing realpaths so CLAUDE_CONFIG_DIR absolute form matches.
+    assert.equal(realpathSync(dest), realpathSync(claudeSkill));
+    assert.equal(realpathSync(target), realpathSync(claudeSkill));
+  } finally {
+    cleanup(home);
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host grok: fails with remediation when Claude skill is missing (#731)", () => {
+  const home = makeTmp();
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    // Claude config dir exists but no skills/pipeline managed install.
+    mkdirSync(claudeTmp, { recursive: true });
+    const result = runInstaller(["install", "--host", "grok"], {
+      HOME: home,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.notEqual(result.status, 0);
+    const out = `${result.stdout}${result.stderr}`;
+    assert.match(out, /requires a Claude-managed skill install/i);
+    assert.match(out, /--host claude/);
+    assert.equal(existsSync(join(home, ".grok", "skills", "pipeline")), false);
+  } finally {
+    cleanup(home);
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host grok: idempotent re-run refreshes symlink (#731)", () => {
+  const home = makeTmp();
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const claudeSkill = stubExistingCoreInstall(claudeTmp);
+    const env = {
+      HOME: home,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    };
+    const first = runInstaller(["install", "--host", "grok"], env);
+    assert.equal(first.status, 0, first.stderr);
+    const dest = join(home, ".grok", "skills", "pipeline");
+    // Stale wrong target → re-run must refresh (unlink link only).
+    rmSync(dest, { recursive: true, force: true });
+    symlinkSync(join(home, "wrong-target"), dest);
+    const second = runInstaller(["install", "--host", "grok"], env);
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(realpathSync(dest), realpathSync(claudeSkill));
+    // Same-target re-run is a net no-op success.
+    const third = runInstaller(["install", "--host", "grok"], env);
+    assert.equal(third.status, 0, third.stderr);
+    assert.match(`${third.stdout}${third.stderr}`, /already linked|linked →/);
+    assert.equal(realpathSync(dest), realpathSync(claudeSkill));
+  } finally {
+    cleanup(home);
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host grok: refuses to delete documented copy layout directory (#731 fdfca57c)", () => {
+  const home = makeTmp();
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    stubExistingCoreInstall(claudeTmp);
+    const dest = join(home, ".grok", "skills", "pipeline");
+    mkdirSync(dest, { recursive: true });
+    // Simulate the documented copy-based layout with operator-owned content.
+    writeFileSync(join(dest, "SKILL.md"), "operator copy layout content");
+    writeFileSync(join(dest, "personal-notes.txt"), "do not delete me");
+
+    const result = runInstaller(["install", "--host", "grok"], {
+      HOME: home,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.notEqual(result.status, 0, "must refuse non-symlink Grok path without deleting it");
+    const out = `${result.stdout}${result.stderr}`;
+    assert.match(out, /Refusing to replace non-symlink path/i);
+    assert.match(out, /mv |relocate/i);
+    // Path and content must remain byte-identical — no recursive delete.
+    assert.ok(existsSync(dest), "copy layout directory must still exist");
+    assert.equal(
+      lstatSync(dest).isSymbolicLink(),
+      false,
+      "must not convert directory to symlink without operator action",
+    );
+    assert.equal(readFileSync(join(dest, "SKILL.md"), "utf8"), "operator copy layout content");
+    assert.equal(readFileSync(join(dest, "personal-notes.txt"), "utf8"), "do not delete me");
+  } finally {
+    cleanup(home);
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host grok: refreshes wrong-target symlink without recursive tree delete (#731)", () => {
+  const home = makeTmp();
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const claudeSkill = stubExistingCoreInstall(claudeTmp);
+    const skillsDir = join(home, ".grok", "skills");
+    mkdirSync(skillsDir, { recursive: true });
+    // Sibling tree that must survive if a buggy rm -rf ever followed a link path.
+    const sibling = join(skillsDir, "unrelated-skill");
+    mkdirSync(sibling, { recursive: true });
+    writeFileSync(join(sibling, "keep.txt"), "preserve");
+    const dest = join(skillsDir, "pipeline");
+    symlinkSync(join(home, "stale-target"), dest);
+
+    const result = runInstaller(["install", "--host", "grok"], {
+      HOME: home,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(lstatSync(dest).isSymbolicLink());
+    assert.equal(realpathSync(dest), realpathSync(claudeSkill));
+    assert.equal(readFileSync(join(sibling, "keep.txt"), "utf8"), "preserve");
+  } finally {
+    cleanup(home);
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("uninstall --host grok: unlinks installer symlink only (#731 148c1b7b)", () => {
+  const home = makeTmp();
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const claudeSkill = stubExistingCoreInstall(claudeTmp);
+    // Claude target tree must survive Grok uninstall (unlink only, not follow).
+    writeFileSync(join(claudeSkill, "keep-claude.txt"), "claude-owned");
+    const dest = join(home, ".grok", "skills", "pipeline");
+    mkdirSync(join(home, ".grok", "skills"), { recursive: true });
+    symlinkSync(claudeSkill, dest);
+
+    const result = runInstaller(["uninstall", "--host", "grok"], {
+      HOME: home,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.equal(result.status, 0, `stderr=${result.stderr}\nstdout=${result.stdout}`);
+    assert.equal(existsSync(dest), false, "Grok symlink must be removed");
+    assert.ok(existsSync(claudeSkill), "Claude target tree must not be deleted");
+    assert.equal(readFileSync(join(claudeSkill, "keep-claude.txt"), "utf8"), "claude-owned");
+  } finally {
+    cleanup(home);
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("uninstall --host grok: refuses to delete documented copy layout directory (#731 148c1b7b)", () => {
+  const home = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const dest = join(home, ".grok", "skills", "pipeline");
+    mkdirSync(dest, { recursive: true });
+    writeFileSync(join(dest, "SKILL.md"), "operator copy layout content");
+    writeFileSync(join(dest, "personal-notes.txt"), "do not delete me");
+
+    const result = runInstaller(["uninstall", "--host", "grok"], {
+      HOME: home,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.notEqual(result.status, 0, "must refuse non-symlink Grok path without deleting it");
+    const out = `${result.stdout}${result.stderr}`;
+    assert.match(out, /Refusing to delete non-symlink path/i);
+    assert.match(out, /mv |backup|copy/i);
+    // Path and content must remain byte-identical — no recursive delete.
+    assert.ok(existsSync(dest), "copy layout directory must still exist");
+    assert.equal(lstatSync(dest).isSymbolicLink(), false);
+    assert.equal(readFileSync(join(dest, "SKILL.md"), "utf8"), "operator copy layout content");
+    assert.equal(readFileSync(join(dest, "personal-notes.txt"), "utf8"), "do not delete me");
+  } finally {
+    cleanup(home);
+    cleanup(lockTmp);
   }
 });

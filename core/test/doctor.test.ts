@@ -10,12 +10,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   buildPreflightChecks,
   doctorResultPath,
   formatDoctorJson,
   formatDoctorSummary,
   loadLatestPreflightResult,
+  resolveInstallRoot,
   runPreflight,
   storePreflightResult,
   type DoctorDeps,
@@ -587,6 +590,98 @@ test("check install:version-coherence — fails with reinstall remediation when 
   );
   assertFailWithRemediation(r);
   assert.match(r.remediation!, /reinstall/i);
+});
+
+// ---------------------------------------------------------------------------
+// install:version-coherence via symlink entry path (#731)
+// ---------------------------------------------------------------------------
+
+test("resolveInstallRoot — symlink into a managed core tree collapses to the real path (#731)", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-doctor-symlink-"));
+  try {
+    const managedCore = path.join(tmp, "claude", "skills", "pipeline", "core");
+    fs.mkdirSync(managedCore, { recursive: true });
+    fs.writeFileSync(path.join(managedCore, "package.json"), JSON.stringify({ version: "1.0.0" }));
+
+    const grokSkill = path.join(tmp, "grok", "skills", "pipeline");
+    fs.mkdirSync(path.dirname(grokSkill), { recursive: true });
+    fs.symlinkSync(path.join(tmp, "claude", "skills", "pipeline"), grokSkill);
+
+    const viaSymlink = path.join(grokSkill, "core");
+    const resolved = resolveInstallRoot(viaSymlink);
+    assert.equal(resolved, fs.realpathSync(managedCore));
+    assert.equal(resolved, fs.realpathSync(viaSymlink));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("check install:version-coherence — symlink entry into coherent managed tree still passes (#731)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-doctor-coherence-symlink-"));
+  try {
+    const managedCore = path.join(tmp, "claude", "skills", "pipeline", "core");
+    fs.mkdirSync(managedCore, { recursive: true });
+    fs.writeFileSync(path.join(managedCore, "package.json"), JSON.stringify({ version: "1.0.0" }));
+
+    const grokSkill = path.join(tmp, "grok", "skills", "pipeline");
+    fs.mkdirSync(path.dirname(grokSkill), { recursive: true });
+    fs.symlinkSync(path.join(tmp, "claude", "skills", "pipeline"), grokSkill);
+
+    const viaSymlink = path.join(grokSkill, "core");
+    const resolvedRoot = resolveInstallRoot(viaSymlink);
+    const check = buildPreflightChecks(makeConfig(), "1.0.0", viaSymlink).find(
+      (c) => c.id === "install:version-coherence",
+    )!;
+    const r = await check.run(
+      fakeDeps({
+        readTextFile: async (p) => {
+          try {
+            return fs.readFileSync(p, "utf8");
+          } catch {
+            return null;
+          }
+        },
+      }),
+    );
+    assert.equal(r.status, "pass");
+    assert.match(r.detail, /1\.0\.0/);
+    // Detail must report the managed (real) path, not invent a second install solely from the symlink.
+    assert.match(r.detail, new RegExp(resolvedRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("check install:version-freshness — symlink entry does not fail solely due to symlink path (#731)", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-doctor-fresh-symlink-"));
+  try {
+    const managedCore = path.join(tmp, "claude", "skills", "pipeline", "core");
+    fs.mkdirSync(managedCore, { recursive: true });
+    fs.writeFileSync(path.join(managedCore, "package.json"), JSON.stringify({ version: "1.1.0" }));
+    const grokSkill = path.join(tmp, "grok", "skills", "pipeline");
+    fs.mkdirSync(path.dirname(grokSkill), { recursive: true });
+    fs.symlinkSync(path.join(tmp, "claude", "skills", "pipeline"), grokSkill);
+
+    const viaSymlink = path.join(grokSkill, "core");
+    // Freshness only compares running VERSION to gh release tag — install root
+    // path is irrelevant; prove a symlink-resolved launch path still passes.
+    const check = buildPreflightChecks(makeConfig(), "1.1.0", viaSymlink).find(
+      (c) => c.id === "install:version-freshness",
+    )!;
+    const r = await check.run(
+      fakeDeps({
+        exec: async (file, args) => {
+          if (file === "gh" && args.includes("release")) {
+            return { ok: true, stdout: JSON.stringify({ tagName: "v1.1.0" }), stderr: "" };
+          }
+          return { ok: true, stdout: '{"loggedIn":true}', stderr: "" };
+        },
+      }),
+    );
+    assert.equal(r.status, "pass");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

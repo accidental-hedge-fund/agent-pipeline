@@ -282,6 +282,23 @@ function compareVersionSegments(a: string, b: string): number {
   return 0;
 }
 
+/**
+ * Resolve the install root for version checks.
+ * When the skill is reached via a symlink (e.g. ~/.grok/skills/pipeline →
+ * ~/.claude/skills/pipeline), realpath collapses to the managed tree so
+ * install:version-coherence / freshness report the same core identity as the
+ * real path (#731). Falls back to the unresolved path if realpath fails.
+ */
+export function resolveInstallRoot(installRoot?: string): string {
+  const derived =
+    installRoot ?? path.dirname(path.dirname(path.dirname(fileURLToPath(import.meta.url))));
+  try {
+    return fs.realpathSync(derived);
+  } catch {
+    return derived;
+  }
+}
+
 /** Build the ordered list of preflight checks for the given resolved config.
  *  `version` is the `VERSION` constant from `pipeline.ts` (loaded at startup) and is used
  *  by the install:version-coherence check. `installRoot` overrides the auto-derived install
@@ -291,8 +308,8 @@ export function buildPreflightChecks(
   version: string,
   installRoot?: string,
 ): PreflightCheck[] {
-  // core/scripts/stages/doctor.ts → dirname×3 → core/
-  const root = installRoot ?? path.dirname(path.dirname(path.dirname(fileURLToPath(import.meta.url))));
+  // core/scripts/stages/doctor.ts → dirname×3 → core/; realpath for symlink entry paths (#731)
+  const root = resolveInstallRoot(installRoot);
   const checks: PreflightCheck[] = [];
 
   // 1. Required CLIs — one check per binary so remediation can name it.
