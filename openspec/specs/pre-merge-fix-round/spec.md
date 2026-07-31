@@ -7,11 +7,15 @@ TBD - created by archiving change pre-merge-fix-round. Update Purpose after arch
 
 The pipeline SHALL partition blocking pre-merge delta-review findings into an **auto-fixable**
 subset and a **residual human-required** subset using the fixed category allowlist
-`{ correctness, missing-dep, concurrency }` (case-insensitive, trimmed). A finding is
-auto-fixable if and only if its `category` is in that allowlist. A finding is residual
-human-required when its category is outside the allowlist — including `security`, `scope`,
-`product-judgment-required`, `spec-divergence`, `data-loss`, `observability`, an unrecognized
-token, or an absent/empty category (fail-closed for that finding).
+`{ correctness, missing-dep, concurrency }` (case-insensitive, trimmed), **plus** any finding
+whose `category` is `spec-divergence` and whose structured
+`spec_divergence_direction` is `code-behind-spec`. A finding is auto-fixable if and only if
+its category is in that allowlist **or** it is a `code-behind-spec` directed
+`spec-divergence`. A finding is residual human-required when it is outside that set —
+including `security`, `scope`, `product-judgment-required`, direction-less
+`spec-divergence`, `spec-divergence` with direction `spec-behind-code`, `data-loss`,
+`observability`, an unrecognized token, or an absent/empty category (fail-closed for that
+finding).
 
 The pipeline SHALL attempt the bounded pre-merge auto-fix when **all** of the following hold:
 the auto-fixable subset is non-empty; an implementer harness is configured; and no prior
@@ -35,50 +39,29 @@ require an OpenSpec change and tests, not an undocumented string add.
 - **THEN** the pipeline SHALL perform exactly one bounded auto-fix attempt (see the bounded-attempt
   requirement) rather than escalating to `needs-human`
 
-#### Scenario: all blocking findings are concurrency — auto-fix eligible
+#### Scenario: pure code-behind-spec residual is auto-fix eligible
 
-- **WHEN** the pre-merge delta review returns `needs-attention` with one or more blocking findings
-- **AND** every blocking finding's `category` is `concurrency`
-- **AND** no auto-fix has been attempted for the current pre-merge entry
-- **THEN** the pipeline SHALL perform exactly one bounded auto-fix attempt rather than escalating
-  to `needs-human` on the first hop
-
-#### Scenario: mixed allowlisted categories remain eligible
-
-- **WHEN** the blocking findings include only categories from
-  `{ correctness, missing-dep, concurrency }` (any non-empty combination)
-- **AND** no prior auto-fix commit exists for the entry
-- **THEN** the pipeline SHALL treat the set as auto-fixable and attempt one auto-fix
-
-#### Scenario: mixed allowlisted and residual non-allowlisted — partition attempts auto-fix
-
-- **WHEN** the blocking findings include at least one allowlisted category
-  (`correctness`, `missing-dep`, or `concurrency`)
-- **AND** at least one residual non-allowlisted category (for example `spec-divergence`,
-  `security`, `scope`, or `product-judgment-required`)
+- **WHEN** every blocking finding has `category` `spec-divergence` and
+  `spec_divergence_direction` `code-behind-spec`
 - **AND** no prior auto-fix attempt is recognized for the entry
 - **AND** an implementer harness is configured
-- **THEN** the pipeline SHALL attempt exactly one bounded auto-fix scoped to the allowlisted
-  subset
-- **AND** SHALL NOT skip the auto-fix solely because residual non-allowlisted findings are
-  co-batched
-- **AND** residual findings SHALL NOT be included in the auto-fix prompt
+- **THEN** the pipeline SHALL perform exactly one bounded auto-fix attempt for that set
+- **AND** SHALL NOT first-hop to `needs-human` solely because the category token is
+  `spec-divergence`
 
-#### Scenario: #729-shaped concurrency + spec-divergence still attempts auto-fix
+#### Scenario: direction-less or spec-behind-code remains residual
 
-- **WHEN** the blocking findings are a HIGH `concurrency` finding and a HIGH `spec-divergence`
-  finding (co-batched under the same delta verdict)
-- **AND** no prior auto-fix attempt is recognized for the entry
-- **AND** an implementer harness is configured
-- **THEN** the pipeline SHALL invoke the auto-fix harness once for the `concurrency` subset
-- **AND** SHALL NOT first-hop to `needs-human` without an auto-fix attempt solely because of
-  the co-batched `spec-divergence` finding
+- **WHEN** every blocking finding has `category` `spec-divergence` and either lacks
+  `spec_divergence_direction` or has direction `spec-behind-code`
+- **THEN** the pipeline SHALL NOT invoke the implementer auto-fix harness for that residual set
+- **AND** SHALL set `blocked`/`needs-human` without that harness call (spec-behind-code MAY be
+  handled by a separate bounded spec-repair path; it is not implementer autofix)
 
 #### Scenario: pure residual non-allowlisted batch — escalate without auto-fix
 
 - **WHEN** every blocking finding has a residual non-allowlisted category (including
-  `security`, `scope`, `product-judgment-required`, `spec-divergence`, `data-loss`,
-  `observability`, or absent/empty/unrecognized)
+  `security`, `scope`, `product-judgment-required`, direction-less `spec-divergence`,
+  `spec-behind-code`, `data-loss`, `observability`, or absent/empty/unrecognized)
 - **THEN** the pipeline SHALL NOT invoke the auto-fix harness
 - **AND** SHALL set `blocked`/`needs-human` without a harness call
 
@@ -87,16 +70,6 @@ require an OpenSpec change and tests, not an undocumented string add.
 - **WHEN** the only blocking findings have `category` `security`
 - **THEN** the pipeline SHALL NOT invoke the auto-fix harness
 - **AND** SHALL set `blocked`/`needs-human` immediately
-
-#### Scenario: residual after partial auto-fix still needs human
-
-- **WHEN** a mixed batch receives one bounded auto-fix attempt on the allowlisted subset
-- **AND** the single post-fix re-delta (or post-noop re-verify) still reports residual
-  non-allowlisted blocking findings and/or still-blocking allowlisted findings
-- **THEN** the pipeline SHALL set `blocked`/`needs-human`
-- **AND** SHALL NOT invoke the auto-fix harness a second time
-- **AND** the block reason SHALL name which keys/categories required human disposition versus
-  which were auto-fix attempted
 
 ### Requirement: Pre-merge SHALL perform at most one auto-fix attempt per entry
 
