@@ -605,6 +605,68 @@ test("gate (#384, bites): testGateBlockReason keeps the tooling-failure and test
   assert.match(testGateBlockReason(testFailGate), /failed after 2 fix attempt/i);
 });
 
+test("gate (#722, bites): testGateBlockReason does not wrap dirty-worktree blocks as fix exhaustion", () => {
+  const preDirtyGate = {
+    skipped: false as const,
+    passed: false,
+    attempts: 0,
+    dirtyWorktree: true,
+    blockReason:
+      "Worktree has uncommitted changes before the test gate ran. " +
+      "All changes must be committed so test results can be trusted.\n\n" +
+      "Uncommitted paths:\n?? package-lock.json",
+  };
+  const postRunDirtyGate = {
+    skipped: false as const,
+    passed: false,
+    attempts: 0,
+    dirtyWorktree: true,
+    blockReason:
+      "Test/build command left uncommitted changes in the working tree. " +
+      "Commit any generated artifacts (snapshots, tsbuildinfo, lock-file updates) " +
+      "so the gate certifies the exact committed state.\n\n" +
+      "Uncommitted paths:\n?? yarn.lock",
+  };
+  const exhaustedTestFail = {
+    skipped: false as const,
+    passed: false,
+    attempts: 2,
+    blockReason: "FAIL: 1 test failed",
+  };
+
+  const preDirtyReason = testGateBlockReason(preDirtyGate);
+  assert.doesNotMatch(preDirtyReason, /failed after \d+ fix attempt/i);
+  assert.doesNotMatch(preDirtyReason, /command is still failing/i);
+  assert.match(preDirtyReason, /uncommitted changes/i);
+  assert.match(preDirtyReason, /package-lock\.json/);
+
+  const postDirtyReason = testGateBlockReason(postRunDirtyGate);
+  assert.doesNotMatch(postDirtyReason, /failed after \d+ fix attempt/i);
+  assert.doesNotMatch(postDirtyReason, /command is still failing/i);
+  assert.match(postDirtyReason, /uncommitted changes|generated artifacts/i);
+  assert.match(postDirtyReason, /yarn\.lock/);
+
+  // Exhausted genuine test failures keep the exhaustion wrapper.
+  assert.match(testGateBlockReason(exhaustedTestFail), /failed after 2 fix attempt/i);
+  assert.match(testGateBlockReason(exhaustedTestFail), /command is still failing/i);
+});
+
+test("gate (#722): pre-dirty runTestGate result is tagged dirtyWorktree for the formatter", async () => {
+  const out = await runTestGate(cfgWith({}), 722, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      throw new Error("test command must not run when pre-dirty");
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => "?? package-lock.json\n",
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.equal(out.dirtyWorktree, true);
+  assert.doesNotMatch(testGateBlockReason(out), /failed after \d+ fix attempt/i);
+  assert.match(testGateBlockReason(out), /package-lock\.json/);
+});
+
 test("gate: max_attempts 2, both post-fix fail → blocked with reason", async () => {
   let invoked = 0;
   const out = await runTestGate(cfgWith({ max_attempts: 2 }), 1, "/wt", {

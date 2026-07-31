@@ -536,3 +536,138 @@ test("resumeFromImplementing: pr_created event streams to stdout via runStoreDep
   assert.ok(stdout.some((l) => l.includes('"pr_created"')), `pr_created must stream to stdout; got ${JSON.stringify(stdout)}`);
   assert.ok(stdout.some((l) => l.includes('"pr":77')), "the streamed event must carry the PR number");
 });
+
+// ---------------------------------------------------------------------------
+// #722: implement-path lockfile fold before format/test gates
+// ---------------------------------------------------------------------------
+
+test("resumeFromImplementing (#722): lockfile fold runs before format/test gates when lock is dirty", async () => {
+  const callLog: string[] = [];
+  let foldPaths: string[] | undefined;
+
+  const deps: ResumeFromImplementingDeps = {
+    includeLockfileSideEffects: async (wtPath, _lockDeps) => {
+      assert.equal(wtPath, "/fake/wt");
+      callLog.push("lock-fold");
+      foldPaths = ["package-lock.json"];
+      return { included: true, paths: foldPaths };
+    },
+    _runFormatAndTestGates: async () => {
+      callLog.push("gates");
+      return { ok: true, gate: passedGate() };
+    },
+    getPrForBranch: async () => null,
+    createPr: async () => 88,
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    setBlocked: async () => {},
+    transition: async () => {},
+  };
+
+  const result = await resumeFromImplementing(
+    makeCfg(),
+    722,
+    makeWt(),
+    {
+      prTitle: "[Pipeline] fold locks (#722)",
+      prBody: "Closes #722",
+      transitionMessage: (n) => `PR #${n}`,
+      pipelineRunId: "run-722",
+    },
+    deps,
+  );
+
+  assert.equal(result.advanced, true);
+  assert.deepEqual(callLog, ["lock-fold", "gates"], "lock fold must complete before gates runner");
+  assert.deepEqual(foldPaths, ["package-lock.json"]);
+});
+
+test("resumeFromImplementing (#722): lock fold is still invoked when no lock dirt (helper no-ops)", async () => {
+  // Parity: resume always calls the helper; clean of locks → included:false, no amend.
+  const callLog: string[] = [];
+
+  const deps: ResumeFromImplementingDeps = {
+    includeLockfileSideEffects: async () => {
+      callLog.push("lock-fold");
+      return { included: false };
+    },
+    _runFormatAndTestGates: async () => {
+      callLog.push("gates");
+      return { ok: true, gate: passedGate() };
+    },
+    getPrForBranch: async () => 1,
+    createPr: async () => 0,
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    setBlocked: async () => {},
+    transition: async () => {},
+  };
+
+  await resumeFromImplementing(
+    makeCfg(),
+    722,
+    makeWt(),
+    {
+      prTitle: "[Pipeline] clean (#722)",
+      prBody: "Closes #722",
+      transitionMessage: (n) => `PR #${n}`,
+      pipelineRunId: "run-722b",
+    },
+    deps,
+  );
+
+  assert.deepEqual(callLog, ["lock-fold", "gates"]);
+});
+
+test("resumeFromImplementing (#722, bites): without the lock-fold call, fold seam is never invoked before gates", async () => {
+  // Source pin: the production resumeFromImplementing body must call the fold
+  // seam before resolving the gates runner. Removing the fold call makes this
+  // fail — proves the regression guards the implement path, not a silent no-op.
+  const { readFile } = await import("node:fs/promises");
+  const { fileURLToPath } = await import("node:url");
+  const src = await readFile(
+    fileURLToPath(new URL("../scripts/stages/planning.ts", import.meta.url)),
+    "utf8",
+  );
+  // Locate the resumeFromImplementing function body (not the interface docs).
+  const fnIdx = src.indexOf("export async function resumeFromImplementing(");
+  assert.ok(fnIdx !== -1, "resumeFromImplementing must exist");
+  const body = src.slice(fnIdx);
+  const foldIdx = body.indexOf("const lockResult = await lockFold(");
+  const gatesIdx = body.indexOf("const gates = await gatesRunner(");
+  assert.ok(foldIdx !== -1, "expected lock-fold call (lockFold) inside resumeFromImplementing");
+  assert.ok(gatesIdx !== -1, "expected gatesRunner call inside resumeFromImplementing");
+  assert.ok(foldIdx < gatesIdx, "lock fold must be invoked before the format/test gates runner");
+});
+
+test("resumeFromImplementing (#722): nested yarn/pnpm lock basenames are folded via the shared helper seam", async () => {
+  // Call-site contract only: the fold seam receives the worktree path; recognition
+  // of yarn.lock / pnpm-lock.yaml is owned by includeLockfileSideEffects (covered
+  // in lockfile-side-effects.test.ts). Here we prove nested paths can be reported.
+  let seenPaths: string[] | undefined;
+  const deps: ResumeFromImplementingDeps = {
+    includeLockfileSideEffects: async () => {
+      seenPaths = ["packages/app/yarn.lock", "apps/web/pnpm-lock.yaml"];
+      return { included: true, paths: seenPaths };
+    },
+    _runFormatAndTestGates: async () => ({ ok: true, gate: passedGate() }),
+    getPrForBranch: async () => 9,
+    createPr: async () => 0,
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    setBlocked: async () => {},
+    transition: async () => {},
+  };
+
+  await resumeFromImplementing(
+    makeCfg(),
+    722,
+    makeWt(),
+    {
+      prTitle: "[Pipeline] nested locks (#722)",
+      prBody: "Closes #722",
+      transitionMessage: (n) => `PR #${n}`,
+      pipelineRunId: "run-722c",
+    },
+    deps,
+  );
+
+  assert.deepEqual(seenPaths, ["packages/app/yarn.lock", "apps/web/pnpm-lock.yaml"]);
+});
