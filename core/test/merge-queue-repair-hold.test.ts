@@ -1277,7 +1277,7 @@ test("realDriveDeps: threads expectedBaseBranch into mergePr gate", async () => 
   );
 });
 
-test("realDriveDeps: matching base threads expectedBase into ghPrMerge opts (base-bound write)", async () => {
+test("realDriveDeps: matching base threads expectedBase into ghPrMerge opts (base-guarded write)", async () => {
   const mergeOpts: Array<{ expectedBaseBranch?: string } | undefined> = [];
   const mergeDeps: MergeDeps = {
     async ghPrView() {
@@ -1316,6 +1316,6 @@ test("realDriveDeps: matching base threads expectedBase into ghPrMerge opts (bas
   assert.equal(
     mergeOpts[0]?.expectedBaseBranch,
     "main",
-    "queue merge write must receive expectedBase for server-side base binding",
+    "queue merge write must receive expectedBase for write-boundary base guard",
   );
 });

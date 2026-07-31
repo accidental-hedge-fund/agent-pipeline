@@ -12,7 +12,8 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import {
   mergePr,
-  gitHeadsRefApiPath,
+  assertBaseGuardedMergeWrite,
+  assertBaseGuardedMergeResult,
   type GhPrMergeOptions,
   type MergeDeps,
   type RequiredCheck,
@@ -619,15 +620,17 @@ test("merge: empty headRefOid aborts before merge (guards against missing SHA)",
 });
 
 // ---------------------------------------------------------------------------
-// 4.12b Base-bound merge: retarget-to-merge race (finding 3de99c1e / #675)
+// 4.12b Base-guarded merge: retarget-to-merge race + real MERGED semantics (#675)
 //
-// Client-side baseRefName checks alone are TOCTOU: a PR can be retargeted after
-// the gate read without changing head SHA. When expectedBaseBranch is set,
-// mergePr MUST thread it into ghPrMerge so the production write binds the
-// destination server-side (named base ref), not the PR's live base at merge time.
+// When expectedBaseBranch is set, mergePr MUST thread it into ghPrMerge. The
+// production write re-validates base/head immediately before `gh pr merge`
+// (real three-way squash + MERGED state) and refuses retargets — it must NOT
+// copy the raw PR-head tree onto the base (overwrites prior queue merges) nor
+// `gh pr close` (leaves CLOSED, not MERGED) nor delete fork branch names in the
+// base repo.
 // ---------------------------------------------------------------------------
 
-test("merge: expectedBaseBranch is threaded into ghPrMerge for server-side base binding", async () => {
+test("merge: expectedBaseBranch is threaded into ghPrMerge for write-boundary base guard", async () => {
   const deps = makeDeps({
     expectedBaseBranch: "main",
     async ghPrView(_pr, fields) {
@@ -645,16 +648,14 @@ test("merge: expectedBaseBranch is threaded into ghPrMerge for server-side base 
   assert.equal(
     deps.mergeCalls[0].opts?.expectedBaseBranch,
     "main",
-    "ghPrMerge must receive expectedBaseBranch so the write can bind destination",
+    "ghPrMerge must receive expectedBaseBranch so the write can re-check base",
   );
 });
 
-test("merge: retarget between gate read and merge cannot redirect destination base", async () => {
-  // Simulate a concurrent retarget after the gate observes base=main: the live
-  // PR base becomes "staging", but the merge write must still be invoked with
-  // expectedBaseBranch=main (server-enforced destination), never liveBase.
+test("merge: write-boundary guard refuses retarget before gh pr merge", async () => {
+  // Simulate concurrent retarget after gate observes base=main: production-like
+  // ghPrMerge re-checks live base against opts.expectedBaseBranch and refuses.
   let liveBase = "main";
-  const destinations: string[] = [];
   const deps = makeDeps({
     expectedBaseBranch: "main",
     async ghPrView(_pr, _fields) {
@@ -665,30 +666,33 @@ test("merge: retarget between gate read and merge cannot redirect destination ba
         baseRefName: liveBase,
       };
     },
-    async ghPrMerge(_pr, _head, opts) {
+    async ghPrMerge(pr, head, opts) {
       // Retarget races in after the gate read and before the write body:
       liveBase = "staging";
-      // Production base-bound path uses opts.expectedBaseBranch as the ref to
-      // update — not the PR's live baseRefName — so destination stays "main".
-      const dest = opts?.expectedBaseBranch;
-      if (!dest) {
-        throw new Error("expected base-bound merge opts; refusing live-base merge");
-      }
-      destinations.push(dest);
+      const expected = (opts?.expectedBaseBranch ?? "").trim();
+      assertBaseGuardedMergeWrite({
+        pr,
+        expectedBase: expected,
+        liveBase,
+        liveHead: head,
+        expectedHead: head,
+        liveState: "OPEN",
+      });
+      deps.mergeCalls.push({ pr, headRefOid: head, opts });
     },
   });
-  await mergePr(42, deps);
-  assert.deepEqual(
-    destinations,
-    ["main"],
-    "merge destination must remain the expected base despite mid-flight retarget",
+  await assert.rejects(
+    () => mergePr(42, deps),
+    (err: Error) => {
+      assert.ok(
+        err.message.includes("base branch mismatch at merge write"),
+        `expected write-boundary base refuse, got: ${err.message}`,
+      );
+      return true;
+    },
   );
-  assert.equal(liveBase, "staging", "retarget occurred; destination still bound to main");
-  assert.notEqual(
-    destinations[0],
-    liveBase,
-    "regression: destination must not follow the retargeted live PR base",
-  );
+  assert.equal(deps.mergeCalls.length, 0, "must not record a successful merge after retarget");
+  assert.equal(liveBase, "staging", "retarget occurred; merge must not have landed");
 });
 
 test("merge: without expectedBaseBranch, ghPrMerge is not given a base bind option", async () => {
@@ -702,16 +706,99 @@ test("merge: without expectedBaseBranch, ghPrMerge is not given a base bind opti
   );
 });
 
-test("gitHeadsRefApiPath encodes nested branch segments", () => {
-  assert.equal(gitHeadsRefApiPath("main", false), "git/ref/heads/main");
-  assert.equal(gitHeadsRefApiPath("main", true), "git/refs/heads/main");
-  assert.equal(
-    gitHeadsRefApiPath("release/1.0", false),
-    "git/ref/heads/release/1.0",
+test("assertBaseGuardedMergeWrite: matching base and head allow write", () => {
+  assert.doesNotThrow(() =>
+    assertBaseGuardedMergeWrite({
+      pr: 10,
+      expectedBase: "main",
+      liveBase: "main",
+      liveHead: "abc",
+      expectedHead: "abc",
+      liveState: "OPEN",
+    }),
   );
-  assert.equal(
-    gitHeadsRefApiPath("feature/a b", true),
-    "git/refs/heads/feature/a%20b",
+});
+
+test("assertBaseGuardedMergeWrite: sequential queue must not use raw head tree — guard is base+head only", () => {
+  // Documents the contract that replaces raw-tree baseBoundSquashMerge: we never
+  // invent a destination tree here; production always calls real gh pr merge.
+  assert.throws(
+    () =>
+      assertBaseGuardedMergeWrite({
+        pr: 11,
+        expectedBase: "main",
+        liveBase: "main",
+        liveHead: "head-of-pr-2",
+        expectedHead: "head-of-pr-1",
+        liveState: "OPEN",
+      }),
+    /head moved between gate and merge write/,
+  );
+});
+
+test("assertBaseGuardedMergeResult: CLOSED is not success (must be MERGED)", () => {
+  assert.throws(
+    () =>
+      assertBaseGuardedMergeResult({
+        pr: 12,
+        expectedBase: "main",
+        state: "CLOSED",
+        baseRefName: "main",
+      }),
+    /is not MERGED/,
+  );
+});
+
+test("assertBaseGuardedMergeResult: MERGED on wrong base is refused", () => {
+  assert.throws(
+    () =>
+      assertBaseGuardedMergeResult({
+        pr: 13,
+        expectedBase: "main",
+        state: "MERGED",
+        baseRefName: "staging",
+      }),
+    /merged onto base=staging/,
+  );
+});
+
+test("assertBaseGuardedMergeResult: MERGED on expected base is success", () => {
+  assert.doesNotThrow(() =>
+    assertBaseGuardedMergeResult({
+      pr: 14,
+      expectedBase: "main",
+      state: "MERGED",
+      baseRefName: "main",
+    }),
+  );
+});
+
+test("merge: production path uses real gh pr merge — not raw-tree ref update or pr close", () => {
+  const mergeSrc = fs.readFileSync(
+    path.join(STAGES_DIR, "merge.ts"),
+    "utf8",
+  );
+  assert.ok(
+    !mergeSrc.includes("baseBoundSquashMerge"),
+    "regression: raw-head-tree baseBoundSquashMerge must remain removed",
+  );
+  // Executable close invocation only (comments may mention the rejected pattern).
+  assert.ok(
+    !mergeSrc.includes('"pr", "close"') && !mergeSrc.includes("'pr', 'close'"),
+    "regression: must not gh pr close as a stand-in for merge (CLOSED ≠ MERGED)",
+  );
+  assert.ok(
+    mergeSrc.includes('"pr", "merge"'),
+    "production merge write must call gh pr merge for real three-way squash + MERGED",
+  );
+  // Manual head-ref DELETE can wipe a same-named base-repo branch on fork PRs.
+  assert.ok(
+    !mergeSrc.includes('"-X", "DELETE"') && !mergeSrc.includes("-X DELETE"),
+    "regression: must not DELETE repos/.../git/refs/heads/<headRefName> by short name",
+  );
+  assert.ok(
+    !mergeSrc.includes("parents[]=") && !mergeSrc.includes("tree=${headTree}"),
+    "regression: must not create squash commits from the raw PR-head tree",
   );
 });
 

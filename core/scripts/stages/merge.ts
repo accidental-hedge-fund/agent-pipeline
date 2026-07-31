@@ -23,13 +23,15 @@
 //   Exits 0 on success; aborts if the PR head has advanced past <sha> since inspection.
 //   May emit a stderr warning about the branch already being deleted (non-fatal).
 //
-// Base-bound path (when expectedBaseBranch is set — merge-queue drive):
-//   `gh pr merge` only binds head via --match-head-commit; a PR retarget after the
-//   client-side baseRefName gate can still land the squash on another base. The
-//   base-bound path instead squash-creates a commit onto the *named* expected base
-//   tip (Git Data API) and fast-forward updates that ref (force=false CAS). The
-//   irreversible write targets refs/heads/<expectedBase> only — PR base retarget
-//   cannot redirect the destination.
+// Base-guarded path (when expectedBaseBranch is set — merge-queue drive):
+//   Still uses real `gh pr merge --squash --delete-branch --match-head-commit` so
+//   GitHub computes a true three-way squash, records MERGED (not CLOSED), closes
+//   linked issues, and deletes only the PR head branch (not a same-named base-repo
+//   branch for fork PRs). Before that write, production re-reads baseRefName +
+//   headRefOid and refuses on mismatch; after success it requires state=MERGED and
+//   baseRefName still equal to the expected base. A prior raw-head-tree + ref-update
+//   + `gh pr close` path was rejected: it overwrote earlier queue merges and never
+//   produced a GitHub merged-PR record.
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -48,9 +50,10 @@ export interface RequiredCheck {
 /** Options for the irreversible merge write. */
 export interface GhPrMergeOptions {
   /**
-   * When set, the production merge MUST land on this named base via a
-   * server-enforced base-bound squash (explicit base ref update). Must not
-   * rely solely on the PR's live `baseRefName` at `gh pr merge` time.
+   * When set (merge-queue drive), production re-validates that the PR's live
+   * `baseRefName` still equals this branch immediately before `gh pr merge`,
+   * then post-checks that the PR is MERGED onto that base. Must not use a
+   * raw PR-head tree + base ref update (overwrites prior queue merges).
    */
   expectedBaseBranch?: string;
 }
@@ -66,11 +69,11 @@ export interface MergeDeps {
    *  branch has no required checks configured. */
   ghPrChecksAll(pr: number): Promise<RequiredCheck[]>;
   /**
-   * Irreversible merge write. Without `expectedBaseBranch`, calls
+   * Irreversible merge write. Always uses
    * `gh pr merge --squash --delete-branch --match-head-commit <headRefOid>`
-   * (head-bound TOCTOU guard). With `expectedBaseBranch`, performs a
-   * base-bound squash onto that named branch so a PR retarget cannot redirect
-   * the merge destination, then closes the PR and deletes the head branch.
+   * so GitHub records MERGED and performs a real three-way squash. When
+   * `expectedBaseBranch` is set, production re-reads base/head immediately
+   * before that call and post-checks MERGED + base match after success.
    */
   ghPrMerge(pr: number, headRefOid: string, opts?: GhPrMergeOptions): Promise<void>;
   getIssueLabels(issueNumber: number): Promise<string[]>;
@@ -83,20 +86,78 @@ export interface MergeDeps {
   /**
    * When set (merge-queue drive), immediately-pre-merge gate requires the PR's
    * `baseRefName` to match this branch (early refuse). The irreversible write
-   * additionally uses server-enforced base binding (see `ghPrMerge` opts) so a
-   * retarget between the gate read and the write cannot land on another base.
+   * re-checks the same constraint at the write boundary (see `ghPrMerge` opts).
    */
   expectedBaseBranch?: string;
   log(msg: string): void;
 }
 
-/** Encode a branch name for GitHub git/ref(s)/heads/* paths (supports nested branches). */
-export function gitHeadsRefApiPath(branch: string, plural: boolean): string {
-  const encoded = branch
-    .split("/")
-    .map((seg) => encodeURIComponent(seg))
-    .join("/");
-  return plural ? `git/refs/heads/${encoded}` : `git/ref/heads/${encoded}`;
+/**
+ * Pure write-boundary base/head guard used by production `ghPrMerge` when
+ * `expectedBaseBranch` is set. Exported for unit tests (no I/O).
+ */
+export function assertBaseGuardedMergeWrite(args: {
+  pr: number;
+  expectedBase: string;
+  liveBase: string;
+  liveHead: string;
+  expectedHead: string;
+  liveState: string;
+}): void {
+  const expectedBase = args.expectedBase.trim();
+  const liveBase = String(args.liveBase ?? "");
+  const liveHead = String(args.liveHead ?? "");
+  const expectedHead = String(args.expectedHead ?? "");
+  const liveState = String(args.liveState ?? "").trim().toUpperCase();
+
+  if (liveState !== "OPEN") {
+    throw new Error(
+      `base-guarded merge: PR #${args.pr} is not OPEN at merge write ` +
+        `(state=${liveState || "(empty)"}). Refusing merge.`,
+    );
+  }
+  if (liveBase !== expectedBase) {
+    throw new Error(
+      `base-guarded merge: PR #${args.pr} base branch mismatch at merge write: ` +
+        `baseRefName=${liveBase || "(empty)"} expected=${expectedBase}. ` +
+        `Refusing merge (possible retarget race).`,
+    );
+  }
+  if (!expectedHead || liveHead !== expectedHead) {
+    throw new Error(
+      `base-guarded merge: PR #${args.pr} head moved between gate and merge write ` +
+        `(gate=${expectedHead ? expectedHead.slice(0, 12) : "(empty)"} ` +
+        `live=${liveHead ? liveHead.slice(0, 12) : "(empty)"}). Refusing merge.`,
+    );
+  }
+}
+
+/**
+ * Pure post-merge assertion: queue success requires a real GitHub MERGED record
+ * on the expected base — never CLOSED-as-success after a direct ref update.
+ */
+export function assertBaseGuardedMergeResult(args: {
+  pr: number;
+  expectedBase: string;
+  state: string;
+  baseRefName: string;
+}): void {
+  const expectedBase = args.expectedBase.trim();
+  const state = String(args.state ?? "").trim().toUpperCase();
+  const baseRefName = String(args.baseRefName ?? "");
+
+  if (state !== "MERGED") {
+    throw new Error(
+      `base-guarded merge: PR #${args.pr} is not MERGED after gh pr merge ` +
+        `(state=${state || "(empty)"}). Refusing to treat non-merged state as success.`,
+    );
+  }
+  if (baseRefName !== expectedBase) {
+    throw new Error(
+      `base-guarded merge: PR #${args.pr} merged onto base=${baseRefName || "(empty)"} ` +
+        `expected=${expectedBase}.`,
+    );
+  }
 }
 
 export function realMergeDeps(repo: string): MergeDeps {
@@ -131,9 +192,49 @@ export function realMergeDeps(repo: string): MergeDeps {
     async ghPrMerge(pr, headRefOid, opts) {
       const expectedBase = (opts?.expectedBaseBranch ?? "").trim();
       if (expectedBase) {
-        await baseBoundSquashMerge(repo, pr, headRefOid, expectedBase);
-        return;
+        // Write-boundary revalidation: refuse retarget / head move before merge.
+        let liveBase = "";
+        let liveHead = "";
+        let liveState = "";
+        try {
+          const { stdout } = await execFileAsync(
+            "gh",
+            [
+              "pr",
+              "view",
+              String(pr),
+              "--json",
+              "baseRefName,headRefOid,state",
+              "-R",
+              repo,
+            ],
+            { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 },
+          );
+          const live = JSON.parse(stdout) as {
+            baseRefName?: string;
+            headRefOid?: string;
+            state?: string;
+          };
+          liveBase = String(live.baseRefName ?? "");
+          liveHead = String(live.headRefOid ?? "");
+          liveState = String(live.state ?? "");
+        } catch (err) {
+          const e = err as { stderr?: string; message?: string };
+          throw new Error(
+            `base-guarded merge: could not re-read PR #${pr} before merge: ` +
+              `${String(e.stderr ?? e.message ?? err).trim()}`,
+          );
+        }
+        assertBaseGuardedMergeWrite({
+          pr,
+          expectedBase,
+          liveBase,
+          liveHead,
+          expectedHead: headRefOid,
+          liveState,
+        });
       }
+
       try {
         await execFileAsync(
           "gh",
@@ -153,10 +254,45 @@ export function realMergeDeps(repo: string): MergeDeps {
         // Only match the specific already-deleted condition — "could not delete"
         // alone can accompany a real failure (e.g. permissions) and must surface.
         if (stderr.includes("already deleted") || stderr.includes("branch not found")) {
-          return;
+          // Fall through to post-check when base-guarded.
+        } else {
+          const raw = String(e.stderr ?? e.message).trim();
+          throw new Error(`gh pr merge failed: ${raw}`);
         }
-        const raw = String(e.stderr ?? e.message).trim();
-        throw new Error(`gh pr merge failed: ${raw}`);
+      }
+
+      if (expectedBase) {
+        // Require real MERGED on the expected base (not CLOSED via pr close).
+        let state = "";
+        let baseRefName = "";
+        try {
+          const { stdout } = await execFileAsync(
+            "gh",
+            [
+              "pr",
+              "view",
+              String(pr),
+              "--json",
+              "state,baseRefName",
+              "-R",
+              repo,
+            ],
+            { timeout: 30_000, maxBuffer: 50 * 1024 * 1024 },
+          );
+          const after = JSON.parse(stdout) as {
+            state?: string;
+            baseRefName?: string;
+          };
+          state = String(after.state ?? "");
+          baseRefName = String(after.baseRefName ?? "");
+        } catch (err) {
+          const e = err as { stderr?: string; message?: string };
+          throw new Error(
+            `base-guarded merge: could not verify PR #${pr} after merge: ` +
+              `${String(e.stderr ?? e.message ?? err).trim()}`,
+          );
+        }
+        assertBaseGuardedMergeResult({ pr, expectedBase, state, baseRefName });
       }
     },
 
@@ -345,178 +481,6 @@ function checkStatusChecks(requiredChecks: RequiredCheck[]): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// Base-bound squash (server-enforced destination)
-// ---------------------------------------------------------------------------
-
-/**
- * Squash the inspected head onto the named expected base and fast-forward that
- * base ref only. Destination is the branch name passed to the ref update API —
- * not the PR's live baseRefName — so a retarget after gate inspection cannot
- * redirect the irreversible write. force=false requires a fast-forward (CAS
- * against the tip used as the squash parent).
- */
-async function baseBoundSquashMerge(
-  repo: string,
-  pr: number,
-  headRefOid: string,
-  expectedBase: string,
-): Promise<void> {
-  const ghApi = async (args: string[], timeout = 30_000): Promise<string> => {
-    const { stdout } = await execFileAsync("gh", ["api", ...args], {
-      timeout,
-      maxBuffer: 50 * 1024 * 1024,
-    });
-    return stdout;
-  };
-
-  // 1. Tree of the inspected head (binds content to headRefOid like --match-head-commit).
-  let headTree: string;
-  try {
-    const headJson = JSON.parse(
-      await ghApi([`repos/${repo}/git/commits/${headRefOid}`]),
-    ) as { tree?: { sha?: string } };
-    headTree = String(headJson.tree?.sha ?? "");
-  } catch (err) {
-    const e = err as { stderr?: string; message?: string };
-    throw new Error(
-      `base-bound merge: could not read head commit ${headRefOid}: ${String(e.stderr ?? e.message ?? err).trim()}`,
-    );
-  }
-  if (!headTree) {
-    throw new Error(
-      `base-bound merge: head commit ${headRefOid} has empty tree sha; refusing merge.`,
-    );
-  }
-
-  // 2. Current tip of the *named* expected base (destination ref).
-  const baseRefPath = gitHeadsRefApiPath(expectedBase, false);
-  let baseTip: string;
-  try {
-    const refJson = JSON.parse(
-      await ghApi([`repos/${repo}/${baseRefPath}`]),
-    ) as { object?: { sha?: string } };
-    baseTip = String(refJson.object?.sha ?? "");
-  } catch (err) {
-    const e = err as { stderr?: string; message?: string };
-    throw new Error(
-      `base-bound merge: could not read base ref ${expectedBase}: ${String(e.stderr ?? e.message ?? err).trim()}`,
-    );
-  }
-  if (!baseTip) {
-    throw new Error(
-      `base-bound merge: base branch ${expectedBase} has empty tip sha; refusing merge.`,
-    );
-  }
-
-  // 3. Squash commit: single parent = base tip, tree = head tree.
-  const message =
-    `Squash merge PR #${pr} into ${expectedBase} ` +
-    `(base-bound; head ${headRefOid.slice(0, 12)})`;
-  let squashSha: string;
-  try {
-    const commitJson = JSON.parse(
-      await ghApi([
-        "-X",
-        "POST",
-        `repos/${repo}/git/commits`,
-        "-f",
-        `message=${message}`,
-        "-f",
-        `tree=${headTree}`,
-        "-f",
-        `parents[]=${baseTip}`,
-      ]),
-    ) as { sha?: string };
-    squashSha = String(commitJson.sha ?? "");
-  } catch (err) {
-    const e = err as { stderr?: string; message?: string };
-    throw new Error(
-      `base-bound merge: create squash commit failed: ${String(e.stderr ?? e.message ?? err).trim()}`,
-    );
-  }
-  if (!squashSha) {
-    throw new Error(`base-bound merge: create squash commit returned empty sha; refusing ref update.`);
-  }
-
-  // 4. Fast-forward only the expected base ref (server-enforced destination + CAS).
-  const baseRefsPath = gitHeadsRefApiPath(expectedBase, true);
-  try {
-    await ghApi(
-      [
-        "-X",
-        "PATCH",
-        `repos/${repo}/${baseRefsPath}`,
-        "-f",
-        `sha=${squashSha}`,
-        "-F",
-        "force=false",
-      ],
-      60_000,
-    );
-  } catch (err) {
-    const e = err as { stderr?: string; message?: string };
-    throw new Error(
-      `base-bound merge: fast-forward of ${expectedBase} to ${squashSha.slice(0, 12)} failed ` +
-        `(base may have moved): ${String(e.stderr ?? e.message ?? err).trim()}`,
-    );
-  }
-
-  // 5. Close PR if still open and delete head branch (parity with --delete-branch).
-  // Base ref already advanced — cleanup failures are non-fatal.
-  let headRefName = "";
-  let prState = "";
-  try {
-    const { stdout } = await execFileAsync(
-      "gh",
-      [
-        "pr",
-        "view",
-        String(pr),
-        "--json",
-        "headRefName,state",
-        "-R",
-        repo,
-      ],
-      { timeout: 30_000 },
-    );
-    const meta = JSON.parse(stdout) as { headRefName?: string; state?: string };
-    headRefName = String(meta.headRefName ?? "").trim();
-    prState = String(meta.state ?? "").trim().toUpperCase();
-  } catch {
-    // Best-effort metadata only.
-  }
-
-  if (prState === "OPEN") {
-    try {
-      await execFileAsync(
-        "gh",
-        [
-          "pr",
-          "close",
-          String(pr),
-          "--comment",
-          `Merged into \`${expectedBase}\` via merge-queue base-bound squash ` +
-            `(head ${headRefOid.slice(0, 12)} → ${squashSha.slice(0, 12)}).`,
-          "-R",
-          repo,
-        ],
-        { timeout: 30_000 },
-      );
-    } catch {
-      // Non-fatal: base already has the squash; PR close is cleanup.
-    }
-  }
-
-  if (headRefName) {
-    try {
-      await ghApi(["-X", "DELETE", `repos/${repo}/${gitHeadsRefApiPath(headRefName, true)}`]);
-    } catch {
-      // Non-fatal: already deleted / gone / permissions — base update is the merge.
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Gate 3: linked issue stage
 // ---------------------------------------------------------------------------
 
@@ -565,11 +529,10 @@ export async function mergePr(pr: number, deps: MergeDeps): Promise<void> {
   deps.log(`[pipeline merge] #${pr}: checking mergeability...`);
 
   // Fetch mergeable state and the head SHA together. headRefOid is threaded
-  // through to the merge write (match-head-commit or base-bound squash parent
-  // tree) so content is bound to the inspected head.
-  // When queue drive supplies expectedBaseBranch, also fetch baseRefName for an
-  // early refuse if already retargeted; the merge write itself is additionally
-  // base-bound so a retarget after this read still cannot land on another base.
+  // through to the merge write (--match-head-commit) so content is bound to the
+  // inspected head. When queue drive supplies expectedBaseBranch, also fetch
+  // baseRefName for an early refuse if already retargeted; the merge write
+  // re-checks base/head at its boundary and post-checks MERGED on that base.
   const expectedBase = (deps.expectedBaseBranch ?? "").trim();
   const viewFields = [
     "mergeable",
@@ -664,11 +627,11 @@ export async function mergePr(pr: number, deps: MergeDeps): Promise<void> {
 
   deps.log(
     expectedBase
-      ? `[pipeline merge] #${pr}: all gates passed — base-bound squash onto ${expectedBase}...`
+      ? `[pipeline merge] #${pr}: all gates passed — base-guarded squash onto ${expectedBase}...`
       : `[pipeline merge] #${pr}: all gates passed — squash-merging and deleting branch...`,
   );
-  // When expectedBase is set, pass it into the merge write so the production
-  // implementation binds the destination server-side (not only the pre-check).
+  // When expectedBase is set, pass it into the merge write so production
+  // re-validates base/head at the write boundary and requires MERGED after.
   await deps.ghPrMerge(
     pr,
     headRefOid,

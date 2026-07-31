@@ -91,7 +91,7 @@ After confirming checks pass, the handler SHALL resolve the GitHub issue linked 
 ### Requirement: The `merge` sub-command SHALL squash-merge and delete the branch on success
 When all gates pass and `MergeDeps.expectedBaseBranch` is **not** set, the handler SHALL invoke `gh pr merge <pr> --squash --delete-branch --match-head-commit <headRefOid>` where `headRefOid` is the PR head commit SHA fetched in the same `gh pr view` call used for the mergeability gate. The `--match-head-commit` flag binds the merge to the inspected head SHA and causes `gh` to abort if a new commit was pushed between gate inspection and merge execution, closing the head TOCTOU race. The handler SHALL print a confirmation message on success and exit 0.
 
-When `MergeDeps.expectedBaseBranch` **is** set (merge-queue drive), after the same gates pass (including an early refuse if live `baseRefName` does not match the expected base), the handler SHALL perform a **base-bound squash** onto that named base branch: create a squash commit whose tree is the inspected head and whose parent is the current tip of the expected base, then fast-forward-update only `refs/heads/<expectedBaseBranch>` (non-force). The irreversible write SHALL target the named expected base ref — not the PR's live `baseRefName` at merge time — so a PR retarget between the gate read and the write cannot land the merge on another base. The handler SHALL then best-effort close the PR and delete the head branch (parity with `--delete-branch`).
+When `MergeDeps.expectedBaseBranch` **is** set (merge-queue drive), after the same gates pass (including an early refuse if live `baseRefName` does not match the expected base), the handler SHALL still invoke real `gh pr merge <pr> --squash --delete-branch --match-head-commit <headRefOid>` so GitHub computes a true three-way squash, records the PR as **MERGED** (not CLOSED), applies normal linked-issue side effects, and deletes only the PR head branch (including correct handling of fork heads). Immediately before that call the production write SHALL re-read the PR's `baseRefName` and `headRefOid` and SHALL refuse if they no longer match the expected base / inspected head. After a successful merge call it SHALL re-read the PR and SHALL refuse to report success unless `state` is `MERGED` and `baseRefName` still equals the expected base. The handler SHALL NOT create a squash commit from the raw PR-head tree, SHALL NOT fast-forward the base ref via the Git Data API as a stand-in for merge, SHALL NOT `gh pr close` as a stand-in for merge, and SHALL NOT delete `repos/<repo>/git/refs/heads/<headRefName>` by short name (fork PRs can share a short name with an unrelated base-repo branch).
 
 #### Scenario: Successful squash merge
 - **WHEN** all three gates pass (mergeable, checks, issue stage) and `expectedBaseBranch` is unset
@@ -111,15 +111,17 @@ When `MergeDeps.expectedBaseBranch` **is** set (merge-queue drive), after the sa
 - **WHEN** `gh pr merge` exits non-zero for any reason other than branch already deleted
 - **THEN** the handler SHALL exit non-zero with the `gh` error output surfaced to the user
 
-#### Scenario: Expected base threads into base-bound merge write
+#### Scenario: Expected base threads into base-guarded merge write
 - **WHEN** `MergeDeps.expectedBaseBranch` is set and the PR's live base matches at the pre-merge gate
 - **THEN** the handler SHALL invoke `ghPrMerge` with `opts.expectedBaseBranch` equal to that expected base
-- **AND** the production write SHALL bind the destination to that named base ref server-side
+- **AND** the production write SHALL re-validate that live `baseRefName` still equals the expected base immediately before `gh pr merge`
+- **AND** SHALL require the PR to be `MERGED` onto that base after the call
 
-#### Scenario: Retarget after gate cannot redirect base-bound destination
-- **WHEN** `expectedBaseBranch` is set, the gate observed a matching `baseRefName`, and the PR is retargeted to another base before the merge write completes
-- **THEN** the base-bound write SHALL still update only `refs/heads/<expectedBaseBranch>`
-- **AND** SHALL NOT land the squash on the retargeted base
+#### Scenario: Retarget after gate is refused at write boundary
+- **WHEN** `expectedBaseBranch` is set, the gate observed a matching `baseRefName`, and the PR is retargeted to another base before the merge write runs
+- **THEN** the production write-boundary re-check SHALL refuse the merge
+- **AND** SHALL NOT invoke a raw-head-tree base ref update
+- **AND** SHALL NOT report success for a CLOSED (non-MERGED) PR
 
 ---
 

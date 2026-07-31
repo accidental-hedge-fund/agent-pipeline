@@ -203,16 +203,16 @@ treat the mismatch as a surgical-repair hold.
 - **AND** SHALL NOT call `mergePr` for that PR
 - **AND** SHALL NOT invoke surgical repair solely to "fix" the wrong base
 
-#### Scenario: Merge write binds expected base server-side against retarget-to-merge race
+#### Scenario: Merge write re-guards expected base and uses real gh pr merge
 
 - **WHEN** the drive calls `mergePr` with a configured expected base after gates pass
 - **THEN** `mergePr` SHALL pass that expected base into the merge write (`ghPrMerge` opts)
-- **AND** the production merge write SHALL land on the named expected base via a
-  server-enforced base-bound squash (explicit base ref update), not solely via
-  `gh pr merge` which only binds head SHA
+- **AND** the production merge write SHALL re-validate live `baseRefName` against the
+  expected base immediately before `gh pr merge --squash --delete-branch --match-head-commit`
+- **AND** SHALL require a real GitHub `MERGED` result on that base (not `CLOSED` via
+  `gh pr close`, and not a raw PR-head-tree base ref update)
 - **AND** a unit test SHALL demonstrate that a retarget of the PR base between the
-  gate read and the merge write cannot redirect the destination away from the
-  expected base
+  gate read and the merge write is refused at the write boundary
 
 ---
 
