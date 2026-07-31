@@ -740,8 +740,9 @@ for (const flagArgs of ALLOWED_MERGE_FLAGS) {
 // 4.16 Loop-isolation guarantee
 //
 // Reads every stage handler file and asserts none of them import from merge.ts.
-// Also reads pipeline.ts and verifies the dispatch() function body does not
-// reference mergePr, preserving the never-auto-merge structural invariant.
+// Also reads pipeline-run.ts and verifies the advance dispatch path does not
+// import or call mergePr, preserving the never-autonomous-merge structural
+// invariant (#217 / #764).
 // ---------------------------------------------------------------------------
 
 test("merge: loop-isolation — no stage handler imports from merge.ts", () => {
@@ -764,7 +765,7 @@ test("merge: loop-isolation — no stage handler imports from merge.ts", () => {
       content.includes("require('../stages/merge");
     assert.ok(
       !hasImport,
-      `Stage handler ${file} must not import from merge.ts — the autonomous loop must stay merge-free (#217)`,
+      `Stage handler ${file} must not import from merge.ts — the autonomous loop must stay merge-free (#217/#764)`,
     );
   }
 });
@@ -774,6 +775,17 @@ test("merge: loop-isolation — dispatch() in pipeline-run.ts does not call merg
   // The invariant is preserved: check pipeline-run.ts instead.
   const pipelineRunTs = path.join(__dirname, "..", "scripts", "pipeline-run.ts");
   const content = fs.readFileSync(pipelineRunTs, "utf8");
+
+  // Whole-module guard: advance loop source must not import merge.ts / mergePr.
+  // (CLI wiring of `pipeline merge` lives in pipeline.ts, outside this path.)
+  assert.ok(
+    !content.includes("mergePr") &&
+      !content.includes('from "./stages/merge') &&
+      !content.includes("from './stages/merge") &&
+      !content.includes('from "./stages/merge-queue') &&
+      !content.includes("from './stages/merge-queue"),
+    "pipeline-run.ts (advance loop) must not import or reference mergePr / merge-queue — never-autonomous-merge (#764)",
+  );
 
   // Extract the dispatch() function body by finding its declaration and the
   // closing brace at the same indentation level. We look for the function text
@@ -802,6 +814,6 @@ test("merge: loop-isolation — dispatch() in pipeline-run.ts does not call merg
   const dispatchBody = content.slice(dispatchStart, dispatchEnd + 1);
   assert.ok(
     !dispatchBody.includes("mergePr"),
-    "dispatch() must not call mergePr — the advance loop must never invoke the merge handler (#217)",
+    "dispatch() must not call mergePr — the advance loop must never invoke the merge handler (#217/#764)",
   );
 });

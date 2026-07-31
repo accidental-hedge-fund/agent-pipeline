@@ -20,7 +20,12 @@ conventions. Keep it in sync with `CLAUDE.md`.
    **full history and tags** so tag-dependent generators match a full local clone.
    Treat a red `ci` as not-done.
 3. **Rigor over latency.** Do not disable or default-demote review steps.
-4. **The pipeline never merges.** No auto-merge path; no `auto_merge` config key.
+4. **No autonomous merges.** The advance loop stops at `pipeline:ready-to-deploy`. Merging
+   happens only through explicit operator invocation (`pipeline merge` / `/pipeline:merge`
+   per-PR; `merge-queue --apply` batch, dry-run default); the invoking operator is the
+   session-bound merge authority. There is no `auto_merge` config key and no unattended
+   merge path — don't add either. Unattended merge remains gated on #662's shadow-calibrated
+   evidence standard.
 5. **Verify external shapes; never guess.** Confirm `gh --json` field names with
    a real call before coding against them.
 

@@ -1,6 +1,6 @@
 # agent-pipeline
 
-**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 15-stage state machine — planning → plan-review → implementing → design-gate → review → fix → pre-merge → visual-gate → eval-gate → shipcheck-gate. It does **not** auto-merge; you own the merge button.
+**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to a green, current, mergeable `pipeline:ready-to-deploy` result through a 15-stage state machine — planning → plan-review → implementing → design-gate → review → fix → pre-merge → visual-gate → eval-gate → shipcheck-gate. Autonomy ends at ready-to-deploy: the advance loop never merges. Merge requires explicit session-bound operator authority (`pipeline merge` per-PR; `merge-queue --apply` for batch; dry-run is the merge-queue default). Autonomous deployment and unattended end-to-end SDLC/ADLC are out of scope.
 
 It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)** from a single shared TypeScript core. **Both harnesses are required for every run**: one implements, and the other cross-reviews. By default, `/pipeline` uses Claude to implement and Codex to review; `$pipeline` inverts this. The pipeline is cross-harness by design — you cannot skip the reviewer install.
 
@@ -8,7 +8,7 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 
 ![agent-pipeline state machine — ready → deploy-ready, no human writes the code](docs/assets/state-machine.png)
 
-`ready` is the queue/opt-in entry point. Once a run starts, long-running work is labelled and recorded under the concrete stages that are doing it: `planning`, `plan-review`, and `implementing`. Recoverable stops keep the active `pipeline:*` stage plus `blocked`; exhausted or ambiguous paths park at `needs-human`. The pipeline never guesses past uncertainty and never presses merge.
+`ready` is the queue/opt-in entry point. Once a run starts, long-running work is labelled and recorded under the concrete stages that are doing it: `planning`, `plan-review`, and `implementing`. Recoverable stops keep the active `pipeline:*` stage plus `blocked`; exhausted or ambiguous paths park at `needs-human`. The pipeline never guesses past uncertainty and the advance loop never merges.
 
 | Band | What happens |
 | --- | --- |
@@ -17,12 +17,12 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 | Bounded convergence | Review/fix rounds are capped by policy and guarded against recurring findings. If the run cannot converge cleanly, it stops with evidence instead of looping indefinitely. |
 | Surgical fixes | `fix-1` and `fix-2` are scoped to reviewer findings. No opportunistic refactors, no scope creep, no destructive cleanup. |
 | Gated stop | `pre-merge` checks CI, conflicts, mergeability, and spec archive. `visual-gate` can run a repo-defined E2E/visual suite (e.g. Playwright) and captures its artifacts as PR-visible evidence. `eval-gate` can run a repo-defined eval/scoring suite. `shipcheck-gate` lets the reviewer apply an acceptance rubric. |
-| Human merge | `ready-to-deploy` is terminal for the autonomous loop. A human owns the merge button. |
+| Operator merge | `ready-to-deploy` is terminal for the autonomous loop. Merge only under explicit operator invocation (`pipeline merge`, `merge-queue --apply`); no `auto_merge` config key. |
 
 | Naive AI loop | agent-pipeline lifecycle |
 | --- | --- |
-| `prompt -> code -> merge` | `plan -> build -> review/fix -> gated stop` |
-| Unreviewed, unbounded, opaque | Reviewed, bounded, audited, human-gated |
+| `prompt -> code -> merge` | `plan -> build -> review/fix -> ready-to-deploy` (operator merges) |
+| Unreviewed, unbounded, opaque | Reviewed, bounded, audited; merge is session-bound operator authority |
 
 ## Contents
 

@@ -25,8 +25,12 @@ review steps must follow.
    default-demote review steps to go faster. Speed work must be rigor-preserving (better
    prompts, removing dead/deterministic asks, fixing real convergence bugs) — never by
    removing review coverage.
-4. **The pipeline never merges.** It stops at `pipeline:ready-to-deploy`; a human owns the
-   merge button. There is no auto-merge path and no `auto_merge` config key — don't add either.
+4. **No autonomous merges.** The advance loop stops at `pipeline:ready-to-deploy`. Merging
+   happens only through explicit operator invocation (`pipeline merge` / `/pipeline:merge`
+   per-PR; `merge-queue --apply` batch, dry-run default); the invoking operator is the
+   session-bound merge authority. There is no `auto_merge` config key and no unattended
+   merge path — don't add either. Unattended merge remains gated on #662's shadow-calibrated
+   evidence standard.
 5. **Verify external shapes; never guess.** Especially `gh --json` field names: confirm the
    real output (`gh pr view N --json <field>`) before coding against it. Guessing gh field
    shapes has caused multiple wasted review rounds.

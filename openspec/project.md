@@ -24,5 +24,6 @@ shared TypeScript core; the two hosts differ only by a JSON profile.
   `{{placeholders}}`, opt-in/auto-detected config) over novel approaches.
 
 ## Out of scope
-- Auto-merging PRs — the pipeline stops at `pipeline:ready-to-deploy`; a human
-  owns the merge button.
+- Autonomous/unattended merging — the advance loop stops at
+  `pipeline:ready-to-deploy`; merge requires explicit operator invocation
+  (`pipeline merge`, `merge-queue --apply`). No `auto_merge` config key.

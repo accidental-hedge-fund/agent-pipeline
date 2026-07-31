@@ -13,9 +13,11 @@ description: |
 # pipeline
 
 Self-contained TypeScript skill that advances a GitHub issue (or PR's linked
-issue) through a 13-stage label-driven state machine, ending at
-`pipeline:ready-to-deploy`. The pipeline does NOT auto-merge — the user owns
-the merge button.
+issue) through a 13-stage label-driven state machine, ending at a green,
+current, mergeable `pipeline:ready-to-deploy` result. Autonomy ends there: the
+advance loop never merges. Merge requires explicit session-bound operator
+authority (`/pipeline:merge` per-PR; `/pipeline:merge-queue --apply` batch;
+dry-run is the merge-queue default). Autonomous deployment is out of scope.
 
 ## Developing this skill itself (core/ → plugin/ mirror)
 
@@ -925,8 +927,9 @@ node ~/.claude/skills/pipeline/scripts/pipeline.mjs summary <run-id>
 
 Include starting stage, ending stage, transitions made, wall-clock elapsed, PR
 URL if one was opened, the terminal state, and the merge-next-step note that
-the pipeline does not auto-merge. Also send one final notify via the host map
-with the terminal state (Claude: `PushNotification`).
+the advance loop does not merge and merge requires explicit operator invocation
+(`/pipeline:merge` or `/pipeline:merge-queue --apply`). Also send one final
+notify via the host map with the terminal state (Claude: `PushNotification`).
 
 
 ### 4b. Orchestration pattern for `/pipeline:loop` (multi-item durable drive/resume)
@@ -1380,7 +1383,7 @@ When the loop ends, the skill prints:
 
 ## What this skill never does
 
-- Auto-merge PRs autonomously — the advance loop never merges and there is no `auto_merge` config key. The human-invoked `/pipeline merge <pr>` command is the controlled, explicit surface for merging after `pipeline:ready-to-deploy`; it is never called by the advance loop. `/pipeline:merge-queue --milestone <m>` is a dry-run planner only (ordered R2D candidates); it never merges and is never called by advance.
+- Auto-merge PRs autonomously or unattended — the advance loop never merges and there is no `auto_merge` config key. Merge requires explicit session-bound operator authority: `/pipeline merge <pr>` (per-PR squash after `pipeline:ready-to-deploy`) and `/pipeline:merge-queue --milestone <m> --apply` (batch sequential merge; dry-run is the default without `--apply`). Neither surface is ever called by the advance loop. Unattended merge remains out of scope (#662).
 - Bypass the `pipeline:*` opt-in label gate.
 - Run more than one transition under `--once`.
 - Touch the GitHub repo in `--dry-run` mode.
