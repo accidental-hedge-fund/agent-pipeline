@@ -7,6 +7,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
   DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT,
@@ -19,6 +21,7 @@ import {
   runSupervisorCycle,
   type SupervisorDeps,
 } from "../scripts/loop/supervisor.ts";
+import { ACTIVE_RUN_STORE_MAX_AGE_MS } from "../scripts/loop/live-advance.ts";
 import {
   acquireLock,
   initRun,
@@ -2911,6 +2914,122 @@ test("regression (#770 ce4794fb / hold-clear): blocked cleared while live advanc
     events.some((e) => e.kind === "loop_item_coexistence_deferred"),
     "durable deferred re-admission record required",
   );
+});
+
+test("regression (#770 956d20df): default probe path uses deps.findWrapperPid (no full probe override)", async () => {
+  // Production defaultRunLoopEngine wires findWrapperPid + repoDir + lockDomain and
+  // does NOT replace probeLiveAdvance. This test exercises that wiring shape.
+  const contract = testContract({ items: [{ id: "675", depends_on: [] }] });
+  const ledger = testLedger({ "675": itemEntry("675", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe } = coordinatedFakes();
+  const calls: string[] = [];
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request.item_id);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle = await runSupervisorCycle(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      // No probeLiveAdvance override — production default path.
+      repoDir: "/tmp/not-a-real-repo-770",
+      lockDomain: "agent-pipeline",
+      findWrapperPid: () => process.pid,
+    },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(calls.length, 0, "live wrapper PID must block a second full dispatch");
+  assert.equal(cycle.stop, null, "wrapper coexistence must not run_fatal");
+  const events = await readEvents(deps, "run-1");
+  const coexistence = events.filter((e) => e.kind === "loop_item_coexistence_wait");
+  assert.ok(coexistence.length >= 1);
+  assert.equal((coexistence[0]!.data as { evidence?: string }).evidence, "wrapper_pid");
+});
+
+test("regression (#770 b48730b7): default probe with stale crash store does not block genuine defect", async () => {
+  // Old non-terminal run-store + no live lock/wrapper must NOT force coexistence;
+  // a genuine crash outcome must still be able to escalate to workflow-engine-defect.
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: [PIPELINE_READY_LABEL, "pipeline:review-1"] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [{ label: "pipeline:review-1", createdAt: "2026-07-22T00:00:00.000Z" }];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "engine_internal_crash" as LoopExecutionResponse["outcome"],
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+
+  // Stale crash store on disk for this issue — default probe (no override) must
+  // treat it as not-live so Pass-2 keeps genuine-defect / run_fatal.
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "loop-stale-770-"));
+  const runId = "100-crash-old";
+  const dir = path.join(repo, ".agent-pipeline", "runs", runId);
+  fs.mkdirSync(dir, { recursive: true });
+  const events = path.join(dir, "events.jsonl");
+  fs.writeFileSync(events, JSON.stringify({ type: "stage_start", stage: "fix" }) + "\n");
+  const old = (Date.now() - ACTIVE_RUN_STORE_MAX_AGE_MS - 120_000) / 1000;
+  fs.utimesSync(dir, old, old);
+  fs.utimesSync(events, old, old);
+
+  try {
+    const result = await driveSupervisor(
+      {
+        store: deps,
+        observe,
+        dispatchItem,
+        // Default probe path: repoDir only — no findWrapperPid, no probe override.
+        repoDir: repo,
+        lockDomain: "agent-pipeline",
+      },
+      { runId: "run-1", engine: "claude" },
+    );
+
+    assert.equal(result.stop?.reason, "run_fatal", "stale crash store must not mask genuine defect");
+    const finalLedger = await readLedger(deps, "run-1");
+    assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test("regression (#770 ce4794fb): hold-clear with terminal linkage (probe not live) re-admits and dispatches", async () => {

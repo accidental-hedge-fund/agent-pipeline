@@ -2,12 +2,14 @@
 // classifiers for loop/operator coexistence (#770).
 //
 // Unit tests inject the probe; production wires lock-file PID liveness,
-// non-terminal run-store detection, and terminal-aware loop linkage.
+// freshness-bounded non-terminal run-store detection, wrapper/process identity
+// under ~/.pipeline/runs/<issue>, and terminal-aware loop linkage.
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { homedir } from "node:os";
 import { RUNS_ARTIFACT, artifactSubdir } from "../artifact-ignore.ts";
+import { LOCK_ACQUIRED_FILE, issueRunsDir, lockFilePath } from "../detach.ts";
 
 export type LiveAdvanceEvidenceClass =
   | "lock_held"
@@ -24,6 +26,15 @@ export type LiveAdvanceProbeResult =
       holder_pid?: number;
       events_path?: string;
     };
+
+/**
+ * Host-local freshness bound for non-terminal advance run-stores (#770 review 2
+ * b48730b7). A crashed advance leaves exactly the non-terminal events shape;
+ * without a bound those crash artifacts would look "live" forever and suppress
+ * genuine re-dispatch / run_fatal classification. Long-running advances that
+ * go quiet are covered by live lock / wrapper PID evidence instead.
+ */
+export const ACTIVE_RUN_STORE_MAX_AGE_MS = 30 * 60 * 1000;
 
 /** Match detach handshake / install race / already-running strings. Pure. */
 export function isCoexistenceFailureEvidence(text: string | null | undefined): boolean {
@@ -82,19 +93,33 @@ export function tryReadTextFile(filePath: string): string | null {
   }
 }
 
+/** True when `process.kill(pid, 0)` succeeds (process exists / EPERM). */
+export function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Parse a lock / `.lock-acquired` body into a positive PID, or null. */
+export function parsePidText(raw: string | null | undefined): number | null {
+  if (!raw) return null;
+  const pid = Number(raw.trim().split(/\s+/)[0]);
+  if (!Number.isFinite(pid) || pid <= 0) return null;
+  return pid;
+}
+
 /** Read a lock file path; live when PID is parseable and `process.kill(pid, 0)` succeeds. */
 export function isLockFileLive(lockPath: string): { live: boolean; pid?: number } {
   try {
     if (!fs.existsSync(lockPath)) return { live: false };
-    const raw = fs.readFileSync(lockPath, "utf8").trim();
-    const pid = Number(raw.split(/\s+/)[0]);
-    if (!Number.isFinite(pid) || pid <= 0) return { live: false };
-    try {
-      process.kill(pid, 0);
-      return { live: true, pid };
-    } catch {
-      return { live: false };
-    }
+    const pid = parsePidText(fs.readFileSync(lockPath, "utf8"));
+    if (pid == null) return { live: false };
+    if (isPidAlive(pid)) return { live: true, pid };
+    return { live: false };
   } catch {
     return { live: false };
   }
@@ -132,19 +157,13 @@ export function resolveLinkageTerminalState(
 }
 
 /**
- * Freshness bound for treating a non-terminal run-store as live without a
- * corroborating lock/wrapper PID (#770 review 2 b48730b7). Stale crash stores
- * older than this are not coexistence evidence.
- */
-export const ACTIVE_RUN_STORE_MAX_AGE_MS = 15 * 60 * 1000;
-
-/**
- * Newest **fresh** non-terminal advance run-store for an issue under
+ * Newest *fresh* non-terminal advance run-store for an issue under
  * `<repoDir>/.agent-pipeline/runs/<issue>-*`, or null when none.
  *
- * A non-terminal events file alone is not enough — require mtime within
- * {@link ACTIVE_RUN_STORE_MAX_AGE_MS} (or injectable nowMs) so crashed advances
- * that left `run_complete` missing do not block re-dispatch forever.
+ * Freshness: events.jsonl (or the run dir when events are absent) must have
+ * mtime within {@link ACTIVE_RUN_STORE_MAX_AGE_MS} of `nowMs`. Stale crash
+ * artifacts without recent activity are not treated as live (#770 review 2
+ * b48730b7) — live long-running advances are covered by lock / wrapper PID.
  */
 export function findActiveRunStoreForIssue(
   repoDir: string,
@@ -153,7 +172,7 @@ export function findActiveRunStoreForIssue(
     readdirSync?: (dir: string) => string[];
     statMtimeMs?: (p: string) => number;
     readText?: (p: string) => string | null;
-    nowMs?: () => number;
+    nowMs?: number;
     maxAgeMs?: number;
   },
 ): { pipeline_run_id: string; events_path: string } | null {
@@ -168,7 +187,7 @@ export function findActiveRunStoreForIssue(
       }
     });
   const read = opts?.readText ?? tryReadTextFile;
-  const now = opts?.nowMs?.() ?? Date.now();
+  const now = opts?.nowMs ?? Date.now();
   const maxAge = opts?.maxAgeMs ?? ACTIVE_RUN_STORE_MAX_AGE_MS;
   const runsRoot = artifactSubdir(repoDir, RUNS_ARTIFACT);
   let names: string[];
@@ -182,13 +201,17 @@ export function findActiveRunStoreForIssue(
     .filter((n) => n.startsWith(prefix) && !n.includes("/") && n !== "." && n !== "..")
     .map((name) => ({ name, mtime: mtimeMs(path.join(runsRoot, name)) }))
     .sort((a, b) => b.mtime - a.mtime);
-  for (const { name, mtime } of candidates) {
-    if (mtime <= 0 || now - mtime > maxAge) continue; // stale crash store
+  for (const { name, mtime: dirMtime } of candidates) {
     const events_path = path.join(runsRoot, name, "events.jsonl");
+    const eventsMtime = mtimeMs(events_path);
+    const activityMs = eventsMtime > 0 ? eventsMtime : dirMtime;
+    // Stale non-terminal crash store: skip (do not treat as live forever).
+    if (activityMs <= 0 || now - activityMs > maxAge) continue;
+
     const text = read(events_path);
     if (text === null) {
       // No events yet but run dir exists — treat as active only when run.json
-      // is present (store initialized), summary is absent, and dir is fresh.
+      // is present (store initialized) and summary is absent.
       const runJson = read(path.join(runsRoot, name, "run.json"));
       const summary = read(path.join(runsRoot, name, "summary.json"));
       if (runJson !== null && summary === null) {
@@ -204,51 +227,66 @@ export function findActiveRunStoreForIssue(
 }
 
 /**
- * Best-effort live wrapper PID for issue N from `~/.pipeline/runs/<N>/…-p<pid>`
- * directory names (detach launcher layout). Pure over injectable readdir + kill.
+ * Production wrapper / process-identity lookup for an issue (#770 review 2
+ * 956d20df). Host-local only — reads the detach issue lock and newest
+ * non-sentinel run dirs' `.lock-acquired` under `~/.pipeline/runs/<issue>/`.
+ * Returns a live PID or null. Injectable FS / liveness for unit tests.
  */
 export function findWrapperPidForIssue(
   issueNumber: number,
   opts?: {
-    runsHome?: string;
+    homedir?: string;
     readdirSync?: (dir: string) => string[];
-    isPidLive?: (pid: number) => boolean;
+    readText?: (p: string) => string | null;
+    isPidAlive?: (pid: number) => boolean;
+    statMtimeMs?: (p: string) => number;
   },
 ): number | null {
-  const home =
-    opts?.runsHome ?? path.join(homedir(), ".pipeline", "runs", String(issueNumber));
+  const home = opts?.homedir ?? os.homedir();
   const readdir = opts?.readdirSync ?? ((dir: string) => fs.readdirSync(dir));
-  const isLive =
-    opts?.isPidLive ??
-    ((pid: number) => {
+  const read = opts?.readText ?? tryReadTextFile;
+  const alive = opts?.isPidAlive ?? isPidAlive;
+  const mtimeMs =
+    opts?.statMtimeMs ??
+    ((p: string) => {
       try {
-        process.kill(pid, 0);
-        return true;
+        return fs.statSync(p).mtimeMs;
       } catch {
-        return false;
+        return 0;
       }
     });
+
+  const issueDir = issueRunsDir(home, issueNumber);
+
+  // 1. Detach issue-level advisory lock (`~/.pipeline/runs/<issue>/.lock`)
+  const detachLock = lockFilePath(home, issueNumber);
+  const lockPid = parsePidText(read(detachLock));
+  if (lockPid != null && alive(lockPid)) return lockPid;
+
+  // 2. Newest non-terminal detach run dirs with a live `.lock-acquired` PID
   let names: string[];
   try {
-    names = readdir(home);
+    names = readdir(issueDir);
   } catch {
     return null;
   }
-  // Prefer newest-looking dir names (lexicographic ISO timestamps sort well).
-  const sorted = [...names].sort().reverse();
-  for (const name of sorted) {
-    const m = /-p(\d+)$/.exec(name);
-    if (!m) continue;
-    const pid = Number(m[1]);
-    if (!Number.isFinite(pid) || pid <= 0) continue;
-    if (isLive(pid)) return pid;
+  const candidates = names
+    .filter((n) => n !== "." && n !== ".." && n !== ".lock" && !n.startsWith("."))
+    .map((name) => ({ name, mtime: mtimeMs(path.join(issueDir, name)) }))
+    .sort((a, b) => b.mtime - a.mtime);
+  for (const { name } of candidates) {
+    const dir = path.join(issueDir, name);
+    // sentinel.json means the wrapper already exited — not live identity.
+    if (read(path.join(dir, "sentinel.json")) !== null) continue;
+    const acquiredPid = parsePidText(read(path.join(dir, LOCK_ACQUIRED_FILE)));
+    if (acquiredPid != null && alive(acquiredPid)) return acquiredPid;
   }
   return null;
 }
 
 /**
- * Production probe: host-local lock PID, non-terminal run-store, optional
- * wrapper PID, and terminal-aware loop linkage.
+ * Production probe: host-local lock PID, freshness-bounded non-terminal
+ * run-store, optional wrapper PID, and terminal-aware loop linkage.
  *
  * Loop linkage is live only when proven non-terminal. A retained
  * `advance_run_id` whose run already completed MUST NOT block re-admission
@@ -302,7 +340,7 @@ export function probeLiveAdvance(input: {
     // terminal === true or null: fall through to other evidence sources
   }
 
-  // 3. Active (non-terminal) advance run-store for this issue
+  // 3. Active (fresh, non-terminal) advance run-store for this issue
   if (input.findActiveRunStore) {
     const active = input.findActiveRunStore(input.issueNumber);
     if (active) {
@@ -326,15 +364,12 @@ export function probeLiveAdvance(input: {
   }
 
   // 4. Live wrapper / process identity for the issue
-  const wrapperPid = input.findWrapperPid
-    ? input.findWrapperPid(input.issueNumber)
-    : findWrapperPidForIssue(input.issueNumber);
-  if (wrapperPid != null && Number.isFinite(wrapperPid) && wrapperPid > 0) {
-    try {
-      process.kill(wrapperPid, 0);
-      return { live: true, evidence: "wrapper_pid", holder_pid: wrapperPid };
-    } catch {
-      /* dead */
+  if (input.findWrapperPid) {
+    const pid = input.findWrapperPid(input.issueNumber);
+    if (pid != null && Number.isFinite(pid) && pid > 0) {
+      if (isPidAlive(pid)) {
+        return { live: true, evidence: "wrapper_pid", holder_pid: pid };
+      }
     }
   }
 

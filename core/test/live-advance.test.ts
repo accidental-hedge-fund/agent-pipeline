@@ -5,14 +5,17 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  ACTIVE_RUN_STORE_MAX_AGE_MS,
   isCoexistenceFailureEvidence,
   isNonFatalMidStageExit,
   isLockFileLive,
   eventsTextIsTerminal,
   resolveLinkageTerminalState,
   findActiveRunStoreForIssue,
+  findWrapperPidForIssue,
   probeLiveAdvance,
 } from "../scripts/loop/live-advance.ts";
+import { LOCK_ACQUIRED_FILE } from "../scripts/detach.ts";
 import { classifyDispatchOutcome } from "../scripts/pipeline.ts";
 import { normalizeLoopOutcome } from "../scripts/loop-execution-contract.ts";
 
@@ -230,13 +233,143 @@ test("findActiveRunStoreForIssue: non-terminal run dir is active; terminal is no
   const newer = Date.now();
   fs.utimesSync(path.join(runs, doneId), newer / 1000, newer / 1000);
   fs.utimesSync(path.join(runs, activeId), (newer - 10_000) / 1000, (newer - 10_000) / 1000);
+  fs.utimesSync(path.join(runs, activeId, "events.jsonl"), (newer - 10_000) / 1000, (newer - 10_000) / 1000);
 
-  const found = findActiveRunStoreForIssue(repo, 42);
+  const found = findActiveRunStoreForIssue(repo, 42, { nowMs: newer });
   assert.ok(found, "expected a non-terminal run");
   assert.equal(found!.pipeline_run_id, activeId);
 
   // Issue with only terminal runs → null
-  assert.equal(findActiveRunStoreForIssue(repo, 99), null);
+  assert.equal(findActiveRunStoreForIssue(repo, 99, { nowMs: newer }), null);
 
   fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test("findActiveRunStoreForIssue / default probe: stale non-terminal crash store is not live (#770 b48730b7)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "live-adv-stale-"));
+  const runs = path.join(repo, ".agent-pipeline", "runs");
+  const crashId = "770-2026-01-01T00-00-00-000Z";
+  fs.mkdirSync(path.join(runs, crashId), { recursive: true });
+  const eventsPath = path.join(runs, crashId, "events.jsonl");
+  fs.writeFileSync(
+    eventsPath,
+    JSON.stringify({ type: "stage_start", stage: "fix", at: "t" }) + "\n",
+  );
+  // Crash left non-terminal events hours ago — no live lock / wrapper.
+  const now = Date.now();
+  const old = now - ACTIVE_RUN_STORE_MAX_AGE_MS - 60_000;
+  fs.utimesSync(path.join(runs, crashId), old / 1000, old / 1000);
+  fs.utimesSync(eventsPath, old / 1000, old / 1000);
+
+  assert.equal(
+    findActiveRunStoreForIssue(repo, 770, { nowMs: now }),
+    null,
+    "stale crash store must not count as active",
+  );
+
+  // Default production path (repoDir only, no injectable findActiveRunStore):
+  // must report not-live so genuine re-dispatch / defect classification remain possible.
+  const r = probeLiveAdvance({
+    domain: "test",
+    issueNumber: 770,
+    repoDir: repo,
+    lockPathForTest: path.join(os.tmpdir(), "no-such-lock-770-stale"),
+  });
+  assert.equal(r.live, false, "default probe must not treat stale crash store as live forever");
+
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test("findActiveRunStoreForIssue: fresh non-terminal store is still active within freshness bound", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "live-adv-fresh-"));
+  const runs = path.join(repo, ".agent-pipeline", "runs");
+  const activeId = "770-fresh-run";
+  fs.mkdirSync(path.join(runs, activeId), { recursive: true });
+  const eventsPath = path.join(runs, activeId, "events.jsonl");
+  fs.writeFileSync(
+    eventsPath,
+    JSON.stringify({ type: "stage_start", stage: "review", at: "t" }) + "\n",
+  );
+  const now = Date.now();
+  fs.utimesSync(path.join(runs, activeId), now / 1000, now / 1000);
+  fs.utimesSync(eventsPath, now / 1000, now / 1000);
+
+  const found = findActiveRunStoreForIssue(repo, 770, { nowMs: now });
+  assert.ok(found);
+  assert.equal(found!.pipeline_run_id, activeId);
+
+  const r = probeLiveAdvance({
+    domain: "test",
+    issueNumber: 770,
+    repoDir: repo,
+    lockPathForTest: path.join(os.tmpdir(), "no-such-lock-770-fresh"),
+  });
+  assert.equal(r.live, true);
+  if (r.live) assert.equal(r.evidence, "active_run_store");
+
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test("findWrapperPidForIssue: live .lock-acquired without sentinel (#770 956d20df)", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "live-adv-wrap-"));
+  const issue = 675;
+  const runDir = path.join(home, ".pipeline", "runs", String(issue), "2026-07-31_run1");
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(path.join(runDir, LOCK_ACQUIRED_FILE), String(process.pid));
+
+  const pid = findWrapperPidForIssue(issue, {
+    homedir: home,
+    isPidAlive: (p) => p === process.pid,
+  });
+  assert.equal(pid, process.pid);
+
+  // Completed detach (sentinel present) must not count.
+  fs.writeFileSync(path.join(runDir, "sentinel.json"), JSON.stringify({ exitCode: 0 }));
+  assert.equal(
+    findWrapperPidForIssue(issue, { homedir: home, isPidAlive: () => true }),
+    null,
+  );
+
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("findWrapperPidForIssue: live detach issue lock", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "live-adv-dlock-"));
+  const issue = 42;
+  const issueDir = path.join(home, ".pipeline", "runs", String(issue));
+  fs.mkdirSync(issueDir, { recursive: true });
+  fs.writeFileSync(path.join(issueDir, ".lock"), String(process.pid));
+
+  assert.equal(
+    findWrapperPidForIssue(issue, {
+      homedir: home,
+      isPidAlive: (p) => p === process.pid,
+    }),
+    process.pid,
+  );
+  assert.equal(
+    findWrapperPidForIssue(issue, {
+      homedir: home,
+      isPidAlive: () => false,
+    }),
+    null,
+    "dead lock PID must not count",
+  );
+
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("probeLiveAdvance: production-shaped wiring with findWrapperPid (#770 956d20df)", () => {
+  // Mirrors defaultRunLoopEngine: repoDir + domain + findWrapperPid, no full probe override.
+  const r = probeLiveAdvance({
+    domain: "agent-pipeline",
+    issueNumber: 675,
+    lockPathForTest: path.join(os.tmpdir(), "no-such-lock-770-prod-wrap"),
+    findWrapperPid: () => process.pid,
+  });
+  assert.equal(r.live, true);
+  if (r.live) {
+    assert.equal(r.evidence, "wrapper_pid");
+    assert.equal(r.holder_pid, process.pid);
+  }
 });

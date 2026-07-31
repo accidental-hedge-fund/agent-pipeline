@@ -2,7 +2,7 @@
 
 ### Requirement: Loop dispatch SHALL not start a second full advance while a host-local advance is already live
 
-Before the durable loop dispatches a full per-item advance through `pipeline/loop-execution@1`, the supervisor SHALL probe host-local evidence for whether an advance is already live for that issue. Live evidence SHALL include any of: a per-issue advisory lock held by a live process, a non-terminal advance run-store for that issue, a live wrapper/process identity for that issue, or a non-terminal advance linkage already recorded on the loop run for that item. When live evidence is present, the loop SHALL attach to the existing advance, skip the dispatch cycle for that item, or wait and re-probe — and SHALL NOT spawn a second full advance that can collide on the lock. The multi-item run SHALL NOT record a `run_fatal` stop solely because that item already had a live advance. The probe and disposition SHALL be injectable so unit tests drive them with no real network, git, or subprocess call. Cross-host advance liveness is out of scope; host-local single-host concurrency remains the supported scope.
+Before the durable loop dispatches a full per-item advance through `pipeline/loop-execution@1`, the supervisor SHALL probe host-local evidence for whether an advance is already live for that issue. Live evidence SHALL include any of: a per-issue advisory lock held by a live process, a **fresh** non-terminal advance run-store for that issue (activity within the host-local freshness bound; a stale non-terminal crash artifact without recent activity and without live lock/wrapper evidence SHALL NOT count as live), a live wrapper/process identity for that issue (production MUST wire a real host-local wrapper/process lookup into the default loop supervisor dependencies — unit tests inject the seam), or a non-terminal advance linkage already recorded on the loop run for that item. When live evidence is present, the loop SHALL attach to the existing advance, skip the dispatch cycle for that item, or wait and re-probe — and SHALL NOT spawn a second full advance that can collide on the lock. The multi-item run SHALL NOT record a `run_fatal` stop solely because that item already had a live advance. The probe and disposition SHALL be injectable so unit tests drive them with no real network, git, or subprocess call. Cross-host advance liveness is out of scope; host-local single-host concurrency remains the supported scope.
 
 #### Scenario: Live lock prevents a second full dispatch
 
@@ -24,6 +24,20 @@ Before the durable loop dispatches a full per-item advance through `pipeline/loo
 - **WHEN** the live-advance probe reports not live and no non-terminal loop linkage exists for the item
 - **THEN** the supervisor MAY dispatch a full advance under existing scheduler rules
 - **AND** this requirement SHALL NOT weaken normal dispatch for clean items
+
+#### Scenario: Stale non-terminal crash store is not live evidence
+
+- **WHEN** the only host-local run-store for an item is non-terminal
+- **AND** its activity is older than the host-local freshness bound
+- **AND** no live lock and no live wrapper/process identity exist for that item
+- **THEN** the live-advance probe SHALL report not live
+- **AND** a subsequent genuine engine defect for that item SHALL still be classifiable under existing `workflow-engine-defect` / `run_fatal` policy
+
+#### Scenario: Production default wiring includes wrapper/process identity
+
+- **WHEN** the durable loop is driven through the production supervisor dependencies (not a unit-test probe override)
+- **THEN** the live-advance probe SHALL be able to observe a live wrapper/process identity for an issue
+- **AND** that observation SHALL prevent a second full dispatch without requiring a test-only injected full probe override
 
 ---
 

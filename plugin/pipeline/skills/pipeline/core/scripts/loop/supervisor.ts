@@ -155,8 +155,9 @@ export interface SupervisorDeps {
   dispatchItem(request: LoopExecutionRequest, hooks?: DispatchItemHooks): Promise<LoopExecutionResponse>;
   /**
    * Host-local live-advance probe (#770). When omitted, production uses
-   * {@link probeLiveAdvance} against the per-issue lock path, non-terminal
-   * run-store under `repoDir`, and terminal-aware loop linkage.
+   * {@link probeLiveAdvance} against the per-issue lock path, freshness-bounded
+   * non-terminal run-store under `repoDir`, optional `findWrapperPid`, and
+   * terminal-aware loop linkage.
    */
   probeLiveAdvance?(itemId: string): Promise<LiveAdvanceProbeResult> | LiveAdvanceProbeResult;
   /** Domain used for per-issue lock paths (default agent-pipeline). */
@@ -166,6 +167,12 @@ export interface SupervisorDeps {
    * When omitted, the default probe still checks lock + provided linkage.
    */
   repoDir?: string;
+  /**
+   * Production wrapper / process-identity lookup for an issue (#770). Wired by
+   * `defaultRunLoopEngine` to `findWrapperPidForIssue`; unit tests inject a
+   * fake or omit (wrapper evidence branch skipped).
+   */
+  findWrapperPid?(issueNumber: number): number | null;
   /** The live changed-file-overlap seam (#530, capability
    *  `durable-run-independent-scheduler`): returns the paths an item's managed worktree actually
    *  changed versus base. Consulted only when more than one item is dispatched in the same cycle
@@ -452,6 +459,7 @@ async function reopenClearedBlockedHolds(
           issueNumber: Number(item.id),
           repoDir: deps.repoDir,
           knownLinkage,
+          findWrapperPid: deps.findWrapperPid,
         });
     if (probe.live) {
       await appendEvent(deps.store, runId, token, "loop_item_coexistence_deferred", {
@@ -722,6 +730,7 @@ export async function runSupervisorCycle(
             issueNumber: Number(itemId),
             repoDir: deps.repoDir,
             knownLinkage,
+            findWrapperPid: deps.findWrapperPid,
           });
       if (probe.live) {
         ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });
@@ -1227,6 +1236,7 @@ export async function runSupervisorCycle(
               issueNumber: Number(itemId),
               repoDir: deps.repoDir,
               knownLinkage,
+              findWrapperPid: deps.findWrapperPid,
             });
         if (isCoexistenceFailureEvidence(errText) || probe.live) {
           coexistenceNoOp = true;

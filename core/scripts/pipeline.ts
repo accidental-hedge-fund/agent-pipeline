@@ -44,7 +44,7 @@ import {
   transition,
 } from "./gh.ts";
 import { isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
-import { isCoexistenceFailureEvidence } from "./loop/live-advance.ts";
+import { findWrapperPidForIssue, isCoexistenceFailureEvidence } from "./loop/live-advance.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import {
   attestPipelineComment,
@@ -1561,9 +1561,12 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     observe: defaultReconcileObserveDeps(cfg),
     dispatchItem: realDispatchItem(cfg, input.engine),
     getChangedFiles: realGetChangedFiles(cfg),
-    // Host-local live-advance probe scope (#770): run-store discovery + domain.
+    // Host-local live-advance probe scope (#770): run-store discovery + domain
+    // + production wrapper/process identity under ~/.pipeline/runs/<issue>
+    // (#770 review 2 finding 956d20df).
     repoDir: cfg.repo_dir,
     lockDomain: cfg.domain,
+    findWrapperPid: (issueNumber) => findWrapperPidForIssue(issueNumber),
     // Mid-advance stage-progress observation (#611): read the linked advance
     // events.jsonl while waiting on the child. Injectable for unit tests.
     readAdvanceEvents: async (eventsPath) => {
