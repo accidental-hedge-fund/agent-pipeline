@@ -11,6 +11,7 @@ import {
   getPrForIssue,
   getPrForIssueAnyState,
   isBlocked,
+  listOpenPrsForIssue,
   mapRawIssue,
   mapApiIssue,
   mapOpenPrGraphQlNodes,
@@ -22,6 +23,7 @@ import {
   parsePrMergeState,
   pickPrFromTimelinePage,
   pickStage,
+  resolveOpenPrsForIssue,
   resolvePrForIssue,
   selectPrForBranch,
   type GhApiRunner,
@@ -400,6 +402,19 @@ test("resolvePrForIssue: closing ref matches despite mixed casing in owner/repo 
     },
   ];
   assert.equal(resolvePrForIssue(prs, 42, "Owner/Repo"), 11);
+});
+
+test("resolveOpenPrsForIssue: returns every branch + closing-ref match (#754 multi-PR)", () => {
+  const prs = [
+    cand(50, "feat/unrelated"),
+    cand(201, "pipeline/42-replacement"),
+    cand(202, "pipeline/42-abandoned-draft"),
+    cand(203, "chore/docs", { closes: [42] }),
+    cand(204, "pipeline/42-fork-spoof", { fork: true }),
+  ];
+  assert.deepEqual(resolveOpenPrsForIssue(prs, 42, TARGET_REPO), [201, 202, 203]);
+  // Singleton path still prefers the first branch match.
+  assert.equal(resolvePrForIssue(prs, 42, TARGET_REPO), 201);
 });
 
 // ---------- selectPrForBranch (#175 adversarial regression) ----------
@@ -973,6 +988,22 @@ test("getPrForIssue: resolves via paginated GraphQL open PRs, not a hard -L 100 
   assert.ok(joined.includes("pullRequests"), "must query open repository pullRequests");
   assert.ok(!joined.includes("pr list") && !captured.includes("pr"), "must not use gh pr list");
   assert.ok(!joined.includes("-L"), "must not hard-cap with -L");
+});
+
+test("listOpenPrsForIssue: returns every open associated PR, not only the first match (#754)", async () => {
+  const run: GhApiRunner = async () =>
+    openPrsPageResponse([
+      openPrNode(201, "pipeline/42-replacement"),
+      openPrNode(202, "pipeline/42-abandoned-draft"),
+      openPrNode(203, "chore/docs", {
+        closes: [{ number: 42, owner: "owner", name: "repo" }],
+      }),
+      openPrNode(99, "feat/unrelated"),
+    ]);
+  const result = await listOpenPrsForIssue(OPEN_PR_CFG, 42, run);
+  assert.deepEqual(result, [201, 202, 203]);
+  // Singleton still returns only the first branch match.
+  assert.equal(await getPrForIssue(OPEN_PR_CFG, 42, run), 201);
 });
 
 test("getPrForIssue: matching open PR beyond the first 100-open window is still resolved", async () => {

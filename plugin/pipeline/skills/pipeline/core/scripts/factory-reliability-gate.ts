@@ -1168,7 +1168,11 @@ export interface FrgPackCloseDeps {
   getIssueStateAndLabels(
     issueNumber: number,
   ): Promise<{ state: "open" | "closed"; labels: string[] } | null>;
-  findOpenPrForIssue(issueNumber: number): Promise<number | null>;
+  /**
+   * Every open PR associated with the issue (pipeline branch and/or same-repo
+   * closing ref). Singleton resolvers leave abandoned drafts open (#754 review-2).
+   */
+  findOpenPrsForIssue(issueNumber: number): Promise<number[]>;
   /** Close PR without merging; post the deterministic FRG comment. */
   closePr(prNumber: number, comment: string): Promise<void>;
   /** Close issue with the same deterministic FRG comment. */
@@ -1228,9 +1232,9 @@ export async function closeFrgPackArtifacts(
       continue;
     }
 
-    let prNumber: number | null = null;
+    let prNumbers: number[] = [];
     try {
-      prNumber = await deps.findOpenPrForIssue(issueNumber);
+      prNumbers = await deps.findOpenPrsForIssue(issueNumber);
     } catch (err) {
       const msg =
         `issue #${issueNumber}: open PR lookup failed: ${(err as Error).message}`;
@@ -1238,7 +1242,9 @@ export async function closeFrgPackArtifacts(
       log(`[pipeline factory-gate] pack close: ${msg}`);
     }
 
-    if (prNumber !== null) {
+    // Close each open associated PR independently (fail-soft per PR). A
+    // singleton resolver leaves replacement/abandoned drafts open (#754).
+    for (const prNumber of prNumbers) {
       try {
         await deps.closePr(prNumber, comment);
         result.closedPrs.push(prNumber);

@@ -2682,7 +2682,7 @@ async function main(): Promise<void> {
     const { defaultLoopStoreDeps, readLedger, readContract } = await import("./loop/store.ts");
     const {
       getIssueStateAndLabels,
-      getPrForIssue,
+      listOpenPrsForIssue,
       closePr,
       closeIssue,
     } = await import("./gh.ts");
@@ -2718,8 +2718,9 @@ async function main(): Promise<void> {
           : {
               getIssueStateAndLabels: async (issueNumber) =>
                 getIssueStateAndLabels(getPackCfg(), issueNumber),
-              findOpenPrForIssue: async (issueNumber) =>
-                getPrForIssue(getPackCfg(), issueNumber),
+              // All open associated PRs — not getPrForIssue singleton (#754 review-2).
+              findOpenPrsForIssue: async (issueNumber) =>
+                listOpenPrsForIssue(getPackCfg(), issueNumber),
               closePr: async (prNumber, comment) =>
                 closePr(getPackCfg(), prNumber, comment),
               closeIssue: async (issueNumber, comment) =>

@@ -24,6 +24,16 @@ this disposition.
 - **AND** SHALL attach a deterministic comment on each closed resource that cites version `X.Y.Z`
   and `run_id` `R` and states closing without merge
 
+#### Scenario: Multiple open PRs for one ready_clean item are all closed
+
+- **WHEN** release-eligible evidence with `pass: true` is written
+- **AND** a scored `ready_clean` pack item has more than one open associated PR (for example a
+  replacement PR and an abandoned draft still linked to the same issue)
+- **THEN** the driver SHALL close each of those open associated PRs without merging
+- **AND** SHALL close the linked open issue when it still carries the pack selector label
+- **AND** a close failure on one PR SHALL NOT prevent remaining PR closes for that item
+  (fail-soft per PR)
+
 #### Scenario: Non-pass does not close pack artifacts
 
 - **WHEN** the FRG driver produces evidence with `pass: false`

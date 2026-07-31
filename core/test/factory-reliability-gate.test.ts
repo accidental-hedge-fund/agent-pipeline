@@ -876,7 +876,14 @@ test("paths are stable under .agent-pipeline/frg", () => {
 function fakePackCloseDeps(opts: {
   issues?: Record<
     number,
-    { state: "open" | "closed"; labels: string[]; pr?: number | null }
+    {
+      state: "open" | "closed";
+      labels: string[];
+      /** Single open PR (convenience); prefer `prs` when multiple. */
+      pr?: number | null;
+      /** All open associated PRs for the issue (#754 multi-PR disposition). */
+      prs?: number[];
+    }
   >;
   closePrImpl?: (pr: number, comment: string) => Promise<void>;
   closeIssueImpl?: (issue: number, comment: string) => Promise<void>;
@@ -897,10 +904,12 @@ function fakePackCloseDeps(opts: {
       if (!row) return null;
       return { state: row.state, labels: row.labels };
     },
-    findOpenPrForIssue: async (n) => {
+    findOpenPrsForIssue: async (n) => {
       const row = issues[n];
-      if (!row) return null;
-      return row.pr === undefined ? null : row.pr;
+      if (!row) return [];
+      if (row.prs !== undefined) return [...row.prs];
+      if (row.pr === undefined || row.pr === null) return [];
+      return [row.pr];
     },
     closePr: async (pr, comment) => {
       if (opts.closePrImpl) return opts.closePrImpl(pr, comment);
@@ -969,6 +978,38 @@ test("closeFrgPackArtifacts: closes open pack PR+issue with standard comment", a
   assert.ok(deps.closedPrs.every((c) => c.comment === comment));
   assert.ok(deps.closedIssues.every((c) => c.comment === comment));
   assert.equal(deps.mergeCalls, 0);
+});
+
+test("closeFrgPackArtifacts: closes every open PR for one ready_clean issue (#754 multi-PR)", async () => {
+  // fullPackPassInput scores items 1 and 2 ready_clean; multi-PR only on #1.
+  const evidence = computeFrgEvidence(fullPackPassInput({ run_id: "frg-multi-pr" }));
+  assert.equal(evidence.pass, true);
+  const deps = fakePackCloseDeps({
+    issues: {
+      // Replacement PR + abandoned draft both still open for the same pack item.
+      1: { state: "open", labels: ["factory-gate"], prs: [201, 202] },
+      2: { state: "open", labels: ["factory-gate"], pr: 102 },
+    },
+  });
+  const result = await closeFrgPackArtifacts(evidence, "factory-gate", deps);
+  assert.deepEqual(result.closedPrs.sort((a, b) => a - b), [102, 201, 202]);
+  assert.deepEqual(result.closedIssues.sort((a, b) => a - b), [1, 2]);
+  assert.equal(result.errors.length, 0);
+  // Fail-soft still closes remaining PRs when one of several fails for the same issue.
+  const soft = fakePackCloseDeps({
+    issues: {
+      1: { state: "open", labels: ["factory-gate"], prs: [301, 302] },
+      2: { state: "open", labels: ["factory-gate"], pr: 102 },
+    },
+  });
+  soft.closePr = async (pr, comment) => {
+    if (pr === 301) throw new Error("simulated close of first of two PRs");
+    soft.closedPrs.push({ pr, comment });
+  };
+  const softResult = await closeFrgPackArtifacts(evidence, "factory-gate", soft);
+  assert.ok(softResult.errors.some((e) => /PR #301/.test(e)));
+  assert.deepEqual(softResult.closedPrs.sort((a, b) => a - b), [102, 302]);
+  assert.deepEqual(softResult.closedIssues.sort((a, b) => a - b), [1, 2]);
 });
 
 test("closeFrgPackArtifacts: skips issues missing pack label (product never closed)", async () => {
