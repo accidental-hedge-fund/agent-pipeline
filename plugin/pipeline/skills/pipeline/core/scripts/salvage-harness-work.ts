@@ -90,15 +90,30 @@ function isPipelineInternalMarkerPath(pathPart: string): boolean {
   );
 }
 
-// Strip pipeline-internal marker files out of a `git status --porcelain`
-// output before it is used to decide whether the worktree is dirty. Porcelain
-// lines are `XY <path>` (2-char status + space + path); slicing off the first
-// 3 characters recovers the path regardless of the status code.
-function stripPipelineInternalMarkers(status: string): string {
+/**
+ * Strip pipeline-internal marker files out of a `git status --porcelain`
+ * output before it is used to decide whether the worktree is dirty. Porcelain
+ * lines are `XY <path>` (2-char status + space + path); slicing off the first
+ * 3 characters recovers the path regardless of the status code.
+ *
+ * Shared by salvage (#522) and pre-merge OpenSpec archive cleanliness (#597
+ * dogfood): engine-owned markers are not operator work and must not escalate
+ * to needs-human when they are the only dirty paths.
+ */
+export function stripPipelineInternalMarkers(status: string): string {
   return status
     .split("\n")
     .filter((line) => line.trim() !== "" && !isPipelineInternalMarkerPath(line.slice(3).trim()))
     .join("\n");
+}
+
+/**
+ * True when porcelain reports only pipeline-internal marker files (or is empty
+ * after stripping). Status exit code is the caller's responsibility — a failed
+ * `git status` must still fail closed.
+ */
+export function isOnlyPipelineInternalMarkerDirt(status: string): boolean {
+  return stripPipelineInternalMarkers(status).trim() === "";
 }
 
 // Depth-agnostic node_modules exclusion (#521): `:(exclude)node_modules` is a

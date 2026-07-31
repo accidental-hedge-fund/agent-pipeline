@@ -345,6 +345,69 @@ test("isAutoFixableFinding: correctness, missing-dep, concurrency → true; othe
   assert.equal(isAutoFixableFinding({} as ReviewFinding), false);
 });
 
+test("isAutoFixableFinding: code-behind-spec is auto-fixable; other directions residual", () => {
+  assert.equal(
+    isAutoFixableFinding({
+      category: "spec-divergence",
+      spec_divergence_direction: "code-behind-spec",
+    } as ReviewFinding),
+    true,
+    "code-behind-spec is implementer work — must not first-hop to needs-human",
+  );
+  assert.equal(
+    isAutoFixableFinding({
+      category: "SPEC-DIVERGENCE",
+      spec_divergence_direction: "code-behind-spec",
+    } as ReviewFinding),
+    true,
+    "category match is case-insensitive",
+  );
+  assert.equal(
+    isAutoFixableFinding({
+      category: "spec-divergence",
+      spec_divergence_direction: "spec-behind-code",
+    } as ReviewFinding),
+    false,
+    "spec-behind-code stays residual (delta/spec repair, not implementer autofix)",
+  );
+  assert.equal(
+    isAutoFixableFinding({ category: "spec-divergence" } as ReviewFinding),
+    false,
+    "direction-less spec-divergence stays residual (fail-closed)",
+  );
+  assert.equal(
+    allBlockingAutoFixable([
+      {
+        severity: "high",
+        title: "Missing title match",
+        body: "x",
+        confidence: 0.99,
+        recommendation: "fetch title/body",
+        category: "spec-divergence",
+        spec_divergence_direction: "code-behind-spec",
+      } as ReviewFinding,
+    ]),
+    true,
+    "pure code-behind-spec batch is auto-fix eligible (#729 dogfood shape)",
+  );
+});
+
+test("partitionBlockingForAutofix: code-behind-spec joins allowlisted subset", () => {
+  const codeBehind = {
+    severity: "high" as const,
+    title: "Title refs never superseded",
+    body: "x",
+    confidence: 0.99,
+    recommendation: "parse title/body",
+    category: "spec-divergence",
+    spec_divergence_direction: "code-behind-spec" as const,
+  };
+  const security = blockingFinding("security", "Auth gap");
+  const p = partitionBlockingForAutofix([codeBehind, security]);
+  assert.deepEqual(p.autoFixable, [codeBehind]);
+  assert.deepEqual(p.residual, [security]);
+});
+
 test("allBlockingAutoFixable: allowlisted sets → true; mixed security / empty → false (#680)", () => {
   assert.equal(allBlockingAutoFixable([blockingFinding("correctness")]), true);
   assert.equal(allBlockingAutoFixable([blockingFinding("missing-dep")]), true);

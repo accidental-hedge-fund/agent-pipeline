@@ -39,7 +39,12 @@ import {
   type CiFailureClass,
 } from "../ci-failure-classify.ts";
 import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
-import { PIPELINE_INTERNAL_MARKER_FILES, trySalvageUncommittedWork } from "../salvage-harness-work.ts";
+import {
+  PIPELINE_INTERNAL_MARKER_FILES,
+  isOnlyPipelineInternalMarkerDirt,
+  stripPipelineInternalMarkers,
+  trySalvageUncommittedWork,
+} from "../salvage-harness-work.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import {
   attestPipelineComment,
@@ -511,11 +516,19 @@ export function supersededDeltaReviewNotice(reviewedSha: string, headSha: string
  *                     defects (#668 dogfood class)
  *
  * Residual / excluded from the auto-fix prompt (human disposition):
- *   - security, scope, product-judgment-required, spec-divergence, data-loss,
- *     observability, and any absent/empty/unrecognized token (fail-closed for
- *     that finding). Co-batched residual findings do **not** veto auto-fix of
- *     a non-empty allowlisted subset (#747 partition); pure residual-only
- *     batches still skip the harness.
+ *   - security, scope, product-judgment-required, data-loss, observability,
+ *     `spec-divergence` without `code-behind-spec` direction (or with
+ *     `spec-behind-code` — that is a delta/spec repair path, not implementer
+ *     autofix), and any absent/empty/unrecognized token (fail-closed for that
+ *     finding). Co-batched residual findings do **not** veto auto-fix of a
+ *     non-empty allowlisted subset (#747 partition); pure residual-only batches
+ *     still skip the harness.
+ *
+ * Directional exception (#factory dogfood 2026-07-31):
+ *   - `spec-divergence` + `spec_divergence_direction: code-behind-spec` is
+ *     **auto-fixable**. The active acceptance criteria already require the
+ *     behavior; the implementer must change code — parking for human
+ *     disposition is a factory defect, not product judgment.
  */
 export const PRE_MERGE_AUTOFIX_CATEGORIES = [
   "correctness",
@@ -531,14 +544,23 @@ export const PRE_MERGE_AUTOFIX_CATEGORY_SET: ReadonlySet<string> = new Set(
 );
 
 /**
- * True iff a blocking finding's category is in the auto-fix allowlist
- * {@link PRE_MERGE_AUTOFIX_CATEGORIES} (`correctness`, `missing-dep`,
- * `concurrency`). Absent/empty/unknown category → false (fail-closed: auto-fix
- * only on positive allowlisted signal). (#359, #680)
+ * True iff a blocking finding is eligible for the bounded pre-merge auto-fix:
+ * - category in {@link PRE_MERGE_AUTOFIX_CATEGORIES} (`correctness`,
+ *   `missing-dep`, `concurrency`), or
+ * - `spec-divergence` with structured direction `code-behind-spec` (code must
+ *   catch the already-authoritative acceptance criteria).
+ *
+ * Absent/empty/unknown category → false (fail-closed: auto-fix only on positive
+ * allowlisted signal). `spec-behind-code` and direction-less `spec-divergence`
+ * remain residual. (#359, #680, factory dogfood)
  */
 export function isAutoFixableFinding(f: ReviewFinding): boolean {
   const cat = (f.category ?? "").toLowerCase().trim();
-  return PRE_MERGE_AUTOFIX_CATEGORY_SET.has(cat);
+  if (PRE_MERGE_AUTOFIX_CATEGORY_SET.has(cat)) return true;
+  if (cat === "spec-divergence") {
+    return f.spec_divergence_direction === "code-behind-spec";
+  }
+  return false;
 }
 
 /**
@@ -3583,22 +3605,37 @@ export async function maybeArchiveOpenspec(
 
   // Pre-archive cleanliness guard: the commit-failure rollback below is destructive
   // (`git restore .` + `git clean -fd openspec/`), so it is provably lossless ONLY when
-  // the worktree is fully clean before archive. Block on ANY pre-existing dirty state —
-  // a path-prefix filter is unsafe two ways: a dirty tracked openspec/ file (e.g.
+  // the worktree is fully clean of *real* work before archive. Block on genuine dirty
+  // state — a path-prefix filter is unsafe two ways: a dirty tracked openspec/ file (e.g.
   // `M  openspec/specs/x.md`) would be silently discarded by the rollback, and a porcelain
   // rename/copy record (`R  openspec/a -> core/a`) has a destination outside openspec/ that
-  // matching only the first path misses. All planning/fix work is committed before pre-merge,
-  // so any non-empty status here is anomalous — fail safe rather than risk data loss.
-  // Fail CLOSED: only proceed when `git status` SUCCEEDS and reports a clean tree. If the
-  // status check itself errors (non-zero exit, often with empty stdout), we cannot prove the
-  // tree is clean — treating that as clean would let the destructive rollback run over
-  // unproven state, the very data-loss class this guard exists to close.
+  // matching only the first path misses.
+  //
+  // Pipeline-internal marker files (`.pipeline-rebase-attempted`, #522) are **not**
+  // operator work: salvage already treats marker-only porcelain as clean, and parking
+  // archive for them alone is a factory defect (dogfood #597). Strip them from the
+  // dirt decision; when they are the only dirty paths, unlink them and proceed.
+  // Fail CLOSED: only proceed when `git status` SUCCEEDS and reports a clean tree
+  // after marker strip. If the status check itself errors (non-zero exit, often with
+  // empty stdout), we cannot prove the tree is clean — treating that as clean would
+  // let the destructive rollback run over unproven state.
   const preArchiveStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
-  if (preArchiveStatus.code !== 0 || preArchiveStatus.stdout.trim() !== "") {
+  if (preArchiveStatus.code !== 0) {
     const detail =
-      preArchiveStatus.code !== 0
-        ? `git status --porcelain failed (exit ${preArchiveStatus.code}): ${(preArchiveStatus.stderr || preArchiveStatus.stdout || "(no output)").trim()}`
-        : `pre-existing dirty paths:\n${preArchiveStatus.stdout.trim()}`;
+      `git status --porcelain failed (exit ${preArchiveStatus.code}): ${(preArchiveStatus.stderr || preArchiveStatus.stdout || "(no output)").trim()}`;
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Cannot verify a clean worktree before the OpenSpec archive, so a failed archive commit's destructive rollback could discard pre-existing work — ${detail}. Commit/stash changes (or fix the git error) and re-run.`,
+      "pre-merge",
+      "needs-human",
+    );
+    await recordDecision("fail", "pre-archive git status failed");
+    return preMergeBlocked("pre-archive git status failed", "needs-human");
+  }
+  const meaningfulDirt = stripPipelineInternalMarkers(preArchiveStatus.stdout);
+  if (meaningfulDirt.trim() !== "") {
+    const detail = `pre-existing dirty paths:\n${meaningfulDirt.trim()}`;
     // Workspace/git failures — not OpenSpec structural validation. Use needs-human
     // with no finer path tag so scoreboard offramp_class maps to residual `other`
     // (#683 review 1: dirty/status must not inflate openspec-invalid).
@@ -3609,10 +3646,19 @@ export async function maybeArchiveOpenspec(
       "pre-merge",
       "needs-human",
     );
-    const blockedReason =
-      preArchiveStatus.code !== 0 ? "pre-archive git status failed" : "worktree dirty before archive";
-    await recordDecision("fail", blockedReason);
-    return preMergeBlocked(blockedReason, "needs-human");
+    await recordDecision("fail", "worktree dirty before archive");
+    return preMergeBlocked("worktree dirty before archive", "needs-human");
+  }
+  // Marker-only dirt: remove engine markers so later porcelain checks stay clean.
+  // Real work was already ruled out above via isOnlyPipelineInternalMarkerDirt.
+  if (
+    preArchiveStatus.stdout.trim() !== "" &&
+    isOnlyPipelineInternalMarkerDirt(preArchiveStatus.stdout)
+  ) {
+    for (const marker of PIPELINE_INTERNAL_MARKER_FILES) {
+      // Best-effort unlink via git clean of the untracked marker; ignore failures.
+      await gitFn(wt.path, ["clean", "-fd", "--", marker], { ignoreFailure: true });
+    }
   }
 
   // ---- Archive-base sync guard (#579) ----
