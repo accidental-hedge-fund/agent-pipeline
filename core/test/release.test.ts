@@ -450,6 +450,41 @@ test("scaffoldRoadmap: missing unshipped plan row is scaffolded then ship-marked
   assert.ok(result.includes("**v1.6.0 shipped 2026-06-17**"), "intro still patched");
 });
 
+test("scaffoldRoadmap: shipped-only plan row is preserved (ship-mark no-op, no duplicate)", () => {
+  // Regression for #730 review-1 (eb3d985c): ensure + patchReleasePlanRow + full
+  // scaffold must not abort when only `| **v{version}** ✅ shipped |` exists.
+  // ensure is a no-op; ship-mark is idempotent; other sites still patch.
+  const shippedOnly = SAMPLE_ROADMAP.replace(
+    "| **v1.6.0** | minor | Intake & backlog automation | #158, #170 | Intake and release automation. |",
+    "| **v1.6.0** ✅ shipped | minor | Intake & backlog automation | #158, #170 | Shipped already. |",
+  );
+  assert.ok(
+    shippedOnly.split("\n").some((l) => l.startsWith("| **v1.6.0**") && l.includes("✅ shipped")),
+    "fixture has shipped-only v1.6.0 plan row",
+  );
+  assert.ok(
+    !shippedOnly.split("\n").some((l) => l.startsWith("| **v1.6.0**") && !l.includes("✅ shipped")),
+    "fixture has no unshipped v1.6.0 plan row",
+  );
+
+  // Direct ship-mark helper is already idempotent on shipped-only rows.
+  assert.equal(patchReleasePlanRow(shippedOnly, SAMPLE_CTX), shippedOnly);
+
+  const result = scaffoldRoadmap(shippedOnly, SAMPLE_CTX);
+  const planRows = result.split("\n").filter((l) => l.startsWith("| **v1.6.0**"));
+  assert.equal(planRows.length, 1, "exactly one v1.6.0 plan row (no unshipped duplicate)");
+  assert.ok(planRows[0].includes("✅ shipped"), "shipped marker preserved");
+  assert.ok(
+    planRows[0].includes("Shipped already."),
+    "original shipped why-column preserved (ship-mark no-op)",
+  );
+  assert.ok(result.includes("**v1.6.0 shipped 2026-06-17**"), "intro still patched");
+  assert.ok(
+    result.includes("**v1.6.0 — Intake & backlog automation (shipped 2026-06-17"),
+    "shipped section still prepended",
+  );
+});
+
 test("scaffoldRoadmap bite: without ensure, missing plan row still fails patchReleasePlanRow", () => {
   // Documents that the regression is specifically ensure-before-mutate: calling
   // patch alone on a missing row throws; scaffoldRoadmap with ensure does not.
