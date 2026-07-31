@@ -1,6 +1,6 @@
 ---
-description: List or stream pipeline run logs
-argument-hint: '[<run-id>] [-f]'
+description: List or stream pipeline run logs (events --follow exits 0 on run_complete; --no-until-terminal for interrupt-only)
+argument-hint: '[<run-id>] [--events] [-f]'
 ---
 
 Invoke: `node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs logs $ARGUMENTS`
