@@ -499,11 +499,28 @@ Codex against the full repo; review stages invoke the `claude` CLI directly with
 the pipeline's JSON-returning review prompt. Worst-case full path is
 9 transitions, ~2 hours.
 
-### 4. Orchestration pattern (Codex-side, for default-mode advance)
+### 4. Orchestration pattern (host-side, for default-mode advance)
 
 A foreground command may run longer than normal interactive command windows,
 especially when a planning/review/fix stage invokes a harness for up to about
-20 minutes. For default advance mode, Codex must orchestrate the run as follows:
+20 minutes. For default advance mode, the harness **must** orchestrate the run
+as follows.
+
+#### Host notify map (material progress)
+
+On each **material** progress line (shared material filter — see §4.c),
+**must notify via the host map** below. Do not invent a pipeline push service;
+do not gate stages on delivery. `events.jsonl` remains the complete evidence
+stream. **Codex never requires Claude `PushNotification`.**
+
+| Host | Follow / surface | Material path |
+| --- | --- | --- |
+| **Claude** | Monitor + `PushNotification` on material one-liners | `hosts/claude/SKILL.md` |
+| **Grok** | Host `monitor` on material-filtered stream (each line = bubble); no `PushNotification` | Claude overlay Grok substitute / future `hosts/grok` (#731) |
+| **Codex** | Poll/follow material stream; **concise chat/status updates** on each material line | This file's §4.c–d |
+
+Re-arm material follow after wait cancel until `run_complete` / `loop_run_stopped`
+(full re-attach semantics: #725). Dual-follow density demotion remains #611.
 
 #### a. Status pre-check (fast, synchronous)
 
@@ -529,19 +546,27 @@ This command returns quickly. `RUN_DIR` is a supervision wrapper under
 log and summary commands below. Do not leave a live pipeline session running
 when the Codex turn ends.
 
-#### c. Poll structured run events
+#### c. Poll structured run events (material filter preferred)
 
 Follow the run-store event stream and summarize material lifecycle records to
-the user:
+the user. Prefer the shared **events.jsonl material filter** for host notify;
+unfiltered events remain available for diagnostics:
 
 ```bash
+# Preferred — material one-liners for chat/status notify
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow \
+  | node --experimental-strip-types ~/.codex/skills/pipeline/core/scripts/material-filter.ts
+
+# Diagnostic fallback — full unfiltered events.jsonl
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
 ```
 
 `--events` follows `.agent-pipeline/runs/<run-id>/events.jsonl`, the canonical
 structured stream for lifecycle, gate, blocker, PR, review, accounting, and
 completion events. It is not a grep-filtered terminal log and it is not a
-separate `/tmp` transitions artifact.
+separate `/tmp` transitions artifact. The material filter never rewrites the
+run store. **Re-arm** material follow after interruption until `run_complete`
+(#725).
 
 **Fallback — raw terminal output:** If you need the full combined output, follow
 `terminal.log` from the same run store:
@@ -554,23 +579,24 @@ Do not create or recommend extra `/tmp/pipeline-<domain>-<N>.log` files for
 normal monitoring. If a human manually redirects output for local debugging,
 that file is scratch output, not the pipeline evidence contract.
 
-#### d. User-visible progress updates
+#### d. User-visible progress updates (notify via host map)
 
-For every material event record, send a concise chat update. The state machine
-has only a bounded number of stage transitions, so this gives enough signal
-without flooding the user.
+For every material filter line, send a concise **chat/status** update (Codex
+host map entry — never Claude `PushNotification`). The state machine has only
+a bounded number of stage transitions, so this gives enough signal without
+flooding the user.
 
-Examples that should be surfaced:
+Material advance kinds (aligned with `core/scripts/material-filter.ts`):
 - `run_start`
 - `stage_start`
 - `stage_complete`
 - `pr_created` / `pr_updated`
 - `review_verdict`
-- `gate_result`
+- `gate_result` (filter suppresses repeated CI `partial` and OpenSpec `skipped` spam)
 - `blocker_set` / `blocker_cleared`
 - `run_complete`
 
-Examples to suppress or summarize:
+Examples to suppress or summarize (shared filter):
 - **Repeated polling-loop sub-events** — `pre_merge.advancePolling`
   re-enters the gate check every `ci_poll_interval` seconds (default 30s).
   Surface the first material stage/gate event per stage entry; suppress
@@ -769,13 +795,21 @@ Then resolve the events file:
 
 Poll or follow the loop events file **as soon as** `run_id` is known (step b) —
 do not wait for supervisor exit — and summarize material lifecycle records.
-Prefer the first-class CLI (exits 0 on `loop_run_stopped` by default):
+Prefer the first-class CLI (exits 0 on `loop_run_stopped` by default) **piped
+through the shared material filter** for host notify:
 
 ```bash
-node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow
+# Preferred — material one-liners (apply the same filter to dual-follow advance streams)
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow \
+  | node --experimental-strip-types ~/.codex/skills/pipeline/core/scripts/material-filter.ts
 # default until-terminal: process exits 0 after loop_run_stopped
 # interrupt-only dashboards: add --no-until-terminal
+
+# Diagnostic fallback — full unfiltered loop events.jsonl
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow
 ```
+
+**Re-arm** material follow after wait cancel until `loop_run_stopped` (#725).
 
 **Do not** use a bare `tail -F` on `events.jsonl` as a follow fallback: it never
 exits after `loop_run_stopped`, prints no final summary, and leaves zombie
@@ -842,15 +876,18 @@ pre-merge gate outcomes are already mirrored onto the loop stream** as
 auto-fix, terminal blocked/advanced) while linkage is active — hosts do
 **not** need advance-only follow solely to learn those gate results (#682).
 
-Optionally still follow the linked advance `events.jsonl` for full-fidelity
-stage/harness detail (accounting, raw review findings, etc.):
+**Must** also arm material-filtered advance follow for mid-item stage progress
+(dual-follow). Prefer material filter on **both** streams over dual raw
+unfiltered JSONL:
 
 ```bash
-node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <advance-run-id> --events --follow
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <advance-run-id> --events --follow \
+  | node --experimental-strip-types ~/.codex/skills/pipeline/core/scripts/material-filter.ts
 ```
 
 The absolute `events` path from the linkage record is an acceptable alternative
-target (e.g. `tail -F` or host-equivalent follow on that file).
+target (e.g. `tail -F` or host-equivalent follow on that file, still preferably
+through the material filter).
 
 **Before linkage exists:** continue loop-only follow — do **not** require a
 non-existent advance-linkage field.
@@ -864,7 +901,8 @@ non-existent advance-linkage field.
 3. Keep the **loop** event stream follow active across item boundaries until a
    terminal loop outcome or supervisor process exit.
 
-**Material advance kinds** to surface (same spirit as single-issue §4):
+**Material advance kinds** to surface via the host map (same spirit as
+single-issue §4; shared filter constant):
 
 - `stage_start`
 - `stage_complete`
@@ -875,8 +913,10 @@ non-existent advance-linkage field.
 - `run_complete`
 
 **Suppress** pure CI poll spam — including repeated identical
-`pre_merge.advancePolling`-style updates in the same burst (surface the first
-material stage/gate event; wait for the eventual advance/block outcome).
+`pre_merge.advancePolling`-style updates and repeated CI `partial` / OpenSpec
+`skipped` spam in the same burst (surface the first material stage/gate event;
+wait for the eventual advance/block outcome). The material filter enforces this
+deterministically.
 
 **Loop-only follow** remains valid for schedule, hold, and terminal **loop**
 kinds (`loop_schedule_evaluated`, holds, `loop_run_stopped`, …), but is
@@ -884,18 +924,22 @@ kinds (`loop_schedule_evaluated`, holds, `loop_run_stopped`, …), but is
 makes the loop stream carry first-class stage progress, this dual-follow
 mandate **MAY** be demoted to optional / “recommended for full fidelity” in
 that same PR (with host skill + living-spec updates together). Do **not** demote
-solely for quieter notifications while the loop stream is still sparse.
+solely for quieter notifications while the loop stream is still sparse. This
+notify packaging change (#742) does **not** replace #611 or #725.
 
 #### e. User-visible progress on material loop events
 
-**Must surface** (chat update):
+**Must notify** via the host map (Codex: concise chat/status; never Claude
+`PushNotification`):
 
 - `loop_item_started`
 - `loop_item_transitioned`
 - `loop_item_blocked`
+- `loop_item_advance_linked` / `loop_item_advance_finished`
+- `loop_item_stage_progress` (when present)
 - `loop_run_stopped`
 
-**Should surface** when present (not spam):
+**Should surface** when present (not spam; material filter applies):
 
 - `loop_item_progress` — shared progress kind; for `domain: "pre_merge"`, notify
   on definitive outcomes (`pass`, `fail`, `approve`, `needs_attention`,
