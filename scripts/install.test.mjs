@@ -1780,3 +1780,65 @@ test("install --host grok: refreshes wrong-target symlink without recursive tree
     cleanup(lockTmp);
   }
 });
+
+test("uninstall --host grok: unlinks installer symlink only (#731 148c1b7b)", () => {
+  const home = makeTmp();
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const claudeSkill = stubExistingCoreInstall(claudeTmp);
+    // Claude target tree must survive Grok uninstall (unlink only, not follow).
+    writeFileSync(join(claudeSkill, "keep-claude.txt"), "claude-owned");
+    const dest = join(home, ".grok", "skills", "pipeline");
+    mkdirSync(join(home, ".grok", "skills"), { recursive: true });
+    symlinkSync(claudeSkill, dest);
+
+    const result = runInstaller(["uninstall", "--host", "grok"], {
+      HOME: home,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.equal(result.status, 0, `stderr=${result.stderr}\nstdout=${result.stdout}`);
+    assert.equal(existsSync(dest), false, "Grok symlink must be removed");
+    assert.ok(existsSync(claudeSkill), "Claude target tree must not be deleted");
+    assert.equal(readFileSync(join(claudeSkill, "keep-claude.txt"), "utf8"), "claude-owned");
+  } finally {
+    cleanup(home);
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("uninstall --host grok: refuses to delete documented copy layout directory (#731 148c1b7b)", () => {
+  const home = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const dest = join(home, ".grok", "skills", "pipeline");
+    mkdirSync(dest, { recursive: true });
+    writeFileSync(join(dest, "SKILL.md"), "operator copy layout content");
+    writeFileSync(join(dest, "personal-notes.txt"), "do not delete me");
+
+    const result = runInstaller(["uninstall", "--host", "grok"], {
+      HOME: home,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.notEqual(result.status, 0, "must refuse non-symlink Grok path without deleting it");
+    const out = `${result.stdout}${result.stderr}`;
+    assert.match(out, /Refusing to delete non-symlink path/i);
+    assert.match(out, /mv |backup|copy/i);
+    // Path and content must remain byte-identical — no recursive delete.
+    assert.ok(existsSync(dest), "copy layout directory must still exist");
+    assert.equal(lstatSync(dest).isSymbolicLink(), false);
+    assert.equal(readFileSync(join(dest, "SKILL.md"), "utf8"), "operator copy layout content");
+    assert.equal(readFileSync(join(dest, "personal-notes.txt"), "utf8"), "do not delete me");
+  } finally {
+    cleanup(home);
+    cleanup(lockTmp);
+  }
+});

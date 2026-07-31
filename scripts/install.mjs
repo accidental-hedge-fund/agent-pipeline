@@ -778,12 +778,40 @@ function uninstallHost(host, dryRun) {
     return;
   }
   log(`→ ${cfg.label}: removing ${dest}`);
+
+  // symlink-claude (Grok): only unlink an installer-owned symlink. Never
+  // recursively delete a copy-based layout or personal directory.
+  if (cfg.installMode === "symlink-claude") {
+    let st;
+    try {
+      st = lstatSync(dest);
+    } catch (err) {
+      fail(
+        `Cannot inspect existing path at ${dest}: ${err.message}\n` +
+          `  Relocate or remove it manually if needed.`,
+      );
+    }
+    if (!st.isSymbolicLink()) {
+      fail(
+        `Refusing to delete non-symlink path at ${dest}.\n` +
+          `  This may be a copy-based Grok skill layout or personal content.\n` +
+          `  uninstall --host grok only unlinks an installer-created symlink; it will not recursively delete this path.\n` +
+          `  To keep the copy: no action needed (the copy layout is supported; it does not track Claude updates).\n` +
+          `  To remove it yourself after backup:\n` +
+          `    mv '${dest}' '${dest}.bak'`,
+      );
+    }
+    if (dryRun) {
+      log("  (dry-run) would unlink the Grok skill symlink");
+      return;
+    }
+    unlinkSync(dest);
+    log("  ✓ removed");
+    return;
+  }
+
   if (dryRun) {
-    log(
-      cfg.installMode === "symlink-claude"
-        ? "  (dry-run) would unlink the Grok skill symlink"
-        : "  (dry-run) would rm -rf the skill directory",
-    );
+    log("  (dry-run) would rm -rf the skill directory");
     return;
   }
   rmSync(dest, { recursive: true, force: true });
