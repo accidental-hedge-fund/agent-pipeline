@@ -1,33 +1,4 @@
-# readme-user-clarity Specification
-
-## Purpose
-TBD - created by archiving change readme-user-clarity. Update Purpose after archive.
-## Requirements
-### Requirement: README opens with a purpose-first summary
-The README SHALL communicate — within the first visible screenful, before any configuration detail or repository layout — what the tool does, who it is for, the cross-harness model (both Claude Code and Codex are required), and the core prerequisites (Node ≥ 24, git, gh, both CLIs authenticated).
-
-#### Scenario: First screenful is informative
-- **WHEN** a developer opens the README cold on GitHub
-- **THEN** the first screen SHALL contain the tool's purpose, the two-host model, and the prerequisite summary before any configuration block or repository layout
-
-#### Scenario: Cross-harness prerequisite is visible before install
-- **WHEN** a reader reaches the install section
-- **THEN** the requirement for both `claude` and `codex` CLIs SHALL have been stated earlier in the document, not only inside install sub-sections
-
----
-
-### Requirement: README contains a quickstart section
-The README SHALL include a dedicated quickstart (or "Getting Started") section that provides one clearly recommended install path and a minimal first-run example that takes a reader from install to advancing a single issue — without requiring the reader to parse optional or advanced sections first.
-
-#### Scenario: Single recommended install command is present
-- **WHEN** a reader wants to install the tool for the first time
-- **THEN** there SHALL be exactly one visually highlighted recommended command (the `npx github:...` one-liner) before alternatives are listed
-
-#### Scenario: First-run example is present
-- **WHEN** a reader completes the recommended install path
-- **THEN** the quickstart SHALL show at minimum: how to add the first `pipeline:ready` label to an issue and the command to invoke the pipeline on it (`/pipeline N` or `$pipeline N`)
-
----
+## MODIFIED Requirements
 
 ### Requirement: Optional and advanced topics are visually separated from core flow
 Advanced, optional, or less-common topics — including OpenSpec integration, last30days context, configurable steps, eval gate, and development — SHALL appear either (a) in README sections that are clearly labeled as optional/advanced and positioned after the core getting-started flow, or (b) in the linked `docs/concepts.md` companion (or other linked docs pages) that the README points to after the core flow. A newcomer SHALL be able to reach a working setup without reading optional/advanced README sections or any `docs/` companion page. Companion review modes are removed and SHALL NOT appear as optional topics.
@@ -65,15 +36,3 @@ Every instruction, command, flag, and description in the README and in the linke
 #### Scenario: Config key examples are valid
 - **WHEN** the README or `docs/config.md` shows a `.github/pipeline.yml` example block
 - **THEN** every key shown SHALL be a currently recognized config key; no deprecated or non-existent keys (`auto_merge`, `harnesses`) SHALL appear
-
-### Requirement: Formatting and code blocks render correctly on GitHub
-All Markdown formatting SHALL follow GitHub-Flavored Markdown conventions: fenced code blocks SHALL specify a language hint where appropriate, inline code SHALL use backticks, links SHALL be valid and resolvable, and no mixed or inconsistent heading/list styles SHALL appear in the same section.
-
-#### Scenario: Code blocks have language hints
-- **WHEN** a fenced code block contains shell commands or YAML
-- **THEN** the opening fence SHALL include a language identifier (`bash`, `yaml`, `json`, etc.)
-
-#### Scenario: No broken links
-- **WHEN** the document contains a hyperlink
-- **THEN** the link SHALL resolve to a real resource (no 404, no placeholder anchors)
-

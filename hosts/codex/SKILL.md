@@ -51,65 +51,111 @@ The primary invocation is the advance loop; all other operations are available a
 distinct `$pipeline:<command>` entries in the skill menu.
 
 ```
-$pipeline N                              advance loop (default; up to 12 transitions)
-$pipeline N --once                       advance one stage and stop
-$pipeline N --dry-run                    log what would happen; no harness calls, no GitHub writes
-$pipeline N --domain d                   override domain name in lock/log paths
-$pipeline N --base branch                override base branch
-$pipeline N --repo-path path             target a different repo working tree
-$pipeline N --detach                     run the advance loop in a detached background process
+<!-- BEGIN GENERATED: cli-command-table -->
+```
+$pipeline N                               Advance issue N through the pipeline (default path; up to 12 transitions)
+$pipeline N --once                        Advance issue N through the pipeline (default path; up to 12 transitions)
+$pipeline N --dry-run                     Advance issue N through the pipeline (default path; up to 12 transitions)
+$pipeline N --domain <d>                  Advance issue N through the pipeline (default path; up to 12 transitions)
+$pipeline N --base <branch>               Advance issue N through the pipeline (default path; up to 12 transitions)
+$pipeline N --repo-path <path>            Advance issue N through the pipeline (default path; up to 12 transitions)
+$pipeline N --detach                      Advance issue N through the pipeline (default path; up to 12 transitions)
+$pipeline N --doctor                      Advance issue N through the pipeline (default path; up to 12 transitions)
 
-$pipeline:status <N>                     read-only; print stage, blocker, PR, last review
-$pipeline:unblock <N> "answer"           post answer and clear blocked label
-$pipeline:override <N> "key: reason"     disposition a review finding and auto-resume the advance loop
-$pipeline:summary <N>                    print the evidence bundle for issue N (local, offline)
-$pipeline:doctor                         deterministic preflight check; print summary, exit 0/1
-$pipeline N --doctor                     run the preflight before advancing; abort the run on any failure
-$pipeline:init                           ensure labels + scaffold .github/pipeline.yml
-$pipeline:cleanup                        sweep merged-PR worktrees
-$pipeline:intake [--description "text"]  spec a rough description into a GitHub issue + ROADMAP PR
-$pipeline:triage <N> --stage ready       set pipeline:ready on issue N
-$pipeline:triage <N> --stage backlog     set pipeline:backlog on issue N
-$pipeline:sweep                          batch re-spec thin issues + reconcile ROADMAP.md (dry-run)
-$pipeline:sweep --apply                  same, with write-backs applied
-$pipeline:roadmap                        dependency-aware scored roadmap for the backlog (dry-run)
-$pipeline:roadmap --apply                same, with write-backs applied
-$pipeline:merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
-$pipeline:merge-queue --milestone <m>    dry-run ordered R2D merges for a milestone (no merges)
-$pipeline:merge-queue --milestone <m> --apply  sequential merges via existing merge surface
-$pipeline:merge-queue --milestone <m> --apply --release-when-complete --release-version minor
-                                         after a complete queue, prepare a release PR (never tags/merges/publishes)
-$pipeline:release <version> [--theme "..."]  prepare a release PR for the given version
-                                         (missing unshipped plan row is auto-scaffolded before
-                                         other ROADMAP mutations when `| *(none)* |` is present:
-                                         `| **vX.Y.Z** | major|minor|patch | <theme> | #N, #M | <why> |`;
-                                         shipped `✅ shipped` rows are never overwritten; insert
-                                         failure aborts before version bump with a copy-paste row)
-$pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
+$pipeline:logs [<run-id>]                 List or stream pipeline run logs (terminal or structured events)
+$pipeline:logs <run-id> --follow          List or stream pipeline run logs (terminal or structured events)
+$pipeline:logs <run-id> --events --follow  List or stream pipeline run logs (terminal or structured events)
 
-$pipeline:release <version>              prepare a release PR for the given version
-$pipeline:logs [<run-id>] [--events] [-f]  list or stream run logs (events --follow exits 0 on run_complete; --no-until-terminal for interrupt-only)
-$pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor
-$pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
-$pipeline:loop --audit                   read-only report for the run; no writes
-$pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (default: exit 0 on loop_run_stopped; --no-until-terminal for interrupt-only)
-$pipeline:loop --audit                   read-only report (process identity, action evidence, per-item stage table); no writes
-$pipeline:loop --resume <run-id> --audit --follow  stream whole-run stage-progress lines (not harness stdout)
-$pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run\'s events.jsonl (default: exit 0 on loop_run_stopped; --no-until-terminal for interrupt-only)
-$pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent)
-$pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
-$pipeline scoreboard --bucket day|week   add a chronological day/week time-series to the scoreboard report
-$pipeline scoreboard --by <dimension>    group scoreboard metrics by harness|model|effort|executor (exactly one; missing/absent identities report as `unknown`, dimensions that can't apply — e.g. executor on a local-harness stage — report as `not applicable`)
-$pipeline scoreboard --corrections-by <dimension>  group repeat-correction/recurrence metrics by repo|stage|harness|model|source_kind|failure_class|proposed_control|implemented_control (exactly one)
-$pipeline scoreboard --html <path>       write a self-contained, offline HTML export of the report to <path> (local/archival only; makes no network requests, composes with the other scoreboard flags)
-$pipeline evals plan experiment.json     expand + persist an experiment's run plan; invokes no harness, creates no worktree
-$pipeline evals run experiment.json      execute an experiment's cells (resumable); never writes to production GitHub
-$pipeline evals grade experiment.json/exp1   grade a completed experiment's cells; writes grades.jsonl (never gates a PR)
-$pipeline evals run experiment.json --trajectory-max-events <n> --trajectory-max-bytes <n>  override the default trajectory/verifier artifact bounding ceilings (default: 200 events / 200000 bytes)
-$pipeline evals report experiment.json/exp1 --baseline <treatment_id>  paired comparative summary.json
-$pipeline evals report experiment.json/exp1 --baseline <treatment_id> --link-artifacts  additionally link trajectory/verifier artifacts for flagged cells (opt-in; default output unchanged)
-$pipeline evals harvest request.json     draft an eval fixture from sanitized run/correction evidence; --apply [--plan-only] to promote (never writes GitHub)
-$pipeline --version                      print the package version, then exit (no number; -V alias)
+$pipeline:status <N>                      Read-only status of issue or PR N — stage, blocker, PR, last review
+
+$pipeline:summary <N>                     Print the evidence bundle for issue N, or for an exact run-id
+$pipeline:summary <run-id>                Print the evidence bundle for issue N, or for an exact run-id
+
+$pipeline:cleanup                         Sweep merged-PR worktrees and delete their local branches
+
+$pipeline config schema                   Config schema/validate/sync and repo-map maintenance for .github/pipeline.yml
+$pipeline config validate                 Config schema/validate/sync and repo-map maintenance for .github/pipeline.yml
+$pipeline config sync [--apply]           Config schema/validate/sync and repo-map maintenance for .github/pipeline.yml
+$pipeline config repo-map <add|remove|list>  Config schema/validate/sync and repo-map maintenance for .github/pipeline.yml
+
+$pipeline:doctor                          Run deterministic preflight checks and print a pass/fail summary
+$pipeline:doctor --json                   Run deterministic preflight checks and print a pass/fail summary
+$pipeline:doctor --is-ok                  Run deterministic preflight checks and print a pass/fail summary
+$pipeline:doctor --fail-fast              Run deterministic preflight checks and print a pass/fail summary
+
+$pipeline:init                            Ensure pipeline labels and scaffold .github/pipeline.yml
+
+$pipeline:override <N> "<key>: <reason>"  Disposition a review finding and auto-resume the advance loop for issue N
+
+$pipeline path                            Print resolved install/engine paths for this host
+$pipeline path --json                     Print resolved install/engine paths for this host
+
+$pipeline N --remove-worktree             Remove issue N's on-disk worktree and local branch
+$pipeline N --remove-worktree --force     Remove issue N's on-disk worktree and local branch
+$pipeline N --remove-worktree --json      Remove issue N's on-disk worktree and local branch
+
+$pipeline report                          Preview or submit a privacy-safe product-fault report (opt-in; inert when disabled)
+$pipeline report --yes                    Preview or submit a privacy-safe product-fault report (opt-in; inert when disabled)
+
+$pipeline:unblock <N> "<answer>"          Post an answer and clear the blocked label for issue N
+
+$pipeline backfill                        Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
+$pipeline backfill --apply                Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
+$pipeline backfill --apply --capability <name>  Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
+
+$pipeline:intake [--description "<text>"] [--release <vX.Y.Z>] [--dry-run]  Spec a rough description into a GitHub issue and ROADMAP PR
+
+$pipeline refine-spec --title "<t>" --body "<b>"  Refine an existing issue title/body into a decision-complete spec (non-mutating JSON)
+$pipeline refine-spec --title "<t>" --body "<b>" --json  Refine an existing issue title/body into a decision-complete spec (non-mutating JSON)
+
+$pipeline:roadmap                         Generate a dependency-aware scored roadmap for the backlog
+$pipeline:roadmap --apply                 Generate a dependency-aware scored roadmap for the backlog
+$pipeline:roadmap --next <N>              Generate a dependency-aware scored roadmap for the backlog
+$pipeline:roadmap --dry-run               Generate a dependency-aware scored roadmap for the backlog
+
+$pipeline:sweep                           Batch re-spec thin issues and reconcile ROADMAP.md
+$pipeline:sweep --apply                   Batch re-spec thin issues and reconcile ROADMAP.md
+$pipeline:sweep --apply --repo <owner/repo>  Batch re-spec thin issues and reconcile ROADMAP.md
+
+$pipeline:triage <N> --stage ready        Set a pre-pipeline stage label (ready or backlog) on issue N
+$pipeline:triage <N> --stage backlog      Set a pre-pipeline stage label (ready or backlog) on issue N
+
+$pipeline:merge <pr>                      Human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
+
+$pipeline:release <version>               Prepare a release PR for the given version
+$pipeline:release <version> --dry-run     Prepare a release PR for the given version
+$pipeline:release <version> --edit        Prepare a release PR for the given version
+
+$pipeline correction record …             Record a structured correction event or attribute a control disposition
+$pipeline correction attribute …          Record a structured correction event or attribute a control disposition
+
+$pipeline improve                         Cluster recurring run friction and optionally file backlog issues
+$pipeline improve --apply                 Cluster recurring run friction and optionally file backlog issues
+$pipeline improve --top <N> --since <date> --json  Cluster recurring run friction and optionally file backlog issues
+
+$pipeline:loop --milestone <name>         Start, resume, or audit a durable multi-item run (in-repo supervisor)
+$pipeline:loop --resume <run-id>          Start, resume, or audit a durable multi-item run (in-repo supervisor)
+$pipeline:loop --audit                    Start, resume, or audit a durable multi-item run (in-repo supervisor)
+$pipeline:loop --resume <run-id> --audit --follow  Start, resume, or audit a durable multi-item run (in-repo supervisor)
+$pipeline:loop logs [<run-id>] [--events] [-f]  Start, resume, or audit a durable multi-item run (in-repo supervisor)
+
+$pipeline queue                           Batch factory: dispatch pipeline:ready issues up to limits
+$pipeline queue --max-issues <N> --concurrency <N> --budget-dollars <N>  Batch factory: dispatch pipeline:ready issues up to limits
+$pipeline queue --label <label> --milestone <m> --risk <r>  Batch factory: dispatch pipeline:ready issues up to limits
+
+$pipeline scoreboard                      Print read-only factory throughput/cost/reliability metrics from run artifacts
+$pipeline scoreboard --days <N> --json    Print read-only factory throughput/cost/reliability metrics from run artifacts
+$pipeline scoreboard --bucket day|week    Print read-only factory throughput/cost/reliability metrics from run artifacts
+$pipeline scoreboard --by <dimension>     Print read-only factory throughput/cost/reliability metrics from run artifacts
+$pipeline scoreboard --html <path>        Print read-only factory throughput/cost/reliability metrics from run artifacts
+
+$pipeline evals plan <manifest.json>      Manifest-driven offline experiment runner (plan/run/grade/report/harvest); never writes production GitHub
+$pipeline evals run <manifest.json>       Manifest-driven offline experiment runner (plan/run/grade/report/harvest); never writes production GitHub
+$pipeline evals grade <experiment-dir>    Manifest-driven offline experiment runner (plan/run/grade/report/harvest); never writes production GitHub
+$pipeline evals report <experiment-dir> --baseline <treatment_id>  Manifest-driven offline experiment runner (plan/run/grade/report/harvest); never writes production GitHub
+$pipeline evals harvest <request.json> [--apply] [--plan-only]  Manifest-driven offline experiment runner (plan/run/grade/report/harvest); never writes production GitHub
+```
+<!-- END GENERATED: cli-command-table -->
 ```
 
 **Deprecated flag forms** (still work, emit a one-line deprecation notice to stderr):
