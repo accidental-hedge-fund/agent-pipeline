@@ -751,8 +751,16 @@ test("merge: loop-isolation — no stage handler imports from merge.ts", () => {
   // merge-queue.ts is a human-gated CLI surface (#676) that intentionally calls
   // mergePr via the same merge authority model as `pipeline merge` — not part of
   // the autonomous advance loop. Its release-when-complete path is prepare-only.
+  // Human-gated merge-queue surfaces (#674/#675/#676) intentionally call
+  // mergePr; they are never entered by the autonomous advance loop.
   const checkFiles = stageFiles.filter(
-    (f) => f !== "merge.ts" && f !== "merge-queue.ts" && f !== "merge-queue-release-when-complete.ts",
+    (f) =>
+      f !== "merge.ts" &&
+      f !== "merge-queue.ts" &&
+      f !== "merge-queue-release-when-complete.ts" &&
+      f !== "merge_queue.ts" &&
+      f !== "merge_queue_drive.ts" &&
+      f !== "merge_queue_hold.ts",
   );
 
   for (const file of checkFiles) {

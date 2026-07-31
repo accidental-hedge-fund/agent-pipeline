@@ -37,6 +37,9 @@ import {
   type MergeQueueHoldReason,
   type RepairBudget,
 } from "./merge_queue_hold.ts";
+import { invoke, type InvokeOptions } from "../harness.ts";
+import type { PipelineConfig } from "../types.ts";
+import { getOnDiskForIssue } from "../worktree.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -334,9 +337,10 @@ function resolveBudget(opts: DriveOptions | undefined): RepairBudget {
  * Sequential single-flight drive over an ordered candidate list.
  * Awaits revalidation + optional repair + merge for each item before the next.
  *
- * Default policy for merge-conflict / checks-failed: **hold-item-and-continue**.
- * Hard errors (revalidation exception, eligibility I/O error, non-hold merge
- * failure) still fail-stop the batch.
+ * Default policy: **fail-stop** — merge-conflict / checks-failed holds (after
+ * optional repair budget), revalidation errors, eligibility I/O errors, and
+ * merge failures all stop the batch and mark later candidates not-attempted.
+ * Already-done skips still continue.
  */
 export async function driveMergeQueue(
   candidates: readonly DriveCandidate[],
@@ -467,8 +471,8 @@ export async function driveMergeQueue(
           `(attempt ${repairAttempts + 1}/${budget.maxAttempts})...`,
       );
 
-      // Catch resolver/harness rejections so we still record a durable hold and
-      // continue later candidates under hold-and-continue (never drop evidence).
+      // Catch resolver/harness rejections so we still record a durable hold
+      // (never drop evidence) before fail-stopping the batch.
       try {
         const wt = await deps.repair.resolveManagedWorktree(c);
         if (!wt) {
@@ -570,7 +574,7 @@ export async function driveMergeQueue(
       });
       holds.push(hold);
       deps.log(
-        `[merge-queue drive] PR #${c.prNumber}: held (${hold.reason}) — continue remaining candidates. ` +
+        `[merge-queue drive] PR #${c.prNumber}: held (${hold.reason}) — fail-stop. ` +
           hold.remediation,
       );
       outcomes.push({
@@ -580,7 +584,9 @@ export async function driveMergeQueue(
         reason: hold.reason,
         hold,
       });
-      // Hold-and-continue: do not stop the batch.
+      // Fail-stop: a hold is a hard queue stop point (merge-queue-drive).
+      stopped = true;
+      stopReason = `stopped after held PR #${c.prNumber}`;
       continue;
     }
 
@@ -619,7 +625,7 @@ export async function driveMergeQueue(
       const holdReason = classifyMergeErrorToHoldReason(reason);
       if (holdReason) {
         // Belt-and-suspenders: mergePr refused for conflict/checks after our
-        // pre-check (TOCTOU). Hold-and-continue; never force-merge.
+        // pre-check (TOCTOU). Record hold and fail-stop; never force-merge.
         const hold = createHold({
           prNumber: c.prNumber,
           issueNumber: c.issueNumber,
@@ -630,7 +636,7 @@ export async function driveMergeQueue(
         });
         holds.push(hold);
         deps.log(
-          `[merge-queue drive] PR #${c.prNumber}: merge refused (${holdReason}) — hold and continue. ` +
+          `[merge-queue drive] PR #${c.prNumber}: merge refused (${holdReason}) — hold and fail-stop. ` +
             hold.remediation,
         );
         outcomes.push({
@@ -640,6 +646,8 @@ export async function driveMergeQueue(
           reason: hold.reason,
           hold,
         });
+        stopped = true;
+        stopReason = `stopped after held PR #${c.prNumber}`;
         continue;
       }
 
@@ -724,9 +732,11 @@ export function formatDriveSummary(
     `Summary: ${counts.merged} merged, ${counts["skipped-already-done"]} skipped-already-done, ` +
       `${counts.held} held, ${counts.failed} failed, ${counts["not-attempted"]} not-attempted.` +
       (result.stopped
-        ? " Drive stopped on hard failure."
+        ? result.holds.length > 0
+          ? " Drive stopped on hold (fail-stop)."
+          : " Drive stopped on hard failure."
         : result.holds.length > 0
-          ? " Drive completed with holds (hold-and-continue)."
+          ? " Drive completed with holds."
           : " Drive completed."),
   );
   return lines.join("\n");
@@ -737,9 +747,55 @@ export function formatDriveSummary(
 // ---------------------------------------------------------------------------
 
 /**
+ * Production surgical-repair hooks for merge-queue drive (#675).
+ * Resolves the issue's managed worktree on disk and invokes the implementer
+ * harness with the surgical-repair prompt. Injectable for unit tests.
+ */
+export function realMergeQueueRepairDeps(
+  cfg: PipelineConfig,
+  deps: {
+    getOnDiskForIssue?: typeof getOnDiskForIssue;
+    invokeFn?: (
+      harness: string,
+      worktreeDir: string,
+      prompt: string,
+      opts?: InvokeOptions,
+    ) => ReturnType<typeof invoke>;
+  } = {},
+): NonNullable<DriveDeps["repair"]> {
+  const resolveWt = deps.getOnDiskForIssue ?? getOnDiskForIssue;
+  const invokeFn = deps.invokeFn ?? invoke;
+  return {
+    async resolveManagedWorktree(candidate) {
+      const wt = await resolveWt(cfg, candidate.issueNumber);
+      return wt ? { path: wt.path } : null;
+    },
+    async invokeRepair(args) {
+      const harness = cfg.harnesses?.implementer;
+      if (!harness) {
+        return { ok: false, detail: "no implementer harness configured" };
+      }
+      const result = await invokeFn(harness, args.worktreePath, args.prompt, {
+        timeoutSec: cfg.fix_timeout,
+        model: cfg.models?.fix ?? null,
+        sandbox: cfg.harness_sandbox,
+      });
+      if (result.success) return { ok: true };
+      const parts: string[] = [];
+      if (result.timed_out) parts.push("timed out");
+      if (result.spawn_error) parts.push("spawn error");
+      parts.push(`exit ${result.exit_code}`);
+      return { ok: false, detail: parts.join("; ") };
+    },
+  };
+}
+
+/**
  * Production drive deps: already-done via ghPrView; eligibility via the same
  * mergeability + checks + base gates as the plan; merge only via exported
  * `mergePr`. Repair hooks are optional and off unless the caller wires `repair`.
+ * When `expectedBaseBranch` is set it is threaded into both eligibility and the
+ * shared merge surface so a mid-flight retarget cannot bypass the queue base.
  */
 export function realDriveDeps(
   repo: string,
@@ -747,23 +803,28 @@ export function realDriveDeps(
   repair?: DriveDeps["repair"],
   opts?: { expectedBaseBranch?: string },
 ): DriveDeps {
+  const expectedBaseBranch = opts?.expectedBaseBranch;
+  const mergeWithBase: MergeDeps = {
+    ...mergeDeps,
+    expectedBaseBranch: expectedBaseBranch ?? mergeDeps.expectedBaseBranch,
+  };
   const eligibilityDeps: DriveEligibilityDeps = {
-    ghPrView: (pr, fields) => mergeDeps.ghPrView(pr, fields),
-    ghPrChecksRequired: (pr) => mergeDeps.ghPrChecksRequired(pr),
-    ghPrChecksAll: (pr) => mergeDeps.ghPrChecksAll(pr),
-    expectedBaseBranch: opts?.expectedBaseBranch,
+    ghPrView: (pr, fields) => mergeWithBase.ghPrView(pr, fields),
+    ghPrChecksRequired: (pr) => mergeWithBase.ghPrChecksRequired(pr),
+    ghPrChecksAll: (pr) => mergeWithBase.ghPrChecksAll(pr),
+    expectedBaseBranch,
   };
 
   return {
     revalidate: (candidate) =>
       revalidateDriveCandidate(candidate, {
-        ghPrView: (pr, fields) => mergeDeps.ghPrView(pr, fields),
+        ghPrView: (pr, fields) => mergeWithBase.ghPrView(pr, fields),
       }),
     evaluateEligibility: (candidate) =>
       evaluateDriveEligibility(candidate, eligibilityDeps),
-    mergePr: (pr) => mergePr(pr, mergeDeps),
+    mergePr: (pr) => mergePr(pr, mergeWithBase),
     repair,
-    log: (msg) => mergeDeps.log(msg),
+    log: (msg) => mergeWithBase.log(msg),
   };
 }
 

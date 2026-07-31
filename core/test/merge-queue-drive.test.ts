@@ -302,8 +302,8 @@ test("drive: hard revalidation failure fail-stops; later not-attempted", async (
 // 4.5 mergePr throw fail-stop
 // ---------------------------------------------------------------------------
 
-test("drive: mergePr throw for conflict holds and continues (not fail-stop)", async () => {
-  // #675: conflict/checks refusals from mergePr become holds, not batch abort.
+test("drive: mergePr throw for conflict holds and fail-stops", async () => {
+  // Conflict/checks refusals from mergePr become holds and stop the queue.
   const deps = makeDriveDeps({
     mergeImpl: async (pr) => {
       if (pr === 10) {
@@ -315,11 +315,11 @@ test("drive: mergePr throw for conflict holds and continues (not fail-stop)", as
   });
   const result = await driveMergeQueue([cand(10, 1), cand(11, 2)], deps);
   assert.equal(result.exitCode, 1, "holds leave non-zero exit for operator attention");
-  assert.equal(result.stopped, false, "hold-and-continue must not fail-stop");
-  assert.deepEqual(deps.mergeCalls, [10, 11], "later candidate still merges");
+  assert.equal(result.stopped, true, "hold is a fail-stop queue point");
+  assert.deepEqual(deps.mergeCalls, [10], "later candidates must not merge after hold");
   assert.equal(result.outcomes[0].outcome, "held");
   assert.equal(result.outcomes[0].hold?.reason, "merge-conflict");
-  assert.equal(result.outcomes[1].outcome, "merged");
+  assert.equal(result.outcomes[1].outcome, "not-attempted");
 });
 
 test("drive: mergePr throw for non-hold error still fail-stops", async () => {
@@ -496,6 +496,37 @@ test("drive: pipeline.ts only reaches drive from merge-queue command path", () =
   assert.ok(
     !content.includes("auto_merge"),
     "pipeline.ts must not introduce auto_merge",
+  );
+});
+
+test("drive: pipeline.ts rejects --apply with --dry-run before branching", () => {
+  const content = fs.readFileSync(PIPELINE_TS, "utf8");
+  // Must not route apply&&dry-run into dry-run success via `apply && !dryRun`.
+  assert.ok(
+    content.includes("cannot combine --apply and --dry-run"),
+    "main() must validate mutually exclusive --apply and --dry-run",
+  );
+  assert.ok(
+    !/const applying = !!opts\.apply && !opts\.dryRun/.test(content),
+    "must not silently demote --apply --dry-run to plan-only success",
+  );
+});
+
+test("drive: pipeline.ts wires production repair deps when --repair is set", () => {
+  const content = fs.readFileSync(PIPELINE_TS, "utf8");
+  assert.ok(
+    content.includes("realMergeQueueRepairDeps"),
+    "CLI must import production repair wiring",
+  );
+  assert.ok(
+    /realMergeQueueRepairDeps\s*\(\s*mqCfg\s*\)/.test(content) ||
+      content.includes("realMergeQueueRepairDeps(mqCfg)"),
+    "CLI must construct repair hooks from config when --repair is set",
+  );
+  // Must not pass a hard-coded undefined repair when repair flag is present.
+  assert.ok(
+    !/realDriveDeps\([^)]*undefined,\s*\{\s*expectedBaseBranch/.test(content),
+    "must not always pass undefined repair into realDriveDeps",
   );
 });
 

@@ -103,6 +103,7 @@ import { mergePr, realMergeDeps } from "./stages/merge.ts";
 import { runMergeQueue, realMergeQueueDeps } from "./stages/merge-queue.ts";
 import {
   realDriveDeps,
+  realMergeQueueRepairDeps,
   runMergeQueueCommand,
 } from "./stages/merge_queue_drive.ts";
 import { realMergeQueueDeps as realPlanMergeQueueDeps } from "./stages/merge_queue.ts";
@@ -3125,8 +3126,18 @@ async function main(): Promise<void> {
     try {
       // #674/#675 sequential drive (+ optional surgical repair) when applying.
       // Dry-run stays on the #676 plan/release-when-complete surface.
-      const applying = !!opts.apply && !opts.dryRun;
+      // Mutually exclusive flags must fail before either path (spec + review).
+      if (opts.apply && opts.dryRun) {
+        console.error(
+          "pipeline merge-queue: cannot combine --apply and --dry-run.\n" +
+            "  Use --apply to drive merges, or omit both flags (default dry-run plan).",
+        );
+        process.exit(2);
+      }
+      const applying = !!opts.apply;
       if (applying) {
+        const repairHooks =
+          opts.repair === true ? realMergeQueueRepairDeps(mqCfg) : undefined;
         const code = await runMergeQueueCommand(
           {
             milestone: String(opts.milestone).trim(),
@@ -3140,7 +3151,7 @@ async function main(): Promise<void> {
                 : undefined,
           },
           realPlanMergeQueueDeps(mqCfg.repo),
-          realDriveDeps(mqCfg.repo, realMergeDeps(mqCfg.repo), undefined, {
+          realDriveDeps(mqCfg.repo, realMergeDeps(mqCfg.repo), repairHooks, {
             expectedBaseBranch: mqCfg.base_branch,
           }),
           console.log,

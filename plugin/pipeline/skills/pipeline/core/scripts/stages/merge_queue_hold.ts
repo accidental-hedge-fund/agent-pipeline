@@ -1,9 +1,9 @@
 // Merge-queue hold + surgical repair model (#675).
 //
 // When sequential drive hits merge conflicts or blocking required checks, the
-// queue records a per-item hold (never force-merges), continues remaining
-// candidates by default, and optionally attempts a budget-bounded surgical
-// repair in the managed worktree before re-gating and retrying mergePr.
+// queue records a per-item hold (never force-merges), fail-stops the batch
+// (later candidates not-attempted), and optionally attempts a budget-bounded
+// surgical repair in the managed worktree before re-gating and retrying mergePr.
 //
 // Pure constructors and classifiers live here so unit tests need no network,
 // git, or subprocess. Drive orchestration is in merge_queue_drive.ts.

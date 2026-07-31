@@ -77,8 +77,9 @@ failures only as plan skips and SHALL NOT record holds or invoke repair.
 The merge-queue drive SHALL record a per-item hold and SHALL NOT invoke the merge surface
 when it encounters `merge-conflict` or `checks-failed` for a candidate while the hold
 condition remains true, and SHALL NOT bypass mergeability or required-check gates. The
-default drive policy SHALL be **hold the item and continue** with remaining ordered
-candidates that are still eligible. The drive SHALL NOT introduce an `auto_merge` config key
+default drive policy SHALL be **fail-stop**: after recording the hold (and exhausting any
+optional repair budget for that item), the drive SHALL stop the run and mark later ordered
+candidates as not-attempted. The drive SHALL NOT introduce an `auto_merge` config key
 and SHALL NOT merge from the autonomous advance loop.
 
 #### Scenario: Conflicted PR is held and not merged
@@ -94,13 +95,13 @@ and SHALL NOT merge from the autonomous advance loop.
 - **AND** SHALL NOT call `mergePr` / the merge handler for that PR while required checks
   remain blocking
 
-#### Scenario: Default policy continues remaining candidates after a hold
+#### Scenario: Default policy fail-stops remaining candidates after a hold
 
 - **WHEN** one candidate is held for `merge-conflict` or `checks-failed` and one or more
   later candidates remain in the ordered list
-- **THEN** the drive SHALL continue evaluating the remaining candidates under the default
-  hold-and-continue policy
-- **AND** SHALL NOT abort the entire batch solely because one item was held
+- **THEN** the drive SHALL set the run as stopped
+- **AND** SHALL mark later candidates as not-attempted
+- **AND** SHALL NOT call `mergePr` for any later candidate in that run
 
 #### Scenario: No force-merge path exists for held items
 
@@ -143,15 +144,16 @@ record the hold and remediation without invoking a harness.
   required-check failures
 - **AND** SHALL explicitly forbid refactors, scope-broadening, and opportunistic cleanup
 
-#### Scenario: Repair infrastructure failure records a hold and continues
+#### Scenario: Repair infrastructure failure records a hold and fail-stops
 
 - **WHEN** repair is enabled and resolving the managed worktree or invoking the repair
   harness throws / rejects (infrastructure failure)
 - **THEN** the drive SHALL record a held outcome for that item with the current hold reason
   and evidence including the infrastructure error and attempt count
 - **AND** SHALL NOT call `mergePr` for that item while the hold remains
-- **AND** SHALL continue evaluating later candidates under the default hold-and-continue policy
+- **AND** SHALL stop the run and mark later candidates as not-attempted (fail-stop)
 - **AND** SHALL NOT exit the drive run solely because of the uncaught repair exception
+  without first recording that hold
 
 ---
 

@@ -13,12 +13,16 @@ import {
   driveMergeQueue,
   evaluateDriveEligibility,
   formatDriveSummary,
+  realDriveDeps,
+  realMergeQueueRepairDeps,
   runMergeQueueCommand,
   type DriveCandidate,
   type DriveDeps,
   type DriveEligibility,
   type DriveRevalidation,
 } from "../scripts/stages/merge_queue_drive.ts";
+import type { MergeDeps } from "../scripts/stages/merge.ts";
+import type { PipelineConfig } from "../scripts/types.ts";
 import {
   buildHoldRemediation,
   buildMergeQueueRepairPrompt,
@@ -256,7 +260,7 @@ test("drive: conflict fixture → merge-conflict hold; zero merge surface calls"
   assert.equal(deps.mergeCalls.length, 0, "must not call mergePr while conflicted");
   assert.equal(result.holds.length, 1);
   assert.match(result.holds[0].remediation, /PR #10/);
-  assert.equal(result.stopped, false);
+  assert.equal(result.stopped, true, "hold is a fail-stop queue point");
   assert.equal(result.exitCode, 1);
 });
 
@@ -277,7 +281,7 @@ test("drive: red required checks → checks-failed hold; zero merge surface call
   assert.equal(result.outcomes[0].outcome, "held");
   assert.equal(result.outcomes[0].hold?.reason, "checks-failed");
   assert.equal(deps.mergeCalls.length, 0);
-  assert.equal(result.stopped, false);
+  assert.equal(result.stopped, true, "hold is a fail-stop queue point");
 });
 
 // ---------------------------------------------------------------------------
@@ -361,10 +365,10 @@ test("drive: budget exhaust after N failed repairs → held; no attempt N+1", as
 });
 
 // ---------------------------------------------------------------------------
-// 6.5 Hold-and-continue
+// 6.5 Hold fail-stop
 // ---------------------------------------------------------------------------
 
-test("drive: hold-and-continue processes later eligible candidate", async () => {
+test("drive: hold fail-stops later candidates as not-attempted", async () => {
   const deps = makeDriveDeps({
     evaluateEligibility: (c) => {
       if (c.prNumber === 10) {
@@ -379,12 +383,13 @@ test("drive: hold-and-continue processes later eligible candidate", async () => 
     },
   });
   const result = await driveMergeQueue([cand(10, 1), cand(11, 2), cand(12, 3)], deps);
-  assert.equal(result.stopped, false);
+  assert.equal(result.stopped, true);
   assert.equal(result.outcomes[0].outcome, "held");
-  assert.equal(result.outcomes[1].outcome, "merged");
-  assert.equal(result.outcomes[2].outcome, "merged");
-  assert.deepEqual(deps.mergeCalls, [11, 12]);
+  assert.equal(result.outcomes[1].outcome, "not-attempted");
+  assert.equal(result.outcomes[2].outcome, "not-attempted");
+  assert.deepEqual(deps.mergeCalls, []);
   assert.equal(result.holds.length, 1);
+  assert.equal(result.exitCode, 1);
 });
 
 // ---------------------------------------------------------------------------
@@ -596,7 +601,7 @@ test("drive: post-repair re-gate wrong base does not merge", async () => {
   assert.equal(result.stopped, true);
 });
 
-test("drive: resolveManagedWorktree rejection records hold and continues", async () => {
+test("drive: resolveManagedWorktree rejection records hold and fail-stops", async () => {
   const deps = makeDriveDeps({
     evaluateEligibility: (c) => {
       if (c.prNumber === 10) {
@@ -627,13 +632,13 @@ test("drive: resolveManagedWorktree rejection records hold and continues", async
   assert.match(result.outcomes[0].hold?.summary ?? "", /repair-infra-error/);
   assert.match(result.outcomes[0].hold?.summary ?? "", /worktree resolver crashed/);
   assert.equal(result.outcomes[0].hold?.repairAttempts, 1);
-  assert.equal(result.outcomes[1].outcome, "merged");
-  assert.deepEqual(deps.mergeCalls, [11], "later candidate still merges");
-  assert.equal(result.stopped, false);
+  assert.equal(result.outcomes[1].outcome, "not-attempted");
+  assert.deepEqual(deps.mergeCalls, [], "later candidates must not merge after hold");
+  assert.equal(result.stopped, true);
   assert.equal(result.exitCode, 1, "holds leave non-zero exit");
 });
 
-test("drive: invokeRepair rejection records hold and continues", async () => {
+test("drive: invokeRepair rejection records hold and fail-stops", async () => {
   const deps = makeDriveDeps({
     evaluateEligibility: (c) => {
       if (c.prNumber === 20) {
@@ -663,9 +668,9 @@ test("drive: invokeRepair rejection records hold and continues", async () => {
   assert.equal(result.outcomes[0].hold?.reason, "checks-failed");
   assert.match(result.outcomes[0].hold?.summary ?? "", /harness process killed/);
   assert.equal(result.outcomes[0].hold?.repairAttempts, 1);
-  assert.equal(result.outcomes[1].outcome, "merged");
-  assert.deepEqual(deps.mergeCalls, [21]);
-  assert.equal(result.stopped, false);
+  assert.equal(result.outcomes[1].outcome, "not-attempted");
+  assert.deepEqual(deps.mergeCalls, []);
+  assert.equal(result.stopped, true);
 });
 
 // ---------------------------------------------------------------------------
@@ -1046,17 +1051,23 @@ test("formatDriveSummary surfaces held items and remediation", () => {
           reason: "checks-failed",
           hold,
         },
+        {
+          prNumber: 12,
+          issueNumber: 3,
+          outcome: "not-attempted",
+          reason: "stopped after held PR #11",
+        },
       ],
       holds: [hold],
       exitCode: 1,
-      stopped: false,
+      stopped: true,
     },
     { milestone: "v1" },
   );
   assert.match(text, /held/);
   assert.match(text, /remediation:/);
   assert.match(text, /Outstanding holds/);
-  assert.match(text, /hold-and-continue/);
+  assert.match(text, /stopped on hold \(fail-stop\)/);
   assert.match(text, /repair_attempts=1/);
 });
 
@@ -1064,15 +1075,19 @@ test("formatDriveSummary surfaces held items and remediation", () => {
 // 6.7 Bite tests: logic is present in source
 // ---------------------------------------------------------------------------
 
-test("bite: hold module and drive encode hold-and-continue + re-gate", () => {
+test("bite: hold module and drive encode fail-stop + re-gate", () => {
   const holdSrc = fs.readFileSync(HOLD_TS, "utf8");
   const driveSrc = fs.readFileSync(DRIVE_TS, "utf8");
   assert.ok(holdSrc.includes('"merge-conflict"'));
   assert.ok(holdSrc.includes('"checks-failed"'));
   assert.ok(driveSrc.includes("evaluateEligibility"));
   assert.ok(driveSrc.includes("held"));
-  assert.ok(driveSrc.includes("hold-and-continue") || driveSrc.includes("Hold-and-continue"));
+  assert.ok(
+    driveSrc.includes("fail-stop") || driveSrc.includes("Fail-stop"),
+    "drive must document fail-stop on hold",
+  );
   assert.ok(driveSrc.includes("buildMergeQueueRepairPrompt"));
+  assert.ok(driveSrc.includes("realMergeQueueRepairDeps"), "production repair wiring must exist");
   // Must not introduce an auto_merge config key (prose denial of auto_merge is fine).
   assert.ok(
     !/auto_merge\s*[:=]/.test(driveSrc) && !/auto_merge\s*[:=]/.test(holdSrc),
@@ -1096,5 +1111,168 @@ test("bite: without evaluateEligibility green path, conflict would incorrectly m
     deps.mergeCalls.length,
     0,
     "regression: conflict must not reach mergePr",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Production repair wiring (injected — no real harness/git)
+// ---------------------------------------------------------------------------
+
+function minimalCfg(overrides: Partial<PipelineConfig> = {}): PipelineConfig {
+  return {
+    profile_name: "test",
+    invocation: "test",
+    review_mode: "prompt-harness",
+    marker_footer: "",
+    implementation_ready_message: "",
+    conventions_default: "",
+    domain: "test",
+    repo: "o/r",
+    repo_dir: "/tmp/repo",
+    base_branch: "main",
+    worktree_root: ".worktrees",
+    max_concurrent_worktrees: 4,
+    auto_recovery_max_retries: 1,
+    implementation_timeout: 60,
+    review_timeout: 60,
+    plan_review_timeout: 60,
+    fix_timeout: 120,
+    intake_timeout: 60,
+    sweep_timeout: 60,
+    ci_timeout: 60,
+    ci_poll_interval: 5,
+    ci_no_run_grace_s: 0,
+    ci_mode: "github",
+    pre_merge_ci_assertion_fix: false,
+    pre_merge_ci_rerun_enabled: true,
+    harnesses: {
+      implementer: "codex",
+      reviewer: "claude",
+      implementerSource: "profile",
+      reviewerSource: "profile",
+    },
+    models: {
+      planning: "m",
+      implementing: "m",
+      review: "m",
+      fix: "m",
+      intake: "m",
+      sweep: "m",
+    },
+    effort: {},
+    ...overrides,
+  } as PipelineConfig;
+}
+
+test("realMergeQueueRepairDeps: resolves managed worktree and invokes harness", async () => {
+  let resolveIssue: number | null = null;
+  let invokeArgs: { harness: string; cwd: string; prompt: string } | null = null;
+  const repair = realMergeQueueRepairDeps(minimalCfg(), {
+    async getOnDiskForIssue(_cfg, issueNumber) {
+      resolveIssue = issueNumber;
+      return { path: "/managed/wt-7", slug: "slug" };
+    },
+    async invokeFn(harness, worktreeDir, prompt) {
+      invokeArgs = { harness, cwd: worktreeDir, prompt };
+      return {
+        success: true,
+        stdout: "",
+        stderr: "",
+        exit_code: 0,
+        duration: 1,
+        timed_out: false,
+      };
+    },
+  });
+  const wt = await repair.resolveManagedWorktree(cand(42, 7));
+  assert.deepEqual(wt, { path: "/managed/wt-7" });
+  assert.equal(resolveIssue, 7);
+  const result = await repair.invokeRepair({
+    candidate: cand(42, 7),
+    holdReason: "merge-conflict",
+    summary: "DIRTY",
+    worktreePath: "/managed/wt-7",
+    lastHeadSha: "abc",
+    prompt: "surgical repair prompt",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(invokeArgs?.harness, "codex");
+  assert.equal(invokeArgs?.cwd, "/managed/wt-7");
+  assert.equal(invokeArgs?.prompt, "surgical repair prompt");
+});
+
+test("realMergeQueueRepairDeps: missing worktree returns null without invoke", async () => {
+  let invokeCalls = 0;
+  const repair = realMergeQueueRepairDeps(minimalCfg(), {
+    async getOnDiskForIssue() {
+      return null;
+    },
+    async invokeFn() {
+      invokeCalls++;
+      return {
+        success: true,
+        stdout: "",
+        stderr: "",
+        exit_code: 0,
+        duration: 0,
+        timed_out: false,
+      };
+    },
+  });
+  assert.equal(await repair.resolveManagedWorktree(cand(1, 1)), null);
+  assert.equal(invokeCalls, 0);
+});
+
+test("realDriveDeps: threads expectedBaseBranch into mergePr gate", async () => {
+  const mergeCalls: number[] = [];
+  const viewedFields: string[][] = [];
+  const mergeDeps: MergeDeps = {
+    async ghPrView(_pr, fields) {
+      viewedFields.push([...fields]);
+      return {
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN",
+        headRefOid: "head-sha",
+        baseRefName: "staging", // retargeted off expected main
+      };
+    },
+    async ghPrChecksRequired() {
+      return [{ name: "ci", bucket: "pass" }];
+    },
+    async ghPrChecksAll() {
+      return [{ name: "ci", bucket: "pass" }];
+    },
+    async ghPrMerge(pr) {
+      mergeCalls.push(pr);
+    },
+    async getIssueLabels() {
+      return ["pipeline:ready-to-deploy"];
+    },
+    async getPrLinkedIssue() {
+      return 1;
+    },
+    async getPrForIssue() {
+      return 10;
+    },
+    log() {},
+  };
+  const drive = realDriveDeps("o/r", mergeDeps, undefined, {
+    expectedBaseBranch: "main",
+  });
+  // Eligibility rejects wrong base without merge.
+  const elig = await drive.evaluateEligibility(cand(10, 1));
+  assert.equal(elig.kind, "ineligible");
+  // Direct merge path also rejects retarget (immediately-pre-merge gate).
+  await assert.rejects(
+    () => drive.mergePr(10),
+    (err: Error) => {
+      assert.match(err.message, /base branch mismatch|baseRefName/);
+      return true;
+    },
+  );
+  assert.equal(mergeCalls.length, 0, "must not merge after base retarget at merge gate");
+  assert.ok(
+    viewedFields.some((f) => f.includes("baseRefName")),
+    "merge gate must request baseRefName when expected base is set",
   );
 });

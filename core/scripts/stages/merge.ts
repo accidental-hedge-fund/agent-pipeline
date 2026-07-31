@@ -58,6 +58,12 @@ export interface MergeDeps {
    *  that a closingIssuesReferences candidate actually maps back to the correct PR
    *  in this repository, guarding against cross-repo reference mismatches. */
   getPrForIssue(issueNumber: number): Promise<number | null>;
+  /**
+   * When set (merge-queue drive), immediately-pre-merge gate requires the PR's
+   * `baseRefName` to match this branch. Closes the retarget race between drive
+   * eligibility and the irreversible `gh pr merge` call.
+   */
+  expectedBaseBranch?: string;
   log(msg: string): void;
 }
 
@@ -352,11 +358,26 @@ export async function mergePr(pr: number, deps: MergeDeps): Promise<void> {
   // Fetch mergeable state and the head SHA together. headRefOid is threaded
   // through to --match-head-commit so the merge is bound to the commit that
   // was inspected, closing the TOCTOU race between gate inspection and merge.
-  const prData = await deps.ghPrView(pr, [
+  // When queue drive supplies expectedBaseBranch, also fetch baseRefName so the
+  // base constraint is re-checked in this same immediately-pre-merge gate.
+  const expectedBase = (deps.expectedBaseBranch ?? "").trim();
+  const viewFields = [
     "mergeable",
     "mergeStateStatus",
     "headRefOid",
-  ]);
+    ...(expectedBase ? (["baseRefName"] as const) : []),
+  ];
+  const prData = await deps.ghPrView(pr, [...viewFields]);
+
+  if (expectedBase) {
+    const baseRefName = String(prData.baseRefName ?? "");
+    if (baseRefName !== expectedBase) {
+      throw new Error(
+        `PR #${pr} base branch mismatch at merge gate: baseRefName=${baseRefName || "(empty)"} ` +
+          `expected=${expectedBase}. Refusing merge (possible retarget race).`,
+      );
+    }
+  }
 
   const mergeabilityError = checkMergeability(
     String(prData.mergeable ?? "UNKNOWN"),
