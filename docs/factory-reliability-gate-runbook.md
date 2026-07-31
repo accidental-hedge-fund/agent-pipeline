@@ -58,6 +58,13 @@ Thresholds may tighten over time via this runbook; they remain numeric and check
 The pack uses a **dedicated** synthetic / labeled work-list (`factory-gate` label or
 reliability selector) — **not** the full product milestone backlog.
 
+### Pack composition provenance (Layer B clean items)
+
+Synthetic easy items that exist only to satisfy `clean-item-throughput` leave a
+checked-in marker here so auditors can see pack identity without product scope:
+
+- **v1.29.1 clean composition item 2** — issue #750; docs/OpenSpec-only deliverable for multi-item ready-to-deploy throughput (K ≥ 2).
+
 ### Layer A waivers (explicit; no silent gaps)
 
 | Scenario id | Tracking issue |

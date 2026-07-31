@@ -1,13 +1,13 @@
 ## 1. Provenance note
 
-- [ ] 1.1 Add a minimal checked-in provenance note under `docs/` (preferred: short line in `docs/factory-reliability-gate-runbook.md`) and/or a one-line `README.md` note naming FRG pack clean composition item 2 for v1.29.1 / issue #750
-- [ ] 1.2 Confirm the diff is docs/comment-only plus this OpenSpec change — no product code, no FRG scoring/driver edits, no auto-merge or release-tag changes
+- [x] 1.1 Add a minimal checked-in provenance note under `docs/` (preferred: short line in `docs/factory-reliability-gate-runbook.md`) and/or a one-line `README.md` note naming FRG pack clean composition item 2 for v1.29.1 / issue #750
+- [x] 1.2 Confirm the diff is docs/comment-only plus this OpenSpec change — no product code, no FRG scoring/driver edits, no auto-merge or release-tag changes
 
 ## 2. Verification
 
-- [ ] 2.1 Run `openspec validate frg-pack-clean-composition-item-2` and fix any structural issues
-- [ ] 2.2 Run `npm run ci` from the repo root and ensure green
-- [ ] 2.3 Spot-check acceptance criteria in `proposal.md` against the landed diff
+- [x] 2.1 Run `openspec validate frg-pack-clean-composition-item-2` and fix any structural issues
+- [x] 2.2 Run `npm run ci` from the repo root and ensure green
+- [x] 2.3 Spot-check acceptance criteria in `proposal.md` against the landed diff
 
 ## 3. Pipeline outcome (pack scoring)
 
