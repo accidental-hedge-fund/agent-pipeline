@@ -22,3 +22,11 @@ When the shared post-implementation path (`resumeFromImplementing` or equivalent
 - **THEN** the post-implement path SHALL NOT complete the stage transition away from `implementing`
 - **AND** SHALL NOT set `pipeline:blocked` on the issue
 - **AND** SHALL return a non-advancing waiting outcome
+
+#### Scenario: closed managed PR stops post-implement advance without superseding siblings
+
+- **WHEN** the supersession sweep reports a non-winning outcome because the managed PR is not present as an open eligible managed head on the authoritative open-PR list
+- **THEN** the post-implement path SHALL NOT complete the stage transition away from `implementing`
+- **AND** SHALL NOT set `pipeline:blocked` on the issue
+- **AND** SHALL return a non-advancing waiting outcome
+- **AND** SHALL NOT treat the closed managed PR as authority to supersede other open issue-linked PRs

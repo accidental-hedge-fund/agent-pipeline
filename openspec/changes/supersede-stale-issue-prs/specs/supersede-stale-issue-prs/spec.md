@@ -105,7 +105,7 @@ The repository test suite SHALL include regression coverage that constructs a fi
 
 ### Requirement: Concurrent managed heads SHALL elect one GitHub-authoritative winner before superseding
 
-Before applying any supersede comment or close for issue N, the supersession sweep SHALL elect a single managed winner among open same-repository, same-base pull requests whose head branch starts with `pipeline/<N>-` (non-fork). The election rule SHALL be highest PR number wins. The caller's managed PR identity SHALL always participate in the election even if it is missing from a partial open-PR list. The sweep SHALL revalidate this election from a fresh open-PR list immediately before acting. When the caller's managed PR is not the elected winner, the sweep SHALL NOT comment on or close any candidate (including the elected winner), SHALL report a lost-election outcome, and the post-implement path SHALL stop without transitioning away from `implementing` and without setting `pipeline:blocked` on the issue (so the winning host is not stalled). When the caller's managed PR is the elected winner, supersession of other candidates SHALL proceed under the configured `supersede_mode` as elsewhere in this capability.
+Before applying any supersede comment or close for issue N, the supersession sweep SHALL elect a single managed winner among open same-repository, same-base pull requests whose head branch starts with `pipeline/<N>-` (non-fork). The election rule SHALL be highest PR number wins. When the open-PR list is known to be partial, the caller's managed PR identity SHALL participate in the election even if it is missing from that list. When the open-PR list is the production authoritative complete enumeration (or an equivalent complete injectable list), the caller's managed PR SHALL win or act only if it is still present in that list as an open same-base non-fork `pipeline/<N>-*` head matching the caller's managed PR number and managed head branch; if it is absent, the sweep SHALL NOT comment on or close any candidate and SHALL report a non-winning outcome so the post-implement path does not advance. The sweep SHALL revalidate this election from a fresh open-PR list immediately before acting. When the caller's managed PR is not the elected winner, the sweep SHALL NOT comment on or close any candidate (including the elected winner), SHALL report a lost-election outcome, and the post-implement path SHALL stop without transitioning away from `implementing` and without setting `pipeline:blocked` on the issue (so the winning host is not stalled). When the caller's managed PR is the elected winner, supersession of other candidates SHALL proceed under the configured `supersede_mode` as elsewhere in this capability.
 
 #### Scenario: lower-numbered concurrent managed PR does not close the higher-numbered peer
 
@@ -129,3 +129,12 @@ Before applying any supersede comment or close for issue N, the supersession swe
 - **THEN** the path SHALL NOT transition `implementing → design-gate`
 - **AND** SHALL NOT set `pipeline:blocked` on issue N
 - **AND** SHALL return a non-advancing waiting outcome that names the elected winning PR
+
+#### Scenario: closed managed PR does not supersede open siblings
+
+- **WHEN** the caller's managed PR number and head are absent from the authoritative complete open-PR list (for example the managed PR was closed externally after create-or-reuse)
+- **AND** at least one other open same-repo issue-linked PR remains for issue N
+- **THEN** the supersession sweep SHALL NOT comment on or close that open sibling
+- **AND** SHALL report a non-winning outcome
+- **AND** the post-implement path SHALL NOT transition away from `implementing`
+- **AND** SHALL NOT set `pipeline:blocked` on the issue

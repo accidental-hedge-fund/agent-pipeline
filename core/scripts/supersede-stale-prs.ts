@@ -84,10 +84,43 @@ export function isManagedPipelineHead(
 }
 
 /**
+ * True when the caller's managed PR appears in `openPrs` as an open same-base
+ * non-fork `pipeline/<N>-*` head with matching number and branch. Used to
+ * refuse acting when the managed PR was externally closed between create/reuse
+ * and the supersede sweep (#729 adversarial review).
+ */
+export function isManagedPrOpenEligible(
+  openPrs: PrCandidate[],
+  opts: {
+    issueNumber: number;
+    managedPrNumber: number;
+    managedBranch: string;
+    baseBranch: string;
+  },
+): boolean {
+  return openPrs.some(
+    (pr) =>
+      pr.number === opts.managedPrNumber &&
+      pr.headRefName === opts.managedBranch &&
+      isManagedPipelineHead(pr, opts),
+  );
+}
+
+/**
  * Elect the GitHub-authoritative managed PR winner for issue N among open
  * same-base `pipeline/<N>-*` heads. Highest PR number wins (newest open
- * managed head). The caller's managed identity is always included so a
- * truncated/stale list cannot elect a lower peer over an unlisted managed PR.
+ * managed head).
+ *
+ * On an **authoritative complete** open-PR list (`listIsPartial` false/omitted
+ * — production `listOpenPrCandidates` never returns a partial result), the
+ * caller's identity is **not** seeded when absent: a closed managed PR must
+ * not win and close live siblings. On an **explicitly partial** list
+ * (`listIsPartial: true`), the caller's managed identity is always included so
+ * a truncated list cannot elect a lower peer over an unlisted managed PR.
+ *
+ * Returns `null` when no eligible managed heads participate (empty complete
+ * set, or empty partial set after seeding is still empty only if caller
+ * identity were omitted — seeding always yields at least the caller).
  * Pure + exported for unit tests.
  */
 export function electManagedPrWinner(
@@ -97,15 +130,24 @@ export function electManagedPrWinner(
     managedPrNumber: number;
     managedBranch: string;
     baseBranch: string;
+    /**
+     * When true, seed the caller's managed identity even if missing from
+     * `openPrs` (partial/truncated list source only). Production sweeps use
+     * the complete open-PR enumeration and leave this false/omitted.
+     */
+    listIsPartial?: boolean;
   },
-): ManagedPrIdentity {
-  let winner: ManagedPrIdentity = {
-    prNumber: opts.managedPrNumber,
-    branch: opts.managedBranch,
-  };
+): ManagedPrIdentity | null {
+  let winner: ManagedPrIdentity | null = null;
+  if (opts.listIsPartial) {
+    winner = {
+      prNumber: opts.managedPrNumber,
+      branch: opts.managedBranch,
+    };
+  }
   for (const pr of openPrs) {
     if (!isManagedPipelineHead(pr, opts)) continue;
-    if (pr.number > winner.prNumber) {
+    if (winner === null || pr.number > winner.prNumber) {
       winner = { prNumber: pr.number, branch: pr.headRefName };
     }
   }
@@ -202,24 +244,46 @@ async function planSupersession(
     };
   }
 
-  const elected = electManagedPrWinner(openPrs, {
+  // Production listOpenPrCandidates is complete or throws — never partial.
+  // Do not seed a closed/missing managed PR as winner (would close live siblings).
+  const electionOpts = {
     issueNumber,
     managedPrNumber: managed.prNumber,
     managedBranch: managed.branch,
     baseBranch: cfg.base_branch,
-  });
+  };
+  if (!isManagedPrOpenEligible(openPrs, electionOpts)) {
+    const diagnostic =
+      `[pipeline] #${issueNumber}: supersede: managed PR #${managed.prNumber} ` +
+      `on ${managed.branch} is not an open eligible managed head on the ` +
+      `authoritative open-PR list; not closing peers and not advancing`;
+    log(diagnostic);
+    const electedAmongOpen = electManagedPrWinner(openPrs, electionOpts);
+    return {
+      ok: false,
+      result: emptyResult(managed.prNumber, {
+        wonElection: false,
+        // Peer winner if any open managed head remains; else self (caller can
+        // distinguish closed-managed vs lost-to-peer when electedPr === managed).
+        electedPr: electedAmongOpen?.prNumber ?? managed.prNumber,
+        errors: [diagnostic],
+      }),
+    };
+  }
 
-  if (elected.prNumber !== managed.prNumber) {
+  const elected = electManagedPrWinner(openPrs, electionOpts);
+  if (elected === null || elected.prNumber !== managed.prNumber) {
+    const electedPr = elected?.prNumber ?? managed.prNumber;
     const diagnostic =
       `[pipeline] #${issueNumber}: supersede lost managed-head election to PR ` +
-      `#${elected.prNumber} (this managed PR #${managed.prNumber} on ` +
+      `#${electedPr} (this managed PR #${managed.prNumber} on ` +
       `${managed.branch}); not closing peers`;
     log(diagnostic);
     return {
       ok: false,
       result: emptyResult(managed.prNumber, {
         wonElection: false,
-        electedPr: elected.prNumber,
+        electedPr,
         errors: [diagnostic],
       }),
     };

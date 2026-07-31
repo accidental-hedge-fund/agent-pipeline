@@ -171,8 +171,9 @@ test("electManagedPrWinner: highest open pipeline/<N>-* PR number wins", () => {
   assert.deepEqual(winner, { prNumber: 101, branch: "pipeline/729-host-b" });
 });
 
-test("electManagedPrWinner: caller's managed identity is always in the election set", () => {
-  // Managed PR missing from the open list must still beat a lower peer.
+test("electManagedPrWinner: partial list seeds caller's managed identity", () => {
+  // Explicit partial-list source only: managed missing from the list still beats
+  // a lower peer. Authoritative complete lists do NOT seed (see closed-managed test).
   const winner = electManagedPrWinner(
     [cand(50, "pipeline/729-old")],
     {
@@ -180,9 +181,24 @@ test("electManagedPrWinner: caller's managed identity is always in the election 
       managedPrNumber: 200,
       managedBranch: "pipeline/729-new",
       baseBranch: "main",
+      listIsPartial: true,
     },
   );
   assert.deepEqual(winner, { prNumber: 200, branch: "pipeline/729-new" });
+});
+
+test("electManagedPrWinner: complete list does not seed absent managed PR", () => {
+  const winner = electManagedPrWinner(
+    [cand(50, "pipeline/729-old")],
+    {
+      issueNumber: 729,
+      managedPrNumber: 200,
+      managedBranch: "pipeline/729-new",
+      baseBranch: "main",
+      // listIsPartial omitted → authoritative; do not invent a closed winner
+    },
+  );
+  assert.deepEqual(winner, { prNumber: 50, branch: "pipeline/729-old" });
 });
 
 // ---------------------------------------------------------------------------
@@ -405,6 +421,39 @@ test("supersedeStaleIssuePrs: revalidation before act — loses if higher manage
   assert.ok(listCalls >= 2, "must re-list before acting");
 });
 
+test("supersedeStaleIssuePrs: closed managed PR does not win or close open siblings", async () => {
+  // Managed PR was closed (human/external) after create/reuse; authoritative
+  // open list has only a dual-linked sibling. Must not seed closed PR as winner
+  // and must not comment/close the live sibling.
+  const comments: number[] = [];
+  const closed: number[] = [];
+  const result = await supersedeStaleIssuePrs(
+    makeCfg(),
+    729,
+    { prNumber: 200, branch: "pipeline/729-managed" },
+    {
+      listOpenPrs: async () => [
+        // managed #200 absent — closed
+        cand(656, "eval/expanded-corpus", { closes: [729] }),
+      ],
+      postPrComment: async (_cfg, pr) => {
+        comments.push(pr);
+      },
+      closePr: async (_cfg, pr) => {
+        closed.push(pr);
+      },
+      log: () => {},
+    },
+  );
+  assert.equal(result.wonElection, false);
+  assert.deepEqual(result.candidates, []);
+  assert.deepEqual(result.commented, []);
+  assert.deepEqual(result.closed, []);
+  assert.deepEqual(comments, []);
+  assert.deepEqual(closed, []);
+  assert.ok(result.errors.some((e) => /not an open eligible managed head/.test(e)));
+});
+
 // ---------------------------------------------------------------------------
 // resumeFromImplementing wiring (#729)
 // ---------------------------------------------------------------------------
@@ -620,6 +669,65 @@ test("resumeFromImplementing: lost managed-head election stops without transitio
   assert.equal(transitioned, false, "loser must not transition toward design-gate");
   assert.equal(blocked, false, "loser must not setBlocked (would stall the winner)");
   assert.deepEqual(closed, [], "loser must not close the winning managed PR");
+});
+
+test("resumeFromImplementing: closed managed PR does not close siblings or advance", async () => {
+  // Regression #729 adversarial: managed PR closed externally after create;
+  // open sibling remains. Sweep must not comment/close the sibling; post-implement
+  // must not transition away from implementing.
+  let transitioned = false;
+  let blocked = false;
+  const closed: number[] = [];
+  const comments: number[] = [];
+
+  const deps: ResumeFromImplementingDeps = {
+    runTestGate: async () => passedGate(),
+    runFormatGate: async () => ({ status: "ok", committed: false }),
+    enforceDocsFreshness: async () => ({ ok: true, ran: false }),
+    getPrForBranch: async () => null,
+    createPr: async () => 200,
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    setBlocked: async () => {
+      blocked = true;
+    },
+    transition: async () => {
+      transitioned = true;
+    },
+    supersedeDeps: {
+      listOpenPrs: async () => [
+        // Managed #200 absent (closed); sibling still open and dual-linked.
+        cand(656, "eval/expanded-corpus", { closes: [729] }),
+      ],
+      postPrComment: async (_cfg, pr) => {
+        comments.push(pr);
+      },
+      closePr: async (_cfg, pr) => {
+        closed.push(pr);
+      },
+      log: () => {},
+    },
+  };
+
+  const result = await resumeFromImplementing(
+    makeCfg(),
+    729,
+    { path: "/fake/wt", branch: "pipeline/729-managed" },
+    {
+      prTitle: "[Pipeline] #729",
+      prBody: "Closes #729",
+      transitionMessage: (n) => `PR #${n}`,
+      pipelineRunId: "run-closed-managed",
+    },
+    deps,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(result.status, "waiting");
+  assert.match(result.reason ?? "", /no longer an open eligible managed head/);
+  assert.equal(transitioned, false, "must not transition with a closed managed PR");
+  assert.equal(blocked, false, "must not setBlocked");
+  assert.deepEqual(closed, [], "must not close open sibling");
+  assert.deepEqual(comments, [], "must not comment-flag open sibling");
 });
 
 test("bite: resumeFromImplementing source must call supersede after managed PR is known", () => {

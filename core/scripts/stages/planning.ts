@@ -1629,10 +1629,16 @@ export async function resumeFromImplementing(
     deps.supersedeDeps ?? {},
   );
   if (supersedeResult.wonElection === false) {
+    // electedPr === this PR means the managed PR is no longer open/eligible
+    // (e.g. human closed it between create/reuse and the sweep). Otherwise a
+    // higher concurrent managed head won the GitHub-authoritative election.
     const reason =
-      `concurrent managed PR #${supersedeResult.electedPr} won the GitHub-authoritative ` +
-      `supersession election for issue #${issueNumber}; this host's PR #${prNumber} is not ` +
-      `the live managed head — not advancing`;
+      supersedeResult.electedPr === prNumber
+        ? `managed PR #${prNumber} is no longer an open eligible managed head for ` +
+          `issue #${issueNumber}; not advancing`
+        : `concurrent managed PR #${supersedeResult.electedPr} won the GitHub-authoritative ` +
+          `supersession election for issue #${issueNumber}; this host's PR #${prNumber} is not ` +
+          `the live managed head — not advancing`;
     console.log(`[pipeline] #${issueNumber}: ${reason}`);
     // Do not setBlocked: that would stall the winning host on the same issue.
     // Waiting is host-local; the winner continues advancing the issue.

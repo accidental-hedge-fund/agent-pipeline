@@ -27,7 +27,8 @@
 - [x] 4.5 Prove the multi-PR close test fails if the supersede call is removed from the post-implement path (or equivalent bite proof).
 - [x] 4.6 Concurrent managed heads: highest open `pipeline/<N>-*` PR number wins election; loser does not close winner; winner closes loser; revalidate before act.
 - [x] 4.7 Resume path: lost election returns waiting without transition or setBlocked.
-- [x] 4.6 Keep existing planning/resume PR create-or-reuse tests green.
+- [x] 4.8 Closed managed PR absent from authoritative open list: no comment/close of open siblings; post-implement does not advance (no setBlocked).
+- [x] 4.9 Keep existing planning/resume PR create-or-reuse tests green.
 
 ## 5. Mirror, validate, gate
 
