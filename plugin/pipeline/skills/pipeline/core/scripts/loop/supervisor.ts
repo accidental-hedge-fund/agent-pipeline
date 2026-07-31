@@ -70,6 +70,11 @@ import {
   type AdvanceStageEvent,
   type StageProgressTableRow,
 } from "./stage-progress.ts";
+import {
+  isCoexistenceFailureEvidence,
+  probeLiveAdvance,
+  type LiveAdvanceProbeResult,
+} from "./live-advance.ts";
 
 /** Optional hooks the production dispatch seam (or a test fake) may invoke
  *  during a whole-item hand-off. `onAdvanceLinked` fires when the advance
@@ -148,6 +153,13 @@ export interface SupervisorDeps {
    * start-linkage on the loop run trail (#667). Existing fakes may ignore it.
    */
   dispatchItem(request: LoopExecutionRequest, hooks?: DispatchItemHooks): Promise<LoopExecutionResponse>;
+  /**
+   * Host-local live-advance probe (#770). When omitted, production uses
+   * {@link probeLiveAdvance} against the per-issue lock path.
+   */
+  probeLiveAdvance?(itemId: string): Promise<LiveAdvanceProbeResult> | LiveAdvanceProbeResult;
+  /** Domain used for per-issue lock paths (default agent-pipeline). */
+  lockDomain?: string;
   /** The live changed-file-overlap seam (#530, capability
    *  `durable-run-independent-scheduler`): returns the paths an item's managed worktree actually
    *  changed versus base. Consulted only when more than one item is dispatched in the same cycle
@@ -418,6 +430,30 @@ async function reopenClearedBlockedHolds(
 
     const current = ledger.items[item.id];
     if (!current || (current.state !== "waiting" && current.state !== "paused")) continue;
+
+    // #770: do not re-admit while a host-local advance is still live (operator
+    // resume / mid-flight detach). Clearing `pipeline:blocked` alone is not enough.
+    const domain = deps.lockDomain ?? "agent-pipeline";
+    const probe: LiveAdvanceProbeResult = deps.probeLiveAdvance
+      ? await deps.probeLiveAdvance(item.id)
+      : probeLiveAdvance({
+          domain,
+          issueNumber: Number(item.id),
+          knownLinkage: current.advance_run_id
+            ? { pipeline_run_id: current.advance_run_id }
+            : null,
+        });
+    if (probe.live) {
+      await appendEvent(deps.store, runId, token, "loop_item_coexistence_deferred", {
+        item_id: item.id,
+        evidence: probe.evidence,
+        pipeline_run_id: "pipeline_run_id" in probe ? probe.pipeline_run_id : undefined,
+        holder_pid: "holder_pid" in probe ? probe.holder_pid : undefined,
+        reason: "blocked_label_cleared_but_advance_still_live",
+      }).catch(() => {});
+      continue;
+    }
+
     const time = deps.store.now().toISOString();
     const updated: LoopItemLedgerEntry = {
       ...current,
@@ -652,6 +688,56 @@ export async function runSupervisorCycle(
       progress: drifted || propagated ? "progress" : "no_progress",
     });
     return { progress: drifted || propagated, stop: null, holdOutstanding: false, allDone: false, heldItemIds };
+  }
+
+  // #770 pre-dispatch: if another host-local advance already holds the issue
+  // lock (operator `/pipeline N`), do not spawn a second full dispatch.
+  {
+    const kept: string[] = [];
+    const domain = deps.lockDomain ?? "agent-pipeline";
+    for (const itemId of activeItemIds) {
+      const item = ledger.items[itemId];
+      const probe: LiveAdvanceProbeResult = deps.probeLiveAdvance
+        ? await deps.probeLiveAdvance(itemId)
+        : probeLiveAdvance({
+            domain,
+            issueNumber: Number(itemId),
+            // Do not treat this cycle's own just-started in_progress as linkage live —
+            // only an explicit non-self advance_run_id from a prior attach would count.
+            knownLinkage: null,
+          });
+      if (probe.live) {
+        ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });
+        await appendEvent(deps.store, runId, token, "loop_item_coexistence_wait", {
+          item_id: itemId,
+          evidence: probe.evidence,
+          pipeline_run_id: "pipeline_run_id" in probe ? probe.pipeline_run_id : undefined,
+          holder_pid: "holder_pid" in probe ? probe.holder_pid : undefined,
+          reason: "pre_dispatch_live_advance",
+        }).catch(() => {});
+        await appendActionEvidence(deps.store, runId, token, {
+          item_id: itemId,
+          action: "dispatch_item",
+          outcome: "coexistence_wait",
+          next_action: "noop",
+          progress: "progress",
+          worktree_root: null,
+        });
+        void item;
+        continue;
+      }
+      kept.push(itemId);
+    }
+    activeItemIds = kept;
+    if (activeItemIds.length === 0) {
+      return {
+        progress: true,
+        stop: null,
+        holdOutstanding: heldItemIds.length > 0,
+        allDone: false,
+        heldItemIds,
+      };
+    }
   }
 
   // Dispatch every admitted item concurrently through the unchanged, per-item
@@ -988,6 +1074,15 @@ export async function runSupervisorCycle(
       ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });
       capacityWaitItemIds.push(itemId);
       evidenceOutcome = "capacity_wait";
+    } else if (outcome === "coexistence_wait") {
+      // #770: live host-local advance or non-fatal mid-stage exit — re-queue
+      // pending so siblings continue; never run_fatal.
+      ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });
+      evidenceOutcome = "coexistence_wait";
+      await appendEvent(deps.store, runId, token, "loop_item_coexistence_wait", {
+        item_id: itemId,
+        raw_outcome: String(rawOutcomeByItem.get(itemId) ?? "coexistence_wait"),
+      }).catch(() => {});
     } else if (outcome === "blocked_needs_human") {
       // A needs-human pipeline blocker (#570, capability `loop-needs-human-blocker-disposition`):
       // the standard operator remediation is a one-line unblock + re-run, not an engine defect.
@@ -1096,7 +1191,28 @@ export async function runSupervisorCycle(
       }
       if (preconditionNoOp) continue;
 
+      // #770 Pass-2 coexistence safety net: lock / already-running / install-in-progress
+      // (or failed outcome with live lock probe) must never run_fatal.
+      let coexistenceNoOp = false;
       if (!needsHumanBlockerNoOp) {
+        const errText = dispatchError ?? String(rawOutcomeByItem.get(itemId) ?? "");
+        const domain = deps.lockDomain ?? "agent-pipeline";
+        const probe: LiveAdvanceProbeResult = deps.probeLiveAdvance
+          ? await deps.probeLiveAdvance(itemId)
+          : probeLiveAdvance({ domain, issueNumber: Number(itemId) });
+        if (isCoexistenceFailureEvidence(errText) || probe.live) {
+          coexistenceNoOp = true;
+          ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });
+          evidenceOutcome = "coexistence_wait";
+          await appendEvent(deps.store, runId, token, "loop_item_coexistence_wait", {
+            item_id: itemId,
+            evidence: probe.live ? probe.evidence : "dispatch_text",
+            raw_outcome: errText,
+          }).catch(() => {});
+        }
+      }
+
+      if (!needsHumanBlockerNoOp && !coexistenceNoOp) {
         // A genuine engine defect: recorded as a blocked item under the workflow-engine-defect
         // class so it is never silently re-dispatched — that class's default policy is run_fatal,
         // stopping the run immediately.

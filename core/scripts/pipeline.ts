@@ -44,6 +44,10 @@ import {
   transition,
 } from "./gh.ts";
 import { isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
+import {
+  isCoexistenceFailureEvidence,
+  isNonFatalMidStageExit,
+} from "./loop/live-advance.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import {
   attestPipelineComment,
@@ -842,6 +846,8 @@ export function buildTerminalLinkagePayload(
 export function classifyDispatchOutcome(
   detail: { labels: readonly string[]; state: string },
   lastBlockerKind?: string | null,
+  /** Optional advance events.jsonl body for mid-stage / coexistence classification (#770). */
+  eventsText?: string | null,
 ): LoopExecutionResponse["outcome"] {
   const readyLabel = `${LABEL_PREFIX}ready-to-deploy`;
   if (detail.labels.includes(readyLabel)) return "ready_to_deploy";
@@ -850,6 +856,9 @@ export function classifyDispatchOutcome(
     return "blocked_needs_human";
   }
   if (detail.state === "closed") return "abandoned";
+  if (isCoexistenceFailureEvidence(eventsText) || isNonFatalMidStageExit(eventsText, detail.labels)) {
+    return "coexistence_wait";
+  }
   return "failed";
 }
 
@@ -1068,7 +1077,9 @@ export function realDispatchItem(
           blockedLabeledAt,
         });
       }
-      outcome = classifyDispatchOutcome(detail, lastKind);
+      const eventsTextForClassify =
+        pin && storeReady ? readEventsTextFn(pin.events_path) : null;
+      outcome = classifyDispatchOutcome(detail, lastKind, eventsTextForClassify);
       // Pure capacity is ops admission, not a product block: clear the label so
       // re-admission after a slot frees does not thrash on an already-blocked
       // early-exit (#718). Clear MUST succeed before capacity_wait is safe for a
