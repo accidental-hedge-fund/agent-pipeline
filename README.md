@@ -136,7 +136,7 @@ Or clone and run directly:
 
 ```bash
 gh repo clone accidental-hedge-fund/agent-pipeline
-node agent-pipeline/scripts/install.mjs install        # --host claude|codex|all  (default: all)
+node agent-pipeline/scripts/install.mjs install        # --host claude|codex|grok|all  (default: all)
 ```
 
 The installer copies the shared core and the right host overlay into `~/.claude/skills/pipeline` and/or `~/.codex/skills/pipeline`, writes a launcher shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME`. **Restart Codex** after a Codex install; Claude picks the skill up live.
@@ -216,6 +216,42 @@ node scripts/install.mjs update --host claude
 ```
 
 Running it twice in a row is a net no-op — safe to re-run whenever `pipeline doctor` reports the `install:version-freshness` check is behind the latest release (see [Preflight (doctor)](#preflight-doctor)).
+
+### Grok Build skill path
+
+Grok Build discovers skills under `~/.grok/skills/`. It is **not** a third packaged host overlay (there is no `hosts/grok` SKILL.md fork): Grok reuses the Claude-managed skill content via a path under `~/.grok/skills/pipeline`.
+
+**Preferred:** install Claude first, then materialize a symlink to that install:
+
+```bash
+# 1) Claude-managed skill (default ~/.claude/skills/pipeline, or under CLAUDE_CONFIG_DIR)
+npx github:accidental-hedge-fund/agent-pipeline install --host claude
+
+# 2) Grok path — installer creates/refreshes the symlink
+npx github:accidental-hedge-fund/agent-pipeline install --host grok
+# or from a clone:
+node scripts/install.mjs install --host grok
+```
+
+Equivalent manual layout:
+
+```bash
+mkdir -p ~/.grok/skills
+ln -sfn ~/.claude/skills/pipeline ~/.grok/skills/pipeline
+# If you use CLAUDE_CONFIG_DIR, point the symlink at that skills/pipeline dir instead.
+```
+
+**Copy (secondary):** you may copy the skill tree into `~/.grok/skills/pipeline` instead of symlinking. A copy does **not** track Claude-side updates — re-copy (or switch to the symlink layout) after each Claude skill update.
+
+**After a Claude reinstall or update:** re-run the Grok step so the path is not left dangling or stale:
+
+```bash
+npx github:accidental-hedge-fund/agent-pipeline update --host claude
+npx github:accidental-hedge-fund/agent-pipeline install --host grok
+# manual equivalent: ln -sfn <claude-skill-dir> ~/.grok/skills/pipeline
+```
+
+`pipeline doctor` version checks (`install:version-coherence`, `install:version-freshness`) follow the same core as the Claude install when the Grok path is a symlink into that tree — the symlink entry path alone does not invent a second install root.
 
 ## Usage
 

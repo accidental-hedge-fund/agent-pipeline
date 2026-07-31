@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // agent-pipeline cross-tool installer.
 //
-//   node scripts/install.mjs install   [--host claude|codex|all] [--dry-run]
+//   node scripts/install.mjs install   [--host claude|codex|grok|all] [--dry-run]
 //   node scripts/install.mjs update    [--host …]            (alias for install; idempotent)
 //   node scripts/install.mjs uninstall [--host …]
 //
@@ -11,19 +11,28 @@
 // portable launcher shim, and pre-installs the core's npm dependencies.
 //
 // Honors CLAUDE_CONFIG_DIR and CODEX_HOME for non-default install locations.
+//
+// Grok Build: --host grok materializes ~/.grok/skills/pipeline as a symlink to
+// the Claude-managed skill install (no separate hosts/grok SKILL.md overlay).
+// Requires the Claude skill to already be installed. After a Claude reinstall,
+// re-run --host grok (or recreate the symlink) so the Grok path is not left
+// dangling. Manual layout is documented in the README ("Grok Build skill path").
 
 import {
   closeSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
+  symlinkSync,
   unlinkSync,
   linkSync,
   writeFileSync,
@@ -43,6 +52,9 @@ const HOME = homedir();
 // pre-existing personal install that would shadow the plugin's /pipeline skill.
 const MANAGED_MARKER = ".pipeline-installer-managed";
 
+/** Host names accepted by --host (plus the pseudo-host `all`). */
+const VALID_HOSTS = ["claude", "codex", "grok", "all"];
+
 // ---------------------------------------------------------------------------
 // Host definitions
 // ---------------------------------------------------------------------------
@@ -51,6 +63,15 @@ function claudeBase() {
   return process.env.CLAUDE_CONFIG_DIR
     ? resolve(process.env.CLAUDE_CONFIG_DIR)
     : join(HOME, ".claude");
+}
+
+/** Absolute path of the Claude-managed pipeline skill directory. */
+function claudeSkillDir() {
+  return join(claudeBase(), "skills", "pipeline");
+}
+
+function grokBase() {
+  return join(HOME, ".grok");
 }
 
 // Codex's user-skill path has drifted between ~/.codex/skills (installer + current
@@ -72,6 +93,8 @@ const HOSTS = {
     overlayDir: join(REPO_ROOT, "hosts", "claude"),
     overlayFiles: ["SKILL.md"],
     overlayDirs: [],
+    // Full tree install: stage core + host overlay into skillsDir/pipeline.
+    installMode: "tree",
     baseExists: () => existsSync(claudeBase()),
     skillsDir: () => join(claudeBase(), "skills"),
     postInstall: "Invoke with /pipeline. Live-detected this session (no restart).",
@@ -82,9 +105,25 @@ const HOSTS = {
     overlayDir: join(REPO_ROOT, "hosts", "codex"),
     overlayFiles: ["SKILL.md"],
     overlayDirs: ["agents"],
+    installMode: "tree",
     baseExists: () => existsSync(dirname(codexSkillsDir())),
     skillsDir: () => codexSkillsDir(),
     postInstall: "Restart Codex to pick it up, then invoke with $pipeline.",
+  },
+  // Path materialization only: symlink to the Claude-managed skill (no hosts/grok
+  // overlay). Grok Build discovers skills under ~/.grok/skills/.
+  grok: {
+    label: "Grok Build",
+    profile: "claude",
+    overlayDir: join(REPO_ROOT, "hosts", "claude"),
+    overlayFiles: [],
+    overlayDirs: [],
+    installMode: "symlink-claude",
+    baseExists: () => existsSync(grokBase()),
+    skillsDir: () => join(grokBase(), "skills"),
+    postInstall:
+      "Skill path is a symlink to the Claude-managed install (no separate Grok SKILL.md). " +
+      "After a Claude skill update, re-run: node scripts/install.mjs install --host grok",
   },
 };
 
@@ -114,16 +153,24 @@ function parseArgs(argv) {
 
 function selectedHosts(hostArg) {
   if (hostArg === "all") {
+    // Prefer tree hosts (claude, codex) before grok so a combined install can
+    // materialize Claude first, then symlink Grok to it in the same run.
     const present = Object.keys(HOSTS).filter((h) => HOSTS[h].baseExists());
     if (present.length === 0) {
       fail(
-        "No host detected (neither ~/.claude nor ~/.codex found). " +
-          "Pass --host claude or --host codex to force one.",
+        "No host detected (neither ~/.claude, ~/.codex, nor ~/.grok found). " +
+          "Pass --host claude, codex, or grok to force one. " +
+          "Grok requires a Claude skill install and materializes ~/.grok/skills/pipeline as a symlink to it.",
       );
     }
     return present;
   }
-  if (!HOSTS[hostArg]) fail(`Unknown --host '${hostArg}'. Use claude, codex, or all.`);
+  if (!HOSTS[hostArg]) {
+    fail(
+      `Unknown --host '${hostArg}'. Use claude, codex, grok, or all. ` +
+        `Grok materializes ~/.grok/skills/pipeline → Claude skill (see README "Grok Build skill path").`,
+    );
+  }
   return [hostArg];
 }
 
@@ -579,8 +626,83 @@ function installCodexCommands(agentsDir, dryRun) {
   log(`  ✓ wrote ${OPERATION_SURFACE.length} pipeline:<command> agent files to ${agentsDir}`);
 }
 
+/** True when `p` exists or is a (possibly broken) symlink. */
+function pathPresent(p) {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Materialize ~/.grok/skills/pipeline as a symlink to the Claude-managed skill.
+ * Fail closed when Claude is missing — never silently create a divergent copy.
+ * Exported for unit tests.
+ */
+function installGrokHost(dryRun) {
+  const cfg = HOSTS.grok;
+  const skillsDir = cfg.skillsDir();
+  const dest = join(skillsDir, "pipeline");
+  const claudeDest = claudeSkillDir();
+  log(`→ ${cfg.label}: ${dest}`);
+
+  if (!existsSync(claudeDest)) {
+    fail(
+      `Grok host requires a Claude-managed skill install at ${claudeDest}.\n` +
+        `  Install Claude first, then re-run Grok path setup:\n` +
+        `    node scripts/install.mjs install --host claude\n` +
+        `    node scripts/install.mjs install --host grok\n` +
+        `  Or create the symlink manually (see README "Grok Build skill path"):\n` +
+        `    mkdir -p ~/.grok/skills && ln -sfn <claude-skill-dir> ~/.grok/skills/pipeline`,
+    );
+  }
+
+  // Prefer the absolute Claude skill path as the symlink target so the link
+  // stays valid under CLAUDE_CONFIG_DIR overrides.
+  const target = resolve(claudeDest);
+
+  if (dryRun) {
+    log(`  (dry-run) would symlink ${dest} → ${target}`);
+    return;
+  }
+
+  mkdirSync(skillsDir, { recursive: true });
+
+  if (pathPresent(dest)) {
+    try {
+      const st = lstatSync(dest);
+      if (st.isSymbolicLink()) {
+        let current;
+        try {
+          current = resolve(dirname(dest), readlinkSync(dest));
+        } catch {
+          current = null;
+        }
+        if (current === target) {
+          log(`  ✓ already linked → ${target}. ${cfg.postInstall}`);
+          return;
+        }
+      }
+    } catch {
+      // fall through to replace
+    }
+    // Replace stale symlink, broken link, or divergent copy with the preferred layout.
+    rmSync(dest, { recursive: true, force: true });
+  }
+
+  symlinkSync(target, dest);
+  log(`  ✓ linked → ${target}. ${cfg.postInstall}`);
+}
+
 function installHost(host, dryRun) {
   const cfg = HOSTS[host];
+  if (cfg.installMode === "symlink-claude") {
+    installGrokHost(dryRun);
+    return;
+  }
+
   const skillsDir = cfg.skillsDir();
   const dest = join(skillsDir, "pipeline");
   log(`→ ${cfg.label}: ${dest}`);
@@ -623,13 +745,18 @@ function installHost(host, dryRun) {
 function uninstallHost(host, dryRun) {
   const cfg = HOSTS[host];
   const dest = join(cfg.skillsDir(), "pipeline");
-  if (!existsSync(dest)) {
+  // pathPresent so a broken Grok symlink is still removable.
+  if (!pathPresent(dest)) {
     log(`→ ${cfg.label}: nothing installed at ${dest}`);
     return;
   }
   log(`→ ${cfg.label}: removing ${dest}`);
   if (dryRun) {
-    log("  (dry-run) would rm -rf the skill directory");
+    log(
+      cfg.installMode === "symlink-claude"
+        ? "  (dry-run) would unlink the Grok skill symlink"
+        : "  (dry-run) would rm -rf the skill directory",
+    );
     return;
   }
   rmSync(dest, { recursive: true, force: true });
@@ -1082,6 +1209,8 @@ async function main() {
 export {
   MANAGED_MARKER,
   DEPS,
+  HOSTS,
+  VALID_HOSTS,
   checkLoopCoherence,
   detectPersonalSkill,
   uniqueBackupPath,
@@ -1098,6 +1227,10 @@ export {
   installDep,
   printDepSummary,
   parseArgs,
+  selectedHosts,
+  claudeSkillDir,
+  installGrokHost,
+  installHost,
   findLiveRunLocks,
   formatLiveRunMessage,
   acquireUpdateLock,
