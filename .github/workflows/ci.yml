@@ -32,7 +32,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # Full history + tags: tag-dependent generators (e.g. CHANGELOG from `git tag -l 'v*'`)
+      # and local `npm run ci` / docs:check must see the same git inputs as a full clone.
+      # Do not reintroduce the action default shallow/tagless checkout for this gate (#756).
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: actions/setup-node@v4
         with:

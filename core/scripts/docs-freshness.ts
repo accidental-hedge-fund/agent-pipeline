@@ -101,13 +101,28 @@ export function scriptIsDocsFreshnessCheck(scriptValue: string | undefined): boo
 }
 
 /**
+ * True when a script body is the conditional CI docs entry (`scripts/ci-docs.mjs`).
+ * That entry is check-mode when the generator is present and a no-op when absent
+ * (#756) — structurally it is the docs-freshness edge on the `ci` chain.
+ */
+export function scriptIsConditionalDocsCiEntry(scriptValue: string | undefined): boolean {
+  if (!scriptValue) return false;
+  return /(?:^|[\s/])ci-docs\.mjs\b/.test(scriptValue);
+}
+
+/**
  * Walk an npm scripts map starting from `ci` (and transitively via `npm run X`
  * references) and return true when the graph reaches a docs freshness step.
  * Pure — used by the structural drift-guard and unit tests.
  *
- * Only **check-mode** edges count (`generate-docs … --check`, or a `docs:check`
- * script whose body is itself check-mode). A write-mode `docs:check` that merely
- * invokes the generator does **not** satisfy CI freshness parity.
+ * Edges that count:
+ * - **check-mode** generator invocations (`generate-docs … --check`, or a
+ *   `docs:check` script whose body is itself check-mode);
+ * - the **conditional** `ci:docs` / `scripts/ci-docs.mjs` entry (#756), which
+ *   runs real check-mode when the generator is present.
+ *
+ * A write-mode `docs:check` that merely invokes the generator does **not**
+ * satisfy CI freshness parity by itself.
  */
 export function ciScriptReachesDocsFreshness(scripts: Record<string, string>): boolean {
   const visited = new Set<string>();
@@ -119,6 +134,7 @@ export function ciScriptReachesDocsFreshness(scripts: Record<string, string>): b
     const body = scripts[name];
     if (typeof body !== "string") continue;
     if (scriptIsDocsFreshnessCheck(body)) return true;
+    if (scriptIsConditionalDocsCiEntry(body)) return true;
     if (/\bdocs:check\b/.test(body)) {
       // Direct reference — only accept when docs:check is itself check-mode.
       const docsCheckBody = scripts["docs:check"];
