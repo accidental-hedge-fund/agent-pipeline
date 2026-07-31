@@ -329,10 +329,14 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "Rebase the branch on the latest target, resolve the conflicts, push, " +
     "remove the `blocked` label, then re-run `$pipeline {{N}}`.",
   "worktree-missing":
-    "The worktree for this issue no longer exists. The fix stage cannot run " +
-    "without it — re-running will block again immediately. Recreate it manually " +
-    "from the issue's branch (`git worktree add`), remove the `blocked` label, " +
-    "then re-run `$pipeline {{N}}`.",
+    "The managed worktree for this issue is missing and could not be rematerialized " +
+    "automatically (no recoverable remote branch / open PR head, or rematerialize " +
+    "could not run). Verify the pipeline branch is still on the remote or that an " +
+    "open PR exists for it, check `gh` auth, free worktree capacity if needed, and " +
+    "resolve any dirty or local-only reclaim blockers under the managed worktree " +
+    "root. Then remove the `blocked` label and re-run `$pipeline {{N}}`. As a " +
+    "last resort, recreate manually with `git worktree add` from the issue branch " +
+    "before re-running.",
   "worktree-creation-failed":
     "Creating the worktree failed (see the error above). If a `.git/config.lock` " +
     "file is present, remove it: `rm -f .git/config.lock`. Delete the dangling " +

@@ -102,12 +102,22 @@ test("maybeArchiveOpenspec: candidate probe (git diff) exits non-zero → blocke
 // 2. Worktree missing while the PR still introduces an active change (3.2)
 // ---------------------------------------------------------------------------
 
-test("maybeArchiveOpenspec: worktree missing + PR-head tip tree still carries an active change → blocked needs-human", async (t) => {
+test("maybeArchiveOpenspec: worktree missing + active tip change + rematerialize fail → typed block (not needs-human)", async (t) => {
   const blockedCalls: Array<{ reason: string; label: string }> = [];
+  let ensureCalls = 0;
   const deps: AdvancePreMergeDeps = {
     getForIssue: async () => null,
     // Tip-tree membership (not cumulative path subtraction) drives missing-worktree (#714).
     listPrHeadChangeDirs: async () => ["foo"],
+    ensureManagedWorktree: async () => {
+      ensureCalls += 1;
+      return {
+        result: "fail",
+        worktree: null,
+        reason: "no recoverable remote branch or open PR head",
+        blockerKind: "worktree-missing",
+      };
+    },
     setBlocked: (async (_cfg, _n, reason, _stage, label) => {
       blockedCalls.push({ reason, label });
     }) as AdvancePreMergeDeps["setBlocked"],
@@ -120,9 +130,11 @@ test("maybeArchiveOpenspec: worktree missing + PR-head tip tree still carries an
 
   assert.notEqual(out, null, "missing worktree with an active PR change must not silently continue");
   assert.equal((out as { status: string })?.status, "blocked");
+  assert.equal(ensureCalls, 1, "must attempt rematerialize before parking");
   assert.equal(blockedCalls.length, 1);
-  assert.equal(blockedCalls[0].label, "needs-human");
+  assert.equal(blockedCalls[0].label, "worktree-missing");
   assert.match(blockedCalls[0].reason, /foo/);
+  assert.match(blockedCalls[0].reason, /rematerialize failed/);
 });
 
 test("maybeArchiveOpenspec: worktree missing + empty PR-head tip tree → returns null (unchanged)", async (t) => {
@@ -306,14 +318,25 @@ test("enforceOpenspecActiveChangeGuard: PR-head tip-tree list fails → fails cl
 test("maybeArchiveOpenspec: missing worktree + archive-then-reintroduce tip tree blocks (not no-candidates) (#714 5e98a850)", async (t) => {
   // Cumulative PR paths would include both archive/…-foo/ and reintroduced
   // openspec/changes/foo/ → sharedActiveChangeIdsFromPaths yields []. Tip tree
-  // still has foo — must block needs-human, never skip/no-candidates.
+  // still has foo — rematerialize is attempted (#769); when it fails, typed
+  // worktree block (not needs-human absence-only, never skip/no-candidates).
   const blockedCalls: Array<{ reason: string; label: string }> = [];
   const appended: string[] = [];
   let pathProbeCalled = false;
+  let ensureCalls = 0;
 
   const deps: AdvancePreMergeDeps = {
     getForIssue: async () => null,
     listPrHeadChangeDirs: async () => ["foo"],
+    ensureManagedWorktree: async () => {
+      ensureCalls += 1;
+      return {
+        result: "fail",
+        worktree: null,
+        reason: "no recoverable remote branch or open PR head",
+        blockerKind: "worktree-missing",
+      };
+    },
     getPrDiff: async () => {
       pathProbeCalled = true;
       return (
@@ -334,9 +357,10 @@ test("maybeArchiveOpenspec: missing worktree + archive-then-reintroduce tip tree
   });
 
   assert.equal(pathProbeCalled, false, "missing-worktree must not use cumulative PR path subtraction");
+  assert.equal(ensureCalls, 1, "must attempt rematerialize before typed park");
   assert.notEqual(out, null);
   assert.equal((out as { status: string })?.status, "blocked");
-  assert.equal(blockedCalls[0]?.label, "needs-human");
+  assert.equal(blockedCalls[0]?.label, "worktree-missing");
   assert.match(blockedCalls[0]?.reason ?? "", /foo/);
   const events = appendedEvents(appended).filter((e) => e.type === "gate_result" && e.gate === "openspec-archive");
   assert.equal(events.length, 1);

@@ -38,7 +38,16 @@ import {
   classifyCiFailure,
   type CiFailureClass,
 } from "../ci-failure-classify.ts";
-import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, reattachIfDetached } from "../worktree.ts";
+import {
+  branchName,
+  ensureManagedWorktree,
+  getForIssue,
+  getOnDiskForIssue,
+  gitInWorktree,
+  reattachIfDetached,
+  type EnsureManagedWorktreeDeps,
+  type EnsureManagedWorktreeResult,
+} from "../worktree.ts";
 import {
   PIPELINE_INTERNAL_MARKER_FILES,
   isOnlyPipelineInternalMarkerDirt,
@@ -239,11 +248,25 @@ export const PRE_MERGE_AUTOFIX_ATTEMPT_RE =
  *                   unreadable HEAD, or pre-dirty worktree. Worktree rolled
  *                   back to pre-fix HEAD when applicable. Not eligible for the
  *                   clean-noop re-verify path.
+ * "rematerialize-failed" — managed worktree was missing and ensureManagedWorktree
+ *                   failed before implementer work (#769). Carries the seam's
+ *                   typed blockerKind so residual re-entry / delta SHA-gate
+ *                   paths park as worktree-* rather than product needs-human.
  */
+export type PreMergeAutofixRematerializeBlockerKind =
+  | "worktree-missing"
+  | "worktree-creation-failed"
+  | "worktree-capacity";
+
 export type PreMergeAutoFixResult =
   | { status: "fix-committed"; headSha: string }
   | { status: "noop-clean"; headSha: string; diagnostic: string }
-  | { status: "error"; diagnostic?: string };
+  | { status: "error"; diagnostic?: string }
+  | {
+      status: "rematerialize-failed";
+      blockerKind: PreMergeAutofixRematerializeBlockerKind;
+      diagnostic: string;
+    };
 
 /**
  * Injectable seam for the bounded pre-merge auto-fix attempt (#359, #747).
@@ -1379,6 +1402,15 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
    */
   trySalvageUncommittedWork?: typeof trySalvageUncommittedWork;
   /**
+   * Rematerialize a missing managed worktree before archive / autofix (#769).
+   * Production default: {@link ensureManagedWorktree}. Tests inject fakes.
+   */
+  ensureManagedWorktree?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    ensureDeps?: EnsureManagedWorktreeDeps,
+  ) => Promise<EnsureManagedWorktreeResult>;
+  /**
    * GitHub login of the pipeline actor used to filter review comments to
    * trusted-authored entries before extracting spec-divergence signals (#356
    * finding 1). When absent, `maybeArchiveOpenspec` resolves it via `getGhActor()`
@@ -1529,16 +1561,35 @@ export async function advance(
   // Wire the bounded pre-merge auto-fix dep (#359): when the implementer harness
   // is configured and no seam is injected by the caller, build a production closure
   // that invokes `performPreMergeAutoFix` (fix + amend + push) for the gate to call.
+  // Missing managed worktree rematerializes first (#769) so residual re-entry and
+  // normal delta autofix share one factory path (no bare empty `{status:"error"}`).
   const gitFnForAutoFix = deps.gitInWorktree ?? gitInWorktree;
   const invokeFnForAutoFix = deps.invokeFn ?? invoke;
   const getForIssueForAutoFix = deps.getForIssue ?? getOnDiskForIssue;
   const salvageFnForAutoFix = deps.trySalvageUncommittedWork ?? trySalvageUncommittedWork;
+  const ensureWtForAutoFix = deps.ensureManagedWorktree ?? ensureManagedWorktree;
   const preAutoFixFn: ShaGateDeps["attemptPreMergeAutoFix"] =
     deps.attemptPreMergeAutoFix ??
     (cfg.harnesses?.implementer
       ? async (blockingFindings, issueTitle, findingsText) => {
-          const wt = await getForIssueForAutoFix(cfg, issueNumber);
-          if (!wt) return { status: "error" };
+          let wt = await getForIssueForAutoFix(cfg, issueNumber);
+          if (!wt) {
+            const remat = await ensureWtForAutoFix(cfg, issueNumber, {
+              getOnDiskForIssue: getForIssueForAutoFix,
+              getIssueTitle: async () => issueTitle,
+              runDir: opts.runDir,
+              runStoreDeps: opts.runStoreDeps,
+            });
+            if (remat.result === "fail") {
+              return {
+                status: "rematerialize-failed",
+                blockerKind: remat.blockerKind,
+                diagnostic:
+                  `worktree rematerialize failed (${remat.blockerKind}): ${remat.reason}`,
+              };
+            }
+            wt = { path: remat.worktree.path, slug: remat.worktree.slug };
+          }
           return performPreMergeAutoFix(
             cfg,
             issueNumber,
@@ -2591,9 +2642,39 @@ export async function enforceReviewShaGate(
                 summary: `residual re-entry auto-fix ${fixRes.status}; re-enter SHA gate`,
               };
             }
+            // Typed worktree/rematerialize failure (#769): park as the seam's
+            // blocker kind — not product needs-human residual judgment.
+            if (fixRes.status === "rematerialize-failed") {
+              console.warn(
+                `[pipeline] #${issueNumber}: residual re-entry auto-fix rematerialize-failed ` +
+                  `(${fixRes.blockerKind}): ${fixRes.diagnostic}`,
+              );
+              await recordPreMergeGateResult(
+                { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+                "pre-merge-autofix",
+                "fail",
+                `residual-reentry:rematerialize-failed:${fixRes.blockerKind}`,
+              );
+              const rematKind = fixRes.blockerKind;
+              const rematReason = fixRes.diagnostic;
+              if (rematKind === "worktree-capacity") {
+                await setBlockedFn(cfg, issueNumber, rematReason, "pre-merge", "worktree-capacity");
+                return preMergeBlocked(rematReason, "worktree-capacity");
+              }
+              if (rematKind === "worktree-creation-failed") {
+                await setBlockedFn(
+                  cfg, issueNumber, rematReason, "pre-merge", "worktree-creation-failed",
+                );
+                return preMergeBlocked(rematReason, "worktree-creation-failed");
+              }
+              await setBlockedFn(cfg, issueNumber, rematReason, "pre-merge", "worktree-missing");
+              return preMergeBlocked(rematReason, "worktree-missing");
+            }
             console.warn(
               `[pipeline] #${issueNumber}: residual re-entry auto-fix ${fixRes.status}` +
-                (fixRes.diagnostic ? ` (${fixRes.diagnostic})` : "") +
+                (fixRes.status === "error" && fixRes.diagnostic
+                  ? ` (${fixRes.diagnostic})`
+                  : "") +
                 "; escalating remaining blockers",
             );
             await recordPreMergeGateResult(
@@ -3594,6 +3675,30 @@ export async function enforceReviewShaGate(
               "fail",
               "exhausted",
             );
+          } else if (fixRes?.status === "rematerialize-failed") {
+            // Typed worktree/rematerialize failure from the shared production
+            // autofix seam (#769): park with the seam's blocker kind before the
+            // product needs-human residual disposition path.
+            await recordPreMergeGateResult(
+              { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+              "pre-merge-autofix",
+              "fail",
+              `rematerialize-failed:${fixRes.blockerKind}`,
+            );
+            const rematKind = fixRes.blockerKind;
+            const rematReason = fixRes.diagnostic;
+            if (rematKind === "worktree-capacity") {
+              await setBlockedFn(cfg, issueNumber, rematReason, "pre-merge", "worktree-capacity");
+              return preMergeBlocked(rematReason, "worktree-capacity");
+            }
+            if (rematKind === "worktree-creation-failed") {
+              await setBlockedFn(
+                cfg, issueNumber, rematReason, "pre-merge", "worktree-creation-failed",
+              );
+              return preMergeBlocked(rematReason, "worktree-creation-failed");
+            }
+            await setBlockedFn(cfg, issueNumber, rematReason, "pre-merge", "worktree-missing");
+            return preMergeBlocked(rematReason, "worktree-missing");
           } else {
             // fixRes.status === "error" (or attempt marker failed → fixRes null).
             await recordPreMergeGateResult(
@@ -4035,40 +4140,74 @@ export async function maybeArchiveOpenspec(
     return preMergeBlocked(reason, "openspec-invalid");
   };
 
-  const wt = await getForIssueFn(cfg, issueNumber);
+  let wt = await getForIssueFn(cfg, issueNumber);
   if (!wt) {
     // Worktree missing: resolve active membership from the reviewed PR-head tree
     // (GitHub Contents API), never cumulative PR path subtraction — the latter
     // masks archive-then-reintroduce (#467 / #714 review 2). `openspec.enabled: off`
     // disables the integration outright regardless of tip contents.
+    // When tip has active change(s) or membership is unconfirmed, rematerialize
+    // first (#769) instead of parking needs-human solely for absence.
     const mode = cfg.openspec?.enabled ?? "auto";
     if (mode === "off" || prNumber === undefined) {
       await recordDecision("skipped", "openspec-inactive");
       return null;
     }
-    let remaining: string[];
+    let remaining: string[] = [];
+    let membershipUnconfirmed = false;
+    let listingError = "";
     try {
       remaining = [...(await listPrHeadChangeDirsFn(cfg, prNumber))].sort();
     } catch (err) {
-      const reason =
-        `Worktree for #${issueNumber} not found on disk and listing PR-head OpenSpec change ` +
-        `dirs failed (${(err as Error).message}), so it cannot be confirmed there is no active ` +
-        `OpenSpec change to archive. Restore the worktree (or gh auth) and re-run.`;
-      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
-      await recordDecision("fail", reason);
-      return preMergeBlocked(reason, "needs-human");
+      membershipUnconfirmed = true;
+      listingError = (err as Error).message ?? String(err);
     }
-    if (remaining.length > 0) {
-      const reason =
-        `OpenSpec worktree for #${issueNumber} not found on disk, and the pull request still ` +
-        `introduces active OpenSpec change(s): ${remaining.join(", ")}. Restore the worktree ` +
-        `(or re-run planning) so the archive step can run, then re-run the pipeline.`;
-      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "needs-human");
-      await recordDecision("fail", reason);
-      return preMergeBlocked(reason, "needs-human");
+    if (!membershipUnconfirmed && remaining.length === 0) {
+      await recordDecision("skipped", "no-candidates");
+      return null;
     }
-    await recordDecision("skipped", "no-candidates");
-    return null;
+
+    const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+    const remat = await ensureFn(cfg, issueNumber, {
+      getOnDiskForIssue: getForIssueFn,
+      runDir: deps.runDir,
+      runStoreDeps: deps.runStoreDeps,
+    });
+    if (remat.result === "fail") {
+      const activePart = membershipUnconfirmed
+        ? `PR-head OpenSpec membership unconfirmed (${listingError})`
+        : `active OpenSpec change(s) still on the PR tip: ${remaining.join(", ")}`;
+      const reason =
+        `OpenSpec worktree for #${issueNumber} not found on disk (${activePart}); ` +
+        `rematerialize failed (${remat.blockerKind}): ${remat.reason}`;
+      // Separate calls keep explicit BlockerKind string literals visible to the
+      // blocked-recipes exhaustiveness scan (nested ternaries confuse its paren walk).
+      if (remat.blockerKind === "worktree-capacity") {
+        await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "worktree-capacity");
+        await recordDecision("fail", reason);
+        return preMergeBlocked(reason, "worktree-capacity");
+      }
+      if (remat.blockerKind === "worktree-creation-failed") {
+        await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "worktree-creation-failed");
+        await recordDecision("fail", reason);
+        return preMergeBlocked(reason, "worktree-creation-failed");
+      }
+      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "worktree-missing");
+      await recordDecision("fail", reason);
+      return preMergeBlocked(reason, "worktree-missing");
+    }
+    // Rematerialize succeeded (or was skipped if race recreated the tree).
+    const reResolved = await getForIssueFn(cfg, issueNumber);
+    if (!reResolved) {
+      // Defensive: ensure claimed pass/skipped but lookup still empty.
+      const reason =
+        `Rematerialize reported ${remat.result} for #${issueNumber} but worktree still ` +
+        `missing on disk after recreate.`;
+      await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "worktree-creation-failed");
+      await recordDecision("fail", reason);
+      return preMergeBlocked(reason, "worktree-creation-failed");
+    }
+    wt = reResolved;
   }
   if (!isActiveFn(cfg, wt.path)) {
     await recordDecision("skipped", "openspec-inactive");
