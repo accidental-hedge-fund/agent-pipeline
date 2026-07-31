@@ -9,7 +9,9 @@ import { join } from "node:path";
 import {
   advance,
   buildCiExhaustedBlockReason,
+  ciRecoveryShaSetHas,
   loadCiRecoveryMarkers,
+  REBASE_HEAD_UNVERIFIED_WAIT_REASON,
   resolveRebasePushResult,
   saveCiRecoveryMarkers,
   type AdvancePreMergeDeps,
@@ -179,7 +181,7 @@ test("buildCiExhaustedBlockReason surfaces closed PR reopen step", () => {
 });
 
 test("saveCiRecoveryMarkers fails closed without runDir", () => {
-  const result = saveCiRecoveryMarkers(undefined, { ciRerunAttemptedForSha: SHA_HEAD });
+  const result = saveCiRecoveryMarkers(undefined, { ciRerunAttemptedShas: [SHA_HEAD] });
   assert.equal(result.ok, false);
   if (!result.ok) assert.match(result.reason, /runDir unavailable/);
 });
@@ -209,7 +211,7 @@ test("flake fail → re-run → green advances without needs-human", async (t) =
     assert.equal(first!.status, "waiting");
     assert.equal(rec.reruns, 1);
     assert.equal(rec.blocked.length, 0);
-    assert.equal(pollingCtx.ciRerunAttemptedForSha, SHA_HEAD);
+    assert.ok(ciRecoveryShaSetHas(pollingCtx.ciRerunAttemptedShas, SHA_HEAD));
 
     let second;
     await quiet(t, async () => {
@@ -267,7 +269,7 @@ test("durable marker after simulated restart skips second re-run", async (t) => 
     });
     assert.equal(rec.reruns, 1);
     const disk = loadCiRecoveryMarkers(runDir);
-    assert.equal(disk.ciRerunAttemptedForSha, SHA_HEAD);
+    assert.ok(ciRecoveryShaSetHas(disk.ciRerunAttemptedShas, SHA_HEAD));
     const raw = await readFile(join(runDir, "pre-merge-ci-recovery.json"), "utf8");
     assert.match(raw, new RegExp(SHA_HEAD));
 
@@ -362,7 +364,7 @@ test("archive-only + prior green after re-run exhausted — one close+reopen the
     });
     const pollingCtx: PreMergePollingContext = {
       preArchiveSha: SHA_PRE,
-      ciRerunAttemptedForSha: SHA_HEAD,
+      ciRerunAttemptedShas: [SHA_HEAD],
     };
 
     let out;
@@ -375,7 +377,7 @@ test("archive-only + prior green after re-run exhausted — one close+reopen the
     assert.equal(rec.reopenCalls, 1, "reopen once");
     assert.equal(rec.reruns, 0);
     assert.equal(rec.blocked.length, 0);
-    assert.equal(pollingCtx.ciArchiveFailRecoveryAttemptedForSha, SHA_HEAD);
+    assert.ok(ciRecoveryShaSetHas(pollingCtx.ciArchiveFailRecoveryAttemptedShas, SHA_HEAD));
   });
 });
 
@@ -406,7 +408,7 @@ test("archive-only prior-green: restart after re-run still close+reopens; escala
     assert.equal(rec.reruns, 1);
     assert.equal(rec.closeCalls, 0);
     const diskAfterRerun = loadCiRecoveryMarkers(runDir);
-    assert.equal(diskAfterRerun.ciRerunAttemptedForSha, SHA_HEAD);
+    assert.ok(ciRecoveryShaSetHas(diskAfterRerun.ciRerunAttemptedShas, SHA_HEAD));
     assert.equal(
       diskAfterRerun.preArchiveSha,
       SHA_PRE,
@@ -427,7 +429,7 @@ test("archive-only prior-green: restart after re-run still close+reopens; escala
     assert.equal(rec.reopenCalls, 1);
     assert.equal(rec.blocked.length, 0);
     assert.equal(ctx2.preArchiveSha, SHA_PRE, "hydrated preArchiveSha after restart");
-    assert.equal(ctx2.ciArchiveFailRecoveryAttemptedForSha, SHA_HEAD);
+    assert.ok(ciRecoveryShaSetHas(ctx2.ciArchiveFailRecoveryAttemptedShas, SHA_HEAD));
 
     // Process 3: still red, budget exhausted → escalate with pre-archive green evidence.
     const ctx3: PreMergePollingContext = {};
@@ -462,7 +464,7 @@ test("archive close succeeds reopen fails — retry reopen; escalate with PR clo
     });
     const pollingCtx: PreMergePollingContext = {
       preArchiveSha: SHA_PRE,
-      ciRerunAttemptedForSha: SHA_HEAD,
+      ciRerunAttemptedShas: [SHA_HEAD],
     };
 
     let out;
@@ -476,7 +478,7 @@ test("archive close succeeds reopen fails — retry reopen; escalate with PR clo
     assert.match(rec.blocked[0].reason, /still CLOSED/i);
     assert.match(rec.blocked[0].reason, /gh pr reopen 678/);
     assert.match(rec.blocked[0].reason, /close succeeded; reopen failed/i);
-    assert.equal(pollingCtx.ciArchiveFailRecoveryAttemptedForSha, SHA_HEAD);
+    assert.ok(ciRecoveryShaSetHas(pollingCtx.ciArchiveFailRecoveryAttemptedShas, SHA_HEAD));
   });
 });
 
@@ -494,7 +496,7 @@ test("archive close succeeds reopen recovers on retry → waiting", async (t) =>
     });
     const pollingCtx: PreMergePollingContext = {
       preArchiveSha: SHA_PRE,
-      ciRerunAttemptedForSha: SHA_HEAD,
+      ciRerunAttemptedShas: [SHA_HEAD],
     };
 
     let out;
@@ -573,7 +575,7 @@ test("assertion fix enabled runs once then stops", async (t) => {
     });
     assert.equal(first!.status, "waiting");
     assert.equal(fixCalls, 1);
-    assert.equal(pollingCtx.ciAssertionFixAttemptedForSha, SHA_HEAD);
+    assert.ok(ciRecoveryShaSetHas(pollingCtx.ciAssertionFixAttemptedShas, SHA_HEAD));
 
     let second;
     await quiet(t, async () => {
@@ -594,8 +596,8 @@ test("#181 non-regression: budget exhausted returns blocked not waiting", async 
     rerunFailedWorkflows: async () => ({ attempted: false, runIds: [], reason: "unavailable" }),
   });
   const pollingCtx: PreMergePollingContext = {
-    ciRerunAttemptedForSha: SHA_HEAD,
-    ciArchiveFailRecoveryAttemptedForSha: SHA_HEAD,
+    ciRerunAttemptedShas: [SHA_HEAD],
+    ciArchiveFailRecoveryAttemptedShas: [SHA_HEAD],
   };
   let out;
   await quiet(t, async () => {
@@ -623,7 +625,7 @@ test("new head SHA resets re-run budget", async (t) => {
       comments: [{ body: `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${head} -->` }],
     })) as AdvancePreMergeDeps["getIssueDetail"];
 
-    const pollingCtx: PreMergePollingContext = { ciRerunAttemptedForSha: SHA_HEAD };
+    const pollingCtx: PreMergePollingContext = { ciRerunAttemptedShas: [SHA_HEAD] };
 
     // Still on SHA_HEAD with marker → no re-run, escalate (no archive path).
     let first;
@@ -646,7 +648,7 @@ test("new head SHA resets re-run budget", async (t) => {
     });
     assert.equal(second!.status, "waiting");
     assert.equal(rec.reruns, 1);
-    assert.equal(pollingCtx.ciRerunAttemptedForSha, SHA2);
+    assert.ok(ciRecoveryShaSetHas(pollingCtx.ciRerunAttemptedShas, SHA2));
   });
 });
 
@@ -679,7 +681,7 @@ test("#771 1.1 settled failure + budget exhausted → blocked; rebase at most on
     assert.equal(first!.reason, "CI failed");
     assert.equal(rec.blocked[0]?.kind, "ci-exhausted");
     assert.equal(rebaseCalls, 1, "first hop may attempt one rebase");
-    assert.equal(pollingCtx.ciRebaseAttemptedForSha, SHA_HEAD);
+    assert.ok(ciRecoveryShaSetHas(pollingCtx.ciRebaseAttemptedShas, SHA_HEAD));
 
     let second;
     await quiet(t, async () => {
@@ -786,8 +788,8 @@ test("#771 1.5 rebase success but HEAD unchanged → not rebased; CI re-running;
     });
     assert.notEqual(first!.reason, "rebased; CI re-running");
     assert.equal(first!.status, "blocked");
-    assert.equal(pollingCtx.ciRebaseAttemptedForSha, SHA_HEAD);
-    assert.equal(loadCiRecoveryMarkers(runDir).ciRebaseAttemptedForSha, SHA_HEAD);
+    assert.ok(ciRecoveryShaSetHas(pollingCtx.ciRebaseAttemptedShas, SHA_HEAD));
+    assert.ok(ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciRebaseAttemptedShas, SHA_HEAD));
 
     await quiet(t, async () => {
       await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
@@ -880,7 +882,7 @@ test("#771 1.7 durable rebase marker survives process restart — no second reba
       await advance(cfg, ISSUE, { pollingCtx: ctx1, runDir }, deps);
     });
     assert.equal(rebaseCalls, 1);
-    assert.equal(loadCiRecoveryMarkers(runDir).ciRebaseAttemptedForSha, SHA_HEAD);
+    assert.ok(ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciRebaseAttemptedShas, SHA_HEAD));
 
     // Fresh process: empty ctx, hydrate from disk; worktree marker absent (recreated).
     const ctx2: PreMergePollingContext = {};
@@ -930,7 +932,7 @@ test("#771 1.8 terminal gate_result ci/fail once per failed SHA; no partial reba
     assert.equal(ciFails.length, 1, "terminal ci/fail once per failed head SHA");
     assert.equal(rebasedPartials.length, 0, "must not spam partial rebased rows on pure re-poll");
     assert.equal(rebaseCalls, 1);
-    assert.equal(pollingCtx.ciTerminalFailRecordedForSha, SHA_HEAD);
+    assert.ok(ciRecoveryShaSetHas(pollingCtx.ciTerminalFailRecordedShas, SHA_HEAD));
   });
 });
 
@@ -999,7 +1001,7 @@ test("#771 concurrent head change during CI poll → wait re-eval; no recovery o
     assert.equal(reruns, 0, "must not re-run workflows for the stale polled SHA");
     assert.equal(rec.blocked.length, 0);
     assert.equal(
-      pollingCtx.ciRebaseAttemptedForSha,
+      pollingCtx.ciRebaseAttemptedShas,
       undefined,
       "must not consume rebase budget for the pre-poll SHA when head moved",
     );
@@ -1047,7 +1049,7 @@ test("#771 1.10 external head advance during failed rebase → wait re-eval; no 
     assert.equal(first!.status, "waiting");
     assert.notEqual(first!.reason, "rebased; CI re-running");
     assert.match(first!.reason ?? "", /head advanced|waiting for checks/i);
-    assert.equal(pollingCtx.ciRebaseAttemptedForSha, SHA_HEAD);
+    assert.ok(ciRecoveryShaSetHas(pollingCtx.ciRebaseAttemptedShas, SHA_HEAD));
     assert.equal(rec.blocked.length, 0);
     assert.equal(rebaseCalls, 1);
 
@@ -1073,8 +1075,8 @@ test("#771 1.11 log fetch failure still escalates with failing check names", asy
       rerunFailedWorkflows: async () => ({ attempted: false, runIds: [], reason: "unavailable" }),
     });
     const pollingCtx: PreMergePollingContext = {
-      ciRebaseAttemptedForSha: SHA_HEAD,
-      ciRerunAttemptedForSha: SHA_HEAD,
+      ciRebaseAttemptedShas: [SHA_HEAD],
+      ciRerunAttemptedShas: [SHA_HEAD],
     };
     let out;
     await quiet(t, async () => {
@@ -1089,12 +1091,210 @@ test("#771 1.11 log fetch failure still escalates with failing check names", asy
 
 test("#771 resolveRebasePushResult helper truth table", async () => {
   const moved = await resolveRebasePushResult("aaa", true, "bbb");
-  assert.deepEqual(moved, { ok: true, headMoved: true, beforeSha: "aaa", afterSha: "bbb" });
+  assert.deepEqual(moved, {
+    ok: true,
+    verified: true,
+    headMoved: true,
+    beforeSha: "aaa",
+    afterSha: "bbb",
+  });
   const noop = await resolveRebasePushResult("aaa", true, "aaa");
-  assert.deepEqual(noop, { ok: true, headMoved: false, beforeSha: "aaa", afterSha: "aaa" });
+  assert.deepEqual(noop, {
+    ok: true,
+    verified: true,
+    headMoved: false,
+    beforeSha: "aaa",
+    afterSha: "aaa",
+  });
+  const unverified = await resolveRebasePushResult("aaa", true, undefined);
+  assert.deepEqual(unverified, { ok: true, verified: false, beforeSha: "aaa" });
   const fail = await resolveRebasePushResult("aaa", false, "aaa");
   assert.equal(fail.ok, false);
+  const failUnread = await resolveRebasePushResult("aaa", false, undefined);
+  assert.equal(failUnread.ok, false);
   const external = await resolveRebasePushResult("aaa", false, "bbb");
   assert.equal(external.ok, false);
   if (!external.ok) assert.equal(external.afterSha, "bbb");
+});
+
+// ---------------------------------------------------------------------------
+// #771 review 2 regressions
+// ---------------------------------------------------------------------------
+
+test("#771 r2 terminal ci/fail idempotent with { runDir } and no pollingCtx", async (t) => {
+  await withRunDir(async (runDir) => {
+    let rebaseCalls = 0;
+    const { deps, rec } = baseDeps({
+      rebaseAlreadyAttempted: () => false,
+      tryRebaseAndPush: async () => {
+        rebaseCalls++;
+        return true; // no-op HEAD
+      },
+      rerunFailedWorkflows: async () => ({ attempted: false, runIds: [], reason: "unavailable" }),
+    });
+
+    let first;
+    await quiet(t, async () => {
+      first = await advance(cfg, ISSUE, { runDir }, deps);
+    });
+    assert.equal(first!.status, "blocked");
+    assert.equal(rec.blocked[0]!.kind, "ci-exhausted");
+
+    let second;
+    await quiet(t, async () => {
+      second = await advance(cfg, ISSUE, { runDir }, deps);
+    });
+    assert.equal(second!.status, "blocked");
+    assert.equal(rebaseCalls, 1, "no pollingCtx must still honor durable rebase budget");
+
+    const events = await readEvents(runDir);
+    const ciFails = events.filter(
+      (e) =>
+        e.type === "gate_result" &&
+        (e as { gate?: string }).gate === "ci" &&
+        (e as { result?: string }).result === "fail",
+    );
+    assert.equal(
+      ciFails.length,
+      1,
+      "terminal ci/fail must be idempotent when only runDir is provided",
+    );
+    assert.ok(
+      ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciTerminalFailRecordedShas, SHA_HEAD),
+    );
+  });
+});
+
+test("#771 r2 successful rebase + unreadable post-rebase HEAD → re-eval wait, not escalate", async (t) => {
+  await withRunDir(async (runDir) => {
+    let rebased = false;
+    let rebaseCalls = 0;
+    const { deps, rec } = baseDeps({
+      getPrDetail: (async () => {
+        // Fail only the post-rebase authoritative HEAD re-read.
+        if (rebased) {
+          throw new Error("simulated post-rebase getPrDetail failure");
+        }
+        return {
+          head_sha: SHA_HEAD,
+          mergeable: true,
+          mergeable_state: "CLEAN",
+        };
+      }) as AdvancePreMergeDeps["getPrDetail"],
+      rebaseAlreadyAttempted: () => false,
+      tryRebaseAndPush: async () => {
+        rebaseCalls++;
+        rebased = true;
+        return true;
+      },
+      rerunFailedWorkflows: async () => {
+        throw new Error("must not continue ladder after unverified successful rebase");
+      },
+    });
+    const pollingCtx: PreMergePollingContext = {};
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(out!.status, "waiting");
+    assert.equal(out!.reason, REBASE_HEAD_UNVERIFIED_WAIT_REASON);
+    assert.notEqual(out!.reason, "rebased; CI re-running");
+    assert.equal(rebaseCalls, 1);
+    assert.equal(rec.blocked.length, 0, "must not ci-exhausted on unverified post-rebase HEAD");
+    assert.ok(ciRecoveryShaSetHas(pollingCtx.ciRebaseAttemptedShas, SHA_HEAD));
+  });
+});
+
+test("#771 r2 H1→H2→H1 multi-SHA durable budget + terminal marker survive fresh ctx", async (t) => {
+  await withRunDir(async (runDir) => {
+    const SHA_H1 = SHA_HEAD;
+    const SHA_H2_LOCAL = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let head = SHA_H1;
+    let rebaseCalls = 0;
+    const { deps, rec } = baseDeps({
+      getPrDetail: (async () => ({
+        head_sha: head,
+        mergeable: true,
+        mergeable_state: "CLEAN",
+      })) as AdvancePreMergeDeps["getPrDetail"],
+      getIssueDetail: (async () => ({
+        comments: [
+          {
+            body: `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${head} -->`,
+          },
+        ],
+      })) as AdvancePreMergeDeps["getIssueDetail"],
+      rebaseAlreadyAttempted: () => false,
+      tryRebaseAndPush: async () => {
+        rebaseCalls++;
+        return true; // no-op for each head
+      },
+      rerunFailedWorkflows: async () => ({ attempted: false, runIds: [], reason: "unavailable" }),
+    });
+
+    // Hop 1: consume H1 budget and terminal-fail.
+    await quiet(t, async () => {
+      await advance(cfg, ISSUE, { pollingCtx: {}, runDir }, deps);
+    });
+    assert.equal(rebaseCalls, 1);
+    assert.ok(ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciRebaseAttemptedShas, SHA_H1));
+
+    // Hop 2: new head H2 gets its own one-shot.
+    head = SHA_H2_LOCAL;
+    deps.rebaseAlreadyAttempted = () => false; // simulated worktree recreate
+    await quiet(t, async () => {
+      await advance(cfg, ISSUE, { pollingCtx: {}, runDir }, deps);
+    });
+    assert.equal(rebaseCalls, 2, "H2 may rebase once");
+    const diskMid = loadCiRecoveryMarkers(runDir);
+    assert.ok(ciRecoveryShaSetHas(diskMid.ciRebaseAttemptedShas, SHA_H1));
+    assert.ok(ciRecoveryShaSetHas(diskMid.ciRebaseAttemptedShas, SHA_H2_LOCAL));
+
+    // Hop 3: force-push back to H1 + fresh polling context/worktree — must not re-rebase H1
+    // and must not emit a second terminal ci/fail for H1.
+    head = SHA_H1;
+    deps.rebaseAlreadyAttempted = () => false;
+    rec.blocked.length = 0;
+    let third;
+    await quiet(t, async () => {
+      third = await advance(cfg, ISSUE, { pollingCtx: {}, runDir }, deps);
+    });
+    assert.equal(third!.status, "blocked");
+    assert.equal(rebaseCalls, 2, "returning to H1 must not re-open H1 rebase budget");
+    assert.equal(rec.blocked[0]!.kind, "ci-exhausted");
+
+    const events = await readEvents(runDir);
+    const ciFails = events.filter(
+      (e) =>
+        e.type === "gate_result" &&
+        (e as { gate?: string }).gate === "ci" &&
+        (e as { result?: string }).result === "fail",
+    );
+    // H1 and H2 each escalate once → two terminal fails max; H1 must not get a third.
+    assert.ok(ciFails.length <= 2, `expected ≤2 terminal fails, got ${ciFails.length}`);
+    assert.ok(
+      ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciTerminalFailRecordedShas, SHA_H1),
+    );
+  });
+});
+
+test("#771 r2 legacy scalar markers migrate into SHA sets on load", async () => {
+  await withRunDir(async (runDir) => {
+    // Write pre-set-format file with only scalar fields.
+    await writeFile(
+      join(runDir, "pre-merge-ci-recovery.json"),
+      JSON.stringify(
+        {
+          ciRebaseAttemptedForSha: SHA_HEAD,
+          ciTerminalFailRecordedForSha: SHA_HEAD,
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    const loaded = loadCiRecoveryMarkers(runDir);
+    assert.ok(ciRecoveryShaSetHas(loaded.ciRebaseAttemptedShas, SHA_HEAD));
+    assert.ok(ciRecoveryShaSetHas(loaded.ciTerminalFailRecordedShas, SHA_HEAD));
+    assert.equal(loaded.ciRebaseAttemptedForSha, undefined, "normalized form drops scalars");
+  });
 });

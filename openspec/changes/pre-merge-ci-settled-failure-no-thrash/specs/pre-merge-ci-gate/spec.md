@@ -72,6 +72,22 @@ The one-shot rebase recovery for definitive CI failure SHALL be tracked against 
 - **THEN** the gate SHALL allow at most one rebase attempt for `H2` under the same rules
 - **AND** SHALL NOT treat “already rebased for `H1`” as permanent suppression for all future heads without re-evaluation
 
+#### Scenario: Force-push back to a previously consumed head retains that head’s budget
+
+- **WHEN** rebase budget was consumed for head SHA `H1` and later for a distinct head SHA `H2`
+- **AND** the PR head is force-pushed back to `H1` (or otherwise returns to `H1`)
+- **AND** a new process or empty polling context resumes pre-merge with durable run state for the same run directory
+- **THEN** the gate SHALL NOT call `tryRebaseAndPush` again for `H1`
+- **AND** SHALL retain `H1` (and `H2`) in the durable per-class recovery marker set rather than overwriting a single latest-SHA scalar
+
+#### Scenario: Successful rebase with unverified post-rebase HEAD re-evaluates without escalating
+
+- **WHEN** the rebase/push side-effect reports success for head SHA `H`
+- **AND** the authoritative post-rebase `getPrDetail` head read fails or returns no SHA
+- **THEN** the gate SHALL consume the one-shot rebase budget for `H`
+- **AND** SHALL return `{ advanced: false, status: "waiting" }` with a re-evaluation reason (not `rebased; CI re-running`)
+- **AND** SHALL NOT call `setBlocked` with kind `ci-exhausted` on that tick using the pre-rebase failed checks alone
+
 ### Requirement: Escalated settled CI failure SHALL emit a terminal CI gate_result fail
 
 When the gate escalates from settled CI failure (budget exhausted), it SHALL record a durable `gate_result` for gate `ci` with `result: "fail"` (or the established blocked equivalent already used by pre-merge observability) including a reason that identifies CI failure. For a given failed head SHA after escalation, the gate SHALL NOT emit an unbounded sequence of `gate_result` rows with `result: "partial"` and reason `rebased; CI re-running` on pure re-polls that perform no new recovery side-effect.
@@ -94,6 +110,14 @@ When the gate escalates from settled CI failure (budget exhausted), it SHALL rec
 - **AND** a pure re-poll observes the same head still settled red with recovery budgets exhausted
 - **THEN** the gate SHALL NOT append another terminal `ci`/`fail` solely for that re-poll
 - **AND** SHALL still return `blocked` (not unbounded `waiting`)
+
+#### Scenario: Terminal ci fail remains idempotent when only runDir is provided
+
+- **WHEN** `advance` is invoked with a run directory and without an in-memory `pollingCtx`
+- **AND** the gate has already recorded a terminal `gate_result` `ci`/`fail` for head SHA `H` in durable run state
+- **AND** a subsequent invocation observes the same head still settled red with recovery budgets exhausted
+- **THEN** the gate SHALL NOT append another terminal `ci`/`fail` solely for that re-poll
+- **AND** SHALL still return `blocked`
 
 ### Requirement: Settled-check aggregate SHALL be pending-first for the current PR head
 
