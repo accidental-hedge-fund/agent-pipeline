@@ -72,6 +72,14 @@ The one-shot rebase recovery for definitive CI failure SHALL be tracked against 
 - **THEN** the gate SHALL allow at most one rebase attempt for `H2` under the same rules
 - **AND** SHALL NOT treat “already rebased for `H1`” as permanent suppression for all future heads without re-evaluation
 
+#### Scenario: Same-worktree secondary marker must not suppress a later head’s rebase budget
+
+- **WHEN** rebase budget was consumed for head SHA `H1` and a worktree-local secondary rebase marker was left in the issue worktree
+- **AND** the PR head advances to a distinct head SHA `H2` while that same worktree (and its secondary marker) remains present
+- **AND** durable run state has not yet recorded a rebase attempt for `H2`
+- **THEN** the gate SHALL allow at most one rebase attempt for `H2`
+- **AND** SHALL NOT treat the unkeyed worktree secondary marker alone as authorization to skip `H2`’s durable one-shot
+
 #### Scenario: Force-push back to a previously consumed head retains that head’s budget
 
 - **WHEN** rebase budget was consumed for head SHA `H1` and later for a distinct head SHA `H2`

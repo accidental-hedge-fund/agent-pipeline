@@ -1820,7 +1820,6 @@ export async function advance(
         getPrDetailFn,
         setBlockedFn,
         tryRebaseAndPushFn,
-        rebaseAlreadyAttemptedFn,
         markRebaseAttemptedFn,
         getSuccessfulCheckRunCountFn,
         getDiffFilePathsFn,
@@ -4358,7 +4357,6 @@ interface DefinitiveCiFailureFns {
   getPrDetailFn: typeof getPrDetail;
   setBlockedFn: typeof setBlocked;
   tryRebaseAndPushFn: typeof tryRebaseAndPush;
-  rebaseAlreadyAttemptedFn: typeof rebaseAlreadyAttempted;
   markRebaseAttemptedFn: typeof markRebaseAttempted;
   getSuccessfulCheckRunCountFn: typeof getSuccessfulCheckRunCount;
   getDiffFilePathsFn: (cfg: PipelineConfig, baseSha: string, headSha: string) => Promise<string[]>;
@@ -4414,12 +4412,12 @@ async function handleDefinitiveCiFailure(
   let durablePersistFailure: string | undefined;
 
   // 1. One-shot rebase — durable per head SHA (#771), not worktree-only.
-  // Worktree marker is retained as a same-session secondary guard so existing
-  // BEHIND/conflict paths still share awareness within a worktree lifetime.
+  // Authorization is durable-only: an unkeyed worktree marker left by H1 must not
+  // suppress H2's one-shot in the same worktree. After durable persist succeeds we
+  // still write the worktree marker so BEHIND/conflict same-session paths share awareness.
   const wt = await fns.getForIssueFn(cfg, issueNumber);
   const durableRebaseDone = ciRecoveryShaSetHas(ctx.ciRebaseAttemptedShas, headSha);
-  const worktreeRebaseDone = wt ? fns.rebaseAlreadyAttemptedFn(wt.path) : true;
-  if (!durableRebaseDone && !worktreeRebaseDone && wt) {
+  if (!durableRebaseDone && wt) {
     // Persist-before-side-effect: refuse rebase if markers cannot be durably stored.
     const prevRebaseShas = ctx.ciRebaseAttemptedShas;
     ctx.ciRebaseAttemptedShas = ciRecoveryShaSetAdd(ctx.ciRebaseAttemptedShas, headSha);
@@ -4432,7 +4430,7 @@ async function handleDefinitiveCiFailure(
       );
       // Fall through to remaining ladder / escalate (fail-closed, no thrash wait).
     } else {
-      // Mark worktree after durable success so same-session paths share the slot.
+      // Worktree marker is informational for BEHIND/conflict — not CI auth.
       fns.markRebaseAttemptedFn(wt.path);
 
       const beforeSha = headSha;

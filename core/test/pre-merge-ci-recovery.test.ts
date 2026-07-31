@@ -1211,6 +1211,8 @@ test("#771 r2 H1→H2→H1 multi-SHA durable budget + terminal marker survive fr
     const SHA_H2_LOCAL = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     let head = SHA_H1;
     let rebaseCalls = 0;
+    // Stateful unkeyed worktree marker — must not gate H2 when left by H1.
+    let worktreeMarker = false;
     const { deps, rec } = baseDeps({
       getPrDetail: (async () => ({
         head_sha: head,
@@ -1224,7 +1226,10 @@ test("#771 r2 H1→H2→H1 multi-SHA durable budget + terminal marker survive fr
           },
         ],
       })) as AdvancePreMergeDeps["getIssueDetail"],
-      rebaseAlreadyAttempted: () => false,
+      rebaseAlreadyAttempted: () => worktreeMarker,
+      markRebaseAttempted: () => {
+        worktreeMarker = true;
+      },
       tryRebaseAndPush: async () => {
         rebaseCalls++;
         return true; // no-op for each head
@@ -1237,23 +1242,22 @@ test("#771 r2 H1→H2→H1 multi-SHA durable budget + terminal marker survive fr
       await advance(cfg, ISSUE, { pollingCtx: {}, runDir }, deps);
     });
     assert.equal(rebaseCalls, 1);
+    assert.equal(worktreeMarker, true, "H1 leaves worktree secondary marker");
     assert.ok(ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciRebaseAttemptedShas, SHA_H1));
 
-    // Hop 2: new head H2 gets its own one-shot.
+    // Hop 2: new head H2 gets its own one-shot in the same worktree (marker still set).
     head = SHA_H2_LOCAL;
-    deps.rebaseAlreadyAttempted = () => false; // simulated worktree recreate
     await quiet(t, async () => {
       await advance(cfg, ISSUE, { pollingCtx: {}, runDir }, deps);
     });
-    assert.equal(rebaseCalls, 2, "H2 may rebase once");
+    assert.equal(rebaseCalls, 2, "H2 may rebase once despite H1 worktree marker");
     const diskMid = loadCiRecoveryMarkers(runDir);
     assert.ok(ciRecoveryShaSetHas(diskMid.ciRebaseAttemptedShas, SHA_H1));
     assert.ok(ciRecoveryShaSetHas(diskMid.ciRebaseAttemptedShas, SHA_H2_LOCAL));
 
-    // Hop 3: force-push back to H1 + fresh polling context/worktree — must not re-rebase H1
-    // and must not emit a second terminal ci/fail for H1.
+    // Hop 3: force-push back to H1 + fresh polling context — must not re-rebase H1
+    // and must not emit a second terminal ci/fail for H1. Worktree marker remains set.
     head = SHA_H1;
-    deps.rebaseAlreadyAttempted = () => false;
     rec.blocked.length = 0;
     let third;
     await quiet(t, async () => {
@@ -1275,6 +1279,64 @@ test("#771 r2 H1→H2→H1 multi-SHA durable budget + terminal marker survive fr
     assert.ok(
       ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciTerminalFailRecordedShas, SHA_H1),
     );
+  });
+});
+
+test("#771 r3 same-worktree H1 secondary marker must not suppress H2 rebase budget", async (t) => {
+  await withRunDir(async (runDir) => {
+    const SHA_H1 = SHA_HEAD;
+    const SHA_H2_LOCAL = "ffffffffffffffffffffffffffffffffffffffff";
+    let head = SHA_H1;
+    let rebaseCalls = 0;
+    let worktreeMarker = false;
+    const { deps } = baseDeps({
+      getPrDetail: (async () => ({
+        head_sha: head,
+        mergeable: true,
+        mergeable_state: "CLEAN",
+      })) as AdvancePreMergeDeps["getPrDetail"],
+      getIssueDetail: (async () => ({
+        comments: [
+          {
+            body: `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${head} -->`,
+          },
+        ],
+      })) as AdvancePreMergeDeps["getIssueDetail"],
+      rebaseAlreadyAttempted: () => worktreeMarker,
+      markRebaseAttempted: () => {
+        worktreeMarker = true;
+      },
+      tryRebaseAndPush: async () => {
+        rebaseCalls++;
+        return true; // no-op HEAD
+      },
+      rerunFailedWorkflows: async () => ({ attempted: false, runIds: [], reason: "unavailable" }),
+    });
+
+    await quiet(t, async () => {
+      await advance(cfg, ISSUE, { pollingCtx: {}, runDir }, deps);
+    });
+    assert.equal(rebaseCalls, 1);
+    assert.equal(worktreeMarker, true, "H1 must leave the unkeyed worktree secondary marker");
+    assert.ok(ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciRebaseAttemptedShas, SHA_H1));
+
+    // Same worktree, marker still true — H2 must still get its durable one-shot.
+    head = SHA_H2_LOCAL;
+    await quiet(t, async () => {
+      await advance(cfg, ISSUE, { pollingCtx: {}, runDir }, deps);
+    });
+    assert.equal(
+      rebaseCalls,
+      2,
+      "H2 must receive exactly one rebase despite H1 worktree secondary marker",
+    );
+    assert.ok(ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciRebaseAttemptedShas, SHA_H2_LOCAL));
+
+    // H2 budget consumed; same marker still set — no third rebase for H2.
+    await quiet(t, async () => {
+      await advance(cfg, ISSUE, { pollingCtx: {}, runDir }, deps);
+    });
+    assert.equal(rebaseCalls, 2, "H2 durable budget is one-shot even with worktree marker set");
   });
 });
 
