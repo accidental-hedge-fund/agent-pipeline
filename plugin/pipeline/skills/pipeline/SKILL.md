@@ -84,7 +84,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline:merge-queue --milestone <m> --apply --release-when-complete --release-version minor
                                          after a complete queue, prepare a release PR (never tags/merges/publishes)
 /pipeline:release <version>              prepare a release PR for the given version
-/pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
+/pipeline:logs [<run-id>] [--events] [-f]  list or stream run logs (events --follow exits 0 on run_complete; --no-until-terminal for interrupt-only)
 /pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent, no issue number)
 /pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
 /pipeline scoreboard --bucket day|week   add a chronological day/week time-series to the scoreboard report
@@ -769,10 +769,13 @@ log and summary commands below.
 
 #### c. Stream structured run events via Monitor
 
-Arm a persistent Monitor on the run-store event stream:
+Arm a persistent Monitor on the run-store event stream (or wait on the CLI
+process, which exits 0 on terminal by default):
 
 ```bash
 node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
+# default until-terminal: process exits 0 after a run_complete event is printed
+# interrupt-only dashboards: add --no-until-terminal
 ```
 
 `--events` follows `.agent-pipeline/runs/<run-id>/events.jsonl`, the canonical
@@ -780,12 +783,20 @@ structured stream for lifecycle, gate, blocker, PR, review, accounting, and
 completion events. It is not a grep-filtered terminal log and it is not a
 separate `/tmp` transitions artifact.
 
-Set `persistent: true`, `timeout_ms: 3600000` (1 hour — re-arm if
-needed). Each emitted line lands in Claude's notification stream.
+**Supervise-until-terminal (non-interactive):** wait on process exit, then
+summary:
+
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow \
+  && node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs summary <run-id>
+```
+
+Set `persistent: true`, `timeout_ms: 3600000` (1 hour — re-arm if needed; see
+**re-attach** below). Each emitted line lands in Claude's notification stream.
 
 **Fallback — raw terminal output:** If you need the full combined output
 (harness prose, CI stdout, stage output), follow `terminal.log` from the same
-run store:
+run store (interrupt-only — no auto-exit on `run_complete`):
 
 ```bash
 node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs logs <run-id> --follow
@@ -826,12 +837,46 @@ about ambient noise — but `/pipeline N` is a foreground operation the
 user explicitly invoked, not background ambient state. They asked for
 this push stream; deliver it.
 
-#### e. Stop the Monitor when the run completes
+#### e. Re-attach after cancelled or lost follow (mandatory — same turn)
 
-Stop the Monitor when a `run_complete` event appears, or when the wrapper
-`$RUN_DIR/sentinel.json` reports completion. Then surface the final summary.
+A cancelled, interrupted, timed-out, or lost follow/wait is **not** a terminal
+pipeline outcome and must **not** be treated as “stop watching.” Tool cancel,
+Monitor stop, wait timeout, and session pause do **not** mean the advance
+finished. Supervision ends only after confirmed `run_complete` / sentinel
+completion (or an explicit operator decision to abandon watching a still-live
+run, outside the default happy path).
 
-#### f. Final summary
+When a host follow/wait ends **before** `run_complete` / sentinel completion,
+act **in the same harness turn**:
+
+1. **Liveness** — check whether the detached run is still live or already
+   terminal via at least one of: wrapper `$RUN_DIR/sentinel.json`,
+   `run_complete` in events / finalized summary, `pipeline status <N>`, or
+   process liveness if you still hold the detach pid.
+2. **If already terminal** — skip re-follow; run `pipeline summary <run-id>`,
+   emit the final operator summary, and stop any remaining follows for that
+   run. Do not leave the operator without a terminal handoff.
+3. **If still live or not confirmed terminal** — re-arm
+   `pipeline logs <run-id> --events --follow` (same run-store `run_id`),
+   continue until `run_complete` / sentinel completion.
+4. **Then** emit the final summary and stop follows (step f).
+
+**Operator re-attach path** (run-store ids only — not `/tmp` scratch logs):
+
+```bash
+node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs status <N>
+node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
+node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs summary <run-id>
+```
+
+#### f. Stop the Monitor when the run completes (same turn)
+
+Stop the Monitor / events follow when a `run_complete` event appears, or when
+the wrapper `$RUN_DIR/sentinel.json` reports completion — including after one
+or more re-attach cycles. In the same harness turn, emit the final summary
+and stop that run’s follows. Do not leave follows open until the operator asks.
+
+#### g. Final summary
 
 Read the run-store summary and surface inline:
 
@@ -840,8 +885,9 @@ node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs summary <run-id>
 ```
 
 Include starting stage, ending stage, transitions made, wall-clock elapsed, PR
-URL if one was opened, and the terminal state. Also send one final
-PushNotification with the terminal state.
+URL if one was opened, the terminal state, and the merge-next-step note that
+the pipeline does not auto-merge. Also send one final PushNotification with
+the terminal state.
 
 ### 4b. Orchestration pattern for `/pipeline:loop` (multi-item durable drive/resume)
 

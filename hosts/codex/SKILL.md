@@ -80,7 +80,7 @@ $pipeline:merge-queue --milestone <m> --apply  sequential merges via existing me
 $pipeline:merge-queue --milestone <m> --apply --release-when-complete --release-version minor
                                          after a complete queue, prepare a release PR (never tags/merges/publishes)
 $pipeline:release <version>              prepare a release PR for the given version
-$pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
+$pipeline:logs [<run-id>] [--events] [-f]  list or stream run logs (events --follow exits 0 on run_complete; --no-until-terminal for interrupt-only)
 $pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor
 $pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
 $pipeline:loop --audit                   read-only report for the run; no writes
@@ -532,10 +532,12 @@ when the Codex turn ends.
 #### c. Poll structured run events
 
 Follow the run-store event stream and summarize material lifecycle records to
-the user:
+the user (CLI exits 0 on terminal by default):
 
 ```bash
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
+# default until-terminal: process exits 0 after a run_complete event is printed
+# interrupt-only dashboards: add --no-until-terminal
 ```
 
 `--events` follows `.agent-pipeline/runs/<run-id>/events.jsonl`, the canonical
@@ -543,8 +545,17 @@ structured stream for lifecycle, gate, blocker, PR, review, accounting, and
 completion events. It is not a grep-filtered terminal log and it is not a
 separate `/tmp` transitions artifact.
 
+**Supervise-until-terminal (non-interactive):** wait on process exit, then
+summary:
+
+```bash
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow \
+  && node ~/.codex/skills/pipeline/scripts/pipeline.mjs summary <run-id>
+```
+
 **Fallback — raw terminal output:** If you need the full combined output, follow
-`terminal.log` from the same run store:
+`terminal.log` from the same run store (interrupt-only — no auto-exit on
+`run_complete`):
 
 ```bash
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --follow
@@ -577,13 +588,46 @@ Examples to suppress or summarize:
   subsequent identical polling updates in the same burst. The next material
   event is the eventual advancing or blocked stage outcome.
 
-#### e. Finish the run
+#### e. Re-attach after cancelled or lost follow (mandatory — same turn)
+
+A cancelled, interrupted, timed-out, or lost follow/wait is **not** a terminal
+pipeline outcome and must **not** be treated as “stop watching.” Tool cancel,
+wait timeout, and session pause do **not** mean the advance finished.
+Supervision ends only after confirmed `run_complete` / sentinel completion
+(or an explicit operator decision to abandon watching a still-live run,
+outside the default happy path).
+
+When a host follow/wait ends **before** `run_complete` / sentinel completion,
+act **in the same harness turn**:
+
+1. **Liveness** — check whether the detached run is still live or already
+   terminal via at least one of: wrapper `$RUN_DIR/sentinel.json`,
+   `run_complete` in events / finalized summary, `pipeline status <N>`, or
+   process liveness if you still hold the detach pid.
+2. **If already terminal** — skip re-follow; run `pipeline summary <run-id>`,
+   emit the final operator summary, and stop any remaining follows for that
+   run. Do not leave the operator without a terminal handoff.
+3. **If still live or not confirmed terminal** — re-arm
+   `pipeline logs <run-id> --events --follow` (same run-store `run_id`),
+   continue until `run_complete` / sentinel completion.
+4. **Then** emit the final summary and stop follows (step f).
+
+**Operator re-attach path** (run-store ids only — not `/tmp` scratch logs):
+
+```bash
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs status <N>
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs summary <run-id>
+```
+
+#### f. Finish the run (same turn)
 
 When a `run_complete` event appears, or when the wrapper
-`$RUN_DIR/sentinel.json` reports completion, stop polling and surface the final
-summary.
+`$RUN_DIR/sentinel.json` reports completion — including after one or more
+re-attach cycles — stop polling/following and, in the same harness turn,
+surface the final summary. Do not leave follows open until the operator asks.
 
-#### f. Final summary
+#### g. Final summary
 
 Read the run-store summary and surface inline:
 
@@ -592,7 +636,8 @@ node ~/.codex/skills/pipeline/scripts/pipeline.mjs summary <run-id>
 ```
 
 Include starting stage, ending stage, transitions made, wall-clock elapsed, PR
-URL if one was opened, and the terminal state.
+URL if one was opened, the terminal state, and the merge-next-step note that
+the pipeline does not auto-merge.
 
 ### 4b. Orchestration pattern for `$pipeline:loop` (multi-item durable drive/resume)
 

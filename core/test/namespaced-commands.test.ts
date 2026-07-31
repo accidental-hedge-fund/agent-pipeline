@@ -407,9 +407,89 @@ test("namespaced-commands 7.5b6: host loop skill stop-on-terminal + dual-follow 
       }
     }
   }
+});
 
-  // LOOP_ORCH_NOTE (command packaging) must also require same-turn stop language.
-  // Checked via rendered Claude command after import of build.mjs.
+// #725: single-issue advance §4 must require re-attach after cancelled/lost
+// follow, treat cancelled wait as non-terminal, and document run-store
+// re-attach path (status + logs --events --follow + summary).
+test("namespaced-commands 7.5b7: host advance skill re-attach + cancelled-wait-not-terminal (#725)", () => {
+  const repoRoot = join(__dirname, "..", "..");
+  const hostSkills = [
+    join(repoRoot, "hosts", "claude", "SKILL.md"),
+    join(repoRoot, "hosts", "codex", "SKILL.md"),
+  ];
+  for (const skillPath of hostSkills) {
+    const body = readFileSync(skillPath, "utf8");
+
+    // (a) re-attach / re-arm after cancelled or interrupted follow before terminal
+    assert.ok(
+      /re-?attach|re-?arm/i.test(body),
+      `${skillPath} must require re-attach/re-arm after lost advance follow (#725)`,
+    );
+    assert.ok(
+      /(?:cancelled|interrupted|timed-?out|lost)[\s\S]{0,400}(?:re-?attach|re-?arm)|(?:re-?attach|re-?arm)[\s\S]{0,400}(?:cancelled|interrupted|timed-?out|lost)/i.test(
+        body,
+      ),
+      `${skillPath} must tie re-attach to cancelled/interrupted/lost follow (#725)`,
+    );
+    assert.ok(
+      /same turn|same-turn|in the same harness turn/i.test(body),
+      `${skillPath} must require same-turn re-attach for advance follow recovery (#725)`,
+    );
+
+    // (b) cancelled wait is not a terminal pipeline outcome
+    assert.ok(
+      /(?:cancelled|interrupted|timed-?out).{0,120}(?:not|≠|is not).{0,40}terminal|not a terminal pipeline outcome/i.test(
+        body,
+      ),
+      `${skillPath} must state cancelled wait is not a terminal pipeline outcome (#725)`,
+    );
+    assert.ok(
+      /stop watching|must \*\*not\*\* be treated as|must not be treated as/i.test(body),
+      `${skillPath} must forbid treating cancelled wait as stop-watching (#725)`,
+    );
+
+    // (c) run-store re-attach path: status + logs --events --follow + summary
+    assert.ok(
+      /status\s+<N>|status <N>|pipeline status/i.test(body),
+      `${skillPath} re-attach path must include status <N> (#725)`,
+    );
+    assert.ok(
+      /logs\s+<run-id>\s+--events\s+--follow|logs <run-id> --events --follow/i.test(body),
+      `${skillPath} re-attach path must include logs <run-id> --events --follow (#725)`,
+    );
+    assert.ok(
+      /summary\s+<run-id>|summary <run-id>/i.test(body),
+      `${skillPath} re-attach path must include summary <run-id> (#725)`,
+    );
+
+    // Advance events follow documents until-terminal default on run_complete
+    assert.ok(
+      /until-terminal|exits 0 after a run_complete|exit 0 after a run_complete|exits 0 on run_complete/i.test(
+        body,
+      ),
+      `${skillPath} must document until-terminal / exit-on-run_complete for advance logs follow (#725)`,
+    );
+
+    // Forbidden: advance logs one-liner that claims unconditional no-auto-exit
+    // without documenting until-terminal / run_complete default.
+    const oneLiners = body
+      .split("\n")
+      .filter(
+        (l) =>
+          /logs\s/.test(l) &&
+          /--events/.test(l) &&
+          /--follow|-f\b/.test(l) &&
+          !/loop logs/.test(l),
+      );
+    for (const line of oneLiners) {
+      if (/no auto-exit on terminal/i.test(line) && !/until-terminal|run_complete/i.test(line)) {
+        assert.fail(
+          `${skillPath} advance logs one-liner claims unconditional no auto-exit without until-terminal docs: ${line}`,
+        );
+      }
+    }
+  }
 });
 
 test("namespaced-commands 7.5b6b: LOOP_ORCH_NOTE requires same-turn stop + follows stopped (#699)", async () => {
