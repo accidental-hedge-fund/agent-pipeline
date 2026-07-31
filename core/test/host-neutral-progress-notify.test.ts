@@ -21,6 +21,10 @@ const MATERIAL_FILTER_SRC = path.join(
   repoRoot,
   "core/scripts/material-filter.ts",
 );
+const MATERIAL_FILTER_LAUNCHER = path.join(
+  repoRoot,
+  "hosts/_shared/material-filter.mjs",
+);
 
 function read(p: string): string {
   return fs.readFileSync(p, "utf8");
@@ -38,13 +42,21 @@ function sectionFrom(source: string, headingRe: RegExp): string {
 
 test("shared material filter module is present", () => {
   assert.ok(fs.existsSync(MATERIAL_FILTER_SRC), "material-filter.ts must exist");
+  assert.ok(
+    fs.existsSync(MATERIAL_FILTER_LAUNCHER),
+    "installed-path launcher hosts/_shared/material-filter.mjs must exist",
+  );
 });
 
 test("Claude host documents material notify map entry (Monitor + PushNotification)", () => {
   const src = read(CLAUDE_SKILL);
   assert.match(src, /Host notify map/i, "Claude skill must have host notify map");
   assert.match(src, /PushNotification/, "Claude map entry may name PushNotification");
-  assert.match(src, /material-filter\.ts/, "Claude skill must name the shared material filter");
+  assert.match(
+    src,
+    /scripts\/material-filter\.mjs/,
+    "Claude skill must name the installed material-filter.mjs path",
+  );
   assert.match(
     src,
     /must notify via the host map/i,
@@ -60,7 +72,11 @@ test("Codex host notify map uses chat/status and never requires PushNotification
     /chat\/status|concise chat/i,
     "Codex map must name chat/status surface",
   );
-  assert.match(src, /material-filter\.ts/, "Codex skill must name the shared material filter");
+  assert.match(
+    src,
+    /scripts\/material-filter\.mjs/,
+    "Codex skill must name the installed material-filter.mjs path",
+  );
   // Codex must not list PushNotification as a required tool.
   // (Allow disclaimers like "never requires Claude PushNotification".)
   assert.ok(

@@ -798,7 +798,7 @@ evidence stream for diagnostics.
 ```bash
 # Preferred — material one-liners for host notify (Claude Monitor / Grok monitor)
 node ~/.claude/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow \
-  | node --experimental-strip-types ~/.claude/skills/pipeline/core/scripts/material-filter.ts
+  | node ~/.claude/skills/pipeline/scripts/material-filter.mjs
 
 # Diagnostic fallback — full unfiltered events.jsonl
 node ~/.claude/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
@@ -835,7 +835,7 @@ stdout line — do not require `PushNotification`. On **Codex**, send a concise
 chat/status update. The state machine has only a bounded number of stage
 transitions, so this caps at a small number of bubbles per full run.
 
-Material advance kinds (aligned with `core/scripts/material-filter.ts`):
+Material advance kinds (aligned with `scripts/material-filter.mjs` → `core/scripts/material-filter.ts`):
 - `run_start`
 - `stage_start`
 - `stage_complete`
@@ -1055,7 +1055,7 @@ for host notify (raw unfiltered events remain available for diagnostics):
 ```bash
 # Preferred — material one-liners for host notify (dual-follow uses the same filter)
 node ~/.claude/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow \
-  | node --experimental-strip-types ~/.claude/skills/pipeline/core/scripts/material-filter.ts
+  | node ~/.claude/skills/pipeline/scripts/material-filter.mjs
 # default until-terminal: process exits 0 after loop_run_stopped
 # interrupt-only dashboards: add --no-until-terminal
 
@@ -1144,7 +1144,7 @@ unfiltered JSONL:
 
 ```bash
 node ~/.claude/skills/pipeline/scripts/pipeline.mjs logs <advance-run-id> --events --follow \
-  | node --experimental-strip-types ~/.claude/skills/pipeline/core/scripts/material-filter.ts
+  | node ~/.claude/skills/pipeline/scripts/material-filter.mjs
 ```
 
 The absolute `events` path from the linkage record is an acceptable alternative

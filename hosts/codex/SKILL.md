@@ -555,7 +555,7 @@ unfiltered events remain available for diagnostics:
 ```bash
 # Preferred — material one-liners for chat/status notify
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow \
-  | node --experimental-strip-types ~/.codex/skills/pipeline/core/scripts/material-filter.ts
+  | node ~/.codex/skills/pipeline/scripts/material-filter.mjs
 
 # Diagnostic fallback — full unfiltered events.jsonl
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
@@ -586,7 +586,7 @@ host map entry — never Claude `PushNotification`). The state machine has only
 a bounded number of stage transitions, so this gives enough signal without
 flooding the user.
 
-Material advance kinds (aligned with `core/scripts/material-filter.ts`):
+Material advance kinds (aligned with `scripts/material-filter.mjs` → `core/scripts/material-filter.ts`):
 - `run_start`
 - `stage_start`
 - `stage_complete`
@@ -801,7 +801,7 @@ through the shared material filter** for host notify:
 ```bash
 # Preferred — material one-liners (apply the same filter to dual-follow advance streams)
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow \
-  | node --experimental-strip-types ~/.codex/skills/pipeline/core/scripts/material-filter.ts
+  | node ~/.codex/skills/pipeline/scripts/material-filter.mjs
 # default until-terminal: process exits 0 after loop_run_stopped
 # interrupt-only dashboards: add --no-until-terminal
 
@@ -882,7 +882,7 @@ unfiltered JSONL:
 
 ```bash
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <advance-run-id> --events --follow \
-  | node --experimental-strip-types ~/.codex/skills/pipeline/core/scripts/material-filter.ts
+  | node ~/.codex/skills/pipeline/scripts/material-filter.mjs
 ```
 
 The absolute `events` path from the linkage record is an acceptable alternative
