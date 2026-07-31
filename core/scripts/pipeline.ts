@@ -267,6 +267,8 @@ export interface CliOpts {
   body?: string;
   /** Intake/release: pin the target release slot (e.g. "v1.6.0" or "1.6.0"). */
   release?: string;
+  /** release: theme for a scaffolded release-plan row when missing (#730). */
+  theme?: string;
   /** Roadmap/sweep: gate GitHub write-backs (comments, PRs); default is dry-run. */
   apply?: boolean;
   /** Roadmap: emit top-N dependency-safe issues from an existing plan.json. */
@@ -476,6 +478,10 @@ export function buildCmd(): Command {
     .option("--flock-timeout <ms>", "max ms to wait for the per-issue advisory lock (default: 5000)", Number)
     .option("--run-id <id>", "internal: pin the run-store run id (set by the detached launcher so the inner run uses the caller's run directory)")
     .option("--no-edit", "release: skip opening $EDITOR after ROADMAP scaffold (commit as scaffolded)")
+    .option(
+      "--theme <text>",
+      "release: theme for a scaffolded release-plan row when missing (overrides milestone title; default: plan-row theme, milestone title, or <theme>)",
+    )
     .option("--description <text>", "intake: short free-text description to spec into a GitHub issue")
     .option("--title <text>", "refine-spec: existing issue title to refine")
     .option("--body <markdown>", "refine-spec: existing issue body to refine")
@@ -2135,8 +2141,12 @@ async function main(): Promise<void> {
     if (!versionArgEarly) {
       console.error(
         "pipeline release: a version argument is required.\n" +
-          "  Usage: pipeline release <X.Y.Z | major | minor | patch>\n" +
-          "  Example: pipeline release 1.6.0  OR  pipeline release minor",
+          "  Usage: pipeline release <X.Y.Z | major | minor | patch> [--theme \"...\"] [--dry-run] [--no-edit]\n" +
+          "  Example: pipeline release 1.6.0  OR  pipeline release minor\n" +
+          "  Unshipped release-plan row shape (auto-scaffolded when missing if `| *(none)* |` is present):\n" +
+          "    | **vX.Y.Z** | major|minor|patch | <theme> | #N, #M | <why> |\n" +
+          "  Columns: Release | Bump | Theme | Issues | Why this bump. Shipped rows use `✅ shipped` and are never overwritten.\n" +
+          "  If the plan row cannot be inserted, release fails before any version bump with a copy-pasteable row for ROADMAP.md.",
       );
       process.exit(2);
     }
@@ -2265,7 +2275,15 @@ async function main(): Promise<void> {
     const localCfg = resolveReleaseConfig(repoDir, opts.base, opts.profile);
     const versionArg = cmd.args[1] as string;
     try {
-      await runRelease(versionArg, { dryRun: opts.dryRun, noEdit: opts.edit === false }, localCfg);
+      await runRelease(
+        versionArg,
+        {
+          dryRun: opts.dryRun,
+          noEdit: opts.edit === false,
+          theme: typeof opts.theme === "string" ? opts.theme : undefined,
+        },
+        localCfg,
+      );
     } catch (err) {
       console.error(`pipeline release: ${(err as Error).message}`);
       process.exit(1);

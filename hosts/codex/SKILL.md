@@ -79,7 +79,12 @@ $pipeline:merge-queue --milestone <m>    dry-run ordered R2D merges for a milest
 $pipeline:merge-queue --milestone <m> --apply  sequential merges via existing merge surface
 $pipeline:merge-queue --milestone <m> --apply --release-when-complete --release-version minor
                                          after a complete queue, prepare a release PR (never tags/merges/publishes)
-$pipeline:release <version>              prepare a release PR for the given version
+$pipeline:release <version> [--theme "..."]  prepare a release PR for the given version
+                                         (missing unshipped plan row is auto-scaffolded before
+                                         other ROADMAP mutations when `| *(none)* |` is present:
+                                         `| **vX.Y.Z** | major|minor|patch | <theme> | #N, #M | <why> |`;
+                                         shipped `✅ shipped` rows are never overwritten; insert
+                                         failure aborts before version bump with a copy-paste row)
 $pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
 $pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor
 $pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine

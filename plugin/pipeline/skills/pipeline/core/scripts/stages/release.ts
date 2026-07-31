@@ -29,11 +29,23 @@ import {
 export interface ReleaseOpts {
   dryRun?: boolean;
   noEdit?: boolean;
+  /**
+   * Optional theme for a scaffolded release-plan row when none exists for the
+   * resolved version. Precedence: CLI `--theme` → existing plan-row theme →
+   * matching milestone title → {@link PLAN_ROW_THEME_PLACEHOLDER}.
+   */
+  theme?: string;
 }
 
 export interface ShippedPR {
   number: number;
   title: string;
+}
+
+/** Milestone metadata used only for plan-row scaffold theme/issues (#730). */
+export interface ReleaseMilestoneInfo {
+  title: string;
+  issueNumbers: number[];
 }
 
 export interface ReleaseContext {
@@ -44,7 +56,33 @@ export interface ReleaseContext {
   shippedPRs: ShippedPR[];
   /** Issue numbers confirmed shipped (resolved from PR closing references). Empty in dry-run or when no PRs detected. */
   shippedIssueNumbers: number[];
+  /**
+   * Issue numbers for the plan-row Issues column when ensuring a missing row
+   * (e.g. milestone membership). Merged with {@link shippedIssueNumbers}; never
+   * invent numbers outside these sources.
+   */
+  planIssueNumbers?: number[];
 }
+
+/**
+ * Documented placeholder when no theme is available from CLI, plan row, or milestone.
+ * Matches {@link extractTheme}'s missing-row return value.
+ */
+export const PLAN_ROW_THEME_PLACEHOLDER = "<theme>";
+
+/**
+ * Documented Issues-column placeholder when milestone membership and shipped-PR
+ * discovery yield no issue numbers. Never invent `#N` values.
+ */
+export const PLAN_ROW_ISSUES_PLACEHOLDER = "<issues>";
+
+/**
+ * Canonical unshipped release-plan row shape (single conceptual source with
+ * {@link insertReleasePlanRow} / {@link patchReleasePlanRow}).
+ * Columns: Release | Bump | Theme | Issues | Why this bump.
+ */
+export const RELEASE_PLAN_ROW_SHAPE =
+  "| **vX.Y.Z** | major|minor|patch | <theme> | #N, #M | <why> |";
 
 export interface CommandResult {
   code: number;
@@ -89,6 +127,13 @@ export interface ReleaseDeps {
    * artifact (or throws) without touching the filesystem.
    */
   requireFrgPass?(repoDir: string, version: string): Promise<FrgEvidence>;
+  /**
+   * Optional: look up a GitHub milestone matching the resolved version for
+   * plan-row scaffold theme/issues (#730). Return null when none matches or
+   * discovery is unavailable. Soft-fail preferred — callers must not block
+   * ensure solely on milestone fetch. Dry-run paths typically omit the call.
+   */
+  fetchMilestoneForVersion?(version: string): Promise<ReleaseMilestoneInfo | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +219,72 @@ export function realReleaseDeps(repoDir?: string): ReleaseDeps {
     today: () => new Date().toISOString().slice(0, 10),
     stdout: (msg) => process.stdout.write(msg + "\n"),
     stderr: (msg) => process.stderr.write(msg + "\n"),
+    fetchMilestoneForVersion: async (version) => {
+      // Soft-fail: theme/issues fall back to placeholders when discovery fails.
+      try {
+        const repoResult = spawnSync(
+          "gh",
+          ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+          { encoding: "utf8", stdio: "pipe", cwd: repoDir },
+        );
+        if (repoResult.status !== 0) return null;
+        const repo = repoResult.stdout.trim();
+        if (!repo) return null;
+
+        const msResult = spawnSync(
+          "gh",
+          ["api", `repos/${repo}/milestones?state=all&per_page=100`],
+          { encoding: "utf8", stdio: "pipe", cwd: repoDir, maxBuffer: 10 * 1024 * 1024 },
+        );
+        if (msResult.status !== 0) return null;
+        const milestones = JSON.parse(msResult.stdout || "[]") as Array<{
+          number: number;
+          title: string;
+        }>;
+        const match = milestones.find((m) => {
+          const t = m.title ?? "";
+          return (
+            t.includes(`v${version}`) ||
+            new RegExp(`(?:^|[^0-9.])${escapeRegex(version)}(?:[^0-9.]|$)`).test(t)
+          );
+        });
+        if (!match) return null;
+
+        const issuesResult = spawnSync(
+          "gh",
+          [
+            "api",
+            `repos/${repo}/issues?milestone=${match.number}&state=all&per_page=100`,
+            "--paginate",
+          ],
+          { encoding: "utf8", stdio: "pipe", cwd: repoDir, maxBuffer: 20 * 1024 * 1024 },
+        );
+        let issueNumbers: number[] = [];
+        if (issuesResult.status === 0 && issuesResult.stdout.trim()) {
+          // --paginate without --slurp concatenates JSON arrays; parse each page blob.
+          const raw = issuesResult.stdout.trim();
+          let items: Array<{ number?: number; pull_request?: unknown }> = [];
+          try {
+            items = JSON.parse(raw) as typeof items;
+          } catch {
+            // Multi-page concat: split on "][" boundaries
+            const joined = raw.replace(/\]\s*\[/g, ",");
+            try {
+              items = JSON.parse(joined) as typeof items;
+            } catch {
+              items = [];
+            }
+          }
+          // Milestones list both issues and PRs; plan-row Issues column wants issues.
+          issueNumbers = items
+            .filter((i) => i && typeof i.number === "number" && !i.pull_request)
+            .map((i) => i.number as number);
+        }
+        return { title: match.title, issueNumbers };
+      } catch {
+        return null;
+      }
+    },
   };
 }
 
@@ -408,9 +519,134 @@ export function extractTheme(roadmapText: string, version: string): string {
   for (const line of lines) {
     if (!line.startsWith(`| **v${version}**`)) continue;
     const cols = line.split("|");
-    if (cols.length >= 4) return cols[3].trim() || "<theme>";
+    if (cols.length >= 4) return cols[3].trim() || PLAN_ROW_THEME_PLACEHOLDER;
   }
-  return "<theme>";
+  return PLAN_ROW_THEME_PLACEHOLDER;
+}
+
+/** True when any plan-row line starts with `| **v{version}**` (shipped or not). */
+export function hasReleasePlanRow(roadmapText: string, version: string): boolean {
+  return roadmapText.split("\n").some((l) => l.startsWith(`| **v${version}**`));
+}
+
+/**
+ * Strip a leading version prefix from a milestone title for use as Theme.
+ * e.g. `v1.29.0 — Factory reliability` → `Factory reliability`.
+ */
+export function themeFromMilestoneTitle(title: string, version: string): string {
+  const trimmed = title.trim();
+  if (!trimmed) return PLAN_ROW_THEME_PLACEHOLDER;
+  const re = new RegExp(`^v?${escapeRegex(version)}\\s*[—:\\-]\\s*`, "i");
+  const stripped = trimmed.replace(re, "").trim();
+  return stripped || trimmed;
+}
+
+/**
+ * Resolve theme for release scaffold: CLI `--theme` → plan-row theme → milestone
+ * title → documented placeholder.
+ */
+export function resolveReleaseTheme(args: {
+  cliTheme?: string;
+  roadmapText: string;
+  version: string;
+  milestoneTitle?: string | null;
+}): string {
+  if (args.cliTheme?.trim()) return args.cliTheme.trim();
+  const fromRow = extractTheme(args.roadmapText, args.version);
+  if (fromRow !== PLAN_ROW_THEME_PLACEHOLDER) return fromRow;
+  if (args.milestoneTitle?.trim()) {
+    return themeFromMilestoneTitle(args.milestoneTitle.trim(), args.version);
+  }
+  return PLAN_ROW_THEME_PLACEHOLDER;
+}
+
+/** Format Issues column from discovered numbers; placeholder when empty. */
+export function formatPlanRowIssues(issueNumbers: number[]): string {
+  const uniq = [...new Set(issueNumbers.filter((n) => Number.isFinite(n) && n > 0))].sort(
+    (a, b) => a - b,
+  );
+  if (uniq.length === 0) return PLAN_ROW_ISSUES_PLACEHOLDER;
+  return uniq.map((n) => `#${n}`).join(", ");
+}
+
+/** Why-column note for release-scaffolded plan rows (operator-editable). */
+export function planRowScaffoldWhy(version: string): string {
+  return `Scaffolded by pipeline release for v${version} cut.`;
+}
+
+/** Build one unshipped plan-row line in the insert/patch shape. */
+export function formatReleasePlanRow(
+  version: string,
+  bump: string,
+  theme: string,
+  issues: string,
+  why: string,
+): string {
+  return `| **v${version}** | ${bump} | ${theme} | ${issues} | ${why} |`;
+}
+
+/**
+ * Derive major/minor/patch bump label from a resolved X.Y.Z version.
+ * Exported for plan-row scaffold and tests (#730).
+ */
+export function versionBumpType(version: string): "major" | "minor" | "patch" {
+  const parts = version.split(".").map(Number);
+  const patch = parts[2] ?? 0;
+  const minor = parts[1] ?? 0;
+  if (patch > 0) return "patch";
+  if (minor > 0) return "minor";
+  return "major";
+}
+
+export interface EnsureReleasePlanRowOpts {
+  version: string;
+  theme?: string;
+  issues?: string;
+  why?: string;
+}
+
+/**
+ * Ensure an unshipped release-plan row exists for `version` before ship mutations.
+ *
+ * - Unshipped `| **v{version}** |` present → unchanged (no duplicate).
+ * - Only shipped `| **v{version}** ✅ shipped |` present → unchanged (never un-ship).
+ * - Missing → insert via {@link insertReleasePlanRow} before `| *(none)* |`.
+ * - Insert impossible → structured remediation error (file, copy-paste row, location).
+ */
+export function ensureReleasePlanRow(text: string, opts: EnsureReleasePlanRowOpts): string {
+  const { version } = opts;
+  const lines = text.split("\n");
+  const hasUnshipped = lines.some(
+    (l) => l.startsWith(`| **v${version}**`) && !l.includes("✅ shipped"),
+  );
+  if (hasUnshipped) return text;
+
+  const hasShipped = lines.some(
+    (l) => l.startsWith(`| **v${version}**`) && l.includes("✅ shipped"),
+  );
+  if (hasShipped) return text;
+
+  const bump = versionBumpType(version);
+  const theme = opts.theme?.trim() || PLAN_ROW_THEME_PLACEHOLDER;
+  const issues = opts.issues?.trim() || PLAN_ROW_ISSUES_PLACEHOLDER;
+  const why = opts.why?.trim() || planRowScaffoldWhy(version);
+  const example = formatReleasePlanRow(version, bump, theme, issues, why);
+
+  try {
+    return insertReleasePlanRow(text, version, bump, theme, issues, why);
+  } catch {
+    throw new Error(
+      `ROADMAP anchor not found: release-plan-none-row` +
+        ` (cannot auto-scaffold missing release-plan-row for v${version}).\n` +
+        `File: ROADMAP.md\n` +
+        `Expected insert location: before the \`| *(none)* |\` sentinel in the release-plan table ` +
+        `(restore that table/sentinel if missing).\n` +
+        `Copy-paste this unshipped plan row:\n` +
+        `  ${example}\n` +
+        `Column shape: | Release | Bump | Theme | Issues | Why this bump | — unshipped Release cell is \`| **vX.Y.Z** |\`.\n` +
+        `Canonical shape: ${RELEASE_PLAN_ROW_SHAPE}`,
+    );
+  }
 }
 
 function minorOrdinal(minor: number): string {
@@ -421,15 +657,6 @@ function minorOrdinal(minor: number): string {
     "sixteenth", "seventeenth", "eighteenth", "nineteenth", "twentieth",
   ];
   return words[minor - 1] ?? `${minor}th`;
-}
-
-function versionBumpType(version: string): "major" | "minor" | "patch" {
-  const parts = version.split(".").map(Number);
-  const patch = parts[2] ?? 0;
-  const minor = parts[1] ?? 0;
-  if (patch > 0) return "patch";
-  if (minor > 0) return "minor";
-  return "major";
 }
 
 // ---------------------------------------------------------------------------
@@ -799,8 +1026,10 @@ export function insertDetailSectionBullet(
 }
 
 /**
- * Apply all four ROADMAP mutations atomically in memory.
- * Throws with a named-anchor error on the first missing site.
+ * Ensure a plan row for the version (insert when missing), then apply all four
+ * ROADMAP ship mutations atomically in memory.
+ * Throws with a named-anchor error on the first missing site (or plan-row
+ * remediation when insert is impossible).
  * The optional `warn` callback is forwarded to stampPerIssueTable for
  * per-row "planned but not shipped" notifications.
  */
@@ -809,7 +1038,16 @@ export function scaffoldRoadmap(
   ctx: ReleaseContext,
   warn?: (msg: string) => void,
 ): string {
-  let text = roadmapText;
+  const planIssues = formatPlanRowIssues([
+    ...(ctx.planIssueNumbers ?? []),
+    ...(ctx.shippedIssueNumbers ?? []),
+  ]);
+  let text = ensureReleasePlanRow(roadmapText, {
+    version: ctx.version,
+    theme: ctx.theme,
+    issues: planIssues,
+    why: planRowScaffoldWhy(ctx.version),
+  });
   text = patchIntroLine(text, ctx);
   text = patchReleasePlanRow(text, ctx);
   text = prependShippedBlock(text, ctx);
@@ -963,10 +1201,35 @@ export async function runRelease(
     d.stdout("[pipeline release] no previous tag found; git log range: HEAD");
   }
 
-  // 4. Read ROADMAP and extract theme (local, safe in all modes).
+  // 4. Read ROADMAP and resolve theme / plan-row issue sources.
+  //    Dry-run stays local-only (no milestone fetch). Live path may soft-fetch a
+  //    matching milestone for theme/issues when scaffolding a missing plan row (#730).
   const roadmapText = d.readFile(roadmapPath);
-  const theme = extractTheme(roadmapText, resolvedVersion);
   const today = d.today();
+
+  let milestoneTitle: string | null = null;
+  let planIssueNumbers: number[] = [];
+  if (!opts.dryRun && d.fetchMilestoneForVersion) {
+    try {
+      const ms = await d.fetchMilestoneForVersion(resolvedVersion);
+      if (ms) {
+        milestoneTitle = ms.title;
+        planIssueNumbers = ms.issueNumbers ?? [];
+      }
+    } catch (err) {
+      d.stderr(
+        `[pipeline release] warning: milestone lookup for v${resolvedVersion} failed — ` +
+          `${err instanceof Error ? err.message : String(err)} (continuing with placeholders)`,
+      );
+    }
+  }
+
+  const theme = resolveReleaseTheme({
+    cliTheme: opts.theme,
+    roadmapText,
+    version: resolvedVersion,
+    milestoneTitle,
+  });
 
   // --- Dry-run path: local-only, no file writes, no GitHub API calls ---
   if (opts.dryRun) {
@@ -974,9 +1237,10 @@ export async function runRelease(
     const shippedPRs = await discoverShippedPRs(lastTag, repoDir, d, /* localOnly= */ true);
 
     // shippedIssueNumbers is empty in dry-run: resolving closing issues requires GitHub API.
+    // planIssueNumbers also empty (no milestone fetch in dry-run) — Issues column uses placeholder if scaffolding.
     const ctx: ReleaseContext = {
       version: resolvedVersion, previousVersion, date: today, theme,
-      shippedPRs, shippedIssueNumbers: [],
+      shippedPRs, shippedIssueNumbers: [], planIssueNumbers: [],
     };
 
     // Compute version-bump diffs in memory (no file writes).
@@ -1014,9 +1278,10 @@ export async function runRelease(
   d.stdout("[pipeline release] validating ROADMAP.md anchors...");
   const validationCtx: ReleaseContext = {
     version: resolvedVersion, previousVersion, date: today, theme,
-    shippedPRs: [], shippedIssueNumbers: [],
+    shippedPRs: [], shippedIssueNumbers: [], planIssueNumbers,
   };
-  scaffoldRoadmap(roadmapText, validationCtx);  // throws on missing anchor; result discarded
+  // Ensure-or-scaffold plan row + other anchors in memory; throws before package writes.
+  scaffoldRoadmap(roadmapText, validationCtx);  // result discarded
 
   // Refuse to start if any release-managed path already has uncommitted changes (tracked
   // modifications OR untracked files). The pre-branch rollback below restores these paths
@@ -1135,10 +1400,10 @@ export async function runRelease(
       );
     }
 
-    // 11. Scaffold ROADMAP in memory and build PR body.
+    // 11. Scaffold ROADMAP in memory and build PR body (ensure plan row first).
     const ctx: ReleaseContext = {
       version: resolvedVersion, previousVersion, date: today, theme,
-      shippedPRs, shippedIssueNumbers,
+      shippedPRs, shippedIssueNumbers, planIssueNumbers,
     };
     const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx, (msg) => d.stderr(msg));
     prBody = buildPRBody(ctx, lastTag, frgEvidence);
