@@ -13,6 +13,8 @@ soaks do **not** substitute unless they run through this driver and produce a
 conforming FRG evidence artifact for the target version.
 
 FRG **never** merges PRs, enables auto-merge, or creates git tags (golden rule #4).
+After a **release-eligible** pass, FRG **auto-closes** synthetic pack open PRs and
+linked open issues **without merging** as post-pass hygiene (#754). Close ≠ merge.
 
 ## Two layers (both mandatory)
 
@@ -99,7 +101,7 @@ Under the **repository root**:
 ### Score an existing durable loop run (recommended after a pack loop finishes)
 
 ```bash
-pipeline factory-gate --for 1.29.1 --from-run <loop-run-id> [--json]
+pipeline factory-gate --for 1.29.1 --from-run <loop-run-id> [--json] [--no-close-pack]
 ```
 
 - Exit `0` only when `pass: true`.
@@ -119,6 +121,15 @@ pipeline factory-gate --for 1.29.1 --from-run <loop-run-id> [--json]
   by default and cannot mint release-usable pass artifacts without that provenance.
 - Incomplete evidence (empty scenarios, missing thresholds/scoreboard) is rejected by release
   lookup.
+- **Post-pass pack auto-close (#754):** after a release-eligible `pass: true` write, the driver
+  closes **without merging** each open PR (and open linked issue) for `scoreboard.per_item[]`
+  entries that are `ready_clean: true` **and** still carry the pack selector label
+  (`factory-gate` for the default pack). Comments cite version + `run_id`. Scope is **only**
+  those scored pack items — never a repo-wide “close all factory-gate”, and never product-
+  milestone / non-pack work that merely shared a host or loop window. Close failures are
+  reported but **do not** flip `pass` or delete evidence. Use `--no-close-pack` to skip
+  auto-close (debugging mid-pack scoring, intentional land-of-provenance). **Merge is never
+  part of FRG** — operators who want pack PRs on main still merge by hand.
 
 ### Start the pack (operator procedure)
 
@@ -140,10 +151,13 @@ pipeline factory-gate --for 1.29.1 --from-run <loop-run-id> [--json]
 
    ```bash
    pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> --json
+   # default: auto-closes synthetic pack R2D PRs/issues without merge
+   # pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> --no-close-pack
    ```
 
 6. Attach evidence to the release PR (automated by `pipeline release` on success; or paste
-   `run_id` + pass summary manually).
+   `run_id` + pass summary manually). Synthetic pack throwaways should already be closed
+   after step 5 unless you passed `--no-close-pack`.
 
 ### Concurrency settings (documented defaults for FRG)
 

@@ -1306,8 +1306,32 @@ export async function getUnresolvedReviewThreadCount(
   return isNaN(n) ? 0 : n;
 }
 
-export async function closePr(cfg: PipelineConfig, prNumber: number): Promise<void> {
-  await ghRun(["pr", "close", String(prNumber), "-R", cfg.repo]);
+export async function closePr(
+  cfg: PipelineConfig,
+  prNumber: number,
+  comment?: string,
+): Promise<void> {
+  const args = ["pr", "close", String(prNumber), "-R", cfg.repo];
+  if (comment !== undefined && comment !== "") {
+    args.push("--comment", comment);
+  }
+  await ghRun(args);
+}
+
+/**
+ * Close a GitHub issue, optionally leaving a closing comment (`gh issue close --comment`).
+ * Does not merge PRs; issue-only disposition.
+ */
+export async function closeIssue(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  comment?: string,
+): Promise<void> {
+  const args = ["issue", "close", String(issueNumber), "-R", cfg.repo];
+  if (comment !== undefined && comment !== "") {
+    args.push("--comment", comment);
+  }
+  await ghRun(args);
 }
 
 export async function reopenPr(cfg: PipelineConfig, prNumber: number): Promise<void> {
