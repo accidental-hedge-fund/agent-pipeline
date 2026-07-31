@@ -248,11 +248,25 @@ export const PRE_MERGE_AUTOFIX_ATTEMPT_RE =
  *                   unreadable HEAD, or pre-dirty worktree. Worktree rolled
  *                   back to pre-fix HEAD when applicable. Not eligible for the
  *                   clean-noop re-verify path.
+ * "rematerialize-failed" — managed worktree was missing and ensureManagedWorktree
+ *                   failed before implementer work (#769). Carries the seam's
+ *                   typed blockerKind so residual re-entry / delta SHA-gate
+ *                   paths park as worktree-* rather than product needs-human.
  */
+export type PreMergeAutofixRematerializeBlockerKind =
+  | "worktree-missing"
+  | "worktree-creation-failed"
+  | "worktree-capacity";
+
 export type PreMergeAutoFixResult =
   | { status: "fix-committed"; headSha: string }
   | { status: "noop-clean"; headSha: string; diagnostic: string }
-  | { status: "error"; diagnostic?: string };
+  | { status: "error"; diagnostic?: string }
+  | {
+      status: "rematerialize-failed";
+      blockerKind: PreMergeAutofixRematerializeBlockerKind;
+      diagnostic: string;
+    };
 
 /**
  * Injectable seam for the bounded pre-merge auto-fix attempt (#359, #747).
@@ -1311,7 +1325,8 @@ export async function advance(
             });
             if (remat.result === "fail") {
               return {
-                status: "error",
+                status: "rematerialize-failed",
+                blockerKind: remat.blockerKind,
                 diagnostic:
                   `worktree rematerialize failed (${remat.blockerKind}): ${remat.reason}`,
               };
@@ -2279,9 +2294,39 @@ export async function enforceReviewShaGate(
                 summary: `residual re-entry auto-fix ${fixRes.status}; re-enter SHA gate`,
               };
             }
+            // Typed worktree/rematerialize failure (#769): park as the seam's
+            // blocker kind — not product needs-human residual judgment.
+            if (fixRes.status === "rematerialize-failed") {
+              console.warn(
+                `[pipeline] #${issueNumber}: residual re-entry auto-fix rematerialize-failed ` +
+                  `(${fixRes.blockerKind}): ${fixRes.diagnostic}`,
+              );
+              await recordPreMergeGateResult(
+                { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+                "pre-merge-autofix",
+                "fail",
+                `residual-reentry:rematerialize-failed:${fixRes.blockerKind}`,
+              );
+              const rematKind = fixRes.blockerKind;
+              const rematReason = fixRes.diagnostic;
+              if (rematKind === "worktree-capacity") {
+                await setBlockedFn(cfg, issueNumber, rematReason, "pre-merge", "worktree-capacity");
+                return preMergeBlocked(rematReason, "worktree-capacity");
+              }
+              if (rematKind === "worktree-creation-failed") {
+                await setBlockedFn(
+                  cfg, issueNumber, rematReason, "pre-merge", "worktree-creation-failed",
+                );
+                return preMergeBlocked(rematReason, "worktree-creation-failed");
+              }
+              await setBlockedFn(cfg, issueNumber, rematReason, "pre-merge", "worktree-missing");
+              return preMergeBlocked(rematReason, "worktree-missing");
+            }
             console.warn(
               `[pipeline] #${issueNumber}: residual re-entry auto-fix ${fixRes.status}` +
-                (fixRes.diagnostic ? ` (${fixRes.diagnostic})` : "") +
+                (fixRes.status === "error" && fixRes.diagnostic
+                  ? ` (${fixRes.diagnostic})`
+                  : "") +
                 "; escalating remaining blockers",
             );
             await recordPreMergeGateResult(
@@ -3282,6 +3327,30 @@ export async function enforceReviewShaGate(
               "fail",
               "exhausted",
             );
+          } else if (fixRes?.status === "rematerialize-failed") {
+            // Typed worktree/rematerialize failure from the shared production
+            // autofix seam (#769): park with the seam's blocker kind before the
+            // product needs-human residual disposition path.
+            await recordPreMergeGateResult(
+              { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
+              "pre-merge-autofix",
+              "fail",
+              `rematerialize-failed:${fixRes.blockerKind}`,
+            );
+            const rematKind = fixRes.blockerKind;
+            const rematReason = fixRes.diagnostic;
+            if (rematKind === "worktree-capacity") {
+              await setBlockedFn(cfg, issueNumber, rematReason, "pre-merge", "worktree-capacity");
+              return preMergeBlocked(rematReason, "worktree-capacity");
+            }
+            if (rematKind === "worktree-creation-failed") {
+              await setBlockedFn(
+                cfg, issueNumber, rematReason, "pre-merge", "worktree-creation-failed",
+              );
+              return preMergeBlocked(rematReason, "worktree-creation-failed");
+            }
+            await setBlockedFn(cfg, issueNumber, rematReason, "pre-merge", "worktree-missing");
+            return preMergeBlocked(rematReason, "worktree-missing");
           } else {
             // fixRes.status === "error" (or attempt marker failed → fixRes null).
             await recordPreMergeGateResult(

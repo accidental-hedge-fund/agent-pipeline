@@ -13,13 +13,19 @@ import {
   type EnsureManagedWorktreeResult,
 } from "../scripts/worktree.ts";
 import {
+  enforceReviewShaGate,
   maybeArchiveOpenspec,
   type AdvancePreMergeDeps,
   type PreMergeAutoFixResult,
+  type ShaGateDeps,
 } from "../scripts/stages/pre_merge.ts";
 import type { AdvanceFixDeps } from "../scripts/stages/fix.ts";
-import type { PipelineConfig } from "../scripts/types.ts";
+import type { PipelineConfig, ReviewFinding } from "../scripts/types.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
+import {
+  computeDiffHash,
+  encodeReviewArtifact,
+} from "../scripts/stages/review.ts";
 
 const cfg = {
   base_branch: "main",
@@ -390,57 +396,245 @@ test("maybeArchiveOpenspec: membership unconfirmed + rematerialize fail → type
 });
 
 // ---------------------------------------------------------------------------
-// Call sites B+C — production autofix rematerialize (via injectible ensure)
+// Call sites B+C — enforceReviewShaGate residual re-entry + delta autofix
+// typed rematerialize-failed propagation (#769 review-1 finding 7412f05b)
 // ---------------------------------------------------------------------------
 
-test("pre-merge autofix production path: rematerialize before implementer when wt missing", async () => {
-  // Exercise the same contract the production closure uses: ensure then autofix
-  // with recreated path. (Full advance() wiring is integration-heavy; this
-  // proves the ensure → perform path that residual re-entry and delta share.)
-  let ensureCalls = 0;
-  let autofixPath: string | null = null;
+const SHA_HEAD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const SHA_REVIEWED = "cccccccccccccccccccccccccccccccccccccccc";
+const TEST_ACTOR = "pipeline-bot";
+const OLD_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
+const NEW_DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 2;";
+const oldHash = computeDiffHash(OLD_DIFF);
 
-  const ensure: AdvancePreMergeDeps["ensureManagedWorktree"] = async () => {
-    ensureCalls += 1;
-    return {
-      result: "pass",
-      worktree: { path: WT_PATH, slug: SLUG, branch: BRANCH },
-      reason: "recreated",
-    };
+const cfgWithPolicy = {
+  ...cfg,
+  review_policy: { block_threshold: "low" as const, min_confidence: 0 },
+  harnesses: { reviewer: "claude", implementer: "claude" },
+} as unknown as PipelineConfig;
+
+/** Residual re-entry durable comment: matching HEAD + blocking artifact with autofixable category. */
+function residualReentryBlockingComment(sha: string): string {
+  const artifactLine = encodeReviewArtifact({
+    round: 2,
+    reviewedSha: sha,
+    diffHash: "abcd1234",
+    blockingKeys: ["5284604a"],
+    review1Risk: null,
+    bodyHash: "00",
+    blockingFindings: [{
+      key: "5284604a",
+      surface: "core/scripts/gh.ts|correctness",
+      severity: "high",
+      title: "Off-by-one in parser",
+      confidence: 0.95,
+    }],
+  });
+  return [
+    `## Review 2 (Adversarial) — needs-attention`,
+    "",
+    "No-ship: blocking findings remain.",
+    "",
+    `**1. [HIGH] Off-by-one** \`override-key: 5284604a\` \`category: correctness\``,
+    "",
+    `<!-- reviewed-sha: ${sha} -->`,
+    `<!-- pipeline-blocking-keys: 5284604a -->`,
+    artifactLine,
+  ].join("\n");
+}
+
+function reviewCommentWithHash(round: 1 | 2, sha: string, hash: string): string {
+  return (
+    `## Review ${round} (${round === 1 ? "Standard" : "Adversarial"}) — approve\n\n` +
+    `LGTM\n\n<!-- reviewed-sha: ${sha} -->\n<!-- verdict-diff-hash: ${hash} -->`
+  );
+}
+
+function blockingCorrectnessFinding(): ReviewFinding {
+  return {
+    severity: "high",
+    title: "Off-by-one",
+    body: "Details",
+    confidence: 0.95,
+    recommendation: "Fix it",
+    category: "correctness",
+  } as ReviewFinding;
+}
+
+/** Production-shaped rematerialize fail result from the autofix seam. */
+function rematerializeFailedResult(
+  kind: "worktree-missing" | "worktree-creation-failed" | "worktree-capacity" = "worktree-creation-failed",
+  reason = "create refused: dirty reclaim",
+): PreMergeAutoFixResult {
+  return {
+    status: "rematerialize-failed",
+    blockerKind: kind,
+    diagnostic: `worktree rematerialize failed (${kind}): ${reason}`,
+  };
+}
+
+test("enforceReviewShaGate residual re-entry: rematerialize-failed parks typed worktree block (not needs-human)", async (t) => {
+  // Real residual re-entry path: reviewed-sha == HEAD with unresolved blockers,
+  // allowlisted reconstructed findings, no prior autofix attempt → seam invoked.
+  const blocked: Array<{ reason: string; kind?: string }> = [];
+  let autoFixCalls = 0;
+  const rematRes = rematerializeFailedResult("worktree-creation-failed", "dirty reclaim");
+
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () =>
+      ({
+        title: "Rematerialize test",
+        body: "Body",
+        comments: [{
+          body: residualReentryBlockingComment(SHA_HEAD),
+          author: TEST_ACTOR,
+        }],
+      }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD, head_ref: BRANCH }) as any,
+    getPrCommits: async () =>
+      [
+        { oid: SHA_HEAD, messageHeadline: "fix: prior work" },
+      ] as any,
+    postComment: async () => {},
+    transition: async () => {},
+    setBlocked: async (_cfg, _n, reason, _stage, kind) => {
+      blocked.push({ reason, kind: kind as string | undefined });
+    },
+    getForIssue: async () => null,
+    getGhActor: async () => TEST_ACTOR,
+    attemptPreMergeAutoFix: async () => {
+      autoFixCalls += 1;
+      return rematRes;
+    },
   };
 
-  // Simulate the production closure body from advance():
-  const getForIssue = async () => null as { path: string; slug: string } | null;
-  let wt = await getForIssue();
-  if (!wt) {
-    const remat = (await ensure!(cfg, ISSUE, {})) as EnsureManagedWorktreeResult;
-    assert.notEqual(remat.result, "fail");
-    if (remat.result !== "fail") {
-      wt = { path: remat.worktree.path, slug: remat.worktree.slug };
-    }
-  }
-  autofixPath = wt!.path;
+  let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = null;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, ISSUE, PR, deps);
+  });
 
-  assert.equal(ensureCalls, 1);
-  assert.equal(autofixPath, WT_PATH);
+  assert.equal(autoFixCalls, 1, "residual re-entry must invoke autofix seam");
+  assert.notEqual(out, null);
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.equal(
+    (out as { blockerKind?: string }).blockerKind,
+    "worktree-creation-failed",
+    "outcome must carry typed worktree blocker, not needs-human",
+  );
+  assert.equal(blocked.length, 1);
+  assert.equal(blocked[0]!.kind, "worktree-creation-failed");
+  assert.match(blocked[0]!.reason, /rematerialize failed/);
+  assert.match(blocked[0]!.reason, /worktree-creation-failed/);
 });
 
-test("pre-merge autofix: rematerialize fail returns diagnostic error (not bare empty error)", async () => {
+test("enforceReviewShaGate residual re-entry: worktree-missing / capacity kinds propagate", async (t) => {
+  for (const kind of ["worktree-missing", "worktree-capacity"] as const) {
+    const blocked: Array<{ kind?: string }> = [];
+    const deps: ShaGateDeps = {
+      getIssueDetail: async () =>
+        ({
+          title: "x",
+          body: "",
+          comments: [{ body: residualReentryBlockingComment(SHA_HEAD), author: TEST_ACTOR }],
+        }) as any,
+      getPrDetail: async () => ({ head_sha: SHA_HEAD }) as any,
+      getPrCommits: async () => [{ oid: SHA_HEAD, messageHeadline: "feat" }] as any,
+      postComment: async () => {},
+      transition: async () => {},
+      setBlocked: async (_c, _n, _r, _s, k) => {
+        blocked.push({ kind: k as string | undefined });
+      },
+      getForIssue: async () => null,
+      getGhActor: async () => TEST_ACTOR,
+      attemptPreMergeAutoFix: async () => rematerializeFailedResult(kind, `fail-${kind}`),
+    };
+    let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = null;
+    await quiet(t, async () => {
+      out = await enforceReviewShaGate(cfgWithPolicy, ISSUE, PR, deps);
+    });
+    assert.equal((out as { blockerKind?: string }).blockerKind, kind, `kind ${kind}`);
+    assert.equal(blocked[0]?.kind, kind);
+  }
+});
+
+test("enforceReviewShaGate delta autofix: rematerialize-failed parks typed worktree block (not needs-human)", async (t) => {
+  // Normal delta path (SHA mismatch → delta review blocks → autofix).
+  const blocked: Array<{ reason: string; kind?: string }> = [];
+  let autoFixCalls = 0;
+  let deltaCalls = 0;
+
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () =>
+      ({
+        title: "Delta rematerialize test",
+        body: "Body",
+        comments: [{
+          body: reviewCommentWithHash(2, SHA_REVIEWED, oldHash),
+          author: TEST_ACTOR,
+        }],
+      }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD, head_ref: BRANCH }) as any,
+    getPrCommits: async () =>
+      [
+        { oid: SHA_REVIEWED, messageHeadline: "feat: implement" },
+        { oid: SHA_HEAD, messageHeadline: "fix: address review" },
+      ] as any,
+    getPrDiff: async () => NEW_DIFF,
+    getCommitDeltaDiff: async () => NEW_DIFF,
+    runDeltaReview: async () => {
+      deltaCalls += 1;
+      return {
+        verdict: "needs-attention",
+        findings: [blockingCorrectnessFinding()],
+        summary: "blocking",
+      } as any;
+    },
+    postComment: async () => {},
+    transition: async () => {},
+    setBlocked: async (_cfg, _n, reason, _stage, kind) => {
+      blocked.push({ reason, kind: kind as string | undefined });
+    },
+    getForIssue: async () => ({ path: WT_PATH, slug: SLUG }) as any,
+    getGhActor: async () => TEST_ACTOR,
+    attemptPreMergeAutoFix: async () => {
+      autoFixCalls += 1;
+      return rematerializeFailedResult("worktree-missing", "no recoverable head");
+    },
+  };
+
+  let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = null;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, ISSUE, PR, deps);
+  });
+
+  assert.equal(deltaCalls, 1, "delta review must run");
+  assert.equal(autoFixCalls, 1, "delta autofix seam must run");
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.equal(
+    (out as { blockerKind?: string }).blockerKind,
+    "worktree-missing",
+    "delta path must park typed worktree-missing, not needs-human",
+  );
+  assert.equal(blocked[0]?.kind, "worktree-missing");
+  assert.match(blocked[0]!.reason, /rematerialize failed/);
+});
+
+test("pre-merge autofix: rematerialize fail uses rematerialize-failed contract (not bare error)", () => {
   const remat: EnsureManagedWorktreeResult = {
     result: "fail",
     worktree: null,
     reason: "create refused: dirty reclaim",
     blockerKind: "worktree-creation-failed",
   };
-  // Same shape production closure returns on rematerialize fail.
+  // Same shape production closure returns on rematerialize fail (#769).
   const fixRes: PreMergeAutoFixResult = {
-    status: "error",
+    status: "rematerialize-failed",
+    blockerKind: remat.blockerKind,
     diagnostic: `worktree rematerialize failed (${remat.blockerKind}): ${remat.reason}`,
   };
-  assert.equal(fixRes.status, "error");
-  assert.ok(fixRes.diagnostic && fixRes.diagnostic.length > 0);
+  assert.equal(fixRes.status, "rematerialize-failed");
+  assert.equal(fixRes.blockerKind, "worktree-creation-failed");
   assert.match(fixRes.diagnostic, /rematerialize failed/);
-  assert.match(fixRes.diagnostic, /worktree-creation-failed/);
 });
 
 // ---------------------------------------------------------------------------
@@ -506,6 +700,16 @@ test("source wiring: pre_merge autofix/archive and fix rematerialize before bare
   // Production autofix closure must rematerialize — never bare empty error alone.
   assert.match(preMerge, /ensureWtForAutoFix|ensureManagedWorktree/);
   assert.match(preMerge, /worktree rematerialize failed/);
+  assert.match(
+    preMerge,
+    /status:\s*"rematerialize-failed"/,
+    "production autofix must return typed rematerialize-failed (not bare error)",
+  );
+  assert.match(
+    preMerge,
+    /fixRes\.status === "rematerialize-failed"/,
+    "SHA-gate residual/delta paths must branch on rematerialize-failed",
+  );
   assert.ok(
     !/if\s*\(\s*!wt\s*\)\s*return\s*\{\s*status:\s*"error"\s*\}/.test(preMerge),
     "production autofix must not bare-return {status:\"error\"} on missing wt",
