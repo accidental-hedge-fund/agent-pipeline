@@ -15,8 +15,16 @@ import {
   resolveRebasePushResult,
   saveCiRecoveryMarkers,
   type AdvancePreMergeDeps,
+  type CiRecoveryMarkers,
   type PreMergePollingContext,
 } from "../scripts/stages/pre_merge.ts";
+
+/** Unwrap a successful load; fail the test on corrupt/missing-ok:false. */
+function requireMarkers(runDir: string): CiRecoveryMarkers {
+  const loaded = loadCiRecoveryMarkers(runDir);
+  assert.equal(loaded.ok, true, loaded.ok ? "" : loaded.reason);
+  return loaded.ok ? loaded.markers : {};
+}
 import { extractWorkflowRunId, trimLogExcerpt } from "../scripts/gh.ts";
 import { readEvents } from "../scripts/run-store.ts";
 import type { CheckRun, PipelineConfig } from "../scripts/types.ts";
@@ -268,7 +276,7 @@ test("durable marker after simulated restart skips second re-run", async (t) => 
       await advance(cfg, ISSUE, { pollingCtx: ctx1, runDir }, deps);
     });
     assert.equal(rec.reruns, 1);
-    const disk = loadCiRecoveryMarkers(runDir);
+    const disk = requireMarkers(runDir);
     assert.ok(ciRecoveryShaSetHas(disk.ciRerunAttemptedShas, SHA_HEAD));
     const raw = await readFile(join(runDir, "pre-merge-ci-recovery.json"), "utf8");
     assert.match(raw, new RegExp(SHA_HEAD));
@@ -407,7 +415,7 @@ test("archive-only prior-green: restart after re-run still close+reopens; escala
     assert.equal(first!.status, "waiting");
     assert.equal(rec.reruns, 1);
     assert.equal(rec.closeCalls, 0);
-    const diskAfterRerun = loadCiRecoveryMarkers(runDir);
+    const diskAfterRerun = requireMarkers(runDir);
     assert.ok(ciRecoveryShaSetHas(diskAfterRerun.ciRerunAttemptedShas, SHA_HEAD));
     assert.equal(
       diskAfterRerun.preArchiveSha,
@@ -789,7 +797,7 @@ test("#771 1.5 rebase success but HEAD unchanged → not rebased; CI re-running;
     assert.notEqual(first!.reason, "rebased; CI re-running");
     assert.equal(first!.status, "blocked");
     assert.ok(ciRecoveryShaSetHas(pollingCtx.ciRebaseAttemptedShas, SHA_HEAD));
-    assert.ok(ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciRebaseAttemptedShas, SHA_HEAD));
+    assert.ok(ciRecoveryShaSetHas(requireMarkers(runDir).ciRebaseAttemptedShas, SHA_HEAD));
 
     await quiet(t, async () => {
       await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
@@ -882,7 +890,7 @@ test("#771 1.7 durable rebase marker survives process restart — no second reba
       await advance(cfg, ISSUE, { pollingCtx: ctx1, runDir }, deps);
     });
     assert.equal(rebaseCalls, 1);
-    assert.ok(ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciRebaseAttemptedShas, SHA_HEAD));
+    assert.ok(ciRecoveryShaSetHas(requireMarkers(runDir).ciRebaseAttemptedShas, SHA_HEAD));
 
     // Fresh process: empty ctx, hydrate from disk; worktree marker absent (recreated).
     const ctx2: PreMergePollingContext = {};
@@ -1160,7 +1168,7 @@ test("#771 r2 terminal ci/fail idempotent with { runDir } and no pollingCtx", as
       "terminal ci/fail must be idempotent when only runDir is provided",
     );
     assert.ok(
-      ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciTerminalFailRecordedShas, SHA_HEAD),
+      ciRecoveryShaSetHas(requireMarkers(runDir).ciTerminalFailRecordedShas, SHA_HEAD),
     );
   });
 });
@@ -1243,7 +1251,7 @@ test("#771 r2 H1→H2→H1 multi-SHA durable budget + terminal marker survive fr
     });
     assert.equal(rebaseCalls, 1);
     assert.equal(worktreeMarker, true, "H1 leaves worktree secondary marker");
-    assert.ok(ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciRebaseAttemptedShas, SHA_H1));
+    assert.ok(ciRecoveryShaSetHas(requireMarkers(runDir).ciRebaseAttemptedShas, SHA_H1));
 
     // Hop 2: new head H2 gets its own one-shot in the same worktree (marker still set).
     head = SHA_H2_LOCAL;
@@ -1251,7 +1259,7 @@ test("#771 r2 H1→H2→H1 multi-SHA durable budget + terminal marker survive fr
       await advance(cfg, ISSUE, { pollingCtx: {}, runDir }, deps);
     });
     assert.equal(rebaseCalls, 2, "H2 may rebase once despite H1 worktree marker");
-    const diskMid = loadCiRecoveryMarkers(runDir);
+    const diskMid = requireMarkers(runDir);
     assert.ok(ciRecoveryShaSetHas(diskMid.ciRebaseAttemptedShas, SHA_H1));
     assert.ok(ciRecoveryShaSetHas(diskMid.ciRebaseAttemptedShas, SHA_H2_LOCAL));
 
@@ -1277,7 +1285,7 @@ test("#771 r2 H1→H2→H1 multi-SHA durable budget + terminal marker survive fr
     // H1 and H2 each escalate once → two terminal fails max; H1 must not get a third.
     assert.ok(ciFails.length <= 2, `expected ≤2 terminal fails, got ${ciFails.length}`);
     assert.ok(
-      ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciTerminalFailRecordedShas, SHA_H1),
+      ciRecoveryShaSetHas(requireMarkers(runDir).ciTerminalFailRecordedShas, SHA_H1),
     );
   });
 });
@@ -1318,7 +1326,7 @@ test("#771 r3 same-worktree H1 secondary marker must not suppress H2 rebase budg
     });
     assert.equal(rebaseCalls, 1);
     assert.equal(worktreeMarker, true, "H1 must leave the unkeyed worktree secondary marker");
-    assert.ok(ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciRebaseAttemptedShas, SHA_H1));
+    assert.ok(ciRecoveryShaSetHas(requireMarkers(runDir).ciRebaseAttemptedShas, SHA_H1));
 
     // Same worktree, marker still true — H2 must still get its durable one-shot.
     head = SHA_H2_LOCAL;
@@ -1330,7 +1338,7 @@ test("#771 r3 same-worktree H1 secondary marker must not suppress H2 rebase budg
       2,
       "H2 must receive exactly one rebase despite H1 worktree secondary marker",
     );
-    assert.ok(ciRecoveryShaSetHas(loadCiRecoveryMarkers(runDir).ciRebaseAttemptedShas, SHA_H2_LOCAL));
+    assert.ok(ciRecoveryShaSetHas(requireMarkers(runDir).ciRebaseAttemptedShas, SHA_H2_LOCAL));
 
     // H2 budget consumed; same marker still set — no third rebase for H2.
     await quiet(t, async () => {
@@ -1354,9 +1362,166 @@ test("#771 r2 legacy scalar markers migrate into SHA sets on load", async () => 
         2,
       ) + "\n",
     );
-    const loaded = loadCiRecoveryMarkers(runDir);
+    const loaded = requireMarkers(runDir);
     assert.ok(ciRecoveryShaSetHas(loaded.ciRebaseAttemptedShas, SHA_HEAD));
     assert.ok(ciRecoveryShaSetHas(loaded.ciTerminalFailRecordedShas, SHA_HEAD));
     assert.equal(loaded.ciRebaseAttemptedForSha, undefined, "normalized form drops scalars");
   });
+});
+
+// ---------------------------------------------------------------------------
+// #771 review 2 adversarial — failure-atomic terminal claim + atomic markers
+// ---------------------------------------------------------------------------
+
+test("#771 r2b corrupt recovery markers fail closed; previously consumed budget not re-opened", async (t) => {
+  await withRunDir(async (runDir) => {
+    // Seed a consumed rebase budget for H, then truncate the file (simulates
+    // in-place write kill / storage error from pre-atomic writer).
+    const seeded = saveCiRecoveryMarkers(runDir, {
+      ciRebaseAttemptedShas: [SHA_HEAD],
+      ciTerminalFailRecordedShas: [SHA_HEAD],
+    });
+    assert.equal(seeded.ok, true);
+    await writeFile(
+      join(runDir, "pre-merge-ci-recovery.json"),
+      '{"ciRebaseAttemptedShas":["bbbbbbbb',
+    );
+
+    const corrupt = loadCiRecoveryMarkers(runDir);
+    assert.equal(corrupt.ok, false, "truncated/malformed marker file must not load as empty");
+    if (!corrupt.ok) assert.match(corrupt.reason, /corrupt|malformed|unparseable/i);
+
+    let rebaseCalls = 0;
+    const { deps, rec } = baseDeps({
+      rebaseAlreadyAttempted: () => false,
+      tryRebaseAndPush: async () => {
+        rebaseCalls++;
+        return true;
+      },
+      rerunFailedWorkflows: async () => ({ attempted: false, runIds: [], reason: "unavailable" }),
+    });
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { runDir }, deps);
+    });
+    assert.equal(out!.status, "blocked");
+    assert.equal(
+      rebaseCalls,
+      0,
+      "corrupt markers must fail closed — must not re-run tryRebaseAndPush",
+    );
+    assert.equal(rec.blocked[0]!.kind, "ci-exhausted");
+    assert.match(
+      rec.blocked[0]!.reason,
+      /corrupt|unparseable|malformed|unreadable|Durable recovery marker|persist/i,
+    );
+  });
+});
+
+test("#771 r2b atomic save leaves no truncated marker; missing file is empty not corrupt", async () => {
+  await withRunDir(async (runDir) => {
+    const missing = loadCiRecoveryMarkers(runDir);
+    assert.equal(missing.ok, true);
+    if (missing.ok) assert.deepEqual(missing.markers, {});
+
+    const saved = saveCiRecoveryMarkers(runDir, {
+      ciRebaseAttemptedShas: [SHA_HEAD, "cccccccccccccccccccccccccccccccccccccccc"],
+    });
+    assert.equal(saved.ok, true);
+    const loaded = requireMarkers(runDir);
+    assert.ok(ciRecoveryShaSetHas(loaded.ciRebaseAttemptedShas, SHA_HEAD));
+    assert.ok(
+      ciRecoveryShaSetHas(loaded.ciRebaseAttemptedShas, "cccccccccccccccccccccccccccccccccccccccc"),
+    );
+    // No leftover temp siblings from the atomic writer.
+    const { readdir } = await import("node:fs/promises");
+    const entries = await readdir(runDir);
+    assert.ok(
+      entries.every((e) => !e.endsWith(".tmp")),
+      `atomic save must clean up temps; got ${entries.join(",")}`,
+    );
+  });
+});
+
+test("#771 r2b terminal claim-before-event: claimed slot without event is restart-idempotent", async (t) => {
+  await withRunDir(async (runDir) => {
+    // Simulate crash after durable claim but before event append: marker present,
+    // events.jsonl has no terminal fail. Restart must not spam another fail row
+    // and must not re-open rebase budget.
+    const claim = saveCiRecoveryMarkers(runDir, {
+      ciRebaseAttemptedShas: [SHA_HEAD],
+      ciTerminalFailRecordedShas: [SHA_HEAD],
+    });
+    assert.equal(claim.ok, true);
+
+    let rebaseCalls = 0;
+    const { deps, rec } = baseDeps({
+      rebaseAlreadyAttempted: () => false,
+      tryRebaseAndPush: async () => {
+        rebaseCalls++;
+        return true;
+      },
+      rerunFailedWorkflows: async () => ({ attempted: false, runIds: [], reason: "unavailable" }),
+    });
+
+    await quiet(t, async () => {
+      await advance(cfg, ISSUE, { runDir }, deps);
+    });
+    await quiet(t, async () => {
+      await advance(cfg, ISSUE, { runDir }, deps);
+    });
+
+    assert.equal(rebaseCalls, 0, "claimed rebase budget must survive restart");
+    assert.equal(rec.blocked.length, 2);
+    assert.equal(rec.blocked[0]!.kind, "ci-exhausted");
+
+    const events = await readEvents(runDir);
+    const ciFails = events.filter(
+      (e) =>
+        e.type === "gate_result" &&
+        (e as { gate?: string }).gate === "ci" &&
+        (e as { result?: string }).result === "fail",
+    );
+    assert.equal(
+      ciFails.length,
+      0,
+      "durable terminal claim without prior event must not re-append on restart",
+    );
+  });
+});
+
+test("#771 r2b terminal claim persist failure does not append fail before durable slot", async (t) => {
+  const parent = await mkdtemp(join(tmpdir(), "ci-term-bad-"));
+  const badRunDir = join(parent, "not-a-dir");
+  await writeFile(badRunDir, "not a directory\n");
+  try {
+    let rebaseCalls = 0;
+    const { deps, rec } = baseDeps({
+      rebaseAlreadyAttempted: () => false,
+      tryRebaseAndPush: async () => {
+        rebaseCalls++;
+        return true;
+      },
+      rerunFailedWorkflows: async () => ({ attempted: false, runIds: [], reason: "unavailable" }),
+    });
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { runDir: badRunDir }, deps);
+    });
+    assert.equal(out!.status, "blocked");
+    assert.equal(rebaseCalls, 0);
+    assert.equal(rec.blocked[0]!.kind, "ci-exhausted");
+    // Cannot read events under a file-as-runDir; prove no events file was created
+    // beside the bad path as a directory child.
+    const { access } = await import("node:fs/promises");
+    let eventsExist = true;
+    try {
+      await access(join(badRunDir, "events.jsonl"));
+    } catch {
+      eventsExist = false;
+    }
+    assert.equal(eventsExist, false, "must not append terminal fail without durable claim");
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
 });

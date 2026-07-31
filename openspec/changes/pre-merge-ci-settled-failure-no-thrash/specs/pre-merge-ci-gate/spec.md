@@ -127,6 +127,13 @@ When the gate escalates from settled CI failure (budget exhausted), it SHALL rec
 - **THEN** the gate SHALL NOT append another terminal `ci`/`fail` solely for that re-poll
 - **AND** SHALL still return `blocked`
 
+#### Scenario: Terminal ci fail claim is durable before event append
+
+- **WHEN** the gate escalates to `blocked` for settled CI failure at head SHA `H` and has not yet claimed a terminal fail for `H`
+- **THEN** the gate SHALL persist the per-head terminal-fail claim in durable run state before appending the terminal `gate_result` `ci`/`fail` event
+- **AND** when durable claim persistence fails, the gate SHALL NOT append the terminal fail event on that tick (so a later successful claim can emit exactly once)
+- **AND** when the durable claim is present for `H` after a crash that prevented the event append, a subsequent pure re-poll SHALL NOT append a terminal `ci`/`fail` solely for that re-poll
+
 ### Requirement: Settled-check aggregate SHALL be pending-first for the current PR head
 
 The pre-merge CI gate SHALL evaluate settlement using the checks returned for the PR at poll time against the **current** PR head SHA from `getPrDetail`. Any pending check (bucket not `pass`/`skipping`/`fail`/`cancel`) SHALL take precedence over failure: the gate SHALL return `waiting` and SHALL NOT enter definitive-failure recovery or `ci-exhausted` while pending remains. Neutral/skipped (`skipping`) checks SHALL NOT count as failure or pending. Immediately after a settled-failure check poll and before entering definitive-failure recovery, the gate SHALL re-read `getPrDetail`; if the head SHA differs from the SHA observed when the poll began, the gate SHALL return `waiting` without recovery side-effects so the next tick re-evaluates the new head.
@@ -149,7 +156,7 @@ The pre-merge CI gate SHALL evaluate settlement using the checks returned for th
 
 ### Requirement: CI recovery persistence failure SHALL fail closed
 
-When the durable CI recovery marker store cannot be written or read-back-verified before a recovery side-effect that would consume budget, the gate SHALL refuse that side-effect and SHALL escalate with `ci-exhausted` naming the persistence failure rather than returning unbounded `waiting` on in-memory-only state. This applies to rebase as well as re-run / archive / assertion classes.
+When the durable CI recovery marker store cannot be written or read-back-verified before a recovery side-effect that would consume budget, the gate SHALL refuse that side-effect and SHALL escalate with `ci-exhausted` naming the persistence failure rather than returning unbounded `waiting` on in-memory-only state. This applies to rebase as well as re-run / archive / assertion classes. Marker writes SHALL be atomic (same-directory temporary file then rename) so an interrupted write cannot leave a truncated file. A missing initial marker file SHALL be treated as empty budgets; a malformed or unreadable existing marker file SHALL be treated as a persistence failure and fail closed before any recovery side-effect (not as an empty budget that re-opens consumed heads).
 
 #### Scenario: Marker write failure refuses side-effect and blocks
 
@@ -157,6 +164,14 @@ When the durable CI recovery marker store cannot be written or read-back-verifie
 - **AND** persisting the per-class attempt marker fails or runDir is unavailable
 - **THEN** the gate SHALL NOT perform that recovery side-effect (or SHALL not claim a successful recovery wait after an undurable attempt)
 - **AND** SHALL escalate with `ci-exhausted` including a durable-persistence failure signal in the operator reason
+
+#### Scenario: Corrupt existing marker file fails closed without re-opening budgets
+
+- **WHEN** the durable CI recovery marker file exists but is truncated, malformed, or otherwise unreadable
+- **AND** settled failure would otherwise authorize a recovery class attempt for head `H`
+- **THEN** the gate SHALL NOT call `tryRebaseAndPush` (or other recovery side-effects) for `H`
+- **AND** SHALL escalate with `ci-exhausted` naming the persistence / unreadable-marker failure
+- **AND** SHALL NOT treat the unreadable file as an empty marker set that re-opens a previously consumed budget
 
 ### Requirement: Escalation evidence SHALL include failing checks and optional capped logs
 

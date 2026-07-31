@@ -1074,16 +1074,48 @@ export function normalizeCiRecoveryMarkers(raw: CiRecoveryMarkers): CiRecoveryMa
   };
 }
 
-/** Load durable CI recovery markers from the run directory (best-effort). */
-export function loadCiRecoveryMarkers(runDir: string | undefined): CiRecoveryMarkers {
-  if (!runDir) return {};
+/** Result of loading CI recovery markers (#771 fail-closed durability). */
+export type LoadCiRecoveryMarkersResult =
+  | { ok: true; markers: CiRecoveryMarkers }
+  | { ok: false; reason: string };
+
+/**
+ * Load durable CI recovery markers from the run directory.
+ * Missing file (never written) → empty markers. Corrupt / unreadable existing
+ * state → ok:false so callers fail closed rather than treating truncated JSON
+ * as an empty budget that re-opens already-consumed recovery (#771 r2).
+ */
+export function loadCiRecoveryMarkers(
+  runDir: string | undefined,
+): LoadCiRecoveryMarkersResult {
+  if (!runDir) return { ok: true, markers: {} };
+  const filePath = ciRecoveryMarkersPath(runDir);
+  let raw: string;
   try {
-    const raw = fs.readFileSync(ciRecoveryMarkersPath(runDir), "utf8");
+    raw = fs.readFileSync(filePath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { ok: true, markers: {} };
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason: `CI recovery markers unreadable: ${msg}` };
+  }
+  try {
     const parsed = JSON.parse(raw) as CiRecoveryMarkers;
-    if (!parsed || typeof parsed !== "object") return {};
-    return normalizeCiRecoveryMarkers(parsed);
-  } catch {
-    return {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {
+        ok: false,
+        reason:
+          "CI recovery markers file is malformed (not a JSON object); refusing empty budget",
+      };
+    }
+    return { ok: true, markers: normalizeCiRecoveryMarkers(parsed) };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      reason: `CI recovery markers file is corrupt/unparseable: ${msg}`,
+    };
   }
 }
 
@@ -1092,6 +1124,8 @@ export function loadCiRecoveryMarkers(runDir: string | undefined): CiRecoveryMar
  * Returns ok:false when runDir is missing or the write/read-back fails — callers
  * MUST NOT return `waiting` after consuming recovery budget without ok:true
  * (otherwise a restarted process can re-consume the budget; #679 / #181).
+ * Writes atomically (same-dir temp + rename) so a kill mid-write cannot leave a
+ * truncated marker file that would erase previously consumed SHA budgets (#771).
  * Writes the set form only (legacy scalars are not re-emitted).
  */
 export function saveCiRecoveryMarkers(
@@ -1104,19 +1138,42 @@ export function saveCiRecoveryMarkers(
       reason: "runDir unavailable; cannot persist CI recovery markers",
     };
   }
+  const filePath = ciRecoveryMarkersPath(runDir);
+  const tmpPath = path.join(
+    runDir,
+    `.${CI_RECOVERY_MARKERS_FILE}.${process.pid}.${Date.now()}.tmp`,
+  );
   try {
     fs.mkdirSync(runDir, { recursive: true });
-    const filePath = ciRecoveryMarkersPath(runDir);
     const normalized = normalizeCiRecoveryMarkers(markers);
-    fs.writeFileSync(filePath, JSON.stringify(normalized, null, 2) + "\n");
+    const content = JSON.stringify(normalized, null, 2) + "\n";
+    fs.writeFileSync(tmpPath, content, "utf8");
+    // Best-effort fsync of the temp file before rename so a crash cannot leave
+    // a zero-length target after rename on filesystems that reorder metadata.
+    try {
+      const fd = fs.openSync(tmpPath, "r");
+      try {
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      /* fsync optional; rename + read-back still apply */
+    }
+    fs.renameSync(tmpPath, filePath);
     // Read-back so a write that appears to succeed but is not durable fails closed.
     const raw = fs.readFileSync(filePath, "utf8");
     const parsed = JSON.parse(raw) as CiRecoveryMarkers;
-    if (!parsed || typeof parsed !== "object") {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return { ok: false, reason: "CI recovery marker read-back was not an object" };
     }
     return { ok: true };
   } catch (err) {
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      /* best-effort cleanup; original error is what matters */
+    }
     const msg = err instanceof Error ? err.message : String(err);
     return { ok: false, reason: `failed to persist CI recovery markers: ${msg}` };
   }
@@ -1126,12 +1183,16 @@ export function saveCiRecoveryMarkers(
  * Merge durable file markers into a polling context.
  * Per-class SHA sets are **unioned** so in-memory session state cannot drop
  * previously consumed heads already on disk (#771 multi-SHA durability).
+ * Returns ok:false when existing on-disk state is corrupt/unreadable — callers
+ * must fail closed before recovery side-effects (#771 r2).
  */
 export function hydrateCiRecoveryMarkers(
   ctx: PreMergePollingContext,
   runDir: string | undefined,
-): void {
-  const disk = loadCiRecoveryMarkers(runDir);
+): SaveCiRecoveryMarkersResult {
+  const loaded = loadCiRecoveryMarkers(runDir);
+  if (!loaded.ok) return loaded;
+  const disk = loaded.markers;
   // Restore preArchiveSha before any capture path can overwrite it with the
   // current (post-archive) head after a process restart (#679 review 2).
   if (!ctx.preArchiveSha && disk.preArchiveSha) {
@@ -1157,17 +1218,22 @@ export function hydrateCiRecoveryMarkers(
     ctx.ciTerminalFailRecordedShas,
     disk.ciTerminalFailRecordedShas,
   );
+  return { ok: true };
 }
 
 /**
  * Persist recovery markers, unioning with any disk state first so a partial
  * in-memory context cannot erase previously consumed head budgets (#771).
+ * Fails closed when existing on-disk markers are corrupt/unreadable rather than
+ * rewriting from an incomplete in-memory view (#771 r2).
  */
 function persistCtxCiMarkers(
   ctx: PreMergePollingContext,
   runDir: string | undefined,
 ): SaveCiRecoveryMarkersResult {
-  const disk = loadCiRecoveryMarkers(runDir);
+  const loaded = loadCiRecoveryMarkers(runDir);
+  if (!loaded.ok) return loaded;
+  const disk = loaded.markers;
   const markers: CiRecoveryMarkers = {
     preArchiveSha: ctx.preArchiveSha ?? disk.preArchiveSha,
     ciRebaseAttemptedShas: ciRecoveryShaSetUnion(
@@ -1836,27 +1902,43 @@ export async function advance(
       // re-polls of an unchanged red head escalate rather than re-wait.
       // Effective recovery context: hydrate from runDir even when the caller
       // omits pollingCtx so `{ runDir }`-only restarts stay idempotent (#771 r2).
+      // Durable claim of the per-head terminal slot happens BEFORE the event
+      // append so a crash/persist failure cannot re-append the same fail row
+      // on restart (#771 r2 adversarial: failure-atomic terminal recording).
       if (recoveryOut.status === "blocked") {
         const failHead = settledHeadSha;
         const recoveryCtx: PreMergePollingContext = opts.pollingCtx ?? {};
-        hydrateCiRecoveryMarkers(recoveryCtx, opts.runDir);
-        const alreadyTerminal = ciRecoveryShaSetHas(
-          recoveryCtx.ciTerminalFailRecordedShas,
-          failHead,
-        );
-        if (!alreadyTerminal) {
-          await recordPreMergeGateResult(
-            { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
-            "ci",
-            "fail",
-            recoveryOut.reason ?? "CI failed",
+        const hydrate = hydrateCiRecoveryMarkers(recoveryCtx, opts.runDir);
+        if (!hydrate.ok) {
+          console.log(
+            `[pipeline] #${issueNumber}: skipping terminal ci/fail event — ${hydrate.reason}`,
           );
-          recoveryCtx.ciTerminalFailRecordedShas = ciRecoveryShaSetAdd(
+        } else {
+          const alreadyTerminal = ciRecoveryShaSetHas(
             recoveryCtx.ciTerminalFailRecordedShas,
             failHead,
           );
-          // Durable so restarts (and no-pollingCtx callers) skip a second fail row.
-          persistCtxCiMarkers(recoveryCtx, opts.runDir);
+          if (!alreadyTerminal) {
+            const prevTerminal = recoveryCtx.ciTerminalFailRecordedShas;
+            recoveryCtx.ciTerminalFailRecordedShas = ciRecoveryShaSetAdd(
+              recoveryCtx.ciTerminalFailRecordedShas,
+              failHead,
+            );
+            const claim = persistCtxCiMarkers(recoveryCtx, opts.runDir);
+            if (!claim.ok) {
+              recoveryCtx.ciTerminalFailRecordedShas = prevTerminal;
+              console.log(
+                `[pipeline] #${issueNumber}: skipping terminal ci/fail event — durable claim failed: ${claim.reason}`,
+              );
+            } else {
+              await recordPreMergeGateResult(
+                { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+                "ci",
+                "fail",
+                recoveryOut.reason ?? "CI failed",
+              );
+            }
+          }
         }
         if (opts.pollingCtx) opts.pollingCtx.ciWaitingGateRecorded = false;
       } else if (recoveryOut.status === "waiting") {
@@ -4406,10 +4488,27 @@ async function handleDefinitiveCiFailure(
   // When pollingCtx is omitted, ephemeral ctx still hydrates from runDir so
   // durable budgets and terminal-fail markers survive process restart (#771 r2).
   const ctx: PreMergePollingContext = opts.pollingCtx ?? {};
-  hydrateCiRecoveryMarkers(ctx, opts.runDir);
-
   /** Set when a recovery side-effect could not be paired with durable markers. */
   let durablePersistFailure: string | undefined;
+  const hydrate = hydrateCiRecoveryMarkers(ctx, opts.runDir);
+  if (!hydrate.ok) {
+    // Corrupt/unreadable marker store: fail closed — do not treat as empty budget
+    // that would re-open already-consumed recovery classes (#771 r2).
+    durablePersistFailure = hydrate.reason;
+    ctx.ciRebaseAttemptedShas = ciRecoveryShaSetAdd(ctx.ciRebaseAttemptedShas, headSha);
+    ctx.ciRerunAttemptedShas = ciRecoveryShaSetAdd(ctx.ciRerunAttemptedShas, headSha);
+    ctx.ciArchiveFailRecoveryAttemptedShas = ciRecoveryShaSetAdd(
+      ctx.ciArchiveFailRecoveryAttemptedShas,
+      headSha,
+    );
+    ctx.ciAssertionFixAttemptedShas = ciRecoveryShaSetAdd(
+      ctx.ciAssertionFixAttemptedShas,
+      headSha,
+    );
+    console.log(
+      `[pipeline] #${issueNumber}: CI recovery markers unusable — ${hydrate.reason}; escalating without recovery side-effects`,
+    );
+  }
 
   // 1. One-shot rebase — durable per head SHA (#771), not worktree-only.
   // Authorization is durable-only: an unkeyed worktree marker left by H1 must not
