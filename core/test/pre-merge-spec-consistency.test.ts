@@ -379,6 +379,72 @@ test("maybeArchiveOpenspec: pre-existing dirty openspec/ file → blocked (rollb
   );
 });
 
+// Pipeline-internal marker-only dirt must NOT park archive (#597 dogfood).
+// Salvage already treats `.pipeline-rebase-attempted` as clean; archive must match.
+test("maybeArchiveOpenspec: marker-only dirty (.pipeline-rebase-attempted) → proceeds, cleans marker", async () => {
+  const archiveCalls: string[] = [];
+  const blocked: Array<{ reason: string; kind: string }> = [];
+  const cleanCalls: string[][] = [];
+  let statusCalls = 0;
+
+  const fakeGit = (async (_wt: string, args: string[]) => {
+    if (args[0] === "status") {
+      statusCalls += 1;
+      // First pre-archive status: marker only. Later checks (post-sync etc.) clean.
+      if (statusCalls === 1) {
+        return { stdout: "?? .pipeline-rebase-attempted", stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "clean") {
+      cleanCalls.push([...args]);
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "rev-parse") return { stdout: "abc123", stderr: "", code: 0 };
+    if (args[0] === "fetch") return { stdout: "", stderr: "", code: 0 };
+    if (args[0] === "merge-base") return { stdout: "abc123", stderr: "", code: 0 };
+    if (args[0] === "diff" && args.includes("--name-only")) {
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    // Branch tip equality for archive-base sync.
+    if (args[0] === "rev-list" || args[0] === "log") {
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    return { stdout: "", stderr: "", code: 0 };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: fakeGit,
+    changeDirExists: () => false,
+    listChangeDirs: () => [],
+    listPrHeadChangeDirs: (async () => []) as AdvancePreMergeDeps["listPrHeadChangeDirs"],
+    branchDeveloperCommits: async () => [],
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async (_c, _n, reason: string, _stage: string, kind: string) => {
+      blocked.push({ reason, kind });
+    }) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async (_w: string, id: string) => {
+      archiveCalls.push(id);
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
+
+  assert.equal(blocked.length, 0, `must not block on marker-only dirt; got: ${JSON.stringify(blocked)}`);
+  assert.ok(
+    out === null || (out && out.advanced !== false) || (out && out.status !== "blocked"),
+    `expected non-blocked outcome; got: ${JSON.stringify(out)}`,
+  );
+  assert.ok(
+    cleanCalls.some((a) => a.includes(".pipeline-rebase-attempted")),
+    "must unlink/clean the engine marker before continuing",
+  );
+});
+
 // Regression (#255 review): a porcelain rename/copy record has a destination outside
 // openspec/ (`R  openspec/a -> core/a`) that first-path prefix matching misses; the
 // conservative guard blocks on any non-empty status, so it is covered.
