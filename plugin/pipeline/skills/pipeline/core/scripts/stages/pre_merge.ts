@@ -1648,12 +1648,40 @@ export async function advance(
     }
 
     if (agg.failed.length > 0) {
+      // Re-read PR head after the check poll and before definitive-failure
+      // recovery. A concurrent developer push while getPrChecks was in flight
+      // must not bind recovery budget / force-push rebase to the pre-poll SHA
+      // (#771 review: stale head after polling).
+      const polledHeadSha = prDetail.head_sha;
+      let settledHeadSha: string;
+      try {
+        settledHeadSha = (await getPrDetailFn(cfg, prNumber)).head_sha;
+      } catch (err) {
+        const e = err as Error;
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: `PR head re-read failed after checks: ${e.message}`,
+        };
+      }
+      if (settledHeadSha !== polledHeadSha) {
+        console.log(
+          `[pipeline] #${issueNumber}: PR head advanced during CI poll ` +
+            `(${polledHeadSha.slice(0, 7)} → ${settledHeadSha.slice(0, 7)}); re-evaluating without recovery`,
+        );
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: "PR head advanced; waiting for checks",
+        };
+      }
+
       // Full CheckRun objects (with link/description) for classification + URLs.
       const failedChecks = checks.filter((c) => {
         const b = (c.bucket ?? "").toLowerCase();
         return b === "fail" || b === "cancel";
       });
-      const recoveryOut = await handleDefinitiveCiFailure(cfg, issueNumber, prNumber, prDetail.head_sha, failedChecks, opts, {
+      const recoveryOut = await handleDefinitiveCiFailure(cfg, issueNumber, prNumber, settledHeadSha, failedChecks, opts, {
         getForIssueFn,
         getPrDetailFn,
         setBlockedFn,
@@ -1674,7 +1702,7 @@ export async function advance(
       // false `rebased; CI re-running` is prevented by the ladder itself: pure
       // re-polls of an unchanged red head escalate rather than re-wait.
       if (recoveryOut.status === "blocked") {
-        const failHead = prDetail.head_sha;
+        const failHead = settledHeadSha;
         const alreadyTerminal =
           opts.pollingCtx?.ciTerminalFailRecordedForSha === failHead;
         if (!alreadyTerminal) {

@@ -960,6 +960,52 @@ test("#771 1.9 persist failure → ci-exhausted; no rebase side-effect thrash", 
   }
 });
 
+test("#771 concurrent head change during CI poll → wait re-eval; no recovery on stale SHA", async (t) => {
+  await withRunDir(async (runDir) => {
+    let head = SHA_HEAD;
+    let rebaseCalls = 0;
+    let reruns = 0;
+    const { deps, rec } = baseDeps({
+      getPrDetail: (async () => ({
+        head_sha: head,
+        mergeable: true,
+        mergeable_state: "CLEAN",
+      })) as AdvancePreMergeDeps["getPrDetail"],
+      getPrChecks: async () => {
+        // Simulate a concurrent developer push while getPrChecks is in flight:
+        // checks return red for the pre-poll tip, then head moves before recovery.
+        const checks = [{ name: "test", bucket: "fail", link: RUN_URL } as CheckRun];
+        head = SHA_H2;
+        return checks;
+      },
+      rebaseAlreadyAttempted: () => false,
+      tryRebaseAndPush: async () => {
+        rebaseCalls++;
+        return true;
+      },
+      rerunFailedWorkflows: async () => {
+        reruns++;
+        return { attempted: true, runIds: ["1"] };
+      },
+    });
+    const pollingCtx: PreMergePollingContext = {};
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { pollingCtx, runDir }, deps);
+    });
+    assert.equal(out!.status, "waiting");
+    assert.match(out!.reason ?? "", /head advanced|waiting for checks/i);
+    assert.equal(rebaseCalls, 0, "must not tryRebaseAndPush against a post-poll concurrent head");
+    assert.equal(reruns, 0, "must not re-run workflows for the stale polled SHA");
+    assert.equal(rec.blocked.length, 0);
+    assert.equal(
+      pollingCtx.ciRebaseAttemptedForSha,
+      undefined,
+      "must not consume rebase budget for the pre-poll SHA when head moved",
+    );
+  });
+});
+
 test("#771 1.10 external head advance during failed rebase → wait re-eval; no thrash for old SHA", async (t) => {
   await withRunDir(async (runDir) => {
     let head = SHA_HEAD;

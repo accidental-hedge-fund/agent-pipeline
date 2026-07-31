@@ -97,7 +97,7 @@ When the gate escalates from settled CI failure (budget exhausted), it SHALL rec
 
 ### Requirement: Settled-check aggregate SHALL be pending-first for the current PR head
 
-The pre-merge CI gate SHALL evaluate settlement using the checks returned for the PR at poll time against the **current** PR head SHA from `getPrDetail`. Any pending check (bucket not `pass`/`skipping`/`fail`/`cancel`) SHALL take precedence over failure: the gate SHALL return `waiting` and SHALL NOT enter definitive-failure recovery or `ci-exhausted` while pending remains. Neutral/skipped (`skipping`) checks SHALL NOT count as failure or pending.
+The pre-merge CI gate SHALL evaluate settlement using the checks returned for the PR at poll time against the **current** PR head SHA from `getPrDetail`. Any pending check (bucket not `pass`/`skipping`/`fail`/`cancel`) SHALL take precedence over failure: the gate SHALL return `waiting` and SHALL NOT enter definitive-failure recovery or `ci-exhausted` while pending remains. Neutral/skipped (`skipping`) checks SHALL NOT count as failure or pending. Immediately after a settled-failure check poll and before entering definitive-failure recovery, the gate SHALL re-read `getPrDetail`; if the head SHA differs from the SHA observed when the poll began, the gate SHALL return `waiting` without recovery side-effects so the next tick re-evaluates the new head.
 
 #### Scenario: Red plus pending waits without recovery
 
@@ -105,6 +105,15 @@ The pre-merge CI gate SHALL evaluate settlement using the checks returned for th
 - **THEN** the gate SHALL return `{ status: "waiting" }`
 - **AND** SHALL NOT call `tryRebaseAndPush` or other definitive-failure recovery side-effects on that tick
 - **AND** SHALL NOT call `setBlocked` with kind `ci-exhausted`
+
+#### Scenario: Concurrent head change during check poll skips recovery
+
+- **WHEN** `getPrChecks` returns settled failure for the head SHA observed when the poll began (`H1`)
+- **AND** a re-read of `getPrDetail` immediately after that poll reports a distinct head SHA `H2`
+- **THEN** the gate SHALL return `{ status: "waiting" }` (re-evaluation / head-advanced wait)
+- **AND** SHALL NOT call `tryRebaseAndPush` or other definitive-failure recovery side-effects on that tick
+- **AND** SHALL NOT consume per-head recovery budget markers for `H1` on that tick
+- **AND** SHALL NOT call `setBlocked` with kind `ci-exhausted` on that tick
 
 ### Requirement: CI recovery persistence failure SHALL fail closed
 
