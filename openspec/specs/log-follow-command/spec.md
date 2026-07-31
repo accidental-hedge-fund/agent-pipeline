@@ -111,6 +111,32 @@ reserve / do-not-reserve with no real filesystem, process-signal, or subprocess 
   report the command run-mutating (reservation required)
 - **AND** it SHALL make that decision with no real filesystem, process-signal, or subprocess call
 
+### Requirement: Optional material-only events follow SHALL reuse the shared material filter when implemented
+
+When a material-only events follow path is implemented (for example `pipeline logs <run-id> --events --follow --material`, and optionally the same flag on `pipeline loop logs … --events --follow`), the CLI SHALL apply the same shared material-filter rules used by host skill packaging (advance and loop material kinds and spam suppression) and SHALL remain read-only without holding a run-liveness lock. When the flag is absent, existing unfiltered `--events` behavior SHALL remain unchanged. A skill-side material filter script alone is sufficient for the host-neutral progress-notify capability; this engine flag is optional UX sugar.
+
+#### Scenario: Unfiltered events follow remains default
+
+- **WHEN** `pipeline logs <run-id> --events --follow` is invoked without a
+  material-only flag
+- **THEN** the command SHALL continue to stream full `events.jsonl` lines as
+  today
+- **AND** SHALL NOT silently drop non-material kinds
+
+#### Scenario: Material flag uses shared filter rules when present
+
+- **WHEN** a material-only events follow flag is implemented and invoked
+- **THEN** stdout SHALL include only lines selected by the shared material
+  filter rules
+- **AND** the run store `events.jsonl` file SHALL remain complete and unmodified
+
+#### Scenario: Material follow stays read-only
+
+- **WHEN** material-only events follow is running
+- **THEN** the command SHALL NOT create or hold a `pipeline-*.lock` run-liveness
+  reservation
+- **AND** SHALL remain classified as a read-only observation command
+
 ### Requirement: pipeline logs --events --follow SHALL exit on run_complete by default
 
 When `pipeline logs <run-id> --events --follow` is used, until-terminal mode SHALL be the default: the command SHALL exit successfully (exit code 0) after it has read and printed a complete JSONL line whose advance event type is `run_complete`. Until-terminal detection SHALL apply to lines already present when follow starts as well as lines appended later. An explicit `--no-until-terminal` flag SHALL restore interrupt-only behavior: with that flag, follow SHALL remain open until interrupted (SIGINT/SIGTERM) or the follow cannot be established, and SHALL NOT exit solely because a `run_complete` event was observed. An explicit `--until-terminal` flag MAY be accepted as affirming the default. Without `--follow`, until-terminal flags SHALL be ignored for dump/list modes.

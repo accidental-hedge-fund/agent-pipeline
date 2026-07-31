@@ -536,12 +536,16 @@ function stageInto(stagingDir, host) {
     const src = join(REPO_ROOT, "core", entry);
     if (existsSync(src)) cpSync(src, join(coreDst, entry), { recursive: true });
   }
-  // Launcher shim.
+  // Launcher shim + material-filter install surface (#742).
   const scriptsDst = join(stagingDir, "scripts");
   mkdirSync(scriptsDst, { recursive: true });
   const shimPath = join(scriptsDst, "pipeline.mjs");
   writeFileSync(shimPath, renderShim(cfg.profile));
   chmodSync(shimPath, 0o755);
+  // Host skill docs pipe events through this path (not core/scripts/*.ts).
+  const materialFilterPath = join(scriptsDst, "material-filter.mjs");
+  cpSync(join(REPO_ROOT, "hosts", "_shared", "material-filter.mjs"), materialFilterPath);
+  chmodSync(materialFilterPath, 0o755);
   // Sentinel: written into staging so it lands atomically with the skill tree.
   // Future runs use this to distinguish an installer-managed dir from a personal one.
   writeFileSync(join(stagingDir, MANAGED_MARKER), "");
