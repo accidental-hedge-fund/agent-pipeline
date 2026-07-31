@@ -586,7 +586,12 @@ function formatFindingDispositionLabel(f: ReviewFinding): string {
 export function formatPartitionDispositionReason(args: {
   residual: ReviewFinding[];
   autoFixable: ReviewFinding[];
-  /** True when the harness was invoked (or would have been after attempt marker). */
+  /**
+   * True when an auto-fix attempt is recognized for the entry: a new attempt
+   * marker was posted this turn, or a prior prefix commit / durable
+   * attempt|noop marker already exhausts the bound. Not only "harness invoked
+   * this turn" — exhausted priors must not read as unattempted (#747).
+   */
   attempted: boolean;
   diagnostic?: string;
 }): string {
@@ -2621,8 +2626,16 @@ export async function enforceReviewShaGate(
       let autoFixDiagnostic: string | undefined;
       let autoFixBlockReason: string | undefined;
       const categoryPartition = partitionBlockingForAutofix(partition.blocking);
-      // Track attempt + partition for operator-facing disposition naming (#747).
-      let autoFixAttempted = false;
+      // Operator-facing disposition (#747): residual labels track the final
+      // blocking set used for setBlocked; autoFixable labels retain the initial
+      // allowlisted subset when an attempt was recognized (original auto-fix scope).
+      let dispositionResidual = categoryPartition.residual;
+      let dispositionAutoFixable = categoryPartition.autoFixable;
+      // True when a prior prefix commit / durable attempt|noop marker was found
+      // or this invocation posted a new attempt marker — distinct from "this
+      // turn invoked the harness", so exhausted priors are not reported as
+      // unattempted (review finding 5f4a751f).
+      let autoFixAttemptRecognized = false;
       // Observability (#682): needs-attention with blocking count for the loop mirror.
       await recordPreMergeGateResult(
         { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
@@ -2667,6 +2680,7 @@ export async function enforceReviewShaGate(
           // marker cannot be read (crash-safe at-most-one requirement).
           priorAutoFix = true;
         }
+        if (priorAutoFix) autoFixAttemptRecognized = true;
 
         if (!priorAutoFix) {
           await recordPreMergeGateResult(
@@ -2722,7 +2736,7 @@ export async function enforceReviewShaGate(
                 categoryPartition.autoFixable, detail.title, blockingOnlyBody,
               )
             : null;
-          if (attemptMarkerPosted) autoFixAttempted = true;
+          if (attemptMarkerPosted) autoFixAttemptRecognized = true;
           // fix-committed → re-review at new head; noop-clean → re-verify at
           // unchanged head (#698). Both share the single re-review path; neither
           // counts as a second auto-fix attempt.
@@ -3035,6 +3049,18 @@ export async function enforceReviewShaGate(
               return null;
             }
             // Re-review still blocks or returned unparseable output.
+            // Partition the *final* blocking set for residual-human labels so
+            // operators see the findings that still block after re-delta, not
+            // only the initial partition (review finding 3d396927 / #747).
+            // Keep the initial allowlisted subset for "auto-fix attempted" scope.
+            if (rePartition.blocking.length > 0 && !reIsUnparseable) {
+              const finalCategoryPartition = partitionBlockingForAutofix(
+                rePartition.blocking,
+              );
+              dispositionResidual = finalCategoryPartition.residual;
+              // Attempt scope stays the original allowlisted subset when recognized.
+              dispositionAutoFixable = categoryPartition.autoFixable;
+            }
             if (wasNoopClean && rePartition.blocking.length > 0 && !reIsUnparseable) {
               autoFixBlockReason = formatNoopStillBrokenReason(
                 rePartition.blocking,
@@ -3095,14 +3121,16 @@ export async function enforceReviewShaGate(
       // Prefer partition disposition naming when residual or a mixed batch was
       // involved (#747); pure allowlisted exhausted paths keep the simpler
       // diagnostic-appended message (or noop still-broken recipe).
+      // Residual labels come from the final disposition partition (post re-delta
+      // when an attempt ran); auto-fixable labels report attempt scope.
       const blockReason =
         autoFixBlockReason ??
-        (categoryPartition.residual.length > 0 ||
-        (categoryPartition.autoFixable.length > 0 && autoFixAttempted)
+        (dispositionResidual.length > 0 ||
+        (dispositionAutoFixable.length > 0 && autoFixAttemptRecognized)
           ? formatPartitionDispositionReason({
-              residual: categoryPartition.residual,
-              autoFixable: categoryPartition.autoFixable,
-              attempted: autoFixAttempted,
+              residual: dispositionResidual,
+              autoFixable: dispositionAutoFixable,
+              attempted: autoFixAttemptRecognized,
               diagnostic: autoFixDiagnostic,
             })
           : autoFixDiagnostic

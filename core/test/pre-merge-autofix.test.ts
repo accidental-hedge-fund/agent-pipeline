@@ -35,6 +35,7 @@ import {
   citedRegionContent,
   extractClassificationTokens,
   extractKnownPipelineClassificationTokens,
+  findingKey,
   HEAD_ALREADY_IMPLEMENTS_RECOMMENDATION,
   headImplementsRecommendedClassification,
   isClassificationOrControlFlowClaim,
@@ -836,6 +837,103 @@ test("pre-merge auto-fix #747: pure residual-only (spec-divergence) skips harnes
   assert.match(rec.blocked[0].reason, /no auto-fix attempt/);
   assert.match(rec.blocked[0].reason, /spec-divergence/);
   assert.doesNotMatch(rec.blocked[0].reason, /Auto-fix attempted/);
+});
+
+// ---------------------------------------------------------------------------
+// #747 review 1: disposition accounting (exhausted prior + final residual labels)
+// ---------------------------------------------------------------------------
+
+test("pre-merge auto-fix #747: mixed + prior attempt marker reports exhaustion, not no-attempt (5f4a751f)", async (t) => {
+  // Bite: without autoFixAttemptRecognized, prior marker suppression left
+  // attempted=false so residual text said "no auto-fix attempt".
+  const concurrency = blockingFinding("concurrency", "TOCTOU still races");
+  const specDiv = blockingFinding("spec-divergence", "Partial list still unwired");
+  const { deps, rec } = makeDeps({
+    findings: [concurrency, specDiv],
+    reReviewFindings: [specDiv],
+    autoFixResult: "fix-committed",
+    priorAttemptMarker: true,
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(rec.autoFixCalls, 0, "prior durable marker exhausts the one-attempt bound");
+  assert.equal(rec.deltaReviewCalls, 1, "no post-fix re-delta when harness is skipped");
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0].reason, /Human disposition required for residual non-allowlisted:/);
+  assert.match(rec.blocked[0].reason, /spec-divergence/);
+  assert.match(rec.blocked[0].reason, /Auto-fix attempted for allowlisted:/);
+  assert.match(rec.blocked[0].reason, /concurrency/);
+  assert.doesNotMatch(
+    rec.blocked[0].reason,
+    /no auto-fix attempt/,
+    "exhausted prior must not be mislabeled as unattempted",
+  );
+});
+
+test("pre-merge auto-fix #747: mixed + prior auto-fix commit reports exhaustion, not no-attempt (5f4a751f)", async (t) => {
+  const concurrency = blockingFinding("concurrency", "Lock ownership still races");
+  const security = blockingFinding("security", "Auth gap remains");
+  const { deps, rec } = makeDeps({
+    findings: [concurrency, security],
+    reReviewFindings: [security],
+    autoFixResult: "fix-committed",
+    priorAutoFixCommit: true,
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(rec.autoFixCalls, 0);
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0].reason, /security/);
+  assert.match(rec.blocked[0].reason, /Auto-fix attempted for allowlisted/);
+  assert.doesNotMatch(rec.blocked[0].reason, /no auto-fix attempt/);
+});
+
+test("pre-merge auto-fix #747: post-fix re-delta residual labels final blocking findings (3d396927)", async (t) => {
+  // Bite: categoryPartition retained from the initial delta meant the block
+  // reason named the original residual key even when re-delta returned a
+  // different residual finding that actually still blocks.
+  const concurrency = blockingFinding("concurrency", "TOCTOU on shared marker");
+  const originalResidual = blockingFinding("spec-divergence", "Original partial-list wiring");
+  const differentResidual = reRaisedBlockingFinding(
+    blockingFinding("spec-divergence", "Different residual after auto-fix"),
+  );
+  // Distinct finding keys: different titles without file/line → different findingKey.
+  assert.notEqual(
+    originalResidual.title,
+    differentResidual.title,
+    "fixture requires distinct residual titles so keys differ",
+  );
+  const { deps, rec } = makeDeps({
+    findings: [concurrency, originalResidual],
+    reReviewFindings: [differentResidual],
+    autoFixResult: "fix-committed",
+  });
+  await quiet(t, async () => {
+    await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(rec.autoFixCalls, 1);
+  assert.equal(rec.deltaReviewCalls, 2);
+  assert.equal(rec.blocked.length, 1);
+  assert.match(rec.blocked[0].reason, /spec-divergence/);
+  // Disposition labels are `findingKey (category)` — assert the final residual
+  // key is present and the initial residual key is not retained after re-delta.
+  const finalKey = findingKey(differentResidual);
+  const originalKey = findingKey(originalResidual);
+  assert.notEqual(finalKey, originalKey, "fixture keys must differ");
+  assert.match(
+    rec.blocked[0].reason,
+    new RegExp(finalKey),
+    "block reason must name the final residual finding key, not only the initial partition",
+  );
+  assert.doesNotMatch(
+    rec.blocked[0].reason,
+    new RegExp(originalKey),
+    "stale initial residual key must not appear after re-delta replaced it",
+  );
+  assert.match(rec.blocked[0].reason, /Auto-fix attempted for allowlisted/);
+  assert.match(rec.blocked[0].reason, /concurrency/);
 });
 
 test("pre-merge auto-fix #747: after partition attempt, residual still blocking → no second attempt", async (t) => {
