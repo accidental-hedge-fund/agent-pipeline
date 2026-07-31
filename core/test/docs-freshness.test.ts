@@ -15,6 +15,7 @@ import {
   enforceDocsFreshness,
   extractStalePaths,
   scriptInvokesDocsGenerator,
+  scriptIsConditionalDocsCiEntry,
   scriptIsDocsFreshnessCheck,
   type DocsFreshnessDeps,
 } from "../scripts/docs-freshness.ts";
@@ -399,6 +400,25 @@ test("ciScriptReachesDocsFreshness: false when ci has no docs step", () => {
       ci: "npm run ci:core && node scripts/build.mjs --check",
       "ci:core": "npm test",
     }),
+    false,
+  );
+});
+
+test("ciScriptReachesDocsFreshness: conditional ci:docs entry counts (#756)", () => {
+  assert.equal(
+    ciScriptReachesDocsFreshness({
+      ci: "npm run ci:core && npm run ci:docs",
+      "ci:core": "npm test",
+      "ci:docs": "node scripts/ci-docs.mjs",
+    }),
+    true,
+  );
+  assert.equal(
+    scriptIsConditionalDocsCiEntry("node scripts/ci-docs.mjs"),
+    true,
+  );
+  assert.equal(
+    scriptIsConditionalDocsCiEntry("node scripts/build.mjs --check"),
     false,
   );
 });
@@ -935,31 +955,30 @@ test("implementing prompt: docsEnabled without generator keeps hand-maintained d
 // Repo structural drift-guard (conditional on generator presence)
 // ---------------------------------------------------------------------------
 
-test("repo drift-guard: when generate-docs.mjs is present, package.json ci reaches docs freshness", () => {
-  const genPath = path.join(REPO_ROOT, "scripts", "generate-docs.mjs");
+test("repo drift-guard: package.json ci always reaches conditional docs entry (#756)", () => {
   const pkgPath = path.join(REPO_ROOT, "package.json");
   const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as {
     scripts?: Record<string, string>;
   };
   const scripts = pkg.scripts ?? {};
 
-  if (!fs.existsSync(genPath)) {
-    // Generator not on this branch yet (#597 may land later) — guard is inert.
-    // Still prove the pure walker would fail a mis-wired ci if generator existed.
-    assert.equal(
-      ciScriptReachesDocsFreshness({
-        ci: "npm run ci:core && node scripts/build.mjs --check",
-        "ci:core": "npm test",
-      }),
-      false,
-      "mis-wired ci without docs step must not report freshness",
-    );
-    return;
-  }
-
   assert.ok(
     ciScriptReachesDocsFreshness(scripts),
-    `package.json 'ci' must transitively reach docs:check / generate-docs --check when ` +
-      `scripts/generate-docs.mjs is present; got ci=${scripts.ci}`,
+    `package.json 'ci' must reach ci:docs / generate-docs --check; got ci=${scripts.ci}`,
+  );
+  assert.ok(
+    typeof scripts["ci:docs"] === "string" &&
+      scriptIsConditionalDocsCiEntry(scripts["ci:docs"]),
+    "package.json must define ci:docs → scripts/ci-docs.mjs",
+  );
+
+  // Mis-wired chain without docs entry must not report freshness.
+  assert.equal(
+    ciScriptReachesDocsFreshness({
+      ci: "npm run ci:core && node scripts/build.mjs --check",
+      "ci:core": "npm test",
+    }),
+    false,
+    "mis-wired ci without docs step must not report freshness",
   );
 });
