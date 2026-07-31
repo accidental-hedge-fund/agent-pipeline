@@ -563,7 +563,13 @@ export interface LoopStopRecord {
      *  eligible to start, and at least one non-terminal item remains gated on a pending or
      *  unsatisfiable dependency — reported instead of spinning into `supervisor_no_progress`
      *  (capability `durable-run-dependency-integrity`, see loop/dependencies.ts). */
-    | "dependency_deadlock";
+    | "dependency_deadlock"
+    /**
+     * Residual worktree capacity is full of true-active (non-parked) managed
+     * worktrees (#718). Admission stops without cascading per-item product
+     * needs-human holds on every remaining pending item.
+     */
+    | "worktree_capacity";
   time: string;
   item_id?: string;
   theme?: string;

@@ -296,6 +296,20 @@ The number is auto-detected as an issue or PR. PRs resolve to their linked closi
 
 `/pipeline:cleanup` takes no number: it sweeps pipeline-managed worktrees under `worktree_root` whose PR is already merged, removing the worktree and its local branch. It only touches `pipeline/<N>-<slug>` worktrees, never the remote branch, and skips (reporting the reason) any worktree with uncommitted changes or a local HEAD that differs from the merged PR's commit. It is idempotent — a second run finds nothing to do.
 
+### Worktree capacity and park-release (#718)
+
+`max_concurrent_worktrees` (default **5** in config) limits how many **on-disk managed** pipeline worktrees may exist at once for open issues that are not `pipeline:ready-to-deploy`. Capacity is counted from live git worktree discovery under the managed root(s) — not from ledger state alone.
+
+**What counts:** each active managed worktree for a different open, non-ready-to-deploy issue. The issue being created does not count against itself (same-issue reclaim runs before the capacity check).
+
+**Park-release (Policy A):** when an issue durable-parks (blocked / needs-human hold, no further harness work in that worktree), the pipeline attempts to **release** its managed worktree so capacity frees for other schedulable items. Release succeeds only when every safety precondition holds: path under a managed root, clean working tree, no definitive local-only (unpushed) commits, and the branch tip is on the remote **or** an open PR exists for that head. On success the worktree is removed from disk and deregistered; the remote branch and open PR are **not** deleted. On resume / re-advance, `createWorktree` recreates the worktree (preferring an existing remote tip when present).
+
+**Retain (fail-closed):** dirty workdirs, unpushed commits, unverifiable local-only state, or missing remote/PR recoverability keep the worktree. The retain reason is logged. Free a retained tree only when it is safe (`git push` then re-park, or `$pipeline N --remove-worktree` / `--force` with care).
+
+**Capacity vs product needs-human:** a pure capacity refusal is an **ops/admission** disposition (`worktree-capacity` blocker kind / durable `capacity_wait` outcome). It is **not** a product-judgment needs-human hold that asks for finding overrides. The durable loop stops admitting new starts with a `worktree_capacity` reason rather than cascading every remaining pending item into a product blocked human hold.
+
+**Cleanup limits:** `pipeline:cleanup` is **merge-only** — it does not free worktrees for open blocked PRs. Use park-release (automatic when safe), manual safe remove, or wait for active work to complete.
+
 ## Intake sub-command
 
 `pipeline intake` is a no-issue-number front-door command that turns a rough one-line description into a decision-complete GitHub issue **and** proposes a matching `ROADMAP.md` update — all in one shot.
@@ -787,6 +801,13 @@ genuine reason, `--new-run` mints a fresh, deterministic, re-resumable run for t
 selector, recording a `supersedes`/`superseded_by` pointer pair so the retired run's
 ledger and audit trail stay intact — no hand-moving durable state. It is refused
 (zero writes) unless the canonical run is actually terminally stopped.
+
+**Worktree capacity admission (#718).** Durable park of an item releases a *safe*
+managed worktree (clean + remote tip or open PR) so other dependency-ready items can
+start without hitting a permanent capacity wall. Pure capacity failures are ops
+admission (`capacity_wait` / `worktree_capacity` stop) — not product needs-human
+cascades. See [Worktree capacity and park-release](#worktree-capacity-and-park-release-718)
+above for what counts, release vs retain, and merge-only cleanup limits.
 
 **Native-`/goal` detection (#506).** `/goal` is an interactive slash command, not a CLI
 flag — it never appears in `<engine> --help`, so absence of a marker there is not

@@ -389,6 +389,7 @@ test("blockerKindToInterventionKind: specific mappings are stable", () => {
   assert.equal(blockerKindToInterventionKind("merge-conflict"), "merge-conflict-or-branch-drift");
   assert.equal(blockerKindToInterventionKind("worktree-missing"), "auth-tooling-preflight-failure");
   assert.equal(blockerKindToInterventionKind("worktree-creation-failed"), "auth-tooling-preflight-failure");
+  assert.equal(blockerKindToInterventionKind("worktree-capacity"), "auth-tooling-preflight-failure");
   assert.equal(blockerKindToInterventionKind("worktree-setup-failed"), "auth-tooling-preflight-failure");
   assert.equal(blockerKindToInterventionKind("harness-failure"), "reviewer-unavailable");
   assert.equal(blockerKindToInterventionKind("needs-human"), "product-judgment-required");

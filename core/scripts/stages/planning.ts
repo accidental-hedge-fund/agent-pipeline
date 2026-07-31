@@ -42,6 +42,7 @@ import {
   getOnDiskForIssue,
   gitInWorktree,
   hasCommitsAhead,
+  isWorktreeCapacityError,
   removeWorktree,
   slugify,
 } from "../worktree.ts";
@@ -172,7 +173,11 @@ export interface BootstrapWorktreeDeps {
 
 export type BootstrapResult =
   | { ok: true; wt: { path: string; branch: string }; setupCommand?: string }
-  | { ok: false; reason: string; tag: "worktree-creation-failed" | "worktree-setup-failed" };
+  | {
+      ok: false;
+      reason: string;
+      tag: "worktree-creation-failed" | "worktree-setup-failed" | "worktree-capacity";
+    };
 
 /**
  * Create a worktree and run the dependency install step. On install failure,
@@ -198,6 +203,11 @@ export async function bootstrapWorktree(
     wt = await cwFn(cfg, issueNumber, slug);
     console.log(`[pipeline] #${issueNumber}: worktree at ${wt.path}`);
   } catch (err) {
+    // Pure capacity is a distinct ops admission disposition (#718), not a
+    // generic create failure / product needs-human recipe.
+    if (isWorktreeCapacityError(err)) {
+      return { ok: false, reason: (err as Error).message, tag: "worktree-capacity" };
+    }
     return { ok: false, reason: (err as Error).message, tag: "worktree-creation-failed" };
   }
 
@@ -532,12 +542,20 @@ export async function runPlanningPhases(
   const slug = slugify(title) || `issue-${issueNumber}`;
   const bootstrap = await bootstrapWorktree(cfg, issueNumber, slug, deps);
   if (!bootstrap.ok) {
-    const bootstrapMsg = bootstrap.tag === "worktree-creation-failed"
-      ? `Worktree creation failed: ${bootstrap.reason}`
-      : `Worktree setup failed: ${bootstrap.reason}`;
+    const bootstrapMsg =
+      bootstrap.tag === "worktree-capacity"
+        ? `Worktree capacity full: ${bootstrap.reason}`
+        : bootstrap.tag === "worktree-creation-failed"
+          ? `Worktree creation failed: ${bootstrap.reason}`
+          : `Worktree setup failed: ${bootstrap.reason}`;
     await doSetBlocked(cfg, issueNumber, bootstrapMsg, "planning", bootstrap.tag);
     await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked");
-    return { advanced: false, status: "blocked", reason: bootstrap.reason };
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: bootstrap.reason,
+      blockerKind: bootstrap.tag,
+    };
   }
   wt = bootstrap.wt;
   activeLifecycle.headBefore = await currentHead(wt.path, doGitInWorktree);

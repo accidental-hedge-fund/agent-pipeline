@@ -49,6 +49,11 @@ export interface LoopExecutionRequest {
 export const LOOP_TERMINAL_OUTCOMES = [
   "ready_to_deploy",
   "blocked_needs_human",
+  /**
+   * Ops admission wait: pure worktree capacity (#718). Distinct from product
+   * needs-human so the durable supervisor does not cascade human answer holds.
+   */
+  "capacity_wait",
   "failed",
   "abandoned",
 ] as const;

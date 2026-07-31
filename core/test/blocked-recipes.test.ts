@@ -106,6 +106,15 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "file is present, remove it: `rm -f .git/config.lock`. Delete the dangling " +
     "branch: `git branch -D pipeline/7-<slug>`. Remove the `blocked` label, " +
     "then re-run `$pipeline 7`.",
+  "worktree-capacity":
+    "Worktree capacity is full (`max_concurrent_worktrees` other active managed " +
+    "worktrees). This is an ops/admission wait, not a product decision. Wait for " +
+    "an active issue to complete (or for a durable park to release a clean parked " +
+    "worktree), then re-run `$pipeline 7`. If a parked issue still holds a " +
+    "worktree because it was dirty or unpushed, push or clean it and " +
+    "`$pipeline 7 --remove-worktree` when safe. `pipeline:cleanup` only sweeps " +
+    "merged-PR worktrees and does not free open blocked PRs. Remove the `blocked` " +
+    "label before re-running if it is still present.",
   "pr-creation-failed":
     "Opening the pull request failed (see the error above). Check GitHub " +
     "permissions and rate limits, remove the `blocked` label, then " +
@@ -457,6 +466,16 @@ test("worktree-setup-failed directs to fix root cause or opt out via setup_comma
 // worktree-creation-failed: recipe must include the four .git/config.lock
 // cleanup steps introduced in #183.
 // ---------------------------------------------------------------------------
+
+test("worktree-capacity is ops-oriented and not product needs-human (#718)", () => {
+  const body = comment("worktree-capacity");
+  assert.match(body, /capacity|max_concurrent_worktrees|ops\/admission/i);
+  assert.match(body, /Wait for an active issue|parked/i);
+  assert.doesNotMatch(body, /override.*finding-key|product decision is required/i);
+  assert.ok(BLOCKER_KINDS.includes("worktree-capacity"));
+  assert.ok(BLOCKER_RECIPES["worktree-capacity"].trim().length > 0);
+  assert.notEqual("worktree-capacity", "needs-human");
+});
 
 test("worktree-creation-failed directs to remove config lock, delete dangling branch, clear label, re-run", () => {
   const body = comment("worktree-creation-failed");

@@ -208,6 +208,7 @@ export function blockerKindToInterventionKind(kind: BlockerKind): HumanIntervent
       return "merge-conflict-or-branch-drift";
     case "worktree-missing":
     case "worktree-creation-failed":
+    case "worktree-capacity":
     case "worktree-setup-failed":
     case "pr-creation-failed":
     case "plan-gen-failed":

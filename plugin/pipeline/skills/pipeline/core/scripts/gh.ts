@@ -1037,6 +1037,8 @@ export function buildBlockedComment(args: {
   reason: string;
   kind: BlockerKind;
 }): string {
+  // Machine-readable kind marker so capacity admission can re-classify after a
+  // failed clearBlocked + re-dispatch without a fresh blocker_set event (#718).
   return [
     `## Pipeline: Blocked at ${String(args.stageStr).replace(/-/g, " ")}`,
     "",
@@ -1048,7 +1050,125 @@ export function buildBlockedComment(args: {
     "",
     "### How to unblock",
     renderRecipe(args.kind, args.issueNumber),
-  ].join("\n") + COMMENT_FOOTER;
+  ].join("\n") + COMMENT_FOOTER + `\n<!-- pipeline-blocker-kind: ${args.kind} -->`;
+}
+
+/**
+ * Read the latest trusted `<!-- pipeline-blocker-kind: … -->` from issue
+ * comments (most recent verified pipeline "## Pipeline: Blocked" body).
+ * Pure; used when advance events lack a `blocker_set` (early-blocked
+ * re-dispatch after capacity clear failure).
+ *
+ * Trust model (#718 review b5108544 / 69894186): only a comment that (1) is
+ * authored by the pipeline actor (`trustedAuthor`), (2) carries a verified
+ * `pipeline-attest` marker with kind `blocked`, and (3) belongs to the
+ * **current** `blocked`-label incarnation (`blockedLabeledAt` — the latest
+ * application time of the `blocked` label; comment `createdAt` must be at or
+ * after that timestamp) may authorize capacity reclassification /
+ * `clearBlocked`. An older authentic capacity marker left from a prior hold
+ * must not clear a later product/human hold whose blocker comment was lost.
+ * Missing `trustedAuthor`, missing `blockedLabeledAt`, or a comment without a
+ * usable `createdAt` fails closed (returns null → product needs-human).
+ */
+export function lastBlockerKindFromComments(
+  comments: readonly {
+    body: string;
+    author?: string | null;
+    createdAt?: string | null;
+  }[],
+  opts?: {
+    trustedAuthor?: string | null;
+    /** ISO timestamp of the latest `blocked` label application on the issue. */
+    blockedLabeledAt?: string | null;
+  },
+): string | null {
+  const trustedAuthor = opts?.trustedAuthor;
+  if (trustedAuthor == null || trustedAuthor === "") return null;
+
+  // Bind fallback to the current blocked-label incarnation (#718 69894186).
+  // Without this, a stale authentic capacity comment can clear a later hold.
+  const blockedLabeledAt = opts?.blockedLabeledAt;
+  if (blockedLabeledAt == null || blockedLabeledAt === "") return null;
+  const notBeforeMs = Date.parse(blockedLabeledAt);
+  if (!Number.isFinite(notBeforeMs)) return null;
+
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const c = comments[i];
+    if (!c) continue;
+    if (c.author !== trustedAuthor) continue;
+    const createdAt = c.createdAt;
+    if (createdAt == null || createdAt === "") continue;
+    const createdMs = Date.parse(createdAt);
+    if (!Number.isFinite(createdMs) || createdMs < notBeforeMs) continue;
+    const body = c.body ?? "";
+    if (!body.includes("## Pipeline: Blocked")) continue;
+    const attestation = extractPipelineAttestation(body);
+    if (attestation === null || attestation.kind !== "blocked") continue;
+    if (!isVerifiedPipelineAttestation(body)) continue;
+    const m = body.match(/<!--\s*pipeline-blocker-kind:\s*([a-z0-9-]+)\s*-->/i);
+    if (m?.[1]) return m[1];
+  }
+  return null;
+}
+
+/**
+ * ISO timestamp of the latest application of the plain `blocked` label
+ * (not `pipeline:*`) on the issue, from the newest LABELED_EVENT window.
+ * Pure over a pre-fetched event list so unit tests inject events without
+ * network. Returns null when no `blocked` labeled event is present.
+ */
+export function latestBlockedLabeledAtFromEvents(
+  events: readonly { label: string; createdAt: string }[],
+): string | null {
+  let latest: string | null = null;
+  let latestMs = -Infinity;
+  for (const e of events) {
+    if (e.label !== BLOCKED_LABEL) continue;
+    const ms = Date.parse(e.createdAt);
+    if (!Number.isFinite(ms)) continue;
+    if (ms >= latestMs) {
+      latestMs = ms;
+      latest = e.createdAt;
+    }
+  }
+  return latest;
+}
+
+/**
+ * Fetch the latest `blocked`-label application timestamp for capacity-comment
+ * incarnation binding (#718 69894186). Uses the same GraphQL latest-100
+ * LABELED_EVENT window as {@link getIssueLabelEvents}, but selects the plain
+ * `blocked` label (which that helper deliberately excludes). Throws on GitHub
+ * failure so the caller can fail closed rather than use a stale marker.
+ */
+export async function getLatestBlockedLabeledAt(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  run: GhApiRunner = (args) => ghRun(args),
+): Promise<string | null> {
+  const [owner, repo] = cfg.repo.split("/");
+  const stdout = await run([
+    "api",
+    "graphql",
+    "-f",
+    "query=query($owner:String!,$repo:String!,$num:Int!){repository(owner:$owner,name:$repo)" +
+      "{issue(number:$num){timelineItems(last:100,itemTypes:[LABELED_EVENT])" +
+      "{nodes{__typename ... on LabeledEvent{createdAt label{name}}}}}}}",
+    "-F",
+    `owner=${owner}`,
+    "-F",
+    `repo=${repo}`,
+    "-F",
+    `num=${issueNumber}`,
+    "--jq",
+    `.data.repository.issue.timelineItems.nodes[] | select(.label.name == "${BLOCKED_LABEL}") | {label: .label.name, createdAt: .createdAt}`,
+  ]);
+  const events = stdout
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as { label: string; createdAt: string });
+  return latestBlockedLabeledAtFromEvents(events);
 }
 
 /**

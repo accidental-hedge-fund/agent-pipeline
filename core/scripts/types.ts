@@ -261,6 +261,8 @@ export const BLOCKER_KINDS = [
   "merge-conflict",
   "worktree-missing",
   "worktree-creation-failed",
+  /** Ops admission: other active managed worktrees are at max_concurrent_worktrees (#718). */
+  "worktree-capacity",
   "pr-creation-failed",
   "no-pull-request",
   "plan-gen-failed",
@@ -336,6 +338,15 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "file is present, remove it: `rm -f .git/config.lock`. Delete the dangling " +
     "branch: `git branch -D pipeline/{{N}}-<slug>`. Remove the `blocked` label, " +
     "then re-run `$pipeline {{N}}`.",
+  "worktree-capacity":
+    "Worktree capacity is full (`max_concurrent_worktrees` other active managed " +
+    "worktrees). This is an ops/admission wait, not a product decision. Wait for " +
+    "an active issue to complete (or for a durable park to release a clean parked " +
+    "worktree), then re-run `$pipeline {{N}}`. If a parked issue still holds a " +
+    "worktree because it was dirty or unpushed, push or clean it and " +
+    "`$pipeline {{N}} --remove-worktree` when safe. `pipeline:cleanup` only sweeps " +
+    "merged-PR worktrees and does not free open blocked PRs. Remove the `blocked` " +
+    "label before re-running if it is still present.",
   "pr-creation-failed":
     "Opening the pull request failed (see the error above). Check GitHub " +
     "permissions and rate limits, remove the `blocked` label, then " +
