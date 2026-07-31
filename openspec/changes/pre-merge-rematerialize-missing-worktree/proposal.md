@@ -34,11 +34,13 @@ Dogfood (v1.29.2 loop / post-#768 residual path) showed mechanical `needs-human`
 
 Observable, falsifiable outcomes that make #769 done:
 
-- [ ] Missing managed worktree + active OpenSpec change on PR tip: rematerialize seam is invoked; on success archive proceeds without a worktree-not-found `needs-human` park (unit-tested with fakes).
-- [ ] Missing managed worktree + residual re-entry autofix eligible: rematerialize runs before `attemptPreMergeAutoFix` (or autofix dep observes a recreated path); no immediate bare `error` solely from null worktree when rematerialize would succeed.
-- [ ] Rematerialize failure: stage blocks with typed `worktree-missing` / `worktree-creation-failed` (or equivalent documented kinds) and concrete recovery text; active OpenSpec change is **not** silently skipped.
-- [ ] Existing dirty / local-only reclaim safety (#622) is not weakened: rematerialize does not force-remove dirty or unpushed local-only candidates.
-- [ ] Durable run events record rematerialize attempt + pass/fail (or skip) for dogfood proof.
-- [ ] `worktree-missing` recipe / recipe tests remain truthful after the behavior change.
+- [ ] Missing managed worktree + active OpenSpec change on PR tip: `ensureManagedWorktree` is invoked; on success archive proceeds without a worktree-not-found `needs-human` park (unit-tested with fakes).
+- [ ] Missing managed worktree + residual re-entry autofix eligible: rematerialize runs before implementer work; autofix sees recreated path; no immediate bare empty `{status:"error"}` solely from null worktree when rematerialize would succeed.
+- [ ] Rematerialize failure: stage blocks with typed `worktree-missing` / `worktree-creation-failed` / `worktree-capacity` and concrete recovery text; active OpenSpec change is **not** silently skipped (`null` not returned while active/unknown).
+- [ ] HEAD mismatch after create fails rematerialize with `worktree-creation-failed`; archive/autofix/fix do not continue on the mismatched tree.
+- [ ] Stale manager metadata without on-disk path is treated as missing and rematerialize is attempted.
+- [ ] Existing dirty / local-only reclaim safety (#622) is not weakened: rematerialize does not force-remove dirty or unpushed local-only candidates under the managed root.
+- [ ] When `runDir` is present, durable `gate_result` events with gate `worktree-rematerialize` record `pass`, `fail`, and `skipped` (not optional for skip).
+- [ ] `worktree-missing` recipe / recipe tests remain truthful after the behavior change (no false “re-run never recreates” claim for scoped paths).
 - [ ] Unit tests inject I/O via deps; `openspec validate` passes for this change; implementation phase will require `npm run ci` green and `plugin/` mirror regen if `core/` changes.
 - [ ] Dogfood: re-advance #626 / #729 after install does not park solely for “worktree not found” when the PR branch remains recoverable.

@@ -1262,6 +1262,219 @@ export async function gitInWorktree(
   }
 }
 
+// ---------------------------------------------------------------------------
+// ensureManagedWorktree — rematerialize missing managed worktree (#769)
+// ---------------------------------------------------------------------------
+
+/** Stable gate id for durable rematerialize evidence (dogfood greps). */
+export const WORKTREE_REMATERIALIZE_GATE = "worktree-rematerialize" as const;
+
+/** Result of {@link ensureManagedWorktree}. Fixed contract for all call sites. */
+export type EnsureManagedWorktreeResult =
+  | {
+      result: "pass";
+      worktree: { path: string; slug: string; branch: string };
+      reason: string;
+      blockerKind?: undefined;
+    }
+  | {
+      result: "skipped";
+      worktree: { path: string; slug: string; branch?: string };
+      reason: string;
+      blockerKind?: undefined;
+    }
+  | {
+      result: "fail";
+      worktree: null;
+      reason: string;
+      blockerKind: "worktree-creation-failed" | "worktree-capacity" | "worktree-missing";
+    };
+
+/** Injectable deps for {@link ensureManagedWorktree}. No real network/git in tests. */
+export interface EnsureManagedWorktreeDeps {
+  getOnDiskForIssue?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+  ) => Promise<{ path: string; slug: string } | null>;
+  createWorktree?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    slug: string,
+    createDeps?: CreateWorktreeDeps,
+  ) => Promise<{ path: string; branch: string }>;
+  /** Issue title for slugify (defaults to getIssueDetail). */
+  getIssueTitle?: (cfg: PipelineConfig, issueNumber: number) => Promise<string>;
+  gitCmd?: CreateWorktreeDeps["gitCmd"];
+  resolveOpenPrHeadForBranch?: CreateWorktreeDeps["resolveOpenPrHeadForBranch"];
+  gitInWorktree?: typeof gitInWorktree;
+  /** Extra create deps forwarded into createWorktree (reclaim fakes, etc.). */
+  createWorktreeDeps?: CreateWorktreeDeps;
+  /** When set, always append gate_result for pass/fail/skipped. */
+  runDir?: string;
+  runStoreDeps?: import("./run-store.ts").RunStoreDeps;
+}
+
+const REMATERIALIZE_REASON_MAX = 400;
+
+function boundRematerializeReason(reason: string): string {
+  const t = reason.replace(/\s+/g, " ").trim();
+  if (t.length <= REMATERIALIZE_REASON_MAX) return t;
+  return t.slice(0, REMATERIALIZE_REASON_MAX - 1) + "…";
+}
+
+async function recordRematerializeGate(
+  deps: EnsureManagedWorktreeDeps,
+  result: "pass" | "fail" | "skipped",
+  reason: string,
+): Promise<void> {
+  if (!deps.runDir) return;
+  try {
+    const { appendEvent, RUN_SCHEMA_VERSION } = await import("./run-store.ts");
+    await appendEvent(
+      deps.runDir,
+      {
+        schema_version: RUN_SCHEMA_VERSION,
+        type: "gate_result",
+        at: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+        gate: WORKTREE_REMATERIALIZE_GATE,
+        result,
+        reason: boundRematerializeReason(reason),
+      },
+      deps.runStoreDeps,
+    );
+  } catch {
+    // Best-effort: durable evidence must not change control flow.
+  }
+}
+
+async function defaultGetIssueTitle(cfg: PipelineConfig, issueNumber: number): Promise<string> {
+  const { getIssueDetail } = await import("./gh.ts");
+  const detail = await getIssueDetail(cfg, issueNumber);
+  return detail.title ?? "";
+}
+
+/**
+ * Ensure a managed on-disk worktree exists for the issue before a stage that
+ * requires one (OpenSpec archive, pre-merge autofix, fix write path) (#769).
+ *
+ * - On-disk path present → `skipped` (no force recreate).
+ * - Absent / stale metadata without path → rematerialize via {@link createWorktree}
+ *   (same startPoint + #622 reclaim safety), then verify HEAD vs open-PR head
+ *   SHA (or verified remote tip).
+ * - Failures map to typed `blockerKind`s; when `runDir` is set, always records
+ *   a `gate_result` with gate `worktree-rematerialize`.
+ */
+export async function ensureManagedWorktree(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  deps: EnsureManagedWorktreeDeps = {},
+): Promise<EnsureManagedWorktreeResult> {
+  const getOnDiskFn = deps.getOnDiskForIssue ?? getOnDiskForIssue;
+  const createFn = deps.createWorktree ?? createWorktree;
+  const getTitleFn = deps.getIssueTitle ?? defaultGetIssueTitle;
+  const gitFn = deps.gitCmd ?? git;
+  const resolveOpenPrHeadFn = deps.resolveOpenPrHeadForBranch ?? realResolveOpenPrHeadForBranch;
+  const gitWtFn = deps.gitInWorktree ?? gitInWorktree;
+
+  const existing = await getOnDiskFn(cfg, issueNumber);
+  if (existing) {
+    const reason = "already-present";
+    await recordRematerializeGate(deps, "skipped", reason);
+    return {
+      result: "skipped",
+      worktree: {
+        path: existing.path,
+        slug: existing.slug,
+        branch: branchName(issueNumber, existing.slug),
+      },
+      reason,
+    };
+  }
+
+  let title: string;
+  try {
+    title = await getTitleFn(cfg, issueNumber);
+  } catch (err) {
+    const reason = boundRematerializeReason(
+      `cannot resolve issue title for rematerialize: ${(err as Error).message ?? String(err)}`,
+    );
+    await recordRematerializeGate(deps, "fail", reason);
+    return { result: "fail", worktree: null, reason, blockerKind: "worktree-missing" };
+  }
+  const slug = slugify(title) || `issue-${issueNumber}`;
+  const branch = branchName(issueNumber, slug);
+
+  // Recoverability pre-check: do not create from base alone when rematerializing.
+  const lsRemote = await gitFn(
+    cfg,
+    cfg.repo_dir,
+    ["ls-remote", "origin", `refs/heads/${branch}`],
+    { ignoreFailure: true },
+  );
+  const remoteTip =
+    lsRemote.code === 0 && (lsRemote.stdout.trim().split(/\s+/)[0] ?? "").length > 0
+      ? lsRemote.stdout.trim().split(/\s+/)[0]!
+      : null;
+
+  let prHead: { prNumber: number; headSha: string } | null = null;
+  try {
+    prHead = await resolveOpenPrHeadFn(cfg, branch);
+  } catch {
+    prHead = null;
+  }
+  const prSha = prHead && prHead.headSha.length > 0 ? prHead.headSha : null;
+
+  if (!remoteTip && !prSha) {
+    const reason = boundRematerializeReason(
+      `no recoverable remote branch or open PR head for ${branch}; cannot rematerialize managed worktree`,
+    );
+    await recordRematerializeGate(deps, "fail", reason);
+    return { result: "fail", worktree: null, reason, blockerKind: "worktree-missing" };
+  }
+
+  // Intended tip: prefer open-PR head when present, else verified remote tip.
+  const intendedSha = prSha ?? remoteTip!;
+
+  let created: { path: string; branch: string };
+  try {
+    created = await createFn(cfg, issueNumber, slug, {
+      ...deps.createWorktreeDeps,
+      gitCmd: deps.createWorktreeDeps?.gitCmd ?? gitFn,
+      resolveOpenPrHeadForBranch:
+        deps.createWorktreeDeps?.resolveOpenPrHeadForBranch ?? resolveOpenPrHeadFn,
+    });
+  } catch (err) {
+    if (isWorktreeCapacityError(err)) {
+      const reason = boundRematerializeReason(err.message);
+      await recordRematerializeGate(deps, "fail", reason);
+      return { result: "fail", worktree: null, reason, blockerKind: "worktree-capacity" };
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    const reason = boundRematerializeReason(`rematerialize create failed: ${msg}`);
+    await recordRematerializeGate(deps, "fail", reason);
+    return { result: "fail", worktree: null, reason, blockerKind: "worktree-creation-failed" };
+  }
+
+  const headRes = await gitWtFn(created.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
+  const headSha = headRes.code === 0 ? headRes.stdout.trim() : "";
+  if (!headSha || headSha !== intendedSha) {
+    const reason = boundRematerializeReason(
+      `worktree HEAD after rematerialize (${headSha || "unresolved"}) does not match intended tip ${intendedSha}`,
+    );
+    await recordRematerializeGate(deps, "fail", reason);
+    return { result: "fail", worktree: null, reason, blockerKind: "worktree-creation-failed" };
+  }
+
+  const source = prSha ? `open PR head ${intendedSha.slice(0, 7)}` : `origin/${branch} ${intendedSha.slice(0, 7)}`;
+  const reason = boundRematerializeReason(`recreated from ${source}`);
+  await recordRematerializeGate(deps, "pass", reason);
+  return {
+    result: "pass",
+    worktree: { path: created.path, slug, branch: created.branch },
+    reason,
+  };
+}
+
 export async function hasCommitsAhead(cwd: string, baseBranch: string): Promise<boolean> {
   const { stdout } = await gitInWorktree(
     cwd,

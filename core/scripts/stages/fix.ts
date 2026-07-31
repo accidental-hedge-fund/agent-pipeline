@@ -33,10 +33,13 @@ import { invoke, papercutIdentityEnv, type HarnessResult } from "../harness.ts";
 import { invokeStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import {
   branchName,
+  ensureManagedWorktree,
   getOnDiskForIssue,
   gitInWorktree,
   reattachIfDetached,
   renderWorktreeStateSection,
+  type EnsureManagedWorktreeDeps,
+  type EnsureManagedWorktreeResult,
 } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
@@ -156,6 +159,17 @@ export interface AdvanceFixDeps {
    * is exercised with no real harness, executor HTTP, or subprocess call.
    */
   invokeFixHarnessAttempt?: (prompt: string, timeoutSec: number) => Promise<HarnessResult>;
+  /**
+   * Rematerialize a missing managed worktree before write-in-tree fix (#769).
+   * Production default: {@link ensureManagedWorktree}. Tests inject fakes.
+   */
+  ensureManagedWorktree?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    ensureDeps?: EnsureManagedWorktreeDeps,
+  ) => Promise<EnsureManagedWorktreeResult>;
+  /** On-disk worktree lookup (defaults to getOnDiskForIssue). */
+  getOnDiskForIssue?: typeof getOnDiskForIssue;
 }
 
 // ---------------------------------------------------------------------------
@@ -432,10 +446,34 @@ export async function advanceFix(
 
   console.log(`[pipeline] #${issueNumber}: ${stage} by ${harness}`);
 
-  const wt = await getOnDiskForIssue(cfg, issueNumber);
+  const getOnDiskFn = deps.getOnDiskForIssue ?? getOnDiskForIssue;
+  const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+  let wt = await getOnDiskFn(cfg, issueNumber);
   if (!wt) {
-    await setBlocked(cfg, issueNumber, "No worktree found. Cannot apply fixes.", stage, "worktree-missing");
-    return { advanced: false, status: "blocked", reason: "No worktree found. Cannot apply fixes.", blockerKind: "worktree-missing" };
+    // Rematerialize once before parking (#769) — park-release may have deleted
+    // a clean tree while the PR branch remains recoverable.
+    const remat = await ensureFn(cfg, issueNumber, {
+      getOnDiskForIssue: getOnDiskFn,
+      runDir: opts.runDir,
+      runStoreDeps: opts.runStoreDeps,
+    });
+    if (remat.result === "fail") {
+      const reason =
+        `No worktree found and rematerialize failed (${remat.blockerKind}): ${remat.reason}`;
+      // Separate calls keep explicit BlockerKind string literals visible to the
+      // blocked-recipes exhaustiveness scan (nested ternaries confuse its paren walk).
+      if (remat.blockerKind === "worktree-capacity") {
+        await setBlocked(cfg, issueNumber, reason, stage, "worktree-capacity");
+        return { advanced: false, status: "blocked", reason, blockerKind: "worktree-capacity" };
+      }
+      if (remat.blockerKind === "worktree-creation-failed") {
+        await setBlocked(cfg, issueNumber, reason, stage, "worktree-creation-failed");
+        return { advanced: false, status: "blocked", reason, blockerKind: "worktree-creation-failed" };
+      }
+      await setBlocked(cfg, issueNumber, reason, stage, "worktree-missing");
+      return { advanced: false, status: "blocked", reason, blockerKind: "worktree-missing" };
+    }
+    wt = { path: remat.worktree.path, slug: remat.worktree.slug };
   }
 
   const detail = await getIssueDetail(cfg, issueNumber);

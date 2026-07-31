@@ -97,10 +97,14 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "Rebase the branch on the latest target, resolve the conflicts, push, " +
     "remove the `blocked` label, then re-run `$pipeline 7`.",
   "worktree-missing":
-    "The worktree for this issue no longer exists. The fix stage cannot run " +
-    "without it — re-running will block again immediately. Recreate it manually " +
-    "from the issue's branch (`git worktree add`), remove the `blocked` label, " +
-    "then re-run `$pipeline 7`.",
+    "The managed worktree for this issue is missing and could not be rematerialized " +
+    "automatically (no recoverable remote branch / open PR head, or rematerialize " +
+    "could not run). Verify the pipeline branch is still on the remote or that an " +
+    "open PR exists for it, check `gh` auth, free worktree capacity if needed, and " +
+    "resolve any dirty or local-only reclaim blockers under the managed worktree " +
+    "root. Then remove the `blocked` label and re-run `$pipeline 7`. As a " +
+    "last resort, recreate manually with `git worktree add` from the issue branch " +
+    "before re-running.",
   "worktree-creation-failed":
     "Creating the worktree failed (see the error above). If a `.git/config.lock` " +
     "file is present, remove it: `rm -f .git/config.lock`. Delete the dangling " +
@@ -413,20 +417,30 @@ test("no recipe mentions the non-existent 'pipeline:blocked' label", () => {
 });
 
 // ---------------------------------------------------------------------------
-// worktree-missing: recipe must not promise re-run recreates the worktree
-// (Finding 2, review 2). The fix/eval stages call getForIssue and block
-// immediately — they never call createWorktree.
+// worktree-missing: after #769, scoped pre-merge/fix paths rematerialize
+// automatically. Residual park recipe must stay honest — no "re-run always
+// blocks immediately without recreation" claim — and still give concrete
+// recovery (auth/PR recoverability/capacity/dirty reclaim + last-resort
+// manual worktree add).
 // ---------------------------------------------------------------------------
 
-test("worktree-missing recipe does not falsely promise re-run will recreate the worktree", () => {
+test("worktree-missing recipe stays accurate after rematerialize (#769)", () => {
   const rendered = renderRecipe("worktree-missing", 42);
   assert.ok(
-    !rendered.includes("recreate it from the branch"),
-    "worktree-missing recipe must not claim re-running recreates the worktree",
+    !/block again immediately|never recreates|will not recreate/i.test(rendered),
+    "worktree-missing recipe must not claim re-run always blocks without recreation",
+  );
+  assert.ok(
+    /rematerializ/i.test(rendered),
+    "worktree-missing recipe should acknowledge automatic rematerialize was attempted",
   );
   assert.ok(
     rendered.includes("git worktree add"),
-    "worktree-missing recipe must direct the operator to manually recreate with git worktree add",
+    "worktree-missing recipe must keep last-resort manual recreate guidance",
+  );
+  assert.ok(
+    /recoverable|open PR|auth|capacity|dirty|local-only/i.test(rendered),
+    "worktree-missing recipe must point at concrete rematerialize failure recovery",
   );
 });
 
