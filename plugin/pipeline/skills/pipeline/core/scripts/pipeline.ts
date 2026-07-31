@@ -101,6 +101,11 @@ import { runSweep, realSweepDeps } from "./stages/sweep.ts";
 import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
 import { mergePr, realMergeDeps } from "./stages/merge.ts";
 import { runMergeQueue, realMergeQueueDeps } from "./stages/merge-queue.ts";
+import {
+  realDriveDeps,
+  runMergeQueueCommand,
+} from "./stages/merge_queue_drive.ts";
+import { realMergeQueueDeps as realPlanMergeQueueDeps } from "./stages/merge_queue.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -347,6 +352,13 @@ export interface CliOpts {
    * Required when release-when-complete is enabled.
    */
   releaseVersion?: string;
+  /**
+   * merge-queue (#675): with --apply, opt-in surgical conflict/CI repair on holds
+   * (budget-bounded; default off).
+   */
+  repair?: boolean;
+  /** merge-queue --repair: max automatic repair attempts per held item (default 1). */
+  maxRepairAttempts?: number;
   /** backfill: scope the apply slice to a named capability. */
   capability?: string;
   /** config repo-map add/remove: target relationship list (default: depends_on). */
@@ -495,7 +507,9 @@ export function buildCmd(): Command {
     .option("--title <text>", "refine-spec: existing issue title to refine")
     .option("--body <markdown>", "refine-spec: existing issue body to refine")
     .option("--release <version>", "intake/release: pin the target release slot (e.g. v1.6.0)")
-    .option("--apply", "roadmap/sweep/backfill/improve/config sync: execute write-backs; default is dry-run/preview")
+    .option("--apply", "roadmap/sweep/backfill/improve/config sync/merge-queue: execute write-backs or sequential merges; default is dry-run/preview")
+    .option("--repair", "merge-queue --apply: attempt surgical conflict/CI repair on holds (budget-bounded; default off)")
+    .option("--max-repair-attempts <n>", "merge-queue --repair: max automatic repair attempts per item (default: 1)", Number)
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
     .option("--repo <owner/repo>", "sweep/backfill: override the target GitHub repository (default: current repo from gh config)")
     .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)")
@@ -3085,16 +3099,19 @@ async function main(): Promise<void> {
   }
 
   // Early merge-queue dispatch — human-gated sequential R2D merges + optional
-  // release-when-complete prepare (#676). Never tags/publishes/merges a release.
+  // release-when-complete prepare (#676) and surgical repair hold (#675).
+  // Never tags/publishes/merges a release.
   if (isMergeQueueCommand) {
     if (!opts.milestone || String(opts.milestone).trim() === "") {
       console.error(
         "pipeline merge-queue: --milestone <title> is required.\n" +
           "  Usage: pipeline merge-queue --milestone <title> [--apply] [--dry-run]\n" +
+          "         [--repair] [--max-repair-attempts <n>]\n" +
           "         [--release-when-complete --release-version <major|minor|patch|X.Y.Z>]\n" +
           "  Default is dry-run (no merges). --apply performs sequential merges via the\n" +
-          "  existing merge surface. --release-when-complete is opt-in prepare-only:\n" +
-          "  never tags, publishes to npm, or merges the release PR.",
+          "  existing merge surface. --repair (with --apply) enables budget-bounded\n" +
+          "  surgical conflict/CI repair on holds (#675). --release-when-complete is\n" +
+          "  opt-in prepare-only: never tags, publishes to npm, or merges the release PR.",
       );
       process.exit(2);
     }
@@ -3106,23 +3123,48 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     try {
-      const result = await runMergeQueue(
-        {
-          milestone: String(opts.milestone).trim(),
-          apply: !!opts.apply,
-          // Explicit --dry-run forces plan-only even when combined with --apply.
-          dryRun: !!opts.dryRun,
-          releaseWhenComplete: !!opts.releaseWhenComplete,
-          releaseVersion: opts.releaseVersion,
-          releaseWhenCompleteConfig: mqCfg.merge_queue?.release_when_complete ?? false,
-          repoDir: mqCfg.repo_dir,
-          repo: mqCfg.repo,
-          baseBranch: mqCfg.base_branch,
-          releaseModel: mqCfg.roadmap?.release_model,
-        },
-        realMergeQueueDeps(mqCfg.repo_dir, mqCfg.repo),
-      );
-      if (result.exitCode !== 0) process.exit(result.exitCode);
+      // #674/#675 sequential drive (+ optional surgical repair) when applying.
+      // Dry-run stays on the #676 plan/release-when-complete surface.
+      const applying = !!opts.apply && !opts.dryRun;
+      if (applying) {
+        const code = await runMergeQueueCommand(
+          {
+            milestone: String(opts.milestone).trim(),
+            apply: true,
+            dryRun: false,
+            baseBranch: mqCfg.base_branch,
+            repair: !!opts.repair,
+            maxRepairAttempts:
+              typeof opts.maxRepairAttempts === "number" && Number.isFinite(opts.maxRepairAttempts)
+                ? opts.maxRepairAttempts
+                : undefined,
+          },
+          realPlanMergeQueueDeps(mqCfg.repo),
+          realDriveDeps(mqCfg.repo, realMergeDeps(mqCfg.repo), undefined, {
+            expectedBaseBranch: mqCfg.base_branch,
+          }),
+          console.log,
+          mqCfg.repo,
+        );
+        if (code !== 0) process.exit(code);
+      } else {
+        const result = await runMergeQueue(
+          {
+            milestone: String(opts.milestone).trim(),
+            apply: false,
+            dryRun: true,
+            releaseWhenComplete: !!opts.releaseWhenComplete,
+            releaseVersion: opts.releaseVersion,
+            releaseWhenCompleteConfig: mqCfg.merge_queue?.release_when_complete ?? false,
+            repoDir: mqCfg.repo_dir,
+            repo: mqCfg.repo,
+            baseBranch: mqCfg.base_branch,
+            releaseModel: mqCfg.roadmap?.release_model,
+          },
+          realMergeQueueDeps(mqCfg.repo_dir, mqCfg.repo),
+        );
+        if (result.exitCode !== 0) process.exit(result.exitCode);
+      }
     } catch (err) {
       console.error(`pipeline merge-queue: ${(err as Error).message}`);
       process.exit(1);

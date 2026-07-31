@@ -135,6 +135,8 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
       "milestone",
       "apply",
       "dryRun",
+      "repair",
+      "maxRepairAttempts",
       "releaseWhenComplete",
       "releaseVersion",
     ]),
