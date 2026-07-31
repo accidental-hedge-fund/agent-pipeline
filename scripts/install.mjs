@@ -1250,17 +1250,21 @@ async function main() {
     try {
       log(`Installing agent-pipeline → [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
       for (const h of hosts) {
-        // Shadow detection for every selected host (Claude + Codex) (#635).
-        // Backup base is dirname(skillsDir) so CLAUDE_CONFIG_DIR / CODEX_HOME
-        // overrides are honored without hardcoding ~/.claude or ~/.codex.
-        const { shadowing, dest } = detectPersonalSkill(h);
-        if (shadowing) {
-          const action = await offerRelocation(dest, hostBackupBase(h), dryRun);
-          if (action === "skip") {
-            log(
-              `  ↷ Skipped ${HOSTS[h].label} install — relocate the personal install first, then re-run.`,
-            );
-            continue;
+        // Shadow detection for tree installs (Claude + Codex) (#635). Backup base
+        // is dirname(skillsDir) so CLAUDE_CONFIG_DIR / CODEX_HOME overrides are
+        // honored without hardcoding ~/.claude or ~/.codex. Grok (symlink-claude)
+        // must not auto-relocate a non-symlink path — installGrokHost refuses
+        // replacement so documented copy layouts stay intact (#731).
+        if (HOSTS[h].installMode !== "symlink-claude") {
+          const { shadowing, dest } = detectPersonalSkill(h);
+          if (shadowing) {
+            const action = await offerRelocation(dest, hostBackupBase(h), dryRun);
+            if (action === "skip") {
+              log(
+                `  ↷ Skipped ${HOSTS[h].label} install — relocate the personal install first, then re-run.`,
+              );
+              continue;
+            }
           }
         }
         installHost(h, dryRun);
