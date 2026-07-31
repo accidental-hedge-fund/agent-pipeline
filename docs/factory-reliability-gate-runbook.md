@@ -58,6 +58,10 @@ Thresholds may tighten over time via this runbook; they remain numeric and check
 The pack uses a **dedicated** synthetic / labeled work-list (`factory-gate` label or
 reliability selector) — **not** the full product milestone backlog.
 
+**Pack provenance (1.29.1):** clean composition pack item 1 — synthetic
+`factory-gate-v1` / factory-gate contributor for Layer B scenario
+`clean-item-throughput` (docs-only; no product or FRG scoring change).
+
 ### Layer A waivers (explicit; no silent gaps)
 
 | Scenario id | Tracking issue |
