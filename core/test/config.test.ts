@@ -2778,6 +2778,53 @@ test("resolveConfig: out-of-enum ci_mode value is rejected with error naming ci_
   }
 });
 
+// ---- supersede_mode (#729) ----
+
+test("resolveConfig: supersede_mode absent defaults to 'close'", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/ss0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.supersede_mode, "close");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: supersede_mode: comment-only is accepted", async () => {
+  const repo = makeFakeRepo(`supersede_mode: comment-only\n`);
+  const binDir = makeFakeGh("acme/ss1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.supersede_mode, "comment-only");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: invalid supersede_mode is rejected with error naming supersede_mode", async () => {
+  const repo = makeFakeRepo(`supersede_mode: force-merge\n`);
+  const binDir = makeFakeGh("acme/ss2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("supersede_mode"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---- event_sink (#343) ----
 
 test("resolveConfig: no event_sink configured → event_sink is undefined", async () => {

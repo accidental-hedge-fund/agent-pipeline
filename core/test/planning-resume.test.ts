@@ -137,6 +137,7 @@ test("resumeFromImplementing: gate passes + push ok + no existing PR → creates
       assert.equal(to, "design-gate");
       transitionCalled = true;
     },
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   const result = await resumeFromImplementing(
@@ -177,6 +178,7 @@ test("resumeFromImplementing: gate passes + push ok + PR already exists → reus
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
     transition: async (_cfg, _n, _from, _to, msg) => { transitionMsg = msg ?? ""; },
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   const result = await resumeFromImplementing(
@@ -213,6 +215,7 @@ test("resumeFromImplementing: gate fails → calls setBlocked and returns blocke
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async (_cfg, _n, reason) => { setBlockedArgs.push(reason); },
     transition: async () => { transitionCalled = true; },
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   const result = await resumeFromImplementing(
@@ -265,6 +268,7 @@ test("resumeFromImplementing: createPr throws but PR appeared concurrently → r
       assert.ok(msg?.includes("66"), "transition comment should reference PR #66");
       transitionCalled = true;
     },
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   const result = await resumeFromImplementing(
@@ -335,6 +339,7 @@ test("3.6 bite-proof: resumeFromImplementing — calling createPr when PR exists
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
     transition: async () => {},
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   // The correct implementation should NOT call createPr when PR exists.
@@ -370,6 +375,7 @@ test("resumeFromImplementing: skipped gate → advances to review-1 (gate-less r
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
     transition: async () => {},
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   const result = await resumeFromImplementing(
@@ -410,6 +416,7 @@ test("resumeFromImplementing: fresh-flow worktree shape (no slug, branch from cr
     },
     setBlocked: async () => {},
     transition: async () => {},
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   const result = await resumeFromImplementing(
@@ -460,6 +467,7 @@ test("resumeFromImplementing: format gate blocks first (before the test gate) �
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async (_cfg, _n, reason) => { setBlockedArgs.push(reason); },
     transition: async () => {},
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   const result = await resumeFromImplementing(
@@ -516,6 +524,7 @@ test("resumeFromImplementing: pr_created event streams to stdout via runStoreDep
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
     transition: async () => {},
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
   await resumeFromImplementing(
     makeCfg(),
@@ -561,6 +570,7 @@ test("resumeFromImplementing (#722): lockfile fold runs before format/test gates
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
     transition: async () => {},
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   const result = await resumeFromImplementing(
@@ -599,6 +609,7 @@ test("resumeFromImplementing (#722): lock fold is still invoked when no lock dir
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
     transition: async () => {},
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   await resumeFromImplementing(
@@ -654,6 +665,7 @@ test("resumeFromImplementing (#722): nested yarn/pnpm lock basenames are folded 
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
     transition: async () => {},
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   await resumeFromImplementing(

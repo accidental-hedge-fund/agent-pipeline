@@ -569,6 +569,7 @@ test("resumeFromImplementing: docs check runs after gates and before push/create
     },
     setBlocked: async () => {},
     transition: async () => {},
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   const result = await resumeFromImplementing(
@@ -629,6 +630,7 @@ test("resumeFromImplementing: red docs blocks createPr and push (deliberate stal
     transition: async () => {
       assert.fail("transition must not run on red docs");
     },
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   const result = await resumeFromImplementing(
@@ -679,6 +681,7 @@ test("resumeFromImplementing: existing-PR resume also fails closed on red docs",
     transition: async () => {
       transitionCalled = true;
     },
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   const result = await resumeFromImplementing(
@@ -731,6 +734,7 @@ test("resumeFromImplementing: auto-heal re-runs format+test gates then final doc
     transition: async () => {
       callLog.push("transition");
     },
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   const result = await resumeFromImplementing(
@@ -795,6 +799,7 @@ test("resumeFromImplementing: post-heal final docs check red blocks push/createP
     transition: async () => {
       assert.fail("transition must not run when final docs check is red");
     },
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   const result = await resumeFromImplementing(
@@ -840,6 +845,7 @@ test("bite: removing pre-PR docs enforcement would allow createPr on red docs", 
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
     transition: async () => {},
+    supersedeStaleIssuePrs: async () => ({ candidates: [], commented: [], closed: [], errors: [] }),
   };
 
   await resumeFromImplementing(

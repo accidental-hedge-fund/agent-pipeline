@@ -617,6 +617,13 @@ export interface PipelineConfig {
    * workflow re-run per head SHA for infra/unknown classifications (#679).
    */
   pre_merge_ci_rerun_enabled: boolean;
+  /**
+   * After managed PR create-or-reuse for issue N, how to handle other open
+   * same-repo issue-linked PRs on different heads (#729):
+   * - `close` (default): post a structured `pipeline-superseded` comment and close
+   * - `comment-only`: post the comment and leave the PR open
+   */
+  supersede_mode: "close" | "comment-only";
   // Harness roles + models. The implementer is always taken from the active
   // profile (repo config cannot set it). The reviewer defaults to the profile's
   // value but MAY be overridden per-repo by the `review_harness` config key
@@ -1010,6 +1017,7 @@ export const DEFAULT_CONFIG: Omit<
   ci_mode: "github",
   pre_merge_ci_assertion_fix: false,
   pre_merge_ci_rerun_enabled: true,
+  supersede_mode: "close",
   // review defaults to claude-fable-5 (#366): it is the auto-routed choice for
   // every Adversarial stage, so aligning the default with that routing
   // strengthens review rigor. Only honored when the reviewer harness is claude

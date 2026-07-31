@@ -913,11 +913,16 @@ const OPEN_PR_CFG = { repo: "owner/repo" } as PipelineConfig;
 function openPrNode(
   number: number,
   headRefName: string,
-  opts: { fork?: boolean; closes?: { number: number; owner: string; name: string }[] } = {},
+  opts: {
+    fork?: boolean;
+    base?: string;
+    closes?: { number: number; owner: string; name: string }[];
+  } = {},
 ) {
   return {
     number,
     headRefName,
+    baseRefName: opts.base ?? "main",
     isCrossRepository: opts.fork ?? false,
     closingIssuesReferences: {
       nodes: (opts.closes ?? []).map((c) => ({
@@ -953,9 +958,11 @@ test("mapOpenPrGraphQlNodes: maps GraphQL open-PR nodes into PrCandidate shape",
     headRefName: "pipeline/76-fix",
     isCrossRepository: false,
     closingIssues: [{ number: 76, nameWithOwner: "owner/repo" }],
+    baseRefName: "main",
   });
   assert.equal(prs[1].isCrossRepository, true);
   assert.deepEqual(prs[1].closingIssues, []);
+  assert.equal(prs[1].baseRefName, "main");
 });
 
 test("getPrForIssue: resolves via paginated GraphQL open PRs, not a hard -L 100 pr list scan", async () => {

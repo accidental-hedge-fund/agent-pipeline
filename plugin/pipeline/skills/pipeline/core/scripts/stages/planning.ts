@@ -82,6 +82,10 @@ import {
   checkDocsFreshness,
   type DocsFreshnessDeps,
 } from "../docs-freshness.ts";
+import {
+  supersedeStaleIssuePrs,
+  type SupersedeStaleIssuePrsDeps,
+} from "../supersede-stale-prs.ts";
 
 /**
  * Appended once when plan-revision stdout fails the acknowledgement shape gate
@@ -1446,6 +1450,14 @@ export interface ResumeFromImplementingDeps {
    * fakes; use this seam only when the test must assert invocation order.
    */
   includeLockfileSideEffects?: typeof includeLockfileSideEffects;
+  /**
+   * Supersede other open issue-linked PRs after managed create-or-reuse (#729).
+   * Defaults to {@link supersedeStaleIssuePrs}. Tests inject a spy or no-op so
+   * the default path never needs real network.
+   */
+  supersedeStaleIssuePrs?: typeof supersedeStaleIssuePrs;
+  /** Deps forwarded into the default supersede implementation. */
+  supersedeDeps?: SupersedeStaleIssuePrsDeps;
 }
 
 /**
@@ -1601,6 +1613,18 @@ export async function resumeFromImplementing(
     const evType = prIsNew ? "pr_created" : "pr_updated";
     await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: evType, at, pr: prNumber }, opts.runStoreDeps).catch(() => {});
   }
+
+  // ---- Supersede other open issue-linked PRs on different heads (#729) ----
+  // Runs after the live managed PR number is known (create and exact-head reuse,
+  // including create-race reuse) and after pr_created/pr_updated so the managed
+  // PR is already logged. Failures are non-blocking — never undo PR create.
+  const supersede = deps.supersedeStaleIssuePrs ?? supersedeStaleIssuePrs;
+  await supersede(
+    cfg,
+    issueNumber,
+    { prNumber, branch },
+    deps.supersedeDeps ?? {},
+  );
 
   // ---- implementing → design-gate ----
   // Always traversed (#436): the design-gate stage itself decides whether it

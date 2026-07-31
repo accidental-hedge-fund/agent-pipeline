@@ -67,6 +67,7 @@ import {
 } from "../scripts/stages/pre_merge.ts";
 import { buildAutoRecoveryComment, buildAutoRecoveryLimitComment } from "../scripts/stages/auto_recover.ts";
 import { buildPipelineCompleteComment } from "../scripts/stages/deploy_ready.ts";
+import { buildSupersededComment } from "../scripts/supersede-stale-prs.ts";
 import { formatEvidenceCommentBody } from "../scripts/evidence-bundle.ts";
 import {
   buildAuditRepairBlockedComment,
@@ -286,6 +287,8 @@ const KIND_RENDERERS: Record<string, () => string> = {
       headSha: "a".repeat(40),
       timestamp: ts(0),
     }),
+  "pipeline-superseded": () =>
+    buildSupersededComment({ managedPrNumber: 726, issueNumber: 601 }),
   "finding-does-not-reproduce": () =>
     nonReproducingDispositionComment({
       key: "abcd1234",

@@ -233,6 +233,12 @@ const PartialConfigSchema = z.object({
   ci_mode: z.enum(["github", "local"]).optional().describe("Source of pre-merge CI verification: github (default) waits on gh pr checks; local relies on the current run's local test-gate result and skips the GitHub Actions wait."),
   pre_merge_ci_assertion_fix: z.boolean().optional().describe("When true, allow one surgical implementer fix attempt per head SHA for assertion-classified pre-merge CI failures. Default false (opt-in)."),
   pre_merge_ci_rerun_enabled: z.boolean().optional().describe("When true (default), allow one automatic failed-workflow re-run per head SHA for infra/unknown pre-merge CI failures."),
+  supersede_mode: z
+    .enum(["close", "comment-only"])
+    .optional()
+    .describe(
+      "After managed PR create-or-reuse, how to handle other open same-repo issue-linked PRs on different heads (#729): close (default) posts a pipeline-superseded comment and closes; comment-only posts the comment and leaves them open.",
+    ),
   // Repository-configurable primary/secondary harness roles (#608). Both keys
   // are optional and independently fall back to the active profile's default
   // when omitted — a repo can pin one role without the other. `implementer`
@@ -985,6 +991,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       fileConfig.pre_merge_ci_assertion_fix ?? DEFAULT_CONFIG.pre_merge_ci_assertion_fix,
     pre_merge_ci_rerun_enabled:
       fileConfig.pre_merge_ci_rerun_enabled ?? DEFAULT_CONFIG.pre_merge_ci_rerun_enabled,
+    supersede_mode: fileConfig.supersede_mode ?? DEFAULT_CONFIG.supersede_mode,
     // Harness roles are resolved per-role (#608): the repository's
     // `harnesses:` block wins over the active profile for each of
     // implementer/reviewer independently; `review_harness` may additionally
@@ -2127,6 +2134,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     `ci_mode: ${yamlScalar(config.ci_mode ?? d.ci_mode)} # ${sd("ci_mode", "github (default): wait for GitHub Actions check-runs; local: rely on the current run's local test-gate result and skip the GitHub Actions wait")}`,
     `pre_merge_ci_assertion_fix: ${yamlScalar(config.pre_merge_ci_assertion_fix ?? d.pre_merge_ci_assertion_fix)} # ${sd("pre_merge_ci_assertion_fix", "opt-in: one surgical fix attempt per head SHA for assertion-classified pre-merge CI failures (default false)")}`,
     `pre_merge_ci_rerun_enabled: ${yamlScalar(config.pre_merge_ci_rerun_enabled ?? d.pre_merge_ci_rerun_enabled)} # ${sd("pre_merge_ci_rerun_enabled", "allow one automatic failed-workflow re-run per head SHA for infra/unknown CI failures (default true)")}`,
+    `supersede_mode: ${yamlScalar(config.supersede_mode ?? d.supersede_mode)} # ${sd("supersede_mode", "close (default): post pipeline-superseded comment and close other open issue-linked PRs on different heads after managed PR create-or-reuse; comment-only: comment without closing (#729)")}`,
     "",
     renderModelLines(config.models),
     "",
@@ -2500,6 +2508,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     ci_mode: config.ci_mode ?? d.ci_mode,
     pre_merge_ci_assertion_fix: config.pre_merge_ci_assertion_fix ?? d.pre_merge_ci_assertion_fix,
     pre_merge_ci_rerun_enabled: config.pre_merge_ci_rerun_enabled ?? d.pre_merge_ci_rerun_enabled,
+    supersede_mode: config.supersede_mode ?? d.supersede_mode,
     models: { ...d.models, ...config.models },
     openspec: { ...d.openspec, ...config.openspec },
     last30days: { ...d.last30days, ...config.last30days },

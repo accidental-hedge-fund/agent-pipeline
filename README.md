@@ -893,6 +893,7 @@ worktree_root: .worktrees
 review_timeout: 1200
 ci_timeout: 900
 ci_mode: github                    # github (default): wait for GitHub Actions check-runs; local: rely on the current run's local test-gate result and skip the GitHub Actions wait (see "ci_mode: local" below)
+supersede_mode: close              # close (default): after managed PR create-or-reuse, close other open same-repo issue-linked PRs on different heads with a pipeline-superseded comment; comment-only: comment without closing
 intake_timeout: 600                # seconds for the intake spec-generation harness (fail-fast on a hung call)
 sweep_timeout: 600                 # seconds for each sweep issue re-spec harness
 models:                            # per-phase model alias. Each key also accepts "auto" (see "Auto model/effort routing").
