@@ -1302,6 +1302,17 @@ export interface EnsureManagedWorktreeDeps {
     slug: string,
     createDeps?: CreateWorktreeDeps,
   ) => Promise<{ path: string; branch: string }>;
+  /**
+   * Remove a just-created mismatched worktree after post-create HEAD verification
+   * fails (#769 review-2). Defaults to {@link removeWorktree}. Callers/tests inject
+   * fakes; production path is scoped to the managed worktree root only.
+   */
+  removeWorktree?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    slug: string,
+    resolvedPath?: string,
+  ) => Promise<void>;
   /** Issue title for slugify (defaults to getIssueDetail). */
   getIssueTitle?: (cfg: PipelineConfig, issueNumber: number) => Promise<string>;
   gitCmd?: CreateWorktreeDeps["gitCmd"];
@@ -1312,6 +1323,8 @@ export interface EnsureManagedWorktreeDeps {
   /** When set, always append gate_result for pass/fail/skipped. */
   runDir?: string;
   runStoreDeps?: import("./run-store.ts").RunStoreDeps;
+  /** Path existence check used after HEAD-mismatch cleanup (defaults to fs.existsSync). */
+  existsSync?: (p: string) => boolean;
 }
 
 const REMATERIALIZE_REASON_MAX = 400;
@@ -1353,6 +1366,17 @@ async function defaultGetIssueTitle(cfg: PipelineConfig, issueNumber: number): P
   return detail.title ?? "";
 }
 
+/** True when `candidatePath` resolves strictly under this checkout's managed
+ *  worktree root (`<repo_dir>/<worktree_root>/…`). Used to scope destructive
+ *  cleanup after post-create HEAD mismatch so remove never targets paths
+ *  outside the managed root. */
+function isUnderManagedWorktreeRoot(cfg: PipelineConfig, candidatePath: string): boolean {
+  const root = worktreeRoot(cfg);
+  const resolved = path.resolve(candidatePath);
+  const rel = path.relative(root, resolved);
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
 /**
  * Ensure a managed on-disk worktree exists for the issue before a stage that
  * requires one (OpenSpec archive, pre-merge autofix, fix write path) (#769).
@@ -1361,6 +1385,9 @@ async function defaultGetIssueTitle(cfg: PipelineConfig, issueNumber: number): P
  * - Absent / stale metadata without path → rematerialize via {@link createWorktree}
  *   (same startPoint + #622 reclaim safety), then verify HEAD vs open-PR head
  *   SHA (or verified remote tip).
+ * - Post-create HEAD mismatch → remove/quarantine the just-created managed
+ *   path before returning fail, so a later getOnDiskForIssue cannot treat the
+ *   mismatched tree as a valid present worktree (#769 review-2).
  * - Failures map to typed `blockerKind`s; when `runDir` is set, always records
  *   a `gate_result` with gate `worktree-rematerialize`.
  */
@@ -1371,10 +1398,12 @@ export async function ensureManagedWorktree(
 ): Promise<EnsureManagedWorktreeResult> {
   const getOnDiskFn = deps.getOnDiskForIssue ?? getOnDiskForIssue;
   const createFn = deps.createWorktree ?? createWorktree;
+  const removeFn = deps.removeWorktree ?? removeWorktree;
   const getTitleFn = deps.getIssueTitle ?? defaultGetIssueTitle;
   const gitFn = deps.gitCmd ?? git;
   const resolveOpenPrHeadFn = deps.resolveOpenPrHeadForBranch ?? realResolveOpenPrHeadForBranch;
   const gitWtFn = deps.gitInWorktree ?? gitInWorktree;
+  const existsFn = deps.existsSync ?? ((p: string) => fs.existsSync(p));
 
   const existing = await getOnDiskFn(cfg, issueNumber);
   if (existing) {
@@ -1458,8 +1487,32 @@ export async function ensureManagedWorktree(
   const headRes = await gitWtFn(created.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
   const headSha = headRes.code === 0 ? headRes.stdout.trim() : "";
   if (!headSha || headSha !== intendedSha) {
+    // Safety scope: destructive remove is limited to the just-created path and
+    // only when that path is under this checkout's managed worktree root.
+    // Leaving a mismatched tree on disk would let a later getOnDiskForIssue
+    // classify it as present, skip rematerialize, and run archive/autofix/fix
+    // on the wrong revision (#769 review-2 finding f9fac3ac).
+    let cleanupNote = "";
+    if (isUnderManagedWorktreeRoot(cfg, created.path)) {
+      try {
+        await removeFn(cfg, issueNumber, slug, created.path);
+        if (existsFn(created.path)) {
+          cleanupNote =
+            "; mismatched worktree cleanup incomplete — path still present under managed root; remove before re-run";
+        } else {
+          cleanupNote = "; mismatched worktree removed from managed root";
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        cleanupNote = `; mismatched worktree cleanup failed: ${msg}`;
+      }
+    } else {
+      cleanupNote =
+        "; mismatched path outside managed worktree root — refused automatic cleanup";
+    }
     const reason = boundRematerializeReason(
-      `worktree HEAD after rematerialize (${headSha || "unresolved"}) does not match intended tip ${intendedSha}`,
+      `worktree HEAD after rematerialize (${headSha || "unresolved"}) does not match intended tip ${intendedSha}` +
+        cleanupNote,
     );
     await recordRematerializeGate(deps, "fail", reason);
     return { result: "fail", worktree: null, reason, blockerKind: "worktree-creation-failed" };

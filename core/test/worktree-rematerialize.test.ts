@@ -215,7 +215,9 @@ test("ensureManagedWorktree: reclaim-dirty create failure → worktree-creation-
   assert.match(out.reason, /dirty|reclaim/i);
 });
 
-test("ensureManagedWorktree: HEAD mismatch after create → worktree-creation-failed", async () => {
+test("ensureManagedWorktree: HEAD mismatch after create → worktree-creation-failed + removes mismatched path", async () => {
+  const removed: Array<{ issue: number; slug: string; path?: string }> = [];
+  let pathPresent = true;
   const deps: EnsureManagedWorktreeDeps = {
     getOnDiskForIssue: async () => null,
     getIssueTitle: async () => "Rematerialize Test",
@@ -227,11 +229,68 @@ test("ensureManagedWorktree: HEAD mismatch after create → worktree-creation-fa
       stderr: "",
       code: 0,
     }),
+    removeWorktree: async (_cfg, issueNumber, slug, resolvedPath) => {
+      removed.push({ issue: issueNumber, slug, path: resolvedPath });
+      pathPresent = false;
+    },
+    existsSync: (p) => (p === WT_PATH ? pathPresent : false),
   };
   const out = await ensureManagedWorktree(cfg, ISSUE, deps);
   assert.equal(out.result, "fail");
   assert.equal(out.blockerKind, "worktree-creation-failed");
   assert.match(out.reason, /does not match intended tip/);
+  assert.equal(removed.length, 1);
+  assert.equal(removed[0]!.issue, ISSUE);
+  assert.equal(removed[0]!.slug, SLUG);
+  assert.equal(removed[0]!.path, WT_PATH);
+  assert.match(out.reason, /mismatched worktree removed/);
+  assert.equal(pathPresent, false);
+});
+
+test("ensureManagedWorktree: HEAD mismatch cleanup prevents re-entry skip on mismatched tree", async () => {
+  // Regression for #769 review-2 f9fac3ac: a post-create HEAD mismatch must
+  // not leave a path that the next ensure/stage entry treats as valid present.
+  let onDisk: { path: string; slug: string } | null = null;
+  let createCalls = 0;
+  let removeCalls = 0;
+  const shared: EnsureManagedWorktreeDeps = {
+    getOnDiskForIssue: async () => onDisk,
+    getIssueTitle: async () => "Rematerialize Test",
+    gitCmd: async () => ({ stdout: `${TIP_SHA}\trefs/heads/x\n`, stderr: "", code: 0 }),
+    resolveOpenPrHeadForBranch: async () => ({ prNumber: PR, headSha: TIP_SHA }),
+    createWorktree: async () => {
+      createCalls += 1;
+      onDisk = { path: WT_PATH, slug: SLUG };
+      return { path: WT_PATH, branch: BRANCH };
+    },
+    gitInWorktree: async () => ({
+      // Always mismatch so create never becomes a pass.
+      stdout: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+      stderr: "",
+      code: 0,
+    }),
+    removeWorktree: async () => {
+      removeCalls += 1;
+      onDisk = null; // simulate successful managed-root cleanup
+    },
+    existsSync: (p) => p === WT_PATH && onDisk !== null,
+  };
+
+  const first = await ensureManagedWorktree(cfg, ISSUE, shared);
+  assert.equal(first.result, "fail");
+  assert.equal(first.blockerKind, "worktree-creation-failed");
+  assert.equal(createCalls, 1);
+  assert.equal(removeCalls, 1);
+  assert.equal(onDisk, null, "mismatched path must not remain discoverable");
+
+  // Re-entry after blocked label is cleared: lookup must not classify the
+  // former mismatched tree as present (would skip rematerialize and proceed).
+  const second = await ensureManagedWorktree(cfg, ISSUE, shared);
+  assert.equal(second.result, "fail");
+  assert.notEqual(second.result, "skipped");
+  assert.equal(createCalls, 2, "re-entry must attempt create again, not skip");
+  assert.equal(removeCalls, 2);
+  assert.equal(onDisk, null);
 });
 
 test("ensureManagedWorktree: no runDir still returns contract (no event)", async () => {

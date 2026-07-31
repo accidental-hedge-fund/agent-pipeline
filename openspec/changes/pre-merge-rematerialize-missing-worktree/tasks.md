@@ -3,7 +3,7 @@
 - [x] 1.1 Implement injectable `ensureManagedWorktree` with fixed result contract: `{ result: pass|skipped|fail, worktree, reason, blockerKind? }`.
 - [x] 1.2 Lookup: on-disk managed path present → `skipped` (no force recreate). Absent / stale metadata without path → rematerialize.
 - [x] 1.3 Create path: delegate to `createWorktree` (same startPoint + #622 reclaim). Slug from `slugify(issue title)`.
-- [x] 1.4 After create: verify worktree `HEAD` equals open-PR `head_sha` when open PR exists, else verified remote tip SHA; mismatch → `fail` + `worktree-creation-failed`.
+- [x] 1.4 After create: verify worktree `HEAD` equals open-PR `head_sha` when open PR exists, else verified remote tip SHA; mismatch → `fail` + `worktree-creation-failed` and remove/quarantine the just-created managed path so re-entry cannot skip on the mismatched tree (#769 review-2).
 - [x] 1.5 Map failures: capacity → `worktree-capacity`; create/reclaim/auth/branch/HEAD → `worktree-creation-failed`; no recoverable identity → `worktree-missing`.
 - [x] 1.6 When `runDir` present, always append `gate_result` gate=`worktree-rematerialize` for pass/fail/skipped with bounded reason.
 - [x] 1.7 Plumb seam through `AdvancePreMergeDeps` / fix deps / autofix production closure; unit tests inject fakes only.
@@ -40,7 +40,7 @@
 - [x] 6.4 Membership unconfirmed (listing throws) → rematerialize attempted; fail → typed block (not `null`).
 - [x] 6.5 Already-present worktree → `skipped`; no create call; durable skipped event when runDir set.
 - [x] 6.6 Stale manager metadata / absent on-disk path → treated as missing; rematerialize invoked.
-- [x] 6.7 HEAD mismatch after create → `fail` + `worktree-creation-failed`; stage does not continue on mismatched tree.
+- [x] 6.7 HEAD mismatch after create → `fail` + `worktree-creation-failed`; mismatched managed path is removed; re-entry does not `skip` on that tree.
 - [x] 6.8 Failure mapping: capacity / reclaim-dirty / reclaim-local-only / auth-or-branch → correct `blockerKind`.
 - [x] 6.9 Regression: #622 dirty / local-only / unverifiable candidate under managed root refuses destructive reclaim.
 - [x] 6.10 Durable events: pass / fail / skipped each recorded with gate `worktree-rematerialize` when runDir present.

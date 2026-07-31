@@ -9,7 +9,7 @@ Rematerialize SHALL:
 1. Resolve the branch as `pipeline/<issueNumber>-<slug>` with `slug` from the issue title (`slugify`), matching planning’s create identity.
 2. Reuse `createWorktree` startPoint resolution and #622 reclaim safety: prefer verified remote tip `origin/<pipeline/N-…>` when `ls-remote` confirms the tip and the local remote-tracking ref matches after fetch; else recover from the open pull request head (`pull/<prNumber>/head` / open-PR `head_sha`). It SHALL NOT use a stale local-only branch ref as the sole startPoint when remote/PR recovery is available or required.
 3. Refuse to force-destroy dirty workdirs or local-only unpushed commits (dirty/local-only checks apply only when an existing reclaim candidate path is present; managed-root containment is preserved).
-4. After a successful create, verify the recreated worktree `HEAD` equals the open-PR head SHA when an open PR exists for that branch, otherwise the verified remote tip SHA used as startPoint. A HEAD mismatch SHALL be treated as rematerialize failure (`worktree-creation-failed`).
+4. After a successful create, verify the recreated worktree `HEAD` equals the open-PR head SHA when an open PR exists for that branch, otherwise the verified remote tip SHA used as startPoint. A HEAD mismatch SHALL be treated as rematerialize failure (`worktree-creation-failed`). On HEAD mismatch the seam SHALL remove (or otherwise quarantine so lookup cannot classify it as present) the just-created managed worktree path when that path is under the managed worktree root, so a later re-entry cannot `skip` rematerialize and proceed archive/autofix/fix on the mismatched revision.
 5. Map capacity refusals to `worktree-capacity` and other create/reclaim/auth/branch/HEAD failures to `worktree-creation-failed`. When rematerialize cannot be attempted because no recoverable remote branch or open-PR head exists, map to `worktree-missing`.
 
 When rematerialize succeeds (`result: pass`), the stage SHALL continue with the recreated worktree. When it fails (`result: fail`), the stage SHALL block with the seam’s `blockerKind` and a reason that names the rematerialize failure — it SHALL NOT first-hop to a product-judgment `needs-human` park whose sole cause is a missing tree. When lookup already finds an on-disk managed worktree, the seam SHALL return `result: skipped` and SHALL NOT remove and recreate that worktree solely because a stage requires a tree.
@@ -56,6 +56,15 @@ When rematerialize succeeds (`result: pass`), the stage SHALL continue with the 
 - **WHEN** `createWorktree` returns a path but worktree `HEAD` does not equal the open-PR head SHA (or verified remote tip SHA)
 - **THEN** the seam SHALL return `result: fail` with `blockerKind: worktree-creation-failed`
 - **AND** the stage SHALL NOT continue archive/autofix/fix on the mismatched tree
+- **AND** when the created path is under the managed worktree root, the seam SHALL remove or quarantine that path so subsequent on-disk lookup does not treat it as a valid present worktree
+
+#### Scenario: HEAD-mismatch leftover does not skip on re-entry
+
+- **WHEN** a prior rematerialize attempt failed post-create HEAD verification and cleaned up the mismatched managed path
+- **AND** the pipeline re-enters a scoped stage that calls `ensureManagedWorktree`
+- **THEN** on-disk lookup SHALL NOT classify the former mismatched path as present solely from that failed create
+- **AND** the seam SHALL NOT return `skipped` for that stale mismatched tree
+- **AND** rematerialize SHALL be attempted again (or fail typed) rather than proceeding archive/autofix/fix on the wrong revision
 
 ---
 
