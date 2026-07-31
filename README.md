@@ -54,13 +54,13 @@ The installer prints a prerequisite checklist during install (warnings do not bl
 
 ```bash
 # Pinned to a released version (reproducible — recommended):
-npx -y github:accidental-hedge-fund/agent-pipeline#v1.2.1 install
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.28.4 install
 
 # Or track the latest default branch:
 npx github:accidental-hedge-fund/agent-pipeline install
 ```
 
-This detects which of `~/.claude` and `~/.codex` exist and installs to each. After installing for Codex, **restart Codex** to pick up the skill. Pin to a tag (`#v1.2.1`) for a reproducible install; the bare form tracks the latest default branch — see [Install a specific version](#install-a-specific-version).
+This detects which of `~/.claude` and `~/.codex` exist and installs to each. After installing for Codex, **restart Codex** to pick up the skill. Pin to a tag (`#v1.28.4`) for a reproducible install; the bare form tracks the latest default branch — see [Install a specific version](#install-a-specific-version).
 
 **Step 2 — Label an issue and run**
 
@@ -101,10 +101,10 @@ npx github:accidental-hedge-fund/agent-pipeline install --host claude
 npx github:accidental-hedge-fund/agent-pipeline install --host codex
 ```
 
-For a reproducible, non-interactive install — pin the released tag (`#v1.2.1`) and auto-accept the optional-dependency prompts with `--yes-deps`:
+For a reproducible, non-interactive install — pin the released tag (`#v1.28.4`) and auto-accept the optional-dependency prompts with `--yes-deps`:
 
 ```bash
-npx -y github:accidental-hedge-fund/agent-pipeline#v1.2.1 install --host claude --yes-deps
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.28.4 install --host claude --yes-deps
 ```
 
 The bare commands above always track the **latest** default branch; add `#<tag>` to pin a release. The pipeline is **cross-harness** regardless of which host you install — `--host claude` only controls where the skill lands; the *other* harness's CLI is still required for review.
@@ -154,14 +154,14 @@ Update later with `/plugin marketplace update ahf-tools`.
 ### Install a specific version
 
 ```bash
-npx -y github:accidental-hedge-fund/agent-pipeline#v1.2.1 install --host claude
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.28.4 install --host claude
 ```
 
 Or clone and check out the tag:
 
 ```bash
 gh repo clone accidental-hedge-fund/agent-pipeline
-cd agent-pipeline && git checkout v1.2.1
+cd agent-pipeline && git checkout v1.28.4
 node scripts/install.mjs install --host claude
 ```
 
