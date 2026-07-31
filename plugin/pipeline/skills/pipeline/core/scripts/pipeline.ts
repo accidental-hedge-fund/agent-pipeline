@@ -44,6 +44,7 @@ import {
   transition,
 } from "./gh.ts";
 import { isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
+import { findWrapperPidForIssue, isCoexistenceFailureEvidence } from "./loop/live-advance.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import {
   attestPipelineComment,
@@ -842,6 +843,8 @@ export function buildTerminalLinkagePayload(
 export function classifyDispatchOutcome(
   detail: { labels: readonly string[]; state: string },
   lastBlockerKind?: string | null,
+  /** Optional advance events.jsonl body for mid-stage / coexistence classification (#770). */
+  eventsText?: string | null,
 ): LoopExecutionResponse["outcome"] {
   const readyLabel = `${LABEL_PREFIX}ready-to-deploy`;
   if (detail.labels.includes(readyLabel)) return "ready_to_deploy";
@@ -850,6 +853,12 @@ export function classifyDispatchOutcome(
     return "blocked_needs_human";
   }
   if (detail.state === "closed") return "abandoned";
+  // Coexistence is only lock / already-running / install evidence — never bare
+  // mid-stage skipped/waiting events that can mask a genuine crash (#770 review
+  // finding 929fc0ac).
+  if (isCoexistenceFailureEvidence(eventsText)) {
+    return "coexistence_wait";
+  }
   return "failed";
 }
 
@@ -1068,7 +1077,9 @@ export function realDispatchItem(
           blockedLabeledAt,
         });
       }
-      outcome = classifyDispatchOutcome(detail, lastKind);
+      const eventsTextForClassify =
+        pin && storeReady ? readEventsTextFn(pin.events_path) : null;
+      outcome = classifyDispatchOutcome(detail, lastKind, eventsTextForClassify);
       // Pure capacity is ops admission, not a product block: clear the label so
       // re-admission after a slot frees does not thrash on an already-blocked
       // early-exit (#718). Clear MUST succeed before capacity_wait is safe for a
@@ -1550,6 +1561,12 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     observe: defaultReconcileObserveDeps(cfg),
     dispatchItem: realDispatchItem(cfg, input.engine),
     getChangedFiles: realGetChangedFiles(cfg),
+    // Host-local live-advance probe scope (#770): run-store discovery + domain
+    // + production wrapper/process identity under ~/.pipeline/runs/<issue>
+    // (#770 review 2 finding 956d20df).
+    repoDir: cfg.repo_dir,
+    lockDomain: cfg.domain,
+    findWrapperPid: (issueNumber) => findWrapperPidForIssue(issueNumber),
     // Mid-advance stage-progress observation (#611): read the linked advance
     // events.jsonl while waiting on the child. Injectable for unit tests.
     readAdvanceEvents: async (eventsPath) => {

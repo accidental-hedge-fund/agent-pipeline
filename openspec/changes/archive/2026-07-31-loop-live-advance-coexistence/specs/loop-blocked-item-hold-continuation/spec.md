@@ -1,62 +1,4 @@
-# loop-blocked-item-hold-continuation Specification
-
-## Purpose
-TBD - created by archiving change loop-blocked-item-hold-continuation. Update Purpose after archive.
-## Requirements
-### Requirement: An already-blocked dispatched item SHALL be held per-item, never a run-fatal engine defect
-
-The supervisor SHALL record a dispatched item as a per-item **needs-human hold** — never
-classify it under the `workflow-engine-defect` blocker class and never record a `run_fatal`
-or `human_authority` run stop for it — when, on live truth, the item is observed carrying
-the `pipeline:blocked` label, the dispatch made no stage transition, and the dispatch
-neither crashed nor was rejected. Detection of the `pipeline:blocked` disposition SHALL use
-the **presence** of that label in the item's observed live label set, independent of any
-co-present `pipeline:*` stage label and independent of the single-winner stage value derived
-for the item; a `pipeline:blocked` label co-present with any other `pipeline:*` stage label
-SHALL still be detected. A `pipeline:blocked` label whose recorded reason is absent, empty,
-or otherwise unrecoverable (a stale or orphaned blocker) SHALL be dispositioned identically
-to any other `pipeline:blocked` label — a needs-human hold — because its remediation is
-identical: a human clears the label and the run resumes. The disposition SHALL be a
-deterministic function of the observed live labels and the pre/post-dispatch label-add
-history, so a unit test drives it with no real network, git, or subprocess call. A genuine
-engine defect — a rejected or crashed dispatch, or an unrecognized terminal outcome with the
-item at no `pipeline:blocked` state — SHALL remain classified `workflow-engine-defect` with
-its `run_fatal` policy unchanged.
-
-#### Scenario: A stale co-present blocked label becomes a hold, not a run-fatal defect
-
-- **WHEN** a dispatched item is observed carrying `pipeline:blocked` co-present with a
-  `pipeline:*` stage label, the dispatch made zero stage transitions, and the dispatch
-  neither crashed nor was rejected
-- **THEN** the supervisor SHALL record the item as a per-item needs-human hold
-- **AND** it SHALL NOT classify the item under `workflow-engine-defect`
-- **AND** it SHALL NOT record a `run_fatal` or `human_authority` run stop
-
-#### Scenario: A reason-less blocker is dispositioned like any blocker
-
-- **WHEN** the observed `pipeline:blocked` label carries no recoverable reason (a stale,
-  orphaned audit-repair placeholder)
-- **THEN** the supervisor SHALL record the item as a per-item needs-human hold exactly as it
-  would for a `pipeline:blocked` label carrying a reason
-- **AND** it SHALL NOT treat the missing reason as a genuine engine defect
-
-#### Scenario: Presence detection does not depend on the stage-winner
-
-- **WHEN** the item's single-winner pipeline stage value derived from its labels is a value
-  other than `blocked`, yet `pipeline:blocked` is present in the same label set
-- **THEN** the supervisor SHALL detect the `pipeline:blocked` disposition from the label's
-  presence and route the item to the needs-human hold
-- **AND** it SHALL NOT fall through to `workflow-engine-defect` because `blocked` was not the
-  stage-winner
-
-#### Scenario: A genuine engine defect is still run-fatal
-
-- **WHEN** a dispatch is rejected or crashes, or reports an outcome outside the defined
-  terminal set with the item at no `pipeline:blocked` state
-- **THEN** the outcome SHALL be classified `workflow-engine-defect`
-- **AND** its existing `run_fatal` policy SHALL apply unchanged
-
----
+## MODIFIED Requirements
 
 ### Requirement: A per-item needs-human hold SHALL NOT terminate a run that still has schedulable work
 
@@ -121,36 +63,7 @@ are considered done, or weaken the existing no-progress watchdog.
 - **AND** a durable record SHALL show that re-admission was deferred for coexistence rather
   than treating the item as unconditionally cleared for dispatch
 
-### Requirement: Schedule next_actions SHALL NOT advertise advance for GitHub-blocked items without an unblock path
-
-The durable loop schedule SHALL NOT present an actionable `advance` disposition in `next_actions`
-for an item whose live labels include `pipeline:blocked` (including when a stage label co-presents)
-when no unblock path has cleared that blocker. The action SHALL be a hold / waiting /
-unblock-oriented disposition consistent with the per-item needs-human hold model, until a human
-clears `pipeline:blocked` or an audited unblock path applies. This requirement is additive
-disclosure and schedule hygiene: it SHALL NOT weaken run-fatal classification for genuine engine
-defects, and SHALL NOT clear or rewrite GitHub labels on its own.
-
-#### Scenario: Blocked pre-merge item is not next_actions advance
-
-- **WHEN** live labels for an item include `pipeline:blocked` after a pre-merge needs-human
-  escalation
-- **AND** no unblock path has cleared that label
-- **THEN** reconciliation `next_actions` for that item SHALL NOT be an actionable `advance`
-- **AND** the disposition SHALL indicate the item is held awaiting human unblock (or equivalent
-  non-dispatchable state)
-
-#### Scenario: Cleared blocker can become advanceable again
-
-- **WHEN** a previously blocked item no longer carries `pipeline:blocked` on live truth and is
-  otherwise schedulable
-- **THEN** reconciliation MAY assign an `advance` (or other progressive) next action under the
-  existing scheduler rules
-
-#### Scenario: Engine defects remain run-fatal when applicable
-
-- **WHEN** a dispatch is rejected or crashes without a `pipeline:blocked` disposition
-- **THEN** existing `workflow-engine-defect` / `run_fatal` policy SHALL apply unchanged
+## ADDED Requirements
 
 ### Requirement: Hold-clear reconciliation SHALL consult live-advance evidence before frontier re-admission
 
@@ -177,4 +90,3 @@ hold model or the non-run-fatal continuation of schedulable siblings.
 - **THEN** the supervisor MAY re-admit `675` under ordinary scheduler rules
 - **AND** a subsequent dispatch, if any, is not classified as coexistence solely for the prior
   live period
-

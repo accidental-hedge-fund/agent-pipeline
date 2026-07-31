@@ -183,15 +183,67 @@ export function writeSentinel(runDirPath: string, data: SentinelData): void {
 }
 
 // ---------------------------------------------------------------------------
+// Process-instance identity for detach lock markers (#770 review / #668)
+//
+// PID alone is not enough: after a wrapper is killed before sentinel.json,
+// the OS may reuse the recorded PID for an unrelated process. Markers therefore
+// store `pid starttime` and readers must verify both (see live-advance.ts).
+// ---------------------------------------------------------------------------
+
+/**
+ * Host process starttime token for `pid`.
+ * Linux: `/proc/<pid>/stat` field 22 (clock ticks). Darwin/portable: `ps -o lstart=`.
+ * Returns null when the process is gone or the token cannot be read.
+ */
+export function getProcessStartTime(pid: number): string | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const s = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const i = s.lastIndexOf(")");
+    if (i >= 0) {
+      const f = s.slice(i + 2).trim().split(/\s+/);
+      if (f[19]) return f[19];
+    }
+  } catch {
+    /* not Linux, or process gone — try portable fallback */
+  }
+  try {
+    const out = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: 2000,
+    });
+    if (out.status === 0) {
+      const t = (out.stdout ?? "").trim();
+      if (t) return t;
+    }
+  } catch {
+    /* ps unavailable */
+  }
+  return null;
+}
+
+/**
+ * Body for `.lock` / `.lock-acquired`: `pid starttime` when starttime is known,
+ * else bare `pid` (readers treat bare pid as non-verifiable / non-live).
+ */
+export function formatProcessIdentityMarker(
+  pid: number = process.pid,
+  getStartTime: (p: number) => string | null = getProcessStartTime,
+): string {
+  const st = getStartTime(pid);
+  return st != null && st !== "" ? `${pid} ${st}` : String(pid);
+}
+
+// ---------------------------------------------------------------------------
 // Advisory lock helpers
 // ---------------------------------------------------------------------------
 
-/** Atomically create the lock file with own PID. Returns true on success. */
+/** Atomically create the lock file with own PID + starttime. Returns true on success. */
 function tryWriteLock(lp: string): boolean {
   try {
     const fd = fs.openSync(lp, "wx");
     try {
-      fs.writeSync(fd, String(process.pid));
+      fs.writeSync(fd, formatProcessIdentityMarker());
     } finally {
       fs.closeSync(fd);
     }
@@ -481,7 +533,8 @@ export async function runWrapper(argv: string[]): Promise<void> {
     process.exit(1);
   }
   try {
-    fs.writeFileSync(path.join(runDirPath, LOCK_ACQUIRED_FILE), String(process.pid));
+    // pid + starttime so coexistence probes can reject recycled PIDs (#770).
+    fs.writeFileSync(path.join(runDirPath, LOCK_ACQUIRED_FILE), formatProcessIdentityMarker());
   } catch {
     /* best-effort handshake — the launcher's wait will time out and clean up */
   }

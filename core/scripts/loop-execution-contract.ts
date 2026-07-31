@@ -54,6 +54,12 @@ export const LOOP_TERMINAL_OUTCOMES = [
    * needs-human so the durable supervisor does not cascade human answer holds.
    */
   "capacity_wait",
+  /**
+   * Host-local advance coexistence (#770): another advance is live for this
+   * issue, or the just-finished dispatch exited mid-pipeline without a product
+   * block. Must never map to workflow-engine-defect / run_fatal.
+   */
+  "coexistence_wait",
   "failed",
   "abandoned",
 ] as const;
