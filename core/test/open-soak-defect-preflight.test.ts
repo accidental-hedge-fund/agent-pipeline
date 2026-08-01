@@ -73,6 +73,14 @@ test("open typed terminal engine-class defects block with doctor-grade message",
         engineClass: true,
         blockerClass: "workflow-engine-defect",
       },
+      {
+        issueNumber: 714,
+        loopRunId: "loop-4d2de11c6c029a2f-s1",
+        terminal: true,
+        recovered: false,
+        engineClass: true,
+        blockerClass: "workflow-engine-defect",
+      },
     ],
   });
   assert.equal(result.ok, false);
@@ -245,6 +253,24 @@ test("override with non-empty reason permits pass and returns waived issues", as
           body: "loop-4d2de11c6c029a2f-s1 workflow-engine-defect",
         }),
       ],
+      listTypedSoakEvidence: async () => [
+        {
+          issueNumber: 712,
+          loopRunId: "loop-4d2de11c6c029a2f-s1",
+          terminal: true,
+          recovered: false,
+          engineClass: true,
+          blockerClass: "workflow-engine-defect",
+        },
+        {
+          issueNumber: 714,
+          loopRunId: "loop-4d2de11c6c029a2f-s1",
+          terminal: true,
+          recovered: false,
+          engineClass: true,
+          blockerClass: "workflow-engine-defect",
+        },
+      ],
     },
   );
   assert.equal(result.ok, true);
@@ -265,26 +291,40 @@ test("empty override reason is rejected (fail closed)", async () => {
           body: "loop-4d2de11c6c029a2f-s1 Blocker class: workflow-engine-defect",
         }),
       ],
+      listTypedSoakEvidence: async () => [
+        {
+          issueNumber: 712,
+          loopRunId: "loop-4d2de11c6c029a2f-s1",
+          terminal: true,
+          recovered: false,
+          engineClass: true,
+          blockerClass: "workflow-engine-defect",
+        },
+      ],
     },
   );
   assert.equal(result.ok, false);
 });
 
-test("created-since-previous-tag window is considered for typed body markers", async () => {
+test("created-since-previous-tag window is considered via label-fallback", async () => {
+  // Without soak body linkage, post-tag window still evaluates under engine-class
+  // rules: label-fallback (bug + pipeline:engine-class), not uncorroborated body text.
   const result = await runOpenSoakDefectPreflight(BASE_INPUT, {
     listOpenIssues: async () => [
       openIssue({
         number: 900,
         title: "post-tag engine defect without embedded loop id",
         body: "Blocker class: workflow-engine-defect\nterminal exhaustion",
+        labels: [BUG_LABEL, ENGINE_CLASS_MARKER_LABEL],
         createdAt: "2026-07-30T10:00:00Z",
       }),
     ],
+    listTypedSoakEvidence: async () => [],
   });
   assert.equal(result.ok, false);
   if (result.ok) throw new Error("expected fail");
   assert.equal(result.blocking[0]!.issueNumber, 900);
-  assert.equal(result.blocking[0]!.classificationSource, "typed");
+  assert.equal(result.blocking[0]!.classificationSource, "label-fallback");
 });
 
 test("formatOpenSoakDefectWaiverSection lists issues and reason", () => {
@@ -420,4 +460,102 @@ test("typed evidence without issue number joins open issue by fingerprint", asyn
   if (result.ok) throw new Error("expected fail");
   assert.equal(result.blocking[0]!.issueNumber, 723);
   assert.equal(result.blocking[0]!.classificationSource, "typed");
+});
+
+test("ledger join does not attribute terminal evidence via soak id alone", async () => {
+  // Regression for b50dce47: terminal typed evidence without issueNumber must not
+  // join every open issue that merely mentions the candidate soak run.
+  const result = await runOpenSoakDefectPreflight(BASE_INPUT, {
+    listOpenIssues: async () => [
+      openIssue({
+        number: 901,
+        title: "unrelated product follow-up from same soak",
+        body: [
+          "Seen during soak loop-4d2de11c6c029a2f-s1",
+          "Not the engine defect — product UX niggle only.",
+        ].join("\n"),
+        labels: [],
+      }),
+      openIssue({
+        number: 902,
+        title: "Durable-run blocker: workflow-engine-defect:fp-real",
+        body: [
+          "Evidence fingerprint: fp-real",
+          "Affected run IDs",
+          "- loop-4d2de11c6c029a2f-s1",
+          "Blocker class: workflow-engine-defect",
+        ].join("\n"),
+        labels: [],
+      }),
+    ],
+    listTypedSoakEvidence: async (): Promise<TypedSoakEvidence[]> => [
+      {
+        issueNumber: null,
+        loopRunId: "loop-4d2de11c6c029a2f-s1",
+        terminal: true,
+        recovered: false,
+        engineClass: true,
+        blockerClass: "workflow-engine-defect",
+        fingerprint: "fp-real",
+        reasonKey: "terminal-engine-class",
+      },
+    ],
+  });
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error("expected fail");
+  assert.equal(result.blocking.length, 1);
+  assert.equal(result.blocking[0]!.issueNumber, 902);
+  assert.equal(result.blocking[0]!.classificationSource, "typed");
+  assert.ok(!result.blocking.some((b) => b.issueNumber === 901));
+});
+
+test("uncorroborated issue body markers for recovered intermediate do not block", async () => {
+  // Regression for 6d2381fd: soak-linked open issue text with engine-class markers
+  // is non-authoritative unless joined to terminal/recovery-exhaustion evidence.
+  const result = await runOpenSoakDefectPreflight(BASE_INPUT, {
+    listOpenIssues: async () => [
+      openIssue({
+        number: 910,
+        title: "tracking: mid-run engine-adjacent that recovered",
+        body: [
+          "loop-4d2de11c6c029a2f-s1",
+          "Blocker class: workflow-engine-defect",
+          "disposition: engine-class",
+          "Recovered in-run; item completed successfully.",
+          "Evidence fingerprint: fp-recovered-mid",
+        ].join("\n"),
+        labels: [], // no label-fallback either
+      }),
+    ],
+    listTypedSoakEvidence: async (): Promise<TypedSoakEvidence[]> => [
+      {
+        issueNumber: null,
+        loopRunId: "loop-4d2de11c6c029a2f-s1",
+        terminal: false,
+        recovered: true,
+        engineClass: true,
+        blockerClass: "workflow-engine-defect",
+        fingerprint: "fp-recovered-mid",
+        title: "mid-run recovered",
+        reasonKey: "recovered-intermediate",
+      },
+    ],
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.blocking, []);
+});
+
+test("issue body markers alone without terminal ledger evidence do not block as typed", async () => {
+  const result = await runOpenSoakDefectPreflight(BASE_INPUT, {
+    listOpenIssues: async () => [
+      openIssue({
+        number: 911,
+        title: "mentions engine defect markers only",
+        body: "loop-4d2de11c6c029a2f-s1 Blocker class: workflow-engine-defect",
+      }),
+    ],
+    listTypedSoakEvidence: async () => [],
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.blocking, []);
 });

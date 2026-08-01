@@ -291,14 +291,34 @@ export async function runOpenSoakDefectPreflight(
       continue;
     }
 
-    // Join ledger-terminal evidence to open issues via fingerprint / soak id /
-    // blocker class markers so missing issueNumber still yields a typed block.
+    // Join ledger-terminal evidence to open issues only via defect-specific
+    // linkage (fingerprint, or matching typed blocker-class/disposition).
+    // Soak identity is an additional constraint — never sufficient alone
+    // (otherwise any open issue that merely mentions the soak run would block).
     const matched = openIssues.filter((issue) => {
       const hay = `${issue.title}\n${issue.body ?? ""}`;
-      if (ev.fingerprint && hay.includes(ev.fingerprint)) return true;
-      if (ev.loopRunId && hay.includes(ev.loopRunId)) return true;
-      if (ev.blockerClass && new RegExp(`Blocker class:\\s*${escapeRegExp(ev.blockerClass)}`, "i").test(hay)) {
-        return soakIds.length === 0 || soakIds.some((id) => hay.includes(id));
+      const soakLinked =
+        soakIds.length === 0 || issueReferencesSoak(issue, soakIds);
+      if (!soakLinked) return false;
+      // When evidence carries a fingerprint, that is the only join key —
+      // do not fall through to class-level matching (would over-join).
+      if (ev.fingerprint) {
+        return hay.includes(ev.fingerprint);
+      }
+      // No fingerprint: require matching typed diagnostic line or #760 disposition.
+      if (
+        ev.blockerClass &&
+        new RegExp(`Blocker class:\\s*${escapeRegExp(ev.blockerClass)}`, "i").test(hay)
+      ) {
+        return true;
+      }
+      if (
+        ev.blockerClass &&
+        issue.typedDisposition != null &&
+        issue.typedDisposition === ev.blockerClass &&
+        classifyFrgBlocker(issue.typedDisposition) === "engine-class"
+      ) {
+        return true;
       }
       return false;
     });
@@ -325,25 +345,15 @@ export async function runOpenSoakDefectPreflight(
     }
   }
 
-  // --- Open issues: soak-linked body markers (typed) + label fallback ---
+  // --- Open issues: label fallback only (body markers are non-authoritative) ---
+  // Uncorroborated issue body text (workflow-engine-defect strings, disposition
+  // markers, etc.) MUST NOT alone establish a typed terminal block — that would
+  // treat open tracking notes for in-run recoveries as release blockers.
+  // Typed classification comes solely from the ledger/diagnostic path above,
+  // which requires terminal / recovery-exhaustion evidence.
   for (const issue of openIssues) {
     const soakLinked = issueReferencesSoak(issue, soakIds);
     const inWindow = issueInPostTagWindow(issue, input.previousTagCreatedAt);
-    const typedMarkers = issueHasTypedEngineClassMarkers(issue);
-
-    // Typed: candidate-linked (soak id or #763 run ids) + engine-class body/disposition.
-    // Also accept typed markers on post-tag window issues when soak body link is missing
-    // but disposition fields mark engine-class terminal defects (historical soak window).
-    if (typedMarkers && (soakLinked || inWindow)) {
-      // Prefer not to double-count if already typed from ledger with same number.
-      addBlocking({
-        issueNumber: issue.number,
-        title: issue.title,
-        classificationSource: "typed",
-        reasonKey: "issue-typed-markers",
-      });
-      continue;
-    }
 
     // Label fallback: both markers required; only when typed evidence is absent
     // for this issue. Window OR soak linkage required.
