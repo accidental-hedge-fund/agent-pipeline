@@ -36,6 +36,7 @@ import {
   runRelease,
   resolvePreviousTagCreatedAt,
   mapGhIssueToSoakCandidate,
+  projectGithubAttributedTypedEvidence,
   type ReleaseDeps,
   type ReleaseContext,
   type CommandResult,
@@ -2281,6 +2282,209 @@ test("mapGhIssueToSoakCandidate: projects typedDisposition and candidateRunIds",
   assert.equal(mapped.typedDisposition, "workflow-engine-defect");
   assert.deepEqual(mapped.candidateRunIds, ["loop-test", "frg-test-pass"]);
   assert.equal(mapped.state, "OPEN");
+});
+
+test("projectGithubAttributedTypedEvidence: absent Terminal stop does not emit suppressing recovered evidence", () => {
+  // Regression for 37e3edb0: auto-file provenance with disposition + soak ids but
+  // no authoritative terminal/recovery marker must NOT project recovered:true
+  // typed evidence (which would suppress bug+engine-class label fallback).
+  const out = projectGithubAttributedTypedEvidence(
+    [
+      {
+        number: 740,
+        title: "Durable-run blocker: workflow-engine-defect:fp-no-term",
+        state: "OPEN",
+        labels: ["bug", "pipeline:engine-class", "pipeline:backlog"],
+        body: [
+          "**Blocker class**: workflow-engine-defect",
+          "**Evidence fingerprint**: fp-no-term",
+          // Intentionally no **Terminal stop** line — historical / incomplete body.
+          "",
+          "### Affected run IDs",
+          "- loop-test",
+          "- frg-test-pass",
+        ].join("\n"),
+        createdAt: "2026-07-30T12:00:00Z",
+        typedDisposition: "workflow-engine-defect",
+        candidateRunIds: ["loop-test", "frg-test-pass"],
+      },
+    ],
+    "loop-test",
+    "frg-test-pass",
+  );
+  assert.deepEqual(out, []);
+});
+
+test("projectGithubAttributedTypedEvidence: FRG run_id alone links terminal typed defect without loop_run_id", () => {
+  // Regression for 7335c9e2: FRG run_id is a primary soak identity; missing
+  // loop_run_id must not disable GitHub typed attribution discovery.
+  const out = projectGithubAttributedTypedEvidence(
+    [
+      {
+        number: 741,
+        title: "terminal engine defect linked only to FRG run",
+        state: "OPEN",
+        labels: ["enhancement"], // wrong labels — typed path must still project
+        body: [
+          "**Blocker class**: workflow-engine-defect",
+          "**Evidence fingerprint**: fp-frg-only",
+          "**Terminal stop**: yes",
+          "",
+          "### Affected run IDs",
+          "- frg-only-run-id",
+        ].join("\n"),
+        createdAt: "2026-07-30T12:00:00Z",
+      },
+    ],
+    null,
+    "frg-only-run-id",
+  );
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.issueNumber, 741);
+  assert.equal(out[0]!.terminal, true);
+  assert.equal(out[0]!.recovered, false);
+  assert.equal(out[0]!.engineClass, true);
+  assert.equal(out[0]!.loopRunId, null);
+  assert.equal(out[0]!.frgRunId, "frg-only-run-id");
+  assert.equal(out[0]!.fingerprint, "fp-frg-only");
+});
+
+test("projectGithubAttributedTypedEvidence: explicit Terminal stop no projects recovered", () => {
+  const out = projectGithubAttributedTypedEvidence(
+    [
+      {
+        number: 742,
+        title: "recovered intermediate",
+        state: "OPEN",
+        labels: ["bug", "pipeline:engine-class"],
+        body: [
+          "**Blocker class**: workflow-engine-defect",
+          "**Evidence fingerprint**: fp-recovered",
+          "**Terminal stop**: no",
+          "",
+          "### Affected run IDs",
+          "- frg-test-pass",
+        ].join("\n"),
+        createdAt: "2026-07-30T12:00:00Z",
+      },
+    ],
+    null,
+    "frg-test-pass",
+  );
+  assert.equal(out.length, 1);
+  assert.equal(out[0]!.terminal, false);
+  assert.equal(out[0]!.recovered, true);
+});
+
+test("runRelease: labeled open auto-file without terminal marker blocks via label-fallback (no local ledger)", async () => {
+  // Regression for 37e3edb0 end-to-end: production-style GitHub projection yields
+  // no typed row when Terminal stop is absent; bug+engine-class labels still block.
+  const written: string[] = [];
+  const openIssue = {
+    number: 740,
+    title: "Durable-run blocker: workflow-engine-defect:fp-no-term",
+    state: "OPEN" as const,
+    labels: ["bug", "pipeline:engine-class", "pipeline:backlog"],
+    body: [
+      "**Blocker class**: workflow-engine-defect",
+      "**Evidence fingerprint**: fp-no-term",
+      "",
+      "### Affected run IDs",
+      "- loop-test",
+      "- frg-test-pass",
+    ].join("\n"),
+    createdAt: "2026-07-30T12:00:00Z",
+    typedDisposition: "workflow-engine-defect",
+    candidateRunIds: ["loop-test", "frg-test-pass"],
+  };
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => {
+      written.push(p);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "for-each-ref") {
+        return {
+          code: 0,
+          stdout: `2026-06-01T00:00:00Z${"\0"}2026-05-01T00:00:00Z\n`,
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    requireFrgPass: async (_d, version) => defaultFrgPass(version),
+    listOpenSoakDefectCandidates: async () => [openIssue],
+    // Simulate real production projection (no local ledger; GitHub path only).
+    listTypedSoakEvidence: async ({ loopRunId, frgRunId }) =>
+      projectGithubAttributedTypedEvidence([openIssue], loopRunId, frgRunId),
+  });
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /#740/,
+  );
+  assert.equal(written.length, 0);
+});
+
+test("runRelease: FRG run_id only (no loop_run_id) blocks on typed engine defect", async () => {
+  // Regression for 7335c9e2 end-to-end: FRG evidence supplies only run_id; open
+  // typed terminal defect linked to that id must still block release prep.
+  const written: string[] = [];
+  const openIssue = {
+    number: 741,
+    title: "terminal engine defect linked only to FRG run",
+    state: "OPEN" as const,
+    labels: ["enhancement"],
+    body: [
+      "**Blocker class**: workflow-engine-defect",
+      "**Evidence fingerprint**: fp-frg-only",
+      "**Terminal stop**: yes",
+      "",
+      "### Affected run IDs",
+      "- frg-only-run-id",
+    ].join("\n"),
+    createdAt: "2026-07-30T12:00:00Z",
+  };
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => {
+      written.push(p);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "for-each-ref") {
+        return {
+          code: 0,
+          stdout: `2026-06-01T00:00:00Z${"\0"}2026-05-01T00:00:00Z\n`,
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    requireFrgPass: async (_d, version) => ({
+      ...defaultFrgPass(version),
+      run_id: "frg-only-run-id",
+      loop_run_id: null,
+    }),
+    listOpenSoakDefectCandidates: async () => [openIssue],
+    listTypedSoakEvidence: async ({ loopRunId, frgRunId }) =>
+      projectGithubAttributedTypedEvidence([openIssue], loopRunId, frgRunId),
+  });
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /#741/,
+  );
+  assert.equal(written.length, 0);
 });
 
 test("runRelease: typed stage-diagnostic evidence blocks despite wrong labels and no open-list body match", async () => {

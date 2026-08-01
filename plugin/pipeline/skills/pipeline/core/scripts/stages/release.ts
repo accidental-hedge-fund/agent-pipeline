@@ -176,8 +176,9 @@ export interface ReleaseDeps {
   listClosedSoakDefectCandidates?(): Promise<SoakDefectCandidateIssue[]>;
   /**
    * Typed terminal/recovery soak evidence for the candidate FRG/loop run (#755).
-   * Defaults to durable-loop blocker occurrences, canonical stage diagnostics,
-   * and GitHub #760/#763 attribution for the FRG `loop_run_id`.
+   * Defaults to durable-loop blocker occurrences + stage diagnostics when
+   * `loop_run_id` is present, and GitHub #760/#763 attribution matched by
+   * FRG `run_id` and/or `loop_run_id` (FRG run alone is sufficient).
    */
   listTypedSoakEvidence?(args: {
     loopRunId: string | null;
@@ -418,6 +419,10 @@ export function mapGhIssueToSoakCandidate(i: {
  * GitHub #760/#763 attribution for the candidate soak into typed preflight
  * evidence. Terminal + engine-class → blocking candidate; non-terminal recovered
  * intermediates are marked recovered so they do not block alone.
+ *
+ * Local ledger/diagnostic reads require `loop_run_id` to scope safely. GitHub
+ * typed attribution (#760/#763) uses FRG `run_id` as a primary soak identity and
+ * still runs when `loop_run_id` is absent (#755).
  */
 async function listTypedSoakEvidenceReal(
   loopRunId: string | null,
@@ -425,36 +430,39 @@ async function listTypedSoakEvidenceReal(
   repoDir?: string,
 ): Promise<TypedSoakEvidence[]> {
   const out: TypedSoakEvidence[] = [];
-  // When loop_run_id is absent, do not invent cross-run attribution from the
-  // whole host ledger — only FRG-linked loop id scopes typed evidence.
-  if (!loopRunId) return out;
 
-  const storeDeps = defaultLoopStoreDeps();
-  const occurrences = await readDurableRunBlockerOccurrences(storeDeps);
-  for (const occ of occurrences) {
-    if (occ.runId !== loopRunId) continue;
-    const engineClass = classifyFrgBlocker(occ.blockerClass) === "engine-class";
-    out.push({
-      issueNumber: null,
-      loopRunId: occ.runId,
-      frgRunId,
-      terminal: occ.terminal,
-      // Non-terminal occurrences in a completed run are treated as recovered
-      // intermediates unless still terminal at stop.
-      recovered: !occ.terminal,
-      engineClass,
-      blockerClass: occ.blockerClass,
-      title: `durable-run blocker ${occ.blockerClass}:${occ.fingerprint}`,
-      reasonKey: occ.blockerClass,
-      fingerprint: occ.fingerprint,
-    });
+  // Host-local durable ledger + stage diagnostics: only when loop_run_id is
+  // known. Without it, do not invent cross-run attribution from the whole
+  // host ledger — but still proceed to GitHub FRG-run attribution below.
+  if (loopRunId) {
+    const storeDeps = defaultLoopStoreDeps();
+    const occurrences = await readDurableRunBlockerOccurrences(storeDeps);
+    for (const occ of occurrences) {
+      if (occ.runId !== loopRunId) continue;
+      const engineClass = classifyFrgBlocker(occ.blockerClass) === "engine-class";
+      out.push({
+        issueNumber: null,
+        loopRunId: occ.runId,
+        frgRunId,
+        terminal: occ.terminal,
+        // Non-terminal occurrences in a completed run are treated as recovered
+        // intermediates unless still terminal at stop.
+        recovered: !occ.terminal,
+        engineClass,
+        blockerClass: occ.blockerClass,
+        title: `durable-run blocker ${occ.blockerClass}:${occ.fingerprint}`,
+        reasonKey: occ.blockerClass,
+        fingerprint: occ.fingerprint,
+      });
+    }
+
+    // Canonical pipeline/stage-diagnostic@1 from the durable loop events log.
+    out.push(...(await listStageDiagnosticTypedEvidence(loopRunId, frgRunId, storeDeps)));
   }
-
-  // Canonical pipeline/stage-diagnostic@1 from the durable loop events log.
-  out.push(...(await listStageDiagnosticTypedEvidence(loopRunId, frgRunId, storeDeps)));
 
   // Cross-host / no-local-ledger path: project structured GitHub attribution
   // (#760 disposition + #763 candidate runs + terminal stop) into typed evidence.
+  // FRG run_id alone is sufficient soak identity when loop_run_id is missing.
   out.push(...listGithubAttributedTypedEvidence(loopRunId, frgRunId, repoDir));
 
   return out;
@@ -529,24 +537,22 @@ function extractStageDiagnostic(data: Record<string, unknown>): StageDiagnostic 
 }
 
 /**
- * Project open GitHub issues with structured terminal engine-class attribution
- * into typed soak evidence so a release host without the local loop ledger still
- * fails closed on candidate-linked defects.
+ * Project open GitHub issues with structured engine-class attribution into typed
+ * soak evidence so a release host without the local loop ledger still fails
+ * closed on candidate-linked defects. Pure — injectable issues for unit tests.
+ *
+ * Authoritative terminal/recovery outcome is required: only an explicit
+ * `**Terminal stop**: yes|no` marker projects typed evidence. When that marker
+ * is absent, no typed row is emitted (including recovered/suppressing rows) so
+ * the issue stays eligible for historical label fallback (#755).
  */
-function listGithubAttributedTypedEvidence(
-  loopRunId: string,
+export function projectGithubAttributedTypedEvidence(
+  issues: SoakDefectCandidateIssue[],
+  loopRunId: string | null,
   frgRunId: string,
-  repoDir?: string,
 ): TypedSoakEvidence[] {
-  let issues: SoakDefectCandidateIssue[];
-  try {
-    issues = listSoakDefectCandidatesReal("open", repoDir);
-  } catch {
-    // Soft-fail: ledger + diagnostics still participate; missing gh must not
-    // invent empty typed coverage that would clear a real ledger hit.
-    return [];
-  }
-  const soakIds = [loopRunId, frgRunId].filter((x) => x && x.trim());
+  const soakIds = [loopRunId, frgRunId].filter((x): x is string => !!x && x.trim() !== "");
+  if (soakIds.length === 0) return [];
   const out: TypedSoakEvidence[] = [];
   for (const issue of issues) {
     const attr = projectIssueTypedAttribution(issue.body);
@@ -559,8 +565,9 @@ function listGithubAttributedTypedEvidence(
       runIds.some((id) => soakIds.includes(id)) ||
       soakIds.some((id) => `${issue.title}\n${issue.body}`.includes(id));
     if (!linked) continue;
-    // Only structured Terminal stop: yes projects as terminal typed evidence;
-    // absent/no remains non-terminal (label fallback may still apply).
+    // Missing terminal outcome is not "recovered" — do not emit suppressing
+    // typed evidence that would defeat label fallback on open engine-class bugs.
+    if (attr.terminalStop == null) continue;
     const terminal = attr.terminalStop === true;
     out.push({
       issueNumber: issue.number,
@@ -576,6 +583,26 @@ function listGithubAttributedTypedEvidence(
     });
   }
   return out;
+}
+
+/**
+ * Live GitHub-backed projection wrapper. Soft-fails on gh errors so local
+ * ledger/diagnostic hits still participate when available.
+ */
+function listGithubAttributedTypedEvidence(
+  loopRunId: string | null,
+  frgRunId: string,
+  repoDir?: string,
+): TypedSoakEvidence[] {
+  let issues: SoakDefectCandidateIssue[];
+  try {
+    issues = listSoakDefectCandidatesReal("open", repoDir);
+  } catch {
+    // Soft-fail: ledger + diagnostics still participate; missing gh must not
+    // invent empty typed coverage that would clear a real ledger hit.
+    return [];
+  }
+  return projectGithubAttributedTypedEvidence(issues, loopRunId, frgRunId);
 }
 
 /**
