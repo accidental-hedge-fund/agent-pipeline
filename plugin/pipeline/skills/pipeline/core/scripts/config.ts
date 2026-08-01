@@ -634,8 +634,9 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Auto-merge eligibility gate: classifies PRs as auto-merge-eligible or needs-human after deterministic policy checks and LLM judge evaluation (#306)."),
-  // Human-gated merge-queue defaults (#676). release_when_complete is prepare-only
-  // and default false — never tags/publishes/merges a release. No auto_merge key.
+  // Human-gated merge-queue defaults (#676/#675). release_when_complete is
+  // prepare-only and default false — never tags/publishes/merges a release.
+  // repair is opt-in surgical hold remediation (default false). No auto_merge key.
   merge_queue: z
     .object({
       release_when_complete: z
@@ -644,10 +645,26 @@ const PartialConfigSchema = z.object({
         .describe(
           "When true, merge-queue may prepare a release PR after a complete drive (still requires --release-version). Default false. Prepare-only: never tags, publishes, or merges the release.",
         ),
+      repair: z
+        .boolean()
+        .optional()
+        .describe(
+          "When true, merge-queue --apply may attempt deterministic-first then surgical/mechanical repair of conflict/CI holds (default false). Dry-run never repairs. Does not grant auto_merge.",
+        ),
+      repair_max_attempts: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe(
+          "Max charged implementer repair attempts per held item per drive (default 1). 0 disables implementer repair while still allowing deterministic re-query.",
+        ),
     })
     .strict()
     .optional()
-    .describe("Human-gated merge-queue defaults (#676). Opt-in release-when-complete only; no auto_merge."),
+    .describe(
+      "Human-gated merge-queue defaults (#676/#675). Opt-in release-when-complete and optional repair; no auto_merge.",
+    ),
   // Stage-aware issue context snapshots (#318). Optional per-repo override for
   // the character cap on the human-comment context snapshot injected into
   // planning, review, and shipcheck prompts. Absent → default (8000) applies.
@@ -1180,6 +1197,11 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       release_when_complete:
         fileConfig.merge_queue?.release_when_complete ??
         DEFAULT_CONFIG.merge_queue.release_when_complete,
+      repair:
+        fileConfig.merge_queue?.repair ?? DEFAULT_CONFIG.merge_queue.repair,
+      repair_max_attempts:
+        fileConfig.merge_queue?.repair_max_attempts ??
+        DEFAULT_CONFIG.merge_queue.repair_max_attempts,
     },
     repo_map: {
       depends_on: fileConfig.repo_map?.depends_on ?? DEFAULT_CONFIG.repo_map.depends_on,
@@ -2424,8 +2446,10 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       ].join("\n"),
     [
       "",
-      "# merge_queue: # human-gated merge-queue defaults (#676) — prepare-only release-when-complete; never tags/publishes/merges",
+      "# merge_queue: # human-gated merge-queue defaults (#676/#675) — prepare-only release-when-complete; optional surgical repair; never auto_merge / never tags-publishes-merges release",
       `#   release_when_complete: ${yamlScalar(d.merge_queue.release_when_complete)} # ${sd("merge_queue.release_when_complete", "when true, merge-queue may prepare a release PR after a complete drive (still requires --release-version); default false")}`,
+      `#   repair: ${yamlScalar(d.merge_queue.repair)} # ${sd("merge_queue.repair", "when true, merge-queue --apply may attempt surgical repair of conflict/CI holds; default false; dry-run never repairs; does not grant auto_merge")}`,
+      `#   repair_max_attempts: ${yamlScalar(d.merge_queue.repair_max_attempts)} # ${sd("merge_queue.repair_max_attempts", "max charged implementer repair attempts per held item per drive (default 1)")}`,
     ].join("\n"),
     config.context_snapshot !== undefined
       ? `\ncontext_snapshot: # stage-aware issue context snapshot cap override (#318)\n${yamlBlock(config.context_snapshot, 2)}`
