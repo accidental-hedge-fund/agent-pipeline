@@ -306,10 +306,6 @@ function blockingKey(b: BlockingSoakDefect): string {
   return `t:${b.title}|${b.reasonKey ?? ""}`;
 }
 
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 // ---------------------------------------------------------------------------
 // Preflight
 // ---------------------------------------------------------------------------
@@ -354,30 +350,14 @@ export async function runOpenSoakDefectPreflight(
     return openIssues.filter((issue) => {
       // Explicit issue linkage is authoritative when present.
       if (ev.issueNumber != null) return issue.number === ev.issueNumber;
-      const hay = `${issue.title}\n${issue.body ?? ""}`;
+      // Defect-specific identity required before projecting terminal/recovery
+      // evidence onto an open issue. blockerClass / typedDisposition are
+      // category-level and would over-join unrelated same-class soak issues
+      // (one terminal occurrence marking a recovered sibling as terminal).
+      if (!ev.fingerprint) return false;
       const soakLinked = soakIds.length === 0 || issueReferencesSoak(issue, soakIds);
       if (!soakLinked) return false;
-      // When evidence carries a fingerprint, that is the only join key —
-      // do not fall through to class-level matching (would over-join).
-      if (ev.fingerprint) {
-        return hay.includes(ev.fingerprint);
-      }
-      // No fingerprint: require matching typed diagnostic line or #760 disposition.
-      if (
-        ev.blockerClass &&
-        new RegExp(`Blocker class:\\s*${escapeRegExp(ev.blockerClass)}`, "i").test(hay)
-      ) {
-        return true;
-      }
-      if (
-        ev.blockerClass &&
-        issue.typedDisposition != null &&
-        issue.typedDisposition === ev.blockerClass &&
-        classifyFrgBlocker(issue.typedDisposition) === "engine-class"
-      ) {
-        return true;
-      }
-      return false;
+      return issueMatchesFingerprint(issue, ev.fingerprint);
     });
   };
 
@@ -420,9 +400,9 @@ export async function runOpenSoakDefectPreflight(
     }
 
     // Join ledger-terminal evidence to open issues only via defect-specific
-    // linkage (fingerprint, or matching typed blocker-class/disposition).
-    // Soak identity is an additional constraint — never sufficient alone
-    // (otherwise any open issue that merely mentions the soak run would block).
+    // linkage (issue number handled above; fingerprint here). Soak identity
+    // is an additional constraint — never sufficient alone; blocker class /
+    // disposition alone is category-level and MUST NOT join.
     const matched = openIssuesMatchingEvidence(ev);
     if (matched.length > 0) {
       for (const open of matched) {
@@ -460,9 +440,9 @@ export async function runOpenSoakDefectPreflight(
       continue;
     }
 
-    // No fingerprint and no open join: synthetic only for explicit ledger-only
-    // projections that are known not to have a GitHub-backed defect record
-    // (tests / pre-file terminal evidence without auto-file linkage).
+    // No defect-specific identity and no open join: leave unmatched terminal
+    // evidence synthetic rather than borrowing terminal state from same-class
+    // open issues. Only for explicit ledger-only projections (title/reason).
     if (ev.title || ev.reasonKey) {
       addBlocking({
         issueNumber: null,

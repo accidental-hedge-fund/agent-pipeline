@@ -89,6 +89,35 @@ issues that represent those terminal outcomes SHALL block release preparation.
 
 ---
 
+### Requirement: Typed ledger evidence SHALL join open issues only via defect-specific identity
+
+The preflight SHALL require a defect-specific identity when projecting terminal or recovery typed
+ledger evidence onto open GitHub issues: an explicit issue number on the evidence, or a matching
+evidence fingerprint present on the issue. Category-level fields alone (`blockerClass`, typed
+disposition / `Blocker class:` body text) SHALL NOT be sufficient to join evidence to an issue.
+Unmatched terminal evidence that names a defect surface (title or reason key) MAY remain a synthetic
+unlinked blocker rather than borrowing terminal or recovered state from every soak-linked issue of
+the same class.
+
+#### Scenario: Unidentified terminal evidence does not join same-class open issues
+
+- **WHEN** terminal engine-class ledger evidence for the candidate soak has neither `issueNumber`
+  nor `fingerprint`
+- **AND** open soak-linked issues exist that share only the same blocker class or disposition
+- **THEN** the preflight SHALL NOT mark those open issues as typed terminal blockers solely via
+  that class match
+- **AND** when the evidence carries a title or reason key, it MAY appear as a synthetic unlinked
+  typed blocker instead
+
+#### Scenario: Unidentified recovered evidence does not suppress same-class label fallback
+
+- **WHEN** recovered non-terminal ledger evidence has neither `issueNumber` nor `fingerprint`
+- **AND** an open soak-linked issue carries `bug` + `pipeline:engine-class` for label fallback
+- **THEN** the preflight SHALL NOT suppress that issue's label-fallback classification solely
+  because the recovered evidence shares the same blocker class
+
+---
+
 ### Requirement: Non-empty open-defect set SHALL fail closed with doctor-grade remediation
 
 When the blocking set is non-empty and no valid audited override is supplied, the preflight SHALL

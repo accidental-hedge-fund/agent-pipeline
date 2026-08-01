@@ -663,3 +663,85 @@ test("recovered typed evidence by fingerprint suppresses label-fallback without 
   assert.equal(result.ok, true);
   assert.deepEqual(result.blocking, []);
 });
+
+test("unidentified terminal evidence does not join open issues by blocker class alone", async () => {
+  // Regression for 08ff8421: terminal ledger evidence with neither issueNumber
+  // nor fingerprint must not project onto soak-linked issues that merely share
+  // the same blocker class / disposition (category-level, not defect identity).
+  // Unmatched terminal evidence stays synthetic.
+  const result = await runOpenSoakDefectPreflight(BASE_INPUT, {
+    listOpenIssues: async () => [
+      openIssue({
+        number: 930,
+        title: "earlier recovered same-class defect still open for tracking",
+        body: [
+          "loop-4d2de11c6c029a2f-s1",
+          "Blocker class: workflow-engine-defect",
+          "Recovered; tracking only.",
+        ].join("\n"),
+        labels: [],
+        typedDisposition: "workflow-engine-defect",
+      }),
+      openIssue({
+        number: 931,
+        title: "unrelated same-class soak note",
+        body: "loop-4d2de11c6c029a2f-s1\nBlocker class: workflow-engine-defect",
+        labels: [],
+      }),
+    ],
+    listTypedSoakEvidence: async (): Promise<TypedSoakEvidence[]> => [
+      {
+        issueNumber: null,
+        loopRunId: "loop-4d2de11c6c029a2f-s1",
+        terminal: true,
+        recovered: false,
+        engineClass: true,
+        blockerClass: "workflow-engine-defect",
+        title: "unlinked terminal engine defect",
+        reasonKey: "terminal-engine-class",
+      },
+    ],
+  });
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error("expected fail");
+  assert.equal(result.blocking.length, 1);
+  assert.equal(result.blocking[0]!.issueNumber, null);
+  assert.equal(result.blocking[0]!.classificationSource, "typed");
+  assert.equal(result.blocking[0]!.title, "unlinked terminal engine defect");
+  assert.ok(!result.blocking.some((b) => b.issueNumber === 930));
+  assert.ok(!result.blocking.some((b) => b.issueNumber === 931));
+});
+
+test("unidentified recovered evidence does not suppress label-fallback by class alone", async () => {
+  // Same identity rule for recovery projection: without issueNumber/fingerprint,
+  // recovered evidence must not clear label-fallback on every same-class issue.
+  const result = await runOpenSoakDefectPreflight(BASE_INPUT, {
+    listOpenIssues: async () => [
+      openIssue({
+        number: 932,
+        title: "still open engine-class labeled defect",
+        body: "loop-4d2de11c6c029a2f-s1\nBlocker class: workflow-engine-defect",
+        labels: [BUG_LABEL, ENGINE_CLASS_MARKER_LABEL],
+        createdAt: "2026-07-30T12:00:00Z",
+        typedDisposition: "workflow-engine-defect",
+      }),
+    ],
+    listTypedSoakEvidence: async (): Promise<TypedSoakEvidence[]> => [
+      {
+        issueNumber: null,
+        loopRunId: "loop-4d2de11c6c029a2f-s1",
+        terminal: false,
+        recovered: true,
+        engineClass: true,
+        blockerClass: "workflow-engine-defect",
+        title: "recovered intermediate",
+        reasonKey: "recovered-intermediate",
+      },
+    ],
+  });
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error("expected fail");
+  assert.equal(result.blocking.length, 1);
+  assert.equal(result.blocking[0]!.issueNumber, 932);
+  assert.equal(result.blocking[0]!.classificationSource, "label-fallback");
+});
