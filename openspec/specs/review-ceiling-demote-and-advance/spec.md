@@ -4,43 +4,32 @@
 TBD - created by archiving change review-ceiling-demote-and-advance. Update Purpose after archive.
 ## Requirements
 ### Requirement: High or critical findings SHALL hard-park at the round ceiling regardless of ceiling_action
+At the repair-eligible `max_adversarial_rounds` ceiling, high or critical findings SHALL never be
+demoted. When every blocker has consumed an eligible fix attempt, the stage SHALL remain blocked as
+`review-findings` with canonical `review-findings` recovery evidence and SHALL NOT file a
+demotion follow-up. This mechanical block SHALL NOT transition to `needs-human`. If any blocker is
+new to the eligible lineage, the entire verdict SHALL route to `fix-N` rather than treating stale
+issue history as a spent ceiling.
 
-At the `max_adversarial_rounds` round-budget ceiling, the pipeline SHALL partition
-the still-blocking findings into a **high/critical** set
-(`severityRank(severity) >= severityRank("high")`) and a **below-high** set (the
-rest). When the high/critical set is non-empty, the pipeline SHALL post the
-existing "Review ceiling reached" punch-list comment and transition to
-`needs-human` — identical to the behavior before this capability — and SHALL NOT
-demote, advance, or file a follow-up issue. This park SHALL occur regardless of
-the configured `review_policy.ceiling_action`.
+#### Scenario: Recurring high finding at the ceiling enters recovery
+- **WHEN** a high or critical blocker reaches the repair-eligible ceiling after its proven fix attempt
+- **THEN** it SHALL remain blocking and SHALL enter typed mechanical recovery
+- **AND** it SHALL NOT be demoted or transitioned to `needs-human`
 
-#### Scenario: A high finding present at the ceiling parks at needs-human
-
-- **WHEN** a review round hits the `max_adversarial_rounds` ceiling with at least one `high`- or `critical`-severity blocking finding still present
-- **AND** `review_policy.ceiling_action` is `demote_and_advance`
-- **THEN** the item SHALL transition to `needs-human`
-- **AND** the pipeline SHALL NOT file a follow-up issue and SHALL NOT demote any finding
-
-#### Scenario: Mixed severities with a critical present still park
-
-- **WHEN** the ceiling is hit with a mix of `medium` and `critical` blocking findings
-- **AND** `review_policy.ceiling_action` is `demote_and_advance`
-- **THEN** the item SHALL transition to `needs-human` without demoting the `medium` findings
+#### Scenario: New high finding at an apparent issue-wide ceiling receives a fix
+- **WHEN** old issue comments would satisfy the numeric ceiling but the current blocker lacks a verified repair cycle
+- **THEN** the blocker SHALL route to `fix-N`
 
 ### Requirement: ceiling_action park SHALL preserve the current hard-park behavior
+The pipeline SHALL preserve blocking quality when `ceiling_action` is `park` and every blocker has consumed its verified repair opportunity,
+the stage SHALL preserve blocking quality but SHALL assign the block to the durable recovery
+controller. It SHALL emit `review-findings` and a canonical recover disposition, without demotion,
+override, follow-up issue, `needs-human` transition, or human-intervention event.
 
-The round-budget ceiling SHALL preserve its prior hard-park behavior for every
-finding severity when `review_policy.ceiling_action` is `park` (the default): the
-pipeline SHALL post the "Review ceiling reached" punch-list and transition to
-`needs-human`, and SHALL NOT demote findings, record dispositions, or file a
-follow-up issue.
-
-#### Scenario: Default park hard-parks even when all findings are below high
-
-- **WHEN** the ceiling is hit with only `medium` blocking findings
-- **AND** `review_policy.ceiling_action` is `park`
-- **THEN** the item SHALL transition to `needs-human`
-- **AND** the pipeline SHALL NOT file a follow-up issue and SHALL NOT demote any finding
+#### Scenario: Default park preserves blocking without human authority
+- **WHEN** all remaining blockers have consumed eligible fix attempts and `ceiling_action` is `park`
+- **THEN** the stage SHALL remain blocked and recoverable
+- **AND** no blocker SHALL be demoted or converted into human authority
 
 ### Requirement: Below-high findings at the ceiling SHALL demote and advance under demote_and_advance
 
@@ -102,19 +91,24 @@ keys for the demoted findings, so the item SHALL advance through pre-merge to
 - **AND** the item SHALL NOT re-park at `needs-human` on account of the demoted findings
 
 ### Requirement: The recurrence early-park SHALL NOT be governed by ceiling_action
+Exact eligible recurrence SHALL remain blocking independent of `ceiling_action`. Before the
+repair-eligible ceiling it SHALL enter typed mechanical recovery. At the ceiling,
+`demote_and_advance` MAY demote and defer a fully recurring below-high set through the audited
+existing path; high/critical findings SHALL instead enter mechanical recovery. New or mixed
+blockers SHALL receive `fix-N` and SHALL not be governed by recurrence or ceiling disposition.
 
-The `review-loop-recurrence` early park SHALL NOT be relaxed by
-`review_policy.ceiling_action`: a blocking finding re-emitted with an unchanged
-`findingKey` after a fix round SHALL continue to transition to `needs-human`. Only
-the `max_adversarial_rounds` round-budget ceiling SHALL be governed by
-`ceiling_action`.
+#### Scenario: Recurring medium before the ceiling enters recovery
+- **WHEN** a medium blocker recurs after a proven fix before the repair-eligible ceiling
+- **THEN** it SHALL enter typed mechanical recovery regardless of `ceiling_action`
 
-#### Scenario: Recurrence park ignores demote_and_advance
+#### Scenario: Fully recurring medium at a demote ceiling can advance
+- **WHEN** all blockers are eligible below-high recurrences at the ceiling
+- **AND** `ceiling_action` is `demote_and_advance`
+- **THEN** the audited demotion and follow-up path SHALL remain available
 
-- **WHEN** a blocking `medium` finding recurs with an unchanged `findingKey` after a fix round
-- **AND** `review_policy.ceiling_action` is `demote_and_advance`
-- **THEN** the item SHALL still transition to `needs-human` via the recurrence early-park
-- **AND** the pipeline SHALL NOT demote the finding or file a follow-up issue
+#### Scenario: New blocker is not a ceiling blocker
+- **WHEN** any current blocker lacks eligible verified repair history
+- **THEN** the verdict SHALL route to `fix-N`
 
 ### Requirement: Follow-up issue and comment writes use the shared async gh transport
 

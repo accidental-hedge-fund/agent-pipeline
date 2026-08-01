@@ -4,44 +4,18 @@
 TBD - created by archiving change durable-run-blocker-classification. Update Purpose after archive.
 ## Requirements
 ### Requirement: The engine SHALL classify every durable-run blocker into a closed typed set
+The engine SHALL define a `DurableBlockerClass` string enum comprising exactly
+`transient-rate-limit`, `workflow-state`, `implementation-ci`, `review-findings`,
+`environment-auth`, `specification-decision`, `missing-authority`, `upstream-dependency`, and
+`workflow-engine-defect`. Every durable-run transition into `blocked` SHALL carry exactly one
+member, and its blocked theme SHALL use that member as the budget key. Missing and unknown classes
+SHALL fail validation without changing durable state. An already-blocked item SHALL require an
+intervening successful recovery before another block can count as repeated evidence.
 
-The engine SHALL define a `DurableBlockerClass` string enum in the durable loop module covering
-every structurally distinct durable-run failure class, comprising exactly: `transient-rate-limit`,
-`workflow-state`, `implementation-ci`, `environment-auth`, `specification-decision`,
-`missing-authority`, `upstream-dependency`, and `workflow-engine-defect`. Every durable-run
-transition into the `blocked` state SHALL carry exactly one member of this enum, and the recorded
-blocked theme SHALL be that member's name so a block's typed class is its budget key. A block that
-supplies no class, or a value outside the enum, SHALL be refused as a validation failure that
-leaves durable state unchanged. Only an item currently `in_progress` SHALL be eligible to
-transition into `blocked` — an item already `blocked` SHALL be refused a second blocking
-transition as a validation failure, so a duplicate or retried block report on an item nothing has
-attempted to recover can never be counted as repeated no-progress; reaching `blocked` again for the
-same item requires an intervening successful recovery back to `in_progress`.
-
-#### Scenario: A blocked transition carries a valid class
-
-- **WHEN** an item transitions into `blocked` with class `implementation-ci`
-- **THEN** the transition SHALL be accepted
-- **AND** the item's recorded blocked theme SHALL be `implementation-ci`
-
-#### Scenario: A duplicate block report on an already-blocked item is refused
-
-- **WHEN** an item that is already `blocked` is given another blocking transition without an
-  intervening successful recovery back to `in_progress`
-- **THEN** it SHALL be refused as a validation failure
-- **AND** the item's repeated-evidence count SHALL NOT be incremented
-
-#### Scenario: A blocked transition without a class is refused
-
-- **WHEN** an item transitions into `blocked` with no blocker class supplied
-- **THEN** it SHALL be refused as a validation failure
-- **AND** the item's state SHALL be unchanged
-
-#### Scenario: An out-of-enum class is refused
-
-- **WHEN** an item transitions into `blocked` with a class value not in `DurableBlockerClass`
-- **THEN** it SHALL be refused as a validation failure naming the offending value
-- **AND** durable state SHALL be unchanged
+#### Scenario: Review findings carry their own durable class
+- **WHEN** an eligible review non-convergence diagnostic transitions an item into `blocked`
+- **THEN** the item's blocked theme SHALL be `review-findings`
+- **AND** its budget and recipe selection SHALL be independent of generic CI failures
 
 ### Requirement: The recovery policy SHALL be a machine-readable, validated document keyed by blocker class
 
@@ -239,4 +213,42 @@ continuation SHALL respect the existing active-item and merge-barrier invariants
   attempt and no sibling can progress
 - **THEN** the run MAY record a terminal system-failure stop
 - **AND** the stop SHALL NOT be recorded as needs-human or human-authority
+
+### Requirement: Resumed recovery contracts SHALL acquire safety-critical policy migrations
+Before a persisted contract is used for recovery, the runtime SHALL upgrade obsolete policy shapes.
+A missing newly introduced class SHALL be added from the current default without replacing other
+entries. An entry exactly matching a known stale default SHALL be replaced class by class with the current
+default so its configured recipes are executable and reachable. A custom entry
+SHALL preserve recipe order, budgets, backoff, terminal outcome, fatality, and repeat limit. The
+obsolete recipe token `reauthenticate` SHALL be renamed to `verify_authentication` wherever it
+appears. The complete migrated policy SHALL be compiled and malformed policies SHALL fail closed.
+Migration SHALL NOT rewrite the contract's canonical hash or other immutable identity fields.
+
+#### Scenario: Exact obsolete defaults gain current recipes
+- **WHEN** a resumed contract carries the pre-#787 default workflow-state, implementation-CI, authentication, or engine-defect entry
+- **THEN** each exact obsolete entry SHALL be replaced by its current default
+- **AND** the workflow, CI, and engine classes SHALL include `repair_pipeline_item`
+
+#### Scenario: Missing review class is added without resetting custom policy
+- **WHEN** a resumed contract predates `review-findings` and customizes an unrelated class
+- **THEN** runtime migration SHALL add the default `review-findings` entry
+- **AND** SHALL preserve the unrelated customization byte-for-byte except sanctioned token renames
+
+#### Scenario: Engine fallback remains reachable
+- **WHEN** a stale engine-defect default advertises restart followed by `repair_pipeline_item` but carries only one retry/repeat unit
+- **THEN** runtime migration SHALL install budgets that permit restart and the later repair action
+- **AND** tests SHALL prove both actions can be claimed in order
+
+#### Scenario: Custom policy survives migration
+- **WHEN** an entry differs from the known obsolete default
+- **THEN** its policy fields and recipe ordering SHALL be preserved
+- **AND** only an obsolete `reauthenticate` token SHALL be renamed
+
+#### Scenario: Malformed complete policy fails closed
+- **WHEN** a resumed policy contains every class but an invalid budget, recipe, or outcome
+- **THEN** migration SHALL fail with typed validation rather than silently defaulting it
+
+#### Scenario: Contract identity is immutable
+- **WHEN** runtime policy migration changes the in-memory recovery policy
+- **THEN** the canonical contract hash and run identity SHALL remain unchanged
 
