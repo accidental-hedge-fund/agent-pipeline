@@ -72,7 +72,7 @@ import {
   type VerifyDeps,
   type VerifyResult,
 } from "../verify-harness-commits.ts";
-import type { Harness, Outcome, PipelineConfig, Stage, StageOutcome } from "../types.ts";
+import type { BlockerKind, Harness, Outcome, PipelineConfig, Stage, StageOutcome } from "../types.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import { recordStage } from "../evidence-bundle.ts";
 import { INJECTION_PATTERNS } from "../artifact-sanitize.ts";
@@ -95,6 +95,12 @@ export const PLAN_REVISION_FORMAT_REPAIR_ADDENDUM = [
   "- Do not wrap that section only inside a code fence.",
   "- Then re-emit the complete revised plan (not only the acknowledgement fragment).",
 ].join("\n");
+
+type BlockedOutcome = Extract<Outcome, { advanced: false; status: "blocked" }>;
+
+function blockedOutcome(reason: string, blockerKind: BlockerKind): BlockedOutcome {
+  return { advanced: false, status: "blocked", reason, blockerKind };
+}
 
 // ---------------------------------------------------------------------------
 // OpenSpec project-config commit — exported for unit testing (#352)
@@ -279,7 +285,7 @@ export interface PlanningPhaseHooks {
         specContext: string;
         readyToPlanningMsg: string;
       }
-    | { ok: false; reason: string; tag: string }
+    | { ok: false; reason: string; tag: BlockerKind }
   >;
 
   /**
@@ -288,7 +294,7 @@ export interface PlanningPhaseHooks {
    */
   validateArtifact(wt: { path: string }): Promise<
     | { ok: true }
-    | { ok: false; reason: string; tag: string; blockStage: Stage }
+    | { ok: false; reason: string; tag: BlockerKind; blockStage: Stage }
   >;
 
   /**
@@ -297,7 +303,7 @@ export interface PlanningPhaseHooks {
    */
   revalidateArtifact(wt: { path: string }, revisionStdout: string): Promise<
     | { ok: true; updatedPlanText: string; updatedSpecContext: string }
-    | { ok: false; reason: string; tag: string }
+    | { ok: false; reason: string; tag: BlockerKind }
   >;
 
   /** Build the PR body from the plan excerpt and harness names. */
@@ -550,12 +556,7 @@ export async function runPlanningPhases(
           : `Worktree setup failed: ${bootstrap.reason}`;
     await doSetBlocked(cfg, issueNumber, bootstrapMsg, "planning", bootstrap.tag);
     await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked");
-    return {
-      advanced: false,
-      status: "blocked",
-      reason: bootstrap.reason,
-      blockerKind: bootstrap.tag,
-    };
+    return blockedOutcome(bootstrap.reason, bootstrap.tag);
   }
   wt = bootstrap.wt;
   activeLifecycle.headBefore = await currentHead(wt.path, doGitInWorktree);
@@ -572,7 +573,7 @@ export async function runPlanningPhases(
   if (!authorResult.ok) {
     await doSetBlocked(cfg, issueNumber, authorResult.reason, "planning", authorResult.tag);
     await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-    return { advanced: false, status: "blocked", reason: authorResult.reason };
+    return blockedOutcome(authorResult.reason, authorResult.tag);
   }
   let planText = authorResult.planText;
   // `promptPlanText` is the version passed to review/revision prompts — for OpenSpec
@@ -585,7 +586,7 @@ export async function runPlanningPhases(
   if (!validateResult.ok) {
     await doSetBlocked(cfg, issueNumber, validateResult.reason, validateResult.blockStage, validateResult.tag);
     await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-    return { advanced: false, status: "blocked", reason: validateResult.reason };
+    return blockedOutcome(validateResult.reason, validateResult.tag);
   }
   // #352 (round 2): openspec.validateItem inside validateArtifact can also trigger
   // ensureDefaultConfig, leaving config.yaml dirty after the authorArtifact commit.
@@ -666,14 +667,14 @@ export async function runPlanningPhases(
         : `Plan-review harness (${reviewer}) failed: ${reason}${stderrExcerpt}`;
       await doSetBlocked(cfg, issueNumber, blockMsg, "plan-review", "harness-failure");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return { advanced: false, status: "blocked", reason };
+      return blockedOutcome(reason, "harness-failure");
     }
     const planReview = reviewResult.stdout.trim();
     if (!planReview.includes("## Plan Review Verdict")) {
       const reason = `plan-review output missing required "## Plan Review Verdict" section — the reviewer returned prose instead of a structured verdict`;
       await doSetBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return { advanced: false, status: "blocked", reason };
+      return blockedOutcome(reason, "needs-human");
     }
     const planReviewBanner = planSelfReview ? `${selfReviewBanner(reviewer, planReviewer)}\n\n` : "";
     await doPostComment(cfg, issueNumber, `## Plan Review\n\n${planReviewBanner}**Reviewer**: ${planReviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`);
@@ -702,7 +703,7 @@ export async function runPlanningPhases(
         : `Plan revision failed (exit ${revisionResult.exit_code})`;
       await doSetBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review", "harness-failure");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return { advanced: false, status: "blocked", reason };
+      return blockedOutcome(reason, "harness-failure");
     }
     // Verify the plan-revision output includes the required acknowledgement section (#68).
     // Mid-line headers are normalised inside verifyPlanRevisionOutput (#658). Pure
@@ -723,7 +724,7 @@ export async function runPlanningPhases(
           : `Plan revision format-repair failed (exit ${repairResult.exit_code})`;
         await doSetBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review", "harness-failure");
         await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-        return { advanced: false, status: "blocked", reason };
+        return blockedOutcome(reason, "harness-failure");
       }
       revisionResult = repairResult;
       ackCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
@@ -731,7 +732,7 @@ export async function runPlanningPhases(
     if (!ackCheck.ok) {
       await doSetBlocked(cfg, issueNumber, ackCheck.reason, "plan-review", "needs-human");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return { advanced: false, status: "blocked", reason: ackCheck.reason };
+      return blockedOutcome(ackCheck.reason, "needs-human");
     }
     if (ackCheck.warning) {
       console.warn(`[pipeline] #${issueNumber}: plan-revision warning — ${ackCheck.warning}`);
@@ -742,7 +743,7 @@ export async function runPlanningPhases(
     if (!rv.ok) {
       await doSetBlocked(cfg, issueNumber, rv.reason, "plan-review", rv.tag);
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return { advanced: false, status: "blocked", reason: rv.reason };
+      return blockedOutcome(rv.reason, rv.tag);
     }
     revisedPlan = rv.updatedPlanText;
     specContext = rv.updatedSpecContext || specContext;
@@ -755,7 +756,7 @@ export async function runPlanningPhases(
       const reason = `Plan revision by ${primary} is missing the required "${HUMAN_FEEDBACK_ACK_HEADER}" section for human comments from ${commenters}`;
       await doSetBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return { advanced: false, status: "blocked", reason };
+      return blockedOutcome(reason, "needs-human");
     }
     await doPostComment(
       cfg,
@@ -827,7 +828,7 @@ export async function runPlanningPhases(
         "harness-failure",
       );
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return { advanced: false, status: "blocked", reason };
+      return blockedOutcome(reason, "harness-failure");
     }
     console.log(
       `[pipeline] #${issueNumber}: implementation harness (${primary}) failed (${reason}) but left ` +
@@ -860,7 +861,7 @@ export async function runPlanningPhases(
       "no-commits",
     );
     await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-    return { advanced: false, status: "blocked", reason: "no commits produced" };
+    return blockedOutcome("no commits produced", "no-commits");
   }
 
   // ---- Verify implementation commit references the issue (#68) ----
@@ -869,7 +870,7 @@ export async function runPlanningPhases(
     if (!implCheck.ok) {
       await doSetBlocked(cfg, issueNumber, implCheck.reason, "implementing", "needs-human");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return { advanced: false, status: "blocked", reason: implCheck.reason };
+      return blockedOutcome(implCheck.reason, "needs-human");
     }
   }
 
@@ -1518,11 +1519,12 @@ export async function resumeFromImplementing(
     opts.runDir, opts.runStoreDeps,
   );
   if (!gates.ok) {
+    const blockerKind: BlockerKind = gates.source === "test" ? "test-gate-exhausted" : "needs-human";
     await blocker(
       cfg, issueNumber, gates.reason, "implementing",
-      gates.source === "test" ? "test-gate-exhausted" : "needs-human",
+      blockerKind,
     );
-    return { advanced: false, status: "blocked", reason: gates.reason };
+    return blockedOutcome(gates.reason, blockerKind);
   }
 
   // ---- Docs freshness (#716): after format/test, before push / createPr ----
@@ -1533,7 +1535,7 @@ export async function resumeFromImplementing(
   const docsResult = await docsEnforce(wt.path, issueNumber, deps.docsFreshness ?? {});
   if (!docsResult.ok) {
     await blocker(cfg, issueNumber, docsResult.reason, "implementing", "needs-human");
-    return { advanced: false, status: "blocked", reason: docsResult.reason };
+    return blockedOutcome(docsResult.reason, "needs-human");
   }
   if (docsResult.ran && docsResult.healed) {
     console.log(
@@ -1545,17 +1547,18 @@ export async function resumeFromImplementing(
       opts.runDir, opts.runStoreDeps,
     );
     if (!postHealGates.ok) {
+      const blockerKind: BlockerKind = postHealGates.source === "test" ? "test-gate-exhausted" : "needs-human";
       await blocker(
         cfg, issueNumber, postHealGates.reason, "implementing",
-        postHealGates.source === "test" ? "test-gate-exhausted" : "needs-human",
+        blockerKind,
       );
-      return { advanced: false, status: "blocked", reason: postHealGates.reason };
+      return blockedOutcome(postHealGates.reason, blockerKind);
     }
     const docsCheckOnly = deps.checkDocsFreshness ?? checkDocsFreshness;
     const finalDocs = await docsCheckOnly(wt.path, deps.docsFreshness ?? {});
     if (!finalDocs.ok) {
       await blocker(cfg, issueNumber, finalDocs.reason, "implementing", "needs-human");
-      return { advanced: false, status: "blocked", reason: finalDocs.reason };
+      return blockedOutcome(finalDocs.reason, "needs-human");
     }
   }
 
@@ -1563,7 +1566,7 @@ export async function resumeFromImplementing(
   const push = await gitOp(wt.path, ["push", "-u", "origin", branch], { ignoreFailure: true });
   if (push.code !== 0) {
     await blocker(cfg, issueNumber, `Git push failed: ${push.stderr.trim()}`, "implementing", "push-failed");
-    return { advanced: false, status: "blocked", reason: "push failed" };
+    return blockedOutcome("push failed", "push-failed");
   }
 
   // ---- Create or find PR (exact-branch check first to avoid duplicates on resume) ----
@@ -1589,7 +1592,7 @@ export async function resumeFromImplementing(
       } else {
         const e = err as Error;
         await blocker(cfg, issueNumber, `PR creation failed: ${e.message}`, "implementing", "pr-creation-failed");
-        return { advanced: false, status: "blocked", reason: e.message };
+        return blockedOutcome(e.message, "pr-creation-failed");
       }
     }
   }

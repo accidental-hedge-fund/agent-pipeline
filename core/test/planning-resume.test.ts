@@ -203,6 +203,7 @@ test("resumeFromImplementing: gate passes + push ok + PR already exists → reus
 
 test("resumeFromImplementing: gate fails → calls setBlocked and returns blocked without opening PR", async () => {
   const setBlockedArgs: string[] = [];
+  let setBlockedKind = "";
   let createPrCalled = false;
   let transitionCalled = false;
 
@@ -211,7 +212,10 @@ test("resumeFromImplementing: gate fails → calls setBlocked and returns blocke
     getPrForBranch: async () => null,
     createPr: async () => { createPrCalled = true; return 0; },
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
-    setBlocked: async (_cfg, _n, reason) => { setBlockedArgs.push(reason); },
+    setBlocked: async (_cfg, _n, reason, _stage, kind) => {
+      setBlockedArgs.push(reason);
+      setBlockedKind = kind;
+    },
     transition: async () => { transitionCalled = true; },
   };
 
@@ -234,6 +238,52 @@ test("resumeFromImplementing: gate fails → calls setBlocked and returns blocke
   assert.equal(result.advanced, false);
   if (!result.advanced) {
     assert.equal(result.status, "blocked");
+    if (result.status === "blocked") {
+      assert.equal(setBlockedKind, "test-gate-exhausted");
+      assert.equal(result.blockerKind, setBlockedKind, "returned blockerKind must match setBlocked");
+    }
+  }
+});
+
+test("resumeFromImplementing: push failure returns the push-failed blocker kind", async () => {
+  let setBlockedKind = "";
+  const deps: ResumeFromImplementingDeps = {
+    includeLockfileSideEffects: async () => ({ included: false }),
+    _runFormatAndTestGates: async () => ({ ok: true, gate: skippedGate() }),
+    enforceDocsFreshness: async () => ({ ok: true, ran: false }),
+    gitInWorktree: async (_path, args) => ({
+      stdout: "",
+      stderr: args[0] === "push" ? "remote rejected" : "",
+      code: args[0] === "push" ? 1 : 0,
+    }),
+    setBlocked: async (_cfg, _n, _reason, _stage, kind) => {
+      setBlockedKind = kind;
+    },
+    getPrForBranch: async () => null,
+    createPr: async () => assert.fail("createPr must not run after push failure"),
+    transition: async () => assert.fail("transition must not run after push failure"),
+  };
+
+  const result = await resumeFromImplementing(
+    makeCfg(),
+    42,
+    makeWt(),
+    {
+      prTitle: "[Pipeline] Fix the bug (#42)",
+      prBody: "Closes #42",
+      transitionMessage: (prNumber) => `PR #${prNumber} ready.`,
+      pipelineRunId: "run-1",
+    },
+    deps,
+  );
+
+  assert.equal(result.advanced, false);
+  if (!result.advanced) {
+    assert.equal(result.status, "blocked");
+    if (result.status === "blocked") {
+      assert.equal(setBlockedKind, "push-failed");
+      assert.equal(result.blockerKind, setBlockedKind, "returned blockerKind must match setBlocked");
+    }
   }
 });
 

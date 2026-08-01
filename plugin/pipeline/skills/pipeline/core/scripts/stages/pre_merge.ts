@@ -137,6 +137,7 @@ import type { BlockerKind } from "../types.ts";
 import type { PreMergeOfframpPathTag } from "../pre-merge-offramp.ts";
 import { readEvents } from "../run-store.ts";
 import type { GateResultEvent, RunStoreDeps, StageAccountingEvent } from "../run-store.ts";
+import { buildStageDiagnostic, type StageDiagnostic } from "../stage-diagnostic.ts";
 import { runTestGate } from "../testgate.ts";
 
 /**
@@ -187,6 +188,7 @@ function preMergeBlocked(
   reason: string,
   kind: BlockerKind,
   pathTag?: PreMergeOfframpPathTag,
+  diagnostic?: StageDiagnostic,
 ): Extract<Outcome, { status: "blocked" }> {
   return {
     advanced: false,
@@ -194,6 +196,7 @@ function preMergeBlocked(
     reason,
     blockerKind: kind,
     ...(pathTag !== undefined ? { offrampPathTag: pathTag } : {}),
+    ...(diagnostic !== undefined ? { diagnostic } : {}),
   };
 }
 
@@ -765,6 +768,7 @@ export async function performPreMergeAutoFix(
   gitFn: typeof gitInWorktree,
   invokeFn: InvokeFn,
   salvageFn: typeof trySalvageUncommittedWork = trySalvageUncommittedWork,
+  repairIdentity: { commitSubjectPrefix?: string; salvageLabel?: string } = {},
 ): Promise<PreMergeAutoFixResult> {
   const harness = cfg.harnesses?.implementer;
   if (!harness) return { status: "error" };
@@ -824,7 +828,10 @@ export async function performPreMergeAutoFix(
   let salvageFoundNothing = false;
   if (confirmedNoNewCommit) {
     const salvageResult = await salvageFn(
-      wt.path, issueNumber, pipelineRunId, PRE_MERGE_AUTOFIX_SALVAGE_LABEL,
+      wt.path,
+      issueNumber,
+      pipelineRunId,
+      repairIdentity.salvageLabel ?? PRE_MERGE_AUTOFIX_SALVAGE_LABEL,
     );
     salvaged = salvageResult.salvaged;
     // "Nothing to salvage" (as opposed to an attempted-but-failed salvage,
@@ -885,7 +892,7 @@ export async function performPreMergeAutoFix(
   // commit (#547); amend to set the canonical subject so the one-attempt
   // bound can detect this commit by subject prefix.
   const autoFixMsg = withTrailers(
-    `${PRE_MERGE_AUTOFIX_PREFIX} for #${issueNumber}`,
+    `${repairIdentity.commitSubjectPrefix ?? PRE_MERGE_AUTOFIX_PREFIX} for #${issueNumber}`,
     issueNumber,
     pipelineRunId,
   );
@@ -4132,12 +4139,23 @@ export async function maybeArchiveOpenspec(
 
   /** Residual still-active block — same remedy text as enforceOpenspecActiveChangeGuard. */
   const blockResidualActive = async (remaining: string[]): Promise<Outcome> => {
+    const stableRemaining = [...remaining].sort();
     const reason =
-      `Pre-merge cannot advance: OpenSpec change(s) still active on this PR: ${remaining.join(", ")}. ` +
+      `Pre-merge cannot advance: OpenSpec change(s) still active on this PR: ${stableRemaining.join(", ")}. ` +
       `Run \`openspec archive <id>\` for each and push before pre-merge can continue.`;
+    const diagnostic = buildStageDiagnostic({
+      reasonCode: openspec.OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE,
+      evidenceKey:
+        `${openspec.OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE}:` +
+        `${stableRemaining.join(",")}:archive_active_change_remains`,
+      blockerKind: "openspec-invalid",
+      reason,
+      stage: "pre-merge",
+      offrampClass: "openspec-invalid",
+    });
     await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
     await recordDecision("fail", reason);
-    return preMergeBlocked(reason, "openspec-invalid");
+    return preMergeBlocked(reason, "openspec-invalid", "openspec-invalid", diagnostic);
   };
 
   let wt = await getForIssueFn(cfg, issueNumber);
@@ -4472,9 +4490,19 @@ export async function maybeArchiveOpenspec(
       // Surface the CLI output verbatim (#467) — e.g. a "header not found" error from a
       // retitled `## MODIFIED Requirements` delta the living spec does not (yet) contain.
       const reason = `openspec archive ${id} failed:\n${res.output}`;
+      const diagnostic = res.diagnostic
+        ? buildStageDiagnostic({
+            reasonCode: res.diagnostic.reasonCode,
+            evidenceKey: res.diagnostic.evidenceKey,
+            blockerKind: "openspec-invalid",
+            reason,
+            stage: "pre-merge",
+            offrampClass: "openspec-invalid",
+          })
+        : undefined;
       await setBlockedFn(cfg, issueNumber, reason, "pre-merge", "openspec-invalid");
       await recordDecision("fail", reason);
-      return preMergeBlocked(reason, "openspec-invalid");
+      return preMergeBlocked(reason, "openspec-invalid", "openspec-invalid", diagnostic);
     }
   }
 

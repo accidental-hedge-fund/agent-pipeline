@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  archive,
   changeDirExists,
   changeIdFromArchiveFolderName,
   changeIdsFromPaths,
@@ -14,6 +15,8 @@ import {
   listChangeDirs,
   openspecContext,
   openspecContextFromDiff,
+  OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE,
+  parseArchiveResult,
   parseValidateResult,
   readChangeFile,
   readSpecDeltas,
@@ -85,6 +88,105 @@ test("parseValidateResult: nested results.changes shape extracts issues", () => 
   const r = parseValidateResult(1, out);
   assert.equal(r.valid, false);
   assert.ok(r.issues.some((i) => /delta missing scenario/.test(i.message)));
+});
+
+test("parseArchiveResult: requires a matching archive object and removed active change", () => {
+  const stdout = JSON.stringify({
+    archive: {
+      change: "add-auth",
+      archivedAs: "2026-07-31-add-auth",
+      path: "/repo/openspec/changes/archive/2026-07-31-add-auth",
+      specsUpdated: true,
+    },
+  });
+
+  assert.deepEqual(parseArchiveResult("add-auth", 0, stdout, "", "removed"), {
+    success: true,
+    unavailable: false,
+    output: stdout,
+  });
+});
+
+test("parseArchiveResult: exit 0 with a semantic apply failure is not success", () => {
+  const stdout = JSON.stringify({
+    archive: null,
+    status: [{
+      severity: "error",
+      code: "archive_spec_update_failed",
+      message: "ADDED requirement already exists",
+      fix: "Fix the change delta specs and rerun. No files were changed.",
+    }],
+  });
+
+  const result = parseArchiveResult("add-auth", 0, stdout, "", "present");
+
+  assert.equal(result.success, false);
+  assert.equal(result.diagnostic?.reasonCode, OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE);
+  assert.equal(result.diagnostic?.diagnosticCode, "archive_spec_update_failed");
+  assert.equal(
+    result.diagnostic?.evidenceKey,
+    "openspec-archive-apply-conflict:add-auth:archive_spec_update_failed",
+  );
+  assert.equal(result.diagnostic?.message, "ADDED requirement already exists");
+});
+
+test("parseArchiveResult: archive object with a residual active dir fails its postcondition", () => {
+  const stdout = JSON.stringify({
+    archive: { change: "add-auth", archivedAs: "2026-07-31-add-auth" },
+  });
+
+  const result = parseArchiveResult("add-auth", 0, stdout, "", "present");
+
+  assert.equal(result.success, false);
+  assert.equal(result.diagnostic?.diagnosticCode, "archive_active_change_remains");
+  assert.equal(
+    result.diagnostic?.evidenceKey,
+    "openspec-archive-apply-conflict:add-auth:archive_active_change_remains",
+  );
+});
+
+test("parseArchiveResult: rejects a success object for a different change", () => {
+  const stdout = JSON.stringify({
+    archive: { change: "other-change", archivedAs: "2026-07-31-other-change" },
+  });
+
+  const result = parseArchiveResult("add-auth", 0, stdout, "", "removed");
+
+  assert.equal(result.success, false);
+  assert.equal(result.diagnostic?.diagnosticCode, "archive_result_mismatch");
+});
+
+test("parseArchiveResult: unverifiable active-change removal is not semantic success", () => {
+  const stdout = JSON.stringify({
+    archive: { change: "add-auth", archivedAs: "2026-07-31-add-auth" },
+  });
+
+  const result = parseArchiveResult("add-auth", 0, stdout, "", "unverified");
+
+  assert.equal(result.success, false);
+  assert.equal(result.diagnostic?.diagnosticCode, "archive_active_change_unverified");
+});
+
+test("archive: requests JSON and verifies removal independently of exit code", async () => {
+  const calls: string[][] = [];
+  const result = await archive("/repo", "add-auth", 1234, {
+    run: async (_dir, args) => {
+      calls.push(args);
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          archive: { change: "add-auth", archivedAs: "2026-07-31-add-auth" },
+        }),
+        stderr: "",
+        unavailable: false,
+      };
+    },
+    changeState: () => "present",
+  });
+
+  assert.deepEqual(calls, [["archive", "add-auth", "--yes", "--json"]]);
+  assert.equal(result.success, false);
+  assert.equal(result.diagnostic?.diagnosticCode, "archive_active_change_remains");
 });
 
 test("listChangeDirs: lists change folders excluding archive", () => {

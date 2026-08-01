@@ -3,9 +3,8 @@
 // loop state home. Path resolution is single-sourced with the durable loop
 // store (`resolveStateHome` / `runDir`); no lock, ledger write, or GitHub call.
 //
-// Follow default (#699): exit successfully after printing a `loop_run_stopped`
-// event (until-terminal). Opt out with `--no-until-terminal` for interrupt-only
-// dashboards.
+// Follow default (#699): exit successfully after printing a terminal loop
+// lifecycle event. Opt out with `--no-until-terminal` for interrupt-only dashboards.
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
@@ -20,6 +19,10 @@ import {
 
 /** Event kind written by the durable loop supervisor when a run stops. */
 export const LOOP_RUN_STOPPED_KIND = "loop_run_stopped";
+/** Final accounting event written when one supervisor drive resolves, stops, or holds. */
+export const LOOP_RUN_COMPLETE_KIND = "loop_run_complete";
+/** A new drive incarnation; resets a prior resumable hold completion for follow. */
+export const LOOP_DRIVE_STARTED_KIND = "loop_drive_started";
 
 /**
  * Advance run-store completion event type (writers in `run-store.ts` emit
@@ -31,7 +34,7 @@ export const ADVANCE_RUN_COMPLETE_TYPE = "run_complete";
 export interface LoopLogsFollowOptions {
   /**
    * When true (default with `--follow`), exit 0 after a complete JSONL line
-   * whose event kind is `loop_run_stopped` is printed. When false
+   * whose event kind is `loop_run_stopped` or `loop_run_complete` is printed. When false
    * (`--no-until-terminal`), remain open until interrupt / follow failure.
    * Ignored when follow is false.
    */
@@ -114,6 +117,35 @@ export function isLoopRunStoppedLine(line: string): boolean {
   }
 }
 
+/** True for a store-shaped loop completion record (uses `kind`, never `type`). */
+export function isLoopRunCompleteLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  try {
+    const obj = JSON.parse(trimmed) as { kind?: unknown };
+    return obj != null && typeof obj === "object" && obj.kind === LOOP_RUN_COMPLETE_KIND;
+  } catch {
+    return false;
+  }
+}
+
+/** Terminal loop lifecycle predicate used by default follow. */
+export function isLoopTerminalLine(line: string): boolean {
+  return isLoopRunStoppedLine(line) || isLoopRunCompleteLine(line);
+}
+
+/** True when a resumed/new supervisor drive supersedes an earlier resumable completion. */
+export function isLoopDriveStartedLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  try {
+    const obj = JSON.parse(trimmed) as { kind?: unknown };
+    return obj != null && typeof obj === "object" && obj.kind === LOOP_DRIVE_STARTED_KIND;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * True when `line` is a complete JSONL advance run-store event with
  * `type: "run_complete"`. Malformed / non-JSON / wrong-type lines return false.
@@ -133,13 +165,15 @@ export function isAdvanceRunCompleteLine(line: string): boolean {
  * Append a follow chunk to a line buffer. Invokes `onLine` for each complete
  * newline-terminated line (including the trailing `\n`). Incomplete trailing
  * bytes remain in `pending`. Returns whether any complete line matched
- * `isTerminalLine` (default: loop `loop_run_stopped`).
+ * `isTerminalLine` (default: loop stop/complete). A later drive-start line
+ * resets a historical resumable completion when replaying the existing file.
  */
 export function appendFollowChunk(
   pending: string,
   chunk: string,
   onLine: (line: string) => void,
-  isTerminalLine: (line: string) => boolean = isLoopRunStoppedLine,
+  isTerminalLine: (line: string) => boolean = isLoopTerminalLine,
+  isTerminalResetLine: (line: string) => boolean = isLoopDriveStartedLine,
 ): { pending: string; sawTerminal: boolean } {
   let buf = pending + chunk;
   let sawTerminal = false;
@@ -151,7 +185,9 @@ export function appendFollowChunk(
     onLine(line);
     // Strip trailing newline for detection (JSON.parse of "…\n" fails).
     const forDetect = line.endsWith("\n") ? line.slice(0, -1) : line;
-    if (isTerminalLine(forDetect)) {
+    if (isTerminalResetLine(forDetect)) {
+      sawTerminal = false;
+    } else if (isTerminalLine(forDetect)) {
       sawTerminal = true;
     }
   }
@@ -165,7 +201,7 @@ export function appendFollowChunk(
  * - One-shot → print full current events.jsonl (always events.jsonl; `--events`
  *   is accepted for parity but does not change the selected artifact).
  * - `--follow` → stream lines (existing + newly appended). **Default**
- *   until-terminal: exit 0 after printing a `loop_run_stopped` line (historical
+ *   until-terminal: exit 0 after printing a loop stop/completion line (historical
  *   or live). `--no-until-terminal` restores interrupt-only follow.
  *   SIGINT/SIGTERM remain valid stop conditions in both modes.
  *
@@ -232,7 +268,7 @@ export async function runLoopLogs(
       `pipeline loop logs: events.jsonl not yet written for run '${runId}'\n` +
         `  Path: ${eventsFile}\n` +
         `  Follow mode streams event lines; by default it exits 0 after ` +
-        `loop_run_stopped (use --no-until-terminal for interrupt-only).\n`,
+        `loop_run_stopped/loop_run_complete (use --no-until-terminal for interrupt-only).\n`,
     );
     process.exitCode = 1;
     return;
@@ -253,7 +289,7 @@ export async function runLoopLogs(
  *
  * Used for interrupt-only follow (`--no-until-terminal`). The default
  * until-terminal path uses {@link followEventsWithTerminalExit} instead so
- * lines can be inspected for `loop_run_stopped`.
+ * lines can be inspected for terminal loop lifecycle events.
  *
  * `io.spawn` / `io.process` are injectable for unit tests — no real process
  * or signal is required.
@@ -372,7 +408,7 @@ export type FollowEventsIo = {
 
 /**
  * Line-aware follow: print complete lines, optionally exit 0 when a line
- * matches `isTerminalLine` (default: loop `loop_run_stopped`; advance
+ * matches `isTerminalLine` (default: loop stop/completion; advance
  * `run_complete` via {@link isAdvanceRunCompleteLine}). Reads existing content
  * from offset 0 first (historical terminal ends follow without hanging).
  * Incomplete trailing bytes are buffered until a newline arrives.
@@ -381,7 +417,7 @@ export async function followEventsWithTerminalExit(
   logFile: string,
   opts: {
     untilTerminal: boolean;
-    /** Default: {@link isLoopRunStoppedLine}. */
+    /** Default: {@link isLoopTerminalLine}. */
     isTerminalLine?: (line: string) => boolean;
     /** Prefix for read-failure diagnostics (default: pipeline loop logs). */
     errorLabel?: string;
@@ -393,7 +429,7 @@ export async function followEventsWithTerminalExit(
   let interrupted: NodeJS.Signals | null = null;
   let onSigint: () => void = () => {};
   let onSigterm: () => void = () => {};
-  const isTerminalLine = opts.isTerminalLine ?? isLoopRunStoppedLine;
+  const isTerminalLine = opts.isTerminalLine ?? isLoopTerminalLine;
   const errorLabel = opts.errorLabel ?? "pipeline loop logs";
 
   const interruptStatus = (sig: NodeJS.Signals): number =>

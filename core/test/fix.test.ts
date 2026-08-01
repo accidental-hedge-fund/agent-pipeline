@@ -1552,10 +1552,12 @@ test("advanceFix source pin: the needs-human-decision park is evaluated before t
 
 test("advanceFix source pin: an accepted needs-human-decision park blocks with the dedicated blocker kind, not no-commits", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
-  const humanDecisionBlockIdx = src.indexOf('"human-decision-required"');
-  const returnIdx = src.indexOf('blockerKind: "human-decision-required"', humanDecisionBlockIdx);
-  assert.ok(humanDecisionBlockIdx !== -1, "expected the human-decision-required blocker kind to be used");
-  assert.ok(returnIdx !== -1, "expected advanceFix to return blockerKind: \"human-decision-required\" on an accepted park");
+  const authorityFilterIdx = src.indexOf('decl.category === "product-decision" || decl.category === "authority"');
+  const humanDecisionBlockIdx = src.indexOf('? "human-decision-required" as const', authorityFilterIdx);
+  const returnedKindIdx = src.indexOf("blockerKind,", humanDecisionBlockIdx);
+  assert.ok(authorityFilterIdx !== -1, "expected an explicit authority-category filter");
+  assert.ok(humanDecisionBlockIdx !== -1, "expected accepted authority evidence to select human-decision-required");
+  assert.ok(returnedKindIdx !== -1, "expected advanceFix to return the authority-derived blocker kind");
 });
 
 // ---------------------------------------------------------------------------

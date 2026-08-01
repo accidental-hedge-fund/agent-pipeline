@@ -162,6 +162,11 @@ import {
 } from "./loop/stage-progress.ts";
 import { initRecoverableRun } from "./loop/recovery.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
+import {
+  createRepairPipelineItemExecutor,
+  type RepairPipelineItemInput,
+  type RepairPipelineItemResult,
+} from "./loop/repair-pipeline-item.ts";
 import { compileContractItems, type RawContractItem } from "./loop/dependencies.ts";
 import {
   discoverDeclaredDependencies,
@@ -183,6 +188,12 @@ import {
   type LoopExecutionRequest,
   type LoopExecutionResponse,
 } from "./loop-execution-contract.ts";
+import {
+  buildStageDiagnostic,
+  lastStageDiagnosticFromEventsJsonl,
+  projectStageDiagnostic,
+  type StageDiagnostic,
+} from "./stage-diagnostic.ts";
 import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
   BLOCKED_LABEL,
@@ -782,9 +793,10 @@ export function buildLoopEvidencePointer(opts: {
       ...(opts.worktree_root !== undefined ? { worktree_root: opts.worktree_root } : {}),
     };
   }
+  const pipelineRunId = syntheticLoopEvidencePipelineRunId(opts.loop_run_id, opts.item_id);
   return {
     pr_number: opts.pr_number,
-    pipeline_run_id: syntheticLoopEvidencePipelineRunId(opts.loop_run_id, opts.item_id),
+    pipeline_run_id: pipelineRunId,
     ...(opts.worktree_root !== undefined ? { worktree_root: opts.worktree_root } : {}),
   };
 }
@@ -838,19 +850,23 @@ export function buildTerminalLinkagePayload(
  *  old wrong name here mapped a real needs-human block to `failed`, which the supervisor then
  *  classified as workflow-engine-defect and run_fataled the whole run (#616).
  *
- *  Optional `lastBlockerKind` (from the advance `blocker_set` event) distinguishes pure
- *  worktree capacity (#718) from product needs-human when both carry the `blocked` label. */
+ *  The canonical diagnostic from the final structured `blocker_set` decides
+ *  recoverable, capacity, or explicit human authority. Missing/malformed
+ *  diagnostics fail the protocol; labels and prose never grant authority. */
 export function classifyDispatchOutcome(
   detail: { labels: readonly string[]; state: string },
-  lastBlockerKind?: string | null,
+  diagnostic?: StageDiagnostic | null,
   /** Optional advance events.jsonl body for mid-stage / coexistence classification (#770). */
   eventsText?: string | null,
 ): LoopExecutionResponse["outcome"] {
   const readyLabel = `${LABEL_PREFIX}ready-to-deploy`;
   if (detail.labels.includes(readyLabel)) return "ready_to_deploy";
   if (detail.labels.includes(BLOCKED_LABEL)) {
-    if (lastBlockerKind === "worktree-capacity") return "capacity_wait";
-    return "blocked_needs_human";
+    const projection = projectStageDiagnostic(diagnostic);
+    if (projection.disposition === "capacity") return "capacity_wait";
+    if (projection.disposition === "recover") return "blocked_recoverable";
+    if (projection.disposition === "human_authority") return "blocked_needs_human";
+    return "failed";
   }
   if (detail.state === "closed") return "abandoned";
   // Coexistence is only lock / already-running / install evidence — never bare
@@ -869,15 +885,11 @@ export function classifyDispatchOutcome(
 export function lastBlockerKindFromEventsJsonl(eventsText: string): string | null {
   let last: string | null = null;
   for (const line of eventsText.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
     try {
-      const ev = JSON.parse(trimmed) as { type?: string; blocker_kind?: string };
-      if (ev.type === "blocker_set" && typeof ev.blocker_kind === "string" && ev.blocker_kind.length > 0) {
-        last = ev.blocker_kind;
-      }
+      const event = JSON.parse(line) as { type?: unknown; blocker_kind?: unknown };
+      if (event.type === "blocker_set" && typeof event.blocker_kind === "string") last = event.blocker_kind;
     } catch {
-      /* skip malformed lines */
+      // Compatibility reader only; dispatch classification uses the typed parser.
     }
   }
   return last;
@@ -1048,6 +1060,7 @@ export function realDispatchItem(
     await startLinkage;
 
     let outcome: LoopExecutionResponse["outcome"] = "failed";
+    let diagnostic: StageDiagnostic | undefined;
     let prNumber: number | null = null;
     try {
       const detail = await getIssueDetailFn(cfg, issueNumber);
@@ -1055,16 +1068,15 @@ export function realDispatchItem(
       // not classified as product needs-human when the blocked label is set.
       // Fall back to the durable kind marker on the blocked comment when events
       // lack blocker_set (early-blocked re-dispatch after a prior capacity hit).
-      let lastKind: string | null = null;
+      let eventsTextForClassify: string | null = null;
       if (pin && storeReady) {
-        const text = readEventsTextFn(pin.events_path);
-        if (text !== null) lastKind = lastBlockerKindFromEventsJsonl(text);
+        eventsTextForClassify = readEventsTextFn(pin.events_path);
       }
-      if (!lastKind && Array.isArray(detail.comments)) {
-        // Fail closed without a trusted actor or without binding the comment to
-        // the current blocked-label incarnation: unauthenticated or stale
-        // authentic capacity markers must not reclassify a later product hold
-        // (#718 b5108544 / 69894186).
+      let resolution = lastStageDiagnosticFromEventsJsonl(eventsTextForClassify ?? "");
+      // Compatibility for capacity early-exits before a fresh run-store event:
+      // only the authenticated, current blocked-label incarnation may supply
+      // this structural fallback. Comment prose is never read or transported.
+      if (resolution.diagnostic === null && Array.isArray(detail.comments)) {
         const actor = await getGhActorFn();
         let blockedLabeledAt: string | null = null;
         try {
@@ -1072,14 +1084,23 @@ export function realDispatchItem(
         } catch {
           blockedLabeledAt = null;
         }
-        lastKind = lastBlockerKindFromComments(detail.comments, {
+        const trustedKind = lastBlockerKindFromComments(detail.comments, {
           trustedAuthor: actor,
           blockedLabeledAt,
         });
+        if (trustedKind === "worktree-capacity") {
+          const capacityDiagnostic = buildStageDiagnostic({
+            blockerKind: "worktree-capacity",
+            reason: "trusted current blocker-kind attestation",
+          });
+          resolution = {
+            ...projectStageDiagnostic(capacityDiagnostic),
+            diagnostic: capacityDiagnostic,
+          };
+        }
       }
-      const eventsTextForClassify =
-        pin && storeReady ? readEventsTextFn(pin.events_path) : null;
-      outcome = classifyDispatchOutcome(detail, lastKind, eventsTextForClassify);
+      diagnostic = resolution.diagnostic ?? undefined;
+      outcome = classifyDispatchOutcome(detail, diagnostic, eventsTextForClassify);
       // Pure capacity is ops admission, not a product block: clear the label so
       // re-admission after a slot frees does not thrash on an already-blocked
       // early-exit (#718). Clear MUST succeed before capacity_wait is safe for a
@@ -1123,6 +1144,7 @@ export function realDispatchItem(
         // Only advertise a live events path when the store was confirmed.
         events_path_known: storeReady,
       }),
+      ...(diagnostic ? { diagnostic } : {}),
     };
   };
 }
@@ -1151,6 +1173,96 @@ export function realGetChangedFiles(cfg: PipelineConfig, deps: RealGetChangedFil
     if (!wt) return [];
     const result = await gitInWorktreeFn(wt.path, ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`], { ignoreFailure: true });
     return result.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  };
+}
+
+type ExecuteRecoveryInput = Parameters<NonNullable<SupervisorDeps["executeRecovery"]>>[0];
+
+export interface RealExecuteRecoveryDeps {
+  getIssueDetail?: typeof getIssueDetail;
+  clearBlocked?: typeof clearBlocked;
+  repairPipelineItem?: (input: RepairPipelineItemInput) => Promise<RepairPipelineItemResult>;
+}
+
+/** Production provider-neutral recovery registry. Substantive repair delegates
+ * to the configured whole-item implementer transaction; narrow recipes only
+ * clear a current mechanical block and verify that exact state transition. */
+export function realExecuteRecovery(
+  cfg: PipelineConfig,
+  deps: RealExecuteRecoveryDeps = {},
+): NonNullable<SupervisorDeps["executeRecovery"]> {
+  const getDetail = deps.getIssueDetail ?? getIssueDetail;
+  const clear = deps.clearBlocked ?? clearBlocked;
+  const repairPipelineItem = deps.repairPipelineItem ?? createRepairPipelineItemExecutor(cfg);
+
+  const failed = (error: string): RepairPipelineItemResult => ({
+    succeeded: false,
+    evidence: error,
+    error,
+  });
+
+  const resyncMechanicalBlock = async (
+    input: ExecuteRecoveryInput,
+  ): Promise<RepairPipelineItemResult> => {
+    const issueNumber = Number(input.itemId);
+    if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
+      return failed(`recovery action ${input.action} requires a positive numeric item id`);
+    }
+    let before: Awaited<ReturnType<typeof getIssueDetail>>;
+    try {
+      before = await getDetail(cfg, issueNumber);
+    } catch (err) {
+      return failed(`cannot inspect live item before ${input.action}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (before.state !== "open") {
+      return failed(`item ${input.itemId} is ${before.state}; refusing recovery mutation`);
+    }
+    if (!before.labels.includes(BLOCKED_LABEL)) {
+      return {
+        succeeded: true,
+        evidence: `recovery action ${input.action} observed the mechanical blocked state already clear; normal whole-item redispatch may proceed`,
+      };
+    }
+    try {
+      await clear(cfg, issueNumber);
+      const after = await getDetail(cfg, issueNumber);
+      if (after.labels.includes(BLOCKED_LABEL)) {
+        return failed(`recovery action ${input.action} returned but the blocked label remains`);
+      }
+    } catch (err) {
+      return failed(`recovery action ${input.action} could not clear the mechanical blocked state: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return {
+      succeeded: true,
+      evidence: `recovery action ${input.action} cleared the mechanical blocked state and verified normal whole-item redispatch is admissible`,
+    };
+  };
+
+  return async (input) => {
+    const projection = projectStageDiagnostic(input.diagnostic);
+    if (projection.disposition !== "recover" || projection.blockerClass !== input.blockerClass) {
+      return failed(
+        `recovery action ${input.action} refused diagnostic disposition ${projection.disposition} for class ${input.blockerClass}`,
+      );
+    }
+    switch (input.action) {
+      case "repair_pipeline_item":
+        return repairPipelineItem({
+          runId: input.runId,
+          itemId: input.itemId,
+          attemptId: input.attemptId,
+          candidateIdentity: input.candidateIdentity,
+          diagnostic: input.diagnostic,
+        });
+      case "wait_and_retry":
+      case "rerun_ci":
+      case "resync_workflow_state":
+      case "retry_upstream_check":
+      case "restart_workflow_engine":
+        return resyncMechanicalBlock(input);
+      case "reauthenticate":
+        return failed("reauthenticate requires external credential authority and cannot be performed by autonomous recovery");
+    }
   };
 }
 
@@ -1560,6 +1672,8 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     store,
     observe: defaultReconcileObserveDeps(cfg),
     dispatchItem: realDispatchItem(cfg, input.engine),
+    executeRecovery: realExecuteRecovery(cfg),
+    recoverySleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     getChangedFiles: realGetChangedFiles(cfg),
     // Host-local live-advance probe scope (#770): run-store discovery + domain
     // + production wrapper/process identity under ~/.pipeline/runs/<issue>

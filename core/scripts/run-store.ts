@@ -23,6 +23,7 @@ import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
 import { stageDurationMs } from "./evidence-bundle.ts";
 import type { GhMetricsSummary } from "./gh.ts";
 import type { HumanInterventionEvent } from "./intervention.ts";
+import type { StageDiagnostic } from "./stage-diagnostic.ts";
 import { validateCorrectionEvent, type CorrectionEvent } from "./correction.ts";
 import type { ProductFaultEvent } from "./product-fault.ts";
 import { accountingSummary, sanitizeStageAccountingRecord } from "./accounting.ts";
@@ -140,6 +141,8 @@ export interface GateResultEvent extends RunEventBase {
 export interface BlockerSetEvent extends RunEventBase {
   type: "blocker_set";
   reason: string;
+  /** Exact producer-authored diagnostic; legacy events may omit it. */
+  diagnostic?: StageDiagnostic;
   /**
    * Pipeline stage that produced the block (#683). Additive optional — absent
    * on pre-#683 events. Scoreboard pre-merge aggregates filter on

@@ -20,6 +20,7 @@ import {
   postComment,
   postPrComment,
   reconcileAuditComment,
+  setBlocked,
   setGhCollector,
   setGhRunId,
   transition,
@@ -57,6 +58,7 @@ import {
   runIdFor,
   startTerminalLogTee,
   type RunStoreDeps,
+  type BlockerSetEvent,
   type TerminalLogTee,
 } from "./run-store.ts";
 import { buildEventSinkDeps } from "./event-sink.ts";
@@ -71,6 +73,7 @@ import { parseOverrideArg } from "./review-policy.ts";
 import { classifyProductFault, emitProductFault, resolveHostAdapter, resolveProductFaultConfig } from "./product-fault.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
 import { toPreMergeOfframpClass } from "./pre-merge-offramp.ts";
+import { buildStageDiagnostic, projectStageDiagnostic } from "./stage-diagnostic.ts";
 import { autoFileCorrections, autoFilePapercuts, realAutoFileDeps } from "./stages/papercut.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
@@ -84,6 +87,7 @@ import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
 import {
   reviewStageSkipTarget,
+  type BlockerKind,
   type EvidenceBundle,
   type Outcome,
   type PipelineConfig,
@@ -176,9 +180,8 @@ export function buildAutoLoopExhaustedComment(
       `- **Rounds used**: ${roundsSpent} / ${cfg.auto_loop.max_rounds}`,
       `- **Time used**: ${elapsedMinutes.toFixed(1)} / ${cfg.auto_loop.max_wallclock_minutes} minutes`,
       "",
-      "The issue is parked at `needs-human`. To resume:",
-      "- Fix the underlying issue and re-run `pipeline <N>` after relabeling to the appropriate stage.",
-      "- Or record an audited disposition with `--override \"<key>: <reason>\"` if applicable.",
+      `The issue remains blocked at \`${stage}\` with its mechanical blocker kind preserved. To resume:`,
+      "- Fix the underlying issue, clear the block, and re-run `pipeline <N>`.",
       "",
       "---",
       cfg.marker_footer,
@@ -227,9 +230,10 @@ export function shouldRunDeferredTerminalFinalize(args: {
 /**
  * A non-advancing outcome is auto-loop recoverable when it is `waiting` (the
  * stage explicitly signals a retriable temporary state) or `blocked` with a
- * pipeline-owned recovery (i.e. blockerKind is set and is not `needs-human`).
+ * pipeline-owned recovery (i.e. blockerKind is set and is neither a generic
+ * `needs-human` block nor an explicit `human-decision-required` authority stop).
  * Non-recoverable: `error`, `no-op`, `finalized`, and any `blocked` outcome
- * whose blockerKind is `needs-human` or absent (absent → treated as
+ * whose blockerKind requires human authority or is absent (absent → treated as
  * non-recoverable so unannotated stages cannot be silently auto-retried).
  */
 export function isAutoLoopRecoverable(out: Outcome): boolean {
@@ -240,11 +244,109 @@ export function isAutoLoopRecoverable(out: Outcome): boolean {
   // the pipeline cannot determine a recovery recipe for an unannotated blocker.
   if (!out.blockerKind) return false;
   // Capacity is an ops admission wait — re-driving the auto-loop cannot free
-  // slots and would only thrash (#718). Product needs-human also stays out.
-  if (out.blockerKind === "needs-human" || out.blockerKind === "worktree-capacity") {
+  // slots and would only thrash (#718). Human-required blocks also stay out.
+  if (
+    out.blockerKind === "needs-human" ||
+    out.blockerKind === "human-decision-required" ||
+    out.blockerKind === "worktree-capacity"
+  ) {
     return false;
   }
   return true;
+}
+
+type BlockedOutcome = Extract<Outcome, { advanced: false; status: "blocked" }>;
+
+/** Only an attested fix-stage authority decision is a human-required block. */
+export function isHumanAuthorityBlocker(
+  kind: BlockerKind | undefined,
+  diagnostic?: unknown,
+): boolean {
+  return kind === "human-decision-required" &&
+    projectStageDiagnostic(diagnostic).disposition === "human_authority";
+}
+
+/**
+ * Preserve a stage's typed block when the in-process retry budget is exhausted.
+ * Waiting outcomes have no blocker kind, so materialize a mechanical kind for
+ * the durable supervisor instead of converting the item to `needs-human`.
+ */
+export function autoLoopExhaustedBlockedOutcome(out: Outcome, stage: Stage): BlockedOutcome {
+  if (!out.advanced && out.status === "blocked" && out.blockerKind) {
+    return out;
+  }
+  const reason = out.advanced ? out.summary : out.reason;
+  const blockerKind: BlockerKind = stage === "pre-merge" ? "ci-exhausted" : "harness-failure";
+  const exhaustedReason = `auto-loop budget exhausted at ${stage}: ${reason}`;
+  const offrampPathTag = stage === "pre-merge" ? "ci-failed" as const : undefined;
+  return {
+    advanced: false,
+    status: "blocked",
+    reason: exhaustedReason,
+    blockerKind,
+    diagnostic: buildStageDiagnostic({
+      blockerKind,
+      reason: exhaustedReason,
+      stage,
+      ...(offrampPathTag ? { offrampClass: offrampPathTag } : {}),
+    }),
+    ...(offrampPathTag ? { offrampPathTag } : {}),
+  };
+}
+
+interface BlockedOutcomeEventDeps {
+  appendEvent?: typeof appendEvent;
+  emitHumanIntervention?: typeof emitHumanIntervention;
+  randomUUID?: () => string;
+}
+
+/**
+ * Emit canonical evidence for every blocked outcome. Human-intervention
+ * telemetry is reserved for explicit authority decisions; mechanical blocks
+ * remain visible solely through `blocker_set` and their structural kind.
+ */
+export async function emitBlockedOutcomeEvents(
+  runDir: string,
+  issueNumber: number,
+  stage: Stage,
+  out: BlockedOutcome,
+  runStoreDeps: RunStoreDeps,
+  deps: BlockedOutcomeEventDeps = {},
+): Promise<BlockerSetEvent> {
+  const doAppendEvent = deps.appendEvent ?? appendEvent;
+  const doEmitHumanIntervention = deps.emitHumanIntervention ?? emitHumanIntervention;
+  const blockerKind = out.blockerKind ?? "needs-human";
+  const pathTag = "offrampPathTag" in out ? out.offrampPathTag : undefined;
+  const offrampId = (deps.randomUUID ?? randomUUID)();
+  const blockerEvent: BlockerSetEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "blocker_set",
+    at: evidenceTimestamp(),
+    reason: out.reason,
+    ...(out.diagnostic ? { diagnostic: out.diagnostic } : {}),
+    stage,
+    blocker_kind: blockerKind,
+    offramp_id: offrampId,
+    ...(stage === "pre-merge"
+      ? {
+          offramp_class: toPreMergeOfframpClass({
+            blockerKind,
+            pathTag: pathTag ?? null,
+          }),
+        }
+      : {}),
+  };
+  await doAppendEvent(runDir, blockerEvent, runStoreDeps).catch(() => {});
+  if (isHumanAuthorityBlocker(blockerKind, out.diagnostic)) {
+    await doEmitHumanIntervention(runDir, {
+      kind: blockerKindToInterventionKind(blockerKind),
+      stage,
+      issue: issueNumber,
+      detail: out.reason,
+      offramp_id: offrampId,
+    }, runStoreDeps).catch(() => {});
+  }
+  return blockerEvent;
 }
 
 /**
@@ -1097,6 +1199,17 @@ export async function runAdvance(
         lastStage = (out as { to: Stage }).to;
         finalStage = lastStage; // keep final-state accurate when --once breaks after an advance
       } else {
+        // Record every structural block before any in-process recovery clears it.
+        // This is the canonical child evidence consumed by durable supervision.
+        if (out.status === "blocked" && runDir) {
+          await emitBlockedOutcomeEvents(
+            runDir,
+            issueNumber,
+            auditStage,
+            out,
+            runStoreDeps,
+          );
+        }
         // Non-advancing: check auto-loop eligibility before stopping (#149).
         const eligible = isAutoLoopEligible(out, stage, cfg.auto_loop);
         if (eligible && canAutoLoopContinue(cfg.auto_loop, autoLoopRoundsSpent, t0, nowFn())) {
@@ -1133,29 +1246,38 @@ export async function runAdvance(
           if (opts.once) break;
           continue;
         } else if (eligible && autoLoopRoundsSpent > 0) {
-          // Budget exhausted after at least one continuation: park at needs-human.
+          // Budget exhausted after at least one continuation: preserve or
+          // materialize a typed mechanical block at the current stage.
           const elapsedMinutes = (nowFn() - t0) / 60_000;
+          const exhaustedOutcome = autoLoopExhaustedBlockedOutcome(out, stage);
           console.log(
             `[pipeline] #${issueNumber}: auto-loop budget exhausted after ${autoLoopRoundsSpent} ` +
-            `continuation(s) — parking at needs-human`,
+            `continuation(s) — remaining blocked at ${stage} (${exhaustedOutcome.blockerKind})`,
           );
           if (!opts.dryRun) {
-            await transition(cfg, issueNumber, stage, "needs-human", "auto-loop budget exhausted");
-            await clearBlocked(cfg, issueNumber).catch(() => {});
-            finalStage = "needs-human";
+            if (out.status !== "blocked") {
+              await setBlocked(
+                cfg,
+                issueNumber,
+                exhaustedOutcome.reason,
+                stage,
+                exhaustedOutcome.blockerKind,
+              );
+              if (runDir) {
+                await emitBlockedOutcomeEvents(
+                  runDir,
+                  issueNumber,
+                  auditStage,
+                  exhaustedOutcome,
+                  runStoreDeps,
+                );
+              }
+            }
             await postComment(
               cfg,
               issueNumber,
               buildAutoLoopExhaustedComment(cfg, autoLoopRoundsSpent, stage, out.status, out.reason, elapsedMinutes),
             ).catch(() => {});
-            if (runDir) {
-              await emitHumanIntervention(runDir, {
-                kind: blockerKindToInterventionKind(out.status === "blocked" ? (out.blockerKind ?? "needs-human") : "needs-human"),
-                stage: auditStage,
-                issue: issueNumber,
-                detail: `auto-loop budget exhausted after ${autoLoopRoundsSpent}/${cfg.auto_loop.max_rounds} rounds: ${out.reason}`,
-              }, runStoreDeps).catch(() => {});
-            }
             if (stateDir) {
               await recordRecovery(stateDir, issueNumber, {
                 trigger: "bounded-auto-loop:exhausted",
@@ -1164,53 +1286,11 @@ export async function runAdvance(
               }).catch(() => {});
             }
           }
+          out = exhaustedOutcome;
         } else {
           // Not eligible or no rounds spent: stop as today.
-          if (out.status === "blocked" && runDir) {
-            // Enrich blocker_set with stage/kind/class (#683). Additive fields
-            // keep schema_version 1; offramp_class only for pre-merge. Shared
-            // offramp_id pairs this blocker_set with the co-emitted intervention
-            // so scoreboard dedupes only that pair (#683 review 2). Event write
-            // is best-effort — never masks the blocked stage outcome.
-            const blockerKind = out.blockerKind ?? "needs-human";
-            const pathTag =
-              out.status === "blocked" && "offrampPathTag" in out
-                ? out.offrampPathTag
-                : undefined;
-            const offrampId = randomUUID();
-            const blockerEvent: {
-              schema_version: typeof RUN_SCHEMA_VERSION;
-              type: "blocker_set";
-              at: string;
-              reason: string;
-              stage: string;
-              blocker_kind: string;
-              offramp_class?: string;
-              offramp_id?: string;
-            } = {
-              schema_version: RUN_SCHEMA_VERSION,
-              type: "blocker_set",
-              at: evidenceTimestamp(),
-              reason: out.reason,
-              stage: auditStage,
-              blocker_kind: blockerKind,
-              offramp_id: offrampId,
-            };
-            if (auditStage === "pre-merge") {
-              blockerEvent.offramp_class = toPreMergeOfframpClass({
-                blockerKind,
-                pathTag: pathTag ?? null,
-              });
-            }
-            await appendEvent(runDir, blockerEvent, runStoreDeps).catch(() => {});
-            await emitHumanIntervention(runDir, {
-              kind: blockerKindToInterventionKind(blockerKind),
-              stage: auditStage,
-              issue: issueNumber,
-              detail: out.reason,
-              offramp_id: offrampId,
-            }, runStoreDeps).catch(() => {});
-          }
+          // The block event was emitted above. No generic human-intervention
+          // event is synthesized for mechanical or untyped blocks.
         }
         // Durable park sink (#718): free a safe managed worktree so capacity is
         // not stranded while this issue waits. Mid-process auto-loop continues

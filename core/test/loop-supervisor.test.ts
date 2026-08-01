@@ -42,6 +42,7 @@ import {
   type LoopLedger,
 } from "../scripts/loop/types.ts";
 import { LOOP_EXECUTION_CONTRACT_SCHEMA, type LoopExecutionRequest, type LoopExecutionResponse } from "../scripts/loop-execution-contract.ts";
+import { buildStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 
 const READY_LABEL = "pipeline:ready-to-deploy";
 // The precondition stage gate (#568, capability `loop-precondition-stage-gate`) excludes a
@@ -50,6 +51,37 @@ const READY_LABEL = "pipeline:ready-to-deploy";
 // predates and is orthogonal to the precondition gate) is unaffected; tests of the gate itself
 // override this explicitly.
 const PIPELINE_READY_LABEL = "pipeline:ready";
+
+function humanAuthorityDiagnostic(reason = "A human product decision is required") {
+  return buildStageDiagnostic({
+    blockerKind: "human-decision-required",
+    reason,
+    stage: "plan-review",
+    authorityEvidence: [{
+      category: "product-decision",
+      finding_key: "deadbeef",
+      finding_fingerprint: "0123456789abcdef",
+      reviewed_sha: "abc123",
+    }],
+  });
+}
+
+function currentLocalIdentity(issueNumber = 100) {
+  return {
+    issue_number: issueNumber,
+    issue_open: true,
+    ready_label_present: false,
+    blocked_label_present: false,
+    pr_number: null,
+    pr_state: null,
+    head_branch: `pipeline/${issueNumber}-fix`,
+    head_sha: "abc123",
+    merge_commit_sha: null,
+    checks_conclusion: "none" as const,
+    pipeline_stage: "ready",
+    observed_at: "2026-07-23T00:00:00.000Z",
+  };
+}
 
 // ---------------------------------------------------------------------------
 // In-memory fakes (mirrors loop-reconcile.test.ts's fakeDeps/fakeObserveDeps).
@@ -865,6 +897,101 @@ test("onDriveEnd is absent by default (optional) — existing SupervisorDeps cal
   assert.equal(result.allDone, true);
 });
 
+test("driveSupervisor records one terminal loop_run_complete for a resolved drive", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem } = coordinatedFakes();
+
+  await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  const events = await readEvents(deps, "run-1");
+  const started = events.filter((event) => event.kind === "loop_drive_started");
+  const completed = events.filter((event) => event.kind === "loop_run_complete");
+  assert.equal(started.length, 1);
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0]?.data.outcome, "all_done");
+  assert.equal(completed[0]?.data.drive_id, started[0]?.data.drive_id);
+});
+
+test("driveSupervisor does not duplicate completion for an unchanged terminal revision", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem } = coordinatedFakes();
+
+  await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+  await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  const events = await readEvents(deps, "run-1");
+  assert.equal(events.filter((event) => event.kind === "loop_run_complete").length, 1);
+});
+
+test("driveSupervisor records one terminal event kind for a stopped drive", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: ["200"] },
+      { id: "200", depends_on: ["999"] },
+    ],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { deps: observe } = fakeObserveDeps();
+  const { dispatchItem } = coordinatedFakes();
+
+  await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  const events = await readEvents(deps, "run-1");
+  assert.equal(events.filter((event) => event.kind === "loop_run_stopped").length, 1);
+  assert.equal(events.filter((event) => event.kind === "loop_run_complete").length, 0);
+});
+
+test("driveSupervisor records hold completion but never completes an explicit maxCycles pause", async () => {
+  const heldContract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const heldLedger = testLedger({
+    "100": {
+      ...itemEntry("100", "waiting"),
+      hold_request: {
+        request_id: "req-1",
+        item_id: "100",
+        kind: "answer",
+        prompt: "operator answer required",
+        requested_by_engine: "claude",
+        requested_at: "2026-07-23T00:00:00.000Z",
+      },
+    },
+  });
+  const heldSetup = await setup(heldContract, heldLedger);
+  const heldFakes = coordinatedFakes();
+  await driveSupervisor(
+    { store: heldSetup.deps, observe: heldFakes.observe, dispatchItem: heldFakes.dispatchItem },
+    { runId: "run-1", engine: "claude" },
+  );
+  const heldEvents = await readEvents(heldSetup.deps, "run-1");
+  assert.equal(heldEvents.filter((event) => event.kind === "loop_run_complete").length, 1);
+  assert.equal(heldEvents.find((event) => event.kind === "loop_run_complete")?.data.outcome, "hold_outstanding");
+
+  const pausedContract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: ["100"] },
+    ],
+  });
+  const pausedLedger = testLedger({
+    "100": itemEntry("100", "pending"),
+    "200": itemEntry("200", "pending"),
+  });
+  const pausedSetup = await setup(pausedContract, pausedLedger);
+  const pausedFakes = coordinatedFakes();
+  await driveSupervisor(
+    { store: pausedSetup.deps, observe: pausedFakes.observe, dispatchItem: pausedFakes.dispatchItem },
+    { runId: "run-1", engine: "claude", maxCycles: 1 },
+  );
+  const pausedEvents = await readEvents(pausedSetup.deps, "run-1");
+  assert.equal(pausedEvents.filter((event) => event.kind === "loop_drive_started").length, 1);
+  assert.equal(pausedEvents.filter((event) => event.kind === "loop_run_complete").length, 0);
+});
+
 // ---------------------------------------------------------------------------
 // #530 — the independent-set scheduler wired into the supervisor cycle.
 // ---------------------------------------------------------------------------
@@ -1086,15 +1213,19 @@ test("runSupervisorCycle: a failed concurrent sibling does not strand an already
   const result = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
 
   assert.deepEqual(new Set(calls.map((c) => c.item_id)), new Set(["100", "200"]), "both independent items were dispatched");
-  assert.equal(result.stop?.reason, "run_fatal", "the failed item's block records the run_fatal stop");
+  assert.equal(result.stop, null, "the failed item cannot stop a sibling in the dispatch cycle");
 
   const finalLedger = await readLedger(deps, "run-1");
-  assert.equal(finalLedger.items["100"].state, "blocked", "the failing item is durably blocked, not silently re-dispatchable");
+  assert.equal(finalLedger.items["100"].state, "ready", "fresh verified completion supersedes the stale failed response");
   assert.equal(
     finalLedger.items["200"].state,
     "ready",
     "the sibling's already-completed ready_to_deploy outcome is preserved, not stranded in_progress",
   );
+
+  const terminal = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+  assert.equal(terminal.allDone, true, "verified external completion remains terminal");
+  assert.equal((await readLedger(deps, "run-1")).items["100"].state, "ready");
 
   const events = await readEvents(deps, "run-1");
   assert.ok(events.some((e: any) => e.kind === "loop_item_transitioned" && e.data?.item_id === "200" && e.data?.to === "ready"));
@@ -1119,18 +1250,75 @@ test("runSupervisorCycle: a rejected concurrent dispatch is durably classified f
   const { token } = await acquireLock(deps, "run-1", "claude");
   const result = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
 
-  assert.equal(result.stop?.reason, "run_fatal");
+  assert.equal(result.stop, null);
 
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked", "the rejected dispatch is classified failed and blocked, not silently dropped");
   assert.equal(finalLedger.items["100"].evidence_fingerprint !== undefined, true);
   assert.equal(finalLedger.items["200"].state, "ready", "the successful sibling's outcome survives the sibling's rejected dispatch");
+  const terminal = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+  assert.equal(terminal.stop?.reason, "run_fatal");
+});
+
+test("serialized dispatch rejection enters bounded recovery and redispatches the same item", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let dispatchCount = 0;
+  let recoveryCount = 0;
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: dispatchCount >= 2 ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue() {
+      return dispatchCount >= 2 ? 12 : null;
+    },
+    async getPrDetail() {
+      return {
+        state: "open",
+        head_ref: "pipeline/100-fix",
+        head_sha: recoveryCount > 0 ? "def456" : "abc123",
+        merge_commit_sha: null,
+      };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: recoveryCount > 0 ? "def456" : "abc123" };
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    if (dispatchCount === 1) throw new Error("adapter process exited before returning a response");
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: 12, pipeline_run_id: "advance-retry" },
+    };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCount++;
+    return { succeeded: true, evidence: "adapter state repaired", candidateHead: "def456" };
+  };
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(result.allDone, true);
+  assert.equal(result.stop, null);
+  assert.equal(dispatchCount, 2);
+  assert.equal(recoveryCount, 1);
 });
 
 // #530 review 2 finding a7abc98c: a terminal run-fatal stop recorded for the first dispatched
 // item in pass 2 must not leave a later sibling's own failed/blocked outcome unclassified and
 // `in_progress` (and therefore eligible for duplicate redispatch on a later resume).
-test("runSupervisorCycle: a terminal stop from one dispatched item does not strand a later sibling's own failed outcome in_progress", async () => {
+test("runSupervisorCycle: deferred terminalization does not strand a later sibling's own failed outcome in_progress", async () => {
   const contract = testContract({
     concurrency: { max_concurrent: 2 },
     items: [
@@ -1145,23 +1333,25 @@ test("runSupervisorCycle: a terminal stop from one dispatched item does not stra
   const { token } = await acquireLock(deps, "run-1", "claude");
   const result = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
 
-  assert.equal(result.stop?.reason, "run_fatal", "the first item's block records the run-fatal stop");
+  assert.equal(result.stop, null, "both item outcomes are classified before any run-level stop");
 
   const finalLedger = await readLedger(deps, "run-1");
-  assert.equal(finalLedger.items["100"].state, "blocked", "the first item is durably classified");
+  assert.equal(finalLedger.items["100"].state, "ready", "fresh verified completion supersedes the first stale response");
   assert.equal(
     finalLedger.items["200"].state,
-    "blocked",
-    "the second item is also durably classified despite the run already being terminally stopped by the first — never left in_progress",
+    "ready",
+    "the second item also honors fresh verified completion and is never left in_progress",
   );
-  assert.equal(finalLedger.items["200"].blocked_theme, "workflow-engine-defect");
-  // The first-cause stop reason/item is preserved — the second item's own classification never
-  // overwrites which item actually caused the run to stop.
-  assert.equal(finalLedger.stop?.item_id, "100");
+  // Live ready-to-deploy evidence wins on the next reconciliation pass even
+  // though both adapter responses were malformed.
+  const terminal = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+  assert.equal(terminal.allDone, true);
+  const reconciled = await readLedger(deps, "run-1");
+  assert.equal(reconciled.items["100"].state, "ready");
+  assert.equal(reconciled.items["200"].state, "ready");
 
-  const events = await readEvents(deps, "run-1");
-  const stopEvents = events.filter((e: any) => e.kind === "loop_run_stopped");
-  assert.equal(stopEvents.length, 1, "only one loop_run_stopped event is recorded — the second item's classification doesn't re-fire it");
+  const stopEvents = (await readEvents(deps, "run-1")).filter((e: any) => e.kind === "loop_run_stopped");
+  assert.equal(stopEvents.length, 0, "reconciled completion never emits a stale mechanical stop");
 });
 
 // #530 review 2 finding 0526bc5f: a rejected changed-file observation for one concurrently-run
@@ -1390,6 +1580,7 @@ test("regression (#581, pre-merge 20713d3b): a precondition-excluded sibling tha
       run_id: request.run_id,
       outcome: outcome as LoopExecutionResponse["outcome"],
       evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+      ...(request.item_id === "200" ? { diagnostic: humanAuthorityDiagnostic() } : {}),
     };
   };
 
@@ -1735,7 +1926,9 @@ test("regression (#568 review 2, finding 8bb189a0): a round-trip dispatch (backl
 
   const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
 
-  assert.equal(cycle.stop?.reason, "run_fatal", "a round-trip transition must never be masked as a zero-transition no-op");
+  assert.equal(cycle.stop, null, "the mechanical block is recorded before terminal promotion");
+  const terminal = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+  assert.equal(terminal.stop?.reason, "run_fatal", "a round-trip transition must never be masked as a zero-transition no-op");
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
   assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
@@ -1803,12 +1996,549 @@ test("regression (#568 review 1, finding f09d500c): a real round-trip transition
 
   const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
 
-  assert.equal(cycle.stop?.reason, "run_fatal", "clock skew must never mask a real round-trip transition as a zero-transition no-op");
+  assert.equal(cycle.stop, null, "the mechanical block is recorded before terminal promotion");
+  const terminal = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+  assert.equal(terminal.stop?.reason, "run_fatal", "clock skew must never mask a real round-trip transition as a zero-transition no-op");
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
   assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
   const events = await readEvents(deps, "run-1");
   assert.ok(!events.find((e: any) => e.kind === "loop_item_precondition_excluded"), "must not be recorded as a precondition exclusion");
+});
+
+// ---------------------------------------------------------------------------
+// Typed mechanical recovery.
+// ---------------------------------------------------------------------------
+
+test("blocked_recoverable is claimed before execution and redispatches the same item after repair", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let dispatchCount = 0;
+  let claimWasDurableBeforeExecution = false;
+  const backoffWaits: number[] = [];
+  const recoveryCalls: Parameters<NonNullable<SupervisorDeps["executeRecovery"]>>[0][] = [];
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "The PR head must be rebased onto main",
+    stage: "pre-merge",
+  });
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      return {
+        state: "open",
+        labels: dispatchCount >= 2 ? [READY_LABEL] : [PIPELINE_READY_LABEL],
+      };
+    },
+    async findPrForIssue() {
+      return dispatchCount >= 2 ? 12 : null;
+    },
+    async getPrDetail() {
+      return {
+        state: "open",
+        head_ref: "pipeline/100-fix",
+        head_sha: recoveryCalls.length > 0 ? "def456" : "abc123",
+        merge_commit_sha: null,
+      };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: recoveryCalls.length > 0 ? "def456" : "abc123" };
+    },
+    async baseBranchContainsSha() {
+      return false;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    if (dispatchCount === 1) {
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "blocked_recoverable",
+        evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+        diagnostic,
+      };
+    }
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: 12, pipeline_run_id: "advance-100-retry" },
+    };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    recoveryCalls.push(input);
+    const claimed = await readLedger(deps, "run-1");
+    claimWasDurableBeforeExecution = claimed.recovery_attempts.some(
+      (attempt) => attempt.attempt_id === input.attemptId && attempt.outcome === "started",
+    );
+    return { succeeded: true, evidence: "rebased and pushed current head", candidateHead: "def456" };
+  };
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem, executeRecovery, recoverySleep: async (ms) => { backoffWaits.push(ms); } },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(result.stop, null);
+  assert.equal(result.allDone, true);
+  assert.equal(dispatchCount, 2, "the repaired item is redispatched through the whole-item facade");
+  assert.equal(claimWasDurableBeforeExecution, true, "the budgeted claim exists before the side effect");
+  assert.equal(backoffWaits.length, 1, "the compiled backoff is applied after the claim and before execution");
+  assert.ok(backoffWaits[0] > 0 && backoffWaits[0] <= 15_000);
+  assert.equal(recoveryCalls.length, 1);
+  assert.equal(recoveryCalls[0].action, "repair_pipeline_item");
+  assert.equal(recoveryCalls[0].blockerClass, "workflow-state");
+  assert.match(recoveryCalls[0].candidateIdentity, /base=main.*head=abc123.*attempt=0/);
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "ready");
+  assert.equal(finalLedger.items["100"].recovery_budgets_remaining["workflow-state"], 2);
+  assert.equal(finalLedger.recovery_attempts.length, 1);
+  assert.equal(finalLedger.recovery_attempts[0].outcome, "recovered");
+  const events = await readEvents(deps, "run-1");
+  const startedIndex = events.findIndex((event) => event.kind === "loop_recovery_attempt_started");
+  const executedIndex = events.findIndex((event) => event.kind === "loop_recovery_action_executed");
+  const completedIndex = events.findIndex(
+    (event) => event.kind === "loop_recovery_attempt" && event.data.outcome === "recovered",
+  );
+  assert.ok(startedIndex >= 0 && startedIndex < executedIndex && executedIndex < completedIndex);
+});
+
+test("restart reconciliation lets the repair executor reconcile its pushed candidate without replaying the model", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let head = "abc123";
+  let failPostObservation = false;
+  let recoveryCalls = 0;
+  let modelExecutions = 0;
+  let dispatchCount = 0;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "harness-failure",
+    reason: "adapter state is inconsistent",
+    stage: "loop-supervisor",
+  });
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: dispatchCount >= 2 ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue() {
+      return dispatchCount >= 2 ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: head, merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      if (failPostObservation) throw new Error("observation unavailable after side effect");
+      return { branch: "pipeline/100-fix", sha: head };
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: dispatchCount === 1 ? "blocked_recoverable" : "ready_to_deploy",
+      evidence: { pr_number: dispatchCount === 1 ? null : 12, pipeline_run_id: `advance-100-${dispatchCount}` },
+      ...(dispatchCount === 1 ? { diagnostic } : {}),
+    };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    if (recoveryCalls === 1) {
+      modelExecutions++;
+      head = "def456";
+      failPostObservation = true;
+      return { succeeded: true, evidence: "repair pushed before observation failed", candidateHead: "def456" };
+    }
+    return { succeeded: true, evidence: "reconciled the marked remote commit", candidateHead: "def456" };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const interrupted = await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+  assert.equal(interrupted.stop, null);
+  assert.equal((await readLedger(deps, "run-1")).recovery_attempts[0].outcome, "started");
+
+  failPostObservation = false;
+  const resumed = await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+  assert.equal(resumed.stop, null);
+  assert.equal(recoveryCalls, 2, "the durable executor is re-entered to reconcile its exact marked commit");
+  assert.equal(modelExecutions, 1, "the implementer is not replayed after the pushed commit");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.recovery_attempts[0].outcome, "recovered");
+  assert.equal(finalLedger.items["100"].state, "ready");
+  assert.equal((await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  )).allDone, true);
+});
+
+test("durable recovery backoff schedules an independent sibling instead of sleeping in the item path", async () => {
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": {
+        ...workflowState,
+        backoff: { initial_seconds: 300, multiplier: 2, max_seconds: 300 },
+      },
+    },
+    items: [{ id: "100", depends_on: [] }, { id: "200", depends_on: [] }],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const dispatched = new Set<string>();
+  const sleeps: number[] = [];
+  let recoveryCalls = 0;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "candidate requires a mechanical rebase",
+    stage: "pre-merge",
+  });
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels(issueNumber) {
+      return {
+        state: "open",
+        labels: dispatched.has(String(issueNumber)) && issueNumber === 200
+          ? [READY_LABEL]
+          : [PIPELINE_READY_LABEL],
+      };
+    },
+    async findPrForIssue(issueNumber) {
+      return dispatched.has(String(issueNumber)) && issueNumber === 200 ? 22 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/200-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead(issueNumber) {
+      return issueNumber === 100 ? { branch: "pipeline/100-fix", sha: "abc123" } : null;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatched.add(request.item_id);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: request.item_id === "100" ? "blocked_recoverable" : "ready_to_deploy",
+      evidence: { pr_number: request.item_id === "200" ? 22 : null, pipeline_run_id: `advance-${request.item_id}` },
+      ...(request.item_id === "100" ? { diagnostic } : {}),
+    };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: false, evidence: "must not run before not_before" };
+  };
+  const supervisorDeps: SupervisorDeps = {
+    store: deps,
+    observe,
+    dispatchItem,
+    executeRecovery,
+    recoverySleep: async (ms) => { sleeps.push(ms); },
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle(supervisorDeps, "run-1", token, "claude");
+  const siblingCycle = await runSupervisorCycle(supervisorDeps, "run-1", token, "claude");
+
+  const current = await readLedger(deps, "run-1");
+  assert.equal(current.items["100"].state, "blocked");
+  assert.equal(current.items["200"].state, "ready");
+  assert.ok(current.recovery_attempts[0].not_before, "the eligibility deadline is durable");
+  assert.equal(recoveryCalls, 0, "the recovery side effect is not executed early");
+  assert.equal(sleeps.length, 0, "runSupervisorCycle never blocks sibling scheduling on the timer");
+  assert.equal(siblingCycle.retryAfterMs, undefined, "a dispatched sibling takes precedence over idle waiting");
+});
+
+test("fresh ready state supersedes an interrupted recovery claim without another side effect", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let ready = false;
+  let failObservation = false;
+  let recoveryCalls = 0;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "candidate requires a mechanical rebase",
+    stage: "pre-merge",
+  });
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ready ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue() {
+      return ready ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: "def456", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      if (failObservation) throw new Error("postcondition temporarily unavailable");
+      return { branch: "pipeline/100-fix", sha: ready ? "def456" : "abc123" };
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_recoverable",
+    evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+    diagnostic,
+  });
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    failObservation = true;
+    return { succeeded: true, evidence: "repair pushed", candidateHead: "def456" };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle({ store: deps, observe, dispatchItem, executeRecovery }, "run-1", token, "claude");
+  assert.equal((await readLedger(deps, "run-1")).recovery_attempts[0].outcome, "started");
+
+  failObservation = false;
+  ready = true;
+  const resumed = await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(resumed.allDone, true);
+  assert.equal(finalLedger.items["100"].state, "ready");
+  assert.equal(finalLedger.recovery_attempts[0].outcome, "superseded");
+  assert.equal(recoveryCalls, 1);
+  assert.ok((await readEvents(deps, "run-1")).some((event) => event.kind === "loop_recovery_superseded"));
+});
+
+test("a failed budgeted recovery stays blocked and stops only after the action is observed", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({
+    "100": { ...itemEntry("100", "pending"), last_verified_identity: currentLocalIdentity() },
+  });
+  const { deps } = await setup(contract, ledger);
+  let recoveryCalls = 0;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "harness-failure",
+    reason: "The host returned a malformed stage result",
+    stage: "loop-supervisor",
+  });
+  const observe = fakeObserveDeps({
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: "abc123" };
+    },
+    async baseBranchContainsSha() {
+      return false;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_recoverable",
+    evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+    diagnostic,
+  });
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: false, evidence: "repair exited non-zero", error: "repair exited non-zero" };
+  };
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(recoveryCalls, 1);
+  assert.equal(result.stop?.reason, "run_fatal");
+  assert.equal(result.stop?.theme, "workflow-engine-defect");
+  assert.equal(result.holdOutstanding, false);
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked");
+  assert.equal(finalLedger.items["100"].recovery_budgets_remaining["workflow-engine-defect"], 0);
+  assert.equal(finalLedger.recovery_attempts[0].outcome, "failed");
+  assert.equal(finalLedger.recovery_attempts[0].error, "repair exited non-zero");
+});
+
+test("an exhausted mechanical item cannot stop an independent sibling before that sibling runs", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({
+    "100": itemEntry("100", "pending"),
+    "200": itemEntry("200", "pending"),
+  });
+  const { deps } = await setup(contract, ledger);
+  let item200Dispatched = false;
+  let recoveryCalls = 0;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "harness-failure",
+    reason: "The adapter returned an invalid result",
+    stage: "loop-supervisor",
+  });
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels(issueNumber) {
+      return {
+        state: "open",
+        labels: issueNumber === 200 && item200Dispatched ? [READY_LABEL] : [PIPELINE_READY_LABEL],
+      };
+    },
+    async findPrForIssue(issueNumber) {
+      return issueNumber === 200 && item200Dispatched ? 22 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/200-fix", head_sha: "def456", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead(issueNumber) {
+      return issueNumber === 100 ? { branch: "pipeline/100-fix", sha: "abc123" } : null;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    if (request.item_id === "200") item200Dispatched = true;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: request.item_id === "100" ? "blocked_recoverable" : "ready_to_deploy",
+      evidence: { pr_number: request.item_id === "200" ? 22 : null, pipeline_run_id: `advance-${request.item_id}` },
+      ...(request.item_id === "100" ? { diagnostic } : {}),
+    };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: false, evidence: "repair failed", error: "repair failed" };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const blockedCycle = await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+  assert.equal(blockedCycle.stop, null);
+  assert.equal((await readLedger(deps, "run-1")).items["100"].state, "blocked");
+
+  const siblingCycle = await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+  assert.equal(siblingCycle.stop, null, "exhaustion remains item-local while the sibling is schedulable");
+  assert.equal((await readLedger(deps, "run-1")).items["200"].state, "ready");
+  assert.equal(recoveryCalls, 1);
+
+  const terminalCycle = await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+  assert.equal(terminalCycle.stop?.reason, "run_fatal", "the exhausted item stops only after sibling progress is complete");
+  assert.deepEqual(terminalCycle.stop?.outstanding_ready, ["200"]);
+});
+
+test("recovery advances through the configured recipe list after a failed action", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({
+    "100": { ...itemEntry("100", "pending"), last_verified_identity: currentLocalIdentity() },
+  });
+  const { deps } = await setup(contract, ledger);
+  let dispatchCount = 0;
+  const actions: string[] = [];
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "candidate needs mechanical repair or workflow resync",
+    stage: "pre-merge",
+  });
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: dispatchCount >= 2 ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue() {
+      return dispatchCount >= 2 ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: "abc123" };
+    },
+    async baseBranchContainsSha() {
+      return false;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: dispatchCount === 1 ? "blocked_recoverable" : "ready_to_deploy",
+      evidence: { pr_number: 12, pipeline_run_id: `advance-${dispatchCount}` },
+      ...(dispatchCount === 1 ? { diagnostic } : {}),
+    };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    actions.push(input.action);
+    return input.action === "repair_pipeline_item"
+      ? { succeeded: false, evidence: "repair failed", error: "repair failed" }
+      : { succeeded: true, evidence: "workflow state resynchronized" };
+  };
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(result.allDone, true);
+  assert.deepEqual(actions, ["repair_pipeline_item", "resync_workflow_state"]);
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.deepEqual(finalLedger.recovery_attempts.map((attempt) => attempt.outcome), ["failed", "recovered"]);
+  assert.equal(finalLedger.items["100"].recovery_budgets_remaining["workflow-state"], 1);
 });
 
 // ---------------------------------------------------------------------------
@@ -1834,6 +2564,9 @@ test("regression (#570): a direct blocked_needs_human outcome enters a needs-hum
   const observe: ReconcileObserveDeps = {
     async getIssueStateAndLabels(issueNumber) {
       const id = String(issueNumber);
+      if (id === "200" && dispatched.has(id)) {
+        return { state: "open", labels: ["pipeline:plan-review", "blocked"] };
+      }
       return { state: "open", labels: dispatched.has(id) ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
     },
     async findPrForIssue(issueNumber) {
@@ -1865,6 +2598,7 @@ test("regression (#570): a direct blocked_needs_human outcome enters a needs-hum
       run_id: request.run_id,
       outcome: outcome as LoopExecutionResponse["outcome"],
       evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+      ...(request.item_id === "200" ? { diagnostic: humanAuthorityDiagnostic() } : {}),
     };
   };
 
@@ -1906,7 +2640,7 @@ test("regression (#581 review 1, finding fcb03bcd04fc9b04): a direct blocked_nee
       return [];
     },
     async getLocalHead() {
-      return null;
+      return { branch: "pipeline/100-fix", sha: "abc123" };
     },
     async baseBranchContainsSha() {
       return null;
@@ -1925,6 +2659,7 @@ test("regression (#581 review 1, finding fcb03bcd04fc9b04): a direct blocked_nee
       run_id: request.run_id,
       outcome: "blocked_needs_human" as LoopExecutionResponse["outcome"],
       evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+      diagnostic: humanAuthorityDiagnostic(),
     };
   };
 
@@ -1951,11 +2686,59 @@ test("regression (#581 review 1, finding fcb03bcd04fc9b04): a direct blocked_nee
   assert.equal(finalLedger.items["100"].state, "waiting", "the hold remains outstanding, awaiting a human resume");
 });
 
-test("needs-human blocker-disposition safety net (#570): a failed outcome observed carrying the blocked label is routed to the hold, not workflow-engine-defect", async () => {
-  // Item "100" is dispatched, its harness reports the well-known retryable plan-review format
-  // failure normalized to "failed" (LOOP_TERMINAL_OUTCOMES has no such literal outcome), and the
-  // live issue is nonetheless observed carrying `blocked` — a recoverable,
-  // human-unblockable disposition, not a genuine dispatch crash/rejection.
+test("candidate-bound human authority expires on HEAD movement even while the blocked label remains", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const diagnostic = humanAuthorityDiagnostic();
+  const waiting = {
+    ...itemEntry("100", "waiting"),
+    last_verified_identity: currentLocalIdentity(),
+    hold_request: {
+      request_id: "hold-100",
+      item_id: "100",
+      kind: "answer" as const,
+      prompt: "Decide the reviewed candidate question",
+      requested_by_engine: "claude" as const,
+      requested_at: "2026-07-23T00:00:00.000Z",
+      authority_evidence_key: diagnostic.evidence_key,
+      authority_candidate_head: "abc123",
+      source: "pipeline_blocked_label" as const,
+    },
+  };
+  const { deps } = await setup(contract, testLedger({ "100": waiting }));
+  let dispatchCount = 0;
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: [PIPELINE_READY_LABEL, "blocked"] };
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: "def456" };
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "abandoned",
+      evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(cycle.holdOutstanding, false);
+  assert.equal(dispatchCount, 1, "the stale authority hold is re-admitted in the same cycle");
+  assert.equal(finalLedger.items["100"].state, "abandoned");
+  assert.equal(finalLedger.items["100"].hold_request, undefined);
+  assert.ok((await readEvents(deps, "run-1")).some((event) => event.kind === "loop_item_hold_invalidated"));
+});
+
+test("authority fail-closed: a failed outcome carrying only the blocked label is an engine defect, never a human hold", async () => {
+  // Labels are workflow evidence, not authority. A failed response without a
+  // typed human-decision diagnostic must not hard-park the item for a human.
   const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
   const ledger = testLedger({ "100": itemEntry("100", "pending") });
   const { deps } = await setup(contract, ledger);
@@ -1998,13 +2781,14 @@ test("needs-human blocker-disposition safety net (#570): a failed outcome observ
 
   const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
 
-  assert.equal(result.stop, null, "a plan-review format blocker must never be classified workflow-engine-defect / run_fatal");
-  assert.equal(result.holdOutstanding, true);
+  assert.equal(result.stop?.reason, "run_fatal");
+  assert.equal(result.stop?.theme, "workflow-engine-defect");
+  assert.equal(result.holdOutstanding, false);
 
   const finalLedger = await readLedger(deps, "run-1");
-  assert.equal(finalLedger.stop, null);
-  assert.equal(finalLedger.items["100"].state, "waiting");
-  assert.notEqual(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
+  assert.equal(finalLedger.items["100"].state, "blocked");
+  assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
+  assert.equal(finalLedger.items["100"].hold_request, undefined);
 });
 
 test("regression (#570): a run stop while a sibling is ready discloses the outstanding ready item on the stop record", async () => {
@@ -2154,7 +2938,7 @@ test("regression (#581): one already-blocked item co-present with a stage label 
       return [{ bucket: "pass" }];
     },
     async getLocalHead() {
-      return null;
+      return { branch: "pipeline/100-fix", sha: "abc123" };
     },
     async baseBranchContainsSha() {
       return null;
@@ -2166,13 +2950,14 @@ test("regression (#581): one already-blocked item co-present with a stage label 
   };
   const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
     dispatched.add(request.item_id);
-    const outcome = request.item_id === "100" ? "failed" : "ready_to_deploy";
+    const outcome = request.item_id === "100" ? "blocked_needs_human" : "ready_to_deploy";
     return {
       schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
       item_id: request.item_id,
       run_id: request.run_id,
       outcome: outcome as LoopExecutionResponse["outcome"],
       evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+      ...(request.item_id === "100" ? { diagnostic: humanAuthorityDiagnostic() } : {}),
     };
   };
 
@@ -2283,6 +3068,72 @@ test("re-admission (#581 review 2, finding 016d467e9d176c6f): a held item whose 
   assert.equal(finalLedger.items["100"].state, "ready", "the re-admitted item reaches its dispatched outcome");
 });
 
+test("post-dispatch reconciliation reopens a sibling cleared while another item was in flight", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({
+    "100": {
+      ...itemEntry("100", "waiting"),
+      hold_request: {
+        request_id: "req-1",
+        item_id: "100",
+        kind: "answer",
+        prompt: "clear the product blocker",
+        requested_by_engine: "claude",
+        requested_at: "2026-07-23T00:00:00.000Z",
+        source: "pipeline_blocked_label",
+      },
+    },
+    "200": itemEntry("200", "pending"),
+  });
+  const { deps } = await setup(contract, ledger);
+  let dispatchFinished = false;
+  const observe: ReconcileObserveDeps = {
+    ...fakeObserveDeps().deps,
+    async getIssueStateAndLabels(issueNumber) {
+      if (issueNumber === 100) {
+        return {
+          state: "open",
+          labels: dispatchFinished ? [PIPELINE_READY_LABEL] : [PIPELINE_READY_LABEL, "blocked"],
+        };
+      }
+      return { state: "open", labels: [PIPELINE_READY_LABEL, "blocked"] };
+    },
+    async getLocalHead(issueNumber) {
+      return issueNumber === 200 ? { branch: "pipeline/200-fix", sha: "abc123" } : null;
+    },
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchFinished = true;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked_needs_human",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+      diagnostic: humanAuthorityDiagnostic(),
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const result = await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, probeLiveAdvance: () => ({ live: false }) },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(result.holdOutstanding, false, "the freshly re-admitted sibling keeps the run schedulable");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "pending");
+  assert.equal(finalLedger.items["200"].state, "waiting");
+  assert.ok((await readEvents(deps, "run-1")).some((event) => event.kind === "loop_item_hold_cleared"));
+});
+
 test("re-admission gated by discriminator (#581 review 2, finding 016d467e9d176c6f): a held item with no pipeline_blocked_label source is never auto-reopened even once its labels show no blocker", async () => {
   const contract = testContract({
     items: [{ id: "100", depends_on: [] }],
@@ -2352,7 +3203,7 @@ test("regression (#581 review 2, finding b38ac1b0566a5373): a needs-human hold p
       return [{ bucket: "pass" }];
     },
     async getLocalHead() {
-      return null;
+      return { branch: "pipeline/100-fix", sha: "abc123" };
     },
     async baseBranchContainsSha() {
       return null;
@@ -2368,8 +3219,9 @@ test("regression (#581 review 2, finding b38ac1b0566a5373): a needs-human hold p
       schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
       item_id: request.item_id,
       run_id: request.run_id,
-      outcome: "failed",
+      outcome: "blocked_needs_human",
       evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+      diagnostic: humanAuthorityDiagnostic(),
     };
   };
 

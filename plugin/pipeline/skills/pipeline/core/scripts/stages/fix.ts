@@ -65,6 +65,7 @@ import {
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 import { extractBlockingKeysMarker, extractReviewedSha } from "./review.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
+import { buildStageDiagnostic } from "../stage-diagnostic.ts";
 import {
   computeBranchDeveloperCommits,
   enforceSpecConsistencyGuard,
@@ -836,10 +837,11 @@ export async function advanceFix(
       } else {
         // #473: before the #391 does-not-reproduce carve-out, check whether the
         // harness declared that one or more invoked blocking findings require a
-        // human decision — a durable product/authority/external-dependency
-        // impasse, never a code fix and never a claim the finding's condition
-        // does not exist. Evaluated first so a round mixing both outcomes always
-        // parks rather than advancing. Fails closed: any malformed, stale, or
+        // no-code disposition — either a durable product/authority decision or
+        // an external dependency that remains controller-owned, never a claim
+        // that the finding's condition does not exist. Evaluated first so a
+        // round mixing either disposition with does-not-reproduce never advances.
+        // Fails closed: any malformed, stale, or
         // unmatched declaration is simply not accepted here and falls through to
         // the does-not-reproduce check and then the existing no-commits block.
         const humanDecisionDeclarations = parseHumanDecisionDeclarations(result.stdout ?? "");
@@ -850,7 +852,10 @@ export async function advanceFix(
         );
         if (acceptedHumanDecisions.length > 0) {
           const timestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-          for (const decl of acceptedHumanDecisions) {
+          const authorityDecisions = acceptedHumanDecisions.filter(
+            (decl) => decl.category === "product-decision" || decl.category === "authority",
+          );
+          for (const decl of authorityDecisions) {
             await postComment(
               cfg,
               issueNumber,
@@ -875,18 +880,44 @@ export async function advanceFix(
           const requests = acceptedHumanDecisions
             .map((d) => `\`${d.key}\`: ${neutralizeSentinelText(d.request)}`)
             .join("; ");
-          const humanDecisionMsg =
-            `${stage}: the fix harness produced no new commits and declared ` +
-            `${acceptedHumanDecisions.length} blocking finding(s) require a human decision ` +
-            `(${categories}) at the reviewed SHA (${headAfter}) — ${requests}. This does not ` +
-            `resolve or advance the item.`;
+          const humanDecisionMsg = authorityDecisions.length > 0
+            ? `${stage}: the fix harness produced no new commits and declared ` +
+              `${authorityDecisions.length} blocking finding(s) require human authority ` +
+              `(${categories}) at the reviewed SHA (${headAfter}) — ${requests}. This does not ` +
+              `resolve or advance the item.`
+            : `${stage}: the fix harness produced no new commits and declared an external dependency ` +
+              `at the reviewed SHA (${headAfter}) — ${requests}. This remains a mechanical ` +
+              `controller-owned wait/retry condition and grants no human authority.`;
           const humanDecisionReason = await appendWorktreeStateDisclosure(wt.path, humanDecisionMsg);
-          await setBlocked(cfg, issueNumber, humanDecisionReason, stage, "human-decision-required");
+          const blockerKind = authorityDecisions.length > 0
+            ? "human-decision-required" as const
+            : "needs-human" as const;
+          const diagnostic = buildStageDiagnostic({
+            blockerKind,
+            reason: humanDecisionMsg,
+            stage,
+            ...(authorityDecisions.length > 0
+              ? {
+                  authorityEvidence: authorityDecisions.map((decl) => ({
+                    category: decl.category as "product-decision" | "authority",
+                    finding_key: decl.key,
+                    finding_fingerprint: decl.fingerprint,
+                    reviewed_sha: decl.reviewedSha,
+                  })),
+                }
+              : {}),
+          });
+          if (authorityDecisions.length > 0) {
+            await setBlocked(cfg, issueNumber, humanDecisionReason, stage, "human-decision-required");
+          } else {
+            await setBlocked(cfg, issueNumber, humanDecisionReason, stage, "needs-human");
+          }
           return {
             advanced: false,
             status: "blocked",
             reason: humanDecisionMsg,
-            blockerKind: "human-decision-required",
+            blockerKind,
+            diagnostic,
           };
         }
         // #391: before blocking, check whether the harness declared every

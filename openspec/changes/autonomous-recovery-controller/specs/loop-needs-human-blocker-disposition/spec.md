@@ -1,0 +1,94 @@
+## MODIFIED Requirements
+
+### Requirement: A needs-human pipeline blocker SHALL be recorded as a non-terminal hold, never as a run-fatal engine defect
+
+The supervisor SHALL record a nonterminal needs-human hold only when a blocked dispatch carries a
+current canonical `human-decision-required` diagnostic whose structured blocker kind is also
+`human-decision-required`. The supervisor SHALL verify that diagnostic against fresh dispatch
+evidence before creating or retaining the hold. A `pipeline:blocked` label, a
+`blocked_needs_human` outcome without that diagnostic, a missing or
+reason-less diagnostic, a plan/output format error, an artifact failure, an exhausted mechanical
+attempt, or any co-present stage label SHALL be insufficient authority evidence. Those cases SHALL
+enter typed engine recovery or terminal system failure and SHALL NOT emit `human_intervention`.
+While a genuine human hold exists, the run SHALL continue any schedulable dependency-independent
+sibling and preserve every sibling's state. A rejected/crashed dispatch or protocol defect SHALL
+remain engine-owned and SHALL follow bounded recovery before any terminal system stop.
+
+#### Scenario: A plan-review format blocker remains engine-owned
+
+- **WHEN** an item's dispatch reports a missing required output section and the issue is observed
+  carrying `pipeline:blocked` without a current `human-decision-required` diagnostic
+- **THEN** the supervisor SHALL route the canonical engine-owned diagnostic through bounded recovery
+- **AND** it SHALL NOT create a needs-human hold or emit `human_intervention`
+
+#### Scenario: A blocked label co-present with a stage label is not authority
+
+- **WHEN** an item's dispatch reports blocked or failed and live truth carries `pipeline:blocked`
+  co-present with another `pipeline:*` stage label but no current human-decision diagnostic
+- **THEN** the supervisor SHALL preserve the stage and diagnostic for recovery classification
+- **AND** it SHALL NOT create a human hold from either label
+
+#### Scenario: A blocked_needs_human outcome requires authority evidence
+
+- **WHEN** per-item execution reports `blocked_needs_human`
+- **THEN** the supervisor SHALL inspect its current canonical diagnostic
+- **AND** it SHALL create a human hold only when the strict authority predicate passes
+
+#### Scenario: Current human-decision diagnostic creates a resumable hold
+
+- **WHEN** a blocked dispatch carries a current canonical `human-decision-required` diagnostic
+- **THEN** the supervisor SHALL move the item to a `paused` or `waiting` hold and report
+  `hold_outstanding=true`
+- **AND** it SHALL retain the candidate and authority evidence needed to validate a later answer
+
+#### Scenario: A genuine engine defect is recovered before terminalization
+
+- **WHEN** a dispatch is rejected, crashes, or reports a protocol defect without authority evidence
+- **THEN** the outcome SHALL be classified as an engine-owned diagnostic
+- **AND** bounded recovery SHALL run before any terminal system stop
+
+#### Scenario: A ready sibling survives a genuine human hold
+
+- **WHEN** a run holds one item on current human-authority evidence while a sibling is already
+  `ready`
+- **THEN** the ready sibling's state SHALL be preserved unchanged
+- **AND** the hold SHALL not be reclassified as an engine defect
+
+#### Scenario: A human hold with a schedulable sibling continues the run
+
+- **WHEN** a run holds one item on current human-authority evidence while a dependency-independent
+  sibling remains schedulable
+- **THEN** the run SHALL continue dispatching the sibling
+- **AND** it SHALL revalidate the held item's authority evidence on later cycles
+
+### Requirement: Pure capacity outcomes SHALL NOT become needs-human product holds
+
+The supervisor SHALL classify a pure worktree-capacity admission failure as an engine-owned
+`worktree-capacity` diagnostic and SHALL route it to capacity release, wait, or bounded retry. It
+SHALL NOT create a product needs-human hold or request a human answer for capacity alone. A genuine
+human hold SHALL still require a current canonical `human-decision-required` diagnostic;
+neither a blocked label nor stale blocker commentary SHALL satisfy that predicate. Capacity and
+authority evidence SHALL be correlated to the current candidate and current blocker application so
+stale evidence cannot determine disposition.
+
+#### Scenario: Capacity-only planning failure is not a product needs-human hold
+
+- **WHEN** an item's dispatch fails in planning solely with a worktree-capacity diagnostic
+- **AND** no current `human-decision-required` diagnostic exists
+- **THEN** the supervisor SHALL apply capacity release, wait, or bounded retry
+- **AND** it SHALL NOT create a human hold or emit `human_intervention`
+
+#### Scenario: Genuine authority hold remains distinct from capacity
+
+- **WHEN** an item carries a current canonical `human-decision-required` diagnostic and
+  capacity is also tight
+- **THEN** the supervisor SHALL preserve the authority hold for the diagnostic's concrete question
+- **AND** it SHALL not rewrite the authority reason as capacity admission
+
+#### Scenario: Stale authentic capacity comment does not determine a later block
+
+- **WHEN** an issue has a prior trusted capacity blocker record from an earlier candidate or block
+  application
+- **AND** the current block has no matching current diagnostic
+- **THEN** the supervisor SHALL NOT classify the current block from the stale capacity record
+- **AND** it SHALL reconcile current live identity and evidence before choosing a disposition

@@ -33,7 +33,7 @@ import type { TrySalvageResult } from "../scripts/salvage-harness-work.ts";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import type { OpenIssue } from "../scripts/gh.ts";
-import type { PipelineConfig } from "../scripts/types.ts";
+import type { Outcome, PipelineConfig } from "../scripts/types.ts";
 
 const enabledCfg = {
   last30days: { enabled: true, timeout: 600 },
@@ -684,6 +684,16 @@ async function runAndCapture(
   hooks: PlanningPhaseHooks,
   depsOverrides: Record<string, unknown> = {},
 ): Promise<{ tag: string; reason: string; stage: string } | undefined> {
+  return (await runAndCaptureOutcome(hooks, depsOverrides)).captured;
+}
+
+async function runAndCaptureOutcome(
+  hooks: PlanningPhaseHooks,
+  depsOverrides: Record<string, unknown> = {},
+): Promise<{
+  captured: { tag: string; reason: string; stage: string } | undefined;
+  outcome: Outcome;
+}> {
   let captured: { tag: string; reason: string; stage: string } | undefined;
   const deps = {
     ...eqBaseDeps(),
@@ -692,8 +702,22 @@ async function runAndCapture(
       captured = { tag, reason, stage };
     },
   };
-  await runPlanningPhases(eqCfg, 42, "Test issue", "test body", "run-42", {}, hooks, deps as any);
-  return captured;
+  const outcome = await runPlanningPhases(eqCfg, 42, "Test issue", "test body", "run-42", {}, hooks, deps as any);
+  return { captured, outcome };
+}
+
+function assertReturnedBlockerMatches(
+  result: Awaited<ReturnType<typeof runAndCaptureOutcome>>,
+  expected: string,
+): void {
+  assert.equal(result.captured?.tag, expected, "setBlocked kind");
+  assert.equal(result.outcome.advanced, false);
+  if (!result.outcome.advanced) {
+    assert.equal(result.outcome.status, "blocked");
+    if (result.outcome.status === "blocked") {
+      assert.equal(result.outcome.blockerKind, expected, "returned blockerKind must match setBlocked");
+    }
+  }
 }
 
 test("runPlanningPhases — blocker equivalence: bootstrap creation failure", async () => {
@@ -751,6 +775,36 @@ test("runPlanningPhases — blocker equivalence: openspec validation failure", a
   assert.equal(o?.stage, f?.stage, "openspec stage matches freeform");
   assert.ok(f?.reason.includes("is invalid:"), `freeform reason: ${f?.reason}`);
   assert.ok(o?.reason.includes("is invalid:"), `openspec reason: ${o?.reason}`);
+});
+
+test("runPlanningPhases: invalid OpenSpec after plan revision returns openspec-invalid", async () => {
+  const result = await runAndCaptureOutcome(openspecHooks({
+    async revalidateArtifact() {
+      return {
+        ok: false,
+        reason: "OpenSpec change `test-change` is invalid after revision: requirement body is missing SHALL",
+        tag: "openspec-invalid",
+      };
+    },
+  }));
+
+  assertReturnedBlockerMatches(result, "openspec-invalid");
+  assert.equal(result.captured?.stage, "plan-review");
+});
+
+test("runPlanningPhases: blocked returns preserve harness-failure and no-commits kinds", async () => {
+  const harnessResult = await runAndCaptureOutcome(freeformHooks({
+    async authorArtifact() {
+      return { ok: false, reason: "Plan generation failed (exit 1)", tag: "harness-failure" };
+    },
+  }));
+  assertReturnedBlockerMatches(harnessResult, "harness-failure");
+
+  const noCommitsResult = await runAndCaptureOutcome(
+    freeformHooks(),
+    { hasCommitsAhead: async () => false },
+  );
+  assertReturnedBlockerMatches(noCommitsResult, "no-commits");
 });
 
 test("runPlanningPhases: transitions ready to planning before authoring", async () => {

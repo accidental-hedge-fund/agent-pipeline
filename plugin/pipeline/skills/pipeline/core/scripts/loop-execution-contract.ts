@@ -12,6 +12,8 @@
 // Pipeline advances it stage by stage, which is what keeps the per-item
 // advance loop from ever owning more than one issue (a stated non-goal).
 
+import type { StageDiagnostic } from "./stage-diagnostic.ts";
+
 export const LOOP_EXECUTION_CONTRACT_SCHEMA = "pipeline/loop-execution@1";
 
 export type LoopEngine = "claude" | "codex";
@@ -48,6 +50,8 @@ export interface LoopExecutionRequest {
  *  silently retrying (see {@link isLoopTerminalOutcome}). */
 export const LOOP_TERMINAL_OUTCOMES = [
   "ready_to_deploy",
+  /** A structurally diagnosed mechanical block eligible for bounded recovery. */
+  "blocked_recoverable",
   "blocked_needs_human",
   /**
    * Ops admission wait: pure worktree capacity (#718). Distinct from product
@@ -98,6 +102,9 @@ export interface LoopExecutionResponse {
   run_id: string;
   outcome: LoopTerminalOutcome;
   evidence: LoopEvidencePointer;
+  /** Canonical stage blocker transport. Required by the supervisor for any
+   *  blocked disposition; absent/malformed diagnostics are protocol failures. */
+  diagnostic?: StageDiagnostic;
 }
 
 /** Normalize an arbitrary reported outcome to a terminal one, per the "no

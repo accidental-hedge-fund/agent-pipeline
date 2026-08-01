@@ -256,6 +256,12 @@ test("maybeArchiveOpenspec #675: partial multi-archive blocks residual, never pa
   assert.equal(blocked[0]?.kind, "openspec-invalid");
   assert.match(blocked[0]?.reason ?? "", new RegExp(BETA));
   assert.match(blocked[0]?.reason ?? "", /openspec archive/);
+  const diagnostic = (out as { diagnostic?: { reason_code?: string; evidence_key?: string } })?.diagnostic;
+  assert.equal(diagnostic?.reason_code, "openspec-archive-apply-conflict");
+  assert.equal(
+    diagnostic?.evidence_key,
+    `openspec-archive-apply-conflict:${BETA}:archive_active_change_remains`,
+  );
   // Alpha may be mentioned as archived for clarity, but beta must not be presented as archived-only success.
   assert.ok(archiveCalls.includes(ALPHA) && archiveCalls.includes(BETA));
 });

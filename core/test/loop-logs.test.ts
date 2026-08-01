@@ -10,9 +10,14 @@ import {
   appendFollowChunk,
   followEventsWithTerminalExit,
   followFileWithSignalCleanup,
+  isLoopDriveStartedLine,
+  isLoopRunCompleteLine,
   isLoopRunStoppedLine,
+  isLoopTerminalLine,
   listLoopRunIds,
   loopEventsPath,
+  LOOP_DRIVE_STARTED_KIND,
+  LOOP_RUN_COMPLETE_KIND,
   LOOP_RUN_STOPPED_KIND,
   runLoopLogs,
   type FollowEventsIo,
@@ -389,6 +394,14 @@ test("isLoopRunStoppedLine: matches store-shaped kind field only", () => {
   assert.equal(isLoopRunStoppedLine('{"type":"loop_run_stopped"}'), false, "must use kind, not type");
 });
 
+test("loop completion predicates use store-shaped kinds and include successful/hold completion", () => {
+  assert.equal(isLoopRunCompleteLine(`{"kind":"${LOOP_RUN_COMPLETE_KIND}"}`), true);
+  assert.equal(isLoopRunCompleteLine('{"type":"loop_run_complete"}'), false);
+  assert.equal(isLoopTerminalLine(`{"kind":"${LOOP_RUN_COMPLETE_KIND}"}`), true);
+  assert.equal(isLoopTerminalLine(`{"kind":"${LOOP_RUN_STOPPED_KIND}"}`), true);
+  assert.equal(isLoopDriveStartedLine(`{"kind":"${LOOP_DRIVE_STARTED_KIND}"}`), true);
+});
+
 test("appendFollowChunk: buffers incomplete lines; detects terminal on complete line", () => {
   const lines: string[] = [];
   let r = appendFollowChunk("", '{"kind":"loop_item_started"}\n{"kind":"loop_run_', (l) => lines.push(l));
@@ -400,6 +413,14 @@ test("appendFollowChunk: buffers incomplete lines; detects terminal on complete 
   assert.equal(r.sawTerminal, true);
   assert.equal(r.pending, "");
   assert.equal(lines[1], '{"kind":"loop_run_stopped"}\n');
+});
+
+test("appendFollowChunk: a resumed drive supersedes a historical hold completion", () => {
+  const content =
+    `{"kind":"${LOOP_RUN_COMPLETE_KIND}","data":{"outcome":"hold_outstanding"}}\n` +
+    `{"kind":"${LOOP_DRIVE_STARTED_KIND}","data":{"resumed":true}}\n`;
+  const result = appendFollowChunk("", content, () => {});
+  assert.equal(result.sawTerminal, false, "the active resumed drive is not ended by its prior hold completion");
 });
 
 test("loop-logs: default follow exits 0 when loop_run_stopped is delivered (#699)", async () => {
@@ -439,6 +460,23 @@ test("loop-logs: historical loop_run_stopped ends follow without hang (#699)", a
   await runLoopLogs(RUN_A, true, deps, { untilTerminal: true });
   assert.equal(process.exitCode === undefined || process.exitCode === 0, true);
   assert.ok(out.join("").includes("loop_run_stopped"));
+  process.exitCode = 0;
+});
+
+test("loop-logs: historical loop_run_complete ends follow for a clean completion", async () => {
+  const ep = eventsPathFor(RUN_A);
+  const content = `{"kind":"${LOOP_RUN_COMPLETE_KIND}","data":{"outcome":"all_done"}}\n`;
+  const { deps, out } = makeDeps({
+    env: { [PIPELINE_STATE_HOME_ENV]: HOME },
+    files: new Map([[ep, content]]),
+    dirs: new Set([runDirFor(RUN_A)]),
+    followContent: content,
+    followExit: 99,
+  });
+  process.exitCode = undefined;
+  await runLoopLogs(RUN_A, true, deps, { untilTerminal: true });
+  assert.equal(process.exitCode === undefined || process.exitCode === 0, true);
+  assert.ok(out.join("").includes(LOOP_RUN_COMPLETE_KIND));
   process.exitCode = 0;
 });
 

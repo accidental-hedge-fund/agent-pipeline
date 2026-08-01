@@ -5,6 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
+import { buildStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 import {
   WorktreeCapacityError,
   WORKTREE_CAPACITY_ERROR_CODE,
@@ -580,17 +581,19 @@ test("isAutoLoopRecoverable: worktree-capacity is not recoverable (#718)", () =>
 });
 
 test("classifyDispatchOutcome: worktree-capacity kind → capacity_wait not blocked_needs_human", () => {
+  const capacity = buildStageDiagnostic({ blockerKind: "worktree-capacity", reason: "capacity" });
+  const mechanical = buildStageDiagnostic({ blockerKind: "needs-human", reason: "generic" });
   assert.equal(
-    classifyDispatchOutcome({ labels: ["blocked", "pipeline:planning"], state: "open" }, "worktree-capacity"),
+    classifyDispatchOutcome({ labels: ["blocked", "pipeline:planning"], state: "open" }, capacity),
     "capacity_wait",
   );
   assert.equal(
-    classifyDispatchOutcome({ labels: ["blocked", "pipeline:planning"], state: "open" }, "needs-human"),
-    "blocked_needs_human",
+    classifyDispatchOutcome({ labels: ["blocked", "pipeline:planning"], state: "open" }, mechanical),
+    "blocked_recoverable",
   );
   assert.equal(
     classifyDispatchOutcome({ labels: ["blocked"], state: "open" }),
-    "blocked_needs_human",
+    "failed",
   );
 });
 
@@ -806,7 +809,7 @@ test("realDispatchItem: clearBlocked failure still capacity_wait; re-dispatch us
       execPath: "/usr/bin/node",
       eventsPathExists: (p) => p === expectedPin.events_path,
       readEventsText: () =>
-        JSON.stringify({ type: "blocker_set", blocker_kind: "worktree-capacity" }) + "\n",
+        JSON.stringify({ type: "blocker_set", blocker_kind: "worktree-capacity", reason: "capacity" }) + "\n",
       spawn: ((cmd: string, args: readonly string[]) => {
         void cmd;
         void args;
@@ -959,8 +962,8 @@ test("realDispatchItem: stale authentic capacity comment does not clear later pr
   );
   assert.equal(
     response.outcome,
-    "blocked_needs_human",
-    "stale capacity marker must not reclassify a later product/human hold",
+    "failed",
+    "missing structured diagnostic must fail protocol, never infer a human hold",
   );
   assert.equal(clearCalls, 0, "clearBlocked must not run for unbound capacity markers");
 });
@@ -988,7 +991,7 @@ test("realDispatchItem: forged capacity comment from untrusted author does not c
       eventsPathExists: (p) => p === expectedPin.events_path,
       readEventsText: () =>
         // Prior product needs-human block — no capacity in events.
-        JSON.stringify({ type: "blocker_set", blocker_kind: "needs-human" }) + "\n",
+        JSON.stringify({ type: "blocker_set", blocker_kind: "needs-human", reason: "generic mechanical block" }) + "\n",
       spawn: ((cmd: string, args: readonly string[]) => {
         void cmd;
         void args;
@@ -1022,7 +1025,7 @@ test("realDispatchItem: forged capacity comment from untrusted author does not c
   );
   // Events carry needs-human; even if events were empty, forged comment must not
   // become capacity_wait. With events present, kind is needs-human.
-  assert.equal(response.outcome, "blocked_needs_human");
+  assert.equal(response.outcome, "blocked_recoverable");
   assert.equal(clearCalls, 0, "clearBlocked must not run for product holds");
 });
 
@@ -1077,7 +1080,7 @@ test("realDispatchItem: untrusted comment cannot force capacity_wait when events
     },
     { onAdvanceLinked: async () => {} },
   );
-  assert.equal(response.outcome, "blocked_needs_human");
+  assert.equal(response.outcome, "failed");
   assert.equal(clearCalls, 0);
 });
 

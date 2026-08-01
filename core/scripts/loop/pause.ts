@@ -104,6 +104,8 @@ export interface WaitRequestInput {
   prompt: unknown;
   permitted_responses?: unknown;
   source?: "pipeline_blocked_label";
+  authority_evidence_key?: unknown;
+  authority_candidate_head?: unknown;
 }
 
 export interface EnterWaitingInput extends EnterHoldInput {
@@ -147,6 +149,18 @@ function buildHumanInputRequest(
     permitted = req.permitted_responses as string[];
   }
   const kind: LoopHumanInputRequestKind = req.kind;
+  if (
+    (req.authority_evidence_key !== undefined &&
+      (typeof req.authority_evidence_key !== "string" || req.authority_evidence_key.trim() === "")) ||
+    (req.authority_candidate_head !== undefined &&
+      (typeof req.authority_candidate_head !== "string" || req.authority_candidate_head.trim() === "")) ||
+    ((req.authority_evidence_key === undefined) !== (req.authority_candidate_head === undefined))
+  ) {
+    throw new LoopError(
+      "validation",
+      "authority hold evidence requires both a non-empty evidence key and candidate head",
+    );
+  }
   return {
     request_id: `req-${deps.uuid()}`,
     item_id: itemId,
@@ -156,6 +170,12 @@ function buildHumanInputRequest(
     requested_by_engine: engine,
     requested_at: deps.now().toISOString(),
     source: req.source,
+    ...(typeof req.authority_evidence_key === "string"
+      ? { authority_evidence_key: req.authority_evidence_key }
+      : {}),
+    ...(typeof req.authority_candidate_head === "string"
+      ? { authority_candidate_head: req.authority_candidate_head }
+      : {}),
   };
 }
 
