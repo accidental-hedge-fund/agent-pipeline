@@ -1,6 +1,6 @@
 # agent-pipeline
 
-**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 16-stage state machine — backlog → ready → planning → plan-review → implementing → design-gate → review-1 → fix-1 → review-2 → fix-2 → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy, with `needs-human` as the terminal park off-ramp. It does **not** auto-merge; you own the merge button.
+**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to a green, current, mergeable `pipeline:ready-to-deploy` result through a 15-stage state machine — planning → plan-review → implementing → design-gate → review → fix → pre-merge → visual-gate → eval-gate → shipcheck-gate. It is autonomous through ready-to-deploy; it does **not** auto-merge unattended. Merging requires explicit session-bound operator authority (`pipeline merge` per-PR, or `merge-queue --apply` for batch; dry-run is the merge-queue default). Autonomous deployment is out of scope — this is not an end-to-end autonomous SDLC/ADLC.
 
 It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)** from a single shared TypeScript core. **Both harnesses are required for every run**: one implements, and the other cross-reviews. By default, `/pipeline` uses Claude to implement and Codex to review; `$pipeline` inverts this. The pipeline is cross-harness by design — you cannot skip the reviewer install.
 
@@ -8,7 +8,7 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 
 ![agent-pipeline state machine — ready → deploy-ready, no human writes the code](docs/assets/state-machine.png)
 
-`ready` is the queue/opt-in entry point. Once a run starts, long-running work is labelled and recorded under the concrete stages that are doing it: `planning`, `plan-review`, and `implementing`. Recoverable stops keep the active `pipeline:*` stage plus `blocked`; exhausted or ambiguous paths park at `needs-human`. The pipeline never guesses past uncertainty and never presses merge.
+`ready` is the queue/opt-in entry point. Once a run starts, long-running work is labelled and recorded under the concrete stages that are doing it: `planning`, `plan-review`, and `implementing`. Recoverable stops keep the active `pipeline:*` stage plus `blocked`; exhausted or ambiguous paths park at `needs-human`. The pipeline never guesses past uncertainty, and the advance loop never presses merge.
 
 | Band | What happens |
 | --- | --- |
@@ -17,7 +17,7 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 | Bounded convergence | Review/fix rounds are capped by policy and guarded against recurring findings. If the run cannot converge cleanly, it stops with evidence instead of looping indefinitely. |
 | Surgical fixes | `fix-1` and `fix-2` are scoped to reviewer findings. No opportunistic refactors, no scope creep, no destructive cleanup. |
 | Gated stop | `pre-merge` checks CI, conflicts, mergeability, and spec archive. `visual-gate` can run a repo-defined E2E/visual suite (e.g. Playwright) and captures its artifacts as PR-visible evidence. `eval-gate` can run a repo-defined eval/scoring suite. `shipcheck-gate` lets the reviewer apply an acceptance rubric. |
-| Human merge | `ready-to-deploy` is the happy-path terminal for the autonomous loop; `needs-human` is the park terminal when review ceilings or similar paths exhaust. A human owns the merge button. |
+| Operator merge | `ready-to-deploy` is terminal for the autonomous advance loop. Merge requires explicit operator invocation (`pipeline merge` / `merge-queue --apply`); no unattended auto-merge. |
 
 | Naive AI loop | agent-pipeline lifecycle |
 | --- | --- |
@@ -26,11 +26,33 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 
 ## Contents
 
+- [Lifecycle](#lifecycle)
 - [Prerequisites](#prerequisites)
 - [Quickstart](#quickstart)
 - [Install](#install)
-- [Where to go next](#where-to-go-next)
+- [Usage](#usage)
 - [Onboarding a new repo](#onboarding-a-new-repo)
+- [Per-repo config](#per-repo-config-optional)
+- [Test/build gate](#testbuild-gate-optional-default-on)
+- [Troubleshooting](#troubleshooting)
+  - [Evidence bundle](#evidence-bundle)
+  - [External event sink](#external-event-sink-optional)
+  - [Privacy-safe product-fault reporting](#privacy-safe-product-fault-reporting-pipeline-report-optional-off-by-default)
+  - [Machine-readable artifact conventions](#machine-readable-artifact-conventions)
+- [Advanced topics](#advanced-topics)
+  - [Configurable steps](#configurable-steps)
+  - [Human plan feedback](#human-plan-feedback)
+  - [Commit traceability trailers](#commit-traceability-trailers-always-on)
+  - [Visual gate](#visual-gate)
+  - [Eval gate](#eval-gate)
+  - [Shipcheck gate](#shipcheck-gate)
+  - [OpenSpec integration](#openspec-integration)
+  - [last30days context](#last30days-context)
+  - [Conventions & carry-forward lessons](#conventions--carry-forward-lessons)
+- [How the two hosts share one core](#how-the-two-hosts-share-one-core)
+- [Repository layout](#repository-layout)
+- [Editor / Desktop integration](#editor--desktop-integration)
+- [Uninstall](#uninstall)
 - [Development](#development)
 - [License](#license)
 
@@ -42,7 +64,7 @@ The pipeline is **cross-harness** — each run uses one CLI to implement and the
 - **`git`** and **`gh`** on PATH, with `gh auth status` authenticated against the target repo.
 - **Both `claude` and `codex` CLIs** on PATH and **authenticated** — each run uses one to implement and the other to review.
 - **Review runs on the *other* harness, invoked directly** (`reviewMode: prompt-harness`): the reviewer CLI is called with the pipeline's own JSON-returning review prompt. **No review plugin is required** — you just need the other harness's CLI installed and authenticated.
-- **Same-harness fallback (if the reviewer CLI is missing).** Cross-harness review is the design and the recommended setup — keep both CLIs installed. But if the configured reviewer CLI is *not installed / not spawnable* at review time, the pipeline does not stall: the implementing harness reviews its own work instead, and every such review is **prominently labeled as a same-harness self-review**. A self-reviewed item still advances normally (the pipeline never merges — a human owns that). If *neither* harness is spawnable, the item blocks. A reviewer that runs but times out or errors is a genuine failure and still blocks — only a missing CLI triggers the fallback.
+- **Same-harness fallback (if the reviewer CLI is missing).** Cross-harness review is the design and the recommended setup — keep both CLIs installed. But if the configured reviewer CLI is *not installed / not spawnable* at review time, the pipeline does not stall: the implementing harness reviews its own work instead, and every such review (plan-review and both rounds) is **prominently labeled as a same-harness self-review** in the posted comment and the stage transition. A self-review is weaker than an independent one, so the label makes clear it was not cross-harness; a self-reviewed item still advances normally (the advance loop never merges — merge needs explicit operator authority). If *neither* harness is spawnable, the item blocks with a specific reason (there is nothing to review with). A reviewer that runs but times out or errors is a genuine failure and still blocks — only a missing CLI triggers the fallback.
 - `~/.agent-operating-contract.md` and a per-repo conventions file: `CLAUDE.md` (Claude) or `AGENTS.md` (Codex).
 - **Optional:** the [OpenSpec](https://openspec.dev/) CLI (`npm i -g @fission-ai/openspec`) — only needed for repos that opt into the OpenSpec planning flow.
 - No API keys — LLM budget comes from your `claude` / `codex` subscriptions.
@@ -58,10 +80,10 @@ The installer prints a prerequisite checklist during install (warnings do not bl
 npx github:accidental-hedge-fund/agent-pipeline install
 
 # Or pin a released tag for a reproducible install (recommended for prod):
-npx -y github:accidental-hedge-fund/agent-pipeline#v1.29.1 install
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.28.4 install
 ```
 
-This detects which of `~/.claude` and `~/.codex` exist and installs to each. After installing for Codex, **restart Codex** to pick up the skill. Pin to a released tag (see [GitHub Releases](https://github.com/accidental-hedge-fund/agent-pipeline/releases)) for a reproducible install.
+This detects which of `~/.claude` and `~/.codex` exist and installs to each. After installing for Codex, **restart Codex** to pick up the skill. Pin to a released tag (see [GitHub Releases](https://github.com/accidental-hedge-fund/agent-pipeline/releases)) for a reproducible install; the bare form tracks the latest default branch — see [Install a specific version](#install-a-specific-version).
 
 **Step 2 — Label an issue and run**
 
@@ -85,7 +107,7 @@ Or from Codex (after restarting it):
 $pipeline N
 ```
 
-The pipeline advances the issue through planning, implementation, cross-harness review, fix rounds, and pre-merge checks — without further manual input — and stops at `pipeline:ready-to-deploy` for a human merge.
+The pipeline advances the issue up to 12 transitions per invocation — creating a worktree, opening a PR, requesting cross-harness review, fixing review findings, and running pre-merge checks — all without further manual input.
 
 ## Install
 
@@ -102,13 +124,13 @@ npx github:accidental-hedge-fund/agent-pipeline install --host claude
 npx github:accidental-hedge-fund/agent-pipeline install --host codex
 ```
 
-For a reproducible, non-interactive install — pin a released tag and auto-accept optional-dependency prompts with `--yes-deps`:
+For a reproducible, non-interactive install — pin a released tag and auto-accept the optional-dependency prompts with `--yes-deps`:
 
 ```bash
-npx -y github:accidental-hedge-fund/agent-pipeline#v1.29.1 install --host claude --yes-deps
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.28.4 install --host claude --yes-deps
 ```
 
-The bare commands track the **latest** default branch; add `#<tag>` to pin a release. The pipeline is **cross-harness** regardless of which host you install — `--host claude` only controls where the skill lands; the *other* harness's CLI is still required for review.
+The bare commands above always track the **latest** default branch; add `#<tag>` to pin a release (see [Install a specific version](#install-a-specific-version)). The pipeline is **cross-harness** regardless of which host you install — `--host claude` only controls where the skill lands; the *other* harness's CLI (`codex`) is still required for review.
 
 Or clone and run directly:
 
@@ -117,26 +139,101 @@ gh repo clone accidental-hedge-fund/agent-pipeline
 node agent-pipeline/scripts/install.mjs install        # --host claude|codex|grok|all  (default: all)
 ```
 
-The installer copies the shared core and the right host overlay into `~/.claude/skills/pipeline` and/or `~/.codex/skills/pipeline`, writes a launcher shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME` (Claude `/pipeline:*` command files embed the resolved skill path under that config dir). If a **personal** skill already exists at the host's skills path without the installer's managed marker, install offers relocation (or auto-relocates in non-TTY) for **both** Claude and Codex so the personal tree is not silently overwritten. **Restart Codex** after a Codex install; Claude picks the skill up live.
+The installer copies the shared core and the right host overlay into `~/.claude/skills/pipeline` and/or `~/.codex/skills/pipeline`, writes a launcher shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME`. **Restart Codex** after a Codex install; Claude picks the skill up live.
 
-### Optional dependency prompts
+After the core install, the installer detects which optional feature tools (the OpenSpec CLI, the last30days skill) are relevant to your setup and prompts you to install or update each one. Declining any dependency still completes the core install.
 
-After the core install, the installer may prompt for optional tools (OpenSpec CLI, last30days skill). Declining still completes the core install.
+To skip all prompts and auto-accept in non-interactive environments:
 
 ```bash
 npx github:accidental-hedge-fund/agent-pipeline install --yes-deps
 PIPELINE_INSTALL_DEPS=1 npx github:accidental-hedge-fund/agent-pipeline install  # same via env var
 ```
 
-### Grok (optional)
+In non-interactive environments without `--yes-deps`, dependency prompts are skipped automatically and a summary is printed with instructions to re-run with `--yes-deps`.
+
+#### Claude as the primary harness (`/pipeline`)
+
+Claude Code implements, Codex reviews.
 
 ```bash
+npx github:accidental-hedge-fund/agent-pipeline install --host claude
+codex login                                            # the reviewer — review invokes `codex` directly
+```
+
+Review (`reviewMode: prompt-harness`) invokes the `codex` CLI directly with a JSON-returning prompt — **no review plugin needed**, just the authenticated `codex` CLI.
+
+#### Codex as the primary harness (`$pipeline`)
+
+Codex implements, Claude Code reviews.
+
+```bash
+npx github:accidental-hedge-fund/agent-pipeline install --host codex
+claude auth login                                      # the reviewer — review invokes `claude` directly
+```
+
+Review (`reviewMode: prompt-harness`) invokes the `claude` CLI directly with a JSON-returning prompt — **no review plugin needed**, just the authenticated `claude` CLI. Then restart Codex and run `$pipeline N`.
+
+### Claude Code plugin marketplace (versioned, auto-updatable)
+
+```text
+/plugin marketplace add accidental-hedge-fund/agent-pipeline
+/plugin install pipeline@ahf-tools
+```
+
+This installs the same skill as a plugin (`/pipeline`, shown as `pipeline:pipeline`). If you have a personal install at `~/.claude/skills/pipeline`, the installer detects it automatically and offers to relocate it to a timestamped backup — no data is lost. Update later with `/plugin marketplace update ahf-tools`.
+
+### Install a specific version
+
+The bare `npx github:…` commands above install the **latest** code (the default branch). To install a specific released version instead, pin the git ref with `#<tag>` — released versions are tagged `vMAJOR.MINOR.PATCH` (see the [tags](https://github.com/accidental-hedge-fund/agent-pipeline/tags)):
+
+```bash
+# Install exactly v1.28.4 (any host flag works the same way; pick a tag from Releases)
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.28.4 install --host claude
+```
+
+Everything else is identical to the latest-version commands — `#v1.28.4` (or any other released `vMAJOR.MINOR.PATCH` tag) just tells `npx` to fetch that tag rather than the default branch. Or clone and check out the tag directly:
+
+```bash
+gh repo clone accidental-hedge-fund/agent-pipeline
+cd agent-pipeline && git checkout v1.28.4
+node scripts/install.mjs install --host claude
+```
+
+Confirm what's installed at any time with `pipeline --version` (or `/pipeline --version` / `$pipeline --version`).
+
+> The plugin marketplace path above always tracks the **latest** published version and is not a way to pin an older release — use the `#<tag>` form for that.
+
+### Updating an npx/clone install
+
+For the `npx github:…` or clone-and-run install paths (not the plugin marketplace, which updates via `/plugin marketplace update`), refresh an existing install in place with the `update` verb — an idempotent alias for `install` that re-stages and atomically swaps the skill directory:
+
+```bash
+npx github:accidental-hedge-fund/agent-pipeline update            # both hosts
+npx github:accidental-hedge-fund/agent-pipeline update --host claude
+# or from a clone:
+node scripts/install.mjs update --host claude
+```
+
+Running it twice in a row is a net no-op — safe to re-run whenever `pipeline doctor` reports the `install:version-freshness` check is behind the latest release (see [Preflight (doctor)](#preflight-doctor)).
+
+### Grok Build skill path
+
+Grok Build discovers skills under `~/.grok/skills/`. It is **not** a third packaged host overlay (there is no `hosts/grok` SKILL.md fork): Grok reuses the Claude-managed skill content via a path under `~/.grok/skills/pipeline`.
+
+**Preferred:** install Claude first, then materialize a symlink to that install:
+
+```bash
+# 1) Claude-managed skill (default ~/.claude/skills/pipeline, or under CLAUDE_CONFIG_DIR)
+npx github:accidental-hedge-fund/agent-pipeline install --host claude
+
+# 2) Grok path — installer creates/refreshes the symlink
 npx github:accidental-hedge-fund/agent-pipeline install --host grok
 # or from a clone:
 node scripts/install.mjs install --host grok
 ```
 
-### Uninstall
+Equivalent manual layout:
 
 ```bash
 mkdir -p ~/.grok/skills
@@ -201,7 +298,6 @@ pipeline single N                              host-facing controller used by de
 /pipeline:merge <pr>                          human-invoked squash-merge of a ready-to-deploy PR (no advance loop)
 /pipeline:merge-queue --milestone <title>     dry-run ordered R2D merges for a milestone (no merges)
 /pipeline:merge-queue --milestone <title> --apply  sequential merges via the existing merge surface
-/pipeline:merge-queue --milestone <title> --apply --repair  hold conflict/CI items; optional surgical repair then re-gate
 /pipeline:merge-queue --milestone <title> --apply --release-when-complete --release-version minor
                                               after a complete queue, prepare a release PR (never tags/merges/publishes)
 /pipeline:release <version>                   prepare a release PR for the given version
@@ -500,18 +596,15 @@ If any gate fails the command exits non-zero with a clear, actionable message id
 
 ## Merge-queue sub-command
 
-`pipeline merge-queue` is a **human-gated** walker over `pipeline:ready-to-deploy` PRs for a milestone. Default is dry-run (plan only). `--apply` merges candidates one at a time through the existing `pipeline merge` surface. Conflict or red required checks produce a typed hold (`merge-conflict` / `checks-failed`) with remediation text; the drive **never force-merges** and continues remaining candidates by default.
+`pipeline merge-queue` is a **human-gated** walker over `pipeline:ready-to-deploy` PRs for a milestone. Default is dry-run (plan only). `--apply` merges candidates one at a time through the existing `pipeline merge` surface.
 
 ```bash
 pipeline merge-queue --milestone v1.28.0
 pipeline merge-queue --milestone v1.28.0 --apply
-pipeline merge-queue --milestone v1.28.0 --apply --repair
 pipeline merge-queue --milestone v1.28.0 --apply --release-when-complete --release-version minor
 ```
 
-**Surgical repair holds (#675):** opt-in only (CLI `--repair` and/or config `merge_queue.repair: false` default). When enabled during `--apply`, a held item may attempt deterministic remediation first (re-query mergeability/checks), then a bounded mechanical/surgical repair in the managed worktree under surgical-fix discipline. After any candidate-moving repair the queue **re-runs the same eligibility gates** before retrying merge via `mergePr` only. Dry-run never repairs. Repair budget exhaustion leaves a typed manual-repair hold with evidence (not human-authority solely due to exhaustion) and never auto-merges. There is no `auto_merge` config key.
-
-**Release-when-complete (#676):** opt-in only (CLI `--release-when-complete` and/or config `merge_queue.release_when_complete: false` default). When enabled and the queue is **complete** after the drive — no remaining open R2D candidates for the selector and no held items (including typed conflict/checks/repair holds) — the command invokes the shared `pipeline release` prepare path non-interactively (`noEdit`) and opens a release PR for human review. It **never** tags, publishes to npm, or merges the release PR. Open non-R2D issues on the milestone do not block prepare (they are reported as a warning). If prepare fails after successful merges, merges stay done and the command exits non-zero with a clear error. Dry-run with the flag reports would-prepare / would-not + reason against **current** completeness and creates no PR.
+**Release-when-complete (#676):** opt-in only (CLI `--release-when-complete` and/or config `merge_queue.release_when_complete: false` default). When enabled and the queue is **complete** after the drive — no remaining open R2D candidates for the selector and no held items — the command invokes the shared `pipeline release` prepare path non-interactively (`noEdit`) and opens a release PR for human review. It **never** tags, publishes to npm, or merges the release PR. Open non-R2D issues on the milestone do not block prepare (they are reported as a warning). If prepare fails after successful merges, merges stay done and the command exits non-zero with a clear error. Dry-run with the flag reports would-prepare / would-not + reason against **current** completeness and creates no PR.
 
 ## Factory Reliability Gate (release precondition)
 
@@ -804,7 +897,6 @@ Commit `.github/pipeline.yml` to override defaults:
 
 ```yaml
 base_branch: main
-supersede_mode: close              # close (default) or comment-only: dispose other open associated same-base PRs after managed PR create/reuse (#729)
 worktree_root: .worktrees
 review_timeout: 1200
 ci_timeout: 900
@@ -1541,7 +1633,7 @@ Review verdicts are also pinned to the commit they evaluated. Every review comme
 
 ### Human plan feedback
 
-When `plan_review` is on, the pipeline posts the plan as an `## Implementation Plan` issue comment and runs agent plan review via the configured reviewer / secondary harness. When that reviewer is available, this is **independent agent plan review** — the plan-review control when the step is enabled, agent evidence, **not** human approval or human sign-off. If the reviewer CLI is missing or unspawnable, the [same-harness fallback](#prerequisites) applies instead: the implementing harness reviews its own plan, and the posted `## Plan Review` is **prominently labeled as a same-harness self-review**. That degraded path is still plan-review evidence and still advances (the pipeline never merges), but it is **not** independent agent plan review — do not treat a self-review label as cross-harness control.
+When `plan_review` is on, the pipeline posts the plan as an `## Implementation Plan` issue comment and runs agent plan review via the configured reviewer / secondary harness. When that reviewer is available, this is **independent agent plan review** — the plan-review control when the step is enabled, agent evidence, **not** human approval or human sign-off. If the reviewer CLI is missing or unspawnable, the [same-harness fallback](#prerequisites) applies instead: the implementing harness reviews its own plan, and the posted `## Plan Review` is **prominently labeled as a same-harness self-review**. That degraded path is still plan-review evidence and still advances (the advance loop never merges), but it is **not** independent agent plan review — do not treat a self-review label as cross-harness control.
 
 During the **human feedback window** after the plan is posted, comments you leave before the revision step are optional steering: they are folded into the revision alongside the reviewer's feedback. Any comment posted after the plan that doesn't start with a pipeline header (`## Implementation Plan`, `## Plan Review`, `## Pipeline:`, …) is treated as human input; the practical window is the reviewer-harness run (comments that land after the revision starts are picked up on the next trigger).
 
@@ -1988,41 +2080,56 @@ pipeline config repo-map list
 npx github:accidental-hedge-fund/agent-pipeline uninstall --host all   # or claude | codex
 # or from a clone:
 node scripts/install.mjs uninstall --host all
+# plugin install:
+/plugin uninstall pipeline@ahf-tools
 ```
-
-Uninstall removes the host skill tree. For Claude it also removes installer-written `pipeline:*.md` command files under the resolved Claude config `commands/` directory (same base as install / `CLAUDE_CONFIG_DIR`); other command files are left alone.
 
 ## Benchmark & Reliability Suite
 
-| Doc | What it covers |
-| --- | --- |
-| **[docs/cli.md](docs/cli.md)** | Full CLI command reference (generated from the command registry) |
-| **[docs/config.md](docs/config.md)** | `.github/pipeline.yml` config key reference (generated from the Zod schema) |
-| **[docs/concepts.md](docs/concepts.md)** | Advanced/optional topics: gates, OpenSpec, review policy, desktop integration, troubleshooting |
-| **[CHANGELOG.md](CHANGELOG.md)** | Per-version release history (generated from git tags) |
-| **[ROADMAP.md](ROADMAP.md)** | Forward-looking release plan |
+`core/test/benchmark-reliability.test.ts` is a lightweight suite that runs inside the normal `npm test` pass. It covers six hotspot scenarios using injectable fake deps — no real network, git, or subprocess calls — and produces structured timing and call-count output.
 
-**Common commands** (see [docs/cli.md](docs/cli.md) for the full inventory):
-
-```text
-/pipeline N                 # advance issue N (Claude)
-$pipeline N                 # advance issue N (Codex)
-/pipeline:status N          # stage, blocker, PR, last review
-/pipeline:doctor            # deterministic preflight
-/pipeline:init              # labels + .github/pipeline.yml scaffold
-```
-
-## Onboarding a new repo
+### How to run
 
 ```bash
-# From the target repo:
-/pipeline:init              # or: pipeline init
-# Commit .github/pipeline.yml (edit as needed), then:
-gh issue edit N --add-label "pipeline:ready"
-/pipeline N
+cd core && npm test   # includes the benchmark/reliability suite alongside all other tests
 ```
 
-`init` ensures pipeline labels, scaffolds `.github/pipeline.yml`, and gitignores local-only `.agent-pipeline/` paths. For configuration detail, see [docs/config.md](docs/config.md). For optional gates, OpenSpec, and conventions, see [docs/concepts.md](docs/concepts.md).
+### Output
+
+Each benchmark scenario logs a summary line to stdout:
+
+```
+[bench] status-latency-50: p50=0.002ms p95=0.005ms gh_calls=30 total=0.1ms
+[bench] stage-loop-gh-call-count: gh_calls=8 (budget=15) duration=1.6ms
+[bench] pre-merge-polling-call-count: CI polls=4 (K=3) iterations=4 duration=3.0ms
+```
+
+Each reliability scenario logs what it asserted:
+
+```
+[reliability] harness-timeout: outcome={"advanced":false,"status":"blocked",...}
+[reliability] partial-transition-failure: error surfaced="gh label add: label not found"
+[reliability] missing-summary-json: exit code handled, diagnostic emitted
+```
+
+### BenchmarkResult fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `scenario` | string | Identifier for the scenario |
+| `p50_ms` | number ≥ 0 | p50 wall time across samples (milliseconds) |
+| `p95_ms` | number ≥ 0 | p95 wall time across samples (milliseconds) |
+| `gh_call_count` | integer ≥ 0 | Total fake-gh invocations during the scenario |
+| `stage_duration_ms` | number ≥ 0 | Total wall time for the scenario (all samples) |
+
+### Six hotspot scenarios covered
+
+1. **Status latency — 1, 10, 50 worktrees** — measures the worktree scan path (mirrors `getForIssue` / `listActive`) with 30 samples each; asserts `gh_call_count` does not grow super-linearly.
+2. **Stage-loop gh call count** — runs one full `advanceReview` iteration with fake deps; asserts the call count stays within a documented observational budget (currently ~8).
+3. **Pre-merge CI polling** — simulates K=3 pending polls then success; asserts `getPrChecks` is called exactly K+1 times.
+4. **Harness timeout** — injects a `timed_out: true` harness result; asserts the stage transitions to `blocked` and does not advance or throw uncaught.
+5. **Partial transition failure** — injects a `transition` dep that throws on label add; asserts the error surfaces and the stage does not silently advance.
+6. **Artifact corruption** — tests `runSummaryByRunId` with a missing file and a malformed (non-JSON) `summary.json`; asserts `process.exitCode = 1` and a diagnostic message, not an uncaught throw.
 
 ## Development
 
@@ -2031,16 +2138,10 @@ npm run setup-hooks               # one-time per clone: auto-regenerate plugin/ 
 cd core && npm ci && npm test     # node --test
 node scripts/build.mjs            # regenerate plugin/ after editing core or the Claude overlay
 node scripts/build.mjs --check    # CI gate: fail if committed plugin/ is stale
-node scripts/generate-docs.mjs    # regenerate docs/cli.md, docs/config.md, CHANGELOG.md, SKILL tables
-node scripts/generate-docs.mjs --check
-npm run docs:generate             # same as generate-docs write mode
-npm run docs:check                # same as generate-docs --check
-npm run ci                        # full CI gate (tests + mirror + install-smoke + openspec + docs + scripts)
+npm run ci                        # run the full CI command (tests + build check + install smoke)
 ```
 
-After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run `build.mjs` and commit the regenerated `plugin/` (CI enforces this). After changing the command registry, config schema, or docs generator, re-run `generate-docs.mjs` and commit generated docs (CI enforces this via `ci:docs` once the generator is present).
-
-`npm run ci` always includes a **conditional** docs freshness step (`ci:docs`): it is a no-op when the docs generator is absent, and runs check-mode when `scripts/generate-docs.mjs` is present — so a stale generated artifact fails the same local command the pipeline test-gate runs.
+After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run `build.mjs` and commit the regenerated `plugin/` (CI enforces this). Run `npm run setup-hooks` once per clone to install a local pre-commit hook that does this for you: when a commit touches `core/` or `hosts/claude/` it regenerates and stages `plugin/` + `.claude-plugin/marketplace.json` automatically. It's convenience only — `build.mjs --check` in CI stays the authoritative gate, and `git commit --no-verify` bypasses it.
 
 ## License
 

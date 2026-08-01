@@ -741,7 +741,8 @@ for (const flagArgs of ALLOWED_MERGE_FLAGS) {
 //
 // Reads every stage handler file and asserts none of them import from merge.ts.
 // Also reads pipeline.ts and verifies the dispatch() function body does not
-// reference mergePr, preserving the never-auto-merge structural invariant.
+// reference mergePr / merge-queue drive, preserving the never-autonomous-merge
+// structural invariant (#217, #764).
 // ---------------------------------------------------------------------------
 
 test("merge: loop-isolation — no stage handler imports from merge.ts", () => {
@@ -803,5 +804,14 @@ test("merge: loop-isolation — dispatch() in pipeline-run.ts does not call merg
   assert.ok(
     !dispatchBody.includes("mergePr"),
     "dispatch() must not call mergePr — the advance loop must never invoke the merge handler (#217)",
+  );
+  // Operator merge-queue surfaces (plan/drive) are also unreachable from advance (#764).
+  assert.ok(
+    !dispatchBody.includes("merge-queue") &&
+      !dispatchBody.includes("merge_queue") &&
+      !dispatchBody.includes("planMergeQueue") &&
+      !dispatchBody.includes("runMergeQueueDryRun") &&
+      !dispatchBody.includes("runMergeQueue"),
+    "dispatch() must not reference merge-queue plan/drive symbols — never-autonomous-merge (#764)",
   );
 });

@@ -33,12 +33,11 @@ the autonomous `advance` loop or by any stage handler reachable from
 The merge-queue command SHALL default to dry-run mode. In dry-run mode the
 handler SHALL inspect GitHub state and print a plan only. It SHALL NOT invoke
 `gh pr merge`, push, force-push, delete a branch, add/remove labels, close
-issues, create comments, run surgical/mechanical repair side effects, or
-otherwise mutate repository or issue state. An explicit `--dry-run` flag SHALL
-be accepted as affirming the default. Apply/drive mode MAY perform merges only
-when the operator passes an explicit apply/confirm flag; optional repair MAY
-run only when repair is explicitly enabled and the invocation is not dry-run.
-The command SHALL NOT introduce an `auto_merge` config key.
+issues, create comments, or otherwise mutate repository or issue state. An
+explicit `--dry-run` flag SHALL be accepted as affirming the default. Until a
+documented apply/drive mode is implemented (follow-up), any explicit apply/drive
+flag SHALL fail closed with a non-zero exit and an actionable message rather
+than partially mutating.
 
 #### Scenario: Default invocation is dry-run with no merges
 - **WHEN** the user runs `pipeline merge-queue --milestone "v1.28.2"`
@@ -50,10 +49,11 @@ The command SHALL NOT introduce an `auto_merge` config key.
 - **THEN** the handler SHALL produce the same class of plan output as the default
 - **AND** SHALL NOT mutate GitHub state
 
-#### Scenario: Dry-run ignores repair intent for side effects
-- **WHEN** the user runs dry-run with a repair opt-in flag present
-- **THEN** the command SHALL NOT open worktrees for repair, invoke an implementer,
-  push repair commits, or merge any PR
+#### Scenario: Premature apply/drive fails closed
+- **WHEN** the user passes an apply/drive option that requests real merges before
+  that mode is implemented
+- **THEN** the command SHALL exit non-zero explaining that drive is not available
+- **AND** SHALL NOT merge any PR
 
 #### Scenario: Dry-run is idempotent
 - **WHEN** the user runs the same dry-run invocation twice against unchanged
@@ -232,8 +232,10 @@ The merge-queue handler SHALL NOT be called from any stage handler, the advance
 loop, or any path reachable from `pipeline advance`. The pipeline configuration
 schema and documented config keys SHALL NOT introduce an `auto_merge` key that
 enables autonomous merging. Human-owned merge authority remains: only explicit
-operator invocation of `pipeline merge` (and a future human-invoked merge-queue
-drive) may merge.
+operator invocation of `pipeline merge` or of `pipeline merge-queue` with
+`--apply` (dry-run is the default) MAY merge. Merge-queue dry-run planning
+SHALL NOT merge. An unattended or config-driven auto-merge path SHALL NOT be
+added under this capability.
 
 #### Scenario: No stage transition calls merge-queue
 - **WHEN** the advance loop dispatches any stage (planning through deploy-ready)
@@ -250,32 +252,10 @@ drive) may merge.
 - **THEN** they SHALL NOT define an `auto_merge` config key that enables
   autonomous merging of ready-to-deploy PRs
 
-### Requirement: Merge-queue apply mode SHALL surface typed holds and optional repair without auto_merge
-
-When apply/drive is enabled, the merge-queue command SHALL process candidates
-through the existing merge surface and MAY record typed holds
-(`merge-conflict`, `checks-failed`) per `merge-queue-repair-hold`. An optional
-repair opt-in (CLI flag and/or config defaulting to false) SHALL be rejected or
-ignored for side effects unless apply mode is active. The command registry
-allowlist MAY include apply and repair-related flags; unsupported flags still
-fail closed. No `auto_merge` config key SHALL enable drive or repair.
-
-#### Scenario: Apply without repair records holds on conflict
-
-- **WHEN** the operator runs apply/drive without repair enabled and a candidate
-  is conflicting
-- **THEN** the command SHALL record a `merge-conflict` hold with remediation
-- **AND** SHALL NOT force-merge that PR
-
-#### Scenario: Repair flag does not grant auto_merge
-
-- **WHEN** repository configuration and CLI flags for merge-queue are inspected
-- **THEN** no `auto_merge` key SHALL enable autonomous merging
-- **AND** repair opt-in SHALL only authorize surgical/mechanical remediation of
-  held items under the repair-hold capability, not unattended merge of red/dirty PRs
-
-#### Scenario: Advance loop still does not invoke merge-queue
-
-- **WHEN** the advance loop dispatches any stage
-- **THEN** no call to merge-queue plan, drive, hold, or repair handlers occurs
+#### Scenario: Explicit operator --apply is the batch merge authority
+- **WHEN** an operator runs `pipeline merge-queue` with a required selector and without `--apply`
+- **THEN** the command SHALL run in dry-run mode and SHALL NOT merge any PR
+- **WHEN** an operator runs `pipeline merge-queue` with a required selector and with `--apply`
+- **THEN** the command MAY merge eligible candidates through the existing merge surface under operator session authority
+- **AND** that path SHALL still be unreachable from `pipeline advance`
 
