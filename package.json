@@ -34,7 +34,9 @@
     "ci:launcher-smoke": "node scripts/launcher-smoke.mjs",
     "ci:openspec": "node scripts/ci-openspec.mjs",
     "ci:docs": "node scripts/ci-docs.mjs",
-    "ci:scripts": "node scripts/run-scripts-tests.mjs"
+    "ci:scripts": "node scripts/run-scripts-tests.mjs",
+    "docs:generate": "node scripts/generate-docs.mjs",
+    "docs:check": "node scripts/generate-docs.mjs --check"
   },
   "repository": {
     "type": "git",

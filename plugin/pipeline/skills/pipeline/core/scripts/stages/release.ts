@@ -719,7 +719,7 @@ export function patchReleasePlanRow(text: string, ctx: ReleaseContext): string {
   const lastContentIdx = cols.length - 2;
   if (lastContentIdx >= 1) {
     cols[lastContentIdx] =
-      ` Shipped ${date} (tag \`v${version}\`). See **Shipped** above for the per-PR detail. `;
+      ` Shipped ${date} (tag \`v${version}\`). See CHANGELOG.md. `;
   }
   lines[rowIdx] = cols.join("|");
   return lines.join("\n");
@@ -1026,8 +1026,15 @@ export function insertDetailSectionBullet(
 }
 
 /**
- * Ensure a plan row for the version (insert when missing), then apply all four
- * ROADMAP ship mutations atomically in memory.
+ * Ensure a plan row for the version (insert when missing), then apply the
+ * remaining ROADMAP ship mutations that stay forward-looking (#597):
+ * compact release-plan row ✅ shipped + per-issue table stamps.
+ *
+ * Does **not** accrete free-form "## Shipped" prose or intro-chain history —
+ * those surfaces were retired in favor of generated CHANGELOG.md. The pure
+ * helpers `patchIntroLine` / `prependShippedBlock` remain exported for
+ * regression tests and one-off recovery, but are no longer called here.
+ *
  * Throws with a named-anchor error on the first missing site (or plan-row
  * remediation when insert is impossible).
  * The optional `warn` callback is forwarded to stampPerIssueTable for
@@ -1048,9 +1055,9 @@ export function scaffoldRoadmap(
     issues: planIssues,
     why: planRowScaffoldWhy(ctx.version),
   });
-  text = patchIntroLine(text, ctx);
+  // #597: do not call patchIntroLine / prependShippedBlock — CHANGELOG.md is
+  // the history surface; ROADMAP keeps only forward plan + compact ✅ markers.
   text = patchReleasePlanRow(text, ctx);
-  text = prependShippedBlock(text, ctx);
   text = stampPerIssueTable(text, ctx, warn);
   return text;
 }
@@ -1272,15 +1279,16 @@ export async function runRelease(
 
   // --- Live path ---
 
-  // 5. Pre-validate all ROADMAP anchors in memory BEFORE writing any files.
-  //    scaffoldRoadmap throws with a named-anchor error if any of the four sites is missing.
+  // 5. Pre-validate ROADMAP anchors in memory BEFORE writing any files.
+  //    scaffoldRoadmap throws with a named-anchor error if plan-row / per-issue
+  //    sites are missing (#597: intro-chain and ## Shipped are no longer required).
   //    This guarantees a missing anchor aborts cleanly before version files are written.
   d.stdout("[pipeline release] validating ROADMAP.md anchors...");
   const validationCtx: ReleaseContext = {
     version: resolvedVersion, previousVersion, date: today, theme,
     shippedPRs: [], shippedIssueNumbers: [], planIssueNumbers,
   };
-  // Ensure-or-scaffold plan row + other anchors in memory; throws before package writes.
+  // Ensure-or-scaffold plan row + compact ship mutations in memory; throws before package writes.
   scaffoldRoadmap(roadmapText, validationCtx);  // result discarded
 
   // Refuse to start if any release-managed path already has uncommitted changes (tracked

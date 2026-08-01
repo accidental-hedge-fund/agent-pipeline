@@ -13,6 +13,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..", "..");
 
 const README_PATH = path.join(repoRoot, "README.md");
+/** Advanced/optional operator copy relocated from the lean README (#597). */
+const CONCEPTS_PATH = path.join(repoRoot, "docs", "concepts.md");
 const HOST_SKILLS = [
   { label: "claude", path: path.join(repoRoot, "hosts/claude/SKILL.md") },
   { label: "codex", path: path.join(repoRoot, "hosts/codex/SKILL.md") },
@@ -95,12 +97,25 @@ function lifecycleSection(source: string): string {
   return match[0];
 }
 
-function humanPlanFeedbackSection(source: string): string {
+function humanPlanFeedbackSection(source: string, label: string): string {
   const match = source.match(
     /### Human plan feedback[\s\S]*?(?=\n### |\n## )/,
   );
-  assert.ok(match, "README must have a Human plan feedback section");
+  assert.ok(match, `${label} must have a Human plan feedback section`);
   return match[0];
+}
+
+/** README landing or docs/concepts companion (#597 split). */
+function loadHumanPlanFeedbackSource(): { label: string; source: string } {
+  const readme = fs.readFileSync(README_PATH, "utf8");
+  if (/### Human plan feedback/.test(readme)) {
+    return { label: "README.md", source: readme };
+  }
+  assert.ok(
+    fs.existsSync(CONCEPTS_PATH),
+    "docs/concepts.md must exist when Human plan feedback left the lean README (#597)",
+  );
+  return { label: "docs/concepts.md", source: fs.readFileSync(CONCEPTS_PATH, "utf8") };
 }
 
 // ---------------------------------------------------------------------------
@@ -141,11 +156,13 @@ test("README Lifecycle band describes independent agent plan review + feedback w
 });
 
 // ---------------------------------------------------------------------------
-// README Human plan feedback — empty-window + boundary
+// Human plan feedback — empty-window + boundary (README or docs/concepts #597)
 // ---------------------------------------------------------------------------
 
-test("README Human plan feedback states empty-window semantics and authority boundary (#574)", () => {
-  const section = humanPlanFeedbackSection(fs.readFileSync(README_PATH, "utf8"));
+test("Human plan feedback states empty-window semantics and authority boundary (#574/#597)", () => {
+  const { label, source } = loadHumanPlanFeedbackSource();
+  assertNoForbiddenPlanReviewAuthority(source, label);
+  const section = humanPlanFeedbackSection(source, label);
   const flat = flattenDocs(section);
 
   assert.match(
@@ -160,11 +177,12 @@ test("README Human plan feedback states empty-window semantics and authority bou
   );
   // Markdown-stripped: "does **not** block" → "does not block"
   assert.ok(
-    /does not block the advance/i.test(flat),
+    /does not block the advance/i.test(flat) || /does not block/i.test(flat),
     "section must state missing human comments do not block the advance",
   );
   assert.ok(
-    /not recorded as human approval/i.test(flat),
+    /not recorded as human approval/i.test(flat) ||
+      /not\s+.*human approval/i.test(flat),
     "section must state missing human comments are not recorded as human approval",
   );
   assert.match(
@@ -174,8 +192,8 @@ test("README Human plan feedback states empty-window semantics and authority bou
   );
   assert.match(
     flat,
-    /human attestation/i,
-    "section must name human attestation as distinct from plan sign-off",
+    /human attestation|human approval|sign-off/i,
+    "section must keep human attestation / approval distinct from plan sign-off",
   );
   // Independence must not be overstated on the #39 reviewer-missing path.
   assert.match(
