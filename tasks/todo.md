@@ -25,7 +25,7 @@ the seven child failures as acceptance fixtures, not seven independent patches.
 - [x] Route single-issue advancement through the same durable recovery controller as multi-item loops.
 - [x] Document the recovery/authority matrix and update stale manual-unblock guidance.
 - [x] Add regression coverage, regenerate `plugin/`, and run full CI.
-- [ ] Push the PR and verify hosted CI.
+- [x] Push the PR and verify hosted CI.
 
 ## Review
 
@@ -44,6 +44,7 @@ the seven child failures as acceptance fixtures, not seven independent patches.
 - `openspec validate autonomous-recovery-controller --strict`: passed.
 - Focused host/supervisor regression suite: 129 passed, 0 failed.
 - `npm run ci`: passed, including 6,190 core tests and 223 OpenSpec items.
+- PR #787 hosted `ci/test`: passed.
 
 # #771 — pre-merge CI settled failure must not thrash
 
