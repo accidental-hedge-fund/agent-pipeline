@@ -7,6 +7,7 @@ import {
   disposeSupersededIssuePrs,
   electCanonicalManagedIssuePr,
   formatSupersededPrComment,
+  isManagedPrOpenOnHead,
   PIPELINE_SUPERSEDED_MARKER,
   selectSupersededOpenPrs,
   type PrCandidate,
@@ -156,12 +157,25 @@ test("electCanonicalManagedIssuePr: highest pipeline/<N>-* same-base PR wins", (
   assert.equal(winner, 101, "newest managed pipeline PR is canonical");
 });
 
-test("electCanonicalManagedIssuePr: caller's managed PR is a contender when list lags", () => {
+test("electCanonicalManagedIssuePr: authoritative list does not seed absent managed PR", () => {
+  // Production listOpenPrCandidates is complete or throws — never seed a closed PR.
   const winner = electCanonicalManagedIssuePr([], {
     issueNumber: 42,
     managedPrNumber: MANAGED_PR,
     baseBranch: BASE,
     targetRepo: TARGET_REPO,
+    seedCallerIfAbsent: false,
+  });
+  assert.equal(winner, null, "absent managed PR must not win on authoritative list");
+});
+
+test("electCanonicalManagedIssuePr: seedCallerIfAbsent only for explicit partial-list sources", () => {
+  const winner = electCanonicalManagedIssuePr([], {
+    issueNumber: 42,
+    managedPrNumber: MANAGED_PR,
+    baseBranch: BASE,
+    targetRepo: TARGET_REPO,
+    seedCallerIfAbsent: true,
   });
   assert.equal(winner, MANAGED_PR);
 });
@@ -177,6 +191,35 @@ test("electCanonicalManagedIssuePr: closing-ref-only heads are not contenders", 
     },
   );
   assert.equal(winner, MANAGED_PR, "closing-ref-only PR must not win election");
+});
+
+test("isManagedPrOpenOnHead: requires number, same-repo head, and base", () => {
+  assert.equal(
+    isManagedPrOpenOnHead([cand(MANAGED_PR, MANAGED_BRANCH)], {
+      managedPrNumber: MANAGED_PR,
+      managedBranch: MANAGED_BRANCH,
+      baseBranch: BASE,
+    }),
+    true,
+  );
+  assert.equal(
+    isManagedPrOpenOnHead([cand(STALE_PR, "eval/other", { closes: [42] })], {
+      managedPrNumber: MANAGED_PR,
+      managedBranch: MANAGED_BRANCH,
+      baseBranch: BASE,
+    }),
+    false,
+    "sibling open without managed PR is not presence",
+  );
+  assert.equal(
+    isManagedPrOpenOnHead([cand(MANAGED_PR, "pipeline/42-other-slug")], {
+      managedPrNumber: MANAGED_PR,
+      managedBranch: MANAGED_BRANCH,
+      baseBranch: BASE,
+    }),
+    false,
+    "head mismatch is not open on managed head",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -477,6 +520,42 @@ test("disposeSupersededIssuePrs: revalidation list can flip election and cancel 
   assert.deepEqual(closed, [], "must not close after losing revalidation election");
 });
 
+test("disposeSupersededIssuePrs: absent managed PR from authoritative open list closes nothing", async () => {
+  // Human closed the managed PR after create/reuse and before list: both
+  // authoritative open lists omit it. Must NOT seed it as winner and must NOT
+  // dispose the still-open linked sibling (#729 adversarial review).
+  const closed: number[] = [];
+  const commented: number[] = [];
+  const openOnlySibling: PrCandidate[] = [
+    cand(STALE_PR, "eval/expanded-corpus-20260728", { closes: [42] }),
+  ];
+
+  const result = await disposeSupersededIssuePrs(
+    makeCfg(),
+    {
+      issueNumber: 42,
+      managedBranch: MANAGED_BRANCH,
+      managedPrNumber: MANAGED_PR,
+      mode: "close",
+    },
+    {
+      listOpenPrCandidates: async () => openOnlySibling,
+      closePr: async (_cfg, pr) => {
+        closed.push(pr);
+      },
+      postPrComment: async (_cfg, pr) => {
+        commented.push(pr);
+      },
+      log: () => {},
+    },
+  );
+
+  assert.equal(result.isCanonical, false);
+  assert.deepEqual(result.closed, []);
+  assert.deepEqual(closed, [], "must not close live sibling when managed PR is closed/absent");
+  assert.deepEqual(commented, [], "must not supersede-comment when managed PR is absent");
+});
+
 // ---------------------------------------------------------------------------
 // resumeFromImplementing integration (create + reuse)
 // ---------------------------------------------------------------------------
@@ -665,6 +744,62 @@ test("resumeFromImplementing: non-canonical concurrent managed head does not tra
   assert.equal(result.status, "no-op");
   assert.ok(!transitionCalled, "loser must not transition on a PR the winner will close");
   assert.deepEqual(closed, [], "loser must not close the winning managed PR");
+  assert.match(result.reason, /non-canonical|canonical/i);
+});
+
+test("resumeFromImplementing: closed managed PR absent from open lists does not dispose or transition", async () => {
+  // Managed PR was ensure'd (create/reuse returned a number) then closed
+  // externally before the authoritative open list. Linked sibling remains open.
+  // Must not close the sibling and must not stage-transition on the closed PR.
+  let transitionCalled = false;
+  const closed: number[] = [];
+
+  const deps: ResumeFromImplementingDeps = {
+    runTestGate: async () => passedGate(),
+    getPrForBranch: async () => MANAGED_PR,
+    createPr: async () => {
+      assert.fail("must not create when exact-head lookup returns a number");
+      return 0;
+    },
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    setBlocked: async () => {
+      assert.fail("absent managed PR stop must not setBlocked");
+    },
+    transition: async () => {
+      transitionCalled = true;
+    },
+    supersedeDeps: {
+      // Authoritative open list: managed PR gone; sibling still open.
+      listOpenPrCandidates: async () => [
+        cand(STALE_PR, "eval/old-head", { closes: [42] }),
+      ],
+      closePr: async (_cfg, pr) => {
+        closed.push(pr);
+      },
+      postPrComment: async () => {
+        assert.fail("must not comment when managed PR is absent from open list");
+      },
+      log: () => {},
+    },
+  };
+
+  const result = await resumeFromImplementing(
+    makeCfg(),
+    42,
+    { path: "/fake/wt", branch: MANAGED_BRANCH },
+    {
+      prTitle: "t",
+      prBody: "b",
+      transitionMessage: (n) => `PR #${n}`,
+      pipelineRunId: "run-1",
+    },
+    deps,
+  );
+
+  assert.equal(result.advanced, false);
+  assert.equal(result.status, "no-op");
+  assert.ok(!transitionCalled, "must not transition using an already-closed managed PR");
+  assert.deepEqual(closed, [], "must not close the live sibling PR");
   assert.match(result.reason, /non-canonical|canonical/i);
 });
 

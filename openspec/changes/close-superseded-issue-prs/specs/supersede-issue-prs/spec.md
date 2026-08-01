@@ -42,7 +42,7 @@ The engine SHALL, after creating or reusing the open same-repo PR for issue N on
 
 ### Requirement: Canonical managed PR election before supersede dispose
 
-Before closing or supersede-commenting any open associated PR for issue N, the engine SHALL elect a single canonical open managed pipeline PR from GitHub-visible open PR state: contenders SHALL be same-repo open PRs whose head starts with `pipeline/<N>-` and whose base is `cfg.base_branch`, plus the caller's ensured managed PR number (so list lag cannot elect a foreign winner when this run is the only managed head). The elected winner SHALL be the highest PR number among contenders. Closing-ref-only associated heads SHALL NOT be election contenders. The engine SHALL re-list open candidates and re-elect immediately before any close/comment action. Only when the caller's managed PR number equals the elected canonical SHALL the engine dispose other associated same-base PRs. When the caller's managed PR is not canonical, the engine SHALL NOT close or supersede-comment any candidate (including the elected winner) and SHALL report non-canonical status to the caller.
+Before closing or supersede-commenting any open associated PR for issue N, the engine SHALL use a GitHub-authoritative open-PR list (complete open set for the repo, or fail the list call) and SHALL require that the caller's ensured managed PR number **and** managed head branch H both appear as an open same-repo candidate targeting `cfg.base_branch` before any elect or dispose. When that open presence check fails (for example the managed PR was closed externally after ensure), the engine SHALL treat the run as non-canonical, SHALL NOT close or supersede-comment any candidate, and SHALL report non-canonical status to the caller. Contenders for election SHALL be same-repo open PRs whose head starts with `pipeline/<N>-` and whose base is `cfg.base_branch` as present in the open list; the production authoritative list path SHALL NOT seed the caller's managed PR number when it is absent from the open list. Caller seeding of a missing managed PR number is reserved only for an explicitly partial-list source (not the production open-list path). The elected winner SHALL be the highest PR number among contenders. Closing-ref-only associated heads SHALL NOT be election contenders. The engine SHALL re-list open candidates, re-check managed open presence, and re-elect immediately before any close/comment action. Only when the caller's managed PR is still open on H and its number equals the elected canonical SHALL the engine dispose other associated same-base PRs. When the caller's managed PR is not canonical, the engine SHALL NOT close or supersede-comment any candidate (including the elected winner) and SHALL report non-canonical status to the caller.
 
 #### Scenario: Concurrent managed heads — only highest PR disposes
 
@@ -68,6 +68,16 @@ Before closing or supersede-commenting any open associated PR for issue N, the e
   `pipeline/<N>-*` PR W
 - **THEN** the engine SHALL treat the run as non-canonical
 - **AND** SHALL NOT close or supersede-comment any candidate
+
+#### Scenario: Externally closed managed PR does not dispose live siblings
+
+- **WHEN** this run ensured managed PR M for head H
+- **AND** the authoritative open-PR list (initial or revalidation) does not include
+  an open same-repo candidate for M on head H with base `cfg.base_branch`
+- **AND** another open associated PR S for issue N remains on a different head
+- **THEN** supersede disposal SHALL return non-canonical
+- **AND** SHALL NOT close or supersede-comment S
+- **AND** SHALL NOT seed M as the elected winner solely because the caller passed M
 
 ### Requirement: Supersede mode close versus comment-only
 

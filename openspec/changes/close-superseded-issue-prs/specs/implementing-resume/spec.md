@@ -39,3 +39,12 @@ The post-implementation path SHALL, after creating or reusing the PR for issue N
   managed pipeline PR for N (another concurrent `pipeline/<N>-*` head won)
 - **THEN** the path SHALL NOT transition out of `implementing` as advanced
 - **AND** SHALL NOT close the elected winning managed PR
+
+#### Scenario: Externally closed managed PR does not transition or dispose siblings
+
+- **WHEN** the resume/post-implement path ensures PR M for managed head H
+- **AND** the authoritative open-PR list used by supersede disposal omits M on head H
+  (for example a human closed M after ensure)
+- **AND** another open associated PR S for issue N remains on a different head
+- **THEN** the path SHALL NOT transition out of `implementing` as advanced
+- **AND** SHALL NOT close or supersede-comment S

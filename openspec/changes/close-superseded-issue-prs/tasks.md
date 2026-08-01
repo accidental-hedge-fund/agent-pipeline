@@ -43,6 +43,8 @@
 - [x] 3.7 Concurrent managed heads (injected race): two different `pipeline/<N>-*` PRs
       cannot mutually close each other; only the highest-number canonical survives open;
       non-canonical resume does not stage-transition.
+- [x] 3.8 Absent managed PR on authoritative open list (externally closed) while a linked
+      sibling remains open: no close/comment dispose and resume does not stage-transition.
 
 ## 4. Mirror, validate, gate
 
