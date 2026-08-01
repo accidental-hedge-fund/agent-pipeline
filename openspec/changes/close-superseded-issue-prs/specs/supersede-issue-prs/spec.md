@@ -2,11 +2,12 @@
 
 ### Requirement: Supersede open associated PRs after managed PR ensure
 
-The engine SHALL, after creating or reusing the open same-repo PR for issue N on the current managed head branch H, identify every other open PR associated with N under the living dual strategies of `pr-resolution` (same-repo head branch starting with `pipeline/<N>-`, or target-repo `closingIssuesReferences` containing N) whose head branch is not H and whose number is not the managed PR number. For each such PR that targets base `cfg.base_branch`, the engine SHALL dispose it under the active supersede mode. The engine SHALL NOT use title or body text search to associate PRs with N for this path. The engine SHALL NOT dispose the managed PR for H, PRs not associated with N under dual strategies, fork branch-prefix spoofs excluded by `pr-resolution`, or associated open PRs whose base is not `cfg.base_branch`.
+The engine SHALL, after creating or reusing the open same-repo PR for issue N on the current managed head branch H, identify every other open PR associated with N under the living dual strategies of `pr-resolution` (same-repo head branch starting with `pipeline/<N>-`, or target-repo `closingIssuesReferences` containing N) whose head branch is not H and whose number is not the managed PR number. For each such PR that targets base `cfg.base_branch`, the engine SHALL dispose it under the active supersede mode **only when the managed PR for H is the GitHub-elected canonical managed pipeline PR for N** (see Requirement: Canonical managed PR election before supersede dispose). The engine SHALL NOT use title or body text search to associate PRs with N for this path. The engine SHALL NOT dispose the managed PR for H, PRs not associated with N under dual strategies, fork branch-prefix spoofs excluded by `pr-resolution`, or associated open PRs whose base is not `cfg.base_branch`.
 
 #### Scenario: Second open PR on different head is closed by default
 
 - **WHEN** issue N has managed head branch H with open PR M
+- **AND** M is the GitHub-elected canonical open managed pipeline PR for N
 - **AND** another open same-repo PR S is associated with N under dual strategies
 - **AND** S's head is not H and S's base is `cfg.base_branch`
 - **AND** supersede mode is `close` (default)
@@ -38,6 +39,35 @@ The engine SHALL, after creating or reusing the open same-repo PR for issue N on
 - **AND** S's head is not the managed head H
 - **AND** S's base is not `cfg.base_branch`
 - **THEN** the engine SHALL NOT close PR S as superseded
+
+### Requirement: Canonical managed PR election before supersede dispose
+
+Before closing or supersede-commenting any open associated PR for issue N, the engine SHALL elect a single canonical open managed pipeline PR from GitHub-visible open PR state: contenders SHALL be same-repo open PRs whose head starts with `pipeline/<N>-` and whose base is `cfg.base_branch`, plus the caller's ensured managed PR number (so list lag cannot elect a foreign winner when this run is the only managed head). The elected winner SHALL be the highest PR number among contenders. Closing-ref-only associated heads SHALL NOT be election contenders. The engine SHALL re-list open candidates and re-elect immediately before any close/comment action. Only when the caller's managed PR number equals the elected canonical SHALL the engine dispose other associated same-base PRs. When the caller's managed PR is not canonical, the engine SHALL NOT close or supersede-comment any candidate (including the elected winner) and SHALL report non-canonical status to the caller.
+
+#### Scenario: Concurrent managed heads — only highest PR disposes
+
+- **WHEN** two open same-base managed pipeline PRs exist for issue N on different
+  `pipeline/<N>-*` heads with numbers P_low and P_high (P_high > P_low)
+- **AND** host A ensures P_low and host B ensures P_high
+- **AND** both run supersede disposal against a snapshot that includes both
+- **THEN** host A SHALL observe non-canonical status and SHALL NOT close P_high
+- **AND** host B SHALL be canonical and MAY close P_low under supersede rules
+- **AND** the hosts SHALL NOT mutually close each other's managed PRs
+
+#### Scenario: Non-canonical run does not close the winner
+
+- **WHEN** this run's managed PR M is open
+- **AND** another open same-base `pipeline/<N>-*` PR W has a higher number than M
+- **THEN** supersede disposal for M SHALL return non-canonical
+- **AND** SHALL NOT close or supersede-comment W
+
+#### Scenario: Revalidation loses election and cancels dispose
+
+- **WHEN** an initial open-list elects this run's managed PR M as canonical
+- **AND** the immediate revalidation list shows a higher open same-base
+  `pipeline/<N>-*` PR W
+- **THEN** the engine SHALL treat the run as non-canonical
+- **AND** SHALL NOT close or supersede-comment any candidate
 
 ### Requirement: Supersede mode close versus comment-only
 

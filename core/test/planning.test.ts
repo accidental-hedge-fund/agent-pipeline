@@ -630,7 +630,7 @@ function eqBaseDeps() {
     runFormatGate: async () => ({ status: "ok" as const, committed: false }),
     getPrForBranch: async () => null,
     createPr: async () => 99,
-    disposeSupersededIssuePrs: async () => ({ closed: [], commented: [], errors: [] }),
+    disposeSupersededIssuePrs: async () => ({ closed: [], commented: [], errors: [], isCanonical: true }),
   };
 }
 

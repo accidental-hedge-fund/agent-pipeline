@@ -1619,11 +1619,15 @@ export async function resumeFromImplementing(
   // ---- Supersede other open associated PRs for this issue (#729) ----
   // Runs on both create and reuse so a stale associated PR on a different head
   // is not left open solely because the managed branch already had a PR.
-  // Fail-soft inside dispose: never blocks ensure-PR / transition when M is ready.
+  // Cross-host: dispose elects a single GitHub-authoritative canonical managed
+  // PR; only the winner closes others. A non-canonical run must not transition
+  // as if its PR is the live integration head (concurrent hosts would otherwise
+  // mutually close each other then both advance on closed PRs).
+  // Fail-soft inside dispose for list/close I/O when the managed PR is canonical.
   {
     const dispose =
       deps.disposeSupersededIssuePrs ?? disposeSupersededIssuePrs;
-    await dispose(
+    const supersedeResult = await dispose(
       cfg,
       {
         issueNumber,
@@ -1633,6 +1637,15 @@ export async function resumeFromImplementing(
       },
       deps.supersedeDeps ?? {},
     );
+    if (supersedeResult.isCanonical === false) {
+      const winner = supersedeResult.canonicalPrNumber;
+      const reason =
+        `Non-canonical managed PR #${prNumber} for issue #${issueNumber}` +
+        (winner !== undefined ? ` (GitHub-elected canonical is PR #${winner})` : "") +
+        `; stopping without stage transition so concurrent advances cannot mutually close managed heads.`;
+      console.log(`[pipeline] #${issueNumber}: ${reason}`);
+      return { advanced: false, status: "no-op", reason };
+    }
   }
 
   // ---- implementing → design-gate ----

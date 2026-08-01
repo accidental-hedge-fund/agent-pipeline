@@ -40,6 +40,9 @@
 - [x] 3.5 Reuse path (existing managed PR on H) still disposes other-head associated PRs.
 - [x] 3.6 Fail-soft: close failure on one candidate does not fail the ensure-PR outcome;
       other candidates still attempted.
+- [x] 3.7 Concurrent managed heads (injected race): two different `pipeline/<N>-*` PRs
+      cannot mutually close each other; only the highest-number canonical survives open;
+      non-canonical resume does not stage-transition.
 
 ## 4. Mirror, validate, gate
 

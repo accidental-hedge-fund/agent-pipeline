@@ -55,6 +55,7 @@ const noopDispose: NonNullable<ResumeFromImplementingDeps["disposeSupersededIssu
   closed: [],
   commented: [],
   errors: [],
+  isCanonical: true,
 });
 
 

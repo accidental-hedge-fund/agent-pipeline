@@ -1824,6 +1824,10 @@ export interface SelectSupersededOpenPrsArgs {
  * {@link resolveOpenPrsForIssue} (no title/body search). Excludes: the managed
  * PR M, any PR whose head is the managed branch H, dual-strategy non-matches,
  * and PRs whose base is not `baseBranch` (missing base never matches).
+ *
+ * Callers that perform destructive close MUST first confirm the caller's managed
+ * PR is the GitHub-elected canonical via {@link electCanonicalManagedIssuePr};
+ * this pure selector does not itself gate on election.
  */
 export function selectSupersededOpenPrs(
   candidates: PrCandidate[],
@@ -1845,6 +1849,47 @@ export function selectSupersededOpenPrs(
     out.push(n);
   }
   return out;
+}
+
+export interface ElectCanonicalManagedIssuePrArgs {
+  issueNumber: number;
+  /** Caller's ensured managed PR — always a contender even if list lag omits it. */
+  managedPrNumber: number;
+  baseBranch: string;
+  targetRepo: string;
+}
+
+/**
+ * GitHub-authoritative election of the single canonical open managed pipeline PR
+ * for issue N (#729 concurrency).
+ *
+ * Contenders are open same-repo PRs whose head starts with `pipeline/<N>-` and
+ * whose base is `baseBranch`, plus the caller's `managedPrNumber` (so a lagging
+ * open-list cannot elect a foreign PR when this run is the only managed head).
+ * The winner is the **highest PR number** (newest GitHub object wins), so two
+ * hosts reconciling independently converge on the same survivor without a
+ * host-local lock. Non-pipeline associated heads (closing-ref only) are never
+ * contenders — they are dispose targets for the winner only.
+ *
+ * Pure / synchronous; unit-testable without network.
+ */
+export function electCanonicalManagedIssuePr(
+  candidates: PrCandidate[],
+  args: ElectCanonicalManagedIssuePrArgs,
+): number {
+  const branchPrefix = `pipeline/${args.issueNumber}-`;
+  const contenders = new Set<number>([args.managedPrNumber]);
+  for (const c of candidates) {
+    if (c.isCrossRepository) continue;
+    if (c.baseRefName !== args.baseBranch) continue;
+    if (!c.headRefName.startsWith(branchPrefix)) continue;
+    contenders.add(c.number);
+  }
+  let winner = args.managedPrNumber;
+  for (const n of contenders) {
+    if (n > winner) winner = n;
+  }
+  return winner;
 }
 
 /** Stable marker in supersession comments (auditable / greppable). */
@@ -1895,11 +1940,27 @@ export interface DisposeSupersededIssuePrsResult {
   commented: number[];
   /** Non-fatal diagnostics (list failure or per-PR close/comment failure). */
   errors: string[];
+  /**
+   * Whether this run's managed PR is the GitHub-elected canonical open managed
+   * pipeline PR for the issue. `true` when list fails (fail-soft: do not strand
+   * advance on list outage). `false` when another concurrent managed head wins
+   * the election — caller must not transition as if this PR is the live head.
+   */
+  isCanonical: boolean;
+  /** Elected canonical PR number when known (omitted on list failure). */
+  canonicalPrNumber?: number;
 }
 
 /**
  * After managed PR create/reuse for issue N on head H, dispose other open
  * associated same-base PRs under the active supersede mode (#729).
+ *
+ * Cross-host safety: elects a single canonical open managed pipeline PR via
+ * {@link electCanonicalManagedIssuePr} (highest PR number among same-base
+ * `pipeline/<N>-*` heads), re-lists and re-elects immediately before any
+ * close/comment, and only the winner disposes. A non-canonical run closes
+ * nothing (including not closing the winner) and returns `isCanonical: false`
+ * so the resume path can stop without advancing on a PR that will be closed.
  *
  * Fail-soft: list failure or per-PR close/comment failure is logged and does
  * not throw. Never merges, force-pushes, or deletes branches.
@@ -1927,6 +1988,15 @@ export async function disposeSupersededIssuePrs(
     closed: [],
     commented: [],
     errors: [],
+    // List outage: fail-soft and allow advance (no election evidence to deny it).
+    isCanonical: true,
+  };
+
+  const electArgs: ElectCanonicalManagedIssuePrArgs = {
+    issueNumber: opts.issueNumber,
+    managedPrNumber: opts.managedPrNumber,
+    baseBranch: cfg.base_branch,
+    targetRepo: cfg.repo,
   };
 
   let candidates: PrCandidate[];
@@ -1938,6 +2008,42 @@ export async function disposeSupersededIssuePrs(
       `${(err as Error).message}`;
     result.errors.push(msg);
     log(`[pipeline] #${opts.issueNumber}: ${msg}`);
+    return result;
+  }
+
+  // First election against the open snapshot.
+  let canonical = electCanonicalManagedIssuePr(candidates, electArgs);
+  result.canonicalPrNumber = canonical;
+  if (canonical !== opts.managedPrNumber) {
+    result.isCanonical = false;
+    log(
+      `[pipeline] #${opts.issueNumber}: non-canonical managed PR #${opts.managedPrNumber} ` +
+        `(GitHub-elected canonical is PR #${canonical}); skipping supersede dispose`,
+    );
+    return result;
+  }
+
+  // Re-list + re-elect immediately before destructive dispose (TOCTOU / cross-host).
+  try {
+    candidates = await list(cfg);
+  } catch (err) {
+    const msg =
+      `supersede revalidation list failed for issue #${opts.issueNumber}: ` +
+      `${(err as Error).message}`;
+    result.errors.push(msg);
+    log(`[pipeline] #${opts.issueNumber}: ${msg}`);
+    // Fail-soft: first election said we won; list flap must not block advance.
+    return result;
+  }
+  canonical = electCanonicalManagedIssuePr(candidates, electArgs);
+  result.canonicalPrNumber = canonical;
+  if (canonical !== opts.managedPrNumber) {
+    result.isCanonical = false;
+    log(
+      `[pipeline] #${opts.issueNumber}: lost canonical election on revalidation ` +
+        `(managed PR #${opts.managedPrNumber}, canonical PR #${canonical}); ` +
+        `skipping supersede dispose`,
+    );
     return result;
   }
 
@@ -1954,6 +2060,8 @@ export async function disposeSupersededIssuePrs(
   }
 
   for (const prNumber of targets) {
+    // Never dispose the elected canonical (defensive — selection already excludes M).
+    if (prNumber === canonical) continue;
     const body = formatSupersededPrComment({
       managedPrNumber: opts.managedPrNumber,
       issueNumber: opts.issueNumber,

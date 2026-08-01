@@ -562,6 +562,7 @@ const noopDispose: NonNullable<ResumeFromImplementingDeps["disposeSupersededIssu
   closed: [],
   commented: [],
   errors: [],
+  isCanonical: true,
 });
 
 // resumeFromImplementing wiring — ordering, both PR surfaces, bite
