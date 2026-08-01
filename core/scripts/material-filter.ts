@@ -47,6 +47,7 @@ export const LOOP_MATERIAL_KINDS = [
   "loop_item_stage_progress",
   "loop_item_progress",
   "loop_run_stopped",
+  "loop_run_complete",
 ] as const;
 
 export type LoopMaterialKind = (typeof LOOP_MATERIAL_KINDS)[number];
@@ -242,11 +243,12 @@ function filterLoopMust(
     kind === "loop_item_advance_finished" ||
     kind === "loop_item_stage_progress" ||
     kind === "loop_run_stopped" ||
+    kind === "loop_run_complete" ||
     kind === "loop_item_started" ||
     kind === "loop_item_transitioned" ||
     kind === "loop_item_blocked"
   ) {
-    if (kind === "loop_item_advance_finished" || kind === "loop_run_stopped") {
+    if (kind === "loop_item_advance_finished" || kind === "loop_run_stopped" || kind === "loop_run_complete") {
       state.ciWaitingOpen = false;
       state.lastBurstFp = null;
     }

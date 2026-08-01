@@ -1136,7 +1136,7 @@ function markerFallbackRequest(runId: string) {
   };
 }
 
-test("regression (#787 review): trusted human-decision-required marker on an early-blocked re-dispatch is a human hold, never failed/engine-defect", async () => {
+test("trusted human-decision-required marker without authority evidence remains a protocol defect", async () => {
   const fixedNow = new Date("2026-07-30T22:09:03.000Z");
   const humanComment = buildAttestedBlockedComment({
     issueNumber: 718,
@@ -1156,13 +1156,13 @@ test("regression (#787 review): trusted human-decision-required marker on an ear
   const response = await dispatch(markerFallbackRequest("loop-run-human"), { onAdvanceLinked: async () => {} });
   assert.equal(
     response.outcome,
-    "blocked_needs_human",
-    "an already-blocked human-decision item must stay a human hold, not become failed → workflow-engine-defect recovery",
+    "failed",
+    "a comment marker cannot manufacture the current authority proof required for a human hold",
   );
   // Authority boundary: the marker restores only the hold's KIND — no
   // attested authority diagnostic may be fabricated from it.
   assert.equal(response.diagnostic, undefined, "no synthesized authority_evidence diagnostic from a comment marker");
-  assert.equal(clearCalls, 0, "the human's blocked label must never be cleared");
+  assert.equal(clearCalls, 0, "classification alone does not mutate the blocked label");
 });
 
 test("#787 review: trusted mechanical marker (merge-conflict) classifies blocked_recoverable with the true blocker class", async () => {

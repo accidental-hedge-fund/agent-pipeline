@@ -55,7 +55,13 @@ reconciles a `started` claim against live truth before replay.
 Alternative rejected: worktree marker files and completion-only charging. Both permit either
 permanent suppression or unbounded crash replay.
 
-### 4. Whole-item repair execution
+### 4. Deterministic recovery before whole-item repair
+
+Each mechanical class starts with its narrow deterministic action: workflow-state resync and
+redispatch, CI/OpenSpec gate re-entry, or workflow-engine restart and redispatch. Only repeated
+current evidence advances to `repair_pipeline_item`. This avoids spending an implementer call on a
+state transition the engine can perform directly while preserving model repair as the bounded
+backstop.
 
 `repair_pipeline_item` is a provider-neutral supervisor recovery action. Its registered executor
 resolves the normal configured implementer/model/effort, rematerializes/synchronizes the worktree,
@@ -64,7 +70,17 @@ validates/commits/pushes, and returns. The supervisor then redispatches the same
 existing whole-item facade, which re-runs all review and gate logic. The supervisor never branches
 on OpenSpec, merge conflict, review round, or harness name.
 
-### 5. Reconcile at every authority boundary
+Authentication is separate: `verify_authentication` proves a live non-empty GitHub actor before
+redispatch. It never enters credentials or claims success for a no-op.
+
+### 5. One controller for one or many items
+
+The host-facing single-issue command compiles a one-item work-list and invokes the same durable
+supervisor used by `pipeline:loop`. It resumes an active canonical run and supersedes only a
+terminally stopped chain head. Host skills monitor the loop event stream through the early handoff;
+they do not launch the legacy detached raw advance for their default command.
+
+### 6. Reconcile at every authority boundary
 
 The supervisor reconciles immediately before a recovery side effect and again before persisting its
 result or a hold/stop. Its idempotent repair executor may reconcile the exact marked commit produced
@@ -73,7 +89,7 @@ supersedes stale recovery, and candidate movement invalidates human authority re
 SHA. Driver exit writes a terminal/completion event only for a genuinely terminal result. A claimed
 recovery remains durable and resumable across process failure.
 
-### 6. OpenSpec failures are structured fixtures, not special policy
+### 7. OpenSpec failures are structured fixtures, not special policy
 
 OpenSpec archive uses JSON mode and verifies both the explicit archive result and active-directory
 removal. Archive apply conflicts emit the exact `openspec-archive-apply-conflict` reason code;
@@ -85,7 +101,8 @@ per keyed budget; OpenSpec does not decide whether the failure is human-owned.
 
 ## Risks / Trade-offs
 
-- **A generic repair prompt could make an unsafe broad change** -> constrain paths/authority,
+- **A generic repair prompt could make an unsafe broad change** -> run deterministic recovery
+  first, constrain paths/authority,
   require normal commit/test/review gates, and make the implementer emit a no-action result when the
   diagnostic cannot be repaired safely.
 - **Crash replay could duplicate external effects** -> claim before action and reconcile the

@@ -327,27 +327,40 @@ export async function emitBlockedOutcomeEvents(
   const doEmitHumanIntervention = deps.emitHumanIntervention ?? emitHumanIntervention;
   const blockerKind = out.blockerKind ?? "needs-human";
   const pathTag = "offrampPathTag" in out ? out.offrampPathTag : undefined;
+  const offrampClass = stage === "pre-merge"
+    ? toPreMergeOfframpClass({ blockerKind, pathTag: pathTag ?? null })
+    : undefined;
+  // Every valid mechanical producer emits the canonical diagnostic inline.
+  // Human authority is the one intentional exception: it cannot be
+  // synthesized without current finding/candidate attestation.
+  const diagnostic = out.diagnostic ?? (
+    blockerKind === "human-decision-required"
+      ? undefined
+      : buildStageDiagnostic({
+          blockerKind,
+          reason: out.reason,
+          stage,
+          ...(offrampClass !== undefined ? { offrampClass } : {}),
+        })
+  );
   const offrampId = (deps.randomUUID ?? randomUUID)();
   const blockerEvent: BlockerSetEvent = {
     schema_version: RUN_SCHEMA_VERSION,
     type: "blocker_set",
     at: evidenceTimestamp(),
     reason: out.reason,
-    ...(out.diagnostic ? { diagnostic: out.diagnostic } : {}),
+    ...(diagnostic ? { diagnostic } : {}),
     stage,
     blocker_kind: blockerKind,
     offramp_id: offrampId,
     ...(stage === "pre-merge"
       ? {
-          offramp_class: toPreMergeOfframpClass({
-            blockerKind,
-            pathTag: pathTag ?? null,
-          }),
+          offramp_class: offrampClass!,
         }
       : {}),
   };
   await doAppendEvent(runDir, blockerEvent, runStoreDeps).catch(() => {});
-  if (isHumanAuthorityBlocker(blockerKind, out.diagnostic)) {
+  if (isHumanAuthorityBlocker(blockerKind, diagnostic)) {
     await doEmitHumanIntervention(runDir, {
       kind: blockerKindToInterventionKind(blockerKind),
       stage,

@@ -83,6 +83,18 @@ test("diagnostic policy is adapter-neutral by construction", () => {
   }
 });
 
+test("environment authentication is a typed recoverable class, not a human-authority inference", () => {
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "environment-auth",
+    blockerKind: "harness-failure",
+    reason: "configured forge credentials are unavailable",
+  });
+  assert.deepEqual(projectStageDiagnostic(diagnostic), {
+    blockerClass: "environment-auth",
+    disposition: "recover",
+  });
+});
+
 test("producer evidence key is preserved and fallback evidence ignores free-form prose", () => {
   const supplied = buildStageDiagnostic({
     reasonCode: "openspec-archive-apply-conflict",

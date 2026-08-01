@@ -168,10 +168,11 @@ test("compileRecoveryPolicy: the default policy covers every DurableBlockerClass
   assert.equal(Object.keys(DEFAULT_RECOVERY_POLICY).length, DURABLE_BLOCKER_CLASSES.length);
 });
 
-test("the provider-neutral repair recipe is the primary mechanical recovery for pipeline state, CI, and engine defects", () => {
-  assert.equal(DEFAULT_RECOVERY_POLICY["workflow-state"].recipes[0], "repair_pipeline_item");
-  assert.equal(DEFAULT_RECOVERY_POLICY["implementation-ci"].recipes[0], "repair_pipeline_item");
-  assert.equal(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes[0], "repair_pipeline_item");
+test("deterministic redispatch precedes provider-neutral model repair for mechanical blockers", () => {
+  assert.deepEqual(DEFAULT_RECOVERY_POLICY["workflow-state"].recipes, ["resync_workflow_state", "repair_pipeline_item"]);
+  assert.deepEqual(DEFAULT_RECOVERY_POLICY["implementation-ci"].recipes, ["rerun_ci", "repair_pipeline_item"]);
+  assert.deepEqual(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes, ["restart_workflow_engine", "repair_pipeline_item"]);
+  assert.deepEqual(DEFAULT_RECOVERY_POLICY["environment-auth"].recipes, ["verify_authentication"]);
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["missing-authority"].recipes, []);
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["specification-decision"].recipes, []);
 });
@@ -448,10 +449,10 @@ test("blockItem: a stopped run refuses every further transition", async () => {
 test("blockItem: a run-fatal, retry-capable class remains item-local after mechanical recovery is exhausted", async () => {
   const { deps, contract, token } = await setup();
   let ledger = await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "environment-auth", evidence: "token expired" });
-  assert.equal(ledger.stop, null, "the configured reauthenticate recipe remains reachable");
+  assert.equal(ledger.stop, null, "the configured authentication verification remains reachable");
 
   const first = await recoverItem(deps, contract, {
-    runId: "run-1", token, itemId: "100", engine: "claude", actions: ["reauthenticate"],
+    runId: "run-1", token, itemId: "100", engine: "claude", actions: ["verify_authentication"],
     candidateIdentity: "credential-candidate-1", succeeded: false, error: "token refresh rejected",
   });
   assert.equal(first.attempt.outcome, "failed");
@@ -459,7 +460,7 @@ test("blockItem: a run-fatal, retry-capable class remains item-local after mecha
   assert.equal(first.ledger.stop, null, "one mechanical attempt remains");
 
   const second = await recoverItem(deps, contract, {
-    runId: "run-1", token, itemId: "100", engine: "claude", actions: ["reauthenticate"],
+    runId: "run-1", token, itemId: "100", engine: "claude", actions: ["verify_authentication"],
     candidateIdentity: "credential-candidate-2", succeeded: false, error: "token refresh rejected again",
   });
   ledger = second.ledger;
@@ -703,7 +704,7 @@ test("recoverItem: a recipe not permitted for the class is refused", async () =>
   const { deps, contract, token } = await setup();
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed" });
   await assert.rejects(
-    () => recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["reauthenticate"] , succeeded: true }),
+    () => recoverItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", actions: ["verify_authentication"] , succeeded: true }),
     (err: unknown) => {
       assert.ok(err instanceof LoopError);
       assert.equal(err.loopFailureClass, "validation");

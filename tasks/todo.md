@@ -1,8 +1,8 @@
 # v1.29.2 autonomous recovery regression
 
 ## Status
-Incident reconstructed. Implementing a provider-neutral recovery controller; the seven child
-failures are acceptance fixtures, not seven independent patches.
+Implementation and local verification complete. The provider-neutral recovery controller treats
+the seven child failures as acceptance fixtures, not seven independent patches.
 
 ## Plan
 - [x] Reconstruct all seven terminal outcomes from run, loop, GitHub, and engine-identity evidence.
@@ -20,6 +20,12 @@ failures are acceptance fixtures, not seven independent patches.
 - [x] Invalidate candidate-bound human holds when the reviewed HEAD changes, even if `pipeline:blocked` remains.
 - [x] Let freshly observed ready, merged, or closed state supersede a stale recovery claim before mutation.
 - [x] Rerun focused regressions, regenerate `plugin/`, validate OpenSpec, and rerun `npm run ci`.
+- [x] Run deterministic redispatch before model repair for mechanical recovery classes.
+- [x] Replace the non-executable authentication recipe with a real credential verification action.
+- [x] Route single-issue advancement through the same durable recovery controller as multi-item loops.
+- [x] Document the recovery/authority matrix and update stale manual-unblock guidance.
+- [x] Add regression coverage, regenerate `plugin/`, and run full CI.
+- [ ] Push the PR and verify hosted CI.
 
 ## Review
 
@@ -31,9 +37,13 @@ failures are acceptance fixtures, not seven independent patches.
 - Fresh ready/merged/closed truth supersedes stale recovery; human authority expires when the
   reviewed candidate HEAD changes even if the blocked label remains.
 - OpenSpec archive success now requires machine-readable success and removal of the active change.
+- Deterministic recovery runs before model repair; authentication recovery performs a live
+  credential check instead of claiming a no-op recipe succeeded.
+- Single-issue host invocations now enter the same durable recovery controller as milestone loops,
+  and unattested `needs-human` outcomes remain engine-owned regardless of labels or stale comments.
 - `openspec validate autonomous-recovery-controller --strict`: passed.
-- Focused recovery supervisor/primitive/executor suite: 147 passed, 0 failed.
-- `npm run ci`: passed, including 6,136 core tests and 223 OpenSpec items.
+- Focused host/supervisor regression suite: 129 passed, 0 failed.
+- `npm run ci`: passed, including 6,190 core tests and 223 OpenSpec items.
 
 # #771 — pre-merge CI settled failure must not thrash
 

@@ -143,7 +143,7 @@ export function isDurableBlockerClass(value: unknown): value is DurableBlockerCl
  *  policy entry's `recipes` must draw from. */
 export const RECOVERY_RECIPES = [
   "wait_and_retry",
-  "reauthenticate",
+  "verify_authentication",
   "repair_pipeline_item",
   "rerun_ci",
   "resync_workflow_state",

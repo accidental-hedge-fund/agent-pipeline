@@ -134,7 +134,7 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy({
     repeated_evidence_limit: 3,
   },
   "workflow-state": {
-    recipes: ["repair_pipeline_item", "resync_workflow_state"],
+    recipes: ["resync_workflow_state", "repair_pipeline_item"],
     retry_budget: 3,
     backoff: { initial_seconds: 15, multiplier: 2, max_seconds: 300 },
     terminal_outcome: "retry",
@@ -142,7 +142,7 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy({
     repeated_evidence_limit: 2,
   },
   "implementation-ci": {
-    recipes: ["repair_pipeline_item", "rerun_ci"],
+    recipes: ["rerun_ci", "repair_pipeline_item"],
     retry_budget: 3,
     backoff: { initial_seconds: 30, multiplier: 2, max_seconds: 600 },
     terminal_outcome: "retry",
@@ -150,7 +150,7 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy({
     repeated_evidence_limit: 2,
   },
   "environment-auth": {
-    recipes: ["reauthenticate"],
+    recipes: ["verify_authentication"],
     retry_budget: 2,
     backoff: { initial_seconds: 10, multiplier: 2, max_seconds: 120 },
     terminal_outcome: "retry",
@@ -182,7 +182,7 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy({
     repeated_evidence_limit: 3,
   },
   "workflow-engine-defect": {
-    recipes: ["repair_pipeline_item", "restart_workflow_engine"],
+    recipes: ["restart_workflow_engine", "repair_pipeline_item"],
     retry_budget: 1,
     backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
     terminal_outcome: "retry",

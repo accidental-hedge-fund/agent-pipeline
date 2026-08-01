@@ -5,7 +5,7 @@
 Every blocked model-executed stage SHALL emit a `pipeline/stage-diagnostic@1` record with a closed
 `reason_code`, stable `evidence_key`, and bounded structured detail containing a recognized
 `blocker_kind`, reason, and optional stage/pre-merge class. The closed reason-code set SHALL be
-exactly `workflow-state`, `implementation-ci`, `workflow-engine-defect`, `worktree-capacity`,
+exactly `workflow-state`, `implementation-ci`, `workflow-engine-defect`, `environment-auth`, `worktree-capacity`,
 `human-decision-required`, `openspec-archive-apply-conflict`, and
 `openspec-generated-delta-invalid`. One exhaustive projection SHALL derive the durable blocker
 class and recovery disposition from that record. The projection SHALL NOT inspect a
@@ -101,6 +101,10 @@ then decide whether to resume, retry, or terminate. A run-fatal or terminal engi
 SHALL NOT be persisted while a safe permitted recipe has unconsumed budget. A genuine current human
 authority decision MAY bypass automated recovery and enter a hold immediately. A blocked item SHALL
 NOT prevent dependency-independent siblings from continuing when the run contract permits them.
+For workflow-state, implementation-CI, and workflow-engine failures, policy SHALL attempt the
+corresponding deterministic redispatch/re-entry recipe before `repair_pipeline_item`. Repeated
+current evidence SHALL advance to the next configured recipe without repeating the exhausted
+deterministic action indefinitely.
 
 #### Scenario: Recoverable dispatch failure is handled before stop
 
@@ -123,6 +127,26 @@ NOT prevent dependency-independent siblings from continuing when the run contrac
   closed before a claimed side effect executes
 - **THEN** the controller SHALL forward-repair or abandon the item without running the recovery
 - **AND** any interrupted started attempt SHALL be completed as `superseded`
+
+#### Scenario: Deterministic recovery precedes model repair
+
+- **WHEN** a workflow-state, implementation-CI, or workflow-engine diagnostic first blocks an item
+- **THEN** the controller SHALL claim the class's deterministic redispatch/re-entry recipe first
+- **AND** it SHALL invoke `repair_pipeline_item` only when the same current evidence returns and a
+  later configured recipe retains budget
+
+### Requirement: Authentication recovery SHALL verify rather than impersonate
+
+The `environment-auth` recovery recipe SHALL perform a live non-interactive authentication probe
+and SHALL report success only when it observes a non-empty authenticated GitHub actor. It MAY then
+redispatch normal workflow state. It SHALL NOT log in, enter credentials, manufacture an identity,
+clear a blocker after a failed probe, or describe an unverified no-op as reauthentication.
+
+#### Scenario: Missing credentials remain an external operator action
+
+- **WHEN** the live authentication probe fails or returns no actor
+- **THEN** the recovery attempt SHALL fail with exact evidence and preserve the blocked state
+- **AND** the outcome SHALL remain an environment/system failure rather than product authority
 
 ### Requirement: Mechanical remediation SHALL re-enter the normal whole-item pipeline
 

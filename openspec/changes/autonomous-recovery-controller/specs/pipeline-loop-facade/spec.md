@@ -79,3 +79,9 @@ canonical `human-decision-required` diagnostic SHALL route it to a human hold.
 - **WHEN** a recovery action creates a candidate-changing commit and the same item is redispatched
 - **THEN** the next normal dispatch SHALL re-run the applicable review and deterministic gates
 - **AND** prior evidence SHALL NOT be reused as approval for the changed candidate
+
+#### Scenario: Single-issue and multi-item facades are behaviorally identical
+
+- **WHEN** the same issue and diagnostic are dispatched through a one-item drive and a multi-item drive
+- **THEN** both SHALL use the same `pipeline/loop-execution@1` whole-item request and response contract
+- **AND** neither host facade SHALL add provider-specific recovery or human-authority policy

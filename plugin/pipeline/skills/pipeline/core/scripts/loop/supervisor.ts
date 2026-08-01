@@ -2151,64 +2151,25 @@ export async function runSupervisorCycle(
           });
         }
       } else {
-        // No current attested authority. Before treating the transport as a
-        // protocol failure, re-read live labels: a blocked_needs_human item
-        // whose live issue still carries the product `blocked` label (e.g. the
-        // #718 early-blocked re-dispatch whose fresh events carry no
-        // blocker_set but whose durable attested marker kind is
-        // human-decision-required) parks as the conservative human-resume-only
-        // hold — no authority_evidence, no candidate binding, so it is exempt
-        // from stale-authority invalidation and only a human answer/label
-        // clear resumes it. The label never grants *attested* authority; it
-        // only withholds autonomous recovery, which must never act on a
-        // human-held item (it could push an unsolicited commit or clear the
-        // human's label). A failed live read falls through to engine recovery.
-        let liveBlockedLabel = false;
-        try {
-          const issue = await deps.observe.getIssueStateAndLabels(Number(itemId));
-          liveBlockedLabel = isBlockedInLabels(issue?.labels ?? []);
-        } catch {
-          liveBlockedLabel = false;
-        }
-        if (liveBlockedLabel) {
-          // Mid-pass stop guard (same as the attested arm above): once a
-          // sibling recorded the run stop, waitItem would throw
-          // LoopError("stop") — skip the hold gracefully with no side effect.
-          const preHoldLedger = await readLedger(deps.store, runId);
-          if (preHoldLedger.stop) {
-            ledger = preHoldLedger;
-          } else {
-            ledger = await waitItem(deps.store, {
-              runId,
-              token,
-              itemId,
-              engine,
-              request: {
-                kind: "answer",
-                prompt: `pipeline/loop-execution@1 reported blocked_needs_human for item ${itemId} and the live issue carries the blocked label — needs a human answer/unblock before this item can resume`,
-                source: "pipeline_blocked_label",
-              },
-              note: "needs-human pipeline blocker without attested authority — conservative human-resume-only hold",
-            });
-          }
-        } else {
-          const diagnostic = engineDefectDiagnostic(
-            `pipeline/loop-execution@1 reported blocked_needs_human for item ${itemId} without current attested human authority: ${projection.protocolError ?? `disposition=${projection.disposition}`}`,
-          );
-          const recovery = await blockAndExecuteRecovery(deps, contract, {
-            runId,
-            token,
-            itemId,
-            engine,
-            blockerClass: "workflow-engine-defect",
-            diagnostic,
-            evidence: transportEvidence,
-            allowAlreadyStopped: true,
-          });
-          ledger = recovery.ledger;
-          recoveryProgress ||= recovery.attempted;
-          evidenceOutcome = "protocol_failure";
-        }
+        // No current attested authority means no human hold. Labels and prior
+        // comment markers cannot supply the missing finding/candidate proof;
+        // route the protocol defect through bounded engine recovery.
+        const diagnostic = engineDefectDiagnostic(
+          `pipeline/loop-execution@1 reported blocked_needs_human for item ${itemId} without current attested human authority: ${projection.protocolError ?? `disposition=${projection.disposition}`}`,
+        );
+        const recovery = await blockAndExecuteRecovery(deps, contract, {
+          runId,
+          token,
+          itemId,
+          engine,
+          blockerClass: "workflow-engine-defect",
+          diagnostic,
+          evidence: transportEvidence,
+          allowAlreadyStopped: true,
+        });
+        ledger = recovery.ledger;
+        recoveryProgress ||= recovery.attempted;
+        evidenceOutcome = "protocol_failure";
       }
     } else {
       // "failed" — either reported directly, a rejected dispatch, or normalized from an outcome

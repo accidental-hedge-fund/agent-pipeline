@@ -17,6 +17,7 @@ export const STAGE_DIAGNOSTIC_REASON_CODES = [
   "workflow-state",
   "implementation-ci",
   "workflow-engine-defect",
+  "environment-auth",
   "worktree-capacity",
   "human-decision-required",
   "openspec-archive-apply-conflict",
@@ -170,6 +171,8 @@ export function projectPipelineReasonCode(reasonCode: unknown): StageDiagnosticP
       return { blockerClass: "implementation-ci", disposition: "recover" };
     case "workflow-engine-defect":
       return { blockerClass: "workflow-engine-defect", disposition: "recover" };
+    case "environment-auth":
+      return { blockerClass: "environment-auth", disposition: "recover" };
     case "worktree-capacity":
       return { blockerClass: "workflow-state", disposition: "capacity" };
     case "human-decision-required":
@@ -255,7 +258,11 @@ export function projectStageDiagnostic(value: unknown): StageDiagnosticProjectio
       detail.blocker_kind === "openspec-invalid" &&
       (detail.stage === "planning" || detail.stage === "plan-review") &&
       detail.offramp_class === undefined);
-  if (candidate.reason_code !== expectedReasonCode && !exactOpenSpecReason) {
+  const exactEnvironmentAuthReason =
+    candidate.reason_code === "environment-auth" &&
+    detail.blocker_kind === "harness-failure" &&
+    detail.offramp_class === undefined;
+  if (candidate.reason_code !== expectedReasonCode && !exactOpenSpecReason && !exactEnvironmentAuthReason) {
     return {
       blockerClass: "workflow-engine-defect",
       disposition: "protocol_failure",

@@ -60,6 +60,7 @@ test("LOOP_MATERIAL_KINDS covers the issue allow-list", () => {
     "loop_item_stage_progress",
     "loop_item_progress",
     "loop_run_stopped",
+    "loop_run_complete",
   ]) {
     assert.ok(
       (LOOP_MATERIAL_KINDS as readonly string[]).includes(k),
@@ -115,6 +116,7 @@ test("loop material kinds pass the filter among noise", () => {
     }),
     loop("loop_item_advance_finished", { item_id: "#742", outcome: "advanced" }),
     loop("loop_run_stopped", { reason: "all_done" }),
+    loop("loop_run_complete", { outcome: "all_items_done" }),
   ];
   const out = filterMaterialLines(lines);
   const joined = out.join("\n");

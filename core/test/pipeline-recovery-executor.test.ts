@@ -71,6 +71,67 @@ test("narrow recovery clears only a current mechanical block and verifies live s
   assert.match(result.evidence, /cleared.*verified/);
 });
 
+test("authentication recovery verifies live credentials before clearing the mechanical block", async () => {
+  let actorReads = 0;
+  let clears = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    getGhActor: async () => {
+      actorReads++;
+      return "pipeline-bot";
+    },
+    getIssueDetail: async () => ({
+      number: 42,
+      type: "issue",
+      title: "auth",
+      body: "",
+      state: "open",
+      url: "https://example.test/42",
+      labels: clears === 0 ? ["blocked", "pipeline:pre-merge"] : ["pipeline:pre-merge"],
+    }),
+    clearBlocked: async () => {
+      clears++;
+    },
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "environment-auth",
+    blockerKind: "harness-failure",
+    reason: "GitHub credentials expired",
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "verify_authentication",
+    blockerClass: "environment-auth",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, true);
+  assert.equal(actorReads, 1);
+  assert.equal(clears, 1);
+});
+
+test("authentication recovery preserves the block when credentials are still unusable", async () => {
+  let cleared = false;
+  const execute = realExecuteRecovery(cfg(), {
+    getGhActor: async () => null,
+    clearBlocked: async () => {
+      cleared = true;
+    },
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "environment-auth",
+    blockerKind: "harness-failure",
+    reason: "GitHub credentials expired",
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "verify_authentication",
+    blockerClass: "environment-auth",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, false);
+  assert.equal(cleared, false);
+  assert.match(result.error ?? "", /authenticated actor/);
+});
+
 test("human authority and malformed diagnostics are rejected before any mutation", async () => {
   let mutated = false;
   const execute = realExecuteRecovery(cfg(), {

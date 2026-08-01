@@ -259,10 +259,11 @@ Each operation is available as its own discoverable `/pipeline:<command>` (Claud
 or `$pipeline:<command>` (Codex) entry. The advance loop has no sub-command.
 
 ```text
-/pipeline N            $pipeline N            advance loop (default; up to 12 transitions)
+/pipeline N            $pipeline N            durable autonomous one-item drive (default)
 /pipeline N --once                            advance one stage and stop
 /pipeline N --dry-run                         log only; no harness calls, no GitHub writes
-/pipeline N --detach                          run the advance loop in a detached background process
+/pipeline N --detach                          legacy raw detached advance; bypasses durable recovery
+pipeline single N                              host-facing controller used by default /pipeline N and $pipeline N
 
 /pipeline:status N     $pipeline:status N     read-only: stage, blocker, PR, last review
 /pipeline:status N --json                     machine-readable JSON status envelope (stable contract)
@@ -767,7 +768,14 @@ After every run, `queue` writes `.agent-pipeline/runs/batch-<batch_id>/batch-sum
 
 `halt_reason` is `null` when the batch ran to natural completion, `"budget_exhausted"` when the budget gate fired, or `"failure_rate_exceeded"` when the failure-rate gate fired. `excluded_count` is the number of eligible issues that were filtered out (by label/milestone/risk/cap) and not dispatched.
 
-## Durable multi-item runs (`pipeline:loop`)
+## Durable autonomous runs (`pipeline single` and `pipeline:loop`)
+
+Default `/pipeline N` and `$pipeline N` invocations use the host-facing
+`pipeline single N` command. It selects one issue but otherwise uses the same durable
+supervisor, typed diagnostics, recovery recipes, attempt ledger, reconciliation, and
+strict human-authority boundary as a multi-item loop. `--once`, `--dry-run`, and the
+legacy `--detach` mode remain low-level raw-advance controls and do not promise durable
+recovery.
 
 `pipeline queue` (above) is Pipeline's own bounded, single-session batch mode. For a
 **durable** run that spans sessions or engines — selection, dependency-aware ordering,
@@ -1359,31 +1367,41 @@ build_command: "npm run build"
 
 ### Pipeline is blocked
 
-When the pipeline cannot advance on its own, it applies a `blocked` label to the issue and posts a `## Pipeline: Blocked` comment explaining why. The comment's **### How to unblock** section states the recovery verb that actually resolves *that* blocker class — it is recipe-specific, not a one-size hint. For example:
+The `blocked` label is an observation, not the recovery policy. Default single-issue
+and multi-item drives read the canonical stage diagnostic and apply this controller
+matrix before any terminal decision:
 
-- **Test/build gate failed** → fix the failing test(s) in the worktree, commit, then re-run.
-- **Merge conflict / branch behind** → rebase on the latest target, resolve, push, then re-run.
-- **OpenSpec change invalid** → run `openspec validate <change>`, fix the errors, commit, then re-run.
-- **No commits produced** → finish and commit the work in the worktree (the pipeline salvages real uncommitted work automatically), then re-run.
-- **Needs a human decision** → fix the findings and re-run, **or** record an audited disposition with `--override "<finding-key>: <reason>"`.
+| Durable class | First action | Bounded fallback | Terminal ownership |
+| --- | --- | --- | --- |
+| `workflow-state` | Reconcile and redispatch the normal state machine | Configured implementer repairs current issue state, then all gates re-run | Engine/system failure, never product authority |
+| `implementation-ci` | Re-enter the deterministic CI/OpenSpec/review gate | Configured implementer repairs current candidate, then all gates re-run | Engine/system failure, never product authority |
+| `workflow-engine-defect` | Restart and redispatch the workflow engine | One bounded configured-implementer repair | Engine/system failure |
+| `environment-auth` | Verify a live authenticated `gh` actor | None; the engine cannot enter credentials | External operator credential action, not a product decision |
+| `transient-rate-limit` / `upstream-dependency` | Wait and retry with durable backoff | None | Typed dependency/system exhaustion |
+| Worktree capacity | Release a safe parked worktree or wait for capacity | Reconcile on the next cycle | Capacity wait, not a human-authority hold |
+| `human-decision-required` with current attested product/authority evidence | None | None | Resumable human hold |
+| Missing, malformed, or unknown diagnostic | Protocol-defect recovery | Bounded engine repair/restart | Engine/system failure, never inferred human authority |
 
-To unblock:
+Deterministic actions run before model repair so a rebase, gate re-entry, or clean
+state resync does not spend implementer budget. A successful action clears the stale
+blocked state and redispatches the whole item. If the same current evidence returns,
+the next configured recipe runs; attempts are charged durably before side effects.
 
-1. Read the blocker comment and follow its **### How to unblock** recipe.
-2. Address the root cause in the worktree (fix tests, rebase, validate specs, etc.) and commit.
-3. Re-run the pipeline — it picks up from the blocked stage:
-
-```bash
-gh issue edit N --remove-label "blocked"
-/pipeline N   # or: $pipeline N
-```
-
-For a blocker that only needs a human answer (no code change), post the answer and clear the label in one step:
+Only a current canonical `human-decision-required` diagnostic with attested product or
+authority evidence should wait for an answer. Post that answer and clear the hold with:
 
 ```bash
 /pipeline N --unblock "your answer or context here"
 # or for Codex:
 $pipeline N --unblock "your answer or context here"
+```
+
+For engine-owned terminal exhaustion, inspect the durable loop audit and linked
+advance evidence instead of relabeling it as human-owned:
+
+```bash
+pipeline loop --resume <run-id> --audit
+pipeline loop logs <run-id> --events
 ```
 
 ### Common blockers
@@ -1489,7 +1507,7 @@ Durable multi-item loop runs store events under the loop state home (not
 # print a durable loop run's events.jsonl
 $pipeline loop logs <loop-run-id> --events
 
-# follow until loop_run_stopped (default; exit 0) — use --no-until-terminal for interrupt-only
+# follow until loop_run_stopped or loop_run_complete (default; exit 0)
 $pipeline loop logs <loop-run-id> --events --follow
 
 # long-lived dashboard: keep streaming past terminal until SIGINT/SIGTERM

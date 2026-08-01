@@ -72,6 +72,9 @@ test("mechanical OpenSpec, merge, and test blocks emit blocker_set without human
     assert.equal(event.blocker_kind, kind);
     assert.equal(event.offramp_class, expectedClass);
     assert.equal(event.offramp_id, `offramp-${kind}`);
+    assert.equal(event.diagnostic?.detail.blocker_kind, kind);
+    assert.equal(event.diagnostic?.detail.stage, "pre-merge");
+    assert.equal(event.diagnostic?.detail.offramp_class, expectedClass);
   }
 });
 
@@ -159,7 +162,7 @@ test("blocker_set preserves the producer diagnostic exactly", async () => {
 
 test("generic needs-human is not authority evidence", async () => {
   const interventions: unknown[] = [];
-  await emitBlockedOutcomeEvents(
+  const event = await emitBlockedOutcomeEvents(
     "/run",
     88,
     "review-2",
@@ -177,6 +180,8 @@ test("generic needs-human is not authority evidence", async () => {
   assert.equal(isHumanAuthorityBlocker("needs-human"), false);
   assert.equal(isHumanAuthorityBlocker("human-decision-required"), false);
   assert.equal(interventions.length, 0);
+  assert.equal(event.diagnostic?.reason_code, "workflow-state");
+  assert.equal(event.diagnostic?.detail.stage, "review-2");
 });
 
 test("explicit authority is not eligible for mechanical auto-loop retry", () => {

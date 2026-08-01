@@ -88,3 +88,16 @@
   mirror in the same implementation commit.
 - [x] 7.4 Run `openspec validate autonomous-recovery-controller --strict` and the full
   `npm run ci` gate, retaining command output as completion evidence.
+
+## 8. Deterministic Recovery And Single-Issue Integration
+
+- [x] 8.1 Order workflow-state, implementation-CI, and workflow-engine recipes so deterministic
+  redispatch/re-entry executes before `repair_pipeline_item`, with regression coverage for fallback.
+- [x] 8.2 Replace placeholder reauthentication with a live authenticated-actor verification that
+  cannot enter credentials or clear state after a failed probe.
+- [x] 8.3 Add a canonical one-item command that resumes active durable state, supersedes terminal
+  state, emits early handoff, and uses the same supervisor as multi-item loops.
+- [x] 8.4 Update Claude/Codex host skills and operator documentation to launch and observe the
+  one-item controller, including the recovery-versus-human-authority matrix.
+- [x] 8.5 Emit successful `loop_run_complete` records through the shared material-event filter and
+  add regression coverage.

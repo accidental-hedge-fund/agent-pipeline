@@ -15,6 +15,10 @@ loop event; mechanical failures therefore become operator work by construction.
 - Wire recovery-policy recipe execution into the production supervisor before hold/stop
   classification, with durable keyed attempts, budget consumption, restart-safe re-entry, and
   sibling continuation.
+- Prefer deterministic state/gate/engine redispatch before configured-implementer repair, and make
+  authentication recovery a real live-actor verification rather than a placeholder action.
+- Route the default single-issue host command through the same durable supervisor used by
+  multi-item loops.
 - Add a shared mechanical-remediation transaction that can rematerialize the worktree, invoke the
   configured implementer, validate/commit/push the repair, and re-enter the child pipeline.
 - Emit real diagnostics for recoverable OpenSpec archive and artifact-validation failures; do not

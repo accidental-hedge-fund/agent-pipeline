@@ -18,3 +18,11 @@
   cannot preserve authority granted for stale reviewed evidence.
 - A green broad suite does not replace adversarial lifecycle review. Explicitly test crashes after
   each external side effect and fresh external truth that overtakes a durable local claim.
+- An autonomous recovery policy is still misleading when its first action is a model call while a
+  deterministic redispatch can re-evaluate the invariant, or when a named recipe is guaranteed to
+  fail. Every configured recipe must have a real production side effect or verification path.
+- Recovery semantics must be shared by single-item and multi-item entry points. A durable loop that
+  heals mechanical blocks does not make the product autonomous when the primary one-item command
+  bypasses that controller and parks the same outcome.
+- Fail-closed authority means missing current authority proof stays engine-owned. Do not create a
+  "conservative" human-resume-only hold from a label, outcome name, or old blocker-kind marker.

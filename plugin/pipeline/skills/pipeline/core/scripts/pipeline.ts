@@ -261,7 +261,8 @@ export interface CliOpts {
   /**
    * Events follow until-terminal: exit 0 after terminal event (default true).
    * Advance `pipeline logs … --events --follow` → `run_complete` (#725);
-   * loop `pipeline loop logs … --follow` → `loop_run_stopped` (#699).
+   * loop `pipeline loop logs … --follow` → `loop_run_stopped` or
+   * `loop_run_complete` (#699).
    * Commander `--no-until-terminal` sets this false for interrupt-only follow.
    */
   untilTerminal?: boolean;
@@ -438,6 +439,7 @@ export interface CliOpts {
 export function maxPositionalsFor(command: string | undefined): number {
   if (
     command === "run" ||
+    command === "single" ||
     command === "release" ||
     command === "intake" ||
     command === "triage" ||
@@ -469,7 +471,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | factory-gate | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -497,7 +499,7 @@ export function buildCmd(): Command {
     // (#699 loop; #725 advance events).
     .option(
       "--no-until-terminal",
-      "events --follow: keep streaming until interrupt only (default: exit 0 after run_complete for advance logs, or loop_run_stopped for loop logs)",
+      "events --follow: keep streaming until interrupt only (default: exit 0 after run_complete for advance logs, or loop_run_stopped/loop_run_complete for loop logs)",
     )
     .option("--events", "logs mode: read/follow events.jsonl (required selection for advance logs; always selected for 'pipeline loop logs')")
     // `pipeline run <N> --detach` options
@@ -1081,7 +1083,6 @@ export function realDispatchItem(
       // Compatibility for early-exits before a fresh run-store event: only the
       // authenticated, current blocked-label incarnation may supply this
       // structural fallback. Comment prose is never read or transported.
-      let markerHumanDecision = false;
       if (resolution.diagnostic === null && Array.isArray(detail.comments)) {
         const actor = await getGhActorFn();
         let blockedLabeledAt: string | null = null;
@@ -1095,15 +1096,10 @@ export function realDispatchItem(
           blockedLabeledAt,
         });
         if (trustedKind === "human-decision-required") {
-          // Authority boundary: the marker attests only the prior hold's
-          // structured KIND. It may keep an already-blocked item safely parked
-          // for a human, but it never reconstructs attested human authority —
-          // no authority_evidence, no reviewed-candidate binding — so no
-          // diagnostic is synthesized (buildStageDiagnostic rightly rejects an
-          // evidence-less human-decision-required). The outcome override below
-          // yields the conservative human-resume-only hold, never an
-          // authority-verified one.
-          markerHumanDecision = true;
+          // A marker attests only the prior blocker's kind. It cannot
+          // reconstruct authority_evidence or candidate binding, so it must
+          // remain a protocol defect and enter bounded engine recovery rather
+          // than manufacturing or preserving a human hold.
         } else if (
           trustedKind !== null &&
           (BLOCKER_KINDS as readonly string[]).includes(trustedKind)
@@ -1123,14 +1119,6 @@ export function realDispatchItem(
       }
       diagnostic = resolution.diagnostic ?? undefined;
       outcome = classifyDispatchOutcome(detail, diagnostic, eventsTextForClassify);
-      // A trusted human-decision marker on a still-blocked item is a human
-      // hold, not a protocol failure — without this the supervisor would
-      // synthesize workflow-engine-defect and run autonomous recovery against
-      // a human-authority-held item. Absent/invalid markers keep the
-      // protocol-failure classification above.
-      if (markerHumanDecision && outcome === "failed" && detail.labels.includes(BLOCKED_LABEL)) {
-        outcome = "blocked_needs_human";
-      }
       // Pure capacity is ops admission, not a product block: clear the label so
       // re-admission after a slot frees does not thrash on an already-blocked
       // early-exit (#718). Clear MUST succeed before capacity_wait is safe for a
@@ -1211,6 +1199,7 @@ type ExecuteRecoveryInput = Parameters<NonNullable<SupervisorDeps["executeRecove
 
 export interface RealExecuteRecoveryDeps {
   getIssueDetail?: typeof getIssueDetail;
+  getGhActor?: typeof getGhActor;
   clearBlocked?: typeof clearBlocked;
   repairPipelineItem?: (input: RepairPipelineItemInput) => Promise<RepairPipelineItemResult>;
 }
@@ -1223,6 +1212,7 @@ export function realExecuteRecovery(
   deps: RealExecuteRecoveryDeps = {},
 ): NonNullable<SupervisorDeps["executeRecovery"]> {
   const getDetail = deps.getIssueDetail ?? getIssueDetail;
+  const verifyAuthentication = deps.getGhActor ?? getGhActor;
   const clear = deps.clearBlocked ?? clearBlocked;
   const repairPipelineItem = deps.repairPipelineItem ?? createRepairPipelineItemExecutor(cfg);
 
@@ -1291,8 +1281,20 @@ export function realExecuteRecovery(
       case "retry_upstream_check":
       case "restart_workflow_engine":
         return resyncMechanicalBlock(input);
-      case "reauthenticate":
-        return failed("reauthenticate requires external credential authority and cannot be performed by autonomous recovery");
+      case "verify_authentication": {
+        let actor: string | null;
+        try {
+          actor = await verifyAuthentication();
+        } catch (err) {
+          return failed(
+            `authentication is not currently usable: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        if (!actor?.trim()) {
+          return failed("authentication is not currently usable: the authenticated actor could not be resolved");
+        }
+        return resyncMechanicalBlock(input);
+      }
     }
   };
 }
@@ -1469,6 +1471,10 @@ export interface RunLoopEngineInput {
   /** `--new-run` (#568, capability `loop-run-supersession`): only ever true alongside `selector`
    *  — {@link normalizeLoopArgs} refuses it with `--resume` or with no selector present. */
   newRun?: boolean;
+  /** One-item command mode: resume the current durable run when active and
+   * automatically supersede it when terminal, so a fresh operator invocation
+   * never reuses an exhausted recovery ledger. */
+  autoSupersedeTerminal?: boolean;
   /**
    * `--audit --follow` (#611): read-only whole-run stage-progress stream.
    * Requires `audit: true` (enforced by normalizeLoopArgs).
@@ -1604,6 +1610,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
   }
 
   let runId: string;
+  let resumeExisting = false;
   if (input.resumeRunId) {
     runId = input.resumeRunId;
   } else if (input.selector) {
@@ -1621,8 +1628,9 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     const discoverDeps = workListDiscoverDepsForCompile(cfg, roadmapDeclaredEdges);
     const canonicalRunId = workListRunId(cfg.repo, input.engine, issues);
 
-    if (input.newRun) {
-      if (!(await loopRunExists(store, canonicalRunId))) {
+    const canonicalExists = await loopRunExists(store, canonicalRunId);
+    if (input.newRun || (input.autoSupersedeTerminal && canonicalExists)) {
+      if (!canonicalExists) {
         return {
           kind: "error",
           message: `--new-run: no existing run found for this selector (canonical run "${canonicalRunId}") — nothing to supersede`,
@@ -1632,14 +1640,20 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
       const headLedger = await readLedger(store, headRunId);
       const decision = decideNewRunSupersession(canonicalRunId, chainLength, !!headLedger.stop);
       if (decision.kind === "refuse") {
-        return {
-          kind: "error",
-          message: `--new-run: run "${headRunId}" for this selector is not terminally stopped — resume it instead (--resume ${headRunId})`,
-        };
+        if (input.autoSupersedeTerminal) {
+          runId = headRunId;
+          resumeExisting = true;
+        } else {
+          return {
+            kind: "error",
+            message: `--new-run: run "${headRunId}" for this selector is not terminally stopped — resume it instead (--resume ${headRunId})`,
+          };
+        }
       }
       if (decision.kind === "resume-existing") {
         runId = headRunId;
-      } else {
+        resumeExisting = !!input.autoSupersedeTerminal;
+      } else if (decision.kind === "mint") {
         const newRunId = decision.newRunId;
         // Re-derive the repair plan from live state on every mint attempt — including a retry
         // where `newRunId` already exists — rather than gating the reverse-pointer write on
@@ -1681,7 +1695,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
       }
     } else {
       runId = canonicalRunId;
-      if (!(await loopRunExists(store, runId))) {
+      if (!canonicalExists) {
         let compiled: Awaited<ReturnType<typeof compileWorkListRunFresh>>;
         try {
           compiled = await compileWorkListRunFresh(cfg, input.engine, issues, runId, discoverDeps);
@@ -1759,7 +1773,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     const result = await driveSupervisor(supervisorDeps, {
       runId,
       engine: input.engine as LoopEngineName,
-      resume: !!input.resumeRunId,
+      resume: !!input.resumeRunId || resumeExisting,
       onRunReady: input.onRunReady
         ? async (ctx) => {
             // Selector is known only at the engine/CLI layer; bare --resume has none.
@@ -1894,37 +1908,37 @@ export async function runLoopCommand(
     return;
   }
 
-  // A stop must never silently strand a ready-to-deploy item (#570, capability
-  // `loop-needs-human-blocker-disposition`): name every outstanding `ready` item on the CLI
-  // output whenever a stop carries one, alongside the machine-readable `stop.outstanding_ready`
-  // already embedded in the JSON below.
-  const outstandingReady = engineResult.result.stop?.outstanding_ready ?? [];
+  process.exitCode = renderLoopDriveResult(engine, engineResult.result);
+}
+
+/** Render the shared terminal contract for multi-item and canonical one-item
+ * durable drives. Returns the process exit code so command facades cannot
+ * diverge on stop/hold/exclusion behavior. */
+export function renderLoopDriveResult(
+  engine: LoopEngine,
+  result: Extract<LoopEngineResult, { kind: "drive" }>["result"],
+  commandLabel = "pipeline loop",
+): number {
+  const outstandingReady = result.stop?.outstanding_ready ?? [];
   if (outstandingReady.length > 0) {
     console.error(
-      `pipeline loop: stopped with ${outstandingReady.length} item(s) stranded at ready-to-deploy, awaiting human merge: ${outstandingReady.join(", ")}`,
+      `${commandLabel}: stopped with ${outstandingReady.length} item(s) stranded at ready-to-deploy, awaiting human merge: ${outstandingReady.join(", ")}`,
     );
   }
 
-  // The terminal outstanding-hold condition names every held item so an operator sees exactly
-  // which items await a human (#581, capability `loop-blocked-item-hold-continuation`) — a hold
-  // alongside still-schedulable work never reaches this point (the run keeps cycling instead).
-  const heldItemIds = engineResult.result.heldItemIds ?? [];
-  if (engineResult.result.holdOutstanding && heldItemIds.length > 0) {
+  const heldItemIds = result.heldItemIds ?? [];
+  if (result.holdOutstanding && heldItemIds.length > 0) {
     console.error(
-      `pipeline loop: paused with ${heldItemIds.length} item(s) held for a human: ${heldItemIds.join(", ")}`,
+      `${commandLabel}: paused with ${heldItemIds.length} item(s) held for a human: ${heldItemIds.join(", ")}`,
     );
   }
 
-  // A resolved run with ≥1 precondition-excluded item is named on the CLI's own output, not only
-  // recoverable via `--audit` (#614, capability `loop-terminal-exclusion-disclosure`) — the same
-  // "all_done: true masked nothing ran" gap #570/#581 already closed for stops and holds.
-  const excludedItemIds = engineResult.result.excludedItemIds ?? [];
+  const excludedItemIds = result.excludedItemIds ?? [];
   if (excludedItemIds.length > 0) {
-    const dispatched = engineResult.result.dispatched;
-    const total = dispatched + excludedItemIds.length;
-    const reason = humanizeExclusionReason(engineResult.result.exclusionReason);
+    const total = result.dispatched + excludedItemIds.length;
+    const reason = humanizeExclusionReason(result.exclusionReason);
     console.error(
-      `pipeline loop: ${dispatched} of ${total} item(s) dispatchable — ${excludedItemIds.length} excluded: ${reason} (${excludedItemIds
+      `${commandLabel}: ${result.dispatched} of ${total} item(s) dispatchable — ${excludedItemIds.length} excluded: ${reason} (${excludedItemIds
         .map((id) => `#${id}`)
         .join(", ")})`,
     );
@@ -1934,25 +1948,102 @@ export async function runLoopCommand(
     JSON.stringify({
       schema_version: "1",
       engine,
-      run_id: engineResult.result.runId,
-      cycles: engineResult.result.cycles,
-      stop: engineResult.result.stop,
-      hold_outstanding: engineResult.result.holdOutstanding,
+      run_id: result.runId,
+      cycles: result.cycles,
+      stop: result.stop,
+      hold_outstanding: result.holdOutstanding,
       held_item_ids: heldItemIds,
-      all_done: engineResult.result.allDone,
-      resumed: engineResult.result.resumed,
-      dispatched: engineResult.result.dispatched,
+      all_done: result.allDone,
+      resumed: result.resumed,
+      dispatched: result.dispatched,
       excluded: excludedItemIds.length,
       excluded_item_ids: excludedItemIds,
-      exclusion_reason: engineResult.result.exclusionReason,
-      completion: engineResult.result.completion,
+      exclusion_reason: result.exclusionReason,
+      completion: result.completion,
     }),
   );
-  process.exitCode = engineResult.result.stop || engineResult.result.holdOutstanding
+  return result.stop || result.holdOutstanding
     ? 1
-    : engineResult.result.completion === "none_dispatchable"
+    : result.completion === "none_dispatchable"
       ? 2
       : 0;
+}
+
+export interface SingleIssueCommandDeps {
+  resolveConfig: typeof resolveConfig;
+  resolveIssueNumber: typeof resolveIssueNumber;
+  runLoopEngine: (input: RunLoopEngineInput) => Promise<LoopEngineResult>;
+  writeStdoutLine: (line: string) => void | Promise<void>;
+}
+
+const defaultSingleIssueCommandDeps: SingleIssueCommandDeps = {
+  resolveConfig,
+  resolveIssueNumber,
+  runLoopEngine: defaultRunLoopEngine,
+  writeStdoutLine: writeFlushedStdoutLine,
+};
+
+/** Canonical one-item autonomous drive. The stage machine still performs every
+ * normal transition; this facade supplies the same durable supervisor and
+ * recovery controller used by `pipeline loop` without requiring an outer
+ * multi-item `/goal` bootstrap. */
+export async function runSingleIssueCommand(
+  rawNumber: string | undefined,
+  opts: CliOpts,
+  deps: SingleIssueCommandDeps = defaultSingleIssueCommandDeps,
+): Promise<void> {
+  const parsed = Number.parseInt(rawNumber ?? "", 10);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || String(parsed) !== rawNumber) {
+    console.error("pipeline single: <number> is required and must be a positive integer");
+    process.exitCode = 2;
+    return;
+  }
+
+  let cfg: PipelineConfig;
+  try {
+    cfg = deps.resolveConfig({
+      repoPath: opts.repoPath,
+      baseBranch: opts.base,
+      profile: opts.profile,
+    });
+  } catch (err) {
+    console.error(`pipeline single: config error: ${(err as Error).message}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  let issueNumber: number;
+  try {
+    issueNumber = await deps.resolveIssueNumber(cfg, parsed);
+  } catch (err) {
+    console.error(`pipeline single: ${(err as Error).message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const engine: LoopEngine = opts.profile === "claude" ? "claude" : "codex";
+  const engineResult = await deps.runLoopEngine({
+    engine,
+    selector: { type: "work-list", value: [String(issueNumber)] },
+    audit: false,
+    autoSupersedeTerminal: true,
+    repoDir: cfg.repo_dir,
+    onRunReady: async (ctx) => {
+      await deps.writeStdoutLine(formatLoopRunHandoff({ ...ctx, selector: { type: "work-list", value: [String(issueNumber)] } }));
+      console.error(`pipeline single: run ready ${ctx.runId}; events ${ctx.events}`);
+    },
+  });
+  if (engineResult.kind === "error") {
+    console.error(`pipeline single: ${engineResult.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (engineResult.kind !== "drive") {
+    console.error("pipeline single: internal error: one-item drive returned an audit result");
+    process.exitCode = 1;
+    return;
+  }
+  process.exitCode = renderLoopDriveResult(engine, engineResult.result, "pipeline single");
 }
 
 /** Renders a machine-readable `precondition:required=<stage>,observed=<stage>` exclusion reason
@@ -2169,6 +2260,8 @@ async function main(): Promise<void> {
   // `pipeline loop ...` (#451) — deterministic preflight + delegation to goal-loop.
   // Needs no PipelineConfig and calls no gh at all (see command-registry.ts).
   const isLoopCommand = numArg === "loop";
+  // `pipeline single <N>` — canonical durable one-item autonomous drive.
+  const isSingleCommand = numArg === "single";
   // `pipeline refine-spec --title "<t>" --body "<b>"` — non-mutating spec refinement preview.
   const isRefineSpecCommand = numArg === "refine-spec";
 
@@ -2199,7 +2292,7 @@ async function main(): Promise<void> {
   // state home. Nested `logs` must never enter loop preflight or the supervisor
   // drive path. Dispatched before flag validation / config / gh — same offline
   // discipline as advance `pipeline logs`. Default follow exits 0 on
-  // loop_run_stopped; --no-until-terminal restores interrupt-only.
+  // loop_run_stopped or loop_run_complete; --no-until-terminal restores interrupt-only.
   if (numArg === "loop" && cmd.args[1] === "logs") {
     const loopLogsArg = cmd.args[2];
     const loopLogsRunId =
@@ -3233,6 +3326,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (isSingleCommand) {
+    await runSingleIssueCommand(cmd.args[1], opts);
+    return;
+  }
+
   // Early triage dispatch — resolves config for cfg.repo so gh wrappers target the
   // configured repository. The handler validates issue number and stage, then makes
   // the gh calls to read/add/remove labels.
@@ -3354,7 +3452,7 @@ async function main(): Promise<void> {
   if (numArg && !/^\d+$/.test(numArg)) {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
-      "logs", "path", "config", "run", "release", "intake", "refine-spec",
+      "logs", "path", "config", "run", "single", "release", "intake", "refine-spec",
       "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "factory-gate", "queue", "backfill", "evals",
       "loop",
     ];

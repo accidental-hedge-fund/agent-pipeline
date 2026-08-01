@@ -8,13 +8,9 @@ also `human-decision-required`. The supervisor SHALL verify that diagnostic agai
 evidence before creating or retaining the hold. A `pipeline:blocked` label, a
 `blocked_needs_human` outcome without that diagnostic, a missing or
 reason-less diagnostic, a plan/output format error, an artifact failure, an exhausted mechanical
-attempt, or any co-present stage label SHALL be insufficient authority evidence. An explicit
-`blocked_needs_human` outcome without attested authority whose live issue still carries the
-product blocked label SHALL park as a conservative human-resume-only wait that carries no
-authority evidence, is exempt from stale-authority invalidation, and resumes only on a human
-answer or label clear; autonomous recovery SHALL NOT act on it and it SHALL NOT emit
-`human_intervention`. Labels alone SHALL never create that wait. Every other unattested case SHALL
-enter typed engine recovery or terminal system failure and SHALL NOT emit `human_intervention`.
+attempt, or any co-present stage label SHALL be insufficient authority evidence. Every unattested
+case SHALL enter typed engine recovery or terminal system failure and SHALL NOT emit
+`human_intervention`, even when the live issue still carries the product blocked label.
 While a genuine human hold exists, the run SHALL continue any schedulable dependency-independent
 sibling and preserve every sibling's state. A rejected/crashed dispatch or protocol defect SHALL
 remain engine-owned and SHALL follow bounded recovery before any terminal system stop.
@@ -39,14 +35,14 @@ remain engine-owned and SHALL follow bounded recovery before any terminal system
 - **THEN** the supervisor SHALL inspect its current canonical diagnostic
 - **AND** it SHALL create an attested authority hold only when the strict authority predicate passes
 
-#### Scenario: An unattested needs-human outcome with a live blocked label parks conservatively
+#### Scenario: An unattested needs-human outcome with a live blocked label remains engine-owned
 
 - **WHEN** per-item execution reports `blocked_needs_human` without a current attested
   human-authority diagnostic
 - **AND** a fresh live read shows the issue still carries the product blocked label
-- **THEN** the supervisor SHALL park the item as a human-resume-only wait carrying no authority
-  evidence, exempt from stale-authority invalidation
-- **AND** autonomous recovery SHALL NOT act on the item and no `human_intervention` SHALL be emitted
+- **THEN** the supervisor SHALL classify the missing authority proof as a protocol defect and run
+  bounded engine recovery
+- **AND** it SHALL create no human hold and emit no `human_intervention`
 
 #### Scenario: Current human-decision diagnostic creates a resumable hold
 
