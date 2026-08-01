@@ -16,5 +16,5 @@
 - [x] 3.1 Add #626/#675, production-transition, duplicate-comment, auto-loop, repair-first, migration, reconciliation, and supervisor regressions.
 - [x] 3.2 Validate the corrected OpenSpec change strictly and regenerate the plugin mirror.
 - [x] 3.3 Run `npm run ci` and review the local diff.
-- [ ] 3.4 Verify hosted PR CI.
-- [ ] 3.5 Install the merged build and reset #626/#675 to their correct fix stages.
+- [x] 3.4 Verify hosted PR CI.
+- [x] 3.5 Install the merged build and reset #626/#675 to their correct fix stages.
