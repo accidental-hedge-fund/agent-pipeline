@@ -18,6 +18,8 @@ import {
 import { initRun, readLedger, acquireLock, type LoopStoreDeps } from "../scripts/loop/store.ts";
 import {
   DEFAULT_RECOVERY_POLICY,
+  blockItem,
+  startRecoveryAttempt,
 } from "../scripts/loop/recovery.ts";
 import {
   LOOP_CONTRACT_SCHEMA,
@@ -418,6 +420,21 @@ test("classifyDrift: local + open PR + mid-flight stage is NOT ledger-behind (#7
   assert.equal(
     classifyDrift("implemented", openPrIdentity({ pipeline_stage: "pre-merge" }), null),
     null,
+  );
+});
+
+test("classifyDrift: an open PR never supersedes blocked recovery, but ready and merged truth do", () => {
+  assert.equal(
+    classifyDrift("blocked", openPrIdentity({ pipeline_stage: "needs-human" }), null),
+    null,
+  );
+  assert.equal(
+    classifyDrift("blocked", openPrIdentity({ pipeline_stage: "needs-human", ready_label_present: true }), null),
+    "ledger-behind",
+  );
+  assert.equal(
+    classifyDrift("blocked", openPrIdentity({ pipeline_stage: "needs-human", pr_state: "merged" }), null),
+    "ledger-behind",
   );
 });
 
@@ -898,6 +915,42 @@ test("reconcile: local + ready-to-deploy label still repairs to ready even with 
   assert.equal(result.drift[0]?.class, "ledger-behind");
   const ledger = await readLedger(deps, "run-1");
   assert.equal(ledger.items["100"].state, "ready");
+});
+
+test("regression #797: reconcile preserves a blocked item and its started recovery claim when an open PR is visible", async () => {
+  const { deps, token, contract } = await setup("in_progress");
+  await blockItem(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    blockerClass: "implementation-ci",
+    evidence: "review finding remains blocking on current head",
+  });
+  await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "repair_pipeline_item",
+    candidateIdentity: "base=main;head=abc123;attempt=0",
+  });
+  const before = await readLedger(deps, "run-1");
+  const budgetAfterClaim = before.items["100"].recovery_budgets_remaining["implementation-ci"];
+
+  const result = await reconcile(
+    deps,
+    openPrObserveDeps({ stage: "needs-human", checks: "success" }),
+    { runId: "run-1", token, engine: "claude" },
+  );
+
+  const after = await readLedger(deps, "run-1");
+  assert.equal(result.drift.find((entry) => entry.item_id === "100"), undefined);
+  assert.equal(after.items["100"].state, "blocked");
+  assert.equal(after.recovery_attempts.length, 1);
+  assert.equal(after.recovery_attempts[0].outcome, "started");
+  assert.equal(after.items["100"].recovery_budgets_remaining["implementation-ci"], budgetAfterClaim);
+  assert.ok(!after.items["100"].history.some((entry) => entry.from === "blocked" && entry.to === "pr_opened"));
 });
 
 test("reconcile: local + open PR + null stage still repairs to pr_opened (#511 compatibility)", async () => {

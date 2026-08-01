@@ -2148,7 +2148,7 @@ test("blocked_recoverable is claimed before execution and redispatches the same 
   assert.ok(startedIndex >= 0 && startedIndex < executedIndex && executedIndex < completedIndex);
 });
 
-test("restart reconciliation lets the repair executor reconcile its pushed candidate without replaying the model", async () => {
+test("regression #797: restart reconciliation preserves a started repair when its open PR is visible", async () => {
   const engineDefect = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"];
   const contract = testContract({
     items: [{ id: "100", depends_on: [] }],
@@ -2171,12 +2171,20 @@ test("restart reconciliation lets the repair executor reconcile its pushed candi
   });
   const observe = fakeObserveDeps({
     async getIssueStateAndLabels() {
-      return { state: "open", labels: dispatchCount >= 2 ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+      return {
+        state: "open",
+        labels: dispatchCount >= 2
+          ? [READY_LABEL]
+          : dispatchCount >= 1
+            ? ["pipeline:needs-human"]
+            : [PIPELINE_READY_LABEL],
+      };
     },
     async findPrForIssue() {
-      return dispatchCount >= 2 ? 12 : null;
+      return dispatchCount >= 1 ? 12 : null;
     },
     async getPrDetail() {
+      if (failPostObservation) return null;
       return { state: "open", head_ref: "pipeline/100-fix", head_sha: head, merge_commit_sha: null };
     },
     async getPrChecks() {
@@ -2512,7 +2520,7 @@ test("a failed budgeted recovery stays blocked and stops only after the action i
     "100": { ...itemEntry("100", "pending"), last_verified_identity: currentLocalIdentity() },
   });
   const { deps } = await setup(contract, ledger);
-  let recoveryCalls = 0;
+  const recoveryActions: string[] = [];
   const diagnostic = buildStageDiagnostic({
     blockerKind: "harness-failure",
     reason: "The host returned a malformed stage result",
@@ -2534,8 +2542,8 @@ test("a failed budgeted recovery stays blocked and stops only after the action i
     evidence: { pr_number: null, pipeline_run_id: "advance-100" },
     diagnostic,
   });
-  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
-    recoveryCalls++;
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    recoveryActions.push(input.action);
     return { succeeded: false, evidence: "repair exited non-zero", error: "repair exited non-zero" };
   };
 
@@ -2544,15 +2552,15 @@ test("a failed budgeted recovery stays blocked and stops only after the action i
     { runId: "run-1", engine: "claude" },
   );
 
-  assert.equal(recoveryCalls, 1);
+  assert.deepEqual(recoveryActions, ["restart_workflow_engine", "repair_pipeline_item"]);
   assert.equal(result.stop?.reason, "run_fatal");
   assert.equal(result.stop?.theme, "workflow-engine-defect");
   assert.equal(result.holdOutstanding, false);
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
   assert.equal(finalLedger.items["100"].recovery_budgets_remaining["workflow-engine-defect"], 0);
-  assert.equal(finalLedger.recovery_attempts[0].outcome, "failed");
-  assert.equal(finalLedger.recovery_attempts[0].error, "repair exited non-zero");
+  assert.deepEqual(finalLedger.recovery_attempts.map((attempt) => attempt.outcome), ["failed", "failed"]);
+  assert.equal(finalLedger.recovery_attempts[1].error, "repair exited non-zero");
 });
 
 test("an exhausted mechanical item cannot stop an independent sibling before that sibling runs", async () => {
@@ -2628,7 +2636,7 @@ test("an exhausted mechanical item cannot stop an independent sibling before tha
   );
   assert.equal(siblingCycle.stop, null, "exhaustion remains item-local while the sibling is schedulable");
   assert.equal((await readLedger(deps, "run-1")).items["200"].state, "ready");
-  assert.equal(recoveryCalls, 1);
+  assert.equal(recoveryCalls, 2);
 
   const terminalCycle = await runSupervisorCycle(
     { store: deps, observe, dispatchItem, executeRecovery },
@@ -4611,7 +4619,7 @@ test("regression (#787): a run_fatal class exhausted stops with reason run_fatal
 
   assert.equal(result.stop?.reason, "run_fatal", "workflow-engine-defect is run_fatal once its budget is exhausted");
   assert.equal(result.stop?.theme, "workflow-engine-defect");
-  assert.equal(recoveryCalls, 1);
+  assert.equal(recoveryCalls, 2);
 });
 
 test("regression (#787): a mid-pass run stop before a sibling's pass-2 recovery skips gracefully — no throw, no side effect, first-cause stop preserved", async () => {
@@ -5075,6 +5083,58 @@ function blockedRecoveryItem(id: string): LoopLedger["items"][string] {
     ],
   };
 }
+
+function blockedReviewRecoveryItem(id: string): LoopLedger["items"][string] {
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "review-findings",
+    reason: "Blocking review finding survived a verified repair cycle",
+    stage: "review-2",
+  });
+  return {
+    ...itemEntry(id, "blocked"),
+    blocked_theme: "review-findings",
+    history: [{
+      time: "2026-07-23T00:00:00.000Z",
+      from: "in_progress",
+      to: "blocked",
+      engine: "claude",
+      theme: "review-findings",
+      evidence: JSON.stringify({
+        schema: "pipeline/loop-recovery-evidence@1",
+        diagnostic,
+        transport: { pr_number: 12, pipeline_run_id: `advance-${id}` },
+      }),
+    }],
+  };
+}
+
+test("regression #797: review non-convergence enters substantive repair as its first durable action", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": blockedReviewRecoveryItem("100") });
+  const { deps } = await setup(contract, ledger);
+  const observe = blockedRecoveryObserve();
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async () => {
+    throw new Error("a blocked item must recover before redispatch");
+  };
+  const actions: string[] = [];
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    actions.push(input.action);
+    return { succeeded: false, evidence: "repair attempted", error: "fixture stops after action selection" };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.deepEqual(actions, ["repair_pipeline_item"]);
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.recovery_attempts[0].class, "review-findings");
+  assert.equal(finalLedger.recovery_attempts[0].action, "repair_pipeline_item");
+});
 
 /** Observe fake for the coexistence-guard tests: blocked items sit mid-pipeline
  *  (mirrors the seeded-blocked fake at "pipeline:review-1") with an observable

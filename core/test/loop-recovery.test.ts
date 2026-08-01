@@ -171,7 +171,10 @@ test("compileRecoveryPolicy: the default policy covers every DurableBlockerClass
 test("deterministic redispatch precedes provider-neutral model repair for mechanical blockers", () => {
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["workflow-state"].recipes, ["resync_workflow_state", "repair_pipeline_item"]);
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["implementation-ci"].recipes, ["rerun_ci", "repair_pipeline_item"]);
+  assert.deepEqual(DEFAULT_RECOVERY_POLICY["review-findings"].recipes, ["repair_pipeline_item"]);
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes, ["restart_workflow_engine", "repair_pipeline_item"]);
+  assert.equal(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].retry_budget, 2);
+  assert.equal(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].repeated_evidence_limit, 2);
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["environment-auth"].recipes, ["verify_authentication"]);
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["missing-authority"].recipes, []);
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["specification-decision"].recipes, []);
@@ -639,6 +642,34 @@ test("workflow-engine-defect can execute its provider-neutral repair recipe befo
   assert.equal(recovered.ledger.stop, null);
 });
 
+test("workflow-engine-defect budgets make the second repair recipe reachable after restart", async () => {
+  const { deps, contract, token } = await setup();
+  const evidence = "child dispatch failed";
+  await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "workflow-engine-defect", evidence,
+  });
+  const restarted = await recoverItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    actions: ["restart_workflow_engine"], candidateIdentity: "dispatch-1", succeeded: true,
+  });
+  assert.equal(restarted.ledger.items["100"].state, "in_progress");
+
+  await blockItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    blockerClass: "workflow-engine-defect", evidence,
+  });
+  const repaired = await recoverItem(deps, contract, {
+    runId: "run-1", token, itemId: "100", engine: "claude",
+    actions: ["repair_pipeline_item"], candidateIdentity: "dispatch-2", succeeded: true,
+  });
+
+  assert.equal(repaired.attempt.action, "repair_pipeline_item");
+  assert.equal(repaired.attempt.budget_remaining, 0);
+  assert.equal(repaired.ledger.items["100"].state, "in_progress");
+  assert.equal(repaired.ledger.stop, null);
+});
+
 test("a failed final action records item-local typed recovery exhaustion for a non-run-fatal class", async () => {
   const contract = testContract({
     recovery_policy: compileRecoveryPolicy({
@@ -822,6 +853,113 @@ test("upgradeContractForRecovery: a pre-#509 contract with no recovery_policy is
 
   const compiled = testContract();
   assert.equal(upgradeContractForRecovery(compiled), compiled, "an already-compiled contract is returned unchanged");
+});
+
+test("upgradeContractForRecovery: exact pre-#787 defaults gain deterministic repair recipes on resume", () => {
+  const legacyPolicy = structuredClone(DEFAULT_RECOVERY_POLICY) as unknown as Record<string, unknown>;
+  delete legacyPolicy["review-findings"];
+  legacyPolicy["workflow-state"] = {
+    recipes: ["resync_workflow_state"], retry_budget: 3,
+    backoff: { initial_seconds: 15, multiplier: 2, max_seconds: 300 },
+    terminal_outcome: "retry", run_fatal: false, repeated_evidence_limit: 2,
+  };
+  legacyPolicy["implementation-ci"] = {
+    recipes: ["rerun_ci"], retry_budget: 3,
+    backoff: { initial_seconds: 30, multiplier: 2, max_seconds: 600 },
+    terminal_outcome: "retry", run_fatal: false, repeated_evidence_limit: 2,
+  };
+  legacyPolicy["environment-auth"] = {
+    recipes: ["reauthenticate"], retry_budget: 2,
+    backoff: { initial_seconds: 10, multiplier: 2, max_seconds: 120 },
+    terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 2,
+  };
+  legacyPolicy["workflow-engine-defect"] = {
+    recipes: ["restart_workflow_engine"], retry_budget: 1,
+    backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
+    terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 1,
+  };
+  const legacy = {
+    ...testContract(),
+    recovery_policy: legacyPolicy,
+    canonical_hash: "immutable-run-identity",
+  } as unknown as LoopContract;
+
+  const upgraded = upgradeContractForRecovery(legacy);
+
+  assert.deepEqual(upgraded.recovery_policy["workflow-state"].recipes, ["resync_workflow_state", "repair_pipeline_item"]);
+  assert.deepEqual(upgraded.recovery_policy["implementation-ci"].recipes, ["rerun_ci", "repair_pipeline_item"]);
+  assert.deepEqual(upgraded.recovery_policy["review-findings"], DEFAULT_RECOVERY_POLICY["review-findings"]);
+  assert.deepEqual(upgraded.recovery_policy["workflow-engine-defect"].recipes, ["restart_workflow_engine", "repair_pipeline_item"]);
+  assert.equal(upgraded.recovery_policy["workflow-engine-defect"].retry_budget, 2);
+  assert.deepEqual(upgraded.recovery_policy["environment-auth"].recipes, ["verify_authentication"]);
+  assert.equal(upgraded.canonical_hash, "immutable-run-identity", "runtime migration must not rewrite run identity");
+});
+
+test("upgradeContractForRecovery: adding review recovery preserves unrelated custom policy entries", () => {
+  const legacyPolicy = structuredClone(DEFAULT_RECOVERY_POLICY) as unknown as Record<string, any>;
+  delete legacyPolicy["review-findings"];
+  legacyPolicy["implementation-ci"] = {
+    ...legacyPolicy["implementation-ci"],
+    recipes: ["repair_pipeline_item", "rerun_ci"],
+    retry_budget: 7,
+  };
+  legacyPolicy["workflow-engine-defect"] = {
+    recipes: ["restart_workflow_engine", "repair_pipeline_item"],
+    retry_budget: 1,
+    backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
+    terminal_outcome: "retry",
+    run_fatal: true,
+    repeated_evidence_limit: 1,
+  };
+
+  const upgraded = upgradeContractForRecovery({
+    ...testContract(),
+    recovery_policy: legacyPolicy,
+  } as unknown as LoopContract);
+
+  assert.deepEqual(upgraded.recovery_policy["implementation-ci"], legacyPolicy["implementation-ci"]);
+  assert.deepEqual(upgraded.recovery_policy["review-findings"], DEFAULT_RECOVERY_POLICY["review-findings"]);
+  assert.deepEqual(upgraded.recovery_policy["workflow-engine-defect"], DEFAULT_RECOVERY_POLICY["workflow-engine-defect"]);
+});
+
+test("upgradeContractForRecovery: custom entries keep their policy while legacy auth action is renamed", () => {
+  const customPolicy = structuredClone(DEFAULT_RECOVERY_POLICY) as unknown as Record<string, any>;
+  customPolicy["implementation-ci"] = {
+    recipes: ["repair_pipeline_item", "rerun_ci"],
+    retry_budget: 7,
+    backoff: { initial_seconds: 3, multiplier: 3, max_seconds: 99 },
+    terminal_outcome: "retry",
+    run_fatal: true,
+    repeated_evidence_limit: 5,
+  };
+  customPolicy["environment-auth"] = {
+    recipes: ["reauthenticate", "wait_and_retry"],
+    retry_budget: 4,
+    backoff: { initial_seconds: 2, multiplier: 4, max_seconds: 80 },
+    terminal_outcome: "retry",
+    run_fatal: false,
+    repeated_evidence_limit: 6,
+  };
+
+  const upgraded = upgradeContractForRecovery({
+    ...testContract(),
+    recovery_policy: customPolicy,
+  } as unknown as LoopContract);
+
+  assert.deepEqual(upgraded.recovery_policy["implementation-ci"], customPolicy["implementation-ci"]);
+  assert.deepEqual(upgraded.recovery_policy["environment-auth"], {
+    ...customPolicy["environment-auth"],
+    recipes: ["verify_authentication", "wait_and_retry"],
+  });
+});
+
+test("upgradeContractForRecovery: a complete malformed policy still fails closed", () => {
+  const malformed = structuredClone(DEFAULT_RECOVERY_POLICY) as unknown as Record<string, any>;
+  malformed["implementation-ci"] = { ...malformed["implementation-ci"], retry_budget: -1 };
+  assert.throws(
+    () => upgradeContractForRecovery({ ...testContract(), recovery_policy: malformed } as unknown as LoopContract),
+    (err: unknown) => err instanceof LoopError && err.loopFailureClass === "validation",
+  );
 });
 
 test("upgradeLedgerForRecovery: a pre-#509 ledger with no recovery_attempts is defaulted to an empty array", () => {

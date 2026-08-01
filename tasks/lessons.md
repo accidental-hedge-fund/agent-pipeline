@@ -26,3 +26,20 @@
   bypasses that controller and parks the same outcome.
 - Fail-closed authority means missing current authority proof stays engine-owned. Do not create a
   "conservative" human-resume-only hold from a label, outcome name, or old blocker-kind marker.
+- Do not defer a regression in newly shipped behavior into a later architectural milestone merely
+  because future issues own broader consolidation. Patch the broken release invariant now and add
+  only the remaining structural acceptance criteria to the future owners.
+- Review recurrence is evidence only when it is bound to the current run/candidate and follows an
+  actual repair attempt. Issue-wide comment history cannot prove same-candidate non-convergence.
+- Lifecycle regressions must use the production transition graph and run-identity boundaries in
+  their fixtures. A fabricated transition can make an unreachable recovery path look complete.
+- A recovery policy is internally inconsistent when its first action cannot change the failed
+  invariant or its retry/repeat budgets make a later recipe unreachable. Test recipe order through
+  the real supervisor, not only policy compilation.
+- A body hash proves integrity, not authorship of individual fields inside reviewer-controlled
+  prose. Security- or policy-relevant lineage must live in a typed, validated artifact field and
+  consumers must ignore lookalike prose markers.
+
+# Installer command discovery
+
+- `scripts/install.mjs` does not implement `--help`; invoking it with that flag falls through to the default all-host install. Read its usage header/docs or use an explicit supported dry run when inspecting installer behavior, and never run command-discovery probes from an unmerged worktree.

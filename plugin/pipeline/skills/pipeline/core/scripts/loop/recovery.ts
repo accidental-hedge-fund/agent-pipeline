@@ -149,6 +149,14 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy({
     run_fatal: false,
     repeated_evidence_limit: 2,
   },
+  "review-findings": {
+    recipes: ["repair_pipeline_item"],
+    retry_budget: 3,
+    backoff: { initial_seconds: 15, multiplier: 2, max_seconds: 300 },
+    terminal_outcome: "retry",
+    run_fatal: false,
+    repeated_evidence_limit: 2,
+  },
   "environment-auth": {
     recipes: ["verify_authentication"],
     retry_budget: 2,
@@ -183,13 +191,61 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy({
   },
   "workflow-engine-defect": {
     recipes: ["restart_workflow_engine", "repair_pipeline_item"],
-    retry_budget: 1,
+    retry_budget: 2,
     backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
     terminal_outcome: "retry",
     run_fatal: true,
-    repeated_evidence_limit: 1,
+    repeated_evidence_limit: 2,
   },
 });
+
+/** Exact stale defaults persisted by prior releases. These shapes are
+ * migrated entry-by-entry so custom recipes/budgets/backoff remain untouched. */
+const STALE_DEFAULT_POLICY_ENTRIES: Partial<Record<DurableBlockerClass, readonly Record<string, unknown>[]>> = {
+  "workflow-state": [{
+    recipes: ["resync_workflow_state"], retry_budget: 3,
+    backoff: { initial_seconds: 15, multiplier: 2, max_seconds: 300 },
+    terminal_outcome: "retry", run_fatal: false, repeated_evidence_limit: 2,
+  }],
+  "implementation-ci": [{
+    recipes: ["rerun_ci"], retry_budget: 3,
+    backoff: { initial_seconds: 30, multiplier: 2, max_seconds: 600 },
+    terminal_outcome: "retry", run_fatal: false, repeated_evidence_limit: 2,
+  }],
+  "environment-auth": [{
+    recipes: ["reauthenticate"], retry_budget: 2,
+    backoff: { initial_seconds: 10, multiplier: 2, max_seconds: 120 },
+    terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 2,
+  }],
+  "workflow-engine-defect": [
+    {
+      recipes: ["restart_workflow_engine"], retry_budget: 1,
+      backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
+      terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 1,
+    },
+    {
+      recipes: ["restart_workflow_engine", "repair_pipeline_item"], retry_budget: 1,
+      backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
+      terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 1,
+    },
+  ],
+};
+
+function samePolicyEntry(left: unknown, right: unknown): boolean {
+  if (!isPlainObject(left) || !isPlainObject(right)) return false;
+  if (!Array.isArray(left.recipes) || !Array.isArray(right.recipes)) return false;
+  if (left.recipes.length !== right.recipes.length || left.recipes.some((recipe, i) => recipe !== right.recipes[i])) {
+    return false;
+  }
+  if (!isPlainObject(left.backoff) || !isPlainObject(right.backoff)) return false;
+  return left.retry_budget === right.retry_budget &&
+    left.terminal_outcome === right.terminal_outcome &&
+    left.run_fatal === right.run_fatal &&
+    left.repeated_evidence_limit === right.repeated_evidence_limit &&
+    left.backoff.initial_seconds === right.backoff.initial_seconds &&
+    left.backoff.multiplier === right.backoff.multiplier &&
+    left.backoff.max_seconds === right.backoff.max_seconds;
+}
 
 /** A run-contract shape accepted at real initialization time: every
  *  {@link LoopContract} field except `recovery_policy`, which is either the
@@ -226,13 +282,42 @@ export async function initRecoverableRun(
 // The upgraded shape is written back on the next successful mutation.
 // ---------------------------------------------------------------------------
 
-/** Installs {@link DEFAULT_RECOVERY_POLICY} when `recovery_policy` is absent
- *  or missing a class (a pre-#509 contract has no such field at all). A
- *  no-op for an already-compiled contract. */
+/** Installs {@link DEFAULT_RECOVERY_POLICY} when `recovery_policy` is absent.
+ *  Persisted policies missing a newer class gain only that class's default;
+ *  exact stale defaults migrate entry-by-entry and custom entries survive. */
 export function upgradeContractForRecovery(contract: LoopContract): LoopContract {
   const policy = contract.recovery_policy;
-  const complete = policy && DURABLE_BLOCKER_CLASSES.every((cls) => policy[cls] !== undefined);
-  return complete ? contract : { ...contract, recovery_policy: DEFAULT_RECOVERY_POLICY };
+  if (policy === undefined) return { ...contract, recovery_policy: DEFAULT_RECOVERY_POLICY };
+  if (!isPlainObject(policy)) {
+    // Preserve fail-closed validation for malformed persisted contracts.
+    return { ...contract, recovery_policy: compileRecoveryPolicy(policy) };
+  }
+
+  let changed = false;
+  const migrated = { ...policy } as Record<string, unknown>;
+  for (const cls of DURABLE_BLOCKER_CLASSES) {
+    const entry = migrated[cls];
+    if (entry === undefined) {
+      migrated[cls] = DEFAULT_RECOVERY_POLICY[cls];
+      changed = true;
+      continue;
+    }
+    const staleDefaults = STALE_DEFAULT_POLICY_ENTRIES[cls] ?? [];
+    if (staleDefaults.some((staleDefault) => samePolicyEntry(entry, staleDefault))) {
+      migrated[cls] = DEFAULT_RECOVERY_POLICY[cls];
+      changed = true;
+      continue;
+    }
+    if (isPlainObject(entry) && Array.isArray(entry.recipes) && entry.recipes.includes("reauthenticate")) {
+      migrated[cls] = {
+        ...entry,
+        recipes: entry.recipes.map((recipe) => recipe === "reauthenticate" ? "verify_authentication" : recipe),
+      };
+      changed = true;
+    }
+  }
+  const compiled = compileRecoveryPolicy(migrated);
+  return changed ? { ...contract, recovery_policy: compiled } : contract;
 }
 
 /** Defaults `recovery_attempts` to `[]` when absent (a pre-#509 ledger has no

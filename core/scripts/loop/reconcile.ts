@@ -312,7 +312,11 @@ export function classifyDrift(
     // opening/merging the PR but before recording the transition (#511
     // review-2 finding: this branch used to hard-return null here and could
     // never recover such a crash).
-    if (verifiedForwardTarget(identity)) return "ledger-behind";
+    const target = verifiedForwardTarget(identity);
+    // Bare PR existence is weaker evidence than a durable engine-owned block.
+    // Only ready/merged truth may supersede blocked recovery state; otherwise
+    // an already-claimed action would be orphaned at pr_opened.
+    if (target && !(state === "blocked" && target === "pr_opened")) return "ledger-behind";
     return checksRegressed(bound, identity) ? "checks-regressed" : null;
   }
 

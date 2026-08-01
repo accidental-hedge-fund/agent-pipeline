@@ -284,10 +284,10 @@ test("runOverride (#135): override covering the only blocker auto-resumes and th
 });
 
 // ---------------------------------------------------------------------------
-// 2.2 some blockers remain → the resumed loop re-parks at needs-human
+// 2.2 some blockers remain → the resumed loop routes them through repair
 // ---------------------------------------------------------------------------
 
-test("runOverride (#135): override covering only one of two blockers re-parks at needs-human", async (t) => {
+test("runOverride (#135, #797): override covering only one of two blockers routes the remainder to fix", async (t) => {
   // Parked at needs-human after the round-2 ceiling: 3 prior verdict comments
   // (cap 3), then the ceiling comment. Overriding A still leaves B blocking.
   const priorR2 = (sha: string): Comment => ({
@@ -316,16 +316,17 @@ test("runOverride (#135): override covering only one of two blockers re-parks at
 
   assert.deepEqual(rec.flips, ["needs-human->review-2"], "must flip back to the ceiling round");
   assert.equal(rec.advances, 1);
-  // B is still blocking and the round is at its ceiling → re-park, never advance.
-  assert.deepEqual(review.rec.transitions, ["needs-human"], "remaining blocker → re-park at needs-human");
+  // B is still blocking but has no proven current-run fix attempt, so it keeps
+  // its repair opportunity instead of inheriting issue-wide ceiling history.
+  assert.deepEqual(review.rec.transitions, ["fix-2"], "remaining blocker → repair, not human authority");
   assert.ok(
-    !review.rec.transitions.some((to) => to === "pre-merge" || to === "ready-to-deploy"),
+    !review.rec.transitions.some((to) => to === "pre-merge" || to === "ready-to-deploy" || to === "needs-human"),
     "must NOT advance past an unresolved blocker",
   );
-  assert.equal((outcome as { to?: Stage } | undefined)?.to, "needs-human");
+  assert.equal((outcome as { to?: Stage } | undefined)?.to, "fix-2");
   assert.ok(
-    review.rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
-    "a fresh ceiling punch-list is posted on re-park",
+    !review.rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
+    "stale issue-wide history must not create another ceiling punch-list",
   );
 });
 

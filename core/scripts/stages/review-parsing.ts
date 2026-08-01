@@ -61,6 +61,8 @@ export interface ReviewArtifact {
   blockingKeys: string[];
   /** Review-1 risk tier, set on round-1 comments; null for round-2 and delta. */
   review1Risk: "low" | "standard" | null;
+  /** Child pipeline run that emitted this review. Absent on legacy artifacts. */
+  pipelineRunId?: string;
   /**
    * SHA-256 hex digest of the rendered comment body preceding this artifact
    * line (#390 review 1). Optional for backward compat with artifacts encoded
@@ -213,6 +215,8 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
       !Array.isArray(obj.blockingKeys) ||
       !obj.blockingKeys.every((k: unknown) => typeof k === "string") ||
       (obj.review1Risk !== null && obj.review1Risk !== "low" && obj.review1Risk !== "standard") ||
+      (obj.pipelineRunId !== undefined &&
+        (typeof obj.pipelineRunId !== "string" || !/^[A-Za-z0-9._:/-]+$/.test(obj.pipelineRunId))) ||
       (obj.bodyHash !== undefined && typeof obj.bodyHash !== "string") ||
       (obj.blockingFindings !== undefined && !isValidBlockingFindings(obj.blockingFindings)) ||
       (obj.advisoryFindings !== undefined && !isValidBlockingFindings(obj.advisoryFindings))
@@ -226,6 +230,7 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
       blockingKeys: obj.blockingKeys as string[],
       review1Risk: obj.review1Risk as "low" | "standard" | null,
     };
+    if (typeof obj.pipelineRunId === "string") artifact.pipelineRunId = obj.pipelineRunId;
     if (typeof obj.bodyHash === "string") artifact.bodyHash = obj.bodyHash;
     if (isValidBlockingFindings(obj.blockingFindings)) {
       artifact.blockingFindings = obj.blockingFindings;
@@ -269,6 +274,14 @@ export function isVerifiedPipelineReviewOutput(body: string): boolean {
   const prefix = rawPrefix.endsWith("\n") ? rawPrefix.slice(0, -1) : rawPrefix;
   if (typeof artifact.bodyHash !== "string") return false;
   return hashReviewBody(prefix) === artifact.bodyHash;
+}
+
+/** Return the child pipeline run that produced a verified review comment.
+ * Legacy comments intentionally return null: unbound issue history cannot
+ * prove a candidate-changing repair cycle. */
+export function extractReviewRunId(body: string): string | null {
+  if (!isVerifiedPipelineReviewOutput(body)) return null;
+  return extractReviewArtifact(body)?.pipelineRunId ?? null;
 }
 
 // ---------------------------------------------------------------------------
