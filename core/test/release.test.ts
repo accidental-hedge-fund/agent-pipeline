@@ -34,6 +34,8 @@ import {
   extractTheme,
   computeUnifiedDiff,
   runRelease,
+  resolvePreviousTagCreatedAt,
+  mapGhIssueToSoakCandidate,
   type ReleaseDeps,
   type ReleaseContext,
   type CommandResult,
@@ -2221,4 +2223,175 @@ test("buildPRBody: includes open-soak waiver section when provided", () => {
   assert.match(body, /#712/);
   assert.match(body, /#714/);
   assert.match(body, /accepted residual; tracked offline/);
+});
+
+test("resolvePreviousTagCreatedAt: prefers annotated taggerdate over commit creatordate", () => {
+  // Regression for a0f367e9: delayed tag whose target commit predates tagger time
+  // must use the tagger timestamp so pre-tag issues are not swept into the window.
+  const tagger = "2026-07-29T18:00:00Z";
+  const committer = "2026-07-28T10:00:00Z";
+  const iso = resolvePreviousTagCreatedAt(
+    "v1.29.0",
+    (cmd, args) => {
+      if (cmd === "git" && args[0] === "for-each-ref") {
+        return { code: 0, stdout: `${tagger}${"\0"}${committer}\n`, stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "log") {
+        return { code: 0, stdout: `${committer}\n`, stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: "unexpected" };
+    },
+    "/repo",
+  );
+  assert.equal(iso, tagger);
+});
+
+test("resolvePreviousTagCreatedAt: lightweight tag falls back to creatordate", () => {
+  const committer = "2026-07-28T10:00:00Z";
+  const iso = resolvePreviousTagCreatedAt(
+    "v1.29.0",
+    (cmd, args) => {
+      if (cmd === "git" && args[0] === "for-each-ref") {
+        return { code: 0, stdout: `${"\0"}${committer}\n`, stderr: "" };
+      }
+      return { code: 1, stdout: "", stderr: "" };
+    },
+    "/repo",
+  );
+  assert.equal(iso, committer);
+});
+
+test("mapGhIssueToSoakCandidate: projects typedDisposition and candidateRunIds", () => {
+  const mapped = mapGhIssueToSoakCandidate({
+    number: 712,
+    title: "engine defect",
+    state: "open",
+    created_at: "2026-07-30T00:00:00Z",
+    labels: [{ name: "enhancement" }],
+    body: [
+      "**Blocker class**: workflow-engine-defect",
+      "**Evidence fingerprint**: fp-attr",
+      "**Terminal stop**: yes",
+      "",
+      "### Affected run IDs",
+      "- loop-test",
+      "- frg-test-pass",
+    ].join("\n"),
+  });
+  assert.equal(mapped.typedDisposition, "workflow-engine-defect");
+  assert.deepEqual(mapped.candidateRunIds, ["loop-test", "frg-test-pass"]);
+  assert.equal(mapped.state, "OPEN");
+});
+
+test("runRelease: typed stage-diagnostic evidence blocks despite wrong labels and no open-list body match", async () => {
+  // Regression for 2a78a59f: injected typed diagnostic (no local ledger simulation)
+  // must block even when the open issue has wrong/missing labels.
+  const written: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => {
+      written.push(p);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "for-each-ref") {
+        return {
+          code: 0,
+          stdout: `2026-06-01T00:00:00Z${"\0"}2026-05-01T00:00:00Z\n`,
+          stderr: "",
+        };
+      }
+      if (cmd === "git" && args[0] === "log" && args.some((a) => a.includes("%cI"))) {
+        return { code: 0, stdout: "2026-05-01T00:00:00Z", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    requireFrgPass: async (_d, version) => defaultFrgPass(version),
+    listOpenSoakDefectCandidates: async () => [
+      {
+        number: 712,
+        title: "mislabeled soak defect",
+        state: "OPEN",
+        labels: ["enhancement"], // wrong labels — typed path must still block
+        body: "unrelated prose without soak markers",
+        createdAt: "2026-07-30T12:00:00Z",
+      },
+    ],
+    listTypedSoakEvidence: async () => [
+      {
+        issueNumber: 712,
+        loopRunId: "loop-test",
+        frgRunId: "frg-test-pass",
+        terminal: true,
+        recovered: false,
+        engineClass: true,
+        blockerClass: "workflow-engine-defect",
+        title: "stage-diagnostic workflow-engine-defect:sha256:abc",
+        reasonKey: "workflow-engine-defect",
+        fingerprint: "sha256:abc",
+      },
+    ],
+  });
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /#712/,
+  );
+  assert.equal(written.length, 0);
+});
+
+test("runRelease: delayed tag uses taggerdate so pre-tag issues stay outside fallback window", async () => {
+  // Commit dated day-1, annotated tag created day-3; issue created day-2 must not
+  // enter the post-tag label-fallback window when taggerdate is authoritative.
+  const written: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => {
+      written.push(p);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "for-each-ref") {
+        // tagger = day-3; creator/commit = day-1
+        return {
+          code: 0,
+          stdout: `2026-07-03T00:00:00Z${"\0"}2026-07-01T00:00:00Z\n`,
+          stderr: "",
+        };
+      }
+      if (cmd === "git" && args[0] === "log" && args.some((a) => a.includes("%cI"))) {
+        // Commit time is day-1 — using this alone would incorrectly include day-2 issues.
+        return { code: 0, stdout: "2026-07-01T00:00:00Z", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    requireFrgPass: async (_d, version) => defaultFrgPass(version),
+    listOpenSoakDefectCandidates: async () => [
+      {
+        number: 930,
+        title: "pre-tag engine defect",
+        state: "OPEN",
+        labels: ["bug", "pipeline:engine-class"],
+        body: "",
+        // After commit, before annotated tag → must NOT block via label-fallback.
+        createdAt: "2026-07-02T12:00:00Z",
+      },
+    ],
+    listTypedSoakEvidence: async () => [],
+  });
+  // Clean set (no typed hits; issue outside tagger window) → release proceeds past preflight.
+  // Dry-run still runs preflight; use dry-run to avoid full release path.
+  await runRelease("1.6.0", { dryRun: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+  assert.equal(written.length, 0);
 });

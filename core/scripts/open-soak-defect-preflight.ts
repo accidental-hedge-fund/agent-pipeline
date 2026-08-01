@@ -133,6 +133,13 @@ export interface OpenSoakDefectPreflightDeps {
    * When omitted, only issue body markers + label fallback participate.
    */
   listTypedSoakEvidence?: () => Promise<TypedSoakEvidence[]>;
+  /**
+   * Optional closed issues for fingerprint / issue-number reconciliation.
+   * Terminal ledger evidence with `issueNumber: null` must not emit a synthetic
+   * unlinked blocker when a closed GitHub issue already records that fingerprint
+   * (closing the defect clears the release gate).
+   */
+  listClosedIssues?: () => Promise<SoakDefectCandidateIssue[]>;
 }
 
 export interface BlockingSoakDefect {
@@ -205,9 +212,77 @@ export function hasEngineClassLabelFallback(issue: SoakDefectCandidateIssue): bo
   return labels.includes(BUG_LABEL) && labels.includes(ENGINE_CLASS_MARKER_LABEL);
 }
 
+/**
+ * Parse structured #760 / auto-file attribution from an issue body when present.
+ * Free-form prose alone is not enough — only explicit disposition/blocker-class
+ * lines and affected-run lists project into typed fields.
+ */
+export function projectIssueTypedAttribution(body: string | null | undefined): {
+  typedDisposition: string | null;
+  candidateRunIds: string[];
+  fingerprint: string | null;
+  /** True when the body explicitly records a terminal stop / exhaustion. */
+  terminalStop: boolean | null;
+} {
+  const text = body ?? "";
+  let typedDisposition: string | null = null;
+  const classMatch =
+    text.match(/\*\*Blocker class\*\*:\s*([a-z0-9-]+)/i) ??
+    text.match(/Blocker class:\s*([a-z0-9-]+)/i) ??
+    text.match(/typed[_ ]disposition:\s*([a-z0-9-]+)/i) ??
+    text.match(/disposition:\s*([a-z0-9-]+)/i);
+  if (classMatch) typedDisposition = classMatch[1]!.toLowerCase();
+
+  let fingerprint: string | null = null;
+  const fpMatch =
+    text.match(/\*\*Evidence fingerprint\*\*:\s*([^\s\n]+)/i) ??
+    text.match(/Evidence fingerprint:\s*([^\s\n]+)/i);
+  if (fpMatch) fingerprint = fpMatch[1]!.trim();
+
+  const candidateRunIds: string[] = [];
+  // Prefer the structured "Affected run IDs" section; also accept #763-style lists.
+  const runSection = text.match(
+    /(?:###\s*Affected run IDs|candidate[_ ]run[_ ]ids?)\s*:?\s*\n((?:[-*]\s*.+\n?)*)/i,
+  );
+  if (runSection) {
+    for (const line of runSection[1]!.split("\n")) {
+      const m = line.match(/^[-*]\s*`?([^\s`]+)`?\s*$/);
+      if (m) candidateRunIds.push(m[1]!);
+    }
+  }
+
+  let terminalStop: boolean | null = null;
+  const termMatch = text.match(/\*\*Terminal stop\*\*:\s*(yes|no)\b/i);
+  if (termMatch) terminalStop = termMatch[1]!.toLowerCase() === "yes";
+
+  return { typedDisposition, candidateRunIds, fingerprint, terminalStop };
+}
+
+/** Whether issue text / haystack contains a defect fingerprint token. */
+export function issueMatchesFingerprint(
+  issue: Pick<SoakDefectCandidateIssue, "title" | "body">,
+  fingerprint: string,
+): boolean {
+  if (!fingerprint || !fingerprint.trim()) return false;
+  const hay = `${issue.title}\n${issue.body ?? ""}`;
+  return hay.includes(fingerprint);
+}
+
 function createdAtMs(iso: string): number {
   const t = Date.parse(iso);
   return Number.isFinite(t) ? t : NaN;
+}
+
+/** Candidate-link check for typed evidence against soak ids. */
+function typedEvidenceLinkedToSoak(
+  ev: TypedSoakEvidence,
+  soakIds: string[],
+): boolean {
+  const evIds = [ev.loopRunId, ev.frgRunId].filter((x): x is string => !!x && x.trim() !== "");
+  // Caller-scoped lists (no ids on evidence) are treated as already candidate-scoped.
+  if (evIds.length === 0) return true;
+  if (soakIds.length === 0) return true;
+  return evIds.some((id) => soakIds.includes(id));
 }
 
 /**
@@ -250,9 +325,18 @@ export async function runOpenSoakDefectPreflight(
   const soakIds = soakIdentityIds(input.frgRunId, input.loopRunId);
   const openIssues = (await deps.listOpenIssues()).filter((i) => i.state === "OPEN");
   const openByNumber = new Map(openIssues.map((i) => [i.number, i]));
+  const closedIssues = deps.listClosedIssues
+    ? (await deps.listClosedIssues()).filter((i) => i.state === "CLOSED")
+    : [];
 
   const typed = deps.listTypedSoakEvidence ? await deps.listTypedSoakEvidence() : [];
   const blockingMap = new Map<string, BlockingSoakDefect>();
+  /**
+   * Issues for which usable typed evidence already determined recovered /
+   * non-terminal / non-engine-class (or already classified as typed). Label
+   * fallback MUST NOT override that determination (#755 review 2).
+   */
+  const suppressLabelFallback = new Set<number>();
 
   const addBlocking = (b: BlockingSoakDefect): void => {
     const key = blockingKey(b);
@@ -261,44 +345,17 @@ export async function runOpenSoakDefectPreflight(
     if (existing && existing.classificationSource === "typed") return;
     if (existing && b.classificationSource === "label-fallback") return;
     blockingMap.set(key, b);
+    if (b.issueNumber != null && b.classificationSource === "typed") {
+      suppressLabelFallback.add(b.issueNumber);
+    }
   };
 
-  // --- Typed evidence path (authoritative when present) ---
-  for (const ev of typed) {
-    if (!ev.engineClass) continue;
-    // Converged intermediate recoveries never block.
-    if (ev.recovered && !ev.terminal) continue;
-    if (!ev.terminal) continue;
-
-    // Attribute to candidate soak when run ids match (or evidence omits ids and
-    // the caller already scoped the list to this soak).
-    const evIds = [ev.loopRunId, ev.frgRunId].filter((x): x is string => !!x && x.trim() !== "");
-    if (evIds.length > 0 && soakIds.length > 0) {
-      const linked = evIds.some((id) => soakIds.includes(id));
-      if (!linked) continue;
-    }
-
-    const issueNum = ev.issueNumber ?? null;
-    if (issueNum != null) {
-      const open = openByNumber.get(issueNum);
-      if (!open) continue; // closed or missing — not an open release defect
-      addBlocking({
-        issueNumber: issueNum,
-        title: open.title || ev.title || `issue #${issueNum}`,
-        classificationSource: "typed",
-        reasonKey: ev.reasonKey ?? ev.blockerClass ?? "terminal-engine-class",
-      });
-      continue;
-    }
-
-    // Join ledger-terminal evidence to open issues only via defect-specific
-    // linkage (fingerprint, or matching typed blocker-class/disposition).
-    // Soak identity is an additional constraint — never sufficient alone
-    // (otherwise any open issue that merely mentions the soak run would block).
-    const matched = openIssues.filter((issue) => {
+  const openIssuesMatchingEvidence = (ev: TypedSoakEvidence): SoakDefectCandidateIssue[] => {
+    return openIssues.filter((issue) => {
+      // Explicit issue linkage is authoritative when present.
+      if (ev.issueNumber != null) return issue.number === ev.issueNumber;
       const hay = `${issue.title}\n${issue.body ?? ""}`;
-      const soakLinked =
-        soakIds.length === 0 || issueReferencesSoak(issue, soakIds);
+      const soakLinked = soakIds.length === 0 || issueReferencesSoak(issue, soakIds);
       if (!soakLinked) return false;
       // When evidence carries a fingerprint, that is the only join key —
       // do not fall through to class-level matching (would over-join).
@@ -322,6 +379,51 @@ export async function runOpenSoakDefectPreflight(
       }
       return false;
     });
+  };
+
+  // --- Typed coverage (including recovered / non-terminal / non-engine) ---
+  // Record issues that usable typed evidence already speaks for so label
+  // fallback cannot resurrect them as release blockers.
+  for (const ev of typed) {
+    if (!typedEvidenceLinkedToSoak(ev, soakIds)) continue;
+    const covers =
+      (ev.recovered && !ev.terminal) || !ev.terminal || !ev.engineClass;
+    if (!covers) continue;
+    if (ev.issueNumber != null) {
+      suppressLabelFallback.add(ev.issueNumber);
+      continue;
+    }
+    for (const open of openIssuesMatchingEvidence(ev)) {
+      suppressLabelFallback.add(open.number);
+    }
+  }
+
+  // --- Typed evidence path (authoritative when present) ---
+  for (const ev of typed) {
+    if (!ev.engineClass) continue;
+    // Converged intermediate recoveries never block.
+    if (ev.recovered && !ev.terminal) continue;
+    if (!ev.terminal) continue;
+    if (!typedEvidenceLinkedToSoak(ev, soakIds)) continue;
+
+    const issueNum = ev.issueNumber ?? null;
+    if (issueNum != null) {
+      const open = openByNumber.get(issueNum);
+      if (!open) continue; // closed or missing — not an open release defect
+      addBlocking({
+        issueNumber: issueNum,
+        title: open.title || ev.title || `issue #${issueNum}`,
+        classificationSource: "typed",
+        reasonKey: ev.reasonKey ?? ev.blockerClass ?? "terminal-engine-class",
+      });
+      continue;
+    }
+
+    // Join ledger-terminal evidence to open issues only via defect-specific
+    // linkage (fingerprint, or matching typed blocker-class/disposition).
+    // Soak identity is an additional constraint — never sufficient alone
+    // (otherwise any open issue that merely mentions the soak run would block).
+    const matched = openIssuesMatchingEvidence(ev);
     if (matched.length > 0) {
       for (const open of matched) {
         addBlocking({
@@ -334,7 +436,33 @@ export async function runOpenSoakDefectPreflight(
       continue;
     }
 
-    // Explicit typed projection without a joinable open issue (tests / ledger-only).
+    // Fingerprint present: reconcile against closed GitHub records before any
+    // synthetic unlinked blocker. A closed matching issue means the defect was
+    // resolved and MUST NOT reappear as a ledger-only block.
+    if (ev.fingerprint) {
+      const closedMatch = closedIssues.some(
+        (issue) =>
+          issueMatchesFingerprint(issue, ev.fingerprint!) &&
+          (soakIds.length === 0 || issueReferencesSoak(issue, soakIds)),
+      );
+      if (closedMatch) continue;
+      // Open+closed search found nothing → no GitHub-backed record for this
+      // fingerprint. Emit synthetic only when the evidence names a defect
+      // surface (title/reason) so empty shells do not invent blockers.
+      if (ev.title || ev.reasonKey) {
+        addBlocking({
+          issueNumber: null,
+          title: ev.title ?? ev.reasonKey ?? "typed terminal engine-class defect",
+          classificationSource: "typed",
+          reasonKey: ev.reasonKey ?? ev.blockerClass ?? "terminal-engine-class",
+        });
+      }
+      continue;
+    }
+
+    // No fingerprint and no open join: synthetic only for explicit ledger-only
+    // projections that are known not to have a GitHub-backed defect record
+    // (tests / pre-file terminal evidence without auto-file linkage).
     if (ev.title || ev.reasonKey) {
       addBlocking({
         issueNumber: null,
@@ -359,7 +487,8 @@ export async function runOpenSoakDefectPreflight(
     // for this issue. Window OR soak linkage required.
     if (!hasEngineClassLabelFallback(issue)) continue;
     if (!soakLinked && !inWindow) continue;
-    // If we already have a typed entry for this issue, skip label-fallback.
+    // Typed evidence already classified or determined recovered/non-engine.
+    if (suppressLabelFallback.has(issue.number)) continue;
     const existing = blockingMap.get(`n:${issue.number}`);
     if (existing?.classificationSource === "typed") continue;
     addBlocking({

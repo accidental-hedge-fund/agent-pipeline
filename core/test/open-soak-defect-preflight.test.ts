@@ -559,3 +559,107 @@ test("issue body markers alone without terminal ledger evidence do not block as 
   assert.equal(result.ok, true);
   assert.deepEqual(result.blocking, []);
 });
+
+test("closed fingerprint-matched issue clears null-issueNumber ledger evidence (no synthetic blocker)", async () => {
+  // Regression for 4fb12f08: production typed projection always sets issueNumber
+  // null. When the auto-filed issue was closed, open-list join fails and must
+  // NOT fall through to a (no issue number) synthetic block.
+  const result = await runOpenSoakDefectPreflight(BASE_INPUT, {
+    listOpenIssues: async () => [],
+    listClosedIssues: async () => [
+      {
+        number: 712,
+        title: "Durable-run blocker: workflow-engine-defect:fp-closed",
+        state: "CLOSED",
+        labels: [BUG_LABEL, ENGINE_CLASS_MARKER_LABEL],
+        body: [
+          "Evidence fingerprint: fp-closed",
+          "Affected run IDs",
+          "- loop-4d2de11c6c029a2f-s1",
+          "Blocker class: workflow-engine-defect",
+        ].join("\n"),
+        createdAt: "2026-07-28T00:00:00Z",
+      },
+    ],
+    listTypedSoakEvidence: async (): Promise<TypedSoakEvidence[]> => [
+      {
+        issueNumber: null,
+        loopRunId: "loop-4d2de11c6c029a2f-s1",
+        terminal: true,
+        recovered: false,
+        engineClass: true,
+        blockerClass: "workflow-engine-defect",
+        fingerprint: "fp-closed",
+        title: "durable-run blocker workflow-engine-defect:fp-closed",
+        reasonKey: "workflow-engine-defect",
+      },
+    ],
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.blocking, []);
+});
+
+test("recovered typed evidence suppresses label-fallback on same issue", async () => {
+  // Regression for 6d2381fd: candidate-linked typed evidence with
+  // terminal:false recovered:true must suppress bug+engine-class label fallback.
+  const result = await runOpenSoakDefectPreflight(BASE_INPUT, {
+    listOpenIssues: async () => [
+      openIssue({
+        number: 920,
+        title: "converged intermediate still labeled engine-class",
+        body: [
+          "Evidence fingerprint: fp-recovered-labels",
+          "Affected run IDs",
+          "- loop-4d2de11c6c029a2f-s1",
+          "Blocker class: workflow-engine-defect",
+          "Recovered in-run.",
+        ].join("\n"),
+        labels: [BUG_LABEL, ENGINE_CLASS_MARKER_LABEL, BACKLOG_LABEL],
+        createdAt: "2026-07-30T12:00:00Z",
+      }),
+    ],
+    listTypedSoakEvidence: async (): Promise<TypedSoakEvidence[]> => [
+      {
+        issueNumber: 920,
+        loopRunId: "loop-4d2de11c6c029a2f-s1",
+        terminal: false,
+        recovered: true,
+        engineClass: true,
+        blockerClass: "workflow-engine-defect",
+        fingerprint: "fp-recovered-labels",
+        title: "mid-run recovered",
+        reasonKey: "recovered-intermediate",
+      },
+    ],
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.blocking, []);
+});
+
+test("recovered typed evidence by fingerprint suppresses label-fallback without issueNumber", async () => {
+  const result = await runOpenSoakDefectPreflight(BASE_INPUT, {
+    listOpenIssues: async () => [
+      openIssue({
+        number: 921,
+        title: "labels present after recovery",
+        body: "Evidence fingerprint: fp-rec-fp-only\nloop-4d2de11c6c029a2f-s1",
+        labels: [BUG_LABEL, ENGINE_CLASS_MARKER_LABEL],
+        createdAt: "2026-07-30T12:00:00Z",
+      }),
+    ],
+    listTypedSoakEvidence: async (): Promise<TypedSoakEvidence[]> => [
+      {
+        issueNumber: null,
+        loopRunId: "loop-4d2de11c6c029a2f-s1",
+        terminal: false,
+        recovered: true,
+        engineClass: true,
+        fingerprint: "fp-rec-fp-only",
+        title: "recovered",
+        reasonKey: "recovered-intermediate",
+      },
+    ],
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.blocking, []);
+});
