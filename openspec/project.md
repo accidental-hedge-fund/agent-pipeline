@@ -2,9 +2,10 @@
 
 ## Purpose
 A label-driven pipeline that advances a GitHub issue (or a PR's linked issue)
-through an 11-stage state machine to `pipeline:ready-to-deploy`. It ships as a
-skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)** from a single
-shared TypeScript core; the two hosts differ only by a JSON profile.
+through a 16-stage state machine (code `STAGES` in `core/scripts/types.ts`,
+including the terminal park off-ramp `needs-human`) to `pipeline:ready-to-deploy`.
+It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)**
+from a single shared TypeScript core; the two hosts differ only by a JSON profile.
 
 ## Tech & layout
 - Node ≥ 24. The core is TypeScript run via native type-stripping — no build step.

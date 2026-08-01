@@ -15,9 +15,10 @@ This skill keeps the old `/pipeline` workflow as Codex skill `$pipeline`.
 Treat the text after `$pipeline`, `/pipeline`, or the natural-language request as the argument string.
 
 Self-contained TypeScript skill that advances a GitHub issue (or PR's linked
-issue) through a 13-stage label-driven state machine, ending at
-`pipeline:ready-to-deploy`. The pipeline does NOT auto-merge — the user owns
-the merge button.
+issue) through a 16-stage label-driven state machine, ending at
+`pipeline:ready-to-deploy` on the happy path (or parking at `pipeline:needs-human`
+when review ceilings / similar paths exhaust). The pipeline does NOT auto-merge —
+the user owns the merge button.
 
 ## Developing this skill itself (core/ → plugin/ mirror)
 
@@ -30,10 +31,19 @@ of `core/` (+ `hosts/claude`). After editing any file under `core/`, run
 
 ## State machine
 
+Happy path (16 stages total in code `STAGES`, including the park off-ramp):
+
 ```
-backlog → ready → planning → implementing
+backlog → ready → planning → plan-review → implementing → design-gate
               → review-1 → fix-1 → review-2 → fix-2
-              → pre-merge → eval-gate → shipcheck-gate → ready-to-deploy
+              → pre-merge → visual-gate → eval-gate → shipcheck-gate
+              → ready-to-deploy
+```
+
+Terminal off-ramp (not a happy-path successor of `ready-to-deploy`):
+
+```
+… review ceilings / exhaustion → needs-human
 ```
 
 Each item carries one `pipeline:<stage>` label and at most one `blocked`
@@ -44,6 +54,8 @@ stage logic. There is no separate orchestrator process.
 
 `backlog` is a triage marker (e.g. set by `$sweep`). `$pipeline` starts work
 at `ready` and only acts on items that already carry a `pipeline:*` label.
+`needs-human` is a terminal park state (review-ceiling punch list, etc.); the
+advance loop never auto-advances from it to `ready-to-deploy`.
 
 ## Modes
 
