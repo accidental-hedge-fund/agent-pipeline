@@ -173,9 +173,20 @@ pipeline factory-gate --for 1.29.1 --from-run <loop-run-id> [--json] [--no-close
 
 1. Looks up `.agent-pipeline/frg/<version>/latest.json`.
 2. **Fails closed** when missing, unparsable, `pass: false`, or empty `run_id`.
-3. On success, includes an FRG section on the release PR body (`run_id`, pass summary).
-4. Still runs `npm run ci` (additive). Neither gate alone is sufficient.
-5. Does **not** merge or tag because FRG passed.
+3. **Open soak-defect preflight (#755)** — with FRG `loop_run_id` / `run_id` available, **fails closed** when open engine-class soak defects are attributable to that candidate (typed terminal / recovery-exhaustion evidence preferred; `bug` + `pipeline:engine-class` label fallback for historical records). Runs **before** any version-file mutation. A recoverable intermediate that converged in-run does **not** block.
+4. On success, includes an FRG section on the release PR body (`run_id`, pass summary). When the audited override was used, also includes a waiver section (waived issue numbers + reason).
+5. Still runs `npm run ci` (additive). FRG, open-soak preflight, and CI are independent; none alone is sufficient.
+6. Does **not** merge or tag because FRG/open-soak passed.
+
+### Open soak-defect override (audited only)
+
+When open candidate-linked engine-class defects must not hold a deliberate release:
+
+```bash
+pipeline release <X.Y.Z> --allow-open-soak-defects "<non-empty reason>"
+```
+
+The reason is recorded on the release PR body. **Silent skip is not available** (no env/config default clears this gate).
 
 Remediation message always points at this runbook and:
 
@@ -189,6 +200,7 @@ pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id>
 - [ ] Result shows **pass** for the **same** version as the release
 - [ ] Artifact path or digest available for auditors
 - [ ] Engine-class rate and clean-ready counts meet thresholds
+- [ ] Open engine-class soak defects from the candidate soak are closed **or** an audited `--allow-open-soak-defects` waiver section is on the PR body (#755)
 
 Unrecorded local claims (“we soaked it”) **do not** satisfy the attachment requirement.
 

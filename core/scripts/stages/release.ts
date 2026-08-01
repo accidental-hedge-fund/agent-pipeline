@@ -1,26 +1,41 @@
 // Release sub-command (#170): prepares a release PR by:
 // 1. Resolving the version (alias → semver)
 // 2. Requiring a Factory Reliability Gate pass for that version (#723)
+// 2c. Failing closed on open candidate-linked engine-class soak defects (#755)
 // 3. Bumping both package.json files
 // 4. Regenerating the plugin/ mirror (node scripts/build.mjs)
 // 5. Running the CI gate (npm run ci)
 // 6. Scaffolding ROADMAP.md at four mutation sites
 // 7. Opening $EDITOR for human confirmation (skipped under --no-edit / --dry-run)
-// 8. Committing on a new branch and opening a release PR (body includes FRG run_id)
+// 8. Committing on a new branch and opening a release PR (body includes FRG run_id
+//    and, when used, open-soak-defect override evidence)
 //
 // Stops at the open PR — does not tag, merge, or publish (the post-merge
-// release.yml workflow handles those after a human merges). FRG check also
-// never merges or tags.
+// release.yml workflow handles those after a human merges). FRG and open-soak
+// preflights also never merge or tag.
 
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import {
+  classifyFrgBlocker,
   formatFrgPrSection,
   requireFrgPassForRelease,
   type FrgEvidence,
   type FrgFsDeps,
 } from "../factory-reliability-gate.ts";
+import {
+  formatOpenSoakDefectWaiverSection,
+  runOpenSoakDefectPreflight,
+  type BlockingSoakDefect,
+  type OpenSoakDefectWaiver,
+  type SoakDefectCandidateIssue,
+  type TypedSoakEvidence,
+} from "../open-soak-defect-preflight.ts";
+import {
+  defaultLoopStoreDeps,
+  readDurableRunBlockerOccurrences,
+} from "../loop/store.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -35,6 +50,12 @@ export interface ReleaseOpts {
    * matching milestone title → {@link PLAN_ROW_THEME_PLACEHOLDER}.
    */
   theme?: string;
+  /**
+   * Audited override reason to proceed despite open engine-class soak defects
+   * (#755). Must be non-empty when a blocking set exists. Recorded on the
+   * release PR body. There is no silent env/config skip.
+   */
+  allowOpenSoakDefects?: string;
 }
 
 export interface ShippedPR {
@@ -134,6 +155,20 @@ export interface ReleaseDeps {
    * ensure solely on milestone fetch. Dry-run paths typically omit the call.
    */
   fetchMilestoneForVersion?(version: string): Promise<ReleaseMilestoneInfo | null>;
+  /**
+   * Open soak-defect candidate issues for release preflight (#755).
+   * Defaults to a paginated `gh api` issue list. Tests inject fakes — never
+   * rely on real network. Missing injection in tests should return `[]`.
+   */
+  listOpenSoakDefectCandidates?(): Promise<SoakDefectCandidateIssue[]>;
+  /**
+   * Typed terminal/recovery soak evidence for the candidate FRG/loop run (#755).
+   * Defaults to durable-loop blocker occurrences for the FRG `loop_run_id`.
+   */
+  listTypedSoakEvidence?(args: {
+    loopRunId: string | null;
+    frgRunId: string;
+  }): Promise<TypedSoakEvidence[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +320,93 @@ export function realReleaseDeps(repoDir?: string): ReleaseDeps {
         return null;
       }
     },
+    listOpenSoakDefectCandidates: async () => listOpenSoakDefectCandidatesReal(repoDir),
+    listTypedSoakEvidence: async ({ loopRunId, frgRunId }) =>
+      listTypedSoakEvidenceReal(loopRunId, frgRunId),
   };
+}
+
+/** Real gh-backed open-issue listing for open-soak-defect preflight (#755). */
+function listOpenSoakDefectCandidatesReal(repoDir?: string): SoakDefectCandidateIssue[] {
+  const result = spawnSync(
+    "gh",
+    [
+      "api",
+      "repos/{owner}/{repo}/issues?state=open&per_page=100",
+      "--paginate",
+      "--slurp",
+    ],
+    { encoding: "utf8", stdio: "pipe", cwd: repoDir, maxBuffer: 50 * 1024 * 1024 },
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      `[pipeline release] open-soak-defect preflight: gh issue list failed: ${result.stderr?.trim() || `exit ${result.status}`}`,
+    );
+  }
+  let pages: Array<
+    Array<{
+      number: number;
+      title: string;
+      state: string;
+      created_at: string;
+      body?: string | null;
+      labels?: Array<{ name: string }>;
+      pull_request?: unknown;
+    }>
+  >;
+  try {
+    pages = JSON.parse(result.stdout || "[]") as typeof pages;
+  } catch (err) {
+    throw new Error(
+      `[pipeline release] open-soak-defect preflight: could not parse issue list: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  return pages
+    .flat()
+    .filter((i) => i && typeof i.number === "number" && !i.pull_request)
+    .map((i) => ({
+      number: i.number,
+      title: i.title ?? "",
+      state: (i.state?.toLowerCase() === "closed" ? "CLOSED" : "OPEN") as "OPEN" | "CLOSED",
+      createdAt: i.created_at ?? "",
+      labels: (i.labels ?? []).map((l) => l.name),
+      body: i.body ?? "",
+    }));
+}
+
+/**
+ * Project durable-loop blocker occurrences for the candidate soak into typed
+ * preflight evidence. Terminal + engine-class → blocking candidate; non-terminal
+ * recovered intermediates are marked recovered so they do not block alone.
+ */
+async function listTypedSoakEvidenceReal(
+  loopRunId: string | null,
+  frgRunId: string,
+): Promise<TypedSoakEvidence[]> {
+  const occurrences = await readDurableRunBlockerOccurrences(defaultLoopStoreDeps());
+  const out: TypedSoakEvidence[] = [];
+  for (const occ of occurrences) {
+    if (loopRunId && occ.runId !== loopRunId) continue;
+    // When loop_run_id is absent, do not invent cross-run attribution from the
+    // whole host ledger — only FRG-linked loop id scopes typed evidence.
+    if (!loopRunId) continue;
+    const engineClass = classifyFrgBlocker(occ.blockerClass) === "engine-class";
+    out.push({
+      issueNumber: null,
+      loopRunId: occ.runId,
+      frgRunId,
+      terminal: occ.terminal,
+      // Non-terminal occurrences in a completed run are treated as recovered
+      // intermediates unless still terminal at stop.
+      recovered: !occ.terminal,
+      engineClass,
+      blockerClass: occ.blockerClass,
+      title: `durable-run blocker ${occ.blockerClass}:${occ.fingerprint}`,
+      reasonKey: occ.blockerClass,
+      fingerprint: occ.fingerprint,
+    });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,6 +1191,10 @@ export function buildPRBody(
   ctx: ReleaseContext,
   lastTag: string,
   frg?: FrgEvidence | null,
+  openSoakWaiver?: {
+    waived: OpenSoakDefectWaiver;
+    blocking: BlockingSoakDefect[];
+  } | null,
 ): string {
   const { version, theme, date, shippedPRs } = ctx;
   const since = lastTag ? `\`${lastTag}\`` : "the beginning";
@@ -1079,6 +1204,10 @@ export function buildPRBody(
       : "_(no merged PRs detected — fill in manually)_";
 
   const frgSection = frg ? ["", formatFrgPrSection(frg), ""] : [];
+  const waiverSection =
+    openSoakWaiver && openSoakWaiver.waived
+      ? ["", formatOpenSoakDefectWaiverSection(openSoakWaiver.waived, openSoakWaiver.blocking), ""]
+      : [];
 
   return [
     `## Release: v${version} — ${theme}`,
@@ -1089,6 +1218,7 @@ export function buildPRBody(
     "",
     prLines,
     ...frgSection,
+    ...waiverSection,
     "---",
     "",
     "**Merging this PR is the final step.** It auto-tags the merge commit " +
@@ -1208,6 +1338,60 @@ export async function runRelease(
     d.stdout("[pipeline release] no previous tag found; git log range: HEAD");
   }
 
+  // 3b. Open soak-defect preflight (#755) — after FRG identity is known and the
+  // previous tag is resolved, before any version-file mutation. Live and dry-run.
+  // Merge-queue release-when-complete reuses this same runRelease gate (no bypass).
+  let previousTagCreatedAt: string | null = null;
+  if (lastTag) {
+    const tagDateResult = d.runCommand(
+      "git",
+      ["log", "-1", "--format=%cI", lastTag],
+      { cwd: repoDir },
+    );
+    if (tagDateResult.code === 0 && tagDateResult.stdout.trim()) {
+      previousTagCreatedAt = tagDateResult.stdout.trim();
+    }
+  }
+
+  d.stdout("[pipeline release] checking open engine-class soak defects for candidate...");
+  const listOpen =
+    d.listOpenSoakDefectCandidates ?? (async () => [] as SoakDefectCandidateIssue[]);
+  const listTyped =
+    d.listTypedSoakEvidence ??
+    (async () => [] as TypedSoakEvidence[]);
+  const soakPreflight = await runOpenSoakDefectPreflight(
+    {
+      version: resolvedVersion,
+      frgRunId: frgEvidence.run_id,
+      loopRunId: frgEvidence.loop_run_id,
+      previousTag: lastTag || null,
+      previousTagCreatedAt,
+      overrideReason: opts.allowOpenSoakDefects,
+    },
+    {
+      listOpenIssues: listOpen,
+      listTypedSoakEvidence: () =>
+        listTyped({
+          loopRunId: frgEvidence.loop_run_id,
+          frgRunId: frgEvidence.run_id,
+        }),
+    },
+  );
+  if (!soakPreflight.ok) {
+    throw new Error(soakPreflight.message);
+  }
+  const openSoakWaiver =
+    soakPreflight.waived != null
+      ? { waived: soakPreflight.waived, blocking: soakPreflight.blocking }
+      : null;
+  if (openSoakWaiver) {
+    d.stdout(
+      `[pipeline release] open-soak-defect override accepted for ${openSoakWaiver.waived.issueNumbers.map((n) => `#${n}`).join(", ") || "(defects)"} — reason recorded on PR body`,
+    );
+  } else {
+    d.stdout("[pipeline release] open-soak-defect preflight: no blocking open engine-class defects");
+  }
+
   // 4. Read ROADMAP and resolve theme / plan-row issue sources.
   //    Dry-run stays local-only (no milestone fetch). Live path may soft-fetch a
   //    matching milestone for theme/issues when scaffolding a missing plan row (#730).
@@ -1238,7 +1422,8 @@ export async function runRelease(
     milestoneTitle,
   });
 
-  // --- Dry-run path: local-only, no file writes, no GitHub API calls ---
+  // --- Dry-run path: no file writes. Open-soak preflight already ran (may use
+  // injected gh/list deps). Shipped-PR title/closing-issue discovery stays local. ---
   if (opts.dryRun) {
     // Discover PR numbers from git log only (localOnly=true skips fetchPRTitle → gh).
     const shippedPRs = await discoverShippedPRs(lastTag, repoDir, d, /* localOnly= */ true);
@@ -1262,7 +1447,7 @@ export async function runRelease(
     const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx);
     const roadmapDiff = computeUnifiedDiff(roadmapText, patchedRoadmap, "a/ROADMAP.md", "b/ROADMAP.md");
 
-    const prBody = buildPRBody(ctx, lastTag, frgEvidence);
+    const prBody = buildPRBody(ctx, lastTag, frgEvidence, openSoakWaiver);
 
     d.stdout(`\n=== Resolved version: ${resolvedVersion} ===\n`);
     d.stdout(`=== package.json diff ===`);
@@ -1414,7 +1599,7 @@ export async function runRelease(
       shippedPRs, shippedIssueNumbers, planIssueNumbers,
     };
     const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx, (msg) => d.stderr(msg));
-    prBody = buildPRBody(ctx, lastTag, frgEvidence);
+    prBody = buildPRBody(ctx, lastTag, frgEvidence, openSoakWaiver);
 
     // 12. Write scaffolded ROADMAP to disk.
     d.stdout("[pipeline release] writing scaffolded ROADMAP.md...");

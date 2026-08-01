@@ -2005,3 +2005,220 @@ test("runRelease: FRG check does not invoke merge or tag commands", async () => 
     "must not merge because FRG passed",
   );
 });
+
+// ---------------------------------------------------------------------------
+// Open soak-defect preflight (#755)
+// ---------------------------------------------------------------------------
+
+test("runRelease: open soak defects abort before package.json mutation", async () => {
+  const written: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => {
+      written.push(p);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log" && args.some((a) => a.includes("%cI"))) {
+        return { code: 0, stdout: "2026-06-01T00:00:00Z", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    requireFrgPass: async (_d, version) => defaultFrgPass(version),
+    listOpenSoakDefectCandidates: async () => [
+      {
+        number: 712,
+        title: "engine soak defect",
+        state: "OPEN",
+        labels: [],
+        body: "loop-test Blocker class: workflow-engine-defect",
+        createdAt: "2026-07-30T12:00:00Z",
+      },
+    ],
+    listTypedSoakEvidence: async () => [
+      {
+        issueNumber: 712,
+        loopRunId: "loop-test",
+        terminal: true,
+        recovered: false,
+        engineClass: true,
+        blockerClass: "workflow-engine-defect",
+      },
+    ],
+  });
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /open engine-class soak defects block release preparation for v1\.6\.0/,
+  );
+  assert.equal(written.length, 0, "must not mutate version files when open soak defects block");
+});
+
+test("runRelease dry-run: open soak defects still block (no mutation)", async () => {
+  const written: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => {
+      written.push(p);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log" && args.some((a) => a.includes("%cI"))) {
+        return { code: 0, stdout: "2026-06-01T00:00:00Z", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    listOpenSoakDefectCandidates: async () => [
+      {
+        number: 714,
+        title: "dry-run block",
+        state: "OPEN",
+        labels: ["bug", "pipeline:engine-class"],
+        body: "",
+        createdAt: "2026-07-01T00:00:00Z",
+      },
+    ],
+  });
+  await assert.rejects(
+    () => runRelease("1.6.0", { dryRun: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /#714/,
+  );
+  assert.equal(written.length, 0);
+});
+
+test("runRelease: allow-open-soak-defects override records waiver on PR body", async () => {
+  let prBody = "";
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "log" && args.some((a) => a.includes("%cI"))) {
+        return { code: 0, stdout: "2026-06-01T00:00:00Z", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "create") {
+        const bodyIdx = args.indexOf("--body");
+        prBody = bodyIdx >= 0 ? args[bodyIdx + 1]! : "";
+        return { code: 0, stdout: "https://github.com/org/repo/pull/999", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    listOpenSoakDefectCandidates: async () => [
+      {
+        number: 712,
+        title: "waived engine defect",
+        state: "OPEN",
+        labels: [],
+        body: "loop-test workflow-engine-defect",
+        createdAt: "2026-07-30T12:00:00Z",
+      },
+    ],
+    listTypedSoakEvidence: async () => [
+      {
+        issueNumber: 712,
+        loopRunId: "loop-test",
+        terminal: true,
+        recovered: false,
+        engineClass: true,
+      },
+    ],
+  });
+  await runRelease(
+    "1.6.0",
+    { noEdit: true, allowOpenSoakDefects: "accepted residual; tracked offline" },
+    { repo_dir: "/repo", repo: "org/repo" },
+    deps,
+  );
+  assert.match(prBody, /Open soak-defect override/);
+  assert.match(prBody, /#712/);
+  assert.match(prBody, /accepted residual; tracked offline/);
+});
+
+test("runRelease: empty override reason still fails closed on open defects", async () => {
+  const written: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => {
+      written.push(p);
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log" && args.some((a) => a.includes("%cI"))) {
+        return { code: 0, stdout: "2026-06-01T00:00:00Z", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    listOpenSoakDefectCandidates: async () => [
+      {
+        number: 712,
+        title: "still blocks",
+        state: "OPEN",
+        labels: ["bug", "pipeline:engine-class"],
+        body: "",
+        createdAt: "2026-07-01T00:00:00Z",
+      },
+    ],
+  });
+  await assert.rejects(
+    () =>
+      runRelease(
+        "1.6.0",
+        { noEdit: true, allowOpenSoakDefects: "  " },
+        { repo_dir: "/repo", repo: "org/repo" },
+        deps,
+      ),
+    /open engine-class soak defects/,
+  );
+  assert.equal(written.length, 0);
+});
+
+test("runRelease: clean open-defect set does not invent waiver section", async () => {
+  let prBody = "";
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "create") {
+        const bodyIdx = args.indexOf("--body");
+        prBody = bodyIdx >= 0 ? args[bodyIdx + 1]! : "";
+        return { code: 0, stdout: "https://github.com/org/repo/pull/999", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    listOpenSoakDefectCandidates: async () => [],
+    listTypedSoakEvidence: async () => [],
+  });
+  await runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+  assert.ok(!/Open soak-defect override/.test(prBody), "waiver section only when override used");
+  assert.match(prBody, /Factory Reliability Gate/);
+});
+
+test("buildPRBody: includes open-soak waiver section when provided", () => {
+  const body = buildPRBody(SAMPLE_CTX, "v1.5.0", defaultFrgPass("1.6.0"), {
+    waived: { issueNumbers: [712, 714], reason: "accepted residual; tracked offline" },
+    blocking: [
+      { issueNumber: 712, title: "a", classificationSource: "typed" },
+      { issueNumber: 714, title: "b", classificationSource: "label-fallback" },
+    ],
+  });
+  assert.match(body, /#712/);
+  assert.match(body, /#714/);
+  assert.match(body, /accepted residual; tracked offline/);
+});
