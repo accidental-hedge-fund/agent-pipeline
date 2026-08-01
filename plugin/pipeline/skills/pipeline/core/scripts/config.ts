@@ -218,6 +218,12 @@ const ExecutorDefinitionSchema = z.discriminatedUnion("type", [
 const PartialConfigSchema = z.object({
   repo: z.string().optional().describe("GitHub repository in 'owner/name' format (overrides auto-detected value)."),
   base_branch: z.string().optional().describe("Branch that PRs target and worktrees branch from."),
+  supersede_mode: z
+    .enum(["close", "comment-only"])
+    .optional()
+    .describe(
+      'After managed PR create/reuse, dispose other open associated same-base PRs for the issue: "close" (default) with a pipeline-superseded comment, or "comment-only" (notice only, leave open).',
+    ),
   worktree_root: z.string().optional().describe("Directory (relative to repo root) where pipeline worktrees are created."),
   max_concurrent_worktrees: z.number().int().positive().optional().describe("Maximum number of simultaneous in-flight worktrees."),
   auto_recovery_max_retries: z.number().int().min(0).optional().describe("Number of auto-recovery attempts when implementation blocks."),
@@ -982,6 +988,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     repo: fileConfig.repo ?? repo,
     repo_dir: repoDir,
     base_branch: opts.baseBranch ?? fileConfig.base_branch ?? DEFAULT_CONFIG.base_branch,
+    supersede_mode: fileConfig.supersede_mode ?? DEFAULT_CONFIG.supersede_mode,
     worktree_root: fileConfig.worktree_root ?? DEFAULT_CONFIG.worktree_root,
     max_concurrent_worktrees:
       fileConfig.max_concurrent_worktrees ?? DEFAULT_CONFIG.max_concurrent_worktrees,
@@ -2134,6 +2141,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     ...optionalTop,
     optionalTop.length ? "" : undefined,
     `base_branch: ${yamlScalar(config.base_branch ?? d.base_branch)} # ${sd("base_branch", "branch PRs target and worktrees branch from")}`,
+    `supersede_mode: ${yamlScalar(config.supersede_mode ?? d.supersede_mode)} # ${sd("supersede_mode", 'after managed PR create/reuse: close (default) or comment-only for other open associated same-base PRs on different heads (#729)')}`,
     `worktree_root: ${yamlScalar(config.worktree_root ?? d.worktree_root)} # ${sd("worktree_root", "dir (relative to repo) holding pipeline worktrees")}`,
     `max_concurrent_worktrees: ${yamlScalar(config.max_concurrent_worktrees ?? d.max_concurrent_worktrees)} # ${sd("max_concurrent_worktrees", "cap on simultaneous in-flight worktrees")}`,
     `auto_recovery_max_retries: ${yamlScalar(config.auto_recovery_max_retries ?? d.auto_recovery_max_retries)} # ${sd("auto_recovery_max_retries", "auto-recovery attempts when implementation blocks")}`,
@@ -2509,6 +2517,7 @@ function normalizeForSync(config: PartialConfig): unknown {
   return {
     repo: config.repo,
     base_branch: config.base_branch ?? d.base_branch,
+    supersede_mode: config.supersede_mode ?? d.supersede_mode,
     worktree_root: config.worktree_root ?? d.worktree_root,
     max_concurrent_worktrees: config.max_concurrent_worktrees ?? d.max_concurrent_worktrees,
     auto_recovery_max_retries: config.auto_recovery_max_retries ?? d.auto_recovery_max_retries,

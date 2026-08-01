@@ -13,6 +13,7 @@
 import {
   addLabel,
   createPr,
+  disposeSupersededIssuePrs,
   extractHumanPlanComments,
   getIssueDetail,
   getOpenIssues,
@@ -21,6 +22,7 @@ import {
   postComment,
   setBlocked,
   transition,
+  type DisposeSupersededIssuePrsDeps,
 } from "../gh.ts";
 import {
   buildContextSnapshot,
@@ -1447,6 +1449,15 @@ export interface ResumeFromImplementingDeps {
    * fakes; use this seam only when the test must assert invocation order.
    */
   includeLockfileSideEffects?: typeof includeLockfileSideEffects;
+  /**
+   * After create-or-reuse of the managed PR, dispose other open associated PRs
+   * for the same issue on different heads (#729). Defaults to
+   * {@link disposeSupersededIssuePrs}. Inject a no-op in unit tests that must
+   * not touch GitHub; inject a spy to assert supersede runs on create and reuse.
+   */
+  disposeSupersededIssuePrs?: typeof disposeSupersededIssuePrs;
+  /** Deps forwarded into the default disposeSupersededIssuePrs implementation. */
+  supersedeDeps?: DisposeSupersededIssuePrsDeps;
 }
 
 /**
@@ -1603,6 +1614,25 @@ export async function resumeFromImplementing(
     const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
     const evType = prIsNew ? "pr_created" : "pr_updated";
     await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: evType, at, pr: prNumber }, opts.runStoreDeps).catch(() => {});
+  }
+
+  // ---- Supersede other open associated PRs for this issue (#729) ----
+  // Runs on both create and reuse so a stale associated PR on a different head
+  // is not left open solely because the managed branch already had a PR.
+  // Fail-soft inside dispose: never blocks ensure-PR / transition when M is ready.
+  {
+    const dispose =
+      deps.disposeSupersededIssuePrs ?? disposeSupersededIssuePrs;
+    await dispose(
+      cfg,
+      {
+        issueNumber,
+        managedBranch: branch,
+        managedPrNumber: prNumber,
+        mode: cfg.supersede_mode,
+      },
+      deps.supersedeDeps ?? {},
+    );
   }
 
   // ---- implementing → design-gate ----

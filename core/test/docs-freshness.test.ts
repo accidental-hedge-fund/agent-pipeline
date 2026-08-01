@@ -557,6 +557,13 @@ test("checkDocsFreshness: red check-only → fail closed, no generate", async ()
 });
 
 // ---------------------------------------------------------------------------
+/** No-op supersede so unit tests never hit GitHub (#729). */
+const noopDispose: NonNullable<ResumeFromImplementingDeps["disposeSupersededIssuePrs"]> = async () => ({
+  closed: [],
+  commented: [],
+  errors: [],
+});
+
 // resumeFromImplementing wiring — ordering, both PR surfaces, bite
 // ---------------------------------------------------------------------------
 
@@ -578,6 +585,7 @@ test("resumeFromImplementing: docs check runs after gates and before push/create
       return { ok: true, ran: true, healed: false };
     },
     getPrForBranch: async () => null,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => {
       callLog.push("createPr");
       createPrCalled = true;
@@ -635,6 +643,7 @@ test("resumeFromImplementing: red docs blocks createPr and push (deliberate stal
       stalePaths: ["CHANGELOG.md"],
     }),
     getPrForBranch: async () => null,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => {
       createPrCalled = true;
       return 0;
@@ -687,6 +696,7 @@ test("resumeFromImplementing: existing-PR resume also fails closed on red docs",
       stalePaths: ["CHANGELOG.md"],
     }),
     getPrForBranch: async () => 55,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => {
       createPrCalled = true;
       return 0;
@@ -739,6 +749,7 @@ test("resumeFromImplementing: auto-heal re-runs format+test gates then final doc
       return { ok: true, ran: true, healed: false };
     },
     getPrForBranch: async () => null,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => {
       callLog.push("createPr");
       return 88;
@@ -801,6 +812,7 @@ test("resumeFromImplementing: post-heal final docs check red blocks push/createP
       stalePaths: ["CHANGELOG.md"],
     }),
     getPrForBranch: async () => null,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => {
       createPrCalled = true;
       return 0;
@@ -853,6 +865,7 @@ test("bite: removing pre-PR docs enforcement would allow createPr on red docs", 
       return { ok: true, ran: true, healed: false };
     },
     getPrForBranch: async () => null,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => {
       createPrCalled = true;
       return 1;

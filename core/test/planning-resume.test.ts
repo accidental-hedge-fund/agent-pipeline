@@ -50,6 +50,14 @@ function skippedGate(): TestGateResult {
   return { skipped: true };
 }
 
+/** No-op supersede so unit tests never hit GitHub (#729). */
+const noopDispose: NonNullable<ResumeFromImplementingDeps["disposeSupersededIssuePrs"]> = async () => ({
+  closed: [],
+  commented: [],
+  errors: [],
+});
+
+
 // ---------------------------------------------------------------------------
 // 3.1: dispatch path — worktree with commits → advances to review-1
 // ---------------------------------------------------------------------------
@@ -129,6 +137,7 @@ test("resumeFromImplementing: gate passes + push ok + no existing PR → creates
   const deps: ResumeFromImplementingDeps = {
     runTestGate: async () => passedGate(),
     getPrForBranch: async () => null,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => { createPrCalled = true; return 77; },
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async (_cfg, _n, reason) => { setBlockedCalls.push(reason); },
@@ -174,6 +183,7 @@ test("resumeFromImplementing: gate passes + push ok + PR already exists → reus
     runTestGate: async () => passedGate(),
     getPrForBranch: async () => 55, // existing PR #55
     createPr: async () => { createPrCalled = true; return 0; },
+    disposeSupersededIssuePrs: noopDispose,
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
     transition: async (_cfg, _n, _from, _to, msg) => { transitionMsg = msg ?? ""; },
@@ -210,6 +220,7 @@ test("resumeFromImplementing: gate fails → calls setBlocked and returns blocke
   const deps: ResumeFromImplementingDeps = {
     runTestGate: async () => failedGate(),
     getPrForBranch: async () => null,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => { createPrCalled = true; return 0; },
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async (_cfg, _n, reason, _stage, kind) => {
@@ -260,6 +271,7 @@ test("resumeFromImplementing: push failure returns the push-failed blocker kind"
       setBlockedKind = kind;
     },
     getPrForBranch: async () => null,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => assert.fail("createPr must not run after push failure"),
     transition: async () => assert.fail("transition must not run after push failure"),
   };
@@ -306,6 +318,7 @@ test("resumeFromImplementing: createPr throws but PR appeared concurrently → r
         return calls === 1 ? null : 66;
       };
     })(),
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => { throw new Error("PR already exists"); },
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async (_cfg, _n, reason) => { setBlockedCalls.push(reason); },
@@ -383,6 +396,7 @@ test("3.6 bite-proof: resumeFromImplementing — calling createPr when PR exists
     getPrForBranch: async () => 55, // existing PR
     createPr: brokenCreatePr, // broken: would create even when PR exists
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
+    disposeSupersededIssuePrs: noopDispose,
     setBlocked: async () => {},
     transition: async () => {},
   };
@@ -416,6 +430,7 @@ test("resumeFromImplementing: skipped gate → advances to review-1 (gate-less r
   const deps: ResumeFromImplementingDeps = {
     runTestGate: async () => skippedGate(),
     getPrForBranch: async () => null,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => { createPrCalled = true; return 88; },
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
@@ -453,6 +468,7 @@ test("resumeFromImplementing: fresh-flow worktree shape (no slug, branch from cr
   const deps: ResumeFromImplementingDeps = {
     runTestGate: async () => passedGate(),
     getPrForBranch: async () => null,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => 99,
     gitInWorktree: async (_path, args) => {
       if (args[0] === "push") pushedBranch.push(args[args.length - 1]);
@@ -506,6 +522,7 @@ test("resumeFromImplementing: format gate blocks first (before the test gate) �
       return passedGate();
     },
     getPrForBranch: async () => null,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => { createPrCalled = true; return 0; },
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async (_cfg, _n, reason) => { setBlockedArgs.push(reason); },
@@ -562,6 +579,7 @@ test("resumeFromImplementing: pr_created event streams to stdout via runStoreDep
   const deps: ResumeFromImplementingDeps = {
     runTestGate: async () => passedGate(),
     getPrForBranch: async () => null,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => 77,
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
@@ -607,6 +625,7 @@ test("resumeFromImplementing (#722): lockfile fold runs before format/test gates
       return { ok: true, gate: passedGate() };
     },
     getPrForBranch: async () => null,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => 88,
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
@@ -645,6 +664,7 @@ test("resumeFromImplementing (#722): lock fold is still invoked when no lock dir
       return { ok: true, gate: passedGate() };
     },
     getPrForBranch: async () => 1,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => 0,
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
@@ -700,6 +720,7 @@ test("resumeFromImplementing (#722): nested yarn/pnpm lock basenames are folded 
     },
     _runFormatAndTestGates: async () => ({ ok: true, gate: passedGate() }),
     getPrForBranch: async () => 9,
+    disposeSupersededIssuePrs: noopDispose,
     createPr: async () => 0,
     gitInWorktree: async () => ({ stdout: "", stderr: "", code: 0 }),
     setBlocked: async () => {},
