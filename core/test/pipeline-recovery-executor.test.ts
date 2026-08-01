@@ -46,6 +46,33 @@ test("production recovery delegates repair_pipeline_item with deterministic clai
   assert.deepEqual(result, { succeeded: true, evidence: "pushed verified repair" });
 });
 
+test("production review recovery delegates substantive repair without clearing the block first", async () => {
+  let repairs = 0;
+  let clears = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    clearBlocked: async () => { clears++; },
+    repairPipelineItem: async () => {
+      repairs++;
+      return { succeeded: true, evidence: "review finding repaired", candidateHead: "b".repeat(40) };
+    },
+  });
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "review-findings",
+    reason: "blocking finding survived a verified repair cycle",
+    stage: "review-2",
+  });
+
+  const result = await execute({
+    ...mechanicalInput(),
+    blockerClass: "review-findings",
+    diagnostic,
+  });
+
+  assert.equal(result.succeeded, true);
+  assert.equal(repairs, 1);
+  assert.equal(clears, 0);
+});
+
 test("narrow recovery clears only a current mechanical block and verifies live state", async () => {
   let detailReads = 0;
   let clears = 0;

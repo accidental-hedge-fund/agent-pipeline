@@ -376,6 +376,15 @@ test("isAutoLoopRecoverable: blocked with pipeline-owned kind → true (has reco
   assert.equal(isAutoLoopRecoverable(BLOCKED_WITH_KIND), true);
 });
 
+test("isAutoLoopRecoverable: durable review repair bypasses the stage-local retry loop", () => {
+  assert.equal(isAutoLoopRecoverable({
+    advanced: false,
+    status: "blocked",
+    reason: "review finding survived repair",
+    blockerKind: "review-findings",
+  }), false);
+});
+
 test("isAutoLoopRecoverable: blocked with needs-human kind → false (requires human intervention)", () => {
   assert.equal(isAutoLoopRecoverable(BLOCKED_NEEDS_HUMAN), false);
 });

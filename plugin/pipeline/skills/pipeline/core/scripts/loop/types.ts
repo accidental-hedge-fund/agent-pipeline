@@ -125,6 +125,7 @@ export const DURABLE_BLOCKER_CLASSES = [
   "transient-rate-limit",
   "workflow-state",
   "implementation-ci",
+  "review-findings",
   "environment-auth",
   "specification-decision",
   "missing-authority",

@@ -255,6 +255,7 @@ export interface ModelEndpointProvenance {
 // runtime, but `BLOCKER_KINDS` survives.
 export const BLOCKER_KINDS = [
   "needs-human",
+  "review-findings",
   "test-gate-exhausted",
   "no-commits",
   "harness-failure",
@@ -301,6 +302,11 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     '`$pipeline {{N}} --override "<finding-key>: <reason>"` to advance past an ' +
     "accepted or out-of-scope finding (the key comes from the review comment; " +
     "`--override` clears the label and resumes automatically).",
+  "review-findings":
+    "Blocking review findings remain after the stage-local fix budget. The durable " +
+    "controller owns bounded remediation and a fresh review. If automated recovery " +
+    "is exhausted, fix the listed findings in the worktree, commit, remove the " +
+    "`blocked` label, and re-run `$pipeline {{N}}`.",
   "test-gate-exhausted":
     "The test/build gate failed after the pipeline's fix attempts were " +
     "exhausted. Fix the failing test(s) or build error in the worktree, commit " +

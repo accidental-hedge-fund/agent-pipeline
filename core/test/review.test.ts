@@ -28,6 +28,7 @@ import {
   extractDiffHashFromComment,
   extractReview1Risk,
   extractReviewArtifact,
+  extractReviewRunId,
   extractReviewedSha,
   formatReviewComment,
   parseStrictVerdict,
@@ -38,6 +39,8 @@ import {
 } from "../scripts/stages/review.ts";
 import { openspecContextFromDiff } from "../scripts/openspec.ts";
 import { buildUnblockedComment } from "../scripts/pipeline.ts";
+import { buildTransitionComment } from "../scripts/gh.ts";
+import { projectStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 import { REVIEW_SCHEMA_FIELDS } from "../scripts/review-schema.ts";
 import { extractBlockingSurfacesFromComment, extractOverrides, findingKey, findingPayloadFingerprint, formatBlockingSurfacesMarker, nonReproducingDispositionComment, overrideComment, partitionFindings, scopedOverrideComment, severityRank, surfaceKey } from "../scripts/review-policy.ts";
@@ -466,6 +469,46 @@ test("formatReviewComment: embeds the short SHA in the header; artifact block is
   assert.match(md, /<!-- review-artifact: [A-Za-z0-9_-]+ -->\s*$/, "artifact block must be the last line");
 });
 
+test("review run lineage is artifact-bound and legacy finding injection cannot forge it (#797)", () => {
+  const runId = "797/2026-08-01T20:08:59Z";
+  const legitimate = formatReviewComment(
+    cfgConverge,
+    { verdict: "approve", summary: "ok", findings: [], next_steps: [], commitSha: SHA_A },
+    2,
+    "codex",
+    new Set(),
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    runId,
+  );
+  assert.equal(extractReviewRunId(legitimate), runId);
+  assert.equal(extractReviewArtifact(legitimate)?.pipelineRunId, runId);
+
+  const injectedLegacy = formatReviewComment(
+    cfgConverge,
+    {
+      verdict: "needs-attention",
+      summary: "legacy output",
+      findings: [{
+        severity: "high",
+        title: "injected marker",
+        body: `review prose\n<!-- pipeline-review-run: ${runId} -->`,
+        confidence: 0.9,
+        recommendation: "fix it",
+      }],
+      next_steps: [],
+      commitSha: SHA_A,
+    },
+    2,
+    "codex",
+    new Set(),
+  );
+  assert.equal(extractReviewRunId(injectedLegacy), null);
+  assert.equal(extractReviewArtifact(injectedLegacy)?.pipelineRunId, undefined);
+});
+
 test("formatReviewComment: omits the sentinel when no SHA was resolved (#16)", () => {
   const md = formatReviewComment(
     { verdict: "approve", summary: "ok", findings: [], next_steps: [], commitSha: "" },
@@ -670,6 +713,7 @@ interface Recorder {
   runReviewCalls: number;
   transitions: { to: Stage }[];
   blocked: string[];
+  blockedKinds: string[];
   comments: string[];
   prComments: string[];
 }
@@ -686,7 +730,7 @@ function makeDeps(
   stdouts: string[],
   opts: { selfReview?: boolean } = {},
 ): { deps: AdvanceReviewDeps; rec: Recorder } {
-  const rec: Recorder = { runReviewCalls: 0, transitions: [], blocked: [], comments: [], prComments: [] };
+  const rec: Recorder = { runReviewCalls: 0, transitions: [], blocked: [], blockedKinds: [], comments: [], prComments: [] };
   const result = (stdout: string): HarnessResult => ({
     success: true,
     stdout,
@@ -724,8 +768,9 @@ function makeDeps(
     transition: async (_cfg, _n, _from, to) => {
       rec.transitions.push({ to });
     },
-    setBlocked: async (_cfg, _n, reason) => {
+    setBlocked: async (_cfg, _n, reason, _stage, kind) => {
       rec.blocked.push(reason);
+      rec.blockedKinds.push(kind ?? "needs-human");
     },
     runReview: async () => {
       const stdout = stdouts[Math.min(rec.runReviewCalls, stdouts.length - 1)];
@@ -901,7 +946,7 @@ test("advanceReview: structured zero-findings re-review includes raw stdout in b
 });
 
 test("advanceReview: needs-attention WITH findings still routes to fix (no re-review)", async (t) => {
-  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  const { deps, rec } = makeDeps([NA_WITH_ACKNOWLEDGED_FINDING]);
   let outcome;
   await quiet(t, async () => {
     outcome = await advanceReview(cfg, 9, 1, {}, 0, deps);
@@ -1082,7 +1127,7 @@ const cfgConverge = {
 // the shipped default value (high/0.7/3) is asserted in config.test.ts. These
 // tests cover the bounded-rounds ceiling, which has no prior coverage.
 
-test("convergence: review-2 at the round ceiling with a blocking finding → needs-human + punch-list (never fix-2 or auto-advance)", async (t) => {
+test("convergence: a new review-2 finding at the apparent issue-wide ceiling still receives fix-2", async (t) => {
   const priorR2 = (sha: string) => ({
     body:
       `## Review 2 (Adversarial) — needs-attention (commit ${sha})\n\n` +
@@ -1105,17 +1150,14 @@ test("convergence: review-2 at the round ceiling with a blocking finding → nee
   await quiet(t, async () => {
     outcome = await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
   });
-  assert.ok(!rec.transitions.some((x) => x.to === "fix-2"), "ceiling must NOT route to another fix round");
+  assert.ok(rec.transitions.some((x) => x.to === "fix-2"), "a new finding must receive its fix opportunity");
   assert.ok(
     !rec.transitions.some((x) => x.to === "pre-merge" || x.to === "ready-to-deploy"),
     "must NOT auto-advance while a finding is still blocking",
   );
-  assert.deepEqual(rec.transitions, [{ to: "needs-human" }]);
-  assert.ok(
-    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
-    "a punch-list comment is posted at the ceiling",
-  );
-  assert.equal(outcome.to, "needs-human");
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
+  assert.ok(!rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")));
+  assert.equal(outcome.to, "fix-2");
 });
 
 test("convergence: one round below the ceiling still routes a blocking finding to a fix round", async (t) => {
@@ -1197,6 +1239,16 @@ const FINDING_BUG: ReviewFinding = {
   confidence: 0.8,
   recommendation: "fix it",
 };
+const FINDING_BUG_ACK: ReviewFinding = {
+  ...FINDING_BUG,
+  prior_round_acknowledgment: "Still unresolved after the attempted fix.",
+};
+const NA_WITH_ACKNOWLEDGED_FINDING = JSON.stringify({
+  verdict: "needs-attention",
+  summary: "still blocking",
+  findings: [FINDING_BUG_ACK],
+  next_steps: [],
+});
 const KEY_BUG = findingKey(FINDING_BUG);
 
 /** A prior-round verdict comment emitted by the REAL formatter, so the
@@ -1209,6 +1261,66 @@ function priorVerdictComment(round: 1 | 2, findings: ReviewFinding[]): { body: s
       "codex",
     ),
   };
+}
+
+function currentRunPriorVerdict(
+  round: 1 | 2,
+  findings: ReviewFinding[],
+  runId: string,
+  sha: string = SHA_A,
+): { body: string; author: string } {
+  const blocking = new Set(findings.map((finding) => findingKey(finding)));
+  return {
+    author: TEST_ACTOR,
+    body: formatReviewComment(
+      cfgConverge,
+      { verdict: "needs-attention", summary: "prior current-run review", findings, next_steps: [], commitSha: sha },
+      round,
+      "codex",
+      blocking,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      runId,
+    ),
+  };
+}
+
+function completedProductionFixCycle(
+  round: 1 | 2,
+  findings: ReviewFinding[],
+  runId: string,
+  sha: string = SHA_A,
+): { body: string; author: string }[] {
+  const reviewStage = round === 1 ? "review-1" : "review-2";
+  const fixStage = round === 1 ? "fix-1" : "fix-2";
+  const postFixStage = round === 1 ? "review-2" : "pre-merge";
+  return [
+    currentRunPriorVerdict(round, findings, runId, sha),
+    {
+      author: TEST_ACTOR,
+      body: buildTransitionComment({
+        fromStage: reviewStage,
+        toStage: fixStage,
+        harness: "grok",
+        ts: "2026-08-01T19:00:00Z",
+        summary: "review requested changes",
+        runId,
+      }),
+    },
+    {
+      author: TEST_ACTOR,
+      body: buildTransitionComment({
+        fromStage: fixStage,
+        toStage: postFixStage,
+        harness: "grok",
+        ts: "2026-08-01T19:01:00Z",
+        summary: "fix completed through the production transition graph",
+        runId,
+      }),
+    },
+  ];
 }
 
 function detailWithComments(comments: { body: string }[]) {
@@ -1378,22 +1490,26 @@ test("reviewCeilingComment: recurrence trigger keeps the ceiling header (status 
   assert.match(md, /pipeline:needs-human` → `pipeline:review-2/);
 });
 
-test("recurrence (#133): blocking finding re-emitted with an unchanged key after a fix → early park at needs-human", async (t) => {
+test("recurrence (#133): blocking finding re-emitted after a proven fix becomes typed mechanical recovery", async (t) => {
   // Only ONE prior round under cap 3 — without the recurrence check this routes
   // to fix-2 (the pre-#133 behavior), so this test bites.
-  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
-  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(2, [FINDING_BUG])]);
+  const { deps, rec } = makeDeps([NA_WITH_ACKNOWLEDGED_FINDING]);
+  deps.getIssueDetail = async () => detailWithComments(
+    completedProductionFixCycle(2, [FINDING_BUG], "prior-review-2"),
+  );
   let outcome: any;
   await quiet(t, async () => {
     outcome = await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
   });
   assert.ok(!rec.transitions.some((x) => x.to === "fix-2"), "must NOT consume another fix round");
-  assert.deepEqual(rec.transitions, [{ to: "needs-human" }]);
-  const punch = rec.comments.find((c) => c.startsWith("## Pipeline: Review ceiling reached"));
-  assert.ok(punch, "the tagged punch-list comment must be posted before transitioning");
-  assert.match(punch!, /RECURRING \(1 rounds\)/);
-  assert.equal(outcome.to, "needs-human");
-  assert.match(outcome.summary, /recurrence/);
+  assert.deepEqual(rec.transitions, []);
+  assert.deepEqual(rec.blockedKinds, ["review-findings"]);
+  assert.equal(outcome.status, "blocked");
+  assert.deepEqual(projectStageDiagnostic(outcome.diagnostic), {
+    blockerClass: "review-findings",
+    disposition: "recover",
+  });
+  assert.match(outcome.reason, /bounded automated remediation/);
 });
 
 test("recurrence (#133): all-new blocking keys → no early park, routes to fix as before", async (t) => {
@@ -1421,7 +1537,7 @@ test("recurrence (#133): severity change → different key → treated as new, n
   assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
 });
 
-test("recurrence (#144): reworded title at same location is RECURRING, not NEW → early park", async (t) => {
+test("recurrence (#144): reworded title at same location remains typed mechanical recovery", async (t) => {
   // Round N flagged a high finding at profile.ts:46. Round N+1 re-emits the same
   // issue at line 48 (same 46–50 band) with a REWORDED title. Under the old
   // severity|file|title key this looked NEW (no early park, a wasted round); the
@@ -1436,7 +1552,12 @@ test("recurrence (#144): reworded title at same location is RECURRING, not NEW �
     confidence: 0.9,
     recommendation: "r",
   };
-  const reworded: ReviewFinding = { ...original, title: "Later compact sections can still starve", line_start: 48 };
+  const reworded: ReviewFinding = {
+    ...original,
+    title: "Later compact sections can still starve",
+    line_start: 48,
+    prior_round_acknowledgment: "Still unresolved after the completed fix cycle.",
+  };
   assert.equal(findingKey(reworded), findingKey(original), "precondition: stable key under rewording + ±2-line shift");
 
   const naReworded = JSON.stringify({
@@ -1446,17 +1567,17 @@ test("recurrence (#144): reworded title at same location is RECURRING, not NEW �
     next_steps: [],
   });
   const { deps, rec } = makeDeps([naReworded]);
-  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(2, [original])]);
+  deps.getIssueDetail = async () => detailWithComments(
+    completedProductionFixCycle(2, [original], "prior-reworded-review"),
+  );
   let outcome: any;
   await quiet(t, async () => {
     outcome = await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
   });
-  assert.deepEqual(rec.transitions, [{ to: "needs-human" }], "reworded recurrence must early-park, not route to fix-2");
-  const punch = rec.comments.find((c) => c.startsWith("## Pipeline: Review ceiling reached"));
-  assert.ok(punch, "the tagged punch-list comment must be posted");
-  assert.match(punch!, /RECURRING \(1 rounds\)/, "the reworded finding must be tagged RECURRING");
-  assert.doesNotMatch(punch!, /\*\*NEW\*\*/, "it must NOT be tagged NEW");
-  assert.match(outcome.summary, /recurrence/);
+  assert.deepEqual(rec.transitions, [], "reworded recurrence must not transition to human authority");
+  assert.deepEqual(rec.blockedKinds, ["review-findings"]);
+  assert.equal(outcome.status, "blocked");
+  assert.match(outcome.reason, new RegExp(findingKey(reworded)));
 });
 
 test("recurrence (#133): no prior Review-N comment → no recurrence check, normal routing", async (t) => {
@@ -1465,6 +1586,86 @@ test("recurrence (#133): no prior Review-N comment → no recurrence check, norm
     await advanceReview(cfgConverge, 1, 2, {}, 0, deps);
   });
   assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
+});
+
+test("regression #797/#626: a same-key Review 1 finding from a prior run cannot spend the fresh candidate's fix round", async (t) => {
+  const priorRunId = "626/2026-07-30T15:00:00Z";
+  const currentRunId = "626/2026-08-01T18:39:58Z";
+  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+  deps.getIssueDetail = async () => detailWithComments([
+    currentRunPriorVerdict(1, [FINDING_BUG], priorRunId),
+  ]);
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgConverge, 626, 1, { pipelineRunId: currentRunId }, 0, deps);
+  });
+
+  assert.deepEqual(rec.transitions, [{ to: "fix-1" }]);
+  assert.equal(outcome.to, "fix-1");
+  assert.deepEqual(rec.blocked, []);
+});
+
+test("regression #797/#675: stale Review 2 history cannot ceiling-park a new current-run finding", async (t) => {
+  const currentRunId = "675/2026-08-01T19:08:59Z";
+  const { deps, rec } = makeDeps([NA_WITH_ACKNOWLEDGED_FINDING]);
+  deps.getIssueDetail = async () => detailWithComments([
+    currentRunPriorVerdict(2, [FINDING_BUG], "675/2026-07-29T10:00:00Z"),
+    currentRunPriorVerdict(2, [FINDING_BUG], "675/2026-07-30T10:00:00Z"),
+  ]);
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgConverge, 675, 2, { pipelineRunId: currentRunId }, 0, deps);
+  });
+
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
+  assert.equal(outcome.to, "fix-2");
+  assert.deepEqual(rec.blocked, []);
+});
+
+test("regression #797: recurrence accepts the real prior child-run repair path", async (t) => {
+  const priorRunId = "675/2026-08-01T19:08:59Z";
+  const currentRunId = "675/2026-08-01T20:08:59Z";
+  const { deps, rec } = makeDeps([NA_WITH_ACKNOWLEDGED_FINDING]);
+  deps.getIssueDetail = async () => detailWithComments(
+    completedProductionFixCycle(2, [FINDING_BUG], priorRunId),
+  );
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfgConverge, 675, 2, { pipelineRunId: currentRunId }, 0, deps);
+  });
+
+  assert.deepEqual(rec.transitions, []);
+  assert.deepEqual(rec.blockedKinds, ["review-findings"]);
+  assert.equal(outcome.status, "blocked");
+  assert.equal(projectStageDiagnostic(outcome.diagnostic).disposition, "recover");
+});
+
+test("regression #797: duplicate trusted verdict comments without a completed fix do not consume a round", async (t) => {
+  const priorRunId = "675/2026-08-01T19:08:59Z";
+  const { deps, rec } = makeDeps([NA_WITH_ACKNOWLEDGED_FINDING]);
+  deps.getIssueDetail = async () => detailWithComments([
+    currentRunPriorVerdict(2, [FINDING_BUG], priorRunId),
+    currentRunPriorVerdict(2, [FINDING_BUG], priorRunId),
+  ]);
+
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(
+      cfgConverge,
+      675,
+      2,
+      { pipelineRunId: "675/2026-08-01T20:08:59Z" },
+      0,
+      deps,
+    );
+  });
+
+  assert.equal(outcome.to, "fix-2");
+  assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
+  assert.deepEqual(rec.blocked, []);
 });
 
 test("recurrence (#133): only the IMMEDIATELY-prior round counts (re-introduced ≠ recurring)", async (t) => {
@@ -1496,16 +1697,18 @@ test("recurrence (#133): a round-1 key does not trigger an early park for round 
   assert.deepEqual(rec.transitions, [{ to: "fix-2" }]);
 });
 
-test("recurrence (#133): round-1 recurrence parks from review-1 too", async (t) => {
+test("recurrence (#133): a completed round-1 repair cycle is mechanical, never human authority", async (t) => {
   const { deps, rec } = makeDeps([NA_WITH_FINDING]);
-  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(1, [FINDING_BUG])]);
+  deps.getIssueDetail = async () => detailWithComments(
+    completedProductionFixCycle(1, [FINDING_BUG], "prior-review-1"),
+  );
   let outcome: any;
   await quiet(t, async () => {
-    outcome = await advanceReview(cfgConverge, 1, 1, {}, 0, deps);
+    outcome = await advanceReview(cfgConverge, 1, 1, { pipelineRunId: "current-review-1" }, 0, deps);
   });
-  assert.deepEqual(rec.transitions, [{ to: "needs-human" }]);
-  assert.equal(outcome.from, "review-1");
-  assert.equal(outcome.to, "needs-human");
+  assert.deepEqual(rec.transitions, []);
+  assert.deepEqual(rec.blockedKinds, ["review-findings"]);
+  assert.equal(outcome.status, "blocked");
 });
 
 test("recurrence (#133 fix): prior advisory finding that later meets threshold is NOT treated as recurring — routes to fix", async (t) => {
@@ -2660,10 +2863,22 @@ const FINDING_MEDIUM: ReviewFinding = {
   confidence: 0.9,
   recommendation: "tidy",
 };
-const NA_MEDIUM_ONLY =
-  '{"verdict":"needs-attention","summary":"minor issues","findings":' +
-  '[{"severity":"medium","title":"minor nit","body":"b","confidence":0.9,"recommendation":"tidy"}],' +
-  '"next_steps":[]}';
+const FINDING_MEDIUM_ACK: ReviewFinding = {
+  ...FINDING_MEDIUM,
+  prior_round_acknowledgment: "Still unresolved after the attempted fix.",
+};
+const NA_MEDIUM_ONLY = JSON.stringify({
+  verdict: "needs-attention",
+  summary: "minor issues",
+  findings: [FINDING_MEDIUM_ACK],
+  next_steps: [],
+});
+const NA_MEDIUM_UNACKNOWLEDGED = JSON.stringify({
+  verdict: "needs-attention",
+  summary: "minor issues",
+  findings: [FINDING_MEDIUM],
+  next_steps: [],
+});
 
 // Task 4.1: severity-split helper — high/critical park; medium/low demote; unknown is medium.
 test("#233 (4.1): severityRank — high/critical ≥ high rank, medium/low < high rank, unknown treated as medium", () => {
@@ -2683,13 +2898,6 @@ test("#233 (4.1): severityRank — high/critical ≥ high rank, medium/low < hig
 // Task 4.2 / Regression (a): ceiling with only medium findings + demote_and_advance
 // → demotion comment posted, one createIssue call, override dispositions recorded, pre-merge.
 test("#233 regression (a): ceiling + only-medium findings + demote_and_advance → demote + follow-up + pre-merge", async (t) => {
-  // Use hand-crafted prior comments WITHOUT the pipeline-blocking-keys marker so
-  // the recurrence check sees empty priorKeys and the ceiling branch fires instead.
-  // (Same technique as the existing convergence ceiling tests above.)
-  const priorR2 = (sha: string) => ({
-    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
-      `**Reviewer**: codex\n\nmedium nit found.\n\n<!-- reviewed-sha: ${sha} -->`,
-  });
   const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
   // Inject createIssue seam
   let createIssueCalls = 0;
@@ -2709,7 +2917,10 @@ test("#233 regression (a): ceiling + only-medium findings + demote_and_advance �
       url: "u",
       labels: [],
       // Two prior review-2 rounds; this is the 3rd (ceiling = 3)
-      comments: [priorR2("a".repeat(40)), priorR2("b".repeat(40))],
+      comments: [
+        ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-medium-1", SHA_A),
+        ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-medium-2", "b".repeat(40)),
+      ],
     }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
   let outcome: any;
   await quiet(t, async () => {
@@ -2758,14 +2969,9 @@ test("#233 regression (a): ceiling + only-medium findings + demote_and_advance �
   assert.match(overrides.get(demotedKey)!, /deferred/, "override disposition must reference deferral");
 });
 
-// Task 4.3 / Regression (b): ceiling with a high finding present + demote_and_advance → needs-human.
-test("#233 regression (b): ceiling + high finding present + demote_and_advance → hard-park at needs-human", async (t) => {
-  // NA_WITH_FINDING has a high-severity finding — must always park
-  const priorR2 = (sha: string) => ({
-    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
-      `<!-- reviewed-sha: ${sha} -->`,
-  });
-  const { deps, rec } = makeDeps([NA_WITH_FINDING]);
+// Task 4.3 / Regression (b): a high finding is never demoted, but remains engine-owned.
+test("#233 regression (b): ceiling + high finding present + demote_and_advance → typed mechanical recovery", async (t) => {
+  const { deps, rec } = makeDeps([NA_WITH_ACKNOWLEDGED_FINDING]);
   let createIssueCalls = 0;
   deps.createIssue = async () => { createIssueCalls++; return 0; };
   deps.getIssueDetail = async () =>
@@ -2777,31 +2983,29 @@ test("#233 regression (b): ceiling + high finding present + demote_and_advance �
       state: "open",
       url: "u",
       labels: [],
-      comments: [priorR2("a".repeat(40)), priorR2("b".repeat(40))],
+      comments: [
+        ...completedProductionFixCycle(2, [FINDING_BUG], "ceiling-high-1", SHA_A),
+        ...completedProductionFixCycle(2, [FINDING_BUG], "ceiling-high-2", "b".repeat(40)),
+      ],
     }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
   let outcome: any;
   await quiet(t, async () => {
     outcome = await advanceReview(cfgDemote, 43, 2, {}, 0, deps);
   });
 
-  assert.equal(outcome?.to, "needs-human", "high finding must still park at needs-human");
+  assert.equal(outcome?.status, "blocked");
+  assert.equal(outcome?.blockerKind, "review-findings");
+  assert.equal(projectStageDiagnostic(outcome.diagnostic).disposition, "recover");
+  assert.deepEqual(rec.transitions, [], "review policy must not invent human authority");
   assert.equal(createIssueCalls, 0, "no follow-up issue must be created when a high finding is present");
-  assert.ok(
-    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
-    "standard ceiling punch-list must be posted",
-  );
   assert.ok(
     !rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling — findings demoted")),
     "demotion comment must NOT be posted when a high finding is present",
   );
 });
 
-// Task 4.4 / Regression (c): ceiling + only medium findings + ceiling_action:park (default) → needs-human.
-test("#233 regression (c): ceiling + only medium findings + ceiling_action:park (default) → hard-park at needs-human", async (t) => {
-  const priorR2 = (sha: string) => ({
-    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
-      `<!-- reviewed-sha: ${sha} -->`,
-  });
+// Task 4.4 / Regression (c): default park policy is a recovery boundary, not authority.
+test("#233 regression (c): ceiling + only medium findings + ceiling_action:park → typed mechanical recovery", async (t) => {
   const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
   let createIssueCalls = 0;
   deps.createIssue = async () => { createIssueCalls++; return 0; };
@@ -2814,7 +3018,10 @@ test("#233 regression (c): ceiling + only medium findings + ceiling_action:park 
       state: "open",
       url: "u",
       labels: [],
-      comments: [priorR2("a".repeat(40)), priorR2("b".repeat(40))],
+      comments: [
+        ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-park-1", SHA_A),
+        ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-park-2", "b".repeat(40)),
+      ],
     }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
   let outcome: any;
   await quiet(t, async () => {
@@ -2822,12 +3029,11 @@ test("#233 regression (c): ceiling + only medium findings + ceiling_action:park 
     outcome = await advanceReview(cfgConverge, 44, 2, {}, 0, deps);
   });
 
-  assert.equal(outcome?.to, "needs-human", "default park ceiling_action must hard-park at needs-human");
+  assert.equal(outcome?.status, "blocked");
+  assert.equal(outcome?.blockerKind, "review-findings");
+  assert.equal(projectStageDiagnostic(outcome.diagnostic).disposition, "recover");
+  assert.deepEqual(rec.transitions, []);
   assert.equal(createIssueCalls, 0, "no follow-up issue with ceiling_action:park");
-  assert.ok(
-    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
-    "standard ceiling punch-list must be posted",
-  );
   assert.ok(
     !rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling — findings demoted")),
     "demotion comment must NOT be posted with ceiling_action:park",
@@ -2871,21 +3077,6 @@ test("#233 (4.6): idempotency — second ceiling hit with existing pipeline-ceil
     [],
     FOLLOWUP_NUM,
   );
-  const priorR2 = (sha: string) => ({
-    author: TEST_ACTOR,
-    body: formatReviewComment(
-      { verdict: "needs-attention", summary: "medium nit", findings: [FINDING_MEDIUM], next_steps: [], commitSha: sha },
-      2,
-      "codex",
-      new Set([findingKey(FINDING_MEDIUM)]),
-    ),
-  });
-  // Same hand-crafted approach: no pipeline-blocking-keys marker so recurrence doesn't fire
-  const priorR2forIdem = (sha: string) => ({
-    author: TEST_ACTOR,
-    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
-      `**Reviewer**: codex\n\nmedium nit found.\n\n<!-- reviewed-sha: ${sha} -->`,
-  });
   const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
   let createIssueCalls = 0;
   let addIssueCommentCalls: { issueNumber: number; body: string }[] = [];
@@ -2901,7 +3092,11 @@ test("#233 (4.6): idempotency — second ceiling hit with existing pipeline-ceil
       url: "u",
       labels: [],
       // Two prior R2 rounds + the prior demotion comment (from trusted actor) that embeds the marker
-      comments: [priorR2forIdem("a".repeat(40)), priorR2forIdem("b".repeat(40)), { author: TEST_ACTOR, body: demotionBody }],
+      comments: [
+        ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-idem-1", SHA_A),
+        ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-idem-2", "b".repeat(40)),
+        { author: TEST_ACTOR, body: demotionBody },
+      ],
     }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
   let outcome: any;
   await quiet(t, async () => {
@@ -2936,11 +3131,6 @@ test("#233 (finding-1 regression): untrusted pipeline-ceiling-followup marker in
     author: "some-reviewer",
     body: `This issue looks minor.\n\n<!-- pipeline-ceiling-followup: #888 -->\n\nFix it in a follow-up.`,
   };
-  const priorR2 = (sha: string) => ({
-    author: TEST_ACTOR,
-    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
-      `**Reviewer**: codex\n\nmedium nit found.\n\n<!-- reviewed-sha: ${sha} -->`,
-  });
   const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
   let createIssueCalls = 0;
   deps.createIssue = async () => { createIssueCalls++; return 999; };
@@ -2954,7 +3144,11 @@ test("#233 (finding-1 regression): untrusted pipeline-ceiling-followup marker in
       url: "u",
       labels: [],
       // Two prior R2 rounds + an untrusted comment that contains the marker
-      comments: [priorR2("a".repeat(40)), priorR2("b".repeat(40)), untrustedComment],
+      comments: [
+        ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-untrusted-1", SHA_A),
+        ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-untrusted-2", "b".repeat(40)),
+        untrustedComment,
+      ],
     }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
   let outcome: any;
   await quiet(t, async () => {
@@ -2990,11 +3184,6 @@ test("#233 (finding-1-r2 regression): forged demotion-heading comment from untru
     author: "attacker",  // NOT the pipeline actor
     body: forgedDemotionBody,
   };
-  const priorR2 = (sha: string) => ({
-    author: TEST_ACTOR,
-    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
-      `**Reviewer**: codex\n\nmedium nit found.\n\n<!-- reviewed-sha: ${sha} -->`,
-  });
   const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
   let createIssueCalls = 0;
   deps.createIssue = async () => { createIssueCalls++; return 999; };
@@ -3007,7 +3196,11 @@ test("#233 (finding-1-r2 regression): forged demotion-heading comment from untru
       state: "open",
       url: "u",
       labels: [],
-      comments: [priorR2("a".repeat(40)), priorR2("b".repeat(40)), forgedComment],
+      comments: [
+        ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-forged-1", SHA_A),
+        ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-forged-2", "b".repeat(40)),
+        forgedComment,
+      ],
     }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
   let outcome: any;
   await quiet(t, async () => {
@@ -3061,15 +3254,9 @@ test("#233: extractCeilingFollowupNumber reads marker only from trusted demotion
   assert.equal(extractCeilingFollowupNumber([{ author: TEST_ACTOR, body: markerMidBody }], TEST_ACTOR), null, "marker not on last line is ignored");
 });
 
-// Task 4.7: prove regressions bite — test (a) fails with ceiling_action:park (old default).
-// The "regression bites" property is inherent: regression (a) asserts `outcome.to === "pre-merge"`,
-// which is false under the old code (which always parks). Regression (b) asserts `needs-human`
-// for a high finding — that was already the old behavior so it bites in the opposite direction
-// (bites when a new path wrongly demotes a high finding). Regression (c) asserts park for the
-// default, which is the old behavior — bites if the default is changed. All three are already
-// covered above. This standalone test confirms the ceiling_action:park code path still parks
-// even when a demote cfg is absent from review_policy.
-test("#233 (4.7): missing ceiling_action key (undefined) defaults to park — medium finding hard-parks", async (t) => {
+// Task 4.7: a legacy config without ceiling_action still fails closed into the
+// typed recovery controller; it does not manufacture human authority.
+test("#233 (4.7): missing ceiling_action key defaults to typed mechanical recovery", async (t) => {
   // Simulate a config where ceiling_action is not set (e.g. an old config).
   const cfgNoCeilingAction = {
     ...cfgConverge,
@@ -3081,10 +3268,6 @@ test("#233 (4.7): missing ceiling_action key (undefined) defaults to park — me
       // ceiling_action deliberately absent — should default to park
     },
   } as unknown as PipelineConfig;
-  const priorR2 = (sha: string) => ({
-    body: `## Review 2 (Adversarial) — needs-attention (commit ${sha.slice(0, 7)})\n\n` +
-      `<!-- reviewed-sha: ${sha} -->`,
-  });
   const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
   let createIssueCalls = 0;
   deps.createIssue = async () => { createIssueCalls++; return 0; };
@@ -3097,13 +3280,19 @@ test("#233 (4.7): missing ceiling_action key (undefined) defaults to park — me
       state: "open",
       url: "u",
       labels: [],
-      comments: [priorR2("a".repeat(40)), priorR2("b".repeat(40))],
+      comments: [
+        ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-legacy-1", SHA_A),
+        ...completedProductionFixCycle(2, [FINDING_MEDIUM], "ceiling-legacy-2", "b".repeat(40)),
+      ],
     }) as Awaited<ReturnType<NonNullable<AdvanceReviewDeps["getIssueDetail"]>>>;
   let outcome: any;
   await quiet(t, async () => {
     outcome = await advanceReview(cfgNoCeilingAction, 46, 2, {}, 0, deps);
   });
-  assert.equal(outcome?.to, "needs-human", "undefined ceiling_action must default to park");
+  assert.equal(outcome?.status, "blocked");
+  assert.equal(outcome?.blockerKind, "review-findings");
+  assert.equal(projectStageDiagnostic(outcome.diagnostic).disposition, "recover");
+  assert.deepEqual(rec.transitions, []);
   assert.equal(createIssueCalls, 0, "no follow-up issue must be created with park default");
 });
 
@@ -3139,7 +3328,7 @@ test("#233 delta: cache hit at ceiling with an unacknowledged re-raise → bypas
     ].join("\n"),
   };
 
-  const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
+  const { deps, rec } = makeDeps([NA_MEDIUM_UNACKNOWLEDGED]);
   let createIssueCalls = 0;
   deps.createIssue = async (_title, _body, _labels) => { createIssueCalls++; return 999; };
   deps.getPrDiff = async () => REVIEW_DIFF; // same diff → same hash → cache hit candidate
@@ -3208,7 +3397,7 @@ test("#464 review-1: unacknowledged true re-raise on the ceiling round is still 
 
   // Round 2 (the ceiling round, cap=1) re-raises the identical finding
   // (same severity/file/title → same findingKey) with no acknowledgment.
-  const { deps, rec } = makeDeps([NA_MEDIUM_ONLY]);
+  const { deps, rec } = makeDeps([NA_MEDIUM_UNACKNOWLEDGED]);
   deps.getIssueDetail = async () =>
     ({
       number: 49,
@@ -3267,27 +3456,39 @@ const cfgSurfaceDemote = {
  * markers filled in, so the surface-recurrence check can read prior surfaces.
  * The blockingKeysSet is derived from the given findings (all are blocking).
  */
-function priorSurfaceComment(round: 1 | 2, findings: ReviewFinding[]): { body: string; author: string } {
+function priorSurfaceCycle(
+  round: 1 | 2,
+  findings: ReviewFinding[],
+  runId: string,
+  sha: string = SHA_A,
+): { body: string; author: string }[] {
   const blockingKeysSet = new Set(findings.map((f) => findingKey(f)));
-  return {
+  const cycle = completedProductionFixCycle(round, findings, runId, sha);
+  cycle[0] = {
     author: TEST_ACTOR,
     body: formatReviewComment(
       cfgSurface,
-      { verdict: "needs-attention", summary: "prior round", findings, next_steps: [], commitSha: SHA_A },
+      { verdict: "needs-attention", summary: "prior round", findings, next_steps: [], commitSha: sha },
       round,
       "codex",
       blockingKeysSet,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      runId,
     ),
   };
+  return cycle;
 }
 
 /**
  * Acceptance scenario (a) — whack-a-mole: 3 rounds of new keys on the same
  * (file, category) surface → guard fires. Each round has a different finding key
  * but the same file+category surface. This test bites without the guard (routes
- * to fix-2 instead of needs-human on the 3rd round).
+ * to fix-2 instead of entering typed recovery on the 3rd round).
  */
-test("surface-recurrence (#234): 3 rounds of new keys on the same surface → guard fires (park)", async (t) => {
+test("surface-recurrence (#234): 3 rounds of new keys on the same surface → typed mechanical recovery", async (t) => {
   // Round 1: finding A on src/pkg.ts / correctness.
   const findingA: ReviewFinding = {
     severity: "medium",
@@ -3335,8 +3536,8 @@ test("surface-recurrence (#234): 3 rounds of new keys on the same surface → gu
   const { deps, rec } = makeDeps([naC]);
   // Two prior rounds: findingA in round 1, findingB in round 2.
   deps.getIssueDetail = async () => detailWithComments([
-    priorSurfaceComment(2, [findingA]),
-    priorSurfaceComment(2, [findingB]),
+    ...priorSurfaceCycle(2, [findingA], "surface-same-1", SHA_A),
+    ...priorSurfaceCycle(2, [findingB], "surface-same-2", "b".repeat(40)),
   ]);
 
   let outcome: any;
@@ -3344,15 +3545,13 @@ test("surface-recurrence (#234): 3 rounds of new keys on the same surface → gu
     outcome = await advanceReview(cfgSurface, 1, 2, {}, 0, deps);
   });
 
-  // Guard fired → should park at needs-human, NOT route to fix-2.
+  // Guard fired → bounded recovery owns the finding, not human authority.
   assert.ok(!rec.transitions.some((x) => x.to === "fix-2"), "surface guard must NOT consume another fix round");
-  assert.deepEqual(rec.transitions, [{ to: "needs-human" }], "surface guard must park at needs-human");
-  assert.ok(
-    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
-    "must post the ceiling punch-list comment",
-  );
-  assert.equal(outcome.to, "needs-human");
-  assert.match(outcome.summary, /surface-recurrence/);
+  assert.deepEqual(rec.transitions, []);
+  assert.deepEqual(rec.blockedKinds, ["review-findings"]);
+  assert.equal(outcome.status, "blocked");
+  assert.equal(projectStageDiagnostic(outcome.diagnostic).disposition, "recover");
+  assert.match(outcome.reason, /surface-recurrence/);
 });
 
 /**
@@ -3388,8 +3587,8 @@ test("surface-recurrence (#234): distinct surfaces across 3 rounds → guard doe
 
   const { deps, rec } = makeDeps([naZ]);
   deps.getIssueDetail = async () => detailWithComments([
-    priorSurfaceComment(2, [findingX]),
-    priorSurfaceComment(2, [findingY]),
+    ...priorSurfaceCycle(2, [findingX], "surface-distinct-1", SHA_A),
+    ...priorSurfaceCycle(2, [findingY], "surface-distinct-2", "b".repeat(40)),
   ]);
 
   await quiet(t, async () => {
@@ -3404,7 +3603,7 @@ test("surface-recurrence (#234): distinct surfaces across 3 rounds → guard doe
   );
 });
 
-test("surface-recurrence (#234): exact-key repeat parks before the surface guard runs", async (t) => {
+test("surface-recurrence (#234): exact-key repeat enters typed recovery before the surface guard runs", async (t) => {
   // An exact finding-key repeat must be caught by the exact-key recurrence guard,
   // not by the surface guard. The outcome and comment style is the recurrence path.
   const findingA: ReviewFinding = {
@@ -3420,18 +3619,16 @@ test("surface-recurrence (#234): exact-key repeat parks before the surface guard
   const naA = JSON.stringify({ verdict: "needs-attention", summary: "repeat", findings: [currentFindingA], next_steps: [] });
   const { deps, rec } = makeDeps([naA]);
   // One prior round with the exact same finding (same key) — triggers exact-key recurrence guard.
-  deps.getIssueDetail = async () => detailWithComments([priorSurfaceComment(2, [findingA])]);
+  deps.getIssueDetail = async () => detailWithComments(
+    priorSurfaceCycle(2, [findingA], "surface-exact"),
+  );
 
   await quiet(t, async () => {
     await advanceReview(cfgSurface, 1, 2, {}, 0, deps);
   });
 
-  // The exact-key guard parks at needs-human before the surface guard evaluates.
-  assert.deepEqual(rec.transitions, [{ to: "needs-human" }]);
-  assert.ok(
-    rec.comments.some((c) => c.startsWith("## Pipeline: Review ceiling reached")),
-    "exact-key recurrence must post the ceiling comment",
-  );
+  assert.deepEqual(rec.transitions, []);
+  assert.deepEqual(rec.blockedKinds, ["review-findings"]);
 });
 
 test("surface-recurrence (#234): streak below threshold → guard does not fire", async (t) => {
@@ -3452,7 +3649,9 @@ test("surface-recurrence (#234): streak below threshold → guard does not fire"
   const naB = JSON.stringify({ verdict: "needs-attention", summary: "s", findings: [findingB], next_steps: [] });
   const { deps, rec } = makeDeps([naB]);
   // Only ONE prior round (streak would be 2 after current round — below threshold 3).
-  deps.getIssueDetail = async () => detailWithComments([priorSurfaceComment(2, [findingA])]);
+  deps.getIssueDetail = async () => detailWithComments(
+    priorSurfaceCycle(2, [findingA], "surface-below-threshold"),
+  );
 
   await quiet(t, async () => {
     await advanceReview(cfgSurface, 1, 2, {}, 0, deps);
@@ -3483,8 +3682,8 @@ test("surface-recurrence (#234): surface_recurrence_rounds=0 disables the guard"
 
   const { deps, rec } = makeDeps([naC]);
   deps.getIssueDetail = async () => detailWithComments([
-    priorSurfaceComment(2, [findingA]),
-    priorSurfaceComment(2, [findingB]),
+    ...priorSurfaceCycle(2, [findingA], "surface-disabled-1", SHA_A),
+    ...priorSurfaceCycle(2, [findingB], "surface-disabled-2", "b".repeat(40)),
   ]);
 
   await quiet(t, async () => {
@@ -3514,8 +3713,8 @@ test("surface-recurrence (#234): demote_and_advance — below-high cluster demot
   let createIssueCalls = 0;
   const { deps, rec } = makeDeps([naC]);
   deps.getIssueDetail = async () => detailWithComments([
-    priorSurfaceComment(2, [findingA]),
-    priorSurfaceComment(2, [findingB]),
+    ...priorSurfaceCycle(2, [findingA], "surface-demote-1", SHA_A),
+    ...priorSurfaceCycle(2, [findingB], "surface-demote-2", "b".repeat(40)),
   ]);
   deps.createIssue = async () => { createIssueCalls++; return 999; };
   deps.addIssueComment = async () => {};
@@ -3553,8 +3752,8 @@ test("surface-recurrence (#234): high finding in fired cluster is never auto-dem
   let createIssueCalls = 0;
   const { deps, rec } = makeDeps([naC]);
   deps.getIssueDetail = async () => detailWithComments([
-    priorSurfaceComment(2, [findingA]),
-    priorSurfaceComment(2, [findingB]),
+    ...priorSurfaceCycle(2, [findingA], "surface-high-1", SHA_A),
+    ...priorSurfaceCycle(2, [findingB], "surface-high-2", "b".repeat(40)),
   ]);
   deps.createIssue = async () => { createIssueCalls++; return 998; };
 
@@ -3563,8 +3762,11 @@ test("surface-recurrence (#234): high finding in fired cluster is never auto-dem
     outcome = await advanceReview(cfgSurfaceDemote, 1, 2, {}, 0, deps);
   });
 
-  // High finding must NOT be auto-demoted → park at needs-human.
-  assert.equal(outcome.to, "needs-human", "high finding in fired cluster must park, not advance");
+  // High finding must NOT be auto-demoted, but it remains engine-owned.
+  assert.equal(outcome.status, "blocked");
+  assert.equal(outcome.blockerKind, "review-findings");
+  assert.equal(projectStageDiagnostic(outcome.diagnostic).disposition, "recover");
+  assert.deepEqual(rec.transitions, []);
   assert.equal(createIssueCalls, 0, "no follow-up issue when high finding prevents demotion");
 });
 
@@ -3695,8 +3897,8 @@ test("surface-recurrence (#234): demote_and_advance from review-1 routes to revi
   const { deps, rec } = makeDeps([naC]);
   // Prior comments are round-1 comments so they are found by the round=1 filter.
   deps.getIssueDetail = async () => detailWithComments([
-    priorSurfaceComment(1, [findingA]),
-    priorSurfaceComment(1, [findingB]),
+    ...priorSurfaceCycle(1, [findingA], "surface-round1-1", SHA_A),
+    ...priorSurfaceCycle(1, [findingB], "surface-round1-2", "b".repeat(40)),
   ]);
   deps.createIssue = async () => { createIssueCalls++; return 997; };
   deps.addIssueComment = async () => {};
@@ -4249,15 +4451,18 @@ test("repair (#499): a partially-cleared round (prior finding gone, a NEW distin
 });
 
 test("repair (#499): a recurring finding (still blocking, unchanged key) is NOT recorded as repaired", async (t) => {
-  const { deps, rec } = makeDeps([NA_WITH_FINDING]); // re-emits FINDING_BUG (high) — still blocking
-  deps.getIssueDetail = async () => detailWithComments([priorVerdictComment(2, [FINDING_BUG])]);
+  const { deps, rec } = makeDeps([NA_WITH_ACKNOWLEDGED_FINDING]);
+  deps.getIssueDetail = async () => detailWithComments(
+    completedProductionFixCycle(2, [FINDING_BUG], "repair-recurring"),
+  );
   const { runStoreDeps, lines } = memRunStoreDepsForCorrection();
 
   await quiet(t, async () => {
     await advanceReview(cfgConverge, 1, 2, { runDir: "/tmp/run", runStoreDeps }, 0, deps);
   });
 
-  assert.deepEqual(rec.transitions, [{ to: "needs-human" }]);
+  assert.deepEqual(rec.transitions, []);
+  assert.deepEqual(rec.blockedKinds, ["review-findings"]);
   const corrections = lines().map((l) => JSON.parse(l)).filter((e) => e.type === "correction_event");
   assert.equal(corrections.length, 0, "a recurring/still-blocking finding is a detection, not a correction");
 });

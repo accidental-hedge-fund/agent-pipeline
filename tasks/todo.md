@@ -1,3 +1,35 @@
+# Post-#787 review recovery regressions
+
+## Status
+
+Implementation and local verification complete. Adversarial review rejected the first recurrence model because it used
+transitions production never emits and allowed stage-local/no-op recovery to consume the block. The
+replacement uses production-shaped repair evidence and a repair-first durable review class.
+
+## Plan
+
+- [x] Bind recurrence and ceiling history to a verified prior review/fix/advance cycle on an older candidate.
+- [x] Route genuine review non-convergence through a repair-first durable class, never stage-local retry or human authority.
+- [x] Upgrade resumed durable contracts additively while preserving custom entries and making every configured recipe reachable.
+- [x] Preserve `blocked` over bare open-PR reconciliation and replay existing started attempts without a second charge.
+- [x] Add production-shaped review, policy-migration, reconciliation, and supervisor regressions.
+- [x] Regenerate `plugin/` and update the relevant OpenSpec requirements.
+- [x] Run focused tests and `npm run ci`.
+- [ ] Create/upsert GitHub issue ownership, open a `v1.29.2` PR, and verify hosted CI.
+- [ ] After the fix is merged and installed, reset #626 to `pipeline:fix-1` and #675 to `pipeline:fix-2`.
+
+## Review
+
+- First adversarial pass found fabricated `fix-N -> review-N` fixtures, child-run identity mismatch,
+  stage-local auto-loop capture, a no-op `rerun_ci` first action, and an unreachable second engine
+  recipe. Shipping stopped before commit; all five findings are part of the replacement design.
+- Corrected focused regression suite: 542 passed, 0 failed. Strict OpenSpec validation,
+  generated-mirror check, diff check, and full `npm run ci` all passed.
+- Second adversarial pass found reviewer-prose injection could forge the standalone run marker.
+  Run identity is now a validated `ReviewArtifact` field, with a regression proving legacy injected
+  markers remain ineligible for recurrence.
+- Adversarial recheck of the artifact-bound fix: no blockers.
+
 # v1.29.2 autonomous recovery regression
 
 ## Status

@@ -16,6 +16,7 @@ export const STAGE_DIAGNOSTIC_SCHEMA = "pipeline/stage-diagnostic@1";
 export const STAGE_DIAGNOSTIC_REASON_CODES = [
   "workflow-state",
   "implementation-ci",
+  "review-findings",
   "workflow-engine-defect",
   "environment-auth",
   "worktree-capacity",
@@ -106,6 +107,8 @@ function mechanicalReasonCodeForKind(kind: BlockerKind): StageDiagnosticReasonCo
     case "design-gate-failed":
     case "ci-exhausted":
       return "implementation-ci";
+    case "review-findings":
+      return "review-findings";
     case "harness-failure":
       return "workflow-engine-defect";
     case "worktree-capacity":
@@ -169,6 +172,8 @@ export function projectPipelineReasonCode(reasonCode: unknown): StageDiagnosticP
       return { blockerClass: "workflow-state", disposition: "recover" };
     case "implementation-ci":
       return { blockerClass: "implementation-ci", disposition: "recover" };
+    case "review-findings":
+      return { blockerClass: "review-findings", disposition: "recover" };
     case "workflow-engine-defect":
       return { blockerClass: "workflow-engine-defect", disposition: "recover" };
     case "environment-auth":

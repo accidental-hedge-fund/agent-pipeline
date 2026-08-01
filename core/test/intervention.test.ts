@@ -383,6 +383,7 @@ test("blockerKindToInterventionKind: every BlockerKind maps to a known HumanInte
 
 test("blockerKindToInterventionKind: specific mappings are stable", () => {
   assert.equal(blockerKindToInterventionKind("test-gate-exhausted"), "test-build-failure");
+  assert.equal(blockerKindToInterventionKind("review-findings"), "test-build-failure");
   assert.equal(blockerKindToInterventionKind("eval-gate-failed"), "eval-shipcheck-failure");
   assert.equal(blockerKindToInterventionKind("eval-gate-misconfigured"), "eval-shipcheck-failure");
   assert.equal(blockerKindToInterventionKind("shipcheck-failed"), "eval-shipcheck-failure");

@@ -243,11 +243,13 @@ export function isAutoLoopRecoverable(out: Outcome): boolean {
   // Missing blockerKind is treated as non-recoverable (same as needs-human):
   // the pipeline cannot determine a recovery recipe for an unannotated blocker.
   if (!out.blockerKind) return false;
-  // Capacity is an ops admission wait — re-driving the auto-loop cannot free
-  // slots and would only thrash (#718). Human-required blocks also stay out.
+  // Capacity is an ops admission wait and review non-convergence requires a
+  // candidate-changing durable repair. Re-driving the same stage cannot
+  // satisfy either invariant. Human-required blocks also stay out.
   if (
     out.blockerKind === "needs-human" ||
     out.blockerKind === "human-decision-required" ||
+    out.blockerKind === "review-findings" ||
     out.blockerKind === "worktree-capacity"
   ) {
     return false;
@@ -677,9 +679,9 @@ export async function dispatch(
     case "design-gate":
       return designGateStage.advanceDesignGate(cfg, issueNumber, { dryRun, stateDir });
     case "review-1":
-      return reviewStage.advanceReview(cfg, issueNumber, 1, { dryRun, model, stateDir, runDir, runStoreDeps });
+      return reviewStage.advanceReview(cfg, issueNumber, 1, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "review-2":
-      return reviewStage.advanceReview(cfg, issueNumber, 2, { dryRun, model, stateDir, runDir, runStoreDeps });
+      return reviewStage.advanceReview(cfg, issueNumber, 2, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "fix-1":
       return fixStage.advanceFix(cfg, issueNumber, 1, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "fix-2":

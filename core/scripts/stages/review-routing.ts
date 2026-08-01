@@ -55,8 +55,8 @@ import {
 } from "../review-policy.ts";
 import { makePromptRecord, recordPrompt, recordReview } from "../evidence-bundle.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
-import { emitHumanIntervention } from "../intervention.ts";
 import { emitCorrectionEvent } from "../correction.ts";
+import { buildStageDiagnostic } from "../stage-diagnostic.ts";
 import { sanitizeDeep } from "../artifact-sanitize.ts";
 import type {
   Outcome,
@@ -75,7 +75,10 @@ import {
   extractDiffHashFromComment,
   extractReview1Risk,
   extractReviewArtifact,
+  extractReviewRunId,
   extractReviewedSha,
+  extractPipelineAttestation,
+  isVerifiedPipelineAttestation,
   parseStrictVerdict,
   parseStructuredVerdict,
   REVIEW_MARKER_PREFIX_R1,
@@ -87,7 +90,6 @@ import {
   buildFollowupUpdateComment,
   cfgFooter,
   formatReviewComment,
-  reviewCeilingComment,
   reviewCeilingDemotionComment,
 } from "./review-rendering.ts";
 import {
@@ -103,6 +105,8 @@ export interface AdvanceReviewOpts {
   stateDir?: string;
   /** Run directory for JSONL event log (#155). Undefined → event appends disabled. */
   runDir?: string;
+  /** GitHub audit run identity shared with stage-transition comments. */
+  pipelineRunId?: string;
   /** Run-store deps carrying `stdoutWrite` for streaming events (#155). */
   runStoreDeps?: RunStoreDeps;
   /** Pre-rendered context snapshot block for prompt injection (#318). Set internally by advanceReview. */
@@ -169,6 +173,7 @@ export async function advanceReview(
   const actor = await getGhActorFn();
 
   const stage: Stage = round === 1 ? "review-1" : "review-2";
+  const currentReviewRunId = opts.pipelineRunId;
 
   async function safeTransitionFn(fromStage: Stage, toStage: Stage, message: string): Promise<Outcome | null> {
     try {
@@ -255,15 +260,6 @@ export async function advanceReview(
   const plan = extractPlan(detail.comments);
   const review1Summary = round === 2 ? extractReview1Summary(detail.comments) : undefined;
   const priorReview2Findings = round === 2 ? extractReview2Findings(detail.comments) : undefined;
-  // Cross-round memory digest (#389): round 1 is by definition the first round
-  // of a run and re-reviews the full diff from scratch, so only round 2 (and
-  // its re-reviews) receives it.
-  const priorRoundsDigest: PriorRoundDigest | undefined =
-    round === 2
-      ? buildPriorRoundDigest(detail.comments, { actor, trustedOverrideActors: cfg.trusted_override_actors })
-      : undefined;
-  opts = { ...opts, priorRoundsDigest };
-
   // Extract pre-planning context snapshot (#318). Use exact header match to
   // avoid picking up the last30days brief (## Pre-Planning Context — last30days).
   const prePlanningCtxComment = extractSnapshotComment(detail.comments);
@@ -314,10 +310,86 @@ export async function advanceReview(
   // "approve" (zero findings block) and "needs-attention with residual
   // findings" paths below can detect which of those keys are no longer
   // blocking — a durably-landed repair, not a bare detection.
-  const priorRoundCommentsForRepair = detail.comments.filter((c) => c.body.startsWith(roundPfx));
-  const lastPriorRoundForRepair = priorRoundCommentsForRepair[priorRoundCommentsForRepair.length - 1];
-  const priorKeysForRepair = lastPriorRoundForRepair
-    ? extractBlockingKeysFromComment(lastPriorRoundForRepair.body)
+  const currentRunReviewHistory = currentReviewRunId === undefined
+    ? detail.comments
+    : detail.comments.filter((comment) =>
+      actor !== null &&
+      comment.author === actor &&
+      extractReviewRunId(comment.body) === currentReviewRunId
+    );
+  // Cross-round memory is a policy decision, so stale reviews from prior runs
+  // must not silently demote a fresh finding on the current candidate.
+  const priorRoundsDigest: PriorRoundDigest | undefined =
+    round === 2
+      ? buildPriorRoundDigest(currentRunReviewHistory, {
+        actor,
+        trustedOverrideActors: cfg.trusted_override_actors,
+      })
+      : undefined;
+  opts = { ...opts, priorRoundsDigest };
+
+  // A prior verdict counts toward recurrence/ceiling only after production's
+  // real repair path completed for that exact review run. Durable redispatch
+  // intentionally creates a new child run id, so the current review run is
+  // not expected to match the prior cycle. The trusted sequence is:
+  //   review-N verdict -> review-N/fix-N -> fix-N/actual-next-stage
+  // and the reviewed candidate must have changed. Duplicate verdict comments,
+  // legacy unmarked output, and fabricated fix-N/review-N transitions cannot
+  // consume a round.
+  const matchingFixStage = round === 1 ? "fix-1" : "fix-2";
+  const postFixStage = round === 1 ? "review-2" : "pre-merge";
+  const isRunTransition = (
+    comment: (typeof detail.comments)[number],
+    fromStage: Stage,
+    toStage: Stage,
+    runId: string,
+  ): boolean => {
+    const attestation = extractPipelineAttestation(comment.body);
+    return actor !== null &&
+      comment.author === actor &&
+      attestation?.kind === "stage-transition" &&
+      isVerifiedPipelineAttestation(comment.body) &&
+      comment.body.includes(`**Transition**: \`${fromStage}\` → \`${toStage}\``) &&
+      comment.body.includes(`<!-- pipeline-audit: run=${runId} state=${toStage} -->`);
+  };
+  const priorRoundCommentsForRecovery: typeof detail.comments = [];
+  for (let i = 0; i < detail.comments.length; i++) {
+    const comment = detail.comments[i];
+    if (actor === null || comment.author !== actor || !comment.body.startsWith(roundPfx)) continue;
+    const priorRunId = extractReviewRunId(comment.body);
+    const priorSha = extractReviewedSha([comment])?.sha ?? null;
+    if (priorRunId === null || priorSha === null) continue;
+
+    let enteredFix = false;
+    let completedFix = false;
+    let nextCandidateSha = commitSha;
+    for (let j = i + 1; j < detail.comments.length; j++) {
+      const later = detail.comments[j];
+      // A later verdict starts another candidate cycle. Do not let its
+      // transitions retroactively validate this one.
+      if (
+        later.body.startsWith(roundPfx) &&
+        actor !== null &&
+        later.author === actor &&
+        extractReviewRunId(later.body) !== null
+      ) {
+        nextCandidateSha = extractReviewedSha([later])?.sha ?? priorSha;
+        break;
+      }
+      if (!enteredFix && isRunTransition(later, stage, matchingFixStage, priorRunId)) {
+        enteredFix = true;
+        continue;
+      }
+      if (enteredFix && isRunTransition(later, matchingFixStage, postFixStage, priorRunId)) {
+        completedFix = true;
+      }
+    }
+    if (completedFix && nextCandidateSha !== priorSha) priorRoundCommentsForRecovery.push(comment);
+  }
+  const priorRoundCommentsForCorrection = detail.comments.filter((comment) => comment.body.startsWith(roundPfx));
+  const lastPriorRoundForCorrection = priorRoundCommentsForCorrection[priorRoundCommentsForCorrection.length - 1];
+  const priorKeysForCorrection = lastPriorRoundForCorrection
+    ? extractBlockingKeysFromComment(lastPriorRoundForCorrection.body)
     : new Set<string>();
 
   // #499 finding 7971a697: the reviewed SHA a repaired finding is lineage-
@@ -328,8 +400,8 @@ export async function advanceReview(
   // can still compute staleness/currency from the pair. Reuses
   // `extractReviewedSha`'s existing artifact-then-legacy-sentinel fallback
   // rather than reimplementing it.
-  const priorRoundReviewedSha = lastPriorRoundForRepair
-    ? extractReviewedSha([lastPriorRoundForRepair])?.sha ?? null
+  const priorRoundReviewedSha = lastPriorRoundForCorrection
+    ? extractReviewedSha([lastPriorRoundForCorrection])?.sha ?? null
     : null;
 
   // #499 review-2 finding c89694f9: a prior finding that is still returned by
@@ -341,7 +413,7 @@ export async function advanceReview(
   async function emitRepairedKeys(currentFindingKeys: Set<string>): Promise<void> {
     const headChanged = priorRoundReviewedSha !== null && priorRoundReviewedSha !== commitSha;
     const repairedKeys = headChanged
-      ? [...priorKeysForRepair].filter((k) => !currentFindingKeys.has(k))
+      ? [...priorKeysForCorrection].filter((k) => !currentFindingKeys.has(k))
       : [];
     if (!opts.runDir || repairedKeys.length === 0) return;
     const runId = path.basename(opts.runDir);
@@ -578,7 +650,7 @@ export async function advanceReview(
     // reviewer's own findings (which may carry non-blocking advisory
     // findings) — not assume every prior blocking key is gone.
     await emitRepairedKeys(new Set(verdict.findings.map((f) => findingKey(f))));
-    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, diffHash, review1RiskForComment)));
+    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, diffHash, review1RiskForComment, undefined, undefined, currentReviewRunId)));
     if (round === 1) {
       const r1Blocked = await safeTransitionFn("review-1", "review-2",
         `Standard review by ${reviewerLabel} — approved (${verdict.findings.length} findings).`);
@@ -600,7 +672,7 @@ export async function advanceReview(
       );
       return advanceReview(cfg, issueNumber, round, opts, retryCount + 1, deps);
     }
-    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, undefined, review1RiskForComment)));
+    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, undefined, review1RiskForComment, undefined, undefined, currentReviewRunId)));
     if (opts.stateDir) {
       await recordReview(opts.stateDir, issueNumber, {
         round, sha: commitSha, verdict: verdict.verdict, findingCounts,
@@ -708,7 +780,7 @@ export async function advanceReview(
   await emitRepairedKeys(new Set(verdict.findings.map((f) => findingKey(f))));
 
   if (partition.blocking.length === 0) {
-    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions, alternativeDemotions)));
+    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions, alternativeDemotions, currentReviewRunId)));
     const advisory = reviewComment(advisoryAdvanceComment(cfg, round, reviewer, partition));
     await postCommentFn(cfg, issueNumber, advisory);
     if (partition.advisory.length || partition.overridden.length) {
@@ -734,45 +806,53 @@ export async function advanceReview(
     };
   }
 
-  await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions, alternativeDemotions)));
+  await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions, alternativeDemotions, currentReviewRunId)));
 
-  const priorRoundComments = priorRoundCommentsForRepair;
+  const priorRoundComments = priorRoundCommentsForRecovery;
   const roundCap = cfg.review_policy.max_adversarial_rounds;
 
+  const blockForMechanicalReviewRecovery = async (detailText: string): Promise<Outcome> => {
+    const findings = partition.blocking.map((finding) => {
+      const location = finding.file
+        ? `${finding.file}${finding.line_start ? `:${finding.line_start}` : ""}`
+        : "unknown location";
+      return `${findingKey(finding)}/${findingPayloadFingerprint(finding)} ` +
+        `[${(finding.severity ?? "medium").toUpperCase()}] ${finding.title} at ${location}; ` +
+        `remediation: ${finding.recommendation || "address the blocking review finding"}`;
+    }).join(" | ");
+    const reason = `${detailText} at reviewed SHA ${commitSha}. The unresolved findings remain blocking and require bounded automated remediation followed by a fresh review; they do not grant human authority. Findings: ${findings}`;
+    const blockerKind = "review-findings" as const;
+    const diagnostic = buildStageDiagnostic({
+      blockerKind,
+      reason,
+      stage,
+    });
+    await setBlockedFn(cfg, issueNumber, reason, stage, blockerKind);
+    return {
+      advanced: false,
+      status: "blocked",
+      reason,
+      blockerKind,
+      diagnostic,
+    };
+  };
+
   // Recurrence-aware early park (#133).
-  const priorKeys = priorKeysForRepair;
+  const lastPriorRoundForRecovery = priorRoundCommentsForRecovery[priorRoundCommentsForRecovery.length - 1];
+  const priorKeys = lastPriorRoundForRecovery
+    ? extractBlockingKeysFromComment(lastPriorRoundForRecovery.body)
+    : new Set<string>();
   const recurring = partition.blocking.filter((f) => priorKeys.has(findingKey(f)));
-  if (recurring.length > 0) {
+  const newBlocking = partition.blocking.filter((f) => !priorKeys.has(findingKey(f)));
+  if (recurring.length > 0 && newBlocking.length === 0) {
     const atDemoteCeiling =
       roundCap > 0 &&
       priorRoundComments.length + 1 >= roundCap &&
       cfg.review_policy.ceiling_action === "demote_and_advance";
     if (!atDemoteCeiling) {
-      await postCommentFn(
-        cfg,
-        issueNumber,
-        reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments, "recurrence")),
-      );
       const recurrenceDetail = `Review ${round} re-emitted ${recurring.length} blocking finding(s) with an unchanged ` +
         `finding key after a fix round — a proven non-convergence signal`;
-      const recurrenceBlocked = await safeTransitionFn(stage, "needs-human",
-        `${recurrenceDetail}. Recorded as advisory; ` +
-          `parked at needs-human early, without consuming the remaining round budget (will NOT ` +
-          `auto-advance to ready-to-deploy).`,
-      );
-      await emitHumanIntervention(opts.runDir, {
-        kind: "review-non-convergence",
-        stage,
-        issue: issueNumber,
-        detail: recurrenceDetail,
-      }, opts.runStoreDeps).catch(() => {});
-      if (recurrenceBlocked) return recurrenceBlocked;
-      return {
-        advanced: true,
-        from: stage,
-        to: "needs-human",
-        summary: `recurrence: ${recurring.length} blocking finding(s) unchanged after a fix → needs-human`,
-      };
+      return blockForMechanicalReviewRecovery(recurrenceDetail);
     }
     // At ceiling with demote_and_advance: fall through.
   }
@@ -843,98 +923,83 @@ export async function advanceReview(
         nonFiredBlockers.length === 0 &&
         belowHighInFired.length > 0;
 
-      if (!shouldSurfaceDemote) {
-        await postCommentFn(
-          cfg,
-          issueNumber,
-          reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments, "recurrence")),
+      if (nonFiredBlockers.length > 0) {
+        // A mixed verdict contains a new blocker that has not consumed a repair
+        // attempt. Route the complete finding set through the normal fix path.
+      } else {
+        if (!shouldSurfaceDemote) {
+          const srDetail = `Review ${round} surface-recurrence guard fired on ${firedSurfaces.size} ` +
+            `surface(s) after ${surfaceRounds} consecutive rounds of new-key findings on the ` +
+            `same (file + category) cluster`;
+          return blockForMechanicalReviewRecovery(srDetail);
+        }
+
+        const createIssueFn = deps.createIssue ?? defaultCreateIssue(cfg);
+        const addIssueCommentFn = deps.addIssueComment ?? defaultAddIssueComment(cfg);
+
+        const existingFollowup = extractCeilingFollowupNumber(detail.comments, actor);
+        let surfaceFollowupNumber: number;
+        if (existingFollowup !== null) {
+          surfaceFollowupNumber = existingFollowup;
+          const updateBody = buildFollowupUpdateComment(issueNumber, priorRoundComments.length + 1, belowHighInFired);
+          await addIssueCommentFn(surfaceFollowupNumber, updateBody);
+        } else {
+          const followupBody = buildFollowupIssueBody(issueNumber, belowHighInFired);
+          surfaceFollowupNumber = await createIssueFn(
+            `[Deferred] Review ceiling findings from #${issueNumber}`,
+            followupBody,
+            [],
+          );
+        }
+
+        const surfaceDemotionBody = reviewCeilingDemotionComment(
+          cfg, round, reviewer,
+          { ...partition, blocking: belowHighInFired },
+          surfaceRounds, priorRoundComments, surfaceFollowupNumber,
         );
-        const srDetail = `Review ${round} surface-recurrence guard fired on ${firedSurfaces.size} ` +
-          `surface(s) after ${surfaceRounds} consecutive rounds of new-key findings on the ` +
-          `same (file + category) cluster`;
-        const srBlocked = await safeTransitionFn(stage, "needs-human",
-          `${srDetail}. Parked at needs-human early without consuming the remaining round budget.`,
+        const surfaceDemotionComment = reviewComment(surfaceDemotionBody);
+        await postCommentFn(cfg, issueNumber, surfaceDemotionComment);
+        try {
+          await postPrCommentFn(cfg, prNumber, surfaceDemotionComment);
+        } catch (err) {
+          console.warn(
+            `[pipeline] #${issueNumber}: could not mirror surface-recurrence demotion comment to PR #${prNumber}: ${(err as Error).message}`,
+          );
+        }
+
+        const surfaceTimestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+        for (const f of belowHighInFired) {
+          const key = findingKey(f);
+          const disposition = `deferred-#${surfaceFollowupNumber}`;
+          const body = overrideComment({
+            key,
+            disposition,
+            reason: `auto-demoted at surface-recurrence guard (${surfaceRounds} consecutive rounds on same (file+category) surface); deferred to #${surfaceFollowupNumber}`,
+            stage,
+            timestamp: surfaceTimestamp,
+            footer: cfg.marker_footer,
+          });
+          await postCommentFn(cfg, issueNumber, body);
+        }
+
+        const surfaceNextStage: Stage = round === 1 ? "review-2" : "pre-merge";
+        const srdBlocked = await safeTransitionFn(stage, surfaceNextStage,
+          `Surface-recurrence guard fired: ${belowHighInFired.length} below-high finding(s) ` +
+            `auto-demoted to advisory and deferred to #${surfaceFollowupNumber}. Advancing to ${surfaceNextStage}.`,
         );
-        await emitHumanIntervention(opts.runDir, {
-          kind: "review-non-convergence",
-          stage,
-          issue: issueNumber,
-          detail: srDetail,
-        }, opts.runStoreDeps).catch(() => {});
-        if (srBlocked) return srBlocked;
+        if (srdBlocked) return srdBlocked;
         return {
           advanced: true,
           from: stage,
-          to: "needs-human",
-          summary: `surface-recurrence: ${firedSurfaces.size} surface(s) hit ${surfaceRounds}-round streak → needs-human`,
+          to: surfaceNextStage,
+          summary: `surface-recurrence: ${belowHighInFired.length} below-high findings demoted → ${surfaceNextStage} (follow-up #${surfaceFollowupNumber})`,
         };
       }
-
-      const createIssueFn = deps.createIssue ?? defaultCreateIssue(cfg);
-      const addIssueCommentFn = deps.addIssueComment ?? defaultAddIssueComment(cfg);
-
-      const existingFollowup = extractCeilingFollowupNumber(detail.comments, actor);
-      let surfaceFollowupNumber: number;
-      if (existingFollowup !== null) {
-        surfaceFollowupNumber = existingFollowup;
-        const updateBody = buildFollowupUpdateComment(issueNumber, priorRoundComments.length + 1, belowHighInFired);
-        await addIssueCommentFn(surfaceFollowupNumber, updateBody);
-      } else {
-        const followupBody = buildFollowupIssueBody(issueNumber, belowHighInFired);
-        surfaceFollowupNumber = await createIssueFn(
-          `[Deferred] Review ceiling findings from #${issueNumber}`,
-          followupBody,
-          [],
-        );
-      }
-
-      const surfaceDemotionBody = reviewCeilingDemotionComment(
-        cfg, round, reviewer,
-        { ...partition, blocking: belowHighInFired },
-        surfaceRounds, priorRoundComments, surfaceFollowupNumber,
-      );
-      const surfaceDemotionComment = reviewComment(surfaceDemotionBody);
-      await postCommentFn(cfg, issueNumber, surfaceDemotionComment);
-      try {
-        await postPrCommentFn(cfg, prNumber, surfaceDemotionComment);
-      } catch (err) {
-        console.warn(
-          `[pipeline] #${issueNumber}: could not mirror surface-recurrence demotion comment to PR #${prNumber}: ${(err as Error).message}`,
-        );
-      }
-
-      const surfaceTimestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-      for (const f of belowHighInFired) {
-        const key = findingKey(f);
-        const disposition = `deferred-#${surfaceFollowupNumber}`;
-        const body = overrideComment({
-          key,
-          disposition,
-          reason: `auto-demoted at surface-recurrence guard (${surfaceRounds} consecutive rounds on same (file+category) surface); deferred to #${surfaceFollowupNumber}`,
-          stage,
-          timestamp: surfaceTimestamp,
-          footer: cfg.marker_footer,
-        });
-        await postCommentFn(cfg, issueNumber, body);
-      }
-
-      const surfaceNextStage: Stage = round === 1 ? "review-2" : "pre-merge";
-      const srdBlocked = await safeTransitionFn(stage, surfaceNextStage,
-        `Surface-recurrence guard fired: ${belowHighInFired.length} below-high finding(s) ` +
-          `auto-demoted to advisory and deferred to #${surfaceFollowupNumber}. Advancing to ${surfaceNextStage}.`,
-      );
-      if (srdBlocked) return srdBlocked;
-      return {
-        advanced: true,
-        from: stage,
-        to: surfaceNextStage,
-        summary: `surface-recurrence: ${belowHighInFired.length} below-high findings demoted → ${surfaceNextStage} (follow-up #${surfaceFollowupNumber})`,
-      };
     }
   }
 
   // Bounded rounds ceiling (#233).
-  if (roundCap > 0 && priorRoundComments.length + 1 >= roundCap) {
+  if (roundCap > 0 && newBlocking.length === 0 && priorRoundComments.length + 1 >= roundCap) {
     const highOrCritical = partition.blocking.filter(
       (f) => severityRank(f.severity) >= severityRank("high"),
     );
@@ -948,30 +1013,9 @@ export async function advanceReview(
       cfg.review_policy.ceiling_action === "demote_and_advance";
 
     if (!shouldDemote) {
-      await postCommentFn(
-        cfg,
-        issueNumber,
-        reviewComment(reviewCeilingComment(cfg, round, reviewer, partition, roundCap, priorRoundComments)),
-      );
       const ceilingDetail = `Review ${round} hit the ${roundCap}-round ceiling with ` +
         `${partition.blocking.length} finding(s) still blocking`;
-      const ceilingBlocked = await safeTransitionFn(stage, "needs-human",
-        `${ceilingDetail}. Recorded as advisory; parked at ` +
-          `needs-human for a human to override or fix (will NOT auto-advance to ready-to-deploy).`,
-      );
-      await emitHumanIntervention(opts.runDir, {
-        kind: "review-non-convergence",
-        stage,
-        issue: issueNumber,
-        detail: ceilingDetail,
-      }, opts.runStoreDeps).catch(() => {});
-      if (ceilingBlocked) return ceilingBlocked;
-      return {
-        advanced: true,
-        from: stage,
-        to: "needs-human",
-        summary: `review ceiling: ${partition.blocking.length} unresolved blocking → needs-human`,
-      };
+      return blockForMechanicalReviewRecovery(ceilingDetail);
     }
 
     const createIssueFn = deps.createIssue ?? defaultCreateIssue(cfg);

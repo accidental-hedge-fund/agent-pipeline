@@ -98,6 +98,7 @@ export function formatReviewComment(
   review1Risk?: Review1Risk,
   reversalDemotions?: Map<string, ReversalMatch>,
   alternativeDemotions?: Map<string, AlternativeReinstatementMatch>,
+  pipelineRunId?: string,
 ): string {
   const cfg = maybeReviewer === undefined ? undefined : cfgOrVerdict as PipelineConfig;
   const verdict = maybeReviewer === undefined
@@ -167,6 +168,12 @@ export function formatReviewComment(
   if (advisoryOrdinals.length > 0) {
     lines.push(`<!-- pipeline-advisory-ordinals: ${advisoryOrdinals.join(",")} -->`);
   }
+  if (pipelineRunId !== undefined) {
+    if (!/^[A-Za-z0-9._:/-]+$/.test(pipelineRunId)) {
+      throw new Error(`invalid pipeline review run id: ${pipelineRunId}`);
+    }
+    lines.push(`<!-- pipeline-review-run: ${pipelineRunId} -->`);
+  }
   // review1Risk sentinel for round-1 comments (so review-2 can recover the tier).
   if (round === 1 && review1Risk !== undefined) {
     lines.push(`<!-- pipeline-review1-risk: ${review1Risk} -->`);
@@ -192,6 +199,7 @@ export function formatReviewComment(
       review1Risk: round === 1 ? (review1Risk ?? null) : null,
       bodyHash,
     };
+    if (pipelineRunId !== undefined) artifact.pipelineRunId = pipelineRunId;
     if (blockingKeys !== undefined) {
       artifact.blockingFindings = buildFindingsExtension(
         verdict.findings.filter((f) => blockingKeys.has(findingKey(f))),

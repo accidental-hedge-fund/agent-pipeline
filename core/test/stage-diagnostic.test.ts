@@ -56,6 +56,19 @@ test("generic needs-human and delta-review are mechanical without explicit autho
   assert.equal(delta.reason_code, "workflow-state");
 });
 
+test("review findings project to a repair-first durable class", () => {
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "review-findings",
+    reason: "blocking adversarial finding survived a verified repair cycle",
+    stage: "review-2",
+  });
+  assert.equal(diagnostic.reason_code, "review-findings");
+  assert.deepEqual(projectStageDiagnostic(diagnostic), {
+    blockerClass: "review-findings",
+    disposition: "recover",
+  });
+});
+
 test("explicit human authority cannot be downgraded by a mechanical path tag", () => {
   for (const offrampClass of ["delta-review", "merge-conflict", "openspec-invalid"] as const) {
     const diagnostic = buildStageDiagnostic({
