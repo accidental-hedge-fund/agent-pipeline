@@ -1,8 +1,3 @@
-## RENAMED Requirements
-
-- FROM: `### Requirement: Terminal stage is ready-to-deploy`
-- TO: `### Requirement: Terminal stages are ready-to-deploy and needs-human`
-
 ## MODIFIED Requirements
 
 ### Requirement: Canonical ordered stage sequence
