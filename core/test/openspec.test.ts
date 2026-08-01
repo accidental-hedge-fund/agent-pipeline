@@ -16,7 +16,9 @@ import {
   openspecContext,
   openspecContextFromDiff,
   OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE,
+  OPENSPEC_ARCHIVE_JSON_MIN_VERSION,
   parseArchiveResult,
+  parseOpenspecCliVersion,
   parseValidateResult,
   readChangeFile,
   readSpecDeltas,
@@ -172,6 +174,9 @@ test("archive: requests JSON and verifies removal independently of exit code", a
   const result = await archive("/repo", "add-auth", 1234, {
     run: async (_dir, args) => {
       calls.push(args);
+      if (args[0] === "--version") {
+        return { code: 0, stdout: `${OPENSPEC_ARCHIVE_JSON_MIN_VERSION}\n`, stderr: "", unavailable: false };
+      }
       return {
         code: 0,
         stdout: JSON.stringify({
@@ -184,9 +189,82 @@ test("archive: requests JSON and verifies removal independently of exit code", a
     changeState: () => "present",
   });
 
-  assert.deepEqual(calls, [["archive", "add-auth", "--yes", "--json"]]);
+  assert.deepEqual(calls, [["--version"], ["archive", "add-auth", "--yes", "--json"]]);
   assert.equal(result.success, false);
   assert.equal(result.diagnostic?.diagnosticCode, "archive_active_change_remains");
+});
+
+// ---------------------------------------------------------------------------
+// archive CLI capability preflight — an old CLI (no `archive --json`) must fail
+// with an actionable upgrade diagnostic, never a garbage JSON-parse failure
+// that feeds implementer repair rounds.
+// ---------------------------------------------------------------------------
+
+test("archive: an older CLI fails the version preflight with an upgrade diagnostic and never reaches the JSON archive call", async () => {
+  const calls: string[][] = [];
+  const result = await archive("/repo", "add-auth", 1234, {
+    run: async (_dir, args) => {
+      calls.push(args);
+      if (args[0] === "--version") {
+        return { code: 0, stdout: "1.4.2\n", stderr: "", unavailable: false };
+      }
+      // What an old CLI would emit for the unsupported flag — must never be parsed.
+      return { code: 1, stdout: "", stderr: "error: unknown option '--json'", unavailable: false };
+    },
+    changeState: () => "present",
+  });
+
+  assert.deepEqual(calls, [["--version"]], "the archive --json call must not run on an unsupported CLI");
+  assert.equal(result.success, false);
+  assert.equal(result.unavailable, false);
+  assert.equal(result.diagnostic?.diagnosticCode, "archive_cli_unsupported");
+  assert.equal(result.diagnostic?.reasonCode, OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE);
+  // Doctor-grade: names the found version, the required version, and the remedy.
+  assert.match(result.output, /1\.4\.2/);
+  assert.ok(result.output.includes(OPENSPEC_ARCHIVE_JSON_MIN_VERSION));
+  assert.match(result.output, /Upgrade the openspec CLI/);
+  assert.ok(result.diagnostic?.message?.includes(OPENSPEC_ARCHIVE_JSON_MIN_VERSION));
+  assert.match(result.diagnostic?.fix ?? "", /Upgrade the openspec CLI/);
+});
+
+test("archive: an inconclusive version probe falls through to the archive call whose own result governs", async () => {
+  const calls: string[][] = [];
+  const result = await archive("/repo", "add-auth", 1234, {
+    run: async (_dir, args) => {
+      calls.push(args);
+      if (args[0] === "--version") {
+        // No parseable semver — the probe must not block a healthy CLI.
+        return { code: 0, stdout: "openspec dev build\n", stderr: "", unavailable: false };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ archive: { change: "add-auth", archivedAs: "2026-07-31-add-auth" } }),
+        stderr: "",
+        unavailable: false,
+      };
+    },
+    changeState: () => "removed",
+  });
+
+  assert.deepEqual(calls, [["--version"], ["archive", "add-auth", "--yes", "--json"]]);
+  assert.equal(result.success, true);
+});
+
+test("archive: an unavailable version probe reports the CLI unavailable without an apply-conflict diagnostic", async () => {
+  const result = await archive("/repo", "add-auth", 1234, {
+    run: async () => ({ code: -1, stdout: "", stderr: "openspec not found", unavailable: true }),
+    changeState: () => "present",
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.unavailable, true);
+  assert.equal(result.diagnostic, undefined);
+});
+
+test("parseOpenspecCliVersion: parses the real bare-version output and rejects versionless text", () => {
+  assert.deepEqual(parseOpenspecCliVersion("1.5.0\n"), [1, 5, 0]);
+  assert.deepEqual(parseOpenspecCliVersion("openspec/2.10.3 linux"), [2, 10, 3]);
+  assert.equal(parseOpenspecCliVersion("openspec dev build"), null);
 });
 
 test("listChangeDirs: lists change folders excluding archive", () => {

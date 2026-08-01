@@ -521,7 +521,11 @@ export interface LoopItemLedgerEntry {
    *  most recent blocked evidence recorded for this item. */
   evidence_fingerprint?: string;
   /** Consecutive prior blocks whose fingerprint equals `evidence_fingerprint`
-   *  — 0 on first occurrence, reset to 0 whenever the fingerprint changes. */
+   *  — 0 on first occurrence, reset to 0 whenever the fingerprint changes. At
+   *  the class's `repeated_evidence_limit` the supervisor claims no further
+   *  recovery attempt for this item (independent of remaining class budget)
+   *  and records a `repeated_no_progress` stop once no independent sibling is
+   *  schedulable. */
   repeated_evidence_count?: number;
   /** Present only while `state === "waiting"` — the outstanding human-input request a resume
    *  must satisfy. Cleared on a successful resume or abandon. */

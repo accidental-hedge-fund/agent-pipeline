@@ -165,7 +165,17 @@ function makeDeps(opts: {
     "pre-merge fix harness for #16 ran but left worktree /fake/worktree clean with no new " +
       "commit — no recoverable work was found there";
 
-  const autoFix: AttemptPreMergeAutoFixFn = async (findings, _title, reviewComment) => {
+  const autoFix: AttemptPreMergeAutoFixFn = async (findings, _title, reviewComment, claimAttempt) => {
+    // Honor the seam contract (#787): preflight is done here, so charge the
+    // durable attempt immediately before implementer work. A failed claim
+    // must not count as a harness invocation (autoFixCalls stays 0).
+    if (claimAttempt && !(await claimAttempt())) {
+      return {
+        status: "claim-failed",
+        diagnostic:
+          "durable pre-merge auto-fix attempt marker could not be recorded; implementer not invoked",
+      };
+    }
     rec.autoFixCalls++;
     rec.autoFixFindings = findings;
     rec.autoFixReviewComment = reviewComment;
@@ -2757,6 +2767,262 @@ test("pre-merge auto-fix #698 review-2: attempt-started marker post fails — ha
   assert.equal(rec.autoFixCalls, 0, "must not invoke harness when attempt marker cannot be recorded");
   assert.equal(rec.blocked.length, 1);
   assert.match(rec.blocked[0].reason, /attempt marker/i);
+});
+
+// ---------------------------------------------------------------------------
+// #787 preflight-before-claim: worktree preflight failures must not consume
+// the one-attempt bound (spec pre-merge-fix-round). The durable attempt marker
+// is charged by the seam only after worktree lookup / rematerialization /
+// clean-tree preflight succeed, immediately before the implementer.
+// ---------------------------------------------------------------------------
+
+/** Durable residual re-entry blocking verdict at `sha` (correctness → autofixable). */
+function residualReentryBlockingComment(sha: string): string {
+  const artifactLine = encodeReviewArtifact({
+    round: 2,
+    reviewedSha: sha,
+    diffHash: "abcd1234",
+    blockingKeys: ["5284604a"],
+    review1Risk: null,
+    bodyHash: "00",
+    blockingFindings: [{
+      key: "5284604a",
+      surface: "core/scripts/gh.ts|correctness",
+      severity: "high",
+      title: "Off-by-one in parser",
+      confidence: 0.95,
+    }],
+  });
+  return [
+    `## Review 2 (Adversarial) — needs-attention`,
+    "",
+    "No-ship: blocking findings remain.",
+    "",
+    `**1. [HIGH] Off-by-one** \`override-key: 5284604a\` \`category: correctness\``,
+    "",
+    `<!-- reviewed-sha: ${sha} -->`,
+    `<!-- pipeline-blocking-keys: 5284604a -->`,
+    artifactLine,
+  ].join("\n");
+}
+
+test("pre-merge auto-fix #787: residual re-entry preflight failure posts no marker; retry at same head still runs the implementer", async (t) => {
+  // Concrete #787 harm: rematerialization fails on worktree capacity BEFORE
+  // the implementer claim. Pre-fix, the gate posted the durable attempt marker
+  // before the seam, so this preflight failure consumed the single repair
+  // attempt and a freed-capacity re-entry at the same head refused to run the
+  // implementer (escalation instead of repair).
+  const initialComments = [
+    { author: TEST_ACTOR, body: residualReentryBlockingComment(SHA_HEAD) },
+  ];
+  const posted: string[] = [];
+  let implementerRuns = 0;
+  // Entry 1: production-shaped preflight failure — ensureManagedWorktree fails
+  // before performPreMergeAutoFix, so claimAttempt is never invoked.
+  let seam: AttemptPreMergeAutoFixFn = async () => ({
+    status: "rematerialize-failed",
+    blockerKind: "worktree-capacity",
+    diagnostic: "worktree rematerialize failed (worktree-capacity): at cap",
+  });
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () =>
+      ({
+        title: "Test issue",
+        body: "Body",
+        comments: [
+          ...initialComments,
+          ...posted.map((body) => ({ author: TEST_ACTOR, body })),
+        ],
+      }) as any,
+    getPrDetail: async () => ({ head_sha: SHA_HEAD, head_ref: "pipeline/16-test" }) as any,
+    getPrCommits: async () => [{ oid: SHA_HEAD, messageHeadline: "fix: prior work" }] as any,
+    postComment: async (_cfg, _n, body) => { posted.push(body); },
+    transition: async () => {},
+    setBlocked: async () => {},
+    getForIssue: async () => null,
+    listPrHeadChangeDirs: async () => [],
+    getGhActor: async () => TEST_ACTOR,
+    attemptPreMergeAutoFix: (findings, title, comment, claim) =>
+      seam(findings, title, comment, claim),
+  };
+  let out1: any;
+  await quiet(t, async () => {
+    out1 = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out1?.status, "blocked");
+  assert.equal(out1?.blockerKind, "worktree-capacity", "typed worktree park, not needs-human");
+  assert.equal(
+    posted.filter((c) => c.startsWith(PRE_MERGE_AUTOFIX_ATTEMPT_HEADING)).length,
+    0,
+    "preflight failure must NOT post the durable attempt-started marker (#787)",
+  );
+
+  // Entry 2: capacity freed — same head. The marker scan must find nothing, so
+  // the seam reaches the implementer this time.
+  seam = async (_findings, _title, _comment, claimAttempt) => {
+    if (claimAttempt && !(await claimAttempt())) {
+      return { status: "claim-failed", diagnostic: "claim failed" };
+    }
+    implementerRuns++;
+    return { status: "fix-committed", headSha: SHA_AFTER_FIX };
+  };
+  let out2: any;
+  await quiet(t, async () => {
+    out2 = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(
+    implementerRuns,
+    1,
+    "re-entry at the same head must run the implementer — the preflight failure did not consume the attempt",
+  );
+  assert.equal(out2?.advanced, true, "successful residual re-entry auto-fix re-enters pre-merge");
+  assert.equal(out2?.to, "pre-merge");
+  assert.equal(
+    posted.filter((c) => c.startsWith(PRE_MERGE_AUTOFIX_ATTEMPT_HEADING)).length,
+    1,
+    "successful path posts the attempt marker exactly once",
+  );
+});
+
+test("pre-merge auto-fix #787: delta-path rematerialize-failed preflight does not post the attempt marker", async (t) => {
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("correctness")],
+    reReviewFindings: [],
+    autoFixResult: "fix-committed",
+  });
+  let seamCalls = 0;
+  // Production-shaped: ensureManagedWorktree fails inside the seam before
+  // performPreMergeAutoFix, so claimAttempt is never invoked.
+  deps.attemptPreMergeAutoFix = async () => {
+    seamCalls++;
+    return {
+      status: "rematerialize-failed",
+      blockerKind: "worktree-capacity",
+      diagnostic: "worktree rematerialize failed (worktree-capacity): at cap",
+    };
+  };
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(seamCalls, 1, "delta path invokes the seam");
+  assert.equal(out?.status, "blocked");
+  assert.equal(out?.blockerKind, "worktree-capacity");
+  assert.equal(
+    rec.comments.filter((c) => c.startsWith(PRE_MERGE_AUTOFIX_ATTEMPT_HEADING)).length,
+    0,
+    "delta-path preflight failure must NOT post the attempt-started marker (#787)",
+  );
+});
+
+test("pre-merge auto-fix #787: marker is claimed exactly once, after preflight and before the implementer", async (t) => {
+  const { deps, rec } = makeDeps({
+    findings: [blockingFinding("correctness")],
+    reReviewFindings: [],
+    autoFixResult: "fix-committed",
+  });
+  let markerPresentAtImplementerStart: boolean | null = null;
+  let implementerRuns = 0;
+  deps.attemptPreMergeAutoFix = async (_findings, _title, _comment, claimAttempt) => {
+    if (claimAttempt && !(await claimAttempt())) {
+      return { status: "claim-failed", diagnostic: "claim failed" };
+    }
+    implementerRuns++;
+    rec.autoFixCalls++;
+    markerPresentAtImplementerStart = rec.comments.some((c) =>
+      c.startsWith(PRE_MERGE_AUTOFIX_ATTEMPT_HEADING),
+    );
+    return { status: "fix-committed", headSha: SHA_AFTER_FIX };
+  };
+  let out: any;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfgWithPolicy, 16, 99, deps);
+  });
+  assert.equal(out, null, "fix + approving re-review proceeds");
+  assert.equal(implementerRuns, 1);
+  assert.equal(
+    markerPresentAtImplementerStart,
+    true,
+    "the durable attempt marker must be posted before the implementer runs",
+  );
+  assert.equal(
+    rec.comments.filter((c) => c.startsWith(PRE_MERGE_AUTOFIX_ATTEMPT_HEADING)).length,
+    1,
+    "exactly one attempt marker on the successful path",
+  );
+  // Duplicate re-entry at the same head still refuses a second implementer run
+  // (durable marker bound) — covered end-to-end by the #698 review-2 tests
+  // above ("prior attempt-started marker exhausts attempt ...").
+});
+
+test("performPreMergeAutoFix #787: claim runs after clean-tree preflight, immediately before the harness", async () => {
+  const stubSalvage = async () => ({ salvaged: false }) as TrySalvageResult;
+  const okInvoke = { success: true, stdout: "", stderr: "", exit_code: 0, duration: 0, timed_out: false };
+
+  // (1) Dirty pre-fix tree: preflight fails → the attempt must NOT be charged.
+  {
+    const { fn: gitFn } = makeSeqGitFn([
+      { code: 0, stdout: "sha1" }, // rev-parse HEAD
+      { code: 0, stdout: "M  core/scripts/foo.ts" }, // status --porcelain (pre: DIRTY)
+    ]);
+    let claims = 0;
+    let invoked = false;
+    const result = await performPreMergeAutoFix(
+      autoFixCfg, 42, "run-id", "finding: x", "Test issue", autoFixWt, gitFn,
+      async () => { invoked = true; return okInvoke; },
+      stubSalvage, {},
+      async () => { claims++; return true; },
+    );
+    assert.deepEqual(result, { status: "error" });
+    assert.equal(claims, 0, "dirty-tree preflight failure must not charge the attempt (#787)");
+    assert.equal(invoked, false, "harness must not run on a dirty pre-fix tree");
+  }
+
+  // (2) Clean path: claim charged exactly once, before the harness is invoked.
+  {
+    const { fn: gitFn } = makeSeqGitFn([
+      { code: 0, stdout: "sha1" }, // rev-parse HEAD
+      { code: 0, stdout: "" },     // status --porcelain (pre: clean)
+      { code: 0, stdout: "" },     // checkout -B (reattach)
+      { code: 0, stdout: "sha2" }, // rev-parse HEAD (post-harness, new commit)
+      { code: 0, stdout: "" },     // status --porcelain (post: clean)
+      { code: 0, stdout: "" },     // commit --amend
+      { code: 0, stdout: "sha3" }, // rev-parse HEAD (postFixHead)
+      { code: 0, stdout: "" },     // push
+    ]);
+    let claims = 0;
+    let claimsAtInvoke = -1;
+    const result = await performPreMergeAutoFix(
+      autoFixCfg, 42, "run-id", "finding: x", "Test issue", autoFixWt, gitFn,
+      async () => { claimsAtInvoke = claims; return okInvoke; },
+      stubSalvage, {},
+      async () => { claims++; return true; },
+    );
+    assert.deepEqual(result, { status: "fix-committed", headSha: "sha3" });
+    assert.equal(claims, 1, "exactly one claim per attempt");
+    assert.equal(
+      claimsAtInvoke, 1,
+      "the attempt must be charged BEFORE the harness runs (#787 — pre-fix, the gate claimed outside the seam)",
+    );
+  }
+
+  // (3) Claim refused: harness must not run; typed claim-failed returned.
+  {
+    const { fn: gitFn } = makeSeqGitFn([
+      { code: 0, stdout: "sha1" }, // rev-parse HEAD
+      { code: 0, stdout: "" },     // status --porcelain (pre: clean)
+      { code: 0, stdout: "" },     // checkout -B (reattach)
+    ]);
+    let invoked = false;
+    const result = await performPreMergeAutoFix(
+      autoFixCfg, 42, "run-id", "finding: x", "Test issue", autoFixWt, gitFn,
+      async () => { invoked = true; return okInvoke; },
+      stubSalvage, {},
+      async () => false,
+    );
+    assert.equal(result.status, "claim-failed", "refused claim must return the typed claim-failed outcome");
+    assert.equal(invoked, false, "failed claim must not invoke the harness");
+  }
 });
 
 test("pre-merge auto-fix #698: #683-class stale classification already correct on HEAD does not hard-block", async (t) => {

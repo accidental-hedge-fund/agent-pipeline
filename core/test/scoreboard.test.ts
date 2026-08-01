@@ -2179,3 +2179,125 @@ test("buildScoreboardReport: legacy dual-write without offramp_id in one entry d
   assert.equal(pm.by_class["merge-conflict"].count, 1);
   assert.equal(pm.by_class.other.count, 0);
 });
+
+test("buildScoreboardReport: per-round blocker_set recovered in-process does not count; terminal blocks do (#787)", async () => {
+  // blocker_set is now emitted per round, before in-process recovery clears
+  // it. A block followed by a pre-merge re-entry in the same run was recovered
+  // by the bounded auto-loop and must not count as an off-ramp.
+  const files: Record<string, string> = {};
+  // Run A: blocked, auto-loop recovered in-process, then advanced → 0 off-ramps.
+  addRun(files, "recovered-2026-06-10T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-10T00:00:00Z", issue: 1 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-10T00:00:00Z", issue: 1, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-10T00:00:10Z", stage: "pre-merge" },
+      { schema_version: 1, type: "stage_complete", at: "2026-06-10T00:01:00Z", stage: "pre-merge", outcome: "blocked" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-10T00:01:01Z",
+        reason: "CI checks failed",
+        stage: "pre-merge",
+        blocker_kind: "test-gate-exhausted",
+        offramp_class: "ci-failed",
+      },
+      // Auto-loop re-entry: the block above was cleared in-process.
+      { schema_version: 1, type: "stage_start", at: "2026-06-10T00:05:00Z", stage: "pre-merge" },
+      { schema_version: 1, type: "stage_complete", at: "2026-06-10T00:06:00Z", stage: "pre-merge", outcome: "advanced" },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T00:07:00Z", final_state: "ready-to-deploy", elapsed_ms: 420000 },
+    ],
+    summary: { issue: 1, pr: 101, finalState: "ready-to-deploy", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+  // Run B: ends blocked → exactly 1 off-ramp.
+  addRun(files, "terminal-2026-06-11T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-11T00:00:00Z", issue: 2 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-11T00:00:00Z", issue: 2, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-11T00:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-11T00:01:00Z",
+        reason: "merge conflict",
+        stage: "pre-merge",
+        blocker_kind: "merge-conflict",
+        offramp_class: "merge-conflict",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-11T00:02:00Z", final_state: "blocked", elapsed_ms: 120000 },
+    ],
+    summary: { issue: 2, pr: 102, finalState: "blocked", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+  // Run C: blocked, recovered, blocked again terminally → only the last counts.
+  addRun(files, "re-terminal-2026-06-12T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-12T00:00:00Z", issue: 3 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-12T00:00:00Z", issue: 3, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-12T00:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-12T00:01:00Z",
+        reason: "CI checks failed",
+        stage: "pre-merge",
+        blocker_kind: "test-gate-exhausted",
+        offramp_class: "ci-failed",
+      },
+      { schema_version: 1, type: "stage_start", at: "2026-06-12T00:05:00Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-12T00:06:00Z",
+        reason: "CI checks failed again",
+        stage: "pre-merge",
+        blocker_kind: "test-gate-exhausted",
+        offramp_class: "ci-failed",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-12T00:07:00Z", final_state: "blocked", elapsed_ms: 420000 },
+    ],
+    summary: { issue: 3, pr: 103, finalState: "blocked", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" },
+    memDeps(files),
+  );
+  const pm = report.metrics.pre_merge_needs_human;
+  assert.equal(pm.pre_merge_entries, 5, "every pre-merge entry still counts in the denominator");
+  assert.equal(pm.pre_merge_needs_human_count, 2, "in-process-recovered blocks are evidence, not off-ramps");
+  assert.equal(pm.by_class["ci-failed"].count, 1, "only run C's terminal CI block counts");
+  assert.equal(pm.by_class["merge-conflict"].count, 1);
+});
+
+test("buildScoreboardReport: blocker_cleared before a re-entry is a human-resolved off-ramp and still counts (#787)", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "human-cleared-2026-06-10T00-00-00-000Z", {
+    runJson: { started_at: "2026-06-10T00:00:00Z", issue: 1 },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-10T00:00:00Z", issue: 1, repo: "owner/repo" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-10T00:00:10Z", stage: "pre-merge" },
+      {
+        schema_version: 1,
+        type: "blocker_set",
+        at: "2026-06-10T00:01:00Z",
+        reason: "merge conflict",
+        stage: "pre-merge",
+        blocker_kind: "merge-conflict",
+        offramp_class: "merge-conflict",
+      },
+      // Human unblock/override records blocker_cleared before the re-entry.
+      { schema_version: 1, type: "blocker_cleared", at: "2026-06-10T01:00:00Z" },
+      { schema_version: 1, type: "stage_start", at: "2026-06-10T01:00:10Z", stage: "pre-merge" },
+      { schema_version: 1, type: "stage_complete", at: "2026-06-10T01:01:00Z", stage: "pre-merge", outcome: "advanced" },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T01:02:00Z", final_state: "ready-to-deploy", elapsed_ms: 3720000 },
+    ],
+    summary: { issue: 1, pr: 101, finalState: "ready-to-deploy", stages: [], reviews: [], overrides: [], recoveries: [] },
+  });
+
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-30T00:00:00Z" },
+    memDeps(files),
+  );
+  const pm = report.metrics.pre_merge_needs_human;
+  assert.equal(pm.pre_merge_needs_human_count, 1, "a human-cleared block was still an off-ramp to a human");
+  assert.equal(pm.by_class["merge-conflict"].count, 1);
+});

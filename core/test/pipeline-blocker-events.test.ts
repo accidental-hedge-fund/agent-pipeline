@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { readFileSync } from "node:fs";
 
 import {
@@ -7,10 +10,17 @@ import {
   emitBlockedOutcomeEvents,
   isAutoLoopRecoverable,
   isHumanAuthorityBlocker,
+  runAdvance,
+  type AdvanceDeps,
 } from "../scripts/pipeline-run.ts";
-import type { RunStoreDeps } from "../scripts/run-store.ts";
-import { buildStageDiagnostic, type StageDiagnostic } from "../scripts/stage-diagnostic.ts";
-import type { BlockerKind, Outcome } from "../scripts/types.ts";
+import { runDirPath, type RunStoreDeps } from "../scripts/run-store.ts";
+import {
+  buildStageDiagnostic,
+  projectStageDiagnostic,
+  type StageDiagnostic,
+} from "../scripts/stage-diagnostic.ts";
+import type { BlockerKind, Outcome, PipelineConfig } from "../scripts/types.ts";
+import type { CliOpts } from "../scripts/pipeline.ts";
 
 const runStoreDeps = {} as RunStoreDeps;
 
@@ -186,12 +196,118 @@ test("auto-loop exhaustion preserves typed blocks and materializes typed waits",
   assert.equal(exhaustedCi.diagnostic?.detail.blocker_kind, "ci-exhausted");
   assert.equal(exhaustedCi.diagnostic?.reason_code, "implementation-ci");
 
+  // A non-pre-merge expired wait is workflow state, never an engine defect:
+  // `harness-failure` would project to `workflow-engine-defect` (run_fatal,
+  // retry budget 1) and stop a whole durable loop run over an ordinary wait.
   const executorWait: Outcome = { advanced: false, status: "waiting", reason: "executor unavailable" };
   const exhaustedExecutor = autoLoopExhaustedBlockedOutcome(executorWait, "eval-gate");
   assert.equal(exhaustedExecutor.status, "blocked");
-  assert.equal(exhaustedExecutor.blockerKind, "harness-failure");
-  assert.equal(exhaustedExecutor.diagnostic?.reason_code, "workflow-engine-defect");
-  assert.notEqual(exhaustedExecutor.blockerKind, "needs-human");
+  assert.equal(exhaustedExecutor.blockerKind, "needs-human");
+  assert.equal(exhaustedExecutor.diagnostic?.reason_code, "workflow-state");
+  assert.notEqual(exhaustedExecutor.blockerKind, "harness-failure");
+  const projected = projectStageDiagnostic(exhaustedExecutor.diagnostic);
+  assert.equal(projected.blockerClass, "workflow-state");
+  assert.equal(projected.disposition, "recover");
+});
+
+// ---------------------------------------------------------------------------
+// Runtime wiring regression (#787): the REAL runAdvance loop must write the
+// canonical blocker_set evidence to events.jsonl for a blocked stage outcome.
+// Deleting the emission block in runAdvance must fail this test — a source-text
+// pin cannot detect that. All I/O is injected via AdvanceDeps; the run store
+// writes to a temp dir. No network, git, or subprocess.
+// ---------------------------------------------------------------------------
+
+test("runAdvance emits blocker_set with the producer diagnostic to events.jsonl (runtime wiring)", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-run-advance-"));
+  // runStateDir/withLock derive host-local paths from the domain; a unique
+  // domain confines this test's /tmp state, removed in the finally below.
+  const domain = `blocker-events-${process.pid}-${Date.now()}`;
+  const stateDir = `/tmp/pipeline-${domain}`;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "merge conflict with base",
+    stage: "ready",
+  });
+  const cfg = {
+    repo: "owner/repo",
+    domain,
+    repo_dir: repoDir,
+    base_branch: "main",
+    invocation: "pipeline",
+    marker_footer: "*Automated by Claude Code Pipeline Skill*",
+    harnesses: {
+      implementer: "claude",
+      implementerSource: "default",
+      reviewer: "codex",
+      reviewerSource: "default",
+    },
+    steps: { standard_review: true, adversarial_review: true },
+    auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
+    papercuts: { enabled: false, auto_file: false },
+    corrections: { auto_file: false },
+  } as unknown as PipelineConfig;
+  const detail = {
+    number: 7,
+    type: "issue",
+    title: "T",
+    body: "B",
+    state: "open",
+    url: "https://example.test/7",
+    labels: ["pipeline:ready"],
+    comments: [],
+  };
+  const runId = "7-2026-08-01T00-00-00-000Z";
+  const deps: AdvanceDeps = {
+    resolvePinnedEngineIdentity: () => null,
+    probeEngineIdentity: () => null,
+    releaseParkedWorktree: async () => ({
+      action: "absent",
+      reason: "no managed worktree",
+      branch: null,
+      worktree: null,
+    }),
+    ensurePipelineLabels: async () => {},
+    getIssueDetail: (async () => detail) as AdvanceDeps["getIssueDetail"],
+    getGhActor: async () => "pipeline-bot",
+    getPrForIssue: async () => null,
+    getOnDiskForIssue: async () => null,
+    postComment: async () => {},
+    postPrComment: async () => {},
+    dispatch: async () => ({
+      advanced: false,
+      status: "blocked",
+      reason: "merge conflict with base",
+      blockerKind: "merge-conflict",
+      diagnostic,
+    }),
+  };
+  try {
+    await runAdvance(cfg, 7, { runId } as CliOpts, deps);
+    const eventsPath = path.join(runDirPath(repoDir, runId), "events.jsonl");
+    const events = fs
+      .readFileSync(eventsPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const blockerEvents = events.filter((e) => e.type === "blocker_set");
+    assert.equal(
+      blockerEvents.length,
+      1,
+      "the real advance loop must emit exactly one blocker_set for a blocked outcome",
+    );
+    const event = blockerEvents[0];
+    assert.equal(event.stage, "ready");
+    assert.equal(event.blocker_kind, "merge-conflict");
+    assert.equal(event.reason, "merge conflict with base");
+    assert.deepEqual(event.diagnostic, diagnostic, "the producer diagnostic must be transported into the event");
+    assert.equal(typeof event.offramp_id, "string");
+    // Mechanical block: canonical evidence only — no human_intervention.
+    assert.equal(events.some((e) => e.type === "human_intervention"), false);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
 });
 
 test("auto-loop exhaustion branch does not transition or emit generic human intervention", () => {

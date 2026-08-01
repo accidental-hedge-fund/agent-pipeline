@@ -43,7 +43,7 @@ import {
   silentTransition,
   transition,
 } from "./gh.ts";
-import { isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
+import { PipelineLock, isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
 import { findWrapperPidForIssue, isCoexistenceFailureEvidence } from "./loop/live-advance.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import {
@@ -197,8 +197,10 @@ import {
 import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
   BLOCKED_LABEL,
+  BLOCKER_KINDS,
   LABEL_PREFIX,
   reviewStageSkipTarget,
+  type BlockerKind,
   type EvidenceBundle,
   type Outcome,
   type PipelineConfig,
@@ -1064,18 +1066,22 @@ export function realDispatchItem(
     let prNumber: number | null = null;
     try {
       const detail = await getIssueDetailFn(cfg, issueNumber);
-      // Prefer the advance run's last blocker_kind so pure capacity (#718) is
-      // not classified as product needs-human when the blocked label is set.
-      // Fall back to the durable kind marker on the blocked comment when events
-      // lack blocker_set (early-blocked re-dispatch after a prior capacity hit).
+      // Prefer the advance run's last blocker_set diagnostic. When the fresh
+      // per-dispatch events lack one (an already-blocked item early-exits in
+      // pipeline-run.ts before writing any blocker_set), fall back to the
+      // durable attested kind marker on the blocked comment (#718) for EVERY
+      // blocker kind — capacity, mechanical, or human — so the re-dispatch is
+      // classified by its true blocker class instead of cascading into a
+      // protocol failure the supervisor treats as an engine defect.
       let eventsTextForClassify: string | null = null;
       if (pin && storeReady) {
         eventsTextForClassify = readEventsTextFn(pin.events_path);
       }
       let resolution = lastStageDiagnosticFromEventsJsonl(eventsTextForClassify ?? "");
-      // Compatibility for capacity early-exits before a fresh run-store event:
-      // only the authenticated, current blocked-label incarnation may supply
-      // this structural fallback. Comment prose is never read or transported.
+      // Compatibility for early-exits before a fresh run-store event: only the
+      // authenticated, current blocked-label incarnation may supply this
+      // structural fallback. Comment prose is never read or transported.
+      let markerHumanDecision = false;
       if (resolution.diagnostic === null && Array.isArray(detail.comments)) {
         const actor = await getGhActorFn();
         let blockedLabeledAt: string | null = null;
@@ -1088,19 +1094,43 @@ export function realDispatchItem(
           trustedAuthor: actor,
           blockedLabeledAt,
         });
-        if (trustedKind === "worktree-capacity") {
-          const capacityDiagnostic = buildStageDiagnostic({
-            blockerKind: "worktree-capacity",
+        if (trustedKind === "human-decision-required") {
+          // Authority boundary: the marker attests only the prior hold's
+          // structured KIND. It may keep an already-blocked item safely parked
+          // for a human, but it never reconstructs attested human authority —
+          // no authority_evidence, no reviewed-candidate binding — so no
+          // diagnostic is synthesized (buildStageDiagnostic rightly rejects an
+          // evidence-less human-decision-required). The outcome override below
+          // yields the conservative human-resume-only hold, never an
+          // authority-verified one.
+          markerHumanDecision = true;
+        } else if (
+          trustedKind !== null &&
+          (BLOCKER_KINDS as readonly string[]).includes(trustedKind)
+        ) {
+          // Mechanical kinds (including worktree-capacity) synthesize the same
+          // coarse structural diagnostic stageDiagnosticFromBlockerSet builds,
+          // so recovery targets the true blocker class, not engine-defect.
+          const markerDiagnostic = buildStageDiagnostic({
+            blockerKind: trustedKind as BlockerKind,
             reason: "trusted current blocker-kind attestation",
           });
           resolution = {
-            ...projectStageDiagnostic(capacityDiagnostic),
-            diagnostic: capacityDiagnostic,
+            ...projectStageDiagnostic(markerDiagnostic),
+            diagnostic: markerDiagnostic,
           };
         }
       }
       diagnostic = resolution.diagnostic ?? undefined;
       outcome = classifyDispatchOutcome(detail, diagnostic, eventsTextForClassify);
+      // A trusted human-decision marker on a still-blocked item is a human
+      // hold, not a protocol failure — without this the supervisor would
+      // synthesize workflow-engine-defect and run autonomous recovery against
+      // a human-authority-held item. Absent/invalid markers keep the
+      // protocol-failure classification above.
+      if (markerHumanDecision && outcome === "failed" && detail.labels.includes(BLOCKED_LABEL)) {
+        outcome = "blocked_needs_human";
+      }
       // Pure capacity is ops admission, not a product block: clear the label so
       // re-admission after a slot frees does not thrash on an already-blocked
       // early-exit (#718). Clear MUST succeed before capacity_wait is safe for a
@@ -1120,9 +1150,10 @@ export function realDispatchItem(
               `emitting capacity_wait with blocked label still present — durable ` +
               `blocker-kind on the issue comment must classify the next re-dispatch as capacity`,
           );
-          // Do not convert to failed: supervisor maps failed+blocked → needs-human.
-          // capacity_wait keeps ops admission for this cycle; comment kind protects
-          // the next early-blocked re-dispatch (see lastBlockerKindFromComments).
+          // Do not convert to failed: the supervisor routes failed into
+          // engine-defect recovery / run_fatal. capacity_wait keeps ops
+          // admission for this cycle; the durable marker classifies the next
+          // early-blocked re-dispatch as capacity (see lastBlockerKindFromComments).
         }
       }
       const pr = await getPrForIssueFn(cfg, issueNumber).catch(() => null);
@@ -1681,6 +1712,19 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     repoDir: cfg.repo_dir,
     lockDomain: cfg.domain,
     findWrapperPid: (issueNumber) => findWrapperPidForIssue(issueNumber),
+    // Recovery coexistence guard: the supervisor takes this same per-issue
+    // advance lock (the one every `pipeline run` / override advance serializes
+    // through) non-blocking and holds it across a recovery execution, so a
+    // concurrent advance and a loop recovery can never write the same managed
+    // worktree at once. A non-numeric item id cannot map to a lock path —
+    // treat it as busy (fail closed) rather than recovering unlocked.
+    acquireItemAdvanceLock: (itemId) => {
+      const issueNumber = Number(itemId);
+      if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) return null;
+      const lock = new PipelineLock({ domain: cfg.domain, issueNumber });
+      if (!lock.acquire()) return null;
+      return { release: () => lock.release() };
+    },
     // Mid-advance stage-progress observation (#611): read the linked advance
     // events.jsonl while waiting on the child. Injectable for unit tests.
     readAdvanceEvents: async (eventsPath) => {

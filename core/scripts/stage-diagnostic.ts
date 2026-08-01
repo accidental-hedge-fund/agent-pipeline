@@ -20,6 +20,11 @@ export const STAGE_DIAGNOSTIC_REASON_CODES = [
   "worktree-capacity",
   "human-decision-required",
   "openspec-archive-apply-conflict",
+  // No engine stage emits this exact code today: planning/plan-review
+  // validation failures project the coarse implementation-ci diagnostic (see
+  // specs/openspec-integration). The member is accepted for external
+  // loop-execution producers (LoopExecutionResponse.diagnostic) through the
+  // exact-acceptance branch in projectStageDiagnostic below.
   "openspec-generated-delta-invalid",
 ] as const;
 

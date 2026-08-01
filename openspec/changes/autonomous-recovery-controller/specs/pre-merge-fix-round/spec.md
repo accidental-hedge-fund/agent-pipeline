@@ -3,16 +3,19 @@
 ### Requirement: Pre-merge SHALL perform at most one auto-fix attempt per entry
 
 The pipeline SHALL perform at most one implementer auto-fix attempt for a pre-merge blocking delta
-review at a given authoritative candidate identity. The durable attempt key SHALL be item,
-candidate identity, reason code, and repair action rather than a worktree marker alone. Candidate-
-currency checks, worktree lookup, safe rematerialization, synchronization, and clean-tree checks
-SHALL be preflight and SHALL NOT consume the implementer repair attempt. Immediately before invoking
-the implementer, the pipeline SHALL durably claim and charge the attempt. A successful commit,
-confirmed clean no-op, harness failure, timeout, unsafe no-action, or process death after claim SHALL
-consume that attempt. After a successful commit the pipeline SHALL re-run delta review exactly once
-against the new head. After a clean no-op it SHALL re-verify exactly once. A candidate identity
-change SHALL supersede the old attempt and require fresh eligibility computation; it SHALL not
-mutate or replay the old candidate.
+review at a given authoritative candidate identity. In the pre-merge stage the durable attempt key
+SHALL be the issue plus the candidate head SHA, recorded as a trusted pipeline-attested
+attempt-started (or noop-clean) PR comment marker and detectable via the auto-fix commit-subject
+prefix — not a worktree marker alone. On the durable loop supervisor's repair path the ledger
+attempt SHALL be keyed by item, candidate identity, evidence fingerprint, and repair action.
+Candidate-currency checks, worktree lookup, safe rematerialization, synchronization, and clean-tree
+checks SHALL be preflight and SHALL NOT consume the implementer repair attempt. Immediately before
+invoking the implementer, the pipeline SHALL durably claim and charge the attempt. A successful
+commit, confirmed clean no-op, harness failure, timeout, unsafe no-action, or process death after
+claim SHALL consume that attempt. After a successful commit the pipeline SHALL re-run delta review
+exactly once against the new head. After a clean no-op it SHALL re-verify exactly once. A candidate
+identity change SHALL supersede the old attempt and require fresh eligibility computation; it SHALL
+not mutate or replay the old candidate.
 
 #### Scenario: Fix resolves the finding and pre-merge proceeds
 
@@ -29,8 +32,10 @@ mutate or replay the old candidate.
 
 #### Scenario: Prior charged attempt is recognized after restart
 
-- **WHEN** the durable ledger contains a claimed or completed auto-fix attempt for the same item,
-  candidate, reason, and action
+- **WHEN** a prior auto-fix commit subject, or a trusted attested attempt-started or noop-clean
+  marker, exists for the same issue and candidate head — or, on the durable supervisor's repair
+  path, the ledger contains a claimed or completed attempt for the same item, candidate identity,
+  evidence fingerprint, and action
 - **AND** the finding remains blocking
 - **THEN** the pipeline SHALL NOT invoke the implementer again for that key
 - **AND** it SHALL reconcile the recorded attempt result before choosing the next disposition
@@ -53,7 +58,9 @@ mutate or replay the old candidate.
 - **WHEN** candidate-currency, rematerialization, synchronization, or clean-tree preflight fails
   before the implementer claim
 - **THEN** no implementer repair unit SHALL be consumed
-- **AND** the preflight failure SHALL emit its own typed diagnostic
+- **AND** the preflight failure SHALL surface its own diagnostic — a typed `worktree-missing`,
+  `worktree-capacity`, or `worktree-creation-failed` blocker for rematerialization failures, and
+  the auto-fix error outcome for a dirty pre-fix tree
 
 #### Scenario: Claim persistence failure prevents implementer invocation
 
@@ -68,7 +75,7 @@ reconcile the open PR head and candidate identity and then attempt safe remateri
 `ensureManagedWorktree`. Rematerialization and synchronization SHALL occur before the implementer
 attempt is claimed, so their failure SHALL not consume the single implementer repair unit. Success
 SHALL continue into the same shared auto-fix transaction on the recreated path. Failure SHALL emit
-a typed `worktree-missing`, `worktree-capacity`, `worktree-dirty`, or worktree-creation diagnostic
+a typed `worktree-missing`, `worktree-capacity`, or `worktree-creation-failed` diagnostic
 with exact evidence and enter the controller's bounded preflight recovery. It SHALL not collapse to
 a bare error or product needs-human hold. Normal delta auto-fix and residual re-entry SHALL use the
 same production closure and reconciliation seam.

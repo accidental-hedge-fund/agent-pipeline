@@ -2,13 +2,18 @@
 
 ### Requirement: A needs-human pipeline blocker SHALL be recorded as a non-terminal hold, never as a run-fatal engine defect
 
-The supervisor SHALL record a nonterminal needs-human hold only when a blocked dispatch carries a
-current canonical `human-decision-required` diagnostic whose structured blocker kind is also
-`human-decision-required`. The supervisor SHALL verify that diagnostic against fresh dispatch
+The supervisor SHALL record an attested nonterminal needs-human hold only when a blocked dispatch
+carries a current canonical `human-decision-required` diagnostic whose structured blocker kind is
+also `human-decision-required`. The supervisor SHALL verify that diagnostic against fresh dispatch
 evidence before creating or retaining the hold. A `pipeline:blocked` label, a
 `blocked_needs_human` outcome without that diagnostic, a missing or
 reason-less diagnostic, a plan/output format error, an artifact failure, an exhausted mechanical
-attempt, or any co-present stage label SHALL be insufficient authority evidence. Those cases SHALL
+attempt, or any co-present stage label SHALL be insufficient authority evidence. An explicit
+`blocked_needs_human` outcome without attested authority whose live issue still carries the
+product blocked label SHALL park as a conservative human-resume-only wait that carries no
+authority evidence, is exempt from stale-authority invalidation, and resumes only on a human
+answer or label clear; autonomous recovery SHALL NOT act on it and it SHALL NOT emit
+`human_intervention`. Labels alone SHALL never create that wait. Every other unattested case SHALL
 enter typed engine recovery or terminal system failure and SHALL NOT emit `human_intervention`.
 While a genuine human hold exists, the run SHALL continue any schedulable dependency-independent
 sibling and preserve every sibling's state. A rejected/crashed dispatch or protocol defect SHALL
@@ -32,7 +37,16 @@ remain engine-owned and SHALL follow bounded recovery before any terminal system
 
 - **WHEN** per-item execution reports `blocked_needs_human`
 - **THEN** the supervisor SHALL inspect its current canonical diagnostic
-- **AND** it SHALL create a human hold only when the strict authority predicate passes
+- **AND** it SHALL create an attested authority hold only when the strict authority predicate passes
+
+#### Scenario: An unattested needs-human outcome with a live blocked label parks conservatively
+
+- **WHEN** per-item execution reports `blocked_needs_human` without a current attested
+  human-authority diagnostic
+- **AND** a fresh live read shows the issue still carries the product blocked label
+- **THEN** the supervisor SHALL park the item as a human-resume-only wait carrying no authority
+  evidence, exempt from stale-authority invalidation
+- **AND** autonomous recovery SHALL NOT act on the item and no `human_intervention` SHALL be emitted
 
 #### Scenario: Current human-decision diagnostic creates a resumable hold
 

@@ -76,9 +76,12 @@ recovery remains durable and resumable across process failure.
 ### 6. OpenSpec failures are structured fixtures, not special policy
 
 OpenSpec archive uses JSON mode and verifies both the explicit archive result and active-directory
-removal. Archive apply conflicts and post-revision validation errors emit exact reason codes. The
-shared repair transaction receives those diagnostics and may repair once per keyed budget; OpenSpec
-does not decide whether the failure is human-owned.
+removal. Archive apply conflicts emit the exact `openspec-archive-apply-conflict` reason code;
+planning/plan-review validation failures emit the coarse canonical `implementation-ci` diagnostic
+with blocker kind `openspec-invalid` (per `specs/openspec-integration` — the exact
+`openspec-generated-delta-invalid` code is accepted from external loop-execution producers but has
+no engine producer). The shared repair transaction receives those diagnostics and may repair once
+per keyed budget; OpenSpec does not decide whether the failure is human-owned.
 
 ## Risks / Trade-offs
 

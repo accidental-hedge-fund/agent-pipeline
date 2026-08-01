@@ -92,6 +92,12 @@ charge a permitted recipe before side effects, execute it, and reconcile its res
 current canonical `human-decision-required` diagnostic SHALL permit an immediate human hold.
 Only exhausted or unrecoverable engine-owned work SHALL permit a terminal system stop.
 
+The supervisor SHALL, before claiming any recovery attempt for an item, consult the host-local
+live-advance probe for that item AND acquire the same per-issue advance lock the advance path
+uses, holding that lock for the entire recovery executor run. A live probe or an unavailable
+lock SHALL defer that item's recovery for the current cycle without charging any recovery
+budget, while sibling items continue to be scheduled and recovered unaffected.
+
 #### Scenario: Failed dispatch recovers before run-fatal
 
 - **WHEN** a dispatch returns an engine-owned diagnostic with safe recipe budget remaining
@@ -110,6 +116,22 @@ Only exhausted or unrecoverable engine-owned work SHALL permit a terminal system
   `human-decision-required` diagnostic
 - **THEN** the supervisor SHALL NOT create a human hold from the label alone
 - **AND** it SHALL classify the diagnostic as engine-owned recovery or terminal system failure
+
+#### Scenario: A live concurrent advance defers recovery without charging budget
+
+- **WHEN** a blocked item is eligible for recovery but the live-advance probe reports a concurrent
+  host-local advance on that item
+- **THEN** the supervisor SHALL defer that item's recovery for the cycle without claiming or
+  charging any recovery budget
+- **AND** sibling items SHALL continue to be scheduled and recovered
+
+#### Scenario: An unavailable per-issue advance lock defers recovery without charging budget
+
+- **WHEN** the probe reports no live advance but the per-issue advance lock the advance path uses
+  cannot be acquired
+- **THEN** the supervisor SHALL defer that item's recovery for the cycle without charging budget
+- **AND** when the lock is acquired the supervisor SHALL hold it for the entire recovery executor
+  run before releasing it
 
 ### Requirement: Every terminal driver exit SHALL emit one durable terminal event
 

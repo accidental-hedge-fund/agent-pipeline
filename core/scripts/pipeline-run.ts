@@ -268,15 +268,25 @@ export function isHumanAuthorityBlocker(
 
 /**
  * Preserve a stage's typed block when the in-process retry budget is exhausted.
- * Waiting outcomes have no blocker kind, so materialize a mechanical kind for
- * the durable supervisor instead of converting the item to `needs-human`.
+ * Waiting outcomes have no blocker kind, so one is materialized: pre-merge
+ * waits are CI-shaped (`ci-exhausted`); every other stage's wait keeps
+ * `needs-human` — the closed BLOCKER_KINDS member that honestly names a
+ * generic workflow-state block. It projects to `workflow-state` recovery
+ * (see mechanicalReasonCodeForKind), not a human-authority hold — only an
+ * attested `human-decision-required` decision is that (isHumanAuthorityBlocker).
  */
 export function autoLoopExhaustedBlockedOutcome(out: Outcome, stage: Stage): BlockedOutcome {
   if (!out.advanced && out.status === "blocked" && out.blockerKind) {
     return out;
   }
   const reason = out.advanced ? out.summary : out.reason;
-  const blockerKind: BlockerKind = stage === "pre-merge" ? "ci-exhausted" : "harness-failure";
+  // An expired wait is workflow state, not evidence of an engine defect:
+  // pre-merge waits are CI-shaped (`ci-exhausted` → implementation-ci); any
+  // other stage's wait (cross-domain planning contention, triage) keeps the
+  // generic workflow-state kind so the durable supervisor recovers it
+  // (non-fatal) instead of run_fataling the loop as a `harness-failure`
+  // workflow-engine-defect it never was.
+  const blockerKind: BlockerKind = stage === "pre-merge" ? "ci-exhausted" : "needs-human";
   const exhaustedReason = `auto-loop budget exhausted at ${stage}: ${reason}`;
   const offrampPathTag = stage === "pre-merge" ? "ci-failed" as const : undefined;
   return {
@@ -404,6 +414,21 @@ export interface AdvanceDeps {
     issueNumber: number,
     parkDeps?: ParkReleaseDeps,
   ) => Promise<ParkReleaseResult>;
+  /**
+   * Hermetic-drive seams (#787): the gh/worktree/dispatch calls the advance
+   * loop makes, injectable so a unit test can drive the REAL runAdvance —
+   * including the canonical `blocker_set` emission — with no network, git, or
+   * subprocess. Production callers omit them; every default is the real
+   * module-level implementation.
+   */
+  ensurePipelineLabels?: typeof ensurePipelineLabels;
+  getIssueDetail?: typeof getIssueDetail;
+  getGhActor?: typeof getGhActor;
+  getPrForIssue?: typeof getPrForIssue;
+  getOnDiskForIssue?: typeof getOnDiskForIssue;
+  postComment?: typeof postComment;
+  postPrComment?: typeof postPrComment;
+  dispatch?: typeof dispatch;
 }
 
 /**
@@ -579,15 +604,16 @@ async function notifyBundlePath(
   issueNumber: number,
   stateDir: string,
   bundle: EvidenceBundle,
+  deps: AdvanceDeps = {},
 ): Promise<void> {
   if (bundle.notifiedAt) return;
   const p = bundlePath(stateDir, issueNumber);
   const body = formatEvidenceCommentBody(bundle, p, `${cfg.invocation} ${issueNumber} --summary`);
-  const pr = await getPrForIssue(cfg, issueNumber).catch(() => null);
+  const pr = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(() => null);
   if (pr) {
-    await postPrComment(cfg, pr, body);
+    await (deps.postPrComment ?? postPrComment)(cfg, pr, body);
   } else {
-    await postComment(cfg, issueNumber, body);
+    await (deps.postComment ?? postComment)(cfg, issueNumber, body);
   }
   await markNotified(stateDir, issueNumber);
 }
@@ -737,9 +763,9 @@ export async function runAdvance(
     setGhCollector(ghCollector);
     // Ensure pipeline labels exist inside the collector scope so label-list/create
     // calls are captured in the run's gh_metrics_summary (#257 finding 1).
-    if (!opts.dryRun) await ensurePipelineLabels(cfg);
+    if (!opts.dryRun) await (deps.ensurePipelineLabels ?? ensurePipelineLabels)(cfg);
     try {
-    const startDetail = await getIssueDetail(cfg, issueNumber);
+    const startDetail = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber);
     if (startDetail.state === "closed") {
       console.error(`#${issueNumber} is closed; nothing to advance.`);
       return;
@@ -888,11 +914,11 @@ export async function runAdvance(
     if (stateDir) {
       let bundlePr: number | null = null;
       try {
-        bundlePr = await getPrForIssue(cfg, issueNumber);
+        bundlePr = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber);
       } catch {
         /* no PR yet, or lookup failed — record null */
       }
-      const startWt = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
+      const startWt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(() => null);
       const bundleBranch = startWt ? branchName(issueNumber, startWt.slug) : null;
       const harnesses = Array.from(new Set([cfg.harnesses.implementer, cfg.harnesses.reviewer]));
       await createBundle(stateDir, {
@@ -975,7 +1001,7 @@ export async function runAdvance(
 
     try {
     for (let i = 0; i < MAX_ITERATIONS; i++) {
-      const detail = await getIssueDetail(cfg, issueNumber);
+      const detail = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber);
       const stage = pickStage(detail.labels);
       if (!stage) {
         tlog(`[pipeline] #${issueNumber}: pipeline label removed; stopping.`);
@@ -988,7 +1014,7 @@ export async function runAdvance(
       // comment post failed, the sentinel is missing. Detect and repair the gap.
       // Resolve the pipeline's own GitHub actor once so a sentinel is only trusted from a
       // pipeline-authored comment — body-prefix text alone is forgeable (security review).
-      const auditTrustedActor = opts.dryRun ? null : await getGhActor();
+      const auditTrustedActor = opts.dryRun ? null : await (deps.getGhActor ?? getGhActor)();
       // Skip stage-sentinel repair for manually-applied entry-point stages ("ready", "backlog")
       // since those are never created by transition() and have no sentinel to repair.
       if (!opts.dryRun && stage !== "ready" && stage !== "backlog") {
@@ -1104,7 +1130,7 @@ export async function runAdvance(
       // Pre-dispatch: capture worktree HEAD so we can record which commits the stage produced.
       let headBeforeDispatch = "";
       if (!dispatchOwnsLifecycle && stateDir) {
-        const wtBefore = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
+        const wtBefore = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(() => null);
         if (wtBefore) {
           headBeforeDispatch = (
             await gitInWorktree(wtBefore.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
@@ -1125,7 +1151,7 @@ export async function runAdvance(
       }
       let out: Outcome;
       try {
-        out = await dispatch(cfg, issueNumber, stage, opts, pipelineRunId, stateDir, runDir, runStoreDeps);
+        out = await (deps.dispatch ?? dispatch)(cfg, issueNumber, stage, opts, pipelineRunId, stateDir, runDir, runStoreDeps);
       } catch (err) {
         // Stage threw — record an error outcome before rethrowing so the bundle
         // never shows a perpetually in-progress stage.
@@ -1169,7 +1195,7 @@ export async function runAdvance(
       const stageExitedAt = evidenceTimestamp();
       let stageCommits: string[] = [];
       if (!dispatchOwnsLifecycle && stateDir) {
-        const wtAfter = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
+        const wtAfter = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(() => null);
         if (wtAfter) {
           lastKnownBranch = branchName(issueNumber, wtAfter.slug);
           // If no worktree existed before dispatch (e.g., planning creates it), fall
@@ -1326,8 +1352,8 @@ export async function runAdvance(
           // hadn't run yet. Only patch non-null values: deployReady removes the
           // worktree before this block runs, so latestBranch is null on a successful
           // ready-to-deploy run. Overwriting with null would erase the captured branch.
-          const latestPr = await getPrForIssue(cfg, issueNumber).catch(() => null);
-          const latestWt = await getOnDiskForIssue(cfg, issueNumber).catch(() => null);
+          const latestPr = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(() => null);
+          const latestWt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(() => null);
           // deployReady.finalize() removes the worktree before this block runs, so
           // latestWt may be null on a successful run. Fall back to the last branch we
           // observed during the dispatch loop so the bundle is never finalized with
@@ -1377,7 +1403,7 @@ export async function runAdvance(
               realAutoFileDeps(cfg.repo_dir),
             ).catch(() => {});
           }
-          await notifyBundlePath(cfg, issueNumber, stateDir, finalized);
+          await notifyBundlePath(cfg, issueNumber, stateDir, finalized, deps);
         } catch {
           /* audit-only — ignore */
         }

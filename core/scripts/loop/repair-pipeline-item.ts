@@ -1,12 +1,14 @@
 // Provider-neutral whole-item remediation for durable loop recovery. The
 // supervisor owns claim/budget state; this module owns the actual candidate
 // repair and reports success only after the configured implementer produced a
-// committed, pushed change and the mechanical block was cleared.
+// committed, pushed change; a post-push label-clear failure is recorded in the
+// evidence rather than failing the verified repair.
 
 import { clearBlocked, getIssueDetail } from "../gh.ts";
 import { invoke } from "../harness.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import { performPreMergeAutoFix } from "../stages/pre_merge.ts";
+import { withTrailers } from "../traceability.ts";
 import type { StageDiagnostic } from "../stage-diagnostic.ts";
 import { LABEL_PREFIX, type PipelineConfig } from "../types.ts";
 import {
@@ -89,6 +91,35 @@ export function createRepairPipelineItemExecutor(
       return { succeeded: false, evidence: error, error };
     }
 
+    // Durable pre-invocation breadcrumb: a git ref in the managed worktree's
+    // repository, keyed by this attempt id and pointing at the claimed head.
+    // It is written immediately before the harness/auto-fix seam is invoked,
+    // survives process death, never dirties `git status`, and is the smallest
+    // durable mechanism this executor already owns (it has a git seam but no
+    // run-store/token seam). The unmarked-commit reconciliation below may
+    // adopt a commit ONLY when this breadcrumb proves the attempt's own
+    // interrupted run was mid-harness at exactly the claimed head.
+    const breadcrumbRef = `refs/pipeline-recovery/${input.attemptId}`;
+
+    // A post-push label-clear hiccup must not convert a verified pushed
+    // repair into a charged failure — for a budget-1 run_fatal class that
+    // would end the whole run. Retry once; a residual failure is returned so
+    // callers record it in the evidence and the supervisor's next reconcile
+    // pass re-observes labels and resyncs.
+    const clearBlockedWithRetry = async (): Promise<string | undefined> => {
+      try {
+        await unblock(cfg, issueNumber);
+        return undefined;
+      } catch {
+        try {
+          await unblock(cfg, issueNumber);
+          return undefined;
+        } catch (err) {
+          return err instanceof Error ? err.message : String(err);
+        }
+      }
+    };
+
     let wt = await getWorktree(cfg, issueNumber);
     if (!wt) {
       const materialized = await ensureWorktree(cfg, issueNumber);
@@ -103,15 +134,141 @@ export function createRepairPipelineItemExecutor(
     }
 
     const headResult = await git(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
-    const actualHead = headResult.stdout.trim();
+    let actualHead = headResult.stdout.trim();
     if (headResult.code !== 0 || !actualHead) {
       const error = `cannot verify the current worktree head for repair attempt ${input.attemptId}`;
       return { succeeded: false, evidence: error, error };
     }
-    if (actualHead !== expected) {
+    if (actualHead.toLowerCase() !== expected.toLowerCase()) {
       const attemptMarker = input.attemptId.slice(0, 12);
       const subject = await git(wt.path, ["log", "-1", "--format=%s"], { ignoreFailure: true });
-      if (subject.code === 0 && subject.stdout.includes(`pipeline recovery ${attemptMarker}`)) {
+      let marked = subject.code === 0 && subject.stdout.includes(`pipeline recovery ${attemptMarker}`);
+      if (!marked) {
+        // No marked commit to reconcile. Before declaring the candidate moved,
+        // distinguish two recoverable local states — both require a clean tree
+        // and a remote branch still at the claimed head (the head the claim
+        // bound); anything dirty or unprovable fails closed.
+        const status = await git(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+        if (status.code !== 0 || status.stdout.trim() !== "") {
+          const error =
+            `recovery candidate moved before repair: claimed ${expected}, worktree is ${actualHead} ` +
+            "with uncommitted changes; refusing destructive reconciliation";
+          return { succeeded: false, evidence: error, error };
+        }
+        const branch = branchName(issueNumber, wt.slug);
+        const remote = await git(
+          wt.path,
+          ["ls-remote", "origin", `refs/heads/${branch}`],
+          { ignoreFailure: true },
+        );
+        const remoteHead = remote.code === 0 ? remote.stdout.trim().split(/\s+/, 1)[0] ?? "" : "";
+        if (remoteHead.toLowerCase() !== expected.toLowerCase()) {
+          const error =
+            `recovery candidate moved before repair: claimed ${expected}, worktree is ${actualHead}; ` +
+            "reconcile and claim the current candidate instead";
+          return { succeeded: false, evidence: error, error };
+        }
+        const parent = await git(wt.path, ["rev-parse", "HEAD^"], { ignoreFailure: true });
+        if (parent.code === 0 && parent.stdout.trim().toLowerCase() === expected.toLowerCase()) {
+          // Crash window: this attempt's harness/salvage commit landed but the
+          // process died before the marker amend. Exactly one clean, unpushed
+          // commit sits on the claimed head while the remote is still at the
+          // claim. That shape alone is NOT proof of authorship — a human's
+          // local commit in the managed worktree matches it too, and adopting
+          // one would amend away their commit message and publish their work.
+          // Safety scope: the destructive amend+push below therefore also
+          // require the durable pre-invocation breadcrumb — it must exist for
+          // THIS attempt id and record THIS claimed head. Our own attempts
+          // always write it before the harness runs, so a genuinely crashed
+          // attempt still reconciles; anything unprovable fails closed.
+          const breadcrumb = await git(
+            wt.path,
+            ["rev-parse", "--verify", "--quiet", breadcrumbRef],
+            { ignoreFailure: true },
+          );
+          const breadcrumbHead = breadcrumb.code === 0 ? breadcrumb.stdout.trim() : "";
+          if (breadcrumbHead.toLowerCase() !== expected.toLowerCase()) {
+            const error =
+              `recovery candidate moved before repair: claimed ${expected}, worktree is ${actualHead} ` +
+              `carrying an unpushed commit that attempt ${input.attemptId} cannot prove it authored ` +
+              "(no pre-invocation breadcrumb); refusing to adopt, amend, or publish it";
+            return { succeeded: false, evidence: error, error };
+          }
+          // Stamp the marker now and let the marked-commit flow below push and
+          // verify it instead of wedging the attempt.
+          const amend = await git(
+            wt.path,
+            [
+              "commit",
+              "--amend",
+              "-m",
+              withTrailers(
+                `fix: pipeline recovery ${attemptMarker} for #${issueNumber}`,
+                issueNumber,
+                input.runId,
+              ),
+            ],
+            { ignoreFailure: true },
+          );
+          const amendedHead = amend.code === 0
+            ? (await git(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim()
+            : "";
+          if (!amendedHead) {
+            const error =
+              `recovery attempt ${input.attemptId} could not stamp its marker onto the ` +
+              `interrupted commit ${actualHead}`;
+            return { succeeded: false, evidence: error, error };
+          }
+          // The stamped marker subject is now the durable proof of authorship;
+          // retire the breadcrumb so it can never vouch for a future commit.
+          await git(wt.path, ["update-ref", "-d", breadcrumbRef], { ignoreFailure: true });
+          actualHead = amendedHead;
+          marked = true;
+        } else {
+          // Present-but-stale worktree: the claim binds the remote PR head, and
+          // the remote branch is verified above to still be exactly the claimed
+          // head. Hard-sync so the attempt repairs the claimed candidate instead
+          // of failing deterministically until the budget exhausts.
+          // `fetch` + `reset --hard` is destructive but provably scoped: it
+          // targets only this managed worktree root, and the reset target is the
+          // claimed head, which IS the current remote branch truth.
+          const fetched = await git(wt.path, ["fetch", "origin", branch], { ignoreFailure: true });
+          if (fetched.code === 0) {
+            // The reset target is proven above (claimed head == remote truth),
+            // but that alone says nothing about what the reset would DISCARD.
+            // Safety scope: only a worktree strictly behind remote truth may be
+            // hard-synced — local HEAD must be an ancestor of the claimed
+            // head. Any local-only commit (ahead or diverged) fails closed
+            // instead of being silently destroyed.
+            const ancestry = await git(
+              wt.path,
+              ["merge-base", "--is-ancestor", "HEAD", expected],
+              { ignoreFailure: true },
+            );
+            if (ancestry.code !== 0) {
+              const error =
+                `recovery attempt ${input.attemptId} found the stale worktree at ${actualHead} ` +
+                `with local commits not reachable from the claimed head ${expected}: ` +
+                "local commits present; refusing to discard them with a hard sync";
+              return { succeeded: false, evidence: error, error };
+            }
+          }
+          const reset = fetched.code === 0
+            ? await git(wt.path, ["reset", "--hard", expected], { ignoreFailure: true })
+            : fetched;
+          const syncedHead = reset.code === 0
+            ? (await git(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim()
+            : "";
+          if (syncedHead.toLowerCase() !== expected.toLowerCase()) {
+            const error =
+              `recovery attempt ${input.attemptId} could not sync the stale worktree ` +
+              `from ${actualHead} to the claimed head ${expected}`;
+            return { succeeded: false, evidence: error, error };
+          }
+          actualHead = syncedHead;
+        }
+      }
+      if (marked) {
         const branch = branchName(issueNumber, wt.slug);
         const remote = await git(
           wt.path,
@@ -120,21 +277,19 @@ export function createRepairPipelineItemExecutor(
         );
         const remoteHead = remote.code === 0 ? remote.stdout.trim().split(/\s+/, 1)[0] ?? "" : "";
         if (remoteHead.toLowerCase() === actualHead.toLowerCase()) {
-          try {
-            await unblock(cfg, issueNumber);
-          } catch (err) {
-            const error =
-              `recovery commit ${actualHead} is already present for attempt ${input.attemptId}, ` +
-              `but the mechanical blocked label could not be cleared: ` +
-              `${err instanceof Error ? err.message : String(err)}`;
-            return { succeeded: false, evidence: error, error };
-          }
+          // The recovery commit is already remote-verified; like the
+          // substantive path below, a label-clear failure must not convert
+          // the verified repair into a charged failure.
+          const labelClearFailure = await clearBlockedWithRetry();
           return {
             succeeded: true,
             candidateHead: actualHead,
             evidence:
               `reconciled remote recovery attempt ${input.attemptId} at ${actualHead} ` +
-              "and cleared the mechanical block without replaying the implementer",
+              (labelClearFailure
+                ? `without replaying the implementer, but the mechanical blocked label could not ` +
+                  `be cleared after a retry (next reconcile pass must resync it): ${labelClearFailure}`
+                : "and cleared the mechanical block without replaying the implementer"),
           };
         }
         if (remoteHead.toLowerCase() !== expected.toLowerCase()) {
@@ -180,28 +335,23 @@ export function createRepairPipelineItemExecutor(
             `on remote branch ${branch}`;
           return { succeeded: false, evidence: error, error };
         }
-        try {
-          await unblock(cfg, issueNumber);
-        } catch (err) {
-          const error =
-            `recovery commit ${actualHead} was pushed for attempt ${input.attemptId}, ` +
-            `but the mechanical blocked label could not be cleared: ` +
-            `${err instanceof Error ? err.message : String(err)}`;
-          return { succeeded: false, evidence: error, error };
-        }
+        // The push above is remote-verified; like the substantive path below,
+        // a label-clear failure must not convert it into a charged failure.
+        const labelClearFailure = await clearBlockedWithRetry();
         return {
           succeeded: true,
           candidateHead: actualHead,
           evidence:
             `pushed and reconciled recovery attempt ${input.attemptId} at ${actualHead} ` +
-            "without replaying the implementer",
+            "without replaying the implementer" +
+            (labelClearFailure
+              ? `, but the mechanical blocked label could not be cleared after a retry ` +
+                `(next reconcile pass must resync it): ${labelClearFailure}`
+              : ""),
         };
-      } else {
-        const error =
-          `recovery candidate moved before repair: claimed ${expected}, worktree is ${actualHead}; ` +
-          "reconcile and claim the current candidate instead";
-        return { succeeded: false, evidence: error, error };
       }
+      // Reaching here means the stale worktree was hard-synced to the claimed
+      // head; the substantive repair below operates on the claimed candidate.
     }
 
     let detail: Awaited<ReturnType<typeof getIssueDetail>>;
@@ -225,6 +375,12 @@ export function createRepairPipelineItemExecutor(
         ...opts,
         reasoningEffort: cfg.effort?.fix,
       });
+    // Write the durable breadcrumb immediately before the harness/auto-fix
+    // seam runs: if the process dies mid-harness, the replayed attempt can
+    // prove any clean unpushed commit on the claimed head came from its own
+    // interrupted run. Best-effort — a failed write only ever fails CLOSED
+    // later (the reconciliation refuses to adopt without it).
+    await git(wt.path, ["update-ref", breadcrumbRef, expected], { ignoreFailure: true });
     const result = await repair(
       cfg,
       issueNumber,
@@ -240,6 +396,9 @@ export function createRepairPipelineItemExecutor(
         salvageLabel: "pipeline recovery",
       },
     );
+    // Controlled completion (any status): retire the breadcrumb so it can
+    // only ever vouch for a genuinely interrupted (crashed) harness run.
+    await git(wt.path, ["update-ref", "-d", breadcrumbRef], { ignoreFailure: true });
     if (result.status !== "fix-committed") {
       const error =
         result.status === "noop-clean"
@@ -248,21 +407,19 @@ export function createRepairPipelineItemExecutor(
       return { succeeded: false, evidence: error, error };
     }
 
-    try {
-      await unblock(cfg, issueNumber);
-    } catch (err) {
-      const error =
-        `repair commit ${result.headSha} was pushed but the mechanical blocked label could not be cleared: ` +
-        `${err instanceof Error ? err.message : String(err)}`;
-      return { succeeded: false, evidence: error, error };
-    }
+    // The verified push above already proved the repair; a label-API hiccup
+    // must not convert it into a failed (budget-charged) attempt.
+    const labelClearFailure = await clearBlockedWithRetry();
 
     return {
       succeeded: true,
       candidateHead: result.headSha,
       evidence:
         `repair attempt ${input.attemptId} moved ${expected} to ${result.headSha}, pushed the candidate, ` +
-        "and cleared the mechanical block for normal Pipeline re-entry",
+        (labelClearFailure
+          ? `but the mechanical blocked label could not be cleared after a retry ` +
+            `(next reconcile pass must resync it): ${labelClearFailure}`
+          : "and cleared the mechanical block for normal Pipeline re-entry"),
     };
   };
 }

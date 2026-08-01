@@ -855,7 +855,13 @@ export async function advanceFix(
           const authorityDecisions = acceptedHumanDecisions.filter(
             (decl) => decl.category === "product-decision" || decl.category === "authority",
           );
-          for (const decl of authorityDecisions) {
+          const externalDecisions = acceptedHumanDecisions.filter(
+            (decl) => decl.category === "external-dependency",
+          );
+          // #473: every accepted declaration — the external-dependency
+          // reclassified path included — posts the audited evidence comment.
+          // The blocker-kind split below must not drop the durable audit trail.
+          for (const decl of acceptedHumanDecisions) {
             await postComment(
               cfg,
               issueNumber,
@@ -871,23 +877,25 @@ export async function advanceFix(
               }),
             );
           }
-          const categories = [...new Set(acceptedHumanDecisions.map((d) => d.category))].join(", ");
           // #473 review-2 finding a64f2252cd2dbd0a: neutralize the harness-provided
           // request here too — it is copied into the blocker reason passed to
           // setBlocked, a distinct sink from the evidence comment above, and an
           // unsanitized request could otherwise forge a trusted override/
           // non-reproducing sentinel in the pipeline-authored blocked comment.
-          const requests = acceptedHumanDecisions
-            .map((d) => `\`${d.key}\`: ${neutralizeSentinelText(d.request)}`)
-            .join("; ");
+          const formatRequests = (decls: HumanDecisionDeclaration[]): string =>
+            decls.map((d) => `\`${d.key}\`: ${neutralizeSentinelText(d.request)}`).join("; ");
+          // Each blocker message carries only its own group's categories and
+          // requests: external-dependency declarations never inflate the
+          // authority message (they are audited via the comments above).
+          const categories = [...new Set(authorityDecisions.map((d) => d.category))].join(", ");
           const humanDecisionMsg = authorityDecisions.length > 0
             ? `${stage}: the fix harness produced no new commits and declared ` +
               `${authorityDecisions.length} blocking finding(s) require human authority ` +
-              `(${categories}) at the reviewed SHA (${headAfter}) — ${requests}. This does not ` +
-              `resolve or advance the item.`
+              `(${categories}) at the reviewed SHA (${headAfter}) — ${formatRequests(authorityDecisions)}. ` +
+              `This does not resolve or advance the item.`
             : `${stage}: the fix harness produced no new commits and declared an external dependency ` +
-              `at the reviewed SHA (${headAfter}) — ${requests}. This remains a mechanical ` +
-              `controller-owned wait/retry condition and grants no human authority.`;
+              `at the reviewed SHA (${headAfter}) — ${formatRequests(externalDecisions)}. This remains ` +
+              `a mechanical controller-owned wait/retry condition and grants no human authority.`;
           const humanDecisionReason = await appendWorktreeStateDisclosure(wt.path, humanDecisionMsg);
           const blockerKind = authorityDecisions.length > 0
             ? "human-decision-required" as const

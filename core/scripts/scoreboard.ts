@@ -1974,7 +1974,13 @@ function resolvePreMergeOfframpClass(event: JsonRecord): PreMergeOfframpClass {
  * Collect pre-merge blocked/needs-human off-ramp classes from durable events.
  *
  * Per pre-merge stage entry (events between `stage_start` pre-merge markers):
- * 1. Count every pre-merge `blocker_set` in the entry.
+ * 1. Count a pre-merge `blocker_set` only when it is TERMINAL for the run.
+ *    `blocker_set` is emitted per round, before any in-process recovery clears
+ *    it (#787 evidence semantics): a block followed by a later pre-merge
+ *    re-entry in the same run was recovered in-process (bounded auto-loop) and
+ *    is evidence, not an off-ramp. The exception is a `blocker_cleared` after
+ *    the block in the same entry — that is a human-resolved off-ramp
+ *    (`pipeline unblock` / `--override`) and still counts.
  * 2. Count pre-merge `human_intervention` only when it is not paired with a
  *    `blocker_set` in that same entry:
  *    - Shared `offramp_id` (new dual-write): skip the intervention with the
@@ -1992,14 +1998,20 @@ function collectPreMergeOfframpClasses(run: IncludedRun): PreMergeOfframpClass[]
   // Partition into stage-entry windows keyed by pre-merge stage_start index.
   // Events before the first pre-merge stage_start still form an entry so
   // historical streams without stage_start are not dropped.
-  type Entry = { blockers: JsonRecord[]; interventions: JsonRecord[] };
-  const entries: Entry[] = [{ blockers: [], interventions: [] }];
+  type Entry = { blockers: JsonRecord[]; interventions: JsonRecord[]; clearedAfterBlock: boolean };
+  const entries: Entry[] = [{ blockers: [], interventions: [], clearedAfterBlock: false }];
   let current = entries[0];
 
   for (const event of run.events) {
     if (event["type"] === "stage_start" && stringField(event, "stage") === "pre-merge") {
-      current = { blockers: [], interventions: [] };
+      current = { blockers: [], interventions: [], clearedAfterBlock: false };
       entries.push(current);
+      continue;
+    }
+    // blocker_cleared carries no stage field: it clears whatever block the
+    // entry holds, so record it before the stage filter below.
+    if (event["type"] === "blocker_cleared" && current.blockers.length > 0) {
+      current.clearedAfterBlock = true;
       continue;
     }
     if (stringField(event, "stage") !== "pre-merge") continue;
@@ -2011,12 +2023,16 @@ function collectPreMergeOfframpClasses(run: IncludedRun): PreMergeOfframpClass[]
   }
 
   const classes: PreMergeOfframpClass[] = [];
-  for (const entry of entries) {
+  for (const [index, entry] of entries.entries()) {
+    // A later pre-merge stage_start exists → this entry's block was recovered
+    // in-process, unless a blocker_cleared shows a human resolved it first.
+    const recoveredInProcess = index < entries.length - 1 && !entry.clearedAfterBlock;
     const pairedIds = new Set<string>();
     for (const blocker of entry.blockers) {
-      classes.push(resolvePreMergeOfframpClass(blocker));
       const id = stringField(blocker, "offramp_id");
       if (id) pairedIds.add(id);
+      if (recoveredInProcess) continue;
+      classes.push(resolvePreMergeOfframpClass(blocker));
     }
     for (const intervention of entry.interventions) {
       const id = stringField(intervention, "offramp_id");

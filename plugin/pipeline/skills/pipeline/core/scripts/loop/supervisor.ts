@@ -53,7 +53,7 @@ import {
   transitionItem,
   type ReconcileObserveDeps,
 } from "./reconcile.ts";
-import { blockItem, completeRecoveryAttempt, startRecoveryAttempt } from "./recovery.ts";
+import { blockItem, completeRecoveryAttempt, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
 import { waitItem } from "./pause.ts";
 import { computeExternalDependencyStatuses, detectDependencyDeadlock, propagateSkips } from "./dependencies.ts";
 import { detectChangedFileOverlap, selectSchedulableSet } from "./schedule.ts";
@@ -193,6 +193,23 @@ export interface SupervisorDeps {
    * terminal-aware loop linkage.
    */
   probeLiveAdvance?(itemId: string): Promise<LiveAdvanceProbeResult> | LiveAdvanceProbeResult;
+  /**
+   * Non-blocking acquire of the same host-local per-issue advance lock every
+   * advance serializes through (`withLock` → /tmp/pipeline-{domain}-{N}.lock).
+   * Returns a release handle when this supervisor now owns the lock, or null
+   * when a concurrent holder owns it. The blocked-item recovery pass holds the
+   * handle across the whole recovery execution so a concurrent host-local
+   * advance (`pipeline run` / override resume) can never interleave with the
+   * recovery executor's managed-worktree writes. When absent, the lock leg of
+   * the recovery coexistence guard is skipped (probe-only) — production wires
+   * the real lock in pipeline.ts.
+   */
+  acquireItemAdvanceLock?(
+    itemId: string,
+  ):
+    | Promise<{ release(): void | Promise<void> } | null>
+    | { release(): void | Promise<void> }
+    | null;
   /** Domain used for per-issue lock paths (default agent-pipeline). */
   lockDomain?: string;
   /**
@@ -553,6 +570,11 @@ interface RecoveryExecutionResult {
   deferredUntil?: string;
 }
 
+/** Bounded re-reads of the remote head after a successful pushed repair —
+ *  replication lag on the gh read must not misrecord the repair as failed. */
+const REPAIR_HEAD_REREAD_LIMIT = 3;
+const REPAIR_HEAD_REREAD_DELAY_MS = 2_000;
+
 async function supersedeStartedRecoveryAttempts(
   deps: SupervisorDeps,
   runId: string,
@@ -560,7 +582,7 @@ async function supersedeStartedRecoveryAttempts(
   itemId: string,
   reason: string,
 ): Promise<LoopLedger> {
-  const ledger = await readLedger(deps.store, runId);
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps.store, runId));
   const time = deps.store.now().toISOString();
   const superseded = ledger.recovery_attempts
     .filter((attempt) => attempt.item_id === itemId && attempt.outcome === "started")
@@ -591,13 +613,23 @@ async function supersedeStartedRecoveryAttempts(
  *  unit; a fresh claim requires reconciled head/PR identity. */
 async function executeBlockedRecovery(
   deps: SupervisorDeps,
-  contract: LoopContract,
+  contractInput: LoopContract,
   runId: string,
   token: string,
   engine: LoopEngineName,
   itemId: string,
 ): Promise<RecoveryExecutionResult> {
-  let ledger = await readLedger(deps.store, runId);
+  // A pre-#509 contract/ledger carries no recovery_policy/recovery_attempts
+  // field — route both through the pure upgraders before any recovery access.
+  const contract = upgradeContractForRecovery(contractInput);
+  let ledger = upgradeLedgerForRecovery(await readLedger(deps.store, runId));
+  // A sibling processed earlier in this same concurrent pass may already have
+  // recorded a terminal stop. Once `ledger.stop` is set no recovery side
+  // effect may start: skip gracefully, preserving the first-cause stop record
+  // (mirrors blockItem's allowAlreadyStopped design), instead of letting
+  // startRecoveryAttempt/completeRecoveryAttempt throw LoopError("stop") out
+  // of the drive.
+  if (ledger.stop) return { ledger, attempted: false };
   let item = ledger.items[itemId];
   if (!item || item.state !== "blocked" || !item.blocked_theme) {
     return { ledger, attempted: false };
@@ -625,7 +657,7 @@ async function executeBlockedRecovery(
   try {
     const identity = await observeExternalIdentity(deps.observe, itemId);
     observedIdentity = identity;
-    const currentLedger = await readLedger(deps.store, runId);
+    const currentLedger = upgradeLedgerForRecovery(await readLedger(deps.store, runId));
     const currentItem = currentLedger.items[itemId];
     if (!currentItem || currentItem.state !== "blocked") {
       return { ledger: currentLedger, attempted: false };
@@ -676,28 +708,52 @@ async function executeBlockedRecovery(
     return { ledger, attempted: false };
   }
   if (!observedIdentity.issue_open) {
-    ledger = await transitionItem(deps.store, deps.observe, contract, {
-      runId,
-      token,
-      itemId,
-      engine,
-      to: "abandoned",
-      note: "fresh external identity closed the issue before recovery execution",
-    });
-    ledger = await supersedeStartedRecoveryAttempts(
-      deps,
-      runId,
-      token,
-      itemId,
-      "fresh external identity proves the issue is closed without a merged candidate",
-    );
-    await appendEvent(deps.store, runId, token, "loop_recovery_superseded", {
-      item_id: itemId,
-      state: "abandoned",
-      pr_number: observedIdentity.pr_number,
-      head_sha: observedIdentity.head_sha || null,
-    });
-    return { ledger, attempted: false };
+    // observeExternalIdentity folds an UNOBSERVABLE issue read into
+    // issue_open=false: getIssueStateAndLabels swallows every gh failure to
+    // null (gh.ts), so a single transient failure is indistinguishable from a
+    // real close here. Abandoning is irreversible (nothing re-admits an
+    // abandoned item) and supersedes started claims — require a fresh
+    // POSITIVE closed observation before abandoning. A null/unobservable
+    // re-read defers this item's recovery for the cycle with its started
+    // claim intact (mirrors the coexistence deferral); a positively open
+    // re-read falls through to normal recovery below.
+    let freshIssue: Awaited<ReturnType<typeof deps.observe.getIssueStateAndLabels>> = null;
+    try {
+      freshIssue = await deps.observe.getIssueStateAndLabels(Number(itemId));
+    } catch {
+      freshIssue = null;
+    }
+    if (!freshIssue) {
+      await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
+        item_id: itemId,
+        reason: "issue state unobservable — recovery deferred this cycle instead of abandoning",
+      });
+      return { ledger, attempted: false };
+    }
+    if (freshIssue.state === "closed") {
+      ledger = await transitionItem(deps.store, deps.observe, contract, {
+        runId,
+        token,
+        itemId,
+        engine,
+        to: "abandoned",
+        note: "fresh external identity closed the issue before recovery execution",
+      });
+      ledger = await supersedeStartedRecoveryAttempts(
+        deps,
+        runId,
+        token,
+        itemId,
+        "fresh external identity proves the issue is closed without a merged candidate",
+      );
+      await appendEvent(deps.store, runId, token, "loop_recovery_superseded", {
+        item_id: itemId,
+        state: "abandoned",
+        pr_number: observedIdentity.pr_number,
+        head_sha: observedIdentity.head_sha || null,
+      });
+      return { ledger, attempted: false };
+    }
   }
 
   const matchingAttempts = ledger.recovery_attempts.filter(
@@ -710,6 +766,23 @@ async function executeBlockedRecovery(
   let claimedNow = false;
   if (!attempt) {
     const policy = contract.recovery_policy[item.blocked_theme];
+    // Repeated byte-identical evidence is bounded independently of the class
+    // retry budget: at `repeated_evidence_limit` no further attempt is claimed
+    // here — the idle-promotion branch in runSupervisorCycle records the
+    // repeated_no_progress stop once the scheduler proves no independent
+    // sibling is schedulable.
+    if ((item.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit) {
+      // Durable trace for the per-cycle skip (mirrors the coexistence
+      // deferrals' events): without it the at-limit refusal leaves no run-trail
+      // record until the idle promotion records the terminal stop.
+      await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
+        item_id: itemId,
+        reason: "repeated_evidence_limit",
+        repeated_evidence_count: item.repeated_evidence_count ?? 0,
+        limit: policy.repeated_evidence_limit,
+      }).catch(() => {});
+      return { ledger, attempted: false };
+    }
     const hasCandidateHead = Boolean(item.last_verified_identity?.head_sha.trim());
     const executableRecipes = hasCandidateHead
       ? policy.recipes
@@ -750,7 +823,15 @@ async function executeBlockedRecovery(
 
   const claimedIdentityHead = /(?:^|\|)head=([^|]+)(?:\||$)/i.exec(attempt.candidate_identity)?.[1]?.toLowerCase() ?? "none";
   const observedIdentityHead = item.last_verified_identity?.head_sha.trim().toLowerCase() || "none";
-  if (claimedIdentityHead !== observedIdentityHead && attempt.action !== "repair_pipeline_item") {
+  // An unobservable fresh head ("none") is not movement evidence — skip only
+  // this stale-supersede gate and let the claimed action replay in this same
+  // cycle without burning another durable budget unit; supersede only on a
+  // proven different head.
+  if (
+    observedIdentityHead !== "none" &&
+    claimedIdentityHead !== observedIdentityHead &&
+    attempt.action !== "repair_pipeline_item"
+  ) {
     const error =
       `recovery claim ${attempt.attempt_id} is stale: claimed head ${claimedIdentityHead}, ` +
       `current head ${observedIdentityHead}`;
@@ -784,7 +865,7 @@ async function executeBlockedRecovery(
       not_before: attempt.not_before,
     });
     return {
-      ledger: await readLedger(deps.store, runId),
+      ledger: upgradeLedgerForRecovery(await readLedger(deps.store, runId)),
       attempted: claimedNow,
       deferredUntil: attempt.not_before,
     };
@@ -840,7 +921,7 @@ async function executeBlockedRecovery(
       item_id: itemId,
       reason: err instanceof Error ? err.message : String(err),
     });
-    return { ledger: await readLedger(deps.store, runId), attempted: true };
+    return { ledger: upgradeLedgerForRecovery(await readLedger(deps.store, runId)), attempted: true };
   }
   const claimedHead = /(?:^|\|)head=([0-9a-f]{6,64})(?:\||$)/i.exec(attempt.candidate_identity)?.[1] ?? "";
   if (execution.succeeded && attempt.action === "repair_pipeline_item") {
@@ -850,14 +931,33 @@ async function executeBlockedRecovery(
         evidence: "repair executor did not prove a remote candidate-changing commit",
         error: "repair executor did not prove a remote candidate-changing commit",
       };
-    } else if (postIdentity.head_sha.toLowerCase() !== execution.candidateHead.toLowerCase()) {
-      execution = {
-        succeeded: false,
-        evidence:
-          `remote candidate is ${postIdentity.head_sha || "unobserved"} while recovery produced ` +
-          `${execution.candidateHead}`,
-        error: "recovery candidate head was not verified remotely",
-      };
+    } else {
+      // The remote read can lag a just-pushed repair (gh replication). Re-read
+      // the observed head a small bounded number of times before declaring the
+      // repair unverified — only the gh-backed observation is retried; the
+      // executor's claimed head is never trusted without a matching read.
+      for (
+        let reread = 0;
+        postIdentity.head_sha.toLowerCase() !== execution.candidateHead.toLowerCase() &&
+        reread < REPAIR_HEAD_REREAD_LIMIT;
+        reread++
+      ) {
+        if (deps.recoverySleep) await deps.recoverySleep(REPAIR_HEAD_REREAD_DELAY_MS);
+        try {
+          postIdentity = await observeExternalIdentity(deps.observe, itemId);
+        } catch {
+          break; // keep the last successful observation; the mismatch stands
+        }
+      }
+      if (postIdentity.head_sha.toLowerCase() !== execution.candidateHead.toLowerCase()) {
+        execution = {
+          succeeded: false,
+          evidence:
+            `remote candidate is ${postIdentity.head_sha || "unobserved"} while recovery produced ` +
+            `${execution.candidateHead}`,
+          error: "recovery candidate head was not verified remotely",
+        };
+      }
     }
   } else if (execution.succeeded) {
     if (
@@ -948,11 +1048,17 @@ async function blockAndExecuteRecovery(
   // A child result can be stale by the time it is classified, especially in
   // concurrent batches. Fresh verified completion always wins before the
   // supervisor records a mechanical block or claims a recovery side effect.
+  // After a mid-pass sibling stop, the reconcile/transition supersede paths
+  // below are side effects that must not start — fall through straight to
+  // blockItem, which still records this item's own classification under
+  // `allowAlreadyStopped` while preserving the first-cause stop record.
   let identity: Awaited<ReturnType<typeof observeExternalIdentity>> | null = null;
-  try {
-    identity = await observeExternalIdentity(deps.observe, input.itemId);
-  } catch {
-    // The recovery preflight re-observes before executing any claimed action.
+  if (!current.stop) {
+    try {
+      identity = await observeExternalIdentity(deps.observe, input.itemId);
+    } catch {
+      // The recovery preflight re-observes before executing any claimed action.
+    }
   }
   if (identity) {
     if (identity.pr_state === "merged" || (identity.pr_state === "open" && identity.ready_label_present)) {
@@ -971,21 +1077,37 @@ async function blockAndExecuteRecovery(
       return { ledger: reconciled, attempted: false };
     }
     if (!identity.issue_open) {
-      const abandoned = await transitionItem(deps.store, deps.observe, contract, {
-        runId: input.runId,
-        token: input.token,
-        itemId: input.itemId,
-        engine: input.engine,
-        to: "abandoned",
-        note: "fresh external identity closed the issue before recovery classification",
-      });
-      await appendEvent(deps.store, input.runId, input.token, "loop_recovery_superseded", {
-        item_id: input.itemId,
-        state: "abandoned",
-        pr_number: identity.pr_number,
-        head_sha: identity.head_sha || null,
-      });
-      return { ledger: abandoned, attempted: false };
+      // Same fail-open guard as executeBlockedRecovery's preflight: a
+      // swallowed-to-null gh read makes issue_open false without proving the
+      // issue closed, and abandonment is irreversible. Only a fresh POSITIVE
+      // closed observation may abandon; a null/unobservable (or positively
+      // open) re-read falls through to blockItem — the same handling as an
+      // observation failure above — so this item's classification is still
+      // recorded and the recovery preflight re-observes before any claimed
+      // action.
+      let freshIssue: Awaited<ReturnType<typeof deps.observe.getIssueStateAndLabels>> = null;
+      try {
+        freshIssue = await deps.observe.getIssueStateAndLabels(Number(input.itemId));
+      } catch {
+        freshIssue = null;
+      }
+      if (freshIssue?.state === "closed") {
+        const abandoned = await transitionItem(deps.store, deps.observe, contract, {
+          runId: input.runId,
+          token: input.token,
+          itemId: input.itemId,
+          engine: input.engine,
+          to: "abandoned",
+          note: "fresh external identity closed the issue before recovery classification",
+        });
+        await appendEvent(deps.store, input.runId, input.token, "loop_recovery_superseded", {
+          item_id: input.itemId,
+          state: "abandoned",
+          pr_number: identity.pr_number,
+          head_sha: identity.head_sha || null,
+        });
+        return { ledger: abandoned, attempted: false };
+      }
     }
   }
 
@@ -1030,7 +1152,13 @@ async function reopenClearedBlockedHolds(
     let labels: string[];
     try {
       const issue = await deps.observe.getIssueStateAndLabels(Number(item.id));
-      labels = issue?.labels ?? [];
+      if (!issue) {
+        // getIssueStateAndLabels swallows every gh failure to null — a null
+        // read is "unobservable", not "labels cleared". Leave the hold in
+        // place; only a positive read with the label absent may re-admit.
+        continue;
+      }
+      labels = issue.labels;
     } catch {
       // The live observation failed — leave the hold in place rather than guessing it cleared.
       continue;
@@ -1108,7 +1236,11 @@ async function invalidateStaleAuthorityHolds(
     const authorityHead = item.hold_request?.authority_candidate_head;
     if (!authorityHead) return false;
     const currentHead = observed[item.id]?.head_sha.trim();
-    return !currentHead || currentHead.toLowerCase() !== authorityHead.toLowerCase();
+    // An unobservable head ("" from a transient gh failure or a missing local
+    // worktree) is not movement evidence — leave the hold in place rather than
+    // guessing the candidate moved (mirrors reopenClearedBlockedHolds).
+    if (!currentHead) return false;
+    return currentHead.toLowerCase() !== authorityHead.toLowerCase();
   });
 
   for (const candidate of candidates) {
@@ -1177,7 +1309,9 @@ export async function runSupervisorCycle(
   token: string,
   engine: LoopEngineName,
 ): Promise<SupervisorCycleResult> {
-  const contract = await readContract(deps.store, runId);
+  // A pre-#509 contract carries no recovery_policy — the pure upgrader installs
+  // the default so the recovery/idle-promotion reads below never fault.
+  const contract = upgradeContractForRecovery(await readContract(deps.store, runId));
   let ledger = await readLedger(deps.store, runId);
 
   if (ledger.stop) {
@@ -1210,7 +1344,9 @@ export async function runSupervisorCycle(
     throw err;
   }
 
-  ledger = await readLedger(deps.store, runId);
+  // Upgraded read (pre-#509 ledgers have no recovery_attempts): this ledger
+  // feeds the started-claim scan and the idle-promotion branch below.
+  ledger = upgradeLedgerForRecovery(await readLedger(deps.store, runId));
   if (ledger.stop) {
     await appendActionEvidence(deps.store, runId, token, {
       item_id: null,
@@ -1307,7 +1443,56 @@ export async function runSupervisorCycle(
   let recoveryDeferredUntil: string | undefined;
   for (const item of Object.values(ledger.items)) {
     if (item.state !== "blocked") continue;
-    const recovery = await executeBlockedRecovery(deps, contract, runId, token, engine, item.id);
+    // Coexistence guard: the recovery executor is a worktree-writing path
+    // (implementer run, amend, push, rollback) in the item's managed worktree —
+    // the same worktree a concurrent host-local advance (`pipeline run` /
+    // override resume) owns while it holds the per-issue advance lock. Probe
+    // for a live advance, then take that same lock non-blocking and hold it
+    // across the whole recovery execution. Both run before the durable claim:
+    // a busy item is deferred this cycle without charging budget, and siblings
+    // are unaffected. The item's own crashed advance run id is excluded from
+    // linkage/store evidence (mirrors Pass-2, #770 12e4c0fd) so its own crash
+    // artifacts cannot defer its recovery forever.
+    const domain = deps.lockDomain ?? "agent-pipeline";
+    const ownAdvanceRunId =
+      item.advance_run_id && item.advance_run_id.length > 0 ? item.advance_run_id : null;
+    const probe: LiveAdvanceProbeResult = deps.probeLiveAdvance
+      ? await deps.probeLiveAdvance(item.id)
+      : probeLiveAdvance({
+          domain,
+          issueNumber: Number(item.id),
+          repoDir: deps.repoDir,
+          knownLinkage: ownAdvanceRunId ? { pipeline_run_id: ownAdvanceRunId } : null,
+          findWrapperPid: deps.findWrapperPid,
+          ignorePipelineRunIds: ownAdvanceRunId ? [ownAdvanceRunId] : [],
+        });
+    if (probe.live) {
+      await appendEvent(deps.store, runId, token, "loop_item_coexistence_deferred", {
+        item_id: item.id,
+        evidence: probe.evidence,
+        pipeline_run_id: "pipeline_run_id" in probe ? probe.pipeline_run_id : undefined,
+        holder_pid: "holder_pid" in probe ? probe.holder_pid : undefined,
+        reason: "recovery_deferred_live_advance",
+      }).catch(() => {});
+      continue;
+    }
+    const advanceLock = deps.acquireItemAdvanceLock
+      ? await deps.acquireItemAdvanceLock(item.id)
+      : undefined;
+    if (advanceLock === null) {
+      await appendEvent(deps.store, runId, token, "loop_item_coexistence_deferred", {
+        item_id: item.id,
+        evidence: "lock_held",
+        reason: "recovery_deferred_advance_lock_busy",
+      }).catch(() => {});
+      continue;
+    }
+    let recovery: RecoveryExecutionResult;
+    try {
+      recovery = await executeBlockedRecovery(deps, contract, runId, token, engine, item.id);
+    } finally {
+      if (advanceLock) await advanceLock.release();
+    }
     ledger = recovery.ledger;
     recoveryProgress ||= recovery.attempted;
     if (
@@ -1931,46 +2116,99 @@ export async function runSupervisorCycle(
         }
       }
       if (authorityIdentity && response?.diagnostic) {
-        const currentItem = ledger.items[itemId];
-        ledger = {
-          ...ledger,
-          items: {
-            ...ledger.items,
-            [itemId]: { ...currentItem, last_verified_identity: authorityIdentity },
-          },
-        };
-        await writeLedger(deps.store, ledger, token);
-        ledger = await waitItem(deps.store, {
-          runId,
-          token,
-          itemId,
-          engine,
-          request: {
-            kind: "answer",
-            prompt: response!.diagnostic!.detail.reason,
-            authority_evidence_key: response.diagnostic.evidence_key,
-            authority_candidate_head: authorityIdentity.head_sha,
-            ...(authorityIdentity.blocked_label_present ? { source: "pipeline_blocked_label" as const } : {}),
-          },
-          note: "explicit human-authority stage diagnostic",
-        });
+        // A sibling processed earlier in this same concurrent pass may already
+        // have recorded a terminal stop; entering a hold would throw
+        // LoopError("stop") out of the drive (pause.ts enterHold) and strand
+        // this in_progress item. Re-check the durable stop and skip the hold
+        // gracefully — no ledger write, no waitItem — preserving the
+        // first-cause stop record (mirrors executeBlockedRecovery's guard).
+        const preHoldLedger = await readLedger(deps.store, runId);
+        if (preHoldLedger.stop) {
+          ledger = preHoldLedger;
+        } else {
+          const currentItem = ledger.items[itemId];
+          ledger = {
+            ...ledger,
+            items: {
+              ...ledger.items,
+              [itemId]: { ...currentItem, last_verified_identity: authorityIdentity },
+            },
+          };
+          await writeLedger(deps.store, ledger, token);
+          ledger = await waitItem(deps.store, {
+            runId,
+            token,
+            itemId,
+            engine,
+            request: {
+              kind: "answer",
+              prompt: response!.diagnostic!.detail.reason,
+              authority_evidence_key: response.diagnostic.evidence_key,
+              authority_candidate_head: authorityIdentity.head_sha,
+              ...(authorityIdentity.blocked_label_present ? { source: "pipeline_blocked_label" as const } : {}),
+            },
+            note: "explicit human-authority stage diagnostic",
+          });
+        }
       } else {
-        const diagnostic = engineDefectDiagnostic(
-          `pipeline/loop-execution@1 reported blocked_needs_human for item ${itemId} without current attested human authority: ${projection.protocolError ?? `disposition=${projection.disposition}`}`,
-        );
-        const recovery = await blockAndExecuteRecovery(deps, contract, {
-          runId,
-          token,
-          itemId,
-          engine,
-          blockerClass: "workflow-engine-defect",
-          diagnostic,
-          evidence: transportEvidence,
-          allowAlreadyStopped: true,
-        });
-        ledger = recovery.ledger;
-        recoveryProgress ||= recovery.attempted;
-        evidenceOutcome = "protocol_failure";
+        // No current attested authority. Before treating the transport as a
+        // protocol failure, re-read live labels: a blocked_needs_human item
+        // whose live issue still carries the product `blocked` label (e.g. the
+        // #718 early-blocked re-dispatch whose fresh events carry no
+        // blocker_set but whose durable attested marker kind is
+        // human-decision-required) parks as the conservative human-resume-only
+        // hold — no authority_evidence, no candidate binding, so it is exempt
+        // from stale-authority invalidation and only a human answer/label
+        // clear resumes it. The label never grants *attested* authority; it
+        // only withholds autonomous recovery, which must never act on a
+        // human-held item (it could push an unsolicited commit or clear the
+        // human's label). A failed live read falls through to engine recovery.
+        let liveBlockedLabel = false;
+        try {
+          const issue = await deps.observe.getIssueStateAndLabels(Number(itemId));
+          liveBlockedLabel = isBlockedInLabels(issue?.labels ?? []);
+        } catch {
+          liveBlockedLabel = false;
+        }
+        if (liveBlockedLabel) {
+          // Mid-pass stop guard (same as the attested arm above): once a
+          // sibling recorded the run stop, waitItem would throw
+          // LoopError("stop") — skip the hold gracefully with no side effect.
+          const preHoldLedger = await readLedger(deps.store, runId);
+          if (preHoldLedger.stop) {
+            ledger = preHoldLedger;
+          } else {
+            ledger = await waitItem(deps.store, {
+              runId,
+              token,
+              itemId,
+              engine,
+              request: {
+                kind: "answer",
+                prompt: `pipeline/loop-execution@1 reported blocked_needs_human for item ${itemId} and the live issue carries the blocked label — needs a human answer/unblock before this item can resume`,
+                source: "pipeline_blocked_label",
+              },
+              note: "needs-human pipeline blocker without attested authority — conservative human-resume-only hold",
+            });
+          }
+        } else {
+          const diagnostic = engineDefectDiagnostic(
+            `pipeline/loop-execution@1 reported blocked_needs_human for item ${itemId} without current attested human authority: ${projection.protocolError ?? `disposition=${projection.disposition}`}`,
+          );
+          const recovery = await blockAndExecuteRecovery(deps, contract, {
+            runId,
+            token,
+            itemId,
+            engine,
+            blockerClass: "workflow-engine-defect",
+            diagnostic,
+            evidence: transportEvidence,
+            allowAlreadyStopped: true,
+          });
+          ledger = recovery.ledger;
+          recoveryProgress ||= recovery.attempted;
+          evidenceOutcome = "protocol_failure";
+        }
       }
     } else {
       // "failed" — either reported directly, a rejected dispatch, or normalized from an outcome
@@ -2437,9 +2675,24 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
       }
 
       if (result.retryAfterMs !== undefined && deps.recoverySleep) {
-        // Keep the supervisor heartbeat fresh during long policy backoffs.
-        // The cycle only returns a deadline after proving no sibling can run.
-        await deps.recoverySleep(Math.min(result.retryAfterMs, 5_000));
+        // Keep the supervisor heartbeat fresh during long policy backoffs. The
+        // cycle only returns a deadline after proving no sibling can run, so
+        // the window is slept here in heartbeat-sized chunks with no API calls
+        // between them — but each no-reentry stretch is capped at 60s so the
+        // full cycle (and its remote observation) re-enters at least every
+        // 60s. An external mid-window intervention (blocked-label clear,
+        // resume answer, externally recorded stop) is therefore picked up
+        // within bounded latency, while API pressure stays 12x below the
+        // pre-#787 5s re-poll. If the deadline is still ahead on re-entry the
+        // cycle returns a fresh retryAfterMs and the next stretch is slept.
+        let remainingMs = Math.min(result.retryAfterMs, 60_000);
+        while (remainingMs > 0) {
+          const chunk = Math.min(remainingMs, 5_000);
+          await deps.recoverySleep(chunk);
+          remainingMs -= chunk;
+          record = { ...record, heartbeat_at: deps.store.now().toISOString() };
+          await writeSupervisorProcess(deps.store, record, token);
+        }
       }
 
       if (record.consecutive_no_progress >= limit) {

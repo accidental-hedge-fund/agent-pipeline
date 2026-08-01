@@ -223,10 +223,12 @@ export const PRE_MERGE_AUTOFIX_NOOP_RE =
 
 /**
  * Durable attempt-started marker posted **before** the harness is invoked
- * (#698 review-2). Guarantees the one-attempt bound even when the post-noop
- * completion marker fails to persist (or the process crashes mid-harness):
- * a later pre-merge entry at the same head recognizes this sentinel and does
- * not start a second auto-fix.
+ * (#698 review-2) but only **after** preflight (worktree lookup,
+ * rematerialization, clean-tree check) succeeds (#787), so preflight failures
+ * do not consume the one-attempt bound. Guarantees the bound even when the
+ * post-noop completion marker fails to persist (or the process crashes
+ * mid-harness): a later pre-merge entry at the same head recognizes this
+ * sentinel and does not start a second auto-fix.
  */
 export const PRE_MERGE_AUTOFIX_ATTEMPT_HEADING = "## Pipeline: Pre-merge auto-fix attempt";
 /** Machine sentinel: `<!-- pipeline-pre-merge-autofix-attempt: <40-hex-sha> -->`. */
@@ -255,6 +257,11 @@ export const PRE_MERGE_AUTOFIX_ATTEMPT_RE =
  *                   failed before implementer work (#769). Carries the seam's
  *                   typed blockerKind so residual re-entry / delta SHA-gate
  *                   paths park as worktree-* rather than product needs-human.
+ * "claim-failed"  — every preflight succeeded but the durable attempt claim
+ *                   (the caller's `claimAttempt` callback) could not be
+ *                   recorded (#787). The implementer was NOT invoked and no
+ *                   attempt was consumed; a later entry at the same head may
+ *                   retry the claim.
  */
 export type PreMergeAutofixRematerializeBlockerKind =
   | "worktree-missing"
@@ -269,7 +276,8 @@ export type PreMergeAutoFixResult =
       status: "rematerialize-failed";
       blockerKind: PreMergeAutofixRematerializeBlockerKind;
       diagnostic: string;
-    };
+    }
+  | { status: "claim-failed"; diagnostic: string };
 
 /**
  * Injectable seam for the bounded pre-merge auto-fix attempt (#359, #747).
@@ -279,11 +287,20 @@ export type PreMergeAutoFixResult =
  * category partition yields a non-empty auto-fixable subset and (b) no prior
  * auto-fix commit / durable attempt or noop-clean marker is present.
  * Residual non-allowlisted findings are never passed into this seam.
+ *
+ * `claimAttempt` (#787, spec pre-merge-fix-round): the caller's durable
+ * attempt-charge callback (posts the attempt-started marker). The seam MUST
+ * invoke and await it only after every preflight step — worktree lookup,
+ * rematerialization, and the clean-tree check — has succeeded, immediately
+ * before invoking the implementer, so a preflight failure never consumes the
+ * one-attempt bound. A false/throwing claim MUST NOT invoke the implementer
+ * ("claim-failed").
  */
 export type AttemptPreMergeAutoFixFn = (
   blockingFindings: ReviewFinding[],
   issueTitle: string,
   reviewComment: string,
+  claimAttempt?: () => Promise<boolean>,
 ) => Promise<PreMergeAutoFixResult>;
 
 /**
@@ -738,6 +755,9 @@ const PRE_MERGE_AUTOFIX_SALVAGE_LABEL = "pre-merge auto-fix";
  * (the durable crash-safe one-attempt marker), and pushes to the PR head.
  *
  * Pre-conditions: worktree must be clean (fail closed otherwise).
+ * `claimAttempt` (#787): optional durable attempt-charge callback, awaited
+ * only after the clean-tree/reattach preflight, immediately before the
+ * harness — false/throw returns "claim-failed" without invoking the harness.
  * On dirty/unsalvaged harness failure, ambiguous partial state, or push error:
  * rolls the worktree back to the pre-fix HEAD over a clean tree and returns
  * "error". A confirmed clean no-commit (`headAfter === headBefore`, worktree
@@ -769,6 +789,7 @@ export async function performPreMergeAutoFix(
   invokeFn: InvokeFn,
   salvageFn: typeof trySalvageUncommittedWork = trySalvageUncommittedWork,
   repairIdentity: { commitSubjectPrefix?: string; salvageLabel?: string } = {},
+  claimAttempt?: () => Promise<boolean>,
 ): Promise<PreMergeAutoFixResult> {
   const harness = cfg.harnesses?.implementer;
   if (!harness) return { status: "error" };
@@ -797,6 +818,27 @@ export async function performPreMergeAutoFix(
     fixRound: 1,
     pipelineRunId,
   });
+
+  // Durable one-attempt claim (#787): charge the attempt only after every
+  // preflight above (clean tree, reattach) has succeeded, immediately before
+  // the implementer runs — a preflight failure must not consume the single
+  // repair unit. A failed claim must not invoke the harness: fail closed so a
+  // later entry at the same head can retry the claim (no unbound attempt).
+  if (claimAttempt) {
+    let claimed = false;
+    try {
+      claimed = await claimAttempt();
+    } catch {
+      claimed = false;
+    }
+    if (!claimed) {
+      return {
+        status: "claim-failed",
+        diagnostic:
+          "durable pre-merge auto-fix attempt marker could not be recorded; implementer not invoked",
+      };
+    }
+  }
 
   const result = await invokeFn(harness, wt.path, prompt, {
     timeoutSec: cfg.fix_timeout,
@@ -1578,7 +1620,7 @@ export async function advance(
   const preAutoFixFn: ShaGateDeps["attemptPreMergeAutoFix"] =
     deps.attemptPreMergeAutoFix ??
     (cfg.harnesses?.implementer
-      ? async (blockingFindings, issueTitle, findingsText) => {
+      ? async (blockingFindings, issueTitle, findingsText, claimAttempt) => {
           let wt = await getForIssueForAutoFix(cfg, issueNumber);
           if (!wt) {
             const remat = await ensureWtForAutoFix(cfg, issueNumber, {
@@ -1597,6 +1639,9 @@ export async function advance(
             }
             wt = { path: remat.worktree.path, slug: remat.worktree.slug };
           }
+          // `claimAttempt` charges the durable one-attempt marker inside
+          // performPreMergeAutoFix only after the clean-tree preflight, so a
+          // preflight failure here or below never consumes the attempt (#787).
           return performPreMergeAutoFix(
             cfg,
             issueNumber,
@@ -1607,6 +1652,8 @@ export async function advance(
             gitFnForAutoFix,
             invokeFnForAutoFix,
             salvageFnForAutoFix,
+            {},
+            claimAttempt,
           );
         }
       : undefined);
@@ -2609,25 +2656,34 @@ export async function enforceReviewShaGate(
           priorAutoFix = true; // fail closed: cannot prove no prior attempt
         }
         if (!priorAutoFix) {
-          let attemptMarkerPosted = false;
-          try {
-            await postCommentFn(
-              cfg,
-              issueNumber,
-              preMergeAutofixAttemptComment({ issueNumber, headSha: head }),
-            );
-            attemptMarkerPosted = true;
-          } catch (err) {
-            console.warn(
-              `[pipeline] #${issueNumber}: residual re-entry autofix marker post failed: ` +
-                `${(err as Error).message ?? String(err)}; escalating`,
-            );
-          }
-          if (attemptMarkerPosted) {
+          // Preflight-before-claim (#787, spec pre-merge-fix-round): the
+          // durable attempt-started marker is posted by this closure, which
+          // the seam invokes only after worktree lookup, rematerialization,
+          // and the clean-tree preflight succeed — immediately before the
+          // implementer. A preflight failure (e.g. rematerialize-failed)
+          // therefore parks without consuming the one-attempt bound.
+          const claimAttempt = async (): Promise<boolean> => {
+            try {
+              await postCommentFn(
+                cfg,
+                issueNumber,
+                preMergeAutofixAttemptComment({ issueNumber, headSha: head }),
+              );
+              return true;
+            } catch (err) {
+              console.warn(
+                `[pipeline] #${issueNumber}: residual re-entry autofix marker post failed: ` +
+                  `${(err as Error).message ?? String(err)}; escalating`,
+              );
+              return false;
+            }
+          };
+          {
             const fixRes = await attemptAutoFixFn(
               autoFixable,
               detail.title ?? `issue #${issueNumber}`,
               commentBody,
+              claimAttempt,
             );
             if (fixRes.status === "fix-committed" || fixRes.status === "noop-clean") {
               // HEAD may have moved (or re-verify is required). Bounce pre-merge
@@ -3302,40 +3358,47 @@ export async function enforceReviewShaGate(
             autoFixableKeys.size > 0 ? autoFixableKeys : undefined,
             newHash,
           );
-          // Crash-safe one-attempt guard (#698 review-2): persist attempt-started
-          // BEFORE invoking the harness. If this post fails, do not run the
-          // harness — fail closed so a later entry can retry the marker rather
-          // than leave an unbound attempt. Once posted, a later entry at the
-          // same head will not start a second auto-fix even if the noop
-          // completion marker never lands.
+          // Crash-safe one-attempt guard (#698 review-2), claimed at the seam
+          // (#787, spec pre-merge-fix-round): the durable attempt-started
+          // marker is posted by this closure, which the seam invokes only
+          // after worktree lookup, rematerialization, and the clean-tree
+          // preflight succeed — immediately before the harness — so a
+          // preflight failure never consumes the one-attempt bound. If the
+          // post fails, the harness is not run ("claim-failed") — fail closed
+          // so a later entry can retry the marker rather than leave an
+          // unbound attempt. Once posted, a later entry at the same head will
+          // not start a second auto-fix even if the noop completion marker
+          // never lands.
           let attemptMarkerPosted = false;
-          try {
-            await postCommentFn(
-              cfg,
-              issueNumber,
-              preMergeAutofixAttemptComment({
+          const claimAttempt = async (): Promise<boolean> => {
+            try {
+              await postCommentFn(
+                cfg,
                 issueNumber,
-                headSha: targetHead,
-              }),
-            );
-            attemptMarkerPosted = true;
-          } catch (err) {
-            autoFixDiagnostic =
-              `failed to record durable pre-merge auto-fix attempt marker at ` +
-              `${targetHead.slice(0, 7)} before harness invoke: ` +
-              `${(err as Error).message ?? String(err)}`;
-            console.warn(
-              `[pipeline] #${issueNumber}: ${autoFixDiagnostic}; escalating without auto-fix`,
-            );
-            // Fall through to setBlocked below without calling the harness.
-            // Do not set priorAutoFix — there is no durable marker; a later
-            // entry may retry the attempt-started post (still no double harness).
-          }
-          const fixRes = attemptMarkerPosted
-            ? await attemptAutoFixFn(
-                categoryPartition.autoFixable, detail.title, blockingOnlyBody,
-              )
-            : null;
+                preMergeAutofixAttemptComment({
+                  issueNumber,
+                  headSha: targetHead,
+                }),
+              );
+              attemptMarkerPosted = true;
+              return true;
+            } catch (err) {
+              autoFixDiagnostic =
+                `failed to record durable pre-merge auto-fix attempt marker at ` +
+                `${targetHead.slice(0, 7)} before harness invoke: ` +
+                `${(err as Error).message ?? String(err)}`;
+              console.warn(
+                `[pipeline] #${issueNumber}: ${autoFixDiagnostic}; escalating without auto-fix`,
+              );
+              // Caller falls through to setBlocked without running the harness.
+              // Do not set priorAutoFix — there is no durable marker; a later
+              // entry may retry the attempt-started post (still no double harness).
+              return false;
+            }
+          };
+          const fixRes = await attemptAutoFixFn(
+            categoryPartition.autoFixable, detail.title, blockingOnlyBody, claimAttempt,
+          );
           if (attemptMarkerPosted) autoFixAttemptRecognized = true;
           // fix-committed → re-review at new head; noop-clean → re-verify at
           // unchanged head (#698). Both share the single re-review path; neither
@@ -3707,7 +3770,8 @@ export async function enforceReviewShaGate(
             await setBlockedFn(cfg, issueNumber, rematReason, "pre-merge", "worktree-missing");
             return preMergeBlocked(rematReason, "worktree-missing");
           } else {
-            // fixRes.status === "error" (or attempt marker failed → fixRes null).
+            // fixRes.status === "error", or "claim-failed" (attempt marker
+            // post failed after preflight — harness not run, attempt unconsumed).
             await recordPreMergeGateResult(
               { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
               "pre-merge-autofix",

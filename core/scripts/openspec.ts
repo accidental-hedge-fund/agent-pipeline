@@ -211,6 +211,29 @@ export interface ArchiveDeps {
   changeState?: (dir: string, name: string) => ArchiveChangeState;
 }
 
+/** Minimum OpenSpec CLI version whose `archive` supports `--json` — 1.5 added
+ *  the machine-readable `{ archive, status }` envelope parseArchiveResult
+ *  requires. */
+export const OPENSPEC_ARCHIVE_JSON_MIN_VERSION = "1.5.0";
+
+/**
+ * Parse the first `major.minor.patch` triple out of `openspec --version`
+ * output (the real CLI prints a bare `1.5.0`). Returns null when no version is
+ * identifiable — the preflight in {@link archive} then treats the probe as
+ * inconclusive and lets the archive call's own result govern.
+ */
+export function parseOpenspecCliVersion(output: string): [number, number, number] | null {
+  const m = output.match(/(\d+)\.(\d+)\.(\d+)/);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+function versionAtLeast(v: [number, number, number], min: [number, number, number]): boolean {
+  for (let i = 0; i < 3; i++) {
+    if (v[i] !== min[i]) return v[i] > min[i];
+  }
+  return true;
+}
+
 interface ArchiveJsonDiagnostic {
   code?: string;
   message?: string;
@@ -315,6 +338,26 @@ export async function archive(
   deps: ArchiveDeps = {},
 ): Promise<ArchiveResult> {
   const run = deps.run ?? runOpenspec;
+  // Capability preflight: `archive --json` requires OpenSpec >= 1.5. A
+  // positively identified older CLI must fail here with an actionable upgrade
+  // diagnostic — feeding its non-JSON usage error into the parse below would
+  // misreport a tooling gap as a generic archive_command_failed apply
+  // conflict and send implementer repair rounds chasing a change that has
+  // nothing wrong with it. An inconclusive probe (unrecognized output or
+  // probe error) falls through to the archive call, whose own result governs.
+  const probe = await run(dir, ["--version"], timeoutMs);
+  if (probe.unavailable) {
+    return { success: false, unavailable: true, output: `${probe.stdout}${probe.stderr}`.trim() };
+  }
+  const cliVersion = probe.code === 0 ? parseOpenspecCliVersion(`${probe.stdout}${probe.stderr}`) : null;
+  if (cliVersion && !versionAtLeast(cliVersion, parseOpenspecCliVersion(OPENSPEC_ARCHIVE_JSON_MIN_VERSION)!)) {
+    const found = cliVersion.join(".");
+    const message =
+      `openspec CLI ${found} does not support \`archive --json\`; ` +
+      `openspec >= ${OPENSPEC_ARCHIVE_JSON_MIN_VERSION} is required`;
+    const fix = `Upgrade the openspec CLI to ${OPENSPEC_ARCHIVE_JSON_MIN_VERSION} or newer, then re-run.`;
+    return archiveFailure(name, "archive_cli_unsupported", `${message}. ${fix}`, { message, fix });
+  }
   const r = await run(dir, ["archive", name, "--yes", "--json"], timeoutMs);
   if (r.unavailable) {
     return {

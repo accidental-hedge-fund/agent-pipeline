@@ -1568,15 +1568,50 @@ test("advanceFix source pin: an accepted needs-human-decision park blocks with t
 // extractors would honor.
 // ---------------------------------------------------------------------------
 
-test("advanceFix source pin: the blocker-reason `requests` string neutralizes each declaration's request via neutralizeSentinelText", async () => {
+test("advanceFix source pin: the blocker-reason requests string neutralizes each declaration's request via neutralizeSentinelText", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
-  const requestsIdx = src.indexOf("const requests = acceptedHumanDecisions");
-  assert.ok(requestsIdx !== -1, "expected the `requests` blocker-reason construction to exist");
+  const requestsIdx = src.indexOf("const formatRequests = (decls: HumanDecisionDeclaration[]): string =>");
+  assert.ok(requestsIdx !== -1, "expected the formatRequests blocker-reason construction to exist");
   const snippet = src.slice(requestsIdx, requestsIdx + 200);
   assert.match(
     snippet,
     /neutralizeSentinelText\(d\.request\)/,
     "the blocker-reason sink must neutralize each declaration's request the same way the evidence comment does",
+  );
+});
+
+// The external-dependency reclassification (needs-human blocker kind instead of
+// human-decision-required) must not drop the #473 audited evidence comment for
+// the reclassified declarations, and each blocker message must be built from
+// its own group's fields only — external-dependency categories/requests must
+// never inflate the human-authority message.
+
+test("advanceFix source pin: the #473 audit comment is posted for every accepted declaration, external-dependency included", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  assert.ok(
+    src.includes("for (const decl of acceptedHumanDecisions) {"),
+    "the humanDecisionComment audit loop must iterate ALL accepted declarations, not just the authority subset",
+  );
+  assert.equal(
+    src.indexOf("for (const decl of authorityDecisions) {"),
+    -1,
+    "the audit loop must not be restricted to authority declarations — that drops the external-dependency audit trail",
+  );
+});
+
+test("advanceFix source pin: authority and external blocker messages are built from their own group's categories/requests", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  assert.ok(
+    src.includes("[...new Set(authorityDecisions.map((d) => d.category))]"),
+    "the authority message's categories must come from authorityDecisions only",
+  );
+  assert.ok(
+    src.includes("${formatRequests(authorityDecisions)}"),
+    "the authority message's requests must come from authorityDecisions only",
+  );
+  assert.ok(
+    src.includes("${formatRequests(externalDecisions)}"),
+    "the external-dependency message's requests must come from externalDecisions only",
   );
 });
 

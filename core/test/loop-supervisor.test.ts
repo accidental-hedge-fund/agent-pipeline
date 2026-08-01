@@ -17,8 +17,8 @@ import {
   attachSupervisor,
   auditSupervisor,
   dominantExclusionReason,
-  driveSupervisor,
-  runSupervisorCycle,
+  driveSupervisor as driveSupervisorRaw,
+  runSupervisorCycle as runSupervisorCycleRaw,
   type SupervisorDeps,
 } from "../scripts/loop/supervisor.ts";
 import { ACTIVE_RUN_STORE_MAX_AGE_MS } from "../scripts/loop/live-advance.ts";
@@ -33,7 +33,7 @@ import {
   writeLedger,
   type LoopStoreDeps,
 } from "../scripts/loop/store.ts";
-import { DEFAULT_RECOVERY_POLICY } from "../scripts/loop/recovery.ts";
+import { DEFAULT_RECOVERY_POLICY, blockItem } from "../scripts/loop/recovery.ts";
 import type { ReconcileObserveDeps } from "../scripts/loop/reconcile.ts";
 import {
   LOOP_CONTRACT_SCHEMA,
@@ -51,6 +51,32 @@ const READY_LABEL = "pipeline:ready-to-deploy";
 // predates and is orthogonal to the precondition gate) is unaffected; tests of the gate itself
 // override this explicitly.
 const PIPELINE_READY_LABEL = "pipeline:ready";
+
+// ---------------------------------------------------------------------------
+// Hermeticity by default (verification round 2): SupervisorDeps built without
+// probeLiveAdvance/acquireItemAdvanceLock fall back to the REAL host probe,
+// which reads /tmp/pipeline-<domain>-<issue>.lock and calls
+// process.kill(pid, 0) — on a dogfooding host a genuinely live advance for a
+// colliding issue number would flake these tests. Every test in this file goes
+// through the wrappers below, which default-inject a dead probe and a
+// permissive advance-lock fake; a test exercising the coexistence guard keeps
+// its own fakes (its explicit keys win the spread), and the #770
+// default-wiring regressions call the *Raw entry points directly with a
+// test-unique lock domain.
+// ---------------------------------------------------------------------------
+
+function hermeticSupervisorDeps(deps: SupervisorDeps): SupervisorDeps {
+  return {
+    probeLiveAdvance: () => ({ live: false as const }),
+    acquireItemAdvanceLock: () => ({ release() {} }),
+    ...deps,
+  };
+}
+
+const driveSupervisor: typeof driveSupervisorRaw = (deps, input) =>
+  driveSupervisorRaw(hermeticSupervisorDeps(deps), input);
+const runSupervisorCycle: typeof runSupervisorCycleRaw = (deps, runId, token, engine) =>
+  runSupervisorCycleRaw(hermeticSupervisorDeps(deps), runId, token, engine);
 
 function humanAuthorityDiagnostic(reason = "A human product decision is required") {
   return buildStageDiagnostic({
@@ -2344,6 +2370,127 @@ test("fresh ready state supersedes an interrupted recovery claim without another
   assert.ok((await readEvents(deps, "run-1")).some((event) => event.kind === "loop_recovery_superseded"));
 });
 
+test("regression (#787): an unobservable fresh head does not fail a started recovery claim", async () => {
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      // A single non-repair recipe so the claim is subject to the stale-claim gate.
+      "workflow-state": { ...workflowState, recipes: ["resync_workflow_state"] },
+    },
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let localHead: { branch: string; sha: string } | null = { branch: "pipeline/100-fix", sha: "abc123" };
+  let failObservation = false;
+  let recoveryCalls = 0;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "candidate requires a mechanical resync",
+    stage: "pre-merge",
+  });
+  const observe = fakeObserveDeps({
+    async getLocalHead() {
+      if (failObservation) throw new Error("postcondition temporarily unavailable");
+      return localHead;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_recoverable",
+    evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+    diagnostic,
+  });
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    failObservation = true;
+    return { succeeded: true, evidence: "resync applied", candidateHead: "abc123" };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle({ store: deps, observe, dispatchItem, executeRecovery }, "run-1", token, "claude");
+  const afterClaim = await readLedger(deps, "run-1");
+  assert.equal(afterClaim.recovery_attempts[0].outcome, "started");
+  const budgetAfterClaim = afterClaim.items["100"].recovery_budgets_remaining["workflow-state"];
+
+  // The next cycle's fresh observation succeeds but yields no head at all (no
+  // PR detail resolves and no local worktree exists) — the claim must survive
+  // for the next cycle instead of being failed as stale.
+  failObservation = false;
+  localHead = null;
+  await runSupervisorCycle({ store: deps, observe, dispatchItem, executeRecovery }, "run-1", token, "claude");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(recoveryCalls, 2, "the durable claim is replayed, not failed pre-execution");
+  assert.equal(finalLedger.recovery_attempts.length, 1, "no replacement claim is charged");
+  assert.equal(finalLedger.recovery_attempts[0].outcome, "started", "the claim survives an unobservable head");
+  assert.equal(
+    finalLedger.items["100"].recovery_budgets_remaining["workflow-state"],
+    budgetAfterClaim,
+    "no extra budget unit is burned",
+  );
+  assert.ok(
+    !(await readEvents(deps, "run-1")).some((event) => event.kind === "loop_recovery_attempt_stale"),
+    "no stale-claim event is recorded for a merely unobservable head",
+  );
+});
+
+test("a started recovery claim is failed as stale when the freshly observed head genuinely differs", async () => {
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": { ...workflowState, recipes: ["resync_workflow_state"] },
+    },
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let localHead: { branch: string; sha: string } | null = { branch: "pipeline/100-fix", sha: "abc123" };
+  let failObservation = false;
+  let recoveryCalls = 0;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "candidate requires a mechanical resync",
+    stage: "pre-merge",
+  });
+  const observe = fakeObserveDeps({
+    async getLocalHead() {
+      if (failObservation) throw new Error("postcondition temporarily unavailable");
+      return localHead;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_recoverable",
+    evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+    diagnostic,
+  });
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    failObservation = true;
+    return { succeeded: true, evidence: "resync applied", candidateHead: "abc123" };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle({ store: deps, observe, dispatchItem, executeRecovery }, "run-1", token, "claude");
+  assert.equal((await readLedger(deps, "run-1")).recovery_attempts[0].outcome, "started");
+
+  // The next cycle observes a real, different head: the claimed candidate moved.
+  failObservation = false;
+  localHead = { branch: "pipeline/100-fix", sha: "def456" };
+  await runSupervisorCycle({ store: deps, observe, dispatchItem, executeRecovery }, "run-1", token, "claude");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(recoveryCalls, 1, "the stale claim is never re-executed");
+  assert.equal(finalLedger.recovery_attempts[0].outcome, "failed");
+  assert.match(finalLedger.recovery_attempts[0].error ?? "", /stale/);
+  assert.ok((await readEvents(deps, "run-1")).some((event) => event.kind === "loop_recovery_attempt_stale"));
+});
+
 test("a failed budgeted recovery stays blocked and stops only after the action is observed", async () => {
   const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
   const ledger = testLedger({
@@ -2619,6 +2766,92 @@ test("regression (#570): a direct blocked_needs_human outcome enters a needs-hum
   );
 });
 
+test("regression (#787 review): blocked_needs_human without attested authority but with a live blocked label parks as a conservative human-resume-only hold — no autonomous recovery", async () => {
+  // The #718 early-blocked re-dispatch shape: the fresh advance events carry no
+  // blocker_set, so the dispatch classifies via the durable attested
+  // human-decision-required marker and transports blocked_needs_human WITHOUT a
+  // diagnostic (a comment marker can never reconstruct authority_evidence).
+  const contract = testContract({ items: [{ id: "200", depends_on: [] }] });
+  const ledger = testLedger({ "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+
+  const dispatched = new Set<string>();
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels(issueNumber) {
+      const id = String(issueNumber);
+      if (id === "200" && dispatched.has(id)) {
+        return { state: "open", labels: ["pipeline:plan-review", "blocked"] };
+      }
+      return { state: "open", labels: [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  let recoveryExecutions = 0;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatched.add(request.item_id);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked_needs_human",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+      // No diagnostic: marker-derived transport (never fabricated authority).
+    };
+  };
+
+  const result = await driveSupervisor(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      executeRecovery: async () => {
+        recoveryExecutions++;
+        return { succeeded: false, evidence: "must never run against a human-held item" };
+      },
+      probeLiveAdvance: () => ({ live: false }),
+    },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(recoveryExecutions, 0, "autonomous recovery must never act on a human-held item");
+  assert.equal(result.stop, null, "never run_fatal for a live human hold");
+  assert.equal(result.holdOutstanding, true);
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["200"].state, "waiting");
+  assert.equal(finalLedger.items["200"].hold_request?.kind, "answer");
+  assert.equal(
+    finalLedger.items["200"].hold_request?.source,
+    "pipeline_blocked_label",
+    "label-cleared re-admission must work once the human unblocks",
+  );
+  assert.equal(
+    finalLedger.items["200"].hold_request?.authority_candidate_head,
+    undefined,
+    "a marker-derived hold carries no candidate-bound authority — conservative human-resume-only",
+  );
+  assert.notEqual(finalLedger.items["200"].blocked_theme, "workflow-engine-defect");
+  assert.equal((finalLedger.recovery_attempts ?? []).length, 0, "no recovery attempt is claimed");
+});
+
 test("regression (#581 review 1, finding fcb03bcd04fc9b04): a direct blocked_needs_human outcome with no live blocked label is held without the pipeline_blocked_label discriminator and is never auto-reopened for redispatch", async () => {
   const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
   const ledger = testLedger({ "100": itemEntry("100", "pending") });
@@ -2734,6 +2967,59 @@ test("candidate-bound human authority expires on HEAD movement even while the bl
   assert.equal(finalLedger.items["100"].state, "abandoned");
   assert.equal(finalLedger.items["100"].hold_request, undefined);
   assert.ok((await readEvents(deps, "run-1")).some((event) => event.kind === "loop_item_hold_invalidated"));
+});
+
+test("regression (#787): an unobservable head never invalidates a candidate-bound human authority hold", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const diagnostic = humanAuthorityDiagnostic();
+  const waiting = {
+    ...itemEntry("100", "waiting"),
+    last_verified_identity: currentLocalIdentity(),
+    hold_request: {
+      request_id: "hold-100",
+      item_id: "100",
+      kind: "answer" as const,
+      prompt: "Decide the reviewed candidate question",
+      requested_by_engine: "claude" as const,
+      requested_at: "2026-07-23T00:00:00.000Z",
+      authority_evidence_key: diagnostic.evidence_key,
+      authority_candidate_head: "abc123",
+      source: "pipeline_blocked_label" as const,
+    },
+  };
+  const { deps } = await setup(contract, testLedger({ "100": waiting }));
+  let dispatchCount = 0;
+  // Every head observation comes back empty this cycle: no PR detail resolves
+  // and no local worktree exists (the default fakes) — a transient observation
+  // failure, not evidence the reviewed candidate moved.
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: [PIPELINE_READY_LABEL, "blocked"] };
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "abandoned",
+      evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(cycle.holdOutstanding, true);
+  assert.equal(dispatchCount, 0, "the held item is never re-admitted on an unobservable head");
+  assert.equal(finalLedger.items["100"].state, "waiting");
+  assert.equal(finalLedger.items["100"].hold_request?.authority_candidate_head, "abc123", "the hold survives intact");
+  assert.ok(
+    !(await readEvents(deps, "run-1")).some((event) => event.kind === "loop_item_hold_invalidated"),
+    "no invalidation event is recorded for a merely unobservable head",
+  );
 });
 
 test("authority fail-closed: a failed outcome carrying only the blocked label is an engine defect, never a human hold", async () => {
@@ -3788,14 +4074,18 @@ test("regression (#770 956d20df): default probe path uses deps.findWrapperPid (n
   };
   const { token } = await acquireLock(deps, "run-1", "claude");
 
-  const cycle = await runSupervisorCycle(
+  // Raw entry point: this test deliberately exercises the production default
+  // probe (no injected fake). The lock domain is test-unique so the real
+  // /tmp/pipeline-<domain>-<issue>.lock path can never collide with a live
+  // advance on a dogfooding host.
+  const cycle = await runSupervisorCycleRaw(
     {
       store: deps,
       observe,
       dispatchItem,
       // No probeLiveAdvance override — production default path.
       repoDir: "/tmp/not-a-real-repo-770",
-      lockDomain: "agent-pipeline",
+      lockDomain: "agent-pipeline-test-956d20df",
       findWrapperPid: () => process.pid,
     },
     "run-1",
@@ -3864,14 +4154,16 @@ test("regression (#770 b48730b7): default probe with stale crash store does not 
   fs.utimesSync(events, old, old);
 
   try {
-    const result = await driveSupervisor(
+    // Raw entry point + test-unique lock domain: exercises the production
+    // default probe hermetically (no /tmp lock collision with a live advance).
+    const result = await driveSupervisorRaw(
       {
         store: deps,
         observe,
         dispatchItem,
         // Default probe path: repoDir only — no findWrapperPid, no probe override.
         repoDir: repo,
-        lockDomain: "agent-pipeline",
+        lockDomain: "agent-pipeline-test-b48730b7",
       },
       { runId: "run-1", engine: "claude" },
     );
@@ -3964,13 +4256,15 @@ test("regression (#770 12e4c0fd): aged linked crash artifact still escalates gen
   try {
     // Pre-dispatch must not treat aged linkage as live (would skip dispatch entirely).
     // Pass-2 must not reclassify the crash as coexistence via stale linkage.
-    const result = await driveSupervisor(
+    // Raw entry point + test-unique lock domain: exercises the production
+    // default probe hermetically (no /tmp lock collision with a live advance).
+    const result = await driveSupervisorRaw(
       {
         store: deps,
         observe,
         dispatchItem,
         repoDir: repo,
-        lockDomain: "agent-pipeline",
+        lockDomain: "agent-pipeline-test-12e4c0fd-aged",
         // No probeLiveAdvance override — production default path.
       },
       { runId: "run-1", engine: "claude" },
@@ -4072,13 +4366,15 @@ test("regression (#770 12e4c0fd): freshly crashed linked advance escalates genui
   };
 
   try {
-    const result = await driveSupervisor(
+    // Raw entry point + test-unique lock domain: exercises the production
+    // default probe hermetically (no /tmp lock collision with a live advance).
+    const result = await driveSupervisorRaw(
       {
         store: deps,
         observe,
         dispatchItem,
         repoDir: repo,
-        lockDomain: "agent-pipeline",
+        lockDomain: "agent-pipeline-test-12e4c0fd-fresh",
         // Default probe path — Pass-2 must ignore the failed attempt's own fresh
         // linkage/run-store and still escalate without lock/wrapper holder.
       },
@@ -4145,4 +4441,1154 @@ test("regression (#770 ce4794fb): hold-clear with terminal linkage (probe not li
   assert.deepEqual(calls.map((c) => c.item_id), ["675"]);
   assert.equal(result.allDone, true);
   assert.equal(result.stop, null);
+});
+
+// ---------------------------------------------------------------------------
+// Recovery bounds & guards (#787 review): repeated_evidence_limit as an
+// independent bound, mid-pass stop guards, pre-#509 shape upgrades, and
+// lag-tolerant post-repair head verification.
+// ---------------------------------------------------------------------------
+
+test("regression (#787): repeated identical evidence stops the run at repeated_evidence_limit with class budget remaining, reason repeated_no_progress", async () => {
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      // backoff 0 keeps every claimed attempt immediately executable so the
+      // test exercises the limit bound, not the deferral path. limit 2 /
+      // budget 3 (defaults) — the limit must bind before the budget drains.
+      "workflow-state": { ...workflowState, backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 } },
+    },
+    items: [{ id: "100", depends_on: [] }],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let dispatchCount = 0;
+  let recoveryCalls = 0;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "The PR head must be rebased onto main",
+    stage: "pre-merge",
+  });
+  const observe = fakeObserveDeps({
+    async getLocalHead() {
+      return null; // no candidate head -> narrow resync recipe, never repair
+    },
+  }).deps;
+  // Every dispatch re-blocks with byte-identical evidence: same diagnostic,
+  // same transport pointer.
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked_recoverable",
+      evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+      diagnostic,
+    };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: true, evidence: "workflow state resynchronized" };
+  };
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(result.stop?.reason, "repeated_no_progress", "the limit is promoted to a stop once no sibling is schedulable");
+  assert.equal(result.stop?.item_id, "100");
+  assert.equal(result.stop?.theme, "workflow-state");
+  assert.ok(result.stop?.fingerprint, "the repeating fingerprint is disclosed on the stop record");
+  assert.equal(recoveryCalls, 2, "the limit bounds implementer dispatches independently of the class budget");
+  assert.equal(dispatchCount, 3, "no further dispatch is spent once the limit is reached");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked");
+  assert.equal(finalLedger.items["100"].repeated_evidence_count, 2);
+  assert.equal(
+    finalLedger.items["100"].recovery_budgets_remaining["workflow-state"],
+    1,
+    "the class retry budget was NOT drained to reach the stop",
+  );
+});
+
+test("regression (#787): a non-run_fatal class whose budget exhausts stops with reason recovery_exhausted", async () => {
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": {
+        ...workflowState,
+        recipes: ["resync_workflow_state"],
+        retry_budget: 1,
+        backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 },
+        repeated_evidence_limit: 5,
+      },
+    },
+    items: [{ id: "100", depends_on: [] }],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let recoveryCalls = 0;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "The PR head must be rebased onto main",
+    stage: "pre-merge",
+  });
+  const observe = fakeObserveDeps({
+    async getLocalHead() {
+      return null;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_recoverable",
+    evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+    diagnostic,
+  });
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: false, evidence: "resync failed", error: "resync failed" };
+  };
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(result.stop?.reason, "recovery_exhausted");
+  assert.equal(result.stop?.theme, "workflow-state");
+  assert.equal(recoveryCalls, 1, "exactly the budgeted attempt executed");
+});
+
+test("regression (#787): a run_fatal class exhausted stops with reason run_fatal", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let recoveryCalls = 0;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "harness-failure",
+    reason: "The host returned a malformed stage result",
+    stage: "loop-supervisor",
+  });
+  const observe = fakeObserveDeps({
+    async getLocalHead() {
+      return null;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_recoverable",
+    evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+    diagnostic,
+  });
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: false, evidence: "restart failed", error: "restart failed" };
+  };
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(result.stop?.reason, "run_fatal", "workflow-engine-defect is run_fatal once its budget is exhausted");
+  assert.equal(result.stop?.theme, "workflow-engine-defect");
+  assert.equal(recoveryCalls, 1);
+});
+
+test("regression (#787): a mid-pass run stop before a sibling's pass-2 recovery skips gracefully — no throw, no side effect, first-cause stop preserved", async () => {
+  const engineDefect = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"];
+  const contract = testContract({
+    concurrency: { max_concurrent: 2 },
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      // Only repair remains; without a candidate head this makes item 100's
+      // recovery preflight record the mid-pass run_fatal stop.
+      "workflow-engine-defect": { ...engineDefect, recipes: ["repair_pipeline_item"] },
+    },
+    items: [
+      { id: "100", depends_on: [], ownership: { exclusive: ["src/one/**"] } },
+      { id: "200", depends_on: [], ownership: { exclusive: ["src/two/**"] } },
+    ],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  let recoveryCalls = 0;
+  const canonicalEvidence = JSON.stringify({
+    schema: "pipeline/loop-recovery-evidence@1",
+    diagnostic: buildStageDiagnostic({
+      blockerKind: "merge-conflict",
+      reason: "The PR head must be rebased onto main",
+      stage: "pre-merge",
+    }),
+    transport: { pr_number: null, pipeline_run_id: "advance-200" },
+  });
+  const observe = fakeObserveDeps({
+    async getLocalHead() {
+      return null; // no candidate head anywhere in this scenario
+    },
+  }).deps;
+  // Item 200 simulates a legacy/in-process child that durably records its own
+  // block (canonical recovery evidence) right before its dispatch transport
+  // dies; item 100's plain transport failure is classified first in pass 2 and
+  // records the run stop before 200's recovery call runs.
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    if (request.item_id === "200") {
+      await blockItem(deps, contract, {
+        runId: "run-1",
+        token,
+        itemId: "200",
+        engine: "claude",
+        blockerClass: "workflow-state",
+        evidence: canonicalEvidence,
+      });
+    }
+    throw new Error("dispatch transport failed");
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: true, evidence: "must never run once the run is stopped" };
+  };
+
+  const cycle = await runSupervisorCycle(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      executeRecovery,
+      probeLiveAdvance: async () => ({ live: false as const }),
+    },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(cycle.stop?.reason, "run_fatal", "the earlier sibling's stop is the cycle's terminal condition");
+  assert.equal(cycle.stop?.item_id, "100", "the first-cause stop record is preserved, not overwritten by the sibling");
+  assert.equal(recoveryCalls, 0, "no recovery side effect starts once the run is stopped");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.stop?.item_id, "100");
+  assert.equal(finalLedger.items["200"].state, "blocked", "the sibling's own classification is still durably recorded");
+  assert.equal(finalLedger.recovery_attempts.length, 0, "no recovery attempt is claimed against a stopped run");
+});
+
+test("regression (#787): a pre-#509 ledger (no recovery_attempts) and contract (no recovery_policy) drive recovery without a TypeError", async () => {
+  const { recovery_policy: _droppedPolicy, ...contractRest } = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const legacyContract = contractRest as unknown as LoopContract;
+  const canonicalEvidence = JSON.stringify({
+    schema: "pipeline/loop-recovery-evidence@1",
+    diagnostic: buildStageDiagnostic({
+      blockerKind: "merge-conflict",
+      reason: "The PR head must be rebased onto main",
+      stage: "pre-merge",
+    }),
+    transport: { pr_number: null, pipeline_run_id: "advance-100" },
+  });
+  const blockedEntry: LoopLedger["items"][string] = {
+    ...itemEntry("100", "blocked"),
+    blocked_theme: "workflow-state",
+    evidence_fingerprint: "legacy-fp",
+    repeated_evidence_count: 0,
+    history: [
+      {
+        time: "2026-07-22T00:00:00.000Z",
+        from: "in_progress",
+        to: "blocked",
+        engine: "claude",
+        theme: "workflow-state",
+        evidence: canonicalEvidence,
+      },
+    ],
+  };
+  const { recovery_attempts: _droppedAttempts, ...ledgerRest } = testLedger({ "100": blockedEntry });
+  const legacyLedger = ledgerRest as unknown as LoopLedger;
+  const { deps } = await setup(legacyContract, legacyLedger);
+  let dispatchCount = 0;
+  let recoveryCalls = 0;
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: dispatchCount >= 1 ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue() {
+      return dispatchCount >= 1 ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: 12, pipeline_run_id: "advance-100-retry" },
+    };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: true, evidence: "workflow state resynchronized" };
+  };
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(result.stop, null);
+  assert.equal(result.allDone, true, "the legacy-shaped run resumes, recovers, and completes");
+  assert.equal(recoveryCalls, 1, "recovery ran under the default (upgraded) policy");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.recovery_attempts.length, 1);
+  assert.equal(finalLedger.recovery_attempts[0].outcome, "recovered");
+  assert.equal(finalLedger.items["100"].state, "ready");
+});
+
+test("regression (#787): a lagging remote-head read after a pushed repair is re-read before declaring failure", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let dispatchCount = 0;
+  let postRepairHeadReads = 0;
+  const recoveryCalls: string[] = [];
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "The PR head must be rebased onto main",
+    stage: "pre-merge",
+  });
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: dispatchCount >= 2 ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue() {
+      return dispatchCount >= 2 ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: "def456", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    // Replication lag: the first two reads after the pushed repair still show
+    // the old head; only the third shows the repair's commit.
+    async getLocalHead() {
+      if (recoveryCalls.length === 0) return { branch: "pipeline/100-fix", sha: "abc123" };
+      postRepairHeadReads++;
+      return { branch: "pipeline/100-fix", sha: postRepairHeadReads <= 2 ? "abc123" : "def456" };
+    },
+    async baseBranchContainsSha() {
+      return false;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: dispatchCount === 1 ? "blocked_recoverable" : "ready_to_deploy",
+      evidence: { pr_number: dispatchCount === 1 ? null : 12, pipeline_run_id: "advance-100" },
+      ...(dispatchCount === 1 ? { diagnostic } : {}),
+    };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    recoveryCalls.push(input.action);
+    return { succeeded: true, evidence: "rebased and pushed current head", candidateHead: "def456" };
+  };
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem, executeRecovery, recoverySleep: async () => {} },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(result.stop, null);
+  assert.equal(result.allDone, true);
+  assert.deepEqual(recoveryCalls, ["repair_pipeline_item"], "only the gh read is retried — the executor runs once");
+  assert.equal(postRepairHeadReads, 3, "the stale read is retried a bounded number of times");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.recovery_attempts.length, 1, "the successful pushed repair is never misrecorded as failed");
+  assert.equal(finalLedger.recovery_attempts[0].outcome, "recovered");
+});
+
+test("regression (#787): a recovery backoff window sleeps in heartbeat chunks without re-polling the remote API every chunk", async () => {
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": {
+        ...workflowState,
+        recipes: ["resync_workflow_state"],
+        backoff: { initial_seconds: 60, multiplier: 1, max_seconds: 60 },
+      },
+    },
+    items: [{ id: "100", depends_on: [] }],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let dispatchCount = 0;
+  let recoveryCalls = 0;
+  let observeCalls = 0;
+  const sleeps: number[] = [];
+  const obsAtSleep: number[] = [];
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "The PR head must be rebased onto main",
+    stage: "pre-merge",
+  });
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      observeCalls++;
+      return { state: "open", labels: dispatchCount >= 2 ? [READY_LABEL] : [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue() {
+      observeCalls++;
+      return dispatchCount >= 2 ? 12 : null;
+    },
+    async getPrDetail() {
+      observeCalls++;
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      observeCalls++;
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      observeCalls++;
+      return null;
+    },
+    async baseBranchContainsSha() {
+      observeCalls++;
+      return null;
+    },
+    async getLabelEvents() {
+      observeCalls++;
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: dispatchCount === 1 ? "blocked_recoverable" : "ready_to_deploy",
+      evidence: { pr_number: dispatchCount === 1 ? null : 12, pipeline_run_id: "advance-100" },
+      ...(dispatchCount === 1 ? { diagnostic } : {}),
+    };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: true, evidence: "workflow state resynchronized" };
+  };
+
+  const result = await driveSupervisor(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      executeRecovery,
+      recoverySleep: async (ms) => {
+        sleeps.push(ms);
+        obsAtSleep.push(observeCalls);
+      },
+    },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  assert.equal(result.allDone, true);
+  assert.equal(recoveryCalls, 1, "the action executes exactly once, after the deadline");
+  assert.ok(sleeps.length >= 2, "a long window is slept in multiple chunks");
+  assert.ok(sleeps.every((ms) => ms <= 5_000), "every chunk stays heartbeat-sized");
+  // This 60s window fits inside one no-reentry stretch (the drive caps each
+  // stretch at 60s — see the >60s bounded-latency regression below), so its
+  // chunks sleep back-to-back with zero API calls between them.
+  assert.ok(
+    obsAtSleep.some((count, i) => i > 0 && count === obsAtSleep[i - 1]),
+    "consecutive backoff chunks sleep without re-polling the remote API between them",
+  );
+});
+
+test("regression (round 2): a backoff window longer than 60s re-enters the full cycle at least every 60s, so a mid-window external intervention is picked up with bounded latency", async () => {
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": {
+        ...workflowState,
+        recipes: ["resync_workflow_state"],
+        backoff: { initial_seconds: 1800, multiplier: 1, max_seconds: 1800 },
+      },
+    },
+    items: [{ id: "100", depends_on: [] }],
+  });
+  const ledger = testLedger({ "100": blockedRecoveryItem("100") });
+  const { deps } = await setup(contract, ledger);
+  let recoveryCalls = 0;
+  let observeCalls = 0;
+  let sleptTotalMs = 0;
+  // Simulated external mid-window intervention: 60s into the 1800s backoff a
+  // human resolves the item out-of-band (PR opens with ready-to-deploy).
+  let intervened = false;
+  const sleeps: number[] = [];
+  const obsAtSleep: number[] = [];
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      observeCalls++;
+      return { state: "open", labels: intervened ? [READY_LABEL] : ["pipeline:review-1"] };
+    },
+    async findPrForIssue() {
+      observeCalls++;
+      return intervened ? 12 : null;
+    },
+    async getPrDetail() {
+      observeCalls++;
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      observeCalls++;
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead(issueNumber) {
+      observeCalls++;
+      return { branch: `pipeline/${issueNumber}-fix`, sha: "abc123" };
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "ready_to_deploy",
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+  });
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: true, evidence: "must not execute — the intervention supersedes the claim" };
+  };
+
+  const result = await driveSupervisor(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      executeRecovery,
+      recoverySleep: async (ms) => {
+        sleeps.push(ms);
+        obsAtSleep.push(observeCalls);
+        sleptTotalMs += ms;
+        if (sleptTotalMs >= 60_000) intervened = true;
+      },
+    },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  // Bounded no-reentry stretch: the maximum contiguous slept time with zero
+  // API observation between chunks must never exceed 60s — pre-fix the whole
+  // 1800s window was slept through in one stretch.
+  let maxStretchMs = 0;
+  let currentStretchMs = 0;
+  for (let i = 0; i < sleeps.length; i++) {
+    if (i > 0 && obsAtSleep[i] !== obsAtSleep[i - 1]) currentStretchMs = 0;
+    currentStretchMs += sleeps[i];
+    maxStretchMs = Math.max(maxStretchMs, currentStretchMs);
+  }
+  assert.ok(
+    maxStretchMs <= 60_000,
+    `a window longer than 60s must re-enter the full cycle within 60s (max no-reentry stretch was ${maxStretchMs}ms)`,
+  );
+  assert.ok(
+    sleptTotalMs < 200_000,
+    `the mid-window intervention must be picked up bounded, not slept through the 1800s window (slept ${sleptTotalMs}ms)`,
+  );
+  assert.equal(result.allDone, true, "the externally resolved item completes the run");
+  assert.equal(recoveryCalls, 0, "the superseded claim's action never executes after the intervention");
+});
+
+// ---------------------------------------------------------------------------
+// Recovery coexistence guard — the blocked-item recovery pass must not run the
+// worktree-writing recovery executor while a concurrent host-local advance
+// owns the item (live probe or the per-issue advance lock).
+// ---------------------------------------------------------------------------
+
+/** A ledger entry already blocked with valid persisted recovery evidence, so
+ *  the recovery pass (not a same-cycle dispatch classification) claims and
+ *  executes its recovery. */
+function blockedRecoveryItem(id: string): LoopLedger["items"][string] {
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "The PR head must be rebased onto main",
+    stage: "pre-merge",
+  });
+  return {
+    ...itemEntry(id, "blocked"),
+    blocked_theme: "workflow-state",
+    history: [
+      {
+        time: "2026-07-23T00:00:00.000Z",
+        from: "in_progress",
+        to: "blocked",
+        engine: "claude",
+        theme: "workflow-state",
+        evidence: JSON.stringify({
+          schema: "pipeline/loop-recovery-evidence@1",
+          diagnostic,
+          transport: { pr_number: null, pipeline_run_id: `advance-${id}` },
+        }),
+      },
+    ],
+  };
+}
+
+/** Observe fake for the coexistence-guard tests: blocked items sit mid-pipeline
+ *  (mirrors the seeded-blocked fake at "pipeline:review-1") with an observable
+ *  local head so the recovery preflight can bind a candidate identity. */
+function blockedRecoveryObserve() {
+  return fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: ["pipeline:review-1"] };
+    },
+    async getLocalHead(issueNumber) {
+      return { branch: `pipeline/${issueNumber}-fix`, sha: "abc123" };
+    },
+  }).deps;
+}
+
+test("regression (coexistence guard): a live host-local advance defers blocked-item recovery without claiming budget while the sibling still recovers", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({
+    "100": blockedRecoveryItem("100"),
+    "200": blockedRecoveryItem("200"),
+  });
+  const { deps } = await setup(contract, ledger);
+  const observe = blockedRecoveryObserve();
+  const dispatchCalls: LoopExecutionRequest[] = [];
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCalls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  const recoveredItemIds: string[] = [];
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    recoveredItemIds.push(input.itemId);
+    return { succeeded: false, evidence: "repair attempt failed" };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle = await runSupervisorCycle(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      executeRecovery,
+      probeLiveAdvance: (itemId) =>
+        itemId === "100"
+          ? { live: true as const, evidence: "lock_held" as const, holder_pid: 4242 }
+          : { live: false as const },
+    },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(cycle.stop, null);
+  assert.deepEqual(
+    recoveredItemIds,
+    ["200"],
+    "the live item's executor never runs; the independent sibling still recovers this cycle",
+  );
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(
+    finalLedger.recovery_attempts.filter((attempt) => attempt.item_id === "100").length,
+    0,
+    "no recovery claim is charged for the live item",
+  );
+  assert.deepEqual(
+    finalLedger.items["100"].recovery_budgets_remaining,
+    { default: 3 },
+    "the live item's budget is untouched",
+  );
+  assert.equal(finalLedger.items["100"].state, "blocked", "the live item stays blocked for a later cycle");
+  assert.equal(finalLedger.recovery_attempts.filter((attempt) => attempt.item_id === "200").length, 1);
+  const events = await readEvents(deps, "run-1");
+  const deferred = events.filter(
+    (e: any) => e.kind === "loop_item_coexistence_deferred" && e.data.item_id === "100",
+  );
+  assert.equal(deferred.length, 1, "the deferral is durably recorded");
+  assert.equal((deferred[0] as any).data.reason, "recovery_deferred_live_advance");
+  assert.equal((deferred[0] as any).data.evidence, "lock_held");
+});
+
+test("coexistence guard: an unavailable per-issue advance lock defers recovery without claiming; the sibling's lock is held and released", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const ledger = testLedger({
+    "100": blockedRecoveryItem("100"),
+    "200": blockedRecoveryItem("200"),
+  });
+  const { deps } = await setup(contract, ledger);
+  const observe = blockedRecoveryObserve();
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "ready_to_deploy",
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+  });
+  const recoveredItemIds: string[] = [];
+  const released: string[] = [];
+  let siblingLockHeldDuringExecutor: boolean | null = null;
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    recoveredItemIds.push(input.itemId);
+    if (input.itemId === "200") siblingLockHeldDuringExecutor = !released.includes("200");
+    return { succeeded: false, evidence: "repair attempt failed" };
+  };
+  const lockCalls: string[] = [];
+  const acquireItemAdvanceLock: NonNullable<SupervisorDeps["acquireItemAdvanceLock"]> = (itemId) => {
+    lockCalls.push(itemId);
+    if (itemId === "100") return null;
+    return { release: () => { released.push(itemId); } };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle = await runSupervisorCycle(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      executeRecovery,
+      probeLiveAdvance: () => ({ live: false as const }),
+      acquireItemAdvanceLock,
+    },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(cycle.stop, null);
+  assert.deepEqual(lockCalls, ["100", "200"], "the lock is attempted for every blocked item");
+  assert.deepEqual(recoveredItemIds, ["200"], "the lock-busy item's executor never runs");
+  assert.equal(siblingLockHeldDuringExecutor, true, "the sibling's lock is still held while its executor runs");
+  assert.deepEqual(released, ["200"], "the acquired sibling lock is released after execution");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(
+    finalLedger.recovery_attempts.filter((attempt) => attempt.item_id === "100").length,
+    0,
+    "no recovery claim is charged while the advance lock is held elsewhere",
+  );
+  assert.deepEqual(finalLedger.items["100"].recovery_budgets_remaining, { default: 3 });
+  const events = await readEvents(deps, "run-1");
+  const deferred = events.filter(
+    (e: any) => e.kind === "loop_item_coexistence_deferred" && e.data.item_id === "100",
+  );
+  assert.equal(deferred.length, 1);
+  assert.equal((deferred[0] as any).data.reason, "recovery_deferred_advance_lock_busy");
+});
+
+test("coexistence guard: the advance lock is acquired before the claim, held across the executor, and released even when the executor throws", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": blockedRecoveryItem("100") });
+  const { deps } = await setup(contract, ledger);
+  const observe = blockedRecoveryObserve();
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "ready_to_deploy",
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+  });
+  let releasedCount = 0;
+  let claimExistedAtAcquire: boolean | null = null;
+  let lockHeldDuringExecutor: boolean | null = null;
+  let claimDurableDuringExecutor: boolean | null = null;
+  const acquireItemAdvanceLock: NonNullable<SupervisorDeps["acquireItemAdvanceLock"]> = async () => {
+    const current = await readLedger(deps, "run-1");
+    claimExistedAtAcquire = current.recovery_attempts.length > 0;
+    return { release: () => { releasedCount++; } };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    lockHeldDuringExecutor = releasedCount === 0;
+    const claimed = await readLedger(deps, "run-1");
+    claimDurableDuringExecutor = claimed.recovery_attempts.some(
+      (attempt) => attempt.attempt_id === input.attemptId && attempt.outcome === "started",
+    );
+    throw new Error("executor transport died");
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle = await runSupervisorCycle(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      executeRecovery,
+      probeLiveAdvance: () => ({ live: false as const }),
+      acquireItemAdvanceLock,
+    },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(cycle.stop, null);
+  assert.equal(claimExistedAtAcquire, false, "lock acquisition precedes the durable claim");
+  assert.equal(lockHeldDuringExecutor, true, "the lock is still held when the executor is invoked");
+  assert.equal(claimDurableDuringExecutor, true, "the claim still precedes the side effect");
+  assert.equal(releasedCount, 1, "the lock is released exactly once, in finally, despite the executor throw");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.recovery_attempts.length, 1);
+  assert.equal(finalLedger.recovery_attempts[0].outcome, "failed", "the thrown execution completes the claim as failed");
+});
+
+// ---------------------------------------------------------------------------
+// Verification round 2: an UNOBSERVABLE issue read (gh.ts swallows every gh
+// failure to null, which observeExternalIdentity folds into issue_open=false)
+// must never be treated as a positive "issue closed" / "labels cleared"
+// observation. Abandonment is irreversible — nothing re-admits an abandoned
+// item — so it requires a fresh POSITIVE closed read at both recovery sites,
+// and a pipeline_blocked_label hold is only re-admitted on a positive
+// label-absent read.
+// ---------------------------------------------------------------------------
+
+test("regression (round 2): an unobservable issue read never abandons a blocked item or supersedes its started claim", async () => {
+  const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
+  const contract = testContract({
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-state": { ...workflowState, recipes: ["resync_workflow_state"] },
+    },
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let issueUnobservable = false;
+  let failPostObservation = false;
+  let recoveryCalls = 0;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "candidate requires a mechanical resync",
+    stage: "pre-merge",
+  });
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      // gh.ts swallows every gh failure to null — model the transient failure
+      // exactly as production observes it (no throw, just null).
+      return issueUnobservable ? null : { state: "open", labels: [PIPELINE_READY_LABEL] };
+    },
+    async getLocalHead() {
+      if (failPostObservation) throw new Error("postcondition temporarily unavailable");
+      return { branch: "pipeline/100-fix", sha: "abc123" };
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_recoverable",
+    evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+    diagnostic,
+  });
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    failPostObservation = true; // strand the claim `started` (post-observation fails)
+    return { succeeded: true, evidence: "resync applied", candidateHead: "abc123" };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle({ store: deps, observe, dispatchItem, executeRecovery }, "run-1", token, "claude");
+  const afterClaim = await readLedger(deps, "run-1");
+  assert.equal(afterClaim.items["100"].state, "blocked");
+  assert.equal(afterClaim.recovery_attempts[0].outcome, "started");
+  assert.equal(recoveryCalls, 1);
+
+  // Next cycle: ONE transient gh failure makes every issue read null.
+  failPostObservation = false;
+  issueUnobservable = true;
+  await runSupervisorCycle({ store: deps, observe, dispatchItem, executeRecovery }, "run-1", token, "claude");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked", "an unobservable issue is never treated as closed/abandoned");
+  assert.equal(finalLedger.recovery_attempts[0].outcome, "started", "the started claim survives intact");
+  const events = await readEvents(deps, "run-1");
+  assert.ok(!events.some((e) => e.kind === "loop_recovery_superseded"), "no abandonment/supersede is recorded");
+  assert.ok(
+    events.some(
+      (e) =>
+        e.kind === "loop_recovery_preflight_deferred" &&
+        /unobservable/.test(String((e.data as { reason?: string }).reason)),
+    ),
+    "the per-cycle deferral leaves a durable trace",
+  );
+});
+
+test("regression (round 2): an unobservable issue read at blocked classification records the block instead of abandoning", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let dispatched = false;
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "merge-conflict",
+    reason: "The PR head must be rebased onto main",
+    stage: "pre-merge",
+  });
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      // The gh read starts failing (swallowed to null) exactly when the child
+      // result is classified — one transient failure window.
+      return dispatched ? null : { state: "open", labels: [PIPELINE_READY_LABEL] };
+    },
+    async getLocalHead() {
+      return null;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatched = true;
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked_recoverable",
+      evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+      diagnostic,
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(
+    finalLedger.items["100"].state,
+    "blocked",
+    "classification records the block; it never abandons on an unobservable read",
+  );
+  assert.equal(finalLedger.items["100"].blocked_theme, "workflow-state");
+  assert.ok(!(await readEvents(deps, "run-1")).some((e) => e.kind === "loop_recovery_superseded"));
+});
+
+test("round 2: a POSITIVE closed issue observation still abandons the blocked item", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": blockedRecoveryItem("100") });
+  const { deps } = await setup(contract, ledger);
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "closed", labels: [] };
+    },
+    async getLocalHead() {
+      return null;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async () => {
+    throw new Error("must not dispatch a closed item");
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+
+  const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "abandoned", "a positively observed close still abandons");
+  assert.ok((await readEvents(deps, "run-1")).some((e) => e.kind === "loop_recovery_superseded"));
+  assert.equal(cycle.allDone, true, "the abandoned item resolves the single-item run");
+});
+
+test("regression (round 2): a null issue read never re-admits a pipeline_blocked_label hold", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({
+    "100": {
+      id: "100",
+      state: "waiting",
+      history: [],
+      recovery_budgets_remaining: { default: 3 },
+      hold_request: {
+        request_id: "req-1",
+        item_id: "100",
+        kind: "answer",
+        prompt: "needs a human answer/unblock",
+        requested_by_engine: "claude",
+        requested_at: "2026-07-23T00:00:00.000Z",
+        source: "pipeline_blocked_label",
+      },
+    },
+  });
+  const { deps } = await setup(contract, ledger);
+  const calls: string[] = [];
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      // The human's blocked label is still present, but the read is swallowed
+      // to null by gh.ts — "unobservable", never "cleared".
+      return null;
+    },
+    async getLocalHead() {
+      return null;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request.item_id);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+
+  const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  assert.equal(calls.length, 0, "the held item must not be re-dispatched on an unobservable label read");
+  assert.equal(result.holdOutstanding, true, "the hold remains the run's outstanding condition");
+  assert.deepEqual(result.heldItemIds, ["100"]);
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "waiting", "the hold is preserved, not re-admitted");
+  assert.ok(!(await readEvents(deps, "run-1")).some((e) => e.kind === "loop_item_hold_cleared"));
+});
+
+// ---------------------------------------------------------------------------
+// Verification round 2: pass-2 blocked_needs_human arms after a mid-pass run
+// stop — waitItem's enterHold throws LoopError("stop") once ledger.stop is
+// set, so both hold arms must re-check the durable stop and skip gracefully
+// (mirrors the pass-2 recovery stop guard proven at "a mid-pass run stop
+// before a sibling's pass-2 recovery skips gracefully").
+// ---------------------------------------------------------------------------
+
+test("regression (round 2): a mid-pass run stop before a sibling's attested-authority hold skips the hold gracefully — no throw, first-cause stop preserved", async () => {
+  const engineDefect = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"];
+  const contract = testContract({
+    concurrency: { max_concurrent: 2 },
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      // Only repair remains; without a candidate head this makes item 100's
+      // recovery preflight record the mid-pass run_fatal stop first.
+      "workflow-engine-defect": { ...engineDefect, recipes: ["repair_pipeline_item"] },
+    },
+    items: [
+      { id: "100", depends_on: [], ownership: { exclusive: ["src/one/**"] } },
+      { id: "200", depends_on: [], ownership: { exclusive: ["src/two/**"] } },
+    ],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const observe = fakeObserveDeps({
+    async getLocalHead(issueNumber) {
+      // 200's head matches the attested diagnostic's reviewed_sha; 100 has no
+      // candidate head anywhere (drives its preflight run_fatal stop).
+      return issueNumber === 200 ? { branch: "pipeline/200-fix", sha: "abc123" } : null;
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    if (request.item_id === "100") throw new Error("dispatch transport failed");
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked_needs_human",
+      evidence: { pr_number: null, pipeline_run_id: "pipeline-run-200" },
+      diagnostic: humanAuthorityDiagnostic(),
+    };
+  };
+
+  const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.equal(cycle.stop?.reason, "run_fatal", "the earlier sibling's stop is the cycle's terminal condition");
+  assert.equal(cycle.stop?.item_id, "100", "the first-cause stop record is preserved");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.stop?.item_id, "100");
+  assert.equal(finalLedger.items["200"].state, "in_progress", "no hold is written after the stop");
+  assert.equal(finalLedger.items["200"].hold_request, undefined);
+  assert.ok(
+    !(await readEvents(deps, "run-1")).some(
+      (e) => e.kind === "loop_item_waiting" && (e.data as { item_id?: string }).item_id === "200",
+    ),
+    "no waiting-hold event once the run is stopped",
+  );
+});
+
+test("regression (round 2): a mid-pass run stop before a sibling's conservative blocked-label hold skips the hold gracefully — no throw, first-cause stop preserved", async () => {
+  const engineDefect = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"];
+  const contract = testContract({
+    concurrency: { max_concurrent: 2 },
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-engine-defect": { ...engineDefect, recipes: ["repair_pipeline_item"] },
+    },
+    items: [
+      { id: "100", depends_on: [], ownership: { exclusive: ["src/one/**"] } },
+      { id: "200", depends_on: [], ownership: { exclusive: ["src/two/**"] } },
+    ],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending"), "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const dispatched = new Set<string>();
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels(issueNumber) {
+      const id = String(issueNumber);
+      if (id === "200" && dispatched.has(id)) {
+        return { state: "open", labels: ["pipeline:plan-review", "blocked"] };
+      }
+      return { state: "open", labels: [PIPELINE_READY_LABEL] };
+    },
+    async getLocalHead() {
+      return null; // no candidate head anywhere (drives 100's run_fatal stop)
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatched.add(request.item_id);
+    if (request.item_id === "100") throw new Error("dispatch transport failed");
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked_needs_human",
+      evidence: { pr_number: null, pipeline_run_id: "pipeline-run-200" },
+      // No diagnostic: the conservative live-blocked-label hold arm.
+    };
+  };
+
+  const cycle = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.equal(cycle.stop?.reason, "run_fatal", "the earlier sibling's stop is the cycle's terminal condition");
+  assert.equal(cycle.stop?.item_id, "100", "the first-cause stop record is preserved");
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.stop?.item_id, "100");
+  assert.equal(finalLedger.items["200"].state, "in_progress", "no hold is written after the stop");
+  assert.equal(finalLedger.items["200"].hold_request, undefined);
+  assert.ok(
+    !(await readEvents(deps, "run-1")).some(
+      (e) => e.kind === "loop_item_waiting" && (e.data as { item_id?: string }).item_id === "200",
+    ),
+    "no waiting-hold event once the run is stopped",
+  );
 });

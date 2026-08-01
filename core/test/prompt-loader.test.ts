@@ -1835,6 +1835,14 @@ test("fix prompt: needs-human-decision outcome names the sentinel shape, categor
     /does not (?:resolve|advance)/i,
     "fix prompt must state the declaration neither resolves the finding nor advances the item",
   );
+  // The engine classifies external-dependency as a mechanical controller-owned
+  // wait (needs-human), not a human-authority hold — the prompt contract must
+  // state the same split so the harness's declaration matches its disposition.
+  assert.match(
+    out,
+    /controller-owned wait\/retry/,
+    "fix prompt must state an external-dependency declaration is a controller-owned wait, not a human-authority hold",
+  );
   assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/, "no unfilled placeholders when reviewedSha is supplied");
 });
 

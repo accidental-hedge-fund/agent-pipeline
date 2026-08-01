@@ -77,7 +77,7 @@ Rules for this declaration:
 - The `finding-fingerprint` MUST be copied verbatim from the marker shown directly above the finding you are declaring — never guessed or reused from a different finding.
 - The reviewed SHA in the declaration MUST be exactly `{{reviewed_sha}}` — a declaration against any other SHA is ignored.
 - The decision request MUST be a single line (no line breaks) stating exactly what decision is needed and from whom.
-- This declaration does not resolve the finding, does not suppress it, and does not advance this item to the next review, pre-merge, or ready-to-deploy stage. The finding remains blocking until a human records an audited disposition through the normal unblock/override flow. Use this outcome only when the finding genuinely cannot be resolved by any code change — never to defer a finding you simply haven't gotten to yet.
+- This declaration does not resolve the finding, does not suppress it, and does not advance this item to the next review, pre-merge, or ready-to-deploy stage. A `product-decision` or `authority` declaration parks the item until a human records an audited disposition through the normal unblock/override flow. An `external-dependency` declaration is NOT a human-authority hold: the pipeline records it as a controller-owned wait/retry condition — the finding still remains blocking, but no human decision is claimed and the pipeline may retry once the dependency is available. Every accepted declaration, whichever category, is recorded as an audited evidence comment on the issue. Use this outcome only when the finding genuinely cannot be resolved by any code change — never to defer a finding you simply haven't gotten to yet.
 
 ## Review Findings
 
