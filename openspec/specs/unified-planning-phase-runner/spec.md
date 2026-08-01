@@ -17,22 +17,59 @@ The planning stage SHALL implement a `runPlanningPhases` internal function that 
 - **AND** the observable behavior (transitions, blockers, comments, PR body) SHALL be identical to the pre-change OpenSpec path
 
 ### Requirement: Hook interface isolates the authoring and validation steps
-The `PlanningPhaseHooks` interface SHALL declare exactly the following hook points: authoring the planning artifact, plan-revision invocation (optional), post-author structural validation, post-revision re-validation, and building the PR body and transition message. No other lifecycle step SHALL vary between hook implementations. The plan-revision hook (`invokeRevision`) is optional — when absent, the shared runner falls back to `invokePlanStep` (which uses `cfg.repo_dir` for non-sandboxed runs); when present, it allows the revision harness to run in the issue worktree.
 
-#### Scenario: authoring hook produces the planning artifact
+The `PlanningPhaseHooks` interface SHALL declare exactly these hook points: authoring the planning
+artifact, optional plan-revision invocation, post-author structural validation, post-revision
+re-validation, and building the PR body and transition message. Validation hooks SHALL return a
+typed artifact result containing exact bounded diagnostics rather than only prose. No other
+lifecycle step SHALL vary between hook implementations. The optional revision hook SHALL run in the
+issue worktree when present; when absent, the shared runner SHALL use `invokePlanStep`. After a
+post-revision validation failure, the shared runner SHALL preserve and return the exact canonical
+diagnostic as an engine-owned block. When invoked by a durable loop, the outer provider-neutral
+recovery controller SHALL use that diagnostic and current candidate for bounded remediation, then
+redispatch the whole item so the same validation hook runs again. The mechanical block SHALL not
+imply human authority.
+
+#### Scenario: Authoring hook produces the planning artifact
+
 - **WHEN** `runPlanningPhases` reaches the authoring step
-- **THEN** it SHALL call `hooks.authorArtifact` and use the returned artifact text as the plan content for subsequent steps
+- **THEN** it SHALL call `hooks.authorArtifact`
+- **AND** it SHALL use the returned artifact as plan content for later steps
 
-#### Scenario: validation hook gates progression
-- **WHEN** `runPlanningPhases` calls `hooks.validateArtifact` (post-author or post-revision)
-- **AND** the hook returns a failure
-- **THEN** `runPlanningPhases` SHALL call `setBlocked` with the hook-supplied reason and return `{ advanced: false, status: "blocked" }`
+#### Scenario: Validation hook gates progression
+
+- **WHEN** `runPlanningPhases` calls a structural validation hook and it returns failure
+- **THEN** the runner SHALL preserve the hook's exact typed diagnostic
+- **AND** it SHALL not progress to implementation until validation succeeds
+
+#### Scenario: Post-revision validation receives bounded artifact repair
+
+- **WHEN** post-revision validation fails and an eligible keyed artifact-repair attempt remains
+- **THEN** the shared runner SHALL return the exact engine-owned diagnostic without granting human
+  authority
+- **AND** the outer controller SHALL remediate and redispatch so the same validation hook runs
+  against the repaired current candidate
+
+#### Scenario: Exhausted post-revision validation remains engine-owned
+
+- **WHEN** post-revision validation continues to fail after its keyed repair budget is exhausted
+- **THEN** `runPlanningPhases` SHALL call `setBlocked` with the typed artifact diagnostic and return
+  `{ advanced: false, status: "blocked" }`
+- **AND** it SHALL not emit human-authority evidence solely for that failure
 
 #### Scenario: OpenSpec revision hook runs in the issue worktree
-- **WHEN** `runPlanningPhases` reaches the plan-revision step
-- **AND** `hooks.invokeRevision` is present
-- **THEN** it SHALL call `hooks.invokeRevision` with the issue worktree and delegate invocation entirely to the hook
-- **AND** the OpenSpec implementation SHALL run the revision harness in `wt.path` so it can update the OpenSpec change files in place
+
+- **WHEN** `runPlanningPhases` reaches plan revision and `hooks.invokeRevision` is present
+- **THEN** it SHALL call `hooks.invokeRevision` with the issue worktree and delegate invocation to
+  the hook
+- **AND** the OpenSpec implementation SHALL run the revision harness in that worktree so it can
+  update the change files in place
+
+#### Scenario: Repair uses configured roles rather than a provider-specific hook
+
+- **WHEN** the outer controller invokes artifact remediation for a planning diagnostic
+- **THEN** the transaction SHALL resolve the configured implementer adapter, model, and effort
+- **AND** `PlanningPhaseHooks` SHALL not add a provider-specific repair hook
 
 ### Requirement: Paired blocker equivalence across paths
 For every failure mode in the planning lifecycle — bootstrap failure, plan-generation failure, plan-review failure, plan-revision failure, human-feedback-ack failure, implementation harness failure, no-commits, and PR-creation failure — the freeform and OpenSpec hooks SHALL produce the same blocker `tag` value and the same reason prefix when routed through `runPlanningPhases`.

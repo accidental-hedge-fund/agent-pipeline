@@ -5,85 +5,74 @@ TBD - created by archiving change loop-needs-human-blocker-disposition. Update P
 ## Requirements
 ### Requirement: A needs-human pipeline blocker SHALL be recorded as a non-terminal hold, never as a run-fatal engine defect
 
-The supervisor SHALL treat a per-item pipeline blocker whose disposition is "needs human
-answer / unblock" — observed as the dispatched item carrying `pipeline:blocked` on live
-truth — as a non-terminal **needs-human hold**. Detection of the `pipeline:blocked`
-disposition SHALL use the **presence** of that label in the item's observed live label set,
-independent of any co-present `pipeline:*` stage label and independent of the single-winner
-stage value derived for the item. When per-item execution reports `blocked_needs_human`, or
-reports a `failed` outcome whose live issue is nonetheless observed carrying `pipeline:blocked`
-(a recoverable, human-unblockable disposition — including a stale or reason-less blocker, and
-including one co-present with a stage label) without a crashed or rejected dispatch, the
-supervisor SHALL move the item into a `paused`/`waiting` hold so the run reports
-`hold_outstanding=true` and holds that item. The run SHALL pause on that hold only when no
-other item can make progress; while at least one other item is schedulable the run SHALL
-continue with the remaining schedulable items and re-evaluate the held item each cycle (per
-`loop-blocked-item-hold-continuation`). Such an outcome SHALL NEVER be classified under the
-`workflow-engine-defect` blocker class and SHALL NEVER record a `run_fatal` or
-`human_authority` run stop. Every sibling item's state — including an item already at `ready`
-— SHALL be preserved across the hold. A genuine engine defect — a rejected or crashed
-dispatch, or an unrecognized terminal outcome with the item at no `pipeline:blocked` state —
-SHALL remain classified `workflow-engine-defect` with its `run_fatal` policy unchanged. The
-disposition SHALL be a deterministic function of the observed live labels so a unit test
-drives it with no real network, git, or subprocess call.
+The supervisor SHALL record an attested nonterminal needs-human hold only when a blocked dispatch
+carries a current canonical `human-decision-required` diagnostic whose structured blocker kind is
+also `human-decision-required`. The supervisor SHALL verify that diagnostic against fresh dispatch
+evidence before creating or retaining the hold. A `pipeline:blocked` label, a
+`blocked_needs_human` outcome without that diagnostic, a missing or
+reason-less diagnostic, a plan/output format error, an artifact failure, an exhausted mechanical
+attempt, or any co-present stage label SHALL be insufficient authority evidence. Every unattested
+case SHALL enter typed engine recovery or terminal system failure and SHALL NOT emit
+`human_intervention`, even when the live issue still carries the product blocked label.
+While a genuine human hold exists, the run SHALL continue any schedulable dependency-independent
+sibling and preserve every sibling's state. A rejected/crashed dispatch or protocol defect SHALL
+remain engine-owned and SHALL follow bounded recovery before any terminal system stop.
 
-#### Scenario: A plan-review format blocker becomes a needs-human hold
+#### Scenario: A plan-review format blocker remains engine-owned
 
-- **WHEN** an item's dispatch reports "blocked at plan-review: `Plan revision output is
-  missing required ## Feedback Incorporated section`" and the item is observed carrying
-  `pipeline:blocked`
-- **THEN** the supervisor SHALL move the item into a `paused`/`waiting` hold and report
+- **WHEN** an item's dispatch reports a missing required output section and the issue is observed
+  carrying `pipeline:blocked` without a current `human-decision-required` diagnostic
+- **THEN** the supervisor SHALL route the canonical engine-owned diagnostic through bounded recovery
+- **AND** it SHALL NOT create a needs-human hold or emit `human_intervention`
+
+#### Scenario: A blocked label co-present with a stage label is not authority
+
+- **WHEN** an item's dispatch reports blocked or failed and live truth carries `pipeline:blocked`
+  co-present with another `pipeline:*` stage label but no current human-decision diagnostic
+- **THEN** the supervisor SHALL preserve the stage and diagnostic for recovery classification
+- **AND** it SHALL NOT create a human hold from either label
+
+#### Scenario: A blocked_needs_human outcome requires authority evidence
+
+- **WHEN** per-item execution reports `blocked_needs_human`
+- **THEN** the supervisor SHALL inspect its current canonical diagnostic
+- **AND** it SHALL create an attested authority hold only when the strict authority predicate passes
+
+#### Scenario: An unattested needs-human outcome with a live blocked label remains engine-owned
+
+- **WHEN** per-item execution reports `blocked_needs_human` without a current attested
+  human-authority diagnostic
+- **AND** a fresh live read shows the issue still carries the product blocked label
+- **THEN** the supervisor SHALL classify the missing authority proof as a protocol defect and run
+  bounded engine recovery
+- **AND** it SHALL create no human hold and emit no `human_intervention`
+
+#### Scenario: Current human-decision diagnostic creates a resumable hold
+
+- **WHEN** a blocked dispatch carries a current canonical `human-decision-required` diagnostic
+- **THEN** the supervisor SHALL move the item to a `paused` or `waiting` hold and report
   `hold_outstanding=true`
-- **AND** it SHALL NOT classify the item under `workflow-engine-defect`
-- **AND** it SHALL NOT record a `run_fatal` or `human_authority` run stop
+- **AND** it SHALL retain the candidate and authority evidence needed to validate a later answer
 
-#### Scenario: A blocked label co-present with a stage label is still detected
+#### Scenario: A genuine engine defect is recovered before terminalization
 
-- **WHEN** an item's dispatch outcome normalizes to `failed`, the dispatch did not crash or
-  reject, and the item is observed carrying `pipeline:blocked` co-present with another
-  `pipeline:*` stage label
-- **THEN** the supervisor SHALL detect the `pipeline:blocked` disposition from the label's
-  presence and move the item into a needs-human hold
-- **AND** it SHALL NOT fall through to `workflow-engine-defect` because another label was the
-  single stage-winner
+- **WHEN** a dispatch is rejected, crashes, or reports a protocol defect without authority evidence
+- **THEN** the outcome SHALL be classified as an engine-owned diagnostic
+- **AND** bounded recovery SHALL run before any terminal system stop
 
-#### Scenario: A direct blocked_needs_human outcome holds rather than stops
+#### Scenario: A ready sibling survives a genuine human hold
 
-- **WHEN** per-item execution reports the terminal outcome `blocked_needs_human`
-- **THEN** the supervisor SHALL record a non-terminal needs-human hold with
-  `hold_outstanding=true`
-- **AND** it SHALL NOT record a terminal `human_authority` or `run_fatal` run stop for that
-  outcome
+- **WHEN** a run holds one item on current human-authority evidence while a sibling is already
+  `ready`
+- **THEN** the ready sibling's state SHALL be preserved unchanged
+- **AND** the hold SHALL not be reclassified as an engine defect
 
-#### Scenario: A failed outcome observed at pipeline:blocked is routed to the hold
+#### Scenario: A human hold with a schedulable sibling continues the run
 
-- **WHEN** an item's dispatch outcome normalizes to `failed`, the dispatch did not crash or
-  reject, and the item is observed on live truth carrying `pipeline:blocked`
-- **THEN** the supervisor SHALL treat it as a needs-human hold with `hold_outstanding=true`
-- **AND** it SHALL NOT classify the item under `workflow-engine-defect` and SHALL NOT record
-  a `run_fatal` run stop
-
-#### Scenario: A genuine engine defect is still run-fatal
-
-- **WHEN** a dispatch is rejected or crashes, or reports an outcome outside the defined
-  terminal set with the item at no `pipeline:blocked` state
-- **THEN** the outcome SHALL be classified `workflow-engine-defect`
-- **AND** its existing `run_fatal` policy SHALL apply unchanged
-
-#### Scenario: A ready sibling survives a needs-human hold
-
-- **WHEN** a run holds one item for a needs-human pipeline blocker while a sibling item is
-  at `ready` and no other item is schedulable
-- **THEN** the run SHALL pause with `hold_outstanding=true` rather than record a terminal
-  stop
-- **AND** the `ready` sibling's state SHALL be preserved unchanged
-
-#### Scenario: A hold with a schedulable sibling continues the run
-
-- **WHEN** a run holds one item for a needs-human pipeline blocker while a sibling item is
-  still schedulable
-- **THEN** the run SHALL continue dispatching the schedulable sibling rather than pausing
-- **AND** the held item SHALL be re-evaluated each cycle and remain a non-terminal hold
+- **WHEN** a run holds one item on current human-authority evidence while a dependency-independent
+  sibling remains schedulable
+- **THEN** the run SHALL continue dispatching the sibling
+- **AND** it SHALL revalidate the held item's authority evidence on later cycles
 
 ### Requirement: A terminal run stop SHALL disclose every outstanding ready-to-deploy item
 
@@ -121,26 +110,33 @@ existing stop output SHALL be otherwise unchanged.
 
 ### Requirement: Pure capacity outcomes SHALL NOT become needs-human product holds
 
-The supervisor's needs-human hold path (per-item `paused`/`waiting` holds for product or review blockers that require a human answer) SHALL NOT absorb pure worktree capacity admission failures as if they were product-judgment needs-human outcomes. When a dispatch or planning create fails solely for worktree capacity, the supervisor SHALL route that outcome to capacity admission handling (see `worktree-capacity-admission`) — stop or hold admission with a capacity reason, or allow a later cycle after park-release frees slots — and SHALL NOT record a product needs-human hold that requests a human answer for that capacity-only case. Genuine `pipeline:blocked` product/review holds and genuine `blocked_needs_human` product outcomes remain needs-human holds as already specified.
+The supervisor SHALL classify a pure worktree-capacity admission failure as an engine-owned
+`worktree-capacity` diagnostic and SHALL route it to capacity release, wait, or bounded retry. It
+SHALL NOT create a product needs-human hold or request a human answer for capacity alone. A genuine
+human hold SHALL still require a current canonical `human-decision-required` diagnostic;
+neither a blocked label nor stale blocker commentary SHALL satisfy that predicate. Capacity and
+authority evidence SHALL be correlated to the current candidate and current blocker application so
+stale evidence cannot determine disposition.
 
 #### Scenario: Capacity-only planning failure is not a product needs-human hold
 
-- **WHEN** an item's dispatch fails in planning solely with a worktree capacity error
-- **AND** no product or review needs-human condition is present
-- **THEN** the supervisor SHALL NOT classify the item as a product needs-human hold that requests a human answer
-- **AND** SHALL apply capacity admission disposition instead
+- **WHEN** an item's dispatch fails in planning solely with a worktree-capacity diagnostic
+- **AND** no current `human-decision-required` diagnostic exists
+- **THEN** the supervisor SHALL apply capacity release, wait, or bounded retry
+- **AND** it SHALL NOT create a human hold or emit `human_intervention`
 
-#### Scenario: Genuine blocked product hold is unchanged
+#### Scenario: Genuine authority hold remains distinct from capacity
 
-- **WHEN** an item carries `pipeline:blocked` for a product or review reason unrelated to capacity
-- **THEN** the supervisor SHALL still record a needs-human hold per existing requirements
-- **AND** SHALL NOT reclassify that hold as capacity admission solely because capacity is also tight in the fleet
+- **WHEN** an item carries a current canonical `human-decision-required` diagnostic and
+  capacity is also tight
+- **THEN** the supervisor SHALL preserve the authority hold for the diagnostic's concrete question
+- **AND** it SHALL not rewrite the authority reason as capacity admission
 
-#### Scenario: Stale authentic capacity comment does not clear a later product hold
+#### Scenario: Stale authentic capacity comment does not determine a later block
 
-- **WHEN** an issue has a prior trusted attested capacity blocker comment from an earlier hold
-- **AND** the current `blocked` label application is a later product or human hold whose own blocker comment is absent or unavailable
-- **AND** advance events lack a fresh `blocker_set` (event-less redispatch)
-- **THEN** the pipeline SHALL NOT reclassify the issue as capacity admission from the stale capacity comment alone
-- **AND** SHALL NOT clear the current `blocked` label solely on the basis of that stale authentic capacity marker
+- **WHEN** an issue has a prior trusted capacity blocker record from an earlier candidate or block
+  application
+- **AND** the current block has no matching current diagnostic
+- **THEN** the supervisor SHALL NOT classify the current block from the stale capacity record
+- **AND** it SHALL reconcile current live identity and evidence before choosing a disposition
 
