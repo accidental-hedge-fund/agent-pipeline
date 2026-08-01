@@ -3452,7 +3452,7 @@ async function main(): Promise<void> {
           baseBranch: mqCfg.base_branch,
           releaseModel: mqCfg.roadmap?.release_model,
         },
-        realMergeQueueDeps(mqCfg.repo_dir, mqCfg.repo),
+        realMergeQueueDeps(mqCfg.repo_dir, mqCfg.repo, undefined, mqCfg),
       );
       if (result.exitCode !== 0) process.exit(result.exitCode);
     } catch (err) {

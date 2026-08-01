@@ -11,6 +11,13 @@
 // deterministic-first then shared mechanical repair, re-gate, then mergePr.
 
 import { spawnSync } from "node:child_process";
+import { invoke } from "../harness.ts";
+import type { PipelineConfig } from "../types.ts";
+import {
+  ensureManagedWorktree,
+  getOnDiskForIssue,
+  gitInWorktree,
+} from "../worktree.ts";
 import { mergePr, realMergeDeps, type MergeDeps } from "./merge.ts";
 import {
   evaluateReleaseWhenComplete,
@@ -20,12 +27,13 @@ import {
   type ReleaseWhenCompleteHookResult,
   type RunReleaseFn,
 } from "./merge-queue-release-when-complete.ts";
+import { performPreMergeAutoFix } from "./pre_merge.ts";
 import { runRelease } from "./release.ts";
 import {
   canAttemptRepair,
   claimRepairAttempt,
-  classifyEligibility,
   classifyFromMergeError,
+  classifyQueueEligibility,
   createHold,
   createRepairBudget,
   buildSurgicalRepairPrompt,
@@ -273,20 +281,24 @@ export function isRepairEnabled(
 
 /**
  * Production eligibility evaluator using the same gates as dry-run selection /
- * mergePr (mergeable+CLEAN + checks policy).
+ * mergePr: PR open + linked-issue R2D policy + mergeable+CLEAN + checks policy.
  */
 export async function evaluateCandidateEligibility(
-  prNumber: number,
+  candidate: { prNumber: number; issueNumber: number },
   planDeps: Pick<PlanDeps, "ghPrView" | "ghPrChecksRequired" | "ghPrChecksAll">,
+  labelDeps?: Pick<MergeDeps, "getIssueLabels">,
 ): Promise<EligibilitySnapshot> {
+  const prNumber = candidate.prNumber;
   const prData = await planDeps.ghPrView(prNumber, [
     "mergeable",
     "mergeStateStatus",
     "headRefOid",
+    "state",
   ]);
   const mergeable = String(prData.mergeable ?? "UNKNOWN");
   const mergeStateStatus = String(prData.mergeStateStatus ?? "UNKNOWN");
   const headRefOid = String(prData.headRefOid ?? "") || undefined;
+  const prState = String(prData.state ?? "") || undefined;
 
   // When conflict/dirty, checks are secondary (conflict wins) but still
   // surface detail when both fail.
@@ -306,12 +318,115 @@ export async function evaluateCandidateEligibility(
     }
   }
 
+  let issueHasR2d: boolean | undefined;
+  if (labelDeps) {
+    try {
+      const labels = await labelDeps.getIssueLabels(candidate.issueNumber);
+      issueHasR2d = labels.includes(R2D_LABEL);
+    } catch {
+      // Fail closed: unknown labels must not look like policy-pass.
+      issueHasR2d = false;
+    }
+  }
+
   return {
     mergeable,
     mergeStateStatus,
     checksOk,
     checksDetail,
     headRefOid,
+    prState,
+    issueHasR2d,
+  };
+}
+
+/**
+ * Shared mechanical-remediation transaction for merge-queue repair (#675).
+ * Reuses managed-worktree resolve + {@link performPreMergeAutoFix} (same push
+ * path as recovery's repair_pipeline_item executor) without inventing a
+ * merge-queue-only model branch. Does not call mergePr.
+ *
+ * Injectable for hermetic tests; production wires real worktree/harness deps.
+ */
+export async function runSharedMechanicalRepair(
+  candidate: MergeQueueCandidate,
+  prompt: string,
+  cfg: PipelineConfig,
+  deps: {
+    getOnDiskForIssue?: typeof getOnDiskForIssue;
+    ensureManagedWorktree?: typeof ensureManagedWorktree;
+    gitInWorktree?: typeof gitInWorktree;
+    performRepair?: typeof performPreMergeAutoFix;
+    invoke?: typeof invoke;
+  } = {},
+): Promise<MechanicalRepairResult> {
+  const getWorktree = deps.getOnDiskForIssue ?? getOnDiskForIssue;
+  const ensureWorktree = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+  const git = deps.gitInWorktree ?? gitInWorktree;
+  const repair = deps.performRepair ?? performPreMergeAutoFix;
+  const invokeFn = deps.invoke ?? invoke;
+
+  if (!cfg.harnesses?.implementer) {
+    return {
+      succeeded: false,
+      evidence: "no implementer harness configured for mechanical repair",
+      error: "no implementer harness configured",
+    };
+  }
+
+  let wt = await getWorktree(cfg, candidate.issueNumber);
+  if (!wt) {
+    const materialized = await ensureWorktree(cfg, candidate.issueNumber);
+    if (materialized.result === "fail" || !materialized.worktree) {
+      const detail =
+        materialized.result === "fail"
+          ? materialized.reason
+          : "worktree rematerialization did not return a worktree";
+      return {
+        succeeded: false,
+        evidence: `managed worktree unavailable: ${detail}`,
+        error: detail,
+      };
+    }
+    wt = { path: materialized.worktree.path, slug: materialized.worktree.slug };
+  }
+
+  const runId = `merge-queue-repair-pr-${candidate.prNumber}`;
+  const result = await repair(
+    cfg,
+    candidate.issueNumber,
+    runId,
+    prompt,
+    candidate.title,
+    wt,
+    git,
+    invokeFn,
+    undefined,
+    {
+      commitSubjectPrefix: `fix: merge-queue surgical repair`,
+      salvageLabel: "merge-queue surgical repair",
+    },
+  );
+
+  if (result.status === "fix-committed") {
+    return {
+      succeeded: true,
+      headSha: result.headSha,
+      evidence: `shared mechanical repair pushed ${result.headSha}`,
+    };
+  }
+  if (result.status === "noop-clean") {
+    return {
+      succeeded: false,
+      headSha: result.headSha,
+      evidence: result.diagnostic ?? "mechanical repair left clean no-op",
+      error: result.diagnostic ?? "noop-clean",
+    };
+  }
+  return {
+    succeeded: false,
+    evidence: `mechanical repair status=${result.status}`,
+    error: `mechanical repair status=${result.status}`,
   };
 }
 
@@ -319,6 +434,8 @@ export function realMergeQueueDeps(
   repoDir: string,
   repo: string,
   mergeDeps?: MergeDeps,
+  /** Required for production mechanical repair (managed worktree + implementer). */
+  cfg?: PipelineConfig,
 ): MergeQueueDeps {
   const md = mergeDeps ?? realMergeDeps(repo);
   const plan = realPlanDeps(repo);
@@ -411,18 +528,16 @@ export function realMergeQueueDeps(
     },
 
     async evaluateEligibility(candidate) {
-      return evaluateCandidateEligibility(candidate.prNumber, plan);
+      return evaluateCandidateEligibility(candidate, plan, md);
     },
 
-    // Production does not auto-wire implementer repair here — operators opt in
-    // via --repair and injectors/tests supply mechanical seams. Deterministic
-    // path re-queries eligibility only (checks re-read; no silent rebase without
-    // worktree wiring). Full worktree rebase remains available through the
-    // injected attemptDeterministicRepair / attemptMechanicalRepair seams.
+    // Deterministic path re-queries eligibility only (checks re-read; no silent
+    // rebase without worktree wiring). Conflict resolution that needs a dirty
+    // tree goes through the claimed mechanical seam below.
     async attemptDeterministicRepair(candidate, reason, _snapshot) {
       if (reason === "checks-failed") {
         // Re-query settled check state (no second poller loop — one re-read).
-        const snap = await evaluateCandidateEligibility(candidate.prNumber, plan);
+        const snap = await evaluateCandidateEligibility(candidate, plan, md);
         return {
           changed: false,
           headSha: snap.headRefOid,
@@ -432,7 +547,7 @@ export function realMergeQueueDeps(
         };
       }
       // Conflict: re-read mergeability; actual rebase requires mechanical/worktree path.
-      const snap = await evaluateCandidateEligibility(candidate.prNumber, plan);
+      const snap = await evaluateCandidateEligibility(candidate, plan, md);
       return {
         changed: false,
         headSha: snap.headRefOid,
@@ -442,7 +557,22 @@ export function realMergeQueueDeps(
       };
     },
 
-    runRelease: (versionArg, opts, cfg) => runRelease(versionArg, opts, cfg),
+    // Production mechanical repair: shared managed-worktree + performPreMergeAutoFix
+    // transaction (same implementer push path as recovery). Manual-repair holds
+    // are reserved for budget exhaustion or executor failure after claim.
+    async attemptMechanicalRepair(candidate, _reason, _snapshot, prompt) {
+      if (!cfg) {
+        return {
+          succeeded: false,
+          evidence:
+            "PipelineConfig required for production mechanical repair (pass cfg to realMergeQueueDeps)",
+          error: "missing PipelineConfig for mechanical repair",
+        };
+      }
+      return runSharedMechanicalRepair(candidate, prompt, cfg);
+    },
+
+    runRelease: (versionArg, opts, releaseCfg) => runRelease(versionArg, opts, releaseCfg),
 
     now: () => Date.now(),
 
@@ -478,6 +608,7 @@ async function processCandidateApply(
 ): Promise<
   | { status: "merged" }
   | { status: "held"; hold: MergeQueueHeldItem }
+  | { status: "already-done"; summary: string }
 > {
   const nowFn = deps.now ?? (() => Date.now());
   let budget: RepairBudgetState | undefined;
@@ -488,46 +619,163 @@ async function processCandidateApply(
     });
   }
 
-  const reEvaluate = async (): Promise<EligibilitySnapshot | null> => {
-    if (!deps.evaluateEligibility) return null;
-    return deps.evaluateEligibility(candidate);
+  /** Re-evaluate with isolation: dependency failures never escape the item. */
+  const reEvaluate = async (): Promise<
+    | { ok: true; snapshot: EligibilitySnapshot | null }
+    | { ok: false; error: string }
+  > => {
+    if (!deps.evaluateEligibility) return { ok: true, snapshot: null };
+    try {
+      const snapshot = await deps.evaluateEligibility(candidate);
+      return { ok: true, snapshot };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
   };
 
-  let snapshot = await reEvaluate();
-  let reason: MergeQueueHoldReason | null = snapshot
-    ? classifyEligibility(snapshot)
-    : null;
+  const freeFormHold = (
+    message: string,
+    attemptsUsed: number,
+    budgetExhausted = false,
+  ): MergeQueueHeldItem => ({
+    issueNumber: candidate.issueNumber,
+    prNumber: candidate.prNumber,
+    reason: message,
+    summary: message,
+    outcome: budgetExhausted ? "manual-repair" : "failed",
+    humanAuthority: false,
+    repairAttemptsUsed: attemptsUsed,
+    remediation:
+      `PR #${candidate.prNumber} (issue #${candidate.issueNumber}): ${message}. ` +
+      `Inspect the error, fix, then retry merge-queue apply or pipeline merge ${candidate.prNumber}.`,
+  });
+
+  const policyHold = (summary: string, attemptsUsed: number): MergeQueueHeldItem => ({
+    issueNumber: candidate.issueNumber,
+    prNumber: candidate.prNumber,
+    reason: summary,
+    summary,
+    outcome: "held",
+    humanAuthority: false,
+    repairAttemptsUsed: attemptsUsed,
+    remediation:
+      `PR #${candidate.prNumber} (issue #${candidate.issueNumber}) is not queue-eligible: ${summary}. ` +
+      `Restore pipeline:ready-to-deploy on the linked issue (and keep the PR open) before retrying.`,
+  });
+
+  /**
+   * Apply full queue gates (open + R2D + conflict/checks). Returns merge-ready
+   * only when every known gate passes; never calls mergePr itself.
+   */
+  const applyQueueGates = (
+    snap: EligibilitySnapshot | null,
+    fallbackReason: MergeQueueHoldReason | null,
+    fallbackSummary: string,
+  ):
+    | { status: "eligible" }
+    | { status: "already-done"; summary: string }
+    | { status: "policy"; summary: string }
+    | {
+        status: "ineligible";
+        reason: MergeQueueHoldReason;
+        snapshot: EligibilitySnapshot | null;
+        summary: string;
+      } => {
+    if (!snap) {
+      if (fallbackReason) {
+        return {
+          status: "ineligible",
+          reason: fallbackReason,
+          snapshot: null,
+          summary: fallbackSummary,
+        };
+      }
+      return { status: "eligible" };
+    }
+    const gate = classifyQueueEligibility(snap);
+    if (gate.kind === "eligible") return { status: "eligible" };
+    if (gate.kind === "already-done") {
+      return { status: "already-done", summary: gate.summary };
+    }
+    if (gate.kind === "policy") {
+      return { status: "policy", summary: gate.summary };
+    }
+    return {
+      status: "ineligible",
+      reason: gate.reason,
+      snapshot: snap,
+      summary: snapshotSummary(gate.reason, snap),
+    };
+  };
+
+  let evalResult = await reEvaluate();
+  if (!evalResult.ok) {
+    // Preflight failure: hold this item and let the outer loop continue.
+    return {
+      status: "held",
+      hold: freeFormHold(`eligibility preflight failed: ${evalResult.error}`, 0),
+    };
+  }
+
+  let snapshot = evalResult.snapshot;
+  let reason: MergeQueueHoldReason | null = null;
+  let summary = "";
+  let attemptsUsed = 0;
 
   // Eligible path (or no evaluator): attempt merge; classify throw if needed.
   const attemptMergeOnce = async (): Promise<
     | { status: "merged" }
     | { status: "held"; hold: MergeQueueHeldItem }
-    | { status: "ineligible"; reason: MergeQueueHoldReason; snapshot: EligibilitySnapshot | null; summary: string }
+    | { status: "already-done"; summary: string }
+    | {
+        status: "ineligible";
+        reason: MergeQueueHoldReason;
+        snapshot: EligibilitySnapshot | null;
+        summary: string;
+      }
   > => {
-    if (reason && snapshot) {
-      return {
-        status: "ineligible",
-        reason,
-        snapshot,
-        summary: snapshotSummary(reason, snapshot),
-      };
+    const gates = applyQueueGates(snapshot, null, "");
+    if (gates.status === "already-done") return gates;
+    if (gates.status === "policy") {
+      return { status: "held", hold: policyHold(gates.summary, attemptsUsed) };
     }
+    if (gates.status === "ineligible") return gates;
+
     const mergeResult = await tryMerge(candidate, deps);
     if (mergeResult.ok) return { status: "merged" };
 
     const fromErr = classifyFromMergeError(mergeResult.error);
     if (fromErr) {
       // Refresh snapshot if we can so re-gate/repair have current evidence.
-      snapshot = (await reEvaluate()) ?? snapshot;
+      const refreshed = await reEvaluate();
+      if (refreshed.ok) {
+        snapshot = refreshed.snapshot ?? snapshot;
+      }
       if (snapshot) {
-        const classified = classifyEligibility(snapshot) ?? fromErr;
+        const gate = classifyQueueEligibility(snapshot);
+        if (gate.kind === "already-done") {
+          return { status: "already-done", summary: gate.summary };
+        }
+        if (gate.kind === "policy") {
+          return { status: "held", hold: policyHold(gate.summary, attemptsUsed) };
+        }
+        if (gate.kind === "hold") {
+          return {
+            status: "ineligible",
+            reason: gate.reason,
+            snapshot,
+            summary: snapshotSummary(gate.reason, snapshot),
+          };
+        }
+        // Snapshot looks eligible but merge threw a classifiable error — trust error.
         return {
           status: "ineligible",
-          reason: classified,
+          reason: fromErr,
           snapshot,
-          summary: snapshot
-            ? snapshotSummary(classified, snapshot)
-            : mergeResult.error,
+          summary: mergeResult.error,
         };
       }
       return {
@@ -541,29 +789,19 @@ async function processCandidateApply(
     // Non-classifiable hard failure — hold with free-form reason (no force-merge).
     return {
       status: "held",
-      hold: {
-        issueNumber: candidate.issueNumber,
-        prNumber: candidate.prNumber,
-        reason: mergeResult.error,
-        summary: mergeResult.error,
-        outcome: "failed",
-        humanAuthority: false,
-        remediation:
-          `PR #${candidate.prNumber} (issue #${candidate.issueNumber}) failed merge: ${mergeResult.error}. ` +
-          `Inspect the error, fix, then retry merge-queue apply or pipeline merge ${candidate.prNumber}.`,
-      },
+      hold: freeFormHold(mergeResult.error, attemptsUsed),
     };
   };
 
   let first = await attemptMergeOnce();
   if (first.status === "merged") return { status: "merged" };
   if (first.status === "held") return first;
+  if (first.status === "already-done") return first;
 
   // Ineligible: optional repair ladder, else hold.
   reason = first.reason;
   snapshot = first.snapshot;
-  let summary = first.summary;
-  let attemptsUsed = 0;
+  summary = first.summary;
 
   const makeHold = (budgetExhausted: boolean): MergeQueueHeldItem =>
     holdToResultItem(
@@ -590,14 +828,44 @@ async function processCandidateApply(
         `[merge-queue] deterministic repair for issue #${candidate.issueNumber} ` +
           `PR #${candidate.prNumber} (${reason})…`,
       );
-      const det = await deps.attemptDeterministicRepair(candidate, reason!, snapshot);
-      deps.log(`[merge-queue] deterministic: ${det.evidence}`);
+      let detEvidence = "deterministic repair";
+      try {
+        const det = await deps.attemptDeterministicRepair(
+          candidate,
+          reason!,
+          snapshot,
+        );
+        detEvidence = det.evidence;
+        deps.log(`[merge-queue] deterministic: ${det.evidence}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        detEvidence = `deterministic repair failed: ${msg}`;
+        deps.log(`[merge-queue] deterministic failed (hold-and-continue path): ${msg}`);
+        // Keep prior reason; fall through to mechanical / budget gates.
+      }
+
       // Always re-gate after deterministic path (even re-query only).
-      snapshot = (await reEvaluate()) ?? snapshot;
+      const afterDet = await reEvaluate();
+      if (!afterDet.ok) {
+        return {
+          status: "held",
+          hold: freeFormHold(
+            `post-deterministic re-gate failed: ${afterDet.error}; last: ${detEvidence}`,
+            attemptsUsed,
+          ),
+        };
+      }
+      snapshot = afterDet.snapshot ?? snapshot;
       if (snapshot) {
-        reason = classifyEligibility(snapshot);
-        if (reason) {
-          summary = snapshotSummary(reason, snapshot);
+        const gates = applyQueueGates(snapshot, reason, summary);
+        if (gates.status === "already-done") return gates;
+        if (gates.status === "policy") {
+          return { status: "held", hold: policyHold(gates.summary, attemptsUsed) };
+        }
+        if (gates.status === "ineligible") {
+          reason = gates.reason;
+          summary = gates.summary;
+          snapshot = gates.snapshot ?? snapshot;
         } else {
           // Re-eligible — merge via existing surface only.
           const mergeResult = await tryMerge(candidate, deps);
@@ -606,19 +874,12 @@ async function processCandidateApply(
           if (fromErr) {
             reason = fromErr;
             summary = mergeResult.error;
-            snapshot = (await reEvaluate()) ?? snapshot;
+            const refreshed = await reEvaluate();
+            if (refreshed.ok) snapshot = refreshed.snapshot ?? snapshot;
           } else {
             return {
               status: "held",
-              hold: {
-                issueNumber: candidate.issueNumber,
-                prNumber: candidate.prNumber,
-                reason: mergeResult.error,
-                summary: mergeResult.error,
-                outcome: "failed",
-                humanAuthority: false,
-                repairAttemptsUsed: attemptsUsed,
-              },
+              hold: freeFormHold(mergeResult.error, attemptsUsed),
             };
           }
         }
@@ -661,26 +922,54 @@ async function processCandidateApply(
       `[merge-queue] mechanical repair attempt ${attemptsUsed} for ` +
         `issue #${candidate.issueNumber} PR #${candidate.prNumber}…`,
     );
-    const mech = await deps.attemptMechanicalRepair(
-      candidate,
-      reason!,
-      snapshot ?? {
-        mergeable: "UNKNOWN",
-        mergeStateStatus: "UNKNOWN",
-        checksOk: false,
-        checksDetail: summary,
-      },
-      prompt,
-    );
+
+    let mech: MechanicalRepairResult;
+    try {
+      mech = await deps.attemptMechanicalRepair(
+        candidate,
+        reason!,
+        snapshot ?? {
+          mergeable: "UNKNOWN",
+          mergeStateStatus: "UNKNOWN",
+          checksOk: false,
+          checksDetail: summary,
+        },
+        prompt,
+      );
+    } catch (err) {
+      // Claimed attempt is charged on failure/timeout/rejection.
+      const msg = err instanceof Error ? err.message : String(err);
+      deps.log(`[merge-queue] mechanical repair rejected: ${msg}`);
+      mech = {
+        succeeded: false,
+        evidence: `mechanical repair threw: ${msg}`,
+        error: msg,
+      };
+    }
     deps.log(
       `[merge-queue] mechanical repair: succeeded=${mech.succeeded} ${mech.evidence}`,
     );
 
     // Mandatory re-gate after candidate-moving repair (or any mechanical attempt).
-    snapshot = (await reEvaluate()) ?? snapshot;
+    const afterMech = await reEvaluate();
+    if (!afterMech.ok) {
+      return {
+        status: "held",
+        hold: freeFormHold(
+          `post-repair re-gate failed: ${afterMech.error}; repair: ${mech.evidence}`,
+          attemptsUsed,
+          !canAttemptRepair(budget, nowFn()),
+        ),
+      };
+    }
+    snapshot = afterMech.snapshot ?? snapshot;
     if (snapshot) {
-      reason = classifyEligibility(snapshot);
-      if (!reason) {
+      const gates = applyQueueGates(snapshot, reason, summary);
+      if (gates.status === "already-done") return gates;
+      if (gates.status === "policy") {
+        return { status: "held", hold: policyHold(gates.summary, attemptsUsed) };
+      }
+      if (gates.status === "eligible") {
         const mergeResult = await tryMerge(candidate, deps);
         if (mergeResult.ok) return { status: "merged" };
         const fromErr = classifyFromMergeError(mergeResult.error);
@@ -690,19 +979,13 @@ async function processCandidateApply(
         } else {
           return {
             status: "held",
-            hold: {
-              issueNumber: candidate.issueNumber,
-              prNumber: candidate.prNumber,
-              reason: mergeResult.error,
-              summary: mergeResult.error,
-              outcome: "failed",
-              humanAuthority: false,
-              repairAttemptsUsed: attemptsUsed,
-            },
+            hold: freeFormHold(mergeResult.error, attemptsUsed),
           };
         }
       } else {
-        summary = snapshotSummary(reason, snapshot);
+        reason = gates.reason;
+        summary = gates.summary;
+        snapshot = gates.snapshot ?? snapshot;
       }
     } else if (!mech.succeeded) {
       summary = mech.error ?? mech.evidence ?? summary;
@@ -711,7 +994,10 @@ async function processCandidateApply(
     // Loop: if still ineligible, continue while budget remains.
     if (!reason) {
       // No snapshot and merge didn't run — hold.
-      return { status: "held", hold: makeHold(!canAttemptRepair(budget, nowFn())) };
+      return {
+        status: "held",
+        hold: makeHold(!canAttemptRepair(budget, nowFn())),
+      };
     }
   }
 }
@@ -822,6 +1108,12 @@ export async function runMergeQueue(
         merged.push(c);
         deps.log(
           `[merge-queue] merged issue #${c.issueNumber} PR #${c.prNumber}`,
+        );
+      } else if (outcome.status === "already-done") {
+        // PR no longer open (merged/closed) after selection or repair — not held.
+        deps.log(
+          `[merge-queue] already-done issue #${c.issueNumber} PR #${c.prNumber}` +
+            ` — ${outcome.summary}`,
         );
       } else {
         held.push(outcome.hold);

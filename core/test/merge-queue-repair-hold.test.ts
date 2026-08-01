@@ -14,6 +14,7 @@ import {
   claimRepairAttempt,
   classifyEligibility,
   classifyFromMergeError,
+  classifyQueueEligibility,
   createHold,
   createRepairBudget,
   type EligibilitySnapshot,
@@ -21,10 +22,13 @@ import {
 import {
   runMergeQueue,
   isRepairEnabled,
+  realMergeQueueDeps,
+  runSharedMechanicalRepair,
   type MergeQueueCandidate,
   type MergeQueueDeps,
   type MergeQueueNonCandidate,
 } from "../scripts/stages/merge-queue.ts";
+import type { PipelineConfig } from "../scripts/types.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -571,4 +575,254 @@ test("isolation: no auto_merge key in merge_queue config schema surface", () => 
   assert.ok(
     typesBody.includes("No `auto_merge` key") || typesBody.includes("no auto_merge"),
   );
+});
+
+// ---------------------------------------------------------------------------
+// Review-1 regressions (#675 fix round 1)
+// ---------------------------------------------------------------------------
+
+test("classifyQueueEligibility: open + R2D + clean is eligible; closed/MERGED is already-done; lost R2D is policy", () => {
+  assert.equal(
+    classifyQueueEligibility({
+      ...CLEAN_SNAP,
+      prState: "OPEN",
+      issueHasR2d: true,
+    }).kind,
+    "eligible",
+  );
+  assert.equal(
+    classifyQueueEligibility({
+      ...CLEAN_SNAP,
+      prState: "MERGED",
+      issueHasR2d: true,
+    }).kind,
+    "already-done",
+  );
+  assert.equal(
+    classifyQueueEligibility({
+      ...CLEAN_SNAP,
+      prState: "CLOSED",
+      issueHasR2d: true,
+    }).kind,
+    "already-done",
+  );
+  const policy = classifyQueueEligibility({
+    ...CLEAN_SNAP,
+    prState: "OPEN",
+    issueHasR2d: false,
+  });
+  assert.equal(policy.kind, "policy");
+  assert.equal(
+    classifyQueueEligibility({
+      ...CONFLICT_SNAP,
+      prState: "OPEN",
+      issueHasR2d: true,
+    }).kind,
+    "hold",
+  );
+});
+
+test("realMergeQueueDeps wires production attemptMechanicalRepair seam", () => {
+  // Smoke: production deps always expose the shared mechanical seam (cfg
+  // optional for call wiring; missing cfg fails closed at invoke time).
+  const deps = realMergeQueueDeps("/tmp/repo-does-not-need-to-exist", "org/repo");
+  assert.equal(typeof deps.attemptMechanicalRepair, "function");
+  assert.equal(typeof deps.attemptDeterministicRepair, "function");
+  assert.equal(typeof deps.evaluateEligibility, "function");
+});
+
+test("runSharedMechanicalRepair uses injected shared repair path (no network)", async () => {
+  const cfg = {
+    harnesses: { implementer: "claude" },
+  } as unknown as PipelineConfig;
+  let repairCalls = 0;
+  const result = await runSharedMechanicalRepair(
+    { issueNumber: 42, prNumber: 7, title: "fix me" },
+    "surgical prompt body",
+    cfg,
+    {
+      async getOnDiskForIssue() {
+        return { path: "/managed/wt", slug: "slug" };
+      },
+      async ensureManagedWorktree() {
+        throw new Error("should not rematerialize when worktree exists");
+      },
+      async gitInWorktree() {
+        throw new Error("git should not run when repair is injected");
+      },
+      async performRepair(
+        _cfg,
+        issueNumber,
+        _runId,
+        findingsText,
+        _title,
+        wt,
+      ) {
+        repairCalls += 1;
+        assert.equal(issueNumber, 42);
+        assert.equal(findingsText, "surgical prompt body");
+        assert.equal(wt.path, "/managed/wt");
+        return { status: "fix-committed", headSha: "abc123def" };
+      },
+      async invoke() {
+        throw new Error("invoke should not run when performRepair is injected");
+      },
+    },
+  );
+  assert.equal(repairCalls, 1);
+  assert.equal(result.succeeded, true);
+  assert.equal(result.headSha, "abc123def");
+});
+
+test("drive: evaluateEligibility rejection holds item A and continues to B", async () => {
+  const deps = makeDeps({
+    candidates: [
+      { issueNumber: 1, prNumber: 10, title: "A" },
+      { issueNumber: 2, prNumber: 20, title: "B" },
+    ],
+    remainingAfterApply: [],
+    eligibility: new Map([[20, CLEAN_SNAP]]),
+  });
+  // Override evaluate to throw for PR 10 only.
+  const originalEval = deps.evaluateEligibility!.bind(deps);
+  deps.evaluateEligibility = async (c) => {
+    if (c.prNumber === 10) throw new Error("github read timeout");
+    return originalEval(c);
+  };
+
+  const result = await runMergeQueue({ ...baseOpts }, deps);
+  assert.equal(result.held.length, 1);
+  assert.ok(
+    String(result.held[0]!.reason).includes("eligibility preflight failed") ||
+      String(result.held[0]!.summary).includes("github read timeout"),
+  );
+  assert.equal(result.merged.length, 1);
+  assert.equal(result.merged[0]!.prNumber, 20);
+  assert.equal(deps.mergeCalls.length, 1);
+});
+
+test("drive: mechanical repair rejection is charged, held, and does not abandon batch", async () => {
+  const deps = makeDeps({
+    candidates: [
+      { issueNumber: 1, prNumber: 10, title: "A" },
+      { issueNumber: 2, prNumber: 20, title: "B" },
+    ],
+    remainingAfterApply: [],
+    eligibility: new Map([
+      [10, CONFLICT_SNAP],
+      [20, CLEAN_SNAP],
+    ]),
+    async mechanicalImpl() {
+      throw new Error("harness timeout");
+    },
+  });
+  const result = await runMergeQueue(
+    { ...baseOpts, repair: true, repairMaxAttempts: 1 },
+    deps,
+  );
+  assert.equal(result.held.length, 1);
+  assert.equal(result.held[0]!.prNumber, 10);
+  assert.equal(result.held[0]!.repairAttemptsUsed, 1);
+  assert.equal(result.held[0]!.outcome, "manual-repair");
+  assert.equal(result.merged.length, 1);
+  assert.equal(result.merged[0]!.prNumber, 20);
+  assert.equal(deps.mechanicalCalls, 1);
+  assert.equal(deps.mergeCalls.length, 1, "only B merges; A never force-merged");
+});
+
+test("drive: post-repair re-gate refuses merge when PR is no longer open", async () => {
+  const deps = makeDeps({
+    candidates: [{ issueNumber: 5, prNumber: 50, title: "fixme" }],
+    remainingAfterApply: [],
+    eligibility: new Map([
+      [
+        50,
+        [
+          CONFLICT_SNAP,
+          CONFLICT_SNAP, // after deterministic
+          {
+            ...CLEAN_SNAP,
+            prState: "MERGED",
+            issueHasR2d: true,
+          },
+        ],
+      ],
+    ]),
+    async mechanicalImpl() {
+      return { succeeded: true, headSha: "sha-green", evidence: "pushed" };
+    },
+  });
+  const result = await runMergeQueue(
+    { ...baseOpts, repair: true, repairMaxAttempts: 1 },
+    deps,
+  );
+  assert.equal(result.merged.length, 0, "must not call merge after MERGED re-gate");
+  assert.equal(deps.mergeCalls.length, 0);
+  assert.equal(result.held.length, 0, "already-done is not a hold");
+  assert.ok(deps.logs.some((l) => l.includes("already-done")));
+});
+
+test("drive: post-repair re-gate holds when linked issue lost R2D", async () => {
+  const deps = makeDeps({
+    candidates: [{ issueNumber: 5, prNumber: 50, title: "fixme" }],
+    remainingAfterApply: [],
+    eligibility: new Map([
+      [
+        50,
+        [
+          CONFLICT_SNAP,
+          CONFLICT_SNAP,
+          {
+            ...CLEAN_SNAP,
+            prState: "OPEN",
+            issueHasR2d: false,
+          },
+        ],
+      ],
+    ]),
+    async mechanicalImpl() {
+      return { succeeded: true, headSha: "sha-green", evidence: "pushed" };
+    },
+  });
+  const result = await runMergeQueue(
+    { ...baseOpts, repair: true, repairMaxAttempts: 1 },
+    deps,
+  );
+  assert.equal(deps.mergeCalls.length, 0, "must not merge without R2D policy");
+  assert.equal(result.merged.length, 0);
+  assert.equal(result.held.length, 1);
+  assert.ok(
+    String(result.held[0]!.reason).includes("ready-to-deploy") ||
+      String(result.held[0]!.summary).includes("ready-to-deploy"),
+  );
+});
+
+test("drive: deterministic repair rejection holds-and-continues without escaping", async () => {
+  const deps = makeDeps({
+    candidates: [
+      { issueNumber: 1, prNumber: 10, title: "A" },
+      { issueNumber: 2, prNumber: 20, title: "B" },
+    ],
+    remainingAfterApply: [],
+    eligibility: new Map([
+      [10, CONFLICT_SNAP],
+      [20, CLEAN_SNAP],
+    ]),
+    async deterministicImpl() {
+      throw new Error("rebase worktree boom");
+    },
+    async mechanicalImpl() {
+      return { succeeded: false, evidence: "still conflict", error: "still conflict" };
+    },
+  });
+  const result = await runMergeQueue(
+    { ...baseOpts, repair: true, repairMaxAttempts: 1 },
+    deps,
+  );
+  assert.equal(result.held.length, 1);
+  assert.equal(result.held[0]!.prNumber, 10);
+  assert.equal(result.merged.length, 1);
+  assert.equal(result.merged[0]!.prNumber, 20);
+  assert.ok(deps.deterministicCalls >= 1, "deterministic was invoked (may retry each ladder pass)");
+  assert.equal(deps.mechanicalCalls, 1, "mechanical still attempted after det throw");
 });

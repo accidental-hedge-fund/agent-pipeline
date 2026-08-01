@@ -19,6 +19,8 @@ export const MERGE_QUEUE_HOLD_REASONS: readonly MergeQueueHoldReason[] = [
 /**
  * Eligibility snapshot used to classify hold reasons before merge.
  * Checks gate is pre-evaluated (same policy as merge / dry-run selection).
+ * Optional open/R2D fields are set by production re-gate so post-repair merge
+ * never proceeds when the PR left the queue policy set.
  */
 export interface EligibilitySnapshot {
   mergeable: string;
@@ -28,6 +30,16 @@ export interface EligibilitySnapshot {
   /** Blocking-check summary when checksOk is false. */
   checksDetail?: string;
   headRefOid?: string;
+  /**
+   * PR state from `gh pr view` when known (`OPEN` / `CLOSED` / `MERGED`).
+   * Omitted in unit fixtures that only exercise mergeability/checks.
+   */
+  prState?: string;
+  /**
+   * Whether the linked issue currently has `pipeline:ready-to-deploy`.
+   * Omitted in unit fixtures that only exercise mergeability/checks.
+   */
+  issueHasR2d?: boolean;
 }
 
 export interface CreateHoldInput {
@@ -85,7 +97,9 @@ export function isConflictOrDirtyMergeState(
 }
 
 /**
- * Classify eligibility into a typed hold reason, or null when eligible to merge.
+ * Classify eligibility into a typed hold reason, or null when mergeability +
+ * checks alone look mergeable. Callers that re-gate after repair MUST also use
+ * {@link classifyQueueEligibility} (open PR + linked R2D) before merge.
  * Conflict wins when both conflict/dirty and checks fail.
  */
 export function classifyEligibility(
@@ -98,6 +112,49 @@ export function classifyEligibility(
     return "checks-failed";
   }
   return null;
+}
+
+/**
+ * Full queue re-gate: PR open policy, linked-issue R2D policy, then conflict/checks.
+ * Used before every post-repair (and production preflight) merge attempt.
+ *
+ * - `already-done`: PR is MERGED (or closed and no longer open) — do not merge or hold as conflict.
+ * - `policy`: open PR but linked issue lost R2D — hold free-form / not mergeable via queue policy.
+ * - `hold`: typed conflict or checks-failed.
+ * - `eligible`: all known gates pass (unknown open/R2D fields do not block for fixture compat).
+ */
+export type QueueEligibilityClass =
+  | { kind: "eligible" }
+  | { kind: "already-done"; summary: string }
+  | { kind: "policy"; summary: string }
+  | { kind: "hold"; reason: MergeQueueHoldReason };
+
+export function classifyQueueEligibility(
+  snapshot: EligibilitySnapshot,
+): QueueEligibilityClass {
+  if (snapshot.prState != null) {
+    const state = snapshot.prState.toUpperCase();
+    if (state === "MERGED") {
+      return { kind: "already-done", summary: `PR state is ${snapshot.prState}` };
+    }
+    if (state !== "OPEN") {
+      // CLOSED without MERGED (or other non-open): already out of the queue.
+      return {
+        kind: "already-done",
+        summary: `PR is not open (state=${snapshot.prState})`,
+      };
+    }
+  }
+  if (snapshot.issueHasR2d === false) {
+    return {
+      kind: "policy",
+      summary:
+        "linked issue no longer has pipeline:ready-to-deploy; queue policy forbids merge",
+    };
+  }
+  const hold = classifyEligibility(snapshot);
+  if (hold) return { kind: "hold", reason: hold };
+  return { kind: "eligible" };
 }
 
 /**
