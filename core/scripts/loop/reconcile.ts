@@ -378,14 +378,14 @@ export function computeNextAction(
   identity: LoopExternalIdentity,
   drift: LoopDriftClass | null,
   mergeBarrierSetForThisItem: boolean,
+  currentHumanAuthority = false,
 ): LoopNextAction {
   if (drift === "ledger-behind") return "repair-forward";
-  if (drift === "ledger-ahead" || drift === "external-absent" || drift === "identity-mismatch") return "hold-for-human";
-  if (drift === "checks-regressed") return identity.checks_conclusion === "pending" ? "await-checks" : "hold-for-human";
-  // Live GitHub blocked label (#698 / loop-blocked-item-hold-continuation): do
-  // not advertise actionable `advance` while the issue still carries `blocked`
-  // and no unblock path has cleared it. Hold until labels show clear.
-  if (identity.blocked_label_present) return "hold-for-human";
+  if (currentHumanAuthority) return "hold-for-human";
+  if (drift === "ledger-ahead" || drift === "external-absent" || drift === "identity-mismatch") return "noop";
+  if (drift === "checks-regressed") return identity.checks_conclusion === "pending" ? "await-checks" : "noop";
+  // Labels carry workflow state, never authority.
+  if (identity.blocked_label_present) return "noop";
 
   switch (state) {
     case "pr_opened":
@@ -511,7 +511,19 @@ export async function reconcile(
     const identity = observed[id];
     const driftEntry = drift.find((d) => d.item_id === id);
     const barrierSet = ledger.merge_barrier?.item_id === id && merge_barrier !== null;
-    next_actions[id] = computeNextAction(entry.state, identity, driftEntry?.class ?? null, barrierSet);
+    const currentHumanAuthority =
+      (entry.state === "waiting" || entry.state === "paused") &&
+      typeof entry.hold_request?.authority_evidence_key === "string" &&
+      entry.hold_request.authority_evidence_key.length > 0 &&
+      typeof entry.hold_request.authority_candidate_head === "string" &&
+      entry.hold_request.authority_candidate_head.toLowerCase() === identity.head_sha.toLowerCase();
+    next_actions[id] = computeNextAction(
+      entry.state,
+      identity,
+      driftEntry?.class ?? null,
+      barrierSet,
+      currentHumanAuthority,
+    );
   }
 
   const sequence = ledger.reconciliation_sequence + 1;

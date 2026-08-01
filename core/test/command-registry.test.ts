@@ -29,7 +29,7 @@ import { buildCmd } from "../scripts/pipeline.ts";
 const DISPATCH_KEYWORDS = [
   "init", "doctor", "status", "unblock", "override", "cleanup",
   "release", "intake", "sweep", "triage", "merge", "merge-queue",
-  "refine-spec", "logs", "summary", "path", "config", "run", "improve",
+  "refine-spec", "logs", "summary", "path", "config", "run", "single", "improve",
   "scoreboard", "roadmap", "loop", "correction", "report",
 ];
 
@@ -229,12 +229,13 @@ test("command-registry: every 'loop:'-namespaced registered option is in the loo
 });
 
 // ---------------------------------------------------------------------------
-// 2.8  needsIssueNumber: advance and run require an issue number; named sub-commands do not
+// 2.8  issue-scoped commands require an issue number; repo-scoped commands do not
 // ---------------------------------------------------------------------------
 
-test("command-registry: needsIssueNumber is true for advance, run, status, unblock, override", () => {
+test("command-registry: needsIssueNumber is true for issue-scoped commands", () => {
   assert.equal(COMMAND_REGISTRY.advance.needsIssueNumber, true);
   assert.equal(COMMAND_REGISTRY.run.needsIssueNumber, true);
+  assert.equal(COMMAND_REGISTRY.single.needsIssueNumber, true);
   assert.equal(COMMAND_REGISTRY.status.needsIssueNumber, true);
   assert.equal(COMMAND_REGISTRY.unblock.needsIssueNumber, true);
   assert.equal(COMMAND_REGISTRY.override.needsIssueNumber, true);

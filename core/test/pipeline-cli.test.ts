@@ -138,6 +138,14 @@ test("pipeline-cli: run — run with issue number, all flags accepted → []", (
   assert.deepEqual(roundTrip(["run", "42", "--dry-run"]), []);
 });
 
+test("pipeline-cli: single — canonical one-item durable drive accepts host and repo coordinates", () => {
+  assert.deepEqual(roundTrip(["single", "42", "--profile", "claude", "--repo-path", "/repo"]), []);
+});
+
+test("pipeline-cli: single rejects raw advance-only controls", () => {
+  assert.deepEqual(roundTrip(["single", "42", "--once", "--dry-run"]), ["once", "dryRun"]);
+});
+
 // ---------------------------------------------------------------------------
 // 5.2  Unsupported global flag on a restricted command
 // ---------------------------------------------------------------------------

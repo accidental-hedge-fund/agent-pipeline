@@ -1,5 +1,7 @@
 // Shared types + state-machine constants for the pipeline skill.
 
+import type { StageDiagnostic } from "./stage-diagnostic.ts";
+
 export const STAGES = [
   "backlog",
   "ready",
@@ -1119,6 +1121,8 @@ export type Outcome =
       status: "blocked";
       reason: string;
       blockerKind?: BlockerKind;
+      /** Producer-authored structured diagnostic for exact mechanical causes. */
+      diagnostic?: StageDiagnostic;
       /** Pre-merge-only path tag for offramp_class mapping (#683). */
       offrampPathTag?:
         | "ci-failed"

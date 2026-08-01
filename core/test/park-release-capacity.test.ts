@@ -5,6 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
+import { buildStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 import {
   WorktreeCapacityError,
   WORKTREE_CAPACITY_ERROR_CODE,
@@ -580,17 +581,19 @@ test("isAutoLoopRecoverable: worktree-capacity is not recoverable (#718)", () =>
 });
 
 test("classifyDispatchOutcome: worktree-capacity kind → capacity_wait not blocked_needs_human", () => {
+  const capacity = buildStageDiagnostic({ blockerKind: "worktree-capacity", reason: "capacity" });
+  const mechanical = buildStageDiagnostic({ blockerKind: "needs-human", reason: "generic" });
   assert.equal(
-    classifyDispatchOutcome({ labels: ["blocked", "pipeline:planning"], state: "open" }, "worktree-capacity"),
+    classifyDispatchOutcome({ labels: ["blocked", "pipeline:planning"], state: "open" }, capacity),
     "capacity_wait",
   );
   assert.equal(
-    classifyDispatchOutcome({ labels: ["blocked", "pipeline:planning"], state: "open" }, "needs-human"),
-    "blocked_needs_human",
+    classifyDispatchOutcome({ labels: ["blocked", "pipeline:planning"], state: "open" }, mechanical),
+    "blocked_recoverable",
   );
   assert.equal(
     classifyDispatchOutcome({ labels: ["blocked"], state: "open" }),
-    "blocked_needs_human",
+    "failed",
   );
 });
 
@@ -806,7 +809,7 @@ test("realDispatchItem: clearBlocked failure still capacity_wait; re-dispatch us
       execPath: "/usr/bin/node",
       eventsPathExists: (p) => p === expectedPin.events_path,
       readEventsText: () =>
-        JSON.stringify({ type: "blocker_set", blocker_kind: "worktree-capacity" }) + "\n",
+        JSON.stringify({ type: "blocker_set", blocker_kind: "worktree-capacity", reason: "capacity" }) + "\n",
       spawn: ((cmd: string, args: readonly string[]) => {
         void cmd;
         void args;
@@ -959,8 +962,8 @@ test("realDispatchItem: stale authentic capacity comment does not clear later pr
   );
   assert.equal(
     response.outcome,
-    "blocked_needs_human",
-    "stale capacity marker must not reclassify a later product/human hold",
+    "failed",
+    "missing structured diagnostic must fail protocol, never infer a human hold",
   );
   assert.equal(clearCalls, 0, "clearBlocked must not run for unbound capacity markers");
 });
@@ -988,7 +991,7 @@ test("realDispatchItem: forged capacity comment from untrusted author does not c
       eventsPathExists: (p) => p === expectedPin.events_path,
       readEventsText: () =>
         // Prior product needs-human block — no capacity in events.
-        JSON.stringify({ type: "blocker_set", blocker_kind: "needs-human" }) + "\n",
+        JSON.stringify({ type: "blocker_set", blocker_kind: "needs-human", reason: "generic mechanical block" }) + "\n",
       spawn: ((cmd: string, args: readonly string[]) => {
         void cmd;
         void args;
@@ -1022,7 +1025,7 @@ test("realDispatchItem: forged capacity comment from untrusted author does not c
   );
   // Events carry needs-human; even if events were empty, forged comment must not
   // become capacity_wait. With events present, kind is needs-human.
-  assert.equal(response.outcome, "blocked_needs_human");
+  assert.equal(response.outcome, "blocked_recoverable");
   assert.equal(clearCalls, 0, "clearBlocked must not run for product holds");
 });
 
@@ -1077,8 +1080,127 @@ test("realDispatchItem: untrusted comment cannot force capacity_wait when events
     },
     { onAdvanceLinked: async () => {} },
   );
-  assert.equal(response.outcome, "blocked_needs_human");
+  assert.equal(response.outcome, "failed");
   assert.equal(clearCalls, 0);
+});
+
+// ---------------------------------------------------------------------------
+// #787 review — the trusted marker fallback covers EVERY blocker kind, not just
+// worktree-capacity. An early-blocked re-dispatch writes no fresh blocker_set,
+// so the durable attested marker is the only structural evidence left.
+// ---------------------------------------------------------------------------
+
+/** Shared realDispatchItem deps for the marker-fallback classification tests:
+ *  blocked label, event-less re-dispatch, one trusted attested comment. */
+function markerFallbackDeps(args: {
+  fixedNow: Date;
+  comments: { author: string; body: string; createdAt: string }[];
+  onClearBlocked?: () => void;
+}) {
+  const expectedPin = pinAdvanceRunIdentity("/repo", 718, args.fixedNow);
+  return {
+    now: () => args.fixedNow,
+    scriptPath: "/path/to/pipeline.ts",
+    execPath: "/usr/bin/node",
+    eventsPathExists: (p: string) => p === expectedPin.events_path,
+    readEventsText: () => "", // no blocker_set — early-blocked re-dispatch
+    spawn: ((cmd: string, cmdArgs: readonly string[]) => {
+      void cmd;
+      void cmdArgs;
+      return fakeSpawnChild();
+    }) as typeof import("node:child_process").spawn,
+    getIssueDetail: async () =>
+      ({
+        labels: ["blocked", "pipeline:plan-review"],
+        state: "open",
+        comments: args.comments,
+      }) as never,
+    getPrForIssue: async () => null,
+    getGhActor: async () => PIPELINE_ACTOR,
+    getLatestBlockedLabeledAt: async () => BLOCKED_LABELED_AT,
+    clearBlocked: async () => {
+      args.onClearBlocked?.();
+    },
+  };
+}
+
+function markerFallbackRequest(runId: string) {
+  return {
+    schema: "pipeline/loop-execution@1" as const,
+    item_id: "718",
+    repo: { name: "acme/w", base_branch: "main" },
+    engine: "claude" as const,
+    worktree_policy: "default" as const,
+    done_definition: "pipeline:ready-to-deploy",
+    run_id: runId,
+  };
+}
+
+test("trusted human-decision-required marker without authority evidence remains a protocol defect", async () => {
+  const fixedNow = new Date("2026-07-30T22:09:03.000Z");
+  const humanComment = buildAttestedBlockedComment({
+    issueNumber: 718,
+    stageStr: "plan-review",
+    harness: "claude",
+    ts: BLOCKED_LABELED_AT,
+    reason: "A human product decision is required",
+    kind: "human-decision-required",
+    runId: "run-human-718",
+  });
+  let clearCalls = 0;
+  const dispatch = realDispatchItem({ repo_dir: "/repo" } as PipelineConfig, "claude", markerFallbackDeps({
+    fixedNow,
+    comments: [{ author: PIPELINE_ACTOR, body: humanComment, createdAt: "2026-07-30T22:00:01Z" }],
+    onClearBlocked: () => clearCalls++,
+  }));
+  const response = await dispatch(markerFallbackRequest("loop-run-human"), { onAdvanceLinked: async () => {} });
+  assert.equal(
+    response.outcome,
+    "failed",
+    "a comment marker cannot manufacture the current authority proof required for a human hold",
+  );
+  // Authority boundary: the marker restores only the hold's KIND — no
+  // attested authority diagnostic may be fabricated from it.
+  assert.equal(response.diagnostic, undefined, "no synthesized authority_evidence diagnostic from a comment marker");
+  assert.equal(clearCalls, 0, "classification alone does not mutate the blocked label");
+});
+
+test("#787 review: trusted mechanical marker (merge-conflict) classifies blocked_recoverable with the true blocker class", async () => {
+  const fixedNow = new Date("2026-07-30T22:09:03.000Z");
+  const conflictComment = buildAttestedBlockedComment({
+    issueNumber: 718,
+    stageStr: "pre-merge",
+    harness: "claude",
+    ts: BLOCKED_LABELED_AT,
+    reason: "Rebase conflict against base",
+    kind: "merge-conflict",
+    runId: "run-conflict-718",
+  });
+  let clearCalls = 0;
+  const dispatch = realDispatchItem({ repo_dir: "/repo" } as PipelineConfig, "claude", markerFallbackDeps({
+    fixedNow,
+    comments: [{ author: PIPELINE_ACTOR, body: conflictComment, createdAt: "2026-07-30T22:00:01Z" }],
+    onClearBlocked: () => clearCalls++,
+  }));
+  const response = await dispatch(markerFallbackRequest("loop-run-conflict"), { onAdvanceLinked: async () => {} });
+  assert.equal(response.outcome, "blocked_recoverable");
+  assert.equal(response.diagnostic?.detail.blocker_kind, "merge-conflict");
+  assert.equal(
+    response.diagnostic?.reason_code,
+    "workflow-state",
+    "recovery must target the true blocker class, not workflow-engine-defect",
+  );
+  assert.equal(clearCalls, 0, "only worktree-capacity clears the blocked label");
+});
+
+test("#787 review: no marker at all keeps the protocol-failure failed classification", async () => {
+  const fixedNow = new Date("2026-07-30T22:09:03.000Z");
+  const dispatch = realDispatchItem({ repo_dir: "/repo" } as PipelineConfig, "claude", markerFallbackDeps({
+    fixedNow,
+    comments: [{ author: PIPELINE_ACTOR, body: "no marker here", createdAt: "2026-07-30T22:00:01Z" }],
+  }));
+  const response = await dispatch(markerFallbackRequest("loop-run-no-marker"), { onAdvanceLinked: async () => {} });
+  assert.equal(response.outcome, "failed", "absent/invalid marker with no blocker_set stays a protocol failure");
 });
 
 test("isDurableParkOutcome: blocked and finalized park; waiting does not", () => {

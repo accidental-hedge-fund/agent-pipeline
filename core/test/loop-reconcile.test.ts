@@ -473,10 +473,15 @@ test("computeNextAction: pending checks on an aligned pr_opened item yields awai
   assert.equal(computeNextAction("pr_opened", identity, null, false), "await-checks");
 });
 
-test("computeNextAction: every contradiction class yields hold-for-human", () => {
+test("computeNextAction: contradictions never invent human authority", () => {
   for (const cls of ["ledger-ahead", "external-absent", "identity-mismatch"] as const) {
-    assert.equal(computeNextAction("pr_opened", openPrIdentity(), cls, false), "hold-for-human");
+    assert.equal(computeNextAction("pr_opened", openPrIdentity(), cls, false), "noop");
   }
+});
+
+test("computeNextAction: only current authority evidence yields hold-for-human", () => {
+  assert.equal(computeNextAction("waiting", openPrIdentity(), null, false, true), "hold-for-human");
+  assert.equal(computeNextAction("waiting", openPrIdentity(), null, false, false), "noop");
 });
 
 test("computeNextAction: ledger-behind drift yields repair-forward", () => {
@@ -642,19 +647,19 @@ test("reconcile: an over-claim (ledger-ahead) is surfaced, not rewritten — sta
 
   const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
   assert.equal(result.drift[0].class, "ledger-ahead");
-  assert.equal(result.next_actions["100"], "hold-for-human");
+  assert.equal(result.next_actions["100"], "noop");
 
   const ledger = await readLedger(deps, "run-1");
   assert.equal(ledger.items["100"].state, "merged", "ledger-ahead drift must never be silently rewritten");
 });
 
-test("reconcile: external-absent — a claimed PR that does not exist is surfaced and routed to a human", async () => {
+test("reconcile: external-absent is surfaced without inventing human authority", async () => {
   const { deps, token } = await setup("pr_opened");
   const { deps: observeDeps } = fakeObserveDeps();
 
   const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
   assert.equal(result.drift[0].class, "external-absent");
-  assert.equal(result.next_actions["100"], "hold-for-human");
+  assert.equal(result.next_actions["100"], "noop");
   const ledger = await readLedger(deps, "run-1");
   assert.equal(ledger.items["100"].state, "pr_opened");
 });

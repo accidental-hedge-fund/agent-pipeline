@@ -43,7 +43,7 @@ import {
   silentTransition,
   transition,
 } from "./gh.ts";
-import { isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
+import { PipelineLock, isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
 import { findWrapperPidForIssue, isCoexistenceFailureEvidence } from "./loop/live-advance.ts";
 import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
 import {
@@ -162,6 +162,11 @@ import {
 } from "./loop/stage-progress.ts";
 import { initRecoverableRun } from "./loop/recovery.ts";
 import { defaultReconcileObserveDeps } from "./loop/reconcile.ts";
+import {
+  createRepairPipelineItemExecutor,
+  type RepairPipelineItemInput,
+  type RepairPipelineItemResult,
+} from "./loop/repair-pipeline-item.ts";
 import { compileContractItems, type RawContractItem } from "./loop/dependencies.ts";
 import {
   discoverDeclaredDependencies,
@@ -183,11 +188,19 @@ import {
   type LoopExecutionRequest,
   type LoopExecutionResponse,
 } from "./loop-execution-contract.ts";
+import {
+  buildStageDiagnostic,
+  lastStageDiagnosticFromEventsJsonl,
+  projectStageDiagnostic,
+  type StageDiagnostic,
+} from "./stage-diagnostic.ts";
 import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
 import {
   BLOCKED_LABEL,
+  BLOCKER_KINDS,
   LABEL_PREFIX,
   reviewStageSkipTarget,
+  type BlockerKind,
   type EvidenceBundle,
   type Outcome,
   type PipelineConfig,
@@ -248,7 +261,8 @@ export interface CliOpts {
   /**
    * Events follow until-terminal: exit 0 after terminal event (default true).
    * Advance `pipeline logs … --events --follow` → `run_complete` (#725);
-   * loop `pipeline loop logs … --follow` → `loop_run_stopped` (#699).
+   * loop `pipeline loop logs … --follow` → `loop_run_stopped` or
+   * `loop_run_complete` (#699).
    * Commander `--no-until-terminal` sets this false for interrupt-only follow.
    */
   untilTerminal?: boolean;
@@ -425,6 +439,7 @@ export interface CliOpts {
 export function maxPositionalsFor(command: string | undefined): number {
   if (
     command === "run" ||
+    command === "single" ||
     command === "release" ||
     command === "intake" ||
     command === "triage" ||
@@ -456,7 +471,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | release | factory-gate | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -484,7 +499,7 @@ export function buildCmd(): Command {
     // (#699 loop; #725 advance events).
     .option(
       "--no-until-terminal",
-      "events --follow: keep streaming until interrupt only (default: exit 0 after run_complete for advance logs, or loop_run_stopped for loop logs)",
+      "events --follow: keep streaming until interrupt only (default: exit 0 after run_complete for advance logs, or loop_run_stopped/loop_run_complete for loop logs)",
     )
     .option("--events", "logs mode: read/follow events.jsonl (required selection for advance logs; always selected for 'pipeline loop logs')")
     // `pipeline run <N> --detach` options
@@ -782,9 +797,10 @@ export function buildLoopEvidencePointer(opts: {
       ...(opts.worktree_root !== undefined ? { worktree_root: opts.worktree_root } : {}),
     };
   }
+  const pipelineRunId = syntheticLoopEvidencePipelineRunId(opts.loop_run_id, opts.item_id);
   return {
     pr_number: opts.pr_number,
-    pipeline_run_id: syntheticLoopEvidencePipelineRunId(opts.loop_run_id, opts.item_id),
+    pipeline_run_id: pipelineRunId,
     ...(opts.worktree_root !== undefined ? { worktree_root: opts.worktree_root } : {}),
   };
 }
@@ -838,19 +854,23 @@ export function buildTerminalLinkagePayload(
  *  old wrong name here mapped a real needs-human block to `failed`, which the supervisor then
  *  classified as workflow-engine-defect and run_fataled the whole run (#616).
  *
- *  Optional `lastBlockerKind` (from the advance `blocker_set` event) distinguishes pure
- *  worktree capacity (#718) from product needs-human when both carry the `blocked` label. */
+ *  The canonical diagnostic from the final structured `blocker_set` decides
+ *  recoverable, capacity, or explicit human authority. Missing/malformed
+ *  diagnostics fail the protocol; labels and prose never grant authority. */
 export function classifyDispatchOutcome(
   detail: { labels: readonly string[]; state: string },
-  lastBlockerKind?: string | null,
+  diagnostic?: StageDiagnostic | null,
   /** Optional advance events.jsonl body for mid-stage / coexistence classification (#770). */
   eventsText?: string | null,
 ): LoopExecutionResponse["outcome"] {
   const readyLabel = `${LABEL_PREFIX}ready-to-deploy`;
   if (detail.labels.includes(readyLabel)) return "ready_to_deploy";
   if (detail.labels.includes(BLOCKED_LABEL)) {
-    if (lastBlockerKind === "worktree-capacity") return "capacity_wait";
-    return "blocked_needs_human";
+    const projection = projectStageDiagnostic(diagnostic);
+    if (projection.disposition === "capacity") return "capacity_wait";
+    if (projection.disposition === "recover") return "blocked_recoverable";
+    if (projection.disposition === "human_authority") return "blocked_needs_human";
+    return "failed";
   }
   if (detail.state === "closed") return "abandoned";
   // Coexistence is only lock / already-running / install evidence — never bare
@@ -869,15 +889,11 @@ export function classifyDispatchOutcome(
 export function lastBlockerKindFromEventsJsonl(eventsText: string): string | null {
   let last: string | null = null;
   for (const line of eventsText.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
     try {
-      const ev = JSON.parse(trimmed) as { type?: string; blocker_kind?: string };
-      if (ev.type === "blocker_set" && typeof ev.blocker_kind === "string" && ev.blocker_kind.length > 0) {
-        last = ev.blocker_kind;
-      }
+      const event = JSON.parse(line) as { type?: unknown; blocker_kind?: unknown };
+      if (event.type === "blocker_set" && typeof event.blocker_kind === "string") last = event.blocker_kind;
     } catch {
-      /* skip malformed lines */
+      // Compatibility reader only; dispatch classification uses the typed parser.
     }
   }
   return last;
@@ -1048,23 +1064,26 @@ export function realDispatchItem(
     await startLinkage;
 
     let outcome: LoopExecutionResponse["outcome"] = "failed";
+    let diagnostic: StageDiagnostic | undefined;
     let prNumber: number | null = null;
     try {
       const detail = await getIssueDetailFn(cfg, issueNumber);
-      // Prefer the advance run's last blocker_kind so pure capacity (#718) is
-      // not classified as product needs-human when the blocked label is set.
-      // Fall back to the durable kind marker on the blocked comment when events
-      // lack blocker_set (early-blocked re-dispatch after a prior capacity hit).
-      let lastKind: string | null = null;
+      // Prefer the advance run's last blocker_set diagnostic. When the fresh
+      // per-dispatch events lack one (an already-blocked item early-exits in
+      // pipeline-run.ts before writing any blocker_set), fall back to the
+      // durable attested kind marker on the blocked comment (#718) for EVERY
+      // blocker kind — capacity, mechanical, or human — so the re-dispatch is
+      // classified by its true blocker class instead of cascading into a
+      // protocol failure the supervisor treats as an engine defect.
+      let eventsTextForClassify: string | null = null;
       if (pin && storeReady) {
-        const text = readEventsTextFn(pin.events_path);
-        if (text !== null) lastKind = lastBlockerKindFromEventsJsonl(text);
+        eventsTextForClassify = readEventsTextFn(pin.events_path);
       }
-      if (!lastKind && Array.isArray(detail.comments)) {
-        // Fail closed without a trusted actor or without binding the comment to
-        // the current blocked-label incarnation: unauthenticated or stale
-        // authentic capacity markers must not reclassify a later product hold
-        // (#718 b5108544 / 69894186).
+      let resolution = lastStageDiagnosticFromEventsJsonl(eventsTextForClassify ?? "");
+      // Compatibility for early-exits before a fresh run-store event: only the
+      // authenticated, current blocked-label incarnation may supply this
+      // structural fallback. Comment prose is never read or transported.
+      if (resolution.diagnostic === null && Array.isArray(detail.comments)) {
         const actor = await getGhActorFn();
         let blockedLabeledAt: string | null = null;
         try {
@@ -1072,14 +1091,34 @@ export function realDispatchItem(
         } catch {
           blockedLabeledAt = null;
         }
-        lastKind = lastBlockerKindFromComments(detail.comments, {
+        const trustedKind = lastBlockerKindFromComments(detail.comments, {
           trustedAuthor: actor,
           blockedLabeledAt,
         });
+        if (trustedKind === "human-decision-required") {
+          // A marker attests only the prior blocker's kind. It cannot
+          // reconstruct authority_evidence or candidate binding, so it must
+          // remain a protocol defect and enter bounded engine recovery rather
+          // than manufacturing or preserving a human hold.
+        } else if (
+          trustedKind !== null &&
+          (BLOCKER_KINDS as readonly string[]).includes(trustedKind)
+        ) {
+          // Mechanical kinds (including worktree-capacity) synthesize the same
+          // coarse structural diagnostic stageDiagnosticFromBlockerSet builds,
+          // so recovery targets the true blocker class, not engine-defect.
+          const markerDiagnostic = buildStageDiagnostic({
+            blockerKind: trustedKind as BlockerKind,
+            reason: "trusted current blocker-kind attestation",
+          });
+          resolution = {
+            ...projectStageDiagnostic(markerDiagnostic),
+            diagnostic: markerDiagnostic,
+          };
+        }
       }
-      const eventsTextForClassify =
-        pin && storeReady ? readEventsTextFn(pin.events_path) : null;
-      outcome = classifyDispatchOutcome(detail, lastKind, eventsTextForClassify);
+      diagnostic = resolution.diagnostic ?? undefined;
+      outcome = classifyDispatchOutcome(detail, diagnostic, eventsTextForClassify);
       // Pure capacity is ops admission, not a product block: clear the label so
       // re-admission after a slot frees does not thrash on an already-blocked
       // early-exit (#718). Clear MUST succeed before capacity_wait is safe for a
@@ -1099,9 +1138,10 @@ export function realDispatchItem(
               `emitting capacity_wait with blocked label still present — durable ` +
               `blocker-kind on the issue comment must classify the next re-dispatch as capacity`,
           );
-          // Do not convert to failed: supervisor maps failed+blocked → needs-human.
-          // capacity_wait keeps ops admission for this cycle; comment kind protects
-          // the next early-blocked re-dispatch (see lastBlockerKindFromComments).
+          // Do not convert to failed: the supervisor routes failed into
+          // engine-defect recovery / run_fatal. capacity_wait keeps ops
+          // admission for this cycle; the durable marker classifies the next
+          // early-blocked re-dispatch as capacity (see lastBlockerKindFromComments).
         }
       }
       const pr = await getPrForIssueFn(cfg, issueNumber).catch(() => null);
@@ -1123,6 +1163,7 @@ export function realDispatchItem(
         // Only advertise a live events path when the store was confirmed.
         events_path_known: storeReady,
       }),
+      ...(diagnostic ? { diagnostic } : {}),
     };
   };
 }
@@ -1151,6 +1192,110 @@ export function realGetChangedFiles(cfg: PipelineConfig, deps: RealGetChangedFil
     if (!wt) return [];
     const result = await gitInWorktreeFn(wt.path, ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`], { ignoreFailure: true });
     return result.stdout.split("\n").map((s) => s.trim()).filter(Boolean);
+  };
+}
+
+type ExecuteRecoveryInput = Parameters<NonNullable<SupervisorDeps["executeRecovery"]>>[0];
+
+export interface RealExecuteRecoveryDeps {
+  getIssueDetail?: typeof getIssueDetail;
+  getGhActor?: typeof getGhActor;
+  clearBlocked?: typeof clearBlocked;
+  repairPipelineItem?: (input: RepairPipelineItemInput) => Promise<RepairPipelineItemResult>;
+}
+
+/** Production provider-neutral recovery registry. Substantive repair delegates
+ * to the configured whole-item implementer transaction; narrow recipes only
+ * clear a current mechanical block and verify that exact state transition. */
+export function realExecuteRecovery(
+  cfg: PipelineConfig,
+  deps: RealExecuteRecoveryDeps = {},
+): NonNullable<SupervisorDeps["executeRecovery"]> {
+  const getDetail = deps.getIssueDetail ?? getIssueDetail;
+  const verifyAuthentication = deps.getGhActor ?? getGhActor;
+  const clear = deps.clearBlocked ?? clearBlocked;
+  const repairPipelineItem = deps.repairPipelineItem ?? createRepairPipelineItemExecutor(cfg);
+
+  const failed = (error: string): RepairPipelineItemResult => ({
+    succeeded: false,
+    evidence: error,
+    error,
+  });
+
+  const resyncMechanicalBlock = async (
+    input: ExecuteRecoveryInput,
+  ): Promise<RepairPipelineItemResult> => {
+    const issueNumber = Number(input.itemId);
+    if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
+      return failed(`recovery action ${input.action} requires a positive numeric item id`);
+    }
+    let before: Awaited<ReturnType<typeof getIssueDetail>>;
+    try {
+      before = await getDetail(cfg, issueNumber);
+    } catch (err) {
+      return failed(`cannot inspect live item before ${input.action}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (before.state !== "open") {
+      return failed(`item ${input.itemId} is ${before.state}; refusing recovery mutation`);
+    }
+    if (!before.labels.includes(BLOCKED_LABEL)) {
+      return {
+        succeeded: true,
+        evidence: `recovery action ${input.action} observed the mechanical blocked state already clear; normal whole-item redispatch may proceed`,
+      };
+    }
+    try {
+      await clear(cfg, issueNumber);
+      const after = await getDetail(cfg, issueNumber);
+      if (after.labels.includes(BLOCKED_LABEL)) {
+        return failed(`recovery action ${input.action} returned but the blocked label remains`);
+      }
+    } catch (err) {
+      return failed(`recovery action ${input.action} could not clear the mechanical blocked state: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return {
+      succeeded: true,
+      evidence: `recovery action ${input.action} cleared the mechanical blocked state and verified normal whole-item redispatch is admissible`,
+    };
+  };
+
+  return async (input) => {
+    const projection = projectStageDiagnostic(input.diagnostic);
+    if (projection.disposition !== "recover" || projection.blockerClass !== input.blockerClass) {
+      return failed(
+        `recovery action ${input.action} refused diagnostic disposition ${projection.disposition} for class ${input.blockerClass}`,
+      );
+    }
+    switch (input.action) {
+      case "repair_pipeline_item":
+        return repairPipelineItem({
+          runId: input.runId,
+          itemId: input.itemId,
+          attemptId: input.attemptId,
+          candidateIdentity: input.candidateIdentity,
+          diagnostic: input.diagnostic,
+        });
+      case "wait_and_retry":
+      case "rerun_ci":
+      case "resync_workflow_state":
+      case "retry_upstream_check":
+      case "restart_workflow_engine":
+        return resyncMechanicalBlock(input);
+      case "verify_authentication": {
+        let actor: string | null;
+        try {
+          actor = await verifyAuthentication();
+        } catch (err) {
+          return failed(
+            `authentication is not currently usable: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        if (!actor?.trim()) {
+          return failed("authentication is not currently usable: the authenticated actor could not be resolved");
+        }
+        return resyncMechanicalBlock(input);
+      }
+    }
   };
 }
 
@@ -1326,6 +1471,10 @@ export interface RunLoopEngineInput {
   /** `--new-run` (#568, capability `loop-run-supersession`): only ever true alongside `selector`
    *  — {@link normalizeLoopArgs} refuses it with `--resume` or with no selector present. */
   newRun?: boolean;
+  /** One-item command mode: resume the current durable run when active and
+   * automatically supersede it when terminal, so a fresh operator invocation
+   * never reuses an exhausted recovery ledger. */
+  autoSupersedeTerminal?: boolean;
   /**
    * `--audit --follow` (#611): read-only whole-run stage-progress stream.
    * Requires `audit: true` (enforced by normalizeLoopArgs).
@@ -1461,6 +1610,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
   }
 
   let runId: string;
+  let resumeExisting = false;
   if (input.resumeRunId) {
     runId = input.resumeRunId;
   } else if (input.selector) {
@@ -1478,8 +1628,9 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     const discoverDeps = workListDiscoverDepsForCompile(cfg, roadmapDeclaredEdges);
     const canonicalRunId = workListRunId(cfg.repo, input.engine, issues);
 
-    if (input.newRun) {
-      if (!(await loopRunExists(store, canonicalRunId))) {
+    const canonicalExists = await loopRunExists(store, canonicalRunId);
+    if (input.newRun || (input.autoSupersedeTerminal && canonicalExists)) {
+      if (!canonicalExists) {
         return {
           kind: "error",
           message: `--new-run: no existing run found for this selector (canonical run "${canonicalRunId}") — nothing to supersede`,
@@ -1489,14 +1640,20 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
       const headLedger = await readLedger(store, headRunId);
       const decision = decideNewRunSupersession(canonicalRunId, chainLength, !!headLedger.stop);
       if (decision.kind === "refuse") {
-        return {
-          kind: "error",
-          message: `--new-run: run "${headRunId}" for this selector is not terminally stopped — resume it instead (--resume ${headRunId})`,
-        };
+        if (input.autoSupersedeTerminal) {
+          runId = headRunId;
+          resumeExisting = true;
+        } else {
+          return {
+            kind: "error",
+            message: `--new-run: run "${headRunId}" for this selector is not terminally stopped — resume it instead (--resume ${headRunId})`,
+          };
+        }
       }
       if (decision.kind === "resume-existing") {
         runId = headRunId;
-      } else {
+        resumeExisting = !!input.autoSupersedeTerminal;
+      } else if (decision.kind === "mint") {
         const newRunId = decision.newRunId;
         // Re-derive the repair plan from live state on every mint attempt — including a retry
         // where `newRunId` already exists — rather than gating the reverse-pointer write on
@@ -1538,7 +1695,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
       }
     } else {
       runId = canonicalRunId;
-      if (!(await loopRunExists(store, runId))) {
+      if (!canonicalExists) {
         let compiled: Awaited<ReturnType<typeof compileWorkListRunFresh>>;
         try {
           compiled = await compileWorkListRunFresh(cfg, input.engine, issues, runId, discoverDeps);
@@ -1560,6 +1717,8 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     store,
     observe: defaultReconcileObserveDeps(cfg),
     dispatchItem: realDispatchItem(cfg, input.engine),
+    executeRecovery: realExecuteRecovery(cfg),
+    recoverySleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     getChangedFiles: realGetChangedFiles(cfg),
     // Host-local live-advance probe scope (#770): run-store discovery + domain
     // + production wrapper/process identity under ~/.pipeline/runs/<issue>
@@ -1567,6 +1726,19 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     repoDir: cfg.repo_dir,
     lockDomain: cfg.domain,
     findWrapperPid: (issueNumber) => findWrapperPidForIssue(issueNumber),
+    // Recovery coexistence guard: the supervisor takes this same per-issue
+    // advance lock (the one every `pipeline run` / override advance serializes
+    // through) non-blocking and holds it across a recovery execution, so a
+    // concurrent advance and a loop recovery can never write the same managed
+    // worktree at once. A non-numeric item id cannot map to a lock path —
+    // treat it as busy (fail closed) rather than recovering unlocked.
+    acquireItemAdvanceLock: (itemId) => {
+      const issueNumber = Number(itemId);
+      if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) return null;
+      const lock = new PipelineLock({ domain: cfg.domain, issueNumber });
+      if (!lock.acquire()) return null;
+      return { release: () => lock.release() };
+    },
     // Mid-advance stage-progress observation (#611): read the linked advance
     // events.jsonl while waiting on the child. Injectable for unit tests.
     readAdvanceEvents: async (eventsPath) => {
@@ -1601,7 +1773,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     const result = await driveSupervisor(supervisorDeps, {
       runId,
       engine: input.engine as LoopEngineName,
-      resume: !!input.resumeRunId,
+      resume: !!input.resumeRunId || resumeExisting,
       onRunReady: input.onRunReady
         ? async (ctx) => {
             // Selector is known only at the engine/CLI layer; bare --resume has none.
@@ -1736,37 +1908,37 @@ export async function runLoopCommand(
     return;
   }
 
-  // A stop must never silently strand a ready-to-deploy item (#570, capability
-  // `loop-needs-human-blocker-disposition`): name every outstanding `ready` item on the CLI
-  // output whenever a stop carries one, alongside the machine-readable `stop.outstanding_ready`
-  // already embedded in the JSON below.
-  const outstandingReady = engineResult.result.stop?.outstanding_ready ?? [];
+  process.exitCode = renderLoopDriveResult(engine, engineResult.result);
+}
+
+/** Render the shared terminal contract for multi-item and canonical one-item
+ * durable drives. Returns the process exit code so command facades cannot
+ * diverge on stop/hold/exclusion behavior. */
+export function renderLoopDriveResult(
+  engine: LoopEngine,
+  result: Extract<LoopEngineResult, { kind: "drive" }>["result"],
+  commandLabel = "pipeline loop",
+): number {
+  const outstandingReady = result.stop?.outstanding_ready ?? [];
   if (outstandingReady.length > 0) {
     console.error(
-      `pipeline loop: stopped with ${outstandingReady.length} item(s) stranded at ready-to-deploy, awaiting human merge: ${outstandingReady.join(", ")}`,
+      `${commandLabel}: stopped with ${outstandingReady.length} item(s) stranded at ready-to-deploy, awaiting human merge: ${outstandingReady.join(", ")}`,
     );
   }
 
-  // The terminal outstanding-hold condition names every held item so an operator sees exactly
-  // which items await a human (#581, capability `loop-blocked-item-hold-continuation`) — a hold
-  // alongside still-schedulable work never reaches this point (the run keeps cycling instead).
-  const heldItemIds = engineResult.result.heldItemIds ?? [];
-  if (engineResult.result.holdOutstanding && heldItemIds.length > 0) {
+  const heldItemIds = result.heldItemIds ?? [];
+  if (result.holdOutstanding && heldItemIds.length > 0) {
     console.error(
-      `pipeline loop: paused with ${heldItemIds.length} item(s) held for a human: ${heldItemIds.join(", ")}`,
+      `${commandLabel}: paused with ${heldItemIds.length} item(s) held for a human: ${heldItemIds.join(", ")}`,
     );
   }
 
-  // A resolved run with ≥1 precondition-excluded item is named on the CLI's own output, not only
-  // recoverable via `--audit` (#614, capability `loop-terminal-exclusion-disclosure`) — the same
-  // "all_done: true masked nothing ran" gap #570/#581 already closed for stops and holds.
-  const excludedItemIds = engineResult.result.excludedItemIds ?? [];
+  const excludedItemIds = result.excludedItemIds ?? [];
   if (excludedItemIds.length > 0) {
-    const dispatched = engineResult.result.dispatched;
-    const total = dispatched + excludedItemIds.length;
-    const reason = humanizeExclusionReason(engineResult.result.exclusionReason);
+    const total = result.dispatched + excludedItemIds.length;
+    const reason = humanizeExclusionReason(result.exclusionReason);
     console.error(
-      `pipeline loop: ${dispatched} of ${total} item(s) dispatchable — ${excludedItemIds.length} excluded: ${reason} (${excludedItemIds
+      `${commandLabel}: ${result.dispatched} of ${total} item(s) dispatchable — ${excludedItemIds.length} excluded: ${reason} (${excludedItemIds
         .map((id) => `#${id}`)
         .join(", ")})`,
     );
@@ -1776,25 +1948,102 @@ export async function runLoopCommand(
     JSON.stringify({
       schema_version: "1",
       engine,
-      run_id: engineResult.result.runId,
-      cycles: engineResult.result.cycles,
-      stop: engineResult.result.stop,
-      hold_outstanding: engineResult.result.holdOutstanding,
+      run_id: result.runId,
+      cycles: result.cycles,
+      stop: result.stop,
+      hold_outstanding: result.holdOutstanding,
       held_item_ids: heldItemIds,
-      all_done: engineResult.result.allDone,
-      resumed: engineResult.result.resumed,
-      dispatched: engineResult.result.dispatched,
+      all_done: result.allDone,
+      resumed: result.resumed,
+      dispatched: result.dispatched,
       excluded: excludedItemIds.length,
       excluded_item_ids: excludedItemIds,
-      exclusion_reason: engineResult.result.exclusionReason,
-      completion: engineResult.result.completion,
+      exclusion_reason: result.exclusionReason,
+      completion: result.completion,
     }),
   );
-  process.exitCode = engineResult.result.stop || engineResult.result.holdOutstanding
+  return result.stop || result.holdOutstanding
     ? 1
-    : engineResult.result.completion === "none_dispatchable"
+    : result.completion === "none_dispatchable"
       ? 2
       : 0;
+}
+
+export interface SingleIssueCommandDeps {
+  resolveConfig: typeof resolveConfig;
+  resolveIssueNumber: typeof resolveIssueNumber;
+  runLoopEngine: (input: RunLoopEngineInput) => Promise<LoopEngineResult>;
+  writeStdoutLine: (line: string) => void | Promise<void>;
+}
+
+const defaultSingleIssueCommandDeps: SingleIssueCommandDeps = {
+  resolveConfig,
+  resolveIssueNumber,
+  runLoopEngine: defaultRunLoopEngine,
+  writeStdoutLine: writeFlushedStdoutLine,
+};
+
+/** Canonical one-item autonomous drive. The stage machine still performs every
+ * normal transition; this facade supplies the same durable supervisor and
+ * recovery controller used by `pipeline loop` without requiring an outer
+ * multi-item `/goal` bootstrap. */
+export async function runSingleIssueCommand(
+  rawNumber: string | undefined,
+  opts: CliOpts,
+  deps: SingleIssueCommandDeps = defaultSingleIssueCommandDeps,
+): Promise<void> {
+  const parsed = Number.parseInt(rawNumber ?? "", 10);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || String(parsed) !== rawNumber) {
+    console.error("pipeline single: <number> is required and must be a positive integer");
+    process.exitCode = 2;
+    return;
+  }
+
+  let cfg: PipelineConfig;
+  try {
+    cfg = deps.resolveConfig({
+      repoPath: opts.repoPath,
+      baseBranch: opts.base,
+      profile: opts.profile,
+    });
+  } catch (err) {
+    console.error(`pipeline single: config error: ${(err as Error).message}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  let issueNumber: number;
+  try {
+    issueNumber = await deps.resolveIssueNumber(cfg, parsed);
+  } catch (err) {
+    console.error(`pipeline single: ${(err as Error).message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const engine: LoopEngine = opts.profile === "claude" ? "claude" : "codex";
+  const engineResult = await deps.runLoopEngine({
+    engine,
+    selector: { type: "work-list", value: [String(issueNumber)] },
+    audit: false,
+    autoSupersedeTerminal: true,
+    repoDir: cfg.repo_dir,
+    onRunReady: async (ctx) => {
+      await deps.writeStdoutLine(formatLoopRunHandoff({ ...ctx, selector: { type: "work-list", value: [String(issueNumber)] } }));
+      console.error(`pipeline single: run ready ${ctx.runId}; events ${ctx.events}`);
+    },
+  });
+  if (engineResult.kind === "error") {
+    console.error(`pipeline single: ${engineResult.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (engineResult.kind !== "drive") {
+    console.error("pipeline single: internal error: one-item drive returned an audit result");
+    process.exitCode = 1;
+    return;
+  }
+  process.exitCode = renderLoopDriveResult(engine, engineResult.result, "pipeline single");
 }
 
 /** Renders a machine-readable `precondition:required=<stage>,observed=<stage>` exclusion reason
@@ -2011,6 +2260,8 @@ async function main(): Promise<void> {
   // `pipeline loop ...` (#451) — deterministic preflight + delegation to goal-loop.
   // Needs no PipelineConfig and calls no gh at all (see command-registry.ts).
   const isLoopCommand = numArg === "loop";
+  // `pipeline single <N>` — canonical durable one-item autonomous drive.
+  const isSingleCommand = numArg === "single";
   // `pipeline refine-spec --title "<t>" --body "<b>"` — non-mutating spec refinement preview.
   const isRefineSpecCommand = numArg === "refine-spec";
 
@@ -2041,7 +2292,7 @@ async function main(): Promise<void> {
   // state home. Nested `logs` must never enter loop preflight or the supervisor
   // drive path. Dispatched before flag validation / config / gh — same offline
   // discipline as advance `pipeline logs`. Default follow exits 0 on
-  // loop_run_stopped; --no-until-terminal restores interrupt-only.
+  // loop_run_stopped or loop_run_complete; --no-until-terminal restores interrupt-only.
   if (numArg === "loop" && cmd.args[1] === "logs") {
     const loopLogsArg = cmd.args[2];
     const loopLogsRunId =
@@ -3075,6 +3326,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (isSingleCommand) {
+    await runSingleIssueCommand(cmd.args[1], opts);
+    return;
+  }
+
   // Early triage dispatch — resolves config for cfg.repo so gh wrappers target the
   // configured repository. The handler validates issue number and stage, then makes
   // the gh calls to read/add/remove labels.
@@ -3196,7 +3452,7 @@ async function main(): Promise<void> {
   if (numArg && !/^\d+$/.test(numArg)) {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
-      "logs", "path", "config", "run", "release", "intake", "refine-spec",
+      "logs", "path", "config", "run", "single", "release", "intake", "refine-spec",
       "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "factory-gate", "queue", "backfill", "evals",
       "loop",
     ];

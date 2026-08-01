@@ -1,3 +1,51 @@
+# v1.29.2 autonomous recovery regression
+
+## Status
+Implementation and local verification complete. The provider-neutral recovery controller treats
+the seven child failures as acceptance fixtures, not seven independent patches.
+
+## Plan
+- [x] Reconstruct all seven terminal outcomes from run, loop, GitHub, and engine-identity evidence.
+- [x] Prove the common orchestration failure: mechanical blocks became human holds while recovery budgets stayed unused.
+- [x] Define a closed human-authority predicate and typed mechanical recovery reasons.
+- [x] Wire durable keyed recovery attempts, bounded recipe dispatch, reconciliation, and re-entry into the production supervisor.
+- [x] Preserve provider neutrality: stage contracts and recipes, never Claude/Grok/Codex branches.
+- [x] Add incident-shaped controller/restart/exhaustion tests.
+- [x] Regenerate the `plugin/` mirror.
+- [x] Run focused tests and `npm run ci`.
+- [x] Replay the seven observed failure classes through controller regression fixtures; all remain
+  mechanical and zero produce a false human-authority hold.
+- [x] Reconcile a crash after a pushed repair through the idempotent executor without replaying the model.
+- [x] Persist recovery eligibility time and keep deferred items from starving schedulable siblings.
+- [x] Invalidate candidate-bound human holds when the reviewed HEAD changes, even if `pipeline:blocked` remains.
+- [x] Let freshly observed ready, merged, or closed state supersede a stale recovery claim before mutation.
+- [x] Rerun focused regressions, regenerate `plugin/`, validate OpenSpec, and rerun `npm run ci`.
+- [x] Run deterministic redispatch before model repair for mechanical recovery classes.
+- [x] Replace the non-executable authentication recipe with a real credential verification action.
+- [x] Route single-issue advancement through the same durable recovery controller as multi-item loops.
+- [x] Document the recovery/authority matrix and update stale manual-unblock guidance.
+- [x] Add regression coverage, regenerate `plugin/`, and run full CI.
+- [x] Push the PR and verify hosted CI.
+
+## Review
+
+- Canonical diagnostics distinguish merge/workflow, OpenSpec archive, generated-delta, CI, engine,
+  capacity, and attested product/authority decisions without provider branches.
+- Recovery is claim-before-side-effect, deadline-backed, restart-idempotent, candidate-bound, and
+  redispatches the same item through normal gates. Deferred recovery cannot starve an independent
+  sibling, and pushed repair commits reconcile without replaying the implementer.
+- Fresh ready/merged/closed truth supersedes stale recovery; human authority expires when the
+  reviewed candidate HEAD changes even if the blocked label remains.
+- OpenSpec archive success now requires machine-readable success and removal of the active change.
+- Deterministic recovery runs before model repair; authentication recovery performs a live
+  credential check instead of claiming a no-op recipe succeeded.
+- Single-issue host invocations now enter the same durable recovery controller as milestone loops,
+  and unattested `needs-human` outcomes remain engine-owned regardless of labels or stale comments.
+- `openspec validate autonomous-recovery-controller --strict`: passed.
+- Focused host/supervisor regression suite: 129 passed, 0 failed.
+- `npm run ci`: passed, including 6,190 core tests and 223 OpenSpec items.
+- PR #787 hosted `ci/test`: passed.
+
 # #771 — pre-merge CI settled failure must not thrash
 
 ## Status

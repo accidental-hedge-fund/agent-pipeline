@@ -26,6 +26,7 @@ import { BLOCKED_LABEL } from "../scripts/types.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
+import { buildStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 
 // ---------------------------------------------------------------------------
 // classifyDispatchOutcome — the per-item advance's label/state → outcome mapping
@@ -34,11 +35,23 @@ import type { ChildProcess } from "node:child_process";
 // classifying it as workflow-engine-defect and run_fataling the whole run.
 // ---------------------------------------------------------------------------
 
-test("classifyDispatchOutcome: a real 'blocked'-labeled item maps to blocked_needs_human, not failed (#616)", () => {
+test("classifyDispatchOutcome: blocked authority requires an explicit typed human decision", () => {
   // The exact live shape observed in #616: the canonical BLOCKED_LABEL co-present with a stage label.
   assert.equal(BLOCKED_LABEL, "blocked");
-  assert.equal(classifyDispatchOutcome({ labels: [BLOCKED_LABEL, "pipeline:fix-2"], state: "open" }), "blocked_needs_human");
-  assert.equal(classifyDispatchOutcome({ labels: ["blocked"], state: "open" }), "blocked_needs_human");
+  const human = buildStageDiagnostic({
+    blockerKind: "human-decision-required",
+    reason: "choose API contract",
+    authorityEvidence: [{
+      category: "product-decision",
+      finding_key: "deadbeef",
+      finding_fingerprint: "0123456789abcdef",
+      reviewed_sha: "abc1234",
+    }],
+  });
+  const mechanical = buildStageDiagnostic({ blockerKind: "needs-human", reason: "legacy generic kind" });
+  assert.equal(classifyDispatchOutcome({ labels: [BLOCKED_LABEL, "pipeline:fix-2"], state: "open" }, human), "blocked_needs_human");
+  assert.equal(classifyDispatchOutcome({ labels: ["blocked"], state: "open" }, mechanical), "blocked_recoverable");
+  assert.equal(classifyDispatchOutcome({ labels: ["blocked"], state: "open" }), "failed");
 });
 
 test("classifyDispatchOutcome: the phantom 'pipeline:blocked' label is NOT a blocker — it falls through to failed (#616)", () => {

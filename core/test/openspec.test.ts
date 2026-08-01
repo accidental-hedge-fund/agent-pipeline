@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  archive,
   changeDirExists,
   changeIdFromArchiveFolderName,
   changeIdsFromPaths,
@@ -14,6 +15,10 @@ import {
   listChangeDirs,
   openspecContext,
   openspecContextFromDiff,
+  OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE,
+  OPENSPEC_ARCHIVE_JSON_MIN_VERSION,
+  parseArchiveResult,
+  parseOpenspecCliVersion,
   parseValidateResult,
   readChangeFile,
   readSpecDeltas,
@@ -85,6 +90,181 @@ test("parseValidateResult: nested results.changes shape extracts issues", () => 
   const r = parseValidateResult(1, out);
   assert.equal(r.valid, false);
   assert.ok(r.issues.some((i) => /delta missing scenario/.test(i.message)));
+});
+
+test("parseArchiveResult: requires a matching archive object and removed active change", () => {
+  const stdout = JSON.stringify({
+    archive: {
+      change: "add-auth",
+      archivedAs: "2026-07-31-add-auth",
+      path: "/repo/openspec/changes/archive/2026-07-31-add-auth",
+      specsUpdated: true,
+    },
+  });
+
+  assert.deepEqual(parseArchiveResult("add-auth", 0, stdout, "", "removed"), {
+    success: true,
+    unavailable: false,
+    output: stdout,
+  });
+});
+
+test("parseArchiveResult: exit 0 with a semantic apply failure is not success", () => {
+  const stdout = JSON.stringify({
+    archive: null,
+    status: [{
+      severity: "error",
+      code: "archive_spec_update_failed",
+      message: "ADDED requirement already exists",
+      fix: "Fix the change delta specs and rerun. No files were changed.",
+    }],
+  });
+
+  const result = parseArchiveResult("add-auth", 0, stdout, "", "present");
+
+  assert.equal(result.success, false);
+  assert.equal(result.diagnostic?.reasonCode, OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE);
+  assert.equal(result.diagnostic?.diagnosticCode, "archive_spec_update_failed");
+  assert.equal(
+    result.diagnostic?.evidenceKey,
+    "openspec-archive-apply-conflict:add-auth:archive_spec_update_failed",
+  );
+  assert.equal(result.diagnostic?.message, "ADDED requirement already exists");
+});
+
+test("parseArchiveResult: archive object with a residual active dir fails its postcondition", () => {
+  const stdout = JSON.stringify({
+    archive: { change: "add-auth", archivedAs: "2026-07-31-add-auth" },
+  });
+
+  const result = parseArchiveResult("add-auth", 0, stdout, "", "present");
+
+  assert.equal(result.success, false);
+  assert.equal(result.diagnostic?.diagnosticCode, "archive_active_change_remains");
+  assert.equal(
+    result.diagnostic?.evidenceKey,
+    "openspec-archive-apply-conflict:add-auth:archive_active_change_remains",
+  );
+});
+
+test("parseArchiveResult: rejects a success object for a different change", () => {
+  const stdout = JSON.stringify({
+    archive: { change: "other-change", archivedAs: "2026-07-31-other-change" },
+  });
+
+  const result = parseArchiveResult("add-auth", 0, stdout, "", "removed");
+
+  assert.equal(result.success, false);
+  assert.equal(result.diagnostic?.diagnosticCode, "archive_result_mismatch");
+});
+
+test("parseArchiveResult: unverifiable active-change removal is not semantic success", () => {
+  const stdout = JSON.stringify({
+    archive: { change: "add-auth", archivedAs: "2026-07-31-add-auth" },
+  });
+
+  const result = parseArchiveResult("add-auth", 0, stdout, "", "unverified");
+
+  assert.equal(result.success, false);
+  assert.equal(result.diagnostic?.diagnosticCode, "archive_active_change_unverified");
+});
+
+test("archive: requests JSON and verifies removal independently of exit code", async () => {
+  const calls: string[][] = [];
+  const result = await archive("/repo", "add-auth", 1234, {
+    run: async (_dir, args) => {
+      calls.push(args);
+      if (args[0] === "--version") {
+        return { code: 0, stdout: `${OPENSPEC_ARCHIVE_JSON_MIN_VERSION}\n`, stderr: "", unavailable: false };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          archive: { change: "add-auth", archivedAs: "2026-07-31-add-auth" },
+        }),
+        stderr: "",
+        unavailable: false,
+      };
+    },
+    changeState: () => "present",
+  });
+
+  assert.deepEqual(calls, [["--version"], ["archive", "add-auth", "--yes", "--json"]]);
+  assert.equal(result.success, false);
+  assert.equal(result.diagnostic?.diagnosticCode, "archive_active_change_remains");
+});
+
+// ---------------------------------------------------------------------------
+// archive CLI capability preflight — an old CLI (no `archive --json`) must fail
+// with an actionable upgrade diagnostic, never a garbage JSON-parse failure
+// that feeds implementer repair rounds.
+// ---------------------------------------------------------------------------
+
+test("archive: an older CLI fails the version preflight with an upgrade diagnostic and never reaches the JSON archive call", async () => {
+  const calls: string[][] = [];
+  const result = await archive("/repo", "add-auth", 1234, {
+    run: async (_dir, args) => {
+      calls.push(args);
+      if (args[0] === "--version") {
+        return { code: 0, stdout: "1.4.2\n", stderr: "", unavailable: false };
+      }
+      // What an old CLI would emit for the unsupported flag — must never be parsed.
+      return { code: 1, stdout: "", stderr: "error: unknown option '--json'", unavailable: false };
+    },
+    changeState: () => "present",
+  });
+
+  assert.deepEqual(calls, [["--version"]], "the archive --json call must not run on an unsupported CLI");
+  assert.equal(result.success, false);
+  assert.equal(result.unavailable, false);
+  assert.equal(result.diagnostic?.diagnosticCode, "archive_cli_unsupported");
+  assert.equal(result.diagnostic?.reasonCode, OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE);
+  // Doctor-grade: names the found version, the required version, and the remedy.
+  assert.match(result.output, /1\.4\.2/);
+  assert.ok(result.output.includes(OPENSPEC_ARCHIVE_JSON_MIN_VERSION));
+  assert.match(result.output, /Upgrade the openspec CLI/);
+  assert.ok(result.diagnostic?.message?.includes(OPENSPEC_ARCHIVE_JSON_MIN_VERSION));
+  assert.match(result.diagnostic?.fix ?? "", /Upgrade the openspec CLI/);
+});
+
+test("archive: an inconclusive version probe falls through to the archive call whose own result governs", async () => {
+  const calls: string[][] = [];
+  const result = await archive("/repo", "add-auth", 1234, {
+    run: async (_dir, args) => {
+      calls.push(args);
+      if (args[0] === "--version") {
+        // No parseable semver — the probe must not block a healthy CLI.
+        return { code: 0, stdout: "openspec dev build\n", stderr: "", unavailable: false };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ archive: { change: "add-auth", archivedAs: "2026-07-31-add-auth" } }),
+        stderr: "",
+        unavailable: false,
+      };
+    },
+    changeState: () => "removed",
+  });
+
+  assert.deepEqual(calls, [["--version"], ["archive", "add-auth", "--yes", "--json"]]);
+  assert.equal(result.success, true);
+});
+
+test("archive: an unavailable version probe reports the CLI unavailable without an apply-conflict diagnostic", async () => {
+  const result = await archive("/repo", "add-auth", 1234, {
+    run: async () => ({ code: -1, stdout: "", stderr: "openspec not found", unavailable: true }),
+    changeState: () => "present",
+  });
+
+  assert.equal(result.success, false);
+  assert.equal(result.unavailable, true);
+  assert.equal(result.diagnostic, undefined);
+});
+
+test("parseOpenspecCliVersion: parses the real bare-version output and rejects versionless text", () => {
+  assert.deepEqual(parseOpenspecCliVersion("1.5.0\n"), [1, 5, 0]);
+  assert.deepEqual(parseOpenspecCliVersion("openspec/2.10.3 linux"), [2, 10, 3]);
+  assert.equal(parseOpenspecCliVersion("openspec dev build"), null);
 });
 
 test("listChangeDirs: lists change folders excluding archive", () => {

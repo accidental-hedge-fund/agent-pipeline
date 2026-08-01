@@ -23,7 +23,10 @@ import {
   maybeArchiveOpenspec,
   type AdvancePreMergeDeps,
 } from "../scripts/stages/pre_merge.ts";
-import { unarchivedChangeIdsFromPrFiles } from "../scripts/openspec.ts";
+import {
+  OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE,
+  unarchivedChangeIdsFromPrFiles,
+} from "../scripts/openspec.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
 
@@ -186,7 +189,19 @@ test("maybeArchiveOpenspec: openspec archive fails on a retitled MODIFIED header
       return { stdout: "", stderr: "", code: 0 };
     }) as AdvancePreMergeDeps["gitInWorktree"],
     changeDirExists: () => true,
-    openspecArchive: (async () => ({ success: false, unavailable: false, output: CLI_OUTPUT })) as AdvancePreMergeDeps["openspecArchive"],
+    openspecArchive: (async () => ({
+      success: false,
+      unavailable: false,
+      output: CLI_OUTPUT,
+      diagnostic: {
+        reasonCode: OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE,
+        evidenceKey:
+          `${OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE}:` +
+          `${CHANGE_ID}:archive_spec_update_failed`,
+        diagnosticCode: "archive_spec_update_failed",
+        message: CLI_OUTPUT,
+      },
+    })) as AdvancePreMergeDeps["openspecArchive"],
     setBlocked: (async (_cfg, _n, reason, _stage, label) => {
       blockedCalls.push({ reason, label });
     }) as AdvancePreMergeDeps["setBlocked"],
@@ -206,6 +221,12 @@ test("maybeArchiveOpenspec: openspec archive fails on a retitled MODIFIED header
   assert.equal(blockedCalls[0].label, "openspec-invalid");
   assert.match(blockedCalls[0].reason, new RegExp(CHANGE_ID));
   assert.ok(blockedCalls[0].reason.includes(CLI_OUTPUT), "CLI output must appear verbatim in the blocker reason");
+  const diagnostic = (out as { diagnostic?: { reason_code?: string; evidence_key?: string } })?.diagnostic;
+  assert.equal(diagnostic?.reason_code, OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE);
+  assert.equal(
+    diagnostic?.evidence_key,
+    `${OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE}:${CHANGE_ID}:archive_spec_update_failed`,
+  );
 });
 
 // ---------------------------------------------------------------------------

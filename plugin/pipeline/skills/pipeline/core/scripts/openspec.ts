@@ -9,10 +9,9 @@
 //
 // This module is intentionally thin: it shells out via execFile (like gh.ts),
 // reads change folders straight off disk for deterministic discovery, and
-// exposes a PURE parser (parseValidateResult) the tests cover without needing
-// the `openspec` binary. Pass/fail is driven by the CLI's exit code — the
-// documented, CI-friendly contract — with `--json` output parsed best-effort
-// only to surface human-readable issue messages.
+// exposes PURE parsers the tests cover without needing the `openspec` binary.
+// Machine-readable commands require both CLI success and their documented
+// semantic postconditions; an exit code alone is not proof that state changed.
 
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
@@ -190,16 +189,185 @@ export interface ArchiveResult {
   success: boolean;
   unavailable: boolean;
   output: string;
+  /** Stable policy input for engine-owned archive repair. */
+  diagnostic?: ArchiveFailureDiagnostic;
 }
 
-/** `openspec archive <name> --yes` — merges delta specs and moves the change to archive/. */
-export async function archive(dir: string, name: string, timeoutMs = 60_000): Promise<ArchiveResult> {
-  const r = await runOpenspec(dir, ["archive", name, "--yes"], timeoutMs);
+export const OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE = "openspec-archive-apply-conflict" as const;
+
+export interface ArchiveFailureDiagnostic {
+  reasonCode: typeof OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE;
+  evidenceKey: string;
+  /** Exact OpenSpec status code, or a stable wrapper postcondition code. */
+  diagnosticCode: string;
+  message?: string;
+  fix?: string;
+}
+
+export type ArchiveChangeState = "removed" | "present" | "unverified";
+
+export interface ArchiveDeps {
+  run?: (dir: string, args: string[], timeoutMs: number) => Promise<RunResult>;
+  changeState?: (dir: string, name: string) => ArchiveChangeState;
+}
+
+/** Minimum OpenSpec CLI version whose `archive` supports `--json` — 1.5 added
+ *  the machine-readable `{ archive, status }` envelope parseArchiveResult
+ *  requires. */
+export const OPENSPEC_ARCHIVE_JSON_MIN_VERSION = "1.5.0";
+
+/**
+ * Parse the first `major.minor.patch` triple out of `openspec --version`
+ * output (the real CLI prints a bare `1.5.0`). Returns null when no version is
+ * identifiable — the preflight in {@link archive} then treats the probe as
+ * inconclusive and lets the archive call's own result govern.
+ */
+export function parseOpenspecCliVersion(output: string): [number, number, number] | null {
+  const m = output.match(/(\d+)\.(\d+)\.(\d+)/);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+function versionAtLeast(v: [number, number, number], min: [number, number, number]): boolean {
+  for (let i = 0; i < 3; i++) {
+    if (v[i] !== min[i]) return v[i] > min[i];
+  }
+  return true;
+}
+
+interface ArchiveJsonDiagnostic {
+  code?: string;
+  message?: string;
+  fix?: string;
+}
+
+function archiveFailure(
+  name: string,
+  diagnosticCode: string,
+  output: string,
+  diagnostic: ArchiveJsonDiagnostic = {},
+): ArchiveResult {
   return {
-    success: r.code === 0 && !r.unavailable,
-    unavailable: r.unavailable,
-    output: `${r.stdout}${r.stderr}`.trim(),
+    success: false,
+    unavailable: false,
+    output,
+    diagnostic: {
+      reasonCode: OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE,
+      evidenceKey: `${OPENSPEC_ARCHIVE_APPLY_CONFLICT_REASON_CODE}:${name}:${diagnosticCode}`,
+      diagnosticCode,
+      ...(diagnostic.message ? { message: diagnostic.message } : {}),
+      ...(diagnostic.fix ? { fix: diagnostic.fix } : {}),
+    },
   };
+}
+
+/**
+ * Parse `openspec archive --json` and require the named archive plus its
+ * filesystem postcondition. OpenSpec 1.5 emits `{ archive: null, status: [...] }`
+ * for semantic failures, including apply conflicts that human mode reports with
+ * exit 0 after printing "Aborted. No files were changed."
+ */
+export function parseArchiveResult(
+  name: string,
+  code: number,
+  stdout: string,
+  stderr: string,
+  changeState: ArchiveChangeState,
+): ArchiveResult {
+  const output = `${stdout}${stderr}`.trim();
+  let parsed: Record<string, unknown>;
+  try {
+    const value = JSON.parse(stdout.trim()) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return archiveFailure(name, code === 0 ? "archive_json_invalid" : "archive_command_failed", output);
+    }
+    parsed = value as Record<string, unknown>;
+  } catch {
+    return archiveFailure(name, code === 0 ? "archive_json_invalid" : "archive_command_failed", output);
+  }
+
+  const status = Array.isArray(parsed.status)
+    ? parsed.status.find((entry): entry is Record<string, unknown> => !!entry && typeof entry === "object" && !Array.isArray(entry))
+    : undefined;
+  const cliDiagnostic: ArchiveJsonDiagnostic = status
+    ? {
+        ...(typeof status.code === "string" ? { code: status.code } : {}),
+        ...(typeof status.message === "string" ? { message: status.message } : {}),
+        ...(typeof status.fix === "string" ? { fix: status.fix } : {}),
+      }
+    : {};
+
+  if (code !== 0 || cliDiagnostic.code) {
+    return archiveFailure(name, cliDiagnostic.code ?? "archive_command_failed", output, cliDiagnostic);
+  }
+
+  const archiveValue = parsed.archive;
+  if (!archiveValue || typeof archiveValue !== "object" || Array.isArray(archiveValue)) {
+    return archiveFailure(name, cliDiagnostic.code ?? "archive_result_missing", output, cliDiagnostic);
+  }
+  const archiveObject = archiveValue as Record<string, unknown>;
+  if (
+    archiveObject.change !== name ||
+    typeof archiveObject.archivedAs !== "string" ||
+    archiveObject.archivedAs.length === 0
+  ) {
+    return archiveFailure(name, "archive_result_mismatch", output);
+  }
+  if (changeState === "present") {
+    return archiveFailure(name, "archive_active_change_remains", output);
+  }
+  if (changeState === "unverified") {
+    return archiveFailure(name, "archive_active_change_unverified", output);
+  }
+
+  return { success: true, unavailable: false, output };
+}
+
+function archiveChangeState(dir: string, name: string): ArchiveChangeState {
+  try {
+    return fs.statSync(path.join(dir, "openspec", "changes", name)).isDirectory() ? "present" : "unverified";
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? "removed" : "unverified";
+  }
+}
+
+/** `openspec archive <name> --yes --json` — apply deltas and verify the active change left the tree. */
+export async function archive(
+  dir: string,
+  name: string,
+  timeoutMs = 60_000,
+  deps: ArchiveDeps = {},
+): Promise<ArchiveResult> {
+  const run = deps.run ?? runOpenspec;
+  // Capability preflight: `archive --json` requires OpenSpec >= 1.5. A
+  // positively identified older CLI must fail here with an actionable upgrade
+  // diagnostic — feeding its non-JSON usage error into the parse below would
+  // misreport a tooling gap as a generic archive_command_failed apply
+  // conflict and send implementer repair rounds chasing a change that has
+  // nothing wrong with it. An inconclusive probe (unrecognized output or
+  // probe error) falls through to the archive call, whose own result governs.
+  const probe = await run(dir, ["--version"], timeoutMs);
+  if (probe.unavailable) {
+    return { success: false, unavailable: true, output: `${probe.stdout}${probe.stderr}`.trim() };
+  }
+  const cliVersion = probe.code === 0 ? parseOpenspecCliVersion(`${probe.stdout}${probe.stderr}`) : null;
+  if (cliVersion && !versionAtLeast(cliVersion, parseOpenspecCliVersion(OPENSPEC_ARCHIVE_JSON_MIN_VERSION)!)) {
+    const found = cliVersion.join(".");
+    const message =
+      `openspec CLI ${found} does not support \`archive --json\`; ` +
+      `openspec >= ${OPENSPEC_ARCHIVE_JSON_MIN_VERSION} is required`;
+    const fix = `Upgrade the openspec CLI to ${OPENSPEC_ARCHIVE_JSON_MIN_VERSION} or newer, then re-run.`;
+    return archiveFailure(name, "archive_cli_unsupported", `${message}. ${fix}`, { message, fix });
+  }
+  const r = await run(dir, ["archive", name, "--yes", "--json"], timeoutMs);
+  if (r.unavailable) {
+    return {
+      success: false,
+      unavailable: true,
+      output: `${r.stdout}${r.stderr}`.trim(),
+    };
+  }
+  const changeState = (deps.changeState ?? archiveChangeState)(dir, name);
+  return parseArchiveResult(name, r.code, r.stdout, r.stderr, changeState);
 }
 
 export interface InitResult {

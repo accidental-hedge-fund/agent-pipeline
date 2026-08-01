@@ -67,6 +67,10 @@ export interface LoopHumanInputRequest {
   permitted_responses?: string[];
   requested_by_engine: LoopEngineName;
   requested_at: string;
+  /** Present only for a hold proven by a canonical current authority
+   * diagnostic. Reconciliation requires both values to remain candidate-bound. */
+  authority_evidence_key?: string;
+  authority_candidate_head?: string;
   /** Set when this hold was entered because the dispatched item was observed carrying a live
    *  `pipeline:blocked` label (#581, capability `loop-blocked-item-hold-continuation`) — the
    *  discriminator the supervisor's reconciliation-driven re-admission checks before
@@ -139,7 +143,8 @@ export function isDurableBlockerClass(value: unknown): value is DurableBlockerCl
  *  policy entry's `recipes` must draw from. */
 export const RECOVERY_RECIPES = [
   "wait_and_retry",
-  "reauthenticate",
+  "verify_authentication",
+  "repair_pipeline_item",
   "rerun_ci",
   "resync_workflow_state",
   "retry_upstream_check",
@@ -167,8 +172,8 @@ export interface RecoveryPolicyEntry {
   retry_budget: number;
   backoff: RecoveryBackoff;
   terminal_outcome: RecoveryTerminalOutcome;
-  /** When true, this class's block stops the whole run rather than allowing
-   *  dependency-independent items to continue. */
+  /** When true, exhausted recovery terminates the run as `run_fatal`. Before
+   *  exhaustion, independent sibling work remains eligible. */
   run_fatal: boolean;
   /** Consecutive identical-evidence-fingerprint repeats permitted on the same
    *  item before the run stops terminally for repeated no-progress. */
@@ -181,13 +186,13 @@ export interface RecoveryPolicyEntry {
  *  refuses a policy missing any class as a validation failure. */
 export type RecoveryPolicy = Record<DurableBlockerClass, RecoveryPolicyEntry>;
 
-/** The outcome of one recovery attempt on a blocked item. `failed` records a
- *  recovery action that was actually attempted but did not succeed — the item
- *  stays `blocked` and no budget is charged (#509 review round 2 finding
- *  2794f4b6: a caller-reported failure must never be persisted as a
- *  successful resume). */
+/** The durable lifecycle of one recovery action. `started` is written before
+ *  the action runs and consumes its budget unit; a resuming process can then
+ *  complete that same deterministic attempt without charging it again. */
 export type RecoveryAttemptOutcome =
+  | "started"
   | "recovered"
+  | "superseded"
   | "exhausted"
   | "repeated_no_progress"
   | "needs_human"
@@ -199,13 +204,29 @@ export type RecoveryAttemptOutcome =
  *  resume (#509 requirement "Classification, actions, evidence, and outcome
  *  SHALL be persisted and emitted"). */
 export interface LoopRecoveryAttempt {
+  /** Stable idempotency key over item + candidate + evidence + action. */
+  attempt_id: string;
   seq: number;
   time: string;
+  /** Earliest wall-clock time this claimed action may execute. Persisting the
+   *  deadline lets a resumed supervisor honor backoff without blocking sibling
+   *  scheduling or recomputing the delay from process-local state. */
+  not_before?: string;
+  completed_at?: string;
   item_id: string;
   class: DurableBlockerClass;
+  /** Identity of the concrete candidate being repaired (for example a head/base pair). */
+  candidate_identity: string;
+  /** Exactly one action is started and budgeted per attempt. */
+  action: RecoveryRecipe;
+  /** Backward-compatible action-list projection retained for existing consumers. */
   actions: RecoveryRecipe[];
   evidence_fingerprint: string;
   outcome: RecoveryAttemptOutcome;
+  /** Remaining class budget immediately after this action was started. */
+  budget_remaining: number;
+  /** Persisted failure/exhaustion detail; absent for started/recovered attempts. */
+  error?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -500,7 +521,11 @@ export interface LoopItemLedgerEntry {
    *  most recent blocked evidence recorded for this item. */
   evidence_fingerprint?: string;
   /** Consecutive prior blocks whose fingerprint equals `evidence_fingerprint`
-   *  — 0 on first occurrence, reset to 0 whenever the fingerprint changes. */
+   *  — 0 on first occurrence, reset to 0 whenever the fingerprint changes. At
+   *  the class's `repeated_evidence_limit` the supervisor claims no further
+   *  recovery attempt for this item (independent of remaining class budget)
+   *  and records a `repeated_no_progress` stop once no independent sibling is
+   *  schedulable. */
   repeated_evidence_count?: number;
   /** Present only while `state === "waiting"` — the outstanding human-input request a resume
    *  must satisfy. Cleared on a successful resume or abandon. */

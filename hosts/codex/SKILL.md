@@ -51,13 +51,13 @@ The primary invocation is the advance loop; all other operations are available a
 distinct `$pipeline:<command>` entries in the skill menu.
 
 ```
-$pipeline N                              advance loop (default; up to 12 transitions)
+$pipeline N                              durable autonomous one-item drive (default)
 $pipeline N --once                       advance one stage and stop
 $pipeline N --dry-run                    log what would happen; no harness calls, no GitHub writes
 $pipeline N --domain d                   override domain name in lock/log paths
 $pipeline N --base branch                override base branch
 $pipeline N --repo-path path             target a different repo working tree
-$pipeline N --detach                     run the advance loop in a detached background process
+$pipeline N --detach                     legacy raw detached advance; bypasses durable recovery
 
 $pipeline:status <N>                     read-only; print stage, blocker, PR, last review
 $pipeline:unblock <N> "answer"           post answer and clear blocked label
@@ -92,10 +92,10 @@ $pipeline:logs [<run-id>] [--events] [-f]  list or stream run logs (events --fol
 $pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor
 $pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
 $pipeline:loop --audit                   read-only report for the run; no writes
-$pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (default: exit 0 on loop_run_stopped; --no-until-terminal for interrupt-only)
+$pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (default: exit 0 on loop_run_stopped/loop_run_complete)
 $pipeline:loop --audit                   read-only report (process identity, action evidence, per-item stage table); no writes
 $pipeline:loop --resume <run-id> --audit --follow  stream whole-run stage-progress lines (not harness stdout)
-$pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run\'s events.jsonl (default: exit 0 on loop_run_stopped; --no-until-terminal for interrupt-only)
+$pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run\'s events.jsonl (default: exit 0 on loop_run_stopped/loop_run_complete)
 $pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent)
 $pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
 $pipeline scoreboard --bucket day|week   add a chronological day/week time-series to the scoreboard report
@@ -527,7 +527,7 @@ stream. **Codex never requires Claude `PushNotification`.**
 | **Grok** | Host `monitor` on material-filtered stream (each line = bubble); no `PushNotification` | Claude overlay Grok substitute / future `hosts/grok` (#731) |
 | **Codex** | Poll/follow material stream; **concise chat/status updates** on each material line | This file's §4.c–d |
 
-Re-arm material follow after wait cancel until `run_complete` / `loop_run_stopped`
+Re-arm material follow after wait cancel until `loop_run_complete` / `loop_run_stopped`
 (full re-attach semantics: #725). Dual-follow density demotion remains #611.
 
 #### a. Status pre-check (fast, synchronous)
@@ -536,23 +536,24 @@ Re-arm material follow after wait cancel until `run_complete` / `loop_run_stoppe
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs <N> --status
 ```
 
-Confirms target exists, has a `pipeline:*` label, isn't already at a
-terminal/blocked state. If anything looks wrong, surface it and stop —
-do not start an advance.
+Confirms the target exists and has a `pipeline:*` label. A `blocked` label is
+**not** a reason to stop: it is input to the durable recovery controller. Stop
+only for an invalid target or a genuinely terminal issue state.
 
-#### b. Launch the advance through detached run-store mode
+#### b. Launch the durable one-item controller
 
 ```bash
 cd <repo_dir>
-RUN_DIR=$(node ~/.codex/skills/pipeline/scripts/pipeline.mjs run <N> --detach)
-cat "$RUN_DIR/run-store.json"
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs single <N>
 ```
 
-This command returns quickly. `RUN_DIR` is a supervision wrapper under
-`~/.pipeline/runs/...`; `run-store.json` points at the canonical
-`.agent-pipeline/runs/<run-id>/` run store. Use that `run_store_run_id` for all
-log and summary commands below. Do not leave a live pipeline session running
-when the Codex turn ends.
+Start it with Codex's nonblocking command runner and retain the process/session
+handle. Do not use `pipeline run <N> --detach` for the default `$pipeline N`
+path: that command drives the raw advance state machine and bypasses durable
+recovery. `pipeline single` prints an early `loop_run_handoff` JSON line after
+it owns the durable lock and before the first child dispatch. Read `run_id` and
+`events` from that line, then keep the controller process supervised until it
+exits.
 
 #### c. Poll structured run events (material filter preferred)
 
@@ -564,41 +565,31 @@ available for diagnostics:
 
 ```bash
 # Preferred — material one-liners for chat/status notify
-node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow \
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop logs <run-id> --events --follow \
   | node ~/.codex/skills/pipeline/scripts/material-filter.mjs
 
 # Diagnostic fallback — full unfiltered events.jsonl
-node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
-# default until-terminal: process exits 0 after a run_complete event is printed
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop logs <run-id> --events --follow
+# default until-terminal: exits 0 after loop_run_complete or loop_run_stopped
 # interrupt-only dashboards: add --no-until-terminal
 ```
 
-`--events` follows `.agent-pipeline/runs/<run-id>/events.jsonl`, the canonical
-structured stream for lifecycle, gate, blocker, PR, review, accounting, and
-completion events. It is not a grep-filtered terminal log and it is not a
-separate `/tmp` transitions artifact. The material filter never rewrites the
-run store. **Re-arm** material follow after interruption until `run_complete`
-(#725).
+This follows the durable loop's `events.jsonl`. Per-advance details remain
+linked by `loop_item_advance_linked`; use its `pipeline_run_id` with
+`pipeline logs <advance-run-id> --events --follow` only for diagnostics. The
+material filter never rewrites either run store. Re-arm the loop follow after
+interruption until `loop_run_complete` or `loop_run_stopped`.
 
 **Supervise-until-terminal (non-interactive):** wait on process exit, then
 summary:
 
 ```bash
-node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow \
-  && node ~/.codex/skills/pipeline/scripts/pipeline.mjs summary <run-id>
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop logs <run-id> --events --follow
 ```
 
-**Fallback — raw terminal output:** If you need the full combined output, follow
-`terminal.log` from the same run store (interrupt-only — no auto-exit on
-`run_complete`):
-
-```bash
-node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --follow
-```
-
-Do not create or recommend extra `/tmp/pipeline-<domain>-<N>.log` files for
-normal monitoring. If a human manually redirects output for local debugging,
-that file is scratch output, not the pipeline evidence contract.
+After terminal loop evidence appears, wait for the retained `pipeline single`
+process and read its final JSON result. Do not leave the controller process
+running when the Codex turn ends.
 
 #### d. User-visible progress updates (notify via host map)
 
@@ -607,15 +598,14 @@ host map entry — never Claude `PushNotification`). The state machine has only
 a bounded number of stage transitions, so this gives enough signal without
 flooding the user.
 
-Material advance kinds (aligned with `scripts/material-filter.mjs` → `core/scripts/material-filter.ts`):
-- `run_start`
-- `stage_start`
-- `stage_complete`
-- `pr_created` / `pr_updated`
-- `review_verdict`
-- `gate_result` (filter suppresses repeated CI `partial` and OpenSpec `skipped` spam)
-- `blocker_set` / `blocker_cleared`
-- `run_complete`
+Material loop kinds include item start/transition/block, advance linkage and
+completion, stage/gate progress, recovery attempts, and
+`loop_run_complete` / `loop_run_stopped`. The shared filter suppresses repeated
+CI waiting and OpenSpec skipped events.
+
+Linked advance diagnostics use the same shared material set: `run_start`,
+`stage_start`, `stage_complete`, `pr_created`, `pr_updated`, `review_verdict`,
+`gate_result`, `blocker_set`, `blocker_cleared`, and `run_complete`.
 
 Examples to suppress or summarize (shared filter):
 - **Repeated polling-loop sub-events** — `pre_merge.advancePolling`
@@ -629,51 +619,48 @@ Examples to suppress or summarize (shared filter):
 A cancelled, interrupted, timed-out, or lost follow/wait is **not** a terminal
 pipeline outcome and must **not** be treated as “stop watching.” Tool cancel,
 wait timeout, and session pause do **not** mean the advance finished.
-Supervision ends only after confirmed `run_complete` / sentinel completion
+Supervision ends only after confirmed `loop_run_complete` /
+`loop_run_stopped` and controller-process completion
 (or an explicit operator decision to abandon watching a still-live run,
 outside the default happy path).
 
-When a host follow/wait ends **before** `run_complete` / sentinel completion,
+When a host follow/wait ends **before** a terminal loop event,
 act **in the same harness turn**:
 
-1. **Liveness** — check whether the detached run is still live or already
-   terminal via at least one of: wrapper `$RUN_DIR/sentinel.json`,
-   `run_complete` in events / finalized summary, `pipeline status <N>`, or
-   process liveness if you still hold the detach pid.
-2. **If already terminal** — skip re-follow; run `pipeline summary <run-id>`,
-   emit the final operator summary, and stop any remaining follows for that
-   run. Do not leave the operator without a terminal handoff.
+1. **Liveness** — check the retained controller process and the durable loop
+   stream for `loop_run_complete` / `loop_run_stopped`.
+2. **If already terminal** — skip re-follow, wait for the controller process,
+   and emit its final JSON result.
 3. **If still live or not confirmed terminal** — re-arm
-   `pipeline logs <run-id> --events --follow` (same run-store `run_id`),
-   continue until `run_complete` / sentinel completion.
+   `pipeline loop logs <run-id> --events --follow`, then continue until a
+   terminal loop event.
 4. **Then** emit the final summary and stop follows (step f).
 
 **Operator re-attach path** (run-store ids only — not `/tmp` scratch logs):
 
 ```bash
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs status <N>
-node ~/.codex/skills/pipeline/scripts/pipeline.mjs logs <run-id> --events --follow
-node ~/.codex/skills/pipeline/scripts/pipeline.mjs summary <run-id>
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop logs <run-id> --events --follow
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audit
 ```
 
 #### f. Finish the run (same turn)
 
-When a `run_complete` event appears, or when the wrapper
-`$RUN_DIR/sentinel.json` reports completion — including after one or more
-re-attach cycles — stop polling/following and, in the same harness turn,
-surface the final summary. Do not leave follows open until the operator asks.
+When `loop_run_complete` or `loop_run_stopped` appears, including after one or
+more re-attach cycles, stop the follow, wait for the retained controller
+process, and surface its final result in the same harness turn.
 
 #### g. Final summary
 
-Read the run-store summary and surface inline:
+Surface the terminal JSON printed by `pipeline single`; optionally add the
+read-only durable audit:
 
 ```bash
-node ~/.codex/skills/pipeline/scripts/pipeline.mjs summary <run-id>
+node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audit
 ```
 
-Include starting stage, ending stage, transitions made, wall-clock elapsed, PR
-URL if one was opened, the terminal state, and the merge-next-step note that
-the pipeline does not auto-merge.
+Include recovery actions attempted, final item state, the linked advance/PR
+evidence, and the merge-next-step note that the pipeline does not auto-merge.
 
 ### 4b. Orchestration pattern for `$pipeline:loop` (multi-item durable drive/resume)
 
@@ -850,26 +837,28 @@ Then resolve the events file:
 
 Poll or follow the loop events file **as soon as** `run_id` is known (step b) —
 do not wait for supervisor exit — and summarize material lifecycle records.
-Prefer the first-class CLI (exits 0 on `loop_run_stopped` by default) **piped
+Prefer the first-class CLI (exits 0 on `loop_run_stopped` or
+`loop_run_complete` by default) **piped
 through the shared material filter** for host notify:
 
 ```bash
 # Preferred — material one-liners (apply the same filter to dual-follow advance streams)
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow \
   | node ~/.codex/skills/pipeline/scripts/material-filter.mjs
-# default until-terminal: process exits 0 after loop_run_stopped
+# default until-terminal: process exits 0 after loop_run_stopped/loop_run_complete
 # interrupt-only dashboards: add --no-until-terminal
 
 # Diagnostic fallback — full unfiltered loop events.jsonl
 node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow
 ```
 
-**Re-arm** material follow after wait cancel until `loop_run_stopped` (#725).
+**Re-arm** material follow after wait cancel until `loop_run_stopped` or
+`loop_run_complete` (#725).
 
 **Do not** use a bare `tail -F` on `events.jsonl` as a follow fallback: it never
-exits after `loop_run_stopped`, prints no final summary, and leaves zombie
+exits after a terminal loop event, prints no final summary, and leaves zombie
 follows. Prefer the CLI above. Dual-follow / multi-stream scripts **must
-`exit 0`** after observing `loop_run_stopped` and printing a final summary line
+`exit 0`** after observing either terminal kind and printing a final summary line
 (do not print `TERMINAL` inside `while true` and keep looping). Any raw tail
 must **explicitly track** its tail child PID and **TERM/KILL** that child on
 terminal — process substitution + bare `exit 0` orphans `tail -F`. Example
@@ -899,7 +888,7 @@ trap stop_tail EXIT INT TERM
 while IFS= read -r line; do
   printf '%s\n' "$line"
   case "$line" in
-    *'"kind":"loop_run_stopped"'*|*'"kind": "loop_run_stopped"'*)
+    *'"kind":"loop_run_stopped"'*|*'"kind": "loop_run_stopped"'*|*'"kind":"loop_run_complete"'*|*'"kind": "loop_run_complete"'*)
       reason=$(printf '%s' "$line" | sed -n 's/.*"reason"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
       echo "TERMINAL reason=${reason:-stopped}; follows stopped"
       stop_tail
@@ -993,6 +982,7 @@ notify packaging change (#742) does **not** replace #611 or #725.
 - `loop_item_advance_linked` / `loop_item_advance_finished`
 - `loop_item_stage_progress` (when present)
 - `loop_run_stopped`
+- `loop_run_complete`
 
 **Should surface** when present (not spam; material filter applies):
 

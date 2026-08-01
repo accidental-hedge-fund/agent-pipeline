@@ -46,6 +46,18 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
+  // Canonical one-item autonomous drive. Unlike `advance`, this command owns a
+  // durable one-item loop and delegates each whole-item attempt back through
+  // the normal advance state machine.
+  single: {
+    needsIssueNumber: true,
+    allowedFlags: new Set(["repoPath", "base", "profile"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
   init: {
     needsIssueNumber: false,
     allowedFlags: new Set(["repoPath", "base", "profile", "init"]),
