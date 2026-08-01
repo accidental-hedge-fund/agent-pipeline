@@ -26,42 +26,81 @@ When the OpenSpec flow is active, planning SHALL author an OpenSpec change (a `p
 - **THEN** an `openspec/changes/<id>/` directory SHALL be created with proposal/tasks/spec-delta artifacts and committed
 
 ### Requirement: Structural validation gates the change
-The change SHALL be validated with `openspec validate` at draft and again after revision; a validation failure SHALL block rather than advance.
 
-#### Scenario: invalid change blocks
-- **WHEN** the authored or revised change fails `openspec validate`
-- **THEN** the stage SHALL block rather than proceed to implementation
+The change SHALL be validated with `openspec validate` at draft and again after revision. A
+validation failure SHALL emit a canonical `implementation-ci` stage diagnostic with blocker kind
+`openspec-invalid`, a reason containing the exact bounded CLI output, change id, and validation
+phase, plus a stable evidence key. The stage SHALL return that diagnostic through the whole-item
+response. Before terminalizing the run, the outer recovery controller SHALL route it through the
+shared bounded remediation transaction when its keyed budget permits, then redispatch the whole
+item so validation runs against the resulting current candidate. The item SHALL proceed only after
+validation passes. Exhausted validation repair SHALL remain an engine-owned artifact failure and
+SHALL NOT emit `human_intervention` without separate current authority evidence.
+
+#### Scenario: Invalid change receives bounded repair before terminal block
+
+- **WHEN** the authored or revised change fails `openspec validate` and an artifact-repair attempt
+  remains for the diagnostic key
+- **THEN** the stage SHALL return the exact recoverable diagnostic before terminalizing
+- **AND** the outer controller SHALL repair and redispatch the item so validation re-runs against
+  the current candidate
+
+#### Scenario: Exhausted invalid change remains blocked but not human-owned
+
+- **WHEN** structural validation still fails after the keyed repair budget is exhausted
+- **THEN** the stage SHALL remain blocked with the exact canonical OpenSpec diagnostic
+- **AND** it SHALL NOT create a needs-human authority hold or emit `human_intervention` solely for
+  the validation failure
 
 ### Requirement: Archive into living specs at finalize
 
-At pre-merge the change SHALL be archived (`openspec archive`) — folding its spec deltas into `openspec/specs/` and moving the change under `openspec/changes/archive/` — and `openspec validate --all` SHALL pass before the item reaches `ready-to-deploy`. Before calling `openspec archive`, the pre-merge stage SHALL run a consistency guard that blocks a stale-delta archive. The guard SHALL block when ALL of: (1) a non-pipeline commit on the branch changed implementation files in a commit ordered after the last commit that changed the change's `specs/**` (order-aware file-path check), AND (2) the most recent review verdict contains a finding tagged with the structured category `spec-divergence`. The guard SHALL read condition (2) from the structured category marker emitted into the review comment, and SHALL NOT infer divergence by keyword-matching the reviewer's free-text prose.
+At pre-merge the change SHALL be archived by `openspec archive` in machine-readable mode, folding
+its deltas into `openspec/specs/` and moving it under `openspec/changes/archive/`, and
+`openspec validate --all` SHALL pass before the item reaches `ready-to-deploy`. Archive success
+SHALL require both an explicit successful result for every intended change id and verification that
+each corresponding active change directory is absent from the authoritative post-archive
+candidate. Before archive, the pre-merge stage SHALL run the existing stale-delta consistency guard:
+it SHALL block when both a later non-pipeline implementation commit exists after the last delta-spec
+commit and the current structured review verdict carries `category: spec-divergence`. The guard
+SHALL read the category marker and SHALL NOT infer divergence from reviewer prose.
 
-#### Scenario: archive on finalize when spec and code are consistent
+#### Scenario: Archive on finalize when spec and code are consistent
 
-- **WHEN** an OpenSpec-active item reaches pre-merge
-- **AND** the consistency guard does not detect a code-spec divergence
-- **THEN** its change SHALL be archived into the living specs and `openspec validate --all` SHALL pass before advancing
+- **WHEN** an OpenSpec-active item reaches pre-merge and the consistency guard does not detect a
+  code-spec divergence
+- **THEN** each active change SHALL be archived in machine-readable mode
+- **AND** explicit archive results, active-directory removal, and `openspec validate --all` SHALL be
+  verified before advancing
 
-#### Scenario: pre-merge blocks when code moved but spec did not and a finding is tagged spec-divergence
+#### Scenario: Archive output without active-directory removal is not success
 
-- **WHEN** an OpenSpec-active item reaches pre-merge
-- **AND** a non-pipeline commit changed implementation files after the last commit that changed the change's `specs/**`
-- **AND** the most recent review verdict contains a finding tagged `category: spec-divergence`
-- **THEN** the pre-merge stage SHALL block with a reason naming the stale-delta condition
-- **AND** SHALL NOT call `openspec archive`
+- **WHEN** the archive command exits successfully but an intended change directory remains active
+  on the authoritative candidate
+- **THEN** the archive gate SHALL emit a canonical `implementation-ci` diagnostic with blocker kind
+  `openspec-invalid` and remain blocked
+- **AND** it SHALL NOT record archive success or advance
 
-#### Scenario: pre-merge proceeds when no finding is tagged spec-divergence
+#### Scenario: Pre-merge blocks when code moved but spec did not and a finding is tagged spec-divergence
 
-- **WHEN** an OpenSpec-active item reaches pre-merge
-- **AND** implementation files changed but the change's `specs/**` did not
-- **AND** no review finding is tagged `category: spec-divergence` (even if a finding's prose mentions "diverges" or "spec")
-- **THEN** the consistency guard SHALL NOT block
-- **AND** the archive step SHALL proceed normally
+- **WHEN** a non-pipeline commit changed implementation files after the last commit that changed
+  the change's `specs/**`
+- **AND** the most recent review verdict contains `category: spec-divergence`
+- **THEN** pre-merge SHALL remain blocked with a diagnostic naming the stale-delta condition
+- **AND** it SHALL NOT call `openspec archive`
 
-#### Scenario: the consistency guard ignores prose
+#### Scenario: Pre-merge proceeds when no finding is tagged spec-divergence
 
-- **WHEN** the most recent review verdict contains a finding whose body mentions a spec divergence in prose but carries no `category: spec-divergence` marker
-- **THEN** the consistency guard SHALL treat it as no divergence flag and SHALL NOT block on that basis
+- **WHEN** implementation files changed but the change's `specs/**` did not
+- **AND** no review finding is tagged `category: spec-divergence`
+- **THEN** the consistency guard SHALL NOT block on code/delta ordering alone
+- **AND** archive evaluation SHALL proceed normally
+
+#### Scenario: The consistency guard ignores prose
+
+- **WHEN** a current review finding mentions spec divergence in prose but carries no structured
+  `category: spec-divergence` marker
+- **THEN** the consistency guard SHALL treat it as no divergence flag
+- **AND** it SHALL NOT block on that prose alone
 
 ### Requirement: Bootstrap is opt-in
 When the flow is active on a repo lacking an `openspec/` workspace, planning SHALL run `openspec init` only if `cfg.openspec.bootstrap` is `true`; otherwise it SHALL block with an actionable message rather than silently proceeding.
@@ -327,16 +366,36 @@ When the worktree for the issue cannot be found on disk while the OpenSpec flow 
 
 ### Requirement: A failed `openspec archive` SHALL block pre-merge with the CLI output surfaced verbatim
 
-When `openspec archive <id>` exits non-zero (for example because a `## MODIFIED Requirements` header in the change's delta does not exist in the living spec, which the CLI reports as a header-not-found error), the pre-merge stage SHALL call `setBlocked` with stage `pre-merge` and type `openspec-invalid`, SHALL include the change id and the CLI's output verbatim in the blocking reason, SHALL return `{ advanced: false, status: "blocked" }`, and SHALL NOT advance toward `ready-to-deploy` with the change left active.
+Pre-merge SHALL, when `openspec archive <id>` exits nonzero, returns a non-success machine-readable
+result, or leaves the change active, emit a canonical `implementation-ci` diagnostic with blocker
+kind `openspec-invalid`, a reason containing the change id, archive result, and exact bounded
+stdout/stderr, plus a stable evidence key.
+It SHALL remain blocked and SHALL NOT advance toward `ready-to-deploy`. Before terminalizing the
+run, the outer controller SHALL enter the shared bounded remediation transaction for that keyed
+diagnostic when budget remains, then redispatch the item to re-evaluate archive preconditions and
+archive the current candidate. A failed or no-action repair SHALL consume its claimed budget.
+Exhaustion SHALL produce a typed engine-owned failure and SHALL NOT create a human-authority hold
+without separate current authority evidence.
 
-#### Scenario: archive fails on a retitled MODIFIED requirement
+#### Scenario: Archive fails on a retitled MODIFIED requirement
 
-- **WHEN** `openspec archive <id>` exits non-zero with output reporting that a requirement header was not found in the living spec
-- **THEN** pre-merge SHALL block with type `openspec-invalid`
-- **AND** the blocking reason SHALL contain the change id and the CLI output verbatim
+- **WHEN** `openspec archive <id>` reports that a modified requirement header is absent from the
+  living spec
+- **THEN** pre-merge SHALL emit a canonical `implementation-ci` diagnostic containing the change
+  id and exact CLI output in its bounded reason
 - **AND** the item SHALL NOT reach `ready-to-deploy`
 
----
+#### Scenario: Archive failure receives one keyed repair path
+
+- **WHEN** a canonical OpenSpec archive diagnostic has an eligible repair attempt
+- **THEN** pre-merge SHALL return that exact diagnostic to the outer recovery controller
+- **AND** the controller SHALL remediate and redispatch only within the durable keyed budget
+
+#### Scenario: Failed artifact repair consumes budget without human intervention
+
+- **WHEN** a started artifact repair fails
+- **THEN** the attempt SHALL remain charged and its exact error SHALL be recorded
+- **AND** no `human_intervention` SHALL be emitted solely for that engine-owned failure
 
 ### Requirement: The pre-merge archive decision SHALL be recorded as run evidence
 

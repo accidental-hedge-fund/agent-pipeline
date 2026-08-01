@@ -100,74 +100,71 @@ require an OpenSpec change and tests, not an undocumented string add.
 
 ### Requirement: Pre-merge SHALL perform at most one auto-fix attempt per entry
 
-The pipeline SHALL perform **at most one** auto-fix attempt for a given pre-merge blocking delta
-review. An auto-fix attempt SHALL count whether it produces a fix commit **or** ends in a confirmed
-clean no-commit outcome (`headAfter === headBefore` with nothing salvageable). After a successful
-auto-fix commit the pipeline SHALL re-run the delta review exactly once against the new head; if
-that re-review still returns blocking findings the pipeline SHALL set `blocked`/`needs-human` and
-SHALL NOT attempt a second auto-fix. After a clean no-commit outcome the pipeline SHALL re-verify
-the findings against the current head exactly once (see the clean-noop re-verify requirement) and
-SHALL NOT attempt a second auto-fix. The bound SHALL be crash-safe: the durable marker SHALL be either the auto-fix commit
-(documented subject prefix) **or** a trusted durable record of an auto-fix attempt at the head
-SHA. The pipeline SHALL post an **attempt-started** durable record (for example a
-pipeline-authored audit comment or sentinel that survives process restart and host switch)
-**before** invoking the implementer harness, so a process crash mid-harness or a failure to
-persist the post-noop completion marker still exhausts the bound on re-entry. A post-noop
-completion marker MAY still be recorded for evidence, but the one-attempt bound MUST NOT depend
-on it alone. When the attempt-started record cannot be posted, the pipeline SHALL NOT invoke the
-harness and SHALL fail closed (escalate) so an unbound attempt is never started.
+The pipeline SHALL perform at most one implementer auto-fix attempt for a pre-merge blocking delta
+review at a given authoritative candidate identity. In the pre-merge stage the durable attempt key
+SHALL be the issue plus the candidate head SHA, recorded as a trusted pipeline-attested
+attempt-started (or noop-clean) PR comment marker and detectable via the auto-fix commit-subject
+prefix — not a worktree marker alone. On the durable loop supervisor's repair path the ledger
+attempt SHALL be keyed by item, candidate identity, evidence fingerprint, and repair action.
+Candidate-currency checks, worktree lookup, safe rematerialization, synchronization, and clean-tree
+checks SHALL be preflight and SHALL NOT consume the implementer repair attempt. Immediately before
+invoking the implementer, the pipeline SHALL durably claim and charge the attempt. A successful
+commit, confirmed clean no-op, harness failure, timeout, unsafe no-action, or process death after
+claim SHALL consume that attempt. After a successful commit the pipeline SHALL re-run delta review
+exactly once against the new head. After a clean no-op it SHALL re-verify exactly once. A candidate
+identity change SHALL supersede the old attempt and require fresh eligibility computation; it SHALL
+not mutate or replay the old candidate.
 
-#### Scenario: fix resolves the finding — pre-merge proceeds
+#### Scenario: Fix resolves the finding and pre-merge proceeds
 
-- **WHEN** the auto-fix attempt commits a fix and the single re-run delta review returns `approve`
-  (or all findings fall below the active `review_policy`)
-- **THEN** the pipeline SHALL return without blocking (pre-merge proceeds)
-- **AND** SHALL NOT attempt a further auto-fix
+- **WHEN** a claimed auto-fix commits a repair and the single re-run delta review approves under
+  active policy
+- **THEN** pre-merge SHALL proceed without another auto-fix attempt for the old candidate
+- **AND** the prior evidence SHALL remain bound to that candidate
 
-#### Scenario: fix does not resolve the finding — escalate, no second attempt
+#### Scenario: Fix does not resolve the finding and consumes the attempt
 
-- **WHEN** the auto-fix attempt commits a fix but the single re-run delta review still returns
-  blocking findings
-- **THEN** the pipeline SHALL set `blocked`/`needs-human`
-- **AND** SHALL NOT invoke the auto-fix harness a second time
+- **WHEN** a claimed auto-fix commits but the single re-run still reports blocking findings
+- **THEN** the keyed attempt SHALL remain consumed
+- **AND** the item SHALL return a typed blocked diagnostic without a second implementer invocation
 
-#### Scenario: prior auto-fix commit is recognized after a restart
+#### Scenario: Prior charged attempt is recognized after restart
 
-- **WHEN** the developer commits since the last reviewed SHA already include a pre-merge auto-fix
-  commit (recognized by its documented subject prefix)
-- **AND** the current delta review still returns blocking findings
-- **THEN** the pipeline SHALL set `blocked`/`needs-human`
-- **AND** SHALL NOT invoke the auto-fix harness again for this entry
+- **WHEN** a prior auto-fix commit subject, or a trusted attested attempt-started or noop-clean
+  marker, exists for the same issue and candidate head — or, on the durable supervisor's repair
+  path, the ledger contains a claimed or completed attempt for the same item, candidate identity,
+  evidence fingerprint, and action
+- **AND** the finding remains blocking
+- **THEN** the pipeline SHALL NOT invoke the implementer again for that key
+- **AND** it SHALL reconcile the recorded attempt result before choosing the next disposition
 
-#### Scenario: prior clean no-op auto-fix is recognized without a second attempt
+#### Scenario: Prior clean no-op is reverified without a second attempt
 
-- **WHEN** a trusted durable record shows a pre-merge auto-fix already attempted at the current
-  head with a clean no-commit (noop-clean) outcome
-- **AND** the current delta review still returns blocking findings
-- **THEN** the pipeline SHALL set `blocked`/`needs-human`
-- **AND** SHALL NOT invoke the auto-fix harness again for this entry
+- **WHEN** a charged attempt at the current candidate ended in confirmed clean no-op
+- **AND** the finding remains under evaluation
+- **THEN** the pipeline SHALL run the single current-head reverify path
+- **AND** it SHALL NOT invoke the implementer again for that key
 
-#### Scenario: prior attempt-started record is recognized without a second attempt
+#### Scenario: Process death after claim does not grant a free retry
 
-- **WHEN** a trusted durable attempt-started record exists for the current head (even when no
-  noop-clean completion marker or auto-fix commit is present)
-- **AND** the current delta review still returns blocking findings
-- **THEN** the pipeline SHALL set `blocked`/`needs-human`
-- **AND** SHALL NOT invoke the auto-fix harness again for this entry
+- **WHEN** the process dies after charging the attempt and before recording its result
+- **THEN** resume SHALL reconcile live candidate and postconditions against that attempt
+- **AND** it SHALL not create an uncharged second implementer attempt
 
-#### Scenario: noop completion marker post fails after harness — bound still holds
+#### Scenario: Preflight failure does not consume implementer repair
 
-- **WHEN** the harness ends noop-clean and posting the noop-clean completion marker fails
-- **AND** the attempt-started durable record was already posted for that head
-- **THEN** a later pre-merge entry at the same head SHALL NOT invoke the auto-fix harness again
-- **AND** the current entry SHALL still re-verify (or fail closed) rather than treating the
-  marker-post failure as an unbound retry
+- **WHEN** candidate-currency, rematerialization, synchronization, or clean-tree preflight fails
+  before the implementer claim
+- **THEN** no implementer repair unit SHALL be consumed
+- **AND** the preflight failure SHALL surface its own diagnostic — a typed `worktree-missing`,
+  `worktree-capacity`, or `worktree-creation-failed` blocker for rematerialization failures, and
+  the auto-fix error outcome for a dirty pre-fix tree
 
-#### Scenario: attempt-started post fails — harness not invoked
+#### Scenario: Claim persistence failure prevents implementer invocation
 
-- **WHEN** the pipeline cannot post the attempt-started durable record before the harness
-- **THEN** the pipeline SHALL NOT invoke the implementer harness
-- **AND** SHALL escalate fail-closed for that entry
+- **WHEN** the pipeline cannot durably claim and charge the attempt
+- **THEN** it SHALL NOT invoke the implementer harness
+- **AND** it SHALL return a typed engine-owned persistence failure
 
 ### Requirement: The pre-merge auto-fix SHALL reuse the surgical-fix prompt and roll back on failure
 
@@ -543,38 +540,49 @@ from still-broken post-attempt re-delta blocks.
 
 ### Requirement: Pre-merge auto-fix SHALL rematerialize a missing managed worktree before implementer work
 
-When the pre-merge auto-fix path is eligible (allowlisted subset non-empty, implementer harness configured, no prior auto-fix attempt marker at the entry head) — including residual re-entry auto-fix after a prior park via `reuseBlockedBy` / `enforceReviewShaGate` — and the issue’s managed worktree is not on disk, the pipeline SHALL attempt rematerialize via `ensureManagedWorktree` (see `worktree-rematerialize`) before invoking the implementer harness or returning an auto-fix failure status.
+When pre-merge auto-fix is eligible and the managed worktree is absent, the pipeline SHALL first
+reconcile the open PR head and candidate identity and then attempt safe rematerialization through
+`ensureManagedWorktree`. Rematerialization and synchronization SHALL occur before the implementer
+attempt is claimed, so their failure SHALL not consume the single implementer repair unit. Success
+SHALL continue into the same shared auto-fix transaction on the recreated path. Failure SHALL emit
+a typed `worktree-missing`, `worktree-capacity`, or `worktree-creation-failed` diagnostic
+with exact evidence and enter the controller's bounded preflight recovery. It SHALL not collapse to
+a bare error or product needs-human hold. Normal delta auto-fix and residual re-entry SHALL use the
+same production closure and reconciliation seam.
 
-On rematerialize success, auto-fix SHALL proceed with the recreated path. On rematerialize failure, the path SHALL surface a typed worktree / rematerialize failure — via a distinct autofix result (`rematerialize-failed` carrying the seam's `blockerKind`) — with a diagnostic that names the rematerialize failure. `enforceReviewShaGate` (residual re-entry and normal delta autofix routing) SHALL park with that worktree blocker kind (`worktree-missing`, `worktree-creation-failed`, or `worktree-capacity`). It SHALL NOT collapse rematerialize failure into a bare `{ status: "error" }` that is indistinguishable from product residual judgment, and SHALL NOT use a product `needs-human` park whose sole root cause is rematerialize failure after a missing tree.
+#### Scenario: Residual re-entry rematerializes then runs implementer
 
-Both the normal delta-review autofix path and the residual re-entry path SHALL share the same production autofix closure (or the same injected seam) so rematerialize cannot be wired for one entry and omitted for the other.
+- **WHEN** residual re-entry auto-fix is eligible, the managed worktree is absent, and safe
+  rematerialization succeeds for the current PR head
+- **THEN** the pipeline SHALL claim and invoke auto-fix on the recreated path
+- **AND** it SHALL not fail solely because the worktree was initially absent
 
-#### Scenario: Residual re-entry autofix rematerializes then runs implementer
+#### Scenario: Missing worktree enters typed recovery only after rematerialize fails
 
-- **WHEN** residual re-entry auto-fix is eligible for an allowlisted blocking subset
-- **AND** on-disk worktree lookup returns no worktree
-- **AND** rematerialize succeeds
-- **THEN** the pipeline SHALL invoke the auto-fix path with the recreated worktree
-- **AND** SHALL NOT return auto-fix `error` solely because the worktree was initially missing
+- **WHEN** auto-fix is eligible, the worktree is absent, and safe rematerialization fails
+- **THEN** the path SHALL return a typed worktree diagnostic containing the rematerialization error
+- **AND** it SHALL not return a bare error or infer human authority
 
-#### Scenario: Missing worktree blocks residual autofix only after rematerialize fails
+#### Scenario: Rematerialization failure does not consume implementer repair
 
-- **WHEN** residual re-entry auto-fix is eligible
-- **AND** on-disk worktree lookup returns no worktree
-- **AND** rematerialize fails
-- **THEN** the auto-fix path SHALL fail with status `rematerialize-failed` (or equivalent typed result) carrying the seam's worktree `blockerKind` and a diagnostic naming rematerialize / worktree creation failure
-- **AND** `enforceReviewShaGate` residual re-entry SHALL `setBlocked` / return blocked with that worktree kind — not bare `needs-human`
-- **AND** a durable rematerialize fail event SHALL be recorded when a run dir is present
-- **AND** the failure SHALL NOT be a bare empty `{ status: "error" }` with no rematerialize diagnostic
+- **WHEN** rematerialization fails before an implementer attempt is claimed
+- **THEN** the implementer repair budget SHALL remain unchanged
+- **AND** the worktree recovery policy SHALL account for its own bounded attempt
 
-#### Scenario: Present worktree skips rematerialize and runs autofix as today
+#### Scenario: Present worktree skips rematerialize and runs auto-fix
 
-- **WHEN** auto-fix is eligible and a managed worktree is already on disk
-- **THEN** the pipeline SHALL NOT recreate the worktree solely for auto-fix
-- **AND** SHALL run the existing bounded auto-fix attempt on that path
+- **WHEN** auto-fix is eligible and a managed worktree already exists for the current candidate
+- **THEN** the pipeline SHALL not recreate it solely for auto-fix
+- **AND** it SHALL continue through clean-tree preflight and the bounded implementer claim
 
-#### Scenario: Normal delta autofix shares the same rematerialize seam
+#### Scenario: Normal delta and residual re-entry share rematerialization
 
-- **WHEN** the normal pre-merge delta auto-fix path is eligible and the worktree is missing
-- **THEN** the same `ensureManagedWorktree` seam used by residual re-entry SHALL run before implementer work
+- **WHEN** either normal delta auto-fix or residual re-entry needs an absent worktree
+- **THEN** both SHALL use the same `ensureManagedWorktree` and current-identity reconciliation seam
+
+#### Scenario: Candidate movement prevents stale rematerialization mutation
+
+- **WHEN** live reconciliation observes that the PR head changed before rematerialization or repair
+- **THEN** the old attempt SHALL be superseded before any mutation
+- **AND** eligibility SHALL be recomputed against the new head
 
