@@ -414,17 +414,39 @@ export const HEALTHY_WRITE_HEALTH: WriteHealthRecord = {
   exclusive_fallback_succeeded: false,
 };
 
-/** Event types that recovery / authority disposition depends on. */
+/**
+ * Event types that recovery / authority disposition depends on.
+ * Includes run-store control records and loop control-plane kinds that may be
+ * classified through this helper (or bridged onto the same criticality API).
+ */
 const CONTROL_CRITICAL_EVENT_TYPES = new Set<string>([
+  // Blocker + stage-diagnostic evidence (diagnostic is nested on blocker_set;
+  // standalone type name reserved so a separate emit path cannot default to best-effort)
   "blocker_set",
   "blocker_cleared",
-  "run_complete",
+  "stage_diagnostic",
   "human_intervention",
+  // Recovery claim / result (run-store path + loop recovery kinds)
+  "correction_event",
+  "fix_harness_retry",
+  "loop_recovery_attempt",
+  "loop_recovery_attempt_started",
+  "loop_recovery_attempt_stale",
+  // Run / loop terminal state
+  "run_complete",
+  "loop_run_stopped",
+  "loop_run_complete",
+  "loop_item_blocked",
 ]);
 
-/** Default criticality for an event `type` string. Callers may override. */
+/** Default criticality for an event `type` (or loop `kind`) string. Callers may override. */
 export function eventCriticalityForType(type: string): EventCriticality {
-  return CONTROL_CRITICAL_EVENT_TYPES.has(type) ? "control-critical" : "best-effort";
+  if (CONTROL_CRITICAL_EVENT_TYPES.has(type)) return "control-critical";
+  // Family prefixes: any recovery-claim/result kind stays control-critical even
+  // when a new suffix is added without updating the closed set.
+  if (type.startsWith("loop_recovery_")) return "control-critical";
+  if (type.startsWith("stage_diagnostic")) return "control-critical";
+  return "best-effort";
 }
 
 export function isElevatedWriteHealth(
@@ -452,19 +474,40 @@ export function writeHealthPath(runDir: string): string {
   return path.join(runDir, WRITE_HEALTH_FILENAME);
 }
 
-/** Read write-health.json; missing/unreadable → null (legacy or never written). */
-export async function readWriteHealth(
-  runDir: string,
-  deps: RunStoreDeps = defaultRunStoreDeps,
-): Promise<WriteHealthRecord | null> {
+/**
+ * Synthetic elevated record when write-health.json exists but cannot be trusted
+ * (I/O error other than missing, JSON parse failure, or invalid shape). Fail-safe:
+ * operators and recovery treat this as control-critical incomplete evidence —
+ * never as healthy / zero-failure.
+ */
+export const UNREADABLE_WRITE_HEALTH: WriteHealthRecord = {
+  schema_version: WRITE_HEALTH_SCHEMA_VERSION,
+  failure_count: 1,
+  last_failure_at: null,
+  last_error: "write-health.json unreadable or corrupt",
+  last_event_type: null,
+  worst_criticality: "control-critical",
+  exclusive_fallback_attempted: false,
+  exclusive_fallback_succeeded: false,
+};
+
+/**
+ * Parse write-health JSON text. Corrupt / invalid content returns
+ * {@link UNREADABLE_WRITE_HEALTH} (elevated) rather than null so callers never
+ * convert a present-but-broken artifact into a healthy run.
+ */
+export function parseWriteHealthText(raw: string): WriteHealthRecord {
   try {
-    const raw = await deps.readFile(writeHealthPath(runDir));
     const parsed = JSON.parse(raw) as Partial<WriteHealthRecord>;
-    if (!parsed || typeof parsed !== "object") return null;
-    const failureCount =
-      typeof parsed.failure_count === "number" && Number.isFinite(parsed.failure_count)
-        ? Math.max(0, Math.floor(parsed.failure_count))
-        : 0;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { ...UNREADABLE_WRITE_HEALTH };
+    }
+    // failure_count is required for a trustworthy record; missing/invalid
+    // means the artifact is corrupt (partial write / schema drift).
+    if (typeof parsed.failure_count !== "number" || !Number.isFinite(parsed.failure_count)) {
+      return { ...UNREADABLE_WRITE_HEALTH };
+    }
+    const failureCount = Math.max(0, Math.floor(parsed.failure_count));
     const worst =
       parsed.worst_criticality === "control-critical" || parsed.worst_criticality === "best-effort"
         ? parsed.worst_criticality
@@ -484,7 +527,35 @@ export async function readWriteHealth(
       exclusive_fallback_succeeded: parsed.exclusive_fallback_succeeded === true,
     };
   } catch {
-    return null;
+    return { ...UNREADABLE_WRITE_HEALTH };
+  }
+}
+
+/**
+ * Read write-health.json.
+ * - Missing file (ENOENT) → null (legacy run / never written; not a failure).
+ * - Present but unreadable, corrupt, or invalid shape → elevated
+ *   {@link UNREADABLE_WRITE_HEALTH} (fail-safe; never substitute healthy).
+ * - Valid JSON → normalized {@link WriteHealthRecord}.
+ */
+export async function readWriteHealth(
+  runDir: string,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<WriteHealthRecord | null> {
+  try {
+    const raw = await deps.readFile(writeHealthPath(runDir));
+    return parseWriteHealthText(raw);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") return null;
+    // File present but unreadable (EACCES, EISDIR, …) or unknown I/O error —
+    // fail safe rather than treating as healthy/absent.
+    return {
+      ...UNREADABLE_WRITE_HEALTH,
+      last_error: capWriteHealthError(
+        `write-health.json unreadable: ${(err as Error).message ?? String(err)}`,
+      ),
+    };
   }
 }
 

@@ -20,6 +20,7 @@ import type { PipelineConfig } from "../types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "../artifact-sanitize.ts";
 import { checkLoopContractCoherence } from "../loop-preflight.ts";
 import { resolveAdapter } from "../harness-adapters/index.ts";
+import { isElevatedWriteHealth, parseWriteHealthText } from "../run-store.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -730,13 +731,8 @@ export function buildPreflightChecks(
         const healthPath = path.join(runsRoot, entry.name, "write-health.json");
         const raw = await deps.readTextFile(healthPath);
         if (raw === null) continue; // legacy / never written → not elevated
-        try {
-          const parsed = JSON.parse(raw) as { failure_count?: unknown };
-          if (typeof parsed.failure_count === "number" && parsed.failure_count > 0) {
-            elevated.push(entry.name);
-          }
-        } catch {
-          // Unparseable write-health is itself a signal of incomplete evidence.
+        // Corrupt/unreadable or elevated failure_count both fail doctor (#633).
+        if (isElevatedWriteHealth(parseWriteHealthText(raw))) {
           elevated.push(entry.name);
         }
       }

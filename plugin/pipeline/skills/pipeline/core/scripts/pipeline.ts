@@ -74,11 +74,13 @@ import {
   emitGhMetrics,
   finalizeRun,
   initRunDir,
+  isElevatedWriteHealth,
   isValidSummaryBundle,
   latestRunDirForIssue,
   latestRunEventsSummaryForIssue,
   latestSummaryForIssue,
   listRunIds,
+  parseWriteHealthText,
   runDirPath,
   runIdFor,
   runsDir,
@@ -1134,26 +1136,17 @@ export function realDispatchItem(
       if (pin && storeReady) {
         eventsTextForClassify = readEventsTextFn(pin.events_path);
         const whRaw = readWriteHealthTextFn(pin.events_path);
-        if (whRaw) {
-          try {
-            const parsed = JSON.parse(whRaw) as {
-              failure_count?: unknown;
-              worst_criticality?: unknown;
-              last_error?: unknown;
-              last_event_type?: unknown;
+        if (whRaw != null && whRaw !== "") {
+          // Corrupt/unreadable write-health is fail-safe elevated (#633 review):
+          // never treat a present-but-broken artifact as healthy/absent.
+          const parsed = parseWriteHealthText(whRaw);
+          if (isElevatedWriteHealth(parsed)) {
+            writeHealthHint = {
+              failure_count: parsed.failure_count,
+              worst_criticality: parsed.worst_criticality,
+              last_error: parsed.last_error,
+              last_event_type: parsed.last_event_type,
             };
-            if (typeof parsed.failure_count === "number" && parsed.failure_count > 0) {
-              writeHealthHint = {
-                failure_count: parsed.failure_count,
-                worst_criticality:
-                  typeof parsed.worst_criticality === "string" ? parsed.worst_criticality : null,
-                last_error: typeof parsed.last_error === "string" ? parsed.last_error : null,
-                last_event_type:
-                  typeof parsed.last_event_type === "string" ? parsed.last_event_type : null,
-              };
-            }
-          } catch {
-            // Unparseable write-health is not elevated for classification.
           }
         }
       }

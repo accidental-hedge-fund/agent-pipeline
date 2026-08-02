@@ -1750,6 +1750,19 @@ test("check run-store:write-health — fails when recent run has elevated write-
   assert.match(r.remediation!, /incomplete|sink|events\.jsonl/i);
 });
 
+test("check run-store:write-health — fails when write-health.json is corrupt (#633)", async () => {
+  const r = await getCheck(makeConfig(), "run-store:write-health").run(
+    fakeDeps({
+      isWritable: () => true,
+      listDirNames: () => ["633-2026-08-02T13-00-00-000Z"],
+      readTextFile: (p) =>
+        p.endsWith("write-health.json") ? "{partial corrupt health" : null,
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /elevated event-stream write-health/);
+});
+
 test("check run-store:write-health — skips when repo_dir is empty", async () => {
   const r = await getCheck(makeConfig({ repo_dir: "" }), "run-store:write-health").run(fakeDeps());
   assert.equal(r.status, "skip");

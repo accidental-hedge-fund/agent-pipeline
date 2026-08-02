@@ -7,6 +7,7 @@ import * as path from "node:path";
 import {
   RUN_SCHEMA_VERSION,
   HEALTHY_WRITE_HEALTH,
+  UNREADABLE_WRITE_HEALTH,
   appendEvent,
   appendIssueHistory,
   emitPapercut,
@@ -22,6 +23,7 @@ import {
   latestRunEventsSummaryForIssue,
   latestSummaryForIssue,
   listRunIds,
+  parseWriteHealthText,
   readEvents,
   readWriteHealth,
   resolveRunEngineIdentity,
@@ -1906,13 +1908,78 @@ test("finalizeRun: a summary.json write failure is non-fatal even with delta-rou
 // Write-health (#633) — appendEvent failures, exclusive fallback, criticality
 // ---------------------------------------------------------------------------
 
-test("eventCriticalityForType: control-critical for blocker/run terminal; best-effort otherwise", () => {
+test("eventCriticalityForType: control-critical for blocker/recovery/diagnostic/terminal; best-effort otherwise", () => {
+  // Blocker + stage-diagnostic evidence
   assert.equal(eventCriticalityForType("blocker_set"), "control-critical");
   assert.equal(eventCriticalityForType("blocker_cleared"), "control-critical");
-  assert.equal(eventCriticalityForType("run_complete"), "control-critical");
+  assert.equal(eventCriticalityForType("stage_diagnostic"), "control-critical");
   assert.equal(eventCriticalityForType("human_intervention"), "control-critical");
+  // Recovery claim / result
+  assert.equal(eventCriticalityForType("correction_event"), "control-critical");
+  assert.equal(eventCriticalityForType("fix_harness_retry"), "control-critical");
+  assert.equal(eventCriticalityForType("loop_recovery_attempt"), "control-critical");
+  assert.equal(eventCriticalityForType("loop_recovery_attempt_started"), "control-critical");
+  assert.equal(eventCriticalityForType("loop_recovery_attempt_stale"), "control-critical");
+  assert.equal(eventCriticalityForType("loop_recovery_attempt_custom"), "control-critical");
+  // Run / loop terminal
+  assert.equal(eventCriticalityForType("run_complete"), "control-critical");
+  assert.equal(eventCriticalityForType("loop_run_stopped"), "control-critical");
+  assert.equal(eventCriticalityForType("loop_run_complete"), "control-critical");
+  assert.equal(eventCriticalityForType("loop_item_blocked"), "control-critical");
+  // Best-effort telemetry
   assert.equal(eventCriticalityForType("stage_start"), "best-effort");
   assert.equal(eventCriticalityForType("papercut"), "best-effort");
+  assert.equal(eventCriticalityForType("stage_accounting"), "best-effort");
+});
+
+test("appendEvent: recovery claim/result failure elevates control-critical write-health (#633)", async () => {
+  const { deps } = memRunStore();
+  const failing: RunStoreDeps = {
+    ...deps,
+    appendFile: async () => {
+      throw new Error("ENOSPC: recovery claim lost");
+    },
+  };
+  for (const type of [
+    "loop_recovery_attempt_started",
+    "loop_recovery_attempt",
+    "correction_event",
+  ] as const) {
+    // Use a minimal RunEvent-compatible payload; classifier keys on type only.
+    const event = {
+      schema_version: RUN_SCHEMA_VERSION,
+      type,
+      at: STARTED_AT_ISO,
+    } as unknown as RunEvent;
+    const ok = await appendEvent(RUN_DIR, event, failing);
+    assert.equal(ok, false, type);
+  }
+  const health = await readWriteHealth(RUN_DIR, failing);
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health!.worst_criticality, "control-critical");
+  assert.equal(health!.failure_count, 3);
+});
+
+test("appendEvent: stage-diagnostic and loop-terminal failure elevates control-critical (#633)", async () => {
+  const { deps } = memRunStore();
+  const failing: RunStoreDeps = {
+    ...deps,
+    appendFile: async () => {
+      throw new Error("EIO: control record lost");
+    },
+  };
+  for (const type of ["stage_diagnostic", "loop_run_stopped", "loop_run_complete"] as const) {
+    const event = {
+      schema_version: RUN_SCHEMA_VERSION,
+      type,
+      at: STARTED_AT_ISO,
+    } as unknown as RunEvent;
+    const ok = await appendEvent(RUN_DIR, event, failing);
+    assert.equal(ok, false, type);
+  }
+  const health = await readWriteHealth(RUN_DIR, failing);
+  assert.equal(health!.worst_criticality, "control-critical");
+  assert.equal(health!.failure_count, 3);
 });
 
 test("appendEvent: local I/O failure returns false and elevates write-health (#633)", async () => {
@@ -2145,4 +2212,73 @@ test("finalizeRun: healthy run embeds zero-failure write-health (#633)", async (
   const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
   assert.ok(summary.write_health);
   assert.equal(summary.write_health.failure_count, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Unreadable / corrupt write-health fail-safe (#633 review finding ffe0551d)
+// ---------------------------------------------------------------------------
+
+test("parseWriteHealthText: corrupt JSON is elevated control-critical, not healthy (#633)", () => {
+  const health = parseWriteHealthText("{not json");
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health.worst_criticality, "control-critical");
+  assert.match(health.last_error ?? "", /unreadable|corrupt/i);
+  assert.equal(health.failure_count, UNREADABLE_WRITE_HEALTH.failure_count);
+});
+
+test("parseWriteHealthText: invalid shape (missing failure_count) is elevated, not healthy (#633)", () => {
+  const health = parseWriteHealthText("{}");
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health.worst_criticality, "control-critical");
+});
+
+test("parseWriteHealthText: partial mid-write JSON is elevated (#633)", () => {
+  const health = parseWriteHealthText('{"schema_version":1,"failure_count":');
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health.worst_criticality, "control-critical");
+});
+
+test("readWriteHealth: missing file remains null (legacy healthy/absent) (#633)", async () => {
+  const { deps } = memRunStore();
+  const health = await readWriteHealth(RUN_DIR, deps);
+  assert.equal(health, null);
+});
+
+test("readWriteHealth: corrupt on-disk artifact is elevated, not null/healthy (#633)", async () => {
+  const { deps } = memRunStore();
+  await deps.writeFile(writeHealthPath(RUN_DIR), "{partial corrupt write-health\n");
+  const health = await readWriteHealth(RUN_DIR, deps);
+  assert.ok(health);
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health!.worst_criticality, "control-critical");
+});
+
+test("readWriteHealth: non-ENOENT I/O error is elevated fail-safe (#633)", async () => {
+  const { deps } = memRunStore();
+  const blocked: RunStoreDeps = {
+    ...deps,
+    readFile: async () => {
+      const e = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
+      e.code = "EACCES";
+      throw e;
+    },
+  };
+  const health = await readWriteHealth(RUN_DIR, blocked);
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health!.worst_criticality, "control-critical");
+  assert.match(health!.last_error ?? "", /unreadable|EACCES|permission/i);
+});
+
+test("finalizeRun: corrupt write-health embeds elevated state, not healthy (#633)", async () => {
+  const { deps, readFile } = memRunStore();
+  await deps.writeFile(writeHealthPath(RUN_DIR), "not-json-at-all");
+  const bundle = makeBundle();
+  bundle.finalState = "ready-to-deploy";
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.ok(summary.write_health);
+  assert.ok(summary.write_health.failure_count >= 1);
+  assert.equal(summary.write_health.worst_criticality, "control-critical");
+  // Must not substitute HEALTHY_WRITE_HEALTH when the artifact is corrupt.
+  assert.notEqual(summary.write_health.failure_count, 0);
 });

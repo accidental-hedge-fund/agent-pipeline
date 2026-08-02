@@ -34,6 +34,16 @@ failures SHALL themselves be best-effort and SHALL NOT throw out of `appendEvent
 - **THEN** that consumer SHALL observe the persisted write-health failure state without relying on
   in-memory process state
 
+#### Scenario: Unreadable or corrupt write-health is elevated fail-safe
+
+- **WHEN** `write-health.json` exists but is unreadable, partially written, or not a valid
+  write-health record
+- **THEN** readers SHALL NOT treat the run as healthy or zero-failure
+- **AND** SHALL expose an elevated write-health state with control-critical worst criticality
+- **AND** operator surfaces (status, summary, doctor) and recovery classification SHALL observe
+  that elevated state
+- **AND** a missing write-health file (legacy / never written) SHALL remain non-elevated
+
 ### Requirement: Event appends SHALL carry a criticality class
 
 Every `appendEvent` invocation SHALL be classified as either `control-critical` or `best-effort`.
