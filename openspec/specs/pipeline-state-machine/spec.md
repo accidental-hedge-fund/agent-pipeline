@@ -11,13 +11,20 @@ inert unless the design-interrogation gate is enabled and a risk trigger matches
 untriggered it SHALL advance immediately to `review-1` with a recorded reason and no harness call. Its
 gate behavior is specified by the `design-interrogation-gate` capability.
 
+`needs-human` SHALL appear in `STAGES` as the terminal off-ramp entry (after `ready-to-deploy` in the
+constant order). It is not a happy-path successor of `ready-to-deploy`; it is a park state the
+advance loop may enter from review-ceiling and similar exhaustion paths. Its resume and status
+surfaces are specified by the `needs-human-status-surface` and override-related capabilities.
+
 #### Scenario: STAGES order
 - **WHEN** the `STAGES` constant is inspected
-- **THEN** it SHALL list, in order: `backlog`, `ready`, `planning`, `plan-review`, `implementing`, `design-gate`, `review-1`, `fix-1`, `review-2`, `fix-2`, `pre-merge`, `visual-gate`, `eval-gate`, `shipcheck-gate`, `ready-to-deploy`
+- **THEN** it SHALL list, in order: `backlog`, `ready`, `planning`, `plan-review`, `implementing`, `design-gate`, `review-1`, `fix-1`, `review-2`, `fix-2`, `pre-merge`, `visual-gate`, `eval-gate`, `shipcheck-gate`, `ready-to-deploy`, `needs-human`
 - **AND** `design-gate` SHALL appear at an index greater than `implementing` and less than `review-1`
 - **AND** `visual-gate` SHALL appear at an index greater than `pre-merge` and less than `eval-gate`
 - **AND** `eval-gate` SHALL appear at an index greater than `visual-gate` and less than `shipcheck-gate`
 - **AND** `shipcheck-gate` SHALL appear at an index greater than `eval-gate` and less than `ready-to-deploy`
+- **AND** `needs-human` SHALL appear after `ready-to-deploy` in the constant order
+- **AND** `needs-human` SHALL be a member of `TERMINAL_STAGES`
 
 #### Scenario: dispatch routes design-gate
 - **WHEN** the current stage label is `pipeline:design-gate`
@@ -44,13 +51,28 @@ gate behavior is specified by the `design-interrogation-gate` capability.
 - **THEN** the orchestrator SHALL call the shipcheck stage handler
 - **AND** SHALL NOT call `deployReady.finalize()` directly
 
-### Requirement: Terminal stage is ready-to-deploy
-`TERMINAL_STAGES` SHALL contain exactly `ready-to-deploy`. When an issue reaches it, the run finalizes and the advance loop stops; no stage follows it.
+### Requirement: Terminal stages are ready-to-deploy and needs-human
+`TERMINAL_STAGES` SHALL be exactly the set `{ready-to-deploy, needs-human}`. Both members stop the advance loop; neither is followed by another stage handler dispatch, and neither merges the PR.
 
-#### Scenario: reaching the terminal stage
+When an issue reaches `ready-to-deploy`, the run finalizes the happy path (tagging the PR `pipeline:ready-to-deploy` and posting a summary) and the advance loop stops. When an issue reaches `needs-human`, the advance loop stops at the park off-ramp with advisory evidence for a human (override or fix); the item is never auto-advanced from `needs-human` to `ready-to-deploy`.
+
+#### Scenario: reaching the ready-to-deploy terminal stage
 - **WHEN** an issue advances to `ready-to-deploy`
 - **THEN** the run SHALL finalize (tagging the PR `pipeline:ready-to-deploy` and posting a summary) and stop
 - **AND** no further stage handler SHALL be dispatched
+- **AND** the PR SHALL NOT be merged by the advance loop
+
+#### Scenario: reaching the needs-human terminal stage
+- **WHEN** an issue reaches `needs-human` (e.g. a review round hits its ceiling with findings still blocking)
+- **THEN** the advance loop SHALL stop
+- **AND** no further stage handler SHALL be dispatched to auto-advance toward `ready-to-deploy`
+- **AND** the PR SHALL NOT be merged by the advance loop
+
+#### Scenario: TERMINAL_STAGES membership
+- **WHEN** the `TERMINAL_STAGES` constant is inspected
+- **THEN** it SHALL contain exactly `ready-to-deploy` and `needs-human`
+- **AND** it SHALL NOT omit `needs-human`
+- **AND** it SHALL NOT contain any other stage name
 
 ### Requirement: Opt-in via the pipeline label gate
 The pipeline SHALL act only on issues that already carry a `pipeline:<stage>` label. An issue with no such label SHALL be refused — the run exits without dispatching any stage and explains how to opt in (add `pipeline:ready`). `backlog` is a triage marker only; the orchestrator starts work at `ready`.
@@ -76,7 +98,7 @@ The orchestrator SHALL advance at most `MAX_ITERATIONS` (= 12) transitions per i
 - **THEN** the loop SHALL stop after at most 12 transitions in a single invocation
 
 ### Requirement: Never auto-merge (structural guarantee)
-The pipeline SHALL NOT merge pull requests from the autonomous `advance` loop. There is no merge stage in `STAGES` and no merge command anywhere in the orchestrator or stage handlers; the terminal stage is `ready-to-deploy`. The `auto_merge` config key SHALL be absent from `PartialConfigSchema`; a repo that sets it SHALL receive a strict-schema parse error identifying `auto_merge` as an unknown key (see `pipeline-configuration`). The never-auto-merge guarantee is structural — enforced at config parse time, not run time.
+The pipeline SHALL NOT merge pull requests from the autonomous `advance` loop. There is no merge stage in `STAGES` and no merge command anywhere in the orchestrator or stage handlers; the happy-path terminal is `ready-to-deploy` and the park terminal is `needs-human` — neither merges. The `auto_merge` config key SHALL be absent from `PartialConfigSchema`; a repo that sets it SHALL receive a strict-schema parse error identifying `auto_merge` as an unknown key (see `pipeline-configuration`). The never-auto-merge guarantee is structural — enforced at config parse time, not run time.
 
 A human-invoked `pipeline merge <pr>` sub-command exists as a separate, loop-isolated surface. This sub-command is never called by the advance loop and does not weaken the structural guarantee; it is the controlled, explicit mechanism by which a human (or pipeline-desk on a human button click) performs a merge after the pipeline reaches `ready-to-deploy`. See the `merge-sub-command` capability for its requirements.
 
@@ -86,9 +108,9 @@ A human-invoked `pipeline merge <pr>` sub-command exists as a separate, loop-iso
 - **AND** the pipeline SHALL NOT run
 
 #### Scenario: advance loop never invokes the merge handler
-- **WHEN** the advance loop dispatches any stage transition (from `ready` through `ready-to-deploy`)
+- **WHEN** the advance loop dispatches any stage transition (from `ready` through `ready-to-deploy` or into `needs-human`)
 - **THEN** no call to the `pipeline merge` handler or any symbol from `merge.ts` is made
-- **AND** the loop terminates at `ready-to-deploy` without merging the PR
+- **AND** the loop stops at a terminal stage (`ready-to-deploy` or `needs-human`) without merging the PR
 
 ### Requirement: Blocked state halts the advance loop
 
