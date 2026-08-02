@@ -22,7 +22,7 @@ import {
   silentTransition as defaultSilentTransition,
   transition as defaultTransition,
 } from "../gh.ts";
-import { isPipelineInternalCommit } from "./pre_merge.ts";
+import { isPipelineInternalCommit } from "../pipeline-commits.ts";
 import { extractSnapshotComment } from "../issue-context-snapshot.ts";
 import { getOnDiskForIssue as defaultGetForIssue, gitInWorktree as defaultGitInWorktree } from "../worktree.ts";
 import { openspecContextFromDiff, readSpecDeltas } from "../openspec.ts";

@@ -54,6 +54,7 @@ import {
   stripPipelineInternalMarkers,
   trySalvageUncommittedWork,
 } from "../salvage-harness-work.ts";
+import { runHarnessRound } from "../harness-round.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import {
   attestPipelineComment,
@@ -130,7 +131,12 @@ export {
 } from "../openspec-consistency.ts";
 import { invoke } from "../harness.ts";
 import { reviewerModelSourceWasAuto } from "../stage-routing.ts";
-import { VISUAL_PUBLISH_COMMIT_PREFIX } from "./visual.ts";
+import {
+  isPipelineInternalCommit,
+  OPENSPEC_ARCHIVE_PREFIX,
+} from "../pipeline-commits.ts";
+// Re-export for existing test imports; preferred import is pipeline-commits.ts (#629).
+export { isPipelineInternalCommit, OPENSPEC_ARCHIVE_PREFIX } from "../pipeline-commits.ts";
 import type { CheckRun, Outcome, PipelineConfig, ReviewFinding, Stage } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { BlockerKind } from "../types.ts";
@@ -165,19 +171,6 @@ async function recordPreMergeGateResult(
   await appendEvent(deps.runDir, event, deps.runStoreDeps).catch(() => {});
 }
 
-const OPENSPEC_ARCHIVE_PREFIX = "chore: archive OpenSpec change(s) for #";
-
-/**
- * Exact publish-commit subject pattern (#463): the full prescribed subject,
- * `VISUAL_PUBLISH_COMMIT_PREFIX` followed by an issue number and nothing
- * else. Matched in full (not as a prefix) so a developer's own code-changing
- * commit merely starting with the same words — e.g. `chore: publish
- * visual-gate evidence for #463 and tweak layout` — does NOT match and still
- * triggers the required re-review.
- */
-const VISUAL_PUBLISH_COMMIT_PATTERN = new RegExp(
-  `^${VISUAL_PUBLISH_COMMIT_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\d+$`,
-);
 export const REBASE_MARKER_FILE = PIPELINE_INTERNAL_MARKER_FILES[0];
 
 /**
@@ -438,28 +431,6 @@ export function formatNoopStillBrokenReason(
     `Pre-merge delta review found blocking findings; auto-fix made no diff; ` +
     `${pathPart} — human fix required.`;
   return diagnostic ? `${base} ${diagnostic}` : base;
-}
-
-/**
- * True when a commit was authored by the pipeline itself in pre-merge (an
- * OpenSpec archive) rather than by a developer/fix step. These commits do not
- * change the code the reviewer evaluated, so they must not invalidate the
- * review verdict (#98). Matched on the exact pre-merge commit prefix — a
- * developer's own `chore:` commit with different wording does NOT match and
- * still triggers a re-review. A `docs: update documentation for #N` commit is
- * NOT pipeline-internal: the pre-merge docs harness was removed (#91, docs now
- * land inside the reviewed implementation diff), so any such commit can only
- * come from a developer. Also matches the visual-gate artifact-publish commit
- * (#463): it republishes already-reviewed evidence, does not change the code
- * the reviewer evaluated, and must not invalidate the verdict or be mistaken
- * for a visual-fix commit (distinct prefix from `visualFixCommitPattern`).
- * Exported for tests.
- */
-export function isPipelineInternalCommit(messageHeadline: string): boolean {
-  return (
-    messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX) ||
-    VISUAL_PUBLISH_COMMIT_PATTERN.test(messageHeadline)
-  );
 }
 
 /**
@@ -794,21 +765,11 @@ export async function performPreMergeAutoFix(
   const harness = cfg.harnesses?.implementer;
   if (!harness) return { status: "error" };
 
-  const headBefore = (
-    await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
-  ).stdout.trim();
-
   // Pre-fix cleanliness check: a dirty worktree before the attempt fails closed
   // (#235). Rollback uses `git reset --hard`; running that over pre-existing dirty
   // work would irreversibly discard it.
   const preStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
   if (preStatus.code !== 0 || preStatus.stdout.trim() !== "") return { status: "error" };
-
-  // Reattach detached HEAD before the harness commits (#359 Finding 3): commits
-  // made in a detached worktree don't move the branch ref, so the later push
-  // would silently leave the PR branch unchanged while returning success.
-  const reattach = await reattachIfDetached(wt, issueNumber, gitFn);
-  if (!reattach.ok) return { status: "error" };
 
   const prompt = buildFixPrompt({
     cfg,
@@ -819,159 +780,161 @@ export async function performPreMergeAutoFix(
     pipelineRunId,
   });
 
-  // Durable one-attempt claim (#787): charge the attempt only after every
-  // preflight above (clean tree, reattach) has succeeded, immediately before
-  // the implementer runs — a preflight failure must not consume the single
-  // repair unit. A failed claim must not invoke the harness: fail closed so a
-  // later entry at the same head can retry the claim (no unbound attempt).
-  if (claimAttempt) {
-    let claimed = false;
-    try {
-      claimed = await claimAttempt();
-    } catch {
-      claimed = false;
-    }
-    if (!claimed) {
-      return {
-        status: "claim-failed",
-        diagnostic:
-          "durable pre-merge auto-fix attempt marker could not be recorded; implementer not invoked",
-      };
-    }
-  }
-
-  const result = await invokeFn(harness, wt.path, prompt, {
-    timeoutSec: cfg.fix_timeout,
-    model: cfg.models?.fix ?? null,
-    sandbox: cfg.harness_sandbox,
-  });
-
-  // Determine whether the harness left a new commit, regardless of whether it
-  // reported success or crashed/timed out (#547) — a crashed/timed-out harness
-  // may still have left no commit but genuine uncommitted work worth
-  // salvaging, exactly like the success-without-committing case below.
-  const headAfterHarness = (
-    await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
-  ).stdout.trim();
-  const hasNewCommitHarness = Boolean(headAfterHarness && headBefore && headAfterHarness !== headBefore);
-  // Confirmed-no-new-commit requires both reads to have actually succeeded and
-  // matched — an unreadable/empty post-harness HEAD must NOT be treated as
-  // "no new commit" (#547 review 1 finding 1), since a harness that did commit
-  // could then have its commit salvaged-over. Fail closed (existing rollback)
-  // when we can't prove HEAD is unchanged.
-  const confirmedNoNewCommit = Boolean(headBefore && headAfterHarness && headAfterHarness === headBefore);
-
-  // Salvage (#547): attempt only when we've confirmed the harness left no new
-  // commit — whether it crashed/timed out or reported success without
-  // committing. A commit that exists alongside extra leftover dirt (checked
-  // below) is an ambiguous case out of scope (design decision 2) and keeps the
-  // existing fail-closed rollback unchanged.
-  let salvaged = false;
-  let salvageFoundNothing = false;
-  if (confirmedNoNewCommit) {
-    const salvageResult = await salvageFn(
-      wt.path,
-      issueNumber,
-      pipelineRunId,
-      repairIdentity.salvageLabel ?? PRE_MERGE_AUTOFIX_SALVAGE_LABEL,
-    );
-    salvaged = salvageResult.salvaged;
-    // "Nothing to salvage" (as opposed to an attempted-but-failed salvage,
-    // signalled by `failureReason`) means the worktree was genuinely clean —
-    // the #553 disclosed case below.
-    salvageFoundNothing = !salvaged && !salvageResult.failureReason;
-  }
-
-  if (!salvaged) {
-    // #553 / #698: the harness ran and left the inspected worktree clean with
-    // no new commit — nothing for salvage to recover. Name the worktree so the
-    // operator can tell this apart from a silent no-op; return **noop-clean**
-    // (not a generic error) so the SHA gate re-verifies findings against HEAD
-    // rather than hard-blocking solely because no commit was produced.
-    const cleanNoRecoverableWork = confirmedNoNewCommit && salvageFoundNothing;
-    const diagnostic = cleanNoRecoverableWork
-      ? `pre-merge fix harness for #${issueNumber} ran but left worktree ${wt.path} ` +
-        `clean with no new commit — no recoverable work was found there`
-      : undefined;
-
-    if (!result.success) {
-      if (diagnostic) console.error(`[pipeline] ${diagnostic}`);
-      if (headBefore) {
-        await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
-        await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-      }
-      // Confirmed clean no-commit after harness failure/timeout still enters
-      // the re-verify path (#698 / harness-uncommitted-salvage): the tree is
-      // unambiguous and salvage found nothing. Dirty/unreadable cases remain error.
-      if (diagnostic && headBefore) {
-        return { status: "noop-clean", headSha: headBefore, diagnostic };
-      }
-      return { status: "error" };
-    }
-
-    const statusAfter = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
-    // Fail closed when status exits non-zero: we cannot prove the worktree is clean (#359 R2 F4).
-    const hasUncommitted = statusAfter.code !== 0 || statusAfter.stdout.trim() !== "";
-
-    // Spec (#359 / #698): a dirty post-harness worktree (uncommitted changes remaining)
-    // is a failure — roll back. A confirmed clean no-commit is **noop-clean** so the
-    // caller re-verifies rather than hard-blocking. Ambiguous partial state stays error.
-    if (hasUncommitted || !hasNewCommitHarness) {
-      const finalDiagnostic = diagnostic && !hasUncommitted ? diagnostic : undefined;
-      if (finalDiagnostic) console.error(`[pipeline] ${finalDiagnostic}`);
-      if (headBefore) {
-        await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
-        await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-      }
-      if (finalDiagnostic && headBefore) {
-        return { status: "noop-clean", headSha: headBefore, diagnostic: finalDiagnostic };
-      }
-      return { status: "error" };
-    }
-  }
-
-  // Harness committed cleanly, or its uncommitted work was salvaged into a
-  // commit (#547); amend to set the canonical subject so the one-attempt
-  // bound can detect this commit by subject prefix.
-  const autoFixMsg = withTrailers(
-    `${repairIdentity.commitSubjectPrefix ?? PRE_MERGE_AUTOFIX_PREFIX} for #${issueNumber}`,
+  // Shared implementer-round skeleton (#629): reattach → headBefore → invoke →
+  // salvage on confirmed no-new-commit → stage-owned amend/push/noop-clean.
+  return runHarnessRound({
+    wtPath: wt.path,
     issueNumber,
     pipelineRunId,
-  );
+    salvageLabel: repairIdentity.salvageLabel ?? PRE_MERGE_AUTOFIX_SALVAGE_LABEL,
+    // Reattach detached HEAD before the harness commits (#359 Finding 3): commits
+    // made in a detached worktree don't move the branch ref, so the later push
+    // would silently leave the PR branch unchanged while returning success.
+    reattach: { wt, issueNumber },
+    // Durable one-attempt claim (#787): charge the attempt only after every
+    // preflight above (clean tree, reattach) has succeeded, immediately before
+    // the implementer runs — a preflight failure must not consume the single
+    // repair unit. A failed claim must not invoke the harness: fail closed so a
+    // later entry at the same head can retry the claim (no unbound attempt).
+    beforeInvoke: async () => {
+      if (!claimAttempt) return;
+      let claimed = false;
+      try {
+        claimed = await claimAttempt();
+      } catch {
+        claimed = false;
+      }
+      if (!claimed) {
+        return {
+          abort: {
+            status: "claim-failed" as const,
+            diagnostic:
+              "durable pre-merge auto-fix attempt marker could not be recorded; implementer not invoked",
+          },
+        };
+      }
+    },
+    // Salvage (#547): attempt only when we've confirmed the harness left no new
+    // commit — whether it crashed/timed out or reported success without
+    // committing. A commit that exists alongside extra leftover dirt (checked
+    // below) is an ambiguous case out of scope (design decision 2) and keeps the
+    // existing fail-closed rollback unchanged.
+    shouldAttemptSalvage: ({ confirmedNoNewCommit }) => confirmedNoNewCommit,
+    invoke: () =>
+      invokeFn(harness, wt.path, prompt, {
+        timeoutSec: cfg.fix_timeout,
+        model: cfg.models?.fix ?? null,
+        sandbox: cfg.harness_sandbox,
+      }),
+    onReattachFailed: () => ({ status: "error" as const }),
+    deps: {
+      gitHead: async (cwd) =>
+        (await gitFn(cwd, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim(),
+      reattach: async (worktree, issue) => reattachIfDetached(worktree, issue, gitFn),
+      salvage: salvageFn,
+    },
+    afterRound: async (ctx) => {
+      const result = ctx.invokeResult;
+      const headBefore = ctx.headBefore;
+      // hasNewCommitHarness uses pre-salvage equality: when salvage ran, either
+      // it created a commit (salvaged) or confirmed no-new-commit. When salvage
+      // did not run, confirmedNoNewCommit is false only if HEAD advanced.
+      const hasNewCommitHarness = Boolean(
+        ctx.headAfter && headBefore && (ctx.salvaged || !ctx.confirmedNoNewCommit),
+      );
 
-  const amendRes = await gitFn(
-    wt.path, ["commit", "--amend", "-m", autoFixMsg], { ignoreFailure: true },
-  );
-  if (amendRes.code !== 0) {
-    await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
-    await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-    return { status: "error" };
-  }
+      if (!ctx.salvaged) {
+        // #553 / #698: the harness ran and left the inspected worktree clean with
+        // no new commit — nothing for salvage to recover. Name the worktree so the
+        // operator can tell this apart from a silent no-op; return **noop-clean**
+        // (not a generic error) so the SHA gate re-verifies findings against HEAD
+        // rather than hard-blocking solely because no commit was produced.
+        const cleanNoRecoverableWork = ctx.confirmedNoNewCommit && ctx.salvageFoundNothing;
+        const diagnostic = cleanNoRecoverableWork
+          ? `pre-merge fix harness for #${issueNumber} ran but left worktree ${wt.path} ` +
+            `clean with no new commit — no recoverable work was found there`
+          : undefined;
 
-  // Capture the authoritative post-fix head from local git state (#371) — the
-  // amend rewrote the commit SHA, so this is the SHA the caller's re-review must
-  // evaluate. Read here (not re-derived from a GitHub-API PR-head read after the
-  // push), since that API read can still lag and return the pre-fix head.
-  const postFixHead = (
-    await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
-  ).stdout.trim();
-  if (!postFixHead) {
-    await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
-    await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-    return { status: "error" };
-  }
+        if (!result.success) {
+          if (diagnostic) console.error(`[pipeline] ${diagnostic}`);
+          if (headBefore) {
+            await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+            await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+          }
+          // Confirmed clean no-commit after harness failure/timeout still enters
+          // the re-verify path (#698 / harness-uncommitted-salvage): the tree is
+          // unambiguous and salvage found nothing. Dirty/unreadable cases remain error.
+          if (diagnostic && headBefore) {
+            return { status: "noop-clean", headSha: headBefore, diagnostic };
+          }
+          return { status: "error" };
+        }
 
-  // Push the fix commit to the PR head.
-  const branch = branchName(issueNumber, wt.slug);
-  const pushRes = await gitFn(wt.path, ["push", "origin", branch], { ignoreFailure: true });
-  if (pushRes.code !== 0) {
-    // Rollback: push failed, remove the local commit so the next attempt is clean.
-    await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
-    await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
-    return { status: "error" };
-  }
+        const statusAfter = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+        // Fail closed when status exits non-zero: we cannot prove the worktree is clean (#359 R2 F4).
+        const hasUncommitted = statusAfter.code !== 0 || statusAfter.stdout.trim() !== "";
 
-  return { status: "fix-committed", headSha: postFixHead };
+        // Spec (#359 / #698): a dirty post-harness worktree (uncommitted changes remaining)
+        // is a failure — roll back. A confirmed clean no-commit is **noop-clean** so the
+        // caller re-verifies rather than hard-blocking. Ambiguous partial state stays error.
+        if (hasUncommitted || !hasNewCommitHarness) {
+          const finalDiagnostic = diagnostic && !hasUncommitted ? diagnostic : undefined;
+          if (finalDiagnostic) console.error(`[pipeline] ${finalDiagnostic}`);
+          if (headBefore) {
+            await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+            await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+          }
+          if (finalDiagnostic && headBefore) {
+            return { status: "noop-clean", headSha: headBefore, diagnostic: finalDiagnostic };
+          }
+          return { status: "error" };
+        }
+      }
+
+      // Harness committed cleanly, or its uncommitted work was salvaged into a
+      // commit (#547); amend to set the canonical subject so the one-attempt
+      // bound can detect this commit by subject prefix.
+      const autoFixMsg = withTrailers(
+        `${repairIdentity.commitSubjectPrefix ?? PRE_MERGE_AUTOFIX_PREFIX} for #${issueNumber}`,
+        issueNumber,
+        pipelineRunId,
+      );
+
+      const amendRes = await gitFn(
+        wt.path, ["commit", "--amend", "-m", autoFixMsg], { ignoreFailure: true },
+      );
+      if (amendRes.code !== 0) {
+        await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+        await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+        return { status: "error" };
+      }
+
+      // Capture the authoritative post-fix head from local git state (#371) — the
+      // amend rewrote the commit SHA, so this is the SHA the caller's re-review must
+      // evaluate. Read here (not re-derived from a GitHub-API PR-head read after the
+      // push), since that API read can still lag and return the pre-fix head.
+      const postFixHead = (
+        await gitFn(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+      ).stdout.trim();
+      if (!postFixHead) {
+        await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+        await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+        return { status: "error" };
+      }
+
+      // Push the fix commit to the PR head.
+      const branch = branchName(issueNumber, wt.slug);
+      const pushRes = await gitFn(wt.path, ["push", "origin", branch], { ignoreFailure: true });
+      if (pushRes.code !== 0) {
+        // Rollback: push failed, remove the local commit so the next attempt is clean.
+        await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });
+        await gitFn(wt.path, ["clean", "-fd"], { ignoreFailure: true });
+        return { status: "error" };
+      }
+
+      return { status: "fix-committed", headSha: postFixHead };
+    },
+  });
 }
 
 /**

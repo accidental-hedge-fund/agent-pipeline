@@ -1228,26 +1228,27 @@ test("runPlanningPhases #547: implement harness fails, salvage also fails → bl
   );
 });
 
-// Bite check: without the #547 salvage wiring, the implement-failure block
-// path never calls trySalvageUncommittedWork at all, so the injected fake
-// above would never run and this assertion would have nothing to prove
-// against — the reason string would just be the bare harness-failure message
-// with no salvage disclosure. The assertion above only holds because the fix
-// threads `crashSalvageFailure` into the block comment.
-test("planning.ts source pin #547: implement-failure path attempts salvage before the terminal harness-failure block", async () => {
+// Bite check: implement path must route through the shared harness-round
+// helper (#629) with salvage-on-no-new-commit, and the failure branch must
+// still disclose salvage failures before the terminal harness-failure block.
+test("planning.ts source pin #547/#629: implement path uses shared harness-round salvage before harness-failure block", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/planning.ts", import.meta.url)), "utf8");
-  const resultCheckIdx = src.indexOf("if (!result.success) {");
-  const salvageIdx = src.indexOf(
-    "const { salvaged, failureReason: crashSalvageFailure } = await salvageIfNoNewCommit(",
-    resultCheckIdx,
+  const roundIdx = src.indexOf("runHarnessRound({");
+  const salvageModeIdx = src.indexOf(
+    "shouldAttemptSalvage: ({ confirmedNoNewCommit }) => confirmedNoNewCommit",
+    roundIdx,
   );
+  const resultCheckIdx = src.indexOf("if (!result.success) {", roundIdx);
+  const salvageCheckIdx = src.indexOf("if (!ctx.salvaged) {", resultCheckIdx);
   const blockIdx = src.indexOf(
-    '"implementing",\n        "harness-failure",\n      );',
+    '"implementing",\n            "harness-failure",\n          );',
     resultCheckIdx,
   );
-  assert.ok(resultCheckIdx !== -1 && salvageIdx !== -1 && blockIdx !== -1);
-  assert.ok(resultCheckIdx < salvageIdx, "salvage must be attempted inside the harness-failure branch");
-  assert.ok(salvageIdx < blockIdx, "salvage must be attempted before the terminal harness-failure block");
+  assert.ok(roundIdx !== -1, "implement path must call runHarnessRound");
+  assert.ok(salvageModeIdx !== -1, "implement path must salvage on confirmed no-new-commit");
+  assert.ok(resultCheckIdx !== -1 && salvageCheckIdx !== -1 && blockIdx !== -1);
+  assert.ok(resultCheckIdx < salvageCheckIdx, "salvage outcome must be checked inside the harness-failure branch");
+  assert.ok(salvageCheckIdx < blockIdx, "salvage failure disclosure must precede the terminal harness-failure block");
 });
 
 test("runPlanningPhases — blocker equivalence: no-commits", async () => {

@@ -720,3 +720,58 @@ for (const fixture of [
     assert.match(result.error ?? "", fixture.error);
   });
 }
+
+test("repair_pipeline_item #629: substantive path uses performPreMergeAutoFix (shared-round consumer), not a private full skeleton", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const { fileURLToPath } = await import("node:url");
+  const src = await readFile(
+    fileURLToPath(new URL("../scripts/loop/repair-pipeline-item.ts", import.meta.url)),
+    "utf8",
+  );
+  // Shell exemption: recovery may own breadcrumb/ownership, but substantive work
+  // must go through performPreMergeAutoFix (shared-helper-backed).
+  assert.match(src, /performPreMergeAutoFix/);
+  assert.match(src, /performRepair \?\? performPreMergeAutoFix/);
+  // Documented consumer-via-auto-fix disposition (not a private full skeleton).
+  assert.match(src, /#629/);
+  assert.match(src, /breadcrumb/);
+  // No private headBefore → invoke → salvage skeleton in this shell file.
+  assert.doesNotMatch(src, /const headBefore\s*=/);
+  assert.doesNotMatch(src, /trySalvageUncommittedWork\s*\(/);
+});
+
+test("repair_pipeline_item #629: refuses unmarked human commits (ownership proof)", async () => {
+  // Unpushed commit on claimed head without breadcrumb → refuse.
+  const execute = createRepairPipelineItemExecutor(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
+    gitInWorktree: async (_dir, args) => {
+      if (args[0] === "rev-parse" && args[1] === "HEAD") {
+        return { code: 0, stdout: `${NEXT}\n`, stderr: "" };
+      }
+      if (args[0] === "log") {
+        return { code: 0, stdout: "feat: human WIP\n", stderr: "" };
+      }
+      if (args[0] === "status") {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "ls-remote") {
+        return { code: 0, stdout: `${HEAD}\n`, stderr: "" };
+      }
+      if (args[0] === "rev-parse" && args[1] === "HEAD^") {
+        return { code: 0, stdout: `${HEAD}\n`, stderr: "" };
+      }
+      if (args[0] === "rev-parse" && args.includes("refs/pipeline-recovery/attempt-1")) {
+        // No breadcrumb → refuse.
+        return { code: 1, stdout: "", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    performRepair: async () => {
+      throw new Error("must not invoke substantive repair for unmarked human commit");
+    },
+  });
+
+  const result = await execute(input());
+  assert.equal(result.succeeded, false);
+  assert.match(result.error ?? result.evidence, /cannot prove it authored|refusing to adopt/i);
+});

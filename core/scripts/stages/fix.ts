@@ -50,6 +50,7 @@ import {
 } from "../verify-harness-commits.ts";
 import { makePipelineRunId } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
+import { runHarnessRound, type HarnessRoundContext } from "../harness-round.ts";
 import { detectIgnoredArtifacts } from "../ignored-artifact-warning.ts";
 import * as openspec from "../openspec.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
@@ -604,25 +605,12 @@ export async function advanceFix(
     };
   }
 
-  // Ensure the worktree is on its pipeline branch before the harness commits.
-  // The review stage may have checked out a specific SHA (detached HEAD); any
-  // commits made while detached don't move the branch ref, so the later push
-  // would silently leave the PR branch unchanged.
-  const reattach = await reattachIfDetached(wt, issueNumber);
-  if (!reattach.ok) {
-    await setBlocked(
-      cfg, issueNumber,
-      `Failed to reattach detached worktree to pipeline branch: ${reattach.stderr}`,
-      stage, "needs-human",
-    );
-    return { advanced: false, status: "blocked", reason: "reattach failed" };
-  }
-
-  // Capture HEAD before so we can detect non-commits. Mutable: the external-commit
-  // advance path (#349) rebases this to the reviewed SHA so the commit/openspec/
-  // format/test gates below validate the externally-applied commit(s) rather than
-  // seeing a no-op diff.
-  let headBefore = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
+  // Shared implementer-round skeleton (#629): reattach → headBefore → invoke
+  // (with crash-retry inside invoke) → salvage → stage-owned gates/push.
+  // Prompt assembly needs headBefore for reviewedSha, so capture head for the
+  // prompt via a short pre-round read; the shared helper re-captures for the
+  // commit-range (reattach may not change HEAD content).
+  const preRoundHead = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
 
   // Use branch-diff to identify the OpenSpec change this branch introduced rather
   // than changes[0], which may be an unrelated pre-existing change in the worktree.
@@ -642,10 +630,10 @@ export async function advanceFix(
     fixRound: round,
     pipelineRunId,
     specContext,
-    // #391: the SHA the harness is being asked to assess against — headBefore
+    // #391: the SHA the harness is being asked to assess against — preRoundHead
     // at this point equals the reviewed SHA (no commits have happened yet).
     // A does-not-reproduce declaration must exactly match this value.
-    reviewedSha: headBefore,
+    reviewedSha: preRoundHead,
   });
   const model = opts.model ?? cfg.models.fix;
   // External stage executor delegation (#314): fix-1/fix-2 are
@@ -690,92 +678,140 @@ export async function advanceFix(
     });
   };
 
-  // Crash-retry loop (#486): a fix-harness invocation that exits non-zero or
-  // times out is retried in place, up to cfg.auto_recovery_max_retries
-  // additional times, within the remaining fix_timeout budget — never
-  // touching git/the worktree, so a crashed attempt's uncommitted work is
-  // exactly what the retry inherits.
-  const retryResult = await invokeFixHarnessWithRetry({
-    maxRetries: cfg.auto_recovery_max_retries,
-    fixTimeoutSec: cfg.fix_timeout,
-    basePrompt: prompt,
-    invokeAttempt: deps.invokeFixHarnessAttempt ?? invokeAttempt,
-    onBeforeAttempt: async (attempt, _timeoutSec, attemptPrompt) => {
-      if (!opts.stateDir) return;
-      const kind = attempt === 1 ? `fix-${round}` : `fix-${round}-retry-${attempt}`;
-      await recordPrompt(
-        opts.stateDir,
-        issueNumber,
-        stage,
-        makePromptRecord(kind, harness, attemptPrompt),
-      ).catch(() => {});
+  type FixRoundInvoke = {
+    result: HarnessResult;
+    retryResult: Awaited<ReturnType<typeof invokeFixHarnessWithRetry>>;
+  };
+  type FixRoundEarly = { kind: "early"; outcome: Outcome };
+  type FixRoundContinue = {
+    kind: "continue";
+    ctx: HarnessRoundContext<FixRoundInvoke>;
+    crashSalvaged: boolean;
+  };
+
+  const roundResult = await runHarnessRound<FixRoundInvoke, FixRoundEarly | FixRoundContinue>({
+    wtPath: wt.path,
+    issueNumber,
+    pipelineRunId,
+    salvageLabel: fixSalvageStageLabel(round, issueNumber),
+    // Ensure the worktree is on its pipeline branch before the harness commits.
+    // The review stage may have checked out a specific SHA (detached HEAD); any
+    // commits made while detached don't move the branch ref, so the later push
+    // would silently leave the PR branch unchanged.
+    reattach: { wt, issueNumber },
+    // Salvage on crash always (dirty tree may hold work even if HEAD moved), or
+    // on success when confirmed no-new-commit (#131 / #486).
+    shouldAttemptSalvage: ({ confirmedNoNewCommit, invokeResult }) =>
+      !invokeResult.result.success || confirmedNoNewCommit,
+    invoke: async () => {
+      // Crash-retry loop (#486): a fix-harness invocation that exits non-zero or
+      // times out is retried in place, up to cfg.auto_recovery_max_retries
+      // additional times, within the remaining fix_timeout budget — never
+      // touching git/the worktree, so a crashed attempt's uncommitted work is
+      // exactly what the retry inherits.
+      const retryResult = await invokeFixHarnessWithRetry({
+        maxRetries: cfg.auto_recovery_max_retries,
+        fixTimeoutSec: cfg.fix_timeout,
+        basePrompt: prompt,
+        invokeAttempt: deps.invokeFixHarnessAttempt ?? invokeAttempt,
+        onBeforeAttempt: async (attempt, _timeoutSec, attemptPrompt) => {
+          if (!opts.stateDir) return;
+          const kind = attempt === 1 ? `fix-${round}` : `fix-${round}-retry-${attempt}`;
+          await recordPrompt(
+            opts.stateDir,
+            issueNumber,
+            stage,
+            makePromptRecord(kind, harness, attemptPrompt),
+          ).catch(() => {});
+        },
+        onRetryScheduled: async (attempt, limit, reason) => {
+          const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+          if (opts.runDir) {
+            await appendEvent(
+              opts.runDir,
+              { schema_version: RUN_SCHEMA_VERSION, type: "fix_harness_retry", at, stage, attempt, limit, reason },
+              opts.runStoreDeps,
+            ).catch(() => {});
+          }
+          if (opts.stateDir) {
+            await recordRecovery(opts.stateDir, issueNumber, {
+              trigger: `fix-harness-crash-retry: ${reason}`,
+              round: attempt,
+              at,
+            }).catch(() => {});
+          }
+        },
+      });
+      const result = retryResult.finalResult;
+
+      // #553: the final attempt was served by an external stage executor with no
+      // cwd of its own — sync `wt.path` to whatever it may have pushed to the
+      // issue branch before any local git state (HEAD, status, salvage) is read
+      // below, so the executor's real result and the pipeline's inspection can
+      // never diverge.
+      if (result.executor_name) {
+        await syncWorktreeToDelegatedExecutorResult(wt.path, branchName(issueNumber, wt.slug));
+      }
+      return { result, retryResult };
     },
-    onRetryScheduled: async (attempt, limit, reason) => {
-      const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-      if (opts.runDir) {
-        await appendEvent(
-          opts.runDir,
-          { schema_version: RUN_SCHEMA_VERSION, type: "fix_harness_retry", at, stage, attempt, limit, reason },
-          opts.runStoreDeps,
-        ).catch(() => {});
+    onReattachFailed: async (stderr) => {
+      await setBlocked(
+        cfg, issueNumber,
+        `Failed to reattach detached worktree to pipeline branch: ${stderr}`,
+        stage, "needs-human",
+      );
+      return { kind: "early", outcome: { advanced: false, status: "blocked", reason: "reattach failed" } };
+    },
+    deps: {
+      gitHead: async (cwd) =>
+        (await gitInWorktree(cwd, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim(),
+      reattach: (worktree, issue) => reattachIfDetached(worktree, issue),
+      salvage: trySalvageUncommittedWork,
+    },
+    afterRound: async (ctx) => {
+      const result = ctx.invokeResult.result;
+      const retryResult = ctx.invokeResult.retryResult;
+      // Crash salvage: retries exhausted; salvage of crashed attempts' work (#486).
+      if (!result.success && !ctx.salvaged) {
+        const finalReason = result.timed_out
+          ? `timed out after ${result.duration.toFixed(0)}s`
+          : `exit ${result.exit_code}`;
+        const attemptsNote = retryResult.attempts.length > 1
+          ? ` after ${retryResult.attempts.length} attempts`
+          : "";
+        const budgetNote = retryResult.budgetExhausted
+          ? " The remaining fix_timeout budget was exhausted before another retry could be attempted."
+          : "";
+        // #521: disclose why nothing was salvaged so the operator can see that
+        // recoverable work may still exist without reading terminal.log.
+        // #553: a genuinely clean worktree (no salvage failure) is named
+        // explicitly — the harness ran but left nothing recoverable there.
+        const salvageNote = ctx.salvageFailureReason
+          ? ` Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
+          : ` Worktree ${wt.path} is clean; no recoverable work was found there.`;
+        const baseReason = `Fix harness (${harness}) failed${attemptsNote}: ${finalReason}.${budgetNote}${salvageNote}`;
+        const reason = await appendWorktreeStateDisclosure(wt.path, baseReason);
+        await setBlocked(cfg, issueNumber, reason, stage, "harness-failure");
+        return { kind: "early", outcome: fixHarnessFailureOutcome(finalReason) };
       }
-      if (opts.stateDir) {
-        await recordRecovery(opts.stateDir, issueNumber, {
-          trigger: `fix-harness-crash-retry: ${reason}`,
-          round: attempt,
-          at,
-        }).catch(() => {});
-      }
+      return {
+        kind: "continue",
+        ctx,
+        crashSalvaged: !result.success && ctx.salvaged,
+      };
     },
   });
-  const result = retryResult.finalResult;
 
-  // #553: the final attempt was served by an external stage executor with no
-  // cwd of its own — sync `wt.path` to whatever it may have pushed to the
-  // issue branch before any local git state (HEAD, status, salvage) is read
-  // below, so the executor's real result and the pipeline's inspection can
-  // never diverge.
-  if (result.executor_name) {
-    await syncWorktreeToDelegatedExecutorResult(wt.path, branchName(issueNumber, wt.slug));
-  }
+  if (roundResult.kind === "early") return roundResult.outcome;
 
-  // Retries exhausted (cap reached, or remaining budget fell at/below the
-  // usable floor). Before the terminal block, attempt salvage of whatever
-  // uncommitted work the crashed attempts left behind (#486) — the same
-  // salvage path used by the success-but-no-commit case below — instead of
-  // abandoning a near-complete diff to a human.
-  let crashSalvaged = false;
-  if (!result.success) {
-    const finalReason = result.timed_out
-      ? `timed out after ${result.duration.toFixed(0)}s`
-      : `exit ${result.exit_code}`;
-    const { salvaged, failureReason: crashSalvageFailure } = await trySalvageUncommittedWork(
-      wt.path,
-      issueNumber,
-      pipelineRunId,
-      fixSalvageStageLabel(round, issueNumber),
-    );
-    if (!salvaged) {
-      const attemptsNote = retryResult.attempts.length > 1
-        ? ` after ${retryResult.attempts.length} attempts`
-        : "";
-      const budgetNote = retryResult.budgetExhausted
-        ? " The remaining fix_timeout budget was exhausted before another retry could be attempted."
-        : "";
-      // #521: disclose why nothing was salvaged so the operator can see that
-      // recoverable work may still exist without reading terminal.log.
-      // #553: a genuinely clean worktree (no salvage failure) is named
-      // explicitly — the harness ran but left nothing recoverable there.
-      const salvageNote = crashSalvageFailure
-        ? ` Salvage of uncommitted work also failed: ${crashSalvageFailure}`
-        : ` Worktree ${wt.path} is clean; no recoverable work was found there.`;
-      const baseReason = `Fix harness (${harness}) failed${attemptsNote}: ${finalReason}.${budgetNote}${salvageNote}`;
-      const reason = await appendWorktreeStateDisclosure(wt.path, baseReason);
-      await setBlocked(cfg, issueNumber, reason, stage, "harness-failure");
-      return fixHarnessFailureOutcome(finalReason);
-    }
-    crashSalvaged = true;
-  }
+  const result = roundResult.ctx.invokeResult.result;
+  // Capture HEAD before so we can detect non-commits. Mutable: the external-commit
+  // advance path (#349) rebases this to the reviewed SHA so the commit/openspec/
+  // format/test gates below validate the externally-applied commit(s) rather than
+  // seeing a no-op diff.
+  let headBefore = roundResult.ctx.headBefore;
+  const crashSalvaged = roundResult.crashSalvaged;
+  const noCommitSalvageFailure = roundResult.ctx.salvageFailureReason;
 
   // Set when the no-new-commits path (#349) decides the reviewed SHA is stale
   // (fix already applied externally); carries the decided target stage through
@@ -792,18 +828,12 @@ export async function advanceFix(
   // so the headBefore === headAfter branch below (the #131 success-but-no-commit
   // path) is correctly skipped — the crash-retry salvage already produced the
   // commit that path exists to create.
-  let headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
-  if (!crashSalvaged && headBefore && headAfter && headBefore === headAfter) {
-    // #131: the harness reported success without committing — salvage real
-    // uncommitted work into a commit instead of discarding it. A clean
-    // worktree (nothing salvaged) keeps the existing block path.
-    const { salvaged, failureReason: noCommitSalvageFailure } = await trySalvageUncommittedWork(
-      wt.path,
-      issueNumber,
-      pipelineRunId,
-      fixSalvageStageLabel(round, issueNumber),
-    );
-    if (!salvaged) {
+  let headAfter = roundResult.ctx.headAfter;
+  if (!crashSalvaged && headBefore && headAfter && headBefore === headAfter && !roundResult.ctx.salvaged) {
+    // #131: the harness reported success without committing and salvage found
+    // nothing — external-advance / DNR / block paths below (salvage already
+    // attempted by the shared helper).
+    {
       // #349: before blocking, check whether a human already pushed the fix the
       // reviewer asked for. When HEAD is past the SHA the reviewer last saw,
       // treat this as "fix already applied externally" and advance instead of
@@ -991,8 +1021,6 @@ export async function advanceFix(
         await setBlocked(cfg, issueNumber, noCommitsReason, stage, "no-commits");
         return { advanced: false, status: "blocked", reason: noCommitsMsg, blockerKind: "no-commits" };
       }
-    } else {
-      headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
     }
   }
 

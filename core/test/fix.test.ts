@@ -831,15 +831,14 @@ test("syncWorktreeToDelegatedExecutorResult: merges FETCH_HEAD, not the origin/<
 
 test("advanceFix source pin: a delegated executor result triggers the worktree sync before any local git state is read", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  // Inside the shared harness-round invoke callback (#629): retry result → sync → return
+  // so the helper's post-invoke HEAD read cannot race a delegated executor push.
   const retryIdx = src.indexOf("const result = retryResult.finalResult;");
   const syncIdx = src.indexOf("await syncWorktreeToDelegatedExecutorResult(wt.path,", retryIdx);
-  const headAfterIdx = src.indexOf(
-    'let headAfter = (await gitInWorktree(wt.path, ["rev-parse", "HEAD"]',
-    retryIdx,
-  );
-  assert.ok(retryIdx !== -1 && syncIdx !== -1 && headAfterIdx !== -1);
+  const returnIdx = src.indexOf("return { result, retryResult };", syncIdx);
+  assert.ok(retryIdx !== -1 && syncIdx !== -1 && returnIdx !== -1);
   assert.ok(retryIdx < syncIdx, "the sync must run after the harness result is known");
-  assert.ok(syncIdx < headAfterIdx, "the sync must run before local HEAD is read for new-commit detection");
+  assert.ok(syncIdx < returnIdx, "the sync must run before the invoke callback returns (before shared helper reads HEAD)");
   const guardSlice = src.slice(retryIdx, syncIdx);
   assert.match(
     guardSlice,
@@ -2276,20 +2275,26 @@ test("advanceFix source pin: no destructive git/worktree call anywhere in fix.ts
   assert.doesNotMatch(src, /"restore"|'restore'/, "fix.ts must never issue a working-tree git restore");
 });
 
-test("advanceFix source pin: on retry exhaustion, salvage is attempted before the terminal harness-failure block (#486)", async () => {
+test("advanceFix source pin: on retry exhaustion, salvage is attempted before the terminal harness-failure block (#486/#629)", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  // Shared harness-round owns salvage; fix still sequences retry → salvage → block.
+  const roundIdx = src.indexOf("runHarnessRound");
   const retryIdx = src.indexOf("const retryResult = await invokeFixHarnessWithRetry(");
-  const salvageIdx = src.indexOf("const { salvaged, failureReason: crashSalvageFailure } = await trySalvageUncommittedWork(", retryIdx);
+  const salvageModeIdx = src.indexOf("shouldAttemptSalvage:", roundIdx);
+  const crashFailIdx = src.indexOf("if (!result.success && !ctx.salvaged)", retryIdx);
   const blockIdx = src.indexOf('await setBlocked(cfg, issueNumber, reason, stage, "harness-failure");', retryIdx);
-  assert.ok(retryIdx !== -1 && salvageIdx !== -1 && blockIdx !== -1);
-  assert.ok(retryIdx < salvageIdx, "the retry loop must run before salvage is attempted");
-  assert.ok(salvageIdx < blockIdx, "salvage must be attempted before the terminal harness-failure block");
+  assert.ok(roundIdx !== -1, "fix-round must use shared runHarnessRound (#629)");
+  assert.ok(retryIdx !== -1 && salvageModeIdx !== -1 && crashFailIdx !== -1 && blockIdx !== -1);
+  assert.ok(retryIdx < crashFailIdx, "the retry loop must run before crash-salvage outcome handling");
+  assert.ok(crashFailIdx < blockIdx, "salvage outcome must be checked before the terminal harness-failure block");
 });
 
-test("advanceFix source pin: a crash-retry salvage falls through the SAME downstream gates as a harness commit, skipping the #131 no-commit branch (#486)", async () => {
+test("advanceFix source pin: a crash-retry salvage falls through the SAME downstream gates as a harness commit, skipping the #131 no-commit branch (#486/#629)", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
-  const crashSalvagedSetIdx = src.indexOf("crashSalvaged = true;");
-  const skipGuardIdx = src.indexOf("if (!crashSalvaged && headBefore && headAfter && headBefore === headAfter) {");
+  const crashSalvagedSetIdx = src.indexOf("crashSalvaged: !result.success && ctx.salvaged");
+  const skipGuardIdx = src.indexOf(
+    "if (!crashSalvaged && headBefore && headAfter && headBefore === headAfter && !roundResult.ctx.salvaged)",
+  );
   const commitGateIdx = src.indexOf("Verify fix-round commit message format (#68)", skipGuardIdx);
   assert.ok(crashSalvagedSetIdx !== -1, "expected crashSalvaged to be set on a successful crash-retry salvage");
   assert.ok(skipGuardIdx !== -1, "expected the #131 no-commit branch to be gated on !crashSalvaged");
@@ -2307,7 +2312,7 @@ test("advanceFix source pin: retry-event/recovery recording is best-effort — a
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
   const onRetryIdx = src.indexOf("onRetryScheduled: async (attempt, limit, reason) => {");
   assert.ok(onRetryIdx !== -1);
-  const onRetryBlock = src.slice(onRetryIdx, onRetryIdx + 600);
+  const onRetryBlock = src.slice(onRetryIdx, onRetryIdx + 1200);
   const appendEventCall = onRetryBlock.match(/await appendEvent\([\s\S]*?\)\.catch\(\(\) => \{\}\);/);
   const recordRecoveryCall = onRetryBlock.match(/await recordRecovery\([\s\S]*?\)\.catch\(\(\) => \{\}\);/);
   assert.ok(appendEventCall, "retry appendEvent call must be .catch()-wrapped (best-effort)");

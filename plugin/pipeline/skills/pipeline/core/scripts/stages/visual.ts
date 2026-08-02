@@ -43,6 +43,7 @@ import {
 } from "../verify-harness-commits.ts";
 import { makePipelineRunId, validateCommitTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
+import { runHarnessRound } from "../harness-round.ts";
 import { makeCommandRecord, makePromptRecord, recordCommand, recordPrompt } from "../evidence-bundle.ts";
 import { redactSecrets } from "../artifact-sanitize.ts";
 import type { BlockerKind, Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -78,11 +79,12 @@ const PUBLISH_MAX_TOTAL_BYTES = 10 * 1024 * 1024; // 10MB total
  *  the publish commit by `git add -f`. */
 const PUBLISH_EVIDENCE_DIR = ".pipeline-visual-evidence";
 
-/** Commit-subject prefix for the artifact-publish commit. Recognized by
- *  `isPipelineInternalCommit` (pre_merge.ts) so it does not invalidate a
- *  recorded review verdict; must NOT match `visualFixCommitPattern` so it is
- *  never mistaken for a visual-fix commit. */
-export const VISUAL_PUBLISH_COMMIT_PREFIX = "chore: publish visual-gate evidence for #";
+import { VISUAL_PUBLISH_COMMIT_PREFIX } from "../pipeline-commits.ts";
+/** Commit-subject prefix for the artifact-publish commit. Single-sourced with
+ *  `isPipelineInternalCommit` in `pipeline-commits.ts` (#629) so it does not
+ *  invalidate a recorded review verdict; must NOT match `visualFixCommitPattern`
+ *  so it is never mistaken for a visual-fix commit. */
+export { VISUAL_PUBLISH_COMMIT_PREFIX };
 
 export interface AdvanceVisualOpts {
   dryRun?: boolean;
@@ -787,84 +789,93 @@ async function runVisualFixRound(
     ).catch(() => {});
   }
 
-  const headBefore = await deps.gitHead(wtPath);
-  const fixModel = cfg.models.fix;
-  const fixRes = await deps.invoke(harness, wtPath, prompt, {
-    timeoutSec: cfg.fix_timeout,
-    model: fixModel,
-    sandbox: cfg.harness_sandbox,
-    accounting: opts.runDir
-      ? {
-          runDir: opts.runDir,
-          runStoreDeps: opts.runStoreDeps,
-          issue: issueNumber,
-          stage: "visual-gate",
-          modelSlot: "fix",
-          model: fixModel,
+  // Shared implementer-round skeleton (#629): headBefore → invoke → salvage →
+  // stage-owned verify/push. Reattach is not required here (visual fix runs
+  // on the already-attached managed worktree from the visual command).
+  return runHarnessRound<HarnessResult, VisualFixRoundResult>({
+    wtPath,
+    issueNumber,
+    pipelineRunId,
+    salvageLabel: visualFixSalvageStageLabel(issueNumber),
+    shouldAttemptSalvage: ({ confirmedNoNewCommit, invokeResult }) =>
+      Boolean(invokeResult.success && confirmedNoNewCommit),
+    invoke: async () => {
+      const fixModel = cfg.models.fix;
+      return deps.invoke(harness, wtPath, prompt, {
+        timeoutSec: cfg.fix_timeout,
+        model: fixModel,
+        sandbox: cfg.harness_sandbox,
+        accounting: opts.runDir
+          ? {
+              runDir: opts.runDir,
+              runStoreDeps: opts.runStoreDeps,
+              issue: issueNumber,
+              stage: "visual-gate",
+              modelSlot: "fix",
+              model: fixModel,
+            }
+          : undefined,
+      });
+    },
+    deps: {
+      gitHead: deps.gitHead,
+      salvage: deps.salvage,
+    },
+    afterRound: async (ctx) => {
+      const fixRes = ctx.invokeResult;
+      if (!fixRes.success) {
+        const reason = fixRes.timed_out
+          ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on visual-gate fix round ${attempt}.`
+          : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on visual-gate fix round ${attempt}.`;
+        return { ok: false, reason, blockerKind: "harness-failure" };
+      }
+
+      if (ctx.confirmedNoNewCommit && !ctx.salvaged) {
+        // #521: disclose why nothing was salvaged so the operator can see that
+        // recoverable work may still exist without reading terminal.log.
+        const reason = ctx.salvageFailureReason
+          ? `visual-gate fix round ${attempt} reported success but produced no new commits. ` +
+            `Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
+          : `visual-gate fix round ${attempt} reported success but produced no new commits.`;
+        return { ok: false, reason, blockerKind: "harness-failure" };
+      }
+
+      if (await deps.gitDirty(wtPath)) {
+        return {
+          ok: false,
+          reason:
+            `visual-gate fix round ${attempt} left uncommitted changes in the working tree. ` +
+            "Visual gate results can't be trusted — stage and commit the fix before re-running.",
+          blockerKind: "harness-failure",
+        };
+      }
+
+      if (ctx.headBefore) {
+        const commitCheck = await deps.verifyVisualFix(wtPath, ctx.headBefore);
+        if (!commitCheck.ok) {
+          return { ok: false, reason: commitCheck.reason, blockerKind: "harness-failure" };
         }
-      : undefined,
+
+        const newMessages = await deps.gitCommitMessages(wtPath, ctx.headBefore);
+        const trailerErr = validateCommitTrailers(newMessages, issueNumber, pipelineRunId);
+        if (trailerErr) {
+          return { ok: false, reason: trailerErr, blockerKind: "harness-failure" };
+        }
+      }
+
+      const branch = branchName(issueNumber, slug);
+      const push = await deps.gitPush(wtPath, branch);
+      if (push.code !== 0) {
+        return {
+          ok: false,
+          reason: `Git push failed after visual-gate fix: ${push.stderr.trim()}`,
+          blockerKind: "push-failed",
+        };
+      }
+
+      return { ok: true };
+    },
   });
-
-  if (!fixRes.success) {
-    const reason = fixRes.timed_out
-      ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on visual-gate fix round ${attempt}.`
-      : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on visual-gate fix round ${attempt}.`;
-    return { ok: false, reason, blockerKind: "harness-failure" };
-  }
-
-  let headAfter = await deps.gitHead(wtPath);
-  if (headBefore && headAfter && headBefore === headAfter) {
-    const { salvaged, failureReason } = await deps.salvage(wtPath, issueNumber, pipelineRunId, visualFixSalvageStageLabel(issueNumber));
-    if (!salvaged) {
-      // #521: disclose why nothing was salvaged so the operator can see that
-      // recoverable work may still exist without reading terminal.log.
-      const reason = failureReason
-        ? `visual-gate fix round ${attempt} reported success but produced no new commits. ` +
-          `Salvage of uncommitted work also failed: ${failureReason}`
-        : `visual-gate fix round ${attempt} reported success but produced no new commits.`;
-      return {
-        ok: false,
-        reason,
-        blockerKind: "harness-failure",
-      };
-    }
-    headAfter = await deps.gitHead(wtPath);
-  }
-
-  if (await deps.gitDirty(wtPath)) {
-    return {
-      ok: false,
-      reason:
-        `visual-gate fix round ${attempt} left uncommitted changes in the working tree. ` +
-        "Visual gate results can't be trusted — stage and commit the fix before re-running.",
-      blockerKind: "harness-failure",
-    };
-  }
-
-  if (headBefore) {
-    const commitCheck = await deps.verifyVisualFix(wtPath, headBefore);
-    if (!commitCheck.ok) {
-      return { ok: false, reason: commitCheck.reason, blockerKind: "harness-failure" };
-    }
-
-    const newMessages = await deps.gitCommitMessages(wtPath, headBefore);
-    const trailerErr = validateCommitTrailers(newMessages, issueNumber, pipelineRunId);
-    if (trailerErr) {
-      return { ok: false, reason: trailerErr, blockerKind: "harness-failure" };
-    }
-  }
-
-  const branch = branchName(issueNumber, slug);
-  const push = await deps.gitPush(wtPath, branch);
-  if (push.code !== 0) {
-    return {
-      ok: false,
-      reason: `Git push failed after visual-gate fix: ${push.stderr.trim()}`,
-      blockerKind: "push-failed",
-    };
-  }
-
-  return { ok: true };
 }
 
 function eventTimestamp(): string {
