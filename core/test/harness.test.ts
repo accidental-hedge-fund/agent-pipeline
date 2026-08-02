@@ -201,6 +201,57 @@ test("invoke(): claude with sandbox absent (undefined) defaults to bypassPermiss
   }
 });
 
+/** #613: managed-sandbox Codex argv is consecutive `--sandbox` + `workspace-write`. */
+function assertCodexManagedSandboxArgv(argvText: string, message?: string): void {
+  const lines = argvText.split("\n").filter((l) => l !== "");
+  const sandboxIdx = lines.indexOf("--sandbox");
+  assert.ok(sandboxIdx !== -1, message ?? "managed codex argv must include --sandbox");
+  assert.equal(
+    lines[sandboxIdx + 1],
+    "workspace-write",
+    message ?? "managed codex argv must pass workspace-write immediately after --sandbox",
+  );
+  assert.doesNotMatch(argvText, /--full-auto/, "managed codex argv must not reintroduce deprecated --full-auto");
+  assert.doesNotMatch(argvText, /(^|\n)-a(\n|$)/, "managed codex argv must not pass -a after exec");
+  assert.doesNotMatch(argvText, /--ask-for-approval/, "managed codex argv must not pass --ask-for-approval after exec");
+  assert.doesNotMatch(
+    argvText,
+    /--dangerously-bypass-approvals-and-sandbox/,
+    "managed codex argv must not also pass the external-bypass flag",
+  );
+}
+
+/** Strip the multi-token managed sandbox sequence for managed-vs-bypass comparison (#613 D3). */
+function stripCodexManagedSandboxArgs(lines: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i] === "--sandbox" && lines[i + 1] === "workspace-write") {
+      i++; // skip both tokens
+      continue;
+    }
+    if (lines[i] === "") continue;
+    out.push(lines[i]!);
+  }
+  return out;
+}
+
+function assertCodexBypassSandboxArgv(argvText: string): void {
+  assert.match(
+    argvText,
+    /--dangerously-bypass-approvals-and-sandbox/,
+    "bypass codex argv must use Codex's no-sandbox automation mode",
+  );
+  assert.doesNotMatch(argvText, /--full-auto/, "bypass codex argv must not pass --full-auto");
+  assert.doesNotMatch(argvText, /(^|\n)-a(\n|$)/, "bypass codex argv must not pass -a after exec");
+  assert.doesNotMatch(argvText, /--ask-for-approval/, "bypass codex argv must not pass --ask-for-approval after exec");
+  const lines = argvText.split("\n").filter((l) => l !== "");
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i] === "--sandbox" && lines[i + 1] === "workspace-write") {
+      assert.fail("bypass codex argv must not carry the managed --sandbox workspace-write pair");
+    }
+  }
+}
+
 test("invoke(): codex with sandbox:true produces args identical to sandbox:false (#21)", async () => {
   const cli = makeScript("codex", `printf '%s\\n' "$@"`);
   const oldPath = process.env.PATH;
@@ -213,7 +264,7 @@ test("invoke(): codex with sandbox:true produces args identical to sandbox:false
       invoke("codex", tmpRoot, "test-prompt", { stream: false, sandbox: false }),
     ]);
     assert.equal(withSandbox.stdout, withoutSandbox.stdout, "codex args must be identical regardless of sandbox flag");
-    assert.match(withSandbox.stdout, /--full-auto/, "default codex invocation must keep --full-auto");
+    assertCodexManagedSandboxArgv(withSandbox.stdout, "default codex invocation must use managed --sandbox workspace-write (#613)");
   } finally {
     process.env.PATH = oldPath;
     if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
@@ -229,12 +280,7 @@ test("invoke(): PIPELINE_CODEX_NO_SANDBOX=1 switches codex to explicit no-sandbo
   process.env.PIPELINE_CODEX_NO_SANDBOX = "1";
   try {
     const result = await invoke("codex", tmpRoot, "test-prompt", { stream: false });
-    assert.match(
-      result.stdout,
-      /--dangerously-bypass-approvals-and-sandbox/,
-      "explicit env opt-in must use Codex's no-sandbox automation mode",
-    );
-    assert.doesNotMatch(result.stdout, /--full-auto/, "no-sandbox mode must not also pass --full-auto");
+    assertCodexBypassSandboxArgv(result.stdout);
     const { argvLines, stdin } = splitArgvStdin(result.stdout);
     assert.equal(argvLines[argvLines.length - 1], "-", "codex must receive the trailing '-' stdin sentinel, not the prompt, as its last positional (#492)");
     assert.doesNotMatch(argvLines.join("\n"), /test-prompt/, "the prompt must never appear in argv (#492)");
@@ -252,6 +298,9 @@ test("invoke(): PIPELINE_CODEX_NO_SANDBOX=1 switches codex to explicit no-sandbo
 // taking precedence over the ambient PIPELINE_CODEX_NO_SANDBOX env var. The
 // two tests above (no sandboxMode supplied) must keep passing unchanged —
 // they pin the pre-#607 ambient-only behavior.
+// #613: managed selector is the multi-token sequence `--sandbox` +
+// `workspace-write` (not deprecated `--full-auto`); comparison strips that
+// sequence, not a single alias token.
 // ---------------------------------------------------------------------------
 
 test("invoke(): sandboxMode 'external-bypass' selects the bypass argument, with the rest of argv unchanged", async () => {
@@ -265,13 +314,13 @@ test("invoke(): sandboxMode 'external-bypass' selects the bypass argument, with 
       invoke("codex", tmpRoot, "test-prompt", { stream: false, sandboxMode: "managed" }),
       invoke("codex", tmpRoot, "test-prompt", { stream: false, sandboxMode: "external-bypass" }),
     ]);
-    assert.match(managed.stdout, /--full-auto/);
-    assert.doesNotMatch(managed.stdout, /--dangerously-bypass-approvals-and-sandbox/);
-    assert.match(bypass.stdout, /--dangerously-bypass-approvals-and-sandbox/);
-    assert.doesNotMatch(bypass.stdout, /--full-auto/);
-    const managedArgs = managed.stdout.split("\n").filter((l) => l !== "--full-auto" && l !== "");
-    const bypassArgs = bypass.stdout.split("\n").filter((l) => l !== "--dangerously-bypass-approvals-and-sandbox" && l !== "");
-    assert.deepEqual(managedArgs, bypassArgs, "the two sandbox modes must differ only in the sandbox-selecting argument");
+    assertCodexManagedSandboxArgv(managed.stdout);
+    assertCodexBypassSandboxArgv(bypass.stdout);
+    const managedArgs = stripCodexManagedSandboxArgs(managed.stdout.split("\n"));
+    const bypassArgs = bypass.stdout
+      .split("\n")
+      .filter((l) => l !== "--dangerously-bypass-approvals-and-sandbox" && l !== "");
+    assert.deepEqual(managedArgs, bypassArgs, "the two sandbox modes must differ only in the sandbox-selecting argument sequence");
   } finally {
     process.env.PATH = oldPath;
     if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
@@ -287,8 +336,10 @@ test("invoke(): an explicit sandboxMode 'managed' overrides an ambient PIPELINE_
   process.env.PIPELINE_CODEX_NO_SANDBOX = "1";
   try {
     const result = await invoke("codex", tmpRoot, "test-prompt", { stream: false, sandboxMode: "managed" });
-    assert.match(result.stdout, /--full-auto/, "explicit managed mode must win over the ambient bypass env var");
-    assert.doesNotMatch(result.stdout, /--dangerously-bypass-approvals-and-sandbox/);
+    assertCodexManagedSandboxArgv(
+      result.stdout,
+      "explicit managed mode must win over the ambient bypass env var (#613)",
+    );
   } finally {
     process.env.PATH = oldPath;
     if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
@@ -304,12 +355,11 @@ test("invoke(): no caller-supplied sandboxMode reproduces the ambient-only PIPEL
   try {
     process.env.PIPELINE_CODEX_NO_SANDBOX = "1";
     const withEnvBypass = await invoke("codex", tmpRoot, "test-prompt", { stream: false });
-    assert.match(withEnvBypass.stdout, /--dangerously-bypass-approvals-and-sandbox/);
+    assertCodexBypassSandboxArgv(withEnvBypass.stdout);
 
     delete process.env.PIPELINE_CODEX_NO_SANDBOX;
     const withoutEnvBypass = await invoke("codex", tmpRoot, "test-prompt", { stream: false });
-    assert.match(withoutEnvBypass.stdout, /--full-auto/);
-    assert.doesNotMatch(withoutEnvBypass.stdout, /--dangerously-bypass-approvals-and-sandbox/);
+    assertCodexManagedSandboxArgv(withoutEnvBypass.stdout);
   } finally {
     process.env.PATH = oldPath;
     if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
@@ -473,32 +523,45 @@ test("invoke(): a timed-out harness kills its grandchild — proves invoke() thr
 test("invoke(): codex with reasoningEffort:'medium' includes -c model_reasoning_effort=medium in args (#278)", async () => {
   const cli = makeArgvStdinScript("codex");
   const oldPath = process.env.PATH;
+  const oldNoSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  delete process.env.PIPELINE_CODEX_NO_SANDBOX;
   try {
     const result = await invoke("codex", tmpRoot, "PROMPT-MARKER", { stream: false, reasoningEffort: "medium" });
     const { argvLines, stdin } = splitArgvStdin(result.stdout);
+    assertCodexManagedSandboxArgv(argvLines.join("\n"), "reasoning-effort path must keep managed sandbox flags (#613)");
     const cIdx = argvLines.indexOf("-c");
     assert.ok(cIdx !== -1, "-c flag must be present in codex args");
     assert.equal(argvLines[cIdx + 1], "model_reasoning_effort=medium", "-c value must be model_reasoning_effort=medium");
+    // Effort must sit immediately before the stdin sentinel (#613 / plan-review-effort-controls).
+    assert.equal(argvLines[argvLines.length - 3], "-c", "reasoning-effort -c must sit immediately before the stdin sentinel");
+    assert.equal(argvLines[argvLines.length - 2], "model_reasoning_effort=medium");
     // The prompt is delivered on stdin, not argv (#492); the trailing
     // positional is the '-' stdin sentinel.
     assert.equal(argvLines[argvLines.length - 1], "-", "codex must receive the trailing '-' stdin sentinel");
     assert.equal(stdin, "PROMPT-MARKER", "prompt must be delivered on stdin");
   } finally {
     process.env.PATH = oldPath;
+    if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
+    else process.env.PIPELINE_CODEX_NO_SANDBOX = oldNoSandbox;
   }
 });
 
 test("invoke(): codex WITHOUT reasoningEffort has no -c model_reasoning_effort flag (#278)", async () => {
   const cli = makeScript("codex", `printf '%s\\n' "$@"`);
   const oldPath = process.env.PATH;
+  const oldNoSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  delete process.env.PIPELINE_CODEX_NO_SANDBOX;
   try {
     const result = await invoke("codex", tmpRoot, "PROMPT-MARKER", { stream: false });
+    assertCodexManagedSandboxArgv(result.stdout, "default managed path without effort must still use --sandbox workspace-write (#613)");
     assert.doesNotMatch(result.stdout, /model_reasoning_effort/, "no reasoning-effort flag when reasoningEffort is absent");
     assert.doesNotMatch(result.stdout, /-c\n/, "no -c flag when reasoningEffort is absent");
   } finally {
     process.env.PATH = oldPath;
+    if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
+    else process.env.PIPELINE_CODEX_NO_SANDBOX = oldNoSandbox;
   }
 });
 
@@ -1732,13 +1795,17 @@ test("invoke(): telemetry mode is the default — claude passes --verbose --outp
 test("invoke(): telemetry mode is the default — codex passes --json", async () => {
   const cli = makeScript("codex", `printf '%s\\n' "$@"`);
   const oldPath = process.env.PATH;
+  const oldNoSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  delete process.env.PIPELINE_CODEX_NO_SANDBOX;
   try {
     const result = await invoke("codex", tmpRoot, "test-prompt", { stream: false });
     assert.match(result.stdout, /--json/);
-    assert.match(result.stdout, /--full-auto/, "the sandbox flag must still be present alongside --json");
+    assertCodexManagedSandboxArgv(result.stdout, "the managed sandbox pair must still be present alongside --json (#613)");
   } finally {
     process.env.PATH = oldPath;
+    if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
+    else process.env.PIPELINE_CODEX_NO_SANDBOX = oldNoSandbox;
   }
 });
 

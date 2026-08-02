@@ -1,11 +1,18 @@
 // codex adapter — reproduces the pre-adapter argv byte-for-byte apart from
-// prompt delivery (#431 task 2.2; #492 moved the prompt off argv).
+// prompt delivery (#431 task 2.2; #492 moved the prompt off argv) and the
+// #613 managed-sandbox flag migration.
 //
-// codex: codex exec [--json] --full-auto -C <worktreeDir> [-m X]
+// codex: codex exec [--json] --sandbox workspace-write -C <worktreeDir> [-m X]
 //        [-c model_reasoning_effort=Y] -
 //        (the trailing `-` sentinel; prompt delivered on stdin, not as a
 //        positional)
-//        PIPELINE_CODEX_NO_SANDBOX=1 swaps --full-auto for
+//        Managed path uses consecutive `--sandbox` + `workspace-write` (not
+//        the deprecated `--full-auto` alias). On codex-cli 0.145.0, that shape
+//        is session-equivalent to former `--full-auto`: `approval: never` +
+//        `sandbox: workspace-write`. Post-`exec` approval-policy tokens
+//        (`-a` / `--ask-for-approval`) are rejected by the CLI and are not
+//        emitted; never-ask is the `codex exec` path default.
+//        PIPELINE_CODEX_NO_SANDBOX=1 swaps the managed sandbox pair for
 //        --dangerously-bypass-approvals-and-sandbox. #607: a caller-supplied
 //        `ctx.sandboxMode` takes precedence over that ambient env var — see
 //        AdapterInvocationContext.sandboxMode.
@@ -90,7 +97,9 @@ export function makeCodexForwardTransform(): (chunk: string) => string {
 const CAPABILITIES: AdapterCapabilities = {
   model: true,
   effort: true,
-  sandbox: false, // already workspace-sandboxed via --full-auto; sandbox opt is a no-op
+  // already workspace-sandboxed via --sandbox workspace-write; harness_sandbox
+  // opt is a no-op for codex (separate from the managed/bypass selector below)
+  sandbox: false,
   workingDir: "flag",
   telemetry: "jsonl",
 };
@@ -106,7 +115,16 @@ export const codexAdapter: HarnessAdapter = {
       : process.env.PIPELINE_CODEX_NO_SANDBOX === "1";
     const args = ["exec"];
     if (telemetryMode) args.push("--json");
-    args.push(noSandbox ? "--dangerously-bypass-approvals-and-sandbox" : "--full-auto", "-C", ctx.worktreeDir);
+    // Managed: `--sandbox` + `workspace-write` (two argv elements). Do not emit
+    // post-`exec` approval-policy tokens (`-a` / `--ask-for-approval`) — the
+    // CLI rejects them after `exec`, and never-ask is the exec-path default
+    // (#613 / codex-cli 0.145.0). Bypass is mutually exclusive with that pair.
+    if (noSandbox) {
+      args.push("--dangerously-bypass-approvals-and-sandbox");
+    } else {
+      args.push("--sandbox", "workspace-write");
+    }
+    args.push("-C", ctx.worktreeDir);
     if (ctx.model) args.push("-m", ctx.model);
     if (ctx.effort) args.push("-c", `model_reasoning_effort=${ctx.effort}`);
     args.push("-");

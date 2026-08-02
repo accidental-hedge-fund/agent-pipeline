@@ -12,8 +12,9 @@
 
 /** The execution sandbox mode a harness invocation runs under (#607 —
  *  eval-agent-isolation-boundary). `"managed"` is the harness's own sandbox
- *  (codex's `--full-auto`); `"external-bypass"` is the explicit bypass mode
- *  codex offers for a runner whose own sandbox (bubblewrap/userns) cannot
+ *  (codex: consecutive `--sandbox` + `workspace-write`; #613 replaced the
+ *  deprecated `--full-auto` alias); `"external-bypass"` is the explicit bypass
+ *  mode codex offers for a runner whose own sandbox (bubblewrap/userns) cannot
  *  start. Single-sourced here so the eval manifest and adapter invocation
  *  shaping never drift on the set of supported values. */
 export const EXTERNAL_SANDBOX_MODES = ["managed", "external-bypass"] as const;
@@ -25,7 +26,8 @@ export interface AdapterCapabilities {
   model: boolean;
   /** Supports a reasoning-effort control via a CLI flag. */
   effort: boolean;
-  /** Supports a restricted-permission / sandboxed mode distinct from full-auto. */
+  /** Supports a restricted-permission / sandboxed mode distinct from the
+   *  harness's default managed workspace sandbox. */
   sandbox: boolean;
   /** How the working directory is set: process cwd inheritance, or an explicit flag. */
   workingDir: "cwd" | "flag";

@@ -1006,7 +1006,7 @@ test("runPreflight — never invokes a language model (no harness model call)", 
   const cfg = makeConfig({ openspec: { enabled: "auto", bootstrap: false } });
   await runPreflight(cfg, fakeDeps({ onCall: (file, args) => calls.push({ file, args }) }), {}, FAKE_VERSION);
   for (const { file, args } of calls) {
-    // A model invocation would look like `claude --print …` or `codex exec --full-auto …`.
+    // A model invocation would look like `claude --print …` or `codex exec --sandbox workspace-write …`.
     assert.ok(!(file === "claude" && args.includes("--print")), `model call detected: ${file} ${args.join(" ")}`);
     assert.ok(!(file === "codex" && args.includes("exec")), `model call detected: ${file} ${args.join(" ")}`);
     // Harness binaries are probed for presence (--version) and login state

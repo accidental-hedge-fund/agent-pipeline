@@ -3,7 +3,9 @@
 //
 // claude:  claude --print --permission-mode bypassPermissions --verbose --output-format stream-json
 //          --include-partial-messages [--model X] [--effort Y] <prompt>
-// codex:   codex exec --json --full-auto -C <worktreeDir> [-m X] [-c model_reasoning_effort=Y] <prompt>
+// codex:   codex exec --json --sandbox workspace-write -C <worktreeDir> [-m X] [-c model_reasoning_effort=Y] <prompt>
+//          Managed path is `--sandbox workspace-write` (not deprecated `--full-auto`);
+//          headless never-ask is the `codex exec` default (#613 / codex-cli 0.145.0).
 //          Set PIPELINE_CODEX_NO_SANDBOX=1 to use Codex's explicit
 //          --dangerously-bypass-approvals-and-sandbox mode on externally
 //          sandboxed runners where Codex's bubblewrap/userns sandbox cannot start.
@@ -212,7 +214,8 @@ export interface InvokeOptions {
   stream?: boolean;
   /**
    * When true and harness is "claude", passes --permission-mode default instead
-   * of bypassPermissions (#21). Ignored for codex (already sandboxed via --full-auto).
+   * of bypassPermissions (#21). Ignored for codex (already workspace-sandboxed
+   * via `--sandbox workspace-write`; see #613).
    */
   sandbox?: boolean;
   /**
@@ -263,9 +266,10 @@ export interface InvokeOptions {
   /** Explicit execution sandbox mode for this invocation (#607 —
    *  eval-agent-isolation-boundary). Consulted only by the codex adapter;
    *  when supplied it alone decides `--dangerously-bypass-approvals-and-sandbox`
-   *  vs `--full-auto`. When absent, the codex adapter falls back to the
-   *  ambient `PIPELINE_CODEX_NO_SANDBOX` environment variable — every
-   *  existing call site (which supplies no value) is byte-identical. */
+   *  vs the managed pair `--sandbox` + `workspace-write` (#613). When absent,
+   *  the codex adapter falls back to the ambient `PIPELINE_CODEX_NO_SANDBOX`
+   *  environment variable — every existing call site (which supplies no value)
+   *  keeps ambient selection semantics. */
   sandboxMode?: ExternalSandboxMode;
 }
 
