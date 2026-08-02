@@ -43,6 +43,7 @@ import {
 } from "../verify-harness-commits.ts";
 import { makePipelineRunId, validateCommitTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
+import { runHarnessRound } from "../harness-round.ts";
 import { makeCommandRecord, makePromptRecord, recordCommand, recordPrompt } from "../evidence-bundle.ts";
 import type { BlockerKind, Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
@@ -342,88 +343,95 @@ async function runEvalFixRound(
     ).catch(() => {});
   }
 
-  const headBefore = await deps.gitHead(wtPath);
-  const fixModel = cfg.models.fix;
-  const fixRes = await deps.invoke(harness, wtPath, prompt, {
-    timeoutSec: cfg.fix_timeout,
-    model: fixModel,
-    sandbox: cfg.harness_sandbox,
-    accounting: opts.runDir
-      ? {
-          runDir: opts.runDir,
-          runStoreDeps: opts.runStoreDeps,
-          issue: issueNumber,
-          stage: "eval-gate",
-          modelSlot: "fix",
-          model: fixModel,
+  // Shared implementer-round skeleton (#629): headBefore → invoke → salvage →
+  // stage-owned verify/push.
+  return runHarnessRound<HarnessResult, EvalFixRoundResult>({
+    wtPath,
+    issueNumber,
+    pipelineRunId,
+    salvageLabel: evalFixSalvageStageLabel(issueNumber),
+    shouldAttemptSalvage: ({ confirmedNoNewCommit, invokeResult }) =>
+      Boolean(invokeResult.success && confirmedNoNewCommit),
+    invoke: async () => {
+      const fixModel = cfg.models.fix;
+      return deps.invoke(harness, wtPath, prompt, {
+        timeoutSec: cfg.fix_timeout,
+        model: fixModel,
+        sandbox: cfg.harness_sandbox,
+        accounting: opts.runDir
+          ? {
+              runDir: opts.runDir,
+              runStoreDeps: opts.runStoreDeps,
+              issue: issueNumber,
+              stage: "eval-gate",
+              modelSlot: "fix",
+              model: fixModel,
+            }
+          : undefined,
+      });
+    },
+    deps: {
+      gitHead: deps.gitHead,
+      salvage: deps.salvage,
+    },
+    afterRound: async (ctx) => {
+      const fixRes = ctx.invokeResult;
+      if (!fixRes.success) {
+        const reason = fixRes.timed_out
+          ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on eval-gate fix round ${attempt}.`
+          : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on eval-gate fix round ${attempt}.`;
+        return { ok: false, reason, blockerKind: "harness-failure" };
+      }
+
+      // #131: no new commit and salvage produced nothing — block with disclosure.
+      if (ctx.confirmedNoNewCommit && !ctx.salvaged) {
+        // #521: disclose why nothing was salvaged so the operator can see that
+        // recoverable work may still exist without reading terminal.log.
+        const reason = ctx.salvageFailureReason
+          ? `eval-gate fix round ${attempt} reported success but produced no new commits. ` +
+            `Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
+          : `eval-gate fix round ${attempt} reported success but produced no new commits.`;
+        return { ok: false, reason, blockerKind: "harness-failure" };
+      }
+
+      // Require a clean worktree after the fix round regardless of whether HEAD
+      // advanced — an eval re-run must not certify uncommitted state.
+      if (await deps.gitDirty(wtPath)) {
+        return {
+          ok: false,
+          reason:
+            `eval-gate fix round ${attempt} left uncommitted changes in the working tree. ` +
+            "Eval results can't be trusted — stage and commit the fix before re-running.",
+          blockerKind: "harness-failure",
+        };
+      }
+
+      if (ctx.headBefore) {
+        const commitCheck = await deps.verifyEvalFix(wtPath, ctx.headBefore);
+        if (!commitCheck.ok) {
+          return { ok: false, reason: commitCheck.reason, blockerKind: "harness-failure" };
         }
-      : undefined,
+
+        const newMessages = await deps.gitCommitMessages(wtPath, ctx.headBefore);
+        const trailerErr = validateCommitTrailers(newMessages, issueNumber, pipelineRunId);
+        if (trailerErr) {
+          return { ok: false, reason: trailerErr, blockerKind: "harness-failure" };
+        }
+      }
+
+      const branch = branchName(issueNumber, slug);
+      const push = await deps.gitPush(wtPath, branch);
+      if (push.code !== 0) {
+        return {
+          ok: false,
+          reason: `Git push failed after eval-gate fix: ${push.stderr.trim()}`,
+          blockerKind: "push-failed",
+        };
+      }
+
+      return { ok: true };
+    },
   });
-
-  if (!fixRes.success) {
-    const reason = fixRes.timed_out
-      ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on eval-gate fix round ${attempt}.`
-      : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on eval-gate fix round ${attempt}.`;
-    return { ok: false, reason, blockerKind: "harness-failure" };
-  }
-
-  // #131: the harness may have done the work without committing — salvage real
-  // uncommitted changes into a commit instead of discarding it.
-  let headAfter = await deps.gitHead(wtPath);
-  if (headBefore && headAfter && headBefore === headAfter) {
-    const { salvaged, failureReason } = await deps.salvage(wtPath, issueNumber, pipelineRunId, evalFixSalvageStageLabel(issueNumber));
-    if (!salvaged) {
-      // #521: disclose why nothing was salvaged so the operator can see that
-      // recoverable work may still exist without reading terminal.log.
-      const reason = failureReason
-        ? `eval-gate fix round ${attempt} reported success but produced no new commits. ` +
-          `Salvage of uncommitted work also failed: ${failureReason}`
-        : `eval-gate fix round ${attempt} reported success but produced no new commits.`;
-      return {
-        ok: false,
-        reason,
-        blockerKind: "harness-failure",
-      };
-    }
-    headAfter = await deps.gitHead(wtPath);
-  }
-
-  // Require a clean worktree after the fix round regardless of whether HEAD
-  // advanced — an eval re-run must not certify uncommitted state.
-  if (await deps.gitDirty(wtPath)) {
-    return {
-      ok: false,
-      reason:
-        `eval-gate fix round ${attempt} left uncommitted changes in the working tree. ` +
-        "Eval results can't be trusted — stage and commit the fix before re-running.",
-      blockerKind: "harness-failure",
-    };
-  }
-
-  if (headBefore) {
-    const commitCheck = await deps.verifyEvalFix(wtPath, headBefore);
-    if (!commitCheck.ok) {
-      return { ok: false, reason: commitCheck.reason, blockerKind: "harness-failure" };
-    }
-
-    const newMessages = await deps.gitCommitMessages(wtPath, headBefore);
-    const trailerErr = validateCommitTrailers(newMessages, issueNumber, pipelineRunId);
-    if (trailerErr) {
-      return { ok: false, reason: trailerErr, blockerKind: "harness-failure" };
-    }
-  }
-
-  const branch = branchName(issueNumber, slug);
-  const push = await deps.gitPush(wtPath, branch);
-  if (push.code !== 0) {
-    return {
-      ok: false,
-      reason: `Git push failed after eval-gate fix: ${push.stderr.trim()}`,
-      blockerKind: "push-failed",
-    };
-  }
-
-  return { ok: true };
 }
 
 function eventTimestamp(): string {

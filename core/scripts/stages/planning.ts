@@ -60,6 +60,7 @@ import { runTestGate } from "../testgate.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
+import { runHarnessRound } from "../harness-round.ts";
 import { detectIgnoredArtifacts } from "../ignored-artifact-warning.ts";
 import {
   includeLockfileSideEffects,
@@ -796,117 +797,129 @@ export async function runPlanningPhases(
     docsGeneratorPresent,
     specContext,
   });
-  const implHeadBefore = (
-    await doGitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
-  ).stdout.trim();
-  const result = await invokeImplementer(primary, wt.path, implPrompt, cfg, opts, { invoke: deps.invoke }, { issue: issueNumber, stage: "implementing" });
-
-  if (!result.success) {
-    const reason = result.timed_out
-      ? `timed out after ${result.duration.toFixed(0)}s`
-      : `exit ${result.exit_code}`;
-
-    // Salvage (#547): before blocking, attempt to recover uncommitted implement
-    // harness work — mirroring the fix stage's crash-retry salvage (#486). A
-    // crashed/timed-out implement harness may still have left a complete diff
-    // uncommitted; a successful salvage falls through to the normal downstream
-    // verification (commit checks, test gate) below instead of discarding it.
-    const { salvaged, failureReason: crashSalvageFailure } = await salvageIfNoNewCommit(
-      wt.path, issueNumber, pipelineRunId, "implement (crash/timeout)", implHeadBefore,
-      undefined, doGitInWorktree, doTrySalvage,
-    );
-
-    if (!salvaged) {
-      // #521: disclose why nothing was salvaged so the operator can see that
-      // recoverable work may still exist without reading terminal.log.
-      const salvageNote = crashSalvageFailure
-        ? ` Salvage of uncommitted work also failed: ${crashSalvageFailure}`
-        : "";
-      await doSetBlocked(
-        cfg,
-        issueNumber,
-        `Implementation harness (${primary}) failed: ${reason}.${salvageNote}`,
-        "implementing",
-        "harness-failure",
-      );
-      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return blockedOutcome(reason, "harness-failure");
-    }
-    console.log(
-      `[pipeline] #${issueNumber}: implementation harness (${primary}) failed (${reason}) but left ` +
-        `salvageable work — salvaged into a commit, proceeding to normal verification`,
-    );
-  }
-
-  console.log(
-    `[pipeline] #${issueNumber}: implementation done (${result.duration.toFixed(0)}s, harness=${primary})`,
-  );
-
-  // #131: the implementer may have done the work without committing — salvage
-  // real uncommitted changes into a commit before the no-commit checks below.
-  const implSalvage = await salvageIfNoNewCommit(wt.path, issueNumber, pipelineRunId, "implement", implHeadBefore);
-
-  // ---- Verify commits ----
-  const ahead = await doHasCommitsAhead(wt.path, cfg.base_branch);
-  if (!ahead) {
-    // #521: disclose why nothing was salvaged so the operator can see that
-    // recoverable work may still exist without reading terminal.log.
-    const noCommitsReason = implSalvage.failureReason
-      ? `Implementation harness (${primary}) completed but produced no commits. ` +
-        `Salvage of uncommitted work also failed: ${implSalvage.failureReason}`
-      : `Implementation harness (${primary}) completed but produced no commits.`;
-    await doSetBlocked(
-      cfg,
-      issueNumber,
-      noCommitsReason,
-      "implementing",
-      "no-commits",
-    );
-    await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-    return blockedOutcome("no commits produced", "no-commits");
-  }
-
-  // ---- Verify implementation commit references the issue (#68) ----
-  if (implHeadBefore) {
-    const implCheck = await enforceImplCommitRef(issueNumber, wt.path, implHeadBefore);
-    if (!implCheck.ok) {
-      await doSetBlocked(cfg, issueNumber, implCheck.reason, "implementing", "needs-human");
-      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return blockedOutcome(implCheck.reason, "needs-human");
-    }
-  }
-
-  // #445: advisory-only — warn when the implementing commit(s) left a
-  // gitignored, change-referenced artifact uncommitted. Never blocks.
-  if (implHeadBefore) {
-    const implHeadAfter = (
-      await doGitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
-    ).stdout.trim();
-    await detectIgnoredArtifacts(wt.path, implHeadBefore, implHeadAfter, {
-      emitEvent: (files) =>
-        opts.runDir
-          ? appendEvent(
-              opts.runDir,
-              { schema_version: RUN_SCHEMA_VERSION, type: "ignored_artifact_warning", at: nowIso(), stage: "implementing", files },
-              opts.runStoreDeps,
-            ).catch(() => {})
-          : undefined,
-    });
-  }
-
-  // ---- Build PR body and hand off to post-implementation steps ----
-  const planExcerpt = revisedPlan.length > 2000 ? revisedPlan.slice(0, 2000) + "\n\n[…plan truncated]" : revisedPlan;
-  const prBody = hooks.buildPrBody(cfg, issueNumber, title, planExcerpt, primary, reviewer);
-
-  const resumeOutcome = await resumeFromImplementing(cfg, issueNumber, wt, {
-    prTitle: `[Pipeline] ${title} (#${issueNumber})`,
-    prBody,
-    transitionMessage: (prNumber) => hooks.buildTransitionMessage(prNumber, primary, reviewer),
+  // Shared implementer-round skeleton (#629): headBefore → invoke → salvage on
+  // confirmed no-new-commit (crash or success) → stage-owned verify/format/PR.
+  // Crash and success paths share one salvage attempt (label distinguishes).
+  const implementRound = await runHarnessRound({
+    wtPath: wt.path,
+    issueNumber,
     pipelineRunId,
-    stateDir: opts.stateDir,
-    runDir: opts.runDir,
-    runStoreDeps: opts.runStoreDeps,
-  }, deps);
+    salvageLabel: "implement",
+    shouldAttemptSalvage: ({ confirmedNoNewCommit }) => confirmedNoNewCommit,
+    invoke: () =>
+      invokeImplementer(
+        primary,
+        wt.path,
+        implPrompt,
+        cfg,
+        opts,
+        { invoke: deps.invoke },
+        { issue: issueNumber, stage: "implementing" },
+      ),
+    deps: {
+      gitHead: async (cwd) =>
+        (await doGitInWorktree(cwd, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim(),
+      salvage: doTrySalvage,
+    },
+    afterRound: async (ctx) => {
+      const result = ctx.invokeResult;
+      const implHeadBefore = ctx.headBefore;
+
+      if (!result.success) {
+        const reason = result.timed_out
+          ? `timed out after ${result.duration.toFixed(0)}s`
+          : `exit ${result.exit_code}`;
+
+        // Salvage (#547): before blocking, attempt to recover uncommitted implement
+        // harness work — mirroring the fix stage's crash-retry salvage (#486). A
+        // successful salvage falls through to the normal downstream verification.
+        if (!ctx.salvaged) {
+          // #521: disclose why nothing was salvaged so the operator can see that
+          // recoverable work may still exist without reading terminal.log.
+          const salvageNote = ctx.salvageFailureReason
+            ? ` Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
+            : "";
+          await doSetBlocked(
+            cfg,
+            issueNumber,
+            `Implementation harness (${primary}) failed: ${reason}.${salvageNote}`,
+            "implementing",
+            "harness-failure",
+          );
+          await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+          return blockedOutcome(reason, "harness-failure");
+        }
+        console.log(
+          `[pipeline] #${issueNumber}: implementation harness (${primary}) failed (${reason}) but left ` +
+            `salvageable work — salvaged into a commit, proceeding to normal verification`,
+        );
+      }
+
+      console.log(
+        `[pipeline] #${issueNumber}: implementation done (${result.duration.toFixed(0)}s, harness=${primary})`,
+      );
+
+      // ---- Verify commits ----
+      const ahead = await doHasCommitsAhead(wt.path, cfg.base_branch);
+      if (!ahead) {
+        // #521: disclose why nothing was salvaged so the operator can see that
+        // recoverable work may still exist without reading terminal.log.
+        const noCommitsReason = ctx.salvageFailureReason
+          ? `Implementation harness (${primary}) completed but produced no commits. ` +
+            `Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
+          : `Implementation harness (${primary}) completed but produced no commits.`;
+        await doSetBlocked(
+          cfg,
+          issueNumber,
+          noCommitsReason,
+          "implementing",
+          "no-commits",
+        );
+        await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+        return blockedOutcome("no commits produced", "no-commits");
+      }
+
+      // ---- Verify implementation commit references the issue (#68) ----
+      if (implHeadBefore) {
+        const implCheck = await enforceImplCommitRef(issueNumber, wt.path, implHeadBefore);
+        if (!implCheck.ok) {
+          await doSetBlocked(cfg, issueNumber, implCheck.reason, "implementing", "needs-human");
+          await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+          return blockedOutcome(implCheck.reason, "needs-human");
+        }
+      }
+
+      // #445: advisory-only — warn when the implementing commit(s) left a
+      // gitignored, change-referenced artifact uncommitted. Never blocks.
+      if (implHeadBefore) {
+        await detectIgnoredArtifacts(wt.path, implHeadBefore, ctx.headAfter, {
+          emitEvent: (files) =>
+            opts.runDir
+              ? appendEvent(
+                  opts.runDir,
+                  { schema_version: RUN_SCHEMA_VERSION, type: "ignored_artifact_warning", at: nowIso(), stage: "implementing", files },
+                  opts.runStoreDeps,
+                ).catch(() => {})
+              : undefined,
+        });
+      }
+
+      // ---- Build PR body and hand off to post-implementation steps ----
+      const planExcerpt = revisedPlan.length > 2000 ? revisedPlan.slice(0, 2000) + "\n\n[…plan truncated]" : revisedPlan;
+      const prBody = hooks.buildPrBody(cfg, issueNumber, title, planExcerpt, primary, reviewer);
+
+      return resumeFromImplementing(cfg, issueNumber, wt, {
+        prTitle: `[Pipeline] ${title} (#${issueNumber})`,
+        prBody,
+        transitionMessage: (prNumber) => hooks.buildTransitionMessage(prNumber, primary, reviewer),
+        pipelineRunId,
+        stateDir: opts.stateDir,
+        runDir: opts.runDir,
+        runStoreDeps: opts.runStoreDeps,
+      }, deps);
+    },
+  });
+  const resumeOutcome = implementRound;
   await completePlanningLifecycle(
     cfg,
     issueNumber,

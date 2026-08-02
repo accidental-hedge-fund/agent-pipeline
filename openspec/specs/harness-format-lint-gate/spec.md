@@ -94,22 +94,6 @@ For each `format_gate` entry with `auto_fix: false`, the pipeline SHALL run the 
 - **THEN** the pipeline SHALL block with reason `"Format gate command '<cmd>' failed:\n<output>"` where `<output>` is the combined stdout+stderr
 - **AND** SHALL NOT open or update the PR
 
-### Requirement: Auto-format commits are classified as pipeline-internal
-
-The `isPipelineInternalCommit` predicate SHALL recognize commits whose message begins with `chore: auto-format (#` as pipeline-internal, so the review-SHA gate does not re-trigger a full review cycle on a pure formatting commit.
-
-#### Scenario: Auto-format commit does not re-trigger review
-
-- **WHEN** the only new commit since the last review verdict begins with `chore: auto-format (#`
-- **THEN** `isPipelineInternalCommit` SHALL return `true` for that commit
-- **AND** the review-SHA gate SHALL NOT invalidate the existing verdict
-
-#### Scenario: Developer commit alongside auto-format commit does re-trigger review
-
-- **WHEN** new commits include both a `chore: auto-format (#` commit and a developer commit (e.g. `fix:` prefix)
-- **THEN** the review-SHA gate SHALL treat the developer commit as non-internal
-- **AND** SHALL re-trigger review as normal
-
 ### Requirement: Format gate has regression tests with injectable deps
 
 The `runFormatGate` function SHALL accept a `deps` parameter (following the existing `AdvanceReviewDeps` / `ShaGateDeps` pattern) so unit tests can mock command execution and git operations without real subprocess calls. At minimum, the test suite SHALL include: a no-op test (empty config), an auto-fix test where changes are produced and committed, an auto-fix re-run-failure test (blocks), and a check-only failure test (blocks).
@@ -123,4 +107,25 @@ The `runFormatGate` function SHALL accept a `deps` parameter (following the exis
 
 - **WHEN** the test injects a fake `exec` that exits non-zero for a check-only entry
 - **THEN** the test SHALL assert the gate returns `{ status: "blocked", reason: ... }`
+
+### Requirement: Auto-format commits are NOT classified as pipeline-internal
+
+The `isPipelineInternalCommit` predicate (owned by the neutral pipeline-commits module) SHALL return false for commits whose message begins with `chore: auto-format (#`. Auto-format commits are developer/format commits for SHA-gate purposes: when they are the only new commits since a review verdict, the gate SHALL proceed through its normal non-internal path (diff-hash cache / re-review rules), not the pipeline-internal exemption. This requirement aligns the living spec with the tested #228 disposition and supersedes any prior wording that treated auto-format subjects as pipeline-internal.
+
+#### Scenario: Auto-format commit is not pipeline-internal
+
+- **WHEN** `isPipelineInternalCommit` is called with `chore: auto-format (#182)`
+- **THEN** it SHALL return false
+
+#### Scenario: Auto-format commit does not use the internal-only exemption
+
+- **WHEN** the only new commit since the last review verdict begins with `chore: auto-format (#`
+- **THEN** the review-SHA gate SHALL NOT treat that commit as pipeline-internal
+- **AND** SHALL apply the non-internal path (diff-hash cache check and subsequent rules) rather than the internal-commit-only exemption
+
+#### Scenario: Developer fix commit alongside auto-format still re-triggers review rules
+
+- **WHEN** new commits include both a `chore: auto-format (#` commit and a developer fix commit (e.g. `fix:` prefix)
+- **THEN** the review-SHA gate SHALL treat both as non-internal
+- **AND** SHALL re-trigger review or delta evaluation as normal when the diff hash changes
 

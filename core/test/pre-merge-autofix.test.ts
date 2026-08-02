@@ -1351,12 +1351,12 @@ function makeSeqGitFn(
 // Finding 1 regression: dirty post-harness worktree → "error", not "fix-committed"
 test("performPreMergeAutoFix finding-1: dirty post-harness worktree → rollback and return error", async () => {
   const { fn: gitFn, calls } = makeSeqGitFn([
-    // rev-parse HEAD (headBefore)
-    { code: 0, stdout: "sha1" },
-    // status --porcelain (pre-fix: clean)
+        // status --porcelain (pre-fix: clean)
     { code: 0, stdout: "" },
     // checkout -B <branch> (reattach succeeds)
     { code: 0, stdout: "" },
+    // rev-parse HEAD (headBefore) — after reattach via shared harness-round
+    { code: 0, stdout: "sha1" },
     // rev-parse HEAD (headAfter — different = hasNewCommit)
     { code: 0, stdout: "sha2" },
     // status --porcelain (post-harness: DIRTY)
@@ -1393,12 +1393,12 @@ test("performPreMergeAutoFix finding-1: dirty post-harness worktree → rollback
 // This test documents that dirty state must NOT be committed.
 test("performPreMergeAutoFix finding-1 (bite): clean commit path → fix-committed (no rollback)", async () => {
   const { fn: gitFn, calls } = makeSeqGitFn([
-    // rev-parse HEAD (headBefore)
-    { code: 0, stdout: "sha1" },
-    // status --porcelain (pre-fix: clean)
+        // status --porcelain (pre-fix: clean)
     { code: 0, stdout: "" },
     // checkout -B <branch> (reattach succeeds)
     { code: 0, stdout: "" },
+    // rev-parse HEAD (headBefore) — after reattach via shared harness-round
+    { code: 0, stdout: "sha1" },
     // rev-parse HEAD (headAfter — different = hasNewCommit)
     { code: 0, stdout: "sha2" },
     // status --porcelain (post-harness: clean)
@@ -1433,12 +1433,12 @@ test("performPreMergeAutoFix finding-1 (bite): clean commit path → fix-committ
 
 test("performPreMergeAutoFix #553: harness cwd equals the salvage-inspected worktree path (worktree-locality invariant)", async () => {
   const { fn: gitFn } = makeSeqGitFn([
-    // rev-parse HEAD (headBefore)
-    { code: 0, stdout: "sha1" },
-    // status --porcelain (pre-fix: clean)
+        // status --porcelain (pre-fix: clean)
     { code: 0, stdout: "" },
     // checkout -B <branch> (reattach succeeds)
     { code: 0, stdout: "" },
+    // rev-parse HEAD (headBefore) — after reattach via shared harness-round
+    { code: 0, stdout: "sha1" },
     // rev-parse HEAD (headAfterHarness — SAME as headBefore: no new commit)
     { code: 0, stdout: "sha1" },
     // reset --hard sha1 (rollback, since salvage found nothing)
@@ -1474,12 +1474,12 @@ test("performPreMergeAutoFix #553: harness cwd equals the salvage-inspected work
 test("performPreMergeAutoFix finding-3: reattach detached worktree fails → return error", async () => {
   let invokeCalled = false;
   const { fn: gitFn } = makeSeqGitFn([
-    // rev-parse HEAD (headBefore)
-    { code: 0, stdout: "sha1" },
-    // status --porcelain (pre-fix: clean)
+        // status --porcelain (pre-fix: clean)
     { code: 0, stdout: "" },
     // checkout -B <branch> (reattach FAILS)
     { code: 1, stdout: "", stderr: "fatal: could not checkout" },
+    // rev-parse HEAD (headBefore) — after reattach via shared harness-round
+    { code: 0, stdout: "sha1" },
   ]);
 
   const result = await performPreMergeAutoFix(
@@ -1632,12 +1632,12 @@ test("pre-merge auto-fix finding-2: re-review needs-attention + zero findings �
 
 test("performPreMergeAutoFix R2-F4: post-harness git status exits non-zero (empty stdout) → rollback and return error", async () => {
   const { fn: gitFn, calls } = makeSeqGitFn([
-    // rev-parse HEAD (headBefore)
-    { code: 0, stdout: "sha1" },
-    // status --porcelain (pre-fix: clean)
+        // status --porcelain (pre-fix: clean)
     { code: 0, stdout: "" },
     // checkout -B <branch> (reattach succeeds)
     { code: 0, stdout: "" },
+    // rev-parse HEAD (headBefore) — after reattach via shared harness-round
+    { code: 0, stdout: "sha1" },
     // rev-parse HEAD (headAfter — different = hasNewCommit)
     { code: 0, stdout: "sha2" },
     // status --porcelain (post-harness: exits code 1, empty stdout — cannot prove clean)
@@ -2241,13 +2241,15 @@ function makeSalvageFn(result: TrySalvageResult): {
 
 test("performPreMergeAutoFix #547: harness times out with a dirty worktree → salvaged, amended, pushed (not discarded)", async () => {
   const { fn: gitFn, calls } = makeSeqGitFn([
-    // rev-parse HEAD (headBefore)
-    { code: 0, stdout: "sha1" },
-    // status --porcelain (pre-fix: clean)
+        // status --porcelain (pre-fix: clean)
     { code: 0, stdout: "" },
     // checkout -B <branch> (reattach succeeds)
     { code: 0, stdout: "" },
+    // rev-parse HEAD (headBefore) — after reattach via shared harness-round
+    { code: 0, stdout: "sha1" },
     // rev-parse HEAD (headAfterHarness — SAME as headBefore: no new commit)
+    { code: 0, stdout: "sha1" },
+    // rev-parse HEAD (post-salvage headAfter via shared helper)
     { code: 0, stdout: "sha1" },
     // commit --amend -m ... (amend succeeds, over the salvaged commit)
     { code: 0, stdout: "" },
@@ -2282,13 +2284,15 @@ test("performPreMergeAutoFix #547: harness times out with a dirty worktree → s
 
 test("performPreMergeAutoFix #547: harness reports success without committing, worktree dirty → salvaged, amended, pushed", async () => {
   const { fn: gitFn, calls } = makeSeqGitFn([
-    // rev-parse HEAD (headBefore)
-    { code: 0, stdout: "sha1" },
-    // status --porcelain (pre-fix: clean)
+        // status --porcelain (pre-fix: clean)
     { code: 0, stdout: "" },
     // checkout -B <branch> (reattach succeeds)
     { code: 0, stdout: "" },
+    // rev-parse HEAD (headBefore) — after reattach via shared harness-round
+    { code: 0, stdout: "sha1" },
     // rev-parse HEAD (headAfterHarness — SAME as headBefore: no new commit)
+    { code: 0, stdout: "sha1" },
+    // rev-parse HEAD (post-salvage headAfter via shared helper)
     { code: 0, stdout: "sha1" },
     // commit --amend -m ... (amend succeeds, over the salvaged commit)
     { code: 0, stdout: "" },
@@ -2323,12 +2327,12 @@ test("performPreMergeAutoFix #547: harness reports success without committing, w
 
 test("performPreMergeAutoFix #547/#698: genuinely clean worktree (nothing to salvage) → noop-clean with #553 disclosure", async () => {
   const { fn: gitFn, calls } = makeSeqGitFn([
-    // rev-parse HEAD (headBefore)
-    { code: 0, stdout: "sha1" },
-    // status --porcelain (pre-fix: clean)
+        // status --porcelain (pre-fix: clean)
     { code: 0, stdout: "" },
     // checkout -B <branch> (reattach succeeds)
     { code: 0, stdout: "" },
+    // rev-parse HEAD (headBefore) — after reattach via shared harness-round
+    { code: 0, stdout: "sha1" },
     // rev-parse HEAD (headAfterHarness — SAME as headBefore: no new commit)
     { code: 0, stdout: "sha1" },
     // reset --hard sha1 (no-op rollback after clean tree)
@@ -2375,12 +2379,12 @@ test("performPreMergeAutoFix #547/#698: genuinely clean worktree (nothing to sal
 
 test("performPreMergeAutoFix #553/#698: harness reports success with a genuinely clean worktree (no commit) → noop-clean names the worktree", async () => {
   const { fn: gitFn } = makeSeqGitFn([
-    // rev-parse HEAD (headBefore)
-    { code: 0, stdout: "sha1" },
-    // status --porcelain (pre-fix: clean)
+        // status --porcelain (pre-fix: clean)
     { code: 0, stdout: "" },
     // checkout -B <branch> (reattach succeeds)
     { code: 0, stdout: "" },
+    // rev-parse HEAD (headBefore) — after reattach via shared harness-round
+    { code: 0, stdout: "sha1" },
     // rev-parse HEAD (headAfterHarness — SAME as headBefore: no new commit)
     { code: 0, stdout: "sha1" },
     // status --porcelain (post-harness: also clean)
@@ -2415,12 +2419,12 @@ test("performPreMergeAutoFix #553/#698: harness reports success with a genuinely
 
 test("performPreMergeAutoFix #547: harness committed AND left extra dirt → ambiguous case stays out of scope, existing rollback unchanged", async () => {
   const { fn: gitFn, calls } = makeSeqGitFn([
-    // rev-parse HEAD (headBefore)
-    { code: 0, stdout: "sha1" },
-    // status --porcelain (pre-fix: clean)
+        // status --porcelain (pre-fix: clean)
     { code: 0, stdout: "" },
     // checkout -B <branch> (reattach succeeds)
     { code: 0, stdout: "" },
+    // rev-parse HEAD (headBefore) — after reattach via shared harness-round
+    { code: 0, stdout: "sha1" },
     // rev-parse HEAD (headAfterHarness — DIFFERENT: a commit was made)
     { code: 0, stdout: "sha2" },
     // status --porcelain (post-harness: extra dirt remains)
@@ -2459,12 +2463,12 @@ test("performPreMergeAutoFix #547: harness committed AND left extra dirt → amb
 
 test("performPreMergeAutoFix R1-F1: post-harness HEAD read fails/empty → fail-closed rollback, salvage NOT called", async () => {
   const { fn: gitFn, calls } = makeSeqGitFn([
-    // rev-parse HEAD (headBefore)
-    { code: 0, stdout: "sha1" },
-    // status --porcelain (pre-fix: clean)
+        // status --porcelain (pre-fix: clean)
     { code: 0, stdout: "" },
     // checkout -B <branch> (reattach succeeds)
     { code: 0, stdout: "" },
+    // rev-parse HEAD (headBefore) — after reattach via shared harness-round
+    { code: 0, stdout: "sha1" },
     // rev-parse HEAD (headAfterHarness — read fails/empty: cannot prove no new commit)
     { code: 1, stdout: "" },
     // reset --hard sha1 (rollback)
@@ -2962,7 +2966,6 @@ test("performPreMergeAutoFix #787: claim runs after clean-tree preflight, immedi
   // (1) Dirty pre-fix tree: preflight fails → the attempt must NOT be charged.
   {
     const { fn: gitFn } = makeSeqGitFn([
-      { code: 0, stdout: "sha1" }, // rev-parse HEAD
       { code: 0, stdout: "M  core/scripts/foo.ts" }, // status --porcelain (pre: DIRTY)
     ]);
     let claims = 0;
@@ -2981,9 +2984,9 @@ test("performPreMergeAutoFix #787: claim runs after clean-tree preflight, immedi
   // (2) Clean path: claim charged exactly once, before the harness is invoked.
   {
     const { fn: gitFn } = makeSeqGitFn([
-      { code: 0, stdout: "sha1" }, // rev-parse HEAD
       { code: 0, stdout: "" },     // status --porcelain (pre: clean)
       { code: 0, stdout: "" },     // checkout -B (reattach)
+      { code: 0, stdout: "sha1" }, // rev-parse HEAD (headBefore via shared helper)
       { code: 0, stdout: "sha2" }, // rev-parse HEAD (post-harness, new commit)
       { code: 0, stdout: "" },     // status --porcelain (post: clean)
       { code: 0, stdout: "" },     // commit --amend
@@ -3009,7 +3012,6 @@ test("performPreMergeAutoFix #787: claim runs after clean-tree preflight, immedi
   // (3) Claim refused: harness must not run; typed claim-failed returned.
   {
     const { fn: gitFn } = makeSeqGitFn([
-      { code: 0, stdout: "sha1" }, // rev-parse HEAD
       { code: 0, stdout: "" },     // status --porcelain (pre: clean)
       { code: 0, stdout: "" },     // checkout -B (reattach)
     ]);

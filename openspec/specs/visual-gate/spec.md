@@ -472,23 +472,19 @@ same commit so at most one bounded evidence set is present on the branch.
 
 ### Requirement: The artifact-publish commit SHALL be pipeline-internal
 
-The stage SHALL author the publish commit with a prescribed subject that `isPipelineInternalCommit`
-classifies as pipeline-internal, so the commit does NOT invalidate a recorded pre-merge review
-verdict (#16/#98) and cannot trigger a re-review cascade. The publish subject SHALL NOT match the
-visual-fix commit message pattern, so a published-evidence commit is never mistaken for a visual-fix
-commit that owes a pre-merge re-review.
+The stage SHALL author the publish commit with a prescribed subject that `isPipelineInternalCommit` (from the neutral pipeline-commits module) classifies as pipeline-internal, so the commit does NOT invalidate a recorded pre-merge review verdict and is not mistaken for a visual-fix commit. The publish subject prefix SHALL be single-sourced with the classifier (the visual stage MAY import the prefix from the neutral module or share the same constant definition). The subject SHALL be the publish prefix followed by the issue number and nothing else.
 
-#### Scenario: publish commit does not invalidate the review verdict
+#### Scenario: Publish commit does not invalidate the review-SHA gate
 
-- **WHEN** a publish commit is the only commit that landed on the PR since the last reviewed SHA
+- **WHEN** the visual-gate stage commits artifact publish evidence with the prescribed exact subject for the issue
 - **THEN** the pre-merge review-SHA gate SHALL classify it as pipeline-internal
-- **AND** SHALL NOT require a re-review on account of that commit
+- **AND** SHALL NOT invalidate a prior verdict solely because that publish commit landed
 
-#### Scenario: publish commit is not read as a visual-fix commit
+#### Scenario: Publish prefix is single-sourced with the classifier
 
-- **WHEN** the stage evaluates whether a visual-fix commit is pending review
-- **THEN** the publish commit's subject SHALL NOT match the visual-fix commit pattern
-- **AND** a passing gate SHALL NOT be routed back to `pre-merge` solely because evidence was published
+- **WHEN** the visual-gate stage builds the publish commit subject for issue N
+- **THEN** the prefix used in that subject SHALL be the same definition the neutral classifier uses for exact-match recognition
+- **AND** a near-miss subject with trailing text SHALL remain non-internal
 
 ### Requirement: Manifest entries SHALL link to the published location
 

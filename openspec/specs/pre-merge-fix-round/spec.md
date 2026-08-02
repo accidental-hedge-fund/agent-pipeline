@@ -222,9 +222,9 @@ from the absence of a commit.
 
 The auto-fix commit SHALL carry the run's `Issue: #N` and `Pipeline-Run: <id>` git trailers and
 SHALL be classified as a developer commit, so the review-SHA gate re-reviews it. `isPipelineInternalCommit`
-SHALL continue to return `false` for the auto-fix commit subject; the recognizable marker used by the
-one-attempt bound (a commit-subject prefix or dedicated trailer) SHALL NOT cause
-`isPipelineInternalCommit` to return `true`.
+(from the neutral pipeline-commits module) SHALL continue to return `false` for the auto-fix commit
+subject; the recognizable marker used by the one-attempt bound (a commit-subject prefix or dedicated
+trailer) SHALL NOT cause `isPipelineInternalCommit` to return `true`.
 
 #### Scenario: auto-fix commit carries traceability trailers
 
@@ -585,4 +585,25 @@ same production closure and reconciliation seam.
 - **WHEN** live reconciliation observes that the PR head changed before rematerialization or repair
 - **THEN** the old attempt SHALL be superseded before any mutation
 - **AND** eligibility SHALL be recomputed against the new head
+
+### Requirement: Pre-merge bounded auto-fix SHALL use the shared harness-round helper
+
+The pre-merge bounded auto-fix path SHALL run its implementer-round skeleton (head capture, invoke,
+salvage on dirty no-commit, commit subject amendment / verification, push coordination) through the
+shared harness-round helper rather than a private full copy of that skeleton. One-attempt bound,
+noop-clean outcome, amend-to-auto-fix-prefix, and post-fix delta re-review SHALL remain
+pre-merge product rules and SHALL keep their pre-change outcomes.
+
+#### Scenario: Auto-fix skeleton is shared
+
+- **WHEN** pre-merge launches a bounded auto-fix implementer round
+- **THEN** head capture, invoke, and salvage sequencing SHALL go through the shared harness-round helper
+- **AND** a successful fix SHALL still be pushed and re-reviewed exactly once under the existing
+  one-attempt bound
+
+#### Scenario: Noop-clean outcome is preserved
+
+- **WHEN** the auto-fix harness exits with no new commit and a clean worktree
+- **THEN** the path SHALL expose the existing noop-clean outcome for re-verify
+- **AND** SHALL NOT create a salvage commit or consume a second auto-fix attempt incorrectly
 

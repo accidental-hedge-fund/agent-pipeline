@@ -3,6 +3,15 @@
 // repair and reports success only after the configured implementer produced a
 // committed, pushed change; a post-push label-clear failure is recorded in the
 // evidence rather than failing the verified repair.
+//
+// #629 disposition (consumer via shared auto-fix): substantive implementer
+// work goes through `performPreMergeAutoFix`, which itself uses the shared
+// `runHarnessRound` helper. This file is a **documented narrow exemption**
+// from calling `runHarnessRound` directly — the recovery shell owns durable
+// pre-invocation breadcrumb refs, ownership proof before adopting unpushed
+// commits, idempotent reconciliation of already-pushed marked repairs, and
+// refusal to adopt unmarked human commits. Those shell invariants must not be
+// flattened into the stage skeleton.
 
 import { clearBlocked, getIssueDetail } from "../gh.ts";
 import { invoke } from "../harness.ts";
@@ -381,6 +390,8 @@ export function createRepairPipelineItemExecutor(
     // interrupted run. Best-effort — a failed write only ever fails CLOSED
     // later (the reconciliation refuses to adopt without it).
     await git(wt.path, ["update-ref", breadcrumbRef, expected], { ignoreFailure: true });
+    // Substantive path: shared-helper-backed pre-merge auto-fix (#629 / #787).
+    // Do not reintroduce a private full implementer-round skeleton here.
     const result = await repair(
       cfg,
       issueNumber,

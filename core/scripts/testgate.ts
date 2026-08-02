@@ -4,6 +4,13 @@
 // failure blocks the item BEFORE a PR is opened (planning) or BEFORE it advances
 // (fix rounds) — so broken changes never reach review. Repos with no detectable
 // test/build command (and no explicit override) are skipped entirely.
+//
+// #629 exemption: test-fix still uses a private headBefore → invoke → salvage
+// skeleton rather than `runHarnessRound`. Migration is deferred because the
+// test-gate loop interleaves command re-runs, build-artifact fold, and multi-
+// attempt bookkeeping that is not a straight implementer-round consumer; the
+// mandatory #629 consumers are fix / planning implement / visual-fix /
+// eval-fix / pre-merge auto-fix.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
