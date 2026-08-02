@@ -100,7 +100,9 @@ test("CONFLICTING PR skips the CI poll and rebases (#95)", async (t) => {
   });
   assert.equal(rec.ciPolls, 0, "CI checks must never be polled for a conflicting PR");
   assert.equal(rec.rebaseCalls, 1, "rebase attempted exactly once");
-  assert.deepEqual(rec.marked, [WT_PATH], "rebase marked as attempted on success");
+  // #759: markRebaseAttempted is a no-op / spy; durable authority is the ledger.
+  // Injectable spy may still be invoked for call-site compatibility.
+  assert.deepEqual(rec.marked, [WT_PATH], "markRebaseAttempted spy still invoked (writer is no-op)");
   assert.deepEqual(rec.blocked, []);
 });
 

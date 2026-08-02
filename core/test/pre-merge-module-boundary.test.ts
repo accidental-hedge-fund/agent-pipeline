@@ -50,6 +50,10 @@ const FACADE_CANARY_EXPORTS = [
   "staleReviewNotice",
   "archiveAlreadyDone",
   "partitionBlockingForAutofix",
+  // #759 reconcile-shaped domain surfaces
+  "reconcileCiRecoveryState",
+  "reconcileConflictRebaseState",
+  "reconcileReviewShaGateState",
 ] as const;
 
 test("pre-merge domain modules exist under stages/", () => {
@@ -82,6 +86,9 @@ test("facade re-exports resolve to the same bindings as domain modules", () => {
   assert.equal(preMergeFacade.REBASE_MARKER_FILE, REBASE_MARKER_FILE);
   assert.equal(preMergeFacade.advance, advance);
   assert.equal(preMergeFacade.advancePolling, advancePolling);
+  assert.equal(typeof preMergeFacade.reconcileCiRecoveryState, "function");
+  assert.equal(typeof preMergeFacade.reconcileConflictRebaseState, "function");
+  assert.equal(typeof preMergeFacade.reconcileReviewShaGateState, "function");
 });
 
 test("pre_merge.ts is a thin re-export facade (not the sole implementation home)", () => {

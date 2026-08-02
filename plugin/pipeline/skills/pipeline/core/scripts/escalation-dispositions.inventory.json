@@ -11,7 +11,7 @@
       "disposition": "deliberately-fail-closed",
       "blocker_kind": null,
       "canonical_reason": "workflow-engine-defect",
-      "notes": "dynamic kind \u2014 fail-closed until explicit",
+      "notes": "dynamic kind — fail-closed until explicit",
       "emitter": "setBlocked"
     },
     {
@@ -199,7 +199,7 @@
       "module": "scripts/stages/eval.ts",
       "line": 762,
       "occurrence": 2,
-      "match": "Eval gate runner/tooling error${attempts} \u2014 the eval command could not be execut",
+      "match": "Eval gate runner/tooling error${attempts} — the eval command could not be execut",
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
@@ -259,7 +259,7 @@
       "module": "scripts/stages/fix.ts",
       "line": 523,
       "occurrence": 0,
-      "match": "${unacknowledged.length} unacknowledged human comment(s) after the latest plan \u2014",
+      "match": "${unacknowledged.length} unacknowledged human comment(s) after the latest plan —",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
       "canonical_reason": "human-context-required",
@@ -437,7 +437,7 @@
     {
       "site_id": "stages.pre-merge-ci-gate:ci-exhausted#0",
       "module": "scripts/stages/pre-merge-ci-gate.ts",
-      "line": 757,
+      "line": 839,
       "occurrence": 0,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -449,7 +449,7 @@
     {
       "site_id": "stages.pre-merge-ci-gate:needs-human#0",
       "module": "scripts/stages/pre-merge-ci-gate.ts",
-      "line": 893,
+      "line": 975,
       "occurrence": 0,
       "match": "No CI run detected for head SHA ${headSha.slice(0, 7)}; close+reopen recovery wa",
       "disposition": "transient-retryable",
@@ -461,7 +461,7 @@
     {
       "site_id": "stages.pre-merge-ci-gate:needs-human#1",
       "module": "scripts/stages/pre-merge-ci-gate.ts",
-      "line": 927,
+      "line": 1009,
       "occurrence": 1,
       "match": "No CI run detected for head SHA ${headSha.slice(0, 7)}; close+reopen recovery fa",
       "disposition": "deliberately-fail-closed",
@@ -473,7 +473,7 @@
     {
       "site_id": "stages.pre-merge-ci-gate:needs-human#2",
       "module": "scripts/stages/pre-merge-ci-gate.ts",
-      "line": 948,
+      "line": 1030,
       "occurrence": 2,
       "match": "No CI run detected for head SHA ${headSha.slice(0, 7)}; try closing and reopenin",
       "disposition": "deliberately-fail-closed",
@@ -485,9 +485,9 @@
     {
       "site_id": "stages.pre-merge-conflict-rebase:merge-conflict#0",
       "module": "scripts/stages/pre-merge-conflict-rebase.ts",
-      "line": 183,
+      "line": 143,
       "occurrence": 0,
-      "match": "PR has a merge conflict with the base branch that could not be automatically reb",
+      "match": "PR has a merge conflict; stage-attempt ledger unusable (${hydrated.reason}) — ma",
       "disposition": "reconcile-owned",
       "blocker_kind": "merge-conflict",
       "canonical_reason": "workflow-state",
@@ -497,7 +497,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#0",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 118,
+      "line": 123,
       "occurrence": 0,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -509,7 +509,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#0",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 131,
+      "line": 136,
       "occurrence": 0,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -521,7 +521,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#1",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 139,
+      "line": 144,
       "occurrence": 1,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -533,7 +533,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#2",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 218,
+      "line": 223,
       "occurrence": 2,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -545,7 +545,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:worktree-capacity#0",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 266,
+      "line": 271,
       "occurrence": 0,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -557,7 +557,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:worktree-creation-failed#0",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 271,
+      "line": 276,
       "occurrence": 0,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -569,7 +569,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:worktree-missing#0",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 275,
+      "line": 280,
       "occurrence": 0,
       "match": "pre-merge",
       "disposition": "transient-retryable",
@@ -581,7 +581,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:worktree-creation-failed#1",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 286,
+      "line": 291,
       "occurrence": 1,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -593,7 +593,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#1",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 322,
+      "line": 327,
       "occurrence": 1,
       "match": "Cannot verify a clean worktree before the OpenSpec archive, so a failed archive ",
       "disposition": "deliberately-fail-closed",
@@ -605,7 +605,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#2",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 338,
+      "line": 343,
       "occurrence": 2,
       "match": "Cannot verify a clean worktree before the OpenSpec archive, so a failed archive ",
       "disposition": "deliberately-fail-closed",
@@ -617,7 +617,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#3",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 384,
+      "line": 389,
       "occurrence": 3,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -629,7 +629,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#4",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 396,
+      "line": 401,
       "occurrence": 4,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -641,7 +641,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#5",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 412,
+      "line": 417,
       "occurrence": 5,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -653,7 +653,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#6",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 438,
+      "line": 443,
       "occurrence": 6,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -665,7 +665,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#3",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 454,
+      "line": 459,
       "occurrence": 3,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -677,7 +677,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#7",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 521,
+      "line": 549,
       "occurrence": 7,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -689,7 +689,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#8",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 547,
+      "line": 575,
       "occurrence": 8,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -701,7 +701,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#4",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 565,
+      "line": 593,
       "occurrence": 4,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -713,7 +713,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#5",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 595,
+      "line": 623,
       "occurrence": 5,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -725,7 +725,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:push-failed#0",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 615,
+      "line": 643,
       "occurrence": 0,
       "match": "OpenSpec archive commit failed:\\n${detail}",
       "disposition": "transient-retryable",
@@ -737,7 +737,7 @@
     {
       "site_id": "stages.pre-merge-openspec-archive:push-failed#1",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
-      "line": 646,
+      "line": 674,
       "occurrence": 1,
       "match": "Git push failed after OpenSpec archive: ${push.stderr.trim()}",
       "disposition": "transient-retryable",
@@ -749,7 +749,7 @@
     {
       "site_id": "stages.pre-merge-routing:needs-human#0",
       "module": "scripts/stages/pre-merge-routing.ts",
-      "line": 350,
+      "line": 358,
       "occurrence": 0,
       "match": "No pull request found for pre-merge gate.",
       "disposition": "deliberately-fail-closed",
@@ -761,9 +761,9 @@
     {
       "site_id": "stages.pre-merge-routing:needs-human#1",
       "module": "scripts/stages/pre-merge-routing.ts",
-      "line": 528,
+      "line": 536,
       "occurrence": 1,
-      "match": "ci_mode: local \u2014 no worktree found for this issue; cannot run the local test gat",
+      "match": "ci_mode: local — no worktree found for this issue; cannot run the local test gat",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
@@ -773,9 +773,9 @@
     {
       "site_id": "stages.pre-merge-routing:needs-human#2",
       "module": "scripts/stages/pre-merge-routing.ts",
-      "line": 551,
+      "line": 559,
       "occurrence": 2,
-      "match": "ci_mode: local \u2014 the inline local test gate was skipped (test_gate is disabled o",
+      "match": "ci_mode: local — the inline local test gate was skipped (test_gate is disabled o",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
@@ -785,9 +785,9 @@
     {
       "site_id": "stages.pre-merge-routing:needs-human#3",
       "module": "scripts/stages/pre-merge-routing.ts",
-      "line": 566,
+      "line": 574,
       "occurrence": 3,
-      "match": "ci_mode: local \u2014 the inline local test gate (run from pre-merge) failed. ",
+      "match": "ci_mode: local — the inline local test gate (run from pre-merge) failed. ",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
@@ -797,7 +797,7 @@
     {
       "site_id": "stages.pre-merge-routing:needs-human#4",
       "module": "scripts/stages/pre-merge-routing.ts",
-      "line": 581,
+      "line": 589,
       "occurrence": 4,
       "match": "failing tests (${inlineResult.attempts} attempt(s)). ",
       "disposition": "deliberately-fail-closed",
@@ -809,7 +809,7 @@
     {
       "site_id": "stages.pre-merge-routing:needs-human#5",
       "module": "scripts/stages/pre-merge-routing.ts",
-      "line": 608,
+      "line": 616,
       "occurrence": 5,
       "match": "(worktree HEAD ${worktreeHead.slice(0, 7)}, PR head ${prDetail.head_sha.slice(0,",
       "disposition": "deliberately-fail-closed",
@@ -821,7 +821,7 @@
     {
       "site_id": "stages.pre-merge-routing:needs-human#6",
       "module": "scripts/stages/pre-merge-routing.ts",
-      "line": 625,
+      "line": 633,
       "occurrence": 6,
       "match": "ci_mode: local is set but the most recent local test-gate result is a failure. ",
       "disposition": "deliberately-fail-closed",
@@ -833,7 +833,7 @@
     {
       "site_id": "stages.pre-merge-routing:needs-human#7",
       "module": "scripts/stages/pre-merge-routing.ts",
-      "line": 850,
+      "line": 858,
       "occurrence": 7,
       "match": "(tested ${testedAt}, current head ${freshPrDetail.head_sha.slice(0, 7)}). ",
       "disposition": "deliberately-fail-closed",
@@ -845,7 +845,7 @@
     {
       "site_id": "stages.pre-merge-routing:merge-conflict#0",
       "module": "scripts/stages/pre-merge-routing.ts",
-      "line": 925,
+      "line": 933,
       "occurrence": 0,
       "match": "pre-merge",
       "disposition": "reconcile-owned",
@@ -857,7 +857,7 @@
     {
       "site_id": "stages.pre-merge-routing:openspec-invalid#0",
       "module": "scripts/stages/pre-merge-routing.ts",
-      "line": 950,
+      "line": 958,
       "occurrence": 0,
       "match": "OpenSpec validation failed (\\",
       "disposition": "deliberately-fail-closed",
@@ -869,9 +869,9 @@
     {
       "site_id": "stages.pre-merge-sha-gate:needs-human#0",
       "module": "scripts/stages/pre-merge-sha-gate.ts",
-      "line": 434,
+      "line": 500,
       "occurrence": 0,
-      "match": "Pre-merge: cannot verify review-comment provenance \u2014 authenticated gh actor ",
+      "match": "Pre-merge: cannot verify review-comment provenance — authenticated gh actor ",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
       "canonical_reason": "environment-auth",
@@ -881,7 +881,7 @@
     {
       "site_id": "stages.pre-merge-sha-gate:needs-human#1",
       "module": "scripts/stages/pre-merge-sha-gate.ts",
-      "line": 514,
+      "line": 580,
       "occurrence": 1,
       "match": "Pre-merge: prior runner recorded ${unresolved.length} unresolved blocking ",
       "disposition": "deliberately-fail-closed",
@@ -893,7 +893,7 @@
     {
       "site_id": "stages.pre-merge-sha-gate:worktree-capacity#0",
       "module": "scripts/stages/pre-merge-sha-gate.ts",
-      "line": 687,
+      "line": 765,
       "occurrence": 0,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -905,7 +905,7 @@
     {
       "site_id": "stages.pre-merge-sha-gate:worktree-creation-failed#0",
       "module": "scripts/stages/pre-merge-sha-gate.ts",
-      "line": 691,
+      "line": 769,
       "occurrence": 0,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -917,7 +917,7 @@
     {
       "site_id": "stages.pre-merge-sha-gate:worktree-missing#0",
       "module": "scripts/stages/pre-merge-sha-gate.ts",
-      "line": 696,
+      "line": 774,
       "occurrence": 0,
       "match": "pre-merge",
       "disposition": "transient-retryable",
@@ -929,7 +929,7 @@
     {
       "site_id": "stages.pre-merge-sha-gate:needs-human#2",
       "module": "scripts/stages/pre-merge-sha-gate.ts",
-      "line": 717,
+      "line": 795,
       "occurrence": 2,
       "match": "Pre-merge: the last review recorded ${unresolved.length} unresolved blocking fin",
       "disposition": "deliberately-fail-closed",
@@ -941,7 +941,7 @@
     {
       "site_id": "stages.pre-merge-sha-gate:review-findings#0",
       "module": "scripts/stages/pre-merge-sha-gate.ts",
-      "line": 910,
+      "line": 988,
       "occurrence": 0,
       "match": "Pre-merge delta review reached the ${deltaRoundCap}-round ceiling with ${outstan",
       "disposition": "deliberately-fail-closed",
@@ -953,7 +953,7 @@
     {
       "site_id": "stages.pre-merge-sha-gate:worktree-capacity#1",
       "module": "scripts/stages/pre-merge-sha-gate.ts",
-      "line": 1727,
+      "line": 1816,
       "occurrence": 1,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -965,7 +965,7 @@
     {
       "site_id": "stages.pre-merge-sha-gate:worktree-creation-failed#1",
       "module": "scripts/stages/pre-merge-sha-gate.ts",
-      "line": 1731,
+      "line": 1820,
       "occurrence": 1,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -977,7 +977,7 @@
     {
       "site_id": "stages.pre-merge-sha-gate:worktree-missing#1",
       "module": "scripts/stages/pre-merge-sha-gate.ts",
-      "line": 1736,
+      "line": 1825,
       "occurrence": 1,
       "match": "pre-merge",
       "disposition": "transient-retryable",
@@ -989,7 +989,7 @@
     {
       "site_id": "stages.pre-merge-sha-gate:needs-human#3",
       "module": "scripts/stages/pre-merge-sha-gate.ts",
-      "line": 1802,
+      "line": 1891,
       "occurrence": 3,
       "match": "pre-merge",
       "disposition": "deliberately-fail-closed",
@@ -1075,7 +1075,7 @@
       "module": "scripts/stages/review-routing.ts",
       "line": 237,
       "occurrence": 5,
-      "match": "PR HEAD moved while fetching diff (${commitSha.slice(0, 7)} \u2192 ${postDiffSha.slic",
+      "match": "PR HEAD moved while fetching diff (${commitSha.slice(0, 7)} → ${postDiffSha.slic",
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
@@ -1099,7 +1099,7 @@
       "module": "scripts/stages/review-routing.ts",
       "line": 300,
       "occurrence": 0,
-      "match": "${unacknowledged.length} unacknowledged human comment(s) after the latest plan \u2014",
+      "match": "${unacknowledged.length} unacknowledged human comment(s) after the latest plan —",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
       "canonical_reason": "human-context-required",
@@ -1387,7 +1387,7 @@
       "module": "scripts/stages/visual.ts",
       "line": 1220,
       "occurrence": 2,
-      "match": "Visual gate runner/tooling error${attempts} \u2014 the visual command could not be ex",
+      "match": "Visual gate runner/tooling error${attempts} — the visual command could not be ex",
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
@@ -1404,6 +1404,42 @@
       "blocker_kind": "visual-gate-failed",
       "canonical_reason": "implementation-ci",
       "notes": "gate product outcome",
+      "emitter": "setBlocked"
+    },
+    {
+      "site_id": "stages.pre-merge-conflict-rebase:merge-conflict#1",
+      "module": "scripts/stages/pre-merge-conflict-rebase.ts",
+      "line": 163,
+      "occurrence": 1,
+      "match": "PR has a merge conflict; could not durably claim rebase attempt (${claimed.reaso",
+      "disposition": "reconcile-owned",
+      "blocker_kind": "merge-conflict",
+      "canonical_reason": "workflow-state",
+      "notes": "reconciler/attempt-ledger #759 owns destructive recovery",
+      "emitter": "setBlocked"
+    },
+    {
+      "site_id": "stages.pre-merge-conflict-rebase:merge-conflict#2",
+      "module": "scripts/stages/pre-merge-conflict-rebase.ts",
+      "line": 174,
+      "occurrence": 2,
+      "match": "PR has a merge conflict with the base branch that could not be automatically reb",
+      "disposition": "reconcile-owned",
+      "blocker_kind": "merge-conflict",
+      "canonical_reason": "workflow-state",
+      "notes": "reconciler/attempt-ledger #759 owns destructive recovery",
+      "emitter": "setBlocked"
+    },
+    {
+      "site_id": "stages.pre-merge-conflict-rebase:merge-conflict#3",
+      "module": "scripts/stages/pre-merge-conflict-rebase.ts",
+      "line": 283,
+      "occurrence": 3,
+      "match": "PR has a merge conflict with the base branch that could not be automatically reb",
+      "disposition": "reconcile-owned",
+      "blocker_kind": "merge-conflict",
+      "canonical_reason": "workflow-state",
+      "notes": "reconciler/attempt-ledger #759 owns destructive recovery",
       "emitter": "setBlocked"
     }
   ],

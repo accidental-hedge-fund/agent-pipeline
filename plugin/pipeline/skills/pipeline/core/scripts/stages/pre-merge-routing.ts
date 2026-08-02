@@ -87,8 +87,9 @@ import {
  * the CI-gate grace window and the no-run recovery guard persist across polls
  * (fixing the reset-on-every-poll bug — #281 review 2).
  *
- * CI recovery markers (#679) are also persisted to `runDir/pre-merge-ci-recovery.json`
- * when a run directory is available so a process restart does not re-consume budget.
+ * CI recovery attempt authority (#679 / #759) is the stage-attempt ledger
+ * (`runDir/stage-attempt-ledger.json`); SHA-set fields below are a process-local
+ * cache projected from the ledger so a process restart does not re-consume budget.
  */
 export interface PreMergePollingContext {
   /** Wall-clock ms when the CI gate first observed pending checks. Set by
@@ -111,7 +112,7 @@ export interface PreMergePollingContext {
   ciWaitingGateRecorded?: boolean;
   /**
    * Head SHAs for which the definitive-CI-failure one-shot rebase was already
-   * attempted (#771). Durable via `pre-merge-ci-recovery.json` as a set so
+   * attempted (#771). Durable via stage-attempt ledger (SHA-set cache) so
    * H1→H2→H1 cannot re-open a consumed budget for H1 after worktree recreate.
    */
   ciRebaseAttemptedShas?: string[];
@@ -162,6 +163,13 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
   tryRebaseAndPush?: typeof tryRebaseAndPush;
   rebaseAlreadyAttempted?: typeof rebaseAlreadyAttempted;
   markRebaseAttempted?: typeof markRebaseAttempted;
+  /**
+   * Optional head-SHA rebase-attempt probe for tests (#759). Production uses
+   * the stage-attempt ledger when runDir is available.
+   */
+  rebaseAttemptedForHead?: (headSha: string) => boolean;
+  /** Injectable stage-attempt ledger I/O (#759). */
+  stageAttemptLedgerDeps?: import("../stage-attempt-ledger.ts").StageAttemptLedgerDeps;
   // Seams for the OpenSpec archive step + its consistency guard (#106), so
   // maybeArchiveOpenspec is testable without a real worktree, git, openspec
   // CLI, or GitHub.
@@ -491,7 +499,7 @@ export async function advance(
     (prDetail.mergeable_state ?? "").toUpperCase() === "DIRTY";
   if (isEarlyConflict) {
     console.log(`[pipeline] #${issueNumber}: PR #${prNumber} is conflicting; skipping CI poll`);
-    return recoverFromMergeConflict(cfg, issueNumber, opts.stateDir, deps, prNumber);
+    return recoverFromMergeConflict(cfg, issueNumber, opts.stateDir, deps, prNumber, opts.runDir);
   }
 
   // ---- Step 1: CI ----
@@ -865,7 +873,7 @@ export async function advance(
   const freshState = (freshPrDetail.mergeable_state ?? "").toUpperCase();
   const isFreshConflict = freshPrDetail.mergeable === false || freshState === "DIRTY";
   if (isFreshConflict) {
-    return recoverFromMergeConflict(cfg, issueNumber, opts.stateDir, deps, prNumber);
+    return recoverFromMergeConflict(cfg, issueNumber, opts.stateDir, deps, prNumber, opts.runDir);
   }
   if (freshState === "BEHIND") {
     // BEHIND means the branch is out-of-date but has no code conflict.

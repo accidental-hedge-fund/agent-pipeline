@@ -203,7 +203,11 @@ export type RecoveryAttemptOutcome =
 /** A single persisted recovery attempt — the ledger.recovery_attempts entry
  *  the durable-blocker-classification capability requires to survive a
  *  resume (#509 requirement "Classification, actions, evidence, and outcome
- *  SHALL be persisted and emitted"). */
+ *  SHALL be persisted and emitted").
+ *
+ *  #759 extends this family for stage-shared fields (additive/optional so
+ *  pre-#759 ledgers still load). Stage-local one-shots use the same identity
+ *  space via `stage-attempt-ledger.ts` rather than a parallel schema. */
 export interface LoopRecoveryAttempt {
   /** Stable idempotency key over item + candidate + evidence + action. */
   attempt_id: string;
@@ -213,6 +217,11 @@ export interface LoopRecoveryAttempt {
    *  deadline lets a resumed supervisor honor backoff without blocking sibling
    *  scheduling or recomputing the delay from process-local state. */
   not_before?: string;
+  /**
+   * Alias of `not_before` for stage/operator visibility (#759). When both are
+   * present, `not_before` is authoritative for eligibility.
+   */
+  next_attempt_at?: string;
   completed_at?: string;
   item_id: string;
   class: DurableBlockerClass;
@@ -224,10 +233,28 @@ export interface LoopRecoveryAttempt {
   actions: RecoveryRecipe[];
   evidence_fingerprint: string;
   outcome: RecoveryAttemptOutcome;
+  /**
+   * Explicit action status projection (#759). When absent, consumers derive
+   * status from `outcome` (`started` | terminal outcomes).
+   */
+  status?: RecoveryAttemptOutcome;
   /** Remaining class budget immediately after this action was started. */
   budget_remaining: number;
   /** Persisted failure/exhaustion detail; absent for started/recovered attempts. */
   error?: string;
+  /** Alias of `error` for stage-shared field naming (#759). */
+  last_error?: string;
+  /** Closed typed reason (#760 vocabulary when applicable; #759 stage share). */
+  typed_reason?: string;
+  /**
+   * Terminal outcome among success / failed / superseded once the attempt
+   * leaves `started` (#759). Optional; derived from `outcome` when absent.
+   */
+  terminal_outcome?: "success" | "failed" | "superseded";
+  /** Idempotency key alias of `attempt_id` for stage-shared consumers (#759). */
+  idempotency_key?: string;
+  /** PR head SHA when the attempt is stage-bound to a head (#759). */
+  head_sha?: string;
 }
 
 // ---------------------------------------------------------------------------

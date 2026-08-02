@@ -101,6 +101,17 @@ import {
   type PreMergeAutoFixResult,
   type PreMergeAutofixRematerializeBlockerKind,
 } from "./pre-merge-autofix.ts";
+import {
+  reconcileReviewCurrency,
+  type ReviewCurrencyObservedState,
+  type ReviewCurrencyReconcileResult,
+} from "../reconcile-and-converge.ts";
+import {
+  claimAndPersistStageAttempt,
+  hasAttempted,
+  hydrateStageAttemptLedger,
+  type StageAttemptLedgerDeps,
+} from "../stage-attempt-ledger.ts";
 
 /**
  * Tri-state result of {@link resolveReviewedShaCurrency}: whether a SHA a
@@ -163,6 +174,61 @@ export async function resolveReviewedShaCurrency(
  *  pre-merge entry (#481). Exceeding it falls back to the conservative full
  *  re-review path rather than looping. */
 export const MAX_DELTA_SUPERSESSION_RETRIES = 1;
+
+/**
+ * Domain reconcile surface for review-SHA currency (#759 / #628): pure
+ * reuse / re-review / hold dispositions from observed evidence. Recurrence and
+ * ceiling counts are inputs for recovery routing — they do not independently
+ * authorize `pipeline:needs-human` without current human-decision-required
+ * authority.
+ */
+export function reconcileReviewShaGateState(
+  observed: ReviewCurrencyObservedState,
+): ReviewCurrencyReconcileResult {
+  return reconcileReviewCurrency(observed);
+}
+
+/**
+ * Claim pre-merge autofix on the stage-attempt ledger before implementer side
+ * effects (#759). GH attempt comments remain attestation; ledger is authority.
+ * Returns false when the action was already claimed or persist fails.
+ */
+export async function claimPreMergeAutofixOnLedger(input: {
+  runDir: string | undefined;
+  headSha: string;
+  issueNumber?: number;
+  ledgerDeps?: StageAttemptLedgerDeps;
+}): Promise<boolean> {
+  if (!input.runDir || !input.headSha) return true; // no durable store → caller uses comment attestation
+  const hydrated = hydrateStageAttemptLedger(input.runDir, input.ledgerDeps);
+  if (!hydrated.ok) {
+    // Host-local ledger unusable: GH attestation remains the claim path.
+    // Fail closed only when we can prove a prior charged attempt.
+    return true;
+  }
+  if (hasAttempted(hydrated.ledger, input.headSha, "pre_merge_autofix")) {
+    return false;
+  }
+  const claimed = claimAndPersistStageAttempt(
+    input.runDir,
+    hydrated.ledger,
+    {
+      headSha: input.headSha,
+      action: "pre_merge_autofix",
+      itemId: input.issueNumber !== undefined ? String(input.issueNumber) : undefined,
+      typedReason: "pre_merge_autofix_claim",
+    },
+    input.ledgerDeps,
+  );
+  if (!claimed.ok) {
+    // Persist failed (e.g. synthetic runDir used only for event append). Allow
+    // the GH comment claim path rather than blocking autofix on host-local I/O.
+    return true;
+  }
+  // Only a freshly created claim authorizes the implementer. Existing started/
+  // completed attempts must not free-replay after restart (#759).
+  return claimed.created;
+}
 
 /**
  * Notice posted when a pre-merge delta verdict is discarded because the PR
@@ -626,6 +692,18 @@ export async function enforceReviewShaGate(
           // implementer. A preflight failure (e.g. rematerialize-failed)
           // therefore parks without consuming the one-attempt bound.
           const claimAttempt = async (): Promise<boolean> => {
+            // Ledger claim first (#759); GH comment is cross-host attestation only.
+            const ledgerOk = await claimPreMergeAutofixOnLedger({
+              runDir: deps.runDir,
+              headSha: head,
+              issueNumber,
+            });
+            if (!ledgerOk && deps.runDir) {
+              console.warn(
+                `[pipeline] #${issueNumber}: residual re-entry autofix ledger claim failed or already charged; escalating`,
+              );
+              return false;
+            }
             try {
               await postCommentFn(
                 cfg,
@@ -1296,6 +1374,13 @@ export async function enforceReviewShaGate(
               commentsForMarker, targetHead, actor,
             );
           }
+          // Stage-attempt ledger authority (#759): prefer ledger over comment-only.
+          if (!priorAutoFix && deps.runDir) {
+            const hydrated = hydrateStageAttemptLedger(deps.runDir);
+            if (hydrated.ok && hasAttempted(hydrated.ledger, targetHead, "pre_merge_autofix")) {
+              priorAutoFix = true;
+            }
+          }
         } catch {
           // Cannot determine prior attempt — fail closed (#359): skipping the
           // auto-fix is safer than risking a second attempt when the durable
@@ -1324,19 +1409,23 @@ export async function enforceReviewShaGate(
             autoFixableKeys.size > 0 ? autoFixableKeys : undefined,
             newHash,
           );
-          // Crash-safe one-attempt guard (#698 review-2), claimed at the seam
-          // (#787, spec pre-merge-fix-round): the durable attempt-started
-          // marker is posted by this closure, which the seam invokes only
-          // after worktree lookup, rematerialization, and the clean-tree
-          // preflight succeed — immediately before the harness — so a
-          // preflight failure never consumes the one-attempt bound. If the
-          // post fails, the harness is not run ("claim-failed") — fail closed
-          // so a later entry can retry the marker rather than leave an
-          // unbound attempt. Once posted, a later entry at the same head will
-          // not start a second auto-fix even if the noop completion marker
-          // never lands.
+          // Crash-safe one-attempt guard (#698 review-2 / #759): claim the
+          // stage-attempt ledger first; GH attempt comment is attestation.
+          // The seam invokes this only after worktree preflight succeeds.
           let attemptMarkerPosted = false;
           const claimAttempt = async (): Promise<boolean> => {
+            const ledgerOk = await claimPreMergeAutofixOnLedger({
+              runDir: deps.runDir,
+              headSha: targetHead,
+              issueNumber,
+            });
+            if (!ledgerOk && deps.runDir) {
+              autoFixDiagnostic =
+                `failed to claim pre-merge auto-fix on stage-attempt ledger at ` +
+                `${targetHead.slice(0, 7)} before harness invoke`;
+              console.warn(`[pipeline] #${issueNumber}: ${autoFixDiagnostic}`);
+              return false;
+            }
             try {
               await postCommentFn(
                 cfg,

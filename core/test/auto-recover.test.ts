@@ -93,11 +93,21 @@ function memRunStoreDeps(): { deps: RunStoreDeps; lines: () => string[] } {
 }
 
 function baseDeps(overrides: Partial<AutoRecoverDeps> = {}): AutoRecoverDeps {
+  const removeWorktree = overrides.removeWorktree ?? (async () => {});
   return {
     getOnDiskForIssue: async () => ({ path: "/tmp/repo/.worktrees/x", slug: "x" }) as Awaited<ReturnType<AutoRecoverDeps["getOnDiskForIssue"]>>,
     hasCommitsAhead: async () => false,
     getIssueDetail: async () => ({ comments: [] }) as Awaited<ReturnType<AutoRecoverDeps["getIssueDetail"]>>,
-    removeWorktree: async () => {},
+    removeWorktree,
+    // Inject safety-gated remove that skips real git porcelain checks (#759).
+    removeManagedWorktreeSafely: async (cfg, issueNumber, slug, resolvedPath, safeDeps) => {
+      await (safeDeps?.removeWorktree ?? removeWorktree)(cfg, issueNumber, slug, resolvedPath);
+      return {
+        removed: true,
+        path: resolvedPath ?? `/tmp/repo/.worktrees/${slug}`,
+        branch: `pipeline/${issueNumber}-${slug}`,
+      };
+    },
     postComment: async () => {},
     removeLabel: async () => {},
     addLabel: async () => {},

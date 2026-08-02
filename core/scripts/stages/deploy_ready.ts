@@ -4,9 +4,20 @@
 import { addLabelToPr, getIssueDetail, getPrForIssue, postComment, postPrComment } from "../gh.ts";
 import { attestPipelineComment } from "./review-parsing.ts";
 import { LABEL_PREFIX } from "../types.ts";
-import { getOnDiskForIssue, removeWorktree } from "../worktree.ts";
+import {
+  getOnDiskForIssue,
+  removeManagedWorktreeSafely,
+  type SafeRemoveDeps,
+} from "../worktree.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
 import { RUN_SCHEMA_VERSION, appendEvent, defaultRunStoreDeps, type RunStoreDeps } from "../run-store.ts";
+
+/** Injectable seams for {@link finalize} unit tests (#759). */
+export interface FinalizeDeps {
+  getOnDiskForIssue?: typeof getOnDiskForIssue;
+  removeManagedWorktreeSafely?: typeof removeManagedWorktreeSafely;
+  safeRemoveDeps?: SafeRemoveDeps;
+}
 
 const FINAL_SUMMARY_MARKER = "## Pipeline Complete";
 
@@ -48,9 +59,12 @@ export async function finalize(
   issueNumber: number,
   runDir?: string,
   runStoreDeps?: RunStoreDeps,
+  deps: FinalizeDeps = {},
 ): Promise<Outcome> {
   const detail = await getIssueDetail(cfg, issueNumber);
   const prNumber = await getPrForIssue(cfg, issueNumber);
+  const getOnDiskFn = deps.getOnDiskForIssue ?? getOnDiskForIssue;
+  const safeRemoveFn = deps.removeManagedWorktreeSafely ?? removeManagedWorktreeSafely;
 
   // Idempotency: only post if no existing summary.
   const alreadyPosted = detail.comments.some((c) => c.body.startsWith(FINAL_SUMMARY_MARKER));
@@ -97,14 +111,25 @@ export async function finalize(
     }
   }
 
-  // Remove worktree.
-  const wt = await getOnDiskForIssue(cfg, issueNumber);
+  // Remove worktree through evaluateRemoveSafety (#759). Terminal ready-to-deploy
+  // still refuses local-only commits and (without force) dirty trees so
+  // uncommitted operator work is not destroyed.
+  const wt = await getOnDiskFn(cfg, issueNumber);
   if (wt) {
-    await removeWorktree(cfg, issueNumber, wt.slug);
-    console.log(`[pipeline] #${issueNumber}: worktree removed`);
-    if (runDir) {
-      const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-      await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_removed", at, _localPath: wt.path }, runStoreDeps ?? defaultRunStoreDeps).catch(() => {});
+    const removed = await safeRemoveFn(cfg, issueNumber, wt.slug, wt.path, {
+      force: false,
+      ...(deps.safeRemoveDeps ?? {}),
+    });
+    if (removed.removed) {
+      console.log(`[pipeline] #${issueNumber}: worktree removed`);
+      if (runDir) {
+        const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+        await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_removed", at, _localPath: wt.path }, runStoreDeps ?? defaultRunStoreDeps).catch(() => {});
+      }
+    } else {
+      console.log(
+        `[pipeline] #${issueNumber}: worktree retained after ready-to-deploy (${removed.reason})`,
+      );
     }
   }
 

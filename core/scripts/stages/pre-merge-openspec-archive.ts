@@ -45,6 +45,11 @@ import { buildStageDiagnostic } from "../stage-diagnostic.ts";
 import { preMergeBlocked } from "./pre-merge-shared.ts";
 import type { AdvancePreMergeDeps } from "./pre-merge-routing.ts";
 import { diffFilePaths, findLatestReviewCommentBody, extractReviewArtifact } from "./review.ts";
+import {
+  claimAndPersistStageAttempt,
+  hasAttempted,
+  hydrateStageAttemptLedger,
+} from "../stage-attempt-ledger.ts";
 
 // ---------------------------------------------------------------------------
 // OpenSpec archive (once per PR)
@@ -480,12 +485,39 @@ export async function maybeArchiveOpenspec(
   // AND a review finding is tagged `category: spec-divergence`, archiving would
   // fold a stale delta into the living specs (silent corruption). Runs only once
   // we have post-sync candidates so empty shared-set skips stay free of gh actor I/O.
+  const getHeadShaFn = async (p: string): Promise<string | null> => {
+    const r = await gitFn(p, ["rev-parse", "HEAD"], { ignoreFailure: true });
+    return r.stdout.trim() || null;
+  };
+  // Process-local cache of ledger claim (#759); durability is the stage-attempt ledger.
   let repairAttempted = false;
   const attemptRepairFn: SpecConsistencyDeps["attemptBoundedRepair"] =
     deps.attemptBoundedRepair ??
     (cfg.harnesses?.implementer
       ? async (changeId, issNo, runId) => {
           if (repairAttempted) return "already-attempted";
+          // Ledger-first when runDir available so restart does not free-replay repair.
+          const headForKey = await getHeadShaFn(wt.path);
+          if (deps.runDir && headForKey) {
+            const hydrated = hydrateStageAttemptLedger(deps.runDir);
+            if (hydrated.ok && hasAttempted(hydrated.ledger, headForKey, "openspec_repair")) {
+              repairAttempted = true;
+              return "already-attempted";
+            }
+            if (hydrated.ok) {
+              const claimed = claimAndPersistStageAttempt(deps.runDir, hydrated.ledger, {
+                headSha: headForKey,
+                action: "openspec_repair",
+                itemId: String(issNo),
+                typedReason: "openspec_bounded_spec_repair",
+              });
+              if (!claimed.ok) return "already-attempted"; // fail closed
+              if (!claimed.created && hasAttempted(claimed.ledger, headForKey, "openspec_repair")) {
+                repairAttempted = true;
+                return "already-attempted";
+              }
+            }
+          }
           repairAttempted = true;
           return performBoundedSpecRepair(
             cfg,
@@ -500,10 +532,6 @@ export async function maybeArchiveOpenspec(
           );
         }
       : undefined);
-  const getHeadShaFn = async (p: string): Promise<string | null> => {
-    const r = await gitFn(p, ["rev-parse", "HEAD"], { ignoreFailure: true });
-    return r.stdout.trim() || null;
-  };
   // Resolve the trusted review-comment author for the comment-author filter (#356 finding 1).
   // When the dep is provided (including null), use it directly so tests avoid a real network call.
   // In production (dep absent), fail closed: null from getGhActor() means auth is degraded,

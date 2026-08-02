@@ -14,7 +14,15 @@ import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
 import { preMergeBlocked } from "./pre-merge-shared.ts";
 import type { AdvancePreMergeDeps } from "./pre-merge-routing.ts";
+import {
+  claimAndPersistStageAttempt,
+  completeAndPersistStageAttempt,
+  hasAttempted,
+  hydrateStageAttemptLedger,
+  type StageAttemptLedgerDeps,
+} from "../stage-attempt-ledger.ts";
 
+/** Residual legacy marker path — salvage exclusion only; engine does not write it (#759). */
 export const REBASE_MARKER_FILE = PIPELINE_INTERNAL_MARKER_FILES[0];
 
 
@@ -72,11 +80,12 @@ export async function resolveRebasePushResult(
 
 /**
  * Conflict recovery shared by the early-conflict check (#95) and the Step 2
- * mergeability gate: attempt one auto-rebase, bounded by the per-worktree
- * rebase marker so an unresolvable conflict cannot retry a rebase on every
- * poll iteration. When the rebase cannot resolve the conflict (or was already
- * attempted), blocks with a conflict-specific reason rather than a generic
- * CI-timeout or CI-failure message.
+ * mergeability gate: attempt one auto-rebase, bounded by the stage-attempt
+ * ledger (head SHA + conflict_rebase) so an unresolvable conflict cannot retry
+ * a rebase on every poll iteration (#759). Legacy worktree marker is no longer
+ * sole authority and is not written. When the rebase cannot resolve the
+ * conflict (or was already attempted), blocks with a conflict-specific reason
+ * rather than a generic CI-timeout or CI-failure message.
  */
 export async function recoverFromMergeConflict(
   cfg: PipelineConfig,
@@ -85,6 +94,8 @@ export async function recoverFromMergeConflict(
   deps: AdvancePreMergeDeps = {},
   /** PR number for authoritative HEAD re-read after rebase (#771). */
   prNumber?: number,
+  /** Run directory for stage-attempt ledger durability (#759). */
+  runDir?: string,
 ): Promise<Outcome> {
   const getForIssueFn = deps.getForIssue ?? getOnDiskForIssue;
   const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
@@ -92,16 +103,82 @@ export async function recoverFromMergeConflict(
   const tryRebaseAndPushFn = deps.tryRebaseAndPush ?? tryRebaseAndPush;
   const rebaseAlreadyAttemptedFn = deps.rebaseAlreadyAttempted ?? rebaseAlreadyAttempted;
   const markRebaseAttemptedFn = deps.markRebaseAttempted ?? markRebaseAttempted;
+  const ledgerRunDir = runDir ?? stateDir;
+  const ledgerDeps: StageAttemptLedgerDeps | undefined = deps.stageAttemptLedgerDeps;
 
   const wt = await getForIssueFn(cfg, issueNumber);
-  const alreadyRebased = wt ? rebaseAlreadyAttemptedFn(wt.path) : true;
+
+  // Resolve head for ledger key; fall back to worktree-path-only deps for tests
+  // that inject rebaseAlreadyAttempted without a PR.
+  let headShaForLedger: string | undefined;
+  if (prNumber !== undefined) {
+    try {
+      headShaForLedger = (await getPrDetailFn(cfg, prNumber)).head_sha;
+    } catch {
+      headShaForLedger = undefined;
+    }
+  }
+
+  let alreadyRebased: boolean;
+  if (headShaForLedger && ledgerRunDir) {
+    const hydrated = hydrateStageAttemptLedger(ledgerRunDir, ledgerDeps);
+    alreadyRebased = hydrated.ok
+      ? hasAttempted(hydrated.ledger, headShaForLedger, "conflict_rebase") ||
+        hasAttempted(hydrated.ledger, headShaForLedger, "ci_rebase")
+      : true; // fail closed on corrupt ledger
+  } else if (headShaForLedger && deps.rebaseAttemptedForHead) {
+    alreadyRebased = deps.rebaseAttemptedForHead(headShaForLedger);
+  } else {
+    // Legacy injectable path (tests) — worktree marker check as cache only.
+    alreadyRebased = wt ? rebaseAlreadyAttemptedFn(wt.path) : true;
+  }
+
   if (!alreadyRebased && wt) {
-    let beforeSha: string | undefined;
-    if (prNumber !== undefined) {
-      try {
-        beforeSha = (await getPrDetailFn(cfg, prNumber)).head_sha;
-      } catch {
-        beforeSha = undefined;
+    const beforeSha = headShaForLedger;
+
+    // Claim-before-side-effect when we have head + runDir.
+    if (beforeSha && ledgerRunDir) {
+      const hydrated = hydrateStageAttemptLedger(ledgerRunDir, ledgerDeps);
+      if (!hydrated.ok) {
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          `PR has a merge conflict; stage-attempt ledger unusable (${hydrated.reason}) — manual rebase needed.`,
+          "pre-merge",
+          "merge-conflict",
+        );
+        return preMergeBlocked("merge conflict", "merge-conflict");
+      }
+      const claimed = claimAndPersistStageAttempt(
+        ledgerRunDir,
+        hydrated.ledger,
+        {
+          headSha: beforeSha,
+          action: "conflict_rebase",
+          typedReason: "early_conflict_rebase",
+        },
+        ledgerDeps,
+      );
+      if (!claimed.ok) {
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          `PR has a merge conflict; could not durably claim rebase attempt (${claimed.reason}) — manual rebase needed.`,
+          "pre-merge",
+          "merge-conflict",
+        );
+        return preMergeBlocked("merge conflict", "merge-conflict");
+      }
+      if (!claimed.created && hasAttempted(claimed.ledger, beforeSha, "conflict_rebase")) {
+        // Prior claim — do not re-fire.
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          "PR has a merge conflict with the base branch that could not be automatically rebased — manual rebase needed.",
+          "pre-merge",
+          "merge-conflict",
+        );
+        return preMergeBlocked("merge conflict", "merge-conflict");
       }
     }
 
@@ -143,7 +220,31 @@ export async function recoverFromMergeConflict(
           ),
         ).catch(() => {});
       }
+      // Ledger claim already charged; complete for visibility. Do NOT write
+      // worktree `.pipeline-rebase-attempted` (#759).
       markRebaseAttemptedFn(wt.path);
+      if (ledgerRunDir && beforeSha) {
+        const hydrated = hydrateStageAttemptLedger(ledgerRunDir, ledgerDeps);
+        if (hydrated.ok) {
+          const attempt = hydrated.ledger.attempts.find(
+            (a) => a.head_sha === beforeSha && a.action === "conflict_rebase",
+          );
+          if (attempt) {
+            completeAndPersistStageAttempt(
+              ledgerRunDir,
+              hydrated.ledger,
+              {
+                attemptId: attempt.attempt_id,
+                succeeded: !!(rebaseResult.ok && rebaseResult.verified && rebaseResult.headMoved),
+                error: rebaseResult.ok
+                  ? undefined
+                  : "conflict-recovery rebase failed or HEAD unchanged",
+              },
+              ledgerDeps,
+            );
+          }
+        }
+      }
       if (rebaseResult.ok && rebaseResult.verified && rebaseResult.headMoved) {
         return { advanced: false, status: "waiting", reason: "rebase-resolved; CI re-running" };
       }
@@ -172,12 +273,11 @@ export async function recoverFromMergeConflict(
           ),
         ).catch(() => {});
       }
+      // Informational only — engine does not write the worktree marker (#759).
+      markRebaseAttemptedFn(wt.path);
       if (claimCiRerunning) {
-        markRebaseAttemptedFn(wt.path);
         return { advanced: false, status: "waiting", reason: "rebase-resolved; CI re-running" };
       }
-      // Failed: mark so we do not thrash rebase on the next poll (#771).
-      markRebaseAttemptedFn(wt.path);
     }
   }
   await setBlockedFn(
@@ -190,12 +290,45 @@ export async function recoverFromMergeConflict(
   return preMergeBlocked("merge conflict", "merge-conflict");
 }
 
+/**
+ * Domain reconcile for early-conflict rebase bounds (#759): ledger-first,
+ * residual worktree marker is cache/defense-in-depth only.
+ */
+export function reconcileConflictRebaseState(input: {
+  headSha?: string;
+  ledgerAttempted: boolean;
+  worktreeMarkerPresent?: boolean;
+}): {
+  actions: Array<{ kind: "attempt_rebase" } | { kind: "block_manual_rebase" }>;
+} {
+  if (input.ledgerAttempted) {
+    return { actions: [{ kind: "block_manual_rebase" }] };
+  }
+  // Marker alone without ledger is not sole authority — still allow attempt
+  // when head is known and ledger is empty (migration). When no head, marker
+  // may bound same-session tests that only inject the marker path.
+  if (!input.headSha && input.worktreeMarkerPresent) {
+    return { actions: [{ kind: "block_manual_rebase" }] };
+  }
+  return { actions: [{ kind: "attempt_rebase" }] };
+}
+
+/**
+ * Legacy residual check: presence of leftover `.pipeline-rebase-attempted`.
+ * Not production attempt authority (#759). Prefer ledger `hasAttempted`.
+ */
 export function rebaseAlreadyAttempted(wtPath: string): boolean {
   return fs.existsSync(path.join(wtPath, REBASE_MARKER_FILE));
 }
 
-export function markRebaseAttempted(wtPath: string): void {
-  fs.writeFileSync(path.join(wtPath, REBASE_MARKER_FILE), "1");
+/**
+ * Retired writer (#759): the engine SHALL NOT create `.pipeline-rebase-attempted`
+ * as attempt authority. Kept as a no-op (or injectable spy in tests) so call
+ * sites and deps remain stable without dual-writing marker authority.
+ */
+export function markRebaseAttempted(_wtPath: string): void {
+  // Intentionally empty — durable authority is the stage-attempt ledger.
+  void _wtPath;
 }
 
 export async function tryRebaseAndPush(
