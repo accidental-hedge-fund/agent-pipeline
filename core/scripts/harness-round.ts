@@ -10,9 +10,24 @@
  * Stage-specific product policy stays in the caller via callbacks. Salvage
  * semantics are delegated to the existing `trySalvageUncommittedWork`
  * implementation — this helper does not reimplement staging rules.
+ *
+ * #777 stage-output contracts: when a shared-round consumer produces
+ * machine-checkable stdout governed by a registered stage-output contract,
+ * pure shape failures MUST use `runFormatRepairLoop` /
+ * `runContractWithFormatRepair` from `stage-output-contract.ts` rather than a
+ * private full repair skeleton. Non-round stages (plan-revision, OpenSpec
+ * authoring) call that same helper without becoming commit-producing
+ * shared-round consumers solely for repair.
  */
 
 import type { trySalvageUncommittedWork } from "./salvage-harness-work.ts";
+
+/** Re-export for shared-round consumers that need the single format-repair policy (#777). */
+export {
+  DEFAULT_FORMAT_REPAIR_BUDGET,
+  runContractWithFormatRepair,
+  runFormatRepairLoop,
+} from "./stage-output-contract.ts";
 
 /** Minimal reattach result shape shared with worktree.reattachIfDetached. */
 export type HarnessRoundReattachResult = { ok: true } | { ok: false; stderr: string };

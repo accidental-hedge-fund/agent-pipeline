@@ -995,11 +995,11 @@ test("runPlanningPhases — missing ack retries once then proceeds on repair (#6
   }
 });
 
-test("runPlanningPhases — missing ack still blocked needs-human after exhausted format-repair (#658)", async () => {
+test("runPlanningPhases — missing ack blocked harness-contract after exhausted format-repair (#658/#777)", async () => {
   for (const hooks of [freeformHooks(), openspecHooks()]) {
     let revisionCalls = 0;
     let postedRevised = false;
-    const captured = await runAndCapture(hooks, {
+    const result = await runAndCaptureOutcome(hooks, {
       invoke: async (_h: unknown, _cwd: unknown, prompt: string) => {
         if (typeof prompt === "string" && prompt.includes("Revise the implementation plan")) {
           revisionCalls++;
@@ -1013,7 +1013,9 @@ test("runPlanningPhases — missing ack still blocked needs-human after exhauste
         }
       },
     });
-    assert.equal(captured?.tag, "needs-human", `tag: ${captured?.tag}`);
+    const captured = result.captured;
+    // #777: pure shape exhaustion is harness-failure + harness-contract diagnostic, not needs-human.
+    assert.equal(captured?.tag, "harness-failure", `tag: ${captured?.tag}`);
     assert.equal(captured?.stage, "plan-review");
     assert.ok(
       captured?.reason.includes("## Feedback Incorporated"),
@@ -1021,12 +1023,23 @@ test("runPlanningPhases — missing ack still blocked needs-human after exhauste
     );
     assert.equal(revisionCalls, 2, "original + one repair, then terminal block");
     assert.equal(postedRevised, false, "must not post revised plan after exhausted format repair");
+    assert.equal(result.outcome.advanced, false);
+    if (!result.outcome.advanced && result.outcome.status === "blocked") {
+      assert.equal(result.outcome.blockerKind, "harness-failure");
+      assert.equal(result.outcome.diagnostic?.reason_code, "harness-contract");
+      assert.notEqual(
+        result.outcome.diagnostic?.reason_code,
+        "human-decision-required",
+        "shape failure must not project as product human authority",
+      );
+    }
   }
 });
 
-// Exit-0 empty stdout is an output-contract failure, not harness-failure: it must
-// still get the format-repair re-prompt, and exhausted empty repair must terminal
-// as needs-human with the missing-section reason (#658 review finding 121084d7).
+// Exit-0 empty stdout is an output-contract failure (not a process harness-failure):
+// it must still get the format-repair re-prompt. Exhausted empty repair terminals as
+// harness-contract (blocker_kind harness-failure) with the missing-section reason
+// (#658 / #777) — not product needs-human.
 const revisionEmptyStdout: HarnessResult = {
   success: true,
   stdout: "",
@@ -1073,12 +1086,12 @@ test("runPlanningPhases — exit-0 empty revision stdout retries format-repair t
   }
 });
 
-test("runPlanningPhases — exit-0 empty stdout on initial+repair ends needs-human not harness-failure (#658)", async () => {
+test("runPlanningPhases — exit-0 empty stdout on initial+repair ends harness-contract not product needs-human (#658/#777)", async () => {
   for (const empty of [revisionEmptyStdout, revisionWhitespaceStdout]) {
     for (const hooks of [freeformHooks(), openspecHooks()]) {
       let revisionCalls = 0;
       let postedRevised = false;
-      const captured = await runAndCapture(hooks, {
+      const result = await runAndCaptureOutcome(hooks, {
         invoke: async (_h: unknown, _cwd: unknown, prompt: string) => {
           if (typeof prompt === "string" && prompt.includes("Revise the implementation plan")) {
             revisionCalls++;
@@ -1092,7 +1105,8 @@ test("runPlanningPhases — exit-0 empty stdout on initial+repair ends needs-hum
           }
         },
       });
-      assert.equal(captured?.tag, "needs-human", `tag must be needs-human not harness-failure; got ${captured?.tag}`);
+      const captured = result.captured;
+      assert.equal(captured?.tag, "harness-failure", `tag must be harness-failure (contract); got ${captured?.tag}`);
       assert.equal(captured?.stage, "plan-review");
       assert.ok(
         captured?.reason.includes("missing required ## Feedback Incorporated section"),
@@ -1100,6 +1114,9 @@ test("runPlanningPhases — exit-0 empty stdout on initial+repair ends needs-hum
       );
       assert.equal(revisionCalls, 2, "original + one repair, then terminal contract block");
       assert.equal(postedRevised, false, "must not post revised plan after exhausted empty repair");
+      if (!result.outcome.advanced && result.outcome.status === "blocked") {
+        assert.equal(result.outcome.diagnostic?.reason_code, "harness-contract");
+      }
     }
   }
 });
