@@ -104,7 +104,12 @@ const PATH_ONLY_STAGES = [
   "planning.ts",
   "review-routing.ts",
   "shipcheck.ts",
-  "pre_merge.ts",
+  // #628: pre_merge is a thin facade; path-only lookups live in domain modules.
+  "pre-merge-routing.ts",
+  "pre-merge-conflict-rebase.ts",
+  "pre-merge-openspec-archive.ts",
+  "pre-merge-sha-gate.ts",
+  "pre-merge-ci-gate.ts",
 ];
 
 for (const stage of PATH_ONLY_STAGES) {

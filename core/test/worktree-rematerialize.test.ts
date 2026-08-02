@@ -748,14 +748,18 @@ test("ensureManagedWorktree does not bypass createWorktree reclaim (dirty refuse
 // ---------------------------------------------------------------------------
 
 test("source wiring: pre_merge autofix/archive and fix rematerialize before bare missing-wt park", () => {
-  const preMerge = readFileSync(
-    fileURLToPath(new URL("../scripts/stages/pre_merge.ts", import.meta.url)),
-    "utf8",
-  );
-  const fixSrc = readFileSync(
-    fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)),
-    "utf8",
-  );
+  // #628: pre_merge.ts is a facade; rematerialize wiring lives in domain modules.
+  const stagesUrl = (name: string) =>
+    fileURLToPath(new URL(`../scripts/stages/${name}`, import.meta.url));
+  const preMerge = [
+    "pre-merge-routing.ts",
+    "pre-merge-sha-gate.ts",
+    "pre-merge-openspec-archive.ts",
+    "pre-merge-autofix.ts",
+  ]
+    .map((name) => readFileSync(stagesUrl(name), "utf8"))
+    .join("\n");
+  const fixSrc = readFileSync(stagesUrl("fix.ts"), "utf8");
   // Production autofix closure must rematerialize — never bare empty error alone.
   assert.match(preMerge, /ensureWtForAutoFix|ensureManagedWorktree/);
   assert.match(preMerge, /worktree rematerialize failed/);
