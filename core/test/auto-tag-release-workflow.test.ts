@@ -324,3 +324,38 @@ exit 1
   assert.notEqual(result.status, 0, "expected the script to fail when no notes can be resolved");
   assert.match(result.stderr + result.stdout, /No non-empty release notes could be resolved/);
 });
+
+// ---------------------------------------------------------------------------
+// #757: FRG evidence guard must run before tag create/push
+// ---------------------------------------------------------------------------
+
+test("auto-tag-release workflow has FRG verification step ordered before tag create/push", () => {
+  const workflowSrc = readFileSync(WORKFLOW_PATH, "utf-8");
+  // Match step names only (not prose comments that may mention the tag step).
+  const frgStep = workflowSrc.indexOf("- name: Verify Factory Reliability Gate evidence");
+  const tagStep = workflowSrc.indexOf("- name: Create and push annotated tag");
+  assert.notEqual(frgStep, -1, "expected FRG verification step in auto-tag-release.yml");
+  assert.notEqual(tagStep, -1, "expected tag create/push step");
+  assert.ok(
+    frgStep < tagStep,
+    "FRG verification must be ordered before Create and push annotated tag",
+  );
+  // Step must invoke the shared Node validator entry
+  const frgScript = extractStepScript("Verify Factory Reliability Gate evidence");
+  assert.match(frgScript, /factory-reliability-gate\.ts/);
+  assert.match(frgScript, /--validate-tag/);
+  // HMAC attestation secret required (cca5f0f7 — reject hand-authored evidence)
+  assert.match(frgScript, /PIPELINE_FRG_ATTESTATION_KEY/);
+  assert.match(workflowSrc, /secrets\.PIPELINE_FRG_ATTESTATION_KEY/);
+});
+
+test("auto-tag-release FRG step fails closed when evidence missing (script exit non-zero)", () => {
+  // Drift-guard: the FRG step has no continue-on-error and uses validate-tag.
+  const workflowSrc = readFileSync(WORKFLOW_PATH, "utf-8");
+  const startIdx = workflowSrc.indexOf("- name: Verify Factory Reliability Gate evidence");
+  assert.notEqual(startIdx, -1);
+  const slice = workflowSrc.slice(startIdx, startIdx + 1200);
+  assert.equal(/continue-on-error:\s*true/.test(slice), false);
+  assert.match(slice, /--validate-tag/);
+  assert.match(slice, /PIPELINE_FRG_ATTESTATION_KEY/);
+});

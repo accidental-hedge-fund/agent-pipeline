@@ -41,14 +41,25 @@ import type { RunStoreDeps } from "../scripts/run-store.ts";
 // Waiver inventory completeness
 // ---------------------------------------------------------------------------
 
-test("FRG Layer A: every waived scenario names a tracking issue", () => {
+test("FRG Layer A: every waived scenario names a tracking issue (none may cite closed #729/#730 only)", () => {
+  // After #757 both former waivers have hermetic tests; inventory is empty.
+  assert.deepEqual(FRG_LAYER_A_WAIVERS, {});
   for (const [id, own] of Object.entries(FRG_SCENARIO_OWNERSHIP)) {
     if (own.layer_a === "waiver") {
       const issue = FRG_LAYER_A_WAIVERS[id as keyof typeof FRG_LAYER_A_WAIVERS];
       assert.ok(issue, `silent gap: ${id} waived without issue`);
       assert.match(issue, /^#\d+$/);
+      assert.notEqual(issue, "#729", "closed #729 is not a valid waiver target");
+      assert.notEqual(issue, "#730", "closed #730 is not a valid waiver target");
     }
   }
+  assert.equal(FRG_SCENARIO_OWNERSHIP["pr-supersession"].layer_a, "test");
+  assert.equal(FRG_SCENARIO_OWNERSHIP["release-plan-row"].layer_a, "test");
+});
+
+test("FRG Layer A pr-supersession: default supersede_mode closes stale second PRs", async () => {
+  const { DEFAULT_CONFIG } = await import("../scripts/types.ts");
+  assert.equal(DEFAULT_CONFIG.supersede_mode, "close");
 });
 
 // ---------------------------------------------------------------------------
@@ -382,7 +393,14 @@ test("FRG Layer A clean-item-throughput + blocker-taxonomy: thresholds are numer
   const { frgRequiredObservationOverrides } = await import(
     "../scripts/factory-reliability-gate.ts"
   );
+  const { frgRequiredCompositionOverrides } = await import(
+    "../scripts/factory-reliability-gate.ts"
+  );
   const packObs = frgRequiredObservationOverrides("pass");
+  const packComp = frgRequiredCompositionOverrides("pass");
+  const { FRG_UNIT_TEST_ATTESTATION_KEY } = await import(
+    "../scripts/factory-reliability-gate.ts"
+  );
   const pass = computeFrgEvidence({
     version: "1.29.1",
     run_id: "layer-a-pass",
@@ -393,8 +411,11 @@ test("FRG Layer A clean-item-throughput + blocker-taxonomy: thresholds are numer
       { item_id: "2", state: "ready", ready_clean: true },
     ],
     scenario_overrides: packObs,
+    composition_overrides: packComp,
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
   });
   assert.equal(pass.pass, true);
+  assert.equal(pass.scoreboard.engine_class_rate, 0);
   assert.equal(
     pass.scenarios.find((s) => s.id === "clean-item-throughput")?.status,
     "pass",

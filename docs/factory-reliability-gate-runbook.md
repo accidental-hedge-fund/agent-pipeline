@@ -1,4 +1,4 @@
-# Factory Reliability Gate (FRG) — runbook (#723)
+# Factory Reliability Gate (FRG) — runbook (#723 / #757)
 
 **Hard rule:** no release tag and no release PR prepared as ready without a recorded
 FRG pass artifact for that version.
@@ -15,32 +15,97 @@ conforming FRG evidence artifact for the target version.
 FRG **never** merges PRs, enables auto-merge, or creates git tags (golden rule #4).
 After a **release-eligible** pass, FRG **auto-closes** synthetic pack open PRs and
 linked open issues **without merging** as post-pass hygiene (#754). Close ≠ merge.
+Tag creation remains owned by `auto-tag-release.yml`, which **verifies FRG evidence
+before** creating or pushing a tag (#757).
 
 ## Two layers (both mandatory)
 
 | Layer | When | What |
 |-------|------|------|
-| **A. Hermetic** | Every PR that can break composition; always in `npm test` / `npm run ci` | Fake-deps composition tests for capacity, resume, OpenSpec archive coherence, lockfold, docs parity |
-| **B. Live** | **Every release** (patch / minor / major) | Multi-item durable `pipeline:loop` against a fixed scenario pack; immutable evidence artifact |
+| **A. Hermetic** | Every PR that can break composition; always in `npm test` / `npm run ci` | Fake-deps composition tests for capacity, resume, OpenSpec archive coherence, lockfold, docs parity, supersede_mode, auto-tag FRG guard |
+| **B. Live** | **Every release** (patch / minor / major) | Multi-item durable `pipeline:loop` against a **representative** fixed scenario pack; immutable evidence artifact |
 
-## Numeric thresholds (v1)
+## Numeric thresholds (bootstrap / provisional)
 
 | Key | Symbol | Value | Meaning |
 |-----|--------|------:|---------|
 | `min_clean_ready_to_deploy` | **K** | `2` | Minimum pack items that reach `ready` / ready-to-deploy without an engine-class block |
 | `capacity_stress_n` | **N** | `2` | Blocked-retain count the pack must tolerate under low max worktrees without capacity cascade |
-| `max_engine_class_rate` | — | `0.25` | Maximum allowed engine-class / classified-blocker rate (strictly greater **fails**) |
+| `max_engine_class_rate` | — | `0.25` | Maximum allowed engine-class rate with **item_count** denominator (strictly greater **fails**) |
 
-Thresholds may tighten over time via this runbook; they remain numeric and checked by
-`pipeline factory-gate` / `computeFrgEvidence` in `core/scripts/factory-reliability-gate.ts`.
+**Bootstrap origin (#757):** K=`2` and max engine-class rate `25%` are **provisional** values
+chosen for the first mandatory gate. They are **not** multi-release empirical optima.
+Tightening them is a **follow-on** once the [trend ledger](#trend-ledger) has sufficient
+history for operators to review. This change does **not** alter the numeric values.
+
+Thresholds remain numeric and checked by `pipeline factory-gate` /
+`computeFrgEvidence` in `core/scripts/factory-reliability-gate.ts`.
+
+## Engine-class rate formula
+
+Whenever `scoreboard.item_count ≥ 1`:
+
+```text
+engine_class_rate = engine_class_count / item_count
+```
+
+- Denominator is **processed pack item count** (every `per_item` row once).
+- Clean items with no blocker class are in the denominator.
+- Zero engine-class items → rate `0` (never `null` / never print `n/a` when `item_count ≥ 1`).
+- `item_count === 0` → not release-eligible.
+- Each pack item contributes at most one taxonomy class (terminal projection; multi-event
+  recovery on the same item does not multi-count).
+
+Product-class and human-authority counts remain on the scoreboard for honesty; they are
+**not** the rate denominator.
 
 ## Blocker taxonomy
 
 | Bucket | Meaning | Gate effect |
 |--------|---------|-------------|
-| **engine-class** | Factory defects (capacity cascade, resume strand, archive false-pass, lock dirt at 0 attempts, docs-after-PR, PR supersession bugs, `workflow-engine-defect`, unknown free-form themes) | Counted toward engine-class rate; rate above threshold fails FRG |
+| **engine-class** | Factory defects (capacity cascade, resume strand, archive false-pass, lock dirt at 0 attempts, docs-after-PR, PR supersession bugs, `workflow-engine-defect`, typed engine exhaustion, unknown free-form themes) | Counted toward engine-class rate; rate above threshold fails FRG |
 | **product-class** | Intentional product failures / out-of-scope product issues injected by the pack | Does not fail FRG by itself |
-| **human-authority** | Correct human holds (`missing-authority`, `specification-decision`) | Does not fail FRG by itself |
+| **human-authority** | Correct human holds (`missing-authority`, `specification-decision`) | Does not fail FRG by itself; **false** projection for injected recoverables fails release-eligible composition |
+
+## Representative pack composition (#757)
+
+Release-eligible `pass: true` requires a **representative** pack — not only clean-item
+throughput at K. Machine-readable `composition.dimensions[]` must show every required
+dimension as `status: pass`, with `false_human_authority_count === 0`.
+
+| Dimension id | Meaning |
+|--------------|---------|
+| `openspec-bearing-item` | ≥1 item carried a real OpenSpec change through archive/coherence |
+| `fix-rereview-cycle` | ≥1 item traversed blocking finding → fix → re-review |
+| `concurrency-contention` | Multi-item concurrency with worktree contention N≥2 |
+| `managed-worktree-dirt` | Missing/dirty managed worktrees exercised |
+| `process-restart-hydration` | Process death + fresh-process resume/hydration |
+| `forge-http-5xx-backoff` | Forge HTTP 5xx with bounded backoff |
+| `ci-pending-red-recovery` | Pending/red CI with bounded recovery |
+| `same-head-noop-reentry` | Same-HEAD no-op re-entry |
+| `capacity-live-run-coexistence` | Concurrent capacity pressure + live-run coexistence |
+| `recovery-controller-one-item` | Production #787 controller via **`pipeline single <N>`** |
+| `recovery-controller-multi-item` | Production #787 controller via **`pipeline loop`** |
+
+Clean-only comment / trivial no-op packs (**#749/#750 class**) are **retired** as
+non-representative fixtures for release-eligible FRG. Satisfying K alone does **not**
+yield `pass: true`. Failure evidence lists `composition.missing[]` naming each gap.
+
+### Recovery controller bounds (policy-backed)
+
+| Injected class | Canonical path | Bound (`DEFAULT_RECOVERY_POLICY`) |
+|----------------|----------------|-------------------------------------|
+| forge HTTP 5xx / rate limit | `transient-rate-limit` | retry_budget **5**, backoff max 900s |
+| workflow / OpenSpec state | `workflow-state` | retry_budget **3**, max 300s |
+| pending/red CI | `implementation-ci` | retry_budget **3**, max 600s |
+| review fix cycle | `review-findings` | retry_budget **3** |
+| process death / restart | `workflow-engine-defect` / resume | retry_budget **2** |
+| capacity pressure | capacity + worktree | N=`capacity_stress_n` (2) |
+| same-HEAD no-op | noop-advance | must not false `human_authority` |
+| true human holds | `missing-authority`, `specification-decision` | retry_budget **0**, legitimate `human_authority` |
+
+Recovery aggregates (`recovery_aggregates.by_reason`) feed the scoreboard path (item
+classification) and the [trend ledger](#trend-ledger) when available from the pack run.
 
 ## Scenario pack inventory
 
@@ -52,24 +117,25 @@ Thresholds may tighten over time via this runbook; they remain numeric and check
 | `implement-lockfile-dirt` | test | yes | Uncommitted lockfile after HEAD advanced is folded/cleaned; no human-block on known lock dirt at 0 attempts |
 | `local-docs-parity` | test | yes | Docs/generator checks that fail on CI fail **before** PR open (or before ready-to-deploy) |
 | `clean-item-throughput` | test (scoring) | yes | ≥ **K** easy items reach ready without engine-class block |
-| `blocker-taxonomy` | test (scoring) | yes | Engine-class rate ≤ max |
-| `pr-supersession` | **waiver #729** | yes | Stale second PR for same issue does not remain open after new head |
-| `release-plan-row` | **waiver #730** | yes | Release-cut plan-row present or scaffolded; tag path documented |
+| `blocker-taxonomy` | test (scoring) | yes | Engine-class rate ≤ max (item_count denom) |
+| `pr-supersession` | test | yes | Default `supersede_mode: close` — stale second PR for same issue does not remain open after new head |
+| `release-plan-row` | test | yes | Auto-tag FRG guard validates release-eligible evidence before tag create/push |
 | `empty-depends-on-stack-honesty` | test | yes | Empty `depends_on` items that still stack OpenSpec across branches → **warn** or **fail** |
 
 The pack uses a **dedicated** synthetic / labeled work-list (`factory-gate` label or
 reliability selector) — **not** the full product milestone backlog.
 
-### Layer A waivers (explicit; no silent gaps)
+### Layer A waivers
 
 | Scenario id | Tracking issue |
 |-------------|----------------|
-| `pr-supersession` | #729 |
-| `release-plan-row` | #730 |
+| _(none)_ | All required Layer A scenarios have hermetic tests after #757 |
+
+Former closed-issue citations (#729, #730) are **not** valid waivers. Coverage is tests.
 
 ## Evidence schema
 
-Machine-readable JSON (`schema_version: 1`):
+Machine-readable JSON (`schema_version: 1`), additive fields for #757:
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -78,35 +144,71 @@ Machine-readable JSON (`schema_version: 1`):
 | `run_id` | string | Unique FRG run id (non-empty) |
 | `pass` | boolean | Overall machine-checked outcome |
 | `scenarios` | array | Per-scenario `{ id, status, detail, observed?, threshold? }` |
-| `scoreboard` | object | `item_count`, `ready_clean_count`, `engine_class_*`, `product_class_count`, `human_authority_count`, `engine_class_rate`, `per_item[]` |
+| `scoreboard` | object | counts, `engine_class_rate`, `per_item[]` (rate = count/item_count when item_count≥1) |
 | `thresholds` | object | K, N, max engine-class rate applied |
 | `loop_run_id` | string \| null | Durable loop run id; **required non-empty for release-eligible `pass: true`** |
 | `pack_id` | string \| null | Fixed pack identity (must be `factory-gate-v1` for release-eligible pass) |
+| `composition` | object | `dimensions[]`, `false_human_authority_count`, `missing[]` |
+| `integrity` | object | `producer`, `scoreboard_fingerprint`, `composition_fingerprint`, `attestation?` |
+| `recovery_aggregates` | object? | optional `by_reason` map |
 | `created_at` | string | ISO-8601 |
 | `notes` | string[] | Pack selection / warnings |
+
+Integrity fingerprints are recomputed on parse; a minimal forged `{ "pass": true }` fails.
+
+**Producer attestation (required for release-eligible pass / auto-tag):**
+
+- Env / secret: `PIPELINE_FRG_ATTESTATION_KEY` (same value as repo Actions secret used by
+  `auto-tag-release.yml`).
+- Mint: export the key before `pipeline factory-gate …` so `integrity.attestation` is written
+  (`alg: hmac-sha256-v1`, hex MAC over version/run_id/loop_run_id/pack_id + fingerprints).
+- Without the key, the driver will **not** mint release-eligible `pass: true`.
+- Auto-tag verifies the MAC with the secret; self-consistent hand-authored JSON that only
+  recomputes public fingerprints is **rejected** (fail closed, no tag).
 
 ### Evidence paths (stable)
 
 Under the **repository root**:
 
 ```text
-.agent-pipeline/frg/<X.Y.Z>/<frg-run-id>/evidence.json   # immutable
+.agent-pipeline/frg/<X.Y.Z>/<frg-run-id>/evidence.json   # immutable primary
 .agent-pipeline/frg/<X.Y.Z>/latest.json                  # lookup pointer (full evidence copy)
+.agent-pipeline/frg/trend-ledger.jsonl                   # append-only trend (#757)
 ```
 
-`pipeline release` reads `latest.json` for the resolved version.
+`pipeline release` and `auto-tag-release.yml` read `latest.json` for the resolved version.
+
+**Commit bar:** `.agent-pipeline/frg/` is **not** gitignored. Operators **must** commit at
+least `.agent-pipeline/frg/<X.Y.Z>/latest.json` (and preferably the sibling
+`…/<run_id>/evidence.json`) on the **release PR** so auto-tag’s checkout sees the artifact.
+A worktree-local-only write that is never committed **correctly fails** auto-tag (fail closed).
+
+### Trend ledger
+
+Each successful primary evidence write appends one JSON line (idempotent on
+`(version, run_id)`). Fields include version, run_id, loop_run_id, pass, pack_id,
+created_at, item/rate counts, thresholds snapshot, optional recovery aggregates, and
+composition missing summary.
+
+Ledger I/O failure after primary write is **fail-soft**: reported on stderr; evidence is
+**not** deleted; `pass` is not flipped. Operators can rebuild from
+`frg/*/…/evidence.json` trees.
 
 ## Driver invocation (Layer B)
 
 ### Score an existing durable loop run (recommended after a pack loop finishes)
 
 ```bash
-pipeline factory-gate --for 1.29.1 --from-run <loop-run-id> [--json] [--no-close-pack]
+export PIPELINE_FRG_ATTESTATION_KEY='…'   # same value as the repo Actions secret
+pipeline factory-gate --for 1.30.0 --from-run <loop-run-id> \
+  --observations path/to/observations.json \
+  [--scenario id=status:detail[:observed=N]] \
+  [--json] [--no-close-pack]
 ```
 
 - Exit `0` only when `pass: true`.
 - Exit non-zero when `pass: false` or evidence cannot be produced.
-- Writes evidence under `.agent-pipeline/frg/<version>/…`.
+- Writes evidence under `.agent-pipeline/frg/<version>/…` and appends the trend ledger.
 - `--json` prints the full evidence object on stdout.
 - **Fixed-pack only:** `--from-run` validates the durable loop contract against the versioned
   pack manifest (`pack_id=factory-gate-v1`: selector must be label `factory-gate` or milestone
@@ -116,48 +218,92 @@ pipeline factory-gate --for 1.29.1 --from-run <loop-run-id> [--json] [--no-close
   observed with machine-checked criteria; `not_observed`, `fail`, or `skip` fails the gate.
   `capacity-blocked-retain` pass requires `observed ≥ N` (`capacity_stress_n`). `warn` is
   pass-permitting only for documented honesty outcomes (e.g. `empty-depends-on-stack-honesty`).
-- **Live loop + pack provenance:** release-eligible `pass: true` also requires non-empty
-  `loop_run_id` and `pack_id=factory-gate-v1`. Offline/fixture scoring does not write evidence
-  by default and cannot mint release-usable pass artifacts without that provenance.
-- Incomplete evidence (empty scenarios, missing thresholds/scoreboard) is rejected by release
-  lookup.
-- **Post-pass pack auto-close (#754):** after a release-eligible `pass: true` write, the driver
-  closes **without merging** each open PR (and open linked issue) for `scoreboard.per_item[]`
-  entries that are `ready_clean: true` **and** still carry the pack selector label
-  (`factory-gate` for the default pack). Comments cite version + `run_id`. Scope is **only**
-  those scored pack items — never a repo-wide “close all factory-gate”, and never product-
-  milestone / non-pack work that merely shared a host or loop window. Close failures are
-  reported but **do not** flip `pass` or delete evidence. Use `--no-close-pack` to skip
-  auto-close (debugging mid-pack scoring, intentional land-of-provenance). **Merge is never
-  part of FRG** — operators who want pack PRs on main still merge by hand.
+- **Composition required:** release-eligible pass also requires every composition dimension
+  to pass (via ledger projection and/or observations file).
+- **Live loop + pack provenance:** non-empty `loop_run_id` and `pack_id=factory-gate-v1`.
+- **Post-pass pack auto-close (#754):** after a release-eligible `pass: true` write, closes
+  synthetic pack open PRs/issues **without merge** unless `--no-close-pack`.
+
+### Observations file schema (`--observations`)
+
+```json
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "id": "resume-mid-flight",
+      "status": "pass",
+      "detail": "killed mid-advance; pipeline loop --resume recovered",
+      "observed": null,
+      "threshold": null
+    }
+  ],
+  "composition": [
+    {
+      "id": "fix-rereview-cycle",
+      "status": "pass",
+      "detail": "item 42: blocking finding → fix → re-review pass",
+      "observed": null
+    },
+    {
+      "id": "recovery-controller-one-item",
+      "status": "pass",
+      "detail": "pipeline single 42 exercised #787 recovery path",
+      "observed": 1
+    }
+  ],
+  "false_human_authority_count": 0,
+  "recovery_aggregates": {
+    "by_reason": {
+      "implementation-ci": {
+        "success": 1,
+        "exhaustion": 0,
+        "resumes": 0,
+        "elapsed_ms": 12000
+      }
+    }
+  }
+}
+```
+
+Unknown scenario or composition ids are **hard-rejected** (CLI exit non-zero before scoring).
+Auto-scored scenarios (`clean-item-throughput`, `blocker-taxonomy`) still derive from the
+ledger; observations cannot loosen numeric capacity / rate rules.
+
+**Test-only helper** `frgRequiredObservationOverrides` / `frgRequiredCompositionOverrides`
+must not be used as the operator path for minting release evidence.
+
+Optional repeated CLI tokens:
+
+```bash
+--scenario resume-mid-flight=pass:killed and resumed
+--scenario capacity-blocked-retain=pass:ok:observed=2
+```
 
 ### Start the pack (operator procedure)
 
-1. File or select a **small fixed pack** of issues labeled `factory-gate` (or a known
-   reliability milestone selector) covering the scenario inventory. Do **not** use the
-   full product milestone as the work-list.
-2. Set concurrency low enough to exercise capacity (e.g. `max_concurrent_worktrees: 2–3`
-   and loop `concurrency.max_concurrent` aligned with the runbook). Document the values
-   used in FRG `notes`.
-3. Start the durable loop:
+1. File or select a **representative fixed pack** labeled `factory-gate` (or a known
+   reliability milestone selector) covering scenarios **and** composition dimensions.
+   Do **not** use #749/#750-class comment-only fixtures. Do **not** use the full product
+   milestone as the work-list.
+2. Exercise one-item recovery via `pipeline single <N>` and multi-item via
+   `pipeline loop --label factory-gate` (production #787 controller paths).
+3. Set concurrency low enough to exercise capacity (e.g. `max_concurrent_worktrees: 2–3`
+   and loop `concurrency.max_concurrent` aligned with the runbook). Document values in
+   FRG `notes`.
+4. Inject/observe recovery classes (worktree dirt/missing, process death + resume, forge
+   5xx, CI pending/red, same-HEAD no-op, capacity + live-run).
+5. When the pack run is terminal (or sufficiently complete for scoring), score it with an
+   observations file covering remaining non-auto dimensions:
 
    ```bash
-   pipeline loop --label factory-gate
-   # or: pipeline loop --milestone "<reliability-pack-milestone>"
+   pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> \
+     --observations docs/frg-observations.example.json --json
    ```
 
-4. Exercise mid-flight resume (kill supervisor mid-advance; `pipeline loop --resume <run-id>`).
-5. When the pack run is terminal (or sufficiently complete for scoring), score it:
-
-   ```bash
-   pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> --json
-   # default: auto-closes synthetic pack R2D PRs/issues without merge
-   # pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> --no-close-pack
-   ```
-
-6. Attach evidence to the release PR (automated by `pipeline release` on success; or paste
-   `run_id` + pass summary manually). Synthetic pack throwaways should already be closed
-   after step 5 unless you passed `--no-close-pack`.
+6. **Commit** `.agent-pipeline/frg/<X.Y.Z>/latest.json` (and run evidence) on the release
+   branch/PR. `pipeline release` embeds the FRG section; files must land in the tree for
+   auto-tag.
 
 ### Concurrency settings (documented defaults for FRG)
 
@@ -172,35 +318,51 @@ pipeline factory-gate --for 1.29.1 --from-run <loop-run-id> [--json] [--no-close
 `pipeline release <X.Y.Z|major|minor|patch>` **after version resolution**:
 
 1. Looks up `.agent-pipeline/frg/<version>/latest.json`.
-2. **Fails closed** when missing, unparsable, `pass: false`, or empty `run_id`.
-3. **Open soak-defect preflight (#755)** — with FRG `loop_run_id` / `run_id` available, **fails closed** when open engine-class soak defects are attributable to that candidate (typed terminal / recovery-exhaustion evidence preferred; `bug` + `pipeline:engine-class` label fallback for historical records). Runs **before** any version-file mutation. A recoverable intermediate that converged in-run does **not** block.
-4. On success, includes an FRG section on the release PR body (`run_id`, pass summary). When the audited override was used, also includes a waiver section (waived issue numbers + reason).
-5. Still runs `npm run ci` (additive). FRG, open-soak preflight, and CI are independent; none alone is sufficient.
+2. **Fails closed** when missing, unparsable, `pass: false`, empty `run_id`, or not
+   release-eligible (composition, integrity, rate integrity, etc.).
+3. **Open soak-defect preflight (#755)** — with FRG `loop_run_id` / `run_id` available,
+   fails closed when open engine-class soak defects are attributable to that candidate.
+4. On success, includes an FRG section on the release PR body (`run_id`, numeric rate, composition).
+5. Still runs `npm run ci` (additive). FRG, open-soak preflight, and CI are independent.
 6. Does **not** merge or tag because FRG/open-soak passed.
 
-### Open soak-defect override (audited only)
+### Auto-tag FRG guard (#757)
 
-When open candidate-linked engine-class defects must not hold a deliberate release:
+On a detected release merge (`release: X.Y.Z — …` subject + `core/package.json` version match,
+tag not already present), `.github/workflows/auto-tag-release.yml`:
+
+1. Verifies `.agent-pipeline/frg/<X.Y.Z>/latest.json` via the shared Node validator
+   (`factory-reliability-gate.ts --validate-tag <version>`).
+2. **Fails closed** (no tag create/push) when missing, unparsable, `pass: false`, or not
+   release-eligible.
+3. On success, proceeds to notes resolution and annotated tag push (existing rules).
+4. Non-release pushes remain successful no-ops without FRG.
+5. Existing tags remain successful no-ops.
+
+FRG never creates tags itself; the workflow remains the tag owner.
+
+### Open soak-defect override (audited only)
 
 ```bash
 pipeline release <X.Y.Z> --allow-open-soak-defects "<non-empty reason>"
 ```
 
-The reason is recorded on the release PR body. **Silent skip is not available** (no env/config default clears this gate).
+The reason is recorded on the release PR body. Silent skip is not available.
 
-Remediation message always points at this runbook and:
+Remediation:
 
 ```bash
-pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id>
+pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> --observations <file>
 ```
 
 ## Attachment checklist (release PR)
 
 - [ ] FRG `run_id` visible on the PR body (or comment)
 - [ ] Result shows **pass** for the **same** version as the release
-- [ ] Artifact path or digest available for auditors
-- [ ] Engine-class rate and clean-ready counts meet thresholds
-- [ ] Open engine-class soak defects from the candidate soak are closed **or** an audited `--allow-open-soak-defects` waiver section is on the PR body (#755)
+- [ ] **Committed** `.agent-pipeline/frg/<version>/latest.json` on the release branch
+- [ ] Engine-class rate is numeric (item_count denom) and ≤ max
+- [ ] Composition dimensions all pass; `false_human_authority_count` is 0
+- [ ] Open engine-class soak defects closed **or** audited `--allow-open-soak-defects`
 
 Unrecorded local claims (“we soaked it”) **do not** satisfy the attachment requirement.
 
@@ -209,24 +371,16 @@ Unrecorded local claims (“we soaked it”) **do not** satisfy the attachment r
 Every subsequent release reuses:
 
 1. This runbook  
-2. `pipeline factory-gate`  
-3. The same scenario id inventory and evidence schema  
+2. `pipeline factory-gate` with observations CLI  
+3. The same scenario id + composition dimension inventory and evidence schema  
+4. Trend ledger history for threshold review  
 
 Each version gets its **own** evidence artifact keyed by `version`.
 
-## First shipping release after the gate lands
-
-Target: **v1.29.1** (or the next release that ships this change).
-
-1. Land reliability siblings as needed (#712, #714, #716, #718, #722, …).  
-2. Run Layer B pack + `pipeline factory-gate --for 1.29.1 --from-run …`.  
-3. Retain `pass: true` evidence under `.agent-pipeline/frg/1.29.1/`.  
-4. Link FRG `run_id` from the release PR and issue #723.  
-5. Next release (e.g. v1.30.0) reuses this same procedure (prove not a one-off).
-
 ## Related docs
 
+- CLI: `docs/cli.md` (`factory-gate` command)
 - Two-item pilot (smoke, not a release gate): `docs/durable-run-two-item-live-pilot-runbook.md`
-- Parallel conflict pilot: `docs/durable-run-parallel-conflict-pilot-runbook.md`
 - Implementation: `core/scripts/factory-reliability-gate.ts`
-- OpenSpec: `openspec/changes/release-mandatory-factory-reliability-gate/`
+- OpenSpec change: `openspec/changes/frg-representative-pack-requirements/`
+- Auto-tag workflow: `.github/workflows/auto-tag-release.yml`

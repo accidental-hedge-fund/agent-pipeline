@@ -100,7 +100,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `factory-gate`
 
-- **Usage:** `pipeline factory-gate --for <version> [--from-run <run-id>]`
+- **Usage:** `pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail]`
 - **Summary:** Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)
 
 #### `improve`

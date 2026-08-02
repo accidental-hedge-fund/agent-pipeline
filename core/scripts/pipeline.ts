@@ -582,6 +582,16 @@ export function buildCmd(): Command {
       "--no-close-pack",
       "factory-gate: skip auto-close of synthetic pack PRs/issues after a release-eligible pass",
     )
+    .option(
+      "--observations <file>",
+      "factory-gate: JSON file of scenario + composition observations (see FRG runbook)",
+    )
+    .option(
+      "--scenario <token>",
+      "factory-gate: additive scenario observation id=status:detail[:observed=N] (repeatable)",
+      collectRepeatable,
+      [],
+    )
     .option("--since <date>", "improve/scoreboard: restrict analysis to runs on or after this ISO date (e.g. 2026-06-01)")
     .option("--until <date>", "scoreboard: restrict analysis to runs on or before this ISO date (e.g. 2026-06-15)")
     .option("--days <n>", "scoreboard: analyze the last N days (default: 30)", Number)
@@ -3280,7 +3290,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  // `pipeline factory-gate --for <version> [--from-run <id>] [--json] [--no-close-pack]` (#723/#754).
+  // `pipeline factory-gate --for <version> [--from-run <id>] [--observations <file>]
+  // [--scenario …] [--json] [--no-close-pack]` (#723/#754/#757).
   // Scores a durable loop (or refuses without --from-run) and writes FRG evidence.
   // Never merges or tags. After a release-eligible pass, closes synthetic pack
   // PRs/issues without merge unless --no-close-pack.
@@ -3291,12 +3302,17 @@ async function main(): Promise<void> {
     if (!versionArg) {
       console.error(
         "pipeline factory-gate: --for <X.Y.Z> is required.\n" +
-          "  Usage: pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> [--json] [--no-close-pack]\n" +
+          "  Usage: pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> \\\n" +
+          "           [--observations <file>] [--scenario id=status:detail] [--json] [--no-close-pack]\n" +
           "  See docs/factory-reliability-gate-runbook.md",
       );
       process.exit(2);
     }
-    const { runFactoryGate } = await import("./factory-reliability-gate.ts");
+    const {
+      runFactoryGate,
+      parseFrgObservationsJson,
+      parseFrgScenarioCliToken,
+    } = await import("./factory-reliability-gate.ts");
     const { defaultLoopStoreDeps, readLedger, readContract } = await import("./loop/store.ts");
     const {
       getIssueStateAndLabels,
@@ -3323,6 +3339,38 @@ async function main(): Promise<void> {
       };
       // Commander `--no-close-pack` sets closePack=false (same as --no-edit → edit).
       const noClosePack = opts.closePack === false;
+
+      // Observation file + optional --scenario tokens (#757).
+      let scenarioOverrides: import("./factory-reliability-gate.ts").FrgScenarioOverride[] = [];
+      let compositionOverrides:
+        | import("./factory-reliability-gate.ts").FrgCompositionOverride[]
+        | undefined;
+      let falseHumanAuthorityCount: number | undefined;
+      let recoveryAggregates:
+        | import("./factory-reliability-gate.ts").FrgRecoveryAggregates
+        | undefined;
+      if (opts.observations) {
+        const obsPath = path.resolve(repoDir, opts.observations as string);
+        const text = await fsPromises.readFile(obsPath, "utf8");
+        const obs = parseFrgObservationsJson(text);
+        scenarioOverrides = [...(obs.scenarios ?? [])];
+        compositionOverrides = obs.composition;
+        falseHumanAuthorityCount = obs.false_human_authority_count;
+        recoveryAggregates = obs.recovery_aggregates;
+      }
+      const scenarioTokens: string[] = Array.isArray(opts.scenario)
+        ? (opts.scenario as string[])
+        : opts.scenario
+          ? [String(opts.scenario)]
+          : [];
+      for (const token of scenarioTokens) {
+        const parsed = parseFrgScenarioCliToken(token);
+        scenarioOverrides = [
+          ...scenarioOverrides.filter((s) => s.id !== parsed.id),
+          parsed,
+        ];
+      }
+
       const result = await runFactoryGate({
         version: versionArg,
         repoDir,
@@ -3331,6 +3379,10 @@ async function main(): Promise<void> {
         milestone: opts.milestone,
         json: !!opts.json,
         noClosePack,
+        scenarioOverrides: scenarioOverrides.length > 0 ? scenarioOverrides : undefined,
+        compositionOverrides,
+        falseHumanAuthorityCount,
+        recoveryAggregates,
         packCloseDeps: noClosePack
           ? undefined
           : {

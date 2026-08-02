@@ -1,17 +1,15 @@
-# #777 Universal stage-output contract layer
+# #757 — FRG representative pack (plan revision)
 
-## Plan
-- [x] stage-output-contract.ts: registry, validators, format-repair, fixture hook
-- [x] Register plan-revision.ack@1, openspec.change-singular@1, review.verdict@1
-- [x] Migrate planning plan-revision + OpenSpec singularity to shared repair + harness-contract
-- [x] Wire review delegated unparseable path through shared repair
-- [x] Golden fixtures + tests + drift guards
-- [x] plugin regenerate + npm run ci + commit
+## Status
 
-## Review
-- Central `core/scripts/stage-output-contract.ts` owns versioned registry + shared format-repair.
-- Plan-revision / OpenSpec authoring / delegated review use the same repair budget (1).
-- Terminal pure shape failure emits `pipeline/stage-diagnostic@1` reason `harness-contract`.
-- Named provider shapes are golden fixtures only; extension fixture hook present.
-- Follow-ups for shipcheck/design/auto-merge listed and drift-pinned.
-- `npm run ci` green.
+Plan revised after Codex NEEDS_REVISION review. Implementation not started.
+
+## Artifacts
+
+- `openspec/changes/frg-representative-pack-requirements/design.md` — strengthened
+- `openspec/changes/frg-representative-pack-requirements/tasks.md` — strengthened
+- Spec deltas already present under `openspec/changes/frg-representative-pack-requirements/specs/`
+
+## Next
+
+Implement per revised plan (engine rate → composition validator → ledger → CLI → auto-tag → waivers → runbook → `npm run ci` + plugin mirror).
