@@ -90,7 +90,7 @@ review_policy: # which review findings block progression vs. merely advise (#17)
   # surface_recurrence_rounds: 3 # same-surface recurrence guard; 0 disables (#234)
 
 doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here
-  runOnStart: false # if true, run the preflight checks before planning and abort the run on any failure
+  runOnStart: true # run the preflight checks before planning and abort the run on any failure
   failFast: false # if true, stop at the first failing check instead of collecting all failures
 
 # auto_loop: # bounded auto-loop mode (#149) — opt-in; disabled by default
@@ -124,3 +124,146 @@ doctor: # deterministic preflight capability check (#146) — run `pipeline doct
 # harness_sandbox: false # set true to run the claude implementer with --permission-mode default
 #   instead of bypassPermissions (#21). The codex harness is already sandboxed
 #   via --full-auto and is unaffected. Default false -> current invocation unchanged.
+
+# repo: "owner/name" # GitHub repository in 'owner/name' format (overrides auto-detected value). Auto-detected from the git remote when absent.
+
+# conventions_md_path: "CONVENTIONS.md" # Repo-root-relative path to the conventions file embedded in stage prompts. Absent by default (no conventions file embedded).
+
+supersede_mode: close # After managed PR create/reuse, dispose other open associated same-base PRs for the issue: "close" (default) with a pipeline-superseded comment, or "comment-only" (notice only, leave open).
+
+ci_mode: github # Source of pre-merge CI verification: github (default) waits on gh pr checks; local relies on the current run's local test-gate result and skips the GitHub Actions wait.
+
+pre_merge_ci_assertion_fix: true # Allow one surgical implementer fix attempt per head SHA for assertion-classified pre-merge CI failures.
+
+pre_merge_ci_rerun_enabled: true # When true (default), allow one automatic failed-workflow re-run per head SHA for infra/unknown pre-merge CI failures.
+
+design_gate: # risk-triggered design-interrogation gate (#436)
+  enabled: true
+  triggers: [concurrency, storage, auth, migration, infrastructure, public-api, architecture]
+  extra_triggers: {}
+  max_rounds: 2
+  block_threshold: medium
+  min_confidence: 0.6
+  limits:
+    max_decisions: 8
+    max_field_chars: 4000
+    max_artifact_bytes: 65536
+
+visual_gate: # run the repo's E2E/visual suite after pre-merge and before eval-gate
+  enabled: false # Enable the visual gate (set true to activate; one-time declaration per repo).
+  # command: npx playwright test # Shell command to run the E2E/visual suite (required when enabled).
+  mode: gate # gate: block on failure; advisory: record result and advance.
+  timeout: 900 # Stage-level budget in seconds (shared across attempts).
+  max_attempts: 2 # Total attempts before giving up (1 = no retry).
+  artifacts_dir: .pipeline-visual # Worktree-relative directory the command writes screenshots/diffs/traces into.
+  publish: false # Publish the deciding run's captured artifacts to the PR branch as a bounded, pipeline-internal commit (default false). (repo-history tradeoff — see README)
+
+# loop: # pipeline:loop native-goal capability attestation (#506) — uncomment to override automatic detection
+#   native_goal_attestation: auto # Operator attestation of the active engine's native /goal capability: "auto" (default) detects automatically; "available"/"unavailable" overrides detection.
+
+papercuts: # agent-logged minor-friction capture (#419)
+  enabled: true
+  auto_file: false
+  auto_file_window_hours: 24
+  auto_file_max_per_window: 3
+  auto_file_min_occurrences: 3
+
+# corrections: # opt-in correction auto-file (#500) — uncomment to auto-file recurring correction_event clusters. Capture (#499) is unconditional and unaffected.
+#   auto_file: false # When true, automatically file pipeline:backlog issues for recurring correction clusters at run_complete and queue-batch end. Single-host concurrency scope (#459) — see docs.
+#   auto_file_window_hours: 24 # Trailing window (hours) over which correction_event records are clustered for auto-filing.
+#   auto_file_max_per_window: 3 # Maximum number of issues auto-filed within the trailing window.
+#   auto_file_min_occurrences: 2 # Minimum in-window distinct-occurrence count a correction cluster must meet to be auto-filed (floor 2).
+
+# durable_runs: # opt-in durable-run-blocker auto-file (#538) — uncomment to auto-file terminal or recurring durable-run-blocker clusters at durable-run terminal stop/completion
+#   auto_file: false # When true, automatically file pipeline:backlog issues for terminal or recurring durable-run-blocker clusters at durable-run terminal stop/completion.
+#   auto_file_window_hours: 24 # Trailing window (hours) over which durable-run-blocker occurrences are clustered for auto-filing.
+#   auto_file_max_per_window: 3 # Maximum number of issues auto-filed within the trailing window.
+#   auto_file_min_occurrences: 2 # Minimum cross-run recurrence count a non-terminal durable-run-blocker cluster must meet to be auto-filed (floor 2). A terminal stop always qualifies from a single occurrence.
+
+build_command: "npm run build" # keep generated plugin artifacts synchronized after fix/auto-fix edits (#387)
+#   When declared, fix and auto-fix rounds run it after committing source edits and fold any
+#   resulting generated-artifact changes (dist/, a plugin manifest, …) into the round commit,
+#   so committed artifacts stay fresh and a CI artifact-drift check never fails on drift the
+#   round itself introduced. Absent (default): no build runs, no auto-detection, no fallback.
+
+# event_sink: # optional external event sink (#343) — uncomment to deliver run events.jsonl records to an operator-controlled forwarder. SECURITY: forwards run/stage/issue/PR event metadata to the configured command — treat it as a trusted destination.
+#   command: "logger -t pipeline" # forwarder command; receives each event JSON line on stdin. Unset -> no sink (local events.jsonl only, unchanged).
+#   mode: additive # additive (default): write events.jsonl AND deliver to the sink | exclusive: sink only (events.jsonl is not written)
+#   Env overrides: PIPELINE_EVENT_SINK_COMMAND, PIPELINE_EVENT_SINK_MODE (win over file config). Delivery failures are non-fatal.
+
+# product_fault: # privacy-safe upstream product-fault reporting (#502) — uncomment to enable 'pipeline report'. SECURITY: when enabled, an explicitly-confirmed report sends the sanitized payload to intake_endpoint — treat it as a trusted destination. Absent (default): fully inert — no network reporting, no GitHub issue.
+#   enabled: false # set true to let 'pipeline report' build and (after explicit confirmation) submit a sanitized product-fault payload
+#   intake_endpoint: "https://intake.example.com/product-fault" # maintainer-controlled intake service URL; absent -> pipeline report prepares a manual GitHub issue draft instead of submitting
+#   intake_auth_env: "PRODUCT_FAULT_INTAKE_TOKEN" # name of an env var holding a submission-scoped credential — never a GitHub token, never stored here
+
+# roadmap: # backlog roadmap engine overrides (#171) — uncomment to override; absent (default): built-in roadmap defaults apply
+#   include_labels: [] # Include only issues with at least one of these labels.
+#   exclude_labels: [] # Exclude issues that carry any of these labels.
+#   score_weights: # Multiplier overrides for each scoring sub-factor (default: 1.0 each).
+#     impact: 1.0
+#     confidence: 1.0
+#     ease: 1.0
+#     risk_reduction: 1.0
+#     dep_leverage: 1.0
+#   hygiene_auto_apply: false # When true, hygiene actions are applied automatically with --apply (default: false).
+#   pr_docs: true # When false, skip opening the roadmap.md PR (default: true).
+#   release_model: semver # How the roadmap groups issues into milestones: 'semver' (default) bundles into version-numbered release lanes; 'continuous' groups by theme/epic for continuous delivery.
+#   release_capacity: # Capacity policy for the semver release model. Controls per-milestone effort budget and breaking-change isolation. Absent block uses capacity-aware defaults.
+#     effort_budget: 8 # Per-milestone effort-points capacity budget for the semver model (XS=1 S=2 M=3 L=5 XL=8). An issue with effort_points ≥ budget is isolated into its own milestone. Default: 8.
+#     isolate_breaking: true # When true (default), each breaking-change issue is given its own milestone instead of sharing one with unrelated issues. Tunes capacity-aware semver milestone grouping.
+#   inventory_concurrency: 4 # Maximum concurrent harness calls during inventory phase (default: 4).
+#   depgraph_concurrency: 4 # Maximum concurrent harness calls during dependency verification (default: 4).
+#   depgraph_verify_cap: 20 # Maximum candidates to source-verify; excess go to open_questions (default: 20).
+
+# sweep: # sweep backlog maintenance thresholds (#168) — uncomment to override; absent (default): built-in thresholds apply
+#   min_body_length: 150 # Minimum body character count for an issue to be considered sufficient (default: 150).
+#   required_sections: ["Summary", "User story", "Acceptance criteria", "Out of scope"] # Section headings (without ##) that must be present for an issue to be considered sufficient (default: Summary, User story, Acceptance criteria, Out of scope).
+
+# trusted_override_actors: [] # Additional GitHub identities whose override sentinels are trusted besides the current pipeline actor. (#229). Absent (default): only the current actor is trusted.
+#   Grants override authority to each listed identity — SECURITY: it can dispose of blocking review findings without further review; keep this list minimal and audited.
+#   e.g. trusted_override_actors: ["octocat"]
+
+# queue: # queue batch factory operator defaults (#305) — uncomment to override. Precedence: CLI flags > these values > built-in defaults. Absent by default.
+#   max_issues: 10 # Maximum number of issues to dispatch in a batch run (default: 10).
+#   budget_dollars: null # Stop launching new runs when cumulative cost reaches this limit in USD; null means unlimited.
+#   concurrency: 1 # Maximum simultaneously active pipeline runs (default: 1).
+#   max_failure_rate: 1.0 # Halt new launches when failedCount/completedCount reaches this threshold (0.0–1.0); requires at least 3 completed runs (default: 1.0).
+
+# auto_merge_eligibility: # auto-merge eligibility classification (#306). Disabled by default. SECURITY: informational classification only — the pipeline never merges (#4); a human still owns the merge button regardless of this setting.
+#   enabled: false # Enable the auto-merge eligibility gate (default false). When false, the gate is a no-op.
+#   max_diff_lines: 300 # Hard-deny if total PR diff lines (additions + deletions) exceed this threshold (default 300).
+#   max_files: 10 # Hard-deny if changed file count exceeds this threshold (default 10).
+#   deny_paths: [] # Additional glob patterns that always trigger needs-human regardless of other checks (default [])., e.g. ["infra/**", "**/migrations/**"]
+#   allow_paths: [] # When non-empty, any changed file not covered by this list triggers needs-human (default []).
+#   min_confidence: 0.8 # LLM judge confidence floor (0–1); outputs below this route to needs-human (default 0.8).
+
+# merge_queue: # human-gated merge-queue defaults (#676/#675) — prepare-only release-when-complete; optional surgical repair; never auto_merge / never tags-publishes-merges release
+#   release_when_complete: false # When true, merge-queue may prepare a release PR after a complete drive (still requires --release-version). Default false. Prepare-only: never tags, publishes, or merges the release.
+#   repair: false # When true, merge-queue --apply may attempt deterministic-first then surgical/mechanical repair of conflict/CI holds (default false). Dry-run never repairs. Does not grant auto_merge.
+#   repair_max_attempts: 1 # Max charged implementer repair attempts per held item per drive (default 1). 0 disables implementer repair while still allowing deterministic re-query.
+
+# context_snapshot: # stage-aware issue context snapshot cap override (#318) — uncomment to override; absent (default): an 8000-character cap applies
+#   max_chars: 8000 # Maximum total character count for human comment bodies in the context snapshot. Oldest entries are dropped first when the cap is exceeded.
+
+# repo_map: # cross-repo dependency map (#312) — uncomment to declare inter-repo relationships
+#   # When set, the planning stage fetches open issues from declared repos as supplemental context.
+#   # Relationships are declared independently per repo; no reverse-edge inference is performed.
+#   depends_on: [] # owner/repo strings this repo consumes (e.g. - acme/shared-lib)
+#   depended_on_by: [] # owner/repo strings that consume this repo (e.g. - acme/consumer-app)
+
+# executors: # external stage executors (#314) — uncomment to delegate model-invoking stages to an external agent system or model endpoint. SECURITY: the assigned stage's prompt/context is sent to this external endpoint; credential is an env-var NAME, never a literal secret.
+#   opencode-main:
+#     type: agent-system # full execution backend (OpenCode/HermesAgent/OpenClaw), valid for any model-invoking stage
+#     provider: opencode
+#     endpoint: https://opencode.internal/api
+#     credential: OPENCODE_API_KEY # env-var NAME resolved at invocation time — never a literal secret value
+#   local-ollama:
+#     type: model-endpoint # raw OpenAI-compatible chat/completions endpoint; valid ONLY for plan-review/review-1/review-2
+#     base_url: http://localhost:11434/v1
+#     model: llama3.1:70b
+
+# stage_executors: # assign a name from executors: to a model-invoking stage; unassigned stages use the local claude/codex harness unchanged
+#   planning: opencode-main
+#   review-1: local-ollama
+#   review-2: local-ollama
+#   Known model-invoking stages: planning, plan-review, implementing, review-1, fix-1, review-2, fix-2, shipcheck-gate
