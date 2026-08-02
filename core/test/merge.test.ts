@@ -739,32 +739,57 @@ for (const flagArgs of ALLOWED_MERGE_FLAGS) {
 // ---------------------------------------------------------------------------
 // 4.16 Loop-isolation guarantee
 //
-// Reads every stage handler file and asserts none of them import from merge.ts.
-// Also reads pipeline.ts and verifies the dispatch() function body does not
-// reference mergePr, preserving the never-auto-merge structural invariant.
+// Reads every advance-path stage handler file and asserts none of them import
+// from merge.ts or reference merge-queue plan/drive surfaces. Also reads
+// pipeline-run.ts and verifies the dispatch() function body does not reference
+// mergePr / merge-queue drive, preserving the never-autonomous-merge structural
+// invariant (#217, #764).
 // ---------------------------------------------------------------------------
 
-test("merge: loop-isolation — no stage handler imports from merge.ts", () => {
+test("merge: loop-isolation — no stage handler imports merge or merge-queue", () => {
   const stageFiles = fs.readdirSync(STAGES_DIR).filter((f) => f.endsWith(".ts"));
-  // merge.ts itself is excluded — it IS the module; checking it for self-references
-  // would trivially pass and is not meaningful.
-  // merge-queue.ts is a human-gated CLI surface (#676) that intentionally calls
-  // mergePr via the same merge authority model as `pipeline merge` — not part of
-  // the autonomous advance loop. Its release-when-complete path is prepare-only.
+  // Human-gated CLI surfaces (not advance stages) are excluded from the scan:
+  // - merge.ts — per-PR merge primitive
+  // - merge-queue.ts / merge_queue.ts — operator merge-queue plan/drive
+  // - merge-queue-release-when-complete.ts — prepare-only hook used by merge-queue
+  // - merge_queue_hold.ts — pure hold/repair-budget helpers for operator drive (#675)
+  //   (same exempt set as merge-queue.test.ts loop-isolation)
   const checkFiles = stageFiles.filter(
-    (f) => f !== "merge.ts" && f !== "merge-queue.ts" && f !== "merge-queue-release-when-complete.ts",
+    (f) =>
+      f !== "merge.ts" &&
+      f !== "merge-queue.ts" &&
+      f !== "merge_queue.ts" &&
+      f !== "merge-queue-release-when-complete.ts" &&
+      f !== "merge_queue_hold.ts",
   );
 
   for (const file of checkFiles) {
     const content = fs.readFileSync(path.join(STAGES_DIR, file), "utf8");
-    const hasImport =
+    const hasMergeImport =
       content.includes('from "./merge') ||
+      content.includes("from './merge") ||
       content.includes('from "../stages/merge') ||
+      content.includes("from '../stages/merge") ||
       content.includes('require("./merge') ||
+      content.includes("require('./merge") ||
+      content.includes('require("../stages/merge') ||
       content.includes("require('../stages/merge");
     assert.ok(
-      !hasImport,
+      !hasMergeImport,
       `Stage handler ${file} must not import from merge.ts — the autonomous loop must stay merge-free (#217)`,
+    );
+    // Operator merge-queue plan/drive must also stay unreachable from advance
+    // handlers (#764). Mirror the dispatch-body symbol scan at handler level so a
+    // stage that imports runMergeQueue / planMergeQueue (or merge-queue.ts) fails CI.
+    const hasMergeQueueSurface =
+      content.includes("merge-queue") ||
+      content.includes("merge_queue") ||
+      content.includes("planMergeQueue") ||
+      content.includes("runMergeQueueDryRun") ||
+      content.includes("runMergeQueue");
+    assert.ok(
+      !hasMergeQueueSurface,
+      `Stage handler ${file} must not import or reference merge-queue plan/drive — never-autonomous-merge (#764)`,
     );
   }
 });
@@ -803,5 +828,14 @@ test("merge: loop-isolation — dispatch() in pipeline-run.ts does not call merg
   assert.ok(
     !dispatchBody.includes("mergePr"),
     "dispatch() must not call mergePr — the advance loop must never invoke the merge handler (#217)",
+  );
+  // Operator merge-queue surfaces (plan/drive) are also unreachable from advance (#764).
+  assert.ok(
+    !dispatchBody.includes("merge-queue") &&
+      !dispatchBody.includes("merge_queue") &&
+      !dispatchBody.includes("planMergeQueue") &&
+      !dispatchBody.includes("runMergeQueueDryRun") &&
+      !dispatchBody.includes("runMergeQueue"),
+    "dispatch() must not reference merge-queue plan/drive symbols — never-autonomous-merge (#764)",
   );
 });
