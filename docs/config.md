@@ -453,8 +453,8 @@ Nested fields:
 ### `merge_queue`
 
 - **Type:** object
-- **Default:** `{"release_when_complete":false}`
-- **Description:** Human-gated merge-queue defaults (#676). Opt-in release-when-complete only; no auto_merge.
+- **Default:** `{"release_when_complete":false,"repair":false,"repair_max_attempts":1}`
+- **Description:** Human-gated merge-queue defaults (#676/#675). Opt-in release-when-complete and optional repair; no auto_merge.
 
 Nested fields:
 
@@ -462,6 +462,16 @@ Nested fields:
 
 - **Type:** boolean
 - **Description:** When true, merge-queue may prepare a release PR after a complete drive (still requires --release-version). Default false. Prepare-only: never tags, publishes, or merges the release.
+
+#### `merge_queue.repair`
+
+- **Type:** boolean
+- **Description:** When true, merge-queue --apply may attempt deterministic-first then surgical/mechanical repair of conflict/CI holds (default false). Dry-run never repairs. Does not grant auto_merge.
+
+#### `merge_queue.repair_max_attempts`
+
+- **Type:** integer
+- **Description:** Max charged implementer repair attempts per held item per drive (default 1). 0 disables implementer repair while still allowing deterministic re-query.
 
 ### `models`
 
