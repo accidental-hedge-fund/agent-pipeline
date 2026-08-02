@@ -1,4 +1,10 @@
-## MODIFIED Requirements
+## REMOVED Requirements
+
+### Requirement: Pipeline-internal commit exemption covers only OpenSpec archive commits
+
+**Reason:** Superseded. Classification now uses the neutral pipeline-commits classifier (OpenSpec archive prefix plus exact visual-gate artifact-publish subject), not an archive-only rule. See the replacement requirement below.
+
+## ADDED Requirements
 
 ### Requirement: Pipeline-internal commit exemption uses the neutral classifier set
 

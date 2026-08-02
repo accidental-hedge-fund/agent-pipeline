@@ -1,4 +1,10 @@
-## MODIFIED Requirements
+## REMOVED Requirements
+
+### Requirement: Auto-format commits are classified as pipeline-internal
+
+**Reason:** Superseded by the tested #228 disposition and the neutral pipeline-commits classifier: auto-format subjects are **not** pipeline-internal. See the replacement requirement below.
+
+## ADDED Requirements
 
 ### Requirement: Auto-format commits are NOT classified as pipeline-internal
 
