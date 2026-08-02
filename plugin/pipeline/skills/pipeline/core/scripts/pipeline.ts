@@ -102,15 +102,13 @@ import { runSweep, realSweepDeps } from "./stages/sweep.ts";
 import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
 import { mergePr, realMergeDeps } from "./stages/merge.ts";
 import { runMergeQueue, realMergeQueueDeps } from "./stages/merge-queue.ts";
-import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
-import * as fixStage from "./stages/fix.ts";
-import * as preMergeStage from "./stages/pre_merge.ts";
-import * as evalStage from "./stages/eval.ts";
-import * as shipchecKStage from "./stages/shipcheck.ts";
-import * as deployReady from "./stages/deploy_ready.ts";
-import * as autoRecover from "./stages/auto_recover.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
+import {
+  REVIEW_CEILING_MARKER,
+  ceilingRound,
+  evidenceTimestamp,
+} from "./advance-shared.ts";
 import {
   emitCorrectionEvent,
   emitControlAttribution,
@@ -216,12 +214,30 @@ import {
   runAdvance,
   realPlanningRecoveryDeps,
   type AdvanceDeps,
+  type AdvanceOpts,
   type PlanningRecoveryDeps,
 } from "./pipeline-run.ts";
 
 // Re-export for backward compatibility with existing import paths.
 export { isAutoLoopRecoverable, isAutoLoopEligible, canAutoLoopContinue };
-export type { AdvanceDeps, PlanningRecoveryDeps };
+export { ceilingRound, REVIEW_CEILING_MARKER } from "./advance-shared.ts";
+export type { AdvanceDeps, AdvanceOpts, PlanningRecoveryDeps };
+
+/** Map Commander-facing {@link CliOpts} into the thin advance bag (#630). */
+export function toAdvanceOpts(opts: Pick<
+  CliOpts,
+  "dryRun" | "model" | "once" | "override" | "jsonEvents" | "profile" | "runId"
+>): AdvanceOpts {
+  return {
+    dryRun: opts.dryRun,
+    model: opts.model,
+    once: opts.once,
+    override: opts.override,
+    jsonEvents: opts.jsonEvents,
+    profile: opts.profile,
+    runId: opts.runId,
+  };
+}
 
 // Package version, single-sourced from package.json so a version bump is reflected
 // automatically. The path is `../package.json` (core/package.json) and is mirror-safe:
@@ -3824,7 +3840,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  await runAdvance(cfg, issueNumber, opts);
+  await runAdvance(cfg, issueNumber, toAdvanceOpts(opts));
 }
 
 // ---------------------------------------------------------------------------
@@ -4208,11 +4224,6 @@ export async function resolveIssueNumber(
 // Status mode
 // ---------------------------------------------------------------------------
 
-/** First line of the punch-list comment posted when a review round hits the
- *  round ceiling and parks the item at `needs-human` (emitted by review.ts's
- *  `reviewCeilingComment`). A controlled string the pipeline owns end-to-end. */
-const REVIEW_CEILING_MARKER = "## Pipeline: Review ceiling reached";
-
 /** IO seam for {@link runStatus} so unit tests inject fakes — no real gh. */
 export interface RunStatusDeps {
   getIssueDetail: typeof getIssueDetail;
@@ -4369,20 +4380,6 @@ export function needsHumanPunchlist(
     `- \`--override "<key>: <reason>"\` (audited) — records the decision and auto-resumes.`,
     `- Or fix it by hand and relabel \`pipeline:needs-human\` → \`pipeline:review-${round}\`.`,
   ].join("\n");
-}
-
-/**
- * The review round recorded in a ceiling comment (#135) — the round `--override`
- * auto-resumes into. Reads the controlled `Review N re-ran …` line the pipeline
- * itself emits (review.ts's `reviewCeilingComment`). Line-anchored and
- * first-match-wins: the controlled line precedes any reviewer-authored finding
- * text, so injected content later in the body can never override it (the
- * e8b1f0b4 lesson — a whole-body `pipeline:review-N` regex matched finding
- * prose). Returns null when the line is absent.
- */
-export function ceilingRound(body: string): 1 | 2 | null {
-  const m = body.match(/^Review ([12]) re-ran /m);
-  return m ? (Number(m[1]) as 1 | 2) : null;
 }
 
 /** The `- ` bullet lines under the controlled `### Unresolved blocking findings`
@@ -4765,7 +4762,7 @@ export async function handleRunSubcommand(
     return;
   }
 
-  await runAdvance(cfg, number, opts);
+  await runAdvance(cfg, number, toAdvanceOpts(opts));
 }
 
 // ---------------------------------------------------------------------------
@@ -5085,12 +5082,7 @@ export async function runOverride(
       `[pipeline] #${issueNumber}: needs-human → ${to} (resuming the round that hit the ceiling)`,
     );
   }
-  await deps.runAdvance(cfg, issueNumber, opts);
-}
-
-/** ISO 8601 timestamp at seconds precision — local copy for appendBlockerCleared. */
-function evidenceTimestamp(): string {
-  return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  await deps.runAdvance(cfg, issueNumber, toAdvanceOpts(opts));
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
