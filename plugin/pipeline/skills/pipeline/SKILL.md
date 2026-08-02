@@ -13,11 +13,10 @@ description: |
 # pipeline
 
 Self-contained TypeScript skill that advances a GitHub issue (or PR's linked
-issue) through a 13-stage label-driven state machine, ending at a green,
-current, mergeable `pipeline:ready-to-deploy` result. The advance loop does
-NOT auto-merge; merging requires explicit session-bound operator authority
-(`/pipeline:merge` per-PR, or `/pipeline:merge-queue … --apply` for batch;
-dry-run is the merge-queue default). Autonomous deployment is out of scope.
+issue) through a 16-stage label-driven state machine, ending at
+`pipeline:ready-to-deploy` on the happy path (or parking at `pipeline:needs-human`
+when review ceilings / similar paths exhaust). The pipeline does NOT auto-merge —
+the user owns the merge button.
 
 ## Developing this skill itself (core/ → plugin/ mirror)
 
@@ -30,10 +29,19 @@ of `core/` (+ `hosts/claude`). After editing any file under `core/`, run
 
 ## State machine
 
+Happy path (16 stages total in code `STAGES`, including the park off-ramp):
+
 ```
-backlog → ready → planning → implementing
+backlog → ready → planning → plan-review → implementing → design-gate
               → review-1 → fix-1 → review-2 → fix-2
-              → pre-merge → eval-gate → shipcheck-gate → ready-to-deploy
+              → pre-merge → visual-gate → eval-gate → shipcheck-gate
+              → ready-to-deploy
+```
+
+Terminal off-ramp (not a happy-path successor of `ready-to-deploy`):
+
+```
+… review ceilings / exhaustion → needs-human
 ```
 
 Each item carries one `pipeline:<stage>` label and at most one `blocked`
@@ -44,85 +52,49 @@ stage logic. There is no separate orchestrator process.
 
 `backlog` is a triage marker (e.g. set by `/sweep`). `/pipeline` starts work
 at `ready` and only acts on items that already carry a `pipeline:*` label.
+`needs-human` is a terminal park state (review-ceiling punch list, etc.); the
+advance loop never auto-advances from it to `ready-to-deploy`.
 
 ## Modes
 
 The primary invocation is the advance loop; all other operations are available as
 distinct `pipeline:<command>` entries in the skill/command menu.
 
+<!-- BEGIN GENERATED: cli-command-table -->
 ```
-/pipeline N                              durable autonomous one-item drive (default)
-/pipeline N --once                       advance one stage and stop
-/pipeline N --dry-run                    log what would happen; no harness calls, no GitHub writes
-/pipeline N --domain <d>                 override domain name in lock/log paths
-/pipeline N --base <branch>              override base branch
-/pipeline N --repo-path <path>           target a different repo working tree
-/pipeline N --detach                     legacy raw detached advance; bypasses durable recovery
-
-/pipeline:status <N>                     read-only — print stage, blocker, PR, last review
-/pipeline:unblock <N> "<answer>"         post answer + clear blocked label
-/pipeline:override <N> "<key>: <reason>" disposition a review finding and auto-resume the advance loop
-/pipeline:summary <N>                    print the run's evidence bundle for issue N (local, offline)
-/pipeline:doctor                         deterministic preflight check; print summary, exit 0/1
-/pipeline N --doctor                     run the preflight before advancing; abort the run on any failure
-/pipeline:init                           ensure labels + scaffold .github/pipeline.yml
-/pipeline:cleanup                        sweep merged-PR worktrees
-/pipeline:intake [--description "<text>"]  spec a rough description into a GitHub issue + ROADMAP PR
-/pipeline:intake --description "<text>" --dry-run  preview only; no writes
-/pipeline:triage <N> --stage ready       set pipeline:ready on issue N; remove any other pipeline:* stage label
-/pipeline:triage <N> --stage backlog     set pipeline:backlog on issue N; idempotent, no model call
-/pipeline:sweep                          batch re-spec thin issues + reconcile ROADMAP.md (dry-run)
-/pipeline:sweep --apply                  same, applying issue body updates and opening a ROADMAP PR
-/pipeline:sweep --apply --repo other/r   sweep a different repository
-/pipeline backfill                       preview OpenSpec coverage for legacy behavior (non-mutating)
-/pipeline backfill --apply               author a spec-only PR for missing-coverage behaviors
-/pipeline backfill --apply --capability auth  scope the apply slice to a named capability
-/pipeline:roadmap                        analyze open backlog → dependency-aware scored roadmap (dry-run)
-/pipeline:roadmap --apply                same, applying hygiene write-backs + opening a roadmap.md PR
-/pipeline:roadmap --next <N>             read existing plan.json, emit top-N dependency-safe issues (no re-run)
-/pipeline:merge <pr>                     human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
-/pipeline:merge-queue --milestone <m>    dry-run ordered R2D merges for a milestone (no merges)
-/pipeline:merge-queue --milestone <m> --apply  sequential merges via existing merge surface
-/pipeline:merge-queue --milestone <m> --apply --release-when-complete --release-version minor
-                                         after a complete queue, prepare a release PR (never tags/merges/publishes)
-/pipeline:release <version> [--theme "..."]  prepare a release PR for the given version
-                                         (missing unshipped plan row is auto-scaffolded before
-                                         other ROADMAP mutations when `| *(none)* |` is present:
-                                         `| **vX.Y.Z** | major|minor|patch | <theme> | #N, #M | <why> |`;
-                                         shipped `✅ shipped` rows are never overwritten; insert
-                                         failure aborts before version bump with a copy-paste row)
-/pipeline:logs [<run-id>] [-f]           list or stream pipeline run logs
-
-/pipeline:release <version>              prepare a release PR for the given version
-/pipeline:logs [<run-id>] [--events] [-f]  list or stream run logs (events --follow exits 0 on run_complete; --no-until-terminal for interrupt-only)
-/pipeline summary <run-id>               print evidence bundle for an exact run (domain-independent, no issue number)
-/pipeline scoreboard                     print read-only factory throughput/cost/reliability metrics from run artifacts
-/pipeline scoreboard --bucket day|week   add a chronological day/week time-series to the scoreboard report
-/pipeline scoreboard --by <dimension>    group scoreboard metrics by harness|model|effort|executor (exactly one; missing/absent identities report as `unknown`, dimensions that can't apply — e.g. executor on a local-harness stage — report as `not applicable`)
-/pipeline scoreboard --corrections-by <dimension>  group repeat-correction/recurrence metrics by repo|stage|harness|model|source_kind|failure_class|proposed_control|implemented_control (exactly one)
-/pipeline scoreboard --html <path>       write a self-contained, offline HTML export of the report to <path> (local/archival only; makes no network requests, composes with the other scoreboard flags)
-/pipeline config sync [--apply]          preview/apply a safe .github/pipeline.yml scaffold refresh
-/pipeline config repo-map <add|remove|list>  add/remove/list repo_map entries in .github/pipeline.yml
-/pipeline refine-spec --title "<t>" --body "<b>"  refine existing issue spec; non-mutating JSON output
-/pipeline queue                          batch factory: dispatch all pipeline:ready issues up to limits
-/pipeline:loop --milestone v2            canonical durable multi-item run — driven entirely in-repo by this skill's own supervisor
-/pipeline:loop --resume <run-id>         resume an existing durable run by id, on either engine
-/pipeline:loop --audit                   read-only report for the run; no writes
-/pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run's events.jsonl (default: exit 0 on loop_run_stopped/loop_run_complete)
-/pipeline:loop --audit                   read-only report (process identity, action evidence, per-item stage table); no writes
-/pipeline:loop --resume <run-id> --audit --follow  stream whole-run stage-progress lines (not harness stdout)
-/pipeline loop logs [<run-id>] [--events] [-f]  dump or follow a durable loop run\'s events.jsonl (default: exit 0 on loop_run_stopped/loop_run_complete)
-/pipeline evals plan <manifest.json>     expand + persist an experiment's run plan; invokes no harness, creates no worktree
-/pipeline evals run <manifest.json>      execute an experiment's cells (resumable); never writes to production GitHub
-/pipeline evals run <manifest.json> --fixtures <dir>  override the fixtures directory (default: core/evals/fixtures)
-/pipeline evals grade <experiment-dir>   grade a completed experiment's cells; writes grades.jsonl (never gates a PR)
-/pipeline evals run <manifest.json> --trajectory-max-events <n> --trajectory-max-bytes <n>  override the default trajectory/verifier artifact bounding ceilings (default: 200 events / 200000 bytes)
-/pipeline evals report <experiment-dir> --baseline <treatment_id>  paired comparative summary.json
-/pipeline evals report <experiment-dir> --baseline <treatment_id> --link-artifacts  additionally link trajectory/verifier artifacts for flagged cells (opt-in; default output unchanged)
-/pipeline evals harvest <request.json>   draft an eval fixture from sanitized run/correction evidence (never writes; prints/writes the draft)
-/pipeline evals harvest <request.json> --apply [--plan-only]  promote a validated draft into the fixtures dir; --plan-only also proves it's executable (no live model call, no GitHub write)
-/pipeline --version                      print the package version, then exit (no number; -V alias)
+/pipeline N                                     durable autonomous one-item drive (default)
+/pipeline loop --milestone <m>|--label <l>|--range a-b [--resume <run-id>] [--audit] [--follow] Durable multi-item run — driven in-repo by the pipeline's own loop supervisor
+/pipeline run <n> [--detach]                    Advance alias; use with --detach for a legacy raw detached run (desktop launchers)
+/pipeline single <n>                            Canonical durable one-item autonomous drive (owns a durable loop; delegates stages to advance)
+/pipeline cleanup                               Sweep merged-PR worktrees and delete their local branches
+/pipeline doctor                                Deterministic preflight check; print summary, exit 0/1
+/pipeline init                                  Ensure pipeline labels and scaffold .github/pipeline.yml
+/pipeline merge <pr>                            Human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
+/pipeline merge-queue --milestone <m> [--apply] [--release-when-complete --release-version <ver>] Human-gated sequential merge of ready-to-deploy PRs; optional prepare-only release-when-complete
+/pipeline override <n> "<key>: <reason>"        Disposition a review finding and auto-resume the advance loop
+/pipeline release <version> [--theme "..."] [--dry-run] Prepare a release PR for the given version (never tags, merges, or publishes)
+/pipeline remove-worktree <n> [--force]         Remove a managed pipeline worktree for an issue (optional --force)
+/pipeline status <n>                            Read-only — print stage, blocker, PR, last review
+/pipeline unblock <n> "<answer>"                Post an answer and clear the blocked label
+/pipeline backfill [--apply] [--capability <name>] Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
+/pipeline evals plan|run|grade|report|harvest … Offline eval plan/run/grade/report/harvest (never writes to production GitHub)
+/pipeline factory-gate --for <version> [--from-run <run-id>] Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)
+/pipeline improve [--apply] [--top <n>] [--json] Cluster papercuts / corrections / durable-run blockers into backlog candidates
+/pipeline intake --description "<text>" [--release vX.Y.Z] [--dry-run] Spec a rough description into a GitHub issue and ROADMAP PR
+/pipeline queue [--max-issues <n>] [--concurrency <n>] [--budget-dollars <d>] Batch factory: dispatch all pipeline:ready issues up to concurrency/budget limits
+/pipeline refine-spec --title "<t>" --body "<b>" Refine an existing issue's spec; non-mutating JSON output
+/pipeline roadmap [--apply] [--next <n>]        Analyze open backlog into a dependency-aware scored roadmap
+/pipeline sweep [--apply] [--repo owner/name]   Batch re-spec thin issues and reconcile ROADMAP.md
+/pipeline triage <n> --stage ready|backlog      Set a pre-pipeline stage label (ready or backlog) on an issue
+/pipeline correction record|attribute …         Record a correction event or attribute a control (append-only local ledger)
+/pipeline logs [<run-id>] [--events] [-f] [--no-until-terminal] List or stream pipeline run logs (events --follow exits 0 on terminal run_complete)
+/pipeline report [--yes]                        Privacy-safe product-fault report preview/submit (optional; off by default in config)
+/pipeline scoreboard [--bucket day|week] [--by <dim>] [--html <path>] Print read-only factory throughput/cost/reliability metrics from run artifacts
+/pipeline summary <run-id>                      Print the run evidence bundle for an issue number or exact run-id
+/pipeline config schema|validate|sync|repo-map … Config schema, validate, sync scaffold, and repo-map mutations
+/pipeline path [--json]                         Discover installed host skill paths (JSON-friendly for desktop integrators)
 ```
+<!-- END GENERATED: cli-command-table -->
 
 **Deprecated flag forms** (still work, emit a one-line deprecation notice to stderr):
 ```
@@ -195,8 +167,8 @@ Native completion is likewise a **host/user action**. `/pipeline:loop` reports
 its own terminal done and reconciliation conditions from the durable loop
 engine (see `--audit` above); ending the native `/goal` session afterward is
 something the operator or Claude Code's `/goal` mode does, not something this
-skill performs. Consistent with no autonomous merge, this skill neither ends
-the `/goal` session nor merges once a run reports done.
+skill performs. Consistent with the pipeline never merging, this skill neither
+ends the `/goal` session nor merges once a run reports done.
 
 `--cleanup` is the one mode that takes no number. It sweeps pipeline-managed
 worktrees under `worktree_root` whose PR is already merged, removing the worktree
@@ -857,7 +829,7 @@ node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop --resume <r
 ```
 
 Include recovery actions attempted, final item state, linked advance/PR
-evidence, and the merge-next-step note that merge requires explicit operator authority (not unattended auto-merge).
+evidence, and the merge-next-step note that the pipeline does not auto-merge.
 Send one final host notification with the terminal state.
 
 
@@ -1314,7 +1286,7 @@ When the loop ends, the skill prints:
 
 ## What this skill never does
 
-- Auto-merge PRs autonomously — the advance loop never merges and there is no `auto_merge` config key. Explicit operator invocation of `/pipeline merge <pr>` (per-PR) or `/pipeline:merge-queue … --apply` (batch; dry-run is the default without `--apply`) is the controlled, session-bound merge authority after `pipeline:ready-to-deploy`; neither surface is ever called by the advance loop. Autonomous deployment is out of scope.
+- Auto-merge PRs autonomously — the advance loop never merges and there is no `auto_merge` config key. The human-invoked `/pipeline merge <pr>` command is the controlled, explicit surface for merging after `pipeline:ready-to-deploy`; it is never called by the advance loop. `/pipeline:merge-queue --milestone <m>` is a dry-run planner only (ordered R2D candidates); it never merges and is never called by advance.
 - Bypass the `pipeline:*` opt-in label gate.
 - Run more than one transition under `--once`.
 - Touch the GitHub repo in `--dry-run` mode.
