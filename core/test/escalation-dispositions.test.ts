@@ -213,6 +213,41 @@ test("gh HTTP 422 is deterministic and not retried class", () => {
   assert.equal(c.class, "deterministic-client");
 });
 
+test("gh capability refusal keeps a distinct canonical reason (not environment-auth)", () => {
+  for (const stderr of [
+    "HTTP 403: Resource not accessible by integration",
+    "GraphQL: Resource not accessible by integration (repository)",
+    "HTTP 403: Forbidden — missing permission to update labels",
+  ]) {
+    const c = classifyGhError(stderr);
+    assert.equal(c.class, "capability-refusal", stderr);
+    assert.equal(c.reason_code, "capability-refusal", stderr);
+    assert.equal(c.transient, false, stderr);
+    assert.notEqual(c.reason_code, "environment-auth", stderr);
+  }
+  // Auth remains a separate code.
+  const auth = classifyGhError("HTTP 401: authentication required");
+  assert.equal(auth.reason_code, "environment-auth");
+  assert.equal(auth.class, "environment-auth");
+  // Projection stays engine-owned environment recovery class.
+  const proj = projectPipelineReasonCode("capability-refusal");
+  assert.equal(proj.blockerClass, "environment-auth");
+  assert.equal(proj.disposition, "recover");
+  assert.notEqual(proj.disposition, "human_authority");
+});
+
+test("pre-merge delta-round ceiling inventory projects review-findings (not needs-human default)", () => {
+  const ceiling = ESCALATION_INVENTORY.sites.find(
+    (s) =>
+      s.module.includes("pre-merge-sha-gate") &&
+      /deltaRoundCap|round ceiling|delta review reached/i.test(s.match + s.notes),
+  );
+  assert.ok(ceiling, "expected pre-merge delta-round ceiling inventory row");
+  assert.equal(ceiling!.blocker_kind, "review-findings");
+  assert.equal(ceiling!.canonical_reason, "review-findings");
+  assert.notEqual(ceiling!.blocker_kind, "needs-human");
+});
+
 test("every reason code projects to exactly one DurableBlockerClass (or residual protocol path)", () => {
   for (const code of STAGE_DIAGNOSTIC_REASON_CODES) {
     const proj = projectPipelineReasonCode(code);

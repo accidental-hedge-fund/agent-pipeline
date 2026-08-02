@@ -904,15 +904,18 @@ export async function enforceReviewShaGate(
             cfg, issueNumber,
             deltaRoundCeilingComment(cfg, deltaRoundCount, deltaRoundCap, cfg.review_policy.ceiling_action, outstanding),
           );
+          // Round-ceiling exhaustion is engine-owned review recovery (#814 / #760):
+          // unresolved findings remain blocking under review-findings; they do not
+          // mint human authority by default.
           await setBlockedFn(
             cfg, issueNumber,
             `Pre-merge delta review reached the ${deltaRoundCap}-round ceiling with ${outstanding.length} ` +
               `unresolved blocking finding(s).`,
-            "pre-merge", "needs-human",
+            "pre-merge", "review-findings",
           );
           return preMergeBlocked(
             `pre-merge delta-round ceiling: ${outstanding.length} unresolved blocking finding(s)`,
-            "needs-human",
+            "review-findings",
             "delta-review",
           );
         }

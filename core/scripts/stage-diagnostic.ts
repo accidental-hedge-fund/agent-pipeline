@@ -35,6 +35,9 @@ export const STAGE_DIAGNOSTIC_REASON_CODES = [
   "repair-budget-exhausted",
   "external-wait",
   "human-context-required",
+  // Distinct from environment-auth: missing forge capability/permission (e.g. 403
+  // resource not accessible) vs credential/authentication failure.
+  "capability-refusal",
 ] as const;
 
 export type StageDiagnosticReasonCode = (typeof STAGE_DIAGNOSTIC_REASON_CODES)[number];
@@ -144,6 +147,9 @@ function reasonCodeFor(
     case "openspec-stale-delta":
       return "implementation-ci";
     case "delta-review":
+      // Reporting path tag for pre-merge delta review / round-ceiling surfaces —
+      // engine-owned review recovery, never a human-authority default (#814 / #760).
+      return "review-findings";
     case "merge-conflict":
       return "workflow-state";
     case "other":
@@ -184,6 +190,11 @@ export function projectPipelineReasonCode(reasonCode: unknown): StageDiagnosticP
     case "workflow-engine-defect":
       return { blockerClass: "workflow-engine-defect", disposition: "recover" };
     case "environment-auth":
+      return { blockerClass: "environment-auth", disposition: "recover" };
+    case "capability-refusal":
+      // Same durable recovery class as auth (environment/operator setup) but a
+      // distinct canonical reason so metrics and operator guidance can tell
+      // permission/capability refusals from credential failures.
       return { blockerClass: "environment-auth", disposition: "recover" };
     case "worktree-capacity":
       return { blockerClass: "workflow-state", disposition: "capacity" };
@@ -298,7 +309,8 @@ export function projectStageDiagnostic(value: unknown): StageDiagnosticProjectio
       candidate.reason_code === "harness-contract" ||
       candidate.reason_code === "repair-budget-exhausted" ||
       candidate.reason_code === "external-wait" ||
-      candidate.reason_code === "human-context-required"
+      candidate.reason_code === "human-context-required" ||
+      candidate.reason_code === "capability-refusal"
     ) &&
     detail.offramp_class === undefined &&
     (

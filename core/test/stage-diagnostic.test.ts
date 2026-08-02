@@ -46,14 +46,17 @@ test("generic needs-human and delta-review are mechanical without explicit autho
   const generic = buildStageDiagnostic({ blockerKind: "needs-human", reason: "free-form says human" });
   assert.equal(projectStageDiagnostic(generic).disposition, "recover");
 
+  // Pre-merge delta-review / round-ceiling path tags project to engine-owned
+  // review-findings recovery — not a human-authority default (#814 / #760).
   const delta = buildStageDiagnostic({
-    blockerKind: "needs-human",
+    blockerKind: "review-findings",
     reason: "blocking review finding remains",
     stage: "pre-merge",
     offrampClass: "delta-review",
   });
   assert.equal(projectStageDiagnostic(delta).disposition, "recover");
-  assert.equal(delta.reason_code, "workflow-state");
+  assert.equal(delta.reason_code, "review-findings");
+  assert.equal(projectStageDiagnostic(delta).blockerClass, "review-findings");
 });
 
 test("review findings project to a repair-first durable class", () => {

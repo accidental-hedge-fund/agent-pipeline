@@ -91,7 +91,7 @@ export function classifyGhError(stderr: string): {
     if (!(s.includes("rate limit") || s.includes("secondary rate limit"))) {
       return {
         class: "capability-refusal",
-        reason_code: "environment-auth",
+        reason_code: "capability-refusal",
         transient: false,
       };
     }
@@ -159,6 +159,7 @@ export function interventionKindFromReason(
       }
       return "test-build-failure";
     case "environment-auth":
+    case "capability-refusal":
       return "auth-tooling-preflight-failure";
     case "harness-timeout":
     case "harness-contract":
@@ -217,6 +218,7 @@ export function isMechanicalInfrastructureReason(reasonCode: StageDiagnosticReas
     reasonCode === "repair-budget-exhausted" ||
     reasonCode === "worktree-capacity" ||
     reasonCode === "environment-auth" ||
+    reasonCode === "capability-refusal" ||
     reasonCode === "workflow-engine-defect"
   );
 }
