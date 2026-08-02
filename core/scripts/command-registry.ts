@@ -135,9 +135,10 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
-  // Human-gated merge-queue (#676): sequential R2D merges + optional prepare-only
-  // release-when-complete. Allowlist keeps merge/release flags explicit; never
-  // auto_merge. mutatesGitHub true when --apply (merges) or release prepare runs.
+  // Human-gated merge-queue (#676/#675): sequential R2D merges + optional
+  // prepare-only release-when-complete + optional surgical repair holds.
+  // Allowlist keeps merge/release/repair flags explicit; never auto_merge.
+  // mutatesGitHub true when --apply (merges/repair) or release prepare runs.
   "merge-queue": {
     needsIssueNumber: false,
     allowedFlags: new Set([
@@ -147,6 +148,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
       "milestone",
       "apply",
       "dryRun",
+      "repair",
       "releaseWhenComplete",
       "releaseVersion",
     ]),

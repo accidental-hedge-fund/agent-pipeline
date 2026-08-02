@@ -588,11 +588,13 @@ test("merge-queue: no required checks + all green → candidate", async () => {
 test("merge-queue: loop-isolation — no advance stage handler imports merge_queue", () => {
   const stageFiles = fs.readdirSync(STAGES_DIR).filter((f) => f.endsWith(".ts"));
   // Human-only modules: merge_queue dry-run (#673), merge-queue drive (#676),
-  // release-when-complete helper (#676), and merge (per-PR primitive). None are advance.
+  // release-when-complete helper (#676), repair-hold pure helpers (#675),
+  // and merge (per-PR primitive). None are advance.
   const exempt = new Set([
     "merge_queue.ts",
     "merge-queue.ts",
     "merge-queue-release-when-complete.ts",
+    "merge_queue_hold.ts",
     "merge.ts",
   ]);
   const checkFiles = stageFiles.filter((f) => !exempt.has(f));

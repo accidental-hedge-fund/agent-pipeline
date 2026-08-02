@@ -367,6 +367,12 @@ export interface CliOpts {
    * Required when release-when-complete is enabled.
    */
   releaseVersion?: string;
+  /**
+   * merge-queue (#675): opt-in surgical/mechanical repair of conflict/CI holds
+   * during --apply. Default off; dry-run never repairs. CLI ORs with
+   * config merge_queue.repair. Does not grant auto_merge.
+   */
+  repair?: boolean;
   /** backfill: scope the apply slice to a named capability. */
   capability?: string;
   /** config repo-map add/remove: target relationship list (default: depends_on). */
@@ -573,6 +579,10 @@ export function buildCmd(): Command {
     .option(
       "--release-version <version>",
       "merge-queue: version for --release-when-complete (major|minor|patch|X.Y.Z); required when release-when-complete is enabled",
+    )
+    .option(
+      "--repair",
+      "merge-queue: during --apply, attempt deterministic-first then surgical repair of conflict/CI holds (opt-in; default off; dry-run never repairs; does not grant auto_merge)",
     )
     // backfill options (#327)
     .option("--capability <name>", "backfill: scope the apply slice to a named capability")
@@ -2362,7 +2372,8 @@ async function main(): Promise<void> {
       } else if (isMergeQueueCommand) {
         console.error(
           `pipeline: 'pipeline merge-queue' does not support ${flags}. ` +
-            `Allowed: --milestone, --dry-run, --repo-path, --base, --profile. Drive/apply is not implemented (#674).`,
+            `Allowed: --milestone, --apply, --dry-run, --repair, --release-when-complete, ` +
+            `--release-version, --repo-path, --base, --profile.`,
         );
       } else if (opts.removeWorktree && isNumericOrAbsent) {
         console.error(`pipeline: '--remove-worktree' mode does not support ${flags}. These are separate modes.`);
@@ -3407,11 +3418,12 @@ async function main(): Promise<void> {
     if (!opts.milestone || String(opts.milestone).trim() === "") {
       console.error(
         "pipeline merge-queue: --milestone <title> is required.\n" +
-          "  Usage: pipeline merge-queue --milestone <title> [--apply] [--dry-run]\n" +
+          "  Usage: pipeline merge-queue --milestone <title> [--apply] [--dry-run] [--repair]\n" +
           "         [--release-when-complete --release-version <major|minor|patch|X.Y.Z>]\n" +
           "  Default is dry-run (no merges). --apply performs sequential merges via the\n" +
-          "  existing merge surface. --release-when-complete is opt-in prepare-only:\n" +
-          "  never tags, publishes to npm, or merges the release PR.",
+          "  existing merge surface. --repair (opt-in) may surgically remediate conflict/CI\n" +
+          "  holds then re-gate before merge; dry-run never repairs. --release-when-complete\n" +
+          "  is opt-in prepare-only: never tags, publishes to npm, or merges the release PR.",
       );
       process.exit(2);
     }
@@ -3429,6 +3441,9 @@ async function main(): Promise<void> {
           apply: !!opts.apply,
           // Explicit --dry-run forces plan-only even when combined with --apply.
           dryRun: !!opts.dryRun,
+          repair: !!opts.repair,
+          repairConfig: mqCfg.merge_queue?.repair ?? false,
+          repairMaxAttempts: mqCfg.merge_queue?.repair_max_attempts,
           releaseWhenComplete: !!opts.releaseWhenComplete,
           releaseVersion: opts.releaseVersion,
           releaseWhenCompleteConfig: mqCfg.merge_queue?.release_when_complete ?? false,
@@ -3437,7 +3452,7 @@ async function main(): Promise<void> {
           baseBranch: mqCfg.base_branch,
           releaseModel: mqCfg.roadmap?.release_model,
         },
-        realMergeQueueDeps(mqCfg.repo_dir, mqCfg.repo),
+        realMergeQueueDeps(mqCfg.repo_dir, mqCfg.repo, undefined, mqCfg),
       );
       if (result.exitCode !== 0) process.exit(result.exitCode);
     } catch (err) {

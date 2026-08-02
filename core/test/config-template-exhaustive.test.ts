@@ -166,6 +166,11 @@ test("defaults-parity: merge_queue commented defaults match DEFAULT_CONFIG.merge
     template,
     new RegExp(`#\\s*release_when_complete: ${d.release_when_complete} #`),
   );
+  assert.match(template, new RegExp(`#\\s*repair: ${d.repair} #`));
+  assert.match(
+    template,
+    new RegExp(`#\\s*repair_max_attempts: ${d.repair_max_attempts} #`),
+  );
 });
 
 test("defaults-parity: context_snapshot documented absence-default matches the real runtime constant", () => {

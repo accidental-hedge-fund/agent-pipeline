@@ -932,12 +932,17 @@ export interface PipelineConfig {
     min_confidence: number;
   };
   /**
-   * Human-gated merge-queue defaults (#676). Opt-in release-when-complete only
-   * — prepare a release PR after a complete drive; never tags/publishes/merges.
-   * Default: release_when_complete false. No `auto_merge` key.
+   * Human-gated merge-queue defaults (#676/#675). Opt-in release-when-complete
+   * (prepare a release PR after a complete drive; never tags/publishes/merges)
+   * and opt-in surgical repair of conflict/CI holds. Defaults false.
+   * No `auto_merge` key.
    */
   merge_queue: {
     release_when_complete: boolean;
+    /** When true, merge-queue --apply may attempt surgical repair of holds. Default false. */
+    repair: boolean;
+    /** Max charged implementer repair attempts per item per drive (default 1). */
+    repair_max_attempts: number;
   };
   // Stage-aware issue context snapshots (#318). When set, `max_chars` caps the
   // total character count of human comments included in the context snapshot
@@ -1092,6 +1097,8 @@ export const DEFAULT_CONFIG: Omit<
   },
   merge_queue: {
     release_when_complete: false,
+    repair: false,
+    repair_max_attempts: 1,
   },
   repo_map: { depends_on: [] as string[], depended_on_by: [] as string[] },
   executors: {} as Record<string, ExecutorDefinition>,
