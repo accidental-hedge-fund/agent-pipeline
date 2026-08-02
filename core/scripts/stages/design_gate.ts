@@ -36,7 +36,10 @@ import {
   validateDesignDecisionRecord,
 } from "../design-gate.ts";
 import {
+  ensureManagedWorktree,
   getForIssue as defaultGetForIssue,
+  type EnsureManagedWorktreeDeps,
+  type EnsureManagedWorktreeResult,
 } from "../worktree.ts";
 import {
   getGhActor as defaultGetGhActor,
@@ -94,6 +97,12 @@ export interface DesignGateDeps {
   setBlocked?: (cfg: PipelineConfig, issueNumber: number, reason: string, stage: Stage | null, kind?: BlockerKind) => Promise<void>;
   postComment?: (cfg: PipelineConfig, issueNumber: number, body: string) => Promise<void>;
   invoke?: InvokeFn;
+  /** #760: rematerialize before worktree-missing park (transient-retryable). */
+  ensureManagedWorktree?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    ensureDeps?: EnsureManagedWorktreeDeps,
+  ) => Promise<EnsureManagedWorktreeResult>;
 }
 
 export interface AdvanceDesignGateOpts {
@@ -249,16 +258,28 @@ export async function advanceDesignGate(
     return { advanced: true, from: "design-gate", to: NEXT_STAGE, summary: `design-gate not triggered (${trigger.reason})` };
   }
 
-  const wt = await getForIssueFn(cfg, issueNumber);
+  let wt = await getForIssueFn(cfg, issueNumber);
   if (!wt) {
-    await setBlockedFn(
-      cfg,
-      issueNumber,
-      "design-gate: no worktree found for this issue. The worktree may have been removed prematurely.",
-      "design-gate",
-      "worktree-missing",
-    );
-    return { advanced: false, status: "blocked", reason: "no worktree", blockerKind: "worktree-missing" };
+    // #760: transient-retryable worktree-missing — rematerialize before park.
+    const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+    const remat = await ensureFn(cfg, issueNumber, { getOnDiskForIssue: getForIssueFn });
+    if (remat.result === "ok") {
+      wt = { path: remat.worktree.path, slug: remat.worktree.slug };
+    } else {
+      const reason =
+        `design-gate: no worktree found and rematerialize failed (${remat.blockerKind}): ${remat.reason}`;
+      // Explicit kind literals keep the blocked-recipes / disposition scanners honest.
+      if (remat.blockerKind === "worktree-capacity") {
+        await setBlockedFn(cfg, issueNumber, reason, "design-gate", "worktree-capacity");
+        return { advanced: false, status: "blocked", reason, blockerKind: "worktree-capacity" };
+      }
+      if (remat.blockerKind === "worktree-creation-failed") {
+        await setBlockedFn(cfg, issueNumber, reason, "design-gate", "worktree-creation-failed");
+        return { advanced: false, status: "blocked", reason, blockerKind: "worktree-creation-failed" };
+      }
+      await setBlockedFn(cfg, issueNumber, reason, "design-gate", "worktree-missing");
+      return { advanced: false, status: "blocked", reason, blockerKind: "worktree-missing" };
+    }
   }
 
   // Reconstruct prior state from this issue's own design-gate comments (#436 D8).

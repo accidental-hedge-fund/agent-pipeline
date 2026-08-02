@@ -20,8 +20,11 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import {
   branchName,
+  ensureManagedWorktree,
   getOnDiskForIssue as defaultGetForIssue,
   gitInWorktree,
+  type EnsureManagedWorktreeDeps,
+  type EnsureManagedWorktreeResult,
 } from "../worktree.ts";
 import {
   getGhActor as defaultGetGhActor,
@@ -160,6 +163,12 @@ export interface VisualGateDeps {
     cfg: PipelineConfig,
     issueNumber: number,
   ) => Promise<{ path: string; slug: string } | null>;
+  /** #760: rematerialize before worktree-missing park (transient-retryable). */
+  ensureManagedWorktree?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    ensureDeps?: EnsureManagedWorktreeDeps,
+  ) => Promise<EnsureManagedWorktreeResult>;
   transition?: (
     cfg: PipelineConfig,
     issueNumber: number,
@@ -967,16 +976,27 @@ export async function advanceVisual(
     return { advanced: false, status: "blocked", reason: "visual_gate.command not set", blockerKind: "visual-gate-misconfigured" };
   }
 
-  const wt = await getForIssueFn(cfg, issueNumber);
+  // #760: rematerialize before parking worktree-missing (transient-retryable).
+  let wt = await getForIssueFn(cfg, issueNumber);
   if (!wt) {
-    await setBlockedFn(
-      cfg,
-      issueNumber,
-      "visual-gate: no worktree found for this issue. The worktree may have been removed prematurely.",
-      "visual-gate",
-      "worktree-missing",
-    );
-    return { advanced: false, status: "blocked", reason: "no worktree", blockerKind: "worktree-missing" };
+    const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+    const remat = await ensureFn(cfg, issueNumber, { getOnDiskForIssue: getForIssueFn });
+    if (remat.result === "ok") {
+      wt = { path: remat.worktree.path, slug: remat.worktree.slug };
+    } else {
+      const reason =
+        `visual-gate: no worktree found and rematerialize failed (${remat.blockerKind}): ${remat.reason}`;
+      if (remat.blockerKind === "worktree-capacity") {
+        await setBlockedFn(cfg, issueNumber, reason, "visual-gate", "worktree-capacity");
+        return { advanced: false, status: "blocked", reason, blockerKind: "worktree-capacity" };
+      }
+      if (remat.blockerKind === "worktree-creation-failed") {
+        await setBlockedFn(cfg, issueNumber, reason, "visual-gate", "worktree-creation-failed");
+        return { advanced: false, status: "blocked", reason, blockerKind: "worktree-creation-failed" };
+      }
+      await setBlockedFn(cfg, issueNumber, reason, "visual-gate", "worktree-missing");
+      return { advanced: false, status: "blocked", reason, blockerKind: "worktree-missing" };
+    }
   }
 
   const maxAttempts = cfg.visual_gate.max_attempts;

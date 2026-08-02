@@ -696,12 +696,19 @@ test("eval-gate: no worktree → blocked", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, command: "pnpm evals" });
   const deps = makeDeps(log, [passResult()], null);
+  // #760: rematerialize is attempted before park; inject fail so no real gh.
+  deps.ensureManagedWorktree = async () => ({
+    result: "fail" as const,
+    blockerKind: "worktree-missing" as const,
+    reason: "no recoverable remote branch",
+  });
 
   const out = await advanceEval(cfg, 50, {}, deps);
 
   assert.equal(out.advanced, false);
-  assert.equal((out as { reason: string }).reason, "no worktree");
+  assert.match((out as { reason: string }).reason, /no worktree found and rematerialize failed/);
   assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0].kind, "worktree-missing");
 });
 
 // Regression tests for Finding 2: dry-run must not mutate GitHub state even

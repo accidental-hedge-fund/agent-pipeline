@@ -76,6 +76,13 @@ import {
   type SpecConsistencyDeps,
   type ValidateFn,
 } from "../openspec-consistency.ts";
+import {
+  prescribedFixCommitSubject,
+  pushWithCurrencyCheck,
+  selfFixPipelineFormat,
+  validateFixCommitSubject,
+  type PushWithCurrencyDeps,
+} from "../transient-wrappers.ts";
 
 export interface AdvanceFixOpts {
   dryRun?: boolean;
@@ -170,6 +177,24 @@ export interface AdvanceFixDeps {
     issueNumber: number,
     ensureDeps?: EnsureManagedWorktreeDeps,
   ) => Promise<EnsureManagedWorktreeResult>;
+  /**
+   * #760: bounded push-with-currency wrapper (transient-retryable site
+   * `stages.fix:push-failed#0`). Injectable for unit tests; defaults to
+   * {@link pushWithCurrencyCheck}.
+   */
+  pushWithCurrency?: typeof pushWithCurrencyCheck;
+  /** Injectable sleep for push/backoff wrappers (#760). */
+  sleep?: (ms: number) => Promise<void>;
+  /**
+   * #760: rewrite HEAD commit subject to the pipeline-owned fix format when
+   * the post-harness subject check fails. Defaults to a single `git commit
+   * --amend` of the prescribed subject (never rewrites human prose bodies
+   * beyond the owned subject line).
+   */
+  amendFixCommitSubject?: (
+    wtPath: string,
+    subject: string,
+  ) => Promise<{ ok: boolean; reason?: string }>;
   /** On-disk worktree lookup (defaults to getOnDiskForIssue). */
   getOnDiskForIssue?: typeof getOnDiskForIssue;
 }
@@ -1035,12 +1060,66 @@ export async function advanceFix(
   // OpenSpec, lockfile, format/test, and consistency gates below still apply
   // unchanged.
   if (headBefore) {
-    const commitCheck = externalAdvance && commitGateMode === "external"
+    let commitCheck = externalAdvance && commitGateMode === "external"
       ? await enforceExternalCommitGate(wt.path, headBefore)
       : await enforceFixCommitGate(round, issueNumber, wt.path, headBefore);
+    // #760: pipeline-owned fix subject self-fix (one rewrite) before parking.
+    // External commits keep the exemption path above and are never rewritten.
+    if (
+      !commitCheck.ok &&
+      !(externalAdvance && commitGateMode === "external")
+    ) {
+      const prescribed = prescribedFixCommitSubject(round, issueNumber);
+      const plan = selfFixPipelineFormat({
+        kind: "fix-commit-subject",
+        current: commitCheck.reason,
+        prescribed,
+        validate: (t) => validateFixCommitSubject(t, round, issueNumber),
+        humanProse: false,
+      });
+      if (plan.ok && plan.rewrote) {
+        const amend =
+          deps.amendFixCommitSubject ??
+          (async (wtPath: string, subject: string) => {
+            const r = await gitInWorktree(
+              wtPath,
+              ["commit", "--amend", "-m", subject],
+              { ignoreFailure: true },
+            );
+            if (r.code !== 0) {
+              return {
+                ok: false as const,
+                reason: r.stderr.trim() || r.stdout.trim() || "amend failed",
+              };
+            }
+            return { ok: true as const };
+          });
+        const amended = await amend(wt.path, prescribed);
+        if (amended.ok) {
+          commitCheck = await enforceFixCommitGate(round, issueNumber, wt.path, headBefore);
+        } else {
+          commitCheck = {
+            ok: false,
+            reason:
+              `${commitCheck.reason}; format self-fix amend failed: ${amended.reason ?? "unknown"}`,
+          };
+        }
+      }
+    }
     if (!commitCheck.ok) {
       await setBlocked(cfg, issueNumber, commitCheck.reason, stage, "needs-human");
-      return { advanced: false, status: "blocked", reason: commitCheck.reason };
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: commitCheck.reason,
+        blockerKind: "needs-human",
+        diagnostic: buildStageDiagnostic({
+          reasonCode: "workflow-engine-defect",
+          blockerKind: "needs-human",
+          reason: commitCheck.reason,
+          stage,
+        }),
+      };
     }
   }
 
@@ -1228,11 +1307,38 @@ export async function advanceFix(
   }
 
   const branch = branchName(issueNumber, wt.slug);
-  const push = await gitInWorktree(wt.path, ["push", "origin", branch], { ignoreFailure: true });
-  if (push.code !== 0) {
-    const pushFailedMsg = `Git push failed after fix: ${push.stderr.trim()}`;
+  // #760: transient-retryable push with currency re-sync (no force-push).
+  const localHead = (
+    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+  ).stdout.trim();
+  const pushFn = deps.pushWithCurrency ?? pushWithCurrencyCheck;
+  const pushResult = await pushFn(branch, {
+    siteId: "stages.fix:push-failed#0",
+    expectedLocalSha: localHead || null,
+    sleep: deps.sleep,
+    git: async (args) => {
+      // Currency-check uses fetch/rev-parse; push uses origin + branch.
+      if (args[0] === "push") {
+        return gitInWorktree(wt.path, ["push", "origin", branch], { ignoreFailure: true });
+      }
+      return gitInWorktree(wt.path, args, { ignoreFailure: true });
+    },
+  } satisfies PushWithCurrencyDeps);
+  if (!pushResult.ok) {
+    const pushFailedMsg = `Git push failed after fix: ${pushResult.reason}`;
     await setBlocked(cfg, issueNumber, pushFailedMsg, stage, "push-failed");
-    return { advanced: false, status: "blocked", reason: pushFailedMsg, blockerKind: "push-failed" };
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: pushFailedMsg,
+      blockerKind: "push-failed",
+      diagnostic: buildStageDiagnostic({
+        reasonCode: pushResult.head_drift ? "workflow-state" : "transient-infra",
+        blockerKind: "push-failed",
+        reason: pushFailedMsg,
+        stage,
+      }),
+    };
   }
 
   if (externalAdvance) {

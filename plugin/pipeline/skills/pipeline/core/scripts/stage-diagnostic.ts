@@ -28,6 +28,13 @@ export const STAGE_DIAGNOSTIC_REASON_CODES = [
   // loop-execution producers (LoopExecutionResponse.diagnostic) through the
   // exact-acceptance branch in projectStageDiagnostic below.
   "openspec-generated-delta-invalid",
+  // #760 — mechanical harness / forge / budget classes (additive; no competing enum).
+  "transient-infra",
+  "harness-timeout",
+  "harness-contract",
+  "repair-budget-exhausted",
+  "external-wait",
+  "human-context-required",
 ] as const;
 
 export type StageDiagnosticReasonCode = (typeof STAGE_DIAGNOSTIC_REASON_CODES)[number];
@@ -185,6 +192,21 @@ export function projectPipelineReasonCode(reasonCode: unknown): StageDiagnosticP
     case "openspec-archive-apply-conflict":
     case "openspec-generated-delta-invalid":
       return { blockerClass: "implementation-ci", disposition: "recover" };
+    // #760 additive mechanical classes — never project to human_authority alone.
+    case "transient-infra":
+      return { blockerClass: "transient-rate-limit", disposition: "recover" };
+    case "harness-timeout":
+    case "harness-contract":
+      return { blockerClass: "workflow-engine-defect", disposition: "recover" };
+    case "repair-budget-exhausted":
+      // Engine-owned terminal/exhaustion path — not a human hold.
+      return { blockerClass: "workflow-engine-defect", disposition: "recover" };
+    case "external-wait":
+      return { blockerClass: "upstream-dependency", disposition: "recover" };
+    case "human-context-required":
+      // Underspec / missing operator context is not product authority by itself;
+      // waiting/human-input protocol is a separate durable hold path.
+      return { blockerClass: "specification-decision", disposition: "recover" };
     default:
       return {
         blockerClass: "workflow-engine-defect",
@@ -267,7 +289,34 @@ export function projectStageDiagnostic(value: unknown): StageDiagnosticProjectio
     candidate.reason_code === "environment-auth" &&
     detail.blocker_kind === "harness-failure" &&
     detail.offramp_class === undefined;
-  if (candidate.reason_code !== expectedReasonCode && !exactOpenSpecReason && !exactEnvironmentAuthReason) {
+  // #760: producers may attach additive mechanical reason codes on top of a
+  // coarse BlockerKind when the kind alone would lossily collapse the class.
+  const exactAdditiveMechanicalReason =
+    (
+      candidate.reason_code === "transient-infra" ||
+      candidate.reason_code === "harness-timeout" ||
+      candidate.reason_code === "harness-contract" ||
+      candidate.reason_code === "repair-budget-exhausted" ||
+      candidate.reason_code === "external-wait" ||
+      candidate.reason_code === "human-context-required"
+    ) &&
+    detail.offramp_class === undefined &&
+    (
+      detail.blocker_kind === "harness-failure" ||
+      detail.blocker_kind === "push-failed" ||
+      detail.blocker_kind === "needs-human" ||
+      detail.blocker_kind === "worktree-missing" ||
+      detail.blocker_kind === "worktree-creation-failed" ||
+      detail.blocker_kind === "worktree-setup-failed" ||
+      detail.blocker_kind === "no-pull-request" ||
+      detail.blocker_kind === "pr-creation-failed"
+    );
+  if (
+    candidate.reason_code !== expectedReasonCode &&
+    !exactOpenSpecReason &&
+    !exactEnvironmentAuthReason &&
+    !exactAdditiveMechanicalReason
+  ) {
     return {
       blockerClass: "workflow-engine-defect",
       disposition: "protocol_failure",

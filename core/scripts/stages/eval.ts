@@ -20,8 +20,11 @@
 import * as path from "node:path";
 import {
   branchName,
+  ensureManagedWorktree,
   getOnDiskForIssue as defaultGetForIssue,
   gitInWorktree,
+  type EnsureManagedWorktreeDeps,
+  type EnsureManagedWorktreeResult,
 } from "../worktree.ts";
 import {
   getGhActor as defaultGetGhActor,
@@ -101,6 +104,12 @@ export interface EvalDeps {
     cfg: PipelineConfig,
     issueNumber: number,
   ) => Promise<{ path: string; slug: string } | null>;
+  /** #760: rematerialize before worktree-missing park (transient-retryable). */
+  ensureManagedWorktree?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    ensureDeps?: EnsureManagedWorktreeDeps,
+  ) => Promise<EnsureManagedWorktreeResult>;
   transition?: (
     cfg: PipelineConfig,
     issueNumber: number,
@@ -521,17 +530,28 @@ export async function advanceEval(
     return { advanced: false, status: "blocked", reason: "eval_gate.command not set", blockerKind: "eval-gate-misconfigured" };
   }
 
-  // Resolve worktree (evals run inside the issue's code).
-  const wt = await getForIssueFn(cfg, issueNumber);
+  // Resolve worktree (evals run inside the issue's code). #760: rematerialize
+  // before parking worktree-missing (transient-retryable disposition).
+  let wt = await getForIssueFn(cfg, issueNumber);
   if (!wt) {
-    await setBlockedFn(
-      cfg,
-      issueNumber,
-      "eval-gate: no worktree found for this issue. The worktree may have been removed prematurely.",
-      "eval-gate",
-      "worktree-missing",
-    );
-    return { advanced: false, status: "blocked", reason: "no worktree", blockerKind: "worktree-missing" };
+    const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+    const remat = await ensureFn(cfg, issueNumber, { getOnDiskForIssue: getForIssueFn });
+    if (remat.result === "ok") {
+      wt = { path: remat.worktree.path, slug: remat.worktree.slug };
+    } else {
+      const reason =
+        `eval-gate: no worktree found and rematerialize failed (${remat.blockerKind}): ${remat.reason}`;
+      if (remat.blockerKind === "worktree-capacity") {
+        await setBlockedFn(cfg, issueNumber, reason, "eval-gate", "worktree-capacity");
+        return { advanced: false, status: "blocked", reason, blockerKind: "worktree-capacity" };
+      }
+      if (remat.blockerKind === "worktree-creation-failed") {
+        await setBlockedFn(cfg, issueNumber, reason, "eval-gate", "worktree-creation-failed");
+        return { advanced: false, status: "blocked", reason, blockerKind: "worktree-creation-failed" };
+      }
+      await setBlockedFn(cfg, issueNumber, reason, "eval-gate", "worktree-missing");
+      return { advanced: false, status: "blocked", reason, blockerKind: "worktree-missing" };
+    }
   }
 
   const maxAttempts = cfg.eval_gate.max_attempts;

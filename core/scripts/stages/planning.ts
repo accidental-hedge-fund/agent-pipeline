@@ -48,6 +48,7 @@ import {
   removeWorktree,
   slugify,
 } from "../worktree.ts";
+import { pushWithCurrencyCheck } from "../transient-wrappers.ts";
 import { detectAndInstall, type SetupResult } from "../worktree-setup.ts";
 import {
   buildImplementingPrompt,
@@ -1586,11 +1587,29 @@ export async function resumeFromImplementing(
     }
   }
 
-  // ---- Push ----
-  const push = await gitOp(wt.path, ["push", "-u", "origin", branch], { ignoreFailure: true });
-  if (push.code !== 0) {
-    await blocker(cfg, issueNumber, `Git push failed: ${push.stderr.trim()}`, "implementing", "push-failed");
-    return blockedOutcome("push failed", "push-failed");
+  // ---- Push (#760: transient-retryable with currency re-sync; no force-push) ----
+  const localHead = (await gitOp(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
+  const pushResult = await pushWithCurrencyCheck(branch, {
+    // Planning push shares the transient-retryable push class. Site id gates
+    // retry eligibility via the disposition inventory.
+    siteId: "stages.fix:push-failed#0",
+    expectedLocalSha: localHead || null,
+    git: async (args) => {
+      if (args[0] === "push") {
+        return gitOp(wt.path, ["push", "-u", "origin", branch], { ignoreFailure: true });
+      }
+      return gitOp(wt.path, args, { ignoreFailure: true });
+    },
+  });
+  if (!pushResult.ok) {
+    await blocker(
+      cfg,
+      issueNumber,
+      `Git push failed: ${pushResult.reason}`,
+      "implementing",
+      "push-failed",
+    );
+    return blockedOutcome(`push failed: ${pushResult.reason}`, "push-failed");
   }
 
   // ---- Create or find PR (exact-branch check first to avoid duplicates on resume) ----
