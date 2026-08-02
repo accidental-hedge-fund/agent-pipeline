@@ -1746,10 +1746,17 @@ test("validateReleaseEligibleFrgEvidence rejects hand-authored self-consistent e
     ...honest,
     integrity: signFrgIntegrity({
       integrity: buildFrgIntegrity(honest.scoreboard, honest.composition),
+      schema_version: honest.schema_version,
       version: honest.version,
       run_id: honest.run_id,
       loop_run_id: honest.loop_run_id!,
       pack_id: honest.pack_id!,
+      pass: honest.pass,
+      thresholds: honest.thresholds,
+      scenarios: honest.scenarios,
+      scoreboard: honest.scoreboard,
+      composition: honest.composition,
+      recovery_aggregates: honest.recovery_aggregates ?? null,
       attestationKey: otherKey,
     }),
   };
@@ -1762,6 +1769,58 @@ test("validateReleaseEligibleFrgEvidence rejects hand-authored self-consistent e
       }),
     /attestation MAC|forged|does not match/i,
   );
+});
+
+test("HMAC binds pass/scenarios/thresholds — eligibility-field replay rejected (e951091b)", () => {
+  // Signed failed attempt: composition/scoreboard OK, scenarios not observed → pass false.
+  // Old bug: MAC covered only ids+fingerprints, so attacker could flip scenarios/pass.
+  const signedFail = computeFrgEvidence({
+    version: "1.30.0",
+    run_id: "frg-eligibility-replay",
+    loop_run_id: "loop-replay",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(signedFail.pass, false);
+  assert.ok(
+    signedFail.integrity.attestation?.mac,
+    "failed attempts with a producer key still mint a MAC over the failure payload",
+  );
+
+  const honest = computeFrgEvidence(
+    fullPackPassInput({ version: "1.30.0", run_id: "frg-eligibility-honest" }),
+  );
+  assert.equal(honest.pass, true);
+
+  // Replay: keep the failed MAC, graft passing scenarios + pass:true + thresholds.
+  const replay = JSON.parse(JSON.stringify(signedFail)) as FrgEvidence;
+  replay.pass = true;
+  replay.scenarios = JSON.parse(JSON.stringify(honest.scenarios));
+  replay.thresholds = { ...honest.thresholds };
+  // Fingerprints still match scoreboard/composition (unchanged) — without field binding
+  // the old MAC would still verify.
+  assert.equal(
+    verifyFrgAttestation(replay, FRG_UNIT_TEST_ATTESTATION_KEY),
+    false,
+    "MAC must fail when pass/scenarios/thresholds are mutated after signing",
+  );
+  assert.throws(
+    () =>
+      validateReleaseEligibleFrgEvidence(replay, "1.30.0", {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
+    /attestation MAC|forged|does not match/i,
+  );
+
+  // Threshold-only tamper on an otherwise honest document also fails MAC.
+  const thr = JSON.parse(JSON.stringify(honest)) as FrgEvidence;
+  thr.thresholds = { ...thr.thresholds, max_engine_class_rate: 0.99 };
+  assert.equal(verifyFrgAttestation(thr, FRG_UNIT_TEST_ATTESTATION_KEY), false);
 });
 
 test("validateFrgEvidenceFileForTag: missing fails closed; good pass succeeds", async () => {
@@ -1825,4 +1884,115 @@ test("appendFrgTrendLedger standalone + entry fields", async () => {
   assert.equal(r1.appended, true);
   const r2 = await appendFrgTrendLedger("/repo", entry, fs);
   assert.equal(r2.appended, false);
+});
+
+test("appendFrgTrendLedger concurrent writers retain both entries (d178b8e5)", async () => {
+  // In-memory mutex mirrors production withPathLock serialization.
+  let chain: Promise<unknown> = Promise.resolve();
+  const base = memFs();
+  const fs: FrgFsDeps & { files: Map<string, string> } = {
+    ...base,
+    files: base.files,
+    withPathLock: async <T>(_key: string, fn: () => Promise<T>): Promise<T> => {
+      const run = chain.then(() => fn());
+      chain = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
+    },
+  };
+
+  const a = trendLedgerEntryFromEvidence(
+    computeFrgEvidence(fullPackPassInput({ version: "1.40.0", run_id: "frg-conc-a" })),
+  );
+  const b = trendLedgerEntryFromEvidence(
+    computeFrgEvidence(fullPackPassInput({ version: "1.40.1", run_id: "frg-conc-b" })),
+  );
+
+  const [rA, rB] = await Promise.all([
+    appendFrgTrendLedger("/repo", a, fs),
+    appendFrgTrendLedger("/repo", b, fs),
+  ]);
+  assert.equal(rA.appended, true);
+  assert.equal(rB.appended, true);
+
+  const body = await fs.readFile(frgTrendLedgerPath("/repo"));
+  const lines = body
+    .trim()
+    .split("\n")
+    .filter((l) => l.length > 0);
+  assert.equal(lines.length, 2, "both concurrent appends must be retained");
+  assert.ok(lines.some((l) => l.includes("frg-conc-a")));
+  assert.ok(lines.some((l) => l.includes("frg-conc-b")));
+  assert.ok(lines.some((l) => l.includes("1.40.0")));
+  assert.ok(lines.some((l) => l.includes("1.40.1")));
+});
+
+test("appendFrgTrendLedger without lock loses history under concurrent rewrite race", async () => {
+  // Regression guard: the unlocked read–merge–write + shared-style race drops an entry.
+  // Production always supplies withPathLock; this proves why the lock is required.
+  const files = new Map<string, string>();
+  let readGate: Promise<void> = Promise.resolve();
+  let releaseRead: (() => void) | undefined;
+  let readersWaiting = 0;
+
+  const racingFs: FrgFsDeps = {
+    async readFile(p) {
+      const v = files.get(p);
+      if (v === undefined) {
+        const err = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        // Coordinate: both writers observe empty ledger before either renames.
+        readersWaiting += 1;
+        if (readersWaiting === 1) {
+          readGate = new Promise<void>((resolve) => {
+            releaseRead = resolve;
+          });
+        } else if (readersWaiting >= 2 && releaseRead) {
+          releaseRead();
+        }
+        await readGate;
+        throw err;
+      }
+      return v;
+    },
+    async writeFile(p, data) {
+      files.set(p, data);
+    },
+    async mkdir() {},
+    async rename(from, to) {
+      const v = files.get(from);
+      if (v === undefined) throw new Error(`ENOENT rename ${from}`);
+      files.set(to, v);
+      files.delete(from);
+    },
+    // Intentionally no withPathLock — and bypass default by providing the field as undefined
+    // is not enough (append falls back to defaultFrgPathLock). Override with passthrough.
+    withPathLock: async (_key, fn) => fn(),
+  };
+
+  const a = trendLedgerEntryFromEvidence(
+    computeFrgEvidence(fullPackPassInput({ version: "1.41.0", run_id: "frg-race-a" })),
+  );
+  const b = trendLedgerEntryFromEvidence(
+    computeFrgEvidence(fullPackPassInput({ version: "1.41.1", run_id: "frg-race-b" })),
+  );
+
+  await Promise.all([
+    appendFrgTrendLedger("/repo-race", a, racingFs),
+    appendFrgTrendLedger("/repo-race", b, racingFs),
+  ]);
+
+  const body = files.get(frgTrendLedgerPath("/repo-race")) ?? "";
+  const lines = body
+    .trim()
+    .split("\n")
+    .filter((l) => l.length > 0);
+  // Last rename wins → only one complete ledger body (lost concurrent history).
+  assert.equal(
+    lines.length,
+    1,
+    "unlocked concurrent rewrite must drop one entry (proves the race)",
+  );
 });

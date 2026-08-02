@@ -111,7 +111,10 @@ scoreboard for honesty and SHALL NOT serve as the rate denominator.
 Each durable Layer B FRG evidence write SHALL append a machine-readable trend-ledger entry so
 operators can review K, ready-clean counts, engine-class rate, thresholds applied, and recovery
 aggregates across releases without reconstructing history by hand. The ledger SHALL be
-append-only (prior entries retained). The stable path SHALL be documented in the FRG runbook
+append-only (prior entries retained), including under concurrent writers on the same host:
+append serialization SHALL use a path-scoped host-local lock (or equivalent durable append
+primitive) and MUST NOT rely on a single shared temporary filename that concurrent renames can
+clobber. The stable path SHALL be documented in the FRG runbook
 (default: `.agent-pipeline/frg/trend-ledger.jsonl` under the repository root, or an equivalent
 documented path). Each entry SHALL include at least: `version`, `run_id`, `loop_run_id` (when
 present), `pass`, `pack_id` (when present), `created_at`, `item_count`, `ready_clean_count`,
@@ -271,13 +274,16 @@ computable engine-class rate path (via item classification) and to the trend led
 
 A release-eligible FRG evidence artifact with `pass: true` SHALL include
 `integrity.attestation` with algorithm `hmac-sha256-v1` and a MAC over a canonical payload
-binding at least `version`, `run_id`, `loop_run_id`, `pack_id`, scoreboard fingerprint, and
+binding every field that can affect release eligibility, at minimum: `schema_version`,
+`version`, `run_id`, `loop_run_id`, `pack_id`, `pass`, `thresholds`, `scenarios`,
+`scoreboard`, `composition`, recovery aggregates (when present), scoreboard fingerprint, and
 composition fingerprint. The driver SHALL mint the MAC only when the producer key
 `PIPELINE_FRG_ATTESTATION_KEY` is available. Release-eligibility validation used by auto-tag
 (and any shared tag/release validator) SHALL require the same env key and SHALL reject
-evidence when the key is missing, the attestation is absent, or the MAC does not verify.
-Self-consistent scoreboard/composition fingerprints alone SHALL NOT satisfy the tag path:
-hand-authored JSON that recomputes public hashes without the producer secret SHALL fail
+evidence when the key is missing, the attestation is absent, or the MAC does not verify
+(including when eligibility-defining fields were mutated after mint while fingerprints stay
+intact). Self-consistent scoreboard/composition fingerprints alone SHALL NOT satisfy the tag
+path: hand-authored JSON that recomputes public hashes without the producer secret SHALL fail
 validation.
 
 #### Scenario: Mint without producer key is not release-eligible

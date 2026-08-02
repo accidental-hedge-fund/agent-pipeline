@@ -440,24 +440,41 @@ export function resolveFrgAttestationKey(
 }
 
 /**
- * Canonical fields covered by the HMAC. Self-consistent scoreboard/composition
- * fingerprints alone are forgeable; the MAC requires the producer secret.
+ * Canonical fields covered by the HMAC. Must bind every field that can affect
+ * release eligibility so a MAC from a failed attempt cannot be replayed with
+ * mutated `pass` / scenarios / thresholds while fingerprints stay intact.
+ * Self-consistent public fingerprints alone are forgeable; the MAC requires the
+ * producer secret over the full eligibility payload.
  */
 export function buildFrgAttestationPayload(input: {
+  schema_version: number;
   version: string;
   run_id: string;
   loop_run_id: string;
   pack_id: string;
+  pass: boolean;
+  thresholds: FrgThresholds;
+  scenarios: readonly FrgScenarioOutcome[];
+  scoreboard: FrgScoreboard;
+  composition: FrgComposition;
+  recovery_aggregates?: FrgRecoveryAggregates | null;
   scoreboard_fingerprint: string;
   composition_fingerprint: string;
-}): Record<string, string> {
+}): Record<string, unknown> {
   return {
     producer: "pipeline-factory-gate",
     alg: FRG_ATTESTATION_ALG,
+    schema_version: input.schema_version,
     version: input.version,
     run_id: input.run_id,
     loop_run_id: input.loop_run_id,
     pack_id: input.pack_id,
+    pass: input.pass,
+    thresholds: input.thresholds,
+    scenarios: input.scenarios,
+    scoreboard: input.scoreboard,
+    composition: input.composition,
+    recovery_aggregates: input.recovery_aggregates ?? null,
     scoreboard_fingerprint: input.scoreboard_fingerprint,
     composition_fingerprint: input.composition_fingerprint,
   };
@@ -478,7 +495,7 @@ function frgCanonicalJson(value: unknown): string {
 }
 
 export function computeFrgAttestationMac(
-  payload: Record<string, string>,
+  payload: Record<string, unknown>,
   key: string,
 ): string {
   return crypto
@@ -487,19 +504,36 @@ export function computeFrgAttestationMac(
     .digest("hex");
 }
 
-export function signFrgIntegrity(input: {
+/** Fields required to mint or verify the eligibility-binding attestation MAC. */
+export interface FrgAttestationSignInput {
   integrity: FrgIntegrity;
+  schema_version: number;
   version: string;
   run_id: string;
   loop_run_id: string;
   pack_id: string;
+  pass: boolean;
+  thresholds: FrgThresholds;
+  scenarios: readonly FrgScenarioOutcome[];
+  scoreboard: FrgScoreboard;
+  composition: FrgComposition;
+  recovery_aggregates?: FrgRecoveryAggregates | null;
   attestationKey: string;
-}): FrgIntegrity {
+}
+
+export function signFrgIntegrity(input: FrgAttestationSignInput): FrgIntegrity {
   const payload = buildFrgAttestationPayload({
+    schema_version: input.schema_version,
     version: input.version,
     run_id: input.run_id,
     loop_run_id: input.loop_run_id,
     pack_id: input.pack_id,
+    pass: input.pass,
+    thresholds: input.thresholds,
+    scenarios: input.scenarios,
+    scoreboard: input.scoreboard,
+    composition: input.composition,
+    recovery_aggregates: input.recovery_aggregates,
     scoreboard_fingerprint: input.integrity.scoreboard_fingerprint,
     composition_fingerprint: input.integrity.composition_fingerprint,
   });
@@ -524,15 +558,24 @@ function timingSafeEqualHex(a: string, b: string): boolean {
 }
 
 /**
- * Verify integrity.attestation against the attestation key.
+ * Verify integrity.attestation against the attestation key over the full
+ * eligibility-binding payload (pass, scenarios, thresholds, scoreboard,
+ * composition, recovery aggregates — not fingerprints alone).
  * Returns true only when alg/mac are present and the MAC matches.
  */
 export function verifyFrgAttestation(
   evidence: {
+    schema_version: number;
     version: string;
     run_id: string;
+    pass: boolean;
     loop_run_id: string | null;
     pack_id: string | null;
+    thresholds: FrgThresholds;
+    scenarios: readonly FrgScenarioOutcome[];
+    scoreboard: FrgScoreboard;
+    composition: FrgComposition;
+    recovery_aggregates?: FrgRecoveryAggregates | null;
     integrity: FrgIntegrity;
   },
   attestationKey: string,
@@ -550,10 +593,17 @@ export function verifyFrgAttestation(
     return false;
   }
   const payload = buildFrgAttestationPayload({
+    schema_version: evidence.schema_version,
     version: evidence.version,
     run_id: evidence.run_id,
     loop_run_id: evidence.loop_run_id,
     pack_id: evidence.pack_id,
+    pass: evidence.pass,
+    thresholds: evidence.thresholds,
+    scenarios: evidence.scenarios,
+    scoreboard: evidence.scoreboard,
+    composition: evidence.composition,
+    recovery_aggregates: evidence.recovery_aggregates,
     scoreboard_fingerprint: evidence.integrity.scoreboard_fingerprint,
     composition_fingerprint: evidence.integrity.composition_fingerprint,
   });
@@ -667,6 +717,38 @@ export interface FrgFsDeps {
   writeFile(p: string, data: string): Promise<void>;
   mkdir(p: string, opts: { recursive: boolean }): Promise<void>;
   rename(from: string, to: string): Promise<void>;
+  /**
+   * Host-local serialization for a path-scoped critical section (trend ledger).
+   * Production default uses a short-retry PID lock; tests inject an in-memory mutex.
+   */
+  withPathLock?: <T>(lockKey: string, fn: () => Promise<T>) => Promise<T>;
+}
+
+/** Host-local path lock with brief retry (default production seam for ledger append). */
+async function defaultFrgPathLock<T>(
+  lockKey: string,
+  fn: () => Promise<T>,
+  timeoutMs = 5_000,
+): Promise<T> {
+  // Lazy import keeps unit tests that never touch the default dep free of /tmp locks.
+  const { withLock } = await import("./lock.ts");
+  const domain =
+    "frg-tl-" + crypto.createHash("sha256").update(lockKey).digest("hex").slice(0, 16);
+  const deadline = Date.now() + timeoutMs;
+  let lastErr: Error | undefined;
+  while (Date.now() < deadline) {
+    try {
+      return await withLock(domain, fn);
+    } catch (err) {
+      lastErr = err as Error;
+      if (!/Pipeline lock held/i.test(lastErr.message)) throw err;
+      await new Promise((r) => setTimeout(r, 15 + Math.floor(Math.random() * 35)));
+    }
+  }
+  throw new Error(
+    `FRG path lock timeout for ${lockKey}` +
+      (lastErr ? ` (${lastErr.message})` : ""),
+  );
 }
 
 const defaultFsDeps: FrgFsDeps = {
@@ -676,6 +758,7 @@ const defaultFsDeps: FrgFsDeps = {
     await fsp.mkdir(p, opts);
   },
   rename: (from, to) => fsp.rename(from, to),
+  withPathLock: defaultFrgPathLock,
 };
 
 function isFiniteNumber(v: unknown): v is number {
@@ -1069,17 +1152,26 @@ export function frgScenariosPermitPass(scenarios: readonly FrgScenarioOutcome[])
  * for the strengthened gate (except when evaluating intermediate pass flags
  * inside computeFrgEvidence which always supplies them).
  */
-export function isReleaseEligibleFrgPass(evidence: {
-  pass: boolean;
-  scenarios: readonly FrgScenarioOutcome[];
-  loop_run_id: string | null;
-  pack_id: string | null;
-  thresholds: FrgThresholds;
-  scoreboard?: FrgScoreboard;
-  composition?: FrgComposition;
-  integrity?: FrgIntegrity;
-  run_id?: string;
-}): boolean {
+export function isReleaseEligibleFrgPass(
+  evidence: {
+    pass: boolean;
+    scenarios: readonly FrgScenarioOutcome[];
+    loop_run_id: string | null;
+    pack_id: string | null;
+    thresholds: FrgThresholds;
+    scoreboard?: FrgScoreboard;
+    composition?: FrgComposition;
+    integrity?: FrgIntegrity;
+    run_id?: string;
+  },
+  opts?: {
+    /**
+     * When false, skip the attestation-presence check so the mint path can
+     * compute structural eligibility before attaching the HMAC. Default true.
+     */
+    requireAttestation?: boolean;
+  },
+): boolean {
   if (!evidence.pass) return false;
   if (!frgScenariosPermitPass(evidence.scenarios)) return false;
   if (typeof evidence.loop_run_id !== "string" || evidence.loop_run_id.trim() === "") {
@@ -1105,7 +1197,9 @@ export function isReleaseEligibleFrgPass(evidence: {
   if (evidence.integrity.composition_fingerprint !== expectedComp) return false;
   if (typeof evidence.run_id === "string" && evidence.run_id.trim() === "") return false;
   // Attestation must be present for release-eligible pass (MAC verified on tag path).
-  if (!frgAttestationPresent(evidence.integrity)) return false;
+  if (opts?.requireAttestation !== false && !frgAttestationPresent(evidence.integrity)) {
+    return false;
+  }
   return true;
 }
 
@@ -1476,7 +1570,9 @@ export function trendLedgerEntryFromEvidence(evidence: FrgEvidence): FrgTrendLed
 
 /**
  * Append a trend-ledger line with idempotency key (version, run_id).
- * Duplicate keys are no-ops. Uses read-merge-write under host-local scope.
+ * Duplicate keys are no-ops. Read–merge–write is serialized via
+ * {@link FrgFsDeps.withPathLock} (host-local) and uses a unique temp filename
+ * so concurrent writers cannot clobber retained history via a shared `.tmp`.
  */
 export async function appendFrgTrendLedger(
   repoDir: string,
@@ -1485,31 +1581,39 @@ export async function appendFrgTrendLedger(
 ): Promise<{ appended: boolean; path: string }> {
   const ledgerPath = frgTrendLedgerPath(repoDir);
   await deps.mkdir(path.dirname(ledgerPath), { recursive: true });
-  let existing = "";
-  try {
-    existing = await deps.readFile(ledgerPath);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-  }
-  const lines = existing
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
-  for (const line of lines) {
+
+  const critical = async (): Promise<{ appended: boolean; path: string }> => {
+    let existing = "";
     try {
-      const prev = JSON.parse(line) as { version?: unknown; run_id?: unknown };
-      if (prev.version === entry.version && prev.run_id === entry.run_id) {
-        return { appended: false, path: ledgerPath };
-      }
-    } catch {
-      // keep malformed prior lines; do not treat as the same key
+      existing = await deps.readFile(ledgerPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
-  }
-  const nextBody = `${lines.length ? lines.join("\n") + "\n" : ""}${JSON.stringify(entry)}\n`;
-  const tmp = `${ledgerPath}.tmp`;
-  await deps.writeFile(tmp, nextBody);
-  await deps.rename(tmp, ledgerPath);
-  return { appended: true, path: ledgerPath };
+    const lines = existing
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    for (const line of lines) {
+      try {
+        const prev = JSON.parse(line) as { version?: unknown; run_id?: unknown };
+        if (prev.version === entry.version && prev.run_id === entry.run_id) {
+          return { appended: false, path: ledgerPath };
+        }
+      } catch {
+        // keep malformed prior lines; do not treat as the same key
+      }
+    }
+    const nextBody = `${lines.length ? lines.join("\n") + "\n" : ""}${JSON.stringify(entry)}\n`;
+    // Unique temp avoids two writers racing on the same `${ledgerPath}.tmp`.
+    const tmp =
+      `${ledgerPath}.tmp.${process.pid}.${crypto.randomBytes(8).toString("hex")}`;
+    await deps.writeFile(tmp, nextBody);
+    await deps.rename(tmp, ledgerPath);
+    return { appended: true, path: ledgerPath };
+  };
+
+  const lock = deps.withPathLock ?? defaultFrgPathLock;
+  return lock(ledgerPath, critical);
 }
 
 /**
@@ -2280,40 +2384,53 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
 
   // Sign when a producer key is available (env or explicit). Without a key,
   // attestation is omitted and release-eligible pass cannot be true (#757).
+  // MAC binds eligibility-defining fields (pass, scenarios, thresholds, …) so a
+  // failed-attempt MAC cannot be replayed with mutated scenario/threshold values.
   const attestationKey =
     input.attestation_key !== undefined
       ? input.attestation_key && input.attestation_key.trim() !== ""
         ? input.attestation_key.trim()
         : null
       : resolveFrgAttestationKey();
-  if (
-    attestationKey &&
-    loopRunId &&
-    packId &&
-    runId.trim() !== ""
-  ) {
-    integrity = signFrgIntegrity({
-      integrity,
-      version,
-      run_id: runId,
+  const canSign = Boolean(
+    attestationKey && loopRunId && packId && runId.trim() !== "",
+  );
+
+  // Structural eligibility first (no attestation yet); final pass requires MAC.
+  const structuralPass = isReleaseEligibleFrgPass(
+    {
+      pass: true,
+      scenarios,
       loop_run_id: loopRunId,
       pack_id: packId,
-      attestationKey,
+      thresholds,
+      scoreboard,
+      composition,
+      integrity,
+      run_id: runId,
+    },
+    { requireAttestation: false },
+  );
+  // Claim pass:true only when structure is eligible and we will attach attestation.
+  const pass = structuralPass && canSign;
+
+  if (canSign) {
+    integrity = signFrgIntegrity({
+      integrity,
+      schema_version: FRG_SCHEMA_VERSION,
+      version,
+      run_id: runId,
+      loop_run_id: loopRunId!,
+      pack_id: packId!,
+      pass,
+      thresholds,
+      scenarios,
+      scoreboard,
+      composition,
+      recovery_aggregates: input.recovery_aggregates ?? null,
+      attestationKey: attestationKey!,
     });
   }
-
-  // Fail closed: scenarios + live loop + pack + composition + integrity + attestation (#757).
-  const pass = isReleaseEligibleFrgPass({
-    pass: true,
-    scenarios,
-    loop_run_id: loopRunId,
-    pack_id: packId,
-    thresholds,
-    scoreboard,
-    composition,
-    integrity,
-    run_id: runId,
-  });
 
   const evidence: FrgEvidence = {
     schema_version: FRG_SCHEMA_VERSION,
