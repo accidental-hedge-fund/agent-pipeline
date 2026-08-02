@@ -399,7 +399,7 @@ test("runStatus --json: schema_version is \"1\"", async () => {
 test("runStatus --json: all minimum fields are present", async () => {
   const parsed = await captureStatusJson("review-1", 42) as Record<string, unknown>;
   for (const field of ["schema_version", "status", "issue", "stage", "pr", "branch", "worktree",
-    "last_event", "review_summary", "next_action", "config", "possibly_wedged"]) {
+    "last_event", "review_summary", "next_action", "config", "possibly_wedged", "event_stream_write_health"]) {
     assert.ok(field in parsed, `missing field: ${field}`);
   }
 });
@@ -518,6 +518,7 @@ test("runStatus --json: possibly_wedged is populated when the latest run is unfi
     getLatestRunEvents: async () => ({
       finalized: false,
       lastEvent: { type: "harness_timeout", at: staleAt },
+      writeHealth: null,
     }),
   };
   const lines: string[] = [];
@@ -544,6 +545,7 @@ test("runStatus --json: possibly_wedged is null when the latest run is finalized
     getLatestRunEvents: async () => ({
       finalized: true,
       lastEvent: { type: "run_complete", at: staleAt },
+      writeHealth: null,
     }),
   };
   const lines: string[] = [];
@@ -566,6 +568,7 @@ test("runStatus --json: possibly_wedged is null when the latest run's last event
     getLatestRunEvents: async () => ({
       finalized: false,
       lastEvent: { type: "stage_start", at: new Date().toISOString() },
+      writeHealth: null,
     }),
   };
   const lines: string[] = [];
@@ -596,6 +599,104 @@ test("runStatus --json: prose output (State:, Stage:, etc.) is NOT emitted", asy
   }
   assert.equal(lines.length, 1, "only JSON line must be emitted");
   assert.doesNotMatch(lines[0], /^State:|^Stage:|^Blocked:|^Repo:/m);
+});
+
+// ---------------------------------------------------------------------------
+// event_stream_write_health via runStatus (#633)
+// ---------------------------------------------------------------------------
+
+test("runStatus --json: elevated write-health appears as event_stream_write_health (#633)", async () => {
+  const deps: RunStatusDeps = {
+    getIssueDetail: async () => detailAt("review-1", []),
+    getPrForIssue: async () => null,
+    loadLatestPreflightResult: async () => null,
+    getLatestRunEvents: async () => ({
+      finalized: true,
+      lastEvent: { type: "run_complete", at: "2026-08-02T12:00:00Z" },
+      writeHealth: {
+        schema_version: 1,
+        failure_count: 1,
+        last_failure_at: "2026-08-02T12:00:00Z",
+        last_error: "ENOSPC",
+        last_event_type: "blocker_set",
+        worst_criticality: "control-critical",
+        exclusive_fallback_attempted: false,
+        exclusive_fallback_succeeded: false,
+      },
+    }),
+  };
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await runStatus(CFG_WITH_TIMEOUTS, 115, deps, { json: true });
+  } finally {
+    console.log = orig;
+  }
+  const parsed = JSON.parse(lines[0]) as {
+    schema_version: string;
+    event_stream_write_health: { failure_count: number; worst_criticality: string } | null;
+  };
+  assert.equal(parsed.schema_version, "1");
+  assert.ok(parsed.event_stream_write_health !== null);
+  assert.equal(parsed.event_stream_write_health!.failure_count, 1);
+  assert.equal(parsed.event_stream_write_health!.worst_criticality, "control-critical");
+});
+
+test("runStatus prose: warns when write-health is elevated (#633)", async () => {
+  const deps: RunStatusDeps = {
+    getIssueDetail: async () => detailAt("review-1", []),
+    getPrForIssue: async () => null,
+    loadLatestPreflightResult: async () => null,
+    getLatestRunEvents: async () => ({
+      finalized: true,
+      lastEvent: { type: "run_complete", at: "2026-08-02T12:00:00Z" },
+      writeHealth: {
+        schema_version: 1,
+        failure_count: 3,
+        last_failure_at: "2026-08-02T12:00:00Z",
+        last_error: "ENOSPC",
+        last_event_type: "blocker_set",
+        worst_criticality: "control-critical",
+        exclusive_fallback_attempted: true,
+        exclusive_fallback_succeeded: false,
+      },
+    }),
+  };
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await runStatus(CFG, 115, deps);
+  } finally {
+    console.log = orig;
+  }
+  const joined = lines.join("\n");
+  assert.match(joined, /event stream write failure/i);
+  assert.match(joined, /control-critical/);
+});
+
+test("runStatus prose: no write-health warning when healthy (#633)", async () => {
+  const deps: RunStatusDeps = {
+    getIssueDetail: async () => detailAt("review-1", []),
+    getPrForIssue: async () => null,
+    loadLatestPreflightResult: async () => null,
+    getLatestRunEvents: async () => ({
+      finalized: true,
+      lastEvent: { type: "run_complete", at: "2026-08-02T12:00:00Z" },
+      writeHealth: null,
+    }),
+  };
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    await runStatus(CFG, 115, deps);
+  } finally {
+    console.log = orig;
+  }
+  const joined = lines.join("\n");
+  assert.doesNotMatch(joined, /event stream write failure/i);
 });
 
 // ---------------------------------------------------------------------------

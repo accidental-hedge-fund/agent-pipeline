@@ -74,15 +74,18 @@ import {
   emitGhMetrics,
   finalizeRun,
   initRunDir,
+  isElevatedWriteHealth,
   isValidSummaryBundle,
   latestRunDirForIssue,
   latestRunEventsSummaryForIssue,
   latestSummaryForIssue,
   listRunIds,
+  parseWriteHealthText,
   runDirPath,
   runIdFor,
   runsDir,
   startTerminalLogTee,
+  writeHealthTextForReadFailure,
   type RunEventsSummary,
   type RunStoreDeps,
   type TerminalLogTee,
@@ -192,7 +195,11 @@ import {
   projectStageDiagnostic,
   type StageDiagnostic,
 } from "./stage-diagnostic.ts";
-import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
+import {
+  buildStatusPayload,
+  formatWriteHealthStatusWarning,
+  type StatusPayload,
+} from "./status-json.ts";
 import {
   BLOCKED_LABEL,
   BLOCKER_KINDS,
@@ -973,6 +980,18 @@ export interface RealDispatchItemDeps {
    * Defaults to fs.readFileSync when the path exists.
    */
   readEventsText?: (eventsPath: string) => string | null;
+  /**
+   * Read write-health.json beside the advance events path (#633). Defaults to
+   * reading `<runDir>/write-health.json` when present. Used so missing
+   * control-critical evidence after a recorded stream failure stays fail-safe.
+   *
+   * Contract: return `null` only when the file is missing (ENOENT / legacy).
+   * Present-but-unreadable (EACCES, I/O) MUST NOT collapse to null — return
+   * non-empty text that fails parse so recovery elevates to
+   * UNREADABLE_WRITE_HEALTH. Collapsing unreadable → null would follow the
+   * ordinary missing-evidence path instead of the persistence-failure path.
+   */
+  readWriteHealthText?: (eventsPath: string) => string | null;
   /** Poll interval (ms) while waiting for store init during the child wait. */
   storeReadyPollMs?: number;
 }
@@ -1000,6 +1019,17 @@ export function realDispatchItem(
         return readFileSync(p, "utf8");
       } catch {
         return null;
+      }
+    });
+  const readWriteHealthTextFn =
+    deps.readWriteHealthText ??
+    ((eventsPath: string): string | null => {
+      const healthPath = path.join(path.dirname(eventsPath), "write-health.json");
+      try {
+        return readFileSync(healthPath, "utf8");
+      } catch (err) {
+        // Missing → null; present-but-unreadable → elevated sentinel text.
+        return writeHealthTextForReadFailure(err);
       }
     });
   const storeReadyPollMs = deps.storeReadyPollMs ?? 50;
@@ -1111,10 +1141,28 @@ export function realDispatchItem(
       // classified by its true blocker class instead of cascading into a
       // protocol failure the supervisor treats as an engine defect.
       let eventsTextForClassify: string | null = null;
+      let writeHealthHint: { failure_count: number; worst_criticality?: string | null; last_error?: string | null; last_event_type?: string | null } | null = null;
       if (pin && storeReady) {
         eventsTextForClassify = readEventsTextFn(pin.events_path);
+        const whRaw = readWriteHealthTextFn(pin.events_path);
+        if (whRaw != null && whRaw !== "") {
+          // Corrupt/unreadable write-health is fail-safe elevated (#633 review):
+          // never treat a present-but-broken artifact as healthy/absent.
+          const parsed = parseWriteHealthText(whRaw);
+          if (isElevatedWriteHealth(parsed)) {
+            writeHealthHint = {
+              failure_count: parsed.failure_count,
+              worst_criticality: parsed.worst_criticality,
+              last_error: parsed.last_error,
+              last_event_type: parsed.last_event_type,
+            };
+          }
+        }
       }
-      let resolution = lastStageDiagnosticFromEventsJsonl(eventsTextForClassify ?? "");
+      let resolution = lastStageDiagnosticFromEventsJsonl(
+        eventsTextForClassify ?? "",
+        writeHealthHint,
+      );
       // Compatibility for early-exits before a fresh run-store event: only the
       // authenticated, current blocked-label incarnation may supply this
       // structural fallback. Comment prose is never read or transported.
@@ -4332,6 +4380,17 @@ export async function runStatus(
           `Run \`--override "<key>: <reason>"\` (auto-resumes) or fix the residual findings and relabel ` +
           `\`pipeline:needs-human\` → \`pipeline:review-<round>\` to resume.`,
     );
+  }
+
+  // #633: warn when the latest run's event stream recorded write failures so
+  // operators can see incomplete evidence without reading the original stderr.
+  const runEvents = deps.getLatestRunEvents
+    ? await deps.getLatestRunEvents(cfg, issueNumber).catch(() => null)
+    : null;
+  const writeHealthWarning = formatWriteHealthStatusWarning(runEvents?.writeHealth ?? null);
+  if (writeHealthWarning) {
+    console.log("");
+    console.log(writeHealthWarning);
   }
 
   // #146: surface the latest preflight result if one was stored by a prior

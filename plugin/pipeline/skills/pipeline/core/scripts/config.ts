@@ -427,11 +427,19 @@ const PartialConfigSchema = z.object({
   event_sink: z
     .object({
       command: z.string().optional().describe("Operator-controlled forwarder command that receives each event JSON line on stdin."),
-      mode: z.enum(["additive", "exclusive"]).optional().describe("additive (default): write to the local events.jsonl AND deliver to the sink. exclusive: deliver to the sink only; events.jsonl is not written."),
+      mode: z
+        .enum(["additive", "exclusive"])
+        .optional()
+        .describe(
+          "additive (default): write to the local events.jsonl AND deliver to the sink. " +
+            "exclusive: on successful sink delivery, skip local events.jsonl (remote-only while the sink is healthy). " +
+            "If exclusive sink delivery fails, the engine falls back to a local events.jsonl write for that event and " +
+            "records the sink failure in write-health — do not assume dual durability in exclusive mode (#633).",
+        ),
     })
     .strict()
     .optional()
-    .describe("Optional external event sink for run events (#343)."),
+    .describe("Optional external event sink for run events (#343). exclusive mode is remote-only while the sink is healthy; sink failure triggers local events.jsonl fallback + write-health (#633)."),
   // Privacy-safe upstream product-fault reporting (#502). Opt-in and default-
   // absent: absent, or `enabled: false`, leaves `pipeline report` fully inert
   // — no network reporting, no `gh` write, no GitHub issue. `intake_endpoint`
@@ -2370,7 +2378,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       : [
         "# event_sink: # optional external event sink (#343) — uncomment to deliver run events.jsonl records to an operator-controlled forwarder. SECURITY: forwards run/stage/issue/PR event metadata to the configured command — treat it as a trusted destination.",
         '#   command: "logger -t pipeline" # forwarder command; receives each event JSON line on stdin. Unset -> no sink (local events.jsonl only, unchanged).',
-        "#   mode: additive # additive (default): write events.jsonl AND deliver to the sink | exclusive: sink only (events.jsonl is not written)",
+        "#   mode: additive # additive (default): write events.jsonl AND deliver to the sink | exclusive: sink only while healthy; on sink failure local events.jsonl fallback + write-health (#633)",
         "#   Env overrides: PIPELINE_EVENT_SINK_COMMAND, PIPELINE_EVENT_SINK_MODE (win over file config). Delivery failures are non-fatal.",
       ].join("\n"),
     "",

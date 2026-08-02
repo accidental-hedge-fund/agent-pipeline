@@ -3,7 +3,11 @@
 // The caller provides pre-fetched data; this module maps it to the stable JSON envelope.
 
 import { isBlocked, pickStage } from "./gh.ts";
-import type { RunEventsSummary } from "./run-store.ts";
+import {
+  isElevatedWriteHealth,
+  type RunEventsSummary,
+  type WriteHealthRecord,
+} from "./run-store.ts";
 import type { PipelineConfig } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -32,6 +36,12 @@ export interface StatusPayload {
   next_action: string;
   config: { repo: string; domain: string };
   possibly_wedged: PossiblyWedged | null;
+  /**
+   * Event-stream write-health for the latest run (#633). Non-null when the run
+   * recorded one or more append/sink failures. Null when healthy, absent, or
+   * no run-events summary was provided. Additive; schema_version stays `"1"`.
+   */
+  event_stream_write_health: WriteHealthRecord | null;
 }
 
 export interface StatusErrorEnvelope {
@@ -221,6 +231,7 @@ export function buildStatusPayload(
   const branch = worktreeInfo ? `pipeline/${detail.number}-${worktreeInfo.slug}` : null;
   const worktree = worktreeInfo ? worktreeInfo.path : null;
 
+  const writeHealth = runEvents?.writeHealth ?? null;
   return {
     schema_version: "1",
     status: deriveStatus(stage, blocked, detail.state),
@@ -234,5 +245,21 @@ export function buildStatusPayload(
     next_action: deriveNextAction(stage, blocked),
     config: { repo: cfg.repo, domain: cfg.domain },
     possibly_wedged: derivePossiblyWedged(runEvents, largestConfiguredStageTimeoutSec(cfg) * 1000 + WEDGE_MARGIN_MS, now),
+    // Elevated only — healthy/absent must not invent a failure (#633).
+    event_stream_write_health: isElevatedWriteHealth(writeHealth) ? writeHealth : null,
   };
+}
+
+/** One-line prose warning when event-stream write-health is elevated (#633). */
+export function formatWriteHealthStatusWarning(
+  health: WriteHealthRecord | null | undefined,
+): string | null {
+  if (!isElevatedWriteHealth(health)) return null;
+  const crit = health!.worst_criticality ?? "best-effort";
+  const lastType = health!.last_event_type ?? "unknown";
+  const lastErr = health!.last_error ?? "unknown error";
+  return (
+    `WARNING: event stream write failure — evidence may be incomplete ` +
+    `(failures=${health!.failure_count}, worst=${crit}, last_type=${lastType}, last_error=${lastErr})`
+  );
 }

@@ -686,6 +686,30 @@ export function formatSummary(bundle: EvidenceBundle): string {
     }
   }
 
+  // Event-stream write-health (#633): always show when present so a successful
+  // finalState cannot hide truncated or empty audit trails.
+  if (bundle.write_health) {
+    const wh = bundle.write_health;
+    lines.push("");
+    lines.push("Event-stream write-health:");
+    if (wh.failure_count > 0) {
+      lines.push(
+        `  WARNING: elevated — failures=${wh.failure_count}` +
+          (wh.worst_criticality ? `, worst=${wh.worst_criticality}` : "") +
+          (wh.last_event_type ? `, last_type=${wh.last_event_type}` : "") +
+          (wh.last_error ? `, last_error=${wh.last_error}` : ""),
+      );
+      if (wh.exclusive_fallback_attempted) {
+        lines.push(
+          `  exclusive sink fallback: attempted` +
+            (wh.exclusive_fallback_succeeded ? ", local write succeeded" : ", local write also failed"),
+        );
+      }
+    } else {
+      lines.push("  healthy (0 failures)");
+    }
+  }
+
   return lines.join("\n");
 }
 
