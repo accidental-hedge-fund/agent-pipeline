@@ -845,6 +845,14 @@ Nested fields:
 - **Type:** boolean
 - **Description:** First review round (review-1) and its fix round.
 
+### `supersede_mode`
+
+- **Type:** enum
+- **Default:** `close`
+- **Description:** After managed PR create/reuse, dispose other open associated same-base PRs for the issue: "close" (default) with a pipeline-superseded comment, or "comment-only" (notice only, leave open).
+
+- **Allowed values:** `close`, `comment-only`
+
 ### `sweep`
 
 - **Type:** object
