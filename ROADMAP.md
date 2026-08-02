@@ -84,6 +84,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.28.4** ✅ shipped | patch | Pre-merge auto-fix noop re-verify: do not hard-block when autofix makes no commit and HEAD already satisfies findings | #698 | Shipped 2026-07-30 (tag `v1.28.4`). See [CHANGELOG.md](CHANGELOG.md). |
 | **v1.29.0** ✅ shipped | minor | Docs/packaging truth, plan-review authority docs, human-gated merge-queue (dry-run + release-when-complete), evals ordered primary-reviewer pairs | #574, #627, #673, #676, #601 | Shipped 2026-07-30 (tag `v1.29.0`). See [CHANGELOG.md](CHANGELOG.md). |
 | **v1.29.1** ✅ shipped | patch | v1.29.1 | #712, #714, #716, #718, #722, #723, #725, #730, #731, #742, #747 | Shipped 2026-07-31 (tag `v1.29.1`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.29.2** ✅ shipped | patch | v1.29.2 | #449, #588, #597, #626, #635, #674, #675, #729, #754, #755, #756, #761, #764, #769, #770, #771, #773, #797 | Shipped 2026-08-02 (tag `v1.29.2`). See CHANGELOG.md. |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
