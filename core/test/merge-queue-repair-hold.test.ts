@@ -679,10 +679,65 @@ test("runSharedMechanicalRepair uses injected shared repair path (no network)", 
 // Deterministic conflict rebase/restack (#675 review-2: before implementer)
 // ---------------------------------------------------------------------------
 
-test("runDeterministicConflictRebase: clean rebase then force-with-lease push of pipeline branch", async () => {
+const EXPECTED_SHA = "aaaaaaa1bbbbbbb1ccccccc1ddddddd1eeeeeee1";
+const AFTER_REBASE_SHA = "bbbbbbb2ccccccc2ddddddd2eeeeeee2fffffff2";
+
+/** Shared fake git for clean rebase path: no prior rebase, clean worktree, matching SHAs. */
+function cleanRebaseGit(
+  gitCalls: string[][],
+  opts: {
+    cwd?: string;
+    headAfterRebase?: string;
+    pushCode?: number;
+    rebaseCode?: number;
+    remoteSha?: string;
+    localHead?: string;
+  } = {},
+) {
+  let headRevCount = 0;
+  const localHead = opts.localHead ?? EXPECTED_SHA;
+  const remoteSha = opts.remoteSha ?? EXPECTED_SHA;
+  const after = opts.headAfterRebase ?? AFTER_REBASE_SHA;
+  return async (cwd: string, args: string[]) => {
+    if (opts.cwd) assert.equal(cwd, opts.cwd, "git must stay in managed worktree root");
+    gitCalls.push([...args]);
+    // Prior-rebase probe
+    if (args[0] === "rev-parse" && args[1] === "--verify" && args[2] === "REBASE_HEAD") {
+      return { stdout: "", stderr: "fatal: Needed a single revision", code: 1 };
+    }
+    if (args[0] === "status" && args[1] === "--porcelain") {
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "rev-parse" && args[1] === "HEAD") {
+      headRevCount += 1;
+      const sha = headRevCount === 1 ? localHead : after;
+      return { stdout: `${sha}\n`, stderr: "", code: 0 };
+    }
+    if (args[0] === "rev-parse" && String(args[1]).startsWith("refs/remotes/origin/")) {
+      return { stdout: `${remoteSha}\n`, stderr: "", code: 0 };
+    }
+    if (args[0] === "rebase" && args[1] === "origin/main") {
+      return { stdout: "", stderr: "", code: opts.rebaseCode ?? 0 };
+    }
+    if (args[0] === "rebase" && args[1] === "origin/staging") {
+      return { stdout: "", stderr: "", code: opts.rebaseCode ?? 0 };
+    }
+    if (args[0] === "rebase" && args[1] === "--abort") {
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "push") {
+      return { stdout: "", stderr: opts.pushCode ? "rejected" : "", code: opts.pushCode ?? 0 };
+    }
+    if (args[0] === "reset" && args[1] === "--hard") {
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    return { stdout: "", stderr: "", code: 0 };
+  };
+}
+
+test("runDeterministicConflictRebase: clean rebase then bound force-with-lease push", async () => {
   const cfg = { base_branch: "main" } as unknown as PipelineConfig;
   const gitCalls: string[][] = [];
-  let revParseCount = 0;
   const result = await runDeterministicConflictRebase(
     { issueNumber: 42, prNumber: 7, title: "restack me" },
     cfg,
@@ -693,38 +748,27 @@ test("runDeterministicConflictRebase: clean rebase then force-with-lease push of
       async ensureManagedWorktree() {
         throw new Error("should not rematerialize when worktree exists");
       },
-      async gitInWorktree(cwd, args) {
-        assert.equal(cwd, "/managed/wt", "git must stay in managed worktree root");
-        gitCalls.push([...args]);
-        if (args[0] === "rev-parse" && args[1] === "HEAD") {
-          revParseCount += 1;
-          // HEAD moves after rebase.
-          const sha = revParseCount === 1 ? "aaaaaaa1bbbbbbb1ccccccc1ddddddd1eeeeeee1" : "bbbbbbb2ccccccc2ddddddd2eeeeeee2fffffff2";
-          return { stdout: `${sha}\n`, stderr: "", code: 0 };
-        }
-        return { stdout: "", stderr: "", code: 0 };
-      },
+      gitInWorktree: cleanRebaseGit(gitCalls, { cwd: "/managed/wt" }),
     },
+    EXPECTED_SHA,
   );
   assert.equal(result.changed, true);
-  assert.equal(result.headSha, "bbbbbbb2ccccccc2ddddddd2eeeeeee2fffffff2");
+  assert.equal(result.headSha, AFTER_REBASE_SHA);
   assert.ok(result.evidence.includes("deterministic clean rebase"));
   assert.ok(result.evidence.includes("origin/main"));
   assert.ok(result.evidence.includes("pipeline/42-slug"));
-  // Sequence: rev-parse → fetch → rebase → rev-parse → push --force-with-lease
-  assert.deepEqual(gitCalls[0], ["rev-parse", "HEAD"]);
-  assert.deepEqual(gitCalls[1], ["fetch", "origin", "main"]);
-  assert.deepEqual(gitCalls[2], ["rebase", "origin/main"]);
-  assert.deepEqual(gitCalls[3], ["rev-parse", "HEAD"]);
-  assert.deepEqual(gitCalls[4], [
-    "push",
-    "--force-with-lease",
-    "origin",
-    "pipeline/42-slug",
-  ]);
+  // Bound lease to eligibility snapshot head
+  const push = gitCalls.find((a) => a[0] === "push");
+  assert.ok(push, "must push");
+  assert.ok(
+    push!.some((a) => a.startsWith("--force-with-lease=refs/heads/pipeline/42-slug:")),
+    `expected bound force-with-lease, got ${JSON.stringify(push)}`,
+  );
+  assert.ok(push!.includes(`HEAD:refs/heads/pipeline/42-slug`));
+  assert.ok(gitCalls.some((a) => a[0] === "rebase" && a[1] === "origin/main"));
 });
 
-test("runDeterministicConflictRebase: rebase conflict aborts without push (no implementer)", async () => {
+test("runDeterministicConflictRebase: rebase conflict aborts only our session without push", async () => {
   const cfg = { base_branch: "main" } as unknown as PipelineConfig;
   const gitCalls: string[][] = [];
   const result = await runDeterministicConflictRebase(
@@ -737,28 +781,17 @@ test("runDeterministicConflictRebase: rebase conflict aborts without push (no im
       async ensureManagedWorktree() {
         throw new Error("should not rematerialize");
       },
-      async gitInWorktree(_cwd, args) {
-        gitCalls.push([...args]);
-        if (args[0] === "rev-parse") {
-          return { stdout: "deadbeef\n", stderr: "", code: 0 };
-        }
-        if (args[0] === "rebase" && args[1] === "origin/main") {
-          return { stdout: "", stderr: "CONFLICT", code: 1 };
-        }
-        if (args[0] === "rebase" && args[1] === "--abort") {
-          return { stdout: "", stderr: "", code: 0 };
-        }
-        return { stdout: "", stderr: "", code: 0 };
-      },
+      gitInWorktree: cleanRebaseGit(gitCalls, { rebaseCode: 1 }),
     },
+    EXPECTED_SHA,
   );
   assert.equal(result.changed, false);
-  assert.equal(result.headSha, "deadbeef");
+  assert.equal(result.headSha, EXPECTED_SHA);
   assert.ok(result.evidence.includes("failed"));
-  assert.ok(result.evidence.includes("aborted"));
+  assert.ok(result.evidence.includes("aborted our session"));
   assert.ok(
     gitCalls.some((a) => a[0] === "rebase" && a[1] === "--abort"),
-    "must abort failed rebase",
+    "must abort only the rebase we started",
   );
   assert.ok(
     !gitCalls.some((a) => a[0] === "push"),
@@ -766,9 +799,87 @@ test("runDeterministicConflictRebase: rebase conflict aborts without push (no im
   );
 });
 
+test("runDeterministicConflictRebase: pre-existing rebase is fail-closed (no abort)", async () => {
+  const cfg = { base_branch: "main" } as unknown as PipelineConfig;
+  const gitCalls: string[][] = [];
+  const result = await runDeterministicConflictRebase(
+    { issueNumber: 11, prNumber: 110, title: "manual rebase" },
+    cfg,
+    {
+      async getOnDiskForIssue() {
+        return { path: "/managed/wt", slug: "s" };
+      },
+      async gitInWorktree(_cwd, args) {
+        gitCalls.push([...args]);
+        if (args[0] === "rev-parse" && args[2] === "REBASE_HEAD") {
+          return { stdout: "mid-rebase\n", stderr: "", code: 0 }; // rebase in progress
+        }
+        return { stdout: "", stderr: "", code: 0 };
+      },
+    },
+    EXPECTED_SHA,
+  );
+  assert.equal(result.changed, false);
+  assert.ok(result.evidence.includes("rebase already in progress"));
+  assert.ok(
+    !gitCalls.some((a) => a[0] === "rebase" && a[1] === "--abort"),
+    "must not abort operator-owned rebase",
+  );
+  assert.ok(!gitCalls.some((a) => a[0] === "push"));
+});
+
+test("runDeterministicConflictRebase: force-with-lease bound to snapshot; push fail restores HEAD", async () => {
+  const cfg = { base_branch: "main" } as unknown as PipelineConfig;
+  const gitCalls: string[][] = [];
+  const result = await runDeterministicConflictRebase(
+    { issueNumber: 42, prNumber: 7, title: "push fail" },
+    cfg,
+    {
+      async getOnDiskForIssue() {
+        return { path: "/managed/wt", slug: "slug" };
+      },
+      gitInWorktree: cleanRebaseGit(gitCalls, { pushCode: 1 }),
+    },
+    EXPECTED_SHA,
+  );
+  assert.equal(result.changed, false);
+  assert.equal(result.headSha, EXPECTED_SHA);
+  assert.ok(result.evidence.includes("force-with-lease push"));
+  assert.ok(result.evidence.includes("local branch restored"));
+  assert.ok(
+    gitCalls.some((a) => a[0] === "reset" && a[1] === "--hard" && a[2] === EXPECTED_SHA),
+    "must restore pre-rebase SHA after push failure",
+  );
+});
+
+test("runDeterministicConflictRebase: stale remote head fails closed without rebase", async () => {
+  const cfg = { base_branch: "main" } as unknown as PipelineConfig;
+  const gitCalls: string[][] = [];
+  const result = await runDeterministicConflictRebase(
+    { issueNumber: 42, prNumber: 7, title: "stale remote" },
+    cfg,
+    {
+      async getOnDiskForIssue() {
+        return { path: "/managed/wt", slug: "slug" };
+      },
+      gitInWorktree: cleanRebaseGit(gitCalls, {
+        remoteSha: "cccccccc3ddddddd3eeeeeee3fffffff3aaaaaaa3",
+      }),
+    },
+    EXPECTED_SHA,
+  );
+  assert.equal(result.changed, false);
+  assert.ok(result.evidence.includes("stale or divergent remote head"));
+  assert.ok(
+    !gitCalls.some((a) => a[0] === "rebase" && a[1]?.startsWith("origin/")),
+    "must not rebase when remote head diverged from snapshot",
+  );
+});
+
 test("runDeterministicConflictRebase: rematerializes managed worktree when missing", async () => {
   const cfg = { base_branch: "staging" } as unknown as PipelineConfig;
   let ensureCalls = 0;
+  const gitCalls: string[][] = [];
   const result = await runDeterministicConflictRebase(
     { issueNumber: 3, prNumber: 30, title: "need wt" },
     cfg,
@@ -788,15 +899,12 @@ test("runDeterministicConflictRebase: rematerializes managed worktree when missi
           reason: "rematerialized",
         };
       },
-      async gitInWorktree(cwd, args) {
-        assert.equal(cwd, "/new/wt");
-        if (args[0] === "rev-parse") {
-          // HEAD unchanged → no push (already up to date).
-          return { stdout: "same-sha\n", stderr: "", code: 0 };
-        }
-        return { stdout: "", stderr: "", code: 0 };
-      },
+      gitInWorktree: cleanRebaseGit(gitCalls, {
+        cwd: "/new/wt",
+        headAfterRebase: EXPECTED_SHA, // no-op restack
+      }),
     },
+    EXPECTED_SHA,
   );
   assert.equal(ensureCalls, 1);
   assert.equal(result.changed, false);

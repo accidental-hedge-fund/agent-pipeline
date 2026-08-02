@@ -348,10 +348,13 @@ export async function evaluateCandidateEligibility(
  * Safety scope (destructive force-with-lease):
  * - Operates only inside the **managed worktree root** for the candidate issue.
  * - Pushes only the issue's pipeline branch (`pipeline/<issue>-<slug>`) with
- *   `--force-with-lease` — same shape as pre-merge conflict recovery — never
- *   force-pushes the integration base or unrelated refs.
- * - On rebase failure, aborts the in-progress rebase and leaves the worktree
- *   without claiming a successful restack.
+ *   `--force-with-lease=refs/heads/<branch>:<expectedHeadSha>` bound to the
+ *   eligibility snapshot head — never force-pushes the integration base.
+ * - Fails closed (no abort) when a rebase is already in progress or the worktree
+ *   is dirty — never aborts an operator-owned rebase session.
+ * - Only aborts a rebase this invocation started from a proven-clean worktree.
+ * - On push failure, restores the candidate branch to the pre-rebase SHA so a
+ *   later drive can retry (no silent local-only restack).
  *
  * Injectable for hermetic tests; production wires real worktree/git deps.
  */
@@ -364,6 +367,11 @@ export async function runDeterministicConflictRebase(
     gitInWorktree?: typeof gitInWorktree;
     branchNameFn?: typeof branchName;
   } = {},
+  /**
+   * PR head SHA from the eligibility snapshot that classified the conflict.
+   * Required for bound force-with-lease; when absent, fail closed.
+   */
+  expectedHeadSha?: string,
 ): Promise<DeterministicRepairResult> {
   const getWorktree = deps.getOnDiskForIssue ?? getOnDiskForIssue;
   const ensureWorktree = deps.ensureManagedWorktree ?? ensureManagedWorktree;
@@ -375,6 +383,15 @@ export async function runDeterministicConflictRebase(
     return {
       changed: false,
       evidence: "deterministic rebase skipped: no base_branch configured",
+    };
+  }
+
+  const expected = expectedHeadSha?.trim();
+  if (!expected) {
+    return {
+      changed: false,
+      evidence:
+        "deterministic rebase skipped: no expected PR head SHA (eligibility snapshot required)",
     };
   }
 
@@ -398,33 +415,109 @@ export async function runDeterministicConflictRebase(
   const managedRoot = wt.path;
   const branch = branchFn(candidate.issueNumber, wt.slug);
 
+  // Fail closed if a rebase is already in progress (operator-owned session).
+  const rebaseMerge = await git(
+    managedRoot,
+    ["rev-parse", "--verify", "REBASE_HEAD"],
+    { ignoreFailure: true },
+  );
+  if (rebaseMerge.code === 0) {
+    return {
+      changed: false,
+      evidence:
+        "deterministic rebase skipped: rebase already in progress (will not abort operator session)",
+    };
+  }
+
+  // Fail closed on a dirty worktree — do not clobber uncommitted operator work.
+  const dirty = await git(managedRoot, ["status", "--porcelain"], {
+    ignoreFailure: true,
+  });
+  if (dirty.code === 0 && dirty.stdout.trim() !== "") {
+    return {
+      changed: false,
+      evidence:
+        "deterministic rebase skipped: managed worktree has uncommitted changes",
+    };
+  }
+
   const headBefore = await git(managedRoot, ["rev-parse", "HEAD"], {
     ignoreFailure: true,
   });
   const beforeSha =
     headBefore.code === 0 ? headBefore.stdout.trim() || undefined : undefined;
+  if (!beforeSha) {
+    return {
+      changed: false,
+      evidence: "deterministic rebase: cannot resolve local HEAD",
+    };
+  }
+  if (beforeSha !== expected) {
+    return {
+      changed: false,
+      headSha: beforeSha,
+      evidence:
+        `deterministic rebase skipped: local HEAD ${beforeSha.slice(0, 7)} ` +
+        `!== eligibility snapshot head ${expected.slice(0, 7)} (stale checkout)`,
+    };
+  }
 
-  const fetch = await git(managedRoot, ["fetch", "origin", base], {
+  // Fetch base and the candidate branch so remote-tracking is current.
+  const fetchBase = await git(managedRoot, ["fetch", "origin", base], {
     ignoreFailure: true,
   });
-  if (fetch.code !== 0) {
+  if (fetchBase.code !== 0) {
     return {
       changed: false,
       headSha: beforeSha,
       evidence: `deterministic rebase: fetch origin/${base} failed`,
     };
   }
+  const fetchBranch = await git(managedRoot, ["fetch", "origin", branch], {
+    ignoreFailure: true,
+  });
+  if (fetchBranch.code !== 0) {
+    return {
+      changed: false,
+      headSha: beforeSha,
+      evidence: `deterministic rebase: fetch origin/${branch} failed`,
+    };
+  }
 
+  const remoteHead = await git(
+    managedRoot,
+    ["rev-parse", `refs/remotes/origin/${branch}`],
+    { ignoreFailure: true },
+  );
+  const remoteSha =
+    remoteHead.code === 0 ? remoteHead.stdout.trim() || undefined : undefined;
+  if (!remoteSha || remoteSha !== expected) {
+    return {
+      changed: false,
+      headSha: beforeSha,
+      evidence:
+        `deterministic rebase skipped: origin/${branch} ` +
+        `${(remoteSha ?? "missing").slice(0, 12)} !== eligibility snapshot ` +
+        `${expected.slice(0, 7)} (stale or divergent remote head)`,
+    };
+  }
+
+  // We started from a proven-clean, non-rebasing worktree at the expected SHA.
+  // Only then is aborting a rebase we start safe (it is ours).
   const rebase = await git(managedRoot, ["rebase", `origin/${base}`], {
     ignoreFailure: true,
   });
   if (rebase.code !== 0) {
     await git(managedRoot, ["rebase", "--abort"], { ignoreFailure: true });
+    // Ensure we are back on the pre-rebase SHA (abort should restore; belt+suspenders).
+    await git(managedRoot, ["reset", "--hard", expected], {
+      ignoreFailure: true,
+    });
     return {
       changed: false,
-      headSha: beforeSha,
+      headSha: expected,
       evidence:
-        `deterministic rebase onto origin/${base} failed (conflicts or unclean); aborted`,
+        `deterministic rebase onto origin/${base} failed (conflicts or unclean); aborted our session`,
     };
   }
 
@@ -445,18 +538,24 @@ export async function runDeterministicConflictRebase(
     };
   }
 
-  // Force-with-lease scoped to the candidate's pipeline branch only (reviewed head).
+  // Bound force-with-lease to the eligibility snapshot head, not a floating tracking ref.
+  const leaseRef = `refs/heads/${branch}:${expected}`;
   const push = await git(
     managedRoot,
-    ["push", "--force-with-lease", "origin", branch],
+    ["push", `--force-with-lease=${leaseRef}`, "origin", `HEAD:refs/heads/${branch}`],
     { ignoreFailure: true },
   );
   if (push.code !== 0) {
+    // Restore local branch so a later drive can retry (avoids "already up to date" no-op).
+    await git(managedRoot, ["reset", "--hard", expected], {
+      ignoreFailure: true,
+    });
     return {
       changed: false,
-      headSha: afterRebaseSha ?? beforeSha,
+      headSha: expected,
       evidence:
-        `deterministic rebase succeeded locally but force-with-lease push of ${branch} failed`,
+        `deterministic rebase succeeded locally but force-with-lease push of ${branch} ` +
+        `failed (lease expected ${expected.slice(0, 7)}); local branch restored`,
     };
   }
 
@@ -665,7 +764,7 @@ export function realMergeQueueDeps(
 
     // Deterministic-first: checks re-query; conflicts attempt clean rebase/restack
     // onto the integration base in the managed worktree before mechanical repair.
-    async attemptDeterministicRepair(candidate, reason, _snapshot) {
+    async attemptDeterministicRepair(candidate, reason, snapshot) {
       if (reason === "checks-failed") {
         // Re-query settled check state (no second poller loop — one re-read).
         const snap = await evaluateCandidateEligibility(candidate, plan, md);
@@ -680,8 +779,15 @@ export function realMergeQueueDeps(
       // Conflict: managed-worktree clean rebase/restack first (does not charge
       // implementer budget). Falls back to mergeability re-query only when cfg
       // is unavailable so worktree ops cannot run.
+      // Thread eligibility snapshot head so force-with-lease is bound to the
+      // inspected PR tip (never an unbound lease on a floating tracking ref).
       if (cfg) {
-        return runDeterministicConflictRebase(candidate, cfg);
+        return runDeterministicConflictRebase(
+          candidate,
+          cfg,
+          {},
+          snapshot.headRefOid,
+        );
       }
       const snap = await evaluateCandidateEligibility(candidate, plan, md);
       return {
