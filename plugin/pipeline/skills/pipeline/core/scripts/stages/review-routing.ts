@@ -57,6 +57,11 @@ import { makePromptRecord, recordPrompt, recordReview } from "../evidence-bundle
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import { emitCorrectionEvent } from "../correction.ts";
 import { buildStageDiagnostic } from "../stage-diagnostic.ts";
+import {
+  buildHarnessContractDiagnostic,
+  runFormatRepairLoop,
+  validateReviewVerdict,
+} from "../stage-output-contract.ts";
 import { sanitizeDeep } from "../artifact-sanitize.ts";
 import type {
   Outcome,
@@ -513,17 +518,9 @@ export async function advanceReview(
     cwd,
     opts,
   );
-  const result = invocation.result;
+  let result = invocation.result;
   reviewer = invocation.effectiveReviewer;
-  const selfReview = invocation.selfReview;
-  const reviewComment = (text: string) => {
-    if (!selfReview) return text;
-    const nl = text.indexOf("\n");
-    return nl >= 0
-      ? `${text.slice(0, nl)}\n\n${selfReviewBanner(configuredReviewer, reviewer)}${text.slice(nl)}`
-      : `${text}\n\n${selfReviewBanner(configuredReviewer, reviewer)}`;
-  };
-  const reviewerLabel = selfReview ? `${reviewer} (self-review)` : reviewer;
+  let selfReview = invocation.selfReview;
 
   if (!result.success) {
     const reason = result.timed_out
@@ -545,24 +542,111 @@ export async function advanceReview(
 
   // A delegated `stage_executors` result must satisfy the FULL verdict schema —
   // no partial-JSON defaulting, no prose/text-verdict fallback — or it is a
-  // contract violation that blocks the run (#314 review-2 finding 9e069297).
+  // contract violation (#314 review-2 finding 9e069297). #777 routes pure shape
+  // failures through review.verdict@1 + the shared format-repair policy (one
+  // re-prompt) before terminal harness-contract.
   // `executor_name` is only set on a `HarnessResult` produced by
   // `invokeStageExecutor`; a local reviewer's result never carries it.
   const isDelegatedResult = result.executor_name !== undefined;
-  const strictVerdict = isDelegatedResult ? parseStrictVerdict(result.stdout, commitSha) : undefined;
+  let strictVerdict = isDelegatedResult
+    ? parseStrictVerdict(result.stdout, commitSha)
+    : undefined;
   if (isDelegatedResult && strictVerdict === null) {
-    const providerNote = result.executor_provider ? ` (provider "${result.executor_provider}")` : "";
-    await setBlockedFn(
-      cfg,
-      issueNumber,
-      `Delegated executor "${result.executor_name}"${providerNote} for stage "${stage}" returned a result ` +
+    const providerNote = result.executor_provider
+      ? ` (provider "${result.executor_provider}")`
+      : "";
+    const executorName = result.executor_name;
+    const shapeRepair = await runFormatRepairLoop({
+      validate: (stdout) => {
+        const shape = validateReviewVerdict(stdout);
+        if (!shape.ok) return shape;
+        // Delegated path still requires full strict fields after shape gate.
+        if (parseStrictVerdict(stdout, commitSha) === null) {
+          return {
+            ok: false,
+            reason:
+              "Review output is JSON-shaped but does not satisfy the full strict verdict schema",
+          };
+        }
+        return { ok: true };
+      },
+      initialOutput: result.stdout,
+      repairInvoke: async () => {
+        console.warn(
+          `[pipeline] #${issueNumber}: review.verdict@1 failed for delegated executor; attempting one format-repair re-prompt`,
+        );
+        const repairInvocation = await runReviewFn(
+          cfg,
+          issueNumber,
+          detail,
+          plan,
+          review1Summary,
+          priorReview2Findings,
+          diff,
+          round,
+          cwd,
+          opts,
+        );
+        if (!repairInvocation.result.success) {
+          const reason = repairInvocation.result.timed_out
+            ? `Review format-repair timed out after ${repairInvocation.result.duration.toFixed(0)}s`
+            : `Review format-repair failed (exit ${repairInvocation.result.exit_code})`;
+          return { success: false, reason };
+        }
+        result = repairInvocation.result;
+        reviewer = repairInvocation.effectiveReviewer;
+        selfReview = repairInvocation.selfReview;
+        return { success: true, output: repairInvocation.result.stdout };
+      },
+    });
+    if (shapeRepair.status === "invoke-failed") {
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        `Delegated executor "${executorName}"${providerNote} for stage "${stage}" format-repair failed: ${shapeRepair.reason}`,
+        stage,
+        "harness-failure",
+      );
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: shapeRepair.reason,
+        blockerKind: "harness-failure",
+      };
+    }
+    if (shapeRepair.status === "contract-exhausted") {
+      const reason =
+        `Delegated executor "${executorName}"${providerNote} for stage "${stage}" returned a result ` +
         `that does not satisfy the review verdict contract (missing/invalid fields, or non-JSON/prose ` +
-        `output). No fallback — the run is blocked.`,
-      stage,
-      "harness-failure",
-    );
-    return { advanced: false, status: "blocked", reason: "external executor verdict contract violation" };
+        `output) after shared format-repair. No fallback — the run is blocked.`;
+      const diagnostic = buildHarnessContractDiagnostic({
+        reason,
+        stage,
+        evidenceKey: `review.verdict@1#${issueNumber}#${stage}`,
+      });
+      await setBlockedFn(cfg, issueNumber, reason, stage, "harness-failure");
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: "external executor verdict contract violation",
+        blockerKind: "harness-failure",
+        diagnostic,
+      };
+    }
+    strictVerdict = parseStrictVerdict(shapeRepair.output, commitSha) ?? undefined;
   }
+
+  const reviewComment = (text: string) => {
+    if (!selfReview) return text;
+    const nl = text.indexOf("\n");
+    return nl >= 0
+      ? `${text.slice(0, nl)}\n\n${selfReviewBanner(configuredReviewer, reviewer)}${text.slice(nl)}`
+      : `${text}\n\n${selfReviewBanner(configuredReviewer, reviewer)}`;
+  };
+  const reviewerLabel = selfReview ? `${reviewer} (self-review)` : reviewer;
+
+  // Local (non-delegated) path keeps parseStructuredVerdict product tolerances;
+  // review.verdict@1 is the pure schema gate used for delegated repair + fixtures.
   const verdict = strictVerdict ?? parseStructuredVerdict(result.stdout, commitSha);
   console.log(
     `[pipeline] #${issueNumber}: verdict=${verdict.verdict} findings=${verdict.findings.length}`,

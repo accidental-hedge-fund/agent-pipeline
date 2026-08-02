@@ -1,0 +1,8 @@
+## Feedback Incorporated
+
+- [ADDRESSED] first required change
+- [DEFERRED] optional polish — reason: out of scope
+
+## Revised Plan
+
+Implement the feature as specified.

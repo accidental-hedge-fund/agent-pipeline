@@ -77,11 +77,18 @@ import * as last30days from "../last30days.ts";
 import { setLivePlanningMarker, clearLivePlanningMarker, isLivePlanningActive } from "../lock.ts";
 import {
   verifyHarnessCommits,
-  verifyPlanRevisionOutput,
   type VerifyDeps,
   type VerifyResult,
 } from "../verify-harness-commits.ts";
+import {
+  OPENSPEC_SINGULAR_REPAIR_ADDENDUM,
+  PLAN_REVISION_ACK_REPAIR_ADDENDUM,
+  buildHarnessContractDiagnostic,
+  runContractWithFormatRepair,
+  validateOpenspecChangeSingular,
+} from "../stage-output-contract.ts";
 import type { BlockerKind, Harness, Outcome, PipelineConfig, Stage, StageOutcome } from "../types.ts";
+import type { StageDiagnostic } from "../stage-diagnostic.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import { recordStage } from "../evidence-bundle.ts";
 import { INJECTION_PATTERNS } from "../artifact-sanitize.ts";
@@ -93,22 +100,26 @@ import {
 } from "../docs-freshness.ts";
 
 /**
- * Appended once when plan-revision stdout fails the acknowledgement shape gate
- * after mid-line normalisation (#658). One automatic re-prompt only; exhausted
- * failures still terminal-block as needs-human.
+ * Plan-revision format-repair addendum (#658 / #777).
+ * Thin re-export of the contract-owned text — the shared format-repair policy
+ * owns the retry budget; stages must not reimplement a private full repair loop.
  */
-export const PLAN_REVISION_FORMAT_REPAIR_ADDENDUM = [
-  "FORMAT REPAIR (required — previous output failed the machine-checkable acknowledgement contract):",
-  "- Emit `## Feedback Incorporated` exactly once as a **line-start** level-2 heading (never glued to preamble text on the same line).",
-  "- Under it, list each feedback item as a line-start bullet: `- [ADDRESSED] …` or `- [DEFERRED] … — reason: …`.",
-  "- Do not wrap that section only inside a code fence.",
-  "- Then re-emit the complete revised plan (not only the acknowledgement fragment).",
-].join("\n");
+export const PLAN_REVISION_FORMAT_REPAIR_ADDENDUM = PLAN_REVISION_ACK_REPAIR_ADDENDUM;
 
 type BlockedOutcome = Extract<Outcome, { advanced: false; status: "blocked" }>;
 
-function blockedOutcome(reason: string, blockerKind: BlockerKind): BlockedOutcome {
-  return { advanced: false, status: "blocked", reason, blockerKind };
+function blockedOutcome(
+  reason: string,
+  blockerKind: BlockerKind,
+  diagnostic?: StageDiagnostic,
+): BlockedOutcome {
+  return {
+    advanced: false,
+    status: "blocked",
+    reason,
+    blockerKind,
+    ...(diagnostic ? { diagnostic } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +305,7 @@ export interface PlanningPhaseHooks {
         specContext: string;
         readyToPlanningMsg: string;
       }
-    | { ok: false; reason: string; tag: BlockerKind }
+    | { ok: false; reason: string; tag: BlockerKind; diagnostic?: StageDiagnostic }
   >;
 
   /**
@@ -588,7 +599,7 @@ export async function runPlanningPhases(
   if (!authorResult.ok) {
     await doSetBlocked(cfg, issueNumber, authorResult.reason, "planning", authorResult.tag);
     await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-    return blockedOutcome(authorResult.reason, authorResult.tag);
+    return blockedOutcome(authorResult.reason, authorResult.tag, authorResult.diagnostic);
   }
   let planText = authorResult.planText;
   // `promptPlanText` is the version passed to review/revision prompts — for OpenSpec
@@ -711,7 +722,7 @@ export async function runPlanningPhases(
     let revisionResult = await invokeRevisionOnce(revisionPrompt);
     // Only treat unsuccessful/timed-out invocations as harness-failure. Exit-0
     // empty/whitespace stdout is an output-contract failure: route it through
-    // verifyPlanRevisionOutput so the format-repair retry can still run (#658).
+    // plan-revision.ack@1 + shared format-repair so the retry can still run (#658/#777).
     if (!revisionResult.success) {
       const reason = revisionResult.timed_out
         ? `Plan revision timed out after ${revisionResult.duration.toFixed(0)}s`
@@ -720,37 +731,46 @@ export async function runPlanningPhases(
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return blockedOutcome(reason, "harness-failure");
     }
-    // Verify the plan-revision output includes the required acknowledgement section (#68).
-    // Mid-line headers are normalised inside verifyPlanRevisionOutput (#658). Pure
-    // output-contract failures (including empty stdout) get one format-repair
-    // re-prompt before needs-human.
-    let ackCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
-    if (!ackCheck.ok) {
-      console.warn(
-        `[pipeline] #${issueNumber}: plan-revision ack contract failed (${ackCheck.reason}); attempting one format-repair re-prompt`,
-      );
-      const repairPrompt = `${revisionPrompt}\n\n${PLAN_REVISION_FORMAT_REPAIR_ADDENDUM}`;
-      const repairResult = await invokeRevisionOnce(repairPrompt);
-      // Same rule as the initial invoke: only unsuccessful repair is harness-failure.
-      // Successful empty repair falls through to the exhausted-contract needs-human path.
-      if (!repairResult.success) {
-        const reason = repairResult.timed_out
-          ? `Plan revision format-repair timed out after ${repairResult.duration.toFixed(0)}s`
-          : `Plan revision format-repair failed (exit ${repairResult.exit_code})`;
-        await doSetBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review", "harness-failure");
-        await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-        return blockedOutcome(reason, "harness-failure");
-      }
-      revisionResult = repairResult;
-      ackCheck = verifyPlanRevisionOutput(revisionResult.stdout, planReview);
-    }
-    if (!ackCheck.ok) {
-      await doSetBlocked(cfg, issueNumber, ackCheck.reason, "plan-review", "needs-human");
+    // plan-revision.ack@1 via the central stage-output-contract layer + shared
+    // format-repair policy (single automatic re-prompt). Terminal pure shape
+    // exhaustion is harness-contract, not product needs-human (#777).
+    const ackRepair = await runContractWithFormatRepair({
+      contractId: "plan-revision.ack@1",
+      toValidateInput: (stdout: string) => ({ stdout, feedback: planReview }),
+      initialOutput: revisionResult.stdout,
+      repairInvoke: async () => {
+        console.warn(
+          `[pipeline] #${issueNumber}: plan-revision ack contract failed; attempting one format-repair re-prompt`,
+        );
+        const repairPrompt = `${revisionPrompt}\n\n${PLAN_REVISION_FORMAT_REPAIR_ADDENDUM}`;
+        const repairResult = await invokeRevisionOnce(repairPrompt);
+        if (!repairResult.success) {
+          const reason = repairResult.timed_out
+            ? `Plan revision format-repair timed out after ${repairResult.duration.toFixed(0)}s`
+            : `Plan revision format-repair failed (exit ${repairResult.exit_code})`;
+          return { success: false, reason };
+        }
+        revisionResult = repairResult;
+        return { success: true, output: repairResult.stdout };
+      },
+    });
+    if (ackRepair.status === "invoke-failed") {
+      await doSetBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${ackRepair.reason}`, "plan-review", "harness-failure");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return blockedOutcome(ackCheck.reason, "needs-human");
+      return blockedOutcome(ackRepair.reason, "harness-failure");
     }
-    if (ackCheck.warning) {
-      console.warn(`[pipeline] #${issueNumber}: plan-revision warning — ${ackCheck.warning}`);
+    if (ackRepair.status === "contract-exhausted") {
+      const diagnostic = buildHarnessContractDiagnostic({
+        reason: ackRepair.reason,
+        stage: "plan-review",
+        evidenceKey: `plan-revision.ack@1#${issueNumber}`,
+      });
+      await doSetBlocked(cfg, issueNumber, ackRepair.reason, "plan-review", "harness-failure");
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+      return blockedOutcome(ackRepair.reason, "harness-failure", diagnostic);
+    }
+    if (ackRepair.warning) {
+      console.warn(`[pipeline] #${issueNumber}: plan-revision warning — ${ackRepair.warning}`);
     }
 
     // Re-validate and re-read artifact after revision (OpenSpec re-reads proposal; freeform is a no-op).
@@ -1338,25 +1358,101 @@ export function makeOpenspecPlanningHooks(
       // so it falls inside the verified range and satisfies allowPattern:/^openspec\//
       await commitOpenspecProjectConfig(wt.path, issueNumber, pipelineRunId, deps);
 
-      // ---- Discover the change the implementer created. ----
-      const after = openspec.listChangeDirs(wt.path);
-      const fresh = after.filter((c) => !beforeList.includes(c));
-      const changeResult = enforceOpenspecChangeSingular(fresh, after);
-      if (!changeResult.ok) {
-        // #521: disclose why nothing was salvaged so the operator can see that
-        // recoverable authoring work may still exist without reading terminal.log.
+      // ---- Discover the change the implementer created (openspec.change-singular@1). ----
+      const listSingularInput = () => {
+        const after = openspec.listChangeDirs(wt.path);
+        const fresh = after.filter((c) => !beforeList.includes(c));
+        return { fresh, all: after };
+      };
+      const formatSingularBlockReason = (
+        reason: string,
+        salvageFailureReason: string | undefined,
+      ): string => {
         const noChangeReason =
           "OpenSpec is active but the planning step produced no change under `openspec/changes/`. " +
           "Ensure the `openspec` CLI is installed and the repo is initialized (`openspec init`).";
-        const blockMsg =
-          changeResult.reason === "no openspec change created"
-            ? authorSalvage.failureReason
-              ? `${noChangeReason} Salvage of uncommitted work also failed: ${authorSalvage.failureReason}`
-              : noChangeReason
-            : changeResult.reason;
-        return { ok: false, reason: blockMsg, tag: "needs-human" };
+        return reason === "no openspec change created"
+          ? salvageFailureReason
+            ? `${noChangeReason} Salvage of uncommitted work also failed: ${salvageFailureReason}`
+            : noChangeReason
+          : reason;
+      };
+
+      let authorSalvageLatest = authorSalvage;
+      const singularRepair = await runContractWithFormatRepair({
+        contractId: "openspec.change-singular@1",
+        toValidateInput: (input: { fresh: string[]; all: string[] }) => input,
+        initialOutput: listSingularInput(),
+        repairInvoke: async () => {
+          console.warn(
+            `[pipeline] #${issueNumber}: openspec.change-singular@1 failed; attempting one format-repair re-prompt`,
+          );
+          const repairPrompt = `${openspecPlanPrompt}\n\n${OPENSPEC_SINGULAR_REPAIR_ADDENDUM}`;
+          const repairResult =
+            (await invokeStageExecutor(
+              "planning",
+              innerCfg,
+              repairPrompt,
+              {
+                timeoutSec: innerCfg.implementation_timeout,
+                accounting: opts.runDir
+                  ? { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps, issue: issueNumber, stage: "planning", modelSlot: "planning" }
+                  : undefined,
+              },
+              opts.executorHttpDeps,
+            )) ??
+            (await inv(primary, wt.path, repairPrompt, {
+              timeoutSec: innerCfg.implementation_timeout,
+              model: planModel,
+              reasoningEffort: innerCfg.effort?.planning,
+              sandbox: innerCfg.harness_sandbox,
+              accounting: accountingForInvoke(opts, issueNumber, "planning", "planning", planModel),
+            }));
+          if (!repairResult.success) {
+            const reason = repairResult.timed_out
+              ? `OpenSpec authoring format-repair timed out after ${repairResult.duration.toFixed(0)}s`
+              : `OpenSpec authoring format-repair failed (exit ${repairResult.exit_code})`;
+            return { success: false, reason };
+          }
+          authorSalvageLatest = await salvageIfNoNewCommit(
+            wt.path,
+            issueNumber,
+            pipelineRunId,
+            "OpenSpec authoring format-repair",
+            osAuthorHeadBefore,
+            "openspec/",
+          );
+          await commitOpenspecProjectConfig(wt.path, issueNumber, pipelineRunId, deps);
+          return { success: true, output: listSingularInput() };
+        },
+      });
+
+      if (singularRepair.status === "invoke-failed") {
+        return { ok: false, reason: singularRepair.reason, tag: "harness-failure" };
       }
-      changeId = changeResult.changeId;
+      if (singularRepair.status === "contract-exhausted") {
+        const blockMsg = formatSingularBlockReason(
+          singularRepair.reason,
+          authorSalvageLatest.failureReason,
+        );
+        // Exhausted pure singularity shape → harness-contract (not product needs-human).
+        return {
+          ok: false,
+          reason: blockMsg,
+          tag: "harness-failure",
+          diagnostic: buildHarnessContractDiagnostic({
+            reason: blockMsg,
+            stage: "planning",
+            evidenceKey: `openspec.change-singular@1#${issueNumber}`,
+          }),
+        };
+      }
+      const changeCheck = validateOpenspecChangeSingular(singularRepair.output);
+      if (!changeCheck.ok || !changeCheck.value) {
+        // validate succeeded in the loop; defensive.
+        return { ok: false, reason: changeCheck.ok ? "missing changeId" : changeCheck.reason, tag: "harness-failure" };
+      }
+      changeId = changeCheck.value.changeId;
 
       // ---- Verify the authoring harness committed only openspec/ artifacts (#68). ----
       if (osAuthorHeadBefore) {
@@ -1518,6 +1614,9 @@ export function makeOpenspecPlanningHooks(
  * a single pre-existing change (fallback for harnesses that modify rather than
  * create). Multiple new changes are always a hard block.
  *
+ * Thin wrapper over `openspec.change-singular@1` / {@link validateOpenspecChangeSingular}
+ * so existing call sites and unit tests keep a stable import path.
+ *
  * Returns `{ ok: true, changeId }` or `{ ok: false, reason }`. Exported for
  * unit testing without mocking the full `advanceOpenspec` chain.
  */
@@ -1525,17 +1624,9 @@ export function enforceOpenspecChangeSingular(
   fresh: string[],
   all: string[],
 ): { ok: true; changeId: string } | { ok: false; reason: string } {
-  if (fresh.length > 1) {
-    return {
-      ok: false,
-      reason: `OpenSpec authoring produced ${fresh.length} new changes (${fresh.join(", ")}) — expected exactly one`,
-    };
-  }
-  const changeId = fresh[0] ?? (all.length === 1 ? all[0] : undefined);
-  if (!changeId) {
-    return { ok: false, reason: "no openspec change created" };
-  }
-  return { ok: true, changeId };
+  const result = validateOpenspecChangeSingular({ fresh, all });
+  if (!result.ok) return { ok: false, reason: result.reason };
+  return { ok: true, changeId: result.value!.changeId };
 }
 
 // ---------------------------------------------------------------------------

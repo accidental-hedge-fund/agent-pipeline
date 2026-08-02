@@ -1,0 +1,18 @@
+Here is my review:
+
+```json
+{
+  "verdict": "needs-attention",
+  "summary": "One high-severity issue",
+  "findings": [
+    {
+      "severity": "high",
+      "title": "Missing null check",
+      "body": "Null can crash the path",
+      "confidence": 0.9,
+      "recommendation": "Guard the null"
+    }
+  ],
+  "next_steps": ["Add the null guard"]
+}
+```
