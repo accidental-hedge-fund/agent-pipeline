@@ -33,6 +33,7 @@ test("evaluatePostHarnessNoNewCommit: satisfied goal → advance with evidence",
     headBefore: SHA,
     headAfter: SHA,
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "fix-1",
     issueNumber: 758,
     now: FIXED_NOW,
@@ -57,6 +58,7 @@ test("evaluatePostHarnessNoNewCommit: unsatisfied goal → escalate", async () =
     headBefore: SHA,
     headAfter: SHA,
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "fix-1",
     goalCheck: () => ({
       satisfied: false,
@@ -73,6 +75,7 @@ test("evaluatePostHarnessNoNewCommit: non-empty commit range → not-applicable"
     headBefore: SHA,
     headAfter: SHA_B,
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "fix-1",
     goalCheck: () => {
       throw new Error("goal check must not run on non-empty range");
@@ -88,6 +91,7 @@ test("evaluatePostHarnessNoNewCommit: successful salvage → not-applicable", as
     headBefore: SHA,
     headAfter: SHA, // even if equal before re-read, salvaged flag wins
     salvaged: true,
+    salvageFoundNothing: false,
     stage: "fix-1",
     goalCheck: () => {
       throw new Error("goal check must not run after salvage commit");
@@ -98,11 +102,30 @@ test("evaluatePostHarnessNoNewCommit: successful salvage → not-applicable", as
   assert.match(result.reason, /salvage created a commit/);
 });
 
+test("evaluatePostHarnessNoNewCommit: unconfirmed clean/salvage → not-applicable (no goal check)", async () => {
+  // #758 R1 finding 2: equal HEADs alone must not run goal check when salvage
+  // was skipped or failed (salvageFoundNothing false).
+  const result = await evaluatePostHarnessNoNewCommit({
+    headBefore: SHA,
+    headAfter: SHA,
+    salvaged: false,
+    salvageFoundNothing: false,
+    stage: "implementing",
+    goalCheck: () => {
+      throw new Error("goal check must not run without confirmed clean/no-salvage");
+    },
+  });
+  assert.equal(result.decision, "not-applicable");
+  if (result.decision !== "not-applicable") return;
+  assert.match(result.reason, /clean\/no-salvage status not confirmed/);
+});
+
 test("evaluatePostHarnessNoNewCommit: missing heads → not-applicable", async () => {
   const result = await evaluatePostHarnessNoNewCommit({
     headBefore: "",
     headAfter: "",
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "implementing",
     goalCheck: () => ({ satisfied: true, rationaleClass: "x", note: "n" }),
   });
@@ -114,6 +137,7 @@ test("evaluatePostHarnessNoNewCommit: unsatisfied does not claim advance evidenc
     headBefore: SHA,
     headAfter: SHA,
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "pre-merge",
     goalCheck: () => ({ satisfied: false, note: "residual findings" }),
   });
@@ -192,6 +216,7 @@ test("#747-shaped: findings clear still advances after partition (shared check)"
     headBefore: SHA,
     headAfter: SHA,
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "pre-merge",
     now: FIXED_NOW,
     goalCheck: () =>
@@ -278,6 +303,7 @@ test("formatNoopAdvanceEvidenceNote names SHA and rationale class", async () => 
     headBefore: SHA,
     headAfter: SHA,
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "implementing",
     issueNumber: 588,
     now: FIXED_NOW,
@@ -319,6 +345,7 @@ test("async goal checks are supported", async () => {
     headBefore: SHA,
     headAfter: SHA,
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "fix-2",
     goalCheck: async (): Promise<GoalCheckResult> => {
       await Promise.resolve();

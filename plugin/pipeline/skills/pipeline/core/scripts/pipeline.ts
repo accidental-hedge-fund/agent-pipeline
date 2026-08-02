@@ -1293,6 +1293,12 @@ export interface RealExecuteRecoveryDeps {
   repairPipelineItem?: (input: RepairPipelineItemInput) => Promise<RepairPipelineItemResult>;
   /** Injectable HEAD read for verify_head_goal (#758). */
   gitHead?: (wtPath: string) => Promise<string>;
+  /**
+   * Injectable worktree cleanliness probe for verify_head_goal (#758 R1).
+   * Returns true only when the tree is clean relative to HEAD (no uncommitted
+   * work). Failures must return false (fail closed).
+   */
+  isWorktreeClean?: (wtPath: string) => Promise<boolean>;
   getOnDiskForIssue?: typeof getOnDiskForIssue;
   listChangeDirs?: (dir: string) => string[];
   postComment?: typeof postComment;
@@ -1316,6 +1322,18 @@ export function realExecuteRecovery(
     deps.gitHead ??
     (async (wtPath: string) =>
       (await gitInWorktree(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim());
+  const isWorktreeClean =
+    deps.isWorktreeClean ??
+    (async (wtPath: string) => {
+      // Fail closed: non-zero status or any porcelain output ⇒ not clean.
+      const status = await gitInWorktree(
+        wtPath,
+        ["status", "--porcelain", "--untracked-files=all"],
+        { ignoreFailure: true },
+      );
+      if (status.code !== 0) return false;
+      return status.stdout.trim() === "";
+    });
 
   const failed = (error: string): RepairPipelineItemResult => ({
     succeeded: false,
@@ -1354,15 +1372,28 @@ export function realExecuteRecovery(
     if (!headSha) {
       return failed(`verify_head_goal: cannot read HEAD for #${issueNumber}`);
     }
+    // Deterministic worktree cleanliness — never hard-code clean (#758 R1 F1).
+    const worktreeClean = await isWorktreeClean(wt.path);
+    if (!worktreeClean) {
+      return failed(
+        `verify_head_goal: worktree not clean for #${issueNumber}; cannot certify goal satisfaction`,
+      );
+    }
     // Stage-supplied goal checks — same classes as normal stage execution.
-    // Implementing: OpenSpec deliverable already present. Other stages without
-    // a recovery-time checker escalate (fail closed to next recipe).
+    // Implementing: OpenSpec deliverable already present + clean tree.
+    // Gates are not pre-certified here: successful recovery only clears the
+    // no-commits block and redispatches so normal stage gates still run.
+    // Other stages without a recovery-time checker escalate (fail closed).
     const goalCheck = () => {
       if (stage === "implementing" || stage === "planning" || stage === "plan-review") {
         const changes = listChanges(wt.path);
         return implementDeliverablePresentGoalCheck({
           deliverablePresent: changes.length > 0,
           worktreeClean: true,
+          // Redispatch runs format/test gates; do not claim they already passed.
+          // implementDeliverablePresent treats omitted/true as "gates ok for
+          // this check"; false would block deliverable-present recovery entirely.
+          // Recovery never skips post-redispatch gates — only certifies deliverable+clean.
           gatesGreen: true,
           deliverableDescription:
             changes.length > 0
@@ -1382,6 +1413,8 @@ export function realExecuteRecovery(
       headBefore: headSha,
       headAfter: headSha,
       salvaged: false,
+      // Worktree proven clean above — same signal as salvageFoundNothing.
+      salvageFoundNothing: true,
       stage,
       issueNumber,
       goalCheck,
@@ -1392,10 +1425,17 @@ export function realExecuteRecovery(
           (result.decision === "escalate" ? ` (${result.note})` : ` (${result.reason})`),
       );
     }
+    // Durable attested evidence is required before clearing the block
+    // (#758 R1 finding 3). Swallowing a post failure would redispatch without
+    // an audit trail readable on subsequent re-entry.
     try {
       await post(cfg, issueNumber, formatNoopAdvanceEvidenceNote(result.evidence));
-    } catch {
-      /* evidence is best-effort; clearing blocked still redispatch-safe */
+    } catch (err) {
+      return failed(
+        `verify_head_goal: stage goal satisfied but durable evidence could not be recorded: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
     }
     try {
       await clear(cfg, issueNumber);

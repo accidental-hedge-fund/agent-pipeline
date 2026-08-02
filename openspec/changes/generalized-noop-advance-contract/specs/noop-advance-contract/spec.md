@@ -30,6 +30,13 @@ The pipeline SHALL expose a single shared evaluation surface (module/API under `
 - **THEN** the shared evaluation SHALL return **not-applicable** (or SHALL NOT classify the result as clean-noop goal advance)
 - **AND** the stage SHALL follow the existing post-salvage verification path
 
+#### Scenario: Unconfirmed clean/no-salvage status is not-applicable
+
+- **WHEN** `headAfter === headBefore` and salvage did not create a commit, but confirmed clean/no-salvage status is not true (salvage skipped, salvage failed, or worktree cleanliness not proven)
+- **THEN** the shared evaluation SHALL return **not-applicable**
+- **AND** SHALL NOT invoke the stage goal check solely because HEADs are equal
+- **AND** callers SHALL NOT synthesize placeholder HEAD values or treat artifact-directory presence as proof of a clean worktree
+
 ### Requirement: Goal satisfaction SHALL be stage-declared and deterministic
 
 Each migrated consumer SHALL supply one or more explicit goal checks that answer whether HEAD already satisfies that stage’s goal. Checks SHALL be deterministic given their injected inputs (comments, HEAD SHA, artifact presence, review partition, active OpenSpec set, gate results as applicable) and SHALL NOT rely solely on unconstrained freeform model judgment as the only satisfaction proof for this contract. At minimum the following goal classes SHALL be expressible:
@@ -78,6 +85,12 @@ When the shared evaluation returns **advance**, the pipeline SHALL record an att
 
 - **WHEN** the shared evaluation returns **escalate**
 - **THEN** the pipeline SHALL NOT record an advance evidence note claiming goal satisfaction for that round
+
+#### Scenario: Advance is refused when durable evidence cannot be recorded
+
+- **WHEN** the shared evaluation returns **advance** but every durable evidence sink (trusted pipeline comment and/or structured event) fails
+- **THEN** the pipeline SHALL NOT clear a blocked label or complete a goal-satisfaction advance solely on that evaluation
+- **AND** recovery recipes and stage paths SHALL fail closed so the block remains until evidence can be persisted
 
 ### Requirement: Recovery re-entry SHALL reuse the same evaluation as the first deterministic no-commits recipe
 

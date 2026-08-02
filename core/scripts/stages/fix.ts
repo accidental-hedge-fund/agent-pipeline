@@ -898,6 +898,7 @@ export async function advanceFix(
         headBefore,
         headAfter,
         salvaged: false,
+        salvageFoundNothing: roundResult.ctx.salvageFoundNothing,
         stage,
         issueNumber,
         goalCheck: () => externalGoal,
@@ -1009,6 +1010,7 @@ export async function advanceFix(
           headBefore,
           headAfter,
           salvaged: false,
+          salvageFoundNothing: roundResult.ctx.salvageFoundNothing,
           stage,
           issueNumber,
           goalCheck: () =>

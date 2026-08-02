@@ -834,18 +834,22 @@ export async function runPlanningPhases(
       salvage: doTrySalvage,
     },
     // #758 / #588: shared harness-round clean no-new-commit hook → noop-advance.
+    // Invoked only when salvageFoundNothing is already confirmed by harness-round.
     onCleanNoNewCommit: async ({ headBefore, headAfter }) => {
       const activeChanges = doListChangeDirs(wt.path);
       return evaluatePostHarnessNoNewCommit({
         headBefore,
         headAfter,
         salvaged: false,
+        salvageFoundNothing: true,
         stage: "implementing",
         issueNumber,
         goalCheck: () =>
           implementDeliverablePresentGoalCheck({
             deliverablePresent: activeChanges.length > 0,
             worktreeClean: true,
+            // Gates run in post-implement steps after this advance; do not
+            // pre-certify them here. Fail closed if the path cannot run gates.
             gatesGreen: true,
             deliverableDescription:
               activeChanges.length > 0
@@ -896,29 +900,31 @@ export async function runPlanningPhases(
       const ahead = await doHasCommitsAhead(wt.path, cfg.base_branch);
       const cleanNoNewImplement =
         Boolean(implHeadBefore) &&
+        Boolean(ctx.headAfter) &&
         ctx.confirmedNoNewCommit &&
-        !ctx.salvaged;
+        !ctx.salvaged &&
+        ctx.salvageFoundNothing;
 
       type NoopEval = Awaited<ReturnType<typeof evaluatePostHarnessNoNewCommit>>;
       let noopResult: NoopEval | null =
         (ctx.cleanNoNewCommitHookResult as NoopEval | undefined) ?? null;
 
-      // Re-evaluate when the hook did not run (e.g. salvage path) but the branch
-      // has no commits ahead — same shared contract, not a private skeleton.
-      if (!noopResult && (cleanNoNewImplement || !ahead)) {
+      // Re-evaluate only on a confirmed clean no-new-commit (real HEADs +
+      // salvageFoundNothing). Never synthesize "unknown" heads or relax
+      // cleanliness because a change directory exists (#758 R1 finding 2).
+      if (!noopResult && cleanNoNewImplement) {
         const activeChanges = doListChangeDirs(wt.path);
-        const worktreeClean =
-          ctx.salvageFoundNothing || (!ctx.salvaged && !ctx.salvageFailureReason);
         noopResult = await evaluatePostHarnessNoNewCommit({
-          headBefore: implHeadBefore || ctx.headAfter || "unknown",
-          headAfter: ctx.headAfter || implHeadBefore || "unknown",
-          salvaged: ctx.salvaged,
+          headBefore: implHeadBefore,
+          headAfter: ctx.headAfter,
+          salvaged: false,
+          salvageFoundNothing: true,
           stage: "implementing",
           issueNumber,
           goalCheck: () =>
             implementDeliverablePresentGoalCheck({
               deliverablePresent: activeChanges.length > 0,
-              worktreeClean: worktreeClean || activeChanges.length > 0,
+              worktreeClean: true,
               gatesGreen: true,
               deliverableDescription:
                 activeChanges.length > 0
@@ -930,16 +936,35 @@ export async function runPlanningPhases(
 
       let deliverableAdvance = false;
       if (noopResult?.decision === "advance") {
-        deliverableAdvance = true;
-        console.log(
-          `[pipeline] #${issueNumber}: implement goal already satisfied at HEAD ` +
-            `(${noopResult.evidence.rationaleClass}) — advancing without empty implementer commit`,
-        );
-        await doPostComment(
-          cfg,
-          issueNumber,
-          formatNoopAdvanceEvidenceNote(noopResult.evidence),
-        ).catch(() => {});
+        // Attested evidence is required before treating the goal as satisfied
+        // (#758 R1 finding 3). If the durable sink fails, preserve the block.
+        try {
+          await doPostComment(
+            cfg,
+            issueNumber,
+            formatNoopAdvanceEvidenceNote(noopResult.evidence),
+          );
+          deliverableAdvance = true;
+          console.log(
+            `[pipeline] #${issueNumber}: implement goal already satisfied at HEAD ` +
+              `(${noopResult.evidence.rationaleClass}) — advancing without empty implementer commit`,
+          );
+        } catch (err) {
+          const evidenceFailReason =
+            `Implementation goal was already satisfied at HEAD but durable ` +
+            `noop-advance evidence could not be recorded: ${
+              err instanceof Error ? err.message : String(err)
+            }`;
+          await doSetBlocked(
+            cfg,
+            issueNumber,
+            evidenceFailReason,
+            "implementing",
+            "no-commits",
+          );
+          await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+          return blockedOutcome("noop-advance evidence not durable", "no-commits");
+        }
       } else if (!ahead) {
         const noCommitsReason = ctx.salvageFailureReason
           ? `Implementation harness (${primary}) completed but produced no commits. ` +

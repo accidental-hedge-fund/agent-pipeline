@@ -47,6 +47,8 @@ export async function evaluatePreMergeNoopCleanDisposition(opts: {
     headBefore: opts.headSha,
     headAfter: opts.headSha,
     salvaged: false,
+    // Caller already confirmed noop-clean (HEAD unchanged + clean salvage).
+    salvageFoundNothing: true,
     stage: "pre-merge",
     issueNumber: opts.issueNumber,
     goalCheck: () =>

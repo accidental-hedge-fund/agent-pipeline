@@ -88,6 +88,13 @@ export interface EvaluatePostHarnessNoNewCommitInput {
    * not-applicable to clean-noop goal advance.
    */
   salvaged: boolean;
+  /**
+   * True when salvage ran (or recovery/pre-merge confirmed a clean tree with
+   * nothing to salvage) and found nothing — i.e. a confirmed clean / no-salvage
+   * round. Required for clean-noop goal advance; false/omitted → not-applicable
+   * so callers cannot evaluate after salvage was skipped or failed (#758 R1).
+   */
+  salvageFoundNothing: boolean;
   /** Stage identity for evidence (e.g. "fix-1", "implementing", "pre-merge"). */
   stage: string;
   issueNumber?: number;
@@ -162,25 +169,50 @@ function isCleanNoNewCommit(
   headBefore: string,
   headAfter: string,
   salvaged: boolean,
+  salvageFoundNothing: boolean,
 ): boolean {
-  return Boolean(headBefore && headAfter && headBefore === headAfter && !salvaged);
+  return Boolean(
+    headBefore &&
+      headAfter &&
+      headBefore === headAfter &&
+      !salvaged &&
+      salvageFoundNothing,
+  );
 }
 
 /**
  * Post-harness (or post-round) evaluation: only runs the stage goal check when
- * the round is a confirmed clean no-new-commit (HEAD unchanged and salvage did
- * not create a commit). Non-empty commit ranges and successful salvage return
- * not-applicable so the stage continues its existing commit-gate path.
+ * the round is a confirmed clean no-new-commit (HEAD unchanged, salvage did not
+ * create a commit, and salvageFoundNothing confirms a clean/no-salvage round).
+ * Non-empty commit ranges, successful salvage, and unconfirmed clean status
+ * return not-applicable so the stage continues its existing path.
  */
 export async function evaluatePostHarnessNoNewCommit(
   input: EvaluatePostHarnessNoNewCommitInput,
 ): Promise<NoopAdvanceResult> {
-  const { headBefore, headAfter, salvaged, stage, issueNumber, goalCheck, now } = input;
+  const {
+    headBefore,
+    headAfter,
+    salvaged,
+    salvageFoundNothing,
+    stage,
+    issueNumber,
+    goalCheck,
+    now,
+  } = input;
 
   if (salvaged) {
     return {
       decision: "not-applicable",
       reason: "salvage created a commit — follow post-salvage verification path",
+    };
+  }
+
+  if (!salvageFoundNothing) {
+    return {
+      decision: "not-applicable",
+      reason:
+        "clean/no-salvage status not confirmed — salvage was skipped, failed, or worktree not proven clean",
     };
   }
 
@@ -198,7 +230,7 @@ export async function evaluatePostHarnessNoNewCommit(
     };
   }
 
-  if (!isCleanNoNewCommit(headBefore, headAfter, salvaged)) {
+  if (!isCleanNoNewCommit(headBefore, headAfter, salvaged, salvageFoundNothing)) {
     return {
       decision: "not-applicable",
       reason: "not a clean no-new-commit path",

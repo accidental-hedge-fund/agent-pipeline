@@ -112,6 +112,7 @@ test("#714 via shared path: empty active set is archive-coherent advance", async
     headBefore: "h",
     headAfter: "h",
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "pre-merge",
     goalCheck: () => preMergeArchiveCoherentGoalCheck({ activeIds: [] }),
   });
@@ -123,6 +124,7 @@ test("#714 via shared path: residual active ids escalate (fail closed)", async (
     headBefore: "h",
     headAfter: "h",
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "pre-merge",
     goalCheck: () => preMergeArchiveCoherentGoalCheck({ activeIds: ["still-active"] }),
   });
@@ -168,6 +170,7 @@ test("fix override-empty / external / DNR map through shared evaluation", async 
     headBefore: SHA,
     headAfter: SHA,
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "fix-1",
     goalCheck: () =>
       fixExternalCommitGoalCheck({
@@ -182,6 +185,7 @@ test("fix override-empty / external / DNR map through shared evaluation", async 
     headBefore: SHA,
     headAfter: SHA,
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "fix-1",
     goalCheck: () =>
       fixDoesNotReproduceGoalCheck({
@@ -204,6 +208,7 @@ test("#588 re-entry: implement-deliverable-present advances without empty commit
     headBefore: SHA,
     headAfter: SHA,
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "implementing",
     issueNumber: 588,
     goalCheck: () =>
@@ -225,6 +230,7 @@ test("#588 bite: missing deliverable does not advance", async () => {
     headBefore: SHA,
     headAfter: SHA,
     salvaged: false,
+    salvageFoundNothing: true,
     stage: "implementing",
     goalCheck: () =>
       implementDeliverablePresentGoalCheck({
@@ -293,6 +299,7 @@ test("#787: verify_head_goal advances no-commits without repair_pipeline_item", 
     },
     getOnDiskForIssue: async () => ({ path: "/wt", branch: "pipeline/1", slug: "s" } as any),
     gitHead: async () => SHA,
+    isWorktreeClean: async () => true,
     listChangeDirs: () => ["generalized-noop-advance-contract"],
   });
   const diagnostic = buildStageDiagnostic({
@@ -333,6 +340,7 @@ test("#787: verify_head_goal escalates when deliverable absent (next recipe may 
     },
     getOnDiskForIssue: async () => ({ path: "/wt", branch: "pipeline/1", slug: "s" } as any),
     gitHead: async () => SHA,
+    isWorktreeClean: async () => true,
     listChangeDirs: () => [],
   });
   const diagnostic = buildStageDiagnostic({
@@ -353,4 +361,105 @@ test("#787: verify_head_goal escalates when deliverable absent (next recipe may 
   assert.equal(result.succeeded, false);
   assert.equal(repairs, 0);
   assert.match(result.error ?? "", /does not satisfy|not satisfied|absent|implement goal/i);
+});
+
+test("#758 R1: verify_head_goal fails closed on dirty worktree (no clear)", async () => {
+  let clears = 0;
+  let posts = 0;
+  const cfg: PipelineConfig = {
+    ...DEFAULT_CONFIG,
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    base_branch: "main",
+  };
+  const execute = realExecuteRecovery(cfg, {
+    clearBlocked: async () => {
+      clears++;
+    },
+    postComment: async () => {
+      posts++;
+    },
+    getOnDiskForIssue: async () => ({ path: "/wt", branch: "pipeline/1", slug: "s" } as any),
+    gitHead: async () => SHA,
+    isWorktreeClean: async () => false,
+    listChangeDirs: () => ["generalized-noop-advance-contract"],
+  });
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "no-commits",
+    reason: "no commits",
+    stage: "implementing",
+  });
+  const result = await execute({
+    runId: "loop-1",
+    itemId: "42",
+    blockerClass: "implementation-ci",
+    attemptId: "a1",
+    candidateIdentity: `repo=owner/repo|head=${SHA}|attempt=0`,
+    action: "verify_head_goal",
+    diagnostic,
+    evidence: { pr_number: 1, pipeline_run_id: "run-1", candidate_identity: "x" },
+  });
+  assert.equal(result.succeeded, false);
+  assert.equal(clears, 0, "must not clear blocked when worktree is dirty");
+  assert.equal(posts, 0, "must not claim goal-satisfied evidence on dirty tree");
+  assert.match(result.error ?? "", /worktree not clean/i);
+});
+
+test("#758 R1: verify_head_goal fails closed when durable evidence cannot be recorded", async () => {
+  let clears = 0;
+  const cfg: PipelineConfig = {
+    ...DEFAULT_CONFIG,
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    base_branch: "main",
+  };
+  const execute = realExecuteRecovery(cfg, {
+    clearBlocked: async () => {
+      clears++;
+    },
+    postComment: async () => {
+      throw new Error("gh api 502");
+    },
+    getOnDiskForIssue: async () => ({ path: "/wt", branch: "pipeline/1", slug: "s" } as any),
+    gitHead: async () => SHA,
+    isWorktreeClean: async () => true,
+    listChangeDirs: () => ["generalized-noop-advance-contract"],
+  });
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "no-commits",
+    reason: "no commits",
+    stage: "implementing",
+  });
+  const result = await execute({
+    runId: "loop-1",
+    itemId: "42",
+    blockerClass: "implementation-ci",
+    attemptId: "a1",
+    candidateIdentity: `repo=owner/repo|head=${SHA}|attempt=0`,
+    action: "verify_head_goal",
+    diagnostic,
+    evidence: { pr_number: 1, pipeline_run_id: "run-1", candidate_identity: "x" },
+  });
+  assert.equal(result.succeeded, false);
+  assert.equal(clears, 0, "must preserve block when evidence sink fails");
+  assert.match(result.error ?? "", /durable evidence could not be recorded/i);
+});
+
+test("#758 R1: planning implement path does not synthesize unknown HEAD or relax cleanliness", async () => {
+  const src = await readFile(
+    fileURLToPath(new URL("../scripts/stages/planning.ts", import.meta.url)),
+    "utf8",
+  );
+  assert.doesNotMatch(
+    src,
+    /headBefore:\s*implHeadBefore\s*\|\|\s*ctx\.headAfter\s*\|\|\s*"unknown"/,
+    "must not synthesize unknown headBefore for noop evaluation",
+  );
+  assert.doesNotMatch(
+    src,
+    /worktreeClean:\s*worktreeClean\s*\|\|\s*activeChanges\.length\s*>\s*0/,
+    "must not treat change-dir presence as worktree cleanliness",
+  );
+  assert.match(src, /salvageFoundNothing:\s*true/);
+  assert.match(src, /durable evidence could not be recorded|noop-advance evidence not durable/);
 });
