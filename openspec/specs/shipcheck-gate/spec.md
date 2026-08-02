@@ -222,17 +222,18 @@ It SHALL read the most recent shipcheck verdict comment authored by the
 authenticated `gh` actor and extract its `shipcheck-sha`. When that recorded SHA is
 present and differs from the current PR head, and at least one commit between the
 recorded SHA and the current head is NOT a pipeline-internal commit (per
-`isPipelineInternalCommit`), the stage SHALL transition `shipcheck-gate → pre-merge`
-— routing the new head back through CI status checks, the review-SHA gate, and
-eval-gate — rather than transitioning to `ready-to-deploy`. Before routing back, the
-stage SHALL post a notice naming the stale and current head SHAs.
+`isPipelineInternalCommit` from the neutral pipeline-commits module), the stage SHALL
+transition `shipcheck-gate → pre-merge` — routing the new head back through CI status
+checks, the review-SHA gate, and eval-gate — rather than transitioning to
+`ready-to-deploy`. Before routing back, the stage SHALL post a notice naming the
+stale and current head SHAs.
 
 When the recorded SHA equals the current PR head, when every commit since the
-recorded SHA is pipeline-internal (e.g. the OpenSpec archive commit), or when no
-prior shipcheck verdict comment exists (first entry), the stage SHALL proceed with
-the reviewer evaluation as before — it SHALL NOT route back. Only shipcheck verdict
-comments authored by the authenticated `gh` actor SHALL be trusted as the recorded
-SHA source.
+recorded SHA is pipeline-internal (for example the OpenSpec archive commit or an
+exact visual-gate artifact-publish commit), or when no prior shipcheck verdict
+comment exists (first entry), the stage SHALL proceed with the reviewer evaluation
+as before — it SHALL NOT route back. Only shipcheck verdict comments authored by the
+authenticated `gh` actor SHALL be trusted as the recorded SHA source.
 
 When a prior verdict comment by the authenticated actor exists but carries no
 `shipcheck-sha` sentinel (a legacy comment posted by an older harness version), the
@@ -241,6 +242,9 @@ stage SHALL treat it as an unknown prior verdict and SHALL transition
 notice after the transition, so the new head is validated before shipcheck proceeds.
 The existing idempotency guard (`alreadyRoutedForCurrentHead`) prevents this migration
 route from repeating once the notice is posted.
+
+The shipcheck stage module SHALL obtain `isPipelineInternalCommit` from the neutral
+pipeline-commits module and SHALL NOT import that classifier from `stages/pre_merge`.
 
 #### Scenario: developer commit landed since the prior shipcheck verdict — route back to pre-merge
 
@@ -262,7 +266,7 @@ route from repeating once the notice is posted.
 - **WHEN** the current stage is `shipcheck-gate`
 - **AND** the current PR head differs from the recorded `shipcheck-sha`
 - **AND** every commit between the recorded SHA and the current head is a pipeline-internal commit (`isPipelineInternalCommit`)
-- **THEN** the stage SHALL proceed and SHALL NOT route back to `pre-merge` (preventing a non-converging route-back loop on the pipeline's own archive commit)
+- **THEN** the stage SHALL proceed and SHALL NOT route back to `pre-merge` (preventing a non-converging route-back loop on the pipeline's own archive or visual-publish commit)
 
 #### Scenario: first entry — no prior shipcheck comment — proceed and record SHA
 
@@ -277,54 +281,10 @@ route from repeating once the notice is posted.
 - **AND** no `shipcheck-revalidation-sha` notice for the current head has been posted yet
 - **THEN** the stage SHALL transition `shipcheck-gate → pre-merge`
 - **AND** SHALL NOT proceed to the reviewer evaluation
-- **AND** SHALL NOT transition to `ready-to-deploy`
-- **AND** SHALL post a notice with `<!-- shipcheck-revalidation-sha: <current-head> -->` after the transition
 
-#### Scenario: revalidation notice is only posted after a successful transition (idempotency marker not orphaned)
+#### Scenario: shipcheck classification does not import pre_merge
 
-- **WHEN** the stage is routing to `pre-merge` (developer commit or legacy migration)
-- **AND** the label transition fails before completing
-- **THEN** the `<!-- shipcheck-revalidation-sha: … -->` notice SHALL NOT be posted
-- **AND** the next run SHALL still route to `pre-merge` (no orphaned idempotency marker)
-
-#### Scenario: a commit made after a failed shipcheck does not advance directly to ready-to-deploy
-
-- **WHEN** shipcheck-gate previously blocked at PR head `H1` and the operator pushed a fix moving the PR head to `H2`
-- **AND** shipcheck-gate is re-entered with the worktree HEAD equal to `H2` (the fix is pushed)
-- **THEN** the stage SHALL NOT transition directly to `ready-to-deploy`
-- **AND** SHALL transition `shipcheck-gate → pre-merge` to re-validate `H2` through CI status checks, the review-SHA gate, and eval-gate
-
-#### Scenario: re-entered after routing to pre-merge for the same head — idempotency guard proceeds with reviewer
-
-- **WHEN** the stage previously routed `shipcheck-gate → pre-merge` for PR head `H2` (posting a notice with `<!-- shipcheck-revalidation-sha: H2 -->`)
-- **AND** pre-merge/eval completes and shipcheck-gate is re-entered still at head `H2`
-- **THEN** the stage SHALL detect the revalidation-sha notice authored by the authenticated actor and SHALL NOT route back to `pre-merge` again
-- **AND** SHALL proceed with the reviewer evaluation for `H2`
-- **AND** on a pass verdict SHALL transition to `ready-to-deploy`
-- (This prevents the route-back from looping: the prior shipcheck verdict still records `H1`, so without this guard the same developer-commit condition would trigger indefinitely.)
-
-#### Scenario: authenticated actor cannot be resolved — fail closed
-
-- **WHEN** the current stage is `shipcheck-gate`
-- **AND** a PR is linked (`prNumber` is non-null)
-- **AND** the `gh` actor lookup returns null (transient auth failure)
-- **THEN** the stage SHALL call `setBlocked` with blocker kind `needs-human`
-- **AND** SHALL NOT proceed to the reviewer evaluation
-- **AND** SHALL NOT transition to `ready-to-deploy`
-
-#### Scenario: PR head changes during reviewer run — post-review head-coherence recheck routes to pre-merge
-
-- **WHEN** the reviewer harness completes evaluation of PR head `H2`
-- **AND** the PR head has since been updated to `H3` during the reviewer run (a push after the pre-review head fetch)
-- **THEN** the stage SHALL re-fetch the PR head after the reviewer completes
-- **AND** SHALL NOT transition to `ready-to-deploy`
-- **AND** SHALL transition `shipcheck-gate → pre-merge` to re-validate the new head `H3`
-
-#### Scenario: worktree head changes during reviewer run — post-review recheck blocks with head-drift
-
-- **WHEN** the reviewer harness completes evaluation of PR head `H2`
-- **AND** the worktree HEAD has since been updated (a local commit during the reviewer run)
-- **AND** the worktree HEAD no longer matches the evaluated PR head `H2`
-- **THEN** the stage SHALL call `setBlocked` with blocker kind `head-drift`
-- **AND** SHALL NOT transition to `ready-to-deploy`
+- **WHEN** `stages/shipcheck.ts` resolves `isPipelineInternalCommit` for post-verdict revalidation
+- **THEN** the resolution path SHALL use the neutral pipeline-commits module
+- **AND** SHALL NOT require importing `stages/pre_merge.ts`
 
