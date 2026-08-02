@@ -344,6 +344,9 @@ test("auto-tag-release workflow has FRG verification step ordered before tag cre
   const frgScript = extractStepScript("Verify Factory Reliability Gate evidence");
   assert.match(frgScript, /factory-reliability-gate\.ts/);
   assert.match(frgScript, /--validate-tag/);
+  // HMAC attestation secret required (cca5f0f7 — reject hand-authored evidence)
+  assert.match(frgScript, /PIPELINE_FRG_ATTESTATION_KEY/);
+  assert.match(workflowSrc, /secrets\.PIPELINE_FRG_ATTESTATION_KEY/);
 });
 
 test("auto-tag-release FRG step fails closed when evidence missing (script exit non-zero)", () => {
@@ -351,7 +354,8 @@ test("auto-tag-release FRG step fails closed when evidence missing (script exit 
   const workflowSrc = readFileSync(WORKFLOW_PATH, "utf-8");
   const startIdx = workflowSrc.indexOf("- name: Verify Factory Reliability Gate evidence");
   assert.notEqual(startIdx, -1);
-  const slice = workflowSrc.slice(startIdx, startIdx + 800);
+  const slice = workflowSrc.slice(startIdx, startIdx + 1200);
   assert.equal(/continue-on-error:\s*true/.test(slice), false);
   assert.match(slice, /--validate-tag/);
+  assert.match(slice, /PIPELINE_FRG_ATTESTATION_KEY/);
 });

@@ -14,6 +14,7 @@
 - [x] 2.4 Project composition from ledger where possible; accept schema-validated observation file for the rest
 - [x] 2.5 Integrity fingerprints recomputed on validate; minimal forged `pass: true` fails
 - [x] 2.6 Unit tests: forged/incomplete pass; wrong-version; missing provenance; malformed JSON; clean-only; each missing composition dimension; false human_authority
+- [x] 2.7 HMAC attestation (`PIPELINE_FRG_ATTESTATION_KEY` / `integrity.attestation`) required for release-eligible mint and verified on auto-tag; hand-authored self-consistent JSON without the producer secret fails (review 1 / cca5f0f7)
 
 ## 3. Recovery aggregates + #787 controller exercise
 

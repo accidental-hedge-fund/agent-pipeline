@@ -150,7 +150,8 @@ classified === 0.
 ### Decision 4 — Evidence provenance / anti-bypass integrity
 
 Goal: a hand-authored stub `{ "pass": true, "run_id": "x", … }` must **not** parse as
-release-eligible.
+release-eligible, and a full-schema self-consistent document without the producer secret
+must **not** pass auto-tag validation.
 
 **Integrity bar (this change):**
 
@@ -164,14 +165,21 @@ release-eligible.
    - `scoreboard_fingerprint`: stable hash of canonical `per_item` + counts + rate
    - `composition_fingerprint`: stable hash of composition dimensions
    - Validator recomputes fingerprints; mismatch → unparsable / not release-eligible
-5. Auto-tag and `lookupFrgPass` use the same validator.
+5. **`integrity.attestation`** — HMAC-SHA256 (`hmac-sha256-v1`) over a canonical payload
+   binding `version`, `run_id`, `loop_run_id`, `pack_id`, and both fingerprints. Minted only
+   when `PIPELINE_FRG_ATTESTATION_KEY` is set; required for release-eligible `pass: true`.
+   Auto-tag `validateReleaseEligibleFrgEvidence` / `--validate-tag` **always verifies** the
+   MAC with the same repo secret (missing key or bad MAC → fail closed, no tag).
+6. Auto-tag and the shared release-eligibility validator use the same checks (including MAC).
 
-**Residual risk (accepted):** a determined operator can craft a full valid document by hand.
-Mitigation is operational (evidence produced by `pipeline factory-gate` from a real loop) plus
-semantic hardness. Cryptographic signing is out of scope.
+**Residual risk:** anyone who holds `PIPELINE_FRG_ATTESTATION_KEY` can still mint or re-sign
+evidence without running a pack (same class as other release secrets such as
+`RELEASE_TAG_TOKEN`). Mitigation is secret hygiene + operational procedure (mint via
+`pipeline factory-gate` from a real loop). Public fingerprint-only forgery is **not**
+accepted on the tag path.
 
-**Rejected:** Trust release PR body FRG markdown alone; optional skip secret; re-running live
-FRG inside Actions.
+**Rejected:** Trust release PR body FRG markdown alone; optional skip of the attestation
+secret; re-running live FRG inside Actions.
 
 ### Decision 5 — Representative composition (machine-readable)
 
@@ -356,7 +364,8 @@ must not run** without FRG pass — prefer FRG check immediately after exists=fa
 |------|------------|
 | Representative pack is slower every release | Fixed pack still dedicated; composition is minimum dimensions; K stays 2 |
 | Evidence must be committed for auto-tag | Not gitignored; runbook + release procedure require commit of `latest.json`; fail closed is correct |
-| Full-schema hand-forge still possible | Integrity fingerprints + composition + scoreboard math; signing out of scope |
+| Full-schema hand-forge without secret | Rejected on tag path by HMAC attestation (`PIPELINE_FRG_ATTESTATION_KEY`) |
+| Operator with attestation key forges | Same trust class as release-tag token holders; procedure + secret hygiene |
 | Observation CLI gamed with fake passes | Numeric re-validation; prefer ledger-derived composition where possible; missing dims fail |
 | Ledger I/O failure | Fail-soft after primary write; rebuild documented |
 | Both waivers closed | Enumerated; both refreshed this change |

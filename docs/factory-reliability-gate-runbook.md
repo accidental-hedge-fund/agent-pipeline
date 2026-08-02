@@ -149,12 +149,22 @@ Machine-readable JSON (`schema_version: 1`), additive fields for #757:
 | `loop_run_id` | string \| null | Durable loop run id; **required non-empty for release-eligible `pass: true`** |
 | `pack_id` | string \| null | Fixed pack identity (must be `factory-gate-v1` for release-eligible pass) |
 | `composition` | object | `dimensions[]`, `false_human_authority_count`, `missing[]` |
-| `integrity` | object | `producer`, `scoreboard_fingerprint`, `composition_fingerprint` |
+| `integrity` | object | `producer`, `scoreboard_fingerprint`, `composition_fingerprint`, `attestation?` |
 | `recovery_aggregates` | object? | optional `by_reason` map |
 | `created_at` | string | ISO-8601 |
 | `notes` | string[] | Pack selection / warnings |
 
 Integrity fingerprints are recomputed on parse; a minimal forged `{ "pass": true }` fails.
+
+**Producer attestation (required for release-eligible pass / auto-tag):**
+
+- Env / secret: `PIPELINE_FRG_ATTESTATION_KEY` (same value as repo Actions secret used by
+  `auto-tag-release.yml`).
+- Mint: export the key before `pipeline factory-gate …` so `integrity.attestation` is written
+  (`alg: hmac-sha256-v1`, hex MAC over version/run_id/loop_run_id/pack_id + fingerprints).
+- Without the key, the driver will **not** mint release-eligible `pass: true`.
+- Auto-tag verifies the MAC with the secret; self-consistent hand-authored JSON that only
+  recomputes public fingerprints is **rejected** (fail closed, no tag).
 
 ### Evidence paths (stable)
 
@@ -189,6 +199,7 @@ Ledger I/O failure after primary write is **fail-soft**: reported on stderr; evi
 ### Score an existing durable loop run (recommended after a pack loop finishes)
 
 ```bash
+export PIPELINE_FRG_ATTESTATION_KEY='…'   # same value as the repo Actions secret
 pipeline factory-gate --for 1.30.0 --from-run <loop-run-id> \
   --observations path/to/observations.json \
   [--scenario id=status:detail[:observed=N]] \

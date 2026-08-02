@@ -217,10 +217,35 @@ export interface FrgComposition {
   missing: string[];
 }
 
+/** Env var for the HMAC key used to attest release-eligible FRG evidence (#757). */
+export const FRG_ATTESTATION_KEY_ENV = "PIPELINE_FRG_ATTESTATION_KEY";
+
+/** Attestation algorithm id written into evidence.integrity.attestation. */
+export const FRG_ATTESTATION_ALG = "hmac-sha256-v1" as const;
+
+/**
+ * Unit-test-only attestation key. Never a production secret; production mint
+ * and tag validation require {@link FRG_ATTESTATION_KEY_ENV}.
+ */
+export const FRG_UNIT_TEST_ATTESTATION_KEY =
+  "unit-test-frg-attestation-key-not-for-production";
+
+export interface FrgAttestation {
+  alg: typeof FRG_ATTESTATION_ALG;
+  /** Hex-encoded HMAC-SHA256 over the canonical attestation payload. */
+  mac: string;
+}
+
 export interface FrgIntegrity {
   producer: "pipeline-factory-gate";
   scoreboard_fingerprint: string;
   composition_fingerprint: string;
+  /**
+   * HMAC attestation binding evidence to a producer that holds
+   * {@link FRG_ATTESTATION_KEY_ENV}. Required for release-eligible `pass: true`
+   * and verified (not merely present) on the auto-tag path.
+   */
+  attestation?: FrgAttestation;
 }
 
 export interface FrgRecoveryReasonAggregate {
@@ -402,6 +427,148 @@ export function buildFrgIntegrity(
     scoreboard_fingerprint: computeScoreboardFingerprint(scoreboard),
     composition_fingerprint: computeCompositionFingerprint(composition),
   };
+}
+
+/** Resolve the FRG attestation key from an env map (injectable for tests). */
+export function resolveFrgAttestationKey(
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const raw = env[FRG_ATTESTATION_KEY_ENV];
+  if (typeof raw !== "string") return null;
+  const key = raw.trim();
+  return key === "" ? null : key;
+}
+
+/**
+ * Canonical fields covered by the HMAC. Self-consistent scoreboard/composition
+ * fingerprints alone are forgeable; the MAC requires the producer secret.
+ */
+export function buildFrgAttestationPayload(input: {
+  version: string;
+  run_id: string;
+  loop_run_id: string;
+  pack_id: string;
+  scoreboard_fingerprint: string;
+  composition_fingerprint: string;
+}): Record<string, string> {
+  return {
+    producer: "pipeline-factory-gate",
+    alg: FRG_ATTESTATION_ALG,
+    version: input.version,
+    run_id: input.run_id,
+    loop_run_id: input.loop_run_id,
+    pack_id: input.pack_id,
+    scoreboard_fingerprint: input.scoreboard_fingerprint,
+    composition_fingerprint: input.composition_fingerprint,
+  };
+}
+
+/** Deterministic JSON bytes for HMAC (sorted object keys, same as fingerprints). */
+function frgCanonicalJson(value: unknown): string {
+  const canonical = (v: unknown): unknown => {
+    if (v === null || typeof v !== "object") return v;
+    if (Array.isArray(v)) return v.map(canonical);
+    const o = v as Record<string, unknown>;
+    const keys = Object.keys(o).sort();
+    const out: Record<string, unknown> = {};
+    for (const k of keys) out[k] = canonical(o[k]);
+    return out;
+  };
+  return JSON.stringify(canonical(value));
+}
+
+export function computeFrgAttestationMac(
+  payload: Record<string, string>,
+  key: string,
+): string {
+  return crypto
+    .createHmac("sha256", key)
+    .update(frgCanonicalJson(payload), "utf8")
+    .digest("hex");
+}
+
+export function signFrgIntegrity(input: {
+  integrity: FrgIntegrity;
+  version: string;
+  run_id: string;
+  loop_run_id: string;
+  pack_id: string;
+  attestationKey: string;
+}): FrgIntegrity {
+  const payload = buildFrgAttestationPayload({
+    version: input.version,
+    run_id: input.run_id,
+    loop_run_id: input.loop_run_id,
+    pack_id: input.pack_id,
+    scoreboard_fingerprint: input.integrity.scoreboard_fingerprint,
+    composition_fingerprint: input.integrity.composition_fingerprint,
+  });
+  return {
+    ...input.integrity,
+    attestation: {
+      alg: FRG_ATTESTATION_ALG,
+      mac: computeFrgAttestationMac(payload, input.attestationKey),
+    },
+  };
+}
+
+function timingSafeEqualHex(a: string, b: string): boolean {
+  try {
+    const ba = Buffer.from(a, "hex");
+    const bb = Buffer.from(b, "hex");
+    if (ba.length === 0 || ba.length !== bb.length) return false;
+    return crypto.timingSafeEqual(ba, bb);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verify integrity.attestation against the attestation key.
+ * Returns true only when alg/mac are present and the MAC matches.
+ */
+export function verifyFrgAttestation(
+  evidence: {
+    version: string;
+    run_id: string;
+    loop_run_id: string | null;
+    pack_id: string | null;
+    integrity: FrgIntegrity;
+  },
+  attestationKey: string,
+): boolean {
+  const att = evidence.integrity.attestation;
+  if (!att || att.alg !== FRG_ATTESTATION_ALG) return false;
+  if (typeof att.mac !== "string" || !/^[0-9a-f]{64}$/.test(att.mac)) return false;
+  if (
+    typeof evidence.loop_run_id !== "string" ||
+    evidence.loop_run_id.trim() === "" ||
+    typeof evidence.pack_id !== "string" ||
+    evidence.pack_id.trim() === "" ||
+    evidence.run_id.trim() === ""
+  ) {
+    return false;
+  }
+  const payload = buildFrgAttestationPayload({
+    version: evidence.version,
+    run_id: evidence.run_id,
+    loop_run_id: evidence.loop_run_id,
+    pack_id: evidence.pack_id,
+    scoreboard_fingerprint: evidence.integrity.scoreboard_fingerprint,
+    composition_fingerprint: evidence.integrity.composition_fingerprint,
+  });
+  const expected = computeFrgAttestationMac(payload, attestationKey);
+  return timingSafeEqualHex(expected, att.mac);
+}
+
+export function frgAttestationPresent(integrity: FrgIntegrity | undefined): boolean {
+  if (!integrity?.attestation) return false;
+  const att = integrity.attestation;
+  return (
+    att.alg === FRG_ATTESTATION_ALG &&
+    typeof att.mac === "string" &&
+    /^[0-9a-f]{64}$/.test(att.mac)
+  );
 }
 
 /**
@@ -815,11 +982,31 @@ function parseFrgIntegrity(raw: unknown): FrgIntegrity {
   if (typeof i.composition_fingerprint !== "string" || i.composition_fingerprint.trim() === "") {
     throw new Error("FRG evidence.integrity.composition_fingerprint must be a non-empty string");
   }
-  return {
+  let attestation: FrgAttestation | undefined;
+  if (i.attestation !== undefined && i.attestation !== null) {
+    if (typeof i.attestation !== "object" || Array.isArray(i.attestation)) {
+      throw new Error("FRG evidence.integrity.attestation must be an object when present");
+    }
+    const a = i.attestation as Record<string, unknown>;
+    if (a.alg !== FRG_ATTESTATION_ALG) {
+      throw new Error(
+        `FRG evidence.integrity.attestation.alg must be "${FRG_ATTESTATION_ALG}" (got ${String(a.alg)})`,
+      );
+    }
+    if (typeof a.mac !== "string" || !/^[0-9a-f]{64}$/.test(a.mac.trim())) {
+      throw new Error(
+        "FRG evidence.integrity.attestation.mac must be a 64-char lowercase hex HMAC-SHA256",
+      );
+    }
+    attestation = { alg: FRG_ATTESTATION_ALG, mac: a.mac.trim() };
+  }
+  const integrity: FrgIntegrity = {
     producer: "pipeline-factory-gate",
     scoreboard_fingerprint: i.scoreboard_fingerprint.trim(),
     composition_fingerprint: i.composition_fingerprint.trim(),
   };
+  if (attestation) integrity.attestation = attestation;
+  return integrity;
 }
 
 function parseFrgRecoveryAggregates(raw: unknown): FrgRecoveryAggregates | undefined {
@@ -870,7 +1057,11 @@ export function frgScenariosPermitPass(scenarios: readonly FrgScenarioOutcome[])
 /**
  * Release-eligible pass requires scenario criteria + live durable loop provenance
  * (non-empty loop_run_id) + validated fixed-pack identity + scoreboard integrity +
- * representative composition + integrity fingerprints (#757).
+ * representative composition + integrity fingerprints + attestation presence (#757).
+ *
+ * Cryptographic verification of the attestation MAC is performed by
+ * {@link validateReleaseEligibleFrgEvidence} (auto-tag / release gate) with
+ * {@link FRG_ATTESTATION_KEY_ENV} — presence alone is not sufficient there.
  *
  * Accepts partial objects (pre-composition callers) but release-eligible true
  * requires full composition/scoreboard/integrity when those fields are present;
@@ -913,17 +1104,30 @@ export function isReleaseEligibleFrgPass(evidence: {
   if (evidence.integrity.scoreboard_fingerprint !== expectedSb) return false;
   if (evidence.integrity.composition_fingerprint !== expectedComp) return false;
   if (typeof evidence.run_id === "string" && evidence.run_id.trim() === "") return false;
+  // Attestation must be present for release-eligible pass (MAC verified on tag path).
+  if (!frgAttestationPresent(evidence.integrity)) return false;
   return true;
+}
+
+export interface FrgValidateOpts {
+  /**
+   * HMAC key for attestation verification. Defaults to
+   * {@link resolveFrgAttestationKey}(`process.env`). Required non-empty for
+   * release-eligibility validation (auto-tag fails closed when missing).
+   */
+  attestationKey?: string | null;
 }
 
 /**
  * Single strict release-eligibility validator for CLI, parse, lookup, and auto-tag.
  * Throws with a structured message when the raw payload is not release-eligible
- * for `expectedVersion`.
+ * for `expectedVersion`. Always verifies the HMAC attestation against the
+ * producer key so self-consistent hand-authored JSON without the secret fails.
  */
 export function validateReleaseEligibleFrgEvidence(
   raw: unknown,
   expectedVersion: string,
+  opts: FrgValidateOpts = {},
 ): FrgEvidence {
   const expected = normalizeFrgVersion(expectedVersion);
   let evidence: FrgEvidence;
@@ -951,6 +1155,26 @@ export function validateReleaseEligibleFrgEvidence(
         missing,
     );
   }
+  const key =
+    opts.attestationKey !== undefined
+      ? opts.attestationKey && opts.attestationKey.trim() !== ""
+        ? opts.attestationKey.trim()
+        : null
+      : resolveFrgAttestationKey();
+  if (!key) {
+    throw new Error(
+      `FRG release-eligibility validation failed for ${expected}: ` +
+        `${FRG_ATTESTATION_KEY_ENV} is required to verify integrity.attestation ` +
+        `(hand-authored self-consistent JSON is not release-eligible)`,
+    );
+  }
+  if (!verifyFrgAttestation(evidence, key)) {
+    throw new Error(
+      `FRG release-eligibility validation failed for ${expected}: ` +
+        `integrity.attestation MAC is missing or does not match ${FRG_ATTESTATION_KEY_ENV} ` +
+        `(forged or re-signed evidence rejected)`,
+    );
+  }
   return evidence;
 }
 
@@ -962,6 +1186,7 @@ export async function validateFrgEvidenceFileForTag(
   repoDir: string,
   version: string,
   deps: FrgFsDeps = defaultFsDeps,
+  opts: FrgValidateOpts = {},
 ): Promise<FrgEvidence> {
   const v = normalizeFrgVersion(version);
   const latestPath = frgLatestPath(repoDir, v);
@@ -980,7 +1205,7 @@ export async function validateFrgEvidenceFileForTag(
       `FRG evidence unreadable for version ${v} at ${latestPath}: ${(err as Error).message}`,
     );
   }
-  return validateReleaseEligibleFrgEvidence(text, v);
+  return validateReleaseEligibleFrgEvidence(text, v, opts);
 }
 
 /** capacity-blocked-retain pass requires observed blocked-retain count ≥ N. */
@@ -1184,7 +1409,8 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
         "(require observed non-fail scenarios including capacity observed≥N, " +
         `non-empty loop_run_id, pack_id=${FRG_PACK_MANIFEST.pack_id}, ` +
         "item_count≥1 with computable engine_class_rate, representative composition, " +
-        "false_human_authority_count=0, and valid integrity fingerprints;" +
+        "false_human_authority_count=0, valid integrity fingerprints, and " +
+        "integrity.attestation (HMAC via PIPELINE_FRG_ATTESTATION_KEY);" +
         `${missing} offline scoreInput reports are not release evidence)`,
     );
   }
@@ -1912,6 +2138,12 @@ export interface ComputeFrgInput {
   recovery_aggregates?: FrgRecoveryAggregates;
   notes?: string[];
   now?: () => Date;
+  /**
+   * HMAC key for integrity.attestation. When omitted, falls back to
+   * {@link resolveFrgAttestationKey}. Without a key, release-eligible
+   * `pass: true` cannot be minted (attestation required).
+   */
+  attestation_key?: string | null;
 }
 
 function isReadyState(state: string): boolean {
@@ -2044,9 +2276,33 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
     overrides: input.composition_overrides,
     false_human_authority_count: input.false_human_authority_count ?? 0,
   });
-  const integrity = buildFrgIntegrity(scoreboard, composition);
+  let integrity = buildFrgIntegrity(scoreboard, composition);
 
-  // Fail closed: scenarios + live loop + pack + composition + integrity (#757).
+  // Sign when a producer key is available (env or explicit). Without a key,
+  // attestation is omitted and release-eligible pass cannot be true (#757).
+  const attestationKey =
+    input.attestation_key !== undefined
+      ? input.attestation_key && input.attestation_key.trim() !== ""
+        ? input.attestation_key.trim()
+        : null
+      : resolveFrgAttestationKey();
+  if (
+    attestationKey &&
+    loopRunId &&
+    packId &&
+    runId.trim() !== ""
+  ) {
+    integrity = signFrgIntegrity({
+      integrity,
+      version,
+      run_id: runId,
+      loop_run_id: loopRunId,
+      pack_id: packId,
+      attestationKey,
+    });
+  }
+
+  // Fail closed: scenarios + live loop + pack + composition + integrity + attestation (#757).
   const pass = isReleaseEligibleFrgPass({
     pass: true,
     scenarios,
@@ -2074,6 +2330,11 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       ...(input.notes ?? []),
       ...(composition.missing.length > 0
         ? [`composition missing: ${composition.missing.join(", ")}`]
+        : []),
+      ...(!attestationKey
+        ? [
+            `release-eligible attestation omitted: set ${FRG_ATTESTATION_KEY_ENV} when minting evidence`,
+          ]
         : []),
     ],
     composition,
@@ -2397,6 +2658,11 @@ export interface FactoryGateOpts {
   recoveryAggregates?: FrgRecoveryAggregates;
   thresholds?: FrgThresholds;
   now?: () => Date;
+  /**
+   * HMAC key for release-eligible attestation. Defaults to env
+   * {@link FRG_ATTESTATION_KEY_ENV}. Injected in tests; production CLI uses env.
+   */
+  attestationKey?: string | null;
   stdout?: (msg: string) => void;
   stderr?: (msg: string) => void;
 }
@@ -2435,6 +2701,11 @@ export async function runFactoryGate(
   let packSelectorLabel =
     opts.packSelectorLabel ?? FRG_PACK_MANIFEST.allowed_label_selectors[0];
 
+  const resolvedAttestationKey =
+    opts.attestationKey !== undefined
+      ? opts.attestationKey
+      : resolveFrgAttestationKey();
+
   if (opts.scoreInput) {
     computeInput = {
       ...opts.scoreInput,
@@ -2448,6 +2719,10 @@ export async function runFactoryGate(
         opts.scoreInput.false_human_authority_count,
       recovery_aggregates:
         opts.recoveryAggregates ?? opts.scoreInput.recovery_aggregates,
+      attestation_key:
+        opts.scoreInput.attestation_key !== undefined
+          ? opts.scoreInput.attestation_key
+          : resolvedAttestationKey,
     };
   } else if (opts.fromRun) {
     if (!opts.loadLedger) {
@@ -2502,6 +2777,7 @@ export async function runFactoryGate(
       notes,
       thresholds: opts.thresholds,
       now: opts.now,
+      attestation_key: resolvedAttestationKey,
     };
   } else if (opts.startLoop) {
     // Refuse non-pack selectors before starting a durable loop.
@@ -2580,6 +2856,7 @@ export async function runFactoryGate(
       notes,
       thresholds: opts.thresholds,
       now: opts.now,
+      attestation_key: resolvedAttestationKey,
     };
   } else {
     throw new Error(

@@ -46,6 +46,7 @@ import {
   frgRequiredObservationOverrides,
   frgRequiredCompositionOverrides,
   FRG_PACK_MANIFEST,
+  FRG_UNIT_TEST_ATTESTATION_KEY,
 } from "../scripts/factory-reliability-gate.ts";
 
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
@@ -67,6 +68,7 @@ function defaultFrgPass(version = "1.6.0") {
     ],
     scenario_overrides: frgRequiredObservationOverrides("pass"),
     composition_overrides: frgRequiredCompositionOverrides("pass"),
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
     now: () => new Date("2026-07-30T00:00:00.000Z"),
   });
 }

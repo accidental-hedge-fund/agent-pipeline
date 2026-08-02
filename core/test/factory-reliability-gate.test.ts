@@ -45,6 +45,11 @@ import {
   packLabelFromSelector,
   selectReadyCleanPackIssueNumbers,
   closeFrgPackArtifacts,
+  FRG_UNIT_TEST_ATTESTATION_KEY,
+  FRG_ATTESTATION_KEY_ENV,
+  signFrgIntegrity,
+  verifyFrgAttestation,
+  buildFrgIntegrity,
   type FrgEvidence,
   type FrgFsDeps,
   type FrgPackCloseDeps,
@@ -59,6 +64,8 @@ function fullPackPassInput(
     run_id?: string;
     loop_run_id?: string | null;
     pack_id?: string | null;
+    /** When null, omit attestation (not release-eligible). Default: unit-test key. */
+    attestation_key?: string | null;
   } = {},
 ) {
   return {
@@ -75,6 +82,11 @@ function fullPackPassInput(
     ],
     scenario_overrides: frgRequiredObservationOverrides("pass"),
     composition_overrides: frgRequiredCompositionOverrides("pass"),
+    // Release-eligible pass requires HMAC attestation (#757 / cca5f0f7).
+    attestation_key:
+      overrides.attestation_key === undefined
+        ? FRG_UNIT_TEST_ATTESTATION_KEY
+        : overrides.attestation_key,
   };
 }
 
@@ -175,6 +187,7 @@ test("computeFrgEvidence: green unit-shaped pass with K clean ready items + full
     ],
     scenario_overrides: frgRequiredObservationOverrides("pass"),
     composition_overrides: frgRequiredCompositionOverrides("pass"),
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
     now: () => new Date("2026-07-30T12:00:00.000Z"),
   });
   assert.equal(evidence.schema_version, FRG_SCHEMA_VERSION);
@@ -188,6 +201,11 @@ test("computeFrgEvidence: green unit-shaped pass with K clean ready items + full
   assert.equal(evidence.scoreboard.engine_class_rate, 0);
   assert.equal(evidence.composition.missing.length, 0);
   assert.equal(evidence.integrity.producer, "pipeline-factory-gate");
+  assert.ok(evidence.integrity.attestation?.mac);
+  assert.equal(
+    verifyFrgAttestation(evidence, FRG_UNIT_TEST_ATTESTATION_KEY),
+    true,
+  );
   assert.equal(evidence.thresholds.min_clean_ready_to_deploy, DEFAULT_FRG_THRESHOLDS.min_clean_ready_to_deploy);
   const throughput = evidence.scenarios.find((s) => s.id === "clean-item-throughput");
   assert.equal(throughput?.status, "pass");
@@ -866,6 +884,7 @@ test("runFactoryGate --from-run: accepts factory-gate label pack and scores", as
       loadContract: async () => packContract,
       scenarioOverrides: frgRequiredObservationOverrides("pass"),
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
       stdout: () => {},
       stderr: () => {},
     },
@@ -1203,6 +1222,7 @@ test("runFactoryGate: release-eligible pass closes pack artifacts via injected d
       loadContract: async () => packContract,
       scenarioOverrides: frgRequiredObservationOverrides("pass"),
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
       packCloseDeps: deps,
       stdout: () => {},
       stderr: () => {},
@@ -1258,6 +1278,7 @@ test("runFactoryGate: pass:false does not close pack artifacts", async () => {
       loadContract: async () => packContract,
       scenarioOverrides: frgRequiredObservationOverrides("pass"),
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
       packCloseDeps: deps,
       stdout: () => {},
       stderr: () => {},
@@ -1342,6 +1363,7 @@ test("runFactoryGate: --no-close-pack skips closes while keeping pass", async ()
       loadContract: async () => packContract,
       scenarioOverrides: frgRequiredObservationOverrides("pass"),
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
       noClosePack: true,
       packCloseDeps: deps,
       stdout: () => {},
@@ -1396,6 +1418,7 @@ test("runFactoryGate: close error leaves pass and evidence intact (fail-soft)", 
       loadContract: async () => packContract,
       scenarioOverrides: frgRequiredObservationOverrides("pass"),
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
       packCloseDeps: deps,
       stdout: () => {},
       stderr: () => {},
@@ -1442,6 +1465,7 @@ test("runFactoryGate: without packCloseDeps, release pass does not call network 
       loadContract: async () => packContract,
       scenarioOverrides: frgRequiredObservationOverrides("pass"),
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
       stdout: () => {},
       stderr: () => {},
     },
@@ -1493,6 +1517,7 @@ test("runFactoryGate: item absent from scoreboard never closed even if labeled f
       loadContract: async () => packContract,
       scenarioOverrides: frgRequiredObservationOverrides("pass"),
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
       packCloseDeps: deps,
       stdout: () => {},
       stderr: () => {},
@@ -1624,11 +1649,18 @@ test("parseFrgScenarioCliToken parses id=status:detail[:observed=N]", () => {
 
 test("validateReleaseEligibleFrgEvidence rejects forged/incomplete/wrong-version pass", () => {
   const good = computeFrgEvidence(fullPackPassInput({ version: "1.30.0", run_id: "frg-val" }));
-  const parsed = validateReleaseEligibleFrgEvidence(JSON.parse(JSON.stringify(good)), "1.30.0");
+  const parsed = validateReleaseEligibleFrgEvidence(
+    JSON.parse(JSON.stringify(good)),
+    "1.30.0",
+    { attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY },
+  );
   assert.equal(parsed.pass, true);
 
   assert.throws(
-    () => validateReleaseEligibleFrgEvidence(JSON.parse(JSON.stringify(good)), "9.9.9"),
+    () =>
+      validateReleaseEligibleFrgEvidence(JSON.parse(JSON.stringify(good)), "9.9.9", {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
     /version/,
   );
 
@@ -1638,6 +1670,7 @@ test("validateReleaseEligibleFrgEvidence rejects forged/incomplete/wrong-version
       validateReleaseEligibleFrgEvidence(
         { pass: true, run_id: "x", schema_version: 1, version: "1.30.0" },
         "1.30.0",
+        { attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY },
       ),
     /release-eligibility|schema|scenarios|composition/i,
   );
@@ -1657,20 +1690,94 @@ test("validateReleaseEligibleFrgEvidence rejects forged/incomplete/wrong-version
   assert.equal(incomplete.pass, false);
   assert.ok(incomplete.composition.missing.includes("recovery-controller-multi-item"));
   assert.throws(
-    () => validateReleaseEligibleFrgEvidence(JSON.parse(JSON.stringify(incomplete)), "1.30.0"),
+    () =>
+      validateReleaseEligibleFrgEvidence(JSON.parse(JSON.stringify(incomplete)), "1.30.0", {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
     /release-eligibility|missing composition/i,
+  );
+});
+
+test("validateReleaseEligibleFrgEvidence rejects hand-authored self-consistent evidence without valid HMAC (cca5f0f7)", () => {
+  // Full-schema forge: recompute public fingerprints and invent ids, but no producer key.
+  const unsigned = computeFrgEvidence(
+    fullPackPassInput({
+      version: "1.30.0",
+      run_id: "frg-hand-forge",
+      attestation_key: null,
+    }),
+  );
+  assert.equal(unsigned.pass, false, "without key, mint cannot be release-eligible");
+  assert.equal(unsigned.integrity.attestation, undefined);
+
+  // Hand-author: take a fully consistent document and attach a fake MAC (or strip signing).
+  const honest = computeFrgEvidence(
+    fullPackPassInput({ version: "1.30.0", run_id: "frg-hand-forge-honest" }),
+  );
+  assert.equal(honest.pass, true);
+
+  // Wrong key / forged MAC
+  const forged = JSON.parse(JSON.stringify(honest));
+  forged.integrity.attestation = {
+    alg: "hmac-sha256-v1",
+    mac: "a".repeat(64),
+  };
+  // Structural parse may still accept presence; tag validator must reject MAC.
+  assert.throws(
+    () =>
+      validateReleaseEligibleFrgEvidence(forged, "1.30.0", {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
+    /attestation MAC|forged|does not match/i,
+  );
+
+  // Missing key at validation time fails closed
+  assert.throws(
+    () =>
+      validateReleaseEligibleFrgEvidence(JSON.parse(JSON.stringify(honest)), "1.30.0", {
+        attestationKey: null,
+      }),
+    new RegExp(FRG_ATTESTATION_KEY_ENV),
+  );
+
+  // Re-sign with a different key fails under the real producer key
+  const otherKey = "other-operator-key-not-matching";
+  const resign = {
+    ...honest,
+    integrity: signFrgIntegrity({
+      integrity: buildFrgIntegrity(honest.scoreboard, honest.composition),
+      version: honest.version,
+      run_id: honest.run_id,
+      loop_run_id: honest.loop_run_id!,
+      pack_id: honest.pack_id!,
+      attestationKey: otherKey,
+    }),
+  };
+  assert.equal(verifyFrgAttestation(resign, otherKey), true);
+  assert.equal(verifyFrgAttestation(resign, FRG_UNIT_TEST_ATTESTATION_KEY), false);
+  assert.throws(
+    () =>
+      validateReleaseEligibleFrgEvidence(resign, "1.30.0", {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
+    /attestation MAC|forged|does not match/i,
   );
 });
 
 test("validateFrgEvidenceFileForTag: missing fails closed; good pass succeeds", async () => {
   const fs = memFs();
   await assert.rejects(
-    () => validateFrgEvidenceFileForTag("/repo", "1.30.0", fs),
+    () =>
+      validateFrgEvidenceFileForTag("/repo", "1.30.0", fs, {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
     /missing/,
   );
   const good = computeFrgEvidence(fullPackPassInput({ version: "1.30.0", run_id: "frg-tag" }));
   await writeFrgEvidence("/repo", good, fs);
-  const ok = await validateFrgEvidenceFileForTag("/repo", "1.30.0", fs);
+  const ok = await validateFrgEvidenceFileForTag("/repo", "1.30.0", fs, {
+    attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
   assert.equal(ok.pass, true);
   assert.equal(ok.version, "1.30.0");
 
@@ -1682,11 +1789,15 @@ test("validateFrgEvidenceFileForTag: missing fails closed; good pass succeeds", 
     items: [{ item_id: "1", state: "ready", ready_clean: true }],
     scenario_overrides: frgRequiredObservationOverrides("pass"),
     composition_overrides: frgRequiredCompositionOverrides("pass"),
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
   });
   assert.equal(failEv.pass, false);
   await writeFrgEvidence("/repo", failEv, fs);
   await assert.rejects(
-    () => validateFrgEvidenceFileForTag("/repo", "1.30.1", fs),
+    () =>
+      validateFrgEvidenceFileForTag("/repo", "1.30.1", fs, {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
     /release-eligibility|pass=false/i,
   );
 });

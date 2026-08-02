@@ -264,3 +264,42 @@ computable engine-class rate path (via item classification) and to the trend led
   for that run
 - **AND** terminal engine-owned exhaustion SHALL contribute to engine-class item classification
   under existing taxonomy rules
+
+---
+
+### Requirement: Release-eligible FRG evidence SHALL carry a producer HMAC attestation
+
+A release-eligible FRG evidence artifact with `pass: true` SHALL include
+`integrity.attestation` with algorithm `hmac-sha256-v1` and a MAC over a canonical payload
+binding at least `version`, `run_id`, `loop_run_id`, `pack_id`, scoreboard fingerprint, and
+composition fingerprint. The driver SHALL mint the MAC only when the producer key
+`PIPELINE_FRG_ATTESTATION_KEY` is available. Release-eligibility validation used by auto-tag
+(and any shared tag/release validator) SHALL require the same env key and SHALL reject
+evidence when the key is missing, the attestation is absent, or the MAC does not verify.
+Self-consistent scoreboard/composition fingerprints alone SHALL NOT satisfy the tag path:
+hand-authored JSON that recomputes public hashes without the producer secret SHALL fail
+validation.
+
+#### Scenario: Mint without producer key is not release-eligible
+
+- **WHEN** the FRG driver scores a pack that would otherwise meet composition and numeric
+  criteria
+- **AND** `PIPELINE_FRG_ATTESTATION_KEY` is unset and no explicit attestation key is supplied
+- **THEN** the driver SHALL NOT emit release-eligible `pass: true`
+- **AND** `integrity.attestation` SHALL be omitted
+
+#### Scenario: Tag validation rejects forged MAC or missing key
+
+- **WHEN** auto-tag (or `validateReleaseEligibleFrgEvidence`) validates evidence for version
+  `X.Y.Z`
+- **AND** the artifact is schema-complete and fingerprint-consistent but the attestation MAC
+  is missing, forged, or signed under a different key than `PIPELINE_FRG_ATTESTATION_KEY`
+- **THEN** validation SHALL fail closed
+- **AND** no tag create/push path that depends on that validation SHALL proceed
+
+#### Scenario: Matching producer key accepts attested evidence
+
+- **WHEN** evidence was minted with key K and includes a valid `integrity.attestation`
+- **AND** tag validation uses the same key K
+- **AND** all other release-eligibility criteria pass
+- **THEN** validation SHALL accept the evidence as release-eligible

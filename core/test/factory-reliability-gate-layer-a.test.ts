@@ -398,6 +398,9 @@ test("FRG Layer A clean-item-throughput + blocker-taxonomy: thresholds are numer
   );
   const packObs = frgRequiredObservationOverrides("pass");
   const packComp = frgRequiredCompositionOverrides("pass");
+  const { FRG_UNIT_TEST_ATTESTATION_KEY } = await import(
+    "../scripts/factory-reliability-gate.ts"
+  );
   const pass = computeFrgEvidence({
     version: "1.29.1",
     run_id: "layer-a-pass",
@@ -409,6 +412,7 @@ test("FRG Layer A clean-item-throughput + blocker-taxonomy: thresholds are numer
     ],
     scenario_overrides: packObs,
     composition_overrides: packComp,
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
   });
   assert.equal(pass.pass, true);
   assert.equal(pass.scoreboard.engine_class_rate, 0);
