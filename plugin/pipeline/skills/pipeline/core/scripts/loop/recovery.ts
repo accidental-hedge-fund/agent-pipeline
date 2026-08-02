@@ -142,7 +142,10 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy({
     repeated_evidence_limit: 2,
   },
   "implementation-ci": {
-    recipes: ["rerun_ci", "repair_pipeline_item"],
+    // #758: first deterministic recipe is shared HEAD goal-satisfaction
+    // (verify_head_goal) before model-repair — no model-repair budget when HEAD
+    // already satisfies the stage goal.
+    recipes: ["verify_head_goal", "rerun_ci", "repair_pipeline_item"],
     retry_budget: 3,
     backoff: { initial_seconds: 30, multiplier: 2, max_seconds: 600 },
     terminal_outcome: "retry",
@@ -207,11 +210,19 @@ const STALE_DEFAULT_POLICY_ENTRIES: Partial<Record<DurableBlockerClass, readonly
     backoff: { initial_seconds: 15, multiplier: 2, max_seconds: 300 },
     terminal_outcome: "retry", run_fatal: false, repeated_evidence_limit: 2,
   }],
-  "implementation-ci": [{
-    recipes: ["rerun_ci"], retry_budget: 3,
-    backoff: { initial_seconds: 30, multiplier: 2, max_seconds: 600 },
-    terminal_outcome: "retry", run_fatal: false, repeated_evidence_limit: 2,
-  }],
+  "implementation-ci": [
+    {
+      recipes: ["rerun_ci"], retry_budget: 3,
+      backoff: { initial_seconds: 30, multiplier: 2, max_seconds: 600 },
+      terminal_outcome: "retry", run_fatal: false, repeated_evidence_limit: 2,
+    },
+    // Pre-#758 default (no verify_head_goal first recipe).
+    {
+      recipes: ["rerun_ci", "repair_pipeline_item"], retry_budget: 3,
+      backoff: { initial_seconds: 30, multiplier: 2, max_seconds: 600 },
+      terminal_outcome: "retry", run_fatal: false, repeated_evidence_limit: 2,
+    },
+  ],
   "environment-auth": [{
     recipes: ["reauthenticate"], retry_budget: 2,
     backoff: { initial_seconds: 10, multiplier: 2, max_seconds: 120 },

@@ -145,6 +145,8 @@ export function isDurableBlockerClass(value: unknown): value is DurableBlockerCl
 export const RECOVERY_RECIPES = [
   "wait_and_retry",
   "verify_authentication",
+  /** #758: deterministic HEAD goal-satisfaction check (no model-repair budget). */
+  "verify_head_goal",
   "repair_pipeline_item",
   "rerun_ci",
   "resync_workflow_state",

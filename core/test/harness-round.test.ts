@@ -119,6 +119,76 @@ test("runHarnessRound: no salvage on clean no-commit when shouldAttemptSalvage i
   assert.ok(!deps.calls.includes("salvage"));
 });
 
+test("runHarnessRound #758: onCleanNoNewCommit hook runs after clean salvage-found-nothing", async () => {
+  const deps = makeDeps({
+    salvage: async () => ({ salvaged: false }),
+  });
+  let hookArgs: { headBefore: string; headAfter: string } | undefined;
+  const ctx = await runHarnessRound({
+    wtPath: "/wt",
+    issueNumber: 1,
+    pipelineRunId: "run-1",
+    salvageLabel: "test",
+    shouldAttemptSalvage: ({ confirmedNoNewCommit }) => confirmedNoNewCommit,
+    invoke: async () => ({ success: true }),
+    onCleanNoNewCommit: async ({ headBefore, headAfter }) => {
+      hookArgs = { headBefore, headAfter };
+      return { decision: "advance", note: "goal ok" };
+    },
+    afterRound: async (c) => c,
+    deps,
+  });
+  assert.deepEqual(hookArgs, { headBefore: "sha-before", headAfter: "sha-before" });
+  assert.deepEqual(ctx.cleanNoNewCommitHookResult, { decision: "advance", note: "goal ok" });
+});
+
+test("runHarnessRound #758: onCleanNoNewCommit omitted preserves stage outcome (no default advance)", async () => {
+  const deps = makeDeps({
+    salvage: async () => ({ salvaged: false }),
+  });
+  const ctx = await runHarnessRound({
+    wtPath: "/wt",
+    issueNumber: 1,
+    pipelineRunId: "run-1",
+    salvageLabel: "test",
+    shouldAttemptSalvage: () => true,
+    invoke: async () => ({ success: true }),
+    afterRound: async (c) => c,
+    deps,
+  });
+  assert.equal(ctx.cleanNoNewCommitHookResult, undefined);
+  assert.equal(ctx.salvageFoundNothing, true);
+});
+
+test("runHarnessRound #758: onCleanNoNewCommit does not run after successful salvage", async () => {
+  let headReads = 0;
+  const deps: HarnessRoundDeps = {
+    gitHead: async () => {
+      headReads++;
+      return headReads <= 2 ? "sha-before" : "sha-salvaged";
+    },
+    salvage: async () => ({ salvaged: true }),
+  };
+  let hookRan = false;
+  const ctx = await runHarnessRound({
+    wtPath: "/wt",
+    issueNumber: 1,
+    pipelineRunId: "run-1",
+    salvageLabel: "test",
+    shouldAttemptSalvage: () => true,
+    invoke: async () => ({ success: true }),
+    onCleanNoNewCommit: async () => {
+      hookRan = true;
+      return { decision: "advance" };
+    },
+    afterRound: async (c) => c,
+    deps,
+  });
+  assert.equal(hookRan, false);
+  assert.equal(ctx.salvaged, true);
+  assert.equal(ctx.cleanNoNewCommitHookResult, undefined);
+});
+
 test("runHarnessRound: reattach failure short-circuits invoke", async () => {
   const deps = makeDeps({
     reattach: async () => {

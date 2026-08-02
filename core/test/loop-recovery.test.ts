@@ -170,7 +170,11 @@ test("compileRecoveryPolicy: the default policy covers every DurableBlockerClass
 
 test("deterministic redispatch precedes provider-neutral model repair for mechanical blockers", () => {
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["workflow-state"].recipes, ["resync_workflow_state", "repair_pipeline_item"]);
-  assert.deepEqual(DEFAULT_RECOVERY_POLICY["implementation-ci"].recipes, ["rerun_ci", "repair_pipeline_item"]);
+  assert.deepEqual(DEFAULT_RECOVERY_POLICY["implementation-ci"].recipes, [
+    "verify_head_goal",
+    "rerun_ci",
+    "repair_pipeline_item",
+  ]);
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["review-findings"].recipes, ["repair_pipeline_item"]);
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes, ["restart_workflow_engine", "repair_pipeline_item"]);
   assert.equal(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].retry_budget, 2);
@@ -887,7 +891,11 @@ test("upgradeContractForRecovery: exact pre-#787 defaults gain deterministic rep
   const upgraded = upgradeContractForRecovery(legacy);
 
   assert.deepEqual(upgraded.recovery_policy["workflow-state"].recipes, ["resync_workflow_state", "repair_pipeline_item"]);
-  assert.deepEqual(upgraded.recovery_policy["implementation-ci"].recipes, ["rerun_ci", "repair_pipeline_item"]);
+  assert.deepEqual(upgraded.recovery_policy["implementation-ci"].recipes, [
+    "verify_head_goal",
+    "rerun_ci",
+    "repair_pipeline_item",
+  ]);
   assert.deepEqual(upgraded.recovery_policy["review-findings"], DEFAULT_RECOVERY_POLICY["review-findings"]);
   assert.deepEqual(upgraded.recovery_policy["workflow-engine-defect"].recipes, ["restart_workflow_engine", "repair_pipeline_item"]);
   assert.equal(upgraded.recovery_policy["workflow-engine-defect"].retry_budget, 2);

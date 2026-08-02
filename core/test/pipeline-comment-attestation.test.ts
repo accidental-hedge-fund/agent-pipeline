@@ -65,6 +65,7 @@ import {
   preMergeRerunScopeNotice,
   staleReviewNotice,
 } from "../scripts/stages/pre_merge.ts";
+import { formatNoopAdvanceEvidenceNote } from "../scripts/noop-advance.ts";
 import { buildAutoRecoveryComment, buildAutoRecoveryLimitComment } from "../scripts/stages/auto_recover.ts";
 import { buildPipelineCompleteComment } from "../scripts/stages/deploy_ready.ts";
 import { formatEvidenceCommentBody } from "../scripts/evidence-bundle.ts";
@@ -304,6 +305,15 @@ const KIND_RENDERERS: Record<string, () => string> = {
       request: "should we drop this API instead of enforcing it?",
       stage: "fix-1",
       timestamp: ts(0),
+    }),
+  "noop-advance-evidence": () =>
+    formatNoopAdvanceEvidenceNote({
+      stage: "implementing",
+      headSha: "a".repeat(40),
+      rationaleClass: "implement-deliverable-present",
+      note: "OpenSpec deliverable already present at HEAD",
+      issueNumber: 758,
+      at: ts(0),
     }),
   unblocked: () =>
     buildUnblockedComment({ stage: "fix-2", ts: ts(0), answer: "don't retry the call — batch it instead" }),

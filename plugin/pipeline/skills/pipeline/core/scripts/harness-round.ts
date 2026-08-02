@@ -66,6 +66,15 @@ export interface HarnessRoundContext<TInvoke> {
    * failure reason — i.e. the worktree was genuinely clean (#553).
    */
   salvageFoundNothing: boolean;
+  /**
+   * #758: when the consumer supplies `onCleanNoNewCommit` and the round is a
+   * confirmed clean no-new-commit (salvage found nothing), the helper invokes
+   * that callback and attaches the result here for `afterRound`. Stages use
+   * this to route through the shared noop-advance contract without re-deriving
+   * clean-noop preconditions. Undefined when the hook was omitted or the path
+   * is not clean no-new-commit.
+   */
+  cleanNoNewCommitHookResult?: unknown;
 }
 
 /**
@@ -120,6 +129,19 @@ export interface HarnessRoundOptions<TInvoke, TResult> {
    * commit-gate / format / test / push / product outcomes.
    */
   afterRound: (ctx: HarnessRoundContext<TInvoke>) => Promise<TResult>;
+
+  /**
+   * #758 optional hook: when the round is a confirmed clean no-new-commit
+   * (HEAD unchanged, salvage attempted and found nothing), the helper calls
+   * this callback before `afterRound` so migrated consumers can run the shared
+   * noop-advance goal evaluation. When omitted, stages keep their pre-existing
+   * clean no-commit / noop-clean / block product rule (no default always-advance).
+   */
+  onCleanNoNewCommit?: (ctx: {
+    headBefore: string;
+    headAfter: string;
+    invokeResult: TInvoke;
+  }) => Promise<unknown> | unknown;
 
   /** Required when `reattach` is set. */
   onReattachFailed?: (stderr: string) => TResult | Promise<TResult>;
@@ -196,6 +218,21 @@ export async function runHarnessRound<TInvoke, TResult>(
     }
   }
 
+  let cleanNoNewCommitHookResult: unknown;
+  if (
+    options.onCleanNoNewCommit &&
+    confirmedNoNewCommit &&
+    salvageAttempted &&
+    salvageFoundNothing &&
+    !salvaged
+  ) {
+    cleanNoNewCommitHookResult = await options.onCleanNoNewCommit({
+      headBefore,
+      headAfter,
+      invokeResult,
+    });
+  }
+
   return options.afterRound({
     headBefore,
     headAfter,
@@ -205,5 +242,6 @@ export async function runHarnessRound<TInvoke, TResult>(
     salvaged,
     salvageFailureReason,
     salvageFoundNothing,
+    cleanNoNewCommitHookResult,
   });
 }

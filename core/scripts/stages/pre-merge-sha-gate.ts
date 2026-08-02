@@ -87,6 +87,8 @@ import { isPipelineInternalCommit } from "../pipeline-commits.ts";
 import type { Outcome, PipelineConfig, ReviewFinding, Stage } from "../types.ts";
 import { preMergeBlocked, recordPreMergeGateResult } from "./pre-merge-shared.ts";
 import {
+  evaluatePreMergeNoopCleanDisposition,
+  formatNoopAdvanceEvidenceNote,
   formatNoopStillBrokenReason,
   formatPartitionDispositionReason,
   hasPreMergeAutofixBoundMarkerAtHead,
@@ -1709,7 +1711,22 @@ export async function enforceReviewShaGate(
             }
             await postCommentFn(cfg, issueNumber, reComment);
 
-            if (rePartition.blocking.length === 0 && !reIsUnparseable) {
+            // #698 / #758: for noop-clean, terminal proceed vs escalate is
+            // decided via the shared noop-advance contract (findings-clear).
+            // Fix-committed re-approve keeps the existing direct path.
+            const noopDisposition = wasNoopClean
+              ? await evaluatePreMergeNoopCleanDisposition({
+                  headSha: newPrHead,
+                  reverifyBlockingCount: rePartition.blocking.length,
+                  reverifyUnparseable: reIsUnparseable,
+                  issueNumber,
+                })
+              : null;
+
+            if (
+              (wasNoopClean && noopDisposition?.decision === "advance") ||
+              (!wasNoopClean && rePartition.blocking.length === 0 && !reIsUnparseable)
+            ) {
               // Re-validate HEAD, but do not let a single stale GitHub-API
               // PR-head read veto an approving post-fix re-review (#371 review
               // 2). `newPrHead` is the authoritative head we already confirmed
@@ -1750,6 +1767,14 @@ export async function enforceReviewShaGate(
                     `(already fixed / false positive); proceeding`
                   : `[pipeline] #${issueNumber}: pre-merge auto-fix re-review approved; proceeding`,
               );
+              if (wasNoopClean && noopDisposition?.decision === "advance") {
+                // Attested shared-contract evidence (best-effort durable comment).
+                await postCommentFn(
+                  cfg,
+                  issueNumber,
+                  formatNoopAdvanceEvidenceNote(noopDisposition.evidence),
+                ).catch(() => {});
+              }
               await recordPreMergeGateResult(
                 { runDir: deps.runDir, runStoreDeps: deps.runStoreDeps },
                 "pre-merge-autofix",
@@ -1780,11 +1805,10 @@ export async function enforceReviewShaGate(
               dispositionAutoFixable = categoryPartition.autoFixable;
             }
             if (wasNoopClean && rePartition.blocking.length > 0 && !reIsUnparseable) {
-              // Compose the #698 no-op still-broken recipe with partition
-              // disposition labels so residual human-required keys and the
-              // allowlisted attempt scope remain visible (#747 review-2 /
-              // 826962b1). Preferring formatNoopStillBrokenReason alone used
-              // to discard residual-vs-attempted naming on this path.
+              // Shared contract escalated (or residual findings remain). Compose
+              // the #698 no-op still-broken recipe with partition disposition
+              // labels so residual human-required keys and the allowlisted
+              // attempt scope remain visible (#747 review-2 / 826962b1).
               autoFixBlockReason = formatPartitionDispositionReason({
                 residual: dispositionResidual,
                 autoFixable: dispositionAutoFixable,

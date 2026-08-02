@@ -11,6 +11,12 @@ import {
   findingKey,
 } from "../review-policy.ts";
 import { runHarnessRound } from "../harness-round.ts";
+import {
+  evaluatePostHarnessNoNewCommit,
+  formatNoopAdvanceEvidenceNote,
+  preMergeFindingsClearGoalCheck,
+  type NoopAdvanceResult,
+} from "../noop-advance.ts";
 import { withTrailers } from "../traceability.ts";
 import {
   isOnlyPipelineInternalMarkerDirt,
@@ -21,6 +27,40 @@ import { branchName, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import type { InvokeFn } from "../openspec-consistency.ts";
 import type { PipelineConfig, ReviewFinding } from "../types.ts";
+
+/**
+ * #698 / #758: terminal disposition for a confirmed clean auto-fix no-op
+ * (`noop-clean`) after re-verify. Routes through the shared noop-advance
+ * contract so stages do not reimplement "clean no-commit → proceed or
+ * escalate" privately.
+ *
+ * Preconditions are already satisfied by the caller (noop-clean head); this
+ * adapter re-validates via shared evaluation with headBefore === headAfter.
+ */
+export async function evaluatePreMergeNoopCleanDisposition(opts: {
+  headSha: string;
+  reverifyBlockingCount: number;
+  reverifyUnparseable: boolean;
+  issueNumber?: number;
+}): Promise<NoopAdvanceResult> {
+  return evaluatePostHarnessNoNewCommit({
+    headBefore: opts.headSha,
+    headAfter: opts.headSha,
+    salvaged: false,
+    // Caller already confirmed noop-clean (HEAD unchanged + clean salvage).
+    salvageFoundNothing: true,
+    stage: "pre-merge",
+    issueNumber: opts.issueNumber,
+    goalCheck: () =>
+      preMergeFindingsClearGoalCheck({
+        reverifyBlockingCount: opts.reverifyBlockingCount,
+        reverifyUnparseable: opts.reverifyUnparseable,
+        headSha: opts.headSha,
+      }),
+  });
+}
+
+export { formatNoopAdvanceEvidenceNote };
 
 /**
  * Commit-subject prefix for the pre-merge bounded auto-fix round (#359).

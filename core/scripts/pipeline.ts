@@ -168,6 +168,12 @@ import {
   type RepairPipelineItemInput,
   type RepairPipelineItemResult,
 } from "./loop/repair-pipeline-item.ts";
+import {
+  evaluatePostHarnessNoNewCommit,
+  formatNoopAdvanceEvidenceNote,
+  implementDeliverablePresentGoalCheck,
+} from "./noop-advance.ts";
+import * as openspec from "./openspec.ts";
 import { compileContractItems, type RawContractItem } from "./loop/dependencies.ts";
 import {
   discoverDeclaredDependencies,
@@ -1285,6 +1291,66 @@ export interface RealExecuteRecoveryDeps {
   getGhActor?: typeof getGhActor;
   clearBlocked?: typeof clearBlocked;
   repairPipelineItem?: (input: RepairPipelineItemInput) => Promise<RepairPipelineItemResult>;
+  /** Injectable HEAD read for verify_head_goal (#758). */
+  gitHead?: (wtPath: string) => Promise<string>;
+  /**
+   * Injectable worktree cleanliness probe for verify_head_goal (#758 R1).
+   * Returns true only when the tree is clean relative to HEAD (no uncommitted
+   * work). Failures must return false (fail closed).
+   */
+  isWorktreeClean?: (wtPath: string) => Promise<boolean>;
+  getOnDiskForIssue?: typeof getOnDiskForIssue;
+  /**
+   * @deprecated Prefer probeImplementDeliverable. Kept so older test stubs
+   * still type-check; recovery no longer treats non-empty listChangeDirs as
+   * deliverable proof (#758 R2).
+   */
+  listChangeDirs?: (dir: string) => string[];
+  /**
+   * Paths changed on the issue branch vs base (default: git diff
+   * origin/<base>...HEAD). Used by the default deliverable probe to bind
+   * identity to the issue branch rather than any leftover change dir (#758 R2).
+   */
+  listBranchChangedPaths?: (wtPath: string) => Promise<string[]>;
+  /**
+   * True when an OpenSpec change id has the minimum accepted planning
+   * artifacts (proposal.md). Used by the default deliverable probe (#758 R2).
+   */
+  changeHasDeliverableArtifacts?: (wtPath: string, changeId: string) => boolean;
+  /**
+   * Issue-bound implement deliverable probe. Default: branch-introduced
+   * OpenSpec change ids that still exist and have proposal.md. Injectable so
+   * unit tests do not need a real worktree filesystem (#758 R2).
+   */
+  probeImplementDeliverable?: (
+    wtPath: string,
+    issueNumber: number,
+  ) => Promise<{ present: boolean; description?: string }>;
+  /**
+   * Applicable format/test gates at the claimed HEAD. Must not be hard-coded
+   * true — recovery certifies implement-deliverable-present only when this
+   * probe proves green (#758 R2).
+   */
+  probeGatesGreen?: (wtPath: string, issueNumber: number) => Promise<boolean>;
+  /**
+   * Format gate runner for the default probeGatesGreen implementation.
+   * Signature matches `runFormatGate` (status ok | blocked).
+   */
+  runFormatGate?: (
+    wtPath: string,
+    config: Pick<PipelineConfig, "format_gate">,
+    issueNumber: number,
+  ) => Promise<{ status: "ok"; committed: boolean } | { status: "blocked"; reason: string }>;
+  /**
+   * Test gate runner for the default probeGatesGreen implementation.
+   * Signature matches `runTestGate` (passed / skipped fields used).
+   */
+  runTestGate?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    wtPath: string,
+  ) => Promise<{ skipped: boolean; passed?: boolean }>;
+  postComment?: typeof postComment;
 }
 
 /** Production provider-neutral recovery registry. Substantive repair delegates
@@ -1298,12 +1364,205 @@ export function realExecuteRecovery(
   const verifyAuthentication = deps.getGhActor ?? getGhActor;
   const clear = deps.clearBlocked ?? clearBlocked;
   const repairPipelineItem = deps.repairPipelineItem ?? createRepairPipelineItemExecutor(cfg);
+  const getWorktree = deps.getOnDiskForIssue ?? getOnDiskForIssue;
+  const post = deps.postComment ?? postComment;
+  const gitHead =
+    deps.gitHead ??
+    (async (wtPath: string) =>
+      (await gitInWorktree(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim());
+  const isWorktreeClean =
+    deps.isWorktreeClean ??
+    (async (wtPath: string) => {
+      // Fail closed: non-zero status or any porcelain output ⇒ not clean.
+      const status = await gitInWorktree(
+        wtPath,
+        ["status", "--porcelain", "--untracked-files=all"],
+        { ignoreFailure: true },
+      );
+      if (status.code !== 0) return false;
+      return status.stdout.trim() === "";
+    });
+  // Branch-introduced paths — not tip-wide listChangeDirs — so an unrelated
+  // leftover under openspec/changes/ cannot satisfy the implement goal (#758 R2).
+  const listBranchChangedPaths =
+    deps.listBranchChangedPaths ??
+    (async (wtPath: string) => {
+      const result = await gitInWorktree(
+        wtPath,
+        ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
+        { ignoreFailure: true },
+      );
+      if (result.code !== 0) return [];
+      return result.stdout
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    });
+  const changeHasDeliverableArtifacts =
+    deps.changeHasDeliverableArtifacts ??
+    ((wtPath: string, changeId: string) =>
+      openspec.readChangeFile(wtPath, changeId, "proposal.md") !== null);
+  const probeImplementDeliverable =
+    deps.probeImplementDeliverable ??
+    (async (wtPath: string, _issueNumber: number) => {
+      const branchPaths = await listBranchChangedPaths(wtPath);
+      const branchChangeIds = openspec
+        .changeIdsFromPaths(branchPaths)
+        .filter((id) => openspec.changeDirExists(wtPath, id));
+      const acceptedIds = branchChangeIds.filter((id) =>
+        changeHasDeliverableArtifacts(wtPath, id),
+      );
+      if (acceptedIds.length === 0) {
+        return { present: false as const };
+      }
+      return {
+        present: true as const,
+        description: `branch-introduced OpenSpec deliverable(s) at HEAD: ${acceptedIds.join(", ")}`,
+      };
+    });
+  // Applicable gates at claimed HEAD — never hard-code true (#758 R2).
+  // Format is checked non-mutating (auto_fix forced off). Test gate runs with
+  // max_attempts: 0 so a red suite fails closed without charging model repair.
+  const probeGatesGreen =
+    deps.probeGatesGreen ??
+    (async (wtPath: string, issueNumber: number) => {
+      const formatEntries = cfg.format_gate ?? [];
+      if (formatEntries.length > 0) {
+        const { runFormatGate } = await import("./stages/format-gate.ts");
+        const runFmt = deps.runFormatGate ?? runFormatGate;
+        const checkCfg = {
+          ...cfg,
+          format_gate: formatEntries.map((e) => ({
+            command: e.command,
+            auto_fix: false,
+          })),
+        };
+        const fmt = await runFmt(wtPath, checkCfg, issueNumber);
+        if (fmt.status === "blocked") return false;
+      }
+      if (!cfg.test_gate?.enabled) return true;
+      const { runTestGate } = await import("./testgate.ts");
+      const runTest = deps.runTestGate ?? runTestGate;
+      const testCfg = {
+        ...cfg,
+        test_gate: { ...cfg.test_gate, max_attempts: 0 },
+      };
+      const gate = await runTest(testCfg, issueNumber, wtPath);
+      return Boolean(gate.skipped || gate.passed);
+    });
 
   const failed = (error: string): RepairPipelineItemResult => ({
     succeeded: false,
     evidence: error,
     error,
   });
+
+  /**
+   * #758: first deterministic implementation-ci recipe for no-commits — shared
+   * HEAD goal-satisfaction evaluation. Does NOT charge model-repair budget
+   * (this recipe is not repair_pipeline_item). On advance: attested evidence +
+   * clear blocked for redispatch. On escalate: fail so the next recipe runs.
+   */
+  const verifyHeadGoal = async (
+    input: ExecuteRecoveryInput,
+  ): Promise<RepairPipelineItemResult> => {
+    const issueNumber = Number(input.itemId);
+    if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
+      return failed(`verify_head_goal requires a positive numeric item id`);
+    }
+    const blockerKind = input.diagnostic.detail.blocker_kind;
+    const stage = input.diagnostic.detail.stage ?? "implementing";
+    // Only no-commits (and equivalent implementation-outcome) blocks are in
+    // scope for goal-satisfaction recovery; other implementation-ci kinds fall
+    // through so later recipes (rerun_ci / repair) can run.
+    if (blockerKind !== "no-commits") {
+      return failed(
+        `verify_head_goal does not apply to blocker_kind=${blockerKind}; trying next recipe`,
+      );
+    }
+    const wt = await getWorktree(cfg, issueNumber);
+    if (!wt) {
+      return failed(`verify_head_goal: no managed worktree for #${issueNumber}`);
+    }
+    const headSha = await gitHead(wt.path);
+    if (!headSha) {
+      return failed(`verify_head_goal: cannot read HEAD for #${issueNumber}`);
+    }
+    // Deterministic worktree cleanliness — never hard-code clean (#758 R1 F1).
+    const worktreeClean = await isWorktreeClean(wt.path);
+    if (!worktreeClean) {
+      return failed(
+        `verify_head_goal: worktree not clean for #${issueNumber}; cannot certify goal satisfaction`,
+      );
+    }
+    // Stage-supplied goal checks — same classes as normal stage execution.
+    // Implementing: branch-introduced OpenSpec deliverable + clean tree +
+    // applicable gates proven green via injectable probes (#758 R2).
+    // Other stages without a recovery-time checker escalate (fail closed).
+    const goalCheck = async () => {
+      if (stage === "implementing" || stage === "planning" || stage === "plan-review") {
+        const deliverable = await probeImplementDeliverable(wt.path, issueNumber);
+        const gatesGreen = await probeGatesGreen(wt.path, issueNumber);
+        return implementDeliverablePresentGoalCheck({
+          deliverablePresent: deliverable.present,
+          worktreeClean: true,
+          gatesGreen,
+          deliverableDescription: deliverable.description,
+        });
+      }
+      // Fix/pre-merge recovery goal checks need live review partition state;
+      // without it, fail closed so repair_pipeline_item can still run.
+      return {
+        satisfied: false as const,
+        note: `verify_head_goal: no recovery-time goal checker for stage ${stage}`,
+        rationaleClass: "fix-no-actionable-work",
+      };
+    };
+    const result = await evaluatePostHarnessNoNewCommit({
+      headBefore: headSha,
+      headAfter: headSha,
+      salvaged: false,
+      // Worktree proven clean above — same signal as salvageFoundNothing.
+      salvageFoundNothing: true,
+      stage,
+      issueNumber,
+      goalCheck,
+    });
+    if (result.decision !== "advance") {
+      return failed(
+        `verify_head_goal: HEAD does not satisfy stage goal` +
+          (result.decision === "escalate" ? ` (${result.note})` : ` (${result.reason})`),
+      );
+    }
+    // Durable attested evidence is required before clearing the block
+    // (#758 R1 finding 3). Swallowing a post failure would redispatch without
+    // an audit trail readable on subsequent re-entry.
+    try {
+      await post(cfg, issueNumber, formatNoopAdvanceEvidenceNote(result.evidence));
+    } catch (err) {
+      return failed(
+        `verify_head_goal: stage goal satisfied but durable evidence could not be recorded: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+    try {
+      await clear(cfg, issueNumber);
+    } catch (err) {
+      return failed(
+        `verify_head_goal advanced but could not clear blocked: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return {
+      succeeded: true,
+      evidence:
+        `verify_head_goal: stage goal already satisfied at ${headSha.slice(0, 12)} ` +
+        `(${result.evidence.rationaleClass}); cleared blocked without model repair`,
+      // Same head — not a candidate-changing repair; supervisor must not require
+      // a new remote head for this recipe (only repair_pipeline_item does).
+      candidateHead: headSha,
+    };
+  };
 
   const resyncMechanicalBlock = async (
     input: ExecuteRecoveryInput,
@@ -1358,6 +1617,8 @@ export function realExecuteRecovery(
           candidateIdentity: input.candidateIdentity,
           diagnostic: input.diagnostic,
         });
+      case "verify_head_goal":
+        return verifyHeadGoal(input);
       case "wait_and_retry":
       case "rerun_ci":
       case "resync_workflow_state":
