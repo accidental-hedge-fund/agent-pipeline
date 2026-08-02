@@ -1137,7 +1137,7 @@ By default, the claude implementer runs with `--permission-mode bypassPermission
 harness_sandbox: true   # claude implementer uses --permission-mode default (sandboxed)
 ```
 
-When `harness_sandbox` is `true`, the claude harness is invoked with `--permission-mode default` instead of `bypassPermissions`. All other flags are unchanged. The codex harness is already workspace-sandboxed via `--full-auto` and is unaffected by this setting in both modes.
+When `harness_sandbox` is `true`, the claude harness is invoked with `--permission-mode default` instead of `bypassPermissions`. All other flags are unchanged. The codex harness is already workspace-sandboxed via `--sandbox workspace-write` and is unaffected by this setting in both modes.
 
 On runners where Codex's bubblewrap/user-namespace sandbox cannot start because the host is already externally sandboxed, set this runner-local environment variable:
 
@@ -1145,9 +1145,9 @@ On runners where Codex's bubblewrap/user-namespace sandbox cannot start because 
 PIPELINE_CODEX_NO_SANDBOX=1
 ```
 
-With that explicit operator opt-in, the codex harness uses Codex's automation no-sandbox mode (`codex exec --dangerously-bypass-approvals-and-sandbox`) instead of `--full-auto`. Use it only when the surrounding worker/supervisor already provides the required isolation.
+With that explicit operator opt-in, the codex harness uses Codex's automation no-sandbox mode (`codex exec --dangerously-bypass-approvals-and-sandbox`) instead of the managed `--sandbox workspace-write` pair. Use it only when the surrounding worker/supervisor already provides the required isolation.
 
-**Default** (`harness_sandbox: false` or absent, and no `PIPELINE_CODEX_NO_SANDBOX=1`): the invocation is byte-identical to the pre-change behaviour — `--permission-mode bypassPermissions` for claude and `--full-auto` for codex. No change to existing repos unless you opt in.
+**Default** (`harness_sandbox: false` or absent, and no `PIPELINE_CODEX_NO_SANDBOX=1`): claude uses `--permission-mode bypassPermissions` and codex uses `--sandbox workspace-write` (headless never-ask is the `codex exec` default). No change to existing repos unless you opt in.
 
 ## Test/build gate (optional, default on)
 

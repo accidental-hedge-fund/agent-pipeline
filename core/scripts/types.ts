@@ -860,8 +860,8 @@ export interface PipelineConfig {
   // Opt-in sandboxed harness execution (#21). When true, the claude implementer
   // is invoked with --permission-mode default (claude's native sandboxed mode)
   // instead of --permission-mode bypassPermissions. The codex harness is
-  // already workspace-sandboxed via --full-auto and is unaffected. Default false
-  // preserves the current byte-identical invocation.
+  // already workspace-sandboxed via --sandbox workspace-write (#613) and is
+  // unaffected. Default false preserves the current byte-identical invocation.
   harness_sandbox: boolean;
   // Conventions / domain context
   conventions_md_path?: string; // path to a CLAUDE.md or similar to embed

@@ -13,11 +13,15 @@ with any argument that CLI documents for selecting that channel. A golden-argv r
 SHALL pin these argv shapes and each adapter's declared prompt-delivery channel.
 
 For the Codex managed-sandbox shape (no external-bypass selection), the adapter SHALL emit
-`--sandbox` and `workspace-write` as consecutive arguments and SHALL NOT emit `--full-auto`. The
-effective sandbox and headless approval behavior SHALL remain equivalent to the former
-`--full-auto` path on `codex exec` (workspace-write sandbox with non-interactive never-ask
-approval as provided by that CLI's exec path). The external-sandbox bypass argument remains
-`--dangerously-bypass-approvals-and-sandbox`.
+`--sandbox` and `workspace-write` as consecutive arguments after `exec` and SHALL NOT emit
+`--full-auto`. The adapter SHALL NOT emit post-`exec` approval-policy arguments
+(`-a`, `--ask-for-approval`, or equivalent): on the verified Codex CLI, those tokens are rejected
+after `exec`, and the headless never-ask policy is the `codex exec` path default. The effective
+sandbox and headless approval behavior SHALL remain equivalent to the former `--full-auto` path on
+`codex exec` (session-equivalent `approval: never` and `sandbox: workspace-write` as verified for
+the recorded CLI version in this change's design). The external-sandbox bypass argument remains
+`--dangerously-bypass-approvals-and-sandbox` and SHALL be mutually exclusive with the managed
+sandbox sequence (`--sandbox` + `workspace-write`) and with any approval-policy arguments.
 
 Invocation shaping SHALL additionally accept an explicit caller-supplied external-sandbox mode. When
 a caller supplies one, that value alone SHALL select the external-sandbox bypass or the harness's
@@ -40,6 +44,7 @@ sequence (managed: `--sandbox` + `workspace-write`; bypass: the single external-
   selection
 - **THEN** the argument list SHALL include consecutive `--sandbox` and `workspace-write`
 - **AND** the argument list SHALL NOT include `--full-auto`
+- **AND** the argument list SHALL NOT include `-a` or `--ask-for-approval`
 - **AND** the prompt SHALL be delivered as the standard-input payload with the trailing `-`
   sentinel
 
@@ -51,7 +56,8 @@ sequence (managed: `--sandbox` + `workspace-write`; bypass: the single external-
   apart from prompt delivery and the #613 managed-sandbox flag migration on codex
 - **AND** in the lean variant the tool-disabling option SHALL NOT consume any following argument
 - **AND** the external-sandbox bypass variant SHALL carry `--dangerously-bypass-approvals-and-sandbox`
-  and SHALL NOT carry `--full-auto` or `--sandbox workspace-write`
+  and SHALL NOT carry `--full-auto`, `--sandbox` with `workspace-write`, `-a`, or
+  `--ask-for-approval`
 
 #### Scenario: An explicitly supplied sandbox mode selects the invocation shape
 
@@ -60,13 +66,14 @@ sequence (managed: `--sandbox` + `workspace-write`; bypass: the single external-
 - **AND** every other argument SHALL be identical to the managed-sandbox shape after removing the
   managed sandbox-selecting sequence (`--sandbox`, `workspace-write`) from the managed side and the
   bypass flag from the bypass side
+- **AND** neither side SHALL carry `--full-auto` or post-`exec` approval-policy arguments
 
 #### Scenario: An explicitly supplied mode overrides the ambient environment variable
 
 - **WHEN** the ambient external-sandbox environment variable is set and a caller supplies the
   managed-sandbox mode explicitly
 - **THEN** the resulting argument list SHALL be the managed-sandbox shape (`--sandbox` +
-  `workspace-write`, not the bypass flag, not `--full-auto`)
+  `workspace-write`, not the bypass flag, not `--full-auto`, not `-a` / `--ask-for-approval`)
 
 #### Scenario: Callers supplying no mode keep the ambient-environment behavior
 
@@ -74,4 +81,4 @@ sequence (managed: `--sandbox` + `workspace-write`; bypass: the single external-
 - **THEN** the external-sandbox bypass SHALL be selected exactly when the ambient environment
   variable requests it
 - **AND** otherwise the managed-sandbox shape SHALL use `--sandbox` + `workspace-write` and SHALL
-  NOT use `--full-auto`
+  NOT use `--full-auto` or post-`exec` approval-policy arguments

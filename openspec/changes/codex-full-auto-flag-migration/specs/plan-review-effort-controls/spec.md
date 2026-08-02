@@ -7,7 +7,8 @@ When `harness === "codex"` and `reasoningEffort` is set, `invoke()` SHALL append
 `-c model_reasoning_effort=<value>` to the codex args immediately before the prompt-delivery
 sentinel (or historical prompt positional). When `reasoningEffort` is absent or the harness is not
 `"codex"`, the field SHALL be silently ignored. The Codex managed-sandbox selector in these args
-SHALL be `--sandbox` + `workspace-write` and SHALL NOT be `--full-auto`.
+SHALL be consecutive `--sandbox` + `workspace-write` and SHALL NOT be `--full-auto`. The managed
+args SHALL NOT include post-`exec` approval-policy tokens (`-a`, `--ask-for-approval`).
 
 #### Scenario: reasoningEffort passed to codex args
 
@@ -15,15 +16,18 @@ SHALL be `--sandbox` + `workspace-write` and SHALL NOT be `--full-auto`.
   external-bypass selection
 - **THEN** the codex process SHALL be spawned with args that include
   `["exec", "--sandbox", "workspace-write", "-C", dir, "-c", "model_reasoning_effort=medium"]`
-  (plus the adapter's documented prompt-delivery sentinel) and SHALL NOT include `--full-auto`
+  (plus the adapter's documented prompt-delivery sentinel)
+- **AND** the args SHALL NOT include `--full-auto`
+- **AND** the args SHALL NOT include `-a` or `--ask-for-approval`
 
 #### Scenario: reasoningEffort absent — args unchanged except managed-sandbox flags
 
 - **WHEN** `invoke("codex", dir, prompt, {})` is called without `reasoningEffort` and without
   external-bypass selection
 - **THEN** the codex process SHALL be spawned with args that include
-  `["exec", "--sandbox", "workspace-write", "-C", dir]` (no reasoning-effort flag) and SHALL NOT
-  include `--full-auto`
+  `["exec", "--sandbox", "workspace-write", "-C", dir]` (no reasoning-effort flag)
+- **AND** the args SHALL NOT include `--full-auto`
+- **AND** the args SHALL NOT include `-a` or `--ask-for-approval`
 
 #### Scenario: reasoningEffort ignored for claude harness
 

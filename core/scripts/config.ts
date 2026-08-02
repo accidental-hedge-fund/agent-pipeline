@@ -2362,7 +2362,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       : [
         "# harness_sandbox: false # SECURITY: set true to run the claude implementer with --permission-mode default (sandboxed)",
         "#   instead of bypassPermissions (#21). The codex harness is already sandboxed",
-        "#   via --full-auto and is unaffected. Default false -> current invocation unchanged.",
+        "#   via --sandbox workspace-write (#613) and is unaffected. Default false -> current invocation unchanged.",
       ].join("\n"),
     "",
     config.event_sink !== undefined
