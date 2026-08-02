@@ -492,43 +492,100 @@ export const UNREADABLE_WRITE_HEALTH: WriteHealthRecord = {
 };
 
 /**
- * Parse write-health JSON text. Corrupt / invalid content returns
+ * Parse write-health JSON text. Corrupt / invalid / incomplete content returns
  * {@link UNREADABLE_WRITE_HEALTH} (elevated) rather than null so callers never
  * convert a present-but-broken artifact into a healthy run.
+ *
+ * Requires the complete on-disk schema at runtime: supported schema_version,
+ * non-negative integer failure_count, required nullable/string fields, valid
+ * criticality, and boolean exclusive-fallback flags. Partial JSON such as
+ * `{ "failure_count": 0 }` is elevated, not normalized to healthy.
  */
 export function parseWriteHealthText(raw: string): WriteHealthRecord {
   try {
-    const parsed = JSON.parse(raw) as Partial<WriteHealthRecord>;
+    const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       return { ...UNREADABLE_WRITE_HEALTH };
     }
-    // failure_count is required for a trustworthy record; missing/invalid
-    // means the artifact is corrupt (partial write / schema drift).
-    if (typeof parsed.failure_count !== "number" || !Number.isFinite(parsed.failure_count)) {
+    const o = parsed as Record<string, unknown>;
+    // Supported schema version is required — missing/unsupported is corrupt.
+    if (o.schema_version !== WRITE_HEALTH_SCHEMA_VERSION) {
       return { ...UNREADABLE_WRITE_HEALTH };
     }
-    const failureCount = Math.max(0, Math.floor(parsed.failure_count));
-    const worst =
-      parsed.worst_criticality === "control-critical" || parsed.worst_criticality === "best-effort"
-        ? parsed.worst_criticality
-        : failureCount > 0
-          ? "best-effort"
-          : null;
+    // failure_count: required non-negative integer (reject floats/negatives).
+    if (
+      typeof o.failure_count !== "number" ||
+      !Number.isInteger(o.failure_count) ||
+      !Number.isFinite(o.failure_count) ||
+      o.failure_count < 0
+    ) {
+      return { ...UNREADABLE_WRITE_HEALTH };
+    }
+    // Required nullable/string fields must be present with correct types.
+    if (!(o.last_failure_at === null || typeof o.last_failure_at === "string")) {
+      return { ...UNREADABLE_WRITE_HEALTH };
+    }
+    if (!(o.last_error === null || typeof o.last_error === "string")) {
+      return { ...UNREADABLE_WRITE_HEALTH };
+    }
+    if (!(o.last_event_type === null || typeof o.last_event_type === "string")) {
+      return { ...UNREADABLE_WRITE_HEALTH };
+    }
+    // worst_criticality: null when healthy; one of the two classes when elevated.
+    if (
+      !(
+        o.worst_criticality === null ||
+        o.worst_criticality === "control-critical" ||
+        o.worst_criticality === "best-effort"
+      )
+    ) {
+      return { ...UNREADABLE_WRITE_HEALTH };
+    }
+    if (typeof o.exclusive_fallback_attempted !== "boolean") {
+      return { ...UNREADABLE_WRITE_HEALTH };
+    }
+    if (typeof o.exclusive_fallback_succeeded !== "boolean") {
+      return { ...UNREADABLE_WRITE_HEALTH };
+    }
+    // Consistency: elevated records must carry a criticality; healthy must not.
+    if (o.failure_count > 0 && o.worst_criticality === null) {
+      return { ...UNREADABLE_WRITE_HEALTH };
+    }
+    if (o.failure_count === 0 && o.worst_criticality !== null) {
+      return { ...UNREADABLE_WRITE_HEALTH };
+    }
     return {
       schema_version: WRITE_HEALTH_SCHEMA_VERSION,
-      failure_count: failureCount,
-      last_failure_at:
-        typeof parsed.last_failure_at === "string" ? parsed.last_failure_at : null,
-      last_error: typeof parsed.last_error === "string" ? parsed.last_error : null,
-      last_event_type:
-        typeof parsed.last_event_type === "string" ? parsed.last_event_type : null,
-      worst_criticality: worst,
-      exclusive_fallback_attempted: parsed.exclusive_fallback_attempted === true,
-      exclusive_fallback_succeeded: parsed.exclusive_fallback_succeeded === true,
+      failure_count: o.failure_count,
+      last_failure_at: o.last_failure_at,
+      last_error: o.last_error,
+      last_event_type: o.last_event_type,
+      worst_criticality: o.worst_criticality,
+      exclusive_fallback_attempted: o.exclusive_fallback_attempted,
+      exclusive_fallback_succeeded: o.exclusive_fallback_succeeded,
     };
   } catch {
     return { ...UNREADABLE_WRITE_HEALTH };
   }
+}
+
+/**
+ * Map a filesystem read failure for `write-health.json` onto the
+ * missing-vs-unreadable dep contract used by recovery dispatch (#633):
+ * - ENOENT → `null` (legacy / never written; non-elevated)
+ * - any other error → non-empty non-JSON text so {@link parseWriteHealthText}
+ *   elevates to {@link UNREADABLE_WRITE_HEALTH}
+ *
+ * Callers that collapse every read error to `null` lose the fail-safe signal.
+ */
+export function writeHealthTextForReadFailure(err: unknown): string | null {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  if (code === "ENOENT") return null;
+  const msg =
+    err instanceof Error
+      ? err.message || err.name || "unknown read error"
+      : String(err);
+  return `{unreadable write-health: ${msg}}`;
 }
 
 /**
@@ -568,45 +625,100 @@ export interface WriteHealthFailureUpdate {
 }
 
 /**
+ * Per-run serialization for write-health read-modify-write updates (#633).
+ * Prevents concurrent appendEvent failures from losing increments or
+ * downgrading worst_criticality when two updates race on the same runDir.
+ * Host-local / in-process only (same concurrency scope as other run-store I/O).
+ */
+const writeHealthUpdateChains = new Map<string, Promise<void>>();
+
+/** Unique temp path so concurrent writers never share `write-health.json.tmp`. */
+function writeHealthTempPath(target: string): string {
+  const uniq = `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 10)}`;
+  return `${target}.tmp.${uniq}`;
+}
+
+/** Safe, non-empty description of a sink rejection (may be non-Error / empty message). */
+function describeSinkDeliveryError(err: unknown): string {
+  if (err instanceof Error) {
+    const msg = typeof err.message === "string" ? err.message.trim() : "";
+    if (msg) return msg;
+    const name = err.name && err.name !== "Error" ? err.name : "Error";
+    return `${name} (empty message)`;
+  }
+  if (err === undefined) return "sink rejected with undefined";
+  if (err === null) return "sink rejected with null";
+  try {
+    return `sink rejected: ${String(err)}`;
+  } catch {
+    return "sink rejected with unprintable value";
+  }
+}
+
+/**
  * Merge a failure into write-health.json. Best-effort: never throws.
  * Returns the updated record, or null when the update itself could not be
  * persisted (callers still surface via console.warn on the append path).
+ * Updates for the same runDir are serialized so concurrent failures cannot
+ * lose increments or downgrade criticality (#633).
  */
 export async function recordWriteHealthFailure(
   runDir: string,
   update: WriteHealthFailureUpdate,
   deps: RunStoreDeps = defaultRunStoreDeps,
 ): Promise<WriteHealthRecord | null> {
+  const prev = writeHealthUpdateChains.get(runDir) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const chained = prev.then(() => gate).catch(() => undefined);
+  writeHealthUpdateChains.set(runDir, chained);
+  await prev.catch(() => undefined);
   try {
-    const prior = (await readWriteHealth(runDir, deps)) ?? { ...HEALTHY_WRITE_HEALTH };
-    const next: WriteHealthRecord = {
-      schema_version: WRITE_HEALTH_SCHEMA_VERSION,
-      failure_count: prior.failure_count + 1,
-      last_failure_at: nowIso(),
-      last_error: capWriteHealthError(update.error),
-      last_event_type: update.eventType,
-      worst_criticality: worseCriticality(prior.worst_criticality, update.criticality),
-      exclusive_fallback_attempted:
-        prior.exclusive_fallback_attempted || update.exclusiveFallbackAttempted === true,
-      exclusive_fallback_succeeded:
-        prior.exclusive_fallback_succeeded || update.exclusiveFallbackSucceeded === true,
-    };
-    // Prefer atomic tmp+rename when rename is available; fall back to writeFile.
-    const target = writeHealthPath(runDir);
-    const serialized = `${JSON.stringify(next, null, 2)}\n`;
     try {
-      const tmp = `${target}.tmp`;
-      await deps.writeFile(tmp, serialized);
-      await deps.rename(tmp, target);
-    } catch {
-      await deps.writeFile(target, serialized);
+      const priorRaw = await readWriteHealth(runDir, deps);
+      // Unreadable prior still elevates; start from its failure_count when known,
+      // otherwise from healthy zero so we record at least this failure.
+      const prior =
+        priorRaw && priorRaw.failure_count >= 0
+          ? priorRaw
+          : { ...HEALTHY_WRITE_HEALTH };
+      const next: WriteHealthRecord = {
+        schema_version: WRITE_HEALTH_SCHEMA_VERSION,
+        failure_count: prior.failure_count + 1,
+        last_failure_at: nowIso(),
+        last_error: capWriteHealthError(update.error),
+        last_event_type: update.eventType,
+        worst_criticality: worseCriticality(prior.worst_criticality, update.criticality),
+        exclusive_fallback_attempted:
+          prior.exclusive_fallback_attempted || update.exclusiveFallbackAttempted === true,
+        exclusive_fallback_succeeded:
+          prior.exclusive_fallback_succeeded || update.exclusiveFallbackSucceeded === true,
+      };
+      // Prefer atomic unique-tmp+rename when rename is available; fall back to writeFile.
+      const target = writeHealthPath(runDir);
+      const serialized = `${JSON.stringify(next, null, 2)}\n`;
+      try {
+        const tmp = writeHealthTempPath(target);
+        await deps.writeFile(tmp, serialized);
+        await deps.rename(tmp, target);
+      } catch {
+        await deps.writeFile(target, serialized);
+      }
+      return next;
+    } catch (err) {
+      console.warn(
+        `[pipeline] run-store: write-health update failed (non-fatal): ${(err as Error).message}`,
+      );
+      return null;
     }
-    return next;
-  } catch (err) {
-    console.warn(
-      `[pipeline] run-store: write-health update failed (non-fatal): ${(err as Error).message}`,
-    );
-    return null;
+  } finally {
+    release();
+    // Drop map entry when this waiter is still the chain tail (no newer waiter).
+    if (writeHealthUpdateChains.get(runDir) === chained) {
+      writeHealthUpdateChains.delete(runDir);
+    }
   }
 }
 
@@ -881,11 +993,15 @@ export async function appendEvent(
 
   // --- exclusive mode: sink first; local only on sink failure (#633) ---
   if (exclusive) {
-    let sinkError: string | undefined;
+    // Track failure with a boolean — never use error-message truthiness as the
+    // sentinel (empty message / non-Error rejections must still fall back).
+    let sinkFailed = false;
+    let sinkError = "";
     try {
       await deps.eventSink!(line);
     } catch (err) {
-      sinkError = (err as Error).message;
+      sinkFailed = true;
+      sinkError = describeSinkDeliveryError(err);
       console.warn(
         `[pipeline] run-store: eventSink delivery failed (non-fatal): ${sinkError}`,
       );
@@ -895,7 +1011,7 @@ export async function appendEvent(
       deps.stdoutWrite(line);
     }
 
-    if (!sinkError) {
+    if (!sinkFailed) {
       return true; // exclusive happy path: sink-only, no local write
     }
 
@@ -927,12 +1043,14 @@ export async function appendEvent(
     deps.stdoutWrite(line);
   }
 
-  let sinkError: string | undefined;
+  let sinkFailed = false;
+  let sinkError = "";
   if (hasSink) {
     try {
       await deps.eventSink!(line);
     } catch (err) {
-      sinkError = (err as Error).message;
+      sinkFailed = true;
+      sinkError = describeSinkDeliveryError(err);
       console.warn(
         `[pipeline] run-store: eventSink delivery failed (non-fatal): ${sinkError}`,
       );
@@ -943,7 +1061,7 @@ export async function appendEvent(
     await recordFailure(local.error ?? "local events.jsonl append failed");
     return false;
   }
-  if (sinkError) {
+  if (sinkFailed) {
     // Local succeeded; still surface sink loss in write-health.
     await recordFailure(`event sink delivery failed: ${sinkError}`);
   }

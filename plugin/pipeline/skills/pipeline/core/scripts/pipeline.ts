@@ -85,6 +85,7 @@ import {
   runIdFor,
   runsDir,
   startTerminalLogTee,
+  writeHealthTextForReadFailure,
   type RunEventsSummary,
   type RunStoreDeps,
   type TerminalLogTee,
@@ -983,6 +984,12 @@ export interface RealDispatchItemDeps {
    * Read write-health.json beside the advance events path (#633). Defaults to
    * reading `<runDir>/write-health.json` when present. Used so missing
    * control-critical evidence after a recorded stream failure stays fail-safe.
+   *
+   * Contract: return `null` only when the file is missing (ENOENT / legacy).
+   * Present-but-unreadable (EACCES, I/O) MUST NOT collapse to null — return
+   * non-empty text that fails parse so recovery elevates to
+   * UNREADABLE_WRITE_HEALTH. Collapsing unreadable → null would follow the
+   * ordinary missing-evidence path instead of the persistence-failure path.
    */
   readWriteHealthText?: (eventsPath: string) => string | null;
   /** Poll interval (ms) while waiting for store init during the child wait. */
@@ -1017,10 +1024,12 @@ export function realDispatchItem(
   const readWriteHealthTextFn =
     deps.readWriteHealthText ??
     ((eventsPath: string): string | null => {
+      const healthPath = path.join(path.dirname(eventsPath), "write-health.json");
       try {
-        return readFileSync(path.join(path.dirname(eventsPath), "write-health.json"), "utf8");
-      } catch {
-        return null;
+        return readFileSync(healthPath, "utf8");
+      } catch (err) {
+        // Missing → null; present-but-unreadable → elevated sentinel text.
+        return writeHealthTextForReadFailure(err);
       }
     });
   const storeReadyPollMs = deps.storeReadyPollMs ?? 50;

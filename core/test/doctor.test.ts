@@ -1708,14 +1708,23 @@ test("storePreflightResult: clean result is stored without modification", async 
 // ---------------------------------------------------------------------------
 
 test("check run-store:write-health — passes when path writable and no elevated health", async () => {
+  const healthy = JSON.stringify({
+    schema_version: 1,
+    failure_count: 0,
+    last_failure_at: null,
+    last_error: null,
+    last_event_type: null,
+    worst_criticality: null,
+    exclusive_fallback_attempted: false,
+    exclusive_fallback_succeeded: false,
+  });
   const r = await getCheck(makeConfig(), "run-store:write-health").run(
     fakeDeps({
       isWritable: () => true,
       listDirNames: () => ["155-2026-08-02T12-00-00-000Z"],
-      readTextFile: (p) =>
-        p.endsWith("write-health.json")
-          ? JSON.stringify({ failure_count: 0 })
-          : null,
+      // Missing write-health → not elevated (legacy). Present healthy → pass.
+      fsExists: (p) => !p.endsWith("write-health.json"),
+      readTextFile: (p) => (p.endsWith("write-health.json") ? healthy : null),
     }),
   );
   assert.equal(r.status, "pass");
@@ -1738,9 +1747,14 @@ test("check run-store:write-health — fails when recent run has elevated write-
       readTextFile: (p) =>
         p.endsWith("write-health.json")
           ? JSON.stringify({
+              schema_version: 1,
               failure_count: 2,
-              worst_criticality: "control-critical",
+              last_failure_at: "2026-08-02T12:00:00.000Z",
               last_error: "ENOSPC",
+              last_event_type: "blocker_set",
+              worst_criticality: "control-critical",
+              exclusive_fallback_attempted: false,
+              exclusive_fallback_succeeded: false,
             })
           : null,
     }),
@@ -1761,6 +1775,35 @@ test("check run-store:write-health — fails when write-health.json is corrupt (
   );
   assertFailWithRemediation(r);
   assert.match(r.detail, /elevated event-stream write-health/);
+});
+
+// Regression (#633 review 2): present-but-unreadable write-health must not
+// pass as legacy/absent. readTextFile returns null for every error; doctor
+// must use existence to elevate.
+test("check run-store:write-health — fails when write-health.json exists but is unreadable (#633)", async () => {
+  const r = await getCheck(makeConfig(), "run-store:write-health").run(
+    fakeDeps({
+      isWritable: () => true,
+      listDirNames: () => ["633-2026-08-02T14-00-00-000Z"],
+      fsExists: (p) => p.endsWith("write-health.json") || !p.includes("write-health"),
+      readTextFile: (p) => (p.endsWith("write-health.json") ? null : null),
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /elevated event-stream write-health/);
+  assert.match(r.remediation!, /incomplete|sink|events\.jsonl/i);
+});
+
+test("check run-store:write-health — passes when write-health.json is absent (legacy) (#633)", async () => {
+  const r = await getCheck(makeConfig(), "run-store:write-health").run(
+    fakeDeps({
+      isWritable: () => true,
+      listDirNames: () => ["633-2026-08-02T15-00-00-000Z"],
+      fsExists: (p) => !p.endsWith("write-health.json"),
+      readTextFile: () => null,
+    }),
+  );
+  assert.equal(r.status, "pass");
 });
 
 test("check run-store:write-health — skips when repo_dir is empty", async () => {

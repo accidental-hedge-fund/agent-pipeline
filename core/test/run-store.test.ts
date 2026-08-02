@@ -26,11 +26,13 @@ import {
   parseWriteHealthText,
   readEvents,
   readWriteHealth,
+  recordWriteHealthFailure,
   resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
   runsDir,
   writeHealthPath,
+  writeHealthTextForReadFailure,
   type RunEvent,
   type RunStoreDeps,
   type WriteHealthRecord,
@@ -2093,6 +2095,74 @@ test("appendEvent: exclusive dual failure returns false and elevates write-healt
   assert.equal(health!.worst_criticality, "control-critical");
 });
 
+// Regression (#633 review 2): falsy sink rejection must not bypass exclusive
+// fallback / write-health. Empty Error message, undefined, and non-Error
+// rejections must set a failure boolean — not rely on truthy .message.
+test("appendEvent: exclusive empty-message Error still falls back and elevates write-health (#633)", async () => {
+  const { deps, appends } = memRunStore();
+  deps.eventSink = () => {
+    throw new Error(); // empty message — previously treated as success
+  };
+  deps.eventSinkMode = "exclusive";
+  const event: RunEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "stage_start",
+    at: STARTED_AT_ISO,
+    stage: "planning",
+  };
+  const ok = await appendEvent(RUN_DIR, event, deps);
+  assert.equal(ok, true, "local fallback still counts as durable delivery");
+  assert.ok(appends.has(EVENTS_JSONL), "exclusive fallback must write events.jsonl");
+  const health = await readWriteHealth(RUN_DIR, deps);
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health!.exclusive_fallback_attempted, true);
+  assert.equal(health!.exclusive_fallback_succeeded, true);
+  assert.match(health!.last_error ?? "", /empty message|exclusive sink/i);
+});
+
+test("appendEvent: exclusive undefined rejection still falls back and elevates write-health (#633)", async () => {
+  const { deps, appends } = memRunStore();
+  deps.eventSink = () => {
+    // eslint-disable-next-line no-throw-literal -- intentional non-Error rejection
+    throw undefined;
+  };
+  deps.eventSinkMode = "exclusive";
+  const event: RunEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "blocker_set",
+    at: STARTED_AT_ISO,
+    reason: "test",
+    blocker_kind: "merge-conflict",
+  };
+  const ok = await appendEvent(RUN_DIR, event, deps);
+  assert.equal(ok, true);
+  assert.ok(appends.has(EVENTS_JSONL));
+  const health = await readWriteHealth(RUN_DIR, deps);
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health!.worst_criticality, "control-critical");
+  assert.equal(health!.exclusive_fallback_attempted, true);
+});
+
+test("appendEvent: additive empty-message sink rejection still elevates write-health (#633)", async () => {
+  const { deps, appends } = memRunStore();
+  deps.eventSink = () => {
+    throw new Error("");
+  };
+  // default additive
+  const event: RunEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "stage_start",
+    at: STARTED_AT_ISO,
+    stage: "planning",
+  };
+  const ok = await appendEvent(RUN_DIR, event, deps);
+  assert.equal(ok, true);
+  assert.ok(appends.has(EVENTS_JSONL));
+  const health = await readWriteHealth(RUN_DIR, deps);
+  assert.ok(isElevatedWriteHealth(health));
+  assert.match(health!.last_error ?? "", /empty message|sink/i);
+});
+
 test("appendEvent: additive sink failure still writes local and elevates write-health (#633)", async () => {
   const { deps, appends } = memRunStore();
   deps.eventSink = () => {
@@ -2238,10 +2308,149 @@ test("parseWriteHealthText: partial mid-write JSON is elevated (#633)", () => {
   assert.equal(health.worst_criticality, "control-critical");
 });
 
+// Regression (#633 review 2): partial-but-parseable records must NOT normalize
+// to healthy. Only a complete on-disk schema is trustworthy.
+test("parseWriteHealthText: partial {failure_count:0} is elevated, not healthy (#633)", () => {
+  const health = parseWriteHealthText(JSON.stringify({ failure_count: 0 }));
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health.worst_criticality, "control-critical");
+});
+
+test("parseWriteHealthText: missing schema_version is elevated (#633)", () => {
+  const health = parseWriteHealthText(
+    JSON.stringify({
+      failure_count: 0,
+      last_failure_at: null,
+      last_error: null,
+      last_event_type: null,
+      worst_criticality: null,
+      exclusive_fallback_attempted: false,
+      exclusive_fallback_succeeded: false,
+    }),
+  );
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health.worst_criticality, "control-critical");
+});
+
+test("parseWriteHealthText: negative failure_count is elevated, not zeroed (#633)", () => {
+  const health = parseWriteHealthText(
+    JSON.stringify({ ...HEALTHY_WRITE_HEALTH, failure_count: -1 }),
+  );
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health.worst_criticality, "control-critical");
+});
+
+test("parseWriteHealthText: unsupported schema_version is elevated (#633)", () => {
+  const health = parseWriteHealthText(
+    JSON.stringify({ ...HEALTHY_WRITE_HEALTH, schema_version: 99 }),
+  );
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health.worst_criticality, "control-critical");
+});
+
+test("parseWriteHealthText: complete healthy record remains non-elevated (#633)", () => {
+  const health = parseWriteHealthText(JSON.stringify(HEALTHY_WRITE_HEALTH));
+  assert.equal(health.failure_count, 0);
+  assert.equal(isElevatedWriteHealth(health), false);
+  assert.equal(health.worst_criticality, null);
+});
+
+test("parseWriteHealthText: complete elevated record is preserved (#633)", () => {
+  const elevated: WriteHealthRecord = {
+    ...HEALTHY_WRITE_HEALTH,
+    failure_count: 2,
+    last_failure_at: STARTED_AT_ISO,
+    last_error: "ENOSPC",
+    last_event_type: "blocker_set",
+    worst_criticality: "control-critical",
+    exclusive_fallback_attempted: true,
+    exclusive_fallback_succeeded: false,
+  };
+  const health = parseWriteHealthText(JSON.stringify(elevated));
+  assert.equal(health.failure_count, 2);
+  assert.equal(health.worst_criticality, "control-critical");
+  assert.equal(health.exclusive_fallback_attempted, true);
+  assert.equal(health.exclusive_fallback_succeeded, false);
+});
+
+// Regression (#633 review 2): concurrent write-health updates must not lose
+// increments or downgrade control-critical → best-effort.
+test("recordWriteHealthFailure: concurrent updates serialize count and criticality (#633)", async () => {
+  const { deps } = memRunStore();
+  // Interleave a slow first update so a second concurrent writer would race
+  // without the per-run chain lock.
+  let releaseRead: (() => void) | undefined;
+  const holdRead = new Promise<void>((resolve) => {
+    releaseRead = resolve;
+  });
+  let readCount = 0;
+  const racing: RunStoreDeps = {
+    ...deps,
+    readFile: async (p) => {
+      readCount += 1;
+      if (readCount === 1) {
+        // First reader pauses mid read-modify-write; second should wait.
+        await holdRead;
+      }
+      return deps.readFile(p);
+    },
+  };
+  const p1 = recordWriteHealthFailure(
+    RUN_DIR,
+    {
+      eventType: "blocker_set",
+      criticality: "control-critical",
+      error: "control lost",
+    },
+    racing,
+  );
+  // Yield so p1 reaches the held read before p2 starts.
+  await new Promise((r) => setImmediate(r));
+  const p2 = recordWriteHealthFailure(
+    RUN_DIR,
+    {
+      eventType: "stage_start",
+      criticality: "best-effort",
+      error: "best effort lost",
+    },
+    racing,
+  );
+  // Release first reader; both must complete with count 2 + control-critical.
+  releaseRead!();
+  const [r1, r2] = await Promise.all([p1, p2]);
+  assert.ok(r1);
+  assert.ok(r2);
+  const health = await readWriteHealth(RUN_DIR, deps);
+  assert.equal(health!.failure_count, 2, "both failures must be counted");
+  assert.equal(
+    health!.worst_criticality,
+    "control-critical",
+    "control-critical must not be downgraded by a concurrent best-effort update",
+  );
+});
+
 test("readWriteHealth: missing file remains null (legacy healthy/absent) (#633)", async () => {
   const { deps } = memRunStore();
   const health = await readWriteHealth(RUN_DIR, deps);
   assert.equal(health, null);
+});
+
+// Regression (#633 review 2): recovery dep must distinguish missing vs
+// unreadable — ENOENT → null; EACCES/I/O → elevated parse path.
+test("writeHealthTextForReadFailure: ENOENT is null; other errors are elevated text (#633)", () => {
+  const missing = Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" });
+  assert.equal(writeHealthTextForReadFailure(missing), null);
+
+  const denied = Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+  const deniedText = writeHealthTextForReadFailure(denied);
+  assert.ok(deniedText && deniedText.length > 0);
+  const deniedHealth = parseWriteHealthText(deniedText!);
+  assert.ok(isElevatedWriteHealth(deniedHealth));
+  assert.equal(deniedHealth.worst_criticality, "control-critical");
+
+  const io = Object.assign(new Error("EIO: i/o error"), { code: "EIO" });
+  const ioHealth = parseWriteHealthText(writeHealthTextForReadFailure(io)!);
+  assert.ok(isElevatedWriteHealth(ioHealth));
 });
 
 test("readWriteHealth: corrupt on-disk artifact is elevated, not null/healthy (#633)", async () => {

@@ -205,6 +205,25 @@ test("missing blocker_set without write-health keeps the classic protocol error 
   assert.equal(resolution.protocolError, "blocked item has no final blocker_set diagnostic");
 });
 
+// Regression (#633 review 2): unreadable write-health (elevated fail-safe) must
+// surface the persistence-failure protocol path — not the ordinary missing
+// evidence message that recovery would get if unreadable collapsed to absent.
+test("missing blocker_set with unreadable write-health surfaces event-stream write failure (#633)", () => {
+  const resolution = lastStageDiagnosticFromEventsJsonl("", {
+    failure_count: 1,
+    worst_criticality: "control-critical",
+    last_error: "write-health.json unreadable or corrupt",
+    last_event_type: null,
+  });
+  assert.equal(resolution.disposition, "protocol_failure");
+  assert.equal(resolution.blockerClass, "workflow-engine-defect");
+  assert.match(resolution.protocolError ?? "", /event-stream write failure/);
+  assert.notEqual(
+    resolution.protocolError,
+    "blocked item has no final blocker_set diagnostic",
+  );
+});
+
 test("partial events with elevated write-health still use the final valid blocker_set when present (#633)", () => {
   const text = [
     JSON.stringify({

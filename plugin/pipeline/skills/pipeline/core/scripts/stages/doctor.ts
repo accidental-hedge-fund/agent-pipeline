@@ -730,8 +730,16 @@ export function buildPreflightChecks(
       for (const entry of recent) {
         const healthPath = path.join(runsRoot, entry.name, "write-health.json");
         const raw = await deps.readTextFile(healthPath);
-        if (raw === null) continue; // legacy / never written → not elevated
-        // Corrupt/unreadable or elevated failure_count both fail doctor (#633).
+        if (raw === null) {
+          // readTextFile collapses every error to null — distinguish missing
+          // (legacy / never written → not elevated) from present-but-unreadable
+          // (EACCES/I/O → elevated fail-safe) via existence (#633).
+          if (await deps.fsExists(healthPath)) {
+            elevated.push(entry.name);
+          }
+          continue;
+        }
+        // Corrupt/invalid or elevated failure_count both fail doctor (#633).
         if (isElevatedWriteHealth(parseWriteHealthText(raw))) {
           elevated.push(entry.name);
         }
