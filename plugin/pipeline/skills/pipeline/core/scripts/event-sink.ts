@@ -1,7 +1,10 @@
 // External event sink (#343): delivers every run event appended via
 // appendEvent (run-store.ts) to an operator-controlled forwarder command, in
-// addition to (additive) or instead of (exclusive) the local events.jsonl
-// file. The forwarder is an arbitrary shell command supplied by the operator
+// addition to (additive) or instead of (exclusive, on successful delivery)
+// the local events.jsonl file. When exclusive sink delivery fails, appendEvent
+// falls back to a local events.jsonl write and records the failure in
+// write-health (#633) — exclusive mode is remote-only only while the sink is
+// healthy. The forwarder is an arbitrary shell command supplied by the operator
 // (e.g. `logger -t pipeline`, or a script that POSTs to their aggregator);
 // this module owns only invoking it with the event line on stdin — no vendor
 // clients, no retry/backoff policy, no credential handling.

@@ -389,8 +389,34 @@ export function stageDiagnosticFromBlockerSet(value: unknown): StageDiagnosticRe
   return { ...projectStageDiagnostic(diagnostic), diagnostic };
 }
 
-/** Parse the final blocker_set event; never fall back to labels or prose. */
-export function lastStageDiagnosticFromEventsJsonl(eventsText: string): StageDiagnosticResolution {
+/**
+ * Optional write-health context for recovery fail-safe (#633). When control-
+ * critical event evidence is missing after a recorded stream write failure,
+ * the protocol error names the persistence failure so operators and recovery
+ * consumers do not invent an unrelated class or human hold from absence.
+ */
+export interface DiagnosticWriteHealthHint {
+  failure_count: number;
+  worst_criticality?: string | null;
+  last_error?: string | null;
+  last_event_type?: string | null;
+}
+
+/** True when write-health indicates at least one recorded append failure. */
+export function isElevatedDiagnosticWriteHealth(
+  health: DiagnosticWriteHealthHint | null | undefined,
+): boolean {
+  return health != null && health.failure_count > 0;
+}
+
+/** Parse the final blocker_set event; never fall back to labels or prose.
+ *  When the stream is empty/truncated and write-health is elevated (#633), the
+ *  protocol error surfaces the persistence failure (engine-owned defect path)
+ *  without inventing a human hold or unrelated recovery class. */
+export function lastStageDiagnosticFromEventsJsonl(
+  eventsText: string,
+  writeHealth?: DiagnosticWriteHealthHint | null,
+): StageDiagnosticResolution {
   let lastBlockerSet: unknown;
   for (const line of eventsText.split("\n")) {
     const trimmed = line.trim();
@@ -403,6 +429,20 @@ export function lastStageDiagnosticFromEventsJsonl(eventsText: string): StageDia
     }
   }
   if (lastBlockerSet === undefined) {
+    if (isElevatedDiagnosticWriteHealth(writeHealth)) {
+      const crit = writeHealth!.worst_criticality ?? "unknown";
+      const lastErr = writeHealth!.last_error ?? "unknown";
+      const lastType = writeHealth!.last_event_type ?? "unknown";
+      return {
+        blockerClass: "workflow-engine-defect",
+        disposition: "protocol_failure",
+        protocolError:
+          `blocked item has no final blocker_set diagnostic after event-stream write failure ` +
+          `(failures=${writeHealth!.failure_count}, worst_criticality=${crit}, ` +
+          `last_type=${lastType}, last_error=${lastErr})`,
+        diagnostic: null,
+      };
+    }
     return {
       blockerClass: "workflow-engine-defect",
       disposition: "protocol_failure",

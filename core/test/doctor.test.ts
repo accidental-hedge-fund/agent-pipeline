@@ -78,6 +78,8 @@ interface FakeOverrides {
   fsExists?: (p: string) => boolean;
   fileMtime?: (p: string) => number | null;
   readTextFile?: (p: string) => string | null;
+  listDirNames?: (p: string) => string[] | null;
+  isWritable?: (p: string) => boolean;
   onCall?: (file: string, args: string[]) => void;
   listPipelineLocks?: () => string[];
   isPidLive?: (pid: number) => boolean;
@@ -123,6 +125,10 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
     fsExists: async (p) => (o.fsExists ? o.fsExists(p) : true),
     fileMtime: async (p) => (o.fileMtime ? o.fileMtime(p) : 1000),
     readTextFile,
+    // Default: empty run-store (no elevated write-health) and writable path so
+    // pre-existing doctor tests stay green without caring about #633.
+    listDirNames: async (p) => (o.listDirNames ? o.listDirNames(p) : []),
+    isWritable: async (p) => (o.isWritable ? o.isWritable(p) : true),
     listPipelineLocks: async () => (o.listPipelineLocks ? o.listPipelineLocks() : []),
     isPidLive: async (pid) => (o.isPidLive ? o.isPidLive(pid) : true),
     claimStaleLockFile: async (p) => {
@@ -1695,4 +1701,56 @@ test("storePreflightResult: clean result is stored without modification", async 
   } finally {
     try { fs.unlinkSync(path); } catch { /* ignore */ }
   }
+});
+
+// ---------------------------------------------------------------------------
+// run-store:write-health (#633)
+// ---------------------------------------------------------------------------
+
+test("check run-store:write-health — passes when path writable and no elevated health", async () => {
+  const r = await getCheck(makeConfig(), "run-store:write-health").run(
+    fakeDeps({
+      isWritable: () => true,
+      listDirNames: () => ["155-2026-08-02T12-00-00-000Z"],
+      readTextFile: (p) =>
+        p.endsWith("write-health.json")
+          ? JSON.stringify({ failure_count: 0 })
+          : null,
+    }),
+  );
+  assert.equal(r.status, "pass");
+});
+
+test("check run-store:write-health — fails when path is not writable", async () => {
+  const r = await getCheck(makeConfig(), "run-store:write-health").run(
+    fakeDeps({ isWritable: () => false }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /not writable/i);
+  assert.match(r.remediation!, /permission|disk|space/i);
+});
+
+test("check run-store:write-health — fails when recent run has elevated write-health", async () => {
+  const r = await getCheck(makeConfig(), "run-store:write-health").run(
+    fakeDeps({
+      isWritable: () => true,
+      listDirNames: () => ["633-2026-08-02T12-00-00-000Z"],
+      readTextFile: (p) =>
+        p.endsWith("write-health.json")
+          ? JSON.stringify({
+              failure_count: 2,
+              worst_criticality: "control-critical",
+              last_error: "ENOSPC",
+            })
+          : null,
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /elevated event-stream write-health/);
+  assert.match(r.remediation!, /incomplete|sink|events\.jsonl/i);
+});
+
+test("check run-store:write-health — skips when repo_dir is empty", async () => {
+  const r = await getCheck(makeConfig({ repo_dir: "" }), "run-store:write-health").run(fakeDeps());
+  assert.equal(r.status, "skip");
 });

@@ -139,7 +139,7 @@ Each run writes a local evidence bundle under `.agent-pipeline/runs/`. `pipeline
 
 ### External event sink (optional)
 
-`event_sink` can forward `events.jsonl` records to an operator-controlled command. Unset → local events only. See [config.md](config.md).
+`event_sink` can forward `events.jsonl` records to an operator-controlled command. Unset → local events only. In `exclusive` mode the local file is skipped while the sink is healthy; on sink failure the engine falls back to a local `events.jsonl` write and records the failure in per-run write-health (status/doctor/summary). See [config.md](config.md).
 
 ### Product-fault reporting (optional, off by default)
 

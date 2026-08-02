@@ -1,13 +1,21 @@
 // Run-store (#155): stable run directory, append-only event log, and run artifacts.
 //
 // Layout: <repoDir>/.agent-pipeline/runs/<run-id>/
-//   run.json      – immutable identity metadata (written once at initRunDir)
-//   events.jsonl  – append-only O_APPEND event log (one JSON object per line)
-//   terminal.log  – raw combined stdout/stderr (tee started after initRunDir)
-//   summary.json  – finalized evidence bundle (written at finalizeRun)
+//   run.json           – immutable identity metadata (written once at initRunDir)
+//   events.jsonl       – append-only O_APPEND event log (one JSON object per line)
+//   write-health.json  – durable event-stream write-health (#633); elevated on
+//                        append/sink/fallback delivery failures
+//   terminal.log       – raw combined stdout/stderr (tee started after initRunDir)
+//   summary.json       – finalized evidence bundle (written at finalizeRun)
 //
 // All writes are non-fatal: I/O errors are caught and logged. Readers tolerate
 // missing files, corrupt tail lines, and unknown fields (forward-compat).
+//
+// Durability note (#633): events.jsonl uses O_APPEND single-line writes (complete
+// newline-terminated JSON lines). Unlike the durable loop store (temp+fsync+rename
+// whole documents), event appends do not fsync by default — a process crash can
+// lose the last unflushed line(s). Readers skip partial/corrupt tail lines.
+// Post-append fsync is optional via RunStoreDeps.fsyncFile when enabled.
 
 import * as fsp from "node:fs/promises";
 import * as fs from "node:fs";
@@ -369,6 +377,182 @@ export type RunEvent =
   | ProductFaultEvent;
 
 // ---------------------------------------------------------------------------
+// Write-health (#633) — durable mid-run event-stream delivery failures
+// ---------------------------------------------------------------------------
+
+export const WRITE_HEALTH_FILENAME = "write-health.json";
+export const WRITE_HEALTH_SCHEMA_VERSION = 1 as const;
+
+/** Criticality of an event-stream append for recovery / operator surfaces. */
+export type EventCriticality = "control-critical" | "best-effort";
+
+/**
+ * Durable, run-scoped record of event-stream write failures. Absent / zero
+ * failure_count means healthy (or a pre-#633 run that never recorded health).
+ */
+export interface WriteHealthRecord {
+  schema_version: typeof WRITE_HEALTH_SCHEMA_VERSION;
+  failure_count: number;
+  last_failure_at: string | null;
+  /** Redacted/capped last error message. */
+  last_error: string | null;
+  last_event_type: string | null;
+  /** Worst criticality among failed writes; null when failure_count is 0. */
+  worst_criticality: EventCriticality | null;
+  exclusive_fallback_attempted: boolean;
+  exclusive_fallback_succeeded: boolean;
+}
+
+export const HEALTHY_WRITE_HEALTH: WriteHealthRecord = {
+  schema_version: WRITE_HEALTH_SCHEMA_VERSION,
+  failure_count: 0,
+  last_failure_at: null,
+  last_error: null,
+  last_event_type: null,
+  worst_criticality: null,
+  exclusive_fallback_attempted: false,
+  exclusive_fallback_succeeded: false,
+};
+
+/** Event types that recovery / authority disposition depends on. */
+const CONTROL_CRITICAL_EVENT_TYPES = new Set<string>([
+  "blocker_set",
+  "blocker_cleared",
+  "run_complete",
+  "human_intervention",
+]);
+
+/** Default criticality for an event `type` string. Callers may override. */
+export function eventCriticalityForType(type: string): EventCriticality {
+  return CONTROL_CRITICAL_EVENT_TYPES.has(type) ? "control-critical" : "best-effort";
+}
+
+export function isElevatedWriteHealth(
+  health: WriteHealthRecord | null | undefined,
+): boolean {
+  return health != null && health.failure_count > 0;
+}
+
+/** Cap + redact an error message for durable write-health storage. */
+function capWriteHealthError(message: string, maxLen = 240): string {
+  const redacted = sanitize(redactSecrets(message));
+  if (redacted.length <= maxLen) return redacted;
+  return `${redacted.slice(0, maxLen - 1)}…`;
+}
+
+function worseCriticality(
+  a: EventCriticality | null,
+  b: EventCriticality,
+): EventCriticality {
+  if (a === "control-critical" || b === "control-critical") return "control-critical";
+  return "best-effort";
+}
+
+export function writeHealthPath(runDir: string): string {
+  return path.join(runDir, WRITE_HEALTH_FILENAME);
+}
+
+/** Read write-health.json; missing/unreadable → null (legacy or never written). */
+export async function readWriteHealth(
+  runDir: string,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<WriteHealthRecord | null> {
+  try {
+    const raw = await deps.readFile(writeHealthPath(runDir));
+    const parsed = JSON.parse(raw) as Partial<WriteHealthRecord>;
+    if (!parsed || typeof parsed !== "object") return null;
+    const failureCount =
+      typeof parsed.failure_count === "number" && Number.isFinite(parsed.failure_count)
+        ? Math.max(0, Math.floor(parsed.failure_count))
+        : 0;
+    const worst =
+      parsed.worst_criticality === "control-critical" || parsed.worst_criticality === "best-effort"
+        ? parsed.worst_criticality
+        : failureCount > 0
+          ? "best-effort"
+          : null;
+    return {
+      schema_version: WRITE_HEALTH_SCHEMA_VERSION,
+      failure_count: failureCount,
+      last_failure_at:
+        typeof parsed.last_failure_at === "string" ? parsed.last_failure_at : null,
+      last_error: typeof parsed.last_error === "string" ? parsed.last_error : null,
+      last_event_type:
+        typeof parsed.last_event_type === "string" ? parsed.last_event_type : null,
+      worst_criticality: worst,
+      exclusive_fallback_attempted: parsed.exclusive_fallback_attempted === true,
+      exclusive_fallback_succeeded: parsed.exclusive_fallback_succeeded === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export interface WriteHealthFailureUpdate {
+  eventType: string;
+  criticality: EventCriticality;
+  error: string;
+  exclusiveFallbackAttempted?: boolean;
+  exclusiveFallbackSucceeded?: boolean;
+}
+
+/**
+ * Merge a failure into write-health.json. Best-effort: never throws.
+ * Returns the updated record, or null when the update itself could not be
+ * persisted (callers still surface via console.warn on the append path).
+ */
+export async function recordWriteHealthFailure(
+  runDir: string,
+  update: WriteHealthFailureUpdate,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<WriteHealthRecord | null> {
+  try {
+    const prior = (await readWriteHealth(runDir, deps)) ?? { ...HEALTHY_WRITE_HEALTH };
+    const next: WriteHealthRecord = {
+      schema_version: WRITE_HEALTH_SCHEMA_VERSION,
+      failure_count: prior.failure_count + 1,
+      last_failure_at: nowIso(),
+      last_error: capWriteHealthError(update.error),
+      last_event_type: update.eventType,
+      worst_criticality: worseCriticality(prior.worst_criticality, update.criticality),
+      exclusive_fallback_attempted:
+        prior.exclusive_fallback_attempted || update.exclusiveFallbackAttempted === true,
+      exclusive_fallback_succeeded:
+        prior.exclusive_fallback_succeeded || update.exclusiveFallbackSucceeded === true,
+    };
+    // Prefer atomic tmp+rename when rename is available; fall back to writeFile.
+    const target = writeHealthPath(runDir);
+    const serialized = `${JSON.stringify(next, null, 2)}\n`;
+    try {
+      const tmp = `${target}.tmp`;
+      await deps.writeFile(tmp, serialized);
+      await deps.rename(tmp, target);
+    } catch {
+      await deps.writeFile(target, serialized);
+    }
+    return next;
+  } catch (err) {
+    console.warn(
+      `[pipeline] run-store: write-health update failed (non-fatal): ${(err as Error).message}`,
+    );
+    return null;
+  }
+}
+
+/** Public operator-facing shape for status/summary JSON (elevated or healthy). */
+export function writeHealthForOperatorSurface(
+  health: WriteHealthRecord | null | undefined,
+): WriteHealthRecord | null {
+  if (!health) return null;
+  if (!isElevatedWriteHealth(health)) {
+    // Explicit healthy representation for finalized bundles; status JSON uses
+    // null for healthy/absent to avoid inventing failures.
+    return { ...HEALTHY_WRITE_HEALTH };
+  }
+  return health;
+}
+
+// ---------------------------------------------------------------------------
 // Deps — injectable I/O seam; unit tests inject in-memory fakes
 // ---------------------------------------------------------------------------
 
@@ -381,22 +565,31 @@ export interface RunStoreDeps {
   mkdir: (p: string, opts: { recursive: boolean }) => Promise<void>;
   readdir: (p: string) => Promise<Array<{ name: string; isDirectory(): boolean }>>;
   stat: (p: string) => Promise<{ mtime: Date }>;
+  /**
+   * Optional post-append durability flush for events.jsonl (#633). When set,
+   * called after a successful local append; failure is treated as durable-
+   * delivery failure (return false + write-health). Default deps leave this
+   * unset — residual durability gap vs loop store's fsync document writes.
+   */
+  fsyncFile?: (p: string) => Promise<void>;
   /** When set, each appended event line is also passed here (--json-events mode). */
   stdoutWrite?: (line: string) => void;
   /** Optional external event sink (#343). When set, each appended event line is
    *  also delivered here (in addition to, or instead of, the local events.jsonl
    *  write — see `eventSinkMode`). Delivery is best-effort: appendEvent catches
-   *  any throw/rejection and logs a non-fatal warning, never propagating it. */
+   *  any throw/rejection and logs a non-fatal warning, never propagating it.
+   *  In exclusive mode, sink failure triggers a local events.jsonl fallback (#633). */
   eventSink?: (line: string) => void | Promise<void>;
   /** Selects whether the local events.jsonl write happens alongside eventSink
-   *  delivery ("additive", default) or is skipped entirely ("exclusive").
-   *  Ignored when eventSink is unset. */
+   *  delivery ("additive", default) or is skipped on successful sink delivery
+   *  ("exclusive"). On exclusive sink failure the engine falls back to a local
+   *  write (#633). Ignored when eventSink is unset. */
   eventSinkMode?: "additive" | "exclusive";
   /** Optional in-memory accumulator (#343): when set, every event appended via
    *  appendEvent is also pushed here, regardless of eventSinkMode. finalizeRun
    *  reads from this (when present) instead of re-reading events.jsonl, so
    *  stage_accounting/human_intervention data still reaches summary.json in
-   *  exclusive mode, where events.jsonl is never written. */
+   *  exclusive mode, where events.jsonl is not written on the happy path. */
   summaryEvents?: RunEvent[];
 }
 
@@ -413,6 +606,7 @@ export const defaultRunStoreDeps: RunStoreDeps = {
     return entries as Array<{ name: string; isDirectory(): boolean }>;
   },
   stat: (p) => fsp.stat(p),
+  // fsyncFile intentionally unset by default — see file header durability note.
 };
 
 function nowIso(): string {
@@ -538,59 +732,151 @@ export async function resolveRunEngineIdentity(
 // appendEvent
 // ---------------------------------------------------------------------------
 
+export interface AppendEventOptions {
+  /**
+   * Override criticality classification. Defaults from `event.type` via
+   * {@link eventCriticalityForType} (blocker/recovery/terminal → control-critical).
+   */
+  criticality?: EventCriticality;
+}
+
 /** Append a JSON event line to events.jsonl. Non-fatal on I/O error.
  *  If deps.stdoutWrite is set, also passes the line there (--json-events mode).
  *  If deps.eventSink is set (#343), also delivers the line to it: in "additive"
- *  mode (default) alongside the local write, in "exclusive" mode the local
- *  write is skipped entirely. Sink delivery failure is caught and logged as a
- *  non-fatal warning; it never affects the local write or throws out of here. */
-/** Returns whether the event was durably delivered (local write, or sink
- *  delivery in exclusive mode) — non-fatal callers may ignore the result;
- *  a caller that must not report success on a silent failure (e.g. the
- *  `correction record` CLI) can check it. */
+ *  mode (default) alongside the local write; in "exclusive" mode the local
+ *  write is skipped on successful sink delivery, and on sink failure the engine
+ *  falls back to a local `events.jsonl` write (#633). Sink / local failures are
+ *  caught, logged as non-fatal warnings, recorded in write-health, and never
+ *  throw out of here. */
+/** Returns whether the event was durably delivered (local write, exclusive-mode
+ *  sink delivery, or exclusive-mode local fallback) — non-fatal callers may
+ *  ignore the result; a caller that must not report success on a silent failure
+ *  (e.g. the `correction record` CLI) can check it. */
 export async function appendEvent(
   runDir: string,
   event: RunEvent,
   deps: RunStoreDeps = defaultRunStoreDeps,
+  opts: AppendEventOptions = {},
 ): Promise<boolean> {
+  const criticality = opts.criticality ?? eventCriticalityForType(event.type);
   const line = `${JSON.stringify(event)}\n`;
+  const eventsPath = path.join(runDir, "events.jsonl");
   const hasSink = deps.eventSink !== undefined;
-  const skipLocalWrite = hasSink && deps.eventSinkMode === "exclusive";
+  const exclusive = hasSink && deps.eventSinkMode === "exclusive";
 
   if (deps.summaryEvents) {
     deps.summaryEvents.push(event);
   }
 
-  let localOk = true;
-  if (!skipLocalWrite) {
+  const recordFailure = async (
+    error: string,
+    flags: {
+      exclusiveFallbackAttempted?: boolean;
+      exclusiveFallbackSucceeded?: boolean;
+    } = {},
+  ): Promise<void> => {
+    await recordWriteHealthFailure(
+      runDir,
+      {
+        eventType: event.type,
+        criticality,
+        error,
+        exclusiveFallbackAttempted: flags.exclusiveFallbackAttempted,
+        exclusiveFallbackSucceeded: flags.exclusiveFallbackSucceeded,
+      },
+      deps,
+    );
+  };
+
+  const tryLocalAppend = async (): Promise<{ ok: boolean; error?: string }> => {
     try {
-      await deps.appendFile(path.join(runDir, "events.jsonl"), line);
+      await deps.appendFile(eventsPath, line);
+      if (deps.fsyncFile) {
+        try {
+          await deps.fsyncFile(eventsPath);
+        } catch (fsyncErr) {
+          const msg = `fsync failed: ${(fsyncErr as Error).message}`;
+          console.warn(`[pipeline] run-store: appendEvent fsync failed (non-fatal): ${msg}`);
+          return { ok: false, error: msg };
+        }
+      }
+      return { ok: true };
     } catch (err) {
-      console.warn(
-        `[pipeline] run-store: appendEvent failed (non-fatal): ${(err as Error).message}`,
-      );
-      localOk = false;
-      if (!hasSink) return false;
+      const msg = (err as Error).message;
+      console.warn(`[pipeline] run-store: appendEvent failed (non-fatal): ${msg}`);
+      return { ok: false, error: msg };
     }
+  };
+
+  // --- exclusive mode: sink first; local only on sink failure (#633) ---
+  if (exclusive) {
+    let sinkError: string | undefined;
+    try {
+      await deps.eventSink!(line);
+    } catch (err) {
+      sinkError = (err as Error).message;
+      console.warn(
+        `[pipeline] run-store: eventSink delivery failed (non-fatal): ${sinkError}`,
+      );
+    }
+
+    if (deps.stdoutWrite) {
+      deps.stdoutWrite(line);
+    }
+
+    if (!sinkError) {
+      return true; // exclusive happy path: sink-only, no local write
+    }
+
+    // Local fallback after exclusive sink failure.
+    const local = await tryLocalAppend();
+    await recordFailure(
+      local.ok
+        ? `exclusive sink failed (local fallback ok): ${sinkError}`
+        : `exclusive sink and local fallback failed: sink=${sinkError}; local=${local.error ?? "unknown"}`,
+      {
+        exclusiveFallbackAttempted: true,
+        exclusiveFallbackSucceeded: local.ok,
+      },
+    );
+    return local.ok;
+  }
+
+  // --- additive / no-sink: local first, then optional sink ---
+  const local = await tryLocalAppend();
+
+  if (!local.ok && !hasSink) {
+    // No durable destination remaining — do not claim the event on --json-events
+    // stdout either (regression: local-only I/O failure must not emit the line).
+    await recordFailure(local.error ?? "local events.jsonl append failed");
+    return false;
   }
 
   if (deps.stdoutWrite) {
     deps.stdoutWrite(line);
   }
 
-  let sinkOk = true;
+  let sinkError: string | undefined;
   if (hasSink) {
     try {
       await deps.eventSink!(line);
     } catch (err) {
+      sinkError = (err as Error).message;
       console.warn(
-        `[pipeline] run-store: eventSink delivery failed (non-fatal): ${(err as Error).message}`,
+        `[pipeline] run-store: eventSink delivery failed (non-fatal): ${sinkError}`,
       );
-      sinkOk = false;
     }
   }
 
-  return skipLocalWrite ? sinkOk : localOk;
+  if (!local.ok) {
+    await recordFailure(local.error ?? "local events.jsonl append failed");
+    return false;
+  }
+  if (sinkError) {
+    // Local succeeded; still surface sink loss in write-health.
+    await recordFailure(`event sink delivery failed: ${sinkError}`);
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +1146,11 @@ export async function finalizeRun(
   // `finalizeRun` resolves with this same object reference, without a second
   // events.jsonl read (#377).
   bundle.accounting = accountingSummary(accountingRecords);
+  // Event-stream write-health (#633): always embed so a green finalState cannot
+  // hide truncated/empty audit. Absent on-disk health → explicit healthy record.
+  const writeHealth =
+    (await readWriteHealth(runDir, deps)) ?? { ...HEALTHY_WRITE_HEALTH };
+  (bundle as EvidenceBundle & { write_health?: WriteHealthRecord }).write_health = writeHealth;
   const summaryWithVersion = {
     ...bundle,
     schema_version: RUN_SCHEMA_VERSION,
@@ -867,6 +1158,7 @@ export async function finalizeRun(
     interventions,
     corrections,
     correctionErrors,
+    write_health: writeHealth,
   };
   const cleanedBundle = sanitizeDeep(summaryWithVersion);
   const serialized = sanitize(redactSecrets(`${JSON.stringify(cleanedBundle, null, 2)}\n`));
@@ -1070,6 +1362,11 @@ export interface RunEventsSummary {
   finalized: boolean;
   /** The newest event's type/timestamp, or null when events.jsonl is empty. */
   lastEvent: { type: string; at: string } | null;
+  /**
+   * Event-stream write-health for this run (#633). Null when no write-health
+   * artifact exists (legacy run or never written). Elevated when failure_count > 0.
+   */
+  writeHealth: WriteHealthRecord | null;
 }
 
 /** Return a finalized/last-event summary of the most-recent run's events.jsonl
@@ -1077,7 +1374,7 @@ export interface RunEventsSummary {
  *  `latestSummaryForIssue`, this reads events.jsonl directly rather than
  *  summary.json, so a run that has not reached `finalizeRun` yet (including a
  *  wedged one) can still be inspected. Non-fatal: an unreadable events.jsonl is
- *  treated as absent. */
+ *  treated as absent. Also loads write-health.json for status surfaces (#633). */
 export async function latestRunEventsSummaryForIssue(
   repoDir: string,
   issueNumber: number,
@@ -1087,14 +1384,23 @@ export async function latestRunEventsSummaryForIssue(
   const prefix = `${issueNumber}-`;
   const matchId = allIds.find((rid) => rid.startsWith(prefix));
   if (!matchId) return null;
+  const dir = runDirPath(repoDir, matchId);
+  const writeHealth = await readWriteHealth(dir, deps);
   try {
-    const events = await readEvents(runDirPath(repoDir, matchId), deps);
-    if (events.length === 0) return { finalized: false, lastEvent: null };
+    const events = await readEvents(dir, deps);
+    if (events.length === 0) {
+      return { finalized: false, lastEvent: null, writeHealth };
+    }
     const finalized = events.some((e) => e.type === "run_complete");
     const last = events[events.length - 1];
-    return { finalized, lastEvent: { type: last.type, at: last.at } };
+    return {
+      finalized,
+      lastEvent: { type: last.type, at: last.at },
+      writeHealth,
+    };
   } catch {
-    return null;
+    // Unreadable events still expose write-health when present.
+    return { finalized: false, lastEvent: null, writeHealth };
   }
 }
 

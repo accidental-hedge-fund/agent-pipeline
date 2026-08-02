@@ -342,7 +342,7 @@ Nested fields:
 ### `event_sink`
 
 - **Type:** object
-- **Description:** Optional external event sink for run events (#343).
+- **Description:** Optional external event sink for run events (#343). exclusive mode is remote-only while the sink is healthy; sink failure triggers local events.jsonl fallback + write-health (#633).
 
 Nested fields:
 
@@ -354,7 +354,7 @@ Nested fields:
 #### `event_sink.mode`
 
 - **Type:** enum
-- **Description:** additive (default): write to the local events.jsonl AND deliver to the sink. exclusive: deliver to the sink only; events.jsonl is not written.
+- **Description:** additive (default): write to the local events.jsonl AND deliver to the sink. exclusive: on successful sink delivery, skip local events.jsonl (remote-only while the sink is healthy). If exclusive sink delivery fails, the engine falls back to a local events.jsonl write for that event and records the sink failure in write-health — do not assume dual durability in exclusive mode (#633).
 
 - **Allowed values:** `additive`, `exclusive`
 

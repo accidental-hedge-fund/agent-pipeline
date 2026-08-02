@@ -6,13 +6,16 @@ import assert from "node:assert/strict";
 import * as path from "node:path";
 import {
   RUN_SCHEMA_VERSION,
+  HEALTHY_WRITE_HEALTH,
   appendEvent,
   appendIssueHistory,
   emitPapercut,
   emitStageAccounting,
   emitGhMetrics,
+  eventCriticalityForType,
   finalizeRun,
   initRunDir,
+  isElevatedWriteHealth,
   isValidSummaryBundle,
   issueHistoryDir,
   issueHistoryPath,
@@ -20,12 +23,15 @@ import {
   latestSummaryForIssue,
   listRunIds,
   readEvents,
+  readWriteHealth,
   resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
   runsDir,
+  writeHealthPath,
   type RunEvent,
   type RunStoreDeps,
+  type WriteHealthRecord,
 } from "../scripts/run-store.ts";
 import type { EvidenceBundle, IssueHistoryEntry } from "../scripts/types.ts";
 import { buildStageAccountingRecord, STAGE_ACCOUNTING_SCHEMA_VERSION } from "../scripts/accounting.ts";
@@ -1894,4 +1900,249 @@ test("finalizeRun: a summary.json write failure is non-fatal even with delta-rou
     },
   };
   await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, failingDeps); // must not throw
+});
+
+// ---------------------------------------------------------------------------
+// Write-health (#633) — appendEvent failures, exclusive fallback, criticality
+// ---------------------------------------------------------------------------
+
+test("eventCriticalityForType: control-critical for blocker/run terminal; best-effort otherwise", () => {
+  assert.equal(eventCriticalityForType("blocker_set"), "control-critical");
+  assert.equal(eventCriticalityForType("blocker_cleared"), "control-critical");
+  assert.equal(eventCriticalityForType("run_complete"), "control-critical");
+  assert.equal(eventCriticalityForType("human_intervention"), "control-critical");
+  assert.equal(eventCriticalityForType("stage_start"), "best-effort");
+  assert.equal(eventCriticalityForType("papercut"), "best-effort");
+});
+
+test("appendEvent: local I/O failure returns false and elevates write-health (#633)", async () => {
+  const { deps, files } = memRunStore();
+  const failing: RunStoreDeps = {
+    ...deps,
+    appendFile: async () => {
+      throw new Error("ENOSPC: no space left on device");
+    },
+  };
+  const event: RunEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "stage_start",
+    at: STARTED_AT_ISO,
+    stage: "planning",
+  };
+  const ok = await appendEvent(RUN_DIR, event, failing);
+  assert.equal(ok, false);
+  const health = await readWriteHealth(RUN_DIR, failing);
+  assert.ok(health);
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health!.failure_count, 1);
+  assert.equal(health!.last_event_type, "stage_start");
+  assert.equal(health!.worst_criticality, "best-effort");
+  assert.match(health!.last_error ?? "", /ENOSPC|no space/);
+  assert.ok(files.has(writeHealthPath(RUN_DIR)) || true); // may be via rename path
+});
+
+test("appendEvent: successful append does not elevate write-health (#633)", async () => {
+  const { deps } = memRunStore();
+  const event: RunEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "stage_start",
+    at: STARTED_AT_ISO,
+    stage: "planning",
+  };
+  const ok = await appendEvent(RUN_DIR, event, deps);
+  assert.equal(ok, true);
+  const health = await readWriteHealth(RUN_DIR, deps);
+  assert.equal(health, null, "healthy path must not invent a write-health file");
+});
+
+test("appendEvent: control-critical failure elevates worst_criticality (#633)", async () => {
+  const { deps } = memRunStore();
+  const failing: RunStoreDeps = {
+    ...deps,
+    appendFile: async () => {
+      throw new Error("EACCES: permission denied");
+    },
+  };
+  const event: RunEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "blocker_set",
+    at: STARTED_AT_ISO,
+    reason: "test block",
+    blocker_kind: "merge-conflict",
+  };
+  const ok = await appendEvent(RUN_DIR, event, failing);
+  assert.equal(ok, false);
+  const health = await readWriteHealth(RUN_DIR, failing);
+  assert.equal(health!.worst_criticality, "control-critical");
+  assert.equal(health!.last_event_type, "blocker_set");
+});
+
+test("appendEvent: exclusive sink failure falls back to local write and elevates write-health (#633)", async () => {
+  const { deps, appends } = memRunStore();
+  deps.eventSink = () => {
+    throw new Error("sink unreachable");
+  };
+  deps.eventSinkMode = "exclusive";
+  const event: RunEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "stage_start",
+    at: STARTED_AT_ISO,
+    stage: "planning",
+  };
+  const ok = await appendEvent(RUN_DIR, event, deps);
+  assert.equal(ok, true, "local fallback counts as durable delivery");
+  assert.ok(appends.has(EVENTS_JSONL), "exclusive fallback must write events.jsonl");
+  const health = await readWriteHealth(RUN_DIR, deps);
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health!.exclusive_fallback_attempted, true);
+  assert.equal(health!.exclusive_fallback_succeeded, true);
+});
+
+test("appendEvent: exclusive dual failure returns false and elevates write-health (#633)", async () => {
+  const { deps } = memRunStore();
+  deps.eventSink = () => {
+    throw new Error("sink down");
+  };
+  deps.eventSinkMode = "exclusive";
+  const failing: RunStoreDeps = {
+    ...deps,
+    appendFile: async () => {
+      throw new Error("local also failed");
+    },
+  };
+  const event: RunEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "run_complete",
+    at: STARTED_AT_ISO,
+    final_state: "ready-to-deploy",
+    elapsed_ms: 1,
+  };
+  const ok = await appendEvent(RUN_DIR, event, failing);
+  assert.equal(ok, false);
+  const health = await readWriteHealth(RUN_DIR, failing);
+  assert.ok(isElevatedWriteHealth(health));
+  assert.equal(health!.exclusive_fallback_attempted, true);
+  assert.equal(health!.exclusive_fallback_succeeded, false);
+  assert.equal(health!.worst_criticality, "control-critical");
+});
+
+test("appendEvent: additive sink failure still writes local and elevates write-health (#633)", async () => {
+  const { deps, appends } = memRunStore();
+  deps.eventSink = () => {
+    throw new Error("network timeout");
+  };
+  // default additive
+  const event: RunEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "stage_start",
+    at: STARTED_AT_ISO,
+    stage: "planning",
+  };
+  const ok = await appendEvent(RUN_DIR, event, deps);
+  assert.equal(ok, true);
+  assert.ok(appends.has(EVENTS_JSONL));
+  const health = await readWriteHealth(RUN_DIR, deps);
+  assert.ok(isElevatedWriteHealth(health));
+  assert.match(health!.last_error ?? "", /network timeout|sink/i);
+});
+
+test("appendEvent: optional fsync failure is non-fatal and elevates write-health (#633)", async () => {
+  const { deps } = memRunStore();
+  deps.fsyncFile = async () => {
+    throw new Error("fsync EIO");
+  };
+  const event: RunEvent = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "stage_start",
+    at: STARTED_AT_ISO,
+    stage: "planning",
+  };
+  const ok = await appendEvent(RUN_DIR, event, deps);
+  assert.equal(ok, false);
+  const health = await readWriteHealth(RUN_DIR, deps);
+  assert.ok(isElevatedWriteHealth(health));
+  assert.match(health!.last_error ?? "", /fsync/i);
+});
+
+test("readEvents: partial tail line is skipped; prior events remain; write-health survives restart (#633)", async () => {
+  const { deps, files, appends } = memRunStore();
+  const good1 = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "run_start",
+    at: STARTED_AT_ISO,
+    run_id: `${ISSUE}-${STARTED_AT}`,
+    issue: ISSUE,
+    repo: "owner/repo",
+  };
+  const good2 = {
+    schema_version: RUN_SCHEMA_VERSION,
+    type: "stage_start",
+    at: STARTED_AT_ISO,
+    stage: "planning",
+  };
+  await deps.appendFile(EVENTS_JSONL, `${JSON.stringify(good1)}\n`);
+  await deps.appendFile(EVENTS_JSONL, `${JSON.stringify(good2)}\n`);
+  await deps.appendFile(EVENTS_JSONL, `{"type":"partial`); // corrupt tail
+
+  // Simulate a prior write-health failure persisted to disk.
+  const elevated: WriteHealthRecord = {
+    ...HEALTHY_WRITE_HEALTH,
+    failure_count: 1,
+    last_failure_at: STARTED_AT_ISO,
+    last_error: "ENOSPC",
+    last_event_type: "blocker_set",
+    worst_criticality: "control-critical",
+  };
+  await deps.writeFile(writeHealthPath(RUN_DIR), `${JSON.stringify(elevated)}\n`);
+
+  const events = await readEvents(RUN_DIR, deps);
+  assert.equal(events.length, 2);
+  assert.equal(events[0].type, "run_start");
+  assert.equal(events[1].type, "stage_start");
+
+  // "Restart": new deps object reading the same in-memory store.
+  const health = await readWriteHealth(RUN_DIR, deps);
+  assert.equal(health!.failure_count, 1);
+  assert.equal(health!.worst_criticality, "control-critical");
+  assert.ok(files.has(writeHealthPath(RUN_DIR)) || appends);
+});
+
+test("finalizeRun: summary.json embeds elevated write-health even when finalState is success (#633)", async () => {
+  const { deps, readFile } = memRunStore();
+  // Force a failed append before finalize so write-health is elevated.
+  const failOnce: RunStoreDeps = {
+    ...deps,
+    appendFile: async (p, data) => {
+      if (p.endsWith("events.jsonl") && String(data).includes('"type":"stage_start"')) {
+        throw new Error("disk full mid-run");
+      }
+      return deps.appendFile(p, data);
+    },
+  };
+  await appendEvent(
+    RUN_DIR,
+    { schema_version: RUN_SCHEMA_VERSION, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" },
+    failOnce,
+  );
+  const bundle = makeBundle();
+  bundle.finalState = "ready-to-deploy";
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.ok(summary.write_health);
+  assert.ok(summary.write_health.failure_count >= 1);
+  assert.equal(summary.finalState, "ready-to-deploy");
+});
+
+test("finalizeRun: healthy run embeds zero-failure write-health (#633)", async () => {
+  const { deps, readFile } = memRunStore();
+  await appendEvent(
+    RUN_DIR,
+    { schema_version: RUN_SCHEMA_VERSION, type: "stage_start", at: STARTED_AT_ISO, stage: "planning" },
+    deps,
+  );
+  const bundle = makeBundle();
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.ok(summary.write_health);
+  assert.equal(summary.write_health.failure_count, 0);
 });

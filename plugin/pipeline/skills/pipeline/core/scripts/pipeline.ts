@@ -192,7 +192,11 @@ import {
   projectStageDiagnostic,
   type StageDiagnostic,
 } from "./stage-diagnostic.ts";
-import { buildStatusPayload, type StatusPayload } from "./status-json.ts";
+import {
+  buildStatusPayload,
+  formatWriteHealthStatusWarning,
+  type StatusPayload,
+} from "./status-json.ts";
 import {
   BLOCKED_LABEL,
   BLOCKER_KINDS,
@@ -973,6 +977,12 @@ export interface RealDispatchItemDeps {
    * Defaults to fs.readFileSync when the path exists.
    */
   readEventsText?: (eventsPath: string) => string | null;
+  /**
+   * Read write-health.json beside the advance events path (#633). Defaults to
+   * reading `<runDir>/write-health.json` when present. Used so missing
+   * control-critical evidence after a recorded stream failure stays fail-safe.
+   */
+  readWriteHealthText?: (eventsPath: string) => string | null;
   /** Poll interval (ms) while waiting for store init during the child wait. */
   storeReadyPollMs?: number;
 }
@@ -998,6 +1008,15 @@ export function realDispatchItem(
     ((p: string): string | null => {
       try {
         return readFileSync(p, "utf8");
+      } catch {
+        return null;
+      }
+    });
+  const readWriteHealthTextFn =
+    deps.readWriteHealthText ??
+    ((eventsPath: string): string | null => {
+      try {
+        return readFileSync(path.join(path.dirname(eventsPath), "write-health.json"), "utf8");
       } catch {
         return null;
       }
@@ -1111,10 +1130,37 @@ export function realDispatchItem(
       // classified by its true blocker class instead of cascading into a
       // protocol failure the supervisor treats as an engine defect.
       let eventsTextForClassify: string | null = null;
+      let writeHealthHint: { failure_count: number; worst_criticality?: string | null; last_error?: string | null; last_event_type?: string | null } | null = null;
       if (pin && storeReady) {
         eventsTextForClassify = readEventsTextFn(pin.events_path);
+        const whRaw = readWriteHealthTextFn(pin.events_path);
+        if (whRaw) {
+          try {
+            const parsed = JSON.parse(whRaw) as {
+              failure_count?: unknown;
+              worst_criticality?: unknown;
+              last_error?: unknown;
+              last_event_type?: unknown;
+            };
+            if (typeof parsed.failure_count === "number" && parsed.failure_count > 0) {
+              writeHealthHint = {
+                failure_count: parsed.failure_count,
+                worst_criticality:
+                  typeof parsed.worst_criticality === "string" ? parsed.worst_criticality : null,
+                last_error: typeof parsed.last_error === "string" ? parsed.last_error : null,
+                last_event_type:
+                  typeof parsed.last_event_type === "string" ? parsed.last_event_type : null,
+              };
+            }
+          } catch {
+            // Unparseable write-health is not elevated for classification.
+          }
+        }
       }
-      let resolution = lastStageDiagnosticFromEventsJsonl(eventsTextForClassify ?? "");
+      let resolution = lastStageDiagnosticFromEventsJsonl(
+        eventsTextForClassify ?? "",
+        writeHealthHint,
+      );
       // Compatibility for early-exits before a fresh run-store event: only the
       // authenticated, current blocked-label incarnation may supply this
       // structural fallback. Comment prose is never read or transported.
@@ -4332,6 +4378,17 @@ export async function runStatus(
           `Run \`--override "<key>: <reason>"\` (auto-resumes) or fix the residual findings and relabel ` +
           `\`pipeline:needs-human\` → \`pipeline:review-<round>\` to resume.`,
     );
+  }
+
+  // #633: warn when the latest run's event stream recorded write failures so
+  // operators can see incomplete evidence without reading the original stderr.
+  const runEvents = deps.getLatestRunEvents
+    ? await deps.getLatestRunEvents(cfg, issueNumber).catch(() => null)
+    : null;
+  const writeHealthWarning = formatWriteHealthStatusWarning(runEvents?.writeHealth ?? null);
+  if (writeHealthWarning) {
+    console.log("");
+    console.log(writeHealthWarning);
   }
 
   // #146: surface the latest preflight result if one was stored by a prior

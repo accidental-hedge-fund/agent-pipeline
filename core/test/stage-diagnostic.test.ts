@@ -178,3 +178,50 @@ test("the final blocker_set controls classification; malformed final event does 
   assert.equal(resolution.disposition, "protocol_failure");
   assert.equal(resolution.diagnostic, null);
 });
+
+// ---------------------------------------------------------------------------
+// Write-health fail-safe (#633)
+// ---------------------------------------------------------------------------
+
+test("missing blocker_set with elevated write-health is workflow-engine-defect, not human hold (#633)", () => {
+  const resolution = lastStageDiagnosticFromEventsJsonl("", {
+    failure_count: 1,
+    worst_criticality: "control-critical",
+    last_error: "ENOSPC",
+    last_event_type: "blocker_set",
+  });
+  assert.equal(resolution.disposition, "protocol_failure");
+  assert.equal(resolution.blockerClass, "workflow-engine-defect");
+  assert.equal(resolution.diagnostic, null);
+  assert.match(resolution.protocolError ?? "", /event-stream write failure/);
+  assert.match(resolution.protocolError ?? "", /control-critical/);
+  // Must not invent human authority from missing evidence.
+  assert.notEqual(resolution.disposition, "human_authority");
+});
+
+test("missing blocker_set without write-health keeps the classic protocol error (#633)", () => {
+  const resolution = lastStageDiagnosticFromEventsJsonl("");
+  assert.equal(resolution.disposition, "protocol_failure");
+  assert.equal(resolution.protocolError, "blocked item has no final blocker_set diagnostic");
+});
+
+test("partial events with elevated write-health still use the final valid blocker_set when present (#633)", () => {
+  const text = [
+    JSON.stringify({
+      type: "blocker_set",
+      blocker_kind: "merge-conflict",
+      reason: "conflict on main",
+    }),
+    "{partial",
+  ].join("\n");
+  const resolution = lastStageDiagnosticFromEventsJsonl(text, {
+    failure_count: 1,
+    worst_criticality: "best-effort",
+    last_error: "truncated",
+  });
+  // A valid final blocker_set still classifies — write-health does not invent a
+  // different class when the control record is present.
+  assert.equal(resolution.blockerClass, "workflow-state");
+  assert.equal(resolution.disposition, "recover");
+  assert.ok(resolution.diagnostic);
+});

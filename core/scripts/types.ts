@@ -973,7 +973,9 @@ export interface PipelineConfig {
   // today. When set, `command` is an operator-controlled forwarder that
   // receives each event's JSON line on stdin. `mode` selects whether the local
   // events.jsonl write still happens alongside delivery ("additive", the
-  // default) or is skipped entirely ("exclusive").
+  // default) or is skipped on successful sink delivery ("exclusive"). Exclusive
+  // mode falls back to a local write when the sink fails and records the failure
+  // in write-health (#633) — do not assume dual durability while exclusive is healthy.
   event_sink?: {
     command: string;
     mode: "additive" | "exclusive";
@@ -1606,6 +1608,12 @@ export interface EvidenceBundle {
    *  `delta_round_ceiling` / `delta_churn_suspected` events. Absent when the
    *  run performed no pre-merge delta rounds. */
   deltaRounds?: DeltaRoundAccounting;
+  /**
+   * Event-stream write-health from the run directory (#633). Present on
+   * finalize even when healthy (zero failures). Elevated when mid-run
+   * append/sink/fallback delivery failed. Additive; pre-#633 bundles omit it.
+   */
+  write_health?: import("./run-store.ts").WriteHealthRecord;
 }
 
 /** Pre-merge delta-round accounting (#483): the item's durable delta-round

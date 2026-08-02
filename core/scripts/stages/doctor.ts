@@ -46,6 +46,16 @@ export interface DoctorDeps {
   fileMtime(p: string): Promise<number | null>;
   /** Read a file as UTF-8 text; returns null on any error (missing, permission, etc). */
   readTextFile(p: string): Promise<string | null>;
+  /**
+   * List immediate child names under a directory (#633 run-store scan).
+   * Returns null when the path is missing or unreadable.
+   */
+  listDirNames(p: string): Promise<string[] | null>;
+  /**
+   * Whether a path (or its nearest existing parent when the path is missing)
+   * is writable (#633 run-store write-path check).
+   */
+  isWritable(p: string): Promise<boolean>;
   /** List `/tmp/pipeline-*.lock` file paths (the same run-liveness lock naming
    *  the installer's live-run scan and `PipelineLock` use). */
   listPipelineLocks(): Promise<string[]>;
@@ -142,6 +152,32 @@ export function realDoctorDeps(): DoctorDeps {
       return null;
     }
   };
+  const listDirNames: DoctorDeps["listDirNames"] = async (p) => {
+    try {
+      return await fs.promises.readdir(p);
+    } catch {
+      return null;
+    }
+  };
+  const isWritable: DoctorDeps["isWritable"] = async (p) => {
+    // Walk up to the nearest existing ancestor, then probe W_OK on that path.
+    let probe = p;
+    for (;;) {
+      try {
+        await fs.promises.access(probe, fs.constants.W_OK);
+        return true;
+      } catch (err) {
+        const e = err as NodeJS.ErrnoException;
+        if (e.code === "ENOENT") {
+          const parent = path.dirname(probe);
+          if (parent === probe) return false;
+          probe = parent;
+          continue;
+        }
+        return false;
+      }
+    }
+  };
   const listPipelineLocks: DoctorDeps["listPipelineLocks"] = async () => {
     let entries: string[];
     try {
@@ -215,6 +251,8 @@ export function realDoctorDeps(): DoctorDeps {
     fsExists,
     fileMtime,
     readTextFile,
+    listDirNames,
+    isWritable,
     listPipelineLocks,
     isPidLive,
     claimStaleLockFile,
@@ -222,6 +260,9 @@ export function realDoctorDeps(): DoctorDeps {
     discardClaimedLockFile,
   };
 }
+
+/** Bounded number of recent run directories doctor scans for elevated write-health (#633). */
+export const DOCTOR_WRITE_HEALTH_RECENT_LIMIT = 20;
 
 // ---------------------------------------------------------------------------
 // Result constructors (keep individual checks terse)
@@ -648,7 +689,74 @@ export function buildPreflightChecks(
     run: async (deps) => checkLoopContractCoherence(deps),
   });
 
-  // 11. Stale pipeline lock sweep (#567) — /tmp/pipeline-*.lock files whose
+  // 11. Run-store write path + recent write-health (#633) — surface disk
+  //     permissions problems and mid-run event-stream append/sink failures so
+  //     operators do not treat empty/truncated evidence as a green audit trail.
+  //     When repo_dir is unset/unresolvable and no runs are present, skip
+  //     without inventing failures.
+  checks.push({
+    id: "run-store:write-health",
+    description: "Run-store path is writable and recent runs have healthy event-stream write-health",
+    run: async (deps) => {
+      const repoDir = config.repo_dir?.trim();
+      if (!repoDir) {
+        return skip("no resolved repo_dir — run-store write-health check is not applicable");
+      }
+      const runsRoot = path.join(repoDir, ".agent-pipeline", "runs");
+      const parentWritable = await deps.isWritable(runsRoot);
+      if (!parentWritable) {
+        return fail(
+          `run-store path is not writable: ${runsRoot}`,
+          "Check disk permissions and free space for `.agent-pipeline/runs` under the repo root. " +
+            "Event appends are non-fatal for stages but incomplete evidence cannot be recovered after the fact.",
+        );
+      }
+      const names = await deps.listDirNames(runsRoot);
+      if (names === null) {
+        // Path may not exist yet (no runs) — writable parent is enough.
+        return pass(`run-store path is writable (${runsRoot}); no run directories yet`);
+      }
+      // Prefer recent mtimes when available; fall back to reverse lexicographic.
+      const withMtime = await Promise.all(
+        names.map(async (name) => {
+          const mtime = await deps.fileMtime(path.join(runsRoot, name));
+          return { name, mtime: mtime ?? 0 };
+        }),
+      );
+      withMtime.sort((a, b) => b.mtime - a.mtime || b.name.localeCompare(a.name));
+      const recent = withMtime.slice(0, DOCTOR_WRITE_HEALTH_RECENT_LIMIT);
+      const elevated: string[] = [];
+      for (const entry of recent) {
+        const healthPath = path.join(runsRoot, entry.name, "write-health.json");
+        const raw = await deps.readTextFile(healthPath);
+        if (raw === null) continue; // legacy / never written → not elevated
+        try {
+          const parsed = JSON.parse(raw) as { failure_count?: unknown };
+          if (typeof parsed.failure_count === "number" && parsed.failure_count > 0) {
+            elevated.push(entry.name);
+          }
+        } catch {
+          // Unparseable write-health is itself a signal of incomplete evidence.
+          elevated.push(entry.name);
+        }
+      }
+      if (elevated.length > 0) {
+        const sample = elevated.slice(0, 5).join(", ");
+        const more = elevated.length > 5 ? ` (+${elevated.length - 5} more)` : "";
+        return fail(
+          `recent run(s) have elevated event-stream write-health: ${sample}${more}`,
+          "Inspect the named run directories under `.agent-pipeline/runs/` for write-health.json and events.jsonl. " +
+            "Evidence may be incomplete after a disk full condition, permissions error, or exclusive event-sink " +
+            "delivery failure. Re-run with additive sink mode if remote-only exclusive delivery is dropping events.",
+        );
+      }
+      return pass(
+        `run-store path is writable; scanned ${recent.length} recent run(s) with no elevated write-health`,
+      );
+    },
+  });
+
+  // 12. Stale pipeline lock sweep (#567) — /tmp/pipeline-*.lock files whose
   //     recorded PID is provably dead accumulate when nothing else runs the
   //     installer's live-run scan (a common case: a host that's never updated).
   //     Doctor sweeps them here using the exact same conservative liveness

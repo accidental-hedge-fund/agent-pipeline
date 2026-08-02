@@ -1302,3 +1302,40 @@ test("formatSummary: no deltaRounds field → section omitted entirely", () => {
   const out = formatSummary(baseBundle());
   assert.doesNotMatch(out, /Pre-merge delta rounds:/);
 });
+
+test("formatSummary: elevated write_health is surfaced as a warning (#633)", () => {
+  const bundle = baseBundle();
+  bundle.write_health = {
+    schema_version: 1,
+    failure_count: 2,
+    last_failure_at: "2026-08-02T12:00:00Z",
+    last_error: "ENOSPC",
+    last_event_type: "blocker_set",
+    worst_criticality: "control-critical",
+    exclusive_fallback_attempted: true,
+    exclusive_fallback_succeeded: false,
+  };
+  const out = formatSummary(bundle);
+  assert.match(out, /Event-stream write-health:/);
+  assert.match(out, /WARNING: elevated/);
+  assert.match(out, /control-critical/);
+  assert.match(out, /exclusive sink fallback/);
+});
+
+test("formatSummary: healthy write_health reports zero failures (#633)", () => {
+  const bundle = baseBundle();
+  bundle.write_health = {
+    schema_version: 1,
+    failure_count: 0,
+    last_failure_at: null,
+    last_error: null,
+    last_event_type: null,
+    worst_criticality: null,
+    exclusive_fallback_attempted: false,
+    exclusive_fallback_succeeded: false,
+  };
+  const out = formatSummary(bundle);
+  assert.match(out, /Event-stream write-health:/);
+  assert.match(out, /healthy \(0 failures\)/);
+  assert.doesNotMatch(out, /WARNING: elevated/);
+});

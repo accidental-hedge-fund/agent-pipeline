@@ -7,10 +7,12 @@ import {
   buildStatusPayload,
   deriveNextAction,
   deriveStatus,
+  formatWriteHealthStatusWarning,
   largestConfiguredStageTimeoutSec,
   type StageTimeoutConfig,
   type StatusIssueDetail,
 } from "../scripts/status-json.ts";
+import type { WriteHealthRecord } from "../scripts/run-store.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 const CFG = {
@@ -55,6 +57,8 @@ test("buildStatusPayload: all minimum fields are present", () => {
   assert.ok("next_action" in payload);
   assert.ok("config" in payload);
   assert.ok("possibly_wedged" in payload);
+  assert.ok("event_stream_write_health" in payload);
+  assert.equal(payload.event_stream_write_health, null);
 });
 
 test("buildStatusPayload: schema_version is \"1\"", () => {
@@ -294,7 +298,7 @@ test("possibly_wedged: null when the run is finalized, regardless of last-event 
     null,
     null,
     CFG,
-    { finalized: true, lastEvent: { type: "run_complete", at: STALE_AT } },
+    { finalized: true, lastEvent: { type: "run_complete", at: STALE_AT }, writeHealth: null },
     NOW,
   );
   assert.equal(payload.possibly_wedged, null);
@@ -306,7 +310,7 @@ test("possibly_wedged: null when the unfinalized run's last event is within the 
     null,
     null,
     CFG,
-    { finalized: false, lastEvent: { type: "stage_start", at: FRESH_AT } },
+    { finalized: false, lastEvent: { type: "stage_start", at: FRESH_AT }, writeHealth: null },
     NOW,
   );
   assert.equal(payload.possibly_wedged, null);
@@ -318,7 +322,7 @@ test("possibly_wedged: populated when the unfinalized run's last event predates 
     null,
     null,
     CFG,
-    { finalized: false, lastEvent: { type: "harness_timeout", at: STALE_AT } },
+    { finalized: false, lastEvent: { type: "harness_timeout", at: STALE_AT }, writeHealth: null },
     NOW,
   );
   assert.ok(payload.possibly_wedged !== null);
@@ -386,4 +390,82 @@ test("deriveNextAction: ready-to-deploy → awaiting human merge", () => {
 test("deriveNextAction: unknown stage → fallback with stage name", () => {
   const out = deriveNextAction("some-future-stage", false);
   assert.match(out, /some-future-stage/);
+});
+
+// ---------------------------------------------------------------------------
+// event_stream_write_health (#633)
+// ---------------------------------------------------------------------------
+
+const ELEVATED_HEALTH: WriteHealthRecord = {
+  schema_version: 1,
+  failure_count: 2,
+  last_failure_at: "2026-08-02T12:00:00Z",
+  last_error: "ENOSPC: no space left on device",
+  last_event_type: "blocker_set",
+  worst_criticality: "control-critical",
+  exclusive_fallback_attempted: false,
+  exclusive_fallback_succeeded: false,
+};
+
+test("event_stream_write_health: elevated writeHealth appears in status JSON without schema bump (#633)", () => {
+  const payload = buildStatusPayload(
+    makeDetail(),
+    null,
+    null,
+    CFG,
+    {
+      finalized: true,
+      lastEvent: { type: "run_complete", at: "2026-08-02T12:00:00Z" },
+      writeHealth: ELEVATED_HEALTH,
+    },
+  );
+  assert.equal(payload.schema_version, "1");
+  assert.ok(payload.event_stream_write_health !== null);
+  assert.equal(payload.event_stream_write_health!.failure_count, 2);
+  assert.equal(payload.event_stream_write_health!.worst_criticality, "control-critical");
+});
+
+test("event_stream_write_health: healthy writeHealth stays null (does not invent failure) (#633)", () => {
+  const payload = buildStatusPayload(
+    makeDetail(),
+    null,
+    null,
+    CFG,
+    {
+      finalized: true,
+      lastEvent: { type: "run_complete", at: "2026-08-02T12:00:00Z" },
+      writeHealth: {
+        schema_version: 1,
+        failure_count: 0,
+        last_failure_at: null,
+        last_error: null,
+        last_event_type: null,
+        worst_criticality: null,
+        exclusive_fallback_attempted: false,
+        exclusive_fallback_succeeded: false,
+      },
+    },
+  );
+  assert.equal(payload.event_stream_write_health, null);
+});
+
+test("formatWriteHealthStatusWarning: warns only when elevated (#633)", () => {
+  assert.equal(formatWriteHealthStatusWarning(null), null);
+  assert.equal(
+    formatWriteHealthStatusWarning({
+      schema_version: 1,
+      failure_count: 0,
+      last_failure_at: null,
+      last_error: null,
+      last_event_type: null,
+      worst_criticality: null,
+      exclusive_fallback_attempted: false,
+      exclusive_fallback_succeeded: false,
+    }),
+    null,
+  );
+  const warn = formatWriteHealthStatusWarning(ELEVATED_HEALTH);
+  assert.ok(warn);
+  assert.match(warn!, /event stream write failure/i);
+  assert.match(warn!, /control-critical/);
 });
