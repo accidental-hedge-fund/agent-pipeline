@@ -804,6 +804,7 @@ Commit `.github/pipeline.yml` to override defaults:
 
 ```yaml
 base_branch: main
+supersede_mode: close              # close (default) or comment-only: dispose other open associated same-base PRs after managed PR create/reuse (#729)
 worktree_root: .worktrees
 review_timeout: 1200
 ci_timeout: 900

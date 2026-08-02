@@ -599,6 +599,14 @@ export interface PipelineConfig {
   repo: string;            // owner/name
   repo_dir: string;        // absolute path
   base_branch: string;
+  /**
+   * After managed PR create/reuse for issue N, how to dispose other open
+   * associated same-base PRs on different heads (#729).
+   * - `close` (default): close with a structured `pipeline-superseded` comment.
+   * - `comment-only`: post the same notice and leave the PR open.
+   * Absent key behaves as `close`.
+   */
+  supersede_mode: "close" | "comment-only";
   worktree_root: string;   // relative to repo_dir, default ".worktrees"
   max_concurrent_worktrees: number;
   auto_recovery_max_retries: number;
@@ -1012,6 +1020,7 @@ export const DEFAULT_CONFIG: Omit<
   "domain" | "repo" | "repo_dir" | ProfileSourcedKeys
 > = {
   base_branch: "main",
+  supersede_mode: "close",
   worktree_root: ".worktrees",
   max_concurrent_worktrees: 5,
   auto_recovery_max_retries: 2,

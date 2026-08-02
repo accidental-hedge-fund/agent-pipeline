@@ -1535,6 +1535,14 @@ export interface PrCandidate {
   isCrossRepository: boolean;
   /** The issues this PR closes, repo-qualified (from the same list query). */
   closingIssues: ClosingIssueRef[];
+  /**
+   * Base branch name (e.g. `main`). Present on GraphQL open-list nodes
+   * (`baseRefName`, verified live). Used by supersede selection (#729) to
+   * skip intentional different-base PRs. Optional so legacy fixtures / list
+   * paths without base still resolve association; missing base never matches
+   * the same-base supersede filter.
+   */
+  baseRefName?: string;
 }
 
 /** Normalize a gh `closingIssuesReferences` array into ClosingIssueRef[]. gh
@@ -1554,7 +1562,7 @@ export function normalizeClosingRefs(
     }));
 }
 
-/** Parse `gh pr list --json number,headRefName,isCrossRepository,closingIssuesReferences`
+/** Parse `gh pr list --json number,headRefName,isCrossRepository,closingIssuesReferences[,baseRefName]`
  *  into PrCandidate[]. One query carries everything resolvePrForIssue needs.
  *  Exported for tests. */
 export function parsePrList(stdout: string): PrCandidate[] {
@@ -1562,6 +1570,7 @@ export function parsePrList(stdout: string): PrCandidate[] {
     number: number;
     headRefName: string;
     isCrossRepository?: boolean;
+    baseRefName?: string;
     closingIssuesReferences?: {
       number: number;
       repository?: { name: string; owner: { login: string } };
@@ -1572,6 +1581,9 @@ export function parsePrList(stdout: string): PrCandidate[] {
     headRefName: pr.headRefName,
     isCrossRepository: pr.isCrossRepository ?? false,
     closingIssues: normalizeClosingRefs(pr.closingIssuesReferences),
+    ...(typeof pr.baseRefName === "string" && pr.baseRefName
+      ? { baseRefName: pr.baseRefName }
+      : {}),
   }));
 }
 
@@ -1641,13 +1653,15 @@ export function resolveOpenPrsForIssue(
 
 /** One page of open repository PRs from the GraphQL query in
  *  {@link getPrForIssue}. Field shape verified against live `gh api graphql`
- *  (number, headRefName, isCrossRepository, closingIssuesReferences.nodes with
- *  repository.name + owner.login — same nested repo shape as `gh pr list --json`). */
+ *  (number, headRefName, baseRefName, isCrossRepository, closingIssuesReferences.nodes
+ *  with repository.name + owner.login — same nested repo shape as
+ *  `gh pr list --json`). baseRefName verified 2026-08-01 on live open PRs. */
 interface OpenPrsPage {
   pageInfo: { hasNextPage: boolean; endCursor: string | null };
   nodes: {
     number: number;
     headRefName: string;
+    baseRefName?: string;
     isCrossRepository?: boolean;
     closingIssuesReferences?: {
       nodes: {
@@ -1667,7 +1681,7 @@ const OPEN_PRS_MAX_PAGES = 50;
 const OPEN_PRS_QUERY =
   "query($owner:String!,$repo:String!,$after:String){repository(owner:$owner,name:$repo)" +
   `{pullRequests(first:${OPEN_PRS_PAGE_SIZE},states:OPEN,after:$after)` +
-  "{pageInfo{hasNextPage endCursor}nodes{number headRefName isCrossRepository " +
+  "{pageInfo{hasNextPage endCursor}nodes{number headRefName baseRefName isCrossRepository " +
   "closingIssuesReferences(first:50){nodes{number repository{name owner{login}}}}}}}}";
 
 /** Map GraphQL open-PR nodes into {@link PrCandidate}[]. Exported for tests. */
@@ -1677,6 +1691,9 @@ export function mapOpenPrGraphQlNodes(nodes: OpenPrsPage["nodes"]): PrCandidate[
     headRefName: pr.headRefName,
     isCrossRepository: pr.isCrossRepository ?? false,
     closingIssues: normalizeClosingRefs(pr.closingIssuesReferences?.nodes),
+    ...(typeof pr.baseRefName === "string" && pr.baseRefName
+      ? { baseRefName: pr.baseRefName }
+      : {}),
   }));
 }
 
@@ -1771,6 +1788,385 @@ export async function listOpenPrsForIssue(
 ): Promise<number[]> {
   const candidates = await fetchOpenPrCandidates(cfg, run, "listOpenPrsForIssue");
   return resolveOpenPrsForIssue(candidates, issueNumber, cfg.repo);
+}
+
+/**
+ * Full open-PR candidate set (paginated GraphQL), including `baseRefName` when
+ * present. Used by supersede disposal (#729) so selection can apply dual-strategy
+ * association and the same-base filter without a second fan-out.
+ */
+export async function listOpenPrCandidates(
+  cfg: PipelineConfig,
+  run: GhApiRunner = (args) => ghRun(args),
+): Promise<PrCandidate[]> {
+  return fetchOpenPrCandidates(cfg, run, "listOpenPrCandidates");
+}
+
+// ---------------------------------------------------------------------------
+// Supersede open associated PRs after managed PR ensure (#729)
+// ---------------------------------------------------------------------------
+
+/** Configured disposition for non-managed open associated PRs (#729). */
+export type SupersedeMode = "close" | "comment-only";
+
+export interface SelectSupersededOpenPrsArgs {
+  issueNumber: number;
+  managedBranch: string;
+  managedPrNumber: number;
+  baseBranch: string;
+  targetRepo: string;
+}
+
+/**
+ * Pure selection of open PR numbers to supersede after managed PR ensure (#729).
+ *
+ * Candidates must already be open. Association uses the same dual strategies as
+ * {@link resolveOpenPrsForIssue} (no title/body search). Excludes: the managed
+ * PR M, any PR whose head is the managed branch H, dual-strategy non-matches,
+ * and PRs whose base is not `baseBranch` (missing base never matches).
+ *
+ * Callers that perform destructive close MUST first confirm the caller's managed
+ * PR is the GitHub-elected canonical via {@link electCanonicalManagedIssuePr};
+ * this pure selector does not itself gate on election.
+ */
+export function selectSupersededOpenPrs(
+  candidates: PrCandidate[],
+  args: SelectSupersededOpenPrsArgs,
+): number[] {
+  const associated = resolveOpenPrsForIssue(
+    candidates,
+    args.issueNumber,
+    args.targetRepo,
+  );
+  const byNumber = new Map(candidates.map((c) => [c.number, c]));
+  const out: number[] = [];
+  for (const n of associated) {
+    if (n === args.managedPrNumber) continue;
+    const pr = byNumber.get(n);
+    if (!pr) continue;
+    if (pr.headRefName === args.managedBranch) continue;
+    if (pr.baseRefName !== args.baseBranch) continue;
+    out.push(n);
+  }
+  return out;
+}
+
+export interface ElectCanonicalManagedIssuePrArgs {
+  issueNumber: number;
+  /** Caller's ensured managed PR number (used when {@link seedCallerIfAbsent}). */
+  managedPrNumber: number;
+  baseBranch: string;
+  targetRepo: string;
+  /**
+   * When true, seed `managedPrNumber` even if absent from `candidates`.
+   * **Partial-list sources only** (list lag). The production
+   * {@link listOpenPrCandidates} path is authoritative (complete open set or
+   * throw) and MUST leave this false — seeding a closed PR would elect it and
+   * can dispose live sibling PRs (#729 review).
+   */
+  seedCallerIfAbsent?: boolean;
+}
+
+/**
+ * GitHub-authoritative election of the single canonical open managed pipeline PR
+ * for issue N (#729 concurrency).
+ *
+ * Contenders are same-repo open PRs whose head starts with `pipeline/<N>-` and
+ * whose base is `baseBranch`. Optionally (partial lists only), the caller's
+ * `managedPrNumber` may be seeded via {@link ElectCanonicalManagedIssuePrArgs.seedCallerIfAbsent}.
+ * The winner is the **highest PR number** (newest GitHub object wins), so two
+ * hosts reconciling independently converge on the same survivor without a
+ * host-local lock. Non-pipeline associated heads (closing-ref only) are never
+ * contenders — they are dispose targets for the winner only.
+ *
+ * Returns `null` when there are no contenders (empty open managed set and no
+ * seed). Pure / synchronous; unit-testable without network.
+ */
+export function electCanonicalManagedIssuePr(
+  candidates: PrCandidate[],
+  args: ElectCanonicalManagedIssuePrArgs,
+): number | null {
+  const branchPrefix = `pipeline/${args.issueNumber}-`;
+  const contenders = new Set<number>();
+  if (args.seedCallerIfAbsent) {
+    contenders.add(args.managedPrNumber);
+  }
+  for (const c of candidates) {
+    if (c.isCrossRepository) continue;
+    if (c.baseRefName !== args.baseBranch) continue;
+    if (!c.headRefName.startsWith(branchPrefix)) continue;
+    contenders.add(c.number);
+  }
+  if (contenders.size === 0) return null;
+  let winner = -1;
+  for (const n of contenders) {
+    if (n > winner) winner = n;
+  }
+  return winner;
+}
+
+/**
+ * True when the caller's managed PR is present in an authoritative open-PR
+ * snapshot with the expected same-repo head and base (eligible to be elected
+ * or to dispose). Closed or head-mismatched PRs are not open contenders.
+ */
+export function isManagedPrOpenOnHead(
+  candidates: PrCandidate[],
+  args: {
+    managedPrNumber: number;
+    managedBranch: string;
+    baseBranch: string;
+  },
+): boolean {
+  for (const c of candidates) {
+    if (c.number !== args.managedPrNumber) continue;
+    if (c.isCrossRepository) continue;
+    if (c.headRefName !== args.managedBranch) continue;
+    if (c.baseRefName !== args.baseBranch) continue;
+    return true;
+  }
+  return false;
+}
+
+/** Stable marker in supersession comments (auditable / greppable). */
+export const PIPELINE_SUPERSEDED_MARKER = "pipeline-superseded";
+
+/**
+ * Structured supersession comment body. Always includes
+ * {@link PIPELINE_SUPERSEDED_MARKER} and names the superseding PR.
+ */
+export function formatSupersededPrComment(opts: {
+  managedPrNumber: number;
+  issueNumber: number;
+  managedBranch: string;
+  mode: SupersedeMode;
+}): string {
+  const action =
+    opts.mode === "comment-only"
+      ? "Leaving this PR open (supersede_mode: comment-only); prefer the managed head."
+      : "Closing this PR as abandoned relative to the current pipeline head.";
+  return [
+    `${PIPELINE_SUPERSEDED_MARKER}: superseded by PR #${opts.managedPrNumber} for issue #${opts.issueNumber}`,
+    `(managed head: ${opts.managedBranch}). ${action}`,
+  ].join(" ");
+}
+
+/** Injectable GitHub seams for supersede disposal (no merge / force-push / delete). */
+export interface DisposeSupersededIssuePrsDeps {
+  listOpenPrCandidates?: (
+    cfg: PipelineConfig,
+  ) => Promise<PrCandidate[]>;
+  closePr?: (
+    cfg: PipelineConfig,
+    prNumber: number,
+    comment?: string,
+  ) => Promise<void>;
+  postPrComment?: (
+    cfg: PipelineConfig,
+    prNumber: number,
+    body: string,
+  ) => Promise<void>;
+  log?: (msg: string) => void;
+}
+
+export interface DisposeSupersededIssuePrsResult {
+  /** PR numbers closed under `close` mode. */
+  closed: number[];
+  /** PR numbers that received a supersede comment (both modes). */
+  commented: number[];
+  /** Non-fatal diagnostics (list failure or per-PR close/comment failure). */
+  errors: string[];
+  /**
+   * Whether this run's managed PR is the GitHub-elected canonical open managed
+   * pipeline PR for the issue. `true` when list fails (fail-soft: do not strand
+   * advance on list outage). `false` when another concurrent managed head wins
+   * the election — caller must not transition as if this PR is the live head.
+   */
+  isCanonical: boolean;
+  /** Elected canonical PR number when known (omitted on list failure). */
+  canonicalPrNumber?: number;
+}
+
+/**
+ * After managed PR create/reuse for issue N on head H, dispose other open
+ * associated same-base PRs under the active supersede mode (#729).
+ *
+ * Cross-host safety: uses the authoritative open-PR list
+ * ({@link listOpenPrCandidates} — complete set or throw). Requires the caller's
+ * managed PR number **and** managed head to still be present and open before any
+ * elect/dispose. Elects a single canonical open managed pipeline PR via
+ * {@link electCanonicalManagedIssuePr} (highest PR number among same-base
+ * `pipeline/<N>-*` heads; **no** caller seed on this path), re-lists and
+ * re-elects immediately before any close/comment, and only the winner disposes.
+ * A non-canonical run (lost election **or** managed PR absent/closed) closes
+ * nothing (including not closing the winner or live siblings) and returns
+ * `isCanonical: false` so the resume path can stop without advancing on a closed PR.
+ *
+ * Fail-soft: list failure or per-PR close/comment failure is logged and does
+ * not throw. Never merges, force-pushes, or deletes branches.
+ */
+export async function disposeSupersededIssuePrs(
+  cfg: PipelineConfig,
+  opts: {
+    issueNumber: number;
+    managedBranch: string;
+    managedPrNumber: number;
+    /** Defaults to `cfg.supersede_mode` then `close`. */
+    mode?: SupersedeMode;
+  },
+  deps: DisposeSupersededIssuePrsDeps = {},
+): Promise<DisposeSupersededIssuePrsResult> {
+  const log = deps.log ?? ((msg: string) => console.log(msg));
+  const mode: SupersedeMode = opts.mode ?? cfg.supersede_mode ?? "close";
+  const list =
+    deps.listOpenPrCandidates ??
+    ((c: PipelineConfig) => listOpenPrCandidates(c));
+  const closeFn = deps.closePr ?? closePr;
+  const commentFn = deps.postPrComment ?? postPrComment;
+
+  const result: DisposeSupersededIssuePrsResult = {
+    closed: [],
+    commented: [],
+    errors: [],
+    // List outage: fail-soft and allow advance (no election evidence to deny it).
+    isCanonical: true,
+  };
+
+  // Authoritative production list: never seed a missing managed PR (closed PR
+  // must not win election and dispose live siblings).
+  const electArgs: ElectCanonicalManagedIssuePrArgs = {
+    issueNumber: opts.issueNumber,
+    managedPrNumber: opts.managedPrNumber,
+    baseBranch: cfg.base_branch,
+    targetRepo: cfg.repo,
+    seedCallerIfAbsent: false,
+  };
+  const presenceArgs = {
+    managedPrNumber: opts.managedPrNumber,
+    managedBranch: opts.managedBranch,
+    baseBranch: cfg.base_branch,
+  };
+
+  /** Apply election after confirming managed PR is still open on head H. */
+  const electIfManagedOpen = (
+    candidates: PrCandidate[],
+    phase: "initial" | "revalidation",
+  ): { ok: true; canonical: number } | { ok: false } => {
+    if (!isManagedPrOpenOnHead(candidates, presenceArgs)) {
+      result.isCanonical = false;
+      const elected = electCanonicalManagedIssuePr(candidates, electArgs);
+      if (elected !== null) result.canonicalPrNumber = elected;
+      log(
+        `[pipeline] #${opts.issueNumber}: managed PR #${opts.managedPrNumber} ` +
+          `on head ${opts.managedBranch} is not present in the authoritative open-PR list` +
+          (phase === "revalidation" ? " (revalidation)" : "") +
+          `; treating as non-canonical and skipping supersede dispose` +
+          (elected !== null ? ` (open canonical contender PR #${elected})` : ""),
+      );
+      return { ok: false };
+    }
+    const canonical = electCanonicalManagedIssuePr(candidates, electArgs);
+    if (canonical === null || canonical !== opts.managedPrNumber) {
+      result.isCanonical = false;
+      if (canonical !== null) result.canonicalPrNumber = canonical;
+      const phaseNote =
+        phase === "revalidation"
+          ? "lost canonical election on revalidation"
+          : "non-canonical managed PR";
+      log(
+        `[pipeline] #${opts.issueNumber}: ${phaseNote} #${opts.managedPrNumber}` +
+          (canonical !== null
+            ? ` (GitHub-elected canonical is PR #${canonical})`
+            : " (no open managed contenders)") +
+          `; skipping supersede dispose`,
+      );
+      return { ok: false };
+    }
+    result.canonicalPrNumber = canonical;
+    return { ok: true, canonical };
+  };
+
+  let candidates: PrCandidate[];
+  try {
+    candidates = await list(cfg);
+  } catch (err) {
+    const msg =
+      `supersede open-PR list failed for issue #${opts.issueNumber}: ` +
+      `${(err as Error).message}`;
+    result.errors.push(msg);
+    log(`[pipeline] #${opts.issueNumber}: ${msg}`);
+    return result;
+  }
+
+  // First election against the open snapshot (requires managed PR still open).
+  const first = electIfManagedOpen(candidates, "initial");
+  if (!first.ok) return result;
+  let canonical = first.canonical;
+
+  // Re-list + re-elect immediately before destructive dispose (TOCTOU / cross-host).
+  try {
+    candidates = await list(cfg);
+  } catch (err) {
+    const msg =
+      `supersede revalidation list failed for issue #${opts.issueNumber}: ` +
+      `${(err as Error).message}`;
+    result.errors.push(msg);
+    log(`[pipeline] #${opts.issueNumber}: ${msg}`);
+    // Fail-soft: first election said we won; list flap must not block advance.
+    return result;
+  }
+  const second = electIfManagedOpen(candidates, "revalidation");
+  if (!second.ok) return result;
+  canonical = second.canonical;
+
+  const targets = selectSupersededOpenPrs(candidates, {
+    issueNumber: opts.issueNumber,
+    managedBranch: opts.managedBranch,
+    managedPrNumber: opts.managedPrNumber,
+    baseBranch: cfg.base_branch,
+    targetRepo: cfg.repo,
+  });
+
+  if (targets.length === 0) {
+    return result;
+  }
+
+  for (const prNumber of targets) {
+    // Never dispose the elected canonical (defensive — selection already excludes M).
+    if (prNumber === canonical) continue;
+    const body = formatSupersededPrComment({
+      managedPrNumber: opts.managedPrNumber,
+      issueNumber: opts.issueNumber,
+      managedBranch: opts.managedBranch,
+      mode,
+    });
+    try {
+      if (mode === "comment-only") {
+        await commentFn(cfg, prNumber, body);
+        result.commented.push(prNumber);
+        log(
+          `[pipeline] #${opts.issueNumber}: supersede comment on PR #${prNumber} ` +
+            `(comment-only; superseding PR #${opts.managedPrNumber})`,
+        );
+      } else {
+        await closeFn(cfg, prNumber, body);
+        result.closed.push(prNumber);
+        result.commented.push(prNumber);
+        log(
+          `[pipeline] #${opts.issueNumber}: closed superseded PR #${prNumber} ` +
+            `(superseding PR #${opts.managedPrNumber})`,
+        );
+      }
+    } catch (err) {
+      const msg =
+        `supersede dispose failed for PR #${prNumber} (issue #${opts.issueNumber}): ` +
+        `${(err as Error).message}`;
+      result.errors.push(msg);
+      log(`[pipeline] #${opts.issueNumber}: ${msg}`);
+    }
+  }
+
+  return result;
 }
 
 /** One page of an issue's `CONNECTED_EVENT`/`CROSS_REFERENCED_EVENT` timeline,

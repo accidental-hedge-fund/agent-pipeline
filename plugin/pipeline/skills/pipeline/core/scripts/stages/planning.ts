@@ -13,6 +13,7 @@
 import {
   addLabel,
   createPr,
+  disposeSupersededIssuePrs,
   extractHumanPlanComments,
   getIssueDetail,
   getOpenIssues,
@@ -21,6 +22,7 @@ import {
   postComment,
   setBlocked,
   transition,
+  type DisposeSupersededIssuePrsDeps,
 } from "../gh.ts";
 import {
   buildContextSnapshot,
@@ -1447,6 +1449,15 @@ export interface ResumeFromImplementingDeps {
    * fakes; use this seam only when the test must assert invocation order.
    */
   includeLockfileSideEffects?: typeof includeLockfileSideEffects;
+  /**
+   * After create-or-reuse of the managed PR, dispose other open associated PRs
+   * for the same issue on different heads (#729). Defaults to
+   * {@link disposeSupersededIssuePrs}. Inject a no-op in unit tests that must
+   * not touch GitHub; inject a spy to assert supersede runs on create and reuse.
+   */
+  disposeSupersededIssuePrs?: typeof disposeSupersededIssuePrs;
+  /** Deps forwarded into the default disposeSupersededIssuePrs implementation. */
+  supersedeDeps?: DisposeSupersededIssuePrsDeps;
 }
 
 /**
@@ -1603,6 +1614,38 @@ export async function resumeFromImplementing(
     const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
     const evType = prIsNew ? "pr_created" : "pr_updated";
     await appendEvent(opts.runDir, { schema_version: RUN_SCHEMA_VERSION, type: evType, at, pr: prNumber }, opts.runStoreDeps).catch(() => {});
+  }
+
+  // ---- Supersede other open associated PRs for this issue (#729) ----
+  // Runs on both create and reuse so a stale associated PR on a different head
+  // is not left open solely because the managed branch already had a PR.
+  // Cross-host: dispose elects a single GitHub-authoritative canonical managed
+  // PR; only the winner closes others. A non-canonical run must not transition
+  // as if its PR is the live integration head (concurrent hosts would otherwise
+  // mutually close each other then both advance on closed PRs).
+  // Fail-soft inside dispose for list/close I/O when the managed PR is canonical.
+  {
+    const dispose =
+      deps.disposeSupersededIssuePrs ?? disposeSupersededIssuePrs;
+    const supersedeResult = await dispose(
+      cfg,
+      {
+        issueNumber,
+        managedBranch: branch,
+        managedPrNumber: prNumber,
+        mode: cfg.supersede_mode,
+      },
+      deps.supersedeDeps ?? {},
+    );
+    if (supersedeResult.isCanonical === false) {
+      const winner = supersedeResult.canonicalPrNumber;
+      const reason =
+        `Non-canonical managed PR #${prNumber} for issue #${issueNumber}` +
+        (winner !== undefined ? ` (GitHub-elected canonical is PR #${winner})` : "") +
+        `; stopping without stage transition so concurrent advances cannot mutually close managed heads.`;
+      console.log(`[pipeline] #${issueNumber}: ${reason}`);
+      return { advanced: false, status: "no-op", reason };
+    }
   }
 
   // ---- implementing → design-gate ----
