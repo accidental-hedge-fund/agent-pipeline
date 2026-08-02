@@ -447,13 +447,14 @@ test("scaffoldRoadmap: missing unshipped plan row is scaffolded then ship-marked
   });
   assert.ok(result.includes("**v1.6.0** ✅ shipped"), "ship-mark after ensure");
   assert.ok(result.includes("Factory reliability"), "theme from context on scaffolded path");
-  assert.ok(result.includes("**v1.6.0 shipped 2026-06-17**"), "intro still patched");
+  // #597: history surfaces (intro chain / ## Shipped prose) are no longer mutated.
+  assert.ok(!result.includes("**v1.6.0 shipped 2026-06-17**"), "intro chain not accreted");
 });
 
 test("scaffoldRoadmap: shipped-only plan row is preserved (ship-mark no-op, no duplicate)", () => {
   // Regression for #730 review-1 (eb3d985c): ensure + patchReleasePlanRow + full
   // scaffold must not abort when only `| **v{version}** ✅ shipped |` exists.
-  // ensure is a no-op; ship-mark is idempotent; other sites still patch.
+  // ensure is a no-op; ship-mark is idempotent; plan-row stays singular (#597: no Shipped prose).
   const shippedOnly = SAMPLE_ROADMAP.replace(
     "| **v1.6.0** | minor | Intake & backlog automation | #158, #170 | Intake and release automation. |",
     "| **v1.6.0** ✅ shipped | minor | Intake & backlog automation | #158, #170 | Shipped already. |",
@@ -478,10 +479,10 @@ test("scaffoldRoadmap: shipped-only plan row is preserved (ship-mark no-op, no d
     planRows[0].includes("Shipped already."),
     "original shipped why-column preserved (ship-mark no-op)",
   );
-  assert.ok(result.includes("**v1.6.0 shipped 2026-06-17**"), "intro still patched");
+  assert.ok(!result.includes("**v1.6.0 shipped 2026-06-17**"), "intro chain not accreted (#597)");
   assert.ok(
-    result.includes("**v1.6.0 — Intake & backlog automation (shipped 2026-06-17"),
-    "shipped section still prepended",
+    !result.includes("**v1.6.0 — Intake & backlog automation (shipped 2026-06-17"),
+    "free-form Shipped block not prepended (#597)",
   );
 });
 
@@ -613,22 +614,40 @@ test("stampPerIssueTable: throws when per-issue table header is not found", () =
   );
 });
 
-test("scaffoldRoadmap: applies all four mutations atomically and returns patched text", () => {
+test("scaffoldRoadmap: applies plan-row + per-issue mutations (no Shipped prose accretion) (#597)", () => {
   const result = scaffoldRoadmap(SAMPLE_ROADMAP, SAMPLE_CTX);
 
-  // All four mutations must be present.
-  assert.ok(result.includes("**v1.6.0 shipped 2026-06-17**"), "intro line patched");
+  // Compact forward-looking mutations must be present.
   assert.ok(result.includes("**v1.6.0** ✅ shipped"), "release plan row patched");
-  assert.ok(result.includes("**v1.6.0 — Intake & backlog automation"), "shipped block prepended");
   assert.ok(result.includes("✅ v1.6.0"), "per-issue table stamped");
+  assert.ok(result.includes("See CHANGELOG.md"), "plan-row note points at CHANGELOG");
+
+  // #597: release path must NOT reintroduce unbounded Shipped history or intro-chain accretion.
+  assert.ok(
+    !result.includes("**v1.6.0 shipped 2026-06-17**"),
+    "intro-chain history must not be patched by scaffoldRoadmap",
+  );
+  assert.ok(
+    !result.includes("**v1.6.0 — Intake & backlog automation"),
+    "free-form ## Shipped block must not be prepended by scaffoldRoadmap",
+  );
 });
 
-test("scaffoldRoadmap bites: without mutations, the original text has none of the v1.6.0 changes", () => {
+test("scaffoldRoadmap bites: without mutations, the original text has none of the v1.6.0 ship markers", () => {
   // Verify the SAMPLE_ROADMAP does NOT already have the v1.6.0 markers (so the test is meaningful).
-  assert.ok(!SAMPLE_ROADMAP.includes("**v1.6.0 shipped"), "no pre-existing v1.6.0 shipped marker in intro");
   assert.ok(!SAMPLE_ROADMAP.includes("**v1.6.0** ✅ shipped"), "no pre-existing ✅ shipped for v1.6.0 in plan row");
   assert.ok(!SAMPLE_ROADMAP.includes("✅ v1.6.0"), "no pre-existing per-issue stamp for v1.6.0");
-  assert.ok(!SAMPLE_ROADMAP.includes("**v1.6.0 — Intake"), "no pre-existing v1.6.0 shipped block header");
+});
+
+test("scaffoldRoadmap regression: does not grow ## Shipped free-form history (#597)", () => {
+  const withoutShipped = SAMPLE_ROADMAP.replace(
+    /## Shipped[\s\S]*?(?=## Release plan)/,
+    "",
+  );
+  assert.ok(!withoutShipped.includes("## Shipped"), "fixture has no Shipped section");
+  const result = scaffoldRoadmap(withoutShipped, SAMPLE_CTX);
+  assert.ok(!result.includes("## Shipped"), "scaffoldRoadmap must not reintroduce ## Shipped");
+  assert.ok(result.includes("**v1.6.0** ✅ shipped"), "still marks plan row");
 });
 
 // ---------------------------------------------------------------------------

@@ -1,279 +1,17 @@
 # Roadmap
 
-Single source of truth for the open backlog, now organized by **sem-ver release**. Last updated 2026-07-10.
+Single source of truth for the **forward-looking** open backlog, organized by **sem-ver release**. Last updated 2026-08-01.
 
-**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **v1.0.0 shipped 2026-06-10** (tag `v1.0.0`, commit `450b537`) — the pipeline is external-ready. **v1.0.1 shipped 2026-06-10** (tag `v1.0.1`, commit `29a9bc3`) — dev-loop convergence. **v1.0.2 shipped 2026-06-11** (tag `v1.0.2`) — dev-loop convergence continued + first user-facing CLI niceties. **v1.0.3 shipped 2026-06-11** (tag `v1.0.3`) — contributor tooling (auto-regenerated `plugin/` mirror). **v1.0.4 shipped 2026-06-12** (tag `v1.0.4`) — recovery robustness: deterministic recovery + sharper hand-off moved into the skill; see Shipped. **v1.1.0 shipped 2026-06-13** (tag `v1.1.0`) — review quality (first minor): value-type drift guard, world-class review prompts, research-grounded planning, and closed-loop carry-forward lessons; see Shipped. **v1.1.1 shipped 2026-06-14** (tag `v1.1.1`) — capability/evidence hardening: deterministic `doctor` preflight and per-run evidence bundles; see Shipped. **v1.2.0 shipped 2026-06-15** (tag `v1.2.0`) — reviewer pluggability & per-step models: configurable review harness, self-review fallback, `models.implementing`, and override durability; see Shipped. **v1.2.1 shipped 2026-06-16** (tag `v1.2.1`) — pipeline-run reliability (first patch on the 1.2 line): shell-backed (`bash -c` + `pipefail`) configured gate commands, worktree dependency-install with issue-number capacity reclaim, and a resumable `implementing` stage; see Shipped. **v1.2.2 shipped 2026-06-16** (tag `v1.2.2`) — more pipeline-run reliability (second patch on the 1.2 line): persistently-failing pre-merge CI routes to `needs-human` instead of looping, the worktree harness never stages a `node_modules` symlink, and concurrent `git worktree add` is serialized against the shared `.git/config` lock; see Shipped. **v1.3.0 shipped 2026-06-16** (tag `v1.3.0`) — isolation & harness output quality (third minor): opt-in sandboxed harness execution (`harness_sandbox`) and a configurable format/lint normalization gate (`format_gate`) that runs format-before-test to a bounded fixed point; see Shipped. (Graduated-autonomy approval checkpoints #23 and bounded auto-loop #149 were re-scoped from this minor to **v1.4.0** — see Release plan.) **v1.4.0 shipped 2026-06-16** (tag `v1.4.0`) — private eval / shipcheck gate (fourth minor): an opt-in reviewer-owned acceptance-rubric gate (`shipcheck`) that runs before `ready-to-deploy`, advisory-first and default-off; see Shipped. **v1.5.0 shipped 2026-06-16** (tag `v1.5.0`) — Pipeline Desk desktop contracts (fifth minor): host-neutral launcher & install discovery (#153), machine-readable JSON status/preflight (#154), stable run directory + JSON events + non-hanging log-follow (#155), `.github/pipeline.yml` JSON-schema & validation command (#156), and run-artifact conventions — non-fatal I/O, write-time injection denylist, `schema_version`, local-only fields (#161) — so Pipeline Desk can supervise runs without scraping terminal prose; see Shipped. **v1.6.0 shipped 2026-06-17** (tag `v1.6.0`) — Intake & backlog automation (sixth minor): front-door intake (#158), release-PR automation (#170), the backlog-roadmap engine (#171), and the sweep re-spec/rebase command (#168); see Shipped. (#23 + #149 carried forward again, now to **v1.7.0** — the approval-gate forge-resistance security property still needs convergence.) **v1.7.0 shipped 2026-06-19** (tag `v1.7.0`) — Control plane & release_model; see Shipped. **v1.8.0 shipped 2026-06-19** (tag `v1.8.0`) — faster intake/sweep + fail-fast timeouts (eighth minor): intake/sweep spec-generation pinned to a fast model + a lean tool-free harness (no MCP, no repo exploration) → ~15× faster intake (#220/#247), plus configurable `intake_timeout`/`sweep_timeout` (#248/#250); see Shipped. **v1.9.0 shipped 2026-06-21** (tag `v1.9.0`) — Observability & reliability hardening; see Shipped. **v1.9.1 shipped 2026-06-24** (tag `v1.9.1`) — convergence & reliability fixes (first patch on the 1.9 line): planning no longer stalls on inherited `xhigh` reasoning (#278) and a mid-planning crash now resumes by restarting instead of waiting (#271); pre-merge/merge converge on repos with no branch-protection-required checks (#275) and when Actions never fires a run for the archive commit (#281); transient `gh` API failures retry instead of crashing the run (#270); worktrees are cleaned up after a successful merge (#296); plus a non-mutating spec-refinement contract for existing issues (#295), a faster roadmap engine for small backlogs (#292), and a `release.yml` annotated-tag guard (#289); see Shipped. Everything below v1.9.1 is the post-1.9.1 line. **v1.10.0 shipped 2026-06-28** (tag `v1.10.0`) — factory scoreboard + stage-level cost accounting; see Shipped. **v1.11.0 shipped 2026-06-28** (tag `v1.11.0`) — CLI dispatch v2: command registry + lifecycle/CLI-parsing split (#263), queue and budget mode (#305); see Shipped. **v1.12.0 shipped 2026-06-29** (tag `v1.12.0`) — move /pipeline off -- conventions (namespaced command surface, #273), pre-merge silently skips OpenSpec archive when openspec CLI unavailable (#308); see Shipped. **v1.12.1 shipped 2026-06-30** (tag `v1.12.1`) — ci_mode: local skip-GitHub-Actions gate (#350), OpenSpec config-commit path-scoped fix (#352), Codex no-sandbox env (#355); see Shipped. **v1.12.2 shipped 2026-07-01** (tag `v1.12.2`) — disambiguate OpenSpec spec-divergence so fix rounds keep progressing (#356); injectable-dep rule added to implementing and fix prompts (#360); see Shipped. **v1.12.3 shipped 2026-07-01** (tag `v1.12.3`) — Fix harness commit step lock-file side-effects; see Shipped. **v1.12.4 shipped 2026-07-02** (tag `v1.12.4`) — Pre-merge fix round: auto-apply bounded fix for correctness findings; see Shipped. **v1.13.0 shipped 2026-07-04** (tag `v1.13.0`) — Fix-stage recovery + logging portability + repo-map CLI; see Shipped. **v1.14.0 shipped 2026-07-07** (tag `v1.14.0`) — Convergence & evidence: post-fix re-review correctness, eval-gate fix routing, durable evidence, crash recovery; see Shipped. **v1.14.1 shipped 2026-07-07** (tag `v1.14.1`) — Gate/CLI reliability: test-gate capture resilience + wrapper --profile fix; see Shipped. **v1.15.0 shipped 2026-07-08** (tag `v1.15.0`) — Factory reliability: fix-round convergence, wedge-proof timeouts, de-flaked gates, single-operator human-input gate; see Shipped. **v1.15.1 shipped 2026-07-20** (tag `v1.15.1`) — Foundation reliability + release hygiene; see Shipped. **v1.15.2 shipped 2026-07-21** (tag `v1.15.2`) — Reviewer model/effort passthrough for codex + gitignored-artifact commit guard; see Shipped. **v1.16.0 shipped 2026-07-21** (tag `v1.16.0`) — Papercut capture: agent-logged friction events + CLI; see Shipped. **v1.17.0 shipped 2026-07-21** (tag `v1.17.0`) — Add `--bucket day; see Shipped. **v1.18.0 shipped 2026-07-21** (tag `v1.18.0`) — Controlled multi-harness evaluation foundation: Grok Build/Pi/OpenCode adapters + manifest-driven stage eval runner; see Shipped. **v1.19.0 shipped 2026-07-21** (tag `v1.19.0`) — Objective grading + API comparison: eval graders with statistical reporting + OpenRouter executor experiment controls; see Shipped. **v1.20.0 shipped 2026-07-21** (tag `v1.20.0`) — Risk-triggered design-interrogation gate + large-prompt harness delivery; see Shipped. **v1.21.0 shipped 2026-07-21** (tag `v1.21.0`) — Durable goal orchestration behind pipeline:loop; see Shipped. **v1.22.0 shipped 2026-07-22** (tag `v1.22.0`) — Factory robustness: fix-stage recovery, gate/installer/worktree hardening, structured fix outcomes; see Shipped. **v1.23.0 shipped 2026-07-23** (tag `v1.23.0`) — Review-quality context: bounded delta rounds, immutable resolved-finding evidence, PR-visible visual artifacts; see Shipped. **v1.24.0 shipped 2026-07-23** (tag `v1.24.0`) — Factory hygiene: release-discovery tolerance + cross-host auto-file serialization; see Shipped. **v1.25.0 shipped 2026-07-23** (tag `v1.25.0`) — Correction intelligence: structured correction ledger, correction compiler, closed-loop attribution + salvage/intake/init hardening; see Shipped. **v1.26.0 shipped 2026-07-24** (tag `v1.26.0`) — Integrated Durable Orchestration: in-repo pipeline:loop supervisor + conflict-aware parallel execution; see Shipped. **v1.27.0 shipped 2026-07-24** (tag `v1.27.0`) — Trace-Driven Eval Engineering: human-approved trace-to-fixture authoring + bounded eval-diagnosis trajectory artifacts; see Shipped. **v1.28.0 shipped 2026-07-25** (tag `v1.28.0`) — Factory-hardening & customer-hosted foundations: supervisor run-fatal fixes, pre-merge integrity, install/salvage papercuts, and orchestration/telemetry/fault-reporting designs; see Shipped. **v1.28.1 shipped 2026-07-28** (tag `v1.28.1`) — Factory-hardening patch: loop needs-human hold + phantom `pipeline:blocked` run-fatal fix, evaluator isolation restoration, eval effort/verdict correctness, repo-configurable harness roles, and loop-surface papercuts; see Shipped. **v1.28.2 shipped 2026-07-29** (tag `v1.28.2`) — Loop progress followability + factory papercuts: early handoff, durable logs follow, advance-run linkage, long-running skill packaging; worktree reclaim safety, open-PR pagination, nested node_modules verify, plan-revision Feedback Incorporated repair; see Shipped. **v1.28.3 shipped 2026-07-30** (tag `v1.28.3`) — Loop progress + pre-merge recovery: stage progress, dual-follow, CI/delta auto-fix recovery, offramp metrics, event-follow terminal exit; see Shipped. **v1.28.4 shipped 2026-07-30** (tag `v1.28.4`) — Pre-merge auto-fix noop re-verify: do not hard-block when autofix makes no commit and HEAD already satisfies findings; see Shipped. **v1.29.0 shipped 2026-07-30** (tag `v1.29.0`) — Docs/packaging truth, plan-review authority docs, human-gated merge-queue (dry-run + release-when-complete), evals ordered primary-reviewer pairs; see Shipped. **v1.29.1 shipped 2026-07-31** (tag `v1.29.1`) — v1.29.1; see Shipped. Everything below v1.29.1 is the post-1.29.1 line.
+**Goal driving the order:** make the pipeline robust enough to **develop itself**, then continue by value. **Historical release notes** live in [CHANGELOG.md](CHANGELOG.md) (generated from git tags) — this file no longer accretes per-release "Shipped" prose.
 
-**Self-dev is proven.** On 2026-06-08/09 the pipeline shipped **12 issues developing itself** end-to-end (planning → review → fix → `ready-to-deploy`), including three systemic fixes it surfaced about its *own* behavior. The adversarial review layer caught real defects on every run (no-regression violations, a sentinel-injection vector, the "prompt ≠ enforce" class twice).
+**Self-dev is proven.** On 2026-06-08/09 the pipeline shipped **12 issues developing itself** end-to-end (planning → review → fix → `ready-to-deploy`), including three systemic fixes it surfaced about its *own* behavior. The adversarial review layer caught real defects on every run.
 
-**Direction (2026-06-10 simplification audit).** A full read-only audit mapped the default path and proposed a faster minimal pass. The maintainer accepted the audit's *factual findings* and the **do-not-simplify safety list**, but **rejected disabling or default-demoting any review step** — plan-review and the two-phase (standard + adversarial) review stay **on by default**; rigor is the product, latency is not bought by removing review coverage. Speed/churn work is therefore framed as **rigor-preserving**: better prompts, deterministic-ask removal, audited override policy, docs-fold, and dead-surface deletion. No umbrella/tracker meta-issues — issues are standalone and decision-complete.
+**Direction (2026-06-10 simplification audit).** Plan-review and the two-phase (standard + adversarial) review stay **on by default**; rigor is the product. Speed/churn work is **rigor-preserving**. No umbrella/tracker meta-issues — issues are standalone and decision-complete.
 
 ## Forward Roadmap
 
 The next line moves agent-pipeline from "AI writes code under review" toward an open-source **outer-loop harness** for agentic software delivery: plan quality, review memory, evidence, drift control, gates, and human-owned release. The open-source core should prove the operating model and emit durable evidence. Hosted dashboards, org policy management, long-lived audit history, enterprise integrations, and managed reliability are intentionally outside this repo's core boundary.
 
-**v1.29.1 — v1.29.1 (shipped 2026-07-31, tag `v1.29.1`):**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] loop: resume repair-forward strands mid-pipeline items at pr_opened (dead next_action advance) (#712) | #724 |
-| | [Pipeline] pre-merge: openspec-archive can report skipped/no-candidates then block on still-active change (#714) | #732 |
-| | [Pipeline] implement/test-gate: enforce docs:check (and generator outputs) before PR open — stop #597-class red PRs (#716) | #733 |
-| | [Pipeline] loop/worktree: blocked items retain worktrees and exhaust max_concurrent_worktrees, cascading capacity blocks (#718) | #734 |
-| | [Pipeline] release: mandatory multi-item factory reliability gate before every release (#723) | #735 |
-| | [Pipeline] implement: fold uncommitted lockfile side-effects before test gate (parity with #358 fix path) (#722) | #736 |
-| | [Pipeline] factory/skill: advance follow must re-attach after host wait cancel until run_complete (terminal handoff) (#725) | #741 |
-| | [Pipeline] factory/skill: host-neutral progress notify (stop hard-requiring Claude PushNotification) (#742) | #744 |
-| | [Pipeline] release: preflight missing ROADMAP plan row — auto-insert or fail with doctor-grade remediation before version bump (#730) | #745 |
-| | [Pipeline] install: document Grok skill path (symlink) or add first-class --host grok (#731) | #746 |
-| | [Pipeline] pre-merge: category veto blocks auto-fix for entire delta batch (spec-divergence strands fixable concurrency/correctness) (#747) | #748 |
-
-**v1.29.0 — Docs/packaging truth, plan-review authority docs, human-gated merge-queue (dry-run + release-when-complete), evals ordered primary-reviewer pairs (shipped 2026-07-30, tag `v1.29.0`) — 29th minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | docs: include complete MIT license in README | #708 |
-| | [Pipeline] docs: distinguish independent agent plan review from human sign-off (#574) | #710 |
-| | [Pipeline] Align packaging docs: root engines ≥24, README install pins, remove stale goal-loop messaging (#627) | #715 |
-| | [Pipeline] merge-queue: optional release prepare when milestone queue is complete (#676) | #719 |
-| | [Pipeline] merge-queue: human-gated sequential merge of ready-to-deploy PRs (spec + dry-run) (#673) | #720 |
-| | [Pipeline] feat(evals): support ordered primary-reviewer pair treatments (#601) | #726 |
-| | docs(roadmap): plan v1.29.0 release row | #727 |
-
-**v1.28.4 — Pre-merge auto-fix noop re-verify: do not hard-block when autofix makes no commit and HEAD already satisfies findings (shipped 2026-07-30, tag `v1.28.4`):**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Pre-merge auto-fix no-commit after delta block hard-needs-human instead of re-verifying HEAD (stranded on already-fixed findings) (#698) | #700 |
-| | docs(roadmap): plan v1.28.4 (#698 follow-on) | #706 |
-
-**v1.28.3 — Loop progress + pre-merge recovery: stage progress, dual-follow, CI/delta auto-fix recovery, offramp metrics, event-follow terminal exit (shipped 2026-07-30, tag `v1.28.3`):**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] pipeline loop rejects its documented positional issue-list selector (maxPositionals guard fires before loop-preflight) (#554) | #678 |
-| | [Pipeline] pipeline:loop lacks a first-class per-item stage-progress surface (progress only via interleaved per-item advance logs) (#611) | #685 |
-| | [Pipeline] Milestone/label/roadmap-slice loop runs drop declared dependencies (compileWorkListRun hardcodes depends_on: []) (#615) | #686 |
-| | [Pipeline] Pre-merge CI gate: classify failures and bounded recovery before needs-human (post-#181) (#679) | #687 |
-| | [Pipeline] Pre-merge delta review: expand bounded auto-fix so fixable findings do not hard needs-human first (#680) | #688 |
-| | [Pipeline] CI flake: scripts/install.test.mjs fails with Node test-runner IPC deserialize error (#681) | #689 |
-| | [Pipeline] pipeline:loop: publish pre-merge gate sub-events (CI/delta/auto-fix) on the loop event stream (#682) | #690 |
-| | [Pipeline] Scoreboard/metrics: pre-merge needs-human rate by blocker class (#683) | #696 |
-| | [Pipeline] pipeline:loop skill: dual-follow of advance events is mandatory after loop_item_advance_linked (until #611) (#684) | #697 |
-| | [Pipeline] pipeline:loop event follow has no terminal exit (monitors keep running after loop_run_stopped) (#699) | #701 |
-| | docs(roadmap): plan v1.28.3 release row | #704 |
-
-**v1.28.2 — Loop progress followability + factory papercuts: early handoff, durable logs follow, advance-run linkage, long-running skill packaging; worktree reclaim safety, open-PR pagination, nested node_modules verify, plan-revision Feedback Incorporated repair (shipped 2026-07-29, tag `v1.28.2`):**
-
-| # | What | PR |
-|---|------|-----|
-| | config: use Grok primary with Codex review | #652 |
-| | fix(planning): mid-line Feedback Incorporated + format-repair retry (#658) | #659 |
-| | [Pipeline] Worktree reclaim force-deletes dirty/local-only work without operator remove gates (#622) | #660 |
-| | [Pipeline] getPrForIssue still hard-caps open PRs at -L 100 (#623) | #663 |
-| | [Pipeline] Nested node_modules commits pass verify (root-only check) (#624) | #664 |
-| | [Pipeline] pipeline:loop has no early run handoff — harness cannot follow progress (#665) | #669 |
-| | [Pipeline] pipeline loop logs: no --events --follow for durable loop store (#666) | #670 |
-| | [Pipeline] loop dispatch does not publish real per-item advance run_id / events path (#667) | #671 |
-| | [Pipeline] pipeline:loop skill forbids Monitor and claims seconds-long runs (#668) | #672 |
-
-**v1.28.1 — Factory-hardening patch: loop needs-human hold + phantom `pipeline:blocked` run-fatal fix, evaluator isolation restoration, eval effort/verdict correctness, repo-configurable harness roles, and loop-surface papercuts (shipped 2026-07-28, tag `v1.28.1`):**
-
-| # | What | PR |
-|---|------|-----|
-| | chore: stabilize Grok pipeline invocations | #605 |
-| | fix(loop): stop pipeline:loop wrapper from delegating to an external goal-loop skill | #609 |
-| | [Pipeline] Evaluator must enforce an isolated agent/command boundary for local harness cells (#607) | #612 |
-| | fix(loop): needs-human blocker holds instead of run_fataling the whole run — recognize the real 'blocked' label (#616) | #617 |
-| | [Pipeline] Make primary and secondary harness roles repository-configurable (#608) | #619 |
-| | [Pipeline] pipeline:loop --new-run is rejected by its own flag validation (allowedFlags omits newRun) (#610) | #638 |
-| | [Pipeline] Bump js-yaml to ≥4.3.0 (DoS advisories on 4.1.1) (#625) | #639 |
-| | [Pipeline] Eval harness path maps effort incorrectly (effort vs reasoningEffort) (#621) | #640 |
-| | [Pipeline] pipeline:loop reports all_done:true when items were merely excluded (undispatchable), masking 'nothing ran' (#614) | #641 |
-| | [Pipeline] parseStrictVerdict drops cross-round finding fields under stage_executors (#620) | #642 |
-| | [Pipeline] bug(evals): review-mode prompt omits structured verdict contract (#606) | #643 |
-
-**v1.28.0 — Factory-hardening & customer-hosted foundations: supervisor run-fatal fixes, pre-merge integrity, install/salvage papercuts, and orchestration/telemetry/fault-reporting designs (shipped 2026-07-25, tag `v1.28.0`) — 28th minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] loop supervisor dispatches backlog-stage milestone items and misclassifies the refusal as run_fatal workflow-engine-defect (#568) | #578 |
-| | [Pipeline] loop supervisor classifies needs-human plan-review blockers as run_fatal workflow-engine-defect (#570) | #580 |
-| | [Pipeline] Update Pi adapter install guidance to maintained npm package (#571) | #582 |
-| | [Pipeline] pre-merge archives OpenSpec on a stale worktree base, diverging from the reviewed head (push fails non-fast-forward; force would lose reviewed code) (#579) | #583 |
-| | [Pipeline] install update treats long-lived 'pipeline logs --follow' processes as live runs, blocking refresh indefinitely (#567) | #584 |
-| | [Pipeline] pre-merge fix/override-resume path lacks the salvage-uncommitted-work fallback (harness work silently discarded) (#547) | #585 |
-| | [Pipeline] Investigate: pre-merge fix/override-resume harness work missing from stage worktree (clean-worktree signature) (#553) | #586 |
-| | [Pipeline] Decouple orchestration from execution with customer-hosted runners (#505) | #592 |
-| | [Pipeline] Multi-repo fleet telemetry aggregation and cross-host observability (#503) | #593 |
-| | [Pipeline] Privacy-safe upstream product fault reporting and clustered issue promotion (#502) | #594 |
-| | [Pipeline] loop supervisor run_fatals the entire run when one dispatched item already carries a stale 'blocked' label (#581) | #595 |
-
-**v1.27.0 — Trace-Driven Eval Engineering: human-approved trace-to-fixture authoring + bounded eval-diagnosis trajectory artifacts (shipped 2026-07-24, tag `v1.27.0`) — 27th minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Human-approved trace-to-fixture authoring with explicit environment fidelity (#535) | #569 |
-| | [Pipeline] Persist bounded treatment and verifier trajectory artifacts for eval diagnosis (#536) | #572 |
-
-**v1.26.0 — Integrated Durable Orchestration: in-repo pipeline:loop supervisor + conflict-aware parallel execution (shipped 2026-07-24, tag `v1.26.0`) — 26th minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] epic: absorb standalone goal-loop core into Agent Pipeline (#508) | #517 |
-| | [Pipeline] feat: add typed durable-run blocker classification and recovery policies (#509) | #552 |
-| | [Pipeline] feat: add durable paused/waiting states and audited authority amendments (#510) | #555 |
-| | [Pipeline] feat: reconcile GitHub, git, checks, and pipeline truth for durable runs (#511) | #556 |
-| | [Pipeline] feat: implement the in-repo pipeline:loop supervisor, resume, and audit commands (#512) | #557 |
-| | [Pipeline] fix: preserve external dependencies and report durable-run dependency deadlocks (#513) | #558 |
-| | [Pipeline] Auto-file issues for durable-run blockers via the improve clustering path (#538) | #559 |
-| | [Pipeline] feat: document native /goal bootstrap for pipeline:loop on Claude and Codex (#514) | #560 |
-| | [Pipeline] test: complete an integrated pipeline:loop two-item live pilot with recovery (#515) | #561 |
-| | [Pipeline] feat: declare durable-run ownership surfaces and conflict relationships (#529) | #562 |
-| | [Pipeline] feat: schedule only proven-independent pipeline:loop items concurrently (#530) | #563 |
-| | PR #564 | #564 |
-| | [Pipeline] epic: add conflict-aware parallel execution for integrated pipeline:loop runs (#528) | #565 |
-
-**v1.25.0 — Correction intelligence: structured correction ledger, correction compiler, closed-loop attribution + salvage/intake/init hardening (shipped 2026-07-23, tag `v1.25.0`) — 25th minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Auto-salvage git add fails on nested node_modules — ':(exclude)node_modules' only matches top level (#521) | #543 |
-| | [Pipeline] Salvage staging includes pipeline-internal .pipeline-rebase-attempted marker as a round's only content (#522) | #544 |
-| | [Pipeline] Make pipeline init config exhaustive, self-documenting, and schema-drift-proof (#504) | #545 |
-| | [Pipeline] intake: ROADMAP anchor check fires after the model call and aborts against API-created milestones (#539) | #546 |
-| | [Pipeline] Structured correction_event ledger for operator interventions and recovered failures (#499) | #548 |
-| | [Pipeline] Correction compiler: cluster repeated expert corrections into reusable-control proposals (#500) | #549 |
-| | [Pipeline] Closed-loop control attribution and repeat-correction scoreboard (#501) | #550 |
-
-**v1.24.0 — Factory hygiene: release-discovery tolerance + cross-host auto-file serialization (shipped 2026-07-23, tag `v1.24.0`) — 24th minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Release PR discovery misparses non-PR commits ending in a single (#N) as squash-merge PRs (#498) | #540 |
-| | [Pipeline] Cross-host serialization for improve auto-file dedup/rate-cap (follow-up to #421 review finding 582c19e6) (#459) | #541 |
-
-**v1.23.0 — Review-quality context: bounded delta rounds, immutable resolved-finding evidence, PR-visible visual artifacts (shipped 2026-07-23, tag `v1.23.0`) — 23th minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Pre-merge delta rounds are unbounded; settled trade-offs escape the #389 digest under new finding keys (#483) | #532 |
-| | [Pipeline] Pre-merge delta reviews of narrow follow-up diffs re-assert already-resolved findings (no resolved-finding context) (#496) | #533 |
-| | [Pipeline] Visual-gate: publish captured artifacts as truly PR-visible evidence (follow-up to #395) (#463) | #534 |
-
-**v1.22.0 — Factory robustness: fix-stage recovery, gate/installer/worktree hardening, structured fix outcomes (shipped 2026-07-22, tag `v1.22.0`) — 22th minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] pipeline:loop native-goal probe false-negatives on every real host — /goal is a slash command, absent from claude --help (#506) | #507 |
-| | [Pipeline] Fix-stage harness crash (exit 1) gets no auto-recovery — in-progress worktree work is abandoned to a human block (#486) | #518 |
-| | [Pipeline] Human-input gate counts pipeline unblock/override comments as unacknowledged (#390/#471-class recurrence) (#484) | #519 |
-| | [Pipeline] Detached run creates wrapper + run store before validating the repo cwd — strays on exit-2 refusal (#485) | #520 |
-| | [Pipeline] Auto-update races in-flight runs: skill files swap under long-lived run processes (#450) | #523 |
-| | [Pipeline] plan_revision prompt's fenced format example defeats verifyPlanRevisionOutput (#443) | #524 |
-| | [Pipeline] Resolve managed worktrees through Git common-dir/configured root across linked checkout invocations (#472) | #525 |
-| | [Pipeline] Support structured non-code fix outcomes and preserve their blocker disposition (#473) | #526 |
-
-**v1.21.0 — Durable goal orchestration behind pipeline:loop (shipped 2026-07-21, tag `v1.21.0`) — 21th minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] feat: converge durable goal orchestration behind pipeline:loop (#451) | #495 |
-
-**v1.20.0 — Risk-triggered design-interrogation gate + large-prompt harness delivery (shipped 2026-07-21, tag `v1.20.0`) — twentieth minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Add a risk-triggered design-interrogation gate with durable decision evidence (#436) | #491 |
-| | [Pipeline] Review prompts over MAX_ARG_STRLEN (128KiB) fail harness spawn with exit -1 — deliver prompts via stdin, not argv (#492) | #493 |
-
-**v1.19.0 — Objective grading + API comparison: eval graders with statistical reporting + OpenRouter executor experiment controls (shipped 2026-07-21, tag `v1.19.0`) — nineteenth minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Add objective eval graders and comparative statistical reporting (#433) | #488 |
-| | [Pipeline] Extend API executors for OpenRouter experiment controls and provider provenance (#434) | #489 |
-
-**v1.18.0 — Controlled multi-harness evaluation foundation: Grok Build/Pi/OpenCode adapters + manifest-driven stage eval runner (shipped 2026-07-21, tag `v1.18.0`) — eighteenth minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Add Grok Build, Pi, and OpenCode as first-class CLI harness adapters (#431) | #479 |
-| | [Pipeline] Add a manifest-driven stage eval runner with frozen fixtures and isolated worktrees (#432) | #480 |
-| | [Pipeline] Pre-merge delta review races fix-round pushes: verdict recorded against a superseded SHA then blocks on stale findings (#481) | #482 |
-
-**v1.17.0 — Add `--bucket day (shipped 2026-07-21, tag `v1.17.0`) — seventeenth minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Capture actual per-call cost from harness output, not just estimates (#429) | #470 |
-| | [Pipeline] Human-input gate counts the pipeline's own severity-policy transition comment as unacknowledged human input (#390-class recurrence) (#471) | #474 |
-| | [Pipeline] Add `--bucket day|week` time-series output to pipeline scoreboard (#425) | #475 |
-| | [Pipeline] Scoreboard grouping by harness, model, effort, and executor (#437) | #476 |
-| | [Pipeline] Add self-contained HTML export to pipeline scoreboard (#427) | #477 |
-
-**v1.16.0 — Papercut capture: agent-logged friction events + CLI (shipped 2026-07-21, tag `v1.16.0`) — sixteenth minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | ops: set models.review to auto (unblocks codex reviewer after #441 passthrough) | #453 |
-| | [Pipeline] Engine-written .agent-pipeline/history/ is not gitignored — doctor worktree-clean fails on any repo the engine has run in (#452) | #455 |
-| | [Pipeline] Regression (#441): explicit Claude-alias reviewer model now 400s mid-run on codex instead of failing config validation (#454) | #456 |
-| | [Pipeline] Papercut capture: agent-logged friction events + CLI (#419) | #457 |
-| | [Pipeline] Cluster recurring papercuts into backlog issues, with opt-in auto-file (#421) | #458 |
-| | [Pipeline] Archive legacy OpenSpec changes left active on main (#365) | #460 |
-| | [Pipeline] Delta reviews lack cross-round memory — later rounds contradict accepted earlier trade-offs (#389) | #461 |
-| | [Pipeline] Add a visual-gate stage: repo-defined E2E/visual verification with artifact evidence (before eval-gate) (#395) | #462 |
-| | [Pipeline] Cross-round review memory demotes genuinely NEW findings on a previously-fixed surface (reversal-unacknowledged mis-fire) (#464) | #465 |
-| | chore: archive OpenSpec change left active by #464's override-resumed pre-merge | #466 |
-| | [Pipeline] Override-resumed pre-merge skips the OpenSpec archive step, leaving the change active on the default branch (#467) | #468 |
-
-**v1.15.2 — Reviewer model/effort passthrough for codex + gitignored-artifact commit guard (shipped 2026-07-21, tag `v1.15.2`):**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Reviewer CLI model passthrough: honor a configured model (and effort) for the codex reviewer (#441) | #442 |
-| | [Pipeline] Harness commit step silently drops gitignored artifacts — surface the exclusion loudly (#445) | #446 |
-
-**v1.15.1 — Foundation reliability + release hygiene (patch):**
-
-| # | What | Why |
-|---|------|-----|
-| #413 | Auto-tag workflow must not consume `RELEASE_TAG_TOKEN` at checkout | Release automation should fail only on release-tag pushes that actually need the secret, not on every main push. |
-| #402 | Serialize or retry concurrent `git fetch origin main` ref-lock contention | Factory/queue usage must survive parallel runs without turning shared Git refs into blocked pipeline items. |
-| #401 | Make sweep/intake spec generation capture the final spec, not tool-call narration | Backlog automation must be trustworthy before the repo can lean harder into public roadmap generation and issue shaping. |
-
-**v1.16.0 — Outer-loop evidence + drift control (minor):**
-
-| # | What | Why |
-|---|------|-----|
-| #365 | Archive legacy active OpenSpec changes left on `main` and add a default-branch drift check | This is the concrete Drift Backstop proof: stale implementation intent must not pollute current agent context. |
-| #389 | Add cross-round review memory so later reviews do not contradict already-settled trade-offs | Review quality depends on durable reasoning context, not just another stateless adversarial pass. |
-| #395 | Add a first-class visual-gate stage with reviewable artifact evidence | Buyer-visible evidence matters more than "the suite exited 0"; humans need screenshots/traces/diffs at release time. |
-| #419 | Papercut capture: agent-logged friction events + CLI | Non-blocking friction agents push through today vanishes unrecorded; capturing it in run artifacts is the raw material for factory self-improvement. |
-| #421 | Cluster recurring papercuts into backlog issues, with opt-in auto-file | The GitHub issue is this factory's only unit of work — recurring friction must become backlog issues the pipeline then fixes itself. |
-
-**v1.17.0 — Factory observability: scoreboard exports + cost fidelity (minor):**
-
-| # | What | Why |
-|---|------|-----|
-| #425 | Add day/week time-series output to the scoreboard | Trend data makes harness performance and reliability changes visible across release windows. |
-| #427 | Add a self-contained HTML scoreboard export | Evaluation and factory evidence should be reviewable without the CLI or a hosted dashboard. |
-| #429 | Capture actual per-call harness cost and its provenance | Comparative reports must distinguish actual, estimated, and unknown cost instead of treating missing telemetry as free. |
-
-**v1.18.0 — Controlled multi-harness evaluation foundation (minor):**
-
-| # | What | Why |
-|---|------|-----|
-| #431 | Add first-class Grok Build, Pi, and OpenCode CLI adapters alongside Claude and Codex | The deployed CLI harness, including its tool loop and OAuth route, is part of the treatment being measured. |
-| #432 | Add a manifest-driven stage eval runner with frozen fixtures and isolated worktrees | Identical immutable inputs and isolated execution are required before harness/model/effort comparisons are credible. |
-
-**v1.19.0 — Objective grading + API comparison (minor):**
-
-| # | What | Why |
-|---|------|-----|
-| #433 | Add objective graders and comparative statistical reporting | Hidden checks, seeded defects, paired deltas, and confidence intervals turn run evidence into defensible decisions. |
-| #434 | Extend API executors for OpenRouter controls and provider provenance | Direct API treatments need controlled reasoning parameters and resolved-provider evidence, and must remain distinct from OAuth CLI products. |
 
 **Later (unscheduled) — Public adoption + category proof (draft, issues not yet filed; carried from the v1.17.0 draft when that slot became factory observability):**
 
@@ -286,413 +24,66 @@ The next line moves agent-pipeline from "AI writes code under review" toward an 
 | Factory Run demo | Publish a reproducible multi-issue demo showing scoreboard, run artifacts, caught defects, and the human merge boundary. |
 | Event-sink boundary | Keep local events open-source while documenting the hosted-control-plane seam for searchable history, dashboards, audit, SSO/RBAC, and enterprise integrations. |
 
-## Shipped
-
-**Foundation (earlier):** **#13** configurable steps · **#15** test/build gate + bounded fix loop · **#11** last30days carry-forward.
-
-**2026-06-08/09 self-dev run (all merged):**
-
-| # | What | PR |
-|---|------|-----|
-| #12 | eval gate step | #58 |
-| #9 | installer installs/updates deps | #59 |
-| #37 | last30days brief from full issue content | #60 |
-| #16 | SHA-keyed review verdicts + re-review on HEAD move | #63 |
-| #41 | OpenSpec context → all harness steps | #65 |
-| #20 | commit traceability trailers | #66 |
-| #26 | incorporate human plan comments into revision | #67 |
-| #42 | README friendliness | #72 |
-| #35 | explicit `init` command (labels + starter config) | #73 |
-| #38 | OpenSpec baseline capability specs (reviewed agent pass) | #78 |
-
-**Self-surfaced systemic fixes (filed and shipped mid-run):**
-
-| # | What | PR |
-|---|------|-----|
-| #61 | dogfood the test gate (catch `plugin/` mirror staleness in-pipeline) | #62 |
-| #64 | tighten SKILL.md monitor-filter guidance | #69 |
-| #68 | harden harness-instruction steps (verify, don't just prompt) | #71 |
-| #17 | review severity policy + audited overrides | #86 ✅ merged 2026-06-10 |
-
-**v1.15.1 — Foundation reliability + release hygiene (shipped 2026-07-20, tag `v1.15.1`):**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Auto-tag releases when a release PR merges — eliminate the manual annotated-tag step (#411) | #412 |
-| | [Pipeline] auto-tag-release workflow fails every main push when RELEASE_TAG_TOKEN is absent — secret consumed at checkout, before the release guard (#413) | #414 |
-| | docs: organize forward roadmap by release | #415 |
-| | [Pipeline] Sweep/intake spec generation captures tool-call narration instead of the final spec, failing section validation (#401) | #416 |
-| | [Pipeline] Concurrent runs race on 'git fetch origin main' — ref-lock failure blocks a run at planning (#402) | #417 |
-| | docs: scaffold v1.16.0 ROADMAP lane (papercuts) for intake | #418 |
-| | intake: ROADMAP slots for #419 + #421 (papercuts, v1.16.0) | #420 |
-| | docs: scaffold v1.17.0 ROADMAP lane (factory observability) for intake | #424 |
-| | intake: ROADMAP slot for #425 — Add `--bucket day|week` time-series output to pipeline scoreboard | #426 |
-| | intake: ROADMAP slot for #427 — Add self-contained HTML export to pipeline scoreboard | #428 |
-| | intake: ROADMAP slot for #429 — Capture actual per-call cost from harness output, not just estimates | #430 |
-| | docs: add evaluation and reasoning-assurance roadmap lanes | #435 |
-| | intake: ROADMAP slot for #437 — Scoreboard grouping by harness, model, effort, and executor | #438 |
-| | [Pipeline] [Pipeline] Intake/sweep spec prompt never says the harness is tool-free — spec model attempts repo exploration and burns the run on tool-call narration (residual of #401/#416) (#423) | #439 |
-
-**v1.15.0 — Factory reliability: fix-round convergence, wedge-proof timeouts, de-flaked gates, single-operator human-input gate (shipped 2026-07-08, tag `v1.15.0`) — fifteenth minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | docs: add README lifecycle diagram | #335 |
-| | [Pipeline] Detect stale installed engine: doctor check + documented update path when the install lags released fixes (#385) | #400 |
-| | [Pipeline] fix stage dead-ends when all blocking findings are overridden or don't reproduce ('no new commits' block) (#391) | #404 |
-| | [Pipeline] Review harness call can hang indefinitely past review_timeout — runCapped kill fires but the run never concludes (#398) | #405 |
-| | [Pipeline] Flaky event-sink tests: stdin EPIPE races the close event, intermittently failing every test gate (#403) | #406 |
-| | [Pipeline] Human-input gate counts the pipeline's own review comments as unacknowledged human input (#390) | #407 |
-| | [Pipeline] Reviewer spawn crashes the entire run on NUL bytes in the prompt payload (ERR_INVALID_ARG_VALUE) (#393) | #408 |
-| | [Pipeline] Fix/auto-fix rounds don't rebuild generated artifacts before committing (recurring dist-drift CI failures) (#387) | #409 |
-
-**v1.14.1 — Gate/CLI reliability: test-gate capture resilience + wrapper --profile fix (shipped 2026-07-07, tag `v1.14.1`):**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Host wrapper injects --profile into core commands that reject it (refine-spec, scoreboard) (#383) | #394 |
-| | [Pipeline] Test-gate output capture can die mid-stream (event-sink EPIPE), spuriously failing the gate with head-only truncated evidence (#384) | #397 |
-
-**v1.14.0 — Convergence & evidence: post-fix re-review correctness, eval-gate fix routing, durable evidence, crash recovery (shipped 2026-07-07, tag `v1.14.0`) — fourteenth minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Config: per-stage effort levels and model+effort config for review_harness (#366) | #375 |
-| | [Pipeline] Per-stage executor delegation to external agent providers (#314) | #376 |
-| | [Pipeline] Eval-gate output truncation cuts from the wrong end, dropping the diagnostic summary (#373) | #378 |
-| | [Pipeline] Pre-merge auto-fix re-review evaluates the stale pre-fix diff, spuriously re-blocking after a correct auto-fix (#371) | #379 |
-| | [Pipeline] Durable per-stage timing table + issue evidence history in PR comments (#377) | #380 |
-| | [Pipeline] Eval-gate failure should route to a fix round with eval output as context (#372) | #381 |
-| | [Pipeline] Crash-orphaned 'implementing' stage is unrecoverable by a fresh run (exits 0 with 'nothing to do') (#382) | #386 |
-
-**v1.13.0 — Fix-stage recovery + logging portability + repo-map CLI (shipped 2026-07-04, tag `v1.13.0`):**
-
-| # | What | PR |
-|---|------|-----|
-| #349 | [Pipeline] Fix stage: advance instead of blocking when fix was already applied externally (HEAD > review SHA) | #368 |
-| #343 | [Pipeline] Logging portability | #369 |
-| #367 | [Pipeline] pipeline config repo-map: CLI primitive to add/remove repo-map entries | #370 |
-
-**v1.13.0 — Fix-stage recovery + logging portability + repo-map CLI (shipped 2026-07-04, tag `v1.13.0`) — thirteenth minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Fix stage: advance instead of blocking when fix was already applied externally (HEAD > review SHA) (#349) | #368 |
-| | [Pipeline] Logging portability (#343) | #369 |
-| | [Pipeline] pipeline config repo-map: CLI primitive to add/remove repo-map entries (#367) | #370 |
-
-**v1.12.4 — Pre-merge fix round: auto-apply bounded fix for correctness findings (shipped 2026-07-02, tag `v1.12.4`):**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Pre-merge fix round: auto-apply bounded fix for correctness findings before escalating to needs-human (#359) | #363 |
-
-**v1.12.3 — Fix harness commit step lock-file side-effects (shipped 2026-07-01, tag `v1.12.3`):**
-
-| # | What | PR |
-|---|------|-----|
-| | feat: add injectable-dep rule to implementing and fix prompts | #360 |
-| | [Pipeline] Fix harness commit step should include npm lock-file side-effects (#358) | #361 |
-
-**v1.12.2 — OpenSpec spec-divergence disambiguation + injectable-dep rule in prompts (shipped 2026-07-01, tag `v1.12.2`):**
-
-| # | What | PR |
-|---|------|-----|
-| #356 | [Pipeline] Disambiguate OpenSpec spec-divergence so fix rounds keep progressing | #357 |
-| #360 | Add injectable-dep rule to implementing and fix prompts; revert from CLAUDE.md | #360 |
-
-**v1.12.1 — ci_mode local + OpenSpec config path + Codex no-sandbox (shipped 2026-06-30, tag `v1.12.1`):**
-
-| # | What | PR |
-|---|------|-----|
-| #350 | [Pipeline] Add ci_mode: local option to skip GitHub Actions wait in pre-merge | #351 |
-| #352 | [Pipeline] OpenSpec config left untracked causes dirty-worktree block before test gate | #354 |
-| #355 | fix: allow Codex no-sandbox mode via env | #355 |
-
-**v1.12.0 — Namespaced command surface + OpenSpec CLI guard (shipped 2026-06-29, tag `v1.12.0`):**
-
-| # | What | PR |
-|---|------|-----|
-| #273 | [Pipeline] Move /pipeline off -- conventions (namespaced command surface) | — |
-| #308 | [Pipeline] Pre-merge silently skips OpenSpec archive when openspec CLI unavailable | — |
-
-**v1.11.0 — CLI dispatch v2 cont. + queue/budget (shipped 2026-06-28, tag `v1.11.0`):**
-
-| # | What | PR |
-|---|------|-----|
-| #263 | Command registry + lifecycle/CLI-parsing split | #328 |
-| #305 | Queue and budget mode | #330 |
-
-**v1.10.0 — Factory scoreboard + stage-level cost accounting (shipped 2026-06-28, tag `v1.10.0`):**
-
-| # | What | PR |
-|---|------|-----|
-| — | Factory scoreboard + stage-level cost accounting | — |
-
-**v1.9.1 — Convergence & reliability fixes (shipped 2026-06-24, tag `v1.9.1`) — first patch on the 1.9 line:**
-
-| # | What | PR |
-|---|------|-----|
-| | [Pipeline] Planning stalls ~20min: codex plan-review inherits global xhigh reasoning and rewrites the plan instead of returning a verdict (#278) | #291 |
-| | [Pipeline] pre-merge gate polls to ci_timeout when GitHub Actions never fires a run for the archive commit (#281) | #290 |
-| | [Pipeline] Roadmap engine is too slow for small backlogs (#292) | #293 |
-| | chore(ci): add fast local gate + cancel superseded Actions runs | #294 |
-| | [Pipeline] Expose non-mutating spec refinement contract for existing issues (#295) | #297 |
-| | [Pipeline] A transient gh API failure (e.g. HTTP 401) crashes the whole pipeline run instead of retrying (#270) | #299 |
-| | [Pipeline] Ability to clean up worktrees after successful merge (#296) | #298 |
-| | [Pipeline] pipeline merge: hard-fails on repos with no branch-protection-required checks (#275) | #300 |
-| | chore(openspec): archive merge-no-required-checks-fallback change | #307 |
-| | [Pipeline] release.yml: annotated-tag guard + notes extraction fail under actions/checkout (#289) | #309 |
-| | [Pipeline] Crash mid-planning strands the issue on the transient pipeline:planning label; resume waits instead of restarting (#271) | #310 |
-
-**v1.9.0 — Observability & reliability hardening (shipped 2026-06-21, tag `v1.9.0`) — ninth minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | chore: gitignore .worktrees/ + .agent-pipeline/runs/ so pipeline runs don't dirty main | #267 |
-| | [Pipeline] Align GitHub Actions CI with root npm run ci (#254) | #268 |
-| | [Pipeline] Block pre-merge when OpenSpec archive commit fails (#255) | #269 |
-| | [Pipeline] release.yml: published Release notes don't come from the annotated tag (--notes-from-tag yields the commit message / auto-notes) (#253) | #272 |
-| | [Pipeline] Use shared gh wrapper for review follow-up issue/comment writes (#256) | #274 |
-| | [Pipeline] Instrument GitHub call count and latency per pipeline run (#257) | #276 |
-| | [Pipeline] Add fast worktree lookup and cache status snapshots (#258) | #277 |
-| | [Pipeline] Make stage transitions and blocker writes idempotently auditable (#259) | #279 |
-| | [Pipeline] Kill harness descendant processes on timeout (#260) | #280 |
-| | [Pipeline] Prefer run-directory summary.json for pipeline summary mode (#261) | #282 |
-| | [Pipeline] Treat last30days carry-forward context as untrusted prompt input (#262) | #283 |
-| | [Pipeline] Migrate review comments to structured ReviewArtifact records (#264) | #285 |
-| | [Pipeline] Unify freeform and OpenSpec planning flows behind shared phases (#265) | #286 |
-| | [Pipeline] Add minimum benchmark and reliability regression suite for pipeline hotspots (#266) | #287 |
-
-**v1.8.0 — Faster intake/sweep + fail-fast timeouts (shipped 2026-06-19, tag `v1.8.0`) — eighth minor:**
-
-| # | What | PR |
-|---|------|-----|
-| #220 | intake/sweep: pin a fast model + lean tool-free harness call (~15× faster intake) | #247 |
-| #248 | intake/sweep: configurable intake_timeout/sweep_timeout (fail-fast on a hung harness) | #250 |
-| | chore: cover intake_timeout in test + document the new config keys in README | #251 |
-
-**v1.7.0 — Control plane & release_model (shipped 2026-06-19, tag `v1.7.0`) — seventh minor:**
-
-| # | What | PR |
-|---|------|-----|
-| | docs: schedule #186 as v1.6.1 (version-staleness detection) | #210 |
-| | docs: drop closed research trackers #14/#27 from ROADMAP | #211 |
-| | docs: restore intake/sweep *(none)* anchors + v1.7.0 detail section | #213 |
-| | intake: ROADMAP slot for #214 — Roadmap `release_model` config: bundle issues into milestones | #215 |
-| | docs: re-slot ROADMAP — v1.7.0 control plane & release_model; carried autonomy → v1.8.0 | #218 |
-| | [Pipeline] Roadmap `release_model` config: bundle issues into milestones (#214) | #219 |
-| | [Pipeline] `pipeline merge <pr>`: human-invoked PR-merge sub-command (loop-isolated; the autonomous loop never merges) (#217) | #221 |
-| | [Pipeline] `pipeline triage <issue> --stage ready|backlog`: set an issue's pipeline stage label from the CLI (#216) | #222 |
-| | [Pipeline] `pipeline --version` can report a stale version that lags `core/package.json` (running code != claimed version) (#186) | #224 |
-| | [Pipeline] fix→review handoff: discover off-branch (detached) pipeline worktrees (#223) | #226 |
-| | chore(config): tighten review_policy — block_threshold: high, min_confidence: 0.85 | #231 |
-| | [Pipeline] Cache review verdict by diff-hash + delta-only pre-merge re-review to stop redundant non-deterministic re-reviews (#228) | #237 |
-| | [Pipeline] Support area/category-scoped --override dispositions that survive re-review (finding keys drift) (#229) | #238 |
-| | [Pipeline] Review convergence: calibrate severity (make LOW real) + add a non-blocking finding emission path (#236) | #239 |
-| | [Pipeline] Review convergence: risk-proportional adversarial blocking (scale review-2 threshold by review-1 risk tier) (#232) | #240 |
-| | [Pipeline] Review convergence: demote-and-advance at the adversarial round ceiling instead of hard-parking at needs-human (#233) | #241 |
-| | [Pipeline] Review convergence: theme/surface-based recurrence guard (catch new-key-each-round whack-a-mole) (#234) | #242 |
-| | [Pipeline] Review convergence: surgical fix rounds to prevent fix-introduced defects (#235) | #243 |
-| | [Pipeline] bounded auto-loop mode: continue fix/review/test cycles within explicit budgets, then park with evidence (#149) | #244 |
-| | [Pipeline] desktop contract: persist structured per-finding review records into the run directory (Review tab) (#209) | #245 |
-
-**v1.6.0 — Intake & backlog automation (shipped 2026-06-17, tag `v1.6.0`) — sixth minor:**
-
-| # | What | PR |
-|---|------|-----|
-| #170 | `pipeline release` sub-command: prepares a release PR (version bump in both `package.json` + `core/package-lock.json`, `plugin/` mirror regen, four-site ROADMAP scaffold, CI gate) and stops at the open PR. Rollback-safe — a clean-tree precondition (config-independent `--untracked-files=all`) makes any pre-branch abort restore the working tree losslessly; never tags/merges/publishes | #204 |
-| #158 | front-door `intake` sub-command: expands a short description into a decision-complete issue (`/pm` contract) and proposes a matching ROADMAP update as a branch + PR. Orphan-safe — collision-resistant branch naming + a create-only (`--force-with-lease`) reservation over the same push transport, all before the irreversible issue creation; create-only label ensure | #205 |
-| #171 | backlog-roadmap engine (`roadmap` mode): comprehends the repo, inventories the open backlog, builds a source-verified dependency graph, scores + dependency-orders, and emits a `plan.json` + living roadmap doc, with a mandatory adversarial-critique phase; gated + idempotent GitHub write-back | #206 |
-| #168 | `sweep` sub-command: re-specs thin issues and rebases the roadmap (summary by default, `--apply` to write). Partial-failure-safe — `--apply` exits non-zero when roadmap delivery fails after issue rewrites, with step-aware recovery instructions | #207 |
-
-Carried forward to **v1.7.0** (still deferred): **#23** graduated-autonomy approval checkpoints (recurrence-parked on a checkpoint-comment forge-resistance security property; PR #194 open) and **#149** bounded auto-loop (depends on #23).
-
-**v1.5.0 — Pipeline Desk desktop contracts (shipped 2026-06-16, tag `v1.5.0`) — fifth minor:**
-
-| # | What | PR |
-|---|------|-----|
-| #161 | run-artifact conventions: non-fatal artifact I/O, write-time injection denylist + field-level secret/role-marker redaction (`sanitizeDeep`, before `JSON.stringify`), `schema_version` on every record, documented `_`-prefixed local-only fields | #198 |
-| #153 | host-neutral `pipeline` launcher + install discovery (`pipeline path --json`): dependency-free discovery that works even with absent/partial `core/node_modules`, best-effort postinstall, detached-`run` lifecycle-flag forwarding, watchdog process-**tree** kill, and child-side lock acquisition with a launcher handshake (closes the parent-death lock race) | #199 |
-| #154 | machine-readable `runStatus --json` + `doctor --json`/`--is-ok`: latest-window label-event fetch (GraphQL `timelineItems`) so `last_event` reflects the current stage on long issues, and a truly-silent `doctor --is-ok` polling gate (config-resolution warnings suppressed) | #200 |
-| #156 | `.github/pipeline.yml` JSON schema (`pipeline config schema`) + non-throwing `config validate` with severity-tiered, CST-located (offending-key line) diagnostics; rigor/cost-gating keys reject (never coerce) | #201 |
-| #155 | stable run directory (`.agent-pipeline/runs/<run-id>/`): append-only `events.jsonl`, `run.json`, `summary.json`, always-written `terminal.log`; `--json-events` streams **every** lifecycle event (incl. stage-owned + terminal stage) to stdout; non-hanging `pipeline logs <id> --follow`; detached launch pinned to the same run store with a machine-readable `run-store.json` pointer (git-root-resolved) | #202 |
-
-Carried forward to **v1.6.0** (still deferred): **#23** graduated-autonomy approval checkpoints (recurrence-parked on a checkpoint-comment forge-resistance security property; PR #194 open) and **#149** bounded auto-loop (depends on #23).
-
-**v1.4.0 — private eval / shipcheck gate (shipped 2026-06-16, tag `v1.4.0`) — fourth minor:**
-
-| # | What | PR |
-|---|------|-----|
-| #148 | opt-in reviewer-owned **shipcheck** acceptance gate before `ready-to-deploy` (default off): when configured, a reviewer harness scores the completed change against a rubric (`shipcheck.rubric_path`, falling back to the issue's acceptance criteria) and the gate blocks on a fail; wired into both the pre-merge and eval-gate exit paths so it cannot be bypassed. Verdict parsing rejects malformed/timed-out reviewer output; the rubric path is realpath-confined to the repo (no symlink escape) | #196 |
-
-Carried forward to **v1.5.0** (still deferred): **#23** graduated-autonomy approval checkpoints (recurrence-parked on a checkpoint-comment forge-resistance security property; PR #194 open) and **#149** bounded auto-loop (depends on #23).
-
-**v1.3.0 — isolation & harness output quality (shipped 2026-06-16, tag `v1.3.0`) — third minor:**
-
-| # | What | PR |
-|---|------|-----|
-| #21 | opt-in sandboxed harness execution — `harness_sandbox` (default false): when true the claude implementer runs with `--permission-mode default` instead of `bypassPermissions`, threaded through every implementer/fix/test-gate-fix invoke; codex is already sandboxed via `--full-auto`. Sandboxed planning is confined to the issue worktree | #192 |
-| #182 | configurable format/lint normalization gate — `format_gate` (default `[]`): each entry runs in the worktree (`auto_fix: true` commits + re-runs for stability; `auto_fix: false` is check-only and blocks on non-zero). Runs format-BEFORE-test and re-runs both to a bounded fixed point, so the pushed state is simultaneously formatted and tested (no auto-format ships untested, no test-fix ships unformatted); non-convergence blocks to `needs-human` | #193 |
-
-Re-scoped to **v1.4.0** (deferred from this minor): **#23** graduated-autonomy approval checkpoints — converged 6→2→1 review findings but recurrence-parked on a checkpoint-comment forge-resistance security property (clearance must require a pipeline-authored SHA-bound comment, not arbitrary matching text); and **#149** bounded auto-loop, which depends on #23. PR #194 (#23) is left open for v1.4.0.
-
-**v1.2.2 — pipeline-run reliability cont. (shipped 2026-06-16, tag `v1.2.2`) — second patch on the 1.2 line:**
-
-More reliability fixes found while running `/pipeline` against a real downstream repo (pipeline-desk):
-
-| # | What | PR |
-|---|------|-----|
-| #181 | pre-merge gate convergence: the OpenSpec archive step is idempotent (computes active candidates before its skip-shortcut) and a persistently-failing pre-merge CI routes to `needs-human` with the failure surfaced, instead of re-archiving/re-polling until the iteration cap | #189 |
-| #180 | the worktree harness never creates or stages a `node_modules` symlink: staging excludes `node_modules` (via the worktree's resolved `info/exclude`, looked up with `git rev-parse --git-path`), so a tracked symlink can no longer slip into a commit and break CI | #190 |
-| #183 | concurrent `git worktree add` is serialized against the shared `.git/config` lock via an atomic OS-level mutex keyed on the canonical git common dir (with bounded wait + ownership-safe stale reclaim), so two near-simultaneous runs no longer race | #187 |
-
-**v1.2.1 — pipeline-run reliability (shipped 2026-06-16, tag `v1.2.1`) — first patch on the 1.2 line:**
-
-Reliability fixes found while running `/pipeline` against a real downstream repo (pipeline-desk):
-
-| # | What | PR |
-|---|------|-----|
-| #173 | configured `test_gate.command` is run through a shell so POSIX operators (`&&`, `\|\|`, `;`, `\|`) work instead of being passed as literal argv to the first program | #177 |
-| #174 | fresh worktrees are dependency-installed (lockfile-detected package manager, or `setup_command`) before the test gate, with stale-worktree reclaim by **issue number** (excluded from the capacity count) and a setup timeout; also upgraded configured `test_gate.command` execution to `bash -c` with `set -o pipefail` so a failing pipeline stage fails the gate | #178 |
-| #175 | `implementing` is a resumable entry point: on re-entry with an existing worktree/commit the gate→open-PR→review transition re-runs (branch resolved by name, same-repo PR reuse guarded against fork-PR spoofing, PR-creation race tolerated) | #179 |
-
-(#176 — `--init` overwrite — closed as **already-fixed on `main`**: the `wx` exclusive-create guard + skip notice predate v1.2.0; the report was against a stale install whose running code lagged its `package.json`.)
-
-**v1.2.0 — reviewer pluggability & per-step models (shipped 2026-06-15, tag `v1.2.0`) — second minor:**
-
-| # | What | PR |
-|---|------|-----|
-| #39 | same-harness self-review fallback when the cross-harness reviewer CLI is unavailable — clearly labeled, failure-triggered at the invoke seam, no new config key | #163 |
-| #40 | configurable review harness: a real, honored `review_harness` key to point the review step at an arbitrary reviewer CLI (implementer stays profile-owned) | #164 |
-| #70 | per-step model config: adds the `models.implementing` slot (planning/implementing/review/fix); honored on claude, warns when inert on codex | #165 |
-| #144 | override durability: stable shift-tolerant finding identity (`severity\|file\|line_bucket` + payload fingerprint) so a reworded/line-shifted re-emit keeps its `--override`; closes the override-key churn that made #19 take 5 rounds | #166 |
-
-Tooling shipped alongside: config dogfooding — `.github/pipeline.yml` refreshed to the latest accepted format (PR #167); release automation — `release.yml` auto-publishes a GitHub Release on `v*` tag push (PR #169).
-
-**v1.1.1 — capability/evidence hardening (shipped 2026-06-14, tag `v1.1.1`):**
-
-| # | What | PR |
-|---|------|-----|
-| #146 | `doctor` / preflight: deterministic capability check (gh auth/repo, harness availability, worktree cleanliness, OpenSpec, mirror, deps, eval cmd) before expensive autonomous work — standalone `--doctor` + opt-in run-start gate; no model invocation | #151 |
-| #147 | per-run evidence bundle: machine-readable artifact (issue/PR, branch, SHAs, stage transitions, harness identity, commands, test/eval outcomes, verdicts, overrides, recovery events) + human-readable summary; audit/debug only, not a second state machine | #152 |
-
-(#143 — the `readConventions` truncation-fairness follow-up originally slotted here — was folded into #19's reserve-aware water-filling fix and shipped in v1.1.0; closed as done.)
-
-**v1.1.0 — review quality (shipped 2026-06-13, tag `v1.1.0`) — first minor:**
-
-| # | What | PR |
-|---|------|-----|
-| #85 | verdict drift guard extended to value-types/nesting, not just field names (every union arm validated; `\| null` fails closed, `\| undefined` normalizes) | #129 |
-| #57 | world-class review prompts — severity rubric, confidence calibration, few-shot, diff-scoping/blast-radius, deterministic-ask removal, round-1↔round-2 differentiation | #130 |
-| #25 | research-grounded planning — mine repo patterns + prior plans, emit checkable acceptance criteria (OpenSpec planning-context seam) | #141 |
-| #19 | closed-loop learning — human-curated lessons carried forward via `readConventions` injection (no pipeline-written store); reserve-aware water-filling truncation hardened over 5 adversarial review rounds (all real findings; #143 folded in, #144 filed for override-key durability) | #142 |
-
-**v1.0.4 — recovery robustness (shipped 2026-06-12, tag `v1.0.4`):**
-
-| # | What | PR |
-|---|------|-----|
-| #131 | salvage uncommitted harness work (commit + test-gate-certify) instead of hard-blocking | #137 |
-| #133 | recurrence-aware review loop — park earlier on an unchanged re-emit + `RECURRING`/`NEW` tags | #136 |
-| #134 | stage-aware recovery recipe in `setBlocked` (the right resume verb per blocker; correct label, no unsafe actions) | #139 |
-| #135 | override auto-resume — apply a human's recorded `--override` disposition automatically | #138 |
-
-**v1.0.3 — contributor tooling (shipped 2026-06-11, tag `v1.0.3`):**
-
-| # | What | PR |
-|---|------|-----|
-| #124 | pre-commit hook auto-regenerates + stages the `plugin/` mirror after `core/` edits — kills the forgot-to-regen wasted round; `build.mjs --check` stays the enforcement | #126 |
-
-**v1.0.2 — dev-loop convergence (cont.) + CLI niceties (shipped 2026-06-11, tag `v1.0.2`):**
-
-| # | What | PR |
-|---|------|-----|
-| #108 | inject repo conventions into the `fix`/`test-fix` prompts (editing fix rounds no longer rely on best-effort host auto-load) | #121 |
-| #115 | `--status` surfaces the needs-human punch-list (count + resume steps), not just the bare stage | #118 |
-| #116 | warn when a `models.*` alias is set on a Codex-backed step (silently inert); nested `models` schema is now `.strict()` so typo'd keys fail loudly | #119 |
-| #117 | CLI: add `--version` flag (print package version + exit); the install shim answers it before npm provisioning | #120 |
-
-**v1.0.1 — dev-loop convergence (shipped 2026-06-10, tag `v1.0.1`):**
-
-| # | What | PR |
-|---|------|-----|
-| #95 | pre-merge auto-rebase when a PR is CONFLICTING (no `pull_request` CI) | #105 |
-| #75 | zero-machinery `plugin/` mirror regen after editing `core/` | #104 |
-| #110 | convergence hotfix — severity-policy default fix, single-sourced rubric, enumerate-all + re-review ratchet, bounded rounds → `needs-human` terminal, fixer history, structured `category` field | #111 |
-| #110 follow-up | default `block_threshold` → `medium`/`0.7`; mirror advisory findings to the PR (issue-only review comments slip the merge button) | #112 |
-| #106 | OpenSpec spec-drift consistency guard — deterministic file-path (`specDeltaIsStale`) + structured `category: spec-divergence` marker, never prose (supersedes #109) | #113 |
-
-**v1.0.0 — external-ready (tagged 2026-06-10, commit `450b537`):**
-
-| # | What | PR |
-|---|------|-----|
-| #56 | single-source the review verdict JSON schema (prompts ↔ `ReviewFinding`) + drift-guard test | #83 |
-| #98 | pre-merge #16 gate must not re-review pipeline-internal commits (the autonomous-convergence fix) | #99 |
-| #76 | `--status` resolves a PR by `closingIssuesReferences`/branch, not loose body-text (folds #97) | #96 |
-| #91 | fold docs into the implementation step; remove the pre-merge docs stage (one CI cycle) | #100 |
-| #93 | delete dead surface: ignored `harnesses` key, `auto_merge`, `openclaw` profile, companion runtime | #102 |
-| — | repo `CLAUDE.md` — conventions contract for the self-dev pipeline | #101 |
-
 ## Release plan (sem-ver)
 
 Post-1.0 the open backlog is **entirely additive or internal hardening — no breaking changes.** This was verified 2026-06-10 by a per-issue classification with an adversarial breaking-change check; the verifier agreed on all 14 issues. (**#106**, filed later the same day, was classified patch/additive on the same basis — internal hardening, no config or output-schema change.) Each new key (#40, #70, #23, #21) is optional and its **default reproduces current behavior**, so existing configs and runs are unchanged — that, not schema mechanics, is what keeps these MINOR rather than MAJOR. (Top-level config is `.strict()`, so an old config that omits the new key still validates; the new key is always added *optional*, never required. Note `models.*` is itself non-`.strict()` with required inner fields, so #70's `models.implementing` must land as an added **optional** field, not a new required one.) A 2.0 would instead require removing/renaming a key, changing a *deliberate* default, making a dead key live, or breaking the verdict output schema — nothing open does that. **Exception — placeholder/defect defaults:** fixing a default that was an un-finalized placeholder (never a deliberate contract) is a *patch*, not a 2.0, provided the prior behavior stays reachable via explicit config. The **1.0.1** convergence hotfix applies this — it flips `review_policy.block_threshold` `low`→`medium` (and `min_confidence` `0`→`0.7`) because `low/0` was the #17 placeholder that made the policy block on *every* finding and never converge; `block_threshold: low` restores the old behavior verbatim.
 
 | Release | Bump | Theme | Issues | Why this bump |
 |---|---|---|---|---|
-| **v1.0.1** ✅ shipped | patch | Dev-loop convergence | #95, #75, #110, #106 | Shipped 2026-06-10 (tag `v1.0.1`). See **Shipped** above for the per-PR detail. |
-| **v1.0.2** ✅ shipped | patch | Dev-loop convergence (cont.) + CLI niceties | #108, #115, #116, #117 | Shipped 2026-06-11 (tag `v1.0.2`). See **Shipped** above for the per-PR detail. |
-| **v1.0.3** ✅ shipped | patch | Dev-loop convergence (cont.) — contributor tooling | #124 | Shipped 2026-06-11 (tag `v1.0.3`). Pre-commit hook auto-regenerates + stages the `plugin/` mirror so contributors only edit `core/`. See **Shipped** above. |
-| **v1.0.4** ✅ shipped | patch | Dev-loop convergence (cont.) — recovery robustness | #131, #133, #134, #135 | Shipped 2026-06-12 (tag `v1.0.4`). Deterministic recovery + a sharper hand-off moved into the skill (salvage, recurrence-aware park, recovery recipes, override auto-resume); all zero-authority. See **Shipped** above. |
-| **v1.1.0** ✅ shipped | minor | Review quality | #19, #25, #57, #85 | Shipped 2026-06-13 (tag `v1.1.0`) — first minor. New planning/review capability, no breaking change. See **Shipped** above for per-PR detail. (#84 closed — its enumerate-every-instance ask shipped early in v1.0.1 via #110.) |
-| **v1.1.1** ✅ shipped | patch | Capability/evidence hardening | #146, #147 | Shipped 2026-06-14 (tag `v1.1.1`). Deterministic `doctor` preflight + per-run evidence bundles; no change to shipped run behavior. (#143 folded into v1.1.0.) See **Shipped** above. |
-| **v1.2.0** ✅ shipped | minor | Reviewer pluggability & per-step models | #39, #40, #70, #144 | Shipped 2026-06-15 (tag `v1.2.0`) — second minor. Opt-in keys (reviewer selection, `models.implementing`) defaulting to identical behavior + override-durability hardening. See **Shipped** above. (Tooling: config dogfooding PR #167, release automation PR #169.) |
-| **v1.2.1** ✅ shipped | patch | Pipeline-run reliability (pipeline-desk) | #173, #174, #175 | Shipped 2026-06-16 (tag `v1.2.1`). Reliability fixes from running `/pipeline` against a real downstream repo: shell-backed configured gate commands + pipefail, worktree dependency-install with issue-number capacity reclaim, resumable `implementing` stage. (#176 closed as already-fixed on `main`.) See **Shipped** above. |
-| **v1.2.2** ✅ shipped | patch | Pipeline-run reliability cont. (pipeline-desk) | #180, #181, #183 | Shipped 2026-06-16 (tag `v1.2.2`). Second reliability patch: failing pre-merge CI → `needs-human` (no archive/poll loop), worktree harness never stages a `node_modules` symlink, and concurrent `git worktree add` serialized against `.git/config`. See **Shipped** above. |
-| **v1.3.0** ✅ shipped | minor | Isolation & harness output quality | #21, #182 | Shipped 2026-06-16 (tag `v1.3.0`). Opt-in `harness_sandbox` (sandboxed implementer execution) + `format_gate` (format/lint normalization run before the test gate to a bounded fixed point). Both default off/empty → no behavior change. #23 + #149 re-scoped to v1.4.0 (see below). See **Shipped** above. |
-| **v1.4.0** ✅ shipped | minor | Private eval / shipcheck gate | #148 | Shipped 2026-06-16 (tag `v1.4.0`). Opt-in reviewer-owned `shipcheck` acceptance-rubric gate before `ready-to-deploy` (default off; wired into pre-merge + eval exit paths; realpath-confined rubric; rejects malformed/timed-out verdicts). #23 + #149 carried to v1.5.0. See **Shipped** above. |
-| **v1.5.0** ✅ shipped | minor | Pipeline Desk desktop contracts | #153, #154, #155, #156, #161 | Shipped 2026-06-16 (tag `v1.5.0`) — fifth minor. Machine-facing launch/discovery, JSON status/preflight, stable run directory + JSON events + non-hanging log-follow, config schema/validate, and run-artifact conventions so Pipeline Desk can supervise runs without scraping terminal prose. Human `/pipeline` / `$pipeline` flows unchanged. See **Shipped** above. (#23 + #149 carried to v1.6.0.) |
-| **v1.6.0** ✅ shipped | minor | Intake & backlog automation | #158, #170, #171, #168 | Shipped 2026-06-17 (tag `v1.6.0`) — sixth minor. Front-door intake (#158), release-PR automation (#170), backlog-roadmap engine (#171), and the sweep re-spec/rebase command (#168). See **Shipped** above for the per-PR detail. (#23 + #149 carried to v1.7.0.) |
+| **v1.0.1** ✅ shipped | patch | Dev-loop convergence | #95, #75, #110, #106 | Shipped 2026-06-10 (tag `v1.0.1`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.0.2** ✅ shipped | patch | Dev-loop convergence (cont.) + CLI niceties | #108, #115, #116, #117 | Shipped 2026-06-11 (tag `v1.0.2`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.0.3** ✅ shipped | patch | Dev-loop convergence (cont.) — contributor tooling | #124 | Shipped 2026-06-11 (tag `v1.0.3`). Pre-commit hook auto-regenerates + stages the `plugin/` mirror so contributors only edit `core/`. See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.0.4** ✅ shipped | patch | Dev-loop convergence (cont.) — recovery robustness | #131, #133, #134, #135 | Shipped 2026-06-12 (tag `v1.0.4`). Deterministic recovery + a sharper hand-off moved into the skill (salvage, recurrence-aware park, recovery recipes, override auto-resume); all zero-authority. See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.1.0** ✅ shipped | minor | Review quality | #19, #25, #57, #85 | Shipped 2026-06-13 (tag `v1.1.0`) — first minor. New planning/review capability, no breaking change. See [CHANGELOG.md](CHANGELOG.md). (#84 closed — its enumerate-every-instance ask shipped early in v1.0.1 via #110.) |
+| **v1.1.1** ✅ shipped | patch | Capability/evidence hardening | #146, #147 | Shipped 2026-06-14 (tag `v1.1.1`). Deterministic `doctor` preflight + per-run evidence bundles; no change to shipped run behavior. (#143 folded into v1.1.0.) See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.2.0** ✅ shipped | minor | Reviewer pluggability & per-step models | #39, #40, #70, #144 | Shipped 2026-06-15 (tag `v1.2.0`) — second minor. Opt-in keys (reviewer selection, `models.implementing`) defaulting to identical behavior + override-durability hardening. See [CHANGELOG.md](CHANGELOG.md). (Tooling: config dogfooding PR #167, release automation PR #169.) |
+| **v1.2.1** ✅ shipped | patch | Pipeline-run reliability (pipeline-desk) | #173, #174, #175 | Shipped 2026-06-16 (tag `v1.2.1`). Reliability fixes from running `/pipeline` against a real downstream repo: shell-backed configured gate commands + pipefail, worktree dependency-install with issue-number capacity reclaim, resumable `implementing` stage. (#176 closed as already-fixed on `main`.) See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.2.2** ✅ shipped | patch | Pipeline-run reliability cont. (pipeline-desk) | #180, #181, #183 | Shipped 2026-06-16 (tag `v1.2.2`). Second reliability patch: failing pre-merge CI → `needs-human` (no archive/poll loop), worktree harness never stages a `node_modules` symlink, and concurrent `git worktree add` serialized against `.git/config`. See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.3.0** ✅ shipped | minor | Isolation & harness output quality | #21, #182 | Shipped 2026-06-16 (tag `v1.3.0`). Opt-in `harness_sandbox` (sandboxed implementer execution) + `format_gate` (format/lint normalization run before the test gate to a bounded fixed point). Both default off/empty → no behavior change. #23 + #149 re-scoped to v1.4.0 (see below). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.4.0** ✅ shipped | minor | Private eval / shipcheck gate | #148 | Shipped 2026-06-16 (tag `v1.4.0`). Opt-in reviewer-owned `shipcheck` acceptance-rubric gate before `ready-to-deploy` (default off; wired into pre-merge + eval exit paths; realpath-confined rubric; rejects malformed/timed-out verdicts). #23 + #149 carried to v1.5.0. See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.5.0** ✅ shipped | minor | Pipeline Desk desktop contracts | #153, #154, #155, #156, #161 | Shipped 2026-06-16 (tag `v1.5.0`) — fifth minor. Machine-facing launch/discovery, JSON status/preflight, stable run directory + JSON events + non-hanging log-follow, config schema/validate, and run-artifact conventions so Pipeline Desk can supervise runs without scraping terminal prose. Human `/pipeline` / `$pipeline` flows unchanged. See [CHANGELOG.md](CHANGELOG.md). (#23 + #149 carried to v1.6.0.) |
+| **v1.6.0** ✅ shipped | minor | Intake & backlog automation | #158, #170, #171, #168 | Shipped 2026-06-17 (tag `v1.6.0`) — sixth minor. Front-door intake (#158), release-PR automation (#170), backlog-roadmap engine (#171), and the sweep re-spec/rebase command (#168). See [CHANGELOG.md](CHANGELOG.md). (#23 + #149 carried to v1.7.0.) |
 | **v1.6.1** *(folded into v1.7.0)* | patch | Version-staleness detection | #186 | **#186 shipped within v1.7.0** (merged via #224 before the `v1.7.0` tag) — no separate `v1.6.1` tag was cut. Added the `doctor` stale-install / version-coherence check + a `launcher-smoke` assertion that `--version` equals the installed `core/package.json`. |
-| **v1.7.0** ✅ shipped | minor | Control plane & release_model | #214, #216, #217 | Shipped 2026-06-19 (tag `v1.7.0`). See **Shipped** above for the per-PR detail. |
-| **v1.8.0** ✅ shipped | minor | Faster intake/sweep + fail-fast timeouts | #220, #248 | Shipped 2026-06-19 (tag `v1.8.0`) — eighth minor. Intake/sweep spec-generation pinned to a fast model (`models.intake`/`models.sweep`, default `sonnet`) + a lean tool-free harness (`--tools ""`/`--strict-mcp-config`; no MCP, no repo exploration) → ~15× faster intake (#220/#247); plus configurable `intake_timeout`/`sweep_timeout` (#248/#250). Additive keys; defaults preserve behavior. See **Shipped** above. |
-| **v1.9.0** ✅ shipped | minor | Observability & reliability hardening | #256, #257, #258, #259, #260, #261, #262, #264, #265, #266 (+ #253, #254, #255) | Shipped 2026-06-21 (tag `v1.9.0`). See **Shipped** above for the per-PR detail. |
-| **v1.10.0** ✅ shipped | minor | CLI dispatch v2 (command registry + conventions) | #263, #273 | Shipped 2026-06-28 (tag `v1.10.0`). Factory scoreboard + stage-level cost accounting; command registry + lifecycle/CLI-parsing split (#263), queue and budget mode (#305). See **Shipped** above. |
-| **v1.11.0** ✅ shipped | minor | CLI dispatch v2 cont. + queue/budget | #305 | Shipped 2026-06-28 (tag `v1.11.0`). See **Shipped** above. |
-| **v1.12.0** ✅ shipped | minor | Namespaced command surface + OpenSpec CLI guard | #273, #308 | Shipped 2026-06-29 (tag `v1.12.0`). Move /pipeline off -- conventions (namespaced command surface); pre-merge silently skips OpenSpec archive when openspec CLI unavailable. See **Shipped** above. |
-| **v1.12.1** ✅ shipped | patch | ci_mode local + OpenSpec config path + Codex no-sandbox | #350, #352, #355 | Shipped 2026-06-30 (tag `v1.12.1`). See **Shipped** above. |
-| **v1.12.2** ✅ shipped | patch | OpenSpec spec-divergence + injectable-dep rule in prompts | #356, #360 | Shipped 2026-07-01 (tag `v1.12.2`). See **Shipped** above. |
-| **v1.12.3** ✅ shipped | patch | Fix harness commit step lock-file side-effects | #358 | Shipped 2026-07-01 (tag `v1.12.3`). See **Shipped** above for the per-PR detail. |
-| **v1.12.4** ✅ shipped | patch | Pre-merge fix round: auto-apply bounded fix for correctness findings | #359 | Shipped 2026-07-02 (tag `v1.12.4`). See **Shipped** above for the per-PR detail. |
-| **v1.13.0** ✅ shipped | minor | Fix-stage recovery + logging portability + repo-map CLI | #349, #343, #367 | Shipped 2026-07-04 (tag `v1.13.0`). See **Shipped** above for the per-PR detail. |
-| **v1.14.0** ✅ shipped | minor | Convergence & evidence: post-fix re-review correctness, eval-gate fix routing, durable evidence, crash recovery | #373, #371, #377, #372, #382 | Shipped 2026-07-07 (tag `v1.14.0`). See **Shipped** above for the per-PR detail. |
-| **v1.14.1** ✅ shipped | patch | Gate/CLI reliability: test-gate capture resilience + wrapper --profile fix | #384, #383 | Shipped 2026-07-07 (tag `v1.14.1`). See **Shipped** above for the per-PR detail. |
-| **v1.15.0** ✅ shipped | minor | Factory reliability: fix-round convergence, wedge-proof timeouts, de-flaked gates, single-operator human-input gate | #391, #398, #403, #390, #393, #387 | Shipped 2026-07-08 (tag `v1.15.0`). See **Shipped** above for the per-PR detail. |
-| **v1.15.1** ✅ shipped | patch | Foundation reliability + release hygiene | #401, #402, #413, #423 | Shipped 2026-07-20 (tag `v1.15.1`). See **Shipped** above for the per-PR detail. |
-| **v1.15.2** ✅ shipped | patch | Reviewer model/effort passthrough for codex + gitignored-artifact commit guard | #441, #445 | Shipped 2026-07-21 (tag `v1.15.2`). See **Shipped** above for the per-PR detail. |
+| **v1.7.0** ✅ shipped | minor | Control plane & release_model | #214, #216, #217 | Shipped 2026-06-19 (tag `v1.7.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.8.0** ✅ shipped | minor | Faster intake/sweep + fail-fast timeouts | #220, #248 | Shipped 2026-06-19 (tag `v1.8.0`) — eighth minor. Intake/sweep spec-generation pinned to a fast model (`models.intake`/`models.sweep`, default `sonnet`) + a lean tool-free harness (`--tools ""`/`--strict-mcp-config`; no MCP, no repo exploration) → ~15× faster intake (#220/#247); plus configurable `intake_timeout`/`sweep_timeout` (#248/#250). Additive keys; defaults preserve behavior. See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.9.0** ✅ shipped | minor | Observability & reliability hardening | #256, #257, #258, #259, #260, #261, #262, #264, #265, #266 (+ #253, #254, #255) | Shipped 2026-06-21 (tag `v1.9.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.10.0** ✅ shipped | minor | CLI dispatch v2 (command registry + conventions) | #263, #273 | Shipped 2026-06-28 (tag `v1.10.0`). Factory scoreboard + stage-level cost accounting; command registry + lifecycle/CLI-parsing split (#263), queue and budget mode (#305). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.11.0** ✅ shipped | minor | CLI dispatch v2 cont. + queue/budget | #305 | Shipped 2026-06-28 (tag `v1.11.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.12.0** ✅ shipped | minor | Namespaced command surface + OpenSpec CLI guard | #273, #308 | Shipped 2026-06-29 (tag `v1.12.0`). Move /pipeline off -- conventions (namespaced command surface); pre-merge silently skips OpenSpec archive when openspec CLI unavailable. See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.12.1** ✅ shipped | patch | ci_mode local + OpenSpec config path + Codex no-sandbox | #350, #352, #355 | Shipped 2026-06-30 (tag `v1.12.1`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.12.2** ✅ shipped | patch | OpenSpec spec-divergence + injectable-dep rule in prompts | #356, #360 | Shipped 2026-07-01 (tag `v1.12.2`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.12.3** ✅ shipped | patch | Fix harness commit step lock-file side-effects | #358 | Shipped 2026-07-01 (tag `v1.12.3`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.12.4** ✅ shipped | patch | Pre-merge fix round: auto-apply bounded fix for correctness findings | #359 | Shipped 2026-07-02 (tag `v1.12.4`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.13.0** ✅ shipped | minor | Fix-stage recovery + logging portability + repo-map CLI | #349, #343, #367 | Shipped 2026-07-04 (tag `v1.13.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.14.0** ✅ shipped | minor | Convergence & evidence: post-fix re-review correctness, eval-gate fix routing, durable evidence, crash recovery | #373, #371, #377, #372, #382 | Shipped 2026-07-07 (tag `v1.14.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.14.1** ✅ shipped | patch | Gate/CLI reliability: test-gate capture resilience + wrapper --profile fix | #384, #383 | Shipped 2026-07-07 (tag `v1.14.1`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.15.0** ✅ shipped | minor | Factory reliability: fix-round convergence, wedge-proof timeouts, de-flaked gates, single-operator human-input gate | #391, #398, #403, #390, #393, #387 | Shipped 2026-07-08 (tag `v1.15.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.15.1** ✅ shipped | patch | Foundation reliability + release hygiene | #401, #402, #413, #423 | Shipped 2026-07-20 (tag `v1.15.1`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.15.2** ✅ shipped | patch | Reviewer model/effort passthrough for codex + gitignored-artifact commit guard | #441, #445 | Shipped 2026-07-21 (tag `v1.15.2`). See [CHANGELOG.md](CHANGELOG.md). |
 | **deferred** | minor | Graduated autonomy (forge-resistance) | #23 | Carried-forward **#23** (graduated-autonomy approval checkpoints — still parked on the checkpoint-comment forge-resistance security property, PR #194 open). #149 (bounded auto-loop) already shipped in v1.7.0. |
-| **v1.16.0** ✅ shipped | minor | Papercut capture: agent-logged friction events + CLI | #419 | Shipped 2026-07-21 (tag `v1.16.0`). See **Shipped** above for the per-PR detail. |
+| **v1.16.0** ✅ shipped | minor | Papercut capture: agent-logged friction events + CLI | #419 | Shipped 2026-07-21 (tag `v1.16.0`). See [CHANGELOG.md](CHANGELOG.md). |
 | **v1.16.0** | minor | Cluster recurring papercuts into backlog issues, with opt-in auto-file | #421 | `pipeline improve` gains a new `papercut` cluster category: it reads agent-reported friction events captured across runs, groups recurring ones into clusters, and surfaces them in the same dry-run report and `--apply` issue-creation path used by existing categories (flaky-gate, token-waste) — including the same open-issue dedup. Additive; existing flows unchanged. |
-| **v1.17.0** ✅ shipped | minor | Add `--bucket day|week` time-series output to pipeline scoreboard | #425 | The `scoreboard` command gains an optional `--bucket day| Shipped 2026-07-21 (tag `v1.17.0`). See **Shipped** above for the per-PR detail. |
+| **v1.17.0** ✅ shipped | minor | Add `--bucket day|week` time-series output to pipeline scoreboard | #425 | The `scoreboard` command gains an optional `--bucket day| Shipped 2026-07-21 (tag `v1.17.0`). See [CHANGELOG.md](CHANGELOG.md). |
 | **v1.17.0** | minor | Add self-contained HTML export to pipeline scoreboard | #427 | The `scoreboard` command gains an HTML export mode that renders the same metrics scoreboard already computes — cost per ready PR, autonomy rate, fix rounds, needs-human rate, stage durations, and test/eval/shipcheck pass rates — into a single static HTML file. Additive; existing flows unchanged. |
 | **v1.17.0** | minor | Capture actual per-call cost from harness output, not just estimates | #429 | Stage accounting captures the real cost of each harness call from that harness's own output/telemetry whenever the harness exposes it, rather than relying solely on operator-supplied `--estimate-cost` fallbacks. Additive; existing flows unchanged. |
 | **v1.17.0** | minor | Scoreboard grouping by harness, model, effort, and executor | #437 | The `scoreboard` command gains an opt-in grouping flag that splits each stage's existing metrics — durations, fix rounds, review rounds and verdict outcomes, gate pass rates, needs-human rate, tokens, and cost — by who or what performed the work: harness, model, effort, or executor. Additive; existing flows unchanged. |
-| **v1.18.0** ✅ shipped | minor | Controlled multi-harness evaluation foundation: Grok Build/Pi/OpenCode adapters + manifest-driven stage eval runner | #431, #432, #481 | Shipped 2026-07-21 (tag `v1.18.0`). See **Shipped** above for the per-PR detail. |
-| **v1.19.0** ✅ shipped | minor | Objective grading + API comparison: eval graders with statistical reporting + OpenRouter executor experiment controls | #433, #434 | Shipped 2026-07-21 (tag `v1.19.0`). See **Shipped** above for the per-PR detail. |
-| **v1.20.0** ✅ shipped | minor | Risk-triggered design-interrogation gate + large-prompt harness delivery | #436, #492 | Shipped 2026-07-21 (tag `v1.20.0`). See **Shipped** above for the per-PR detail. |
-| **v1.21.0** ✅ shipped | minor | Durable goal orchestration behind pipeline:loop | #451 | Shipped 2026-07-21 (tag `v1.21.0`). See **Shipped** above for the per-PR detail. |
-| **v1.22.0** ✅ shipped | minor | Factory robustness: fix-stage recovery, gate/installer/worktree hardening, structured fix outcomes | #486, #484, #485, #450, #443, #472, #473, #506 | Shipped 2026-07-22 (tag `v1.22.0`). See **Shipped** above for the per-PR detail. |
-| **v1.23.0** ✅ shipped | minor | Review-quality context: bounded delta rounds, immutable resolved-finding evidence, PR-visible visual artifacts | #483, #496, #463 | Shipped 2026-07-23 (tag `v1.23.0`). See **Shipped** above for the per-PR detail. |
-| **v1.24.0** ✅ shipped | minor | Factory hygiene: release-discovery tolerance + cross-host auto-file serialization | #498, #459 | Shipped 2026-07-23 (tag `v1.24.0`). See **Shipped** above for the per-PR detail. |
-| **v1.25.0** ✅ shipped | minor | Correction intelligence: structured correction ledger, correction compiler, closed-loop attribution + salvage/intake/init hardening | #521, #522, #504, #539, #499, #500, #501 | Shipped 2026-07-23 (tag `v1.25.0`). See **Shipped** above for the per-PR detail. |
-| **v1.26.0** ✅ shipped | minor | Integrated Durable Orchestration: in-repo pipeline:loop supervisor + conflict-aware parallel execution | #509, #510, #511, #512, #513, #538, #514, #515, #529, #530, #531, #528 | Shipped 2026-07-24 (tag `v1.26.0`). See **Shipped** above for the per-PR detail. |
-| **v1.27.0** ✅ shipped | minor | Trace-Driven Eval Engineering: human-approved trace-to-fixture authoring + bounded eval-diagnosis trajectory artifacts | #535, #536 | Shipped 2026-07-24 (tag `v1.27.0`). See **Shipped** above for the per-PR detail. |
-| **v1.28.0** ✅ shipped | minor | Factory-hardening & customer-hosted foundations: supervisor run-fatal fixes, pre-merge integrity, install/salvage papercuts, and orchestration/telemetry/fault-reporting designs | #568, #570, #571, #579, #567, #547, #553, #505, #503, #502, #581 | Shipped 2026-07-25 (tag `v1.28.0`). See **Shipped** above for the per-PR detail. |
-| **v1.28.1** ✅ shipped | patch | Factory-hardening patch: loop needs-human hold + phantom `pipeline:blocked` run-fatal fix, evaluator isolation restoration, eval effort/verdict correctness, repo-configurable harness roles, and loop-surface papercuts | #616, #607, #608, #610, #614, #620, #621, #625, #606, #609 | Shipped 2026-07-28 (tag `v1.28.1`). See **Shipped** above for the per-PR detail. |
-| **v1.28.2** ✅ shipped | patch | Loop progress followability + factory papercuts: early handoff, durable logs follow, advance-run linkage, long-running skill packaging; worktree reclaim safety, open-PR pagination, nested node_modules verify, plan-revision Feedback Incorporated repair | #622, #623, #624, #658, #665, #666, #667, #668 | Shipped 2026-07-29 (tag `v1.28.2`). See **Shipped** above for the per-PR detail. |
-| **v1.28.3** ✅ shipped | patch | Loop progress + pre-merge recovery: stage progress, dual-follow, CI/delta auto-fix recovery, offramp metrics, event-follow terminal exit | #554, #611, #615, #679, #680, #681, #682, #683, #684, #699 | Shipped 2026-07-30 (tag `v1.28.3`). See **Shipped** above for the per-PR detail. |
-| **v1.28.4** ✅ shipped | patch | Pre-merge auto-fix noop re-verify: do not hard-block when autofix makes no commit and HEAD already satisfies findings | #698 | Shipped 2026-07-30 (tag `v1.28.4`). See **Shipped** above for the per-PR detail. |
-| **v1.29.0** ✅ shipped | minor | Docs/packaging truth, plan-review authority docs, human-gated merge-queue (dry-run + release-when-complete), evals ordered primary-reviewer pairs | #574, #627, #673, #676, #601 | Shipped 2026-07-30 (tag `v1.29.0`). See **Shipped** above for the per-PR detail. |
-| **v1.29.1** ✅ shipped | patch | v1.29.1 | #712, #714, #716, #718, #722, #723, #725, #730, #731, #742, #747 | Shipped 2026-07-31 (tag `v1.29.1`). See **Shipped** above for the per-PR detail. |
+| **v1.18.0** ✅ shipped | minor | Controlled multi-harness evaluation foundation: Grok Build/Pi/OpenCode adapters + manifest-driven stage eval runner | #431, #432, #481 | Shipped 2026-07-21 (tag `v1.18.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.19.0** ✅ shipped | minor | Objective grading + API comparison: eval graders with statistical reporting + OpenRouter executor experiment controls | #433, #434 | Shipped 2026-07-21 (tag `v1.19.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.20.0** ✅ shipped | minor | Risk-triggered design-interrogation gate + large-prompt harness delivery | #436, #492 | Shipped 2026-07-21 (tag `v1.20.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.21.0** ✅ shipped | minor | Durable goal orchestration behind pipeline:loop | #451 | Shipped 2026-07-21 (tag `v1.21.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.22.0** ✅ shipped | minor | Factory robustness: fix-stage recovery, gate/installer/worktree hardening, structured fix outcomes | #486, #484, #485, #450, #443, #472, #473, #506 | Shipped 2026-07-22 (tag `v1.22.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.23.0** ✅ shipped | minor | Review-quality context: bounded delta rounds, immutable resolved-finding evidence, PR-visible visual artifacts | #483, #496, #463 | Shipped 2026-07-23 (tag `v1.23.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.24.0** ✅ shipped | minor | Factory hygiene: release-discovery tolerance + cross-host auto-file serialization | #498, #459 | Shipped 2026-07-23 (tag `v1.24.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.25.0** ✅ shipped | minor | Correction intelligence: structured correction ledger, correction compiler, closed-loop attribution + salvage/intake/init hardening | #521, #522, #504, #539, #499, #500, #501 | Shipped 2026-07-23 (tag `v1.25.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.26.0** ✅ shipped | minor | Integrated Durable Orchestration: in-repo pipeline:loop supervisor + conflict-aware parallel execution | #509, #510, #511, #512, #513, #538, #514, #515, #529, #530, #531, #528 | Shipped 2026-07-24 (tag `v1.26.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.27.0** ✅ shipped | minor | Trace-Driven Eval Engineering: human-approved trace-to-fixture authoring + bounded eval-diagnosis trajectory artifacts | #535, #536 | Shipped 2026-07-24 (tag `v1.27.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.28.0** ✅ shipped | minor | Factory-hardening & customer-hosted foundations: supervisor run-fatal fixes, pre-merge integrity, install/salvage papercuts, and orchestration/telemetry/fault-reporting designs | #568, #570, #571, #579, #567, #547, #553, #505, #503, #502, #581 | Shipped 2026-07-25 (tag `v1.28.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.28.1** ✅ shipped | patch | Factory-hardening patch: loop needs-human hold + phantom `pipeline:blocked` run-fatal fix, evaluator isolation restoration, eval effort/verdict correctness, repo-configurable harness roles, and loop-surface papercuts | #616, #607, #608, #610, #614, #620, #621, #625, #606, #609 | Shipped 2026-07-28 (tag `v1.28.1`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.28.2** ✅ shipped | patch | Loop progress followability + factory papercuts: early handoff, durable logs follow, advance-run linkage, long-running skill packaging; worktree reclaim safety, open-PR pagination, nested node_modules verify, plan-revision Feedback Incorporated repair | #622, #623, #624, #658, #665, #666, #667, #668 | Shipped 2026-07-29 (tag `v1.28.2`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.28.3** ✅ shipped | patch | Loop progress + pre-merge recovery: stage progress, dual-follow, CI/delta auto-fix recovery, offramp metrics, event-follow terminal exit | #554, #611, #615, #679, #680, #681, #682, #683, #684, #699 | Shipped 2026-07-30 (tag `v1.28.3`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.28.4** ✅ shipped | patch | Pre-merge auto-fix noop re-verify: do not hard-block when autofix makes no commit and HEAD already satisfies findings | #698 | Shipped 2026-07-30 (tag `v1.28.4`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.29.0** ✅ shipped | minor | Docs/packaging truth, plan-review authority docs, human-gated merge-queue (dry-run + release-when-complete), evals ordered primary-reviewer pairs | #574, #627, #673, #676, #601 | Shipped 2026-07-30 (tag `v1.29.0`). See [CHANGELOG.md](CHANGELOG.md). |
+| **v1.29.1** ✅ shipped | patch | v1.29.1 | #712, #714, #716, #718, #722, #723, #725, #730, #731, #742, #747 | Shipped 2026-07-31 (tag `v1.29.1`). See [CHANGELOG.md](CHANGELOG.md). |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
