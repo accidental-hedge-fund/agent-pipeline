@@ -28,6 +28,16 @@ export const STAGE_DIAGNOSTIC_REASON_CODES = [
   // loop-execution producers (LoopExecutionResponse.diagnostic) through the
   // exact-acceptance branch in projectStageDiagnostic below.
   "openspec-generated-delta-invalid",
+  // #760 — mechanical harness / forge / budget classes (additive; no competing enum).
+  "transient-infra",
+  "harness-timeout",
+  "harness-contract",
+  "repair-budget-exhausted",
+  "external-wait",
+  "human-context-required",
+  // Distinct from environment-auth: missing forge capability/permission (e.g. 403
+  // resource not accessible) vs credential/authentication failure.
+  "capability-refusal",
 ] as const;
 
 export type StageDiagnosticReasonCode = (typeof STAGE_DIAGNOSTIC_REASON_CODES)[number];
@@ -137,6 +147,9 @@ function reasonCodeFor(
     case "openspec-stale-delta":
       return "implementation-ci";
     case "delta-review":
+      // Reporting path tag for pre-merge delta review / round-ceiling surfaces —
+      // engine-owned review recovery, never a human-authority default (#814 / #760).
+      return "review-findings";
     case "merge-conflict":
       return "workflow-state";
     case "other":
@@ -178,6 +191,11 @@ export function projectPipelineReasonCode(reasonCode: unknown): StageDiagnosticP
       return { blockerClass: "workflow-engine-defect", disposition: "recover" };
     case "environment-auth":
       return { blockerClass: "environment-auth", disposition: "recover" };
+    case "capability-refusal":
+      // Same durable recovery class as auth (environment/operator setup) but a
+      // distinct canonical reason so metrics and operator guidance can tell
+      // permission/capability refusals from credential failures.
+      return { blockerClass: "environment-auth", disposition: "recover" };
     case "worktree-capacity":
       return { blockerClass: "workflow-state", disposition: "capacity" };
     case "human-decision-required":
@@ -185,6 +203,21 @@ export function projectPipelineReasonCode(reasonCode: unknown): StageDiagnosticP
     case "openspec-archive-apply-conflict":
     case "openspec-generated-delta-invalid":
       return { blockerClass: "implementation-ci", disposition: "recover" };
+    // #760 additive mechanical classes — never project to human_authority alone.
+    case "transient-infra":
+      return { blockerClass: "transient-rate-limit", disposition: "recover" };
+    case "harness-timeout":
+    case "harness-contract":
+      return { blockerClass: "workflow-engine-defect", disposition: "recover" };
+    case "repair-budget-exhausted":
+      // Engine-owned terminal/exhaustion path — not a human hold.
+      return { blockerClass: "workflow-engine-defect", disposition: "recover" };
+    case "external-wait":
+      return { blockerClass: "upstream-dependency", disposition: "recover" };
+    case "human-context-required":
+      // Underspec / missing operator context is not product authority by itself;
+      // waiting/human-input protocol is a separate durable hold path.
+      return { blockerClass: "specification-decision", disposition: "recover" };
     default:
       return {
         blockerClass: "workflow-engine-defect",
@@ -267,7 +300,35 @@ export function projectStageDiagnostic(value: unknown): StageDiagnosticProjectio
     candidate.reason_code === "environment-auth" &&
     detail.blocker_kind === "harness-failure" &&
     detail.offramp_class === undefined;
-  if (candidate.reason_code !== expectedReasonCode && !exactOpenSpecReason && !exactEnvironmentAuthReason) {
+  // #760: producers may attach additive mechanical reason codes on top of a
+  // coarse BlockerKind when the kind alone would lossily collapse the class.
+  const exactAdditiveMechanicalReason =
+    (
+      candidate.reason_code === "transient-infra" ||
+      candidate.reason_code === "harness-timeout" ||
+      candidate.reason_code === "harness-contract" ||
+      candidate.reason_code === "repair-budget-exhausted" ||
+      candidate.reason_code === "external-wait" ||
+      candidate.reason_code === "human-context-required" ||
+      candidate.reason_code === "capability-refusal"
+    ) &&
+    detail.offramp_class === undefined &&
+    (
+      detail.blocker_kind === "harness-failure" ||
+      detail.blocker_kind === "push-failed" ||
+      detail.blocker_kind === "needs-human" ||
+      detail.blocker_kind === "worktree-missing" ||
+      detail.blocker_kind === "worktree-creation-failed" ||
+      detail.blocker_kind === "worktree-setup-failed" ||
+      detail.blocker_kind === "no-pull-request" ||
+      detail.blocker_kind === "pr-creation-failed"
+    );
+  if (
+    candidate.reason_code !== expectedReasonCode &&
+    !exactOpenSpecReason &&
+    !exactEnvironmentAuthReason &&
+    !exactAdditiveMechanicalReason
+  ) {
     return {
       blockerClass: "workflow-engine-defect",
       disposition: "protocol_failure",

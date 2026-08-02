@@ -136,7 +136,7 @@ test("enforceReviewShaGate: at the delta-round cap, the reviewer seam is never i
   assert.equal(reviewerCalls, 0, "the delta reviewer must NOT be invoked at the ceiling");
 });
 
-test("enforceReviewShaGate: ceiling_action park routes to needs-human with the unresolved-blocker punch list", async (t) => {
+test("enforceReviewShaGate: ceiling_action park routes to review-findings with the unresolved-blocker punch list", async (t) => {
   const { deps, rec, cfg } = makeDeps({
     finalBlocking: [MEDIUM_FINDING], maxDeltaRounds: 4, ceilingAction: "park",
   });
@@ -147,7 +147,7 @@ test("enforceReviewShaGate: ceiling_action park routes to needs-human with the u
   assert.deepEqual(out, {
     advanced: false, status: "blocked",
     reason: "pre-merge delta-round ceiling: 1 unresolved blocking finding(s)",
-    blockerKind: "needs-human",
+    blockerKind: "review-findings",
     offrampPathTag: "delta-review",
   });
   assert.equal(rec.blocked.length, 1);
