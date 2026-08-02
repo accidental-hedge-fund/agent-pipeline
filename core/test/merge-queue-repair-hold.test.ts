@@ -23,6 +23,7 @@ import {
   runMergeQueue,
   isRepairEnabled,
   realMergeQueueDeps,
+  runDeterministicConflictRebase,
   runSharedMechanicalRepair,
   type MergeQueueCandidate,
   type MergeQueueDeps,
@@ -672,6 +673,212 @@ test("runSharedMechanicalRepair uses injected shared repair path (no network)", 
   assert.equal(repairCalls, 1);
   assert.equal(result.succeeded, true);
   assert.equal(result.headSha, "abc123def");
+});
+
+// ---------------------------------------------------------------------------
+// Deterministic conflict rebase/restack (#675 review-2: before implementer)
+// ---------------------------------------------------------------------------
+
+test("runDeterministicConflictRebase: clean rebase then force-with-lease push of pipeline branch", async () => {
+  const cfg = { base_branch: "main" } as unknown as PipelineConfig;
+  const gitCalls: string[][] = [];
+  let revParseCount = 0;
+  const result = await runDeterministicConflictRebase(
+    { issueNumber: 42, prNumber: 7, title: "restack me" },
+    cfg,
+    {
+      async getOnDiskForIssue() {
+        return { path: "/managed/wt", slug: "slug" };
+      },
+      async ensureManagedWorktree() {
+        throw new Error("should not rematerialize when worktree exists");
+      },
+      async gitInWorktree(cwd, args) {
+        assert.equal(cwd, "/managed/wt", "git must stay in managed worktree root");
+        gitCalls.push([...args]);
+        if (args[0] === "rev-parse" && args[1] === "HEAD") {
+          revParseCount += 1;
+          // HEAD moves after rebase.
+          const sha = revParseCount === 1 ? "aaaaaaa1bbbbbbb1ccccccc1ddddddd1eeeeeee1" : "bbbbbbb2ccccccc2ddddddd2eeeeeee2fffffff2";
+          return { stdout: `${sha}\n`, stderr: "", code: 0 };
+        }
+        return { stdout: "", stderr: "", code: 0 };
+      },
+    },
+  );
+  assert.equal(result.changed, true);
+  assert.equal(result.headSha, "bbbbbbb2ccccccc2ddddddd2eeeeeee2fffffff2");
+  assert.ok(result.evidence.includes("deterministic clean rebase"));
+  assert.ok(result.evidence.includes("origin/main"));
+  assert.ok(result.evidence.includes("pipeline/42-slug"));
+  // Sequence: rev-parse → fetch → rebase → rev-parse → push --force-with-lease
+  assert.deepEqual(gitCalls[0], ["rev-parse", "HEAD"]);
+  assert.deepEqual(gitCalls[1], ["fetch", "origin", "main"]);
+  assert.deepEqual(gitCalls[2], ["rebase", "origin/main"]);
+  assert.deepEqual(gitCalls[3], ["rev-parse", "HEAD"]);
+  assert.deepEqual(gitCalls[4], [
+    "push",
+    "--force-with-lease",
+    "origin",
+    "pipeline/42-slug",
+  ]);
+});
+
+test("runDeterministicConflictRebase: rebase conflict aborts without push (no implementer)", async () => {
+  const cfg = { base_branch: "main" } as unknown as PipelineConfig;
+  const gitCalls: string[][] = [];
+  const result = await runDeterministicConflictRebase(
+    { issueNumber: 9, prNumber: 90, title: "conflicted" },
+    cfg,
+    {
+      async getOnDiskForIssue() {
+        return { path: "/managed/wt", slug: "s" };
+      },
+      async ensureManagedWorktree() {
+        throw new Error("should not rematerialize");
+      },
+      async gitInWorktree(_cwd, args) {
+        gitCalls.push([...args]);
+        if (args[0] === "rev-parse") {
+          return { stdout: "deadbeef\n", stderr: "", code: 0 };
+        }
+        if (args[0] === "rebase" && args[1] === "origin/main") {
+          return { stdout: "", stderr: "CONFLICT", code: 1 };
+        }
+        if (args[0] === "rebase" && args[1] === "--abort") {
+          return { stdout: "", stderr: "", code: 0 };
+        }
+        return { stdout: "", stderr: "", code: 0 };
+      },
+    },
+  );
+  assert.equal(result.changed, false);
+  assert.equal(result.headSha, "deadbeef");
+  assert.ok(result.evidence.includes("failed"));
+  assert.ok(result.evidence.includes("aborted"));
+  assert.ok(
+    gitCalls.some((a) => a[0] === "rebase" && a[1] === "--abort"),
+    "must abort failed rebase",
+  );
+  assert.ok(
+    !gitCalls.some((a) => a[0] === "push"),
+    "must not push after failed rebase",
+  );
+});
+
+test("runDeterministicConflictRebase: rematerializes managed worktree when missing", async () => {
+  const cfg = { base_branch: "staging" } as unknown as PipelineConfig;
+  let ensureCalls = 0;
+  const result = await runDeterministicConflictRebase(
+    { issueNumber: 3, prNumber: 30, title: "need wt" },
+    cfg,
+    {
+      async getOnDiskForIssue() {
+        return null;
+      },
+      async ensureManagedWorktree() {
+        ensureCalls += 1;
+        return {
+          result: "pass" as const,
+          worktree: {
+            path: "/new/wt",
+            slug: "need-wt",
+            branch: "pipeline/3-need-wt",
+          },
+          reason: "rematerialized",
+        };
+      },
+      async gitInWorktree(cwd, args) {
+        assert.equal(cwd, "/new/wt");
+        if (args[0] === "rev-parse") {
+          // HEAD unchanged → no push (already up to date).
+          return { stdout: "same-sha\n", stderr: "", code: 0 };
+        }
+        return { stdout: "", stderr: "", code: 0 };
+      },
+    },
+  );
+  assert.equal(ensureCalls, 1);
+  assert.equal(result.changed, false);
+  assert.ok(result.evidence.includes("already up to date"));
+});
+
+test("drive: deterministic conflict repair is attempted before mechanical implementer", async () => {
+  const order: string[] = [];
+  const deps = makeDeps({
+    candidates: [{ issueNumber: 50, prNumber: 500, title: "order" }],
+    remainingAfterApply: [],
+    eligibility: new Map([
+      [
+        500,
+        [
+          CONFLICT_SNAP, // preflight
+          CONFLICT_SNAP, // after det still conflicting
+          CONFLICT_SNAP, // after mechanical still conflicting
+        ],
+      ],
+    ]),
+    async deterministicImpl(_c, reason) {
+      order.push(`det:${reason}`);
+      assert.equal(reason, "merge-conflict");
+      return {
+        changed: false,
+        headSha: "sha-conflict",
+        evidence: "deterministic rebase failed (conflicts); aborted",
+      };
+    },
+    async mechanicalImpl() {
+      order.push("mech");
+      return { succeeded: false, evidence: "mech fail", error: "mech fail" };
+    },
+  });
+  const result = await runMergeQueue(
+    { ...baseOpts, repair: true, repairMaxAttempts: 1 },
+    deps,
+  );
+  // Spec: deterministic-first — first call must be det before any implementer.
+  assert.equal(order[0], "det:merge-conflict");
+  assert.ok(order.includes("mech"), "mechanical implementer must run after det fails");
+  assert.ok(
+    order.indexOf("det:merge-conflict") < order.indexOf("mech"),
+    "deterministic rebase/restack must precede implementer repair",
+  );
+  assert.equal(deps.mechanicalCalls, 1);
+  assert.ok(deps.deterministicCalls >= 1);
+  assert.equal(result.held.length, 1);
+  assert.equal(result.held[0]!.reason, "merge-conflict");
+  assert.equal(deps.mergeCalls.length, 0);
+});
+
+test("drive: successful deterministic rebase alone restores eligibility without mechanical", async () => {
+  const deps = makeDeps({
+    candidates: [{ issueNumber: 51, prNumber: 510, title: "clean-restack" }],
+    remainingAfterApply: [],
+    eligibility: new Map([
+      [
+        510,
+        [
+          CONFLICT_SNAP, // preflight conflict
+          CLEAN_SNAP, // after clean restack re-gate
+        ],
+      ],
+    ]),
+    async deterministicImpl() {
+      return {
+        changed: true,
+        headSha: "sha-green",
+        evidence: "deterministic clean rebase onto origin/main; pushed pipeline/51-slug",
+      };
+    },
+  });
+  const result = await runMergeQueue(
+    { ...baseOpts, repair: true, repairMaxAttempts: 1 },
+    deps,
+  );
+  assert.equal(result.merged.length, 1);
+  assert.equal(deps.deterministicCalls, 1);
+  assert.equal(deps.mechanicalCalls, 0, "must not invoke implementer after clean restack");
+  assert.equal(deps.mergeCalls.length, 1);
 });
 
 test("drive: evaluateEligibility rejection holds item A and continues to B", async () => {

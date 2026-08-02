@@ -14,6 +14,7 @@ import { spawnSync } from "node:child_process";
 import { invoke } from "../harness.ts";
 import type { PipelineConfig } from "../types.ts";
 import {
+  branchName,
   ensureManagedWorktree,
   getOnDiskForIssue,
   gitInWorktree,
@@ -341,6 +342,137 @@ export async function evaluateCandidateEligibility(
 }
 
 /**
+ * Deterministic clean rebase/restack onto the configured integration base for
+ * merge-conflict holds (#675). Does **not** charge the implementer budget.
+ *
+ * Safety scope (destructive force-with-lease):
+ * - Operates only inside the **managed worktree root** for the candidate issue.
+ * - Pushes only the issue's pipeline branch (`pipeline/<issue>-<slug>`) with
+ *   `--force-with-lease` — same shape as pre-merge conflict recovery — never
+ *   force-pushes the integration base or unrelated refs.
+ * - On rebase failure, aborts the in-progress rebase and leaves the worktree
+ *   without claiming a successful restack.
+ *
+ * Injectable for hermetic tests; production wires real worktree/git deps.
+ */
+export async function runDeterministicConflictRebase(
+  candidate: MergeQueueCandidate,
+  cfg: PipelineConfig,
+  deps: {
+    getOnDiskForIssue?: typeof getOnDiskForIssue;
+    ensureManagedWorktree?: typeof ensureManagedWorktree;
+    gitInWorktree?: typeof gitInWorktree;
+    branchNameFn?: typeof branchName;
+  } = {},
+): Promise<DeterministicRepairResult> {
+  const getWorktree = deps.getOnDiskForIssue ?? getOnDiskForIssue;
+  const ensureWorktree = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+  const git = deps.gitInWorktree ?? gitInWorktree;
+  const branchFn = deps.branchNameFn ?? branchName;
+
+  const base = cfg.base_branch;
+  if (!base) {
+    return {
+      changed: false,
+      evidence: "deterministic rebase skipped: no base_branch configured",
+    };
+  }
+
+  let wt = await getWorktree(cfg, candidate.issueNumber);
+  if (!wt) {
+    const materialized = await ensureWorktree(cfg, candidate.issueNumber);
+    if (materialized.result === "fail" || !materialized.worktree) {
+      const detail =
+        materialized.result === "fail"
+          ? materialized.reason
+          : "worktree rematerialization did not return a worktree";
+      return {
+        changed: false,
+        evidence: `deterministic rebase: managed worktree unavailable: ${detail}`,
+      };
+    }
+    wt = { path: materialized.worktree.path, slug: materialized.worktree.slug };
+  }
+
+  // Managed worktree only — never operate outside this root.
+  const managedRoot = wt.path;
+  const branch = branchFn(candidate.issueNumber, wt.slug);
+
+  const headBefore = await git(managedRoot, ["rev-parse", "HEAD"], {
+    ignoreFailure: true,
+  });
+  const beforeSha =
+    headBefore.code === 0 ? headBefore.stdout.trim() || undefined : undefined;
+
+  const fetch = await git(managedRoot, ["fetch", "origin", base], {
+    ignoreFailure: true,
+  });
+  if (fetch.code !== 0) {
+    return {
+      changed: false,
+      headSha: beforeSha,
+      evidence: `deterministic rebase: fetch origin/${base} failed`,
+    };
+  }
+
+  const rebase = await git(managedRoot, ["rebase", `origin/${base}`], {
+    ignoreFailure: true,
+  });
+  if (rebase.code !== 0) {
+    await git(managedRoot, ["rebase", "--abort"], { ignoreFailure: true });
+    return {
+      changed: false,
+      headSha: beforeSha,
+      evidence:
+        `deterministic rebase onto origin/${base} failed (conflicts or unclean); aborted`,
+    };
+  }
+
+  const headAfterRebase = await git(managedRoot, ["rev-parse", "HEAD"], {
+    ignoreFailure: true,
+  });
+  const afterRebaseSha =
+    headAfterRebase.code === 0
+      ? headAfterRebase.stdout.trim() || undefined
+      : undefined;
+
+  // No-op restack: branch already based on origin/<base> tip — not candidate-moving.
+  if (beforeSha && afterRebaseSha && beforeSha === afterRebaseSha) {
+    return {
+      changed: false,
+      headSha: afterRebaseSha,
+      evidence: `deterministic rebase: already up to date with origin/${base} (HEAD unchanged)`,
+    };
+  }
+
+  // Force-with-lease scoped to the candidate's pipeline branch only (reviewed head).
+  const push = await git(
+    managedRoot,
+    ["push", "--force-with-lease", "origin", branch],
+    { ignoreFailure: true },
+  );
+  if (push.code !== 0) {
+    return {
+      changed: false,
+      headSha: afterRebaseSha ?? beforeSha,
+      evidence:
+        `deterministic rebase succeeded locally but force-with-lease push of ${branch} failed`,
+    };
+  }
+
+  const moved =
+    beforeSha && afterRebaseSha
+      ? ` (${beforeSha.slice(0, 7)} → ${afterRebaseSha.slice(0, 7)})`
+      : "";
+  return {
+    changed: true,
+    headSha: afterRebaseSha ?? beforeSha,
+    evidence:
+      `deterministic clean rebase onto origin/${base}; pushed ${branch}${moved}`,
+  };
+}
+
+/**
  * Shared mechanical-remediation transaction for merge-queue repair (#675).
  * Reuses managed-worktree resolve + {@link performPreMergeAutoFix} (same push
  * path as recovery's repair_pipeline_item executor) without inventing a
@@ -531,9 +663,8 @@ export function realMergeQueueDeps(
       return evaluateCandidateEligibility(candidate, plan, md);
     },
 
-    // Deterministic path re-queries eligibility only (checks re-read; no silent
-    // rebase without worktree wiring). Conflict resolution that needs a dirty
-    // tree goes through the claimed mechanical seam below.
+    // Deterministic-first: checks re-query; conflicts attempt clean rebase/restack
+    // onto the integration base in the managed worktree before mechanical repair.
     async attemptDeterministicRepair(candidate, reason, _snapshot) {
       if (reason === "checks-failed") {
         // Re-query settled check state (no second poller loop — one re-read).
@@ -546,14 +677,19 @@ export function realMergeQueueDeps(
             : `checks re-query still blocking: ${snap.checksDetail ?? "unknown"}`,
         };
       }
-      // Conflict: re-read mergeability; actual rebase requires mechanical/worktree path.
+      // Conflict: managed-worktree clean rebase/restack first (does not charge
+      // implementer budget). Falls back to mergeability re-query only when cfg
+      // is unavailable so worktree ops cannot run.
+      if (cfg) {
+        return runDeterministicConflictRebase(candidate, cfg);
+      }
       const snap = await evaluateCandidateEligibility(candidate, plan, md);
       return {
         changed: false,
         headSha: snap.headRefOid,
         evidence: isMergeableClean(snap.mergeable, snap.mergeStateStatus)
-          ? "mergeability re-query: MERGEABLE/CLEAN"
-          : `mergeability re-query: mergeable=${snap.mergeable} mergeStateStatus=${snap.mergeStateStatus}`,
+          ? "mergeability re-query: MERGEABLE/CLEAN (rebase skipped: no PipelineConfig)"
+          : `mergeability re-query: mergeable=${snap.mergeable} mergeStateStatus=${snap.mergeStateStatus}; rebase skipped: no PipelineConfig`,
       };
     },
 
