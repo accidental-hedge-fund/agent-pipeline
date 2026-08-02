@@ -94,7 +94,26 @@ import {
   type Stage,
   type StageOutcome,
 } from "./types.ts";
-import type { CliOpts } from "./pipeline.ts";
+import {
+  REVIEW_CEILING_MARKER,
+  ceilingRound,
+  evidenceTimestamp,
+} from "./advance-shared.ts";
+
+/**
+ * Thin options bag for the advance loop (#630). Owned outside the Commander
+ * surface so pipeline-run.ts never type-imports fat CliOpts from pipeline.ts.
+ * Field set is exactly what runAdvance / dispatch read today.
+ */
+export interface AdvanceOpts {
+  dryRun?: boolean;
+  model?: string;
+  once?: boolean;
+  override?: string;
+  jsonEvents?: boolean;
+  profile?: string;
+  runId?: string;
+}
 
 /** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
 export function buildAuditRepairComment(stage: Stage, runId: string): string {
@@ -201,10 +220,6 @@ export function buildAutoLoopExhaustedComment(
  * so PR tagging / Pipeline Complete never depend on a free iteration slot (#773).
  */
 export const MAX_ITERATIONS = 12;
-
-// Same string as pipeline.ts's REVIEW_CEILING_MARKER — kept in sync manually.
-// Defining a local copy avoids a runtime circular import with pipeline.ts.
-const REVIEW_CEILING_MARKER = "## Pipeline: Review ceiling reached";
 
 /**
  * Whether this advance invocation must still run {@link deployReady.finalize}
@@ -592,11 +607,6 @@ export async function classifyAndEmitDispatchCrash(
   }, ctx.runStoreDeps);
 }
 
-/** ISO 8601 timestamp at seconds precision (matches the CLI's other stamps). */
-function evidenceTimestamp(): string {
-  return new Date().toISOString().replace(/\.\d+Z$/, "Z");
-}
-
 export function printOutcome(issueNumber: number, fromStage: Stage, out: Outcome, tlog: (line: string) => void): void {
   if (out.advanced) {
     const oo = out as { from: Stage; to: Stage; summary: string };
@@ -633,13 +643,6 @@ async function notifyBundlePath(
   await markNotified(stateDir, issueNumber);
 }
 
-/** The review round recorded in a ceiling comment — local copy for runAdvance use.
- *  The exported version in pipeline.ts is the canonical one; this avoids a circular import. */
-function ceilingRound(body: string): 1 | 2 | null {
-  const m = body.match(/^Review ([12]) re-ran /m);
-  return m ? (Number(m[1]) as 1 | 2) : null;
-}
-
 // ---------------------------------------------------------------------------
 // Stage dispatch
 // ---------------------------------------------------------------------------
@@ -648,7 +651,7 @@ export async function dispatch(
   cfg: PipelineConfig,
   issueNumber: number,
   stage: Stage,
-  opts: CliOpts,
+  opts: AdvanceOpts,
   pipelineRunId: string,
   stateDir?: string,
   runDir?: string,
@@ -766,7 +769,7 @@ export async function dispatch(
 export async function runAdvance(
   cfg: PipelineConfig,
   issueNumber: number,
-  opts: CliOpts,
+  opts: AdvanceOpts,
   deps: AdvanceDeps = {},
 ): Promise<void> {
   const nowFn = deps.now ?? (() => Date.now());

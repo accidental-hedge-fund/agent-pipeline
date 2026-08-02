@@ -20,7 +20,6 @@ import {
   type StageDiagnostic,
 } from "../scripts/stage-diagnostic.ts";
 import type { BlockerKind, Outcome, PipelineConfig } from "../scripts/types.ts";
-import type { CliOpts } from "../scripts/pipeline.ts";
 
 const runStoreDeps = {} as RunStoreDeps;
 
@@ -288,7 +287,7 @@ test("runAdvance emits blocker_set with the producer diagnostic to events.jsonl 
     }),
   };
   try {
-    await runAdvance(cfg, 7, { runId } as CliOpts, deps);
+    await runAdvance(cfg, 7, { runId }, deps);
     const eventsPath = path.join(runDirPath(repoDir, runId), "events.jsonl");
     const events = fs
       .readFileSync(eventsPath, "utf8")
