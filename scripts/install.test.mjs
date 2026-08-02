@@ -9,6 +9,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   realpathSync,
@@ -46,6 +47,9 @@ import {
   acquireUpdateLock,
   releaseUpdateLock,
   verifyUpdateLockOwnership,
+  installClaudeCommands,
+  uninstallClaudeCommands,
+  uninstallHost,
 } from "./install.mjs";
 
 // ---------------------------------------------------------------------------
@@ -1841,4 +1845,306 @@ test("uninstall --host grok: refuses to delete documented copy layout directory 
     cleanup(home);
     cleanup(lockTmp);
   }
+});
+
+// ==========================================================================
+// #635 — CLAUDE_CONFIG_DIR command skill paths, uninstall command cleanup,
+//        Codex personal-skill shadow detection parity
+// ==========================================================================
+
+test("installClaudeCommands: config-dir skill path embedded, not ~/.claude hardcoded (#635)", () => {
+  const tmp = makeTmp();
+  try {
+    installClaudeCommands(tmp, false);
+    const commandsDir = join(tmp, "commands");
+    assert.ok(existsSync(commandsDir), "commands dir must be created");
+    const files = readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"));
+    assert.ok(files.length > 0, "at least one pipeline:*.md command file");
+    const expectedSkill = join(tmp, "skills", "pipeline");
+    for (const f of files) {
+      const body = readFileSync(join(commandsDir, f), "utf8");
+      assert.ok(
+        body.includes(expectedSkill),
+        `${f} must embed config-dir skill path ${expectedSkill}`,
+      );
+      assert.ok(
+        !body.includes("~/.claude/skills/pipeline"),
+        `${f} must not hardcode ~/.claude/skills/pipeline when config dir is custom`,
+      );
+    }
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("installClaudeCommands: dry-run writes nothing under commands/ (#635)", () => {
+  const tmp = makeTmp();
+  try {
+    installClaudeCommands(tmp, true);
+    assert.equal(
+      existsSync(join(tmp, "commands")),
+      false,
+      "dry-run must not create commands directory",
+    );
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("install --host claude under CLAUDE_CONFIG_DIR: command Invoke paths use config-dir skill (#635)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const result = runInstaller(["install", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(result.status, 0, `install failed: ${result.stderr}\n${result.stdout}`);
+    const commandsDir = join(claudeTmp, "commands");
+    const expectedSkill = join(claudeTmp, "skills", "pipeline");
+    assert.ok(existsSync(expectedSkill), "skill tree must be installed");
+    const files = readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"));
+    assert.ok(files.length > 0, "install must write pipeline:*.md commands");
+    for (const f of files) {
+      const body = readFileSync(join(commandsDir, f), "utf8");
+      assert.ok(body.includes(expectedSkill), `${f} must reference ${expectedSkill}`);
+      assert.ok(!body.includes("~/.claude/skills/pipeline"), `${f} must not hardcode default home path`);
+    }
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("uninstallClaudeCommands: removes pipeline:*.md only; preserves siblings; dry-run is no-op (#635)", () => {
+  const tmp = makeTmp();
+  const commandsDir = join(tmp, "commands");
+  mkdirSync(commandsDir, { recursive: true });
+  writeFileSync(join(commandsDir, "pipeline:status.md"), "invoke pipeline");
+  writeFileSync(join(commandsDir, "pipeline:loop.md"), "invoke loop");
+  writeFileSync(join(commandsDir, "other-tool.md"), "unrelated");
+  try {
+    uninstallClaudeCommands(tmp, true);
+    assert.ok(existsSync(join(commandsDir, "pipeline:status.md")), "dry-run keeps pipeline commands");
+    assert.ok(existsSync(join(commandsDir, "other-tool.md")));
+
+    uninstallClaudeCommands(tmp, false);
+    assert.equal(existsSync(join(commandsDir, "pipeline:status.md")), false);
+    assert.equal(existsSync(join(commandsDir, "pipeline:loop.md")), false);
+    assert.ok(existsSync(join(commandsDir, "other-tool.md")), "non-pipeline command must remain");
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("install then uninstall --host claude: skill + pipeline commands gone; sibling command remains (#635)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const install = runInstaller(["install", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(install.status, 0, `install failed: ${install.stderr}`);
+    const skillDir = join(claudeTmp, "skills", "pipeline");
+    const commandsDir = join(claudeTmp, "commands");
+    assert.ok(existsSync(skillDir));
+    const pipelineCmdsBefore = readdirSync(commandsDir).filter(
+      (f) => f.startsWith("pipeline:") && f.endsWith(".md"),
+    );
+    assert.ok(pipelineCmdsBefore.length > 0);
+    writeFileSync(join(commandsDir, "other-tool.md"), "keep me");
+
+    const uninstall = runInstaller(["uninstall", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(uninstall.status, 0, `uninstall failed: ${uninstall.stderr}`);
+    assert.equal(existsSync(skillDir), false, "skill dir must be removed");
+    const remaining = existsSync(commandsDir)
+      ? readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"))
+      : [];
+    assert.deepEqual(remaining, [], "no pipeline:*.md commands may remain");
+    assert.ok(existsSync(join(commandsDir, "other-tool.md")), "unrelated command preserved");
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("uninstall --host claude --dry-run: leaves skill and pipeline commands in place (#635)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const install = runInstaller(["install", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(install.status, 0, install.stderr);
+    const skillDir = join(claudeTmp, "skills", "pipeline");
+    const commandsDir = join(claudeTmp, "commands");
+    const cmds = readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"));
+
+    const dry = runInstaller(["uninstall", "--host", "claude", "--dry-run"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(dry.status, 0, dry.stderr);
+    const out = `${dry.stdout}${dry.stderr}`;
+    assert.match(out, /dry-run/i);
+    assert.ok(existsSync(skillDir), "dry-run must not remove skill");
+    for (const f of cmds) {
+      assert.ok(existsSync(join(commandsDir, f)), `dry-run must leave ${f}`);
+    }
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("uninstallHost claude: orphan command cleanup when skill already gone (#635)", () => {
+  const claudeTmp = makeTmp();
+  process.env.CLAUDE_CONFIG_DIR = claudeTmp;
+  try {
+    const commandsDir = join(claudeTmp, "commands");
+    mkdirSync(commandsDir, { recursive: true });
+    writeFileSync(join(commandsDir, "pipeline:status.md"), "orphan");
+    writeFileSync(join(commandsDir, "other-tool.md"), "keep");
+    // No skills/pipeline — simulates pre-#635 uninstall that left orphans.
+    uninstallHost("claude", false);
+    assert.equal(existsSync(join(commandsDir, "pipeline:status.md")), false);
+    assert.ok(existsSync(join(commandsDir, "other-tool.md")));
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    cleanup(claudeTmp);
+  }
+});
+
+// --- Codex shadow detection (#635) ---
+
+test("detectPersonalSkill codex: no marker → shadowing true under CODEX_HOME (#635)", () => {
+  const tmp = makeTmp();
+  const dest = join(tmp, "skills", "pipeline");
+  mkdirSync(dest, { recursive: true });
+  writeFileSync(join(dest, "SKILL.md"), "personal codex skill");
+  process.env.CODEX_HOME = tmp;
+  try {
+    const result = detectPersonalSkill("codex");
+    assert.equal(result.shadowing, true);
+    assert.equal(result.dest, dest);
+    assert.ok(result.dest.startsWith(tmp), "dest under CODEX_HOME");
+  } finally {
+    delete process.env.CODEX_HOME;
+    cleanup(tmp);
+  }
+});
+
+test("detectPersonalSkill codex: managed marker → shadowing false (#635)", () => {
+  const tmp = makeTmp();
+  const dest = join(tmp, "skills", "pipeline");
+  mkdirSync(dest, { recursive: true });
+  writeFileSync(join(dest, MANAGED_MARKER), "");
+  process.env.CODEX_HOME = tmp;
+  try {
+    const result = detectPersonalSkill("codex");
+    assert.equal(result.shadowing, false);
+  } finally {
+    delete process.env.CODEX_HOME;
+    cleanup(tmp);
+  }
+});
+
+test("detectPersonalSkill codex: no directory → shadowing false (#635)", () => {
+  const tmp = makeTmp();
+  process.env.CODEX_HOME = tmp;
+  try {
+    const result = detectPersonalSkill("codex");
+    assert.equal(result.shadowing, false);
+  } finally {
+    delete process.env.CODEX_HOME;
+    cleanup(tmp);
+  }
+});
+
+test("install --host codex: personal skill non-TTY auto-relocates under CODEX_HOME then installs (#635)", () => {
+  const codexTmp = makeTmp();
+  const lockTmp = makeTmp();
+  const personal = join(codexTmp, "skills", "pipeline");
+  mkdirSync(personal, { recursive: true });
+  writeFileSync(join(personal, "SKILL.md"), "personal codex content");
+  // No managed marker — must not be silently overwritten.
+  try {
+    const result = runInstaller(["install", "--host", "codex"], {
+      CODEX_HOME: codexTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+      // Non-interactive: stdin not a TTY under spawnSync by default.
+    });
+    assert.equal(result.status, 0, `install failed: ${result.stderr}\n${result.stdout}`);
+    const out = `${result.stdout}${result.stderr}`;
+    assert.match(out, /Personal pipeline skill detected|auto-relocat/i);
+    // Personal content must land in a backup under codex base, not be lost.
+    const backups = readdirSync(codexTmp).filter((e) => e.startsWith("pipeline.") && e.includes(".bak"));
+    assert.ok(backups.length > 0, "personal skill must be relocated to a backup under CODEX_HOME");
+    assert.ok(
+      existsSync(join(codexTmp, backups[0], "SKILL.md")),
+      "backup must contain the personal SKILL.md",
+    );
+    assert.equal(
+      readFileSync(join(codexTmp, backups[0], "SKILL.md"), "utf8"),
+      "personal codex content",
+    );
+    // Managed install proceeds into the skills path.
+    assert.ok(existsSync(join(personal, MANAGED_MARKER)), "managed install must write marker");
+  } finally {
+    cleanup(codexTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host codex: managed marker → normal overwrite, no personal-shadow relocation (#635)", () => {
+  const codexTmp = makeTmp();
+  const lockTmp = makeTmp();
+  const dest = join(codexTmp, "skills", "pipeline");
+  mkdirSync(dest, { recursive: true });
+  writeFileSync(join(dest, MANAGED_MARKER), "");
+  writeFileSync(join(dest, "sentinel.txt"), "old-managed");
+  try {
+    const result = runInstaller(["install", "--host", "codex"], {
+      CODEX_HOME: codexTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(result.status, 0, `install failed: ${result.stderr}\n${result.stdout}`);
+    const out = `${result.stdout}${result.stderr}`;
+    assert.ok(
+      !/Personal pipeline skill detected|auto-relocat|Relocate it/i.test(out),
+      "managed install must not emit personal-shadow relocation offer",
+    );
+    assert.ok(existsSync(join(dest, MANAGED_MARKER)));
+    // No pipeline.*.bak under codex base from this path.
+    const backups = readdirSync(codexTmp).filter((e) => e.startsWith("pipeline.") && e.includes(".bak"));
+    assert.deepEqual(backups, [], "managed overwrite must not relocate");
+  } finally {
+    cleanup(codexTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("HOSTS tree-mode: claude and codex share installMode tree for shadow gate (#635)", () => {
+  assert.equal(HOSTS.claude.installMode, "tree");
+  assert.equal(HOSTS.codex.installMode, "tree");
+  assert.equal(HOSTS.grok.installMode, "symlink-claude");
 });

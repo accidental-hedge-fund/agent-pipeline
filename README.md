@@ -117,7 +117,7 @@ gh repo clone accidental-hedge-fund/agent-pipeline
 node agent-pipeline/scripts/install.mjs install        # --host claude|codex|grok|all  (default: all)
 ```
 
-The installer copies the shared core and the right host overlay into `~/.claude/skills/pipeline` and/or `~/.codex/skills/pipeline`, writes a launcher shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME`. **Restart Codex** after a Codex install; Claude picks the skill up live.
+The installer copies the shared core and the right host overlay into `~/.claude/skills/pipeline` and/or `~/.codex/skills/pipeline`, writes a launcher shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME` (Claude `/pipeline:*` command files embed the resolved skill path under that config dir). If a **personal** skill already exists at the host's skills path without the installer's managed marker, install offers relocation (or auto-relocates in non-TTY) for **both** Claude and Codex so the personal tree is not silently overwritten. **Restart Codex** after a Codex install; Claude picks the skill up live.
 
 ### Optional dependency prompts
 
@@ -144,7 +144,9 @@ npx github:accidental-hedge-fund/agent-pipeline uninstall --host all   # or clau
 node scripts/install.mjs uninstall --host all
 ```
 
-## Where to go next
+Uninstall removes the host skill tree. For Claude it also removes installer-written `pipeline:*.md` command files under the resolved Claude config `commands/` directory (same base as install / `CLAUDE_CONFIG_DIR`); other command files are left alone.
+
+## Benchmark & Reliability Suite
 
 | Doc | What it covers |
 | --- | --- |

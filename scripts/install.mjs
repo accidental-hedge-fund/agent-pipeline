@@ -600,18 +600,49 @@ function stageInto(stagingDir, host) {
 
 // Install the namespaced pipeline:<command> command files for the Claude host (#273).
 // Each file is written to <claudeBase>/commands/pipeline:<name>.md.
+// Invoke lines embed the resolved skill path for this base (honors CLAUDE_CONFIG_DIR; #635).
 function installClaudeCommands(claudeBaseDir, dryRun) {
   const commandsDir = join(claudeBaseDir, "commands");
+  // Absolute skill path so config-dir installs never hardcode ~/.claude/skills/pipeline.
+  const skillPath = join(claudeBaseDir, "skills", "pipeline");
   if (dryRun) {
     log(`  (dry-run) would write ${OPERATION_SURFACE.length} pipeline:<command> files to ${commandsDir}`);
     return;
   }
   mkdirSync(commandsDir, { recursive: true });
   for (const op of OPERATION_SURFACE) {
-    const content = renderClaudeCommand(op, "~/.claude/skills/pipeline");
+    const content = renderClaudeCommand(op, skillPath);
     writeFileSync(join(commandsDir, `pipeline:${op.name}.md`), content);
   }
   log(`  ✓ wrote ${OPERATION_SURFACE.length} pipeline:<command> files to ${commandsDir}`);
+}
+
+/**
+ * Remove installer-written Claude command files (`pipeline:*.md`) under
+ * `<claudeBase>/commands/`. Leaves non-pipeline command files untouched.
+ * Runs even when the skill tree is already gone (orphan cleanup; #635).
+ * Exported for unit tests.
+ */
+function uninstallClaudeCommands(claudeBaseDir, dryRun) {
+  const commandsDir = join(claudeBaseDir, "commands");
+  if (!existsSync(commandsDir)) return;
+  let entries;
+  try {
+    entries = readdirSync(commandsDir);
+  } catch {
+    return;
+  }
+  const pipelineCmds = entries.filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"));
+  if (pipelineCmds.length === 0) return;
+  for (const f of pipelineCmds) {
+    const p = join(commandsDir, f);
+    if (dryRun) {
+      log(`  (dry-run) would remove command ${p}`);
+    } else {
+      unlinkSync(p);
+      log(`  ✓ removed command ${f}`);
+    }
+  }
 }
 
 // Install the namespaced pipeline:<command> agent YAML files for the Codex host (#273).
@@ -776,8 +807,28 @@ function installHost(host, dryRun) {
 function uninstallHost(host, dryRun) {
   const cfg = HOSTS[host];
   const dest = join(cfg.skillsDir(), "pipeline");
+  const skillPresent = pathPresent(dest);
+
+  // Claude: always attempt command-file cleanup under the same base install uses,
+  // even when the skill tree is already gone (orphans from pre-#635 uninstalls).
+  if (host === "claude") {
+    if (!skillPresent) {
+      log(`→ ${cfg.label}: nothing installed at ${dest}`);
+    } else {
+      log(`→ ${cfg.label}: removing ${dest}`);
+      if (dryRun) {
+        log("  (dry-run) would rm -rf the skill directory");
+      } else {
+        rmSync(dest, { recursive: true, force: true });
+        log("  ✓ removed");
+      }
+    }
+    uninstallClaudeCommands(claudeBase(), dryRun);
+    return;
+  }
+
   // pathPresent so a broken Grok symlink is still removable.
-  if (!pathPresent(dest)) {
+  if (!skillPresent) {
     log(`→ ${cfg.label}: nothing installed at ${dest}`);
     return;
   }
@@ -1226,12 +1277,18 @@ async function main() {
     try {
       log(`Installing agent-pipeline → [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
       for (const h of hosts) {
-        if (h === "claude") {
+        // Tree-mode hosts overwrite skillsDir/pipeline; protect unmanaged personal
+        // trees (Claude + Codex). Symlink-only hosts (Grok) use a different gate.
+        if (HOSTS[h].installMode === "tree") {
           const { shadowing, dest } = detectPersonalSkill(h);
           if (shadowing) {
-            const action = await offerRelocation(dest, claudeBase(), dryRun);
+            // Backup base = parent of skills dir (claudeBase / CODEX_HOME / discovered home).
+            const backupBase = dirname(HOSTS[h].skillsDir());
+            const action = await offerRelocation(dest, backupBase, dryRun);
             if (action === "skip") {
-              log(`  ↷ Skipped Claude Code install — relocate the personal install first, then re-run.`);
+              log(
+                `  ↷ Skipped ${HOSTS[h].label} install — relocate the personal install first, then re-run.`,
+              );
               continue;
             }
           }
@@ -1290,6 +1347,9 @@ export {
   claudeSkillDir,
   installGrokHost,
   installHost,
+  installClaudeCommands,
+  uninstallClaudeCommands,
+  uninstallHost,
   findLiveRunLocks,
   formatLiveRunMessage,
   acquireUpdateLock,
