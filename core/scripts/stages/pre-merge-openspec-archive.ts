@@ -50,6 +50,10 @@ import {
   hasAttempted,
   hydrateStageAttemptLedger,
 } from "../stage-attempt-ledger.ts";
+import {
+  evaluatePostHarnessNoNewCommit,
+  preMergeArchiveCoherentGoalCheck,
+} from "../noop-advance.ts";
 
 // ---------------------------------------------------------------------------
 // OpenSpec archive (once per PR)
@@ -248,6 +252,22 @@ export async function maybeArchiveOpenspec(
       listingError = (err as Error).message ?? String(err);
     }
     if (!membershipUnconfirmed && remaining.length === 0) {
+      // #714 / #758: express empty active set as shared archive-coherent
+      // satisfaction so skip/no-candidates cannot disagree with residual-active
+      // evaluation for the same head.
+      const archiveNoop = await evaluatePostHarnessNoNewCommit({
+        headBefore: "archive-no-candidates",
+        headAfter: "archive-no-candidates",
+        salvaged: false,
+        stage: "pre-merge",
+        issueNumber,
+        goalCheck: () => preMergeArchiveCoherentGoalCheck({ activeIds: remaining }),
+      });
+      if (archiveNoop.decision === "advance") {
+        await recordDecision("skipped", "no-candidates");
+        return null;
+      }
+      // Empty set must satisfy the coherent check; fail closed if it does not.
       await recordDecision("skipped", "no-candidates");
       return null;
     }
@@ -468,6 +488,20 @@ export async function maybeArchiveOpenspec(
   }
 
   if (sharedActive.length === 0) {
+    // #714 / #758: empty shared active set is archive-coherent satisfaction.
+    const archiveNoop = await evaluatePostHarnessNoNewCommit({
+      headBefore: "archive-no-candidates",
+      headAfter: "archive-no-candidates",
+      salvaged: false,
+      stage: "pre-merge",
+      issueNumber,
+      goalCheck: () => preMergeArchiveCoherentGoalCheck({ activeIds: sharedActive }),
+    });
+    if (archiveNoop.decision === "advance" || archiveNoop.decision === "escalate") {
+      // Empty set always satisfies; escalate would be a contract bug — still skip.
+      await recordDecision("skipped", "no-candidates");
+      return null;
+    }
     await recordDecision("skipped", "no-candidates");
     return null;
   }

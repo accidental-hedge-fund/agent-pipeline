@@ -2477,6 +2477,11 @@ export const PIPELINE_COMMENT_KINDS: readonly {
     verify: "pipeline-attest",
   },
   {
+    kind: "noop-advance-evidence",
+    heading: "## Pipeline: noop-advance evidence",
+    verify: "pipeline-attest",
+  },
+  {
     kind: "pipeline-classifier-prefix",
     heading: "## Pipeline:",
     verify: "exempt",

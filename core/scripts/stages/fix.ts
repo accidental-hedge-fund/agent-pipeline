@@ -51,6 +51,14 @@ import {
 import { makePipelineRunId } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import { runHarnessRound, type HarnessRoundContext } from "../harness-round.ts";
+import {
+  evaluatePostHarnessNoNewCommit,
+  evaluatePreHarnessNoWork,
+  fixDoesNotReproduceGoalCheck,
+  fixExternalCommitGoalCheck,
+  fixOverrideEmptyGoalCheck,
+  formatNoopAdvanceEvidenceNote,
+} from "../noop-advance.ts";
 import { detectIgnoredArtifacts } from "../ignored-artifact-warning.ts";
 import * as openspec from "../openspec.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
@@ -571,7 +579,8 @@ export async function advanceFix(
     effectiveBlockingKeys && effectiveBlockingKeys.size === 0
   ) {
     // Every triggering blocking finding is already dispositioned — nothing left
-    // to fix. Skip the harness entirely and advance directly (#391).
+    // to fix. Skip the harness entirely and advance directly (#391 / #758 shared
+    // pre-harness noop-advance contract).
     const next: Stage = round === 1 ? "review-2" : "pre-merge";
     if (opts.dryRun) {
       // #391 review-2 finding 9c0750f9: this bypass must honor dry-run exactly
@@ -583,13 +592,30 @@ export async function advanceFix(
       );
       return { advanced: true, from: stage, to: next, summary: "[dry-run] all blocking findings dispositioned" };
     }
+    const noopPre = await evaluatePreHarnessNoWork({
+      headSha: "",
+      stage,
+      issueNumber,
+      goalCheck: () =>
+        fixOverrideEmptyGoalCheck({
+          triggeringCount: triggeringBlockingKeys.size,
+          effectiveCount: 0,
+        }),
+    });
+    // Outer guard already proved effective set empty; shared contract must advance.
+    // If it does not, fall through would re-invoke the harness for empty work —
+    // fail closed by advancing with the disposition message only.
+    const evidenceBlock =
+      noopPre.decision === "advance"
+        ? "\n\n" + formatNoopAdvanceEvidenceNote(noopPre.evidence)
+        : "";
     const msg = [
       `All ${triggeringBlockingKeys.size} blocking finding(s) from the triggering review are ` +
         `already dispositioned by an active override or non-reproducing disposition — nothing ` +
         `left to fix. Advancing to ${next} without invoking the fix harness.`,
       "",
       ...overridePreFilterNotes,
-    ].join("\n");
+    ].join("\n") + evidenceBlock;
     await transition(cfg, issueNumber, stage, next, msg);
     return { advanced: true, from: stage, to: next, summary: "all blocking findings dispositioned" };
   }
@@ -855,50 +881,46 @@ export async function advanceFix(
   // commit that path exists to create.
   let headAfter = roundResult.ctx.headAfter;
   if (!crashSalvaged && headBefore && headAfter && headBefore === headAfter && !roundResult.ctx.salvaged) {
-    // #131: the harness reported success without committing and salvage found
-    // nothing — external-advance / DNR / block paths below (salvage already
-    // attempted by the shared helper).
+    // #131 / #758: harness reported success without committing and salvage
+    // found nothing. Order preserved: external-commit (#349) → human-decision
+    // park (#473) → does-not-reproduce (#391) → no-commits. External and DNR
+    // advances go through the shared noop-advance contract.
     {
-      // #349: before blocking, check whether a human already pushed the fix the
-      // reviewer asked for. When HEAD is past the SHA the reviewer last saw,
-      // treat this as "fix already applied externally" and advance instead of
-      // blocking — recovering otherwise requires a manual label-advance for
-      // work that is already done. Fail closed (block) when no trusted review
-      // SHA is extractable, or when HEAD equals it (genuinely nothing done).
-      const decision = decideExternalCommitAdvance(detail.comments, fixActor, round, headAfter);
-      if (decision.advance) {
-        // #349 review-2: HEAD moving past the reviewed SHA only proves *some*
-        // local commit exists after review — it does not prove that commit
-        // ever passed the pre-push gates (e.g. an earlier fix run committed
-        // locally, then blocked at the commit-message/openspec/format/test
-        // gate before pushing). Do NOT push directly here. Instead, rebase
-        // `headBefore` to the reviewed SHA and fall through to the normal
-        // gate sequence below, so the externally-applied commit(s) are
-        // validated exactly like a harness-authored commit before any push.
-        headBefore = decision.reviewSha;
-        externalAdvance = decision;
-        // #349 review-1 finding 1: confirm the commit(s) already reached the
-        // remote branch before granting the subject-check exemption below —
-        // otherwise a bad-subject commit left over from a prior blocked fix
-        // run (never pushed) would bypass the #68 prompt-compliance gate on
-        // this no-op retry.
+      const externalDecision = decideExternalCommitAdvance(
+        detail.comments, fixActor, round, headAfter,
+      );
+      const externalGoal = fixExternalCommitGoalCheck({
+        advance: externalDecision.advance,
+        reviewSha: externalDecision.reviewSha,
+        headAfter,
+      });
+      const externalNoop = await evaluatePostHarnessNoNewCommit({
+        headBefore,
+        headAfter,
+        salvaged: false,
+        stage,
+        issueNumber,
+        goalCheck: () => externalGoal,
+      });
+
+      if (externalNoop.decision === "advance" && externalDecision.advance) {
+        // #349 review-2: rewrite headBefore and fall through normal gates.
+        headBefore = externalDecision.reviewSha;
+        externalAdvance = externalDecision;
         const verifyOnRemote = deps.verifyCommitOnRemote ?? isCommitOnRemote;
         const verifiedOnRemote = await verifyOnRemote(
           wt.path,
           branchName(issueNumber, wt.slug),
           headAfter,
         );
-        commitGateMode = resolveFixCommitGateMode(decision, verifiedOnRemote);
+        commitGateMode = resolveFixCommitGateMode(externalDecision, verifiedOnRemote);
+        await postComment(
+          cfg,
+          issueNumber,
+          formatNoopAdvanceEvidenceNote(externalNoop.evidence),
+        ).catch(() => {});
       } else {
-        // #473: before the #391 does-not-reproduce carve-out, check whether the
-        // harness declared that one or more invoked blocking findings require a
-        // no-code disposition — either a durable product/authority decision or
-        // an external dependency that remains controller-owned, never a claim
-        // that the finding's condition does not exist. Evaluated first so a
-        // round mixing either disposition with does-not-reproduce never advances.
-        // Fails closed: any malformed, stale, or
-        // unmatched declaration is simply not accepted here and falls through to
-        // the does-not-reproduce check and then the existing no-commits block.
+        // #473: human-decision park before DNR so mixed rounds never advance.
         const humanDecisionDeclarations = parseHumanDecisionDeclarations(result.stdout ?? "");
         const acceptedHumanDecisions = decideHumanDecisionPark(
           invokedIdentities,
@@ -913,9 +935,6 @@ export async function advanceFix(
           const externalDecisions = acceptedHumanDecisions.filter(
             (decl) => decl.category === "external-dependency",
           );
-          // #473: every accepted declaration — the external-dependency
-          // reclassified path included — posts the audited evidence comment.
-          // The blocker-kind split below must not drop the durable audit trail.
           for (const decl of acceptedHumanDecisions) {
             await postComment(
               cfg,
@@ -932,16 +951,8 @@ export async function advanceFix(
               }),
             );
           }
-          // #473 review-2 finding a64f2252cd2dbd0a: neutralize the harness-provided
-          // request here too — it is copied into the blocker reason passed to
-          // setBlocked, a distinct sink from the evidence comment above, and an
-          // unsanitized request could otherwise forge a trusted override/
-          // non-reproducing sentinel in the pipeline-authored blocked comment.
           const formatRequests = (decls: HumanDecisionDeclaration[]): string =>
             decls.map((d) => `\`${d.key}\`: ${neutralizeSentinelText(d.request)}`).join("; ");
-          // Each blocker message carries only its own group's categories and
-          // requests: external-dependency declarations never inflate the
-          // authority message (they are audited via the comments above).
           const categories = [...new Set(authorityDecisions.map((d) => d.category))].join(", ");
           const humanDecisionMsg = authorityDecisions.length > 0
             ? `${stage}: the fix harness produced no new commits and declared ` +
@@ -983,21 +994,9 @@ export async function advanceFix(
             diagnostic,
           };
         }
-        // #391: before blocking, check whether the harness declared every
-        // invoked blocking finding non-reproducing at the reviewed SHA — a
-        // correctly-determined no-op (a tooling artifact / non-issue), not a
-        // silent failure. Fails closed: an empty invoked set, or any invoked
-        // finding left uncovered, falls through to the existing block below.
+
+        // #391: does-not-reproduce via shared evaluation.
         const declarations = parseDoesNotReproduceDeclarations(result.stdout ?? "");
-        // A declaration references a finding by (key, fingerprint) — the
-        // fingerprint, copied verbatim from the `finding-fingerprint` marker
-        // shown above the finding in the fix prompt, ties it to exactly one
-        // rendered finding even when the coarse key was minted for MULTIPLE
-        // distinct findings in this review (#391 pre-merge delta, key
-        // bb8d0a35). A declaration whose identity matches no rendered finding
-        // is dropped BEFORE the advance decision, so that finding stays
-        // uncovered and the round fails closed to the block below instead of
-        // recording a wrong disposition.
         const declSummaries = parseFindingSummaries(reviewBody);
         const unambiguous = filterUnambiguousDeclarations(declarations, declSummaries);
         const dnrDecision = decideDoesNotReproduceAdvance(
@@ -1006,7 +1005,22 @@ export async function advanceFix(
           headAfter,
           round,
         );
-        if (dnrDecision.advance) {
+        const dnrNoop = await evaluatePostHarnessNoNewCommit({
+          headBefore,
+          headAfter,
+          salvaged: false,
+          stage,
+          issueNumber,
+          goalCheck: () =>
+            fixDoesNotReproduceGoalCheck({
+              advance: dnrDecision.advance,
+              coveredCount: dnrDecision.advance ? dnrDecision.covered.size : 0,
+              headAfter,
+              missingCount: dnrDecision.advance ? 0 : dnrDecision.missing.size,
+            }),
+        });
+
+        if (dnrNoop.decision === "advance" && dnrDecision.advance) {
           const timestamp = new Date().toISOString().replace(/\.\d+Z$/, "Z");
           for (const decl of dnrDecision.covered.values()) {
             await postComment(
@@ -1026,17 +1040,13 @@ export async function advanceFix(
           const msg =
             `${stage}: the fix harness produced no new commits, but declared ` +
             `${dnrDecision.covered.size} blocking finding(s) non-reproducing at the reviewed SHA ` +
-            `(${headAfter}) — no code change required. Advancing to ${dnrDecision.to}.`;
+            `(${headAfter}) — no code change required. Advancing to ${dnrDecision.to}.\n\n` +
+            formatNoopAdvanceEvidenceNote(dnrNoop.evidence);
           await transition(cfg, issueNumber, stage, dnrDecision.to, msg);
           return { advanced: true, from: stage, to: dnrDecision.to, summary: "no reproducible findings" };
         }
-        // #521: disclose why nothing was salvaged so the operator can see that
-        // recoverable work may still exist without reading terminal.log.
-        // #553: when the worktree is genuinely clean (no salvage failure — just
-        // nothing there), name the inspected worktree explicitly so this reads
-        // as a disclosed "harness ran, nothing recoverable" outcome rather than
-        // a silent no-op — `appendWorktreeStateDisclosure` below adds nothing
-        // extra for a clean worktree, so the path must be named here.
+
+        // #521 / #553: fail closed with disclosed no-commits.
         const noCommitsMsg = noCommitSalvageFailure
           ? `${stage} reported success but produced no new commits. ` +
             `Salvage of uncommitted work also failed: ${noCommitSalvageFailure}`

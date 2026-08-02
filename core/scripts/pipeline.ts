@@ -168,6 +168,12 @@ import {
   type RepairPipelineItemInput,
   type RepairPipelineItemResult,
 } from "./loop/repair-pipeline-item.ts";
+import {
+  evaluatePostHarnessNoNewCommit,
+  formatNoopAdvanceEvidenceNote,
+  implementDeliverablePresentGoalCheck,
+} from "./noop-advance.ts";
+import * as openspec from "./openspec.ts";
 import { compileContractItems, type RawContractItem } from "./loop/dependencies.ts";
 import {
   discoverDeclaredDependencies,
@@ -1285,6 +1291,11 @@ export interface RealExecuteRecoveryDeps {
   getGhActor?: typeof getGhActor;
   clearBlocked?: typeof clearBlocked;
   repairPipelineItem?: (input: RepairPipelineItemInput) => Promise<RepairPipelineItemResult>;
+  /** Injectable HEAD read for verify_head_goal (#758). */
+  gitHead?: (wtPath: string) => Promise<string>;
+  getOnDiskForIssue?: typeof getOnDiskForIssue;
+  listChangeDirs?: (dir: string) => string[];
+  postComment?: typeof postComment;
 }
 
 /** Production provider-neutral recovery registry. Substantive repair delegates
@@ -1298,12 +1309,111 @@ export function realExecuteRecovery(
   const verifyAuthentication = deps.getGhActor ?? getGhActor;
   const clear = deps.clearBlocked ?? clearBlocked;
   const repairPipelineItem = deps.repairPipelineItem ?? createRepairPipelineItemExecutor(cfg);
+  const getWorktree = deps.getOnDiskForIssue ?? getOnDiskForIssue;
+  const listChanges = deps.listChangeDirs ?? openspec.listChangeDirs;
+  const post = deps.postComment ?? postComment;
+  const gitHead =
+    deps.gitHead ??
+    (async (wtPath: string) =>
+      (await gitInWorktree(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim());
 
   const failed = (error: string): RepairPipelineItemResult => ({
     succeeded: false,
     evidence: error,
     error,
   });
+
+  /**
+   * #758: first deterministic implementation-ci recipe for no-commits — shared
+   * HEAD goal-satisfaction evaluation. Does NOT charge model-repair budget
+   * (this recipe is not repair_pipeline_item). On advance: attested evidence +
+   * clear blocked for redispatch. On escalate: fail so the next recipe runs.
+   */
+  const verifyHeadGoal = async (
+    input: ExecuteRecoveryInput,
+  ): Promise<RepairPipelineItemResult> => {
+    const issueNumber = Number(input.itemId);
+    if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
+      return failed(`verify_head_goal requires a positive numeric item id`);
+    }
+    const blockerKind = input.diagnostic.detail.blocker_kind;
+    const stage = input.diagnostic.detail.stage ?? "implementing";
+    // Only no-commits (and equivalent implementation-outcome) blocks are in
+    // scope for goal-satisfaction recovery; other implementation-ci kinds fall
+    // through so later recipes (rerun_ci / repair) can run.
+    if (blockerKind !== "no-commits") {
+      return failed(
+        `verify_head_goal does not apply to blocker_kind=${blockerKind}; trying next recipe`,
+      );
+    }
+    const wt = await getWorktree(cfg, issueNumber);
+    if (!wt) {
+      return failed(`verify_head_goal: no managed worktree for #${issueNumber}`);
+    }
+    const headSha = await gitHead(wt.path);
+    if (!headSha) {
+      return failed(`verify_head_goal: cannot read HEAD for #${issueNumber}`);
+    }
+    // Stage-supplied goal checks — same classes as normal stage execution.
+    // Implementing: OpenSpec deliverable already present. Other stages without
+    // a recovery-time checker escalate (fail closed to next recipe).
+    const goalCheck = () => {
+      if (stage === "implementing" || stage === "planning" || stage === "plan-review") {
+        const changes = listChanges(wt.path);
+        return implementDeliverablePresentGoalCheck({
+          deliverablePresent: changes.length > 0,
+          worktreeClean: true,
+          gatesGreen: true,
+          deliverableDescription:
+            changes.length > 0
+              ? `OpenSpec change(s) present at HEAD: ${changes.join(", ")}`
+              : undefined,
+        });
+      }
+      // Fix/pre-merge recovery goal checks need live review partition state;
+      // without it, fail closed so repair_pipeline_item can still run.
+      return {
+        satisfied: false as const,
+        note: `verify_head_goal: no recovery-time goal checker for stage ${stage}`,
+        rationaleClass: "fix-no-actionable-work",
+      };
+    };
+    const result = await evaluatePostHarnessNoNewCommit({
+      headBefore: headSha,
+      headAfter: headSha,
+      salvaged: false,
+      stage,
+      issueNumber,
+      goalCheck,
+    });
+    if (result.decision !== "advance") {
+      return failed(
+        `verify_head_goal: HEAD does not satisfy stage goal` +
+          (result.decision === "escalate" ? ` (${result.note})` : ` (${result.reason})`),
+      );
+    }
+    try {
+      await post(cfg, issueNumber, formatNoopAdvanceEvidenceNote(result.evidence));
+    } catch {
+      /* evidence is best-effort; clearing blocked still redispatch-safe */
+    }
+    try {
+      await clear(cfg, issueNumber);
+    } catch (err) {
+      return failed(
+        `verify_head_goal advanced but could not clear blocked: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return {
+      succeeded: true,
+      evidence:
+        `verify_head_goal: stage goal already satisfied at ${headSha.slice(0, 12)} ` +
+        `(${result.evidence.rationaleClass}); cleared blocked without model repair`,
+      // Same head — not a candidate-changing repair; supervisor must not require
+      // a new remote head for this recipe (only repair_pipeline_item does).
+      candidateHead: headSha,
+    };
+  };
 
   const resyncMechanicalBlock = async (
     input: ExecuteRecoveryInput,
@@ -1358,6 +1468,8 @@ export function realExecuteRecovery(
           candidateIdentity: input.candidateIdentity,
           diagnostic: input.diagnostic,
         });
+      case "verify_head_goal":
+        return verifyHeadGoal(input);
       case "wait_and_retry":
       case "rerun_ci":
       case "resync_workflow_state":
