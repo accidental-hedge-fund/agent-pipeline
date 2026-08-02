@@ -205,6 +205,12 @@ export interface AdvanceFixDeps {
   ) => Promise<{ ok: boolean; reason?: string }>;
   /** On-disk worktree lookup (defaults to getOnDiskForIssue). */
   getOnDiskForIssue?: typeof getOnDiskForIssue;
+  /**
+   * Durable comment sink for noop-advance evidence (#758 R2). Defaults to
+   * `postComment`. Tests inject fakes so evidence write failure is exercised
+   * without a real GitHub API call.
+   */
+  postComment?: typeof postComment;
 }
 
 // ---------------------------------------------------------------------------
@@ -905,6 +911,34 @@ export async function advanceFix(
       });
 
       if (externalNoop.decision === "advance" && externalDecision.advance) {
+        // Durable evidence is required before external-commit advance continues
+        // (#758 R2 / noop-advance-contract fail-closed evidence). Do not set
+        // externalAdvance or fall through gates until the sink succeeds.
+        const doPostComment = deps.postComment ?? postComment;
+        try {
+          await doPostComment(
+            cfg,
+            issueNumber,
+            formatNoopAdvanceEvidenceNote(externalNoop.evidence),
+          );
+        } catch (err) {
+          const evidenceFailMsg =
+            `${stage}: external-commit goal was satisfied at HEAD but durable ` +
+            `noop-advance evidence could not be recorded: ${
+              err instanceof Error ? err.message : String(err)
+            }`;
+          const evidenceFailReason = await appendWorktreeStateDisclosure(
+            wt.path,
+            evidenceFailMsg,
+          );
+          await setBlocked(cfg, issueNumber, evidenceFailReason, stage, "no-commits");
+          return {
+            advanced: false,
+            status: "blocked",
+            reason: evidenceFailMsg,
+            blockerKind: "no-commits",
+          };
+        }
         // #349 review-2: rewrite headBefore and fall through normal gates.
         headBefore = externalDecision.reviewSha;
         externalAdvance = externalDecision;
@@ -915,11 +949,6 @@ export async function advanceFix(
           headAfter,
         );
         commitGateMode = resolveFixCommitGateMode(externalDecision, verifiedOnRemote);
-        await postComment(
-          cfg,
-          issueNumber,
-          formatNoopAdvanceEvidenceNote(externalNoop.evidence),
-        ).catch(() => {});
       } else {
         // #473: human-decision park before DNR so mixed rounds never advance.
         const humanDecisionDeclarations = parseHumanDecisionDeclarations(result.stdout ?? "");

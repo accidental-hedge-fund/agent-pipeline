@@ -1300,7 +1300,56 @@ export interface RealExecuteRecoveryDeps {
    */
   isWorktreeClean?: (wtPath: string) => Promise<boolean>;
   getOnDiskForIssue?: typeof getOnDiskForIssue;
+  /**
+   * @deprecated Prefer probeImplementDeliverable. Kept so older test stubs
+   * still type-check; recovery no longer treats non-empty listChangeDirs as
+   * deliverable proof (#758 R2).
+   */
   listChangeDirs?: (dir: string) => string[];
+  /**
+   * Paths changed on the issue branch vs base (default: git diff
+   * origin/<base>...HEAD). Used by the default deliverable probe to bind
+   * identity to the issue branch rather than any leftover change dir (#758 R2).
+   */
+  listBranchChangedPaths?: (wtPath: string) => Promise<string[]>;
+  /**
+   * True when an OpenSpec change id has the minimum accepted planning
+   * artifacts (proposal.md). Used by the default deliverable probe (#758 R2).
+   */
+  changeHasDeliverableArtifacts?: (wtPath: string, changeId: string) => boolean;
+  /**
+   * Issue-bound implement deliverable probe. Default: branch-introduced
+   * OpenSpec change ids that still exist and have proposal.md. Injectable so
+   * unit tests do not need a real worktree filesystem (#758 R2).
+   */
+  probeImplementDeliverable?: (
+    wtPath: string,
+    issueNumber: number,
+  ) => Promise<{ present: boolean; description?: string }>;
+  /**
+   * Applicable format/test gates at the claimed HEAD. Must not be hard-coded
+   * true — recovery certifies implement-deliverable-present only when this
+   * probe proves green (#758 R2).
+   */
+  probeGatesGreen?: (wtPath: string, issueNumber: number) => Promise<boolean>;
+  /**
+   * Format gate runner for the default probeGatesGreen implementation.
+   * Signature matches `runFormatGate` (status ok | blocked).
+   */
+  runFormatGate?: (
+    wtPath: string,
+    config: Pick<PipelineConfig, "format_gate">,
+    issueNumber: number,
+  ) => Promise<{ status: "ok"; committed: boolean } | { status: "blocked"; reason: string }>;
+  /**
+   * Test gate runner for the default probeGatesGreen implementation.
+   * Signature matches `runTestGate` (passed / skipped fields used).
+   */
+  runTestGate?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    wtPath: string,
+  ) => Promise<{ skipped: boolean; passed?: boolean }>;
   postComment?: typeof postComment;
 }
 
@@ -1316,7 +1365,6 @@ export function realExecuteRecovery(
   const clear = deps.clearBlocked ?? clearBlocked;
   const repairPipelineItem = deps.repairPipelineItem ?? createRepairPipelineItemExecutor(cfg);
   const getWorktree = deps.getOnDiskForIssue ?? getOnDiskForIssue;
-  const listChanges = deps.listChangeDirs ?? openspec.listChangeDirs;
   const post = deps.postComment ?? postComment;
   const gitHead =
     deps.gitHead ??
@@ -1333,6 +1381,74 @@ export function realExecuteRecovery(
       );
       if (status.code !== 0) return false;
       return status.stdout.trim() === "";
+    });
+  // Branch-introduced paths — not tip-wide listChangeDirs — so an unrelated
+  // leftover under openspec/changes/ cannot satisfy the implement goal (#758 R2).
+  const listBranchChangedPaths =
+    deps.listBranchChangedPaths ??
+    (async (wtPath: string) => {
+      const result = await gitInWorktree(
+        wtPath,
+        ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
+        { ignoreFailure: true },
+      );
+      if (result.code !== 0) return [];
+      return result.stdout
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    });
+  const changeHasDeliverableArtifacts =
+    deps.changeHasDeliverableArtifacts ??
+    ((wtPath: string, changeId: string) =>
+      openspec.readChangeFile(wtPath, changeId, "proposal.md") !== null);
+  const probeImplementDeliverable =
+    deps.probeImplementDeliverable ??
+    (async (wtPath: string, _issueNumber: number) => {
+      const branchPaths = await listBranchChangedPaths(wtPath);
+      const branchChangeIds = openspec
+        .changeIdsFromPaths(branchPaths)
+        .filter((id) => openspec.changeDirExists(wtPath, id));
+      const acceptedIds = branchChangeIds.filter((id) =>
+        changeHasDeliverableArtifacts(wtPath, id),
+      );
+      if (acceptedIds.length === 0) {
+        return { present: false as const };
+      }
+      return {
+        present: true as const,
+        description: `branch-introduced OpenSpec deliverable(s) at HEAD: ${acceptedIds.join(", ")}`,
+      };
+    });
+  // Applicable gates at claimed HEAD — never hard-code true (#758 R2).
+  // Format is checked non-mutating (auto_fix forced off). Test gate runs with
+  // max_attempts: 0 so a red suite fails closed without charging model repair.
+  const probeGatesGreen =
+    deps.probeGatesGreen ??
+    (async (wtPath: string, issueNumber: number) => {
+      const formatEntries = cfg.format_gate ?? [];
+      if (formatEntries.length > 0) {
+        const { runFormatGate } = await import("./stages/format-gate.ts");
+        const runFmt = deps.runFormatGate ?? runFormatGate;
+        const checkCfg = {
+          ...cfg,
+          format_gate: formatEntries.map((e) => ({
+            command: e.command,
+            auto_fix: false,
+          })),
+        };
+        const fmt = await runFmt(wtPath, checkCfg, issueNumber);
+        if (fmt.status === "blocked") return false;
+      }
+      if (!cfg.test_gate?.enabled) return true;
+      const { runTestGate } = await import("./testgate.ts");
+      const runTest = deps.runTestGate ?? runTestGate;
+      const testCfg = {
+        ...cfg,
+        test_gate: { ...cfg.test_gate, max_attempts: 0 },
+      };
+      const gate = await runTest(testCfg, issueNumber, wtPath);
+      return Boolean(gate.skipped || gate.passed);
     });
 
   const failed = (error: string): RepairPipelineItemResult => ({
@@ -1380,25 +1496,18 @@ export function realExecuteRecovery(
       );
     }
     // Stage-supplied goal checks — same classes as normal stage execution.
-    // Implementing: OpenSpec deliverable already present + clean tree.
-    // Gates are not pre-certified here: successful recovery only clears the
-    // no-commits block and redispatches so normal stage gates still run.
+    // Implementing: branch-introduced OpenSpec deliverable + clean tree +
+    // applicable gates proven green via injectable probes (#758 R2).
     // Other stages without a recovery-time checker escalate (fail closed).
-    const goalCheck = () => {
+    const goalCheck = async () => {
       if (stage === "implementing" || stage === "planning" || stage === "plan-review") {
-        const changes = listChanges(wt.path);
+        const deliverable = await probeImplementDeliverable(wt.path, issueNumber);
+        const gatesGreen = await probeGatesGreen(wt.path, issueNumber);
         return implementDeliverablePresentGoalCheck({
-          deliverablePresent: changes.length > 0,
+          deliverablePresent: deliverable.present,
           worktreeClean: true,
-          // Redispatch runs format/test gates; do not claim they already passed.
-          // implementDeliverablePresent treats omitted/true as "gates ok for
-          // this check"; false would block deliverable-present recovery entirely.
-          // Recovery never skips post-redispatch gates — only certifies deliverable+clean.
-          gatesGreen: true,
-          deliverableDescription:
-            changes.length > 0
-              ? `OpenSpec change(s) present at HEAD: ${changes.join(", ")}`
-              : undefined,
+          gatesGreen,
+          deliverableDescription: deliverable.description,
         });
       }
       // Fix/pre-merge recovery goal checks need live review partition state;

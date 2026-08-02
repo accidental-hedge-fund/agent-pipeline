@@ -300,7 +300,12 @@ test("#787: verify_head_goal advances no-commits without repair_pipeline_item", 
     getOnDiskForIssue: async () => ({ path: "/wt", branch: "pipeline/1", slug: "s" } as any),
     gitHead: async () => SHA,
     isWorktreeClean: async () => true,
-    listChangeDirs: () => ["generalized-noop-advance-contract"],
+    // Issue-bound deliverable + real gates probe — not listChangeDirs / true (#758 R2).
+    probeImplementDeliverable: async () => ({
+      present: true,
+      description: "branch-introduced OpenSpec deliverable(s) at HEAD: generalized-noop-advance-contract",
+    }),
+    probeGatesGreen: async () => true,
   });
   const diagnostic = buildStageDiagnostic({
     blockerKind: "no-commits",
@@ -341,7 +346,8 @@ test("#787: verify_head_goal escalates when deliverable absent (next recipe may 
     getOnDiskForIssue: async () => ({ path: "/wt", branch: "pipeline/1", slug: "s" } as any),
     gitHead: async () => SHA,
     isWorktreeClean: async () => true,
-    listChangeDirs: () => [],
+    probeImplementDeliverable: async () => ({ present: false }),
+    probeGatesGreen: async () => true,
   });
   const diagnostic = buildStageDiagnostic({
     blockerKind: "no-commits",
@@ -382,7 +388,11 @@ test("#758 R1: verify_head_goal fails closed on dirty worktree (no clear)", asyn
     getOnDiskForIssue: async () => ({ path: "/wt", branch: "pipeline/1", slug: "s" } as any),
     gitHead: async () => SHA,
     isWorktreeClean: async () => false,
-    listChangeDirs: () => ["generalized-noop-advance-contract"],
+    probeImplementDeliverable: async () => ({
+      present: true,
+      description: "should not be consulted when dirty",
+    }),
+    probeGatesGreen: async () => true,
   });
   const diagnostic = buildStageDiagnostic({
     blockerKind: "no-commits",
@@ -423,7 +433,11 @@ test("#758 R1: verify_head_goal fails closed when durable evidence cannot be rec
     getOnDiskForIssue: async () => ({ path: "/wt", branch: "pipeline/1", slug: "s" } as any),
     gitHead: async () => SHA,
     isWorktreeClean: async () => true,
-    listChangeDirs: () => ["generalized-noop-advance-contract"],
+    probeImplementDeliverable: async () => ({
+      present: true,
+      description: "branch-introduced OpenSpec deliverable(s) at HEAD: generalized-noop-advance-contract",
+    }),
+    probeGatesGreen: async () => true,
   });
   const diagnostic = buildStageDiagnostic({
     blockerKind: "no-commits",
@@ -443,6 +457,142 @@ test("#758 R1: verify_head_goal fails closed when durable evidence cannot be rec
   assert.equal(result.succeeded, false);
   assert.equal(clears, 0, "must preserve block when evidence sink fails");
   assert.match(result.error ?? "", /durable evidence could not be recorded/i);
+});
+
+test("#758 R2: verify_head_goal fails closed when gates probe is not green", async () => {
+  let clears = 0;
+  let posts = 0;
+  const cfg: PipelineConfig = {
+    ...DEFAULT_CONFIG,
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    base_branch: "main",
+  };
+  const execute = realExecuteRecovery(cfg, {
+    clearBlocked: async () => {
+      clears++;
+    },
+    postComment: async () => {
+      posts++;
+    },
+    getOnDiskForIssue: async () => ({ path: "/wt", branch: "pipeline/1", slug: "s" } as any),
+    gitHead: async () => SHA,
+    isWorktreeClean: async () => true,
+    probeImplementDeliverable: async () => ({
+      present: true,
+      description: "branch-introduced OpenSpec deliverable(s) at HEAD: generalized-noop-advance-contract",
+    }),
+    probeGatesGreen: async () => false,
+  });
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "no-commits",
+    reason: "no commits",
+    stage: "implementing",
+  });
+  const result = await execute({
+    runId: "loop-1",
+    itemId: "42",
+    blockerClass: "implementation-ci",
+    attemptId: "a1",
+    candidateIdentity: `repo=owner/repo|head=${SHA}|attempt=0`,
+    action: "verify_head_goal",
+    diagnostic,
+    evidence: { pr_number: 1, pipeline_run_id: "run-1", candidate_identity: "x" },
+  });
+  assert.equal(result.succeeded, false);
+  assert.equal(clears, 0, "must not clear blocked when gates are not green");
+  assert.equal(posts, 0, "must not claim goal-satisfied evidence when gates fail");
+  assert.match(result.error ?? "", /does not satisfy|gates not green|implement goal/i);
+});
+
+test("#758 R2: verify_head_goal does not treat arbitrary tip change-dirs as the issue deliverable", async () => {
+  let clears = 0;
+  const cfg: PipelineConfig = {
+    ...DEFAULT_CONFIG,
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    base_branch: "main",
+  };
+  // Default deliverable probe: branch paths introduce no OpenSpec change, even
+  // if a leftover change dir exists on disk (listChangeDirs is ignored).
+  const execute = realExecuteRecovery(cfg, {
+    clearBlocked: async () => {
+      clears++;
+    },
+    postComment: async () => {},
+    getOnDiskForIssue: async () => ({ path: "/wt", branch: "pipeline/1", slug: "s" } as any),
+    gitHead: async () => SHA,
+    isWorktreeClean: async () => true,
+    listChangeDirs: () => ["unrelated-leftover-change"],
+    listBranchChangedPaths: async () => ["src/foo.ts"],
+    changeHasDeliverableArtifacts: () => true,
+    probeGatesGreen: async () => true,
+  });
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "no-commits",
+    reason: "no commits",
+    stage: "implementing",
+  });
+  const result = await execute({
+    runId: "loop-1",
+    itemId: "42",
+    blockerClass: "implementation-ci",
+    attemptId: "a1",
+    candidateIdentity: `repo=owner/repo|head=${SHA}|attempt=0`,
+    action: "verify_head_goal",
+    diagnostic,
+    evidence: { pr_number: 1, pipeline_run_id: "run-1", candidate_identity: "x" },
+  });
+  assert.equal(result.succeeded, false, "leftover tip dirs without branch-introduced ids must not advance");
+  assert.equal(clears, 0);
+  assert.match(result.error ?? "", /does not satisfy|not satisfied|absent|implement goal/i);
+});
+
+test("#758 R2: verify_head_goal source pin — no hard-coded gatesGreen true or non-empty listChangeDirs certification", async () => {
+  const src = await readFile(
+    fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url)),
+    "utf8",
+  );
+  // Isolate the verify_head_goal body.
+  const start = src.indexOf("const verifyHeadGoal = async");
+  assert.ok(start !== -1);
+  const body = src.slice(start, start + 4500);
+  assert.doesNotMatch(
+    body,
+    /gatesGreen:\s*true/,
+    "recovery must not hard-code gatesGreen: true",
+  );
+  assert.doesNotMatch(
+    body,
+    /deliverablePresent:\s*(?:changes|listChanges)\([^)]*\)\.length\s*>\s*0/,
+    "recovery must not use non-empty listChangeDirs as deliverable proof",
+  );
+  assert.match(body, /probeImplementDeliverable|probeGatesGreen/);
+});
+
+test("#758 R2: fix external-commit path fails closed when durable evidence cannot be recorded", async () => {
+  const src = await readFile(
+    fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)),
+    "utf8",
+  );
+  // Evidence post must not be swallowed before externalAdvance is set.
+  assert.doesNotMatch(
+    src,
+    /formatNoopAdvanceEvidenceNote\(externalNoop\.evidence\),\s*\)\.catch\(\(\)\s*=>\s*\{\s*\}\)/s,
+    "must not discard external-commit evidence write failures",
+  );
+  assert.match(
+    src,
+    /external-commit goal was satisfied at HEAD but durable/,
+    "must fail closed with a typed evidence-write failure outcome",
+  );
+  const evidenceFail = src.indexOf("external-commit goal was satisfied at HEAD but durable");
+  const externalAdvanceSet = src.indexOf("externalAdvance = externalDecision");
+  assert.ok(evidenceFail !== -1 && externalAdvanceSet !== -1);
+  assert.ok(
+    evidenceFail < externalAdvanceSet,
+    "evidence write failure must be handled before setting externalAdvance",
+  );
 });
 
 test("#758 R1: planning implement path does not synthesize unknown HEAD or relax cleanliness", async () => {
