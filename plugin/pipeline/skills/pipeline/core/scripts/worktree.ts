@@ -736,14 +736,40 @@ export async function createWorktree(
   };
 
   /** Apply operator-remove safety without force before any reclaim mutation (#622).
+   *  Routes through worktree lifecycle reconcile then evaluateRemoveSafety (#759).
    *  Throws a clear error and never mutates on a blocking result. */
   async function assertReclaimSafe(candidatePath: string, candidateBranch: string): Promise<void> {
+    // Lazy import avoids circular init: reconcile-and-converge imports evaluateRemoveSafety from this module.
+    const { reconcileWorktreeLifecycle } = await import("./reconcile-and-converge.ts");
     const pathOnDisk = existsFn(candidatePath);
     let dirty = false;
     if (pathOnDisk) {
       dirty = await dirtyFn(candidatePath);
     }
     const localOnly = await localOnlyFn(cfg, pathOnDisk ? candidatePath : null, candidateBranch);
+    const reconciled = reconcileWorktreeLifecycle({
+      required: true,
+      managedPresent: true,
+      pathExists: pathOnDisk,
+      dirty,
+      localOnly,
+      actualBranch: candidateBranch,
+      force: false,
+    });
+    if (
+      reconciled.actions.some(
+        (a) => a.kind === "refuse_unsafe_remove" || a.kind === "fail_closed",
+      )
+    ) {
+      const reason =
+        reconciled.removeSafety && !reconciled.removeSafety.ok
+          ? reconciled.removeSafety.error
+          : reconciled.actions[0]?.reason ?? "reclaim refused by worktree reconcile";
+      throw new Error(
+        `Cannot reclaim worktree for issue #${issueNumber} at ${candidatePath} ` +
+          `(branch ${candidateBranch}): ${reason}`,
+      );
+    }
     const safety = evaluateRemoveSafety({ dirty, localOnly, force: false });
     if (!safety.ok) {
       throw new Error(
@@ -1106,6 +1132,82 @@ export async function removeWorktree(
     await git(cfg, cfg.repo_dir, ["worktree", "remove", wtPath, "--force"], { ignoreFailure: true });
   }
   await git(cfg, cfg.repo_dir, ["branch", "-D", branch], { ignoreFailure: true });
+}
+
+/**
+ * Result of {@link removeManagedWorktreeSafely} — production stages that
+ * historically force-removed without the ladder (#759 / #622) go through this
+ * single wrapper so every path evaluates `evaluateRemoveSafety` once.
+ */
+export type SafeRemoveResult =
+  | { removed: true; path: string; branch: string }
+  | {
+      removed: false;
+      reason: string;
+      path?: string;
+      branch?: string;
+      blockReason?: "local-only" | "unverifiable" | "verification-failed" | "dirty";
+    };
+
+export interface SafeRemoveDeps {
+  hasDirtyWorkdir?: (wtPath: string) => Promise<boolean>;
+  hasLocalOnlyCommits?: (
+    cfg: PipelineConfig,
+    wtPath: string | null,
+    branch: string,
+  ) => Promise<LocalOnlyCommitResult>;
+  pathExists?: (p: string) => boolean;
+  removeWorktree?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    slug: string,
+    resolvedPath?: string,
+  ) => Promise<void>;
+  /**
+   * When true, dirty trees may be force-removed if local-only is clean.
+   * Default false. Terminal deploy_ready may pass true only with a written
+   * site comment documenting why force is acceptable.
+   */
+  force?: boolean;
+}
+
+/**
+ * Single shared remove wrapper: evaluate `evaluateRemoveSafety` once, then
+ * mutate only when ok. Call sites in auto_recover / deploy_ready / park release
+ * should prefer this over bare `removeWorktree` (#759).
+ */
+export async function removeManagedWorktreeSafely(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  slug: string,
+  resolvedPath?: string,
+  deps: SafeRemoveDeps = {},
+): Promise<SafeRemoveResult> {
+  const dirtyFn = deps.hasDirtyWorkdir ?? hasDirtyWorkdir;
+  const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
+  const existsFn = deps.pathExists ?? fs.existsSync;
+  const removeFn = deps.removeWorktree ?? removeWorktree;
+  const force = !!deps.force;
+  const wtPath = resolvedPath ?? worktreePath(cfg, issueNumber, slug);
+  const branch = branchName(issueNumber, slug);
+  const pathOnDisk = existsFn(wtPath);
+  let dirty = false;
+  if (pathOnDisk) {
+    dirty = await dirtyFn(wtPath);
+  }
+  const localOnly = await localOnlyFn(cfg, pathOnDisk ? wtPath : null, branch);
+  const safety = evaluateRemoveSafety({ dirty, localOnly, force });
+  if (!safety.ok) {
+    return {
+      removed: false,
+      reason: safety.error,
+      path: wtPath,
+      branch,
+      blockReason: safety.blockReason,
+    };
+  }
+  await removeFn(cfg, issueNumber, slug, resolvedPath);
+  return { removed: true, path: wtPath, branch };
 }
 
 export interface CreateWorktreeAtDeps {
@@ -2033,30 +2135,25 @@ export async function releaseWorktreeForParkedIssue(
   if (pathOnDisk) {
     dirty = await dirtyFn(worktreeP);
   }
-  if (dirty) {
-    return {
-      action: "retained",
-      reason: `dirty worktree at ${worktreeP}; park-release retains uncommitted work`,
-      branch,
-      worktree: worktreeP,
-    };
-  }
-
   const localOnly = await localOnlyFn(cfg, pathOnDisk ? worktreeP : null, branch);
-  if (localOnly === true) {
+
+  // Single evaluateRemoveSafety decision for dirty/local-only (#759 parked
+  // release). Prior code re-checked the same policy via early returns and a
+  // second evaluateRemoveSafety call — those could disagree in wording and
+  // counted as two independent preflights.
+  const safety = evaluateRemoveSafety({ dirty, localOnly, force: false });
+  if (!safety.ok) {
+    const reason =
+      safety.blockReason === "dirty"
+        ? `dirty worktree at ${worktreeP}; park-release retains uncommitted work`
+        : safety.blockReason === "local-only"
+          ? `local-only (unpushed) commits on ${branch}; park-release retains the worktree`
+          : safety.blockReason === "verification-failed"
+            ? `cannot verify local-only state for ${branch} (git/network/auth); park-release retains the worktree`
+            : safety.error;
     return {
       action: "retained",
-      reason: `local-only (unpushed) commits on ${branch}; park-release retains the worktree`,
-      branch,
-      worktree: worktreeP,
-    };
-  }
-  if (localOnly === null) {
-    return {
-      action: "retained",
-      reason:
-        `cannot verify local-only state for ${branch} (git/network/auth); ` +
-        "park-release retains the worktree",
+      reason,
       branch,
       worktree: worktreeP,
     };
@@ -2070,7 +2167,7 @@ export async function releaseWorktreeForParkedIssue(
   const hasRecoverableOpenPr = openPrHead !== null && openPrHead.headSha.length > 0;
   // Open PR is an alternate recoverability path when remote-tip verification is
   // marginal (e.g. unverifiable after squash ambiguity) — still require no
-  // definitive local-only commits (handled above).
+  // definitive local-only commits (handled above via evaluateRemoveSafety).
   if (localOnly === "unverifiable" && !hasRecoverableOpenPr && !hasRemoteTip) {
     return {
       action: "retained",
@@ -2087,17 +2184,6 @@ export async function releaseWorktreeForParkedIssue(
       reason:
         `no remote branch tip and no open PR with resolvable head for ${branch}; ` +
         "park-release retains the worktree (missing remote recoverability)",
-      branch,
-      worktree: worktreeP,
-    };
-  }
-
-  // Same non-force safety ladder as operator remove / reclaim.
-  const safety = evaluateRemoveSafety({ dirty: false, localOnly, force: false });
-  if (!safety.ok) {
-    return {
-      action: "retained",
-      reason: safety.error,
       branch,
       worktree: worktreeP,
     };

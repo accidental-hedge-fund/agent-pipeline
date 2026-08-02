@@ -12,7 +12,14 @@ import {
   removeLabel,
 } from "../gh.ts";
 import { attestPipelineComment } from "./review-parsing.ts";
-import { getOnDiskForIssue, hasCommitsAhead, removeWorktree } from "../worktree.ts";
+import {
+  getOnDiskForIssue,
+  hasCommitsAhead,
+  removeManagedWorktreeSafely,
+  removeWorktree,
+  type SafeRemoveDeps,
+  type SafeRemoveResult,
+} from "../worktree.ts";
 import { recordRecovery } from "../evidence-bundle.ts";
 import { emitCorrectionEvent } from "../correction.ts";
 import * as path from "node:path";
@@ -76,7 +83,20 @@ export interface AutoRecoverDeps {
   getOnDiskForIssue: typeof getOnDiskForIssue;
   hasCommitsAhead: typeof hasCommitsAhead;
   getIssueDetail: typeof getIssueDetail;
+  /**
+   * @deprecated Prefer {@link removeManagedWorktreeSafely} via
+   * `removeManagedWorktreeSafely`. Retained for tests that spy on the raw
+   * remove after safety has already been evaluated.
+   */
   removeWorktree: typeof removeWorktree;
+  /** Safety-gated remove (#759). Defaults to {@link removeManagedWorktreeSafely}. */
+  removeManagedWorktreeSafely?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    slug: string,
+    resolvedPath?: string,
+    safeDeps?: SafeRemoveDeps,
+  ) => Promise<SafeRemoveResult>;
   postComment: typeof postComment;
   removeLabel: typeof removeLabel;
   addLabel: typeof addLabel;
@@ -87,6 +107,7 @@ const defaultAutoRecoverDeps: AutoRecoverDeps = {
   hasCommitsAhead,
   getIssueDetail,
   removeWorktree,
+  removeManagedWorktreeSafely,
   postComment,
   removeLabel,
   addLabel,
@@ -119,8 +140,24 @@ export async function tryAutoRecover(
   // Dedupe by round token so a retried marker post doesn't inflate the count.
   const recoveryCount = countRecoveryAttempts(detail.comments);
 
-  // Always remove the failed worktree before retry.
-  await deps.removeWorktree(cfg, issueNumber, wt.slug);
+  // Always remove the failed worktree before retry — through the shared
+  // evaluateRemoveSafety ladder (#759 / #622). Dirty or local-only trees are
+  // retained rather than force-destroyed.
+  const safeRemove =
+    deps.removeManagedWorktreeSafely ?? removeManagedWorktreeSafely;
+  const removed = await safeRemove(cfg, issueNumber, wt.slug, wt.path, {
+    // Wire the dep remove so unit tests that spy on removeWorktree still see the call
+    // after safety passes.
+    removeWorktree: deps.removeWorktree,
+    force: false,
+  });
+  if (!removed.removed) {
+    return {
+      advanced: false,
+      status: "no-op",
+      reason: `auto-recover refused unsafe worktree remove: ${removed.reason}`,
+    };
+  }
 
   if (recoveryCount >= cfg.auto_recovery_max_retries) {
     await deps.postComment(cfg, issueNumber, buildAutoRecoveryLimitComment(cfg, recoveryCount));

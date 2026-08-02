@@ -27,6 +27,17 @@ import {
   tryRebaseAndPush,
   type RebasePushResult,
 } from "./pre-merge-conflict-rebase.ts";
+import {
+  attemptedShasForAction,
+  claimStageAttempt,
+  completeStageAttempt,
+  hydrateStageAttemptLedger,
+  persistStageAttemptLedger,
+  projectCiRecoveryFromLedger,
+  syncCiProjectionIntoLedger,
+  type StageAttemptLedger,
+  type StageAttemptLedgerDeps,
+} from "../stage-attempt-ledger.ts";
 
 /**
  * Durable on-disk shape for CI recovery markers (#679 / #771).
@@ -242,95 +253,164 @@ export function saveCiRecoveryMarkers(
 }
 
 /**
- * Merge durable file markers into a polling context.
- * Per-class SHA sets are **unioned** so in-memory session state cannot drop
- * previously consumed heads already on disk (#771 multi-SHA durability).
+ * Merge durable stage-attempt ledger state into a polling context (#759).
+ * Authority is the stage-attempt ledger (recovery-attempt family); legacy
+ * `pre-merge-ci-recovery.json` is migration input only via hydrate.
+ * Per-class SHA sets on `ctx` are a process-local cache projected from the
+ * ledger so the recovery ladder keeps its existing shape (behavior freeze).
  * Returns ok:false when existing on-disk state is corrupt/unreadable — callers
  * must fail closed before recovery side-effects (#771 r2).
  */
 export function hydrateCiRecoveryMarkers(
   ctx: PreMergePollingContext,
   runDir: string | undefined,
+  ledgerDeps?: StageAttemptLedgerDeps,
 ): SaveCiRecoveryMarkersResult {
-  const loaded = loadCiRecoveryMarkers(runDir);
-  if (!loaded.ok) return loaded;
-  const disk = loaded.markers;
+  const hydrated = hydrateStageAttemptLedger(runDir, ledgerDeps);
+  if (!hydrated.ok) return hydrated;
+  const projection = projectCiRecoveryFromLedger(hydrated.ledger);
   // Restore preArchiveSha before any capture path can overwrite it with the
   // current (post-archive) head after a process restart (#679 review 2).
-  if (!ctx.preArchiveSha && disk.preArchiveSha) {
-    ctx.preArchiveSha = disk.preArchiveSha;
+  if (!ctx.preArchiveSha && projection.preArchiveSha) {
+    ctx.preArchiveSha = projection.preArchiveSha;
   }
   ctx.ciRebaseAttemptedShas = ciRecoveryShaSetUnion(
     ctx.ciRebaseAttemptedShas,
-    disk.ciRebaseAttemptedShas,
+    projection.ciRebaseAttemptedShas,
   );
   ctx.ciRerunAttemptedShas = ciRecoveryShaSetUnion(
     ctx.ciRerunAttemptedShas,
-    disk.ciRerunAttemptedShas,
+    projection.ciRerunAttemptedShas,
   );
   ctx.ciArchiveFailRecoveryAttemptedShas = ciRecoveryShaSetUnion(
     ctx.ciArchiveFailRecoveryAttemptedShas,
-    disk.ciArchiveFailRecoveryAttemptedShas,
+    projection.ciArchiveFailRecoveryAttemptedShas,
   );
   ctx.ciAssertionFixAttemptedShas = ciRecoveryShaSetUnion(
     ctx.ciAssertionFixAttemptedShas,
-    disk.ciAssertionFixAttemptedShas,
+    projection.ciAssertionFixAttemptedShas,
   );
   ctx.ciTerminalFailRecordedShas = ciRecoveryShaSetUnion(
     ctx.ciTerminalFailRecordedShas,
-    disk.ciTerminalFailRecordedShas,
+    projection.ciTerminalFailRecordedShas,
   );
+  // no-run recovery: in-memory flag becomes a cache of ledger no_run_recovery.
+  if (
+    !ctx.noRunRecoveryAttemptedForSha &&
+    projection.noRunRecoveryAttemptedShas?.length
+  ) {
+    // Prefer the most recent charged SHA; single-shot path sets one at a time.
+    ctx.noRunRecoveryAttemptedForSha =
+      projection.noRunRecoveryAttemptedShas[projection.noRunRecoveryAttemptedShas.length - 1];
+  }
+  // When migration produced a ledger and runDir is present, persist once so
+  // subsequent resumes do not re-read legacy as sole authority.
+  if (hydrated.migratedFromLegacy && runDir) {
+    persistStageAttemptLedger(runDir, hydrated.ledger, ledgerDeps);
+  }
   return { ok: true };
 }
 
 /**
- * Persist recovery markers, unioning with any disk state first so a partial
- * in-memory context cannot erase previously consumed head budgets (#771).
- * Fails closed when existing on-disk markers are corrupt/unreadable rather than
- * rewriting from an incomplete in-memory view (#771 r2).
+ * Persist CI recovery authority through the stage-attempt ledger (#759).
+ * Session SHA-set cache is synced into ledger claims then written to
+ * `stage-attempt-ledger.json`. Production correctness does not depend on
+ * writing `pre-merge-ci-recovery.json` (legacy dual-write is intentionally
+ * omitted after ledger write succeeds).
  */
 export function persistCtxCiMarkers(
   ctx: PreMergePollingContext,
   runDir: string | undefined,
+  ledgerDeps?: StageAttemptLedgerDeps,
 ): SaveCiRecoveryMarkersResult {
-  const loaded = loadCiRecoveryMarkers(runDir);
-  if (!loaded.ok) return loaded;
-  const disk = loaded.markers;
-  const markers: CiRecoveryMarkers = {
-    preArchiveSha: ctx.preArchiveSha ?? disk.preArchiveSha,
-    ciRebaseAttemptedShas: ciRecoveryShaSetUnion(
-      ctx.ciRebaseAttemptedShas,
-      disk.ciRebaseAttemptedShas,
-    ),
-    ciRerunAttemptedShas: ciRecoveryShaSetUnion(
-      ctx.ciRerunAttemptedShas,
-      disk.ciRerunAttemptedShas,
-    ),
-    ciArchiveFailRecoveryAttemptedShas: ciRecoveryShaSetUnion(
-      ctx.ciArchiveFailRecoveryAttemptedShas,
-      disk.ciArchiveFailRecoveryAttemptedShas,
-    ),
-    ciAssertionFixAttemptedShas: ciRecoveryShaSetUnion(
-      ctx.ciAssertionFixAttemptedShas,
-      disk.ciAssertionFixAttemptedShas,
-    ),
-    ciTerminalFailRecordedShas: ciRecoveryShaSetUnion(
-      ctx.ciTerminalFailRecordedShas,
-      disk.ciTerminalFailRecordedShas,
-    ),
-  };
-  const result = saveCiRecoveryMarkers(runDir, markers);
+  const hydrated = hydrateStageAttemptLedger(runDir, ledgerDeps);
+  if (!hydrated.ok) return hydrated;
+  const nowIso = (ledgerDeps?.now ?? (() => new Date()))().toISOString();
+  const ledger = syncCiProjectionIntoLedger(
+    hydrated.ledger,
+    {
+      preArchiveSha: ctx.preArchiveSha,
+      ciRebaseAttemptedShas: ctx.ciRebaseAttemptedShas,
+      ciRerunAttemptedShas: ctx.ciRerunAttemptedShas,
+      ciArchiveFailRecoveryAttemptedShas: ctx.ciArchiveFailRecoveryAttemptedShas,
+      ciAssertionFixAttemptedShas: ctx.ciAssertionFixAttemptedShas,
+      ciTerminalFailRecordedShas: ctx.ciTerminalFailRecordedShas,
+      noRunRecoveryAttemptedForSha: ctx.noRunRecoveryAttemptedForSha,
+    },
+    nowIso,
+  );
+  const result = persistStageAttemptLedger(runDir, ledger, ledgerDeps);
   if (result.ok) {
-    // Keep in-memory sets complete after a successful durable write.
-    if (markers.preArchiveSha) ctx.preArchiveSha = markers.preArchiveSha;
-    ctx.ciRebaseAttemptedShas = markers.ciRebaseAttemptedShas;
-    ctx.ciRerunAttemptedShas = markers.ciRerunAttemptedShas;
-    ctx.ciArchiveFailRecoveryAttemptedShas = markers.ciArchiveFailRecoveryAttemptedShas;
-    ctx.ciAssertionFixAttemptedShas = markers.ciAssertionFixAttemptedShas;
-    ctx.ciTerminalFailRecordedShas = markers.ciTerminalFailRecordedShas;
+    const projection = projectCiRecoveryFromLedger(ledger);
+    if (projection.preArchiveSha) ctx.preArchiveSha = projection.preArchiveSha;
+    ctx.ciRebaseAttemptedShas = projection.ciRebaseAttemptedShas;
+    ctx.ciRerunAttemptedShas = projection.ciRerunAttemptedShas;
+    ctx.ciArchiveFailRecoveryAttemptedShas = projection.ciArchiveFailRecoveryAttemptedShas;
+    ctx.ciAssertionFixAttemptedShas = projection.ciAssertionFixAttemptedShas;
+    ctx.ciTerminalFailRecordedShas = projection.ciTerminalFailRecordedShas;
   }
   return result;
 }
+
+/**
+ * Domain reconcile surface for CI recovery (#759 / #628): derive attempt-aware
+ * actions from observed definitive-red state + ledger projection without a
+ * private marker file as sole authority.
+ */
+export function reconcileCiRecoveryState(input: {
+  headSha: string;
+  ledger: StageAttemptLedger;
+  definitiveRed: boolean;
+}): {
+  actions: Array<
+    | { kind: "ci_rebase" }
+    | { kind: "ci_rerun" }
+    | { kind: "ci_archive_fail_recovery" }
+    | { kind: "ci_assertion_fix" }
+    | { kind: "escalate" }
+  >;
+  attempted: {
+    rebase: boolean;
+    rerun: boolean;
+    archive_fail: boolean;
+    assertion_fix: boolean;
+  };
+} {
+  const attempted = {
+    rebase: attemptedShasForAction(input.ledger, "ci_rebase").includes(input.headSha),
+    rerun: attemptedShasForAction(input.ledger, "ci_rerun").includes(input.headSha),
+    archive_fail: attemptedShasForAction(input.ledger, "ci_archive_fail_recovery").includes(
+      input.headSha,
+    ),
+    assertion_fix: attemptedShasForAction(input.ledger, "ci_assertion_fix").includes(
+      input.headSha,
+    ),
+  };
+  if (!input.definitiveRed) {
+    return { actions: [], attempted };
+  }
+  const actions: Array<
+    | { kind: "ci_rebase" }
+    | { kind: "ci_rerun" }
+    | { kind: "ci_archive_fail_recovery" }
+    | { kind: "ci_assertion_fix" }
+    | { kind: "escalate" }
+  > = [];
+  if (!attempted.rebase) actions.push({ kind: "ci_rebase" });
+  if (!attempted.rerun) actions.push({ kind: "ci_rerun" });
+  if (!attempted.archive_fail) actions.push({ kind: "ci_archive_fail_recovery" });
+  if (!attempted.assertion_fix) actions.push({ kind: "ci_assertion_fix" });
+  if (actions.length === 0) actions.push({ kind: "escalate" });
+  return { actions, attempted };
+}
+
+/** @internal re-export for tests that claim CI actions through the ledger API. */
+export {
+  claimStageAttempt,
+  completeStageAttempt,
+  hydrateStageAttemptLedger,
+  persistStageAttemptLedger,
+};
 
 // ---------------------------------------------------------------------------
 // Definitive CI failure recovery ladder (#679)
@@ -371,10 +451,11 @@ interface DefinitiveCiFailureFns {
  * | 5     | assertion_fix | `ciAssertionFixAttemptedShas`           | fix ok → assertion waiting reason                           |
  * | 6     | escalate       | n/a                                     | `setBlocked` `ci-exhausted` + offramp `ci-failed`           |
  *
- * Budget is durable per head SHA via pollingCtx + runDir markers (#679).
- * Rebase budget is durable (not worktree-only) so worktree recreation cannot
- * re-open unlimited rebase thrash (#771 / dogfood #597). Sets retain all
- * previously consumed heads (H1→H2→H1 cannot re-open H1's budget).
+ * Budget is durable per head SHA via the stage-attempt ledger (#759), projected
+ * onto pollingCtx SHA sets as a process-local cache (#679). Rebase budget is
+ * durable (not worktree-only) so worktree recreation cannot re-open unlimited
+ * rebase thrash (#771 / dogfood #597). Sets retain all previously consumed
+ * heads (H1→H2→H1 cannot re-open H1's budget).
  * Does NOT reintroduce #181 infinite wait/archive spin.
  */
 export async function handleDefinitiveCiFailure(
@@ -431,7 +512,8 @@ export async function handleDefinitiveCiFailure(
       );
       // Fall through to remaining ladder / escalate (fail-closed, no thrash wait).
     } else {
-      // Worktree marker is informational for BEHIND/conflict — not CI auth.
+      // #759: worktree marker writer is a no-op; durable authority is the ledger
+      // via persistCtxCiMarkers above. Call retained for injectable test spies.
       fns.markRebaseAttemptedFn(wt.path);
 
       const beforeSha = headSha;

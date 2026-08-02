@@ -18,12 +18,29 @@ import {
   type CiRecoveryMarkers,
   type PreMergePollingContext,
 } from "../scripts/stages/pre_merge.ts";
+import {
+  hydrateStageAttemptLedger,
+  projectCiRecoveryFromLedger,
+  STAGE_ATTEMPT_LEDGER_FILE,
+} from "../scripts/stage-attempt-ledger.ts";
 
-/** Unwrap a successful load; fail the test on corrupt/missing-ok:false. */
+/**
+ * Load durable CI recovery projection from the stage-attempt ledger (#759),
+ * migrating legacy `pre-merge-ci-recovery.json` when present.
+ */
 function requireMarkers(runDir: string): CiRecoveryMarkers {
-  const loaded = loadCiRecoveryMarkers(runDir);
-  assert.equal(loaded.ok, true, loaded.ok ? "" : loaded.reason);
-  return loaded.ok ? loaded.markers : {};
+  const hydrated = hydrateStageAttemptLedger(runDir);
+  assert.equal(hydrated.ok, true, hydrated.ok ? "" : hydrated.reason);
+  if (!hydrated.ok) return {};
+  const p = projectCiRecoveryFromLedger(hydrated.ledger);
+  return {
+    preArchiveSha: p.preArchiveSha,
+    ciRebaseAttemptedShas: p.ciRebaseAttemptedShas,
+    ciRerunAttemptedShas: p.ciRerunAttemptedShas,
+    ciArchiveFailRecoveryAttemptedShas: p.ciArchiveFailRecoveryAttemptedShas,
+    ciAssertionFixAttemptedShas: p.ciAssertionFixAttemptedShas,
+    ciTerminalFailRecordedShas: p.ciTerminalFailRecordedShas,
+  };
 }
 import { extractWorkflowRunId, trimLogExcerpt } from "../scripts/gh.ts";
 import { readEvents } from "../scripts/run-store.ts";
@@ -278,7 +295,7 @@ test("durable marker after simulated restart skips second re-run", async (t) => 
     assert.equal(rec.reruns, 1);
     const disk = requireMarkers(runDir);
     assert.ok(ciRecoveryShaSetHas(disk.ciRerunAttemptedShas, SHA_HEAD));
-    const raw = await readFile(join(runDir, "pre-merge-ci-recovery.json"), "utf8");
+    const raw = await readFile(join(runDir, STAGE_ATTEMPT_LEDGER_FILE), "utf8");
     assert.match(raw, new RegExp(SHA_HEAD));
 
     // Process 2: empty in-memory ctx, same runDir → hydrates, escalates without re-run.

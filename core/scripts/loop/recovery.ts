@@ -670,9 +670,12 @@ export async function startRecoveryAttempt(
 
   const attempt: LoopRecoveryAttempt = {
     attempt_id: attemptId,
+    idempotency_key: attemptId,
     seq: ledger.recovery_attempts.length,
     time,
-    ...(outcome === "started" && backoffSeconds > 0 ? { not_before: notBefore } : {}),
+    ...(outcome === "started" && backoffSeconds > 0
+      ? { not_before: notBefore, next_attempt_at: notBefore }
+      : {}),
     item_id: input.itemId,
     class: blockerClass,
     candidate_identity: candidateIdentity,
@@ -680,8 +683,15 @@ export async function startRecoveryAttempt(
     actions: [input.action],
     evidence_fingerprint: evidenceFingerprint,
     outcome,
+    status: outcome,
     budget_remaining: budgetRemaining,
-    ...(outcome === "exhausted" ? { error: `recovery budget exhausted before action "${input.action}" could start` } : {}),
+    ...(outcome === "exhausted"
+      ? {
+          error: `recovery budget exhausted before action "${input.action}" could start`,
+          last_error: `recovery budget exhausted before action "${input.action}" could start`,
+          terminal_outcome: "failed" as const,
+        }
+      : {}),
   };
   ledger.recovery_attempts.push(attempt);
   if (outcome === "started") {
@@ -734,7 +744,10 @@ export async function completeRecoveryAttempt(
   attempt.completed_at = time;
   if (input.succeeded) {
     attempt.outcome = "recovered";
+    attempt.status = "recovered";
+    attempt.terminal_outcome = "success";
     delete attempt.error;
+    delete attempt.last_error;
     item.state = "in_progress";
     item.history.push({
       time,
@@ -746,7 +759,11 @@ export async function completeRecoveryAttempt(
     });
   } else {
     attempt.outcome = "failed";
-    attempt.error = input.error?.trim() || `recovery action "${attempt.action}" failed without error detail`;
+    attempt.status = "failed";
+    attempt.terminal_outcome = "failed";
+    const err = input.error?.trim() || `recovery action "${attempt.action}" failed without error detail`;
+    attempt.error = err;
+    attempt.last_error = err;
   }
 
   await writeLedger(deps, ledger, input.token);
