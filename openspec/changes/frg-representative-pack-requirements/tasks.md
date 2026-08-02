@@ -1,60 +1,66 @@
-## 1. Engine-class rate formula
+## 1. Engine-class rate + scoreboard integrity
 
-- [ ] 1.1 Change `computeFrgEvidence` so `engine_class_rate = engine_class_count / item_count` when `item_count ≥ 1`, else leave non-release-eligible / incomplete (never `null` for non-empty packs)
-- [ ] 1.2 Update `formatFrgPrSection` / CLI stdout so rate never prints `n/a` when `item_count ≥ 1` (numeric percent, including `0.0%`)
-- [ ] 1.3 Adjust evidence parse validation to require numeric `engine_class_rate` in `[0, 1]` whenever `item_count ≥ 1`
-- [ ] 1.4 Unit tests: clean pack → rate `0`; mixed pack uses item_count denominator; rate above threshold fails; regression that prior `null`/`n/a` path is gone
+- [x] 1.1 Change `computeFrgEvidence` so `engine_class_rate = engine_class_count / item_count` when `item_count ≥ 1` (never `null`); empty pack never release-eligible
+- [x] 1.2 Count each pack item at most once; terminal projected class only; multi-event recovery does not multi-count
+- [x] 1.3 Parse validation: finite numbers only; when `item_count ≥ 1` require rate in `[0,1]` and rate === count/item_count; counts match `per_item` tallies; `item_count === per_item.length`
+- [x] 1.4 Update `formatFrgPrSection` / CLI so rate never prints `n/a` when `item_count ≥ 1`
+- [x] 1.5 Unit tests: clean → 0; mixed item_count denom; above threshold fails; NaN/Infinity rejected; zero items not release-eligible; prior null/n/a path gone
 
-## 2. Representative pack composition validation
+## 2. Composition evidence + single release-eligibility validator
 
-- [ ] 2.1 Define composition evidence shape on FRG evidence (scenario ids and/or `composition` object): OpenSpec-bearing, fix→re-review, concurrency N≥2, recovery classes, controller one-item + multi-item
-- [ ] 2.2 Enforce composition checks inside release-eligibility (`isReleaseEligibleFrgPass` / equivalent) so clean-only packs fail even when K is met
-- [ ] 2.3 Project composition signals from ledger where possible; accept structured observation CLI for the rest
-- [ ] 2.4 Unit tests: clean-only fixture fails with named missing dimensions; full representative fixture can pass when other criteria met; false `human_authority` projection fails
+- [x] 2.1 Add `composition` (+ optional `recovery_aggregates`, `integrity`) to `FrgEvidence` with frozen dimension id list from design Decision 5
+- [x] 2.2 Extend `isReleaseEligibleFrgPass` / export `validateReleaseEligibleFrgEvidence(raw, expectedVersion)` as the single strict gate used by compute, parse, lookup, and auto-tag
+- [x] 2.3 Enforce all required composition dimensions pass; clean-only packs fail with `missing[]` naming each gap; false_human_authority_count must be 0
+- [x] 2.4 Project composition from ledger where possible; accept schema-validated observation file for the rest
+- [x] 2.5 Integrity fingerprints recomputed on validate; minimal forged `pass: true` fails
+- [x] 2.6 Unit tests: forged/incomplete pass; wrong-version; missing provenance; malformed JSON; clean-only; each missing composition dimension; false human_authority
 
-## 3. Recovery aggregates and #787 controller exercise
+## 3. Recovery aggregates + #787 controller exercise
 
-- [ ] 3.1 Extend scoreboard and/or evidence with recovery aggregates (success, exhaustion, resumes, elapsed by canonical reason code) when available from the pack run
-- [ ] 3.2 Wire terminal engine-owned exhaustion into engine-class item classification (existing taxonomy)
-- [ ] 3.3 Document and require one-item + multi-item recovery-controller entry in composition validation
-- [ ] 3.4 Unit tests for aggregate projection and false human-authority rejection (hermetic fakes)
+- [x] 3.1 Document and require controller entry via `pipeline single` (one-item) and `pipeline loop` (multi-item) composition dimensions
+- [x] 3.2 Map injected classes to `DEFAULT_RECOVERY_POLICY` retry budgets / terminal outcomes (design Decision 7)
+- [x] 3.3 Optional `recovery_aggregates.by_reason` on evidence + ledger when available from pack run
+- [x] 3.4 Terminal engine-owned exhaustion → engine-class item classification (existing taxonomy)
+- [x] 3.5 Unit tests: missing one-item or multi-item dimension fails; false human_authority fails; aggregate projection with fakes
 
 ## 4. Trend ledger
 
-- [ ] 4.1 Implement append-only write to `.agent-pipeline/frg/trend-ledger.jsonl` (or documented path) on durable evidence write
-- [ ] 4.2 Include version, run_id, loop_run_id, pass, pack_id, created_at, item/ready/engine counts, rate, thresholds, recovery aggregates
-- [ ] 4.3 Fail-soft: ledger I/O error after primary evidence write reports but does not delete evidence
-- [ ] 4.4 Unit tests with injected fs deps for append, multi-release history, and fail-soft path
+- [x] 4.1 Append-only `.agent-pipeline/frg/trend-ledger.jsonl` after successful primary evidence write
+- [x] 4.2 Idempotency key `(version, run_id)`; duplicate append no-ops
+- [x] 4.3 Fields per design Decision 6; thresholds snapshot; recovery aggregates when present
+- [x] 4.4 Fail-soft ledger I/O after primary write (report, do not delete evidence)
+- [x] 4.5 Unit tests: append, multi-release history, duplicate key, fail-soft
 
-## 5. Scenario observation CLI
+## 5. Scenario / composition observation CLI
 
-- [ ] 5.1 Add documented CLI surface on `pipeline factory-gate` (`--observations <file>` and/or repeated `--scenario` flags)
-- [ ] 5.2 Parse into `scenarioOverrides`; validate schema; wire through `runFactoryGate`
-- [ ] 5.3 Keep `frgRequiredObservationOverrides` test-only (not operator default for release pass)
-- [ ] 5.4 Unit/CLI parse tests; usage string and help text updated
+- [x] 5.1 `--observations <file>` on `pipeline factory-gate` (+ optional repeated `--scenario`); help/usage updated
+- [x] 5.2 Schema-validate observation file; reject unknown/missing required ids; map to overrides
+- [x] 5.3 Keep `frgRequiredObservationOverrides` test-only
+- [x] 5.4 Unit/CLI parse tests
 
-## 6. Auto-tag FRG guard
+## 6. Auto-tag FRG guard + committed evidence
 
-- [ ] 6.1 Add workflow step in `auto-tag-release.yml` after version match / tag-not-exists, before tag create/push: load and validate FRG evidence for the version
-- [ ] 6.2 Prefer shared Node validate entry (reuse parse/release-eligibility) over re-expressing rules in bash
-- [ ] 6.3 Fail closed (non-zero, no tag) on missing/invalid/`pass: false`; non-release path unchanged
-- [ ] 6.4 Drift-guard tests: FRG step present before tag push; removing it fails the test
+- [x] 6.1 Workflow step after version match + tag-not-exists, before tag create/push: invoke shared Node validator on `.agent-pipeline/frg/<version>/latest.json` with detected version
+- [x] 6.2 Fail closed on missing/unparsable/not release-eligible; non-release and existing-tag no-ops unchanged
+- [x] 6.3 Drift-guard tests: FRG step present **and ordered before** tag push; removing fails test; existing-tag and non-release covered
+- [x] 6.4 Runbook: evidence must be committed on release PR (`.agent-pipeline/frg/` is not gitignored)
 
-## 7. Layer A waivers and hermetic coverage
+## 7. Layer A waivers (full inventory — only two waivers)
 
-- [ ] 7.1 Refresh `release-plan-row` waiver: land hermetic/drift-guard test or retarget to open tracking issue (no closed #730 citation)
-- [ ] 7.2 Audit waiver table for any other closed-issue-only citations and refresh
-- [ ] 7.3 Add/adjust hermetic tests for new composition or recovery classes that fit fake-deps seams; explicit open-issue waivers for the rest
+- [x] 7.1 `release-plan-row` (#730 CLOSED): land hermetic/drift test (prefer auto-tag FRG honesty) or retarget open issue; remove closed-only citation
+- [x] 7.2 `pr-supersession` (#729 CLOSED): same rule — test preferred or open-issue retarget
+- [x] 7.3 Assert inventory remains only these waived scenarios; runbook table matches `FRG_LAYER_A_WAIVERS`
 
 ## 8. Runbook and fixture migration
 
-- [ ] 8.1 Update `docs/factory-reliability-gate-runbook.md`: rate formula, bootstrap K/25% note, trend ledger, composition minimums, observation CLI, recovery controller exercise, auto-tag FRG dependency on committed evidence
-- [ ] 8.2 Document retirement of #749/#750-class clean-only fixtures as non-representative
-- [ ] 8.3 Align runbook scenario inventory / waiver table with code and Layer A state
+- [x] 8.1 Update `docs/factory-reliability-gate-runbook.md`: rate formula, bootstrap K/25%, trend ledger semantics, composition minimums + dimension table, observation CLI schema, controller entry points + policy bounds, auto-tag dependency on **committed** evidence, integrity notes
+- [x] 8.2 Retire #749/#750-class clean-only fixtures as non-representative
+- [x] 8.3 Align docs/cli.md factory-gate section with new flags
 
 ## 9. Mirror, CI, and verification
 
-- [ ] 9.1 After all `core/` edits: `node scripts/build.mjs` and commit regenerated `plugin/`
-- [ ] 9.2 `npm run ci` green from repo root
-- [ ] 9.3 Confirm `openspec validate frg-representative-pack-requirements` (and `--all` when archiving later)
-- [ ] 9.4 Do **not** change numeric K or `max_engine_class_rate` defaults in this change
+- [x] 9.1 After `core/` edits: `node scripts/build.mjs` and commit regenerated `plugin/`
+- [x] 9.2 `npm run ci` green from repo root
+- [x] 9.3 `openspec validate frg-representative-pack-requirements` (and `--all` when archiving)
+- [x] 9.4 Do **not** change numeric K or `max_engine_class_rate` defaults
+- [x] 9.5 No auto-merge path; FRG still never tags as a side effect of scoring

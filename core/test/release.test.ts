@@ -41,6 +41,12 @@ import {
   type ReleaseContext,
   type CommandResult,
 } from "../scripts/stages/release.ts";
+import {
+  computeFrgEvidence,
+  frgRequiredObservationOverrides,
+  frgRequiredCompositionOverrides,
+  FRG_PACK_MANIFEST,
+} from "../scripts/factory-reliability-gate.ts";
 
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
 
@@ -48,33 +54,21 @@ const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.m
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Default FRG pass used by release tests so FRG (#723) does not block unrelated cases. */
+/** Default FRG pass used by release tests so FRG (#723/#757) does not block unrelated cases. */
 function defaultFrgPass(version = "1.6.0") {
-  return {
-    schema_version: 1,
+  return computeFrgEvidence({
     version,
     run_id: "frg-test-pass",
-    pass: true as const,
-    scenarios: [],
-    scoreboard: {
-      item_count: 2,
-      ready_clean_count: 2,
-      engine_class_count: 0,
-      product_class_count: 0,
-      human_authority_count: 0,
-      engine_class_rate: null,
-      per_item: [],
-    },
-    thresholds: {
-      min_clean_ready_to_deploy: 2,
-      capacity_stress_n: 2,
-      max_engine_class_rate: 0.25,
-    },
     loop_run_id: "loop-test",
-    pack_id: "factory-gate-v1",
-    created_at: "2026-07-30T00:00:00Z",
-    notes: [],
-  };
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+    now: () => new Date("2026-07-30T00:00:00.000Z"),
+  });
 }
 
 function makeDeps(overrides: Partial<ReleaseDeps> = {}): ReleaseDeps {

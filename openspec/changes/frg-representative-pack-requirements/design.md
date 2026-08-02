@@ -2,9 +2,10 @@
 
 FRG landed via #723 / change `release-mandatory-factory-reliability-gate` and is enforced by
 `pipeline release` (lookup of `.agent-pipeline/frg/<version>/latest.json`). Layer B scoring lives
-in `core/scripts/factory-reliability-gate.ts` (`computeFrgEvidence`, `runFactoryGate`). The first
-release that shipped the gate (v1.29.1) used two clean comment-only pack items (#749/#750). With
-zero classified blockers, `engine_class_rate` is `null` and surfaces as `n/a` — mathematically
+in `core/scripts/factory-reliability-gate.ts` (`computeFrgEvidence`, `runFactoryGate`,
+`isReleaseEligibleFrgPass`, `parseFrgEvidence`, `writeFrgEvidence`). The first release that
+shipped the gate (v1.29.1) used two clean comment-only pack items (#749/#750). With zero
+classified blockers, `engine_class_rate` is `null` and surfaces as `n/a` — mathematically
 “pass” under the current rate rule (`null` is treated as ≤ threshold) without ever exercising
 OpenSpec archive, fix→re-review, capacity cascade, CI recovery, or the #787 autonomous recovery
 controller.
@@ -24,20 +25,24 @@ Constraints:
    remains the tag owner but must consult FRG evidence first.
 5. Reuse durable loop ledger + FRG evidence schema; do not invent a second advance engine.
 6. Synthetic pack auto-close (#754) is out of scope (behavior retained as already specified).
+7. `.agent-pipeline/frg/` is **not** gitignored (unlike `runs/`, `history/`, `evals/`) — evidence
+   **can and must** be committed on the release PR so auto-tag’s fresh checkout sees it.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- Make release-eligible FRG pass require a **representative** pack composition (OpenSpec,
-  fix→re-review, N≥2 contention, recovery classes, #787 controller paths).
-- Define a **computable** engine-class rate whenever ≥1 item was processed (denominator fixed in
-  spec/runbook).
-- Append a **trend ledger** entry per Layer B evidence write for release-over-release review.
+- Make release-eligible FRG pass require a **representative** pack composition with
+  machine-readable per-dimension evidence.
+- Define a **computable** engine-class rate whenever ≥1 item was processed (denominator fixed).
+- Append a **trend ledger** entry per Layer B evidence write with explicit idempotency/fail-soft.
 - Document bootstrap derivation of K=2 / 25%.
-- Guard **auto-tag** with FRG pass validation for the version.
-- Expose scenario observations through a **documented CLI** surface.
-- Refresh Layer A waivers that cite closed issues (especially #730).
+- Guard **auto-tag** with the **same** release-eligibility validator as `factory-gate` /
+  `parseFrgEvidence`, before any tag create/push.
+- Expose scenario observations through a **documented CLI** surface with schema validation.
+- Refresh **full** Layer A waiver inventory (both current waivers cite closed issues).
+- Make forged minimal `pass: true` evidence fail semantic validation (scoreboard math,
+  composition, provenance).
 
 **Non-Goals:**
 
@@ -45,219 +50,334 @@ Constraints:
 - Synthetic pack auto-close redesign (#754).
 - Auto-merge or unattended merge.
 - Replacing product milestones with FRG work-lists.
-- Full automated injection of every recovery fault without operator/fixture support (design may
-  use labeled fixtures + observation CLI; hermetic Layer A covers classes that fit fake-deps).
+- Cryptographic signing / trusted attestation of evidence (out of scope; residual hand-crafted
+  full-schema forgery remains theoretically possible — see Decision 4 integrity bar).
+- Full automated chaos injection without operator fixtures (observation CLI + Layer A hermetic
+  coverage for classes that fit fake deps).
 
 ## Decisions
 
-### Decision 1 — Representative composition as release-eligibility criteria (not optional notes)
+### Decision 1 — Durable evidence contract (paths, latest pointer, commit bar)
 
-Release-eligible `pass: true` SHALL require a composition evidence block (on evidence JSON and/or
-named scenarios) proving at least:
+**Stable paths** (repository root; same as today):
 
-| Dimension | Minimum |
-|-----------|---------|
-| OpenSpec-bearing item | ≥1 pack item that carried a real OpenSpec change (archive/coherence path exercised) |
-| Fix → re-review cycle | ≥1 pack item that hit a blocking finding, applied a fix, and re-entered review |
-| Concurrency / capacity | Pack scored under concurrency with observed worktree contention satisfying N≥2 |
-| Recovery / composition classes | Inventory below observed or hermetically covered + live-observed where Layer B required |
-| #787 controller | Production recovery controller exercised via one-item **and** multi-item entry points |
+```text
+.agent-pipeline/frg/<X.Y.Z>/<frg-run-id>/evidence.json   # immutable primary
+.agent-pipeline/frg/<X.Y.Z>/latest.json                  # full evidence copy (lookup pointer)
+.agent-pipeline/frg/trend-ledger.jsonl                   # append-only trend (new)
+```
 
-Composition MAY be proven by a combination of: durable ledger projections (states, attempt
-counts, blocker themes), structured observation records supplied via CLI, and fixed scenario
-ids. Clean-only / comment-only packs that only satisfy K via trivial items SHALL fail
-representative-composition validation even if throughput math passes.
+**`writeFrgEvidence` semantics (extend existing atomic rename pattern):**
 
-**Rejected:** Soft “runbook recommendation” without driver enforcement (v1.29.1 already showed
-operators take the easy pack). Threshold-only tightening without composition (still green on
-trivial work).
+1. Write `evidence.json` via tmp + `rename` under `frg/<version>/<run_id>/`.
+2. Overwrite `latest.json` for that version via tmp + `rename` with the **same body** as the
+   immutable evidence (existing behavior).
+3. Append one trend-ledger line (Decision 6) after primary success; fail-soft on ledger I/O only.
 
-### Decision 2 — Engine-class rate denominator = processed pack item count
+**Commit / auto-tag availability:**
 
-When `scoreboard.item_count ≥ 1`:
+- `.agent-pipeline/frg/` is intentionally **trackable** (not listed in root `.gitignore`).
+- Layer B operators **must** include at least `.agent-pipeline/frg/<X.Y.Z>/latest.json` (and
+  preferably the sibling `…/<run_id>/evidence.json`) in the **release PR tree** so that after
+  merge, `auto-tag-release.yml`’s `actions/checkout` sees the artifact at the release commit.
+- A worktree-local-only write that is never committed **correctly fails** auto-tag (fail closed).
+- Runbook documents this as a hard operator step; `pipeline release` continues to refuse without
+  a local pass artifact and already embeds FRG in the PR body — implementation also documents
+  that the **files** must land on the release branch, not only the body section.
+
+**Schema version:** remain `FRG_SCHEMA_VERSION = 1` with **additive** fields
+(`composition`, optional `recovery_aggregates`, optional `integrity`) so existing parse can grow
+without a hard break for offline tooling; parsers that require release-eligibility SHALL reject
+missing additive fields when `pass: true`.
+
+### Decision 2 — Single strict release-eligibility validator
+
+**Single source of truth:** extend `isReleaseEligibleFrgPass` (and have `parseFrgEvidence` /
+`computeFrgEvidence` / auto-tag all call it) so release-eligibility is not “`pass: true` alone.”
+
+A versioned evidence object is release-eligible only when **all** hold:
+
+| Check | Rule |
+|-------|------|
+| `pass === true` | After re-deriving eligibility (writer and parser refuse inconsistent `pass`) |
+| Schema | `schema_version === FRG_SCHEMA_VERSION`; parseable |
+| Version binding | `evidence.version === X.Y.Z` under validation (auto-tag passes detected version) |
+| Provenance | non-empty `run_id`, non-empty `loop_run_id`, `pack_id === factory-gate-v1` |
+| Scenarios | exact `FRG_SCENARIO_IDS` set; enforceRequiredScenarioCriteria; frgScenariosPermitPass; capacity observed ≥ N |
+| Scoreboard integrity | `item_count === per_item.length ≥ 1` (empty pack never release-eligible); counts match `per_item` class tallies; `engine_class_rate` finite in `[0,1]` and equals `engine_class_count / item_count` when `item_count ≥ 1` |
+| Representative composition | every required composition dimension present and `status === "pass"` (Decision 5) |
+| Recovery controller | both `recovery-controller-one-item` and `recovery-controller-multi-item` dimensions pass |
+| False human_authority | `composition.false_human_authority_count === 0` (or equivalent) for injected recoverables |
+| Integrity block | present and consistent (Decision 4) |
+
+**Shared entry for CLI + workflow:**
+
+- Export `validateReleaseEligibleFrgEvidence(raw, expectedVersion: string): FrgEvidence` that
+  parses, re-runs eligibility, and throws/returns structured failure reasons.
+- Auto-tag step invokes a thin Node entry (e.g. `node --experimental-strip-types
+  core/scripts/factory-reliability-gate.ts --validate-tag <version>` **or** a dedicated
+  one-liner script under `scripts/` that imports the same export) **after** version match and
+  tag-not-exists, **before** “Create and push annotated tag”.
+- Drift-guard in `core/test/auto-tag-release-workflow.test.ts` asserts step presence **and**
+  ordering before tag create/push.
+
+### Decision 3 — Engine-class rate and classification (precise)
+
+When `item_count ≥ 1`:
 
 ```text
 engine_class_rate = engine_class_count / item_count
 ```
 
-where `engine_class_count` is the number of scored pack items whose projected blocker class is
-`engine-class` (same taxonomy as today), and `item_count` is the number of items on the scored
-pack work-list for that evidence run.
+- **Unit of count:** each processed pack item appears **exactly once** in `per_item` and
+  contributes **at most one** taxonomy class.
+- `engine_class_count` = number of items with `blocker_class === "engine-class"`.
+- Multiple recovery events / attempts on the **same** item do **not** multi-count; the item’s
+  terminal projected class wins (existing `itemsFromLoopLedger` projection: one row per item).
+- Typed exhaustion that projects to `workflow-engine-defect` / engine-class themes increments
+  that item once as engine-class.
+- Unclassified clean items: `blocker_class === null`, not engine-class; they **are** in the
+  denominator.
+- `human_authority` / `product-class` counts remain on the scoreboard; they are **not** the
+  rate denominator.
+- Zero engine-class → rate `0` (never `null` / `n/a` when `item_count ≥ 1`).
+- `item_count === 0` → not release-eligible; do not emit release `pass: true`.
+- Reject non-finite numeric inputs at parse (`NaN`, `Infinity`).
 
-- Zero engine-class items → rate `0` (not `null`).
-- `item_count === 0` → evidence is incomplete / non-release-eligible (existing empty pack
-  refusal paths apply); rate may remain undefined only when no items exist to score.
+**BREAKING vs current code:** today rate = engine / (engine+product+human) and `null` when
+classified === 0.
 
-**BREAKING vs current code:** today `rate = engine / (engine+product+human)` and `null` when
-classified === 0. That definition made a fully clean trivial pack look like `n/a` “pass” and
-made the rate incomparable across packs of different sizes. Item-count denominator always
-yields a number when the pack has items and aligns with “what fraction of the pack hit factory
-defects.”
+### Decision 4 — Evidence provenance / anti-bypass integrity
 
-**Rejected:** Keep classified-blocker denominator but coerce null→0 (still understates risk on
-large clean packs mixed with silent failures; composition gate is the primary fix, but rate
-semantics still need a stable denom for trends). Denominator = max(classified, 1) (distorts
-rate when product/human holds dominate).
+Goal: a hand-authored stub `{ "pass": true, "run_id": "x", … }` must **not** parse as
+release-eligible.
 
-Product-class and human-authority counts remain on the scoreboard for honesty; they no longer
-drive the rate denominator. Rate threshold comparison stays: strictly greater than
-`max_engine_class_rate` fails the gate.
+**Integrity bar (this change):**
 
-Recovery-exhaustion / terminal engine outcomes projected onto pack items continue to increment
-`engine_class_count` via existing taxonomy (`workflow-engine-defect` and FRG engine-class
-members). Aggregates by canonical reason code (success, exhaustion, resume count, elapsed) are
-additional scoreboard/ledger fields — they feed the trend ledger and may contribute to
-engine-class classification of the owning item, not a second competing rate.
+1. **Full-schema parse** already rejects incomplete scenario sets and inconsistent `pass`.
+2. **Scoreboard cross-checks** (Decision 2) reject invented rates/counts that do not match
+   `per_item`.
+3. **Composition block required** for `pass: true` (Decision 5) — clean-only stubs fail named
+   dimensions.
+4. **`integrity` object** written by `computeFrgEvidence` / `writeFrgEvidence`:
+   - `producer`: literal `"pipeline-factory-gate"`
+   - `scoreboard_fingerprint`: stable hash of canonical `per_item` + counts + rate
+   - `composition_fingerprint`: stable hash of composition dimensions
+   - Validator recomputes fingerprints; mismatch → unparsable / not release-eligible
+5. Auto-tag and `lookupFrgPass` use the same validator.
 
-### Decision 3 — Trend ledger as append-only JSONL under FRG root
+**Residual risk (accepted):** a determined operator can craft a full valid document by hand.
+Mitigation is operational (evidence produced by `pipeline factory-gate` from a real loop) plus
+semantic hardness. Cryptographic signing is out of scope.
 
-On each durable Layer B evidence write (`writeFrgEvidence` / release path), append one line to:
+**Rejected:** Trust release PR body FRG markdown alone; optional skip secret; re-running live
+FRG inside Actions.
 
-```text
-.agent-pipeline/frg/trend-ledger.jsonl
+### Decision 5 — Representative composition (machine-readable)
+
+Add additive `composition` on `FrgEvidence`:
+
+```ts
+composition: {
+  dimensions: Array<{
+    id: FrgCompositionDimensionId;
+    status: "pass" | "fail" | "not_observed";
+    source: "ledger" | "observation" | "layer_a" | "derived";
+    detail: string;
+    /** Optional numeric proof (e.g. capacity N, controller entry counts). */
+    observed?: number | null;
+  }>;
+  /** Injected recoverable classes wrongly projected human_authority. */
+  false_human_authority_count: number;
+  missing: string[]; // dimension ids failing / not_observed (empty when all pass)
+}
 ```
 
-Each line is a self-contained JSON object: at least `version`, `run_id`, `loop_run_id`, `pass`,
-`pack_id`, `created_at`, `ready_clean_count`, `item_count`, `engine_class_count`,
-`engine_class_rate`, `thresholds` snapshot, and optional recovery aggregates / composition
-flags. Append is best-effort fail-soft relative to primary evidence write only if write of
-primary evidence already succeeded and ledger I/O fails — prefer: ledger append is part of the
-write path and surfaces errors without deleting already-written immutable `evidence.json`
-(mirror pack auto-close fail-soft pattern for ledger-only faults, or fail the driver if ledger
-is required for release-eligible pass — **prefer fail-soft on ledger I/O after primary write**,
-with stderr note, so a full disk does not orphan a valid pass; operators can rebuild ledger
-from historical `evidence.json` trees).
+**Required dimension ids** (stable kebab-case; freeze in code constant):
 
-**Rejected:** Checked-in-only markdown table (not machine-updated each run). Overwriting a single
-`latest-trend.json` (loses history). GitHub Issues as ledger (noisy, not local-operator
-friendly).
+| Id | Layer B required? | Layer A | Proof |
+|----|-------------------|---------|-------|
+| `openspec-bearing-item` | yes | partial (openspec-multi-change) | ≥1 item with real OpenSpec change / archive path |
+| `fix-rereview-cycle` | yes | no (live/observation) | ≥1 blocking finding → fix → re-review |
+| `concurrency-contention` | yes | yes (capacity-blocked-retain) | observed concurrency / capacity retain ≥ N=2 |
+| `managed-worktree-dirt` | yes | yes (implement-lockfile-dirt + dirt/missing coverage) | observed or hermetic + live observation |
+| `process-restart-hydration` | yes | yes (resume-mid-flight) | process death + fresh resume |
+| `forge-http-5xx-backoff` | yes | prefer hermetic if seam exists else observation | 5xx + bounded backoff |
+| `ci-pending-red-recovery` | yes | prefer hermetic / observation | pending/red CI recovery |
+| `same-head-noop-reentry` | yes | prefer hermetic / observation | same-HEAD no-op re-entry |
+| `capacity-live-run-coexistence` | yes | capacity tests + observation | concurrent capacity + live-run |
+| `recovery-controller-one-item` | yes | partial | production controller via **`pipeline single <N>`** |
+| `recovery-controller-multi-item` | yes | partial | production controller via **`pipeline loop`** (multi-item) |
 
-Runbook documents bootstrap: K=2 and max rate 0.25 were provisional values chosen for the first
-mandatory gate (#723), not multi-release empirical optima; future tightening is a separate
-issue after ≥N releases of ledger data.
+**Observation file schema** (`--observations <path>`):
 
-### Decision 4 — Auto-tag FRG guard before tag create/push
+```json
+{
+  "schema_version": 1,
+  "scenarios": [
+    { "id": "<FrgScenarioId>", "status": "pass|fail|warn|not_observed", "detail": "...", "observed": 2, "threshold": 2 }
+  ],
+  "composition": [
+    { "id": "<FrgCompositionDimensionId>", "status": "pass|fail|not_observed", "detail": "...", "observed": null }
+  ]
+}
+```
 
-After release-merge detection and version match, before annotated tag create/push,
-`auto-tag-release.yml` SHALL:
+- Unknown scenario/composition ids → hard reject (CLI exit non-zero before scoring).
+- Missing required composition dimension after merge with ledger projections →
+  `not_observed` / fail release-eligible; `missing[]` names each.
+- Auto-scored scenarios (`clean-item-throughput`, `blocker-taxonomy`) still derived from ledger;
+  observation file cannot loosen numeric capacity / rate rules (`enforceRequiredScenarioCriteria`).
+- `frgRequiredObservationOverrides` remains **test-only**.
 
-1. Resolve FRG evidence for version `X.Y.Z` from the checked-out tree at the release merge
-   commit: prefer `.agent-pipeline/frg/<X.Y.Z>/latest.json` (same path as `pipeline release`).
-2. Validate with the same release-eligibility rules the driver/release path uses (parseable
-   schema, `pass: true`, non-empty `run_id`, non-empty `loop_run_id`, matching `pack_id`,
-   representative composition satisfied as encoded in evidence). Implementation MAY invoke a
-   small Node entry (existing parse/validate functions) rather than re-expressing rules in bash.
-3. On missing/invalid/`pass: false` → non-zero exit, **no tag**.
-4. On pass → proceed to existing notes resolution + tag push.
+Clean-only #749/#750-class packs fail composition with machine-readable missing dimensions even
+when K is met.
 
-Evidence must be **committed on the release merge** (or otherwise present in the tree at that
-commit). Operators who only keep FRG artifacts local and uncommitted will fail auto-tag — that
-is intentional (same durability bar as release PR attachment). Runbook states that release PRs
-must include the FRG evidence paths (or a documented committed pointer) so main carries them.
+### Decision 6 — Trend ledger append semantics
 
-**Rejected:** Trust release PR body text alone (forgeable, not schema-validated). Re-run live
-FRG inside Actions (too heavy, non-hermetic). Optional “skip FRG” secret (creates silent
-bypass).
+Path: `.agent-pipeline/frg/trend-ledger.jsonl`
 
-Drift-guard tests extend `auto-tag-release-workflow.test.ts` (or sibling) so removing the FRG
-check step fails CI.
+**Entry fields (minimum):** `version`, `run_id`, `loop_run_id`, `pass`, `pack_id`, `created_at`,
+`item_count`, `ready_clean_count`, `engine_class_count`, `engine_class_rate`, `thresholds`,
+optional `recovery_aggregates`, optional composition summary.
 
-### Decision 5 — Scenario observations via documented CLI flags / file
+**Idempotency key:** `(version, run_id)`. Re-append of the same key is a no-op (skip duplicate
+line) so retries do not double-count.
 
-Extend `pipeline factory-gate` with a documented observation surface, for example:
+**Atomicity:** append via write-to-temp-in-same-dir + `rename` of the full file **or**
+`O_APPEND` single-line write with exclusive open; tests inject fs deps. Concurrent writers on
+one host: last-writer for full-file rewrite must re-read and merge by key; prefer simple
+read-merge-write under the existing host-local concurrency scope (same as other `/tmp` locks —
+document single-host).
+
+**latest.json:** still the per-version evidence pointer; ledger is history, not a substitute.
+
+**Fail-soft:** if primary `evidence.json` + `latest.json` succeeded and ledger append fails:
+report on stderr / notes, do **not** delete evidence, do **not** flip `pass`. Operator can
+rebuild ledger from `frg/*/…/evidence.json` trees (runbook).
+
+### Decision 7 — Measurable recovery bounds and #787 entry points
+
+Replace vague “bounded convergence” with policy-backed limits already in-tree:
+
+| Injected class | Canonical durable class / path | Bound |
+|----------------|--------------------------------|-------|
+| forge HTTP 5xx / rate limit | `transient-rate-limit` | `DEFAULT_RECOVERY_POLICY` retry_budget **5**, backoff max 900s |
+| workflow / OpenSpec state | `workflow-state` | retry_budget **3**, max 300s |
+| pending/red CI | `implementation-ci` | retry_budget **3**, max 600s |
+| review fix cycle | `review-findings` | retry_budget **3** |
+| process death / restart | `workflow-engine-defect` / resume path | retry_budget **2**; Layer A resume-mid-flight |
+| capacity pressure | capacity schedule + worktree | N=`capacity_stress_n` (2); no false needs-human solely for capacity |
+| same-HEAD no-op | noop-advance / verify_head_goal | must not false `human_authority` |
+| true human holds | `missing-authority`, `specification-decision` | retry_budget **0**, terminal `human_authority` (legitimate) |
+
+**Controller entry points (production #787 path):**
+
+1. **One-item:** `pipeline single <N>` → durable one-item drive (`pipeline.ts` single command →
+   loop supervisor recovery).
+2. **Multi-item:** `pipeline loop --label factory-gate` (or allowed FRG milestone) → multi-item
+   supervisor + `loop/recovery.ts` (`startRecoveryAttempt` / `completeRecoveryAttempt` /
+   `recoverItem`).
+
+Release-eligible composition requires both entry dimensions pass. Recovery success, exhaustion,
+resumes, and elapsed-by-reason feed optional `recovery_aggregates` on evidence + ledger:
+
+```ts
+recovery_aggregates?: {
+  by_reason: Record<string, { success: number; exhaustion: number; resumes: number; elapsed_ms: number }>;
+}
+```
+
+False `human_authority` for injected recoverables (classes with non-zero automated recipe
+budget) fails release-eligible pass via `false_human_authority_count > 0`.
+
+### Decision 8 — Layer A waiver inventory (complete enumeration)
+
+**Current inventory in code** (`FRG_LAYER_A_WAIVERS` / `FRG_SCENARIO_OWNERSHIP`):
+
+| Scenario | Current Layer A | Tracking | Issue state (as of plan revision) | Disposition this change |
+|----------|-----------------|----------|-------------------------------------|-------------------------|
+| `capacity-blocked-retain` | test | — | — | keep test |
+| `resume-mid-flight` | test | — | — | keep test |
+| `openspec-multi-change` | test | — | — | keep test |
+| `implement-lockfile-dirt` | test | — | — | keep test |
+| `local-docs-parity` | test | — | — | keep test |
+| `clean-item-throughput` | test | — | — | keep test; rate formula updates |
+| `blocker-taxonomy` | test | — | — | keep test; rate formula updates |
+| `pr-supersession` | **waiver** | **#729** | **CLOSED** | refresh: land hermetic/drift test **or** open-issue retarget — **prefer test** if feasible in-repo; else file/open tracking and point waiver there |
+| `release-plan-row` | **waiver** | **#730** | **CLOSED** | refresh: land hermetic/drift test covering release-cut / **auto-tag FRG guard** honesty (this change’s tag path) **preferred** |
+| `empty-depends-on-stack-honesty` | test | — | — | keep test |
+
+There are **exactly two** waived scenarios; both cite closed issues. “Other closed-issue
+waivers” is **not** open-ended — the inventory is these two rows only. After refresh, waiver
+table and runbook match code; closed-only citations forbidden.
+
+### Decision 9 — Observation CLI surface
 
 ```bash
-pipeline factory-gate --for X.Y.Z --from-run <id> \
+pipeline factory-gate --for X.Y.Z --from-run <loop-run-id> \
   --observations path/to/observations.json
-# and/or repeated:
+# optional additive:
 # --scenario id=status:detail[:observed=N]
 ```
 
-Observation file schema: array of `{ id, status, detail, observed?, threshold? }` matching
-existing `FrgScenarioOverride`. CLI parses into `scenarioOverrides` (already an internal dep
-seam). Runbook documents the surface; usage without the file continues to score auto-derived
-scenarios (throughput, taxonomy) and fails `not_observed` for the rest unless ledger projection
-fills them.
+Wire into existing `FactoryGateOpts.scenarioOverrides` + new composition override path. Document
+in `docs/factory-reliability-gate-runbook.md` and `docs/cli.md`. Usage string / commander options
+in `pipeline.ts`.
 
-**Rejected:** Operators importing TS modules and calling `runFactoryGate({ scenarioOverrides })`
-as the supported path. Silent default of “all pass” helper in production CLI
-(`frgRequiredObservationOverrides` remains test-only).
+### Decision 10 — Retire #749/#750 as non-representative
 
-### Decision 6 — Recovery / composition inventory (stable scenario or composition flags)
+Runbook marks #749/#750-class clean composition items as **retired fixtures** for
+release-eligible FRG. Gate refuses clean-only packs regardless of issue open/closed state.
+Closing GitHub issues is process work during/after implementation.
 
-Expand the named inventory (superset of existing pack ids) to include release-eligible
-composition dimensions and recovery classes. Prefer **stable scenario ids** (or composition
-flag keys) so scoreboard and tests stay nameable:
+### Decision 11 — Auto-tag FRG guard placement
 
-| Id / flag | Intent |
-|-----------|--------|
-| existing pack ids | retained |
-| `openspec-bearing-item` (composition) | ≥1 real OpenSpec change item |
-| `fix-rereview-cycle` (composition) | ≥1 blocking finding → fix → re-review |
-| `concurrency-contention` (composition) | N≥2 worktree contention observed |
-| `managed-worktree-dirt` | missing/dirty managed worktree recovery |
-| `process-restart-hydration` | process death + fresh-process resume |
-| `forge-http-5xx-backoff` | forge 5xx with bounded backoff |
-| `ci-pending-red-recovery` | pending/red CI bounded recovery |
-| `same-head-noop-reentry` | same-HEAD no-op re-entry |
-| `capacity-live-run-coexistence` | concurrent capacity pressure + live-run coexistence |
-| `recovery-controller-one-item` | #787 path, single-item entry |
-| `recovery-controller-multi-item` | #787 path, multi-item entry |
+In `.github/workflows/auto-tag-release.yml`, after:
 
-Exact id spelling is implementer’s choice within kebab-case stability; specs refer to the
-**requirement** (what is exercised), not a frozen list that blocks reasonable naming.
+1. detect release subject  
+2. version match `core/package.json`  
+3. tag does not already exist  
 
-Release-eligible pass additionally requires: zero false product-judgment / `human_authority`
-projections for injected recoverable classes, and bounded convergence or typed exhaustion that
-feeds engine-class scoring for each injected class.
+and **before** “Resolve release notes” / “Create and push annotated tag” (FRG must fail closed
+before any tag side effect; notes resolution may stay before or after FRG but **tag create/push
+must not run** without FRG pass — prefer FRG check immediately after exists=false):
 
-### Decision 7 — Waiver refresh for closed #730
-
-`release-plan-row` Layer A currently waives to #730 (CLOSED). Implementation either:
-
-1. Adds a biting hermetic test (or drift-guard) for plan-row / tag-path honesty, **or**
-2. Points the waiver at a still-open tracking issue if a hermetic test is not yet feasible.
-
-Closed-issue citations in the waiver table are forbidden after this change. Prefer (1) for
-`release-plan-row` given auto-tag FRG guard lands in the same change (related honesty surface).
-
-### Decision 8 — Retire #749/#750 as non-representative
-
-Runbook marks clean composition items #749/#750 as **retired fixtures** (not valid alone for
-release-eligible FRG). Operator migration: replace with representative pack issues (OpenSpec +
-review-cycle + recovery fixtures). Closing the GitHub issues is process work during/after
-implementation; specs require the gate refuse clean-only packs regardless of issue state.
+- Step: validate `.agent-pipeline/frg/<version>/latest.json` via shared Node validator with
+  `expectedVersion` from detect output.
+- Failures: missing, unparsable, `pass: false`, not release-eligible, version mismatch →
+  exit non-zero, no tag.
+- Non-release pushes: unchanged successful no-op (no FRG required).
+- Existing-tag: unchanged no-op.
 
 ## Risks / Trade-offs
 
 | Risk | Mitigation |
 |------|------------|
-| Representative pack is slower / harder to run every release | Fixed pack still dedicated (not full milestone); composition is minimum dimensions, not “entire product backlog”; K stays 2 |
-| Evidence must be committed for auto-tag | Runbook + release path already attach FRG; add explicit “commit latest.json / evidence under repo or release tree” procedure; fail closed is correct |
-| Item-count rate is stricter on large packs with incidental engine defects | Desired; composition + rate both enforce honesty; thresholds unchanged this issue |
-| Observation CLI can be gamed with fake `pass` overrides | Numeric capacity rules already re-validate; composition dimensions should prefer ledger-derived proof where possible; overrides remain subject to `enforceRequiredScenarioCriteria` |
-| Trend ledger disk/IO failure | Fail-soft after primary evidence write; rebuild from evidence trees documented |
-| Over-specified recovery injection automation | Specs require exercise and observation, not a full chaos framework in v1 of this change |
+| Representative pack is slower every release | Fixed pack still dedicated; composition is minimum dimensions; K stays 2 |
+| Evidence must be committed for auto-tag | Not gitignored; runbook + release procedure require commit of `latest.json`; fail closed is correct |
+| Full-schema hand-forge still possible | Integrity fingerprints + composition + scoreboard math; signing out of scope |
+| Observation CLI gamed with fake passes | Numeric re-validation; prefer ledger-derived composition where possible; missing dims fail |
+| Ledger I/O failure | Fail-soft after primary write; rebuild documented |
+| Both waivers closed | Enumerated; both refreshed this change |
 
 ## Migration Plan
 
-1. Land schema/scoring/CLI/runbook/tests + auto-tag guard behind normal PR CI.
-2. Update FRG runbook: representative pack procedure, observation CLI, rate formula, trend
-   ledger path, bootstrap threshold note, retired #749/#750.
-3. Next release: operators run representative pack; commit FRG evidence with release PR so
-   auto-tag sees it on merge.
-4. Close or label-retire #749/#750 when replacement fixtures exist.
-5. Rollback: revert PR; prior FRG evidence remains readable; auto-tag loses FRG check only if
-   workflow reverted (acceptable temporary).
+1. Land schema/scoring/CLI/runbook/tests + auto-tag guard.
+2. Update FRG runbook (composition, CLI, rate, ledger, bootstrap note, retired fixtures, commit bar).
+3. Next release: representative pack → `factory-gate` → commit evidence on release PR → merge → auto-tag validates.
+4. Close/label-retire #749/#750 when replacements exist.
+5. Rollback: revert PR; auto-tag loses FRG check only if workflow reverted.
 
 ## Open Questions
 
-1. **Committed evidence layout on release PR:** require `.agent-pipeline/frg/` in the release
-   commit tree vs. upload artifact + checkout from Actions artifact store? Default design:
-   tree-committed `latest.json` (matches current release lookup). Artifact-only can be a
-   follow-on if operators object to committing under `.agent-pipeline/`.
-2. **Whether composition flags are first-class scenario ids vs. a nested `composition` object**
-   on evidence — implementer may choose either as long as validation and tests are machine-checkable.
-3. **Minimum recovery aggregate schema** (exact field names for elapsed/reason-code maps) — lock
-   in implementation with schema_version bump if needed (prefer additive fields on schema v1
-   if parse validation allows optional maps).
+_(Resolved at plan revision)_
+
+1. **Committed evidence:** tree-committed `latest.json` under `.agent-pipeline/frg/` (not
+   Actions artifact-only). Artifact-only is a follow-on if operators object.
+2. **Composition shape:** nested `composition` object (Decision 5), not only free-floating
+   scenario ids — clearer failure reasons and avoids exploding `FRG_SCENARIO_IDS` for every
+   recovery class (scenarios remain the existing pack set; composition is parallel).
+3. **Recovery aggregates:** additive optional map; absence fails only when composition claims
+   controller exercise without any recoverable signal **if** we can detect that — minimum bar is
+   composition dimension status pass via observation/ledger, aggregates preferred for ledger.

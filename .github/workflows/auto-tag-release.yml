@@ -88,6 +88,19 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # FRG guard (#757): fail closed before any tag create/push when release-eligible
+      # evidence for this version is missing, unparsable, or pass:false. Uses the same
+      # validator as pipeline factory-gate / parseFrgEvidence (shared Node entry).
+      # Evidence must be committed on the release PR under .agent-pipeline/frg/<version>/latest.json.
+      - name: Verify Factory Reliability Gate evidence
+        id: frg
+        if: steps.exists.outputs.exists == 'false'
+        run: |
+          version="${{ steps.detect.outputs.version }}"
+          node --experimental-strip-types core/scripts/factory-reliability-gate.ts \
+            --validate-tag "${version}"
+          echo "frg_ok=true" >> "$GITHUB_OUTPUT"
+
       - name: Resolve release notes
         id: notes
         if: steps.exists.outputs.exists == 'false'

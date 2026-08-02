@@ -147,7 +147,8 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   "factory-gate": {
     summary: "Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)",
-    usage: "factory-gate --for <version> [--from-run <run-id>]",
+    usage:
+      "factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail]",
     documented: true,
     section: "factory",
   },

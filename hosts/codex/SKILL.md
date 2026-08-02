@@ -80,7 +80,7 @@ $pipeline status <n>                            Read-only — print stage, block
 $pipeline unblock <n> "<answer>"                Post an answer and clear the blocked label
 $pipeline backfill [--apply] [--capability <name>] Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
 $pipeline evals plan|run|grade|report|harvest … Offline eval plan/run/grade/report/harvest (never writes to production GitHub)
-$pipeline factory-gate --for <version> [--from-run <run-id>] Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)
+$pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)
 $pipeline improve [--apply] [--top <n>] [--json] Cluster papercuts / corrections / durable-run blockers into backlog candidates
 $pipeline intake --description "<text>" [--release vX.Y.Z] [--dry-run] Spec a rough description into a GitHub issue and ROADMAP PR
 $pipeline queue [--max-issues <n>] [--concurrency <n>] [--budget-dollars <d>] Batch factory: dispatch all pipeline:ready issues up to concurrency/budget limits
