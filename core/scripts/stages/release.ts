@@ -1,26 +1,48 @@
 // Release sub-command (#170): prepares a release PR by:
 // 1. Resolving the version (alias → semver)
 // 2. Requiring a Factory Reliability Gate pass for that version (#723)
+// 2c. Failing closed on open candidate-linked engine-class soak defects (#755)
 // 3. Bumping both package.json files
 // 4. Regenerating the plugin/ mirror (node scripts/build.mjs)
 // 5. Running the CI gate (npm run ci)
 // 6. Scaffolding ROADMAP.md at four mutation sites
 // 7. Opening $EDITOR for human confirmation (skipped under --no-edit / --dry-run)
-// 8. Committing on a new branch and opening a release PR (body includes FRG run_id)
+// 8. Committing on a new branch and opening a release PR (body includes FRG run_id
+//    and, when used, open-soak-defect override evidence)
 //
 // Stops at the open PR — does not tag, merge, or publish (the post-merge
-// release.yml workflow handles those after a human merges). FRG check also
-// never merges or tags.
+// release.yml workflow handles those after a human merges). FRG and open-soak
+// preflights also never merge or tag.
 
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import {
+  classifyFrgBlocker,
   formatFrgPrSection,
   requireFrgPassForRelease,
   type FrgEvidence,
   type FrgFsDeps,
 } from "../factory-reliability-gate.ts";
+import {
+  formatOpenSoakDefectWaiverSection,
+  projectIssueTypedAttribution,
+  runOpenSoakDefectPreflight,
+  type BlockingSoakDefect,
+  type OpenSoakDefectWaiver,
+  type SoakDefectCandidateIssue,
+  type TypedSoakEvidence,
+} from "../open-soak-defect-preflight.ts";
+import {
+  defaultLoopStoreDeps,
+  readDurableRunBlockerOccurrences,
+  readEvents,
+} from "../loop/store.ts";
+import {
+  STAGE_DIAGNOSTIC_SCHEMA,
+  projectStageDiagnostic,
+  type StageDiagnostic,
+} from "../stage-diagnostic.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -35,6 +57,12 @@ export interface ReleaseOpts {
    * matching milestone title → {@link PLAN_ROW_THEME_PLACEHOLDER}.
    */
   theme?: string;
+  /**
+   * Audited override reason to proceed despite open engine-class soak defects
+   * (#755). Must be non-empty when a blocking set exists. Recorded on the
+   * release PR body. There is no silent env/config skip.
+   */
+  allowOpenSoakDefects?: string;
 }
 
 export interface ShippedPR {
@@ -134,6 +162,28 @@ export interface ReleaseDeps {
    * ensure solely on milestone fetch. Dry-run paths typically omit the call.
    */
   fetchMilestoneForVersion?(version: string): Promise<ReleaseMilestoneInfo | null>;
+  /**
+   * Open soak-defect candidate issues for release preflight (#755).
+   * Defaults to a paginated `gh api` issue list. Tests inject fakes — never
+   * rely on real network. Missing injection in tests should return `[]`.
+   */
+  listOpenSoakDefectCandidates?(): Promise<SoakDefectCandidateIssue[]>;
+  /**
+   * Closed soak-defect issues for fingerprint reconciliation (#755).
+   * Defaults to a paginated closed-issue list. Used so ledger evidence with
+   * `issueNumber: null` does not re-block after the matching GitHub issue closed.
+   */
+  listClosedSoakDefectCandidates?(): Promise<SoakDefectCandidateIssue[]>;
+  /**
+   * Typed terminal/recovery soak evidence for the candidate FRG/loop run (#755).
+   * Defaults to durable-loop blocker occurrences + stage diagnostics when
+   * `loop_run_id` is present, and GitHub #760/#763 attribution matched by
+   * FRG `run_id` and/or `loop_run_id` (FRG run alone is sufficient).
+   */
+  listTypedSoakEvidence?(args: {
+    loopRunId: string | null;
+    frgRunId: string;
+  }): Promise<TypedSoakEvidence[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +335,309 @@ export function realReleaseDeps(repoDir?: string): ReleaseDeps {
         return null;
       }
     },
+    listOpenSoakDefectCandidates: async () => listSoakDefectCandidatesReal("open", repoDir),
+    listClosedSoakDefectCandidates: async () => listSoakDefectCandidatesReal("closed", repoDir),
+    listTypedSoakEvidence: async ({ loopRunId, frgRunId }) =>
+      listTypedSoakEvidenceReal(loopRunId, frgRunId, repoDir),
   };
+}
+
+type GhIssuePageRow = {
+  number: number;
+  title: string;
+  state: string;
+  created_at: string;
+  body?: string | null;
+  labels?: Array<{ name: string }>;
+  pull_request?: unknown;
+};
+
+/**
+ * Real gh-backed issue listing for open-soak-defect preflight (#755).
+ * Projects #760 typed disposition and #763 candidate run ids from structured
+ * issue body attribution when present (body free-text alone remains
+ * non-authoritative in the pure preflight).
+ */
+function listSoakDefectCandidatesReal(
+  state: "open" | "closed",
+  repoDir?: string,
+): SoakDefectCandidateIssue[] {
+  const result = spawnSync(
+    "gh",
+    [
+      "api",
+      `repos/{owner}/{repo}/issues?state=${state}&per_page=100`,
+      "--paginate",
+      "--slurp",
+    ],
+    { encoding: "utf8", stdio: "pipe", cwd: repoDir, maxBuffer: 50 * 1024 * 1024 },
+  );
+  if (result.status !== 0) {
+    throw new Error(
+      `[pipeline release] open-soak-defect preflight: gh issue list (${state}) failed: ${result.stderr?.trim() || `exit ${result.status}`}`,
+    );
+  }
+  let pages: GhIssuePageRow[][];
+  try {
+    pages = JSON.parse(result.stdout || "[]") as GhIssuePageRow[][];
+  } catch (err) {
+    throw new Error(
+      `[pipeline release] open-soak-defect preflight: could not parse issue list: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  return pages
+    .flat()
+    .filter((i) => i && typeof i.number === "number" && !i.pull_request)
+    .map((i) => mapGhIssueToSoakCandidate(i));
+}
+
+/** Map a raw GitHub issue row into the soak-defect candidate shape. */
+export function mapGhIssueToSoakCandidate(i: {
+  number: number;
+  title?: string;
+  state?: string;
+  created_at?: string;
+  body?: string | null;
+  labels?: Array<{ name: string }>;
+}): SoakDefectCandidateIssue {
+  const body = i.body ?? "";
+  const attribution = projectIssueTypedAttribution(body);
+  return {
+    number: i.number,
+    title: i.title ?? "",
+    state: (i.state?.toLowerCase() === "closed" ? "CLOSED" : "OPEN") as "OPEN" | "CLOSED",
+    createdAt: i.created_at ?? "",
+    labels: (i.labels ?? []).map((l) => l.name),
+    body,
+    typedDisposition: attribution.typedDisposition,
+    candidateRunIds: attribution.candidateRunIds.length > 0 ? attribution.candidateRunIds : undefined,
+  };
+}
+
+/**
+ * Project durable-loop blocker occurrences, canonical stage diagnostics, and
+ * GitHub #760/#763 attribution for the candidate soak into typed preflight
+ * evidence. Terminal + engine-class → blocking candidate; non-terminal recovered
+ * intermediates are marked recovered so they do not block alone.
+ *
+ * Local ledger/diagnostic reads require `loop_run_id` to scope safely. GitHub
+ * typed attribution (#760/#763) uses FRG `run_id` as a primary soak identity and
+ * still runs when `loop_run_id` is absent (#755).
+ */
+async function listTypedSoakEvidenceReal(
+  loopRunId: string | null,
+  frgRunId: string,
+  repoDir?: string,
+): Promise<TypedSoakEvidence[]> {
+  const out: TypedSoakEvidence[] = [];
+
+  // Host-local durable ledger + stage diagnostics: only when loop_run_id is
+  // known. Without it, do not invent cross-run attribution from the whole
+  // host ledger — but still proceed to GitHub FRG-run attribution below.
+  if (loopRunId) {
+    const storeDeps = defaultLoopStoreDeps();
+    const occurrences = await readDurableRunBlockerOccurrences(storeDeps);
+    for (const occ of occurrences) {
+      if (occ.runId !== loopRunId) continue;
+      const engineClass = classifyFrgBlocker(occ.blockerClass) === "engine-class";
+      out.push({
+        issueNumber: null,
+        loopRunId: occ.runId,
+        frgRunId,
+        terminal: occ.terminal,
+        // Non-terminal occurrences in a completed run are treated as recovered
+        // intermediates unless still terminal at stop.
+        recovered: !occ.terminal,
+        engineClass,
+        blockerClass: occ.blockerClass,
+        title: `durable-run blocker ${occ.blockerClass}:${occ.fingerprint}`,
+        reasonKey: occ.blockerClass,
+        fingerprint: occ.fingerprint,
+      });
+    }
+
+    // Canonical pipeline/stage-diagnostic@1 from the durable loop events log.
+    out.push(...(await listStageDiagnosticTypedEvidence(loopRunId, frgRunId, storeDeps)));
+  }
+
+  // Cross-host / no-local-ledger path: project structured GitHub attribution
+  // (#760 disposition + #763 candidate runs + terminal stop) into typed evidence.
+  // FRG run_id alone is sufficient soak identity when loop_run_id is missing.
+  out.push(...listGithubAttributedTypedEvidence(loopRunId, frgRunId, repoDir));
+
+  return out;
+}
+
+/**
+ * Read candidate-scoped canonical stage diagnostics from the durable loop
+ * events log and project engine-class terminal diagnostics into typed evidence.
+ */
+export async function listStageDiagnosticTypedEvidence(
+  loopRunId: string,
+  frgRunId: string,
+  storeDeps = defaultLoopStoreDeps(),
+): Promise<TypedSoakEvidence[]> {
+  const out: TypedSoakEvidence[] = [];
+  let events: Array<{ kind: string; data: unknown }>;
+  try {
+    events = (await readEvents(storeDeps, loopRunId)) as Array<{ kind: string; data: unknown }>;
+  } catch {
+    return out;
+  }
+  for (const ev of events) {
+    const data = (ev.data && typeof ev.data === "object" ? ev.data : null) as Record<
+      string,
+      unknown
+    > | null;
+    if (!data) continue;
+    const diagnostic = extractStageDiagnostic(data);
+    if (!diagnostic) continue;
+    const projection = projectStageDiagnostic(diagnostic);
+    if (projection.disposition === "protocol_failure") continue;
+    const engineClass = classifyFrgBlocker(projection.blockerClass) === "engine-class";
+    // Recovery-exhaustion / terminal stop events are terminal; other diagnostic
+    // embeddings without an exhaustion signal are treated as recovered intermediates.
+    const terminal =
+      ev.kind === "loop_run_stopped" ||
+      ev.kind === "loop_recovery_exhausted" ||
+      (typeof data.outcome === "string" && /exhaust|terminal|failed/i.test(data.outcome)) ||
+      data.terminal === true;
+    const recovered = !terminal;
+    out.push({
+      issueNumber: typeof data.issue_number === "number" ? data.issue_number : null,
+      loopRunId,
+      frgRunId,
+      terminal,
+      recovered,
+      engineClass,
+      blockerClass: projection.blockerClass,
+      title: `stage-diagnostic ${diagnostic.reason_code}:${diagnostic.evidence_key}`,
+      reasonKey: diagnostic.reason_code,
+      fingerprint: diagnostic.evidence_key,
+    });
+  }
+  return out;
+}
+
+function extractStageDiagnostic(data: Record<string, unknown>): StageDiagnostic | null {
+  const direct = data.diagnostic;
+  if (
+    direct &&
+    typeof direct === "object" &&
+    !Array.isArray(direct) &&
+    (direct as StageDiagnostic).schema === STAGE_DIAGNOSTIC_SCHEMA
+  ) {
+    return direct as StageDiagnostic;
+  }
+  // Some recovery evidence embeds the diagnostic at the top level.
+  if (data.schema === STAGE_DIAGNOSTIC_SCHEMA) {
+    return data as unknown as StageDiagnostic;
+  }
+  return null;
+}
+
+/**
+ * Project open GitHub issues with structured engine-class attribution into typed
+ * soak evidence so a release host without the local loop ledger still fails
+ * closed on candidate-linked defects. Pure — injectable issues for unit tests.
+ *
+ * Authoritative terminal/recovery outcome is required: only an explicit
+ * `**Terminal stop**: yes|no` marker projects typed evidence. When that marker
+ * is absent, no typed row is emitted (including recovered/suppressing rows) so
+ * the issue stays eligible for historical label fallback (#755).
+ */
+export function projectGithubAttributedTypedEvidence(
+  issues: SoakDefectCandidateIssue[],
+  loopRunId: string | null,
+  frgRunId: string,
+): TypedSoakEvidence[] {
+  const soakIds = [loopRunId, frgRunId].filter((x): x is string => !!x && x.trim() !== "");
+  if (soakIds.length === 0) return [];
+  const out: TypedSoakEvidence[] = [];
+  for (const issue of issues) {
+    const attr = projectIssueTypedAttribution(issue.body);
+    const disposition = issue.typedDisposition ?? attr.typedDisposition;
+    if (!disposition) continue;
+    const engineClass = classifyFrgBlocker(disposition) === "engine-class";
+    if (!engineClass) continue;
+    const runIds = issue.candidateRunIds ?? attr.candidateRunIds;
+    const linked =
+      runIds.some((id) => soakIds.includes(id)) ||
+      soakIds.some((id) => `${issue.title}\n${issue.body}`.includes(id));
+    if (!linked) continue;
+    // Missing terminal outcome is not "recovered" — do not emit suppressing
+    // typed evidence that would defeat label fallback on open engine-class bugs.
+    if (attr.terminalStop == null) continue;
+    const terminal = attr.terminalStop === true;
+    out.push({
+      issueNumber: issue.number,
+      loopRunId,
+      frgRunId,
+      terminal,
+      recovered: !terminal,
+      engineClass,
+      blockerClass: disposition,
+      title: issue.title,
+      reasonKey: disposition,
+      fingerprint: attr.fingerprint ?? undefined,
+    });
+  }
+  return out;
+}
+
+/**
+ * Live GitHub-backed projection wrapper. Soft-fails on gh errors so local
+ * ledger/diagnostic hits still participate when available.
+ */
+function listGithubAttributedTypedEvidence(
+  loopRunId: string | null,
+  frgRunId: string,
+  repoDir?: string,
+): TypedSoakEvidence[] {
+  let issues: SoakDefectCandidateIssue[];
+  try {
+    issues = listSoakDefectCandidatesReal("open", repoDir);
+  } catch {
+    // Soft-fail: ledger + diagnostics still participate; missing gh must not
+    // invent empty typed coverage that would clear a real ledger hit.
+    return [];
+  }
+  return projectGithubAttributedTypedEvidence(issues, loopRunId, frgRunId);
+}
+
+/**
+ * Resolve the previous release tag's creation timestamp for the post-tag
+ * label-fallback window. Prefers annotated tagger date; falls back to
+ * creatordate (lightweight tags / commit time) when taggerdate is empty.
+ */
+export function resolvePreviousTagCreatedAt(
+  tag: string,
+  runCommand: ReleaseDeps["runCommand"],
+  cwd: string,
+): string | null {
+  // Prefer for-each-ref: taggerdate is the annotated tag object time; creatordate
+  // is the target commit time (lightweight-tag fallback).
+  const refResult = runCommand(
+    "git",
+    [
+      "for-each-ref",
+      "--format=%(taggerdate:iso-strict)%00%(creatordate:iso-strict)",
+      `refs/tags/${tag}`,
+    ],
+    { cwd },
+  );
+  if (refResult.code === 0 && refResult.stdout.trim()) {
+    const line = refResult.stdout.trim().split("\n")[0] ?? "";
+    const [tagger, creator] = line.split("\0");
+    if (tagger && tagger.trim()) return tagger.trim();
+    if (creator && creator.trim()) return creator.trim();
+  }
+  // Legacy fallback for environments that only answer git-log committer time.
+  const logResult = runCommand("git", ["log", "-1", "--format=%cI", tag], { cwd });
+  if (logResult.code === 0 && logResult.stdout.trim()) {
+    return logResult.stdout.trim();
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,6 +1422,10 @@ export function buildPRBody(
   ctx: ReleaseContext,
   lastTag: string,
   frg?: FrgEvidence | null,
+  openSoakWaiver?: {
+    waived: OpenSoakDefectWaiver;
+    blocking: BlockingSoakDefect[];
+  } | null,
 ): string {
   const { version, theme, date, shippedPRs } = ctx;
   const since = lastTag ? `\`${lastTag}\`` : "the beginning";
@@ -1079,6 +1435,10 @@ export function buildPRBody(
       : "_(no merged PRs detected — fill in manually)_";
 
   const frgSection = frg ? ["", formatFrgPrSection(frg), ""] : [];
+  const waiverSection =
+    openSoakWaiver && openSoakWaiver.waived
+      ? ["", formatOpenSoakDefectWaiverSection(openSoakWaiver.waived, openSoakWaiver.blocking), ""]
+      : [];
 
   return [
     `## Release: v${version} — ${theme}`,
@@ -1089,6 +1449,7 @@ export function buildPRBody(
     "",
     prLines,
     ...frgSection,
+    ...waiverSection,
     "---",
     "",
     "**Merging this PR is the final step.** It auto-tags the merge commit " +
@@ -1208,6 +1569,55 @@ export async function runRelease(
     d.stdout("[pipeline release] no previous tag found; git log range: HEAD");
   }
 
+  // 3b. Open soak-defect preflight (#755) — after FRG identity is known and the
+  // previous tag is resolved, before any version-file mutation. Live and dry-run.
+  // Merge-queue release-when-complete reuses this same runRelease gate (no bypass).
+  const previousTagCreatedAt = lastTag
+    ? resolvePreviousTagCreatedAt(lastTag, d.runCommand, repoDir)
+    : null;
+
+  d.stdout("[pipeline release] checking open engine-class soak defects for candidate...");
+  const listOpen =
+    d.listOpenSoakDefectCandidates ?? (async () => [] as SoakDefectCandidateIssue[]);
+  const listClosed =
+    d.listClosedSoakDefectCandidates ?? (async () => [] as SoakDefectCandidateIssue[]);
+  const listTyped =
+    d.listTypedSoakEvidence ??
+    (async () => [] as TypedSoakEvidence[]);
+  const soakPreflight = await runOpenSoakDefectPreflight(
+    {
+      version: resolvedVersion,
+      frgRunId: frgEvidence.run_id,
+      loopRunId: frgEvidence.loop_run_id,
+      previousTag: lastTag || null,
+      previousTagCreatedAt,
+      overrideReason: opts.allowOpenSoakDefects,
+    },
+    {
+      listOpenIssues: listOpen,
+      listClosedIssues: listClosed,
+      listTypedSoakEvidence: () =>
+        listTyped({
+          loopRunId: frgEvidence.loop_run_id,
+          frgRunId: frgEvidence.run_id,
+        }),
+    },
+  );
+  if (!soakPreflight.ok) {
+    throw new Error(soakPreflight.message);
+  }
+  const openSoakWaiver =
+    soakPreflight.waived != null
+      ? { waived: soakPreflight.waived, blocking: soakPreflight.blocking }
+      : null;
+  if (openSoakWaiver) {
+    d.stdout(
+      `[pipeline release] open-soak-defect override accepted for ${openSoakWaiver.waived.issueNumbers.map((n) => `#${n}`).join(", ") || "(defects)"} — reason recorded on PR body`,
+    );
+  } else {
+    d.stdout("[pipeline release] open-soak-defect preflight: no blocking open engine-class defects");
+  }
+
   // 4. Read ROADMAP and resolve theme / plan-row issue sources.
   //    Dry-run stays local-only (no milestone fetch). Live path may soft-fetch a
   //    matching milestone for theme/issues when scaffolding a missing plan row (#730).
@@ -1238,7 +1648,8 @@ export async function runRelease(
     milestoneTitle,
   });
 
-  // --- Dry-run path: local-only, no file writes, no GitHub API calls ---
+  // --- Dry-run path: no file writes. Open-soak preflight already ran (may use
+  // injected gh/list deps). Shipped-PR title/closing-issue discovery stays local. ---
   if (opts.dryRun) {
     // Discover PR numbers from git log only (localOnly=true skips fetchPRTitle → gh).
     const shippedPRs = await discoverShippedPRs(lastTag, repoDir, d, /* localOnly= */ true);
@@ -1262,7 +1673,7 @@ export async function runRelease(
     const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx);
     const roadmapDiff = computeUnifiedDiff(roadmapText, patchedRoadmap, "a/ROADMAP.md", "b/ROADMAP.md");
 
-    const prBody = buildPRBody(ctx, lastTag, frgEvidence);
+    const prBody = buildPRBody(ctx, lastTag, frgEvidence, openSoakWaiver);
 
     d.stdout(`\n=== Resolved version: ${resolvedVersion} ===\n`);
     d.stdout(`=== package.json diff ===`);
@@ -1414,7 +1825,7 @@ export async function runRelease(
       shippedPRs, shippedIssueNumbers, planIssueNumbers,
     };
     const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx, (msg) => d.stderr(msg));
-    prBody = buildPRBody(ctx, lastTag, frgEvidence);
+    prBody = buildPRBody(ctx, lastTag, frgEvidence, openSoakWaiver);
 
     // 12. Write scaffolded ROADMAP to disk.
     d.stdout("[pipeline release] writing scaffolded ROADMAP.md...");

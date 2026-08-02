@@ -35,6 +35,7 @@ import {
 import { redactSecrets, sanitize } from "../artifact-sanitize.ts";
 import { withLock } from "../lock.ts";
 import { defaultLoopStoreDeps, readDurableRunBlockerOccurrences, type DurableBlockerOccurrence } from "../loop/store.ts";
+import { autoFileLabelsForCluster } from "../open-soak-defect-preflight.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -514,8 +515,9 @@ function buildCorrectionAutoFileBody(c: ClusterEntry, windowHours: number): stri
 /** Durable-run-blocker analogue of `buildAutoFileBody`/`buildCorrectionAutoFileBody`
  *  (#538): agent/pipeline-reported-provenance banner, sanitized ledger reproduction
  *  context (run ids, item ids, blocker class, evidence fingerprint, evidence excerpt),
- *  and the suggested-milestone note. The filed issue carries only `pipeline:backlog` —
- *  no milestone is ever assigned; the suggestion is advisory prose only. */
+ *  and the suggested-milestone note. Labels: `pipeline:backlog` always; engine-class
+ *  filings also get `bug` + `pipeline:engine-class` (#755). No milestone is ever
+ *  assigned; the suggestion is advisory prose only. */
 function buildDurableRunBlockerAutoFileBody(c: ClusterEntry, windowHours: number): string {
   const ev = c.durableRunBlocker;
   const detail = [
@@ -707,9 +709,13 @@ async function autoFileClusterCategory(
 
         try {
           const body = category.buildBody(c, opts.windowHours);
-          const url = await deps.createIssue(title, body, ["pipeline:backlog"]);
+          // Engine-class clusters get bug + pipeline:engine-class index markers
+          // in addition to pipeline:backlog (#755). Non-engine stay backlog-only.
+          // Never stage labels, assignees, or milestones — do not auto-advance.
+          const labels = autoFileLabelsForCluster(c);
+          const url = await deps.createIssue(title, body, labels);
           deps.log(`[pipeline] ${category.logPrefix}: created ${url}`);
-          byTitle.set(title, { title, url, state: "OPEN", createdAt: "", labels: ["pipeline:backlog"], body });
+          byTitle.set(title, { title, url, state: "OPEN", createdAt: "", labels: [...labels], body });
           await reconcilePostCreateState(title, deps, cutoffMs, opts.maxPerWindow, category.marker, category.logPrefix);
         } catch (err) {
           deps.log(`[pipeline] ${category.logPrefix}: create failed (non-fatal): ${(err as Error).message}`);

@@ -514,6 +514,24 @@ test("autoFilePapercuts: qualifying in-window cluster is filed with the pipeline
   assert.ok(deps._createCalls[0].title.includes("papercut"));
 });
 
+test("autoFilePapercuts: engine-class papercut signal gets bug + pipeline:engine-class (#755)", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const deps = makeAutoFileDeps({
+    runs: {
+      "r1": [papercutLine(at, "workflow-engine-defect crash mid dispatch")],
+      "r2": [papercutLine(at, "workflow-engine-defect crash mid dispatch")],
+      "r3": [papercutLine(at, "workflow-engine-defect crash mid dispatch")],
+    },
+  });
+  await autoFilePapercuts(defaultAutoFileOpts(), deps);
+  assert.equal(deps._createCalls.length, 1);
+  assert.deepEqual(deps._createCalls[0].labels, [
+    "pipeline:backlog",
+    "bug",
+    "pipeline:engine-class",
+  ]);
+});
+
 test("autoFilePapercuts: below-threshold cluster is not filed", async () => {
   const at = new Date(NOW_MS - 3600_000).toISOString();
   const deps = makeAutoFileDeps({
@@ -1260,8 +1278,24 @@ test("autoFileDurableRunBlockers: a terminal-stop cluster files from a single ru
   });
   await autoFileDurableRunBlockers(defaultAutoFileOpts(), deps);
   assert.equal(deps._createCalls.length, 1);
-  assert.deepEqual(deps._createCalls[0].labels, ["pipeline:backlog"]);
+  // Engine-class (#755): backlog + bug + pipeline:engine-class index markers.
+  assert.deepEqual(deps._createCalls[0].labels, [
+    "pipeline:backlog",
+    "bug",
+    "pipeline:engine-class",
+  ]);
   assert.match(deps._createCalls[0].title, /Durable-run blocker: workflow-engine-defect:fp-1/);
+});
+
+test("autoFileDurableRunBlockers: non-engine-class filings stay backlog-only (#755)", async () => {
+  const deps = makeAutoFileDeps({
+    durableBlockerOccurrences: [
+      durableOccurrence({ terminal: true, blockerClass: "environment-auth", fingerprint: "fp-auth" }),
+    ],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts(), deps);
+  assert.equal(deps._createCalls.length, 1);
+  assert.deepEqual(deps._createCalls[0].labels, ["pipeline:backlog"]);
 });
 
 test("autoFileDurableRunBlockers: a terminal stop still files when its blocked-history entry predates the auto-file window (#538 review 2 finding c5457eee500bcb8d)", async () => {

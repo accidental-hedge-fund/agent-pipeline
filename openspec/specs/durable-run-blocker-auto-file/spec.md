@@ -87,19 +87,29 @@ introduced. Auto-filing SHALL require no human invocation of `pipeline improve
 
 ### Requirement: Auto-filed durable-run-blocker issues SHALL be sanitized, backlog-only, and carry ledger reproduction context
 
-Every auto-filed durable-run-blocker issue SHALL carry only the `pipeline:backlog`
-label, no assignee, no milestone, and no pipeline stage label; the engine SHALL
-NOT enqueue it or advance it. Its body SHALL contain the cluster's reproduction
-context — the affected run ids, item ids, blocker class, evidence fingerprint, and
-an evidence excerpt drawn from the ledger — passed through the store's existing
-secret redaction and injection screening before creation, and SHALL explicitly
-state that its content is agent/pipeline-reported, automatically filed by the
-pipeline, and not human-authored or human-verified.
+Every auto-filed durable-run-blocker issue SHALL carry the `pipeline:backlog` label, no assignee,
+no milestone, and no pipeline stage label; the engine SHALL NOT enqueue it or advance it.
+Non-engine-class filings SHALL carry no labels other than `pipeline:backlog`. Engine-class filings
+(blocker class `workflow-engine-defect` or other FRG engine-class taxonomy members as recorded on
+the cluster) SHALL additionally carry the `bug` label and the stable `pipeline:engine-class` marker
+label as operator/release indexes only. Its body SHALL contain the cluster's reproduction context —
+the affected run ids, item ids, blocker class, evidence fingerprint, and an evidence excerpt drawn
+from the ledger — passed through the store's existing secret redaction and injection screening
+before creation, and SHALL explicitly state that its content is agent/pipeline-reported,
+automatically filed by the pipeline, and not human-authored or human-verified.
 
-#### Scenario: Auto-filed issue is backlog-only
+#### Scenario: Auto-filed non-engine-class issue is backlog-only
 
-- **WHEN** an issue is auto-filed from a durable-run-blocker cluster
+- **WHEN** an issue is auto-filed from a durable-run-blocker cluster whose class is not engine-class
 - **THEN** it SHALL carry only the `pipeline:backlog` label and SHALL NOT be queued or advanced
+- **AND** it SHALL carry no milestone and no assignee
+
+#### Scenario: Auto-filed engine-class issue carries bug and engine-class marker
+
+- **WHEN** an issue is auto-filed from a durable-run-blocker cluster with class
+  `workflow-engine-defect` (or another engine-class member)
+- **THEN** it SHALL carry `pipeline:backlog`, `bug`, and `pipeline:engine-class`
+- **AND** it SHALL NOT be queued or advanced
 - **AND** it SHALL carry no milestone and no assignee
 
 #### Scenario: Reproduction context is present and sanitized

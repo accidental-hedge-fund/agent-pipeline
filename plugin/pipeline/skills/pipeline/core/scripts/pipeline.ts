@@ -297,6 +297,11 @@ export interface CliOpts {
   release?: string;
   /** release: theme for a scaffolded release-plan row when missing (#730). */
   theme?: string;
+  /**
+   * release: audited open-soak-defect override reason (#755). Commander maps
+   * `--allow-open-soak-defects <reason>` → `allowOpenSoakDefects`.
+   */
+  allowOpenSoakDefects?: string;
   /** Roadmap/sweep: gate GitHub write-backs (comments, PRs); default is dry-run. */
   apply?: boolean;
   /** Roadmap: emit top-N dependency-safe issues from an existing plan.json. */
@@ -517,6 +522,10 @@ export function buildCmd(): Command {
     .option(
       "--theme <text>",
       "release: theme for a scaffolded release-plan row when missing (overrides milestone title; default: plan-row theme, milestone title, or <theme>)",
+    )
+    .option(
+      "--allow-open-soak-defects <reason>",
+      "release: audited override to prepare a release PR despite open candidate-linked engine-class soak defects; reason is required and recorded on the PR body (#755). Silent skip is not available.",
     )
     .option("--description <text>", "intake: short free-text description to spec into a GitHub issue")
     .option("--title <text>", "refine-spec: existing issue title to refine")
@@ -2443,6 +2452,7 @@ async function main(): Promise<void> {
       console.error(
         "pipeline release: a version argument is required.\n" +
           "  Usage: pipeline release <X.Y.Z | major | minor | patch> [--theme \"...\"] [--dry-run] [--no-edit]\n" +
+          "         [--allow-open-soak-defects \"<reason>\"]\n" +
           "  Example: pipeline release 1.6.0  OR  pipeline release minor\n" +
           "  Unshipped release-plan row shape (auto-scaffolded when missing if `| *(none)* |` is present):\n" +
           "    | **vX.Y.Z** | major|minor|patch | <theme> | #N, #M | <why> |\n" +
@@ -2582,6 +2592,10 @@ async function main(): Promise<void> {
           dryRun: opts.dryRun,
           noEdit: opts.edit === false,
           theme: typeof opts.theme === "string" ? opts.theme : undefined,
+          allowOpenSoakDefects:
+            typeof opts.allowOpenSoakDefects === "string"
+              ? opts.allowOpenSoakDefects
+              : undefined,
         },
         localCfg,
       );
