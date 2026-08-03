@@ -246,6 +246,37 @@ export const CORRECTION_AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:correction-
  *  reconciliation never conflates the three auto-file sources. */
 export const DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:durable-run-blocker-auto-filed -->";
 
+/**
+ * Shared rate-cap membership predicate (#631): an improve issue counts toward a
+ * category's per-window budget only when it is open, carries `pipeline:backlog`,
+ * includes **that** category's provenance marker, and was created inside the
+ * trailing window. Pre-create deferral and post-create overflow selection MUST
+ * use this same rule so they cannot diverge (no unlabeled backlog count, no
+ * closed-slot inflation, no cross-category bleed).
+ *
+ * Exported for unit tests that assert predicate identity across call sites.
+ */
+export function countsTowardCategoryRateCap(
+  issue: OpenImproveIssue,
+  marker: string,
+  cutoffMs: number,
+): boolean {
+  if (issue.state !== "OPEN") return false;
+  if (!issue.labels.includes("pipeline:backlog")) return false;
+  if (!(issue.body ?? "").includes(marker)) return false;
+  const createdMs = Date.parse(issue.createdAt);
+  return Number.isFinite(createdMs) && createdMs >= cutoffMs;
+}
+
+/** Count of listed issues that currently consume a category's rate-cap slots. */
+function filedInWindowCount(
+  issues: OpenImproveIssue[],
+  marker: string,
+  cutoffMs: number,
+): number {
+  return issues.filter((i) => countsTowardCategoryRateCap(i, marker, cutoffMs)).length;
+}
+
 /** Post-create read-back reconciliation (#459, hardened for review finding
  *  f09ce15de2e6911a): re-list improve issues once and correct two distinct
  *  cross-host races against that single snapshot.
@@ -258,14 +289,15 @@ export const DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:du
  *     cap check (which only reads GitHub *before* either create lands) and
  *     then file *different* titles, overshooting `maxPerWindow` in a way the
  *     duplicate-title check above cannot see (different titles never look
- *     like dupes of each other). Recompute the in-window open auto-filed set
- *     from the same snapshot and close every issue past the lowest-numbered
+ *     like dupes of each other). Recompute the in-window open **category-
+ *     marked** set via `countsTowardCategoryRateCap` (same predicate as
+ *     pre-create, #631) and close every issue past the lowest-numbered
  *     `maxPerWindow` survivors.
  *
- *  Both candidate sets are additionally restricted to issues whose body carries
- *  `AUTO_FILE_PROVENANCE_MARKER` (#459 review 2, finding 582c19e6) — a human-managed or
- *  `pipeline improve --apply`-created `pipeline:backlog`/`[pipeline-improve]`-titled issue
- *  never carries this marker and so is never a reconciliation candidate.
+ *  Both candidate sets are restricted to issues whose body carries **this
+ *  category's** provenance marker (#459 review 2, finding 582c19e6; #631) — a
+ *  human-managed, `pipeline improve --apply`, or other-category auto-filed
+ *  issue never carries this marker and so is never a reconciliation candidate.
  *
  *  Both rules pick survivors by ascending issue number, so two hosts
  *  reconciling independently — potentially against different snapshots taken
@@ -321,15 +353,16 @@ async function reconcilePostCreateState(
     }
   }
 
+  // Same membership as pre-create `filedInWindowCount` (#631) — only this
+  // category's open, marked, in-window backlog issues. Issues already closed
+  // above as title-dupes are excluded so a just-closed dupe cannot also be
+  // selected as a rate-cap overflow (or inflate the survivor set).
   const inWindow = issues
-    .filter((i) => i.state === "OPEN" && i.labels.includes("pipeline:backlog") && isAutoFiled(i))
-    .map((i) => ({ number: issueNumberFromUrl(i.url), createdMs: Date.parse(i.createdAt) }))
+    .filter((i) => countsTowardCategoryRateCap(i, marker, cutoffMs))
+    .map((i) => ({ number: issueNumberFromUrl(i.url) }))
     .filter(
-      (x): x is { number: number; createdMs: number } =>
-        x.number !== null &&
-        !closedNumbers.has(x.number) &&
-        Number.isFinite(x.createdMs) &&
-        x.createdMs >= cutoffMs,
+      (x): x is { number: number } =>
+        x.number !== null && !closedNumbers.has(x.number),
     )
     .sort((a, b) => a.number - b.number);
   for (const over of inWindow.slice(maxPerWindow)) {
@@ -366,8 +399,9 @@ export interface AutoFileOpts {
 
 export interface AutoFileDeps {
   /** Same lookup used by `improve --apply` (#421 D3) — one call per invocation,
-   *  returning both open and closed `[pipeline-improve]` issues. Dedup filters
-   *  to `state === "OPEN"`; the rate-window cap counts both states (#421 finding 3). */
+   *  returning both open and closed `[pipeline-improve]` issues. Dedup and the
+   *  per-category rate-window cap (#631) each filter to `state === "OPEN"` (the
+   *  cap also requires the category provenance marker + backlog label + window). */
   listOpenImproveIssues: () => Promise<OpenImproveIssue[]>;
   /** Create a GitHub issue with the given labels and return its URL. */
   createIssue: (title: string, body: string, labels: string[]) => Promise<string>;
@@ -464,10 +498,10 @@ function buildAutoFileBody(c: ClusterEntry, windowHours: number): string {
 /** Correction-cluster analogue of `buildAutoFileBody` (#500): agent/pipeline-reported-
  *  provenance banner, sanitized evidence bundle, and the control-level proposal —
  *  reusing `renderControlProposal` so the auto-filed body agrees with the report and
- *  `--apply` issue body. Also states the single-host concurrency framing required by
- *  #459: the dedup/rate-cap and post-create reconciliation below are inherited from the
- *  papercut auto-file path's cross-host mechanism, but no cross-host global-dedup
- *  guarantee is newly asserted for the correction source. */
+ *  `--apply` issue body. States the shared cross-host auto-file posture (#459 / #631):
+ *  GitHub-authored state + post-create reconciliation, identical to papercut and
+ *  durable-run-blocker auto-file — no stronger global-serialization claim than that
+ *  shared path provides. */
 function buildCorrectionAutoFileBody(c: ClusterEntry, windowHours: number): string {
   const ev = c.correction;
   const detail = [
@@ -503,10 +537,11 @@ function buildCorrectionAutoFileBody(c: ClusterEntry, windowHours: number): stri
       `records (#499/#500). The content below is agent/pipeline-reported, not human-authored ` +
       `or human-verified — verify independently before acting._`,
     ``,
-    `_Concurrency scope (#459): correction auto-filing is supported single-host. The dedup, ` +
-      `rate-cap, and post-create reconciliation checks below reuse the papercut auto-file ` +
-      `path's cross-host mechanism, but that is described only as inherited behaviour — no new ` +
-      `cross-host global-deduplication guarantee is asserted for the correction source._`,
+    `_Concurrency scope (#459/#631): correction auto-filing inherits the shared cross-host ` +
+      `auto-file path (GitHub-authored issue state for pre-create dedup/rate-cap, plus ` +
+      `post-create reconciliation for duplicate titles and correction-scoped rate-cap ` +
+      `overflow). Host-local \`/tmp\` locks remain a same-host fast path only — no stronger ` +
+      `global-serialization guarantee than that shared path provides._`,
     ``,
     sanitize(redactSecrets(detail)),
   ].join("\n");
@@ -664,13 +699,6 @@ async function autoFileClusterCategory(
       }
       if (toFile.length === 0) return;
 
-      const filedInWindowCount = (issues: OpenImproveIssue[]): number =>
-        issues.filter((i) => {
-          if (!i.labels.includes("pipeline:backlog")) return false;
-          const createdMs = Date.parse(i.createdAt);
-          return Number.isFinite(createdMs) && createdMs >= cutoffMs;
-        }).length;
-
       for (const c of toFile) {
         const title = proposedTitle(c);
         // Re-check byTitle (#421 finding 4): two qualifying clusters whose signals
@@ -686,7 +714,7 @@ async function autoFileClusterCategory(
         // duplicate title or a cap-filling issue filed by another host (or by
         // this host's own prior iteration, once created) is counted before we
         // file — rather than trusting the single up-front `openIssues` snapshot
-        // for the whole loop.
+        // for the whole loop. Cap membership is category-scoped (#631).
         let freshIssues: OpenImproveIssue[];
         try {
           freshIssues = await deps.listOpenImproveIssues();
@@ -702,7 +730,7 @@ async function autoFileClusterCategory(
           deps.log(`[pipeline] ${category.logPrefix}: already tracked (cross-host) — ${title}`);
           continue;
         }
-        if (filedInWindowCount(freshIssues) >= opts.maxPerWindow) {
+        if (filedInWindowCount(freshIssues, category.marker, cutoffMs) >= opts.maxPerWindow) {
           deps.log(`[pipeline] ${category.logPrefix}: deferred (rate cap) — ${title}`);
           continue;
         }
@@ -792,26 +820,28 @@ export async function autoFilePapercuts(opts: AutoFileOpts, deps: AutoFileDeps):
 }
 
 /** Opt-in correction auto-file (#500): reuses the exact same minimum-occurrence,
- *  open-issue dedup, per-window rate cap, sanitization, provenance, and
- *  cross-host reconciliation machinery as `autoFilePapercuts` (#421), keyed on
- *  `correction` clusters instead of `papercut` clusters. Off/inert unless the
- *  caller gates it on `config.corrections.auto_file` — see `pipeline-run.ts`
- *  and `stages/queue.ts`. Honors the single-host concurrency scope of #459 —
- *  see `buildCorrectionAutoFileBody` for the documented framing. */
+ *  open-issue dedup, **independent** per-category rate cap (#631), sanitization,
+ *  provenance, and cross-host reconciliation machinery as `autoFilePapercuts`
+ *  (#421/#459), keyed on `correction` clusters. Off/inert unless the caller
+ *  gates it on `config.corrections.auto_file` — see `pipeline-run.ts` and
+ *  `stages/queue.ts`. Inherits the shared cross-host auto-file posture
+ *  (GitHub-authored state + post-create reconcile); host-local `/tmp` locks
+ *  remain a same-host fast path only. */
 export async function autoFileCorrections(opts: AutoFileOpts, deps: AutoFileDeps): Promise<void> {
   return autoFileClusterCategory(opts, deps, CORRECTION_AUTO_FILE_CATEGORY);
 }
 
 /** Opt-in durable-run-blocker auto-file (#538, capability
  *  `durable-run-blocker-auto-file`): reuses `autoFileClusterCategory`'s dedup,
- *  rate-cap, sanitization, provenance, and cross-host reconciliation machinery
- *  unchanged, keyed on `durable-run-blocker` clusters built from the
- *  durable-loop store's ledgers instead of `.agent-pipeline/runs/` events.
- *  Qualification is the OR-based rule from `qualifiesDurableRunBlocker`
- *  (terminal stop OR recurs across >= minOccurrences distinct runs), not the
- *  plain count threshold `autoFilePapercuts`/`autoFileCorrections` use.
- *  Off/inert unless the caller gates it on `config.durable_runs.auto_file` —
- *  see `pipeline.ts`. */
+ *  **independent** per-category rate cap (#631), sanitization, provenance, and
+ *  cross-host reconciliation machinery, keyed on `durable-run-blocker`
+ *  clusters built from the durable-loop store's ledgers instead of
+ *  `.agent-pipeline/runs/` events. Qualification is the OR-based rule from
+ *  `qualifiesDurableRunBlocker` (terminal stop OR recurs across >=
+ *  minOccurrences distinct runs), not the plain count threshold
+ *  `autoFilePapercuts`/`autoFileCorrections` use. Off/inert unless the caller
+ *  gates it on `config.durable_runs.auto_file` — see `pipeline.ts`. Inherits
+ *  the same cross-host auto-file posture as papercut and correction. */
 export async function autoFileDurableRunBlockers(opts: AutoFileOpts, deps: AutoFileDeps): Promise<void> {
   return autoFileClusterCategory(opts, deps, DURABLE_RUN_BLOCKER_AUTO_FILE_CATEGORY);
 }

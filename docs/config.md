@@ -148,12 +148,12 @@ Nested fields:
 #### `corrections.auto_file`
 
 - **Type:** boolean
-- **Description:** When true, automatically file pipeline:backlog issues for recurring correction clusters at run_complete and queue-batch end. Single-host concurrency scope (#459) — see docs.
+- **Description:** When true, automatically file pipeline:backlog issues for recurring correction clusters at run_complete and queue-batch end. Inherits the shared cross-host auto-file path (GitHub-authored state + post-create reconcile; #459/#631).
 
 #### `corrections.auto_file_max_per_window`
 
 - **Type:** integer
-- **Description:** Maximum number of issues auto-filed within the trailing window.
+- **Description:** Independent per-category max: open correction-auto-filed issues (correction provenance marker only) within the trailing window. Papercuts and durable-run-blockers do not consume this budget (#631).
 
 #### `corrections.auto_file_min_occurrences`
 
@@ -249,12 +249,12 @@ Nested fields:
 #### `durable_runs.auto_file`
 
 - **Type:** boolean
-- **Description:** When true, automatically file pipeline:backlog issues for terminal or recurring durable-run-blocker clusters at durable-run terminal stop/completion.
+- **Description:** When true, automatically file pipeline:backlog issues for terminal or recurring durable-run-blocker clusters at durable-run terminal stop/completion. Inherits the shared cross-host auto-file path (GitHub-authored state + post-create reconcile; #459/#631).
 
 #### `durable_runs.auto_file_max_per_window`
 
 - **Type:** integer
-- **Description:** Maximum number of issues auto-filed within the trailing window.
+- **Description:** Independent per-category max: open durable-run-blocker-auto-filed issues (durable provenance marker only) within the trailing window. Papercuts and corrections do not consume this budget (#631).
 
 #### `durable_runs.auto_file_min_occurrences`
 
@@ -542,12 +542,12 @@ Nested fields:
 #### `papercuts.auto_file`
 
 - **Type:** boolean
-- **Description:** When true, automatically file pipeline:backlog issues for recurring papercut clusters at run_complete and queue-batch end.
+- **Description:** When true, automatically file pipeline:backlog issues for recurring papercut clusters at run_complete and queue-batch end. Cross-host-safe via GitHub-authored state + post-create reconcile (#459/#631).
 
 #### `papercuts.auto_file_max_per_window`
 
 - **Type:** integer
-- **Description:** Maximum number of issues auto-filed within the trailing window.
+- **Description:** Independent per-category max: open papercut-auto-filed issues (papercut provenance marker only) within the trailing window. Corrections and durable-run-blockers do not consume this budget (#631).
 
 #### `papercuts.auto_file_min_occurrences`
 

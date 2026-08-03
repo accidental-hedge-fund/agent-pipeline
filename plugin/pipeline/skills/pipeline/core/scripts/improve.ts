@@ -140,7 +140,8 @@ export interface ImproveDeps {
   ghAuthCheck: () => Promise<boolean>;
   /** List issues (open and closed) whose title carries the `[pipeline-improve]`
    *  prefix. Callers that need dedup filter to `state === "OPEN"` themselves;
-   *  callers that need a rate-window count (#421 finding 3) use both states.
+   *  the auto-file per-category rate-window cap (#631) also filters to OPEN plus
+   *  the category provenance marker (closed issues do not consume budget).
    *  Called once per invocation regardless of cluster count. */
   listOpenImproveIssues: () => Promise<OpenImproveIssue[]>;
   /** Read-only projection over the durable-loop store's ledgers (#538,
@@ -254,9 +255,9 @@ export function realImproveDeps(repoDir: string): ImproveDeps {
       return r.status === 0;
     },
     listOpenImproveIssues: async () => {
-      // state=all (not "open"): the auto-file rate-window cap (#421 finding 3)
-      // must count closed auto-filed issues too, so callers that need only open
-      // issues (dedup) filter on `state === "OPEN"` themselves.
+      // state=all (not "open"): list returns both states so callers can filter.
+      // Dedup and the per-category rate-window cap (#631) each keep only OPEN
+      // (cap also requires category provenance marker + backlog + in-window).
       const r = spawnSync("gh", listOpenImproveIssuesArgs(), { encoding: "utf8", cwd: repoDir });
       if (r.status !== 0) {
         throw new Error(`gh issue list failed: ${r.stderr?.trim() ?? "unknown error"}`);
