@@ -68,24 +68,73 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
       fs.renameSync(tmp, p);
     },
 
-    gitBranchExists: async (repoDir, branch) => {
-      const r = spawnSync("git", ["rev-parse", "--verify", `refs/heads/${branch}`], {
+    /**
+     * Throwaway linked worktree for roadmap docs PR writeback (#632).
+     * Never switches the operator checkout. Path lives under
+     * `<repoDir>/.worktrees/roadmap+…` and is force-removed in `finally`
+     * (not counted as an issue-managed advance worktree). Branch is kept
+     * after removal so the day-keyed PR head remains.
+     */
+    withThrowawayWorktree: async (repoDir, branch, baseRef, fn) => {
+      const safeBranch = branch.replace(/\//g, "+");
+      const wtDir = path.join(repoDir, ".worktrees", `roadmap+${safeBranch}+${process.pid}`);
+
+      // Best-effort: drop a stale path from a prior crashed run at the same pid path.
+      if (fs.existsSync(wtDir)) {
+        spawnSync("git", ["worktree", "remove", "--force", wtDir], {
+          cwd: repoDir, encoding: "utf8",
+        });
+      }
+      fs.mkdirSync(path.dirname(wtDir), { recursive: true });
+
+      // Prefer remote day-branch head when present so existing-PR refresh sees
+      // the published content; else local branch; else create from baseRef.
+      spawnSync("git", ["fetch", "origin", branch], {
         cwd: repoDir, encoding: "utf8",
       });
-      return r.status === 0;
-    },
 
-    gitCreateBranch: async (repoDir, branch, fromRef) => {
-      const args = fromRef
-        ? ["checkout", "-b", branch, fromRef]
-        : ["checkout", "-b", branch];
-      const r = spawnSync("git", args, { cwd: repoDir, encoding: "utf8" });
-      if (r.status !== 0) throw new Error(`git checkout -b ${branch} failed: ${r.stderr}`);
-    },
+      const localExists =
+        spawnSync("git", ["rev-parse", "--verify", `refs/heads/${branch}`], {
+          cwd: repoDir, encoding: "utf8",
+        }).status === 0;
+      const remoteExists =
+        spawnSync("git", ["rev-parse", "--verify", `refs/remotes/origin/${branch}`], {
+          cwd: repoDir, encoding: "utf8",
+        }).status === 0;
 
-    gitSwitchBranch: async (repoDir, branch) => {
-      const r = spawnSync("git", ["checkout", branch], { cwd: repoDir, encoding: "utf8" });
-      if (r.status !== 0) throw new Error(`git checkout ${branch} failed: ${r.stderr}`);
+      let addArgs: string[];
+      if (localExists) {
+        // Checkout existing local branch into the throwaway worktree (no switch of repoDir).
+        addArgs = ["worktree", "add", "--force", wtDir, branch];
+      } else if (remoteExists) {
+        addArgs = ["worktree", "add", "--force", "-b", branch, wtDir, `origin/${branch}`];
+      } else {
+        addArgs = ["worktree", "add", "--force", "-b", branch, wtDir, baseRef];
+      }
+
+      const add = spawnSync("git", addArgs, { cwd: repoDir, encoding: "utf8" });
+      if (add.status !== 0) {
+        throw new Error(
+          `git worktree add for roadmap branch ${branch} failed: ${add.stderr || add.stdout}`,
+        );
+      }
+
+      try {
+        return await fn(wtDir);
+      } finally {
+        // Safety scope: only the path created above. Do not delete the branch —
+        // the day-keyed PR still needs it.
+        const rm = spawnSync("git", ["worktree", "remove", "--force", wtDir], {
+          cwd: repoDir, encoding: "utf8",
+        });
+        if (rm.status !== 0) {
+          // Cleanup failure must not override a successful PR URL or leave the
+          // operator checkout on a different branch (we never switched it).
+          process.stderr.write(
+            `[roadmap] failed to remove throwaway worktree ${wtDir}: ${rm.stderr || rm.stdout}\n`,
+          );
+        }
+      }
     },
 
     gitCommit: async (repoDir, files, message) => {

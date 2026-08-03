@@ -1,4 +1,4 @@
-// Tests for roadmap/writeback.ts (#171)
+// Tests for roadmap/writeback.ts (#171, #632)
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -11,9 +11,13 @@ import {
   applyHygiene,
   applyMilestones,
   openRoadmapPr,
+  buildRoadmapCommitMessage,
 } from "../scripts/roadmap/writeback.ts";
 import type { CrossRepoDep, HygieneItem, MilestoneSpec, PlanJson } from "../scripts/roadmap/types.ts";
 import type { WritebackDeps } from "../scripts/roadmap/writeback.ts";
+
+/** Distinct throwaway path used by default test deps (≠ operator repoDir). */
+const DEFAULT_WT = "/tmp/roadmap-throwaway-wt";
 
 function makePlan(overrides: Partial<PlanJson> = {}): PlanJson {
   return {
@@ -45,9 +49,7 @@ function makeDeps(overrides: Partial<WritebackDeps> = {}): WritebackDeps {
   return {
     writeFile: async () => {},
     readFile: async () => null,
-    gitCreateBranch: async () => {},
-    gitSwitchBranch: async () => {},
-    gitBranchExists: async () => false,
+    withThrowawayWorktree: async (_repoDir, _branch, _baseRef, fn) => fn(DEFAULT_WT),
     gitCommit: async () => {},
     gitPushBranch: async () => {},
     findPrByHead: async () => null,
@@ -272,75 +274,261 @@ describe("applyMilestones - idempotency", () => {
   });
 });
 
-describe("openRoadmapPr - idempotency", () => {
-  it("returns existing PR URL when a PR already exists for the branch (no duplicate PR)", async () => {
+describe("openRoadmapPr - isolation + refresh + commit metadata (#632)", () => {
+  it("never commits or creates PR against the operator repoDir; uses throwaway worktree path", async () => {
+    const operatorRepo = "/operator/checkout";
+    const wtPath = "/tmp/wt-roadmap-isolated";
+    const commitDirs: string[] = [];
+    const pushDirs: string[] = [];
+    const writePaths: string[] = [];
+    const createPrDirs: string[] = [];
+    let withWtCalls = 0;
+    let withWtRepoDir: string | undefined;
+    let withWtBase: string | undefined;
+    let withWtBranch: string | undefined;
+
+    const deps = makeDeps({
+      withThrowawayWorktree: async (repoDir, branch, baseRef, fn) => {
+        withWtCalls++;
+        withWtRepoDir = repoDir;
+        withWtBranch = branch;
+        withWtBase = baseRef;
+        return fn(wtPath);
+      },
+      writeFile: async (p) => { writePaths.push(p); },
+      gitCommit: async (dir) => { commitDirs.push(dir); },
+      gitPushBranch: async (dir) => { pushDirs.push(dir); },
+      createPr: async (dir) => {
+        createPrDirs.push(dir);
+        return "https://github.com/example/repo/pull/1";
+      },
+    });
+
+    const plan = makePlan();
+    await openRoadmapPr(plan, operatorRepo, "develop", deps);
+
+    assert.equal(withWtCalls, 1, "must open a throwaway worktree");
+    assert.equal(withWtRepoDir, operatorRepo);
+    assert.equal(withWtBase, "develop", "worktree base must be the configured baseBranch");
+    assert.ok(withWtBranch?.startsWith("roadmap/"), `branch should be day-keyed, got ${withWtBranch}`);
+    assert.deepEqual(commitDirs, [wtPath], "gitCommit must use worktree path, not operator repoDir");
+    assert.deepEqual(pushDirs, [wtPath], "gitPushBranch must use worktree path");
+    assert.deepEqual(createPrDirs, [wtPath]);
+    assert.ok(
+      writePaths.every((p) => p.startsWith(wtPath + "/") || p.startsWith(wtPath + "\\")),
+      `docs write must target worktree, got: ${writePaths.join(", ")}`,
+    );
+    assert.ok(!commitDirs.includes(operatorRepo));
+    assert.ok(!writePaths.some((p) => p.startsWith(operatorRepo + "/")));
+  });
+
+  it("existing PR + identical branch-head content: no commit, no createPr, returns URL", async () => {
     const existingPrUrl = "https://github.com/example/repo/pull/42";
-    let prCreateCallCount = 0;
+    let commitCount = 0;
+    let prCreateCount = 0;
+    let pushCount = 0;
+    const plan = makePlan();
+    const md = renderRoadmapMd(plan);
+
     const deps = makeDeps({
       findPrByHead: async () => existingPrUrl,
-      createPr: async () => { prCreateCallCount++; return "https://github.com/example/repo/pull/99"; },
+      // Branch-head content via worktree path (not operator checkout).
+      readFile: async (p) => (p.includes("docs/roadmaps/") ? md : null),
+      gitCommit: async () => { commitCount++; },
+      gitPushBranch: async () => { pushCount++; },
+      createPr: async () => {
+        prCreateCount++;
+        return "https://github.com/example/repo/pull/99";
+      },
     });
-    const plan = makePlan();
+
     const result = await openRoadmapPr(plan, "/repo", "main", deps);
-    assert.equal(result, existingPrUrl, "should return existing PR URL");
-    assert.equal(prCreateCallCount, 0, "should not create a new PR when one already exists");
+    assert.equal(result, existingPrUrl);
+    assert.equal(commitCount, 0, "identical content must not commit");
+    assert.equal(pushCount, 0);
+    assert.equal(prCreateCount, 0, "must not open a duplicate PR");
   });
 
-  it("returns null when docs content is unchanged (no redundant PR)", async () => {
-    let prCreateCallCount = 0;
+  it("existing PR + different branch-head content: commit+push, no createPr, returns same URL", async () => {
+    const existingPrUrl = "https://github.com/example/repo/pull/42";
+    let commitCount = 0;
+    let pushCount = 0;
+    let prCreateCount = 0;
+    let commitDir: string | undefined;
     const plan = makePlan();
-    // Simulate existing docs file with identical content
-    const { renderRoadmapMd: render } = await import("../scripts/roadmap/writeback.ts");
-    const existingContent = render(plan);
+
     const deps = makeDeps({
-      findPrByHead: async () => null,
-      readFile: async () => existingContent,  // existing docs matches what we'd write
-      createPr: async () => { prCreateCallCount++; return "https://github.com/example/repo/pull/1"; },
+      findPrByHead: async () => existingPrUrl,
+      // Stale content on the day-keyed branch head (worktree), not operator tree.
+      readFile: async (p) => (p.includes("docs/roadmaps/") ? "# stale roadmap\n" : null),
+      gitCommit: async (dir) => {
+        commitCount++;
+        commitDir = dir;
+      },
+      gitPushBranch: async () => { pushCount++; },
+      createPr: async () => {
+        prCreateCount++;
+        return "https://github.com/example/repo/pull/99";
+      },
     });
+
     const result = await openRoadmapPr(plan, "/repo", "main", deps);
-    assert.equal(result, null, "should return null when docs are unchanged");
-    assert.equal(prCreateCallCount, 0, "should not create PR for unchanged docs");
+    assert.equal(result, existingPrUrl, "must return existing PR URL after refresh");
+    assert.equal(commitCount, 1, "differing content must commit");
+    assert.equal(pushCount, 1);
+    assert.equal(prCreateCount, 0, "must not create a duplicate PR");
+    assert.equal(commitDir, DEFAULT_WT, "refresh commit must land in throwaway worktree");
   });
 
-  it("creates branch from baseBranch (not from HEAD) when branch does not exist", async () => {
-    let createBranchFromRef: string | undefined;
-    let prCreateCallCount = 0;
-    const deps = makeDeps({
-      findPrByHead: async () => null,
-      gitBranchExists: async () => false,
-      gitCreateBranch: async (_repoDir, _branch, fromRef) => { createBranchFromRef = fromRef; },
-      createPr: async () => { prCreateCallCount++; return "https://github.com/example/repo/pull/1"; },
-    });
+  it("content comparison uses worktree (branch head), not operator working tree alone", async () => {
+    const existingPrUrl = "https://github.com/example/repo/pull/7";
     const plan = makePlan();
-    await openRoadmapPr(plan, "/repo", "develop", deps);
-    assert.equal(createBranchFromRef, "develop", "branch should be created from the configured baseBranch");
-    assert.equal(prCreateCallCount, 1, "should create PR when branch and docs are new");
-  });
-
-  it("regression: switches to existing roadmap branch before committing (never commits to wrong branch)", async () => {
-    // Finding #6: when the local roadmap branch already exists but no open PR is found,
-    // the engine must call gitSwitchBranch before writing docs — otherwise the commit
-    // lands on whatever branch the repo currently has checked out (e.g., main).
-    let switchedToBranch: string | undefined;
-    let createBranchCalled = false;
+    const md = renderRoadmapMd(plan);
+    const operatorRepo = "/operator/repo";
+    const wtPath = "/tmp/wt-branch-head";
+    const readPaths: string[] = [];
+    let commitCount = 0;
 
     const deps = makeDeps({
-      findPrByHead: async () => null,
-      gitBranchExists: async () => true, // branch already exists locally
-      gitCreateBranch: async () => { createBranchCalled = true; },
-      gitSwitchBranch: async (_repoDir, branch) => { switchedToBranch = branch; },
-      createPr: async () => "https://github.com/example/repo/pull/2",
+      findPrByHead: async () => existingPrUrl,
+      withThrowawayWorktree: async (_repoDir, _branch, _base, fn) => fn(wtPath),
+      // Operator tree has different/missing docs; branch head (worktree) matches render → no-op.
+      readFile: async (p) => {
+        readPaths.push(p);
+        if (p.startsWith(operatorRepo)) {
+          return "# operator dirty tree — must not drive comparison\n";
+        }
+        if (p.startsWith(wtPath) && p.includes("docs/roadmaps/")) {
+          return md;
+        }
+        return null;
+      },
+      gitCommit: async () => { commitCount++; },
     });
 
-    const plan = makePlan();
-    await openRoadmapPr(plan, "/repo", "main", deps);
-
-    assert.ok(!createBranchCalled, "should not re-create an existing branch");
-    assert.ok(switchedToBranch !== undefined, "must call gitSwitchBranch when branch already exists");
-    // The switched branch should be the roadmap branch (not main or anything else)
+    const result = await openRoadmapPr(plan, operatorRepo, "main", deps);
+    assert.equal(result, existingPrUrl);
+    assert.equal(commitCount, 0, "must no-op when branch head matches, even if operator tree differs");
     assert.ok(
-      switchedToBranch!.startsWith("roadmap/"),
-      `gitSwitchBranch should be called with the roadmap branch, got: ${switchedToBranch}`,
+      readPaths.some((p) => p.startsWith(wtPath)),
+      "must read docs from worktree path",
+    );
+    assert.ok(
+      !readPaths.some((p) => p.startsWith(operatorRepo + "/")),
+      "must not use operator repoDir path for content comparison",
+    );
+  });
+
+  it("no PR + unchanged branch-head docs: returns null without createPr", async () => {
+    let prCreateCount = 0;
+    let commitCount = 0;
+    const plan = makePlan();
+    const md = renderRoadmapMd(plan);
+    const deps = makeDeps({
+      findPrByHead: async () => null,
+      readFile: async () => md,
+      gitCommit: async () => { commitCount++; },
+      createPr: async () => {
+        prCreateCount++;
+        return "https://github.com/example/repo/pull/1";
+      },
+    });
+    const result = await openRoadmapPr(plan, "/repo", "main", deps);
+    assert.equal(result, null);
+    assert.equal(commitCount, 0);
+    assert.equal(prCreateCount, 0);
+  });
+
+  it("no PR + new content: commit+push+createPr via worktree; baseRef passed to worktree helper", async () => {
+    let baseRefSeen: string | undefined;
+    let prCreateCount = 0;
+    const deps = makeDeps({
+      findPrByHead: async () => null,
+      readFile: async () => null,
+      withThrowawayWorktree: async (_repo, _branch, baseRef, fn) => {
+        baseRefSeen = baseRef;
+        return fn(DEFAULT_WT);
+      },
+      createPr: async () => {
+        prCreateCount++;
+        return "https://github.com/example/repo/pull/1";
+      },
+    });
+    await openRoadmapPr(makePlan(), "/repo", "develop", deps);
+    assert.equal(baseRefSeen, "develop");
+    assert.equal(prCreateCount, 1);
+  });
+
+  it("commit message has no fossil #171 / fake run id", async () => {
+    let commitMsg = "";
+    const deps = makeDeps({
+      readFile: async () => null,
+      gitCommit: async (_dir, _files, message) => { commitMsg = message; },
+    });
+    await openRoadmapPr(makePlan(), "/repo", "main", deps);
+    assert.ok(!commitMsg.includes("Issue: #171"), "must not hardcode fossil Issue: #171");
+    assert.ok(
+      !commitMsg.includes("Pipeline-Run: 171/2026-06-17T04:37:16Z"),
+      "must not hardcode fossil Pipeline-Run from #171",
+    );
+    assert.ok(!commitMsg.includes("Issue:"), "default path must omit Issue trailer");
+    assert.ok(!commitMsg.includes("Pipeline-Run:"), "default path must omit Pipeline-Run trailer");
+    assert.match(commitMsg, /^docs: roadmap for example\/repo \(generated 2026-01-01\)$/);
+  });
+
+  it("with full issue+run context, commit message carries both trailers", async () => {
+    let commitMsg = "";
+    const deps = makeDeps({
+      readFile: async () => null,
+      gitCommit: async (_dir, _files, message) => { commitMsg = message; },
+    });
+    await openRoadmapPr(makePlan(), "/repo", "main", deps, {
+      issueNumber: 632,
+      pipelineRunId: "632/2026-08-03T16:19:17Z",
+    });
+    assert.ok(commitMsg.includes("Issue: #632"));
+    assert.ok(commitMsg.includes("Pipeline-Run: 632/2026-08-03T16:19:17Z"));
+    assert.ok(commitMsg.includes("\n\nIssue: #632\n"), "trailers separated by blank line");
+  });
+
+  it("partial context (only issue or only run) invents neither trailer", async () => {
+    for (const trace of [
+      { issueNumber: 632 },
+      { pipelineRunId: "632/2026-08-03T16:19:17Z" },
+    ] as const) {
+      let commitMsg = "";
+      const deps = makeDeps({
+        readFile: async () => null,
+        gitCommit: async (_dir, _files, message) => { commitMsg = message; },
+      });
+      await openRoadmapPr(makePlan(), "/repo", "main", deps, trace);
+      assert.ok(!commitMsg.includes("Issue:"), `partial ${JSON.stringify(trace)} must omit Issue`);
+      assert.ok(!commitMsg.includes("Pipeline-Run:"), `partial ${JSON.stringify(trace)} must omit Pipeline-Run`);
+    }
+  });
+});
+
+describe("buildRoadmapCommitMessage", () => {
+  it("omits trailers without full context", () => {
+    const plan = makePlan();
+    assert.equal(
+      buildRoadmapCommitMessage(plan),
+      "docs: roadmap for example/repo (generated 2026-01-01)",
+    );
+    assert.equal(
+      buildRoadmapCommitMessage(plan, { issueNumber: 1 }),
+      "docs: roadmap for example/repo (generated 2026-01-01)",
+    );
+  });
+
+  it("appends both trailers when fully supplied", () => {
+    const msg = buildRoadmapCommitMessage(makePlan(), {
+      issueNumber: 10,
+      pipelineRunId: "10/2026-01-01T00:00:00Z",
+    });
+    assert.equal(
+      msg,
+      "docs: roadmap for example/repo (generated 2026-01-01)\n\nIssue: #10\nPipeline-Run: 10/2026-01-01T00:00:00Z",
     );
   });
 });
