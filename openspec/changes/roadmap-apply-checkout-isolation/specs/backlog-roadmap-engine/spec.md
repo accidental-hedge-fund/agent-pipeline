@@ -2,13 +2,18 @@
 
 ### Requirement: Roadmap docs PR writeback SHALL isolate git mutations from the operator checkout
 
-Roadmap docs PR writeback SHALL perform all branch create/checkout, file write for
-`docs/roadmaps/<repo>.md`, commit, and push operations inside a throwaway linked
-worktree (or equivalent isolated git surface) derived from the repository when
-`config.roadmap.pr_docs` is true. The writeback path SHALL NOT switch, check out, or
-commit on the caller's current branch in the operator `repoDir` checkout. After writeback
-completes or fails, the operator checkout's current branch SHALL be the same as before
-the call (absent concurrent operator edits unrelated to writeback).
+Roadmap docs PR writeback SHALL perform all file write for `docs/roadmaps/<repo>.md`,
+commit, and push operations inside a throwaway linked worktree (or equivalent isolated
+git surface) derived from the repository when `config.roadmap.pr_docs` is true. The
+throwaway worktree SHALL be created detached (or on a unique temporary branch) at the
+correct tip (`origin/<day-branch>` when present, else local tip or base) and SHALL NOT
+attach to, check out, create with `-b`/`-B`, or reset the shared day-keyed branch ref
+(`roadmap/<repoSlug>-YYYY-MM-DD`) inside that worktree. Push SHALL publish the throwaway
+HEAD to `refs/heads/<day-branch>` (normal fast-forward semantics, not force). The
+writeback path SHALL NOT switch, check out, or commit on the caller's current branch in
+the operator `repoDir` checkout. After writeback completes or fails, the operator
+checkout's current branch name and HEAD commit SHALL be the same as before the call
+(absent concurrent operator edits unrelated to writeback).
 
 #### Scenario: Operator checkout branch is unchanged after PR writeback
 
@@ -20,6 +25,16 @@ the call (absent concurrent operator edits unrelated to writeback).
 - **AND** after the call returns, the operator checkout SHALL still be on the same branch
   it was on before the call
 
+#### Scenario: Operator on the day-keyed branch keeps the same HEAD
+
+- **WHEN** the operator's `repoDir` is already checked out on the day-keyed roadmap
+  branch and writeback creates a docs commit
+- **THEN** writeback SHALL NOT move, reset, or repoint that shared day-branch ref from
+  the throwaway worktree
+- **AND** after the call returns, the operator checkout SHALL still be on that branch
+  name at the same HEAD commit as before the call (new commits are published only via
+  push of the throwaway HEAD to the remote day-branch ref)
+
 #### Scenario: Commit and push use the throwaway worktree path
 
 - **WHEN** writeback creates a new commit for `docs/roadmaps/<repo>.md`
@@ -27,11 +42,16 @@ the call (absent concurrent operator edits unrelated to writeback).
   directory as their repository path
 - **AND** that path SHALL be distinct from the operator `repoDir` path passed into
   writeback
+- **AND** the push SHALL target `HEAD:refs/heads/<day-branch>` (or equivalent) rather
+  than requiring the throwaway worktree to be attached to the day-branch name
 
 #### Scenario: Throwaway worktree is cleaned up
 
-- **WHEN** writeback finishes successfully or fails after creating a throwaway worktree
-- **THEN** writeback SHALL attempt to remove that throwaway worktree
+- **WHEN** writeback finishes successfully or fails after this invocation successfully
+  created a throwaway worktree
+- **THEN** writeback SHALL attempt to remove only that throwaway worktree path
+- **AND** writeback SHALL NOT preemptively force-remove a pre-existing path it did not
+  create (including predictable PID-recycled paths that may hold uncommitted work)
 - **AND** cleanup failure SHALL NOT leave the operator checkout on a different branch
 
 ---

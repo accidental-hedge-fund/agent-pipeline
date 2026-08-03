@@ -15,7 +15,11 @@ import {
 } from "../scripts/roadmap/writeback.ts";
 import {
   planRoadmapThrowawayWorktreeAdd,
+  planRoadmapThrowawayWorktreePath,
   roadmapBranchFetchRefspec,
+  roadmapDayBranchPushRefspec,
+  roadmapThrowawayWorktreeDir,
+  shouldForceRemoveRoadmapWorktree,
 } from "../scripts/stages/roadmap-deps.ts";
 import type { CrossRepoDep, HygieneItem, MilestoneSpec, PlanJson } from "../scripts/roadmap/types.ts";
 import type { WritebackDeps } from "../scripts/roadmap/writeback.ts";
@@ -512,10 +516,10 @@ describe("openRoadmapPr - isolation + refresh + commit metadata (#632)", () => {
   });
 });
 
-describe("planRoadmapThrowawayWorktreeAdd - prefer remote PR head (#632 review 75dd3a1d)", () => {
+describe("planRoadmapThrowawayWorktreeAdd - detached tip + remote preference (#632)", () => {
   const branch = "roadmap/repo-2026-08-03";
   const baseRef = "main";
-  const wtDir = "/repo/.worktrees/roadmap+repo-2026-08-03+1";
+  const wtDir = "/repo/.worktrees/roadmap+repo-2026-08-03+deadbeef";
 
   it("fetch refspec writes the remote-tracking ref, not just FETCH_HEAD", () => {
     assert.equal(
@@ -524,9 +528,15 @@ describe("planRoadmapThrowawayWorktreeAdd - prefer remote PR head (#632 review 7
     );
   });
 
-  it("successful fetch prefers origin/<branch> via -B even when a stale local branch exists", () => {
-    // Regression: old code preferred localExists first, so a stale local day-branch
-    // won over the published PR head (no-op against stale content / non-ff push).
+  it("push refspec publishes detached HEAD to day-branch (FF only)", () => {
+    // Regression #632 review-2 62b576be: never attach worktree to shared day branch.
+    assert.equal(roadmapDayBranchPushRefspec(branch), `HEAD:refs/heads/${branch}`);
+    assert.ok(!roadmapDayBranchPushRefspec(branch).includes("--force"));
+  });
+
+  it("successful fetch detaches at origin/<branch> even when a stale local branch exists", () => {
+    // Prefer remote tip; must NOT use -B / checkout the shared day-branch name
+    // (that would move the operator's HEAD if they are already on that branch).
     const plan = planRoadmapThrowawayWorktreeAdd({
       branch,
       baseRef,
@@ -538,14 +548,17 @@ describe("planRoadmapThrowawayWorktreeAdd - prefer remote PR head (#632 review 7
     assert.equal(plan.kind, "add");
     if (plan.kind !== "add") return;
     assert.deepEqual(plan.addArgs, [
-      "worktree", "add", "--force", "-B", branch, wtDir, `origin/${branch}`,
+      "worktree", "add", "--detach", wtDir, `origin/${branch}`,
     ]);
+    assert.ok(!plan.addArgs.includes("-B"), "must not reset shared day-branch with -B");
+    assert.ok(!plan.addArgs.includes("-b"), "must not create shared day-branch in worktree");
+    // Day-branch name must not appear as the worktree branch to check out —
+    // only as part of origin/<branch> commit-ish.
+    assert.ok(!plan.addArgs.includes(branch), "must not attach worktree to shared day-branch ref");
   });
 
-  it("successful fetch prefers origin/<branch> when local branch is missing", () => {
+  it("successful fetch detaches at origin/<branch> when local branch is missing", () => {
     // Fresh operator checkout: no local day-branch; remote PR branch exists.
-    // Bare `git fetch origin <branch>` left remoteExists false; explicit refspec
-    // + this plan starts from the published tip instead of baseRef.
     const plan = planRoadmapThrowawayWorktreeAdd({
       branch,
       baseRef,
@@ -557,12 +570,13 @@ describe("planRoadmapThrowawayWorktreeAdd - prefer remote PR head (#632 review 7
     assert.equal(plan.kind, "add");
     if (plan.kind !== "add") return;
     assert.deepEqual(plan.addArgs, [
-      "worktree", "add", "--force", "-B", branch, wtDir, `origin/${branch}`,
+      "worktree", "add", "--detach", wtDir, `origin/${branch}`,
     ]);
     assert.ok(!plan.addArgs.includes(baseRef), "must not fall through to baseRef when remote exists");
+    assert.ok(!plan.addArgs.includes("-B"));
   });
 
-  it("missing remote ref + no local branch creates from baseRef (new day branch)", () => {
+  it("missing remote ref + no local branch detaches at baseRef (new day branch)", () => {
     const plan = planRoadmapThrowawayWorktreeAdd({
       branch,
       baseRef,
@@ -574,11 +588,15 @@ describe("planRoadmapThrowawayWorktreeAdd - prefer remote PR head (#632 review 7
     assert.equal(plan.kind, "add");
     if (plan.kind !== "add") return;
     assert.deepEqual(plan.addArgs, [
-      "worktree", "add", "--force", "-b", branch, wtDir, baseRef,
+      "worktree", "add", "--detach", wtDir, baseRef,
     ]);
+    // Must not create the shared day-branch name locally via -b (operator may
+    // later check it out; push publishes HEAD:refs/heads/<day-branch> instead).
+    assert.ok(!plan.addArgs.includes("-b"));
+    assert.ok(!plan.addArgs.includes(branch));
   });
 
-  it("missing remote ref + local branch uses local (not yet pushed)", () => {
+  it("missing remote ref + local branch detaches at local tip (not yet pushed)", () => {
     const plan = planRoadmapThrowawayWorktreeAdd({
       branch,
       baseRef,
@@ -589,7 +607,11 @@ describe("planRoadmapThrowawayWorktreeAdd - prefer remote PR head (#632 review 7
     });
     assert.equal(plan.kind, "add");
     if (plan.kind !== "add") return;
-    assert.deepEqual(plan.addArgs, ["worktree", "add", "--force", wtDir, branch]);
+    // Detach at the commit-ish named by the local branch without checking it out
+    // as a branch (shared ref stays put if operator is on it).
+    assert.deepEqual(plan.addArgs, ["worktree", "add", "--detach", wtDir, branch]);
+    assert.ok(!plan.addArgs.includes("-B"));
+    assert.ok(!plan.addArgs.includes("-b"));
   });
 
   it("non-missing fetch failure fails closed (does not silently start from baseRef)", () => {
@@ -608,6 +630,60 @@ describe("planRoadmapThrowawayWorktreeAdd - prefer remote PR head (#632 review 7
     assert.match(plan.message, /fetch origin/);
     assert.match(plan.message, /refs\/remotes\/origin\//);
     assert.ok(!plan.message.includes("worktree add"), "must not plan a worktree add on hard fetch failure");
+  });
+});
+
+describe("roadmap throwaway path + cleanup ownership (#632 review-2 41f999b5)", () => {
+  const branch = "roadmap/repo-2026-08-03";
+  const repoDir = "/operator/checkout";
+
+  it("path embeds invocation id (not PID alone) under .worktrees", () => {
+    const id = "a1b2c3d4e5f67890";
+    const dir = roadmapThrowawayWorktreeDir(repoDir, branch, id);
+    // branch "roadmap/repo-2026-08-03" → safe "roadmap+repo-2026-08-03"
+    assert.equal(dir, `${repoDir}/.worktrees/roadmap+roadmap+repo-2026-08-03+${id}`);
+    assert.ok(dir.includes(id), "must embed collision-resistant invocation id");
+    assert.ok(!dir.endsWith(`+${process.pid}`), "must not rely on recycled PID alone");
+  });
+
+  it("pre-existing path fails closed — no force-remove of foreign worktree", () => {
+    // Regression: old code removed path derived only from PID with
+    // `git worktree remove --force` before create, deleting uncommitted work
+    // left by a crashed prior process that shared a recycled PID.
+    const plan = planRoadmapThrowawayWorktreePath({
+      repoDir,
+      branch,
+      invocationId: "recycled-pid-path",
+      pathExists: true,
+    });
+    assert.equal(plan.kind, "error");
+    if (plan.kind !== "error") return;
+    assert.match(plan.message, /already exists/);
+    assert.match(plan.message, /refusing to force-remove/);
+  });
+
+  it("absent path is ready for create", () => {
+    const plan = planRoadmapThrowawayWorktreePath({
+      repoDir,
+      branch,
+      invocationId: "fresh-token",
+      pathExists: false,
+    });
+    assert.equal(plan.kind, "ready");
+    if (plan.kind !== "ready") return;
+    assert.equal(
+      plan.wtDir,
+      roadmapThrowawayWorktreeDir(repoDir, branch, "fresh-token"),
+    );
+  });
+
+  it("force-remove only when this invocation created the worktree", () => {
+    assert.equal(shouldForceRemoveRoadmapWorktree(true), true);
+    assert.equal(
+      shouldForceRemoveRoadmapWorktree(false),
+      false,
+      "must not force-remove a path this invocation did not create",
+    );
   });
 });
 
