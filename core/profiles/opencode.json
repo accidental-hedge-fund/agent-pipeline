@@ -1,0 +1,10 @@
+{
+  "name": "opencode",
+  "displayName": "OpenCode pipeline",
+  "invocation": "/pipeline",
+  "harnesses": { "implementer": "opencode", "reviewer": "claude" },
+  "reviewMode": "prompt-harness",
+  "markerFooter": "*Automated by OpenCode Pipeline Skill*",
+  "implementationReadyMessage": "Ready for Claude standard review.",
+  "conventionsDefault": "AGENTS.md"
+}

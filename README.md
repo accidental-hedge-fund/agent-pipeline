@@ -100,6 +100,7 @@ npx github:accidental-hedge-fund/agent-pipeline install
 # Or a specific host:
 npx github:accidental-hedge-fund/agent-pipeline install --host claude
 npx github:accidental-hedge-fund/agent-pipeline install --host codex
+npx github:accidental-hedge-fund/agent-pipeline install --host opencode
 ```
 
 For a reproducible, non-interactive install — pin a released tag and auto-accept optional-dependency prompts with `--yes-deps`:
@@ -114,10 +115,10 @@ Or clone and run directly:
 
 ```bash
 gh repo clone accidental-hedge-fund/agent-pipeline
-node agent-pipeline/scripts/install.mjs install        # --host claude|codex|grok|all  (default: all)
+node agent-pipeline/scripts/install.mjs install        # --host claude|codex|grok|opencode|all  (default: all)
 ```
 
-The installer copies the shared core and the right host overlay into `~/.claude/skills/pipeline` and/or `~/.codex/skills/pipeline`, writes a launcher shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME` (Claude `/pipeline:*` command files embed the resolved skill path under that config dir). If a **personal** skill already exists at the host's skills path without the installer's managed marker, install offers relocation (or auto-relocates in non-TTY) for **both** Claude and Codex so the personal tree is not silently overwritten. **Restart Codex** after a Codex install; Claude picks the skill up live.
+The installer copies the shared core and the right host overlay into `~/.claude/skills/pipeline`, `~/.codex/skills/pipeline`, and/or `~/.config/opencode/skills/pipeline`, writes a launcher shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `OPENCODE_CONFIG_DIR` (Claude `/pipeline:*` command files and the OpenCode `/pipeline` command embed the resolved skill path under that config dir). `OPENCODE_CONFIG` (single config **file**) is not used as an install base. If a **personal** skill already exists at the host's skills path without the installer's managed marker, install offers relocation (or auto-relocates in non-TTY) for **Claude, Codex, and OpenCode** tree hosts so the personal tree is not silently overwritten. **Restart Codex** after a Codex install; Claude picks the skill up live. OpenCode may need a restart/reload if commands do not appear live.
 
 ### Optional dependency prompts
 
@@ -136,15 +137,32 @@ npx github:accidental-hedge-fund/agent-pipeline install --host grok
 node scripts/install.mjs install --host grok
 ```
 
+### OpenCode
+
+```bash
+npx github:accidental-hedge-fund/agent-pipeline install --host opencode
+# or from a clone:
+node scripts/install.mjs install --host opencode
+```
+
+Default install locations (override the config base with `OPENCODE_CONFIG_DIR`):
+
+| Surface | Default path |
+| --- | --- |
+| Skill tree | `~/.config/opencode/skills/pipeline` |
+| Native `/pipeline` command | `~/.config/opencode/commands/pipeline.md` |
+
+The OpenCode `/pipeline` command is an **OpenCode markdown command** (LLM-mediated prompt template — OpenCode does not support pure no-LLM side-effect slash commands). The installer writes a template that **shell-injects** an argv-safe bridge so the installed launcher runs and its stdout is injected into the prompt before the agent turn. For `--version` / `-V`, the inject output equals `node ~/.config/opencode/skills/pipeline/scripts/pipeline.mjs --version` (from `core/package.json` at the install root), and the template instructs the agent to report only that version string without dumping generic skill instructional text.
+
 ### Uninstall
 
 ```bash
-npx github:accidental-hedge-fund/agent-pipeline uninstall --host all   # or claude | codex
+npx github:accidental-hedge-fund/agent-pipeline uninstall --host all   # or claude | codex | opencode | grok
 # or from a clone:
 node scripts/install.mjs uninstall --host all
 ```
 
-Uninstall removes the host skill tree. For Claude it also removes installer-written `pipeline:*.md` command files under the resolved Claude config `commands/` directory (same base as install / `CLAUDE_CONFIG_DIR`); other command files are left alone.
+Uninstall removes the host skill tree. For Claude it also removes installer-written `pipeline:*.md` command files under the resolved Claude config `commands/` directory (same base as install / `CLAUDE_CONFIG_DIR`); other command files are left alone. For OpenCode it removes the managed skill tree and installer-owned `commands/pipeline.md` only (sibling OpenCode commands are left alone).
 
 ## Benchmark & Reliability Suite
 
