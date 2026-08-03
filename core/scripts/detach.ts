@@ -12,6 +12,17 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  PipelineLock,
+  formatProcessIdentityMarker,
+  getProcessStartTime,
+  issueRunLockPath,
+  issueRunLockHeldToken,
+  ISSUE_RUN_LOCK_HELD_ENV,
+} from "./lock.ts";
+
+// Re-export process-identity helpers (canonical home is lock.ts) for existing importers.
+export { formatProcessIdentityMarker, getProcessStartTime, issueRunLockPath };
 
 // ---------------------------------------------------------------------------
 // Process-tree termination (#153)
@@ -113,6 +124,137 @@ export function killProcessTree(
   return ordered;
 }
 
+/**
+ * Signal descendant process groups of `rootPid` **excluding** the root process's
+ * own group. Used on abnormal wrapper shutdown so the wrapper stays alive long
+ * enough to confirm children are gone and only then release the issue-run lock
+ * (SIGKILL of the wrapper's own group would skip exit handlers — #634 review 2).
+ */
+export function killDescendantGroupsOnly(
+  rootPid: number,
+  signal: NodeJS.Signals,
+  deps: KillTreeDeps = defaultKillTreeDeps,
+): number[] {
+  const table = parseProcTable(deps.snapshot());
+  const self = table.find((p) => p.pid === rootPid);
+  const selfPgid = self?.pgid ?? rootPid;
+  const groups = descendantProcessGroups(table, rootPid).filter((g) => g !== selfPgid);
+  for (const pgid of groups) deps.killGroup(pgid, signal);
+  return groups;
+}
+
+/** Grace after SIGTERM before escalating to SIGKILL on abnormal wrapper shutdown. */
+export const ABNORMAL_SHUTDOWN_GRACE_MS = 5_000;
+
+/** Additional wait after SIGKILL before treating termination as unconfirmed. */
+export const ABNORMAL_SHUTDOWN_HARD_WAIT_MS = 2_000;
+
+/** Minimal child shape for {@link waitForChildClose} / {@link terminateWrapperChildren}. */
+export type WaitableChild = {
+  on(event: "close" | "error", cb: (...args: unknown[]) => void): unknown;
+  kill?(signal?: NodeJS.Signals): boolean;
+  pid?: number | undefined;
+  /** Set after exit on real ChildProcess — used to detect already-exited children. */
+  exitCode?: number | null;
+  signalCode?: NodeJS.Signals | null;
+};
+
+export type WaitForChildCloseDeps = {
+  setTimeoutFn?: typeof setTimeout;
+  clearTimeoutFn?: typeof clearTimeout;
+};
+
+/**
+ * Resolve when `child` has exited (`close`/`error`, or already-set exit/signal
+ * codes), or when `timeoutMs` elapses (returns false). `undefined` child → true.
+ */
+export function waitForChildClose(
+  child: WaitableChild | undefined,
+  timeoutMs: number,
+  deps: WaitForChildCloseDeps = {},
+): Promise<boolean> {
+  if (!child) return Promise.resolve(true);
+  // Already exited (close may have fired before we subscribed).
+  if (child.exitCode != null || child.signalCode != null) return Promise.resolve(true);
+
+  const setT = deps.setTimeoutFn ?? setTimeout;
+  const clearT = deps.clearTimeoutFn ?? clearTimeout;
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearT(timer);
+      resolve(ok);
+    };
+    const timer = setT(() => done(false), timeoutMs);
+    child.on("close", () => done(true));
+    child.on("error", () => done(true));
+  });
+}
+
+export type TerminateWrapperChildrenDeps = {
+  killInner: (child: WaitableChild, signal: NodeJS.Signals) => void;
+  killDescendants: (rootPid: number, signal: NodeJS.Signals) => number[];
+  waitForClose: (child: WaitableChild | undefined, timeoutMs: number) => Promise<boolean>;
+  sleep: (ms: number) => Promise<void>;
+};
+
+const defaultTerminateChildrenDeps: TerminateWrapperChildrenDeps = {
+  killInner: (child, signal) => {
+    try {
+      child.kill?.(signal);
+    } catch {
+      /* already gone */
+    }
+  },
+  killDescendants: (rootPid, signal) => killDescendantGroupsOnly(rootPid, signal),
+  waitForClose: (child, timeoutMs) => waitForChildClose(child, timeoutMs),
+  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+};
+
+/**
+ * Terminate the inner pipeline process and detached descendant groups, then
+ * **await confirmed exit** of the inner child (grace → SIGKILL escalate).
+ *
+ * Does **not** kill the wrapper process itself and does **not** release the
+ * issue-run lock — the caller must release only after this resolves (or leave
+ * the lock for stale recovery if the wrapper cannot exit cleanly).
+ *
+ * Returns `"confirmed"` when the inner process is observed gone; `"unconfirmed"`
+ * if the hard wait elapsed without a close event.
+ */
+export async function terminateWrapperChildren(
+  opts: {
+    inner: WaitableChild | undefined;
+    wrapperPid: number;
+    graceMs?: number;
+    hardWaitMs?: number;
+  },
+  deps: Partial<TerminateWrapperChildrenDeps> = {},
+): Promise<"confirmed" | "unconfirmed"> {
+  const d: TerminateWrapperChildrenDeps = { ...defaultTerminateChildrenDeps, ...deps };
+  const graceMs = opts.graceMs ?? ABNORMAL_SHUTDOWN_GRACE_MS;
+  const hardWaitMs = opts.hardWaitMs ?? ABNORMAL_SHUTDOWN_HARD_WAIT_MS;
+
+  if (opts.inner) d.killInner(opts.inner, "SIGTERM");
+  d.killDescendants(opts.wrapperPid, "SIGTERM");
+
+  const exitedSoft = await d.waitForClose(opts.inner, graceMs);
+  if (exitedSoft) {
+    // Inner is gone; still SIGKILL any detached descendant groups that outlived it.
+    d.killDescendants(opts.wrapperPid, "SIGKILL");
+    return "confirmed";
+  }
+
+  if (opts.inner) d.killInner(opts.inner, "SIGKILL");
+  d.killDescendants(opts.wrapperPid, "SIGKILL");
+  const exitedHard = await d.waitForClose(opts.inner, hardWaitMs);
+  // Brief settle so kill signals can take effect before the wrapper releases.
+  await d.sleep(Math.min(hardWaitMs, 250));
+  return exitedHard ? "confirmed" : "unconfirmed";
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -125,6 +267,12 @@ export type SentinelData = {
 };
 
 export type SpawnDetachedOpts = {
+  /**
+   * Pipeline domain (same identity as foreground advance — config domain /
+   * `--domain` / basename of resolved repo). Required for the shared
+   * issue-run lock and domain-scoped wrapper run paths (#634).
+   */
+  domain: string;
   /** Watchdog timeout in seconds. Absent = no watchdog. */
   timeout?: number;
   /** Advisory lock acquisition timeout in ms. Default 5000. */
@@ -157,18 +305,28 @@ const defaultSpawnDeps: SpawnDetachedDeps = {
 
 // ---------------------------------------------------------------------------
 // Path helpers (exported for tests)
+//
+// Wrapper run artifacts live under ~/.pipeline/runs/<domain>/<issue>/ so two
+// repos that share an issue number never interleave logs/sentinels (#634).
+// The mutual-exclusion lock itself is the shared issue-run path under /tmp
+// (see issueRunLockPath / PipelineLock) — not a second home-dir mutex.
 // ---------------------------------------------------------------------------
 
-export function issueRunsDir(homedir: string, issue: number): string {
-  return path.join(homedir, ".pipeline", "runs", String(issue));
+export function issueRunsDir(homedir: string, domain: string, issue: number): string {
+  if (!domain) throw new Error("issueRunsDir: domain is required");
+  return path.join(homedir, ".pipeline", "runs", domain, String(issue));
 }
 
-export function lockFilePath(homedir: string, issue: number): string {
-  return path.join(issueRunsDir(homedir, issue), ".lock");
+/**
+ * Shared issue-run lock path for detach diagnostics / live probes.
+ * Domain-scoped; never issue-number-only. Same path as foreground advance.
+ */
+export function lockFilePath(domain: string, issue: number): string {
+  return issueRunLockPath(domain, issue);
 }
 
-export function makeRunDir(homedir: string, issue: number, ts: string): string {
-  return path.join(issueRunsDir(homedir, issue), ts);
+export function makeRunDir(homedir: string, domain: string, issue: number, ts: string): string {
+  return path.join(issueRunsDir(homedir, domain, issue), ts);
 }
 
 // ---------------------------------------------------------------------------
@@ -183,134 +341,7 @@ export function writeSentinel(runDirPath: string, data: SentinelData): void {
 }
 
 // ---------------------------------------------------------------------------
-// Process-instance identity for detach lock markers (#770 review / #668)
-//
-// PID alone is not enough: after a wrapper is killed before sentinel.json,
-// the OS may reuse the recorded PID for an unrelated process. Markers therefore
-// store `pid starttime` and readers must verify both (see live-advance.ts).
-// ---------------------------------------------------------------------------
-
-/**
- * Host process starttime token for `pid`.
- * Linux: `/proc/<pid>/stat` field 22 (clock ticks). Darwin/portable: `ps -o lstart=`.
- * Returns null when the process is gone or the token cannot be read.
- */
-export function getProcessStartTime(pid: number): string | null {
-  if (!Number.isInteger(pid) || pid <= 0) return null;
-  try {
-    const s = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const i = s.lastIndexOf(")");
-    if (i >= 0) {
-      const f = s.slice(i + 2).trim().split(/\s+/);
-      if (f[19]) return f[19];
-    }
-  } catch {
-    /* not Linux, or process gone — try portable fallback */
-  }
-  try {
-    const out = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
-      encoding: "utf8",
-      timeout: 2000,
-    });
-    if (out.status === 0) {
-      const t = (out.stdout ?? "").trim();
-      if (t) return t;
-    }
-  } catch {
-    /* ps unavailable */
-  }
-  return null;
-}
-
-/**
- * Body for `.lock` / `.lock-acquired`: `pid starttime` when starttime is known,
- * else bare `pid` (readers treat bare pid as non-verifiable / non-live).
- */
-export function formatProcessIdentityMarker(
-  pid: number = process.pid,
-  getStartTime: (p: number) => string | null = getProcessStartTime,
-): string {
-  const st = getStartTime(pid);
-  return st != null && st !== "" ? `${pid} ${st}` : String(pid);
-}
-
-// ---------------------------------------------------------------------------
-// Advisory lock helpers
-// ---------------------------------------------------------------------------
-
-/** Atomically create the lock file with own PID + starttime. Returns true on success. */
-function tryWriteLock(lp: string): boolean {
-  try {
-    const fd = fs.openSync(lp, "wx");
-    try {
-      fs.writeSync(fd, formatProcessIdentityMarker());
-    } finally {
-      fs.closeSync(fd);
-    }
-    return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
-    throw err;
-  }
-}
-
-/** Returns true when the process recorded in the lock file is alive. */
-function lockHolderAlive(lp: string): boolean {
-  let pidText: string;
-  try {
-    pidText = fs.readFileSync(lp, "utf8").trim();
-  } catch {
-    return false; // file vanished — not held
-  }
-  const pid = Number.parseInt(pidText, 10);
-  if (!Number.isFinite(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true; // alive
-  } catch (err) {
-    // ESRCH = no such process (dead); EPERM = alive but permission denied
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-function removeStaleLock(lp: string): void {
-  try {
-    fs.unlinkSync(lp);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-  }
-}
-
-/**
- * Acquire the advisory lock, retrying until timeoutMs elapses.
- * Throws with a human-readable message if the lock cannot be acquired.
- */
-async function acquireLock(lp: string, issue: number, timeoutMs: number): Promise<void> {
-  fs.mkdirSync(path.dirname(lp), { recursive: true });
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    if (tryWriteLock(lp)) return;
-    // Lock held — check liveness.
-    if (!lockHolderAlive(lp)) {
-      removeStaleLock(lp);
-      continue; // retry immediately
-    }
-    if (Date.now() >= deadline) {
-      let holder = "";
-      try {
-        holder = ` (held by PID ${fs.readFileSync(lp, "utf8").trim()})`;
-      } catch {}
-      throw new Error(
-        `pipeline: issue #${issue} is already running${holder}. ` +
-          `Wait for the run to finish or remove ${lp} if it is stale.`,
-      );
-    }
-    await new Promise<void>((r) => setTimeout(r, 200));
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Lock-ownership handshake (#153)
+// Lock-ownership handshake (#153 / #634)
 //
 // The launcher must NOT acquire the per-issue lock and then transfer it to the
 // child after spawn(): if the launcher dies in the window between spawn() and
@@ -359,25 +390,28 @@ const DETACH_TS = fileURLToPath(new URL("./detach.ts", import.meta.url));
  * in a new process group, surviving the launcher's exit. The wrapper writes
  * `sentinel.json` to the run directory on every exit path.
  *
- * The advisory lock is acquired HERE (in the foreground) so a concurrent
- * second invocation for the same issue fails non-zero before the first call
- * returns. After spawning the wrapper, the lock file is updated with the
- * child's PID so the child's lifetime holds the lock.
+ * The shared issue-run lock (`(domain, issue)` → `/tmp/pipeline-{domain}-{N}.lock`)
+ * is acquired by the WRAPPER (not the launcher) so a launcher death cannot
+ * strand a dead-PID lock. The same path is used by foreground advance, so
+ * dual-entry races are closed (#634).
  *
  * Returns the run-directory path (for the caller to print) and the wrapper PID.
  */
 export async function spawnDetached(
   issueNumber: number,
   pipelineArgs: string[],
-  opts: SpawnDetachedOpts = {},
+  opts: SpawnDetachedOpts,
   deps: SpawnDetachedDeps = defaultSpawnDeps,
 ): Promise<SpawnDetachedResult> {
+  const domain = opts.domain?.trim();
+  if (!domain) {
+    throw new Error("pipeline: spawnDetached requires a non-empty domain for the issue-run lock");
+  }
   const { timeout, flockTimeoutMs = 5000 } = opts;
   const home = deps.homedir();
 
-  // The wrapper (not the launcher) acquires the per-issue lock — see the
-  // lock-ownership handshake note above. We keep `lp` only for diagnostics.
-  const lp = lockFilePath(home, issueNumber);
+  // Shared issue-run lock path (diagnostics only here — wrapper acquires it).
+  const lp = lockFilePath(domain, issueNumber);
 
   // Create a collision-proof run directory: millisecond-precision timestamp +
   // PID so two launches within the same second (or same millisecond on fast
@@ -390,7 +424,7 @@ export async function spawnDetached(
     .slice(0, 23)         // include milliseconds: YYYY-MM-DDTHH-mm-ss-mmm
     .replace("T", "_")
     + `-p${deps.pid()}`;  // add PID to prevent same-ms collisions
-  const rd = makeRunDir(home, issueNumber, ts);
+  const rd = makeRunDir(home, domain, issueNumber, ts);
   fs.mkdirSync(rd, { recursive: true });
   if (fs.existsSync(path.join(rd, "sentinel.json"))) {
     throw new Error(
@@ -411,6 +445,8 @@ export async function spawnDetached(
     rd,
     "--issue",
     String(issueNumber),
+    "--domain",
+    domain,
     "--flock-timeout",
     String(flockTimeoutMs),
     ...(timeout !== undefined ? ["--timeout", String(timeout)] : []),
@@ -431,8 +467,8 @@ export async function spawnDetached(
   // Wait for the wrapper to acquire the lock and signal readiness before we
   // report the run started. The wrapper owns the lock for its whole life, so the
   // lock file always names a live PID (no parent-death transfer race). A
-  // concurrent launch for the same issue loses the wrapper's atomic acquire and
-  // reports failure here — preserving the "concurrent launch rejected" contract.
+  // concurrent launch for the same domain+issue loses the wrapper's atomic
+  // acquire and reports failure here.
   const handshake = await deps.awaitLockHandshake(rd, flockTimeoutMs + 2000);
   if (!handshake.acquired) {
     try {
@@ -456,11 +492,12 @@ export async function spawnDetached(
 // ---------------------------------------------------------------------------
 
 export async function runWrapper(argv: string[]): Promise<void> {
-  // Parse: _wrapper --run-dir <dir> --issue <N> [--timeout <s>] [--flock-timeout <ms>]
-  //        [--lock-pre-acquired] [-- args...]
+  // Parse: _wrapper --run-dir <dir> --issue <N> --domain <d> [--timeout <s>]
+  //        [--flock-timeout <ms>] [-- args...]
   const args = argv.slice(1); // skip '_wrapper'
   let runDirPath = "";
   let issueNumber = 0;
+  let domain = "";
   let timeout: number | undefined;
   let flockTimeoutMs = 5000;
   const pipelinePassArgs: string[] = [];
@@ -476,6 +513,8 @@ export async function runWrapper(argv: string[]): Promise<void> {
       runDirPath = args[++i];
     } else if (a === "--issue") {
       issueNumber = Number(args[++i]);
+    } else if (a === "--domain") {
+      domain = String(args[++i] ?? "").trim();
     } else if (a === "--timeout") {
       timeout = Number(args[++i]);
     } else if (a === "--flock-timeout") {
@@ -484,16 +523,19 @@ export async function runWrapper(argv: string[]): Promise<void> {
     i++;
   }
 
-  if (!runDirPath || !issueNumber) {
-    process.stderr.write("detach wrapper: missing --run-dir or --issue\n");
+  if (!runDirPath || !issueNumber || !domain) {
+    process.stderr.write("detach wrapper: missing --run-dir, --issue, or --domain\n");
     process.exit(1);
   }
 
-  const home = os.homedir();
-  const lp = lockFilePath(home, issueNumber);
+  // Shared issue-run lock (same path as foreground advance).
+  const issueLock = new PipelineLock({ domain, issueNumber });
+  const lp = issueLock.path;
   const startMs = Date.now();
   let sentinelWritten = false;
+  let shuttingDown = false;
   let innerProcess: ReturnType<typeof spawn> | undefined;
+  let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
 
   function doWriteSentinel(exitCode: number, timedOut?: true): void {
     if (sentinelWritten) return;
@@ -510,13 +552,44 @@ export async function runWrapper(argv: string[]): Promise<void> {
     }
   }
 
-  // Acquire the per-issue lock FIRST — before registering exit handlers and before
-  // any work — and signal the launcher via a handshake file. The wrapper owns the
-  // lock for its whole life, so the lock file always names a live PID; a launcher
-  // death cannot strand it (#153). Acquiring before the 'exit' handler is registered
-  // means a concurrent-rejection exit writes no sentinel (the run never started).
+  function releaseLock(): void {
+    issueLock.release();
+  }
+
+  /**
+   * Abnormal paths (SIGTERM / watchdog / uncaughtException): write sentinel,
+   * await confirmed child/tree termination, THEN exit so the 'exit' handler
+   * releases the issue-run lock only after the inner work is gone (#634 r2).
+   * Never release the lock before children are terminated — a concurrent
+   * advance/detach would otherwise overlap a still-running inner pipeline.
+   */
+  async function beginAbnormalShutdown(exitCode: number, timedOut?: true): Promise<void> {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (watchdogTimer !== undefined) {
+      clearTimeout(watchdogTimer);
+      watchdogTimer = undefined;
+    }
+    doWriteSentinel(exitCode, timedOut);
+    try {
+      await terminateWrapperChildren({
+        inner: innerProcess,
+        wrapperPid: process.pid,
+      });
+    } catch {
+      /* best-effort — still exit so the lock is released via 'exit' after attempt */
+    }
+    // Lock release happens in process.on('exit') — only after this point.
+    process.exit(exitCode === -1 ? 1 : exitCode);
+  }
+
+  // Acquire the shared issue-run lock FIRST — before registering exit handlers
+  // and before any work — and signal the launcher via a handshake file. The
+  // wrapper owns the lock for its whole life (#153 / #634). Acquiring before
+  // the 'exit' handler is registered means a concurrent-rejection exit writes
+  // no sentinel (the run never started).
   try {
-    await acquireLock(lp, issueNumber, flockTimeoutMs);
+    await issueLock.acquireWithTimeout(flockTimeoutMs);
   } catch (err) {
     let holder = "";
     try {
@@ -539,54 +612,51 @@ export async function runWrapper(argv: string[]): Promise<void> {
     /* best-effort handshake — the launcher's wait will time out and clean up */
   }
 
-  // 'exit' fires on process.exit() but NOT on SIGKILL. SIGTERM is handled below.
+  // 'exit' fires on process.exit() but NOT on SIGKILL. SIGTERM/watchdog go
+  // through beginAbnormalShutdown (await children → process.exit → here).
   process.on("exit", (code) => {
     doWriteSentinel(code ?? 1);
-    removeStaleLock(lp);
+    releaseLock();
   });
 
   process.on("uncaughtException", (err) => {
     process.stderr.write(`detach wrapper: uncaught exception: ${err}\n`);
-    doWriteSentinel(1);
-    removeStaleLock(lp);
-    process.exit(1);
+    void beginAbnormalShutdown(1);
   });
 
   process.on("SIGTERM", () => {
-    if (innerProcess) innerProcess.kill("SIGTERM");
-    doWriteSentinel(143);
-    removeStaleLock(lp);
-    process.exit(143);
+    void beginAbnormalShutdown(143);
   });
 
-  // Watchdog timer.
-  let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
+  // Watchdog timer — terminate children and await exit before lock release.
   if (timeout !== undefined) {
     watchdogTimer = setTimeout(() => {
-      // Write sentinel BEFORE sending SIGKILL (SIGKILL cannot be caught).
-      doWriteSentinel(-1, true);
-      removeStaleLock(lp);
-      // Kill the entire process TREE, not just the wrapper's own group: pipeline
-      // steps spawn shell/setup/harness work in their own process groups, which a
-      // bare `kill(-process.pid)` would leave running after the timeout sentinel.
-      killProcessTree(process.pid, "SIGKILL");
-      process.exit(-1);
+      void beginAbnormalShutdown(-1, true);
     }, timeout * 1000);
     // Don't keep the event loop alive solely for the watchdog.
     watchdogTimer.unref();
   }
 
-  // Spawn the inner pipeline run.
+  // Spawn the inner pipeline run. Mark the issue-run lock as held by this
+  // wrapper so the child's withLock skips re-acquire (#634 dual-entry share).
   const pipelineTs = fileURLToPath(new URL("./pipeline.ts", import.meta.url));
   const innerArgs = [
     "--experimental-strip-types",
     pipelineTs,
     String(issueNumber),
-    ...pipelinePassArgs,
+    // Ensure domain reaches the inner process even if the launcher omitted
+    // --domain from pipelinePassArgs (we always have it for the lock).
+    ...(pipelinePassArgs.includes("--domain")
+      ? pipelinePassArgs
+      : ["--domain", domain, ...pipelinePassArgs]),
   ];
 
   innerProcess = spawn(process.execPath, innerArgs, {
     stdio: ["ignore", "inherit", "inherit"],
+    env: {
+      ...process.env,
+      [ISSUE_RUN_LOCK_HELD_ENV]: issueRunLockHeldToken(domain, issueNumber),
+    },
   });
 
   const exitCode = await new Promise<number>((resolve) => {
@@ -595,6 +665,9 @@ export async function runWrapper(argv: string[]): Promise<void> {
   });
 
   if (watchdogTimer !== undefined) clearTimeout(watchdogTimer);
+  // If SIGTERM/watchdog already owns shutdown, do not race process.exit — that
+  // path awaits tree termination before the shared exit-handler lock release.
+  if (shuttingDown) return;
 
   // process.on('exit') writes the sentinel via doWriteSentinel(exitCode).
   process.exit(exitCode);

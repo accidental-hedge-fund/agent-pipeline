@@ -24,8 +24,12 @@ import {
   parseProcTable,
   descendantProcessGroups,
   killProcessTree,
+  killDescendantGroupsOnly,
+  waitForChildClose,
+  terminateWrapperChildren,
   type SpawnDetachedDeps,
   type SentinelData,
+  type WaitableChild,
 } from "../scripts/detach.ts";
 import { buildCmd, handleRunSubcommand, type RunSubcommandDeps } from "../scripts/pipeline.ts";
 import type { CliOpts } from "../scripts/pipeline.ts";
@@ -77,23 +81,40 @@ function makeTestDeps(homeDir: string) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Path helpers
+// 1. Path helpers (#634 domain-scoped)
 // ---------------------------------------------------------------------------
 
-test("issueRunsDir: returns ~/.pipeline/runs/<issue>", () => {
-  assert.equal(issueRunsDir("/home/alice", 42), "/home/alice/.pipeline/runs/42");
+const TEST_DOMAIN = "agent-pipeline";
+
+test("issueRunsDir: returns ~/.pipeline/runs/<domain>/<issue>", () => {
+  assert.equal(
+    issueRunsDir("/home/alice", "repo-a", 42),
+    "/home/alice/.pipeline/runs/repo-a/42",
+  );
 });
 
-test("lockFilePath: is inside issueRunsDir", () => {
-  const lp = lockFilePath("/home/alice", 42);
-  assert.equal(lp, "/home/alice/.pipeline/runs/42/.lock");
-  assert.ok(lp.startsWith(issueRunsDir("/home/alice", 42)));
+test("issueRunsDir: same issue under different domains do not collide", () => {
+  const a = issueRunsDir("/home/alice", "repo-a", 42);
+  const b = issueRunsDir("/home/alice", "repo-b", 42);
+  assert.notEqual(a, b);
+  assert.ok(a.includes("repo-a"));
+  assert.ok(b.includes("repo-b"));
 });
 
-test("makeRunDir: is inside issueRunsDir with timestamp", () => {
-  const rd = makeRunDir("/home/alice", 42, "2024-01-01_00-00-00");
-  assert.equal(rd, "/home/alice/.pipeline/runs/42/2024-01-01_00-00-00");
-  assert.ok(rd.startsWith(issueRunsDir("/home/alice", 42)));
+test("lockFilePath: is shared issue-run path (domain+issue under /tmp), never issue-only", () => {
+  const lp = lockFilePath("repo-a", 42);
+  assert.equal(lp, "/tmp/pipeline-repo-a-42.lock");
+  assert.ok(lp.includes("repo-a"));
+  assert.ok(lp.includes("42"));
+  // Must not be the old issue-only home path
+  assert.ok(!lp.includes(".pipeline/runs/42"));
+  assert.notEqual(lp, lockFilePath("repo-b", 42));
+});
+
+test("makeRunDir: is inside domain-scoped issueRunsDir with timestamp", () => {
+  const rd = makeRunDir("/home/alice", "repo-a", 42, "2024-01-01_00-00-00");
+  assert.equal(rd, "/home/alice/.pipeline/runs/repo-a/42/2024-01-01_00-00-00");
+  assert.ok(rd.startsWith(issueRunsDir("/home/alice", "repo-a", 42)));
 });
 
 // ---------------------------------------------------------------------------
@@ -164,7 +185,7 @@ test("spawnDetached: calls spawn with detached:true", async () => {
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    await spawnDetached(7, [], {}, deps);
+    await spawnDetached(7, [], { domain: TEST_DOMAIN }, deps);
     assert.equal(deps.calls.length, 1);
     assert.equal(deps.calls[0].opts["detached"], true);
   } finally {
@@ -176,7 +197,7 @@ test("spawnDetached: stdio[0] is 'ignore'", async () => {
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    await spawnDetached(7, [], {}, deps);
+    await spawnDetached(7, [], { domain: TEST_DOMAIN }, deps);
     const stdio = deps.calls[0].opts["stdio"] as unknown[];
     assert.equal(stdio[0], "ignore");
   } finally {
@@ -188,7 +209,7 @@ test("spawnDetached: stdio[1] and stdio[2] are file descriptors (numbers)", asyn
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    await spawnDetached(7, [], {}, deps);
+    await spawnDetached(7, [], { domain: TEST_DOMAIN }, deps);
     const stdio = deps.calls[0].opts["stdio"] as unknown[];
     assert.equal(typeof stdio[1], "number");
     assert.equal(typeof stdio[2], "number");
@@ -202,7 +223,7 @@ test("spawnDetached: creates the run directory", async () => {
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    const result = await spawnDetached(7, [], {}, deps);
+    const result = await spawnDetached(7, [], { domain: TEST_DOMAIN }, deps);
     assert.ok(fs.existsSync(result.runDir), `run dir missing: ${result.runDir}`);
   } finally {
     cleanup(home);
@@ -213,8 +234,8 @@ test("spawnDetached: run dir is inside issueRunsDir", async () => {
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    const result = await spawnDetached(7, [], {}, deps);
-    assert.ok(result.runDir.startsWith(issueRunsDir(home, 7)));
+    const result = await spawnDetached(7, [], { domain: TEST_DOMAIN }, deps);
+    assert.ok(result.runDir.startsWith(issueRunsDir(home, TEST_DOMAIN, 7)));
   } finally {
     cleanup(home);
   }
@@ -224,7 +245,7 @@ test("spawnDetached: returns the child PID", async () => {
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    const result = await spawnDetached(7, [], {}, deps);
+    const result = await spawnDetached(7, [], { domain: TEST_DOMAIN }, deps);
     assert.equal(typeof result.pid, "number");
     assert.ok(result.pid > 0);
   } finally {
@@ -232,15 +253,17 @@ test("spawnDetached: returns the child PID", async () => {
   }
 });
 
-test("spawnDetached: wrapper argv includes --issue, --run-dir, _wrapper", async () => {
+test("spawnDetached: wrapper argv includes --issue, --domain, --run-dir, _wrapper", async () => {
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    await spawnDetached(42, [], {}, deps);
+    await spawnDetached(42, [], { domain: TEST_DOMAIN }, deps);
     const args = deps.calls[0].args;
     assert.ok(args.includes("_wrapper"), "missing _wrapper token");
     assert.ok(args.includes("--issue"), "missing --issue flag");
     assert.ok(args.includes("42"), "missing issue number");
+    assert.ok(args.includes("--domain"), "missing --domain flag");
+    assert.ok(args.includes(TEST_DOMAIN), "missing domain value");
     assert.ok(args.includes("--run-dir"), "missing --run-dir flag");
   } finally {
     cleanup(home);
@@ -251,7 +274,7 @@ test("spawnDetached: --timeout forwarded when provided", async () => {
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    await spawnDetached(42, [], { timeout: 300 }, deps);
+    await spawnDetached(42, [], { domain: TEST_DOMAIN, timeout: 300 }, deps);
     const args = deps.calls[0].args;
     assert.ok(args.includes("--timeout"), "missing --timeout");
     assert.ok(args.includes("300"), "missing timeout value");
@@ -264,7 +287,7 @@ test("spawnDetached: no --timeout in wrapper args when not provided", async () =
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    await spawnDetached(42, [], {}, deps);
+    await spawnDetached(42, [], { domain: TEST_DOMAIN }, deps);
     const args = deps.calls[0].args;
     assert.ok(!args.includes("--timeout"), "unexpected --timeout");
   } finally {
@@ -276,7 +299,7 @@ test("spawnDetached: flock-timeout forwarded with custom value", async () => {
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    await spawnDetached(42, [], { flockTimeoutMs: 8000 }, deps);
+    await spawnDetached(42, [], { domain: TEST_DOMAIN, flockTimeoutMs: 8000 }, deps);
     const args = deps.calls[0].args;
     assert.ok(args.includes("--flock-timeout"), "missing --flock-timeout");
     assert.ok(args.includes("8000"), "missing flock-timeout value");
@@ -289,7 +312,7 @@ test("spawnDetached: creates pipeline.log file in run dir", async () => {
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    const result = await spawnDetached(7, [], {}, deps);
+    const result = await spawnDetached(7, [], { domain: TEST_DOMAIN }, deps);
     const logPath = path.join(result.runDir, "pipeline.log");
     assert.ok(fs.existsSync(logPath), `log file missing: ${logPath}`);
   } finally {
@@ -376,7 +399,7 @@ test("spawnDetached: wrapper argv does NOT include --lock-pre-acquired (wrapper 
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    await spawnDetached(42, [], {}, deps);
+    await spawnDetached(42, [], { domain: TEST_DOMAIN }, deps);
     const args = deps.calls[0].args;
     assert.ok(!args.includes("--lock-pre-acquired"), "launcher must not pre-acquire/transfer the lock");
   } finally {
@@ -388,9 +411,9 @@ test("spawnDetached: does not create the lock file itself (wrapper owns the lock
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    await spawnDetached(42, [], {}, deps);
+    await spawnDetached(42, [], { domain: TEST_DOMAIN }, deps);
     // The launcher no longer writes the per-issue lock; the wrapper does.
-    assert.ok(!fs.existsSync(lockFilePath(home, 42)), "launcher must not write the lock file");
+    assert.ok(!fs.existsSync(lockFilePath(TEST_DOMAIN, 42)), "launcher must not write the lock file");
   } finally {
     cleanup(home);
   }
@@ -401,7 +424,7 @@ test("spawnDetached: rejects when the wrapper reports the lock is already held (
   try {
     const deps = { ...makeTestDeps(home), awaitLockHandshake: async () => ({ acquired: false, holder: "4321" }) };
     await assert.rejects(
-      () => spawnDetached(42, [], {}, deps),
+      () => spawnDetached(42, [], { domain: TEST_DOMAIN }, deps),
       /already running \(held by PID 4321\)/,
     );
   } finally {
@@ -421,7 +444,7 @@ test("spawnDetached: waits for the handshake in the child's run dir", async () =
         return { acquired: true };
       },
     };
-    const result = await spawnDetached(42, [], {}, deps);
+    const result = await spawnDetached(42, [], { domain: TEST_DOMAIN }, deps);
     assert.equal(seenRunDir, result.runDir, "launcher must wait on the spawned run dir's handshake");
   } finally {
     cleanup(home);
@@ -730,7 +753,7 @@ test("spawnDetached: run dir name includes milliseconds and PID suffix", async (
   const home = makeTmpDir();
   try {
     const deps = makeTestDeps(home);
-    const result = await spawnDetached(7, [], {}, deps);
+    const result = await spawnDetached(7, [], { domain: TEST_DOMAIN }, deps);
     const dirName = path.basename(result.runDir);
     // Millisecond precision: format is YYYY-MM-DD_HH-mm-ss-mmm-p<pid>
     assert.match(dirName, /-p\d+$/, "run dir must end with -p<pid>");
@@ -746,12 +769,12 @@ test("spawnDetached: throws when run dir already has sentinel.json (collision gu
   try {
     const deps = makeTestDeps(home);
     // First call succeeds and creates the run dir.
-    const result = await spawnDetached(7, [], {}, deps);
+    const result = await spawnDetached(7, [], { domain: TEST_DOMAIN }, deps);
     // Place a sentinel.json into that run dir to simulate a prior run.
     fs.writeFileSync(path.join(result.runDir, "sentinel.json"), JSON.stringify({ exitCode: 0 }));
     // Second call with the same deps (same timestamp + same pid) must throw.
     await assert.rejects(
-      () => spawnDetached(7, [], {}, deps),
+      () => spawnDetached(7, [], { domain: TEST_DOMAIN }, deps),
       /collision|sentinel/i,
     );
   } finally {
@@ -808,6 +831,139 @@ test("killProcessTree: falls back to the root group when the ps snapshot is empt
   const killed: number[] = [];
   killProcessTree(777, "SIGKILL", { snapshot: () => "", killGroup: (pgid) => killed.push(pgid) });
   assert.deepEqual(killed, [777], "empty snapshot must still terminate the wrapper group");
+});
+
+// ---------------------------------------------------------------------------
+// #634 review-2 (bf44d249): abnormal shutdown must NOT release the issue-run
+// lock until the inner process (and detached descendant groups) have exited.
+// ---------------------------------------------------------------------------
+
+test("killDescendantGroupsOnly: never signals the wrapper's own group", () => {
+  // wrapper(100,pgid100) → inner(200,pgid100) → detached(300,pgid300)
+  const table = " 100 1 100\n 200 100 100\n 300 200 300\n";
+  const killed: number[] = [];
+  const groups = killDescendantGroupsOnly(100, "SIGKILL", {
+    snapshot: () => table,
+    killGroup: (pgid) => killed.push(pgid),
+  });
+  assert.deepEqual(groups, [300]);
+  assert.deepEqual(killed, [300], "wrapper group 100 must not be killed (exit handlers need to run)");
+});
+
+test("waitForChildClose: resolves true when child already has exitCode", async () => {
+  const child: WaitableChild = {
+    exitCode: 0,
+    on() {
+      throw new Error("must not subscribe when already exited");
+    },
+  };
+  assert.equal(await waitForChildClose(child, 1000), true);
+});
+
+test("waitForChildClose: resolves false on timeout when close never fires", async () => {
+  const child: WaitableChild = {
+    on() {
+      /* never emits */
+    },
+  };
+  assert.equal(await waitForChildClose(child, 20), false);
+});
+
+test("waitForChildClose: resolves true when close fires before timeout", async () => {
+  const listeners: Array<(...args: unknown[]) => void> = [];
+  const child: WaitableChild = {
+    on(event, cb) {
+      if (event === "close") listeners.push(cb);
+    },
+  };
+  const p = waitForChildClose(child, 1000);
+  for (const cb of listeners) cb(0);
+  assert.equal(await p, true);
+});
+
+test("#634 r2: terminateWrapperChildren awaits inner exit before returning (lock may only release after)", async () => {
+  const events: string[] = [];
+  const child: WaitableChild = {
+    pid: 200,
+    on() {
+      /* close handled via injected waitForClose */
+    },
+    kill() {
+      return true;
+    },
+  };
+
+  const result = await terminateWrapperChildren(
+    { inner: child, wrapperPid: 100, graceMs: 500, hardWaitMs: 100 },
+    {
+      killInner: (_c, signal) => {
+        events.push(`kill-inner:${signal}`);
+      },
+      killDescendants: (_root, signal) => {
+        events.push(`kill-desc:${signal}`);
+        return [300];
+      },
+      waitForClose: async () => {
+        events.push("await-close-start");
+        // Child exit observed only after signals were delivered.
+        events.push("child-close");
+        return true;
+      },
+      sleep: async () => {
+        events.push("sleep");
+      },
+    },
+  );
+
+  assert.equal(result, "confirmed");
+  // Signal first, then await; return only after close observed. No lock release here.
+  assert.deepEqual(events, [
+    "kill-inner:SIGTERM",
+    "kill-desc:SIGTERM",
+    "await-close-start",
+    "child-close",
+    "kill-desc:SIGKILL", // detached groups that may outlive the inner process
+  ]);
+});
+
+test("#634 r2: terminateWrapperChildren escalates to SIGKILL when grace elapses", async () => {
+  const signals: string[] = [];
+  let waitCount = 0;
+  const child: WaitableChild = {
+    on() {
+      /* never closes on its own */
+    },
+    kill() {
+      return true;
+    },
+  };
+
+  const result = await terminateWrapperChildren(
+    { inner: child, wrapperPid: 1, graceMs: 15, hardWaitMs: 15 },
+    {
+      killInner: (_c, signal) => {
+        signals.push(`inner:${signal}`);
+      },
+      killDescendants: (_r, signal) => {
+        signals.push(`desc:${signal}`);
+        return [];
+      },
+      waitForClose: async () => {
+        waitCount += 1;
+        // First wait (grace) fails; second (hard, after SIGKILL) succeeds.
+        return waitCount >= 2;
+      },
+      sleep: async () => {},
+    },
+  );
+
+  assert.equal(result, "confirmed");
+  assert.deepEqual(signals, [
+    "inner:SIGTERM",
+    "desc:SIGTERM",
+    "inner:SIGKILL",
+    "desc:SIGKILL",
+  ]);
 });
 
 // #156 review-2: a malformed detached run must be rejected before it starts.

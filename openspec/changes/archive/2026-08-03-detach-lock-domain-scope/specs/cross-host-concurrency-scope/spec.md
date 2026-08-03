@@ -1,8 +1,5 @@
-# cross-host-concurrency-scope Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change cross-host-auto-file-serialization. Update Purpose after archive.
-## Requirements
 ### Requirement: The engine SHALL declare single-host operation as the supported concurrency scope for its host-local locks
 
 The engine SHALL document, in its project-level operating guidance, that its host-local PID
@@ -55,4 +52,3 @@ domain+issue key on a single host does **not** expand the lock to cross-host sco
 - **THEN** no new coordination service or auto-merge path SHALL be introduced for these sites
 - **AND** same-host domain+issue mutual exclusion for the issue-run lock SHALL remain in force
   (cross-host scope is separate from same-host multi-repo correctness)
-

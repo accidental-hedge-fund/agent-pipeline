@@ -2074,12 +2074,13 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     executeRecovery: realExecuteRecovery(cfg),
     recoverySleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     getChangedFiles: realGetChangedFiles(cfg),
-    // Host-local live-advance probe scope (#770): run-store discovery + domain
-    // + production wrapper/process identity under ~/.pipeline/runs/<issue>
-    // (#770 review 2 finding 956d20df).
+    // Host-local live-advance probe scope (#770 / #634): run-store discovery +
+    // domain-scoped issue-run lock + wrapper identity under
+    // ~/.pipeline/runs/<domain>/<issue> (#770 review 2 finding 956d20df).
     repoDir: cfg.repo_dir,
     lockDomain: cfg.domain,
-    findWrapperPid: (issueNumber) => findWrapperPidForIssue(issueNumber),
+    findWrapperPid: (issueNumber) =>
+      findWrapperPidForIssue(issueNumber, { domain: cfg.domain }),
     // Recovery coexistence guard: the supervisor takes this same per-issue
     // advance lock (the one every `pipeline run` / override advance serializes
     // through) non-blocking and holds it across a recovery execution, so a
@@ -5048,6 +5049,16 @@ export async function handleRunSubcommand(
       return;
     }
 
+    // Domain identity for the shared issue-run lock (#634): same derivation as
+    // resolveConfig (explicit --domain, else basename of the resolved repo root).
+    // Must be known before any lock or wrapper run-dir is created.
+    const domain = (opts.domain?.trim() || path.basename(repoDir));
+    if (!domain) {
+      console.error(`pipeline: could not derive domain for detached run of #${number}`);
+      process.exitCode = 2;
+      return;
+    }
+
     // Pre-allocate the #155 run-store run id here so the detached caller is given the
     // SAME `.agent-pipeline/runs/<run-id>` the inner run will use. Without this the
     // detached launch exposed only the wrapper dir (pipeline.log/sentinel.json), and a
@@ -5062,7 +5073,8 @@ export async function handleRunSubcommand(
     if (opts.profile) passArgs.push("--profile", opts.profile);
     if (opts.repoPath) passArgs.push("--repo-path", opts.repoPath);
     if (opts.base) passArgs.push("--base", opts.base);
-    if (opts.domain) passArgs.push("--domain", opts.domain);
+    // Always forward domain so the inner process matches the lock key we used.
+    passArgs.push("--domain", domain);
     if (opts.model) passArgs.push("--model", opts.model);
     // Forward lifecycle / no-write semantics too. Omitting these silently broke
     // the contract for the highest-risk mode: `pipeline run <N> --detach --dry-run`
@@ -5082,6 +5094,7 @@ export async function handleRunSubcommand(
     let result: Awaited<ReturnType<typeof spawnDetached>>;
     try {
       result = await deps.spawnDetached(number, passArgs, {
+        domain,
         timeout: opts.timeout,
         flockTimeoutMs: opts.flockTimeout,
       });
