@@ -191,12 +191,16 @@ export interface HarnessTelemetry {
 }
 
 /** Thin, injectable I/O seam for preflight checks — the same shape as
- *  `DoctorDeps`'s `exec`/`execCheck` members, so `doctor.ts` can pass its own
- *  deps straight through without adaptation. No real subprocess/network call
- *  in tests; fakes only. */
+ *  `DoctorDeps`'s `exec`/`execCheck`/`fsExists` members, so `doctor.ts` can
+ *  pass its own deps straight through without adaptation. No real
+ *  subprocess/network call in tests; fakes only. */
 export interface AdapterPreflightDeps {
   exec(file: string, args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }>;
   execCheck(file: string, args: string[]): Promise<boolean>;
+  /** Path existence for absolute/relative path-like CLI commands. Optional so
+   *  existing fakes keep working; path-like readiness checks fail closed when
+   *  absent and other presence probes fail. Matches `DoctorDeps.fsExists`. */
+  fsExists?(p: string): Promise<boolean>;
 }
 
 /** Distinguishable preflight failure classes (design.md decision 7). */

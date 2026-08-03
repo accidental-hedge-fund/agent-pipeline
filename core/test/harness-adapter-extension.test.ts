@@ -28,10 +28,11 @@ import { buildAdapterDeclaration } from "../scripts/harness-adapters/types.ts";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixtureDir = path.join(here, "fixtures", "adapter-extension");
 
-function fakeDeps(present = true): AdapterPreflightDeps {
+function fakeDeps(present = true, pathExists = present): AdapterPreflightDeps {
   return {
     exec: async () => ({ ok: present, stdout: present ? "ok" : "", stderr: "" }),
     execCheck: async () => present,
+    fsExists: async () => pathExists,
   };
 }
 
@@ -171,6 +172,108 @@ test("compatibility adapter: missing CLI fails with public vocabulary", async ()
   assert.equal(res.ok, false);
   assert.equal(res.failure, "missing-cli");
   assert.match(res.message ?? "", /definitely-missing-cli-xyz/);
+});
+
+test("compatibility adapter: object-form model and effort are accepted, not refused", async () => {
+  const compat = materializeCompatibilityAdapter("my-reviewer", { promptDelivery: "stdin" });
+  assert.equal(compat.capabilities.model, true);
+  assert.equal(compat.capabilities.effort, true);
+  assert.equal(compat.declaration.model.supported, true);
+  assert.equal(compat.declaration.effort.supported, true);
+  assert.equal(compat.declaration.model.validation, "open");
+  assert.equal(compat.declaration.effort.validation, "open");
+
+  const pre = await compat.preflight(fakeDeps(true), {
+    model: "auto",
+    effort: "high",
+  });
+  assert.equal(pre.ok, true, `expected accept model/effort, got ${JSON.stringify(pre)}`);
+
+  const inv = compat.buildInvocation({
+    prompt: "PROMPT",
+    worktreeDir: "/tmp/wt",
+    model: "auto",
+    effort: "high",
+  });
+  // Legacy unconstrained spawn: no invented --model/--effort flags.
+  assert.equal(inv.promptDelivery, "stdin");
+  assert.deepEqual(inv.args, []);
+  assert.equal(inv.stdinPayload, "PROMPT");
+
+  const treatment = compat.describeTreatment(
+    { model: "auto", effort: "high" },
+    inv,
+    { cliVersion: null, providerAuthClass: "unknown", resolvedModel: null },
+  );
+  assert.equal(treatment.requestedModel, "auto");
+  assert.equal(treatment.requestedEffort, "high");
+  assert.equal(treatment.resolvedModel, null);
+  assert.deepEqual(treatment.nativeFlags, []);
+});
+
+test("compatibility adapter: sandbox remains unsupported", async () => {
+  const compat = materializeCompatibilityAdapter("my-reviewer");
+  const pre = await compat.preflight(fakeDeps(true), { sandbox: true });
+  assert.equal(pre.ok, false);
+  assert.equal(pre.failure, "unsupported-setting");
+});
+
+test("compatibility adapter: missing path-like CLI fails closed (not ready)", async () => {
+  const pathCmd = "/nonexistent/path/to/custom-reviewer";
+  const compat = materializeCompatibilityAdapter(pathCmd);
+  const absent: AdapterPreflightDeps = {
+    exec: async () => ({ ok: false, stdout: "", stderr: "not found" }),
+    execCheck: async () => false,
+    fsExists: async () => false,
+  };
+  const pre = await compat.preflight(absent, {});
+  assert.equal(pre.ok, false, "path-like missing CLI must not report ready");
+  assert.equal(pre.failure, "missing-cli");
+  assert.match(pre.message ?? "", /custom-reviewer|not found|path/i);
+
+  const smoke = await compat.runtimeSmoke(absent);
+  assert.equal(smoke.ok, false);
+  assert.equal(smoke.failure, "missing-cli");
+});
+
+test("compatibility adapter: path-like CLI ready when fsExists reports present", async () => {
+  const pathCmd = "/opt/tools/my-reviewer";
+  const compat = materializeCompatibilityAdapter(pathCmd);
+  const present: AdapterPreflightDeps = {
+    exec: async () => ({ ok: false, stdout: "", stderr: "" }),
+    execCheck: async () => false, // which and --help/--version all fail
+    fsExists: async (p) => p === pathCmd,
+  };
+  const pre = await compat.preflight(present, { model: "auto", effort: "high" });
+  assert.equal(pre.ok, true, JSON.stringify(pre));
+  const smoke = await compat.runtimeSmoke(present);
+  assert.equal(smoke.ok, true);
+});
+
+test("conformance kit: covers supported settings, envelope normalize, failure classes", async () => {
+  _resetRegistryForTests();
+  for (const adapter of allAdapters()) {
+    if (adapter.declaration.origin !== "builtin") continue;
+    const report = await runConformanceKit(adapter, fakeDeps(true));
+    assert.equal(
+      report.ok,
+      true,
+      `${adapter.name} expanded kit failures: ${JSON.stringify(report.failures, null, 2)}`,
+    );
+    // Kit must exercise failure-classification and output-normalization checks
+    // (report.ok alone is insufficient if those checks were never added).
+    assert.ok(
+      report.failures.length === 0,
+    );
+  }
+  // Compatibility adapter also passes the public kit.
+  const compat = materializeCompatibilityAdapter("kit-custom-reviewer");
+  const compatReport = await runConformanceKit(compat, fakeDeps(true));
+  assert.equal(
+    compatReport.ok,
+    true,
+    `compatibility kit failures: ${JSON.stringify(compatReport.failures, null, 2)}`,
+  );
 });
 
 test("identity: extension treatment does not invent provider or resolved model", () => {

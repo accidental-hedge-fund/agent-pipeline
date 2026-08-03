@@ -29,10 +29,49 @@ export interface CompatibilityAdapterOptions {
   promptDelivery?: "argv" | "stdin";
 }
 
+/** True when the command looks like a filesystem path rather than a PATH name. */
+function isPathLikeCommand(command: string): boolean {
+  return command.includes("/") || command.startsWith(".");
+}
+
+/**
+ * Presence probe for a custom reviewer command. PATH names use `which` +
+ * version/help probes. Path-like commands (absolute or relative) also consult
+ * the injectable `fsExists` seam and never report ready solely because the
+ * string contains a slash.
+ */
+async function isCommandPresent(
+  deps: AdapterPreflightDeps,
+  command: string,
+): Promise<boolean> {
+  if (await deps.execCheck("which", [command])) return true;
+
+  if (isPathLikeCommand(command)) {
+    if (typeof deps.fsExists === "function") {
+      if (await deps.fsExists(command)) return true;
+    }
+    // Direct probes: a real path may answer --version/--help; absence of both
+    // and of fsExists must fail closed (not "ready").
+    if (await deps.execCheck(command, ["--version"]).catch(() => false)) return true;
+    if (await deps.execCheck(command, ["--help"]).catch(() => false)) return true;
+    return false;
+  }
+
+  return (
+    (await deps.execCheck(command, ["--version"])) ||
+    (await deps.execCheck(command, ["--help"]))
+  );
+}
+
 /**
  * Materialize a thin public-contract adapter for an unregistered reviewer CLI.
  * Does NOT register into the runtime registry — full package registration for
  * the same ID remains authoritative when present.
+ *
+ * Model and effort follow the legacy object-form `review_harness` treatment:
+ * values are accepted (open) and recorded on treatment identity, not refused.
+ * Unconstrained CLIs have no standard flag vocabulary, so buildInvocation does
+ * not invent `--model` / `--effort` argv; sandbox remains unsupported.
  */
 export function materializeCompatibilityAdapter(
   command: string,
@@ -42,9 +81,11 @@ export function materializeCompatibilityAdapter(
     throw new Error("materializeCompatibilityAdapter: command must be a non-empty string");
   }
   const promptDelivery: PromptDeliveryChannel = opts.promptDelivery === "stdin" ? "stdin" : "argv";
+  // Open model/effort: retain configured review_harness object-form settings
+  // without inventing a closed catalog or refusing at preflight (#783 review).
   const capabilities = {
-    model: false,
-    effort: false,
+    model: true,
+    effort: true,
     sandbox: false,
     workingDir: "cwd" as const,
     telemetry: "none" as const,
@@ -52,14 +93,23 @@ export function materializeCompatibilityAdapter(
   const declaration = buildAdapterDeclaration({
     roles: ["reviewer"],
     command,
+    executableResolution: isPathLikeCommand(command) ? "absolute" : "path",
     capabilities,
     promptDelivery,
-    modelValidation: "unsupported",
-    effortValidation: "unsupported",
+    modelValidation: "open",
+    effortValidation: "open",
     outputEnvelope: "passthrough",
     authProbe: "none",
     versionProbe: "none",
     origin: "compatibility",
+  });
+
+  const missingCli = (): AdapterPreflightResult => ({
+    ok: false,
+    failure: "missing-cli",
+    message: isPathLikeCommand(command)
+      ? `configured harness \`${command}\` was not found at that path (or is not executable)`
+      : `configured harness \`${command}\` was not found on PATH`,
   });
 
   const adapter: HarnessAdapter = {
@@ -68,6 +118,9 @@ export function materializeCompatibilityAdapter(
     declaration,
 
     buildInvocation(ctx: AdapterInvocationContext): AdapterInvocation {
+      // Legacy custom-CLI spawn: prompt only (argv or stdin). Model/effort are
+      // accepted at the contract surface and recorded on treatment, not turned
+      // into invented CLI flags for an unconstrained command.
       if (promptDelivery === "stdin") {
         return {
           cmd: command,
@@ -86,20 +139,7 @@ export function materializeCompatibilityAdapter(
     },
 
     async preflight(deps: AdapterPreflightDeps, req: AdapterRequest): Promise<AdapterPreflightResult> {
-      if (req.model) {
-        return {
-          ok: false,
-          failure: "unsupported-setting",
-          message: `custom reviewer CLI "${command}" does not support model selection`,
-        };
-      }
-      if (req.effort) {
-        return {
-          ok: false,
-          failure: "unsupported-setting",
-          message: `custom reviewer CLI "${command}" does not support effort selection`,
-        };
-      }
+      // Model/effort are open — do not refuse configured object-form values.
       if (req.sandbox) {
         return {
           ok: false,
@@ -107,29 +147,8 @@ export function materializeCompatibilityAdapter(
           message: `custom reviewer CLI "${command}" does not support sandbox mode`,
         };
       }
-      // PATH-only check: custom CLIs have no documented non-interactive auth probe.
-      const present =
-        (await deps.execCheck("which", [command])) ||
-        (await deps.execCheck(command, ["--help"])) ||
-        (await deps.execCheck(command, ["--version"]));
-      if (!present) {
-        // Absolute paths / scripts: try a zero-arg existence via which on basename
-        // or direct execCheck of the command as a path.
-        const pathPresent = command.includes("/")
-          ? await deps.execCheck(command, ["--help"]).catch(() => false)
-          : false;
-        if (!pathPresent) {
-          // Still allow absolute script paths that may not accept --help: doctor
-          // uses which; for path-like commands accept which failure only when
-          // the name has no slash.
-          if (!command.includes("/")) {
-            return {
-              ok: false,
-              failure: "missing-cli",
-              message: `configured harness \`${command}\` was not found on PATH`,
-            };
-          }
-        }
+      if (!(await isCommandPresent(deps, command))) {
+        return missingCli();
       }
       return { ok: true, authState: "unknown" };
     },
@@ -148,6 +167,7 @@ export function materializeCompatibilityAdapter(
         resolvedModel: null,
         requestedEffort: req.effort ?? null,
         resolvedEffort: null,
+        // No native model/effort flags for unconstrained custom CLIs.
         nativeFlags: [],
         fallback: null,
         throttled: null,
@@ -156,17 +176,10 @@ export function materializeCompatibilityAdapter(
     },
 
     async runtimeSmoke(deps: AdapterPreflightDeps): Promise<AdapterPreflightResult> {
-      const onPath = await deps.execCheck("which", [command]);
-      if (onPath) return { ok: true, authState: "unknown" };
-      if (command.includes("/")) {
-        // Path-like command: smoke is presence-only; preflight does deeper checks.
-        return { ok: true, authState: "unknown" };
+      if (!(await isCommandPresent(deps, command))) {
+        return missingCli();
       }
-      return {
-        ok: false,
-        failure: "missing-cli",
-        message: `configured harness \`${command}\` was not found on PATH`,
-      };
+      return { ok: true, authState: "unknown" };
     },
   };
 
