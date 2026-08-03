@@ -11,6 +11,8 @@
 // deterministic-first then shared mechanical repair, re-gate, then mergePr.
 
 import { spawnSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { invoke } from "../harness.ts";
 import type { PipelineConfig } from "../types.ts";
 import {
@@ -31,6 +33,7 @@ import {
 import { performPreMergeAutoFix } from "./pre_merge.ts";
 import { runRelease } from "./release.ts";
 import {
+  applyReadmeLandingContractGate,
   canAttemptRepair,
   claimRepairAttempt,
   classifyFromMergeError,
@@ -281,13 +284,48 @@ export function isRepairEnabled(
 }
 
 /**
+ * Best-effort read of root README.md from a managed worktree for the landing-page
+ * re-gate (#855). Returns null when no worktree is on disk or the file is missing.
+ * Injectable for hermetic tests — production uses {@link getOnDiskForIssue}.
+ */
+export function readManagedWorktreeReadme(
+  issueNumber: number,
+  cfg: PipelineConfig,
+  deps: {
+    getOnDiskForIssue?: typeof getOnDiskForIssue;
+    readFileSync?: (absPath: string, encoding: "utf8") => string;
+    existsSync?: (absPath: string) => boolean;
+  } = {},
+): string | null {
+  const getWorktree = deps.getOnDiskForIssue ?? getOnDiskForIssue;
+  const exists = deps.existsSync ?? ((p: string) => fs.existsSync(p));
+  const read =
+    deps.readFileSync ??
+    ((p: string, enc: "utf8") => fs.readFileSync(p, enc));
+  try {
+    const onDisk = getWorktree(issueNumber, cfg);
+    if (!onDisk?.path) return null;
+    const readmePath = path.join(onDisk.path, "README.md");
+    if (!exists(readmePath)) return null;
+    return read(readmePath, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Production eligibility evaluator using the same gates as dry-run selection /
  * mergePr: PR open + linked-issue R2D policy + mergeable+CLEAN + checks policy.
+ *
+ * Optional `readmeContent` applies the README landing-page contract (#855) so a
+ * post-repair / restack head that reintroduces a monolithic README cannot be
+ * re-gate eligible even when GitHub checks have not yet re-run.
  */
 export async function evaluateCandidateEligibility(
   candidate: { prNumber: number; issueNumber: number },
   planDeps: Pick<PlanDeps, "ghPrView" | "ghPrChecksRequired" | "ghPrChecksAll">,
   labelDeps?: Pick<MergeDeps, "getIssueLabels">,
+  opts?: { readmeContent?: string | null },
 ): Promise<EligibilitySnapshot> {
   const prNumber = candidate.prNumber;
   const prData = await planDeps.ghPrView(prNumber, [
@@ -330,7 +368,7 @@ export async function evaluateCandidateEligibility(
     }
   }
 
-  return {
+  const base: EligibilitySnapshot = {
     mergeable,
     mergeStateStatus,
     checksOk,
@@ -339,6 +377,10 @@ export async function evaluateCandidateEligibility(
     prState,
     issueHasR2d,
   };
+  if (opts && "readmeContent" in opts) {
+    return applyReadmeLandingContractGate(base, opts.readmeContent);
+  }
+  return base;
 }
 
 /**
@@ -759,7 +801,15 @@ export function realMergeQueueDeps(
     },
 
     async evaluateEligibility(candidate) {
-      return evaluateCandidateEligibility(candidate, plan, md);
+      // Prefer local managed-worktree README for landing-page fail-closed (#855)
+      // so post-restack / post-repair heads with a monolithic README are not
+      // re-gate eligible before CI re-runs docs:check.
+      const readmeContent = cfg
+        ? readManagedWorktreeReadme(candidate.issueNumber, cfg)
+        : null;
+      return evaluateCandidateEligibility(candidate, plan, md, {
+        readmeContent,
+      });
     },
 
     // Deterministic-first: checks re-query; conflicts attempt clean rebase/restack
@@ -767,7 +817,12 @@ export function realMergeQueueDeps(
     async attemptDeterministicRepair(candidate, reason, snapshot) {
       if (reason === "checks-failed") {
         // Re-query settled check state (no second poller loop — one re-read).
-        const snap = await evaluateCandidateEligibility(candidate, plan, md);
+        const readmeContent = cfg
+          ? readManagedWorktreeReadme(candidate.issueNumber, cfg)
+          : null;
+        const snap = await evaluateCandidateEligibility(candidate, plan, md, {
+          readmeContent,
+        });
         return {
           changed: false,
           headSha: snap.headRefOid,

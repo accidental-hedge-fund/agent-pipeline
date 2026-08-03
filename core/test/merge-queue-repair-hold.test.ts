@@ -8,6 +8,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  applyReadmeLandingContractGate,
   buildHoldRemediation,
   buildSurgicalRepairPrompt,
   canAttemptRepair,
@@ -19,6 +20,7 @@ import {
   createRepairBudget,
   type EligibilitySnapshot,
 } from "../scripts/stages/merge_queue_hold.ts";
+import { build793ShapedMonolithicReadme } from "../scripts/readme-landing-contract.ts";
 import {
   runMergeQueue,
   isRepairEnabled,
@@ -576,6 +578,125 @@ test("isolation: no auto_merge key in merge_queue config schema surface", () => 
   assert.ok(
     typesBody.includes("No `auto_merge` key") || typesBody.includes("no auto_merge"),
   );
+});
+
+// ---------------------------------------------------------------------------
+// README landing-page fail-closed after repair / restack (#855)
+// ---------------------------------------------------------------------------
+
+const CLEAN_OPEN_R2D: EligibilitySnapshot = {
+  mergeable: "MERGEABLE",
+  mergeStateStatus: "CLEAN",
+  checksOk: true,
+  headRefOid: "sha-clean",
+  prState: "OPEN",
+  issueHasR2d: true,
+};
+
+test("applyReadmeLandingContractGate: #793-shaped README forces checks-failed re-gate hold", () => {
+  const gated = applyReadmeLandingContractGate(
+    CLEAN_OPEN_R2D,
+    build793ShapedMonolithicReadme(),
+  );
+  assert.equal(gated.checksOk, false);
+  assert.match(gated.checksDetail ?? "", /README landing-page contract breach/i);
+  assert.match(gated.checksDetail ?? "", /line-budget|full-inventory/i);
+  assert.equal(classifyEligibility(gated), "checks-failed");
+  const gate = classifyQueueEligibility(gated);
+  assert.equal(gate.kind, "hold");
+  if (gate.kind === "hold") assert.equal(gate.reason, "checks-failed");
+});
+
+test("applyReadmeLandingContractGate: lean README does not create a false hold", () => {
+  const lean = [
+    "# agent-pipeline",
+    "",
+    "[cli](docs/cli.md) [cfg](docs/config.md) [concepts](docs/concepts.md)",
+    "",
+    "Short landing page.",
+    "",
+  ].join("\n");
+  const gated = applyReadmeLandingContractGate(CLEAN_OPEN_R2D, lean);
+  assert.equal(gated.checksOk, true);
+  assert.equal(classifyQueueEligibility(gated).kind, "eligible");
+});
+
+test("applyReadmeLandingContractGate: null readme is a no-op (CI path still applies later)", () => {
+  const gated = applyReadmeLandingContractGate(CLEAN_OPEN_R2D, null);
+  assert.equal(gated.checksOk, true);
+  assert.equal(classifyQueueEligibility(gated).kind, "eligible");
+});
+
+test("drive: post-repair head with #793-shaped README is not merge-eligible (fail closed)", async () => {
+  // Simulates conflict clearance that left a monolithic README: eligibility
+  // after "repair" is MERGEABLE/CLEAN but landing-page gate marks checks red.
+  const afterRepair = applyReadmeLandingContractGate(
+    {
+      ...CLEAN_OPEN_R2D,
+      headRefOid: "sha-after-repair",
+    },
+    build793ShapedMonolithicReadme(),
+  );
+  const conflictThenBrokenDocs: EligibilitySnapshot[] = [
+    {
+      mergeable: "CONFLICTING",
+      mergeStateStatus: "DIRTY",
+      checksOk: true,
+      headRefOid: "sha-conflict",
+      prState: "OPEN",
+      issueHasR2d: true,
+    },
+    afterRepair,
+  ];
+  const A: MergeQueueCandidate = {
+    issueNumber: 855,
+    prNumber: 793,
+    title: "repair left monolith README",
+  };
+  const deps = makeDeps({
+    candidates: [A],
+    remainingAfterApply: [],
+    eligibility: new Map([[793, conflictThenBrokenDocs]]),
+    async deterministicImpl() {
+      return {
+        changed: true,
+        headSha: "sha-after-repair",
+        evidence: "restack cleared conflicts but restored monolith README",
+      };
+    },
+  });
+  const result = await runMergeQueue(
+    {
+      milestone: "v-test",
+      apply: true,
+      repair: true,
+      repairMaxAttempts: 2,
+    },
+    deps,
+  );
+  assert.equal(result.merged.length, 0, "must not merge with landing-page breach");
+  assert.equal(deps.mergeCalls.length, 0, "mergePr must not be called");
+  assert.ok(result.held.length >= 1, "item must remain held / non-eligible");
+  const hold = result.held[0]!;
+  assert.equal(hold.prNumber, 793);
+  // checks-failed (docs contract) or free-form summary naming the breach
+  const blob = `${hold.reason}\n${hold.summary}\n${hold.remediation ?? ""}`;
+  assert.match(
+    blob,
+    /checks-failed|landing-page|README|docs-contract|contract breach/i,
+    `hold must name docs/README class, got: ${blob}`,
+  );
+});
+
+test("surgical repair prompt forbids monolithic README restoration (#855)", () => {
+  const prompt = buildSurgicalRepairPrompt({
+    reason: "merge-conflict",
+    prNumber: 1,
+    issueNumber: 855,
+    summary: "DIRTY",
+  });
+  assert.match(prompt, /monolithic root `?README\.md`?/i);
+  assert.match(prompt, /landing-page contract/i);
 });
 
 // ---------------------------------------------------------------------------

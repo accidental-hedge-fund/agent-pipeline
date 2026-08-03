@@ -138,17 +138,52 @@ async function main() {
         stale.push(art.relPath);
       }
     }
+
+    // README landing-page contract (#855 / docs-landing-split). Not
+    // generator-owned: write mode never rewrites README, so a breach cannot
+    // be greenwashed by regenerate alone.
+    const {
+      checkReadmeLandingContract,
+      formatReadmeLandingDiagnostics,
+    } = await importCore("readme-landing-contract.ts");
+    const readmeText = readText("README.md");
+    /** @type {{ ok: boolean, diagnostics: unknown[], lineCount: number } | null} */
+    let landing = null;
+    if (readmeText === null) {
+      console.error(
+        "generate-docs --check: README landing-page contract breach:",
+      );
+      console.error("  - [missing-readme] root README.md is absent");
+      process.exit(1);
+    }
+    landing = checkReadmeLandingContract(readmeText);
+    const landingFailed = landing != null && !landing.ok;
+
     if (stale.length > 0) {
       console.error("generate-docs --check: stale generated docs:");
       for (const p of stale) console.error(`  - ${p}`);
       console.error("");
       console.error("Run: node scripts/generate-docs.mjs");
+    }
+    if (landingFailed) {
+      console.error(formatReadmeLandingDiagnostics(landing));
+      console.error("");
+      console.error(
+        "Restore a lean root README.md (< 400 lines, companion links to " +
+          "docs/cli.md, docs/config.md, docs/concepts.md; no full hand-maintained " +
+          "CLI/config inventory). Generator write mode does not rewrite README.",
+      );
+    }
+    if (stale.length > 0 || landingFailed) {
       process.exit(1);
     }
     console.log("generate-docs --check: ok");
     process.exit(0);
   }
 
+  // Write mode regenerates generator-owned artifacts only. It intentionally
+  // does not truncate or rewrite README.md (#855: no silent heal of a
+  // landing-page contract breach).
   for (const art of artifacts) {
     writeText(art.relPath, normalizeTrailingNewline(art.content));
     console.log(`wrote ${art.relPath}`);

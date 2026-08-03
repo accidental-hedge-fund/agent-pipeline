@@ -3,6 +3,16 @@
 // Typed holds for human-gated merge-queue drive when a candidate is
 // non-mergeable (conflict/dirty) or has blocking required checks. Optional
 // surgical repair is opt-in elsewhere; this module stays pure and injectable.
+//
+// #855: post-repair / restack re-gate also fails closed when a candidate head's
+// root README violates the docs-landing-split landing-page contract (large
+// unrelated monolith). That is a checks-class hold, not a new merge-authority
+// or review-policy change.
+
+import {
+  checkReadmeLandingContract,
+  formatReadmeLandingDiagnostics,
+} from "../readme-landing-contract.ts";
 
 // ---------------------------------------------------------------------------
 // Hold vocabulary
@@ -155,6 +165,35 @@ export function classifyQueueEligibility(
   const hold = classifyEligibility(snapshot);
   if (hold) return { kind: "hold", reason: hold };
   return { kind: "eligible" };
+}
+
+/**
+ * Apply the README landing-page contract to an eligibility snapshot (#855).
+ *
+ * When `readmeContent` is null/undefined (no local head material available),
+ * the snapshot is returned unchanged — callers still rely on CI docs:check
+ * once the head is pushed. When content is supplied and violates the
+ * docs-landing-split contract (including a #793-class monolithic append),
+ * force `checksOk: false` with diagnostics that name the README / landing-page
+ * breach so re-gate classifies as checks-failed and never merge-eligible.
+ *
+ * Pure — no I/O. Does not invent new hold reason codes or change merge authority.
+ */
+export function applyReadmeLandingContractGate(
+  snapshot: EligibilitySnapshot,
+  readmeContent: string | null | undefined,
+): EligibilitySnapshot {
+  if (readmeContent == null) return snapshot;
+  const result = checkReadmeLandingContract(readmeContent);
+  if (result.ok) return snapshot;
+  const detail = formatReadmeLandingDiagnostics(result);
+  return {
+    ...snapshot,
+    checksOk: false,
+    checksDetail: snapshot.checksDetail
+      ? `${snapshot.checksDetail}; ${detail}`
+      : detail,
+  };
 }
 
 /**
@@ -374,6 +413,7 @@ export function buildSurgicalRepairPrompt(input: {
     "- Make the **minimal diff** that resolves only the merge conflict or blocking CI failure.",
     "- **Do not** refactor, add features, rename for style, or perform opportunistic cleanup.",
     "- **Do not** weaken tests, review policy, gates, or requirements to go green.",
+    "- **Do not** restore a monolithic root `README.md` or other large unrelated documentation delta during conflict resolution or restack — the landing-page contract (lean README, companion links) is fail-closed on re-gate.",
     "- **Do not** squash-merge or otherwise merge the PR — push the repair only; merge is operator/queue-gated after re-validation.",
     "- Destructive git operations (force-push, worktree remove, branch delete) are allowed only when scoped to this managed worktree / this PR head, with explicit justification.",
     "",
