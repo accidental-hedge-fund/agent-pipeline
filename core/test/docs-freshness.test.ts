@@ -557,6 +557,72 @@ test("checkDocsFreshness: red check-only → fail closed, no generate", async ()
 });
 
 // ---------------------------------------------------------------------------
+// README landing-page contract on the docs-freshness surface (#855)
+// ---------------------------------------------------------------------------
+
+function landingPageCheckOutput(): string {
+  return [
+    "README landing-page contract breach:",
+    "  measured_lines: 2067",
+    "  - [line-budget] README.md landing-page line budget exceeded: 2067 lines (must be fewer than 400)",
+    "  - [full-inventory-shape] README.md matches a full hand-maintained CLI/config inventory shape",
+    "",
+    "Restore a lean root README.md (< 400 lines, companion links).",
+  ].join("\n");
+}
+
+test("checkDocsFreshness: README landing-page red blocks pre-PR class outcomes (#855)", async () => {
+  const { deps, commits } = makeEnforceDeps({
+    checkCodes: [1],
+  });
+  // Override check output to landing-page diagnostics (not stale generator paths).
+  const commands: string[] = [];
+  deps.runDocsCommand = async (_wt, cmd) => {
+    commands.push(cmd);
+    return { code: 1, output: landingPageCheckOutput() };
+  };
+  const result = await checkDocsFreshness("/wt", deps);
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.match(result.reason, /landing-page contract breach|README/i);
+    assert.match(result.reason, /line-budget|2067/);
+    // Must not invent stale generator file names that were not in the failure.
+    assert.deepEqual(result.stalePaths, []);
+    assert.ok(
+      result.reason.includes("landing-page") || result.reason.includes("README"),
+      "failure reason must name the README / landing-page breach class",
+    );
+  }
+  assert.deepEqual(commits, []);
+  assert.equal(commands.length, 1, "only check ran — no generate/heal");
+});
+
+test("enforceDocsFreshness: generator-only heal does not greenwash monolithic README (#855)", async () => {
+  // Check fails for README only; generate "succeeds" and dirties only generator
+  // outputs; re-check still fails with landing-page diagnostics.
+  const landingOut = landingPageCheckOutput();
+  const { deps, commits } = makeEnforceDeps({
+    checkCodes: [1, 1],
+    postStatus: " M docs/cli.md\n M CHANGELOG.md\n",
+  });
+  deps.runDocsCommand = async (_wt, cmd) => {
+    if (/--check|docs:check/.test(cmd)) {
+      return { code: 1, output: landingOut };
+    }
+    // write mode: generator-owned only
+    return { code: 0, output: "wrote docs/cli.md\nwrote CHANGELOG.md\n" };
+  };
+  const result = await enforceDocsFreshness("/wt", 855, deps);
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.match(result.reason, /still failing after regenerate|landing-page|README/i);
+    assert.match(result.reason, /landing-page contract breach/i);
+    assert.deepEqual(result.stalePaths, [], "must not invent stale generator paths from README-only failure");
+  }
+  assert.equal(commits.length, 1, "heal commit of generator outputs may still be attempted");
+});
+
+// ---------------------------------------------------------------------------
 /** No-op supersede so unit tests never hit GitHub (#729). */
 const noopDispose: NonNullable<ResumeFromImplementingDeps["disposeSupersededIssuePrs"]> = async () => ({
   closed: [],
