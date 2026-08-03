@@ -124,6 +124,137 @@ export function killProcessTree(
   return ordered;
 }
 
+/**
+ * Signal descendant process groups of `rootPid` **excluding** the root process's
+ * own group. Used on abnormal wrapper shutdown so the wrapper stays alive long
+ * enough to confirm children are gone and only then release the issue-run lock
+ * (SIGKILL of the wrapper's own group would skip exit handlers — #634 review 2).
+ */
+export function killDescendantGroupsOnly(
+  rootPid: number,
+  signal: NodeJS.Signals,
+  deps: KillTreeDeps = defaultKillTreeDeps,
+): number[] {
+  const table = parseProcTable(deps.snapshot());
+  const self = table.find((p) => p.pid === rootPid);
+  const selfPgid = self?.pgid ?? rootPid;
+  const groups = descendantProcessGroups(table, rootPid).filter((g) => g !== selfPgid);
+  for (const pgid of groups) deps.killGroup(pgid, signal);
+  return groups;
+}
+
+/** Grace after SIGTERM before escalating to SIGKILL on abnormal wrapper shutdown. */
+export const ABNORMAL_SHUTDOWN_GRACE_MS = 5_000;
+
+/** Additional wait after SIGKILL before treating termination as unconfirmed. */
+export const ABNORMAL_SHUTDOWN_HARD_WAIT_MS = 2_000;
+
+/** Minimal child shape for {@link waitForChildClose} / {@link terminateWrapperChildren}. */
+export type WaitableChild = {
+  on(event: "close" | "error", cb: (...args: unknown[]) => void): unknown;
+  kill?(signal?: NodeJS.Signals): boolean;
+  pid?: number | undefined;
+  /** Set after exit on real ChildProcess — used to detect already-exited children. */
+  exitCode?: number | null;
+  signalCode?: NodeJS.Signals | null;
+};
+
+export type WaitForChildCloseDeps = {
+  setTimeoutFn?: typeof setTimeout;
+  clearTimeoutFn?: typeof clearTimeout;
+};
+
+/**
+ * Resolve when `child` has exited (`close`/`error`, or already-set exit/signal
+ * codes), or when `timeoutMs` elapses (returns false). `undefined` child → true.
+ */
+export function waitForChildClose(
+  child: WaitableChild | undefined,
+  timeoutMs: number,
+  deps: WaitForChildCloseDeps = {},
+): Promise<boolean> {
+  if (!child) return Promise.resolve(true);
+  // Already exited (close may have fired before we subscribed).
+  if (child.exitCode != null || child.signalCode != null) return Promise.resolve(true);
+
+  const setT = deps.setTimeoutFn ?? setTimeout;
+  const clearT = deps.clearTimeoutFn ?? clearTimeout;
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearT(timer);
+      resolve(ok);
+    };
+    const timer = setT(() => done(false), timeoutMs);
+    child.on("close", () => done(true));
+    child.on("error", () => done(true));
+  });
+}
+
+export type TerminateWrapperChildrenDeps = {
+  killInner: (child: WaitableChild, signal: NodeJS.Signals) => void;
+  killDescendants: (rootPid: number, signal: NodeJS.Signals) => number[];
+  waitForClose: (child: WaitableChild | undefined, timeoutMs: number) => Promise<boolean>;
+  sleep: (ms: number) => Promise<void>;
+};
+
+const defaultTerminateChildrenDeps: TerminateWrapperChildrenDeps = {
+  killInner: (child, signal) => {
+    try {
+      child.kill?.(signal);
+    } catch {
+      /* already gone */
+    }
+  },
+  killDescendants: (rootPid, signal) => killDescendantGroupsOnly(rootPid, signal),
+  waitForClose: (child, timeoutMs) => waitForChildClose(child, timeoutMs),
+  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+};
+
+/**
+ * Terminate the inner pipeline process and detached descendant groups, then
+ * **await confirmed exit** of the inner child (grace → SIGKILL escalate).
+ *
+ * Does **not** kill the wrapper process itself and does **not** release the
+ * issue-run lock — the caller must release only after this resolves (or leave
+ * the lock for stale recovery if the wrapper cannot exit cleanly).
+ *
+ * Returns `"confirmed"` when the inner process is observed gone; `"unconfirmed"`
+ * if the hard wait elapsed without a close event.
+ */
+export async function terminateWrapperChildren(
+  opts: {
+    inner: WaitableChild | undefined;
+    wrapperPid: number;
+    graceMs?: number;
+    hardWaitMs?: number;
+  },
+  deps: Partial<TerminateWrapperChildrenDeps> = {},
+): Promise<"confirmed" | "unconfirmed"> {
+  const d: TerminateWrapperChildrenDeps = { ...defaultTerminateChildrenDeps, ...deps };
+  const graceMs = opts.graceMs ?? ABNORMAL_SHUTDOWN_GRACE_MS;
+  const hardWaitMs = opts.hardWaitMs ?? ABNORMAL_SHUTDOWN_HARD_WAIT_MS;
+
+  if (opts.inner) d.killInner(opts.inner, "SIGTERM");
+  d.killDescendants(opts.wrapperPid, "SIGTERM");
+
+  const exitedSoft = await d.waitForClose(opts.inner, graceMs);
+  if (exitedSoft) {
+    // Inner is gone; still SIGKILL any detached descendant groups that outlived it.
+    d.killDescendants(opts.wrapperPid, "SIGKILL");
+    return "confirmed";
+  }
+
+  if (opts.inner) d.killInner(opts.inner, "SIGKILL");
+  d.killDescendants(opts.wrapperPid, "SIGKILL");
+  const exitedHard = await d.waitForClose(opts.inner, hardWaitMs);
+  // Brief settle so kill signals can take effect before the wrapper releases.
+  await d.sleep(Math.min(hardWaitMs, 250));
+  return exitedHard ? "confirmed" : "unconfirmed";
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -402,7 +533,9 @@ export async function runWrapper(argv: string[]): Promise<void> {
   const lp = issueLock.path;
   const startMs = Date.now();
   let sentinelWritten = false;
+  let shuttingDown = false;
   let innerProcess: ReturnType<typeof spawn> | undefined;
+  let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
 
   function doWriteSentinel(exitCode: number, timedOut?: true): void {
     if (sentinelWritten) return;
@@ -421,6 +554,33 @@ export async function runWrapper(argv: string[]): Promise<void> {
 
   function releaseLock(): void {
     issueLock.release();
+  }
+
+  /**
+   * Abnormal paths (SIGTERM / watchdog / uncaughtException): write sentinel,
+   * await confirmed child/tree termination, THEN exit so the 'exit' handler
+   * releases the issue-run lock only after the inner work is gone (#634 r2).
+   * Never release the lock before children are terminated — a concurrent
+   * advance/detach would otherwise overlap a still-running inner pipeline.
+   */
+  async function beginAbnormalShutdown(exitCode: number, timedOut?: true): Promise<void> {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (watchdogTimer !== undefined) {
+      clearTimeout(watchdogTimer);
+      watchdogTimer = undefined;
+    }
+    doWriteSentinel(exitCode, timedOut);
+    try {
+      await terminateWrapperChildren({
+        inner: innerProcess,
+        wrapperPid: process.pid,
+      });
+    } catch {
+      /* best-effort — still exit so the lock is released via 'exit' after attempt */
+    }
+    // Lock release happens in process.on('exit') — only after this point.
+    process.exit(exitCode === -1 ? 1 : exitCode);
   }
 
   // Acquire the shared issue-run lock FIRST — before registering exit handlers
@@ -452,7 +612,8 @@ export async function runWrapper(argv: string[]): Promise<void> {
     /* best-effort handshake — the launcher's wait will time out and clean up */
   }
 
-  // 'exit' fires on process.exit() but NOT on SIGKILL. SIGTERM is handled below.
+  // 'exit' fires on process.exit() but NOT on SIGKILL. SIGTERM/watchdog go
+  // through beginAbnormalShutdown (await children → process.exit → here).
   process.on("exit", (code) => {
     doWriteSentinel(code ?? 1);
     releaseLock();
@@ -460,30 +621,17 @@ export async function runWrapper(argv: string[]): Promise<void> {
 
   process.on("uncaughtException", (err) => {
     process.stderr.write(`detach wrapper: uncaught exception: ${err}\n`);
-    doWriteSentinel(1);
-    releaseLock();
-    process.exit(1);
+    void beginAbnormalShutdown(1);
   });
 
   process.on("SIGTERM", () => {
-    if (innerProcess) innerProcess.kill("SIGTERM");
-    doWriteSentinel(143);
-    releaseLock();
-    process.exit(143);
+    void beginAbnormalShutdown(143);
   });
 
-  // Watchdog timer.
-  let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
+  // Watchdog timer — terminate children and await exit before lock release.
   if (timeout !== undefined) {
     watchdogTimer = setTimeout(() => {
-      // Write sentinel BEFORE sending SIGKILL (SIGKILL cannot be caught).
-      doWriteSentinel(-1, true);
-      releaseLock();
-      // Kill the entire process TREE, not just the wrapper's own group: pipeline
-      // steps spawn shell/setup/harness work in their own process groups, which a
-      // bare `kill(-process.pid)` would leave running after the timeout sentinel.
-      killProcessTree(process.pid, "SIGKILL");
-      process.exit(-1);
+      void beginAbnormalShutdown(-1, true);
     }, timeout * 1000);
     // Don't keep the event loop alive solely for the watchdog.
     watchdogTimer.unref();
@@ -517,6 +665,9 @@ export async function runWrapper(argv: string[]): Promise<void> {
   });
 
   if (watchdogTimer !== undefined) clearTimeout(watchdogTimer);
+  // If SIGTERM/watchdog already owns shutdown, do not race process.exit — that
+  // path awaits tree termination before the shared exit-handler lock release.
+  if (shuttingDown) return;
 
   // process.on('exit') writes the sentinel via doWriteSentinel(exitCode).
   process.exit(exitCode);

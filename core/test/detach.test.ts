@@ -24,8 +24,12 @@ import {
   parseProcTable,
   descendantProcessGroups,
   killProcessTree,
+  killDescendantGroupsOnly,
+  waitForChildClose,
+  terminateWrapperChildren,
   type SpawnDetachedDeps,
   type SentinelData,
+  type WaitableChild,
 } from "../scripts/detach.ts";
 import { buildCmd, handleRunSubcommand, type RunSubcommandDeps } from "../scripts/pipeline.ts";
 import type { CliOpts } from "../scripts/pipeline.ts";
@@ -827,6 +831,139 @@ test("killProcessTree: falls back to the root group when the ps snapshot is empt
   const killed: number[] = [];
   killProcessTree(777, "SIGKILL", { snapshot: () => "", killGroup: (pgid) => killed.push(pgid) });
   assert.deepEqual(killed, [777], "empty snapshot must still terminate the wrapper group");
+});
+
+// ---------------------------------------------------------------------------
+// #634 review-2 (bf44d249): abnormal shutdown must NOT release the issue-run
+// lock until the inner process (and detached descendant groups) have exited.
+// ---------------------------------------------------------------------------
+
+test("killDescendantGroupsOnly: never signals the wrapper's own group", () => {
+  // wrapper(100,pgid100) → inner(200,pgid100) → detached(300,pgid300)
+  const table = " 100 1 100\n 200 100 100\n 300 200 300\n";
+  const killed: number[] = [];
+  const groups = killDescendantGroupsOnly(100, "SIGKILL", {
+    snapshot: () => table,
+    killGroup: (pgid) => killed.push(pgid),
+  });
+  assert.deepEqual(groups, [300]);
+  assert.deepEqual(killed, [300], "wrapper group 100 must not be killed (exit handlers need to run)");
+});
+
+test("waitForChildClose: resolves true when child already has exitCode", async () => {
+  const child: WaitableChild = {
+    exitCode: 0,
+    on() {
+      throw new Error("must not subscribe when already exited");
+    },
+  };
+  assert.equal(await waitForChildClose(child, 1000), true);
+});
+
+test("waitForChildClose: resolves false on timeout when close never fires", async () => {
+  const child: WaitableChild = {
+    on() {
+      /* never emits */
+    },
+  };
+  assert.equal(await waitForChildClose(child, 20), false);
+});
+
+test("waitForChildClose: resolves true when close fires before timeout", async () => {
+  const listeners: Array<(...args: unknown[]) => void> = [];
+  const child: WaitableChild = {
+    on(event, cb) {
+      if (event === "close") listeners.push(cb);
+    },
+  };
+  const p = waitForChildClose(child, 1000);
+  for (const cb of listeners) cb(0);
+  assert.equal(await p, true);
+});
+
+test("#634 r2: terminateWrapperChildren awaits inner exit before returning (lock may only release after)", async () => {
+  const events: string[] = [];
+  const child: WaitableChild = {
+    pid: 200,
+    on() {
+      /* close handled via injected waitForClose */
+    },
+    kill() {
+      return true;
+    },
+  };
+
+  const result = await terminateWrapperChildren(
+    { inner: child, wrapperPid: 100, graceMs: 500, hardWaitMs: 100 },
+    {
+      killInner: (_c, signal) => {
+        events.push(`kill-inner:${signal}`);
+      },
+      killDescendants: (_root, signal) => {
+        events.push(`kill-desc:${signal}`);
+        return [300];
+      },
+      waitForClose: async () => {
+        events.push("await-close-start");
+        // Child exit observed only after signals were delivered.
+        events.push("child-close");
+        return true;
+      },
+      sleep: async () => {
+        events.push("sleep");
+      },
+    },
+  );
+
+  assert.equal(result, "confirmed");
+  // Signal first, then await; return only after close observed. No lock release here.
+  assert.deepEqual(events, [
+    "kill-inner:SIGTERM",
+    "kill-desc:SIGTERM",
+    "await-close-start",
+    "child-close",
+    "kill-desc:SIGKILL", // detached groups that may outlive the inner process
+  ]);
+});
+
+test("#634 r2: terminateWrapperChildren escalates to SIGKILL when grace elapses", async () => {
+  const signals: string[] = [];
+  let waitCount = 0;
+  const child: WaitableChild = {
+    on() {
+      /* never closes on its own */
+    },
+    kill() {
+      return true;
+    },
+  };
+
+  const result = await terminateWrapperChildren(
+    { inner: child, wrapperPid: 1, graceMs: 15, hardWaitMs: 15 },
+    {
+      killInner: (_c, signal) => {
+        signals.push(`inner:${signal}`);
+      },
+      killDescendants: (_r, signal) => {
+        signals.push(`desc:${signal}`);
+        return [];
+      },
+      waitForClose: async () => {
+        waitCount += 1;
+        // First wait (grace) fails; second (hard, after SIGKILL) succeeds.
+        return waitCount >= 2;
+      },
+      sleep: async () => {},
+    },
+  );
+
+  assert.equal(result, "confirmed");
+  assert.deepEqual(signals, [
+    "inner:SIGTERM",
+    "desc:SIGTERM",
+    "inner:SIGKILL",
+    "desc:SIGKILL",
+  ]);
 });
 
 // #156 review-2: a malformed detached run must be rejected before it starts.
