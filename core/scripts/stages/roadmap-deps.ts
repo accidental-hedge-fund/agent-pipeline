@@ -13,6 +13,72 @@ import type { RoadmapDeps } from "../roadmap/index.ts";
 import type { PipelineConfig } from "../types.ts";
 
 /**
+ * Explicit refspec so `refs/remotes/origin/<branch>` itself is updated.
+ * Bare `git fetch origin <branch>` only populates FETCH_HEAD and leaves the
+ * remote-tracking ref stale/missing (#632 review finding 75dd3a1d; same class
+ * as #579 / pre-merge archive fetch).
+ */
+export function roadmapBranchFetchRefspec(branch: string): string {
+  return `${branch}:refs/remotes/origin/${branch}`;
+}
+
+export type RoadmapThrowawayWorktreePlan =
+  | { kind: "add"; addArgs: string[] }
+  | { kind: "error"; message: string };
+
+/**
+ * Pure planner for roadmap throwaway `git worktree add` args (#632).
+ *
+ * When the explicit remote-tracking fetch succeeds, ALWAYS start from
+ * `origin/<branch>` (via `-B`) so a stale local day-branch cannot win over the
+ * published PR head. When the remote ref is missing (new day branch), fall back
+ * to local or baseRef. Any other fetch failure fails closed rather than
+ * silently creating from baseRef (which would non-fast-forward-fail on push
+ * against an existing PR).
+ */
+export function planRoadmapThrowawayWorktreeAdd(opts: {
+  branch: string;
+  baseRef: string;
+  wtDir: string;
+  fetchStatus: number;
+  fetchStderr: string;
+  localBranchExists: boolean;
+}): RoadmapThrowawayWorktreePlan {
+  const { branch, baseRef, wtDir, fetchStatus, fetchStderr, localBranchExists } = opts;
+
+  if (fetchStatus === 0) {
+    // Prefer freshly fetched remote head over any local branch. `-B` creates or
+    // resets the local branch name to that tip inside the throwaway worktree.
+    return {
+      kind: "add",
+      addArgs: ["worktree", "add", "--force", "-B", branch, wtDir, `origin/${branch}`],
+    };
+  }
+
+  const err = (fetchStderr || "").trim();
+  const missingRemote = /couldn't find remote ref/i.test(err);
+  if (!missingRemote) {
+    return {
+      kind: "error",
+      message:
+        `git fetch origin ${roadmapBranchFetchRefspec(branch)} failed: ${err || "(no output)"}`,
+    };
+  }
+
+  // Expected for a brand-new day-keyed branch that has never been pushed.
+  if (localBranchExists) {
+    return {
+      kind: "add",
+      addArgs: ["worktree", "add", "--force", wtDir, branch],
+    };
+  }
+  return {
+    kind: "add",
+    addArgs: ["worktree", "add", "--force", "-b", branch, wtDir, baseRef],
+  };
+}
+
+/**
  * Build real RoadmapDeps from the resolved PipelineConfig.
  * All calls hit real gh CLI, real filesystem, and real harness invocations.
  */
@@ -87,32 +153,32 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
       }
       fs.mkdirSync(path.dirname(wtDir), { recursive: true });
 
-      // Prefer remote day-branch head when present so existing-PR refresh sees
-      // the published content; else local branch; else create from baseRef.
-      spawnSync("git", ["fetch", "origin", branch], {
-        cwd: repoDir, encoding: "utf8",
-      });
+      // Explicit destination refspec updates refs/remotes/origin/<branch> itself
+      // (bare fetch only sets FETCH_HEAD — #632 review finding 75dd3a1d).
+      const fetch = spawnSync(
+        "git",
+        ["fetch", "origin", roadmapBranchFetchRefspec(branch)],
+        { cwd: repoDir, encoding: "utf8" },
+      );
 
-      const localExists =
+      const localBranchExists =
         spawnSync("git", ["rev-parse", "--verify", `refs/heads/${branch}`], {
           cwd: repoDir, encoding: "utf8",
         }).status === 0;
-      const remoteExists =
-        spawnSync("git", ["rev-parse", "--verify", `refs/remotes/origin/${branch}`], {
-          cwd: repoDir, encoding: "utf8",
-        }).status === 0;
 
-      let addArgs: string[];
-      if (localExists) {
-        // Checkout existing local branch into the throwaway worktree (no switch of repoDir).
-        addArgs = ["worktree", "add", "--force", wtDir, branch];
-      } else if (remoteExists) {
-        addArgs = ["worktree", "add", "--force", "-b", branch, wtDir, `origin/${branch}`];
-      } else {
-        addArgs = ["worktree", "add", "--force", "-b", branch, wtDir, baseRef];
+      const plan = planRoadmapThrowawayWorktreeAdd({
+        branch,
+        baseRef,
+        wtDir,
+        fetchStatus: fetch.status ?? 1,
+        fetchStderr: `${fetch.stderr || ""}${fetch.stdout || ""}`,
+        localBranchExists,
+      });
+      if (plan.kind === "error") {
+        throw new Error(plan.message);
       }
 
-      const add = spawnSync("git", addArgs, { cwd: repoDir, encoding: "utf8" });
+      const add = spawnSync("git", plan.addArgs, { cwd: repoDir, encoding: "utf8" });
       if (add.status !== 0) {
         throw new Error(
           `git worktree add for roadmap branch ${branch} failed: ${add.stderr || add.stdout}`,

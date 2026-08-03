@@ -13,6 +13,10 @@ import {
   openRoadmapPr,
   buildRoadmapCommitMessage,
 } from "../scripts/roadmap/writeback.ts";
+import {
+  planRoadmapThrowawayWorktreeAdd,
+  roadmapBranchFetchRefspec,
+} from "../scripts/stages/roadmap-deps.ts";
 import type { CrossRepoDep, HygieneItem, MilestoneSpec, PlanJson } from "../scripts/roadmap/types.ts";
 import type { WritebackDeps } from "../scripts/roadmap/writeback.ts";
 
@@ -505,6 +509,105 @@ describe("openRoadmapPr - isolation + refresh + commit metadata (#632)", () => {
       assert.ok(!commitMsg.includes("Issue:"), `partial ${JSON.stringify(trace)} must omit Issue`);
       assert.ok(!commitMsg.includes("Pipeline-Run:"), `partial ${JSON.stringify(trace)} must omit Pipeline-Run`);
     }
+  });
+});
+
+describe("planRoadmapThrowawayWorktreeAdd - prefer remote PR head (#632 review 75dd3a1d)", () => {
+  const branch = "roadmap/repo-2026-08-03";
+  const baseRef = "main";
+  const wtDir = "/repo/.worktrees/roadmap+repo-2026-08-03+1";
+
+  it("fetch refspec writes the remote-tracking ref, not just FETCH_HEAD", () => {
+    assert.equal(
+      roadmapBranchFetchRefspec(branch),
+      `${branch}:refs/remotes/origin/${branch}`,
+    );
+  });
+
+  it("successful fetch prefers origin/<branch> via -B even when a stale local branch exists", () => {
+    // Regression: old code preferred localExists first, so a stale local day-branch
+    // won over the published PR head (no-op against stale content / non-ff push).
+    const plan = planRoadmapThrowawayWorktreeAdd({
+      branch,
+      baseRef,
+      wtDir,
+      fetchStatus: 0,
+      fetchStderr: "",
+      localBranchExists: true,
+    });
+    assert.equal(plan.kind, "add");
+    if (plan.kind !== "add") return;
+    assert.deepEqual(plan.addArgs, [
+      "worktree", "add", "--force", "-B", branch, wtDir, `origin/${branch}`,
+    ]);
+  });
+
+  it("successful fetch prefers origin/<branch> when local branch is missing", () => {
+    // Fresh operator checkout: no local day-branch; remote PR branch exists.
+    // Bare `git fetch origin <branch>` left remoteExists false; explicit refspec
+    // + this plan starts from the published tip instead of baseRef.
+    const plan = planRoadmapThrowawayWorktreeAdd({
+      branch,
+      baseRef,
+      wtDir,
+      fetchStatus: 0,
+      fetchStderr: "",
+      localBranchExists: false,
+    });
+    assert.equal(plan.kind, "add");
+    if (plan.kind !== "add") return;
+    assert.deepEqual(plan.addArgs, [
+      "worktree", "add", "--force", "-B", branch, wtDir, `origin/${branch}`,
+    ]);
+    assert.ok(!plan.addArgs.includes(baseRef), "must not fall through to baseRef when remote exists");
+  });
+
+  it("missing remote ref + no local branch creates from baseRef (new day branch)", () => {
+    const plan = planRoadmapThrowawayWorktreeAdd({
+      branch,
+      baseRef,
+      wtDir,
+      fetchStatus: 128,
+      fetchStderr: `fatal: couldn't find remote ref ${branch}`,
+      localBranchExists: false,
+    });
+    assert.equal(plan.kind, "add");
+    if (plan.kind !== "add") return;
+    assert.deepEqual(plan.addArgs, [
+      "worktree", "add", "--force", "-b", branch, wtDir, baseRef,
+    ]);
+  });
+
+  it("missing remote ref + local branch uses local (not yet pushed)", () => {
+    const plan = planRoadmapThrowawayWorktreeAdd({
+      branch,
+      baseRef,
+      wtDir,
+      fetchStatus: 128,
+      fetchStderr: `fatal: couldn't find remote ref ${branch}`,
+      localBranchExists: true,
+    });
+    assert.equal(plan.kind, "add");
+    if (plan.kind !== "add") return;
+    assert.deepEqual(plan.addArgs, ["worktree", "add", "--force", wtDir, branch]);
+  });
+
+  it("non-missing fetch failure fails closed (does not silently start from baseRef)", () => {
+    // Existing PR path: network/auth failure must not create a divergent branch
+    // from base that then non-fast-forward-fails (or worse, rewrites) on push.
+    const plan = planRoadmapThrowawayWorktreeAdd({
+      branch,
+      baseRef,
+      wtDir,
+      fetchStatus: 1,
+      fetchStderr: "fatal: unable to access 'https://github.com/example/repo.git/': Could not resolve host",
+      localBranchExists: false,
+    });
+    assert.equal(plan.kind, "error");
+    if (plan.kind !== "error") return;
+    assert.match(plan.message, /fetch origin/);
+    assert.match(plan.message, /refs\/remotes\/origin\//);
+    assert.ok(!plan.message.includes("worktree add"), "must not plan a worktree add on hard fetch failure");
   });
 });
 
