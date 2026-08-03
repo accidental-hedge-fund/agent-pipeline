@@ -107,6 +107,7 @@ function readyDeps(): AdapterPreflightDeps {
       return { ok: true, stdout: "ok", stderr: "" };
     },
     fsExists: async () => true,
+    fsExecutable: async () => true,
   };
 }
 
@@ -280,11 +281,12 @@ export async function runConformanceKit(
   const failures = [...structural.failures];
   const name = structural.adapter;
   const ready = readyDeps();
-  // Prefer caller deps for presence-shaped checks, but merge fsExists when provided.
+  // Prefer caller deps for presence-shaped checks, but merge path seams when provided.
   const presentDeps: AdapterPreflightDeps = {
     ...ready,
     ...deps,
     fsExists: deps.fsExists ?? ready.fsExists,
+    fsExecutable: deps.fsExecutable ?? ready.fsExecutable,
   };
 
   // --- Table-driven supported settings → invocation treatment ---
@@ -636,6 +638,7 @@ export async function runConformanceKit(
       exec: async () => ({ ok: false, stdout: "", stderr: "not found" }),
       execCheck: async () => false,
       fsExists: async () => false,
+      fsExecutable: async () => false,
     };
     try {
       const res = await adapter.preflight(missingDeps, {});
@@ -701,6 +704,7 @@ export async function runConformanceKit(
           };
         },
         fsExists: async () => true,
+        fsExecutable: async () => true,
       };
       try {
         const res = await adapter.preflight(unauthDeps, {});
@@ -745,6 +749,7 @@ export async function runConformanceKit(
           return { ok: true, stdout: "ok", stderr: "" };
         },
         fsExists: async () => true,
+        fsExecutable: async () => true,
       };
       try {
         const res = await adapter.preflight(headlessDeps, {});

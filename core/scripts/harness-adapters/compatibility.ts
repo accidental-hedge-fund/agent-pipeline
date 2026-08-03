@@ -36,9 +36,10 @@ function isPathLikeCommand(command: string): boolean {
 
 /**
  * Presence probe for a custom reviewer command. PATH names use `which` +
- * version/help probes. Path-like commands (absolute or relative) also consult
- * the injectable `fsExists` seam and never report ready solely because the
- * string contains a slash.
+ * version/help probes. Path-like commands (absolute or relative) require an
+ * injectable executability check (`fsExecutable`) or a successful direct
+ * spawn probe — mere path existence is not enough (non-executable files and
+ * directories must fail closed as missing-cli).
  */
 async function isCommandPresent(
   deps: AdapterPreflightDeps,
@@ -47,11 +48,13 @@ async function isCommandPresent(
   if (await deps.execCheck("which", [command])) return true;
 
   if (isPathLikeCommand(command)) {
-    if (typeof deps.fsExists === "function") {
-      if (await deps.fsExists(command)) return true;
+    // Executable regular file (not a directory / non-executable path).
+    if (typeof deps.fsExecutable === "function") {
+      if (await deps.fsExecutable(command)) return true;
     }
-    // Direct probes: a real path may answer --version/--help; absence of both
-    // and of fsExists must fail closed (not "ready").
+    // Direct probes: a real executable path may answer --version/--help even
+    // when the injectable seam is absent. Existence-only (fsExists) must not
+    // report ready.
     if (await deps.execCheck(command, ["--version"]).catch(() => false)) return true;
     if (await deps.execCheck(command, ["--help"]).catch(() => false)) return true;
     return false;

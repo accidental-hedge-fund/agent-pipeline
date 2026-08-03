@@ -46,6 +46,13 @@ export interface DoctorDeps {
   execCheck(file: string, args: string[]): Promise<boolean>;
   /** Whether a filesystem path exists. */
   fsExists(p: string): Promise<boolean>;
+  /**
+   * Whether a path is a regular file the process can execute (X_OK, not a
+   * directory). Used by path-like custom-reviewer compatibility preflight so
+   * existence alone does not report ready. Optional on fakes; production
+   * {@link realDoctorDeps} always provides it.
+   */
+  fsExecutable?(p: string): Promise<boolean>;
   /** mtime in ms since epoch, or null when the path does not exist. */
   fileMtime(p: string): Promise<number | null>;
   /** Read a file as UTF-8 text; returns null on any error (missing, permission, etc). */
@@ -138,6 +145,15 @@ export function realDoctorDeps(): DoctorDeps {
     try {
       await fs.promises.access(p);
       return true;
+    } catch {
+      return false;
+    }
+  };
+  const fsExecutable: NonNullable<DoctorDeps["fsExecutable"]> = async (p) => {
+    try {
+      await fs.promises.access(p, fs.constants.X_OK);
+      const st = await fs.promises.stat(p);
+      return st.isFile();
     } catch {
       return false;
     }
@@ -253,6 +269,7 @@ export function realDoctorDeps(): DoctorDeps {
     exec,
     execCheck,
     fsExists,
+    fsExecutable,
     fileMtime,
     readTextFile,
     listDirNames,

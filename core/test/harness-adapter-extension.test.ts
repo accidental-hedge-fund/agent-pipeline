@@ -28,11 +28,12 @@ import { buildAdapterDeclaration } from "../scripts/harness-adapters/types.ts";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixtureDir = path.join(here, "fixtures", "adapter-extension");
 
-function fakeDeps(present = true, pathExists = present): AdapterPreflightDeps {
+function fakeDeps(present = true, pathExists = present, pathExecutable = pathExists): AdapterPreflightDeps {
   return {
     exec: async () => ({ ok: present, stdout: present ? "ok" : "", stderr: "" }),
     execCheck: async () => present,
     fsExists: async () => pathExists,
+    fsExecutable: async () => pathExecutable,
   };
 }
 
@@ -225,6 +226,7 @@ test("compatibility adapter: missing path-like CLI fails closed (not ready)", as
     exec: async () => ({ ok: false, stdout: "", stderr: "not found" }),
     execCheck: async () => false,
     fsExists: async () => false,
+    fsExecutable: async () => false,
   };
   const pre = await compat.preflight(absent, {});
   assert.equal(pre.ok, false, "path-like missing CLI must not report ready");
@@ -236,18 +238,49 @@ test("compatibility adapter: missing path-like CLI fails closed (not ready)", as
   assert.equal(smoke.failure, "missing-cli");
 });
 
-test("compatibility adapter: path-like CLI ready when fsExists reports present", async () => {
+test("compatibility adapter: path-like CLI ready when fsExecutable reports executable file", async () => {
   const pathCmd = "/opt/tools/my-reviewer";
   const compat = materializeCompatibilityAdapter(pathCmd);
   const present: AdapterPreflightDeps = {
     exec: async () => ({ ok: false, stdout: "", stderr: "" }),
     execCheck: async () => false, // which and --help/--version all fail
     fsExists: async (p) => p === pathCmd,
+    fsExecutable: async (p) => p === pathCmd,
   };
   const pre = await compat.preflight(present, { model: "auto", effort: "high" });
   assert.equal(pre.ok, true, JSON.stringify(pre));
   const smoke = await compat.runtimeSmoke(present);
   assert.equal(smoke.ok, true);
+});
+
+test("compatibility adapter: existing non-executable path fails as missing-cli", async () => {
+  const pathCmd = "/opt/tools/not-executable-reviewer";
+  const compat = materializeCompatibilityAdapter(pathCmd);
+  // Path exists but is not executable (e.g. mode 0644 or a directory).
+  const nonExec: AdapterPreflightDeps = {
+    exec: async () => ({ ok: false, stdout: "", stderr: "permission denied" }),
+    execCheck: async () => false,
+    fsExists: async (p) => p === pathCmd,
+    fsExecutable: async () => false,
+  };
+  const pre = await compat.preflight(nonExec, {});
+  assert.equal(pre.ok, false, "existence without executability must not report ready");
+  assert.equal(pre.failure, "missing-cli");
+  assert.match(pre.message ?? "", /not found|not executable|path/i);
+
+  const smoke = await compat.runtimeSmoke(nonExec);
+  assert.equal(smoke.ok, false);
+  assert.equal(smoke.failure, "missing-cli");
+
+  // Existence-only seam without fsExecutable must also fail closed.
+  const existsOnly: AdapterPreflightDeps = {
+    exec: async () => ({ ok: false, stdout: "", stderr: "" }),
+    execCheck: async () => false,
+    fsExists: async (p) => p === pathCmd,
+  };
+  const preExistsOnly = await compat.preflight(existsOnly, {});
+  assert.equal(preExistsOnly.ok, false, "fsExists alone must not report ready");
+  assert.equal(preExistsOnly.failure, "missing-cli");
 });
 
 test("conformance kit: covers supported settings, envelope normalize, failure classes", async () => {
