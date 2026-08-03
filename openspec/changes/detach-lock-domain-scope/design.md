@@ -96,6 +96,14 @@ Domain MUST be available before detach creates lock or run-dir artifacts. Detach
 
 **Decision:** Treat the unified issue-run lock as another row in the #459 assessment table: host-local, single-host supported scope, cross-host failure = two hosts each advance the same issue in their own worktrees (last-writer-wins on labels), not a new irreversible shared artifact. Update `cross-host-concurrency-scope` and project docs to name the unified lock (advance + detach) rather than only “advance lock”.
 
+| Lock site | Guards | Cross-host failure mode | Disposition |
+|---|---|---|---|
+| **Issue-run lock** (advance + detach; `(domain, issue)` → `/tmp/pipeline-{domain}-{N}.lock`) | One host's worktrees, run-state, detach wrapper exclusive dispatch for that issue | Two hosts advance the same issue → each in its own worktree; GitHub labels last-writer-wins | Single-host scope; documented |
+| Queue batch serialization | One host's queue/run-state | Two hosts run overlapping batches on their own machines | Single-host scope; documented |
+| Live-planning marker (`/tmp/pipeline-planning-*`) | One host's planning worktree for a repo+issue | Two hosts plan the same issue concurrently on separate checkouts | Single-host scope; documented |
+
+**Nested acquire under detach:** the wrapper holds the issue-run lock for its lifetime and sets `PIPELINE_ISSUE_RUN_LOCK_HELD={domain}:{issue}` on the inner advance process so `withLock` skips re-acquire (parent owns release). Without this skip, detach would deadlock against its own child on the unified path.
+
 **Non-decision:** No GitHub lease, no Redis, no flock over NFS claims.
 
 ### 6. Stale legacy path handling

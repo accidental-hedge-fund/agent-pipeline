@@ -453,8 +453,9 @@ test("parseProcessIdentityText / livePidFromIdentityMarker: require starttime", 
 
 test("findWrapperPidForIssue: live .lock-acquired without sentinel (#770 956d20df)", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "live-adv-wrap-"));
+  const domain = "agent-pipeline";
   const issue = 675;
-  const runDir = path.join(home, ".pipeline", "runs", String(issue), "2026-07-31_run1");
+  const runDir = path.join(home, ".pipeline", "runs", domain, String(issue), "2026-07-31_run1");
   fs.mkdirSync(runDir, { recursive: true });
   const start = "start-live-1";
   fs.writeFileSync(
@@ -463,6 +464,7 @@ test("findWrapperPidForIssue: live .lock-acquired without sentinel (#770 956d20d
   );
 
   const pid = findWrapperPidForIssue(issue, {
+    domain,
     homedir: home,
     isPidAlive: (p) => p === process.pid,
     getStartTime: (p) => (p === process.pid ? start : null),
@@ -473,6 +475,7 @@ test("findWrapperPidForIssue: live .lock-acquired without sentinel (#770 956d20d
   fs.writeFileSync(path.join(runDir, "sentinel.json"), JSON.stringify({ exitCode: 0 }));
   assert.equal(
     findWrapperPidForIssue(issue, {
+      domain,
       homedir: home,
       isPidAlive: () => true,
       getStartTime: () => start,
@@ -483,17 +486,19 @@ test("findWrapperPidForIssue: live .lock-acquired without sentinel (#770 956d20d
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test("findWrapperPidForIssue: live detach issue lock", () => {
+test("findWrapperPidForIssue: live shared issue-run lock (#634)", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "live-adv-dlock-"));
+  const domain = "repo-a";
   const issue = 42;
-  const issueDir = path.join(home, ".pipeline", "runs", String(issue));
-  fs.mkdirSync(issueDir, { recursive: true });
   const start = "start-lock-1";
-  fs.writeFileSync(path.join(issueDir, ".lock"), formatProcessIdentityMarker(process.pid, () => start));
+  const lockPath = path.join(home, `pipeline-${domain}-${issue}.lock`);
+  fs.writeFileSync(lockPath, formatProcessIdentityMarker(process.pid, () => start));
 
   assert.equal(
     findWrapperPidForIssue(issue, {
+      domain,
       homedir: home,
+      lockPath,
       isPidAlive: (p) => p === process.pid,
       getStartTime: (p) => (p === process.pid ? start : null),
     }),
@@ -501,7 +506,9 @@ test("findWrapperPidForIssue: live detach issue lock", () => {
   );
   assert.equal(
     findWrapperPidForIssue(issue, {
+      domain,
       homedir: home,
+      lockPath,
       isPidAlive: () => false,
       getStartTime: () => start,
     }),
@@ -512,13 +519,49 @@ test("findWrapperPidForIssue: live detach issue lock", () => {
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+test("findWrapperPidForIssue: cross-domain lock/wrapper does not count as live (#634)", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "live-adv-xdom-"));
+  const issue = 42;
+  const start = "start-x";
+  // Live wrapper only under repo-b
+  const runDirB = path.join(home, ".pipeline", "runs", "repo-b", String(issue), "run1");
+  fs.mkdirSync(runDirB, { recursive: true });
+  fs.writeFileSync(
+    path.join(runDirB, LOCK_ACQUIRED_FILE),
+    formatProcessIdentityMarker(process.pid, () => start),
+  );
+
+  assert.equal(
+    findWrapperPidForIssue(issue, {
+      domain: "repo-a",
+      homedir: home,
+      isPidAlive: (p) => p === process.pid,
+      getStartTime: () => start,
+    }),
+    null,
+    "repo-b wrapper must not count for repo-a",
+  );
+  assert.equal(
+    findWrapperPidForIssue(issue, {
+      domain: "repo-b",
+      homedir: home,
+      isPidAlive: (p) => p === process.pid,
+      getStartTime: () => start,
+    }),
+    process.pid,
+  );
+
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 test("findWrapperPidForIssue: stale non-sentinel marker with reused PID is not live (#770 eff1796b)", () => {
   // Wrapper killed before sentinel.json leaves .lock-acquired; OS reuses the PID
   // for an unrelated process. Without starttime verification this would return
   // wrapper_pid and strand redispatch until watchdog/pause.
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "live-adv-reuse-"));
+  const domain = "agent-pipeline";
   const issue = 770;
-  const runDir = path.join(home, ".pipeline", "runs", String(issue), "crashed-no-sentinel");
+  const runDir = path.join(home, ".pipeline", "runs", domain, String(issue), "crashed-no-sentinel");
   fs.mkdirSync(runDir, { recursive: true });
   const recycledPid = 4242;
   fs.writeFileSync(
@@ -528,6 +571,7 @@ test("findWrapperPidForIssue: stale non-sentinel marker with reused PID is not l
 
   assert.equal(
     findWrapperPidForIssue(issue, {
+      domain,
       homedir: home,
       isPidAlive: (p) => p === recycledPid, // kill -0 succeeds on the new process
       getStartTime: (p) => (p === recycledPid ? "birth-reused" : null),
@@ -540,6 +584,7 @@ test("findWrapperPidForIssue: stale non-sentinel marker with reused PID is not l
   fs.writeFileSync(path.join(runDir, LOCK_ACQUIRED_FILE), String(recycledPid));
   assert.equal(
     findWrapperPidForIssue(issue, {
+      domain,
       homedir: home,
       isPidAlive: () => true,
       getStartTime: () => "birth-reused",
@@ -555,6 +600,7 @@ test("findWrapperPidForIssue: stale non-sentinel marker with reused PID is not l
   );
   assert.equal(
     findWrapperPidForIssue(issue, {
+      domain,
       homedir: home,
       isPidAlive: (p) => p === recycledPid,
       getStartTime: (p) => (p === recycledPid ? "birth-original" : null),

@@ -3,7 +3,7 @@
 //
 // Unit tests inject the probe; production wires lock-file PID liveness,
 // freshness-bounded non-terminal run-store detection, wrapper/process identity
-// under ~/.pipeline/runs/<issue>, and terminal-aware loop linkage.
+// under ~/.pipeline/runs/<domain>/<issue>, and terminal-aware loop linkage.
 
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -13,8 +13,8 @@ import {
   LOCK_ACQUIRED_FILE,
   getProcessStartTime,
   issueRunsDir,
-  lockFilePath,
 } from "../detach.ts";
+import { issueRunLockPath } from "../lock.ts";
 import { isSameProcessInstance } from "./lock-ownership.ts";
 
 export type LiveAdvanceEvidenceClass =
@@ -170,8 +170,9 @@ export function isLockFileLive(lockPath: string): { live: boolean; pid?: number 
   }
 }
 
+/** Shared issue-run lock path — same identity as advance and detach (#634). */
 export function issueLockPath(domain: string, issueNumber: number): string {
-  return path.join("/tmp", `pipeline-${domain}-${issueNumber}.lock`);
+  return issueRunLockPath(domain, issueNumber);
 }
 
 export function advanceRunEventsPath(repoDir: string, pipelineRunId: string): string {
@@ -344,33 +345,39 @@ export function findActiveRunStoreForIssue(
 }
 
 /**
- * Production wrapper / process-identity lookup for an issue (#770 review 2
- * 956d20df / review finding eff1796b). Host-local only — reads the detach
- * issue lock and newest non-sentinel run dirs' `.lock-acquired` under
- * `~/.pipeline/runs/<issue>/`. Returns a live PID only when the marker's
- * process-identity token (pid + starttime) still matches the host process
- * table — bare PID liveness alone is not sufficient (PID reuse after a
+ * Production wrapper / process-identity lookup for an issue (#770 / #634).
+ * Host-local only — domain-scoped: reads the shared issue-run lock and newest
+ * non-sentinel run dirs' `.lock-acquired` under
+ * `~/.pipeline/runs/<domain>/<issue>/`. Returns a live PID only when the
+ * marker's process-identity token (pid + starttime) still matches the host
+ * process table — bare PID liveness alone is not sufficient (PID reuse after a
  * pre-sentinel crash must not suppress redispatch). Injectable FS / identity
- * for unit tests.
+ * for unit tests. Cross-domain locks do not count as live for this domain.
  */
 export function findWrapperPidForIssue(
   issueNumber: number,
-  opts?: {
+  opts: {
+    /** Required: same domain key as the issue-run lock / advance. */
+    domain: string;
     homedir?: string;
     readdirSync?: (dir: string) => string[];
     readText?: (p: string) => string | null;
     isPidAlive?: (pid: number) => boolean;
     getStartTime?: (pid: number) => string | number | null | undefined;
     statMtimeMs?: (p: string) => number;
+    /** Override issue-run lock path (tests). Default: issueRunLockPath(domain, issue). */
+    lockPath?: string;
   },
 ): number | null {
-  const home = opts?.homedir ?? os.homedir();
-  const readdir = opts?.readdirSync ?? ((dir: string) => fs.readdirSync(dir));
-  const read = opts?.readText ?? tryReadTextFile;
-  const alive = opts?.isPidAlive ?? isPidAlive;
-  const getStart = opts?.getStartTime ?? getProcessStartTime;
+  const domain = opts.domain;
+  if (!domain) return null;
+  const home = opts.homedir ?? os.homedir();
+  const readdir = opts.readdirSync ?? ((dir: string) => fs.readdirSync(dir));
+  const read = opts.readText ?? tryReadTextFile;
+  const alive = opts.isPidAlive ?? isPidAlive;
+  const getStart = opts.getStartTime ?? getProcessStartTime;
   const mtimeMs =
-    opts?.statMtimeMs ??
+    opts.statMtimeMs ??
     ((p: string) => {
       try {
         return fs.statSync(p).mtimeMs;
@@ -381,14 +388,13 @@ export function findWrapperPidForIssue(
   const liveFrom = (raw: string | null | undefined): number | null =>
     livePidFromIdentityMarker(raw, { isPidAlive: alive, getStartTime: getStart });
 
-  const issueDir = issueRunsDir(home, issueNumber);
-
-  // 1. Detach issue-level advisory lock (`~/.pipeline/runs/<issue>/.lock`)
-  const detachLock = lockFilePath(home, issueNumber);
-  const lockPid = liveFrom(read(detachLock));
+  // 1. Shared issue-run lock (`/tmp/pipeline-{domain}-{N}.lock`) with identity
+  const issueLock = opts.lockPath ?? issueRunLockPath(domain, issueNumber);
+  const lockPid = liveFrom(read(issueLock));
   if (lockPid != null) return lockPid;
 
   // 2. Newest non-terminal detach run dirs with a verified `.lock-acquired`
+  const issueDir = issueRunsDir(home, domain, issueNumber);
   let names: string[];
   try {
     names = readdir(issueDir);

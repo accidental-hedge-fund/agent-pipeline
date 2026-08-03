@@ -93,17 +93,28 @@ into the living specs and runs `openspec validate --all` — a structurally inva
   the concern and withholds the push. All three disciplines are drift-guarded by tests in
   `prompt-loader.test.ts`.
 
-## Concurrency scope (#459)
+## Concurrency scope (#459 / #634)
 
-- The engine's `/tmp` PID locks (`lock.ts`) — the per-issue/domain advance lock, the queue-batch
-  serialization, and the live-planning marker — are **host-local**: they provide mutual exclusion
-  only between processes on the same machine, none across distinct hosts. **Single-host operation
-  is the supported concurrency scope for these lock sites.** Each guards host-local state (one
-  host's worktrees, run-state dir, queue) whose cross-host failure mode is two hosts each doing
-  their own thing in their own worktree — not a persistent, irreversible shared artifact — so this
-  is a documented engineering disposition, not an oversight (see
-  `openspec/changes/cross-host-auto-file-serialization/design.md` for the full per-site
-  assessment).
+- The engine's host-local PID locks (`lock.ts`) — the **unified issue-run lock** used by both
+  foreground advance and detach (keyed by **domain + issue**, path
+  `/tmp/pipeline-{domain}-{N}.lock`; never issue-number-only), the queue-batch serialization, and
+  the live-planning marker — are **host-local**: they provide mutual exclusion only between
+  processes on the same machine, none across distinct hosts. **Single-host operation is the
+  supported concurrency scope for these lock sites.** Each guards host-local state (one host's
+  worktrees, run-state dir, detach wrapper runs, queue) whose cross-host failure mode is two hosts
+  each doing their own thing in their own worktree — not a persistent, irreversible shared
+  artifact — so this is a documented engineering disposition, not an oversight (see
+  `openspec/changes/cross-host-auto-file-serialization/design.md` and
+  `openspec/changes/detach-lock-domain-scope/design.md` for per-site assessment). Unifying advance
+  and detach onto one domain+issue key does **not** expand the lock to cross-host scope.
+- **Per-site dispositions (single-host):**
+  - **Issue-run lock** (advance + detach): guards one host's worktrees / run-state / exclusive
+    dispatch for `(domain, issue)`. Cross-host failure: two hosts advance the same issue in
+    separate worktrees (GitHub labels last-writer-wins).
+  - **Queue-batch serialization:** one host's queue/run-state; two hosts run overlapping batches
+    independently.
+  - **Live-planning marker:** one host's planning worktree for a repo+issue; two hosts plan on
+    separate checkouts.
 - **Exception: the auto-file path** (`autoFilePapercuts`, `autoFileCorrections`,
   `autoFileDurableRunBlockers` in `core/scripts/stages/papercut.ts`) is hardened to be
   **cross-host safe** for all three categories, because its failure mode — a duplicate or over-cap

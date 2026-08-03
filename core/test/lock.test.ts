@@ -12,6 +12,14 @@ import {
   setLivePlanningMarker,
   clearLivePlanningMarker,
   livePlanningMarkerPath,
+  PipelineLock,
+  issueRunLockPath,
+  domainLockPath,
+  withLock,
+  isIssueRunLockHeldByParent,
+  ISSUE_RUN_LOCK_HELD_ENV,
+  issueRunLockHeldToken,
+  formatProcessIdentityMarker,
 } from "../scripts/lock.ts";
 
 const REPO = "test-owner/tryacquire-test";
@@ -155,4 +163,174 @@ test("setLivePlanningMarker: overwrites existing marker atomically", () => {
 
 test("clearLivePlanningMarker: no-op when marker is absent", () => {
   assert.doesNotThrow(() => clearLivePlanningMarker(REPO, ISSUE));
+});
+
+// ---------------------------------------------------------------------------
+// Issue-run lock API (#634) — domain+issue identity, dual-entry, non-collision
+// ---------------------------------------------------------------------------
+
+function uniqueDomain(label: string): string {
+  return `t634-${label}-${process.pid}-${Date.now().toString(36)}`;
+}
+
+function cleanupLock(lockPath: string): void {
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+    /* ignore */
+  }
+}
+
+test("issueRunLockPath: encodes domain and issue, never issue-only", () => {
+  const a = issueRunLockPath("repo-a", 42);
+  const b = issueRunLockPath("repo-b", 42);
+  assert.equal(a, "/tmp/pipeline-repo-a-42.lock");
+  assert.equal(b, "/tmp/pipeline-repo-b-42.lock");
+  assert.notEqual(a, b);
+  assert.ok(!a.endsWith("/42.lock") || a.includes("repo-a"));
+  // Prove issue-only construction would collide — the shared helper must not.
+  const issueOnly = "/tmp/pipeline-42.lock";
+  assert.notEqual(a, issueOnly);
+  assert.notEqual(b, issueOnly);
+});
+
+test("issueRunLockPath: rejects empty domain / non-positive issue", () => {
+  assert.throws(() => issueRunLockPath("", 1), /domain/);
+  assert.throws(() => issueRunLockPath("d", 0), /issueNumber/);
+  assert.throws(() => issueRunLockPath("d", -1), /issueNumber/);
+});
+
+test("domainLockPath: legacy domain-wide path omits issue", () => {
+  assert.equal(domainLockPath("myrepo"), "/tmp/pipeline-myrepo.lock");
+});
+
+test("#634 cross-domain non-collision: same issue number under two domains can both hold", () => {
+  const dA = uniqueDomain("a");
+  const dB = uniqueDomain("b");
+  const lockA = new PipelineLock({ domain: dA, issueNumber: 42 });
+  const lockB = new PipelineLock({ domain: dB, issueNumber: 42 });
+  try {
+    assert.equal(lockA.acquire(), true, "repo-a #42 should acquire");
+    assert.equal(lockB.acquire(), true, "repo-b #42 must not collide with repo-a");
+    assert.notEqual(lockA.path, lockB.path);
+    // Issue-only path would be a single file — both holds prove we are not that.
+    assert.ok(fs.existsSync(lockA.path));
+    assert.ok(fs.existsSync(lockB.path));
+  } finally {
+    lockA.release();
+    lockB.release();
+    cleanupLock(lockA.path);
+    cleanupLock(lockB.path);
+  }
+});
+
+test("#634 same domain+issue is exclusive (second acquire rejected)", () => {
+  const d = uniqueDomain("same");
+  const first = new PipelineLock({ domain: d, issueNumber: 10 });
+  const second = new PipelineLock({ domain: d, issueNumber: 10 });
+  try {
+    assert.equal(first.acquire(), true);
+    assert.equal(second.acquire(), false, "live holder must block second exclusive acquire");
+  } finally {
+    first.release();
+    cleanupLock(first.path);
+  }
+});
+
+test("#634 different issues under one domain remain concurrent", () => {
+  const d = uniqueDomain("diff");
+  const lock10 = new PipelineLock({ domain: d, issueNumber: 10 });
+  const lock11 = new PipelineLock({ domain: d, issueNumber: 11 });
+  try {
+    assert.equal(lock10.acquire(), true);
+    assert.equal(lock11.acquire(), true, "different issues must not serialize");
+  } finally {
+    lock10.release();
+    lock11.release();
+    cleanupLock(lock10.path);
+    cleanupLock(lock11.path);
+  }
+});
+
+test("#634 dual-entry: advance holder blocks detach-style acquire for same key", async () => {
+  const d = uniqueDomain("adv");
+  const advance = new PipelineLock({ domain: d, issueNumber: 99 });
+  try {
+    assert.equal(advance.acquire(), true);
+    const detach = new PipelineLock({ domain: d, issueNumber: 99 });
+    assert.equal(detach.acquire(), false, "detach must see advance holder");
+    await assert.rejects(
+      () => detach.acquireWithTimeout(50),
+      /already running/,
+    );
+  } finally {
+    advance.release();
+    cleanupLock(advance.path);
+  }
+});
+
+test("#634 dual-entry: detach holder blocks withLock (foreground advance) for same key", async () => {
+  const d = uniqueDomain("det");
+  const detach = new PipelineLock({ domain: d, issueNumber: 88 });
+  try {
+    assert.equal(detach.acquire(), true);
+    await assert.rejects(
+      () => withLock(d, async () => "should-not-run", 88),
+      /Pipeline lock held/,
+    );
+  } finally {
+    detach.release();
+    cleanupLock(detach.path);
+  }
+});
+
+test("#634 withLock skips re-acquire when parent wrapper holds issue-run lock", async () => {
+  const d = uniqueDomain("nest");
+  const parent = new PipelineLock({ domain: d, issueNumber: 55 });
+  const prev = process.env[ISSUE_RUN_LOCK_HELD_ENV];
+  try {
+    assert.equal(parent.acquire(), true);
+    process.env[ISSUE_RUN_LOCK_HELD_ENV] = issueRunLockHeldToken(d, 55);
+    assert.equal(isIssueRunLockHeldByParent(d, 55), true);
+    const result = await withLock(d, async () => "nested-ok", 55);
+    assert.equal(result, "nested-ok");
+    // Parent still holds the file
+    assert.ok(fs.existsSync(parent.path));
+  } finally {
+    if (prev === undefined) delete process.env[ISSUE_RUN_LOCK_HELD_ENV];
+    else process.env[ISSUE_RUN_LOCK_HELD_ENV] = prev;
+    parent.release();
+    cleanupLock(parent.path);
+  }
+});
+
+test("#634 issue-run lock marker prefers pid+starttime when available", () => {
+  const d = uniqueDomain("mark");
+  const lock = new PipelineLock({
+    domain: d,
+    issueNumber: 1,
+    formatMarker: (pid) => formatProcessIdentityMarker(pid, () => "99999"),
+  });
+  try {
+    assert.equal(lock.acquire(), true);
+    const body = fs.readFileSync(lock.path, "utf8").trim();
+    assert.equal(body, `${process.pid} 99999`);
+  } finally {
+    lock.release();
+    cleanupLock(lock.path);
+  }
+});
+
+test("#634 domain-wide lock (no issue) still uses bare path", () => {
+  const d = uniqueDomain("wide");
+  const lock = new PipelineLock({ domain: d });
+  try {
+    assert.equal(lock.path, domainLockPath(d));
+    assert.equal(lock.acquire(), true);
+    const body = fs.readFileSync(lock.path, "utf8").trim();
+    assert.equal(body, String(process.pid), "domain-wide marker stays bare PID");
+  } finally {
+    lock.release();
+    cleanupLock(lock.path);
+  }
 });

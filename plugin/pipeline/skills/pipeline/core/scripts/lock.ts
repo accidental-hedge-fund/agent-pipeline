@@ -1,26 +1,137 @@
 // PID-based file lock with stale-lock recovery.
-// Path is /tmp/pipeline-{domain}-{N}.lock when an issueNumber is given (per-issue
-// mutex — multiple pipeline runs on different issues coexist), otherwise
-// /tmp/pipeline-{domain}.lock (legacy global lock, kept for back-compat).
-// Mirrors the Python implementation in ~/.openclaw/scripts/pipeline/lock.py.
+//
+// Issue-run mutex (#634): when an issueNumber is given the identity is always
+// (domain, issue) at /tmp/pipeline-{domain}-{N}.lock — shared by foreground
+// advance and detach. Never issue-number-only. Host-local only (no cross-host
+// mutual exclusion; single-host is the supported concurrency scope — #459).
+// Without issueNumber: /tmp/pipeline-{domain}.lock (legacy domain-wide lock).
+//
+// Marker body prefers `pid starttime` (#770 recycled-PID safety) when starttime
+// is known; bare PID remains parseable by readers that only need the first token.
 
 import * as fs from "node:fs";
+import { spawnSync } from "node:child_process";
+
+// ---------------------------------------------------------------------------
+// Path construction — single shared identity for advance + detach
+// ---------------------------------------------------------------------------
+
+/** Host-local issue-run lock path for `(domain, issueNumber)`. Never issue-only. */
+export function issueRunLockPath(domain: string, issueNumber: number): string {
+  if (!domain || typeof domain !== "string") {
+    throw new Error("issueRunLockPath: domain must be a non-empty string");
+  }
+  if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
+    throw new Error(`issueRunLockPath: issueNumber must be a positive integer, got ${issueNumber}`);
+  }
+  return `/tmp/pipeline-${domain}-${issueNumber}.lock`;
+}
+
+/** Legacy domain-wide lock (callers that omit issueNumber). */
+export function domainLockPath(domain: string): string {
+  if (!domain || typeof domain !== "string") {
+    throw new Error("domainLockPath: domain must be a non-empty string");
+  }
+  return `/tmp/pipeline-${domain}.lock`;
+}
+
+// ---------------------------------------------------------------------------
+// Process-instance identity for issue-run lock markers (#634 / #770)
+// ---------------------------------------------------------------------------
+
+/**
+ * Host process starttime token for `pid`.
+ * Linux: `/proc/<pid>/stat` field 22 (clock ticks). Darwin/portable: `ps -o lstart=`.
+ * Returns null when the process is gone or the token cannot be read.
+ */
+export function getProcessStartTime(pid: number): string | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const s = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const i = s.lastIndexOf(")");
+    if (i >= 0) {
+      const f = s.slice(i + 2).trim().split(/\s+/);
+      if (f[19]) return f[19];
+    }
+  } catch {
+    /* not Linux, or process gone — try portable fallback */
+  }
+  try {
+    const out = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: 2000,
+    });
+    if (out.status === 0) {
+      const t = (out.stdout ?? "").trim();
+      if (t) return t;
+    }
+  } catch {
+    /* ps unavailable */
+  }
+  return null;
+}
+
+/**
+ * Body for issue-run lock / detach handshake markers: `pid starttime` when
+ * starttime is known, else bare `pid` (readers treat bare pid as non-verifiable
+ * for identity probes that require starttime).
+ */
+export function formatProcessIdentityMarker(
+  pid: number = process.pid,
+  getStartTime: (p: number) => string | null = getProcessStartTime,
+): string {
+  const st = getStartTime(pid);
+  return st != null && st !== "" ? `${pid} ${st}` : String(pid);
+}
+
+/**
+ * Env token set by the detach wrapper so the inner advance process does not
+ * re-acquire the same issue-run lock the wrapper already holds (#634).
+ * Format: `{domain}:{issueNumber}`.
+ */
+export const ISSUE_RUN_LOCK_HELD_ENV = "PIPELINE_ISSUE_RUN_LOCK_HELD";
+
+export function issueRunLockHeldToken(domain: string, issueNumber: number): string {
+  return `${domain}:${issueNumber}`;
+}
+
+/** True when the current process is nested under a parent that holds this issue-run lock. */
+export function isIssueRunLockHeldByParent(domain: string, issueNumber: number): boolean {
+  const v = process.env[ISSUE_RUN_LOCK_HELD_ENV];
+  return v === issueRunLockHeldToken(domain, issueNumber);
+}
 
 export interface PipelineLockOptions {
   domain: string;
   /** Optional issue number — when provided, lock is per-issue rather than per-domain. */
   issueNumber?: number;
+  /**
+   * Injectable identity-marker writer (tests). Default: formatProcessIdentityMarker.
+   * Domain-wide locks still use bare PID for back-compat with older readers.
+   */
+  formatMarker?: (pid: number) => string;
 }
 
 export class PipelineLock {
   readonly path: string;
+  readonly domain: string;
+  readonly issueNumber: number | undefined;
   private acquired = false;
+  private readonly formatMarker: (pid: number) => string;
 
   constructor(opts: PipelineLockOptions) {
+    this.domain = opts.domain;
+    this.issueNumber = opts.issueNumber;
     this.path =
       opts.issueNumber !== undefined
-        ? `/tmp/pipeline-${opts.domain}-${opts.issueNumber}.lock`
-        : `/tmp/pipeline-${opts.domain}.lock`;
+        ? issueRunLockPath(opts.domain, opts.issueNumber)
+        : domainLockPath(opts.domain);
+    // Per-issue: stronger pid+starttime. Domain-wide: bare PID (legacy).
+    this.formatMarker =
+      opts.formatMarker ??
+      (opts.issueNumber !== undefined
+        ? (pid) => formatProcessIdentityMarker(pid)
+        : (pid) => String(pid));
   }
 
   /** Try to acquire the lock. Returns true if acquired. */
@@ -29,7 +140,7 @@ export class PipelineLock {
       // O_CREAT | O_EXCL: atomic create-or-fail.
       const fd = fs.openSync(this.path, "wx");
       try {
-        fs.writeSync(fd, String(process.pid));
+        fs.writeSync(fd, this.formatMarker(process.pid));
       } finally {
         fs.closeSync(fd);
       }
@@ -44,6 +155,34 @@ export class PipelineLock {
     }
   }
 
+  /**
+   * Retry acquire until `timeoutMs` elapses (detach wrapper). Throws a
+   * human-readable error when the lock remains held by a live process.
+   */
+  async acquireWithTimeout(timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      if (this.acquire()) return;
+      if (Date.now() >= deadline) {
+        let holder = "";
+        try {
+          holder = ` (held by PID ${fs.readFileSync(this.path, "utf8").trim()})`;
+        } catch {
+          /* vanished */
+        }
+        const scope =
+          this.issueNumber !== undefined
+            ? `issue #${this.issueNumber}`
+            : `domain ${this.domain}`;
+        throw new Error(
+          `pipeline: ${scope} is already running${holder}. ` +
+            `Wait for the run to finish or remove ${this.path} if it is stale.`,
+        );
+      }
+      await new Promise<void>((r) => setTimeout(r, 200));
+    }
+  }
+
   private handleExistingLock(): boolean {
     let pidText: string;
     try {
@@ -54,7 +193,8 @@ export class PipelineLock {
       throw err;
     }
 
-    const pid = Number.parseInt(pidText, 10);
+    // First token is the PID; optional starttime follows (#770 / #634 markers).
+    const pid = Number.parseInt(pidText.split(/\s+/)[0] ?? "", 10);
     if (!Number.isFinite(pid) || pid <= 0) {
       // Garbage in lock file → treat as stale.
       this.removeStale();
@@ -105,15 +245,22 @@ export class PipelineLock {
 /**
  * Run `fn` while holding the pipeline lock. Throws if the lock is held.
  *
- * If `issueNumber` is provided the lock is per-issue (`/tmp/pipeline-{domain}-{N}.lock`),
- * letting concurrent pipeline runs on different issues coexist. Without it, the lock
- * is per-domain (legacy behavior).
+ * If `issueNumber` is provided the lock is the shared issue-run mutex
+ * (`/tmp/pipeline-{domain}-{N}.lock`) used by both foreground advance and
+ * detach. Without it, the lock is per-domain (legacy behavior).
+ *
+ * When the detach wrapper already holds the issue-run lock, it sets
+ * {@link ISSUE_RUN_LOCK_HELD_ENV} so the inner advance process skips re-acquire
+ * (parent owns release for the wrapper lifetime).
  */
 export async function withLock<T>(
   domain: string,
   fn: () => Promise<T>,
   issueNumber?: number,
 ): Promise<T> {
+  if (issueNumber !== undefined && isIssueRunLockHeldByParent(domain, issueNumber)) {
+    return await fn();
+  }
   const lock = new PipelineLock({ domain, issueNumber });
   if (!lock.acquire()) {
     const scope = issueNumber !== undefined ? `for #${issueNumber}` : `(domain-wide)`;
