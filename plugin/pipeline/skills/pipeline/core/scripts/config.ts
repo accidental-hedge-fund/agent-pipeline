@@ -23,7 +23,12 @@ import {
 } from "./types.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
 import { expandAutoEffort, expandAutoModel, isClaudeOnlyModelAlias } from "./stage-routing.ts";
-import { resolveAdapter, registeredAdapterNames } from "./harness-adapters/index.ts";
+import {
+  adapterSupportsRole,
+  loadAdapterExtensions,
+  resolveAdapter,
+  registeredAdapterNames,
+} from "./harness-adapters/index.ts";
 
 // A `models.*`/`effort.*` value: an arbitrary alias/effort string, or the
 // "auto" sentinel (#366) resolved via stage-routing.ts at config-load time.
@@ -248,8 +253,8 @@ const PartialConfigSchema = z.object({
   // a typo'd key (e.g. `reviewr`) is rejected rather than silently ignored.
   harnesses: z
     .object({
-      implementer: z.string().min(1, "harnesses.implementer must not be empty").optional().describe("Primary harness that performs planning, implementation, and fixes. Must name a registered harness adapter (claude, codex, grok, opencode, pi). Falls back to the active profile's implementer when omitted."),
-      reviewer: z.string().min(1, "harnesses.reviewer must not be empty").optional().describe("Secondary harness that performs review. May name a registered adapter or an arbitrary custom reviewer CLI. Falls back to the active profile's reviewer (or review_harness, when set) when omitted."),
+      implementer: z.string().min(1, "harnesses.implementer must not be empty").optional().describe("Primary harness that performs planning, implementation, and fixes. Must name a registered harness adapter that declares the implementer role (built-ins plus any adapter_extensions entries). Falls back to the active profile's implementer when omitted."),
+      reviewer: z.string().min(1, "harnesses.reviewer must not be empty").optional().describe("Secondary harness that performs review. May name a registered adapter that declares the reviewer role, or an arbitrary custom reviewer CLI (compatibility path). Falls back to the active profile's reviewer (or review_harness, when set) when omitted."),
     })
     .strict()
     .optional()
@@ -533,7 +538,15 @@ const PartialConfigSchema = z.object({
         .strict(),
     ])
     .optional()
-    .describe("Override the reviewer CLI for the review step (profile default when absent). Either a bare command string, or { command, model?, effort?, prompt_delivery? } for independent reviewer model/effort/prompt-delivery control."),
+    .describe("Override the reviewer CLI for the review step (profile default when absent). Either a bare command string, or { command, model?, effort?, prompt_delivery? } for independent reviewer model/effort/prompt-delivery control. Unregistered names materialize through the adapter extension compatibility path (#783 / #40)."),
+  // #783: explicit end-user adapter extension entry points. Only listed modules
+  // are loaded — never auto-scanned from node_modules. Each entry is a
+  // repo-relative path (./…), absolute path, or package name that exports a
+  // HarnessAdapter (default / adapters) or register(api) hook.
+  adapter_extensions: z
+    .array(z.string().min(1, "adapter_extensions entries must be non-empty strings"))
+    .optional()
+    .describe("Module entry points that register third-party harness adapters into the runtime registry. Paths are resolved from the repository root; package names must be resolvable from the engine or repo install. Only explicitly listed entries load — unconfigured packages are never auto-loaded."),
   conventions_md_path: z.string().optional().describe("Repo-root-relative path to the conventions file embedded in stage prompts."),
   domain_name: z.string().optional().describe("Human-readable project name used in prompts and logs."),
   domain_description: z.string().optional().describe("Short description of this repository for prompt context."),
@@ -811,17 +824,47 @@ function resolveHarnessRoles(
 /**
  * The implementer role has no custom-CLI escape hatch (unlike the reviewer,
  * which may name an arbitrary command via `review_harness`/`harnesses.reviewer`)
- * — it must always resolve to a registered harness adapter. Validated here,
- * at config-resolve time, rather than left to fail at first spawn, so a typo
+ * — it must always resolve to a registered harness adapter that declares the
+ * implementer role capability (#783). Validated here, at config-resolve time,
+ * rather than left to fail at first spawn, so a typo
  * (`harnesses: { implementer: grock }`) is reported before a worktree is
  * created and names the offending key, value, and the registered names.
  */
 function validateImplementerHarness(implementer: string, source: HarnessRoleSource): void {
-  if (resolveAdapter(implementer) !== null) return;
   const key = source === "repo-config" ? "harnesses.implementer" : "profile.harnesses.implementer";
-  throw new Error(
-    `${key} names "${implementer}", which has no registered harness adapter. Registered adapters: ${registeredAdapterNames().join(", ")}.`,
-  );
+  const adapter = resolveAdapter(implementer);
+  if (adapter === null) {
+    throw new Error(
+      `${key} names "${implementer}", which has no registered harness adapter. Registered adapters: ${registeredAdapterNames().join(", ")}.`,
+    );
+  }
+  if (!adapterSupportsRole(adapter, "implementer")) {
+    throw new Error(
+      `${key} names "${implementer}", which does not declare the implementer role capability ` +
+        `(declared roles: ${adapter.declaration.roles.join(", ") || "(none)"}).`,
+    );
+  }
+}
+
+/**
+ * When the reviewer names a registered adapter, require the reviewer role
+ * capability. Unregistered names remain valid (compatibility custom CLI, #40).
+ */
+function validateReviewerHarness(reviewer: string, source: HarnessRoleSource): void {
+  const adapter = resolveAdapter(reviewer);
+  if (adapter === null) return; // compatibility path
+  if (!adapterSupportsRole(adapter, "reviewer")) {
+    const key =
+      source === "repo-config"
+        ? "harnesses.reviewer"
+        : source === "review_harness"
+          ? "review_harness"
+          : "profile.harnesses.reviewer";
+    throw new Error(
+      `${key} names "${reviewer}", which does not declare the reviewer role capability ` +
+        `(declared roles: ${adapter.declaration.roles.join(", ") || "(none)"}).`,
+    );
+  }
 }
 
 export interface ResolveOptions {
@@ -900,6 +943,28 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     }
   }
 
+  // #783: load explicitly configured adapter extension modules before role
+  // validation so extension IDs are in the runtime registry. Only listed
+  // entry points load — never auto-scanned packages.
+  if (fileConfig.adapter_extensions && fileConfig.adapter_extensions.length > 0) {
+    const extResult = loadAdapterExtensions({
+      repoDir,
+      entryPoints: fileConfig.adapter_extensions,
+    });
+    if (extResult.errors.length > 0) {
+      const message = extResult.errors.join("; ");
+      if (opts.tolerateInvalidConfig) {
+        if (!opts.quiet) {
+          console.warn(
+            `[pipeline] init: adapter_extensions load errors — continuing without those adapters.\n  ${message}`,
+          );
+        }
+      } else {
+        throw new Error(`Invalid ${configPath}: ${message}`);
+      }
+    }
+  }
+
   // tolerateGhFailure: caller flag (standalone doctor / --doctor) OR
   // doctor.runOnStart: true from the local config.  In both cases resolveConfig
   // must not throw on a gh failure so that the preflight gate can run and report
@@ -954,6 +1019,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
   try {
     resolvedRoles = resolveHarnessRoles(fileConfig, profile.harnesses);
     validateImplementerHarness(resolvedRoles.implementer, resolvedRoles.implementerSource);
+    validateReviewerHarness(resolvedRoles.reviewer, resolvedRoles.reviewerSource);
   } catch (err) {
     if (opts.tolerateInvalidConfig) {
       if (!opts.quiet) {
@@ -1259,15 +1325,12 @@ function harnessCapable(harness: string, capability: "model" | "effort"): boolea
  * Warn (non-blocking) about `models.*` aliases that were explicitly set in
  * `.github/pipeline.yml` but are silently inert because the backing role
  * harness's adapter declares no model capability (#608) — e.g. a custom
- * reviewer CLI. Every registered adapter (claude, codex, grok, opencode, pi)
- * declares `model: true`, so no registered role harness ever warns here; this
- * corrects the pre-#608 false positive that fired whenever the implementer
- * was `codex` (implementer model passthrough was already implemented via
- * `invoke()`/`AdapterInvocationContext`, the advisory just hadn't caught up).
- * Advisory only: no throw, no fallback, and the resolved config is unchanged
- * (the inert alias is preserved in `config.models`). Keys absent from
- * `fileConfig.models` take their value from DEFAULT_CONFIG and never warn —
- * only user-authored, inert config does.
+ * reviewer CLI. Registered adapters that declare `model: true` never warn
+ * here; extension adapters may declare model support via the public contract
+ * (#783). Advisory only: no throw, no fallback, and the resolved config is
+ * unchanged (the inert alias is preserved in `config.models`). Keys absent
+ * from `fileConfig.models` take their value from DEFAULT_CONFIG and never
+ * warn — only user-authored, inert config does.
  */
 function warnInertModelAliases(
   fileModels: z.infer<typeof PartialConfigSchema>["models"],
@@ -1795,6 +1858,7 @@ export function validateConfig(
       try {
         resolvedRoles = resolveHarnessRoles(fileConfig, profileHarnesses);
         validateImplementerHarness(resolvedRoles.implementer, resolvedRoles.implementerSource);
+        validateReviewerHarness(resolvedRoles.reviewer, resolvedRoles.reviewerSource);
       } catch (err) {
         diagnostics.push({
           severity: "error",
@@ -2042,6 +2106,28 @@ function renderHarnessesBlock(harnesses: PartialConfig["harnesses"]): string {
   return lines.join("\n");
 }
 
+/** Render the `adapter_extensions:` list (#783) — explicit module entry points
+ *  that register third-party harness adapters into the runtime registry. */
+function renderAdapterExtensionsBlock(
+  extensions: PartialConfig["adapter_extensions"],
+): string {
+  const topDescription = sd(
+    "adapter_extensions",
+    "Module entry points that register third-party harness adapters into the runtime registry.",
+  );
+  if (extensions === undefined) {
+    return [
+      `# adapter_extensions: # ${topDescription} Only listed entries load — never auto-scanned from node_modules.`,
+      `#   - ./path/to/my-adapter.cjs # repo-relative path, absolute path, or package name exporting adapters / register(api)`,
+    ].join("\n");
+  }
+  if (extensions.length === 0) return `adapter_extensions: [] # ${topDescription}`;
+  return [
+    `adapter_extensions: # ${topDescription}`,
+    ...extensions.map((e) => `  - ${yamlScalar(e)}`),
+  ].join("\n");
+}
+
 /** Render the `review_harness:` block for either the string shorthand or the
  *  structured `{ command, model?, effort? }` form (#366). */
 function renderReviewHarnessBlock(reviewHarness: PartialConfig["review_harness"]): string {
@@ -2173,6 +2259,8 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     renderHarnessesBlock(config.harnesses),
     "",
     renderReviewHarnessBlock(config.review_harness),
+    "",
+    renderAdapterExtensionsBlock(config.adapter_extensions),
     "",
     "openspec:",
     `  enabled: ${yamlScalar(openspec.enabled)} # ${sd("openspec.enabled", "auto | on | off")}`,

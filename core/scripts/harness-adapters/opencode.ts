@@ -28,6 +28,8 @@
 
 import {
   EMPTY_TELEMETRY,
+  buildAdapterDeclaration,
+  defaultRuntimeSmoke,
   type AdapterCapabilities,
   type AdapterInvocation,
   type AdapterInvocationContext,
@@ -56,6 +58,16 @@ const CAPABILITIES: AdapterCapabilities = {
 export const opencodeAdapter: HarnessAdapter = {
   name: "opencode",
   capabilities: CAPABILITIES,
+  declaration: buildAdapterDeclaration({
+    command: "opencode",
+    capabilities: CAPABILITIES,
+    promptDelivery: "argv",
+    modelValidation: "format",
+    outputEnvelope: "text",
+    authProbe: "documented",
+    versionProbe: "documented",
+    origin: "builtin",
+  }),
 
   buildInvocation(ctx: AdapterInvocationContext): AdapterInvocation {
     const args = ["run", ctx.prompt, "--dir", ctx.worktreeDir];
@@ -140,6 +152,11 @@ export const opencodeAdapter: HarnessAdapter = {
       nativeFlags,
       fallback: null,
       throttled: probe.throttled ?? null,
+      origin: "builtin",
     };
+  },
+
+  runtimeSmoke(deps: AdapterPreflightDeps): Promise<AdapterPreflightResult> {
+    return defaultRuntimeSmoke("opencode", deps);
   },
 };

@@ -19,7 +19,10 @@ import { fileURLToPath } from "node:url";
 import type { PipelineConfig } from "../types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "../artifact-sanitize.ts";
 import { checkLoopContractCoherence } from "../loop-preflight.ts";
-import { resolveAdapter } from "../harness-adapters/index.ts";
+import {
+  materializeCompatibilityAdapter,
+  resolveAdapter,
+} from "../harness-adapters/index.ts";
 import { isElevatedWriteHealth, parseWriteHealthText } from "../run-store.ts";
 
 const execFileAsync = promisify(execFile);
@@ -43,6 +46,13 @@ export interface DoctorDeps {
   execCheck(file: string, args: string[]): Promise<boolean>;
   /** Whether a filesystem path exists. */
   fsExists(p: string): Promise<boolean>;
+  /**
+   * Whether a path is a regular file the process can execute (X_OK, not a
+   * directory). Used by path-like custom-reviewer compatibility preflight so
+   * existence alone does not report ready. Optional on fakes; production
+   * {@link realDoctorDeps} always provides it.
+   */
+  fsExecutable?(p: string): Promise<boolean>;
   /** mtime in ms since epoch, or null when the path does not exist. */
   fileMtime(p: string): Promise<number | null>;
   /** Read a file as UTF-8 text; returns null on any error (missing, permission, etc). */
@@ -135,6 +145,15 @@ export function realDoctorDeps(): DoctorDeps {
     try {
       await fs.promises.access(p);
       return true;
+    } catch {
+      return false;
+    }
+  };
+  const fsExecutable: NonNullable<DoctorDeps["fsExecutable"]> = async (p) => {
+    try {
+      await fs.promises.access(p, fs.constants.X_OK);
+      const st = await fs.promises.stat(p);
+      return st.isFile();
     } catch {
       return false;
     }
@@ -250,6 +269,7 @@ export function realDoctorDeps(): DoctorDeps {
     exec,
     execCheck,
     fsExists,
+    fsExecutable,
     fileMtime,
     readTextFile,
     listDirNames,
@@ -452,36 +472,37 @@ export function buildPreflightChecks(
     },
   });
 
-  // 5. Harness availability — every distinct resolved-role harness (#608:
-  // implementer and reviewer, which may now name any registered adapter, not
-  // only claude/codex).
+  // 5. Harness availability — every distinct resolved-role harness (#608 /
+  // #783): implementer and reviewer from config assignment + runtime
+  // registry, not a hardcoded built-in name list. Extension adapters assigned
+  // by config are included; unassigned registered adapters may be skipped.
   //
-  // A registered adapter (claude, codex, grok, opencode, pi) is checked with
-  // its own `preflight()`, which distinguishes missing-CLI from
-  // unauthenticated (e.g. `grok login`) — closing the pre-#608 gap where any
-  // non-built-in harness only got a PATH-only `which` probe. A custom
-  // reviewer CLI (review_harness, #40) has no registered adapter and no
-  // documented non-interactive login-state probe — it only guarantees
-  // `<bin> "<prompt>"` as its contract, and running it could invoke a model —
-  // so it keeps the PATH-only `which` check to stay model-free.
+  // Registered adapters use their own preflight/runtimeSmoke. Unregistered
+  // custom reviewer CLIs (review_harness, #40) materialize the compatibility
+  // adapter on the public extension contract — PATH-only smoke, no model call.
   const harnessRoleBins = [...new Set([config.harnesses.implementer, config.harnesses.reviewer])];
   for (const bin of harnessRoleBins) {
-    const adapter = resolveAdapter(bin);
+    const adapter =
+      resolveAdapter(bin) ??
+      materializeCompatibilityAdapter(bin, {
+        promptDelivery: config.harnesses.reviewerPromptDelivery ?? "argv",
+      });
     checks.push({
       id: `harness:${bin}`,
       description: `Configured harness \`${bin}\` is installed and authenticated`,
       run: async (deps) => {
-        if (!adapter) {
-          return (await deps.execCheck("which", [bin]))
-            ? pass(`\`${bin}\` is available`)
-            : fail(
-                `configured harness \`${bin}\` was not found on PATH`,
-                `Install the \`${bin}\` CLI and ensure it is on your PATH — it is a configured pipeline harness for this profile.`,
-              );
-        }
-        const result = await adapter.preflight(deps, {});
+        // Prefer full preflight for registered adapters; smoke for a quick
+        // PATH check is available on every adapter for cheap readiness.
+        const result =
+          adapter.declaration.origin === "compatibility"
+            ? await adapter.runtimeSmoke(deps)
+            : await adapter.preflight(deps, {});
         if (result.ok) {
-          return pass(`\`${bin}\` is available and authenticated`);
+          const suffix =
+            adapter.declaration.origin === "compatibility"
+              ? "is available"
+              : "is available and authenticated";
+          return pass(`\`${bin}\` ${suffix}`);
         }
         const remediation =
           result.failure === "missing-cli"

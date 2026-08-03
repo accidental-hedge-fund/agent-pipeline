@@ -1533,9 +1533,20 @@ test("invoke(): opts.env reaches the real spawned child's environment end-to-end
 });
 
 test("invoke(): no opts.env → the real spawned child sees no PIPELINE_RUN_ID (default path unchanged)", async () => {
-  const cli = makeScript("print-run-id-absent", `printf '%s' "${"$"}{PIPELINE_RUN_ID:-<unset>}"`);
-  const result = await invoke(cli, tmpRoot, "prompt", { stream: false });
-  assert.equal(result.stdout, "<unset>");
+  // Isolate from ambient pipeline harness env (parent may already export
+  // PIPELINE_RUN_ID when tests run under /pipeline). The contract under test is
+  // that invoke() does not inject a run id when opts.env is absent — so the
+  // child must not see one when the parent process doesn't either.
+  const prior = process.env.PIPELINE_RUN_ID;
+  delete process.env.PIPELINE_RUN_ID;
+  try {
+    const cli = makeScript("print-run-id-absent", `printf '%s' "${"$"}{PIPELINE_RUN_ID:-<unset>}"`);
+    const result = await invoke(cli, tmpRoot, "prompt", { stream: false });
+    assert.equal(result.stdout, "<unset>");
+  } finally {
+    if (prior !== undefined) process.env.PIPELINE_RUN_ID = prior;
+    else delete process.env.PIPELINE_RUN_ID;
+  }
 });
 
 // ---------------------------------------------------------------------------

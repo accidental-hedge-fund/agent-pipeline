@@ -22,6 +22,8 @@ import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import {
   EMPTY_TELEMETRY,
+  buildAdapterDeclaration,
+  defaultRuntimeSmoke,
   type AdapterCapabilities,
   type AdapterInvocation,
   type AdapterInvocationContext,
@@ -45,6 +47,15 @@ const CAPABILITIES: AdapterCapabilities = {
 export const grokAdapter: HarnessAdapter = {
   name: "grok",
   capabilities: CAPABILITIES,
+  declaration: buildAdapterDeclaration({
+    command: "grok",
+    capabilities: CAPABILITIES,
+    promptDelivery: "file",
+    outputEnvelope: "text",
+    authProbe: "documented",
+    versionProbe: "documented",
+    origin: "builtin",
+  }),
 
   buildInvocation(ctx: AdapterInvocationContext): AdapterInvocation {
     // Pipeline-owned prompt file under the managed worktree root — the runner
@@ -122,6 +133,11 @@ export const grokAdapter: HarnessAdapter = {
       nativeFlags,
       fallback: null,
       throttled: probe.throttled ?? null,
+      origin: "builtin",
     };
+  },
+
+  runtimeSmoke(deps: AdapterPreflightDeps): Promise<AdapterPreflightResult> {
+    return defaultRuntimeSmoke("grok", deps);
   },
 };

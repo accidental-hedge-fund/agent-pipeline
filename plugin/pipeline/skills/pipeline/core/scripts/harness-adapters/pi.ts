@@ -35,6 +35,8 @@
 
 import {
   EMPTY_TELEMETRY,
+  buildAdapterDeclaration,
+  defaultRuntimeSmoke,
   type AdapterCapabilities,
   type AdapterInvocation,
   type AdapterInvocationContext,
@@ -70,6 +72,17 @@ export const PI_NO_MODELS_MARKER = "No models available";
 export const piAdapter: HarnessAdapter = {
   name: "pi",
   capabilities: CAPABILITIES,
+  declaration: buildAdapterDeclaration({
+    command: "pi",
+    capabilities: CAPABILITIES,
+    promptDelivery: "argv",
+    effortValidation: "closed-enum",
+    effortAllowedValues: [...PI_THINKING_LEVELS],
+    outputEnvelope: "text",
+    authProbe: "documented",
+    versionProbe: "documented",
+    origin: "builtin",
+  }),
 
   buildInvocation(ctx: AdapterInvocationContext): AdapterInvocation {
     const args = ["-p", ctx.prompt];
@@ -163,6 +176,11 @@ export const piAdapter: HarnessAdapter = {
       nativeFlags,
       fallback: null,
       throttled: probe.throttled ?? null,
+      origin: "builtin",
     };
+  },
+
+  runtimeSmoke(deps: AdapterPreflightDeps): Promise<AdapterPreflightResult> {
+    return defaultRuntimeSmoke("pi", deps);
   },
 };
