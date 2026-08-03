@@ -40,7 +40,10 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildStageAccountingRecord } from "./accounting.ts";
-import { resolveAdapter } from "./harness-adapters/index.ts";
+import {
+  materializeCompatibilityAdapter,
+  resolveAdapter,
+} from "./harness-adapters/index.ts";
 import { makeClaudeForwardTransform } from "./harness-adapters/claude.ts";
 import { makeCodexForwardTransform } from "./harness-adapters/codex.ts";
 import { MAX_ARG_STRLEN, type AdapterProbe, type ExternalSandboxMode } from "./harness-adapters/types.ts";
@@ -282,50 +285,34 @@ export async function invoke(
   const stream = opts.stream ?? true;
   const timeoutSec = opts.timeoutSec ?? 1200;
 
-  // #431: dispatch through the adapter registry rather than branching on
-  // harness names. A name with no registered adapter takes the unregistered
-  // custom-reviewer-CLI path (#40) verbatim: `<cmd> <prompt>` by default.
-  const adapter = resolveAdapter(harness);
-  let cmd: string;
-  let args: string[];
-  let cwd: string;
-  let captureMode: "head" | "tail" | undefined;
-  let transformForward: ((chunk: string) => string) | undefined;
+  // #431 / #783: dispatch through the adapter registry. Unregistered names
+  // (custom reviewer CLI, #40) materialize a compatibility adapter on the
+  // public extension contract rather than a permanent raw-spawn branch.
+  const adapter =
+    resolveAdapter(harness) ??
+    materializeCompatibilityAdapter(harness, {
+      promptDelivery: opts.promptDelivery ?? "argv",
+    });
+  const custom = adapter.declaration.origin === "compatibility";
+  const inv = adapter.buildInvocation({
+    prompt,
+    worktreeDir,
+    model: opts.model,
+    effort: opts.reasoningEffort,
+    sandbox: opts.sandbox,
+    lean: opts.lean,
+    env: opts.env,
+    sandboxMode: opts.sandboxMode,
+  });
+  const cmd = inv.cmd;
+  const args = inv.args;
+  const cwd = inv.cwd;
+  const captureMode = inv.captureMode;
+  const transformForward = inv.transformForward;
   let stdinPayload: string | undefined;
   let promptFile: { path: string; content: string } | undefined;
-  const custom = adapter === null;
-  if (adapter) {
-    const inv = adapter.buildInvocation({
-      prompt,
-      worktreeDir,
-      model: opts.model,
-      effort: opts.reasoningEffort,
-      sandbox: opts.sandbox,
-      lean: opts.lean,
-      env: opts.env,
-      sandboxMode: opts.sandboxMode,
-    });
-    cmd = inv.cmd;
-    args = inv.args;
-    cwd = inv.cwd;
-    captureMode = inv.captureMode;
-    transformForward = inv.transformForward;
-    if (inv.promptDelivery === "stdin") stdinPayload = inv.stdinPayload;
-    if (inv.promptDelivery === "file") promptFile = inv.promptFile;
-  } else {
-    // A user-configured reviewer CLI (`review_harness`, #40). Its
-    // prompt-delivery channel defaults to the positional argument (#492 —
-    // byte-for-byte the pre-#492 shape); an operator whose CLI reads stdin can
-    // opt in via review_harness.prompt_delivery: stdin.
-    cmd = harness;
-    cwd = worktreeDir;
-    if (opts.promptDelivery === "stdin") {
-      args = [];
-      stdinPayload = prompt;
-    } else {
-      args = [prompt];
-    }
-  }
+  if (inv.promptDelivery === "stdin") stdinPayload = inv.stdinPayload;
+  if (inv.promptDelivery === "file") promptFile = inv.promptFile;
 
   // #492: materialize a file-channel prompt under the managed worktree root
   // before spawn; always removed after the call completes, spawn or not.
@@ -362,7 +349,7 @@ export async function invoke(
   // Parsing never throws; an unparseable envelope (or an adapter with no
   // telemetry capability at all) falls back to the raw captured output and
   // leaves accounting at `cost_source: "unknown"`.
-  const telemetry = adapter ? adapter.parseTelemetry(result.stdout) : null;
+  const telemetry = adapter.parseTelemetry(result.stdout);
   const finalResult: HarnessResult = {
     ...(telemetry && telemetry.text !== null ? { ...result, stdout: telemetry.text } : result),
     throttled: telemetry?.throttled ?? null,
@@ -374,26 +361,23 @@ export async function invoke(
       telemetry && (telemetry.costUsd !== null || telemetry.usage !== null)
         ? { total_cost_usd: telemetry.costUsd, usage: telemetry.usage }
         : opts.accounting.usage;
-    // Treatment-identity provenance (#431 task 6): populated only for a
-    // registered adapter. No per-invocation CLI probe is run here (that
-    // would add subprocess overhead to every model call) — cliVersion and
-    // providerAuthClass are recorded as unknown rather than fabricated,
-    // matching the "unreported provenance is recorded as unknown" contract.
-    // resolvedModel/throttled, when the adapter's own telemetry parsing
-    // recovered them (review-2 finding 0b0c7e4b), are threaded through here
-    // rather than fabricated by each adapter's describeTreatment.
-    const treatment = adapter
-      ? adapter.describeTreatment(
-          { model: opts.model, effort: opts.reasoningEffort },
-          { cmd, args, cwd },
-          {
-            cliVersion: null,
-            providerAuthClass: "unknown",
-            resolvedModel: telemetry?.resolvedModel ?? null,
-            throttled: telemetry?.throttled ?? null,
-          } satisfies AdapterProbe,
-        )
-      : null;
+    // Treatment-identity provenance (#431 task 6; #783 — every adapter,
+    // including the custom-reviewer compatibility path). No per-invocation
+    // CLI probe is run here (that would add subprocess overhead to every
+    // model call) — cliVersion and providerAuthClass are recorded as unknown
+    // rather than fabricated. resolvedModel/throttled, when the adapter's own
+    // telemetry parsing recovered them, are threaded through here rather than
+    // fabricated by each adapter's describeTreatment.
+    const treatment = adapter.describeTreatment(
+      { model: opts.model, effort: opts.reasoningEffort },
+      inv,
+      {
+        cliVersion: null,
+        providerAuthClass: "unknown",
+        resolvedModel: telemetry?.resolvedModel ?? null,
+        throttled: telemetry?.throttled ?? null,
+      } satisfies AdapterProbe,
+    );
     const record = buildStageAccountingRecord({
       runId: path.basename(opts.accounting.runDir),
       issue: opts.accounting.issue,

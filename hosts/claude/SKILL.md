@@ -577,7 +577,27 @@ harnesses:
   reviewer: codex      # secondary: plan review, review rounds, pre-merge delta review, shipcheck, design gate
 ```
 
-Either key may be omitted — an omitted role keeps the active profile's default for that role only. `implementer` must name a harness with a registered adapter (`claude`, `codex`, `grok`, `opencode`, `pi`); an unregistered name is rejected at config-parse time, naming the key, the value, and the registered adapter names, before any worktree is created. `reviewer` may additionally name an arbitrary custom reviewer CLI, same as the older `review_harness` key below.
+Either key may be omitted — an omitted role keeps the active profile's default for that role only. `implementer` must name a harness with a registered adapter that declares the **implementer** role capability (built-ins: `claude`, `codex`, `grok`, `opencode`, `pi`, plus any IDs from `adapter_extensions` below). An unregistered implementer name is rejected at config-parse time, naming the key, the value, and the **currently registered** adapter IDs from the runtime registry, before any worktree is created. `reviewer` may name a registered adapter that declares the **reviewer** role, or an arbitrary custom reviewer CLI (compatibility path), same as the older `review_harness` key below.
+
+### Third-party adapter extensions (#783)
+
+Register additional local-CLI adapters without editing engine source via `adapter_extensions` — a list of module entry points (repo-relative path, absolute path, or package name). **Only listed entries load**; unconfigured packages are never auto-scanned from `node_modules`.
+
+```yaml
+adapter_extensions:
+  - ./tools/my-pipeline-adapter.cjs   # CommonJS module (createRequire-compatible)
+```
+
+Each module may:
+
+1. `module.exports = { adapters: [harnessAdapter, ...] }` (or `export default` / `export const adapters` in a CJS-interop package)
+2. `module.exports.register = (api) => { api.registerAdapter(adapter); }`
+
+Adapters declare role capabilities (`implementer` and/or `reviewer`), executable resolution, prompt delivery/limits, model/effort/sandbox policy, telemetry, auth/version probes, and a cheap `runtimeSmoke` hook. Built-ins re-register through the same public contract. A shared conformance kit (CI) verifies declarations and refusal behavior.
+
+**Identity separation:** outer host / profile (the CLI that launched the pipeline) stays independent of stage **adapter** ID, provider/auth class, model, and effort. Unknown provider/model metadata stays `unknown` / null — core never invents a vendor-global model catalog or silent default for extension adapters.
+
+**Custom reviewer migration:** unregistered `review_harness` / `harnesses.reviewer` names still work via a thin **compatibility adapter** on the extension contract (PATH preflight, treatment identity marked `origin: compatibility`). A full package registration for the same ID wins over compatibility.
 
 The reviewer role MAY also be set (or overridden) via the optional `review_harness` key:
 
@@ -585,7 +605,7 @@ The reviewer role MAY also be set (or overridden) via the optional `review_harne
 review_harness: my-reviewer   # use a custom CLI as the reviewer instead of the profile default
 ```
 
-When `review_harness` is set, the pipeline spawns `<value> "<prompt>"` and expects a JSON verdict on stdout (same schema as the built-in reviewers). If the CLI cannot be spawned, the item is blocked with an error naming the CLI explicitly, and the implementing harness is tried as a self-review fallback (established by #39). When both `harnesses.reviewer` and `review_harness` are set, they must agree — naming the same command is accepted (and `review_harness`'s structured model/effort/prompt-delivery settings still apply); naming different commands is rejected at config-parse time, naming both keys and both values.
+When `review_harness` is set, the pipeline invokes that command through the compatibility adapter (default `<value> "<prompt>"` on argv, or stdin when `prompt_delivery: stdin`) and expects a JSON verdict on stdout (same schema as the built-in reviewers). If the CLI cannot be spawned, the item is blocked with an error naming the CLI explicitly, and the implementing harness is tried as a self-review fallback (established by #39). When both `harnesses.reviewer` and `review_harness` are set, they must agree — naming the same command is accepted (and `review_harness`'s structured model/effort/prompt-delivery settings still apply); naming different commands is rejected at config-parse time, naming both keys and both values.
 
 `review_harness` also accepts a structured form for independent reviewer model/effort control, each accepting `"auto"` (resolved round-aware — plan-review/review-2 as Definitive, review-1 as Iterative):
 

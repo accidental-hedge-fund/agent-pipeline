@@ -16,7 +16,12 @@ import { codexAdapter } from "../scripts/harness-adapters/codex.ts";
 import { piAdapter } from "../scripts/harness-adapters/pi.ts";
 import { opencodeAdapter } from "../scripts/harness-adapters/opencode.ts";
 import { grokAdapter } from "../scripts/harness-adapters/grok.ts";
-import { resolveAdapter, registeredAdapterNames, allAdapters } from "../scripts/harness-adapters/index.ts";
+import {
+  BUILTIN_ADAPTER_NAMES,
+  resolveAdapter,
+  registeredAdapterNames,
+  allAdapters,
+} from "../scripts/harness-adapters/index.ts";
 import type { AdapterPreflightDeps } from "../scripts/harness-adapters/types.ts";
 
 interface FakeOverrides {
@@ -205,16 +210,19 @@ test("pi/opencode buildInvocation still always passes their unattended auto-appr
   assert.ok(ocInv.args.includes("--auto"));
 });
 
-// --- #608: the registry is the single source of truth `resolveConfig`'s
-// role validation and `pipeline doctor`'s harness readiness checks rely on ---
+// --- #608 / #783: the runtime registry is the single source of truth
+// resolveConfig role validation and doctor harness readiness rely on ---
 
-test("registeredAdapterNames: matches the registry's actual adapters exactly (runtime-checked, no tsc step)", () => {
+test("registeredAdapterNames: stays in lockstep with allAdapters (registry-driven)", () => {
   const names = registeredAdapterNames();
-  assert.deepEqual(new Set(names), new Set(["claude", "codex", "grok", "opencode", "pi"]));
   assert.equal(names.length, allAdapters().length, "registeredAdapterNames() and allAdapters() must stay in lockstep");
+  // Built-in golden set is a subset of the runtime registry, not the completeness criterion.
+  for (const name of BUILTIN_ADAPTER_NAMES) {
+    assert.ok(names.includes(name), `builtin ${name} must appear in registry`);
+  }
 });
 
-test("resolveAdapter: resolves every registered name to its adapter instance", () => {
+test("built-in golden suite: each shipped adapter resolves to its module instance", () => {
   assert.equal(resolveAdapter("claude"), claudeAdapter);
   assert.equal(resolveAdapter("codex"), codexAdapter);
   assert.equal(resolveAdapter("grok"), grokAdapter);

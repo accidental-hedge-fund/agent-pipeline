@@ -17,6 +17,8 @@
 
 import {
   EMPTY_TELEMETRY,
+  buildAdapterDeclaration,
+  defaultRuntimeSmoke,
   isJsonRecord,
   parseJsonLine,
   type AdapterCapabilities,
@@ -121,6 +123,15 @@ const CAPABILITIES: AdapterCapabilities = {
 export const claudeAdapter: HarnessAdapter = {
   name: "claude",
   capabilities: CAPABILITIES,
+  declaration: buildAdapterDeclaration({
+    command: "claude",
+    capabilities: CAPABILITIES,
+    promptDelivery: "stdin",
+    outputEnvelope: "jsonl",
+    authProbe: "documented",
+    versionProbe: "documented",
+    origin: "builtin",
+  }),
 
   buildInvocation(ctx: AdapterInvocationContext): AdapterInvocation {
     const telemetryMode = harnessTelemetryEnabled();
@@ -201,6 +212,11 @@ export const claudeAdapter: HarnessAdapter = {
       nativeFlags,
       fallback: null,
       throttled: probe.throttled ?? null,
+      origin: "builtin",
     };
+  },
+
+  runtimeSmoke(deps: AdapterPreflightDeps): Promise<AdapterPreflightResult> {
+    return defaultRuntimeSmoke("claude", deps);
   },
 };

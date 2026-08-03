@@ -24,6 +24,8 @@
 
 import {
   EMPTY_TELEMETRY,
+  buildAdapterDeclaration,
+  defaultRuntimeSmoke,
   isJsonRecord,
   parseJsonLine,
   type AdapterCapabilities,
@@ -107,6 +109,15 @@ const CAPABILITIES: AdapterCapabilities = {
 export const codexAdapter: HarnessAdapter = {
   name: "codex",
   capabilities: CAPABILITIES,
+  declaration: buildAdapterDeclaration({
+    command: "codex",
+    capabilities: CAPABILITIES,
+    promptDelivery: "stdin",
+    outputEnvelope: "jsonl",
+    authProbe: "documented",
+    versionProbe: "documented",
+    origin: "builtin",
+  }),
 
   buildInvocation(ctx: AdapterInvocationContext): AdapterInvocation {
     const telemetryMode = harnessTelemetryEnabled();
@@ -139,13 +150,27 @@ export const codexAdapter: HarnessAdapter = {
     };
   },
 
-  async preflight(deps: AdapterPreflightDeps, _req: AdapterRequest): Promise<AdapterPreflightResult> {
+  async preflight(deps: AdapterPreflightDeps, req: AdapterRequest): Promise<AdapterPreflightResult> {
     const present = await deps.execCheck("codex", ["--version"]);
     if (!present) {
       return {
         ok: false,
         failure: "missing-cli",
         message: "codex CLI not found on PATH — install it and run `codex login` to complete authentication.",
+      };
+    }
+    // `capabilities.sandbox` is false: codex is always workspace-sandboxed via
+    // its managed `--sandbox workspace-write` path (or explicit external
+    // bypass via sandboxMode). The AdapterRequest.sandbox restricted-permission
+    // flag is not a separate codex mode — refuse rather than silently drop
+    // (#783 unsupported-capability contract). Callers that need external
+    // bypass use sandboxMode on the invocation context, not this flag.
+    if (req.sandbox) {
+      return {
+        ok: false,
+        failure: "unsupported-setting",
+        message:
+          "codex does not honor AdapterRequest.sandbox as a restricted-permission mode — it is always managed workspace-write (or external-bypass via sandboxMode).",
       };
     }
     // `codex login status` is codex's documented non-interactive login-state
@@ -184,6 +209,11 @@ export const codexAdapter: HarnessAdapter = {
       nativeFlags,
       fallback: null,
       throttled: probe.throttled ?? null,
+      origin: "builtin",
     };
+  },
+
+  runtimeSmoke(deps: AdapterPreflightDeps): Promise<AdapterPreflightResult> {
+    return defaultRuntimeSmoke("codex", deps);
   },
 };

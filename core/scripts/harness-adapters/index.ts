@@ -1,37 +1,141 @@
-// Adapter registry (#431 task 1.2). Single-sourced lookup table so
-// `harness.ts`, `executors.ts`, and `stages/doctor.ts` never hand-roll a
-// second list of adapter names.
+// Public adapter registry surface (#431 task 1.2; #783 extension contract).
+// Single-sourced lookup so `harness.ts`, `config.ts`, `executors.ts`, and
+// `stages/doctor.ts` never hand-roll a second list of adapter names.
+//
+// Built-ins re-register through the same public `registerAdapter` surface as
+// third-party extensions.
 
 import { claudeAdapter } from "./claude.ts";
 import { codexAdapter } from "./codex.ts";
 import { grokAdapter } from "./grok.ts";
 import { opencodeAdapter } from "./opencode.ts";
 import { piAdapter } from "./pi.ts";
-import type { HarnessAdapter } from "./types.ts";
+import { materializeCompatibilityAdapter } from "./compatibility.ts";
+import {
+  BUILTIN_ADAPTER_NAMES,
+  allAdapters as registryAllAdapters,
+  registerAdapter,
+  registeredAdapterNames as registryNames,
+  resolveAdapter as registryResolve,
+  resolveRegisteredAdapterForRole,
+  _clearRegistryForTests,
+  _setRegistryForTests as registrySetForTests,
+} from "./registry.ts";
+import type { AdapterRole, HarnessAdapter } from "./types.ts";
 
-const REGISTRY: Readonly<Record<string, HarnessAdapter>> = Object.freeze({
-  claude: claudeAdapter,
-  codex: codexAdapter,
-  grok: grokAdapter,
-  opencode: opencodeAdapter,
-  pi: piAdapter,
-});
+export {
+  BUILTIN_ADAPTER_NAMES,
+  registerAdapter,
+  type BuiltinAdapterName,
+} from "./registry.ts";
 
-/** Resolve a registered adapter by name, or `null` for an unregistered name
- *  (the caller falls back to the custom reviewer-CLI path, #40). */
+const BUILTIN_ADAPTERS: readonly HarnessAdapter[] = [
+  claudeAdapter,
+  codexAdapter,
+  grokAdapter,
+  opencodeAdapter,
+  piAdapter,
+];
+
+let builtinsRegistered = false;
+
+/** Register built-in adapters through the public API (idempotent). */
+export function ensureBuiltinsRegistered(): void {
+  if (builtinsRegistered && BUILTIN_ADAPTER_NAMES.every((n) => registryResolve(n) !== null)) {
+    return;
+  }
+  for (const adapter of BUILTIN_ADAPTERS) {
+    if (registryResolve(adapter.name) === null) {
+      registerAdapter(adapter);
+    }
+  }
+  builtinsRegistered = true;
+}
+
+/** Resolve a registered adapter by name, or `null` when unregistered. */
 export function resolveAdapter(name: string): HarnessAdapter | null {
-  return REGISTRY[name] ?? null;
+  ensureBuiltinsRegistered();
+  return registryResolve(name);
 }
 
-/** All registered adapter names, in registration order. Used for config
- *  error messages (config.ts) and doctor's "only assigned adapters" filter. */
+/**
+ * Resolve an adapter for a configured role.
+ *
+ * - Registered adapters must declare the requested role.
+ * - Unregistered names may use the compatibility path only when
+ *   `allowCompatibility` is true (reviewer custom-CLI escape hatch, #40).
+ */
+export function resolveAdapterForRole(
+  name: string,
+  role: AdapterRole,
+  opts: {
+    allowCompatibility?: boolean;
+    promptDelivery?: "argv" | "stdin";
+  } = {},
+): HarnessAdapter {
+  ensureBuiltinsRegistered();
+  const registered = resolveRegisteredAdapterForRole(name, role);
+  if (registered) return registered;
+  // resolveRegisteredAdapterForRole throws on missing role capability when
+  // the name is registered; null means unregistered.
+  if (opts.allowCompatibility && role === "reviewer") {
+    return materializeCompatibilityAdapter(name, {
+      promptDelivery: opts.promptDelivery ?? "argv",
+    });
+  }
+  throw new Error(
+    `No registered harness adapter named "${name}" for role ${role}. ` +
+      `Registered adapters: ${registeredAdapterNames().join(", ")}.`,
+  );
+}
+
+/** All registered adapter names, in insertion order. */
 export function registeredAdapterNames(): string[] {
-  return Object.keys(REGISTRY);
+  ensureBuiltinsRegistered();
+  return registryNames();
 }
 
-/** All registered adapters. Used by the runtime conformance test. */
+/** All registered adapters. Used by the runtime conformance kit. */
 export function allAdapters(): HarnessAdapter[] {
-  return Object.values(REGISTRY);
+  ensureBuiltinsRegistered();
+  return registryAllAdapters();
 }
+
+/**
+ * Test-only: clear the registry and optionally re-seed built-ins.
+ * Production code must never call this.
+ */
+export function _resetRegistryForTests(opts: { reseedBuiltins?: boolean } = {}): void {
+  _clearRegistryForTests();
+  builtinsRegistered = false;
+  if (opts.reseedBuiltins !== false) {
+    ensureBuiltinsRegistered();
+  }
+}
+
+/**
+ * Test-only: replace the entire registry contents.
+ */
+export function _setRegistryForTests(adapters: HarnessAdapter[]): void {
+  registrySetForTests(adapters);
+  builtinsRegistered =
+    BUILTIN_ADAPTER_NAMES.every((n) => registryResolve(n) !== null);
+}
+
+// Boot: register built-ins immediately so any import of this module has a
+// populated registry without an explicit ensure call.
+ensureBuiltinsRegistered();
 
 export * from "./types.ts";
+export { materializeCompatibilityAdapter } from "./compatibility.ts";
+export {
+  loadAdapterExtensions,
+  type AdapterExtensionLoadResult,
+} from "./extension-loader.ts";
+export {
+  assertAdapterConformance,
+  runConformanceKit,
+  checkStructure,
+  type ConformanceFailure,
+  type ConformanceReport,
+} from "./conformance.ts";

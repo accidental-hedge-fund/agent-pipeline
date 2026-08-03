@@ -1,14 +1,15 @@
-// Adapter contract for local CLI harnesses (#431 — cli-harness-adapters).
+// Adapter contract for local CLI harnesses (#431 — cli-harness-adapters;
+// #783 — public end-user extension registry).
 //
 // Every harness-specific invocation/preflight/telemetry detail lives behind an
-// implementation of `HarnessAdapter`, registered by name in `index.ts`.
-// `harness.ts`'s `invoke()` dispatches through the registry instead of
-// branching on harness names — see design.md decision 2.
+// implementation of `HarnessAdapter`, registered by name via the public
+// `registerAdapter` API in `index.ts`. `harness.ts`'s `invoke()` dispatches
+// through the registry instead of branching on harness names.
 //
 // Because the pipeline strips TypeScript types at runtime (no `tsc` step),
-// this contract is backed by a runtime conformance test
-// (`harness-adapters.test.ts`) that iterates the registry and asserts every
-// adapter actually implements every member below with the right kind.
+// this contract is backed by a shared runtime conformance kit
+// (`conformance.ts` + tests) that iterates the registry and asserts every
+// adapter implements every required member and declaration field.
 
 /** The execution sandbox mode a harness invocation runs under (#607 —
  *  eval-agent-isolation-boundary). `"managed"` is the harness's own sandbox
@@ -19,6 +20,21 @@
  *  shaping never drift on the set of supported values. */
 export const EXTERNAL_SANDBOX_MODES = ["managed", "external-bypass"] as const;
 export type ExternalSandboxMode = (typeof EXTERNAL_SANDBOX_MODES)[number];
+
+/** Roles an adapter may declare eligibility for (#783). Assignment is config +
+ *  declared capability, never a name allowlist or marketing-name heuristic. */
+export const ADAPTER_ROLES = ["implementer", "reviewer"] as const;
+export type AdapterRole = (typeof ADAPTER_ROLES)[number];
+
+/** Registration / materialization origin of an adapter implementation. */
+export type AdapterOrigin = "builtin" | "extension" | "compatibility";
+
+/** How model / effort values are validated when the capability is supported. */
+export type SettingValidationPolicy =
+  | "open" // any non-empty string accepted; CLI validates further
+  | "closed-enum" // adapter preflight enforces a known set
+  | "format" // adapter preflight enforces a structural format (e.g. provider/model)
+  | "unsupported"; // capability is false; requests must refuse
 
 /** What a harness CLI's headless interface supports (design.md decision 2). */
 export interface AdapterCapabilities {
@@ -33,6 +49,59 @@ export interface AdapterCapabilities {
   workingDir: "cwd" | "flag";
   /** Whether the CLI offers machine-readable per-call output ("jsonl") or not ("none"). */
   telemetry: "none" | "jsonl";
+}
+
+/**
+ * Machine-checkable extension declaration surface (#783). Every registered
+ * adapter — built-in, third-party package, or custom-reviewer compatibility —
+ * must populate these fields. The shared conformance kit fails incomplete
+ * declarations by naming the missing field.
+ */
+export interface AdapterExtensionDeclaration {
+  /** Roles this adapter may serve. Empty is invalid. */
+  roles: readonly AdapterRole[];
+  /** How the CLI binary is located. */
+  executable: {
+    /** Command name on PATH, or absolute path when resolution is "absolute". */
+    command: string;
+    /** PATH lookup vs absolute path only. */
+    resolution: "path" | "absolute";
+  };
+  /** Prompt delivery channel and size-limit policy. */
+  prompt: {
+    delivery: PromptDeliveryChannel;
+    /** `"max-arg-strlen"` for argv channel; `"unlimited"` for stdin/file. */
+    sizeLimit: "max-arg-strlen" | "unlimited";
+  };
+  /** Model discovery / validation policy (no vendor-global catalog in core). */
+  model: {
+    supported: boolean;
+    validation: SettingValidationPolicy;
+    /** Optional closed set when validation is "closed-enum". */
+    allowedValues?: readonly string[];
+  };
+  /** Effort discovery / validation policy. */
+  effort: {
+    supported: boolean;
+    validation: SettingValidationPolicy;
+    allowedValues?: readonly string[];
+  };
+  /** Sandbox / tool / permission policy. */
+  sandbox: {
+    supported: boolean;
+  };
+  /** cwd / worktree behavior — mirrors capabilities.workingDir. */
+  workingDir: "cwd" | "flag";
+  /** Expected output envelope after normalization into harness result text. */
+  outputEnvelope: "text" | "jsonl" | "passthrough";
+  /** Telemetry parsing behavior. */
+  telemetry: "none" | "jsonl";
+  /** Authentication probe class. */
+  authProbe: "documented" | "none";
+  /** Version probe class. */
+  versionProbe: "documented" | "none";
+  /** Registration origin for treatment/doctor distinction. */
+  origin: AdapterOrigin;
 }
 
 /** The minimal per-call settings a stage requests of an adapter. Shared base
@@ -168,7 +237,9 @@ export interface AdapterProbe {
   throttled?: boolean | null;
 }
 
-/** Treatment identity recorded into stage accounting (design.md decision 5, 6). */
+/** Treatment identity recorded into stage accounting (design.md decision 5, 6).
+ *  Adapter, provider, model, and effort stay independent dimensions — never
+ *  collapsed into outer-host identity (#783). */
 export interface HarnessTreatment {
   adapter: string;
   cliVersion: string | null;
@@ -187,17 +258,28 @@ export interface HarnessTreatment {
   /** Whether this invocation was subject to provider-side throttling, per the
    *  adapter's own probe (`null` when the CLI reports no such signal). */
   throttled: boolean | null;
+  /** Registration origin — distinguishes full packages from the custom-
+   *  reviewer compatibility path (#783 / #40). */
+  origin?: AdapterOrigin;
 }
 
 /** The complete adapter contract. Every registered adapter must implement
- *  every member — see the runtime conformance test. */
+ *  every member — see the runtime conformance kit. */
 export interface HarnessAdapter {
   readonly name: string;
   readonly capabilities: AdapterCapabilities;
+  /** Full machine-checkable extension declaration (#783). */
+  readonly declaration: AdapterExtensionDeclaration;
   buildInvocation(ctx: AdapterInvocationContext): AdapterInvocation;
   preflight(deps: AdapterPreflightDeps, req: AdapterRequest): Promise<AdapterPreflightResult>;
   parseTelemetry(capturedStdout: string): HarnessTelemetry;
   describeTreatment(req: AdapterRequest, inv: AdapterInvocation, probe: AdapterProbe): HarnessTreatment;
+  /**
+   * Cheap readiness probe distinct from full stage invocation (#783). Doctor
+   * and run-start preflight may call this without spending a full implementer
+   * or reviewer turn. Implementations SHOULD avoid model-consuming work.
+   */
+  runtimeSmoke(deps: AdapterPreflightDeps): Promise<AdapterPreflightResult>;
 }
 
 /** Shared: never throws, matches a JSON object on one line. */
@@ -225,3 +307,96 @@ export const EMPTY_TELEMETRY: HarnessTelemetry = {
   resolvedModel: null,
   throttled: null,
 };
+
+/**
+ * Build a complete extension declaration for a built-in or extension adapter
+ * from the common capability surface. Keeps declaration fields in lockstep
+ * with `AdapterCapabilities` without a second hand-maintained enum.
+ */
+export function buildAdapterDeclaration(opts: {
+  roles?: readonly AdapterRole[];
+  command: string;
+  executableResolution?: "path" | "absolute";
+  capabilities: AdapterCapabilities;
+  promptDelivery: PromptDeliveryChannel;
+  modelValidation?: SettingValidationPolicy;
+  effortValidation?: SettingValidationPolicy;
+  modelAllowedValues?: readonly string[];
+  effortAllowedValues?: readonly string[];
+  outputEnvelope?: "text" | "jsonl" | "passthrough";
+  authProbe?: "documented" | "none";
+  versionProbe?: "documented" | "none";
+  origin?: AdapterOrigin;
+}): AdapterExtensionDeclaration {
+  const caps = opts.capabilities;
+  const promptDelivery = opts.promptDelivery;
+  return {
+    roles: opts.roles ?? (["implementer", "reviewer"] as const),
+    executable: {
+      command: opts.command,
+      resolution: opts.executableResolution ?? "path",
+    },
+    prompt: {
+      delivery: promptDelivery,
+      sizeLimit: promptDelivery === "argv" ? "max-arg-strlen" : "unlimited",
+    },
+    model: {
+      supported: caps.model,
+      validation:
+        opts.modelValidation ??
+        (caps.model ? "open" : "unsupported"),
+      ...(opts.modelAllowedValues ? { allowedValues: opts.modelAllowedValues } : {}),
+    },
+    effort: {
+      supported: caps.effort,
+      validation:
+        opts.effortValidation ??
+        (caps.effort ? "open" : "unsupported"),
+      ...(opts.effortAllowedValues ? { allowedValues: opts.effortAllowedValues } : {}),
+    },
+    sandbox: { supported: caps.sandbox },
+    workingDir: caps.workingDir,
+    outputEnvelope:
+      opts.outputEnvelope ??
+      (caps.telemetry === "jsonl" ? "jsonl" : "text"),
+    telemetry: caps.telemetry,
+    authProbe: opts.authProbe ?? "documented",
+    versionProbe: opts.versionProbe ?? "documented",
+    origin: opts.origin ?? "builtin",
+  };
+}
+
+/** Default cheap smoke: PATH presence via `--version` (or absolute path probe). */
+export async function defaultRuntimeSmoke(
+  command: string,
+  deps: AdapterPreflightDeps,
+  resolution: "path" | "absolute" = "path",
+): Promise<AdapterPreflightResult> {
+  if (resolution === "absolute") {
+    const present = await deps.execCheck(command, ["--version"]).catch(() => false);
+    if (!present) {
+      return {
+        ok: false,
+        failure: "missing-cli",
+        message: `${command} is not executable — install or fix the path for this adapter.`,
+      };
+    }
+    return { ok: true };
+  }
+  const present =
+    (await deps.execCheck(command, ["--version"])) ||
+    (await deps.execCheck(command, ["--help"]));
+  if (!present) {
+    return {
+      ok: false,
+      failure: "missing-cli",
+      message: `${command} CLI not found on PATH.`,
+    };
+  }
+  return { ok: true };
+}
+
+/** Whether `adapter` declares the given role capability. */
+export function adapterSupportsRole(adapter: HarnessAdapter, role: AdapterRole): boolean {
+  return adapter.declaration.roles.includes(role);
+}

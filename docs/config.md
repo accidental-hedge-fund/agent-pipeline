@@ -11,6 +11,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 ## Top-level keys
 
+### `adapter_extensions`
+
+- **Type:** array of string
+- **Description:** Module entry points that register third-party harness adapters into the runtime registry. Paths are resolved from the repository root; package names must be resolvable from the engine or repo install. Only explicitly listed entries load — unconfigured packages are never auto-loaded.
+
 ### `auto_loop`
 
 - **Type:** object
@@ -392,12 +397,12 @@ Nested fields:
 #### `harnesses.implementer`
 
 - **Type:** string
-- **Description:** Primary harness that performs planning, implementation, and fixes. Must name a registered harness adapter (claude, codex, grok, opencode, pi). Falls back to the active profile's implementer when omitted.
+- **Description:** Primary harness that performs planning, implementation, and fixes. Must name a registered harness adapter that declares the implementer role (built-ins plus any adapter_extensions entries). Falls back to the active profile's implementer when omitted.
 
 #### `harnesses.reviewer`
 
 - **Type:** string
-- **Description:** Secondary harness that performs review. May name a registered adapter or an arbitrary custom reviewer CLI. Falls back to the active profile's reviewer (or review_harness, when set) when omitted.
+- **Description:** Secondary harness that performs review. May name a registered adapter that declares the reviewer role, or an arbitrary custom reviewer CLI (compatibility path). Falls back to the active profile's reviewer (or review_harness, when set) when omitted.
 
 ### `implementation_timeout`
 
@@ -657,7 +662,7 @@ Nested fields:
 ### `review_harness`
 
 - **Type:** string | object
-- **Description:** Override the reviewer CLI for the review step (profile default when absent). Either a bare command string, or { command, model?, effort?, prompt_delivery? } for independent reviewer model/effort/prompt-delivery control.
+- **Description:** Override the reviewer CLI for the review step (profile default when absent). Either a bare command string, or { command, model?, effort?, prompt_delivery? } for independent reviewer model/effort/prompt-delivery control. Unregistered names materialize through the adapter extension compatibility path (#783 / #40).
 
 ### `review_policy`
 
