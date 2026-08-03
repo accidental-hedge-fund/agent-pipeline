@@ -465,9 +465,9 @@ const PartialConfigSchema = z.object({
       // Opt-in auto-file path (#421). Default off; when on, the engine clusters
       // recurring papercuts and files pipeline:backlog issues without a human
       // running `pipeline improve --apply`.
-      auto_file: z.boolean().optional().describe("When true, automatically file pipeline:backlog issues for recurring papercut clusters at run_complete and queue-batch end."),
+      auto_file: z.boolean().optional().describe("When true, automatically file pipeline:backlog issues for recurring papercut clusters at run_complete and queue-batch end. Cross-host-safe via GitHub-authored state + post-create reconcile (#459/#631)."),
       auto_file_window_hours: z.number().positive().optional().describe("Trailing window (hours) over which papercut events are clustered for auto-filing."),
-      auto_file_max_per_window: z.number().int().positive().optional().describe("Maximum number of issues auto-filed within the trailing window."),
+      auto_file_max_per_window: z.number().int().positive().optional().describe("Independent per-category max: open papercut-auto-filed issues (papercut provenance marker only) within the trailing window. Corrections and durable-run-blockers do not consume this budget (#631)."),
       auto_file_min_occurrences: z.number().int().min(2).optional().describe("Minimum in-window occurrence count a papercut cluster must meet to be auto-filed."),
     })
     .strict()
@@ -481,9 +481,9 @@ const PartialConfigSchema = z.object({
   // `autoFileCorrections` in `stages/papercut.ts`.
   corrections: z
     .object({
-      auto_file: z.boolean().optional().describe("When true, automatically file pipeline:backlog issues for recurring correction clusters at run_complete and queue-batch end. Single-host concurrency scope (#459) — see docs."),
+      auto_file: z.boolean().optional().describe("When true, automatically file pipeline:backlog issues for recurring correction clusters at run_complete and queue-batch end. Inherits the shared cross-host auto-file path (GitHub-authored state + post-create reconcile; #459/#631)."),
       auto_file_window_hours: z.number().positive().optional().describe("Trailing window (hours) over which correction_event records are clustered for auto-filing."),
-      auto_file_max_per_window: z.number().int().positive().optional().describe("Maximum number of issues auto-filed within the trailing window."),
+      auto_file_max_per_window: z.number().int().positive().optional().describe("Independent per-category max: open correction-auto-filed issues (correction provenance marker only) within the trailing window. Papercuts and durable-run-blockers do not consume this budget (#631)."),
       auto_file_min_occurrences: z.number().int().min(2).optional().describe("Minimum in-window distinct-occurrence count a correction cluster must meet to be auto-filed (floor 2)."),
     })
     .strict()
@@ -495,9 +495,9 @@ const PartialConfigSchema = z.object({
   // auto-filing, mirroring `corrections`' shape with no capture-side `enabled` key.
   durable_runs: z
     .object({
-      auto_file: z.boolean().optional().describe("When true, automatically file pipeline:backlog issues for terminal or recurring durable-run-blocker clusters at durable-run terminal stop/completion."),
+      auto_file: z.boolean().optional().describe("When true, automatically file pipeline:backlog issues for terminal or recurring durable-run-blocker clusters at durable-run terminal stop/completion. Inherits the shared cross-host auto-file path (GitHub-authored state + post-create reconcile; #459/#631)."),
       auto_file_window_hours: z.number().positive().optional().describe("Trailing window (hours) over which durable-run-blocker occurrences are clustered for auto-filing."),
-      auto_file_max_per_window: z.number().int().positive().optional().describe("Maximum number of issues auto-filed within the trailing window."),
+      auto_file_max_per_window: z.number().int().positive().optional().describe("Independent per-category max: open durable-run-blocker-auto-filed issues (durable provenance marker only) within the trailing window. Papercuts and corrections do not consume this budget (#631)."),
       auto_file_min_occurrences: z.number().int().min(2).optional().describe("Minimum cross-run recurrence count a non-terminal durable-run-blocker cluster must meet to be auto-filed (floor 2). A terminal stop always qualifies from a single occurrence."),
     })
     .strict()
@@ -2287,7 +2287,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         `#   enabled: true # ${sd("papercuts.enabled", "gate the papercut instruction into prompts and pass run/stage identity to harness child processes")}`,
         `#   auto_file: false # ${sd("papercuts.auto_file", "opt in (#421) to auto-file pipeline:backlog issues for recurring papercut clusters at run_complete and queue-batch end")}`,
         `#   auto_file_window_hours: ${yamlScalar(papercuts.auto_file_window_hours)} # ${sd("papercuts.auto_file_window_hours", "trailing window (hours) over which papercut events are clustered for auto-filing")}`,
-        `#   auto_file_max_per_window: ${yamlScalar(papercuts.auto_file_max_per_window)} # ${sd("papercuts.auto_file_max_per_window", "maximum number of issues auto-filed within the trailing window")}`,
+        `#   auto_file_max_per_window: ${yamlScalar(papercuts.auto_file_max_per_window)} # ${sd("papercuts.auto_file_max_per_window", "independent max open papercut-auto-filed issues (papercut marker only) in the trailing window (#631)")}`,
         `#   auto_file_min_occurrences: ${yamlScalar(papercuts.auto_file_min_occurrences)} # ${sd("papercuts.auto_file_min_occurrences", "minimum in-window occurrence count a papercut cluster must meet to be auto-filed")}`,
       ].join("\n"),
     "",
@@ -2295,9 +2295,9 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       ? `corrections: # opt-in correction auto-file (#500) — correction_event capture (#499) is unconditional; this only gates auto-filing\n${yamlBlock(config.corrections, 2)}`
       : [
         "# corrections: # opt-in correction auto-file (#500) — uncomment to auto-file recurring correction_event clusters. Capture (#499) is unconditional and unaffected.",
-        `#   auto_file: false # ${sd("corrections.auto_file", "opt in to auto-file pipeline:backlog issues for recurring correction clusters at run_complete and queue-batch end. Single-host concurrency scope (#459).")}`,
+        `#   auto_file: false # ${sd("corrections.auto_file", "opt in to auto-file pipeline:backlog issues for recurring correction clusters at run_complete and queue-batch end. Shares the cross-host auto-file path (#459/#631).")}`,
         `#   auto_file_window_hours: ${yamlScalar(corrections.auto_file_window_hours)} # ${sd("corrections.auto_file_window_hours", "trailing window (hours) over which correction_event records are clustered for auto-filing")}`,
-        `#   auto_file_max_per_window: ${yamlScalar(corrections.auto_file_max_per_window)} # ${sd("corrections.auto_file_max_per_window", "maximum number of issues auto-filed within the trailing window")}`,
+        `#   auto_file_max_per_window: ${yamlScalar(corrections.auto_file_max_per_window)} # ${sd("corrections.auto_file_max_per_window", "independent max open correction-auto-filed issues (correction marker only) in the trailing window (#631)")}`,
         `#   auto_file_min_occurrences: ${yamlScalar(corrections.auto_file_min_occurrences)} # ${sd("corrections.auto_file_min_occurrences", "minimum in-window distinct-occurrence count a correction cluster must meet to be auto-filed (floor 2)")}`,
       ].join("\n"),
     "",
@@ -2305,9 +2305,9 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       ? `durable_runs: # opt-in durable-run-blocker auto-file (#538) — typed blocker classification (#509) is unconditional; this only gates auto-filing\n${yamlBlock(config.durable_runs, 2)}`
       : [
         "# durable_runs: # opt-in durable-run-blocker auto-file (#538) — uncomment to auto-file terminal or recurring durable-run-blocker clusters at durable-run terminal stop/completion",
-        `#   auto_file: false # ${sd("durable_runs.auto_file", "opt in to auto-file pipeline:backlog issues for terminal or recurring durable-run-blocker clusters. Milestone assignment stays human — the report only suggests one.")}`,
+        `#   auto_file: false # ${sd("durable_runs.auto_file", "opt in to auto-file pipeline:backlog issues for terminal or recurring durable-run-blocker clusters. Shares the cross-host auto-file path (#459/#631). Milestone assignment stays human — the report only suggests one.")}`,
         `#   auto_file_window_hours: ${yamlScalar(durableRuns.auto_file_window_hours)} # ${sd("durable_runs.auto_file_window_hours", "trailing window (hours) over which durable-run-blocker occurrences are clustered for auto-filing")}`,
-        `#   auto_file_max_per_window: ${yamlScalar(durableRuns.auto_file_max_per_window)} # ${sd("durable_runs.auto_file_max_per_window", "maximum number of issues auto-filed within the trailing window")}`,
+        `#   auto_file_max_per_window: ${yamlScalar(durableRuns.auto_file_max_per_window)} # ${sd("durable_runs.auto_file_max_per_window", "independent max open durable-run-blocker-auto-filed issues (durable marker only) in the trailing window (#631)")}`,
         `#   auto_file_min_occurrences: ${yamlScalar(durableRuns.auto_file_min_occurrences)} # ${sd("durable_runs.auto_file_min_occurrences", "minimum cross-run recurrence count a non-terminal durable-run-blocker cluster must meet to be auto-filed (floor 2); a terminal stop always qualifies from a single occurrence")}`,
       ].join("\n"),
     "",

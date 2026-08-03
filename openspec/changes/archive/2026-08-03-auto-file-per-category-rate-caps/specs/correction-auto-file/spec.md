@@ -1,29 +1,4 @@
-# correction-auto-file Specification
-
-## Purpose
-TBD - created by archiving change correction-compiler. Update Purpose after archive.
-## Requirements
-### Requirement: Correction auto-filing SHALL be opt-in and fully inert by default
-
-The engine SHALL auto-file backlog issues from recurring `correction` clusters only when a
-`corrections.auto_file` setting resolves to `true`. When the `corrections` block is absent, or when
-`auto_file` is absent or `false`, the engine SHALL create no issues at run completion or at
-queue-batch completion for correction clusters, SHALL make no `gh` calls on behalf of this feature,
-and SHALL produce output, artifacts, event streams, and exit status identical to the behaviour before
-this feature existed.
-
-#### Scenario: Default configuration files nothing
-
-- **WHEN** a run reaches `run_complete` with no `corrections.auto_file` configured
-- **THEN** no correction issue SHALL be created
-- **AND** the run's events, `summary.json`, printed output, and exit status SHALL be identical to the
-  pre-feature behaviour
-
-#### Scenario: Capture present but auto-file off still files nothing
-
-- **WHEN** `correction_event` records exist and `corrections.auto_file` is absent or `false`
-- **THEN** the corrections SHALL still be readable and reportable by `pipeline improve`
-- **AND** no issue SHALL be auto-created
+## MODIFIED Requirements
 
 ### Requirement: Enabled correction auto-filing SHALL reuse the papercut auto-file controls
 
@@ -77,50 +52,6 @@ membership rule. Clusters below the minimum-occurrence threshold SHALL be report
 - **AND** it SHALL NOT close open papercut-auto-filed or durable-run-blocker-auto-filed issues
   solely to enforce the correction cap
 
-### Requirement: Auto-filed correction issues SHALL be sanitized, backlog-only, and provenance-declared
-
-Every auto-filed correction issue SHALL carry only the `pipeline:backlog` label, no assignee, no
-milestone, and no pipeline stage label; the engine SHALL NOT enqueue it or advance it. Its body SHALL
-contain the cluster's sanitized evidence bundle and control-level proposal — passed through secret
-redaction and injection screening before creation — and SHALL explicitly state that its content is
-agent-reported, automatically filed by the pipeline, and not human-authored or human-verified.
-
-#### Scenario: Auto-filed correction issue is backlog-only
-
-- **WHEN** an issue is auto-filed from a correction cluster
-- **THEN** it SHALL carry only the `pipeline:backlog` label and SHALL NOT be queued or advanced
-
-#### Scenario: A secret in a correction never reaches the auto-filed body
-
-- **WHEN** a source correction contains a token matching a recognized secret pattern
-- **THEN** the created issue body SHALL contain the redacted form and SHALL NOT contain the raw secret
-
-#### Scenario: Body declares agent-reported provenance
-
-- **WHEN** an auto-filed correction issue body is read
-- **THEN** it SHALL explicitly state that the content is agent-reported and automatically filed by the
-  pipeline rather than human-authored
-
-### Requirement: Correction auto-filing SHALL never fail a run, stage, or batch
-
-The correction auto-file path SHALL be best-effort and total: any error it encounters —
-unauthenticated `gh`, network failure, a throwing issue creation, unreadable run artifacts — SHALL be
-caught, surfaced as a non-fatal warning, and swallowed. It SHALL NOT change a run's or batch's exit
-status, SHALL NOT mark any stage as failed, SHALL NOT emit a `blocker_set` event, and SHALL NOT
-prevent `run_complete`, `summary.json`, or `batch-summary.json` from being written.
-
-#### Scenario: Issue creation failure is non-fatal
-
-- **WHEN** correction auto-filing is enabled and the GitHub issue-creation call throws
-- **THEN** the engine SHALL log a non-fatal warning
-- **AND** the run or batch SHALL complete with the same exit status it would have had with
-  auto-filing disabled
-
-#### Scenario: Finalization artifacts are still written
-
-- **WHEN** the correction auto-file path fails at run finalization
-- **THEN** `run_complete` and `summary.json` SHALL still be written for that run
-
 ### Requirement: Correction auto-filing SHALL honor the single-host concurrency scope
 
 Correction auto-filing SHALL use the same cross-host-safe path as papercut auto-filing: GitHub-
@@ -148,4 +79,3 @@ shared papercut/durable cross-host auto-file machinery (#459 / #631).
   correction-scoped rate-cap overflow exists
 - **THEN** the engine SHALL close no issue
 - **AND** the output SHALL not assert any cross-host deduplication was performed
-

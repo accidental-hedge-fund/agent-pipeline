@@ -104,12 +104,14 @@ into the living specs and runs `openspec validate --all` — a structurally inva
   is a documented engineering disposition, not an oversight (see
   `openspec/changes/cross-host-auto-file-serialization/design.md` for the full per-site
   assessment).
-- **Exception: the `pipeline improve` auto-file path** (`autoFilePapercuts`,
-  `core/scripts/stages/papercut.ts`) is hardened to be **cross-host safe**, because its failure
-  mode — a duplicate or over-cap auto-filed GitHub issue — is exactly that kind of irreversible
-  artifact. It uses GitHub-authored issue state (not the host-local lock) as the cross-host source
-  of truth: the in-window rate cap is recomputed from GitHub immediately before each create, and a
-  post-create read-back closes any duplicate title down to the lowest-numbered open issue. The
+- **Exception: the auto-file path** (`autoFilePapercuts`, `autoFileCorrections`,
+  `autoFileDurableRunBlockers` in `core/scripts/stages/papercut.ts`) is hardened to be
+  **cross-host safe** for all three categories, because its failure mode — a duplicate or over-cap
+  auto-filed GitHub issue — is exactly that kind of irreversible artifact. It uses GitHub-authored
+  issue state (not the host-local lock) as the cross-host source of truth: each category’s
+  independent per-window rate cap is recomputed from GitHub immediately before each create
+  (marker-scoped open backlog count only; #631), and a post-create read-back closes duplicate
+  titles and category-scoped rate-cap overflow down to the lowest-numbered open survivors. The
   `/tmp` lock is retained only as a same-host fast path.
 
 ## Conventions

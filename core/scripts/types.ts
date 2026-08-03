@@ -815,7 +815,10 @@ export interface PipelineConfig {
     // Opt-in auto-file path (#421): default false. When true, the engine
     // clusters recurring papercut events and files pipeline:backlog issues
     // at run_complete and queue-batch end without a human running
-    // `pipeline improve --apply`.
+    // `pipeline improve --apply`. `auto_file_max_per_window` is this category's
+    // independent budget (#631) — open papercut-auto-filed issues only (marker-
+    // scoped; not shared with corrections/durable). Cross-host posture: shared
+    // GitHub-authored state + post-create reconcile (#459).
     auto_file: boolean;
     auto_file_window_hours: number;
     auto_file_max_per_window: number;
@@ -825,8 +828,9 @@ export interface PipelineConfig {
   // correction capture itself is unconditional (#499 — every accepted operator
   // correction or recovered failure is recorded regardless of config), so this
   // block only gates auto-filing, mirroring `papercuts`' auto_file_* keys with
-  // no capture-side `enabled` flag. Honors the single-host concurrency scope of
-  // #459 — see `core/scripts/stages/papercut.ts` (`autoFileCorrections`).
+  // no capture-side `enabled` flag. Inherits the shared cross-host auto-file
+  // path (#459/#631: GitHub-authored state + post-create reconcile) with an
+  // independent per-category rate cap (correction marker only).
   corrections: {
     auto_file: boolean;
     auto_file_window_hours: number;
@@ -838,7 +842,9 @@ export interface PipelineConfig {
   // `enabled` flag — typed blocker classification (#509) itself is unconditional,
   // this block only gates auto-filing). `auto_file_min_occurrences` floors at 2 —
   // a single non-terminal occurrence never qualifies regardless of this setting;
-  // a terminal stop always qualifies from a single occurrence.
+  // a terminal stop always qualifies from a single occurrence. Independent
+  // per-category rate cap (#631) and the same shared cross-host auto-file
+  // posture as papercut/correction.
   durable_runs: {
     auto_file: boolean;
     auto_file_window_hours: number;

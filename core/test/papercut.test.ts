@@ -12,8 +12,10 @@ import {
   autoFilePapercuts,
   autoFileCorrections,
   autoFileDurableRunBlockers,
+  AUTO_FILE_PROVENANCE_MARKER,
   CORRECTION_AUTO_FILE_PROVENANCE_MARKER,
   DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER,
+  countsTowardCategoryRateCap,
   issueNumberFromUrl,
   type PapercutDeps,
   type AutoFileDeps,
@@ -590,6 +592,7 @@ test("autoFilePapercuts: the rate cap defers clusters once the window's issue co
       state: "OPEN",
       createdAt: withinWindowCreatedAt,
       labels: ["pipeline:backlog"],
+      body: AUTO_FILE_PROVENANCE_MARKER,
     },
   ];
   const deps = makeAutoFileDeps({
@@ -707,7 +710,7 @@ test("autoFilePapercuts: acquires the lock for opts.domain", async () => {
   assert.equal(seenDomain, "my-repo-domain");
 });
 
-test("autoFilePapercuts: a closed auto-filed issue still counts toward the window cap (finding 3)", async () => {
+test("autoFilePapercuts: a closed auto-filed issue does not consume the window cap (#631; supersedes #421 finding 3 closed-slot inflation)", async () => {
   const at = new Date(NOW_MS - 3600_000).toISOString();
   const closedWithinWindow = new Date(NOW_MS - 1000).toISOString();
   const deps = makeAutoFileDeps({
@@ -723,12 +726,17 @@ test("autoFilePapercuts: a closed auto-filed issue still counts toward the windo
         state: "CLOSED",
         createdAt: closedWithinWindow,
         labels: ["pipeline:backlog"],
+        body: AUTO_FILE_PROVENANCE_MARKER,
       },
     ],
   });
   await autoFilePapercuts(defaultAutoFileOpts({ maxPerWindow: 1 }), deps);
-  assert.equal(deps._createCalls.length, 0, "the closed issue already used up the window's only slot");
-  assert.ok(deps._logLines.some((l) => l.includes("deferred (rate cap)")));
+  assert.equal(
+    deps._createCalls.length,
+    1,
+    "closed issues are not open rate-cap members — pre-create and reconcile agree",
+  );
+  assert.ok(!deps._logLines.some((l) => l.includes("deferred (rate cap)")));
 });
 
 test("autoFilePapercuts: two clusters that truncate to the same title within one invocation file only one issue (finding 4)", async () => {
@@ -1165,7 +1173,7 @@ test("autoFileCorrections: below-threshold (singleton) cluster is not filed", as
   assert.equal(deps._createCalls.length, 0);
 });
 
-test("autoFileCorrections: body carries the correction provenance marker, control-level proposal, sanitized excerpt, and single-host framing", async () => {
+test("autoFileCorrections: body carries the correction provenance marker, control-level proposal, sanitized excerpt, and shared cross-host framing", async () => {
   const at = new Date(NOW_MS - 3600_000).toISOString();
   const deps = makeAutoFileDeps({
     runs: {
@@ -1182,7 +1190,8 @@ test("autoFileCorrections: body carries the correction provenance marker, contro
   const body = deps._createCalls[0].body;
   assert.match(body, new RegExp(CORRECTION_AUTO_FILE_PROVENANCE_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(body, /Next control level.*instruction/);
-  assert.match(body, /single-host/i);
+  assert.match(body, /cross-host/i);
+  assert.doesNotMatch(body, /single-host/i);
   assert.doesNotMatch(body, /sk-ABCDEFGHIJKLMNOPQRSTUVWX01234567/);
   assert.match(body, /\[REDACTED\]/);
 });
@@ -1358,7 +1367,14 @@ test("autoFileDurableRunBlockers: a qualifying cluster whose title matches an op
 
 test("autoFileDurableRunBlockers: the rate cap defers clusters once the window's issue count is reached", async () => {
   const github = makeFakeGithub([
-    { title: "[pipeline-improve] Recurring papercut: pre-existing 1", url: "https://github.com/org/repo/issues/1", state: "OPEN", createdAt: new Date(NOW_MS).toISOString(), labels: ["pipeline:backlog"], body: "" },
+    {
+      title: "[pipeline-improve] Recurring durable-run-blocker: pre-existing 1",
+      url: "https://github.com/org/repo/issues/1",
+      state: "OPEN",
+      createdAt: new Date(NOW_MS).toISOString(),
+      labels: ["pipeline:backlog"],
+      body: DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER,
+    },
   ]);
   const deps = makeAutoFileDeps({
     github,
@@ -1412,5 +1428,236 @@ test("autoFileDurableRunBlockers: does not scan .agent-pipeline/runs/ at all —
 
 test("autoFileDurableRunBlockers: provenance marker is distinct from papercut and correction markers", () => {
   assert.notEqual(DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER, CORRECTION_AUTO_FILE_PROVENANCE_MARKER);
-  assert.notEqual(DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER, "<!-- pipeline:papercut-auto-filed -->");
+  assert.notEqual(DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER, AUTO_FILE_PROVENANCE_MARKER);
+});
+
+// ---------------------------------------------------------------------------
+// Per-category independent rate caps (#631)
+// ---------------------------------------------------------------------------
+
+function threeOpenMarked(
+  marker: string,
+  titlePrefix: string,
+  startNumber = 1,
+): OpenImproveIssue[] {
+  const within = new Date(NOW_MS - 1000).toISOString();
+  return [0, 1, 2].map((i) => ({
+    title: `${titlePrefix} ${i + 1}`,
+    url: `https://github.com/org/repo/issues/${startNumber + i}`,
+    state: "OPEN" as const,
+    createdAt: within,
+    labels: ["pipeline:backlog"],
+    body: marker,
+  }));
+}
+
+test("autoFile #631: three open papercut-auto-filed issues do not starve a correction create (independent budgets)", async () => {
+  // Pre-fix shared unlabeled count would treat the three papercuts as filling
+  // maxPerWindow=3 for every category — this assertion fails without marker-scoped
+  // pre-create counting.
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const deps = makeAutoFileDeps({
+    openIssues: threeOpenMarked(
+      AUTO_FILE_PROVENANCE_MARKER,
+      "[pipeline-improve] Recurring papercut: already",
+    ),
+    runs: {
+      r1: [correctionLine({ at, correctionKey: "k-starve", correctionId: "c1" })],
+      r2: [correctionLine({ at, correctionKey: "k-starve", correctionId: "c2" })],
+    },
+  });
+  await autoFileCorrections(defaultAutoFileOpts({ maxPerWindow: 3, minOccurrences: 2 }), deps);
+  assert.equal(
+    deps._createCalls.length,
+    1,
+    "correction budget is independent — papercut fills must not prevent a correction create",
+  );
+  assert.ok(deps._createCalls[0].body.includes(CORRECTION_AUTO_FILE_PROVENANCE_MARKER));
+  assert.ok(!deps._logLines.some((l) => l.includes("deferred (rate cap)")));
+});
+
+test("autoFile #631: three open papercut-auto-filed issues do not starve a durable-run-blocker create", async () => {
+  const deps = makeAutoFileDeps({
+    openIssues: threeOpenMarked(
+      AUTO_FILE_PROVENANCE_MARKER,
+      "[pipeline-improve] Recurring papercut: already",
+    ),
+    durableBlockerOccurrences: [
+      durableOccurrence({ terminal: true, blockerClass: "environment-auth", fingerprint: "fp-independent" }),
+    ],
+  });
+  await autoFileDurableRunBlockers(defaultAutoFileOpts({ maxPerWindow: 3 }), deps);
+  assert.equal(deps._createCalls.length, 1, "durable budget is independent of papercut fills");
+  assert.ok(deps._createCalls[0].body.includes(DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER));
+});
+
+test("autoFile #631: same-category open marked count at max defers further creates", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const deps = makeAutoFileDeps({
+    openIssues: threeOpenMarked(
+      CORRECTION_AUTO_FILE_PROVENANCE_MARKER,
+      "[pipeline-improve] Recurring correction: filled",
+    ),
+    runs: {
+      r1: [correctionLine({ at, correctionKey: "k-cap", correctionId: "c1" })],
+      r2: [correctionLine({ at, correctionKey: "k-cap", correctionId: "c2" })],
+    },
+  });
+  await autoFileCorrections(defaultAutoFileOpts({ maxPerWindow: 3, minOccurrences: 2 }), deps);
+  assert.equal(deps._createCalls.length, 0, "own category at max must defer");
+  assert.ok(deps._logLines.some((l) => l.includes("deferred (rate cap)")));
+});
+
+test("autoFile #631: unmarked improve issues never inflate any category rate cap", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const within = new Date(NOW_MS - 1000).toISOString();
+  const deps = makeAutoFileDeps({
+    openIssues: [
+      {
+        title: "[pipeline-improve] Recurring papercut: human triage note",
+        url: "https://github.com/org/repo/issues/1",
+        state: "OPEN",
+        createdAt: within,
+        labels: ["pipeline:backlog"],
+        body: "Filed by a human / improve --apply — no auto-file marker.",
+      },
+      {
+        title: "[pipeline-improve] Recurring papercut: improve apply",
+        url: "https://github.com/org/repo/issues/2",
+        state: "OPEN",
+        createdAt: within,
+        labels: ["pipeline:backlog"],
+        // no body / no marker
+      },
+    ],
+    runs: {
+      r1: [papercutLine(at, "should still file")],
+      r2: [papercutLine(at, "should still file")],
+      r3: [papercutLine(at, "should still file")],
+    },
+  });
+  await autoFilePapercuts(defaultAutoFileOpts({ maxPerWindow: 1 }), deps);
+  assert.equal(
+    deps._createCalls.length,
+    1,
+    "human/improve --apply backlog issues without an auto-file marker must not consume the papercut cap",
+  );
+});
+
+test("autoFile #631: correction rate-cap reconcile does not close open papercut-auto-filed issues", async () => {
+  const at = new Date(NOW_MS - 3600_000).toISOString();
+  const within = new Date(NOW_MS - 500).toISOString();
+  // Papercut-marked issues must never be closed by correction reconcile even
+  // when a concurrent host's correction create overshoots max=1.
+  const github = makeFakeGithub([
+    {
+      title: "[pipeline-improve] Recurring papercut: keep-me-1",
+      url: "https://github.com/org/repo/issues/10",
+      state: "OPEN",
+      createdAt: within,
+      labels: ["pipeline:backlog"],
+      body: AUTO_FILE_PROVENANCE_MARKER,
+    },
+    {
+      title: "[pipeline-improve] Recurring papercut: keep-me-2",
+      url: "https://github.com/org/repo/issues/11",
+      state: "OPEN",
+      createdAt: within,
+      labels: ["pipeline:backlog"],
+      body: AUTO_FILE_PROVENANCE_MARKER,
+    },
+  ]);
+  const deps = makeAutoFileDeps({
+    github,
+    runs: {
+      r1: [correctionLine({ at, correctionKey: "k-reconcile", correctionId: "c1" })],
+      r2: [correctionLine({ at, correctionKey: "k-reconcile", correctionId: "c2" })],
+    },
+  });
+  // After this host creates (list call 3 is post-create reconcile), inject a
+  // second open correction-marked issue as if another host raced past the cap.
+  const originalList = deps.listOpenImproveIssues;
+  let listCallCount = 0;
+  deps.listOpenImproveIssues = async () => {
+    listCallCount++;
+    const issues = await originalList();
+    if (listCallCount === 3) {
+      const next = Math.max(0, ...issues.map((i) => issueNumberFromUrl(i.url) ?? 0)) + 1;
+      issues.push({
+        title: "[pipeline-improve] Recurring correction: foreign host race",
+        url: `https://github.com/org/repo/issues/${next}`,
+        state: "OPEN",
+        createdAt: new Date(NOW_MS).toISOString(),
+        labels: ["pipeline:backlog"],
+        body: CORRECTION_AUTO_FILE_PROVENANCE_MARKER,
+      });
+    }
+    return issues;
+  };
+
+  await autoFileCorrections(defaultAutoFileOpts({ maxPerWindow: 1, minOccurrences: 2 }), deps);
+  assert.equal(deps._createCalls.length, 1, "under-cap pre-create still files the correction");
+  const closedNumbers = deps._closeCalls.map((c) => c.number);
+  assert.ok(closedNumbers.length >= 1, "rate-cap overflow should close at least one correction issue");
+  assert.ok(!closedNumbers.includes(10) && !closedNumbers.includes(11), "must not close papercut issues");
+  for (const n of closedNumbers) {
+    const closed = github.issues.find((i) => issueNumberFromUrl(i.url) === n)
+      ?? { body: CORRECTION_AUTO_FILE_PROVENANCE_MARKER };
+    // Injected foreign issue is only on the list snapshot, not always mutated
+    // into github.issues; either closed body must be correction-scoped.
+    const body = (closed as OpenImproveIssue).body ?? CORRECTION_AUTO_FILE_PROVENANCE_MARKER;
+    assert.ok(
+      body.includes(CORRECTION_AUTO_FILE_PROVENANCE_MARKER),
+      `closed #${n} must be correction-marked, not papercut`,
+    );
+    assert.ok(!body.includes(AUTO_FILE_PROVENANCE_MARKER) || body.includes(CORRECTION_AUTO_FILE_PROVENANCE_MARKER));
+  }
+  const papercutsStillOpen = github.issues.filter(
+    (i) =>
+      i.state === "OPEN" &&
+      (i.body ?? "").includes(AUTO_FILE_PROVENANCE_MARKER),
+  );
+  assert.equal(papercutsStillOpen.length, 2, "both papercut issues remain open after correction reconcile");
+});
+
+test("countsTowardCategoryRateCap: pre-create and reconcile membership rules are identical", () => {
+  const cutoff = NOW_MS - 24 * 3600_000;
+  const base: OpenImproveIssue = {
+    title: "[pipeline-improve] Recurring papercut: x",
+    url: "https://github.com/org/repo/issues/1",
+    state: "OPEN",
+    createdAt: new Date(NOW_MS - 1000).toISOString(),
+    labels: ["pipeline:backlog"],
+    body: AUTO_FILE_PROVENANCE_MARKER,
+  };
+  assert.equal(countsTowardCategoryRateCap(base, AUTO_FILE_PROVENANCE_MARKER, cutoff), true);
+  assert.equal(
+    countsTowardCategoryRateCap({ ...base, state: "CLOSED" }, AUTO_FILE_PROVENANCE_MARKER, cutoff),
+    false,
+    "closed never counts",
+  );
+  assert.equal(
+    countsTowardCategoryRateCap({ ...base, body: CORRECTION_AUTO_FILE_PROVENANCE_MARKER }, AUTO_FILE_PROVENANCE_MARKER, cutoff),
+    false,
+    "other-category marker never counts",
+  );
+  assert.equal(
+    countsTowardCategoryRateCap({ ...base, body: "human only" }, AUTO_FILE_PROVENANCE_MARKER, cutoff),
+    false,
+    "unmarked never counts",
+  );
+  assert.equal(
+    countsTowardCategoryRateCap({ ...base, labels: [] }, AUTO_FILE_PROVENANCE_MARKER, cutoff),
+    false,
+    "missing backlog label never counts",
+  );
+  assert.equal(
+    countsTowardCategoryRateCap(
+      { ...base, createdAt: new Date(cutoff - 1000).toISOString() },
+      AUTO_FILE_PROVENANCE_MARKER,
+      cutoff,
+    ),
+    false,
+    "out-of-window never counts",
+  );
 });

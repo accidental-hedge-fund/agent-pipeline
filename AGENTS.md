@@ -52,3 +52,12 @@ tags for parity with a full local clone when tag-sourced generators exist.
 New features need unit tests; bug fixes need a regression test that would have
 caught the bug. Tests inject I/O via `deps`/`Deps` seams — no real network, git,
 or subprocess calls in unit tests.
+
+## Concurrency scope (#459 / #631)
+
+- Host-local `/tmp` PID locks (advance, queue-batch, live-planning) are **single-host** only.
+- **Exception:** all three auto-file categories (`autoFilePapercuts`,
+  `autoFileCorrections`, `autoFileDurableRunBlockers`) share one **cross-host-safe**
+  path: GitHub-authored issue state for pre-create dedup/rate-cap, plus post-create
+  reconciliation. Each category has an **independent** `auto_file_max_per_window`
+  budget scoped to its own provenance marker.
