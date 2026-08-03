@@ -16,7 +16,7 @@
 
 - [x] 3.1 Implement `installOpenCodeCommands` writing `<opencodeBase>/commands/pipeline.md` with absolute launcher path under the same base
 - [x] 3.2 Implement argv-safe argument bridge (design D3) so ordinary pipeline args reach the launcher without shell interpolation/loss
-- [x] 3.3 Ensure `--version` / `-V` routing yields the same version string as the installed launcher / `core/package.json` without embedding full SKILL.md instructional body
+- [x] 3.3 Ensure `--version` / `-V` shell-inject path yields the same version string as the installed launcher / `core/package.json` without embedding full SKILL.md instructional body; document OpenCode command surface as explicitly LLM-mediated (no pure no-LLM host claim)
 - [x] 3.4 Implement uninstall cleanup of installer-owned `pipeline.md` only; preserve sibling command files
 - [x] 3.5 Honor `OPENCODE_CONFIG_DIR` for both skill and command paths (no hardcoded default when override is set)
 
@@ -32,13 +32,13 @@
 
 ## 6. Documentation
 
-- [x] 6.1 Document `install --host opencode` in README: default paths, `OPENCODE_CONFIG_DIR`, version command expectation
+- [x] 6.1 Document `install --host opencode` in README: default paths, `OPENCODE_CONFIG_DIR`, LLM-mediated command + inject version contract
 - [x] 6.2 Align installer help strings with implemented hosts including `opencode`
 
 ## 7. Tests and verification
 
 - [x] 7.1 Installer unit tests: OpenCode install layout, isolation from Claude/Codex, dry-run, update, uninstall command+skill cleanup, `OPENCODE_CONFIG_DIR`
-- [x] 7.2 Tests for version routing contract (`--version`/`-V` matches launcher / package.json; no full skill-instruction template on version path)
+- [x] 7.2 Tests for version inject/bridge contract (`--version`/`-V` matches launcher / package.json; template is LLM-mediated + shell inject; no full skill-instruction body)
 - [x] 7.3 Tests for argv safety (spaces / metacharacters not shell-expanded) at the bridge boundary
 - [x] 7.4 Shadow-detection tests for personal OpenCode skill (accept/decline/non-TTY)
 - [x] 7.5 Run `openspec validate native-opencode-pipeline-host` (and `openspec validate --all` if required by gate)

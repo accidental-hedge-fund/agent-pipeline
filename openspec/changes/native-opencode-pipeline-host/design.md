@@ -19,11 +19,13 @@ OpenCode discovers skills and commands under its config directory:
 OpenCode custom commands are **prompt templates** (markdown frontmatter + body),
 not pure side-effect CLIs. Shell injection (`!`command``) can run a process and
 inject stdout into the prompt; pure no-LLM side-effect slash commands are not a
-supported plugin path (upstream issue #30268 closed as not planned). Therefore
-the design must make `/pipeline --version` **deterministically obtain launcher
-stdout** and **avoid dumping instructional skill text**, while remaining honest
-that the host may still present that stdout through OpenCode’s command
-execution surface.
+supported plugin path (upstream issue #30268 closed as not planned; plugin
+`command.execute.before` cannot suppress the LLM turn — #28292). Therefore the
+design MUST be explicitly **LLM-mediated**: `/pipeline --version` SHALL
+**deterministically obtain launcher stdout via shell inject** and **avoid
+embedding instructional skill text** in the template, while remaining honest
+that OpenCode still starts a prompt turn and residual presentation goes through
+the host’s LLM session. Do **not** claim a host-level non-LLM stdout return.
 
 The shared launcher (`hosts/_shared/entry.template.mjs` → `pipeline.mjs` in the
 skill tree) already implements `--version` / `-V` by reading
@@ -37,10 +39,11 @@ skill tree) already implements `--version` / `-V` by reading
   artifacts.
 - OpenCode skill tree with managed marker, core, host overlay, and launcher.
 - Native `/pipeline` command under OpenCode `commands/` that routes arguments to
-  that launcher with argv-safe forwarding.
-- `/pipeline --version` and `/pipeline -V` produce the same version string as the
-  installed launcher, without generic skill-instruction content as the
-  response.
+  that launcher with argv-safe forwarding (LLM-mediated template + shell inject).
+- `/pipeline --version` and `/pipeline -V` **inject** the same version string as
+  the installed launcher (bridge/launcher stdout equality), with agent
+  instruction to report only that string and without embedding generic
+  skill-instruction content in the template.
 - Shadow detection / dry-run / update / uninstall parity with other tree hosts.
 - Document OpenCode as a supported host; regression tests; `npm run ci` green.
 
@@ -142,19 +145,21 @@ blind `!`node launcher $ARGUMENTS`` is unsafe.
 - *OpenCode plugin tool* — heavier; optional later optimization if markdown
   command path proves insufficient for version fidelity.
 
-### D4 — Version short-circuit contract
+### D4 — Version short-circuit contract (inject + instruction, LLM-mediated host)
 
 **Choice:** When the user invokes `/pipeline --version` or `/pipeline -V`, the
-OpenCode command path SHALL cause the installed launcher’s version short-circuit
-to run and SHALL present that version string as the observable result. The
-command template SHALL NOT include the full SKILL.md instructional body as the
-content for those invocations (no “how to use the pipeline” dump).
+OpenCode command path SHALL shell-inject the installed launcher’s version
+short-circuit (via the argv-safe bridge) so inject stdout equals launcher
+`--version` / `-V` / `core/package.json` `version`. The command template SHALL
+instruct the agent to report **only** that injected version string and SHALL
+NOT include the full SKILL.md instructional body (no “how to use the pipeline”
+dump). The host surface remains LLM-mediated; the guaranteed contract is
+deterministic inject + instruction, not pure process-stdout return without an
+LLM turn.
 
-The version string SHALL equal `core/package.json` `version` at the OpenCode
-install root (same as `cli-version-flag` / launcher shim).
-
-**Why:** This is the issue’s primary observable failure mode and acceptance
-criterion.
+**Why:** OpenCode has no pure side-effect slash-command API. The failure mode
+to fix is “skill text / generic usage dump instead of launcher version,” not
+“bypass OpenCode’s prompt turn.”
 
 ### D5 — Host overlay and profile
 
@@ -227,7 +232,7 @@ Note `OPENCODE_CONFIG_DIR`, restart/reload expectations if any, and that
 
 | Risk | Mitigation |
 | --- | --- |
-| OpenCode still routes slash commands through an LLM session | Spec version path as “same version string as launcher, no skill-instruction dump”; fixed shell inject for version; bridge for other args. Document residual host UI wrapping if any. |
+| OpenCode still routes slash commands through an LLM session | **Accepted as host reality.** Spec version path as deterministic inject equality + agent instruction, no skill-instruction dump; bridge for argv; README/spec state LLM mediation explicitly. Do not claim no-LLM stdout return. |
 | `$ARGUMENTS` shell injection bugs | Forbid unquoted shell concat; require bridge/execFile tests with spaces and metacharacters. |
 | `OPENCODE_CONFIG_DIR` semantics drift upstream | Pin documented behavior in design + tests with env override; fail closed to default base when unset. |
 | Skill vs command dual surface confuses operators | README: skill = discoverable instructions; command = native `/pipeline` entry that runs the launcher. |
@@ -247,7 +252,10 @@ Note `OPENCODE_CONFIG_DIR`, restart/reload expectations if any, and that
 1. Exact OpenCode command frontmatter fields required for best UX (`description`,
    optional `agent`) — confirm against current OpenCode docs at implement time
    (golden rule: verify external shapes; do not guess).
-2. Whether a minimal OpenCode plugin (custom tool) is needed if markdown+bridge
-   cannot present raw version stdout cleanly — defer unless acceptance fails.
+2. ~~Whether a minimal OpenCode plugin (custom tool) is needed if markdown+bridge
+   cannot present raw version stdout cleanly~~ — **Resolved:** upstream does not
+   support pure no-LLM side-effect slash commands (#30268 not planned; #28292
+   plugins cannot suppress LLM turn). Stay on markdown + shell inject + bridge;
+   document LLM mediation rather than claim direct stdout.
 3. Whether `--host all` auto-detect should treat presence of
    `~/.config/opencode` alone as sufficient (yes per D6) even when empty.

@@ -21,8 +21,10 @@
 //
 // OpenCode: --host opencode installs a full tree under
 // ~/.config/opencode/skills/pipeline (or $OPENCODE_CONFIG_DIR/…) plus a native
-// /pipeline command at <base>/commands/pipeline.md that routes args to the
-// installed launcher via an argv-safe bridge (see hosts/opencode/).
+// /pipeline command at <base>/commands/pipeline.md. OpenCode custom commands
+// are LLM-mediated prompt templates; the installed command shell-injects an
+// argv-safe bridge (hosts/opencode/) so the launcher runs and its stdout is
+// injected into the prompt — not a pure no-LLM process-stdout host path.
 
 import {
   closeSync,
@@ -656,6 +658,11 @@ function stageInto(stagingDir, host) {
  * Embeds absolute bridge + launcher paths under the same opencodeBase as the skill tree.
  * Does NOT embed the full SKILL.md instructional body — version path stays short.
  *
+ * OpenCode custom commands are LLM-mediated prompt templates (not pure side-effect
+ * CLIs). Shell inject (`!`…``) runs the bridge and injects stdout into the prompt;
+ * residual presentation still goes through OpenCode’s agent turn. Contract:
+ * deterministic inject + instruction — not host-level non-LLM stdout return.
+ *
  * @param {string} skillDir Absolute path to <opencodeBase>/skills/pipeline
  * @returns {string}
  */
@@ -669,10 +676,11 @@ function renderOpenCodePipelineCommand(skillDir) {
     "description: Advance a GitHub issue/PR through agent-pipeline (native launcher)",
     "---",
     "",
-    "Run the installed agent-pipeline launcher with the user's arguments.",
-    "Treat the shell-injection block below as the authoritative command result.",
-    "For `--version` or `-V`, report only that version string — do not expand into",
-    "generic pipeline skill usage or instructional SKILL.md text.",
+    "This OpenCode command is a prompt template (LLM-mediated host surface).",
+    "The shell-injection block below runs the installed agent-pipeline launcher",
+    "via an argv-safe bridge; treat its stdout as the authoritative command result.",
+    "For `--version` or `-V`, report only the injected version string — do not expand",
+    "into generic pipeline skill usage or instructional SKILL.md text.",
     "",
     "Launcher: `" + launcherPath + "`",
     "",

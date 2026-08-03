@@ -2224,6 +2224,11 @@ test("renderOpenCodePipelineCommand: config-dir skill path embedded (#861)", () 
   assert.match(content, /\/custom\/opencode\/skills\/pipeline\/scripts\/pipeline\.mjs/);
   assert.match(content, /\/custom\/opencode\/skills\/pipeline\/scripts\/opencode-pipeline-bridge\.mjs/);
   assert.ok(!content.includes("/.config/opencode/skills/pipeline"), "must not hardcode default when path is custom");
+  // Explicit LLM-mediated contract (adversarial review #861): shell inject + agent instruction.
+  assert.match(content, /LLM-mediated/i);
+  assert.match(content, /!`node \/custom\/opencode\/skills\/pipeline\/scripts\/opencode-pipeline-bridge\.mjs/);
+  assert.match(content, /report only the injected version string/i);
+  assert.ok(!content.includes("## State machine"), "must not embed full skill instructional body");
 });
 
 test("install --host opencode: managed skill tree + command; isolation from Claude/Codex (#861)", () => {
@@ -2436,6 +2441,10 @@ test("personal OpenCode skill non-TTY: auto-relocates then install proceeds (#86
 });
 
 test("OpenCode version routing: bridge --version matches launcher and package.json (#861)", () => {
+  // Host contract: OpenCode markdown commands are LLM-mediated prompt templates.
+  // Guarantees are (1) shell-inject → bridge → launcher stdout equality and
+  // (2) template does not embed full skill instructions. Tests do NOT claim
+  // OpenCode returns process stdout without an LLM turn (unsupported upstream).
   const opencodeTmp = makeTmp();
   const lockTmp = makeTmp();
   try {
@@ -2482,7 +2491,7 @@ test("OpenCode version routing: bridge --version matches launcher and package.js
     assert.equal(bridgeShort.status, 0, bridgeShort.stderr);
     assert.equal(bridgeShort.stdout.trim(), expected);
 
-    // Bridge stdin path (OpenCode command heredoc contract).
+    // Bridge stdin path (OpenCode command heredoc / shell-inject contract).
     const bridgeStdin = spawnSync(process.execPath, [bridge, "--from-stdin"], {
       encoding: "utf8",
       shell: false,
@@ -2491,10 +2500,13 @@ test("OpenCode version routing: bridge --version matches launcher and package.js
     assert.equal(bridgeStdin.status, 0, bridgeStdin.stderr);
     assert.equal(bridgeStdin.stdout.trim(), expected);
 
-    // Command definition must not embed full skill instructional body.
+    // Command definition: LLM-mediated template + shell inject of bridge; no full skill body.
     const cmd = readFileSync(join(opencodeTmp, "commands", "pipeline.md"), "utf8");
     assert.ok(!cmd.includes("## State machine"));
     assert.ok(cmd.includes(bridge));
+    assert.match(cmd, /!`node /);
+    assert.match(cmd, /LLM-mediated/i);
+    assert.match(cmd, /report only the injected version string/i);
   } finally {
     cleanup(opencodeTmp);
     cleanup(lockTmp);

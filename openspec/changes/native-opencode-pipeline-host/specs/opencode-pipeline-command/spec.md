@@ -31,31 +31,68 @@ command file.
 - **THEN** no `pipeline.md` SHALL be created or modified under the resolved
   OpenCode `commands/` directory
 
-### Requirement: OpenCode /pipeline --version SHALL match the installed launcher version
+### Requirement: OpenCode /pipeline command surface SHALL be explicitly LLM-mediated
 
-The OpenCode `/pipeline` command path SHALL route `--version` and `-V` to the
-installed pipeline launcher’s version short-circuit. The observable version
-output SHALL equal the version printed by invoking that same launcher with
-`--version` (and with `-V`), which SHALL equal the `version` field of
-`core/package.json` at the OpenCode install root. The version path SHALL NOT
-present generic pipeline instructional skill text (full skill usage dump) as
-the response content for those invocations.
+The OpenCode `/pipeline` command surface SHALL be an LLM-mediated markdown
+prompt template: when `/pipeline` is invoked, OpenCode expands the template
+(including any shell-injection results) and sends that content as a prompt turn
+to the LLM. The installer SHALL install a markdown command that uses shell
+injection (`!`…``) so the installed bridge/launcher runs and its stdout is
+injected into that prompt. The installer SHALL NOT claim a pure no-LLM /
+direct-process-stdout host integration that OpenCode does not provide. Tests
+SHALL exercise the command→bridge→launcher routing contract without requiring a
+live OpenCode TUI session and SHALL NOT assert that OpenCode returns process
+stdout without an LLM turn.
 
-#### Scenario: /pipeline --version matches launcher --version
+#### Scenario: Command definition uses shell inject plus agent instruction
+
+- **WHEN** `install --host opencode` writes `commands/pipeline.md`
+- **THEN** the file SHALL contain a shell-injection block that invokes the
+  installed argv-safe bridge with the absolute skill-tree path
+- **AND** SHALL contain instruction text telling the agent to treat the inject
+  output as the authoritative launcher result for version-style invocations
+- **AND** SHALL NOT present the command as a pure side-effect CLI that bypasses
+  OpenCode’s prompt turn
+
+#### Scenario: Host-contract tests do not claim no-LLM stdout return
+
+- **WHEN** regression tests cover the OpenCode `/pipeline` version path
+- **THEN** they SHALL prove bridge/launcher stdout equality and template
+  content constraints
+- **AND** SHALL NOT require or claim a live OpenCode host return of process
+  stdout without an LLM turn
+
+### Requirement: OpenCode /pipeline --version inject SHALL match the installed launcher version
+
+The OpenCode `/pipeline --version` and `/pipeline -V` path SHALL run the
+installed pipeline launcher’s version short-circuit via the command template’s
+shell-injection path and argv-safe bridge. The stdout produced by that injection
+SHALL equal the version printed by invoking that same launcher with `--version`
+(and with `-V`), which SHALL equal the `version` field of `core/package.json` at
+the OpenCode install root. The command template SHALL instruct the host agent to
+report only that injected version string for those invocations and SHALL NOT
+embed the full instructional SKILL.md body as template content. Residual
+presentation through OpenCode’s LLM session is acknowledged; the guaranteed
+contract is deterministic inject + instruction, not a host-level non-LLM stdout
+short-circuit.
+
+#### Scenario: /pipeline --version inject matches launcher --version
 
 - **WHEN** OpenCode host is installed
 - **AND** the operator invokes the OpenCode `/pipeline --version` command path
-  (or the test double that exercises the same command→launcher routing)
-- **THEN** the version string obtained SHALL equal the stdout of
-  `node <opencode-skill>/pipeline.mjs --version` (trim trailing newline)
+  (or the test double that exercises the same command→bridge→launcher routing)
+- **THEN** the version string obtained from the bridge/launcher inject path
+  SHALL equal the stdout of `node <opencode-skill>/pipeline.mjs --version`
+  (trim trailing newline)
 - **AND** SHALL equal the `version` field in
   `<opencode-skill>/core/package.json`
 
-#### Scenario: /pipeline -V matches launcher -V
+#### Scenario: /pipeline -V inject matches launcher -V
 
 - **WHEN** OpenCode host is installed
 - **AND** the operator invokes `/pipeline -V` via the same routing contract
-- **THEN** the version string obtained SHALL equal the launcher’s `-V` output
+- **THEN** the version string obtained from the inject path SHALL equal the
+  launcher’s `-V` output
 
 #### Scenario: Version path does not dump skill instructions
 
@@ -63,8 +100,8 @@ the response content for those invocations.
   command definition
 - **THEN** the command definition used for that invocation SHALL NOT embed the
   full instructional SKILL.md body as the template content for the version path
-- **AND** tests SHALL assert the version routing contract without requiring a
-  live OpenCode TUI session
+- **AND** tests SHALL assert the inject/bridge version routing contract without
+  requiring a live OpenCode TUI session
 
 ### Requirement: OpenCode /pipeline SHALL forward arguments without shell interpolation loss
 

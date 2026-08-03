@@ -152,7 +152,7 @@ Default install locations (override the config base with `OPENCODE_CONFIG_DIR`):
 | Skill tree | `~/.config/opencode/skills/pipeline` |
 | Native `/pipeline` command | `~/.config/opencode/commands/pipeline.md` |
 
-The OpenCode command routes arguments to the installed launcher via an argv-safe bridge. After install, `/pipeline --version` (and `-V`) print the same version string as `node ~/.config/opencode/skills/pipeline/scripts/pipeline.mjs --version` (from `core/package.json` at the install root), without dumping generic skill instructional text.
+The OpenCode `/pipeline` command is an **OpenCode markdown command** (LLM-mediated prompt template — OpenCode does not support pure no-LLM side-effect slash commands). The installer writes a template that **shell-injects** an argv-safe bridge so the installed launcher runs and its stdout is injected into the prompt before the agent turn. For `--version` / `-V`, the inject output equals `node ~/.config/opencode/skills/pipeline/scripts/pipeline.mjs --version` (from `core/package.json` at the install root), and the template instructs the agent to report only that version string without dumping generic skill instructional text.
 
 ### Uninstall
 

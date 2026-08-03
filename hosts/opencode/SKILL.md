@@ -13,10 +13,11 @@ description: |
 
 # pipeline
 
-OpenCode host overlay for agent-pipeline. The native `/pipeline`
-command (installed under OpenCode `commands/pipeline.md`) routes arguments to
-the skill launcher so `/pipeline --version` prints the installed version instead
-of instructional skill text.
+OpenCode host overlay for agent-pipeline. The native `/pipeline` command
+(installed under OpenCode `commands/pipeline.md`) is an LLM-mediated OpenCode
+markdown template that shell-injects an argv-safe bridge to the skill launcher
+so `/pipeline --version` injects the installed launcher version instead of
+embedding instructional skill text in the template.
 
 Self-contained TypeScript skill that advances a GitHub issue (or PR's linked
 issue) through a 16-stage label-driven state machine, ending at
