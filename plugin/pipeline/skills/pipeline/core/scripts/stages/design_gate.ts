@@ -60,7 +60,7 @@ import {
 } from "../prompts/index.ts";
 import { recordDesignInterrogation } from "../evidence-bundle.ts";
 import { extractPlan } from "./review-acquisition.ts";
-import { diffFilePaths } from "./review-parsing.ts";
+import { attestPipelineComment, diffFilePaths } from "./review-parsing.ts";
 import type {
   BlockerKind,
   DesignChallenge,
@@ -117,9 +117,14 @@ function isHarnessUnavailable(result: HarnessResult): boolean {
   return !result.success && (result.spawn_error === true || result.timed_out);
 }
 
-/** Render the human-readable body for a `## Design Interrogation` comment, plus
- *  the trailing hidden `DesignGateState` artifact. Pure. */
-function buildDesignGateComment(state: DesignGateState, note: string): string {
+/**
+ * Render the human-readable body for a `## Design Interrogation` comment, plus
+ * the trailing hidden `DesignGateState` artifact, then a generic pipeline
+ * attestation marker (#471). Pure + exported so the PIPELINE_COMMENT_KINDS
+ * drift guard exercises the real renderer and so design-gate posts self-exclude
+ * from `findUnacknowledgedComments` (challenge prose trips negation patterns).
+ */
+export function buildDesignGateComment(state: DesignGateState, note: string): string {
   const lines: string[] = [DESIGN_GATE_COMMENT_HEADING, ""];
   lines.push(`**Matched triggers**: ${state.trigger.matched.map((m) => m.trigger).join(", ") || "(none)"}`);
   if (state.reviewerIdentity) {
@@ -138,8 +143,10 @@ function buildDesignGateComment(state: DesignGateState, note: string): string {
     lines.push("");
   }
   if (state.outcome) lines.push(`**Outcome**: ${state.outcome}`, "");
+  // design-gate-state must precede pipeline-attest: attestation verification
+  // requires the marker to be the last non-empty line of the body.
   lines.push("---", "*Automated by Claude Code Pipeline Skill*", "", encodeDesignGateState(state));
-  return lines.join("\n");
+  return attestPipelineComment("design-interrogation", lines.join("\n"));
 }
 
 function decisionRecordJson(state: DesignGateState): string {

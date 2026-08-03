@@ -36,6 +36,7 @@ import {
   PIPELINE_COMMENT_KINDS,
   buildAttestedBlockedComment,
   buildTransitionComment,
+  classifyComment,
   isVerifiedOperatorSurfaceComment,
 } from "../scripts/gh.ts";
 import { buildUnblockedComment } from "../scripts/pipeline.ts";
@@ -68,6 +69,7 @@ import {
 import { formatNoopAdvanceEvidenceNote } from "../scripts/noop-advance.ts";
 import { buildAutoRecoveryComment, buildAutoRecoveryLimitComment } from "../scripts/stages/auto_recover.ts";
 import { buildPipelineCompleteComment } from "../scripts/stages/deploy_ready.ts";
+import { buildDesignGateComment } from "../scripts/stages/design_gate.ts";
 import { formatEvidenceCommentBody } from "../scripts/evidence-bundle.ts";
 import {
   buildAuditRepairBlockedComment,
@@ -76,7 +78,7 @@ import {
   buildAutoLoopExhaustedComment,
 } from "../scripts/pipeline-run.ts";
 import type { PartitionResult } from "../scripts/review-policy.ts";
-import type { EvidenceBundle, PipelineConfig, ReviewFinding } from "../scripts/types.ts";
+import type { DesignGateState, EvidenceBundle, PipelineConfig, ReviewFinding } from "../scripts/types.ts";
 
 const TEST_ACTOR = "pipeline-bot";
 
@@ -315,6 +317,49 @@ const KIND_RENDERERS: Record<string, () => string> = {
       issueNumber: 758,
       at: ts(0),
     }),
+  // Design-gate comments carry challenge prose that trips NEGATION_PATTERNS
+  // ("instead", "do not", …). Without attestation they false-block review-1.
+  "design-interrogation": () =>
+    buildDesignGateComment(
+      {
+        schema_version: 1,
+        trigger: {
+          triggered: true,
+          matched: [{ trigger: "concurrency", evidence: "path core/scripts/lock.ts matched" }],
+          reason: "triggered",
+        },
+        reviewerIdentity: { harness: "codex", independence: "independent" },
+        decisionRecordVersions: [],
+        bounding: {
+          fieldsTruncated: 0,
+          decisionsDropped: 0,
+          artifactBytesTruncated: false,
+          decisionsDroppedByByteCeiling: 0,
+          arrayEntriesDroppedByByteCeiling: 0,
+        },
+        rounds: [
+          {
+            round: 1,
+            challenges: [
+              {
+                decision_id: "d1",
+                title: "Domain is not proven canonical",
+                severity: "high",
+                confidence: 0.9,
+                falsifier: "Show every entry derives the same domain instead of assuming it.",
+                evidence_request: "Call-site matrix",
+                required_action: "revise",
+                challengeKey: "c0f1d116",
+                blocking: true,
+              },
+            ],
+            responses: [],
+          },
+        ],
+        outcome: null,
+      } as DesignGateState,
+      "Round 1 interrogation complete — do not proceed until challenges resolve.",
+    ),
   unblocked: () =>
     buildUnblockedComment({ stage: "fix-2", ts: ts(0), answer: "don't retry the call — batch it instead" }),
   "finding-override": () =>
@@ -397,6 +442,48 @@ test("PIPELINE_COMMENT_KINDS behavioral drift guard: an unattested body of a wou
   const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
   const unacked = findUnacknowledgedComments(comments, trusted);
   assert.equal(unacked.length, 1, "unattested pipeline-styled body with objection wording must still gate");
+});
+
+// ---------------------------------------------------------------------------
+// Design-interrogation self-exclusion (#634 recovery / design-gate false human-input)
+// ---------------------------------------------------------------------------
+
+test("design-interrogation: real renderer classifies as pipeline, verifies, and does not gate review-1", () => {
+  const body = KIND_RENDERERS["design-interrogation"]();
+  assert.equal(classifyComment(body), "pipeline");
+  assert.equal(isVerifiedPipelineOutput(body), true);
+  // Note prose intentionally includes negation-shaped wording that would gate
+  // an unattested body (NEGATION_PATTERNS includes /\bdo\s+not\b/i).
+  assert.match(body, /\bdo not\b/i);
+
+  const comments = [
+    makeComment(TEST_ACTOR, "## Revised Implementation Plan\n\nUnify the issue-run lock.", ts(0)),
+    makeComment(TEST_ACTOR, body, ts(1)),
+  ];
+  const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.deepEqual(
+    unacked,
+    [],
+    "attested design-gate comments must not be counted as unacknowledged human input",
+  );
+});
+
+test("design-interrogation: unattested Design Interrogation body with objection wording still gates", () => {
+  // Fail-closed: a forged or pre-attestation design-gate-shaped body that
+  // carries objection language must still block, even when the heading is now
+  // recognized as structurally pipeline.
+  const forged =
+    "## Design Interrogation\n\nDo not merge this — do X instead.\n\n<!-- design-gate-state: e30 -->";
+  assert.equal(classifyComment(forged), "pipeline");
+  assert.equal(isVerifiedPipelineOutput(forged), false);
+  const comments = [
+    makeComment(TEST_ACTOR, "## Implementation Plan\n\nDo X.", ts(0)),
+    makeComment(TEST_ACTOR, forged, ts(1)),
+  ];
+  const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(unacked.length, 1, "unattested design-gate-styled body with objection wording must still gate");
 });
 
 // ---------------------------------------------------------------------------

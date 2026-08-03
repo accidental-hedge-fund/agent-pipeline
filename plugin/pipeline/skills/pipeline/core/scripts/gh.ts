@@ -2343,6 +2343,10 @@ export const PIPELINE_COMMENT_HEADERS: readonly string[] = [
   "## Fix 2",
   "## Pipeline:",
   "## Pre-Planning Context",
+  // Design-gate stage posts (heading is DESIGN_GATE_COMMENT_HEADING). Without
+  // this entry, `classifyComment` treats design-interrogation progress as
+  // human input and `findUnacknowledgedComments` false-blocks review-1.
+  "## Design Interrogation",
 ];
 
 // ---------------------------------------------------------------------------
@@ -2426,6 +2430,16 @@ export const PIPELINE_COMMENT_KINDS: readonly {
   // listed here purely so the registry enumerates every posted comment type per spec.
   { kind: "review-verdict", heading: "## Review ", verify: "review-artifact" },
   { kind: "pre-merge-delta-review", heading: "## Pre-merge Delta Review", verify: "review-artifact" },
+  // Design-gate interrogation progress (#436). Heading does not start with
+  // `## Pipeline`, so it is listed here for classification + attestation; the
+  // source guard only scans `## Pipeline…` literals. Challenge prose often
+  // trips NEGATION_PATTERNS ("instead", "do not", …), so attestation is
+  // required for self-exclusion from findUnacknowledgedComments.
+  {
+    kind: "design-interrogation",
+    heading: "## Design Interrogation",
+    verify: "pipeline-attest",
+  },
   // Deliberately unattested/unverified comment types, with justification. Moved here
   // (from a prior test-local allowlist) so there is exactly one exported registry.
   {
