@@ -23,6 +23,13 @@ export type HostEntry = {
   cliBin: string | null;
 };
 
+/** Additive OpenCode host entry (#861). `available` means a managed skill
+ *  install is present; `cliBin` is optional CLI reachability. Does not affect
+ *  `hostCoverage` (Claude/Codex-only enum). */
+export type OpenCodeHostEntry = HostEntry & {
+  skillPath: string | null;
+};
+
 export type HostCoverage = "missing" | "claude-only" | "codex-only" | "both";
 
 export type DiscoveryResult = {
@@ -32,6 +39,8 @@ export type DiscoveryResult = {
   hosts: {
     claude: HostEntry;
     codex: HostEntry;
+    /** Additive OpenCode reporting — never changes hostCoverage meanings. */
+    opencode: OpenCodeHostEntry;
   };
 };
 
@@ -40,6 +49,8 @@ export type DiscoverHostsDeps = {
   which: (cmd: string) => Promise<string | null>;
   probeCandidates: () => Promise<string | null>;
   readVersion: (corePath: string) => Promise<string | null>;
+  /** Optional seam for OpenCode skill path probe (#861). */
+  probeOpenCodeSkill?: () => Promise<string | null>;
 };
 
 // ---------------------------------------------------------------------------
@@ -105,6 +116,11 @@ async function probeCandidatesDefault(): Promise<string | null> {
   }
   candidates.push(path.join(home, ".claude", "skills", "pipeline", "core"));
   candidates.push(path.join(home, ".codex", "skills", "pipeline", "core"));
+  // OpenCode skill tree (#861) — additive candidate only; does not affect hostCoverage.
+  const opencodeBase = process.env.OPENCODE_CONFIG_DIR?.trim()
+    ? process.env.OPENCODE_CONFIG_DIR.trim()
+    : path.join(home, ".config", "opencode");
+  candidates.push(path.join(opencodeBase, "skills", "pipeline", "core"));
   candidates.push(path.join(".", "node_modules", "agent-pipeline", "core")); // local dev
   candidates.push(path.join(".", "node_modules", "pipeline", "core"));       // local dev legacy
 
@@ -112,6 +128,24 @@ async function probeCandidatesDefault(): Promise<string | null> {
     if (fs.existsSync(path.join(candidate, "scripts", "pipeline.ts"))) {
       return candidate;
     }
+  }
+  return null;
+}
+
+/**
+ * Probe for an OpenCode-managed skill install. Returns the skill directory when
+ * present (managed marker or launcher), else null. Additive for discovery only.
+ */
+async function probeOpenCodeSkillDefault(): Promise<string | null> {
+  const home = os.homedir();
+  const base = process.env.OPENCODE_CONFIG_DIR?.trim()
+    ? path.resolve(process.env.OPENCODE_CONFIG_DIR.trim())
+    : path.join(home, ".config", "opencode");
+  const skillDir = path.join(base, "skills", "pipeline");
+  const marker = path.join(skillDir, ".pipeline-installer-managed");
+  const launcher = path.join(skillDir, "scripts", "pipeline.mjs");
+  if (fs.existsSync(marker) || fs.existsSync(launcher)) {
+    return skillDir;
   }
   return null;
 }
@@ -132,6 +166,7 @@ const defaultDeps: DiscoverHostsDeps = {
   which: whichDefault,
   probeCandidates: probeCandidatesDefault,
   readVersion: readVersionDefault,
+  probeOpenCodeSkill: probeOpenCodeSkillDefault,
 };
 
 // ---------------------------------------------------------------------------
@@ -144,14 +179,19 @@ const defaultDeps: DiscoverHostsDeps = {
  * - Exits with code 0 for any resolved state (including `missing`).
  * - Throws on a probe error (e.g., `npm root -g` unavailable) so the CLI
  *   layer can exit non-zero with a diagnostic.
+ * - `hostCoverage` remains Claude/Codex-only; OpenCode is additive under
+ *   `hosts.opencode` and never flips coverage enum meanings (#861).
  */
 export async function discoverHosts(
   deps: DiscoverHostsDeps = defaultDeps,
 ): Promise<DiscoveryResult> {
-  const [corePath, claudeBin, codexBin] = await Promise.all([
+  const probeOpenCode = deps.probeOpenCodeSkill ?? (async () => null);
+  const [corePath, claudeBin, codexBin, opencodeBin, opencodeSkill] = await Promise.all([
     deps.probeCandidates(),
     deps.which("claude"),
     deps.which("codex"),
+    deps.which("opencode"),
+    probeOpenCode(),
   ]);
 
   const version = corePath ? await deps.readVersion(corePath) : null;
@@ -162,6 +202,7 @@ export async function discoverHosts(
   let hostCoverage: HostCoverage;
   if (!corePath || (!claudeAvailable && !codexAvailable)) {
     // No resolved pipeline core, or no host CLIs reachable — not usable.
+    // OpenCode presence alone does not change this Claude/Codex contract (#861).
     hostCoverage = "missing";
   } else if (claudeAvailable && !codexAvailable) {
     hostCoverage = "claude-only";
@@ -178,6 +219,11 @@ export async function discoverHosts(
     hosts: {
       claude: { available: claudeAvailable, cliBin: claudeBin },
       codex: { available: codexAvailable, cliBin: codexBin },
+      opencode: {
+        available: opencodeSkill !== null,
+        cliBin: opencodeBin,
+        skillPath: opencodeSkill,
+      },
     },
   };
 }
@@ -189,11 +235,20 @@ export async function discoverHosts(
  *  shape so the two paths cannot drift (#153). */
 export function formatDiscovery(result: DiscoveryResult, asJson: boolean): string {
   if (asJson) return JSON.stringify(result, null, 2);
-  return [
+  const lines = [
     `core path: ${result.corePath ?? "(not found)"}`,
     `version:   ${result.version ?? "(unknown)"}`,
     `coverage:  ${result.hostCoverage}`,
     `  claude:  ${result.hosts.claude.available ? `yes (${result.hosts.claude.cliBin})` : "no"}`,
     `  codex:   ${result.hosts.codex.available ? `yes (${result.hosts.codex.cliBin})` : "no"}`,
-  ].join("\n");
+  ];
+  // Additive OpenCode line (#861) — never part of hostCoverage.
+  if (result.hosts.opencode) {
+    const oc = result.hosts.opencode;
+    const detail = oc.available
+      ? `yes${oc.skillPath ? ` (${oc.skillPath})` : ""}${oc.cliBin ? ` cli=${oc.cliBin}` : ""}`
+      : "no";
+    lines.push(`  opencode: ${detail}`);
+  }
+  return lines.join("\n");
 }

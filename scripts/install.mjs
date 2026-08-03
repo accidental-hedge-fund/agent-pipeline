@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // agent-pipeline cross-tool installer.
 //
-//   node scripts/install.mjs install   [--host claude|codex|grok|all] [--dry-run]
+//   node scripts/install.mjs install   [--host claude|codex|grok|opencode|all] [--dry-run]
 //   node scripts/install.mjs update    [--host …]            (alias for install; idempotent)
 //   node scripts/install.mjs uninstall [--host …]
 //
@@ -10,13 +10,19 @@
 // core + the right host overlay into each host's skills directory, writes a
 // portable launcher shim, and pre-installs the core's npm dependencies.
 //
-// Honors CLAUDE_CONFIG_DIR and CODEX_HOME for non-default install locations.
+// Honors CLAUDE_CONFIG_DIR, CODEX_HOME, and OPENCODE_CONFIG_DIR for non-default
+// install locations. OPENCODE_CONFIG (single config file) is never used as a base.
 //
 // Grok Build: --host grok materializes ~/.grok/skills/pipeline as a symlink to
 // the Claude-managed skill install (no separate hosts/grok SKILL.md overlay).
 // Requires the Claude skill to already be installed. After a Claude reinstall,
 // re-run --host grok (or recreate the symlink) so the Grok path is not left
 // dangling. Manual layout is documented in the README ("Grok Build skill path").
+//
+// OpenCode: --host opencode installs a full tree under
+// ~/.config/opencode/skills/pipeline (or $OPENCODE_CONFIG_DIR/…) plus a native
+// /pipeline command at <base>/commands/pipeline.md that routes args to the
+// installed launcher via an argv-safe bridge (see hosts/opencode/).
 
 import {
   closeSync,
@@ -53,7 +59,7 @@ const HOME = homedir();
 const MANAGED_MARKER = ".pipeline-installer-managed";
 
 /** Host names accepted by --host (plus the pseudo-host `all`). */
-const VALID_HOSTS = ["claude", "codex", "grok", "all"];
+const VALID_HOSTS = ["claude", "codex", "grok", "opencode", "all"];
 
 // ---------------------------------------------------------------------------
 // Host definitions
@@ -72,6 +78,24 @@ function claudeSkillDir() {
 
 function grokBase() {
   return join(HOME, ".grok");
+}
+
+/**
+ * OpenCode config base (#861). Honors OPENCODE_CONFIG_DIR when set (non-empty);
+ * otherwise ~/.config/opencode. OPENCODE_CONFIG (single file path) is intentionally
+ * ignored — it is not a skills/commands tree root.
+ */
+function opencodeBase() {
+  const override = process.env.OPENCODE_CONFIG_DIR;
+  if (typeof override === "string" && override.trim().length > 0) {
+    return resolve(override.trim());
+  }
+  return join(HOME, ".config", "opencode");
+}
+
+/** Absolute path of the OpenCode-managed pipeline skill directory. */
+function opencodeSkillDir() {
+  return join(opencodeBase(), "skills", "pipeline");
 }
 
 // Codex's user-skill path has drifted between ~/.codex/skills (installer + current
@@ -125,6 +149,22 @@ const HOSTS = {
       "Skill path is a symlink to the Claude-managed install (no separate Grok SKILL.md). " +
       "After a Claude skill update, re-run: node scripts/install.mjs install --host grok",
   },
+  // Full tree host (#861): core + hosts/opencode overlay + launcher + native
+  // commands/pipeline.md. No Claude prerequisite (unlike Grok).
+  opencode: {
+    label: "OpenCode",
+    profile: "opencode",
+    overlayDir: join(REPO_ROOT, "hosts", "opencode"),
+    overlayFiles: ["SKILL.md"],
+    overlayDirs: [],
+    installMode: "tree",
+    baseExists: () => existsSync(opencodeBase()),
+    skillsDir: () => join(opencodeBase(), "skills"),
+    postInstall:
+      "Invoke with /pipeline (native command routes to the launcher). " +
+      "Skill path: " +
+      "<OPENCODE_CONFIG_DIR or ~/.config/opencode>/skills/pipeline. Restart OpenCode if commands do not appear live.",
+  },
 };
 
 // Whitelisted core payload (node_modules is intentionally excluded; the shim
@@ -153,13 +193,15 @@ function parseArgs(argv) {
 
 function selectedHosts(hostArg) {
   if (hostArg === "all") {
-    // Prefer tree hosts (claude, codex) before grok so a combined install can
-    // materialize Claude first, then symlink Grok to it in the same run.
-    const present = Object.keys(HOSTS).filter((h) => HOSTS[h].baseExists());
+    // Prefer tree hosts (claude, codex, opencode) before grok so a combined
+    // install can materialize Claude first, then symlink Grok to it in the same
+    // run. OpenCode has no Claude prerequisite.
+    const order = ["claude", "codex", "opencode", "grok"];
+    const present = order.filter((h) => HOSTS[h] && HOSTS[h].baseExists());
     if (present.length === 0) {
       fail(
-        "No host detected (neither ~/.claude, ~/.codex, nor ~/.grok found). " +
-          "Pass --host claude, codex, or grok to force one. " +
+        "No host detected (neither ~/.claude, ~/.codex, ~/.config/opencode, nor ~/.grok found). " +
+          "Pass --host claude, codex, grok, or opencode to force one. " +
           "Grok requires a Claude skill install and materializes ~/.grok/skills/pipeline as a symlink to it.",
       );
     }
@@ -167,8 +209,9 @@ function selectedHosts(hostArg) {
   }
   if (!HOSTS[hostArg]) {
     fail(
-      `Unknown --host '${hostArg}'. Use claude, codex, grok, or all. ` +
-        `Grok materializes ~/.grok/skills/pipeline → Claude skill (see README "Grok Build skill path").`,
+      `Unknown --host '${hostArg}'. Use claude, codex, grok, opencode, or all. ` +
+        `Grok materializes ~/.grok/skills/pipeline → Claude skill (see README "Grok Build skill path"). ` +
+        `OpenCode installs under ~/.config/opencode (or OPENCODE_CONFIG_DIR).`,
     );
   }
   return [hostArg];
@@ -593,9 +636,85 @@ function stageInto(stagingDir, host) {
   const materialFilterPath = join(scriptsDst, "material-filter.mjs");
   cpSync(join(REPO_ROOT, "hosts", "_shared", "material-filter.mjs"), materialFilterPath);
   chmodSync(materialFilterPath, 0o755);
+  // OpenCode argv-safe bridge (#861) — co-located with the launcher for the
+  // native commands/pipeline.md shell inject.
+  if (host === "opencode") {
+    const bridgeSrc = join(REPO_ROOT, "hosts", "opencode", "opencode-pipeline-bridge.mjs");
+    if (existsSync(bridgeSrc)) {
+      const bridgeDst = join(scriptsDst, "opencode-pipeline-bridge.mjs");
+      cpSync(bridgeSrc, bridgeDst);
+      chmodSync(bridgeDst, 0o755);
+    }
+  }
   // Sentinel: written into staging so it lands atomically with the skill tree.
   // Future runs use this to distinguish an installer-managed dir from a personal one.
   writeFileSync(join(stagingDir, MANAGED_MARKER), "");
+}
+
+/**
+ * Render the OpenCode native `/pipeline` command markdown (#861).
+ * Embeds absolute bridge + launcher paths under the same opencodeBase as the skill tree.
+ * Does NOT embed the full SKILL.md instructional body — version path stays short.
+ *
+ * @param {string} skillDir Absolute path to <opencodeBase>/skills/pipeline
+ * @returns {string}
+ */
+function renderOpenCodePipelineCommand(skillDir) {
+  const bridgePath = join(skillDir, "scripts", "opencode-pipeline-bridge.mjs");
+  const launcherPath = join(skillDir, "scripts", "pipeline.mjs");
+  // Unique heredoc delimiter so user args containing a bare EOF line cannot close early.
+  const eof = "PIPELINE_OPENCODE_ARGS_EOF";
+  return [
+    "---",
+    "description: Advance a GitHub issue/PR through agent-pipeline (native launcher)",
+    "---",
+    "",
+    "Run the installed agent-pipeline launcher with the user's arguments.",
+    "Treat the shell-injection block below as the authoritative command result.",
+    "For `--version` or `-V`, report only that version string — do not expand into",
+    "generic pipeline skill usage or instructional SKILL.md text.",
+    "",
+    "Launcher: `" + launcherPath + "`",
+    "",
+    // Heredoc keeps $ARGUMENTS out of unquoted shell word-splitting / expansion.
+    // OpenCode substitutes $ARGUMENTS into the template before bash runs.
+    "!`node " + bridgePath + " --from-stdin <<" + "'" + eof + "'",
+    "$ARGUMENTS",
+    eof + "`",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Install OpenCode native `/pipeline` command at <opencodeBase>/commands/pipeline.md.
+ * Exported for unit tests.
+ */
+function installOpenCodeCommands(opencodeBaseDir, dryRun) {
+  const commandsDir = join(opencodeBaseDir, "commands");
+  const cmdPath = join(commandsDir, "pipeline.md");
+  const skillDir = join(opencodeBaseDir, "skills", "pipeline");
+  if (dryRun) {
+    log(`  (dry-run) would write OpenCode /pipeline command to ${cmdPath}`);
+    return;
+  }
+  mkdirSync(commandsDir, { recursive: true });
+  writeFileSync(cmdPath, renderOpenCodePipelineCommand(skillDir));
+  log(`  ✓ wrote OpenCode /pipeline command to ${cmdPath}`);
+}
+
+/**
+ * Remove installer-owned OpenCode `pipeline.md` only; leave sibling commands.
+ * Exported for unit tests.
+ */
+function uninstallOpenCodeCommands(opencodeBaseDir, dryRun) {
+  const cmdPath = join(opencodeBaseDir, "commands", "pipeline.md");
+  if (!existsSync(cmdPath)) return;
+  if (dryRun) {
+    log(`  (dry-run) would remove OpenCode command ${cmdPath}`);
+    return;
+  }
+  unlinkSync(cmdPath);
+  log(`  ✓ removed OpenCode command pipeline.md`);
 }
 
 // Install the namespaced pipeline:<command> command files for the Claude host (#273).
@@ -772,6 +891,7 @@ function installHost(host, dryRun) {
     log(`  (dry-run) would stage core + ${host} overlay, swap atomically, then npm ci in core/`);
     if (host === "claude") installClaudeCommands(claudeBase(), true);
     if (host === "codex") installCodexCommands(join(dest, "agents"), true);
+    if (host === "opencode") installOpenCodeCommands(opencodeBase(), true);
     return;
   }
   mkdirSync(skillsDir, { recursive: true });
@@ -801,6 +921,7 @@ function installHost(host, dryRun) {
   // Install the namespaced pipeline:<command> command/agent files for each host.
   if (host === "claude") installClaudeCommands(claudeBase(), false);
   if (host === "codex") installCodexCommands(join(dest, "agents"), false);
+  if (host === "opencode") installOpenCodeCommands(opencodeBase(), false);
   log(`  ✓ installed. ${cfg.postInstall}`);
 }
 
@@ -824,6 +945,23 @@ function uninstallHost(host, dryRun) {
       }
     }
     uninstallClaudeCommands(claudeBase(), dryRun);
+    return;
+  }
+
+  // OpenCode: skill tree + installer-owned commands/pipeline.md only (#861).
+  if (host === "opencode") {
+    if (!skillPresent) {
+      log(`→ ${cfg.label}: nothing installed at ${dest}`);
+    } else {
+      log(`→ ${cfg.label}: removing ${dest}`);
+      if (dryRun) {
+        log("  (dry-run) would rm -rf the skill directory");
+      } else {
+        rmSync(dest, { recursive: true, force: true });
+        log("  ✓ removed");
+      }
+    }
+    uninstallOpenCodeCommands(opencodeBase(), dryRun);
     return;
   }
 
@@ -1345,10 +1483,15 @@ export {
   parseArgs,
   selectedHosts,
   claudeSkillDir,
+  opencodeBase,
+  opencodeSkillDir,
   installGrokHost,
   installHost,
   installClaudeCommands,
   uninstallClaudeCommands,
+  installOpenCodeCommands,
+  uninstallOpenCodeCommands,
+  renderOpenCodePipelineCommand,
   uninstallHost,
   findLiveRunLocks,
   formatLiveRunMessage,

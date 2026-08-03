@@ -19,7 +19,7 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 
 import {
@@ -49,7 +49,13 @@ import {
   verifyUpdateLockOwnership,
   installClaudeCommands,
   uninstallClaudeCommands,
+  installOpenCodeCommands,
+  uninstallOpenCodeCommands,
+  renderOpenCodePipelineCommand,
   uninstallHost,
+  opencodeBase,
+  opencodeSkillDir,
+  installHost,
 } from "./install.mjs";
 
 // ---------------------------------------------------------------------------
@@ -1585,26 +1591,31 @@ test("releaseUpdateLock: refuses to release a lock owned by another process (#45
 // Grok skill path (#731) — --host grok symlink materialization + help text
 // ---------------------------------------------------------------------------
 
-test("VALID_HOSTS and HOSTS include grok alongside claude and codex (#731)", () => {
-  assert.deepEqual(VALID_HOSTS, ["claude", "codex", "grok", "all"]);
+test("VALID_HOSTS and HOSTS include grok and opencode alongside claude and codex (#731/#861)", () => {
+  assert.deepEqual(VALID_HOSTS, ["claude", "codex", "grok", "opencode", "all"]);
   assert.ok(HOSTS.grok, "HOSTS.grok must exist");
+  assert.ok(HOSTS.opencode, "HOSTS.opencode must exist");
   assert.equal(HOSTS.grok.installMode, "symlink-claude");
   assert.equal(HOSTS.claude.installMode, "tree");
   assert.equal(HOSTS.codex.installMode, "tree");
+  assert.equal(HOSTS.opencode.installMode, "tree");
+  assert.equal(HOSTS.opencode.profile, "opencode");
   // No hosts/grok overlay is required for this path target.
   assert.equal(HOSTS.grok.overlayFiles.length, 0);
+  assert.ok(HOSTS.opencode.overlayFiles.includes("SKILL.md"));
 });
 
-test("usage header documents --host grok among implemented hosts (#731)", () => {
+test("usage header documents --host grok and opencode among implemented hosts (#731/#861)", () => {
   const src = readFileSync(fileURLToPath(new URL("./install.mjs", import.meta.url)), "utf8");
-  assert.match(src, /--host claude\|codex\|grok\|all/);
+  assert.match(src, /--host claude\|codex\|grok\|opencode\|all/);
   assert.match(src, /Grok Build/);
   assert.match(src, /~\/\.grok\/skills\/pipeline/);
+  assert.match(src, /OPENCODE_CONFIG_DIR|~\/\.config\/opencode/);
   // Header must not claim a hosts/grok SKILL.md fork.
   assert.match(src, /no separate hosts\/grok SKILL\.md overlay/i);
 });
 
-test("unknown --host error lists grok and points at Grok skill path (#731)", () => {
+test("unknown --host error lists grok/opencode and points at Grok skill path (#731/#861)", () => {
   const home = makeTmp();
   try {
     const result = runInstaller(["install", "--host", "not-a-host"], {
@@ -1614,8 +1625,9 @@ test("unknown --host error lists grok and points at Grok skill path (#731)", () 
     assert.notEqual(result.status, 0);
     const out = `${result.stdout}${result.stderr}`;
     assert.match(out, /Unknown --host 'not-a-host'/);
-    assert.match(out, /claude, codex, grok, or all/);
+    assert.match(out, /claude, codex, grok, opencode, or all/);
     assert.match(out, /~\/\.grok\/skills\/pipeline|Grok Build skill path/);
+    assert.match(out, /opencode/i);
   } finally {
     cleanup(home);
   }
@@ -2143,8 +2155,420 @@ test("install --host codex: managed marker → normal overwrite, no personal-sha
   }
 });
 
-test("HOSTS tree-mode: claude and codex share installMode tree for shadow gate (#635)", () => {
+test("HOSTS tree-mode: claude, codex, and opencode share installMode tree for shadow gate (#635/#861)", () => {
   assert.equal(HOSTS.claude.installMode, "tree");
   assert.equal(HOSTS.codex.installMode, "tree");
+  assert.equal(HOSTS.opencode.installMode, "tree");
   assert.equal(HOSTS.grok.installMode, "symlink-claude");
+});
+
+// ---------------------------------------------------------------------------
+// OpenCode host (#861) — tree install, native /pipeline command, isolation
+// ---------------------------------------------------------------------------
+
+test("installOpenCodeCommands: writes pipeline.md with absolute launcher path (#861)", () => {
+  const tmp = makeTmp();
+  try {
+    installOpenCodeCommands(tmp, false);
+    const cmdPath = join(tmp, "commands", "pipeline.md");
+    assert.ok(existsSync(cmdPath), "pipeline.md must exist");
+    const content = readFileSync(cmdPath, "utf8");
+    const skillDir = join(tmp, "skills", "pipeline");
+    const launcher = join(skillDir, "scripts", "pipeline.mjs");
+    const bridge = join(skillDir, "scripts", "opencode-pipeline-bridge.mjs");
+    assert.match(content, new RegExp(launcher.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(content, new RegExp(bridge.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(content, /--from-stdin/);
+    assert.match(content, /\$ARGUMENTS/);
+    assert.match(content, /PIPELINE_OPENCODE_ARGS_EOF/);
+    // Must not dump full SKILL.md instructional body into the command template.
+    assert.ok(!content.includes("State machine"), "command must not embed full skill instructions");
+    assert.ok(!content.includes("## Modes"), "command must not embed full skill instructions");
+    assert.match(content, /description: Advance a GitHub issue/);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("installOpenCodeCommands: dry-run writes nothing under commands/ (#861)", () => {
+  const tmp = makeTmp();
+  try {
+    installOpenCodeCommands(tmp, true);
+    assert.equal(existsSync(join(tmp, "commands")), false);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("uninstallOpenCodeCommands: removes pipeline.md only; preserves siblings; dry-run is no-op (#861)", () => {
+  const tmp = makeTmp();
+  try {
+    const commandsDir = join(tmp, "commands");
+    mkdirSync(commandsDir, { recursive: true });
+    writeFileSync(join(commandsDir, "pipeline.md"), "owned\n");
+    writeFileSync(join(commandsDir, "other.md"), "sibling\n");
+    uninstallOpenCodeCommands(tmp, true);
+    assert.ok(existsSync(join(commandsDir, "pipeline.md")), "dry-run must not delete");
+    assert.ok(existsSync(join(commandsDir, "other.md")));
+    uninstallOpenCodeCommands(tmp, false);
+    assert.equal(existsSync(join(commandsDir, "pipeline.md")), false);
+    assert.ok(existsSync(join(commandsDir, "other.md")), "siblings must remain");
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("renderOpenCodePipelineCommand: config-dir skill path embedded (#861)", () => {
+  const skillDir = "/custom/opencode/skills/pipeline";
+  const content = renderOpenCodePipelineCommand(skillDir);
+  assert.match(content, /\/custom\/opencode\/skills\/pipeline\/scripts\/pipeline\.mjs/);
+  assert.match(content, /\/custom\/opencode\/skills\/pipeline\/scripts\/opencode-pipeline-bridge\.mjs/);
+  assert.ok(!content.includes("/.config/opencode/skills/pipeline"), "must not hardcode default when path is custom");
+});
+
+test("install --host opencode: managed skill tree + command; isolation from Claude/Codex (#861)", () => {
+  const home = makeTmp();
+  const opencodeTmp = makeTmp();
+  const claudeTmp = makeTmp();
+  const codexTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    // Pre-seed Claude/Codex sentinels so we can prove they are untouched.
+    const claudeSkill = join(claudeTmp, "skills", "pipeline");
+    mkdirSync(claudeSkill, { recursive: true });
+    writeFileSync(join(claudeSkill, "sentinel-claude.txt"), "keep-me");
+    const codexSkill = join(codexTmp, "skills", "pipeline");
+    mkdirSync(codexSkill, { recursive: true });
+    writeFileSync(join(codexSkill, "sentinel-codex.txt"), "keep-me");
+
+    const result = runInstaller(["install", "--host", "opencode"], {
+      HOME: home,
+      OPENCODE_CONFIG_DIR: opencodeTmp,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      CODEX_HOME: codexTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(result.status, 0, `install failed: ${result.stderr}\n${result.stdout}`);
+
+    const skillDir = join(opencodeTmp, "skills", "pipeline");
+    assert.ok(existsSync(join(skillDir, MANAGED_MARKER)), "managed marker required");
+    assert.ok(existsSync(join(skillDir, "SKILL.md")), "OpenCode SKILL.md required");
+    assert.ok(existsSync(join(skillDir, "scripts", "pipeline.mjs")), "launcher required");
+    assert.ok(
+      existsSync(join(skillDir, "scripts", "opencode-pipeline-bridge.mjs")),
+      "argv bridge required",
+    );
+    assert.ok(existsSync(join(skillDir, "core", "package.json")), "core required");
+    assert.ok(existsSync(join(skillDir, "core", "profiles", "opencode.json")), "opencode profile required");
+
+    const cmdPath = join(opencodeTmp, "commands", "pipeline.md");
+    assert.ok(existsSync(cmdPath), "native /pipeline command required");
+    const cmd = readFileSync(cmdPath, "utf8");
+    assert.ok(cmd.includes(join(skillDir, "scripts", "pipeline.mjs")));
+    assert.ok(cmd.includes(join(skillDir, "scripts", "opencode-pipeline-bridge.mjs")));
+
+    // Isolation: Claude/Codex sentinels untouched; no new Claude commands under claudeTmp.
+    assert.equal(readFileSync(join(claudeSkill, "sentinel-claude.txt"), "utf8"), "keep-me");
+    assert.equal(readFileSync(join(codexSkill, "sentinel-codex.txt"), "utf8"), "keep-me");
+    assert.equal(existsSync(join(claudeTmp, "commands")), false);
+  } finally {
+    cleanup(home);
+    cleanup(opencodeTmp);
+    cleanup(claudeTmp);
+    cleanup(codexTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host opencode --dry-run: writes nothing (#861)", () => {
+  const opencodeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const result = runInstaller(["install", "--host", "opencode", "--dry-run"], {
+      OPENCODE_CONFIG_DIR: opencodeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(result.status, 0, `dry-run failed: ${result.stderr}\n${result.stdout}`);
+    assert.equal(existsSync(join(opencodeTmp, "skills", "pipeline")), false);
+    assert.equal(existsSync(join(opencodeTmp, "commands", "pipeline.md")), false);
+    const out = `${result.stdout}${result.stderr}`;
+    assert.match(out, /dry-run/i);
+  } finally {
+    cleanup(opencodeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("uninstall --host opencode: removes skill + pipeline.md; leaves siblings and Claude (#861)", () => {
+  const opencodeTmp = makeTmp();
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    // Install OpenCode first.
+    const install = runInstaller(["install", "--host", "opencode"], {
+      OPENCODE_CONFIG_DIR: opencodeTmp,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(install.status, 0, `install failed: ${install.stderr}\n${install.stdout}`);
+
+    // Sibling OpenCode command + Claude sentinel.
+    writeFileSync(join(opencodeTmp, "commands", "other.md"), "keep-sibling\n");
+    const claudeSkill = join(claudeTmp, "skills", "pipeline");
+    mkdirSync(claudeSkill, { recursive: true });
+    writeFileSync(join(claudeSkill, "sentinel.txt"), "claude-alive");
+
+    const uninstall = runInstaller(["uninstall", "--host", "opencode"], {
+      OPENCODE_CONFIG_DIR: opencodeTmp,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(uninstall.status, 0, `uninstall failed: ${uninstall.stderr}\n${uninstall.stdout}`);
+    assert.equal(existsSync(join(opencodeTmp, "skills", "pipeline")), false);
+    assert.equal(existsSync(join(opencodeTmp, "commands", "pipeline.md")), false);
+    assert.ok(existsSync(join(opencodeTmp, "commands", "other.md")), "sibling command must remain");
+    assert.equal(readFileSync(join(claudeSkill, "sentinel.txt"), "utf8"), "claude-alive");
+  } finally {
+    cleanup(opencodeTmp);
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("uninstall --host opencode --dry-run: does not delete artifacts (#861)", () => {
+  const opencodeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const install = runInstaller(["install", "--host", "opencode"], {
+      OPENCODE_CONFIG_DIR: opencodeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(install.status, 0);
+
+    const dry = runInstaller(["uninstall", "--host", "opencode", "--dry-run"], {
+      OPENCODE_CONFIG_DIR: opencodeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(dry.status, 0);
+    assert.ok(existsSync(join(opencodeTmp, "skills", "pipeline")));
+    assert.ok(existsSync(join(opencodeTmp, "commands", "pipeline.md")));
+    assert.match(`${dry.stdout}${dry.stderr}`, /dry-run/i);
+  } finally {
+    cleanup(opencodeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("update --host opencode: refreshes managed tree without personal shadow (#861)", () => {
+  const opencodeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const first = runInstaller(["install", "--host", "opencode"], {
+      OPENCODE_CONFIG_DIR: opencodeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(first.status, 0);
+    const skillDir = join(opencodeTmp, "skills", "pipeline");
+    assert.ok(existsSync(join(skillDir, MANAGED_MARKER)));
+
+    const second = runInstaller(["update", "--host", "opencode"], {
+      OPENCODE_CONFIG_DIR: opencodeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(second.status, 0, `update failed: ${second.stderr}\n${second.stdout}`);
+    const out = `${second.stdout}${second.stderr}`;
+    assert.ok(!/Personal pipeline skill detected|auto-relocat|Relocate it/i.test(out));
+    assert.ok(existsSync(join(skillDir, MANAGED_MARKER)));
+    assert.ok(existsSync(join(opencodeTmp, "commands", "pipeline.md")));
+  } finally {
+    cleanup(opencodeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("OPENCODE_CONFIG_DIR override: detectPersonalSkill and install paths (#861)", () => {
+  const tmp = makeTmp();
+  process.env.OPENCODE_CONFIG_DIR = tmp;
+  try {
+    const dest = join(tmp, "skills", "pipeline");
+    mkdirSync(dest, { recursive: true });
+    writeFileSync(join(dest, "SKILL.md"), "personal");
+    const result = detectPersonalSkill("opencode");
+    assert.equal(result.shadowing, true);
+    assert.ok(result.dest.startsWith(tmp));
+    assert.equal(opencodeBase(), resolve(tmp));
+    assert.equal(opencodeSkillDir(), resolve(join(tmp, "skills", "pipeline")));
+  } finally {
+    delete process.env.OPENCODE_CONFIG_DIR;
+    cleanup(tmp);
+  }
+});
+
+test("personal OpenCode skill non-TTY: auto-relocates then install proceeds (#861)", async () => {
+  const base = makeTmp();
+  const dest = join(base, "skills", "pipeline");
+  mkdirSync(dest, { recursive: true });
+  writeFileSync(join(dest, "SKILL.md"), "personal-opencode");
+  // No managed marker → personal.
+  const action = await offerRelocationWith(dest, base, false, false /* non-TTY */);
+  assert.equal(action, "proceed");
+  assert.equal(existsSync(dest), false, "personal tree must be relocated");
+  const backups = readdirSync(base).filter((e) => e.startsWith("pipeline.") && e.includes(".bak"));
+  assert.equal(backups.length, 1);
+  assert.ok(existsSync(join(base, backups[0], "SKILL.md")));
+  cleanup(base);
+});
+
+test("OpenCode version routing: bridge --version matches launcher and package.json (#861)", () => {
+  const opencodeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const install = runInstaller(["install", "--host", "opencode"], {
+      OPENCODE_CONFIG_DIR: opencodeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(install.status, 0, `install failed: ${install.stderr}\n${install.stdout}`);
+
+    const skillDir = join(opencodeTmp, "skills", "pipeline");
+    const launcher = join(skillDir, "scripts", "pipeline.mjs");
+    const bridge = join(skillDir, "scripts", "opencode-pipeline-bridge.mjs");
+    const pkg = JSON.parse(readFileSync(join(skillDir, "core", "package.json"), "utf8"));
+    const expected = String(pkg.version).trim();
+
+    const launcherV = spawnSync(process.execPath, [launcher, "--version"], {
+      encoding: "utf8",
+      shell: false,
+    });
+    assert.equal(launcherV.status, 0, launcherV.stderr);
+    assert.equal(launcherV.stdout.trim(), expected);
+
+    const launcherShort = spawnSync(process.execPath, [launcher, "-V"], {
+      encoding: "utf8",
+      shell: false,
+    });
+    assert.equal(launcherShort.status, 0, launcherShort.stderr);
+    assert.equal(launcherShort.stdout.trim(), expected);
+
+    // Bridge discrete-argv path (unit-test / direct invocation contract).
+    const bridgeV = spawnSync(process.execPath, [bridge, "--", "--version"], {
+      encoding: "utf8",
+      shell: false,
+    });
+    assert.equal(bridgeV.status, 0, bridgeV.stderr);
+    assert.equal(bridgeV.stdout.trim(), expected);
+
+    const bridgeShort = spawnSync(process.execPath, [bridge, "-V"], {
+      encoding: "utf8",
+      shell: false,
+    });
+    assert.equal(bridgeShort.status, 0, bridgeShort.stderr);
+    assert.equal(bridgeShort.stdout.trim(), expected);
+
+    // Bridge stdin path (OpenCode command heredoc contract).
+    const bridgeStdin = spawnSync(process.execPath, [bridge, "--from-stdin"], {
+      encoding: "utf8",
+      shell: false,
+      input: "--version\n",
+    });
+    assert.equal(bridgeStdin.status, 0, bridgeStdin.stderr);
+    assert.equal(bridgeStdin.stdout.trim(), expected);
+
+    // Command definition must not embed full skill instructional body.
+    const cmd = readFileSync(join(opencodeTmp, "commands", "pipeline.md"), "utf8");
+    assert.ok(!cmd.includes("## State machine"));
+    assert.ok(cmd.includes(bridge));
+  } finally {
+    cleanup(opencodeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("OpenCode bridge argv safety: spaces and metacharacters not shell-expanded (#861)", () => {
+  // Import the pure tokenizer used by the bridge (no subprocess of user args).
+  // Dynamic import of the host source (repo path) — same code staged into installs.
+  return import(pathToFileURL(join(
+    fileURLToPath(new URL("..", import.meta.url)),
+    "hosts",
+    "opencode",
+    "opencode-pipeline-bridge.mjs",
+  )).href).then(async (mod) => {
+    const { parseArgvString } = mod;
+    assert.deepEqual(parseArgvString("status 42"), ["status", "42"]);
+    assert.deepEqual(parseArgvString('override 5 "key: reason with spaces"'), [
+      "override",
+      "5",
+      "key: reason with spaces",
+    ]);
+    assert.deepEqual(parseArgvString("foo * $HOME `whoami`"), ["foo", "*", "$HOME", "`whoami`"]);
+    assert.deepEqual(parseArgvString("single 'quoted arg'"), ["single", "quoted arg"]);
+
+    // End-to-end: install + bridge with a fake launcher that echoes argv as JSON.
+    const dir = makeTmp();
+    try {
+      const scriptsDir = join(dir, "scripts");
+      mkdirSync(scriptsDir, { recursive: true });
+      // Minimal launcher: print argv JSON to stdout.
+      writeFileSync(
+        join(scriptsDir, "pipeline.mjs"),
+        `#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify(process.argv.slice(2))+"\\n");\n`,
+      );
+      // Copy real bridge next to fake launcher.
+      const bridgeSrc = join(
+        fileURLToPath(new URL("..", import.meta.url)),
+        "hosts",
+        "opencode",
+        "opencode-pipeline-bridge.mjs",
+      );
+      writeFileSync(join(scriptsDir, "opencode-pipeline-bridge.mjs"), readFileSync(bridgeSrc));
+      const bridge = join(scriptsDir, "opencode-pipeline-bridge.mjs");
+
+      const reason = 'key: reason with spaces and * and $HOME';
+      const r = spawnSync(
+        process.execPath,
+        [bridge, "--", "override", "5", reason],
+        { encoding: "utf8", shell: false },
+      );
+      assert.equal(r.status, 0, r.stderr);
+      const got = JSON.parse(r.stdout.trim());
+      assert.deepEqual(got, ["override", "5", reason]);
+
+      // Stdin path with quoted spaces.
+      const r2 = spawnSync(process.execPath, [bridge, "--from-stdin"], {
+        encoding: "utf8",
+        shell: false,
+        input: `override 5 "${reason}"\n`,
+      });
+      assert.equal(r2.status, 0, r2.stderr);
+      assert.deepEqual(JSON.parse(r2.stdout.trim()), ["override", "5", reason]);
+
+      // Metacharacters must arrive literal (no glob/param expansion).
+      const r3 = spawnSync(process.execPath, [bridge, "--from-stdin"], {
+        encoding: "utf8",
+        shell: false,
+        input: "echo * $HOME\n",
+      });
+      assert.equal(r3.status, 0, r3.stderr);
+      assert.deepEqual(JSON.parse(r3.stdout.trim()), ["echo", "*", "$HOME"]);
+    } finally {
+      cleanup(dir);
+    }
+  });
 });

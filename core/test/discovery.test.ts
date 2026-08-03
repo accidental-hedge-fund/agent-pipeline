@@ -23,12 +23,14 @@ function makeDeps(overrides: Partial<DiscoverHostsDeps>): DiscoverHostsDeps {
     which: async () => null,
     probeCandidates: async () => null,
     readVersion: async () => null,
+    probeOpenCodeSkill: async () => null,
     ...overrides,
   };
 }
 
 const FAKE_CORE_PATH = "/usr/local/lib/node_modules/pipeline/core";
 const FAKE_VERSION = "1.4.0";
+const OPENCODE_ABSENT = { available: false, cliBin: null, skillPath: null } as const;
 
 // ---------------------------------------------------------------------------
 // 1. hostCoverage states
@@ -47,6 +49,8 @@ test("discoverHosts: both hosts installed → hostCoverage=both", async () => {
   assert.equal(result.hosts.codex.available, true);
   assert.equal(result.hosts.claude.cliBin, "/usr/local/bin/claude");
   assert.equal(result.hosts.codex.cliBin, "/usr/local/bin/codex");
+  // OpenCode is additive and must not flip hostCoverage (#861).
+  assert.equal(result.hosts.opencode.available, false);
 });
 
 test("discoverHosts: claude only → hostCoverage=claude-only", async () => {
@@ -86,6 +90,35 @@ test("discoverHosts: neither host → hostCoverage=missing", async () => {
   assert.equal(result.hostCoverage, "missing");
   assert.equal(result.hosts.claude.available, false);
   assert.equal(result.hosts.codex.available, false);
+});
+
+test("discoverHosts: OpenCode skill alone does not invent Claude/Codex coverage (#861)", async () => {
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => null,
+      which: async () => null,
+      probeOpenCodeSkill: async () => "/home/u/.config/opencode/skills/pipeline",
+    }),
+  );
+  assert.equal(result.hostCoverage, "missing");
+  assert.equal(result.hosts.opencode.available, true);
+  assert.equal(result.hosts.opencode.skillPath, "/home/u/.config/opencode/skills/pipeline");
+  assert.equal(result.hosts.claude.available, false);
+  assert.equal(result.hosts.codex.available, false);
+});
+
+test("discoverHosts: OpenCode present with both CLIs keeps hostCoverage=both (#861)", async () => {
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      which: async (cmd) => `/usr/local/bin/${cmd}`,
+      probeOpenCodeSkill: async () => "/tmp/opencode/skills/pipeline",
+    }),
+  );
+  assert.equal(result.hostCoverage, "both");
+  assert.equal(result.hosts.opencode.available, true);
+  assert.equal(result.hosts.opencode.cliBin, "/usr/local/bin/opencode");
 });
 
 // ---------------------------------------------------------------------------
@@ -209,6 +242,7 @@ test("handlePathSubcommand --json: serialises DiscoveryResult as valid JSON", as
     hosts: {
       claude: { available: true, cliBin: "/usr/bin/claude" },
       codex: { available: true, cliBin: "/usr/bin/codex" },
+      opencode: { ...OPENCODE_ABSENT },
     },
   };
 
@@ -240,6 +274,7 @@ test("handlePathSubcommand --json: missing install JSON has null corePath", asyn
     hosts: {
       claude: { available: false, cliBin: null },
       codex: { available: false, cliBin: null },
+      opencode: { ...OPENCODE_ABSENT },
     },
   };
 
@@ -261,7 +296,11 @@ test("handlePathSubcommand --json: exit code 0 for missing install (not an error
       corePath: null,
       version: null,
       hostCoverage: "missing" as const,
-      hosts: { claude: { available: false, cliBin: null }, codex: { available: false, cliBin: null } },
+      hosts: {
+        claude: { available: false, cliBin: null },
+        codex: { available: false, cliBin: null },
+        opencode: { ...OPENCODE_ABSENT },
+      },
     }),
   };
   const origExitCode = process.exitCode;
@@ -295,6 +334,7 @@ test("handlePathSubcommand human-readable: prints core path and coverage", async
     hosts: {
       claude: { available: true, cliBin: "/usr/bin/claude" },
       codex: { available: false, cliBin: null },
+      opencode: { ...OPENCODE_ABSENT },
     },
   };
 

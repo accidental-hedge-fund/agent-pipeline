@@ -1,5 +1,5 @@
-// Profile loader tests (#93): the repo ships exactly two profiles (claude,
-// codex), both prompt-harness; unknown names (including the removed openclaw)
+// Profile loader tests (#93): the repo ships claude, codex, and opencode
+// profiles, all prompt-harness; unknown names (including the removed openclaw)
 // and companion review modes are rejected at load time.
 
 import { test } from "node:test";
@@ -24,14 +24,22 @@ test("loadProfile: codex profile loads with inverted harness roles", () => {
   assert.equal(profile.reviewMode, "prompt-harness");
 });
 
+test("loadProfile: opencode profile loads with opencode implementer (#861)", () => {
+  const profile = loadProfile("opencode");
+  assert.equal(profile.name, "opencode");
+  assert.equal(profile.invocation, "/pipeline");
+  assert.deepEqual(profile.harnesses, { implementer: "opencode", reviewer: "claude" });
+  assert.equal(profile.reviewMode, "prompt-harness");
+});
+
 test("loadProfile: openclaw was removed — unknown profile throws", () => {
   assert.throws(() => loadProfile("openclaw"), /Unknown pipeline profile 'openclaw'/);
 });
 
-test("loadProfile: only claude and codex profiles ship", () => {
+test("loadProfile: claude, codex, and opencode profiles ship (#861)", () => {
   const profilesDir = path.resolve(import.meta.dirname, "..", "profiles");
   const shipped = fs.readdirSync(profilesDir).filter((f) => f.endsWith(".json")).sort();
-  assert.deepEqual(shipped, ["claude.json", "codex.json"]);
+  assert.deepEqual(shipped, ["claude.json", "codex.json", "opencode.json"]);
 });
 
 test("loadProfile: a companion reviewMode is rejected at load time", () => {
