@@ -2,6 +2,7 @@
 // All external I/O is injectable via WritebackDeps for unit testing.
 
 import * as crypto from "node:crypto";
+import { withTrailers } from "../traceability.ts";
 import type {
   PlanJson,
   HygieneItem,
@@ -12,12 +13,31 @@ import type {
   CrossRepoDep,
 } from "./types.ts";
 
+/**
+ * Optional issue/run context for honest commit trailers on roadmap docs commits.
+ * Both fields must be present to append trailers; partial context omits both
+ * (never invent fossils). Normal `pipeline roadmap` has neither.
+ */
+export interface RoadmapPrTraceContext {
+  issueNumber?: number;
+  pipelineRunId?: string;
+}
+
 export interface WritebackDeps {
   writeFile(path: string, content: string): Promise<void>;
   readFile(path: string): Promise<string | null>;
-  gitCreateBranch(repoDir: string, branch: string, fromRef?: string): Promise<void>;
-  gitSwitchBranch(repoDir: string, branch: string): Promise<void>;
-  gitBranchExists(repoDir: string, branch: string): Promise<boolean>;
+  /**
+   * Run `fn` inside a throwaway linked worktree of `branch` (created from
+   * `baseRef` when the branch is missing). Always attempts removal after `fn`
+   * settles. Used by roadmap docs PR writeback so the operator `repoDir`
+   * checkout is never branch-switched or committed into (#632).
+   */
+  withThrowawayWorktree<T>(
+    repoDir: string,
+    branch: string,
+    baseRef: string,
+    fn: (worktreeDir: string) => Promise<T>,
+  ): Promise<T>;
   gitCommit(repoDir: string, files: string[], message: string): Promise<void>;
   gitPushBranch(repoDir: string, branch: string): Promise<void>;
   findPrByHead(repo: string, head: string): Promise<string | null>;
@@ -34,6 +54,27 @@ export interface WritebackDeps {
   getIssueState(repo: string, issueNumber: number): Promise<"open" | "closed" | null>;
   getIssueComments(repo: string, issueNumber: number): Promise<{ body: string }[]>;
   log(msg: string): void;
+}
+
+/**
+ * Build the roadmap docs commit message. Never hardcodes fossil #171 trailers.
+ * Appends Issue / Pipeline-Run trailers only when both are supplied.
+ */
+export function buildRoadmapCommitMessage(
+  plan: PlanJson,
+  trace?: RoadmapPrTraceContext,
+): string {
+  const subject = `docs: roadmap for ${plan.repo} (generated ${plan.generated_at.slice(0, 10)})`;
+  if (
+    trace?.issueNumber !== undefined &&
+    Number.isFinite(trace.issueNumber) &&
+    trace.issueNumber > 0 &&
+    typeof trace.pipelineRunId === "string" &&
+    trace.pipelineRunId.length > 0
+  ) {
+    return withTrailers(subject, trace.issueNumber, trace.pipelineRunId);
+  }
+  return subject;
 }
 
 /**
@@ -178,66 +219,82 @@ export async function writeRoadmapMd(
 }
 
 /**
- * Open a PR with the roadmap.md committed to docs/roadmaps/<repo>.md.
- * Skipped when config.pr_docs === false.
+ * Open or refresh a PR with roadmap.md committed to docs/roadmaps/<repo>.md.
+ *
+ * All branch create/checkout, file write, commit, and push run inside a
+ * throwaway linked worktree — the operator `repoDir` checkout is never
+ * switched or committed into (#632). When a day-keyed PR already exists,
+ * content is compared against the branch head (via the worktree) and refreshed
+ * when it differs; identical content is a no-op that still returns the PR URL.
+ *
+ * Commit trailers: only when both issue number and pipeline run id are supplied
+ * via `trace`. Never hardcodes fossil #171 values.
  */
 export async function openRoadmapPr(
   plan: PlanJson,
   repoDir: string,
   baseBranch: string,
   deps: WritebackDeps,
+  trace?: RoadmapPrTraceContext,
 ): Promise<string | null> {
   const md = renderRoadmapMd(plan);
   const repoSlug = plan.repo.split("/").pop() ?? plan.repo;
   const branch = `roadmap/${repoSlug}-${plan.generated_at.slice(0, 10)}`;
-  const docsPath = `${repoDir}/docs/roadmaps/${repoSlug}.md`;
   const relPath = `docs/roadmaps/${repoSlug}.md`;
 
-  // Idempotency: if a PR already exists for this branch, return its URL without re-creating
   const existingPr = await deps.findPrByHead(plan.repo, branch);
-  if (existingPr) {
-    deps.log(`[roadmap] roadmap PR already exists for branch ${branch}: ${existingPr}`);
-    return existingPr;
-  }
 
-  // Check if docs content is unchanged compared to what we'd write — no-op if identical
-  const existingContent = await deps.readFile(docsPath);
-  if (existingContent === md) {
-    deps.log(`[roadmap] roadmap docs unchanged — skipping PR creation`);
-    return null;
-  }
+  return deps.withThrowawayWorktree(repoDir, branch, baseBranch, async (worktreeDir) => {
+    // Compare against branch-head content in the throwaway worktree — never the
+    // operator working tree alone (which may be dirty or on a different branch).
+    const docsPath = `${worktreeDir}/${relPath}`;
+    const existingContent = await deps.readFile(docsPath);
 
-  deps.log(`[roadmap] opening roadmap PR on branch ${branch}...`);
-  const branchExists = await deps.gitBranchExists(repoDir, branch);
-  if (!branchExists) {
-    // Create branch from the configured base so the PR targets the right history
-    await deps.gitCreateBranch(repoDir, branch, baseBranch);
-  } else {
-    // Always switch to the roadmap branch before writing — prevents committing to the
-    // invoking branch (e.g., main) when the roadmap branch already exists locally.
-    await deps.gitSwitchBranch(repoDir, branch);
-  }
-  await deps.writeFile(docsPath, md);
-  const commitMsg = `docs: roadmap for ${plan.repo} (generated ${plan.generated_at.slice(0, 10)})\n\nIssue: #171\nPipeline-Run: 171/2026-06-17T04:37:16Z`;
-  await deps.gitCommit(repoDir, [relPath], commitMsg);
-  await deps.gitPushBranch(repoDir, branch);
+    if (existingContent === md) {
+      if (existingPr) {
+        deps.log(`[roadmap] roadmap docs unchanged on branch ${branch} — keeping existing PR: ${existingPr}`);
+        return existingPr;
+      }
+      deps.log(`[roadmap] roadmap docs unchanged — skipping PR creation`);
+      return null;
+    }
 
-  const prTitle = `docs: backlog roadmap for ${repoSlug} (${plan.generated_at.slice(0, 10)})`;
-  const prBody = [
-    `## Backlog Roadmap — ${plan.repo}`,
-    "",
-    `Generated by \`pipeline roadmap\` on ${plan.generated_at.slice(0, 10)}.`,
-    "",
-    `**Backlog SHA:** \`${plan.backlog_sha}\``,
-    "",
-    `This PR updates \`${relPath}\` with the current dependency-aware, scored roadmap.`,
-    "",
-    "_The pipeline never merges — a human owns this button._",
-  ].join("\n");
+    deps.log(
+      existingPr
+        ? `[roadmap] refreshing roadmap docs on branch ${branch} (existing PR: ${existingPr})...`
+        : `[roadmap] opening roadmap PR on branch ${branch}...`,
+    );
 
-  const prUrl = await deps.createPr(repoDir, prTitle, prBody, baseBranch, branch);
-  deps.log(`[roadmap] roadmap PR opened: ${prUrl}`);
-  return prUrl;
+    await deps.writeFile(docsPath, md);
+    const commitMsg = buildRoadmapCommitMessage(plan, trace);
+    // Commit/push must use the throwaway worktree path, not operator repoDir.
+    await deps.gitCommit(worktreeDir, [relPath], commitMsg);
+    await deps.gitPushBranch(worktreeDir, branch);
+
+    if (existingPr) {
+      deps.log(`[roadmap] roadmap PR updated: ${existingPr}`);
+      return existingPr;
+    }
+
+    const prTitle = `docs: backlog roadmap for ${repoSlug} (${plan.generated_at.slice(0, 10)})`;
+    const prBody = [
+      `## Backlog Roadmap — ${plan.repo}`,
+      "",
+      `Generated by \`pipeline roadmap\` on ${plan.generated_at.slice(0, 10)}.`,
+      "",
+      `**Backlog SHA:** \`${plan.backlog_sha}\``,
+      "",
+      `This PR updates \`${relPath}\` with the current dependency-aware, scored roadmap.`,
+      "",
+      "_The pipeline never merges — a human owns this button._",
+    ].join("\n");
+
+    // createPr cwd can be either path; head branch is already pushed. Prefer
+    // worktree for consistency with isolation invariants.
+    const prUrl = await deps.createPr(worktreeDir, prTitle, prBody, baseBranch, branch);
+    deps.log(`[roadmap] roadmap PR opened: ${prUrl}`);
+    return prUrl;
+  });
 }
 
 /**
