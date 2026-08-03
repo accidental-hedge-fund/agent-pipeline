@@ -52,7 +52,7 @@ membership rule. Clusters below the minimum-occurrence threshold SHALL be report
 - **AND** it SHALL NOT close open papercut-auto-filed or durable-run-blocker-auto-filed issues
   solely to enforce the correction cap
 
-### Requirement: Correction auto-filing SHALL inherit the shared cross-host auto-file machinery
+### Requirement: Correction auto-filing SHALL honor the single-host concurrency scope
 
 Correction auto-filing SHALL use the same cross-host-safe path as papercut auto-filing: GitHub-
 authored issue state as the source of truth for pre-create dedup and rate-cap checks, plus
@@ -61,7 +61,8 @@ Documentation and configuration comments SHALL state that this path inherits tha
 cross-host posture. They SHALL NOT claim that correction auto-filing is single-host-only while
 the implementation reuses cross-host reconciliation, and SHALL NOT invent a stronger global-
 serialization guarantee than the shared path provides. Host-local `/tmp` locks remain a same-host
-fast path only.
+fast path only. The prior "single-host-only" concurrency claim for this path is superseded by the
+shared papercut/durable cross-host auto-file machinery (#459 / #631).
 
 #### Scenario: Shared cross-host posture is documented consistently
 
