@@ -26,6 +26,7 @@ import type {
   HarnessAdapter,
   HarnessTelemetry,
 } from "../harness-adapters/types.ts";
+import { isJsonRecord, parseJsonLine } from "../harness-adapters/types.ts";
 import {
   HARNESS_SMOKE_IMPLEMENTER_CONTRACT_ID,
   HARNESS_SMOKE_REVIEWER_CONTRACT_ID,
@@ -490,9 +491,91 @@ function adapterDeclaresTelemetry(adapter: HarnessAdapter): boolean {
 }
 
 /**
+ * Collect JSON objects from a CLI capture (JSONL lines and/or a whole-capture
+ * JSON object). Used only for provenance checks — not for product parsing.
+ */
+function collectJsonRecords(capturedStdout: string): Record<string, unknown>[] {
+  const records: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  const push = (obj: Record<string, unknown>) => {
+    // De-dupe identical line vs whole-capture parses of the same object.
+    let key: string;
+    try {
+      key = JSON.stringify(obj);
+    } catch {
+      key = String(records.length);
+    }
+    if (seen.has(key)) return;
+    seen.add(key);
+    records.push(obj);
+  };
+  for (const line of capturedStdout.split("\n")) {
+    const obj = parseJsonLine(line);
+    if (obj) push(obj);
+  }
+  const trimmed = capturedStdout.trim();
+  if (trimmed) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (isJsonRecord(parsed)) push(parsed);
+    } catch {
+      // not a single JSON document — fine
+    }
+  }
+  return records;
+}
+
+/** True when `target` appears as a finite number value anywhere under `node`. */
+function jsonContainsFiniteNumber(
+  node: unknown,
+  target: number,
+  depth = 0,
+): boolean {
+  if (depth > 10) return false;
+  if (typeof node === "number" && Number.isFinite(node) && node === target) {
+    return true;
+  }
+  if (Array.isArray(node)) {
+    return node.some((v) => jsonContainsFiniteNumber(v, target, depth + 1));
+  }
+  if (isJsonRecord(node)) {
+    return Object.values(node).some((v) =>
+      jsonContainsFiniteNumber(v, target, depth + 1),
+    );
+  }
+  return false;
+}
+
+/**
+ * True when `target` appears as an object key or string value under `node`.
+ * Matches claude/grok modelUsage keys and any string model fields adapters
+ * may surface without requiring a single vendor schema.
+ */
+function jsonContainsStringKeyOrValue(
+  node: unknown,
+  target: string,
+  depth = 0,
+): boolean {
+  if (depth > 10) return false;
+  if (typeof node === "string" && node === target) return true;
+  if (Array.isArray(node)) {
+    return node.some((v) => jsonContainsStringKeyOrValue(v, target, depth + 1));
+  }
+  if (isJsonRecord(node)) {
+    for (const [k, v] of Object.entries(node)) {
+      if (k === target) return true;
+      if (jsonContainsStringKeyOrValue(v, target, depth + 1)) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Telemetry parse check: when declared, parse must not throw and must not invent
- * a resolved model or cost the CLI did not report. EMPTY_TELEMETRY (all nulls)
- * is acceptable when the stream has no envelope — inventing values is not.
+ * a resolved model or cost the CLI did not report. Provenance is per-field:
+ * a non-null costUsd/resolvedModel is only accepted when that value is present
+ * in the raw capture's JSON envelope (not merely because stdout is nonempty).
+ * EMPTY_TELEMETRY (all nulls) is always acceptable.
  */
 function checkTelemetry(
   adapter: HarnessAdapter,
@@ -510,13 +593,31 @@ function checkTelemetry(
       `Fix adapter \`${adapter.name}\` parseTelemetry so unparseable smoke output degrades to nulls instead of throwing.`,
     );
   }
-  // Guard against inventing values when the CLI produced no machine-readable
-  // payload: if stdout is empty/non-jsonl-like and cost/model are set, fail.
-  const looksEmpty = !capturedStdout.trim();
-  if (looksEmpty && (telemetry.costUsd != null || telemetry.resolvedModel != null)) {
+
+  const records = collectJsonRecords(capturedStdout);
+  const invented: string[] = [];
+
+  if (
+    telemetry.costUsd != null &&
+    Number.isFinite(telemetry.costUsd) &&
+    !records.some((r) => jsonContainsFiniteNumber(r, telemetry.costUsd as number))
+  ) {
+    invented.push("costUsd");
+  }
+  if (
+    telemetry.resolvedModel != null &&
+    telemetry.resolvedModel !== "" &&
+    !records.some((r) =>
+      jsonContainsStringKeyOrValue(r, telemetry.resolvedModel as string),
+    )
+  ) {
+    invented.push("resolvedModel");
+  }
+
+  if (invented.length > 0) {
     return fail(
-      `${label}: parseTelemetry invented cost/model from empty smoke output`,
-      `Adapter \`${adapter.name}\` must not invent resolved model or cost when the CLI did not report them.`,
+      `${label}: parseTelemetry invented ${invented.join(" and ")} without matching fields in the CLI capture`,
+      `Adapter \`${adapter.name}\` must not invent resolved model or cost when the CLI did not report them. Return nulls for fields absent from the telemetry envelope.`,
     );
   }
   return null; // ok

@@ -67,7 +67,9 @@ managed pipeline worktree). The treatment SHALL pass only when all of the follow
    implementer-facing contract id,
 4. when the adapter declares telemetry support, captured output is parseable by the adapter’s
    `parseTelemetry` without throwing and without inventing a resolved model or cost the CLI did not
-   report.
+   report. Provenance is per-field: a non-null `resolvedModel` or `costUsd` SHALL be rejected unless
+   the corresponding value is present in the raw CLI capture’s JSON telemetry envelope (empty or
+   nonempty product-only output without those fields is not sufficient justification).
 
 A failure of any of (1)–(4) SHALL mark that treatment as failed with remediation naming the
 adapter, role, and (when set) model and effort.
@@ -78,6 +80,16 @@ adapter, role, and (when set) model and effort.
   commit in the scratch repo, produces contract-valid output, and (if telemetry is declared) yields
   parseable telemetry
 - **THEN** that treatment’s smoke result SHALL be pass
+
+#### Scenario: Telemetry inventing model or cost from nonempty non-telemetry output fails
+
+- **WHEN** an adapter declares telemetry support
+- **AND** smoke captured output is nonempty ordinary product output or JSONL that does not report
+  model or cost fields
+- **AND** `parseTelemetry` returns a non-null `resolvedModel` or `costUsd` not present in that
+  capture’s JSON envelope
+- **THEN** that treatment’s smoke result SHALL be fail
+- **AND** remediation SHALL state that the adapter must not invent those values
 
 #### Scenario: Implementer missing commit fails
 

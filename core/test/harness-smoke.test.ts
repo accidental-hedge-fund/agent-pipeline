@@ -693,6 +693,255 @@ test("runHarnessSmoke: unparseable reviewer verdict is output-contract failure",
 });
 
 // ---------------------------------------------------------------------------
+// Telemetry provenance (field-aware — not merely nonempty stdout)
+// ---------------------------------------------------------------------------
+
+/** Minimal plan: one implementer + one reviewer coordinate. */
+function singleCoordConfig(implAdapter: string, revAdapter: string): PipelineConfig {
+  return makeConfig({
+    harnesses: {
+      implementer: implAdapter,
+      reviewer: revAdapter,
+      implementerSource: "repo-config",
+      reviewerSource: "repo-config",
+    },
+    models: {
+      planning: "m",
+      implementing: "m",
+      review: "m",
+      fix: "m",
+      intake: "m",
+      sweep: "m",
+    },
+    effort: {
+      planning: "low",
+      implementing: "low",
+      review: "low",
+      fix: "low",
+      intake: "low",
+      sweep: "low",
+    },
+    plan_review_effort: "low",
+  });
+}
+
+test("runHarnessSmoke: telemetry inventing cost/model from nonempty product output fails", async () => {
+  // Successful canned prompts always emit nonempty product JSON — empty-stdout
+  // invention guards alone are insufficient (review 2 finding 383e6ce6).
+  const telAdapter = fakeAdapter("tel-impl", {
+    roles: ["implementer"],
+    telemetry: "jsonl",
+  });
+  const revAdapter = fakeAdapter("tel-rev", {
+    roles: ["reviewer"],
+    telemetry: "jsonl",
+  });
+  const deps = fakeSmokeDeps({
+    adapters: new Map([
+      ["tel-impl", telAdapter],
+      ["tel-rev", revAdapter],
+    ]),
+    parseTelemetry: () => ({
+      text: "product",
+      costUsd: 0.42,
+      usage: null,
+      resolvedModel: "fabricated-model-xyz",
+      throttled: null,
+    }),
+  });
+  const outcomes = await runHarnessSmoke(singleCoordConfig("tel-impl", "tel-rev"), deps);
+  assert.ok(outcomes.length >= 1, JSON.stringify(outcomes));
+  assert.ok(
+    outcomes.every((o) => o.status === "fail"),
+    JSON.stringify(outcomes),
+  );
+  assert.ok(
+    outcomes.every((o) => /invented/i.test(o.detail)),
+    JSON.stringify(outcomes),
+  );
+  assert.ok(
+    outcomes.every((o) => /costUsd|resolvedModel/i.test(o.detail)),
+    JSON.stringify(outcomes),
+  );
+});
+
+test("runHarnessSmoke: telemetry inventing cost from JSONL without cost field fails", async () => {
+  // Codex-shaped JSONL: product + usage, no total_cost_usd / modelUsage.
+  const jsonlNoCost =
+    '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"ok\\":true}"}}\n' +
+    '{"type":"turn.completed","usage":{"input_tokens":2}}\n';
+  const telAdapter = fakeAdapter("tel-impl", {
+    roles: ["implementer"],
+    telemetry: "jsonl",
+  });
+  const revAdapter = fakeAdapter("tel-rev", {
+    roles: ["reviewer"],
+    telemetry: "none",
+  });
+  const deps = fakeSmokeDeps({
+    adapters: new Map([
+      ["tel-impl", telAdapter],
+      ["tel-rev", revAdapter],
+    ]),
+    invoke: async (req) => {
+      if (req.role === "implementer") {
+        return { success: true, exitCode: 0, stdout: jsonlNoCost, stderr: "" };
+      }
+      return {
+        success: true,
+        exitCode: 0,
+        stdout: '{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}',
+        stderr: "",
+      };
+    },
+    parseTelemetry: (_adapter, _out) => ({
+      text: '{"ok":true}',
+      costUsd: 1.23,
+      usage: { input_tokens: 2 },
+      resolvedModel: null,
+      throttled: null,
+    }),
+    // Contract validate on product JSON reconstructed by adapter — smoke uses
+    // raw stdout for validateContract, so force pass for implementer envelope.
+    validateContract: (id, _input) => {
+      if (id === HARNESS_SMOKE_IMPLEMENTER_CONTRACT_ID) return { ok: true };
+      return validateStageOutput(id, _input);
+    },
+  });
+  const outcomes = await runHarnessSmoke(singleCoordConfig("tel-impl", "tel-rev"), deps);
+  const impl = outcomes.filter((o) => o.id.includes(":implementer"));
+  assert.ok(impl.length >= 1, JSON.stringify(outcomes));
+  assert.ok(impl.every((o) => o.status === "fail"), JSON.stringify(impl));
+  assert.ok(impl.every((o) => /invented/i.test(o.detail) && /costUsd/i.test(o.detail)));
+});
+
+test("runHarnessSmoke: telemetry inventing resolvedModel from JSONL without model field fails", async () => {
+  const jsonlNoModel =
+    '{"type":"result","result":"{\\"ok\\":true}","total_cost_usd":0.01,"usage":{"input_tokens":1}}\n';
+  const telAdapter = fakeAdapter("tel-impl", {
+    roles: ["implementer"],
+    telemetry: "jsonl",
+  });
+  const revAdapter = fakeAdapter("tel-rev", {
+    roles: ["reviewer"],
+    telemetry: "none",
+  });
+  const deps = fakeSmokeDeps({
+    adapters: new Map([
+      ["tel-impl", telAdapter],
+      ["tel-rev", revAdapter],
+    ]),
+    invoke: async (req) => {
+      if (req.role === "implementer") {
+        return { success: true, exitCode: 0, stdout: jsonlNoModel, stderr: "" };
+      }
+      return {
+        success: true,
+        exitCode: 0,
+        stdout: '{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}',
+        stderr: "",
+      };
+    },
+    parseTelemetry: () => ({
+      text: '{"ok":true}',
+      costUsd: 0.01, // present in envelope — ok
+      usage: { input_tokens: 1 },
+      resolvedModel: "hardcoded-model", // NOT in envelope
+      throttled: null,
+    }),
+    validateContract: (id, input) => {
+      if (id === HARNESS_SMOKE_IMPLEMENTER_CONTRACT_ID) return { ok: true };
+      return validateStageOutput(id, input);
+    },
+  });
+  const outcomes = await runHarnessSmoke(singleCoordConfig("tel-impl", "tel-rev"), deps);
+  const impl = outcomes.filter((o) => o.id.includes(":implementer"));
+  assert.ok(impl.length >= 1, JSON.stringify(outcomes));
+  assert.ok(impl.every((o) => o.status === "fail"), JSON.stringify(impl));
+  assert.ok(
+    impl.every((o) => /invented/i.test(o.detail) && /resolvedModel/i.test(o.detail)),
+    JSON.stringify(impl),
+  );
+  // Must not claim cost was invented when total_cost_usd was present.
+  assert.ok(impl.every((o) => !/costUsd/i.test(o.detail)), JSON.stringify(impl));
+});
+
+test("runHarnessSmoke: honest telemetry recovery from envelope with cost and model passes", async () => {
+  const envelope =
+    '{"type":"result","result":"{\\"ok\\":true}","total_cost_usd":0.05,"usage":{"input_tokens":3},"modelUsage":{"real-model-abc":{}}}\n';
+  const telAdapter = fakeAdapter("tel-impl", {
+    roles: ["implementer"],
+    telemetry: "jsonl",
+  });
+  const revAdapter = fakeAdapter("tel-rev", {
+    roles: ["reviewer"],
+    telemetry: "jsonl",
+  });
+  const deps = fakeSmokeDeps({
+    adapters: new Map([
+      ["tel-impl", telAdapter],
+      ["tel-rev", revAdapter],
+    ]),
+    invoke: async (req) => {
+      if (req.role === "implementer") {
+        return { success: true, exitCode: 0, stdout: envelope, stderr: "" };
+      }
+      // Reviewer: product verdict only; parseTelemetry returns nulls (honest).
+      return {
+        success: true,
+        exitCode: 0,
+        stdout: '{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}',
+        stderr: "",
+      };
+    },
+    parseTelemetry: (_adapter, out) => {
+      if (out.includes("total_cost_usd")) {
+        return {
+          text: '{"ok":true}',
+          costUsd: 0.05,
+          usage: { input_tokens: 3 },
+          resolvedModel: "real-model-abc",
+          throttled: null,
+        };
+      }
+      return { ...EMPTY_TELEMETRY };
+    },
+    validateContract: (id, input) => {
+      if (id === HARNESS_SMOKE_IMPLEMENTER_CONTRACT_ID) return { ok: true };
+      return validateStageOutput(id, input);
+    },
+  });
+  const outcomes = await runHarnessSmoke(singleCoordConfig("tel-impl", "tel-rev"), deps);
+  assert.ok(
+    outcomes.every((o) => o.status === "pass"),
+    JSON.stringify(outcomes),
+  );
+});
+
+test("runHarnessSmoke: telemetry declared but EMPTY_TELEMETRY on nonempty product passes", async () => {
+  const telAdapter = fakeAdapter("tel-impl", {
+    roles: ["implementer"],
+    telemetry: "jsonl",
+  });
+  const revAdapter = fakeAdapter("tel-rev", {
+    roles: ["reviewer"],
+    telemetry: "jsonl",
+  });
+  const deps = fakeSmokeDeps({
+    adapters: new Map([
+      ["tel-impl", telAdapter],
+      ["tel-rev", revAdapter],
+    ]),
+    parseTelemetry: () => ({ ...EMPTY_TELEMETRY }),
+  });
+  const outcomes = await runHarnessSmoke(singleCoordConfig("tel-impl", "tel-rev"), deps);
+  assert.ok(
+    outcomes.every((o) => o.status === "pass"),
+    JSON.stringify(outcomes),
+  );
+});
+
+// ---------------------------------------------------------------------------
 // JSON / exit aggregation
 // ---------------------------------------------------------------------------
 
