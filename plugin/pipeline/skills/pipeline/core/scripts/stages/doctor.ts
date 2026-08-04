@@ -7,8 +7,10 @@
 //
 // Every check is a `PreflightCheck` record over a `DoctorDeps` seam (the same
 // injectable-deps pattern as the other stages), so the whole module is
-// unit-testable with no real subprocess, filesystem, or network calls. Nothing
-// here invokes a language model.
+// unit-testable with no real subprocess, filesystem, or network calls. Default
+// doctor (no `--harness-smoke`) never invokes a language model. The opt-in
+// `--harness-smoke` path (#780) is composed in `pipeline.ts` after static
+// preflight and may spend one cheap model call per unique configured treatment.
 
 import * as path from "node:path";
 import { execFile } from "node:child_process";

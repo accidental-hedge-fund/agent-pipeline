@@ -138,6 +138,12 @@ import {
   storePreflightResult,
   type PreflightResult,
 } from "./stages/doctor.ts";
+import {
+  foldSmokeIntoChecks,
+  realHarnessSmokeDeps,
+  runHarnessSmoke,
+  type HarnessSmokeDeps,
+} from "./stages/harness-smoke.ts";
 import { runLoopPreflight, MAX_RANGE_SPAN, type LoopEngine, type LoopPreflightOutcome, type LoopSelector, type RawLoopArgs, type NativeGoalAttestation } from "./loop-preflight.ts";
 import { auditSupervisor, driveSupervisor, type SupervisorDeps } from "./loop/supervisor.ts";
 import {
@@ -308,6 +314,12 @@ export interface CliOpts {
   json?: boolean;
   /** Doctor: silent exit-0/1 polling gate; no output. Mutually exclusive with --json. */
   isOk?: boolean;
+  /**
+   * Doctor: opt-in dynamic harness smoke (#780). Runs one cheap canned model
+   * call per unique configured treatment after static preflight. Default doctor
+   * (flag absent) remains model-free.
+   */
+  harnessSmoke?: boolean;
   /** Release: skip opening $EDITOR for ROADMAP review (commit scaffolded ROADMAP as-is).
    *  Commander's `--no-edit` sets `edit: false` here. */
   edit?: boolean;
@@ -516,6 +528,10 @@ export function buildCmd(): Command {
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
     .option("--fail-fast", "doctor: stop at the first failing check instead of collecting all failures")
+    .option(
+      "--harness-smoke",
+      "doctor: opt-in role-aware runtime smoke for every unique configured adapter/role/model/effort treatment (~1 cheap model call per treatment; not model-free)",
+    )
     .option("--is-ok", "doctor: silent exit-0/1 gate (no output); mutually exclusive with --json")
     .option("--status", "read-only status; print stage and exit")
     .option("--json", "emit machine-readable JSON (for --status or the doctor command)")
@@ -4472,14 +4488,62 @@ async function runConfigRepoMapCommand(args: string[], opts: CliOpts): Promise<v
 export interface PreflightCliDeps {
   runPreflight: typeof runPreflight;
   storePreflightResult: typeof storePreflightResult;
+  /** Optional: injected harness-smoke runner for unit tests (#780). */
+  runHarnessSmoke?: (
+    cfg: PipelineConfig,
+    smokeDeps?: HarnessSmokeDeps,
+    opts?: { failFast?: boolean; reviewerPromptDelivery?: "argv" | "stdin" },
+  ) => ReturnType<typeof runHarnessSmoke>;
+  /** Optional: real smoke deps factory; tests omit (orchestration faked via runHarnessSmoke). */
+  harnessSmokeDeps?: () => HarnessSmokeDeps;
 }
 
-const defaultPreflightCliDeps: PreflightCliDeps = { runPreflight, storePreflightResult };
+const defaultPreflightCliDeps: PreflightCliDeps = {
+  runPreflight,
+  storePreflightResult,
+  runHarnessSmoke,
+  harnessSmokeDeps: () => realHarnessSmokeDeps(realDoctorDeps()),
+};
+
+/**
+ * Run static preflight, then optionally fold opt-in harness-smoke outcomes (#780).
+ * Default doctor (no `--harness-smoke`) remains model-free.
+ */
+async function runDoctorChecks(
+  cfg: PipelineConfig,
+  opts: CliOpts,
+  deps: PreflightCliDeps,
+): Promise<PreflightResult> {
+  const failFast = opts.failFast ?? cfg.doctor.failFast;
+  const staticResult = await deps.runPreflight(cfg, undefined, { failFast }, VERSION);
+  if (!opts.harnessSmoke) {
+    return staticResult;
+  }
+  const smokeRunner = deps.runHarnessSmoke ?? runHarnessSmoke;
+  const smokeDeps = deps.harnessSmokeDeps?.();
+  const smokeChecks = await smokeRunner(
+    cfg,
+    smokeDeps,
+    {
+      failFast,
+      reviewerPromptDelivery: cfg.harnesses.reviewerPromptDelivery ?? "argv",
+    },
+  );
+  const folded = foldSmokeIntoChecks(staticResult.checks, smokeChecks);
+  return {
+    schema_version: staticResult.schema_version,
+    ok: folded.ok,
+    checks: folded.checks,
+    ranAt: staticResult.ranAt,
+  };
+}
 
 /** `pipeline doctor`: run every preflight check, print the summary, persist the
  *  result for `--status`, and set the exit code (0 all-pass, 1 any failure).
  *  With `--json`: emit a single unfenced JSON object instead of prose.
  *  With `--is-ok`: emit zero output; exit 0/1 only (cheap polling gate).
+ *  With `--harness-smoke`: also run role-aware dynamic harness smoke (~1 cheap
+ *  model call per unique configured treatment) after static checks (#780).
  *  `--json` and `--is-ok` are mutually exclusive. */
 export async function runDoctor(
   cfg: PipelineConfig,
@@ -4497,8 +4561,7 @@ export async function runDoctor(
   if (opts.isOk) {
     // Silent polling gate: run checks, set exit code, zero bytes of output.
     try {
-      const failFast = opts.failFast ?? cfg.doctor.failFast;
-      const result = await deps.runPreflight(cfg, undefined, { failFast }, VERSION);
+      const result = await runDoctorChecks(cfg, opts, deps);
       process.exitCode = result.ok ? 0 : 1;
     } catch {
       process.exitCode = 1;
@@ -4506,14 +4569,18 @@ export async function runDoctor(
     return;
   }
 
-  const failFast = opts.failFast ?? cfg.doctor.failFast;
-  const result = await deps.runPreflight(cfg, undefined, { failFast }, VERSION);
+  const result = await runDoctorChecks(cfg, opts, deps);
   await deps.storePreflightResult(cfg, result);
 
   if (opts.json) {
     console.log(JSON.stringify(formatDoctorJson(result)));
   } else {
-    console.log(formatDoctorSummary(result));
+    let summary = formatDoctorSummary(result);
+    if (opts.harnessSmoke) {
+      summary +=
+        "\n\nHarness smoke: ~1 cheap model call per unique configured treatment was requested via --harness-smoke.";
+    }
+    console.log(summary);
   }
   process.exitCode = result.ok ? 0 : 1;
 }

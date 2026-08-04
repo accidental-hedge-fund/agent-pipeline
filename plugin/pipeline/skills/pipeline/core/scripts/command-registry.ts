@@ -69,7 +69,16 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   doctor: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "base", "profile", "json", "isOk", "failFast", "doctor"]),
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "profile",
+      "json",
+      "isOk",
+      "failFast",
+      "doctor",
+      "harnessSmoke",
+    ]),
     needsConfig: true,
     needsGhAuth: false,
     mutatesGitHub: false,

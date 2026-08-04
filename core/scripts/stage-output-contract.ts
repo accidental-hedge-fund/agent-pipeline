@@ -53,7 +53,15 @@ export const REQUIRED_STAGE_OUTPUT_CONTRACT_IDS = [
   "plan-revision.ack@1",
   "openspec.change-singular@1",
   "review.verdict@1",
+  /** Cheap implementer ack used only by `pipeline doctor --harness-smoke` (#780). */
+  "harness-smoke.implementer@1",
 ] as const;
+
+/** Contract id for implementer harness-smoke product output (#780). */
+export const HARNESS_SMOKE_IMPLEMENTER_CONTRACT_ID = "harness-smoke.implementer@1" as const;
+
+/** Contract id for reviewer harness-smoke product output (#780) — production review path. */
+export const HARNESS_SMOKE_REVIEWER_CONTRACT_ID = "review.verdict@1" as const;
 
 export type RequiredStageOutputContractId =
   (typeof REQUIRED_STAGE_OUTPUT_CONTRACT_IDS)[number];
@@ -195,6 +203,45 @@ export function validateReviewVerdict(
   };
 }
 
+/**
+ * Cheap implementer smoke ack (#780): a tiny structured JSON object the canned
+ * harness-smoke prompt is designed to emit. Not used by production stages.
+ */
+export function validateHarnessSmokeImplementer(
+  stdout: string,
+): ContractValidateResult {
+  const text = stdout.trim();
+  // Accept fenced or bare JSON.
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fenced?.[1] ?? text).trim();
+  // Prefer a single JSON object in the text (first `{...}` span).
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start < 0 || end <= start) {
+    return {
+      ok: false,
+      reason: "Implementer smoke output is not a JSON object with ok:true",
+    };
+  }
+  try {
+    const parsed = JSON.parse(candidate.slice(start, end + 1)) as unknown;
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      !Array.isArray(parsed) &&
+      (parsed as { ok?: unknown }).ok === true
+    ) {
+      return { ok: true };
+    }
+  } catch {
+    // fall through
+  }
+  return {
+    ok: false,
+    reason: "Implementer smoke output is not a JSON object with ok:true",
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Repair addenda (contract-specific text only; loop is shared)
 // ---------------------------------------------------------------------------
@@ -252,6 +299,14 @@ function registerBuiltInContracts(): void {
     sideEffectGate: "accept review verdict for severity/policy advancement",
     repairAddendum: REVIEW_VERDICT_REPAIR_ADDENDUM,
     validate: (stdout: string) => validateReviewVerdict(stdout),
+  });
+
+  registerStageOutputContract({
+    id: HARNESS_SMOKE_IMPLEMENTER_CONTRACT_ID,
+    version: 1,
+    kind: "json-schema",
+    sideEffectGate: "accept doctor harness-smoke implementer treatment as ready",
+    validate: (stdout: string) => validateHarnessSmokeImplementer(stdout),
   });
 }
 

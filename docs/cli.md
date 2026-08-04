@@ -43,8 +43,8 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `doctor`
 
-- **Usage:** `pipeline doctor`
-- **Summary:** Deterministic preflight check; print summary, exit 0/1
+- **Usage:** `pipeline doctor [--json|--is-ok] [--fail-fast] [--harness-smoke]`
+- **Summary:** Deterministic preflight check; print summary, exit 0/1. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment
 
 #### `init`
 

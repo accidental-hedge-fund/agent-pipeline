@@ -76,6 +76,15 @@ test("pipeline-cli: doctor — no extra flags → []", () => {
   assert.deepEqual(roundTrip(["doctor"]), []);
 });
 
+test("pipeline-cli: doctor --harness-smoke → [] (#780)", () => {
+  assert.deepEqual(roundTrip(["doctor", "--harness-smoke"]), []);
+});
+
+test("pipeline-cli: doctor --harness-smoke is parsed onto opts.harnessSmoke (#780)", () => {
+  const { opts } = parseCli(["doctor", "--harness-smoke"]);
+  assert.equal(opts.harnessSmoke, true);
+});
+
 test("pipeline-cli: release — version argument → []", () => {
   assert.deepEqual(roundTrip(["release", "1.0.0"]), []);
 });
