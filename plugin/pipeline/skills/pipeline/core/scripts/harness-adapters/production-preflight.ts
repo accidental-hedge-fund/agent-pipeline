@@ -2,13 +2,14 @@
 //
 // One choke point used by `harness.invoke` before `buildInvocation` / spawn:
 // prompt-size (#779), absolute executable readiness, role eligibility, and
-// `adapter.preflight` with the exact resolved {model, effort, sandbox}.
+// `adapter.preflight` with the exact resolved {model, effort, sandbox, sandboxMode}.
 // Built-in, extension, and compatibility adapters share this path.
 //
 // Consumes the once-per-run version/binary probe (#778) — does not add a second
 // always-on per-call version exec. Version drift remains fail-soft; missing CLI
 // and capability refusals block.
 
+import { redactSecrets, sanitize } from "../artifact-sanitize.ts";
 import {
   probeCliVersionOnce,
   resolveCommandPath,
@@ -34,12 +35,6 @@ export interface ProductionPreflightRequest extends AdapterRequest {
   role?: AdapterRole | null;
   /** Fully materialized prompt text for the #779 size check. */
   prompt: string;
-  /**
-   * Resolved sandbox/tool policy identity the invocation will apply (e.g.
-   * managed sandboxMode). Distinct from AdapterRequest.sandbox restricted-
-   * permission flag; recorded for diagnostics when provided.
-   */
-  sandboxMode?: string | null;
 }
 
 /** Distinguishable production-gate failure classes (superset of adapter preflight). */
@@ -106,9 +101,37 @@ export interface ProductionPreflightDeps {
   resolvePath?: (command: string) => Promise<string | null>;
 }
 
+/** Max operator-facing diagnostic characters after sanitization (bounded quality). */
+export const PREFLIGHT_DIAGNOSTIC_MAX_CHARS = 500;
+
+/**
+ * Sanitize and bound adapter-supplied or thrown diagnostic text so credential
+ * material never reaches HarnessResult remediation surfaces (#636).
+ */
+export function sanitizePreflightDiagnostic(text: string): string {
+  let cleaned = redactSecrets(String(text ?? ""));
+  // Extra credential-shaped patterns common in CLI stderr / auth URLs that are
+  // not always covered by token-format redaction alone.
+  cleaned = cleaned.replace(/\bBearer\s+[A-Za-z0-9._\-+/=]+/gi, "Bearer [REDACTED]");
+  cleaned = cleaned.replace(
+    /\b(authorization|x-api-key|api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[:=]\s*\S+/gi,
+    "$1=[REDACTED]",
+  );
+  cleaned = cleaned.replace(
+    /https?:\/\/[^\s]*[?&](token|key|api_key|access_token)=([^&\s]+)/gi,
+    (full) => full.replace(/(token|key|api_key|access_token)=([^&\s]+)/gi, "$1=[REDACTED]"),
+  );
+  cleaned = sanitize(cleaned).replace(/\s+/g, " ").trim();
+  if (cleaned.length === 0) return "(no diagnostic detail)";
+  if (cleaned.length > PREFLIGHT_DIAGNOSTIC_MAX_CHARS) {
+    return `${cleaned.slice(0, PREFLIGHT_DIAGNOSTIC_MAX_CHARS)}…`;
+  }
+  return cleaned;
+}
+
 /**
  * Project an adapter / production preflight failure into #760 remediation.
- * Pure — no I/O.
+ * Pure — no I/O. Adapter-supplied detail is sanitized before projection.
  */
 export function projectPreflightRemediation(
   adapterName: string,
@@ -136,9 +159,10 @@ export function projectPreflightRemediation(
     default:
       reasonCode = "capability-refusal";
   }
+  const safeDetail = sanitizePreflightDiagnostic(detail);
   const base =
-    detail.trim().length > 0
-      ? detail.trim()
+    safeDetail !== "(no diagnostic detail)"
+      ? safeDetail
       : `[harness ${adapterName}] production preflight failed: ${failure}${settingBit}`;
   const withAdapter = base.includes(adapterName) ? base : `[harness ${adapterName}] ${base}`;
   return {
@@ -150,7 +174,8 @@ export function projectPreflightRemediation(
 }
 
 /**
- * Resolve a declared adapter command to an absolute path when possible.
+ * Resolve a declared adapter command to an absolute filesystem path when possible.
+ * Relative path-like strings are never returned as "resolved absolute" paths.
  * Injectable; unit tests never need a real PATH.
  */
 export async function resolveAbsoluteExecutable(
@@ -163,21 +188,54 @@ export async function resolveAbsoluteExecutable(
 ): Promise<string | null> {
   const trimmed = command.trim();
   if (!trimmed) return null;
-  if (resolution === "absolute" || trimmed.startsWith("/") || trimmed.startsWith(".")) {
-    // Already path-like — return as-is when absolute; leave relative for fs checks.
-    return trimmed.startsWith("/") ? trimmed : trimmed;
+
+  // Absolute path declaration or already-absolute command — never treat relative
+  // "./foo" / "foo/bar" as a resolved absolute executable path.
+  if (resolution === "absolute" || trimmed.startsWith("/")) {
+    return trimmed.startsWith("/") ? trimmed : null;
   }
+  // Relative path-like names are not PATH bare commands and are not absolute.
+  if (trimmed.startsWith(".") || trimmed.includes("/")) {
+    return null;
+  }
+
   if (deps.resolvePath) {
     try {
-      return (await deps.resolvePath(trimmed)) ?? null;
+      const resolved = (await deps.resolvePath(trimmed)) ?? null;
+      if (resolved == null) return null;
+      const abs = resolved.trim();
+      return abs.startsWith("/") ? abs : null;
     } catch {
       return null;
     }
   }
   if (deps.exec) {
-    return resolveCommandPath(trimmed, { exec: deps.exec });
+    const resolved = await resolveCommandPath(trimmed, { exec: deps.exec });
+    if (resolved == null) return null;
+    const abs = resolved.trim();
+    return abs.startsWith("/") ? abs : null;
   }
   return null;
+}
+
+function missingExecutableRemediation(
+  adapterName: string,
+  command: string,
+  resolution: "path" | "absolute",
+  detail?: string,
+): ProductionPreflightRemediation {
+  const msg =
+    detail ??
+    (resolution === "absolute"
+      ? `[harness ${adapterName}] declared absolute command "${command}" is missing or not executable. ` +
+        `Install or fix the binary path; the pipeline will not spawn an unresolved CLI or fall back to another harness.`
+      : `[harness ${adapterName}] CLI command "${command}" could not be resolved to a runnable absolute executable on PATH. ` +
+        `Install the CLI and ensure it is on PATH (or pack the absolute path for detached runs); ` +
+        `the pipeline will not spawn an unresolved command name alone.`);
+  return projectPreflightRemediation(adapterName, "missing-executable", msg, {
+    setting: "executable",
+    value: command,
+  });
 }
 
 /**
@@ -186,9 +244,9 @@ export async function resolveAbsoluteExecutable(
  * Ordering:
  * 1. #779 prompt-size against adapter maxPromptBytes
  * 2. Role eligibility when role is supplied
- * 3. Absolute executable resolution (record when known)
+ * 3. Absolute executable resolution — fail closed when unresolved / not executable
  * 4. Once-per-run version/binary probe (shared cache; fail-soft on version alone)
- * 5. adapter.preflight with exact resolved AdapterRequest
+ * 5. adapter.preflight with exact resolved AdapterRequest (incl. sandboxMode)
  *
  * Never substitutes an ambient model or another adapter.
  */
@@ -201,6 +259,7 @@ export async function runProductionPreflight(
     ...(req.model !== undefined ? { model: req.model } : {}),
     ...(req.effort !== undefined ? { effort: req.effort } : {}),
     ...(req.sandbox !== undefined ? { sandbox: req.sandbox } : {}),
+    ...(req.sandboxMode !== undefined ? { sandboxMode: req.sandboxMode } : {}),
   };
   const role = req.role ?? null;
   const command = adapter.declaration.executable.command;
@@ -247,7 +306,7 @@ export async function runProductionPreflight(
     };
   }
 
-  // 3. Absolute executable resolution (record when known).
+  // 3. Absolute executable resolution — fail closed independently of adapter.preflight.
   const resolvePath =
     deps.resolvePath ??
     ((cmd: string) =>
@@ -264,13 +323,53 @@ export async function runProductionPreflight(
     cliPath = null;
   }
 
+  if (cliPath == null || !cliPath.startsWith("/")) {
+    return {
+      ok: false,
+      remediation: missingExecutableRemediation(adapter.name, command, resolution),
+      cliPath: null,
+      versionProbe: null,
+      promptBytes: limitCheck.measured,
+      adapterRequest,
+      role,
+    };
+  }
+
+  // Validate the resolved absolute path is runnable when an executability seam
+  // is available (production injects fsExecutable; tests may omit it).
+  if (typeof deps.preflight.fsExecutable === "function") {
+    let executable = false;
+    try {
+      executable = await deps.preflight.fsExecutable(cliPath);
+    } catch {
+      executable = false;
+    }
+    if (!executable) {
+      return {
+        ok: false,
+        remediation: missingExecutableRemediation(
+          adapter.name,
+          command,
+          resolution,
+          `[harness ${adapter.name}] resolved executable "${cliPath}" is missing or not executable. ` +
+            `Fix install permissions or PATH packing; the pipeline will not spawn a non-runnable path.`,
+        ),
+        cliPath,
+        versionProbe: null,
+        promptBytes: limitCheck.measured,
+        adapterRequest,
+        role,
+      };
+    }
+  }
+
   // 4. Once-per-run version probe (shared cache with fingerprint accounting).
   const versionDeps: CliVersionProbeDeps = deps.versionProbe ?? {
     exec: deps.preflight.exec,
     resolvePath,
   };
-  // Prefer probing the absolute path when known so fingerprint path matches.
-  const probeCommand = cliPath && cliPath.startsWith("/") ? cliPath : command;
+  // Prefer probing the absolute path so fingerprint path matches.
+  const probeCommand = cliPath;
   let versionProbe: CliVersionProbeResult = {
     cliVersion: null,
     cliPath,
@@ -285,20 +384,26 @@ export async function runProductionPreflight(
     if (!versionProbe.cliPath && cliPath) {
       versionProbe = { ...versionProbe, cliPath };
     } else if (versionProbe.cliPath) {
-      cliPath = versionProbe.cliPath;
+      // Only adopt probe path when it is absolute; never demote to relative.
+      if (versionProbe.cliPath.startsWith("/")) {
+        cliPath = versionProbe.cliPath;
+      } else {
+        versionProbe = { ...versionProbe, cliPath };
+      }
     }
   } catch {
-    // Version probe is fail-soft for version alone; readiness still checked below.
+    // Version probe is fail-soft for version alone; readiness already established.
   }
 
-  // 5. Adapter preflight with the exact resolved request (no ambient defaults).
+  // 5. Adapter preflight with the exact resolved request (incl. sandboxMode).
   let adapterResult: AdapterPreflightResult;
   try {
     adapterResult = await adapter.preflight(deps.preflight, adapterRequest);
   } catch (err) {
+    const raw =
+      err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
     const msg =
-      `[harness ${adapter.name}] production preflight threw: ` +
-      `${err instanceof Error ? err.message : String(err)}. ` +
+      `[harness ${adapter.name}] production preflight threw: ${raw}. ` +
       `This is a typed capability/readiness failure — the pipeline will not fall back to another harness.`;
     return {
       ok: false,
@@ -312,12 +417,7 @@ export async function runProductionPreflight(
   }
 
   if (!adapterResult.ok) {
-    const failure: ProductionPreflightFailureClass =
-      adapterResult.failure === "missing-cli"
-        ? cliPath == null && resolution === "path"
-          ? "missing-executable"
-          : "missing-cli"
-        : (adapterResult.failure ?? "missing-cli");
+    const failure: ProductionPreflightFailureClass = adapterResult.failure ?? "missing-cli";
     const detail =
       adapterResult.message ??
       `[harness ${adapter.name}] production preflight refused (${failure})`;
@@ -332,10 +432,6 @@ export async function runProductionPreflight(
     };
   }
 
-  // When PATH resolution is declared and we still have no absolute path and the
-  // version probe could not confirm readiness, fail closed for missing executable
-  // only if presence was not established by adapter preflight (ok above means
-  // presence was established — keep path null rather than inventing one).
   return {
     ok: true,
     cliPath,

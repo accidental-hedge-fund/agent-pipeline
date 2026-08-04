@@ -158,22 +158,31 @@ export function _peekCliVersionProbeForTests(command: string): CliVersionProbeRe
 }
 
 /**
- * Default resolvePath using `command -v` via the injectable exec seam.
+ * Default resolvePath using shell `command -v` via the injectable exec seam.
  * Returns null when resolution fails.
+ *
+ * Note: `command` is a shell builtin — `spawn("command", ["-v", name])` is
+ * ENOENT on Linux. Production and doctor use `sh -c` with `$1` so the name is
+ * never shell-interpolated (same pattern as doctor.ts binary checks).
  */
 export async function resolveCommandPath(
   command: string,
   deps: Pick<CliVersionProbeDeps, "exec">,
 ): Promise<string | null> {
-  if (command.startsWith("/")) return command;
+  const trimmed = command.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("/")) return trimmed;
+  // Relative path-like strings are not PATH bare commands.
+  if (trimmed.startsWith(".") || trimmed.includes("/")) return null;
   try {
-    const res = await deps.exec("command", ["-v", command]);
+    const res = await deps.exec("sh", ["-c", 'command -v -- "$1"', "resolve-path", trimmed]);
     if (!res.ok) return null;
     const line = res.stdout
       .split("\n")
       .map((l) => l.trim())
       .find((l) => l.length > 0);
-    return line && line.startsWith("/") ? line : line || null;
+    // Only absolute filesystem paths count as resolved readiness.
+    return line && line.startsWith("/") ? line : null;
   } catch {
     return null;
   }

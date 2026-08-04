@@ -140,6 +140,13 @@ export interface AdapterRequest {
    *  actually honor the request (rather than `buildInvocation` silently
    *  widening permissions when it can't). */
   sandbox?: boolean;
+  /**
+   * Resolved execution sandbox / tool-permission policy for this call (#607 / #636).
+   * Production preflight SHALL pass the same value that subsequent
+   * `buildInvocation` applies so adapters can refuse unsupported modes before
+   * spawn. When absent, adapters that consult ambient env keep prior behavior.
+   */
+  sandboxMode?: ExternalSandboxMode;
 }
 
 /** Full context handed to `buildInvocation`. */
@@ -151,12 +158,6 @@ export interface AdapterInvocationContext extends AdapterRequest {
   lean?: boolean;
   /** Additional env vars merged into the child process's environment. */
   env?: NodeJS.ProcessEnv;
-  /** Explicit execution sandbox mode for this invocation (#607). When
-   *  supplied, it alone decides the sandbox-selecting argument — consulted
-   *  only by the codex adapter today. When absent, the codex adapter falls
-   *  back to the ambient `PIPELINE_CODEX_NO_SANDBOX` environment variable,
-   *  preserving pre-#607 behavior for every caller that supplies no value. */
-  sandboxMode?: ExternalSandboxMode;
 }
 
 /** How a prompt reaches its CLI (#492 — MAX_ARG_STRLEN spawn failures on

@@ -137,7 +137,7 @@ function makeRecordingAdapter(opts: {
 // Exact resolved request for implementer + reviewer
 // ---------------------------------------------------------------------------
 
-test("production preflight: implementer and reviewer pass distinct exact model/effort/sandbox", async () => {
+test("production preflight: implementer and reviewer pass distinct exact model/effort/sandbox/sandboxMode", async () => {
   _resetRegistryForTests({ reseedBuiltins: true });
   _clearCliVersionProbeCacheForTests();
   const { adapter, calls } = makeRecordingAdapter({ name: "ext-exact-636" });
@@ -157,6 +157,7 @@ test("production preflight: implementer and reviewer pass distinct exact model/e
       model: "impl-model-x",
       effort: "high",
       sandbox: true,
+      sandboxMode: "managed",
     },
     deps,
   );
@@ -168,6 +169,7 @@ test("production preflight: implementer and reviewer pass distinct exact model/e
       model: "rev-model-y",
       effort: "low",
       sandbox: false,
+      sandboxMode: "external-bypass",
     },
     deps,
   );
@@ -175,8 +177,18 @@ test("production preflight: implementer and reviewer pass distinct exact model/e
   assert.equal(impl.ok, true);
   assert.equal(rev.ok, true);
   assert.equal(calls.length, 2);
-  assert.deepEqual(calls[0], { model: "impl-model-x", effort: "high", sandbox: true });
-  assert.deepEqual(calls[1], { model: "rev-model-y", effort: "low", sandbox: false });
+  assert.deepEqual(calls[0], {
+    model: "impl-model-x",
+    effort: "high",
+    sandbox: true,
+    sandboxMode: "managed",
+  });
+  assert.deepEqual(calls[1], {
+    model: "rev-model-y",
+    effort: "low",
+    sandbox: false,
+    sandboxMode: "external-bypass",
+  });
   assert.equal(impl.ok && impl.role, "implementer");
   assert.equal(rev.ok && rev.role, "reviewer");
   _resetRegistryForTests({ reseedBuiltins: true });
@@ -213,6 +225,7 @@ test("invoke(): production preflight receives exact resolved treatment for both 
     model: "m-impl",
     reasoningEffort: "xhigh",
     sandbox: true,
+    sandboxMode: "managed",
     preflightDeps: baseDeps,
   });
   const rev = await invoke("invoke-exact-636", tmpRoot, "p", {
@@ -221,14 +234,25 @@ test("invoke(): production preflight receives exact resolved treatment for both 
     model: "m-rev",
     reasoningEffort: "minimal",
     sandbox: false,
+    sandboxMode: "external-bypass",
     preflightDeps: baseDeps,
   });
 
   assert.equal(impl.preflight_failed, true);
   assert.equal(rev.preflight_failed, true);
   assert.equal(seen.length, 2);
-  assert.deepEqual(seen[0], { model: "m-impl", effort: "xhigh", sandbox: true });
-  assert.deepEqual(seen[1], { model: "m-rev", effort: "minimal", sandbox: false });
+  assert.deepEqual(seen[0], {
+    model: "m-impl",
+    effort: "xhigh",
+    sandbox: true,
+    sandboxMode: "managed",
+  });
+  assert.deepEqual(seen[1], {
+    model: "m-rev",
+    effort: "minimal",
+    sandbox: false,
+    sandboxMode: "external-bypass",
+  });
   // No spawn: failure is typed preflight, not spawn_error (auth class).
   assert.equal(impl.spawn_error ?? false, false);
   assert.equal(impl.preflight_class, "unauthenticated");
@@ -305,7 +329,7 @@ test("production preflight: unsupported model/effort/sandbox, oversize prompt, m
     assert.match(modelFail.remediation.message, /nope-model/);
   }
 
-  // Unsupported sandbox
+  // Unsupported sandbox boolean
   const sandboxAdapter = makeRecordingAdapter({
     name: "refuse-sandbox",
     sandboxSupported: false,
@@ -329,6 +353,31 @@ test("production preflight: unsupported model/effort/sandbox, oversize prompt, m
   if (!sandboxFail.ok) {
     assert.equal(sandboxFail.remediation.failure, "unsupported-setting");
     assert.match(sandboxFail.remediation.message, /sandbox/);
+  }
+
+  // Unsupported sandboxMode (distinct tool/permission policy value)
+  const sandboxModeAdapter = makeRecordingAdapter({
+    name: "refuse-sandbox-mode",
+    preflight: async (_d, req) => {
+      if (req.sandboxMode === "external-bypass") {
+        return {
+          ok: false,
+          failure: "unsupported-setting",
+          message: 'refuse-sandbox-mode does not support sandboxMode "external-bypass"',
+        };
+      }
+      return { ok: true };
+    },
+  }).adapter;
+  const sandboxModeFail = await runProductionPreflight(
+    sandboxModeAdapter,
+    { prompt: "p", sandboxMode: "external-bypass" },
+    deps,
+  );
+  assert.equal(sandboxModeFail.ok, false);
+  if (!sandboxModeFail.ok) {
+    assert.equal(sandboxModeFail.remediation.failure, "unsupported-setting");
+    assert.match(sandboxModeFail.remediation.message, /external-bypass/);
   }
 
   // Oversize prompt (#779)
@@ -524,6 +573,146 @@ test("resolveAbsoluteExecutable: success and failure via injectable deps", async
 
   const already = await resolveAbsoluteExecutable("/usr/bin/codex", "absolute", {});
   assert.equal(already, "/usr/bin/codex");
+
+  // Relative paths are never treated as resolved absolute executables.
+  const relative = await resolveAbsoluteExecutable("./local/bin/claude", "path", {
+    resolvePath: async () => "./local/bin/claude",
+  });
+  assert.equal(relative, null);
+
+  const relativeAbsMode = await resolveAbsoluteExecutable("relative-cmd", "absolute", {});
+  assert.equal(relativeAbsMode, null);
+
+  const nonAbsResolved = await resolveAbsoluteExecutable("claude", "path", {
+    resolvePath: async () => "not/an/absolute/path",
+  });
+  assert.equal(nonAbsResolved, null);
+});
+
+test("production preflight: unresolved PATH executable fails closed before adapter.preflight", async () => {
+  let adapterPreflightCalls = 0;
+  const adapter = makeRecordingAdapter({
+    name: "path-unresolved-636",
+    preflight: async () => {
+      adapterPreflightCalls++;
+      // Would succeed if consulted — production must not rely on this alone.
+      return { ok: true, authState: "unknown" };
+    },
+  }).adapter;
+
+  const result = await runProductionPreflight(
+    adapter,
+    { prompt: "p", model: "m" },
+    defaultProductionPreflightDeps({
+      exec: async () => ({ ok: true, stdout: "1.0\n", stderr: "" }),
+      execCheck: async () => true,
+      resolvePath: async () => null,
+    }),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.remediation.failure, "missing-executable");
+    assert.equal(result.remediation.reasonCode, "environment-auth");
+    assert.match(result.remediation.message, /path-unresolved-636|absolute executable/i);
+  }
+  assert.equal(adapterPreflightCalls, 0, "adapter.preflight must not run when executable unresolved");
+});
+
+test("production preflight: non-executable absolute path fails closed via fsExecutable", async () => {
+  let adapterPreflightCalls = 0;
+  const adapter = makeRecordingAdapter({
+    name: "not-exec-636",
+    preflight: async () => {
+      adapterPreflightCalls++;
+      return { ok: true };
+    },
+  }).adapter;
+  // Force absolute resolution with a declared absolute command.
+  const absAdapter: typeof adapter = {
+    ...adapter,
+    declaration: {
+      ...adapter.declaration,
+      executable: { command: "/opt/not-exec-636", resolution: "absolute" },
+    },
+  };
+
+  const result = await runProductionPreflight(
+    absAdapter,
+    { prompt: "p" },
+    defaultProductionPreflightDeps({
+      exec: async () => ({ ok: true, stdout: "1.0\n", stderr: "" }),
+      execCheck: async () => true,
+      fsExecutable: async () => false,
+      resolvePath: async () => "/opt/not-exec-636",
+    }),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.remediation.failure, "missing-executable");
+    assert.match(result.remediation.message, /not executable|missing/i);
+  }
+  assert.equal(adapterPreflightCalls, 0);
+});
+
+test("invoke(): registered adapter diagnostics redact credentials and stay bounded", async () => {
+  _resetRegistryForTests({ reseedBuiltins: true });
+  _clearCliVersionProbeCacheForTests();
+  const secretToken = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+  const bearer = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig";
+  registerAdapter(
+    makeRecordingAdapter({
+      name: "ext-secret-diag-636",
+      preflight: async () => ({
+        ok: false,
+        failure: "unauthenticated",
+        message:
+          `auth failed for ext-secret-diag-636: ${bearer} api_key=${secretToken} ` +
+          `https://api.example.com/login?token=super-secret-token-value status=401`,
+      }),
+    }).adapter,
+  );
+
+  const result = await invoke("ext-secret-diag-636", tmpRoot, "prompt", {
+    stream: false,
+    preflightDeps: defaultProductionPreflightDeps({
+      exec: async () => ({ ok: true, stdout: "1.0\n", stderr: "" }),
+      execCheck: async () => true,
+      resolvePath: async () => "/opt/ext-secret-diag-636",
+    }),
+  });
+  assert.equal(result.success, false);
+  assert.equal(result.preflight_failed, true);
+  assert.equal(result.preflight_class, "unauthenticated");
+  assert.match(result.stderr, /ext-secret-diag-636/);
+  assert.doesNotMatch(result.stderr, new RegExp(secretToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(result.stderr, /Bearer\s+eyJ/);
+  assert.doesNotMatch(result.stderr, /super-secret-token-value/);
+  assert.match(result.stderr, /REDACTED/i);
+
+  // Thrown path also redacts.
+  registerAdapter(
+    makeRecordingAdapter({
+      name: "ext-throw-secret-636",
+      preflight: async () => {
+        throw new Error(`probe stderr: Authorization: ${bearer} key=${secretToken}`);
+      },
+    }).adapter,
+  );
+  const thrown = await invoke("ext-throw-secret-636", tmpRoot, "prompt", {
+    stream: false,
+    preflightDeps: defaultProductionPreflightDeps({
+      exec: async () => ({ ok: true, stdout: "1.0\n", stderr: "" }),
+      execCheck: async () => true,
+      resolvePath: async () => "/opt/ext-throw-secret-636",
+    }),
+  });
+  assert.equal(thrown.preflight_failed, true);
+  assert.doesNotMatch(thrown.stderr, new RegExp(secretToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(thrown.stderr, /Bearer\s+eyJ/);
+  assert.match(thrown.stderr, /REDACTED|threw/i);
+
+  _resetRegistryForTests({ reseedBuiltins: true });
+  _clearCliVersionProbeCacheForTests();
 });
 
 test("production preflight + fingerprint: shared version probe cache is warm (no second exec)", async () => {

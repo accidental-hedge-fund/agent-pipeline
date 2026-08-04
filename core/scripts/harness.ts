@@ -412,7 +412,8 @@ export async function invoke(
       effort: opts.reasoningEffort,
       sandbox: opts.sandbox,
       role,
-      sandboxMode: opts.sandboxMode ?? null,
+      // Exact resolved sandbox/tool policy that buildInvocation will apply (#636).
+      ...(opts.sandboxMode !== undefined ? { sandboxMode: opts.sandboxMode } : {}),
     },
     preflightDeps,
   );
