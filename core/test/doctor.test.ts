@@ -485,6 +485,87 @@ test("check harness prompt-bytes — fails when assigned argv adapter declares u
   _resetRegistryForTests();
 });
 
+test("check harness prompt-bytes — fails when assigned stdin adapter declares finite maxPromptBytes above argv ceiling (#779)", async () => {
+  // Review 2: buildAdapterDeclaration used to derive sizeLimit "max-arg-strlen"
+  // for finite maxPromptBytes, and coherence only rejected finites ≤ MAX_ARGV —
+  // so stdin + 1_000_000 passed doctor while dispatch still enforced the cap.
+  const {
+    registerAdapter,
+    _resetRegistryForTests,
+    buildAdapterDeclaration,
+  } = await import("../scripts/harness-adapters/index.ts");
+  _resetRegistryForTests();
+  const caps = {
+    model: false as const,
+    effort: false as const,
+    sandbox: false as const,
+    workingDir: "cwd" as const,
+    telemetry: "none" as const,
+    maxPromptBytes: 1_000_000 as const,
+  };
+  registerAdapter({
+    name: "stdin-finite-cli",
+    capabilities: caps,
+    declaration: buildAdapterDeclaration({
+      roles: ["implementer", "reviewer"],
+      command: "stdin-finite-cli",
+      capabilities: caps,
+      promptDelivery: "stdin",
+      origin: "extension",
+      authProbe: "none",
+      versionProbe: "none",
+    }),
+    buildInvocation(ctx) {
+      return {
+        cmd: "stdin-finite-cli",
+        args: [],
+        cwd: ctx.worktreeDir,
+        promptDelivery: "stdin",
+        stdinPayload: ctx.prompt,
+      };
+    },
+    async preflight() {
+      return { ok: true, authState: "unknown" };
+    },
+    parseTelemetry() {
+      return {
+        text: null,
+        costUsd: null,
+        usage: null,
+        resolvedModel: null,
+        throttled: null,
+      };
+    },
+    describeTreatment(req, _inv, probe) {
+      return {
+        adapter: "stdin-finite-cli",
+        cliVersion: probe.cliVersion,
+        providerAuthClass: "unknown",
+        requestedModel: req.model ?? null,
+        resolvedModel: null,
+        requestedEffort: req.effort ?? null,
+        resolvedEffort: null,
+        nativeFlags: [],
+        fallback: null,
+        throttled: null,
+        origin: "extension",
+      };
+    },
+    async runtimeSmoke() {
+      return { ok: true };
+    },
+  });
+  const cfg = makeConfig({
+    harnesses: { implementer: "stdin-finite-cli", reviewer: "stdin-finite-cli" },
+  });
+  const r = await getCheck(cfg, "harness:stdin-finite-cli:prompt-bytes").run(fakeDeps());
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /1000000|incoherent|stdin|unlimited/i);
+  assert.ok(r.remediation);
+  assert.match(r.remediation!, /stdin-finite-cli|maxPromptBytes|coherent|unlimited/i);
+  _resetRegistryForTests();
+});
+
 test("check harness:codex — uses --version probe, not which", async () => {
   const calls: Array<{ file: string; args: string[] }> = [];
   await getCheck(makeConfig(), "harness:codex").run(

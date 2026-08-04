@@ -460,6 +460,33 @@ test("conformance kit: requires maxPromptBytes and rejects argv+unlimited (#779)
     ),
     JSON.stringify(unspawnReport.failures),
   );
+
+  // stdin + finite maxPromptBytes above argv ceiling must fail coherence
+  // (#779 review 2) — previously only MAX_ARG_STRLEN-class finites were rejected.
+  const stdinFiniteOver = makeMinimalExtension("stdin-finite-over");
+  (stdinFiniteOver.declaration.prompt as { delivery: string }).delivery = "stdin";
+  (stdinFiniteOver.declaration.prompt as { sizeLimit: string }).sizeLimit = "max-arg-strlen";
+  (stdinFiniteOver.capabilities as { maxPromptBytes: number }).maxPromptBytes = 1_000_000;
+  const stdinOverReport = checkStructure(stdinFiniteOver);
+  assert.equal(stdinOverReport.ok, false);
+  assert.ok(
+    stdinOverReport.failures.some((f) =>
+      /incoherent|stdin|unlimited|1000000/.test(f.message),
+    ),
+    JSON.stringify(stdinOverReport.failures),
+  );
+
+  // file + finite maxPromptBytes (any magnitude) must also fail.
+  const fileFinite = makeMinimalExtension("file-finite");
+  (fileFinite.declaration.prompt as { delivery: string }).delivery = "file";
+  (fileFinite.declaration.prompt as { sizeLimit: string }).sizeLimit = "max-arg-strlen";
+  (fileFinite.capabilities as { maxPromptBytes: number }).maxPromptBytes = 1_000_000;
+  const fileReport = checkStructure(fileFinite);
+  assert.equal(fileReport.ok, false);
+  assert.ok(
+    fileReport.failures.some((f) => /incoherent|file|unlimited|1000000/.test(f.message)),
+    JSON.stringify(fileReport.failures),
+  );
 });
 
 test("builtins declare expected maxPromptBytes (#779)", () => {

@@ -19,8 +19,8 @@ a single source of truth so the coarse size-limit policy and `maxPromptBytes` ca
 Because the engine strips types rather than checking them, the shared runtime conformance kit SHALL
 fail any registered adapter that omits `maxPromptBytes` or that declares an incoherent channel and
 limit pair (for example, positional/`argv` delivery paired with unlimited, or stdin/file delivery
-paired with a finite `MAX_ARG_STRLEN`-class ceiling as if the prompt were still a single argv
-element).
+paired with any finite `maxPromptBytes` — stdin/file channels SHALL declare unlimited regardless
+of magnitude).
 
 #### Scenario: Conformance requires maxPromptBytes on every registered adapter
 
@@ -45,6 +45,13 @@ element).
 - **WHEN** an adapter declares prompt delivery via standard input or a prompt file the CLI reads
 - **THEN** its `maxPromptBytes` SHALL be unlimited
 - **AND** its declaration prompt size/limit policy SHALL be coherent with unlimited
+
+#### Scenario: Conformance rejects finite maxPromptBytes on stdin or file
+
+- **WHEN** an adapter declares `stdin` or `file` prompt delivery and a finite `maxPromptBytes`
+  (including a value greater than the harness spawnable argv ceiling)
+- **THEN** the shared conformance kit SHALL fail
+- **AND** the failure SHALL identify that stdin/file channels must declare unlimited
 
 #### Scenario: Built-in adapters declare expected limits
 

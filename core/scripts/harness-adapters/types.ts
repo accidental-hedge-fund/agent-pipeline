@@ -250,14 +250,14 @@ export function promptLimitCoherenceFailure(
       `declare at most ${MAX_ARGV_PROMPT_BYTES} or use stdin/file delivery`
     );
   }
-  if (
-    (delivery === "stdin" || delivery === "file") &&
-    isFiniteMaxPromptBytes(maxPromptBytes) &&
-    maxPromptBytes <= MAX_ARGV_PROMPT_BYTES
-  ) {
-    // Finite MAX_ARG_STRLEN-class ceiling on a non-argv channel pretends the
-    // prompt is still a single argv element — refuse as incoherent.
-    return `incoherent pair: prompt delivery "${delivery}" with finite maxPromptBytes ${maxPromptBytes} (MAX_ARG_STRLEN-class); stdin/file channels must declare unlimited`;
+  // Stdin/file channels have no OS single-argv ceiling; a finite maxPromptBytes
+  // (any magnitude, including above MAX_ARGV_PROMPT_BYTES) is always incoherent
+  // and must declare unlimited so dispatch cannot impose an artificial cap.
+  if ((delivery === "stdin" || delivery === "file") && isFiniteMaxPromptBytes(maxPromptBytes)) {
+    return (
+      `incoherent pair: prompt delivery "${delivery}" with finite maxPromptBytes ${maxPromptBytes}; ` +
+      `stdin/file channels must declare unlimited`
+    );
   }
   if (sizeLimit !== undefined) {
     const expected = sizeLimitFromMaxPromptBytes(maxPromptBytes);

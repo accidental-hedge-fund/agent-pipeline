@@ -1044,6 +1044,26 @@ test("promptLimitCoherenceFailure: rejects argv maxPromptBytes above MAX_ARGV_PR
   assert.match(atStrlen!, /incoherent|exceeds|spawnable/i);
 });
 
+test("promptLimitCoherenceFailure: rejects any finite maxPromptBytes on stdin/file (#779)", async () => {
+  const { promptLimitCoherenceFailure, MAX_ARGV_PROMPT_BYTES } = await import(
+    "../scripts/harness-adapters/types.ts"
+  );
+  assert.equal(promptLimitCoherenceFailure("unlimited", "stdin"), null);
+  assert.equal(promptLimitCoherenceFailure("unlimited", "file"), null);
+  // Below/at argv ceiling — previously rejected; still must fail.
+  for (const delivery of ["stdin", "file"] as const) {
+    const atOrBelow = promptLimitCoherenceFailure(MAX_ARGV_PROMPT_BYTES, delivery);
+    assert.ok(atOrBelow, `${delivery} + finite at argv ceiling must fail`);
+    assert.match(atOrBelow!, /incoherent|stdin\/file|unlimited/i);
+  }
+  // Above argv ceiling — previously slipped through coherence (#779 review 2).
+  for (const delivery of ["stdin", "file"] as const) {
+    const above = promptLimitCoherenceFailure(1_000_000, delivery);
+    assert.ok(above, `${delivery} + finite above argv ceiling must fail`);
+    assert.match(above!, /incoherent|stdin\/file|unlimited|1000000/i);
+  }
+});
+
 test("invoke(): argv adapter advertising unspawnable maxPromptBytes is refused as typed capability failure for mid-gap prompt (#779)", async () => {
   // Regression: delivery argv + maxPromptBytes 1_000_000 used to pass the
   // typed preflight for a ~200 KiB prompt and only fail later as oversize_argv.

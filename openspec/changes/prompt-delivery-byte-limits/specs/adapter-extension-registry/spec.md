@@ -12,8 +12,8 @@ The shared conformance kit SHALL reject an extension adapter that:
 
 - omits `maxPromptBytes`,
 - declares prompt delivery and size/limit policy that disagree with `maxPromptBytes`,
-- claims unlimited on a positional/`argv` channel or a finite `MAX_ARG_STRLEN`-class ceiling on a
-  stdin/file channel without matching declaration fields, or
+- claims unlimited on a positional/`argv` channel or any finite `maxPromptBytes` on a
+  stdin/file channel (stdin/file SHALL declare unlimited, regardless of magnitude), or
 - claims a finite `maxPromptBytes` on a positional/`argv` channel greater than the harness
   spawnable argv ceiling (`MAX_ARGV_PROMPT_BYTES` / `MAX_ARG_STRLEN`-aware bound used by the
   residual oversize-argv guard).
@@ -40,6 +40,13 @@ limit classes so extension authors do not need a second, conflicting size field.
   greater than the harness spawnable argv ceiling
 - **THEN** the shared conformance kit SHALL fail
 - **AND** the failure SHALL identify the unspawnable limit
+
+#### Scenario: Conformance rejects finite maxPromptBytes on stdin or file delivery
+
+- **WHEN** an extension adapter declares `stdin` or `file` prompt delivery and a finite
+  `maxPromptBytes` (including a value greater than the harness spawnable argv ceiling)
+- **THEN** the shared conformance kit SHALL fail
+- **AND** the failure SHALL identify that stdin/file channels must declare unlimited
 
 #### Scenario: Compatibility custom-reviewer path declares a limit
 
