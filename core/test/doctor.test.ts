@@ -280,13 +280,20 @@ test("buildPreflightChecks — emits one check per distinct configured harness b
   const ids = buildPreflightChecks(makeConfig(), FAKE_VERSION, FAKE_INSTALL_ROOT).map((c) => c.id);
   assert.ok(ids.includes("harness:codex"));
   assert.ok(ids.includes("harness:claude"));
+  // #779: each assigned harness also gets a prompt-bytes coherence check
+  assert.ok(ids.includes("harness:codex:prompt-bytes"));
+  assert.ok(ids.includes("harness:claude:prompt-bytes"));
 });
 
 test("buildPreflightChecks — de-dupes when implementer and reviewer share a binary", () => {
   const cfg = makeConfig({ harnesses: { implementer: "claude", reviewer: "claude" } });
-  const harnessChecks = buildPreflightChecks(cfg, FAKE_VERSION, FAKE_INSTALL_ROOT).filter((c) => c.id.startsWith("harness:"));
-  assert.equal(harnessChecks.length, 1);
-  assert.equal(harnessChecks[0].id, "harness:claude");
+  // Availability + prompt-bytes for the single distinct binary (#779).
+  const harnessChecks = buildPreflightChecks(cfg, FAKE_VERSION, FAKE_INSTALL_ROOT).filter(
+    (c) => c.id === "harness:claude" || c.id === "harness:claude:prompt-bytes",
+  );
+  assert.equal(harnessChecks.length, 2);
+  assert.ok(harnessChecks.some((c) => c.id === "harness:claude"));
+  assert.ok(harnessChecks.some((c) => c.id === "harness:claude:prompt-bytes"));
 });
 
 test("check harness:codex — passes when present; fails naming the binary when missing", async () => {
@@ -295,6 +302,268 @@ test("check harness:codex — passes when present; fails naming the binary when 
   const failR = await getCheck(makeConfig(), "harness:codex").run(fakeDeps({ execCheck: () => false }));
   assertFailWithRemediation(failR);
   assert.match(failR.remediation!, /codex/);
+});
+
+// ---------------------------------------------------------------------------
+// #779 — prompt-delivery byte limit doctor check
+// ---------------------------------------------------------------------------
+
+test("check harness:claude:prompt-bytes — reports unlimited stdin delivery (#779)", async () => {
+  const r = await getCheck(makeConfig(), "harness:claude:prompt-bytes").run(fakeDeps());
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /delivery=stdin/);
+  assert.match(r.detail, /maxPromptBytes=unlimited/);
+});
+
+test("check harness prompt-bytes — finite argv adapter includes large-prompt remediation (#779)", async () => {
+  const cfg = makeConfig({ harnesses: { implementer: "pi", reviewer: "pi" } });
+  const r = await getCheck(cfg, "harness:pi:prompt-bytes").run(fakeDeps());
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /delivery=argv/);
+  assert.match(r.detail, /maxPromptBytes=131071/);
+  assert.match(r.detail, /128 KiB|per-argument/i);
+  assert.ok(r.remediation, "finite argv must carry remediation text");
+  assert.match(r.remediation!, /128 KiB|per-argument/i);
+});
+
+test("check harness prompt-bytes — fails when assigned adapter declares unknown (#779)", async () => {
+  const {
+    registerAdapter,
+    _resetRegistryForTests,
+    buildAdapterDeclaration,
+  } = await import("../scripts/harness-adapters/index.ts");
+  _resetRegistryForTests();
+  const caps = {
+    model: false as const,
+    effort: false as const,
+    sandbox: false as const,
+    workingDir: "cwd" as const,
+    telemetry: "none" as const,
+    maxPromptBytes: "unknown" as const,
+  };
+  registerAdapter({
+    name: "unknown-limit-cli",
+    capabilities: caps,
+    declaration: buildAdapterDeclaration({
+      roles: ["implementer", "reviewer"],
+      command: "unknown-limit-cli",
+      capabilities: caps,
+      promptDelivery: "stdin",
+      origin: "extension",
+      authProbe: "none",
+      versionProbe: "none",
+    }),
+    buildInvocation(ctx) {
+      return {
+        cmd: "unknown-limit-cli",
+        args: [],
+        cwd: ctx.worktreeDir,
+        promptDelivery: "stdin",
+        stdinPayload: ctx.prompt,
+      };
+    },
+    async preflight() {
+      return { ok: true, authState: "unknown" };
+    },
+    parseTelemetry() {
+      return {
+        text: null,
+        costUsd: null,
+        usage: null,
+        resolvedModel: null,
+        throttled: null,
+      };
+    },
+    describeTreatment(req, _inv, probe) {
+      return {
+        adapter: "unknown-limit-cli",
+        cliVersion: probe.cliVersion,
+        providerAuthClass: "unknown",
+        requestedModel: req.model ?? null,
+        resolvedModel: null,
+        requestedEffort: req.effort ?? null,
+        resolvedEffort: null,
+        nativeFlags: [],
+        fallback: null,
+        throttled: null,
+        origin: "extension",
+      };
+    },
+    async runtimeSmoke() {
+      return { ok: true };
+    },
+  });
+  const cfg = makeConfig({
+    harnesses: { implementer: "unknown-limit-cli", reviewer: "unknown-limit-cli" },
+  });
+  const r = await getCheck(cfg, "harness:unknown-limit-cli:prompt-bytes").run(fakeDeps());
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /unknown/);
+  assert.ok(r.remediation);
+  assert.match(r.remediation!, /unknown-limit-cli|finite|unlimited/i);
+  _resetRegistryForTests();
+});
+
+test("check harness prompt-bytes — fails when assigned argv adapter declares unspawnable finite maxPromptBytes (#779)", async () => {
+  const {
+    registerAdapter,
+    _resetRegistryForTests,
+    buildAdapterDeclaration,
+    MAX_ARGV_PROMPT_BYTES,
+  } = await import("../scripts/harness-adapters/index.ts");
+  _resetRegistryForTests();
+  const caps = {
+    model: false as const,
+    effort: false as const,
+    sandbox: false as const,
+    workingDir: "cwd" as const,
+    telemetry: "none" as const,
+    // Above the OS argv spawn ceiling — must fail doctor coherence (#779).
+    maxPromptBytes: 1_000_000 as const,
+  };
+  registerAdapter({
+    name: "argv-overclaim-cli",
+    capabilities: caps,
+    declaration: buildAdapterDeclaration({
+      roles: ["implementer", "reviewer"],
+      command: "argv-overclaim-cli",
+      capabilities: caps,
+      promptDelivery: "argv",
+      origin: "extension",
+      authProbe: "none",
+      versionProbe: "none",
+    }),
+    buildInvocation(ctx) {
+      return {
+        cmd: "argv-overclaim-cli",
+        args: [ctx.prompt],
+        cwd: ctx.worktreeDir,
+        promptDelivery: "argv",
+      };
+    },
+    async preflight() {
+      return { ok: true, authState: "unknown" };
+    },
+    parseTelemetry() {
+      return {
+        text: null,
+        costUsd: null,
+        usage: null,
+        resolvedModel: null,
+        throttled: null,
+      };
+    },
+    describeTreatment(req, _inv, probe) {
+      return {
+        adapter: "argv-overclaim-cli",
+        cliVersion: probe.cliVersion,
+        providerAuthClass: "unknown",
+        requestedModel: req.model ?? null,
+        resolvedModel: null,
+        requestedEffort: req.effort ?? null,
+        resolvedEffort: null,
+        nativeFlags: [],
+        fallback: null,
+        throttled: null,
+        origin: "extension",
+      };
+    },
+    async runtimeSmoke() {
+      return { ok: true };
+    },
+  });
+  const cfg = makeConfig({
+    harnesses: { implementer: "argv-overclaim-cli", reviewer: "argv-overclaim-cli" },
+  });
+  const r = await getCheck(cfg, "harness:argv-overclaim-cli:prompt-bytes").run(fakeDeps());
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /1000000|incoherent|exceeds|spawnable/i);
+  assert.ok(r.remediation);
+  assert.match(r.remediation!, /argv-overclaim-cli|maxPromptBytes|coherent/i);
+  // Ceiling constant stays available for the message / remediation path.
+  assert.equal(typeof MAX_ARGV_PROMPT_BYTES, "number");
+  _resetRegistryForTests();
+});
+
+test("check harness prompt-bytes — fails when assigned stdin adapter declares finite maxPromptBytes above argv ceiling (#779)", async () => {
+  // Review 2: buildAdapterDeclaration used to derive sizeLimit "max-arg-strlen"
+  // for finite maxPromptBytes, and coherence only rejected finites ≤ MAX_ARGV —
+  // so stdin + 1_000_000 passed doctor while dispatch still enforced the cap.
+  const {
+    registerAdapter,
+    _resetRegistryForTests,
+    buildAdapterDeclaration,
+  } = await import("../scripts/harness-adapters/index.ts");
+  _resetRegistryForTests();
+  const caps = {
+    model: false as const,
+    effort: false as const,
+    sandbox: false as const,
+    workingDir: "cwd" as const,
+    telemetry: "none" as const,
+    maxPromptBytes: 1_000_000 as const,
+  };
+  registerAdapter({
+    name: "stdin-finite-cli",
+    capabilities: caps,
+    declaration: buildAdapterDeclaration({
+      roles: ["implementer", "reviewer"],
+      command: "stdin-finite-cli",
+      capabilities: caps,
+      promptDelivery: "stdin",
+      origin: "extension",
+      authProbe: "none",
+      versionProbe: "none",
+    }),
+    buildInvocation(ctx) {
+      return {
+        cmd: "stdin-finite-cli",
+        args: [],
+        cwd: ctx.worktreeDir,
+        promptDelivery: "stdin",
+        stdinPayload: ctx.prompt,
+      };
+    },
+    async preflight() {
+      return { ok: true, authState: "unknown" };
+    },
+    parseTelemetry() {
+      return {
+        text: null,
+        costUsd: null,
+        usage: null,
+        resolvedModel: null,
+        throttled: null,
+      };
+    },
+    describeTreatment(req, _inv, probe) {
+      return {
+        adapter: "stdin-finite-cli",
+        cliVersion: probe.cliVersion,
+        providerAuthClass: "unknown",
+        requestedModel: req.model ?? null,
+        resolvedModel: null,
+        requestedEffort: req.effort ?? null,
+        resolvedEffort: null,
+        nativeFlags: [],
+        fallback: null,
+        throttled: null,
+        origin: "extension",
+      };
+    },
+    async runtimeSmoke() {
+      return { ok: true };
+    },
+  });
+  const cfg = makeConfig({
+    harnesses: { implementer: "stdin-finite-cli", reviewer: "stdin-finite-cli" },
+  });
+  const r = await getCheck(cfg, "harness:stdin-finite-cli:prompt-bytes").run(fakeDeps());
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /1000000|incoherent|stdin|unlimited/i);
+  assert.ok(r.remediation);
+  assert.match(r.remediation!, /stdin-finite-cli|maxPromptBytes|coherent|unlimited/i);
+  _resetRegistryForTests();
 });
 
 test("check harness:codex — uses --version probe, not which", async () => {

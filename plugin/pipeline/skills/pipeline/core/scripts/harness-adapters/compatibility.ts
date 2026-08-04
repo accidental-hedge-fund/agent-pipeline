@@ -11,6 +11,7 @@
 
 import {
   EMPTY_TELEMETRY,
+  MAX_ARGV_PROMPT_BYTES,
   buildAdapterDeclaration,
   type AdapterInvocation,
   type AdapterInvocationContext,
@@ -86,12 +87,15 @@ export function materializeCompatibilityAdapter(
   const promptDelivery: PromptDeliveryChannel = opts.promptDelivery === "stdin" ? "stdin" : "argv";
   // Open model/effort: retain configured review_harness object-form settings
   // without inventing a closed catalog or refusing at preflight (#783 review).
+  // #779: default argv → finite MAX_ARGV_PROMPT_BYTES; stdin → unlimited.
   const capabilities = {
     model: true,
     effort: true,
     sandbox: false,
     workingDir: "cwd" as const,
     telemetry: "none" as const,
+    maxPromptBytes:
+      promptDelivery === "stdin" ? ("unlimited" as const) : MAX_ARGV_PROMPT_BYTES,
   };
   const declaration = buildAdapterDeclaration({
     roles: ["reviewer"],

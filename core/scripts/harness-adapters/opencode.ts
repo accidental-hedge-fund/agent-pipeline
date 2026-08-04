@@ -18,16 +18,17 @@
 // passed — the default is unattended-unsafe for a headless pipeline run (it
 // can block on a permission prompt with no TTY to answer it).
 //
-// #492: `opencode run --help` (re-read at implementation time — golden rule 5)
-// documents no stdin or prompt-file channel for the message positional; `-f`
-// attaches a file alongside the message, it does not replace it. This adapter
-// therefore declares `promptDelivery: "argv"` explicitly rather than being
-// assumed to support another channel — an oversize prompt on this adapter is
-// refused by the pre-spawn guard in `runCapped` rather than silently
-// truncated or guessed at.
+// #492 / #779: re-verified 2026-08-04 (golden rule 5). `opencode run --help`
+// still documents no message-replacing stdin or prompt-file channel for the
+// message positional; `-f` attaches a file *alongside* the message and does
+// not replace it. This adapter therefore keeps `promptDelivery: "argv"` and
+// a finite `maxPromptBytes` (MAX_ARGV_PROMPT_BYTES). Oversize prompts are
+// refused at invoke preflight (#779) and residual-guarded by `runCapped`
+// (#492) — never silently truncated or guessed at.
 
 import {
   EMPTY_TELEMETRY,
+  MAX_ARGV_PROMPT_BYTES,
   buildAdapterDeclaration,
   defaultRuntimeSmoke,
   type AdapterCapabilities,
@@ -53,6 +54,8 @@ const CAPABILITIES: AdapterCapabilities = {
   sandbox: false,
   workingDir: "flag",
   telemetry: "none",
+  // argv delivery — finite limit aligned with #492 runCapped (>= MAX_ARG_STRLEN refuses).
+  maxPromptBytes: MAX_ARGV_PROMPT_BYTES,
 };
 
 export const opencodeAdapter: HarnessAdapter = {

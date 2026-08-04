@@ -18,7 +18,12 @@ import type {
   HarnessAdapter,
   HarnessTreatment,
 } from "./types.ts";
-import { ADAPTER_ROLES, EMPTY_TELEMETRY } from "./types.ts";
+import {
+  ADAPTER_ROLES,
+  EMPTY_TELEMETRY,
+  isFiniteMaxPromptBytes,
+  promptLimitCoherenceFailure,
+} from "./types.ts";
 
 export interface ConformanceFailure {
   adapter: string;
@@ -187,6 +192,34 @@ export function checkStructure(adapter: HarnessAdapter): ConformanceReport {
     }
     // Capability / declaration consistency
     if (adapter.capabilities) {
+      // #779: maxPromptBytes is required on every adapter.
+      if (adapter.capabilities.maxPromptBytes === undefined) {
+        failures.push(
+          fail(name, "capabilities.maxPromptBytes", `missing required field "maxPromptBytes"`),
+        );
+      } else {
+        const coherence = promptLimitCoherenceFailure(
+          adapter.capabilities.maxPromptBytes,
+          decl.prompt?.delivery,
+          decl.prompt?.sizeLimit,
+        );
+        if (coherence) {
+          failures.push(fail(name, "capabilities.maxPromptBytes", coherence));
+        }
+        // argv requires a finite positive limit (not unknown/unlimited).
+        if (
+          decl.prompt?.delivery === "argv" &&
+          !isFiniteMaxPromptBytes(adapter.capabilities.maxPromptBytes)
+        ) {
+          failures.push(
+            fail(
+              name,
+              "capabilities.maxPromptBytes",
+              `argv prompt delivery requires a finite positive maxPromptBytes (got ${JSON.stringify(adapter.capabilities.maxPromptBytes)})`,
+            ),
+          );
+        }
+      }
       if (decl.model?.supported !== adapter.capabilities.model) {
         failures.push(
           fail(
@@ -232,6 +265,8 @@ export function checkStructure(adapter: HarnessAdapter): ConformanceReport {
           ),
         );
       }
+    } else {
+      failures.push(fail(name, "capabilities", `missing required member "capabilities"`));
     }
   }
 

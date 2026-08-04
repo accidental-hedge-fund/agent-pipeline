@@ -104,6 +104,8 @@ const CAPABILITIES: AdapterCapabilities = {
   sandbox: false,
   workingDir: "flag",
   telemetry: "jsonl",
+  // stdin delivery — no OS per-argument ceiling on the prompt payload (#779).
+  maxPromptBytes: "unlimited",
 };
 
 export const codexAdapter: HarnessAdapter = {

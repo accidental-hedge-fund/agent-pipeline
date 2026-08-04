@@ -15,13 +15,15 @@
 // `-a`/`--approve` is always passed (unattended headless run, no TTY to
 // answer a trust prompt).
 //
-// #492: `pi --help` (re-read at implementation time — golden rule 5) documents
-// no stdin or prompt-file channel for the message positional; `@file`
-// arguments attach file CONTENT alongside a message, they do not replace it.
-// This adapter therefore declares `promptDelivery: "argv"` explicitly rather
-// than being assumed to support another channel — an oversize prompt on this
-// adapter is refused by the pre-spawn guard in `runCapped` rather than
-// silently truncated or guessed at.
+// #492 / #779: re-verified 2026-08-04 (golden rule 5). Headless print mode
+// (`pi -p <PROMPT>`) still has no message-replacing stdin or prompt-file
+// channel; `@file` attaches file CONTENT *alongside* a message and does not
+// replace the positional. `pi --mode rpc` is a separate JSON-line protocol
+// over stdin/stdout (RPC commands, not a drop-in replacement for the `-p`
+// message). This adapter therefore keeps `promptDelivery: "argv"` and a
+// finite `maxPromptBytes` (MAX_ARGV_PROMPT_BYTES). Oversize prompts are
+// refused at invoke preflight (#779) and residual-guarded by `runCapped`
+// (#492) — never silently truncated or guessed at.
 //
 // `pi --list-models` is pi's lightweight authenticated-only probe (verified
 // live against the current CLI, review-2 finding 73d2e88a): with no login
@@ -35,6 +37,7 @@
 
 import {
   EMPTY_TELEMETRY,
+  MAX_ARGV_PROMPT_BYTES,
   buildAdapterDeclaration,
   defaultRuntimeSmoke,
   type AdapterCapabilities,
@@ -60,6 +63,8 @@ const CAPABILITIES: AdapterCapabilities = {
   sandbox: false,
   workingDir: "cwd",
   telemetry: "none",
+  // argv delivery — finite limit aligned with #492 runCapped (>= MAX_ARG_STRLEN refuses).
+  maxPromptBytes: MAX_ARGV_PROMPT_BYTES,
 };
 
 // `--thinking <level>` documented enum (verified live, design.md decision 4)

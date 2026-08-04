@@ -454,7 +454,7 @@ Each module may:
 1. `module.exports = { adapters: [harnessAdapter, ...] }` (or `export default` / `export const adapters` in a CJS-interop package)
 2. `module.exports.register = (api) => { api.registerAdapter(adapter); }`
 
-Adapters declare role capabilities (`implementer` and/or `reviewer`), executable resolution, prompt delivery/limits, model/effort/sandbox policy, telemetry, auth/version probes, and a cheap `runtimeSmoke` hook. Built-ins re-register through the same public contract. A shared conformance kit (CI) verifies declarations and refusal behavior.
+Adapters declare role capabilities (`implementer` and/or `reviewer`), executable resolution, prompt delivery/`maxPromptBytes` limits, model/effort/sandbox policy, telemetry, auth/version probes, and a cheap `runtimeSmoke` hook. Built-ins re-register through the same public contract. A shared conformance kit (CI) verifies declarations and refusal behavior.
 
 **Identity separation:** outer host / profile (the CLI that launched the pipeline) stays independent of stage **adapter** ID, provider/auth class, model, and effort. Unknown provider/model metadata stays `unknown` / null — core never invents a vendor-global model catalog or silent default for extension adapters.
 
