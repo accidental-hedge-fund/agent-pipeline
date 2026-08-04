@@ -139,3 +139,35 @@ export {
   type ConformanceFailure,
   type ConformanceReport,
 } from "./conformance.ts";
+// #778 — provider-neutral treatment fingerprint + once-per-run version probe
+// (shared with evals #653 / preflight #636; importable pure units).
+export {
+  ADAPTER_CONTRACT_VERSION,
+  buildTreatmentFingerprint,
+  deriveTelemetryCoverage,
+  hashAdapterCapabilities,
+  sanitizeTreatmentFingerprint,
+  sandboxToolPolicyIdentity,
+  type BuildTreatmentFingerprintInput,
+  type TelemetryChannelCoverage,
+  type TelemetryCoverage,
+  type TreatmentFingerprint,
+} from "./treatment-fingerprint.ts";
+export {
+  createCliVersionProbeCache,
+  parseCliVersionStdout,
+  probeCliVersionOnce,
+  resolveCommandPath,
+  _clearCliVersionProbeCacheForTests,
+  _peekCliVersionProbeForTests,
+  type CliVersionProbeDeps,
+  type CliVersionProbeResult,
+} from "./cli-version-probe.ts";
+export {
+  BUILTIN_VERIFIED_AGAINST,
+  extractComparableVersion,
+  formatVersionDriftWarning,
+  getVerifiedAgainst,
+  versionsCompatible,
+  type VerifiedAgainstIdentity,
+} from "./verified-against.ts";

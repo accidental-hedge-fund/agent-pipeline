@@ -4,9 +4,12 @@
 //
 //   pi -p <PROMPT> [--model <pattern>] [--thinking <level>] -a
 //
-// `--mode json` ("output all events as JSON lines") exists but its payload
-// schema is not verified — same golden-rule-5 reasoning as grok/opencode:
-// this adapter omits it and declares `telemetry: "none"`.
+// #778 disposition: `--mode json` ("output all events as JSON lines") exists
+// but its payload schema has **no recorded fixture** in
+// harness-adapters/fixtures/ — golden rule 5 forbids declaring machine-
+// readable telemetry without fixtures. This adapter keeps `telemetry:
+// "none"`, omits `--mode json`, and `parseTelemetry` returns EMPTY_TELEMETRY.
+// See `verified-against.ts` → pi entry.
 //
 // No documented `--cwd`/`-C` flag exists — pi operates on the process's
 // current working directory, so `workingDir: "cwd"` and the adapter relies

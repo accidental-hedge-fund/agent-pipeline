@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"SECRET-THREAD-xyz"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"hello world"}}
+{"type":"turn.completed","usage":{"input_tokens":14385,"cached_input_tokens":10496,"output_tokens":6,"reasoning_output_tokens":0}}

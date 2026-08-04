@@ -1,4 +1,8 @@
 import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
+import {
+  sanitizeTreatmentFingerprint,
+  type TreatmentFingerprint,
+} from "./harness-adapters/treatment-fingerprint.ts";
 import type {
   StageAccountingCostSource,
   StageAccountingRecord,
@@ -6,6 +10,12 @@ import type {
   StageAccountingUsage,
 } from "./types.ts";
 
+// v6 (#778 provider-neutral treatment fingerprint): additive — records may
+// now carry a nested `treatment_fingerprint` (adapter contract, CLI path/
+// version, capability hash, role, requested/resolved settings, coverage,
+// cost_source honesty). Adds no required field and removes none; readers
+// treat absent as unknown.
+//
 // v5 (#434 api-executor-response-provenance): additive — records may now
 // carry model-endpoint response provenance (upstream provider, request id,
 // finish reason, retry count, rate-limit observation, effort-support marker).
@@ -20,7 +30,7 @@ import type {
 // throttled, termination reason). Adds no required field and removes none;
 // readers must not gate on this value equalling a specific version (design.md
 // decision 5).
-export const STAGE_ACCOUNTING_SCHEMA_VERSION = 5;
+export const STAGE_ACCOUNTING_SCHEMA_VERSION = 6;
 
 export interface UsageAccountingExtraction {
   usage?: StageAccountingUsage;
@@ -73,6 +83,8 @@ export interface BuildStageAccountingRecordInput {
   rateLimited?: boolean | null;
   effortSupport?: string | null;
   requestPayload?: Record<string, unknown> | null;
+  /** Provider-neutral treatment fingerprint (#778). Optional / additive. */
+  treatmentFingerprint?: TreatmentFingerprint | null;
 }
 
 const NUMERIC_USAGE_FIELDS: Record<string, keyof StageAccountingUsage> = {
@@ -217,6 +229,9 @@ export function buildStageAccountingRecord(input: BuildStageAccountingRecordInpu
     ...(typeof input.rateLimited === "boolean" ? { rate_limited: input.rateLimited } : {}),
     ...(cleanOptionalString(input.effortSupport ?? null) !== null ? { effort_support: cleanOptionalString(input.effortSupport ?? null) } : {}),
     ...(input.requestPayload ? { request_payload: sanitizeDeep(input.requestPayload) } : {}),
+    ...(input.treatmentFingerprint
+      ? { treatment_fingerprint: sanitizeTreatmentFingerprint(input.treatmentFingerprint) }
+      : {}),
   };
   return sanitizeStageAccountingRecord(record);
 }
@@ -292,6 +307,10 @@ export function sanitizeStageAccountingRecord(record: StageAccountingRecord): St
   if (effortSupport !== null) cleaned.effort_support = effortSupport;
   if (record.request_payload && typeof record.request_payload === "object") {
     cleaned.request_payload = sanitizeDeep(record.request_payload);
+  }
+  if (record.treatment_fingerprint && typeof record.treatment_fingerprint === "object") {
+    const fp = sanitizeTreatmentFingerprint(record.treatment_fingerprint as TreatmentFingerprint);
+    if (fp) cleaned.treatment_fingerprint = fp;
   }
   return cleaned;
 }
