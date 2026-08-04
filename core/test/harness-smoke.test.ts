@@ -27,9 +27,11 @@ import {
   implementerSmokePrompt,
   reviewerSmokePrompt,
   runHarnessSmoke,
+  scratchRepoMutated,
   smokeCheckId,
   treatmentKey,
   type HarnessSmokeDeps,
+  type ScratchRepoSnapshot,
   type SmokeInvokeRequest,
   type SmokeInvokeResult,
   type SmokeTreatment,
@@ -179,6 +181,8 @@ interface FakeSmokeOpts {
   ) => Promise<AdapterPreflightResult> | AdapterPreflightResult;
   invoke?: (req: SmokeInvokeRequest) => Promise<SmokeInvokeResult> | SmokeInvokeResult;
   newCommitMessages?: (root: string, beforeHead: string | null) => string[];
+  /** Optional snapshot sequence: first call = before invoke, later = after. */
+  snapshots?: ScratchRepoSnapshot[];
   validateContract?: (
     id: string,
     input: string,
@@ -199,8 +203,14 @@ function fakeSmokeDeps(o: FakeSmokeOpts = {}): HarnessSmokeDeps {
     ]);
   const scratchRoots: string[] = o.createScratchRoots ?? [];
   let scratchSeq = 0;
+  let snapshotIdx = 0;
   /** Last invoke role — default newCommitMessages only invents commits for implementer. */
   let lastRole: "implementer" | "reviewer" | null = null;
+  const cleanSnap = (): ScratchRepoSnapshot => ({
+    head: null,
+    commitCount: 0,
+    statusPorcelain: "",
+  });
 
   return {
     resolveAdapter: (name) => adapters.get(name) ?? null,
@@ -212,7 +222,14 @@ function fakeSmokeDeps(o: FakeSmokeOpts = {}): HarnessSmokeDeps {
       return root;
     },
     cleanupScratchRepo: async () => {},
-    snapshotRepo: async () => ({ head: null, commitCount: 0 }),
+    snapshotRepo: async () => {
+      if (o.snapshots && o.snapshots.length > 0) {
+        const snap = o.snapshots[Math.min(snapshotIdx, o.snapshots.length - 1)]!;
+        snapshotIdx += 1;
+        return snap;
+      }
+      return cleanSnap();
+    },
     newCommitMessages: async (root, before) => {
       if (o.newCommitMessages) return o.newCommitMessages(root, before);
       // Default happy path: implementer creates a trailer-bearing commit;
@@ -527,6 +544,84 @@ test("runHarnessSmoke: reviewer mutation fails", async () => {
   assert.ok(revFail.every((o) => /read-only|mutat/i.test(o.detail)));
 });
 
+test("runHarnessSmoke: reviewer uncommitted file write fails (no new commit)", async () => {
+  // Before: clean tree. After invoke: porcelain shows untracked file — no commits.
+  const before: ScratchRepoSnapshot = {
+    head: "abc",
+    commitCount: 1,
+    statusPorcelain: "",
+  };
+  const afterDirty: ScratchRepoSnapshot = {
+    head: "abc",
+    commitCount: 1,
+    statusPorcelain: "?? REVIEWER_TOUCHED.md\n",
+  };
+  assert.equal(scratchRepoMutated(before, afterDirty), true);
+
+  // Single reviewer treatment (plan_review_effort matches review effort).
+  // Implementer readiness fails so it never consumes snapshots.
+  let snapCalls = 0;
+  const deps = fakeSmokeDeps({
+    adapters: new Map([
+      ["codex", fakeAdapter("codex")],
+      ["ext-reviewer", fakeAdapter("ext-reviewer", { roles: ["reviewer"] })],
+    ]),
+    newCommitMessages: () => [],
+    runtimeSmoke: async (adapter) => {
+      if (adapter.name === "codex") {
+        return { ok: false, failure: "cli_missing", message: "skip impl" };
+      }
+      return { ok: true, authState: "authenticated" };
+    },
+  });
+  deps.snapshotRepo = async () => {
+    // Odd calls = pre-invoke (clean); even = post-invoke (dirty uncommitted write).
+    snapCalls += 1;
+    return snapCalls % 2 === 1 ? before : afterDirty;
+  };
+
+  const outcomes = await runHarnessSmoke(
+    makeConfig({
+      harnesses: {
+        implementer: "codex",
+        reviewer: "ext-reviewer",
+        implementerSource: "repo-config",
+        reviewerSource: "repo-config",
+      },
+      models: {
+        planning: "x",
+        implementing: "x",
+        review: "y",
+        fix: "x",
+        intake: "x",
+        sweep: "x",
+      },
+      effort: {
+        planning: "low",
+        implementing: "low",
+        review: "high",
+        fix: "low",
+        intake: "low",
+        sweep: "low",
+      },
+      plan_review_effort: "high",
+    }),
+    deps,
+  );
+  const revFail = outcomes.filter((o) => o.id.includes(":reviewer"));
+  assert.ok(revFail.length >= 1, JSON.stringify(outcomes));
+  assert.ok(revFail.every((o) => o.status === "fail"), JSON.stringify(revFail));
+  assert.ok(
+    revFail.every((o) => /read-only|mutat|working-tree/i.test(o.detail)),
+    JSON.stringify(revFail),
+  );
+  assert.ok(
+    revFail.every((o) => /file mutation|read-only/i.test(o.remediation ?? o.detail)),
+    JSON.stringify(revFail),
+  );
+  assert.equal(snapCalls, 2, "one reviewer treatment: before + after snapshot");
+});
+
 test("runHarnessSmoke: reviewer-only adapter is not required to commit", async () => {
   const okDeps = fakeSmokeDeps({
     adapters: new Map([
@@ -723,6 +818,53 @@ test("runDoctor --harness-smoke with failing smoke exits non-zero", async () => 
   try {
     process.exitCode = undefined;
     await runDoctor(makeConfig(), { harnessSmoke: true } as CliOpts, deps);
+    assert.equal(process.exitCode, 1);
+  } finally {
+    console.log = origLog;
+    process.exitCode = undefined;
+  }
+});
+
+test("runDoctor --harness-smoke --fail-fast does not invoke smoke after static failure", async () => {
+  let smokeCalls = 0;
+  const deps: PreflightCliDeps = {
+    runPreflight: async () => ({
+      schema_version: 1,
+      ok: false,
+      ranAt: "2026-01-01T00:00:00.000Z",
+      checks: [
+        {
+          id: "cli:gh",
+          description: "gh",
+          status: "fail",
+          detail: "missing",
+          remediation: "install gh",
+        },
+      ],
+    }),
+    storePreflightResult: async () => {},
+    runHarnessSmoke: async () => {
+      smokeCalls += 1;
+      return [
+        {
+          id: "harness-smoke:codex:implementer",
+          description: "smoke",
+          status: "pass",
+          detail: "should not run",
+        },
+      ];
+    },
+  };
+  const origLog = console.log;
+  console.log = () => {};
+  try {
+    process.exitCode = undefined;
+    await runDoctor(
+      makeConfig(),
+      { harnessSmoke: true, failFast: true } as CliOpts,
+      deps,
+    );
+    assert.equal(smokeCalls, 0, "fail-fast static failure must not start harness smoke");
     assert.equal(process.exitCode, 1);
   } finally {
     console.log = origLog;

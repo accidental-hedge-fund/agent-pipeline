@@ -4519,6 +4519,10 @@ async function runDoctorChecks(
   if (!opts.harnessSmoke) {
     return staticResult;
   }
+  // Under --fail-fast, do not start paid dynamic smoke after a static failure.
+  if (failFast && !staticResult.ok) {
+    return staticResult;
+  }
   const smokeRunner = deps.runHarnessSmoke ?? runHarnessSmoke;
   const smokeDeps = deps.harnessSmokeDeps?.();
   const smokeChecks = await smokeRunner(

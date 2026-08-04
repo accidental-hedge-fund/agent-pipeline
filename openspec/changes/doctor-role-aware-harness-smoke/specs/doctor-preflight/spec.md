@@ -39,3 +39,10 @@ doctor rule. Default doctor (no `--harness-smoke`) remains model-free.
 - **AND** the harness-smoke path MAY perform cheap model-consuming canned prompts for configured
   treatments as specified by `doctor-harness-smoke`
 - **AND** help or summary text SHALL make that cost expectation visible to the operator
+
+#### Scenario: Fail-fast static failure skips paid harness smoke
+
+- **WHEN** `pipeline doctor --harness-smoke` is invoked with fail-fast enabled
+- **AND** a static preflight check fails
+- **THEN** doctor SHALL exit non-zero with the static failure results
+- **AND** SHALL NOT start the dynamic harness-smoke path (no canned model prompts for treatments)

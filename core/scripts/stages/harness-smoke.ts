@@ -215,6 +215,23 @@ export interface ScratchRepoSnapshot {
   head: string | null;
   /** `git rev-list --count HEAD` when a HEAD exists; else 0. */
   commitCount: number;
+  /**
+   * `git status --porcelain=v1` (tracked + untracked). Used to detect
+   * uncommitted file mutations on reviewer smoke (read-only contract).
+   */
+  statusPorcelain: string;
+}
+
+/** True when HEAD, commit count, or working-tree porcelain differs. */
+export function scratchRepoMutated(
+  before: ScratchRepoSnapshot,
+  after: ScratchRepoSnapshot,
+): boolean {
+  return (
+    before.head !== after.head ||
+    before.commitCount !== after.commitCount ||
+    before.statusPorcelain !== after.statusPorcelain
+  );
 }
 
 export interface HarnessSmokeDeps {
@@ -229,7 +246,7 @@ export interface HarnessSmokeDeps {
   createScratchRepo(): Promise<string>;
   /** Best-effort cleanup of a scratch root. */
   cleanupScratchRepo(root: string): Promise<void>;
-  /** Snapshot HEAD + commit count before a smoke turn. */
+  /** Snapshot HEAD + commit count + working-tree status before a smoke turn. */
   snapshotRepo(root: string): Promise<ScratchRepoSnapshot>;
   /** List full commit messages for commits after `beforeHead` (exclusive). */
   newCommitMessages(root: string, beforeHead: string | null): Promise<string[]>;
@@ -374,13 +391,21 @@ export function realHarnessSmokeDeps(
       }
     },
     snapshotRepo: async (root) => {
+      const statusRes = await gitExec(root, ["status", "--porcelain=v1"]);
+      const statusPorcelain = statusRes.ok ? statusRes.stdout : "";
       const headRes = await gitExec(root, ["rev-parse", "HEAD"]);
-      if (!headRes.ok) return { head: null, commitCount: 0 };
+      if (!headRes.ok) {
+        return { head: null, commitCount: 0, statusPorcelain };
+      }
       const countRes = await gitExec(root, ["rev-list", "--count", "HEAD"]);
       const commitCount = countRes.ok
         ? Number.parseInt(countRes.stdout.trim(), 10) || 0
         : 0;
-      return { head: headRes.stdout.trim() || null, commitCount };
+      return {
+        head: headRes.stdout.trim() || null,
+        commitCount,
+        statusPorcelain,
+      };
     },
     newCommitMessages: async (root, beforeHead) => {
       const range = beforeHead ? `${beforeHead}..HEAD` : "HEAD";
@@ -673,15 +698,21 @@ async function runOneTreatment(
         };
       }
     } else {
-      // Reviewer: structured verdict + no mutation
+      // Reviewer: structured verdict + no commits and no working-tree mutation
       const messages = await deps.newCommitMessages(scratch, before.head);
-      if (messages.length > 0) {
+      const after = await deps.snapshotRepo(scratch);
+      const dirtyTree = scratchRepoMutated(before, after);
+      if (messages.length > 0 || dirtyTree) {
+        const why =
+          messages.length > 0
+            ? `${messages.length} new commit(s)`
+            : "working-tree file mutation(s)";
         return {
           id,
           description,
           ...fail(
-            `${label}: reviewer smoke mutated the repository (${messages.length} new commit(s))`,
-            `Reviewer smoke must remain read-only — do not create commits. Adapter \`${treatment.adapter}\` reviewer treatment failed the no-mutation check.`,
+            `${label}: reviewer smoke mutated the repository (${why})`,
+            `Reviewer smoke must remain read-only — do not create commits or modify tracked/untracked files. Adapter \`${treatment.adapter}\` reviewer treatment failed the no-mutation check.`,
           ),
         };
       }
