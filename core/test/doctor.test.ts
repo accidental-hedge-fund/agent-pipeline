@@ -404,6 +404,87 @@ test("check harness prompt-bytes — fails when assigned adapter declares unknow
   _resetRegistryForTests();
 });
 
+test("check harness prompt-bytes — fails when assigned argv adapter declares unspawnable finite maxPromptBytes (#779)", async () => {
+  const {
+    registerAdapter,
+    _resetRegistryForTests,
+    buildAdapterDeclaration,
+    MAX_ARGV_PROMPT_BYTES,
+  } = await import("../scripts/harness-adapters/index.ts");
+  _resetRegistryForTests();
+  const caps = {
+    model: false as const,
+    effort: false as const,
+    sandbox: false as const,
+    workingDir: "cwd" as const,
+    telemetry: "none" as const,
+    // Above the OS argv spawn ceiling — must fail doctor coherence (#779).
+    maxPromptBytes: 1_000_000 as const,
+  };
+  registerAdapter({
+    name: "argv-overclaim-cli",
+    capabilities: caps,
+    declaration: buildAdapterDeclaration({
+      roles: ["implementer", "reviewer"],
+      command: "argv-overclaim-cli",
+      capabilities: caps,
+      promptDelivery: "argv",
+      origin: "extension",
+      authProbe: "none",
+      versionProbe: "none",
+    }),
+    buildInvocation(ctx) {
+      return {
+        cmd: "argv-overclaim-cli",
+        args: [ctx.prompt],
+        cwd: ctx.worktreeDir,
+        promptDelivery: "argv",
+      };
+    },
+    async preflight() {
+      return { ok: true, authState: "unknown" };
+    },
+    parseTelemetry() {
+      return {
+        text: null,
+        costUsd: null,
+        usage: null,
+        resolvedModel: null,
+        throttled: null,
+      };
+    },
+    describeTreatment(req, _inv, probe) {
+      return {
+        adapter: "argv-overclaim-cli",
+        cliVersion: probe.cliVersion,
+        providerAuthClass: "unknown",
+        requestedModel: req.model ?? null,
+        resolvedModel: null,
+        requestedEffort: req.effort ?? null,
+        resolvedEffort: null,
+        nativeFlags: [],
+        fallback: null,
+        throttled: null,
+        origin: "extension",
+      };
+    },
+    async runtimeSmoke() {
+      return { ok: true };
+    },
+  });
+  const cfg = makeConfig({
+    harnesses: { implementer: "argv-overclaim-cli", reviewer: "argv-overclaim-cli" },
+  });
+  const r = await getCheck(cfg, "harness:argv-overclaim-cli:prompt-bytes").run(fakeDeps());
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /1000000|incoherent|exceeds|spawnable/i);
+  assert.ok(r.remediation);
+  assert.match(r.remediation!, /argv-overclaim-cli|maxPromptBytes|coherent/i);
+  // Ceiling constant stays available for the message / remediation path.
+  assert.equal(typeof MAX_ARGV_PROMPT_BYTES, "number");
+  _resetRegistryForTests();
+});
+
 test("check harness:codex — uses --version probe, not which", async () => {
   const calls: Array<{ file: string; args: string[] }> = [];
   await getCheck(makeConfig(), "harness:codex").run(

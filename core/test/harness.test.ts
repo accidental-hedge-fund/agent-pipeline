@@ -1021,6 +1021,116 @@ test("checkMaterializedPromptBytes: boundary limit-1 / limit / limit+1 (#779)", 
   if (!over.ok) assert.equal(over.reason, "oversize");
 });
 
+test("promptLimitCoherenceFailure: rejects argv maxPromptBytes above MAX_ARGV_PROMPT_BYTES (#779)", async () => {
+  const { promptLimitCoherenceFailure, MAX_ARGV_PROMPT_BYTES } = await import(
+    "../scripts/harness-adapters/types.ts"
+  );
+  assert.equal(
+    promptLimitCoherenceFailure(MAX_ARGV_PROMPT_BYTES, "argv"),
+    null,
+    "exactly the spawnable ceiling must be coherent",
+  );
+  assert.equal(
+    promptLimitCoherenceFailure(MAX_ARGV_PROMPT_BYTES - 1, "argv"),
+    null,
+    "stricter finite argv limits remain coherent",
+  );
+  const over = promptLimitCoherenceFailure(1_000_000, "argv");
+  assert.ok(over, "unspawnable argv ceiling must fail coherence");
+  assert.match(over!, /incoherent|exceeds|spawnable|131071|1000000/i);
+  // MAX_ARG_STRLEN itself is not spawnable as a prompt payload (NUL-aware).
+  const atStrlen = promptLimitCoherenceFailure(MAX_ARGV_PROMPT_BYTES + 1, "argv");
+  assert.ok(atStrlen);
+  assert.match(atStrlen!, /incoherent|exceeds|spawnable/i);
+});
+
+test("invoke(): argv adapter advertising unspawnable maxPromptBytes is refused as typed capability failure for mid-gap prompt (#779)", async () => {
+  // Regression: delivery argv + maxPromptBytes 1_000_000 used to pass the
+  // typed preflight for a ~200 KiB prompt and only fail later as oversize_argv.
+  // After coherence enforcement, force-registered over-claim adapters still
+  // must not surface residual oversize_argv for the mid-gap range — clamp the
+  // effective argv ceiling at preflight so the refusal stays typed.
+  const {
+    registerAdapter,
+    _resetRegistryForTests,
+    buildAdapterDeclaration,
+    MAX_ARGV_PROMPT_BYTES,
+  } = await import("../scripts/harness-adapters/index.ts");
+  _resetRegistryForTests();
+  const caps = {
+    model: false as const,
+    effort: false as const,
+    sandbox: false as const,
+    workingDir: "cwd" as const,
+    telemetry: "none" as const,
+    maxPromptBytes: 1_000_000 as const,
+  };
+  registerAdapter({
+    name: "argv-overclaim-invoke",
+    capabilities: caps,
+    declaration: buildAdapterDeclaration({
+      roles: ["implementer", "reviewer"],
+      command: "argv-overclaim-invoke",
+      capabilities: caps,
+      promptDelivery: "argv",
+      origin: "extension",
+      authProbe: "none",
+      versionProbe: "none",
+    }),
+    buildInvocation(ctx) {
+      return {
+        cmd: "argv-overclaim-invoke",
+        args: [ctx.prompt],
+        cwd: ctx.worktreeDir,
+        promptDelivery: "argv",
+      };
+    },
+    async preflight() {
+      return { ok: true, authState: "unknown" };
+    },
+    parseTelemetry() {
+      return {
+        text: null,
+        costUsd: null,
+        usage: null,
+        resolvedModel: null,
+        throttled: null,
+      };
+    },
+    describeTreatment(req, _inv, probe) {
+      return {
+        adapter: "argv-overclaim-invoke",
+        cliVersion: probe.cliVersion,
+        providerAuthClass: "unknown",
+        requestedModel: req.model ?? null,
+        resolvedModel: null,
+        requestedEffort: req.effort ?? null,
+        resolvedEffort: null,
+        nativeFlags: [],
+        fallback: null,
+        throttled: null,
+        origin: "extension",
+      };
+    },
+    async runtimeSmoke() {
+      return { ok: true };
+    },
+  });
+
+  // Mid-gap: above MAX_ARGV_PROMPT_BYTES, below the falsely advertised 1_000_000.
+  const midGap = "m".repeat(200_000);
+  assert.ok(midGap.length > MAX_ARGV_PROMPT_BYTES);
+  assert.ok(midGap.length < 1_000_000);
+
+  const result = await invoke("argv-overclaim-invoke", tmpRoot, midGap, { stream: false });
+  assert.equal(result.success, false);
+  assert.equal(result.prompt_limit_exceeded, true, "typed capability refusal, not residual oversize_argv");
+  assert.equal(result.oversize_argv ?? false, false);
+  assert.equal(result.spawn_error ?? false, false);
+  assert.match(result.stderr, /argv-overclaim-invoke|maxPromptBytes|13107[01]|spawnable|exceeds/i);
+  _resetRegistryForTests();
+});
+
 test("invoke(): a custom reviewer CLI with promptDelivery:'stdin' is spawned with no prompt positional and the prompt on stdin (#492)", async () => {
   const cli = makeArgvStdinScript("my-stdin-reviewer");
   const result = await invoke(cli, tmpRoot, "PROMPT-MARKER", { stream: false, promptDelivery: "stdin" });

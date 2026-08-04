@@ -235,6 +235,21 @@ export function promptLimitCoherenceFailure(
   if (delivery === "argv" && maxPromptBytes === "unlimited") {
     return `incoherent pair: prompt delivery "argv" cannot declare unlimited maxPromptBytes`;
   }
+  // Argv is a single execve element under the #492 runCapped guard
+  // (`byteLength >= MAX_ARG_STRLEN` refuses). Advertising a higher finite
+  // ceiling lets oversize prompts pass the typed preflight and only fail
+  // later as opaque oversize_argv — reject as unspawnable.
+  if (
+    delivery === "argv" &&
+    isFiniteMaxPromptBytes(maxPromptBytes) &&
+    maxPromptBytes > MAX_ARGV_PROMPT_BYTES
+  ) {
+    return (
+      `incoherent pair: prompt delivery "argv" with finite maxPromptBytes ${maxPromptBytes} ` +
+      `exceeds the spawnable argv ceiling ${MAX_ARGV_PROMPT_BYTES} (MAX_ARG_STRLEN-aware); ` +
+      `declare at most ${MAX_ARGV_PROMPT_BYTES} or use stdin/file delivery`
+    );
+  }
   if (
     (delivery === "stdin" || delivery === "file") &&
     isFiniteMaxPromptBytes(maxPromptBytes) &&
@@ -315,16 +330,28 @@ export function checkMaterializedPromptBytes(
         `positive integer, "unlimited", or "unknown".`,
     };
   }
-  // Finite: refuse when measured > maxPromptBytes (see MAX_ARGV_PROMPT_BYTES docs).
-  if (measured > maxPromptBytes) {
+  // Argv is hard-capped by the spawnable ceiling even if a declaration over-claims
+  // a higher finite limit (defense-in-depth alongside promptLimitCoherenceFailure).
+  // Compare against the effective spawnable bound so mid-gap prompts refuse as
+  // typed prompt_limit_exceeded rather than residual oversize_argv.
+  const effectiveLimit =
+    opts.delivery === "argv" && maxPromptBytes > MAX_ARGV_PROMPT_BYTES
+      ? MAX_ARGV_PROMPT_BYTES
+      : maxPromptBytes;
+  // Finite: refuse when measured > effectiveLimit (see MAX_ARGV_PROMPT_BYTES docs).
+  if (measured > effectiveLimit) {
     return {
       ok: false,
       measured,
-      limit: maxPromptBytes,
+      limit: effectiveLimit,
       reason: "oversize",
       message:
         `[harness ${name}] materialized prompt exceeds adapter maxPromptBytes: prompt is ${measured} UTF-8 bytes, ` +
-        `but adapter "${name}" (delivery: ${channel}) declares a finite limit of ${maxPromptBytes} bytes. ` +
+        `but adapter "${name}" (delivery: ${channel}) declares a finite limit of ${maxPromptBytes} bytes` +
+        (effectiveLimit !== maxPromptBytes
+          ? ` (effective argv ceiling ${effectiveLimit})`
+          : "") +
+        `. ` +
         `This is a typed capability refusal, not a transient spawn error — retrying the same invocation cannot succeed. ` +
         `Remedy: assign a stdin- or file-capable adapter (e.g. claude/codex/grok), or for a custom reviewer CLI set ` +
         `review_harness.prompt_delivery: stdin if it reads its prompt from standard input.`,

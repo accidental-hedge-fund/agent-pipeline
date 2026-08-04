@@ -11,9 +11,12 @@ exception. The public contract vocabulary SHALL treat `maxPromptBytes` as that s
 The shared conformance kit SHALL reject an extension adapter that:
 
 - omits `maxPromptBytes`,
-- declares prompt delivery and size/limit policy that disagree with `maxPromptBytes`, or
+- declares prompt delivery and size/limit policy that disagree with `maxPromptBytes`,
 - claims unlimited on a positional/`argv` channel or a finite `MAX_ARG_STRLEN`-class ceiling on a
-  stdin/file channel without matching declaration fields.
+  stdin/file channel without matching declaration fields, or
+- claims a finite `maxPromptBytes` on a positional/`argv` channel greater than the harness
+  spawnable argv ceiling (`MAX_ARGV_PROMPT_BYTES` / `MAX_ARG_STRLEN`-aware bound used by the
+  residual oversize-argv guard).
 
 Machine-readable manifests and package-hook registrations SHALL be able to express the same three
 limit classes so extension authors do not need a second, conflicting size field.
@@ -30,6 +33,13 @@ limit classes so extension authors do not need a second, conflicting size field.
 - **WHEN** an extension adapter declares `argv` prompt delivery and unlimited `maxPromptBytes`
 - **THEN** the shared conformance kit SHALL fail
 - **AND** the failure SHALL identify the incoherent pair
+
+#### Scenario: Conformance rejects argv limit above the spawnable ceiling
+
+- **WHEN** an extension adapter declares `argv` prompt delivery and a finite `maxPromptBytes`
+  greater than the harness spawnable argv ceiling
+- **THEN** the shared conformance kit SHALL fail
+- **AND** the failure SHALL identify the unspawnable limit
 
 #### Scenario: Compatibility custom-reviewer path declares a limit
 

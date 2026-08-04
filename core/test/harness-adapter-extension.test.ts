@@ -446,6 +446,20 @@ test("conformance kit: requires maxPromptBytes and rejects argv+unlimited (#779)
     ),
     JSON.stringify(incoReport.failures),
   );
+
+  // argv + finite limit above the spawnable ceiling is incoherent (#779 review)
+  // — would otherwise pass typed preflight for mid-gap prompts and only fail as
+  // residual oversize_argv.
+  const unspawnable = makeMinimalExtension("argv-unspawnable-limit");
+  (unspawnable.capabilities as { maxPromptBytes: number }).maxPromptBytes = 1_000_000;
+  const unspawnReport = checkStructure(unspawnable);
+  assert.equal(unspawnReport.ok, false);
+  assert.ok(
+    unspawnReport.failures.some((f) =>
+      /incoherent|exceeds|spawnable|131071|1000000/.test(f.message),
+    ),
+    JSON.stringify(unspawnReport.failures),
+  );
 });
 
 test("builtins declare expected maxPromptBytes (#779)", () => {

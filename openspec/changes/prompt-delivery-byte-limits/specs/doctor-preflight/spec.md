@@ -51,6 +51,14 @@ doctor.
 - **THEN** the prompt-limit coherence check SHALL fail
 - **AND** remediation SHALL name the incoherence
 
+#### Scenario: Argv finite limit above spawnable ceiling fails doctor
+
+- **WHEN** an assigned adapter declares positional/`argv` prompt delivery together with a finite
+  `maxPromptBytes` greater than the harness spawnable argv ceiling
+- **AND** `pipeline doctor` runs
+- **THEN** the prompt-limit coherence check SHALL fail
+- **AND** remediation SHALL name the adapter and the unspawnable limit
+
 #### Scenario: Finite argv-bound assignment includes large-prompt remediation
 
 - **WHEN** an assigned adapter declares finite argv-bound `maxPromptBytes`

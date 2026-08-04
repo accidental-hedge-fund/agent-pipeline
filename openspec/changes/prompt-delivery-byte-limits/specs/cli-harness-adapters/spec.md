@@ -33,9 +33,12 @@ element).
 #### Scenario: Argv delivery requires a finite limit
 
 - **WHEN** an adapter declares prompt delivery via a positional/`argv` channel
-- **THEN** its `maxPromptBytes` SHALL be a finite positive integer consistent with the OS
-  per-argument limit used by the harness oversize guard
+- **THEN** its `maxPromptBytes` SHALL be a finite positive integer at most the harness
+  spawnable argv ceiling (`MAX_ARGV_PROMPT_BYTES`, consistent with the OS per-argument
+  limit used by the harness oversize guard)
 - **AND** its declaration prompt size/limit policy SHALL not claim unlimited for that channel
+- **AND** a finite `maxPromptBytes` greater than that ceiling SHALL fail shared coherence
+  validation (conformance / doctor) so mid-gap prompts cannot bypass typed preflight
 
 #### Scenario: Stdin or file delivery declares unlimited
 
