@@ -12,6 +12,7 @@ const CAPABILITIES = {
   sandbox: false,
   workingDir: "cwd",
   telemetry: "none",
+  maxPromptBytes: "unlimited",
 };
 
 const EMPTY_TELEMETRY = {

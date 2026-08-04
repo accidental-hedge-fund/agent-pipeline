@@ -363,6 +363,121 @@ test("conformance kit: synthetic extension fixture passes", async () => {
   assert.equal(report.ok, true, JSON.stringify(report.failures, null, 2));
 });
 
+test("conformance kit: requires maxPromptBytes and rejects argv+unlimited (#779)", () => {
+  _resetRegistryForTests();
+  // Missing maxPromptBytes
+  const missing = {
+    name: "missing-limit",
+    capabilities: {
+      model: false,
+      effort: false,
+      sandbox: false,
+      workingDir: "cwd" as const,
+      telemetry: "none" as const,
+      // maxPromptBytes deliberately omitted
+    },
+    declaration: {
+      roles: ["reviewer" as const],
+      executable: { command: "missing-limit", resolution: "path" as const },
+      prompt: { delivery: "argv" as const, sizeLimit: "max-arg-strlen" as const },
+      model: { supported: false, validation: "unsupported" as const },
+      effort: { supported: false, validation: "unsupported" as const },
+      sandbox: { supported: false },
+      workingDir: "cwd" as const,
+      outputEnvelope: "text" as const,
+      telemetry: "none" as const,
+      authProbe: "none" as const,
+      versionProbe: "none" as const,
+      origin: "extension" as const,
+    },
+    buildInvocation() {
+      return { cmd: "x", args: [], cwd: "/tmp", promptDelivery: "argv" as const };
+    },
+    async preflight() {
+      return { ok: true };
+    },
+    parseTelemetry() {
+      return {
+        text: null,
+        costUsd: null,
+        usage: null,
+        resolvedModel: null,
+        throttled: null,
+      };
+    },
+    describeTreatment() {
+      return {
+        adapter: "missing-limit",
+        cliVersion: null,
+        providerAuthClass: "unknown",
+        requestedModel: null,
+        resolvedModel: null,
+        requestedEffort: null,
+        resolvedEffort: null,
+        nativeFlags: [],
+        fallback: null,
+        throttled: null,
+      };
+    },
+    async runtimeSmoke() {
+      return { ok: true };
+    },
+  } as HarnessAdapter;
+  const missingReport = checkStructure(missing);
+  assert.equal(missingReport.ok, false);
+  assert.ok(
+    missingReport.failures.some((f) => f.message.includes("maxPromptBytes")),
+    `expected maxPromptBytes named in failures: ${JSON.stringify(missingReport.failures)}`,
+  );
+
+  // argv + unlimited is incoherent
+  const incoherent = makeMinimalExtension("argv-unlimited");
+  // Force incoherent capabilities/declaration pair
+  (incoherent.capabilities as { maxPromptBytes: string }).maxPromptBytes = "unlimited";
+  (incoherent.declaration.prompt as { sizeLimit: string }).sizeLimit = "unlimited";
+  const incoReport = checkStructure(incoherent);
+  assert.equal(incoReport.ok, false);
+  assert.ok(
+    incoReport.failures.some(
+      (f) =>
+        f.message.includes("incoherent") ||
+        f.message.includes("unlimited") ||
+        f.message.includes("maxPromptBytes"),
+    ),
+    JSON.stringify(incoReport.failures),
+  );
+});
+
+test("builtins declare expected maxPromptBytes (#779)", () => {
+  _resetRegistryForTests();
+  const claude = resolveAdapter("claude")!;
+  const codex = resolveAdapter("codex")!;
+  const grok = resolveAdapter("grok")!;
+  const pi = resolveAdapter("pi")!;
+  const opencode = resolveAdapter("opencode")!;
+  assert.equal(claude.capabilities.maxPromptBytes, "unlimited");
+  assert.equal(codex.capabilities.maxPromptBytes, "unlimited");
+  assert.equal(grok.capabilities.maxPromptBytes, "unlimited");
+  assert.equal(pi.capabilities.maxPromptBytes, 131_071);
+  assert.equal(opencode.capabilities.maxPromptBytes, 131_071);
+  assert.equal(pi.declaration.prompt.sizeLimit, "max-arg-strlen");
+  assert.equal(claude.declaration.prompt.sizeLimit, "unlimited");
+  // Header comments record re-verified upstream finding (smoke: modules load).
+  assert.equal(pi.declaration.prompt.delivery, "argv");
+  assert.equal(opencode.declaration.prompt.delivery, "argv");
+});
+
+test("compatibility adapter: argv finite / stdin unlimited maxPromptBytes (#779)", () => {
+  const argvCompat = materializeCompatibilityAdapter("rev-argv");
+  assert.equal(argvCompat.capabilities.maxPromptBytes, 131_071);
+  assert.equal(argvCompat.declaration.prompt.sizeLimit, "max-arg-strlen");
+  const stdinCompat = materializeCompatibilityAdapter("rev-stdin", {
+    promptDelivery: "stdin",
+  });
+  assert.equal(stdinCompat.capabilities.maxPromptBytes, "unlimited");
+  assert.equal(stdinCompat.declaration.prompt.sizeLimit, "unlimited");
+});
+
 test("conformance kit: incomplete fixture fails and names missing member", () => {
   // Load incomplete shape without going through registerAdapter (which also
   // requires declaration) — exercise checkStructure / assertAdapterConformance.
@@ -398,6 +513,7 @@ test("registerAdapter rejects incomplete adapter missing declaration", () => {
           sandbox: false,
           workingDir: "cwd",
           telemetry: "none",
+          maxPromptBytes: "unlimited",
         },
       } as HarnessAdapter),
     /declaration/,
@@ -414,6 +530,8 @@ function makeMinimalExtension(
     sandbox: false,
     workingDir: "cwd" as const,
     telemetry: "none" as const,
+    // argv-bound synthetic extension — finite ceiling (#779).
+    maxPromptBytes: 131_071 as const,
   };
   return {
     name,

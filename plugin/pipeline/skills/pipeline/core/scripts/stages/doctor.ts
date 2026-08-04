@@ -23,6 +23,11 @@ import {
   materializeCompatibilityAdapter,
   resolveAdapter,
 } from "../harness-adapters/index.ts";
+import {
+  isFiniteMaxPromptBytes,
+  promptLimitCoherenceFailure,
+  type MaxPromptBytes,
+} from "../harness-adapters/types.ts";
 import { isElevatedWriteHealth, parseWriteHealthText } from "../run-store.ts";
 
 const execFileAsync = promisify(execFile);
@@ -511,6 +516,62 @@ export function buildPreflightChecks(
               ? `Authenticate the \`${bin}\` CLI — it is a configured pipeline harness for this profile.`
               : `Resolve the \`${bin}\` CLI readiness issue — it is a configured pipeline harness for this profile.`;
         return fail(result.message ?? `configured harness \`${bin}\` failed readiness preflight (${result.failure ?? "unknown"})`, remediation);
+      },
+    });
+
+    // #779: report delivery channel + maxPromptBytes; fail closed on missing,
+    // unknown (when assigned), or incoherent channel/limit pairs. Does not
+    // materialize a stage prompt — declaration inspection only.
+    checks.push({
+      id: `harness:${bin}:prompt-bytes`,
+      description: `Configured harness \`${bin}\` declares a coherent prompt-delivery byte limit`,
+      run: async () => {
+        const delivery = adapter.declaration.prompt.delivery;
+        const maxPromptBytes: MaxPromptBytes | undefined =
+          adapter.capabilities?.maxPromptBytes;
+        const sizeLimit = adapter.declaration.prompt.sizeLimit;
+        const limitLabel =
+          maxPromptBytes === undefined
+            ? "(missing)"
+            : maxPromptBytes === "unlimited" || maxPromptBytes === "unknown"
+              ? maxPromptBytes
+              : `${maxPromptBytes} bytes`;
+
+        const coherence = promptLimitCoherenceFailure(maxPromptBytes, delivery, sizeLimit);
+        if (coherence) {
+          return fail(
+            `\`${bin}\` prompt-limit declaration invalid: delivery=${delivery}, maxPromptBytes=${limitLabel} — ${coherence}`,
+            `Fix the \`${bin}\` adapter declaration so maxPromptBytes is coherent with prompt delivery ` +
+              `(argv requires a finite limit; stdin/file require unlimited), or reassign implementer/reviewer ` +
+              `to a stdin- or file-capable adapter (e.g. claude, codex, grok).`,
+          );
+        }
+        if (maxPromptBytes === "unknown") {
+          return fail(
+            `\`${bin}\` is assigned but declares maxPromptBytes "unknown" (delivery: ${delivery})`,
+            `Declare a finite positive byte limit or "unlimited" on adapter \`${bin}\` before using it ` +
+              `as implementer/reviewer. Unknown limits fail closed at stage dispatch.`,
+          );
+        }
+        // Finite argv-bound assignment: pass, but include large-prompt remediation
+        // so operators learn the hard ceiling before the first review/fix failure.
+        // CheckResult only attaches `remediation` on fail/warn; for pass we embed
+        // the note in detail so human summary and --json both surface it.
+        if (isFiniteMaxPromptBytes(maxPromptBytes) && delivery === "argv") {
+          return {
+            status: "pass" as const,
+            detail:
+              `\`${bin}\` delivery=${delivery}, maxPromptBytes=${limitLabel}. ` +
+              `Note: production review/fix prompts commonly exceed the ~128 KiB OS per-argument ` +
+              `ceiling; assign a stdin/file-capable adapter (claude/codex/grok) for large-context stages, ` +
+              `or set review_harness.prompt_delivery: stdin for a custom reviewer CLI that supports it.`,
+            remediation:
+              `Production review/fix prompts commonly exceed the ~128 KiB per-argument ceiling. ` +
+              `For large-context stages assign a stdin/file-capable adapter (claude/codex/grok), ` +
+              `or set review_harness.prompt_delivery: stdin when the custom CLI supports it.`,
+          };
+        }
+        return pass(`\`${bin}\` delivery=${delivery}, maxPromptBytes=${limitLabel}`);
       },
     });
   }

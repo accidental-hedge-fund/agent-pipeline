@@ -118,6 +118,8 @@ const CAPABILITIES: AdapterCapabilities = {
   sandbox: true,
   workingDir: "cwd",
   telemetry: "jsonl",
+  // stdin delivery — no OS per-argument ceiling on the prompt payload (#779).
+  maxPromptBytes: "unlimited",
 };
 
 export const claudeAdapter: HarnessAdapter = {

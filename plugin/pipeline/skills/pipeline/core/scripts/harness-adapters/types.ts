@@ -36,6 +36,19 @@ export type SettingValidationPolicy =
   | "format" // adapter preflight enforces a structural format (e.g. provider/model)
   | "unsupported"; // capability is false; requests must refuse
 
+/**
+ * Delivery-channel max UTF-8 prompt bytes (#779).
+ *
+ * Encoding (JSON-friendly for doctor `--json` and extension manifests):
+ * - **finite**: positive integer — maximum UTF-8 byte length the prompt
+ *   channel can accept
+ * - **`"unlimited"`**: stdin/file (or equivalent) with no practical single-
+ *   payload OS argv ceiling on the prompt itself
+ * - **`"unknown"`**: the adapter cannot honestly claim a bound (fails closed
+ *   at stage dispatch and on assigned doctor checks)
+ */
+export type MaxPromptBytes = number | "unlimited" | "unknown";
+
 /** What a harness CLI's headless interface supports (design.md decision 2). */
 export interface AdapterCapabilities {
   /** Supports selecting a model via a CLI flag. */
@@ -49,6 +62,13 @@ export interface AdapterCapabilities {
   workingDir: "cwd" | "flag";
   /** Whether the CLI offers machine-readable per-call output ("jsonl") or not ("none"). */
   telemetry: "none" | "jsonl";
+  /**
+   * Maximum UTF-8 byte length of the prompt payload this adapter's declared
+   * delivery channel can accept (#779). Generic capability for every adapter
+   * (built-in, extension, compatibility) — not a vendor-specific exception.
+   * See {@link MaxPromptBytes}.
+   */
+  maxPromptBytes: MaxPromptBytes;
 }
 
 /**
@@ -70,8 +90,13 @@ export interface AdapterExtensionDeclaration {
   /** Prompt delivery channel and size-limit policy. */
   prompt: {
     delivery: PromptDeliveryChannel;
-    /** `"max-arg-strlen"` for argv channel; `"unlimited"` for stdin/file. */
-    sizeLimit: "max-arg-strlen" | "unlimited";
+    /**
+     * Coarse size-limit policy derived from `capabilities.maxPromptBytes`
+     * (#779 lockstep). `"max-arg-strlen"` for finite argv ceilings;
+     * `"unlimited"` for stdin/file; `"unknown"` when the adapter cannot
+     * claim a bound.
+     */
+    sizeLimit: "max-arg-strlen" | "unlimited" | "unknown";
   };
   /** Model discovery / validation policy (no vendor-global catalog in core). */
   model: {
@@ -145,8 +170,168 @@ export type PromptDeliveryChannel = "argv" | "stdin" | "file";
 /** Linux `MAX_ARG_STRLEN` — the maximum size, in bytes, of a single argv
  *  element (32 × PAGE_SIZE = 131,072 bytes on the common 4 KiB page size).
  *  Single-sourced so the pre-spawn oversize guard in `runCapped` and its
- *  regression tests never drift. */
+ *  regression tests never drift.
+ *
+ *  Comparison rule (shared with the #492 `runCapped` guard): refuse when
+ *  `Buffer.byteLength(arg, "utf8") >= MAX_ARG_STRLEN`. execve counts the
+ *  terminating NUL, so a payload of exactly `MAX_ARG_STRLEN` bytes still
+ *  cannot fit. */
 export const MAX_ARG_STRLEN = 131_072;
+
+/**
+ * Maximum UTF-8 byte length of a prompt string that is still spawnable as a
+ * single argv element under the #492 `runCapped` guard
+ * (`byteLength >= MAX_ARG_STRLEN` refuses). Argv-bound adapters declare this
+ * as their finite `maxPromptBytes` (#779).
+ *
+ * Preflight comparison rule for finite limits: refuse when
+ * `measured > maxPromptBytes` (so a prompt of exactly `MAX_ARGV_PROMPT_BYTES`
+ * is accepted by both preflight and `runCapped`).
+ */
+export const MAX_ARGV_PROMPT_BYTES = MAX_ARG_STRLEN - 1;
+
+/**
+ * Derive the coarse `declaration.prompt.sizeLimit` from `maxPromptBytes`
+ * (single source of truth — no dual enum that can disagree).
+ */
+export function sizeLimitFromMaxPromptBytes(
+  maxPromptBytes: MaxPromptBytes,
+): "max-arg-strlen" | "unlimited" | "unknown" {
+  if (maxPromptBytes === "unlimited") return "unlimited";
+  if (maxPromptBytes === "unknown") return "unknown";
+  return "max-arg-strlen";
+}
+
+/**
+ * Whether a `maxPromptBytes` value is a finite positive integer byte limit.
+ */
+export function isFiniteMaxPromptBytes(value: MaxPromptBytes | undefined | null): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 && Number.isInteger(value);
+}
+
+/**
+ * Coherence of delivery channel + maxPromptBytes (+ optional declaration
+ * sizeLimit). Returns null when coherent; otherwise a message naming the
+ * incoherence for doctor/conformance.
+ */
+export function promptLimitCoherenceFailure(
+  maxPromptBytes: MaxPromptBytes | undefined,
+  delivery: PromptDeliveryChannel | undefined,
+  sizeLimit?: "max-arg-strlen" | "unlimited" | "unknown",
+): string | null {
+  if (maxPromptBytes === undefined || maxPromptBytes === null) {
+    return `missing required field "maxPromptBytes"`;
+  }
+  if (
+    maxPromptBytes !== "unlimited" &&
+    maxPromptBytes !== "unknown" &&
+    !isFiniteMaxPromptBytes(maxPromptBytes)
+  ) {
+    return `maxPromptBytes must be a positive integer, "unlimited", or "unknown" (got ${JSON.stringify(maxPromptBytes)})`;
+  }
+  if (!delivery) {
+    return `prompt.delivery is required alongside maxPromptBytes`;
+  }
+  if (delivery === "argv" && maxPromptBytes === "unlimited") {
+    return `incoherent pair: prompt delivery "argv" cannot declare unlimited maxPromptBytes`;
+  }
+  if (
+    (delivery === "stdin" || delivery === "file") &&
+    isFiniteMaxPromptBytes(maxPromptBytes) &&
+    maxPromptBytes <= MAX_ARGV_PROMPT_BYTES
+  ) {
+    // Finite MAX_ARG_STRLEN-class ceiling on a non-argv channel pretends the
+    // prompt is still a single argv element — refuse as incoherent.
+    return `incoherent pair: prompt delivery "${delivery}" with finite maxPromptBytes ${maxPromptBytes} (MAX_ARG_STRLEN-class); stdin/file channels must declare unlimited`;
+  }
+  if (sizeLimit !== undefined) {
+    const expected = sizeLimitFromMaxPromptBytes(maxPromptBytes);
+    if (sizeLimit !== expected) {
+      return `declaration.prompt.sizeLimit "${sizeLimit}" disagrees with maxPromptBytes (expected "${expected}")`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Measure UTF-8 byte length of a fully materialized prompt and compare it to
+ * the adapter's `maxPromptBytes` (#779 preflight-before-invoke).
+ *
+ * Comparison: refuse when finite and `measured > maxPromptBytes`. Unlimited
+ * is never refused by length alone. Unknown fails closed.
+ */
+export function checkMaterializedPromptBytes(
+  maxPromptBytes: MaxPromptBytes | undefined,
+  prompt: string,
+  opts: { adapterName: string; delivery?: PromptDeliveryChannel },
+):
+  | { ok: true; measured: number }
+  | {
+      ok: false;
+      measured: number;
+      limit: MaxPromptBytes | undefined;
+      reason: "missing" | "unknown" | "oversize" | "invalid";
+      message: string;
+    } {
+  const measured = Buffer.byteLength(prompt, "utf8");
+  const name = opts.adapterName;
+  const channel = opts.delivery ?? "unknown";
+
+  if (maxPromptBytes === undefined || maxPromptBytes === null) {
+    return {
+      ok: false,
+      measured,
+      limit: maxPromptBytes,
+      reason: "missing",
+      message:
+        `[harness ${name}] adapter is missing maxPromptBytes — declare a finite byte limit or "unlimited" ` +
+        `on AdapterCapabilities before invoke. This is a capability declaration failure, not a transient spawn error; ` +
+        `retrying the same invocation cannot succeed.`,
+    };
+  }
+  if (maxPromptBytes === "unknown") {
+    return {
+      ok: false,
+      measured,
+      limit: "unknown",
+      reason: "unknown",
+      message:
+        `[harness ${name}] adapter declares maxPromptBytes "unknown" (delivery: ${channel}) — stage dispatch ` +
+        `fails closed. Declare a finite positive byte limit or "unlimited" on the adapter's capabilities. ` +
+        `Retrying the same invocation cannot succeed without changing the declaration.`,
+    };
+  }
+  if (maxPromptBytes === "unlimited") {
+    return { ok: true, measured };
+  }
+  if (!isFiniteMaxPromptBytes(maxPromptBytes)) {
+    return {
+      ok: false,
+      measured,
+      limit: maxPromptBytes,
+      reason: "invalid",
+      message:
+        `[harness ${name}] adapter maxPromptBytes is invalid (${JSON.stringify(maxPromptBytes)}) — must be a ` +
+        `positive integer, "unlimited", or "unknown".`,
+    };
+  }
+  // Finite: refuse when measured > maxPromptBytes (see MAX_ARGV_PROMPT_BYTES docs).
+  if (measured > maxPromptBytes) {
+    return {
+      ok: false,
+      measured,
+      limit: maxPromptBytes,
+      reason: "oversize",
+      message:
+        `[harness ${name}] materialized prompt exceeds adapter maxPromptBytes: prompt is ${measured} UTF-8 bytes, ` +
+        `but adapter "${name}" (delivery: ${channel}) declares a finite limit of ${maxPromptBytes} bytes. ` +
+        `This is a typed capability refusal, not a transient spawn error — retrying the same invocation cannot succeed. ` +
+        `Remedy: assign a stdin- or file-capable adapter (e.g. claude/codex/grok), or for a custom reviewer CLI set ` +
+        `review_harness.prompt_delivery: stdin if it reads its prompt from standard input.`,
+    };
+  }
+  return { ok: true, measured };
+}
 
 /** The concrete command an adapter wants executed. `captureMode`/
  *  `transformForward` mirror `runCapped`'s options — adapter-declared instead
@@ -340,6 +525,9 @@ export function buildAdapterDeclaration(opts: {
 }): AdapterExtensionDeclaration {
   const caps = opts.capabilities;
   const promptDelivery = opts.promptDelivery;
+  // sizeLimit is derived from maxPromptBytes (single source of truth, #779) —
+  // never from delivery alone, so capabilities and declaration cannot disagree.
+  const sizeLimit = sizeLimitFromMaxPromptBytes(caps.maxPromptBytes);
   return {
     roles: opts.roles ?? (["implementer", "reviewer"] as const),
     executable: {
@@ -348,7 +536,7 @@ export function buildAdapterDeclaration(opts: {
     },
     prompt: {
       delivery: promptDelivery,
-      sizeLimit: promptDelivery === "argv" ? "max-arg-strlen" : "unlimited",
+      sizeLimit,
     },
     model: {
       supported: caps.model,

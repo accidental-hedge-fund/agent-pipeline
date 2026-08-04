@@ -46,11 +46,17 @@ import {
 } from "./harness-adapters/index.ts";
 import { makeClaudeForwardTransform } from "./harness-adapters/claude.ts";
 import { makeCodexForwardTransform } from "./harness-adapters/codex.ts";
-import { MAX_ARG_STRLEN, type AdapterProbe, type ExternalSandboxMode } from "./harness-adapters/types.ts";
+import {
+  MAX_ARG_STRLEN,
+  MAX_ARGV_PROMPT_BYTES,
+  checkMaterializedPromptBytes,
+  type AdapterProbe,
+  type ExternalSandboxMode,
+} from "./harness-adapters/types.ts";
 import { RUN_SCHEMA_VERSION, appendEvent, emitStageAccounting, type RunStoreDeps } from "./run-store.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
-export { MAX_ARG_STRLEN };
+export { MAX_ARG_STRLEN, MAX_ARGV_PROMPT_BYTES, checkMaterializedPromptBytes };
 
 const MAX_OUTPUT = 100_000; // 100 KB cap on captured output
 
@@ -171,6 +177,14 @@ export interface HarnessResult {
   // though both set spawn_error: true (so the #39 self-review fallback, which
   // only checks spawn_error, still applies).
   oversize_argv?: boolean;
+  /**
+   * True when `invoke()` refused before spawn because the fully materialized
+   * prompt exceeds the adapter's declared `maxPromptBytes`, or the limit is
+   * missing/unknown (#779). Typed capability refusal — distinct from bare
+   * `spawn_error`, residual `oversize_argv`, missing-CLI, and unauthenticated.
+   * Does **not** set `spawn_error` as the primary classification.
+   */
+  prompt_limit_exceeded?: boolean;
   // True when the output-capture stream (stdout/stderr) errored before a clean
   // process exit code was observed — e.g. the pipe breaking mid-stream (#384).
   // Distinct from spawn_error: the process itself started successfully.
@@ -294,6 +308,30 @@ export async function invoke(
       promptDelivery: opts.promptDelivery ?? "argv",
     });
   const custom = adapter.declaration.origin === "compatibility";
+
+  // #779: preflight-before-invoke — measure the fully materialized prompt
+  // against the adapter's declared maxPromptBytes before buildInvocation or
+  // spawn. Typed capability refusal (not bare spawn_error / oversize_argv).
+  const limitCheck = checkMaterializedPromptBytes(
+    adapter.capabilities.maxPromptBytes,
+    prompt,
+    {
+      adapterName: adapter.name,
+      delivery: adapter.declaration.prompt.delivery,
+    },
+  );
+  if (!limitCheck.ok) {
+    return {
+      success: false,
+      stdout: "",
+      stderr: limitCheck.message,
+      exit_code: -1,
+      duration: 0,
+      timed_out: false,
+      prompt_limit_exceeded: true,
+    };
+  }
+
   const inv = adapter.buildInvocation({
     prompt,
     worktreeDir,

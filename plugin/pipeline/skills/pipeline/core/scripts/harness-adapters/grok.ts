@@ -42,6 +42,8 @@ const CAPABILITIES: AdapterCapabilities = {
   sandbox: true,
   workingDir: "flag",
   telemetry: "none",
+  // prompt-file delivery — no OS per-argument ceiling on the prompt payload (#779).
+  maxPromptBytes: "unlimited",
 };
 
 export const grokAdapter: HarnessAdapter = {

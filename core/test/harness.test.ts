@@ -916,19 +916,109 @@ test("runCapped: an argv element one byte below MAX_ARG_STRLEN (131,071 bytes) i
   assert.equal(result.success, true);
 });
 
-test("invoke(): an unregistered reviewer CLI given an oversize prompt is never spawned and names review_harness.prompt_delivery as the remedy (#492)", async () => {
-  let spawned = false;
+test("invoke(): an unregistered reviewer CLI given an oversize prompt is refused at capability preflight before spawn (#779 / #492)", async () => {
   const missing = `oversize-argv-cli-${path.basename(tmpRoot)}`;
   const bigPrompt = "a".repeat(131_073);
-  // No real CLI on PATH — if the guard failed to refuse pre-spawn, this would
-  // surface as ENOENT, not the oversize-specific failure asserted below.
+  // Compatibility adapter declares finite maxPromptBytes for argv; #779 refuses
+  // at invoke preflight before buildInvocation / runCapped / spawn.
   const result = await invoke(missing, tmpRoot, bigPrompt, { stream: false });
-  assert.equal(spawned, false);
   assert.equal(result.success, false);
-  assert.equal(result.spawn_error, true);
-  assert.equal(result.oversize_argv, true);
+  assert.equal(result.prompt_limit_exceeded, true, "typed capability refusal (#779)");
+  assert.equal(result.spawn_error ?? false, false, "must not be classified as bare spawn_error");
+  assert.equal(result.oversize_argv ?? false, false, "capability preflight fires before residual oversize_argv guard");
   assert.doesNotMatch(result.stderr, /not found or not executable/, "must not be reported as a missing-CLI error");
-  assert.match(result.stderr, /review_harness\.prompt_delivery/, "must name the remedy setting");
+  assert.match(result.stderr, /maxPromptBytes|13107[01]/, "must name the limit");
+  assert.match(result.stderr, /131073/, "must report the measured size");
+  assert.match(result.stderr, /review_harness\.prompt_delivery|stdin/, "must name the remedy");
+});
+
+// ---------------------------------------------------------------------------
+// #779 — maxPromptBytes preflight-before-invoke
+// ---------------------------------------------------------------------------
+
+test("invoke(): finite-limit adapter refuses oversize materialized prompt before spawn with measured size (#779)", async () => {
+  const { materializeCompatibilityAdapter, registerAdapter, _resetRegistryForTests } =
+    await import("../scripts/harness-adapters/index.ts");
+  _resetRegistryForTests();
+  // Register a finite-limit argv adapter under a unique name.
+  const finite = materializeCompatibilityAdapter("finite-limit-cli-779", {
+    promptDelivery: "argv",
+  });
+  assert.equal(finite.capabilities.maxPromptBytes, 131_071);
+  registerAdapter(finite);
+
+  const oversize = "x".repeat(131_072); // limit+1 under measured > max rule
+  const result = await invoke("finite-limit-cli-779", tmpRoot, oversize, { stream: false });
+  assert.equal(result.success, false);
+  assert.equal(result.prompt_limit_exceeded, true);
+  assert.equal(result.spawn_error ?? false, false);
+  assert.match(result.stderr, /finite-limit-cli-779/);
+  assert.match(result.stderr, /131072/);
+  assert.match(result.stderr, /131071/);
+  assert.match(result.stderr, /cannot succeed|retrying/i);
+  _resetRegistryForTests();
+});
+
+test("invoke(): prompt at exactly finite maxPromptBytes is not refused by the size check (#779)", async () => {
+  const cli = makeScript("at-limit-reviewer", `printf 'ok'`);
+  const atLimit = "z".repeat(131_071); // == MAX_ARGV_PROMPT_BYTES
+  const result = await invoke(cli, tmpRoot, atLimit, { stream: false });
+  assert.equal(result.prompt_limit_exceeded ?? false, false);
+  assert.equal(result.oversize_argv ?? false, false);
+  assert.equal(result.success, true);
+});
+
+test("invoke(): unlimited adapter is not size-refused for a >128KiB prompt (#779)", async () => {
+  // claude is unlimited + stdin; large prompt must reach the CLI (same as #492).
+  const cli = makeScript("claude", `wc -c`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  const bigPrompt = "x".repeat(200_000);
+  try {
+    const result = await invoke("claude", tmpRoot, bigPrompt, { stream: false });
+    assert.equal(result.prompt_limit_exceeded ?? false, false);
+    assert.equal(result.spawn_error ?? false, false);
+    assert.equal(result.stdout.trim(), String(Buffer.byteLength(bigPrompt, "utf8")));
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("checkMaterializedPromptBytes: unknown limit fails closed (#779)", async () => {
+  const { checkMaterializedPromptBytes } = await import("../scripts/harness.ts");
+  const res = checkMaterializedPromptBytes("unknown", "small", {
+    adapterName: "mystery",
+    delivery: "stdin",
+  });
+  assert.equal(res.ok, false);
+  if (!res.ok) {
+    assert.equal(res.reason, "unknown");
+    assert.match(res.message, /unknown/);
+    assert.match(res.message, /finite|unlimited/i);
+  }
+});
+
+test("checkMaterializedPromptBytes: boundary limit-1 / limit / limit+1 (#779)", async () => {
+  const { checkMaterializedPromptBytes, MAX_ARGV_PROMPT_BYTES } = await import(
+    "../scripts/harness.ts"
+  );
+  const limit = MAX_ARGV_PROMPT_BYTES;
+  const under = checkMaterializedPromptBytes(limit, "a".repeat(limit - 1), {
+    adapterName: "t",
+    delivery: "argv",
+  });
+  assert.equal(under.ok, true);
+  const exact = checkMaterializedPromptBytes(limit, "a".repeat(limit), {
+    adapterName: "t",
+    delivery: "argv",
+  });
+  assert.equal(exact.ok, true, "measured == maxPromptBytes must not refuse");
+  const over = checkMaterializedPromptBytes(limit, "a".repeat(limit + 1), {
+    adapterName: "t",
+    delivery: "argv",
+  });
+  assert.equal(over.ok, false);
+  if (!over.ok) assert.equal(over.reason, "oversize");
 });
 
 test("invoke(): a custom reviewer CLI with promptDelivery:'stdin' is spawned with no prompt positional and the prompt on stdin (#492)", async () => {
