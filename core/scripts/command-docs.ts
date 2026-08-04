@@ -74,8 +74,9 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     section: "observability",
   },
   doctor: {
-    summary: "Deterministic preflight check; print summary, exit 0/1",
-    usage: "doctor",
+    summary:
+      "Deterministic preflight check; print summary, exit 0/1. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment",
+    usage: "doctor [--json|--is-ok] [--fail-fast] [--harness-smoke]",
     documented: true,
     section: "lifecycle",
   },

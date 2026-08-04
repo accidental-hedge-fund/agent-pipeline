@@ -180,7 +180,7 @@ Uninstall removes the host skill tree. For Claude it also removes installer-writ
 /pipeline N                 # advance issue N (Claude)
 $pipeline N                 # advance issue N (Codex)
 /pipeline:status N          # stage, blocker, PR, last review
-/pipeline:doctor            # deterministic preflight
+/pipeline:doctor            # deterministic preflight (opt-in --harness-smoke)
 /pipeline:init              # labels + .github/pipeline.yml scaffold
 ```
 

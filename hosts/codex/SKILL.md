@@ -69,7 +69,7 @@ $pipeline loop --milestone <m>|--label <l>|--range a-b [--resume <run-id>] [--au
 $pipeline run <n> [--detach]                    Advance alias; use with --detach for a legacy raw detached run (desktop launchers)
 $pipeline single <n>                            Canonical durable one-item autonomous drive (owns a durable loop; delegates stages to advance)
 $pipeline cleanup                               Sweep merged-PR worktrees and delete their local branches
-$pipeline doctor                                Deterministic preflight check; print summary, exit 0/1
+$pipeline doctor [--json|--is-ok] [--fail-fast] [--harness-smoke] Deterministic preflight check; print summary, exit 0/1. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment
 $pipeline init                                  Ensure pipeline labels and scaffold .github/pipeline.yml
 $pipeline merge <pr>                            Human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
 $pipeline merge-queue --milestone <m> [--apply] [--release-when-complete --release-version <ver>] Human-gated sequential merge of ready-to-deploy PRs; optional prepare-only release-when-complete
@@ -206,10 +206,10 @@ idempotent and `remove` tolerates an absent entry (exit 0, warning). `--rel`
 selects `depends_on` (default) or `depended_on_by`. `list` prints current
 entries grouped by relationship kind.
 
-`doctor` takes no number either. It runs a **deterministic, model-free** preflight
-that checks required CLIs (`gh`, `node`), GitHub auth + repo access, worktree
-cleanliness on protected branches, configured harness availability, npm install
-freshness, whether the installed engine version is behind the latest
+`doctor` takes no number either. By default it runs a **deterministic, model-free**
+preflight that checks required CLIs (`gh`, `node`), GitHub auth + repo access,
+worktree cleanliness on protected branches, configured harness availability, npm
+install freshness, whether the installed engine version is behind the latest
 agent-pipeline release, and — when configured — the `openspec` CLI and the eval
 command's binary. It prints a per-check pass/fail/warn summary with one-line
 remediation on each failure or warning and exits `0` (all pass or warn) / `1`
@@ -228,6 +228,16 @@ with `doctor.runOnStart: true` or `--doctor`: a failing check aborts **before
 planning**, so no tokens are spent, while a warning prints but does not abort.
 `--fail-fast` (or `doctor.failFast: true`) stops at the first failure. The
 latest result is stored under `/tmp` and surfaced by `--status`.
+
+**Opt-in harness smoke (`--harness-smoke`, #780):** after the static checks,
+doctor may also run a role-aware, treatment-exact runtime smoke for every unique
+configured `{adapter, role, model, effort}` coordinate (~**one cheap model call
+per treatment**). Implementer smoke proves spawn + trailer-bearing commit +
+stage-output contract + optional telemetry in a throwaway scratch repo; reviewer
+smoke proves a structured read-only verdict with **no** repository mutation
+(reviewer-only adapters are not required to commit). Readiness/`runtimeSmoke`
+hooks run first and short-circuit a treatment without a model call when possible.
+Default `pipeline doctor` (flag absent) remains model-free.
 
 **Doctor vs production preflight-on-invoke (#636):** doctor is optional
 run-start readiness (coarse assigned-adapter / host capability checks). It is
@@ -1066,7 +1076,7 @@ stopped**).
 - `--init` — ensures labels + scaffolds `.github/pipeline.yml`, completes in seconds
 - `config sync` — previews/applies a validated `.github/pipeline.yml` scaffold refresh, completes in seconds
 - `config repo-map <add|remove|list>` — mutates/lists `repo_map` entries, completes in seconds
-- `doctor` — deterministic preflight, no model calls, completes in seconds
+- `doctor` — deterministic preflight by default (no model calls); opt-in `--harness-smoke` adds cheap runtime smoke, completes in seconds without the flag
 - `$pipeline:loop --audit` — read-only report (stage table) for a durable run; synchronous, no event-follow
 - `$pipeline:loop --resume <run-id> --audit --follow` — read-only stage-progress stream; no run-liveness lock
 

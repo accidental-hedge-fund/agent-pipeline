@@ -92,9 +92,9 @@ export const OPERATION_SURFACE = [
   },
   {
     name: "doctor",
-    desc: "Run deterministic preflight checks and print a pass/fail summary",
-    argHint: "",
-    cliArgs: "doctor",
+    desc: "Run deterministic preflight checks and print a pass/fail summary (opt-in --harness-smoke for role-aware runtime smoke)",
+    argHint: "[--harness-smoke]",
+    cliArgs: "doctor $ARGUMENTS",
     fast: true,
   },
   {
