@@ -266,6 +266,77 @@ export type SentinelData = {
   timedOut?: true;
 };
 
+/** Env key carrying JSON map of adapter command → absolute CLI path (#636). */
+export const PIPELINE_HARNESS_CLI_PATHS_ENV = "PIPELINE_HARNESS_CLI_PATHS";
+
+/**
+ * Pack a detach-launch environment so harness CLI discovery stays equivalent
+ * to the foreground launcher (#636). Never strips or replaces PATH; optionally
+ * records absolute executable paths resolved before launch.
+ *
+ * Pure — unit-testable without a real spawn.
+ */
+export function packDetachHarnessEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  opts: {
+    /** Absolute paths keyed by adapter command name (or CLI id). */
+    absoluteCliPaths?: Record<string, string>;
+  } = {},
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...baseEnv };
+  // Explicitly preserve PATH (and empty-string PATH is still "set") so a later
+  // consumer cannot treat omission as "rebuild a minimal PATH".
+  if (baseEnv.PATH !== undefined) env.PATH = baseEnv.PATH;
+  const paths = opts.absoluteCliPaths;
+  if (paths && Object.keys(paths).length > 0) {
+    env[PIPELINE_HARNESS_CLI_PATHS_ENV] = JSON.stringify(paths);
+  }
+  return env;
+}
+
+/**
+ * Assert foreground vs detach harness-discovery parity for one command (#636).
+ * Fails when foreground can resolve the command but a stripped detach PATH
+ * cannot, unless an absolute path was packed for that command.
+ *
+ * Pure — inject `resolve` (e.g. lookup on a synthetic PATH map).
+ */
+export function assertHarnessDiscoveryParity(opts: {
+  command: string;
+  /** PATH string as seen by the foreground launcher. */
+  foregroundPath: string | undefined;
+  /** PATH string as packed for the detached child. */
+  detachPath: string | undefined;
+  /**
+   * Resolve `command` under `pathEnv` to an absolute path, or null when
+   * missing. Tests inject a fake; production may use `command -v` semantics.
+   */
+  resolve: (command: string, pathEnv: string | undefined) => string | null;
+  /** Absolute path packed for this command, if any. */
+  absolutePacked?: string | null;
+}): { ok: true } | { ok: false; message: string } {
+  const fg = opts.resolve(opts.command, opts.foregroundPath);
+  if (!fg) {
+    // Foreground cannot resolve either — parity holds (both missing).
+    return { ok: true };
+  }
+  if (opts.absolutePacked && opts.absolutePacked.startsWith("/")) {
+    return { ok: true };
+  }
+  const bg = opts.resolve(opts.command, opts.detachPath);
+  if (bg) {
+    // Same or different absolute path is fine as long as resolution succeeds.
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    message:
+      `harness discovery PATH parity failed for "${opts.command}": ` +
+      `resolvable in foreground PATH but not under detach PATH, and no absolute ` +
+      `executable was packed. Preserve PATH or pack the absolute path before detach.`,
+  };
+}
+
 export type SpawnDetachedOpts = {
   /**
    * Pipeline domain (same identity as foreground advance — config domain /
@@ -277,6 +348,12 @@ export type SpawnDetachedOpts = {
   timeout?: number;
   /** Advisory lock acquisition timeout in ms. Default 5000. */
   flockTimeoutMs?: number;
+  /**
+   * Absolute harness CLI paths resolved before launch (#636). Packed into the
+   * wrapper/child environment so detached invoke does not depend on a narrower
+   * PATH than the launcher.
+   */
+  absoluteCliPaths?: Record<string, string>;
 };
 
 export type SpawnDetachedResult = {
@@ -453,9 +530,17 @@ export async function spawnDetached(
     ...(pipelineArgs.length > 0 ? ["--", ...pipelineArgs] : []),
   ];
 
+  // #636: preserve harness-discovery PATH equivalence with the foreground
+  // launcher; never spawn detach with a stripped/replaced PATH. Optionally
+  // pack absolute CLI paths resolved before launch.
+  const detachEnv = packDetachHarnessEnv(process.env, {
+    absoluteCliPaths: opts.absoluteCliPaths,
+  });
+
   const child = deps.spawn(process.execPath, wrapperArgs, {
     detached: true,
     stdio: ["ignore", logFd, logFd],
+    env: detachEnv,
   });
 
   fs.closeSync(logFd);
@@ -651,12 +736,14 @@ export async function runWrapper(argv: string[]): Promise<void> {
       : ["--domain", domain, ...pipelinePassArgs]),
   ];
 
+  // #636: inherit the wrapper env (including preserved PATH and any packed
+  // absolute harness CLI paths) rather than rebuilding a minimal env.
+  const innerEnv = packDetachHarnessEnv(process.env);
+  innerEnv[ISSUE_RUN_LOCK_HELD_ENV] = issueRunLockHeldToken(domain, issueNumber);
+
   innerProcess = spawn(process.execPath, innerArgs, {
     stdio: ["ignore", "inherit", "inherit"],
-    env: {
-      ...process.env,
-      [ISSUE_RUN_LOCK_HELD_ENV]: issueRunLockHeldToken(domain, issueNumber),
-    },
+    env: innerEnv,
   });
 
   const exitCode = await new Promise<number>((resolve) => {

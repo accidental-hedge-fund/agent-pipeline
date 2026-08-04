@@ -13,9 +13,10 @@
 //        (`-a` / `--ask-for-approval`) are rejected by the CLI and are not
 //        emitted; never-ask is the `codex exec` path default.
 //        PIPELINE_CODEX_NO_SANDBOX=1 swaps the managed sandbox pair for
-//        --dangerously-bypass-approvals-and-sandbox. #607: a caller-supplied
-//        `ctx.sandboxMode` takes precedence over that ambient env var — see
-//        AdapterInvocationContext.sandboxMode.
+//        --dangerously-bypass-approvals-and-sandbox. #607 / #636: production
+//        `invoke` resolves effective sandboxMode (explicit or ambient) once
+//        before preflight and always passes it here. Ambient env is only a
+//        fallback when `ctx.sandboxMode` is absent (non-invoke callers).
 //
 // #492: `codex exec --help` documents the prompt argument: "If not provided
 // as an argument (or if `-` is used), instructions are read from stdin" — the

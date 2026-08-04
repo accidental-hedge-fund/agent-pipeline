@@ -20,6 +20,7 @@ import {
 } from "../scripts/stages/refine-spec.ts";
 import { buildRefineSpecPrompt } from "../scripts/prompts/index.ts";
 import { buildCmd } from "../scripts/pipeline.ts";
+import { withPreflightReadiness } from "./_preflight-readiness-shim.ts";
 
 // ---------------------------------------------------------------------------
 // Fake deps factory
@@ -487,7 +488,7 @@ test("refine-spec: realRefineSpecDeps.runHarness targets the resolved implemente
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "refine-spec-wt-"));
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "refine-spec-grok-"));
   const cli = path.join(binDir, "grok");
-  fs.writeFileSync(cli, `#!/usr/bin/env bash\ncat "$3"\n`);
+  fs.writeFileSync(cli, withPreflightReadiness(`cat "$3"`));
   fs.chmodSync(cli, 0o755);
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;

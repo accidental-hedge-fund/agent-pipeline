@@ -231,7 +231,7 @@ Nested fields:
 #### `doctor.runOnStart`
 
 - **Type:** boolean
-- **Description:** Run preflight checks before planning; abort on any failure.
+- **Description:** Optional doctor capability checks before planning; abort on any failure. Distinct from mandatory production preflight-on-invoke (#636), which still runs the exact resolved treatment gate on every local-CLI harness call even when this is false.
 
 ### `domain_description`
 

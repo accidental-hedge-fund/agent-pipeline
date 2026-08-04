@@ -17,6 +17,7 @@ import {
 } from "../scripts/stages/backfill.ts";
 import { buildCmd } from "../scripts/pipeline.ts";
 import { lookupCommand, validateFlags, COMMAND_REGISTRY } from "../scripts/command-registry.ts";
+import { withPreflightReadiness } from "./_preflight-readiness-shim.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -613,7 +614,7 @@ test("backfill: realBackfillDeps.runHarness targets the resolved implementer (gr
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-wt-"));
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "backfill-grok-"));
   const cli = path.join(binDir, "grok");
-  fs.writeFileSync(cli, `#!/usr/bin/env bash\ncat "$3"\n`);
+  fs.writeFileSync(cli, withPreflightReadiness(`cat "$3"`));
   fs.chmodSync(cli, 0o755);
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;

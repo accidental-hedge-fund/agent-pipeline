@@ -34,11 +34,57 @@ import type { RunStoreDeps } from "../scripts/run-store.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-harness-test-"));
 
+/**
+ * Common readiness probes exercised by production preflight-on-invoke (#636)
+ * before the real stage spawn. Fake CLIs used as stand-ins for built-in
+ * adapters must answer these without running the test body, so auth/version
+ * checks succeed and the subsequent invoke spawn still sees the body argv.
+ */
+const PREFLIGHT_READINESS_SHIM = `
+# production preflight readiness (#636) — answer probes, then fall through
+if [ "$#" -ge 1 ]; then
+  case "$1" in
+    --version|version|--help)
+      echo "\${0##*/} 1.0.0-test"
+      exit 0
+      ;;
+  esac
+  if [ "$1" = "auth" ] && [ "\${2:-}" = "status" ]; then
+    echo '{"loggedIn":true}'
+    exit 0
+  fi
+  if [ "$1" = "login" ] && [ "\${2:-}" = "status" ]; then
+    echo "Logged in using ChatGPT"
+    exit 0
+  fi
+  if [ "$1" = "--list-models" ]; then
+    echo "model-a (test)"
+    exit 0
+  fi
+  if [ "$1" = "providers" ] && [ "\${2:-}" = "list" ]; then
+    echo "provider-a"
+    exit 0
+  fi
+  if [ "$1" = "run" ] && [ "\${2:-}" = "--help" ]; then
+    echo "Usage: run"
+    exit 0
+  fi
+  # grok auth probe
+  if [ "$1" = "models" ]; then
+    echo "model-a"
+    exit 0
+  fi
+fi
+`.trim();
+
 /** Write an executable shell script at `name` whose body is `body`; returns its path. */
 function makeScript(name: string, body: string): string {
   const dir = fs.mkdtempSync(path.join(tmpRoot, "bin-"));
   const cliPath = path.join(dir, name);
-  fs.writeFileSync(cliPath, `#!/usr/bin/env bash\n${body}\n`);
+  fs.writeFileSync(
+    cliPath,
+    `#!/usr/bin/env bash\n${PREFLIGHT_READINESS_SHIM}\n${body}\n`,
+  );
   fs.chmodSync(cliPath, 0o755);
   return cliPath;
 }
@@ -252,19 +298,33 @@ function assertCodexBypassSandboxArgv(argvText: string): void {
   }
 }
 
-test("invoke(): codex with sandbox:true produces args identical to sandbox:false (#21)", async () => {
+test("invoke(): codex with sandbox:true is refused by production preflight (#636), not silently dropped", async () => {
+  // codex declares capabilities.sandbox: false — AdapterRequest.sandbox must
+  // fail closed before spawn rather than being omitted while reporting success.
   const cli = makeScript("codex", `printf '%s\\n' "$@"`);
   const oldPath = process.env.PATH;
   const oldNoSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
   delete process.env.PIPELINE_CODEX_NO_SANDBOX;
   try {
-    const [withSandbox, withoutSandbox] = await Promise.all([
-      invoke("codex", tmpRoot, "test-prompt", { stream: false, sandbox: true }),
-      invoke("codex", tmpRoot, "test-prompt", { stream: false, sandbox: false }),
-    ]);
-    assert.equal(withSandbox.stdout, withoutSandbox.stdout, "codex args must be identical regardless of sandbox flag");
-    assertCodexManagedSandboxArgv(withSandbox.stdout, "default codex invocation must use managed --sandbox workspace-write (#613)");
+    const withSandbox = await invoke("codex", tmpRoot, "test-prompt", {
+      stream: false,
+      sandbox: true,
+    });
+    assert.equal(withSandbox.success, false);
+    assert.equal(withSandbox.preflight_failed, true);
+    assert.equal(withSandbox.preflight_class, "unsupported-setting");
+    assert.match(withSandbox.stderr, /sandbox/i);
+    // sandbox:false (or absent) still proceeds with managed workspace-write.
+    const withoutSandbox = await invoke("codex", tmpRoot, "test-prompt", {
+      stream: false,
+      sandbox: false,
+    });
+    assert.equal(withoutSandbox.success, true);
+    assertCodexManagedSandboxArgv(
+      withoutSandbox.stdout,
+      "default codex invocation must use managed --sandbox workspace-write (#613)",
+    );
   } finally {
     process.env.PATH = oldPath;
     if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
