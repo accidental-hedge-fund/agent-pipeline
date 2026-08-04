@@ -906,6 +906,7 @@ test("intake: readFileAtBase is also called in dry-run mode", async () => {
 
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { withPreflightReadiness } from "./_preflight-readiness-shim.ts";
 
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
 
@@ -988,7 +989,7 @@ function makeFakeClaudeOnPath(): { restore: () => void } {
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "intake-claude-"));
   const cli = path.join(binDir, "claude");
   // Echo each received arg on its own line so the test can assert the argv.
-  fs.writeFileSync(cli, `#!/usr/bin/env bash\nprintf '%s\\n' "$@"\n`);
+  fs.writeFileSync(cli, withPreflightReadiness(`printf '%s\\n' "$@"`));
   fs.chmodSync(cli, 0o755);
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
@@ -1056,7 +1057,7 @@ test("intake: realIntakeDeps.runHarness targets the resolved implementer (grok) 
   // A fake `grok` that proves it was invoked (`--no-auto-update ... --prompt-file <path>`)
   // by echoing the prompt file's content — the same shape harness.test.ts uses.
   const cli = path.join(binDir, "grok");
-  fs.writeFileSync(cli, `#!/usr/bin/env bash\ncat "$3"\n`);
+  fs.writeFileSync(cli, withPreflightReadiness(`cat "$3"`));
   fs.chmodSync(cli, 0o755);
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;

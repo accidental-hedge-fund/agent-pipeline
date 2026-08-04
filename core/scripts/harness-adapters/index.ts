@@ -171,3 +171,17 @@ export {
   versionsCompatible,
   type VerifiedAgainstIdentity,
 } from "./verified-against.ts";
+// #636 — production preflight-on-invoke for the exact resolved treatment.
+export {
+  defaultProductionPreflightDeps,
+  projectPreflightRemediation,
+  resolveAbsoluteExecutable,
+  runProductionPreflight,
+  type ProductionPreflightDeps,
+  type ProductionPreflightFailureClass,
+  type ProductionPreflightInterventionKind,
+  type ProductionPreflightReasonCode,
+  type ProductionPreflightRemediation,
+  type ProductionPreflightRequest,
+  type ProductionPreflightResult,
+} from "./production-preflight.ts";

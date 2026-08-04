@@ -802,6 +802,9 @@ export interface PipelineConfig {
   // false) stops at the first failing check instead of collecting all failures.
   // Both default off so existing runs are completely unchanged unless explicitly
   // enabled (or `pipeline doctor` / `--doctor` is invoked).
+  // Distinct from mandatory production preflight-on-invoke (#636): every local-CLI
+  // harness model call still preflights the exact resolved treatment even when
+  // `runOnStart` is false.
   doctor: {
     runOnStart: boolean;
     failFast: boolean;

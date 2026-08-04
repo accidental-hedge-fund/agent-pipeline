@@ -232,6 +232,16 @@ planning**, so no tokens are spent, while a warning prints but does not abort.
 `--fail-fast` (or `doctor.failFast: true`) stops at the first failure. The
 latest result is stored under `/tmp` and surfaced by `--status`.
 
+**Doctor vs production preflight-on-invoke (#636):** doctor is optional
+run-start readiness (coarse assigned-adapter / host capability checks). It is
+**not** a substitute for the mandatory per-invocation gate: every production
+local-CLI harness model call (implementer and reviewer) still preflights the
+**exact resolved** adapter, role, model, effort, sandbox/tool policy, prompt
+byte limit, and executable readiness before spawn — even when
+`doctor.runOnStart` is false. Unsupported or unavailable settings fail closed
+with typed remediation; the pipeline never falls back to another harness or an
+ambient model default.
+
 `intake` turns a rough one-line description into a decision-complete GitHub issue
 **and** a matching `ROADMAP.md` update — in one command:
 

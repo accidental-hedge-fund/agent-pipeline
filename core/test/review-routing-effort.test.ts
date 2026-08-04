@@ -16,13 +16,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { invokePromptHarnessReview } from "../scripts/stages/review-routing.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+import { withPreflightReadiness } from "./_preflight-readiness-shim.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-review-routing-test-"));
 
 function makeFakeClaude(): string {
   const dir = fs.mkdtempSync(path.join(tmpRoot, "bin-"));
   const cliPath = path.join(dir, "claude");
-  fs.writeFileSync(cliPath, `#!/usr/bin/env bash\nprintf '%s\\n' "$@"\n`);
+  fs.writeFileSync(cliPath, withPreflightReadiness(`printf '%s\\n' "$@"`));
   fs.chmodSync(cliPath, 0o755);
   return dir;
 }
@@ -30,7 +31,7 @@ function makeFakeClaude(): string {
 function makeFakeCodex(): string {
   const dir = fs.mkdtempSync(path.join(tmpRoot, "bin-"));
   const cliPath = path.join(dir, "codex");
-  fs.writeFileSync(cliPath, `#!/usr/bin/env bash\nprintf '%s\\n' "$@"\n`);
+  fs.writeFileSync(cliPath, withPreflightReadiness(`printf '%s\\n' "$@"`));
   fs.chmodSync(cliPath, 0o755);
   return dir;
 }

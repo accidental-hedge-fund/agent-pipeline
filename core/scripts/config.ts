@@ -403,7 +403,12 @@ const PartialConfigSchema = z.object({
     .describe("Controls which review findings block progression vs. merely advise."),
   doctor: z
     .object({
-      runOnStart: z.boolean().optional().describe("Run preflight checks before planning; abort on any failure."),
+      runOnStart: z
+        .boolean()
+        .optional()
+        .describe(
+          "Optional doctor capability checks before planning; abort on any failure. Distinct from mandatory production preflight-on-invoke (#636), which still runs the exact resolved treatment gate on every local-CLI harness call even when this is false.",
+        ),
       failFast: z.boolean().optional().describe("Stop at the first failing check instead of collecting all failures."),
     })
     .strict()

@@ -787,6 +787,7 @@ test("sweep: roadmap mutation failure is atomic — release-plan row not committ
 
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { withPreflightReadiness } from "./_preflight-readiness-shim.ts";
 
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
 
@@ -1026,7 +1027,7 @@ test("sweep: realSweepDeps.runHarness forwards the pinned model and lean flags t
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-wt-"));
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-claude-"));
   const cli = path.join(binDir, "claude");
-  fs.writeFileSync(cli, `#!/usr/bin/env bash\nprintf '%s\\n' "$@"\n`);
+  fs.writeFileSync(cli, withPreflightReadiness(`printf '%s\\n' "$@"`));
   fs.chmodSync(cli, 0o755);
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
@@ -1046,7 +1047,7 @@ test("sweep: realSweepDeps.runHarness forwards reasoningEffort as --effort to cl
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-wt-"));
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-claude-"));
   const cli = path.join(binDir, "claude");
-  fs.writeFileSync(cli, `#!/usr/bin/env bash\nprintf '%s\\n' "$@"\n`);
+  fs.writeFileSync(cli, withPreflightReadiness(`printf '%s\\n' "$@"`));
   fs.chmodSync(cli, 0o755);
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
@@ -1062,7 +1063,7 @@ test("sweep: realSweepDeps.runHarness omits --effort when reasoningEffort is uns
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-wt-"));
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-claude-"));
   const cli = path.join(binDir, "claude");
-  fs.writeFileSync(cli, `#!/usr/bin/env bash\nprintf '%s\\n' "$@"\n`);
+  fs.writeFileSync(cli, withPreflightReadiness(`printf '%s\\n' "$@"`));
   fs.chmodSync(cli, 0o755);
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
@@ -1078,7 +1079,7 @@ test("sweep: realSweepDeps defaults the model to DEFAULT_CONFIG.models.sweep whe
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-wt-"));
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-claude-"));
   const cli = path.join(binDir, "claude");
-  fs.writeFileSync(cli, `#!/usr/bin/env bash\nprintf '%s\\n' "$@"\n`);
+  fs.writeFileSync(cli, withPreflightReadiness(`printf '%s\\n' "$@"`));
   fs.chmodSync(cli, 0o755);
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;
@@ -1101,7 +1102,7 @@ test("sweep: realSweepDeps.runHarness targets the resolved implementer (grok) wh
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-wt-"));
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-grok-"));
   const cli = path.join(binDir, "grok");
-  fs.writeFileSync(cli, `#!/usr/bin/env bash\ncat "$3"\n`);
+  fs.writeFileSync(cli, withPreflightReadiness(`cat "$3"`));
   fs.chmodSync(cli, 0o755);
   const oldPath = process.env.PATH;
   process.env.PATH = `${binDir}:${oldPath}`;

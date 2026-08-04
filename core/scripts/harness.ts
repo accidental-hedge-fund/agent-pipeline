@@ -42,13 +42,17 @@ import * as path from "node:path";
 import { buildStageAccountingRecord } from "./accounting.ts";
 import {
   buildTreatmentFingerprint,
+  defaultProductionPreflightDeps,
   formatVersionDriftWarning,
   getVerifiedAgainst,
   materializeCompatibilityAdapter,
   probeCliVersionOnce,
   resolveAdapter,
   resolveCommandPath,
+  runProductionPreflight,
   type AdapterRole,
+  type ProductionPreflightDeps,
+  type ProductionPreflightFailureClass,
 } from "./harness-adapters/index.ts";
 import { makeClaudeForwardTransform } from "./harness-adapters/claude.ts";
 import { makeCodexForwardTransform } from "./harness-adapters/codex.ts";
@@ -64,6 +68,16 @@ import { RUN_SCHEMA_VERSION, appendEvent, emitStageAccounting, type RunStoreDeps
 import type { Harness, PipelineConfig } from "./types.ts";
 
 export { MAX_ARG_STRLEN, MAX_ARGV_PROMPT_BYTES, checkMaterializedPromptBytes };
+export {
+  runProductionPreflight,
+  projectPreflightRemediation,
+  resolveAbsoluteExecutable,
+  defaultProductionPreflightDeps,
+  type ProductionPreflightDeps,
+  type ProductionPreflightRequest,
+  type ProductionPreflightResult,
+  type ProductionPreflightFailureClass,
+} from "./harness-adapters/index.ts";
 
 const MAX_OUTPUT = 100_000; // 100 KB cap on captured output
 
@@ -193,6 +207,28 @@ export interface HarnessResult {
    * Does **not** set `spawn_error` as the primary classification.
    */
   prompt_limit_exceeded?: boolean;
+  /**
+   * True when production preflight-on-invoke (#636) refused before
+   * `buildInvocation` / spawn (unsupported setting, missing CLI, role, auth,
+   * headless, prompt limit, …). Distinct from a mid-stage spawn_error.
+   */
+  preflight_failed?: boolean;
+  /**
+   * Structured production preflight failure class when `preflight_failed` is
+   * true (#636). Includes adapter preflight classes plus prompt-limit /
+   * role-ineligible / missing-executable.
+   */
+  preflight_class?: ProductionPreflightFailureClass;
+  /**
+   * #760-compatible stage-diagnostic reason code for a production preflight
+   * refusal (`environment-auth` | `capability-refusal`).
+   */
+  preflight_reason_code?: "environment-auth" | "capability-refusal";
+  /**
+   * #760-compatible human intervention kind for a production preflight
+   * refusal (`auth-tooling-preflight-failure`).
+   */
+  preflight_intervention_kind?: "auth-tooling-preflight-failure";
   // True when the output-capture stream (stdout/stderr) errored before a clean
   // process exit code was observed — e.g. the pipe breaking mid-stream (#384).
   // Distinct from spawn_error: the process itself started successfully.
@@ -293,6 +329,18 @@ export interface InvokeOptions {
   versionProbeDeps?: {
     exec(file: string, args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }>;
   };
+  /**
+   * Injectable production preflight deps (#636). When omitted, production uses
+   * real subprocess/fs readiness probes. Tests inject fakes so the exact
+   * resolved request can be proven without real network/auth.
+   */
+  preflightDeps?: ProductionPreflightDeps;
+  /**
+   * Role for this invocation (implementer / reviewer). When set, production
+   * preflight refuses adapters that do not declare the role (#636 / #783).
+   * Also threaded into treatment fingerprint accounting when present.
+   */
+  role?: AdapterRole | null;
   /** Additional env vars merged into the child process's environment on top of
    *  process.env (#419 — papercuts.enabled run/stage/harness/model identity, so
    *  `pipeline papercut --run <id> ...` can resolve identity without the agent
@@ -327,28 +375,78 @@ export async function invoke(
     });
   const custom = adapter.declaration.origin === "compatibility";
 
-  // #779: preflight-before-invoke — measure the fully materialized prompt
-  // against the adapter's declared maxPromptBytes before buildInvocation or
-  // spawn. Typed capability refusal (not bare spawn_error / oversize_argv).
-  const limitCheck = checkMaterializedPromptBytes(
-    adapter.capabilities.maxPromptBytes,
-    prompt,
+  // #636: production preflight-on-invoke for the exact resolved treatment —
+  // prompt size (#779), absolute executable, role eligibility, and
+  // adapter.preflight({model, effort, sandbox}) before buildInvocation/spawn.
+  // Built-in, extension, and compatibility adapters share this path. Never
+  // substitutes an ambient model or another adapter on failure.
+  //
+  // Preflight I/O is independent of versionProbeDeps: accounting injects a
+  // version-only fake that would break auth JSON probes if reused here.
+  const role = opts.role ?? opts.accounting?.role ?? null;
+  const realExec = defaultVersionProbeDeps().exec;
+  const versionExec = opts.versionProbeDeps?.exec ?? realExec;
+  const preflightDeps: ProductionPreflightDeps =
+    opts.preflightDeps ??
+    (() => {
+      const d = defaultProductionPreflightDeps({
+        exec: realExec,
+        resolvePath: (command) => resolveCommandPath(command, { exec: realExec }),
+        fsExecutable: defaultFsExecutable,
+        fsExists: defaultFsExists,
+      });
+      // Version probe may use the accounting inject (once-per-run cache warm);
+      // readiness/auth still use realExec above.
+      d.versionProbe = {
+        exec: versionExec,
+        resolvePath: (command) => resolveCommandPath(command, { exec: versionExec }),
+      };
+      return d;
+    })();
+
+  const preflight = await runProductionPreflight(
+    adapter,
     {
-      adapterName: adapter.name,
-      delivery: adapter.declaration.prompt.delivery,
+      prompt,
+      model: opts.model,
+      effort: opts.reasoningEffort,
+      sandbox: opts.sandbox,
+      role,
+      sandboxMode: opts.sandboxMode ?? null,
     },
+    preflightDeps,
   );
-  if (!limitCheck.ok) {
+
+  if (!preflight.ok) {
+    const remediation = preflight.remediation;
+    // Missing-CLI classes also set spawn_error so the #39 self-review fallback
+    // (which only checks spawn_error) still applies for a missing reviewer CLI.
+    const missingCli =
+      remediation.failure === "missing-cli" || remediation.failure === "missing-executable";
+    const missingCliMessage =
+      custom && missingCli
+        ? `reviewer CLI '${harness}' not found or not executable — ensure it is installed and on PATH\n${remediation.message}`
+        : remediation.message;
     return {
       success: false,
       stdout: "",
-      stderr: limitCheck.message,
+      stderr: missingCliMessage,
       exit_code: -1,
       duration: 0,
       timed_out: false,
-      prompt_limit_exceeded: true,
+      preflight_failed: true,
+      preflight_class: remediation.failure,
+      preflight_reason_code: remediation.reasonCode,
+      preflight_intervention_kind: remediation.interventionKind,
+      ...(missingCli ? { spawn_error: true } : {}),
+      // Keep the #779 flag for prompt-limit so existing consumers still match.
+      ...(remediation.failure === "prompt-limit" ? { prompt_limit_exceeded: true } : {}),
     };
   }
+
+  // Prefer absolute executable from preflight when known so spawn does not
+  // re-depend on a narrower PATH (detach parity / fingerprint consumers).
+  const resolvedCliPath = preflight.cliPath;
 
   const inv = adapter.buildInvocation({
     prompt,
@@ -360,7 +458,10 @@ export async function invoke(
     env: opts.env,
     sandboxMode: opts.sandboxMode,
   });
-  const cmd = inv.cmd;
+  // When preflight resolved an absolute path, prefer it for the spawn command
+  // so detached/foreground PATH differences cannot re-lose the binary.
+  const cmd =
+    resolvedCliPath && resolvedCliPath.startsWith("/") ? resolvedCliPath : inv.cmd;
   const args = inv.args;
   const cwd = inv.cwd;
   const captureMode = inv.captureMode;
@@ -417,14 +518,22 @@ export async function invoke(
       telemetry && (telemetry.costUsd !== null || telemetry.usage !== null)
         ? { total_cost_usd: telemetry.costUsd, usage: telemetry.usage }
         : opts.accounting.usage;
-    // Once-per-run CLI version probe (#778 / #636 seam). Cached by command
-    // identity — never a fresh subprocess solely for every model call.
-    // Failure leaves cliVersion null (unknown); does not block the stage.
+    // Once-per-run CLI version probe (#778 / #636 seam). Prefer the cached
+    // result already produced by production preflight — never a second
+    // always-on per-call version exec solely for fingerprint accounting.
     const probeDeps = opts.versionProbeDeps ?? defaultVersionProbeDeps();
-    const versionProbe = await probeCliVersionOnce(inv.cmd, {
-      exec: probeDeps.exec,
-      resolvePath: (command) => resolveCommandPath(command, probeDeps),
-    }).catch(() => ({ cliVersion: null as string | null, cliPath: null as string | null, probeOk: false }));
+    const versionProbe =
+      preflight.versionProbe ??
+      (await probeCliVersionOnce(inv.cmd, {
+        exec: probeDeps.exec,
+        resolvePath: (command) => resolveCommandPath(command, probeDeps),
+      }).catch(() => ({
+        cliVersion: null as string | null,
+        cliPath: null as string | null,
+        probeOk: false,
+      })));
+    // Prefer preflight absolute path when the probe left it null.
+    const cliPathForFingerprint = resolvedCliPath ?? versionProbe.cliPath ?? null;
 
     // Fail-soft verified-against drift warning — never blocks the stage.
     const driftWarning = formatVersionDriftWarning(
@@ -444,7 +553,7 @@ export async function invoke(
     // from the cached probe when available; resolvedModel/throttled only from
     // adapter telemetry — never fabricated from the request.
     const treatment = adapter.describeTreatment(
-      { model: opts.model, effort: opts.reasoningEffort },
+      { model: opts.model, effort: opts.reasoningEffort, sandbox: opts.sandbox },
       inv,
       {
         cliVersion: versionProbe.cliVersion,
@@ -476,8 +585,8 @@ export async function invoke(
       },
       telemetry,
       treatment,
-      role: opts.accounting.role ?? null,
-      cliPath: versionProbe.cliPath,
+      role: role ?? opts.accounting.role ?? null,
+      cliPath: cliPathForFingerprint,
       failureReason: finalResult.success ? null : outcome,
       costSource: costSourceHint,
     });
@@ -585,6 +694,25 @@ function defaultVersionProbeDeps(): {
       });
     },
   };
+}
+
+async function defaultFsExists(p: string): Promise<boolean> {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function defaultFsExecutable(p: string): Promise<boolean> {
+  try {
+    await fs.access(p, fsSync.constants.X_OK);
+    const st = await fs.stat(p);
+    return st.isFile();
+  } catch {
+    return false;
+  }
 }
 
 function harnessOutcome(result: HarnessResult): string {
