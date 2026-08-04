@@ -350,10 +350,28 @@ export interface InvokeOptions {
    *  eval-agent-isolation-boundary). Consulted only by the codex adapter;
    *  when supplied it alone decides `--dangerously-bypass-approvals-and-sandbox`
    *  vs the managed pair `--sandbox` + `workspace-write` (#613). When absent,
-   *  the codex adapter falls back to the ambient `PIPELINE_CODEX_NO_SANDBOX`
-   *  environment variable — every existing call site (which supplies no value)
-   *  keeps ambient selection semantics. */
+   *  production `invoke` resolves the effective mode via
+   *  {@link resolveEffectiveSandboxMode} (including legacy
+   *  `PIPELINE_CODEX_NO_SANDBOX`) and passes that same value to preflight and
+   *  `buildInvocation` so ambient policy cannot widen after the gate (#636). */
   sandboxMode?: ExternalSandboxMode;
+}
+
+/**
+ * Resolve the sandbox/tool policy that production preflight and
+ * `buildInvocation` both apply (#636 / #607).
+ *
+ * Explicit `sandboxMode` wins. Otherwise the legacy ambient
+ * `PIPELINE_CODEX_NO_SANDBOX=1` maps to `"external-bypass"`, and the default
+ * is `"managed"`. Callers MUST pass the returned value to both preflight and
+ * build so adapters never re-select policy from ambient env after the gate.
+ */
+export function resolveEffectiveSandboxMode(
+  explicit?: ExternalSandboxMode,
+  env: NodeJS.ProcessEnv = process.env,
+): ExternalSandboxMode {
+  if (explicit !== undefined) return explicit;
+  return env.PIPELINE_CODEX_NO_SANDBOX === "1" ? "external-bypass" : "managed";
 }
 
 export async function invoke(
@@ -374,6 +392,10 @@ export async function invoke(
       promptDelivery: opts.promptDelivery ?? "argv",
     });
   const custom = adapter.declaration.origin === "compatibility";
+
+  // #636: resolve sandbox/tool policy once (incl. legacy ambient fallback)
+  // before the preflight/build split so both see the exact same treatment.
+  const sandboxMode = resolveEffectiveSandboxMode(opts.sandboxMode);
 
   // #636: production preflight-on-invoke for the exact resolved treatment —
   // prompt size (#779), absolute executable, role eligibility, and
@@ -413,7 +435,7 @@ export async function invoke(
       sandbox: opts.sandbox,
       role,
       // Exact resolved sandbox/tool policy that buildInvocation will apply (#636).
-      ...(opts.sandboxMode !== undefined ? { sandboxMode: opts.sandboxMode } : {}),
+      sandboxMode,
     },
     preflightDeps,
   );
@@ -457,7 +479,7 @@ export async function invoke(
     sandbox: opts.sandbox,
     lean: opts.lean,
     env: opts.env,
-    sandboxMode: opts.sandboxMode,
+    sandboxMode,
   });
   // When preflight resolved an absolute path, prefer it for the spawn command
   // so detached/foreground PATH differences cannot re-lose the binary.

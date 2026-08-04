@@ -142,9 +142,11 @@ export interface AdapterRequest {
   sandbox?: boolean;
   /**
    * Resolved execution sandbox / tool-permission policy for this call (#607 / #636).
-   * Production preflight SHALL pass the same value that subsequent
-   * `buildInvocation` applies so adapters can refuse unsupported modes before
-   * spawn. When absent, adapters that consult ambient env keep prior behavior.
+   * Production `invoke` resolves this once (explicit option or legacy ambient
+   * `PIPELINE_CODEX_NO_SANDBOX` fallback) and passes the same value to
+   * preflight and `buildInvocation` so adapters never re-select policy after
+   * the gate. Direct non-invoke callers may still omit it; adapters that need
+   * a concrete mode may consult ambient env only when absent.
    */
   sandboxMode?: ExternalSandboxMode;
 }

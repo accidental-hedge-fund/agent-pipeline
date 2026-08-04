@@ -9,6 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   invoke,
+  resolveEffectiveSandboxMode,
   runProductionPreflight,
   projectPreflightRemediation,
   resolveAbsoluteExecutable,
@@ -262,6 +263,114 @@ test("invoke(): production preflight receives exact resolved treatment for both 
   void calls;
   _resetRegistryForTests({ reseedBuiltins: true });
   _clearCliVersionProbeCacheForTests();
+});
+
+// ---------------------------------------------------------------------------
+// Ambient sandbox policy resolved before preflight (#636 review 2)
+// ---------------------------------------------------------------------------
+
+test("resolveEffectiveSandboxMode: explicit wins; ambient PIPELINE_CODEX_NO_SANDBOX maps to external-bypass", () => {
+  assert.equal(resolveEffectiveSandboxMode("managed", { PIPELINE_CODEX_NO_SANDBOX: "1" }), "managed");
+  assert.equal(
+    resolveEffectiveSandboxMode("external-bypass", {}),
+    "external-bypass",
+  );
+  assert.equal(
+    resolveEffectiveSandboxMode(undefined, { PIPELINE_CODEX_NO_SANDBOX: "1" }),
+    "external-bypass",
+  );
+  assert.equal(resolveEffectiveSandboxMode(undefined, {}), "managed");
+  assert.equal(resolveEffectiveSandboxMode(undefined, { PIPELINE_CODEX_NO_SANDBOX: "0" }), "managed");
+});
+
+test("invoke(): ambient PIPELINE_CODEX_NO_SANDBOX is resolved into preflight and buildInvocation (no post-gate ambient re-select)", async () => {
+  // Regression for review finding 9c234f98: when the caller omits sandboxMode,
+  // production invoke must resolve the legacy ambient policy once and pass that
+  // exact value to both preflight and buildInvocation — adapters must not widen
+  // policy from process.env after preflight has already run.
+  _resetRegistryForTests({ reseedBuiltins: true });
+  _clearCliVersionProbeCacheForTests();
+
+  const preflightSeen: AdapterRequest[] = [];
+  const buildSeen: Array<{ sandboxMode?: string }> = [];
+  const absCli = "/opt/ambient-sandbox-636";
+  const { adapter } = makeRecordingAdapter({ name: "ambient-sandbox-636" });
+
+  registerAdapter({
+    ...adapter,
+    async preflight(_deps, req) {
+      preflightSeen.push({ ...req });
+      // Ok so buildInvocation runs; spawn may fail on the synthetic cmd.
+      return { ok: true };
+    },
+    buildInvocation(ctx) {
+      buildSeen.push({ sandboxMode: ctx.sandboxMode });
+      // Nonexistent absolute path — spawn fails after both surfaces recorded.
+      return {
+        cmd: absCli,
+        args: ["--ok"],
+        cwd: ctx.worktreeDir,
+        promptDelivery: "stdin",
+        stdinPayload: ctx.prompt,
+      };
+    },
+  });
+
+  const baseDeps = defaultProductionPreflightDeps({
+    exec: async () => ({ ok: true, stdout: "1.0.0\n", stderr: "" }),
+    execCheck: async () => true,
+    resolvePath: async () => absCli,
+    fsExecutable: async () => true,
+    fsExists: async () => true,
+  });
+
+  const oldNoSandbox = process.env.PIPELINE_CODEX_NO_SANDBOX;
+  try {
+    process.env.PIPELINE_CODEX_NO_SANDBOX = "1";
+    preflightSeen.length = 0;
+    buildSeen.length = 0;
+    await invoke("ambient-sandbox-636", tmpRoot, "p", {
+      stream: false,
+      // intentionally omit sandboxMode — ambient must resolve to external-bypass
+      preflightDeps: baseDeps,
+    });
+    assert.equal(preflightSeen.length, 1);
+    assert.equal(preflightSeen[0]?.sandboxMode, "external-bypass");
+    assert.equal(buildSeen.length, 1);
+    assert.equal(buildSeen[0]?.sandboxMode, "external-bypass");
+    assert.equal(
+      preflightSeen[0]?.sandboxMode,
+      buildSeen[0]?.sandboxMode,
+      "preflight and buildInvocation must receive the same resolved sandboxMode",
+    );
+
+    delete process.env.PIPELINE_CODEX_NO_SANDBOX;
+    preflightSeen.length = 0;
+    buildSeen.length = 0;
+    await invoke("ambient-sandbox-636", tmpRoot, "p", {
+      stream: false,
+      preflightDeps: baseDeps,
+    });
+    assert.equal(preflightSeen[0]?.sandboxMode, "managed");
+    assert.equal(buildSeen[0]?.sandboxMode, "managed");
+
+    // Explicit managed wins over ambient bypass.
+    process.env.PIPELINE_CODEX_NO_SANDBOX = "1";
+    preflightSeen.length = 0;
+    buildSeen.length = 0;
+    await invoke("ambient-sandbox-636", tmpRoot, "p", {
+      stream: false,
+      sandboxMode: "managed",
+      preflightDeps: baseDeps,
+    });
+    assert.equal(preflightSeen[0]?.sandboxMode, "managed");
+    assert.equal(buildSeen[0]?.sandboxMode, "managed");
+  } finally {
+    if (oldNoSandbox === undefined) delete process.env.PIPELINE_CODEX_NO_SANDBOX;
+    else process.env.PIPELINE_CODEX_NO_SANDBOX = oldNoSandbox;
+    _resetRegistryForTests({ reseedBuiltins: true });
+    _clearCliVersionProbeCacheForTests();
+  }
 });
 
 // ---------------------------------------------------------------------------
