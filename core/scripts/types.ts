@@ -1472,6 +1472,13 @@ export interface StageAccountingRecord {
    *  #434 decision 6). `null`/absent for a stage that did not run through a
    *  `model-endpoint` executor. */
   request_payload?: Record<string, unknown> | null;
+  /**
+   * Provider-neutral immutable treatment fingerprint (#778). Additive and
+   * optional: absent on records written before this field existed; readers
+   * treat absent as unknown. Nested object — never a vendor-specific parallel
+   * record type. See `harness-adapters/treatment-fingerprint.ts`.
+   */
+  treatment_fingerprint?: import("./harness-adapters/treatment-fingerprint.ts").TreatmentFingerprint | null;
 }
 
 export interface StageAccountingTotals {

@@ -1,0 +1,26 @@
+{
+  "text": "hello world",
+  "stopReason": "EndTurn",
+  "sessionId": "SECRET-SESSION-grok-json",
+  "requestId": "SECRET-REQUEST-id",
+  "thought": "The user wants a short greeting.",
+  "usage": {
+    "input_tokens": 100,
+    "cache_read_input_tokens": 20,
+    "output_tokens": 5,
+    "reasoning_tokens": 2,
+    "total_tokens": 125
+  },
+  "num_turns": 1,
+  "total_cost_usd": 0.00125,
+  "total_cost_usd_ticks": 12500000,
+  "modelUsage": {
+    "grok-4.5-build": {
+      "inputTokens": 100,
+      "outputTokens": 5,
+      "cacheReadInputTokens": 20,
+      "modelCalls": 1,
+      "costUSD": 0.00125
+    }
+  }
+}

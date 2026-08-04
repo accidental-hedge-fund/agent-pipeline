@@ -24,6 +24,7 @@ import {
   isFiniteMaxPromptBytes,
   promptLimitCoherenceFailure,
 } from "./types.ts";
+import { getVerifiedAgainst } from "./verified-against.ts";
 
 export interface ConformanceFailure {
   adapter: string;
@@ -520,7 +521,9 @@ export async function runConformanceKit(
       "partial { broken",
       "plain assistant text without envelope\n",
     ];
-    // Representative JSONL / result envelopes (claude-shaped + codex-shaped).
+    // Representative JSONL / result envelopes (claude / codex / grok-shaped).
+    // Vendor-neutral: every jsonl adapter must non-throw on all samples and
+    // must not invent resolvedModel from unparseable input (#778).
     if (
       adapter.declaration?.outputEnvelope === "jsonl" ||
       adapter.declaration?.telemetry === "jsonl" ||
@@ -529,6 +532,7 @@ export async function runConformanceKit(
       envelopeSamples.push(
         '{"type":"result","result":"conformance-text","total_cost_usd":0.01,"usage":{"input_tokens":1},"modelUsage":{"conformance-resolved":{}}}\n',
         '{"type":"item.completed","item":{"type":"agent_message","text":"codex-text"}}\n{"type":"turn.completed","usage":{"input_tokens":2}}\n',
+        '{"text":"grok-text","total_cost_usd":0.02,"usage":{"input_tokens":3},"modelUsage":{"conformance-grok":{}}}\n',
       );
     }
     if (adapter.declaration?.outputEnvelope === "passthrough" || adapter.declaration?.outputEnvelope === "text") {
@@ -586,6 +590,32 @@ export async function runConformanceKit(
       }
     } catch (err) {
       failures.push(fail(name, "telemetry", `parseTelemetry threw: ${(err as Error).message}`));
+    }
+  }
+
+  // #778: built-in adapters that enable machine-readable telemetry MUST expose
+  // a structured verified-against identity (no silent jsonl without baseline).
+  if (
+    adapter.declaration?.origin === "builtin" &&
+    (adapter.capabilities?.telemetry === "jsonl" || adapter.declaration?.telemetry === "jsonl")
+  ) {
+    const verified = getVerifiedAgainst(adapter.name);
+    if (!verified || !verified.version) {
+      failures.push(
+        fail(
+          name,
+          "verified-against",
+          `jsonl-declared built-in must record a non-empty verified-against identity`,
+        ),
+      );
+    } else if (verified.telemetry !== "jsonl") {
+      failures.push(
+        fail(
+          name,
+          "verified-against",
+          `jsonl-declared built-in has verified-against.telemetry="${verified.telemetry}" (expected "jsonl")`,
+        ),
+      );
     }
   }
 

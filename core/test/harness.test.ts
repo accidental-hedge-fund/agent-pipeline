@@ -1936,6 +1936,8 @@ test("makeTelemetryForwardTransform: a JSON line split across two chunk boundari
 // ---------------------------------------------------------------------------
 
 test("invoke(): a claude telemetry-mode call reconstructs stdout as the final assistant text and records cost_source:actual", async () => {
+  const { _clearCliVersionProbeCacheForTests } = await import("../scripts/harness-adapters/cli-version-probe.ts");
+  _clearCliVersionProbeCacheForTests();
   const cli = makeScript("claude", `cat <<'HARNESS_EOF'\n${CLAUDE_TELEMETRY_FIXTURE}\nHARNESS_EOF`);
   const oldPath = process.env.PATH;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
@@ -1944,6 +1946,10 @@ test("invoke(): a claude telemetry-mode call reconstructs stdout as the final as
     const result = await invoke("claude", tmpRoot, "prompt", {
       stream: false,
       accounting: { runDir, issue: 429, stage: "review-1" },
+      // Fake CLI on PATH ignores --version; inject probe so accounting is honest (#778).
+      versionProbeDeps: {
+        exec: async () => ({ ok: true, stdout: "claude 1.0.0\n", stderr: "" }),
+      },
     });
     assert.equal(result.success, true);
     assert.equal(result.stdout, "hello world", "stdout must be the reconstructed assistant text, not the raw JSONL");
@@ -1956,12 +1962,16 @@ test("invoke(): a claude telemetry-mode call reconstructs stdout as the final as
     assert.equal(event.cost_usd, 0.0014);
     assert.equal(event.usage.input_tokens, 10);
     assert.equal(event.usage.output_tokens, 123);
+    assert.equal(event.adapter_cli_version, "1.0.0");
   } finally {
     process.env.PATH = oldPath;
+    _clearCliVersionProbeCacheForTests();
   }
 });
 
 test("invoke(): a codex telemetry-mode call reconstructs stdout as the agent_message text and records tokens with a non-actual cost_source", async () => {
+  const { _clearCliVersionProbeCacheForTests } = await import("../scripts/harness-adapters/cli-version-probe.ts");
+  _clearCliVersionProbeCacheForTests();
   const cli = makeScript("codex", `cat <<'HARNESS_EOF'\n${CODEX_TELEMETRY_FIXTURE}\nHARNESS_EOF`);
   const oldPath = process.env.PATH;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
@@ -1970,6 +1980,9 @@ test("invoke(): a codex telemetry-mode call reconstructs stdout as the agent_mes
     const result = await invoke("codex", tmpRoot, "prompt", {
       stream: false,
       accounting: { runDir, issue: 429, stage: "review-1" },
+      versionProbeDeps: {
+        exec: async () => ({ ok: true, stdout: "codex-cli 0.145.0\n", stderr: "" }),
+      },
     });
     assert.equal(result.success, true);
     assert.equal(result.stdout, "hello world");
@@ -1981,12 +1994,14 @@ test("invoke(): a codex telemetry-mode call reconstructs stdout as the agent_mes
     assert.equal(event.cost_usd, null);
     assert.equal(event.usage.input_tokens, 14385);
     assert.equal(event.usage.cached_input_tokens, 10496);
+    assert.equal(event.adapter_cli_version, "0.145.0");
   } finally {
     process.env.PATH = oldPath;
+    _clearCliVersionProbeCacheForTests();
   }
 });
 
-test("invoke(): PIPELINE_HARNESS_TELEMETRY=off restores the plain-text argv for claude and codex", async () => {
+test("invoke(): PIPELINE_HARNESS_TELEMETRY=off restores the plain-text argv for claude, codex, and grok", async () => {
   const claudeCli = makeScript("claude", `printf '%s\\n' "$@"`);
   const oldPath = process.env.PATH;
   const oldTelemetry = process.env.PIPELINE_HARNESS_TELEMETRY;
@@ -2002,6 +2017,12 @@ test("invoke(): PIPELINE_HARNESS_TELEMETRY=off restores the plain-text argv for 
     process.env.PATH = `${path.dirname(codexCli)}:${oldPath}`;
     const codexResult = await invoke("codex", tmpRoot, "test-prompt", { stream: false });
     assert.doesNotMatch(codexResult.stdout, /--json/, "kill-switch must not pass --json to codex");
+
+    const grokCli = makeScript("grok", `printf '%s\\n' "$@"`);
+    process.env.PATH = `${path.dirname(grokCli)}:${oldPath}`;
+    const grokResult = await invoke("grok", tmpRoot, "test-prompt", { stream: false });
+    assert.match(grokResult.stdout, /--output-format\nplain/, "kill-switch must restore --output-format plain for grok");
+    assert.doesNotMatch(grokResult.stdout, /streaming-json/, "kill-switch must not pass streaming-json mode for grok");
   } finally {
     process.env.PATH = oldPath;
     if (oldTelemetry === undefined) delete process.env.PIPELINE_HARNESS_TELEMETRY;
@@ -2040,7 +2061,98 @@ test("invoke(): telemetry mode is the default — codex passes --json", async ()
   }
 });
 
+test("invoke(): telemetry mode is the default — grok passes --output-format streaming-json (#778)", async () => {
+  const cli = makeScript("grok", `printf '%s\\n' "$@"`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  try {
+    const result = await invoke("grok", tmpRoot, "test-prompt", { stream: false });
+    assert.match(result.stdout, /--output-format\nstreaming-json/);
+    assert.doesNotMatch(result.stdout, /--output-format\nplain/);
+    // Single-document json is incompatible with tail capture for long outputs
+    // (review-2 543d8bde) — production must not select it.
+    assert.doesNotMatch(result.stdout, /--output-format\njson(?:\n|$)/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invoke(): a grok telemetry-mode call reconstructs stdout and records cost_source:actual + adapter_cli_version (#778)", async () => {
+  const { _clearCliVersionProbeCacheForTests } = await import("../scripts/harness-adapters/cli-version-probe.ts");
+  _clearCliVersionProbeCacheForTests();
+  // Production envelope: streaming-json with type:text + terminal type:end.
+  const GROK_FIXTURE = [
+    `{"type":"text","data":"hello world"}`,
+    `{"type":"end","stopReason":"EndTurn","sessionId":"SECRET-GROK-SESSION","usage":{"input_tokens":10,"output_tokens":2},"total_cost_usd":0.0042,"modelUsage":{"grok-4.5-build":{"inputTokens":10,"outputTokens":2,"costUSD":0.0042}}}`,
+  ].join("\n");
+  const cli = makeScript("grok", `cat <<'HARNESS_EOF'\n${GROK_FIXTURE}\nHARNESS_EOF`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  const runDir = fs.mkdtempSync(path.join(tmpRoot, "run-"));
+  try {
+    const result = await invoke("grok", tmpRoot, "prompt", {
+      stream: false,
+      accounting: { runDir, issue: 778, stage: "implementing" },
+      versionProbeDeps: {
+        exec: async () => ({ ok: true, stdout: "grok 0.2.114 (0c78503879) [stable]\n", stderr: "" }),
+      },
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.stdout, "hello world", "stdout must be reconstructed assistant text");
+    const raw = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").trim();
+    assert.doesNotMatch(raw, /SECRET-GROK-SESSION/, "session_id must never be persisted");
+    const event = JSON.parse(raw);
+    assert.equal(event.cost_source, "actual");
+    assert.equal(event.cost_usd, 0.0042);
+    assert.equal(event.adapter_cli_version, "0.2.114");
+    assert.equal(event.resolved_model, "grok-4.5-build");
+    assert.equal(event.treatment_fingerprint?.cliVersion, "0.2.114");
+    assert.equal(event.treatment_fingerprint?.costSource, "actual");
+  } finally {
+    process.env.PATH = oldPath;
+    _clearCliVersionProbeCacheForTests();
+  }
+});
+
+test("invoke(): version drift warns fail-soft without blocking the stage (#778)", async () => {
+  const { _clearCliVersionProbeCacheForTests } = await import("../scripts/harness-adapters/cli-version-probe.ts");
+  _clearCliVersionProbeCacheForTests();
+  const cli = makeScript("grok", `printf 'plain ok\\n'`);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
+  const runDir = fs.mkdtempSync(path.join(tmpRoot, "run-"));
+  const writes: string[] = [];
+  const origWrite = process.stderr.write.bind(process.stderr);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (process.stderr.write as any) = (chunk: string | Uint8Array, ...rest: unknown[]) => {
+    writes.push(String(chunk));
+    return origWrite(chunk as never, ...(rest as never[]));
+  };
+  try {
+    const result = await invoke("grok", tmpRoot, "prompt", {
+      stream: false,
+      accounting: { runDir, issue: 778, stage: "implementing" },
+      versionProbeDeps: {
+        exec: async () => ({ ok: true, stdout: "grok 0.2.93 (old)\n", stderr: "" }),
+      },
+    });
+    assert.equal(result.success, true, "version drift must not block the stage");
+    const joined = writes.join("");
+    assert.match(joined, /version drift/);
+    assert.match(joined, /0\.2\.93/);
+    assert.match(joined, /0\.2\.114/);
+    const event = JSON.parse(fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").trim());
+    assert.equal(event.adapter_cli_version, "0.2.93");
+  } finally {
+    process.stderr.write = origWrite;
+    process.env.PATH = oldPath;
+    _clearCliVersionProbeCacheForTests();
+  }
+});
+
 test("invoke(): an unparseable claude envelope falls back to the raw captured output and cost_source:unknown, without failing the stage", async () => {
+  const { _clearCliVersionProbeCacheForTests } = await import("../scripts/harness-adapters/cli-version-probe.ts");
+  _clearCliVersionProbeCacheForTests();
   const cli = makeScript("claude", `printf 'plain text with no JSON envelope at all\\n'`);
   const oldPath = process.env.PATH;
   process.env.PATH = `${path.dirname(cli)}:${oldPath}`;
@@ -2049,6 +2161,9 @@ test("invoke(): an unparseable claude envelope falls back to the raw captured ou
     const result = await invoke("claude", tmpRoot, "prompt", {
       stream: false,
       accounting: { runDir, issue: 429, stage: "review-1" },
+      versionProbeDeps: {
+        exec: async () => ({ ok: true, stdout: "claude 1.0.0\n", stderr: "" }),
+      },
     });
     assert.equal(result.success, true, "unparseable telemetry must not fail the stage");
     assert.match(result.stdout, /plain text with no JSON envelope at all/, "raw captured output is the fallback stdout");
@@ -2057,6 +2172,7 @@ test("invoke(): an unparseable claude envelope falls back to the raw captured ou
     assert.equal(event.cost_usd, null);
   } finally {
     process.env.PATH = oldPath;
+    _clearCliVersionProbeCacheForTests();
   }
 });
 
@@ -2090,4 +2206,43 @@ test("runCapped: telemetry captureMode:'tail' preserves the final result line ev
   const telemetry = parseHarnessTelemetry("claude", result.stdout);
   assert.equal(telemetry.text, "hello world", "the final result line must survive tail-mode capture");
   assert.equal(telemetry.costUsd, 0.01);
+});
+
+test("runCapped + parseGrokTelemetry: streaming-json type:end survives tail capture over MAX_OUTPUT (#778 review-2 543d8bde)", async () => {
+  // Single-document --output-format json + tail capture truncates mid-object and
+  // loses cost/model. Production streaming-json keeps a complete terminal
+  // type:end line in the retained suffix so accounting still recovers actual cost.
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999998,
+    kill: () => true,
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+  const endLine =
+    `{"type":"end","stopReason":"EndTurn","sessionId":"SECRET-GROK-TAIL","usage":{"input_tokens":50,"output_tokens":8},"total_cost_usd":0.0099,"modelUsage":{"grok-4.5-build":{"inputTokens":50,"outputTokens":8,"costUSD":0.0099}}}\n`;
+
+  setImmediate(() => {
+    // Filler type:text lines dwarf MAX_OUTPUT (100_000); tail must keep type:end.
+    const filler = `{"type":"text","data":"${"x".repeat(80)}"}\n`;
+    for (let i = 0; i < 1500; i++) fakeChild.stdout.emit("data", Buffer.from(filler));
+    fakeChild.stdout.emit("data", Buffer.from(endLine));
+    fakeChild.emit("close", 0);
+  });
+
+  const result = await runCapped("unused", [], tmpRoot, 30, false, "test", {
+    spawnFn,
+    captureMode: "tail",
+  });
+
+  assert.equal(result.success, true);
+  assert.ok(result.stdout.length <= 100_000, "tail capture must stay within MAX_OUTPUT");
+  assert.match(result.stdout, /"type":"end"/, "type:end must remain in the retained tail");
+  // Mid-document single JSON would be unparseable after the same truncation;
+  // streaming-json end record remains complete JSONL.
+  const telemetry = parseHarnessTelemetry("grok", result.stdout);
+  assert.equal(telemetry.costUsd, 0.0099, "cost must survive tail truncation via type:end");
+  assert.equal(telemetry.resolvedModel, "grok-4.5-build");
+  assert.equal(telemetry.usage?.input_tokens, 50);
+  assert.equal(telemetry.throttled, null);
 });

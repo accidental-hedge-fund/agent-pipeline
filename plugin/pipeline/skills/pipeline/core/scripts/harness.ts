@@ -41,11 +41,18 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildStageAccountingRecord } from "./accounting.ts";
 import {
+  buildTreatmentFingerprint,
+  formatVersionDriftWarning,
+  getVerifiedAgainst,
   materializeCompatibilityAdapter,
+  probeCliVersionOnce,
   resolveAdapter,
+  resolveCommandPath,
+  type AdapterRole,
 } from "./harness-adapters/index.ts";
 import { makeClaudeForwardTransform } from "./harness-adapters/claude.ts";
 import { makeCodexForwardTransform } from "./harness-adapters/codex.ts";
+import { makeGrokForwardTransform } from "./harness-adapters/grok.ts";
 import {
   MAX_ARG_STRLEN,
   MAX_ARGV_PROMPT_BYTES,
@@ -159,6 +166,7 @@ export function parseHarnessTelemetry(harness: string, capturedStdout: string): 
 export function makeTelemetryForwardTransform(harness: string): (chunk: string) => string {
   if (harness === "claude") return makeClaudeForwardTransform();
   if (harness === "codex") return makeCodexForwardTransform();
+  if (harness === "grok") return makeGrokForwardTransform();
   return (chunk: string) => chunk;
 }
 
@@ -274,6 +282,16 @@ export interface InvokeOptions {
     subprocessCount?: number;
     usage?: unknown;
     estimatedCostUsd?: number | null;
+    /** Optional role for the treatment fingerprint (#778). Null/absent = unknown. */
+    role?: AdapterRole | null;
+  };
+  /**
+   * Injectable version-probe deps (#778). Tests pass fakes; production uses
+   * real subprocess exec. Probe is once-per-run per CLI identity — never
+   * re-spawned solely to populate cliVersion on every model call.
+   */
+  versionProbeDeps?: {
+    exec(file: string, args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }>;
   };
   /** Additional env vars merged into the child process's environment on top of
    *  process.env (#419 — papercuts.enabled run/stage/harness/model identity, so
@@ -399,23 +417,71 @@ export async function invoke(
       telemetry && (telemetry.costUsd !== null || telemetry.usage !== null)
         ? { total_cost_usd: telemetry.costUsd, usage: telemetry.usage }
         : opts.accounting.usage;
-    // Treatment-identity provenance (#431 task 6; #783 — every adapter,
-    // including the custom-reviewer compatibility path). No per-invocation
-    // CLI probe is run here (that would add subprocess overhead to every
-    // model call) — cliVersion and providerAuthClass are recorded as unknown
-    // rather than fabricated. resolvedModel/throttled, when the adapter's own
-    // telemetry parsing recovered them, are threaded through here rather than
-    // fabricated by each adapter's describeTreatment.
+    // Once-per-run CLI version probe (#778 / #636 seam). Cached by command
+    // identity — never a fresh subprocess solely for every model call.
+    // Failure leaves cliVersion null (unknown); does not block the stage.
+    const probeDeps = opts.versionProbeDeps ?? defaultVersionProbeDeps();
+    const versionProbe = await probeCliVersionOnce(inv.cmd, {
+      exec: probeDeps.exec,
+      resolvePath: (command) => resolveCommandPath(command, probeDeps),
+    }).catch(() => ({ cliVersion: null as string | null, cliPath: null as string | null, probeOk: false }));
+
+    // Fail-soft verified-against drift warning — never blocks the stage.
+    const driftWarning = formatVersionDriftWarning(
+      adapter.name,
+      versionProbe.cliVersion,
+      getVerifiedAgainst(adapter.name),
+    );
+    if (driftWarning) {
+      try {
+        process.stderr.write(`${driftWarning}\n`);
+      } catch {
+        // ignore write failures
+      }
+    }
+
+    // Treatment-identity provenance (#431 / #783 / #778). cliVersion comes
+    // from the cached probe when available; resolvedModel/throttled only from
+    // adapter telemetry — never fabricated from the request.
     const treatment = adapter.describeTreatment(
       { model: opts.model, effort: opts.reasoningEffort },
       inv,
       {
-        cliVersion: null,
+        cliVersion: versionProbe.cliVersion,
         providerAuthClass: "unknown",
         resolvedModel: telemetry?.resolvedModel ?? null,
         throttled: telemetry?.throttled ?? null,
       } satisfies AdapterProbe,
     );
+
+    const outcome = harnessOutcome(finalResult);
+    const costSourceHint =
+      telemetry != null && telemetry.costUsd !== null && Number.isFinite(telemetry.costUsd)
+        ? ("actual" as const)
+        : opts.accounting.estimatedCostUsd != null
+          ? ("estimated" as const)
+          : ("unknown" as const);
+
+    const fingerprint = buildTreatmentFingerprint({
+      adapterId: adapter.name,
+      capabilities: adapter.capabilities,
+      declaration: adapter.declaration,
+      request: { model: opts.model, effort: opts.reasoningEffort, sandbox: opts.sandbox },
+      invocation: inv,
+      probe: {
+        cliVersion: versionProbe.cliVersion,
+        providerAuthClass: "unknown",
+        resolvedModel: telemetry?.resolvedModel ?? null,
+        throttled: telemetry?.throttled ?? null,
+      },
+      telemetry,
+      treatment,
+      role: opts.accounting.role ?? null,
+      cliPath: versionProbe.cliPath,
+      failureReason: finalResult.success ? null : outcome,
+      costSource: costSourceHint,
+    });
+
     const record = buildStageAccountingRecord({
       runId: path.basename(opts.accounting.runDir),
       issue: opts.accounting.issue,
@@ -428,7 +494,7 @@ export async function invoke(
       durationMs: finalResult.duration * 1000,
       commandCount: opts.accounting.commandCount ?? 1,
       subprocessCount: opts.accounting.subprocessCount ?? 1,
-      outcome: harnessOutcome(finalResult),
+      outcome,
       blockerKind: finalResult.success ? null : "harness-failure",
       usage,
       estimatedCostUsd: opts.accounting.estimatedCostUsd,
@@ -445,7 +511,8 @@ export async function invoke(
       nativeFlags: treatment?.nativeFlags ?? null,
       fallback: treatment?.fallback ?? null,
       throttled: treatment?.throttled ?? null,
-      terminationReason: harnessOutcome(finalResult),
+      terminationReason: outcome,
+      treatmentFingerprint: fingerprint,
     });
     await emitStageAccounting(
       opts.accounting.runDir,
@@ -476,6 +543,48 @@ export async function invoke(
     };
   }
   return finalResult;
+}
+
+/**
+ * Default production version-probe deps: spawn `<cli> --version` with a short
+ * timeout. Injectable override on InvokeOptions for tests (no real subprocess).
+ */
+function defaultVersionProbeDeps(): {
+  exec(file: string, args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }>;
+} {
+  return {
+    exec(file, args) {
+      return new Promise((resolve) => {
+        const child = spawn(file, args, {
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        const timer = setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            /* ignore */
+          }
+          resolve({ ok: false, stdout, stderr: stderr || "version probe timed out" });
+        }, 5_000);
+        child.stdout?.on("data", (c: Buffer) => {
+          stdout += c.toString("utf8");
+        });
+        child.stderr?.on("data", (c: Buffer) => {
+          stderr += c.toString("utf8");
+        });
+        child.on("error", () => {
+          clearTimeout(timer);
+          resolve({ ok: false, stdout, stderr });
+        });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          resolve({ ok: code === 0, stdout, stderr });
+        });
+      });
+    },
+  };
 }
 
 function harnessOutcome(result: HarnessResult): string {

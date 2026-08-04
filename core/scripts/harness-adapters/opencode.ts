@@ -5,10 +5,12 @@
 //   opencode run <message> --dir <dir> [-m <provider/model>]
 //             [--variant <effort>] --auto
 //
-// `--format json` ("raw JSON events") exists but its payload schema is not
-// verified — same golden-rule-5 reasoning as the grok adapter: this adapter
-// omits `--format json` (default text output, guaranteed usable downstream)
-// and declares `telemetry: "none"`.
+// #778 disposition: `--format json` ("raw JSON events") exists but its
+// payload schema has **no recorded fixture** in harness-adapters/fixtures/
+// — golden rule 5 forbids declaring machine-readable telemetry without
+// fixtures. This adapter omits `--format json` (default text output), keeps
+// `telemetry: "none"`, and `parseTelemetry` returns EMPTY_TELEMETRY.
+// See `verified-against.ts` → opencode entry.
 //
 // `-m` requires a `provider/model` formatted value (design.md decision 4); a
 // configured model with no `/` is rejected at preflight as an
