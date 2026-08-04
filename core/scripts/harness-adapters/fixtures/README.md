@@ -9,8 +9,8 @@ flag existence in CLI help alone does not justify declaring
 | --- | --- | --- | --- |
 | claude | `claude/stream-json-result.jsonl` | stream-json | text, cost, usage, resolvedModel (modelUsage), throttled |
 | codex | `codex/exec-json.jsonl` | exec --json | text, usage (no cost / resolvedModel / throttled) |
-| grok | `grok/output-format-json.json` | --output-format json | text, cost, usage, resolvedModel (modelUsage) |
-| grok | `grok/streaming-json-end.jsonl` | --output-format streaming-json | text (type:text), cost/usage/model on type:end |
+| grok | `grok/streaming-json-end.jsonl` | --output-format streaming-json (**production**) | text (type:text), cost/usage/model on type:end |
+| grok | `grok/output-format-json.json` | --output-format json (legacy/fixture) | text, cost, usage, resolvedModel (modelUsage) |
 | pi | _(none)_ | — | disposition: telemetry none (no verified fixture) |
 | opencode | _(none)_ | — | disposition: telemetry none (no verified fixture) |
 

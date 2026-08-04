@@ -42,7 +42,7 @@ function readFixture(...parts: string[]): string {
 
 const BASE_INVOCATION: AdapterInvocation = {
   cmd: "grok",
-  args: ["--output-format", "json", "--permission-mode", "bypassPermissions"],
+  args: ["--output-format", "streaming-json", "--permission-mode", "bypassPermissions"],
   cwd: "/tmp/wt",
   promptDelivery: "file",
 };
@@ -194,6 +194,20 @@ test("parseGrokTelemetry: streaming-json fixture recovers text from type:text an
   assert.equal(tel.text, "hello world");
   assert.equal(tel.costUsd, 0.00125);
   assert.equal(tel.resolvedModel, "grok-4.5-build");
+  assert.equal(tel.throttled, null);
+});
+
+test("parseGrokTelemetry: tail-truncated capture still recovers cost/model from type:end only (#778 543d8bde)", () => {
+  // Simulate MAX_OUTPUT tail that dropped early type:text lines and starts mid-stream.
+  const truncated =
+    `":"partial garbage mid-line"}\n` +
+    `{"type":"text","data":" surviving"}\n` +
+    `{"type":"end","stopReason":"EndTurn","usage":{"input_tokens":9,"output_tokens":1},"total_cost_usd":0.0033,"modelUsage":{"grok-4.5-build":{"inputTokens":9,"outputTokens":1,"costUSD":0.0033}}}\n`;
+  const tel = parseGrokTelemetry(truncated);
+  assert.equal(tel.costUsd, 0.0033);
+  assert.equal(tel.resolvedModel, "grok-4.5-build");
+  assert.equal(tel.usage?.input_tokens, 9);
+  assert.equal(tel.text, " surviving");
   assert.equal(tel.throttled, null);
 });
 

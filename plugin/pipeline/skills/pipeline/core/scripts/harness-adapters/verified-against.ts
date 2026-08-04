@@ -49,7 +49,7 @@ export const BUILTIN_VERIFIED_AGAINST: Readonly<Record<string, VerifiedAgainstId
     buildId: "0c78503879",
     telemetry: "jsonl",
     notes:
-      "Argv originally verified on 0.2.93; --output-format json envelope fixture-verified on 0.2.114 (2026-08-04) for text/cost/usage/modelUsage.",
+      "Argv originally verified on 0.2.93; production --output-format streaming-json (type:text + type:end) fixture-verified on 0.2.114 (2026-08-04) for text/cost/usage/modelUsage; single-document json kept as legacy fixture parse path.",
   },
   pi: {
     cli: "pi",

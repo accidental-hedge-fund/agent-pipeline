@@ -3,16 +3,17 @@
 // Argv verified on-machine against installed grok (design.md decision 4):
 //
 //   grok --no-auto-update --prompt-file <PATH> --cwd <CWD>
-//        --output-format json|plain --verbatim
+//        --output-format streaming-json|plain --verbatim
 //        --permission-mode <mode> [-m <model>] [--reasoning-effort <effort>]
 //
-// #778: `--output-format json` envelope was fixture-verified against
-// grok 0.2.114 (recorded under fixtures/grok/). When telemetry is enabled
-// (default), the adapter declares `telemetry: "jsonl"`, enables `--output-
-// format json`, and `parseTelemetry` recovers text / cost / usage /
-// resolvedModel from the single JSON object (and degrades safely on
-// streaming-json `type:end` lines if present). PIPELINE_HARNESS_TELEMETRY=off
-// restores `--output-format plain` (kill-switch, same as claude/codex).
+// #778: production telemetry uses `--output-format streaming-json` (fixture-
+// verified under fixtures/grok/) so tail capture can retain the terminal
+// `type:end` line with cost/usage/modelUsage even when earlier `type:text`
+// deltas exceed MAX_OUTPUT. Single-document `--output-format json` remains
+// parseable for fixtures/legacy captures but is NOT production argv: a
+// truncated single JSON object is unrecoverable under tail capture.
+// PIPELINE_HARNESS_TELEMETRY=off restores `--output-format plain` (kill-switch,
+// same as claude/codex).
 //
 // Throttled is never reported by the verified envelope → null (unknown),
 // never fabricated false. resolvedModel comes only from `modelUsage` keys.
@@ -47,11 +48,11 @@ import {
  * Parse grok machine-readable capture into HarnessTelemetry (#778).
  *
  * Verified shapes (fixtures/grok/):
- *  - `--output-format json`: single JSON object with `text`, `total_cost_usd`,
- *    `usage`, `modelUsage` (resolved model = first key).
- *  - `--output-format streaming-json`: JSONL with `type:text` deltas and a
- *    final `type:end` carrying cost/usage/modelUsage (secondary; production
- *    argv uses `json`).
+ *  - `--output-format streaming-json` (production): JSONL with `type:text`
+ *    deltas and a final `type:end` carrying cost/usage/modelUsage — the end
+ *    record remains recoverable under tail capture after large streams.
+ *  - `--output-format json` (fixture/legacy): single JSON object with `text`,
+ *    `total_cost_usd`, `usage`, `modelUsage` (resolved model = first key).
  *
  * Never throws; unparseable → EMPTY_TELEMETRY nulls. Never copies a requested
  * model into resolvedModel; never fabricates throttled false.
@@ -60,17 +61,8 @@ export function parseGrokTelemetry(capturedStdout: string): HarnessTelemetry {
   const trimmed = capturedStdout.trim();
   if (!trimmed) return { ...EMPTY_TELEMETRY };
 
-  // Primary: whole capture is one JSON object (--output-format json).
-  try {
-    const obj = JSON.parse(trimmed) as unknown;
-    if (isJsonRecord(obj) && (typeof obj.text === "string" || obj.total_cost_usd !== undefined || isJsonRecord(obj.usage))) {
-      return telemetryFromGrokObject(obj);
-    }
-  } catch {
-    // fall through to line-oriented / streaming-json
-  }
-
-  // Secondary: streaming-json (or multi-line with trailing result object).
+  // Prefer line-oriented streaming-json (production) so a tail-truncated
+  // capture that still contains a complete `type:end` line recovers cost.
   const lines = capturedStdout.split("\n");
   let textParts: string[] = [];
   let fromEnd: HarnessTelemetry | null = null;
@@ -84,7 +76,7 @@ export function parseGrokTelemetry(capturedStdout: string): HarnessTelemetry {
     } else if (obj.type === "end") {
       fromEnd = telemetryFromGrokObject(obj, textParts.join("") || null);
     } else if (typeof obj.text === "string" || obj.total_cost_usd !== undefined) {
-      // A full json-mode object emitted as a single line.
+      // A full json-mode object emitted as a single line (legacy/fixture).
       fromObjectLine = telemetryFromGrokObject(obj);
     }
   }
@@ -98,6 +90,16 @@ export function parseGrokTelemetry(capturedStdout: string): HarnessTelemetry {
   if (fromObjectLine) return fromObjectLine;
   if (textParts.length > 0) {
     return { text: textParts.join(""), costUsd: null, usage: null, resolvedModel: null, throttled: null };
+  }
+
+  // Whole capture is one JSON object (--output-format json fixture/legacy).
+  try {
+    const obj = JSON.parse(trimmed) as unknown;
+    if (isJsonRecord(obj) && (typeof obj.text === "string" || obj.total_cost_usd !== undefined || isJsonRecord(obj.usage))) {
+      return telemetryFromGrokObject(obj);
+    }
+  } catch {
+    // unparseable
   }
   return { ...EMPTY_TELEMETRY };
 }
@@ -123,23 +125,24 @@ function telemetryFromGrokObject(
   return { text, costUsd, usage, resolvedModel, throttled: null };
 }
 
-/** Buffer json-mode output and forward only the assistant text once complete. */
+/** Stateful per-call transform for streaming-json: buffer partial JSON lines
+ *  across chunk boundaries and forward only `type:text` assistant deltas —
+ *  raw envelope JSON is never forwarded (mirrors claude/codex #429). */
 export function makeGrokForwardTransform(): (chunk: string) => string {
   let buffered = "";
-  let emitted = false;
   return (chunk: string): string => {
-    if (emitted) return "";
     buffered += chunk;
-    try {
-      const obj = JSON.parse(buffered.trim()) as unknown;
-      if (isJsonRecord(obj) && typeof obj.text === "string") {
-        emitted = true;
-        return obj.text;
+    const lines = buffered.split("\n");
+    buffered = lines.pop() ?? "";
+    let out = "";
+    for (const line of lines) {
+      const obj = parseJsonLine(line);
+      if (!obj) continue;
+      if (obj.type === "text" && typeof obj.data === "string") {
+        out += obj.data;
       }
-    } catch {
-      // incomplete JSON — wait for more chunks
     }
-    return "";
+    return out;
   };
 }
 
@@ -181,7 +184,10 @@ export const grokAdapter: HarnessAdapter = {
       "--cwd",
       ctx.worktreeDir,
       "--output-format",
-      telemetryMode ? "json" : "plain",
+      // streaming-json (not single-document json): tail capture must retain a
+      // complete terminal type:end line for cost/usage/model recovery (#778
+      // review-2 543d8bde).
+      telemetryMode ? "streaming-json" : "plain",
       "--verbatim",
       "--permission-mode",
       ctx.sandbox ? "default" : "bypassPermissions",
