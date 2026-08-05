@@ -298,21 +298,23 @@ export function findUnacknowledgedComments(
     // language in finding bodies/recommendations, and other pipeline comment
     // types (e.g. the severity-policy advance notice, #471) routinely use it
     // in their own explanatory prose, so a VERIFIED pipeline comment —
-    // `isVerifiedPipelineOutput`, true for either a review verdict's
-    // `review-artifact` (#264/#390) or any other registered comment kind's
-    // generic `pipeline-attest` marker (#471) — is exempt from that
-    // scope-language scan (#390 review 1, #471). Appending human content
-    // after either marker fails verification and still falls through to the
-    // scan. Verified output = current-format only: the marker's bodyHash
-    // binds the exact rendered body. There is deliberately NO legacy path —
-    // three prior variants for review verdicts (structural anchor, calendar
-    // cutoff, per-thread observed boundary) each left a forgeable or
-    // stranding hole (#390 delta keys 06e32d8d, 7b445e1e, 37da0054), and the
-    // same no-bypass stance applies to every other comment kind: an
-    // unattested pipeline comment with objection wording gates ONCE, and a
-    // plain acknowledgment from the trusted actor clears it permanently via
-    // the anchor mechanism above — the operator-blessed trade (option A): one
-    // ack per pre-rollout thread instead of any verifier bypass.
+    // `isVerifiedPipelineOutput`, true for a review verdict's
+    // `review-artifact` (#264/#390), any other registered comment kind's
+    // generic `pipeline-attest` marker (#471), or a terminal decodable
+    // design-gate `design-gate-state` artifact (#436 / #784 recovery) — is
+    // exempt from that scope-language scan (#390 review 1, #471). Appending
+    // human content after a terminal marker fails verification and still
+    // falls through to the scan. Review-verdict and generic pipeline-attest
+    // verification bind a bodyHash to the exact rendered body; there is
+    // deliberately no bodyHash-free legacy path for those kinds (#390 delta
+    // keys 06e32d8d, 7b445e1e, 37da0054). Design-gate is different: the
+    // stage's durable state artifact is the authoritative rehydration record
+    // (same decode the stage uses on resume), so a trusted, terminal,
+    // decodable design-gate-state is accepted as verified even when a stale
+    // install omitted pipeline-attest — forged/non-decodable design-gate
+    // shapes still gate. An unattested non-artifact pipeline comment with
+    // objection wording still gates once; a plain acknowledgment from the
+    // trusted actor clears it via the anchor mechanism above.
     const verified = isVerifiedPipelineOutput(c.body);
     if (
       !trustedComments.includes(c) ||
