@@ -11,6 +11,7 @@ import {
   classifyTransition,
   COVERED_MUTATION_SITES,
   declaredScopeFromFindingPaths,
+  defaultManifestCaptureDeps,
   dispositionForClassification,
   emptyDeclaredScope,
   freezeDeclaredScope,
@@ -23,6 +24,7 @@ import {
   mutationRecordPath,
   OUT_OF_SCOPE_MUTATION_SITES,
   pathInScope,
+  persistMutationRecord,
   renameInScope,
   runCandidateMovingMutation,
   type AuthoritativeRefs,
@@ -30,6 +32,7 @@ import {
   type CanonicalPatchRecord,
   type IntegritySubject,
   type ManifestCaptureDeps,
+  type MutationRecord,
 } from "../scripts/candidate-integrity.ts";
 import { computeCandidateIntegrityMetrics } from "../scripts/scoreboard-stabilization.ts";
 import {
@@ -811,4 +814,147 @@ test("invalidation records survive optional event append failure", async () => {
   const inv = await loadInvalidationRecords("/run", deps);
   assert.ok(inv.length >= 1);
   assert.equal(inv[0]!.invalidated_readiness, true);
+});
+
+// ---------------------------------------------------------------------------
+// Review-1 regressions (#857)
+// ---------------------------------------------------------------------------
+
+test("unsupported git name-status (T) is not silently omitted → capture incomplete → unverified", async () => {
+  // Pre: lean surface. Post: same files as A/M plus a T type-change that the
+  // old parser skipped — if skipped, maps would match and falsely equivalent.
+  const git = async (args: string[]) => {
+    if (args.includes("--name-status")) {
+      // Include a supported path plus unsupported T so omission would hide growth.
+      return {
+        code: 0,
+        stdout: ["A\tcore/x.ts", "T\twas-file-now-symlink"].join("\n") + "\n",
+        stderr: "",
+      };
+    }
+    // blobOid path: rev-parse treeish:path
+    const key = args.find((a) => a.includes(":"));
+    if (key?.endsWith(":core/x.ts")) {
+      return { code: 0, stdout: BLOB_CORE + "\n", stderr: "" };
+    }
+    return { code: 1, stdout: "", stderr: "missing" };
+  };
+  const capture = defaultManifestCaptureDeps(git);
+  const refs: AuthoritativeRefs = {
+    base_ref: "main",
+    base_sha: BASE_A,
+    candidate_sha: HEAD_1,
+  };
+  const m = await buildManifestFromDeps(SUBJECT, refs, capture);
+  // listChangedPaths throws → buildManifestFromDeps fail-closed incomplete entry
+  assert.ok(m.entries.some((e) => e.incomplete === true));
+  const pre = manifest(HEAD_1, BASE_A, [
+    entry({ path: "core/x.ts", status: "A", candidate_blob: BLOB_CORE }),
+  ]);
+  const cls = classifyTransition(pre, m, emptyDeclaredScope(), "restack");
+  assert.equal(cls.classification, "unverified");
+});
+
+test("defaultManifestCaptureDeps throws on unsupported name-status status char", async () => {
+  const capture = defaultManifestCaptureDeps(async () => ({
+    code: 0,
+    stdout: "T\tlink-or-type-change\n",
+    stderr: "",
+  }));
+  await assert.rejects(
+    () => capture.listChangedPaths(BASE_A, HEAD_1),
+    /unsupported or malformed git name-status/,
+  );
+});
+
+test("defaultManifestCaptureDeps throws on malformed rename line", async () => {
+  const capture = defaultManifestCaptureDeps(async () => ({
+    code: 0,
+    stdout: "R100\tonly-one-path\n",
+    stderr: "",
+  }));
+  await assert.rejects(
+    () => capture.listChangedPaths(BASE_A, HEAD_1),
+    /malformed rename\/copy/,
+  );
+});
+
+test("authoritative disposition persist failure fails closed (no silent success)", async () => {
+  // Fail writes to invalidations.jsonl after mutation — must not return clean success.
+  const files = new Map<string, string>();
+  const deps = memoryIntegrityStoreDeps(files, {
+    failWrite: (p) => p.endsWith("invalidations.jsonl"),
+  });
+  const result = await runCandidateMovingMutation({
+    storeRoot: "/run",
+    subject: SUBJECT,
+    mutation_method: "restack",
+    storeDeps: deps,
+    preRefs: { base_ref: "main", base_sha: BASE_A, candidate_sha: HEAD_1 },
+    captureManifest: async (refs, phase) => {
+      if (phase === "pre") {
+        return manifest(refs.candidate_sha, refs.base_sha, [
+          entry({ path: "a.ts", status: "A", candidate_blob: BLOB_CORE }),
+        ]);
+      }
+      return manifest(refs.candidate_sha, refs.base_sha, [
+        entry({ path: "evil.md", status: "A", candidate_blob: BLOB_MONOLITH }),
+      ]);
+    },
+    reReadAuthoritative: async () => ({
+      base_ref: "main",
+      base_sha: BASE_B,
+      candidate_sha: HEAD_2,
+    }),
+    mutate: async () => null,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.classification, "unverified");
+  assert.equal(result.disposition.invalidated_readiness, true);
+  assert.ok(result.mutation_error?.includes("authoritative disposition persist failed"));
+});
+
+test("gate blocks from mutation-record disposition when JSONL index is absent", async () => {
+  // Simulates: classified disposition durable on mutation record, invalidations.jsonl missing.
+  const deps = memoryIntegrityStoreDeps();
+  const disp = dispositionForClassification("scope_expansion", {
+    shaChanged: true,
+    classificationReason: "scope_expansion: undeclared path evil.md",
+  });
+  const rec: MutationRecord = {
+    schema_version: 1,
+    mutation_id: "mut-no-jsonl",
+    lifecycle: "classified",
+    mutation_method: "restack",
+    subject: {
+      run_id: SUBJECT.run_id,
+      issue: SUBJECT.issue,
+      pr: SUBJECT.pr ?? null,
+      domain: SUBJECT.domain,
+    },
+    declared_scope: emptyDeclaredScope(),
+    pre_manifest: manifest(HEAD_1, BASE_A, [
+      entry({ path: "a.ts", status: "A", candidate_blob: BLOB_CORE }),
+    ]),
+    post_manifest: manifest(HEAD_2, BASE_B, [
+      entry({ path: "evil.md", status: "A", candidate_blob: BLOB_MONOLITH }),
+    ]),
+    classification: "scope_expansion",
+    disposition: disp,
+    before_sha: HEAD_1,
+    after_sha: HEAD_2,
+    base_sha_before: BASE_A,
+    base_sha_after: BASE_B,
+    created_at: "2026-08-05T12:00:00.000Z",
+    updated_at: "2026-08-05T12:00:00.000Z",
+  };
+  await persistMutationRecord("/run", rec, deps);
+  // Confirm JSONL is empty
+  const jsonl = await loadInvalidationRecords("/run", deps);
+  assert.equal(jsonl.length, 0);
+  const readiness = await integrityBlocksReadiness("/run", HEAD_2, deps);
+  assert.ok(readiness, "mutation-record disposition must block readiness without JSONL");
+  assert.equal(readiness?.classification, "scope_expansion");
+  const review = await integrityBlocksReviewReuse("/run", HEAD_2, HEAD_1, deps);
+  assert.ok(review, "mutation-record disposition must block review reuse without JSONL");
 });

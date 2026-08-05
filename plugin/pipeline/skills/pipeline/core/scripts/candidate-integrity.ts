@@ -740,18 +740,38 @@ export function defaultManifestCaptureDeps(
         if (!line.trim()) continue;
         const parts = line.split("\t");
         const statusRaw = parts[0] ?? "";
-        const statusChar = statusRaw.charAt(0) as PatchStatus;
-        if (!"AMDRC".includes(statusChar)) continue;
+        const statusChar = statusRaw.charAt(0);
+        // Fail closed: unsupported (e.g. T type-change), empty, or malformed
+        // name-status records must not be omitted — omission can yield a false
+        // semantically_equivalent map when undeclared surface exists.
+        if (!statusChar || !"AMDRC".includes(statusChar)) {
+          throw new Error(
+            `unsupported or malformed git name-status record: ${JSON.stringify(line)}`,
+          );
+        }
         if (statusChar === "R" || statusChar === "C") {
           const sim = parseInt(statusRaw.slice(1), 10);
+          const oldPath = parts[1] ?? "";
+          const newPath = parts[2] ?? "";
+          if (!oldPath || !newPath) {
+            throw new Error(
+              `malformed rename/copy name-status (missing path): ${JSON.stringify(line)}`,
+            );
+          }
           out.push({
-            status: statusChar,
-            old_path: parts[1] ?? null,
-            path: parts[2] ?? parts[1] ?? "",
+            status: statusChar as PatchStatus,
+            old_path: oldPath,
+            path: newPath,
             similarity: Number.isFinite(sim) ? sim : undefined,
           });
         } else {
-          out.push({ status: statusChar, path: parts[1] ?? "", old_path: null });
+          const filePath = parts[1] ?? "";
+          if (!filePath) {
+            throw new Error(
+              `malformed name-status (missing path): ${JSON.stringify(line)}`,
+            );
+          }
+          out.push({ status: statusChar as PatchStatus, path: filePath, old_path: null });
         }
       }
       return out;
@@ -923,6 +943,97 @@ export async function loadInvalidationRecords(
     }
   }
   return out;
+}
+
+/**
+ * Derive invalidation rows from durable mutation records (classified/disposed).
+ * Mutation-record disposition is authoritative control-plane state; the JSONL
+ * index is a convenience. Restart-time gates must still block when only the
+ * mutation record was persisted.
+ */
+export async function invalidationsFromMutationRecords(
+  storeRoot: string,
+  deps: IntegrityStoreDeps = {},
+): Promise<IntegrityInvalidationRecord[]> {
+  const d = resolveStoreDeps(deps);
+  const names = await d.readdir(integrityDir(storeRoot));
+  const out: IntegrityInvalidationRecord[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    if (name === CANDIDATE_INTEGRITY_ACTIVE_FILE) continue;
+    if (name.startsWith("budget-")) continue;
+    const raw = await d.readTextFile(path.join(integrityDir(storeRoot), name));
+    if (!raw) continue;
+    let rec: MutationRecord;
+    try {
+      rec = JSON.parse(raw) as MutationRecord;
+    } catch {
+      continue;
+    }
+    if (!rec?.mutation_id || !rec.disposition) continue;
+    if (rec.lifecycle !== "classified" && rec.lifecycle !== "disposed") continue;
+    const disp = rec.disposition;
+    if (
+      !disp.invalidated_review &&
+      !disp.invalidated_readiness &&
+      !disp.requires_fresh_review
+    ) {
+      continue;
+    }
+    out.push({
+      from_sha: rec.before_sha ?? "",
+      to_sha: rec.after_sha ?? rec.before_sha ?? "",
+      mutation_id: rec.mutation_id,
+      classification: rec.classification ?? "unverified",
+      invalidated_review: disp.invalidated_review,
+      invalidated_readiness: disp.invalidated_readiness,
+      requires_fresh_review: disp.requires_fresh_review,
+      reason:
+        disp.invalidation_reason ?? rec.classification ?? "integrity disposition",
+      mutation_method: rec.mutation_method,
+      at: rec.updated_at,
+    });
+  }
+  return out;
+}
+
+/**
+ * Authoritative invalidations: JSONL index unioned with mutation-record
+ * dispositions so restart gates cannot miss a durable classified invalidation.
+ */
+export async function loadAuthoritativeInvalidationRecords(
+  storeRoot: string,
+  deps: IntegrityStoreDeps = {},
+): Promise<IntegrityInvalidationRecord[]> {
+  const fromJsonl = await loadInvalidationRecords(storeRoot, deps);
+  const fromMut = await invalidationsFromMutationRecords(storeRoot, deps);
+  const seen = new Set(fromJsonl.map((r) => `${r.mutation_id}|${r.to_sha}`));
+  const merged = [...fromJsonl];
+  for (const r of fromMut) {
+    const k = `${r.mutation_id}|${r.to_sha}`;
+    if (!seen.has(k)) {
+      seen.add(k);
+      merged.push(r);
+    }
+  }
+  return merged;
+}
+
+/**
+ * Persist classified disposition and, when invalidating, the invalidation index.
+ * Both writes are authoritative and required — callers must not continue as if
+ * the control-plane disposition is durable when either fails.
+ */
+export async function persistClassifiedDisposition(
+  storeRoot: string,
+  record: MutationRecord,
+  inv: IntegrityInvalidationRecord | null,
+  deps: IntegrityStoreDeps = {},
+): Promise<void> {
+  await persistMutationRecord(storeRoot, record, deps);
+  if (inv) {
+    await appendInvalidationRecord(storeRoot, inv, deps);
+  }
 }
 
 /**
@@ -1307,7 +1418,6 @@ export async function runCandidateMovingMutation<T>(
   record.disposition = disposition;
   record.lifecycle = "classified";
   record.updated_at = nowIso();
-  await persistMutationRecord(opts.storeRoot, record, opts.storeDeps).catch(() => {});
 
   // --- disposed: invalidation records + events + budget ---
   let budgetExhausted = false;
@@ -1326,20 +1436,72 @@ export async function runCandidateMovingMutation<T>(
     budgetExhausted = br.exhausted;
   }
 
-  if (disposition.invalidated_review || disposition.invalidated_readiness) {
-    const inv: IntegrityInvalidationRecord = {
-      from_sha: record.before_sha ?? "",
-      to_sha: record.after_sha ?? record.before_sha ?? "",
+  const inv: IntegrityInvalidationRecord | null =
+    disposition.invalidated_review || disposition.invalidated_readiness
+      ? {
+          from_sha: record.before_sha ?? "",
+          to_sha: record.after_sha ?? record.before_sha ?? "",
+          mutation_id: mutationId,
+          classification: classificationResult.classification,
+          invalidated_review: disposition.invalidated_review,
+          invalidated_readiness: disposition.invalidated_readiness,
+          requires_fresh_review: disposition.requires_fresh_review,
+          reason: disposition.invalidation_reason ?? classificationResult.reason,
+          mutation_method: opts.mutation_method,
+          at: nowIso(),
+        }
+      : null;
+
+  // Authoritative durable disposition — required before returning control.
+  // Event emission remains non-fatal; store writes are not.
+  try {
+    await persistClassifiedDisposition(opts.storeRoot, record, inv, opts.storeDeps);
+  } catch (err) {
+    const persistErr = `authoritative disposition persist failed: ${(err as Error).message}`;
+    record.mutation_error = record.mutation_error
+      ? `${record.mutation_error}; ${persistErr}`
+      : persistErr;
+    // Fail closed: do not return a reusable success path without durable state.
+    // Escalating classification to unverified ensures merge/readiness stay blocked
+    // even if only in-memory disposition is available to the caller.
+    const failDisposition = dispositionForClassification("unverified", {
+      shaChanged,
+      classificationReason: persistErr,
+    });
+    record.classification = "unverified";
+    record.disposition = failDisposition;
+    // Best-effort last attempt to leave *some* durable signal (may also fail).
+    await persistMutationRecord(opts.storeRoot, record, opts.storeDeps).catch(() => {});
+    if (failDisposition.invalidated_review || failDisposition.invalidated_readiness) {
+      await appendInvalidationRecord(
+        opts.storeRoot,
+        {
+          from_sha: record.before_sha ?? "",
+          to_sha: record.after_sha ?? record.before_sha ?? "",
+          mutation_id: mutationId,
+          classification: "unverified",
+          invalidated_review: failDisposition.invalidated_review,
+          invalidated_readiness: failDisposition.invalidated_readiness,
+          requires_fresh_review: failDisposition.requires_fresh_review,
+          reason: persistErr,
+          mutation_method: opts.mutation_method,
+          at: nowIso(),
+        },
+        opts.storeDeps,
+      ).catch(() => {});
+    }
+    return {
+      ok: false,
+      aborted: false,
+      mutation_result: mutationResult,
+      mutation_error: persistErr,
+      classification: "unverified",
+      disposition: failDisposition,
       mutation_id: mutationId,
-      classification: classificationResult.classification,
-      invalidated_review: disposition.invalidated_review,
-      invalidated_readiness: disposition.invalidated_readiness,
-      requires_fresh_review: disposition.requires_fresh_review,
-      reason: disposition.invalidation_reason ?? classificationResult.reason,
-      mutation_method: opts.mutation_method,
-      at: nowIso(),
+      record,
+      event: null,
+      budget_exhausted: budgetExhausted,
     };
-    await appendInvalidationRecord(opts.storeRoot, inv, opts.storeDeps).catch(() => {});
   }
 
   const event = buildCandidateIntegrityEvent({
@@ -1369,6 +1531,8 @@ export async function runCandidateMovingMutation<T>(
 
   record.lifecycle = "disposed";
   record.updated_at = nowIso();
+  // Dispose marker is secondary once classified disposition is durable; keep
+  // best-effort so a dispose-only write failure cannot undo invalidation.
   await persistMutationRecord(opts.storeRoot, record, opts.storeDeps).catch(() => {});
 
   return {
@@ -1534,25 +1698,45 @@ export async function hydrateAndCompleteIncompleteMutation(opts: {
   existing.disposition = disposition;
   existing.lifecycle = "classified";
   existing.updated_at = d.now().toISOString();
-  await persistMutationRecord(opts.storeRoot, existing, opts.storeDeps);
 
-  if (disposition.invalidated_review || disposition.invalidated_readiness) {
-    await appendInvalidationRecord(
-      opts.storeRoot,
-      {
-        from_sha: existing.before_sha ?? "",
-        to_sha: existing.after_sha ?? existing.before_sha ?? "",
-        mutation_id: mutationId,
-        classification: classificationResult.classification,
-        invalidated_review: disposition.invalidated_review,
-        invalidated_readiness: disposition.invalidated_readiness,
-        requires_fresh_review: disposition.requires_fresh_review,
-        reason: disposition.invalidation_reason ?? classificationResult.reason,
-        mutation_method: existing.mutation_method,
-        at: d.now().toISOString(),
-      },
-      opts.storeDeps,
-    ).catch(() => {});
+  const inv: IntegrityInvalidationRecord | null =
+    disposition.invalidated_review || disposition.invalidated_readiness
+      ? {
+          from_sha: existing.before_sha ?? "",
+          to_sha: existing.after_sha ?? existing.before_sha ?? "",
+          mutation_id: mutationId,
+          classification: classificationResult.classification,
+          invalidated_review: disposition.invalidated_review,
+          invalidated_readiness: disposition.invalidated_readiness,
+          requires_fresh_review: disposition.requires_fresh_review,
+          reason: disposition.invalidation_reason ?? classificationResult.reason,
+          mutation_method: existing.mutation_method,
+          at: d.now().toISOString(),
+        }
+      : null;
+
+  try {
+    await persistClassifiedDisposition(opts.storeRoot, existing, inv, opts.storeDeps);
+  } catch (err) {
+    const persistErr = `authoritative disposition persist failed: ${(err as Error).message}`;
+    const failDisposition = dispositionForClassification("unverified", {
+      shaChanged,
+      classificationReason: persistErr,
+    });
+    existing.classification = "unverified";
+    existing.disposition = failDisposition;
+    existing.mutation_error = persistErr;
+    await persistMutationRecord(opts.storeRoot, existing, opts.storeDeps).catch(() => {});
+    return {
+      ok: false,
+      aborted: false,
+      classification: "unverified",
+      disposition: failDisposition,
+      mutation_id: mutationId,
+      record: existing,
+      event: null,
+      budget_exhausted: false,
+    };
   }
 
   const event = buildCandidateIntegrityEvent({
@@ -1581,7 +1765,7 @@ export async function hydrateAndCompleteIncompleteMutation(opts: {
 
   existing.lifecycle = "disposed";
   existing.updated_at = d.now().toISOString();
-  await persistMutationRecord(opts.storeRoot, existing, opts.storeDeps);
+  await persistMutationRecord(opts.storeRoot, existing, opts.storeDeps).catch(() => {});
 
   return {
     ok: classificationResult.classification === "semantically_equivalent",
@@ -1610,7 +1794,9 @@ export async function integrityBlocksReviewReuse(
   deps: IntegrityStoreDeps = {},
 ): Promise<IntegrityInvalidationRecord | null> {
   if (!storeRoot) return null;
-  const records = await loadInvalidationRecords(storeRoot, deps);
+  // Mutation-record disposition is authoritative; JSONL alone is not sufficient
+  // after a best-effort index write failure or partial restart recovery.
+  const records = await loadAuthoritativeInvalidationRecords(storeRoot, deps);
   return reviewBlockedByIntegrityInvalidation(records, candidateSha, reviewedSha);
 }
 
@@ -1620,7 +1806,7 @@ export async function integrityBlocksReadiness(
   deps: IntegrityStoreDeps = {},
 ): Promise<IntegrityInvalidationRecord | null> {
   if (!storeRoot) return null;
-  const records = await loadInvalidationRecords(storeRoot, deps);
+  const records = await loadAuthoritativeInvalidationRecords(storeRoot, deps);
   return readinessBlockedByIntegrityInvalidation(records, candidateSha);
 }
 
