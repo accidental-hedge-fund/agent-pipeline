@@ -585,6 +585,58 @@ test("design-interrogation: #762-shaped multi-round unresolved body does not fal
   );
 });
 
+test("design-interrogation: multi-round progress sequence without pipeline-attest does not gate (#873 dogfood)", () => {
+  // Production failure shape on issue #873: design-gate posts six sequential
+  // progress comments after the revised plan, each ending on a terminal
+  // design-gate-state with no pipeline-attest (v1.30.0 renderer). Intermediate
+  // rounds use "unresolved" challenge status that trips negation-shaped prose.
+  // Review-1 must not treat any of them as unacknowledged human input.
+  const makeDg = (round: number, outcome: string | null, status: string): string => {
+    const stateB64 = Buffer.from(
+      JSON.stringify({
+        schema_version: 1,
+        decisionRecordVersions: [],
+        rounds: Array.from({ length: round }, (_, i) => ({
+          round: i + 1,
+          challenges: [],
+          responses: [],
+        })),
+        outcome,
+      }),
+    ).toString("base64url");
+    return (
+      `## Design Interrogation\n\n` +
+      `**Matched triggers**: architecture, architecture\n` +
+      `**Reviewer**: \`codex\` (independent)\n\n` +
+      `Round ${round} interrogation complete.\n\n` +
+      `### Round ${round}\n` +
+      `- \`deadbeef\` [high] Config extension can waive product-dirty protection — **${status}**\n\n` +
+      `---\n*Automated by Claude Code Pipeline Skill*\n\n` +
+      `<!-- design-gate-state: ${stateB64} -->`
+    );
+  };
+  const comments = [
+    makeComment(TEST_ACTOR, "## Revised Implementation Plan\n\nIgnore non-product scratch for gate trust.", ts(0)),
+    makeComment(TEST_ACTOR, makeDg(1, null, "unresolved"), ts(1)),
+    makeComment(TEST_ACTOR, makeDg(1, null, "revised"), ts(2)),
+    makeComment(TEST_ACTOR, makeDg(2, null, "unresolved"), ts(3)),
+    makeComment(TEST_ACTOR, makeDg(2, null, "revised"), ts(4)),
+    makeComment(TEST_ACTOR, makeDg(2, "advanced", "revised"), ts(5)),
+  ];
+  for (const c of comments.slice(1)) {
+    assert.equal(classifyComment(c.body), "pipeline");
+    assert.equal(isVerifiedDesignGateOutput(c.body), true);
+    assert.equal(isVerifiedPipelineOutput(c.body), true);
+  }
+  const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.deepEqual(
+    unacked,
+    [],
+    "#873: six sequential design-gate progress comments without pipeline-attest must not false-block review-1",
+  );
+});
+
 test("design-interrogation: genuine human comment after design-gate still unacknowledged (#872)", () => {
   // Gate must not weaken: free-form operator comments after a resolved
   // design-gate still require re-plan or trusted ack before review-1 / fix.
