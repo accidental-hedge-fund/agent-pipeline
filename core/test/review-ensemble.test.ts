@@ -8,8 +8,10 @@ import {
   formatEnsembleIdentityLine,
   invokeReviewEnsemble,
   isEnsembleEnabled,
+  isUsablePlanReviewOutput,
   mergeEnsembleVerdicts,
   mergePlanReviewOutputs,
+  parsePlanReviewVerdictToken,
   resolveEnsembleAgents,
   tryParseUsableReviewVerdict,
 } from "../scripts/review-ensemble.ts";
@@ -369,13 +371,124 @@ test("mergePlanReviewOutputs: any NEEDS_REVISION wins", () => {
   assert.match(merged, /Migration risk/);
 });
 
-test("tryParseUsableReviewVerdict: JSON fence is usable; garbage is not", () => {
+test("tryParseUsableReviewVerdict: full strict JSON fence is usable; garbage is not", () => {
   const ok = tryParseUsableReviewVerdict(
     '```json\n{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}\n```',
   );
   assert.ok(ok);
   assert.equal(ok!.verdict, "approve");
   assert.equal(tryParseUsableReviewVerdict("hello world no structure"), null);
+});
+
+test("tryParseUsableReviewVerdict: partial JSON approve missing required fields is unparseable (#645 43c9353b)", () => {
+  // Missing summary / findings / next_steps — must NOT satisfy min_usable_agents.
+  assert.equal(
+    tryParseUsableReviewVerdict('```json\n{"verdict":"approve"}\n```'),
+    null,
+  );
+  assert.equal(
+    tryParseUsableReviewVerdict('{"verdict":"approve","findings":[]}'),
+    null,
+    "missing summary and next_steps",
+  );
+  assert.equal(
+    tryParseUsableReviewVerdict(
+      '```json\n{"verdict":"approve","summary":"ok","findings":"not-array","next_steps":[]}\n```',
+    ),
+    null,
+  );
+  // findings present but records lack required fields (severity/title/body/confidence/recommendation)
+  assert.equal(
+    tryParseUsableReviewVerdict(
+      '```json\n{"verdict":"needs-attention","summary":"x","findings":[{"title":"bare"}],"next_steps":[]}\n```',
+    ),
+    null,
+  );
+});
+
+test("isUsablePlanReviewOutput / parsePlanReviewVerdictToken: heading-only is unparseable (#645 43c9353b)", () => {
+  assert.equal(isUsablePlanReviewOutput("## Plan Review Verdict"), false);
+  assert.equal(isUsablePlanReviewOutput("## Plan Review Verdict\n\n"), false);
+  assert.equal(
+    isUsablePlanReviewOutput(
+      "## Plan Review Verdict\n\n## Required Changes\n- None\n",
+    ),
+    false,
+    "heading present but no APPROVE/NEEDS_REVISION token",
+  );
+  assert.equal(parsePlanReviewVerdictToken("copied heading only"), null);
+  assert.equal(
+    parsePlanReviewVerdictToken("## Plan Review Verdict\nAPPROVE\n"),
+    "APPROVE",
+  );
+  assert.equal(
+    parsePlanReviewVerdictToken(
+      "## Plan Review Verdict\nNEEDS_REVISION\n\n## Required Changes\n- Add tests\n",
+    ),
+    "NEEDS_REVISION",
+  );
+  assert.equal(isUsablePlanReviewOutput("## Plan Review Verdict\nAPPROVE\n"), true);
+});
+
+test("invokeReviewEnsemble: sole agent with partial JSON approve fails closed (#645 43c9353b)", async () => {
+  const inv = async (): Promise<HarnessResult> => ({
+    success: true,
+    stdout: '```json\n{"verdict":"approve"}\n```',
+    stderr: "",
+    exit_code: 0,
+    duration: 0.1,
+    timed_out: false,
+  });
+  const cfg = baseCfg({
+    review_ensemble: {
+      enabled: true,
+      agents: [{ role: "primary" }, { harness: "claude" }],
+      min_usable_agents: 1,
+      max_agents: 4,
+    },
+  });
+  const out = await invokeReviewEnsemble(cfg, {
+    worktreeDir: "/wt",
+    prompt: "p",
+    implementer: "claude",
+    kind: "structured",
+    timeoutSec: 30,
+    inv: inv as never,
+  });
+  assert.equal(out.result.success, false, "must not synthesize approve from malformed JSON");
+  assert.equal(out.ensemble!.usable, 0);
+  assert.equal(out.mergedVerdict, undefined);
+  assert.ok(out.ensemble!.agents.every((a) => a.failureClass === "unparseable"));
+});
+
+test("invokeReviewEnsemble: sole agent with heading-only plan review fails closed (#645 43c9353b)", async () => {
+  const inv = async (): Promise<HarnessResult> => ({
+    success: true,
+    stdout: "## Plan Review Verdict\n",
+    stderr: "",
+    exit_code: 0,
+    duration: 0.1,
+    timed_out: false,
+  });
+  const cfg = baseCfg({
+    review_ensemble: {
+      enabled: true,
+      agents: [{ role: "primary" }, { harness: "claude" }],
+      min_usable_agents: 1,
+      max_agents: 4,
+    },
+  });
+  const out = await invokeReviewEnsemble(cfg, {
+    worktreeDir: "/wt",
+    prompt: "p",
+    implementer: "claude",
+    kind: "plan-review",
+    timeoutSec: 30,
+    inv: inv as never,
+  });
+  assert.equal(out.result.success, false, "heading-only plan output must not soft-fail as approve");
+  assert.equal(out.ensemble!.usable, 0);
+  assert.ok(out.ensemble!.agents.every((a) => a.failureClass === "unparseable"));
 });
 
 // ---------------------------------------------------------------------------

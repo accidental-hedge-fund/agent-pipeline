@@ -13,7 +13,7 @@ import {
   severityRank,
 } from "./review-policy.ts";
 import { invokeReviewer, type ReviewerInvocation } from "./self-review.ts";
-import { parseProseReview } from "./stages/review-parsing.ts";
+import { parseProseReview, parseStrictVerdict } from "./stages/review-parsing.ts";
 import type {
   Harness,
   PipelineConfig,
@@ -363,9 +363,13 @@ function splitBullets(section: string | null): string[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Conservative parse for ensemble usability: JSON fence/inline or recognized
- * prose review. Returns null when output is not a usable structured verdict
- * (generic text-fallback invents are NOT usable).
+ * Conservative parse for ensemble usability (#645 review-2).
+ *
+ * Code-review output is usable only when it satisfies the strict
+ * `ReviewVerdict` / `ReviewFinding` schema (`parseStrictVerdict`) or is a
+ * recognized prose review (`parseProseReview`). Partial JSON such as
+ * `{ "verdict": "approve" }` with missing required fields or unvalidated
+ * findings is NOT usable — generic text-fallback invents are never usable.
  */
 export function tryParseUsableReviewVerdict(
   output: string,
@@ -373,46 +377,46 @@ export function tryParseUsableReviewVerdict(
 ): ReviewVerdict | null {
   if (!output || !output.trim()) return null;
 
-  const fenceMatch = output.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
-  const candidates: string[] = [];
-  if (fenceMatch) candidates.push(fenceMatch[1]!);
-  const inlineMatch = output.match(/\{[\s\S]*"verdict"[\s\S]*\}/);
-  if (inlineMatch) candidates.push(inlineMatch[0]!);
-
-  for (const candidate of candidates) {
-    try {
-      const data = JSON.parse(candidate) as Partial<ReviewVerdict>;
-      if (data.verdict === "approve" || data.verdict === "needs-attention") {
-        const findings = Array.isArray(data.findings)
-          ? (data.findings as ReviewFinding[])
-          : [];
-        // approve + findings → needs-attention (same as parseStrictVerdict)
-        const effective =
-          data.verdict === "approve" && findings.length > 0
-            ? "needs-attention"
-            : data.verdict;
-        return {
-          verdict: effective,
-          summary: typeof data.summary === "string" ? data.summary : "",
-          findings,
-          next_steps: Array.isArray(data.next_steps)
-            ? (data.next_steps as string[])
-            : [],
-          commitSha,
-        };
-      }
-    } catch {
-      // try next
-    }
-  }
+  const strict = parseStrictVerdict(output, commitSha);
+  if (strict) return strict;
 
   const prose = parseProseReview(output);
   if (prose) return { ...prose, commitSha };
   return null;
 }
 
+/**
+ * Canonical plan-review verdict token under `## Plan Review Verdict`.
+ * Returns null when the section is missing or the first non-empty line is not
+ * APPROVE / NEEDS_REVISION (heading-only or freeform prose is unusable).
+ */
+export function parsePlanReviewVerdictToken(
+  output: string,
+): "APPROVE" | "NEEDS_REVISION" | null {
+  if (typeof output !== "string" || !output.trim()) return null;
+  if (!/^##\s+Plan Review Verdict\s*$/im.test(output)) return null;
+  const section = extractMarkdownSection(output, "Plan Review Verdict");
+  if (section === null || !section.trim()) return null;
+  const firstLine = section
+    .split("\n")
+    .map((l) => l.trim())
+    .find(Boolean);
+  if (!firstLine) return null;
+  // Strip light markdown emphasis (* `) only — keep underscores so NEEDS_REVISION stays intact.
+  const token = firstLine.replace(/[*`]+/g, "").trim().toUpperCase();
+  if (token === "NEEDS_REVISION" || token === "NEEDS REVISION") {
+    return "NEEDS_REVISION";
+  }
+  if (token === "APPROVE") return "APPROVE";
+  // Allow "Verdict: APPROVE" / "Verdict: NEEDS_REVISION" on the first line.
+  if (/\bNEEDS[_\s]REVISION\b/.test(token)) return "NEEDS_REVISION";
+  if (/\bAPPROVE\b/.test(token) && !/\bNEEDS\b/.test(token)) return "APPROVE";
+  return null;
+}
+
+/** True when plan-review output has the required section and a valid verdict token. */
 export function isUsablePlanReviewOutput(output: string): boolean {
-  return typeof output === "string" && output.includes("## Plan Review Verdict");
+  return parsePlanReviewVerdictToken(output) !== null;
 }
 
 function classifyFailure(result: HarnessResult, unparseable: boolean): EnsembleFailureClass {
