@@ -67,6 +67,26 @@ test("classifyComment: pipeline machine-sentinel marker → pipeline (#390)", ()
   );
 });
 
+test("classifyComment: Design Interrogation heading → pipeline (#872 / #390-class)", () => {
+  // design-gate progress posts use `## Design Interrogation` (not `## Pipeline:`).
+  // Without this inventory entry they misclassify as human and false-block review-1.
+  assert.equal(
+    classifyComment("## Design Interrogation\n\n**Matched triggers**: architecture\n\nRound 1 complete."),
+    "pipeline",
+  );
+  assert.equal(
+    classifyComment("  ## Design Interrogation\n\nDo not collapse outer-host identity."),
+    "pipeline",
+  );
+});
+
+test("classifyComment: pipeline-attest sentinel → pipeline (#471)", () => {
+  assert.equal(
+    classifyComment("Some free-form body\n\n<!-- pipeline-attest: e30 -->"),
+    "pipeline",
+  );
+});
+
 test("classifyComment: unmarked body still → human (#390)", () => {
   assert.equal(classifyComment("Not a pipeline comment at all."), "human");
 });
