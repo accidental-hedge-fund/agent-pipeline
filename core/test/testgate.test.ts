@@ -1696,3 +1696,109 @@ test("gate (#873): config non_product_dirty_globs extends engine set (union)", a
   assert.equal(out.passed, true);
   assert.equal(ran, 1);
 });
+
+test("gate (#873 review): unsafe config globs cannot waive product dirty block", async () => {
+  // Even if pipeline.yml tried non_product_dirty_globs: ["**"] or ["core/**"],
+  // product paths must still hard-block (fail-closed classify-time filter).
+  for (const bad of ["**", "core/**", "plugin/**", "openspec/**"]) {
+    let ran = 0;
+    const out = await runTestGate(
+      cfgWith({ non_product_dirty_globs: [bad] }),
+      873,
+      "/wt",
+      {
+        detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+        runTests: async () => {
+          ran++;
+          return passResult;
+        },
+        gitDirty: async () => true,
+        gitStatusPorcelain: async () => " M core/scripts/foo.ts\n",
+      },
+    );
+    assert.equal(out.passed, false, `expected block under hostile glob ${bad}`);
+    assert.equal(ran, 0, `test must not run under hostile glob ${bad}`);
+    assert.equal(out.dirtyWorktree, true);
+    assert.match(out.blockReason ?? "", /core\/scripts\/foo\.ts/);
+  }
+});
+
+test("gate (#873 review): scratch-only dirt after failed test does not invoke salvage", async () => {
+  // Fix harness leaves only tasks/todo.md dirty (no product). Salvage must not
+  // run — non-goal is not expanding salvage to auto-commit agent scratch.
+  let runs = 0;
+  let dirty = false;
+  const salvageCalls: string[] = [];
+  const out = await runTestGate(
+    cfgWith({ max_attempts: 1 }),
+    873,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => {
+        runs++;
+        // After salvage-skip, scratch-only is clean enough → re-run can pass.
+        return runs === 1 ? failResult : passResult;
+      },
+      invoke: async () => {
+        dirty = true;
+        return okInvoke();
+      },
+      gitHead: async () => "h0",
+      gitDirty: async () => dirty,
+      gitStatusPorcelain: async () => (dirty ? " M tasks/todo.md\n" : ""),
+      salvage: async (_wt, _issue, _run, stageLabel) => {
+        salvageCalls.push(stageLabel);
+        return { salvaged: true };
+      },
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [],
+    },
+    "873/2026-08-05T15:18:23Z",
+  );
+  assert.equal(salvageCalls.length, 0, "scratch-only dirt must not invoke salvage");
+  // Scratch-only post-fix is clean enough for trust → tests re-run and can pass.
+  assert.equal(out.passed, true, `expected pass on scratch-only post-fix: ${JSON.stringify(out)}`);
+  assert.equal(runs, 2);
+});
+
+test("gate (#873 review): mixed scratch+product dirt after fix still invokes salvage", async () => {
+  // Product leftover must still be salvaged; scratch presence must not suppress
+  // salvage of product work (salvage itself stages product-only in production).
+  let runs = 0;
+  let dirty = false;
+  let porcelain = "";
+  const salvageCalls: string[] = [];
+  const out = await runTestGate(
+    cfgWith({ max_attempts: 1 }),
+    873,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => {
+        runs++;
+        return runs === 1 ? failResult : passResult;
+      },
+      invoke: async () => {
+        dirty = true;
+        porcelain = " M tasks/todo.md\n M core/scripts/foo.ts\n";
+        return okInvoke();
+      },
+      gitHead: async () => "h0",
+      gitDirty: async () => dirty,
+      gitStatusPorcelain: async () => porcelain,
+      salvage: async (_wt, _issue, _run, stageLabel) => {
+        salvageCalls.push(stageLabel);
+        // Product committed; scratch may remain (product-only salvage).
+        porcelain = " M tasks/todo.md\n";
+        dirty = true; // scratch still dirty, but product-clean is enough
+        return { salvaged: true };
+      },
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [],
+    },
+    "873/2026-08-05T15:18:23Z",
+  );
+  assert.equal(salvageCalls.length, 1, "mixed dirt with product must still salvage");
+  assert.equal(out.passed, true, `expected pass after product salvage: ${JSON.stringify(out)}`);
+});

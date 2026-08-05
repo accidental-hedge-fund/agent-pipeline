@@ -12,6 +12,7 @@
 
 import { gitInWorktree } from "./worktree.ts";
 import { withTrailers } from "./traceability.ts";
+import { parsePorcelainPaths } from "./worktree-dirt.ts";
 
 export interface SalvageDeps {
   /** `git status --porcelain` output for the worktree ("" when clean).
@@ -39,6 +40,13 @@ export interface SalvageDeps {
   gitAddAll?: (wtPath: string, args: string[]) => Promise<void>;
   /** `git commit -m <message>` in the worktree. */
   gitCommit?: (wtPath: string, message: string) => Promise<void>;
+  /**
+   * When set, only these paths are staged/committed (product-only salvage
+   * #873). Pre-staged paths outside this set are unstaged first so scratch
+   * cannot ride into the salvage commit. Empty array → nothing to salvage.
+   * When set, takes precedence over `scope` for staging selection.
+   */
+  onlyPaths?: readonly string[];
 }
 
 export type SalvageResult = { salvaged: false } | { salvaged: true; message: string };
@@ -216,6 +224,43 @@ export async function salvageUncommittedWork(
     ]);
   } catch {
     // No staged marker to clear — expected in the common case.
+  }
+
+  // Product-only salvage (#873): stage/commit only the listed product paths.
+  // Takes precedence over scope so test-fix mixed dirt never folds scratch.
+  if (deps.onlyPaths !== undefined) {
+    if (deps.onlyPaths.length === 0) return { salvaged: false };
+    const rawStatus = await (deps.gitStatus ?? defaultGitStatus)(wtPath);
+    const status = stripPipelineInternalMarkers(rawStatus);
+    if (!status.trim()) return { salvaged: false };
+    const dirtyPaths = parsePorcelainPaths(status);
+    const productDirty = deps.onlyPaths.filter((p) => dirtyPaths.includes(p));
+    if (productDirty.length === 0) return { salvaged: false };
+    // Unstage everything that is not product so pre-staged scratch cannot ride
+    // into the commit (git commit stages the whole index).
+    const nonProduct = dirtyPaths.filter((p) => !productDirty.includes(p));
+    if (nonProduct.length > 0) {
+      try {
+        await (deps.gitRestoreStaged ?? defaultGitRestoreStaged)(wtPath, [
+          "restore",
+          "--staged",
+          "--",
+          ...nonProduct,
+        ]);
+      } catch {
+        // Pathspec matched nothing staged — fine.
+      }
+    }
+    const message = buildSalvageCommitMessage(issueNumber, pipelineRunId, stageLabel);
+    await (deps.gitAddAll ?? defaultGitAddAll)(wtPath, [
+      "add",
+      "--",
+      ...SALVAGE_NODE_MODULES_EXCLUDE,
+      ...SALVAGE_MARKER_EXCLUDE,
+      ...productDirty,
+    ]);
+    await (deps.gitCommit ?? defaultGitCommit)(wtPath, message);
+    return { salvaged: true, message };
   }
 
   const rawStatus = await (deps.gitStatus ?? defaultGitStatus)(wtPath, scope);

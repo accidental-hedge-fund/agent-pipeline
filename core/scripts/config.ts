@@ -29,6 +29,7 @@ import {
   resolveAdapter,
   registeredAdapterNames,
 } from "./harness-adapters/index.ts";
+import { isSafeScratchExtensionGlob } from "./worktree-dirt.ts";
 
 // A `models.*`/`effort.*` value: an arbitrary alias/effort string, or the
 // "auto" sentinel (#366) resolved via stage-routing.ts at config-load time.
@@ -352,10 +353,32 @@ const PartialConfigSchema = z.object({
       non_product_dirty_globs: z
         .array(z.string())
         .optional()
+        .superRefine((globs, ctx) => {
+          if (!globs) return;
+          // Reject extension globs that can match product paths so config cannot
+          // waive the dirty-gate trust boundary (#873 review). Classify-time
+          // filtering uses the same helper as a belt-and-suspenders path.
+          for (let i = 0; i < globs.length; i++) {
+            const g = globs[i];
+            if (typeof g !== "string" || !g.trim()) continue;
+            if (!isSafeScratchExtensionGlob(g)) {
+              ctx.addIssue({
+                code: "custom",
+                message:
+                  `non_product_dirty_globs entry ${JSON.stringify(g)} is unsafe: ` +
+                  "scratch extension globs must not match product paths " +
+                  "(core/, plugin/, openspec/, package roots, or repo-wide patterns). " +
+                  "Use a narrow non-product namespace (e.g. notes/**).",
+                path: [i],
+              });
+            }
+          }
+        })
         .describe(
           "Extra path globs treated as non-product scratch for format/test gate trust (#873). " +
             "Unioned with the engine-known set (tasks/**, .pipeline-prompt-* at worktree root); " +
-            "does not replace product fail-closed defaults. Lockfiles remain fold targets, not scratch.",
+            "does not replace product fail-closed defaults. Must not match product trees " +
+            "(core/, plugin/, openspec/) or repo-wide patterns (**). Lockfiles remain fold targets, not scratch.",
         ),
     })
     .strict()

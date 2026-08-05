@@ -1012,3 +1012,38 @@ test("generateConfigSchema: ci_mode has github/local enum and non-empty descript
     "ci_mode must carry a non-empty description",
   );
 });
+
+// ---------------------------------------------------------------------------
+// #873: non_product_dirty_globs must not waive product dirt
+// ---------------------------------------------------------------------------
+
+test("validateConfig (#873): safe non_product_dirty_globs accepted", () => {
+  const deps = makeDeps(`
+test_gate:
+  non_product_dirty_globs:
+    - notes/**
+    - tmp/scratch.txt
+`);
+  const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, true, JSON.stringify(result.diagnostics));
+});
+
+test("validateConfig (#873): unsafe non_product_dirty_globs rejected", () => {
+  for (const bad of ["**", "core/**", "plugin/**", "openspec/**"]) {
+    const deps = makeDeps(`
+test_gate:
+  non_product_dirty_globs:
+    - ${JSON.stringify(bad).slice(1, -1)}
+`);
+    // YAML: write the pattern literally
+    const deps2 = makeDeps(
+      ["test_gate:", "  non_product_dirty_globs:", `    - "${bad}"`].join("\n") + "\n",
+    );
+    const result = validateConfig("/fake-repo", deps2);
+    assert.equal(result.valid, false, `expected invalid for glob ${bad}`);
+    assert.ok(
+      result.diagnostics.some((d) => /unsafe|non_product_dirty_globs|product/i.test(d.message)),
+      `expected unsafe-glob diagnostic for ${bad}; got ${JSON.stringify(result.diagnostics)}`,
+    );
+  }
+});

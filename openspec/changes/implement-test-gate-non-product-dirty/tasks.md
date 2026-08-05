@@ -38,6 +38,12 @@
       product path appears in `blockReason`.
 - [x] 4.3 Add or extend format-gate coverage for scratch-only pre-dirty so it
       does not refuse solely for engine-known scratch.
+- [x] 4.4 Constrain `non_product_dirty_globs` so `**` / `core/**` / `plugin/**` /
+      `openspec/**` cannot waive product dirt (config validation + classify-time
+      filter); add regressions.
+- [x] 4.5 Format auto-fix and test-fix salvage commit product paths only;
+      skip salvage for scratch-only dirt; add regressions for pre-staged
+      `tasks/todo.md` and mixed dirt.
 - [x] 4.4 Confirm existing lockfile-fold and dirty-vs-exhaustion tests remain green.
 
 ## 5. Mirror, validate, CI

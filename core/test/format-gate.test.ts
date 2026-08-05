@@ -4,11 +4,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  productOnlyCommitArgs,
   runFormatGate,
   runFormatAndTestGates,
+  unstageScratchArgs,
   type FormatGateDeps,
   type FormatTestGateDeps,
 } from "../scripts/stages/format-gate.ts";
+import { classifyWorktreeDirt } from "../scripts/worktree-dirt.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 // Minimal config builder — only format_gate is relevant here.
@@ -282,6 +285,38 @@ test("format gate (#873): mixed scratch + product pre-dirty still blocks", async
     "reason" in result && result.reason.includes("pre-existing uncommitted changes"),
     `unexpected reason: ${JSON.stringify(result)}`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// #873 review: auto-format commit must not include pre-staged scratch
+// ---------------------------------------------------------------------------
+
+test("format gate (#873 review): product-only commit plan unstages scratch and pathspec-commits product", () => {
+  // Staged scratch (index) + formatter-produced product change: the default
+  // commit path must unstage tasks/todo.md and commit only the product path.
+  const paths = ["tasks/todo.md", "core/scripts/foo.ts"];
+  const { product, scratch } = classifyWorktreeDirt(paths);
+  assert.deepEqual(product, ["core/scripts/foo.ts"]);
+  assert.deepEqual(scratch, ["tasks/todo.md"]);
+
+  const unstage = unstageScratchArgs(scratch);
+  assert.ok(unstage, "scratch must be unstaged before commit");
+  assert.deepEqual(unstage, ["restore", "--staged", "--", "tasks/todo.md"]);
+  assert.ok(!unstage.includes("core/scripts/foo.ts"), "must not unstage product");
+
+  const commitArgs = productOnlyCommitArgs("chore: auto-format (#873)", product);
+  assert.deepEqual(commitArgs, [
+    "commit",
+    "-m",
+    "chore: auto-format (#873)",
+    "--",
+    "core/scripts/foo.ts",
+  ]);
+  assert.ok(!commitArgs.includes("tasks/todo.md"), "scratch must not appear in commit pathspec");
+});
+
+test("format gate (#873 review): unstageScratchArgs is null when no scratch", () => {
+  assert.equal(unstageScratchArgs([]), null);
 });
 
 // ---------------------------------------------------------------------------

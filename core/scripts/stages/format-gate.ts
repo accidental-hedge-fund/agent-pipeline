@@ -11,6 +11,7 @@ import { gitInWorktree } from "../worktree.ts";
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
 import type { TestGateResult } from "../testgate.ts";
 import {
+  classifyWorktreeDirt,
   parsePorcelainPaths,
   productDirtyPaths,
 } from "../worktree-dirt.ts";
@@ -279,8 +280,31 @@ async function defaultGitStatusPorcelain(wtPath: string): Promise<string> {
 }
 
 /**
- * Stage only product-relevant dirty paths and commit (#873). Scratch paths are
- * left unstaged so auto-format never folds tasks/todo.md into product history.
+ * `git restore --staged` argv to drop pre-staged scratch from the index so it
+ * cannot ride into an auto-format commit (#873 review). Pure — no I/O.
+ * Returns null when there is nothing to unstage.
+ */
+export function unstageScratchArgs(scratchPaths: readonly string[]): string[] | null {
+  if (scratchPaths.length === 0) return null;
+  return ["restore", "--staged", "--", ...scratchPaths];
+}
+
+/**
+ * `git commit` argv restricted to product paths only. Pathspec form keeps
+ * pre-staged scratch out of the commit even if it re-enters the index between
+ * unstage and commit (#873 review). Pure — no I/O.
+ */
+export function productOnlyCommitArgs(
+  message: string,
+  productPaths: readonly string[],
+): string[] {
+  return ["commit", "-m", message, "--", ...productPaths];
+}
+
+/**
+ * Stage only product-relevant dirty paths and commit (#873). Pre-staged scratch
+ * is unstaged first and the commit is pathspec-limited to product paths so
+ * tasks/todo.md (and other scratch) never fold into chore: auto-format history.
  */
 async function defaultGitCommit(
   wtPath: string,
@@ -289,16 +313,26 @@ async function defaultGitCommit(
   porcelainFn: (p: string) => Promise<string> = defaultGitStatusPorcelain,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const paths = parsePorcelainPaths(await porcelainFn(wtPath));
-  const product = productDirtyPaths(paths, scratchExtraGlobs);
+  const { product, scratch } = classifyWorktreeDirt(paths, scratchExtraGlobs);
   if (product.length === 0) {
     return { ok: false, error: "no product-relevant changes to commit" };
+  }
+  // Unstage pre-staged scratch so it cannot ride into the auto-format commit.
+  // Index-only; working-tree scratch remains dirty for the operator/agent.
+  const unstage = unstageScratchArgs(scratch);
+  if (unstage) {
+    await gitInWorktree(wtPath, unstage, { ignoreFailure: true });
   }
   const addResult = await gitInWorktree(wtPath, ["add", "--", ...product], { ignoreFailure: true });
   if (addResult.code !== 0) {
     const detail = (addResult.stderr.trim() || addResult.stdout.trim());
     return { ok: false, error: `git add failed (exit ${addResult.code}): ${detail}` };
   }
-  const commitResult = await gitInWorktree(wtPath, ["commit", "-m", message], { ignoreFailure: true });
+  const commitResult = await gitInWorktree(
+    wtPath,
+    productOnlyCommitArgs(message, product),
+    { ignoreFailure: true },
+  );
   if (commitResult.code !== 0) {
     const detail = (commitResult.stderr.trim() || commitResult.stdout.trim());
     return { ok: false, error: `git commit failed (exit ${commitResult.code}): ${detail}` };

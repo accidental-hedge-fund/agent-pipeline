@@ -233,8 +233,8 @@ export async function runTestGate(
     deps.verifyTestFix ??
     ((wt: string, hb: string) => enforceTestFixCommitFormat(issueNumber, wt, hb));
   const gitCommitMessagesFn = deps.gitCommitMessages ?? defaultGitCommitMessages;
-  const salvageFn = deps.salvage ?? trySalvageUncommittedWork;
   // Config-extended scratch globs are unioned with the engine-known set (#873).
+  // Unsafe globs are ignored at classify time (isSafeScratchExtensionGlob).
   const scratchExtraGlobs = cfg.test_gate.non_product_dirty_globs ?? [];
 
   /**
@@ -474,14 +474,43 @@ export async function runTestGate(
     // real uncommitted changes into a commit before the clean-tree and commit
     // checks below. Only the no-new-commit case salvages; a harness that
     // committed AND left dirt still hits the dirty block (its commits must not
-    // be silently amended with leftovers). Salvage triggers on any dirt
-    // (including scratch) so leftover product work is still captured when mixed
-    // with scratch; trust below is product-only (#873).
+    // be silently amended with leftovers).
+    //
+    // #873: salvage is product-path-only. Scratch-only dirt must not become a
+    // salvage/fix commit; mixed dirt salvages product paths only (onlyPaths)
+    // so tasks/todo.md never folds into product history.
     const headAfterFix = await gitHeadFn(wtPath);
     let salvageFailureReason: string | undefined;
     if (headBefore && headAfterFix === headBefore && (await gitDirtyFn(wtPath))) {
-      const salvageResult = await salvageFn(wtPath, issueNumber, pipelineRunId, testFixSalvageStageLabel(issueNumber));
-      salvageFailureReason = salvageResult.failureReason;
+      const porcelain = await gitStatusPorcelainFn(wtPath);
+      const dirtyPaths = parsePorcelainPaths(porcelain);
+      // null = legacy pure-boolean dirty seam (empty porcelain) → keep salvage.
+      // [] after classify = scratch-only → skip salvage.
+      // non-empty product = product or mixed → salvage product only.
+      const productPaths =
+        dirtyPaths.length > 0
+          ? productDirtyPaths(dirtyPaths, scratchExtraGlobs)
+          : null;
+      if (productPaths === null || productPaths.length > 0) {
+        const salvageResult =
+          deps.salvage != null
+            ? await deps.salvage(
+                wtPath,
+                issueNumber,
+                pipelineRunId,
+                testFixSalvageStageLabel(issueNumber),
+              )
+            : await trySalvageUncommittedWork(
+                wtPath,
+                issueNumber,
+                pipelineRunId,
+                testFixSalvageStageLabel(issueNumber),
+                productPaths !== null && productPaths.length > 0
+                  ? { onlyPaths: productPaths }
+                  : {},
+              );
+        salvageFailureReason = salvageResult.failureReason;
+      }
     }
 
     // Require no product-relevant dirt after every fix attempt (#873). Scratch-

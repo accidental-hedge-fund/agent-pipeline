@@ -75,8 +75,42 @@ export function productDirtyPaths(
 }
 
 /**
- * True when `filePath` matches engine-known scratch or any config extension
- * glob. Lockfiles and product trees never match the engine set.
+ * Product canary paths used to reject over-broad scratch extension globs.
+ * An extension glob that matches any of these is unsafe and is ignored at
+ * classify time (fail-closed: product dirt remains product). Covers product
+ * trees (`core/`, `plugin/`, `openspec/`), package roots, and repo-wide
+ * patterns such as `**` (#873 review).
+ */
+export const PRODUCT_PATH_CANARIES: readonly string[] = [
+  "core/scripts/foo.ts",
+  "plugin/scripts/foo.ts",
+  "openspec/changes/x/proposal.md",
+  "package.json",
+  "scripts/build.mjs",
+  "hosts/claude/SKILL.md",
+  "README.md",
+];
+
+/**
+ * True when a configured scratch extension glob is safe: it must not match
+ * any product canary path. Unsafe globs (`**`, `core/**`, `plugin/**`,
+ * `openspec/**`, root-wide `*`, …) are rejected so operators cannot waive the
+ * product-dirt trust boundary.
+ */
+export function isSafeScratchExtensionGlob(pattern: string): boolean {
+  let normalized = pattern.replace(/\\/g, "/").trim();
+  if (!normalized) return false;
+  while (normalized.startsWith("./")) normalized = normalized.slice(2);
+  for (const canary of PRODUCT_PATH_CANARIES) {
+    if (matchScratchGlob(canary, normalized)) return false;
+  }
+  return true;
+}
+
+/**
+ * True when `filePath` matches engine-known scratch or any **safe** config
+ * extension glob. Lockfiles and product trees never match the engine set.
+ * Unsafe extension globs are ignored (fail-closed).
  */
 export function isNonProductScratchPath(
   filePath: string,
@@ -89,7 +123,10 @@ export function isNonProductScratchPath(
   }
   for (const pattern of extraGlobs) {
     if (typeof pattern !== "string" || !pattern.trim()) continue;
-    if (matchScratchGlob(normalized, pattern.trim())) return true;
+    const trimmed = pattern.trim();
+    // Fail-closed: never let a misconfigured extension waive product dirt.
+    if (!isSafeScratchExtensionGlob(trimmed)) continue;
+    if (matchScratchGlob(normalized, trimmed)) return true;
   }
   return false;
 }

@@ -66,6 +66,59 @@ SHALL NOT be reclassified as ignorable scratch by this capability.
 
 ---
 
+### Requirement: Configured scratch extension globs SHALL NOT waive product dirt
+
+Configured extensions of the non-product scratch set (`test_gate.non_product_dirty_globs`) SHALL be constrained so they cannot exempt product-relevant paths from the dirty trust gate. Patterns capable of matching product trees or the whole repository (including at least `**`, `core/**`, `plugin/**`, and `openspec/**`) SHALL be rejected at config validation and SHALL be ignored at classify time. Classification SHALL remain fail-closed: an unsafe or over-broad extension MUST NOT cause an uncommitted product path to be treated as scratch.
+
+#### Scenario: Hostile repo-wide extension does not waive product dirt
+
+- **WHEN** `non_product_dirty_globs` includes `**` or another pattern that would
+  match product paths under `core/`, `plugin/`, or `openspec/`
+- **AND** porcelain reports an uncommitted product path (e.g. `core/scripts/foo.ts`)
+- **THEN** the gate SHALL still hard-block on that product path
+- **AND** SHALL NOT treat the product path as non-product scratch solely because
+  of the hostile extension
+
+#### Scenario: Narrow non-product extension remains allowed
+
+- **WHEN** `non_product_dirty_globs` includes a narrow non-product namespace
+  (e.g. `notes/**`)
+- **AND** porcelain reports only that namespace dirty (plus optional engine-known
+  scratch)
+- **THEN** the gate SHALL treat those paths as non-product scratch for trust
+
+---
+
+### Requirement: Format auto-fix and test-fix salvage commits SHALL be product-path-only
+
+The format-gate auto-fix path and the test-fix salvage path SHALL stage and
+commit product paths only when non-product scratch is dirty or already staged.
+Pre-staged scratch (e.g. `tasks/todo.md`) SHALL be unstaged or otherwise
+excluded so it does not enter the auto-format or salvage commit. Scratch-only
+dirt after a test-fix harness exit SHALL NOT invoke salvage at all.
+
+#### Scenario: Pre-staged scratch does not enter auto-format commit
+
+- **WHEN** `tasks/todo.md` is already staged
+- **AND** an auto-format command produces a product-path change
+- **THEN** the auto-format commit SHALL include the product path
+- **AND** SHALL NOT include `tasks/todo.md`
+
+#### Scenario: Scratch-only post-fix dirt skips salvage
+
+- **WHEN** the test-fix harness exits without a new commit
+- **AND** the only uncommitted paths are non-product scratch
+- **THEN** the pipeline SHALL NOT invoke salvage for that dirt alone
+
+#### Scenario: Mixed dirt salvages product paths only
+
+- **WHEN** the test-fix harness exits without a new commit
+- **AND** both product paths and scratch are uncommitted
+- **THEN** salvage MAY run to capture product work
+- **AND** the salvage commit SHALL NOT include non-product scratch paths
+
+---
+
 ### Requirement: Non-product scratch classification SHALL be shared and injectable
 
 The product-vs-scratch classification used for gate trust SHALL be implemented as

@@ -7,8 +7,10 @@ import {
   ENGINE_NON_PRODUCT_SCRATCH_GLOBS,
   formatProductDirtDisclosure,
   isNonProductScratchPath,
+  isSafeScratchExtensionGlob,
   matchScratchGlob,
   parsePorcelainPaths,
+  PRODUCT_PATH_CANARIES,
   productDirtyPaths,
 } from "../scripts/worktree-dirt.ts";
 
@@ -80,6 +82,51 @@ test("classifier: extra globs are unioned with engine set (no replace)", () => {
   assert.equal(isNonProductScratchPath("core/scripts/x.ts", extra), false);
   // Extension cannot remove engine coverage by omission — empty extra still engines
   assert.equal(isNonProductScratchPath("tasks/todo.md", []), true);
+});
+
+test("classifier (#873 review): unsafe extension globs cannot waive product dirt", () => {
+  // Bites without isSafeScratchExtensionGlob: these would classify product as scratch.
+  for (const bad of ["**", "core/**", "plugin/**", "openspec/**", "*"]) {
+    assert.equal(
+      isSafeScratchExtensionGlob(bad),
+      false,
+      `${bad} must be rejected as an unsafe scratch extension`,
+    );
+    assert.equal(
+      isNonProductScratchPath("core/scripts/foo.ts", [bad]),
+      false,
+      `${bad} must not classify core/ as scratch`,
+    );
+    assert.equal(
+      isNonProductScratchPath("plugin/scripts/foo.ts", [bad]),
+      false,
+      `${bad} must not classify plugin/ as scratch`,
+    );
+    assert.equal(
+      isNonProductScratchPath("openspec/changes/x/proposal.md", [bad]),
+      false,
+      `${bad} must not classify openspec/ as scratch`,
+    );
+    // Product dirt list still non-empty under a hostile extension config
+    assert.deepEqual(
+      productDirtyPaths(
+        ["core/scripts/foo.ts", "tasks/todo.md"],
+        [bad],
+      ),
+      ["core/scripts/foo.ts"],
+    );
+  }
+  // Narrow non-product namespace remains allowed
+  assert.equal(isSafeScratchExtensionGlob("notes/**"), true);
+  assert.equal(isNonProductScratchPath("notes/agent.md", ["notes/**"]), true);
+  // Engine-known scratch still scratch even when unsafe globs are present
+  assert.equal(isNonProductScratchPath("tasks/todo.md", ["**"]), true);
+});
+
+test("PRODUCT_PATH_CANARIES cover required product trees", () => {
+  assert.ok(PRODUCT_PATH_CANARIES.some((p) => p.startsWith("core/")));
+  assert.ok(PRODUCT_PATH_CANARIES.some((p) => p.startsWith("plugin/")));
+  assert.ok(PRODUCT_PATH_CANARIES.some((p) => p.startsWith("openspec/")));
 });
 
 test("parsePorcelainPaths: strips status columns and handles renames", () => {
