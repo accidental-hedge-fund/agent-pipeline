@@ -70,6 +70,10 @@ test("HUMAN_INTERVENTION_KINDS: includes 'unknown' escape hatch", () => {
 function fakeDeps(captured: string[]): EmitInterventionDeps {
   return {
     appendFile: async (_p, data) => { captured.push(data); },
+    // No run.json in unit tests unless a test injects one — do not touch real FS.
+    readFile: async () => {
+      throw new Error("ENOENT");
+    },
   };
 }
 
@@ -113,11 +117,20 @@ test("emitHumanIntervention: stamps engine + discovery attribution when provided
   assert.equal(event.discovery_channel, "live-run");
 });
 
-test("emitHumanIntervention: omits discovery_channel when caller does not supply it (#763 review 2a8f68e9)", async () => {
-  // review-batch / manual / override call sites often omit the field; inventing
-  // live-run would corrupt discovery-channel decomposition. Collectors inherit
-  // from run.json when the event field is absent.
+test("emitHumanIntervention: stamps discovery_channel from run.json when caller omits it (#763 b32309e8)", async () => {
+  // Call sites often omit the field; write-time resolution stamps the active
+  // run's persisted channel so events remain offline-classifiable without
+  // inventing live-run for review-batch/manual contexts.
   const lines: string[] = [];
+  const deps: EmitInterventionDeps = {
+    appendFile: async (_p, data) => {
+      lines.push(data);
+    },
+    readFile: async (p) => {
+      assert.equal(p, "/fake/run/run.json");
+      return JSON.stringify({ discovery_channel: "review-batch" });
+    },
+  };
   await emitHumanIntervention(
     "/fake/run",
     {
@@ -128,26 +141,89 @@ test("emitHumanIntervention: omits discovery_channel when caller does not supply
       ref: "key",
       engine_version: "1.31.0",
       engine_commit_sha: "abc1234",
-      // deliberately no discovery_channel — e.g. review-batch run intervention
+      // deliberately no discovery_channel — resolve from run.json
     },
-    fakeDeps(lines),
+    deps,
+  );
+  const event = JSON.parse(lines[0]) as HumanInterventionEvent;
+  assert.equal(event.engine_version, "1.31.0");
+  assert.equal(event.engine_commit_sha, "abc1234");
+  assert.equal(event.discovery_channel, "review-batch");
+});
+
+test("emitHumanIntervention: caller discovery_channel wins over run.json (#763 b32309e8)", async () => {
+  const lines: string[] = [];
+  const deps: EmitInterventionDeps = {
+    appendFile: async (_p, data) => {
+      lines.push(data);
+    },
+    readFile: async () => {
+      assert.fail("run.json must not be read when caller supplies a valid channel");
+      return "";
+    },
+  };
+  await emitHumanIntervention(
+    "/fake/run",
+    {
+      kind: "human-risk-override",
+      stage: null,
+      issue: 763,
+      detail: "override",
+      discovery_channel: "manual",
+    },
+    deps,
+  );
+  const event = JSON.parse(lines[0]) as HumanInterventionEvent;
+  assert.equal(event.discovery_channel, "manual");
+});
+
+test("emitHumanIntervention: omits discovery_channel when neither caller nor run.json has one (#763)", async () => {
+  // No inventing live-run: unresolved channel is omitted + diagnostic warn.
+  const lines: string[] = [];
+  const deps: EmitInterventionDeps = {
+    appendFile: async (_p, data) => {
+      lines.push(data);
+    },
+    readFile: async () => {
+      throw new Error("ENOENT");
+    },
+  };
+  await emitHumanIntervention(
+    "/fake/run",
+    {
+      kind: "human-risk-override",
+      stage: null,
+      issue: 763,
+      detail: "override applied: key — reason",
+      ref: "key",
+      engine_version: "1.31.0",
+      engine_commit_sha: "abc1234",
+    },
+    deps,
   );
   const event = JSON.parse(lines[0]) as HumanInterventionEvent & Record<string, unknown>;
   assert.equal(event.engine_version, "1.31.0");
-  assert.equal(event.engine_commit_sha, "abc1234");
   assert.equal(
     Object.prototype.hasOwnProperty.call(event, "discovery_channel"),
     false,
-    "event-level discovery_channel must be omitted so collectors inherit run.json channel",
+    "must not invent live-run when channel cannot be resolved",
   );
 });
 
 test("emitHumanIntervention: historical-shaped payload without engine fields still writes (#763)", async () => {
   const lines: string[] = [];
+  const deps: EmitInterventionDeps = {
+    appendFile: async (_p, data) => {
+      lines.push(data);
+    },
+    readFile: async () => {
+      throw new Error("ENOENT");
+    },
+  };
   await emitHumanIntervention(
     "/fake/run",
     { kind: "human-risk-override", stage: null, issue: 1, detail: "legacy" },
-    fakeDeps(lines),
+    deps,
   );
   const event = JSON.parse(lines[0]) as HumanInterventionEvent;
   assert.equal(event.kind, "human-risk-override");

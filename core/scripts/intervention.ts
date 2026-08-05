@@ -10,6 +10,8 @@ import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
 import { type BlockerKind } from "./types.ts";
 import {
   buildEventAttributionFields,
+  isDiscoveryChannel,
+  runLevelDiscoveryChannel,
   type DiscoveryChannel,
 } from "./engine-attribution.ts";
 
@@ -53,9 +55,10 @@ export interface HumanInterventionEvent {
    */
   offramp_id?: string;
   /**
-   * Engine + discovery attribution (#763). Additive optional — collectors may
-   * also inherit from `run.json.engine` + run-level channel default when
-   * omitted. Historical events without these fields remain countable.
+   * Engine + discovery attribution (#763). New producers stamp discovery_channel
+   * from the caller or from the active run's persisted `run.json` channel.
+   * Historical events without these fields remain countable; collectors may
+   * still inherit from run.json when the event field is absent.
    */
   engine_version?: string;
   engine_commit_sha?: string | null;
@@ -70,12 +73,38 @@ export interface HumanInterventionEvent {
  *  `RunStoreDeps` so callers can pass `opts.runStoreDeps` directly. */
 export interface EmitInterventionDeps {
   appendFile: (p: string, data: string) => Promise<void>;
+  /** Optional: read run.json for write-time discovery-channel resolution (#763). */
+  readFile?: (p: string) => Promise<string>;
   stdoutWrite?: (line: string) => void;
 }
 
 const defaultEmitDeps: EmitInterventionDeps = {
   appendFile: (p, data) => fsp.appendFile(p, data, "utf8"),
+  readFile: (p) => fsp.readFile(p, "utf8"),
 };
+
+/**
+ * Resolve discovery_channel for a newly written intervention event.
+ * Priority: validated caller payload → persisted run.json stamp.
+ * Never invents live-run when both are absent/invalid.
+ */
+async function resolveInterventionDiscoveryChannel(
+  runDir: string,
+  payloadChannel: DiscoveryChannel | null | undefined,
+  deps: EmitInterventionDeps,
+): Promise<DiscoveryChannel | undefined> {
+  if (isDiscoveryChannel(payloadChannel)) return payloadChannel;
+  const readFile = deps.readFile ?? defaultEmitDeps.readFile;
+  if (!readFile) return undefined;
+  try {
+    const raw = await readFile(path.join(runDir, "run.json"));
+    const meta = JSON.parse(raw) as Record<string, unknown>;
+    const fromRun = runLevelDiscoveryChannel(meta);
+    return fromRun ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Append a `human_intervention` event to `events.jsonl`.
@@ -108,13 +137,24 @@ export async function emitHumanIntervention(
   try {
     // Attribution enrichment is best-effort: failure to resolve identity must
     // never change the stage outcome (non-fatal emission remains).
-    // Do not invent event-level discovery_channel: omit when the caller does
-    // not supply a validated active-run channel so collectors inherit from
-    // run.json (review-batch/manual must not be stamped live-run).
+    // Prefer caller-supplied channel; else stamp from run.json so the event is
+    // offline-classifiable without collector-side inheritance. Never invent
+    // live-run when both are absent/invalid (#763 pre-merge delta b32309e8).
+    const discoveryChannel = await resolveInterventionDiscoveryChannel(
+      runDir,
+      payload.discovery_channel,
+      deps,
+    );
+    if (discoveryChannel === undefined) {
+      console.warn(
+        "[pipeline] intervention: unresolved discovery_channel for human_intervention " +
+          `(issue ${payload.issue}); event written without channel stamp`,
+      );
+    }
     const attribution = buildEventAttributionFields({
       version: payload.engine_version,
       commit_sha: payload.engine_commit_sha,
-      discovery_channel: payload.discovery_channel,
+      discovery_channel: discoveryChannel,
     });
     const event: HumanInterventionEvent = {
       schema_version: 1,
