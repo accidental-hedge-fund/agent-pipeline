@@ -31,6 +31,25 @@ function fail(host: string, check: string, message: string): OuterHostConformanc
   return { host, check, message };
 }
 
+/**
+ * True when a value is usable as a single relative path segment under a managed
+ * install base (joined via path.join(base, ...segments)). Rejects non-strings,
+ * empty/whitespace, traversal (`..`), and absolute paths. Type annotations do
+ * not protect runtime JSON manifests.
+ */
+function isSafeRelativePathSegment(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const s = value.trim();
+  if (!s) return false;
+  // Absolute Unix / UNC / Windows drive.
+  if (s.startsWith("/") || s.startsWith("\\") || /^[A-Za-z]:[/\\]/.test(s)) {
+    return false;
+  }
+  // Traversal: bare ".." or any path component that is "..".
+  if (s === ".." || s.split(/[/\\]/).includes("..")) return false;
+  return true;
+}
+
 const FORBIDDEN_ADAPTER_FIELDS = [
   "adapterId",
   "adapter_id",
@@ -198,15 +217,21 @@ export function checkOuterHostConformance(manifest: OuterHostManifest): OuterHos
             fail(host, "install.managedArtifacts.commandsKind", "commandsKind is required"),
           );
         } else if (install.managedArtifacts.commandsKind !== "none") {
-          if (
-            !Array.isArray(install.managedArtifacts.commandsDirRelative) ||
-            install.managedArtifacts.commandsDirRelative.length === 0
-          ) {
+          const dirs = install.managedArtifacts.commandsDirRelative;
+          if (!Array.isArray(dirs) || dirs.length === 0) {
             failures.push(
               fail(
                 host,
                 "install.managedArtifacts.commandsDirRelative",
                 "commandsDirRelative is required when commandsKind is not none",
+              ),
+            );
+          } else if (!dirs.every(isSafeRelativePathSegment)) {
+            failures.push(
+              fail(
+                host,
+                "install.managedArtifacts.commandsDirRelative",
+                "commandsDirRelative entries must be non-empty relative path segments (no absolute or '..' segments)",
               ),
             );
           }

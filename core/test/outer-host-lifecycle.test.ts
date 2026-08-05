@@ -268,6 +268,45 @@ test("conformance kit: missing skillsRelative fails when install supported (#784
   );
 });
 
+test("conformance kit: rejects malformed commandsDirRelative entries (#784)", () => {
+  const cases = [
+    "commands-dir-null-entry.json",
+    "commands-dir-empty-entry.json",
+    "commands-dir-traversal.json",
+  ] as const;
+  for (const name of cases) {
+    const report = checkOuterHostConformance(loadFixture(name));
+    assert.equal(report.ok, false, `${name} should fail: ${JSON.stringify(report.failures)}`);
+    assert.ok(
+      report.failures.some(
+        (f) =>
+          f.check === "install.managedArtifacts.commandsDirRelative" &&
+          (f.message.includes("non-empty relative") || f.message.includes("commandsDirRelative")),
+      ),
+      `${name}: expected commandsDirRelative failure, got ${JSON.stringify(report.failures)}`,
+    );
+  }
+  // Absolute segment (runtime JSON path; not covered by type annotations).
+  const absolute = structuredClone(loadFixture("synth-complete.json")) as OuterHostManifest & {
+    install: { managedArtifacts: { commandsDirRelative: unknown } };
+  };
+  absolute.install.managedArtifacts.commandsDirRelative = ["/etc"];
+  const absReport = checkOuterHostConformance(absolute);
+  assert.equal(absReport.ok, false);
+  assert.ok(
+    absReport.failures.some((f) => f.check === "install.managedArtifacts.commandsDirRelative"),
+    JSON.stringify(absReport.failures),
+  );
+  // Non-string number entry.
+  absolute.install.managedArtifacts.commandsDirRelative = [42];
+  const numReport = checkOuterHostConformance(absolute);
+  assert.equal(numReport.ok, false);
+  assert.ok(
+    numReport.failures.some((f) => f.check === "install.managedArtifacts.commandsDirRelative"),
+    JSON.stringify(numReport.failures),
+  );
+});
+
 // ---------------------------------------------------------------------------
 // 4. Orchestration — capability-driven, no host-name branch
 // ---------------------------------------------------------------------------
