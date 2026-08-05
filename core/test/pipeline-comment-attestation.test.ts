@@ -540,6 +540,51 @@ test("design-interrogation: human content after design-gate-state still gates", 
   assert.equal(unacked.length, 1, "appended human objection after design-gate-state must still gate");
 });
 
+test("design-interrogation: #762-shaped multi-round unresolved body does not false-block review-1", () => {
+  // Production failure shape on issue #762 (v1.30.0 install): design-gate Round 2
+  // progress ends on a terminal design-gate-state, carries "unresolved" /
+  // "do not"-shaped challenge titles, and has no pipeline-attest (stale
+  // renderer). Review-1 must not treat that as unacknowledged human input.
+  const stateB64 = Buffer.from(
+    JSON.stringify({
+      schema_version: 1,
+      decisionRecordVersions: [],
+      rounds: [
+        { round: 1, challenges: [], responses: [] },
+        { round: 2, challenges: [], responses: [] },
+      ],
+      outcome: null,
+    }),
+  ).toString("base64url");
+  const body =
+    `## Design Interrogation\n\n` +
+    `**Matched triggers**: architecture, architecture\n` +
+    `**Reviewer**: \`codex\` (independent)\n\n` +
+    `Round 2 interrogation complete.\n\n` +
+    `### Round 1\n` +
+    `- \`d030d8b5\` [high] Candidate intent remains usable — **revised**\n\n` +
+    `### Round 2\n` +
+    `- \`4df3ed17\` [high] A checkout-local pin is not yet a factory-wide authority — **unresolved**\n` +
+    `- \`7b4fa75f\` [high] Forced candidate intent does not prove candidate execution — **unresolved**\n\n` +
+    `---\n*Automated by Claude Code Pipeline Skill*\n\n` +
+    `<!-- design-gate-state: ${stateB64} -->`;
+  assert.equal(classifyComment(body), "pipeline");
+  assert.equal(isVerifiedDesignGateOutput(body), true);
+  assert.match(body, /\bunresolved\b/i);
+
+  const comments = [
+    makeComment(TEST_ACTOR, "## Revised Implementation Plan\n\nTwo-track engine pinning.", ts(0)),
+    makeComment(TEST_ACTOR, body, ts(1)),
+  ];
+  const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.deepEqual(
+    unacked,
+    [],
+    "#762: trusted design-gate Round 2 progress must not gate review-1 as unacknowledged human input",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // 4. Source drift guard — every heading literal in core/scripts/ is registered
 // ---------------------------------------------------------------------------

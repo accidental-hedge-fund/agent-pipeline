@@ -243,6 +243,23 @@ export interface GhRunOptions {
   runner?: GhSubprocessRunner;
 }
 
+/**
+ * Environment for every `gh` child. Host harnesses often export FORCE_COLOR /
+ * CLICOLOR; with those set, `gh --json` can emit ANSI-colored stdout that
+ * breaks `JSON.parse` in `getIssueDetail` and other typed wrappers (workflow-state
+ * false failures: status/summary crash, or partial recovery mis-reads). Always
+ * force a machine-readable, uncolored child env without mutating the parent.
+ */
+export function ghChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return {
+    ...base,
+    NO_COLOR: "1",
+    FORCE_COLOR: "0",
+    CLICOLOR: "0",
+    CLICOLOR_FORCE: "0",
+  };
+}
+
 async function ghRun(args: string[], opts: GhRunOptions = {}): Promise<string> {
   const timeoutMs = opts.timeoutMs ?? 30_000;
   const retries = opts.retries ?? 3;
@@ -250,7 +267,11 @@ async function ghRun(args: string[], opts: GhRunOptions = {}): Promise<string> {
   const _sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const _isTransient = opts.isTransient ?? isTransientGhError;
   const _runner: GhSubprocessRunner = opts.runner ?? ((runArgs) =>
-    execFileAsync("gh", runArgs, { timeout: timeoutMs, maxBuffer: 50 * 1024 * 1024 })
+    execFileAsync("gh", runArgs, {
+      timeout: timeoutMs,
+      maxBuffer: 50 * 1024 * 1024,
+      env: ghChildEnv(),
+    })
   );
   const category = args.slice(0, 2).join(" ");
   let lastErr: Error | null = null;
