@@ -48,6 +48,14 @@ This check is additive to `install:version-coherence` (loaded VERSION vs on-disk
 - **THEN** the check SHALL NOT fail solely for pin mismatch
 - **AND** SHALL still report the pin target and that the active track is `candidate`
 
+#### Scenario: Non-factory doctor does not fail closed on missing pin
+
+- **WHEN** `pipeline doctor` runs on a non-factory product repository host
+- **AND** no explicit `--engine-track` / `engine_track` pinned intent is set
+- **AND** the production pin artifact is missing
+- **THEN** the engine-track check SHALL NOT fail solely for the missing pin
+- **AND** MAY pass or skip with detail that two-track factory policy is inactive
+
 ---
 
 ### Requirement: The engine-track doctor check SHALL be unit-testable via injectable deps

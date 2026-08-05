@@ -551,8 +551,18 @@ export function classifyEngineTrack(input: ClassifyEngineTrackInput): ClassifyEn
 }
 
 // ---------------------------------------------------------------------------
-// Track intent resolution (CLI > config > command default)
+// Track intent resolution (CLI > config > factory-scoped default)
 // ---------------------------------------------------------------------------
+
+/**
+ * Canonical factory control repository (owner/name). Two-track pin policy
+ * defaults apply only here (or when CLI/config explicitly set a track).
+ * Downstream product repos that install the skill must not require a pin.
+ */
+export const FACTORY_CONTROL_REPO = "accidental-hedge-fund/agent-pipeline";
+
+/** Env override for the factory control checkout root used as pin authority. */
+export const FACTORY_CONTROL_DIR_ENV = "AGENT_PIPELINE_FACTORY_CONTROL";
 
 export type TrackCommandFamily =
   | "factory-gate"
@@ -564,9 +574,60 @@ export type TrackCommandFamily =
   | "other";
 
 /**
+ * True when `repo` is the factory control repository that owns the production
+ * pin. Ordinary product-repo consumers of the skill are not factory control.
+ */
+export function isFactoryControlRepo(repo: string | null | undefined): boolean {
+  if (typeof repo !== "string") return false;
+  const n = repo.trim().toLowerCase();
+  return n.length > 0 && n === FACTORY_CONTROL_REPO.toLowerCase();
+}
+
+/**
+ * Directory used as production-pin authority (factory control checkout).
+ * Precedence: factoryControlDir arg → env AGENT_PIPELINE_FACTORY_CONTROL →
+ * targetRepoDir. Pin file override (production_engine_pin_path /
+ * AGENT_PIPELINE_PRODUCTION_PIN) still wins inside {@link productionPinPath}.
+ *
+ * The pin is never treated as living on an arbitrary product target solely
+ * because that target is being advanced — callers pass factoryControlDir or
+ * rely on factory control as the target (self-dogfood).
+ */
+export function resolvePinAuthorityDir(opts: {
+  targetRepoDir: string;
+  factoryControlDir?: string | null;
+  env?: NodeJS.ProcessEnv;
+}): string {
+  const env = opts.env ?? process.env;
+  const fromEnv = env[FACTORY_CONTROL_DIR_ENV];
+  if (typeof fromEnv === "string" && fromEnv.trim()) {
+    return path.resolve(fromEnv.trim());
+  }
+  if (typeof opts.factoryControlDir === "string" && opts.factoryControlDir.trim()) {
+    return path.resolve(opts.factoryControlDir.trim());
+  }
+  return opts.targetRepoDir;
+}
+
+/**
+ * Resolved two-track intent for a command.
+ * - `pinned` | `candidate` — factory two-track policy is active
+ * - `null` — policy inactive (ordinary non-factory advance/doctor); no pin
+ *   enforcement and no claim of track identity
+ */
+export type ResolvedEngineTrackIntent = EngineTrackIntent | null;
+
+/**
  * Resolve engine track intent.
- * Precedence: explicit CLI → config → command default.
- * factory-gate always forces candidate (Layer B soak).
+ * Precedence: force-candidate / factory-gate → explicit CLI → config →
+ * command family defaults.
+ *
+ * Command defaults:
+ * - factory-gate → always candidate (Layer B soak; not overridable to pinned)
+ * - evals → candidate
+ * - loop / single / advance / doctor / other → **pinned only when factory
+ *   control context** (self-dogfood of the control repo); otherwise `null`
+ *   so ordinary product-repo advances do not require a production pin.
  */
 export function resolveEngineTrackIntent(opts: {
   command: TrackCommandFamily;
@@ -574,7 +635,13 @@ export function resolveEngineTrackIntent(opts: {
   configTrack?: EngineTrackIntent | null;
   /** When true (factory-gate), force candidate regardless of CLI/config. */
   forceCandidate?: boolean;
-}): EngineTrackIntent {
+  /**
+   * True when this invocation is factory control production/dogfood
+   * (typically {@link isFactoryControlRepo} on config.repo). When false/omitted,
+   * ordinary commands default to inactive (`null`) rather than pinned.
+   */
+  factoryControlContext?: boolean;
+}): ResolvedEngineTrackIntent {
   if (opts.forceCandidate || opts.command === "factory-gate") {
     return "candidate";
   }
@@ -585,8 +652,9 @@ export function resolveEngineTrackIntent(opts: {
     return opts.configTrack;
   }
   if (opts.command === "evals") return "candidate";
-  // loop / single / advance / doctor / other → pinned production default
-  return "pinned";
+  // Factory production/dogfood default only — never global for all consumers.
+  if (opts.factoryControlContext) return "pinned";
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -747,14 +815,31 @@ export interface EngineTrackCheckResult {
 /**
  * Pure evaluation of install:engine-track for unit tests / doctor.
  * Injectable pin load + version + intent — no filesystem inside this body.
+ * `intent: null` means two-track policy is inactive (ordinary non-factory host).
  */
 export function evaluateEngineTrackCheck(input: {
-  intent: EngineTrackIntent;
+  intent: ResolvedEngineTrackIntent;
   pinLoad: PinLoadResult;
   runningVersion: string;
   /** Install provenance; omitted → missing (fail closed under pinned intent). */
   installProvenance?: PinInstallProvenance | null;
 }): EngineTrackCheckResult {
+  // Non-factory ordinary hosts: pin is not required; do not fail closed.
+  if (input.intent === null) {
+    const pin =
+      input.pinLoad.kind === "ok" ? input.pinLoad.pin : null;
+    const pinPart = pin
+      ? `production pin readable at factory path (v${pin.version}); not enforced`
+      : input.pinLoad.kind === "missing"
+        ? "production pin absent (ok for non-factory hosts)"
+        : `production pin ${input.pinLoad.kind} (ok for non-factory hosts)`;
+    return {
+      status: "pass",
+      detail:
+        `two-track factory policy inactive; running v${input.runningVersion || "(unknown)"}; ${pinPart}`,
+    };
+  }
+
   const pin = input.pinLoad.kind === "ok" ? input.pinLoad.pin : null;
   const installProvenance =
     input.installProvenance ??

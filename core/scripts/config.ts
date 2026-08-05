@@ -419,13 +419,13 @@ const PartialConfigSchema = z.object({
     .enum(["pinned", "candidate"])
     .optional()
     .describe(
-      'Factory engine track intent: "pinned" (production pin / dogfood) or "candidate" (FRG/eval soak). CLI --engine-track overrides. factory-gate always forces candidate.',
+      'Factory engine track intent: "pinned" (production pin / dogfood) or "candidate" (FRG/eval soak). CLI --engine-track overrides. factory-gate always forces candidate. Unset: factory control defaults to pinned; ordinary product repos leave policy inactive.',
     ),
   production_engine_pin_path: z
     .string()
     .optional()
     .describe(
-      "Absolute path override for the production engine pin JSON (default: <repo>/.agent-pipeline/production-engine-pin.json). Env AGENT_PIPELINE_PRODUCTION_PIN also overrides.",
+      "Absolute path override for the production engine pin JSON. Default authority is factory control checkout (.agent-pipeline/production-engine-pin.json), not every product target. Env AGENT_PIPELINE_PRODUCTION_PIN also overrides.",
     ),
   // `pipeline:loop` native-goal capability attestation (#506). Optional;
   // absent/"auto" leaves automatic detection (--help marker, then version
@@ -2386,11 +2386,11 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     "",
     // Two-track engine pinning (#762) — optional; command defaults apply when unset.
     config.engine_track !== undefined
-      ? `engine_track: ${yamlScalar(config.engine_track)} # ${sd("engine_track", 'pinned (production pin) or candidate (FRG/eval soak); CLI --engine-track overrides')}`
-      : `# engine_track: pinned # ${sd("engine_track", 'optional: "pinned" | "candidate"; factory-gate always forces candidate')}`,
+      ? `engine_track: ${yamlScalar(config.engine_track)} # ${sd("engine_track", 'pinned (factory production pin) or candidate (FRG/eval soak); CLI --engine-track overrides; unset = factory control default pinned, product repos inactive')}`
+      : `# engine_track: pinned # ${sd("engine_track", 'optional: "pinned" | "candidate"; factory-gate forces candidate; non-factory unset leaves policy inactive')}`,
     config.production_engine_pin_path !== undefined
-      ? `production_engine_pin_path: ${yamlScalar(config.production_engine_pin_path)} # ${sd("production_engine_pin_path", "absolute override for production pin JSON")}`
-      : `# production_engine_pin_path: /path/to/production-engine-pin.json # ${sd("production_engine_pin_path", "optional; default <repo>/.agent-pipeline/production-engine-pin.json")}`,
+      ? `production_engine_pin_path: ${yamlScalar(config.production_engine_pin_path)} # ${sd("production_engine_pin_path", "absolute override for factory production pin JSON")}`
+      : `# production_engine_pin_path: /path/to/production-engine-pin.json # ${sd("production_engine_pin_path", "optional; factory control authority, not every product target")}`,
     "",
     config.loop !== undefined
       ? `loop: # pipeline:loop native-goal capability attestation (#506)\n${yamlBlock(config.loop, 2)}`

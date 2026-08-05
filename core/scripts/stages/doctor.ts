@@ -34,8 +34,10 @@ import { isElevatedWriteHealth, parseWriteHealthText } from "../run-store.ts";
 import {
   evaluateEngineTrackCheck,
   installReceiptPath,
+  isFactoryControlRepo,
   resolveEngineTrackIntent,
   resolveInstallProvenance,
+  resolvePinAuthorityDir,
   resolveProductionPin,
 } from "../production-engine-pin.ts";
 
@@ -667,14 +669,21 @@ export function buildPreflightChecks(
     description: "Engine track (pinned production pin vs candidate) is disclosed and coherent under pinned intent",
     run: async (deps) => {
       // CLI --engine-track is threaded via config.engine_track when doctor is
-      // invoked from pipeline.ts (resolveConfig merges CLI/config). Doctor
-      // default intent is pinned; factory-gate/evals set candidate elsewhere.
+      // invoked from pipeline.ts (resolveConfig merges CLI/config). Default
+      // pinned intent applies only for factory control context; ordinary
+      // product-repo doctor does not require a production pin.
       const intent = resolveEngineTrackIntent({
         command: "doctor",
         configTrack: config.engine_track ?? null,
+        factoryControlContext: isFactoryControlRepo(config.repo),
+      });
+      // Pin authority is the factory control checkout (or env override), not
+      // necessarily the target product repo being operated on.
+      const pinAuthorityDir = resolvePinAuthorityDir({
+        targetRepoDir: config.repo_dir,
       });
       const pinLoad = await resolveProductionPin({
-        repoDir: config.repo_dir,
+        repoDir: pinAuthorityDir,
         readTextFile: deps.readTextFile,
         overridePath: config.production_engine_pin_path ?? null,
       });

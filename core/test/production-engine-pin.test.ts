@@ -6,6 +6,8 @@ import test from "node:test";
 import * as path from "node:path";
 import type { FrgEvidence, FrgLookupResult } from "../scripts/factory-reliability-gate.ts";
 import {
+  FACTORY_CONTROL_DIR_ENV,
+  FACTORY_CONTROL_REPO,
   INSTALL_RECEIPT_FILENAME,
   PRODUCTION_ENGINE_PIN_REL,
   PRODUCTION_PIN_ENV,
@@ -16,6 +18,7 @@ import {
   evaluateEngineTrackCheck,
   formatProductionPinSummary,
   initProductionPin,
+  isFactoryControlRepo,
   parseInstallReceipt,
   parseProductionEnginePin,
   pinInstallProvenanceMatches,
@@ -23,6 +26,7 @@ import {
   promoteProductionPin,
   resolveEngineTrackIntent,
   resolveInstallProvenance,
+  resolvePinAuthorityDir,
   resolveProductionPin,
   rollbackProductionPin,
   tagForVersion,
@@ -163,6 +167,68 @@ test("productionPinPath: env wins over default", () => {
     productionPinPath("/repo", null, { [PRODUCTION_PIN_ENV]: "/env/pin.json" }),
     path.resolve("/env/pin.json"),
   );
+});
+
+test("isFactoryControlRepo: only the canonical factory control owner/name", () => {
+  assert.equal(isFactoryControlRepo(FACTORY_CONTROL_REPO), true);
+  assert.equal(isFactoryControlRepo(FACTORY_CONTROL_REPO.toUpperCase()), true);
+  assert.equal(isFactoryControlRepo("acme/widget"), false);
+  assert.equal(isFactoryControlRepo("other/agent-pipeline"), false);
+  assert.equal(isFactoryControlRepo(""), false);
+  assert.equal(isFactoryControlRepo(null), false);
+});
+
+test("resolvePinAuthorityDir: factory control env beats target repoDir", () => {
+  assert.equal(
+    resolvePinAuthorityDir({
+      targetRepoDir: "/product/target",
+      env: { [FACTORY_CONTROL_DIR_ENV]: "/factory/control" },
+    }),
+    path.resolve("/factory/control"),
+  );
+  assert.equal(
+    resolvePinAuthorityDir({
+      targetRepoDir: "/product/target",
+      factoryControlDir: "/factory/explicit",
+      env: {},
+    }),
+    path.resolve("/factory/explicit"),
+  );
+  assert.equal(
+    resolvePinAuthorityDir({ targetRepoDir: "/product/target", env: {} }),
+    "/product/target",
+  );
+});
+
+test("resolveProductionPin: pin authority can differ from target product repo", async () => {
+  // Factory pin lives on control checkout; product target has no pin file.
+  const factoryDir = "/factory/control";
+  const factoryPin = path.join(factoryDir, PRODUCTION_ENGINE_PIN_REL);
+  const productDir = "/product/target";
+  const pinJson = JSON.stringify(validPin({ version: "1.29.1" }));
+  const files = new Map<string, string>([[factoryPin, pinJson]]);
+  const readTextFile = async (p: string) => files.get(p) ?? null;
+
+  const fromProduct = await resolveProductionPin({
+    repoDir: productDir,
+    readTextFile,
+  });
+  assert.equal(fromProduct.kind, "missing");
+
+  const authority = resolvePinAuthorityDir({
+    targetRepoDir: productDir,
+    factoryControlDir: factoryDir,
+    env: {},
+  });
+  const fromAuthority = await resolveProductionPin({
+    repoDir: authority,
+    readTextFile,
+  });
+  assert.equal(fromAuthority.kind, "ok");
+  if (fromAuthority.kind === "ok") {
+    assert.equal(fromAuthority.pin.version, "1.29.1");
+    assert.equal(fromAuthority.path, factoryPin);
+  }
 });
 
 test("parseProductionEnginePin: accepts valid pin", () => {
@@ -337,12 +403,34 @@ test("resolveEngineTrackIntent: config when no CLI", () => {
   );
 });
 
-test("resolveEngineTrackIntent: defaults", () => {
+test("resolveEngineTrackIntent: defaults are factory-scoped (#762 review 2)", () => {
   assert.equal(resolveEngineTrackIntent({ command: "evals" }), "candidate");
-  assert.equal(resolveEngineTrackIntent({ command: "loop" }), "pinned");
-  assert.equal(resolveEngineTrackIntent({ command: "single" }), "pinned");
-  assert.equal(resolveEngineTrackIntent({ command: "advance" }), "pinned");
-  assert.equal(resolveEngineTrackIntent({ command: "doctor" }), "pinned");
+  // Factory control production/dogfood defaults to pinned.
+  assert.equal(
+    resolveEngineTrackIntent({ command: "loop", factoryControlContext: true }),
+    "pinned",
+  );
+  assert.equal(
+    resolveEngineTrackIntent({ command: "single", factoryControlContext: true }),
+    "pinned",
+  );
+  assert.equal(
+    resolveEngineTrackIntent({ command: "advance", factoryControlContext: true }),
+    "pinned",
+  );
+  assert.equal(
+    resolveEngineTrackIntent({ command: "doctor", factoryControlContext: true }),
+    "pinned",
+  );
+  // Ordinary non-factory product repos: policy inactive (no pin required).
+  assert.equal(resolveEngineTrackIntent({ command: "loop" }), null);
+  assert.equal(resolveEngineTrackIntent({ command: "single" }), null);
+  assert.equal(resolveEngineTrackIntent({ command: "advance" }), null);
+  assert.equal(resolveEngineTrackIntent({ command: "doctor" }), null);
+  assert.equal(
+    resolveEngineTrackIntent({ command: "advance", factoryControlContext: false }),
+    null,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -536,6 +624,16 @@ test("evaluateEngineTrackCheck: missing pin under pinned intent → fail", () =>
   });
   assert.equal(r.status, "fail");
   assert.match(r.remediation ?? "", /factory-pin init/);
+});
+
+test("evaluateEngineTrackCheck: inactive intent (non-factory) + missing pin → pass", () => {
+  const r = evaluateEngineTrackCheck({
+    intent: null,
+    pinLoad: { kind: "missing", path: PIN_PATH },
+    runningVersion: "1.30.0",
+  });
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /inactive|non-factory/i);
 });
 
 test("evaluateEngineTrackCheck: candidate intent with mismatch → pass", () => {

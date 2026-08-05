@@ -312,7 +312,7 @@ Nested fields:
 ### `engine_track`
 
 - **Type:** enum
-- **Description:** Factory engine track intent: "pinned" (production pin / dogfood) or "candidate" (FRG/eval soak). CLI --engine-track overrides. factory-gate always forces candidate.
+- **Description:** Factory engine track intent: "pinned" (production pin / dogfood) or "candidate" (FRG/eval soak). CLI --engine-track overrides. factory-gate always forces candidate. Unset: factory control defaults to pinned; ordinary product repos leave policy inactive.
 
 - **Allowed values:** `pinned`, `candidate`
 
@@ -619,7 +619,7 @@ Nested fields:
 ### `production_engine_pin_path`
 
 - **Type:** string
-- **Description:** Absolute path override for the production engine pin JSON (default: <repo>/.agent-pipeline/production-engine-pin.json). Env AGENT_PIPELINE_PRODUCTION_PIN also overrides.
+- **Description:** Absolute path override for the production engine pin JSON. Default authority is factory control checkout (.agent-pipeline/production-engine-pin.json), not every product target. Env AGENT_PIPELINE_PRODUCTION_PIN also overrides.
 
 ### `queue`
 

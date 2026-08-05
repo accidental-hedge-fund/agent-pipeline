@@ -35,10 +35,15 @@ production. The running engine version for a pinned-track run SHALL match the pi
 sufficient to classify a run as track `pinned`: the system SHALL also require verifiable
 tag-install provenance (for example an installer receipt identifying the pin tag). A
 same-version working-tree candidate without that provenance SHALL NOT be recorded as
-`pinned`. Under default pinned intent, a missing or invalid production pin SHALL refuse
-the run before stages execute rather than silently reclassifying to candidate and
-continuing. Candidate-track evidence SHALL NOT attach the production pin's `git_sha` as
-the executing engine SHA.
+`pinned`. Under default pinned intent (factory control production/dogfood only), a missing
+or invalid production pin SHALL refuse the run before stages execute rather than silently
+reclassifying to candidate and continuing. Ordinary non-factory advances (product
+repositories that consume the installed skill without explicit `--engine-track` /
+`engine_track` and that are not the factory control repository) SHALL NOT apply pinned-track
+enforcement and SHALL NOT require a production pin. The production pin authority SHALL be
+the factory control checkout (or an explicitly configured pin path / factory-control dir),
+not every target product `repo_dir` under advance. Candidate-track evidence SHALL NOT attach
+the production pin's `git_sha` as the executing engine SHA.
 
 #### Scenario: Pinned-track run matches the pin version
 
@@ -70,6 +75,22 @@ the executing engine SHA.
 - **AND** the production pin artifact is missing or invalid
 - **THEN** the advance path SHALL refuse before stages execute
 - **AND** SHALL NOT continue while only labeling evidence as track `candidate`
+
+#### Scenario: Ordinary non-factory advance does not require a production pin
+
+- **WHEN** an ordinary advance runs against a non-factory product repository
+- **AND** no explicit `--engine-track` / `engine_track` is set
+- **AND** no production pin artifact is present in the target repository
+- **THEN** the advance path SHALL NOT refuse for `missing_pin`
+- **AND** SHALL proceed to stages without requiring factory pin policy
+
+#### Scenario: Pin authority is factory control not every target repo
+
+- **WHEN** pinned-track production intent applies
+- **AND** the production pin is configured via factory control path or pin path override
+- **AND** the advance target repository differs from that pin authority
+- **THEN** pin resolution SHALL use the factory control / override path
+- **AND** SHALL NOT require the pin file to exist under the product target `repo_dir`
 
 #### Scenario: Candidate evidence does not inherit the production pin SHA
 

@@ -20,7 +20,9 @@
 ## 2. Enforceable track-selection interface
 
 - [x] 2.1 Add CLI `--engine-track pinned|candidate` and optional config `engine_track`.
-- [x] 2.2 Defaults: factory-gate / evals → candidate; ordinary loop/single/advance/doctor → pinned.
+- [x] 2.2 Defaults: factory-gate / evals → candidate; factory-control loop/single/advance/doctor →
+      pinned; ordinary non-factory product-repo advances leave two-track policy inactive (no pin
+      required). Pin authority is factory control checkout / override, not every target repo_dir.
 - [x] 2.3 Pinned intent + missing pin or version mismatch → fail before run is presented as pinned
       (run-start and/or doctor.runOnStart path).
 - [x] 2.4 Candidate intent records `candidate` and does not fail solely for pin mismatch.

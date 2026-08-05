@@ -1276,27 +1276,34 @@ function engineTrackDeps(
 }
 
 test("check install:engine-track — pin match + receipt under pinned intent → pass", async () => {
-  const r = await getCheck(makeConfig(), "install:engine-track", "1.29.1").run(
-    engineTrackDeps(pinJson("1.29.1"), {}, "1.29.1"),
-  );
+  // Explicit pinned intent: non-factory product repos only enforce when set.
+  const r = await getCheck(
+    makeConfig({ engine_track: "pinned" }),
+    "install:engine-track",
+    "1.29.1",
+  ).run(engineTrackDeps(pinJson("1.29.1"), {}, "1.29.1"));
   assert.equal(r.status, "pass");
   assert.match(r.detail, /pinned/);
   assert.match(r.detail, /1\.29\.1/);
 });
 
 test("check install:engine-track — pin version match without receipt → fail", async () => {
-  const r = await getCheck(makeConfig(), "install:engine-track", "1.29.1").run(
-    engineTrackDeps(pinJson("1.29.1"), {}, null),
-  );
+  const r = await getCheck(
+    makeConfig({ engine_track: "pinned" }),
+    "install:engine-track",
+    "1.29.1",
+  ).run(engineTrackDeps(pinJson("1.29.1"), {}, null));
   assert.equal(r.status, "fail");
   assert.match(r.detail, /provenance|receipt|tag-install|unverified/i);
   assert.ok(r.remediation && /reinstall|candidate/i.test(r.remediation));
 });
 
 test("check install:engine-track — pin mismatch under production intent → fail", async () => {
-  const r = await getCheck(makeConfig(), "install:engine-track", "1.30.0").run(
-    engineTrackDeps(pinJson("1.29.1"), {}, "1.30.0"),
-  );
+  const r = await getCheck(
+    makeConfig({ engine_track: "pinned" }),
+    "install:engine-track",
+    "1.30.0",
+  ).run(engineTrackDeps(pinJson("1.29.1"), {}, "1.30.0"));
   assert.equal(r.status, "fail");
   assert.match(r.detail, /1\.29\.1/);
   assert.match(r.detail, /1\.30\.0/);
@@ -1304,7 +1311,27 @@ test("check install:engine-track — pin mismatch under production intent → fa
 });
 
 test("check install:engine-track — missing pin under pinned intent → fail with init remediation", async () => {
+  const r = await getCheck(
+    makeConfig({ engine_track: "pinned" }),
+    "install:engine-track",
+    "1.0.0",
+  ).run(engineTrackDeps(null, {}, "1.0.0"));
+  assert.equal(r.status, "fail");
+  assert.match(r.remediation!, /factory-pin init/);
+});
+
+test("check install:engine-track — non-factory host with no pin → pass (policy inactive)", async () => {
+  // makeConfig defaults to acme/widget (not factory control) and no engine_track.
   const r = await getCheck(makeConfig(), "install:engine-track", "1.0.0").run(
+    engineTrackDeps(null, {}, "1.0.0"),
+  );
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /inactive|non-factory/i);
+});
+
+test("check install:engine-track — factory control repo defaults to pinned enforcement", async () => {
+  const cfg = makeConfig({ repo: "accidental-hedge-fund/agent-pipeline" });
+  const r = await getCheck(cfg, "install:engine-track", "1.0.0").run(
     engineTrackDeps(null, {}, "1.0.0"),
   );
   assert.equal(r.status, "fail");
