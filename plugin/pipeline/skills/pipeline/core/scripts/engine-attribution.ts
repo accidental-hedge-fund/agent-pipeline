@@ -221,6 +221,25 @@ export function runLevelDiscoveryChannel(
 }
 
 /**
+ * Resolve the active-run discovery channel for a dispatch (#763).
+ * Priority: persisted run.json stamp (resume / written-once) → validated
+ * entrypoint override (batch/manual) → ordinary-advance live-run default.
+ * Never invents a channel from engine.version alone.
+ */
+export function resolveDispatchDiscoveryChannel(input: {
+  /** Closed-set channel from AdvanceOpts / batch entrypoint, if any. */
+  explicit?: unknown;
+  /** Already-parsed run.json.discovery_channel when the run dir exists. */
+  persisted?: unknown;
+}): DiscoveryChannel {
+  return (
+    normalizeDiscoveryChannel(input.persisted) ??
+    normalizeDiscoveryChannel(input.explicit) ??
+    DEFAULT_LIVE_RUN_CHANNEL
+  );
+}
+
+/**
  * Resolve attribution for a ledger event:
  * 1. Inline event fields (`engine_version`, `engine_commit_sha`, `discovery_channel`)
  * 2. Else inherit from run.json engine identity + run default channel

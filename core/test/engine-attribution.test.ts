@@ -16,6 +16,7 @@ import {
   parseDiscoveryChannelMarker,
   parseDiscoveryChannelLoose,
   parseEngineMarker,
+  resolveDispatchDiscoveryChannel,
   resolveEngineCommitSha,
   resolveEventAttribution,
   runLevelDiscoveryChannel,
@@ -165,6 +166,28 @@ test("runLevelDiscoveryChannel requires explicit stamp; engine.version is not a 
     "live-run",
   );
   assert.equal(runLevelDiscoveryChannel({ discovery_channel: "garbage" }), null);
+});
+
+test("resolveDispatchDiscoveryChannel: persisted > explicit > live-run default (#763)", () => {
+  assert.equal(
+    resolveDispatchDiscoveryChannel({}),
+    DEFAULT_LIVE_RUN_CHANNEL,
+    "ordinary advance with no stamp defaults to live-run",
+  );
+  assert.equal(
+    resolveDispatchDiscoveryChannel({ explicit: "review-batch" }),
+    "review-batch",
+  );
+  assert.equal(
+    resolveDispatchDiscoveryChannel({ explicit: "manual", persisted: "review-batch" }),
+    "review-batch",
+    "persisted run.json stamp wins over entrypoint override on resume",
+  );
+  assert.equal(
+    resolveDispatchDiscoveryChannel({ explicit: "garbage", persisted: "not-a-channel" }),
+    DEFAULT_LIVE_RUN_CHANNEL,
+    "invalid values never invent a non-default channel",
+  );
 });
 
 test("buildEventAttributionFields and snapshotEngineStamp are explicit on unresolved", () => {

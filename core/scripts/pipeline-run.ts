@@ -26,7 +26,11 @@ import {
   setGhRunId,
   transition,
 } from "./gh.ts";
-import { DEFAULT_LIVE_RUN_CHANNEL } from "./engine-attribution.ts";
+import {
+  resolveDispatchDiscoveryChannel,
+  runLevelDiscoveryChannel,
+  type DiscoveryChannel,
+} from "./engine-attribution.ts";
 import {
   getOnDiskForIssue,
   gitInWorktree,
@@ -145,6 +149,14 @@ export interface AdvanceOpts {
    * intentional FRG/eval soaks.
    */
   engineTrack?: "pinned" | "candidate";
+  /**
+   * Run-level discovery channel for this dispatch (#763). Validated against the
+   * closed vocabulary. Ordinary advance omits this and stamps `live-run`.
+   * Batch/manual entrypoints pass `review-batch` / `manual` so initRunDir and
+   * setBlocked inherit the non-live channel. On resume, a persisted
+   * `run.json.discovery_channel` wins over this field (written-once).
+   */
+  discoveryChannel?: DiscoveryChannel;
 }
 
 /** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
@@ -899,6 +911,11 @@ export async function runAdvance(
     // and compared against the on-disk identity at each stage boundary below.
     let pinnedEngine: RunEngineIdentity | undefined;
     let lastObservedEngine: EngineIdentity | undefined;
+    // Discovery channel for this dispatch (#763). Re-resolved below when a
+    // persisted run.json stamp exists (resume). Default: opts or live-run.
+    let activeDiscoveryChannel: DiscoveryChannel = resolveDispatchDiscoveryChannel({
+      explicit: opts.discoveryChannel,
+    });
     const eventSinkDeps = buildEventSinkDeps(cfg);
     const runStoreDeps: RunStoreDeps = {
       ...defaultRunStoreDeps,
@@ -1105,6 +1122,22 @@ export async function runAdvance(
       });
       const outerHost =
         outerHostResolved === OUTER_HOST_UNKNOWN ? null : outerHostResolved;
+      // Discovery channel for this dispatch (#763): prefer a persisted run.json
+      // stamp on resume (written-once), else the entrypoint override, else live-run.
+      // Must be resolved before initRunDir so first-write persists the channel.
+      let persistedDiscovery: DiscoveryChannel | null = null;
+      try {
+        const raw = await runStoreDeps.readFile(path.join(runDir, "run.json"));
+        persistedDiscovery = runLevelDiscoveryChannel(
+          JSON.parse(raw) as Record<string, unknown>,
+        );
+      } catch {
+        /* first init — no run.json yet */
+      }
+      activeDiscoveryChannel = resolveDispatchDiscoveryChannel({
+        explicit: opts.discoveryChannel,
+        persisted: persistedDiscovery,
+      });
       await initRunDir(
         {
           runDir,
@@ -1115,6 +1148,7 @@ export async function runAdvance(
           startedAt: runStartedAtIso,
           engine: pinnedEngine,
           outerHost,
+          discoveryChannel: activeDiscoveryChannel,
         },
         runStoreDeps,
       ).catch(() => {});
@@ -1177,11 +1211,10 @@ export async function runAdvance(
     // every stage and re-entry of the loop — carry the same `Pipeline-Run:` trailer.
     const pipelineRunId = makePipelineRunId(issueNumber, runStartedAt);
     setGhRunId(pipelineRunId);
-    // Ordinary advance stamps live-run at run init; module-level channel so
-    // setBlocked inherits it instead of hardcoding (#763 review a7593c47).
-    // Batch/manual entrypoints that pass a different initRunDir discoveryChannel
-    // must also call setGhDiscoveryChannel with that same closed-set value.
-    setGhDiscoveryChannel(DEFAULT_LIVE_RUN_CHANNEL);
+    // Module-level channel for setBlocked / stage parks (#763): same closed-set
+    // value written to run.json (or opts/live-run when dry-run has no run dir).
+    // Never force live-run over a resolved review-batch / manual stamp.
+    setGhDiscoveryChannel(activeDiscoveryChannel);
     tlog(`[pipeline] #${issueNumber}: run id ${pipelineRunId}`);
 
     if (stateDir) {
