@@ -13,6 +13,7 @@
 // refusal to adopt unmarked human commits. Those shell invariants must not be
 // flattened into the stage skeleton.
 
+import * as path from "node:path";
 import { clearBlocked, getIssueDetail } from "../gh.ts";
 import { invoke } from "../harness.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
@@ -26,6 +27,7 @@ import {
   getOnDiskForIssue,
   gitInWorktree,
 } from "../worktree.ts";
+import { appendEvent, defaultRunStoreDeps, runDirPath } from "../run-store.ts";
 
 export interface RepairPipelineItemInput {
   runId: string;
@@ -392,6 +394,58 @@ export function createRepairPipelineItemExecutor(
     await git(wt.path, ["update-ref", breadcrumbRef, expected], { ignoreFailure: true });
     // Substantive path: shared-helper-backed pre-merge auto-fix (#629 / #787).
     // Do not reintroduce a private full implementer-round skeleton here.
+    // #857: pass candidate-integrity context when we can resolve a durable store.
+    const storeRoot =
+      cfg.repo_dir && input.runId
+        ? runDirPath(cfg.repo_dir, input.runId)
+        : cfg.repo_dir
+          ? path.join(cfg.repo_dir, ".agent-pipeline", "runs", input.runId)
+          : undefined;
+    const base = cfg.base_branch;
+    const branch = branchName(issueNumber, wt.slug);
+    const integrity =
+      storeRoot && base
+        ? {
+            storeRoot,
+            subject: {
+              run_id: input.runId,
+              issue: issueNumber,
+              pr: null as number | null,
+            },
+            base_ref: base,
+            mutation_method: "recovery_repair" as const,
+            // Empty scope → any candidate-side map delta is scope_expansion.
+            declared_scope: {
+              paths: [] as string[],
+              directories: [] as string[],
+              reason: "recovery_repair",
+            },
+            resolveBaseSha: async () => {
+              const r = await git(wt.path, ["rev-parse", `origin/${base}`], {
+                ignoreFailure: true,
+              });
+              return r.code === 0 ? r.stdout.trim() || null : null;
+            },
+            resolveCandidateSha: async () => {
+              const remote = await git(
+                wt.path,
+                ["ls-remote", "origin", `refs/heads/${branch}`],
+                { ignoreFailure: true },
+              );
+              const sha =
+                remote.code === 0 ? remote.stdout.trim().split(/\s+/, 1)[0] ?? "" : "";
+              if (sha) return sha;
+              const local = await git(wt.path, ["rev-parse", "HEAD"], {
+                ignoreFailure: true,
+              });
+              return local.code === 0 ? local.stdout.trim() || null : null;
+            },
+            emitEvent: async (event: unknown) => {
+              await appendEvent(storeRoot, event as never, defaultRunStoreDeps).catch(() => {});
+            },
+          }
+        : undefined;
+
     const result = await repair(
       cfg,
       issueNumber,
@@ -406,6 +460,8 @@ export function createRepairPipelineItemExecutor(
         commitSubjectPrefix: `fix: pipeline recovery ${input.attemptId.slice(0, 12)}`,
         salvageLabel: "pipeline recovery",
       },
+      undefined,
+      integrity,
     );
     // Controlled completion (any status): retire the breadcrumb so it can
     // only ever vouch for a genuinely interrupted (crashed) harness run.

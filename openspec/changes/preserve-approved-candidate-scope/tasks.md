@@ -1,42 +1,51 @@
-## 1. Manifest types and pure comparison
+## 1. Manifest types, canonical patch evidence, pure comparison
 
-- [ ] 1.1 Add a versioned `CandidateIntegrityManifest` type and serializers (schema_version 1, identity, base/candidate SHAs, path surface, path/content digests, optional enrichments, producer id) under `core/scripts/` with injected-deps construction from tree inputs
-- [ ] 1.2 Implement pure compare/classify: `semantically_equivalent` | `expected_scoped_change` | `scope_expansion` | `unverified`; path+content+declared scope drive results; raw size is diagnostic-only
-- [ ] 1.3 Implement durable persist/hydrate helpers for pre- and post-mutation manifests in the run-scoped store (document chosen path against `run-directory-layout`)
-- [ ] 1.4 Unit tests for classify matrix: clean rebase, undeclared path append, in-scope large delta, missing pre-manifest → `unverified`, incomplete digests → `unverified`
+- [x] 1.1 Add versioned `CandidateIntegrityManifest` + per-path patch records (`status`, `path`, `old_path`, `base_blob`, `candidate_blob`) under `core/scripts/` with injected-deps construction (prefer git object OIDs)
+- [x] 1.2 Implement candidate-side map comparison: `semantically_equivalent` | `expected_scoped_change` | `scope_expansion` | `unverified`; raw size diagnostic-only; incomplete digests → `unverified`
+- [x] 1.3 Implement `DeclaredRepairScope` (exact paths + directory prefixes; rename requires both sides; freeze at pre-persist)
+- [x] 1.4 Unit tests: clean rebase with base movement, add/delete/rename, undeclared README append, large in-scope delta, binary/unreadable → unverified, missing pre-manifest → unverified
 
-## 2. Events and evidence surface
+## 2. Lifecycle wrapper and authoritative durable store
 
-- [ ] 2.1 Emit run-ledger `candidate_integrity` events with before/after SHA, mutation_method, classification, changed-path summary, invalidation reason/flags; align field names with #763 scoreboard consumer
-- [ ] 2.2 Surface events in evidence-bundle / summary path without making bundle write authoritative for disposition
-- [ ] 2.3 Injected-deps tests that a scope-expansion transition produces a parseable event #763 metrics can count
+- [x] 2.1 Implement mandatory wrapper state machine: `pre_persisted → mutation_claimed → authoritative_post_read → classified → disposed`
+- [x] 2.2 Pre-persist failure aborts mutation; mutation error still forces authoritative post-read + classify
+- [x] 2.3 Atomic durable store under `.agent-pipeline/runs/<run-id>/candidate-integrity/` (temp+fsync+rename); key by domain/issue/PR/run/mutation_id
+- [x] 2.4 Restart hydration tests for each incomplete lifecycle state; never reseed pre-manifest from post head
 
-## 3. Call-site wrappers
+## 3. Events and evidence surface (#763-compatible)
 
-- [ ] 3.1 Wrap deterministic restack/rebase paths with capturePre → mutate → capturePost → classify → dispose (`restack` / `rebase`)
-- [ ] 3.2 Wrap conflict repair with the same protocol (`conflict_repair`)
-- [ ] 3.3 Wrap pre-merge auto-fix with declared repair scope and protocol (`pre_merge_autofix`); wire expected_scoped_change to existing delta re-review
-- [ ] 3.4 Wrap recovery `repair_pipeline_item` / mechanical remediation (`recovery_repair`)
-- [ ] 3.5 Wrap merge-queue restack/repair re-gate path so scope_expansion/unverified cannot become merge-eligible
-- [ ] 3.6 Contract test listing covered mutation methods and asserting each known call site invokes the shared helper
+- [x] 3.1 Emit `type: "candidate_integrity"` with `mutation_method`, `classification`, `before_sha`/`after_sha`, `changed_path_summary` (bounded), `invalidated_review`/`invalidated_readiness` booleans, `invalidation_reason`, optional `path_class`/`engine_version`
+- [x] 3.2 Injected-deps test that scope-expansion events move `computeCandidateIntegrityMetrics` counters
+- [x] 3.3 Evidence-bundle/summary surfaces events; bundle write non-authority for disposition
 
-## 4. Gate composition
+## 4. Call-site inventory and wrappers
 
-- [ ] 4.1 Integrate integrity invalidation into review-SHA / readiness paths so scope_expansion and unverified block readiness authority without inventing human holds
-- [ ] 4.2 Ensure semantically_equivalent still re-evaluates current-head gates (CI, review blockers, Tester pin when present, docs/invariants)
-- [ ] 4.3 Restart/reattach hydration: incomplete post-classification cannot reuse pre-mutation review for readiness
-- [ ] 4.4 Regression tests for gate dispositions (invalidation, re-gate, no human-hold-only path for mechanical integrity class)
+- [x] 4.1 Freeze inventory from design D7; contract test lists Covered sites
+- [x] 4.2 Wrap `runDeterministicConflictRebase` / merge-queue restack (`rebase`/`restack`)
+- [x] 4.3 Wrap pre-merge conflict rebase + CI one-shot rebase (`rebase`)
+- [x] 4.4 Wrap pre-merge auto-fix with declared scope (`pre_merge_autofix`) → expected_scoped_change forces delta re-review
+- [x] 4.5 Wrap `repair_pipeline_item` / merge-queue mechanical repair (`recovery_repair`/`conflict_repair`)
+- [x] 4.6 Merge-queue re-gate: scope_expansion/unverified not merge-eligible; no mergePr success on that head
 
-## 5. Regression fixtures
+## 5. Gate composition and bounded failure
 
-- [ ] 5.1 #793-class fixture: lean README surface → monolith append after restack/repair → scope_expansion and/or docs invariant red → readiness denied
-- [ ] 5.2 Clean rebase fixture: new SHA, identical digests → semantically_equivalent, no false expansion
-- [ ] 5.3 Intended auto-fix fixture: declared-scope content change → expected_scoped_change → fresh review required at new SHA
-- [ ] 5.4 Restart hydration fixture: pre-manifest survives reload; stale review cannot authorize readiness
-- [ ] 5.5 Multi-item composition fixture: item A invariant survives later mutation of item B only
+- [x] 5.1 Integrate invalidation records into review-SHA / readiness so expansion/unverified/expected_scoped_change cannot reuse pre-mutation approve; semantic equivalence re-evaluates gates and does not preserve ready-to-deploy
+- [x] 5.2 Prevent internal-commit residual exemption from laundering pre-mutation review onto post-mutation SHA after covered mutations
+- [x] 5.3 Bounded retry (default N=2) for repeated expansion/unverified; no human-authority hold solely for integrity; durable diagnostics
+- [x] 5.4 Stale CI / Tester / invariants / readiness markers cannot authorize new SHA
 
-## 6. Mirror, validation, and CI
+## 6. Regression fixtures
 
-- [ ] 6.1 Regenerate `plugin/` via `node scripts/build.mjs` when `core/` changes; commit mirror with core
-- [ ] 6.2 `openspec validate preserve-approved-candidate-scope` and `openspec validate --all` green after any spec edits
-- [ ] 6.3 `npm run ci` green from repo root before marking implementation done
+- [x] 6.1 Self-contained #793-class integrity fixture: undeclared README expansion → scope_expansion + readiness denied (protocol-owned)
+- [x] 6.2 Composition: same transition fails `readme-landing-contract` when content supplied (#855 helper, not a forked product contract)
+- [x] 6.3 Clean rebase fixture: new SHA, equal candidate-side maps → semantically_equivalent, no false expansion, readiness not auto-preserved
+- [x] 6.4 Intended auto-fix → expected_scoped_change → fresh review at new SHA
+- [x] 6.5 Restart hydration fixture
+- [x] 6.6 Multi-item composition: item A intact after item B mutation
+- [x] 6.7 Partial mutation failure still re-reads head; no-op autofix does not invent expansion
+
+## 7. Mirror, validation, and CI
+
+- [x] 7.1 Regenerate `plugin/` via `node scripts/build.mjs` when `core/` changes
+- [x] 7.2 `openspec validate preserve-approved-candidate-scope` and `openspec validate --all`
+- [x] 7.3 Root `npm run ci` green before done

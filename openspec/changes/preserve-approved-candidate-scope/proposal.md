@@ -27,21 +27,19 @@ PR #793 reintroduced ~1,845 lines of the retired README monolith after #597 had 
 
 ## Acceptance Criteria
 
-- [ ] Before every covered pipeline-owned candidate-moving operation (deterministic rebase/restack, conflict repair, pre-merge auto-fix, generic recovery repair), a candidate-integrity manifest is persisted with authoritative base ref/SHA, candidate SHA, changed-path surface, and deterministic path/content comparison evidence.
-- [ ] After each such mutation, the engine re-reads authoritative PR head and base, builds a resulting manifest, and classifies the transition as exactly one of: `semantically_equivalent`, `expected_scoped_change`, `scope_expansion`, or `unverified`.
-- [ ] A pure restack that preserves the candidate change surface classifies as `semantically_equivalent` (or equivalent non-expansion class) and proceeds only after all current-head gates are re-evaluated — no false scope-expansion finding.
-- [ ] A scope expansion or unverified comparison invalidates prior review and readiness evidence, emits a structured candidate-integrity diagnostic, and routes to scoped review or bounded engine recovery; it does **not** silently reach `pipeline:ready-to-deploy` and does **not** create a human-authority hold solely for that mechanical class.
-- [ ] Path and content evidence plus declared repair scope drive classification; raw diff size may enrich diagnostics but is **not** the sole safety boundary (legitimate large in-scope changes are not rejected merely for size).
-- [ ] Restart or reattach after a claimed mutation hydrates the same durable manifest; stale review evidence from a pre-mutation SHA cannot be reused for readiness on the post-mutation head without re-classification.
-- [ ] Ready-to-deploy requires review evidence, CI, and deterministic repository invariants all bound to the **current** authoritative candidate SHA (composing with #646 Tester evidence when present).
-- [ ] Durable run evidence / ledger events of type `candidate_integrity` (or the schema #763 already reads) include before/after SHA, mutation method, changed-path summary, classification, and review-invalidation reason when invalidation occurs.
-- [ ] Regression fixture reproduces #793-class repair/restack that appends the retired README monolith: docs landing-page invariant fails and readiness is denied.
-- [ ] Regression fixture for clean rebase (commit identity changes, semantic candidate surface preserved) re-gates without a false scope-expansion finding.
-- [ ] Regression fixture for intended auto-fix that changes the candidate forces fresh review against the new SHA.
-- [ ] Regression fixture for restart after a claimed mutation preserves the manifest and refuses stale review reuse for readiness.
-- [ ] Synthetic multi-item sequence proves an accepted invariant from item A survives a later repair/restack of item B (composition fixture framework).
-- [ ] No provider- or host-specific behavior; no replacement of review with a line-count/diff-size threshold; no new unattended merge path; no change to #691 trusted-verifier or #737 prompt-quality ownership.
-- [ ] `openspec validate preserve-approved-candidate-scope` passes; implementation phase later keeps `npm run ci` green with `plugin/` regenerated when `core/` changes.
+- [ ] Before every covered pipeline-owned candidate-moving operation, a pre-mutation manifest with canonical per-path patch records (status, base_blob, candidate_blob, rename old_path) is durable under the run `candidate-integrity/` store; mutation does not start until pre-persist succeeds.
+- [ ] All covered sites use the mandatory lifecycle: `pre_persisted → mutation_claimed → authoritative_post_read → classified`; mutation errors still re-read authoritative PR head/base.
+- [ ] After each mutation, classification is exactly one of: `semantically_equivalent`, `expected_scoped_change`, `scope_expansion`, or `unverified`, driven by candidate-side map equality plus declared scope (not raw diff size alone).
+- [ ] Pure restack/rebase with preserved candidate-side map is `semantically_equivalent`, re-evaluates current-head gates, and does **not** preserve ready-to-deploy solely from equivalence; no false scope-expansion.
+- [ ] `scope_expansion` / `unverified` invalidate prior review and readiness, emit structured diagnostics + `candidate_integrity` events with fields `computeCandidateIntegrityMetrics` already reads, route to scoped review/bounded recovery, and never create a human-authority hold solely for integrity.
+- [ ] `expected_scoped_change` forces fresh review (delta path when already routed) at the new SHA; declared scope is frozen exact paths/directory prefixes; restack/rebase cannot declare non-empty scope.
+- [ ] Restart hydrates incomplete lifecycle states without reseeding pre-manifest from post head; stale review cannot authorize readiness.
+- [ ] Repeated expansion/unverified is budget-bounded (default 2 extra mutations) without human hold, merge, or readiness on the failing head.
+- [ ] Call-site inventory covers every head-moving path; Covered sites only wrap through the shared helper (contract test); Out-of-scope sites documented.
+- [ ] Self-contained #793-class fixture denies undeclared README expansion via integrity; composition may also fail #855 readme-landing-contract without forking product ownership.
+- [ ] Clean rebase, intended auto-fix, restart hydration, multi-item isolation, base movement, rename/delete, binary/unreadable → unverified, and partial-failure re-read fixtures pass under injected deps.
+- [ ] No provider-specific behavior; no line-count-only threshold; no unattended merge; no #691/#737 ownership change.
+- [ ] `openspec validate preserve-approved-candidate-scope` and root `npm run ci` green with `plugin/` regenerated when `core/` changes.
 
 ## Impact
 

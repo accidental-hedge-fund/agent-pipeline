@@ -21,6 +21,13 @@ import {
   getOnDiskForIssue,
   gitInWorktree,
 } from "../worktree.ts";
+import {
+  mergeQueueIntegrityStoreRoot,
+  runCoveredCandidateMutation,
+  type CandidateIntegrityContext,
+  type IntegrityClassification,
+} from "../candidate-integrity.ts";
+import { appendEvent, defaultRunStoreDeps } from "../run-store.ts";
 import { mergePr, realMergeDeps, type MergeDeps } from "./merge.ts";
 import {
   evaluateReleaseWhenComplete,
@@ -400,15 +407,37 @@ export async function evaluateCandidateEligibility(
  *
  * Injectable for hermetic tests; production wires real worktree/git deps.
  */
+export type DeterministicRebaseDeps = {
+  getOnDiskForIssue?: typeof getOnDiskForIssue;
+  ensureManagedWorktree?: typeof ensureManagedWorktree;
+  gitInWorktree?: typeof gitInWorktree;
+  branchNameFn?: typeof branchName;
+  /**
+   * #857: when set, the head-moving rebase/push runs under candidate-integrity.
+   * Production wires a store under the repo; tests may inject a memory store via
+   * `integrity.storeDeps` or omit to exercise the legacy path only when intentionally
+   * testing pre-integrity behavior (covered production path always sets this).
+   */
+  integrity?: Omit<
+    CandidateIntegrityContext,
+    | "worktreePath"
+    | "gitInWorktree"
+    | "base_ref"
+    | "resolveBaseSha"
+    | "resolveCandidateSha"
+    | "mutation_method"
+    | "subject"
+  > & {
+    storeRoot?: string;
+    subject?: CandidateIntegrityContext["subject"];
+    skip?: boolean;
+  };
+};
+
 export async function runDeterministicConflictRebase(
   candidate: MergeQueueCandidate,
   cfg: PipelineConfig,
-  deps: {
-    getOnDiskForIssue?: typeof getOnDiskForIssue;
-    ensureManagedWorktree?: typeof ensureManagedWorktree;
-    gitInWorktree?: typeof gitInWorktree;
-    branchNameFn?: typeof branchName;
-  } = {},
+  deps: DeterministicRebaseDeps = {},
   /**
    * PR head SHA from the eligibility snapshot that classified the conflict.
    * Required for bound force-with-lease; when absent, fail closed.
@@ -544,72 +573,170 @@ export async function runDeterministicConflictRebase(
     };
   }
 
-  // We started from a proven-clean, non-rebasing worktree at the expected SHA.
-  // Only then is aborting a rebase we start safe (it is ours).
-  const rebase = await git(managedRoot, ["rebase", `origin/${base}`], {
-    ignoreFailure: true,
-  });
-  if (rebase.code !== 0) {
-    await git(managedRoot, ["rebase", "--abort"], { ignoreFailure: true });
-    // Ensure we are back on the pre-rebase SHA (abort should restore; belt+suspenders).
-    await git(managedRoot, ["reset", "--hard", expected], {
+  const performRebasePush = async (): Promise<DeterministicRepairResult> => {
+    // We started from a proven-clean, non-rebasing worktree at the expected SHA.
+    // Only then is aborting a rebase we start safe (it is ours).
+    const rebase = await git(managedRoot, ["rebase", `origin/${base}`], {
       ignoreFailure: true,
     });
-    return {
-      changed: false,
-      headSha: expected,
-      evidence:
-        `deterministic rebase onto origin/${base} failed (conflicts or unclean); aborted our session`,
-    };
-  }
+    if (rebase.code !== 0) {
+      await git(managedRoot, ["rebase", "--abort"], { ignoreFailure: true });
+      // Ensure we are back on the pre-rebase SHA (abort should restore; belt+suspenders).
+      await git(managedRoot, ["reset", "--hard", expected], {
+        ignoreFailure: true,
+      });
+      return {
+        changed: false,
+        headSha: expected,
+        evidence:
+          `deterministic rebase onto origin/${base} failed (conflicts or unclean); aborted our session`,
+      };
+    }
 
-  const headAfterRebase = await git(managedRoot, ["rev-parse", "HEAD"], {
-    ignoreFailure: true,
-  });
-  const afterRebaseSha =
-    headAfterRebase.code === 0
-      ? headAfterRebase.stdout.trim() || undefined
-      : undefined;
-
-  // No-op restack: branch already based on origin/<base> tip — not candidate-moving.
-  if (beforeSha && afterRebaseSha && beforeSha === afterRebaseSha) {
-    return {
-      changed: false,
-      headSha: afterRebaseSha,
-      evidence: `deterministic rebase: already up to date with origin/${base} (HEAD unchanged)`,
-    };
-  }
-
-  // Bound force-with-lease to the eligibility snapshot head, not a floating tracking ref.
-  const leaseRef = `refs/heads/${branch}:${expected}`;
-  const push = await git(
-    managedRoot,
-    ["push", `--force-with-lease=${leaseRef}`, "origin", `HEAD:refs/heads/${branch}`],
-    { ignoreFailure: true },
-  );
-  if (push.code !== 0) {
-    // Restore local branch so a later drive can retry (avoids "already up to date" no-op).
-    await git(managedRoot, ["reset", "--hard", expected], {
+    const headAfterRebase = await git(managedRoot, ["rev-parse", "HEAD"], {
       ignoreFailure: true,
     });
+    const afterRebaseSha =
+      headAfterRebase.code === 0
+        ? headAfterRebase.stdout.trim() || undefined
+        : undefined;
+
+    // No-op restack: branch already based on origin/<base> tip — not candidate-moving.
+    if (beforeSha && afterRebaseSha && beforeSha === afterRebaseSha) {
+      return {
+        changed: false,
+        headSha: afterRebaseSha,
+        evidence: `deterministic rebase: already up to date with origin/${base} (HEAD unchanged)`,
+      };
+    }
+
+    // Bound force-with-lease to the eligibility snapshot head, not a floating tracking ref.
+    const leaseRef = `refs/heads/${branch}:${expected}`;
+    const push = await git(
+      managedRoot,
+      ["push", `--force-with-lease=${leaseRef}`, "origin", `HEAD:refs/heads/${branch}`],
+      { ignoreFailure: true },
+    );
+    if (push.code !== 0) {
+      // Restore local branch so a later drive can retry (avoids "already up to date" no-op).
+      await git(managedRoot, ["reset", "--hard", expected], {
+        ignoreFailure: true,
+      });
+      return {
+        changed: false,
+        headSha: expected,
+        evidence:
+          `deterministic rebase succeeded locally but force-with-lease push of ${branch} ` +
+          `failed (lease expected ${expected.slice(0, 7)}); local branch restored`,
+      };
+    }
+
+    const moved =
+      beforeSha && afterRebaseSha
+        ? ` (${beforeSha.slice(0, 7)} → ${afterRebaseSha.slice(0, 7)})`
+        : "";
     return {
-      changed: false,
-      headSha: expected,
+      changed: true,
+      headSha: afterRebaseSha ?? beforeSha,
       evidence:
-        `deterministic rebase succeeded locally but force-with-lease push of ${branch} ` +
-        `failed (lease expected ${expected.slice(0, 7)}); local branch restored`,
+        `deterministic clean rebase onto origin/${base}; pushed ${branch}${moved}`,
     };
+  };
+
+  // #857: candidate-integrity lifecycle around head-moving rebase/push.
+  // Production always has cfg.repo_dir (or an explicit integrity.storeRoot).
+  // Hermetic unit tests that omit both keep the pre-integrity mutation path.
+  const storeRoot =
+    deps.integrity?.storeRoot ??
+    (cfg.repo_dir
+      ? mergeQueueIntegrityStoreRoot(cfg.repo_dir, candidate.issueNumber, candidate.prNumber)
+      : undefined);
+  if (!deps.integrity?.skip && storeRoot) {
+    const subject = deps.integrity?.subject ?? {
+      run_id: path.basename(storeRoot),
+      issue: candidate.issueNumber,
+      pr: candidate.prNumber,
+    };
+    const integrityResult = await runCoveredCandidateMutation(
+      {
+        storeRoot,
+        subject,
+        mutation_method: "restack",
+        base_ref: base,
+        worktreePath: managedRoot,
+        gitInWorktree: git,
+        resolveBaseSha: async () => {
+          const r = await git(managedRoot, ["rev-parse", `origin/${base}`], {
+            ignoreFailure: true,
+          });
+          return r.code === 0 ? r.stdout.trim() || null : null;
+        },
+        resolveCandidateSha: async () => {
+          // Prefer remote PR branch tip after push; fall back to local HEAD.
+          const remote = await git(
+            managedRoot,
+            ["rev-parse", `refs/remotes/origin/${branch}`],
+            { ignoreFailure: true },
+          );
+          if (remote.code === 0 && remote.stdout.trim()) return remote.stdout.trim();
+          const local = await git(managedRoot, ["rev-parse", "HEAD"], {
+            ignoreFailure: true,
+          });
+          return local.code === 0 ? local.stdout.trim() || null : null;
+        },
+        emitEvent: deps.integrity?.emitEvent ?? (async (event) => {
+          await appendEvent(storeRoot, event as never, defaultRunStoreDeps).catch(() => {});
+        }),
+        path_class: deps.integrity?.path_class,
+        engine_version: deps.integrity?.engine_version,
+        storeDeps: deps.integrity?.storeDeps,
+        mutation_id: deps.integrity?.mutation_id,
+      },
+      performRebasePush,
+    );
+
+    if (integrityResult.aborted) {
+      return {
+        changed: false,
+        headSha: beforeSha,
+        evidence:
+          `deterministic rebase aborted by candidate-integrity: ${integrityResult.abort_reason ?? "pre-persist failed"}`,
+      };
+    }
+
+    const baseResult =
+      integrityResult.mutation_result ??
+      ({
+        changed: false,
+        headSha: integrityResult.record.after_sha ?? beforeSha,
+        evidence: integrityResult.mutation_error ?? "rebase mutation incomplete",
+      } satisfies DeterministicRepairResult);
+
+    return annotateIntegrityResult(
+      baseResult,
+      integrityResult.classification,
+      integrityResult.disposition.merge_eligible,
+    );
   }
 
-  const moved =
-    beforeSha && afterRebaseSha
-      ? ` (${beforeSha.slice(0, 7)} → ${afterRebaseSha.slice(0, 7)})`
-      : "";
+  return performRebasePush();
+}
+
+/** Annotate repair evidence with integrity classification for re-gate consumers. */
+function annotateIntegrityResult(
+  result: DeterministicRepairResult,
+  classification: IntegrityClassification,
+  mergeEligible: boolean,
+): DeterministicRepairResult {
+  const tag = `[candidate-integrity:${classification}${mergeEligible ? "" : ";not-merge-eligible"}]`;
   return {
-    changed: true,
-    headSha: afterRebaseSha ?? beforeSha,
-    evidence:
-      `deterministic clean rebase onto origin/${base}; pushed ${branch}${moved}`,
+    ...result,
+    evidence: `${result.evidence} ${tag}`,
+    // Scope expansion / unverified must not look like a successful candidate-moving repair.
+    changed:
+      classification === "scope_expansion" || classification === "unverified"
+        ? false
+        : result.changed,
   };
 }
 
@@ -631,6 +758,8 @@ export async function runSharedMechanicalRepair(
     gitInWorktree?: typeof gitInWorktree;
     performRepair?: typeof performPreMergeAutoFix;
     invoke?: typeof invoke;
+    /** #857 integrity context; production sets store via repo_dir. */
+    integrity?: DeterministicRebaseDeps["integrity"];
   } = {},
 ): Promise<MechanicalRepairResult> {
   const getWorktree = deps.getOnDiskForIssue ?? getOnDiskForIssue;
@@ -665,42 +794,137 @@ export async function runSharedMechanicalRepair(
   }
 
   const runId = `merge-queue-repair-pr-${candidate.prNumber}`;
-  const result = await repair(
-    cfg,
-    candidate.issueNumber,
-    runId,
-    prompt,
-    candidate.title,
-    wt,
-    git,
-    invokeFn,
-    undefined,
-    {
-      commitSubjectPrefix: `fix: merge-queue surgical repair`,
-      salvageLabel: "merge-queue surgical repair",
-    },
-  );
+  const doRepair = async () =>
+    repair(
+      cfg,
+      candidate.issueNumber,
+      runId,
+      prompt,
+      candidate.title,
+      wt,
+      git,
+      invokeFn,
+      undefined,
+      {
+        commitSubjectPrefix: `fix: merge-queue surgical repair`,
+        salvageLabel: "merge-queue surgical repair",
+      },
+    );
 
-  if (result.status === "fix-committed") {
-    return {
-      succeeded: true,
-      headSha: result.headSha,
-      evidence: `shared mechanical repair pushed ${result.headSha}`,
-    };
-  }
-  if (result.status === "noop-clean") {
+  const toMechanical = (
+    result: Awaited<ReturnType<typeof repair>>,
+    integrityTag?: string,
+  ): MechanicalRepairResult => {
+    const tag = integrityTag ? ` ${integrityTag}` : "";
+    if (result.status === "fix-committed") {
+      return {
+        succeeded: true,
+        headSha: result.headSha,
+        evidence: `shared mechanical repair pushed ${result.headSha}${tag}`,
+      };
+    }
+    if (result.status === "noop-clean") {
+      return {
+        succeeded: false,
+        headSha: result.headSha,
+        evidence: `${result.diagnostic ?? "mechanical repair left clean no-op"}${tag}`,
+        error: result.diagnostic ?? "noop-clean",
+      };
+    }
     return {
       succeeded: false,
-      headSha: result.headSha,
-      evidence: result.diagnostic ?? "mechanical repair left clean no-op",
-      error: result.diagnostic ?? "noop-clean",
+      evidence: `mechanical repair status=${result.status}${tag}`,
+      error: `mechanical repair status=${result.status}`,
     };
-  }
-  return {
-    succeeded: false,
-    evidence: `mechanical repair status=${result.status}`,
-    error: `mechanical repair status=${result.status}`,
   };
+
+  // #857: wrap mechanical repair head movement in candidate-integrity.
+  const storeRoot =
+    deps.integrity?.storeRoot ??
+    (cfg.repo_dir
+      ? mergeQueueIntegrityStoreRoot(cfg.repo_dir, candidate.issueNumber, candidate.prNumber)
+      : undefined);
+  const base = cfg.base_branch;
+  if (!deps.integrity?.skip && storeRoot && base) {
+    const branch = branchName(candidate.issueNumber, wt.slug);
+    const subject = deps.integrity?.subject ?? {
+      run_id: path.basename(storeRoot),
+      issue: candidate.issueNumber,
+      pr: candidate.prNumber,
+    };
+    const integrityResult = await runCoveredCandidateMutation(
+      {
+        storeRoot,
+        subject,
+        mutation_method: "conflict_repair",
+        base_ref: base,
+        worktreePath: wt.path,
+        gitInWorktree: git,
+        resolveBaseSha: async () => {
+          const r = await git(wt.path, ["rev-parse", `origin/${base}`], {
+            ignoreFailure: true,
+          });
+          return r.code === 0 ? r.stdout.trim() || null : null;
+        },
+        resolveCandidateSha: async () => {
+          const remote = await git(
+            wt.path,
+            ["rev-parse", `refs/remotes/origin/${branch}`],
+            { ignoreFailure: true },
+          );
+          if (remote.code === 0 && remote.stdout.trim()) return remote.stdout.trim();
+          const local = await git(wt.path, ["rev-parse", "HEAD"], {
+            ignoreFailure: true,
+          });
+          return local.code === 0 ? local.stdout.trim() || null : null;
+        },
+        emitEvent: deps.integrity?.emitEvent ?? (async (event) => {
+          await appendEvent(storeRoot, event as never, defaultRunStoreDeps).catch(() => {});
+        }),
+        storeDeps: deps.integrity?.storeDeps,
+        mutation_id: deps.integrity?.mutation_id,
+      },
+      doRepair,
+    );
+
+    if (integrityResult.aborted) {
+      return {
+        succeeded: false,
+        evidence: `mechanical repair aborted by candidate-integrity: ${integrityResult.abort_reason ?? "pre-persist failed"}`,
+        error: integrityResult.abort_reason ?? "integrity pre-persist failed",
+      };
+    }
+
+    const repairResult = integrityResult.mutation_result;
+    if (!repairResult) {
+      return {
+        succeeded: false,
+        evidence: `mechanical repair incomplete under integrity: ${integrityResult.mutation_error ?? "unknown"}`,
+        error: integrityResult.mutation_error ?? "mutation incomplete",
+      };
+    }
+
+    const tag = `[candidate-integrity:${integrityResult.classification}${
+      integrityResult.disposition.merge_eligible ? "" : ";not-merge-eligible"
+    }]`;
+    const out = toMechanical(repairResult, tag);
+    // Scope expansion / unverified must not be merge-eligible success.
+    if (
+      integrityResult.classification === "scope_expansion" ||
+      integrityResult.classification === "unverified"
+    ) {
+      return {
+        ...out,
+        succeeded: false,
+        error:
+          out.error ??
+          `candidate-integrity ${integrityResult.classification}`,
+      };
+    }
+    return out;
+  }
+
+  return toMechanical(await doRepair());
 }
 
 export function realMergeQueueDeps(

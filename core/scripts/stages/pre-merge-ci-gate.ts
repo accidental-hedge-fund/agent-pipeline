@@ -38,6 +38,8 @@ import {
   type StageAttemptLedger,
   type StageAttemptLedgerDeps,
 } from "../stage-attempt-ledger.ts";
+import { runCoveredCandidateMutation } from "../candidate-integrity.ts";
+import { appendEvent, defaultRunStoreDeps } from "../run-store.ts";
 
 /**
  * Durable on-disk shape for CI recovery markers (#679 / #771).
@@ -519,7 +521,57 @@ export async function handleDefinitiveCiFailure(
       const beforeSha = headSha;
       let gitOk = false;
       try {
-        gitOk = await fns.tryRebaseAndPushFn(cfg, issueNumber);
+        // #857: candidate-integrity around CI one-shot rebase when runDir is available.
+        const runDirForIntegrity = opts.runDir;
+        if (runDirForIntegrity && cfg.base_branch && wt) {
+          const integrityResult = await runCoveredCandidateMutation(
+            {
+              storeRoot: runDirForIntegrity,
+              subject: {
+                run_id: path.basename(runDirForIntegrity),
+                issue: issueNumber,
+                pr: prNumber,
+              },
+              mutation_method: "rebase",
+              base_ref: cfg.base_branch,
+              worktreePath: wt.path,
+              gitInWorktree,
+              resolveBaseSha: async () => {
+                const r = await gitInWorktree(
+                  wt.path,
+                  ["rev-parse", `origin/${cfg.base_branch}`],
+                  { ignoreFailure: true },
+                );
+                return r.code === 0 ? r.stdout.trim() || null : null;
+              },
+              resolveCandidateSha: async () => {
+                try {
+                  return (await fns.getPrDetailFn(cfg, prNumber)).head_sha;
+                } catch {
+                  return null;
+                }
+              },
+              emitEvent: async (event) => {
+                await appendEvent(
+                  runDirForIntegrity,
+                  event as never,
+                  defaultRunStoreDeps,
+                ).catch(() => {});
+              },
+            },
+            () => fns.tryRebaseAndPushFn(cfg, issueNumber),
+          );
+          // Mutation side-effect success is independent of integrity classification.
+          // Invalidation is durable in the integrity store; resolveRebasePushResult
+          // still gates "rebased; CI re-running" on verified HEAD movement. Do not
+          // suppress the mutate result for incomplete digests in hermetic tests —
+          // that would skip the one-shot rebase budget entirely.
+          gitOk = integrityResult.aborted
+            ? false
+            : integrityResult.mutation_result === true;
+        } else {
+          gitOk = await fns.tryRebaseAndPushFn(cfg, issueNumber);
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         gitOk = false;

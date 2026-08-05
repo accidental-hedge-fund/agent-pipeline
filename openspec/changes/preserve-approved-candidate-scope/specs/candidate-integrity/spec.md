@@ -9,8 +9,11 @@ integer starting at `1`) that records, at capture time:
 - authoritative `base_ref` and full 40-character `base_sha`
 - full 40-character `candidate_sha` of the PR head being snapshotted
 - the deterministic changed-path surface of the candidate versus that base
-- sufficient deterministic path/content digests (or equivalent tree digest over
-  path→content-hash pairs) to detect path adds, removes, and content changes
+- canonical per-path patch records sufficient across base movement: for each
+  changed path, `status` (`A`/`M`/`D`/`R`), optional `old_path` for renames,
+  `base_blob` preimage digest (null for pure adds), and `candidate_blob`
+  postimage digest (null for pure deletes) — path→candidate-blob alone is not
+  sufficient when the integration base moves
 - optional bounded enrichments (diff size metrics, path-class tags, declared
   repair scope) that MUST NOT be the sole safety boundary
 - producer identity of the deterministic module that built the manifest
@@ -54,8 +57,9 @@ readable.
 
 The engine SHALL re-read the authoritative PR head and base, build a post-mutation `CandidateIntegrityManifest`, compare it to the pre-mutation manifest, and classify the transition after a covered candidate-moving operation completes (success path that yields a new or same published head). Classification SHALL be exactly one of:
 
-- `semantically_equivalent` — same path set and same per-path content digests
-  versus base as the pre-manifest (commit identity may change)
+- `semantically_equivalent` — same candidate-side content map (path →
+  candidate blob or delete marker) as the pre-manifest; commit identity and
+  base SHA may change; base preimage fields may differ after a clean restack
 - `expected_scoped_change` — non-empty surface delta entirely within the
   declared repair scope for that mutation
 - `scope_expansion` — undeclared path add/remove or content change outside
@@ -297,3 +301,112 @@ no real network, git, or subprocess calls.
 - **THEN** item A's accepted invariant and integrity disposition SHALL remain
   intact
 - **AND** item B SHALL be classified independently
+
+#### Scenario: Self-contained integrity fixture owns undeclared README expansion
+
+- **WHEN** a fixture models undeclared README content expansion without
+  depending on product copy owned by #855
+- **THEN** candidate-integrity classification SHALL be `scope_expansion`
+- **AND** readiness SHALL be denied for that head
+- **AND** when #855 `readme-landing-contract` helpers are available, the same
+  synthetic content MAY also fail that invariant as composition evidence
+
+---
+
+### Requirement: Covered mutations SHALL use one mandatory lifecycle wrapper
+
+Every covered pipeline-owned candidate-moving operation SHALL run through a
+single lifecycle wrapper with ordered states: `pre_persisted` →
+`mutation_claimed` → `authoritative_post_read` → `classified` (then dispose).
+The mutation side-effect MUST NOT begin until the pre-mutation manifest is
+durable (`pre_persisted`). If the mutation operation errors or partially
+succeeds, the wrapper SHALL still re-read the authoritative PR head and base
+and complete classification (or fail closed as `unverified`). Pre-persist
+failure SHALL abort the mutation without head-moving side effects.
+
+#### Scenario: Pre-persist failure aborts mutation
+
+- **WHEN** durable pre-manifest write fails
+- **THEN** the wrapper SHALL NOT perform rebase, push, or force-with-lease
+- **AND** SHALL NOT mark the mutation as claimed
+
+#### Scenario: Mutation error still re-reads authoritative head
+
+- **WHEN** a covered mutation side-effect throws or reports failure after
+  `mutation_claimed`
+- **THEN** the wrapper SHALL still perform `authoritative_post_read`
+- **AND** SHALL classify (or mark `unverified` if re-read fails)
+
+---
+
+### Requirement: Declared repair scope SHALL be explicit, frozen, and method-bounded
+
+Declared repair scope SHALL be an explicit wrapper argument frozen at
+`pre_persisted` for that mutation id. v1 scope matching SHALL use exact
+repo-relative paths and optional directory prefixes ending in `/` (no general
+glob language). A rename is in scope only when both `old_path` and new `path`
+match the declared scope. Methods `restack` and `rebase` SHALL use empty
+declared scope. Methods `pre_merge_autofix`, `conflict_repair`, and
+`recovery_repair` MAY declare non-empty scope; with empty scope, any
+candidate-side map delta SHALL classify as `scope_expansion`.
+
+#### Scenario: Restack cannot declare scope to hide expansion
+
+- **WHEN** mutation_method is `restack` or `rebase`
+- **AND** the candidate-side map changes
+- **THEN** classification SHALL be `scope_expansion` (or `unverified`)
+- **AND** SHALL NOT be `expected_scoped_change`
+
+#### Scenario: Rename requires both paths in scope
+
+- **WHEN** declared scope includes only the destination path of a rename
+- **AND** the source path is outside scope
+- **THEN** classification SHALL be `scope_expansion`
+
+---
+
+### Requirement: Manifests and lifecycle state SHALL be authoritative durable control-plane state
+
+Candidate-integrity manifests and lifecycle records SHALL be stored in an
+authoritative, atomic durable store under the run directory, keyed by domain
+(when known), issue, PR (when known), run id, and mutation id. Store writes for
+pre-persist and lifecycle transitions SHALL use atomic replace semantics.
+Optional evidence-bundle or non-fatal event append failure MUST NOT clear an
+integrity invalidation disposition. On restart, each incomplete lifecycle state
+SHALL resume without reseeding the pre-manifest from the post-mutation head.
+
+#### Scenario: Authoritative store survives optional event append failure
+
+- **WHEN** classification is `scope_expansion` and run-ledger append fails
+  non-fatally
+- **THEN** readiness invalidation from the integrity store SHALL still hold
+
+---
+
+### Requirement: Semantic equivalence SHALL NOT preserve ready-to-deploy without re-gate
+
+The engine SHALL re-evaluate current-head readiness gates when classification is `semantically_equivalent` and the candidate SHA changed, and MUST NOT preserve a prior `pipeline:ready-to-deploy` claim solely because the candidate-side map matched. Pipeline-internal-commit exemptions that apply only to an unchanged head MUST NOT launder pre-mutation review authority onto the post-mutation SHA after a covered mutation.
+
+#### Scenario: Equivalent restack clears free ready-to-deploy carry-forward
+
+- **WHEN** restack classifies as `semantically_equivalent` with a new candidate
+  SHA
+- **AND** the issue previously carried ready-to-deploy evidence for the old SHA
+- **THEN** the engine SHALL require current-head gates to pass again before
+  ready-to-deploy
+- **AND** SHALL NOT treat the old SHA's readiness as sufficient
+
+---
+
+### Requirement: Repeated integrity failures SHALL be budget-bounded without human-authority hold
+
+The engine SHALL apply a deterministic retry budget (default two additional covered mutations after the first failure in a surface generation) when classification is repeatedly `scope_expansion` or `unverified` for the same item, MUST NOT create a human-authority hold solely for the integrity class, MUST NOT merge or mark ready-to-deploy on the failing head, and SHALL leave durable diagnostics and `candidate_integrity` events. After budget exhaustion, further automatic candidate-moving repairs/restacks for that item in the run SHALL stop until a new intentional whole-item entry.
+
+#### Scenario: Budget exhaustion stops automatic restack without human hold
+
+- **WHEN** integrity classifications of `scope_expansion` exhaust the retry
+  budget for an item
+- **THEN** the engine SHALL stop further automatic covered mutations for that
+  item in the run
+- **AND** SHALL NOT record a human-authority hold solely for integrity
+- **AND** SHALL retain structured diagnostics in durable evidence
