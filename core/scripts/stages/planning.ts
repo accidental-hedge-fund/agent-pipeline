@@ -45,6 +45,10 @@ import {
 import { expandAutoEffort, resolveReviewerModelForHarness, reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import {
+  appendTesterEvidenceSection,
+  loadTesterEvidenceForReview,
+} from "../tester-evidence.ts";
+import {
   branchName,
   createWorktree,
   getForIssue,
@@ -649,12 +653,30 @@ export async function runPlanningPhases(
     activeLifecycle = await startPlanningLifecycle(cfg, issueNumber, "plan-review", opts, deps, wt.path);
     preImplStage = "plan-review";
 
-    const reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, reviewer, implementer: primary, specContext, contextSnapshot });
+    let reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, reviewer, implementer: primary, specContext, contextSnapshot });
     // #39: same-harness fallback — if the reviewer CLI is unspawnable, the
     // implementing harness reviews the plan, clearly labeled below.
     // OpenSpec hooks supply planReviewCwd=wt.path so the reviewer can inspect
     // the just-authored change files; freeform uses cfg.repo_dir.
     const planReviewCwd = hooks.planReviewCwd ? hooks.planReviewCwd(wt) : cfg.repo_dir;
+    // #646: same Tester acquisition helper (typically missing/not_run at plan-review).
+    let planCandidateSha = "";
+    try {
+      const head = await gitInWorktree(planReviewCwd, ["rev-parse", "HEAD"], { ignoreFailure: true });
+      planCandidateSha = head.stdout.trim();
+    } catch {
+      planCandidateSha = "";
+    }
+    // Plan-review runs before implement/test-gate; suite evidence is typically
+    // missing or not_run. Same acquisition helper + prompt section (#646), but
+    // never withhold the plan-review model solely for missing Tester evidence
+    // (fail_closed applies to product code-review rounds: review-1/2/delta).
+    const planTesterAcq = await loadTesterEvidenceForReview(
+      opts.runDir,
+      planCandidateSha || "0".repeat(40),
+      cfg,
+    );
+    reviewPrompt = appendTesterEvidenceSection(reviewPrompt, planTesterAcq);
     const planReviewModel = resolveReviewerModelForHarness(
       opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review,
       reviewer,

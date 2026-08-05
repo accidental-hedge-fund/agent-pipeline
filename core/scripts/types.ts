@@ -748,6 +748,21 @@ export interface PipelineConfig {
    * approve).
    */
   review_ensemble: ReviewEnsembleConfig;
+  /**
+   * SHA-pinned Tester suite evidence shared by review stages (#646).
+   * Produced by the deterministic test/build gate; acquired at review time
+   * with fail-closed (default) or fail-open disposition when missing/stale.
+   */
+  tester_evidence: {
+    /** Disposition when trustworthy SHA-matched evidence is missing/malformed/stale. */
+    on_missing: "fail_closed" | "fail_open";
+    /** Per-excerpt character budget after redaction. */
+    max_output_chars: number;
+    /** Aggregate serialized artifact budget after redaction. */
+    max_artifact_chars: number;
+    /** Allowlisted per-test extractor ids (default empty = command-level only). */
+    extractors: string[];
+  };
   // Test/build gate (#15). When enabled, the target repo's own test/build
   // command runs in the worktree during implementation and after each fix
   // round; on failure a bounded generate→test→fix loop runs before a PR is
@@ -1139,6 +1154,13 @@ export const DEFAULT_CONFIG: Omit<
     agents: [] as ReviewEnsembleAgent[],
     min_usable_agents: 1,
     max_agents: 4,
+  },
+  // SHA-pinned Tester evidence (#646): fail-closed by default; never imply suite pass without evidence.
+  tester_evidence: {
+    on_missing: "fail_closed" as const,
+    max_output_chars: 4000,
+    max_artifact_chars: 48_000,
+    extractors: [] as string[],
   },
   doctor: { runOnStart: false, failFast: false },
   papercuts: {

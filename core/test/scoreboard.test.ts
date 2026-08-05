@@ -1394,6 +1394,13 @@ function htmlFixtureReport(): ScoreboardReport {
       eval: { pass_rate: { numerator: 0, denominator: 0, ratio: null }, passed: 0, failed: 0, skipped: 4 },
       shipcheck: { pass_rate: { numerator: 3, denominator: 4, ratio: 0.75 }, passed: 3, failed: 1, skipped: 0 },
     },
+    tester: {
+      runs_with_evidence: 0,
+      duration_ms: { count: 0, total_ms: 0, min_ms: null, max_ms: null, avg_ms: null },
+      command_count_total: 0,
+      by_overall_status: {},
+      targeted_check_count: 0,
+    },
   };
 
   return {

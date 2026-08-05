@@ -89,6 +89,11 @@ import { buildDeltaReviewPrompt } from "../prompts/index.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import { reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import { isPipelineInternalCommit } from "../pipeline-commits.ts";
+import {
+  appendTesterEvidenceSection,
+  loadTesterEvidenceForReview,
+  testerEvidenceWithholdResult,
+} from "../tester-evidence.ts";
 import type { Outcome, PipelineConfig, ReviewFinding, Stage } from "../types.ts";
 import { preMergeBlocked, recordPreMergeGateResult } from "./pre-merge-shared.ts";
 import {
@@ -2076,7 +2081,7 @@ async function defaultRunDeltaReview(
     headFiles?: HeadFileState[];
   },
 ): Promise<DeltaReviewResult> {
-  const prompt = buildDeltaReviewPrompt({
+  let prompt = buildDeltaReviewPrompt({
     cfg,
     issueNumber,
     title: issueDetail.title,
@@ -2087,6 +2092,25 @@ async function defaultRunDeltaReview(
     settledFindingsVerification: accounting?.settledFindingsVerification,
     headFiles: accounting?.headFiles,
   });
+  // #646: same Tester acquisition helper as review-1/2 / plan-review.
+  let candidateSha = "";
+  try {
+    const head = await gitInWorktree(worktreePath, ["rev-parse", "HEAD"], { ignoreFailure: true });
+    candidateSha = head.stdout.trim();
+  } catch {
+    candidateSha = "";
+  }
+  const testerAcq = await loadTesterEvidenceForReview(
+    accounting?.runDir,
+    candidateSha || "0".repeat(40),
+    cfg,
+  );
+  prompt = appendTesterEvidenceSection(prompt, testerAcq);
+  if (testerAcq.withholdInvoke) {
+    throw new Error(
+      testerEvidenceWithholdResult(testerAcq.reason).stderr,
+    );
+  }
   // Not yet guarded against the effective reviewer command — invokeReviewer
   // (via the ensemble seam) applies resolveReviewerModelForHarness itself, per
   // attempted harness, so a same-harness fallback (#39) is guarded against the

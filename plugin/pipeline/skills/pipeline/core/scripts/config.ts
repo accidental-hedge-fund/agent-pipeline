@@ -433,6 +433,36 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Controls which review findings block progression vs. merely advise."),
+  // SHA-pinned Tester suite evidence (#646). Default fail_closed at review
+  // acquisition when trustworthy SHA-matched evidence is missing/stale/malformed.
+  tester_evidence: z
+    .object({
+      on_missing: z
+        .enum(["fail_closed", "fail_open"])
+        .optional()
+        .describe(
+          "Disposition when trustworthy SHA-matched Tester evidence is missing, malformed, or stale at review acquisition. fail_closed (default): withhold review model invoke. fail_open: proceed with explicit unavailable section. Neither mode implies suite pass.",
+        ),
+      max_output_chars: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Per-excerpt character budget for Tester command/output/reason fields after redaction (default 4000)."),
+      max_artifact_chars: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Aggregate serialized TesterEvidence budget after redaction (default 48000)."),
+      extractors: z
+        .array(z.string())
+        .optional()
+        .describe("Allowlisted per-test extractor ids (default empty = command-level authority only)."),
+    })
+    .strict()
+    .optional()
+    .describe("SHA-pinned Tester suite evidence shared by review stages (#646)."),
   // Opt-in parallel multi-agent review ensemble (#645). Default-off. v1 merge
   // mode is fixed to union-blocking; majority-vote is intentionally not offered.
   review_ensemble: z
@@ -1403,6 +1433,19 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         DEFAULT_CONFIG.review_policy.max_delta_rounds,
     },
     review_ensemble: resolveReviewEnsemble(fileConfig.review_ensemble),
+    tester_evidence: {
+      on_missing:
+        fileConfig.tester_evidence?.on_missing ?? DEFAULT_CONFIG.tester_evidence.on_missing,
+      max_output_chars:
+        fileConfig.tester_evidence?.max_output_chars ??
+        DEFAULT_CONFIG.tester_evidence.max_output_chars,
+      max_artifact_chars:
+        fileConfig.tester_evidence?.max_artifact_chars ??
+        DEFAULT_CONFIG.tester_evidence.max_artifact_chars,
+      extractors:
+        fileConfig.tester_evidence?.extractors ??
+        [...DEFAULT_CONFIG.tester_evidence.extractors],
+    },
     doctor: {
       runOnStart: fileConfig.doctor?.runOnStart ?? DEFAULT_CONFIG.doctor.runOnStart,
       failFast: fileConfig.doctor?.failFast ?? DEFAULT_CONFIG.doctor.failFast,
@@ -1812,6 +1855,7 @@ export const RIGOR_GATING_PATHS: readonly string[] = [
   "review_ensemble.min_usable_agents",
   "review_ensemble.max_agents",
   "review_ensemble.merge",
+  "tester_evidence.on_missing",
   "steps.plan_review",
   "steps.standard_review",
   "steps.adversarial_review",
@@ -2614,6 +2658,25 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
           `#   merge: union_blocking # ${sd("review_ensemble.merge", 'v1 supports only "union_blocking"; majority-vote approve is not available')}`,
         ].join("\n"),
     "",
+    // tester_evidence (#646): commented defaults so operators can opt into fail_open.
+    config.tester_evidence !== undefined &&
+      config.tester_evidence.on_missing !== undefined &&
+      config.tester_evidence.on_missing !== d.tester_evidence.on_missing
+      ? [
+          "tester_evidence: # SHA-pinned suite evidence shared by review stages (#646)",
+          `  on_missing: ${yamlScalar(config.tester_evidence.on_missing)} # ${sd("tester_evidence.on_missing", "fail_closed (default): withhold review model invoke when evidence is missing/stale/malformed; fail_open: proceed with explicit unavailable section; neither implies suite pass")}`,
+          `  max_output_chars: ${yamlScalar(config.tester_evidence.max_output_chars ?? d.tester_evidence.max_output_chars)} # ${sd("tester_evidence.max_output_chars", "per-excerpt character budget after redaction")}`,
+          `  max_artifact_chars: ${yamlScalar(config.tester_evidence.max_artifact_chars ?? d.tester_evidence.max_artifact_chars)} # ${sd("tester_evidence.max_artifact_chars", "aggregate serialized artifact budget after redaction")}`,
+          `  # extractors: [] # ${sd("tester_evidence.extractors", "allowlisted per-test extractor ids; default empty = command-level only")}`,
+        ].join("\n")
+      : [
+          "# tester_evidence: # SHA-pinned suite evidence shared by review stages (#646). Default fail_closed at review acquisition.",
+          `#   on_missing: ${yamlScalar(d.tester_evidence.on_missing)} # ${sd("tester_evidence.on_missing", "fail_closed (default): withhold review model invoke when evidence is missing/stale/malformed; fail_open: proceed with explicit unavailable section; neither implies suite pass")}`,
+          `#   max_output_chars: ${yamlScalar(d.tester_evidence.max_output_chars)} # ${sd("tester_evidence.max_output_chars", "per-excerpt character budget after redaction")}`,
+          `#   max_artifact_chars: ${yamlScalar(d.tester_evidence.max_artifact_chars)} # ${sd("tester_evidence.max_artifact_chars", "aggregate serialized artifact budget after redaction")}`,
+          `#   extractors: [] # ${sd("tester_evidence.extractors", "allowlisted per-test extractor ids; default empty = command-level only")}`,
+        ].join("\n"),
+    "",
     "doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here",
     `  runOnStart: ${yamlScalar(doctor.runOnStart)} # ${sd("doctor.runOnStart", "run preflight checks before planning; abort on any failure")}`,
     `  failFast: ${yamlScalar(doctor.failFast)} # ${sd("doctor.failFast", "stop at the first failing check instead of collecting all failures")}`,
@@ -2912,6 +2975,11 @@ function normalizeForSync(config: PartialConfig): unknown {
       ...d.review_ensemble,
       ...config.review_ensemble,
       agents: config.review_ensemble?.agents ?? d.review_ensemble.agents,
+    },
+    tester_evidence: {
+      ...d.tester_evidence,
+      ...config.tester_evidence,
+      extractors: config.tester_evidence?.extractors ?? [...d.tester_evidence.extractors],
     },
     doctor: { ...d.doctor, ...config.doctor },
     loop: { ...d.loop, ...config.loop },

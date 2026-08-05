@@ -173,6 +173,27 @@ export interface GateResultEvent extends RunEventBase {
   mode?: string;
   reason?: string;
 }
+/** Structured Tester suite evidence signal (#646). Appended only after a
+ *  successful full-record write of `tester-evidence.json`. */
+export interface TesterEvidenceEvent extends RunEventBase {
+  type: "tester_evidence";
+  overall_status: string;
+  candidate_sha: string;
+  duration_ms: number;
+  command_count: number;
+  issue?: number;
+  run_id?: string;
+}
+/** Supplemental targeted-check signal (#646). Never replaces authoritative suite evidence. */
+export interface TesterTargetedCheckEvent extends RunEventBase {
+  type: "tester_targeted_check";
+  candidate_sha: string;
+  identity: string;
+  status: string;
+  duration_ms: number;
+  issue?: number;
+  run_id?: string;
+}
 export interface BlockerSetEvent extends RunEventBase {
   type: "blocker_set";
   reason: string;
@@ -383,6 +404,8 @@ export type RunEvent =
   | WorktreeRemovedEvent
   | ReviewVerdictEvent
   | GateResultEvent
+  | TesterEvidenceEvent
+  | TesterTargetedCheckEvent
   | BlockerSetEvent
   | BlockerClearedEvent
   | GhMetricsSummaryEvent
