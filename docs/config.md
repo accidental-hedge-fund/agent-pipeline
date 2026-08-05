@@ -964,6 +964,36 @@ Nested fields:
 - **Type:** integer
 - **Description:** Seconds per test/build run.
 
+### `tester_evidence`
+
+- **Type:** object
+- **Default:** `{"on_missing":"fail_closed","max_output_chars":4000,"max_artifact_chars":48000,"extractors":[]}`
+- **Description:** SHA-pinned Tester suite evidence shared by review stages (#646).
+
+Nested fields:
+
+#### `tester_evidence.extractors`
+
+- **Type:** array of string
+- **Description:** Allowlisted per-test extractor ids (default empty = command-level authority only).
+
+#### `tester_evidence.max_artifact_chars`
+
+- **Type:** integer
+- **Description:** Aggregate serialized TesterEvidence budget after redaction (default 48000).
+
+#### `tester_evidence.max_output_chars`
+
+- **Type:** integer
+- **Description:** Per-excerpt character budget for Tester command/output/reason fields after redaction (default 4000).
+
+#### `tester_evidence.on_missing`
+
+- **Type:** enum
+- **Description:** Disposition when trustworthy SHA-matched Tester evidence is missing, malformed, or stale at review acquisition. fail_closed (default): withhold review model invoke. fail_open: proceed with explicit unavailable section. Neither mode implies suite pass.
+
+- **Allowed values:** `fail_closed`, `fail_open`
+
 ### `trusted_override_actors`
 
 - **Type:** array of string

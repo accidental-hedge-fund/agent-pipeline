@@ -37,11 +37,16 @@ import {
   buildReviewStandardPrompt,
 } from "../prompts/index.ts";
 import {
+  appendTesterEvidenceSection,
+  loadTesterEvidenceForReview,
+  testerEvidenceWithholdResult,
+} from "../tester-evidence.ts";
+import {
   buildPriorRoundDigest,
   settledFindings,
   type PriorRoundDigest,
 } from "../review-history.ts";
-import { getForIssue, getOnDiskForIssue } from "../worktree.ts";
+import { getForIssue, getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import {
   buildTrustedOverrideComments,
@@ -1277,12 +1282,31 @@ export async function invokePromptHarnessReview(
   const specContext = openspecContextFromDiff(cfg, cwd, diffFilePaths(diff));
   const contextSnapshot = opts.contextSnapshot;
   const stageName: "review-1" | "review-2" = round === 1 ? "review-1" : "review-2";
-  const prompt = round === 1
+  let prompt = round === 1
     ? buildReviewStandardPrompt({ cfg, issueNumber, title, body, plan, diff, specContext, contextSnapshot })
     : buildReviewAdversarialPrompt({
         cfg, issueNumber, title, body, diff, review1Summary, priorReview2Findings, specContext, contextSnapshot,
         priorRoundsDigest: opts.priorRoundsDigest,
       });
+
+  // #646: load SHA-matched Tester evidence once and append before ensemble so
+  // every agent shares identical authoritative suite bytes.
+  let candidateSha = "";
+  try {
+    const head = await gitInWorktree(cwd, ["rev-parse", "HEAD"], { ignoreFailure: true });
+    candidateSha = head.stdout.trim();
+  } catch {
+    candidateSha = "";
+  }
+  const testerAcq = await loadTesterEvidenceForReview(opts.runDir, candidateSha || "0".repeat(40), cfg);
+  prompt = appendTesterEvidenceSection(prompt, testerAcq);
+  if (testerAcq.withholdInvoke) {
+    return {
+      result: testerEvidenceWithholdResult(testerAcq.reason),
+      effectiveReviewer: "tester-evidence-gate",
+      selfReview: false,
+    };
+  }
 
   // External stage executor delegation (#314): a `stage_executors` assignment
   // for this round bypasses the local reviewer harness (and its #39 self-review

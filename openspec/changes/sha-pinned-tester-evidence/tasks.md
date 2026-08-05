@@ -1,43 +1,58 @@
 ## 1. Schema and pure classification
 
-- [ ] 1.1 Define versioned `TesterEvidence` types (`schema_version: 1`, status taxonomy, command/test rows, identity + config digest + bounded toolchain fingerprint, producer metadata) in a pure module under `core/scripts/`
-- [ ] 1.2 Implement pure helpers: SHA match / stale classification, overall status derivation from command rows, output bound + redaction integration, optional nested identity reserved for #692 compatibility
-- [ ] 1.3 Unit tests for schema validation, pass/fail/timeout/tooling/partial/disabled/not_run/unavailable/stale, secret redaction, truncation — no real I/O
+- [x] 1.1 Define versioned `TesterEvidence` / `TesterTargetedCheck` types and status taxonomy in `core/scripts/tester-evidence.ts`
+- [x] 1.2 Pure helpers: SHA match/stale, overall_status precedence, config_digest (canonical sorted JSON + sha256), worktree_id basename, toolchain allowlist, excerpt bound + aggregate budget, schema validate
+- [x] 1.3 Pure prompt section renderer (authoritative vs supplemental labels; untrusted data framing)
+- [x] 1.4 Unit tests for pass/fail/timeout/tooling/disabled/not_run/unavailable/stale/malformed, redaction, truncation, digest stability — no real I/O
 
-## 2. Deterministic producer on existing gates
+## 2. Deterministic producer on `runTestGate`
 
-- [ ] 2.1 Wire `runTestGate` (and combined format/test production path as designed) to emit/update `TesterEvidence` for HEAD when run/state dir is present
-- [ ] 2.2 Map disabled, no-command skip, dirty-tree hard block, timeout, tooling failure, and multi-command partial outcomes into the status taxonomy
-- [ ] 2.3 Optional allowlisted extractor seam: well-formed → `tests[]`; malformed → keep command authority; absent → no per-test rows
-- [ ] 2.4 Unit tests with injected `runTests` / dirty / head / record seams covering producer paths from acceptance criteria
+- [x] 2.1 Plumb first-class `timed_out` (or equivalent) from `runTests` / `RunTestsResult` so timeout is not collapsed into bare fail
+- [x] 2.2 After each terminal `runTestGate` outcome, when `runDir` is available, produce `TesterEvidence` for HEAD (`producer.component: "test-build-gate"`); map disabled / not_run / dirty unavailable / timeout / tooling / failed / passed
+- [x] 2.3 v1 command inventory: single resolved test/build command only (format-gate out of suite authority)
+- [x] 2.4 Optional allowlisted extractor seam (default empty); malformed → keep command authority
+- [x] 2.5 Unit tests with injected `runTests` / dirty / head / write seams covering producer matrix
 
-## 3. Persistence in evidence surfaces
+## 3. Persistence lifecycle
 
-- [ ] 3.1 Persist full structured record in the run directory and/or `summary.json`; append `events.jsonl` Tester outcome event
-- [ ] 3.2 Apply existing secret-redaction and injection denylist to all Tester string fields before write
-- [ ] 3.3 Surface artifact write failure with existing write-health / #633-style disposition; never claim stored on failure
-- [ ] 3.4 Optional human summary comment path: compact status/SHA/duration/command count only — no full log dump
+- [x] 3.1 Canonical path `{runDir}/tester-evidence.json` via atomic tmp+rename; all strings redact+sanitize
+- [x] 3.2 Append `tester_evidence` event only on successful full-record write; on write failure elevate write-health (#633) and do not claim stored success
+- [x] 3.3 Lookup contract: only current file; SHA mismatch → stale; no multi-SHA auto-pick; prior SHA only via events history
+- [x] 3.4 Optional human summary (status, short SHA, command count, duration) — no full log
+- [x] 3.5 Targeted-check append surface (`targeted-checks.jsonl` / event) that cannot overwrite authoritative file
 
-## 4. Review acquisition and prompt injection
+## 4. Config
 
-- [ ] 4.1 Add config for `tester_evidence` (`on_missing` fail_closed/fail_open, max excerpt length) with `.describe()` and defaults; document in init/template surfaces
-- [ ] 4.2 Implement `loadTesterEvidenceForReview` (or equivalent): SHA match, stale, malformed, missing → deterministic disposition; never imply pass without evidence
-- [ ] 4.3 Inject authoritative suite section into review-1, review-2, and delta re-review prompt assembly; label supplemental targeted checks separately
-- [ ] 4.4 After candidate-changing fix commits, invalidate prior evidence and require producer regeneration before treating suite evidence as current (reuse internal-commit classifier consistency with review-SHA gate)
-- [ ] 4.5 Unit tests: match, mismatch→stale, missing fail_closed, missing fail_open, post-fix regeneration, targeted-check non-overwrite
+- [x] 4.1 `tester_evidence.on_missing` (`fail_closed` default | `fail_open`), `max_output_chars`, `max_artifact_chars`, optional `extractors` with Zod `.describe()` + defaults + init template comments
 
-## 5. Ensemble shared injection
+## 5. Review acquisition and shared injection
 
-- [ ] 5.1 Ensure ensemble fan-out shared prompt material includes the same Tester section for every agent (identity suffix only may differ)
-- [ ] 5.2 Unit test with injected ensemble invoke fakes: N agents receive identical authoritative suite block / classification
+- [x] 5.1 `loadTesterEvidenceForReview` — missing/malformed/stale/current; never imply pass
+- [x] 5.2 fail_closed: withhold review model invoke on non-current evidence (except current disabled/not_run); fail_open: invoke with explicit section
+- [x] 5.3 Single append helper before `invokeReviewEnsemble` in: `review-routing.ts` (review-1/2), `pre-merge-sha-gate.ts` (delta), `planning.ts` (plan-review)
+- [x] 5.4 Post-fix regeneration via existing `runFormatAndTestGates` → `runTestGate` only (no regenerate-inside-review)
+- [x] 5.5 Unit tests: match, stale, fail_closed withhold, fail_open proceed, post-fix new HEAD, shared ensemble core prompt bytes, plan-review same helper
 
 ## 6. Scoreboard and accounting
 
-- [ ] 6.1 Expose structured Tester metrics (duration, command count, overall_status tallies, optional targeted-check count) to scoreboard/accounting consumers without prose parsing
-- [ ] 6.2 Unit or pure tests: metrics from structured fields; runs without artifact remain valid with Tester metrics absent
+- [x] 6.1 Structured Tester metrics extractors (duration, command count, overall_status, optional targeted-check count)
+- [x] 6.2 Runs without artifact remain valid; Tester metrics absent — never inferred pass
 
 ## 7. Mirror, OpenSpec, and CI gate
 
-- [ ] 7.1 Regenerate `plugin/` via `node scripts/build.mjs` after any `core/` change; commit mirror with core
-- [ ] 7.2 Keep this change’s OpenSpec artifacts valid (`openspec validate sha-pinned-tester-evidence` / `openspec validate --all` as required by CI)
-- [ ] 7.3 Run `npm run ci` green before considering implementation complete
+- [x] 7.1 Regenerate `plugin/` via `node scripts/build.mjs` after any `core/` change; commit mirror with core
+- [x] 7.2 Keep OpenSpec change valid (`openspec validate --all` as required by CI)
+- [x] 7.3 Run `npm run ci` green before considering implementation complete
+
+## Review
+
+Implemented #646 SHA-pinned Tester evidence:
+
+- Pure schema/helpers in `core/scripts/tester-evidence.ts`
+- Producer on `runTestGate` with `timed_out` first-class on `RunTestsResult`
+- Persistence: `tester-evidence.json`, `tester_evidence` events, write-health on failure, targeted-checks append-only
+- Config: `tester_evidence` (fail_closed default)
+- Review injection: review-1/2 (fail_closed withhold), delta re-review, plan-review section only (no withhold)
+- Scoreboard `metrics.tester` from structured events
+- Unit coverage in `core/test/tester-evidence.test.ts`
+- `npm run ci` green; plugin mirror regenerated

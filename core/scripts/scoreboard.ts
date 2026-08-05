@@ -21,6 +21,10 @@ import {
   zeroPreMergeOfframpClassCounts,
   type PreMergeOfframpClass,
 } from "./pre-merge-offramp.ts";
+import {
+  extractTesterMetricsFromEvent,
+  type TesterOverallStatus,
+} from "./tester-evidence.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -284,6 +288,18 @@ export interface ScoreboardMetrics {
     test: GatePassMetric;
     eval: GatePassMetric;
     shipcheck: GatePassMetric;
+  };
+  /**
+   * SHA-pinned Tester suite metrics from structured `tester_evidence` events
+   * (#646). Runs without Tester artifacts leave these at zero/empty — never
+   * inferred as passed. Targeted-check cost is optional redundant-check diagnostic.
+   */
+  tester: {
+    runs_with_evidence: number;
+    duration_ms: DurationAggregate;
+    command_count_total: number;
+    by_overall_status: Partial<Record<TesterOverallStatus, number>>;
+    targeted_check_count: number;
   };
 }
 
@@ -1393,6 +1409,11 @@ function reduceRunsCore(
   let preMergeEntries = 0;
   let preMergeNeedsHumanCount = 0;
   const preMergeClassCounts = zeroPreMergeOfframpClassCounts();
+  const testerDuration = newDurationBuilder();
+  let testerRunsWithEvidence = 0;
+  let testerCommandCountTotal = 0;
+  let testerTargetedCheckCount = 0;
+  const testerByStatus = new Map<TesterOverallStatus, number>();
   const { costAccounting, grouping } = aggregateCostAccounting(runs, diagnostics, groupBy);
 
   for (const run of runs) {
@@ -1445,6 +1466,26 @@ function reduceRunsCore(
       else if (result.outcome === "fail") bucket.failed++;
       else bucket.skipped++;
     }
+
+    // Tester suite evidence (#646): structured events only — never prose parse.
+    // One latest-success write per run is typical; count each event row.
+    let sawTester = false;
+    for (const event of run.events) {
+      const metrics = extractTesterMetricsFromEvent(event as Record<string, unknown>);
+      if (metrics) {
+        sawTester = true;
+        testerDuration.add(metrics.duration_ms);
+        testerCommandCountTotal += metrics.command_count;
+        testerByStatus.set(
+          metrics.overall_status,
+          (testerByStatus.get(metrics.overall_status) ?? 0) + 1,
+        );
+      }
+      if (stringField(event, "type") === "tester_targeted_check") {
+        testerTargetedCheckCount++;
+      }
+    }
+    if (sawTester) testerRunsWithEvidence++;
   }
 
   let autonomousReadyPrs = 0;
@@ -1570,6 +1611,15 @@ function reduceRunsCore(
       test: gateMetric(gateCounts.test),
       eval: gateMetric(gateCounts.eval),
       shipcheck: gateMetric(gateCounts.shipcheck),
+    },
+    tester: {
+      runs_with_evidence: testerRunsWithEvidence,
+      duration_ms: testerDuration.value(),
+      command_count_total: testerCommandCountTotal,
+      by_overall_status: Object.fromEntries(
+        [...testerByStatus.entries()].sort(([a], [b]) => a.localeCompare(b)),
+      ) as Partial<Record<TesterOverallStatus, number>>,
+      targeted_check_count: testerTargetedCheckCount,
     },
   };
 

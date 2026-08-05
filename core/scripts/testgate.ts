@@ -39,6 +39,15 @@ import {
   parsePorcelainPaths,
   productDirtyPaths,
 } from "./worktree-dirt.ts";
+import {
+  buildTesterEvidence,
+  DEFAULT_TESTER_EVIDENCE_CONFIG,
+  normalizeCandidateSha,
+  runAllowlistedExtractors,
+  writeTesterEvidence,
+  type TesterCommandStatus,
+  type TesterOverallStatus,
+} from "./tester-evidence.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
 /** A command split into program + argv — never a raw string at spawn time. */
@@ -56,6 +65,9 @@ export interface RunTestsResult {
    *  cleanly-observed exit (zero or non-zero) (#384). Drives the gate's bounded
    *  tooling-failure retry instead of charging a fix attempt. */
   toolingError: boolean;
+  /** True when the command was killed for exceeding the gate timeout (#646).
+   *  Distinct from toolingError and from a clean non-zero exit. */
+  timed_out?: boolean;
 }
 
 export interface TestGateResult {
@@ -221,7 +233,117 @@ export async function runTestGate(
   runDir?: string,
   runStoreDeps?: RunStoreDeps,
 ): Promise<TestGateResult> {
-  if (!cfg.test_gate.enabled) return { skipped: true };
+  const gateStartedAt = new Date();
+  const teCfg = cfg.tester_evidence ?? DEFAULT_TESTER_EVIDENCE_CONFIG;
+  const maxOutputChars = teCfg.max_output_chars ?? DEFAULT_TESTER_EVIDENCE_CONFIG.max_output_chars;
+  const maxArtifactChars =
+    teCfg.max_artifact_chars ?? DEFAULT_TESTER_EVIDENCE_CONFIG.max_artifact_chars;
+
+  /** Last trusted command observation for Tester evidence (#646). */
+  let lastCmdForEvidence: {
+    identity: string;
+    exitCode: number | null;
+    durationMs: number;
+    status: TesterCommandStatus;
+    output: string;
+  } | null = null;
+  let commandIdentity: string | null = null;
+
+  const recordEvidence = async (
+    gate: TestGateResult,
+    opts: {
+      overallStatus: Exclude<TesterOverallStatus, "stale">;
+      overallReason?: string;
+      enabled: boolean;
+      includeLastCommand?: boolean;
+    },
+  ): Promise<void> => {
+    if (!runDir) return;
+    try {
+      let candidateSha = "";
+      try {
+        candidateSha = await (deps.gitHead ?? defaultGitHead)(wtPath);
+      } catch {
+        candidateSha = "";
+      }
+      // Schema requires a full 40-char pin; without it acquisition sees missing.
+      const pinned = normalizeCandidateSha(candidateSha);
+      if (!pinned) return;
+      candidateSha = pinned;
+      const endedAt = new Date();
+      const durationMs = Math.max(0, endedAt.getTime() - gateStartedAt.getTime());
+      let tests =
+        opts.includeLastCommand && lastCmdForEvidence
+          ? runAllowlistedExtractors(
+              lastCmdForEvidence.output,
+              teCfg.extractors,
+            )
+          : { tests: [] as ReturnType<typeof runAllowlistedExtractors>["tests"] };
+      // Malformed/unknown extractors never flip pass → fail; only attach diagnostic.
+      let overallReason = opts.overallReason;
+      if (tests.diagnostic && opts.overallStatus === "passed") {
+        overallReason = overallReason
+          ? `${overallReason}; extractor: ${tests.diagnostic}`
+          : `extractor diagnostic (command authority unchanged): ${tests.diagnostic}`;
+      } else if (tests.diagnostic && !overallReason) {
+        overallReason = `extractor diagnostic: ${tests.diagnostic}`;
+      }
+      const evidence = buildTesterEvidence({
+        candidateSha: candidateSha.trim(),
+        runId: path.basename(runDir),
+        issue: issueNumber,
+        wtPath,
+        enabled: opts.enabled,
+        commandIdentity,
+        timeoutSec: cfg.test_gate.timeout,
+        maxOutputChars,
+        startedAt: gateStartedAt.toISOString().replace(/\.\d+Z$/, "Z"),
+        endedAt: endedAt.toISOString().replace(/\.\d+Z$/, "Z"),
+        durationMs,
+        overallStatus: opts.overallStatus,
+        overallReason,
+        lastCommand:
+          opts.includeLastCommand && lastCmdForEvidence
+            ? lastCmdForEvidence
+            : undefined,
+        tests: tests.tests.length > 0 ? tests.tests : undefined,
+      });
+      await writeTesterEvidence(runDir, evidence, {
+        maxArtifactChars,
+        runStoreDeps,
+      });
+    } catch (err) {
+      console.warn(
+        `[pipeline] tester-evidence: producer failed (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  };
+
+  const finish = async (
+    gate: TestGateResult,
+    evidence: {
+      overallStatus: Exclude<TesterOverallStatus, "stale">;
+      overallReason?: string;
+      enabled: boolean;
+      includeLastCommand?: boolean;
+    },
+  ): Promise<TestGateResult> => {
+    await recordEvidence(gate, evidence);
+    return gate;
+  };
+
+  if (!cfg.test_gate.enabled) {
+    return finish(
+      { skipped: true },
+      {
+        overallStatus: "disabled",
+        overallReason: "test_gate.enabled is false",
+        enabled: false,
+      },
+    );
+  }
 
   const invokeFn = deps.invoke ?? defaultInvoke;
   const runTestsFn = deps.runTests ?? runTests;
@@ -279,12 +401,17 @@ export async function runTestGate(
   // Block early on explicitly-set but empty/whitespace-only commands rather than
   // silently falling back to auto-detection (which would hide the misconfiguration).
   if (rawConfiguredCmd !== undefined && !configuredCmd) {
-    return {
-      skipped: false,
-      passed: false,
-      attempts: 0,
-      blockReason: `test_gate.command is set but empty or whitespace-only ("${rawConfiguredCmd}"). Configure a valid command or remove the setting to use auto-detection.`,
-    };
+    const blockReason =
+      `test_gate.command is set but empty or whitespace-only ("${rawConfiguredCmd}"). ` +
+      "Configure a valid command or remove the setting to use auto-detection.";
+    return finish(
+      { skipped: false, passed: false, attempts: 0, blockReason },
+      {
+        overallStatus: "unavailable",
+        overallReason: blockReason,
+        enabled: true,
+      },
+    );
   }
 
   // `set -o pipefail` on its own line (not `;`-joined) so it applies even when
@@ -293,14 +420,39 @@ export async function runTestGate(
   const command: ParsedCommand | null = configuredCmd
     ? { cmd: "bash", args: ["-c", `set -o pipefail\n${configuredCmd}`] }
     : detectFn(wtPath);
-  if (!command) return { skipped: true };
+  if (!command) {
+    return finish(
+      { skipped: true },
+      {
+        overallStatus: "not_run",
+        overallReason: "no test/build command configured or auto-detected",
+        enabled: true,
+      },
+    );
+  }
 
   // Shell-backed commands require killProcessGroup so all descendants (e.g.
   // npm, pnpm, a test runner in an && chain or pipeline) are terminated on timeout.
   const killProcessGroup = !!configuredCmd;
 
   const label = configuredCmd ?? formatCommand(command);
+  commandIdentity = label;
   console.log(`[pipeline] #${issueNumber}: test gate running \`${label}\``);
+
+  const observeCommand = (res: RunTestsResult): void => {
+    let status: TesterCommandStatus;
+    if (res.timed_out) status = "timeout";
+    else if (res.toolingError) status = "tooling_failure";
+    else if (res.passed) status = "passed";
+    else status = "failed";
+    lastCmdForEvidence = {
+      identity: label,
+      exitCode: res.timed_out || res.toolingError ? null : res.passed ? 0 : 1,
+      durationMs: res.durationSec * 1000,
+      status,
+      output: res.output,
+    };
+  };
 
   // Run the test/build command and record it in the evidence bundle (#147).
   // `runTests` has no exit code (it reports pass/fail), so synthesize 0/1.
@@ -309,6 +461,7 @@ export async function runTestGate(
     const startedAt = new Date();
     const res = await runTestsFn(wtPath, command, cfg.test_gate.timeout, killProcessGroup);
     const endedAt = new Date();
+    observeCommand(res);
     if (stateDir) {
       await recordCommand(
         stateDir,
@@ -378,16 +531,24 @@ export async function runTestGate(
   {
     const pre = await resolveProductDirt();
     if (pre.dirty) {
-      return {
-        skipped: false,
-        passed: false,
-        attempts: 0,
-        dirtyWorktree: true,
-        blockReason:
-          "Worktree has uncommitted product changes before the test gate ran. " +
-          "All product changes must be committed so test results can be trusted." +
-          formatProductDirtDisclosure(pre.productPaths, MAX_BLOCK_OUTPUT),
-      };
+      const blockReason =
+        "Worktree has uncommitted product changes before the test gate ran. " +
+        "All product changes must be committed so test results can be trusted." +
+        formatProductDirtDisclosure(pre.productPaths, MAX_BLOCK_OUTPUT);
+      return finish(
+        {
+          skipped: false,
+          passed: false,
+          attempts: 0,
+          dirtyWorktree: true,
+          blockReason,
+        },
+        {
+          overallStatus: "unavailable",
+          overallReason: blockReason,
+          enabled: true,
+        },
+      );
     }
   }
 
@@ -396,13 +557,22 @@ export async function runTestGate(
     console.log(
       `[pipeline] #${issueNumber}: test gate tooling failure persisted after ${MAX_TOOLING_RETRIES} retries; blocking`,
     );
-    return {
-      skipped: false,
-      passed: false,
-      attempts: 0,
-      blockReason: toolingFailureBlockReason(initialRun.result.output),
-      toolingFailure: true,
-    };
+    const blockReason = toolingFailureBlockReason(initialRun.result.output);
+    return finish(
+      {
+        skipped: false,
+        passed: false,
+        attempts: 0,
+        blockReason,
+        toolingFailure: true,
+      },
+      {
+        overallStatus: "tooling_failure",
+        overallReason: blockReason,
+        enabled: true,
+        includeLastCommand: true,
+      },
+    );
   }
   let { passed, output } = initialRun.result;
   if (passed) {
@@ -412,20 +582,36 @@ export async function runTestGate(
     // gate certifies committed state.
     const post = await resolveProductDirt();
     if (post.dirty) {
-      return {
-        skipped: false,
-        passed: false,
-        attempts: 0,
-        dirtyWorktree: true,
-        blockReason:
-          "Test/build command left uncommitted product changes in the working tree. " +
-          "Commit any generated artifacts (snapshots, tsbuildinfo, lock-file updates) " +
-          "so the gate certifies the exact committed state." +
-          formatProductDirtDisclosure(post.productPaths, MAX_BLOCK_OUTPUT),
-      };
+      const blockReason =
+        "Test/build command left uncommitted product changes in the working tree. " +
+        "Commit any generated artifacts (snapshots, tsbuildinfo, lock-file updates) " +
+        "so the gate certifies the exact committed state." +
+        formatProductDirtDisclosure(post.productPaths, MAX_BLOCK_OUTPUT);
+      return finish(
+        {
+          skipped: false,
+          passed: false,
+          attempts: 0,
+          dirtyWorktree: true,
+          blockReason,
+        },
+        {
+          overallStatus: "unavailable",
+          overallReason: blockReason,
+          enabled: true,
+          includeLastCommand: true,
+        },
+      );
     }
     console.log(`[pipeline] #${issueNumber}: test gate passed`);
-    return { skipped: false, passed: true, attempts: 0 };
+    return finish(
+      { skipped: false, passed: true, attempts: 0 },
+      {
+        overallStatus: "passed",
+        enabled: true,
+        includeLastCommand: true,
+      },
+    );
   }
 
   const harness = cfg.harnesses.implementer;
@@ -467,7 +653,22 @@ export async function runTestGate(
       const reason = fixRes.timed_out
         ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on test-gate fix attempt ${attempt}.`
         : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on test-gate fix attempt ${attempt}.`;
-      return { skipped: false, passed: false, attempts: attempt, blockReason: reason };
+      // Fix harness failure is not a suite tooling_failure; last suite observation stands.
+      const overallStatus =
+        lastCmdForEvidence?.status === "timeout"
+          ? ("timeout" as const)
+          : lastCmdForEvidence?.status === "tooling_failure"
+            ? ("tooling_failure" as const)
+            : ("failed" as const);
+      return finish(
+        { skipped: false, passed: false, attempts: attempt, blockReason: reason },
+        {
+          overallStatus,
+          overallReason: reason,
+          enabled: true,
+          includeLastCommand: !!lastCmdForEvidence,
+        },
+      );
     }
 
     // #131: the fix harness may have done the work without committing — salvage
@@ -527,15 +728,24 @@ export async function runTestGate(
           "Fix harness left uncommitted changes in the working tree. " +
           "Test results can't be trusted — stage and commit the fix before re-running." +
           formatProductDirtDisclosure(afterFix.productPaths, MAX_BLOCK_OUTPUT);
-        return {
-          skipped: false,
-          passed: false,
-          attempts: attempt,
-          dirtyWorktree: true,
-          blockReason: salvageFailureReason
-            ? `${dirtyReason} Salvage of uncommitted work also failed: ${salvageFailureReason}`
-            : dirtyReason,
-        };
+        const blockReason = salvageFailureReason
+          ? `${dirtyReason} Salvage of uncommitted work also failed: ${salvageFailureReason}`
+          : dirtyReason;
+        return finish(
+          {
+            skipped: false,
+            passed: false,
+            attempts: attempt,
+            dirtyWorktree: true,
+            blockReason,
+          },
+          {
+            overallStatus: "unavailable",
+            overallReason: blockReason,
+            enabled: true,
+            includeLastCommand: !!lastCmdForEvidence,
+          },
+        );
       }
     }
 
@@ -543,7 +753,20 @@ export async function runTestGate(
     if (fixHeadBefore) {
       const commitCheck = await verifyTestFixFn(wtPath, fixHeadBefore);
       if (!commitCheck.ok) {
-        return { skipped: false, passed: false, attempts: attempt, blockReason: commitCheck.reason };
+        return finish(
+          { skipped: false, passed: false, attempts: attempt, blockReason: commitCheck.reason },
+          {
+            overallStatus:
+              lastCmdForEvidence?.status === "timeout"
+                ? "timeout"
+                : lastCmdForEvidence?.status === "tooling_failure"
+                  ? "tooling_failure"
+                  : "failed",
+            overallReason: commitCheck.reason,
+            enabled: true,
+            includeLastCommand: !!lastCmdForEvidence,
+          },
+        );
       }
     }
 
@@ -555,7 +778,15 @@ export async function runTestGate(
       const newMessages = await gitCommitMessagesFn(wtPath, headBefore);
       const trailerErr = validateCommitTrailers(newMessages, issueNumber, pipelineRunId);
       if (trailerErr) {
-        return { skipped: false, passed: false, attempts: attempt, blockReason: trailerErr };
+        return finish(
+          { skipped: false, passed: false, attempts: attempt, blockReason: trailerErr },
+          {
+            overallStatus: "failed",
+            overallReason: trailerErr,
+            enabled: true,
+            includeLastCommand: !!lastCmdForEvidence,
+          },
+        );
       }
     }
 
@@ -569,13 +800,22 @@ export async function runTestGate(
     if (cfg.build_command && buildAttemptHead) {
       const buildResult = await includeBuildArtifacts(wtPath, cfg.build_command, buildDeps);
       if (buildResult.ran && !buildResult.ok) {
-        return {
-          skipped: false,
-          passed: false,
-          attempts: attempt,
-          blockReason: buildFailureBlockReason(cfg.build_command, buildResult.output),
-          buildFailure: true,
-        };
+        const blockReason = buildFailureBlockReason(cfg.build_command, buildResult.output);
+        return finish(
+          {
+            skipped: false,
+            passed: false,
+            attempts: attempt,
+            blockReason,
+            buildFailure: true,
+          },
+          {
+            overallStatus: "failed",
+            overallReason: blockReason,
+            enabled: true,
+            includeLastCommand: !!lastCmdForEvidence,
+          },
+        );
       }
       if (buildResult.ran && buildResult.ok && buildResult.amended) {
         console.log(
@@ -589,41 +829,81 @@ export async function runTestGate(
       console.log(
         `[pipeline] #${issueNumber}: test gate tooling failure persisted after ${MAX_TOOLING_RETRIES} retries; blocking`,
       );
-      return {
-        skipped: false,
-        passed: false,
-        attempts: attempt,
-        blockReason: toolingFailureBlockReason(retryRun.result.output),
-        toolingFailure: true,
-      };
+      const blockReason = toolingFailureBlockReason(retryRun.result.output);
+      return finish(
+        {
+          skipped: false,
+          passed: false,
+          attempts: attempt,
+          blockReason,
+          toolingFailure: true,
+        },
+        {
+          overallStatus: "tooling_failure",
+          overallReason: blockReason,
+          enabled: true,
+          includeLastCommand: true,
+        },
+      );
     }
     ({ passed, output } = retryRun.result);
     if (passed) {
       const postFixPass = await resolveProductDirt();
       if (postFixPass.dirty) {
-        return {
-          skipped: false,
-          passed: false,
-          attempts: attempt,
-          dirtyWorktree: true,
-          blockReason:
-            "Test/build command left uncommitted product changes in the working tree. " +
-            "Commit any generated artifacts (snapshots, tsbuildinfo, lock-file updates) " +
-            "so the gate certifies the exact committed state." +
-            formatProductDirtDisclosure(postFixPass.productPaths, MAX_BLOCK_OUTPUT),
-        };
+        const blockReason =
+          "Test/build command left uncommitted product changes in the working tree. " +
+          "Commit any generated artifacts (snapshots, tsbuildinfo, lock-file updates) " +
+          "so the gate certifies the exact committed state." +
+          formatProductDirtDisclosure(postFixPass.productPaths, MAX_BLOCK_OUTPUT);
+        return finish(
+          {
+            skipped: false,
+            passed: false,
+            attempts: attempt,
+            dirtyWorktree: true,
+            blockReason,
+          },
+          {
+            overallStatus: "unavailable",
+            overallReason: blockReason,
+            enabled: true,
+            includeLastCommand: true,
+          },
+        );
       }
       console.log(`[pipeline] #${issueNumber}: test gate passed after ${attempt} fix attempt(s)`);
-      return { skipped: false, passed: true, attempts: attempt };
+      return finish(
+        { skipped: false, passed: true, attempts: attempt },
+        {
+          overallStatus: "passed",
+          enabled: true,
+          includeLastCommand: true,
+        },
+      );
     }
   }
 
-  return {
-    skipped: false,
-    passed: false,
-    attempts: cfg.test_gate.max_attempts,
-    blockReason: truncateTail(output, MAX_BLOCK_OUTPUT),
-  };
+  const exhaustedReason = truncateTail(output, MAX_BLOCK_OUTPUT);
+  const exhaustedStatus: Exclude<TesterOverallStatus, "stale"> =
+    lastCmdForEvidence?.status === "timeout"
+      ? "timeout"
+      : lastCmdForEvidence?.status === "tooling_failure"
+        ? "tooling_failure"
+        : "failed";
+  return finish(
+    {
+      skipped: false,
+      passed: false,
+      attempts: cfg.test_gate.max_attempts,
+      blockReason: exhaustedReason,
+    },
+    {
+      overallStatus: exhaustedStatus,
+      overallReason: exhaustedReason,
+      enabled: true,
+      includeLastCommand: true,
+    },
+  );
 }
 
 /** Captured-output failure excerpt for a bounded tooling-retry exhaustion —
@@ -697,12 +977,14 @@ export async function runTests(
   // A timeout is a distinct, already-handled failure mode (the command ran,
   // just too long) — a genuine spawn error (couldn't start at all) or a
   // capture-stream error (pipe broke before a clean exit was observed) are
-  // both tooling errors (#384), not test failures.
+  // both tooling errors (#384), not test failures. timed_out is first-class
+  // for Tester evidence (#646) so it is not collapsed into bare fail.
   return {
     passed: res.success,
     output,
     durationSec: res.duration,
     toolingError: !!(res.spawn_error || res.capture_error),
+    timed_out: !!res.timed_out,
   };
 }
 

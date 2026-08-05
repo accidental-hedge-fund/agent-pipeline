@@ -311,6 +311,7 @@ const ADDED_KEYS = [
   "conventions_md_path",
   "design_gate",
   "review_ensemble",
+  "tester_evidence",
   "roadmap",
   "sweep",
   "queue",
