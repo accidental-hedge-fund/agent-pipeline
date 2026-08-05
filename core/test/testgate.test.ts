@@ -1723,6 +1723,77 @@ test("gate (#873 review): unsafe config globs cannot waive product dirty block",
   }
 });
 
+test("gate (#873 review 2): lockfile/product exact globs cannot waive dirty block", async () => {
+  // Targeted exemptions that miss finite canaries must still hard-block.
+  for (const bad of ["package-lock.json", "core/package.json", "plugin/SKILL.md"]) {
+    let ran = 0;
+    const porcelain =
+      bad === "package-lock.json"
+        ? "?? package-lock.json\n"
+        : ` M ${bad}\n`;
+    const out = await runTestGate(
+      cfgWith({ non_product_dirty_globs: [bad] }),
+      873,
+      "/wt",
+      {
+        detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+        runTests: async () => {
+          ran++;
+          return passResult;
+        },
+        gitDirty: async () => true,
+        gitStatusPorcelain: async () => porcelain,
+      },
+    );
+    assert.equal(out.passed, false, `expected block under targeted glob ${bad}`);
+    assert.equal(ran, 0, `test must not run under targeted glob ${bad}`);
+    assert.equal(out.dirtyWorktree, true);
+    assert.match(out.blockReason ?? "", new RegExp(bad.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+});
+
+test("gate (#873 review 2): product→scratch rename hard-blocks pre-run", async () => {
+  // Porcelain rename destination-only parsing would see only tasks/foo.ts and
+  // waive the gate while product code was deleted/moved.
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => "R  core/scripts/foo.ts -> tasks/foo.ts\n",
+  });
+  assert.equal(out.passed, false);
+  assert.equal(ran, 0);
+  assert.equal(out.dirtyWorktree, true);
+  assert.match(out.blockReason ?? "", /core\/scripts\/foo\.ts/);
+});
+
+test("gate (#873 review 2): product→scratch rename after pass still fails dirty-trust", async () => {
+  let ran = 0;
+  let dirtyCall = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => {
+      dirtyCall++;
+      // clean pre-run; post-pass reports product→scratch rename
+      return dirtyCall > 1;
+    },
+    gitStatusPorcelain: async () =>
+      dirtyCall > 1 ? "R  core/scripts/foo.ts -> tasks/foo.ts\n" : "",
+  });
+  assert.equal(out.passed, false, `expected post-run block: ${JSON.stringify(out)}`);
+  assert.equal(ran, 1);
+  assert.equal(out.dirtyWorktree, true);
+  assert.match(out.blockReason ?? "", /core\/scripts\/foo\.ts/);
+});
+
 test("gate (#873 review): scratch-only dirt after failed test does not invoke salvage", async () => {
   // Fix harness leaves only tasks/todo.md dirty (no product). Salvage must not
   // run — non-goal is not expanding salvage to auto-commit agent scratch.

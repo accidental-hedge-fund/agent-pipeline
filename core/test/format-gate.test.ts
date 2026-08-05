@@ -287,6 +287,26 @@ test("format gate (#873): mixed scratch + product pre-dirty still blocks", async
   );
 });
 
+test("format gate (#873 review 2): product→scratch rename hard-blocks pre-flight", async () => {
+  // Rename source is product; destination-only parsing would treat as scratch-only.
+  const result = await runFormatGate(
+    "/wt",
+    cfg([{ command: "cargo fmt", auto_fix: true }]),
+    873,
+    {
+      execInWorktree: async () => {
+        throw new Error("should not run when product rename source is dirty");
+      },
+      gitStatusPorcelain: async () => "R  core/scripts/foo.ts -> tasks/foo.ts\n",
+    },
+  );
+  assert.equal(result.status, "blocked");
+  assert.ok(
+    "reason" in result && result.reason.includes("pre-existing uncommitted changes"),
+    `unexpected reason: ${JSON.stringify(result)}`,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // #873 review: auto-format commit must not include pre-staged scratch
 // ---------------------------------------------------------------------------

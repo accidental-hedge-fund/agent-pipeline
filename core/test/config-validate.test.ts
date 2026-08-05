@@ -1047,3 +1047,23 @@ test_gate:
     );
   }
 });
+
+test("validateConfig (#873 review 2): targeted product/lockfile globs rejected", () => {
+  for (const bad of [
+    "package-lock.json",
+    "yarn.lock",
+    "core/package.json",
+    "plugin/SKILL.md",
+    "openspec/specs/foo/spec.md",
+  ]) {
+    const deps = makeDeps(
+      ["test_gate:", "  non_product_dirty_globs:", `    - "${bad}"`].join("\n") + "\n",
+    );
+    const result = validateConfig("/fake-repo", deps);
+    assert.equal(result.valid, false, `expected invalid for glob ${bad}`);
+    assert.ok(
+      result.diagnostics.some((d) => /unsafe|non_product_dirty_globs|product|lock/i.test(d.message)),
+      `expected unsafe-glob diagnostic for ${bad}; got ${JSON.stringify(result.diagnostics)}`,
+    );
+  }
+});

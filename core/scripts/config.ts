@@ -367,7 +367,8 @@ const PartialConfigSchema = z.object({
                 message:
                   `non_product_dirty_globs entry ${JSON.stringify(g)} is unsafe: ` +
                   "scratch extension globs must not match product paths " +
-                  "(core/, plugin/, openspec/, package roots, or repo-wide patterns). " +
+                  "(core/, plugin/, openspec/, hosts/, scripts/, package roots, " +
+                  "recognized lockfiles, or repo-wide patterns). " +
                   "Use a narrow non-product namespace (e.g. notes/**).",
                 path: [i],
               });

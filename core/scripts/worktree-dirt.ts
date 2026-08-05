@@ -28,9 +28,20 @@ export interface DirtClassification {
   scratch: string[];
 }
 
+/** Unquote a porcelain path segment (`"path with space"` → path with space). */
+function unquotePorcelainPath(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
 /**
  * Parse `git status --porcelain` into worktree-relative paths (status columns
- * stripped; rename destinations preferred). Pure — no I/O.
+ * stripped). Rename/copy records contribute **both** endpoints so a
+ * product→scratch rename cannot drop the product half and evade the dirty
+ * gate (#873 review 2). Pure — no I/O.
  */
 export function parsePorcelainPaths(statusOutput: string): string[] {
   const paths: string[] = [];
@@ -38,13 +49,16 @@ export function parsePorcelainPaths(statusOutput: string): string[] {
     if (line.length < 3) continue;
     const rest = line.slice(3); // two-char status + space
     const arrow = rest.indexOf(" -> ");
-    const raw = (arrow >= 0 ? rest.slice(arrow + 4) : rest).trim();
-    // Porcelain may quote paths with spaces: "path with space"
-    const unquoted =
-      raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')
-        ? raw.slice(1, -1)
-        : raw;
-    if (unquoted) paths.push(unquoted);
+    if (arrow >= 0) {
+      // Rename/copy: "old -> new" — keep both so either endpoint can be product.
+      const src = unquotePorcelainPath(rest.slice(0, arrow));
+      const dst = unquotePorcelainPath(rest.slice(arrow + 4));
+      if (src) paths.push(src);
+      if (dst) paths.push(dst);
+    } else {
+      const unquoted = unquotePorcelainPath(rest);
+      if (unquoted) paths.push(unquoted);
+    }
   }
   return paths;
 }
@@ -75,32 +89,139 @@ export function productDirtyPaths(
 }
 
 /**
+ * Product namespace prefixes that extension globs must never waive. Paths under
+ * these trees are always product dirt for gate trust (#873 review 2).
+ */
+export const PRODUCT_NAMESPACE_PREFIXES: readonly string[] = [
+  "core/",
+  "plugin/",
+  "openspec/",
+  "hosts/",
+  "scripts/",
+];
+
+/** Recognized lockfile basenames — fold targets, never ignorable scratch. */
+export const RECOGNIZED_LOCKFILE_BASENAMES: readonly string[] = [
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+];
+
+/**
+ * Product root files that extension globs must never waive. Distinct from
+ * namespaces: exact repo-root product artifacts.
+ */
+export const PRODUCT_ROOT_FILES: readonly string[] = [
+  "package.json",
+  "README.md",
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+];
+
+/**
  * Product canary paths used to reject over-broad scratch extension globs.
- * An extension glob that matches any of these is unsafe and is ignored at
- * classify time (fail-closed: product dirt remains product). Covers product
- * trees (`core/`, `plugin/`, `openspec/`), package roots, and repo-wide
- * patterns such as `**` (#873 review).
+ * Includes nested product files and lockfiles so targeted exemptions like
+ * `package-lock.json` or `core/package.json` cannot slip past finite samples
+ * (#873 review 2). Classify-time `isAlwaysProductPath` is the hard boundary.
  */
 export const PRODUCT_PATH_CANARIES: readonly string[] = [
   "core/scripts/foo.ts",
+  "core/package.json",
   "plugin/scripts/foo.ts",
+  "plugin/SKILL.md",
   "openspec/changes/x/proposal.md",
+  "openspec/specs/foo/spec.md",
   "package.json",
   "scripts/build.mjs",
   "hosts/claude/SKILL.md",
   "README.md",
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "core/package-lock.json",
 ];
 
 /**
+ * True when a path is always product-relevant for gate trust: under a product
+ * namespace, a recognized lockfile, or a known product root file. Extension
+ * globs cannot reclassify these as scratch (fail-closed).
+ */
+export function isAlwaysProductPath(filePath: string): boolean {
+  const normalized = normalizeRepoPath(filePath);
+  if (!normalized) return false;
+  const base = normalized.includes("/")
+    ? normalized.slice(normalized.lastIndexOf("/") + 1)
+    : normalized;
+  if ((RECOGNIZED_LOCKFILE_BASENAMES as readonly string[]).includes(base)) {
+    return true;
+  }
+  for (const prefix of PRODUCT_NAMESPACE_PREFIXES) {
+    const ns = prefix.slice(0, -1);
+    if (normalized === ns || normalized.startsWith(prefix)) return true;
+  }
+  if ((PRODUCT_ROOT_FILES as readonly string[]).includes(normalized)) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * True when a configured scratch extension glob is safe: it must not match
- * any product canary path. Unsafe globs (`**`, `core/**`, `plugin/**`,
- * `openspec/**`, root-wide `*`, …) are rejected so operators cannot waive the
- * product-dirt trust boundary.
+ * protected product namespaces, product root files, or recognized lockfiles.
+ * Uses structural prefix checks plus canaries so targeted product exemptions
+ * (e.g. `package-lock.json`, `core/package.json`) are rejected even when they
+ * miss a single sample canary (#873 review 2).
  */
 export function isSafeScratchExtensionGlob(pattern: string): boolean {
   let normalized = pattern.replace(/\\/g, "/").trim();
   if (!normalized) return false;
   while (normalized.startsWith("./")) normalized = normalized.slice(2);
+
+  // Repo-wide wildcards
+  if (
+    normalized === "**" ||
+    normalized === "*" ||
+    normalized === "**/*" ||
+    normalized === "*/**"
+  ) {
+    return false;
+  }
+
+  // Structural: pattern targets a product namespace (core/**, plugin/SKILL.md, …)
+  for (const prefix of PRODUCT_NAMESPACE_PREFIXES) {
+    const ns = prefix.slice(0, -1);
+    if (
+      normalized === ns ||
+      normalized === prefix ||
+      normalized === `${ns}/**` ||
+      normalized === `${ns}/*` ||
+      normalized.startsWith(prefix) ||
+      normalized.startsWith(`${ns}/**`) ||
+      normalized.startsWith(`${ns}/*`)
+    ) {
+      return false;
+    }
+  }
+
+  // Lockfile basenames as exact or trailing path segments (no wildcards in leaf)
+  const lastSeg = normalized.includes("/")
+    ? normalized.slice(normalized.lastIndexOf("/") + 1)
+    : normalized;
+  if ((RECOGNIZED_LOCKFILE_BASENAMES as readonly string[]).includes(lastSeg)) {
+    return false;
+  }
+  for (const lock of RECOGNIZED_LOCKFILE_BASENAMES) {
+    if (matchScratchGlob(lock, normalized)) return false;
+    if (matchScratchGlob(`nested/${lock}`, normalized)) return false;
+  }
+
+  // Product root files (exact or matched via broad globs)
+  for (const root of PRODUCT_ROOT_FILES) {
+    if (matchScratchGlob(root, normalized)) return false;
+  }
+
+  // Expanded canaries catch remaining broad patterns (**/*.ts, */*, …)
   for (const canary of PRODUCT_PATH_CANARIES) {
     if (matchScratchGlob(canary, normalized)) return false;
   }
@@ -109,7 +230,8 @@ export function isSafeScratchExtensionGlob(pattern: string): boolean {
 
 /**
  * True when `filePath` matches engine-known scratch or any **safe** config
- * extension glob. Lockfiles and product trees never match the engine set.
+ * extension glob. Lockfiles and product trees never match the engine set and
+ * cannot be waived by extension globs (classify-time hard exclusion).
  * Unsafe extension globs are ignored (fail-closed).
  */
 export function isNonProductScratchPath(
@@ -121,6 +243,8 @@ export function isNonProductScratchPath(
   for (const pattern of ENGINE_NON_PRODUCT_SCRATCH_GLOBS) {
     if (matchScratchGlob(normalized, pattern)) return true;
   }
+  // Fail-closed trust boundary: protected product paths are never extension-scratch.
+  if (isAlwaysProductPath(normalized)) return false;
   for (const pattern of extraGlobs) {
     if (typeof pattern !== "string" || !pattern.trim()) continue;
     const trimmed = pattern.trim();
