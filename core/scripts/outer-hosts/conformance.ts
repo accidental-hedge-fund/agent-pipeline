@@ -141,6 +141,9 @@ export function checkOuterHostConformance(manifest: OuterHostManifest): OuterHos
   }
 
   // Install profile (mode/paths — not a free-form how string).
+  // Fallback is required for every non-supported level (limited + unsupported),
+  // matching observation capabilities. Path/artifact fields are required for
+  // every non-unsupported level so limited cannot pass without declared paths.
   const install = manifest.install;
   if (!install || typeof install !== "object") {
     failures.push(fail(host, "required-capability", 'missing required capability area "install"'));
@@ -154,13 +157,18 @@ export function checkOuterHostConformance(manifest: OuterHostManifest): OuterHos
         fail(host, "support-level", `install: invalid support level ${JSON.stringify(install.support)}`),
       );
     }
-    if (install.support === "unsupported") {
+    if (install.support !== "supported") {
       if (typeof install.fallback !== "string" || !install.fallback.trim()) {
         failures.push(
-          fail(host, "fallback", "install: support is unsupported but fallback is missing or empty"),
+          fail(
+            host,
+            "fallback",
+            `install: support is ${install.support} but fallback is missing or empty`,
+          ),
         );
       }
-    } else {
+    }
+    if (install.support !== "unsupported") {
       if (!install.mode || install.mode === "none") {
         failures.push(
           fail(host, "install.mode", "install support is not unsupported but mode is none/missing"),
@@ -177,7 +185,7 @@ export function checkOuterHostConformance(manifest: OuterHostManifest): OuterHos
       }
       if (!install.managedArtifacts || typeof install.managedArtifacts !== "object") {
         failures.push(
-          fail(host, "install.managedArtifacts", "install supported requires managedArtifacts"),
+          fail(host, "install.managedArtifacts", "install supported/limited requires managedArtifacts"),
         );
       } else {
         if (typeof install.managedArtifacts.skillTree !== "boolean") {
@@ -189,6 +197,19 @@ export function checkOuterHostConformance(manifest: OuterHostManifest): OuterHos
           failures.push(
             fail(host, "install.managedArtifacts.commandsKind", "commandsKind is required"),
           );
+        } else if (install.managedArtifacts.commandsKind !== "none") {
+          if (
+            !Array.isArray(install.managedArtifacts.commandsDirRelative) ||
+            install.managedArtifacts.commandsDirRelative.length === 0
+          ) {
+            failures.push(
+              fail(
+                host,
+                "install.managedArtifacts.commandsDirRelative",
+                "commandsDirRelative is required when commandsKind is not none",
+              ),
+            );
+          }
         }
       }
       if (!install.basePath || !Array.isArray(install.basePath.defaultHomeSegments)) {
@@ -196,13 +217,47 @@ export function checkOuterHostConformance(manifest: OuterHostManifest): OuterHos
           fail(host, "install.basePath", "basePath.defaultHomeSegments is required"),
         );
       }
+      if (
+        !Array.isArray(install.skillsRelative) ||
+        install.skillsRelative.length === 0 ||
+        !install.skillsRelative.every((s) => typeof s === "string" && s.trim())
+      ) {
+        failures.push(
+          fail(
+            host,
+            "install.skillsRelative",
+            "skillsRelative must be a non-empty string array when install is supported/limited",
+          ),
+        );
+      }
+      if (typeof install.skillDirName !== "string" || !install.skillDirName.trim()) {
+        failures.push(
+          fail(
+            host,
+            "install.skillDirName",
+            "skillDirName is required when install is supported/limited",
+          ),
+        );
+      }
+      if (
+        (install.mode === "tree" || install.mode === "symlink-claude") &&
+        typeof install.overlayDir !== "string"
+      ) {
+        failures.push(
+          fail(
+            host,
+            "install.overlayDir",
+            "overlayDir is required for tree/symlink-claude install modes (empty string allowed)",
+          ),
+        );
+      }
       if (typeof install.postInstall !== "string" || !install.postInstall.trim()) {
-        failures.push(fail(host, "install.postInstall", "postInstall hint is required when install is supported"));
+        failures.push(fail(host, "install.postInstall", "postInstall hint is required when install is supported/limited"));
       }
     }
   }
 
-  // Invocation surface.
+  // Invocation surface — fallback required for every non-supported level.
   const invocation = manifest.invocation;
   if (!invocation || typeof invocation !== "object") {
     failures.push(
@@ -222,25 +277,26 @@ export function checkOuterHostConformance(manifest: OuterHostManifest): OuterHos
         ),
       );
     }
-    if (invocation.support === "unsupported") {
+    if (invocation.support !== "supported") {
       if (typeof invocation.fallback !== "string" || !invocation.fallback.trim()) {
         failures.push(
           fail(
             host,
             "fallback",
-            "invocation: support is unsupported but fallback is missing or empty",
+            `invocation: support is ${invocation.support} but fallback is missing or empty`,
           ),
         );
       }
-    } else {
+    }
+    if (invocation.support !== "unsupported") {
       if (typeof invocation.commandSurface !== "string" || !invocation.commandSurface.trim()) {
         failures.push(
-          fail(host, "invocation.commandSurface", "commandSurface is required when invocation is supported"),
+          fail(host, "invocation.commandSurface", "commandSurface is required when invocation is supported/limited"),
         );
       }
       if (typeof invocation.skillPathHint !== "string" || !invocation.skillPathHint.trim()) {
         failures.push(
-          fail(host, "invocation.skillPathHint", "skillPathHint is required when invocation is supported"),
+          fail(host, "invocation.skillPathHint", "skillPathHint is required when invocation is supported/limited"),
         );
       }
       // Typed discovery probe (#784) — machine-consumed; free-text discoveryProbe
@@ -251,7 +307,7 @@ export function checkOuterHostConformance(manifest: OuterHostManifest): OuterHos
           fail(
             host,
             "invocation.discovery",
-            "discovery probe spec is required when invocation is supported",
+            "discovery probe spec is required when invocation is supported/limited",
           ),
         );
       } else if (

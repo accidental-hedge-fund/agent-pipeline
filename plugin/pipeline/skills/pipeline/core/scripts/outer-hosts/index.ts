@@ -96,9 +96,10 @@ export function ensureBuiltinOuterHostsRegistered(
   const resolved =
     manifests.length > 0 ? manifests : loadOuterHostManifestsPreferHosts(repoRoot);
   for (const manifest of resolved) {
-    if (registryResolve(manifest.id) === null) {
-      registerOuterHost(manifest);
-    }
+    // Always register through the public API so same-identity re-register is
+    // idempotent and a pre-registered extension that collides with a distinct
+    // builtin under the same id fails closed (never silently retained).
+    registerOuterHost(manifest);
   }
   // Mark only when all built-ins resolved (partial fixture dirs still mark so
   // callers can register extensions afterward without re-scanning forever).

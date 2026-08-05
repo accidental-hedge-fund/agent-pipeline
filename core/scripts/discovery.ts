@@ -225,38 +225,55 @@ export function skillPathPresentDefault(absPath: string): boolean {
 /**
  * Resolve the managed skill install path from a host's install profile.
  * Mirrors install.mjs base-path resolution (env override → defaultHomeSegments
- * → alternateHomeSegments). Pure aside from home/env/exists seams.
+ * → alternateHomeSegments when primary is absent). Prefers the first candidate
+ * whose skill path (or base) is present so a valid alternate-path install
+ * (e.g. Codex `~/.agents/skills/pipeline`) is not reported unavailable.
+ * Pure aside from home/env/exists seams.
  */
 export function resolveManifestSkillPath(
   manifest: OuterHostManifest,
   deps: {
     homeDir: () => string;
     envGet: (key: string) => string | undefined;
+    /**
+     * True when a path exists as a directory or symlink. Defaults to
+     * skillPathPresentDefault. Used for primary-vs-alternate base selection.
+     */
+    pathPresent?: (absPath: string) => boolean;
   },
 ): string {
   const bp = manifest.install.basePath;
-  let base: string;
+  const skillTail = [
+    ...(manifest.install.skillsRelative ?? []),
+    manifest.install.skillDirName ?? "pipeline",
+  ];
+  const pathPresent = deps.pathPresent ?? skillPathPresentDefault;
+  const skillUnder = (base: string) => path.join(base, ...skillTail);
+
   const envKey = typeof bp.env === "string" ? bp.env.trim() : "";
   const envVal = envKey ? deps.envGet(envKey)?.trim() : "";
   if (envVal) {
-    base = path.resolve(envVal);
-  } else {
-    base = path.join(deps.homeDir(), ...bp.defaultHomeSegments);
-    const alt = bp.alternateHomeSegments;
-    // Prefer alternate only when primary does not exist as a path prefix candidate
-    // is not required here — discovery reports the primary default path for the
-    // skill tree; skillPathPresent decides availability.
-    if (Array.isArray(alt) && alt.length > 0) {
-      // Keep primary as the declared path; install.mjs may use alternate when
-      // primary is missing. Discovery checks primary first (skillPathHint-aligned).
-      void alt;
-    }
+    return skillUnder(path.resolve(envVal));
   }
-  return path.join(
-    base,
-    ...manifest.install.skillsRelative,
-    manifest.install.skillDirName,
-  );
+
+  const primaryBase = path.join(deps.homeDir(), ...bp.defaultHomeSegments);
+  const bases: string[] = [primaryBase];
+  const alt = bp.alternateHomeSegments;
+  if (Array.isArray(alt) && alt.length > 0) {
+    bases.push(path.join(deps.homeDir(), ...alt));
+  }
+
+  // Prefer the first candidate whose skill install is present (valid alternate
+  // install must not false-negative when primary base is missing).
+  for (const base of bases) {
+    const skill = skillUnder(base);
+    if (pathPresent(skill)) return skill;
+  }
+  // Mirror install.mjs: first existing base wins when no skill is present yet.
+  for (const base of bases) {
+    if (pathPresent(base)) return skillUnder(base);
+  }
+  return skillUnder(primaryBase);
 }
 
 /** Normalize a manifest discovery probe (defaults whichCommand to host id). */
@@ -381,7 +398,10 @@ export async function discoverHosts(
     }
 
     const probe = normalizeDiscoveryProbe(id, manifest.invocation?.discovery);
-    const skillAbs = resolveManifestSkillPath(manifest, pathDeps);
+    const skillAbs = resolveManifestSkillPath(manifest, {
+      ...pathDeps,
+      pathPresent: skillPresent,
+    });
     const skillOk = skillPresent(skillAbs);
     const skillPath = skillOk ? skillAbs : null;
 

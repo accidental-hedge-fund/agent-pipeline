@@ -10,7 +10,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { discoverHosts, type DiscoverHostsDeps, type DiscoveryResult } from "../scripts/discovery.ts";
+import {
+  discoverHosts,
+  resolveManifestSkillPath,
+  type DiscoverHostsDeps,
+  type DiscoveryResult,
+} from "../scripts/discovery.ts";
 import { handlePathSubcommand, type PathSubcommandDeps } from "../scripts/pipeline.ts";
 import type { CliOpts } from "../scripts/pipeline.ts";
 
@@ -526,4 +531,113 @@ test("discoverHosts: which_or_skill_path host available from skill when CLI miss
   );
   assert.equal(result.hosts["ext-host"].available, true);
   assert.equal((result.hosts["ext-host"] as { skillPath?: string | null }).skillPath, skill);
+});
+
+// ---------------------------------------------------------------------------
+// #784 review-2: alternateHomeSegments (Codex ~/.agents) must not false-negative
+// ---------------------------------------------------------------------------
+
+const CODEX_MANIFEST_MIN = {
+  manifestVersion: 1 as const,
+  id: "codex-alt",
+  displayName: "Codex Alternate",
+  origin: "extension" as const,
+  install: {
+    support: "supported" as const,
+    mode: "tree" as const,
+    basePath: {
+      env: "CODEX_HOME" as string | null,
+      defaultHomeSegments: [".codex"] as const,
+      alternateHomeSegments: [".agents"] as const,
+      skillsUnderBase: true,
+    },
+    skillsRelative: ["skills"] as const,
+    skillDirName: "pipeline",
+    overlayDir: "",
+    overlayFiles: [] as const,
+    overlayDirs: [] as const,
+    managedArtifacts: {
+      skillTree: true,
+      commandsGlob: null,
+      commandsDirRelative: ["agents"] as const,
+      commandsKind: "codex-prompt" as const,
+    },
+    userOwnedExclusion: "managed only",
+    postInstall: "restart",
+    installOrder: 20,
+  },
+  invocation: {
+    support: "supported" as const,
+    skillPathHint: "~/.codex/skills/pipeline",
+    commandSurface: "$pipeline",
+    discoveryProbe: "skill path",
+    discovery: { kind: "skill_path" as const },
+  },
+  early_run_handoff: { support: "supported" as const, how: "handoff" },
+  event_follow: { support: "supported" as const, how: "follow" },
+  reattach: { support: "supported" as const, how: "reattach" },
+  wait_cancel: {
+    support: "supported" as const,
+    classification: "non_terminal" as const,
+    recovery: "reattach_or_portable_follow" as const,
+    how: "non-terminal",
+  },
+  material_progress_notify: {
+    support: "supported" as const,
+    how: "status",
+    mapping: {
+      surface: "codex_chat_status" as const,
+      tools: ["chat"] as const,
+      filter: "scripts/material-filter.mjs",
+    },
+    fallback: "stdout",
+  },
+  terminal_cleanup: { support: "supported" as const, how: "stop" },
+  terminal_summary: { support: "supported" as const, how: "summary" },
+};
+
+test("resolveManifestSkillPath: prefers .agents skill when primary .codex is absent (#784)", () => {
+  const agentsSkill = "/home/u/.agents/skills/pipeline";
+  const resolved = resolveManifestSkillPath(CODEX_MANIFEST_MIN as never, {
+    homeDir: () => "/home/u",
+    envGet: () => undefined,
+    pathPresent: (p) => p === agentsSkill || p === "/home/u/.agents",
+  });
+  assert.equal(resolved, agentsSkill);
+});
+
+test("discoverHosts: skill_path-only install under alternateHomeSegments is available (#784)", async () => {
+  const agentsSkill = "/home/u/.agents/skills/pipeline";
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      which: async () => null,
+      listOuterHostIds: () => ["claude", "codex", "opencode", "codex-alt"],
+      resolveOuterHost: (id) =>
+        id === "codex-alt" ? (CODEX_MANIFEST_MIN as never) : null,
+      // Only alternate skill tree present — primary ~/.codex/skills/pipeline missing.
+      skillPathPresent: (p) => p === agentsSkill || p === "/home/u/.agents",
+      homeDir: () => "/home/u",
+      envGet: () => undefined,
+    }),
+  );
+  assert.equal(
+    result.hosts["codex-alt"].available,
+    true,
+    "alternate-path-only install must not false-negative",
+  );
+  assert.equal(
+    (result.hosts["codex-alt"] as { skillPath?: string | null }).skillPath,
+    agentsSkill,
+  );
+});
+
+test("resolveManifestSkillPath: env override still wins over alternate (#784)", () => {
+  const resolved = resolveManifestSkillPath(CODEX_MANIFEST_MIN as never, {
+    homeDir: () => "/home/u",
+    envGet: (k) => (k === "CODEX_HOME" ? "/custom/codex" : undefined),
+    pathPresent: () => false,
+  });
+  assert.equal(resolved, "/custom/codex/skills/pipeline");
 });

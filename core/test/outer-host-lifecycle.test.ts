@@ -75,6 +75,32 @@ test("registerOuterHost: distinct implementation under same ID fails closed", ()
   assert.equal(resolveOuterHost("claude")!.displayName, "Claude Code");
 });
 
+test("ensureBuiltinOuterHostsRegistered: extension-first collision with builtin fails closed (#784)", () => {
+  _resetOuterHostRegistryForTests();
+  // Extension claims builtin id before builtins load — must not silently retain.
+  const extClaude = loadFixture("synth-complete.json");
+  extClaude.id = "claude";
+  extClaude.displayName = "Extension Claude Impostor";
+  extClaude.origin = "extension";
+  registerOuterHost(extClaude);
+  assert.throws(
+    () => ensureBuiltinOuterHostsRegistered(repoRoot),
+    /Outer-host ID collision.*"claude"/,
+  );
+});
+
+test("ensureBuiltinOuterHostsRegistered: builtin-first then distinct extension collides (#784)", () => {
+  _resetOuterHostRegistryForTests();
+  ensureBuiltinOuterHostsRegistered(repoRoot);
+  const extClaude = loadFixture("synth-complete.json");
+  extClaude.id = "claude";
+  extClaude.displayName = "Extension Claude Impostor";
+  extClaude.origin = "extension";
+  assert.throws(() => registerOuterHost(extClaude), /Outer-host ID collision.*"claude"/);
+  assert.equal(resolveOuterHost("claude")!.origin, "builtin");
+  assert.equal(resolveOuterHost("claude")!.displayName, "Claude Code");
+});
+
 test("registerOuterHost: unsupported manifestVersion is rejected", () => {
   _resetOuterHostRegistryForTests();
   const bad = loadFixture("synth-complete.json");
@@ -203,6 +229,42 @@ test("conformance kit: incomplete synthetic host fails naming missing field", ()
   assert.throws(
     () => assertOuterHostConformance(incomplete),
     /incomplete-synth|early_run_handoff|fallback/,
+  );
+});
+
+test("conformance kit: limited install without fallback fails (#784)", () => {
+  const report = checkOuterHostConformance(loadFixture("limited-install-no-fallback.json"));
+  assert.equal(report.ok, false);
+  assert.ok(
+    report.failures.some(
+      (f) => f.check === "fallback" && f.message.includes("install") && f.message.includes("limited"),
+    ),
+    JSON.stringify(report.failures),
+  );
+});
+
+test("conformance kit: limited invocation without fallback fails (#784)", () => {
+  const report = checkOuterHostConformance(loadFixture("limited-invocation-no-fallback.json"));
+  assert.equal(report.ok, false);
+  assert.ok(
+    report.failures.some(
+      (f) =>
+        f.check === "fallback" &&
+        f.message.includes("invocation") &&
+        f.message.includes("limited"),
+    ),
+    JSON.stringify(report.failures),
+  );
+});
+
+test("conformance kit: missing skillsRelative fails when install supported (#784)", () => {
+  const report = checkOuterHostConformance(loadFixture("missing-skills-relative.json"));
+  assert.equal(report.ok, false);
+  assert.ok(
+    report.failures.some(
+      (f) => f.check === "install.skillsRelative" || f.message.includes("skillsRelative"),
+    ),
+    JSON.stringify(report.failures),
   );
 });
 
