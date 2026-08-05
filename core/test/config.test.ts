@@ -646,6 +646,65 @@ test("resolveConfig: review_ensemble over max_agents is rejected", async () => {
   }
 });
 
+test("resolveConfig: review_ensemble + stage_executors.plan-review is rejected (#645)", async () => {
+  const repo = makeFakeRepo(
+    `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\n` +
+      `stage_executors:\n  plan-review: local-ollama\n` +
+      `review_ensemble:\n  enabled: true\n  agents:\n    - role: primary\n    - harness: claude\n`,
+  );
+  const binDir = makeFakeGh("acme/re5");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re5`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /review_ensemble\.enabled cannot be combined with stage_executors.*plan-review/s,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_ensemble + stage_executors.review-1 is rejected (#645)", async () => {
+  const repo = makeFakeRepo(
+    `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\n` +
+      `stage_executors:\n  review-1: local-ollama\n` +
+      `review_ensemble:\n  enabled: true\n  agents:\n    - role: primary\n`,
+  );
+  const binDir = makeFakeGh("acme/re6");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re6`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /review_ensemble\.enabled cannot be combined with stage_executors.*review-1/s,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_ensemble + stage_executors.planning (non-review) is allowed (#645)", async () => {
+  const repo = makeFakeRepo(
+    `executors:\n  opencode-main:\n    type: agent-system\n    provider: opencode\n    endpoint: https://opencode.internal/api\n` +
+      `stage_executors:\n  planning: opencode-main\n` +
+      `review_ensemble:\n  enabled: true\n  agents:\n    - role: primary\n    - harness: claude\n`,
+  );
+  const binDir = makeFakeGh("acme/re7");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re7`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.review_ensemble.enabled, true);
+    assert.equal(cfg.stage_executors.planning, "opencode-main");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---- review_policy (#17) ----
 
 test("resolveConfig: review_policy defaults apply when absent (block medium+, conf floor 0.7, bounded rounds)", async () => {

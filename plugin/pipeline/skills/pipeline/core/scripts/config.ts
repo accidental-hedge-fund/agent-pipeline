@@ -816,21 +816,39 @@ const EXECUTION_ENVIRONMENT_STAGE_SET = new Set<string>(EXECUTION_ENVIRONMENT_ST
  * assigned to a prompt-contained stage. Throws a single Error naming the
  * offending stage + executor on the first violation found; a no-op when either
  * block is absent (parity with pre-#314 configs).
+ *
+ * Also rejects combining `review_ensemble.enabled` with `stage_executors` for
+ * plan-review / review-1 / review-2 (#645): that combo would silently run a
+ * single stage executor and bypass ensemble fan-out.
  */
 function validateStageExecutorAssignments(fileConfig: PartialConfig): void {
-  if (!fileConfig.stage_executors) return;
-  for (const [stage, name] of Object.entries(fileConfig.stage_executors)) {
-    const definition = fileConfig.executors?.[name];
-    if (!definition) {
-      throw new Error(
-        `stage_executors.${stage} references unknown executor "${name}" — add it under executors:`,
-      );
+  if (fileConfig.stage_executors) {
+    for (const [stage, name] of Object.entries(fileConfig.stage_executors)) {
+      const definition = fileConfig.executors?.[name];
+      if (!definition) {
+        throw new Error(
+          `stage_executors.${stage} references unknown executor "${name}" — add it under executors:`,
+        );
+      }
+      if (definition.type === "model-endpoint" && EXECUTION_ENVIRONMENT_STAGE_SET.has(stage)) {
+        throw new Error(
+          `stage "${stage}" cannot be assigned model-endpoint executor "${name}" — model-endpoint ` +
+            `executors are only valid for prompt-contained stages (plan-review, review-1, review-2); ` +
+            `"${stage}" requires repo/tool access and needs an agent-system executor or the local harness`,
+        );
+      }
     }
-    if (definition.type === "model-endpoint" && EXECUTION_ENVIRONMENT_STAGE_SET.has(stage)) {
+  }
+  // #645: ensemble fan-out and a single stage_executor on the same review
+  // seam are mutually exclusive — never silently prefer one over the other.
+  if (fileConfig.review_ensemble?.enabled === true && fileConfig.stage_executors) {
+    const ensembleSeamStages = ["plan-review", "review-1", "review-2"] as const;
+    const conflicting = ensembleSeamStages.filter((s) => fileConfig.stage_executors?.[s]);
+    if (conflicting.length > 0) {
       throw new Error(
-        `stage "${stage}" cannot be assigned model-endpoint executor "${name}" — model-endpoint ` +
-          `executors are only valid for prompt-contained stages (plan-review, review-1, review-2); ` +
-          `"${stage}" requires repo/tool access and needs an agent-system executor or the local harness`,
+        `review_ensemble.enabled cannot be combined with stage_executors for ${conflicting.join(", ")} — ` +
+          `ensemble requires the shared multi-agent reviewer seam and must not be silently replaced by a single stage executor. ` +
+          `Remove those stage_executors assignment(s) or set review_ensemble.enabled: false.`,
       );
     }
   }

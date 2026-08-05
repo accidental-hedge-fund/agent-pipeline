@@ -98,6 +98,30 @@ export function isEnsembleEnabled(cfg: Pick<PipelineConfig, "review_ensemble">):
   return cfg.review_ensemble?.enabled === true;
 }
 
+/** Review stages that share the ensemble fan-out seam (#645). */
+export const ENSEMBLE_SEAM_STAGES = ["plan-review", "review-1", "review-2"] as const;
+export type EnsembleSeamStage = (typeof ENSEMBLE_SEAM_STAGES)[number];
+
+/**
+ * Fail closed when ensemble is enabled and a stage_executor assignment would
+ * silently replace multi-agent fan-out with a single external executor.
+ * Config-resolve rejects this combo; this guard covers hand-built configs and
+ * any path that skipped resolve validation.
+ */
+export function assertNoEnsembleStageExecutorBypass(
+  cfg: Pick<PipelineConfig, "review_ensemble" | "stage_executors">,
+  stage: EnsembleSeamStage,
+): void {
+  if (!isEnsembleEnabled(cfg)) return;
+  const name = cfg.stage_executors?.[stage];
+  if (!name) return;
+  throw new Error(
+    `review_ensemble.enabled cannot be combined with stage_executors.${stage}="${name}" — ` +
+      `ensemble requires the shared multi-agent reviewer seam and must not be silently replaced by a single stage executor. ` +
+      `Remove stage_executors.${stage} or set review_ensemble.enabled: false.`,
+  );
+}
+
 /**
  * Resolve the ordered ensemble agent list from config + current primary
  * reviewer settings. When ensemble is disabled, returns a single primary agent

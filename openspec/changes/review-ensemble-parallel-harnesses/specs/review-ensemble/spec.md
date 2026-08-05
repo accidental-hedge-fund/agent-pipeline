@@ -10,7 +10,8 @@ run the ensemble path defined by the other requirements in this capability.
 
 The schema SHALL reject invalid ensemble configuration at config-resolve time with an actionable
 message (empty agent list when enabled, empty harness string, agent count above the configured
-maximum, or unknown merge mode if a merge field is present). v1 SHALL support only
+maximum, unknown merge mode if a merge field is present, or `stage_executors` assignments for
+plan-review / review-1 / review-2 while ensemble is enabled). v1 SHALL support only
 union-blocking merge semantics and SHALL NOT expose a majority-vote approve mode.
 
 #### Scenario: ensemble disabled is a no-op
@@ -40,6 +41,14 @@ union-blocking merge semantics and SHALL NOT expose a majority-vote approve mode
   merge field exists in schema)
 - **THEN** config resolution SHALL reject the configuration
 - **AND** the engine SHALL NOT provide a majority-vote approve configuration path
+
+#### Scenario: stage_executors on review seam stages is rejected when ensemble is enabled
+
+- **WHEN** `review_ensemble.enabled` is true
+- **AND** `stage_executors` assigns plan-review, review-1, or review-2
+- **THEN** config resolution SHALL fail with a message that names `review_ensemble` and the
+  conflicting stage_executors assignment(s)
+- **AND** the engine SHALL NOT silently run a single stage executor in place of ensemble fan-out
 
 ---
 

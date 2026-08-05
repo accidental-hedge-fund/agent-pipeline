@@ -36,6 +36,7 @@ import * as path from "node:path";
 import { invoke, formatStderrExcerpt, papercutIdentityEnv, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import {
+  assertNoEnsembleStageExecutorBypass,
   ensembleSelfReviewBanner,
   formatEnsembleIdentityLine,
   invokeReviewEnsemble,
@@ -666,7 +667,10 @@ export async function runPlanningPhases(
     // External stage executor delegation (#314): a `stage_executors` assignment
     // for plan-review bypasses the local reviewer harness (and its #39
     // self-review fallback) entirely — a deliberate operator choice, never
-    // silently degraded.
+    // silently degraded. #645: ensemble + stage_executors.plan-review is
+    // rejected (config-resolve + runtime guard) so we never silently run one
+    // executor instead of multi-agent fan-out.
+    assertNoEnsembleStageExecutorBypass(cfg, "plan-review");
     const planReviewAssignment = resolveStageExecutor(cfg, "plan-review");
     // #645: when ensemble is enabled and no stage_executor override, fan out at
     // the shared reviewer seam. Injected `deps.invokeReviewer` still wins for

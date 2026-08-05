@@ -4,6 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  assertNoEnsembleStageExecutorBypass,
   formatEnsembleIdentityLine,
   invokeReviewEnsemble,
   isEnsembleEnabled,
@@ -142,6 +143,72 @@ test("isEnsembleEnabled: true when enabled", () => {
       }),
     ),
     true,
+  );
+});
+
+test("assertNoEnsembleStageExecutorBypass: allows stage_executor when ensemble disabled", () => {
+  assert.doesNotThrow(() =>
+    assertNoEnsembleStageExecutorBypass(
+      baseCfg({
+        stage_executors: { "plan-review": "local-ollama" },
+      }),
+      "plan-review",
+    ),
+  );
+});
+
+test("assertNoEnsembleStageExecutorBypass: allows ensemble without stage_executor", () => {
+  assert.doesNotThrow(() =>
+    assertNoEnsembleStageExecutorBypass(
+      baseCfg({
+        review_ensemble: {
+          enabled: true,
+          agents: [{ role: "primary" }],
+          min_usable_agents: 1,
+          max_agents: 4,
+        },
+      }),
+      "plan-review",
+    ),
+  );
+});
+
+test("assertNoEnsembleStageExecutorBypass: throws when ensemble + plan-review stage_executor", () => {
+  assert.throws(
+    () =>
+      assertNoEnsembleStageExecutorBypass(
+        baseCfg({
+          review_ensemble: {
+            enabled: true,
+            agents: [{ role: "primary" }],
+            min_usable_agents: 1,
+            max_agents: 4,
+          },
+          stage_executors: { "plan-review": "local-ollama" },
+        }),
+        "plan-review",
+      ),
+    /review_ensemble\.enabled cannot be combined with stage_executors\.plan-review/,
+  );
+});
+
+test("assertNoEnsembleStageExecutorBypass: throws for review-1 and review-2 stage_executors", () => {
+  const cfg = baseCfg({
+    review_ensemble: {
+      enabled: true,
+      agents: [{ role: "primary" }],
+      min_usable_agents: 1,
+      max_agents: 4,
+    },
+    stage_executors: { "review-1": "local-ollama", "review-2": "local-ollama" },
+  });
+  assert.throws(
+    () => assertNoEnsembleStageExecutorBypass(cfg, "review-1"),
+    /stage_executors\.review-1/,
+  );
+  assert.throws(
+    () => assertNoEnsembleStageExecutorBypass(cfg, "review-2"),
+    /stage_executors\.review-2/,
   );
 });
 

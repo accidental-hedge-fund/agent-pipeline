@@ -22,6 +22,7 @@ import {
 import * as path from "node:path";
 import { selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
 import {
+  assertNoEnsembleStageExecutorBypass,
   ensembleSelfReviewBanner,
   formatEnsembleIdentityLine,
   invokeReviewEnsemble,
@@ -1286,6 +1287,9 @@ export async function invokePromptHarnessReview(
   // External stage executor delegation (#314): a `stage_executors` assignment
   // for this round bypasses the local reviewer harness (and its #39 self-review
   // fallback) entirely — a deliberate operator choice never silently degraded.
+  // #645: ensemble + stage_executors for review-1/review-2 is rejected so we
+  // never silently run one executor instead of multi-agent fan-out.
+  assertNoEnsembleStageExecutorBypass(cfg, stageName);
   const assignment = resolveStageExecutor(cfg, stageName);
   if (opts.stateDir) {
     await recordPrompt(
