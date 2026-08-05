@@ -143,6 +143,28 @@ export interface ReviewVerdictEvent extends RunEventBase {
   reviewer_harness?: string;
   reviewer_model?: string;
   self_review?: boolean;
+  /**
+   * Multi-agent ensemble identity when review_ensemble ran for this round
+   * (#645). Additive optional — single-agent rounds omit it. schema_version
+   * is not bumped solely for these fields.
+   */
+  ensemble?: {
+    size: number;
+    usable: number;
+    failed: number;
+    merge: "union_blocking";
+    agents: Array<{
+      role?: "primary";
+      harness: string;
+      effectiveHarness: string;
+      model?: string;
+      selfReview: boolean;
+      status: "usable" | "failed";
+      failureClass?: string;
+      costUsd?: number | null;
+    }>;
+    summary?: string;
+  };
 }
 export interface GateResultEvent extends RunEventBase {
   type: "gate_result";

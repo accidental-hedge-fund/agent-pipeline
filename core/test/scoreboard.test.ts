@@ -1388,6 +1388,7 @@ function htmlFixtureReport(): ScoreboardReport {
       },
     },
     same_harness_fallback_rate: { numerator: 0, denominator: 0, ratio: null },
+    review_ensemble: { ensemble_rounds: 0, ensemble_agent_invocations: 0 },
     gate_pass_rates: {
       test: { pass_rate: { numerator: 4, denominator: 4, ratio: 1 }, passed: 4, failed: 0, skipped: 0 },
       eval: { pass_rate: { numerator: 0, denominator: 0, ratio: null }, passed: 0, failed: 0, skipped: 4 },

@@ -79,7 +79,12 @@ import {
 } from "../review-history.ts";
 import { appendEvent, RUN_SCHEMA_VERSION } from "../run-store.ts";
 import type { RunStoreDeps } from "../run-store.ts";
-import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
+import { selfReviewBanner } from "../self-review.ts";
+import {
+  ensembleSelfReviewBanner,
+  formatEnsembleIdentityLine,
+  invokeReviewEnsemble,
+} from "../review-ensemble.ts";
 import { buildDeltaReviewPrompt } from "../prompts/index.ts";
 import { openspecContextFromDiff } from "../openspec.ts";
 import { reviewerModelSourceWasAuto } from "../stage-routing.ts";
@@ -271,6 +276,8 @@ export interface DeltaReviewResult {
   effectiveReviewer?: string;
   /** True when the implementing harness reviewed its own work (same-harness fallback). */
   selfReview?: boolean;
+  /** Ensemble meta when review_ensemble ran for this delta review (#645). */
+  ensemble?: import("../review-ensemble.ts").EnsembleMeta;
 }
 
 /**
@@ -1259,12 +1266,16 @@ export async function enforceReviewShaGate(
 
       // Apply same-harness self-review disclosure (Finding 4): when invokeReviewer
       // falls back to the implementer, the delta comment must carry the same
-      // selfReviewBanner and (self-review) label used by advanceReview.
+      // selfReviewBanner and (self-review) label used by advanceReview. Ensemble
+      // identity (#645) is also disclosed when multi-agent review ran.
       const deltaEffectiveReviewer = deltaResult.effectiveReviewer ?? cfg.harnesses.reviewer;
       const deltaIsSelfReview = deltaResult.selfReview ?? false;
-      const deltaReviewerLabel = deltaIsSelfReview
-        ? `${deltaEffectiveReviewer} (self-review)`
-        : deltaEffectiveReviewer;
+      const deltaEnsemble = deltaResult.ensemble;
+      const deltaReviewerLabel = deltaEnsemble
+        ? `ensemble(${deltaEnsemble.usable}/${deltaEnsemble.size})`
+        : deltaIsSelfReview
+          ? `${deltaEffectiveReviewer} (self-review)`
+          : deltaEffectiveReviewer;
       const deltaCommentBody = formatDeltaReviewComment(
         cfg,
         deltaCommentVerdict,
@@ -1279,12 +1290,23 @@ export async function enforceReviewShaGate(
       );
       // Place the banner AFTER the heading so isDeltaReviewComment (startsWith check)
       // still recognizes the comment on the next pre-merge re-entry (#228 Finding 5).
-      const deltaComment = deltaIsSelfReview
+      const deltaBanners: string[] = [];
+      if (deltaEnsemble) {
+        deltaBanners.push(formatEnsembleIdentityLine(deltaEnsemble));
+        if (deltaIsSelfReview) {
+          const b = ensembleSelfReviewBanner(deltaEnsemble.agents);
+          if (b) deltaBanners.push(b);
+        }
+      } else if (deltaIsSelfReview) {
+        deltaBanners.push(selfReviewBanner(cfg.harnesses.reviewer, deltaEffectiveReviewer));
+      }
+      const deltaComment = deltaBanners.length
         ? (() => {
             const nl = deltaCommentBody.indexOf("\n");
+            const block = deltaBanners.join("\n\n");
             return nl >= 0
-              ? `${deltaCommentBody.slice(0, nl)}\n\n${selfReviewBanner(cfg.harnesses.reviewer, deltaEffectiveReviewer)}${deltaCommentBody.slice(nl)}`
-              : `${deltaCommentBody}\n\n${selfReviewBanner(cfg.harnesses.reviewer, deltaEffectiveReviewer)}`;
+              ? `${deltaCommentBody.slice(0, nl)}\n\n${block}${deltaCommentBody.slice(nl)}`
+              : `${deltaCommentBody}\n\n${block}`;
           })()
         : deltaCommentBody;
       await postCommentFn(cfg, issueNumber, deltaComment);
@@ -2066,20 +2088,22 @@ async function defaultRunDeltaReview(
     headFiles: accounting?.headFiles,
   });
   // Not yet guarded against the effective reviewer command — invokeReviewer
-  // applies resolveReviewerModelForHarness itself, per attempted harness, so a
-  // same-harness fallback (#39) is guarded against the harness it actually
-  // targets rather than the nominal `cfg.harnesses.reviewer` (#441 finding c0acb169).
+  // (via the ensemble seam) applies resolveReviewerModelForHarness itself, per
+  // attempted harness, so a same-harness fallback (#39) is guarded against the
+  // harness it actually targets rather than the nominal `cfg.harnesses.reviewer`
+  // (#441 finding c0acb169). Ensemble (#645) inherits when enabled.
   const rawModel = cfg.harnesses.reviewerModel ?? cfg.models.review;
   const modelWasAuto = reviewerModelSourceWasAuto(cfg, undefined);
-  const invocation = await invokeReviewer(
-    cfg.harnesses.reviewer,
-    cfg.harnesses.implementer,
-    worktreePath,
+  const invocation = await invokeReviewEnsemble(cfg, {
+    worktreeDir: worktreePath,
     prompt,
-    {
-      timeoutSec: cfg.review_timeout,
-      model: rawModel,
-      modelWasAuto,
+    implementer: cfg.harnesses.implementer,
+    kind: "structured",
+    timeoutSec: cfg.review_timeout,
+    model: rawModel,
+    modelWasAuto,
+    promptDelivery: cfg.harnesses.reviewerPromptDelivery,
+    invokeOpts: {
       accounting: accounting?.runDir
         ? {
             runDir: accounting.runDir,
@@ -2089,13 +2113,12 @@ async function defaultRunDeltaReview(
             modelSlot: "review",
           }
         : undefined,
-      // #492: opt-in prompt-delivery channel for a custom reviewer CLI.
-      promptDelivery: cfg.harnesses.reviewerPromptDelivery,
     },
-  );
+  });
   if (!invocation.result.success) {
+    const ens = invocation.ensemble?.summary ? ` ${invocation.ensemble.summary}` : "";
     throw new Error(
-      `delta review harness failed: exit ${invocation.result.exit_code}`,
+      `delta review harness failed: exit ${invocation.result.exit_code}.${ens}`,
     );
   }
   const parsed = parseStructuredVerdict(invocation.result.stdout, "");
@@ -2105,6 +2128,7 @@ async function defaultRunDeltaReview(
     summary: parsed.summary,
     effectiveReviewer: invocation.effectiveReviewer,
     selfReview: invocation.selfReview,
+    ensemble: invocation.ensemble,
   };
 }
 

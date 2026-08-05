@@ -20,7 +20,14 @@ import {
   findUnacknowledgedComments,
 } from "../issue-context-snapshot.ts";
 import * as path from "node:path";
-import { invokeReviewer, selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
+import { selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
+import {
+  ensembleSelfReviewBanner,
+  formatEnsembleIdentityLine,
+  invokeReviewEnsemble,
+  type EnsembleInvocation,
+  type EnsembleMeta,
+} from "../review-ensemble.ts";
 import { formatStderrExcerpt, papercutIdentityEnv } from "../harness.ts";
 import { expandAutoEffort, resolveReviewerModelForHarness, reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
@@ -521,6 +528,9 @@ export async function advanceReview(
   let result = invocation.result;
   reviewer = invocation.effectiveReviewer;
   let selfReview = invocation.selfReview;
+  // Ensemble meta when review_ensemble ran (#645); undefined on single-agent path.
+  let ensembleMeta: EnsembleMeta | undefined =
+    (invocation as EnsembleInvocation).ensemble;
 
   if (!result.success) {
     const reason = result.timed_out
@@ -596,6 +606,7 @@ export async function advanceReview(
         result = repairInvocation.result;
         reviewer = repairInvocation.effectiveReviewer;
         selfReview = repairInvocation.selfReview;
+        ensembleMeta = (repairInvocation as EnsembleInvocation).ensemble;
         return { success: true, output: repairInvocation.result.stdout };
       },
     });
@@ -637,13 +648,49 @@ export async function advanceReview(
   }
 
   const reviewComment = (text: string) => {
-    if (!selfReview) return text;
+    const banners: string[] = [];
+    if (ensembleMeta) {
+      banners.push(formatEnsembleIdentityLine(ensembleMeta));
+      if (selfReview) {
+        const ensBanner = ensembleSelfReviewBanner(ensembleMeta.agents);
+        if (ensBanner) banners.push(ensBanner);
+      }
+    } else if (selfReview) {
+      banners.push(selfReviewBanner(configuredReviewer, reviewer));
+    }
+    if (banners.length === 0) return text;
+    const bannerBlock = banners.join("\n\n");
     const nl = text.indexOf("\n");
     return nl >= 0
-      ? `${text.slice(0, nl)}\n\n${selfReviewBanner(configuredReviewer, reviewer)}${text.slice(nl)}`
-      : `${text}\n\n${selfReviewBanner(configuredReviewer, reviewer)}`;
+      ? `${text.slice(0, nl)}\n\n${bannerBlock}${text.slice(nl)}`
+      : `${text}\n\n${bannerBlock}`;
   };
-  const reviewerLabel = selfReview ? `${reviewer} (self-review)` : reviewer;
+  const reviewerLabel = ensembleMeta
+    ? `ensemble(${ensembleMeta.usable}/${ensembleMeta.size})`
+    : selfReview
+      ? `${reviewer} (self-review)`
+      : reviewer;
+  const ensembleEvidence = ensembleMeta
+    ? {
+        ensemble: {
+          size: ensembleMeta.size,
+          usable: ensembleMeta.usable,
+          failed: ensembleMeta.failed,
+          merge: ensembleMeta.merge,
+          agents: ensembleMeta.agents.map((a) => ({
+            role: a.role,
+            harness: a.harness,
+            effectiveHarness: a.effectiveHarness,
+            model: a.model,
+            selfReview: a.selfReview,
+            status: a.status,
+            failureClass: a.failureClass,
+            costUsd: a.costUsd,
+          })),
+          summary: ensembleMeta.summary,
+        },
+      }
+    : {};
 
   // Local (non-delegated) path keeps parseStructuredVerdict product tolerances;
   // review.verdict@1 is the pure schema gate used for delegated repair + fixtures.
@@ -719,6 +766,7 @@ export async function advanceReview(
         round, sha: commitSha, verdict: verdict.verdict, findingCounts,
         findings: findingRecords, harness: reviewer, model: reviewerModel, selfReview,
         ...executorEvidence,
+        ...ensembleEvidence,
       }).catch(() => {});
     }
     if (opts.runDir) {
@@ -728,6 +776,7 @@ export async function advanceReview(
         round, sha: commitSha, verdict: verdict.verdict, finding_counts: findingCounts,
         findings: findingRecords, reviewer_harness: reviewer,
         reviewer_model: reviewerModel, self_review: selfReview,
+        ...ensembleEvidence,
       }, opts.runStoreDeps).catch(() => {});
     }
     // #499 repair detection: an approve verdict still needs to check the
@@ -762,6 +811,7 @@ export async function advanceReview(
         round, sha: commitSha, verdict: verdict.verdict, findingCounts,
         findings: findingRecords, harness: reviewer, model: reviewerModel, selfReview,
         ...executorEvidence,
+        ...ensembleEvidence,
       }).catch(() => {});
     }
     if (opts.runDir) {
@@ -771,6 +821,7 @@ export async function advanceReview(
         round, sha: commitSha, verdict: verdict.verdict, finding_counts: findingCounts,
         findings: findingRecords, reviewer_harness: reviewer,
         reviewer_model: reviewerModel, self_review: selfReview,
+        ...ensembleEvidence,
       }, opts.runStoreDeps).catch(() => {});
     }
     const raw = result.stdout.slice(0, 4000).trim() || "(no reviewer output captured)";
@@ -842,6 +893,7 @@ export async function advanceReview(
       round, sha: commitSha, verdict: verdict.verdict, findingCounts,
       findings: findingRecords, harness: reviewer, model: reviewerModel, selfReview,
       ...executorEvidence,
+      ...ensembleEvidence,
     }).catch(() => {});
   }
   if (opts.runDir) {
@@ -851,6 +903,7 @@ export async function advanceReview(
       round, sha: commitSha, verdict: verdict.verdict, finding_counts: findingCounts,
       findings: findingRecords, reviewer_harness: reviewer,
       reviewer_model: reviewerModel, self_review: selfReview,
+      ...ensembleEvidence,
     }, opts.runStoreDeps).catch(() => {});
   }
   const blockingKeysSet = new Set(partition.blocking.map((f) => findingKey(f)));
@@ -1274,32 +1327,36 @@ export async function invokePromptHarnessReview(
     round === 1 ? "review-1" : "review-2",
     "claude",
   );
-  return invokeReviewer(cfg.harnesses.reviewer, cfg.harnesses.implementer, cwd, prompt, {
+  // #645: shared ensemble seam — no-ops to single invokeReviewer when ensemble
+  // is disabled/absent; fans out and union-merges when enabled.
+  return invokeReviewEnsemble(cfg, {
+    worktreeDir: cwd,
+    prompt,
+    implementer: cfg.harnesses.implementer,
+    kind: "structured",
     timeoutSec: cfg.review_timeout,
     model: rawModel,
     modelWasAuto,
     reasoningEffort,
-    accounting: opts.runDir
-      ? {
-          runDir: opts.runDir,
-          runStoreDeps: opts.runStoreDeps,
-          issue: issueNumber,
-          stage: `review-${round}`,
-          modelSlot: "review",
-        }
-      : undefined,
-    env: papercutIdentityEnv(cfg, {
-      runId: opts.runDir ? path.basename(opts.runDir) : null,
-      issue: issueNumber,
-      stage: `review-${round}`,
-      harness: cfg.harnesses.reviewer,
-      model: rawModel ?? null,
-    }),
-    // #492: opt-in prompt-delivery channel for a custom reviewer CLI
-    // (review_harness.prompt_delivery). Ignored by invoke() for the
-    // implementer's own registered adapter on a same-harness fallback (#39) —
-    // that adapter declares its own channel.
     promptDelivery: cfg.harnesses.reviewerPromptDelivery,
+    invokeOpts: {
+      accounting: opts.runDir
+        ? {
+            runDir: opts.runDir,
+            runStoreDeps: opts.runStoreDeps,
+            issue: issueNumber,
+            stage: `review-${round}`,
+            modelSlot: "review",
+          }
+        : undefined,
+      env: papercutIdentityEnv(cfg, {
+        runId: opts.runDir ? path.basename(opts.runDir) : null,
+        issue: issueNumber,
+        stage: `review-${round}`,
+        harness: cfg.harnesses.reviewer,
+        model: rawModel ?? null,
+      }),
+    },
   });
 }
 

@@ -270,6 +270,16 @@ export interface ScoreboardMetrics {
   /** Pre-merge needs-human rate + by-class breakdown (#683). Additive. */
   pre_merge_needs_human: PreMergeNeedsHumanMetric;
   same_harness_fallback_rate: RateValue;
+  /**
+   * Review ensemble coverage (#645). Additive optional-style counters:
+   * ensemble_rounds counts review rounds that recorded multi-agent ensemble
+   * data; ensemble_agent_invocations sums configured agent slots across those
+   * rounds. Single-agent runs leave both at 0.
+   */
+  review_ensemble: {
+    ensemble_rounds: number;
+    ensemble_agent_invocations: number;
+  };
   gate_pass_rates: {
     test: GatePassMetric;
     eval: GatePassMetric;
@@ -1378,6 +1388,8 @@ function reduceRunsCore(
   let needsHuman = 0;
   let reviewRounds = 0;
   let sameHarnessFallbacks = 0;
+  let ensembleRounds = 0;
+  let ensembleAgentInvocations = 0;
   let preMergeEntries = 0;
   let preMergeNeedsHumanCount = 0;
   const preMergeClassCounts = zeroPreMergeOfframpClassCounts();
@@ -1418,7 +1430,13 @@ function reduceRunsCore(
 
     for (const review of collectReviewRecords(run)) {
       reviewRounds++;
-      if (review.selfReview) sameHarnessFallbacks++;
+      // #645: when ensemble agents are present, count self-review per agent so
+      // one independent agent does not mask a same-harness fallback on another.
+      sameHarnessFallbacks += review.selfReviewCount;
+      if (review.ensembleSize !== undefined && review.ensembleSize > 1) {
+        ensembleRounds++;
+        ensembleAgentInvocations += review.ensembleSize;
+      }
     }
 
     for (const result of collectGateResults(run)) {
@@ -1544,6 +1562,10 @@ function reduceRunsCore(
       by_class: preMergeByClass,
     },
     same_harness_fallback_rate: rate(sameHarnessFallbacks, reviewRounds),
+    review_ensemble: {
+      ensemble_rounds: ensembleRounds,
+      ensemble_agent_invocations: ensembleAgentInvocations,
+    },
     gate_pass_rates: {
       test: gateMetric(gateCounts.test),
       eval: gateMetric(gateCounts.eval),
@@ -2053,18 +2075,73 @@ function collectOverrides(run: IncludedRun): JsonRecord[] {
   return arrayRecords(run.summary?.["overrides"]);
 }
 
-function collectReviewRecords(run: IncludedRun): Array<{ selfReview: boolean }> {
-  const reviews = new Map<string, { selfReview: boolean }>();
+function collectReviewRecords(run: IncludedRun): Array<{
+  selfReview: boolean;
+  /** Self-review count when ensemble agents are present (#645); else 0/1. */
+  selfReviewCount: number;
+  ensembleSize?: number;
+}> {
+  const reviews = new Map<
+    string,
+    { selfReview: boolean; selfReviewCount: number; ensembleSize?: number }
+  >();
+  const absorb = (
+    key: string,
+    selfReview: boolean,
+    selfReviewCount: number,
+    ensembleSize?: number,
+  ) => {
+    const prev = reviews.get(key);
+    if (!prev) {
+      reviews.set(key, { selfReview, selfReviewCount, ensembleSize });
+      return;
+    }
+    reviews.set(key, {
+      selfReview: prev.selfReview || selfReview,
+      selfReviewCount: Math.max(prev.selfReviewCount, selfReviewCount),
+      ensembleSize: ensembleSize ?? prev.ensembleSize,
+    });
+  };
   for (const item of arrayRecords(run.summary?.["reviews"])) {
     const key = reviewKey(item);
-    const selfReview = item["selfReview"] === true || item["self_review"] === true;
-    reviews.set(key, { selfReview: (reviews.get(key)?.selfReview ?? false) || selfReview });
+    const ensemble = item["ensemble"];
+    const agents = ensemble && typeof ensemble === "object"
+      ? arrayRecords((ensemble as JsonRecord)["agents"])
+      : [];
+    if (agents.length > 0) {
+      const selfReviewCount = agents.filter(
+        (a) => a["selfReview"] === true || a["self_review"] === true,
+      ).length;
+      const size =
+        typeof (ensemble as JsonRecord)["size"] === "number"
+          ? ((ensemble as JsonRecord)["size"] as number)
+          : agents.length;
+      absorb(key, selfReviewCount > 0, selfReviewCount, size);
+    } else {
+      const selfReview = item["selfReview"] === true || item["self_review"] === true;
+      absorb(key, selfReview, selfReview ? 1 : 0);
+    }
   }
   for (const event of run.events) {
     if (event["type"] !== "review_verdict") continue;
     const key = reviewKey(event);
-    const selfReview = event["self_review"] === true || event["selfReview"] === true;
-    reviews.set(key, { selfReview: (reviews.get(key)?.selfReview ?? false) || selfReview });
+    const ensemble = event["ensemble"];
+    const agents = ensemble && typeof ensemble === "object"
+      ? arrayRecords((ensemble as JsonRecord)["agents"])
+      : [];
+    if (agents.length > 0) {
+      const selfReviewCount = agents.filter(
+        (a) => a["selfReview"] === true || a["self_review"] === true,
+      ).length;
+      const size =
+        typeof (ensemble as JsonRecord)["size"] === "number"
+          ? ((ensemble as JsonRecord)["size"] as number)
+          : agents.length;
+      absorb(key, selfReviewCount > 0, selfReviewCount, size);
+    } else {
+      const selfReview = event["self_review"] === true || event["selfReview"] === true;
+      absorb(key, selfReview, selfReview ? 1 : 0);
+    }
   }
   return [...reviews.values()];
 }
@@ -2101,6 +2178,38 @@ function collectHarnessCalls(run: IncludedRun): HarnessCall[] {
       type === "review_verdict" &&
       stringField(event, "reviewer_harness") !== null &&
       actualCostUsd(event) !== null;
+    // #645: per-agent ensemble costs on review_verdict.ensemble.agents[] — each
+    // agent with a known cost counts as its own harness call so non-primary
+    // costs are not dropped.
+    if (type === "review_verdict") {
+      const ensemble = event["ensemble"];
+      const agents =
+        ensemble && typeof ensemble === "object"
+          ? arrayRecords((ensemble as JsonRecord)["agents"])
+          : [];
+      if (agents.length > 0) {
+        for (const [ai, agent] of agents.entries()) {
+          const cost = actualCostUsd(agent);
+          if (cost === null) continue;
+          addHarnessCall(
+            calls,
+            `event:${index}:ensemble-agent:${ai}:${stringField(agent, "harness") ?? stringField(agent, "effectiveHarness") ?? ""}`,
+            {
+              ...agent,
+              harness:
+                stringField(agent, "effectiveHarness") ??
+                stringField(agent, "harness") ??
+                "",
+              total_cost_usd: cost,
+            },
+            run.eventsPath,
+          );
+        }
+        // Agents covered per-agent costs; still skip the aggregate event unless
+        // it has a top-level cost without ensemble agent costs (legacy).
+        if (!hasHarnessCallType) continue;
+      }
+    }
     if (!hasHarnessCallType && !hasCostedReviewerEvent) continue;
     addHarnessCall(
       calls,

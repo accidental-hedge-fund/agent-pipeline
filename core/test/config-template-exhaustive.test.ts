@@ -150,6 +150,17 @@ test("defaults-parity: design_gate commented defaults match DEFAULT_CONFIG.desig
   assert.match(template, new RegExp(`#\\s*max_artifact_bytes: ${d.limits.max_artifact_bytes} #`));
 });
 
+test("defaults-parity: review_ensemble commented defaults match DEFAULT_CONFIG.review_ensemble", () => {
+  const template = buildConfigTemplate();
+  const d = DEFAULT_CONFIG.review_ensemble;
+  assert.match(template, /# review_ensemble:/);
+  assert.match(template, new RegExp(`#\\s*enabled: ${d.enabled} #`));
+  assert.match(template, new RegExp(`#\\s*min_usable_agents: ${d.min_usable_agents} #`));
+  assert.match(template, new RegExp(`#\\s*max_agents: ${d.max_agents} #`));
+  assert.match(template, /role: primary/);
+  assert.match(template, /merge: union_blocking/);
+});
+
 test("defaults-parity: auto_merge_eligibility commented defaults match DEFAULT_CONFIG.auto_merge_eligibility", () => {
   const template = buildConfigTemplate();
   const d = DEFAULT_CONFIG.auto_merge_eligibility;
@@ -299,6 +310,7 @@ const ADDED_KEYS = [
   "domain_description",
   "conventions_md_path",
   "design_gate",
+  "review_ensemble",
   "roadmap",
   "sweep",
   "queue",

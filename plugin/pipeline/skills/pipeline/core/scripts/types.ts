@@ -588,6 +588,27 @@ export interface DesignGateState {
 
 export type OpenspecMode = "auto" | "on" | "off";
 
+/**
+ * One ensemble agent entry (#645). Either `role: "primary"` (resolves to the
+ * configured reviewer) or an explicit `harness` string (built-in or custom CLI).
+ * Optional model/effort override that agent only.
+ */
+export type ReviewEnsembleAgent =
+  | { role: "primary"; harness?: undefined; model?: string; effort?: string }
+  | { role?: undefined; harness: string; model?: string; effort?: string };
+
+/** Resolved review_ensemble block on PipelineConfig (#645). */
+export interface ReviewEnsembleConfig {
+  enabled: boolean;
+  agents: ReviewEnsembleAgent[];
+  /** Soft-fail threshold; fail closed when usable agents < this. Default 1. */
+  min_usable_agents: number;
+  /** Hard upper bound on agent count. Default 4. */
+  max_agents: number;
+  /** Optional per-agent timeout override (seconds); else review/plan_review timeouts. */
+  agent_timeout_sec?: number;
+}
+
 export interface PipelineConfig {
   profile_name: string;
   invocation: string;
@@ -718,6 +739,15 @@ export interface PipelineConfig {
       max_artifact_bytes: number;
     };
   };
+  /**
+   * Opt-in parallel multi-agent review ensemble (#645). Default-off so existing
+   * repos see no latency/cost change. When enabled, plan-review / review-1 /
+   * review-2 (and SHA-gate re-review via the shared `invokeReviewer` seam) fan
+   * out to N read-only agents, union-merge findings by `findingKey`, and post
+   * one disposition. v1 merge mode is fixed to union-blocking (no majority-vote
+   * approve).
+   */
+  review_ensemble: ReviewEnsembleConfig;
   // Test/build gate (#15). When enabled, the target repo's own test/build
   // command runs in the worktree during implementation and after each fix
   // round; on failure a bounded generate→test→fix loop runs before a PR is
@@ -1079,6 +1109,13 @@ export const DEFAULT_CONFIG: Omit<
     block_on_partial: false,
   },
   review_policy: { block_threshold: "medium" as const, min_confidence: 0.7, max_adversarial_rounds: 3, risk_proportional: false, ceiling_action: "park" as const, surface_recurrence_rounds: 3, max_delta_rounds: 4 },
+  // Review ensemble (#645): default off — zero cost/latency change for existing repos.
+  review_ensemble: {
+    enabled: false,
+    agents: [] as ReviewEnsembleAgent[],
+    min_usable_agents: 1,
+    max_agents: 4,
+  },
   doctor: { runOnStart: false, failFast: false },
   papercuts: {
     enabled: false,
@@ -1367,9 +1404,33 @@ export interface ReviewFindingRecord {
   payload_fingerprint_ambiguous?: boolean;
 }
 
+/** One ensemble agent identity persisted on a review round (#645). Additive. */
+export interface ReviewEnsembleAgentRecord {
+  role?: "primary";
+  harness: string;
+  effectiveHarness: string;
+  model?: string;
+  selfReview: boolean;
+  status: "usable" | "failed";
+  failureClass?: string;
+  costUsd?: number | null;
+}
+
+/** Ensemble summary on a review round (#645). Additive optional. */
+export interface ReviewEnsembleRecord {
+  size: number;
+  usable: number;
+  failed: number;
+  merge: "union_blocking";
+  agents: ReviewEnsembleAgentRecord[];
+  summary?: string;
+}
+
 /** Summary of one review round's verdict. `findingCounts` maps severity → count.
  *  `findings`, `harness`, `model`, and `selfReview` are additive optional fields
- *  (#209) — present on new records, absent on records written before #209. */
+ *  (#209) — present on new records, absent on records written before #209.
+ *  `ensemble` (#645) is additive optional multi-agent identity when review
+ *  ensemble ran for the round. */
 export interface ReviewRecord {
   round: number;
   sha: string;
@@ -1386,6 +1447,8 @@ export interface ReviewRecord {
    *  for a round that ran on the local reviewer harness. */
   executorProvider?: string;
   executorModel?: string;
+  /** Multi-agent ensemble identity when review_ensemble ran (#645). */
+  ensemble?: ReviewEnsembleRecord;
 }
 
 export type StageAccountingCostSource = "actual" | "estimated" | "unknown";

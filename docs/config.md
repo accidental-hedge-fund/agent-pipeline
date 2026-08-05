@@ -659,6 +659,44 @@ Nested fields:
 - **Type:** array of string
 - **Description:** Repos this repo consumes (owner/repo strings). The planning stage fetches open issues from these repos as supplemental context.
 
+### `review_ensemble`
+
+- **Type:** object
+- **Default:** `{"enabled":false,"agents":[],"min_usable_agents":1,"max_agents":4}`
+- **Description:** Opt-in parallel multi-agent review ensemble (#645). Default off — no latency/cost change when absent or disabled.
+
+Nested fields:
+
+#### `review_ensemble.agent_timeout_sec`
+
+- **Type:** integer
+- **Description:** Optional per-agent timeout in seconds; when absent, review_timeout / plan_review_timeout apply.
+
+#### `review_ensemble.agents`
+
+- **Type:** array of object
+- **Description:** Ordered ensemble agents. Use { role: "primary" } for the configured reviewer and { harness: "<cli>" } for additional cross-checks.
+
+#### `review_ensemble.enabled`
+
+- **Type:** boolean
+- **Description:** Enable parallel multi-agent review ensemble at the shared reviewer seam (default false).
+
+#### `review_ensemble.max_agents`
+
+- **Type:** integer
+- **Description:** Hard upper bound on ensemble agent count (default 4).
+
+#### `review_ensemble.merge`
+
+- **Type:** string
+- **Description:** Merge mode. v1 supports only "union_blocking" (union findings, rigor-first blocking). Majority-vote approve is not available.
+
+#### `review_ensemble.min_usable_agents`
+
+- **Type:** integer
+- **Description:** Minimum usable agents required to soft-fail and merge; below this the stage fails closed (default 1).
+
 ### `review_harness`
 
 - **Type:** string | object

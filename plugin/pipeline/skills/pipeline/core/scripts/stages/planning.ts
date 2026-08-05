@@ -35,6 +35,12 @@ import {
 import * as path from "node:path";
 import { invoke, formatStderrExcerpt, papercutIdentityEnv, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
+import {
+  ensembleSelfReviewBanner,
+  formatEnsembleIdentityLine,
+  invokeReviewEnsemble,
+  type EnsembleInvocation,
+} from "../review-ensemble.ts";
 import { expandAutoEffort, resolveReviewerModelForHarness, reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import {
@@ -542,7 +548,7 @@ export async function runPlanningPhases(
   const doTransition = deps.transition ?? transition;
   const doPostComment = deps.postComment ?? postComment;
   const doAddLabel = deps.addLabel ?? addLabel;
-  const doInvokeReviewer = deps.invokeReviewer ?? invokeReviewer;
+  // Per-agent invoke for ensemble / single-agent plan-review (#645).
   const doHasCommitsAhead = deps.hasCommitsAhead ?? hasCommitsAhead;
   const doGitInWorktree = deps.gitInWorktree ?? gitInWorktree;
   const doTrySalvage = deps.trySalvageUncommittedWork ?? trySalvageUncommittedWork;
@@ -662,6 +668,26 @@ export async function runPlanningPhases(
     // self-review fallback) entirely — a deliberate operator choice, never
     // silently degraded.
     const planReviewAssignment = resolveStageExecutor(cfg, "plan-review");
+    // #645: when ensemble is enabled and no stage_executor override, fan out at
+    // the shared reviewer seam. Injected `deps.invokeReviewer` still wins for
+    // unit tests of the single-agent path; ensemble uses invokeReviewEnsemble
+    // with that inject as the per-agent invokeReviewerFn when provided.
+    const planEnsembleInvocation: EnsembleInvocation | null = planReviewAssignment
+      ? null
+      : await invokeReviewEnsemble(cfg, {
+          worktreeDir: planReviewCwd,
+          prompt: reviewPrompt,
+          implementer: primary,
+          kind: "plan-review",
+          timeoutSec: cfg.plan_review_timeout,
+          model: planReviewModel,
+          reasoningEffort: planReviewEffort,
+          promptDelivery: cfg.harnesses.reviewerPromptDelivery,
+          invokeOpts: {
+            accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", planReviewModel),
+          },
+          invokeReviewerFn: deps.invokeReviewer ?? invokeReviewer,
+        });
     const { result: reviewResult, effectiveReviewer: planReviewer, selfReview: planSelfReview } =
       planReviewAssignment
         ? {
@@ -680,21 +706,18 @@ export async function runPlanningPhases(
             effectiveReviewer: planReviewAssignment.name,
             selfReview: false,
           }
-        : await doInvokeReviewer(reviewer, primary, planReviewCwd, reviewPrompt, {
-            timeoutSec: cfg.plan_review_timeout,
-            model: planReviewModel,
-            reasoningEffort: planReviewEffort,
-            accounting: accountingForInvoke(opts, issueNumber, "plan-review", "review", planReviewModel),
-            promptDelivery: cfg.harnesses.reviewerPromptDelivery,
-          });
+        : planEnsembleInvocation!;
     if (!reviewResult.success || !reviewResult.stdout.trim()) {
       const reason = reviewResult.timed_out
         ? `Plan review timed out after ${reviewResult.duration.toFixed(0)}s`
         : `Plan review failed (exit ${reviewResult.exit_code})`;
       const stderrExcerpt = formatStderrExcerpt(reviewResult.stderr);
+      const ensembleNote = planEnsembleInvocation?.ensemble
+        ? ` Ensemble: ${planEnsembleInvocation.ensemble.summary}`
+        : "";
       const blockMsg = planSelfReview
-        ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}${stderrExcerpt}`
-        : `Plan-review harness (${reviewer}) failed: ${reason}${stderrExcerpt}`;
+        ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}${stderrExcerpt}${ensembleNote}`
+        : `Plan-review harness (${reviewer}) failed: ${reason}${stderrExcerpt}${ensembleNote}`;
       await doSetBlocked(cfg, issueNumber, blockMsg, "plan-review", "harness-failure");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return blockedOutcome(reason, "harness-failure");
@@ -706,8 +729,22 @@ export async function runPlanningPhases(
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return blockedOutcome(reason, "needs-human");
     }
-    const planReviewBanner = planSelfReview ? `${selfReviewBanner(reviewer, planReviewer)}\n\n` : "";
-    await doPostComment(cfg, issueNumber, `## Plan Review\n\n${planReviewBanner}**Reviewer**: ${planReviewer}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`);
+    const ensembleMeta = planEnsembleInvocation?.ensemble;
+    const planReviewBanners: string[] = [];
+    if (ensembleMeta) {
+      planReviewBanners.push(formatEnsembleIdentityLine(ensembleMeta));
+      if (planSelfReview) {
+        const b = ensembleSelfReviewBanner(ensembleMeta.agents);
+        if (b) planReviewBanners.push(b);
+      }
+    } else if (planSelfReview) {
+      planReviewBanners.push(selfReviewBanner(reviewer, planReviewer));
+    }
+    const planReviewBanner = planReviewBanners.length ? `${planReviewBanners.join("\n\n")}\n\n` : "";
+    const reviewerLine = ensembleMeta
+      ? `**Reviewer**: ensemble (${ensembleMeta.usable}/${ensembleMeta.size} usable; effective ${planReviewer})`
+      : `**Reviewer**: ${planReviewer}`;
+    await doPostComment(cfg, issueNumber, `## Plan Review\n\n${planReviewBanner}${reviewerLine}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`);
 
     // #26: re-fetch comments so any human feedback left on the posted plan
     // during the reviewer run flows into the revision alongside the reviewer's.
