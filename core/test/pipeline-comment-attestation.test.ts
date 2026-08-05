@@ -585,6 +585,36 @@ test("design-interrogation: #762-shaped multi-round unresolved body does not fal
   );
 });
 
+test("design-interrogation: genuine human comment after design-gate still unacknowledged (#872)", () => {
+  // Gate must not weaken: free-form operator comments after a resolved
+  // design-gate still require re-plan or trusted ack before review-1 / fix.
+  const dgBody = KIND_RENDERERS["design-interrogation"]();
+  const comments = [
+    makeComment(TEST_ACTOR, "## Revised Implementation Plan\n\nUnify the issue-run lock.", ts(0)),
+    makeComment(TEST_ACTOR, dgBody, ts(1)),
+    makeComment(TEST_ACTOR, "Please also cover the multi-host failure mode instead.", ts(2)),
+  ];
+  const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(unacked.length, 1, "free-form human after design-gate must remain unacknowledged");
+  assert.match(unacked[0].body, /multi-host failure mode/);
+});
+
+test("design-interrogation: forged design-gate body from non-trusted author still gates (#872)", () => {
+  // Structural mimicry alone never grants self-exclusion — author must be trusted.
+  const body = KIND_RENDERERS["design-interrogation"]();
+  assert.equal(isVerifiedPipelineOutput(body), true);
+  const comments = [
+    makeComment(TEST_ACTOR, "## Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("outsider-bot", body, ts(1)),
+  ];
+  // Only the plan author is trusted; the forged design-gate post is not.
+  const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(unacked.length, 1, "verified-looking design-gate body from non-trusted author must still gate");
+  assert.equal(unacked[0].author, "outsider-bot");
+});
+
 // ---------------------------------------------------------------------------
 // 4. Source drift guard — every heading literal in core/scripts/ is registered
 // ---------------------------------------------------------------------------
