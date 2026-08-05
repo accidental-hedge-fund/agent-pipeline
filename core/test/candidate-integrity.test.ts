@@ -25,11 +25,14 @@ import {
   OUT_OF_SCOPE_MUTATION_SITES,
   pathInScope,
   persistMutationRecord,
+  readinessBlockedByIntegrityInvalidation,
   renameInScope,
+  reviewBlockedByIntegrityInvalidation,
   runCandidateMovingMutation,
   type AuthoritativeRefs,
   type CandidateIntegrityManifest,
   type CanonicalPatchRecord,
+  type IntegrityInvalidationRecord,
   type IntegritySubject,
   type ManifestCaptureDeps,
   type MutationRecord,
@@ -957,4 +960,159 @@ test("gate blocks from mutation-record disposition when JSONL index is absent", 
   assert.equal(readiness?.classification, "scope_expansion");
   const review = await integrityBlocksReviewReuse("/run", HEAD_2, HEAD_1, deps);
   assert.ok(review, "mutation-record disposition must block review reuse without JSONL");
+});
+
+// ---------------------------------------------------------------------------
+// Review 2 regression: invalidation is not a permanent ban on post-mutation head
+// ---------------------------------------------------------------------------
+
+function invRecord(
+  partial: Partial<IntegrityInvalidationRecord> &
+    Pick<IntegrityInvalidationRecord, "from_sha" | "to_sha" | "classification">,
+): IntegrityInvalidationRecord {
+  return {
+    mutation_id: partial.mutation_id ?? "mut-inv",
+    invalidated_review: partial.invalidated_review ?? true,
+    invalidated_readiness: partial.invalidated_readiness ?? true,
+    requires_fresh_review: partial.requires_fresh_review ?? true,
+    reason: partial.reason ?? `${partial.classification}: test`,
+    mutation_method: partial.mutation_method ?? "pre_merge_autofix",
+    at: partial.at ?? "2026-08-05T12:00:00.000Z",
+    ...partial,
+  };
+}
+
+test("invalidation blocks stale A-bound evidence but allows fresh B-bound review (expected_scoped_change)", () => {
+  const records = [
+    invRecord({
+      from_sha: HEAD_1,
+      to_sha: HEAD_2,
+      classification: "expected_scoped_change",
+      mutation_method: "pre_merge_autofix",
+      reason: "expected_scoped_change: fresh review required at new SHA",
+    }),
+  ];
+  // Pre-mutation approve at A must not authorize head B
+  assert.ok(reviewBlockedByIntegrityInvalidation(records, HEAD_2, HEAD_1));
+  assert.ok(readinessBlockedByIntegrityInvalidation(records, HEAD_2, HEAD_1));
+  assert.ok(
+    readinessBlockedByIntegrityInvalidation(records, HEAD_2),
+    "without B-bound review, readiness remains blocked",
+  );
+  // After reviewer approves B, invalidation no longer rejects B-bound evidence
+  assert.equal(reviewBlockedByIntegrityInvalidation(records, HEAD_2, HEAD_2), null);
+  assert.equal(readinessBlockedByIntegrityInvalidation(records, HEAD_2, HEAD_2), null);
+});
+
+test("invalidation blocks stale A-bound evidence but allows fresh B-bound review (scope_expansion)", () => {
+  const records = [
+    invRecord({
+      from_sha: HEAD_1,
+      to_sha: HEAD_2,
+      classification: "scope_expansion",
+      mutation_method: "restack",
+      reason: "scope_expansion: undeclared path evil.md",
+    }),
+  ];
+  assert.ok(reviewBlockedByIntegrityInvalidation(records, HEAD_2, HEAD_1));
+  assert.ok(readinessBlockedByIntegrityInvalidation(records, HEAD_2, HEAD_1));
+  // Scoped review of expansion head B + B-bound gates may proceed
+  assert.equal(reviewBlockedByIntegrityInvalidation(records, HEAD_2, HEAD_2), null);
+  assert.equal(readinessBlockedByIntegrityInvalidation(records, HEAD_2, HEAD_2), null);
+});
+
+test("lifecycle: expected_scoped_change then B-bound review clears integrity readiness block", async () => {
+  const deps = memoryIntegrityStoreDeps();
+  let phase = 0;
+  const result = await runCandidateMovingMutation({
+    storeRoot: "/run",
+    subject: SUBJECT,
+    mutation_method: "pre_merge_autofix",
+    declared_scope: declaredScopeFromFindingPaths(["core/x.ts"]),
+    storeDeps: deps,
+    preRefs: { base_ref: "main", base_sha: BASE_A, candidate_sha: HEAD_1 },
+    captureManifest: async (refs) => {
+      phase++;
+      const blob = phase === 1 ? BLOB_CORE : BLOB_CORE2;
+      return manifest(refs.candidate_sha, refs.base_sha, [
+        entry({
+          path: "core/x.ts",
+          status: "M",
+          base_blob: "0".repeat(40),
+          candidate_blob: blob,
+        }),
+      ]);
+    },
+    reReadAuthoritative: async () => ({
+      base_ref: "main",
+      base_sha: BASE_A,
+      candidate_sha: HEAD_2,
+    }),
+    mutate: async () => ({ fixed: true }),
+  });
+  assert.equal(result.classification, "expected_scoped_change");
+  // Stale A review still blocked
+  assert.ok(await integrityBlocksReviewReuse("/run", HEAD_2, HEAD_1, deps));
+  assert.ok(await integrityBlocksReadiness("/run", HEAD_2, deps, HEAD_1));
+  // Fresh B review supersedes; historical invalidation retained in store
+  assert.equal(await integrityBlocksReviewReuse("/run", HEAD_2, HEAD_2, deps), null);
+  assert.equal(await integrityBlocksReadiness("/run", HEAD_2, deps, HEAD_2), null);
+  const retained = await loadInvalidationRecords("/run", deps);
+  assert.ok(retained.length >= 1, "historical invalidation remains durable");
+  assert.equal(retained[0]!.to_sha, HEAD_2);
+});
+
+test("lifecycle: scope_expansion then B-bound review clears integrity readiness block", async () => {
+  const deps = memoryIntegrityStoreDeps();
+  const result = await runCandidateMovingMutation({
+    storeRoot: "/run",
+    subject: SUBJECT,
+    mutation_method: "restack",
+    storeDeps: deps,
+    preRefs: { base_ref: "main", base_sha: BASE_A, candidate_sha: HEAD_1 },
+    captureManifest: async (refs, phase) => {
+      if (phase === "pre") {
+        return manifest(refs.candidate_sha, refs.base_sha, [
+          entry({ path: "a.ts", status: "A", candidate_blob: BLOB_CORE }),
+        ]);
+      }
+      return manifest(refs.candidate_sha, refs.base_sha, [
+        entry({ path: "a.ts", status: "A", candidate_blob: BLOB_CORE }),
+        entry({ path: "evil.md", status: "A", candidate_blob: BLOB_MONOLITH }),
+      ]);
+    },
+    reReadAuthoritative: async () => ({
+      base_ref: "main",
+      base_sha: BASE_B,
+      candidate_sha: HEAD_2,
+    }),
+    mutate: async () => null,
+  });
+  assert.equal(result.classification, "scope_expansion");
+  assert.ok(await integrityBlocksReviewReuse("/run", HEAD_2, HEAD_1, deps));
+  assert.ok(await integrityBlocksReadiness("/run", HEAD_2, deps));
+  assert.equal(await integrityBlocksReviewReuse("/run", HEAD_2, HEAD_2, deps), null);
+  assert.equal(await integrityBlocksReadiness("/run", HEAD_2, deps, HEAD_2), null);
+});
+
+test("semantically_equivalent readiness re-eval is cleared by B-bound review, not permanent ban", () => {
+  const records = [
+    invRecord({
+      from_sha: HEAD_1,
+      to_sha: HEAD_2,
+      classification: "semantically_equivalent",
+      mutation_method: "restack",
+      invalidated_review: false,
+      requires_fresh_review: false,
+      invalidated_readiness: true,
+      reason: "semantically_equivalent: re-evaluate current-head gates",
+    }),
+  ];
+  // Without B-bound review: readiness re-eval signal still present
+  assert.ok(readinessBlockedByIntegrityInvalidation(records, HEAD_2));
+  assert.ok(readinessBlockedByIntegrityInvalidation(records, HEAD_2, HEAD_1));
+  // Review not invalidated by semantic equivalence
+  assert.equal(reviewBlockedByIntegrityInvalidation(records, HEAD_2, HEAD_1), null);
+  // After current-head review evidence at B: not a permanent ban
+  assert.equal(readinessBlockedByIntegrityInvalidation(records, HEAD_2, HEAD_2), null);
 });

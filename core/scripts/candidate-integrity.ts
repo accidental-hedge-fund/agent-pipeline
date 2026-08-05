@@ -1037,8 +1037,14 @@ export async function persistClassifiedDisposition(
 }
 
 /**
- * True when a durable invalidation blocks reuse of review evidence for `candidateSha`
- * (to_sha match, or from_sha was reviewed and to_sha is current with invalidation flags).
+ * Whether durable integrity invalidation blocks reuse of review evidence for
+ * `candidateSha`. Invalidation rejects *pre-mutation* evidence only — not a
+ * permanent ban on the post-mutation head.
+ *
+ * A post-mutation candidate SHA did not exist before the mutation that produced
+ * it, so evidence bound to `reviewedSha === candidateSha === to_sha` postdates
+ * the invalidating transition and satisfies the fresh-review path. Historical
+ * invalidation records remain durable diagnostics.
  */
 export function reviewBlockedByIntegrityInvalidation(
   records: IntegrityInvalidationRecord[],
@@ -1053,32 +1059,54 @@ export function reviewBlockedByIntegrityInvalidation(
     if (!r.invalidated_review && !r.requires_fresh_review) continue;
     const to = r.to_sha.toLowerCase();
     const from = r.from_sha.toLowerCase();
+
+    // Fresh review bound to the post-mutation head supersedes this invalidation.
+    if (reviewed && reviewed === head && to === head) {
+      continue;
+    }
+
+    // Current head is the invalidated post-mutation SHA without B-bound review.
     if (to === head) return r;
-    if (reviewed && from === reviewed && to === head) return r;
-    // If head is post-mutation and we have expansion/unverified from that reviewed SHA
+
+    // Reviewed pre-mutation SHA while head moved away from that review.
     if (
       reviewed &&
       from === reviewed &&
+      head !== reviewed &&
       (r.classification === "scope_expansion" ||
         r.classification === "unverified" ||
         r.classification === "expected_scoped_change")
     ) {
-      // Only when candidate differs from reviewed (mutation moved head)
-      if (head !== reviewed) return r;
+      return r;
     }
   }
   return null;
 }
 
+/**
+ * Whether durable integrity invalidation blocks readiness for `candidateSha`.
+ * Invalidation rejects pre-mutation readiness authority only — not a permanent
+ * ban on the post-mutation head.
+ *
+ * When `reviewedSha` equals the current head and that head is the invalidation
+ * `to_sha`, B-bound review evidence supersedes the historical invalidation for
+ * readiness re-earn (normal current-head gates still apply separately).
+ */
 export function readinessBlockedByIntegrityInvalidation(
   records: IntegrityInvalidationRecord[],
   candidateSha: string,
+  reviewedSha?: string | null,
 ): IntegrityInvalidationRecord | null {
   const head = candidateSha.toLowerCase();
+  const reviewed = reviewedSha?.toLowerCase() ?? null;
   for (let i = records.length - 1; i >= 0; i--) {
     const r = records[i]!;
     if (!r.invalidated_readiness) continue;
-    if (r.to_sha.toLowerCase() === head) return r;
+    const to = r.to_sha.toLowerCase();
+    if (to !== head) continue;
+    // B-bound review postdates the mutation that created `to_sha`.
+    if (reviewed && reviewed === head) continue;
+    return r;
   }
   return null;
 }
@@ -1804,10 +1832,12 @@ export async function integrityBlocksReadiness(
   storeRoot: string | undefined,
   candidateSha: string,
   deps: IntegrityStoreDeps = {},
+  /** When equal to candidateSha, B-bound review supersedes historical invalidation. */
+  reviewedSha?: string | null,
 ): Promise<IntegrityInvalidationRecord | null> {
   if (!storeRoot) return null;
   const records = await loadAuthoritativeInvalidationRecords(storeRoot, deps);
-  return readinessBlockedByIntegrityInvalidation(records, candidateSha);
+  return readinessBlockedByIntegrityInvalidation(records, candidateSha, reviewedSha);
 }
 
 /**
