@@ -562,6 +562,149 @@ test("resolveConfig: design_gate unknown key is rejected at parse time", async (
   }
 });
 
+// ---- review_ensemble (#645) ----
+
+test("resolveConfig: review_ensemble absent — disabled by default", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/re0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re0`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.review_ensemble.enabled, false);
+    assert.deepEqual(cfg.review_ensemble.agents, []);
+    assert.equal(cfg.review_ensemble.min_usable_agents, 1);
+    assert.equal(cfg.review_ensemble.max_agents, 4);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_ensemble enabled with primary + additional harness", async () => {
+  const repo = makeFakeRepo(
+    `review_ensemble:\n  enabled: true\n  agents:\n    - role: primary\n    - harness: claude\n`,
+  );
+  const binDir = makeFakeGh("acme/re1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re1`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.review_ensemble.enabled, true);
+    assert.equal(cfg.review_ensemble.agents.length, 2);
+    assert.equal((cfg.review_ensemble.agents[0] as { role?: string }).role, "primary");
+    assert.equal((cfg.review_ensemble.agents[1] as { harness?: string }).harness, "claude");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_ensemble enabled with empty agents is rejected", async () => {
+  const repo = makeFakeRepo(`review_ensemble:\n  enabled: true\n  agents: []\n`);
+  const binDir = makeFakeGh("acme/re2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re2`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /review_ensemble.*empty|agents is empty/i,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_ensemble majority-vote merge mode is rejected", async () => {
+  const repo = makeFakeRepo(
+    `review_ensemble:\n  enabled: true\n  agents:\n    - role: primary\n  merge: majority_vote\n`,
+  );
+  const binDir = makeFakeGh("acme/re3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re3`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid|union_blocking|merge/i);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_ensemble over max_agents is rejected", async () => {
+  const repo = makeFakeRepo(
+    `review_ensemble:\n  enabled: true\n  max_agents: 1\n  agents:\n    - role: primary\n    - harness: claude\n`,
+  );
+  const binDir = makeFakeGh("acme/re4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re4`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /max_agents/i);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_ensemble + stage_executors.plan-review is rejected (#645)", async () => {
+  const repo = makeFakeRepo(
+    `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\n` +
+      `stage_executors:\n  plan-review: local-ollama\n` +
+      `review_ensemble:\n  enabled: true\n  agents:\n    - role: primary\n    - harness: claude\n`,
+  );
+  const binDir = makeFakeGh("acme/re5");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re5`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /review_ensemble\.enabled cannot be combined with stage_executors.*plan-review/s,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_ensemble + stage_executors.review-1 is rejected (#645)", async () => {
+  const repo = makeFakeRepo(
+    `executors:\n  local-ollama:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3.1:70b\n` +
+      `stage_executors:\n  review-1: local-ollama\n` +
+      `review_ensemble:\n  enabled: true\n  agents:\n    - role: primary\n`,
+  );
+  const binDir = makeFakeGh("acme/re6");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re6`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /review_ensemble\.enabled cannot be combined with stage_executors.*review-1/s,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: review_ensemble + stage_executors.planning (non-review) is allowed (#645)", async () => {
+  const repo = makeFakeRepo(
+    `executors:\n  opencode-main:\n    type: agent-system\n    provider: opencode\n    endpoint: https://opencode.internal/api\n` +
+      `stage_executors:\n  planning: opencode-main\n` +
+      `review_ensemble:\n  enabled: true\n  agents:\n    - role: primary\n    - harness: claude\n`,
+  );
+  const binDir = makeFakeGh("acme/re7");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re7`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.review_ensemble.enabled, true);
+    assert.equal(cfg.stage_executors.planning, "opencode-main");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---- review_policy (#17) ----
 
 test("resolveConfig: review_policy defaults apply when absent (block medium+, conf floor 0.7, bounded rounds)", async () => {

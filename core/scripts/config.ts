@@ -401,6 +401,68 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Controls which review findings block progression vs. merely advise."),
+  // Opt-in parallel multi-agent review ensemble (#645). Default-off. v1 merge
+  // mode is fixed to union-blocking; majority-vote is intentionally not offered.
+  review_ensemble: z
+    .object({
+      enabled: z.boolean().optional().describe("Enable parallel multi-agent review ensemble at the shared reviewer seam (default false)."),
+      agents: z
+        .array(
+          z
+            .object({
+              role: z.literal("primary").optional().describe('Use the configured primary reviewer (harnesses.reviewer / review_harness). Mutually exclusive with "harness".'),
+              harness: z.string().min(1, "review_ensemble.agents[].harness must not be empty").optional().describe("Additional reviewer harness or custom CLI name. Mutually exclusive with role: primary."),
+              model: z.string().min(1).optional().describe("Optional model override for this agent only."),
+              effort: z.string().min(1).optional().describe("Optional reasoning-effort override for this agent only."),
+            })
+            .strict()
+            .superRefine((agent, ctx) => {
+              const hasPrimary = agent.role === "primary";
+              const hasHarness = typeof agent.harness === "string" && agent.harness.length > 0;
+              if (hasPrimary && hasHarness) {
+                ctx.addIssue({
+                  code: "custom",
+                  message: 'review_ensemble agent must set either role: "primary" or harness, not both',
+                });
+              } else if (!hasPrimary && !hasHarness) {
+                ctx.addIssue({
+                  code: "custom",
+                  message: 'review_ensemble agent must set role: "primary" or a non-empty harness',
+                });
+              }
+            }),
+        )
+        .optional()
+        .describe('Ordered ensemble agents. Use { role: "primary" } for the configured reviewer and { harness: "<cli>" } for additional cross-checks.'),
+      min_usable_agents: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("Minimum usable agents required to soft-fail and merge; below this the stage fails closed (default 1)."),
+      max_agents: z
+        .number()
+        .int()
+        .min(1)
+        .max(8)
+        .optional()
+        .describe("Hard upper bound on ensemble agent count (default 4)."),
+      agent_timeout_sec: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Optional per-agent timeout in seconds; when absent, review_timeout / plan_review_timeout apply."),
+      // Reserved: only union_blocking is supported in v1. Reject any other value
+      // so operators cannot demote rigor via majority-vote.
+      merge: z
+        .literal("union_blocking")
+        .optional()
+        .describe('Merge mode. v1 supports only "union_blocking" (union findings, rigor-first blocking). Majority-vote approve is not available.'),
+    })
+    .strict()
+    .optional()
+    .describe("Opt-in parallel multi-agent review ensemble (#645). Default off — no latency/cost change when absent or disabled."),
   doctor: z
     .object({
       runOnStart: z
@@ -754,21 +816,39 @@ const EXECUTION_ENVIRONMENT_STAGE_SET = new Set<string>(EXECUTION_ENVIRONMENT_ST
  * assigned to a prompt-contained stage. Throws a single Error naming the
  * offending stage + executor on the first violation found; a no-op when either
  * block is absent (parity with pre-#314 configs).
+ *
+ * Also rejects combining `review_ensemble.enabled` with `stage_executors` for
+ * plan-review / review-1 / review-2 (#645): that combo would silently run a
+ * single stage executor and bypass ensemble fan-out.
  */
 function validateStageExecutorAssignments(fileConfig: PartialConfig): void {
-  if (!fileConfig.stage_executors) return;
-  for (const [stage, name] of Object.entries(fileConfig.stage_executors)) {
-    const definition = fileConfig.executors?.[name];
-    if (!definition) {
-      throw new Error(
-        `stage_executors.${stage} references unknown executor "${name}" — add it under executors:`,
-      );
+  if (fileConfig.stage_executors) {
+    for (const [stage, name] of Object.entries(fileConfig.stage_executors)) {
+      const definition = fileConfig.executors?.[name];
+      if (!definition) {
+        throw new Error(
+          `stage_executors.${stage} references unknown executor "${name}" — add it under executors:`,
+        );
+      }
+      if (definition.type === "model-endpoint" && EXECUTION_ENVIRONMENT_STAGE_SET.has(stage)) {
+        throw new Error(
+          `stage "${stage}" cannot be assigned model-endpoint executor "${name}" — model-endpoint ` +
+            `executors are only valid for prompt-contained stages (plan-review, review-1, review-2); ` +
+            `"${stage}" requires repo/tool access and needs an agent-system executor or the local harness`,
+        );
+      }
     }
-    if (definition.type === "model-endpoint" && EXECUTION_ENVIRONMENT_STAGE_SET.has(stage)) {
+  }
+  // #645: ensemble fan-out and a single stage_executor on the same review
+  // seam are mutually exclusive — never silently prefer one over the other.
+  if (fileConfig.review_ensemble?.enabled === true && fileConfig.stage_executors) {
+    const ensembleSeamStages = ["plan-review", "review-1", "review-2"] as const;
+    const conflicting = ensembleSeamStages.filter((s) => fileConfig.stage_executors?.[s]);
+    if (conflicting.length > 0) {
       throw new Error(
-        `stage "${stage}" cannot be assigned model-endpoint executor "${name}" — model-endpoint ` +
-          `executors are only valid for prompt-contained stages (plan-review, review-1, review-2); ` +
-          `"${stage}" requires repo/tool access and needs an agent-system executor or the local harness`,
+        `review_ensemble.enabled cannot be combined with stage_executors for ${conflicting.join(", ")} — ` +
+          `ensemble requires the shared multi-agent reviewer seam and must not be silently replaced by a single stage executor. ` +
+          `Remove those stage_executors assignment(s) or set review_ensemble.enabled: false.`,
       );
     }
   }
@@ -824,6 +904,67 @@ function resolveHarnessRoles(
   const implementerSource: HarnessRoleSource = repoImplementer !== undefined ? "repo-config" : "profile";
 
   return { implementer, reviewer, implementerSource, reviewerSource };
+}
+
+/**
+ * Resolve `review_ensemble` (#645) with defaults and structural validation.
+ * Enabled + empty agents, over max_agents, and unknown merge modes are rejected
+ * at config-resolve time with actionable messages.
+ */
+function resolveReviewEnsemble(
+  raw: PartialConfig["review_ensemble"],
+): import("./types.ts").ReviewEnsembleConfig {
+  const d = DEFAULT_CONFIG.review_ensemble;
+  const enabled = raw?.enabled ?? d.enabled;
+  const maxAgents = raw?.max_agents ?? d.max_agents;
+  const minUsable = raw?.min_usable_agents ?? d.min_usable_agents;
+  const agents = (raw?.agents ?? []).map((a) => {
+    if (a.role === "primary") {
+      return {
+        role: "primary" as const,
+        ...(a.model !== undefined ? { model: a.model } : {}),
+        ...(a.effort !== undefined ? { effort: a.effort } : {}),
+      };
+    }
+    return {
+      harness: a.harness as string,
+      ...(a.model !== undefined ? { model: a.model } : {}),
+      ...(a.effort !== undefined ? { effort: a.effort } : {}),
+    };
+  });
+
+  if (enabled && agents.length === 0) {
+    throw new Error(
+      "review_ensemble.enabled is true but review_ensemble.agents is empty or missing — list at least one agent (e.g. { role: primary } and optional additional harness entries).",
+    );
+  }
+  if (agents.length > maxAgents) {
+    throw new Error(
+      `review_ensemble.agents has ${agents.length} entries, which exceeds review_ensemble.max_agents (${maxAgents}).`,
+    );
+  }
+  if (minUsable > Math.max(agents.length, 1) && enabled) {
+    throw new Error(
+      `review_ensemble.min_usable_agents (${minUsable}) exceeds the configured agent count (${agents.length}).`,
+    );
+  }
+  // Zod already restricts merge to "union_blocking" when present; keep a
+  // defensive check so a future schema drift still fails closed.
+  if (raw && "merge" in raw && raw.merge !== undefined && raw.merge !== "union_blocking") {
+    throw new Error(
+      `review_ensemble.merge "${String((raw as { merge?: unknown }).merge)}" is not supported — v1 only allows "union_blocking" (majority-vote approve is not available).`,
+    );
+  }
+
+  return {
+    enabled,
+    agents,
+    min_usable_agents: minUsable,
+    max_agents: maxAgents,
+    ...(raw?.agent_timeout_sec !== undefined
+      ? { agent_timeout_sec: raw.agent_timeout_sec }
+      : {}),
+  };
 }
 
 /**
@@ -1215,6 +1356,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         fileConfig.review_policy?.max_delta_rounds ??
         DEFAULT_CONFIG.review_policy.max_delta_rounds,
     },
+    review_ensemble: resolveReviewEnsemble(fileConfig.review_ensemble),
     doctor: {
       runOnStart: fileConfig.doctor?.runOnStart ?? DEFAULT_CONFIG.doctor.runOnStart,
       failFast: fileConfig.doctor?.failFast ?? DEFAULT_CONFIG.doctor.failFast,
@@ -1614,6 +1756,11 @@ export const RIGOR_GATING_PATHS: readonly string[] = [
   "review_policy.ceiling_action",
   "review_policy.surface_recurrence_rounds",
   "review_policy.max_delta_rounds",
+  "review_ensemble.enabled",
+  "review_ensemble.agents",
+  "review_ensemble.min_usable_agents",
+  "review_ensemble.max_agents",
+  "review_ensemble.merge",
   "steps.plan_review",
   "steps.standard_review",
   "steps.adversarial_review",
@@ -2362,6 +2509,50 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     `  max_delta_rounds: ${yamlScalar(reviewPolicy.max_delta_rounds)} # ${sd("review_policy.max_delta_rounds", "cap on pre-merge delta review rounds per item (#483)")}`,
     ...reviewPolicyOptional,
     "",
+    // review_ensemble (#645): default-off comment block after review_policy so
+    // optional review_policy fields stay nested under review_policy.
+    config.review_ensemble !== undefined && config.review_ensemble.enabled
+      ? [
+          "review_ensemble: # parallel multi-agent review at the shared reviewer seam (#645)",
+          `  enabled: ${yamlScalar(config.review_ensemble.enabled)} # ${sd("review_ensemble.enabled", "set true to enable; default false")}`,
+          "  agents:",
+          ...(config.review_ensemble.agents.length > 0
+            ? config.review_ensemble.agents.map((a) =>
+                "role" in a && a.role === "primary"
+                  ? `    - role: primary # ${sd("review_ensemble.agents", "primary = configured harnesses.reviewer / review_harness")}`
+                  : [
+                      `    - harness: ${yamlScalar((a as { harness: string }).harness)} # additional cross-check harness or custom CLI`,
+                      `      # model: auto # ${sd("review_ensemble.agents.model", "optional model override for this agent only")}`,
+                      `      # effort: medium # ${sd("review_ensemble.agents.effort", "optional reasoning-effort override for this agent only")}`,
+                    ].join("\n"),
+              )
+            : [
+                `    - role: primary # ${sd("review_ensemble.agents", "primary = configured harnesses.reviewer / review_harness")}`,
+                "    - harness: claude # additional cross-check harness or custom CLI",
+                `      # model: auto # ${sd("review_ensemble.agents.model", "optional model override for this agent only")}`,
+                `      # effort: medium # ${sd("review_ensemble.agents.effort", "optional reasoning-effort override for this agent only")}`,
+              ]),
+          `  min_usable_agents: ${yamlScalar(config.review_ensemble.min_usable_agents)} # ${sd("review_ensemble.min_usable_agents", "soft-fail threshold; fail closed when usable agents are below this")}`,
+          `  max_agents: ${yamlScalar(config.review_ensemble.max_agents)} # ${sd("review_ensemble.max_agents", "hard upper bound on ensemble agent count")}`,
+          config.review_ensemble.agent_timeout_sec !== undefined
+            ? `  agent_timeout_sec: ${yamlScalar(config.review_ensemble.agent_timeout_sec)} # ${sd("review_ensemble.agent_timeout_sec", "optional per-agent timeout seconds")}`
+            : `  # agent_timeout_sec: 1500 # ${sd("review_ensemble.agent_timeout_sec", "optional per-agent timeout seconds")}`,
+          `  # merge: union_blocking # ${sd("review_ensemble.merge", 'v1 supports only "union_blocking"; majority-vote approve is not available')}`,
+        ].join("\n")
+      : [
+          "# review_ensemble: # parallel multi-agent review at the shared reviewer seam (#645). Default off — no latency/cost change.",
+          `#   enabled: ${yamlScalar(d.review_ensemble.enabled)} # ${sd("review_ensemble.enabled", "set true to enable; default false")}`,
+          "#   agents:",
+          `#     - role: primary # ${sd("review_ensemble.agents", "primary = configured harnesses.reviewer / review_harness")}`,
+          "#     - harness: claude # additional cross-check harness or custom CLI",
+          `#       model: auto # ${sd("review_ensemble.agents.model", "optional model override for this agent only")}`,
+          `#       effort: medium # ${sd("review_ensemble.agents.effort", "optional reasoning-effort override for this agent only")}`,
+          `#   min_usable_agents: ${yamlScalar(d.review_ensemble.min_usable_agents)} # ${sd("review_ensemble.min_usable_agents", "soft-fail threshold; fail closed when usable agents are below this")}`,
+          `#   max_agents: ${yamlScalar(d.review_ensemble.max_agents)} # ${sd("review_ensemble.max_agents", "hard upper bound on ensemble agent count")}`,
+          `#   agent_timeout_sec: 1500 # ${sd("review_ensemble.agent_timeout_sec", "optional per-agent timeout seconds")}`,
+          `#   merge: union_blocking # ${sd("review_ensemble.merge", 'v1 supports only "union_blocking"; majority-vote approve is not available')}`,
+        ].join("\n"),
+    "",
     "doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here",
     `  runOnStart: ${yamlScalar(doctor.runOnStart)} # ${sd("doctor.runOnStart", "run preflight checks before planning; abort on any failure")}`,
     `  failFast: ${yamlScalar(doctor.failFast)} # ${sd("doctor.failFast", "stop at the first failing check instead of collecting all failures")}`,
@@ -2648,6 +2839,11 @@ function normalizeForSync(config: PartialConfig): unknown {
     visual_gate: { ...d.visual_gate, ...config.visual_gate },
     shipcheck_gate: { ...d.shipcheck_gate, ...config.shipcheck_gate },
     review_policy: { ...d.review_policy, ...config.review_policy },
+    review_ensemble: {
+      ...d.review_ensemble,
+      ...config.review_ensemble,
+      agents: config.review_ensemble?.agents ?? d.review_ensemble.agents,
+    },
     doctor: { ...d.doctor, ...config.doctor },
     loop: { ...d.loop, ...config.loop },
     papercuts: { ...d.papercuts, ...config.papercuts },
