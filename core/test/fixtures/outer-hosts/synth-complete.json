@@ -31,7 +31,8 @@
     "support": "supported",
     "skillPathHint": "~/.synth-outer-host/skills/pipeline",
     "commandSurface": "/pipeline",
-    "discoveryProbe": "registry registration only (fixture)"
+    "discoveryProbe": "registry registration only (fixture)",
+    "discovery": { "kind": "skill_path" }
   },
   "early_run_handoff": {
     "support": "supported",

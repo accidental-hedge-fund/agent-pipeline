@@ -28,7 +28,8 @@
     "support": "supported",
     "skillPathHint": "~/.incomplete/skills/pipeline",
     "commandSurface": "/pipeline",
-    "discoveryProbe": "n/a"
+    "discoveryProbe": "n/a",
+    "discovery": { "kind": "skill_path" }
   },
   "early_run_handoff": {
     "support": "unsupported",

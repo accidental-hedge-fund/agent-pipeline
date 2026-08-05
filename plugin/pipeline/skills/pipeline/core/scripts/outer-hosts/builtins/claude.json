@@ -31,7 +31,8 @@
     "support": "supported",
     "skillPathHint": "~/.claude/skills/pipeline",
     "commandSurface": "/pipeline",
-    "discoveryProbe": "which claude"
+    "discoveryProbe": "which claude",
+    "discovery": { "kind": "which", "whichCommand": "claude" }
   },
   "early_run_handoff": {
     "support": "supported",

@@ -32,7 +32,8 @@
     "support": "supported",
     "skillPathHint": "~/.codex/skills/pipeline",
     "commandSurface": "$pipeline",
-    "discoveryProbe": "which codex"
+    "discoveryProbe": "which codex",
+    "discovery": { "kind": "which", "whichCommand": "codex" }
   },
   "early_run_handoff": {
     "support": "supported",

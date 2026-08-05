@@ -32,7 +32,8 @@
     "support": "supported",
     "skillPathHint": "~/.grok/skills/pipeline",
     "commandSurface": "pipeline skill (Grok Build skill path)",
-    "discoveryProbe": "test -L ~/.grok/skills/pipeline || test -d ~/.grok/skills/pipeline"
+    "discoveryProbe": "test -L ~/.grok/skills/pipeline || test -d ~/.grok/skills/pipeline",
+    "discovery": { "kind": "skill_path" }
   },
   "early_run_handoff": {
     "support": "supported",

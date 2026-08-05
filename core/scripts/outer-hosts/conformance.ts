@@ -243,6 +243,30 @@ export function checkOuterHostConformance(manifest: OuterHostManifest): OuterHos
           fail(host, "invocation.skillPathHint", "skillPathHint is required when invocation is supported"),
         );
       }
+      // Typed discovery probe (#784) — machine-consumed; free-text discoveryProbe
+      // is documentation only.
+      const disc = invocation.discovery;
+      if (!disc || typeof disc !== "object") {
+        failures.push(
+          fail(
+            host,
+            "invocation.discovery",
+            "discovery probe spec is required when invocation is supported",
+          ),
+        );
+      } else if (
+        disc.kind !== "which" &&
+        disc.kind !== "skill_path" &&
+        disc.kind !== "which_or_skill_path"
+      ) {
+        failures.push(
+          fail(
+            host,
+            "invocation.discovery.kind",
+            `invalid discovery.kind ${JSON.stringify(disc.kind)} (expected which|skill_path|which_or_skill_path)`,
+          ),
+        );
+      }
     }
   }
 

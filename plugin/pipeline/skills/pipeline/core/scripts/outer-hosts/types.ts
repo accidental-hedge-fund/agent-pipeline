@@ -100,13 +100,42 @@ export interface OuterHostInstallProfile {
   baseOptional?: boolean;
 }
 
+/**
+ * Machine-consumable discovery probe kind. Discovery consumers use this rather
+ * than assuming `which <host-id>` (#784) — e.g. Grok is available via an
+ * installed skill symlink/tree, not a `grok` executable.
+ */
+export type OuterHostDiscoveryProbeKind =
+  | "which"
+  | "skill_path"
+  | "which_or_skill_path";
+
+/** Typed discovery probe declared on the outer-host invocation profile. */
+export interface OuterHostDiscoveryProbeSpec {
+  kind: OuterHostDiscoveryProbeKind;
+  /**
+   * CLI name for `which` / `which_or_skill_path`. Defaults to the host id when
+   * omitted and the kind includes a which probe.
+   */
+  whichCommand?: string;
+}
+
 /** Skill / command invocation surface. */
 export interface OuterHostInvocation {
   support: CapabilitySupport;
   fallback?: string;
   skillPathHint: string;
   commandSurface: string;
+  /**
+   * Human-readable probe description (docs / operator hints). Not executed as a
+   * shell command by discovery — see {@link discovery}.
+   */
   discoveryProbe: string;
+  /**
+   * Machine-consumable discovery probe. Install/discovery surfaces resolve
+   * availability from this field plus install base-path data (#784).
+   */
+  discovery: OuterHostDiscoveryProbeSpec;
 }
 
 /** Generic capability with how-to + required fallback when not fully supported. */

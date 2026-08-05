@@ -32,7 +32,8 @@
     "support": "supported",
     "skillPathHint": "~/.config/opencode/skills/pipeline",
     "commandSurface": "/pipeline",
-    "discoveryProbe": "which opencode; skill marker under OPENCODE_CONFIG_DIR or ~/.config/opencode"
+    "discoveryProbe": "which opencode; skill marker under OPENCODE_CONFIG_DIR or ~/.config/opencode",
+    "discovery": { "kind": "which_or_skill_path", "whichCommand": "opencode" }
   },
   "early_run_handoff": {
     "support": "supported",

@@ -394,3 +394,136 @@ test("discoverHosts: extra registered hosts do not redefine hostCoverage enum (#
   assert.equal(result.hostCoverage, "claude-only");
   assert.ok(result.hosts.grok || result.registeredOuterHosts?.includes("grok"));
 });
+
+// ---------------------------------------------------------------------------
+// 8. Manifest-driven discovery probes (#784) — skill_path vs which <host-id>
+// ---------------------------------------------------------------------------
+
+const GROK_MANIFEST_MIN = {
+  manifestVersion: 1,
+  id: "grok",
+  displayName: "Grok Build",
+  origin: "builtin" as const,
+  install: {
+    support: "supported" as const,
+    mode: "symlink-claude" as const,
+    basePath: { env: null, defaultHomeSegments: [".grok"] as const },
+    skillsRelative: ["skills"] as const,
+    skillDirName: "pipeline",
+    overlayDir: "hosts/claude",
+    overlayFiles: [] as const,
+    overlayDirs: [] as const,
+    managedArtifacts: {
+      skillTree: true,
+      commandsGlob: null,
+      commandsDirRelative: null,
+      commandsKind: "none" as const,
+    },
+    userOwnedExclusion: "symlink only",
+    postInstall: "n/a",
+    installOrder: 40,
+  },
+  invocation: {
+    support: "supported" as const,
+    skillPathHint: "~/.grok/skills/pipeline",
+    commandSurface: "pipeline skill",
+    discoveryProbe: "test -L ~/.grok/skills/pipeline || test -d ~/.grok/skills/pipeline",
+    discovery: { kind: "skill_path" as const },
+  },
+  early_run_handoff: { support: "supported" as const, how: "handoff" },
+  event_follow: { support: "supported" as const, how: "follow" },
+  reattach: { support: "supported" as const, how: "reattach" },
+  wait_cancel: {
+    support: "supported" as const,
+    classification: "non_terminal" as const,
+    recovery: "reattach_or_portable_follow" as const,
+    how: "non-terminal",
+  },
+  material_progress_notify: {
+    support: "supported" as const,
+    how: "monitor",
+    mapping: {
+      surface: "grok_monitor_lines" as const,
+      tools: ["monitor"] as const,
+      filter: "scripts/material-filter.mjs",
+    },
+    fallback: "stdout",
+  },
+  terminal_cleanup: { support: "supported" as const, how: "stop" },
+  terminal_summary: { support: "supported" as const, how: "summary" },
+};
+
+test("discoverHosts: Grok is available via skill_path probe without a grok CLI (#784)", async () => {
+  const grokSkill = "/home/u/.grok/skills/pipeline";
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      // No `grok` binary — the pre-fix bug used which("grok") and reported unavailable.
+      which: async (cmd) =>
+        cmd === "claude" || cmd === "codex" ? `/usr/bin/${cmd}` : null,
+      listOuterHostIds: () => ["claude", "codex", "grok", "opencode"],
+      resolveOuterHost: (id) => (id === "grok" ? (GROK_MANIFEST_MIN as never) : null),
+      skillPathPresent: (p) => p === grokSkill,
+      homeDir: () => "/home/u",
+      envGet: () => undefined,
+    }),
+  );
+  assert.equal(result.hosts.grok.available, true, "installed Grok skill path must mark available");
+  assert.equal(
+    (result.hosts.grok as { skillPath?: string | null }).skillPath,
+    grokSkill,
+  );
+  assert.equal(result.hosts.grok.cliBin, null, "skill_path probe must not invent a grok CLI");
+  assert.equal(result.hostCoverage, "both", "Grok must not redefine hostCoverage");
+});
+
+test("discoverHosts: Grok skill_path absent → available false even when which(grok) would not run (#784)", async () => {
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      which: async () => null,
+      listOuterHostIds: () => ["claude", "codex", "grok", "opencode"],
+      resolveOuterHost: (id) => (id === "grok" ? (GROK_MANIFEST_MIN as never) : null),
+      skillPathPresent: () => false,
+      homeDir: () => "/home/u",
+      envGet: () => undefined,
+    }),
+  );
+  assert.equal(result.hosts.grok.available, false);
+  assert.equal((result.hosts.grok as { skillPath?: string | null }).skillPath, null);
+});
+
+test("discoverHosts: which_or_skill_path host available from skill when CLI missing (#784)", async () => {
+  const skill = "/home/u/.ext/skills/pipeline";
+  const ext = {
+    ...GROK_MANIFEST_MIN,
+    id: "ext-host",
+    displayName: "Ext",
+    install: {
+      ...GROK_MANIFEST_MIN.install,
+      mode: "tree" as const,
+      basePath: { env: null, defaultHomeSegments: [".ext"] as const },
+    },
+    invocation: {
+      ...GROK_MANIFEST_MIN.invocation,
+      discoveryProbe: "which ext-host or skill path",
+      discovery: { kind: "which_or_skill_path" as const, whichCommand: "ext-host" },
+    },
+  };
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      which: async () => null,
+      listOuterHostIds: () => ["claude", "codex", "opencode", "ext-host"],
+      resolveOuterHost: (id) => (id === "ext-host" ? (ext as never) : null),
+      skillPathPresent: (p) => p === skill,
+      homeDir: () => "/home/u",
+      envGet: () => undefined,
+    }),
+  );
+  assert.equal(result.hosts["ext-host"].available, true);
+  assert.equal((result.hosts["ext-host"] as { skillPath?: string | null }).skillPath, skill);
+});

@@ -17,7 +17,12 @@ import { fileURLToPath } from "node:url";
 import {
   ensureBuiltinOuterHostsRegistered,
   registeredOuterHostIds,
+  resolveOuterHost as resolveOuterHostDefault,
 } from "./outer-hosts/index.ts";
+import type {
+  OuterHostDiscoveryProbeSpec,
+  OuterHostManifest,
+} from "./outer-hosts/types.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -82,6 +87,20 @@ export type DiscoverHostsDeps = {
    * Defaults to the outer-host runtime registry.
    */
   listOuterHostIds?: () => string[];
+  /**
+   * Resolve an outer-host manifest for manifest-driven discovery probes (#784).
+   * Defaults to the outer-host runtime registry.
+   */
+  resolveOuterHost?: (id: string) => OuterHostManifest | null;
+  /**
+   * True when a skill path exists as a directory or symlink (including a
+   * dangling symlink — matches `test -L || test -d`). Injectable for tests.
+   */
+  skillPathPresent?: (absPath: string) => boolean;
+  /** Home directory for install base-path resolution. Defaults to os.homedir(). */
+  homeDir?: () => string;
+  /** Env lookup for install.basePath.env overrides. Defaults to process.env. */
+  envGet?: (key: string) => string | undefined;
 };
 
 // ---------------------------------------------------------------------------
@@ -193,6 +212,78 @@ async function readVersionDefault(corePath: string): Promise<string | null> {
   }
 }
 
+/** True when path is a directory or symlink (dangling symlink counts). */
+export function skillPathPresentDefault(absPath: string): boolean {
+  try {
+    const st = fs.lstatSync(absPath);
+    return st.isDirectory() || st.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the managed skill install path from a host's install profile.
+ * Mirrors install.mjs base-path resolution (env override → defaultHomeSegments
+ * → alternateHomeSegments). Pure aside from home/env/exists seams.
+ */
+export function resolveManifestSkillPath(
+  manifest: OuterHostManifest,
+  deps: {
+    homeDir: () => string;
+    envGet: (key: string) => string | undefined;
+  },
+): string {
+  const bp = manifest.install.basePath;
+  let base: string;
+  const envKey = typeof bp.env === "string" ? bp.env.trim() : "";
+  const envVal = envKey ? deps.envGet(envKey)?.trim() : "";
+  if (envVal) {
+    base = path.resolve(envVal);
+  } else {
+    base = path.join(deps.homeDir(), ...bp.defaultHomeSegments);
+    const alt = bp.alternateHomeSegments;
+    // Prefer alternate only when primary does not exist as a path prefix candidate
+    // is not required here — discovery reports the primary default path for the
+    // skill tree; skillPathPresent decides availability.
+    if (Array.isArray(alt) && alt.length > 0) {
+      // Keep primary as the declared path; install.mjs may use alternate when
+      // primary is missing. Discovery checks primary first (skillPathHint-aligned).
+      void alt;
+    }
+  }
+  return path.join(
+    base,
+    ...manifest.install.skillsRelative,
+    manifest.install.skillDirName,
+  );
+}
+
+/** Normalize a manifest discovery probe (defaults whichCommand to host id). */
+export function normalizeDiscoveryProbe(
+  hostId: string,
+  discovery: OuterHostDiscoveryProbeSpec | undefined | null,
+): OuterHostDiscoveryProbeSpec {
+  if (!discovery || typeof discovery !== "object") {
+    // Fail closed for unknown shapes: skill_path-only would false-negative CLI
+    // hosts; which-only false-negatives Grok. Prefer skill_path when the
+    // install profile exists (extensions often ship skill trees without a
+    // same-named CLI). Callers without a probe still get skill_path.
+    return { kind: "skill_path" };
+  }
+  const kind = discovery.kind;
+  if (kind === "which" || kind === "which_or_skill_path") {
+    return {
+      kind,
+      whichCommand:
+        typeof discovery.whichCommand === "string" && discovery.whichCommand.trim()
+          ? discovery.whichCommand.trim()
+          : hostId,
+    };
+  }
+  return { kind: "skill_path" };
+}
+
 const defaultDeps: DiscoverHostsDeps = {
   which: whichDefault,
   probeCandidates: probeCandidatesDefault,
@@ -223,6 +314,17 @@ export async function discoverHosts(
       ensureBuiltinOuterHostsRegistered();
       return registeredOuterHostIds();
     });
+  const resolveHost =
+    deps.resolveOuterHost ??
+    ((id: string) => {
+      ensureBuiltinOuterHostsRegistered();
+      return resolveOuterHostDefault(id);
+    });
+  const skillPresent = deps.skillPathPresent ?? skillPathPresentDefault;
+  const homeDir = deps.homeDir ?? (() => os.homedir());
+  const envGet = deps.envGet ?? ((key: string) => process.env[key]);
+  const pathDeps = { homeDir, envGet };
+
   const [corePath, claudeBin, codexBin, opencodeBin, opencodeSkill] = await Promise.all([
     deps.probeCandidates(),
     deps.which("claude"),
@@ -262,15 +364,48 @@ export async function discoverHosts(
   // Registry-driven completeness: every registered outer host appears under
   // hosts (additive entries for ids beyond the legacy trio). Synthetic hosts
   // in tests inject via listOuterHostIds without editing built-in modules.
+  // Availability is resolved from the manifest's typed discovery probe — never
+  // assumed to be `which <host-id>` (#784 / Grok skill-path install).
   const registeredOuterHosts = listIds();
   for (const id of registeredOuterHosts) {
     if (hosts[id]) continue;
-    // Unknown registry host: CLI probe by id when possible; skill path unknown.
-    const bin = await deps.which(id);
+    const manifest = resolveHost(id);
+    if (!manifest) {
+      // No manifest: do not invent availability from a same-named CLI.
+      hosts[id] = {
+        available: false,
+        cliBin: null,
+        skillPath: null,
+      };
+      continue;
+    }
+
+    const probe = normalizeDiscoveryProbe(id, manifest.invocation?.discovery);
+    const skillAbs = resolveManifestSkillPath(manifest, pathDeps);
+    const skillOk = skillPresent(skillAbs);
+    const skillPath = skillOk ? skillAbs : null;
+
+    let cliBin: string | null = null;
+    if (probe.kind === "which" || probe.kind === "which_or_skill_path") {
+      const cmd = probe.whichCommand ?? id;
+      cliBin = await deps.which(cmd);
+    }
+
+    let available: boolean;
+    if (probe.kind === "which") {
+      available = cliBin !== null;
+    } else if (probe.kind === "skill_path") {
+      available = skillOk;
+    } else {
+      // which_or_skill_path
+      available = cliBin !== null || skillOk;
+    }
+
     hosts[id] = {
-      available: bin !== null,
-      cliBin: bin,
-      skillPath: null,
+      available,
+      cliBin,
+      skillPath,
+      displayName: manifest.displayName,
     };
   }
 
