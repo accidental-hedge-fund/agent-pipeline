@@ -292,6 +292,50 @@ test("validateTesterEvidence accepts pass record and rejects malformed", () => {
   assert.equal(wrongKind.ok, false);
 });
 
+test("validateTesterEvidence rejects missing toolchain_fingerprint", () => {
+  const raw = { ...baseEvidence() } as Record<string, unknown>;
+  delete raw.toolchain_fingerprint;
+  const res = validateTesterEvidence(raw);
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.match(res.reason, /toolchain_fingerprint/);
+});
+
+test("validateTesterEvidence rejects passed overall with failed command", () => {
+  const res = validateTesterEvidence(
+    baseEvidence({
+      overall_status: "passed",
+      commands: [
+        {
+          identity: "npm test",
+          exit_code: 1,
+          duration_ms: 10,
+          status: "failed",
+          output_excerpt: "FAIL",
+        },
+      ],
+    }),
+  );
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.match(res.reason, /inconsistent|passed/i);
+});
+
+test("validateTesterEvidence rejects invalid tests rows when present", () => {
+  const res = validateTesterEvidence(
+    baseEvidence({
+      tests: [{ identity: "t1", status: "not-a-status" as "passed" }],
+    }),
+  );
+  assert.equal(res.ok, false);
+  if (!res.ok) assert.match(res.reason, /test\.status|invalid test/i);
+
+  const ok = validateTesterEvidence(
+    baseEvidence({
+      tests: [{ identity: "t1", status: "passed", duration_ms: 1, message: "ok" }],
+    }),
+  );
+  assert.equal(ok.ok, true);
+});
+
 test("runAllowlistedExtractors: empty / unknown / malformed preserve no invented rows", () => {
   assert.deepEqual(runAllowlistedExtractors("ok", []).tests, []);
   const unknown = runAllowlistedExtractors("ok", ["nope"]);
@@ -386,12 +430,52 @@ test("formatTesterEvidenceSummary is compact", () => {
   assert.doesNotMatch(s, /Y{100}/);
 });
 
-test("loadTesterEvidenceForReview without runDir does not withhold", async () => {
-  const acq = await loadTesterEvidenceForReview(undefined, SHA_A, {
+test("loadTesterEvidenceForReview without runDir honors on_missing", async () => {
+  const closed = await loadTesterEvidenceForReview(undefined, SHA_A, {
     tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG,
   });
-  assert.equal(acq.classification, "missing");
-  assert.equal(acq.withholdInvoke, false);
+  assert.equal(closed.classification, "missing");
+  assert.equal(closed.withholdInvoke, true);
+  assert.match(closed.section, /not allowed|missing|cannot be loaded/i);
+  assert.doesNotMatch(closed.section, /Overall status:\*\* `passed`/);
+
+  const open = await loadTesterEvidenceForReview(undefined, SHA_A, {
+    tester_evidence: { ...DEFAULT_TESTER_EVIDENCE_CONFIG, on_missing: "fail_open" },
+  });
+  assert.equal(open.classification, "missing");
+  assert.equal(open.withholdInvoke, false);
+  assert.match(open.section, /not allowed|missing|cannot be loaded/i);
+  assert.doesNotMatch(open.section, /Overall status:\*\* `passed`/);
+});
+
+test("contradictory passed artifact is malformed not current at acquisition", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/contradictory";
+  const bad = baseEvidence({
+    overall_status: "passed",
+    commands: [
+      {
+        identity: "npm test",
+        exit_code: 1,
+        duration_ms: 5,
+        status: "failed",
+        output_excerpt: "boom",
+      },
+    ],
+  });
+  // Bypass writeTesterEvidence validation path: plant raw JSON on disk.
+  await io.mkdir(runDir, { recursive: true });
+  await io.writeFile(testerEvidencePath(runDir), JSON.stringify(bad));
+  const acq = await loadTesterEvidenceForReview(
+    runDir,
+    SHA_A,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    io,
+  );
+  assert.equal(acq.classification, "malformed");
+  assert.equal(acq.withholdInvoke, true);
+  assert.equal(acq.artifact, null);
+  assert.doesNotMatch(acq.section, /Overall status:\*\* `passed`/);
 });
 
 // ---------------------------------------------------------------------------

@@ -46,6 +46,10 @@ function baseCfg(overrides: Partial<PipelineConfig> = {}): PipelineConfig {
     models: { planning: "sonnet", implementing: "sonnet", review: "opus", fix: "sonnet", intake: "sonnet", sweep: "sonnet" },
     effort: {},
     harnesses: { implementer: "codex", reviewer: "claude" },
+    // These unit tests exercise model/effort CLI argv, not Tester evidence.
+    // Without a runDir + SHA-matched artifact, default fail_closed withholds
+    // the reviewer invoke (#646). Opt into fail_open so the harness runs.
+    tester_evidence: { on_missing: "fail_open", max_output_chars: 4000, max_artifact_chars: 48_000, extractors: [] },
     ...overrides,
   } as unknown as PipelineConfig;
 }

@@ -337,6 +337,11 @@ const CMD_STATUS_SET = new Set<string>([
   "not_run",
 ]);
 
+const TEST_STATUS_SET = new Set<string>(["passed", "failed", "skipped", "error"]);
+
+/** Allowlisted toolchain_fingerprint keys only (no env dump). */
+const TOOLCHAIN_FINGERPRINT_KEYS = new Set(["node", "platform", "arch"]);
+
 export function validateTesterEvidence(
   value: unknown,
 ): { ok: true; evidence: TesterEvidence } | { ok: false; reason: string } {
@@ -364,6 +369,22 @@ export function validateTesterEvidence(
   if (typeof v.config_digest !== "string" || !/^[0-9a-f]{64}$/i.test(v.config_digest)) {
     return { ok: false, reason: "config_digest must be sha256 hex" };
   }
+  if (
+    v.toolchain_fingerprint === null ||
+    typeof v.toolchain_fingerprint !== "object" ||
+    Array.isArray(v.toolchain_fingerprint)
+  ) {
+    return { ok: false, reason: "toolchain_fingerprint required object" };
+  }
+  const fp = v.toolchain_fingerprint as Record<string, unknown>;
+  for (const [k, val] of Object.entries(fp)) {
+    if (!TOOLCHAIN_FINGERPRINT_KEYS.has(k)) {
+      return { ok: false, reason: `toolchain_fingerprint unknown key: ${k}` };
+    }
+    if (typeof val !== "string") {
+      return { ok: false, reason: `toolchain_fingerprint.${k} must be a string` };
+    }
+  }
   if (typeof v.started_at !== "string" || typeof v.ended_at !== "string") {
     return { ok: false, reason: "started_at/ended_at required" };
   }
@@ -374,6 +395,7 @@ export function validateTesterEvidence(
     return { ok: false, reason: `invalid overall_status: ${String(v.overall_status)}` };
   }
   if (!Array.isArray(v.commands)) return { ok: false, reason: "commands must be an array" };
+  const commandStatuses: string[] = [];
   for (const c of v.commands) {
     if (c === null || typeof c !== "object") {
       return { ok: false, reason: "command row must be an object" };
@@ -391,6 +413,48 @@ export function validateTesterEvidence(
     }
     if (typeof cmd.output_excerpt !== "string") {
       return { ok: false, reason: "command.output_excerpt required" };
+    }
+    commandStatuses.push(cmd.status);
+  }
+  // Semantic integrity: a claimed suite pass cannot coexist with non-passing
+  // required commands (or zero commands). Such records are malformed, not current.
+  if (v.overall_status === "passed") {
+    if (commandStatuses.length === 0) {
+      return {
+        ok: false,
+        reason: "overall_status passed requires at least one command row",
+      };
+    }
+    for (const st of commandStatuses) {
+      if (st !== "passed") {
+        return {
+          ok: false,
+          reason: `overall_status passed inconsistent with command.status ${st}`,
+        };
+      }
+    }
+  }
+  if (v.tests !== undefined) {
+    if (!Array.isArray(v.tests)) {
+      return { ok: false, reason: "tests must be an array when present" };
+    }
+    for (const t of v.tests) {
+      if (t === null || typeof t !== "object") {
+        return { ok: false, reason: "test row must be an object" };
+      }
+      const row = t as Record<string, unknown>;
+      if (typeof row.identity !== "string") {
+        return { ok: false, reason: "test.identity required" };
+      }
+      if (typeof row.status !== "string" || !TEST_STATUS_SET.has(row.status)) {
+        return { ok: false, reason: `invalid test.status: ${String(row.status)}` };
+      }
+      if (row.duration_ms !== undefined && typeof row.duration_ms !== "number") {
+        return { ok: false, reason: "test.duration_ms must be a number when present" };
+      }
+      if (row.message !== undefined && typeof row.message !== "string") {
+        return { ok: false, reason: "test.message must be a string when present" };
+      }
     }
   }
   if (typeof v.output_excerpt !== "string") {
@@ -872,19 +936,19 @@ export async function loadTesterEvidenceForReview(
 ): Promise<TesterAcquisitionResult> {
   const onMissing =
     cfg.tester_evidence?.on_missing ?? DEFAULT_TESTER_EVIDENCE_CONFIG.on_missing;
-  // No run surface (unit tests / direct callers): still render explicit missing
-  // section, but do not withhold the model invoke — there is no place suite
-  // evidence could have been stored. Production advance always supplies runDir.
+  // No run surface: treat as missing evidence and honor on_missing. Fail-closed
+  // withholds the review model invoke; fail-open still renders an explicit
+  // unavailable section and never implies suite pass. Callers that intentionally
+  // skip the gate (e.g. plan-review) must ignore withholdInvoke themselves.
   if (!runDir) {
     const acq = loadTesterEvidenceForReviewSync(
       { status: "missing" },
       candidateSha,
-      "fail_open",
+      onMissing,
     );
     acq.reason =
       "No run directory provided — Tester suite evidence cannot be loaded for this invocation.";
     acq.section = renderTesterEvidenceSection(acq);
-    acq.withholdInvoke = false;
     return acq;
   }
   const read = await readTesterEvidence(runDir, io);

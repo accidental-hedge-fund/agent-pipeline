@@ -4227,6 +4227,13 @@ function delegationCfg(): PipelineConfig {
     executors: {
       "local-ollama": { type: "model-endpoint", base_url: "http://localhost:11434/v1", model: "llama3.1:70b" },
     },
+    // #314 tests exercise stage_executors dispatch without a runDir. Default
+    // fail_closed withholds the reviewer invoke when no Tester evidence can be
+    // loaded (#646). Opt into fail_open so the executor path is reachable.
+    tester_evidence: {
+      ...(cfg as PipelineConfig).tester_evidence,
+      on_missing: "fail_open",
+    },
   } as unknown as PipelineConfig;
 }
 
