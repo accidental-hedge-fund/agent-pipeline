@@ -10,6 +10,11 @@ import { spawn } from "node:child_process";
 import { gitInWorktree } from "../worktree.ts";
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
 import type { TestGateResult } from "../testgate.ts";
+import {
+  classifyWorktreeDirt,
+  parsePorcelainPaths,
+  productDirtyPaths,
+} from "../worktree-dirt.ts";
 import type { PipelineConfig, Stage } from "../types.ts";
 import type { RunStoreDeps } from "../run-store.ts";
 
@@ -20,40 +25,63 @@ export type FormatGateResult =
 export interface FormatGateDeps {
   /** Run a shell command in the worktree, capturing combined stdout+stderr. */
   execInWorktree?: (wtPath: string, cmd: string) => Promise<{ code: number; combined: string }>;
-  /** Returns true when the worktree has uncommitted changes. */
+  /**
+   * Returns true when the worktree has **product-relevant** uncommitted changes
+   * (#873). Non-product scratch (tasks/**, .pipeline-prompt-*, config extensions)
+   * alone must not report dirty for gate trust. Injected tests may continue to
+   * drive a pure boolean; production defaults classify porcelain paths.
+   */
   gitIsDirty?: (wtPath: string) => Promise<boolean>;
-  /** Stage all changes and create a commit with the given message. Returns ok/error. */
+  /** Stage product changes and create a commit with the given message. Returns ok/error. */
   gitCommit?: (wtPath: string, message: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+  /** Raw `git status --porcelain` for product-dirt classification (#873). */
+  gitStatusPorcelain?: (wtPath: string) => Promise<string>;
 }
 
 /**
  * Run every format_gate entry in config.format_gate (in order) inside the
  * worktree. Returns { status: "ok" } when all pass, or { status: "blocked",
  * reason } on the first failure. A no-op when format_gate is absent or empty.
+ *
+ * `scratchExtraGlobs` is unioned with the engine-known non-product set when
+ * classifying dirt (#873); typically `cfg.test_gate.non_product_dirty_globs`.
  */
 export async function runFormatGate(
   wtPath: string,
   config: Pick<PipelineConfig, "format_gate">,
   issueNumber: number,
   deps: FormatGateDeps = {},
+  scratchExtraGlobs: readonly string[] = [],
 ): Promise<FormatGateResult> {
   const entries = config.format_gate;
   if (!entries || entries.length === 0) return { status: "ok", committed: false };
 
   const exec = deps.execInWorktree ?? defaultExecInWorktree;
-  const isDirty = deps.gitIsDirty ?? defaultGitIsDirty;
-  const commitFn = deps.gitCommit ?? defaultGitCommit;
+  const porcelainFn = deps.gitStatusPorcelain ?? defaultGitStatusPorcelain;
+  // Product-dirt check: prefer porcelain classification when available; fall
+  // back to the injectable gitIsDirty boolean (test seams / legacy).
+  const isProductDirty =
+    deps.gitIsDirty ??
+    (async (p: string) => {
+      const paths = parsePorcelainPaths(await porcelainFn(p));
+      return productDirtyPaths(paths, scratchExtraGlobs).length > 0;
+    });
+  const commitFn =
+    deps.gitCommit ??
+    ((p: string, message: string) => defaultGitCommit(p, message, scratchExtraGlobs, porcelainFn));
   let committed = false;
 
-  // Pre-flight: block if the worktree is already dirty before any auto-fix command
-  // runs — we cannot distinguish pre-existing harness leftovers from command output,
-  // so sweeping them into an auto-format commit is incorrect.
+  // Pre-flight: block if the worktree already has product dirt before any
+  // auto-fix command runs — we cannot distinguish pre-existing harness
+  // leftovers from command output, so sweeping them into an auto-format commit
+  // is incorrect. Scratch-only dirt is ignored for this trust check (#873).
   const hasAutoFix = entries.some((e) => e.auto_fix);
-  if (hasAutoFix && (await isDirty(wtPath))) {
+  if (hasAutoFix && (await isProductDirty(wtPath))) {
     return {
       status: "blocked",
       reason:
-        "Format gate blocked: pre-existing uncommitted changes found in worktree before any format command ran",
+        "Format gate blocked: pre-existing uncommitted changes found in worktree before any format command ran " +
+        "(product paths only; engine-known scratch such as tasks/todo.md is ignored)",
     };
   }
 
@@ -69,8 +97,9 @@ export async function runFormatGate(
           reason: `Format gate command '${command}' failed:\n${r1.combined}`,
         };
       }
-      // Commit any changes the command produced, then re-run to verify stability.
-      if (await isDirty(wtPath)) {
+      // Commit product changes the command produced (not scratch), then re-run
+      // to verify stability. Scratch-only dirt does not trigger a commit.
+      if (await isProductDirty(wtPath)) {
         const commitResult = await commitFn(wtPath, `chore: auto-format (#${issueNumber})`);
         if (!commitResult.ok) {
           return {
@@ -86,11 +115,12 @@ export async function runFormatGate(
             reason: `Format gate command '${command}' failed after auto-fix:\n${r2.combined}`,
           };
         }
-        // Verify the re-run itself did not produce more changes (non-stable formatter).
-        if (await isDirty(wtPath)) {
+        // Verify the re-run itself did not produce more product changes
+        // (non-stable formatter). Scratch-only residual is fine (#873).
+        if (await isProductDirty(wtPath)) {
           return {
             status: "blocked",
-            reason: `Format gate command '${command}' is non-stable: re-run after auto-fix still produced uncommitted changes`,
+            reason: `Format gate command '${command}' is non-stable: re-run after auto-fix still produced uncommitted product changes`,
           };
         }
       }
@@ -169,8 +199,9 @@ export async function runFormatAndTestGates(
 
   let gate: TestGateResult = { skipped: true };
   let converged = false;
+  const scratchExtraGlobs = cfg.test_gate?.non_product_dirty_globs ?? [];
   for (let round = 0; round < MAX_FORMAT_TEST_ROUNDS; round++) {
-    const fmtResult = await fmt(wtPath, cfg, issueNumber);
+    const fmtResult = await fmt(wtPath, cfg, issueNumber, {}, scratchExtraGlobs);
     if (fmtResult.status === "blocked") {
       return { ok: false, reason: fmtResult.reason, source: "format" };
     }
@@ -243,21 +274,65 @@ async function defaultExecInWorktree(
   });
 }
 
-async function defaultGitIsDirty(wtPath: string): Promise<boolean> {
+async function defaultGitStatusPorcelain(wtPath: string): Promise<string> {
   const r = await gitInWorktree(wtPath, ["status", "--porcelain"], { ignoreFailure: true });
-  return r.stdout.trim().length > 0;
+  return r.stdout;
 }
 
+/**
+ * `git restore --staged` argv to drop pre-staged scratch from the index so it
+ * cannot ride into an auto-format commit (#873 review). Pure — no I/O.
+ * Returns null when there is nothing to unstage.
+ */
+export function unstageScratchArgs(scratchPaths: readonly string[]): string[] | null {
+  if (scratchPaths.length === 0) return null;
+  return ["restore", "--staged", "--", ...scratchPaths];
+}
+
+/**
+ * `git commit` argv restricted to product paths only. Pathspec form keeps
+ * pre-staged scratch out of the commit even if it re-enters the index between
+ * unstage and commit (#873 review). Pure — no I/O.
+ */
+export function productOnlyCommitArgs(
+  message: string,
+  productPaths: readonly string[],
+): string[] {
+  return ["commit", "-m", message, "--", ...productPaths];
+}
+
+/**
+ * Stage only product-relevant dirty paths and commit (#873). Pre-staged scratch
+ * is unstaged first and the commit is pathspec-limited to product paths so
+ * tasks/todo.md (and other scratch) never fold into chore: auto-format history.
+ */
 async function defaultGitCommit(
   wtPath: string,
   message: string,
+  scratchExtraGlobs: readonly string[] = [],
+  porcelainFn: (p: string) => Promise<string> = defaultGitStatusPorcelain,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const addResult = await gitInWorktree(wtPath, ["add", "-A"], { ignoreFailure: true });
+  const paths = parsePorcelainPaths(await porcelainFn(wtPath));
+  const { product, scratch } = classifyWorktreeDirt(paths, scratchExtraGlobs);
+  if (product.length === 0) {
+    return { ok: false, error: "no product-relevant changes to commit" };
+  }
+  // Unstage pre-staged scratch so it cannot ride into the auto-format commit.
+  // Index-only; working-tree scratch remains dirty for the operator/agent.
+  const unstage = unstageScratchArgs(scratch);
+  if (unstage) {
+    await gitInWorktree(wtPath, unstage, { ignoreFailure: true });
+  }
+  const addResult = await gitInWorktree(wtPath, ["add", "--", ...product], { ignoreFailure: true });
   if (addResult.code !== 0) {
     const detail = (addResult.stderr.trim() || addResult.stdout.trim());
-    return { ok: false, error: `git add -A failed (exit ${addResult.code}): ${detail}` };
+    return { ok: false, error: `git add failed (exit ${addResult.code}): ${detail}` };
   }
-  const commitResult = await gitInWorktree(wtPath, ["commit", "-m", message], { ignoreFailure: true });
+  const commitResult = await gitInWorktree(
+    wtPath,
+    productOnlyCommitArgs(message, product),
+    { ignoreFailure: true },
+  );
   if (commitResult.code !== 0) {
     const detail = (commitResult.stderr.trim() || commitResult.stdout.trim());
     return { ok: false, error: `git commit failed (exit ${commitResult.code}): ${detail}` };

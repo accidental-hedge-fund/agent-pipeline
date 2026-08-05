@@ -1552,3 +1552,324 @@ test("gate (#352): clean worktree leaves no Uncommitted paths label in result", 
   // No blockReason when the gate passes.
   assert.ok(!out.blockReason, "passed gate must not have a blockReason");
 });
+
+// ---------------------------------------------------------------------------
+// Non-product scratch dirt must not hard-block gate trust (#873)
+// ---------------------------------------------------------------------------
+
+test("gate (#873): scratch-only pre-dirty (tasks/todo.md) allows the test command to run", async () => {
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => " M tasks/todo.md\n",
+  });
+  assert.equal(out.passed, true, `expected pass, got: ${JSON.stringify(out)}`);
+  assert.equal(ran, 1, "test command must run when only scratch is dirty");
+  assert.equal(out.dirtyWorktree, undefined);
+  assert.ok(!out.blockReason, "scratch-only dirt must not mint a blockReason");
+});
+
+test("gate (#873): scratch-only .pipeline-prompt-* pre-dirty allows the test command to run", async () => {
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => "?? .pipeline-prompt-uuid-here.txt\n",
+  });
+  assert.equal(out.passed, true);
+  assert.equal(ran, 1);
+});
+
+test("gate (#873, bites without exemption): product path still hard-blocks pre-run", async () => {
+  // Proves classification is load-bearing: a product path (not scratch) with the
+  // same dirty/porcelain seams blocks. Without product-vs-scratch filtering,
+  // scratch-only and product-only would behave identically; this case shows
+  // product still fails closed.
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => " M core/scripts/foo.ts\n",
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.equal(ran, 0, "test command must not run when product is dirty");
+  assert.equal(out.dirtyWorktree, true);
+  assert.match(out.blockReason ?? "", /core\/scripts\/foo\.ts/);
+  assert.doesNotMatch(testGateBlockReason(out), /failed after \d+ fix attempt/i);
+  assert.doesNotMatch(testGateBlockReason(out), /command is still failing/i);
+});
+
+test("gate (#873): mixed scratch + product pre-dirty blocks and discloses product path", async () => {
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () =>
+      " M tasks/todo.md\n M core/scripts/testgate.ts\n?? .pipeline-prompt-x.txt\n",
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.equal(ran, 0);
+  assert.equal(out.dirtyWorktree, true);
+  assert.match(out.blockReason ?? "", /core\/scripts\/testgate\.ts/);
+  // Product disclosure present; scratch omitted from blocking disclosure.
+  assert.match(out.blockReason ?? "", /Uncommitted paths:/);
+  assert.doesNotMatch(out.blockReason ?? "", /tasks\/todo\.md/);
+  assert.doesNotMatch(out.blockReason ?? "", /\.pipeline-prompt/);
+});
+
+test("gate (#873): post-pass dirt that is scratch-only does not fail a passing command", async () => {
+  let dirtyCall = 0;
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => {
+      dirtyCall++;
+      // pre-run clean; post-pass "dirty" with only scratch (simulates agent notes
+      // touched during the test run without product artifacts).
+      return dirtyCall > 1;
+    },
+    gitStatusPorcelain: async () => {
+      // pre-run porcelain unused when clean; post-pass returns scratch only.
+      return dirtyCall > 1 ? " M tasks/todo.md\n" : "";
+    },
+  });
+  assert.equal(out.passed, true, `expected pass on scratch-only post-dirt: ${JSON.stringify(out)}`);
+  assert.equal(ran, 1);
+});
+
+test("gate (#873): lockfile paths are product dirt (not reclassified as scratch)", async () => {
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => "?? package-lock.json\n",
+  });
+  assert.equal(out.passed, false);
+  assert.equal(ran, 0);
+  assert.equal(out.dirtyWorktree, true);
+  assert.match(out.blockReason ?? "", /package-lock\.json/);
+});
+
+test("gate (#873): config non_product_dirty_globs extends engine set (union)", async () => {
+  let ran = 0;
+  const out = await runTestGate(
+    cfgWith({ non_product_dirty_globs: ["notes/**"] }),
+    873,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => {
+        ran++;
+        return passResult;
+      },
+      gitDirty: async () => true,
+      gitStatusPorcelain: async () => " M notes/agent.md\n M tasks/todo.md\n",
+    },
+  );
+  assert.equal(out.passed, true);
+  assert.equal(ran, 1);
+});
+
+test("gate (#873 review): unsafe config globs cannot waive product dirty block", async () => {
+  // Even if pipeline.yml tried non_product_dirty_globs: ["**"] or ["core/**"],
+  // product paths must still hard-block (fail-closed classify-time filter).
+  for (const bad of ["**", "core/**", "plugin/**", "openspec/**"]) {
+    let ran = 0;
+    const out = await runTestGate(
+      cfgWith({ non_product_dirty_globs: [bad] }),
+      873,
+      "/wt",
+      {
+        detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+        runTests: async () => {
+          ran++;
+          return passResult;
+        },
+        gitDirty: async () => true,
+        gitStatusPorcelain: async () => " M core/scripts/foo.ts\n",
+      },
+    );
+    assert.equal(out.passed, false, `expected block under hostile glob ${bad}`);
+    assert.equal(ran, 0, `test must not run under hostile glob ${bad}`);
+    assert.equal(out.dirtyWorktree, true);
+    assert.match(out.blockReason ?? "", /core\/scripts\/foo\.ts/);
+  }
+});
+
+test("gate (#873 review 2): lockfile/product exact globs cannot waive dirty block", async () => {
+  // Targeted exemptions that miss finite canaries must still hard-block.
+  for (const bad of ["package-lock.json", "core/package.json", "plugin/SKILL.md"]) {
+    let ran = 0;
+    const porcelain =
+      bad === "package-lock.json"
+        ? "?? package-lock.json\n"
+        : ` M ${bad}\n`;
+    const out = await runTestGate(
+      cfgWith({ non_product_dirty_globs: [bad] }),
+      873,
+      "/wt",
+      {
+        detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+        runTests: async () => {
+          ran++;
+          return passResult;
+        },
+        gitDirty: async () => true,
+        gitStatusPorcelain: async () => porcelain,
+      },
+    );
+    assert.equal(out.passed, false, `expected block under targeted glob ${bad}`);
+    assert.equal(ran, 0, `test must not run under targeted glob ${bad}`);
+    assert.equal(out.dirtyWorktree, true);
+    assert.match(out.blockReason ?? "", new RegExp(bad.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+});
+
+test("gate (#873 review 2): product→scratch rename hard-blocks pre-run", async () => {
+  // Porcelain rename destination-only parsing would see only tasks/foo.ts and
+  // waive the gate while product code was deleted/moved.
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => "R  core/scripts/foo.ts -> tasks/foo.ts\n",
+  });
+  assert.equal(out.passed, false);
+  assert.equal(ran, 0);
+  assert.equal(out.dirtyWorktree, true);
+  assert.match(out.blockReason ?? "", /core\/scripts\/foo\.ts/);
+});
+
+test("gate (#873 review 2): product→scratch rename after pass still fails dirty-trust", async () => {
+  let ran = 0;
+  let dirtyCall = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => {
+      dirtyCall++;
+      // clean pre-run; post-pass reports product→scratch rename
+      return dirtyCall > 1;
+    },
+    gitStatusPorcelain: async () =>
+      dirtyCall > 1 ? "R  core/scripts/foo.ts -> tasks/foo.ts\n" : "",
+  });
+  assert.equal(out.passed, false, `expected post-run block: ${JSON.stringify(out)}`);
+  assert.equal(ran, 1);
+  assert.equal(out.dirtyWorktree, true);
+  assert.match(out.blockReason ?? "", /core\/scripts\/foo\.ts/);
+});
+
+test("gate (#873 review): scratch-only dirt after failed test does not invoke salvage", async () => {
+  // Fix harness leaves only tasks/todo.md dirty (no product). Salvage must not
+  // run — non-goal is not expanding salvage to auto-commit agent scratch.
+  let runs = 0;
+  let dirty = false;
+  const salvageCalls: string[] = [];
+  const out = await runTestGate(
+    cfgWith({ max_attempts: 1 }),
+    873,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => {
+        runs++;
+        // After salvage-skip, scratch-only is clean enough → re-run can pass.
+        return runs === 1 ? failResult : passResult;
+      },
+      invoke: async () => {
+        dirty = true;
+        return okInvoke();
+      },
+      gitHead: async () => "h0",
+      gitDirty: async () => dirty,
+      gitStatusPorcelain: async () => (dirty ? " M tasks/todo.md\n" : ""),
+      salvage: async (_wt, _issue, _run, stageLabel) => {
+        salvageCalls.push(stageLabel);
+        return { salvaged: true };
+      },
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [],
+    },
+    "873/2026-08-05T15:18:23Z",
+  );
+  assert.equal(salvageCalls.length, 0, "scratch-only dirt must not invoke salvage");
+  // Scratch-only post-fix is clean enough for trust → tests re-run and can pass.
+  assert.equal(out.passed, true, `expected pass on scratch-only post-fix: ${JSON.stringify(out)}`);
+  assert.equal(runs, 2);
+});
+
+test("gate (#873 review): mixed scratch+product dirt after fix still invokes salvage", async () => {
+  // Product leftover must still be salvaged; scratch presence must not suppress
+  // salvage of product work (salvage itself stages product-only in production).
+  let runs = 0;
+  let dirty = false;
+  let porcelain = "";
+  const salvageCalls: string[] = [];
+  const out = await runTestGate(
+    cfgWith({ max_attempts: 1 }),
+    873,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => {
+        runs++;
+        return runs === 1 ? failResult : passResult;
+      },
+      invoke: async () => {
+        dirty = true;
+        porcelain = " M tasks/todo.md\n M core/scripts/foo.ts\n";
+        return okInvoke();
+      },
+      gitHead: async () => "h0",
+      gitDirty: async () => dirty,
+      gitStatusPorcelain: async () => porcelain,
+      salvage: async (_wt, _issue, _run, stageLabel) => {
+        salvageCalls.push(stageLabel);
+        // Product committed; scratch may remain (product-only salvage).
+        porcelain = " M tasks/todo.md\n";
+        dirty = true; // scratch still dirty, but product-clean is enough
+        return { salvaged: true };
+      },
+      verifyTestFix: async () => ({ ok: true }),
+      gitCommitMessages: async () => [],
+    },
+    "873/2026-08-05T15:18:23Z",
+  );
+  assert.equal(salvageCalls.length, 1, "mixed dirt with product must still salvage");
+  assert.equal(out.passed, true, `expected pass after product salvage: ${JSON.stringify(out)}`);
+});

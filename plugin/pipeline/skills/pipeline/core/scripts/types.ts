@@ -758,6 +758,13 @@ export interface PipelineConfig {
     command?: string;
     max_attempts: number; // max fix-harness invocations before blocking
     timeout: number; // seconds per test/build run
+    /**
+     * Extra path globs treated as non-product scratch for format/test gate trust
+     * (#873). **Unioned** with the engine-known set (`tasks/**`,
+     * `.pipeline-prompt-*` at worktree root) — never replaces product fail-closed
+     * defaults. Lockfiles are not scratch (handled by lockfile fold).
+     */
+    non_product_dirty_globs?: string[];
   };
   // Eval gate (#12). When enabled, runs the repo's eval harness after pre-merge
   // and before ready-to-deploy. gate mode (default) blocks on fail; advisory

@@ -29,6 +29,7 @@ import {
   resolveAdapter,
   registeredAdapterNames,
 } from "./harness-adapters/index.ts";
+import { isSafeScratchExtensionGlob } from "./worktree-dirt.ts";
 
 // A `models.*`/`effort.*` value: an arbitrary alias/effort string, or the
 // "auto" sentinel (#366) resolved via stage-routing.ts at config-load time.
@@ -349,6 +350,37 @@ const PartialConfigSchema = z.object({
       command: z.string().optional().describe("Explicit test command; auto-detected from lockfile when absent."),
       max_attempts: z.number().int().positive().optional().describe("Maximum fix-harness invocations before blocking."),
       timeout: z.number().int().positive().optional().describe("Seconds per test/build run."),
+      non_product_dirty_globs: z
+        .array(z.string())
+        .optional()
+        .superRefine((globs, ctx) => {
+          if (!globs) return;
+          // Reject extension globs that can match product paths so config cannot
+          // waive the dirty-gate trust boundary (#873 review). Classify-time
+          // filtering uses the same helper as a belt-and-suspenders path.
+          for (let i = 0; i < globs.length; i++) {
+            const g = globs[i];
+            if (typeof g !== "string" || !g.trim()) continue;
+            if (!isSafeScratchExtensionGlob(g)) {
+              ctx.addIssue({
+                code: "custom",
+                message:
+                  `non_product_dirty_globs entry ${JSON.stringify(g)} is unsafe: ` +
+                  "scratch extension globs must not match product paths " +
+                  "(core/, plugin/, openspec/, hosts/, scripts/, package roots, " +
+                  "recognized lockfiles, or repo-wide patterns). " +
+                  "Use a narrow non-product namespace (e.g. notes/**).",
+                path: [i],
+              });
+            }
+          }
+        })
+        .describe(
+          "Extra path globs treated as non-product scratch for format/test gate trust (#873). " +
+            "Unioned with the engine-known set (tasks/**, .pipeline-prompt-* at worktree root); " +
+            "does not replace product fail-closed defaults. Must not match product trees " +
+            "(core/, plugin/, openspec/) or repo-wide patterns (**). Lockfiles remain fold targets, not scratch.",
+        ),
     })
     .strict()
     .optional()
@@ -1326,6 +1358,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       command: fileConfig.test_gate?.command,
       max_attempts: fileConfig.test_gate?.max_attempts ?? DEFAULT_CONFIG.test_gate.max_attempts,
       timeout: fileConfig.test_gate?.timeout ?? DEFAULT_CONFIG.test_gate.timeout,
+      non_product_dirty_globs: fileConfig.test_gate?.non_product_dirty_globs,
     },
     eval_gate: {
       enabled: fileConfig.eval_gate?.enabled ?? DEFAULT_CONFIG.eval_gate.enabled,
@@ -2481,6 +2514,16 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       : `  # command: pnpm test # ${sd("test_gate.command", "explicit command; auto-detected when absent")}`,
     `  max_attempts: ${yamlScalar(testGate.max_attempts)} # ${sd("test_gate.max_attempts", "fix-harness invocations before blocking")}`,
     `  timeout: ${yamlScalar(testGate.timeout)} # ${sd("test_gate.timeout", "seconds per test/build run")}`,
+    // Optional: extra non-product scratch globs for gate trust (#873). Engine-
+    // known set (tasks/**, .pipeline-prompt-*) is always active; this only extends.
+    ...(testGate.non_product_dirty_globs && testGate.non_product_dirty_globs.length > 0
+      ? [
+          `  non_product_dirty_globs: # ${sd("test_gate.non_product_dirty_globs", "extra scratch globs unioned with engine-known tasks/** and .pipeline-prompt-* for format/test gate trust (#873)")}`,
+          ...testGate.non_product_dirty_globs.map((g) => `    - ${yamlScalar(g)}`),
+        ]
+      : [
+          `  # non_product_dirty_globs: [] # ${sd("test_gate.non_product_dirty_globs", "extra scratch globs unioned with engine-known tasks/** and .pipeline-prompt-* for format/test gate trust (#873)")}`,
+        ]),
     "",
     "visual_gate: # run the repo's E2E/visual suite after pre-merge and before eval-gate",
     `  enabled: ${yamlScalar(visualGate.enabled)} # ${sd("visual_gate.enabled", "set true to enable (one-time declaration per repo)")}`,

@@ -4,11 +4,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  productOnlyCommitArgs,
   runFormatGate,
   runFormatAndTestGates,
+  unstageScratchArgs,
   type FormatGateDeps,
   type FormatTestGateDeps,
 } from "../scripts/stages/format-gate.ts";
+import { classifyWorktreeDirt } from "../scripts/worktree-dirt.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 // Minimal config builder — only format_gate is relevant here.
@@ -240,6 +243,100 @@ test("format gate: pre-existing dirty worktree blocks before any command runs", 
     "reason" in result && result.reason.includes("pre-existing uncommitted changes"),
     `unexpected reason: ${JSON.stringify(result)}`,
   );
+});
+
+test("format gate (#873): scratch-only pre-dirty does not refuse auto-fix gate", async () => {
+  // Product tree is clean; only tasks/todo.md is dirty. Pre-flight must proceed
+  // so implement certification is not still blocked by agent scratch.
+  let execCalls = 0;
+  const result = await runFormatGate(
+    "/wt",
+    cfg([{ command: "cargo fmt", auto_fix: true }]),
+    873,
+    {
+      execInWorktree: async () => {
+        execCalls++;
+        return { code: 0, combined: "" };
+      },
+      // Injected boolean dirty would still block; use porcelain classification
+      // (no gitIsDirty override) so scratch-only is clean enough.
+      gitStatusPorcelain: async () => " M tasks/todo.md\n?? .pipeline-prompt-abc.txt\n",
+      gitIsDirty: undefined,
+    },
+  );
+  assert.equal(result.status, "ok", `unexpected: ${JSON.stringify(result)}`);
+  assert.equal(execCalls, 1, "format command must run when only scratch is dirty");
+});
+
+test("format gate (#873): mixed scratch + product pre-dirty still blocks", async () => {
+  const result = await runFormatGate(
+    "/wt",
+    cfg([{ command: "cargo fmt", auto_fix: true }]),
+    873,
+    {
+      execInWorktree: async () => {
+        throw new Error("should not run when product dirt is present");
+      },
+      gitStatusPorcelain: async () => " M tasks/todo.md\n M core/scripts/foo.ts\n",
+    },
+  );
+  assert.equal(result.status, "blocked");
+  assert.ok(
+    "reason" in result && result.reason.includes("pre-existing uncommitted changes"),
+    `unexpected reason: ${JSON.stringify(result)}`,
+  );
+});
+
+test("format gate (#873 review 2): product→scratch rename hard-blocks pre-flight", async () => {
+  // Rename source is product; destination-only parsing would treat as scratch-only.
+  const result = await runFormatGate(
+    "/wt",
+    cfg([{ command: "cargo fmt", auto_fix: true }]),
+    873,
+    {
+      execInWorktree: async () => {
+        throw new Error("should not run when product rename source is dirty");
+      },
+      gitStatusPorcelain: async () => "R  core/scripts/foo.ts -> tasks/foo.ts\n",
+    },
+  );
+  assert.equal(result.status, "blocked");
+  assert.ok(
+    "reason" in result && result.reason.includes("pre-existing uncommitted changes"),
+    `unexpected reason: ${JSON.stringify(result)}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// #873 review: auto-format commit must not include pre-staged scratch
+// ---------------------------------------------------------------------------
+
+test("format gate (#873 review): product-only commit plan unstages scratch and pathspec-commits product", () => {
+  // Staged scratch (index) + formatter-produced product change: the default
+  // commit path must unstage tasks/todo.md and commit only the product path.
+  const paths = ["tasks/todo.md", "core/scripts/foo.ts"];
+  const { product, scratch } = classifyWorktreeDirt(paths);
+  assert.deepEqual(product, ["core/scripts/foo.ts"]);
+  assert.deepEqual(scratch, ["tasks/todo.md"]);
+
+  const unstage = unstageScratchArgs(scratch);
+  assert.ok(unstage, "scratch must be unstaged before commit");
+  assert.deepEqual(unstage, ["restore", "--staged", "--", "tasks/todo.md"]);
+  assert.ok(!unstage.includes("core/scripts/foo.ts"), "must not unstage product");
+
+  const commitArgs = productOnlyCommitArgs("chore: auto-format (#873)", product);
+  assert.deepEqual(commitArgs, [
+    "commit",
+    "-m",
+    "chore: auto-format (#873)",
+    "--",
+    "core/scripts/foo.ts",
+  ]);
+  assert.ok(!commitArgs.includes("tasks/todo.md"), "scratch must not appear in commit pathspec");
+});
+
+test("format gate (#873 review): unstageScratchArgs is null when no scratch", () => {
+  assert.equal(unstageScratchArgs([]), null);
 });
 
 // ---------------------------------------------------------------------------

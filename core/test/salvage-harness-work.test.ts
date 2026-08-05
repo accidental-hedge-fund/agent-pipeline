@@ -740,3 +740,70 @@ test("regression #522: SALVAGE_MARKER_EXCLUDE carries a depth-agnostic exclusion
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// #873: product-only salvage (onlyPaths) — scratch must not enter the commit
+// ---------------------------------------------------------------------------
+
+test("salvage (#873 onlyPaths): stages product only and unstages pre-staged scratch", async () => {
+  const restoreCalls: string[][] = [];
+  let addArgs: string[] | null = null;
+  const deps: SalvageDeps = {
+    gitStatus: async () => "M  tasks/todo.md\n M core/scripts/foo.ts\n",
+    gitRestoreStaged: async (_wt, args) => {
+      restoreCalls.push([...args]);
+    },
+    gitAddAll: async (_wt, args) => {
+      addArgs = [...args];
+    },
+    gitCommit: async () => {},
+    onlyPaths: ["core/scripts/foo.ts"],
+  };
+  const res = await salvageUncommittedWork("/wt", 873, RUN_ID, "test-fix", deps);
+  assert.equal(res.salvaged, true);
+
+  // Marker restore first, then non-product unstage
+  assert.ok(restoreCalls.length >= 2, `expected marker + scratch unstage; got ${restoreCalls.length}`);
+  const scratchRestore = restoreCalls.find((a) => a.includes("tasks/todo.md"));
+  assert.ok(scratchRestore, "must unstage tasks/todo.md before product-only add");
+  assert.ok(addArgs !== null, "gitAddAll must be called");
+  assert.ok((addArgs as string[]).includes("core/scripts/foo.ts"), "must add product path");
+  assert.ok(
+    !(addArgs as string[]).includes("tasks/todo.md"),
+    "must not add scratch path",
+  );
+});
+
+test("salvage (#873 onlyPaths): scratch-only dirty → {salvaged: false}, no add/commit", async () => {
+  let addCalled = false;
+  let commitCalled = false;
+  const deps: SalvageDeps = {
+    gitStatus: async () => " M tasks/todo.md\n",
+    gitRestoreStaged: async () => {},
+    gitAddAll: async () => {
+      addCalled = true;
+    },
+    gitCommit: async () => {
+      commitCalled = true;
+    },
+    onlyPaths: ["core/scripts/foo.ts"], // product list empty vs porcelain
+  };
+  const res = await salvageUncommittedWork("/wt", 873, RUN_ID, "test-fix", deps);
+  assert.deepEqual(res, { salvaged: false });
+  assert.equal(addCalled, false);
+  assert.equal(commitCalled, false);
+});
+
+test("salvage (#873 onlyPaths): empty onlyPaths → {salvaged: false} without status work", async () => {
+  let statusCalled = false;
+  const deps: SalvageDeps = {
+    gitStatus: async () => {
+      statusCalled = true;
+      return " M core/scripts/foo.ts\n";
+    },
+    onlyPaths: [],
+  };
+  const res = await salvageUncommittedWork("/wt", 873, RUN_ID, "test-fix", deps);
+  assert.deepEqual(res, { salvaged: false });
+  assert.equal(statusCalled, false, "empty onlyPaths short-circuits before status");
+});
