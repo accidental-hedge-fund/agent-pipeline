@@ -1057,9 +1057,39 @@ export function buildBlockedComment(args: {
   ts: string;
   reason: string;
   kind: BlockerKind;
+  /** Engine version for attribution stamp (#763). Defaults to unknown. */
+  engineVersion?: string | null;
+  /** Engine commit SHA for attribution stamp (#763). Defaults to unknown. */
+  engineCommitSha?: string | null;
+  /** Discovery channel when known (#763). Defaults to live-run for advance parks. */
+  discoveryChannel?: import("./engine-attribution.ts").DiscoveryChannel | null;
 }): string {
+  // Lazy import keeps gh.ts load light for paths that never block; markers are pure.
   // Machine-readable kind marker so capacity admission can re-classify after a
   // failed clearBlocked + re-dispatch without a fresh blocker_set event (#718).
+  // Engine + discovery stamps (#763) are additive HTML comments.
+  let attribution = "";
+  try {
+    // Dynamic-style static import at module level would cycle; use require via
+    // pre-imported helpers when available. Inline markers match engine-attribution
+    // grammar so parsers stay single-sourced in tests.
+    const version =
+      typeof args.engineVersion === "string" && args.engineVersion.trim()
+        ? args.engineVersion.trim()
+        : "unknown";
+    const sha =
+      typeof args.engineCommitSha === "string" && args.engineCommitSha.trim()
+        ? args.engineCommitSha.trim()
+        : "unknown";
+    const channel = args.discoveryChannel ?? "live-run";
+    attribution =
+      `\n<!-- pipeline:engine version=${version} sha=${sha} -->` +
+      `\n<!-- pipeline:discovery-channel ${channel} -->`;
+  } catch {
+    attribution =
+      `\n<!-- pipeline:engine version=unknown sha=unknown -->` +
+      `\n<!-- pipeline:discovery-channel live-run -->`;
+  }
   return [
     `## Pipeline: Blocked at ${String(args.stageStr).replace(/-/g, " ")}`,
     "",
@@ -1071,7 +1101,7 @@ export function buildBlockedComment(args: {
     "",
     "### How to unblock",
     renderRecipe(args.kind, args.issueNumber),
-  ].join("\n") + COMMENT_FOOTER + `\n<!-- pipeline-blocker-kind: ${args.kind} -->`;
+  ].join("\n") + COMMENT_FOOTER + `\n<!-- pipeline-blocker-kind: ${args.kind} -->` + attribution;
 }
 
 /**
@@ -1205,6 +1235,9 @@ export function buildAttestedBlockedComment(args: {
   reason: string;
   kind: BlockerKind;
   runId: string;
+  engineVersion?: string | null;
+  engineCommitSha?: string | null;
+  discoveryChannel?: import("./engine-attribution.ts").DiscoveryChannel | null;
 }): string {
   const rendered = buildBlockedComment(args) + "\n" + buildAuditSentinel(args.runId, "blocked");
   return attestPipelineComment("blocked", rendered);
@@ -1239,7 +1272,32 @@ export async function setBlocked(
   const harness = getHarnessLabel(detail.labels) ?? "unassigned";
 
   const effectiveRunId = _activeRunId ?? "unknown";
-  const body = buildAttestedBlockedComment({ issueNumber, stageStr, harness, ts, reason, kind, runId: effectiveRunId });
+  // Engine + discovery stamps on blocker comments (#763). Best-effort: unresolved
+  // identity becomes explicit unknown markers inside buildBlockedComment.
+  let engineVersion: string | null = null;
+  let engineCommitSha: string | null = null;
+  try {
+    const { resolvePinnedEngineIdentity } = await import("./engine-identity.ts");
+    const id = resolvePinnedEngineIdentity();
+    if (id) {
+      engineVersion = id.version;
+      engineCommitSha = id.commit_sha ?? null;
+    }
+  } catch {
+    // non-fatal — markers still emit unknown
+  }
+  const body = buildAttestedBlockedComment({
+    issueNumber,
+    stageStr,
+    harness,
+    ts,
+    reason,
+    kind,
+    runId: effectiveRunId,
+    engineVersion,
+    engineCommitSha,
+    discoveryChannel: "live-run",
+  });
 
   await _addBlockedLabel(cfg, issueNumber);
   await retryComment(() => _postComment(cfg, issueNumber, body), 3, _sleep);

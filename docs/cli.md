@@ -162,8 +162,8 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `scoreboard`
 
-- **Usage:** `pipeline scoreboard [--bucket day|week] [--by <dim>] [--html <path>]`
-- **Summary:** Print read-only factory throughput/cost/reliability metrics from run artifacts
+- **Usage:** `pipeline scoreboard [--days <n>|--since <iso>] [--until <iso>] [--bucket day|week] [--by <dim>] [--json] [--html <path>]`
+- **Summary:** Print read-only factory throughput/cost/reliability metrics from run artifacts (incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763)
 
 #### `summary`
 

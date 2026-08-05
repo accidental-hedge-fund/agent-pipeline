@@ -25,6 +25,26 @@ import {
   extractTesterMetricsFromEvent,
   type TesterOverallStatus,
 } from "./tester-evidence.ts";
+import type { EscapeRecurrenceResult } from "./escape-recurrence.ts";
+import {
+  computeCandidateIntegrityMetrics,
+  computeDiscoveryChannelBreakdown,
+  computeEngineClassReleaseSeries,
+  computeEscapeRecurrenceFromArtifacts,
+  computeHumanTouchMetrics,
+  computeStratifiedStabilizationMetrics,
+  type CandidateIntegrityMetrics,
+  type DiscoveryChannelBreakdown,
+  type EngineClassReleaseSeries,
+  type FrgTrendLedgerEntryLite,
+  type HumanTouchMetrics,
+  type StratifiedStabilizationMetrics,
+  type StabilizationRun,
+} from "./scoreboard-stabilization.ts";
+
+/** Repo-relative FRG trend ledger path (#757) — duplicated string to avoid
+ *  importing factory-reliability-gate (config/zod) into the scoreboard graph. */
+const FRG_TREND_LEDGER_REL = path.join(".agent-pipeline", "frg", "trend-ledger.jsonl");
 
 type JsonRecord = Record<string, unknown>;
 
@@ -301,6 +321,22 @@ export interface ScoreboardMetrics {
     by_overall_status: Partial<Record<TesterOverallStatus, number>>;
     targeted_check_count: number;
   };
+  /**
+   * Stabilization / attribution metrics (#763). Always present; rates use
+   * explicit numerators/denominators with `ratio: null` when denom is 0.
+   */
+  human_touches: HumanTouchMetrics;
+  discovery_channel: DiscoveryChannelBreakdown;
+  escape_recurrence: {
+    classes_with_fix_boundary: number;
+    classes_with_post_fix_occurrence: number;
+    ratio: RateValue;
+    by_key: EscapeRecurrenceResult["by_key"];
+    unmapped_occurrence_count: number;
+    missing_boundary_keys: string[];
+  };
+  stratified: StratifiedStabilizationMetrics;
+  candidate_integrity: CandidateIntegrityMetrics;
 }
 
 export interface ScoreboardTotals {
@@ -336,6 +372,11 @@ export interface ScoreboardReport {
   corrections?: CorrectionMetrics;
   correctionsBy?: CorrectionsByDimension;
   correctionsGrouping?: CorrectionGrouping;
+  /**
+   * Release-over-release engine-class needs-human / rate series (#763).
+   * Prefers FRG trend ledger observations when present.
+   */
+  engine_class_release_series?: EngineClassReleaseSeries;
 }
 
 export interface ScoreboardOpts {
@@ -561,13 +602,56 @@ export async function buildScoreboardReport(
     core.totals.successful_prs,
   );
 
-  const diagnostics = [...core.diagnostics, ...correctionDiagnostics];
+  // #763 stabilization / attribution metrics (additive; pure over scan + ledger).
+  const stabRuns = toStabilizationRuns(scan.runs);
+  const humanTouches = computeHumanTouchMetrics(stabRuns);
+  const discoveryChannel = computeDiscoveryChannelBreakdown(stabRuns);
+  const escapeRecurrence = computeEscapeRecurrenceFromArtifacts(stabRuns, attributions);
+  const stratifiedResult = computeStratifiedStabilizationMetrics(stabRuns);
+  const candidateResult = computeCandidateIntegrityMetrics(stabRuns);
+  const frgEntries = await readFrgTrendLedger(opts.repoDir, deps, correctionDiagnostics);
+  const engineClassReleaseSeries = computeEngineClassReleaseSeries({
+    frgTrendEntries: frgEntries,
+    path: path.join(opts.repoDir, FRG_TREND_LEDGER_REL),
+  });
+
+  const metricsWithStab: ScoreboardMetrics = {
+    ...core.metrics,
+    human_touches: humanTouches,
+    discovery_channel: discoveryChannel,
+    escape_recurrence: {
+      classes_with_fix_boundary: escapeRecurrence.classes_with_fix_boundary,
+      classes_with_post_fix_occurrence: escapeRecurrence.classes_with_post_fix_occurrence,
+      ratio: escapeRecurrence.ratio,
+      by_key: escapeRecurrence.by_key,
+      unmapped_occurrence_count: escapeRecurrence.unmapped_occurrence_count,
+      missing_boundary_keys: escapeRecurrence.missing_boundary_keys,
+    },
+    stratified: stratifiedResult.metrics,
+    candidate_integrity: candidateResult.metrics,
+  };
+
+  const stabDiagnostics: ScoreboardDiagnostic[] = [
+    ...escapeRecurrence.diagnostics.map((d) => ({
+      severity: "warning" as const,
+      code: d.code,
+      path: opts.repoDir,
+      message: d.message,
+    })),
+    ...stratifiedResult.diagnostics,
+    ...candidateResult.diagnostics,
+    ...engineClassReleaseSeries.diagnostics,
+  ];
+
+  const diagnostics = [...core.diagnostics, ...correctionDiagnostics, ...stabDiagnostics];
   const report: ScoreboardReport = {
     ...core,
+    metrics: metricsWithStab,
     diagnostics,
     totals: { ...core.totals, diagnostics: diagnostics.length },
     corrections,
     ...(correctionsBy ? { correctionsBy, correctionsGrouping } : {}),
+    engine_class_release_series: engineClassReleaseSeries,
   };
   if (bucket === null) return report;
 
@@ -575,10 +659,63 @@ export async function buildScoreboardReport(
   const assigned = assignRunsToPeriods(periods, scan.runs);
   const correctionsByPeriod = partitionCorrectionInstancesByPeriod(correctionInstances, assigned);
   const series: ScoreboardPeriod[] = periods.map((period, i) => {
-    const entry = buildPeriodEntry(period, assigned[i], estimates, groupBy);
+    const entry = buildPeriodEntry(period, assigned[i], estimates, groupBy, attributions);
     return { ...entry, corrections: computeCorrectionTotals(correctionsByPeriod[i], entry.totals.successful_prs) };
   });
   return { ...report, bucket, series };
+}
+
+function toStabilizationRuns(runs: IncludedRun[]): StabilizationRun[] {
+  return runs.map((r) => ({
+    runId: r.runId,
+    dir: r.dir,
+    runJson: r.runJson,
+    events: r.events,
+    summary: r.summary,
+    startAt: r.startAt,
+    issue: r.issue,
+    pr: r.pr,
+    finalState: r.finalState,
+  }));
+}
+
+/** Read FRG trend-ledger.jsonl (#757 consumer for #763 release series). */
+async function readFrgTrendLedger(
+  repoDir: string,
+  deps: Pick<ScoreboardDeps, "readFile">,
+  diagnostics: ScoreboardDiagnostic[],
+): Promise<FrgTrendLedgerEntryLite[] | null> {
+  const ledgerPath = path.join(repoDir, FRG_TREND_LEDGER_REL);
+  let raw: string;
+  try {
+    raw = await deps.readFile(ledgerPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    diagnostics.push({
+      severity: "warning",
+      code: "frg_trend_ledger_unreadable",
+      path: ledgerPath,
+      message: `FRG trend ledger could not be read: ${(err as Error).message}`,
+    });
+    return null;
+  }
+  const entries: FrgTrendLedgerEntryLite[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as FrgTrendLedgerEntryLite;
+      if (parsed && typeof parsed.version === "string") entries.push(parsed);
+    } catch {
+      diagnostics.push({
+        severity: "warning",
+        code: "frg_trend_ledger_corrupt_line",
+        path: ledgerPath,
+        message: "FRG trend ledger contains an invalid JSON line",
+      });
+    }
+  }
+  return entries;
 }
 
 interface PeriodBounds {
@@ -644,8 +781,9 @@ function buildPeriodEntry(
   runs: IncludedRun[],
   costEstimates: Record<string, number>,
   groupBy: ScoreboardGroupBy | null,
+  attributions: ControlAttribution[] = [],
 ): ScoreboardPeriod {
-  const core = reduceRunsCore(runs, costEstimates, groupBy);
+  const core = reduceRunsCore(runs, costEstimates, groupBy, attributions);
   return {
     start: period.start,
     end: period.end,
@@ -1349,7 +1487,7 @@ function aggregateRuns(
   costEstimates: Record<string, number>,
   groupBy: ScoreboardGroupBy | null,
 ): ScoreboardReport {
-  const core = reduceRunsCore(scan.runs, costEstimates, groupBy);
+  const core = reduceRunsCore(scan.runs, costEstimates, groupBy, []);
   const diagnostics = [...scan.diagnostics, ...core.diagnostics];
 
   return {
@@ -1372,6 +1510,7 @@ function reduceRunsCore(
   runs: IncludedRun[],
   costEstimates: Record<string, number>,
   groupBy: ScoreboardGroupBy | null = null,
+  attributions: ControlAttribution[] = [],
 ): ReducedCore {
   const diagnostics: ScoreboardDiagnostic[] = [];
   const readyGroups = new Map<number, PrGroup>();
@@ -1621,9 +1760,46 @@ function reduceRunsCore(
       ) as Partial<Record<TesterOverallStatus, number>>,
       targeted_check_count: testerTargetedCheckCount,
     },
+    // #763 defaults — buildScoreboardReport overwrites with full-window
+    // collectors; period entries recompute via attributions argument.
+    ...computeStabilizationMetricSlice(runs, attributions),
   };
 
   return { readyRuns, successfulPrs, metrics, diagnostics, grouping };
+}
+
+/** Pure #763 metric slice used by reduceRunsCore (window and period). */
+function computeStabilizationMetricSlice(
+  runs: IncludedRun[],
+  attributions: ControlAttribution[],
+): Pick<
+  ScoreboardMetrics,
+  | "human_touches"
+  | "discovery_channel"
+  | "escape_recurrence"
+  | "stratified"
+  | "candidate_integrity"
+> {
+  const stab = toStabilizationRuns(runs);
+  const human_touches = computeHumanTouchMetrics(stab);
+  const discovery_channel = computeDiscoveryChannelBreakdown(stab);
+  const escape = computeEscapeRecurrenceFromArtifacts(stab, attributions);
+  const stratified = computeStratifiedStabilizationMetrics(stab).metrics;
+  const candidate_integrity = computeCandidateIntegrityMetrics(stab).metrics;
+  return {
+    human_touches,
+    discovery_channel,
+    escape_recurrence: {
+      classes_with_fix_boundary: escape.classes_with_fix_boundary,
+      classes_with_post_fix_occurrence: escape.classes_with_post_fix_occurrence,
+      ratio: escape.ratio,
+      by_key: escape.by_key,
+      unmapped_occurrence_count: escape.unmapped_occurrence_count,
+      missing_boundary_keys: escape.missing_boundary_keys,
+    },
+    stratified,
+    candidate_integrity,
+  };
 }
 
 /** Resolves the group key an accounting record falls into for a single
@@ -2623,6 +2799,26 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
   lines.push(`Eval pass rate: ${formatGate(report.metrics.gate_pass_rates.eval)}`);
   lines.push(`Shipcheck pass rate: ${formatGate(report.metrics.gate_pass_rates.shipcheck)}`);
 
+  appendStabilizationHumanSection(lines, report.metrics);
+
+  if (report.engine_class_release_series) {
+    lines.push("");
+    lines.push("Engine-class needs-human release-over-release:");
+    if (report.engine_class_release_series.entries.length === 0) {
+      lines.push(`  (none; source=${report.engine_class_release_series.source})`);
+    } else {
+      for (const e of report.engine_class_release_series.entries) {
+        const rateStr =
+          e.engine_class_rate === null ? "n/a" : `${(e.engine_class_rate * 100).toFixed(1)}%`;
+        lines.push(
+          `  ${e.version}: engine-class rate ${rateStr}` +
+            (e.engine_class_count != null ? ` (${e.engine_class_count} engine-class)` : "") +
+            ` [${e.source}]`,
+        );
+      }
+    }
+  }
+
   if (report.by && report.grouping) {
     lines.push("");
     appendGroupingSection(lines, report.by, report.grouping);
@@ -2661,6 +2857,7 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
       lines.push(`Test pass rate: ${formatGate(period.metrics.gate_pass_rates.test)}`);
       lines.push(`Eval pass rate: ${formatGate(period.metrics.gate_pass_rates.eval)}`);
       lines.push(`Shipcheck pass rate: ${formatGate(period.metrics.gate_pass_rates.shipcheck)}`);
+      appendStabilizationHumanSection(lines, period.metrics, "  ");
       if (period.by && period.grouping) {
         lines.push("");
         appendGroupingSection(lines, period.by, period.grouping);
@@ -2672,6 +2869,109 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
   }
 
   return lines.join("\n");
+}
+
+/** Human-readable #763 stabilization / attribution section.
+ *  Tolerates partial metrics fixtures (e.g. HTML unit tests) when fields absent. */
+function appendStabilizationHumanSection(
+  lines: string[],
+  metrics: ScoreboardMetrics,
+  indent = "",
+): void {
+  const ht = metrics.human_touches;
+  if (ht) {
+    lines.push(`${indent}Human-touch rates:`);
+    lines.push(
+      `${indent}  per attempted issue: ${formatRate(ht.human_touches_per_attempted_issue)} ` +
+        `(${ht.total_touches} touches)`,
+    );
+    lines.push(
+      `${indent}  per R2D issue: ${formatRate(ht.human_touches_per_r2d_issue)} ` +
+        `(${ht.touches_on_r2d_issues} touches on R2D issues)`,
+    );
+    const kindParts = Object.entries(ht.by_kind)
+      .filter(([, n]) => n > 0)
+      .map(([k, n]) => `${k}=${n}`);
+    lines.push(
+      `${indent}  by kind: ${kindParts.length > 0 ? kindParts.join(", ") : "(none)"}`,
+    );
+  }
+
+  const er = metrics.escape_recurrence;
+  if (er) {
+    lines.push(
+      `${indent}Escape-recurrence: ${formatRate(er.ratio)} ` +
+        `(${er.classes_with_post_fix_occurrence}/${er.classes_with_fix_boundary} classes with fix boundary)`,
+    );
+    if (er.missing_boundary_keys.length > 0) {
+      lines.push(
+        `${indent}  missing fix-boundary keys: ${er.missing_boundary_keys.join(", ")}`,
+      );
+    }
+  }
+
+  const dc = metrics.discovery_channel;
+  if (dc) {
+    lines.push(`${indent}Discovery-channel breakdown:`);
+    for (const ch of ["live-run", "review-batch", "papercut-autofile", "manual"] as const) {
+      lines.push(`${indent}  ${ch}: ${dc.by_channel[ch] ?? 0}`);
+    }
+    lines.push(`${indent}  missing-attribution: ${dc.missing_attribution}`);
+  }
+
+  const st = metrics.stratified;
+  if (st) {
+    lines.push(`${indent}Stratified stabilization:`);
+    lines.push(
+      `${indent}  intervention-free first-attempt R2D: ${formatRate(st.intervention_free_first_attempt_r2d)}`,
+    );
+    lines.push(
+      `${indent}  eventual R2D within ${st.eventual_r2d_attempt_bound} attempts: ${formatRate(st.eventual_r2d_within_bound)}`,
+    );
+    lines.push(
+      `${indent}  false product-judgment rate: ${formatRate(st.false_product_judgment_rate)}`,
+    );
+    lines.push(
+      `${indent}  engine blockers per 100 stage attempts: ${formatRatioValue(st.engine_blockers_per_100_stage_attempts)} ` +
+        `(${st.engine_blocker_events} blockers / ${st.stage_attempts} attempts)`,
+    );
+    lines.push(
+      `${indent}  recovery success rate: ${formatRate(st.recovery.success_rate)} ` +
+        `(success=${st.recovery.success} exhaustion=${st.recovery.exhaustion} attempts=${st.recovery.attempts})`,
+    );
+    lines.push(
+      `${indent}  first-pass approval: ${formatRate(st.first_pass_approval_rate)}; ` +
+        `fix rounds=${st.fix_rounds_total}; recurring findings=${st.recurring_findings_total}`,
+    );
+    lines.push(
+      `${indent}  final green/current/mergeable R2D: ${formatRate(st.final_green_current_mergeable_r2d)}`,
+    );
+    lines.push(
+      `${indent}  orphan followers=${st.orphan_followers}; progress gaps=${st.progress_gaps}; ` +
+        `stale worktrees=${st.stale_worktrees}; false capacity waits=${st.false_capacity_waits}`,
+    );
+    lines.push(
+      `${indent}  evidence coverage: ${formatRate(st.evidence_coverage)} ` +
+        `(missing=${st.evidence_missing}/${st.evidence_total})`,
+    );
+  }
+
+  const ci = metrics.candidate_integrity;
+  if (ci) {
+    lines.push(`${indent}Candidate-integrity observability:`);
+    lines.push(
+      `${indent}  events=${ci.total_events}; repairs=${ci.candidate_moving_repairs}; ` +
+        `restacks=${ci.candidate_moving_restacks}; scope-expansion invalidations=${ci.scope_expansion_invalidations}`,
+    );
+    lines.push(
+      `${indent}  review invalidations=${ci.review_invalidations}; readiness invalidations=${ci.readiness_invalidations}; ` +
+        `unverified comparisons=${ci.unverified_comparisons}`,
+    );
+    lines.push(
+      `${indent}  post-repair invariant failures=${ci.post_repair_invariant_failures}; ` +
+        `post-merge invariant escapes=${ci.post_merge_invariant_escapes}`,
+    );
+  }
 }
 
 /** Human-readable pre-merge needs-human rate + class breakdown (#683). */

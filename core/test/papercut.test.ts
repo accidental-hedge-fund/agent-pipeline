@@ -15,6 +15,7 @@ import {
   AUTO_FILE_PROVENANCE_MARKER,
   CORRECTION_AUTO_FILE_PROVENANCE_MARKER,
   DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER,
+  stampAutoFileAttribution,
   countsTowardCategoryRateCap,
   issueNumberFromUrl,
   type PapercutDeps,
@@ -1262,6 +1263,47 @@ test("autoFileCorrections: an unauthenticated gh resolves without throwing and c
 
 test("autoFileCorrections: papercut and correction auto-file provenance markers are distinct", () => {
   assert.notEqual(CORRECTION_AUTO_FILE_PROVENANCE_MARKER, "<!-- pipeline:papercut-auto-filed -->");
+});
+
+test("stampAutoFileAttribution: engine + discovery-channel stamps; unresolved SHA is unknown; category marker preserved (#763)", () => {
+  const body = stampAutoFileAttribution(
+    [AUTO_FILE_PROVENANCE_MARKER, "## Agent-reported friction", "", "detail"].join("\n"),
+    { version: "1.31.0", commit_sha: "abc123def" },
+  );
+  assert.ok(body.includes(AUTO_FILE_PROVENANCE_MARKER));
+  assert.match(body, /<!-- pipeline:engine version=1\.31\.0 sha=abc123def -->/);
+  assert.match(body, /<!-- pipeline:discovery-channel papercut-autofile -->/);
+
+  const unresolved = stampAutoFileAttribution(
+    [CORRECTION_AUTO_FILE_PROVENANCE_MARKER, "body"].join("\n"),
+    { version: "1.31.0", commit_sha: null },
+  );
+  assert.ok(unresolved.includes(CORRECTION_AUTO_FILE_PROVENANCE_MARKER));
+  assert.match(unresolved, /sha=unknown/);
+  assert.match(unresolved, /discovery-channel papercut-autofile/);
+
+  const durable = stampAutoFileAttribution(
+    [DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER, "body"].join("\n"),
+    { version: null, commit_sha: null },
+  );
+  assert.ok(durable.includes(DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER));
+  assert.match(durable, /version=unknown/);
+  // Category markers still drive rate-cap membership — stamps alone are insufficient.
+  assert.equal(
+    countsTowardCategoryRateCap(
+      {
+        title: "t",
+        url: "https://github.com/o/r/issues/1",
+        state: "OPEN",
+        createdAt: new Date().toISOString(),
+        labels: ["pipeline:backlog"],
+        body: durable,
+      },
+      DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER,
+      0,
+    ),
+    true,
+  );
 });
 
 // ---------------------------------------------------------------------------

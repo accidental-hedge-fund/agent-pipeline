@@ -1082,11 +1082,13 @@ export async function runAdvance(
           if (deps.resolveEngineTrackFields) {
             return { ...base, ...deps.resolveEngineTrackFields(base, trackIntent) };
           }
-          const fields: Pick<RunEngineIdentity, "track" | "pin_version" | "git_sha"> = {
+          const fields: Pick<RunEngineIdentity, "track" | "pin_version" | "git_sha" | "commit_sha"> = {
             track: trackForEvidence ?? (trackIntent === "candidate" ? "candidate" : "pinned"),
           };
           if (pinVersionForEvidence) fields.pin_version = pinVersionForEvidence;
           if (gitShaForEvidence) fields.git_sha = gitShaForEvidence;
+          // Engine checkout SHA (#763) — from resolvePinnedEngineIdentity; never invent.
+          if (base.commit_sha) fields.commit_sha = base.commit_sha;
           return { ...base, ...fields };
         },
         runStoreDeps,

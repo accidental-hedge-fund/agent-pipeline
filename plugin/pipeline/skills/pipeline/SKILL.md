@@ -90,7 +90,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline correction record|attribute …         Record a correction event or attribute a control (append-only local ledger)
 /pipeline logs [<run-id>] [--events] [-f] [--no-until-terminal] List or stream pipeline run logs (events --follow exits 0 on terminal run_complete)
 /pipeline report [--yes]                        Privacy-safe product-fault report preview/submit (optional; off by default in config)
-/pipeline scoreboard [--bucket day|week] [--by <dim>] [--html <path>] Print read-only factory throughput/cost/reliability metrics from run artifacts
+/pipeline scoreboard [--days <n>|--since <iso>] [--until <iso>] [--bucket day|week] [--by <dim>] [--json] [--html <path>] Print read-only factory throughput/cost/reliability metrics from run artifacts (incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763)
 /pipeline summary <run-id>                      Print the run evidence bundle for an issue number or exact run-id
 /pipeline config schema|validate|sync|repo-map … Config schema, validate, sync scaffold, and repo-map mutations
 /pipeline path [--json]                         Discover installed host skill paths (JSON-friendly for desktop integrators)

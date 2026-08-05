@@ -89,6 +89,42 @@ test("emitHumanIntervention: writes a valid JSON line to events.jsonl", async ()
   assert.equal(event.issue, 42);
   assert.equal(event.detail, "npm test failed");
   assert.ok(typeof event.at === "string" && event.at.endsWith("Z"));
+  // #763: default discovery_channel for ordinary advance is live-run
+  assert.equal(event.discovery_channel, "live-run");
+});
+
+test("emitHumanIntervention: stamps engine + discovery attribution when provided (#763)", async () => {
+  const lines: string[] = [];
+  await emitHumanIntervention(
+    "/fake/run",
+    {
+      kind: "human-risk-override",
+      stage: "pre-merge",
+      issue: 7,
+      detail: "operator override",
+      engine_version: "1.31.0",
+      engine_commit_sha: "deadbeef",
+      discovery_channel: "live-run",
+    },
+    fakeDeps(lines),
+  );
+  const event = JSON.parse(lines[0]) as HumanInterventionEvent;
+  assert.equal(event.kind, "human-risk-override");
+  assert.equal(event.engine_version, "1.31.0");
+  assert.equal(event.engine_commit_sha, "deadbeef");
+  assert.equal(event.discovery_channel, "live-run");
+});
+
+test("emitHumanIntervention: historical-shaped payload without engine fields still writes (#763)", async () => {
+  const lines: string[] = [];
+  await emitHumanIntervention(
+    "/fake/run",
+    { kind: "human-risk-override", stage: null, issue: 1, detail: "legacy" },
+    fakeDeps(lines),
+  );
+  const event = JSON.parse(lines[0]) as HumanInterventionEvent;
+  assert.equal(event.kind, "human-risk-override");
+  assert.ok(event.detail);
 });
 
 test("emitHumanIntervention: appends to events.jsonl path inside runDir", async () => {

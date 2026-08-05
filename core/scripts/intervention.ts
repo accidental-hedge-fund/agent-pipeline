@@ -8,6 +8,11 @@ import * as path from "node:path";
 import * as fsp from "node:fs/promises";
 import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
 import { type BlockerKind } from "./types.ts";
+import {
+  buildEventAttributionFields,
+  DEFAULT_LIVE_RUN_CHANNEL,
+  type DiscoveryChannel,
+} from "./engine-attribution.ts";
 
 // ---------------------------------------------------------------------------
 // Taxonomy
@@ -48,6 +53,14 @@ export interface HumanInterventionEvent {
    * historical events.
    */
   offramp_id?: string;
+  /**
+   * Engine + discovery attribution (#763). Additive optional — collectors may
+   * also inherit from `run.json.engine` + run-level channel default when
+   * omitted. Historical events without these fields remain countable.
+   */
+  engine_version?: string;
+  engine_commit_sha?: string | null;
+  discovery_channel?: DiscoveryChannel;
 }
 
 // ---------------------------------------------------------------------------
@@ -85,11 +98,22 @@ export async function emitHumanIntervention(
     ref?: string | null;
     /** Shared pair id with co-emitted blocker_set (#683 review 2). */
     offramp_id?: string;
+    /** Optional engine identity for attribution stamps (#763). */
+    engine_version?: string | null;
+    engine_commit_sha?: string | null;
+    discovery_channel?: DiscoveryChannel | null;
   },
   deps: EmitInterventionDeps = defaultEmitDeps,
 ): Promise<void> {
   if (!runDir) return;
   try {
+    // Attribution enrichment is best-effort: failure to resolve identity must
+    // never change the stage outcome (non-fatal emission remains).
+    const attribution = buildEventAttributionFields({
+      version: payload.engine_version,
+      commit_sha: payload.engine_commit_sha,
+      discovery_channel: payload.discovery_channel ?? DEFAULT_LIVE_RUN_CHANNEL,
+    });
     const event: HumanInterventionEvent = {
       schema_version: 1,
       type: "human_intervention",
@@ -104,6 +128,7 @@ export async function emitHumanIntervention(
       ...(payload.offramp_id != null && payload.offramp_id !== ""
         ? { offramp_id: payload.offramp_id }
         : {}),
+      ...attribution,
     };
     const line = `${JSON.stringify(event)}\n`;
     await deps.appendFile(path.join(runDir, "events.jsonl"), line);

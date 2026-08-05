@@ -870,6 +870,12 @@ export interface RunEngineIdentity {
   pin_version?: string;
   /** Release git SHA when known; omit rather than invent (#762). */
   git_sha?: string;
+  /**
+   * Git commit of the engine root checkout when resolvable at init (#763).
+   * Distinct from `git_sha` (production pin). Omitted/null when unresolvable —
+   * never invented. Write-once with the rest of `engine`.
+   */
+  commit_sha?: string | null;
 }
 
 export interface RunMeta {

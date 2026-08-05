@@ -2595,9 +2595,23 @@ async function main(): Promise<void> {
       "and prints throughput, autonomy, cost, duration, retry, blocker, fallback, and gate metrics.\n" +
       "Includes pre-merge needs-human rate and by-class breakdown (ci-failed, delta-review,\n" +
       "merge-conflict, OpenSpec, other) derived from durable run events — never issue comments.\n\n" +
-      "Dogfood-day query (one-day class breakdown as JSON):\n" +
+      "Stabilization / attribution metrics (#763) — offline from ledgers + optional FRG trend ledger:\n" +
+      "  human-touch rates (per attempted / per R2D issue; discrete event counts, not labor minutes)\n" +
+      "  escape-recurrence (seed defect classes after fix-release boundary)\n" +
+      "  discovery-channel breakdown (live-run | review-batch | papercut-autofile | manual)\n" +
+      "  engine-class needs-human release-over-release (prefers FRG trend-ledger observations)\n" +
+      "  stratified rates (intervention-free first-attempt R2D, recovery, evidence coverage, …)\n" +
+      "  candidate-integrity observability (zeros when #857 events absent; not a gate)\n\n" +
+      "Discovery-channel inheritance: events may omit fields and inherit engine version/SHA and\n" +
+      "default channel live-run from run.json; missing historical stamps count as missing-attribution\n" +
+      "(never silently as live-run). Auto-file bodies stamp discovery-channel papercut-autofile.\n\n" +
+      "Non-goals: no human labor minutes from wall-clock; no raw events/day model comparison;\n" +
+      "no FRG threshold change; HTML export optional (#427) and not required for these metrics.\n\n" +
+      "Dogfood-day queries:\n" +
       "  pipeline scoreboard --days 1 --json\n" +
-      "  # → .metrics.pre_merge_needs_human  (rate + by_class)\n\n" +
+      "  # → .metrics.pre_merge_needs_human, .metrics.human_touches, .metrics.escape_recurrence,\n" +
+      "  #   .metrics.discovery_channel, .metrics.stratified, .metrics.candidate_integrity,\n" +
+      "  #   .engine_class_release_series\n\n" +
       "Options:\n" +
       "  --since <date>              window start (ISO-8601)\n" +
       "  --until <date>              window end (ISO-8601)\n" +
