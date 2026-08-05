@@ -100,8 +100,13 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `factory-gate`
 
-- **Usage:** `pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail]`
+- **Usage:** `pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] [--promote-pin-on-pass]`
 - **Summary:** Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)
+
+#### `factory-pin`
+
+- **Usage:** `pipeline factory-pin show|init --from-frg <X.Y.Z>|promote --for <X.Y.Z>|rollback [--to <X.Y.Z>] [--git-sha <sha>] [--force]`
+- **Summary:** Show / init / promote / rollback the factory production engine pin (last FRG-passed release; never merges or tags)
 
 #### `improve`
 

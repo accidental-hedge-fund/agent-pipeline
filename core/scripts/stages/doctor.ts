@@ -31,6 +31,18 @@ import {
   type MaxPromptBytes,
 } from "../harness-adapters/types.ts";
 import { isElevatedWriteHealth, parseWriteHealthText } from "../run-store.ts";
+import {
+  evaluateEngineTrackCheck,
+  hasProductionPinPathOverride,
+  installReceiptPath,
+  isFactoryControlRepo,
+  PRODUCTION_ENGINE_PIN_REL,
+  resolveEngineTrackIntent,
+  resolveInstallProvenance,
+  resolvePinAuthorityDir,
+  resolveProductionPin,
+  type PinLoadResult,
+} from "../production-engine-pin.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -648,6 +660,74 @@ export function buildPreflightChecks(
         );
       }
       return pass(`installed engine v${installed} is up to date with the latest release v${latest}`);
+    },
+  });
+
+  // 6c. Engine track / production-pin coherence (#762) — additive to
+  //     install:version-coherence and install:version-freshness. Surfaces
+  //     whether the host is on the pinned FRG-passed production track or a
+  //     candidate soak, and fails under pinned intent when install ≠ pin.
+  checks.push({
+    id: "install:engine-track",
+    description: "Engine track (pinned production pin vs candidate) is disclosed and coherent under pinned intent",
+    run: async (deps) => {
+      // CLI --engine-track is threaded via config.engine_track when doctor is
+      // invoked from pipeline.ts (resolveConfig merges CLI/config). Default
+      // pinned intent applies only for factory control context; ordinary
+      // product-repo doctor does not require a production pin.
+      const factoryControlContext = isFactoryControlRepo(config.repo);
+      const intent = resolveEngineTrackIntent({
+        command: "doctor",
+        configTrack: config.engine_track ?? null,
+        factoryControlContext,
+      });
+      // Pin authority is the factory control checkout (or env / pin path), not
+      // an arbitrary product target under active two-track intent.
+      const pinPathOverride = config.production_engine_pin_path ?? null;
+      const pinAuthority = resolvePinAuthorityDir({
+        targetRepoDir: config.repo_dir,
+        targetIsFactoryControl: factoryControlContext,
+        allowTargetFallback: intent === null,
+      });
+      const hasPinOverride = hasProductionPinPathOverride(pinPathOverride);
+      if (intent === "pinned" && !pinAuthority.ok && !hasPinOverride) {
+        return fail(pinAuthority.message, pinAuthority.remediation);
+      }
+      let pinLoad: PinLoadResult;
+      if (!pinAuthority.ok && !hasPinOverride) {
+        // Candidate (or inactive handled via allowTargetFallback) without
+        // factory authority: do not load a product-local pin as authority.
+        pinLoad = { kind: "missing", path: PRODUCTION_ENGINE_PIN_REL };
+      } else {
+        pinLoad = await resolveProductionPin({
+          repoDir: pinAuthority.ok ? pinAuthority.dir : config.repo_dir,
+          readTextFile: deps.readTextFile,
+          overridePath: pinPathOverride,
+        });
+      }
+      // Installer receipt at skill root (parent of core install root).
+      const receiptText = await deps.readTextFile(installReceiptPath(root));
+      const isWorkingTree =
+        root === config.repo_dir ||
+        root.startsWith(config.repo_dir + path.sep) ||
+        root.includes(`${path.sep}.worktrees${path.sep}`);
+      const installProvenance = resolveInstallProvenance({
+        receiptText,
+        isWorkingTree,
+        workingTreeDetail: isWorkingTree
+          ? "engine root is under the control-repo / worktree checkout"
+          : undefined,
+      });
+      const result = evaluateEngineTrackCheck({
+        intent,
+        pinLoad,
+        runningVersion: version,
+        installProvenance,
+      });
+      if (result.status === "pass") return pass(result.detail);
+      if (result.status === "warn") return warn(result.detail, result.remediation);
+      if (result.status === "skip") return skip(result.detail);
+      return fail(result.detail, result.remediation ?? "See docs/factory-reliability-gate-runbook.md (two-track engine pinning).");
     },
   });
 

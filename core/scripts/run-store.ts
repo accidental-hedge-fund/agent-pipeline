@@ -829,11 +829,24 @@ function nowIso(): string {
 
 /** Identity of the engine snapshot a run is pinned to (#450): the engine
  *  version, its resolved root path, and a fingerprint of the pinned prompt-
- *  template set. Captured once at run start; omitted when resolution fails. */
+ *  template set. Captured once at run start; omitted when resolution fails.
+ *
+ *  #762 adds optional two-track fields: `track` (`pinned` | `candidate`) is
+ *  required for **new** runs that write engine identity; historical run.json
+ *  without `track` remains readable — consumers treat missing track as unknown
+ *  and never invent it from version alone. Optional `pin_version` / `git_sha`
+ *  are advisory when known at run start. Mid-run drift uses `engine_drift`
+ *  events and does **not** rewrite `engine.track`. */
 export interface RunEngineIdentity {
   version: string;
   root: string;
   templates_fingerprint: string;
+  /** Two-track classification (#762). Absent on pre-track historical runs. */
+  track?: "pinned" | "candidate";
+  /** Production pin target version when known at run start (#762). */
+  pin_version?: string;
+  /** Release git SHA when known; omit rather than invent (#762). */
+  git_sha?: string;
 }
 
 export interface RunMeta {

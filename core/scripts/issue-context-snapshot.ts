@@ -284,6 +284,20 @@ export function findUnacknowledgedComments(
   for (let i = anchorIdx + 1; i < comments.length; i++) {
     const c = comments[i];
     if (classifyComment(c.body) === 'human') {
+      // #762 recovery / #784 defense-in-depth: a trusted, terminal, decodable
+      // design-gate-state (or other verified pipeline output) must self-exclude
+      // even when `classifyComment` returns `human`. That happens when a stale
+      // install's PIPELINE_COMMENT_HEADERS omits `## Design Interrogation`
+      // (v1.30.0-class) while the body still carries a valid design-gate-state
+      // artifact — the short-circuit below used to push it as unacknowledged
+      // human input and false-block review-1. Verification is still
+      // forge-resistant (decode/attestation + trusted author required).
+      if (
+        trustedComments.includes(c) &&
+        (isVerifiedDesignGateOutput(c.body) || isVerifiedPipelineOutput(c.body))
+      ) {
+        continue;
+      }
       result.push(c);
       continue;
     }

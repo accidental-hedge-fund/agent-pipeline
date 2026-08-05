@@ -5,6 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   activeChangeIdsFromContentsEntries,
+  ghChildEnv,
   isGithubAuthOrPermissionError,
   isHttp404Signal,
   isTransientGhError,
@@ -117,6 +118,27 @@ test("shouldTreatContents404AsEmpty: only when tip root ok and 404 not auth-shap
     shouldTreatContents404AsEmpty("gh: Not Found", true),
     false,
   );
+});
+
+// ---------------------------------------------------------------------------
+// ghChildEnv — uncolored child env for machine-readable gh --json (#762 recovery)
+// ---------------------------------------------------------------------------
+
+test("ghChildEnv: forces NO_COLOR and clears FORCE_COLOR/CLICOLOR from host env", () => {
+  const env = ghChildEnv({
+    PATH: "/usr/bin",
+    FORCE_COLOR: "1",
+    CLICOLOR: "1",
+    CLICOLOR_FORCE: "1",
+    NO_COLOR: "",
+    GH_TOKEN: "secret",
+  });
+  assert.equal(env.NO_COLOR, "1");
+  assert.equal(env.FORCE_COLOR, "0");
+  assert.equal(env.CLICOLOR, "0");
+  assert.equal(env.CLICOLOR_FORCE, "0");
+  assert.equal(env.PATH, "/usr/bin");
+  assert.equal(env.GH_TOKEN, "secret", "parent credentials and PATH must be preserved");
 });
 
 // ---------------------------------------------------------------------------

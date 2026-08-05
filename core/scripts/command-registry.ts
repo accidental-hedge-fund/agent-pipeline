@@ -51,7 +51,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
   // the normal advance state machine.
   single: {
     needsIssueNumber: true,
-    allowedFlags: new Set(["repoPath", "base", "profile"]),
+    allowedFlags: new Set(["repoPath", "base", "profile", "engineTrack"]),
     needsConfig: true,
     needsGhAuth: true,
     mutatesGitHub: true,
@@ -78,6 +78,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
       "failFast",
       "doctor",
       "harnessSmoke",
+      "engineTrack",
     ]),
     needsConfig: true,
     needsGhAuth: false,
@@ -111,6 +112,29 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
       "closePack",
       "observations",
       "scenario",
+      "promotePinOnPass",
+      "engineTrack",
+    ]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
+  // Two-track production pin (#762): show / init / promote / rollback.
+  // Never merges or tags. Writes only the repo pin JSON under .agent-pipeline/.
+  "factory-pin": {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "profile",
+      "json",
+      "for",
+      "fromFrg",
+      "to",
+      "gitSha",
+      "force",
     ]),
     needsConfig: false,
     needsGhAuth: false,
@@ -225,6 +249,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
       "follow",
       "events",
       "untilTerminal",
+      "engineTrack",
     ]),
     needsConfig: false,
     needsGhAuth: false,
@@ -386,6 +411,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     allowedFlags: new Set([
       "repoPath", "base", "profile", "fixtures", "baseline", "judge", "apply", "planOnly", "out",
       "trajectoryMaxEvents", "trajectoryMaxBytes", "linkArtifacts",
+      "engineTrack",
     ]),
     needsConfig: true,
     needsGhAuth: false,

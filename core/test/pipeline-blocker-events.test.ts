@@ -265,6 +265,14 @@ test("runAdvance emits blocker_set with the producer diagnostic to events.jsonl 
   const deps: AdvanceDeps = {
     resolvePinnedEngineIdentity: () => null,
     probeEngineIdentity: () => null,
+    // #762: pin enforcement fails closed without a pin/receipt; this test is
+    // about blocker_set emission, so inject a coherent candidate track result.
+    enforceEngineTrack: async () => ({
+      ok: true as const,
+      track: "candidate" as const,
+      pin_version: undefined,
+      git_sha: undefined,
+    }),
     releaseParkedWorktree: async () => ({
       action: "absent",
       reason: "no managed worktree",
@@ -310,6 +318,312 @@ test("runAdvance emits blocker_set with the producer diagnostic to events.jsonl 
     assert.equal(events.some((e) => e.type === "human_intervention"), false);
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// #762 review 2: two-track pin enforcement must not break ordinary product-repo
+// advances. A non-factory host with no production pin must reach stages (not
+// exit early with missing_pin). Pin authority for factory runs is the control
+// checkout / override path, not every target product repoDir.
+test("runAdvance: non-factory advance with no production pin does not refuse (#762)", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-run-nopin-"));
+  const domain = `nopin-${process.pid}-${Date.now()}`;
+  const stateDir = `/tmp/pipeline-${domain}`;
+  let dispatchCalls = 0;
+  let enforceCalls = 0;
+  const cfg = {
+    repo: "acme/widget",
+    domain,
+    repo_dir: repoDir,
+    base_branch: "main",
+    invocation: "pipeline",
+    marker_footer: "*Automated by Claude Code Pipeline Skill*",
+    harnesses: {
+      implementer: "claude",
+      implementerSource: "default",
+      reviewer: "codex",
+      reviewerSource: "default",
+    },
+    steps: { standard_review: true, adversarial_review: true },
+    auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
+    papercuts: { enabled: false, auto_file: false },
+    corrections: { auto_file: false },
+  } as unknown as PipelineConfig;
+  const detail = {
+    number: 42,
+    type: "issue",
+    title: "T",
+    body: "B",
+    state: "open",
+    url: "https://example.test/42",
+    labels: ["pipeline:ready"],
+    comments: [],
+  };
+  const runId = "42-2026-08-05T00-00-00-000Z";
+  const deps: AdvanceDeps = {
+    resolvePinnedEngineIdentity: () => ({
+      version: "1.30.0",
+      root: "/skill/core",
+      templates_fingerprint: "abc",
+    }),
+    probeEngineIdentity: () => null,
+    // Must not be required for non-factory: if the default path wrongly calls
+    // enforce under pinned intent without a pin, advance would refuse before
+    // dispatch. Count calls to prove policy is inactive.
+    enforceEngineTrack: async () => {
+      enforceCalls += 1;
+      return {
+        ok: false as const,
+        code: "missing_pin",
+        message: "should not run for non-factory",
+        remediation: "n/a",
+      };
+    },
+    releaseParkedWorktree: async () => ({
+      action: "absent",
+      reason: "no managed worktree",
+      branch: null,
+      worktree: null,
+    }),
+    ensurePipelineLabels: async () => {},
+    getIssueDetail: (async () => detail) as AdvanceDeps["getIssueDetail"],
+    getGhActor: async () => "pipeline-bot",
+    getPrForIssue: async () => null,
+    getOnDiskForIssue: async () => null,
+    postComment: async () => {},
+    postPrComment: async () => {},
+    dispatch: async () => {
+      dispatchCalls += 1;
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: "merge conflict with base",
+        blockerKind: "merge-conflict",
+      };
+    },
+  };
+  try {
+    await runAdvance(cfg, 42, { runId }, deps);
+    assert.equal(enforceCalls, 0, "non-factory advance must not invoke pin enforcement");
+    assert.equal(dispatchCalls, 1, "non-factory advance must reach stages without a pin");
+    // run.json may omit track when two-track policy is inactive
+    const runJsonPath = path.join(runDirPath(repoDir, runId), "run.json");
+    if (fs.existsSync(runJsonPath)) {
+      const runJson = JSON.parse(fs.readFileSync(runJsonPath, "utf8")) as {
+        engine?: { track?: string };
+      };
+      assert.equal(
+        runJson.engine?.track,
+        undefined,
+        "non-factory inactive policy must not claim pinned/candidate track",
+      );
+    }
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("runAdvance: factory pin authority uses override path not product target (#762)", async () => {
+  const productDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-run-product-"));
+  const domain = `pin-auth-${process.pid}-${Date.now()}`;
+  const stateDir = `/tmp/pipeline-${domain}`;
+  const pinOverride = "/factory/control/.agent-pipeline/production-engine-pin.json";
+  let seenRepoDir: string | null = null;
+  let seenPinOverride: string | null | undefined = null;
+  let dispatchCalls = 0;
+  const cfg = {
+    // Explicit pinned intent on a product target (not factory control repo id).
+    repo: "acme/widget",
+    domain,
+    repo_dir: productDir,
+    base_branch: "main",
+    invocation: "pipeline",
+    marker_footer: "*Automated by Claude Code Pipeline Skill*",
+    engine_track: "pinned",
+    production_engine_pin_path: pinOverride,
+    harnesses: {
+      implementer: "claude",
+      implementerSource: "default",
+      reviewer: "codex",
+      reviewerSource: "default",
+    },
+    steps: { standard_review: true, adversarial_review: true },
+    auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
+    papercuts: { enabled: false, auto_file: false },
+    corrections: { auto_file: false },
+  } as unknown as PipelineConfig;
+  const detail = {
+    number: 9,
+    type: "issue",
+    title: "T",
+    body: "B",
+    state: "open",
+    url: "https://example.test/9",
+    labels: ["pipeline:ready"],
+    comments: [],
+  };
+  const runId = "9-2026-08-05T00-00-00-000Z";
+  const deps: AdvanceDeps = {
+    resolvePinnedEngineIdentity: () => ({
+      version: "1.29.1",
+      root: "/skill/core",
+      templates_fingerprint: "abc",
+    }),
+    probeEngineIdentity: () => null,
+    enforceEngineTrack: async (input) => {
+      seenRepoDir = input.repoDir;
+      seenPinOverride = input.pinPathOverride ?? null;
+      assert.equal(input.intent, "pinned");
+      return {
+        ok: true as const,
+        track: "pinned" as const,
+        pin_version: "1.29.1",
+        git_sha: undefined,
+      };
+    },
+    releaseParkedWorktree: async () => ({
+      action: "absent",
+      reason: "no managed worktree",
+      branch: null,
+      worktree: null,
+    }),
+    ensurePipelineLabels: async () => {},
+    getIssueDetail: (async () => detail) as AdvanceDeps["getIssueDetail"],
+    getGhActor: async () => "pipeline-bot",
+    getPrForIssue: async () => null,
+    getOnDiskForIssue: async () => null,
+    postComment: async () => {},
+    postPrComment: async () => {},
+    dispatch: async () => {
+      dispatchCalls += 1;
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: "merge conflict with base",
+        blockerKind: "merge-conflict",
+      };
+    },
+  };
+  try {
+    await runAdvance(cfg, 9, { runId }, deps);
+    assert.equal(dispatchCalls, 1, "pinned intent with pin override must reach stages");
+    assert.equal(
+      seenPinOverride,
+      pinOverride,
+      "enforce must receive production_engine_pin_path as pin authority override",
+    );
+    // repoDir passed to enforce is pin-authority dir (resolvePinAuthorityDir);
+    // product target alone is not enough when override names factory pin.
+    assert.ok(seenRepoDir, "enforce must be invoked with a pin-authority repoDir");
+  } finally {
+    fs.rmSync(productDir, { recursive: true, force: true });
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("runAdvance: product pinned without factory authority refuses (#762)", async () => {
+  // Explicit pinned intent on a product target without factory-control dir or
+  // pin path must refuse — must not treat product-local pin as authority.
+  const productDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-run-noauth-"));
+  const domain = `pin-noauth-${process.pid}-${Date.now()}`;
+  const stateDir = `/tmp/pipeline-${domain}`;
+  // Place a product-local pin that must NOT become authority.
+  fs.mkdirSync(path.join(productDir, ".agent-pipeline"), { recursive: true });
+  fs.writeFileSync(
+    path.join(productDir, ".agent-pipeline", "production-engine-pin.json"),
+    JSON.stringify({
+      schema_version: 1,
+      version: "1.29.1",
+      tag: "v1.29.1",
+      git_sha: null,
+      git_sha_source: "unknown",
+      frg_run_id: "frg-product-local",
+      promoted_at: "2026-01-01T00:00:00Z",
+    }),
+  );
+  let enforceCalls = 0;
+  let dispatchCalls = 0;
+  const cfg = {
+    repo: "acme/widget",
+    domain,
+    repo_dir: productDir,
+    base_branch: "main",
+    invocation: "pipeline",
+    marker_footer: "*Automated by Claude Code Pipeline Skill*",
+    engine_track: "pinned",
+    harnesses: {
+      implementer: "claude",
+      implementerSource: "default",
+      reviewer: "codex",
+      reviewerSource: "default",
+    },
+    steps: { standard_review: true, adversarial_review: true },
+    auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
+    papercuts: { enabled: false, auto_file: false },
+    corrections: { auto_file: false },
+  } as unknown as PipelineConfig;
+  const detail = {
+    number: 11,
+    type: "issue",
+    title: "T",
+    body: "B",
+    state: "open",
+    url: "https://example.test/11",
+    labels: ["pipeline:ready"],
+    comments: [],
+  };
+  const runId = "11-2026-08-05T00-00-00-000Z";
+  const deps: AdvanceDeps = {
+    resolvePinnedEngineIdentity: () => ({
+      version: "1.29.1",
+      root: "/skill/core",
+      templates_fingerprint: "abc",
+    }),
+    probeEngineIdentity: () => null,
+    enforceEngineTrack: async () => {
+      enforceCalls += 1;
+      return {
+        ok: true as const,
+        track: "pinned" as const,
+        pin_version: "1.29.1",
+        git_sha: undefined,
+      };
+    },
+    releaseParkedWorktree: async () => ({
+      action: "absent",
+      reason: "no managed worktree",
+      branch: null,
+      worktree: null,
+    }),
+    ensurePipelineLabels: async () => {},
+    getIssueDetail: (async () => detail) as AdvanceDeps["getIssueDetail"],
+    getGhActor: async () => "pipeline-bot",
+    getPrForIssue: async () => null,
+    getOnDiskForIssue: async () => null,
+    postComment: async () => {},
+    postPrComment: async () => {},
+    dispatch: async () => {
+      dispatchCalls += 1;
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: "merge conflict with base",
+        blockerKind: "merge-conflict",
+      };
+    },
+  };
+  try {
+    await runAdvance(cfg, 11, { runId }, deps);
+    assert.equal(
+      enforceCalls,
+      0,
+      "must refuse before enforce when product has no factory pin authority",
+    );
+    assert.equal(dispatchCalls, 0, "must not reach stages without factory pin authority");
+  } finally {
+    fs.rmSync(productDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
   }
 });

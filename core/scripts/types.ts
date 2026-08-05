@@ -839,6 +839,23 @@ export interface PipelineConfig {
     runOnStart: boolean;
     failFast: boolean;
   };
+  /**
+   * Two-track engine intent (#762): `pinned` (factory production/dogfood —
+   * must match production pin) or `candidate` (FRG Layer B / eval soaks).
+   * Optional; when unset, command defaults apply: factory-gate/evals →
+   * candidate; factory control loop/advance/doctor → pinned; ordinary
+   * non-factory product repos leave two-track policy inactive (no pin
+   * required). CLI `--engine-track` overrides this.
+   */
+  engine_track?: "pinned" | "candidate";
+  /**
+   * Optional absolute path override for the production pin artifact (#762).
+   * Default authority is the factory control checkout
+   * (`AGENT_PIPELINE_FACTORY_CONTROL` or, for self-dogfood, `repo_dir`) at
+   * `.agent-pipeline/production-engine-pin.json` — not every product target.
+   * Also overridable via env `AGENT_PIPELINE_PRODUCTION_PIN`.
+   */
+  production_engine_pin_path?: string;
   // Agent-logged minor-friction capture (#419). Opt-in; default disabled so
   // existing runs are unchanged. When enabled, the engine passes run/stage
   // identity env vars to harness child processes and injects a prompt
