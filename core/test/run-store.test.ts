@@ -285,6 +285,47 @@ test("initRunDir: writes the engine identity when supplied", async () => {
   );
   const meta = JSON.parse(readFile(RUN_JSON));
   assert.deepEqual(meta.engine, { version: "1.21.0", root: "/opt/pipeline/core", templates_fingerprint: "deadbeef" });
+  // #763: new runs default discovery_channel to live-run (explicit stamp).
+  assert.equal(meta.discovery_channel, "live-run");
+});
+
+test("initRunDir: persists explicit discovery_channel; null omits stamp (#763)", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  await initRunDir(
+    {
+      runDir: RUN_DIR,
+      runId,
+      issue: ISSUE,
+      repo: "owner/repo",
+      profile: "codex",
+      startedAt: STARTED_AT_ISO,
+      discoveryChannel: "review-batch",
+    },
+    deps,
+  );
+  assert.equal(JSON.parse(readFile(RUN_JSON)).discovery_channel, "review-batch");
+
+  const { deps: deps2, readFile: read2 } = memRunStore();
+  const omitDir = path.join(REPO_DIR, ".agent-pipeline", "runs", "omit-channel");
+  await initRunDir(
+    {
+      runDir: omitDir,
+      runId: "omit-channel",
+      issue: ISSUE,
+      repo: "owner/repo",
+      profile: null,
+      startedAt: STARTED_AT_ISO,
+      discoveryChannel: null,
+    },
+    deps2,
+  );
+  const omitMeta = JSON.parse(read2(path.join(omitDir, "run.json")));
+  assert.equal(
+    "discovery_channel" in omitMeta,
+    false,
+    "discoveryChannel: null must omit the stamp so historical-style fixtures stay unstamped",
+  );
 });
 
 test("initRunDir: omits the engine field (rather than failing the run) when not supplied", async () => {

@@ -18,6 +18,7 @@ import {
   parseEngineMarker,
   resolveEngineCommitSha,
   resolveEventAttribution,
+  runLevelDiscoveryChannel,
   snapshotEngineStamp,
 } from "../scripts/engine-attribution.ts";
 import { redactSecrets, sanitize } from "../scripts/artifact-sanitize.ts";
@@ -139,6 +140,25 @@ test("resolveEventAttribution inherits from run.json and does not invent live-ru
   );
   assert.equal(historical.discovery_channel, null);
   assert.equal(historical.missing_attribution, true);
+
+  // Default runDefaultChannel is null — engine identity alone does not invent live-run.
+  const engineOnly = resolveEventAttribution(
+    { type: "human_intervention" },
+    { version: "1.28.0", commit_sha: "ccc333" },
+  );
+  assert.equal(engineOnly.engine_version, "1.28.0");
+  assert.equal(engineOnly.discovery_channel, null);
+  assert.equal(engineOnly.missing_attribution, false); // version present
+});
+
+test("runLevelDiscoveryChannel requires explicit stamp; engine.version is not a channel", () => {
+  assert.equal(runLevelDiscoveryChannel(null), null);
+  assert.equal(runLevelDiscoveryChannel({ engine: { version: "1.0.0" } }), null);
+  assert.equal(
+    runLevelDiscoveryChannel({ discovery_channel: "live-run", engine: { version: "1.0.0" } }),
+    "live-run",
+  );
+  assert.equal(runLevelDiscoveryChannel({ discovery_channel: "garbage" }), null);
 });
 
 test("buildEventAttributionFields and snapshotEngineStamp are explicit on unresolved", () => {

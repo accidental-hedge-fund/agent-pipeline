@@ -154,7 +154,8 @@ test("discovery-channel: papercut-autofile not folded into live-run; missing not
     {
       runId: "live",
       dir: "/l",
-      runJson: { engine: { version: "1.0.0" } },
+      // Post-#763 stamp: explicit discovery_channel (not engine.version alone)
+      runJson: { engine: { version: "1.0.0" }, discovery_channel: "live-run" },
       events: [],
       summary: null,
       startAt: "2026-06-10T00:00:00Z",
@@ -165,7 +166,7 @@ test("discovery-channel: papercut-autofile not folded into live-run; missing not
     {
       runId: "live2",
       dir: "/l2",
-      runJson: { engine: { version: "1.0.0" } },
+      runJson: { engine: { version: "1.0.0" }, discovery_channel: "live-run" },
       events: [],
       summary: null,
       startAt: "2026-06-10T00:00:00Z",
@@ -200,6 +201,46 @@ test("discovery-channel: papercut-autofile not folded into live-run; missing not
   assert.equal(b.by_channel["live-run"], 2);
   assert.equal(b.by_channel["papercut-autofile"], 20); // 10 run-level + 10 events
   assert.ok(b.missing_attribution >= 1);
+});
+
+test("discovery-channel: pre-#763 run.json with engine.version only is missing-attribution, not live-run", () => {
+  // Regression for review finding e7187729: engine.version predated discovery
+  // stamps; treating it as live-run corrupted historical missingness accounting.
+  const runs: StabilizationRun[] = [
+    {
+      runId: "legacy-engine-only",
+      dir: "/legacy",
+      runJson: { engine: { version: "1.28.0", root: "/opt/core", templates_fingerprint: "x" } },
+      events: [
+        { type: "human_intervention", kind: "human-risk-override" },
+        { type: "blocker_set", reason: "harness-failure" },
+      ],
+      summary: null,
+      startAt: "2026-05-01T00:00:00Z",
+      issue: 42,
+      pr: null,
+      finalState: "needs-human",
+    },
+    {
+      runId: "stamped-live",
+      dir: "/stamped",
+      runJson: {
+        engine: { version: "1.31.0" },
+        discovery_channel: "live-run",
+      },
+      events: [{ type: "human_intervention", kind: "human-risk-override" }],
+      summary: null,
+      startAt: "2026-06-10T00:00:00Z",
+      issue: 43,
+      pr: null,
+      finalState: "ready-to-deploy",
+    },
+  ];
+  const b = computeDiscoveryChannelBreakdown(runs);
+  // Legacy run arrival + 2 events without channel → 3 missing
+  assert.equal(b.by_channel["live-run"], 2); // stamped run + inherited intervention
+  assert.equal(b.missing_attribution, 3);
+  assert.equal(b.by_channel["live-run"] + b.missing_attribution, b.denominator);
 });
 
 test("recovered same-run blocker is not terminal engine off-ramp (post-#787)", () => {

@@ -55,11 +55,14 @@ missing-boundary diagnostics and SHALL NOT inflate the recurrence ratio.
 
 A defect-class key with fix-release boundary B SHALL count as a **recurrence** when at
 least one new occurrence of that key is observed with a timestamp or producing release
-strictly after B. Occurrences at or before B SHALL NOT count as recurrence. The
-escape-recurrence aggregate SHALL expose at minimum: `classes_with_fix_boundary`
-(denominator), `classes_with_post_fix_occurrence` (numerator), and `ratio` as a
-scoreboard `RateValue` (`ratio` is `null` when the denominator is zero). Per-key rows
-SHALL be available in JSON output.
+strictly after B. Occurrences at or before B SHALL NOT count as recurrence. When comparing
+release labels without timestamps, precedence SHALL follow SemVer 2.0.0: build metadata is
+ignored for precedence, and a prerelease of a version is strictly before the corresponding
+final release (for example `v1.30.0-rc.1` is not after `v1.30.0`). The escape-recurrence
+aggregate SHALL expose at minimum: `classes_with_fix_boundary` (denominator),
+`classes_with_post_fix_occurrence` (numerator), and `ratio` as a scoreboard `RateValue`
+(`ratio` is `null` when the denominator is zero). Per-key rows SHALL be available in JSON
+output.
 
 #### Scenario: Post-boundary occurrence is recurrence
 
@@ -74,6 +77,20 @@ SHALL be available in JSON output.
 - **AND** the only occurrences are before that boundary
 - **THEN** `openspec-archive` SHALL remain in the denominator
 - **AND** it SHALL NOT count toward the recurrence numerator
+
+#### Scenario: Prerelease is not post-boundary relative to final release
+
+- **WHEN** a class has fix boundary release `v1.30.0`
+- **AND** an occurrence is observed with producing release `v1.30.0-rc.1` and no
+  timestamp that proves it is after the boundary
+- **THEN** that occurrence SHALL NOT count as post-fix recurrence
+
+#### Scenario: Build metadata does not create false post-boundary order
+
+- **WHEN** a class has fix boundary release `v1.30.0`
+- **AND** an occurrence is observed with producing release `v1.30.0+build.1` and no
+  timestamp that proves it is after the boundary
+- **THEN** that occurrence SHALL NOT count as post-fix recurrence
 
 #### Scenario: Zero fix boundaries yields null ratio
 

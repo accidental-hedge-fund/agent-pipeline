@@ -189,30 +189,84 @@ export function isStrictlyAfterBoundary(
   return false;
 }
 
-function normalizeReleaseLabel(label: string): string {
-  return label.trim().replace(/^v/i, "").toLowerCase();
+/**
+ * Parsed release label for SemVer-correct precedence (#763).
+ * Build metadata is stripped (equal precedence). Prerelease is ordered
+ * below the corresponding final release per SemVer 2.0.0.
+ */
+interface ParsedReleaseLabel {
+  /** true when core X.Y.Z parsed; false for free-form labels */
+  semver: boolean;
+  core: [number, number, number];
+  /** null = final release (no prerelease); array = prerelease identifiers */
+  prerelease: Array<string | number> | null;
+  /** Normalized free-form fallback when not semver */
+  freeform: string;
 }
 
-/** Return negative if a < b, 0 if equal, positive if a > b (semver-ish). */
-export function compareReleaseLabels(a: string, b: string): number {
-  const na = normalizeReleaseLabel(a);
-  const nb = normalizeReleaseLabel(b);
-  if (na === nb) return 0;
-  const pa = na.split(/[.+-]/).map((p) => (/^\d+$/.test(p) ? Number(p) : p));
-  const pb = nb.split(/[.+-]/).map((p) => (/^\d+$/.test(p) ? Number(p) : p));
-  const len = Math.max(pa.length, pb.length);
+function parseReleaseLabel(label: string): ParsedReleaseLabel {
+  const freeform = label.trim().replace(/^v/i, "").toLowerCase();
+  // Build metadata is ignored for precedence (SemVer §10).
+  const noBuild = freeform.split("+")[0] ?? freeform;
+  const m = noBuild.match(/^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$/);
+  if (!m) {
+    return { semver: false, core: [0, 0, 0], prerelease: null, freeform };
+  }
+  const core: [number, number, number] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  if (!m[4]) {
+    return { semver: true, core, prerelease: null, freeform };
+  }
+  const prerelease = m[4].split(".").map((p) => (/^\d+$/.test(p) ? Number(p) : p));
+  return { semver: true, core, prerelease, freeform };
+}
+
+/** Compare prerelease identifier lists per SemVer §11. */
+function comparePrerelease(
+  a: Array<string | number> | null,
+  b: Array<string | number> | null,
+): number {
+  // No prerelease > any prerelease (final release is later than rc).
+  if (a === null && b === null) return 0;
+  if (a === null) return 1;
+  if (b === null) return -1;
+  const len = Math.max(a.length, b.length);
   for (let i = 0; i < len; i++) {
-    const x = pa[i] ?? 0;
-    const y = pb[i] ?? 0;
-    if (typeof x === "number" && typeof y === "number") {
-      if (x !== y) return x - y;
-    } else {
-      const sx = String(x);
-      const sy = String(y);
-      if (sx !== sy) return sx < sy ? -1 : 1;
+    if (i >= a.length) return -1; // fewer identifiers → lower precedence
+    if (i >= b.length) return 1;
+    const x = a[i]!;
+    const y = b[i]!;
+    const xNum = typeof x === "number";
+    const yNum = typeof y === "number";
+    if (xNum && yNum) {
+      if (x !== y) return (x as number) - (y as number);
+    } else if (xNum) {
+      return -1; // numeric identifiers have lower precedence than non-numeric
+    } else if (yNum) {
+      return 1;
+    } else if (x !== y) {
+      return String(x) < String(y) ? -1 : 1;
     }
   }
   return 0;
+}
+
+/**
+ * Return negative if a < b, 0 if equal, positive if a > b.
+ * SemVer 2.0.0 precedence: build metadata ignored; prerelease < final release
+ * with the same core version. Non-semver labels fall back to free-form compare.
+ */
+export function compareReleaseLabels(a: string, b: string): number {
+  const pa = parseReleaseLabel(a);
+  const pb = parseReleaseLabel(b);
+  if (pa.semver && pb.semver) {
+    for (let i = 0; i < 3; i++) {
+      if (pa.core[i] !== pb.core[i]) return pa.core[i]! - pb.core[i]!;
+    }
+    return comparePrerelease(pa.prerelease, pb.prerelease);
+  }
+  // Mixed or non-semver: free-form string compare on normalized labels.
+  if (pa.freeform === pb.freeform) return 0;
+  return pa.freeform < pb.freeform ? -1 : 1;
 }
 
 /**

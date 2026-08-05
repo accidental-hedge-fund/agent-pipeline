@@ -147,3 +147,50 @@ test("isStrictlyAfterBoundary and compareReleaseLabels", () => {
     false,
   );
 });
+
+test("compareReleaseLabels: prerelease < final release; build metadata equal precedence", () => {
+  // SemVer: 1.30.0-rc.1 is earlier than 1.30.0 (not greater).
+  assert.ok(
+    compareReleaseLabels("v1.30.0-rc.1", "v1.30.0") < 0,
+    "prerelease must be before final release",
+  );
+  assert.ok(compareReleaseLabels("v1.30.0", "v1.30.0-rc.1") > 0);
+  assert.ok(compareReleaseLabels("1.30.0-rc.1", "1.30.0-rc.2") < 0);
+  // Build metadata does not affect precedence.
+  assert.equal(compareReleaseLabels("v1.30.0+build.1", "v1.30.0"), 0);
+  assert.equal(compareReleaseLabels("v1.30.0+build.1", "v1.30.0+build.2"), 0);
+  assert.ok(compareReleaseLabels("v1.30.0+build.1", "v1.29.0") > 0);
+  // Prerelease with build metadata still before final.
+  assert.ok(compareReleaseLabels("v1.30.0-rc.1+build.1", "v1.30.0") < 0);
+});
+
+test("isStrictlyAfterBoundary: prerelease/build occurrence is not post-fix recurrence", () => {
+  const boundary = {
+    class_key: "salvage" as const,
+    effective_release: "v1.30.0",
+    effective_at: null,
+    source: "control_attribution" as const,
+  };
+  // Without timestamps, release labels alone decide; rc must not count as after.
+  assert.equal(
+    isStrictlyAfterBoundary(
+      { class_key: "salvage", at: null, producing_release: "v1.30.0-rc.1" },
+      boundary,
+    ),
+    false,
+  );
+  assert.equal(
+    isStrictlyAfterBoundary(
+      { class_key: "salvage", at: null, producing_release: "v1.30.0+build.1" },
+      boundary,
+    ),
+    false,
+  );
+  assert.equal(
+    isStrictlyAfterBoundary(
+      { class_key: "salvage", at: null, producing_release: "v1.30.1" },
+      boundary,
+    ),
+    true,
+  );
+});

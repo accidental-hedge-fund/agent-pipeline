@@ -7,10 +7,10 @@
 import {
   AUTO_FILE_DISCOVERY_CHANNEL,
   DISCOVERY_CHANNELS,
-  DEFAULT_LIVE_RUN_CHANNEL,
   isDiscoveryChannel,
   parseDiscoveryChannelLoose,
   resolveEventAttribution,
+  runLevelDiscoveryChannel,
   type DiscoveryChannel,
   type RunEngineAttributionSource,
 } from "./engine-attribution.ts";
@@ -220,10 +220,11 @@ function runEngineFromJson(runJson: Record<string, unknown> | null): RunEngineAt
 
 /**
  * Count issue arrivals / defect observations by discovery-channel.
- * Prefer event-level stamps; inherit run default only for ordinary run events.
- * Auto-file related events without a stamp count as papercut-autofile when
- * type is papercut/correction auto-file markers; otherwise missing.
- * Historical items without channel → missing_attribution (never live-run).
+ * Prefer event-level stamps; inherit run default only when run.json carries an
+ * explicit discovery_channel stamp (#763). Auto-file related events without a
+ * stamp count as papercut-autofile when type is papercut/auto_file; otherwise
+ * missing. Historical items without channel → missing_attribution (never
+ * invent live-run from engine.version alone).
  */
 export function computeDiscoveryChannelBreakdown(runs: StabilizationRun[]): DiscoveryChannelBreakdown {
   const by_channel = Object.fromEntries(DISCOVERY_CHANNELS.map((c) => [c, 0])) as Record<
@@ -235,16 +236,12 @@ export function computeDiscoveryChannelBreakdown(runs: StabilizationRun[]): Disc
 
   for (const run of runs) {
     const engine = runEngineFromJson(run.runJson);
-    // Run-level arrival: one count per run (issue attempt)
-    const runChannelInline = run.runJson
-      ? parseDiscoveryChannelLoose(run.runJson["discovery_channel"])
-      : null;
-    if (runChannelInline) {
-      by_channel[runChannelInline]++;
-      attributed++;
-    } else if (engine?.version) {
-      // Documented default for ordinary advance runs that pin engine identity.
-      by_channel[DEFAULT_LIVE_RUN_CHANNEL]++;
+    // Run-level arrival: one count per run (issue attempt). Only an explicit
+    // discovery_channel field (post-#763 stamp) attributes the arrival —
+    // engine.version alone is pre-attribution history.
+    const runChannel = runLevelDiscoveryChannel(run.runJson);
+    if (runChannel) {
+      by_channel[runChannel]++;
       attributed++;
     } else {
       missing++;
@@ -274,12 +271,8 @@ export function computeDiscoveryChannelBreakdown(runs: StabilizationRun[]): Disc
         attributed++;
         continue;
       }
-      // Inheritance for intervention/blocker: use run default only when run has engine
-      const resolved = resolveEventAttribution(
-        event,
-        engine,
-        engine?.version ? DEFAULT_LIVE_RUN_CHANNEL : null,
-      );
+      // Inheritance for intervention/blocker: only when run.json stamped a channel
+      const resolved = resolveEventAttribution(event, engine, runChannel);
       if (resolved.discovery_channel) {
         by_channel[resolved.discovery_channel]++;
         attributed++;
@@ -725,9 +718,11 @@ export function computeStratifiedStabilizationMetrics(
         const hasVersion =
           typeof event["engine_version"] === "string" ||
           !!(run.runJson && (run.runJson["engine"] as { version?: string } | undefined)?.version);
+        // Channel evidence requires an explicit stamp (event or run-level) —
+        // engine identity alone is not discovery-channel attribution (#763).
         const hasChannel =
           isDiscoveryChannel(event["discovery_channel"]) ||
-          !!(run.runJson && run.runJson["engine"]);
+          runLevelDiscoveryChannel(run.runJson) !== null;
         if (hasVersion && hasChannel) evidencePresent++;
       }
     }

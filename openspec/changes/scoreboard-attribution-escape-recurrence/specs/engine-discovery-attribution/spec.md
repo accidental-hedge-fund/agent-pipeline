@@ -71,10 +71,13 @@ pre-attribution history. Producers SHALL NOT invent a SHA.
 The engine SHALL ensure run-ledger events that create or classify defects, blockers, human
 interventions, recovery attempt/result outcomes, or auto-file outcomes either (a) include
 additive fields `engine_version`, `engine_commit_sha`, and `discovery_channel`, or
-(b) inherit those values from the run's `run.json` engine identity and a documented
-run-level discovery-channel default, with inheritance proven by tests. Historical events
-lacking fields SHALL remain readable; consumers SHALL count them under missing-attribution
-evidence rather than crash.
+(b) inherit those values from the run's `run.json` engine identity and the run-level
+`discovery_channel` stamp when that stamp is present, with inheritance proven by tests.
+The documented run-level default for ordinary advance is the explicit
+`run.json.discovery_channel` field (typically `live-run`), not the mere presence of
+`engine.version`. Historical events and runs lacking the channel stamp SHALL remain
+readable; consumers SHALL count them under missing-attribution evidence rather than crash
+or invent `live-run`.
 
 #### Scenario: Event includes additive attribution fields
 
@@ -91,6 +94,13 @@ evidence rather than crash.
 - **THEN** it SHALL continue aggregation
 - **AND** it SHALL record missing-attribution evidence for that event rather than treating
   missing as a fabricated channel or version
+
+#### Scenario: Inheritance requires run-level discovery_channel stamp
+
+- **WHEN** a run has `run.json.engine.version` but no `run.json.discovery_channel`
+- **AND** an event omits inline `discovery_channel`
+- **THEN** scoreboard collectors SHALL treat the event channel as missing-attribution
+- **AND** SHALL NOT inherit `live-run` from engine identity alone
 
 ---
 

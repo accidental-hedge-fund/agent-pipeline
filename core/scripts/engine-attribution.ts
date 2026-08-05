@@ -204,20 +204,34 @@ export interface RunEngineAttributionSource {
 }
 
 /**
+ * Read the run-level discovery-channel stamp from run.json when present.
+ * Returns null for historical run.json that lack the field — callers must
+ * treat that as missing-attribution, never invent live-run from engine.version.
+ */
+export function runLevelDiscoveryChannel(
+  runJson: Record<string, unknown> | null | undefined,
+): DiscoveryChannel | null {
+  if (!runJson) return null;
+  return parseDiscoveryChannelLoose(runJson["discovery_channel"]);
+}
+
+/**
  * Resolve attribution for a ledger event:
  * 1. Inline event fields (`engine_version`, `engine_commit_sha`, `discovery_channel`)
  * 2. Else inherit from run.json engine identity + run default channel
  * 3. Missing channel is explicit (never defaulted to live-run at read time
  *    unless `runDefaultChannel` is provided as the documented run-level default)
  *
- * Documented inheritance rule: ordinary advance runs pin
- * `runDefaultChannel = "live-run"` so events that omit the field inherit it.
- * Historical events with no run default remain `missing_attribution`.
+ * Documented inheritance rule: new ordinary-advance runs persist
+ * `run.json.discovery_channel = "live-run"`; collectors pass that stamp as
+ * `runDefaultChannel` so events that omit the field inherit it. Historical
+ * runs without the stamp (or events with `runDefaultChannel = null`) remain
+ * `missing_attribution`. Do **not** infer channel from engine.version alone.
  */
 export function resolveEventAttribution(
   event: Record<string, unknown> | null | undefined,
   runEngine: RunEngineAttributionSource | null | undefined,
-  runDefaultChannel: DiscoveryChannel | null = DEFAULT_LIVE_RUN_CHANNEL,
+  runDefaultChannel: DiscoveryChannel | null = null,
 ): EngineAttributionFields {
   const ev = event ?? {};
   const inlineVersion =

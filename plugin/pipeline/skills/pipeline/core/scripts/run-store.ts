@@ -894,6 +894,13 @@ export interface RunMeta {
    * from adapter id.
    */
   outer_host?: string;
+  /**
+   * Run-level discovery-channel default (#763). Written for new runs so
+   * scoreboard collectors can inherit event-level channel only when this
+   * explicit stamp is present. Historical run.json without the field must
+   * not be treated as live-run merely because engine.version exists.
+   */
+  discovery_channel?: string;
 }
 
 export interface InitRunDirOpts {
@@ -906,6 +913,13 @@ export interface InitRunDirOpts {
   engine?: RunEngineIdentity;
   /** Outer-host id when known (#784). Never invent from adapter id. */
   outerHost?: string | null;
+  /**
+   * Run-level discovery-channel (#763). Defaults to `live-run` for ordinary
+   * advance when omitted so new runs always carry an explicit stamp.
+   * Pass another closed-set value for batch/manual contexts. Historical
+   * runs that predate this field remain readable without inventing a channel.
+   */
+  discoveryChannel?: string | null;
 }
 
 /** Create the run directory, write run.json, append run_start to events.jsonl.
@@ -934,6 +948,14 @@ export async function initRunDir(
       typeof opts.outerHost === "string" && opts.outerHost.trim()
         ? opts.outerHost.trim()
         : undefined;
+    // #763: new runs always persist an explicit discovery_channel so collectors
+    // never treat pre-stamp history (engine.version only) as live-run.
+    const discoveryChannel =
+      typeof opts.discoveryChannel === "string" && opts.discoveryChannel.trim()
+        ? opts.discoveryChannel.trim()
+        : opts.discoveryChannel === null
+          ? undefined
+          : "live-run";
     const meta: RunMeta = {
       schema_version: RUN_SCHEMA_VERSION,
       run_id: opts.runId,
@@ -943,6 +965,7 @@ export async function initRunDir(
       started_at: opts.startedAt,
       ...(opts.engine ? { engine: opts.engine } : {}),
       ...(outerHost ? { outer_host: outerHost } : {}),
+      ...(discoveryChannel ? { discovery_channel: discoveryChannel } : {}),
     };
     await deps.writeFile(
       path.join(opts.runDir, "run.json"),
