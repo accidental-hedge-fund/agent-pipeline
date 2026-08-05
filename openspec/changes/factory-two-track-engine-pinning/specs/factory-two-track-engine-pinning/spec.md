@@ -42,7 +42,10 @@ repositories that consume the installed skill without explicit `--engine-track` 
 `engine_track` and that are not the factory control repository) SHALL NOT apply pinned-track
 enforcement and SHALL NOT require a production pin. The production pin authority SHALL be
 the factory control checkout (or an explicitly configured pin path / factory-control dir),
-not every target product `repo_dir` under advance. Candidate-track evidence SHALL NOT attach
+not every target product `repo_dir` under advance. Under active pinned intent against a
+non-factory target, when neither factory-control directory nor an explicit pin path is
+configured, the system SHALL refuse rather than loading a product-local pin (or treating
+a missing product-local pin as the factory pin). Candidate-track evidence SHALL NOT attach
 the production pin's `git_sha` as the executing engine SHA.
 
 #### Scenario: Pinned-track run matches the pin version
@@ -91,6 +94,17 @@ the production pin's `git_sha` as the executing engine SHA.
 - **AND** the advance target repository differs from that pin authority
 - **THEN** pin resolution SHALL use the factory control / override path
 - **AND** SHALL NOT require the pin file to exist under the product target `repo_dir`
+
+#### Scenario: Pinned intent without factory pin authority refuses
+
+- **WHEN** pinned-track production intent applies
+- **AND** the target repository is not the factory control repository
+- **AND** neither factory-control directory (`AGENT_PIPELINE_FACTORY_CONTROL` or equivalent)
+  nor an explicit pin path override is configured
+- **THEN** the advance path SHALL refuse before stages execute
+- **AND** doctor under the same pinned intent SHALL fail
+- **AND** remediation SHALL require configuring factory-control directory or pin path
+- **AND** SHALL NOT load a product-local pin file as production pin authority
 
 #### Scenario: Candidate evidence does not inherit the production pin SHA
 

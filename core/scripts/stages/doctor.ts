@@ -33,12 +33,15 @@ import {
 import { isElevatedWriteHealth, parseWriteHealthText } from "../run-store.ts";
 import {
   evaluateEngineTrackCheck,
+  hasProductionPinPathOverride,
   installReceiptPath,
   isFactoryControlRepo,
+  PRODUCTION_ENGINE_PIN_REL,
   resolveEngineTrackIntent,
   resolveInstallProvenance,
   resolvePinAuthorityDir,
   resolveProductionPin,
+  type PinLoadResult,
 } from "../production-engine-pin.ts";
 
 const execFileAsync = promisify(execFile);
@@ -672,21 +675,36 @@ export function buildPreflightChecks(
       // invoked from pipeline.ts (resolveConfig merges CLI/config). Default
       // pinned intent applies only for factory control context; ordinary
       // product-repo doctor does not require a production pin.
+      const factoryControlContext = isFactoryControlRepo(config.repo);
       const intent = resolveEngineTrackIntent({
         command: "doctor",
         configTrack: config.engine_track ?? null,
-        factoryControlContext: isFactoryControlRepo(config.repo),
+        factoryControlContext,
       });
-      // Pin authority is the factory control checkout (or env override), not
-      // necessarily the target product repo being operated on.
-      const pinAuthorityDir = resolvePinAuthorityDir({
+      // Pin authority is the factory control checkout (or env / pin path), not
+      // an arbitrary product target under active two-track intent.
+      const pinPathOverride = config.production_engine_pin_path ?? null;
+      const pinAuthority = resolvePinAuthorityDir({
         targetRepoDir: config.repo_dir,
+        targetIsFactoryControl: factoryControlContext,
+        allowTargetFallback: intent === null,
       });
-      const pinLoad = await resolveProductionPin({
-        repoDir: pinAuthorityDir,
-        readTextFile: deps.readTextFile,
-        overridePath: config.production_engine_pin_path ?? null,
-      });
+      const hasPinOverride = hasProductionPinPathOverride(pinPathOverride);
+      if (intent === "pinned" && !pinAuthority.ok && !hasPinOverride) {
+        return fail(pinAuthority.message, pinAuthority.remediation);
+      }
+      let pinLoad: PinLoadResult;
+      if (!pinAuthority.ok && !hasPinOverride) {
+        // Candidate (or inactive handled via allowTargetFallback) without
+        // factory authority: do not load a product-local pin as authority.
+        pinLoad = { kind: "missing", path: PRODUCTION_ENGINE_PIN_REL };
+      } else {
+        pinLoad = await resolveProductionPin({
+          repoDir: pinAuthority.ok ? pinAuthority.dir : config.repo_dir,
+          readTextFile: deps.readTextFile,
+          overridePath: pinPathOverride,
+        });
+      }
       // Installer receipt at skill root (parent of core install root).
       const receiptText = await deps.readTextFile(installReceiptPath(root));
       const isWorkingTree =

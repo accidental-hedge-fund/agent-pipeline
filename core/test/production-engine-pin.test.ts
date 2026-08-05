@@ -179,25 +179,53 @@ test("isFactoryControlRepo: only the canonical factory control owner/name", () =
 });
 
 test("resolvePinAuthorityDir: factory control env beats target repoDir", () => {
-  assert.equal(
-    resolvePinAuthorityDir({
-      targetRepoDir: "/product/target",
-      env: { [FACTORY_CONTROL_DIR_ENV]: "/factory/control" },
-    }),
-    path.resolve("/factory/control"),
-  );
-  assert.equal(
-    resolvePinAuthorityDir({
-      targetRepoDir: "/product/target",
-      factoryControlDir: "/factory/explicit",
-      env: {},
-    }),
-    path.resolve("/factory/explicit"),
-  );
-  assert.equal(
-    resolvePinAuthorityDir({ targetRepoDir: "/product/target", env: {} }),
-    "/product/target",
-  );
+  const fromEnv = resolvePinAuthorityDir({
+    targetRepoDir: "/product/target",
+    env: { [FACTORY_CONTROL_DIR_ENV]: "/factory/control" },
+    allowTargetFallback: false,
+  });
+  assert.equal(fromEnv.ok, true);
+  if (fromEnv.ok) assert.equal(fromEnv.dir, path.resolve("/factory/control"));
+
+  const fromArg = resolvePinAuthorityDir({
+    targetRepoDir: "/product/target",
+    factoryControlDir: "/factory/explicit",
+    env: {},
+    allowTargetFallback: false,
+  });
+  assert.equal(fromArg.ok, true);
+  if (fromArg.ok) assert.equal(fromArg.dir, path.resolve("/factory/explicit"));
+
+  // Inactive/probe default: target fallback allowed.
+  const fallback = resolvePinAuthorityDir({
+    targetRepoDir: "/product/target",
+    env: {},
+  });
+  assert.equal(fallback.ok, true);
+  if (fallback.ok) assert.equal(fallback.dir, "/product/target");
+});
+
+test("resolvePinAuthorityDir: refuses non-factory target under active intent", () => {
+  const refused = resolvePinAuthorityDir({
+    targetRepoDir: "/product/target",
+    env: {},
+    allowTargetFallback: false,
+  });
+  assert.equal(refused.ok, false);
+  if (!refused.ok) {
+    assert.equal(refused.code, "missing_factory_control");
+    assert.match(refused.remediation, /AGENT_PIPELINE_FACTORY_CONTROL|production_engine_pin_path|AGENT_PIPELINE_PRODUCTION_PIN/);
+  }
+
+  // Self-dogfood: factory control target is authority without env.
+  const self = resolvePinAuthorityDir({
+    targetRepoDir: "/factory/control",
+    env: {},
+    targetIsFactoryControl: true,
+    allowTargetFallback: false,
+  });
+  assert.equal(self.ok, true);
+  if (self.ok) assert.equal(self.dir, "/factory/control");
 });
 
 test("resolveProductionPin: pin authority can differ from target product repo", async () => {
@@ -219,9 +247,12 @@ test("resolveProductionPin: pin authority can differ from target product repo", 
     targetRepoDir: productDir,
     factoryControlDir: factoryDir,
     env: {},
+    allowTargetFallback: false,
   });
+  assert.equal(authority.ok, true);
+  if (!authority.ok) return;
   const fromAuthority = await resolveProductionPin({
-    repoDir: authority,
+    repoDir: authority.dir,
     readTextFile,
   });
   assert.equal(fromAuthority.kind, "ok");

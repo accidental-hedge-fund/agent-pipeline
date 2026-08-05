@@ -1276,9 +1276,12 @@ function engineTrackDeps(
 }
 
 test("check install:engine-track — pin match + receipt under pinned intent → pass", async () => {
-  // Explicit pinned intent: non-factory product repos only enforce when set.
+  // Self-dogfood factory control: target is valid pin authority.
   const r = await getCheck(
-    makeConfig({ engine_track: "pinned" }),
+    makeConfig({
+      repo: "accidental-hedge-fund/agent-pipeline",
+      engine_track: "pinned",
+    }),
     "install:engine-track",
     "1.29.1",
   ).run(engineTrackDeps(pinJson("1.29.1"), {}, "1.29.1"));
@@ -1289,7 +1292,10 @@ test("check install:engine-track — pin match + receipt under pinned intent →
 
 test("check install:engine-track — pin version match without receipt → fail", async () => {
   const r = await getCheck(
-    makeConfig({ engine_track: "pinned" }),
+    makeConfig({
+      repo: "accidental-hedge-fund/agent-pipeline",
+      engine_track: "pinned",
+    }),
     "install:engine-track",
     "1.29.1",
   ).run(engineTrackDeps(pinJson("1.29.1"), {}, null));
@@ -1300,7 +1306,10 @@ test("check install:engine-track — pin version match without receipt → fail"
 
 test("check install:engine-track — pin mismatch under production intent → fail", async () => {
   const r = await getCheck(
-    makeConfig({ engine_track: "pinned" }),
+    makeConfig({
+      repo: "accidental-hedge-fund/agent-pipeline",
+      engine_track: "pinned",
+    }),
     "install:engine-track",
     "1.30.0",
   ).run(engineTrackDeps(pinJson("1.29.1"), {}, "1.30.0"));
@@ -1312,12 +1321,53 @@ test("check install:engine-track — pin mismatch under production intent → fa
 
 test("check install:engine-track — missing pin under pinned intent → fail with init remediation", async () => {
   const r = await getCheck(
-    makeConfig({ engine_track: "pinned" }),
+    makeConfig({
+      repo: "accidental-hedge-fund/agent-pipeline",
+      engine_track: "pinned",
+    }),
     "install:engine-track",
     "1.0.0",
   ).run(engineTrackDeps(null, {}, "1.0.0"));
   assert.equal(r.status, "fail");
   assert.match(r.remediation!, /factory-pin init/);
+});
+
+test("check install:engine-track — product pinned without factory authority → fail", async () => {
+  // Explicit pinned on a product target without factory-control dir or pin path
+  // must not treat a product-local pin as production authority.
+  const r = await getCheck(
+    makeConfig({ engine_track: "pinned" }),
+    "install:engine-track",
+    "1.29.1",
+  ).run(engineTrackDeps(pinJson("1.29.1"), {}, "1.29.1"));
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /authority|non-factory|not configured/i);
+  assert.match(
+    r.remediation!,
+    /AGENT_PIPELINE_FACTORY_CONTROL|production_engine_pin_path|AGENT_PIPELINE_PRODUCTION_PIN/,
+  );
+});
+
+test("check install:engine-track — product pinned with pin path override uses override", async () => {
+  const pinPath = "/factory/control/.agent-pipeline/production-engine-pin.json";
+  const r = await getCheck(
+    makeConfig({
+      engine_track: "pinned",
+      production_engine_pin_path: pinPath,
+    }),
+    "install:engine-track",
+    "1.29.1",
+  ).run(
+    fakeDeps({
+      readTextFile: (p) => {
+        if (p === pinPath) return pinJson("1.29.1");
+        if (p.endsWith(".pipeline-install-receipt.json")) return receiptJson("1.29.1");
+        return '{"version":"1.29.1"}';
+      },
+    }),
+  );
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /pinned/);
 });
 
 test("check install:engine-track — non-factory host with no pin → pass (policy inactive)", async () => {
@@ -1339,13 +1389,15 @@ test("check install:engine-track — factory control repo defaults to pinned enf
 });
 
 test("check install:engine-track — candidate intent with mismatch does not fail for mismatch alone", async () => {
+  // Candidate without factory authority: pin not loaded from product target.
   const cfg = makeConfig({ engine_track: "candidate" });
   const r = await getCheck(cfg, "install:engine-track", "1.30.0").run(
     engineTrackDeps(pinJson("1.29.1"), {}, null),
   );
   assert.equal(r.status, "pass");
   assert.match(r.detail, /candidate/);
-  assert.match(r.detail, /1\.29\.1/);
+  // Product-local pin must not be treated as authority without control/override.
+  assert.match(r.detail, /pin absent|absent/i);
 });
 
 test("check install:engine-track — additive stable id alongside coherence and freshness", () => {

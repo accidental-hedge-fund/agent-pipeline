@@ -71,14 +71,17 @@ import {
 import {
   engineTrackEvidenceFields,
   enforcePinnedTrackPolicy,
+  hasProductionPinPathOverride,
   installReceiptPath,
   isFactoryControlRepo,
+  PRODUCTION_ENGINE_PIN_REL,
   resolveEngineTrackIntent,
   resolveInstallProvenance,
   resolvePinAuthorityDir,
   resolveProductionPin,
   type EngineTrackIntent,
   type PinInstallProvenance,
+  type PinLoadResult,
   type ResolvedEngineTrackIntent,
 } from "./production-engine-pin.ts";
 import type { RunEngineIdentity } from "./run-store.ts";
@@ -933,17 +936,31 @@ export async function runAdvance(
         factoryControlContext,
       });
       const baseForGate = (deps.resolvePinnedEngineIdentity ?? resolvePinnedEngineIdentity)();
-      // Pin authority: factory control dir (env/config) when set; else target.
-      // Explicit production_engine_pin_path / AGENT_PIPELINE_PRODUCTION_PIN
-      // still override the file path inside resolveProductionPin.
-      const pinAuthorityDir = resolvePinAuthorityDir({
+      // Pin authority: factory control dir / self-dogfood / explicit pin path.
+      // Never fall back to an arbitrary product target under active track intent.
+      const pinPathOverride = cfg.production_engine_pin_path ?? null;
+      const pinAuthority = resolvePinAuthorityDir({
         targetRepoDir: cfg.repo_dir,
+        targetIsFactoryControl: factoryControlContext,
+        // Active two-track intent: product targets are not pin authority.
+        allowTargetFallback: trackIntent === null,
       });
+      const hasPinOverride = hasProductionPinPathOverride(pinPathOverride);
       let trackForEvidence: "pinned" | "candidate" | undefined;
       let pinVersionForEvidence: string | undefined;
       let gitShaForEvidence: string | undefined;
 
       if (trackIntent !== null) {
+        // Pinned intent without factory-control authority or pin-path override
+        // must refuse — a product-local pin (or missing product pin) is not
+        // production-pin authority.
+        if (trackIntent === "pinned" && !pinAuthority.ok && !hasPinOverride) {
+          console.error(
+            `[pipeline] #${issueNumber}: engine-track policy refused (${pinAuthority.code}): ${pinAuthority.message}\n` +
+              `  → ${pinAuthority.remediation}`,
+          );
+          return;
+        }
         const enforce =
           deps.enforceEngineTrack ??
           (async (input) => {
@@ -954,11 +971,21 @@ export async function runAdvance(
                 return null;
               }
             };
-            const pinLoad = await resolveProductionPin({
-              repoDir: input.repoDir,
-              readTextFile,
-              overridePath: input.pinPathOverride ?? null,
-            });
+            // Without factory authority and without pin override, do not load
+            // a product-local pin (candidate intent continues with missing pin).
+            let pinLoad: PinLoadResult;
+            if (!pinAuthority.ok && !hasPinOverride) {
+              pinLoad = {
+                kind: "missing",
+                path: PRODUCTION_ENGINE_PIN_REL,
+              };
+            } else {
+              pinLoad = await resolveProductionPin({
+                repoDir: input.repoDir,
+                readTextFile,
+                overridePath: input.pinPathOverride ?? null,
+              });
+            }
             let installProvenance: PinInstallProvenance | null | undefined =
               input.installProvenance;
             if (installProvenance === undefined) {
@@ -1006,11 +1033,14 @@ export async function runAdvance(
               }),
             };
           });
+        // Authority dir when resolved; with pin-path override alone, pin load
+        // uses the override and repoDir is only a working-tree comparison base.
+        const pinAuthorityDir = pinAuthority.ok ? pinAuthority.dir : cfg.repo_dir;
         const enforcement = await enforce({
           repoDir: pinAuthorityDir,
           intent: trackIntent,
           runningVersion: baseForGate?.version ?? null,
-          pinPathOverride: cfg.production_engine_pin_path ?? null,
+          pinPathOverride,
           engineRoot: baseForGate?.root ?? null,
         });
         // Fail closed under every failed pinned-track enforcement result.

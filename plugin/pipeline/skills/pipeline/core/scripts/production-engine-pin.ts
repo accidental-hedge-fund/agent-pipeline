@@ -583,30 +583,75 @@ export function isFactoryControlRepo(repo: string | null | undefined): boolean {
   return n.length > 0 && n === FACTORY_CONTROL_REPO.toLowerCase();
 }
 
+/** Result of resolving the production-pin authority directory. */
+export type PinAuthorityResult =
+  | { ok: true; dir: string }
+  | {
+      ok: false;
+      code: "missing_factory_control";
+      message: string;
+      remediation: string;
+    };
+
+/**
+ * True when an absolute pin-file override is configured (config path or env).
+ * When set, pin resolution does not need a factory-control checkout directory.
+ */
+export function hasProductionPinPathOverride(
+  overridePath?: string | null,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (typeof overridePath === "string" && overridePath.trim()) return true;
+  const fromEnv = env[PRODUCTION_PIN_ENV];
+  return typeof fromEnv === "string" && fromEnv.trim().length > 0;
+}
+
 /**
  * Directory used as production-pin authority (factory control checkout).
- * Precedence: factoryControlDir arg → env AGENT_PIPELINE_FACTORY_CONTROL →
- * targetRepoDir. Pin file override (production_engine_pin_path /
- * AGENT_PIPELINE_PRODUCTION_PIN) still wins inside {@link productionPinPath}.
+ * Precedence: env AGENT_PIPELINE_FACTORY_CONTROL → factoryControlDir arg →
+ * targetRepoDir when targetIsFactoryControl or allowTargetFallback.
+ * Pin file override (production_engine_pin_path / AGENT_PIPELINE_PRODUCTION_PIN)
+ * still wins inside {@link productionPinPath} and does not require this dir.
  *
- * The pin is never treated as living on an arbitrary product target solely
- * because that target is being advanced — callers pass factoryControlDir or
- * rely on factory control as the target (self-dogfood).
+ * Active pinned intent on a non-factory target MUST NOT fall back to the
+ * product repo_dir: pass allowTargetFallback: false and either configure
+ * factory control / env or an explicit pin path (see
+ * {@link hasProductionPinPathOverride}).
  */
 export function resolvePinAuthorityDir(opts: {
   targetRepoDir: string;
   factoryControlDir?: string | null;
   env?: NodeJS.ProcessEnv;
-}): string {
+  /** True when target is the factory control repository (self-dogfood). */
+  targetIsFactoryControl?: boolean;
+  /**
+   * When false, refuse non-factory target fallback. Use for active two-track
+   * intent so a product checkout cannot supply pin authority by accident.
+   * Default true preserves inactive/probe behavior for ordinary hosts.
+   */
+  allowTargetFallback?: boolean;
+}): PinAuthorityResult {
   const env = opts.env ?? process.env;
   const fromEnv = env[FACTORY_CONTROL_DIR_ENV];
   if (typeof fromEnv === "string" && fromEnv.trim()) {
-    return path.resolve(fromEnv.trim());
+    return { ok: true, dir: path.resolve(fromEnv.trim()) };
   }
   if (typeof opts.factoryControlDir === "string" && opts.factoryControlDir.trim()) {
-    return path.resolve(opts.factoryControlDir.trim());
+    return { ok: true, dir: path.resolve(opts.factoryControlDir.trim()) };
   }
-  return opts.targetRepoDir;
+  if (opts.targetIsFactoryControl || opts.allowTargetFallback !== false) {
+    return { ok: true, dir: opts.targetRepoDir };
+  }
+  return {
+    ok: false,
+    code: "missing_factory_control",
+    message:
+      "production pin authority is not configured for this non-factory target",
+    remediation:
+      `Set ${FACTORY_CONTROL_DIR_ENV} to the factory control checkout root, ` +
+      `or set production_engine_pin_path / ${PRODUCTION_PIN_ENV} to the pin JSON path. ` +
+      `Do not place a product-local pin as production authority.`,
+  };
 }
 
 /**
