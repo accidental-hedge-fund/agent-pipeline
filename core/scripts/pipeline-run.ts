@@ -69,10 +69,14 @@ import {
   type EngineIdentity,
 } from "./engine-identity.ts";
 import {
+  engineTrackEvidenceFields,
   enforcePinnedTrackPolicy,
+  installReceiptPath,
   resolveEngineTrackIntent,
+  resolveInstallProvenance,
   resolveProductionPin,
   type EngineTrackIntent,
+  type PinInstallProvenance,
 } from "./production-engine-pin.ts";
 import type { RunEngineIdentity } from "./run-store.ts";
 import * as fsp from "node:fs/promises";
@@ -466,17 +470,23 @@ export interface AdvanceDeps {
    * #762: load production pin + enforce pinned-track policy at run start.
    * Injected for hermetic tests (default: real pin file + enforcePinnedTrackPolicy).
    * Return `{ ok: false }` to refuse the advance before stages run.
+   * Under pinned intent every failed enforcement result must refuse (fail closed).
    */
   enforceEngineTrack?: (input: {
     repoDir: string;
     intent: EngineTrackIntent;
     runningVersion: string | null;
     pinPathOverride?: string | null;
+    /** Engine core root for install-receipt resolution (optional). */
+    engineRoot?: string | null;
+    /** Pre-resolved provenance for hermetic tests (skips receipt I/O). */
+    installProvenance?: PinInstallProvenance | null;
   }) => Promise<
     | {
         ok: true;
         track: "pinned" | "candidate";
         pin_version?: string;
+        /** Pin SHA only when track is verified pinned — never for candidate. */
         git_sha?: string;
       }
     | { ok: false; code: string; message: string; remediation: string }
@@ -901,6 +911,9 @@ export async function runAdvance(
 
       // #762 two-track: resolve intent + pin before first init so evidence
       // captures track once and pinned intent can refuse a mislabeled run.
+      // Fail closed: every failed pinned-track enforcement result refuses
+      // before stages (missing/invalid pin, version mismatch, unverified
+      // install provenance). Candidate intent never claims pin git_sha.
       const trackIntent: EngineTrackIntent = resolveEngineTrackIntent({
         command: "advance",
         cliTrack: opts.engineTrack ?? null,
@@ -910,21 +923,47 @@ export async function runAdvance(
       const enforce =
         deps.enforceEngineTrack ??
         (async (input) => {
+          const readTextFile = async (p: string): Promise<string | null> => {
+            try {
+              return await fsp.readFile(p, "utf8");
+            } catch {
+              return null;
+            }
+          };
           const pinLoad = await resolveProductionPin({
             repoDir: input.repoDir,
-            readTextFile: async (p) => {
-              try {
-                return await fsp.readFile(p, "utf8");
-              } catch {
-                return null;
-              }
-            },
+            readTextFile,
             overridePath: input.pinPathOverride ?? null,
           });
+          let installProvenance: PinInstallProvenance | null | undefined =
+            input.installProvenance;
+          if (installProvenance === undefined) {
+            const engineRoot = input.engineRoot ?? baseForGate?.root ?? null;
+            let receiptText: string | null = null;
+            if (engineRoot) {
+              receiptText = await readTextFile(installReceiptPath(engineRoot));
+            }
+            // Working-tree signal: engine root lives under the control repo
+            // (or a worktree path under it). Tag installs live outside repoDir.
+            const isWorkingTree = Boolean(
+              engineRoot &&
+                (engineRoot === input.repoDir ||
+                  engineRoot.startsWith(input.repoDir + path.sep) ||
+                  engineRoot.includes(`${path.sep}.worktrees${path.sep}`)),
+            );
+            installProvenance = resolveInstallProvenance({
+              receiptText,
+              isWorkingTree,
+              workingTreeDetail: isWorkingTree
+                ? "engine root is under the control-repo / worktree checkout"
+                : undefined,
+            });
+          }
           const r = enforcePinnedTrackPolicy({
             intent: input.intent,
             pinLoad,
             runningVersion: input.runningVersion,
+            installProvenance,
           });
           if (!r.ok) {
             return {
@@ -934,13 +973,13 @@ export async function runAdvance(
               remediation: r.remediation,
             };
           }
+          // git_sha only for verified pinned track (never pin SHA on candidate).
           return {
             ok: true as const,
-            track: r.classification.track,
-            ...(r.pin?.version ? { pin_version: r.pin.version } : {}),
-            ...(r.pin?.git_sha && r.pin.git_sha.trim()
-              ? { git_sha: r.pin.git_sha.trim() }
-              : {}),
+            ...engineTrackEvidenceFields({
+              track: r.classification.track,
+              pin: r.pin,
+            }),
           };
         });
       const enforcement = await enforce({
@@ -948,32 +987,25 @@ export async function runAdvance(
         intent: trackIntent,
         runningVersion: baseForGate?.version ?? null,
         pinPathOverride: cfg.production_engine_pin_path ?? null,
+        engineRoot: baseForGate?.root ?? null,
       });
-      // Hard-fail only when a production pin exists and install mismatches under
-      // pinned intent (or version unreadable). Missing/invalid pin under pinned
-      // intent cannot present a coherent pinned run: reclassify as candidate and
-      // continue so non-factory consumers without a pin are not blocked (doctor
-      // still hard-fails for factory disclosure — see install:engine-track).
+      // Fail closed under every failed pinned-track enforcement result.
+      // Intentional soaks must pass --engine-track candidate (or config).
       let trackForEvidence: "pinned" | "candidate" = trackIntent === "candidate" ? "candidate" : "pinned";
       let pinVersionForEvidence: string | undefined;
       let gitShaForEvidence: string | undefined;
       if (!enforcement.ok) {
-        if (enforcement.code === "version_mismatch" || enforcement.code === "unknown_version") {
-          console.error(
-            `[pipeline] #${issueNumber}: engine-track policy refused (${enforcement.code}): ${enforcement.message}\n` +
-              `  → ${enforcement.remediation}`,
-          );
-          return;
-        }
-        console.warn(
-          `[pipeline] #${issueNumber}: engine-track cannot claim pinned (${enforcement.code}): ${enforcement.message} — recording track=candidate`,
+        console.error(
+          `[pipeline] #${issueNumber}: engine-track policy refused (${enforcement.code}): ${enforcement.message}\n` +
+            `  → ${enforcement.remediation}`,
         );
-        trackForEvidence = "candidate";
-      } else {
-        trackForEvidence = enforcement.track;
-        pinVersionForEvidence = enforcement.pin_version;
-        gitShaForEvidence = enforcement.git_sha;
+        return;
       }
+      trackForEvidence = enforcement.track;
+      pinVersionForEvidence = enforcement.pin_version;
+      // Candidate evidence must never inherit the production pin SHA.
+      gitShaForEvidence =
+        enforcement.track === "pinned" ? enforcement.git_sha : undefined;
 
       // Resumed dispatch (#450): reuse the engine identity already recorded in
       // this run's run.json when it exists, rather than re-resolving the

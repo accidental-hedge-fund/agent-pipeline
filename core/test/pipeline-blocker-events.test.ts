@@ -265,6 +265,14 @@ test("runAdvance emits blocker_set with the producer diagnostic to events.jsonl 
   const deps: AdvanceDeps = {
     resolvePinnedEngineIdentity: () => null,
     probeEngineIdentity: () => null,
+    // #762: pin enforcement fails closed without a pin/receipt; this test is
+    // about blocker_set emission, so inject a coherent candidate track result.
+    enforceEngineTrack: async () => ({
+      ok: true as const,
+      track: "candidate" as const,
+      pin_version: undefined,
+      git_sha: undefined,
+    }),
     releaseParkedWorktree: async () => ({
       action: "absent",
       reason: "no managed worktree",

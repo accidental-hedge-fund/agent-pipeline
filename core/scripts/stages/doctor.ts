@@ -33,7 +33,9 @@ import {
 import { isElevatedWriteHealth, parseWriteHealthText } from "../run-store.ts";
 import {
   evaluateEngineTrackCheck,
+  installReceiptPath,
   resolveEngineTrackIntent,
+  resolveInstallProvenance,
   resolveProductionPin,
 } from "../production-engine-pin.ts";
 
@@ -676,10 +678,24 @@ export function buildPreflightChecks(
         readTextFile: deps.readTextFile,
         overridePath: config.production_engine_pin_path ?? null,
       });
+      // Installer receipt at skill root (parent of core install root).
+      const receiptText = await deps.readTextFile(installReceiptPath(root));
+      const isWorkingTree =
+        root === config.repo_dir ||
+        root.startsWith(config.repo_dir + path.sep) ||
+        root.includes(`${path.sep}.worktrees${path.sep}`);
+      const installProvenance = resolveInstallProvenance({
+        receiptText,
+        isWorkingTree,
+        workingTreeDetail: isWorkingTree
+          ? "engine root is under the control-repo / worktree checkout"
+          : undefined,
+      });
       const result = evaluateEngineTrackCheck({
         intent,
         pinLoad,
         runningVersion: version,
+        installProvenance,
       });
       if (result.status === "pass") return pass(result.detail);
       if (result.status === "warn") return warn(result.detail, result.remediation);

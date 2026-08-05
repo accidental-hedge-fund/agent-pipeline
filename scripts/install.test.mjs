@@ -24,6 +24,7 @@ import { spawnSync } from "node:child_process";
 
 import {
   MANAGED_MARKER,
+  INSTALL_RECEIPT,
   DEPS,
   HOSTS,
   VALID_HOSTS,
@@ -2155,6 +2156,12 @@ test("install --host codex: managed marker → normal overwrite, no personal-sha
       "managed install must not emit personal-shadow relocation offer",
     );
     assert.ok(existsSync(join(dest, MANAGED_MARKER)));
+    // #762: tag-install receipt for pinned-track provenance
+    assert.ok(existsSync(join(dest, INSTALL_RECEIPT)), "managed install must write install receipt");
+    const receipt = JSON.parse(readFileSync(join(dest, INSTALL_RECEIPT), "utf8"));
+    assert.equal(receipt.schema_version, 1);
+    assert.ok(typeof receipt.version === "string" && receipt.version.length > 0);
+    assert.ok(typeof receipt.tag === "string" && receipt.tag.startsWith("v"));
     // No pipeline.*.bak under codex base from this path.
     const backups = readdirSync(codexTmp).filter((e) => e.startsWith("pipeline.") && e.includes(".bak"));
     assert.deepEqual(backups, [], "managed overwrite must not relocate");

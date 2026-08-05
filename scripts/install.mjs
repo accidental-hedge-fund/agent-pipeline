@@ -60,6 +60,11 @@ const HOME = homedir();
 // pre-existing personal install that would shadow the plugin's /pipeline skill.
 const MANAGED_MARKER = ".pipeline-installer-managed";
 
+// Installer receipt (#762): tag-install provenance for pinned-track enforcement.
+// Written atomically with the managed marker so doctor / run-start can verify
+// the install came from a release tag rather than a same-version working tree.
+const INSTALL_RECEIPT = ".pipeline-install-receipt.json";
+
 // ---------------------------------------------------------------------------
 // Outer-host manifests (#784) — sole enumeration source for installable hosts.
 // Co-located JSON under hosts/<id>/outer-host.manifest.json; installer stays
@@ -728,6 +733,33 @@ function stageInto(stagingDir, host) {
   // Sentinel: written into staging so it lands atomically with the skill tree.
   // Future runs use this to distinguish an installer-managed dir from a personal one.
   writeFileSync(join(stagingDir, MANAGED_MARKER), "");
+  // #762: tag-install receipt — version/tag from the staged core package.json
+  // (the tree being installed). Pinned-track production requires this receipt
+  // to match the production pin tag; version equality alone is not enough.
+  try {
+    const pkgRaw = readFileSync(join(stagingDir, "core", "package.json"), "utf8");
+    const pkg = JSON.parse(pkgRaw);
+    const version = typeof pkg.version === "string" ? pkg.version.trim() : "";
+    if (version) {
+      const tag = version.startsWith("v") || version.startsWith("V") ? version : `v${version}`;
+      writeFileSync(
+        join(stagingDir, INSTALL_RECEIPT),
+        JSON.stringify(
+          {
+            schema_version: 1,
+            version: version.replace(/^[vV]/, ""),
+            tag,
+            installed_at: new Date().toISOString(),
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+    }
+  } catch {
+    // Receipt is best-effort at install time; pinned-track enforcement will
+    // fail closed if it is absent when production intent is claimed.
+  }
 }
 
 /**
@@ -1548,6 +1580,7 @@ async function main() {
 // Named exports for unit tests.
 export {
   MANAGED_MARKER,
+  INSTALL_RECEIPT,
   DEPS,
   HOSTS,
   VALID_HOSTS,

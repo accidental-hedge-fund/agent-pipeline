@@ -36,11 +36,37 @@ export const PRODUCTION_PIN_ENV = "AGENT_PIPELINE_PRODUCTION_PIN";
 
 export const PRODUCTION_PIN_SCHEMA_VERSION = 1;
 
+/**
+ * Installer receipt written next to the managed-skill marker by `install.mjs`.
+ * Filename is skill-root relative (parent of `core/`). Presence of a receipt
+ * whose `tag` matches the production pin is required to claim track `pinned`.
+ */
+export const INSTALL_RECEIPT_FILENAME = ".pipeline-install-receipt.json";
+
+export const INSTALL_RECEIPT_SCHEMA_VERSION = 1;
+
 export type EngineTrack = "pinned" | "candidate";
 
 export type EngineTrackIntent = "pinned" | "candidate";
 
 export type GitShaSource = "operator" | "promote-arg" | "frg-note" | "unknown";
+
+/** Machine-readable installer receipt (tag-install provenance). */
+export interface InstallReceipt {
+  schema_version: number;
+  version: string;
+  tag: string;
+  installed_at?: string;
+}
+
+/**
+ * Verifiable install provenance for pinned-track enforcement.
+ * Version equality alone is never sufficient to claim track `pinned`.
+ */
+export type PinInstallProvenance =
+  | { kind: "tag_install"; tag: string; version?: string | null }
+  | { kind: "working_tree"; detail?: string }
+  | { kind: "missing"; detail?: string };
 
 /** Prior pin snapshot retained for rollback (one level). */
 export interface ProductionEnginePinPrevious {
@@ -139,6 +165,120 @@ export function versionsMatch(a: string, b: string): boolean {
   const nb = normalizePinVersion(b);
   if (na && nb) return na === nb;
   return a.trim().replace(/^v/i, "") === b.trim().replace(/^v/i, "");
+}
+
+/** True when two tags name the same release (optional leading `v`). */
+export function tagsMatch(a: string, b: string): boolean {
+  return versionsMatch(a, b);
+}
+
+// ---------------------------------------------------------------------------
+// Install receipt / provenance (#762 review: version-only is insufficient)
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse an installer receipt. Throws on invalid shape.
+ * Soft-load helper `tryParseInstallReceipt` never throws.
+ */
+export function parseInstallReceipt(raw: unknown): InstallReceipt {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("install receipt must be a JSON object");
+  }
+  const o = raw as Record<string, unknown>;
+  if (o.schema_version !== INSTALL_RECEIPT_SCHEMA_VERSION) {
+    throw new Error(
+      `install receipt schema_version must be ${INSTALL_RECEIPT_SCHEMA_VERSION}`,
+    );
+  }
+  if (typeof o.version !== "string" || !o.version.trim()) {
+    throw new Error("install receipt.version must be a non-empty string");
+  }
+  if (typeof o.tag !== "string" || !o.tag.trim()) {
+    throw new Error("install receipt.tag must be a non-empty string");
+  }
+  const version = o.version.trim();
+  const tag = o.tag.trim();
+  if (!versionsMatch(version, tag)) {
+    throw new Error(
+      `install receipt version ${version} does not match tag ${tag}`,
+    );
+  }
+  const receipt: InstallReceipt = {
+    schema_version: INSTALL_RECEIPT_SCHEMA_VERSION,
+    version,
+    tag,
+  };
+  if (typeof o.installed_at === "string" && o.installed_at.trim()) {
+    receipt.installed_at = o.installed_at.trim();
+  }
+  return receipt;
+}
+
+export function tryParseInstallReceipt(text: string | null | undefined): InstallReceipt | null {
+  if (typeof text !== "string" || !text.trim()) return null;
+  try {
+    return parseInstallReceipt(JSON.parse(text) as unknown);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve skill-root install provenance from an optional receipt body.
+ * Pure: no I/O. Callers load the receipt text via injected read seams.
+ *
+ * - Valid receipt → `tag_install` (receipt wins over working-tree heuristics)
+ * - Explicit working-tree signal without receipt → `working_tree`
+ * - Missing/invalid receipt → `missing` (fail closed under pinned intent)
+ */
+export function resolveInstallProvenance(input: {
+  receiptText?: string | null;
+  /** When true and no valid receipt, treat as a working-tree engine. */
+  isWorkingTree?: boolean;
+  workingTreeDetail?: string;
+}): PinInstallProvenance {
+  const receipt = tryParseInstallReceipt(input.receiptText ?? null);
+  if (receipt) {
+    return {
+      kind: "tag_install",
+      tag: receipt.tag,
+      version: receipt.version,
+    };
+  }
+  if (input.isWorkingTree) {
+    return {
+      kind: "working_tree",
+      detail: input.workingTreeDetail ?? "engine root is a working-tree checkout",
+    };
+  }
+  return {
+    kind: "missing",
+    detail:
+      typeof input.receiptText === "string" && input.receiptText.trim()
+        ? "install receipt present but unreadable/invalid"
+        : "install receipt absent",
+  };
+}
+
+/**
+ * True when provenance proves a tag install matching the production pin tag.
+ * Version match alone is never sufficient.
+ */
+export function pinInstallProvenanceMatches(
+  provenance: PinInstallProvenance | null | undefined,
+  pin: ProductionEnginePin,
+): boolean {
+  if (!provenance || provenance.kind !== "tag_install") return false;
+  return tagsMatch(provenance.tag, pin.tag);
+}
+
+/**
+ * Absolute path of the install receipt for a skill tree whose `core/` root is
+ * `engineRoot` (or install root passed as core path).
+ */
+export function installReceiptPath(engineRoot: string): string {
+  // engine/core root → skill root (parent) → receipt
+  return path.join(path.dirname(engineRoot), INSTALL_RECEIPT_FILENAME);
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +443,12 @@ export interface ClassifyEngineTrackInput {
   runningVersion: string | null | undefined;
   /** Loaded pin, or null when missing/unreadable. */
   pin: ProductionEnginePin | null;
+  /**
+   * Installer provenance (receipt / working-tree). Required for coherent
+   * `pinned` — version equality alone never claims the production track.
+   * When omitted, treated as missing provenance (fail closed for pinned).
+   */
+  installProvenance?: PinInstallProvenance | null;
 }
 
 export interface ClassifyEngineTrackResult {
@@ -310,15 +456,19 @@ export interface ClassifyEngineTrackResult {
   pin_version: string | null;
   running_version: string | null;
   pin_match: boolean;
-  /** Coherent pinned production posture: intent pinned AND pin present AND versions match. */
+  /**
+   * Coherent pinned production posture: intent pinned AND pin present AND
+   * versions match AND install provenance proves a pin-tag install.
+   */
   coherent_pinned: boolean;
   reason: string;
 }
 
 /**
- * Classify the engine track from intent + pin + running version.
+ * Classify the engine track from intent + pin + running version + provenance.
  * Pure: no I/O. Does not invent track from version alone when intent is absent
- * (caller must supply intent).
+ * (caller must supply intent). Version match without install provenance is
+ * never coherent pinned.
  */
 export function classifyEngineTrack(input: ClassifyEngineTrackInput): ClassifyEngineTrackResult {
   const running =
@@ -328,6 +478,7 @@ export function classifyEngineTrack(input: ClassifyEngineTrackInput): ClassifyEn
   const pinVersion = input.pin?.version ?? null;
   const pinMatch =
     pinVersion !== null && running !== null && versionsMatch(pinVersion, running);
+  const provenance = input.installProvenance ?? { kind: "missing" as const, detail: "install provenance not supplied" };
 
   if (input.intent === "candidate") {
     return {
@@ -373,13 +524,29 @@ export function classifyEngineTrack(input: ClassifyEngineTrackInput): ClassifyEn
       reason: `pinned intent but install v${running} ≠ pin v${pinVersion}`,
     };
   }
+  if (!pinInstallProvenanceMatches(provenance, input.pin)) {
+    const why =
+      provenance.kind === "working_tree"
+        ? provenance.detail ?? "working-tree engine (not a tag install)"
+        : provenance.kind === "tag_install"
+          ? `install receipt tag ${provenance.tag} ≠ pin tag ${input.pin.tag}`
+          : provenance.detail ?? "install receipt missing or unverifiable";
+    return {
+      track: "candidate",
+      pin_version: pinVersion,
+      running_version: running,
+      pin_match: true,
+      coherent_pinned: false,
+      reason: `pinned intent + version match but unverified pin install: ${why}`,
+    };
+  }
   return {
     track: "pinned",
     pin_version: pinVersion,
     running_version: running,
     pin_match: true,
     coherent_pinned: true,
-    reason: `install matches production pin v${pinVersion}`,
+    reason: `install matches production pin v${pinVersion} with tag-install provenance ${input.pin.tag}`,
   };
 }
 
@@ -432,7 +599,12 @@ export type PinEnforcementResult =
       ok: false;
       classification: ClassifyEngineTrackResult;
       pin: ProductionEnginePin | null;
-      code: "missing_pin" | "invalid_pin" | "version_mismatch" | "unknown_version";
+      code:
+        | "missing_pin"
+        | "invalid_pin"
+        | "version_mismatch"
+        | "unknown_version"
+        | "unverified_install";
       message: string;
       remediation: string;
     };
@@ -441,12 +613,21 @@ export function enforcePinnedTrackPolicy(input: {
   intent: EngineTrackIntent;
   pinLoad: PinLoadResult | null;
   runningVersion: string | null | undefined;
+  /**
+   * Installer provenance. Omitted/null is treated as missing and refuses
+   * pinned intent even when versions match (no working-tree as production).
+   */
+  installProvenance?: PinInstallProvenance | null;
 }): PinEnforcementResult {
   const pin = input.pinLoad?.kind === "ok" ? input.pinLoad.pin : null;
+  const installProvenance =
+    input.installProvenance ??
+    ({ kind: "missing", detail: "install provenance not supplied" } satisfies PinInstallProvenance);
   const classification = classifyEngineTrack({
     intent: input.intent,
     runningVersion: input.runningVersion,
     pin,
+    installProvenance,
   });
 
   if (input.intent === "candidate") {
@@ -505,7 +686,50 @@ export function enforcePinnedTrackPolicy(input: {
         `or re-invoke with --engine-track candidate for an intentional soak.`,
     };
   }
+  if (!classification.coherent_pinned) {
+    const pinTag = pin!.tag;
+    return {
+      ok: false,
+      classification,
+      pin,
+      code: "unverified_install",
+      message:
+        `pinned-track intent requires a tag install of ${pinTag}, not a same-version working-tree ` +
+        `or install without a matching receipt (${classification.reason})`,
+      remediation:
+        `Reinstall from the pin tag so the installer writes ${INSTALL_RECEIPT_FILENAME}: ` +
+        `npx -y github:accidental-hedge-fund/agent-pipeline#${pinTag} install, ` +
+        `or re-invoke with --engine-track candidate for an intentional soak.`,
+    };
+  }
   return { ok: true, classification, pin };
+}
+
+/**
+ * Map a successful pin-enforcement result to run-evidence engine fields.
+ * Attaches `git_sha` only for a verified `pinned` track — never the pin SHA
+ * on a candidate run (stale-install / phantom-defect attribution).
+ */
+export function engineTrackEvidenceFields(input: {
+  track: EngineTrack;
+  pin: ProductionEnginePin | null;
+}): Pick<{ track: EngineTrack; pin_version?: string; git_sha?: string }, "track" | "pin_version" | "git_sha"> {
+  const fields: {
+    track: EngineTrack;
+    pin_version?: string;
+    git_sha?: string;
+  } = { track: input.track };
+  if (input.pin?.version) {
+    fields.pin_version = input.pin.version;
+  }
+  if (
+    input.track === "pinned" &&
+    input.pin?.git_sha &&
+    input.pin.git_sha.trim()
+  ) {
+    fields.git_sha = input.pin.git_sha.trim();
+  }
+  return fields;
 }
 
 // ---------------------------------------------------------------------------
@@ -528,12 +752,18 @@ export function evaluateEngineTrackCheck(input: {
   intent: EngineTrackIntent;
   pinLoad: PinLoadResult;
   runningVersion: string;
+  /** Install provenance; omitted → missing (fail closed under pinned intent). */
+  installProvenance?: PinInstallProvenance | null;
 }): EngineTrackCheckResult {
   const pin = input.pinLoad.kind === "ok" ? input.pinLoad.pin : null;
+  const installProvenance =
+    input.installProvenance ??
+    ({ kind: "missing", detail: "install provenance not supplied" } satisfies PinInstallProvenance);
   const classification = classifyEngineTrack({
     intent: input.intent,
     runningVersion: input.runningVersion,
     pin,
+    installProvenance,
   });
 
   if (input.intent === "candidate") {
@@ -598,9 +828,24 @@ export function evaluateEngineTrackCheck(input: {
     };
   }
 
+  if (!classification.coherent_pinned) {
+    return {
+      status: "fail",
+      detail:
+        `pinned-track version matches pin v${pinVer} but install provenance is not a pin-tag install` +
+        ` (${classification.reason})${shaPart}`,
+      remediation:
+        `Reinstall from the pin tag (writes ${INSTALL_RECEIPT_FILENAME}): ` +
+        `npx -y github:accidental-hedge-fund/agent-pipeline#${pin!.tag} install, ` +
+        `or declare intentional candidate soak with --engine-track candidate.`,
+    };
+  }
+
   return {
     status: "pass",
-    detail: `track=pinned; production pin v${pinVer} matches installed/running v${runVer}${shaPart}`,
+    detail:
+      `track=pinned; production pin v${pinVer} matches installed/running v${runVer}` +
+      ` via tag-install ${pin!.tag}${shaPart}`,
   };
 }
 

@@ -120,6 +120,16 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
         previous: null,
       });
     }
+    // #762: matching install receipt so pin+version alone is not enough for
+    // install:engine-track pass under pinned intent.
+    if (p.endsWith(".pipeline-install-receipt.json")) {
+      return JSON.stringify({
+        schema_version: 1,
+        version: "1.0.0",
+        tag: "v1.0.0",
+        installed_at: "2026-01-01T00:00:00Z",
+      });
+    }
     return '{"version":"1.0.0"}';
   };
   return {
@@ -1116,6 +1126,14 @@ test("check locks:stale-sweep — a warn does not fail overall runPreflight", as
             previous: null,
           });
         }
+        if (p.endsWith(".pipeline-install-receipt.json")) {
+          return JSON.stringify({
+            schema_version: 1,
+            version: "1.0.0",
+            tag: "v1.0.0",
+            installed_at: "2026-01-01T00:00:00Z",
+          });
+        }
         return '{"version":"1.0.0"}';
       },
       isPidLive: () => false,
@@ -1230,29 +1248,54 @@ function pinJson(version: string, gitSha: string | null = null): string {
   });
 }
 
-function engineTrackDeps(pinText: string | null, o: FakeOverrides = {}): DoctorDeps {
+function receiptJson(version: string): string {
+  return JSON.stringify({
+    schema_version: 1,
+    version,
+    tag: `v${version}`,
+    installed_at: "2026-07-01T00:00:00Z",
+  });
+}
+
+function engineTrackDeps(
+  pinText: string | null,
+  o: FakeOverrides = {},
+  receiptVersion: string | null = "1.29.1",
+): DoctorDeps {
   return fakeDeps({
     ...o,
     readTextFile: (p) => {
       if (p.endsWith("production-engine-pin.json")) return pinText;
+      if (p.endsWith(".pipeline-install-receipt.json")) {
+        return receiptVersion ? receiptJson(receiptVersion) : null;
+      }
       if (o.readTextFile) return o.readTextFile(p);
       return '{"version":"1.0.0"}';
     },
   });
 }
 
-test("check install:engine-track — pin match under pinned intent → pass", async () => {
+test("check install:engine-track — pin match + receipt under pinned intent → pass", async () => {
   const r = await getCheck(makeConfig(), "install:engine-track", "1.29.1").run(
-    engineTrackDeps(pinJson("1.29.1")),
+    engineTrackDeps(pinJson("1.29.1"), {}, "1.29.1"),
   );
   assert.equal(r.status, "pass");
   assert.match(r.detail, /pinned/);
   assert.match(r.detail, /1\.29\.1/);
 });
 
+test("check install:engine-track — pin version match without receipt → fail", async () => {
+  const r = await getCheck(makeConfig(), "install:engine-track", "1.29.1").run(
+    engineTrackDeps(pinJson("1.29.1"), {}, null),
+  );
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /provenance|receipt|tag-install|unverified/i);
+  assert.ok(r.remediation && /reinstall|candidate/i.test(r.remediation));
+});
+
 test("check install:engine-track — pin mismatch under production intent → fail", async () => {
   const r = await getCheck(makeConfig(), "install:engine-track", "1.30.0").run(
-    engineTrackDeps(pinJson("1.29.1")),
+    engineTrackDeps(pinJson("1.29.1"), {}, "1.30.0"),
   );
   assert.equal(r.status, "fail");
   assert.match(r.detail, /1\.29\.1/);
@@ -1262,7 +1305,7 @@ test("check install:engine-track — pin mismatch under production intent → fa
 
 test("check install:engine-track — missing pin under pinned intent → fail with init remediation", async () => {
   const r = await getCheck(makeConfig(), "install:engine-track", "1.0.0").run(
-    engineTrackDeps(null),
+    engineTrackDeps(null, {}, "1.0.0"),
   );
   assert.equal(r.status, "fail");
   assert.match(r.remediation!, /factory-pin init/);
@@ -1271,7 +1314,7 @@ test("check install:engine-track — missing pin under pinned intent → fail wi
 test("check install:engine-track — candidate intent with mismatch does not fail for mismatch alone", async () => {
   const cfg = makeConfig({ engine_track: "candidate" });
   const r = await getCheck(cfg, "install:engine-track", "1.30.0").run(
-    engineTrackDeps(pinJson("1.29.1")),
+    engineTrackDeps(pinJson("1.29.1"), {}, null),
   );
   assert.equal(r.status, "pass");
   assert.match(r.detail, /candidate/);

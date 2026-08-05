@@ -6,22 +6,28 @@ import test from "node:test";
 import * as path from "node:path";
 import type { FrgEvidence, FrgLookupResult } from "../scripts/factory-reliability-gate.ts";
 import {
+  INSTALL_RECEIPT_FILENAME,
   PRODUCTION_ENGINE_PIN_REL,
   PRODUCTION_PIN_ENV,
   PRODUCTION_PIN_SCHEMA_VERSION,
   classifyEngineTrack,
+  engineTrackEvidenceFields,
   enforcePinnedTrackPolicy,
   evaluateEngineTrackCheck,
   formatProductionPinSummary,
   initProductionPin,
+  parseInstallReceipt,
   parseProductionEnginePin,
+  pinInstallProvenanceMatches,
   productionPinPath,
   promoteProductionPin,
   resolveEngineTrackIntent,
+  resolveInstallProvenance,
   resolveProductionPin,
   rollbackProductionPin,
   tagForVersion,
   versionsMatch,
+  type PinInstallProvenance,
   type ProductionEnginePin,
   type ProductionPinFsDeps,
 } from "../scripts/production-engine-pin.ts";
@@ -43,6 +49,11 @@ function validPin(overrides: Partial<ProductionEnginePin> = {}): ProductionEngin
     previous: null,
     ...overrides,
   };
+}
+
+/** Tag-install provenance matching validPin() — required for coherent pinned. */
+function pinProvenance(tag = "v1.29.1"): PinInstallProvenance {
+  return { kind: "tag_install", tag, version: tag.replace(/^v/i, "") };
 }
 
 function passEvidence(version: string, runId = "frg-pass-1"): FrgEvidence {
@@ -230,14 +241,40 @@ test("resolveProductionPin: invalid JSON", async () => {
 // Classification matrix
 // ---------------------------------------------------------------------------
 
-test("classifyEngineTrack: pinned intent + match → track pinned", () => {
+test("classifyEngineTrack: pinned intent + match + tag provenance → track pinned", () => {
   const r = classifyEngineTrack({
     intent: "pinned",
     runningVersion: "1.29.1",
     pin: validPin(),
+    installProvenance: pinProvenance(),
   });
   assert.equal(r.track, "pinned");
   assert.equal(r.coherent_pinned, true);
+  assert.equal(r.pin_match, true);
+});
+
+test("classifyEngineTrack: pinned intent + version match without provenance → not coherent pinned", () => {
+  const r = classifyEngineTrack({
+    intent: "pinned",
+    runningVersion: "1.29.1",
+    pin: validPin(),
+    // omitted provenance → missing
+  });
+  assert.equal(r.track, "candidate");
+  assert.equal(r.coherent_pinned, false);
+  assert.equal(r.pin_match, true);
+  assert.match(r.reason, /unverified|receipt|provenance/i);
+});
+
+test("classifyEngineTrack: pinned intent + version match + working_tree → not coherent pinned", () => {
+  const r = classifyEngineTrack({
+    intent: "pinned",
+    runningVersion: "1.29.1",
+    pin: validPin(),
+    installProvenance: { kind: "working_tree", detail: "repo checkout" },
+  });
+  assert.equal(r.track, "candidate");
+  assert.equal(r.coherent_pinned, false);
   assert.equal(r.pin_match, true);
 });
 
@@ -246,6 +283,7 @@ test("classifyEngineTrack: pinned intent + mismatch → not coherent pinned", ()
     intent: "pinned",
     runningVersion: "1.30.0",
     pin: validPin(),
+    installProvenance: pinProvenance(),
   });
   assert.equal(r.track, "candidate");
   assert.equal(r.coherent_pinned, false);
@@ -257,6 +295,7 @@ test("classifyEngineTrack: candidate intent always candidate (even on match)", (
     intent: "candidate",
     runningVersion: "1.29.1",
     pin: validPin(),
+    installProvenance: pinProvenance(),
   });
   assert.equal(r.track, "candidate");
   assert.equal(r.coherent_pinned, false);
@@ -325,9 +364,21 @@ test("enforcePinnedTrackPolicy: pinned + missing pin fails", () => {
     intent: "pinned",
     pinLoad: { kind: "missing", path: PIN_PATH },
     runningVersion: "1.29.1",
+    installProvenance: pinProvenance(),
   });
   assert.equal(r.ok, false);
   if (!r.ok) assert.equal(r.code, "missing_pin");
+});
+
+test("enforcePinnedTrackPolicy: pinned + invalid pin fails (fail closed)", () => {
+  const r = enforcePinnedTrackPolicy({
+    intent: "pinned",
+    pinLoad: { kind: "invalid", path: PIN_PATH, detail: "bad json" },
+    runningVersion: "1.29.1",
+    installProvenance: pinProvenance(),
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.equal(r.code, "invalid_pin");
 });
 
 test("enforcePinnedTrackPolicy: pinned + mismatch fails", () => {
@@ -335,6 +386,7 @@ test("enforcePinnedTrackPolicy: pinned + mismatch fails", () => {
     intent: "pinned",
     pinLoad: { kind: "ok", pin: validPin(), path: PIN_PATH },
     runningVersion: "1.30.0",
+    installProvenance: pinProvenance("v1.30.0"),
   });
   assert.equal(r.ok, false);
   if (!r.ok) {
@@ -343,29 +395,124 @@ test("enforcePinnedTrackPolicy: pinned + mismatch fails", () => {
   }
 });
 
-test("enforcePinnedTrackPolicy: pinned + match ok", () => {
+test("enforcePinnedTrackPolicy: pinned + version match + tag receipt ok", () => {
   const r = enforcePinnedTrackPolicy({
     intent: "pinned",
     pinLoad: { kind: "ok", pin: validPin(), path: PIN_PATH },
     runningVersion: "v1.29.1",
+    installProvenance: pinProvenance(),
   });
   assert.equal(r.ok, true);
   assert.equal(r.classification.track, "pinned");
+});
+
+test("enforcePinnedTrackPolicy: pinned + same-version working tree fails (unverified_install)", () => {
+  const r = enforcePinnedTrackPolicy({
+    intent: "pinned",
+    pinLoad: { kind: "ok", pin: validPin(), path: PIN_PATH },
+    runningVersion: "1.29.1",
+    installProvenance: { kind: "working_tree", detail: "control-repo checkout" },
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.equal(r.code, "unverified_install");
+    assert.match(r.remediation, /reinstall|candidate|receipt/i);
+  }
+});
+
+test("enforcePinnedTrackPolicy: pinned + version match without receipt fails", () => {
+  const r = enforcePinnedTrackPolicy({
+    intent: "pinned",
+    pinLoad: { kind: "ok", pin: validPin(), path: PIN_PATH },
+    runningVersion: "1.29.1",
+    installProvenance: { kind: "missing", detail: "no receipt" },
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.equal(r.code, "unverified_install");
+});
+
+test("engineTrackEvidenceFields: pin git_sha only on verified pinned track", () => {
+  const pin = validPin({
+    git_sha: "abc123def4567890abc123def4567890abc123de",
+    git_sha_source: "promote-arg",
+  });
+  const pinned = engineTrackEvidenceFields({ track: "pinned", pin });
+  assert.equal(pinned.track, "pinned");
+  assert.equal(pinned.pin_version, "1.29.1");
+  assert.equal(pinned.git_sha, "abc123def4567890abc123def4567890abc123de");
+
+  const candidate = engineTrackEvidenceFields({ track: "candidate", pin });
+  assert.equal(candidate.track, "candidate");
+  assert.equal(candidate.pin_version, "1.29.1");
+  assert.equal(candidate.git_sha, undefined, "candidate must not inherit production pin SHA");
+});
+
+test("resolveInstallProvenance: receipt → tag_install; receipt wins over working_tree", () => {
+  const text = JSON.stringify({
+    schema_version: 1,
+    version: "1.29.1",
+    tag: "v1.29.1",
+    installed_at: "2026-07-01T00:00:00Z",
+  });
+  const fromReceipt = resolveInstallProvenance({ receiptText: text });
+  assert.equal(fromReceipt.kind, "tag_install");
+  if (fromReceipt.kind === "tag_install") assert.equal(fromReceipt.tag, "v1.29.1");
+
+  // Valid receipt is positive tag-install evidence even if path heuristics
+  // also look like a working tree (e.g. tests under .worktrees/).
+  const receiptOverWt = resolveInstallProvenance({ receiptText: text, isWorkingTree: true });
+  assert.equal(receiptOverWt.kind, "tag_install");
+
+  const wtOnly = resolveInstallProvenance({ receiptText: null, isWorkingTree: true });
+  assert.equal(wtOnly.kind, "working_tree");
+
+  assert.equal(resolveInstallProvenance({ receiptText: null }).kind, "missing");
+});
+
+test("parseInstallReceipt + pinInstallProvenanceMatches", () => {
+  const receipt = parseInstallReceipt({
+    schema_version: 1,
+    version: "1.29.1",
+    tag: "v1.29.1",
+  });
+  assert.equal(receipt.tag, "v1.29.1");
+  assert.equal(
+    pinInstallProvenanceMatches({ kind: "tag_install", tag: "v1.29.1" }, validPin()),
+    true,
+  );
+  assert.equal(
+    pinInstallProvenanceMatches({ kind: "tag_install", tag: "v1.30.0" }, validPin()),
+    false,
+  );
+  assert.equal(INSTALL_RECEIPT_FILENAME, ".pipeline-install-receipt.json");
 });
 
 // ---------------------------------------------------------------------------
 // Doctor evaluateEngineTrackCheck
 // ---------------------------------------------------------------------------
 
-test("evaluateEngineTrackCheck: pin match under pinned intent → pass", () => {
+test("evaluateEngineTrackCheck: pin match + tag provenance under pinned intent → pass", () => {
   const r = evaluateEngineTrackCheck({
     intent: "pinned",
     pinLoad: { kind: "ok", pin: validPin(), path: PIN_PATH },
     runningVersion: "1.29.1",
+    installProvenance: pinProvenance(),
   });
   assert.equal(r.status, "pass");
   assert.match(r.detail, /pinned/);
   assert.match(r.detail, /1\.29\.1/);
+});
+
+test("evaluateEngineTrackCheck: version match without provenance → fail", () => {
+  const r = evaluateEngineTrackCheck({
+    intent: "pinned",
+    pinLoad: { kind: "ok", pin: validPin(), path: PIN_PATH },
+    runningVersion: "1.29.1",
+    installProvenance: { kind: "missing" },
+  });
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /provenance|receipt|tag-install|unverified/i);
+  assert.ok(r.remediation);
 });
 
 test("evaluateEngineTrackCheck: mismatch under pinned intent → fail", () => {
@@ -373,6 +520,7 @@ test("evaluateEngineTrackCheck: mismatch under pinned intent → fail", () => {
     intent: "pinned",
     pinLoad: { kind: "ok", pin: validPin(), path: PIN_PATH },
     runningVersion: "1.30.0",
+    installProvenance: pinProvenance(),
   });
   assert.equal(r.status, "fail");
   assert.match(r.detail, /1\.29\.1/);
@@ -406,6 +554,7 @@ test("evaluateEngineTrackCheck: reports sha unknown when absent", () => {
     intent: "pinned",
     pinLoad: { kind: "ok", pin: validPin({ git_sha: null }), path: PIN_PATH },
     runningVersion: "1.29.1",
+    installProvenance: pinProvenance(),
   });
   assert.equal(r.status, "pass");
   assert.match(r.detail, /unknown/);

@@ -31,7 +31,14 @@ engine install corresponding to the production pin (the existing tag-pinned inst
 `npx …#<tag> install` or an equivalent install of that tag), not an unpinned floating
 default-branch install and not an ad-hoc unreleased working-tree engine used as if it were
 production. The running engine version for a pinned-track run SHALL match the pin's
-`version` (normalizing an optional leading `v`).
+`version` (normalizing an optional leading `v`). Version equality alone SHALL NOT be
+sufficient to classify a run as track `pinned`: the system SHALL also require verifiable
+tag-install provenance (for example an installer receipt identifying the pin tag). A
+same-version working-tree candidate without that provenance SHALL NOT be recorded as
+`pinned`. Under default pinned intent, a missing or invalid production pin SHALL refuse
+the run before stages execute rather than silently reclassifying to candidate and
+continuing. Candidate-track evidence SHALL NOT attach the production pin's `git_sha` as
+the executing engine SHA.
 
 #### Scenario: Pinned-track run matches the pin version
 
@@ -46,6 +53,31 @@ production. The running engine version for a pinned-track run SHALL match the pi
 - **AND** the operator claims or configures pinned-track production intent
 - **THEN** the system SHALL treat the posture as misconfigured (doctor fail or equivalent policy signal)
 - **AND** SHALL NOT present the run as a coherent pinned production execution
+
+#### Scenario: Same-version working-tree is not coherent pinned without install provenance
+
+- **WHEN** pinned-track production intent applies
+- **AND** the running engine version equals the production pin version
+- **AND** tag-install provenance for the pin tag cannot be established (for example no
+  matching installer receipt, or the engine is a control-repo working tree)
+- **THEN** the system SHALL refuse to classify the run as coherent track `pinned`
+- **AND** under default pinned intent SHALL refuse the advance before stages (or doctor
+  fail with reinstall remediation)
+
+#### Scenario: Missing pin under pinned intent refuses the run
+
+- **WHEN** pinned-track production intent applies
+- **AND** the production pin artifact is missing or invalid
+- **THEN** the advance path SHALL refuse before stages execute
+- **AND** SHALL NOT continue while only labeling evidence as track `candidate`
+
+#### Scenario: Candidate evidence does not inherit the production pin SHA
+
+- **WHEN** a run is classified as track `candidate`
+- **AND** a production pin with a non-empty `git_sha` is readable
+- **THEN** run evidence SHALL NOT set `engine.git_sha` to that pin SHA solely because
+  the pin is readable
+- **AND** MAY omit `git_sha` when the candidate checkout SHA is not resolved
 
 ---
 
