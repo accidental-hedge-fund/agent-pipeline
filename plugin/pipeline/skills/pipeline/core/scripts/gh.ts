@@ -100,6 +100,21 @@ export function setGhRunId(id: string | undefined): void {
   _activeRunId = id;
 }
 
+/**
+ * Module-level discovery channel for the active run (#763) — set by pipeline-run
+ * from the persisted run.json stamp (or the init default). Used by setBlocked so
+ * blocker comments inherit the active run's channel rather than hardcoding live-run.
+ * Cleared with the rest of per-run module state at dispatch end.
+ */
+let _activeDiscoveryChannel: import("./engine-attribution.ts").DiscoveryChannel | undefined;
+
+/** Set the active discovery channel for the current dispatch cycle. Pass undefined to clear. */
+export function setGhDiscoveryChannel(
+  channel: import("./engine-attribution.ts").DiscoveryChannel | undefined,
+): void {
+  _activeDiscoveryChannel = channel;
+}
+
 // ---------------------------------------------------------------------------
 // Idempotent audit helpers (#259)
 // ---------------------------------------------------------------------------
@@ -1249,6 +1264,13 @@ export interface SetBlockedDeps {
   addBlockedLabel?: (cfg: PipelineConfig, n: number) => Promise<void>;
   postComment?: (cfg: PipelineConfig, n: number, body: string) => Promise<void>;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Active-run discovery channel for the blocker stamp (#763). Prefer this over
+   * the module-level {@link setGhDiscoveryChannel} value when both are set.
+   * Validated against the closed vocabulary; invalid values fall through to the
+   * module-level stamp, then live-run only when no more-specific context exists.
+   */
+  discoveryChannel?: import("./engine-attribution.ts").DiscoveryChannel | null;
 }
 
 export async function setBlocked(
@@ -1286,6 +1308,17 @@ export async function setBlocked(
   } catch {
     // non-fatal — markers still emit unknown
   }
+  // Prefer deps > module-level active-run stamp > live-run default. Never stamp
+  // live-run when the active run was explicitly review-batch / manual / etc.
+  const { isDiscoveryChannel, DEFAULT_LIVE_RUN_CHANNEL } = await import("./engine-attribution.ts");
+  const discoveryChannel =
+    (deps.discoveryChannel != null && isDiscoveryChannel(deps.discoveryChannel)
+      ? deps.discoveryChannel
+      : null) ??
+    (_activeDiscoveryChannel != null && isDiscoveryChannel(_activeDiscoveryChannel)
+      ? _activeDiscoveryChannel
+      : null) ??
+    DEFAULT_LIVE_RUN_CHANNEL;
   const body = buildAttestedBlockedComment({
     issueNumber,
     stageStr,
@@ -1296,7 +1329,7 @@ export async function setBlocked(
     runId: effectiveRunId,
     engineVersion,
     engineCommitSha,
-    discoveryChannel: "live-run",
+    discoveryChannel,
   });
 
   await _addBlockedLabel(cfg, issueNumber);

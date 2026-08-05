@@ -192,7 +192,12 @@ export interface EngineAttributionFields {
   engine_version: string | null;
   engine_commit_sha: string | null;
   discovery_channel: DiscoveryChannel | null;
-  /** True when neither inline fields nor run inheritance supplied a channel. */
+  /**
+   * True when the resolved discovery channel is null — including legacy
+   * pre-#763 runs that have engine.version/commit_sha but no discovery_channel.
+   * Engine-identity missingness is separate (null fields); do not require both
+   * engine fields to be absent before recording channel missingness.
+   */
   missing_attribution: boolean;
 }
 
@@ -259,8 +264,9 @@ export function resolveEventAttribution(
   const engine_version = inlineVersion ?? inheritedVersion;
   const engine_commit_sha = inlineSha ?? inheritedSha;
   const discovery_channel = inlineChannel ?? runDefaultChannel;
-  const missing_attribution =
-    engine_version === null && engine_commit_sha === null && inlineChannel === null && runDefaultChannel === null;
+  // Channel absence is missing-attribution even when engine identity is present
+  // (historical pre-#763 population: engine.version without discovery_channel).
+  const missing_attribution = discovery_channel === null;
 
   return {
     engine_version,

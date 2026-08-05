@@ -22,9 +22,11 @@ import {
   reconcileAuditComment,
   setBlocked,
   setGhCollector,
+  setGhDiscoveryChannel,
   setGhRunId,
   transition,
 } from "./gh.ts";
+import { DEFAULT_LIVE_RUN_CHANNEL } from "./engine-attribution.ts";
 import {
   getOnDiskForIssue,
   gitInWorktree,
@@ -1175,6 +1177,11 @@ export async function runAdvance(
     // every stage and re-entry of the loop — carry the same `Pipeline-Run:` trailer.
     const pipelineRunId = makePipelineRunId(issueNumber, runStartedAt);
     setGhRunId(pipelineRunId);
+    // Ordinary advance stamps live-run at run init; module-level channel so
+    // setBlocked inherits it instead of hardcoding (#763 review a7593c47).
+    // Batch/manual entrypoints that pass a different initRunDir discoveryChannel
+    // must also call setGhDiscoveryChannel with that same closed-set value.
+    setGhDiscoveryChannel(DEFAULT_LIVE_RUN_CHANNEL);
     tlog(`[pipeline] #${issueNumber}: run id ${pipelineRunId}`);
 
     if (stateDir) {
@@ -1697,6 +1704,7 @@ export async function runAdvance(
       // Clear module-level per-run state when this dispatch cycle ends (#257, #259).
       setGhCollector(undefined);
       setGhRunId(undefined);
+      setGhDiscoveryChannel(undefined);
     }
     },
     issueNumber,

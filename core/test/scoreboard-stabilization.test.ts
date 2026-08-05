@@ -204,8 +204,9 @@ test("discovery-channel: papercut-autofile not folded into live-run; missing not
 });
 
 test("discovery-channel: pre-#763 run.json with engine.version only is missing-attribution, not live-run", () => {
-  // Regression for review finding e7187729: engine.version predated discovery
-  // stamps; treating it as live-run corrupted historical missingness accounting.
+  // Regression for review finding e7187729 / 9ec7c75a: engine.version predated
+  // discovery stamps; treating it as live-run (or as non-missing attribution)
+  // corrupted historical missingness accounting.
   const runs: StabilizationRun[] = [
     {
       runId: "legacy-engine-only",

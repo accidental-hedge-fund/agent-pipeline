@@ -142,13 +142,19 @@ test("resolveEventAttribution inherits from run.json and does not invent live-ru
   assert.equal(historical.missing_attribution, true);
 
   // Default runDefaultChannel is null — engine identity alone does not invent live-run.
+  // Legacy pre-#763: engine.version present, no discovery_channel → missing_attribution.
   const engineOnly = resolveEventAttribution(
     { type: "human_intervention" },
     { version: "1.28.0", commit_sha: "ccc333" },
   );
   assert.equal(engineOnly.engine_version, "1.28.0");
+  assert.equal(engineOnly.engine_commit_sha, "ccc333");
   assert.equal(engineOnly.discovery_channel, null);
-  assert.equal(engineOnly.missing_attribution, false); // version present
+  assert.equal(
+    engineOnly.missing_attribution,
+    true,
+    "missing channel is missing-attribution even when engine identity is present",
+  );
 });
 
 test("runLevelDiscoveryChannel requires explicit stamp; engine.version is not a channel", () => {
