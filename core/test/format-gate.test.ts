@@ -242,6 +242,48 @@ test("format gate: pre-existing dirty worktree blocks before any command runs", 
   );
 });
 
+test("format gate (#873): scratch-only pre-dirty does not refuse auto-fix gate", async () => {
+  // Product tree is clean; only tasks/todo.md is dirty. Pre-flight must proceed
+  // so implement certification is not still blocked by agent scratch.
+  let execCalls = 0;
+  const result = await runFormatGate(
+    "/wt",
+    cfg([{ command: "cargo fmt", auto_fix: true }]),
+    873,
+    {
+      execInWorktree: async () => {
+        execCalls++;
+        return { code: 0, combined: "" };
+      },
+      // Injected boolean dirty would still block; use porcelain classification
+      // (no gitIsDirty override) so scratch-only is clean enough.
+      gitStatusPorcelain: async () => " M tasks/todo.md\n?? .pipeline-prompt-abc.txt\n",
+      gitIsDirty: undefined,
+    },
+  );
+  assert.equal(result.status, "ok", `unexpected: ${JSON.stringify(result)}`);
+  assert.equal(execCalls, 1, "format command must run when only scratch is dirty");
+});
+
+test("format gate (#873): mixed scratch + product pre-dirty still blocks", async () => {
+  const result = await runFormatGate(
+    "/wt",
+    cfg([{ command: "cargo fmt", auto_fix: true }]),
+    873,
+    {
+      execInWorktree: async () => {
+        throw new Error("should not run when product dirt is present");
+      },
+      gitStatusPorcelain: async () => " M tasks/todo.md\n M core/scripts/foo.ts\n",
+    },
+  );
+  assert.equal(result.status, "blocked");
+  assert.ok(
+    "reason" in result && result.reason.includes("pre-existing uncommitted changes"),
+    `unexpected reason: ${JSON.stringify(result)}`,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Regression: auto-fix re-run leaves dirty worktree → non-stable formatter (#182 review-2 finding 2)
 // ---------------------------------------------------------------------------

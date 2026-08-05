@@ -349,6 +349,14 @@ const PartialConfigSchema = z.object({
       command: z.string().optional().describe("Explicit test command; auto-detected from lockfile when absent."),
       max_attempts: z.number().int().positive().optional().describe("Maximum fix-harness invocations before blocking."),
       timeout: z.number().int().positive().optional().describe("Seconds per test/build run."),
+      non_product_dirty_globs: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Extra path globs treated as non-product scratch for format/test gate trust (#873). " +
+            "Unioned with the engine-known set (tasks/**, .pipeline-prompt-* at worktree root); " +
+            "does not replace product fail-closed defaults. Lockfiles remain fold targets, not scratch.",
+        ),
     })
     .strict()
     .optional()
@@ -1326,6 +1334,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       command: fileConfig.test_gate?.command,
       max_attempts: fileConfig.test_gate?.max_attempts ?? DEFAULT_CONFIG.test_gate.max_attempts,
       timeout: fileConfig.test_gate?.timeout ?? DEFAULT_CONFIG.test_gate.timeout,
+      non_product_dirty_globs: fileConfig.test_gate?.non_product_dirty_globs,
     },
     eval_gate: {
       enabled: fileConfig.eval_gate?.enabled ?? DEFAULT_CONFIG.eval_gate.enabled,
@@ -2481,6 +2490,16 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       : `  # command: pnpm test # ${sd("test_gate.command", "explicit command; auto-detected when absent")}`,
     `  max_attempts: ${yamlScalar(testGate.max_attempts)} # ${sd("test_gate.max_attempts", "fix-harness invocations before blocking")}`,
     `  timeout: ${yamlScalar(testGate.timeout)} # ${sd("test_gate.timeout", "seconds per test/build run")}`,
+    // Optional: extra non-product scratch globs for gate trust (#873). Engine-
+    // known set (tasks/**, .pipeline-prompt-*) is always active; this only extends.
+    ...(testGate.non_product_dirty_globs && testGate.non_product_dirty_globs.length > 0
+      ? [
+          `  non_product_dirty_globs: # ${sd("test_gate.non_product_dirty_globs", "extra scratch globs unioned with engine-known tasks/** and .pipeline-prompt-* for format/test gate trust (#873)")}`,
+          ...testGate.non_product_dirty_globs.map((g) => `    - ${yamlScalar(g)}`),
+        ]
+      : [
+          `  # non_product_dirty_globs: [] # ${sd("test_gate.non_product_dirty_globs", "extra scratch globs unioned with engine-known tasks/** and .pipeline-prompt-* for format/test gate trust (#873)")}`,
+        ]),
     "",
     "visual_gate: # run the repo's E2E/visual suite after pre-merge and before eval-gate",
     `  enabled: ${yamlScalar(visualGate.enabled)} # ${sd("visual_gate.enabled", "set true to enable (one-time declaration per repo)")}`,

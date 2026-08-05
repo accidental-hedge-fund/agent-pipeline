@@ -1552,3 +1552,147 @@ test("gate (#352): clean worktree leaves no Uncommitted paths label in result", 
   // No blockReason when the gate passes.
   assert.ok(!out.blockReason, "passed gate must not have a blockReason");
 });
+
+// ---------------------------------------------------------------------------
+// Non-product scratch dirt must not hard-block gate trust (#873)
+// ---------------------------------------------------------------------------
+
+test("gate (#873): scratch-only pre-dirty (tasks/todo.md) allows the test command to run", async () => {
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => " M tasks/todo.md\n",
+  });
+  assert.equal(out.passed, true, `expected pass, got: ${JSON.stringify(out)}`);
+  assert.equal(ran, 1, "test command must run when only scratch is dirty");
+  assert.equal(out.dirtyWorktree, undefined);
+  assert.ok(!out.blockReason, "scratch-only dirt must not mint a blockReason");
+});
+
+test("gate (#873): scratch-only .pipeline-prompt-* pre-dirty allows the test command to run", async () => {
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => "?? .pipeline-prompt-uuid-here.txt\n",
+  });
+  assert.equal(out.passed, true);
+  assert.equal(ran, 1);
+});
+
+test("gate (#873, bites without exemption): product path still hard-blocks pre-run", async () => {
+  // Proves classification is load-bearing: a product path (not scratch) with the
+  // same dirty/porcelain seams blocks. Without product-vs-scratch filtering,
+  // scratch-only and product-only would behave identically; this case shows
+  // product still fails closed.
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => " M core/scripts/foo.ts\n",
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.equal(ran, 0, "test command must not run when product is dirty");
+  assert.equal(out.dirtyWorktree, true);
+  assert.match(out.blockReason ?? "", /core\/scripts\/foo\.ts/);
+  assert.doesNotMatch(testGateBlockReason(out), /failed after \d+ fix attempt/i);
+  assert.doesNotMatch(testGateBlockReason(out), /command is still failing/i);
+});
+
+test("gate (#873): mixed scratch + product pre-dirty blocks and discloses product path", async () => {
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () =>
+      " M tasks/todo.md\n M core/scripts/testgate.ts\n?? .pipeline-prompt-x.txt\n",
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.equal(ran, 0);
+  assert.equal(out.dirtyWorktree, true);
+  assert.match(out.blockReason ?? "", /core\/scripts\/testgate\.ts/);
+  // Product disclosure present; scratch omitted from blocking disclosure.
+  assert.match(out.blockReason ?? "", /Uncommitted paths:/);
+  assert.doesNotMatch(out.blockReason ?? "", /tasks\/todo\.md/);
+  assert.doesNotMatch(out.blockReason ?? "", /\.pipeline-prompt/);
+});
+
+test("gate (#873): post-pass dirt that is scratch-only does not fail a passing command", async () => {
+  let dirtyCall = 0;
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => {
+      dirtyCall++;
+      // pre-run clean; post-pass "dirty" with only scratch (simulates agent notes
+      // touched during the test run without product artifacts).
+      return dirtyCall > 1;
+    },
+    gitStatusPorcelain: async () => {
+      // pre-run porcelain unused when clean; post-pass returns scratch only.
+      return dirtyCall > 1 ? " M tasks/todo.md\n" : "";
+    },
+  });
+  assert.equal(out.passed, true, `expected pass on scratch-only post-dirt: ${JSON.stringify(out)}`);
+  assert.equal(ran, 1);
+});
+
+test("gate (#873): lockfile paths are product dirt (not reclassified as scratch)", async () => {
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 873, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => "?? package-lock.json\n",
+  });
+  assert.equal(out.passed, false);
+  assert.equal(ran, 0);
+  assert.equal(out.dirtyWorktree, true);
+  assert.match(out.blockReason ?? "", /package-lock\.json/);
+});
+
+test("gate (#873): config non_product_dirty_globs extends engine set (union)", async () => {
+  let ran = 0;
+  const out = await runTestGate(
+    cfgWith({ non_product_dirty_globs: ["notes/**"] }),
+    873,
+    "/wt",
+    {
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      runTests: async () => {
+        ran++;
+        return passResult;
+      },
+      gitDirty: async () => true,
+      gitStatusPorcelain: async () => " M notes/agent.md\n M tasks/todo.md\n",
+    },
+  );
+  assert.equal(out.passed, true);
+  assert.equal(ran, 1);
+});

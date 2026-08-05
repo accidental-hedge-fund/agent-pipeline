@@ -34,6 +34,11 @@ import { makeCommandRecord, recordCommand } from "./evidence-bundle.ts";
 import { buildFailureBlockReason, includeBuildArtifacts, type BuildSideEffectsDeps } from "./build-side-effects.ts";
 import { buildStageAccountingRecord } from "./accounting.ts";
 import { emitStageAccounting, type RunStoreDeps } from "./run-store.ts";
+import {
+  formatProductDirtDisclosure,
+  parsePorcelainPaths,
+  productDirtyPaths,
+} from "./worktree-dirt.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
 /** A command split into program + argv — never a raw string at spawn time. */
@@ -75,9 +80,10 @@ export interface TestGateResult {
    *  `build-failed` blocker kind instead of `test-gate-exhausted`. */
   buildFailure?: boolean;
   /** True when `blockReason` reports a dirty-worktree trust refusal (pre-run or
-   *  post-run uncommitted changes) rather than a genuine test/build-command
-   *  failure (#722). Consumed by `testGateBlockReason` so dirty blocks are not
-   *  wrapped as "failed after N fix attempt(s)" / "command is still failing". */
+   *  post-run uncommitted **product** changes) rather than a genuine test/build-
+   *  command failure (#722, #873). Consumed by `testGateBlockReason` so dirty
+   *  blocks are not wrapped as "failed after N fix attempt(s)" / "command is
+   *  still failing". Scratch-only dirt does not set this flag. */
   dirtyWorktree?: boolean;
 }
 
@@ -228,6 +234,35 @@ export async function runTestGate(
     ((wt: string, hb: string) => enforceTestFixCommitFormat(issueNumber, wt, hb));
   const gitCommitMessagesFn = deps.gitCommitMessages ?? defaultGitCommitMessages;
   const salvageFn = deps.salvage ?? trySalvageUncommittedWork;
+  // Config-extended scratch globs are unioned with the engine-known set (#873).
+  const scratchExtraGlobs = cfg.test_gate.non_product_dirty_globs ?? [];
+
+  /**
+   * Product-relevant dirt for gate trust (#873).
+   *
+   * Order:
+   * 1. `gitDirty` false → clean enough (production dirty/porcelain agree; pure-
+   *    boolean test seams that inject clean stay clean).
+   * 2. Dirty + porcelain paths → classify; scratch-only is clean enough;
+   *    product paths hard-block with disclosure.
+   * 3. Dirty + empty porcelain → fail closed as product dirt without path
+   *    disclosure (legacy pure-boolean dirty seams).
+   */
+  const resolveProductDirt = async (): Promise<{
+    productPaths: string[];
+    dirty: boolean;
+  }> => {
+    if (!(await gitDirtyFn(wtPath))) {
+      return { productPaths: [], dirty: false };
+    }
+    const porcelain = await gitStatusPorcelainFn(wtPath);
+    const paths = parsePorcelainPaths(porcelain);
+    if (paths.length > 0) {
+      const productPaths = productDirtyPaths(paths, scratchExtraGlobs);
+      return { productPaths, dirty: productPaths.length > 0 };
+    }
+    return { productPaths: [], dirty: true };
+  };
 
   // Operator-configured commands run through `bash -c "set -o pipefail; …"` so
   // shell operators (&&, ||, ;, pipes) work AND a failing stage in a pipeline
@@ -336,22 +371,24 @@ export async function runTestGate(
     return { result, toolingExhausted: result.toolingError };
   };
 
-  // Require a clean worktree before the first trusted test run. If uncommitted
-  // changes exist, what's tested diverges from what's committed, so the gate
-  // result can't be trusted.
-  if (await gitDirtyFn(wtPath)) {
-    const porcelainOut = truncateHead((await gitStatusPorcelainFn(wtPath)).trim(), MAX_BLOCK_OUTPUT);
-    const pathSuffix = porcelainOut ? `\n\nUncommitted paths:\n${porcelainOut}` : "";
-    return {
-      skipped: false,
-      passed: false,
-      attempts: 0,
-      dirtyWorktree: true,
-      blockReason:
-        "Worktree has uncommitted changes before the test gate ran. " +
-        "All changes must be committed so test results can be trusted." +
-        pathSuffix,
-    };
+  // Require a worktree free of product-relevant dirt before the first trusted
+  // test run (#873). Non-product scratch (tasks/todo.md, .pipeline-prompt-*,
+  // plus config extensions) alone does not hard-block — product dirt still
+  // fails closed because tested state would diverge from committed state.
+  {
+    const pre = await resolveProductDirt();
+    if (pre.dirty) {
+      return {
+        skipped: false,
+        passed: false,
+        attempts: 0,
+        dirtyWorktree: true,
+        blockReason:
+          "Worktree has uncommitted product changes before the test gate ran. " +
+          "All product changes must be committed so test results can be trusted." +
+          formatProductDirtDisclosure(pre.productPaths, MAX_BLOCK_OUTPUT),
+      };
+    }
   }
 
   const initialRun = await runWithToolingRetries();
@@ -369,22 +406,22 @@ export async function runTestGate(
   }
   let { passed, output } = initialRun.result;
   if (passed) {
-    // A passing run can still generate uncommitted artifacts (tsbuildinfo,
-    // snapshots, lock-file updates). If it does, the committed state diverges
-    // from what was tested — block so artifacts are committed and the gate reruns.
-    if (await gitDirtyFn(wtPath)) {
-      const porcelainOut = truncateHead((await gitStatusPorcelainFn(wtPath)).trim(), MAX_BLOCK_OUTPUT);
-      const pathSuffix = porcelainOut ? `\n\nUncommitted paths:\n${porcelainOut}` : "";
+    // A passing run can still generate uncommitted product artifacts
+    // (tsbuildinfo, snapshots, lock-file updates). Scratch-only dirt does not
+    // alone fail a passing command (#873). Product dirt still blocks so the
+    // gate certifies committed state.
+    const post = await resolveProductDirt();
+    if (post.dirty) {
       return {
         skipped: false,
         passed: false,
         attempts: 0,
         dirtyWorktree: true,
         blockReason:
-          "Test/build command left uncommitted changes in the working tree. " +
+          "Test/build command left uncommitted product changes in the working tree. " +
           "Commit any generated artifacts (snapshots, tsbuildinfo, lock-file updates) " +
           "so the gate certifies the exact committed state." +
-          pathSuffix,
+          formatProductDirtDisclosure(post.productPaths, MAX_BLOCK_OUTPUT),
       };
     }
     console.log(`[pipeline] #${issueNumber}: test gate passed`);
@@ -437,7 +474,9 @@ export async function runTestGate(
     // real uncommitted changes into a commit before the clean-tree and commit
     // checks below. Only the no-new-commit case salvages; a harness that
     // committed AND left dirt still hits the dirty block (its commits must not
-    // be silently amended with leftovers).
+    // be silently amended with leftovers). Salvage triggers on any dirt
+    // (including scratch) so leftover product work is still captured when mixed
+    // with scratch; trust below is product-only (#873).
     const headAfterFix = await gitHeadFn(wtPath);
     let salvageFailureReason: string | undefined;
     if (headBefore && headAfterFix === headBefore && (await gitDirtyFn(wtPath))) {
@@ -445,24 +484,30 @@ export async function runTestGate(
       salvageFailureReason = salvageResult.failureReason;
     }
 
-    // Require a clean worktree after every fix attempt regardless of whether HEAD
-    // advanced. If uncommitted changes remain, the test run would certify state
-    // that can't be pushed as-is, defeating the gate's trust invariant.
-    if (await gitDirtyFn(wtPath)) {
-      // #521: disclose why nothing was salvaged so the operator can see that
-      // recoverable work may still exist without reading terminal.log.
-      const dirtyReason =
-        "Fix harness left uncommitted changes in the working tree. " +
-        "Test results can't be trusted — stage and commit the fix before re-running.";
-      return {
-        skipped: false,
-        passed: false,
-        attempts: attempt,
-        dirtyWorktree: true,
-        blockReason: salvageFailureReason
-          ? `${dirtyReason} Salvage of uncommitted work also failed: ${salvageFailureReason}`
-          : dirtyReason,
-      };
+    // Require no product-relevant dirt after every fix attempt (#873). Scratch-
+    // only leftovers do not alone block re-running tests.
+    {
+      const afterFix = await resolveProductDirt();
+      if (afterFix.dirty) {
+        // #521: disclose why nothing was salvaged so the operator can see that
+        // recoverable work may still exist without reading terminal.log.
+        // Keep the historical "uncommitted changes" phrasing (#131/#521) so
+        // dirty-vs-exhaustion wording stays stable; product paths are disclosed
+        // separately when known (#873).
+        const dirtyReason =
+          "Fix harness left uncommitted changes in the working tree. " +
+          "Test results can't be trusted — stage and commit the fix before re-running." +
+          formatProductDirtDisclosure(afterFix.productPaths, MAX_BLOCK_OUTPUT);
+        return {
+          skipped: false,
+          passed: false,
+          attempts: attempt,
+          dirtyWorktree: true,
+          blockReason: salvageFailureReason
+            ? `${dirtyReason} Salvage of uncommitted work also failed: ${salvageFailureReason}`
+            : dirtyReason,
+        };
+      }
     }
 
     // Verify the test-fix commit message format (#68).
@@ -525,16 +570,18 @@ export async function runTestGate(
     }
     ({ passed, output } = retryRun.result);
     if (passed) {
-      if (await gitDirtyFn(wtPath)) {
+      const postFixPass = await resolveProductDirt();
+      if (postFixPass.dirty) {
         return {
           skipped: false,
           passed: false,
           attempts: attempt,
           dirtyWorktree: true,
           blockReason:
-            "Test/build command left uncommitted changes in the working tree. " +
+            "Test/build command left uncommitted product changes in the working tree. " +
             "Commit any generated artifacts (snapshots, tsbuildinfo, lock-file updates) " +
-            "so the gate certifies the exact committed state.",
+            "so the gate certifies the exact committed state." +
+            formatProductDirtDisclosure(postFixPass.productPaths, MAX_BLOCK_OUTPUT),
         };
       }
       console.log(`[pipeline] #${issueNumber}: test gate passed after ${attempt} fix attempt(s)`);
