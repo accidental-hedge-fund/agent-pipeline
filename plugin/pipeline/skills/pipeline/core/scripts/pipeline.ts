@@ -255,6 +255,9 @@ export function toAdvanceOpts(opts: Pick<
     jsonEvents: opts.jsonEvents,
     profile: opts.profile,
     runId: opts.runId,
+    ...(opts.engineTrack === "pinned" || opts.engineTrack === "candidate"
+      ? { engineTrack: opts.engineTrack }
+      : {}),
   };
 }
 
@@ -365,6 +368,22 @@ export interface CliOpts {
   for?: string;
   /** factory-gate: durable loop run id to score (#723). */
   fromRun?: string;
+  /**
+   * Two-track engine intent (#762). Commander maps `--engine-track` → engineTrack.
+   * Values: `pinned` | `candidate`.
+   */
+  engineTrack?: "pinned" | "candidate";
+  /**
+   * factory-gate: after a release-eligible pass, opt-in promote of the production
+   * pin to --for version (#762). Default off — never silent pin write.
+   */
+  promotePinOnPass?: boolean;
+  /** factory-pin promote/init: optional release git SHA (never invented). */
+  gitSha?: string;
+  /** factory-pin init: bootstrap from FRG pass for this version. */
+  fromFrg?: string;
+  /** factory-pin rollback: target version (default: pin.previous). */
+  to?: string;
   /** scoreboard: restrict analysis to runs on or before this ISO date. */
   until?: string;
   /** scoreboard: use a relative N-day window. */
@@ -523,7 +542,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | factory-pin | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -592,8 +611,19 @@ export function buildCmd(): Command {
     // descriptions/visibility, so it never appears anywhere in --help output.
     .addOption(new Option("--run <run-id>", "run-store run id to record an event against, or scope a report to").hideHelp())
     .addOption(new Option("-m, --message <text>", "free-text friction message to record").hideHelp())
-    .option("--for <version>", "factory-gate: target release version X.Y.Z (required)", undefined)
+    .option("--for <version>", "factory-gate / factory-pin promote: target release version X.Y.Z", undefined)
     .option("--from-run <run-id>", "factory-gate: score an existing durable loop run id")
+    .option(
+      "--engine-track <track>",
+      "two-track engine intent: pinned (production pin) or candidate (FRG/eval soak) (#762)",
+    )
+    .option(
+      "--promote-pin-on-pass",
+      "factory-gate: after a release-eligible FRG pass, promote the production engine pin (opt-in; never merges or tags) (#762)",
+    )
+    .option("--git-sha <sha>", "factory-pin promote/init: optional release commit SHA (never invented)")
+    .option("--from-frg <version>", "factory-pin init: bootstrap pin from FRG pass for version X.Y.Z")
+    .option("--to <version>", "factory-pin rollback: repoint pin to this FRG-passed version")
     .option(
       "--no-close-pack",
       "factory-gate: skip auto-close of synthetic pack PRs/issues after a release-eligible pass",
@@ -3422,9 +3452,159 @@ async function main(): Promise<void> {
           }
         },
       });
+      // #762: factory-gate always soaks the candidate track. Opt-in pin promote
+      // only after a release-eligible pass; never merges or tags.
+      if (result.exitCode === 0 && opts.promotePinOnPass && result.evidence?.pass) {
+        const { promoteProductionPin } = await import("./production-engine-pin.ts");
+        const promote = await promoteProductionPin({
+          repoDir,
+          version: versionArg,
+          gitSha: opts.gitSha ?? null,
+        });
+        if (promote.ok) {
+          console.log(
+            `[pipeline factory-gate] promoted production pin to ${promote.pin.version} ` +
+              `(frg_run_id=${promote.pin.frg_run_id}). Reinstall: ${promote.reinstall_hint}`,
+          );
+        } else {
+          console.error(
+            `[pipeline factory-gate] --promote-pin-on-pass refused: ${promote.message}`,
+          );
+          process.exitCode = 1;
+        }
+      }
       if (result.exitCode !== 0) process.exitCode = result.exitCode;
     } catch (err) {
       console.error(`pipeline factory-gate: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // `pipeline factory-pin show|init|promote|rollback` (#762).
+  // Manages the production engine pin. Never merges or tags.
+  if (numArg === "factory-pin") {
+    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(startDir) ?? startDir;
+    const verb = (cmd.args[1] as string | undefined)?.trim() ?? "show";
+    const {
+      resolveProductionPin,
+      formatProductionPinSummary,
+      promoteProductionPin,
+      initProductionPin,
+      rollbackProductionPin,
+      PRODUCTION_ENGINE_PIN_REL,
+    } = await import("./production-engine-pin.ts");
+    try {
+      if (verb === "show") {
+        const load = await resolveProductionPin({
+          repoDir,
+          readTextFile: async (p) => {
+            try {
+              return await fsPromises.readFile(p, "utf8");
+            } catch {
+              return null;
+            }
+          },
+        });
+        if (opts.json) {
+          console.log(JSON.stringify(load, null, 2));
+        } else if (load.kind === "ok") {
+          console.log(`Production engine pin (${load.path}):`);
+          console.log(`  ${formatProductionPinSummary(load.pin)}`);
+          console.log(
+            `  Reinstall: npx -y github:accidental-hedge-fund/agent-pipeline#${load.pin.tag} install`,
+          );
+        } else {
+          console.error(
+            `pipeline factory-pin show: pin ${load.kind} at ${load.path}` +
+              ("detail" in load ? `: ${load.detail}` : "") +
+              `\n  Init: pipeline factory-pin init --from-frg <X.Y.Z>`,
+          );
+          process.exitCode = 1;
+        }
+        return;
+      }
+      if (verb === "promote") {
+        const version = opts.for;
+        if (!version) {
+          console.error(
+            "pipeline factory-pin promote: --for <X.Y.Z> is required.\n" +
+              "  Usage: pipeline factory-pin promote --for <X.Y.Z> [--git-sha <sha>]",
+          );
+          process.exit(2);
+        }
+        const result = await promoteProductionPin({
+          repoDir,
+          version,
+          gitSha: opts.gitSha ?? null,
+        });
+        if (!result.ok) {
+          console.error(`pipeline factory-pin promote: ${result.message}`);
+          process.exit(1);
+        }
+        if (opts.json) {
+          console.log(JSON.stringify({ ok: true, pin: result.pin, path: result.path, reinstall_hint: result.reinstall_hint }, null, 2));
+        } else {
+          console.log(`Promoted production pin to ${result.pin.version} (${result.path})`);
+          console.log(`  frg_run_id=${result.pin.frg_run_id}`);
+          console.log(`  Reinstall: ${result.reinstall_hint}`);
+          console.log(`  Verify: pipeline doctor  (install:engine-track)`);
+        }
+        return;
+      }
+      if (verb === "init") {
+        const version = opts.fromFrg ?? opts.for;
+        if (!version) {
+          console.error(
+            "pipeline factory-pin init: --from-frg <X.Y.Z> is required (same FRG pass gate as promote).\n" +
+              "  Usage: pipeline factory-pin init --from-frg <X.Y.Z> [--force] [--git-sha <sha>]",
+          );
+          process.exit(2);
+        }
+        const result = await initProductionPin({
+          repoDir,
+          version,
+          force: !!opts.force,
+          gitSha: opts.gitSha ?? null,
+        });
+        if (!result.ok) {
+          console.error(`pipeline factory-pin init: ${result.message}`);
+          process.exit(1);
+        }
+        if (opts.json) {
+          console.log(JSON.stringify({ ok: true, pin: result.pin, path: result.path, reinstall_hint: result.reinstall_hint }, null, 2));
+        } else {
+          console.log(`Initialized production pin at ${result.path} → ${result.pin.version}`);
+          console.log(`  Writes ${PRODUCTION_ENGINE_PIN_REL} (commit for multi-host).`);
+          console.log(`  Reinstall: ${result.reinstall_hint}`);
+        }
+        return;
+      }
+      if (verb === "rollback") {
+        const result = await rollbackProductionPin({
+          repoDir,
+          toVersion: opts.to ?? null,
+        });
+        if (!result.ok) {
+          console.error(`pipeline factory-pin rollback: ${result.message}`);
+          process.exit(1);
+        }
+        if (opts.json) {
+          console.log(JSON.stringify({ ok: true, pin: result.pin, path: result.path, reinstall_hint: result.reinstall_hint }, null, 2));
+        } else {
+          console.log(`Rolled back production pin to ${result.pin.version} (${result.path})`);
+          console.log(`  Reinstall: ${result.reinstall_hint}`);
+          console.log(`  Verify: pipeline doctor  (install:engine-track)`);
+        }
+        return;
+      }
+      console.error(
+        `pipeline factory-pin: unknown verb "${verb}". Use show | init | promote | rollback.`,
+      );
+      process.exit(2);
+    } catch (err) {
+      console.error(`pipeline factory-pin: ${(err as Error).message}`);
       process.exit(1);
     }
     return;
@@ -3876,7 +4056,7 @@ async function main(): Promise<void> {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "single", "release", "intake", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "factory-gate", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "factory-gate", "factory-pin", "queue", "backfill", "evals",
       "loop",
     ];
     if (!recognized.includes(numArg)) {
@@ -3945,6 +4125,11 @@ async function main(): Promise<void> {
     }
     console.error(`pipeline: ${e.message}`);
     process.exit(2);
+  }
+
+  // #762: CLI --engine-track overrides config for doctor / advance / loop intent.
+  if (opts.engineTrack === "pinned" || opts.engineTrack === "candidate") {
+    cfg = { ...cfg, engine_track: opts.engineTrack };
   }
 
   // Legacy `--cleanup` flag form — deprecated; use `pipeline cleanup` or

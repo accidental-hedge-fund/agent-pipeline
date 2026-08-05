@@ -414,6 +414,19 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Deterministic preflight capability check settings."),
+  // Two-track engine pinning (#762). Optional; command defaults apply when unset.
+  engine_track: z
+    .enum(["pinned", "candidate"])
+    .optional()
+    .describe(
+      'Factory engine track intent: "pinned" (production pin / dogfood) or "candidate" (FRG/eval soak). CLI --engine-track overrides. factory-gate always forces candidate.',
+    ),
+  production_engine_pin_path: z
+    .string()
+    .optional()
+    .describe(
+      "Absolute path override for the production engine pin JSON (default: <repo>/.agent-pipeline/production-engine-pin.json). Env AGENT_PIPELINE_PRODUCTION_PIN also overrides.",
+    ),
   // `pipeline:loop` native-goal capability attestation (#506). Optional;
   // absent/"auto" leaves automatic detection (--help marker, then version
   // floor) unchanged. "available"/"unavailable" is an explicit operator
@@ -1219,6 +1232,11 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       runOnStart: fileConfig.doctor?.runOnStart ?? DEFAULT_CONFIG.doctor.runOnStart,
       failFast: fileConfig.doctor?.failFast ?? DEFAULT_CONFIG.doctor.failFast,
     },
+    // Two-track engine pin (#762): optional; absent means command defaults.
+    ...(fileConfig.engine_track ? { engine_track: fileConfig.engine_track } : {}),
+    ...(fileConfig.production_engine_pin_path
+      ? { production_engine_pin_path: fileConfig.production_engine_pin_path }
+      : {}),
     loop: {
       native_goal_attestation:
         fileConfig.loop?.native_goal_attestation ?? DEFAULT_CONFIG.loop.native_goal_attestation,
@@ -2365,6 +2383,14 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     "doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here",
     `  runOnStart: ${yamlScalar(doctor.runOnStart)} # ${sd("doctor.runOnStart", "run preflight checks before planning; abort on any failure")}`,
     `  failFast: ${yamlScalar(doctor.failFast)} # ${sd("doctor.failFast", "stop at the first failing check instead of collecting all failures")}`,
+    "",
+    // Two-track engine pinning (#762) — optional; command defaults apply when unset.
+    config.engine_track !== undefined
+      ? `engine_track: ${yamlScalar(config.engine_track)} # ${sd("engine_track", 'pinned (production pin) or candidate (FRG/eval soak); CLI --engine-track overrides')}`
+      : `# engine_track: pinned # ${sd("engine_track", 'optional: "pinned" | "candidate"; factory-gate always forces candidate')}`,
+    config.production_engine_pin_path !== undefined
+      ? `production_engine_pin_path: ${yamlScalar(config.production_engine_pin_path)} # ${sd("production_engine_pin_path", "absolute override for production pin JSON")}`
+      : `# production_engine_pin_path: /path/to/production-engine-pin.json # ${sd("production_engine_pin_path", "optional; default <repo>/.agent-pipeline/production-engine-pin.json")}`,
     "",
     config.loop !== undefined
       ? `loop: # pipeline:loop native-goal capability attestation (#506)\n${yamlBlock(config.loop, 2)}`

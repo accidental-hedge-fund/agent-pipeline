@@ -309,6 +309,13 @@ Nested fields:
 - **Type:** string | string
 - **Description:** Reasoning effort for the sweep spec-generation step (implementer harness), or "auto".
 
+### `engine_track`
+
+- **Type:** enum
+- **Description:** Factory engine track intent: "pinned" (production pin / dogfood) or "candidate" (FRG/eval soak). CLI --engine-track overrides. factory-gate always forces candidate.
+
+- **Allowed values:** `pinned`, `candidate`
+
 ### `eval_gate`
 
 - **Type:** object
@@ -608,6 +615,11 @@ Nested fields:
 
 - **Type:** string
 - **Description:** Maintainer-controlled intake service URL that receives submitted product-fault reports.
+
+### `production_engine_pin_path`
+
+- **Type:** string
+- **Description:** Absolute path override for the production engine pin JSON (default: <repo>/.agent-pipeline/production-engine-pin.json). Env AGENT_PIPELINE_PRODUCTION_PIN also overrides.
 
 ### `queue`
 

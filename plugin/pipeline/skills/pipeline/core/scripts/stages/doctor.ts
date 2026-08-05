@@ -31,6 +31,11 @@ import {
   type MaxPromptBytes,
 } from "../harness-adapters/types.ts";
 import { isElevatedWriteHealth, parseWriteHealthText } from "../run-store.ts";
+import {
+  evaluateEngineTrackCheck,
+  resolveEngineTrackIntent,
+  resolveProductionPin,
+} from "../production-engine-pin.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -648,6 +653,38 @@ export function buildPreflightChecks(
         );
       }
       return pass(`installed engine v${installed} is up to date with the latest release v${latest}`);
+    },
+  });
+
+  // 6c. Engine track / production-pin coherence (#762) — additive to
+  //     install:version-coherence and install:version-freshness. Surfaces
+  //     whether the host is on the pinned FRG-passed production track or a
+  //     candidate soak, and fails under pinned intent when install ≠ pin.
+  checks.push({
+    id: "install:engine-track",
+    description: "Engine track (pinned production pin vs candidate) is disclosed and coherent under pinned intent",
+    run: async (deps) => {
+      // CLI --engine-track is threaded via config.engine_track when doctor is
+      // invoked from pipeline.ts (resolveConfig merges CLI/config). Doctor
+      // default intent is pinned; factory-gate/evals set candidate elsewhere.
+      const intent = resolveEngineTrackIntent({
+        command: "doctor",
+        configTrack: config.engine_track ?? null,
+      });
+      const pinLoad = await resolveProductionPin({
+        repoDir: config.repo_dir,
+        readTextFile: deps.readTextFile,
+        overridePath: config.production_engine_pin_path ?? null,
+      });
+      const result = evaluateEngineTrackCheck({
+        intent,
+        pinLoad,
+        runningVersion: version,
+      });
+      if (result.status === "pass") return pass(result.detail);
+      if (result.status === "warn") return warn(result.detail, result.remediation);
+      if (result.status === "skip") return skip(result.detail);
+      return fail(result.detail, result.remediation ?? "See docs/factory-reliability-gate-runbook.md (two-track engine pinning).");
     },
   });
 

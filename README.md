@@ -57,11 +57,27 @@ The installer prints a prerequisite checklist during install (warnings do not bl
 # Track the latest default branch:
 npx github:accidental-hedge-fund/agent-pipeline install
 
-# Or pin a released tag for a reproducible install (recommended for prod):
-npx -y github:accidental-hedge-fund/agent-pipeline#v1.29.1 install
+# Or pin a released tag for a reproducible install (recommended for prod / factory dogfood):
+npx -y github:accidental-hedge-fund/agent-pipeline#v1.30.0 install
 ```
 
 This detects which of `~/.claude` and `~/.codex` exist and installs to each. After installing for Codex, **restart Codex** to pick up the skill. Pin to a released tag (see [GitHub Releases](https://github.com/accidental-hedge-fund/agent-pipeline/releases)) for a reproducible install.
+
+### Factory two-track engine pinning (#762)
+
+Factory production and dogfood runs should execute the **last FRG-passed release** named by
+`.agent-pipeline/production-engine-pin.json` (install from that tag), not an unpinned working-tree
+candidate. FRG Layer B / eval soaks use the **candidate** track until promote:
+
+```bash
+pipeline factory-pin show
+pipeline factory-pin promote --for X.Y.Z   # after FRG pass:true only
+npx -y github:accidental-hedge-fund/agent-pipeline#vX.Y.Z install
+pipeline doctor                            # install:engine-track
+pipeline factory-pin rollback              # repoint to previous + reinstall
+```
+
+See [docs/factory-reliability-gate-runbook.md](docs/factory-reliability-gate-runbook.md#two-track-engine-pinning-762).
 
 **Step 2 — Label an issue and run**
 

@@ -69,6 +69,14 @@ import {
   type EngineIdentity,
 } from "./engine-identity.ts";
 import {
+  enforcePinnedTrackPolicy,
+  resolveEngineTrackIntent,
+  resolveProductionPin,
+  type EngineTrackIntent,
+} from "./production-engine-pin.ts";
+import type { RunEngineIdentity } from "./run-store.ts";
+import * as fsp from "node:fs/promises";
+import {
   OUTER_HOST_UNKNOWN,
   readOuterHostFromEnv,
   resolveOuterHostEvidence,
@@ -118,6 +126,11 @@ export interface AdvanceOpts {
   jsonEvents?: boolean;
   profile?: string;
   runId?: string;
+  /**
+   * Two-track engine intent (#762). When set, overrides config `engine_track`.
+   * Ordinary advance defaults to pinned; candidate is for intentional soaks.
+   */
+  engineTrack?: "pinned" | "candidate";
 }
 
 /** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
@@ -440,6 +453,34 @@ export interface AdvanceDeps {
   /** Seam over `probeEngineIdentity` (#450) — re-read at each stage boundary
    *  and compared against the pinned identity to detect mid-run drift. */
   probeEngineIdentity?: () => EngineIdentity | null;
+  /**
+   * #762: attach track / pin_version / git_sha on fresh engine identity.
+   * Injected so unit tests supply classification without real pin I/O.
+   * Production default uses pin already enforced at run start.
+   */
+  resolveEngineTrackFields?: (
+    base: EngineIdentity,
+    intent: EngineTrackIntent,
+  ) => Pick<RunEngineIdentity, "track" | "pin_version" | "git_sha">;
+  /**
+   * #762: load production pin + enforce pinned-track policy at run start.
+   * Injected for hermetic tests (default: real pin file + enforcePinnedTrackPolicy).
+   * Return `{ ok: false }` to refuse the advance before stages run.
+   */
+  enforceEngineTrack?: (input: {
+    repoDir: string;
+    intent: EngineTrackIntent;
+    runningVersion: string | null;
+    pinPathOverride?: string | null;
+  }) => Promise<
+    | {
+        ok: true;
+        track: "pinned" | "candidate";
+        pin_version?: string;
+        git_sha?: string;
+      }
+    | { ok: false; code: string; message: string; remediation: string }
+  >;
   /**
    * Park-release hook (#718): free a safe managed worktree when the advance
    * durable-parks so capacity is not stranded. Injected for unit tests.
@@ -834,7 +875,7 @@ export async function runAdvance(
     let terminalTee: TerminalLogTee | undefined;
     // Engine identity this run is pinned to (#450) — resolved once at run start
     // and compared against the on-disk identity at each stage boundary below.
-    let pinnedEngine: EngineIdentity | undefined;
+    let pinnedEngine: RunEngineIdentity | undefined;
     let lastObservedEngine: EngineIdentity | undefined;
     const eventSinkDeps = buildEventSinkDeps(cfg);
     const runStoreDeps: RunStoreDeps = {
@@ -857,15 +898,107 @@ export async function runAdvance(
       if (opts.jsonEvents) {
         runStoreDeps.stdoutWrite = process.stdout.write.bind(process.stdout) as (s: string) => void;
       }
+
+      // #762 two-track: resolve intent + pin before first init so evidence
+      // captures track once and pinned intent can refuse a mislabeled run.
+      const trackIntent: EngineTrackIntent = resolveEngineTrackIntent({
+        command: "advance",
+        cliTrack: opts.engineTrack ?? null,
+        configTrack: cfg.engine_track ?? null,
+      });
+      const baseForGate = (deps.resolvePinnedEngineIdentity ?? resolvePinnedEngineIdentity)();
+      const enforce =
+        deps.enforceEngineTrack ??
+        (async (input) => {
+          const pinLoad = await resolveProductionPin({
+            repoDir: input.repoDir,
+            readTextFile: async (p) => {
+              try {
+                return await fsp.readFile(p, "utf8");
+              } catch {
+                return null;
+              }
+            },
+            overridePath: input.pinPathOverride ?? null,
+          });
+          const r = enforcePinnedTrackPolicy({
+            intent: input.intent,
+            pinLoad,
+            runningVersion: input.runningVersion,
+          });
+          if (!r.ok) {
+            return {
+              ok: false as const,
+              code: r.code,
+              message: r.message,
+              remediation: r.remediation,
+            };
+          }
+          return {
+            ok: true as const,
+            track: r.classification.track,
+            ...(r.pin?.version ? { pin_version: r.pin.version } : {}),
+            ...(r.pin?.git_sha && r.pin.git_sha.trim()
+              ? { git_sha: r.pin.git_sha.trim() }
+              : {}),
+          };
+        });
+      const enforcement = await enforce({
+        repoDir: cfg.repo_dir,
+        intent: trackIntent,
+        runningVersion: baseForGate?.version ?? null,
+        pinPathOverride: cfg.production_engine_pin_path ?? null,
+      });
+      // Hard-fail only when a production pin exists and install mismatches under
+      // pinned intent (or version unreadable). Missing/invalid pin under pinned
+      // intent cannot present a coherent pinned run: reclassify as candidate and
+      // continue so non-factory consumers without a pin are not blocked (doctor
+      // still hard-fails for factory disclosure — see install:engine-track).
+      let trackForEvidence: "pinned" | "candidate" = trackIntent === "candidate" ? "candidate" : "pinned";
+      let pinVersionForEvidence: string | undefined;
+      let gitShaForEvidence: string | undefined;
+      if (!enforcement.ok) {
+        if (enforcement.code === "version_mismatch" || enforcement.code === "unknown_version") {
+          console.error(
+            `[pipeline] #${issueNumber}: engine-track policy refused (${enforcement.code}): ${enforcement.message}\n` +
+              `  → ${enforcement.remediation}`,
+          );
+          return;
+        }
+        console.warn(
+          `[pipeline] #${issueNumber}: engine-track cannot claim pinned (${enforcement.code}): ${enforcement.message} — recording track=candidate`,
+        );
+        trackForEvidence = "candidate";
+      } else {
+        trackForEvidence = enforcement.track;
+        pinVersionForEvidence = enforcement.pin_version;
+        gitShaForEvidence = enforcement.git_sha;
+      }
+
       // Resumed dispatch (#450): reuse the engine identity already recorded in
       // this run's run.json when it exists, rather than re-resolving the
       // current on-disk identity — initRunDir below is idempotent and will NOT
       // overwrite an existing run.json, so pinnedEngine must match what was
       // actually written or drift checks would compare the current identity to
       // itself and silently suppress a real drift event.
+      //
+      // #762: on first init only, attach track + optional pin_version/git_sha.
+      // Resume reuses the written engine object wholesale (including track).
       pinnedEngine = await resolveRunEngineIdentity(
         runDir,
-        () => (deps.resolvePinnedEngineIdentity ?? resolvePinnedEngineIdentity)() ?? undefined,
+        () => {
+          const base = (deps.resolvePinnedEngineIdentity ?? resolvePinnedEngineIdentity)();
+          if (!base) return undefined;
+          if (deps.resolveEngineTrackFields) {
+            return { ...base, ...deps.resolveEngineTrackFields(base, trackIntent) };
+          }
+          const fields: Pick<RunEngineIdentity, "track" | "pin_version" | "git_sha"> = {
+            track: trackForEvidence,
+          };
+          if (pinVersionForEvidence) fields.pin_version = pinVersionForEvidence;
+          if (gitShaForEvidence) fields.git_sha = gitShaForEvidence;
+          return { ...base, ...fields };
+        },
         runStoreDeps,
       );
       lastObservedEngine = pinnedEngine;

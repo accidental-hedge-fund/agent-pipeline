@@ -18,6 +18,53 @@ linked open issues **without merging** as post-pass hygiene (#754). Close ≠ me
 Tag creation remains owned by `auto-tag-release.yml`, which **verifies FRG evidence
 before** creating or pushing a tag (#757).
 
+## Two-track engine pinning (#762)
+
+Factory self-hosting uses **two tracks** so a candidate regression cannot immediately
+degrade the factory's ability to repair itself:
+
+| Track | What runs | Who uses it |
+|-------|-----------|-------------|
+| **Pinned** | Last FRG-passed release promoted into production dogfood | Ordinary `pipeline loop` / advance / production dogfood |
+| **Candidate** | Working tree / release branch / unreleased build | FRG Layer B soaks and documented eval campaigns only |
+
+**Production pin** (authoritative target for the pinned track):
+
+```text
+.agent-pipeline/production-engine-pin.json
+```
+
+Fields: `version`, `tag` (for `npx …#vX.Y.Z install`), `frg_run_id`, optional
+`git_sha` (null/unknown is valid — never invent a SHA), `promoted_at`, optional
+`previous` for rollback.
+
+| Action | Command |
+|--------|---------|
+| Show pin | `pipeline factory-pin show` |
+| Bootstrap from FRG pass | `pipeline factory-pin init --from-frg <X.Y.Z>` |
+| Promote after FRG pass | `pipeline factory-pin promote --for <X.Y.Z> [--git-sha <sha>]` |
+| Optional promote after gate | `pipeline factory-gate --for <X.Y.Z> --from-run <id> --promote-pin-on-pass` |
+| Rollback | `pipeline factory-pin rollback` (uses `previous`) or `… rollback --to <X.Y.Z>` |
+| Verify | `pipeline doctor` → check `install:engine-track` |
+
+After promote or rollback, **reinstall** the skill from the pin tag and re-run doctor:
+
+```bash
+npx -y github:accidental-hedge-fund/agent-pipeline#vX.Y.Z install
+pipeline doctor
+```
+
+**Rules:**
+
+1. Production dogfood installs and runs the **pinned** tag, not an unpinned floating
+   default-branch install and not a silent working-tree candidate.
+2. FRG Layer B exercises the **candidate** until `pass: true`; associated run evidence
+   records `engine.track: "candidate"`.
+3. Promote updates the pin artifact only. It does **not** merge PRs, create git tags,
+   or enable auto-merge. Green unit CI alone never moves the pin.
+4. `pipeline doctor` reports pin target, installed version, and track coherence
+   (`install:engine-track`). Run evidence records `engine.track` at run start.
+
 ## Two layers (both mandatory)
 
 | Layer | When | What |

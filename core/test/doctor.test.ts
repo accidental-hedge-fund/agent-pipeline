@@ -105,6 +105,21 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
     if (p.endsWith("state.py")) {
       return 'CONTRACT_SCHEMA = "goal-loop/contract@2"\nLEDGER_SCHEMA = "goal-loop/ledger@2"\n';
     }
+    // #762: coherent production pin matching FAKE_VERSION so all-pass defaults
+    // keep install:engine-track green; engine-track tests override readTextFile.
+    if (p.endsWith("production-engine-pin.json")) {
+      return JSON.stringify({
+        schema_version: 1,
+        version: "1.0.0",
+        tag: "v1.0.0",
+        git_sha: null,
+        git_sha_source: "unknown",
+        frg_run_id: "frg-test-default",
+        frg_evidence_path: ".agent-pipeline/frg/1.0.0/latest.json",
+        promoted_at: "2026-01-01T00:00:00Z",
+        previous: null,
+      });
+    }
     return '{"version":"1.0.0"}';
   };
   return {
@@ -1088,6 +1103,19 @@ test("check locks:stale-sweep — a warn does not fail overall runPreflight", as
         if (p.includes("pipeline-a-")) return "99999";
         if (p.endsWith(".goal-loop-manifest.json")) return '{"package":"goal-loop","version":"0.2.0"}';
         if (p.endsWith("state.py")) return 'CONTRACT_SCHEMA = "goal-loop/contract@2"\nLEDGER_SCHEMA = "goal-loop/ledger@2"\n';
+        // #762: keep install:engine-track coherent with FAKE_VERSION
+        if (p.endsWith("production-engine-pin.json")) {
+          return JSON.stringify({
+            schema_version: 1,
+            version: "1.0.0",
+            tag: "v1.0.0",
+            git_sha: null,
+            git_sha_source: "unknown",
+            frg_run_id: "frg-test-default",
+            promoted_at: "2026-01-01T00:00:00Z",
+            previous: null,
+          });
+        }
         return '{"version":"1.0.0"}';
       },
       isPidLive: () => false,
@@ -1182,6 +1210,79 @@ test("runPreflight — a stale install (warn) does not set ok:false and does not
   assert.equal(result.ok, true, "a warn-only result must keep ok:true");
   const fresh = result.checks.find((c) => c.id === "install:version-freshness");
   assert.equal(fresh?.status, "warn");
+});
+
+// ---------------------------------------------------------------------------
+// install:engine-track check (#762)
+// ---------------------------------------------------------------------------
+
+function pinJson(version: string, gitSha: string | null = null): string {
+  return JSON.stringify({
+    schema_version: 1,
+    version,
+    tag: `v${version}`,
+    git_sha: gitSha,
+    git_sha_source: gitSha ? "promote-arg" : "unknown",
+    frg_run_id: "frg-test-track",
+    frg_evidence_path: `.agent-pipeline/frg/${version}/latest.json`,
+    promoted_at: "2026-07-01T00:00:00Z",
+    previous: null,
+  });
+}
+
+function engineTrackDeps(pinText: string | null, o: FakeOverrides = {}): DoctorDeps {
+  return fakeDeps({
+    ...o,
+    readTextFile: (p) => {
+      if (p.endsWith("production-engine-pin.json")) return pinText;
+      if (o.readTextFile) return o.readTextFile(p);
+      return '{"version":"1.0.0"}';
+    },
+  });
+}
+
+test("check install:engine-track — pin match under pinned intent → pass", async () => {
+  const r = await getCheck(makeConfig(), "install:engine-track", "1.29.1").run(
+    engineTrackDeps(pinJson("1.29.1")),
+  );
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /pinned/);
+  assert.match(r.detail, /1\.29\.1/);
+});
+
+test("check install:engine-track — pin mismatch under production intent → fail", async () => {
+  const r = await getCheck(makeConfig(), "install:engine-track", "1.30.0").run(
+    engineTrackDeps(pinJson("1.29.1")),
+  );
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /1\.29\.1/);
+  assert.match(r.detail, /1\.30\.0/);
+  assert.ok(r.remediation && /reinstall|candidate/i.test(r.remediation));
+});
+
+test("check install:engine-track — missing pin under pinned intent → fail with init remediation", async () => {
+  const r = await getCheck(makeConfig(), "install:engine-track", "1.0.0").run(
+    engineTrackDeps(null),
+  );
+  assert.equal(r.status, "fail");
+  assert.match(r.remediation!, /factory-pin init/);
+});
+
+test("check install:engine-track — candidate intent with mismatch does not fail for mismatch alone", async () => {
+  const cfg = makeConfig({ engine_track: "candidate" });
+  const r = await getCheck(cfg, "install:engine-track", "1.30.0").run(
+    engineTrackDeps(pinJson("1.29.1")),
+  );
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /candidate/);
+  assert.match(r.detail, /1\.29\.1/);
+});
+
+test("check install:engine-track — additive stable id alongside coherence and freshness", () => {
+  const ids = buildPreflightChecks(makeConfig(), FAKE_VERSION, FAKE_INSTALL_ROOT).map((c) => c.id);
+  assert.ok(ids.includes("install:version-coherence"));
+  assert.ok(ids.includes("install:version-freshness"));
+  assert.ok(ids.includes("install:engine-track"));
 });
 
 // Regression for the corrupt-install startup path (#186 review 2): if core/package.json

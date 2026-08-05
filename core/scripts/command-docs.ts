@@ -149,7 +149,15 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
   "factory-gate": {
     summary: "Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)",
     usage:
-      "factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail]",
+      "factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] [--promote-pin-on-pass]",
+    documented: true,
+    section: "factory",
+  },
+  "factory-pin": {
+    summary:
+      "Show / init / promote / rollback the factory production engine pin (last FRG-passed release; never merges or tags)",
+    usage:
+      "factory-pin show|init --from-frg <X.Y.Z>|promote --for <X.Y.Z>|rollback [--to <X.Y.Z>] [--git-sha <sha>] [--force]",
     documented: true,
     section: "factory",
   },

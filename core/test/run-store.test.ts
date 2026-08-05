@@ -376,6 +376,100 @@ test("resolveRunEngineIdentity: an existing run.json with no recorded engine sta
 });
 
 // ---------------------------------------------------------------------------
+// #762 — engine.track on run identity
+// ---------------------------------------------------------------------------
+
+test("initRunDir: records engine.track pinned with optional pin_version (#762)", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  const engine = {
+    version: "1.29.1",
+    root: "/opt/pipeline/core",
+    templates_fingerprint: "aaa",
+    track: "pinned" as const,
+    pin_version: "1.29.1",
+  };
+  await initRunDir(
+    { runDir: RUN_DIR, runId, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO, engine },
+    deps,
+  );
+  const meta = JSON.parse(readFile(RUN_JSON));
+  assert.equal(meta.engine.track, "pinned");
+  assert.equal(meta.engine.pin_version, "1.29.1");
+  assert.equal(meta.engine.version, "1.29.1");
+});
+
+test("initRunDir: records engine.track candidate (#762)", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  const engine = {
+    version: "1.30.0",
+    root: "/opt/pipeline/core",
+    templates_fingerprint: "bbb",
+    track: "candidate" as const,
+  };
+  await initRunDir(
+    { runDir: RUN_DIR, runId, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO, engine },
+    deps,
+  );
+  const meta = JSON.parse(readFile(RUN_JSON));
+  assert.equal(meta.engine.track, "candidate");
+  assert.equal(meta.engine.version, "1.30.0");
+});
+
+test("historical run.json without track remains readable; consumers treat as unknown (#762)", async () => {
+  const { deps } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  // Pre-track identity (no track field)
+  const engine = { version: "1.21.0", root: "/opt/pipeline/core", templates_fingerprint: "aaa" };
+  await initRunDir(
+    { runDir: RUN_DIR, runId, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO, engine },
+    deps,
+  );
+  const result = await resolveRunEngineIdentity(
+    RUN_DIR,
+    () => ({ version: "9.9.9", root: "/x", templates_fingerprint: "z", track: "candidate" as const }),
+    deps,
+  );
+  assert.ok(result);
+  assert.equal(result!.version, "1.21.0");
+  assert.equal(result!.track, undefined, "historical missing track must stay unknown, not invented");
+});
+
+test("resolveRunEngineIdentity: resume preserves track (#762)", async () => {
+  const { deps } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  const pinned = {
+    version: "1.29.1",
+    root: "/opt/pipeline/core",
+    templates_fingerprint: "aaa",
+    track: "pinned" as const,
+    pin_version: "1.29.1",
+  };
+  await initRunDir(
+    { runDir: RUN_DIR, runId, issue: ISSUE, repo: "owner/repo", profile: "codex", startedAt: STARTED_AT_ISO, engine: pinned },
+    deps,
+  );
+  let resolveFreshCalled = false;
+  const result = await resolveRunEngineIdentity(
+    RUN_DIR,
+    () => {
+      resolveFreshCalled = true;
+      return {
+        version: "1.30.0",
+        root: "/opt/pipeline/core",
+        templates_fingerprint: "bbb",
+        track: "candidate" as const,
+      };
+    },
+    deps,
+  );
+  assert.deepEqual(result, pinned);
+  assert.equal(resolveFreshCalled, false);
+  assert.equal(result!.track, "pinned");
+});
+
+// ---------------------------------------------------------------------------
 // 4.2 — appendEvent
 // ---------------------------------------------------------------------------
 
