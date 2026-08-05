@@ -428,6 +428,34 @@ test("isUsablePlanReviewOutput / parsePlanReviewVerdictToken: heading-only is un
     "NEEDS_REVISION",
   );
   assert.equal(isUsablePlanReviewOutput("## Plan Review Verdict\nAPPROVE\n"), true);
+  // Exact "Verdict: <token>" form is accepted.
+  assert.equal(
+    parsePlanReviewVerdictToken("## Plan Review Verdict\nVerdict: APPROVE\n"),
+    "APPROVE",
+  );
+  assert.equal(
+    parsePlanReviewVerdictToken(
+      "## Plan Review Verdict\nVerdict: NEEDS_REVISION\n",
+    ),
+    "NEEDS_REVISION",
+  );
+  // Freeform prose containing "approve" must NOT count as APPROVE (#645 3a10d857).
+  assert.equal(
+    parsePlanReviewVerdictToken(
+      "## Plan Review Verdict\nI cannot approve this plan\n",
+    ),
+    null,
+  );
+  assert.equal(
+    parsePlanReviewVerdictToken("## Plan Review Verdict\nDO NOT APPROVE\n"),
+    null,
+  );
+  assert.equal(
+    isUsablePlanReviewOutput(
+      "## Plan Review Verdict\nI cannot approve this plan\n",
+    ),
+    false,
+  );
 });
 
 test("invokeReviewEnsemble: sole agent with partial JSON approve fails closed (#645 43c9353b)", async () => {

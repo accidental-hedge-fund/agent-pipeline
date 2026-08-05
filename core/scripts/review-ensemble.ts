@@ -408,9 +408,14 @@ export function parsePlanReviewVerdictToken(
     return "NEEDS_REVISION";
   }
   if (token === "APPROVE") return "APPROVE";
-  // Allow "Verdict: APPROVE" / "Verdict: NEEDS_REVISION" on the first line.
-  if (/\bNEEDS[_\s]REVISION\b/.test(token)) return "NEEDS_REVISION";
-  if (/\bAPPROVE\b/.test(token) && !/\bNEEDS\b/.test(token)) return "APPROVE";
+  // Allow exact "Verdict: APPROVE" / "Verdict: NEEDS_REVISION" only — never freeform
+  // prose that merely contains the word APPROVE (e.g. "I cannot approve this plan").
+  const verdictPrefixed = token.match(
+    /^VERDICT\s*:\s*(APPROVE|NEEDS[_\s]REVISION)\s*$/,
+  );
+  if (verdictPrefixed) {
+    return verdictPrefixed[1] === "APPROVE" ? "APPROVE" : "NEEDS_REVISION";
+  }
   return null;
 }
 
