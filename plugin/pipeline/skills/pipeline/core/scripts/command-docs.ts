@@ -174,8 +174,10 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     section: "advance",
   },
   scoreboard: {
-    summary: "Print read-only factory throughput/cost/reliability metrics from run artifacts",
-    usage: "scoreboard [--bucket day|week] [--by <dim>] [--html <path>]",
+    summary:
+      "Print read-only factory throughput/cost/reliability metrics from run artifacts " +
+      "(incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763)",
+    usage: "scoreboard [--days <n>|--since <iso>] [--until <iso>] [--bucket day|week] [--by <dim>] [--json] [--html <path>]",
     documented: true,
     section: "observability",
   },

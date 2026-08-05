@@ -36,6 +36,11 @@ import { redactSecrets, sanitize } from "../artifact-sanitize.ts";
 import { withLock } from "../lock.ts";
 import { defaultLoopStoreDeps, readDurableRunBlockerOccurrences, type DurableBlockerOccurrence } from "../loop/store.ts";
 import { autoFileLabelsForCluster } from "../open-soak-defect-preflight.ts";
+import {
+  AUTO_FILE_DISCOVERY_CHANNEL,
+  formatAttributionMarkers,
+} from "../engine-attribution.ts";
+import { resolvePinnedEngineIdentity } from "../engine-identity.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -245,6 +250,37 @@ export const CORRECTION_AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:correction-
  *  but for issues auto-filed from durable-run-blocker clusters (#538) — kept distinct so
  *  reconciliation never conflates the three auto-file sources. */
 export const DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER = "<!-- pipeline:durable-run-blocker-auto-filed -->";
+
+/**
+ * Append engine version+SHA and discovery-channel stamps to an auto-file body
+ * (#763). Pure aside from optional identity injection — never removes the
+ * category provenance marker. Unresolvable SHA becomes explicit `unknown`.
+ */
+export function stampAutoFileAttribution(
+  body: string,
+  identity?: { version?: string | null; commit_sha?: string | null } | null,
+): string {
+  const id =
+    identity === undefined
+      ? (() => {
+          try {
+            return resolvePinnedEngineIdentity();
+          } catch {
+            return null;
+          }
+        })()
+      : identity;
+  const markers = formatAttributionMarkers({
+    version: id?.version ?? null,
+    commit_sha: id?.commit_sha ?? null,
+    discovery_channel: AUTO_FILE_DISCOVERY_CHANNEL,
+  });
+  // Place stamps immediately after the first line (category provenance marker)
+  // so offline parsers see both category and attribution at the head of body.
+  const nl = body.indexOf("\n");
+  if (nl === -1) return `${body}\n${markers}`;
+  return `${body.slice(0, nl + 1)}${markers}\n${body.slice(nl + 1)}`;
+}
 
 /**
  * Shared rate-cap membership predicate (#631): an improve issue counts toward a
@@ -483,16 +519,18 @@ function buildAutoFileBody(c: ClusterEntry, windowHours: number): string {
     c.excerpt,
     "```",
   ].join("\n");
-  return [
-    AUTO_FILE_PROVENANCE_MARKER,
-    `## Agent-reported friction (auto-filed by \`pipeline\`)`,
-    ``,
-    `_This issue was filed automatically by the pipeline from agent-reported friction ` +
-      `(\`pipeline papercut\`). The content below is agent-reported, not human-authored ` +
-      `or human-verified — verify independently before acting._`,
-    ``,
-    sanitize(redactSecrets(detail)),
-  ].join("\n");
+  return stampAutoFileAttribution(
+    [
+      AUTO_FILE_PROVENANCE_MARKER,
+      `## Agent-reported friction (auto-filed by \`pipeline\`)`,
+      ``,
+      `_This issue was filed automatically by the pipeline from agent-reported friction ` +
+        `(\`pipeline papercut\`). The content below is agent-reported, not human-authored ` +
+        `or human-verified — verify independently before acting._`,
+      ``,
+      sanitize(redactSecrets(detail)),
+    ].join("\n"),
+  );
 }
 
 /** Correction-cluster analogue of `buildAutoFileBody` (#500): agent/pipeline-reported-
@@ -529,22 +567,24 @@ function buildCorrectionAutoFileBody(c: ClusterEntry, windowHours: number): stri
     ``,
     ...renderControlProposal(c),
   ].join("\n");
-  return [
-    CORRECTION_AUTO_FILE_PROVENANCE_MARKER,
-    `## Recurring correction detected by \`pipeline\` (auto-filed)`,
-    ``,
-    `_This issue was filed automatically by the pipeline from recurring \`correction_event\` ` +
-      `records (#499/#500). The content below is agent/pipeline-reported, not human-authored ` +
-      `or human-verified — verify independently before acting._`,
-    ``,
-    `_Concurrency scope (#459/#631): correction auto-filing inherits the shared cross-host ` +
-      `auto-file path (GitHub-authored issue state for pre-create dedup/rate-cap, plus ` +
-      `post-create reconciliation for duplicate titles and correction-scoped rate-cap ` +
-      `overflow). Host-local \`/tmp\` locks remain a same-host fast path only — no stronger ` +
-      `global-serialization guarantee than that shared path provides._`,
-    ``,
-    sanitize(redactSecrets(detail)),
-  ].join("\n");
+  return stampAutoFileAttribution(
+    [
+      CORRECTION_AUTO_FILE_PROVENANCE_MARKER,
+      `## Recurring correction detected by \`pipeline\` (auto-filed)`,
+      ``,
+      `_This issue was filed automatically by the pipeline from recurring \`correction_event\` ` +
+        `records (#499/#500). The content below is agent/pipeline-reported, not human-authored ` +
+        `or human-verified — verify independently before acting._`,
+      ``,
+      `_Concurrency scope (#459/#631): correction auto-filing inherits the shared cross-host ` +
+        `auto-file path (GitHub-authored issue state for pre-create dedup/rate-cap, plus ` +
+        `post-create reconciliation for duplicate titles and correction-scoped rate-cap ` +
+        `overflow). Host-local \`/tmp\` locks remain a same-host fast path only — no stronger ` +
+        `global-serialization guarantee than that shared path provides._`,
+      ``,
+      sanitize(redactSecrets(detail)),
+    ].join("\n"),
+  );
 }
 
 /** Durable-run-blocker analogue of `buildAutoFileBody`/`buildCorrectionAutoFileBody`
@@ -571,17 +611,19 @@ function buildDurableRunBlockerAutoFileBody(c: ClusterEntry, windowHours: number
     c.excerpt,
     "```",
   ].join("\n");
-  return [
-    DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER,
-    `## Durable-run blocker detected by \`pipeline:loop\` (auto-filed)`,
-    ``,
-    `_This issue was filed automatically by the pipeline from a durable \`pipeline:loop\` run's ` +
-      `typed blocker classification (#509). The content below is agent/pipeline-reported, not ` +
-      `human-authored or human-verified — verify independently before acting. Milestone assignment ` +
-      `stays a human decision: the suggestion above is advisory only._`,
-    ``,
-    sanitize(redactSecrets(detail)),
-  ].join("\n");
+  return stampAutoFileAttribution(
+    [
+      DURABLE_RUN_BLOCKER_AUTO_FILE_PROVENANCE_MARKER,
+      `## Durable-run blocker detected by \`pipeline:loop\` (auto-filed)`,
+      ``,
+      `_This issue was filed automatically by the pipeline from a durable \`pipeline:loop\` run's ` +
+        `typed blocker classification (#509). The content below is agent/pipeline-reported, not ` +
+        `human-authored or human-verified — verify independently before acting. Milestone assignment ` +
+        `stays a human decision: the suggestion above is advisory only._`,
+      ``,
+      sanitize(redactSecrets(detail)),
+    ].join("\n"),
+  );
 }
 
 /** Shape shared by `autoFilePapercuts` and `autoFileCorrections` (#500): which

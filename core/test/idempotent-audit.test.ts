@@ -7,6 +7,7 @@ import {
   buildAuditSentinel,
   reconcileAuditComment,
   retryComment,
+  setGhDiscoveryChannel,
   setGhRunId,
   transition,
   setBlocked,
@@ -370,4 +371,58 @@ test("setBlocked: retries postComment on first failure", async () => {
   await setBlocked(fakeCfg, 42, "reason", null, "needs-human", deps);
   setGhRunId(undefined);
   assert.equal(postCalls, 2, "must retry once and succeed");
+});
+
+// ---------------------------------------------------------------------------
+// setBlocked() — discovery-channel stamp inherits active-run context (#763)
+// ---------------------------------------------------------------------------
+
+test("setBlocked: review-batch active-run stamps discovery-channel review-batch, not live-run", async () => {
+  setGhRunId("763/2026-08-05T00:00:00Z");
+  setGhDiscoveryChannel("review-batch");
+  const posted: string[] = [];
+  const deps: SetBlockedDeps = {
+    getIssueDetail: async () => ({ labels: ["pipeline:review-1"] }),
+    addBlockedLabel: async () => {},
+    postComment: async (_cfg, _n, body) => {
+      posted.push(body);
+    },
+    sleep: async () => {},
+  };
+  await setBlocked(fakeCfg, 42, "batch blocker", "review-1", "needs-human", deps);
+  setGhRunId(undefined);
+  setGhDiscoveryChannel(undefined);
+
+  assert.equal(posted.length, 1);
+  assert.match(
+    posted[0]!,
+    /<!--\s*pipeline:discovery-channel review-batch\s*-->/,
+    "blocker comment must carry the active review-batch channel",
+  );
+  assert.doesNotMatch(
+    posted[0]!,
+    /<!--\s*pipeline:discovery-channel live-run\s*-->/,
+    "must not falsely stamp live-run when active run is review-batch",
+  );
+});
+
+test("setBlocked: deps.discoveryChannel overrides module-level channel", async () => {
+  setGhRunId("763/2026-08-05T00:00:00Z");
+  setGhDiscoveryChannel("live-run");
+  const posted: string[] = [];
+  const deps: SetBlockedDeps = {
+    getIssueDetail: async () => ({ labels: [] }),
+    addBlockedLabel: async () => {},
+    postComment: async (_cfg, _n, body) => {
+      posted.push(body);
+    },
+    sleep: async () => {},
+    discoveryChannel: "manual",
+  };
+  await setBlocked(fakeCfg, 7, "manual park", null, "needs-human", deps);
+  setGhRunId(undefined);
+  setGhDiscoveryChannel(undefined);
+
+  assert.equal(posted.length, 1);
+  assert.match(posted[0]!, /<!--\s*pipeline:discovery-channel manual\s*-->/);
 });

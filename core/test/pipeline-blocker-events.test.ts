@@ -19,6 +19,7 @@ import {
   projectStageDiagnostic,
   type StageDiagnostic,
 } from "../scripts/stage-diagnostic.ts";
+import { setBlocked } from "../scripts/gh.ts";
 import type { BlockerKind, Outcome, PipelineConfig } from "../scripts/types.ts";
 
 const runStoreDeps = {} as RunStoreDeps;
@@ -316,6 +317,224 @@ test("runAdvance emits blocker_set with the producer diagnostic to events.jsonl 
     assert.equal(typeof event.offramp_id, "string");
     // Mechanical block: canonical evidence only — no human_intervention.
     assert.equal(events.some((e) => e.type === "human_intervention"), false);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// #763: non-live discovery channel must survive runAdvance → setBlocked.
+// A review-batch (or manual) dispatch that parks must NOT stamp live-run.
+test("runAdvance: review-batch discovery channel reaches setBlocked, not live-run (#763)", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-run-discovery-"));
+  const domain = `discovery-ch-${process.pid}-${Date.now()}`;
+  const stateDir = `/tmp/pipeline-${domain}`;
+  const posted: string[] = [];
+  const cfg = {
+    repo: "owner/repo",
+    domain,
+    repo_dir: repoDir,
+    base_branch: "main",
+    invocation: "pipeline",
+    marker_footer: "*Automated by Claude Code Pipeline Skill*",
+    harnesses: {
+      implementer: "claude",
+      implementerSource: "default",
+      reviewer: "codex",
+      reviewerSource: "default",
+    },
+    steps: { standard_review: true, adversarial_review: true },
+    auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
+    papercuts: { enabled: false, auto_file: false },
+    corrections: { auto_file: false },
+  } as unknown as PipelineConfig;
+  const detail = {
+    number: 63,
+    type: "issue",
+    title: "T",
+    body: "B",
+    state: "open",
+    url: "https://example.test/63",
+    labels: ["pipeline:ready"],
+    comments: [],
+  };
+  const runId = "63-2026-08-05T00-00-00-000Z";
+  const deps: AdvanceDeps = {
+    resolvePinnedEngineIdentity: () => null,
+    probeEngineIdentity: () => null,
+    enforceEngineTrack: async () => ({
+      ok: true as const,
+      track: "candidate" as const,
+      pin_version: undefined,
+      git_sha: undefined,
+    }),
+    releaseParkedWorktree: async () => ({
+      action: "absent",
+      reason: "no managed worktree",
+      branch: null,
+      worktree: null,
+    }),
+    ensurePipelineLabels: async () => {},
+    getIssueDetail: (async () => detail) as AdvanceDeps["getIssueDetail"],
+    getGhActor: async () => "pipeline-bot",
+    getPrForIssue: async () => null,
+    getOnDiskForIssue: async () => null,
+    postComment: async () => {},
+    postPrComment: async () => {},
+    // Simulate a stage that parks: call real setBlocked so it inherits the
+    // module-level channel runAdvance stamped from AdvanceOpts / run.json.
+    dispatch: async () => {
+      await setBlocked(cfg, 63, "batch park", "ready", "needs-human", {
+        getIssueDetail: async () => ({ labels: ["pipeline:ready"] }),
+        addBlockedLabel: async () => {},
+        postComment: async (_c, _n, body) => {
+          posted.push(body);
+        },
+        sleep: async () => {},
+      });
+      return {
+        advanced: false as const,
+        status: "blocked" as const,
+        reason: "batch park",
+        blockerKind: "needs-human" as const,
+      };
+    },
+  };
+  try {
+    await runAdvance(cfg, 63, { runId, discoveryChannel: "review-batch" }, deps);
+
+    const runJsonPath = path.join(runDirPath(repoDir, runId), "run.json");
+    const runMeta = JSON.parse(fs.readFileSync(runJsonPath, "utf8")) as {
+      discovery_channel?: string;
+    };
+    assert.equal(
+      runMeta.discovery_channel,
+      "review-batch",
+      "initRunDir must persist the non-live channel from AdvanceOpts",
+    );
+
+    assert.equal(posted.length, 1, "dispatch must post a blocker via setBlocked");
+    assert.match(
+      posted[0]!,
+      /<!--\s*pipeline:discovery-channel review-batch\s*-->/,
+      "blocker comment must inherit review-batch from runAdvance, not hardcode live-run",
+    );
+    assert.doesNotMatch(
+      posted[0]!,
+      /<!--\s*pipeline:discovery-channel live-run\s*-->/,
+      "must not corrupt discovery-channel decomposition with live-run",
+    );
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// #763: resume must re-read persisted run.json.discovery_channel into setBlocked.
+test("runAdvance: resume preserves persisted review-batch channel for setBlocked (#763)", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-run-discovery-resume-"));
+  const domain = `discovery-resume-${process.pid}-${Date.now()}`;
+  const stateDir = `/tmp/pipeline-${domain}`;
+  const posted: string[] = [];
+  const cfg = {
+    repo: "owner/repo",
+    domain,
+    repo_dir: repoDir,
+    base_branch: "main",
+    invocation: "pipeline",
+    marker_footer: "*Automated by Claude Code Pipeline Skill*",
+    harnesses: {
+      implementer: "claude",
+      implementerSource: "default",
+      reviewer: "codex",
+      reviewerSource: "default",
+    },
+    steps: { standard_review: true, adversarial_review: true },
+    auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
+    papercuts: { enabled: false, auto_file: false },
+    corrections: { auto_file: false },
+  } as unknown as PipelineConfig;
+  const detail = {
+    number: 64,
+    type: "issue",
+    title: "T",
+    body: "B",
+    state: "open",
+    url: "https://example.test/64",
+    labels: ["pipeline:ready"],
+    comments: [],
+  };
+  const runId = "64-2026-08-05T00-00-00-000Z";
+  // Pre-seed a run.json as if a prior review-batch dispatch already initialized it.
+  const seededRunDir = runDirPath(repoDir, runId);
+  fs.mkdirSync(seededRunDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(seededRunDir, "run.json"),
+    `${JSON.stringify({
+      schema_version: 1,
+      run_id: runId,
+      issue: 64,
+      repo: "owner/repo",
+      profile: null,
+      started_at: "2026-08-05T00:00:00Z",
+      discovery_channel: "review-batch",
+    }, null, 2)}\n`,
+  );
+  fs.writeFileSync(path.join(seededRunDir, "events.jsonl"), "");
+  fs.writeFileSync(path.join(seededRunDir, "terminal.log"), "");
+  const deps: AdvanceDeps = {
+    resolvePinnedEngineIdentity: () => null,
+    probeEngineIdentity: () => null,
+    enforceEngineTrack: async () => ({
+      ok: true as const,
+      track: "candidate" as const,
+      pin_version: undefined,
+      git_sha: undefined,
+    }),
+    releaseParkedWorktree: async () => ({
+      action: "absent",
+      reason: "no managed worktree",
+      branch: null,
+      worktree: null,
+    }),
+    ensurePipelineLabels: async () => {},
+    getIssueDetail: (async () => detail) as AdvanceDeps["getIssueDetail"],
+    getGhActor: async () => "pipeline-bot",
+    getPrForIssue: async () => null,
+    getOnDiskForIssue: async () => null,
+    postComment: async () => {},
+    postPrComment: async () => {},
+    dispatch: async () => {
+      await setBlocked(cfg, 64, "resume park", "ready", "needs-human", {
+        getIssueDetail: async () => ({ labels: ["pipeline:ready"] }),
+        addBlockedLabel: async () => {},
+        postComment: async (_c, _n, body) => {
+          posted.push(body);
+        },
+        sleep: async () => {},
+      });
+      return {
+        advanced: false as const,
+        status: "blocked" as const,
+        reason: "resume park",
+        blockerKind: "needs-human" as const,
+      };
+    },
+  };
+  try {
+    // No discoveryChannel in opts — must re-read review-batch from run.json.
+    await runAdvance(cfg, 64, { runId }, deps);
+
+    assert.equal(posted.length, 1);
+    assert.match(
+      posted[0]!,
+      /<!--\s*pipeline:discovery-channel review-batch\s*-->/,
+      "resume must propagate persisted run.json.discovery_channel into setBlocked",
+    );
+    assert.doesNotMatch(
+      posted[0]!,
+      /<!--\s*pipeline:discovery-channel live-run\s*-->/,
+    );
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });

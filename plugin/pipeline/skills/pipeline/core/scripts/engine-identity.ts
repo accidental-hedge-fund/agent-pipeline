@@ -15,6 +15,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getTemplateSnapshot, type TemplateSnapshot } from "./prompts/index.ts";
+import {
+  resolveEngineCommitSha,
+  type ResolveEngineCommitShaDeps,
+} from "./engine-attribution.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url)); // core/scripts
 const engineRoot = path.dirname(here); // core/
@@ -24,6 +28,12 @@ export interface EngineIdentity {
   version: string;
   root: string;
   templates_fingerprint: string;
+  /**
+   * Git commit SHA of the engine root checkout when resolvable (#763).
+   * Omitted when the install is not a git checkout or rev-parse fails —
+   * never invented. Distinct from production-pin `git_sha` on run.json.
+   */
+  commit_sha?: string;
 }
 
 /** Hash sorted `name:sha256(content)` pairs into one stable value. Content-
@@ -52,11 +62,21 @@ export function readEngineVersion(root: string = engineRoot): string | null {
 /** Resolve the identity of the engine pinned for this process, from the
  *  already-pinned template snapshot. Returns null when the version cannot be
  *  resolved (missing/malformed package.json) — callers omit the identity
- *  rather than fail the run. */
-export function resolvePinnedEngineIdentity(): EngineIdentity | null {
+ *  rather than fail the run. Optional `commitShaDeps` injects git rev-parse
+ *  for tests (#763). */
+export function resolvePinnedEngineIdentity(
+  commitShaDeps?: ResolveEngineCommitShaDeps,
+): EngineIdentity | null {
   const version = readEngineVersion();
   if (version === null) return null;
-  return { version, root: engineRoot, templates_fingerprint: templatesFingerprint(getTemplateSnapshot()) };
+  const identity: EngineIdentity = {
+    version,
+    root: engineRoot,
+    templates_fingerprint: templatesFingerprint(getTemplateSnapshot()),
+  };
+  const sha = resolveEngineCommitSha(engineRoot, commitShaDeps);
+  if (sha) identity.commit_sha = sha;
+  return identity;
 }
 
 /** Injectable seam for `probeEngineIdentity` — both members do a real
@@ -91,7 +111,15 @@ export function probeEngineIdentity(deps: DriftProbeDeps = defaultDriftProbeDeps
     const version = deps.readVersion();
     if (version === null) return null;
     const snapshot = deps.readTemplatesFromDisk();
-    return { version, root: engineRoot, templates_fingerprint: templatesFingerprint(snapshot) };
+    const identity: EngineIdentity = {
+      version,
+      root: engineRoot,
+      templates_fingerprint: templatesFingerprint(snapshot),
+    };
+    // Probe is advisory and must stay non-throwing; SHA is best-effort only.
+    const sha = resolveEngineCommitSha(engineRoot);
+    if (sha) identity.commit_sha = sha;
+    return identity;
   } catch {
     return null;
   }
