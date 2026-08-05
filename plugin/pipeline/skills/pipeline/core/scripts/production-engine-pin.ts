@@ -227,28 +227,36 @@ export function tryParseInstallReceipt(text: string | null | undefined): Install
  * Resolve skill-root install provenance from an optional receipt body.
  * Pure: no I/O. Callers load the receipt text via injected read seams.
  *
- * - Valid receipt → `tag_install` (receipt wins over working-tree heuristics)
- * - Explicit working-tree signal without receipt → `working_tree`
+ * Precedence (fail-closed for production attribution):
+ * - Explicit working-tree signal → `working_tree` even when a receipt file is
+ *   present (copied/stale receipts must not reclassify a control checkout as a
+ *   tag install).
+ * - Valid receipt without working-tree signal → `tag_install`
  * - Missing/invalid receipt → `missing` (fail closed under pinned intent)
  */
 export function resolveInstallProvenance(input: {
   receiptText?: string | null;
-  /** When true and no valid receipt, treat as a working-tree engine. */
+  /**
+   * When true, classify as working-tree even if a receipt parses. Control-repo
+   * and managed-worktree engines are never tag installs.
+   */
   isWorkingTree?: boolean;
   workingTreeDetail?: string;
 }): PinInstallProvenance {
+  // Working-tree detection is authoritative: a receipt adjacent to a control
+  // checkout/worktree (copied or stale) must not masquerade as tag install.
+  if (input.isWorkingTree) {
+    return {
+      kind: "working_tree",
+      detail: input.workingTreeDetail ?? "engine root is a working-tree checkout",
+    };
+  }
   const receipt = tryParseInstallReceipt(input.receiptText ?? null);
   if (receipt) {
     return {
       kind: "tag_install",
       tag: receipt.tag,
       version: receipt.version,
-    };
-  }
-  if (input.isWorkingTree) {
-    return {
-      kind: "working_tree",
-      detail: input.workingTreeDetail ?? "engine root is a working-tree checkout",
     };
   }
   return {
@@ -581,6 +589,149 @@ export function isFactoryControlRepo(repo: string | null | undefined): boolean {
   if (typeof repo !== "string") return false;
   const n = repo.trim().toLowerCase();
   return n.length > 0 && n === FACTORY_CONTROL_REPO.toLowerCase();
+}
+
+/**
+ * Extract owner/name from a package.json `repository` field when it names a
+ * GitHub repo. Pure: no I/O. Used to identify the factory control checkout
+ * without network/gh for factory-pin authority checks.
+ */
+export function ownerRepoFromPackageRepository(
+  repository: unknown,
+): string | null {
+  let raw: string | null = null;
+  if (typeof repository === "string" && repository.trim()) {
+    raw = repository.trim();
+  } else if (
+    repository &&
+    typeof repository === "object" &&
+    !Array.isArray(repository) &&
+    typeof (repository as { url?: unknown }).url === "string"
+  ) {
+    const url = (repository as { url: string }).url.trim();
+    if (url) raw = url;
+  }
+  if (!raw) return null;
+
+  // github:owner/name
+  const ghColon = /^github:([^/]+\/[^/#?]+)/i.exec(raw);
+  if (ghColon) return ghColon[1]!.replace(/\.git$/i, "");
+
+  // https://github.com/owner/name(.git)? or git+https://... or git@github.com:owner/name.git
+  const m =
+    /(?:github\.com[:/]|github:)([^/]+\/[^/#?\s]+)/i.exec(raw) ??
+    null;
+  if (!m) return null;
+  return m[1]!.replace(/\.git$/i, "").replace(/\/+$/, "");
+}
+
+/**
+ * True when package.json metadata identifies the factory control repository.
+ * Checks `repository` owner/name only — package `name` alone is not sufficient
+ * (forks or unrelated packages may share a short name).
+ */
+export function isFactoryControlPackageMeta(pkg: {
+  name?: unknown;
+  repository?: unknown;
+}): boolean {
+  const fromRepo = ownerRepoFromPackageRepository(pkg.repository);
+  return isFactoryControlRepo(fromRepo);
+}
+
+/** Result of resolving factory-pin CLI authority (show/init/promote/rollback). */
+export type FactoryPinAuthorityResult =
+  | {
+      ok: true;
+      /** Directory used as pin/FRG repoDir for factory-pin operations. */
+      repoDir: string;
+      /** Absolute pin path override when configured; otherwise null. */
+      pinPathOverride: string | null;
+      source:
+        | "pin-path-override"
+        | "factory-control-env"
+        | "factory-control-arg"
+        | "self-dogfood";
+    }
+  | {
+      ok: false;
+      code: "not_factory_pin_authority";
+      message: string;
+      remediation: string;
+    };
+
+/**
+ * Resolve where `pipeline factory-pin` may read/write the production pin.
+ * Pure: no I/O.
+ *
+ * Product repositories are refused by default. Authority requires one of:
+ * - explicit pin path (`pinPathOverride` / `AGENT_PIPELINE_PRODUCTION_PIN`)
+ * - factory control dir (`factoryControlDir` / `AGENT_PIPELINE_FACTORY_CONTROL`)
+ * - self-dogfood (`targetIsFactoryControl` on the invocation checkout)
+ *
+ * When a pin-path override is set without factory-control dir, `repoDir` stays
+ * the invocation dir only for FRG lookup pathing; the pin file path still comes
+ * from the override via {@link productionPinPath}.
+ */
+export function resolveFactoryPinAuthority(opts: {
+  invocationRepoDir: string;
+  /** True when invocation checkout is the factory control repository. */
+  targetIsFactoryControl?: boolean;
+  factoryControlDir?: string | null;
+  pinPathOverride?: string | null;
+  env?: NodeJS.ProcessEnv;
+}): FactoryPinAuthorityResult {
+  const env = opts.env ?? process.env;
+  const pinOverride = hasProductionPinPathOverride(opts.pinPathOverride, env)
+    ? productionPinPath(opts.invocationRepoDir, opts.pinPathOverride, env)
+    : null;
+
+  const fromEnv = env[FACTORY_CONTROL_DIR_ENV];
+  if (typeof fromEnv === "string" && fromEnv.trim()) {
+    return {
+      ok: true,
+      repoDir: path.resolve(fromEnv.trim()),
+      pinPathOverride: pinOverride,
+      source: "factory-control-env",
+    };
+  }
+  if (typeof opts.factoryControlDir === "string" && opts.factoryControlDir.trim()) {
+    return {
+      ok: true,
+      repoDir: path.resolve(opts.factoryControlDir.trim()),
+      pinPathOverride: pinOverride,
+      source: "factory-control-arg",
+    };
+  }
+  if (pinOverride) {
+    // Explicit pin file authority without a control dir: allow the pin path,
+    // keep FRG lookups relative to the invocation dir (operator responsibility).
+    return {
+      ok: true,
+      repoDir: opts.invocationRepoDir,
+      pinPathOverride: pinOverride,
+      source: "pin-path-override",
+    };
+  }
+  if (opts.targetIsFactoryControl) {
+    return {
+      ok: true,
+      repoDir: opts.invocationRepoDir,
+      pinPathOverride: null,
+      source: "self-dogfood",
+    };
+  }
+  return {
+    ok: false,
+    code: "not_factory_pin_authority",
+    message:
+      `factory-pin refuses to use ${opts.invocationRepoDir} as production pin authority ` +
+      `(not the factory control checkout and no pin-authority override)`,
+    remediation:
+      `Run factory-pin from the factory control checkout (${FACTORY_CONTROL_REPO}), ` +
+      `or set ${FACTORY_CONTROL_DIR_ENV}=<factory-control-root>, ` +
+      `or set ${PRODUCTION_PIN_ENV}=<absolute-pin.json path>. ` +
+      `Do not write a product-local production pin.`,
+  };
 }
 
 /** Result of resolving the production-pin authority directory. */

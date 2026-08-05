@@ -24,7 +24,10 @@ import {
   pinInstallProvenanceMatches,
   productionPinPath,
   promoteProductionPin,
+  isFactoryControlPackageMeta,
+  ownerRepoFromPackageRepository,
   resolveEngineTrackIntent,
+  resolveFactoryPinAuthority,
   resolveInstallProvenance,
   resolvePinAuthorityDir,
   resolveProductionPin,
@@ -375,6 +378,27 @@ test("classifyEngineTrack: pinned intent + version match + working_tree → not 
   assert.equal(r.pin_match, true);
 });
 
+test("classifyEngineTrack: dual-signal receipt+working_tree resolves to not coherent pinned", () => {
+  // Both signals present → working_tree wins; cannot claim pinned.
+  const provenance = resolveInstallProvenance({
+    receiptText: JSON.stringify({
+      schema_version: 1,
+      version: "1.29.1",
+      tag: "v1.29.1",
+    }),
+    isWorkingTree: true,
+  });
+  assert.equal(provenance.kind, "working_tree");
+  const r = classifyEngineTrack({
+    intent: "pinned",
+    runningVersion: "1.29.1",
+    pin: validPin(),
+    installProvenance: provenance,
+  });
+  assert.equal(r.coherent_pinned, false);
+  assert.equal(r.track, "candidate");
+});
+
 test("classifyEngineTrack: pinned intent + mismatch → not coherent pinned", () => {
   const r = classifyEngineTrack({
     intent: "pinned",
@@ -566,7 +590,7 @@ test("engineTrackEvidenceFields: pin git_sha only on verified pinned track", () 
   assert.equal(candidate.git_sha, undefined, "candidate must not inherit production pin SHA");
 });
 
-test("resolveInstallProvenance: receipt → tag_install; receipt wins over working_tree", () => {
+test("resolveInstallProvenance: working_tree is authoritative over receipt", () => {
   const text = JSON.stringify({
     schema_version: 1,
     version: "1.29.1",
@@ -577,15 +601,107 @@ test("resolveInstallProvenance: receipt → tag_install; receipt wins over worki
   assert.equal(fromReceipt.kind, "tag_install");
   if (fromReceipt.kind === "tag_install") assert.equal(fromReceipt.tag, "v1.29.1");
 
-  // Valid receipt is positive tag-install evidence even if path heuristics
-  // also look like a working tree (e.g. tests under .worktrees/).
-  const receiptOverWt = resolveInstallProvenance({ receiptText: text, isWorkingTree: true });
-  assert.equal(receiptOverWt.kind, "tag_install");
+  // Copied/stale receipt next to a control checkout must not masquerade as
+  // tag-install provenance (#762 review: working_tree wins over receipt).
+  const wtOverReceipt = resolveInstallProvenance({
+    receiptText: text,
+    isWorkingTree: true,
+    workingTreeDetail: "control-repo worktree",
+  });
+  assert.equal(wtOverReceipt.kind, "working_tree");
+  if (wtOverReceipt.kind === "working_tree") {
+    assert.match(wtOverReceipt.detail ?? "", /control-repo/);
+  }
 
   const wtOnly = resolveInstallProvenance({ receiptText: null, isWorkingTree: true });
   assert.equal(wtOnly.kind, "working_tree");
 
   assert.equal(resolveInstallProvenance({ receiptText: null }).kind, "missing");
+});
+
+test("resolveFactoryPinAuthority: refuses product repository invocation", () => {
+  const refused = resolveFactoryPinAuthority({
+    invocationRepoDir: "/product/acme",
+    targetIsFactoryControl: false,
+    env: {},
+  });
+  assert.equal(refused.ok, false);
+  if (!refused.ok) {
+    assert.equal(refused.code, "not_factory_pin_authority");
+    assert.match(refused.remediation, /AGENT_PIPELINE_FACTORY_CONTROL|AGENT_PIPELINE_PRODUCTION_PIN|factory control/);
+  }
+});
+
+test("resolveFactoryPinAuthority: self-dogfood factory control is allowed", () => {
+  const ok = resolveFactoryPinAuthority({
+    invocationRepoDir: "/factory/control",
+    targetIsFactoryControl: true,
+    env: {},
+  });
+  assert.equal(ok.ok, true);
+  if (ok.ok) {
+    assert.equal(ok.repoDir, "/factory/control");
+    assert.equal(ok.source, "self-dogfood");
+    assert.equal(ok.pinPathOverride, null);
+  }
+});
+
+test("resolveFactoryPinAuthority: factory control env beats product cwd", () => {
+  const ok = resolveFactoryPinAuthority({
+    invocationRepoDir: "/product/acme",
+    targetIsFactoryControl: false,
+    env: { [FACTORY_CONTROL_DIR_ENV]: "/factory/control" },
+  });
+  assert.equal(ok.ok, true);
+  if (ok.ok) {
+    assert.equal(ok.repoDir, path.resolve("/factory/control"));
+    assert.equal(ok.source, "factory-control-env");
+  }
+});
+
+test("resolveFactoryPinAuthority: explicit pin path override is authority", () => {
+  const pinFile = "/authority/pins/production-engine-pin.json";
+  const ok = resolveFactoryPinAuthority({
+    invocationRepoDir: "/product/acme",
+    targetIsFactoryControl: false,
+    env: { [PRODUCTION_PIN_ENV]: pinFile },
+  });
+  assert.equal(ok.ok, true);
+  if (ok.ok) {
+    assert.equal(ok.source, "pin-path-override");
+    assert.equal(ok.pinPathOverride, path.resolve(pinFile));
+  }
+});
+
+test("isFactoryControlPackageMeta: repository owner/name only", () => {
+  assert.equal(
+    isFactoryControlPackageMeta({
+      name: "agent-pipeline",
+      repository: {
+        type: "git",
+        url: "git+https://github.com/accidental-hedge-fund/agent-pipeline.git",
+      },
+    }),
+    true,
+  );
+  assert.equal(
+    isFactoryControlPackageMeta({
+      name: "agent-pipeline",
+      repository: "github:other/agent-pipeline",
+    }),
+    false,
+  );
+  assert.equal(
+    isFactoryControlPackageMeta({ name: "agent-pipeline" }),
+    false,
+    "package name alone is not factory-control identity",
+  );
+  assert.equal(
+    ownerRepoFromPackageRepository({
+      url: "git@github.com:accidental-hedge-fund/agent-pipeline.git",
+    }),
+    "accidental-hedge-fund/agent-pipeline",
+  );
 });
 
 test("parseInstallReceipt + pinInstallProvenanceMatches", () => {

@@ -3482,10 +3482,11 @@ async function main(): Promise<void> {
   }
 
   // `pipeline factory-pin show|init|promote|rollback` (#762).
-  // Manages the production engine pin. Never merges or tags.
+  // Manages the production engine pin on factory pin authority only.
+  // Never merges or tags. Never writes a product-local pin by cwd accident.
   if (numArg === "factory-pin") {
     const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
-    const repoDir = findGitRoot(startDir) ?? startDir;
+    const invocationRepoDir = findGitRoot(startDir) ?? startDir;
     const verb = (cmd.args[1] as string | undefined)?.trim() ?? "show";
     const {
       resolveProductionPin,
@@ -3493,12 +3494,40 @@ async function main(): Promise<void> {
       promoteProductionPin,
       initProductionPin,
       rollbackProductionPin,
+      resolveFactoryPinAuthority,
+      isFactoryControlPackageMeta,
       PRODUCTION_ENGINE_PIN_REL,
     } = await import("./production-engine-pin.ts");
     try {
+      // Identify self-dogfood without network: package.json repository field.
+      let targetIsFactoryControl = false;
+      try {
+        const pkgRaw = await fsPromises.readFile(
+          path.join(invocationRepoDir, "package.json"),
+          "utf8",
+        );
+        const pkg = JSON.parse(pkgRaw) as { name?: unknown; repository?: unknown };
+        targetIsFactoryControl = isFactoryControlPackageMeta(pkg);
+      } catch {
+        targetIsFactoryControl = false;
+      }
+      const authority = resolveFactoryPinAuthority({
+        invocationRepoDir,
+        targetIsFactoryControl,
+      });
+      if (!authority.ok) {
+        console.error(
+          `pipeline factory-pin: ${authority.message}\n  → ${authority.remediation}`,
+        );
+        process.exit(1);
+      }
+      const repoDir = authority.repoDir;
+      const pinPathOverride = authority.pinPathOverride;
+
       if (verb === "show") {
         const load = await resolveProductionPin({
           repoDir,
+          overridePath: pinPathOverride,
           readTextFile: async (p) => {
             try {
               return await fsPromises.readFile(p, "utf8");
@@ -3538,6 +3567,7 @@ async function main(): Promise<void> {
           repoDir,
           version,
           gitSha: opts.gitSha ?? null,
+          overridePath: pinPathOverride,
         });
         if (!result.ok) {
           console.error(`pipeline factory-pin promote: ${result.message}`);
@@ -3567,6 +3597,7 @@ async function main(): Promise<void> {
           version,
           force: !!opts.force,
           gitSha: opts.gitSha ?? null,
+          overridePath: pinPathOverride,
         });
         if (!result.ok) {
           console.error(`pipeline factory-pin init: ${result.message}`);
@@ -3585,6 +3616,7 @@ async function main(): Promise<void> {
         const result = await rollbackProductionPin({
           repoDir,
           toVersion: opts.to ?? null,
+          overridePath: pinPathOverride,
         });
         if (!result.ok) {
           console.error(`pipeline factory-pin rollback: ${result.message}`);

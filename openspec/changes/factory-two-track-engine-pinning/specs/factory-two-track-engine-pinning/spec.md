@@ -72,6 +72,13 @@ the production pin's `git_sha` as the executing engine SHA.
 - **AND** under default pinned intent SHALL refuse the advance before stages (or doctor
   fail with reinstall remediation)
 
+#### Scenario: Working-tree signal outranks a copied or stale installer receipt
+
+- **WHEN** the executing engine root is identified as a control-repo or managed worktree
+- **AND** an installer receipt file is also present and parseable for the pin tag
+- **THEN** install provenance SHALL classify as `working_tree` (not `tag_install`)
+- **AND** pinned-track intent SHALL NOT treat the run as coherent track `pinned`
+
 #### Scenario: Missing pin under pinned intent refuses the run
 
 - **WHEN** pinned-track production intent applies
@@ -105,6 +112,16 @@ the production pin's `git_sha` as the executing engine SHA.
 - **AND** doctor under the same pinned intent SHALL fail
 - **AND** remediation SHALL require configuring factory-control directory or pin path
 - **AND** SHALL NOT load a product-local pin file as production pin authority
+
+#### Scenario: factory-pin refuses product repository as pin authority
+
+- **WHEN** an operator runs `pipeline factory-pin` (show, init, promote, or rollback)
+- **AND** the invocation directory is not the factory control checkout
+- **AND** neither factory-control directory (`AGENT_PIPELINE_FACTORY_CONTROL` or equivalent)
+  nor an explicit pin path override is configured
+- **THEN** the command SHALL refuse before reading or writing a production pin
+- **AND** SHALL NOT create or update `.agent-pipeline/production-engine-pin.json` under the
+  product repository as if it were factory pin authority
 
 #### Scenario: Candidate evidence does not inherit the production pin SHA
 
