@@ -605,6 +605,14 @@ harnesses:
 
 Either key may be omitted — an omitted role keeps the active profile's default for that role only. `implementer` must name a harness with a registered adapter that declares the **implementer** role capability (built-ins: `claude`, `codex`, `grok`, `opencode`, `pi`, plus any IDs from `adapter_extensions` below). An unregistered implementer name is rejected at config-parse time, naming the key, the value, and the **currently registered** adapter IDs from the runtime registry, before any worktree is created. `reviewer` may name a registered adapter that declares the **reviewer** role, or an arbitrary custom reviewer CLI (compatibility path), same as the older `review_harness` key below.
 
+### Outer-host lifecycle contract (#784)
+
+The **outer host** (this OpenCode skill session) is independent of stage
+adapter ID, provider, model, effort, and role. Lifecycle capabilities live on
+`hosts/<id>/outer-host.manifest.json` and the runtime outer-host registry.
+Shared orchestration consumes declared capabilities without host-name
+branching. See `core/scripts/outer-hosts/`.
+
 ### Third-party adapter extensions (#783)
 
 Register additional local-CLI adapters without editing engine source via `adapter_extensions` — a list of module entry points (repo-relative path, absolute path, or package name). **Only listed entries load**; unconfigured packages are never auto-scanned from `node_modules`.
@@ -781,12 +789,19 @@ On each **material** progress line (shared material filter — see §4.c),
 service; do not gate stages on delivery. `events.jsonl` remains the
 complete evidence stream.
 
-| Host | Follow / surface | Material path |
+**Outer-host lifecycle contract (#784):** lifecycle steps (handoff, follow,
+reattach, material notify, cleanup, summary) are selected from the active
+outer host's declared capabilities in `outer-host.manifest.json`, not from
+host-name equality checks. OpenCode's material notify mapping is portable
+stdout/`events.jsonl` (`stdout_only`). Set `PIPELINE_OUTER_HOST=opencode` so
+run evidence records outer-host identity separately from adapter treatment.
+
+| Host (declared mapping) | Follow / surface | Material path |
 | --- | --- | --- |
-| **Claude** | Monitor on material-filtered events; call `PushNotification` on each material one-liner | This file's §4.c–d |
-| **Grok** | Host `monitor` on the same material-filtered command (each stdout line = chat bubble). **Never** require Claude `PushNotification` | **Grok substitute** below |
-| **Codex** | Poll/follow material stream; concise chat/status updates (no Claude-only tools) | `hosts/codex/SKILL.md` |
-| **OpenCode** | Host event follow / chat status updates; native `/pipeline` command runs the launcher | `hosts/opencode/SKILL.md` |
+| **Claude** (`claude_monitor_push`) | Monitor on material-filtered events; call `PushNotification` on each material one-liner | `hosts/claude/SKILL.md` |
+| **Grok** (`grok_monitor_lines`) | Host `monitor` on the same material-filtered command (each stdout line = chat bubble). **Never** require Claude `PushNotification` | **Grok substitute** below |
+| **Codex** (`codex_chat_status`) | Poll/follow material stream; concise chat/status updates (no Claude-only tools) | `hosts/codex/SKILL.md` |
+| **OpenCode** (`stdout_only`) | Host event follow / chat status updates; native `/pipeline` command runs the launcher | This file |
 
 **Grok substitute** (when this Claude overlay is the installed/symlink path Grok
 loads — first-class `--host grok` is #731): use host **`monitor`** (or

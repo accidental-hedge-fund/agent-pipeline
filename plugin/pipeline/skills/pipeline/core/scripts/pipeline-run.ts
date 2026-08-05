@@ -68,6 +68,11 @@ import {
   resolvePinnedEngineIdentity,
   type EngineIdentity,
 } from "./engine-identity.ts";
+import {
+  OUTER_HOST_UNKNOWN,
+  readOuterHostFromEnv,
+  resolveOuterHostEvidence,
+} from "./outer-hosts/evidence.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { parseOverrideArg } from "./review-policy.ts";
 import { classifyProductFault, emitProductFault, resolveHostAdapter, resolveProductFaultConfig } from "./product-fault.ts";
@@ -864,8 +869,26 @@ export async function runAdvance(
         runStoreDeps,
       );
       lastObservedEngine = pinnedEngine;
+      // Outer-host identity (#784): from PIPELINE_OUTER_HOST when set; never
+      // invent from implementer/reviewer adapter id. Omit when unknown.
+      const outerHostResolved = resolveOuterHostEvidence({
+        explicit: readOuterHostFromEnv(process.env),
+        implementerAdapterId: cfg.harnesses?.implementer ?? null,
+        reviewerAdapterId: cfg.harnesses?.reviewer ?? null,
+      });
+      const outerHost =
+        outerHostResolved === OUTER_HOST_UNKNOWN ? null : outerHostResolved;
       await initRunDir(
-        { runDir, runId, issue: issueNumber, repo: cfg.repo, profile: opts.profile ?? null, startedAt: runStartedAtIso, engine: pinnedEngine },
+        {
+          runDir,
+          runId,
+          issue: issueNumber,
+          repo: cfg.repo,
+          profile: opts.profile ?? null,
+          startedAt: runStartedAtIso,
+          engine: pinnedEngine,
+          outerHost,
+        },
         runStoreDeps,
       ).catch(() => {});
       // Start the terminal.log tee (directory exists after initRunDir).

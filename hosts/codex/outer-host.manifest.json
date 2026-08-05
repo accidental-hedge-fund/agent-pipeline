@@ -1,0 +1,73 @@
+{
+  "manifestVersion": 1,
+  "id": "codex",
+  "displayName": "Codex",
+  "profileDefault": "codex",
+  "origin": "builtin",
+  "install": {
+    "support": "supported",
+    "mode": "tree",
+    "basePath": {
+      "env": "CODEX_HOME",
+      "defaultHomeSegments": [".codex"],
+      "alternateHomeSegments": [".agents"],
+      "skillsUnderBase": true
+    },
+    "skillsRelative": ["skills"],
+    "skillDirName": "pipeline",
+    "overlayDir": "hosts/codex",
+    "overlayFiles": ["SKILL.md"],
+    "overlayDirs": ["agents"],
+    "managedArtifacts": {
+      "skillTree": true,
+      "commandsGlob": null,
+      "commandsDirRelative": ["agents"],
+      "commandsKind": "codex-prompt"
+    },
+    "userOwnedExclusion": "Only the installer-managed skill tree under skills/pipeline is removed on uninstall. Unrelated user skills and files outside the managed tree are preserved.",
+    "postInstall": "Restart Codex to pick it up, then invoke with $pipeline.",
+    "installOrder": 20
+  },
+  "invocation": {
+    "support": "supported",
+    "skillPathHint": "~/.codex/skills/pipeline",
+    "commandSurface": "$pipeline",
+    "discoveryProbe": "which codex"
+  },
+  "early_run_handoff": {
+    "support": "supported",
+    "how": "Parse durable run handoff JSON from stdout for run_id and events path; fall back to status / run-store discovery when handoff line is missed."
+  },
+  "event_follow": {
+    "support": "supported",
+    "how": "pipeline logs <run-id> --events --follow (or loop logs) until terminal."
+  },
+  "reattach": {
+    "support": "supported",
+    "how": "Re-arm event follow / wait after cancelled or lost follow; cancelled wait is not terminal."
+  },
+  "wait_cancel": {
+    "support": "supported",
+    "classification": "non_terminal",
+    "recovery": "reattach_or_portable_follow",
+    "how": "Cancelled wait before terminal is non-terminal; re-follow events.jsonl until run_complete / loop terminal."
+  },
+  "material_progress_notify": {
+    "support": "supported",
+    "how": "Poll/follow material stream; concise chat/status updates. Never requires Claude PushNotification.",
+    "mapping": {
+      "surface": "codex_chat_status",
+      "tools": ["chat", "status"],
+      "filter": "scripts/material-filter.mjs"
+    },
+    "fallback": "stdout material lines via events.jsonl + material-filter.mjs"
+  },
+  "terminal_cleanup": {
+    "support": "supported",
+    "how": "Stop event follows for this run_id on terminal; leave run store intact."
+  },
+  "terminal_summary": {
+    "support": "supported",
+    "how": "Surface terminal JSON / pipeline summary <run-id>; optional loop --audit."
+  }
+}

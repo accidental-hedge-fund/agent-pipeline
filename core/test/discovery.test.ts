@@ -24,6 +24,9 @@ function makeDeps(overrides: Partial<DiscoverHostsDeps>): DiscoverHostsDeps {
     probeCandidates: async () => null,
     readVersion: async () => null,
     probeOpenCodeSkill: async () => null,
+    // Default tests pin the legacy trio so hostCoverage cases stay focused;
+    // registry-driven completeness is covered in a dedicated #784 test.
+    listOuterHostIds: () => ["claude", "codex", "opencode"],
     ...overrides,
   };
 }
@@ -357,4 +360,37 @@ test("handlePathSubcommand human-readable: prints core path and coverage", async
 test("VERSION export is still a semver string (detach/discovery imports do not break it)", async () => {
   const { VERSION } = await import("../scripts/pipeline.ts");
   assert.match(VERSION, /^\d+\.\d+\.\d+/);
+});
+
+// ---------------------------------------------------------------------------
+// 7. Outer-host registry enumeration (#784)
+// ---------------------------------------------------------------------------
+
+test("discoverHosts: registry-driven listing includes synthetic host without built-in table edit (#784)", async () => {
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      which: async (cmd) => (cmd === "claude" || cmd === "codex" ? `/usr/bin/${cmd}` : null),
+      listOuterHostIds: () => ["claude", "codex", "opencode", "synth-third-party"],
+    }),
+  );
+  assert.equal(result.hostCoverage, "both", "legacy hostCoverage must stay Claude/Codex-only");
+  assert.ok(result.registeredOuterHosts?.includes("synth-third-party"));
+  assert.ok(result.hosts["synth-third-party"], "synthetic host must appear in hosts map");
+  assert.equal(result.hosts["synth-third-party"].available, false);
+  assert.equal(result.hosts["synth-third-party"].cliBin, null);
+});
+
+test("discoverHosts: extra registered hosts do not redefine hostCoverage enum (#784)", async () => {
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      which: async (cmd) => (cmd === "claude" ? "/usr/bin/claude" : null),
+      listOuterHostIds: () => ["claude", "codex", "grok", "opencode", "synth-x"],
+    }),
+  );
+  assert.equal(result.hostCoverage, "claude-only");
+  assert.ok(result.hosts.grok || result.registeredOuterHosts?.includes("grok"));
 });

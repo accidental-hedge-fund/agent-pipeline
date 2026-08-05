@@ -27,6 +27,8 @@ import {
   DEPS,
   HOSTS,
   VALID_HOSTS,
+  reloadHostsFromManifests,
+  loadOuterHostManifests,
   checkLoopCoherence,
   detectPersonalSkill,
   uniqueBackupPath,
@@ -1592,7 +1594,8 @@ test("releaseUpdateLock: refuses to release a lock owned by another process (#45
 // ---------------------------------------------------------------------------
 
 test("VALID_HOSTS and HOSTS include grok and opencode alongside claude and codex (#731/#861)", () => {
-  assert.deepEqual(VALID_HOSTS, ["claude", "codex", "grok", "opencode", "all"]);
+  // installOrder: claude(10), codex(20), opencode(30), grok(40) then pseudo-host all (#784).
+  assert.deepEqual(VALID_HOSTS, ["claude", "codex", "opencode", "grok", "all"]);
   assert.ok(HOSTS.grok, "HOSTS.grok must exist");
   assert.ok(HOSTS.opencode, "HOSTS.opencode must exist");
   assert.equal(HOSTS.grok.installMode, "symlink-claude");
@@ -1617,6 +1620,7 @@ test("usage header documents --host grok and opencode among implemented hosts (#
 
 test("unknown --host error lists grok/opencode and points at Grok skill path (#731/#861)", () => {
   const home = makeTmp();
+  // error message now lists registered hosts from manifests (#784); order is installOrder.
   try {
     const result = runInstaller(["install", "--host", "not-a-host"], {
       // Isolate from the real home so we do not touch user installs if parse somehow proceeds.
@@ -1625,7 +1629,12 @@ test("unknown --host error lists grok/opencode and points at Grok skill path (#7
     assert.notEqual(result.status, 0);
     const out = `${result.stdout}${result.stderr}`;
     assert.match(out, /Unknown --host 'not-a-host'/);
-    assert.match(out, /claude, codex, grok, opencode, or all/);
+    // Registry-driven list (#784): includes all registered hosts + all.
+    assert.match(out, /claude/);
+    assert.match(out, /codex/);
+    assert.match(out, /grok/);
+    assert.match(out, /opencode/);
+    assert.match(out, /\ball\b/);
     assert.match(out, /~\/\.grok\/skills\/pipeline|Grok Build skill path/);
     assert.match(out, /opencode/i);
   } finally {
@@ -2583,4 +2592,37 @@ test("OpenCode bridge argv safety: spaces and metacharacters not shell-expanded 
       cleanup(dir);
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// Outer-host manifest registry (#784)
+// ---------------------------------------------------------------------------
+
+test("HOSTS are built from co-located outer-host manifests (#784)", () => {
+  assert.ok(HOSTS.claude.manifest, "claude must carry manifest");
+  assert.equal(HOSTS.claude.manifest.manifestVersion, 1);
+  assert.equal(HOSTS.claude.commandsKind, "claude-slash");
+  assert.equal(HOSTS.codex.commandsKind, "codex-prompt");
+  assert.equal(HOSTS.opencode.commandsKind, "opencode-native");
+  assert.equal(HOSTS.grok.installMode, "symlink-claude");
+  assert.ok(HOSTS.claude.userOwnedExclusion.length > 0);
+  const manifests = loadOuterHostManifests();
+  assert.ok(manifests.some((m) => m.id === "claude"));
+  assert.ok(manifests.every((m) => m.manifestVersion === 1));
+});
+
+test("reloadHostsFromManifests: synthetic host appears without built-in module edit (#784)", () => {
+  const fixture = fileURLToPath(
+    new URL("../core/test/fixtures/outer-hosts/synth-complete.json", import.meta.url),
+  );
+  try {
+    const hosts = reloadHostsFromManifests([fixture]);
+    assert.ok(hosts["synth-third-party"], "synthetic host must register from fixture path");
+    assert.equal(hosts["synth-third-party"].installMode, "tree");
+    assert.ok(VALID_HOSTS.includes("synth-third-party"));
+    assert.ok(VALID_HOSTS.includes("claude"), "built-ins still present");
+  } finally {
+    // Restore built-in-only registry for remaining tests.
+    reloadHostsFromManifests([]);
+  }
 });

@@ -1,0 +1,72 @@
+{
+  "manifestVersion": 1,
+  "id": "synth-third-party",
+  "displayName": "Synthetic Third-Party Outer Host",
+  "profileDefault": null,
+  "origin": "extension",
+  "install": {
+    "support": "supported",
+    "mode": "tree",
+    "basePath": {
+      "env": "SYNTH_OUTER_HOST_HOME",
+      "defaultHomeSegments": [".synth-outer-host"],
+      "skillsUnderBase": true
+    },
+    "skillsRelative": ["skills"],
+    "skillDirName": "pipeline",
+    "overlayDir": "core/test/fixtures/outer-hosts/synth-overlay",
+    "overlayFiles": ["SKILL.md"],
+    "overlayDirs": [],
+    "managedArtifacts": {
+      "skillTree": true,
+      "commandsGlob": "pipeline:*.md",
+      "commandsDirRelative": ["commands"],
+      "commandsKind": "claude-slash"
+    },
+    "userOwnedExclusion": "Only managed pipeline skill tree and pipeline:*.md commands are removed; user-owned files are preserved.",
+    "postInstall": "Synthetic fixture host — invoke via declared command surface.",
+    "installOrder": 100
+  },
+  "invocation": {
+    "support": "supported",
+    "skillPathHint": "~/.synth-outer-host/skills/pipeline",
+    "commandSurface": "/pipeline",
+    "discoveryProbe": "registry registration only (fixture)"
+  },
+  "early_run_handoff": {
+    "support": "supported",
+    "how": "Parse durable handoff JSON from stdout for run_id and events path."
+  },
+  "event_follow": {
+    "support": "supported",
+    "how": "pipeline logs --events --follow until terminal."
+  },
+  "reattach": {
+    "support": "supported",
+    "how": "Re-arm follow after cancelled wait."
+  },
+  "wait_cancel": {
+    "support": "supported",
+    "classification": "non_terminal",
+    "recovery": "reattach_or_portable_follow",
+    "how": "Cancelled wait is never terminal; reattach required."
+  },
+  "material_progress_notify": {
+    "support": "unsupported",
+    "how": "No host-rich notify tools.",
+    "mapping": {
+      "surface": "stdout_only",
+      "tools": [],
+      "filter": "scripts/material-filter.mjs"
+    },
+    "fallback": "stdout and events.jsonl material lines (portable baseline)"
+  },
+  "terminal_cleanup": {
+    "support": "supported",
+    "how": "Stop follows on terminal."
+  },
+  "terminal_summary": {
+    "support": "supported",
+    "how": "pipeline summary / terminal stdout JSON."
+  }
+}

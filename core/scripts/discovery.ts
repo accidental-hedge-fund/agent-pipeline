@@ -4,6 +4,9 @@
 // `claude` / `codex` host CLIs are reachable, then derives a four-state
 // hostCoverage value that Pipeline Desk (or any integrator) can act on
 // without parsing prose output.
+//
+// #784: completeness-oriented host listing comes from the outer-host registry
+// (or an injectable list). Legacy `hostCoverage` remains Claude/Codex-only.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -11,6 +14,10 @@ import * as os from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import {
+  ensureBuiltinOuterHostsRegistered,
+  registeredOuterHostIds,
+} from "./outer-hosts/index.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -30,6 +37,14 @@ export type OpenCodeHostEntry = HostEntry & {
   skillPath: string | null;
 };
 
+/** Generic registry-driven host entry for completeness listings (#784). */
+export type RegistryHostEntry = HostEntry & {
+  /** When known (e.g. managed skill install path). */
+  skillPath?: string | null;
+  /** Outer-host display name when known. */
+  displayName?: string;
+};
+
 export type HostCoverage = "missing" | "claude-only" | "codex-only" | "both";
 
 export type DiscoveryResult = {
@@ -41,7 +56,18 @@ export type DiscoveryResult = {
     codex: HostEntry;
     /** Additive OpenCode reporting — never changes hostCoverage meanings. */
     opencode: OpenCodeHostEntry;
+    /**
+     * Index signature for registry-registered hosts beyond the legacy trio.
+     * Completeness listings iterate registry ids; synthetic hosts appear here
+     * in tests without editing a built-in-only name table.
+     */
+    [hostId: string]: HostEntry | OpenCodeHostEntry | RegistryHostEntry;
   };
+  /**
+   * Ordered outer-host ids from the runtime registry (completeness source).
+   * Additive (#784) — does not replace hostCoverage.
+   */
+  registeredOuterHosts?: string[];
 };
 
 /** IO seam for unit tests — override probes without touching the filesystem. */
@@ -51,6 +77,11 @@ export type DiscoverHostsDeps = {
   readVersion: (corePath: string) => Promise<string | null>;
   /** Optional seam for OpenCode skill path probe (#861). */
   probeOpenCodeSkill?: () => Promise<string | null>;
+  /**
+   * Optional seam for registry-driven host id enumeration (#784).
+   * Defaults to the outer-host runtime registry.
+   */
+  listOuterHostIds?: () => string[];
 };
 
 // ---------------------------------------------------------------------------
@@ -186,6 +217,12 @@ export async function discoverHosts(
   deps: DiscoverHostsDeps = defaultDeps,
 ): Promise<DiscoveryResult> {
   const probeOpenCode = deps.probeOpenCodeSkill ?? (async () => null);
+  const listIds =
+    deps.listOuterHostIds ??
+    (() => {
+      ensureBuiltinOuterHostsRegistered();
+      return registeredOuterHostIds();
+    });
   const [corePath, claudeBin, codexBin, opencodeBin, opencodeSkill] = await Promise.all([
     deps.probeCandidates(),
     deps.which("claude"),
@@ -212,19 +249,37 @@ export async function discoverHosts(
     hostCoverage = "both";
   }
 
+  const hosts: DiscoveryResult["hosts"] = {
+    claude: { available: claudeAvailable, cliBin: claudeBin },
+    codex: { available: codexAvailable, cliBin: codexBin },
+    opencode: {
+      available: opencodeSkill !== null,
+      cliBin: opencodeBin,
+      skillPath: opencodeSkill,
+    },
+  };
+
+  // Registry-driven completeness: every registered outer host appears under
+  // hosts (additive entries for ids beyond the legacy trio). Synthetic hosts
+  // in tests inject via listOuterHostIds without editing built-in modules.
+  const registeredOuterHosts = listIds();
+  for (const id of registeredOuterHosts) {
+    if (hosts[id]) continue;
+    // Unknown registry host: CLI probe by id when possible; skill path unknown.
+    const bin = await deps.which(id);
+    hosts[id] = {
+      available: bin !== null,
+      cliBin: bin,
+      skillPath: null,
+    };
+  }
+
   return {
     corePath,
     version,
     hostCoverage,
-    hosts: {
-      claude: { available: claudeAvailable, cliBin: claudeBin },
-      codex: { available: codexAvailable, cliBin: codexBin },
-      opencode: {
-        available: opencodeSkill !== null,
-        cliBin: opencodeBin,
-        skillPath: opencodeSkill,
-      },
-    },
+    hosts,
+    registeredOuterHosts,
   };
 }
 
@@ -244,11 +299,23 @@ export function formatDiscovery(result: DiscoveryResult, asJson: boolean): strin
   ];
   // Additive OpenCode line (#861) — never part of hostCoverage.
   if (result.hosts.opencode) {
-    const oc = result.hosts.opencode;
+    const oc = result.hosts.opencode as OpenCodeHostEntry;
     const detail = oc.available
       ? `yes${oc.skillPath ? ` (${oc.skillPath})` : ""}${oc.cliBin ? ` cli=${oc.cliBin}` : ""}`
       : "no";
     lines.push(`  opencode: ${detail}`);
+  }
+  // Registry-driven extras (#784) beyond the legacy Claude/Codex/OpenCode lines.
+  const printed = new Set(["claude", "codex", "opencode"]);
+  for (const id of result.registeredOuterHosts ?? Object.keys(result.hosts)) {
+    if (printed.has(id)) continue;
+    const entry = result.hosts[id];
+    if (!entry) continue;
+    const skill =
+      "skillPath" in entry && entry.skillPath ? ` (${entry.skillPath})` : "";
+    lines.push(
+      `  ${id}: ${entry.available ? `yes${skill}${entry.cliBin ? ` cli=${entry.cliBin}` : ""}` : "no"}`,
+    );
   }
   return lines.join("\n");
 }

@@ -1,0 +1,73 @@
+{
+  "manifestVersion": 1,
+  "id": "grok",
+  "displayName": "Grok Build",
+  "profileDefault": "claude",
+  "origin": "builtin",
+  "install": {
+    "support": "supported",
+    "mode": "symlink-claude",
+    "basePath": {
+      "env": null,
+      "defaultHomeSegments": [".grok"],
+      "skillsUnderBase": true
+    },
+    "skillsRelative": ["skills"],
+    "skillDirName": "pipeline",
+    "overlayDir": "hosts/claude",
+    "overlayFiles": [],
+    "overlayDirs": [],
+    "managedArtifacts": {
+      "skillTree": true,
+      "commandsGlob": null,
+      "commandsDirRelative": null,
+      "commandsKind": "none"
+    },
+    "userOwnedExclusion": "Uninstall only removes an installer-owned symlink at ~/.grok/skills/pipeline. Never deletes the Claude-managed skill tree target or unrelated files under ~/.grok.",
+    "postInstall": "Skill path is a symlink to the Claude-managed install (no separate Grok SKILL.md). After a Claude skill update, re-run: node scripts/install.mjs install --host grok",
+    "installOrder": 40,
+    "baseOptional": true
+  },
+  "invocation": {
+    "support": "supported",
+    "skillPathHint": "~/.grok/skills/pipeline",
+    "commandSurface": "pipeline skill (Grok Build skill path)",
+    "discoveryProbe": "test -L ~/.grok/skills/pipeline || test -d ~/.grok/skills/pipeline"
+  },
+  "early_run_handoff": {
+    "support": "supported",
+    "how": "Same durable handoff JSON as Claude overlay path; parse run_id and events path from stdout."
+  },
+  "event_follow": {
+    "support": "supported",
+    "how": "pipeline logs <run-id> --events --follow until terminal (portable CLI)."
+  },
+  "reattach": {
+    "support": "supported",
+    "how": "Re-arm host monitor / event follow after cancelled wait; cancelled wait is not terminal."
+  },
+  "wait_cancel": {
+    "support": "supported",
+    "classification": "non_terminal",
+    "recovery": "reattach_or_portable_follow",
+    "how": "Cancelled wait is non-terminal; re-follow until terminal loop/run events."
+  },
+  "material_progress_notify": {
+    "support": "supported",
+    "how": "Host monitor on material-filtered stream (each stdout line = chat bubble). Never require Claude PushNotification.",
+    "mapping": {
+      "surface": "grok_monitor_lines",
+      "tools": ["monitor"],
+      "filter": "scripts/material-filter.mjs"
+    },
+    "fallback": "stdout material lines via events.jsonl + material-filter.mjs"
+  },
+  "terminal_cleanup": {
+    "support": "supported",
+    "how": "Stop monitors/follows for this run_id on terminal."
+  },
+  "terminal_summary": {
+    "support": "supported",
+    "how": "Terminal JSON / pipeline summary <run-id>."
+  }
+}
