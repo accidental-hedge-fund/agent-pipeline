@@ -957,7 +957,7 @@ Nested fields:
 #### `test_gate.non_product_dirty_globs`
 
 - **Type:** array of string
-- **Description:** Extra path globs treated as non-product scratch for format/test gate trust (#873). Unioned with the engine-known set (tasks/**, .pipeline-prompt-* at worktree root); does not replace product fail-closed defaults. Lockfiles remain fold targets, not scratch.
+- **Description:** Extra path globs treated as non-product scratch for format/test gate trust (#873). Unioned with the engine-known set (tasks/**, .pipeline-prompt-* at worktree root); does not replace product fail-closed defaults. Must not match product trees (core/, plugin/, openspec/) or repo-wide patterns (**). Lockfiles remain fold targets, not scratch.
 
 #### `test_gate.timeout`
 
