@@ -350,7 +350,11 @@ test("plan-revision private full repair loop is not reintroduced in planning.ts"
   assert.match(src, /plan-revision\.ack@1/);
   // The old private pattern re-assigned ackCheck after a single inline repair without the shared helper.
   // Guard: PLAN_REVISION_FORMAT_REPAIR_ADDENDUM must be a thin re-export, not a second copy of the loop.
-  assert.match(src, /PLAN_REVISION_FORMAT_REPAIR_ADDENDUM\s*=\s*PLAN_REVISION_ACK_REPAIR_ADDENDUM/);
+  // Prefer pure `export { X as Y } from` (avoids circular-import TDZ); still accept the older assignment form.
+  assert.match(
+    src,
+    /export\s*\{\s*PLAN_REVISION_ACK_REPAIR_ADDENDUM\s+as\s+PLAN_REVISION_FORMAT_REPAIR_ADDENDUM\s*\}\s*from\s*["'][^"']*stage-output-contract\.ts["']|PLAN_REVISION_FORMAT_REPAIR_ADDENDUM\s*=\s*PLAN_REVISION_ACK_REPAIR_ADDENDUM/,
+  );
 });
 
 test("shared format-repair budget constant is single-sourced at 1", () => {
