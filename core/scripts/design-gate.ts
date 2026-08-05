@@ -634,4 +634,33 @@ export function decodeDesignGateState(body: string): DesignGateState | null {
   }
 }
 
+/**
+ * True when `body` is a design-interrogation comment whose durable
+ * `design-gate-state` artifact is present, decodable, and terminal (nothing
+ * non-empty after the last marker line). Mirrors
+ * `isVerifiedPipelineReviewOutput`'s terminal-marker rule so challenge prose
+ * that trips NEGATION_PATTERNS cannot false-block review-1 as "unacknowledged
+ * human input" when the stage's own state artifact is intact (#784 recovery /
+ * #634-class design-gate false human-input).
+ *
+ * Current posts also carry a trailing `pipeline-attest` marker; those verify
+ * via attestation instead (this predicate returns false when anything follows
+ * the state marker). Pre-attestation / stale-install posts that end on a valid
+ * design-gate-state still verify here — the stage already trusts the same
+ * decode for crash/resume rehydration.
+ */
+export function isVerifiedDesignGateOutput(body: string): boolean {
+  if (!body.trimStart().startsWith(DESIGN_GATE_COMMENT_HEADING)) return false;
+  if (decodeDesignGateState(body) === null) return false;
+  DESIGN_GATE_ARTIFACT_RE.lastIndex = 0;
+  let lastMatch: RegExpExecArray | null = null;
+  let cur: RegExpExecArray | null;
+  while ((cur = DESIGN_GATE_ARTIFACT_RE.exec(body)) !== null) lastMatch = cur;
+  DESIGN_GATE_ARTIFACT_RE.lastIndex = 0;
+  if (lastMatch === null) return false;
+  // Terminal marker only — human content after the artifact fails closed.
+  if (body.slice(lastMatch.index + lastMatch[0].length).trim() !== "") return false;
+  return true;
+}
+
 export const DESIGN_GATE_COMMENT_HEADING = "## Design Interrogation";

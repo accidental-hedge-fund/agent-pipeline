@@ -60,14 +60,143 @@ const HOME = homedir();
 // pre-existing personal install that would shadow the plugin's /pipeline skill.
 const MANAGED_MARKER = ".pipeline-installer-managed";
 
-/** Host names accepted by --host (plus the pseudo-host `all`). */
-const VALID_HOSTS = ["claude", "codex", "grok", "opencode", "all"];
+// ---------------------------------------------------------------------------
+// Outer-host manifests (#784) — sole enumeration source for installable hosts.
+// Co-located JSON under hosts/<id>/outer-host.manifest.json; installer stays
+// dependency-light (node builtins only). Dispatch install actions by install
+// profile mode / commandsKind — never by host-name equality as the extension path.
+// ---------------------------------------------------------------------------
+
+/**
+ * Load all outer-host manifests from hosts/<id>/outer-host.manifest.json.
+ * Optional extraManifestPaths lets tests register a synthetic host without
+ * editing built-in host modules.
+ * @param {string} [repoRoot]
+ * @param {string[]} [extraManifestPaths]
+ */
+function loadOuterHostManifests(repoRoot = REPO_ROOT, extraManifestPaths = []) {
+  const hostsDir = join(repoRoot, "hosts");
+  const paths = [];
+  if (existsSync(hostsDir)) {
+    for (const ent of readdirSync(hostsDir, { withFileTypes: true })) {
+      if (!ent.isDirectory()) continue;
+      if (ent.name.startsWith("_") || ent.name.startsWith(".")) continue;
+      const p = join(hostsDir, ent.name, "outer-host.manifest.json");
+      if (existsSync(p)) paths.push(p);
+    }
+  }
+  for (const p of extraManifestPaths) {
+    if (existsSync(p)) paths.push(p);
+  }
+  const out = [];
+  for (const p of paths) {
+    const raw = JSON.parse(readFileSync(p, "utf8"));
+    if (!raw || typeof raw.id !== "string") {
+      throw new Error(`Invalid outer-host manifest (missing id): ${p}`);
+    }
+    if (raw.manifestVersion !== 1) {
+      throw new Error(
+        `Unsupported outer-host manifestVersion ${raw.manifestVersion} in ${p} (supported: 1)`,
+      );
+    }
+    out.push(raw);
+  }
+  return out;
+}
+
+/**
+ * Resolve an install base path from a manifest install.basePath profile.
+ * @param {object} basePath
+ */
+function resolveBaseFromProfile(basePath) {
+  const envKey = basePath?.env;
+  if (typeof envKey === "string" && envKey.trim()) {
+    const v = process.env[envKey.trim()];
+    if (typeof v === "string" && v.trim().length > 0) {
+      return resolve(v.trim());
+    }
+  }
+  const primary = join(HOME, ...(basePath.defaultHomeSegments || []));
+  if (existsSync(primary)) return primary;
+  const alt = basePath.alternateHomeSegments;
+  if (Array.isArray(alt) && alt.length > 0) {
+    const altPath = join(HOME, ...alt);
+    if (existsSync(altPath)) return altPath;
+  }
+  return primary;
+}
+
+/**
+ * Build runtime HOSTS map from manifests. Keys are host ids; values carry the
+ * same shape tests/historical install paths expect (label, profile, installMode,
+ * skillsDir, baseExists, commandsKind, …).
+ * @param {object[]} manifests
+ */
+function buildHostsFromManifests(manifests) {
+  /** @type {Record<string, object>} */
+  const hosts = {};
+  // Stable insertion by installOrder then id (deterministic VALID_HOSTS / --host all).
+  const sorted = [...manifests].sort((a, b) => {
+    const ao = a.install?.installOrder ?? 100;
+    const bo = b.install?.installOrder ?? 100;
+    if (ao !== bo) return ao - bo;
+    return String(a.id).localeCompare(String(b.id));
+  });
+  for (const m of sorted) {
+    const install = m.install || {};
+    const bp = install.basePath || { defaultHomeSegments: [] };
+    const skillsRel = install.skillsRelative || ["skills"];
+    const overlayRel = install.overlayDir || "";
+    hosts[m.id] = {
+      id: m.id,
+      label: m.displayName,
+      profile: m.profileDefault || m.id,
+      overlayDir: overlayRel ? join(REPO_ROOT, overlayRel) : join(REPO_ROOT, "hosts", m.id),
+      overlayFiles: [...(install.overlayFiles || [])],
+      overlayDirs: [...(install.overlayDirs || [])],
+      installMode: install.mode || "tree",
+      commandsKind: install.managedArtifacts?.commandsKind || "none",
+      extraScriptFiles: [...(install.managedArtifacts?.extraScriptFiles || [])],
+      userOwnedExclusion: install.userOwnedExclusion || "",
+      postInstall: install.postInstall || "",
+      installOrder: typeof install.installOrder === "number" ? install.installOrder : 100,
+      baseExists: () => existsSync(resolveBaseFromProfile(bp)),
+      baseDir: () => resolveBaseFromProfile(bp),
+      skillsDir: () => join(resolveBaseFromProfile(bp), ...skillsRel),
+      manifest: m,
+    };
+  }
+  return hosts;
+}
+
+/** Mutable registry of install-time hosts (tests may inject extras). */
+let HOSTS = buildHostsFromManifests(loadOuterHostManifests());
+
+/** Host names accepted by --host (plus the pseudo-host `all`). Derived from manifests. */
+function validHostsList() {
+  return [...Object.keys(HOSTS), "all"];
+}
+const VALID_HOSTS = validHostsList();
+
+/**
+ * Test / extension seam: re-load manifests including optional extra paths so a
+ * synthetic host appears without editing built-in host modules.
+ * @param {string[]} [extraManifestPaths]
+ */
+function reloadHostsFromManifests(extraManifestPaths = []) {
+  HOSTS = buildHostsFromManifests(loadOuterHostManifests(REPO_ROOT, extraManifestPaths));
+  // Keep VALID_HOSTS export array in sync (mutate in place for export binding).
+  VALID_HOSTS.length = 0;
+  for (const h of validHostsList()) VALID_HOSTS.push(h);
+  return HOSTS;
+}
 
 // ---------------------------------------------------------------------------
-// Host definitions
+// Base-path helpers (compat exports for tests + command install surfaces)
 // ---------------------------------------------------------------------------
 
 function claudeBase() {
+  if (HOSTS.claude) return HOSTS.claude.baseDir();
   return process.env.CLAUDE_CONFIG_DIR
     ? resolve(process.env.CLAUDE_CONFIG_DIR)
     : join(HOME, ".claude");
@@ -79,6 +208,7 @@ function claudeSkillDir() {
 }
 
 function grokBase() {
+  if (HOSTS.grok) return HOSTS.grok.baseDir();
   return join(HOME, ".grok");
 }
 
@@ -88,6 +218,7 @@ function grokBase() {
  * ignored — it is not a skills/commands tree root.
  */
 function opencodeBase() {
+  if (HOSTS.opencode) return HOSTS.opencode.baseDir();
   const override = process.env.OPENCODE_CONFIG_DIR;
   if (typeof override === "string" && override.trim().length > 0) {
     return resolve(override.trim());
@@ -104,6 +235,7 @@ function opencodeSkillDir() {
 // CLI) and ~/.agents/skills (newer docs). Honor CODEX_HOME first, then prefer
 // whichever base already exists, defaulting to ~/.codex.
 function codexSkillsDir() {
+  if (HOSTS.codex) return HOSTS.codex.skillsDir();
   if (process.env.CODEX_HOME) return join(resolve(process.env.CODEX_HOME), "skills");
   const codexHome = join(HOME, ".codex");
   if (existsSync(codexHome)) return join(codexHome, "skills");
@@ -111,63 +243,6 @@ function codexSkillsDir() {
   if (existsSync(agentsHome)) return join(agentsHome, "skills");
   return join(codexHome, "skills");
 }
-
-const HOSTS = {
-  claude: {
-    label: "Claude Code",
-    profile: "claude",
-    overlayDir: join(REPO_ROOT, "hosts", "claude"),
-    overlayFiles: ["SKILL.md"],
-    overlayDirs: [],
-    // Full tree install: stage core + host overlay into skillsDir/pipeline.
-    installMode: "tree",
-    baseExists: () => existsSync(claudeBase()),
-    skillsDir: () => join(claudeBase(), "skills"),
-    postInstall: "Invoke with /pipeline. Live-detected this session (no restart).",
-  },
-  codex: {
-    label: "Codex",
-    profile: "codex",
-    overlayDir: join(REPO_ROOT, "hosts", "codex"),
-    overlayFiles: ["SKILL.md"],
-    overlayDirs: ["agents"],
-    installMode: "tree",
-    baseExists: () => existsSync(dirname(codexSkillsDir())),
-    skillsDir: () => codexSkillsDir(),
-    postInstall: "Restart Codex to pick it up, then invoke with $pipeline.",
-  },
-  // Path materialization only: symlink to the Claude-managed skill (no hosts/grok
-  // overlay). Grok Build discovers skills under ~/.grok/skills/.
-  grok: {
-    label: "Grok Build",
-    profile: "claude",
-    overlayDir: join(REPO_ROOT, "hosts", "claude"),
-    overlayFiles: [],
-    overlayDirs: [],
-    installMode: "symlink-claude",
-    baseExists: () => existsSync(grokBase()),
-    skillsDir: () => join(grokBase(), "skills"),
-    postInstall:
-      "Skill path is a symlink to the Claude-managed install (no separate Grok SKILL.md). " +
-      "After a Claude skill update, re-run: node scripts/install.mjs install --host grok",
-  },
-  // Full tree host (#861): core + hosts/opencode overlay + launcher + native
-  // commands/pipeline.md. No Claude prerequisite (unlike Grok).
-  opencode: {
-    label: "OpenCode",
-    profile: "opencode",
-    overlayDir: join(REPO_ROOT, "hosts", "opencode"),
-    overlayFiles: ["SKILL.md"],
-    overlayDirs: [],
-    installMode: "tree",
-    baseExists: () => existsSync(opencodeBase()),
-    skillsDir: () => join(opencodeBase(), "skills"),
-    postInstall:
-      "Invoke with /pipeline (native command routes to the launcher). " +
-      "Skill path: " +
-      "<OPENCODE_CONFIG_DIR or ~/.config/opencode>/skills/pipeline. Restart OpenCode if commands do not appear live.",
-  },
-};
 
 // Whitelisted core payload (node_modules is intentionally excluded; the shim
 // or this installer provisions it via `npm ci`).
@@ -195,23 +270,25 @@ function parseArgs(argv) {
 
 function selectedHosts(hostArg) {
   if (hostArg === "all") {
-    // Prefer tree hosts (claude, codex, opencode) before grok so a combined
-    // install can materialize Claude first, then symlink Grok to it in the same
-    // run. OpenCode has no Claude prerequisite.
-    const order = ["claude", "codex", "opencode", "grok"];
+    // installOrder from manifests (tree hosts before symlink-claude consumers).
+    const order = Object.keys(HOSTS).sort(
+      (a, b) => (HOSTS[a].installOrder ?? 100) - (HOSTS[b].installOrder ?? 100),
+    );
     const present = order.filter((h) => HOSTS[h] && HOSTS[h].baseExists());
     if (present.length === 0) {
+      const known = Object.keys(HOSTS).join(", ");
       fail(
-        "No host detected (neither ~/.claude, ~/.codex, ~/.config/opencode, nor ~/.grok found). " +
-          "Pass --host claude, codex, grok, or opencode to force one. " +
-          "Grok requires a Claude skill install and materializes ~/.grok/skills/pipeline as a symlink to it.",
+        `No host detected among registered outer hosts (${known}). ` +
+          `Pass --host <id> to force one. ` +
+          `Grok requires a Claude skill install and materializes ~/.grok/skills/pipeline as a symlink to it.`,
       );
     }
     return present;
   }
   if (!HOSTS[hostArg]) {
+    const known = [...Object.keys(HOSTS), "all"].join(", ");
     fail(
-      `Unknown --host '${hostArg}'. Use claude, codex, grok, opencode, or all. ` +
+      `Unknown --host '${hostArg}'. Registered outer hosts: ${known}. ` +
         `Grok materializes ~/.grok/skills/pipeline → Claude skill (see README "Grok Build skill path"). ` +
         `OpenCode installs under ~/.config/opencode (or OPENCODE_CONFIG_DIR).`,
     );
@@ -638,12 +715,12 @@ function stageInto(stagingDir, host) {
   const materialFilterPath = join(scriptsDst, "material-filter.mjs");
   cpSync(join(REPO_ROOT, "hosts", "_shared", "material-filter.mjs"), materialFilterPath);
   chmodSync(materialFilterPath, 0o755);
-  // OpenCode argv-safe bridge (#861) — co-located with the launcher for the
-  // native commands/pipeline.md shell inject.
-  if (host === "opencode") {
-    const bridgeSrc = join(REPO_ROOT, "hosts", "opencode", "opencode-pipeline-bridge.mjs");
+  // Extra host scripts from install profile (e.g. OpenCode argv-safe bridge #861).
+  // Selected by managedArtifacts.extraScriptFiles — not host-name equality.
+  for (const extra of cfg.extraScriptFiles || []) {
+    const bridgeSrc = join(cfg.overlayDir, extra);
     if (existsSync(bridgeSrc)) {
-      const bridgeDst = join(scriptsDst, "opencode-pipeline-bridge.mjs");
+      const bridgeDst = join(scriptsDst, extra);
       cpSync(bridgeSrc, bridgeDst);
       chmodSync(bridgeDst, 0o755);
     }
@@ -651,6 +728,26 @@ function stageInto(stagingDir, host) {
   // Sentinel: written into staging so it lands atomically with the skill tree.
   // Future runs use this to distinguish an installer-managed dir from a personal one.
   writeFileSync(join(stagingDir, MANAGED_MARKER), "");
+}
+
+/**
+ * Install managed command surface from the host's commandsKind profile.
+ * Extension path is the declared kind, not a new host-name branch.
+ */
+function installCommandsForHost(host, dest, dryRun) {
+  const cfg = HOSTS[host];
+  const kind = cfg.commandsKind || "none";
+  if (kind === "claude-slash") installClaudeCommands(cfg.baseDir(), dryRun);
+  else if (kind === "codex-prompt") installCodexCommands(join(dest, "agents"), dryRun);
+  else if (kind === "opencode-native") installOpenCodeCommands(cfg.baseDir(), dryRun);
+}
+
+function uninstallCommandsForHost(host, dryRun) {
+  const cfg = HOSTS[host];
+  const kind = cfg.commandsKind || "none";
+  if (kind === "claude-slash") uninstallClaudeCommands(cfg.baseDir(), dryRun);
+  else if (kind === "opencode-native") uninstallOpenCodeCommands(cfg.baseDir(), dryRun);
+  // codex-prompt agents live under the skill tree and are removed with it.
 }
 
 /**
@@ -887,6 +984,7 @@ function installGrokHost(dryRun) {
 
 function installHost(host, dryRun) {
   const cfg = HOSTS[host];
+  // Dispatch by install *mode* from the outer-host profile (#784), not host name.
   if (cfg.installMode === "symlink-claude") {
     installGrokHost(dryRun);
     return;
@@ -897,9 +995,7 @@ function installHost(host, dryRun) {
   log(`→ ${cfg.label}: ${dest}`);
   if (dryRun) {
     log(`  (dry-run) would stage core + ${host} overlay, swap atomically, then npm ci in core/`);
-    if (host === "claude") installClaudeCommands(claudeBase(), true);
-    if (host === "codex") installCodexCommands(join(dest, "agents"), true);
-    if (host === "opencode") installOpenCodeCommands(opencodeBase(), true);
+    installCommandsForHost(host, dest, true);
     return;
   }
   mkdirSync(skillsDir, { recursive: true });
@@ -926,10 +1022,8 @@ function installHost(host, dryRun) {
   } else {
     warn("npm not found — dependencies will install on first run.");
   }
-  // Install the namespaced pipeline:<command> command/agent files for each host.
-  if (host === "claude") installClaudeCommands(claudeBase(), false);
-  if (host === "codex") installCodexCommands(join(dest, "agents"), false);
-  if (host === "opencode") installOpenCodeCommands(opencodeBase(), false);
+  // Managed command surface from install profile commandsKind (#784).
+  installCommandsForHost(host, dest, false);
   log(`  ✓ installed. ${cfg.postInstall}`);
 }
 
@@ -937,10 +1031,11 @@ function uninstallHost(host, dryRun) {
   const cfg = HOSTS[host];
   const dest = join(cfg.skillsDir(), "pipeline");
   const skillPresent = pathPresent(dest);
+  const kind = cfg.commandsKind || "none";
 
-  // Claude: always attempt command-file cleanup under the same base install uses,
-  // even when the skill tree is already gone (orphans from pre-#635 uninstalls).
-  if (host === "claude") {
+  // Hosts with external command dirs (claude-slash, opencode-native): always
+  // attempt command cleanup even when the skill tree is already gone.
+  if (kind === "claude-slash" || kind === "opencode-native") {
     if (!skillPresent) {
       log(`→ ${cfg.label}: nothing installed at ${dest}`);
     } else {
@@ -952,24 +1047,7 @@ function uninstallHost(host, dryRun) {
         log("  ✓ removed");
       }
     }
-    uninstallClaudeCommands(claudeBase(), dryRun);
-    return;
-  }
-
-  // OpenCode: skill tree + installer-owned commands/pipeline.md only (#861).
-  if (host === "opencode") {
-    if (!skillPresent) {
-      log(`→ ${cfg.label}: nothing installed at ${dest}`);
-    } else {
-      log(`→ ${cfg.label}: removing ${dest}`);
-      if (dryRun) {
-        log("  (dry-run) would rm -rf the skill directory");
-      } else {
-        rmSync(dest, { recursive: true, force: true });
-        log("  ✓ removed");
-      }
-    }
-    uninstallOpenCodeCommands(opencodeBase(), dryRun);
+    uninstallCommandsForHost(host, dryRun);
     return;
   }
 
@@ -980,7 +1058,7 @@ function uninstallHost(host, dryRun) {
   }
   log(`→ ${cfg.label}: removing ${dest}`);
 
-  // symlink-claude (Grok): only unlink an installer-owned symlink. Never
+  // symlink-claude: only unlink an installer-owned symlink. Never
   // recursively delete a copy-based layout or personal directory.
   if (cfg.installMode === "symlink-claude") {
     let st;
@@ -1473,6 +1551,10 @@ export {
   DEPS,
   HOSTS,
   VALID_HOSTS,
+  loadOuterHostManifests,
+  buildHostsFromManifests,
+  reloadHostsFromManifests,
+  resolveBaseFromProfile,
   checkLoopCoherence,
   detectPersonalSkill,
   uniqueBackupPath,

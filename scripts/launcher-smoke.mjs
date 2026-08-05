@@ -87,9 +87,17 @@ check("path --json exits 0 and emits valid JSON", () => {
     );
     // stub the full entry (it needs commander, which is absent), but copy the REAL
     // dependency-free discovery modules so `path` resolves without node_modules.
+    // outer-hosts/ is part of discovery's registry-driven enumeration (#784) and
+    // is also Node-builtin-only (no commander).
     writeFileSync(join(tmp, "core", "scripts", "pipeline.ts"), "// stub\n");
     copyFileSync(join(REPO_ROOT, "core", "scripts", "discovery.ts"), join(tmp, "core", "scripts", "discovery.ts"));
     copyFileSync(join(REPO_ROOT, "core", "scripts", "path-cli.ts"), join(tmp, "core", "scripts", "path-cli.ts"));
+    const { cpSync } = await import("node:fs");
+    cpSync(
+      join(REPO_ROOT, "core", "scripts", "outer-hosts"),
+      join(tmp, "core", "scripts", "outer-hosts"),
+      { recursive: true },
+    );
     // deliberately do NOT create core/node_modules
 
     check("no node_modules: path --json still exits 0 with valid discovery JSON", () => {

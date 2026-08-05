@@ -599,6 +599,22 @@ harnesses:
 
 Either key may be omitted — an omitted role keeps the active profile's default for that role only. `implementer` must name a harness with a registered adapter that declares the **implementer** role capability (built-ins: `claude`, `codex`, `grok`, `opencode`, `pi`, plus any IDs from `adapter_extensions` below). An unregistered implementer name is rejected at config-parse time, naming the key, the value, and the **currently registered** adapter IDs from the runtime registry, before any worktree is created. `reviewer` may name a registered adapter that declares the **reviewer** role, or an arbitrary custom reviewer CLI (compatibility path), same as the older `review_harness` key below.
 
+### Outer-host lifecycle contract (#784)
+
+The **outer host** is the session host that launches and supervises the pipeline
+(install path, skill/command surface, durable handoff, event follow, reattach,
+material notify, terminal cleanup/summary). It is **independent** of stage
+adapter ID, provider/auth class, model, effort, and implementer/reviewer role
+assignment. Built-in and third-party outer hosts register through the same
+public registry (`core/scripts/outer-hosts/`) using co-located
+`hosts/<id>/outer-host.manifest.json` files. Shared advance/loop orchestration
+consumes declared capabilities and never branches on host name strings for
+lifecycle behavior. Every capability has an explicit unsupported/fallback path;
+the portable baseline is stdout JSON + `events.jsonl`. Install/update/uninstall
+read managed paths from the install profile and preserve user-owned content.
+A shared conformance kit gates complete declarations. See also identity
+separation under adapter extensions below.
+
 ### Third-party adapter extensions (#783)
 
 Register additional local-CLI adapters without editing engine source via `adapter_extensions` — a list of module entry points (repo-relative path, absolute path, or package name). **Only listed entries load**; unconfigured packages are never auto-scanned from `node_modules`.
@@ -775,11 +791,20 @@ On each **material** progress line (shared material filter — see §4.c),
 service; do not gate stages on delivery. `events.jsonl` remains the
 complete evidence stream.
 
-| Host | Follow / surface | Material path |
+**Outer-host lifecycle contract (#784):** material-progress notify, handoff,
+event follow, reattach after cancelled wait, terminal cleanup, and terminal
+summary are declared on the active outer host's `outer-host.manifest.json`
+(capability `material_progress_notify` and peers). Shared orchestration
+selects steps from those declarations — not from host-name equality checks.
+Portable baseline is always stdout JSON + `events.jsonl` follow. Set
+`PIPELINE_OUTER_HOST=<id>` so run evidence records outer-host identity
+separately from implementer/reviewer adapter treatment.
+
+| Host (declared mapping) | Follow / surface | Material path |
 | --- | --- | --- |
-| **Claude** | Monitor on material-filtered events; call `PushNotification` on each material one-liner | This file's §4.c–d |
-| **Grok** | Host `monitor` on the same material-filtered command (each stdout line = chat bubble). **Never** require Claude `PushNotification` | **Grok substitute** below |
-| **Codex** | Poll/follow material stream; concise chat/status updates (no Claude-only tools) | `hosts/codex/SKILL.md` |
+| **Claude** (`claude_monitor_push`) | Monitor on material-filtered events; call `PushNotification` on each material one-liner | This file's §4.c–d |
+| **Grok** (`grok_monitor_lines`) | Host `monitor` on the same material-filtered command (each stdout line = chat bubble). **Never** require Claude `PushNotification` | **Grok substitute** below |
+| **Codex** (`codex_chat_status`) | Poll/follow material stream; concise chat/status updates (no Claude-only tools) | `hosts/codex/SKILL.md` |
 
 **Grok substitute** (when this Claude overlay is the installed/symlink path Grok
 loads — first-class `--host grok` is #731): use host **`monitor`** (or

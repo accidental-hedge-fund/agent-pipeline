@@ -194,6 +194,32 @@ test("initRunDir: creates run dir, writes run.json with all required fields, eve
   assert.equal(events.run_id, runId);
   assert.equal(events.issue, ISSUE);
   assert.equal(events.repo, "owner/repo");
+  // outer_host omitted when not provided (#784)
+  assert.equal(meta.outer_host, undefined);
+  assert.equal(events.outer_host, undefined);
+});
+
+test("initRunDir: records outer_host separately from profile (#784)", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  await initRunDir(
+    {
+      runDir: RUN_DIR,
+      runId,
+      issue: ISSUE,
+      repo: "owner/repo",
+      profile: "codex",
+      startedAt: STARTED_AT_ISO,
+      outerHost: "opencode",
+    },
+    deps,
+  );
+  const meta = JSON.parse(readFile(RUN_JSON));
+  const events = JSON.parse(readFile(EVENTS_JSONL).trim());
+  assert.equal(meta.outer_host, "opencode");
+  assert.equal(meta.profile, "codex");
+  assert.notEqual(meta.outer_host, meta.profile);
+  assert.equal(events.outer_host, "opencode");
 });
 
 test("initRunDir: creates an empty terminal.log up front so `logs --follow` has a file to tail (#155)", async () => {

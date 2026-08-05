@@ -1,0 +1,70 @@
+{
+  "manifestVersion": 1,
+  "id": "commands-dir-null-entry",
+  "displayName": "Commands Dir Null Entry",
+  "origin": "extension",
+  "install": {
+    "support": "supported",
+    "mode": "tree",
+    "basePath": {
+      "defaultHomeSegments": [".commands-dir-null"]
+    },
+    "skillsRelative": ["skills"],
+    "skillDirName": "pipeline",
+    "overlayDir": "",
+    "overlayFiles": [],
+    "overlayDirs": [],
+    "managedArtifacts": {
+      "skillTree": true,
+      "commandsGlob": "pipeline:*.md",
+      "commandsDirRelative": [null],
+      "commandsKind": "claude-slash"
+    },
+    "userOwnedExclusion": "managed only",
+    "postInstall": "n/a",
+    "installOrder": 910
+  },
+  "invocation": {
+    "support": "supported",
+    "skillPathHint": "~/.commands-dir-null/skills/pipeline",
+    "commandSurface": "/pipeline",
+    "discoveryProbe": "n/a",
+    "discovery": { "kind": "skill_path" }
+  },
+  "early_run_handoff": {
+    "support": "supported",
+    "how": "handoff"
+  },
+  "event_follow": {
+    "support": "supported",
+    "how": "follow"
+  },
+  "reattach": {
+    "support": "supported",
+    "how": "reattach"
+  },
+  "wait_cancel": {
+    "support": "supported",
+    "classification": "non_terminal",
+    "recovery": "reattach_or_portable_follow",
+    "how": "non-terminal"
+  },
+  "material_progress_notify": {
+    "support": "supported",
+    "how": "stdout",
+    "mapping": {
+      "surface": "stdout_only",
+      "tools": [],
+      "filter": "scripts/material-filter.mjs"
+    },
+    "fallback": "stdout events.jsonl"
+  },
+  "terminal_cleanup": {
+    "support": "supported",
+    "how": "stop"
+  },
+  "terminal_summary": {
+    "support": "supported",
+    "how": "summary"
+  }
+}

@@ -4,6 +4,9 @@
 // `claude` / `codex` host CLIs are reachable, then derives a four-state
 // hostCoverage value that Pipeline Desk (or any integrator) can act on
 // without parsing prose output.
+//
+// #784: completeness-oriented host listing comes from the outer-host registry
+// (or an injectable list). Legacy `hostCoverage` remains Claude/Codex-only.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -11,6 +14,15 @@ import * as os from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import {
+  ensureBuiltinOuterHostsRegistered,
+  registeredOuterHostIds,
+  resolveOuterHost as resolveOuterHostDefault,
+} from "./outer-hosts/index.ts";
+import type {
+  OuterHostDiscoveryProbeSpec,
+  OuterHostManifest,
+} from "./outer-hosts/types.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -30,6 +42,14 @@ export type OpenCodeHostEntry = HostEntry & {
   skillPath: string | null;
 };
 
+/** Generic registry-driven host entry for completeness listings (#784). */
+export type RegistryHostEntry = HostEntry & {
+  /** When known (e.g. managed skill install path). */
+  skillPath?: string | null;
+  /** Outer-host display name when known. */
+  displayName?: string;
+};
+
 export type HostCoverage = "missing" | "claude-only" | "codex-only" | "both";
 
 export type DiscoveryResult = {
@@ -41,7 +61,18 @@ export type DiscoveryResult = {
     codex: HostEntry;
     /** Additive OpenCode reporting — never changes hostCoverage meanings. */
     opencode: OpenCodeHostEntry;
+    /**
+     * Index signature for registry-registered hosts beyond the legacy trio.
+     * Completeness listings iterate registry ids; synthetic hosts appear here
+     * in tests without editing a built-in-only name table.
+     */
+    [hostId: string]: HostEntry | OpenCodeHostEntry | RegistryHostEntry;
   };
+  /**
+   * Ordered outer-host ids from the runtime registry (completeness source).
+   * Additive (#784) — does not replace hostCoverage.
+   */
+  registeredOuterHosts?: string[];
 };
 
 /** IO seam for unit tests — override probes without touching the filesystem. */
@@ -51,6 +82,25 @@ export type DiscoverHostsDeps = {
   readVersion: (corePath: string) => Promise<string | null>;
   /** Optional seam for OpenCode skill path probe (#861). */
   probeOpenCodeSkill?: () => Promise<string | null>;
+  /**
+   * Optional seam for registry-driven host id enumeration (#784).
+   * Defaults to the outer-host runtime registry.
+   */
+  listOuterHostIds?: () => string[];
+  /**
+   * Resolve an outer-host manifest for manifest-driven discovery probes (#784).
+   * Defaults to the outer-host runtime registry.
+   */
+  resolveOuterHost?: (id: string) => OuterHostManifest | null;
+  /**
+   * True when a skill path exists as a directory or symlink (including a
+   * dangling symlink — matches `test -L || test -d`). Injectable for tests.
+   */
+  skillPathPresent?: (absPath: string) => boolean;
+  /** Home directory for install base-path resolution. Defaults to os.homedir(). */
+  homeDir?: () => string;
+  /** Env lookup for install.basePath.env overrides. Defaults to process.env. */
+  envGet?: (key: string) => string | undefined;
 };
 
 // ---------------------------------------------------------------------------
@@ -162,6 +212,95 @@ async function readVersionDefault(corePath: string): Promise<string | null> {
   }
 }
 
+/** True when path is a directory or symlink (dangling symlink counts). */
+export function skillPathPresentDefault(absPath: string): boolean {
+  try {
+    const st = fs.lstatSync(absPath);
+    return st.isDirectory() || st.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the managed skill install path from a host's install profile.
+ * Mirrors install.mjs base-path resolution (env override → defaultHomeSegments
+ * → alternateHomeSegments when primary is absent). Prefers the first candidate
+ * whose skill path (or base) is present so a valid alternate-path install
+ * (e.g. Codex `~/.agents/skills/pipeline`) is not reported unavailable.
+ * Pure aside from home/env/exists seams.
+ */
+export function resolveManifestSkillPath(
+  manifest: OuterHostManifest,
+  deps: {
+    homeDir: () => string;
+    envGet: (key: string) => string | undefined;
+    /**
+     * True when a path exists as a directory or symlink. Defaults to
+     * skillPathPresentDefault. Used for primary-vs-alternate base selection.
+     */
+    pathPresent?: (absPath: string) => boolean;
+  },
+): string {
+  const bp = manifest.install.basePath;
+  const skillTail = [
+    ...(manifest.install.skillsRelative ?? []),
+    manifest.install.skillDirName ?? "pipeline",
+  ];
+  const pathPresent = deps.pathPresent ?? skillPathPresentDefault;
+  const skillUnder = (base: string) => path.join(base, ...skillTail);
+
+  const envKey = typeof bp.env === "string" ? bp.env.trim() : "";
+  const envVal = envKey ? deps.envGet(envKey)?.trim() : "";
+  if (envVal) {
+    return skillUnder(path.resolve(envVal));
+  }
+
+  const primaryBase = path.join(deps.homeDir(), ...bp.defaultHomeSegments);
+  const bases: string[] = [primaryBase];
+  const alt = bp.alternateHomeSegments;
+  if (Array.isArray(alt) && alt.length > 0) {
+    bases.push(path.join(deps.homeDir(), ...alt));
+  }
+
+  // Prefer the first candidate whose skill install is present (valid alternate
+  // install must not false-negative when primary base is missing).
+  for (const base of bases) {
+    const skill = skillUnder(base);
+    if (pathPresent(skill)) return skill;
+  }
+  // Mirror install.mjs: first existing base wins when no skill is present yet.
+  for (const base of bases) {
+    if (pathPresent(base)) return skillUnder(base);
+  }
+  return skillUnder(primaryBase);
+}
+
+/** Normalize a manifest discovery probe (defaults whichCommand to host id). */
+export function normalizeDiscoveryProbe(
+  hostId: string,
+  discovery: OuterHostDiscoveryProbeSpec | undefined | null,
+): OuterHostDiscoveryProbeSpec {
+  if (!discovery || typeof discovery !== "object") {
+    // Fail closed for unknown shapes: skill_path-only would false-negative CLI
+    // hosts; which-only false-negatives Grok. Prefer skill_path when the
+    // install profile exists (extensions often ship skill trees without a
+    // same-named CLI). Callers without a probe still get skill_path.
+    return { kind: "skill_path" };
+  }
+  const kind = discovery.kind;
+  if (kind === "which" || kind === "which_or_skill_path") {
+    return {
+      kind,
+      whichCommand:
+        typeof discovery.whichCommand === "string" && discovery.whichCommand.trim()
+          ? discovery.whichCommand.trim()
+          : hostId,
+    };
+  }
+  return { kind: "skill_path" };
+}
+
 const defaultDeps: DiscoverHostsDeps = {
   which: whichDefault,
   probeCandidates: probeCandidatesDefault,
@@ -186,6 +325,23 @@ export async function discoverHosts(
   deps: DiscoverHostsDeps = defaultDeps,
 ): Promise<DiscoveryResult> {
   const probeOpenCode = deps.probeOpenCodeSkill ?? (async () => null);
+  const listIds =
+    deps.listOuterHostIds ??
+    (() => {
+      ensureBuiltinOuterHostsRegistered();
+      return registeredOuterHostIds();
+    });
+  const resolveHost =
+    deps.resolveOuterHost ??
+    ((id: string) => {
+      ensureBuiltinOuterHostsRegistered();
+      return resolveOuterHostDefault(id);
+    });
+  const skillPresent = deps.skillPathPresent ?? skillPathPresentDefault;
+  const homeDir = deps.homeDir ?? (() => os.homedir());
+  const envGet = deps.envGet ?? ((key: string) => process.env[key]);
+  const pathDeps = { homeDir, envGet };
+
   const [corePath, claudeBin, codexBin, opencodeBin, opencodeSkill] = await Promise.all([
     deps.probeCandidates(),
     deps.which("claude"),
@@ -212,19 +368,73 @@ export async function discoverHosts(
     hostCoverage = "both";
   }
 
+  const hosts: DiscoveryResult["hosts"] = {
+    claude: { available: claudeAvailable, cliBin: claudeBin },
+    codex: { available: codexAvailable, cliBin: codexBin },
+    opencode: {
+      available: opencodeSkill !== null,
+      cliBin: opencodeBin,
+      skillPath: opencodeSkill,
+    },
+  };
+
+  // Registry-driven completeness: every registered outer host appears under
+  // hosts (additive entries for ids beyond the legacy trio). Synthetic hosts
+  // in tests inject via listOuterHostIds without editing built-in modules.
+  // Availability is resolved from the manifest's typed discovery probe — never
+  // assumed to be `which <host-id>` (#784 / Grok skill-path install).
+  const registeredOuterHosts = listIds();
+  for (const id of registeredOuterHosts) {
+    if (hosts[id]) continue;
+    const manifest = resolveHost(id);
+    if (!manifest) {
+      // No manifest: do not invent availability from a same-named CLI.
+      hosts[id] = {
+        available: false,
+        cliBin: null,
+        skillPath: null,
+      };
+      continue;
+    }
+
+    const probe = normalizeDiscoveryProbe(id, manifest.invocation?.discovery);
+    const skillAbs = resolveManifestSkillPath(manifest, {
+      ...pathDeps,
+      pathPresent: skillPresent,
+    });
+    const skillOk = skillPresent(skillAbs);
+    const skillPath = skillOk ? skillAbs : null;
+
+    let cliBin: string | null = null;
+    if (probe.kind === "which" || probe.kind === "which_or_skill_path") {
+      const cmd = probe.whichCommand ?? id;
+      cliBin = await deps.which(cmd);
+    }
+
+    let available: boolean;
+    if (probe.kind === "which") {
+      available = cliBin !== null;
+    } else if (probe.kind === "skill_path") {
+      available = skillOk;
+    } else {
+      // which_or_skill_path
+      available = cliBin !== null || skillOk;
+    }
+
+    hosts[id] = {
+      available,
+      cliBin,
+      skillPath,
+      displayName: manifest.displayName,
+    };
+  }
+
   return {
     corePath,
     version,
     hostCoverage,
-    hosts: {
-      claude: { available: claudeAvailable, cliBin: claudeBin },
-      codex: { available: codexAvailable, cliBin: codexBin },
-      opencode: {
-        available: opencodeSkill !== null,
-        cliBin: opencodeBin,
-        skillPath: opencodeSkill,
-      },
-    },
+    hosts,
+    registeredOuterHosts,
   };
 }
 
@@ -244,11 +454,23 @@ export function formatDiscovery(result: DiscoveryResult, asJson: boolean): strin
   ];
   // Additive OpenCode line (#861) — never part of hostCoverage.
   if (result.hosts.opencode) {
-    const oc = result.hosts.opencode;
+    const oc = result.hosts.opencode as OpenCodeHostEntry;
     const detail = oc.available
       ? `yes${oc.skillPath ? ` (${oc.skillPath})` : ""}${oc.cliBin ? ` cli=${oc.cliBin}` : ""}`
       : "no";
     lines.push(`  opencode: ${detail}`);
+  }
+  // Registry-driven extras (#784) beyond the legacy Claude/Codex/OpenCode lines.
+  const printed = new Set(["claude", "codex", "opencode"]);
+  for (const id of result.registeredOuterHosts ?? Object.keys(result.hosts)) {
+    if (printed.has(id)) continue;
+    const entry = result.hosts[id];
+    if (!entry) continue;
+    const skill =
+      "skillPath" in entry && entry.skillPath ? ` (${entry.skillPath})` : "";
+    lines.push(
+      `  ${id}: ${entry.available ? `yes${skill}${entry.cliBin ? ` cli=${entry.cliBin}` : ""}` : "no"}`,
+    );
   }
   return lines.join("\n");
 }

@@ -94,6 +94,11 @@ export interface RunStartEvent extends RunEventBase {
   run_id: RunId;
   issue: number;
   repo: string;
+  /**
+   * Outer-host session identity when known (#784). Independent of implementer
+   * / reviewer adapter treatment identity. Omitted when unknown.
+   */
+  outer_host?: string;
 }
 export interface RunCompleteEvent extends RunEventBase {
   type: "run_complete";
@@ -819,6 +824,12 @@ export interface RunMeta {
   /** Omitted when the engine identity cannot be resolved at run-directory
    *  creation (e.g. missing/malformed package.json) — the run still starts. */
   engine?: RunEngineIdentity;
+  /**
+   * Outer-host session identity (#784). Separate from implementer/reviewer
+   * treatment (adapter) identity. Omitted when unknown rather than invented
+   * from adapter id.
+   */
+  outer_host?: string;
 }
 
 export interface InitRunDirOpts {
@@ -829,6 +840,8 @@ export interface InitRunDirOpts {
   profile: string | null;
   startedAt: string;
   engine?: RunEngineIdentity;
+  /** Outer-host id when known (#784). Never invent from adapter id. */
+  outerHost?: string | null;
 }
 
 /** Create the run directory, write run.json, append run_start to events.jsonl.
@@ -853,6 +866,10 @@ export async function initRunDir(
       // ENOENT → first initialization, continue below
     }
 
+    const outerHost =
+      typeof opts.outerHost === "string" && opts.outerHost.trim()
+        ? opts.outerHost.trim()
+        : undefined;
     const meta: RunMeta = {
       schema_version: RUN_SCHEMA_VERSION,
       run_id: opts.runId,
@@ -861,6 +878,7 @@ export async function initRunDir(
       profile: opts.profile,
       started_at: opts.startedAt,
       ...(opts.engine ? { engine: opts.engine } : {}),
+      ...(outerHost ? { outer_host: outerHost } : {}),
     };
     await deps.writeFile(
       path.join(opts.runDir, "run.json"),
@@ -880,6 +898,7 @@ export async function initRunDir(
       run_id: opts.runId,
       issue: opts.issue,
       repo: opts.repo,
+      ...(outerHost ? { outer_host: outerHost } : {}),
     };
     await appendEvent(opts.runDir, event, deps);
   } catch (err) {

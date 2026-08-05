@@ -111,6 +111,15 @@ npx -y github:accidental-hedge-fund/agent-pipeline#v1.29.1 install --host claude
 
 The bare commands track the **latest** default branch; add `#<tag>` to pin a release. The pipeline is **cross-harness** regardless of which host you install — `--host claude` only controls where the skill lands; the *other* harness's CLI is still required for review.
 
+**Outer-host lifecycle (#784):** installable hosts are declared by co-located
+`hosts/<id>/outer-host.manifest.json` files (install mode, skill/command surface,
+handoff/follow/reattach/notify/cleanup/summary capabilities). The installer and
+discovery enumerate those manifests rather than a closed host-name table. Shared
+orchestration consumes declared capabilities; portable baseline is stdout JSON +
+`events.jsonl`. Set `PIPELINE_OUTER_HOST=<id>` so run evidence records outer-host
+identity separately from implementer/reviewer adapter treatment. See
+`core/scripts/outer-hosts/` and the OpenSpec change `outer-host-lifecycle-contract`.
+
 Or clone and run directly:
 
 ```bash

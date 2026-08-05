@@ -103,8 +103,12 @@ import {
  * Plan-revision format-repair addendum (#658 / #777).
  * Thin re-export of the contract-owned text — the shared format-repair policy
  * owns the retry budget; stages must not reimplement a private full repair loop.
+ *
+ * Pure `export { … as … } from` (not `export const X = Y`) so a circular import
+ * graph cannot TDZ-fault when stage-output-contract is still evaluating
+ * (review-parsing → design-gate → review-policy → review-history → planning).
  */
-export const PLAN_REVISION_FORMAT_REPAIR_ADDENDUM = PLAN_REVISION_ACK_REPAIR_ADDENDUM;
+export { PLAN_REVISION_ACK_REPAIR_ADDENDUM as PLAN_REVISION_FORMAT_REPAIR_ADDENDUM } from "../stage-output-contract.ts";
 
 type BlockedOutcome = Extract<Outcome, { advanced: false; status: "blocked" }>;
 
@@ -742,7 +746,7 @@ export async function runPlanningPhases(
         console.warn(
           `[pipeline] #${issueNumber}: plan-revision ack contract failed; attempting one format-repair re-prompt`,
         );
-        const repairPrompt = `${revisionPrompt}\n\n${PLAN_REVISION_FORMAT_REPAIR_ADDENDUM}`;
+        const repairPrompt = `${revisionPrompt}\n\n${PLAN_REVISION_ACK_REPAIR_ADDENDUM}`;
         const repairResult = await invokeRevisionOnce(repairPrompt);
         if (!repairResult.success) {
           const reason = repairResult.timed_out

@@ -1,0 +1,74 @@
+{
+  "manifestVersion": 1,
+  "id": "opencode",
+  "displayName": "OpenCode",
+  "profileDefault": "opencode",
+  "origin": "builtin",
+  "install": {
+    "support": "supported",
+    "mode": "tree",
+    "basePath": {
+      "env": "OPENCODE_CONFIG_DIR",
+      "defaultHomeSegments": [".config", "opencode"],
+      "skillsUnderBase": true
+    },
+    "skillsRelative": ["skills"],
+    "skillDirName": "pipeline",
+    "overlayDir": "hosts/opencode",
+    "overlayFiles": ["SKILL.md"],
+    "overlayDirs": [],
+    "managedArtifacts": {
+      "skillTree": true,
+      "commandsGlob": "pipeline.md",
+      "commandsDirRelative": ["commands"],
+      "commandsKind": "opencode-native",
+      "extraScriptFiles": ["opencode-pipeline-bridge.mjs"]
+    },
+    "userOwnedExclusion": "Only managed pipeline skill tree and commands/pipeline.md are removed on uninstall. Unrelated user commands and files under the OpenCode config dir are preserved. OPENCODE_CONFIG (single file path) is never used as a base.",
+    "postInstall": "Invoke with /pipeline (native command routes to the launcher). Skill path: <OPENCODE_CONFIG_DIR or ~/.config/opencode>/skills/pipeline. Restart OpenCode if commands do not appear live.",
+    "installOrder": 30
+  },
+  "invocation": {
+    "support": "supported",
+    "skillPathHint": "~/.config/opencode/skills/pipeline",
+    "commandSurface": "/pipeline",
+    "discoveryProbe": "which opencode; skill marker under OPENCODE_CONFIG_DIR or ~/.config/opencode",
+    "discovery": { "kind": "which_or_skill_path", "whichCommand": "opencode" }
+  },
+  "early_run_handoff": {
+    "support": "supported",
+    "how": "Parse durable run handoff JSON from launcher stdout for run_id and events path."
+  },
+  "event_follow": {
+    "support": "supported",
+    "how": "pipeline logs <run-id> --events --follow until terminal."
+  },
+  "reattach": {
+    "support": "supported",
+    "how": "Re-arm event follow after cancelled wait; cancelled wait is not terminal."
+  },
+  "wait_cancel": {
+    "support": "supported",
+    "classification": "non_terminal",
+    "recovery": "reattach_or_portable_follow",
+    "how": "Cancelled wait is non-terminal; re-follow events until terminal."
+  },
+  "material_progress_notify": {
+    "support": "limited",
+    "how": "Prefer material-filtered events.jsonl observation; host-native notify is limited.",
+    "mapping": {
+      "surface": "stdout_only",
+      "tools": [],
+      "filter": "scripts/material-filter.mjs"
+    },
+    "fallback": "stdout material lines via events.jsonl + material-filter.mjs (portable baseline)"
+  },
+  "terminal_cleanup": {
+    "support": "supported",
+    "how": "Stop follows for this run_id on terminal."
+  },
+  "terminal_summary": {
+    "support": "supported",
+    "how": "Terminal JSON / pipeline summary <run-id>."
+  }
+}

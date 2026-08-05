@@ -1,0 +1,69 @@
+{
+  "manifestVersion": 1,
+  "id": "incomplete-synth",
+  "displayName": "Incomplete Synthetic Host",
+  "origin": "extension",
+  "install": {
+    "support": "supported",
+    "mode": "tree",
+    "basePath": {
+      "defaultHomeSegments": [".incomplete"]
+    },
+    "skillsRelative": ["skills"],
+    "skillDirName": "pipeline",
+    "overlayDir": "",
+    "overlayFiles": [],
+    "overlayDirs": [],
+    "managedArtifacts": {
+      "skillTree": true,
+      "commandsGlob": null,
+      "commandsDirRelative": null,
+      "commandsKind": "none"
+    },
+    "userOwnedExclusion": "Only managed skill tree removed.",
+    "postInstall": "n/a",
+    "installOrder": 999
+  },
+  "invocation": {
+    "support": "supported",
+    "skillPathHint": "~/.incomplete/skills/pipeline",
+    "commandSurface": "/pipeline",
+    "discoveryProbe": "n/a",
+    "discovery": { "kind": "skill_path" }
+  },
+  "early_run_handoff": {
+    "support": "unsupported",
+    "how": "none"
+  },
+  "event_follow": {
+    "support": "supported",
+    "how": "events.jsonl follow"
+  },
+  "reattach": {
+    "support": "supported",
+    "how": "re-arm"
+  },
+  "wait_cancel": {
+    "support": "supported",
+    "classification": "non_terminal",
+    "recovery": "reattach_or_portable_follow",
+    "how": "non-terminal"
+  },
+  "material_progress_notify": {
+    "support": "supported",
+    "how": "notify",
+    "mapping": {
+      "surface": "stdout_only",
+      "tools": [],
+      "filter": "scripts/material-filter.mjs"
+    }
+  },
+  "terminal_cleanup": {
+    "support": "supported",
+    "how": "stop follows"
+  },
+  "terminal_summary": {
+    "support": "supported",
+    "how": "summary"
+  }
+}

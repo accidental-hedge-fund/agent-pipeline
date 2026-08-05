@@ -460,6 +460,15 @@ harnesses:
 
 Either key may be omitted — an omitted role keeps the active profile's default for that role only. `implementer` must name a harness with a registered adapter that declares the **implementer** role capability (built-ins: `claude`, `codex`, `grok`, `opencode`, `pi`, plus any IDs from `adapter_extensions` below). An unregistered implementer name is rejected at config-parse time, naming the key, the value, and the **currently registered** adapter IDs from the runtime registry, before any worktree is created. `reviewer` may name a registered adapter that declares the **reviewer** role, or an arbitrary custom reviewer CLI (compatibility path), same as the older `review_harness` key below.
 
+### Outer-host lifecycle contract (#784)
+
+The **outer host** (this Codex skill session) is independent of stage adapter
+ID, provider, model, effort, and role. Lifecycle capabilities (install, handoff,
+follow, reattach, material notify, terminal cleanup/summary) live on
+`hosts/<id>/outer-host.manifest.json` and the runtime outer-host registry —
+not solely in profile JSON. Shared orchestration consumes declared capabilities
+without host-name branching. See `core/scripts/outer-hosts/`.
+
 ### Third-party adapter extensions (#783)
 
 Register additional local-CLI adapters without editing engine source via `adapter_extensions` — a list of module entry points (repo-relative path, absolute path, or package name). **Only listed entries load**; unconfigured packages are never auto-scanned from `node_modules`.
@@ -549,11 +558,18 @@ On each **material** progress line (shared material filter — see §4.c),
 do not gate stages on delivery. `events.jsonl` remains the complete evidence
 stream. **Codex never requires Claude `PushNotification`.**
 
-| Host | Follow / surface | Material path |
+**Outer-host lifecycle contract (#784):** notify/handoff/follow/reattach/cleanup
+come from the active outer host's `outer-host.manifest.json` capability
+declarations (`material_progress_notify`, etc.), not host-name switches in
+shared orchestration. Portable baseline: stdout + `events.jsonl`. Set
+`PIPELINE_OUTER_HOST=codex` so run evidence records outer-host identity
+separately from implementer/reviewer adapter treatment.
+
+| Host (declared mapping) | Follow / surface | Material path |
 | --- | --- | --- |
-| **Claude** | Monitor + `PushNotification` on material one-liners | `hosts/claude/SKILL.md` |
-| **Grok** | Host `monitor` on material-filtered stream (each line = bubble); no `PushNotification` | Claude overlay Grok substitute / future `hosts/grok` (#731) |
-| **Codex** | Poll/follow material stream; **concise chat/status updates** on each material line | This file's §4.c–d |
+| **Claude** (`claude_monitor_push`) | Monitor + `PushNotification` on material one-liners | `hosts/claude/SKILL.md` |
+| **Grok** (`grok_monitor_lines`) | Host `monitor` on material-filtered stream (each line = bubble); no `PushNotification` | Claude overlay Grok substitute / `hosts/grok` |
+| **Codex** (`codex_chat_status`) | Poll/follow material stream; **concise chat/status updates** on each material line | This file's §4.c–d |
 
 Re-arm material follow after wait cancel until `loop_run_complete` / `loop_run_stopped`
 (full re-attach semantics: #725). Dual-follow density demotion remains #611.

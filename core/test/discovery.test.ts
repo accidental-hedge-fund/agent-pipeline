@@ -10,7 +10,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { discoverHosts, type DiscoverHostsDeps, type DiscoveryResult } from "../scripts/discovery.ts";
+import {
+  discoverHosts,
+  resolveManifestSkillPath,
+  type DiscoverHostsDeps,
+  type DiscoveryResult,
+} from "../scripts/discovery.ts";
 import { handlePathSubcommand, type PathSubcommandDeps } from "../scripts/pipeline.ts";
 import type { CliOpts } from "../scripts/pipeline.ts";
 
@@ -24,6 +29,9 @@ function makeDeps(overrides: Partial<DiscoverHostsDeps>): DiscoverHostsDeps {
     probeCandidates: async () => null,
     readVersion: async () => null,
     probeOpenCodeSkill: async () => null,
+    // Default tests pin the legacy trio so hostCoverage cases stay focused;
+    // registry-driven completeness is covered in a dedicated #784 test.
+    listOuterHostIds: () => ["claude", "codex", "opencode"],
     ...overrides,
   };
 }
@@ -357,4 +365,279 @@ test("handlePathSubcommand human-readable: prints core path and coverage", async
 test("VERSION export is still a semver string (detach/discovery imports do not break it)", async () => {
   const { VERSION } = await import("../scripts/pipeline.ts");
   assert.match(VERSION, /^\d+\.\d+\.\d+/);
+});
+
+// ---------------------------------------------------------------------------
+// 7. Outer-host registry enumeration (#784)
+// ---------------------------------------------------------------------------
+
+test("discoverHosts: registry-driven listing includes synthetic host without built-in table edit (#784)", async () => {
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      which: async (cmd) => (cmd === "claude" || cmd === "codex" ? `/usr/bin/${cmd}` : null),
+      listOuterHostIds: () => ["claude", "codex", "opencode", "synth-third-party"],
+    }),
+  );
+  assert.equal(result.hostCoverage, "both", "legacy hostCoverage must stay Claude/Codex-only");
+  assert.ok(result.registeredOuterHosts?.includes("synth-third-party"));
+  assert.ok(result.hosts["synth-third-party"], "synthetic host must appear in hosts map");
+  assert.equal(result.hosts["synth-third-party"].available, false);
+  assert.equal(result.hosts["synth-third-party"].cliBin, null);
+});
+
+test("discoverHosts: extra registered hosts do not redefine hostCoverage enum (#784)", async () => {
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      which: async (cmd) => (cmd === "claude" ? "/usr/bin/claude" : null),
+      listOuterHostIds: () => ["claude", "codex", "grok", "opencode", "synth-x"],
+    }),
+  );
+  assert.equal(result.hostCoverage, "claude-only");
+  assert.ok(result.hosts.grok || result.registeredOuterHosts?.includes("grok"));
+});
+
+// ---------------------------------------------------------------------------
+// 8. Manifest-driven discovery probes (#784) — skill_path vs which <host-id>
+// ---------------------------------------------------------------------------
+
+const GROK_MANIFEST_MIN = {
+  manifestVersion: 1,
+  id: "grok",
+  displayName: "Grok Build",
+  origin: "builtin" as const,
+  install: {
+    support: "supported" as const,
+    mode: "symlink-claude" as const,
+    basePath: { env: null, defaultHomeSegments: [".grok"] as const },
+    skillsRelative: ["skills"] as const,
+    skillDirName: "pipeline",
+    overlayDir: "hosts/claude",
+    overlayFiles: [] as const,
+    overlayDirs: [] as const,
+    managedArtifacts: {
+      skillTree: true,
+      commandsGlob: null,
+      commandsDirRelative: null,
+      commandsKind: "none" as const,
+    },
+    userOwnedExclusion: "symlink only",
+    postInstall: "n/a",
+    installOrder: 40,
+  },
+  invocation: {
+    support: "supported" as const,
+    skillPathHint: "~/.grok/skills/pipeline",
+    commandSurface: "pipeline skill",
+    discoveryProbe: "test -L ~/.grok/skills/pipeline || test -d ~/.grok/skills/pipeline",
+    discovery: { kind: "skill_path" as const },
+  },
+  early_run_handoff: { support: "supported" as const, how: "handoff" },
+  event_follow: { support: "supported" as const, how: "follow" },
+  reattach: { support: "supported" as const, how: "reattach" },
+  wait_cancel: {
+    support: "supported" as const,
+    classification: "non_terminal" as const,
+    recovery: "reattach_or_portable_follow" as const,
+    how: "non-terminal",
+  },
+  material_progress_notify: {
+    support: "supported" as const,
+    how: "monitor",
+    mapping: {
+      surface: "grok_monitor_lines" as const,
+      tools: ["monitor"] as const,
+      filter: "scripts/material-filter.mjs",
+    },
+    fallback: "stdout",
+  },
+  terminal_cleanup: { support: "supported" as const, how: "stop" },
+  terminal_summary: { support: "supported" as const, how: "summary" },
+};
+
+test("discoverHosts: Grok is available via skill_path probe without a grok CLI (#784)", async () => {
+  const grokSkill = "/home/u/.grok/skills/pipeline";
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      // No `grok` binary — the pre-fix bug used which("grok") and reported unavailable.
+      which: async (cmd) =>
+        cmd === "claude" || cmd === "codex" ? `/usr/bin/${cmd}` : null,
+      listOuterHostIds: () => ["claude", "codex", "grok", "opencode"],
+      resolveOuterHost: (id) => (id === "grok" ? (GROK_MANIFEST_MIN as never) : null),
+      skillPathPresent: (p) => p === grokSkill,
+      homeDir: () => "/home/u",
+      envGet: () => undefined,
+    }),
+  );
+  assert.equal(result.hosts.grok.available, true, "installed Grok skill path must mark available");
+  assert.equal(
+    (result.hosts.grok as { skillPath?: string | null }).skillPath,
+    grokSkill,
+  );
+  assert.equal(result.hosts.grok.cliBin, null, "skill_path probe must not invent a grok CLI");
+  assert.equal(result.hostCoverage, "both", "Grok must not redefine hostCoverage");
+});
+
+test("discoverHosts: Grok skill_path absent → available false even when which(grok) would not run (#784)", async () => {
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      which: async () => null,
+      listOuterHostIds: () => ["claude", "codex", "grok", "opencode"],
+      resolveOuterHost: (id) => (id === "grok" ? (GROK_MANIFEST_MIN as never) : null),
+      skillPathPresent: () => false,
+      homeDir: () => "/home/u",
+      envGet: () => undefined,
+    }),
+  );
+  assert.equal(result.hosts.grok.available, false);
+  assert.equal((result.hosts.grok as { skillPath?: string | null }).skillPath, null);
+});
+
+test("discoverHosts: which_or_skill_path host available from skill when CLI missing (#784)", async () => {
+  const skill = "/home/u/.ext/skills/pipeline";
+  const ext = {
+    ...GROK_MANIFEST_MIN,
+    id: "ext-host",
+    displayName: "Ext",
+    install: {
+      ...GROK_MANIFEST_MIN.install,
+      mode: "tree" as const,
+      basePath: { env: null, defaultHomeSegments: [".ext"] as const },
+    },
+    invocation: {
+      ...GROK_MANIFEST_MIN.invocation,
+      discoveryProbe: "which ext-host or skill path",
+      discovery: { kind: "which_or_skill_path" as const, whichCommand: "ext-host" },
+    },
+  };
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      which: async () => null,
+      listOuterHostIds: () => ["claude", "codex", "opencode", "ext-host"],
+      resolveOuterHost: (id) => (id === "ext-host" ? (ext as never) : null),
+      skillPathPresent: (p) => p === skill,
+      homeDir: () => "/home/u",
+      envGet: () => undefined,
+    }),
+  );
+  assert.equal(result.hosts["ext-host"].available, true);
+  assert.equal((result.hosts["ext-host"] as { skillPath?: string | null }).skillPath, skill);
+});
+
+// ---------------------------------------------------------------------------
+// #784 review-2: alternateHomeSegments (Codex ~/.agents) must not false-negative
+// ---------------------------------------------------------------------------
+
+const CODEX_MANIFEST_MIN = {
+  manifestVersion: 1 as const,
+  id: "codex-alt",
+  displayName: "Codex Alternate",
+  origin: "extension" as const,
+  install: {
+    support: "supported" as const,
+    mode: "tree" as const,
+    basePath: {
+      env: "CODEX_HOME" as string | null,
+      defaultHomeSegments: [".codex"] as const,
+      alternateHomeSegments: [".agents"] as const,
+      skillsUnderBase: true,
+    },
+    skillsRelative: ["skills"] as const,
+    skillDirName: "pipeline",
+    overlayDir: "",
+    overlayFiles: [] as const,
+    overlayDirs: [] as const,
+    managedArtifacts: {
+      skillTree: true,
+      commandsGlob: null,
+      commandsDirRelative: ["agents"] as const,
+      commandsKind: "codex-prompt" as const,
+    },
+    userOwnedExclusion: "managed only",
+    postInstall: "restart",
+    installOrder: 20,
+  },
+  invocation: {
+    support: "supported" as const,
+    skillPathHint: "~/.codex/skills/pipeline",
+    commandSurface: "$pipeline",
+    discoveryProbe: "skill path",
+    discovery: { kind: "skill_path" as const },
+  },
+  early_run_handoff: { support: "supported" as const, how: "handoff" },
+  event_follow: { support: "supported" as const, how: "follow" },
+  reattach: { support: "supported" as const, how: "reattach" },
+  wait_cancel: {
+    support: "supported" as const,
+    classification: "non_terminal" as const,
+    recovery: "reattach_or_portable_follow" as const,
+    how: "non-terminal",
+  },
+  material_progress_notify: {
+    support: "supported" as const,
+    how: "status",
+    mapping: {
+      surface: "codex_chat_status" as const,
+      tools: ["chat"] as const,
+      filter: "scripts/material-filter.mjs",
+    },
+    fallback: "stdout",
+  },
+  terminal_cleanup: { support: "supported" as const, how: "stop" },
+  terminal_summary: { support: "supported" as const, how: "summary" },
+};
+
+test("resolveManifestSkillPath: prefers .agents skill when primary .codex is absent (#784)", () => {
+  const agentsSkill = "/home/u/.agents/skills/pipeline";
+  const resolved = resolveManifestSkillPath(CODEX_MANIFEST_MIN as never, {
+    homeDir: () => "/home/u",
+    envGet: () => undefined,
+    pathPresent: (p) => p === agentsSkill || p === "/home/u/.agents",
+  });
+  assert.equal(resolved, agentsSkill);
+});
+
+test("discoverHosts: skill_path-only install under alternateHomeSegments is available (#784)", async () => {
+  const agentsSkill = "/home/u/.agents/skills/pipeline";
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      which: async () => null,
+      listOuterHostIds: () => ["claude", "codex", "opencode", "codex-alt"],
+      resolveOuterHost: (id) =>
+        id === "codex-alt" ? (CODEX_MANIFEST_MIN as never) : null,
+      // Only alternate skill tree present — primary ~/.codex/skills/pipeline missing.
+      skillPathPresent: (p) => p === agentsSkill || p === "/home/u/.agents",
+      homeDir: () => "/home/u",
+      envGet: () => undefined,
+    }),
+  );
+  assert.equal(
+    result.hosts["codex-alt"].available,
+    true,
+    "alternate-path-only install must not false-negative",
+  );
+  assert.equal(
+    (result.hosts["codex-alt"] as { skillPath?: string | null }).skillPath,
+    agentsSkill,
+  );
+});
+
+test("resolveManifestSkillPath: env override still wins over alternate (#784)", () => {
+  const resolved = resolveManifestSkillPath(CODEX_MANIFEST_MIN as never, {
+    homeDir: () => "/home/u",
+    envGet: (k) => (k === "CODEX_HOME" ? "/custom/codex" : undefined),
+    pathPresent: () => false,
+  });
+  assert.equal(resolved, "/custom/codex/skills/pipeline");
 });

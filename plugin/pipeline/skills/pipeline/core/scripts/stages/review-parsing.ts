@@ -2,6 +2,7 @@
 // All functions here are pure over string/comment-array inputs — no network or subprocess calls.
 
 import { createHash } from "node:crypto";
+import { isVerifiedDesignGateOutput } from "../design-gate.ts";
 import { findLatestCommentMatching } from "../gh.ts";
 import type { Review1Risk } from "../review-policy.ts";
 import type { ReviewFinding, ReviewVerdict } from "../types.ts";
@@ -378,16 +379,24 @@ export function isVerifiedPipelineAttestation(body: string): boolean {
 }
 
 /**
- * True when `body` is verified pipeline output by EITHER verification form:
- * a review verdict's `review-artifact` (round/SHA/diffHash/blockingKeys
- * record, #264/#390) or a generic `pipeline-attest` marker (#471). This is
- * the single predicate `findUnacknowledgedComments` uses to grant the
- * verified-output exemption from the objection-language scan — it widens the
- * exemption from "verified review output" to "verified pipeline output" of
- * ANY registered kind, with no unverified/legacy fallback for either form.
+ * True when `body` is verified pipeline output by one of:
+ * - a review verdict's `review-artifact` (round/SHA/diffHash/blockingKeys
+ *   record, #264/#390),
+ * - a generic `pipeline-attest` marker (#471), or
+ * - a terminal, decodable design-gate `design-gate-state` artifact
+ *   (`isVerifiedDesignGateOutput`, #436 / #784 recovery) — the stage's own
+ *   durable state, used so challenge prose does not false-block review-1.
+ *
+ * This is the single predicate `findUnacknowledgedComments` uses to grant the
+ * verified-output exemption from the objection-language scan. Forged or
+ * non-decodable design-gate-shaped bodies still fail closed.
  */
 export function isVerifiedPipelineOutput(body: string): boolean {
-  return isVerifiedPipelineReviewOutput(body) || isVerifiedPipelineAttestation(body);
+  return (
+    isVerifiedPipelineReviewOutput(body) ||
+    isVerifiedPipelineAttestation(body) ||
+    isVerifiedDesignGateOutput(body)
+  );
 }
 
 // ---------------------------------------------------------------------------

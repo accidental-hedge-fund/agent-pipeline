@@ -1,0 +1,72 @@
+{
+  "manifestVersion": 1,
+  "id": "synth-unsupported-no-how",
+  "displayName": "Synthetic Unsupported Capability Without How",
+  "profileDefault": null,
+  "origin": "extension",
+  "install": {
+    "support": "supported",
+    "mode": "tree",
+    "basePath": {
+      "env": "SYNTH_UNSUPPORTED_NO_HOW_HOME",
+      "defaultHomeSegments": [".synth-unsupported-no-how"],
+      "skillsUnderBase": true
+    },
+    "skillsRelative": ["skills"],
+    "skillDirName": "pipeline",
+    "overlayDir": "core/test/fixtures/outer-hosts/synth-overlay",
+    "overlayFiles": ["SKILL.md"],
+    "overlayDirs": [],
+    "managedArtifacts": {
+      "skillTree": true,
+      "commandsGlob": "pipeline:*.md",
+      "commandsDirRelative": ["commands"],
+      "commandsKind": "claude-slash"
+    },
+    "userOwnedExclusion": "Only managed pipeline skill tree and pipeline:*.md commands are removed; user-owned files are preserved.",
+    "postInstall": "Synthetic fixture host — invoke via declared command surface.",
+    "installOrder": 100
+  },
+  "invocation": {
+    "support": "supported",
+    "skillPathHint": "~/.synth-unsupported-no-how/skills/pipeline",
+    "commandSurface": "/pipeline",
+    "discoveryProbe": "registry registration only (fixture)",
+    "discovery": { "kind": "skill_path" }
+  },
+  "early_run_handoff": {
+    "support": "unsupported",
+    "fallback": "Discover run_id and events path via pipeline status / run-store inspection (portable baseline)."
+  },
+  "event_follow": {
+    "support": "unsupported",
+    "fallback": "Follow until terminal via events.jsonl / pipeline logs --events --follow (portable baseline)."
+  },
+  "reattach": {
+    "support": "unsupported",
+    "fallback": "Re-arm portable events.jsonl follow after cancelled wait."
+  },
+  "wait_cancel": {
+    "support": "unsupported",
+    "classification": "non_terminal",
+    "recovery": "reattach_or_portable_follow",
+    "fallback": "Cancelled wait is never terminal; reattach or re-follow events.jsonl."
+  },
+  "material_progress_notify": {
+    "support": "unsupported",
+    "mapping": {
+      "surface": "stdout_only",
+      "tools": [],
+      "filter": "scripts/material-filter.mjs"
+    },
+    "fallback": "stdout and events.jsonl material lines (portable baseline)"
+  },
+  "terminal_cleanup": {
+    "support": "unsupported",
+    "fallback": "Stop any local follows for this run_id; leave run store intact."
+  },
+  "terminal_summary": {
+    "support": "unsupported",
+    "fallback": "pipeline summary <run-id> or terminal stdout summary JSON."
+  }
+}

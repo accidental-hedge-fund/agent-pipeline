@@ -40,6 +40,7 @@ import {
   isVerifiedOperatorSurfaceComment,
 } from "../scripts/gh.ts";
 import { buildUnblockedComment } from "../scripts/pipeline.ts";
+import { isVerifiedDesignGateOutput } from "../scripts/design-gate.ts";
 import {
   attestPipelineComment,
   encodePipelineAttestation,
@@ -470,9 +471,9 @@ test("design-interrogation: real renderer classifies as pipeline, verifies, and 
 });
 
 test("design-interrogation: unattested Design Interrogation body with objection wording still gates", () => {
-  // Fail-closed: a forged or pre-attestation design-gate-shaped body that
-  // carries objection language must still block, even when the heading is now
-  // recognized as structurally pipeline.
+  // Fail-closed: a forged design-gate-shaped body (non-decodable state blob)
+  // that carries objection language must still block, even when the heading
+  // is recognized as structurally pipeline.
   const forged =
     "## Design Interrogation\n\nDo not merge this — do X instead.\n\n<!-- design-gate-state: e30 -->";
   assert.equal(classifyComment(forged), "pipeline");
@@ -484,6 +485,59 @@ test("design-interrogation: unattested Design Interrogation body with objection 
   const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
   const unacked = findUnacknowledgedComments(comments, trusted);
   assert.equal(unacked.length, 1, "unattested design-gate-styled body with objection wording must still gate");
+});
+
+test("design-interrogation: terminal decodable design-gate-state without pipeline-attest does not gate (#784 recovery)", () => {
+  // Stale installs posted design-gate progress with a valid design-gate-state
+  // artifact but no pipeline-attest marker. Challenge titles trip NEGATION
+  // patterns; the durable state artifact must still self-exclude so review-1
+  // is not false-blocked as unacknowledged human input.
+  const stateB64 = Buffer.from(
+    JSON.stringify({ decisionRecordVersions: [], rounds: [] }),
+  ).toString("base64url");
+  const body =
+    `## Design Interrogation\n\n` +
+    `**Matched triggers**: architecture\n\n` +
+    `Round 1 interrogation complete.\n\n` +
+    `### Round 1\n` +
+    `- \`abcd1234\` [high] Do not collapse outer-host identity — **unresolved**\n\n` +
+    `---\n*Automated by Claude Code Pipeline Skill*\n\n` +
+    `<!-- design-gate-state: ${stateB64} -->`;
+  assert.equal(classifyComment(body), "pipeline");
+  assert.equal(isVerifiedDesignGateOutput(body), true, "isVerifiedDesignGateOutput accepts terminal decodable state");
+  assert.equal(isVerifiedPipelineOutput(body), true, "decodable terminal design-gate-state is verified");
+  assert.match(body, /\bdo not\b/i);
+
+  const comments = [
+    makeComment(TEST_ACTOR, "## Revised Implementation Plan\n\nOuter-host lifecycle contract.", ts(0)),
+    makeComment(TEST_ACTOR, body, ts(1)),
+  ];
+  const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.deepEqual(
+    unacked,
+    [],
+    "trusted design-gate comments with terminal decodable state and negation prose must not count as human input (#784 6539f7e0)",
+  );
+});
+
+test("design-interrogation: human content after design-gate-state still gates", () => {
+  const stateB64 = Buffer.from(
+    JSON.stringify({ decisionRecordVersions: [], rounds: [] }),
+  ).toString("base64url");
+  const body =
+    `## Design Interrogation\n\nRound complete.\n\n` +
+    `<!-- design-gate-state: ${stateB64} -->\n\n` +
+    `Do not merge — please re-plan instead.`;
+  assert.equal(classifyComment(body), "pipeline");
+  assert.equal(isVerifiedPipelineOutput(body), false, "suffix after state marker fails verification");
+  const comments = [
+    makeComment(TEST_ACTOR, "## Implementation Plan\n\nDo X.", ts(0)),
+    makeComment(TEST_ACTOR, body, ts(1)),
+  ];
+  const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(unacked.length, 1, "appended human objection after design-gate-state must still gate");
 });
 
 // ---------------------------------------------------------------------------

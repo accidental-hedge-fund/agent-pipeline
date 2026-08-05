@@ -1,0 +1,70 @@
+{
+  "manifestVersion": 1,
+  "id": "limited-install-no-fallback",
+  "displayName": "Limited Install Missing Fallback",
+  "origin": "extension",
+  "install": {
+    "support": "limited",
+    "mode": "tree",
+    "basePath": {
+      "defaultHomeSegments": [".limited-nf"]
+    },
+    "skillsRelative": ["skills"],
+    "skillDirName": "pipeline",
+    "overlayDir": "",
+    "overlayFiles": [],
+    "overlayDirs": [],
+    "managedArtifacts": {
+      "skillTree": true,
+      "commandsGlob": null,
+      "commandsDirRelative": null,
+      "commandsKind": "none"
+    },
+    "userOwnedExclusion": "managed only",
+    "postInstall": "n/a",
+    "installOrder": 900
+  },
+  "invocation": {
+    "support": "supported",
+    "skillPathHint": "~/.limited-nf/skills/pipeline",
+    "commandSurface": "/pipeline",
+    "discoveryProbe": "n/a",
+    "discovery": { "kind": "skill_path" }
+  },
+  "early_run_handoff": {
+    "support": "supported",
+    "how": "handoff"
+  },
+  "event_follow": {
+    "support": "supported",
+    "how": "follow"
+  },
+  "reattach": {
+    "support": "supported",
+    "how": "reattach"
+  },
+  "wait_cancel": {
+    "support": "supported",
+    "classification": "non_terminal",
+    "recovery": "reattach_or_portable_follow",
+    "how": "non-terminal"
+  },
+  "material_progress_notify": {
+    "support": "supported",
+    "how": "stdout",
+    "mapping": {
+      "surface": "stdout_only",
+      "tools": [],
+      "filter": "scripts/material-filter.mjs"
+    },
+    "fallback": "stdout events.jsonl"
+  },
+  "terminal_cleanup": {
+    "support": "supported",
+    "how": "stop"
+  },
+  "terminal_summary": {
+    "support": "supported",
+    "how": "summary"
+  }
+}
