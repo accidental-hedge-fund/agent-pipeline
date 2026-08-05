@@ -121,6 +121,7 @@ test("resolveEventAttribution inherits from run.json and does not invent live-ru
   assert.equal(inherited.engine_version, "1.30.0");
   assert.equal(inherited.engine_commit_sha, "aaa111");
   assert.equal(inherited.discovery_channel, "live-run");
+  assert.equal(inherited.missing_attribution, false);
 
   const inline = resolveEventAttribution(
     {
@@ -156,6 +157,48 @@ test("resolveEventAttribution inherits from run.json and does not invent live-ru
     true,
     "missing channel is missing-attribution even when engine identity is present",
   );
+});
+
+test("resolveEventAttribution: present-but-invalid event channel is missing, not run-default (#763 review 49831e50)", () => {
+  // Historical garbage inline channel must not inherit live-run from a modern run.
+  const invalidInline = resolveEventAttribution(
+    {
+      type: "human_intervention",
+      kind: "human-risk-override",
+      discovery_channel: "batch",
+    },
+    { version: "1.31.0", commit_sha: "ddd444" },
+    DEFAULT_LIVE_RUN_CHANNEL,
+  );
+  assert.equal(invalidInline.engine_version, "1.31.0");
+  assert.equal(
+    invalidInline.discovery_channel,
+    null,
+    "invalid inline channel must not fall back to runDefaultChannel",
+  );
+  assert.equal(
+    invalidInline.missing_attribution,
+    true,
+    "present-but-invalid channel is missing-attribution residual",
+  );
+
+  // Explicit null is also present-but-invalid (not an omit → inherit).
+  const nullInline = resolveEventAttribution(
+    { type: "blocker_set", discovery_channel: null },
+    { version: "1.31.0" },
+    DEFAULT_LIVE_RUN_CHANNEL,
+  );
+  assert.equal(nullInline.discovery_channel, null);
+  assert.equal(nullInline.missing_attribution, true);
+
+  // Absent field still inherits the run default (document inheritance path).
+  const omitted = resolveEventAttribution(
+    { type: "human_intervention" },
+    { version: "1.31.0" },
+    "review-batch",
+  );
+  assert.equal(omitted.discovery_channel, "review-batch");
+  assert.equal(omitted.missing_attribution, false);
 });
 
 test("runLevelDiscoveryChannel requires explicit stamp; engine.version is not a channel", () => {

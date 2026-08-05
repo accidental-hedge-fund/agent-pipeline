@@ -10,7 +10,6 @@ import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
 import { type BlockerKind } from "./types.ts";
 import {
   buildEventAttributionFields,
-  DEFAULT_LIVE_RUN_CHANNEL,
   type DiscoveryChannel,
 } from "./engine-attribution.ts";
 
@@ -109,10 +108,13 @@ export async function emitHumanIntervention(
   try {
     // Attribution enrichment is best-effort: failure to resolve identity must
     // never change the stage outcome (non-fatal emission remains).
+    // Do not invent event-level discovery_channel: omit when the caller does
+    // not supply a validated active-run channel so collectors inherit from
+    // run.json (review-batch/manual must not be stamped live-run).
     const attribution = buildEventAttributionFields({
       version: payload.engine_version,
       commit_sha: payload.engine_commit_sha,
-      discovery_channel: payload.discovery_channel ?? DEFAULT_LIVE_RUN_CHANNEL,
+      discovery_channel: payload.discovery_channel,
     });
     const event: HumanInterventionEvent = {
       schema_version: 1,

@@ -89,8 +89,6 @@ test("emitHumanIntervention: writes a valid JSON line to events.jsonl", async ()
   assert.equal(event.issue, 42);
   assert.equal(event.detail, "npm test failed");
   assert.ok(typeof event.at === "string" && event.at.endsWith("Z"));
-  // #763: default discovery_channel for ordinary advance is live-run
-  assert.equal(event.discovery_channel, "live-run");
 });
 
 test("emitHumanIntervention: stamps engine + discovery attribution when provided (#763)", async () => {
@@ -115,6 +113,35 @@ test("emitHumanIntervention: stamps engine + discovery attribution when provided
   assert.equal(event.discovery_channel, "live-run");
 });
 
+test("emitHumanIntervention: omits discovery_channel when caller does not supply it (#763 review 2a8f68e9)", async () => {
+  // review-batch / manual / override call sites often omit the field; inventing
+  // live-run would corrupt discovery-channel decomposition. Collectors inherit
+  // from run.json when the event field is absent.
+  const lines: string[] = [];
+  await emitHumanIntervention(
+    "/fake/run",
+    {
+      kind: "human-risk-override",
+      stage: null,
+      issue: 763,
+      detail: "override applied: key — reason",
+      ref: "key",
+      engine_version: "1.31.0",
+      engine_commit_sha: "abc1234",
+      // deliberately no discovery_channel — e.g. review-batch run intervention
+    },
+    fakeDeps(lines),
+  );
+  const event = JSON.parse(lines[0]) as HumanInterventionEvent & Record<string, unknown>;
+  assert.equal(event.engine_version, "1.31.0");
+  assert.equal(event.engine_commit_sha, "abc1234");
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(event, "discovery_channel"),
+    false,
+    "event-level discovery_channel must be omitted so collectors inherit run.json channel",
+  );
+});
+
 test("emitHumanIntervention: historical-shaped payload without engine fields still writes (#763)", async () => {
   const lines: string[] = [];
   await emitHumanIntervention(
@@ -125,6 +152,11 @@ test("emitHumanIntervention: historical-shaped payload without engine fields sti
   const event = JSON.parse(lines[0]) as HumanInterventionEvent;
   assert.equal(event.kind, "human-risk-override");
   assert.ok(event.detail);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(event, "discovery_channel"),
+    false,
+    "no default live-run stamp when attribution is omitted",
+  );
 });
 
 test("emitHumanIntervention: appends to events.jsonl path inside runDir", async () => {

@@ -248,9 +248,13 @@ export function resolveDispatchDiscoveryChannel(input: {
  *
  * Documented inheritance rule: new ordinary-advance runs persist
  * `run.json.discovery_channel = "live-run"`; collectors pass that stamp as
- * `runDefaultChannel` so events that omit the field inherit it. Historical
+ * `runDefaultChannel` so events that **omit** the field inherit it. Historical
  * runs without the stamp (or events with `runDefaultChannel = null`) remain
  * `missing_attribution`. Do **not** infer channel from engine.version alone.
+ *
+ * Present-but-invalid inline `discovery_channel` (historical garbage) is NOT
+ * eligible for run-default inheritance: resolve to null + missing_attribution
+ * so residual diagnostics stay accurate rather than folding into live-run.
  */
 export function resolveEventAttribution(
   event: Record<string, unknown> | null | undefined,
@@ -266,7 +270,12 @@ export function resolveEventAttribution(
     typeof ev["engine_commit_sha"] === "string" && (ev["engine_commit_sha"] as string).trim()
       ? (ev["engine_commit_sha"] as string).trim()
       : null;
-  const inlineChannel = parseDiscoveryChannelLoose(ev["discovery_channel"]);
+  // Distinguish absent field (inherit run default) from present-but-invalid
+  // (residual / missing-attribution; do not fall back to runDefaultChannel).
+  const hasInlineChannelField = Object.prototype.hasOwnProperty.call(ev, "discovery_channel");
+  const inlineChannel = hasInlineChannelField
+    ? parseDiscoveryChannelLoose(ev["discovery_channel"])
+    : null;
 
   const inheritedVersion =
     typeof runEngine?.version === "string" && runEngine.version.trim()
@@ -282,9 +291,11 @@ export function resolveEventAttribution(
 
   const engine_version = inlineVersion ?? inheritedVersion;
   const engine_commit_sha = inlineSha ?? inheritedSha;
-  const discovery_channel = inlineChannel ?? runDefaultChannel;
-  // Channel absence is missing-attribution even when engine identity is present
-  // (historical pre-#763 population: engine.version without discovery_channel).
+  const discovery_channel = hasInlineChannelField
+    ? inlineChannel
+    : runDefaultChannel;
+  // Channel absence (or present-but-invalid residual) is missing-attribution
+  // even when engine identity is present (historical pre-#763 population).
   const missing_attribution = discovery_channel === null;
 
   return {
