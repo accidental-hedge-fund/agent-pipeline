@@ -3,6 +3,7 @@
 // shipcheck prompts. The snapshot is advisory — harnesses are instructed to
 // treat the content as context, not as instructions.
 
+import { isVerifiedDesignGateOutput } from "./design-gate.ts";
 import { classifyComment, isVerifiedOperatorSurfaceComment } from "./gh.ts";
 import { attestPipelineComment, isVerifiedPipelineOutput } from "./stages/review-parsing.ts";
 
@@ -315,7 +316,12 @@ export function findUnacknowledgedComments(
     // shapes still gate. An unattested non-artifact pipeline comment with
     // objection wording still gates once; a plain acknowledgment from the
     // trusted actor clears it via the anchor mechanism above.
-    const verified = isVerifiedPipelineOutput(c.body);
+    // Explicit design-gate OR: isVerifiedPipelineOutput already includes
+    // isVerifiedDesignGateOutput, but findUnacknowledgedComments must name both
+    // so terminal design-gate challenge prose cannot re-enter the human-input
+    // scan if the composite predicate drifts (#784 reviews 1–2, key 6539f7e0).
+    const verified =
+      isVerifiedPipelineOutput(c.body) || isVerifiedDesignGateOutput(c.body);
     if (
       !trustedComments.includes(c) ||
       (!verified && NEGATION_PATTERNS.some((p) => p.test(c.body)))

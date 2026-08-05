@@ -80,8 +80,12 @@ function requireCapability(
       fail(host, "support-level", `${area}: invalid support level ${JSON.stringify(cap.support)}`),
     );
   }
-  if (typeof cap.how !== "string" || !cap.how.trim()) {
-    failures.push(fail(host, "how", `${area}: missing non-empty how`));
+  // how is required for supported/limited (how-to data). Unsupported capabilities
+  // declare an explicit fallback instead; empty how is permitted (#784 key 40fd547d).
+  if (cap.support === "supported" || cap.support === "limited") {
+    if (typeof cap.how !== "string" || !cap.how.trim()) {
+      failures.push(fail(host, "how", `${area}: missing non-empty how`));
+    }
   }
   if (cap.support !== "supported") {
     if (typeof cap.fallback !== "string" || !cap.fallback.trim()) {

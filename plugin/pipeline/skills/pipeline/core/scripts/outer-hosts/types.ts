@@ -141,8 +141,11 @@ export interface OuterHostInvocation {
 /** Generic capability with how-to + required fallback when not fully supported. */
 export interface OuterHostCapability {
   support: CapabilitySupport;
-  /** How to exercise the capability when supported or limited. */
-  how: string;
+  /**
+   * How to exercise the capability when supported or limited.
+   * Optional when support is unsupported (fallback carries the contract).
+   */
+  how?: string;
   /**
    * Required when support !== "supported". Portable baseline is stdout /
    * events.jsonl when observation is involved.

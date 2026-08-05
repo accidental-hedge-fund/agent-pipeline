@@ -40,6 +40,7 @@ import {
   isVerifiedOperatorSurfaceComment,
 } from "../scripts/gh.ts";
 import { buildUnblockedComment } from "../scripts/pipeline.ts";
+import { isVerifiedDesignGateOutput } from "../scripts/design-gate.ts";
 import {
   attestPipelineComment,
   encodePipelineAttestation,
@@ -503,6 +504,7 @@ test("design-interrogation: terminal decodable design-gate-state without pipelin
     `---\n*Automated by Claude Code Pipeline Skill*\n\n` +
     `<!-- design-gate-state: ${stateB64} -->`;
   assert.equal(classifyComment(body), "pipeline");
+  assert.equal(isVerifiedDesignGateOutput(body), true, "isVerifiedDesignGateOutput accepts terminal decodable state");
   assert.equal(isVerifiedPipelineOutput(body), true, "decodable terminal design-gate-state is verified");
   assert.match(body, /\bdo not\b/i);
 
@@ -515,7 +517,7 @@ test("design-interrogation: terminal decodable design-gate-state without pipelin
   assert.deepEqual(
     unacked,
     [],
-    "trusted design-gate comments with terminal decodable state must not count as human input",
+    "trusted design-gate comments with terminal decodable state and negation prose must not count as human input (#784 6539f7e0)",
   );
 });
 

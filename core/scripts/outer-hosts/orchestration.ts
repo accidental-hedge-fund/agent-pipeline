@@ -46,7 +46,7 @@ function guidanceFor(cap: OuterHostCapability | undefined, portable: string): {
   if (cap.support === "supported") {
     return {
       support: cap.support,
-      guidance: cap.how,
+      guidance: cap.how?.trim() || portable,
       usesPortableBaseline: false,
     };
   }
@@ -97,7 +97,7 @@ export function selectLifecycleSteps(manifest: OuterHostManifest): LifecycleStep
   const notifyGuidance =
     manifest.material_progress_notify?.support === "supported" &&
     manifest.material_progress_notify.mapping
-      ? `${manifest.material_progress_notify.how} [surface=${manifest.material_progress_notify.mapping.surface}]`
+      ? `${manifest.material_progress_notify.how ?? ""} [surface=${manifest.material_progress_notify.mapping.surface}]`.trim()
       : notify.guidance;
 
   return [

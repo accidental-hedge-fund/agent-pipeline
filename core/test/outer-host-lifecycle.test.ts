@@ -213,6 +213,18 @@ test("conformance kit: complete synthetic third-party host passes", () => {
   assert.doesNotThrow(() => assertOuterHostConformance(synth));
 });
 
+test("conformance kit: unsupported capability with fallback and no how passes (#784)", () => {
+  // Spec-valid complete declaration: unsupported + explicit portable fallback,
+  // without how-to data (how is only required for supported/limited).
+  const synth = loadFixture("unsupported-capability-no-how.json");
+  assert.equal(synth.early_run_handoff.support, "unsupported");
+  assert.equal(synth.early_run_handoff.how, undefined);
+  assert.ok(synth.early_run_handoff.fallback?.trim());
+  const report = checkOuterHostConformance(synth);
+  assert.equal(report.ok, true, JSON.stringify(report.failures));
+  assert.doesNotThrow(() => assertOuterHostConformance(synth));
+});
+
 test("conformance kit: incomplete synthetic host fails naming missing field", () => {
   const incomplete = loadFixture("incomplete.json");
   const report = checkOuterHostConformance(incomplete);
