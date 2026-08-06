@@ -15,6 +15,12 @@
 // PIPELINE_HARNESS_TELEMETRY=off restores `--output-format plain` (kill-switch,
 // same as claude/codex).
 //
+// #882: freeform product text is NOT reconstructed solely from the tail-
+// capped raw JSONL. `makeGrokForwardTransform` deltas are accumulated into
+// a head-preserving product side channel in `runCapped` so leading sections
+// (e.g. plan-revision `## Feedback Incorporated`) survive for stage contracts
+// while cost recovery still uses the terminal `type:end` in the raw tail.
+//
 // Throttled is never reported by the verified envelope → null (unknown),
 // never fabricated false. resolvedModel comes only from `modelUsage` keys.
 //

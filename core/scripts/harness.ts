@@ -33,6 +33,12 @@
 // Captured stdout/stderr is capped at MAX_OUTPUT to bound memory. Telemetry-mode
 // stdout capture keeps the TAIL of the stream rather than the head, because the
 // cost/usage-bearing envelope line always arrives last.
+//
+// #882: when a forward transform is present (streaming-json / stream-json),
+// plain assistant product text is accumulated separately in a head-preserving
+// product buffer. Freeform stage contracts (e.g. plan-revision.ack@1) read
+// that product text so a tail-truncated raw JSONL capture cannot drop a
+// leading acknowledgement that was already streamed and forwarded.
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -79,7 +85,15 @@ export {
   type ProductionPreflightFailureClass,
 } from "./harness-adapters/index.ts";
 
-const MAX_OUTPUT = 100_000; // 100 KB cap on captured output
+/** Cap on captured raw stdout/stderr (telemetry envelopes under tail mode). */
+export const MAX_OUTPUT = 100_000; // 100 KB
+/**
+ * Cap on plain product text accumulated from `transformForward` (#882).
+ * Head-preserving: freeform contracts need leading sections (e.g. plan-revision
+ * `## Feedback Incorporated`). Plain text is much smaller than raw JSONL, so
+ * this bound may exceed {@link MAX_OUTPUT} without matching raw envelope memory.
+ */
+export const MAX_PRODUCT_OUTPUT = 500_000; // 500 KB of plain assistant text
 
 function nowIso(): string {
   return new Date().toISOString().replace(/\.\d+Z$/, "Z");
@@ -184,10 +198,48 @@ export function makeTelemetryForwardTransform(harness: string): (chunk: string) 
   return (chunk: string) => chunk;
 }
 
+/**
+ * Choose consumer-facing product stdout after a harness run (#882).
+ *
+ * Freeform / markdown stage contracts need complete plain assistant text.
+ * When a forward-transform product side channel captured non-empty plain text,
+ * prefer it over a reconstruction from a tail-capped raw telemetry buffer
+ * (which can drop a leading acknowledgement). When both product and telemetry
+ * text exist, pick the longer reconstruction so adapters that pack full text
+ * into a terminal envelope line (e.g. Claude `type:result`) are not regressed
+ * if the delta stream was incomplete.
+ *
+ * An empty product side channel (transform installed but no text deltas) MUST
+ * NOT wipe a usable telemetry reconstruction or raw fallback — that is the
+ * unparseable-envelope / no-assistant-text path, not "model said nothing
+ * invent nothing" (true absence is still empty product + empty telemetry).
+ */
+export function resolveHarnessProductStdout(
+  rawStdout: string,
+  productStdout: string | undefined,
+  telemetryText: string | null | undefined,
+): string {
+  const product = productStdout !== undefined && productStdout.length > 0 ? productStdout : undefined;
+  if (product !== undefined && telemetryText != null) {
+    return product.length >= telemetryText.length ? product : telemetryText;
+  }
+  if (product !== undefined) return product;
+  if (telemetryText != null) return telemetryText;
+  return rawStdout;
+}
+
 export interface HarnessResult {
   success: boolean;
   stdout: string;
   stderr: string;
+  /**
+   * Complete plain assistant product text accumulated from `transformForward`
+   * during the run (#882). Present only when a forward transform was installed
+   * (telemetry streaming modes). Independent of the raw telemetry buffer's
+   * tail bound — freeform contracts and `invoke()` product resolution prefer
+   * this over a text reconstruction from a tail-truncated envelope.
+   */
+  product_stdout?: string;
   exit_code: number;
   duration: number; // seconds
   timed_out: boolean;
@@ -523,15 +575,27 @@ export async function invoke(
   }
   const endedAt = new Date();
 
-  // Recover per-call cost/usage from the captured envelope and reconstruct the
-  // final assistant text as `stdout` (#429) — every existing consumer (verdict
-  // parsing, fix rounds, gates) sees the same `stdout` shape as plain-text mode.
-  // Parsing never throws; an unparseable envelope (or an adapter with no
-  // telemetry capability at all) falls back to the raw captured output and
-  // leaves accounting at `cost_source: "unknown"`.
+  // Recover per-call cost/usage from the captured envelope and set consumer
+  // `stdout` to complete plain product text (#429 + #882).
+  //
+  // Raw capture may be tail-capped so the terminal cost line survives large
+  // streams; freeform contracts must not use a text reconstruction from that
+  // truncated buffer alone when the forward transform already accumulated
+  // complete product text (`product_stdout`). Parsing never throws; an
+  // unparseable envelope falls back via resolveHarnessProductStdout and leaves
+  // accounting at `cost_source: "unknown"`.
   const telemetry = adapter.parseTelemetry(result.stdout);
+  const productStdout = resolveHarnessProductStdout(
+    result.stdout,
+    result.product_stdout,
+    telemetry?.text,
+  );
+  // Fold product side channel into stdout for freeform consumers; omit the
+  // internal field so stages keep a single product field (#882).
+  const { product_stdout: _productSideChannel, ...resultWithoutProduct } = result;
   const finalResult: HarnessResult = {
-    ...(telemetry && telemetry.text !== null ? { ...result, stdout: telemetry.text } : result),
+    ...resultWithoutProduct,
+    stdout: productStdout,
     throttled: telemetry?.throttled ?? null,
   };
 
@@ -963,6 +1027,10 @@ export async function runCapped(
     }
     let stdoutBuf = "";
     let stderrBuf = "";
+    // #882: when transformForward is installed, accumulate complete plain
+    // product text independently of the raw telemetry tail bound. Head-
+    // preserving so leading freeform contract sections survive large streams.
+    let productBuf: string | undefined = opts.transformForward ? "" : undefined;
     let timedOut = false;
     let lastExitCode: number | null = null;
     let settled = false;
@@ -1036,6 +1104,10 @@ export async function runCapped(
           ...result,
           stderr: result.stderr ? `${result.stderr}\n${notes}` : notes,
         };
+      }
+      // Attach product side channel when a forward transform ran (#882).
+      if (productBuf !== undefined) {
+        result = { ...result, product_stdout: productBuf };
       }
       resolvePromise(result);
     };
@@ -1144,9 +1216,21 @@ export async function runCapped(
         stdoutBuf += text;
         if (stdoutBuf.length > MAX_OUTPUT) stdoutBuf = stdoutBuf.slice(0, MAX_OUTPUT);
       }
-      if (stream) {
-        const forwardText = opts.transformForward ? opts.transformForward(text) : text;
-        if (forwardText) safeForward(fwd.stdout, forwardText);
+      // Always run transformForward when installed so product text is complete
+      // even if streaming to the terminal is off (#882). Terminal forward still
+      // only when `stream` is true.
+      if (opts.transformForward) {
+        const productChunk = opts.transformForward(text);
+        if (productChunk) {
+          if (productBuf !== undefined && productBuf.length < MAX_PRODUCT_OUTPUT) {
+            const room = MAX_PRODUCT_OUTPUT - productBuf.length;
+            productBuf +=
+              productChunk.length <= room ? productChunk : productChunk.slice(0, room);
+          }
+          if (stream) safeForward(fwd.stdout, productChunk);
+        }
+      } else if (stream) {
+        safeForward(fwd.stdout, text);
       }
     });
     child.stderr?.on("data", (chunk: Buffer) => {

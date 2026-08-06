@@ -24,7 +24,13 @@ import {
   formatStderrExcerpt,
   parseHarnessTelemetry,
   makeTelemetryForwardTransform,
+  resolveHarnessProductStdout,
+  MAX_OUTPUT,
+  MAX_PRODUCT_OUTPUT,
 } from "../scripts/harness.ts";
+import { makeGrokForwardTransform, parseGrokTelemetry } from "../scripts/harness-adapters/grok.ts";
+import { verifyPlanRevisionOutput } from "../scripts/verify-harness-commits.ts";
+import { validateStageOutput } from "../scripts/stage-output-contract.ts";
 import { realInvokeHarness } from "../scripts/evals/executor.ts";
 import {
   createEvalGhSurface,
@@ -2045,7 +2051,10 @@ test("invoke(): a codex telemetry-mode call reconstructs stdout as the agent_mes
       },
     });
     assert.equal(result.success, true);
-    assert.equal(result.stdout, "hello world");
+    // Product side channel (#882) uses the codex forward transform, which
+    // appends a newline for terminal readability; freeform consumers still
+    // receive the full agent_message text.
+    assert.equal(result.stdout.trimEnd(), "hello world");
 
     const raw = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").trim();
     const event = JSON.parse(raw);
@@ -2296,7 +2305,7 @@ test("runCapped + parseGrokTelemetry: streaming-json type:end survives tail capt
   });
 
   assert.equal(result.success, true);
-  assert.ok(result.stdout.length <= 100_000, "tail capture must stay within MAX_OUTPUT");
+  assert.ok(result.stdout.length <= MAX_OUTPUT, "tail capture must stay within MAX_OUTPUT");
   assert.match(result.stdout, /"type":"end"/, "type:end must remain in the retained tail");
   // Mid-document single JSON would be unparseable after the same truncation;
   // streaming-json end record remains complete JSONL.
@@ -2305,4 +2314,227 @@ test("runCapped + parseGrokTelemetry: streaming-json type:end survives tail capt
   assert.equal(telemetry.resolvedModel, "grok-4.5-build");
   assert.equal(telemetry.usage?.input_tokens, 50);
   assert.equal(telemetry.throttled, null);
+});
+
+// ---------------------------------------------------------------------------
+// #882: plan-revision.ack@1 must not false-fail when Grok streaming-json +
+// tail capture drops the leading ## Feedback Incorporated from the raw buffer
+// while the forward transform still saw the full product stream.
+// ---------------------------------------------------------------------------
+
+/** Build a production-shaped Grok streaming-json payload for #882 regressions. */
+function buildLargeGrokPlanRevisionStream(opts: {
+  includeAck: boolean;
+  /** Approximate plain product body size after the optional ack (chars). */
+  planBodyChars: number;
+}): { rawJsonl: string; plainProduct: string } {
+  const ack =
+    "## Feedback Incorporated\n\n" +
+    "- [ADDRESSED] Preserve leading acknowledgement under tail capture\n" +
+    "- [DEFERRED] Unrelated polish — reason: out of scope\n\n";
+  const planBody =
+    "## Revised Plan\n\n" +
+    "Do the thing with enough body that raw JSONL exceeds the telemetry tail cap.\n\n" +
+    "x".repeat(Math.max(0, opts.planBodyChars));
+  const plainProduct = (opts.includeAck ? ack : "") + planBody;
+
+  // Emit product in small type:text deltas so the raw envelope is much larger
+  // than plain text (mirrors live Grok streaming-json).
+  const chunkSize = 40;
+  const lines: string[] = [];
+  for (let i = 0; i < plainProduct.length; i += chunkSize) {
+    const data = plainProduct.slice(i, i + chunkSize);
+    lines.push(JSON.stringify({ type: "text", data }));
+  }
+  lines.push(
+    JSON.stringify({
+      type: "end",
+      stopReason: "EndTurn",
+      sessionId: "SECRET-GROK-882",
+      usage: { input_tokens: 120, output_tokens: 900 },
+      total_cost_usd: 0.042,
+      modelUsage: {
+        "grok-4.5-build": {
+          inputTokens: 120,
+          outputTokens: 900,
+          costUSD: 0.042,
+        },
+      },
+    }),
+  );
+  return { rawJsonl: lines.join("\n") + "\n", plainProduct };
+}
+
+test("runCapped + Grok production settings: leading Feedback Incorporated survives tail raw capture via product_stdout (#882)", async () => {
+  // planBody sized so raw JSONL >> MAX_OUTPUT while ack lives only in the first
+  // ~20% of the plain product stream (and thus in the discarded head of the tail buffer).
+  const { rawJsonl, plainProduct } = buildLargeGrokPlanRevisionStream({
+    includeAck: true,
+    planBodyChars: 80_000,
+  });
+  assert.ok(
+    rawJsonl.length > MAX_OUTPUT,
+    `fixture raw JSONL must exceed MAX_OUTPUT (${rawJsonl.length} > ${MAX_OUTPUT})`,
+  );
+  assert.ok(
+    plainProduct.length < MAX_PRODUCT_OUTPUT,
+    "plain product must fit the product-text bound",
+  );
+  // Ack is only at the head — well within the first 20% of the plain stream.
+  const ackEnd = plainProduct.indexOf("## Revised Plan");
+  assert.ok(ackEnd > 0 && ackEnd / plainProduct.length < 0.2);
+
+  // Pre-fix path: reconstruct product from the tail-capped raw buffer alone.
+  // Tail-only reconstruction drops the leading ack (this is the false-negative).
+  const tailOnlyRaw = rawJsonl.slice(rawJsonl.length - MAX_OUTPUT);
+  const tailOnlyTelemetry = parseGrokTelemetry(tailOnlyRaw);
+  assert.ok(
+    tailOnlyTelemetry.text === null || !tailOnlyTelemetry.text.includes("## Feedback Incorporated"),
+    "pre-fix: tail-only telemetry text must drop the leading Feedback Incorporated section",
+  );
+  assert.equal(
+    verifyPlanRevisionOutput(tailOnlyTelemetry.text ?? "").ok,
+    false,
+    "pre-fix: verifyPlanRevisionOutput on tail-only reconstruction must fail",
+  );
+  // Forwarded / complete product still verifies — documents transcript-vs-stage disagreement.
+  assert.deepEqual(verifyPlanRevisionOutput(plainProduct), { ok: true });
+
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999997,
+    kill: () => true,
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+  const transformForward = makeGrokForwardTransform();
+  const forwarded: string[] = [];
+
+  setImmediate(() => {
+    // Chunk the raw JSONL like a real pipe (not one giant write).
+    const step = 8_000;
+    for (let i = 0; i < rawJsonl.length; i += step) {
+      fakeChild.stdout.emit("data", Buffer.from(rawJsonl.slice(i, i + step)));
+    }
+    fakeChild.emit("close", 0);
+  });
+
+  const result = await runCapped("unused", [], tmpRoot, 30, true, "test", {
+    spawnFn,
+    captureMode: "tail",
+    transformForward,
+    forwardTo: {
+      stdout: Object.assign(new EventEmitter(), {
+        write: (s: string) => {
+          forwarded.push(s);
+          return true;
+        },
+      }) as never,
+      stderr: Object.assign(new EventEmitter(), { write: () => true }) as never,
+    },
+  });
+
+  assert.equal(result.success, true);
+  assert.ok(result.stdout.length <= MAX_OUTPUT, "raw capture stays tail-bounded");
+  assert.match(result.stdout, /"type":"end"/, "type:end remains for cost recovery");
+
+  // Product side channel is complete and head-preserving.
+  assert.ok(result.product_stdout, "product_stdout must be populated when transformForward runs");
+  assert.equal(result.product_stdout, plainProduct);
+  assert.deepEqual(verifyPlanRevisionOutput(result.product_stdout!), { ok: true });
+  assert.equal(
+    validateStageOutput("plan-revision.ack@1", { stdout: result.product_stdout! }).ok,
+    true,
+    "plan-revision.ack@1 must pass on complete product text",
+  );
+
+  // Cost still recoverable from the tail-capped raw buffer.
+  const telemetry = parseGrokTelemetry(result.stdout);
+  assert.equal(telemetry.costUsd, 0.042);
+  assert.equal(telemetry.resolvedModel, "grok-4.5-build");
+
+  // invoke() selection: complete product wins over incomplete telemetry text.
+  const consumerStdout = resolveHarnessProductStdout(
+    result.stdout,
+    result.product_stdout,
+    telemetry.text,
+  );
+  assert.equal(consumerStdout, plainProduct);
+  assert.deepEqual(verifyPlanRevisionOutput(consumerStdout), { ok: true });
+  assert.equal(
+    validateStageOutput("plan-revision.ack@1", { stdout: consumerStdout }).ok,
+    true,
+  );
+
+  // Human-forwarded transcript agrees with product text (no invented section).
+  assert.equal(forwarded.join(""), plainProduct);
+});
+
+test("runCapped + Grok: truly missing Feedback Incorporated is not invented under product side channel (#882)", async () => {
+  const { rawJsonl, plainProduct } = buildLargeGrokPlanRevisionStream({
+    includeAck: false,
+    planBodyChars: 80_000,
+  });
+  assert.ok(rawJsonl.length > MAX_OUTPUT);
+  assert.ok(!plainProduct.includes("## Feedback Incorporated"));
+
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999996,
+    kill: () => true,
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+
+  setImmediate(() => {
+    const step = 8_000;
+    for (let i = 0; i < rawJsonl.length; i += step) {
+      fakeChild.stdout.emit("data", Buffer.from(rawJsonl.slice(i, i + step)));
+    }
+    fakeChild.emit("close", 0);
+  });
+
+  const result = await runCapped("unused", [], tmpRoot, 30, false, "test", {
+    spawnFn,
+    captureMode: "tail",
+    transformForward: makeGrokForwardTransform(),
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.product_stdout, plainProduct);
+  assert.ok(!result.product_stdout!.includes("## Feedback Incorporated"));
+  const ack = verifyPlanRevisionOutput(result.product_stdout!);
+  assert.equal(ack.ok, false);
+  assert.ok(
+    !ack.ok && ack.reason.includes("## Feedback Incorporated"),
+    "true absence still fails with the existing missing-section reason",
+  );
+
+  // Cost still recoverable.
+  const telemetry = parseGrokTelemetry(result.stdout);
+  assert.equal(telemetry.costUsd, 0.042);
+});
+
+test("resolveHarnessProductStdout: prefers longer reconstruction when both product and telemetry exist (#882)", () => {
+  // Claude-shaped: terminal envelope has full text; product deltas match.
+  assert.equal(
+    resolveHarnessProductStdout("raw", "hello", "hello"),
+    "hello",
+  );
+  // Grok-shaped: product is complete; telemetry text is a short tail fragment.
+  assert.equal(
+    resolveHarnessProductStdout("raw-jsonl", "## Feedback Incorporated\n- [ADDRESSED] x\nplan body", "plan body"),
+    "## Feedback Incorporated\n- [ADDRESSED] x\nplan body",
+  );
+  // Terminal envelope fuller than incomplete deltas (prefer longer).
+  assert.equal(
+    resolveHarnessProductStdout("raw", "partial", "full assistant reply from result line"),
+    "full assistant reply from result line",
+  );
+  // No product side channel → telemetry text, else raw.
+  assert.equal(resolveHarnessProductStdout("raw", undefined, "from tel"), "from tel");
+  assert.equal(resolveHarnessProductStdout("raw", undefined, null), "raw");
+  // Empty product (no text deltas) must not wipe raw fallback or invent a section.
+  assert.equal(resolveHarnessProductStdout("raw envelope", "", null), "raw envelope");
+  assert.equal(resolveHarnessProductStdout("raw", "", "from tel only"), "from tel only");
 });
