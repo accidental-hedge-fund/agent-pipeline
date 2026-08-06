@@ -124,6 +124,10 @@ import {
   hydrateStageAttemptLedger,
   type StageAttemptLedgerDeps,
 } from "../stage-attempt-ledger.ts";
+import {
+  integrityBlocksReviewReuse,
+  type IntegrityInvalidationRecord,
+} from "../candidate-integrity.ts";
 
 /**
  * Tri-state result of {@link resolveReviewedShaCurrency}: whether a SHA a
@@ -620,6 +624,63 @@ export async function enforceReviewShaGate(
   }
 
   const head = (await getPrDetailFn(cfg, prNumber)).head_sha;
+
+  // #857 candidate-integrity: scope_expansion / unverified / expected_scoped_change
+  // invalidations block prior review as readiness authority for the post-mutation
+  // head — even when residual SHA / internal-commit heuristics might otherwise
+  // look reusable. Store authority is the runDir integrity store.
+  if (deps.runDir && reviewed.sha && head && reviewed.sha !== head) {
+    let integrityBlock: IntegrityInvalidationRecord | null = null;
+    try {
+      integrityBlock = await integrityBlocksReviewReuse(
+        deps.runDir,
+        head,
+        reviewed.sha,
+      );
+    } catch (err) {
+      console.warn(
+        `[pipeline] #${issueNumber}: candidate-integrity invalidation check failed (non-fatal to gate, fail-closed to re-review): ${(err as Error).message}`,
+      );
+      // Fail closed: cannot confirm integrity → do not reuse prior review.
+      integrityBlock = {
+        from_sha: reviewed.sha,
+        to_sha: head,
+        mutation_id: "unknown",
+        classification: "unverified",
+        invalidated_review: true,
+        invalidated_readiness: true,
+        requires_fresh_review: true,
+        reason: "integrity store unreadable",
+        mutation_method: "rebase",
+        at: new Date().toISOString(),
+      };
+    }
+    if (integrityBlock) {
+      const reviewStage: Stage = reviewed.round === 1 ? "review-1" : "review-2";
+      await postCommentFn(
+        cfg,
+        issueNumber,
+        staleReviewNotice(reviewed.sha, head) +
+          `\n\n_candidate-integrity: \`${integrityBlock.classification}\` — ` +
+          `${integrityBlock.reason}_`,
+      );
+      await transitionFn(
+        cfg,
+        issueNumber,
+        "pre-merge",
+        reviewStage,
+        `Re-running review ${reviewed.round}: candidate-integrity ` +
+          `${integrityBlock.classification} invalidated prior review for ` +
+          `\`${head.slice(0, 7)}\` (was \`${reviewed.sha.slice(0, 7)}\`).`,
+      );
+      return {
+        advanced: true,
+        from: "pre-merge",
+        to: reviewStage,
+        summary: `re-review: candidate-integrity ${integrityBlock.classification}`,
+      };
+    }
+  }
 
   // Shared guard for the verdict-REUSE short-circuits below (exact-SHA match,
   // pipeline-internal-only commits, diff-hash unchanged). A recorded verdict may

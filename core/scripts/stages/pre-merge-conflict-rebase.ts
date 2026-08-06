@@ -21,6 +21,10 @@ import {
   hydrateStageAttemptLedger,
   type StageAttemptLedgerDeps,
 } from "../stage-attempt-ledger.ts";
+import {
+  runCoveredCandidateMutation,
+} from "../candidate-integrity.ts";
+import { appendEvent, defaultRunStoreDeps } from "../run-store.ts";
 
 /** Residual legacy marker path — salvage exclusion only; engine does not write it (#759). */
 export const REBASE_MARKER_FILE = PIPELINE_INTERNAL_MARKER_FILES[0];
@@ -182,7 +186,60 @@ export async function recoverFromMergeConflict(
       }
     }
 
-    const gitOk = await tryRebaseAndPushFn(cfg, issueNumber);
+    // #857: wrap conflict-recovery head movement in candidate-integrity when runDir known.
+    let gitOk: boolean;
+    const tryRebase = () => tryRebaseAndPushFn(cfg, issueNumber);
+    if (ledgerRunDir && cfg.base_branch && beforeSha) {
+      const integrityResult = await runCoveredCandidateMutation(
+        {
+          storeRoot: ledgerRunDir,
+          subject: {
+            run_id: path.basename(ledgerRunDir),
+            issue: issueNumber,
+            pr: prNumber ?? null,
+          },
+          mutation_method: "rebase",
+          base_ref: cfg.base_branch,
+          worktreePath: wt.path,
+          gitInWorktree: deps.gitInWorktree ?? gitInWorktree,
+          resolveBaseSha: async () => {
+            const r = await (deps.gitInWorktree ?? gitInWorktree)(
+              wt.path,
+              ["rev-parse", `origin/${cfg.base_branch}`],
+              { ignoreFailure: true },
+            );
+            return r.code === 0 ? r.stdout.trim() || null : null;
+          },
+          resolveCandidateSha: async () => {
+            if (prNumber === undefined) {
+              const local = await (deps.gitInWorktree ?? gitInWorktree)(
+                wt.path,
+                ["rev-parse", "HEAD"],
+                { ignoreFailure: true },
+              );
+              return local.code === 0 ? local.stdout.trim() || null : null;
+            }
+            try {
+              return (await getPrDetailFn(cfg, prNumber)).head_sha;
+            } catch {
+              return null;
+            }
+          },
+          emitEvent: async (event) => {
+            await appendEvent(ledgerRunDir, event as never, defaultRunStoreDeps).catch(() => {});
+          },
+        },
+        tryRebase,
+      );
+      // Side-effect success vs integrity disposition are separate: HEAD re-read
+      // + resolveRebasePushResult decide "rebased; CI re-running"; integrity
+      // store holds invalidation for readiness/review reuse.
+      gitOk = integrityResult.aborted
+        ? false
+        : integrityResult.mutation_result === true;
+    } else {
+      gitOk = await tryRebase();
+    }
 
     let afterSha: string | undefined;
     if (prNumber !== undefined) {

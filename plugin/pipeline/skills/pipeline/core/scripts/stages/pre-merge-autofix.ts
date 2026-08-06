@@ -27,6 +27,37 @@ import { branchName, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import type { InvokeFn } from "../openspec-consistency.ts";
 import type { PipelineConfig, ReviewFinding } from "../types.ts";
+import {
+  declaredScopeFromFindingPaths,
+  runCoveredCandidateMutation,
+  type DeclaredRepairScope,
+  type IntegritySubject,
+  type IntegrityStoreDeps,
+  type CandidateIntegrityEventPayload,
+  type MutationMethod,
+} from "../candidate-integrity.ts";
+
+/** Optional #857 integrity wrapper context for head-moving auto-fix. */
+export interface PreMergeAutoFixIntegrityOpts {
+  storeRoot: string;
+  subject: IntegritySubject;
+  base_ref: string;
+  resolveBaseSha: () => Promise<string | null>;
+  resolveCandidateSha: () => Promise<string | null>;
+  /** When omitted, empty scope → any content change is scope_expansion. */
+  declared_scope?: DeclaredRepairScope;
+  /** Convenience: build scope from finding file paths. */
+  finding_paths?: string[];
+  emitEvent?: (event: CandidateIntegrityEventPayload) => Promise<void>;
+  storeDeps?: IntegrityStoreDeps;
+  mutation_id?: string;
+  engine_version?: string;
+  /**
+   * Defaults to `pre_merge_autofix`. Recovery mechanical repair passes
+   * `recovery_repair`; conflict surgical repair may pass `conflict_repair`.
+   */
+  mutation_method?: MutationMethod;
+}
 
 /**
  * #698 / #758: terminal disposition for a confirmed clean auto-fix no-op
@@ -546,6 +577,8 @@ export async function performPreMergeAutoFix(
   salvageFn: typeof trySalvageUncommittedWork = trySalvageUncommittedWork,
   repairIdentity: { commitSubjectPrefix?: string; salvageLabel?: string } = {},
   claimAttempt?: () => Promise<boolean>,
+  /** #857: when set, head-moving auto-fix runs under candidate-integrity. */
+  integrity?: PreMergeAutoFixIntegrityOpts,
 ): Promise<PreMergeAutoFixResult> {
   const harness = cfg.harnesses?.implementer;
   if (!harness) return { status: "error" };
@@ -565,9 +598,10 @@ export async function performPreMergeAutoFix(
     pipelineRunId,
   });
 
-  // Shared implementer-round skeleton (#629): reattach → headBefore → invoke →
-  // salvage on confirmed no-new-commit → stage-owned amend/push/noop-clean.
-  return runHarnessRound({
+  const runBody = () =>
+    // Shared implementer-round skeleton (#629): reattach → headBefore → invoke →
+    // salvage on confirmed no-new-commit → stage-owned amend/push/noop-clean.
+    runHarnessRound({
     wtPath: wt.path,
     issueNumber,
     pipelineRunId,
@@ -720,4 +754,65 @@ export async function performPreMergeAutoFix(
       return { status: "fix-committed", headSha: postFixHead };
     },
   });
+
+  if (!integrity) {
+    return runBody();
+  }
+
+  const scope =
+    integrity.declared_scope ??
+    (integrity.finding_paths
+      ? declaredScopeFromFindingPaths(integrity.finding_paths, "pre-merge autofix findings")
+      : { paths: [], directories: [], reason: "pre-merge autofix empty scope" });
+
+  const integrityResult = await runCoveredCandidateMutation(
+    {
+      storeRoot: integrity.storeRoot,
+      subject: integrity.subject,
+      mutation_method: integrity.mutation_method ?? "pre_merge_autofix",
+      declared_scope: scope,
+      base_ref: integrity.base_ref,
+      worktreePath: wt.path,
+      gitInWorktree: gitFn,
+      resolveBaseSha: integrity.resolveBaseSha,
+      resolveCandidateSha: integrity.resolveCandidateSha,
+      emitEvent: integrity.emitEvent,
+      storeDeps: integrity.storeDeps,
+      mutation_id: integrity.mutation_id,
+      engine_version: integrity.engine_version,
+    },
+    runBody,
+  );
+
+  if (integrityResult.aborted) {
+    return {
+      status: "error",
+      diagnostic: `candidate-integrity pre-persist aborted auto-fix: ${integrityResult.abort_reason ?? "unknown"}`,
+    };
+  }
+
+  const body = integrityResult.mutation_result;
+  if (!body) {
+    return {
+      status: "error",
+      diagnostic: integrityResult.mutation_error ?? "auto-fix incomplete under integrity",
+    };
+  }
+
+  // Scope expansion / unverified: force error so readiness cannot carry forward.
+  if (
+    integrityResult.classification === "scope_expansion" ||
+    integrityResult.classification === "unverified"
+  ) {
+    return {
+      status: "error",
+      diagnostic:
+        `candidate-integrity ${integrityResult.classification}: ` +
+        `${integrityResult.disposition.invalidation_reason ?? integrityResult.classification}`,
+    };
+  }
+
+  // expected_scoped_change / semantically_equivalent: return body; SHA gate
+  // requires fresh review via integrity invalidation records for scoped change.
+  return body;
 }
