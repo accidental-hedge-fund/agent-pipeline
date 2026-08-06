@@ -979,11 +979,10 @@ export async function advanceVisual(
   // #760: rematerialize before parking worktree-missing (transient-retryable).
   let wt = await getForIssueFn(cfg, issueNumber);
   if (!wt) {
+    // EnsureManagedWorktreeResult uses pass|skipped|fail (not "ok"); only fail parks.
     const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
     const remat = await ensureFn(cfg, issueNumber, { getOnDiskForIssue: getForIssueFn });
-    if (remat.result === "ok") {
-      wt = { path: remat.worktree.path, slug: remat.worktree.slug };
-    } else {
+    if (remat.result === "fail") {
       const reason =
         `visual-gate: no worktree found and rematerialize failed (${remat.blockerKind}): ${remat.reason}`;
       if (remat.blockerKind === "worktree-capacity") {
@@ -997,6 +996,7 @@ export async function advanceVisual(
       await setBlockedFn(cfg, issueNumber, reason, "visual-gate", "worktree-missing");
       return { advanced: false, status: "blocked", reason, blockerKind: "worktree-missing" };
     }
+    wt = { path: remat.worktree.path, slug: remat.worktree.slug };
   }
 
   const maxAttempts = cfg.visual_gate.max_attempts;

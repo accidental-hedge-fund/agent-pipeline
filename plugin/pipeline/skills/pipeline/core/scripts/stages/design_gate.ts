@@ -268,11 +268,11 @@ export async function advanceDesignGate(
   let wt = await getForIssueFn(cfg, issueNumber);
   if (!wt) {
     // #760: transient-retryable worktree-missing — rematerialize before park.
+    // EnsureManagedWorktreeResult uses pass|skipped|fail (not "ok"); treat only
+    // fail as terminal — successful recreate must continue (#882 recovery).
     const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
     const remat = await ensureFn(cfg, issueNumber, { getOnDiskForIssue: getForIssueFn });
-    if (remat.result === "ok") {
-      wt = { path: remat.worktree.path, slug: remat.worktree.slug };
-    } else {
+    if (remat.result === "fail") {
       const reason =
         `design-gate: no worktree found and rematerialize failed (${remat.blockerKind}): ${remat.reason}`;
       // Explicit kind literals keep the blocked-recipes / disposition scanners honest.
@@ -287,6 +287,7 @@ export async function advanceDesignGate(
       await setBlockedFn(cfg, issueNumber, reason, "design-gate", "worktree-missing");
       return { advanced: false, status: "blocked", reason, blockerKind: "worktree-missing" };
     }
+    wt = { path: remat.worktree.path, slug: remat.worktree.slug };
   }
 
   // Reconstruct prior state from this issue's own design-gate comments (#436 D8).

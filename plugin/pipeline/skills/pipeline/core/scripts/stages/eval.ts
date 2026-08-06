@@ -534,11 +534,10 @@ export async function advanceEval(
   // before parking worktree-missing (transient-retryable disposition).
   let wt = await getForIssueFn(cfg, issueNumber);
   if (!wt) {
+    // EnsureManagedWorktreeResult uses pass|skipped|fail (not "ok"); only fail parks.
     const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
     const remat = await ensureFn(cfg, issueNumber, { getOnDiskForIssue: getForIssueFn });
-    if (remat.result === "ok") {
-      wt = { path: remat.worktree.path, slug: remat.worktree.slug };
-    } else {
+    if (remat.result === "fail") {
       const reason =
         `eval-gate: no worktree found and rematerialize failed (${remat.blockerKind}): ${remat.reason}`;
       if (remat.blockerKind === "worktree-capacity") {
@@ -552,6 +551,7 @@ export async function advanceEval(
       await setBlockedFn(cfg, issueNumber, reason, "eval-gate", "worktree-missing");
       return { advanced: false, status: "blocked", reason, blockerKind: "worktree-missing" };
     }
+    wt = { path: remat.worktree.path, slug: remat.worktree.slug };
   }
 
   const maxAttempts = cfg.eval_gate.max_attempts;

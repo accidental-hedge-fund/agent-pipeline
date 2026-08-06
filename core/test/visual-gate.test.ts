@@ -556,6 +556,7 @@ test("visual-gate: no worktree → blocked", async () => {
   // #760: rematerialize is attempted before park; inject fail so no real gh.
   deps.ensureManagedWorktree = async () => ({
     result: "fail" as const,
+    worktree: null,
     blockerKind: "worktree-missing" as const,
     reason: "no recoverable remote branch",
   });
@@ -566,6 +567,28 @@ test("visual-gate: no worktree → blocked", async () => {
   assert.match((out as { reason: string }).reason, /no worktree found and rematerialize failed/);
   assert.equal(log.blocked.length, 1);
   assert.equal(log.blocked[0].kind, "worktree-missing");
+});
+
+test("visual-gate: missing worktree + rematerialize pass continues (not false worktree-missing)", async () => {
+  // Same result-contract bug as design-gate #882: pass must not be treated as fail.
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, command: "npx playwright test", mode: "gate", max_attempts: 1 });
+  const deps = makeDeps(log, [passResult()], null);
+  let ensureCalls = 0;
+  deps.ensureManagedWorktree = async () => {
+    ensureCalls += 1;
+    return {
+      result: "pass" as const,
+      worktree: { path: "/tmp/wt-remat", slug: "50-slug", branch: "pipeline/50-slug" },
+      reason: "recreated from open PR head 93d8f70",
+    };
+  };
+
+  const out = await advanceVisual(cfg, 50, {}, deps);
+
+  assert.equal(ensureCalls, 1);
+  assert.equal(log.blocked.length, 0, `must not park after successful rematerialize; got: ${JSON.stringify(log.blocked)}`);
+  assert.equal(out.advanced, true);
 });
 
 test("visual-gate: enabled with no command → blocked (visual-gate-misconfigured)", async () => {
