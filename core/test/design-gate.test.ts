@@ -204,6 +204,43 @@ test("parseDesignDecisionRecord: malformed output yields null record with errors
   assert.ok(errors.length > 0);
 });
 
+test("parseDesignDecisionRecord: invalid first fence then valid second fence is accepted (#882 design-gate)", () => {
+  // Production Grok design-gate response shape: prose + broken draft fence +
+  // corrected fence. Pre-fix only tried the first fence (and a greedy inline
+  // span from first `{` to last `}`), so a valid later record false-failed
+  // with no usable decision record after re-ask.
+  const good = validRecord();
+  good.decisions[0] = { ...good.decisions[0], id: "d-recovered", title: "Recovered decision" };
+  const brokenFence =
+    '```json\n{\n  "schema_version": 1,\n  "decisions": [\n    {\n      "id": "d1",\n      "title": "broken",\n      "alternatives": [\n        {\n          "option": "a",\n          "rejected_because": "x"\n      ],\n      "assumptions": []\n    }\n  ]\n}\n```';
+  const goodFence = "```json\n" + JSON.stringify(good, null, 2) + "\n```";
+  const output =
+    "I'll ground decisions in the diff." +
+    brokenFence +
+    "\nCorrected record:\n" +
+    goodFence +
+    "\n";
+  const { record, errors } = parseDesignDecisionRecord(output);
+  assert.equal(errors.length, 0, `expected parse success, got: ${errors.join("; ")}`);
+  assert.ok(record);
+  assert.equal(record!.decisions[0].id, "d-recovered");
+  assert.equal(record!.decisions[0].title, "Recovered decision");
+});
+
+test("parseDesignDecisionRecord: balanced inline objects — later valid object wins over earlier broken draft (#882)", () => {
+  const good = validRecord();
+  good.decisions[0] = { ...good.decisions[0], id: "d-inline" };
+  // Broken first object (missing closing brace for alternatives entry) then a
+  // complete second object — greedy first-to-last `}` matching fails both.
+  const broken =
+    '{\n  "schema_version": 1,\n  "decisions": [{\n    "id": "d1",\n    "title": "x",\n    "alternatives": [{\n      "option": "a",\n      "rejected_because": "b"\n    ],\n    "assumptions": []\n  }]\n}';
+  const output = `preamble\n${broken}\n${JSON.stringify(good)}\n`;
+  const { record, errors } = parseDesignDecisionRecord(output);
+  assert.equal(errors.length, 0, `expected parse success, got: ${errors.join("; ")}`);
+  assert.ok(record);
+  assert.equal(record!.decisions[0].id, "d-inline");
+});
+
 // ---------------------------------------------------------------------------
 // Bounding / truncation
 // ---------------------------------------------------------------------------
