@@ -280,3 +280,123 @@ test("invokePromptHarnessReview: effort.review absent — no --effort flag forwa
     process.env.PATH = oldPath;
   }
 });
+
+// #882: fail_closed + empty runDir used to withhold forever (workflow-state park).
+// Review must call the deterministic producer once before withhold; when the
+// producer writes SHA-matched evidence, the model invoke proceeds.
+// Non-git cwd → acquisition uses 40 zero-hex placeholder; producer writes that pin.
+test("invokePromptHarnessReview: fail_closed missing evidence regenerates then invokes reviewer", async () => {
+  const binDir = makeFakeClaude();
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  const wt = fs.mkdtempSync(path.join(tmpRoot, "wt-"));
+  const runDir = fs.mkdtempSync(path.join(tmpRoot, "run-"));
+  const zeroSha = "0".repeat(40);
+  let gateCalls = 0;
+  try {
+    const cfg = baseCfg({
+      tester_evidence: {
+        on_missing: "fail_closed",
+        max_output_chars: 4000,
+        max_artifact_chars: 48_000,
+        extractors: [],
+      },
+    });
+    const { result, effectiveReviewer } = await invokePromptHarnessReview(
+      cfg,
+      882,
+      "Test issue",
+      "test body",
+      "plan text",
+      undefined,
+      undefined,
+      "diff text",
+      1,
+      wt,
+      {
+        runDir,
+        pipelineRunId: "882-test",
+        runTestGate: async () => {
+          gateCalls += 1;
+          const { writeTesterEvidence, buildTesterEvidence } = await import(
+            "../scripts/tester-evidence.ts"
+          );
+          const evidence = buildTesterEvidence({
+            candidateSha: zeroSha,
+            runId: path.basename(runDir),
+            issue: 882,
+            wtPath: wt,
+            enabled: true,
+            commandIdentity: "npm test",
+            timeoutSec: 60,
+            maxOutputChars: 4000,
+            startedAt: "2026-08-06T00:00:00Z",
+            endedAt: "2026-08-06T00:00:01Z",
+            durationMs: 1000,
+            overallStatus: "passed",
+            lastCommand: {
+              identity: "npm test",
+              exitCode: 0,
+              durationMs: 1000,
+              status: "passed",
+              output: "ok",
+            },
+          });
+          await writeTesterEvidence(runDir, evidence, { appendEvent: false });
+          return { skipped: false, passed: true, attempts: 0 };
+        },
+      },
+    );
+    assert.equal(gateCalls, 1, "must regenerate suite evidence once when missing");
+    assert.notEqual(effectiveReviewer, "tester-evidence-gate");
+    assert.equal(result.success, true);
+    assert.ok(result.stdout.length > 0);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("invokePromptHarnessReview: fail_closed still withholds when regenerate writes nothing", async () => {
+  const binDir = makeFakeClaude();
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  const wt = fs.mkdtempSync(path.join(tmpRoot, "wt-"));
+  const runDir = fs.mkdtempSync(path.join(tmpRoot, "run-"));
+  let gateCalls = 0;
+  try {
+    const cfg = baseCfg({
+      tester_evidence: {
+        on_missing: "fail_closed",
+        max_output_chars: 4000,
+        max_artifact_chars: 48_000,
+        extractors: [],
+      },
+    });
+    const { result, effectiveReviewer } = await invokePromptHarnessReview(
+      cfg,
+      882,
+      "Test issue",
+      "test body",
+      "plan text",
+      undefined,
+      undefined,
+      "diff text",
+      1,
+      wt,
+      {
+        runDir,
+        pipelineRunId: "882-test",
+        runTestGate: async () => {
+          gateCalls += 1;
+          return { skipped: false, passed: true, attempts: 0 };
+        },
+      },
+    );
+    assert.equal(gateCalls, 1);
+    assert.equal(effectiveReviewer, "tester-evidence-gate");
+    assert.equal(result.success, false);
+    assert.match(result.stderr, /fail_closed|missing tester-evidence/i);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});

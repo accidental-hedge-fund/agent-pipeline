@@ -19,6 +19,7 @@ import {
   extractTesterMetricsFromEvent,
   extractTesterMetricsFromEvidence,
   formatTesterEvidenceSummary,
+  loadOrRegenerateTesterEvidenceForReview,
   loadTesterEvidenceForReview,
   loadTesterEvidenceForReviewSync,
   normalizeCandidateSha,
@@ -798,6 +799,114 @@ test("post-fix regeneration: new HEAD overwrites prior evidence (stale until rew
     fs.rmSync(runDir, { recursive: true, force: true });
     fs.rmSync(wt, { recursive: true, force: true });
   }
+});
+
+// #882: mid-pipeline re-entry (fresh runDir after design-gate / recovery) must
+// not park forever under fail_closed solely because tester-evidence.json is
+// absent from *this* run directory. loadOrRegenerate invokes the deterministic
+// producer once, then re-acquires — never invents a pass.
+test("loadOrRegenerate: missing + regenerate writes current evidence (fail_closed recovers)", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/882-regen";
+  let regenerateCalls = 0;
+  const acq = await loadOrRegenerateTesterEvidenceForReview(
+    runDir,
+    SHA_A,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    async () => {
+      regenerateCalls += 1;
+      await writeTesterEvidence(runDir, baseEvidence({ candidate_sha: SHA_A }), {
+        io,
+        appendEvent: false,
+      });
+    },
+    io,
+  );
+  assert.equal(regenerateCalls, 1, "producer must run once when missing under fail_closed");
+  assert.equal(acq.classification, "current");
+  assert.equal(acq.withholdInvoke, false);
+  assert.equal(acq.artifact?.candidate_sha, SHA_A);
+});
+
+test("loadOrRegenerate: current evidence does not call regenerate", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/882-current";
+  await writeTesterEvidence(runDir, baseEvidence({ candidate_sha: SHA_A }), {
+    io,
+    appendEvent: false,
+  });
+  let regenerateCalls = 0;
+  const acq = await loadOrRegenerateTesterEvidenceForReview(
+    runDir,
+    SHA_A,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    async () => {
+      regenerateCalls += 1;
+    },
+    io,
+  );
+  assert.equal(regenerateCalls, 0);
+  assert.equal(acq.classification, "current");
+  assert.equal(acq.withholdInvoke, false);
+});
+
+test("loadOrRegenerate: stale triggers regenerate then current after rewrite", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/882-stale";
+  await writeTesterEvidence(runDir, baseEvidence({ candidate_sha: SHA_A }), {
+    io,
+    appendEvent: false,
+  });
+  let regenerateCalls = 0;
+  const acq = await loadOrRegenerateTesterEvidenceForReview(
+    runDir,
+    SHA_B,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    async () => {
+      regenerateCalls += 1;
+      await writeTesterEvidence(runDir, baseEvidence({ candidate_sha: SHA_B }), {
+        io,
+        appendEvent: false,
+      });
+    },
+    io,
+  );
+  assert.equal(regenerateCalls, 1);
+  assert.equal(acq.classification, "current");
+  assert.equal(acq.artifact?.candidate_sha, SHA_B);
+  assert.equal(acq.withholdInvoke, false);
+});
+
+test("loadOrRegenerate: regenerate that writes nothing still withholds under fail_closed", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/882-still-missing";
+  let regenerateCalls = 0;
+  const acq = await loadOrRegenerateTesterEvidenceForReview(
+    runDir,
+    SHA_A,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    async () => {
+      regenerateCalls += 1;
+      // Intentionally do not write — producer/write failure path.
+    },
+    io,
+  );
+  assert.equal(regenerateCalls, 1);
+  assert.equal(acq.classification, "missing");
+  assert.equal(acq.withholdInvoke, true);
+  assert.doesNotMatch(acq.section, /Overall status:\*\* `passed`/);
+});
+
+test("loadOrRegenerate: no regenerate callback keeps pure load-only fail_closed", async () => {
+  const acq = await loadOrRegenerateTesterEvidenceForReview(
+    "/runs/none",
+    SHA_A,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    undefined,
+    memoryIo(),
+  );
+  assert.equal(acq.classification, "missing");
+  assert.equal(acq.withholdInvoke, true);
 });
 
 test("default max_output_chars constant", () => {
