@@ -198,6 +198,37 @@ test("parseDesignDecisionRecord: extracts a fenced JSON record and validates it"
   assert.equal(record!.decisions[0].id, "d1");
 });
 
+
+test("parseDesignDecisionRecord: prefers a later valid fence when the first is truncated (#882)", () => {
+  const good = JSON.stringify({
+    schema_version: 1,
+    decisions: [
+      {
+        id: "d1",
+        title: "t",
+        surface: "s",
+        alternatives: [{ option: "o", rejected_because: "r" }],
+        assumptions: ["a"],
+        invariants: ["i"],
+        evidence: ["e"],
+        generalization_boundary: "g",
+        uncertainty: "u",
+      },
+    ],
+  });
+  // First fence is truncated/invalid JSON; second is complete (re-ask emission).
+  const output =
+    "preamble\n```json\n{\n  \"schema_version\": 1,\n  \"decisions\": [{\"id\": \"d1\"\n```\n" +
+    "retry\n```json\n" +
+    good +
+    "\n```\n";
+  const { record, errors } = parseDesignDecisionRecord(output);
+  assert.equal(errors.length, 0);
+  assert.ok(record);
+  assert.equal(record!.decisions.length, 1);
+  assert.equal(record!.decisions[0]!.id, "d1");
+});
+
 test("parseDesignDecisionRecord: malformed output yields null record with errors", () => {
   const { record, errors } = parseDesignDecisionRecord("not json at all");
   assert.equal(record, null);
