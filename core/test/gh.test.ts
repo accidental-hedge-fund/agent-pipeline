@@ -259,7 +259,7 @@ test("isTransientGhError: HTTP 403 without rate-limit body is deterministic", ()
 // This is added in gh.ts for this test module. If it's not present, the tests
 // below will fail at import time (proving the bite).
 
-import { ghRunForTest, postComment } from "../scripts/gh.ts";
+import { getPrChecks, ghRunForTest, postComment } from "../scripts/gh.ts";
 import type { GhRunOptions } from "../scripts/gh.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -402,4 +402,48 @@ test("ghRun retry loop: network-level error (ETIMEDOUT in message, empty stderr)
   const result = await ghRunForTest(["api", "user"], { runner, sleep, retries: 3 });
   assert.equal(result, "ok");
   assert.equal(calls, 3);
+});
+
+// ---------------------------------------------------------------------------
+// getPrChecks — "no checks reported" normalizes to [] (#882)
+// ---------------------------------------------------------------------------
+
+test("getPrChecks: gh 'no checks reported' non-zero exit → empty array (#882)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  let calls = 0;
+  const runner = async (_args: string[]) => {
+    calls++;
+    const err = new Error("Command failed: gh pr checks") as Error & { stderr: string };
+    err.stderr = "no checks reported on the 'feature/x' branch";
+    throw err;
+  };
+  const result = await getPrChecks(cfg, 883, { runner, retries: 1 });
+  assert.deepEqual(result, []);
+  assert.equal(calls, 1, "no retries for deterministic empty-check result");
+});
+
+test("getPrChecks: unrelated gh failure still throws (#882)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const runner = async (_args: string[]) => {
+    const err = new Error("Command failed: gh pr checks") as Error & { stderr: string };
+    err.stderr = "HTTP 401: authentication required";
+    throw err;
+  };
+  await assert.rejects(
+    () => getPrChecks(cfg, 883, { runner, retries: 1 }),
+    /401|authentication/i,
+  );
+});
+
+test("getPrChecks: successful JSON stdout parses check runs (#882)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const runner = async (_args: string[]) => ({
+    stdout: JSON.stringify([
+      { name: "test", state: "COMPLETED", bucket: "pass", description: "", link: "" },
+    ]),
+  });
+  const result = await getPrChecks(cfg, 42, { runner, retries: 1 });
+  assert.equal(result.length, 1);
+  assert.equal(result[0].name, "test");
+  assert.equal(result[0].bucket, "pass");
 });

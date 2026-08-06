@@ -662,7 +662,14 @@ export async function advance(
       checks = await getPrChecksFn(cfg, prNumber);
     } catch (err) {
       const e = err as Error;
-      return { advanced: false, status: "waiting", reason: `gh pr checks failed: ${e.message}` };
+      // Defense in depth for older getPrChecks / injected fakes: gh's empty
+      // result is a non-zero exit with "no checks reported", not a waitable
+      // transport error. Same normalization as getPrChecks / merge (#95, #882).
+      if ((e.message ?? "").toLowerCase().includes("no checks reported")) {
+        checks = [];
+      } else {
+        return { advanced: false, status: "waiting", reason: `gh pr checks failed: ${e.message}` };
+      }
     }
 
     const agg = parseChecksAggregate(checks);

@@ -288,3 +288,27 @@ test("non-conflicting PR with zero checks (no CI workflow) still advances (#95)"
   assert.equal(rec.rebaseCalls, 0);
   assert.deepEqual(rec.blocked, []);
 });
+
+test("non-conflicting PR: getPrChecks throws 'no checks reported' still advances (#882)", async (t) => {
+  // Live gh exits non-zero with this message when a PR has zero check-runs.
+  // Pre-merge must not treat that as an indefinite wait (ci_timeout spin).
+  const { deps, rec } = makeDeps({ mergeable: true, mergeable_state: "CLEAN" });
+  deps.getPrChecks = async () => {
+    rec.ciPolls++;
+    throw new Error(
+      "gh pr checks 883 failed: no checks reported on the 'pipeline/882-x' branch",
+    );
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await advance(makeCfg(), ISSUE, {}, deps);
+  });
+  assert.deepEqual(out, {
+    advanced: true,
+    from: "pre-merge",
+    to: "visual-gate",
+    summary: `PR #${PR_NUMBER} pre-merge gates passed`,
+  });
+  assert.equal(rec.ciPolls, 1, "exactly one consult — no wait loop on empty-check CLI error");
+  assert.deepEqual(rec.blocked, []);
+});
