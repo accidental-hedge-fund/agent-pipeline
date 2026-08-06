@@ -2538,3 +2538,105 @@ test("resolveHarnessProductStdout: prefers longer reconstruction when both produ
   assert.equal(resolveHarnessProductStdout("raw envelope", "", null), "raw envelope");
   assert.equal(resolveHarnessProductStdout("raw", "", "from tel only"), "from tel only");
 });
+
+// #882 dogfood: design-gate decision records with an invalid first fence + valid
+// second fence under Grok streaming-json + tail capture. Pre-fix tail-only
+// reconstruction fails with the live reason "no parseable JSON object found in
+// output" even though the human transcript contains a valid multi-fence record.
+test("runCapped + Grok: design-gate multi-fence decision record survives tail capture via product_stdout (#882 dogfood)", async () => {
+  const { parseDesignDecisionRecord } = await import("../scripts/design-gate.ts");
+
+  const decisions = Array.from({ length: 6 }, (_, i) => ({
+    id: `d${i + 1}`,
+    title: `Decision ${i + 1} ` + "t".repeat(180),
+    surface: "core/scripts/harness.ts",
+    alternatives: [
+      { option: "A " + "a".repeat(100), rejected_because: "R " + "r".repeat(100) },
+      { option: "B " + "b".repeat(100), rejected_because: "S " + "s".repeat(100) },
+    ],
+    assumptions: ["assume " + "x".repeat(60)],
+    invariants: ["inv " + "y".repeat(60)],
+    evidence: ["ev " + "z".repeat(60)],
+    generalization_boundary: "gb " + "g".repeat(80),
+    uncertainty: "unc " + "u".repeat(80),
+  }));
+  const good = JSON.stringify({ schema_version: 1, decisions }, null, 2);
+  // Structurally broken first fence (same class as live Grok draft → corrected).
+  const broken =
+    '{\n  "schema_version": 1,\n  "decisions": [{\n    "id": "d1",\n    "title": "broken",\n    "alternatives": [{\n      "option": "a",\n      "rejected_because": "b"\n    ],\n    "assumptions": []\n  }]\n}';
+  const pad = "\n## Notes\n\n" + "p".repeat(60_000);
+  const plainProduct =
+    "I'll ground decisions.\n```json\n" +
+    broken +
+    "\n```\nCorrected:\n```json\n" +
+    good +
+    "\n```\n" +
+    pad;
+
+  const chunkSize = 40;
+  const lines: string[] = [];
+  for (let i = 0; i < plainProduct.length; i += chunkSize) {
+    lines.push(JSON.stringify({ type: "text", data: plainProduct.slice(i, i + chunkSize) }));
+  }
+  lines.push(
+    JSON.stringify({
+      type: "end",
+      stopReason: "EndTurn",
+      sessionId: "SECRET-DG-882",
+      usage: { input_tokens: 1, output_tokens: 2 },
+      total_cost_usd: 0.01,
+      modelUsage: { "grok-4.5-build": { inputTokens: 1, outputTokens: 2, costUSD: 0.01 } },
+    }),
+  );
+  const rawJsonl = lines.join("\n") + "\n";
+  assert.ok(rawJsonl.length > MAX_OUTPUT, "fixture raw JSONL must exceed MAX_OUTPUT");
+  assert.ok(plainProduct.length < MAX_PRODUCT_OUTPUT);
+
+  // Pre-fix: tail-only reconstruction loses the leading multi-fence product →
+  // the exact live design-gate reason observed on #882 dogfood runs.
+  const tailOnlyRaw = rawJsonl.slice(rawJsonl.length - MAX_OUTPUT);
+  const tailOnlyTelemetry = parseGrokTelemetry(tailOnlyRaw);
+  const tailParse = parseDesignDecisionRecord(tailOnlyTelemetry.text ?? "");
+  assert.equal(tailParse.record, null);
+  assert.ok(
+    tailParse.errors.some((e) => /no parseable JSON object found/i.test(e)),
+    `expected live design-gate reason, got: ${tailParse.errors.join("; ")}`,
+  );
+
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999995,
+    kill: () => true,
+  });
+  const spawnFn = (() => fakeChild) as unknown as typeof import("node:child_process").spawn;
+
+  setImmediate(() => {
+    const step = 8_000;
+    for (let i = 0; i < rawJsonl.length; i += step) {
+      fakeChild.stdout.emit("data", Buffer.from(rawJsonl.slice(i, i + step)));
+    }
+    fakeChild.emit("close", 0);
+  });
+
+  const result = await runCapped("unused", [], tmpRoot, 30, false, "test", {
+    spawnFn,
+    captureMode: "tail",
+    transformForward: makeGrokForwardTransform(),
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.product_stdout, plainProduct);
+  assert.equal(parseGrokTelemetry(result.stdout).costUsd, 0.01);
+
+  const consumer = resolveHarnessProductStdout(
+    result.stdout,
+    result.product_stdout,
+    parseGrokTelemetry(result.stdout).text,
+  );
+  const parsed = parseDesignDecisionRecord(consumer);
+  assert.equal(parsed.errors.length, 0, `expected parse success, got: ${parsed.errors.join("; ")}`);
+  assert.ok(parsed.record);
+  assert.equal(parsed.record!.decisions.length, 6);
+  assert.equal(parsed.record!.decisions[0]!.id, "d1");
+});

@@ -1284,6 +1284,19 @@ export async function runCapped(
       // that ignored SIGTERM may still be alive. Defer to the SIGKILL timer above.
       if (timedOut) return;
       clearTimeout(timer);
+      // Force line-oriented forward transforms to emit any complete JSONL line
+      // that lacked a trailing newline at EOF (#882: residual buffer otherwise
+      // drops the final type:text / type:end-adjacent product delta).
+      if (opts.transformForward) {
+        const flushed = opts.transformForward("\n");
+        if (flushed) {
+          if (productBuf !== undefined && productBuf.length < MAX_PRODUCT_OUTPUT) {
+            const room = MAX_PRODUCT_OUTPUT - productBuf.length;
+            productBuf += flushed.length <= room ? flushed : flushed.slice(0, room);
+          }
+          if (stream) safeForward(fwd.stdout, flushed);
+        }
+      }
       const duration = (Date.now() - start) / 1000;
       const result: HarnessResult = {
         success: code === 0,
