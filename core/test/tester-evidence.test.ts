@@ -809,23 +809,36 @@ test("loadOrRegenerate: missing + regenerate writes current evidence (fail_close
   const io = memoryIo();
   const runDir = "/runs/882-regen";
   let regenerateCalls = 0;
-  const acq = await loadOrRegenerateTesterEvidenceForReview(
-    runDir,
-    SHA_A,
-    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
-    async () => {
-      regenerateCalls += 1;
-      await writeTesterEvidence(runDir, baseEvidence({ candidate_sha: SHA_A }), {
-        io,
-        appendEvent: false,
-      });
-    },
-    io,
-  );
-  assert.equal(regenerateCalls, 1, "producer must run once when missing under fail_closed");
-  assert.equal(acq.classification, "current");
-  assert.equal(acq.withholdInvoke, false);
-  assert.equal(acq.artifact?.candidate_sha, SHA_A);
+  const logs: string[] = [];
+  const origLog = console.log;
+  console.log = (...args: unknown[]) => {
+    logs.push(args.map(String).join(" "));
+  };
+  try {
+    const acq = await loadOrRegenerateTesterEvidenceForReview(
+      runDir,
+      SHA_A,
+      { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+      async () => {
+        regenerateCalls += 1;
+        await writeTesterEvidence(runDir, baseEvidence({ candidate_sha: SHA_A }), {
+          io,
+          appendEvent: false,
+        });
+      },
+      io,
+    );
+    assert.equal(regenerateCalls, 1, "producer must run once when missing under fail_closed");
+    assert.equal(acq.classification, "current");
+    assert.equal(acq.withholdInvoke, false);
+    assert.equal(acq.artifact?.candidate_sha, SHA_A);
+    assert.ok(
+      logs.some((l) => /tester-evidence: missing under fail_closed/i.test(l)),
+      "must log deterministic producer attempt before regenerate",
+    );
+  } finally {
+    console.log = origLog;
+  }
 });
 
 test("loadOrRegenerate: current evidence does not call regenerate", async () => {

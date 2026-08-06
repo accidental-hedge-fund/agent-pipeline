@@ -999,6 +999,10 @@ export async function loadOrRegenerateTesterEvidenceForReview(
   if (!isTesterRegenerableClassification(acq.classification)) return acq;
   // No run surface: cannot persist producer output for re-acquisition.
   if (!runDir) return acq;
+  console.log(
+    `[pipeline] tester-evidence: ${acq.classification} under fail_closed — ` +
+      `running deterministic producer once before withhold (candidate ${candidateSha.slice(0, 12) || "unknown"})`,
+  );
   try {
     await regenerate();
   } catch (err) {

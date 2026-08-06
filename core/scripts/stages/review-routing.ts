@@ -563,7 +563,16 @@ export async function advanceReview(
         `harness (${reviewer}) is installed/spawnable for a self-review fallback — ${reason}${stderrExcerpt}`
       : `Review harness (${reviewer})${modelNote} failed: ${reason}${stderrExcerpt}`;
     await setBlockedFn(cfg, issueNumber, detailMsg, stage, "harness-failure");
-    return { advanced: false, status: "blocked", reason };
+    // Must thread blockerKind on the Outcome: emitBlockedOutcomeEvents defaults
+    // missing kind to needs-human → workflow-state, which misroutes durable
+    // recovery for tester-evidence-gate / harness exits as a generic workflow
+    // park instead of harness-failure (#882 recovery diagnostic).
+    return {
+      advanced: false,
+      status: "blocked",
+      reason,
+      blockerKind: "harness-failure",
+    };
   }
 
   // A delegated `stage_executors` result must satisfy the FULL verdict schema —
