@@ -1,20 +1,20 @@
 {
   "schema_version": 1,
-  "version": "1.31.0",
-  "tag": "v1.31.0",
-  "frg_run_id": "frg-2026-08-06T02-42-16-610Z-8e328e51",
-  "frg_evidence_path": ".agent-pipeline/frg/1.31.0/latest.json",
-  "promoted_at": "2026-08-06T15:32:59Z",
-  "git_sha": "4613282de2",
+  "version": "1.31.1",
+  "tag": "v1.31.1",
+  "frg_run_id": "frg-2026-08-07T02-13-17-344Z-6d522271",
+  "frg_evidence_path": ".agent-pipeline/frg/1.31.1/latest.json",
+  "promoted_at": "2026-08-07T02:25:11Z",
+  "git_sha": "ff3cf79d5b",
   "git_sha_source": "promote-arg",
   "previous": {
     "schema_version": 1,
-    "version": "1.30.0",
-    "tag": "v1.30.0",
-    "git_sha": null,
-    "git_sha_source": "unknown",
-    "frg_run_id": "frg-2026-08-02T23-45-44-367Z-e405f0d3",
-    "frg_evidence_path": ".agent-pipeline/frg/1.30.0/latest.json",
-    "promoted_at": "2026-08-05T03:15:37Z"
+    "version": "1.31.0",
+    "tag": "v1.31.0",
+    "git_sha": "4613282de2",
+    "git_sha_source": "promote-arg",
+    "frg_run_id": "frg-2026-08-06T02-42-16-610Z-8e328e51",
+    "frg_evidence_path": ".agent-pipeline/frg/1.31.0/latest.json",
+    "promoted_at": "2026-08-06T15:32:59Z"
   }
 }
