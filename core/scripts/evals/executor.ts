@@ -271,8 +271,13 @@ export interface CellExecutionDeps {
    * side effects must not persist into the treatment lineage; defaults to
    * {@link copyIsolatedVerifierTree} under os.tmpdir. Called once per
    * held-out verifier so side effects cannot cascade across checks.
+   * `deadlineMs` bounds snapshot materialization; implementations MUST fail
+   * rather than run past the cell budget.
    */
-  createVerifierSnapshot?: (worktreeDir: string) => Promise<string>;
+  createVerifierSnapshot?: (
+    worktreeDir: string,
+    opts?: { deadlineMs?: number },
+  ) => Promise<string>;
   /** Remove a verifier snapshot directory from {@link createVerifierSnapshot}. */
   removeVerifierSnapshot?: (snapshotDir: string) => Promise<void>;
   /** Read source files from the post-step worktree for maintainability telemetry (#577). */
@@ -358,9 +363,100 @@ async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: stri
   }
 }
 
+/** True when a child_process error may have partial/truncated stdout. */
+function isGitExecInfraFailure(err: unknown): boolean {
+  const e = err as {
+    killed?: boolean;
+    signal?: string | null;
+    code?: string | number | null;
+    message?: string;
+  };
+  if (e.killed === true) return true;
+  if (e.signal === "SIGTERM" || e.signal === "SIGKILL") return true;
+  if (e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return true;
+  const msg = typeof e.message === "string" ? e.message : "";
+  if (/maxBuffer|ETIMEDOUT|timed out/i.test(msg)) return true;
+  return false;
+}
+
+/** Streamed content digest for a worktree path (mode + bytes or symlink target). */
+async function hashWorktreePathContent(absPath: string): Promise<string> {
+  try {
+    const st = await fs.promises.lstat(absPath);
+    if (st.isSymbolicLink()) {
+      const target = await fs.promises.readlink(absPath);
+      return createHash("sha256").update(`symlink:${st.mode}:${target}`).digest("hex");
+    }
+    if (st.isFile()) {
+      return await new Promise<string>((resolve, reject) => {
+        const h = createHash("sha256");
+        h.update(`file:${st.mode}:`);
+        const stream = fs.createReadStream(absPath);
+        stream.on("data", (chunk: string | Buffer) => h.update(chunk));
+        stream.on("error", reject);
+        stream.on("end", () => resolve(h.digest("hex")));
+      });
+    }
+    return createHash("sha256").update(`special:${st.mode}`).digest("hex");
+  } catch {
+    // Deleted or unreadable path relative to HEAD listing.
+    return createHash("sha256").update("deleted").digest("hex");
+  }
+}
+
+/** Split git `-z` path lists. Preserve path bytes exactly — do not trim. */
+function splitNulPaths(stdout: string): string[] {
+  return stdout.split("\0").filter((p) => p.length > 0);
+}
+
+async function hashWorktreePath(
+  worktreeDir: string,
+  rel: string,
+): Promise<{ path: string; contentSha256: string }> {
+  const abs = path.join(worktreeDir, rel);
+  try {
+    const st = await fs.promises.lstat(abs);
+    if (st.isSymbolicLink()) {
+      const target = await fs.promises.readlink(abs);
+      return {
+        path: rel,
+        contentSha256: createHash("sha256")
+          .update(`symlink:${st.mode}:${target}`)
+          .digest("hex"),
+      };
+    }
+    if (st.isFile()) {
+      // Streamed hash: content-addressed raw bytes (binaries included — not
+      // `git diff`'s "Binary files differ" summary which aliases distinct edits).
+      const h = createHash("sha256");
+      h.update(`file:${st.mode}:`);
+      await new Promise<void>((resolve, reject) => {
+        const stream = fs.createReadStream(abs);
+        stream.on("data", (chunk) => h.update(chunk));
+        stream.on("error", reject);
+        stream.on("end", () => resolve());
+      });
+      return { path: rel, contentSha256: h.digest("hex") };
+    }
+    return {
+      path: rel,
+      contentSha256: createHash("sha256").update(`special:${st.mode}`).digest("hex"),
+    };
+  } catch (err) {
+    return {
+      path: rel,
+      contentSha256: createHash("sha256")
+        .update(`missing:${(err as Error).message}`)
+        .digest("hex"),
+    };
+  }
+}
+
 /**
- * Content-addressed worktree fingerprint: HEAD + full tracked diff vs HEAD +
- * per-path content hashes of untracked files. Path-only porcelain status is
+ * Content-addressed worktree fingerprint: HEAD + per-path content hashes of
+ * every tracked and untracked working-tree path. Does **not** use `git diff`
+ * (binary summaries alias distinct bytes; partial stdout on timeout/maxBuffer
+ * is not a safe fingerprint input). Path-only porcelain status is also
  * insufficient — two distinct edits to the same path must not alias.
  */
 async function defaultGetRepoFingerprint(args: { worktreeDir: string }): Promise<string> {
@@ -372,138 +468,193 @@ async function defaultGetRepoFingerprint(args: { worktreeDir: string }): Promise
       cwd: args.worktreeDir,
       timeout: 15_000,
     });
-    // Full patch covers staged + unstaged tracked content relative to HEAD.
-    let trackedDiff = "";
-    try {
-      const diff = await execFileAsync("git", ["diff", "HEAD"], {
-        cwd: args.worktreeDir,
-        timeout: 60_000,
-        maxBuffer: 40 * 1024 * 1024,
-      });
-      trackedDiff = diff.stdout;
-    } catch (err) {
-      const e = err as { stdout?: string; code?: number };
-      // git diff exits 0 even with differences; nonzero is a real failure unless stdout present.
-      if (typeof e.stdout === "string") trackedDiff = e.stdout;
-      else throw err;
-    }
+    // Tracked paths (index) + untracked (exclude-standard). Fail closed on
+    // infra errors — never accept partial listing stdout.
+    const trackedList = await execFileAsync("git", ["ls-files", "-z"], {
+      cwd: args.worktreeDir,
+      timeout: 30_000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
     const untrackedList = await execFileAsync(
       "git",
       ["ls-files", "--others", "--exclude-standard", "-z"],
       { cwd: args.worktreeDir, timeout: 30_000, maxBuffer: 10 * 1024 * 1024 },
     );
-    const untrackedPaths = untrackedList.stdout
-      .split("\0")
-      .map((p) => p.trim())
-      .filter((p) => p.length > 0)
-      .sort();
-    const untrackedFiles: Array<{ path: string; contentSha256: string }> = [];
-    for (const rel of untrackedPaths) {
-      const abs = path.join(args.worktreeDir, rel);
-      let contentSha256: string;
-      try {
-        const st = await fs.promises.lstat(abs);
-        if (st.isSymbolicLink()) {
-          const target = await fs.promises.readlink(abs);
-          contentSha256 = createHash("sha256").update(`symlink:${target}`).digest("hex");
-        } else if (st.isFile()) {
-          const buf = await fs.promises.readFile(abs);
-          contentSha256 = createHash("sha256").update(buf).digest("hex");
-        } else {
-          contentSha256 = createHash("sha256").update(`special:${st.mode}`).digest("hex");
-        }
-      } catch (err) {
-        contentSha256 = createHash("sha256")
-          .update(`missing:${(err as Error).message}`)
-          .digest("hex");
-      }
-      untrackedFiles.push({ path: rel, contentSha256 });
+    const pathSet = new Set<string>([
+      ...splitNulPaths(trackedList.stdout),
+      ...splitNulPaths(untrackedList.stdout),
+    ]);
+    const files: Array<{ path: string; contentSha256: string }> = [];
+    for (const rel of [...pathSet].sort()) {
+      files.push(await hashWorktreePath(args.worktreeDir, rel));
     }
     return contentAddressedRepoFingerprint({
       headSha: head.stdout.trim(),
-      trackedDiff,
-      untrackedFiles,
+      pathEntries: files,
     });
   } catch (err) {
+    // Infra failure is not a silent fingerprint of partial state — surface as
+    // a distinct error digest so callers can see fingerprinting failed.
     return createHash("sha256").update(`fingerprint-error:${(err as Error).message}`).digest("hex");
   }
+}
+
+/** Default limits for verifier snapshot materialization (bounded, deadline-aware). */
+export const VERIFIER_SNAPSHOT_DEFAULTS = {
+  maxEntries: 50_000,
+  maxBytes: 256 * 1024 * 1024,
+} as const;
+
+export interface CopyIsolatedVerifierTreeOptions {
+  /** Absolute deadline (epoch ms). Exceeding fails the copy. */
+  deadlineMs?: number;
+  maxEntries?: number;
+  maxBytes?: number;
 }
 
 /**
  * Copy a treatment worktree into an independent, non-Git filesystem tree for
  * held-out verifier execution. Skips `.git` metadata (gitfile or directory)
  * so verifier git commands cannot mutate lineage refs, and materializes
- * symlinks as regular file/directory copies of their targets when the target
- * resolves inside the source tree (external or broken links are omitted).
+ * symlinks as regular file/directory copies of their targets when the
+ * **realpath** of the target is inside the realpath of the source root
+ * (external links, intermediate escapes, and cycles are omitted/rejected).
  */
-export async function copyIsolatedVerifierTree(srcDir: string, destDir: string): Promise<void> {
+export async function copyIsolatedVerifierTree(
+  srcDir: string,
+  destDir: string,
+  options: CopyIsolatedVerifierTreeOptions = {},
+): Promise<void> {
   await fs.promises.mkdir(destDir, { recursive: true });
-  const root = path.resolve(srcDir);
+  const maxEntries = options.maxEntries ?? VERIFIER_SNAPSHOT_DEFAULTS.maxEntries;
+  const maxBytes = options.maxBytes ?? VERIFIER_SNAPSHOT_DEFAULTS.maxBytes;
+  const deadlineMs = options.deadlineMs;
 
-  function isInsideRoot(resolved: string): boolean {
-    return resolved === root || resolved.startsWith(root + path.sep);
+  let realRoot: string;
+  try {
+    realRoot = await fs.promises.realpath(srcDir);
+  } catch (err) {
+    throw new Error(`verifier snapshot: cannot realpath source: ${(err as Error).message}`);
   }
 
+  function isInsideRealRoot(realPath: string): boolean {
+    return realPath === realRoot || realPath.startsWith(realRoot + path.sep);
+  }
+
+  function assertBudget(entries: number, bytes: number): void {
+    if (deadlineMs !== undefined && Date.now() > deadlineMs) {
+      throw new Error("verifier snapshot: deadline exceeded during materialization");
+    }
+    if (entries > maxEntries) {
+      throw new Error(`verifier snapshot: entry limit exceeded (${maxEntries})`);
+    }
+    if (bytes > maxBytes) {
+      throw new Error(`verifier snapshot: byte limit exceeded (${maxBytes})`);
+    }
+  }
+
+  let entryCount = 0;
+  let byteCount = 0;
+  /** Real directories already being walked — cycle detection. */
+  const visitingRealDirs = new Set<string>();
+
   async function materialize(srcPath: string, destPath: string): Promise<void> {
+    assertBudget(entryCount, byteCount);
     let st: fs.Stats;
     try {
       st = await fs.promises.lstat(srcPath);
     } catch {
       return;
     }
+
     if (st.isSymbolicLink()) {
-      let target: string;
+      // Containment is decided on realpath(target), not lexical resolve — an
+      // intermediate link like `out -> /etc` + `leaked -> out/passwd` must not
+      // pass isInsideRoot on the lexical path while stat follows to /etc/passwd.
+      let realTarget: string;
       try {
-        target = await fs.promises.readlink(srcPath);
+        realTarget = await fs.promises.realpath(srcPath);
+      } catch {
+        // Broken or unresolvable link — omit.
+        return;
+      }
+      if (!isInsideRealRoot(realTarget)) {
+        return;
+      }
+      let targetSt: fs.Stats;
+      try {
+        targetSt = await fs.promises.stat(realTarget);
       } catch {
         return;
       }
-      const resolved = path.resolve(path.dirname(srcPath), target);
-      if (!isInsideRoot(resolved)) {
-        // External symlink — omit rather than escape the snapshot boundary.
-        return;
-      }
-      try {
-        const targetSt = await fs.promises.stat(resolved);
-        if (targetSt.isDirectory()) {
-          await fs.promises.mkdir(destPath, { recursive: true });
-          const entries = await fs.promises.readdir(resolved);
-          for (const name of entries) {
-            if (name === ".git") continue;
-            await materialize(path.join(resolved, name), path.join(destPath, name));
-          }
-        } else if (targetSt.isFile()) {
-          await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
-          await fs.promises.copyFile(resolved, destPath);
-        }
-      } catch {
-        // Broken link — omit.
+      if (targetSt.isDirectory()) {
+        await materializeDirectory(realTarget, destPath);
+      } else if (targetSt.isFile()) {
+        entryCount += 1;
+        assertBudget(entryCount, byteCount);
+        await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+        await fs.promises.copyFile(realTarget, destPath);
+        byteCount += targetSt.size;
+        assertBudget(entryCount, byteCount);
       }
       return;
     }
+
     if (st.isDirectory()) {
-      await fs.promises.mkdir(destPath, { recursive: true });
-      const entries = await fs.promises.readdir(srcPath);
-      for (const name of entries) {
-        if (name === ".git") continue;
-        await materialize(path.join(srcPath, name), path.join(destPath, name));
+      let realDir: string;
+      try {
+        realDir = await fs.promises.realpath(srcPath);
+      } catch {
+        return;
       }
+      if (!isInsideRealRoot(realDir)) {
+        return;
+      }
+      await materializeDirectory(realDir, destPath);
       return;
     }
+
     if (st.isFile()) {
+      entryCount += 1;
+      assertBudget(entryCount, byteCount);
       await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
       await fs.promises.copyFile(srcPath, destPath);
+      byteCount += st.size;
+      assertBudget(entryCount, byteCount);
     }
   }
 
-  await materialize(root, destDir);
+  async function materializeDirectory(realDir: string, destPath: string): Promise<void> {
+    if (visitingRealDirs.has(realDir)) {
+      // Symlink/hard cycle — omit re-entry rather than loop forever.
+      return;
+    }
+    visitingRealDirs.add(realDir);
+    try {
+      entryCount += 1;
+      assertBudget(entryCount, byteCount);
+      await fs.promises.mkdir(destPath, { recursive: true });
+      const entries = await fs.promises.readdir(realDir);
+      for (const name of entries) {
+        if (name === ".git") continue;
+        await materialize(path.join(realDir, name), path.join(destPath, name));
+      }
+    } finally {
+      visitingRealDirs.delete(realDir);
+    }
+  }
+
+  await materializeDirectory(realRoot, destDir);
 }
 
 /** Disposable isolated filesystem copy of the treatment worktree for held-out verifiers. */
-async function defaultCreateVerifierSnapshot(worktreeDir: string): Promise<string> {
+async function defaultCreateVerifierSnapshot(
+  worktreeDir: string,
+  options?: CopyIsolatedVerifierTreeOptions,
+): Promise<string> {
   const os = await import("node:os");
   const snapshotDir = path.join(os.tmpdir(), `pipeline-eval-mc-verifier-${randomUUID()}`);
-  await copyIsolatedVerifierTree(worktreeDir, snapshotDir);
+  await copyIsolatedVerifierTree(worktreeDir, snapshotDir, options);
   return snapshotDir;
 }
 
@@ -1130,21 +1281,29 @@ async function runMultiChangeLineage(args: {
 
     // Each held-out verifier runs in its own clean isolated snapshot so one
     // check's side effects cannot cascade into another or into the lineage.
+    // Snapshot creation is deadline-aware; remaining time is recomputed after
+    // materialization so setup cost cannot silently overrun the cell budget.
     const checkResults: Record<string, boolean> = {};
-    const deadlineAtStart = Date.now();
     for (const v of allVerifiers) {
-      const remaining = remainingForChecks - (Date.now() - deadlineAtStart);
-      if (remaining <= 0) {
+      const remainingBeforeSnapshot = cellDeadlineMs - Date.now();
+      if (remainingBeforeSnapshot <= 0) {
         checkResults[v.check] = false;
         continue;
       }
       let snapshotDir: string | undefined;
       try {
-        snapshotDir = await createVerifierSnapshotFn(identity.worktreePath);
+        snapshotDir = await createVerifierSnapshotFn(identity.worktreePath, {
+          deadlineMs: cellDeadlineMs,
+        });
+        const remainingAfterSnapshot = cellDeadlineMs - Date.now();
+        if (remainingAfterSnapshot <= 0) {
+          checkResults[v.check] = false;
+          continue;
+        }
         const one = await runChecksFn({
           worktreeDir: snapshotDir,
           checks: [v.check],
-          deadlineMs: remaining,
+          deadlineMs: remainingAfterSnapshot,
         });
         checkResults[v.check] = one[v.check] === true;
       } catch (err) {
@@ -1219,7 +1378,25 @@ async function runMultiChangeLineage(args: {
     previousProductionLoc = production_loc;
     previousTestLoc = test_loc;
 
-    const fingerprint = await getRepoFingerprintFn({ worktreeDir: identity.worktreePath });
+    let fingerprint: string;
+    try {
+      fingerprint = await getRepoFingerprintFn({ worktreeDir: identity.worktreePath });
+    } catch (err) {
+      const error = `checkpoint "${checkpoint.checkpoint_id}" repository fingerprint failed: ${(err as Error).message}`;
+      trajectoryActions.push(error);
+      return finish({
+        result_class: "infra_error",
+        error,
+        detail: {
+          multi_change: {
+            profile,
+            checkpoints: evidence,
+            aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "infra_error" },
+          },
+          ...(environmentDetail !== undefined ? { environment: environmentDetail } : {}),
+        },
+      });
+    }
 
     const stepEvidence: MultiChangeCheckpointEvidence = {
       checkpoint_id: checkpoint.checkpoint_id,

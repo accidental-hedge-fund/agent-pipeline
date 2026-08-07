@@ -1077,41 +1077,33 @@ test("generateSummary: multi_change section present; no forbidden maintainabilit
 // --- review 2 regression: fingerprint, isolation, leakage channels, telemetry ---
 
 test("contentAddressedRepoFingerprint: distinct edits to same path differ", () => {
-  const base = {
-    headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    untrackedFiles: [] as Array<{ path: string; contentSha256: string }>,
-  };
+  const headSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const a = contentAddressedRepoFingerprint({
-    ...base,
-    trackedDiff: "diff --git a/x b/x\n+const a = 1;\n",
+    headSha,
+    pathEntries: [{ path: "x", contentSha256: "hash-of-a1" }],
   });
   const b = contentAddressedRepoFingerprint({
-    ...base,
-    trackedDiff: "diff --git a/x b/x\n+const a = 2;\n",
+    headSha,
+    pathEntries: [{ path: "x", contentSha256: "hash-of-a2" }],
   });
-  assert.notEqual(a, b);
+  assert.notEqual(a, b, "distinct content hashes on same path must not alias");
   const c = contentAddressedRepoFingerprint({
-    ...base,
-    trackedDiff: "",
-    untrackedFiles: [{ path: "new.js", contentSha256: "hash-one" }],
+    headSha,
+    pathEntries: [{ path: "new.js", contentSha256: "hash-one" }],
   });
   const d = contentAddressedRepoFingerprint({
-    ...base,
-    trackedDiff: "",
-    untrackedFiles: [{ path: "new.js", contentSha256: "hash-two" }],
+    headSha,
+    pathEntries: [{ path: "new.js", contentSha256: "hash-two" }],
   });
   assert.notEqual(c, d);
-  // Path-only identity with different content must not alias (both untracked same path).
   assert.equal(
     contentAddressedRepoFingerprint({
-      ...base,
-      trackedDiff: "same",
-      untrackedFiles: [{ path: "p", contentSha256: "x" }],
+      headSha,
+      pathEntries: [{ path: "p", contentSha256: "x" }],
     }),
     contentAddressedRepoFingerprint({
-      ...base,
-      trackedDiff: "same",
-      untrackedFiles: [{ path: "p", contentSha256: "x" }],
+      headSha,
+      pathEntries: [{ path: "p", contentSha256: "x" }],
     }),
   );
 });
@@ -1202,6 +1194,67 @@ test("copyIsolatedVerifierTree: omits .git and materializes internal symlinks wi
     fs.writeFileSync(path.join(dest, "link-data.txt"), "mutated-in-snapshot");
     assert.equal(fs.readFileSync(path.join(root, "real-data.txt"), "utf8"), "secret-lineage-data");
     fs.unlinkSync(outside);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dest, { recursive: true, force: true });
+  }
+});
+
+test("copyIsolatedVerifierTree: intermediate symlink escape via nested link is refused", async () => {
+  // Regression for pre-merge bd71053b: lexical isInsideRoot passes for
+  // `leaked -> out/passwd` when `out -> /etc`, but realpath escapes the root.
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mc-iso-mid-src-"));
+  const dest = fs.mkdtempSync(path.join(os.tmpdir(), "mc-iso-mid-dst-"));
+  try {
+    fs.writeFileSync(path.join(root, "safe.txt"), "inside");
+    // Intermediate directory symlink pointing outside the root.
+    fs.symlinkSync("/etc", path.join(root, "out"));
+    // Nested path that is lexically under root but realpath-resolves outside.
+    fs.symlinkSync("out/passwd", path.join(root, "leaked"));
+
+    await copyIsolatedVerifierTree(root, dest);
+
+    assert.equal(fs.readFileSync(path.join(dest, "safe.txt"), "utf8"), "inside");
+    assert.equal(fs.existsSync(path.join(dest, "out")), false, "external dir symlink must be omitted");
+    assert.equal(
+      fs.existsSync(path.join(dest, "leaked")),
+      false,
+      "intermediate-link escape must not materialize host files",
+    );
+    // Snapshot must not contain passwd contents even if a broken path exists.
+    const walk = (d: string): string[] => {
+      const out: string[] = [];
+      for (const name of fs.readdirSync(d)) {
+        const p = path.join(d, name);
+        const st = fs.lstatSync(p);
+        if (st.isDirectory()) out.push(...walk(p));
+        else out.push(fs.readFileSync(p, "utf8"));
+      }
+      return out;
+    };
+    const bodies = walk(dest).join("\n");
+    assert.equal(bodies.includes("root:"), false, "must not copy /etc/passwd content");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dest, { recursive: true, force: true });
+  }
+});
+
+test("copyIsolatedVerifierTree: entry limit fails closed", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mc-iso-lim-src-"));
+  const dest = fs.mkdtempSync(path.join(os.tmpdir(), "mc-iso-lim-dst-"));
+  try {
+    for (let i = 0; i < 5; i++) fs.writeFileSync(path.join(root, `f${i}.txt`), "x");
+    await assert.rejects(
+      () => copyIsolatedVerifierTree(root, dest, { maxEntries: 3 }),
+      /entry limit/,
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(dest, { recursive: true, force: true });

@@ -408,23 +408,26 @@ export function allHeldOutVerifiers(fixture: Fixture): MultiChangeHeldOutVerifie
 
 /**
  * Content-addressed repository fingerprint inputs (pure). Two distinct edits
- * to the same path MUST produce different digests when trackedDiff or untracked
- * content hashes differ — path-only porcelain status is not sufficient.
+ * to the same path MUST produce different digests when path content hashes
+ * differ — path-only porcelain status and git's "Binary files differ" summary
+ * are not sufficient.
  */
 export function contentAddressedRepoFingerprint(parts: {
   headSha: string;
-  /** Full unified diff of tracked changes vs HEAD (staged + unstaged). */
-  trackedDiff: string;
-  /** Sorted untracked paths with content digests (empty file → empty hash). */
-  untrackedFiles: Array<{ path: string; contentSha256: string }>;
+  /**
+   * Worktree path digests for every path that differs from HEAD (tracked
+   * modifications/adds/deletes and untracked files). Deletions use a
+   * sentinel content digest such as `deleted`. Paths are sorted before hash.
+   */
+  pathEntries: Array<{ path: string; contentSha256: string }>;
 }): string {
   const h = createHash("sha256");
   h.update("head:");
   h.update(parts.headSha.trim());
-  h.update("\ntracked-diff:");
-  h.update(parts.trackedDiff);
-  h.update("\nuntracked:\n");
-  const sorted = [...parts.untrackedFiles].sort((a, b) => a.path.localeCompare(b.path));
+  h.update("\npaths:\n");
+  const sorted = [...parts.pathEntries].sort((a, b) =>
+    a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
+  );
   for (const f of sorted) {
     h.update(f.path);
     h.update("\0");
