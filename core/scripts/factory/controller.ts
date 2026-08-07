@@ -28,8 +28,10 @@ import {
   type FactoryCoarsePhase,
   type FactoryCompletionPolicy,
   type FactoryControlIdentities,
+  type FactoryDependencyEdge,
   type FactoryExecutionContractRevision,
   type FactoryFingerprints,
+  type FactoryGithubIdentitySnapshot,
   type FactoryLinkedRuns,
   type FactoryNextAction,
   type FactoryPhaseEvidence,
@@ -62,13 +64,21 @@ export interface FactoryMacroDeps {
     baseBranch: string;
   }): Promise<{ name: string; base_branch: string }>;
   /**
-   * Fresh GitHub selector/live checks — required on every enabled tick; not
-   * authoritative for contract body content.
+   * Fresh GitHub-linked identity observation — required on every enabled tick.
+   * Receives the full contracted selector/issue/PR/milestone/dependency snapshot
+   * and MUST return a typed live observation so the controller can compare each
+   * field against the accepted revision before dispatch. Not authoritative for
+   * contract body content (drift → replan_required + CAS replan).
    */
   observeGithubSnapshot(input: {
     repo: string;
-    issue_ids: string[];
-  }): Promise<{ ok: boolean; detail?: string }>;
+    contracted: FactoryGithubIdentitySnapshot;
+  }): Promise<{
+    ok: boolean;
+    detail?: string;
+    /** Live observed identities; required for successful reconciliation. */
+    observed?: FactoryGithubIdentitySnapshot;
+  }>;
   now(): Date;
   /** Start/resume durable loop as whole-run (never per-stage). */
   startOrResumeLoop(input: {
@@ -541,7 +551,7 @@ async function persistPhaseEvidence(
     coarse_phase: FactoryCoarsePhase;
     next_action: FactoryNextAction;
     reason: string;
-    service_controller: string;
+    identities: FactoryControlIdentities;
     live: FactoryLiveObservation;
     replan_reason?: string | null;
   },
@@ -564,10 +574,98 @@ async function persistPhaseEvidence(
     coarse_phase: input.coarse_phase,
     next_action: input.next_action,
     reason: input.reason,
-    service_controller: input.service_controller,
+    service_controller: input.identities.service_controller,
+    outer_host: input.identities.outer_host,
+    implementer_treatment: input.identities.implementer_treatment,
+    reviewer_treatment: input.identities.reviewer_treatment,
+    privileged_mutation_actor: input.identities.privileged_mutation_actor,
     child_disposition,
     replan_reason: input.replan_reason ?? null,
   });
+}
+
+/** Canonical string multiset equality for identity lists. */
+function sameStringMultiset(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const as = [...a].map(String).sort();
+  const bs = [...b].map(String).sort();
+  return as.every((v, i) => v === bs[i]);
+}
+
+function sameSelector(a: FactorySelector, b: FactorySelector): boolean {
+  return a.type === b.type && a.value === b.value;
+}
+
+function sameDependencyEdges(
+  a: FactoryDependencyEdge[],
+  b: FactoryDependencyEdge[],
+): boolean {
+  if (a.length !== b.length) return false;
+  const canon = (edges: FactoryDependencyEdge[]) =>
+    [...edges]
+      .map((e) => `${String(e.from)}\0${String(e.to)}`)
+      .sort()
+      .join("\n");
+  return canon(a) === canon(b);
+}
+
+/**
+ * Compare a live GitHub identity snapshot against the accepted contract fields.
+ * Returns null when equal; otherwise a human-readable drift reason.
+ */
+export function githubIdentityDriftReason(
+  contract: Pick<
+    FactoryExecutionContractRevision,
+    "selector" | "issue_ids" | "pr_ids" | "milestones" | "dependency_edges"
+  >,
+  observed: FactoryGithubIdentitySnapshot,
+): string | null {
+  if (!sameSelector(observed.selector, contract.selector)) {
+    return (
+      `GitHub selector drift: live ${observed.selector.type}:${observed.selector.value} !== ` +
+      `contract ${contract.selector.type}:${contract.selector.value}`
+    );
+  }
+  if (!sameStringMultiset(observed.issue_ids, contract.issue_ids)) {
+    return (
+      `GitHub issue_ids drift: live [${[...observed.issue_ids].map(String).sort().join(",")}] !== ` +
+      `contract [${[...contract.issue_ids].map(String).sort().join(",")}]`
+    );
+  }
+  if (!sameStringMultiset(observed.pr_ids, contract.pr_ids)) {
+    return (
+      `GitHub pr_ids drift: live [${[...observed.pr_ids].map(String).sort().join(",")}] !== ` +
+      `contract [${[...contract.pr_ids].map(String).sort().join(",")}]`
+    );
+  }
+  if (!sameStringMultiset(observed.milestones, contract.milestones)) {
+    return (
+      `GitHub milestones drift: live [${[...observed.milestones].map(String).sort().join(",")}] !== ` +
+      `contract [${[...contract.milestones].map(String).sort().join(",")}]`
+    );
+  }
+  if (!sameDependencyEdges(observed.dependency_edges, contract.dependency_edges)) {
+    return "GitHub dependency_edges drift vs accepted contract";
+  }
+  return null;
+}
+
+export function contractGithubIdentitySnapshot(
+  contract: Pick<
+    FactoryExecutionContractRevision,
+    "selector" | "issue_ids" | "pr_ids" | "milestones" | "dependency_edges"
+  >,
+): FactoryGithubIdentitySnapshot {
+  return {
+    selector: { type: contract.selector.type, value: contract.selector.value },
+    issue_ids: [...contract.issue_ids],
+    pr_ids: [...contract.pr_ids],
+    milestones: [...contract.milestones],
+    dependency_edges: contract.dependency_edges.map((e) => ({
+      from: e.from,
+      to: e.to,
+    })),
+  };
 }
 
 /**
@@ -576,13 +674,19 @@ async function persistPhaseEvidence(
  * posture (CAS replan is required to adopt the new live identity into a
  * retained revision). Absent GitHub, configuration, or repository-identity
  * observations fail closed — they are not treated as successful reconciliation.
+ * GitHub reconciliation compares the full contracted selector, issue/PR ids,
+ * milestones, and dependency edges against the typed live observation.
  */
 export function reconcileLiveIdentity(input: {
   contract: FactoryExecutionContractRevision;
   base_sha: string;
   /** Fresh repo name + base_branch; null/undefined fails closed. */
   live_repo?: { name: string; base_branch: string } | null;
-  github?: { ok: boolean; detail?: string } | null;
+  github?: {
+    ok: boolean;
+    detail?: string;
+    observed?: FactoryGithubIdentitySnapshot;
+  } | null;
   configFingerprints?: FactoryFingerprints | null;
 }): { ok: true } | { ok: false; reason: string } {
   const { contract, base_sha, live_repo, github, configFingerprints } = input;
@@ -623,6 +727,22 @@ export function reconcileLiveIdentity(input: {
       ok: false,
       reason: `GitHub snapshot mismatch: ${github.detail ?? "ok=false"} — CAS replan required`,
     };
+  }
+  if (github.observed == null) {
+    return {
+      ok: false,
+      reason:
+        "GitHub identity observation missing observed selector/issue/PR/milestone/dependency snapshot — CAS replan required",
+    };
+  }
+  {
+    const drift = githubIdentityDriftReason(contract, github.observed);
+    if (drift) {
+      return {
+        ok: false,
+        reason: `${drift} — CAS replan required`,
+      };
+    }
   }
   if (configFingerprints == null) {
     return {
@@ -690,8 +810,15 @@ async function tickFactoryLocked(
     throw new FactoryError("not_found", `factory run "${factoryRunId}" has no current revision`);
   }
 
-  const serviceController =
-    contract.identities.service_controller || FACTORY_SERVICE_CONTROLLER_ID;
+  const controlIdentities: FactoryControlIdentities = {
+    service_controller:
+      contract.identities.service_controller || FACTORY_SERVICE_CONTROLLER_ID,
+    outer_host: contract.identities.outer_host,
+    implementer_treatment: contract.identities.implementer_treatment,
+    reviewer_treatment: contract.identities.reviewer_treatment,
+    privileged_mutation_actor: contract.identities.privileged_mutation_actor,
+  };
+  const serviceController = controlIdentities.service_controller;
 
   // Observe live truth (git base, repository identity, GitHub, config, children).
   // All four external-truth seams are required; missing providers fail closed
@@ -704,11 +831,12 @@ async function tickFactoryLocked(
           baseBranch: contract.repo.base_branch,
         })
       : null;
+  const contractedGithub = contractGithubIdentitySnapshot(contract);
   const github =
     deps.observeGithubSnapshot != null
       ? await deps.observeGithubSnapshot({
           repo: contract.repo.name,
-          issue_ids: contract.issue_ids,
+          contracted: contractedGithub,
         })
       : null;
   const configFingerprints =
@@ -769,7 +897,7 @@ async function tickFactoryLocked(
       coarse_phase,
       next_action,
       reason: liveOk.reason,
-      service_controller: serviceController,
+      identities: controlIdentities,
       live,
       replan_reason: liveOk.reason,
     });
@@ -815,7 +943,7 @@ async function tickFactoryLocked(
       coarse_phase: reportedPhase,
       next_action: "replan_required",
       reason: advanceSeamMissingReason,
-      service_controller: serviceController,
+      identities: controlIdentities,
       live,
       replan_reason: advanceSeamMissingReason,
     });
@@ -842,7 +970,7 @@ async function tickFactoryLocked(
       coarse_phase: reportedPhase,
       next_action: derived.next_action,
       reason: derived.reason,
-      service_controller: serviceController,
+      identities: controlIdentities,
       live,
     });
     const status = (await getFactoryStatus(deps.store, factoryRunId))!;
@@ -870,7 +998,7 @@ async function tickFactoryLocked(
     revision: contract.revision,
     action_id: actionId,
     action: derived.next_action,
-    service_controller: serviceController,
+    identities: controlIdentities,
   });
 
   if (deps._fault?.crashAfterClaim) {
@@ -1026,7 +1154,7 @@ async function tickFactoryLocked(
     coarse_phase: reportedAfter,
     next_action: derivedAfter.next_action,
     reason: derivedAfter.reason,
-    service_controller: serviceController,
+    identities: controlIdentities,
     live: liveAfter,
   });
 

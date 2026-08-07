@@ -21,9 +21,14 @@ import {
   parseProductionEnginePin,
   type ProductionEnginePin,
 } from "../production-engine-pin.ts";
-import { FactoryError, type FactoryFingerprints } from "./types.ts";
+import {
+  FactoryError,
+  type FactoryFingerprints,
+  type FactoryGithubIdentitySnapshot,
+} from "./types.ts";
 import type { ChildRunStatus, FactoryMacroDeps } from "./controller.ts";
 import type { FactoryStoreDeps } from "./store.ts";
+import { getMilestones } from "../gh.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -48,6 +53,19 @@ export interface FactoryLiveObserverDeps {
     repo: string,
     issueNumber: number,
   ): Promise<{ number: number; state: string } | null>;
+  /**
+   * Resolve one pull request in `owner/repo`. Return null when absent or
+   * unreadable (caller maps that to snapshot mismatch / identity drift).
+   */
+  getPull(
+    repo: string,
+    prNumber: number,
+  ): Promise<{ number: number; state: string } | null>;
+  /**
+   * List milestone titles for the repository (live selector / milestone
+   * identity observation).
+   */
+  listMilestones(repo: string): Promise<string[]>;
   /** Optional production engine pin for the engine_pin fingerprint. */
   readEnginePin(repoDir: string): Promise<ProductionEnginePin | null>;
   /** Durable loop store for child observation (never invents run state). */
@@ -89,6 +107,35 @@ export function defaultFactoryLiveObserverDeps(
         return { number: detail.number, state: detail.state };
       } catch {
         return null;
+      }
+    },
+    async getPull(repo, prNumber) {
+      try {
+        const { stdout } = await execFileAsync(
+          "gh",
+          [
+            "pr",
+            "view",
+            String(prNumber),
+            "--json",
+            "number,state",
+            "-R",
+            repo,
+          ],
+          { timeout: 30_000, maxBuffer: 1024 * 1024 },
+        );
+        const data = JSON.parse(stdout) as { number: number; state: string };
+        return { number: data.number, state: data.state };
+      } catch {
+        return null;
+      }
+    },
+    async listMilestones(repo) {
+      try {
+        const ms = await getMilestones(repo);
+        return ms.map((m) => m.title);
+      } catch {
+        return [];
       }
     },
     async readEnginePin(repoDir) {
@@ -235,33 +282,111 @@ export async function observeFactoryRepoIdentity(
 }
 
 /**
- * Fresh GitHub snapshot: each contracted issue id must resolve in the live
- * repository. Empty issue lists are a successful no-op observation.
+ * Fresh GitHub identity snapshot for the contracted selector, issue/PR ids,
+ * milestones, and dependency edges. Returns a typed `observed` object so the
+ * controller can compare each field against the accepted revision. Empty
+ * issue/PR/milestone lists are successful no-ops for those slots.
  */
 export async function observeFactoryGithubSnapshot(
-  deps: Pick<FactoryLiveObserverDeps, "getIssue">,
-  input: { repo: string; issue_ids: string[] },
-): Promise<{ ok: boolean; detail?: string }> {
+  deps: Pick<FactoryLiveObserverDeps, "getIssue" | "getPull" | "listMilestones">,
+  input: { repo: string; contracted: FactoryGithubIdentitySnapshot },
+): Promise<{
+  ok: boolean;
+  detail?: string;
+  observed?: FactoryGithubIdentitySnapshot;
+}> {
   if (!input.repo || !input.repo.includes("/")) {
     return { ok: false, detail: `invalid repo identity "${input.repo}"` };
   }
-  const missing: string[] = [];
-  for (const raw of input.issue_ids) {
+  const contracted = input.contracted;
+  const missingIssues: string[] = [];
+  const observedIssues: string[] = [];
+  for (const raw of contracted.issue_ids) {
     const n = Number.parseInt(String(raw), 10);
     if (!Number.isFinite(n) || n <= 0) {
-      missing.push(String(raw));
+      missingIssues.push(String(raw));
       continue;
     }
     const issue = await deps.getIssue(input.repo, n);
-    if (!issue) missing.push(String(raw));
+    if (!issue) missingIssues.push(String(raw));
+    else observedIssues.push(String(raw));
   }
-  if (missing.length > 0) {
+  if (missingIssues.length > 0) {
     return {
       ok: false,
-      detail: `selector issues not readable in ${input.repo}: ${missing.join(", ")}`,
+      detail: `selector issues not readable in ${input.repo}: ${missingIssues.join(", ")}`,
     };
   }
-  return { ok: true };
+
+  const missingPrs: string[] = [];
+  const observedPrs: string[] = [];
+  for (const raw of contracted.pr_ids) {
+    const n = Number.parseInt(String(raw), 10);
+    if (!Number.isFinite(n) || n <= 0) {
+      missingPrs.push(String(raw));
+      continue;
+    }
+    const pr = await deps.getPull(input.repo, n);
+    if (!pr) missingPrs.push(String(raw));
+    else observedPrs.push(String(raw));
+  }
+  if (missingPrs.length > 0) {
+    return {
+      ok: false,
+      detail: `contracted PRs not readable in ${input.repo}: ${missingPrs.join(", ")}`,
+    };
+  }
+
+  const liveMilestoneTitles = await deps.listMilestones(input.repo);
+  const liveMilestoneSet = new Set(liveMilestoneTitles.map(String));
+  const observedMilestones = contracted.milestones.filter((m) =>
+    liveMilestoneSet.has(String(m)),
+  );
+  if (observedMilestones.length !== contracted.milestones.length) {
+    const missing = contracted.milestones.filter((m) => !liveMilestoneSet.has(String(m)));
+    return {
+      ok: false,
+      detail: `contracted milestones not present in ${input.repo}: ${missing.join(", ")}`,
+    };
+  }
+
+  // Selector backing identity: milestone/label/issues must still be live.
+  const selector = {
+    type: contracted.selector.type,
+    value: contracted.selector.value,
+  };
+  if (selector.type === "milestone" && selector.value) {
+    if (!liveMilestoneSet.has(selector.value)) {
+      return {
+        ok: false,
+        detail: `selector milestone "${selector.value}" not present in ${input.repo}`,
+      };
+    }
+  }
+  if (selector.type === "issues" || selector.type === "explicit") {
+    // Membership is the issue list already verified above.
+  }
+
+  // Dependency edges: both endpoints must remain among observed issues.
+  const issueSet = new Set(observedIssues.map(String));
+  const observedEdges = contracted.dependency_edges.filter(
+    (e) => issueSet.has(String(e.from)) && issueSet.has(String(e.to)),
+  );
+  if (observedEdges.length !== contracted.dependency_edges.length) {
+    return {
+      ok: false,
+      detail: `dependency edge endpoints missing from live issues in ${input.repo}`,
+    };
+  }
+
+  const observed: FactoryGithubIdentitySnapshot = {
+    selector,
+    issue_ids: observedIssues,
+    pr_ids: observedPrs,
+    milestones: observedMilestones,
+    dependency_edges: observedEdges.map((e) => ({ from: e.from, to: e.to })),
+  };
+  return { ok: true, observed };
 }
 
 /** Map durable loop status into the factory child observation shape. */
@@ -344,6 +469,8 @@ export function buildFactoryMacroDeps(
     loopStore: input.observers?.loopStore ?? base.loopStore,
     git: input.observers?.git ?? base.git,
     getIssue: input.observers?.getIssue ?? base.getIssue,
+    getPull: input.observers?.getPull ?? base.getPull,
+    listMilestones: input.observers?.listMilestones ?? base.listMilestones,
     readEnginePin: input.observers?.readEnginePin ?? base.readEnginePin,
     now: input.observers?.now ?? base.now,
   };

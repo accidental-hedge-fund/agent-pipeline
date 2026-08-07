@@ -120,6 +120,20 @@ export interface FactoryDependencyEdge {
   to: string;
 }
 
+/**
+ * GitHub-linked identities carried on an accepted contract and re-observed on
+ * every enabled tick for live reconciliation (selector, issues/PRs, milestones,
+ * dependency edges). Not authoritative for contract body content — drift forces
+ * a retained CAS replan.
+ */
+export interface FactoryGithubIdentitySnapshot {
+  selector: FactorySelector;
+  issue_ids: string[];
+  pr_ids: string[];
+  milestones: string[];
+  dependency_edges: FactoryDependencyEdge[];
+}
+
 export interface FactoryLinkedRuns {
   /** Native durable loop run id under the loop store (sole item-ledger authority). */
   loop_run_id?: string | null;
@@ -204,7 +218,12 @@ export interface FactoryActionClaim {
   action_id: string;
   action: FactoryNextAction;
   state: FactoryClaimState;
+  /** Five distinct control-identity slots from the authorizing revision. */
   service_controller: string;
+  outer_host: string;
+  implementer_treatment: string;
+  reviewer_treatment: string;
+  privileged_mutation_actor: string;
   claimed_at: string;
   updated_at: string;
   /** Child loop/advance run id when the claim dispatched a whole-run child. */
@@ -264,7 +283,12 @@ export interface FactoryPhaseEvidence {
   coarse_phase: FactoryCoarsePhase;
   next_action: FactoryNextAction;
   reason: string;
+  /** Five distinct control-identity slots from the authorizing revision. */
   service_controller: string;
+  outer_host: string;
+  implementer_treatment: string;
+  reviewer_treatment: string;
+  privileged_mutation_actor: string;
   recorded_at: string;
   /** Child completion disposition when the evidence came from a terminal child. */
   child_disposition?: {

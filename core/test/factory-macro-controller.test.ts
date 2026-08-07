@@ -34,7 +34,9 @@ import {
 } from "../scripts/factory/store.ts";
 import {
   adoptFactoryContract,
+  contractGithubIdentitySnapshot,
   derivePhaseAndNextAction,
+  githubIdentityDriftReason,
   reconcileLiveIdentity,
   tickFactory,
   factoryStatus,
@@ -49,6 +51,7 @@ import {
   FactoryError,
   type FactoryControlIdentities,
   type FactoryExecutionContractBody,
+  type FactoryGithubIdentitySnapshot,
 } from "../scripts/factory/types.ts";
 import { isFactoryMacroEnabled, isFactoryMacroEnabledFromEnv } from "../scripts/factory/enabled.ts";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
@@ -196,7 +199,16 @@ function makeMacroDeps(
     repoIdentity?: { name: string; base_branch: string };
     /** When true, omit observeRepoIdentity (runtime fail-closed path). */
     omitRepoIdentity?: boolean;
-    github?: { ok: boolean; detail?: string } | null;
+    github?: {
+      ok: boolean;
+      detail?: string;
+      observed?: FactoryGithubIdentitySnapshot;
+    } | null;
+    /**
+     * When set, override the observed GitHub identity snapshot (for drift
+     * tests). Defaults to echoing the contracted snapshot when ok.
+     */
+    githubObserved?: FactoryGithubIdentitySnapshot | "omit";
     /** When true, omit observeGithubSnapshot. */
     omitGithub?: boolean;
     configFingerprints?: {
@@ -225,7 +237,24 @@ function makeMacroDeps(
     observeBaseSha: async () => opts.baseSha ?? "abc123deadbeef",
     observeRepoIdentity: async () =>
       opts.repoIdentity ?? { name: "acme/widgets", base_branch: "main" },
-    observeGithubSnapshot: async () => opts.github ?? { ok: true },
+    observeGithubSnapshot: async ({ contracted }) => {
+      if (opts.github) {
+        if (opts.github.ok && opts.github.observed == null && opts.githubObserved !== "omit") {
+          return {
+            ...opts.github,
+            observed: opts.githubObserved ?? contracted,
+          };
+        }
+        return opts.github;
+      }
+      if (opts.githubObserved === "omit") {
+        return { ok: true };
+      }
+      return {
+        ok: true,
+        observed: opts.githubObserved ?? contracted,
+      };
+    },
     readConfigFingerprints: async () => opts.configFingerprints ?? DEFAULT_FINGERPRINTS,
     now: () => store.now(),
     startOrResumeLoop: async ({ loop_run_id, factory_run_id, action_id }) => {
@@ -515,7 +544,7 @@ test("claim is exclusive — second claim loses and does not overwrite", async (
     revision: 1,
     action_id: "r1-start_loop-0",
     action: "start_loop",
-    service_controller: FACTORY_SERVICE_CONTROLLER_ID,
+    identities: baseIdentities(),
   });
   assert.equal(a.won, true);
   const b = await claimAction(deps, {
@@ -523,7 +552,7 @@ test("claim is exclusive — second claim loses and does not overwrite", async (
     revision: 1,
     action_id: "r1-start_loop-0",
     action: "start_loop",
-    service_controller: FACTORY_SERVICE_CONTROLLER_ID,
+    identities: baseIdentities(),
   });
   assert.equal(b.won, false);
   assert.equal(b.claim.action_id, a.claim.action_id);
@@ -544,7 +573,7 @@ test("unfinished dispatch lease is recoverable when claim has no child_run_id", 
     revision: 1,
     action_id: "r1-start_loop-0",
     action: "start_loop",
-    service_controller: FACTORY_SERVICE_CONTROLLER_ID,
+    identities: baseIdentities(),
   });
   assert.equal(await tryAcquireDispatchLease(deps, "frun-1", "r1-start_loop-0"), true);
   const recovered = await tryAcquireOrRecoverDispatchLease(
@@ -569,7 +598,7 @@ test("unfinished dispatch lease is recoverable when claim has no child_run_id", 
       revision: 1,
       action_id: "r1-start_loop-0",
       action: "start_loop",
-      service_controller: FACTORY_SERVICE_CONTROLLER_ID,
+      identities: baseIdentities(),
     })).claim,
   );
   assert.equal(linked.acquired, false);
@@ -726,7 +755,7 @@ test("crash after ambiguous child result: restart re-queries live truth", async 
     revision: 1,
     action_id: "r1-observe_loop-0",
     action: "observe_loop",
-    service_controller: FACTORY_SERVICE_CONTROLLER_ID,
+    identities: baseIdentities(),
   });
   await updateClaim(deps, "frun-1", "r1-observe_loop-0", {
     state: "ambiguous_reconcile",
@@ -816,22 +845,47 @@ test("GitHub snapshot mismatch fails closed with replan_required", async () => {
   assert.match(t.derive_reason, /GitHub snapshot/);
 });
 
-test("reconcileLiveIdentity accepts matching observations", () => {
-  const contract = {
+function sampleGithubIdentity(
+  overrides: Partial<FactoryGithubIdentitySnapshot> = {},
+): FactoryGithubIdentitySnapshot {
+  return {
+    selector: { type: "milestone", value: "v2" },
+    issue_ids: ["100", "101"],
+    pr_ids: [],
+    milestones: ["v2"],
+    dependency_edges: [{ from: "100", to: "101" }],
+    ...overrides,
+  };
+}
+
+function sampleContractForReconcile(overrides: Record<string, unknown> = {}) {
+  return {
     repo: { name: "acme/widgets", base_branch: "main", observed_base_sha: "abc" },
+    selector: { type: "milestone", value: "v2" },
+    issue_ids: ["100", "101"],
+    pr_ids: [] as string[],
+    milestones: ["v2"],
+    dependency_edges: [{ from: "100", to: "101" }],
+    fingerprints: DEFAULT_FINGERPRINTS,
+    ...overrides,
+  } as never;
+}
+
+test("reconcileLiveIdentity accepts matching observations", () => {
+  const contract = sampleContractForReconcile({
     fingerprints: {
       authority_policy: "a",
       engine_pin: "e",
       configuration: "c",
       treatment: "t",
     },
-  } as never;
+  });
   assert.equal(
     reconcileLiveIdentity({
       contract,
       base_sha: "abc",
       live_repo: { name: "acme/widgets", base_branch: "main" },
-      github: { ok: true },
+      github: { ok: true, observed: sampleGithubIdentity() },
       configFingerprints: {
         authority_policy: "a",
         engine_pin: "e",
@@ -844,10 +898,7 @@ test("reconcileLiveIdentity accepts matching observations", () => {
 });
 
 test("reconcileLiveIdentity fails closed when GitHub observation is absent", () => {
-  const contract = {
-    repo: { name: "acme/widgets", base_branch: "main", observed_base_sha: "abc" },
-    fingerprints: DEFAULT_FINGERPRINTS,
-  } as never;
+  const contract = sampleContractForReconcile();
   const r = reconcileLiveIdentity({
     contract,
     base_sha: "abc",
@@ -859,16 +910,80 @@ test("reconcileLiveIdentity fails closed when GitHub observation is absent", () 
   if (!r.ok) assert.match(r.reason, /GitHub snapshot observation required/);
 });
 
-test("reconcileLiveIdentity fails closed when configuration observation is absent", () => {
-  const contract = {
-    repo: { name: "acme/widgets", base_branch: "main", observed_base_sha: "abc" },
-    fingerprints: DEFAULT_FINGERPRINTS,
-  } as never;
+test("reconcileLiveIdentity fails closed when observed GitHub identity is missing", () => {
+  const contract = sampleContractForReconcile();
   const r = reconcileLiveIdentity({
     contract,
     base_sha: "abc",
     live_repo: { name: "acme/widgets", base_branch: "main" },
     github: { ok: true },
+    configFingerprints: DEFAULT_FINGERPRINTS,
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.match(r.reason, /observed selector\/issue\/PR\/milestone\/dependency/);
+});
+
+test("reconcileLiveIdentity fails closed on selector / issue / milestone / dependency drift", () => {
+  const contract = sampleContractForReconcile();
+  const cases: Array<{ name: string; observed: FactoryGithubIdentitySnapshot; re: RegExp }> = [
+    {
+      name: "selector",
+      observed: sampleGithubIdentity({ selector: { type: "label", value: "ship" } }),
+      re: /selector drift/,
+    },
+    {
+      name: "issue_ids",
+      observed: sampleGithubIdentity({ issue_ids: ["100", "999"] }),
+      re: /issue_ids drift/,
+    },
+    {
+      name: "pr_ids",
+      observed: sampleGithubIdentity({ pr_ids: ["55"] }),
+      re: /pr_ids drift/,
+    },
+    {
+      name: "milestones",
+      observed: sampleGithubIdentity({ milestones: ["v3"] }),
+      re: /milestones drift/,
+    },
+    {
+      name: "dependency_edges",
+      observed: sampleGithubIdentity({
+        dependency_edges: [{ from: "101", to: "100" }],
+      }),
+      re: /dependency_edges drift/,
+    },
+  ];
+  for (const c of cases) {
+    const r = reconcileLiveIdentity({
+      contract,
+      base_sha: "abc",
+      live_repo: { name: "acme/widgets", base_branch: "main" },
+      github: { ok: true, observed: c.observed },
+      configFingerprints: DEFAULT_FINGERPRINTS,
+    });
+    assert.equal(r.ok, false, c.name);
+    if (!r.ok) assert.match(r.reason, c.re, c.name);
+  }
+});
+
+test("githubIdentityDriftReason and contractGithubIdentitySnapshot round-trip", () => {
+  const contract = sampleContractForReconcile();
+  const snap = contractGithubIdentitySnapshot(contract);
+  assert.equal(githubIdentityDriftReason(contract, snap), null);
+  assert.match(
+    githubIdentityDriftReason(contract, sampleGithubIdentity({ issue_ids: ["1"] })) ?? "",
+    /issue_ids drift/,
+  );
+});
+
+test("reconcileLiveIdentity fails closed when configuration observation is absent", () => {
+  const contract = sampleContractForReconcile();
+  const r = reconcileLiveIdentity({
+    contract,
+    base_sha: "abc",
+    live_repo: { name: "acme/widgets", base_branch: "main" },
+    github: { ok: true, observed: sampleGithubIdentity() },
     configFingerprints: null,
   });
   assert.equal(r.ok, false);
@@ -876,15 +991,12 @@ test("reconcileLiveIdentity fails closed when configuration observation is absen
 });
 
 test("reconcileLiveIdentity fails closed on repository identity drift", () => {
-  const contract = {
-    repo: { name: "acme/widgets", base_branch: "main", observed_base_sha: "abc" },
-    fingerprints: DEFAULT_FINGERPRINTS,
-  } as never;
+  const contract = sampleContractForReconcile();
   const r = reconcileLiveIdentity({
     contract,
     base_sha: "abc",
     live_repo: { name: "other/repo", base_branch: "main" },
-    github: { ok: true },
+    github: { ok: true, observed: sampleGithubIdentity() },
     configFingerprints: DEFAULT_FINGERPRINTS,
   });
   assert.equal(r.ok, false);
@@ -1002,7 +1114,7 @@ test("read-only status reconstructs phase after tick records completion disposit
     revision: 1,
     action_id: "r1-observe_loop-0",
     action: "observe_loop",
-    service_controller: FACTORY_SERVICE_CONTROLLER_ID,
+    identities: baseIdentities(),
   });
   await updateClaim(deps, "frun-1", "r1-observe_loop-0", {
     state: "started",
@@ -1159,6 +1271,79 @@ test("coarse-action evidence attributes controller and revision", async () => {
   assert.equal(data.revision, 1);
 });
 
+test("coarse-action claim and phase evidence preserve all five control identities", async () => {
+  const { deps } = fakeStore();
+  const identities = baseIdentities({
+    outer_host: "session-host-a",
+    implementer_treatment: "my-ext",
+    reviewer_treatment: "codex",
+    privileged_mutation_actor: "operator-session-1",
+  });
+  await adoptFresh(deps, {
+    identities,
+    linked_runs: {
+      loop_run_id: null,
+      loop_contract_hash: null,
+      advance_run_id: null,
+      legacy_run_identity: null,
+    },
+  });
+  const macro = makeMacroDeps(deps);
+  const t = await tickFactory(macro, "frun-1", { repoDir: "/repo" });
+  assert.ok(t.claim);
+  assert.equal(t.claim!.service_controller, FACTORY_SERVICE_CONTROLLER_ID);
+  assert.equal(t.claim!.outer_host, "session-host-a");
+  assert.equal(t.claim!.implementer_treatment, "my-ext");
+  assert.equal(t.claim!.reviewer_treatment, "codex");
+  assert.equal(t.claim!.privileged_mutation_actor, "operator-session-1");
+  // Distinct slots — none collapsed into a single host/engine string.
+  const slots = [
+    t.claim!.service_controller,
+    t.claim!.outer_host,
+    t.claim!.implementer_treatment,
+    t.claim!.reviewer_treatment,
+    t.claim!.privileged_mutation_actor,
+  ];
+  assert.equal(new Set(slots).size, 5);
+
+  const evidence = await readPhaseEvidence(deps, "frun-1");
+  assert.ok(evidence);
+  assert.equal(evidence!.service_controller, FACTORY_SERVICE_CONTROLLER_ID);
+  assert.equal(evidence!.outer_host, "session-host-a");
+  assert.equal(evidence!.implementer_treatment, "my-ext");
+  assert.equal(evidence!.reviewer_treatment, "codex");
+  assert.equal(evidence!.privileged_mutation_actor, "operator-session-1");
+
+  // Restart reconciliation: re-read claim from durable store without re-dispatch.
+  const restarted = await tickFactory(makeMacroDeps(deps), "frun-1", { repoDir: "/repo" });
+  assert.equal(restarted.claim_won, false);
+  assert.equal(restarted.claim?.outer_host, "session-host-a");
+  assert.equal(restarted.claim?.implementer_treatment, "my-ext");
+  assert.equal(restarted.claim?.reviewer_treatment, "codex");
+  assert.equal(restarted.claim?.privileged_mutation_actor, "operator-session-1");
+  assert.equal(restarted.claim?.service_controller, FACTORY_SERVICE_CONTROLLER_ID);
+});
+
+test("tick fails closed when live GitHub selector identity drifts from contract", async () => {
+  const { deps } = fakeStore();
+  await adoptFresh(deps);
+  const t = await tickFactory(
+    makeMacroDeps(deps, {
+      githubObserved: sampleGithubIdentity({
+        selector: { type: "label", value: "other" },
+        issue_ids: ["100", "101"],
+        milestones: ["v2"],
+        dependency_edges: [{ from: "100", to: "101" }],
+      }),
+    }),
+    "frun-1",
+    { repoDir: "/repo" },
+  );
+  assert.equal(t.next_action, "replan_required");
+  assert.equal(t.dispatched, false);
+  assert.match(t.derive_reason, /selector drift/);
+});
+
 // ---------------------------------------------------------------------------
 // Concurrency non-widening (controller does not set budget)
 // ---------------------------------------------------------------------------
@@ -1178,7 +1363,7 @@ test("macro controller does not inject concurrency budget into start call", asyn
     store: deps,
     observeBaseSha: async () => "abc123deadbeef",
     observeRepoIdentity: async () => ({ name: "acme/widgets", base_branch: "main" }),
-    observeGithubSnapshot: async () => ({ ok: true }),
+    observeGithubSnapshot: async ({ contracted }) => ({ ok: true, observed: contracted }),
     readConfigFingerprints: async () => DEFAULT_FINGERPRINTS,
     now: () => deps.now(),
     startOrResumeLoop: async (input) => {

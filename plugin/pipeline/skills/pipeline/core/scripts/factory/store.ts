@@ -24,6 +24,7 @@ import {
   FactoryError,
   type FactoryActionClaim,
   type FactoryClaimState,
+  type FactoryControlIdentities,
   type FactoryCurrentPointer,
   type FactoryExecutionContractBody,
   type FactoryExecutionContractRevision,
@@ -470,7 +471,8 @@ export async function claimAction(
     revision: number;
     action_id: string;
     action: FactoryNextAction;
-    service_controller: string;
+    /** Five distinct control identities from the authorizing revision. */
+    identities: FactoryControlIdentities;
   },
 ): Promise<{ claim: FactoryActionClaim; won: boolean }> {
   assertSafeActionId(input.action_id);
@@ -478,6 +480,7 @@ export async function claimAction(
   await deps.mkdirp(path.join(dir, "claims"));
 
   const now = deps.now().toISOString();
+  const ids = input.identities;
   const claim: FactoryActionClaim = {
     schema: FACTORY_CLAIM_SCHEMA,
     factory_run_id: input.factory_run_id,
@@ -485,7 +488,11 @@ export async function claimAction(
     action_id: input.action_id,
     action: input.action,
     state: "claimed",
-    service_controller: input.service_controller,
+    service_controller: ids.service_controller,
+    outer_host: ids.outer_host,
+    implementer_treatment: ids.implementer_treatment,
+    reviewer_treatment: ids.reviewer_treatment,
+    privileged_mutation_actor: ids.privileged_mutation_actor,
     claimed_at: now,
     updated_at: now,
     child_run_id: null,
@@ -509,7 +516,11 @@ export async function claimAction(
     action_id: input.action_id,
     action: input.action,
     revision: input.revision,
-    service_controller: input.service_controller,
+    service_controller: ids.service_controller,
+    outer_host: ids.outer_host,
+    implementer_treatment: ids.implementer_treatment,
+    reviewer_treatment: ids.reviewer_treatment,
+    privileged_mutation_actor: ids.privileged_mutation_actor,
   });
 
   return { claim, won: true };
@@ -708,6 +719,10 @@ export async function writePhaseEvidence(
     next_action: evidence.next_action,
     reason: evidence.reason,
     service_controller: evidence.service_controller,
+    outer_host: evidence.outer_host,
+    implementer_treatment: evidence.implementer_treatment,
+    reviewer_treatment: evidence.reviewer_treatment,
+    privileged_mutation_actor: evidence.privileged_mutation_actor,
     recorded_at: evidence.recorded_at ?? deps.now().toISOString(),
     child_disposition: evidence.child_disposition ?? null,
     replan_reason: evidence.replan_reason ?? null,
@@ -719,6 +734,10 @@ export async function writePhaseEvidence(
     next_action: doc.next_action,
     reason: doc.reason,
     service_controller: doc.service_controller,
+    outer_host: doc.outer_host,
+    implementer_treatment: doc.implementer_treatment,
+    reviewer_treatment: doc.reviewer_treatment,
+    privileged_mutation_actor: doc.privileged_mutation_actor,
     replan_reason: doc.replan_reason ?? null,
     child_disposition: doc.child_disposition ?? null,
   });

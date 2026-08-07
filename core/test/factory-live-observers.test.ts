@@ -172,38 +172,105 @@ test("observeFactoryRepoIdentity uses resolved config repo/base_branch", async (
   );
 });
 
-test("observeFactoryGithubSnapshot verifies each issue via injected getIssue", async () => {
+function contractedGithub(
+  overrides: Record<string, unknown> = {},
+): {
+  selector: { type: "milestone" | "label" | "range" | "issues" | "explicit"; value: string };
+  issue_ids: string[];
+  pr_ids: string[];
+  milestones: string[];
+  dependency_edges: { from: string; to: string }[];
+} {
+  return {
+    selector: { type: "milestone", value: "v2" },
+    issue_ids: ["1", "3"],
+    pr_ids: [],
+    milestones: ["v2"],
+    dependency_edges: [{ from: "1", to: "3" }],
+    ...overrides,
+  };
+}
+
+function githubObserverDeps(
+  overrides: Partial<
+    Pick<FactoryLiveObserverDeps, "getIssue" | "getPull" | "listMilestones">
+  > = {},
+): Pick<FactoryLiveObserverDeps, "getIssue" | "getPull" | "listMilestones"> {
+  return {
+    async getIssue(_repo, n) {
+      return { number: n, state: "open" };
+    },
+    async getPull(_repo, n) {
+      return { number: n, state: "OPEN" };
+    },
+    async listMilestones() {
+      return ["v2", "v3"];
+    },
+    ...overrides,
+  };
+}
+
+test("observeFactoryGithubSnapshot verifies issues/PRs/milestones/edges via injected seams", async () => {
   const seen: number[] = [];
-  const deps: Pick<FactoryLiveObserverDeps, "getIssue"> = {
+  const deps = githubObserverDeps({
     async getIssue(repo, n) {
       assert.equal(repo, "acme/widgets");
       seen.push(n);
       if (n === 2) return null;
       return { number: n, state: "open" };
     },
-  };
+  });
   const ok = await observeFactoryGithubSnapshot(deps, {
     repo: "acme/widgets",
-    issue_ids: ["1", "3"],
+    contracted: contractedGithub({ issue_ids: ["1", "3"] }),
   });
-  assert.deepEqual(ok, { ok: true });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(ok.observed?.issue_ids, ["1", "3"]);
+  assert.deepEqual(ok.observed?.milestones, ["v2"]);
+  assert.deepEqual(ok.observed?.dependency_edges, [{ from: "1", to: "3" }]);
   assert.deepEqual(seen, [1, 3]);
 
   const bad = await observeFactoryGithubSnapshot(deps, {
     repo: "acme/widgets",
-    issue_ids: ["1", "2"],
+    contracted: contractedGithub({ issue_ids: ["1", "2"], dependency_edges: [] }),
   });
   assert.equal(bad.ok, false);
   assert.match(bad.detail ?? "", /2/);
 });
 
+test("observeFactoryGithubSnapshot fails closed when contracted PR or milestone is missing", async () => {
+  const missingPr = await observeFactoryGithubSnapshot(
+    githubObserverDeps({
+      async getPull() {
+        return null;
+      },
+    }),
+    {
+      repo: "acme/widgets",
+      contracted: contractedGithub({ pr_ids: ["9"], dependency_edges: [] }),
+    },
+  );
+  assert.equal(missingPr.ok, false);
+  assert.match(missingPr.detail ?? "", /9/);
+
+  const missingMs = await observeFactoryGithubSnapshot(githubObserverDeps(), {
+    repo: "acme/widgets",
+    contracted: contractedGithub({ milestones: ["gone"], dependency_edges: [] }),
+  });
+  assert.equal(missingMs.ok, false);
+  assert.match(missingMs.detail ?? "", /gone/);
+});
+
 test("observeFactoryGithubSnapshot never invents success for empty/invalid repo", async () => {
-  const deps: Pick<FactoryLiveObserverDeps, "getIssue"> = {
+  const deps = githubObserverDeps({
     async getIssue() {
       throw new Error("should not be called for invalid repo");
     },
-  };
-  const r = await observeFactoryGithubSnapshot(deps, { repo: "not-a-repo", issue_ids: [] });
+  });
+  const r = await observeFactoryGithubSnapshot(deps, {
+    repo: "not-a-repo",
+    contracted: contractedGithub({ issue_ids: [] }),
+  });
   assert.equal(r.ok, false);
 });
 
@@ -252,6 +319,12 @@ test("buildFactoryMacroDeps wires real observers — no synthetic unknown/ok:tru
         issueCalls.push(n);
         return { number: n, state: "open" };
       },
+      async getPull(_repo, n) {
+        return { number: n, state: "OPEN" };
+      },
+      async listMilestones() {
+        return ["v2"];
+      },
       async readEnginePin() {
         return null;
       },
@@ -265,8 +338,18 @@ test("buildFactoryMacroDeps wires real observers — no synthetic unknown/ok:tru
     name: "acme/widgets",
     base_branch: "main",
   });
-  const gh = await macro.observeGithubSnapshot({ repo: "acme/widgets", issue_ids: ["42"] });
-  assert.deepEqual(gh, { ok: true });
+  const contracted = contractedGithub({
+    issue_ids: ["42"],
+    milestones: [],
+    dependency_edges: [],
+    selector: { type: "issues", value: "42" },
+  });
+  const gh = await macro.observeGithubSnapshot({
+    repo: "acme/widgets",
+    contracted,
+  });
+  assert.equal(gh.ok, true);
+  assert.deepEqual(gh.observed?.issue_ids, ["42"]);
   assert.deepEqual(issueCalls, [42]);
 
   const fps = await macro.readConfigFingerprints();
@@ -356,6 +439,12 @@ test("regression: synthetic unknown fingerprints and ok:true without getIssue mu
         issueCalls.push(n);
         return null;
       },
+      async getPull() {
+        return null;
+      },
+      async listMilestones() {
+        return [];
+      },
       async readEnginePin() {
         return null;
       },
@@ -371,7 +460,12 @@ test("regression: synthetic unknown fingerprints and ok:true without getIssue mu
 
   const snap = await macro.observeGithubSnapshot({
     repo: "acme/widgets",
-    issue_ids: ["99"],
+    contracted: contractedGithub({
+      issue_ids: ["99"],
+      milestones: [],
+      dependency_edges: [],
+      selector: { type: "issues", value: "99" },
+    }),
   });
   assert.equal(snap.ok, false, "missing issue must fail closed, not fabricate ok:true");
   assert.equal(issueCalls.length, 1);
