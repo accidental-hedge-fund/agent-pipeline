@@ -87,6 +87,7 @@ Post-1.0 the open backlog is **entirely additive or internal hardening — no br
 | **v1.29.2** ✅ shipped | patch | v1.29.2 | #449, #588, #597, #626, #635, #674, #675, #729, #754, #755, #756, #761, #764, #769, #770, #771, #773, #797 | Shipped 2026-08-02 (tag `v1.29.2`). See CHANGELOG.md. |
 | **v1.30.0** ✅ shipped | minor | v1.30.0 | #613, #628, #629, #630, #633, #757, #758, #759, #760, #761, #777 | Shipped 2026-08-02 (tag `v1.30.0`). See CHANGELOG.md. |
 | **v1.31.0** ✅ shipped | minor | v1.31.0 | #631, #632, #634, #636, #645, #646, #699, #762, #763, #778, #779, #780, #783, #784, #855, #857, #861, #872, #873 | Shipped 2026-08-06 (tag `v1.31.0`). See CHANGELOG.md. |
+| **v1.31.1** ✅ shipped | patch | v1.31.1 | #882 | Shipped 2026-08-07 (tag `v1.31.1`). See CHANGELOG.md. |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake`/`sweep` — **do not remove**. Issues that map to no release lane (research, indefinitely-deferred) list here._ |
 
 Per-issue sem-ver detail (✓ = dependency already merged in v1.0.0):
