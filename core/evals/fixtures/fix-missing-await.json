@@ -5,13 +5,16 @@
   "task_input": "Resolve this review finding with a minimal, surgical diff.",
   "stage_entry_artifacts": {
     "fix": {
-      "finding": "core/scripts/worktree.ts:612 — removeFn(cfg, issueNumber, slug) is called without awaiting its promise, so the worktree removal can race the subsequent `git worktree add`.",
+      "finding": "core/scripts/worktree.ts:612 \u2014 removeFn(cfg, issueNumber, slug) is called without awaiting its promise, so the worktree removal can race the subsequent `git worktree add`.",
       "severity": "block"
     }
   },
-  "public_checks": ["npm run ci"],
+  "public_checks": [
+    "npm run ci"
+  ],
   "grader_refs": [],
   "category": "review-fix-application",
   "risk": "medium",
-  "provenance": "synthetic"
+  "provenance": "synthetic",
+  "smoke_only": true
 }

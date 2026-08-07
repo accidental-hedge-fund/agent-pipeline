@@ -47,6 +47,7 @@ function makeFixtureFile(id: string, stage = "review") {
     stage_entry_artifacts: { [stage]: { x: 1 } },
     public_checks: [],
     grader_refs: [],
+    smoke_only: true,
     category: "c",
     risk: "low",
     provenance: "synthetic",
@@ -123,7 +124,7 @@ test("runExperiment: executes the full matrix, writes join keys, and performs ze
       preflight: async () => ({ ok: true }),
       invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 }),
     });
-    const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution });
+    const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution });
     assert.equal(executed.length, 2, `mode=${mode}`);
     for (const record of executed) {
       assert.equal(record.result_class, "completed");
@@ -149,6 +150,7 @@ test("runExperiment: cell records carry the fixture's env_surface_hash, which di
       stage_entry_artifacts: { review: { x: 1 } },
       public_checks: [],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -174,10 +176,10 @@ test("runExperiment: cell records carry the fixture's env_surface_hash, which di
   const manifest = makeManifestFile({ treatments: { harness: ["claude"] } });
 
   const { deps: depsSimulated } = makeHarness({ f1: fixtureWithEnv("simulated") }, manifest);
-  const { executed: executedSimulated } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...depsSimulated, cellExecution });
+  const { executed: executedSimulated } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...depsSimulated, skipFixturePreflight: true, cellExecution });
 
   const { deps: depsLive } = makeHarness({ f1: fixtureWithEnv("live") }, manifest);
-  const { executed: executedLive } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...depsLive, cellExecution });
+  const { executed: executedLive } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...depsLive, skipFixturePreflight: true, cellExecution });
 
   assert.equal(typeof executedSimulated[0].env_surface_hash, "string");
   assert.notEqual(executedSimulated[0].env_surface_hash, executedLive[0].env_surface_hash);
@@ -192,7 +194,7 @@ test("runExperiment: resume executes only cells without a completed record, and 
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => { invocationCount++; return { success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 }; },
   });
-  const first = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution });
+  const first = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution });
   assert.equal(first.executed.length, 2);
   assert.equal(invocationCount, 2);
 
@@ -200,7 +202,7 @@ test("runExperiment: resume executes only cells without a completed record, and 
   const runsAfterFirst = outFiles.get(path.join(dir, "runs.jsonl"));
 
   // Re-invoke with the same in-memory store — every cell already has a record.
-  const second = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution });
+  const second = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution });
   assert.equal(second.executed.length, 0, "resume must not re-execute completed cells");
   assert.equal(invocationCount, 2, "the harness must not be invoked again");
   assert.equal(outFiles.get(path.join(dir, "runs.jsonl")), runsAfterFirst, "existing records must be byte-identical after resume");
@@ -225,7 +227,7 @@ test("runExperiment: concurrency never exceeds the manifest's concurrency bound"
       return { success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 };
     },
   });
-  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution });
+  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution });
   assert.equal(executed.length, 4); // 2 fixtures x 2 harnesses x 1 replicate
   assert.ok(maxInFlight <= 2, `expected concurrency <= 2, observed ${maxInFlight}`);
   assert.ok(maxInFlight > 1, "expected the pool to actually run cells concurrently, not serially");
@@ -241,6 +243,7 @@ test("runExperiment: a cell whose record cannot be durably appended is not repor
   });
   const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", {
     ...deps,
+    skipFixturePreflight: true,
     appendFile: async () => { throw new Error("disk full"); },
     cellExecution,
   });
@@ -252,7 +255,7 @@ test("runExperiment: an infra_error cell is written to failures.jsonl and exclud
   const cellExecution = baseCellExecution({
     createWorktree: async () => { throw new Error("git worktree add failed"); },
   });
-  const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution });
+  const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution });
   assert.equal(executed.length, 1);
   assert.equal(executed[0].result_class, "infra_error");
   const dir = experimentDir(path.join(FAKE_CFG.repo_dir, manifest.output_dir), "exp1");
@@ -265,7 +268,7 @@ test("runExperiment: an infra_error cell is written to failures.jsonl and exclud
 // and sandbox_mode reach the durable cell record.
 // ---------------------------------------------------------------------------
 
-test("runExperiment: a cell's process-boundary denial and gh-surface refusal both reach the persisted record, with result_class unchanged", async () => {
+test("runExperiment: a cell's process-boundary denial reaches the persisted record, with result_class unchanged (#637)", async () => {
   const { deps, outFiles } = makeHarness({ f1: makeFixtureFile("f1", "review") }, makeManifestFile({ treatments: { harness: ["claude"] } }));
   const cellExecution = baseCellExecution({
     createWorktree: async (_c, o) => o,
@@ -275,22 +278,22 @@ test("runExperiment: a cell's process-boundary denial and gh-surface refusal bot
       { command: "git", argv: ["worktree", "add", "../nested"], category: "nested-worktree", at: "2026-01-01T00:00:00.000Z" },
     ],
     invokeHarness: async (args) => {
-      await args.gh.addLabel(1, "pipeline:ready-to-deploy").catch(() => {});
+      // Local-CLI path: no EvalGhSurface on args; credential strip is on env.
+      assert.equal((args as { gh?: unknown }).gh, undefined);
+      assert.equal(args.env?.GH_TOKEN, "");
       return { success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 };
     },
   });
-  const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution });
+  const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution });
   assert.equal(executed.length, 1);
   const record = executed[0];
   assert.equal(record.result_class, "completed", "a boundary denial alone must not change result_class");
   assert.equal(record.boundary_evidence?.denials.length, 1);
   assert.equal(record.boundary_evidence?.denials[0].category, "nested-worktree");
-  assert.equal(record.boundary_evidence?.gh_refusals.length, 1);
-  assert.equal(record.boundary_evidence?.gh_refusals[0].operation, "addLabel");
+  assert.equal(record.boundary_evidence?.gh_refusals.length, 0);
   const dir = experimentDir(path.join(FAKE_CFG.repo_dir, manifest.output_dir), "exp1");
   const persisted = JSON.parse((outFiles.get(path.join(dir, "runs.jsonl")) ?? "").trim());
   assert.equal(persisted.boundary_evidence.denials.length, 1);
-  assert.equal(persisted.boundary_evidence.gh_refusals.length, 1);
 });
 
 test("runExperiment: a cell with no denials carries no boundary_evidence field on the persisted record", async () => {
@@ -301,7 +304,7 @@ test("runExperiment: a cell with no denials carries no boundary_evidence field o
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 }),
   });
-  const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution });
+  const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution });
   assert.equal(executed[0].boundary_evidence, undefined);
   const dir = experimentDir(path.join(FAKE_CFG.repo_dir, manifest.output_dir), "exp1");
   const persisted = JSON.parse((outFiles.get(path.join(dir, "runs.jsonl")) ?? "").trim());
@@ -317,7 +320,7 @@ test("runExperiment: a boundary-evidence collection failure is recorded as bound
     readBoundaryDenials: () => { throw new Error("denial log unreadable"); },
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 }),
   });
-  const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution });
+  const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution });
   assert.equal(executed[0].boundary_evidence, undefined);
   assert.match(executed[0].boundary_evidence_error ?? "", /denial log unreadable/);
   const dir = experimentDir(path.join(FAKE_CFG.repo_dir, manifest.output_dir), "exp1");
@@ -336,10 +339,45 @@ test("runExperiment: the manifest's resolved sandbox_mode is carried onto every 
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 }),
   });
-  const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution });
+  const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution });
   assert.equal(manifest.sandbox_mode, "external-bypass");
   assert.equal(executed[0].sandbox_mode, "external-bypass");
   const dir = experimentDir(path.join(FAKE_CFG.repo_dir, manifest.output_dir), "exp1");
   const persisted = JSON.parse((outFiles.get(path.join(dir, "runs.jsonl")) ?? "").trim());
   assert.equal(persisted.sandbox_mode, "external-bypass");
+});
+
+test("runExperiment: fixture preflight failure aborts before treatments (infrastructure) (#637)", async () => {
+  const { deps } = makeHarness({ f1: makeFixtureFile("f1", "review") }, makeManifestFile({ treatments: { harness: ["claude"] } }));
+  let invoked = false;
+  const cellExecution = baseCellExecution({
+    createWorktree: async (_c, o) => o,
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => {
+      invoked = true;
+      return { success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 };
+    },
+  });
+  await assert.rejects(
+    () =>
+      runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", {
+        ...deps,
+        cellExecution,
+        fixturePreflight: {
+          staticDeps: { catFile: async () => null },
+          createWorktree: async () => {},
+          removeWorktree: async () => {},
+          runCheck: async () => true,
+          pathExists: async () => true,
+        },
+      }),
+    (err: unknown) => {
+      assert.equal((err as Error).name, "FixturePreflightError");
+      assert.match((err as Error).message, /fixture integrity preflight failed/);
+      assert.match(String((err as { failures?: string }).failures ?? err), /fixture_preflight/);
+      return true;
+    },
+  );
+  assert.equal(invoked, false, "no treatment may run after preflight failure");
 });

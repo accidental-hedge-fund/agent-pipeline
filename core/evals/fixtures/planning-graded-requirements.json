@@ -14,20 +14,32 @@
     {
       "id": "flag-registered",
       "statement": "The plan adds a --dry-run flag to the doctor command.",
-      "keywords": ["--dry-run"]
+      "keywords": [
+        "--dry-run"
+      ]
     },
     {
       "id": "no-execution",
       "statement": "The plan lists checks without executing them when --dry-run is set.",
-      "keywords": ["without executing", "list"]
+      "keywords": [
+        "without executing",
+        "list"
+      ]
     },
     {
       "id": "test-coverage",
       "statement": "The plan adds a test covering the new flag.",
-      "keywords": ["test"]
+      "keywords": [
+        "test"
+      ]
     }
   ],
-  "grader_refs": [{ "grader": "planning", "version": "1" }],
+  "grader_refs": [
+    {
+      "grader": "planning",
+      "version": "1"
+    }
+  ],
   "category": "cli-feature",
   "risk": "low",
   "provenance": "synthetic"

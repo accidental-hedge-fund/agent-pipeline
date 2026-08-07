@@ -2302,3 +2302,87 @@ test("check run-store:write-health — skips when repo_dir is empty", async () =
   const r = await getCheck(makeConfig({ repo_dir: "" }), "run-store:write-health").run(fakeDeps());
   assert.equal(r.status, "skip");
 });
+
+// ---------------------------------------------------------------------------
+// eval-fixture-integrity (#637)
+// ---------------------------------------------------------------------------
+
+test("check eval-fixture-integrity — skips when fixtures dir is absent", async () => {
+  const r = await getCheck(makeConfig(), "eval-fixture-integrity").run(
+    fakeDeps({ fsExists: (p) => !p.includes("evals/fixtures") }),
+  );
+  assert.equal(r.status, "skip");
+});
+
+test("check eval-fixture-integrity — skips when fixtures dir has no JSON", async () => {
+  const r = await getCheck(makeConfig(), "eval-fixture-integrity").run(
+    fakeDeps({
+      fsExists: () => true,
+      listDirNames: () => [],
+    }),
+  );
+  assert.equal(r.status, "skip");
+});
+
+test("check eval-fixture-integrity — fails naming fixture and SHA when object missing", async () => {
+  const body = JSON.stringify({
+    fixture_id: "broken-pin",
+    schema_version: 1,
+    base_commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    task_input: "t",
+    stage_entry_artifacts: { review: { diff: "x" } },
+    public_checks: [],
+    grader_refs: [],
+    smoke_only: true,
+    category: "c",
+    risk: "low",
+    provenance: "synthetic",
+  });
+  const r = await getCheck(makeConfig(), "eval-fixture-integrity").run(
+    fakeDeps({
+      fsExists: () => true,
+      listDirNames: (p) => (p.includes("fixtures") ? ["broken-pin.json"] : []),
+      readTextFile: async (p) => (p.endsWith("broken-pin.json") ? body : '{"version":"1.0.0"}'),
+      exec: async (f, a) => {
+        if (f === "git" && a.includes("cat-file")) {
+          return { ok: false, stdout: "", stderr: "missing" };
+        }
+        return { ok: true, stdout: '{"loggedIn":true}', stderr: "" };
+      },
+    }),
+  );
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /broken-pin/);
+  assert.match(r.detail, /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/);
+  assert.match(r.detail, /fixture_preflight/);
+});
+
+test("check eval-fixture-integrity — passes when all pins resolve as commit", async () => {
+  const body = JSON.stringify({
+    fixture_id: "ok-pin",
+    schema_version: 1,
+    base_commit: "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+    task_input: "t",
+    stage_entry_artifacts: { review: { diff: "x" } },
+    public_checks: [],
+    grader_refs: [],
+    smoke_only: true,
+    category: "c",
+    risk: "low",
+    provenance: "synthetic",
+  });
+  const r = await getCheck(makeConfig(), "eval-fixture-integrity").run(
+    fakeDeps({
+      fsExists: () => true,
+      listDirNames: (p) => (p.includes("fixtures") ? ["ok-pin.json"] : []),
+      readTextFile: async (p) => (p.endsWith("ok-pin.json") ? body : '{"version":"1.0.0"}'),
+      exec: async (f, a) => {
+        if (f === "git" && a.includes("cat-file")) {
+          return { ok: true, stdout: "commit\n", stderr: "" };
+        }
+        return { ok: true, stdout: '{"loggedIn":true}', stderr: "" };
+      },
+    }),
+  );
+  assert.equal(r.status, "pass", r.detail);
+});

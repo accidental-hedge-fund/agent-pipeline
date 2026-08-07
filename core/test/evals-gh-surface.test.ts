@@ -44,3 +44,12 @@ test("GhWriteRefusedError: carries the operation name and a clear message", asyn
     assert.match(err.message, /refused/i);
   }
 });
+
+test("EvalGhSurface is an in-process refuse surface — not local-CLI child protection (#637)", () => {
+  // Construction alone does not protect a harness child process. Local-CLI
+  // denial is PATH boundary + credential strip (see boundary-shim / executor).
+  // This test pins that disposition so it is not re-claimed as child protection.
+  const disposition =
+    "surface construction is not proof that a local-CLI harness child cannot write";
+  assert.match(disposition, /not proof that a local-CLI harness child/i);
+});

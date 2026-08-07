@@ -154,6 +154,10 @@ export interface Fixture {
    *  means "no boundary declared" — out-of-scope is then reported unknown. */
   allowed_change_paths?: string[];
   grader_refs: GraderRef[];
+  /** Explicit smoke-only mark (#637). Required when `grader_refs` is empty;
+   *  forbidden when `grader_refs` is non-empty. Smoke fixtures are eligible for
+   *  harness/isolation smoke but never enter graded quality aggregates. */
+  smoke_only: boolean;
   category: string;
   risk: string;
   provenance: FixtureProvenance;
@@ -167,6 +171,10 @@ export interface Fixture {
    *  (eval-fixture-contract #535) — always computed at fixture-load time,
    *  even for a fixture declaring neither (a stable baseline hash). */
   env_surface_hash: string;
+  /** Optional explicit bootstrap that materializes `base_commit` when the
+   *  object is not present in a default clone (#637). When present, preflight
+   *  runs this procedure before cells. Absent + missing object fails preflight. */
+  base_commit_bootstrap?: string;
 }
 
 export const SUPPORTED_FIXTURE_SCHEMA_VERSIONS = [1] as const;

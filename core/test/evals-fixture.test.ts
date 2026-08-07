@@ -14,7 +14,7 @@ import {
 const VALID_SHA = "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd";
 
 function validFixtureRaw(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
+  const merged: Record<string, unknown> = {
     fixture_id: "f1",
     schema_version: 1,
     base_commit: VALID_SHA,
@@ -22,11 +22,18 @@ function validFixtureRaw(overrides: Record<string, unknown> = {}): Record<string
     stage_entry_artifacts: { review: { diff: "..." } },
     public_checks: [],
     grader_refs: [],
+    smoke_only: true,
     category: "cli-feature",
     risk: "low",
     provenance: "synthetic",
     ...overrides,
   };
+  // Graded fixtures cannot be smoke_only (#637).
+  const refs = merged.grader_refs;
+  if (Array.isArray(refs) && refs.length > 0 && overrides.smoke_only === undefined) {
+    merged.smoke_only = false;
+  }
+  return merged;
 }
 
 test("validateFixture: a complete fixture is accepted", () => {
@@ -334,4 +341,47 @@ test("validateFixture: two fixtures identical except one dependency's mode produ
   const f1 = validateFixture(validFixtureRaw({ environment: [validEnvDep()] }), "f1.json");
   const f2 = validateFixture(validFixtureRaw({ environment: [validEnvDep({ mode: "live" })] }), "f1.json");
   assert.notEqual(f1.env_surface_hash, f2.env_surface_hash);
+});
+
+// --- smoke_only mark (#637) ---
+
+test("validateFixture: empty grader_refs with smoke_only true is accepted", () => {
+  const fixture = validateFixture(validFixtureRaw({ grader_refs: [], smoke_only: true }), "f1.json");
+  assert.equal(fixture.smoke_only, true);
+  assert.deepEqual(fixture.grader_refs, []);
+});
+
+test("validateFixture: empty grader_refs without smoke_only is rejected naming the mark", () => {
+  assert.throws(
+    () => validateFixture(validFixtureRaw({ grader_refs: [], smoke_only: false }), "f1.json"),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /smoke_only/.test((err as Error).message) &&
+      /empty grader_refs/.test((err as Error).message),
+  );
+});
+
+test("validateFixture: graded fixture marked smoke_only is rejected", () => {
+  assert.throws(
+    () =>
+      validateFixture(
+        validFixtureRaw({
+          grader_refs: [{ grader: "review", version: "1" }],
+          smoke_only: true,
+        }),
+        "f1.json",
+      ),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /smoke_only/.test((err as Error).message) &&
+      /graded fixture/.test((err as Error).message),
+  );
+});
+
+test("validateFixture: graded fixture without smoke_only is accepted with smoke_only false", () => {
+  const fixture = validateFixture(
+    validFixtureRaw({ grader_refs: [{ grader: "review", version: "1" }] }),
+    "f1.json",
+  );
+  assert.equal(fixture.smoke_only, false);
 });

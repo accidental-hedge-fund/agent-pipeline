@@ -15,12 +15,7 @@ import { resolveAdapter } from "../harness-adapters/index.ts";
 import { preflightExecutor, invokeExternalExecutor, type ExecutorAssignment } from "../executors.ts";
 import type { HarnessResult } from "../harness.ts";
 import type { ModelEndpointOverride, ModelInvokingStage, PipelineConfig } from "../types.ts";
-import {
-  createEvalGhSurface,
-  createRecordingRefusalRecorder,
-  type EvalGhSurface,
-  type GhRefusalRecord,
-} from "./gh-eval-surface.ts";
+import type { GhRefusalRecord } from "./gh-eval-surface.ts";
 import { EVAL_AGENT_CONTRACT_PATHS, EVAL_AGENT_CONTRACT_TEXT } from "./agent-contract.ts";
 import {
   boundaryEnv,
@@ -88,14 +83,12 @@ function resolveTreatmentModel(
 }
 
 /** Env overrides that strip GitHub/git write credentials from the harness
- *  child process (review 1 finding ddab0172; hardened for review 2 finding
- *  c5141ca2): the injected `EvalGhSurface` only refuses calls made through it,
- *  but a real harness is an external CLI that can shell out to `gh`/`git`
- *  directly with the operator's ambient credentials, bypassing that surface
- *  entirely. Redirecting `GH_CONFIG_DIR` to an empty, cell-scoped directory
- *  makes `gh` see no stored login; blanking the token env vars defeats
- *  env-based `gh`/git auth; dropping `SSH_AUTH_SOCK` defeats agent-based
- *  `git push` over SSH.
+ *  child process (#607 / #637). Local-CLI children never receive the
+ *  in-process `EvalGhSurface`; write denial for shell-outs is this credential
+ *  strip plus the PATH deny shim (`boundary-shim`). Redirecting
+ *  `GH_CONFIG_DIR` to an empty, cell-scoped directory makes `gh` see no
+ *  stored login; blanking the token env vars defeats env-based `gh`/git auth;
+ *  dropping `SSH_AUTH_SOCK` defeats agent-based `git push` over SSH.
  *
  *  `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL` point git at an empty,
  *  cell-scoped config instead of the operator's real system/global
@@ -108,7 +101,8 @@ function resolveTreatmentModel(
  *  real `$HOME`, and the eval runner's job is to exercise that CLI, not lock
  *  it out of its own auth — these vars scope the block to git/ssh/gh
  *  specifically, at the actual process boundary rather than a prompt-only
- *  convention. */
+ *  convention. This is a cooperative-agent validity fence, not multi-tenant
+ *  OS isolation (#618). */
 function isolatedGhEnv(worktreeDir: string): NodeJS.ProcessEnv {
   return {
     GH_TOKEN: "",
@@ -244,9 +238,9 @@ export interface HarnessInvokeArgs {
   timeoutSec: number;
   model?: string;
   effort?: string;
-  gh: EvalGhSurface;
   /** Env overrides merged on top of the child process's environment —
-   *  used to strip GitHub/git write credentials (see `isolatedGhEnv`). */
+   *  PATH deny shim + GitHub/git credential strip (see `evalIsolationEnv`).
+   *  Local-CLI write denial does not use an injected EvalGhSurface (#637). */
   env?: NodeJS.ProcessEnv;
   /** Explicit execution sandbox mode for this invocation (#607) — the eval
    *  path always supplies this from the resolved manifest field; it never
@@ -718,8 +712,11 @@ export async function runCell(
   const preflightFn = deps.preflight ?? realPreflight;
 
   const identity = allocateCellIdentity(cfg, cell);
-  const recorder = createRecordingRefusalRecorder();
-  const ghSurface = createEvalGhSurface(recorder);
+  // In-process EvalGhSurface is not constructed here: the local-CLI path has
+  // no in-process mutating gh call sites. Child denial is PATH + credentials
+  // (#637). When an in-process mutator is added, wire createEvalGhSurface and
+  // append refusals into boundary evidence.
+  const ghRefusals: GhRefusalRecord[] = [];
 
   const stages: EvalStageName[] = stagesForMode(cell.mode, fixture);
   const prompts = stages.map((stage) => materializeStagePrompt(stage, fixture));
@@ -778,7 +775,6 @@ export async function runCell(
     if (worktreeCreated) {
       try {
         const denials = readBoundaryDenialsFn(identity.worktreePath);
-        const ghRefusals = recorder.refusals;
         if (denials.length > 0 || ghRefusals.length > 0 || restoreFailures.length > 0) {
           boundaryEvidence = {
             denials,
@@ -804,7 +800,7 @@ export async function runCell(
       outcome,
       materializedPrompt,
       effectiveConfig,
-      ghRefusals: recorder.refusals,
+      ghRefusals,
       boundaryEvidence,
       boundaryEvidenceError,
       trajectory: {
@@ -910,7 +906,6 @@ export async function runCell(
         fixture,
         manifest,
         worktreeDir: identity.worktreePath,
-        gh: ghSurface,
         cellDeadlineMs,
         trajectoryActions,
         trajectoryStages,
@@ -1095,7 +1090,6 @@ export async function runCell(
           timeoutSec: Math.max(1, Math.ceil(remainingMs / 1000)),
           model: resolvedModel.model,
           effort: cell.treatment.effort,
-          gh: ghSurface,
           env: evalIsolationEnv(identity.worktreePath),
           sandboxMode: manifest.sandbox_mode,
         });

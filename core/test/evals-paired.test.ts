@@ -439,11 +439,11 @@ test("implementing-paired: per-cell timeout spans the whole pair loop", async ()
   assert.equal(result.outcome.result_class, "timeout");
 });
 
-test("implementing-paired: no production GitHub writes across full pair loop", async () => {
+test("implementing-paired: no production GitHub writes — local-CLI path uses env isolation not EvalGhSurface (#637)", async () => {
   const fixture = makeFixture();
   const manifest = pairedManifest();
   const cell = makeCell();
-  const ghOps: string[] = [];
+  const envs: Array<NodeJS.ProcessEnv | undefined> = [];
 
   const result = await runCell(FAKE_CFG, cell, fixture, manifest, {
     createWorktree: async () => ({ path: "/fake/wt", branch: "b" }),
@@ -452,39 +452,21 @@ test("implementing-paired: no production GitHub writes across full pair loop", a
     getDiff: async () => "diff --git a/x\n+y\n",
     getChangedPaths: async () => ["core/scripts/foo.ts"],
     invokeHarness: async (args) => {
-      // Attempt mutating operations through the eval gh surface if present.
-      const gh = args.gh as {
-        addLabel?: (...a: unknown[]) => Promise<unknown>;
-        postComment?: (...a: unknown[]) => Promise<unknown>;
-        createPr?: (...a: unknown[]) => Promise<unknown>;
-      };
-      if (gh.addLabel) {
-        try {
-          await gh.addLabel("x", 1, "pipeline:implementing");
-          ghOps.push("addLabel-succeeded");
-        } catch {
-          ghOps.push("addLabel-refused");
-        }
-      }
-      if (gh.postComment) {
-        try {
-          await gh.postComment("x", 1, "hi");
-          ghOps.push("postComment-succeeded");
-        } catch {
-          ghOps.push("postComment-refused");
-        }
-      }
+      envs.push(args.env);
+      // Ornamental gh removed from local-CLI invoke path.
+      assert.equal((args as { gh?: unknown }).gh, undefined);
       if (args.harness === "claude") return success("impl");
       return success(approveVerdict([]));
     },
   });
 
   assert.equal(result.outcome.result_class, "completed");
-  assert.ok(!ghOps.some((op) => op.endsWith("-succeeded")), `no successful mutations: ${ghOps.join(",")}`);
-  // Refusals should be recorded when the surface is exercised.
-  if (ghOps.length > 0) {
-    assert.ok(result.ghRefusals.length > 0 || ghOps.every((op) => op.endsWith("-refused")));
+  assert.ok(envs.length > 0);
+  for (const env of envs) {
+    assert.equal(env?.GH_TOKEN, "");
+    assert.equal(env?.GITHUB_TOKEN, "");
   }
+  assert.equal(result.ghRefusals.length, 0);
 });
 
 test("pipeline-paired: graph order planning → plan-review → implement → review; skips plan revision when clean", async () => {

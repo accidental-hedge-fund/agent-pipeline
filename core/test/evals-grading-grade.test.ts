@@ -39,6 +39,7 @@ function fixtureUngraded(): Fixture {
       stage_entry_artifacts: { fix: { finding: "x" } },
       public_checks: [],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -150,7 +151,8 @@ test("gradeExperiment: a completed cell whose fixture declares no grader_ref is 
   });
   assert.equal(grades.length, 0);
   assert.equal(skipped.length, 1);
-  assert.match(skipped[0].reason, /grader_ref/);
+  // Empty grader_refs fixtures are smoke_only (#637) and skip before grader_ref check.
+  assert.match(skipped[0].reason, /smoke_only|grader_ref/);
 });
 
 test("gradeExperiment: opens no runner-written file for writing — only reads manifest.json/runs.jsonl and writes grades.jsonl", async () => {
@@ -356,7 +358,8 @@ test("gradeExperiment: an end-to-end cell with no captured review/planning outpu
   });
   assert.equal(grades.length, 0);
   assert.equal(skipped.length, 1);
-  assert.match(skipped[0].reason, /no applicable grader/);
+  // smoke_only short-circuits before the mode/grader applicability check (#637).
+  assert.match(skipped[0].reason, /smoke_only|no applicable grader/);
 });
 
 test("gradeExperiment: regrading the same records twice produces byte-identical grades.jsonl", async () => {

@@ -277,11 +277,14 @@ plan. `evals run <manifest>` additionally executes every cell that has no
 completed record yet, in seed-derived order interleaved across harnesses,
 each in a **fresh worktree checked out at the fixture's `base_commit`**
 (never the current branch head) — no two cells, including replicates, share a
-worktree, branch, or session. **Evaluation mode performs zero production
-GitHub writes**: no label, comment, PR, or push — the gh surface used in this
-mode refuses every mutating call. Interrupting and re-running `evals run`
-never re-executes a completed cell or rewrites an existing
-`runs.jsonl`/`failures.jsonl` line.
+worktree, branch, or session. **Evaluation mode performs zero production GitHub writes**: no
+label, comment, PR, or push. Local-CLI cells enforce that at the **process
+boundary** (PATH deny shim + credential strip), not by injecting
+`EvalGhSurface` into the child. Isolation is a **cooperative-agent validity
+fence**, not multi-tenant OS security. `evals run` runs **fixture integrity
+preflight** before treatments; empty-`grader_refs` fixtures require
+`smoke_only: true`. Interrupting and re-running `evals run` never re-executes
+a completed cell or rewrites an existing `runs.jsonl`/`failures.jsonl` line.
 
 Results land under `<output_dir>/<experiment-id>/`: `manifest.json`,
 `plan.json`, `runs.jsonl` (append-only, `completed` cells only), and

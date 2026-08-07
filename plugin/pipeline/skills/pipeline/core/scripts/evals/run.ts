@@ -15,6 +15,11 @@ import {
 import { cellsRemaining, scheduleCells } from "./scheduler.ts";
 import { appendCellRecord, experimentDir, readExistingRecords, writePlanArtifacts, type ResultsWriterDeps } from "./results.ts";
 import { runCell, type CellExecutionDeps } from "./executor.ts";
+import {
+  formatPreflightFailures,
+  runDeepExperimentPreflight,
+  type DeepPreflightDeps,
+} from "./preflight.ts";
 import { buildTreatmentTrajectoryArtifact } from "./trajectory/collect.ts";
 import { writeContentAddressedArtifact, type ArtifactStoreDeps } from "./trajectory/store.ts";
 import type { BoundCeilings } from "./trajectory/bound.ts";
@@ -113,6 +118,22 @@ export interface RunExperimentDeps extends ExpandExperimentDeps, ResultsWriterDe
   /** Configurable byte/event ceilings for treatment trajectory artifacts
    *  (#536 task 7.1). Defaults to `DEFAULT_TRAJECTORY_CEILINGS` when absent. */
   trajectoryCeilings?: BoundCeilings;
+  /** Injectable deep/static fixture integrity preflight (#637). When omitted,
+   *  production runs deep preflight for every fixture id the manifest
+   *  references before any treatment executes. */
+  fixturePreflight?: DeepPreflightDeps;
+  /** When true, skip deep preflight (unit tests that inject cell fakes only).
+   *  Production callers must leave this false/absent. */
+  skipFixturePreflight?: boolean;
+}
+
+export class FixturePreflightError extends Error {
+  readonly failures: ReturnType<typeof formatPreflightFailures>;
+  constructor(message: string, detail: string) {
+    super(message);
+    this.name = "FixturePreflightError";
+    this.failures = detail;
+  }
 }
 
 /** `pipeline evals run <manifest>`: expand + persist the plan, then execute
@@ -128,6 +149,25 @@ export async function runExperiment(
   const { manifest, plan, fixtures } = expandExperiment(manifestPath, fixturesDir, deps);
   const outputDir = resolveOutputDir(cfg, manifest);
   await writePlanArtifacts(outputDir, manifest, plan, deps);
+
+  // Fixture integrity preflight (#637): static reachability + deep cell-like
+  // checks for graded fixtures, before any treatment or model invocation.
+  // Failures are infrastructure and abort the experiment (no quality pooling).
+  if (!deps.skipFixturePreflight) {
+    const preflight = await runDeepExperimentPreflight(
+      cfg,
+      fixtures,
+      manifest.fixture_ids,
+      deps.fixturePreflight ?? {},
+    );
+    if (!preflight.ok) {
+      const detail = formatPreflightFailures(preflight.failures);
+      throw new FixturePreflightError(
+        `fixture integrity preflight failed for experiment ${manifest.experiment_id} (${preflight.failures.length} failure(s))`,
+        detail,
+      );
+    }
+  }
 
   const scheduled = scheduleCells(plan.cells, manifest.seed);
   const existing = await readExistingRecords(outputDir, manifest.experiment_id, deps);

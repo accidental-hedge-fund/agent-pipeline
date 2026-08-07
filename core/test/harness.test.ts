@@ -32,10 +32,6 @@ import { makeGrokForwardTransform, parseGrokTelemetry } from "../scripts/harness
 import { verifyPlanRevisionOutput } from "../scripts/verify-harness-commits.ts";
 import { validateStageOutput } from "../scripts/stage-output-contract.ts";
 import { realInvokeHarness } from "../scripts/evals/executor.ts";
-import {
-  createEvalGhSurface,
-  createRecordingRefusalRecorder,
-} from "../scripts/evals/gh-eval-surface.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-harness-test-"));
@@ -683,10 +679,6 @@ test("invoke(): claude WITHOUT reasoningEffort has no --effort flag (#366)", asy
 // `InvokeOptions` never read.
 // ---------------------------------------------------------------------------
 
-function makeEvalGhSurface() {
-  return createEvalGhSurface(createRecordingRefusalRecorder());
-}
-
 test("realInvokeHarness (eval path): a codex cell declaring effort:'high' delivers -c model_reasoning_effort=high to argv (#621)", async () => {
   const cli = makeArgvStdinScript("codex");
   const oldPath = process.env.PATH;
@@ -698,7 +690,6 @@ test("realInvokeHarness (eval path): a codex cell declaring effort:'high' delive
       prompt: "PROMPT-MARKER",
       timeoutSec: 30,
       effort: "high",
-      gh: makeEvalGhSurface(),
     });
     const { argvLines } = splitArgvStdin(result.stdout);
     const cIdx = argvLines.indexOf("-c");
@@ -720,7 +711,6 @@ test("realInvokeHarness (eval path): a claude cell declaring effort:'high' deliv
       prompt: "PROMPT-MARKER",
       timeoutSec: 30,
       effort: "high",
-      gh: makeEvalGhSurface(),
     });
     const { argvLines } = splitArgvStdin(result.stdout);
     const effortIdx = argvLines.indexOf("--effort");
@@ -741,7 +731,6 @@ test("realInvokeHarness (eval path): a cell declaring no effort produces argv by
       worktreeDir: tmpRoot,
       prompt: "PROMPT-MARKER",
       timeoutSec: 30,
-      gh: makeEvalGhSurface(),
     });
     assert.doesNotMatch(result.stdout, /model_reasoning_effort/, "no reasoning-effort flag when effort is absent");
     assert.doesNotMatch(result.stdout, /-c\n/, "no -c flag when effort is absent");
@@ -761,7 +750,6 @@ test("realInvokeHarness (eval path): two cells differing only in declared effort
       prompt: "PROMPT-MARKER",
       timeoutSec: 30,
       effort: "low",
-      gh: makeEvalGhSurface(),
     });
     const high = await realInvokeHarness({
       harness: "codex",
@@ -769,7 +757,6 @@ test("realInvokeHarness (eval path): two cells differing only in declared effort
       prompt: "PROMPT-MARKER",
       timeoutSec: 30,
       effort: "high",
-      gh: makeEvalGhSurface(),
     });
     assert.notEqual(low.stdout, high.stdout, "argv must differ between the two declared efforts");
   } finally {

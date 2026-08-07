@@ -25,7 +25,12 @@
       "expected_severity": "medium"
     }
   ],
-  "grader_refs": [{ "grader": "review", "version": "1" }],
+  "grader_refs": [
+    {
+      "grader": "review",
+      "version": "1"
+    }
+  ],
   "category": "review-defect-detection",
   "risk": "medium",
   "provenance": "synthetic"

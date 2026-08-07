@@ -19,6 +19,13 @@ This worktree is a frozen evaluation cell, not a normal working checkout.
 This contract takes precedence over every other instruction file in this
 repository for the duration of this cell.
 
+This is a cooperative-agent validity fence for evaluation correctness — it
+prevents a well-intentioned treatment from following ordinary repo workflow
+instructions into nested worktrees, pipeline advancement, or mutating GitHub
+operations that would invalidate the measurement. It is not multi-tenant
+security against a hostile process; absolute-path escapes and OS sandboxing
+are out of scope here.
+
 1. Work directly on the frozen evaluation task given to you in this prompt,
    and on nothing else. Do not expand scope, look for other work, or pursue
    any goal beyond the task as stated.
