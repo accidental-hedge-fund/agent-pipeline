@@ -955,6 +955,66 @@ export async function loadTesterEvidenceForReview(
   return loadTesterEvidenceForReviewSync(read, candidateSha, onMissing);
 }
 
+/**
+ * Classifications where the deterministic producer may regenerate before
+ * fail_closed withholds a code-review model invoke (#646 / #882 recovery).
+ * Acquisition itself remains load-only; the optional `regenerate` callback is
+ * the sole writer path (typically `runTestGate` with `max_attempts: 0`).
+ */
+export const TESTER_REGENERABLE_CLASSIFICATIONS = [
+  "missing",
+  "stale",
+  "malformed",
+] as const;
+
+export type TesterRegenerableClassification =
+  (typeof TESTER_REGENERABLE_CLASSIFICATIONS)[number];
+
+export function isTesterRegenerableClassification(
+  c: TesterAcquisitionResult["classification"],
+): c is TesterRegenerableClassification {
+  return (TESTER_REGENERABLE_CLASSIFICATIONS as readonly string[]).includes(c);
+}
+
+/**
+ * Load SHA-matched Tester evidence for review; when fail_closed would withhold
+ * because the artifact is missing/stale/malformed, optionally invoke the
+ * deterministic producer once and re-acquire.
+ *
+ * Does **not** invent a pass: if regeneration fails or still cannot write a
+ * current artifact, the post-regeneration acquisition (and on_missing) applies.
+ * Used by review-1 / review-2 / delta so a fresh runDir after design-gate or a
+ * candidate-changing commit is not permanently parked solely for absent
+ * `tester-evidence.json` in this run directory.
+ */
+export async function loadOrRegenerateTesterEvidenceForReview(
+  runDir: string | undefined,
+  candidateSha: string,
+  cfg: Pick<PipelineConfig, "tester_evidence"> | { tester_evidence?: TesterEvidenceConfig },
+  regenerate?: () => Promise<void>,
+  io: TesterEvidenceIoDeps = defaultIoDeps,
+): Promise<TesterAcquisitionResult> {
+  let acq = await loadTesterEvidenceForReview(runDir, candidateSha, cfg, io);
+  if (!acq.withholdInvoke || !regenerate) return acq;
+  if (!isTesterRegenerableClassification(acq.classification)) return acq;
+  // No run surface: cannot persist producer output for re-acquisition.
+  if (!runDir) return acq;
+  console.log(
+    `[pipeline] tester-evidence: ${acq.classification} under fail_closed — ` +
+      `running deterministic producer once before withhold (candidate ${candidateSha.slice(0, 12) || "unknown"})`,
+  );
+  try {
+    await regenerate();
+  } catch (err) {
+    console.warn(
+      `[pipeline] tester-evidence: pre-review regeneration failed (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  return loadTesterEvidenceForReview(runDir, candidateSha, cfg, io);
+}
+
 // ---------------------------------------------------------------------------
 // Producer — build evidence from gate outcomes (no I/O)
 // ---------------------------------------------------------------------------

@@ -562,20 +562,44 @@ export async function getPrDetail(cfg: PipelineConfig, prNumber: number): Promis
   };
 }
 
+/**
+ * List PR check runs via `gh pr checks --json`.
+ *
+ * `gh` exits non-zero with a stderr message containing "no checks reported"
+ * when the PR has zero observable checks (no workflow runs / no check-runs).
+ * That is a valid empty result for pre-merge (#95) and merge (#275) — not a
+ * transport failure. Normalize it to `[]` so callers do not spin until
+ * `ci_timeout` treating the CLI failure as an indefinite wait (#882).
+ *
+ * Optional `opts` is for unit tests (injectable runner / retries); production
+ * callers omit it.
+ */
 export async function getPrChecks(
   cfg: PipelineConfig,
   prNumber: number,
+  opts?: GhRunOptions,
 ): Promise<CheckRun[]> {
-  const stdout = await ghRun([
-    "pr",
-    "checks",
-    String(prNumber),
-    "--json",
-    "name,state,bucket,description,link",
-    "-R",
-    cfg.repo,
-  ]);
-  return JSON.parse(stdout) as CheckRun[];
+  try {
+    const stdout = await ghRun(
+      [
+        "pr",
+        "checks",
+        String(prNumber),
+        "--json",
+        "name,state,bucket,description,link",
+        "-R",
+        cfg.repo,
+      ],
+      opts,
+    );
+    return JSON.parse(stdout) as CheckRun[];
+  } catch (err) {
+    const text = err instanceof Error ? err.message : String(err);
+    if (text.toLowerCase().includes("no checks reported")) {
+      return [];
+    }
+    throw err;
+  }
 }
 
 export async function getPrDiff(cfg: PipelineConfig, prNumber: number): Promise<string> {

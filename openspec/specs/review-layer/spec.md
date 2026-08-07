@@ -254,6 +254,21 @@ SHALL NOT overwrite the authoritative Tester record used for the round.
   fail-open/fail-closed policy from `tester-evidence`
 - **AND** SHALL NOT imply that tests passed
 
+#### Scenario: review regenerates missing suite evidence before fail_closed withhold
+
+- **WHEN** `review-1`, `review-2`, or delta re-review is about to acquire Tester
+  evidence for candidate SHA `S`
+- **AND** the current run directory has no trustworthy SHA-matched artifact
+  (missing, stale, or malformed)
+- **AND** `on_missing` is `fail_closed`
+- **AND** a run directory and worktree are available for the deterministic
+  producer
+- **THEN** the review path SHALL invoke the deterministic producer (`runTestGate`
+  or equivalent) once for `S` without a fix-harness loop before withholding
+- **AND** SHALL re-acquire after production
+- **AND** SHALL still apply fail_closed (and SHALL NOT invent a pass) when
+  regeneration fails to yield a current artifact
+
 #### Scenario: targeted checks remain supplemental in the review path
 
 - **WHEN** a reviewer performs a targeted check during a review round

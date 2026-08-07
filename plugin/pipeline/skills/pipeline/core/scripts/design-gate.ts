@@ -263,16 +263,89 @@ export function validateDesignDecisionRecord(candidate: unknown): DecisionRecord
   return { ok: errors.length === 0, errors };
 }
 
+/**
+ * Index of the matching `}` for a JSON object starting at `start` (`text[start]
+ * === "{"`), respecting strings and escapes. Returns -1 when unbalanced.
+ */
+function findBalancedJsonObjectEnd(text: string, start: number): number {
+  if (text[start] !== "{") return -1;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i]!;
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (c === "\\") {
+        escape = true;
+      } else if (c === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Extract balanced `{...}` slices that contain `"schema_version"` (design-gate
+ * decision-record marker). Walks left-to-right and advances past each complete
+ * object so nested objects are not double-scanned as outer candidates.
+ *
+ * Replaces the historical greedy `\{[\s\S]*"schema_version"[\s\S]*\}` match,
+ * which spanned from the first `{` to the last `}` and failed whenever the
+ * model emitted a broken draft object followed by a corrected record (#882
+ * design-gate false-fail on multi-fence Grok output).
+ */
+function extractSchemaVersionJsonObjects(text: string): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] !== "{") {
+      i++;
+      continue;
+    }
+    const end = findBalancedJsonObjectEnd(text, i);
+    if (end === -1) {
+      i++;
+      continue;
+    }
+    const slice = text.slice(i, end + 1);
+    if (slice.includes('"schema_version"')) out.push(slice);
+    i = end + 1;
+  }
+  return out;
+}
+
 /** Parse a decision record from raw harness output (fenced JSON or an inline
  *  object), then validate it. Returns `null` on any parse or validation
  *  failure — never a partial/defaulted record (design-decision-record spec:
- *  "rejected and re-requested rather than accepted"). */
+ *  "rejected and re-requested rather than accepted").
+ *
+ *  Tries every fenced JSON block in document order, then each balanced inline
+ *  object that carries `"schema_version"`. A leading invalid draft (common
+ *  when the implementer self-corrects mid-response) must not hide a later
+ *  valid record. */
 export function parseDesignDecisionRecord(output: string): { record: DesignDecisionRecord; errors: [] } | { record: null; errors: string[] } {
-  const fenceMatch = output.match(/```(?:json)?\s*\n([\s\S]*?)\n```/);
   const candidates: string[] = [];
-  if (fenceMatch) candidates.push(fenceMatch[1]);
-  const inlineMatch = output.match(/\{[\s\S]*"schema_version"[\s\S]*\}/);
-  if (inlineMatch) candidates.push(inlineMatch[0]);
+  // Global fence scan — not only the first block (#882 design-gate recovery).
+  const fenceRe = /```(?:json)?\s*\n([\s\S]*?)\n```/g;
+  for (const m of output.matchAll(fenceRe)) {
+    candidates.push(m[1]!);
+  }
+  for (const obj of extractSchemaVersionJsonObjects(output)) {
+    if (!candidates.includes(obj)) candidates.push(obj);
+  }
 
   let lastErrors: string[] = ["no parseable JSON object found in output"];
   for (const candidate of candidates) {

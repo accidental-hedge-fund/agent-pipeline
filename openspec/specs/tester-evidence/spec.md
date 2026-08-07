@@ -173,6 +173,18 @@ require SHA match or an explicit internal-commit policy consistent with
 - **AND** the deterministic producer SHALL regenerate evidence for `B` before
   suite evidence is considered current for `B`
 
+#### Scenario: mid-pipeline re-entry regenerates before fail_closed park
+
+- **WHEN** a new advance run directory is created after implementing (for
+  example at design-gate or review-1 re-entry) with no `tester-evidence.json`
+  for the current candidate HEAD
+- **AND** `on_missing` is `fail_closed`
+- **THEN** the code-review path SHALL attempt one deterministic producer run
+  for the current HEAD before treating the absence as a terminal withhold
+- **AND** acquisition after that attempt SHALL remain load-only (no invented
+  pass): only a successfully written SHA-matched artifact yields current
+  evidence
+
 ---
 
 ### Requirement: Missing or malformed evidence disposition SHALL be deterministic and never imply pass

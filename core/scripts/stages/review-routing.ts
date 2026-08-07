@@ -38,9 +38,10 @@ import {
 } from "../prompts/index.ts";
 import {
   appendTesterEvidenceSection,
-  loadTesterEvidenceForReview,
+  loadOrRegenerateTesterEvidenceForReview,
   testerEvidenceWithholdResult,
 } from "../tester-evidence.ts";
+import { runTestGate, type TestGateDeps } from "../testgate.ts";
 import {
   buildPriorRoundDigest,
   settledFindings,
@@ -134,6 +135,15 @@ export interface AdvanceReviewOpts {
   /** Injectable HTTP deps for external stage executor dispatch (#314). Tests
    *  supply a fake `fetchImpl` so no real network call is made. */
   executorHttpDeps?: ExecutorHttpDeps;
+  /**
+   * Deterministic test-gate runner used to regenerate SHA-pinned Tester
+   * evidence when review would otherwise fail_closed on missing/stale/malformed
+   * suite evidence for this runDir (#646 regeneration before review; #882
+   * mid-pipeline re-entry). Injected in unit tests; defaults to `runTestGate`.
+   */
+  runTestGate?: typeof runTestGate;
+  /** Optional TestGateDeps for the regenerative producer (tests inject fakes). */
+  testGateDeps?: TestGateDeps;
 }
 
 /**
@@ -553,7 +563,16 @@ export async function advanceReview(
         `harness (${reviewer}) is installed/spawnable for a self-review fallback — ${reason}${stderrExcerpt}`
       : `Review harness (${reviewer})${modelNote} failed: ${reason}${stderrExcerpt}`;
     await setBlockedFn(cfg, issueNumber, detailMsg, stage, "harness-failure");
-    return { advanced: false, status: "blocked", reason };
+    // Must thread blockerKind on the Outcome: emitBlockedOutcomeEvents defaults
+    // missing kind to needs-human → workflow-state, which misroutes durable
+    // recovery for tester-evidence-gate / harness exits as a generic workflow
+    // park instead of harness-failure (#882 recovery diagnostic).
+    return {
+      advanced: false,
+      status: "blocked",
+      reason,
+      blockerKind: "harness-failure",
+    };
   }
 
   // A delegated `stage_executors` result must satisfy the FULL verdict schema —
@@ -1290,7 +1309,11 @@ export async function invokePromptHarnessReview(
       });
 
   // #646: load SHA-matched Tester evidence once and append before ensemble so
-  // every agent shares identical authoritative suite bytes.
+  // every agent shares identical authoritative suite bytes. When fail_closed
+  // would withhold solely because this runDir has no current artifact (fresh
+  // advance after design-gate, or HEAD moved without re-running the implement
+  // gate), re-run the deterministic producer once (no fix-harness loop) and
+  // re-acquire — never invent a pass (#882 workflow-state recovery).
   let candidateSha = "";
   try {
     const head = await gitInWorktree(cwd, ["rev-parse", "HEAD"], { ignoreFailure: true });
@@ -1298,7 +1321,31 @@ export async function invokePromptHarnessReview(
   } catch {
     candidateSha = "";
   }
-  const testerAcq = await loadTesterEvidenceForReview(opts.runDir, candidateSha || "0".repeat(40), cfg);
+  const shaForReview = candidateSha || "0".repeat(40);
+  const gateRunner = opts.runTestGate ?? runTestGate;
+  const testerAcq = await loadOrRegenerateTesterEvidenceForReview(
+    opts.runDir,
+    shaForReview,
+    cfg,
+    opts.runDir
+      ? async () => {
+          const pipelineRunId =
+            opts.pipelineRunId ?? path.basename(opts.runDir!);
+          // max_attempts: 0 → measure/produce only; no implementer fix loop.
+          await gateRunner(
+            { ...cfg, test_gate: { ...cfg.test_gate, max_attempts: 0 } },
+            issueNumber,
+            cwd,
+            opts.testGateDeps ?? {},
+            pipelineRunId,
+            stageName,
+            opts.stateDir,
+            opts.runDir,
+            opts.runStoreDeps,
+          );
+        }
+      : undefined,
+  );
   prompt = appendTesterEvidenceSection(prompt, testerAcq);
   if (testerAcq.withholdInvoke) {
     return {

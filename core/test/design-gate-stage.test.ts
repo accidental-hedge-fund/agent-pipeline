@@ -184,6 +184,78 @@ test("design-gate: enabled but no trigger matched — advances immediately, no h
 });
 
 // ---------------------------------------------------------------------------
+// Worktree rematerialize (#882 recovery / #760)
+// ---------------------------------------------------------------------------
+
+test("design-gate: missing worktree + rematerialize pass continues (not false worktree-missing)", async () => {
+  // Live #882 false-fail: ensureManagedWorktree returned result:"pass" with
+  // reason "recreated from open PR head …" but design-gate checked === "ok"
+  // and parked as worktree-missing with blockerKind undefined.
+  const log = makeLog();
+  const deps = makeDeps(log, [harnessOk(decisionRecordOutput()), harnessOk(verdictOutput("approve"))]);
+  deps.getForIssue = async () => null;
+  let ensureCalls = 0;
+  deps.ensureManagedWorktree = async () => {
+    ensureCalls += 1;
+    return {
+      result: "pass",
+      worktree: { path: "/tmp/wt-remat", slug: "882-slug", branch: "pipeline/882-slug" },
+      reason: "recreated from open PR head 93d8f70",
+    };
+  };
+  const cfg = baseCfg();
+  const result = await advanceDesignGate(cfg, 42, {}, deps);
+  assert.equal(ensureCalls, 1, "must attempt rematerialize when on-disk worktree is missing");
+  assert.equal(log.blocked.length, 0, `must not park after successful rematerialize; got: ${JSON.stringify(log.blocked)}`);
+  assert.equal(result.advanced, true);
+  if (result.advanced) assert.equal(result.to, "review-1");
+  assert.equal(log.invokeCalls, 2, "decision record + challenge verdict must still run on rematerialized tree");
+});
+
+test("design-gate: missing worktree + rematerialize fail → worktree-missing park", async () => {
+  const log = makeLog();
+  const deps = makeDeps(log, []);
+  deps.getForIssue = async () => null;
+  deps.ensureManagedWorktree = async () => ({
+    result: "fail",
+    worktree: null,
+    reason: "no recoverable remote branch",
+    blockerKind: "worktree-missing",
+  });
+  const cfg = baseCfg();
+  const result = await advanceDesignGate(cfg, 42, {}, deps);
+  assert.equal(result.advanced, false);
+  assert.equal((result as { status?: string }).status, "blocked");
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0]?.kind, "worktree-missing");
+  assert.match(log.blocked[0]?.reason ?? "", /rematerialize failed/);
+  assert.equal(log.invokeCalls, 0);
+});
+
+test("design-gate: rematerialize skipped with null worktree → worktree-missing (no throw)", async () => {
+  // #882 review-2: non-fail rematerialize with null worktree must not
+  // dereference remat.worktree.path; park as recoverable worktree-missing.
+  const log = makeLog();
+  const deps = makeDeps(log, []);
+  deps.getForIssue = async () => null;
+  deps.ensureManagedWorktree = async () =>
+    ({
+      result: "skipped",
+      worktree: null,
+      reason: "already-present (stale fixture)",
+    }) as Awaited<ReturnType<NonNullable<typeof deps.ensureManagedWorktree>>>;
+  const cfg = baseCfg();
+  const result = await advanceDesignGate(cfg, 42, {}, deps);
+  assert.equal(result.advanced, false);
+  assert.equal((result as { status?: string }).status, "blocked");
+  assert.equal((result as { blockerKind?: string }).blockerKind, "worktree-missing");
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0]?.kind, "worktree-missing");
+  assert.match(log.blocked[0]?.reason ?? "", /without a worktree/);
+  assert.equal(log.invokeCalls, 0);
+});
+
+// ---------------------------------------------------------------------------
 // Clean approval
 // ---------------------------------------------------------------------------
 

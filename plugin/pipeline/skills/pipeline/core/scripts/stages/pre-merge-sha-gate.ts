@@ -91,9 +91,10 @@ import { reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import { isPipelineInternalCommit } from "../pipeline-commits.ts";
 import {
   appendTesterEvidenceSection,
-  loadTesterEvidenceForReview,
+  loadOrRegenerateTesterEvidenceForReview,
   testerEvidenceWithholdResult,
 } from "../tester-evidence.ts";
+import { runTestGate } from "../testgate.ts";
 import type { Outcome, PipelineConfig, ReviewFinding, Stage } from "../types.ts";
 import { preMergeBlocked, recordPreMergeGateResult } from "./pre-merge-shared.ts";
 import {
@@ -2153,7 +2154,8 @@ async function defaultRunDeltaReview(
     settledFindingsVerification: accounting?.settledFindingsVerification,
     headFiles: accounting?.headFiles,
   });
-  // #646: same Tester acquisition helper as review-1/2 / plan-review.
+  // #646: same Tester acquisition helper as review-1/2 — regenerate once when
+  // fail_closed would withhold on missing/stale/malformed for this runDir.
   let candidateSha = "";
   try {
     const head = await gitInWorktree(worktreePath, ["rev-parse", "HEAD"], { ignoreFailure: true });
@@ -2161,10 +2163,27 @@ async function defaultRunDeltaReview(
   } catch {
     candidateSha = "";
   }
-  const testerAcq = await loadTesterEvidenceForReview(
-    accounting?.runDir,
-    candidateSha || "0".repeat(40),
+  const shaForReview = candidateSha || "0".repeat(40);
+  const runDir = accounting?.runDir;
+  const testerAcq = await loadOrRegenerateTesterEvidenceForReview(
+    runDir,
+    shaForReview,
     cfg,
+    runDir
+      ? async () => {
+          await runTestGate(
+            { ...cfg, test_gate: { ...cfg.test_gate, max_attempts: 0 } },
+            issueNumber,
+            worktreePath,
+            {},
+            path.basename(runDir),
+            "pre-merge",
+            undefined,
+            runDir,
+            accounting?.runStoreDeps,
+          );
+        }
+      : undefined,
   );
   prompt = appendTesterEvidenceSection(prompt, testerAcq);
   if (testerAcq.withholdInvoke) {

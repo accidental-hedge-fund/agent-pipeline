@@ -639,6 +639,46 @@ test("advanceReview: SHA resolution failure → blocked, no review posted (#16)"
   assert.equal(rec.comments.length, 0, "no review comment may be posted without a valid SHA");
 });
 
+test("advanceReview: harness exit failure Outcome carries blockerKind harness-failure (#882)", async (t) => {
+  // Without blockerKind, emitBlockedOutcomeEvents defaults to needs-human →
+  // workflow-state, so durable recovery misroutes tester-evidence-gate /
+  // harness exits as a generic workflow park.
+  const { deps, rec } = makeDeps([APPROVE]);
+  const failingDeps: AdvanceReviewDeps = {
+    ...deps,
+    runReview: async () => ({
+      result: {
+        success: false,
+        stdout: "",
+        stderr:
+          "Tester suite evidence gate (fail_closed): withholding review model invoke. " +
+          "No Tester suite evidence file for this run (missing tester-evidence.json).",
+        exit_code: 1,
+        duration: 0,
+        timed_out: false,
+      },
+      effectiveReviewer: "tester-evidence-gate",
+      selfReview: false,
+    }),
+  };
+  let out: Awaited<ReturnType<typeof advanceReview>> | undefined;
+  await quiet(t, async () => {
+    out = await advanceReview(cfg, 882, 2, {}, 0, failingDeps);
+  });
+  assert.equal(out?.advanced, false);
+  assert.equal(out && !out.advanced ? out.status : undefined, "blocked");
+  assert.equal(out && !out.advanced ? out.blockerKind : undefined, "harness-failure");
+  assert.equal(out && !out.advanced ? out.reason : undefined, "exit 1");
+  assert.ok(
+    rec.blockedKinds.includes("harness-failure"),
+    "setBlocked must still record harness-failure",
+  );
+  assert.ok(
+    rec.blocked.some((b) => /tester-evidence-gate|fail_closed|missing tester-evidence/i.test(b)),
+    "blocked comment must name the tester-evidence withhold",
+  );
+});
+
 test("advanceReview: HEAD moves between SHA capture and diff fetch → blocked (#16)", async (t) => {
   // Regression for review finding #3: diff/SHA race — stamped SHA must match
   // the diff that was reviewed.
