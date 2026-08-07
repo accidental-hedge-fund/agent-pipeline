@@ -51,7 +51,7 @@
         }
       ],
       "portability": {
-        "model": "gpt-4o-mini"
+        "model": "haiku"
       }
     }
   ]

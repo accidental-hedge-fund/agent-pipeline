@@ -21,9 +21,47 @@ import { qualityScore } from "../scripts/evals/reporting/quality.ts";
 import { FORBIDDEN_MAINTAINABILITY_SCORE_FIELDS } from "../scripts/evals/reporting/types.ts";
 import type { Cell, ExperimentManifest, Fixture, RunPlan } from "../scripts/evals/types.ts";
 import type { GradeRecord } from "../scripts/evals/grading/types.ts";
+import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
 
 const SHA = "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd";
-const FAKE_CFG = { repo_dir: "/fake/repo" } as import("../scripts/types.ts").PipelineConfig;
+const FAKE_CFG = {
+  ...DEFAULT_CONFIG,
+  repo_dir: "/fake/repo",
+  repo: "owner/repo",
+  domain: "test",
+  review_policy: { block_threshold: "medium" as const, min_confidence: 0.7 },
+} as PipelineConfig;
+
+function approveVerdict(
+  findings: Array<{
+    severity: string;
+    title: string;
+    body: string;
+    confidence: number;
+    recommendation: string;
+    file: string;
+    line_start: number;
+    line_end: number;
+  }> = [],
+): string {
+  return JSON.stringify({
+    verdict: findings.length === 0 ? "approve" : "needs-attention",
+    summary: findings.length === 0 ? "LGTM" : "Issues found",
+    findings,
+    next_steps: [],
+  });
+}
+
+const BLOCKING_FINDING = {
+  severity: "high",
+  title: "bug",
+  body: "A real defect",
+  confidence: 0.9,
+  recommendation: "Fix it",
+  file: "core/scripts/foo.ts",
+  line_start: 1,
+  line_end: 2,
+};
 
 function multiChangeFixture(): Fixture {
   return validateFixture(
@@ -289,6 +327,8 @@ test("runCell multi-change: one worktree, ordered checkpoints, fresh sessions, c
     },
     getChangedPaths: async () => ["core/evals/sandboxes/x.js"],
     getRepoFingerprint: async () => `fp-${checkPassPattern}`,
+    createVerifierSnapshot: async (dir) => `${dir}__verifier_snap`,
+    removeVerifierSnapshot: async () => {},
   };
 
   const result = await runCell(FAKE_CFG, cell, fixture, manifest, deps);
@@ -366,13 +406,17 @@ test("runCell multi-change: cells are isolated (separate worktree paths)", async
       success: true,
       timed_out: false,
       exit_code: 0,
-      stdout: "",
+      // Parseable approval (no blocking → no fix loop).
+      stdout: approveVerdict(),
       stderr: "",
       duration: 0.1,
     }),
     runChecks: async ({ checks }) => Object.fromEntries(checks.map((c) => [c, true])),
     getChangedPaths: async () => [],
     getRepoFingerprint: async () => "fp",
+    getDiff: async () => "diff --git a/x b/x\n+ok\n",
+    createVerifierSnapshot: async (dir) => `${dir}__verifier_snap`,
+    removeVerifierSnapshot: async () => {},
   };
 
   await runCell(FAKE_CFG, makeCell("exp/mc1/profile=bare/1"), fixture, manifest, deps);
@@ -433,6 +477,10 @@ test("runCell multi-change: infra abort does not continue lineage as quality", a
     },
     getChangedPaths: async () => [],
     getRepoFingerprint: async () => "fp",
+    createVerifierSnapshot: async () => {
+      throw new Error("should not snapshot after spawn_error");
+    },
+    removeVerifierSnapshot: async () => {},
   };
 
   const result = await runCell(FAKE_CFG, cell, fixture, manifest, deps);
@@ -440,6 +488,205 @@ test("runCell multi-change: infra abort does not continue lineage as quality", a
   assert.equal(invokes, 1);
   const mc = result.outcome.detail?.multi_change as { aborted?: { result_class: string } };
   assert.equal(mc?.aborted?.result_class, "infra_error");
+});
+
+test("runCell multi-change: held-out verifiers run on disposable snapshot, not lineage worktree", async () => {
+  const fixture = multiChangeFixture();
+  const cell: Cell = {
+    cell_id: "exp/mc1/profile=bare/1",
+    experiment_id: "exp",
+    fixture_id: "mc1",
+    treatment_id: "profile=bare",
+    treatment: { harness: "claude", model: "strong-model", profile: "bare" },
+    replicate: 1,
+    mode: "implementing",
+    base_sha: SHA,
+  };
+  const manifest = {
+    schema_version: 1,
+    experiment_id: "exp",
+    fixture_ids: ["mc1"],
+    mode: "implementing",
+    treatments: { profile: ["bare"] },
+    replicates: 1,
+    seed: 1,
+    concurrency: 1,
+    timeout: 60,
+    output_dir: "/out",
+    sandbox_mode: "managed",
+  } as ExperimentManifest;
+
+  let lineagePath = "";
+  const checkDirs: string[] = [];
+  const snapshotsCreated: string[] = [];
+  const snapshotsRemoved: string[] = [];
+
+  const deps: CellExecutionDeps = {
+    contractIO: fakeContractIO(),
+    installBoundaryShim: (d) => `${d}/.shim`,
+    readBoundaryDenials: () => [],
+    removeBoundaryShim: () => {},
+    createWorktree: async (_c, o) => {
+      lineagePath = o.path;
+      return { path: o.path, branch: o.branch };
+    },
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      success: true,
+      timed_out: false,
+      exit_code: 0,
+      stdout: "ok",
+      stderr: "",
+      duration: 0.1,
+    }),
+    createVerifierSnapshot: async (worktreeDir) => {
+      assert.equal(worktreeDir, lineagePath);
+      const snap = `${worktreeDir}__verifier_snap_${snapshotsCreated.length}`;
+      snapshotsCreated.push(snap);
+      return snap;
+    },
+    removeVerifierSnapshot: async (dir) => {
+      snapshotsRemoved.push(dir);
+    },
+    runChecks: async ({ worktreeDir, checks }) => {
+      checkDirs.push(worktreeDir);
+      // Mutating verifier: if this ran on the lineage path it would leak state.
+      assert.notEqual(worktreeDir, lineagePath, "held-out checks must not run in the lineage worktree");
+      assert.ok(worktreeDir.includes("__verifier_snap"));
+      return Object.fromEntries(checks.map((c) => [c, true]));
+    },
+    getChangedPaths: async () => [],
+    getRepoFingerprint: async () => "fp",
+  };
+
+  const result = await runCell(FAKE_CFG, cell, fixture, manifest, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  assert.equal(checkDirs.length, 3);
+  for (const d of checkDirs) {
+    assert.notEqual(d, lineagePath);
+  }
+  assert.equal(snapshotsCreated.length, 3);
+  assert.deepEqual(snapshotsRemoved.sort(), snapshotsCreated.sort());
+});
+
+test("runCell multi-change: pipeline-current runs review_policy + fix when findings block", async () => {
+  const fixture = multiChangeFixture();
+  // Single checkpoint to keep role sequence short.
+  const oneCp = validateFixture(
+    {
+      ...fixture,
+      fixture_id: "mc-pipe",
+      checkpoints: [
+        {
+          checkpoint_id: "C1",
+          task_input: "Only requirement.",
+          held_out_verifiers: [{ verifier_id: "C1.a", check: "check-c1-a" }],
+        },
+      ],
+    },
+    "mc-pipe.json",
+  );
+  const cell: Cell = {
+    cell_id: "exp/mc-pipe/profile=pipeline-current/1",
+    experiment_id: "exp",
+    fixture_id: "mc-pipe",
+    treatment_id: "profile=pipeline-current",
+    treatment: { harness: "claude", model: "m", profile: "pipeline-current" },
+    replicate: 1,
+    mode: "implementing",
+    base_sha: SHA,
+  };
+  const bareCell: Cell = {
+    ...cell,
+    cell_id: "exp/mc-pipe/profile=bare/1",
+    treatment_id: "profile=bare",
+    treatment: { harness: "claude", model: "m", profile: "bare" },
+  };
+  const manifest = {
+    schema_version: 1,
+    experiment_id: "exp",
+    fixture_ids: ["mc-pipe"],
+    mode: "implementing",
+    treatments: { profile: ["bare", "pipeline-current"] },
+    replicates: 1,
+    seed: 1,
+    concurrency: 1,
+    timeout: 120,
+    output_dir: "/out",
+    sandbox_mode: "managed",
+  } as ExperimentManifest;
+
+  const rolesFor = async (profile: "bare" | "pipeline-current") => {
+    let reviewInvokes = 0;
+    const deps: CellExecutionDeps = {
+      contractIO: fakeContractIO(),
+      installBoundaryShim: (d) => `${d}/.shim`,
+      readBoundaryDenials: () => [],
+      removeBoundaryShim: () => {},
+      createWorktree: async (_c, o) => ({ path: o.path, branch: o.branch }),
+      removeWorktree: async () => {},
+      preflight: async () => ({ ok: true }),
+      getDiff: async () => "diff --git a/x b/x\n+changed\n",
+      createVerifierSnapshot: async (dir) => `${dir}__snap`,
+      removeVerifierSnapshot: async () => {},
+      runChecks: async ({ checks }) => Object.fromEntries(checks.map((c) => [c, true])),
+      getChangedPaths: async () => [],
+      getRepoFingerprint: async () => "fp",
+      invokeHarness: async (args) => {
+        // review-1 / review-2 prompts are production review templates (not the multi-change implement prompt).
+        const isImplement = args.prompt.includes("You are applying the next change");
+        const isFix = args.prompt.includes("fixRound") || /fix round|surgical-fix|Resolve the following review/i.test(args.prompt);
+        let stdout = "implemented";
+        if (!isImplement && !isFix) {
+          reviewInvokes++;
+          stdout = reviewInvokes === 1 ? approveVerdict([BLOCKING_FINDING]) : approveVerdict();
+        }
+        return {
+          success: true,
+          timed_out: false,
+          exit_code: 0,
+          stdout,
+          stderr: "",
+          duration: 0.1,
+        };
+      },
+    };
+    const c = profile === "bare" ? bareCell : cell;
+    const result = await runCell(FAKE_CFG, c, oneCp, manifest, deps);
+    assert.equal(result.outcome.result_class, "completed", result.outcome.error);
+    return result.trajectory.stages.map((s) => s.stage);
+  };
+
+  const bareRoles = await rolesFor("bare");
+  assert.deepEqual(bareRoles, ["implement"]);
+
+  const pipeRoles = await rolesFor("pipeline-current");
+  assert.ok(pipeRoles.includes("implement"), `expected implement in ${pipeRoles.join(",")}`);
+  assert.ok(pipeRoles.includes("review-1"), `expected review-1 in ${pipeRoles.join(",")}`);
+  assert.ok(pipeRoles.includes("fix-1"), `expected fix-1 after blocking findings in ${pipeRoles.join(",")}`);
+  assert.ok(pipeRoles.includes("review-2"), `expected re-review after fix in ${pipeRoles.join(",")}`);
+  // Differentiated from bare: more than a single implement invoke.
+  assert.ok(pipeRoles.length > bareRoles.length);
+});
+
+test("mc-native-widget-config portability model is Claude-harness compatible", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const { dirname, join } = await import("node:path");
+  // Fixture lives next to other eval fixtures under core/evals/fixtures.
+  const fixturePath = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "../evals/fixtures/mc-native-widget-config.json",
+  );
+  const raw = JSON.parse(readFileSync(fixturePath, "utf8")) as {
+    checkpoints: Array<{ checkpoint_id: string; portability?: { model?: string; harness?: string } }>;
+  };
+  const c3 = raw.checkpoints.find((c) => c.checkpoint_id === "C3");
+  assert.ok(c3?.portability?.model);
+  // Sample experiment pins harness=claude; override must not be an OpenAI-only id.
+  assert.notEqual(c3!.portability!.model, "gpt-4o-mini");
+  assert.match(c3!.portability!.model!, /haiku|claude|sonnet|opus/i);
 });
 
 // --- grading integration ---
