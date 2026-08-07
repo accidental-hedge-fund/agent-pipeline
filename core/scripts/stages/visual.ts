@@ -982,14 +982,23 @@ export async function advanceVisual(
     // EnsureManagedWorktreeResult uses pass|skipped|fail (not "ok"); only fail parks.
     const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
     const remat = await ensureFn(cfg, issueNumber, { getOnDiskForIssue: getForIssueFn });
-    if (remat.result === "fail") {
+    // Only proceed with a materialized worktree. `skipped`/`pass` without a
+    // non-null worktree is not usable (runtime type-stripping + injectable
+    // fakes can return that shape) — park as worktree-missing (#882 review-2).
+    if (remat.result === "fail" || !remat.worktree) {
+      const blockerKind =
+        remat.result === "fail" && remat.blockerKind
+          ? remat.blockerKind
+          : "worktree-missing";
       const reason =
-        `visual-gate: no worktree found and rematerialize failed (${remat.blockerKind}): ${remat.reason}`;
-      if (remat.blockerKind === "worktree-capacity") {
+        remat.result === "fail"
+          ? `visual-gate: no worktree found and rematerialize failed (${blockerKind}): ${remat.reason}`
+          : `visual-gate: no worktree found and rematerialize returned ${remat.result} without a worktree: ${remat.reason}`;
+      if (blockerKind === "worktree-capacity") {
         await setBlockedFn(cfg, issueNumber, reason, "visual-gate", "worktree-capacity");
         return { advanced: false, status: "blocked", reason, blockerKind: "worktree-capacity" };
       }
-      if (remat.blockerKind === "worktree-creation-failed") {
+      if (blockerKind === "worktree-creation-failed") {
         await setBlockedFn(cfg, issueNumber, reason, "visual-gate", "worktree-creation-failed");
         return { advanced: false, status: "blocked", reason, blockerKind: "worktree-creation-failed" };
       }

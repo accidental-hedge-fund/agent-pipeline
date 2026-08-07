@@ -232,6 +232,29 @@ test("design-gate: missing worktree + rematerialize fail → worktree-missing pa
   assert.equal(log.invokeCalls, 0);
 });
 
+test("design-gate: rematerialize skipped with null worktree → worktree-missing (no throw)", async () => {
+  // #882 review-2: non-fail rematerialize with null worktree must not
+  // dereference remat.worktree.path; park as recoverable worktree-missing.
+  const log = makeLog();
+  const deps = makeDeps(log, []);
+  deps.getForIssue = async () => null;
+  deps.ensureManagedWorktree = async () =>
+    ({
+      result: "skipped",
+      worktree: null,
+      reason: "already-present (stale fixture)",
+    }) as Awaited<ReturnType<NonNullable<typeof deps.ensureManagedWorktree>>>;
+  const cfg = baseCfg();
+  const result = await advanceDesignGate(cfg, 42, {}, deps);
+  assert.equal(result.advanced, false);
+  assert.equal((result as { status?: string }).status, "blocked");
+  assert.equal((result as { blockerKind?: string }).blockerKind, "worktree-missing");
+  assert.equal(log.blocked.length, 1);
+  assert.equal(log.blocked[0]?.kind, "worktree-missing");
+  assert.match(log.blocked[0]?.reason ?? "", /without a worktree/);
+  assert.equal(log.invokeCalls, 0);
+});
+
 // ---------------------------------------------------------------------------
 // Clean approval
 // ---------------------------------------------------------------------------
