@@ -79,6 +79,14 @@ pipeline factory-pin rollback              # repoint to previous + reinstall
 
 See [docs/factory-reliability-gate-runbook.md](docs/factory-reliability-gate-runbook.md#two-track-engine-pinning-762).
 
+### Factory macro-controller (#890)
+
+Optional, **off by default**. When enabled, Pipeline owns coarse factory lifecycle
+(immutable execution-contract revisions, CAS replan, at-most-once coarse actions)
+while item scheduling stays with the durable loop. Ordinary `pipeline` / `single` /
+`loop` / `merge` / `release` are unchanged when disabled. See
+[docs/factory-macro-controller.md](docs/factory-macro-controller.md).
+
 **Step 2 — Label an issue and run**
 
 ```bash

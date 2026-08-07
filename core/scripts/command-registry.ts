@@ -95,6 +95,29 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
+  // Factory macro-controller (#890): opt-in coarse lifecycle. Default off —
+  // ordinary pipeline/single/loop/merge/release do not require this command.
+  // Subcommands: adopt | replan | tick | status. Never merges or tags.
+  factory: {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "profile",
+      "json",
+      "runId",
+      "resume",
+      "fromRun",
+      "milestone",
+      "label",
+      "engineTrack",
+    ]),
+    needsConfig: true,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
   // Factory Reliability Gate (#723): score a durable loop / fixture pack and
   // write immutable evidence under .agent-pipeline/frg/<version>/. Never merges
   // or tags. --from-run scores an existing loop; no gh required for scoring.

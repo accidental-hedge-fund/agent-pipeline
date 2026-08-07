@@ -1082,6 +1082,17 @@ export interface PipelineConfig {
   loop: {
     native_goal_attestation: "auto" | "available" | "unavailable";
   };
+  /**
+   * Factory macro-controller (#890). Disabled by default — ordinary
+   * pipeline/single/loop/merge/release paths are unchanged when absent or
+   * `enabled: false`. When enabled, Pipeline owns coarse factory phase via
+   * immutable execution-contract revisions. Does not introduce `auto_merge`.
+   */
+  factory: {
+    macro_controller: {
+      enabled: boolean;
+    };
+  };
 }
 
 // Keys resolved from the active profile at config time, never from defaults
@@ -1207,6 +1218,7 @@ export const DEFAULT_CONFIG: Omit<
   executors: {} as Record<string, ExecutorDefinition>,
   stage_executors: {} as Partial<Record<ModelInvokingStage, string>>,
   loop: { native_goal_attestation: "auto" as const },
+  factory: { macro_controller: { enabled: false } },
 };
 
 // ---------------------------------------------------------------------------

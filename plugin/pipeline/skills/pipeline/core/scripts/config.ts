@@ -566,6 +566,26 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("pipeline:loop settings (#506)."),
+  // Factory macro-controller (#890). Opt-in; default disabled. Does not add
+  // auto_merge or change ordinary advance/loop/merge/release when off.
+  factory: z
+    .object({
+      macro_controller: z
+        .object({
+          enabled: z
+            .boolean()
+            .optional()
+            .describe(
+              "When true, enable the Pipeline-owned factory macro-controller for coarse lifecycle (execution-contract revisions). Default false — ordinary pipeline/single/loop/merge/release unchanged.",
+            ),
+        })
+        .strict()
+        .optional()
+        .describe("Factory macro-controller settings (#890). No auto_merge key."),
+    })
+    .strict()
+    .optional()
+    .describe("Factory lifecycle controller (#890). Disabled by default; sole Pipeline authority when enabled."),
   // Optional external event sink (#343). Opt-in; unconfigured behavior (local
   // events.jsonl only) is unchanged. `command` names an operator-controlled
   // forwarder that receives each event's JSON line on stdin; `mode` selects
@@ -1458,6 +1478,13 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     loop: {
       native_goal_attestation:
         fileConfig.loop?.native_goal_attestation ?? DEFAULT_CONFIG.loop.native_goal_attestation,
+    },
+    factory: {
+      macro_controller: {
+        enabled:
+          fileConfig.factory?.macro_controller?.enabled ??
+          DEFAULT_CONFIG.factory.macro_controller.enabled,
+      },
     },
     papercuts: {
       enabled: fileConfig.papercuts?.enabled ?? DEFAULT_CONFIG.papercuts.enabled,
@@ -2696,6 +2723,14 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         `#   native_goal_attestation: ${yamlScalar(loopCfg.native_goal_attestation)} # ${sd("loop.native_goal_attestation", "auto (default) detects automatically; available/unavailable overrides detection")}`,
       ].join("\n"),
     "",
+    config.factory !== undefined && config.factory.macro_controller?.enabled === true
+      ? `factory: # factory macro-controller (#890) — opt-in coarse lifecycle; no auto_merge\n  macro_controller:\n    enabled: true # ${sd("factory.macro_controller.enabled", "enable Pipeline-owned factory macro-controller; default false")}`
+      : [
+        "# factory: # factory macro-controller (#890) — disabled by default; ordinary pipeline/single/loop/merge/release unchanged",
+        "#   macro_controller:",
+        `#     enabled: false # ${sd("factory.macro_controller.enabled", "when true, Pipeline owns coarse factory phase via immutable execution-contract revisions; no auto_merge")}`,
+      ].join("\n"),
+    "",
     config.papercuts !== undefined
       ? `papercuts: # agent-logged minor-friction capture (#419) — opt in to record friction via 'pipeline papercut' without stopping the run\n${yamlBlock(config.papercuts, 2)}`
       : [
@@ -2983,6 +3018,12 @@ function normalizeForSync(config: PartialConfig): unknown {
     },
     doctor: { ...d.doctor, ...config.doctor },
     loop: { ...d.loop, ...config.loop },
+    factory: {
+      macro_controller: {
+        ...d.factory.macro_controller,
+        ...config.factory?.macro_controller,
+      },
+    },
     papercuts: { ...d.papercuts, ...config.papercuts },
     corrections: { ...d.corrections, ...config.corrections },
     durable_runs: { ...d.durable_runs, ...config.durable_runs },

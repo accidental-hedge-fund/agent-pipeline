@@ -80,6 +80,7 @@ $pipeline status <n>                            Read-only — print stage, block
 $pipeline unblock <n> "<answer>"                Post an answer and clear the blocked label
 $pipeline backfill [--apply] [--capability <name>] Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
 $pipeline evals plan|run|grade|report|harvest … Offline eval plan/run/grade/report/harvest (never writes to production GitHub)
+$pipeline factory status|tick|adopt|replan --run-id <id> [--json]  # requires factory.macro_controller.enabled Opt-in factory macro-controller: adopt/replan/tick/status over immutable execution-contract revisions (default off; never merges or tags)
 $pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] [--promote-pin-on-pass] Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)
 $pipeline factory-pin show|init --from-frg <X.Y.Z>|promote --for <X.Y.Z>|rollback [--to <X.Y.Z>] [--git-sha <sha>] [--force] Show / init / promote / rollback the factory production engine pin (last FRG-passed release; never merges or tags)
 $pipeline improve [--apply] [--top <n>] [--json] Cluster papercuts / corrections / durable-run blockers into backlog candidates
