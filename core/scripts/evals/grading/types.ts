@@ -78,11 +78,42 @@ export type CompositeSubGradePayload =
   | { kind: "review"; grade: ReviewGrade }
   | { kind: "planning"; grade: PlanningGrade; self_assessment_observed?: unknown };
 
+/** Multi-change maintainability grade (#577): strict pass + defect states per
+ *  checkpoint, terminal all-green for the lineage. Structural telemetry lives
+ *  on evidence/report axes, never as a collapsed maintainability score here. */
+export interface MultiChangeGradePayload {
+  checkpoints: Array<{
+    checkpoint_id: string;
+    checkpoint_index: number;
+    strict_pass: boolean;
+    current_step_defects: string[];
+    inherited_defects: string[];
+    accumulated_unresolved: string[];
+    recovered_defects: string[];
+    new_verifier_results: Record<string, boolean>;
+    inherited_verifier_results: Record<string, boolean>;
+    model: string | null;
+    portability_probe: boolean;
+    resource: {
+      duration_sec: number;
+      tokens?: number | null;
+      cost_usd?: number | null;
+      cost_source?: "actual" | "estimated" | "unknown";
+      retries?: number;
+      interventions?: number;
+    };
+    structural_telemetry?: Record<string, unknown>;
+    growth?: Record<string, unknown>;
+  }>;
+  terminal_all_green: boolean;
+}
+
 export type StageGradePayload =
   | { kind: "implementation-fix"; grade: ImplementationFixGrade }
   | { kind: "review"; grade: ReviewGrade }
   | { kind: "planning"; grade: PlanningGrade; self_assessment_observed?: unknown }
-  | { kind: "composite"; grades: CompositeSubGradePayload[] };
+  | { kind: "composite"; grades: CompositeSubGradePayload[] }
+  | { kind: "multi-change"; grade: MultiChangeGradePayload };
 
 /** One line of grades.jsonl. */
 export interface GradeRecord extends CellIdentity {

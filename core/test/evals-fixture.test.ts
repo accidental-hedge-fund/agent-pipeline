@@ -429,3 +429,273 @@ test("validateFixture: graded fixture without smoke_only is accepted with smoke_
   );
   assert.equal(fixture.smoke_only, false);
 });
+
+// --- multi-change maintainability fixtures (#577) ---
+
+function multiChangeRaw(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return validFixtureRaw({
+    kind: "multi_change",
+    task_input: "Sequence synopsis for multi-change maintainability.",
+    stage_entry_artifacts: { implementing: { plan: "apply current checkpoint only" } },
+    grader_refs: [{ grader: "multi-change", version: "1" }],
+    smoke_only: false,
+    checkpoints: [
+      {
+        checkpoint_id: "C1",
+        task_input: "Add module A.",
+        held_out_verifiers: [{ verifier_id: "C1.v1", check: "node -e \"process.exit(0)\"" }],
+      },
+      {
+        checkpoint_id: "C2",
+        task_input: "Extend module A with B.",
+        held_out_verifiers: [{ verifier_id: "C2.v1", check: "node -e \"process.exit(0)\"" }],
+      },
+    ],
+    ...overrides,
+  });
+}
+
+test("validateFixture: complete multi-change fixture is accepted", () => {
+  const fixture = validateFixture(multiChangeRaw(), "mc.json");
+  assert.equal(fixture.kind, "multi_change");
+  assert.equal(fixture.checkpoints?.length, 2);
+  assert.equal(fixture.checkpoints?.[0].checkpoint_id, "C1");
+});
+
+test("validateFixture: single-task fixtures remain valid without multi-change form", () => {
+  const fixture = validateFixture(validFixtureRaw(), "f1.json");
+  assert.equal(fixture.kind, undefined);
+  assert.equal(fixture.checkpoints, undefined);
+});
+
+test("validateFixture: empty checkpoint list is rejected naming checkpoints", () => {
+  assert.throws(
+    () => validateFixture(multiChangeRaw({ checkpoints: [] }), "mc.json"),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /checkpoints/.test((err as Error).message) &&
+      /at least one/.test((err as Error).message),
+  );
+});
+
+test("validateFixture: duplicate checkpoint_id is rejected", () => {
+  assert.throws(
+    () =>
+      validateFixture(
+        multiChangeRaw({
+          checkpoints: [
+            {
+              checkpoint_id: "C1",
+              task_input: "a",
+              held_out_verifiers: [{ verifier_id: "v1", check: "true" }],
+            },
+            {
+              checkpoint_id: "C1",
+              task_input: "b",
+              held_out_verifiers: [{ verifier_id: "v2", check: "true" }],
+            },
+          ],
+        }),
+        "mc.json",
+      ),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /duplicate checkpoint_id/.test((err as Error).message) &&
+      /"C1"/.test((err as Error).message),
+  );
+});
+
+test("validateFixture: checkpoint missing held-out verifiers is rejected", () => {
+  assert.throws(
+    () =>
+      validateFixture(
+        multiChangeRaw({
+          checkpoints: [{ checkpoint_id: "C1", task_input: "do it", held_out_verifiers: [] }],
+        }),
+        "mc.json",
+      ),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /held_out_verifiers/.test((err as Error).message) &&
+      /"C1"/.test((err as Error).message),
+  );
+});
+
+test("validateFixture: held-out verifier body in task_input is rejected as leakage", () => {
+  const secretCheck = "node -e \"require('fs').accessSync('hidden-oracle')\"";
+  assert.throws(
+    () =>
+      validateFixture(
+        multiChangeRaw({
+          checkpoints: [
+            {
+              checkpoint_id: "C1",
+              task_input: `Implement the feature. Secret oracle: ${secretCheck}`,
+              held_out_verifiers: [{ verifier_id: "C1.v1", check: secretCheck }],
+            },
+          ],
+        }),
+        "mc.json",
+      ),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /held-out verifier check body/.test((err as Error).message) &&
+      /"C1"/.test((err as Error).message),
+  );
+});
+
+
+test("validateFixture: held-out verifier body in fixture-level task_input is rejected", () => {
+  const secretCheck = "node -e \"require('fs').accessSync('hidden-oracle-root')\"";
+  assert.throws(
+    () =>
+      validateFixture(
+        multiChangeRaw({
+          task_input: `Synopsis leaks oracle: ${secretCheck}`,
+          checkpoints: [
+            {
+              checkpoint_id: "C1",
+              task_input: "Implement without secrets.",
+              held_out_verifiers: [{ verifier_id: "C1.v1", check: secretCheck }],
+            },
+          ],
+        }),
+        "mc.json",
+      ),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /held-out verifier check body/.test((err as Error).message),
+  );
+});
+
+test("validateFixture: held-out verifier id in stage_entry_artifacts is rejected", () => {
+  assert.throws(
+    () =>
+      validateFixture(
+        multiChangeRaw({
+          stage_entry_artifacts: {
+            implementing: { plan: "Pass C1.secret_oracle to ship" },
+          },
+          checkpoints: [
+            {
+              checkpoint_id: "C1",
+              task_input: "Implement the feature.",
+              held_out_verifiers: [{ verifier_id: "C1.secret_oracle", check: "node -e \"process.exit(0)\"" }],
+            },
+          ],
+        }),
+        "mc.json",
+      ),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /held-out verifier id/.test((err as Error).message) &&
+      /C1\.secret_oracle/.test((err as Error).message),
+  );
+});
+
+test("validateFixture: public_checks wrapper containing held-out body is rejected", () => {
+  const secretCheck = "node -e \"require('fs').accessSync('wrapped-oracle')\"";
+  assert.throws(
+    () =>
+      validateFixture(
+        multiChangeRaw({
+          // Wrapper embeds the exact held-out command body (not merely equal to it).
+          public_checks: [`bash -lc 'set -e; ${secretCheck}'`],
+          checkpoints: [
+            {
+              checkpoint_id: "C1",
+              task_input: "Implement the feature.",
+              held_out_verifiers: [{ verifier_id: "C1.v1", check: secretCheck }],
+            },
+          ],
+        }),
+        "mc.json",
+      ),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /held-out verifier check body/.test((err as Error).message),
+  );
+});
+
+test("validateFixture: checkpoint public_checks wrapper containing held-out body is rejected", () => {
+  const secretCheck = "node -e \"require('fs').accessSync('cp-wrapped-oracle')\"";
+  assert.throws(
+    () =>
+      validateFixture(
+        multiChangeRaw({
+          checkpoints: [
+            {
+              checkpoint_id: "C1",
+              task_input: "Implement the feature.",
+              public_checks: [`sh -c 'set -e; ${secretCheck}'`],
+              held_out_verifiers: [{ verifier_id: "C1.v1", check: secretCheck }],
+            },
+          ],
+        }),
+        "mc.json",
+      ),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /held-out verifier check body/.test((err as Error).message) &&
+      /"C1"/.test((err as Error).message),
+  );
+});
+test("validateFixture: portability override scoped to checkpoint is accepted", () => {
+  const fixture = validateFixture(
+    multiChangeRaw({
+      checkpoints: [
+        {
+          checkpoint_id: "C1",
+          task_input: "strong model step",
+          held_out_verifiers: [{ verifier_id: "C1.v1", check: "true" }],
+        },
+        {
+          checkpoint_id: "C2",
+          task_input: "weaker model portability probe",
+          held_out_verifiers: [{ verifier_id: "C2.v1", check: "true" }],
+          portability: { model: "gpt-4o-mini" },
+        },
+      ],
+    }),
+    "mc.json",
+  );
+  assert.equal(fixture.checkpoints?.[1].portability?.model, "gpt-4o-mini");
+  assert.equal(fixture.checkpoints?.[0].portability, undefined);
+});
+
+test("validateFixture: role metadata is optional for multi-change", () => {
+  const fixture = validateFixture(multiChangeRaw(), "mc.json");
+  assert.equal(fixture.roles, undefined);
+});
+
+test("validateFixture: shortcut_debt and external_canary roles are accepted", () => {
+  const fixture = validateFixture(
+    multiChangeRaw({
+      roles: { shortcut_debt: true, external_canary: true, external_canary_provenance: "slopcodebench-curated" },
+    }),
+    "mc.json",
+  );
+  assert.equal(fixture.roles?.shortcut_debt, true);
+  assert.equal(fixture.roles?.external_canary, true);
+  assert.equal(fixture.roles?.external_canary_provenance, "slopcodebench-curated");
+});
+
+test("validateFixture: portability without model coordinate is rejected", () => {
+  assert.throws(
+    () =>
+      validateFixture(
+        multiChangeRaw({
+          checkpoints: [
+            {
+              checkpoint_id: "C1",
+              task_input: "x",
+              held_out_verifiers: [{ verifier_id: "v1", check: "true" }],
+              portability: { harness: "claude" },
+            },
+          ],
+        }),
+        "mc.json",
+      ),
+    /portability override must name a non-empty "model"/,
+  );
+});

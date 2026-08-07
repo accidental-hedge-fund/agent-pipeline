@@ -23,7 +23,15 @@ import {
 import { buildTreatmentTrajectoryArtifact } from "./trajectory/collect.ts";
 import { writeContentAddressedArtifact, type ArtifactStoreDeps } from "./trajectory/store.ts";
 import type { BoundCeilings } from "./trajectory/bound.ts";
-import { isPairedEvalMode, type Cell, type CellRecord, type ExperimentManifest, type Fixture, type RunPlan } from "./types.ts";
+import {
+  isMultiChangeFixture,
+  isPairedEvalMode,
+  type Cell,
+  type CellRecord,
+  type ExperimentManifest,
+  type Fixture,
+  type RunPlan,
+} from "./types.ts";
 
 export interface FixtureLoaderDeps extends LoadFixtureDeps {
   listFixtureFiles?: (dir: string) => string[];
@@ -64,17 +72,20 @@ export function expandExperiment(
 
   // Paired modes start from task_input + first-stage artifacts (planning or
   // implementing) with live handoffs thereafter — not a single frozen stage.
-  if (manifest.mode !== "end-to-end" && !isPairedEvalMode(manifest.mode)) {
-    for (const fixtureId of manifest.fixture_ids) {
-      validateFixtureEntersStage(fixtures.get(fixtureId)!, manifest.mode);
+  // Multi-change fixtures (#577) always need implementing-stage entry (or a
+  // per-checkpoint equivalent); they are not mode-gated beyond that.
+  for (const fixtureId of manifest.fixture_ids) {
+    const fixture = fixtures.get(fixtureId)!;
+    if (isMultiChangeFixture(fixture)) {
+      validateFixtureEntersStage(fixture, "implementing");
+      continue;
     }
-  } else if (manifest.mode === "implementing-paired") {
-    for (const fixtureId of manifest.fixture_ids) {
-      validateFixtureEntersStage(fixtures.get(fixtureId)!, "implementing");
-    }
-  } else if (manifest.mode === "pipeline-paired") {
-    for (const fixtureId of manifest.fixture_ids) {
-      validateFixtureEntersStage(fixtures.get(fixtureId)!, "planning");
+    if (manifest.mode !== "end-to-end" && !isPairedEvalMode(manifest.mode)) {
+      validateFixtureEntersStage(fixture, manifest.mode);
+    } else if (manifest.mode === "implementing-paired") {
+      validateFixtureEntersStage(fixture, "implementing");
+    } else if (manifest.mode === "pipeline-paired") {
+      validateFixtureEntersStage(fixture, "planning");
     }
   }
 

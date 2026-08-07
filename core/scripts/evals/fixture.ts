@@ -15,9 +15,19 @@ import {
   type EnvironmentDependency,
   type EvalStageName,
   type Fixture,
+  type FixtureKind,
   type GraderRef,
+  type MultiChangeCheckpoint,
+  type MultiChangeHeldOutVerifier,
+  type MultiChangeRoles,
+  type PortabilityModelOverride,
   type SeededDefect,
 } from "./types.ts";
+import {
+  checkpointVisibleSources,
+  detectHeldOutLeakage,
+  fixtureVisibleSources,
+} from "./multi-change.ts";
 import { stableStringify } from "./manifest.ts";
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
@@ -340,14 +350,51 @@ export function validateFixture(raw: unknown, sourcePath: string): Fixture {
     capabilitySurface = validateCapabilitySurface(fixtureId, capabilitySurfaceRaw);
   }
 
+  // Multi-change form (#577): kind + ordered checkpoints with held-out verifiers.
+  let kind: FixtureKind | undefined;
+  if (obj.kind !== undefined) {
+    if (obj.kind !== "single_task" && obj.kind !== "multi_change") {
+      throw new FixtureValidationError(
+        fixtureId,
+        "kind",
+        `must be "single_task" or "multi_change", got ${JSON.stringify(obj.kind)}`,
+      );
+    }
+    kind = obj.kind;
+  }
+
+  let checkpoints: MultiChangeCheckpoint[] | undefined;
+  let roles: MultiChangeRoles | undefined;
+
+  if (kind === "multi_change") {
+    const validated = validateMultiChangeForm(fixtureId, obj, publicChecks, hiddenChecks);
+    checkpoints = validated.checkpoints;
+    roles = validated.roles;
+  } else if (obj.checkpoints !== undefined) {
+    throw new FixtureValidationError(
+      fixtureId,
+      "checkpoints",
+      'checkpoints are only valid when kind is "multi_change"',
+    );
+  } else if (obj.roles !== undefined) {
+    throw new FixtureValidationError(
+      fixtureId,
+      "roles",
+      'roles metadata is only valid when kind is "multi_change"',
+    );
+  }
+
   return {
     fixture_id: fixtureId,
     schema_version: schemaVersion,
+    ...(kind ? { kind } : {}),
     base_commit: baseCommit,
     task_input: taskInput,
     stage_entry_artifacts: artifacts as Partial<Record<EvalStageName, unknown>>,
     public_checks: publicChecks,
     hidden_checks: hiddenChecks,
+    ...(checkpoints ? { checkpoints } : {}),
+    ...(roles ? { roles } : {}),
     seeded_defects: seededDefects,
     acceptance_criteria: acceptanceCriteria,
     allowed_change_paths: allowedChangePaths,
@@ -361,6 +408,262 @@ export function validateFixture(raw: unknown, sourcePath: string): Fixture {
     env_surface_hash: computeEnvSurfaceHash(environment, capabilitySurface),
     base_commit_bootstrap: baseCommitBootstrap,
   };
+}
+
+/** Validate multi-change checkpoints + optional roles (#577). */
+function validateMultiChangeForm(
+  fixtureId: string,
+  obj: Record<string, unknown>,
+  publicChecks: string[],
+  hiddenChecks: string[] | undefined,
+): { checkpoints: MultiChangeCheckpoint[]; roles?: MultiChangeRoles } {
+  const checkpointsRaw = obj.checkpoints;
+  if (!Array.isArray(checkpointsRaw)) {
+    throw new FixtureValidationError(fixtureId, "checkpoints", "required non-empty array for multi_change fixtures");
+  }
+  if (checkpointsRaw.length === 0) {
+    throw new FixtureValidationError(fixtureId, "checkpoints", "must contain at least one checkpoint");
+  }
+
+  const seenCheckpointIds = new Set<string>();
+  const seenVerifierIds = new Set<string>();
+  const allVerifiers: MultiChangeHeldOutVerifier[] = [];
+  const publicSet = new Set(publicChecks);
+
+  const checkpoints: MultiChangeCheckpoint[] = checkpointsRaw.map((raw, idx) => {
+    if (typeof raw !== "object" || raw === null) {
+      throw new FixtureValidationError(fixtureId, "checkpoints", `entry ${idx} must be an object`);
+    }
+    const c = raw as Record<string, unknown>;
+    const checkpointId = c.checkpoint_id;
+    if (typeof checkpointId !== "string" || checkpointId.length === 0) {
+      throw new FixtureValidationError(fixtureId, "checkpoints", `entry ${idx} is missing "checkpoint_id"`);
+    }
+    if (seenCheckpointIds.has(checkpointId)) {
+      throw new FixtureValidationError(
+        fixtureId,
+        "checkpoints",
+        `duplicate checkpoint_id ${JSON.stringify(checkpointId)}`,
+      );
+    }
+    seenCheckpointIds.add(checkpointId);
+
+    if (typeof c.task_input !== "string" || c.task_input.length === 0) {
+      throw new FixtureValidationError(
+        fixtureId,
+        "checkpoints",
+        `checkpoint ${JSON.stringify(checkpointId)} is missing non-empty "task_input"`,
+      );
+    }
+
+    const verifiersRaw = c.held_out_verifiers;
+    if (!Array.isArray(verifiersRaw) || verifiersRaw.length === 0) {
+      throw new FixtureValidationError(
+        fixtureId,
+        "checkpoints",
+        `checkpoint ${JSON.stringify(checkpointId)} must declare a non-empty held_out_verifiers set`,
+      );
+    }
+
+    const held_out_verifiers: MultiChangeHeldOutVerifier[] = verifiersRaw.map((vr, vIdx) => {
+      if (typeof vr !== "object" || vr === null) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "checkpoints",
+          `checkpoint ${JSON.stringify(checkpointId)} held_out_verifiers[${vIdx}] must be an object`,
+        );
+      }
+      const v = vr as Record<string, unknown>;
+      if (typeof v.verifier_id !== "string" || v.verifier_id.length === 0) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "checkpoints",
+          `checkpoint ${JSON.stringify(checkpointId)} held_out_verifiers[${vIdx}] is missing "verifier_id"`,
+        );
+      }
+      if (seenVerifierIds.has(v.verifier_id)) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "checkpoints",
+          `duplicate verifier_id ${JSON.stringify(v.verifier_id)}`,
+        );
+      }
+      seenVerifierIds.add(v.verifier_id);
+      if (typeof v.check !== "string" || v.check.trim().length === 0) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "checkpoints",
+          `checkpoint ${JSON.stringify(checkpointId)} verifier ${JSON.stringify(v.verifier_id)} is missing non-empty "check"`,
+        );
+      }
+      if (publicSet.has(v.check)) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "checkpoints",
+          `checkpoint ${JSON.stringify(checkpointId)} held-out check must not also appear in public_checks`,
+        );
+      }
+      if (hiddenChecks?.includes(v.check)) {
+        // Allowed structurally (both hidden), but multi-change prefers its own field.
+      }
+      return { verifier_id: v.verifier_id, check: v.check };
+    });
+    allVerifiers.push(...held_out_verifiers);
+
+    let checkpointPublic: string[] | undefined;
+    if (c.public_checks !== undefined) {
+      if (!Array.isArray(c.public_checks) || c.public_checks.some((x) => typeof x !== "string")) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "checkpoints",
+          `checkpoint ${JSON.stringify(checkpointId)} "public_checks" must be a string[] when present`,
+        );
+      }
+      checkpointPublic = c.public_checks as string[];
+      for (const check of held_out_verifiers) {
+        if (checkpointPublic.includes(check.check)) {
+          throw new FixtureValidationError(
+            fixtureId,
+            "checkpoints",
+            `checkpoint ${JSON.stringify(checkpointId)} held-out check must not appear in checkpoint public_checks`,
+          );
+        }
+      }
+    }
+
+    let stageEntry: MultiChangeCheckpoint["stage_entry_artifacts"];
+    if (c.stage_entry_artifacts !== undefined) {
+      if (typeof c.stage_entry_artifacts !== "object" || c.stage_entry_artifacts === null || Array.isArray(c.stage_entry_artifacts)) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "checkpoints",
+          `checkpoint ${JSON.stringify(checkpointId)} stage_entry_artifacts must be an object when present`,
+        );
+      }
+      const sea = c.stage_entry_artifacts as Record<string, unknown>;
+      for (const key of Object.keys(sea)) {
+        if (!(EVAL_STAGE_NAMES as readonly string[]).includes(key)) {
+          throw new FixtureValidationError(
+            fixtureId,
+            "checkpoints",
+            `checkpoint ${JSON.stringify(checkpointId)} unknown stage key "${key}"`,
+          );
+        }
+      }
+      stageEntry = sea as MultiChangeCheckpoint["stage_entry_artifacts"];
+    }
+
+    let portability: PortabilityModelOverride | undefined;
+    if (c.portability !== undefined) {
+      if (typeof c.portability !== "object" || c.portability === null || Array.isArray(c.portability)) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "checkpoints",
+          `checkpoint ${JSON.stringify(checkpointId)} portability must be an object when present`,
+        );
+      }
+      const p = c.portability as Record<string, unknown>;
+      if (typeof p.model !== "string" || p.model.length === 0) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "checkpoints",
+          `checkpoint ${JSON.stringify(checkpointId)} portability override must name a non-empty "model" coordinate`,
+        );
+      }
+      if (p.harness !== undefined && (typeof p.harness !== "string" || p.harness.length === 0)) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "checkpoints",
+          `checkpoint ${JSON.stringify(checkpointId)} portability.harness must be a non-empty string when present`,
+        );
+      }
+      if (p.effort !== undefined && (typeof p.effort !== "string" || p.effort.length === 0)) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "checkpoints",
+          `checkpoint ${JSON.stringify(checkpointId)} portability.effort must be a non-empty string when present`,
+        );
+      }
+      portability = {
+        model: p.model,
+        ...(typeof p.harness === "string" ? { harness: p.harness } : {}),
+        ...(typeof p.effort === "string" ? { effort: p.effort } : {}),
+      };
+    }
+
+    if (c.introduces_shortcut_debt !== undefined && typeof c.introduces_shortcut_debt !== "boolean") {
+      throw new FixtureValidationError(
+        fixtureId,
+        "checkpoints",
+        `checkpoint ${JSON.stringify(checkpointId)} introduces_shortcut_debt must be a boolean when present`,
+      );
+    }
+
+    return {
+      checkpoint_id: checkpointId,
+      task_input: c.task_input as string,
+      held_out_verifiers,
+      ...(stageEntry ? { stage_entry_artifacts: stageEntry } : {}),
+      ...(checkpointPublic ? { public_checks: checkpointPublic } : {}),
+      ...(c.introduces_shortcut_debt === true ? { introduces_shortcut_debt: true } : {}),
+      ...(portability ? { portability } : {}),
+    };
+  });
+
+  // Leakage: held-out verifier bodies/ids must not appear in any treatment-visible
+  // channel (fixture-level synopsis/artifacts/public checks + per-checkpoint fields).
+  const rootVisible = fixtureVisibleSources({
+    task_input: typeof obj.task_input === "string" ? obj.task_input : "",
+    public_checks: publicChecks,
+    stage_entry_artifacts: obj.stage_entry_artifacts,
+  });
+  const rootLeak = detectHeldOutLeakage(rootVisible, allVerifiers);
+  if (rootLeak) {
+    throw new FixtureValidationError(fixtureId, "task_input", rootLeak);
+  }
+  for (const cp of checkpoints) {
+    const leak = detectHeldOutLeakage(checkpointVisibleSources(cp), allVerifiers);
+    if (leak) {
+      throw new FixtureValidationError(
+        fixtureId,
+        "checkpoints",
+        `checkpoint ${JSON.stringify(cp.checkpoint_id)}: ${leak}`,
+      );
+    }
+  }
+
+  let roles: MultiChangeRoles | undefined;
+  if (obj.roles !== undefined) {
+    if (typeof obj.roles !== "object" || obj.roles === null || Array.isArray(obj.roles)) {
+      throw new FixtureValidationError(fixtureId, "roles", "must be an object when present");
+    }
+    const r = obj.roles as Record<string, unknown>;
+    roles = {};
+    if (r.shortcut_debt !== undefined) {
+      if (typeof r.shortcut_debt !== "boolean") {
+        throw new FixtureValidationError(fixtureId, "roles", "shortcut_debt must be a boolean when present");
+      }
+      roles.shortcut_debt = r.shortcut_debt;
+    }
+    if (r.external_canary !== undefined) {
+      if (typeof r.external_canary !== "boolean") {
+        throw new FixtureValidationError(fixtureId, "roles", "external_canary must be a boolean when present");
+      }
+      roles.external_canary = r.external_canary;
+    }
+    if (r.external_canary_provenance !== undefined) {
+      if (typeof r.external_canary_provenance !== "string" || r.external_canary_provenance.length === 0) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "roles",
+          "external_canary_provenance must be a non-empty string when present",
+        );
+      }
+      roles.external_canary_provenance = r.external_canary_provenance;
+    }
+  }
+
+  return { checkpoints, roles };
 }
 
 /** Validate one `environment` dependency entry, rejecting an unknown `mode`

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "experiment_id": "multi-change-bare-vs-pipeline-sample",
+  "fixture_ids": [
+    "mc-native-widget-config",
+    "mc-shortcut-debt-filter",
+    "mc-external-canary-ledger"
+  ],
+  "mode": "implementing",
+  "treatments": {
+    "harness": ["claude"],
+    "model": ["claude-sonnet-4-5"],
+    "profile": ["bare", "pipeline-current"]
+  },
+  "replicates": 1,
+  "seed": 577,
+  "concurrency": 1,
+  "timeout": 1800,
+  "output_dir": ".agent-pipeline/evals",
+  "sandbox_mode": "managed",
+  "_comment": "Optional controlled variants (adversarial-review, quality-feedback, design-dossier) may be added to profile without changing checkpoint prompts or verifiers. design-dossier (#575) is optional and must not gate bare-vs-pipeline. Portability probe model override is declared on mc-native-widget-config C3."
+}

@@ -286,6 +286,24 @@ preflight** before treatments; empty-`grader_refs` fixtures require
 `smoke_only: true`. Interrupting and re-running `evals run` never re-executes
 a completed cell or rewrites an existing `runs.jsonl`/`failures.jsonl` line.
 
+**Multi-change maintainability fixtures (#577):** fixtures with
+`kind: "multi_change"` declare an ordered `checkpoints[]` list (each with
+disclosed `task_input` + held-out verifiers). A multi-change **cell** keeps one
+worktree lineage across checkpoints (repo state persists) while starting a
+**fresh model session** each step; only declared pipeline evidence is preserved
+(no chat transcripts, no held-out verifier bodies). At checkpoint *k* the runner
+runs new + inherited (1..k−1) held-out verifiers; **strict pass** requires both
+green. Quality non-strict failures continue the lineage so recovery diagnostics
+remain; infra/auth/timeout abort with existing non-quality result classes.
+Treatments may set a `profile` axis (`bare` / `just-solve` vs `pipeline-current`,
+optional `adversarial-review` / `quality-feedback` / `design-dossier`) without
+changing prompts or verifiers — `#575` is optional and does not gate
+bare-vs-pipeline. Sample manifest:
+`core/evals/experiments/multi-change-bare-vs-pipeline.sample.json`. Grade with
+`grader: "multi-change"`; `evals report` emits a `multi_change` section with
+per-checkpoint defect states, effort, growth, and structural telemetry as
+**separate** dimensions — never a synthetic maintainability/slop score.
+
 Results land under `<output_dir>/<experiment-id>/`: `manifest.json`,
 `plan.json`, `runs.jsonl` (append-only, `completed` cells only), and
 `failures.jsonl` (append-only, `infra_error` / `auth_error` / `timeout`

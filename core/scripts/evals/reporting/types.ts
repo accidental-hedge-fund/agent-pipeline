@@ -87,6 +87,65 @@ export interface LinkedArtifactEntry {
   verifier_artifacts: ArtifactDescriptor[];
 }
 
+/**
+ * Multi-change comparative report section (#577). Correctness, effort, growth,
+ * and structural telemetry remain separate dimensions. This shape MUST NOT
+ * include a synthetic maintainability or "slop" ground-truth score field.
+ */
+export interface MultiChangeCheckpointTreatmentMetrics {
+  treatment_id: string;
+  model: string | null;
+  portability_probe: boolean;
+  strict_pass_rate: number;
+  n: number;
+  current_step_defects_mean: number;
+  inherited_defects_mean: number;
+  accumulated_unresolved_mean: number;
+  recovered_defects_mean: number;
+  mean_duration_sec: number | null;
+  cost: CostSummary | null;
+  mean_retries: number | null;
+  mean_interventions: number | null;
+  growth?: {
+    mean_files_added: number | null;
+    mean_change_amplification: number | null;
+  };
+  /** Structural telemetry as separate non-ground-truth signals. */
+  structural_telemetry?: Record<string, number | null>;
+}
+
+export interface MultiChangeCheckpointReport {
+  fixture_id: string;
+  checkpoint_id: string;
+  checkpoint_index: number;
+  treatments: MultiChangeCheckpointTreatmentMetrics[];
+}
+
+export interface MultiChangeTreatmentLineageSummary {
+  treatment_id: string;
+  terminal_all_green_rate: number;
+  n_lineages: number;
+  /** Named baseline treatment this row is compared against (null for baseline). */
+  baseline_treatment_id: string | null;
+  quality_delta_vs_baseline: Effect | null;
+}
+
+export interface MultiChangeReport {
+  /** Per fixture × checkpoint index, treatments paired for fair deltas. */
+  by_checkpoint: MultiChangeCheckpointReport[];
+  /** Lineage-level terminal all-green and baseline deltas. */
+  lineages: MultiChangeTreatmentLineageSummary[];
+  /** Optional variants requested but not present in the experiment (not zeroed). */
+  variants_not_run: string[];
+  /**
+   * Explicit non-goal marker: structural telemetry and model-judged scores are
+   * never collapsed into maintainability ground truth. Presence of this flag
+   * documents the contract; there is intentionally no `maintainability_score`
+   * or `slop_score` field on this object.
+   */
+  structural_telemetry_is_not_ground_truth: true;
+}
+
 export interface Summary {
   schema_version: number;
   experiment_id: string;
@@ -100,6 +159,17 @@ export interface Summary {
    *  `linkArtifacts`); absent — never an empty array — by default, so the
    *  default summary is byte-identical to the pre-#536 output. */
   linked_artifacts?: LinkedArtifactEntry[];
+  /** Present only when the experiment graded multi-change fixtures (#577). */
+  multi_change?: MultiChangeReport;
 }
 
 export const SUMMARY_SCHEMA_VERSION = 1;
+
+/** Fields that MUST never appear on a multi-change summary (regression guard). */
+export const FORBIDDEN_MAINTAINABILITY_SCORE_FIELDS = [
+  "maintainability_score",
+  "slop_score",
+  "slop",
+  "overall_maintainability",
+  "synthetic_maintainability",
+] as const;

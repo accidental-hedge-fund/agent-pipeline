@@ -29,6 +29,7 @@ import { runPairedCellLoop } from "./paired-loop.ts";
 import { isJsonVerdictShaped, parseProseReview, parseStrictVerdict, parseStructuredVerdict } from "../stages/review-parsing.ts";
 import type { BuildTreatmentTrajectoryInput, RawStageEntry } from "./trajectory/collect.ts";
 import {
+  isMultiChangeFixture,
   isPairedEvalMode,
   type BoundaryDenial,
   type BoundaryEvidence,
@@ -43,6 +44,19 @@ import {
   type SandboxMode,
   type Treatment,
 } from "./types.ts";
+import {
+  buildStructuralTelemetry,
+  computeGrowthFromPaths,
+  contentAddressedRepoFingerprint,
+  hashPrompt,
+  inheritedVerifiers,
+  materializeMultiChangeCheckpointPrompt,
+  resolveCheckpointCoordinates,
+  resolveMultiChangeProfile,
+  type MultiChangeCheckpointEvidence,
+} from "./multi-change.ts";
+import { runMultiChangeCheckpointTreatment } from "./multi-change-treatment.ts";
+import { createHash, randomUUID } from "node:crypto";
 
 function sanitizeForPath(cellId: string): string {
   return cellId.replace(/[^a-zA-Z0-9._-]/g, "-");
@@ -244,9 +258,33 @@ export interface CellExecutionDeps {
    *  given worktree. Only invoked when the fixture declares
    *  `allowed_change_paths` (out-of-scope-change grading needs it). */
   getChangedPaths?: (args: { worktreeDir: string; baseSha: string }) => Promise<string[]>;
+  /** Fingerprint the worktree tree state for multi-change evidence trails
+   *  (#577). Defaults to a content-addressed digest (HEAD + tracked diff +
+   *  untracked content hashes). */
+  getRepoFingerprint?: (args: { worktreeDir: string }) => Promise<string>;
   /** Full unified diff text for the worktree vs baseSha — used by paired modes
    *  so the reviewer sees the actual primary implementation (#601). */
   getDiff?: (args: { worktreeDir: string; baseSha: string }) => Promise<string>;
+  /**
+   * Disposable isolated (non-Git, symlink-safe) copy of the post-treatment
+   * worktree for multi-change held-out verifier execution (#577). Verifier
+   * side effects must not persist into the treatment lineage; defaults to
+   * {@link copyIsolatedVerifierTree} under os.tmpdir. Called once per
+   * held-out verifier so side effects cannot cascade across checks.
+   * `deadlineMs` bounds snapshot materialization; implementations MUST fail
+   * rather than run past the cell budget.
+   */
+  createVerifierSnapshot?: (
+    worktreeDir: string,
+    opts?: { deadlineMs?: number },
+  ) => Promise<string>;
+  /** Remove a verifier snapshot directory from {@link createVerifierSnapshot}. */
+  removeVerifierSnapshot?: (snapshotDir: string) => Promise<void>;
+  /** Read source files from the post-step worktree for maintainability telemetry (#577). */
+  collectWorktreeSourceFiles?: (args: {
+    worktreeDir: string;
+    changedPaths: string[];
+  }) => Promise<Array<{ path: string; content: string }>>;
   /** Dispatch an API treatment through a named `model-endpoint` executor
    *  (#434 task 6). Only invoked when the cell's treatment declares
    *  `executor`. */
@@ -323,6 +361,354 @@ async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: stri
   } catch {
     return [];
   }
+}
+
+/** True when a child_process error may have partial/truncated stdout. */
+function isGitExecInfraFailure(err: unknown): boolean {
+  const e = err as {
+    killed?: boolean;
+    signal?: string | null;
+    code?: string | number | null;
+    message?: string;
+  };
+  if (e.killed === true) return true;
+  if (e.signal === "SIGTERM" || e.signal === "SIGKILL") return true;
+  if (e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return true;
+  const msg = typeof e.message === "string" ? e.message : "";
+  if (/maxBuffer|ETIMEDOUT|timed out/i.test(msg)) return true;
+  return false;
+}
+
+/** Streamed content digest for a worktree path (mode + bytes or symlink target). */
+async function hashWorktreePathContent(absPath: string): Promise<string> {
+  try {
+    const st = await fs.promises.lstat(absPath);
+    if (st.isSymbolicLink()) {
+      const target = await fs.promises.readlink(absPath);
+      return createHash("sha256").update(`symlink:${st.mode}:${target}`).digest("hex");
+    }
+    if (st.isFile()) {
+      return await new Promise<string>((resolve, reject) => {
+        const h = createHash("sha256");
+        h.update(`file:${st.mode}:`);
+        const stream = fs.createReadStream(absPath);
+        stream.on("data", (chunk: string | Buffer) => h.update(chunk));
+        stream.on("error", reject);
+        stream.on("end", () => resolve(h.digest("hex")));
+      });
+    }
+    return createHash("sha256").update(`special:${st.mode}`).digest("hex");
+  } catch {
+    // Deleted or unreadable path relative to HEAD listing.
+    return createHash("sha256").update("deleted").digest("hex");
+  }
+}
+
+/** Split git `-z` path lists. Preserve path bytes exactly — do not trim. */
+function splitNulPaths(stdout: string): string[] {
+  return stdout.split("\0").filter((p) => p.length > 0);
+}
+
+async function hashWorktreePath(
+  worktreeDir: string,
+  rel: string,
+): Promise<{ path: string; contentSha256: string }> {
+  const abs = path.join(worktreeDir, rel);
+  try {
+    const st = await fs.promises.lstat(abs);
+    if (st.isSymbolicLink()) {
+      const target = await fs.promises.readlink(abs);
+      return {
+        path: rel,
+        contentSha256: createHash("sha256")
+          .update(`symlink:${st.mode}:${target}`)
+          .digest("hex"),
+      };
+    }
+    if (st.isFile()) {
+      // Streamed hash: content-addressed raw bytes (binaries included — not
+      // `git diff`'s "Binary files differ" summary which aliases distinct edits).
+      const h = createHash("sha256");
+      h.update(`file:${st.mode}:`);
+      await new Promise<void>((resolve, reject) => {
+        const stream = fs.createReadStream(abs);
+        stream.on("data", (chunk) => h.update(chunk));
+        stream.on("error", reject);
+        stream.on("end", () => resolve());
+      });
+      return { path: rel, contentSha256: h.digest("hex") };
+    }
+    return {
+      path: rel,
+      contentSha256: createHash("sha256").update(`special:${st.mode}`).digest("hex"),
+    };
+  } catch (err) {
+    return {
+      path: rel,
+      contentSha256: createHash("sha256")
+        .update(`missing:${(err as Error).message}`)
+        .digest("hex"),
+    };
+  }
+}
+
+/**
+ * Content-addressed worktree fingerprint: HEAD + per-path content hashes of
+ * every tracked and untracked working-tree path. Does **not** use `git diff`
+ * (binary summaries alias distinct bytes; partial stdout on timeout/maxBuffer
+ * is not a safe fingerprint input). Path-only porcelain status is also
+ * insufficient — two distinct edits to the same path must not alias.
+ */
+async function defaultGetRepoFingerprint(args: { worktreeDir: string }): Promise<string> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileAsync = promisify(execFile);
+  try {
+    const head = await execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: args.worktreeDir,
+      timeout: 15_000,
+    });
+    // Tracked paths (index) + untracked (exclude-standard). Fail closed on
+    // infra errors — never accept partial listing stdout.
+    const trackedList = await execFileAsync("git", ["ls-files", "-z"], {
+      cwd: args.worktreeDir,
+      timeout: 30_000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    const untrackedList = await execFileAsync(
+      "git",
+      ["ls-files", "--others", "--exclude-standard", "-z"],
+      { cwd: args.worktreeDir, timeout: 30_000, maxBuffer: 10 * 1024 * 1024 },
+    );
+    const pathSet = new Set<string>([
+      ...splitNulPaths(trackedList.stdout),
+      ...splitNulPaths(untrackedList.stdout),
+    ]);
+    const files: Array<{ path: string; contentSha256: string }> = [];
+    for (const rel of [...pathSet].sort()) {
+      files.push(await hashWorktreePath(args.worktreeDir, rel));
+    }
+    return contentAddressedRepoFingerprint({
+      headSha: head.stdout.trim(),
+      pathEntries: files,
+    });
+  } catch (err) {
+    // Infra failure is not a silent fingerprint of partial state — surface as
+    // a distinct error digest so callers can see fingerprinting failed.
+    return createHash("sha256").update(`fingerprint-error:${(err as Error).message}`).digest("hex");
+  }
+}
+
+/** Default limits for verifier snapshot materialization (bounded, deadline-aware). */
+export const VERIFIER_SNAPSHOT_DEFAULTS = {
+  maxEntries: 50_000,
+  maxBytes: 256 * 1024 * 1024,
+} as const;
+
+export interface CopyIsolatedVerifierTreeOptions {
+  /** Absolute deadline (epoch ms). Exceeding fails the copy. */
+  deadlineMs?: number;
+  maxEntries?: number;
+  maxBytes?: number;
+}
+
+/**
+ * Copy a treatment worktree into an independent, non-Git filesystem tree for
+ * held-out verifier execution. Skips `.git` metadata (gitfile or directory)
+ * so verifier git commands cannot mutate lineage refs, and materializes
+ * symlinks as regular file/directory copies of their targets when the
+ * **realpath** of the target is inside the realpath of the source root
+ * (external links, intermediate escapes, and cycles are omitted/rejected).
+ */
+export async function copyIsolatedVerifierTree(
+  srcDir: string,
+  destDir: string,
+  options: CopyIsolatedVerifierTreeOptions = {},
+): Promise<void> {
+  await fs.promises.mkdir(destDir, { recursive: true });
+  const maxEntries = options.maxEntries ?? VERIFIER_SNAPSHOT_DEFAULTS.maxEntries;
+  const maxBytes = options.maxBytes ?? VERIFIER_SNAPSHOT_DEFAULTS.maxBytes;
+  const deadlineMs = options.deadlineMs;
+
+  let realRoot: string;
+  try {
+    realRoot = await fs.promises.realpath(srcDir);
+  } catch (err) {
+    throw new Error(`verifier snapshot: cannot realpath source: ${(err as Error).message}`);
+  }
+
+  function isInsideRealRoot(realPath: string): boolean {
+    return realPath === realRoot || realPath.startsWith(realRoot + path.sep);
+  }
+
+  function assertBudget(entries: number, bytes: number): void {
+    if (deadlineMs !== undefined && Date.now() > deadlineMs) {
+      throw new Error("verifier snapshot: deadline exceeded during materialization");
+    }
+    if (entries > maxEntries) {
+      throw new Error(`verifier snapshot: entry limit exceeded (${maxEntries})`);
+    }
+    if (bytes > maxBytes) {
+      throw new Error(`verifier snapshot: byte limit exceeded (${maxBytes})`);
+    }
+  }
+
+  let entryCount = 0;
+  let byteCount = 0;
+  /** Real directories already being walked — cycle detection. */
+  const visitingRealDirs = new Set<string>();
+
+  async function materialize(srcPath: string, destPath: string): Promise<void> {
+    assertBudget(entryCount, byteCount);
+    let st: fs.Stats;
+    try {
+      st = await fs.promises.lstat(srcPath);
+    } catch {
+      return;
+    }
+
+    if (st.isSymbolicLink()) {
+      // Containment is decided on realpath(target), not lexical resolve — an
+      // intermediate link like `out -> /etc` + `leaked -> out/passwd` must not
+      // pass isInsideRoot on the lexical path while stat follows to /etc/passwd.
+      let realTarget: string;
+      try {
+        realTarget = await fs.promises.realpath(srcPath);
+      } catch {
+        // Broken or unresolvable link — omit.
+        return;
+      }
+      if (!isInsideRealRoot(realTarget)) {
+        return;
+      }
+      let targetSt: fs.Stats;
+      try {
+        targetSt = await fs.promises.stat(realTarget);
+      } catch {
+        return;
+      }
+      if (targetSt.isDirectory()) {
+        await materializeDirectory(realTarget, destPath);
+      } else if (targetSt.isFile()) {
+        entryCount += 1;
+        assertBudget(entryCount, byteCount);
+        await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+        await fs.promises.copyFile(realTarget, destPath);
+        byteCount += targetSt.size;
+        assertBudget(entryCount, byteCount);
+      }
+      return;
+    }
+
+    if (st.isDirectory()) {
+      let realDir: string;
+      try {
+        realDir = await fs.promises.realpath(srcPath);
+      } catch {
+        return;
+      }
+      if (!isInsideRealRoot(realDir)) {
+        return;
+      }
+      await materializeDirectory(realDir, destPath);
+      return;
+    }
+
+    if (st.isFile()) {
+      entryCount += 1;
+      assertBudget(entryCount, byteCount);
+      await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+      await fs.promises.copyFile(srcPath, destPath);
+      byteCount += st.size;
+      assertBudget(entryCount, byteCount);
+    }
+  }
+
+  async function materializeDirectory(realDir: string, destPath: string): Promise<void> {
+    if (visitingRealDirs.has(realDir)) {
+      // Symlink/hard cycle — omit re-entry rather than loop forever.
+      return;
+    }
+    visitingRealDirs.add(realDir);
+    try {
+      entryCount += 1;
+      assertBudget(entryCount, byteCount);
+      await fs.promises.mkdir(destPath, { recursive: true });
+      const entries = await fs.promises.readdir(realDir);
+      for (const name of entries) {
+        if (name === ".git") continue;
+        await materialize(path.join(realDir, name), path.join(destPath, name));
+      }
+    } finally {
+      visitingRealDirs.delete(realDir);
+    }
+  }
+
+  await materializeDirectory(realRoot, destDir);
+}
+
+/** Disposable isolated filesystem copy of the treatment worktree for held-out verifiers. */
+async function defaultCreateVerifierSnapshot(
+  worktreeDir: string,
+  options?: CopyIsolatedVerifierTreeOptions,
+): Promise<string> {
+  const os = await import("node:os");
+  const snapshotDir = path.join(os.tmpdir(), `pipeline-eval-mc-verifier-${randomUUID()}`);
+  await copyIsolatedVerifierTree(worktreeDir, snapshotDir, options);
+  return snapshotDir;
+}
+
+async function defaultRemoveVerifierSnapshot(snapshotDir: string): Promise<void> {
+  await fs.promises.rm(snapshotDir, { recursive: true, force: true });
+}
+
+/**
+ * Read source-like files under the worktree for maintainability telemetry.
+ * Unions changed paths with multi-change sandbox modules so cumulative LOC
+ * reflects the post-step tree before teardown.
+ */
+async function defaultCollectWorktreeSourceFiles(args: {
+  worktreeDir: string;
+  changedPaths: string[];
+}): Promise<Array<{ path: string; content: string }>> {
+  const out: Array<{ path: string; content: string }> = [];
+  const seen = new Set<string>();
+  const tryRead = async (rel: string) => {
+    const norm = rel.replace(/\\/g, "/");
+    if (seen.has(norm)) return;
+    seen.add(norm);
+    if (norm.includes("..") || path.isAbsolute(norm)) return;
+    const abs = path.join(args.worktreeDir, norm);
+    try {
+      const st = await fs.promises.lstat(abs);
+      if (!st.isFile() || st.isSymbolicLink()) return;
+      const content = await fs.promises.readFile(abs, "utf8");
+      out.push({ path: norm, content });
+    } catch {
+      // missing / unreadable
+    }
+  };
+  for (const p of args.changedPaths) await tryRead(p);
+
+  const sandboxRoot = path.join(args.worktreeDir, "core/evals/sandboxes");
+  try {
+    const walkSandbox = async (dir: string, relFromSandbox: string) => {
+      const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+      for (const ent of entries) {
+        const rel = relFromSandbox ? `${relFromSandbox}/${ent.name}` : ent.name;
+        if (ent.isDirectory()) {
+          if (ent.name === ".git" || ent.name === "node_modules") continue;
+          await walkSandbox(path.join(dir, ent.name), rel);
+        } else if (ent.isFile()) {
+          await tryRead(`core/evals/sandboxes/${rel}`);
+        }
+      }
+    };
+    await walkSandbox(sandboxRoot, "");
+  } catch {
+    // no sandbox tree in this worktree
+  }
+  return out;
 }
 
 /** Hard cap on total reviewable paired-mode diff size (tracked + untracked).
@@ -659,10 +1045,411 @@ export interface CellExecutionResult {
   trajectory: BuildTreatmentTrajectoryInput;
 }
 
+/**
+ * Multi-change lineage (#577): ordered checkpoints on one worktree with fresh
+ * session context each step. Quality non-strict failures continue the lineage;
+ * infra/auth/timeout abort with the existing non-quality result classes.
+ */
+async function runMultiChangeLineage(args: {
+  cfg: PipelineConfig;
+  cell: Cell;
+  fixture: Fixture;
+  manifest: ExperimentManifest;
+  identity: CellIdentity;
+  cellDeadlineMs: number;
+  trajectoryActions: string[];
+  trajectoryStages: RawStageEntry[];
+  environmentDetail: unknown;
+  invokeHarnessFn: NonNullable<CellExecutionDeps["invokeHarness"]>;
+  preflightFn: NonNullable<CellExecutionDeps["preflight"]>;
+  deps: CellExecutionDeps;
+  finish: (outcome: CellOutcome) => CellExecutionResult;
+  setMaterializedPrompt: (prompt: string) => void;
+}): Promise<CellExecutionResult> {
+  const {
+    cfg,
+    cell,
+    fixture,
+    manifest,
+    identity,
+    cellDeadlineMs,
+    trajectoryActions,
+    trajectoryStages,
+    environmentDetail,
+    invokeHarnessFn,
+    preflightFn,
+    deps,
+    finish,
+    setMaterializedPrompt,
+  } = args;
+
+  const checkpoints = fixture.checkpoints ?? [];
+  if (checkpoints.length === 0) {
+    return finish({
+      result_class: "infra_error",
+      error: `multi-change fixture "${fixture.fixture_id}" has no checkpoints`,
+    });
+  }
+
+  const profile = resolveMultiChangeProfile(cell.treatment, cell.mode);
+  const evidence: MultiChangeCheckpointEvidence[] = [];
+  const promptParts: string[] = [];
+  let previousChangedPaths: string[] = [];
+  let previousProductionLoc = 0;
+  let previousTestLoc = 0;
+  const getChangedPathsFn = deps.getChangedPaths ?? defaultGetChangedPaths;
+  const getRepoFingerprintFn = deps.getRepoFingerprint ?? defaultGetRepoFingerprint;
+  const runChecksFn = deps.runChecks ?? defaultRunChecks;
+  const getDiffFn = deps.getDiff ?? defaultGetDiff;
+  const createVerifierSnapshotFn = deps.createVerifierSnapshot ?? defaultCreateVerifierSnapshot;
+  const removeVerifierSnapshotFn = deps.removeVerifierSnapshot ?? defaultRemoveVerifierSnapshot;
+  const collectSourceFilesFn = deps.collectWorktreeSourceFiles ?? defaultCollectWorktreeSourceFiles;
+
+  for (let k = 0; k < checkpoints.length; k++) {
+    const checkpoint = checkpoints[k];
+    const remainingMs = cellDeadlineMs - Date.now();
+    if (remainingMs <= 0) {
+      const error = `multi-change cell exceeded its ${manifest.timeout}s timeout before checkpoint "${checkpoint.checkpoint_id}"`;
+      trajectoryActions.push(error);
+      return finish({
+        result_class: "timeout",
+        error,
+        detail: {
+          multi_change: {
+            profile,
+            checkpoints: evidence,
+            aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "timeout" },
+          },
+          ...(environmentDetail !== undefined ? { environment: environmentDetail } : {}),
+        },
+      });
+    }
+
+    // Fresh session identity per checkpoint — no chat carry-over.
+    const sessionId = `${identity.sessionId}-cp-${checkpoint.checkpoint_id}`;
+    const coords = resolveCheckpointCoordinates(cell.treatment, checkpoint);
+    const effectiveHarness = coords.harness ?? cell.treatment.harness ?? "claude";
+    const resolvedModel = resolveTreatmentModel(effectiveHarness, {
+      provider: cell.treatment.provider,
+      model: coords.model,
+    });
+    if (!resolvedModel.ok) {
+      trajectoryActions.push(resolvedModel.error);
+      return finish({
+        result_class: "infra_error",
+        error: resolvedModel.error,
+        detail: {
+          multi_change: {
+            profile,
+            checkpoints: evidence,
+            aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "infra_error" },
+          },
+        },
+      });
+    }
+
+    const prompt = materializeMultiChangeCheckpointPrompt(fixture, checkpoint, profile);
+    promptParts.push(prompt);
+    setMaterializedPrompt(promptParts.join("\n\n---\n\n"));
+
+    // Optional preflight for harness credentials (auth classification).
+    if (coords.harness ?? cell.treatment.harness) {
+      try {
+        const preflightResult = await preflightFn(effectiveHarness, {
+          model: resolvedModel.model,
+          effort: coords.effort,
+        });
+        if (!preflightResult.ok) {
+          const resultClass = preflightResult.failure === "unauthenticated" ? "auth_error" : "infra_error";
+          const error = preflightResult.message ?? preflightResult.failure ?? "preflight failed";
+          trajectoryActions.push(`checkpoint "${checkpoint.checkpoint_id}" preflight failed: ${error}`);
+          return finish({
+            result_class: resultClass,
+            error,
+            detail: {
+              multi_change: {
+                profile,
+                checkpoints: evidence,
+                aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: resultClass },
+              },
+            },
+          });
+        }
+      } catch (err) {
+        const error = `preflight failed: ${(err as Error).message}`;
+        trajectoryActions.push(`checkpoint "${checkpoint.checkpoint_id}": ${error}`);
+        return finish({
+          result_class: "infra_error",
+          error,
+          detail: {
+            multi_change: {
+              profile,
+              checkpoints: evidence,
+              aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "infra_error" },
+            },
+          },
+        });
+      }
+    }
+
+    // Treatment graph: bare = implement only; pipeline-current / adversarial
+    // = implement + production review_policy + finding-resolution fix rounds
+    // (shared disclosed implement prompt; review/fix graph differs).
+    const treatment = await runMultiChangeCheckpointTreatment({
+      cfg,
+      fixture,
+      checkpointTaskInput: checkpoint.task_input,
+      checkpointId: checkpoint.checkpoint_id,
+      implementPrompt: prompt,
+      profile,
+      cellId: cell.cell_id,
+      worktreeDir: identity.worktreePath,
+      baseSha: cell.base_sha,
+      harness: effectiveHarness,
+      model: resolvedModel.model,
+      effort: coords.effort,
+      sessionId,
+      cellDeadlineMs,
+      manifestTimeoutSec: manifest.timeout,
+      sandboxMode: manifest.sandbox_mode,
+      deps: {
+        invokeHarness: invokeHarnessFn,
+        getDiff: getDiffFn,
+        classifyPostInvocationFailure: (result, harness, req) =>
+          classifyPostInvocationFailure(result, preflightFn, harness, req),
+        isolationEnv: evalIsolationEnv,
+      },
+      trajectoryActions,
+      trajectoryStages,
+    });
+    if (!treatment.ok) {
+      const aborted = treatment.outcome.detail?.multi_change as
+        | { aborted?: { checkpoint_id: string; result_class: string } }
+        | undefined;
+      return finish({
+        result_class: treatment.outcome.result_class,
+        error: treatment.outcome.error,
+        detail: {
+          ...(treatment.outcome.detail ?? {}),
+          multi_change: {
+            profile,
+            checkpoints: evidence,
+            aborted: aborted?.aborted ?? {
+              checkpoint_id: checkpoint.checkpoint_id,
+              result_class: treatment.outcome.result_class,
+            },
+          },
+          ...(environmentDetail !== undefined ? { environment: environmentDetail } : {}),
+        },
+      });
+    }
+
+    const stepDuration = treatment.duration;
+    const stepTokens: number | null = null;
+    const stepCost: number | null = null;
+    const stepCostSource: "actual" | "estimated" | "unknown" = "unknown";
+    if (treatment.pipeline.fix_1_invoked || treatment.pipeline.fix_2_invoked) {
+      trajectoryActions.push(
+        `checkpoint "${checkpoint.checkpoint_id}" pipeline graph: ` +
+          `fix_1=${treatment.pipeline.fix_1_invoked} fix_2=${treatment.pipeline.fix_2_invoked} ` +
+          `blocking_before_fix_1=${treatment.pipeline.blocking_before_fix_1}`,
+      );
+    }
+
+    // Held-out verifiers: new + inherited. Never passed to the treatment.
+    // Run on a disposable snapshot so verifier mutations cannot leak into the
+    // persistent treatment lineage (C2.file_override writing config.json, etc.).
+    const newVerifiers = checkpoint.held_out_verifiers;
+    const inherited = inheritedVerifiers(checkpoints, k);
+    const allVerifiers = [...inherited, ...newVerifiers];
+    const remainingForChecks = cellDeadlineMs - Date.now();
+    if (remainingForChecks <= 0) {
+      const error = `multi-change cell exceeded its ${manifest.timeout}s timeout before verifiers at "${checkpoint.checkpoint_id}"`;
+      trajectoryActions.push(error);
+      return finish({
+        result_class: "timeout",
+        error,
+        detail: {
+          multi_change: {
+            profile,
+            checkpoints: evidence,
+            aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "timeout" },
+          },
+        },
+      });
+    }
+
+    // Each held-out verifier runs in its own clean isolated snapshot so one
+    // check's side effects cannot cascade into another or into the lineage.
+    // Snapshot creation is deadline-aware; remaining time is recomputed after
+    // materialization so setup cost cannot silently overrun the cell budget.
+    const checkResults: Record<string, boolean> = {};
+    for (const v of allVerifiers) {
+      const remainingBeforeSnapshot = cellDeadlineMs - Date.now();
+      if (remainingBeforeSnapshot <= 0) {
+        checkResults[v.check] = false;
+        continue;
+      }
+      let snapshotDir: string | undefined;
+      try {
+        snapshotDir = await createVerifierSnapshotFn(identity.worktreePath, {
+          deadlineMs: cellDeadlineMs,
+        });
+        const remainingAfterSnapshot = cellDeadlineMs - Date.now();
+        if (remainingAfterSnapshot <= 0) {
+          checkResults[v.check] = false;
+          continue;
+        }
+        const one = await runChecksFn({
+          worktreeDir: snapshotDir,
+          checks: [v.check],
+          deadlineMs: remainingAfterSnapshot,
+        });
+        checkResults[v.check] = one[v.check] === true;
+      } catch (err) {
+        const error = `checkpoint "${checkpoint.checkpoint_id}" held-out verifier isolation failed: ${(err as Error).message}`;
+        trajectoryActions.push(error);
+        return finish({
+          result_class: "infra_error",
+          error,
+          detail: {
+            multi_change: {
+              profile,
+              checkpoints: evidence,
+              aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "infra_error" },
+            },
+          },
+        });
+      } finally {
+        if (snapshotDir !== undefined) {
+          try {
+            await removeVerifierSnapshotFn(snapshotDir);
+          } catch (err) {
+            console.warn(
+              `[pipeline] evals: multi-change verifier snapshot removal failed (non-fatal): ${(err as Error).message}`,
+            );
+          }
+        }
+      }
+    }
+
+    const verifier_results: Record<string, boolean> = {};
+    for (const v of allVerifiers) {
+      verifier_results[v.verifier_id] = checkResults[v.check] === true;
+    }
+
+    // Quality non-strict does NOT abort — continue for recovery diagnostics.
+    const anyFail = Object.values(verifier_results).some((ok) => !ok);
+    trajectoryActions.push(
+      `checkpoint "${checkpoint.checkpoint_id}" verifiers: ` +
+        `${Object.values(verifier_results).filter(Boolean).length}/${allVerifiers.length} passed` +
+        (anyFail ? " (non-strict; lineage continues)" : ""),
+    );
+
+    const changedPaths = await getChangedPathsFn({
+      worktreeDir: identity.worktreePath,
+      baseSha: cell.base_sha,
+    });
+
+    // Collect deterministic content metrics before worktree teardown.
+    let sourceFiles: Array<{ path: string; content: string }> = [];
+    try {
+      sourceFiles = await collectSourceFilesFn({
+        worktreeDir: identity.worktreePath,
+        changedPaths,
+      });
+    } catch (err) {
+      trajectoryActions.push(
+        `checkpoint "${checkpoint.checkpoint_id}" telemetry collection failed (non-fatal): ${(err as Error).message}`,
+      );
+      sourceFiles = [];
+    }
+    const { structural, production_loc, test_loc } = buildStructuralTelemetry({
+      files: sourceFiles,
+      changedPaths,
+    });
+    const growth = computeGrowthFromPaths(previousChangedPaths, changedPaths, {
+      beforeProductionLoc: previousProductionLoc,
+      afterProductionLoc: production_loc,
+      beforeTestLoc: previousTestLoc,
+      afterTestLoc: test_loc,
+    });
+    previousChangedPaths = changedPaths;
+    previousProductionLoc = production_loc;
+    previousTestLoc = test_loc;
+
+    let fingerprint: string;
+    try {
+      fingerprint = await getRepoFingerprintFn({ worktreeDir: identity.worktreePath });
+    } catch (err) {
+      const error = `checkpoint "${checkpoint.checkpoint_id}" repository fingerprint failed: ${(err as Error).message}`;
+      trajectoryActions.push(error);
+      return finish({
+        result_class: "infra_error",
+        error,
+        detail: {
+          multi_change: {
+            profile,
+            checkpoints: evidence,
+            aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "infra_error" },
+          },
+          ...(environmentDetail !== undefined ? { environment: environmentDetail } : {}),
+        },
+      });
+    }
+
+    const stepEvidence: MultiChangeCheckpointEvidence = {
+      checkpoint_id: checkpoint.checkpoint_id,
+      checkpoint_index: k,
+      prompt_hash: hashPrompt(prompt),
+      treatment_id: cell.treatment_id,
+      treatment_profile: profile,
+      model: resolvedModel.model ?? null,
+      harness: effectiveHarness,
+      session_id: sessionId,
+      repo_fingerprint: fingerprint,
+      verifier_results,
+      new_verifier_ids: newVerifiers.map((v) => v.verifier_id),
+      inherited_verifier_ids: inherited.map((v) => v.verifier_id),
+      resource: {
+        duration_sec: stepDuration,
+        tokens: stepTokens,
+        cost_usd: stepCost,
+        cost_source: stepCostSource,
+        retries: 0,
+        interventions: 0,
+      },
+      portability_probe: coords.portability,
+      preserved_evidence_keys: ["repository_state", "pipeline_evidence_bundle"],
+      growth,
+      structural_telemetry: structural,
+    };
+    evidence.push(stepEvidence);
+  }
+
+  // Restore contract before completing so checks above already ran with it in place —
+  // verifiers ran with contract still installed; restoration happens in finish().
+  const detail: Record<string, unknown> = {
+    execution_class: "local-cli" as CellExecutionClass,
+    multi_change: {
+      profile,
+      checkpoints: evidence,
+      // Fresh context guarantee: one distinct session_id per checkpoint.
+      fresh_context_sessions: evidence.map((e) => e.session_id),
+    },
+  };
+  if (environmentDetail !== undefined) detail.environment = environmentDetail;
+  // Aggregate cost unknown coverage at cell level.
+  detail.cost_source = "unknown";
+
+  return finish({ result_class: "completed", detail });
+}
+
 /** Execute exactly one cell: fresh isolated worktree at the fixture's
  *  base_commit, run the stage(s) its mode requires from frozen inputs, tear
  *  the worktree down, and classify the outcome. Never throws — every failure
- *  mode is captured as a result_class. */
+ *  mode is captured as a result_class. Multi-change fixtures (#577) reuse one
+ *  worktree across ordered checkpoints with fresh model context each step. */
 export async function runCell(
   cfg: PipelineConfig,
   cell: Cell,
@@ -856,6 +1643,30 @@ export async function runCell(
         return finish({ result_class: "infra_error", error });
       }
       trajectoryActions.push(`ran setup for simulated dependency ${JSON.stringify(dep.name)}`);
+    }
+
+    // Multi-change maintainability lineage (#577): one worktree, ordered
+    // checkpoints with fresh model context each step, held-out + inherited
+    // verifiers, continue after quality non-strict failures.
+    if (isMultiChangeFixture(fixture)) {
+      return await runMultiChangeLineage({
+        cfg,
+        cell,
+        fixture,
+        manifest,
+        identity,
+        cellDeadlineMs: Date.now() + manifest.timeout * 1000,
+        trajectoryActions,
+        trajectoryStages,
+        environmentDetail,
+        invokeHarnessFn,
+        preflightFn,
+        deps,
+        finish,
+        setMaterializedPrompt: (p) => {
+          materializedPrompt = p;
+        },
+      });
     }
 
     // Paired multi-role graphs (#601): keep the eval contract + command boundary

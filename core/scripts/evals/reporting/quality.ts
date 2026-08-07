@@ -32,6 +32,15 @@ function scoreCompositeSubGrade(sub: CompositeSubGradePayload): number {
   return sub.kind === "review" ? scoreReview(sub.grade) : scorePlanning(sub.grade);
 }
 
+function scoreMultiChange(g: { checkpoints: Array<{ strict_pass: boolean }>; terminal_all_green: boolean }): number {
+  if (g.checkpoints.length === 0) return 0;
+  const strictPasses = g.checkpoints.filter((c) => c.strict_pass).length;
+  const stepRate = strictPasses / g.checkpoints.length;
+  // Terminal all-green is a primary outcome — weight it without collapsing
+  // effort/structural axes into this score (eval-comparative-reporting #577).
+  return g.terminal_all_green ? Math.min(1, 0.5 + stepRate * 0.5) : stepRate * 0.5;
+}
+
 export function qualityScore(grade: GradeRecord): number {
   switch (grade.payload.kind) {
     case "implementation-fix":
@@ -44,5 +53,7 @@ export function qualityScore(grade: GradeRecord): number {
       const scores = grade.payload.grades.map(scoreCompositeSubGrade);
       return scores.length === 0 ? 0 : scores.reduce((a, b) => a + b, 0) / scores.length;
     }
+    case "multi-change":
+      return scoreMultiChange(grade.payload.grade);
   }
 }

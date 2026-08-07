@@ -1,0 +1,55 @@
+{
+  "fixture_id": "mc-external-canary-ledger",
+  "schema_version": 1,
+  "kind": "multi_change",
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Curated external-style canary (SlopCodeBench-inspired, pinned in-repo): incrementally disclosed ledger requirements with inherited regression checks.",
+  "stage_entry_artifacts": {
+    "implementing": {
+      "plan": "Apply only the currently disclosed checkpoint under core/evals/sandboxes/canary-ledger/."
+    }
+  },
+  "public_checks": [],
+  "grader_refs": [{ "grader": "multi-change", "version": "1" }],
+  "smoke_only": false,
+  "category": "maintainability",
+  "risk": "low",
+  "provenance": "synthetic",
+  "roles": {
+    "external_canary": true,
+    "external_canary_provenance": "slopcodebench-curated-incremental"
+  },
+  "allowed_change_paths": ["core/evals/sandboxes/canary-ledger"],
+  "checkpoints": [
+    {
+      "checkpoint_id": "C1",
+      "task_input": "Create core/evals/sandboxes/canary-ledger/ledger.js exporting createLedger() which returns { add(amount), balance() }. add must accept numbers; balance starts at 0 and reflects the sum of adds.",
+      "held_out_verifiers": [
+        {
+          "verifier_id": "C1.balance",
+          "check": "node -e \"const {createLedger}=require('./core/evals/sandboxes/canary-ledger/ledger.js'); const L=createLedger(); L.add(10); L.add(5); if(L.balance()!==15) process.exit(1);\""
+        }
+      ]
+    },
+    {
+      "checkpoint_id": "C2",
+      "task_input": "Extend the ledger with withdraw(amount) that decreases balance and throws if amount exceeds balance. balance() and add() behavior from the first requirement must still hold.",
+      "held_out_verifiers": [
+        {
+          "verifier_id": "C2.withdraw",
+          "check": "node -e \"const {createLedger}=require('./core/evals/sandboxes/canary-ledger/ledger.js'); const L=createLedger(); L.add(20); L.withdraw(7); if(L.balance()!==13) process.exit(1); let threw=false; try{L.withdraw(100);}catch{threw=true;} if(!threw) process.exit(1);\""
+        }
+      ]
+    },
+    {
+      "checkpoint_id": "C3",
+      "task_input": "Add history() returning an array of {type: 'add'|'withdraw', amount} in order. Prior add/withdraw/balance semantics remain required.",
+      "held_out_verifiers": [
+        {
+          "verifier_id": "C3.history",
+          "check": "node -e \"const {createLedger}=require('./core/evals/sandboxes/canary-ledger/ledger.js'); const L=createLedger(); L.add(3); L.withdraw(1); const h=L.history(); if(!Array.isArray(h)||h.length!==2||h[0].type!=='add'||h[0].amount!==3||h[1].type!=='withdraw'||h[1].amount!==1) process.exit(1);\""
+        }
+      ]
+    }
+  ]
+}

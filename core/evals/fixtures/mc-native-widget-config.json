@@ -1,0 +1,58 @@
+{
+  "fixture_id": "mc-native-widget-config",
+  "schema_version": 1,
+  "kind": "multi_change",
+  "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
+  "task_input": "Multi-change maintainability sequence: a widget configuration loader with architectural ambiguity (file vs env vs defaults) and a cross-cutting audit-log constraint.",
+  "stage_entry_artifacts": {
+    "implementing": {
+      "plan": "Apply only the currently disclosed checkpoint. Keep the module under core/evals/sandboxes/widget-config/."
+    }
+  },
+  "public_checks": [],
+  "grader_refs": [{ "grader": "multi-change", "version": "1" }],
+  "smoke_only": false,
+  "category": "maintainability",
+  "risk": "medium",
+  "provenance": "synthetic",
+  "allowed_change_paths": ["core/evals/sandboxes/widget-config"],
+  "checkpoints": [
+    {
+      "checkpoint_id": "C1",
+      "task_input": "Create core/evals/sandboxes/widget-config/loader.js exporting loadConfig(). It must return an object with title (string, default \"Widget\") and enabled (boolean, default true) when no config file exists. Prefer a design that can later accept file-based and environment overrides without rewriting call sites. Architectural choice is yours: monomorphic defaults object, layered providers, or similar.",
+      "held_out_verifiers": [
+        {
+          "verifier_id": "C1.defaults",
+          "check": "node -e \"const m=require('./core/evals/sandboxes/widget-config/loader.js'); const c=m.loadConfig(); if(!c||c.title!=='Widget'||c.enabled!==true) process.exit(1);\""
+        }
+      ]
+    },
+    {
+      "checkpoint_id": "C2",
+      "task_input": "Extend the widget config loader so a JSON file at core/evals/sandboxes/widget-config/config.json overrides defaults when present. Cross-cutting constraint: every successful loadConfig() call must append one line to core/evals/sandboxes/widget-config/audit.log containing the ISO timestamp and the resolved title. Do not break default behavior when the file is absent.",
+      "held_out_verifiers": [
+        {
+          "verifier_id": "C2.file_override",
+          "check": "node -e \"const fs=require('fs');const path=require('path');const dir='core/evals/sandboxes/widget-config';fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(path.join(dir,'config.json'),JSON.stringify({title:'FromFile',enabled:false}));const m=require('./'+dir+'/loader.js');delete require.cache[require.resolve('./'+dir+'/loader.js')];const c=m.loadConfig();if(!c||c.title!=='FromFile'||c.enabled!==false)process.exit(1);\""
+        },
+        {
+          "verifier_id": "C2.audit_log",
+          "check": "node -e \"const fs=require('fs');const path=require('path');const dir='core/evals/sandboxes/widget-config';const log=path.join(dir,'audit.log');if(fs.existsSync(log))fs.unlinkSync(log);const m=require('./'+dir+'/loader.js');delete require.cache[require.resolve('./'+dir+'/loader.js')];m.loadConfig();if(!fs.existsSync(log))process.exit(1);const line=fs.readFileSync(log,'utf8').trim().split(/\\n/).pop();if(!line||!/Widget|FromFile/.test(line))process.exit(1);\""
+        }
+      ]
+    },
+    {
+      "checkpoint_id": "C3",
+      "task_input": "Add environment-variable overrides: WIDGET_TITLE and WIDGET_ENABLED (\"true\"/\"false\") take precedence over the JSON file and defaults. Keep the audit log constraint. Expose a small getConfigSource() that returns \"env\", \"file\", or \"default\" for the title field so operators can debug which layer won.",
+      "held_out_verifiers": [
+        {
+          "verifier_id": "C3.env_wins",
+          "check": "node -e \"process.env.WIDGET_TITLE='FromEnv';process.env.WIDGET_ENABLED='false';const m=require('./core/evals/sandboxes/widget-config/loader.js');delete require.cache[require.resolve('./core/evals/sandboxes/widget-config/loader.js')];const c=m.loadConfig();if(!c||c.title!=='FromEnv'||c.enabled!==false)process.exit(1);if(typeof m.getConfigSource!=='function'||m.getConfigSource()!=='env')process.exit(1);delete process.env.WIDGET_TITLE;delete process.env.WIDGET_ENABLED;\""
+        }
+      ],
+      "portability": {
+        "model": "haiku"
+      }
+    }
+  ]
+}
