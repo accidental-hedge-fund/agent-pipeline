@@ -148,12 +148,22 @@ export function validateFixture(raw: unknown, sourcePath: string): Fixture {
           `defect ${JSON.stringify(defectId)} is missing "expected_severity"`,
         );
       }
+      // Every seeded defect must declare a runnable biting probe so deep
+      // preflight can prove the defect still fails at the pin (#637 ae1fad38).
+      if (typeof d.biting_probe !== "string" || d.biting_probe.trim().length === 0) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "seeded_defects",
+          `defect ${JSON.stringify(defectId)} is missing "biting_probe" (runnable command that must fail at the pin)`,
+        );
+      }
       return {
         defect_id: defectId,
         path: d.path,
         line_start: d.line_start,
         line_end: d.line_end,
         expected_severity: d.expected_severity,
+        biting_probe: d.biting_probe,
       };
     });
   }

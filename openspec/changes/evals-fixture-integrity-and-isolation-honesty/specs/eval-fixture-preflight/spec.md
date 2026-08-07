@@ -82,11 +82,15 @@ abort the experiment (or classify the fixture invalid) before provider spend on 
 
 For a fixture that declares public checks, deep preflight SHALL run those checks (or a declared
 baseline subset) at the pinned `base_commit` with no treatment applied and SHALL require that the
-public baseline is healthy (checks pass). For a fixture that declares seeded defects or hidden
-checks intended as biting ground truth, deep preflight SHALL prove that the seeded or hidden
-probe fails at the pin without a treatment. A fixture whose public baseline is red, or whose
-declared biting probe already passes (non-biting / already fixed), SHALL be marked invalid by
-preflight naming the fixture and the check or defect id.
+public baseline is healthy (checks pass). For a fixture that declares hidden checks intended as
+biting ground truth, deep preflight SHALL prove each hidden check fails at the pin without a
+treatment. For a fixture that declares seeded defects, deep preflight SHALL execute each defect's
+declared `biting_probe` at the pin (not merely verify that the defect path exists) and SHALL
+require that the probe fails. Path existence alone SHALL NOT satisfy the seeded-defect biting
+guarantee. A fixture whose public baseline is red, or whose declared biting probe already passes
+(non-biting / already fixed), SHALL be marked invalid by preflight naming the fixture and the
+check or defect id. An unrelated hidden check SHALL NOT substitute for a seeded defect's own
+`biting_probe`.
 
 #### Scenario: Healthy public baseline at the pin passes
 
@@ -108,6 +112,13 @@ preflight naming the fixture and the check or defect id.
 - **THEN** preflight SHALL fail naming the fixture and the defect or check id
 - **AND** SHALL NOT allow graded experiment execution against that fixture until it is replaced
   or repaired
+
+#### Scenario: Seeded defect path exists but non-biting probe fails preflight
+
+- **WHEN** a fixture declares a seeded defect whose path exists at the pin
+- **AND** that defect's `biting_probe` exits zero at the pin (already fixed / non-biting)
+- **THEN** preflight SHALL fail naming the fixture and the defect id
+- **AND** SHALL NOT treat path existence alone as proof the defect bites
 
 ---
 

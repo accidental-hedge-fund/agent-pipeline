@@ -5,7 +5,8 @@
 //            base_commit object reachability, smoke_only consistency (via
 //            loader), path-token sanity against the repo test-layout policy.
 //   deep   — cell-like worktree at the pin before treatments: public baseline
-//            health, biting hidden probes, generator-owned allowed paths.
+//            health, biting hidden + per-seeded-defect probes, generator-owned
+//            allowed paths.
 //
 // Failures are infrastructure (doctor gate / experiment abort /
 // fixture_preflight:<check>:<fixture_id>) and never enter quality pools.
@@ -280,6 +281,28 @@ export interface DeepPreflightDeps {
   bootstrapWorktree?: (worktreeDir: string) => Promise<void>;
   /** Build cell isolation env overrides (defaults to {@link evalIsolationEnv}). */
   isolationEnv?: (worktreeDir: string) => NodeJS.ProcessEnv;
+  /**
+   * Materialize a fixture's frozen review.diff into the preflight worktree so
+   * seeded-defect biting_probes can inspect review ground truth. Returns the
+   * absolute path written (exposed as EVAL_PREFLIGHT_REVIEW_DIFF).
+   */
+  materializeReviewDiff?: (worktreeDir: string, diff: string) => Promise<string>;
+}
+
+/** Extract stage_entry_artifacts.review.diff when present. */
+export function extractReviewDiff(fixture: Fixture): string | undefined {
+  const review = fixture.stage_entry_artifacts?.review;
+  if (typeof review !== "object" || review === null || Array.isArray(review)) return undefined;
+  const diff = (review as Record<string, unknown>).diff;
+  return typeof diff === "string" ? diff : undefined;
+}
+
+async function defaultMaterializeReviewDiff(worktreeDir: string, diff: string): Promise<string> {
+  const dir = path.join(worktreeDir, ".eval-preflight");
+  await fs.promises.mkdir(dir, { recursive: true });
+  const out = path.join(dir, "review.diff");
+  await fs.promises.writeFile(out, diff, "utf8");
+  return out;
 }
 
 function extractPathTokensFromCheck(command: string): string[] {
@@ -401,8 +424,33 @@ export async function runDeepFixturePreflight(
     boundaryInstalled = true;
     const cellEnv = { ...process.env, ...isolationEnvFn(worktreePath) };
 
-    // Path resolution for check commands + seeded defect paths.
-    for (const cmd of [...fixture.public_checks, ...(fixture.hidden_checks ?? [])]) {
+    // Materialize frozen review.diff for seeded-defect probes that inspect
+    // review ground truth (EVAL_PREFLIGHT_REVIEW_DIFF).
+    const reviewDiff = extractReviewDiff(fixture);
+    if (reviewDiff !== undefined && (fixture.seeded_defects?.length ?? 0) > 0) {
+      const materializeFn = deps.materializeReviewDiff ?? defaultMaterializeReviewDiff;
+      try {
+        const reviewDiffPath = await materializeFn(worktreePath, reviewDiff);
+        cellEnv.EVAL_PREFLIGHT_REVIEW_DIFF = reviewDiffPath;
+      } catch (err) {
+        failures.push(
+          fail(
+            fixture.fixture_id,
+            "biting_probe",
+            `failed to materialize review.diff for seeded-defect biting probes: ${(err as Error).message}`,
+            `Ensure deep preflight can write .eval-preflight/ under the cell worktree for fixture "${fixture.fixture_id}".`,
+          ),
+        );
+      }
+    }
+
+    // Path resolution for check commands, seeded-defect biting probes, and paths.
+    const probeCommands = [
+      ...fixture.public_checks,
+      ...(fixture.hidden_checks ?? []),
+      ...(fixture.seeded_defects ?? []).map((d) => d.biting_probe),
+    ];
+    for (const cmd of probeCommands) {
       for (const tok of extractPathTokensFromCheck(cmd)) {
         // Skip globs / flags that look like paths but aren't files.
         if (tok.includes("*") || tok.startsWith("-")) continue;
@@ -461,6 +509,27 @@ export async function runDeepFixturePreflight(
             "biting_probe",
             `hidden check ${JSON.stringify(check)} already passes at the pin (non-biting / already fixed)`,
             `Replace or retarget the seeded probe on fixture "${fixture.fixture_id}" so it fails at base_commit.`,
+          ),
+        );
+      }
+    }
+
+    // Per-seeded-defect biting probes must FAIL at the pin (path existence alone
+    // is not proof the declared defect still bites — #637 ae1fad38).
+    for (const defect of fixture.seeded_defects ?? []) {
+      const ok = await runCheckFn({
+        worktreeDir: worktreePath,
+        check: defect.biting_probe,
+        deadlineMs,
+        env: cellEnv,
+      });
+      if (ok) {
+        failures.push(
+          fail(
+            fixture.fixture_id,
+            "biting_probe",
+            `seeded defect ${JSON.stringify(defect.defect_id)} biting_probe already passes at the pin (non-biting / already fixed)`,
+            `Replace or retarget biting_probe for defect ${defect.defect_id} on fixture "${fixture.fixture_id}" so it fails at base_commit while the defect remains ground truth.`,
           ),
         );
       }

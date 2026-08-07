@@ -72,3 +72,26 @@ fixture.
 - **WHEN** an experiment configuration requires graded output for a fixture marked smoke-only
 - **THEN** validation or grading SHALL refuse to emit a quality grade for that fixture
 - **AND** SHALL name the fixture and the smoke-only mark
+
+---
+
+### Requirement: Each seeded defect SHALL declare a runnable biting probe
+
+A fixture that declares `seeded_defects` SHALL require every seeded defect entry to include a
+non-empty `biting_probe` string: a runnable command that is expected to fail (non-zero exit) at
+the fixture pin with no treatment applied, proving the declared defect still bites. Fixture
+validation SHALL reject a seeded defect that omits `biting_probe` or supplies an empty probe,
+naming the fixture and the defect id. Path and line-range location fields alone SHALL NOT be
+accepted as proof that the defect is present at the pin.
+
+#### Scenario: Seeded defect with biting_probe is accepted at load
+
+- **WHEN** a fixture declares a seeded defect with a unique defect_id, location, expected_severity,
+  and a non-empty biting_probe
+- **THEN** fixture validation SHALL succeed
+- **AND** the loaded fixture SHALL expose the biting_probe on that defect
+
+#### Scenario: Seeded defect without biting_probe is rejected
+
+- **WHEN** a fixture declares a seeded defect that omits biting_probe or supplies an empty string
+- **THEN** fixture validation SHALL fail naming the fixture and the defect id

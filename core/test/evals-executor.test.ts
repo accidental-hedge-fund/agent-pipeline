@@ -1102,7 +1102,14 @@ function fixtureReviewWithDefect(): Fixture {
       stage_entry_artifacts: { review: { diff: "..." } },
       public_checks: [],
       seeded_defects: [
-        { defect_id: "d1", path: "a.ts", line_start: 10, line_end: 12, expected_severity: "high" },
+        {
+          defect_id: "d1",
+          path: "a.ts",
+          line_start: 10,
+          line_end: 12,
+          expected_severity: "high",
+          biting_probe: "false",
+        },
       ],
       grader_refs: [{ grader: "review", version: "1" }],
       category: "c",
@@ -1233,7 +1240,14 @@ test("runCell: a review stage inside an end-to-end cell receives the contract-be
       stage_entry_artifacts: { planning: { a: 1 }, review: { diff: "..." } },
       public_checks: [],
       seeded_defects: [
-        { defect_id: "d1", path: "a.ts", line_start: 10, line_end: 12, expected_severity: "high" },
+        {
+          defect_id: "d1",
+          path: "a.ts",
+          line_start: 10,
+          line_end: 12,
+          expected_severity: "high",
+          biting_probe: "false",
+        },
       ],
       grader_refs: [],
       smoke_only: true,

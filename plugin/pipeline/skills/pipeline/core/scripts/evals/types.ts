@@ -106,6 +106,15 @@ export interface SeededDefect {
   line_start: number;
   line_end: number;
   expected_severity: string;
+  /**
+   * Runnable command that MUST fail (non-zero exit) at the fixture pin with no
+   * treatment applied — proves the declared defect still bites (#637). Deep
+   * preflight executes this probe and rejects the fixture when it passes
+   * (already fixed / non-biting). For review fixtures whose ground truth is a
+   * frozen stage-entry diff, preflight materializes that diff and sets
+   * `EVAL_PREFLIGHT_REVIEW_DIFF` so probes can inspect it.
+   */
+  biting_probe: string;
 }
 
 /** One checkable statement a correct result must satisfy (eval-fixture-contract).

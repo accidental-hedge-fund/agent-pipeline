@@ -150,8 +150,22 @@ test("validateFixture: a duplicate seeded defect_id is rejected naming the fixtu
       validateFixture(
         validFixtureRaw({
           seeded_defects: [
-            { defect_id: "d1", path: "a.ts", line_start: 1, line_end: 2, expected_severity: "high" },
-            { defect_id: "d1", path: "b.ts", line_start: 1, line_end: 2, expected_severity: "low" },
+            {
+              defect_id: "d1",
+              path: "a.ts",
+              line_start: 1,
+              line_end: 2,
+              expected_severity: "high",
+              biting_probe: "false",
+            },
+            {
+              defect_id: "d1",
+              path: "b.ts",
+              line_start: 1,
+              line_end: 2,
+              expected_severity: "low",
+              biting_probe: "false",
+            },
           ],
         }),
         "f1.json",
@@ -165,7 +179,7 @@ test("validateFixture: a seeded defect missing its location is rejected", () => 
     () =>
       validateFixture(
         validFixtureRaw({
-          seeded_defects: [{ defect_id: "d1", expected_severity: "high" }],
+          seeded_defects: [{ defect_id: "d1", expected_severity: "high", biting_probe: "false" }],
         }),
         "f1.json",
       ),
@@ -178,7 +192,9 @@ test("validateFixture: a seeded defect missing expected_severity is rejected", (
     () =>
       validateFixture(
         validFixtureRaw({
-          seeded_defects: [{ defect_id: "d1", path: "a.ts", line_start: 1, line_end: 2 }],
+          seeded_defects: [
+            { defect_id: "d1", path: "a.ts", line_start: 1, line_end: 2, biting_probe: "false" },
+          ],
         }),
         "f1.json",
       ),
@@ -186,14 +202,42 @@ test("validateFixture: a seeded defect missing expected_severity is rejected", (
   );
 });
 
+test("validateFixture: a seeded defect missing biting_probe is rejected", () => {
+  assert.throws(
+    () =>
+      validateFixture(
+        validFixtureRaw({
+          seeded_defects: [
+            { defect_id: "d1", path: "a.ts", line_start: 1, line_end: 2, expected_severity: "high" },
+          ],
+        }),
+        "f1.json",
+      ),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /d1/.test((err as Error).message) &&
+      /biting_probe/.test((err as Error).message),
+  );
+});
+
 test("validateFixture: a complete seeded defect is accepted", () => {
   const fixture = validateFixture(
     validFixtureRaw({
-      seeded_defects: [{ defect_id: "d1", path: "a.ts", line_start: 1, line_end: 2, expected_severity: "high" }],
+      seeded_defects: [
+        {
+          defect_id: "d1",
+          path: "a.ts",
+          line_start: 1,
+          line_end: 2,
+          expected_severity: "high",
+          biting_probe: "false",
+        },
+      ],
     }),
     "f1.json",
   );
   assert.equal(fixture.seeded_defects?.[0].defect_id, "d1");
+  assert.equal(fixture.seeded_defects?.[0].biting_probe, "false");
 });
 
 test("validateFixture: a duplicate acceptance criterion id is rejected", () => {

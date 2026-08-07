@@ -235,7 +235,16 @@ test("runExperiment: hidden checks and seeded-defect ground truth never appear i
   const fixtureText = makeFixtureFile({
     public_checks: ["true"],
     hidden_checks: ["grep -q SEEDED_DEFECT_MARKER src/thing.ts"],
-    seeded_defects: [{ defect_id: "d1", path: "src/thing.ts", line_start: 1, line_end: 2, expected_severity: "high" }],
+    seeded_defects: [
+      {
+        defect_id: "d1",
+        path: "src/thing.ts",
+        line_start: 1,
+        line_end: 2,
+        expected_severity: "high",
+        biting_probe: "false",
+      },
+    ],
   });
   const { deps, outFiles } = makeFakeFs(fixtureText, makeManifestFile());
   const cellExecution = baseCellExecution({
@@ -276,7 +285,16 @@ test("runExperiment: resume never rewrites an existing trajectory artifact", asy
 
 test("gradeExperiment: a grade record carries a verifier_artifact descriptor whose hash verifies, and evidence includes seeded defects (verifier-only material permitted here)", async () => {
   const fixtureText = makeFixtureFile({
-    seeded_defects: [{ defect_id: "d1", path: "src/thing.ts", line_start: 1, line_end: 2, expected_severity: "high" }],
+    seeded_defects: [
+      {
+        defect_id: "d1",
+        path: "src/thing.ts",
+        line_start: 1,
+        line_end: 2,
+        expected_severity: "high",
+        biting_probe: "false",
+      },
+    ],
   });
   const manifestText = makeManifestFile();
   const runsRecord: CellRecord = {

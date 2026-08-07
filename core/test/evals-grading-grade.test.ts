@@ -224,7 +224,16 @@ function fixtureEndToEnd(): Fixture {
       task_input: "t",
       stage_entry_artifacts: { planning: { issue_body: "..." }, review: { diff: "..." } },
       public_checks: [],
-      seeded_defects: [{ defect_id: "d1", path: "a.ts", line_start: 10, line_end: 12, expected_severity: "high" }],
+      seeded_defects: [
+        {
+          defect_id: "d1",
+          path: "a.ts",
+          line_start: 10,
+          line_end: 12,
+          expected_severity: "high",
+          biting_probe: "false",
+        },
+      ],
       grader_refs: [
         { grader: "review", version: "1" },
         { grader: "planning", version: "1" },

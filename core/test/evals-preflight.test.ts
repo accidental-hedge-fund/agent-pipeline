@@ -34,6 +34,7 @@ function cellSurfaceFakes(extra: DeepPreflightDeps = {}): DeepPreflightDeps {
       EVAL_BOUNDARY_DENIAL_LOG: "/fake/denials.jsonl",
     }),
     pathExists: async () => true,
+    materializeReviewDiff: async () => "/fake/review.diff",
     ...extra,
   };
 }
@@ -208,6 +209,127 @@ test("deep preflight: healthy baseline and biting hidden probe pass", async () =
     }),
   );
   assert.equal(result.ok, true, formatPreflightFailures(result.failures));
+});
+
+// --- #637 review 2: seeded defects must prove they bite (ae1fad38) ---
+
+test("deep preflight: seeded defect path exists but non-biting probe fails preflight naming defect_id", async () => {
+  // Regression: path-existence alone previously let already-fixed seeds into
+  // scored runs. Probe that exits 0 = defect no longer bites.
+  const fixture = makeFixture({
+    public_checks: [],
+    stage_entry_artifacts: {
+      review: {
+        diff: "diff --git a/core/scripts/gh.ts b/core/scripts/gh.ts\n+return Number(result.number);\n",
+      },
+    },
+    seeded_defects: [
+      {
+        defect_id: "already-fixed-sentinel",
+        path: "core/scripts/gh.ts",
+        line_start: 701,
+        line_end: 702,
+        expected_severity: "high",
+        // Probe passes → non-biting (simulates defect already fixed in ground truth)
+        biting_probe: "true",
+      },
+    ],
+    grader_refs: [{ grader: "review", version: "1" }],
+    smoke_only: false,
+  });
+  const result = await runDeepFixturePreflight(
+    cfg,
+    fixture,
+    cellSurfaceFakes({
+      pathExists: async () => true,
+      runCheck: async ({ check }) => check === "true",
+    }),
+  );
+  assert.equal(result.ok, false);
+  const bite = result.failures.find((f) => f.check === "biting_probe");
+  assert.ok(bite, formatPreflightFailures(result.failures));
+  assert.match(bite!.detail, /already-fixed-sentinel/);
+  assert.match(bite!.detail, /already passes|non-biting/);
+});
+
+test("deep preflight: seeded defect with biting probe (fails at pin) passes", async () => {
+  const fixture = makeFixture({
+    public_checks: [],
+    stage_entry_artifacts: {
+      review: {
+        diff: "diff --git a/core/scripts/gh.ts b/core/scripts/gh.ts\n+return Number(result.number ?? -1);\n",
+      },
+    },
+    seeded_defects: [
+      {
+        defect_id: "sentinel-still-present",
+        path: "core/scripts/gh.ts",
+        line_start: 701,
+        line_end: 702,
+        expected_severity: "high",
+        biting_probe: "false",
+      },
+    ],
+    grader_refs: [{ grader: "review", version: "1" }],
+    smoke_only: false,
+  });
+  let seenProbeEnv: NodeJS.ProcessEnv | undefined;
+  const result = await runDeepFixturePreflight(
+    cfg,
+    fixture,
+    cellSurfaceFakes({
+      runCheck: async ({ check, env }) => {
+        if (check === "false") {
+          seenProbeEnv = env;
+          return false; // still fails at pin = biting
+        }
+        return true;
+      },
+    }),
+  );
+  assert.equal(result.ok, true, formatPreflightFailures(result.failures));
+  assert.ok(seenProbeEnv);
+  assert.equal(seenProbeEnv!.EVAL_PREFLIGHT_REVIEW_DIFF, "/fake/review.diff");
+});
+
+test("deep preflight: unrelated hidden check does not substitute for seeded-defect probe", async () => {
+  // A fixture can have a biting hidden check while its seeded defect probe is
+  // already non-biting — preflight must still reject the seeded defect.
+  const fixture = makeFixture({
+    public_checks: [],
+    hidden_checks: ["node --test core/test/unrelated-hidden.test.ts"],
+    seeded_defects: [
+      {
+        defect_id: "seed-without-bite",
+        path: "core/scripts/gh.ts",
+        line_start: 1,
+        line_end: 2,
+        expected_severity: "high",
+        biting_probe: "echo seed-fixed",
+      },
+    ],
+    grader_refs: [{ grader: "review", version: "1" }],
+    smoke_only: false,
+  });
+  const result = await runDeepFixturePreflight(
+    cfg,
+    fixture,
+    cellSurfaceFakes({
+      runCheck: async ({ check }) => {
+        // Hidden still bites (fails); seeded probe already passes.
+        if (check.includes("unrelated-hidden")) return false;
+        if (check.includes("seed-fixed")) return true;
+        return true;
+      },
+    }),
+  );
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.failures.some(
+      (f) => f.check === "biting_probe" && /seed-without-bite/.test(f.detail),
+    ),
+    formatPreflightFailures(result.failures),
+  );
 });
 
 // --- #637 review 1: smoke-only must not bypass deep preflight (235a716c) ---
