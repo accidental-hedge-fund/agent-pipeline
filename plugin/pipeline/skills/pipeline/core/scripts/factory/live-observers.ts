@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { PipelineConfig } from "../types.ts";
-import { getIssueDetail } from "../gh.ts";
+import { getIssueDetail, getMilestones } from "../gh.ts";
 import {
   defaultLoopStoreDeps,
   getStatus,
@@ -17,20 +17,32 @@ import {
   type LoopStatus,
 } from "../loop/store.ts";
 import {
+  discoverDeclaredDependencies,
+  realWorkListDependencyDiscoverDeps,
+} from "../loop/work-list-deps.ts";
+import {
   productionPinPath,
   parseProductionEnginePin,
   type ProductionEnginePin,
 } from "../production-engine-pin.ts";
 import {
   FactoryError,
+  type FactoryDependencyEdge,
   type FactoryFingerprints,
   type FactoryGithubIdentitySnapshot,
+  type FactorySelector,
 } from "./types.ts";
 import type { ChildRunStatus, FactoryMacroDeps } from "./controller.ts";
 import type { FactoryStoreDeps } from "./store.ts";
-import { getMilestones } from "../gh.ts";
 
 const execFileAsync = promisify(execFile);
+
+/** Open issue row used for independent selector membership resolution. */
+export interface FactoryLiveOpenIssue {
+  number: number;
+  labels: string[];
+  milestone: string | null;
+}
 
 // ---------------------------------------------------------------------------
 // Injectable observation deps
@@ -62,10 +74,26 @@ export interface FactoryLiveObserverDeps {
     prNumber: number,
   ): Promise<{ number: number; state: string } | null>;
   /**
-   * List milestone titles for the repository (live selector / milestone
-   * identity observation).
+   * List open issues with labels + milestone for independent selector
+   * membership. Return `null` when the query is unavailable (fail closed).
+   * An empty array is a successful observation of zero open issues.
    */
-  listMilestones(repo: string): Promise<string[]>;
+  listOpenIssues(repo: string): Promise<FactoryLiveOpenIssue[] | null>;
+  /**
+   * Discover live declared dependency edges among `issueIds` from the
+   * authoritative sources (body phrases, native blockedBy, optional roadmap).
+   * Return `null` when discovery is unavailable (fail closed). Edge direction:
+   * `from` = depender, `to` = prerequisite. Only in-membership edges.
+   */
+  listDependencyEdges(
+    repo: string,
+    issueIds: readonly string[],
+  ): Promise<FactoryDependencyEdge[] | null>;
+  /**
+   * List milestone titles for the repository (aux live identity).
+   * Return `null` when the query is unavailable (fail closed).
+   */
+  listMilestones(repo: string): Promise<string[] | null>;
   /** Optional production engine pin for the engine_pin fingerprint. */
   readEnginePin(repoDir: string): Promise<ProductionEnginePin | null>;
   /** Durable loop store for child observation (never invents run state). */
@@ -130,12 +158,73 @@ export function defaultFactoryLiveObserverDeps(
         return null;
       }
     },
+    async listOpenIssues(repo) {
+      try {
+        const { stdout } = await execFileAsync(
+          "gh",
+          [
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--json",
+            "number,labels,milestone",
+            "--limit",
+            "500",
+            "-R",
+            repo,
+          ],
+          { timeout: 60_000, maxBuffer: 8 * 1024 * 1024 },
+        );
+        const items = JSON.parse(stdout.trim() || "[]") as Array<{
+          number: number;
+          labels?: Array<{ name: string } | string>;
+          milestone?: { title: string } | null;
+        }>;
+        return items.map((item) => ({
+          number: item.number,
+          labels: (item.labels ?? []).map((l) =>
+            typeof l === "string" ? l : l.name,
+          ),
+          milestone: item.milestone?.title ?? null,
+        }));
+      } catch {
+        return null;
+      }
+    },
+    async listDependencyEdges(repo, issueIds) {
+      try {
+        const cfg = { repo } as PipelineConfig;
+        const discover = realWorkListDependencyDiscoverDeps(cfg);
+        const items = await discoverDeclaredDependencies(issueIds, discover);
+        const idSet = new Set(issueIds.map(String));
+        const edges: FactoryDependencyEdge[] = [];
+        for (const item of items) {
+          for (const dep of item.depends_on) {
+            const to = String(dep);
+            if (!idSet.has(to)) continue;
+            edges.push({ from: String(item.id), to });
+          }
+        }
+        edges.sort((a, b) => {
+          const af = String(a.from);
+          const bf = String(b.from);
+          if (af !== bf) return Number(af) - Number(bf) || (af < bf ? -1 : 1);
+          const at = String(a.to);
+          const bt = String(b.to);
+          return Number(at) - Number(bt) || (at < bt ? -1 : 1);
+        });
+        return edges;
+      } catch {
+        return null;
+      }
+    },
     async listMilestones(repo) {
       try {
         const ms = await getMilestones(repo);
         return ms.map((m) => m.title);
       } catch {
-        return [];
+        return null;
       }
     },
     async readEnginePin(repoDir) {
@@ -281,14 +370,128 @@ export async function observeFactoryRepoIdentity(
   return { name, base_branch };
 }
 
+/** Parse explicit/issues selector values into sorted canonical issue id strings. */
+export function parseFactorySelectorIssueIds(value: string): string[] {
+  const ids = new Set<string>();
+  for (const m of String(value).matchAll(/\b([1-9][0-9]*)\b/g)) {
+    ids.add(m[1]!);
+  }
+  return [...ids].sort((a, b) => Number(a) - Number(b) || (a < b ? -1 : 1));
+}
+
+/** Parse `N-M` / `N..M` range selector values. */
+export function parseFactorySelectorRange(
+  value: string,
+): { lo: number; hi: number } | null {
+  const m = /^([1-9][0-9]*)\s*(?:\.\.|-)\s*([1-9][0-9]*)$/.exec(String(value).trim());
+  if (!m) return null;
+  let lo = Number(m[1]);
+  let hi = Number(m[2]);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return null;
+  if (lo > hi) [lo, hi] = [hi, lo];
+  return { lo, hi };
+}
+
 /**
- * Fresh GitHub identity snapshot for the contracted selector, issue/PR ids,
- * milestones, and dependency edges. Returns a typed `observed` object so the
- * controller can compare each field against the accepted revision. Empty
- * issue/PR/milestone lists are successful no-ops for those slots.
+ * Resolve selector membership solely from live open-issue rows (and, for
+ * explicit/issues selectors, per-issue existence reads). Does not use
+ * contracted issue_ids as the membership source.
+ */
+export async function resolveLiveSelectorMembership(
+  deps: Pick<FactoryLiveObserverDeps, "getIssue" | "listOpenIssues">,
+  input: { repo: string; selector: FactorySelector },
+): Promise<
+  | {
+      ok: true;
+      issue_ids: string[];
+      /** Live open rows that matched (empty for pure existence selectors). */
+      matched_open: FactoryLiveOpenIssue[];
+    }
+  | { ok: false; detail: string }
+> {
+  const selector = input.selector;
+  const type = selector.type;
+  const value = String(selector.value ?? "");
+
+  if (type === "issues" || type === "explicit") {
+    const ids = parseFactorySelectorIssueIds(value);
+    if (ids.length === 0) {
+      return {
+        ok: false,
+        detail: `selector ${type} value "${value}" yields no issue ids`,
+      };
+    }
+    const observed: string[] = [];
+    for (const id of ids) {
+      const n = Number(id);
+      const issue = await deps.getIssue(input.repo, n);
+      if (issue) observed.push(id);
+    }
+    return { ok: true, issue_ids: observed, matched_open: [] };
+  }
+
+  const openIssues = await deps.listOpenIssues(input.repo);
+  if (openIssues == null) {
+    return {
+      ok: false,
+      detail: `open-issue listing unavailable for ${input.repo} — cannot observe selector membership`,
+    };
+  }
+
+  let matched: FactoryLiveOpenIssue[];
+  if (type === "milestone") {
+    if (!value) {
+      return { ok: false, detail: "milestone selector value is empty" };
+    }
+    matched = openIssues.filter((i) => i.milestone === value);
+  } else if (type === "label") {
+    if (!value) {
+      return { ok: false, detail: "label selector value is empty" };
+    }
+    matched = openIssues.filter((i) => i.labels.includes(value));
+  } else if (type === "range") {
+    const range = parseFactorySelectorRange(value);
+    if (!range) {
+      return {
+        ok: false,
+        detail: `range selector value "${value}" is not a valid N-M or N..M range`,
+      };
+    }
+    matched = openIssues.filter(
+      (i) => i.number >= range.lo && i.number <= range.hi,
+    );
+  } else {
+    return {
+      ok: false,
+      detail: `unsupported factory selector type "${String(type)}"`,
+    };
+  }
+
+  matched = [...matched].sort((a, b) => a.number - b.number);
+  return {
+    ok: true,
+    issue_ids: matched.map((i) => String(i.number)),
+    matched_open: matched,
+  };
+}
+
+/**
+ * Fresh GitHub identity snapshot built solely from independent live queries:
+ * selector membership (label/range/milestone/issue assignment), PR existence
+ * checks, milestone titles assigned to live members, and dependency edges from
+ * the authoritative declared-dependency sources. Contracted issue/edge lists
+ * are never copied into `observed` — the controller compares live vs revision.
+ * Unavailable queries fail closed (ok:false) rather than echoing contract values.
  */
 export async function observeFactoryGithubSnapshot(
-  deps: Pick<FactoryLiveObserverDeps, "getIssue" | "getPull" | "listMilestones">,
+  deps: Pick<
+    FactoryLiveObserverDeps,
+    | "getIssue"
+    | "getPull"
+    | "listOpenIssues"
+    | "listDependencyEdges"
+    | "listMilestones"
+  >,
   input: { repo: string; contracted: FactoryGithubIdentitySnapshot },
 ): Promise<{
   ok: boolean;
@@ -299,25 +502,24 @@ export async function observeFactoryGithubSnapshot(
     return { ok: false, detail: `invalid repo identity "${input.repo}"` };
   }
   const contracted = input.contracted;
-  const missingIssues: string[] = [];
-  const observedIssues: string[] = [];
-  for (const raw of contracted.issue_ids) {
-    const n = Number.parseInt(String(raw), 10);
-    if (!Number.isFinite(n) || n <= 0) {
-      missingIssues.push(String(raw));
-      continue;
-    }
-    const issue = await deps.getIssue(input.repo, n);
-    if (!issue) missingIssues.push(String(raw));
-    else observedIssues.push(String(raw));
-  }
-  if (missingIssues.length > 0) {
-    return {
-      ok: false,
-      detail: `selector issues not readable in ${input.repo}: ${missingIssues.join(", ")}`,
-    };
-  }
+  // Selector under observation is the contracted selector identity (type+value);
+  // membership is resolved live — never by copying contracted.issue_ids.
+  const selector: FactorySelector = {
+    type: contracted.selector.type,
+    value: contracted.selector.value,
+  };
 
+  const membership = await resolveLiveSelectorMembership(deps, {
+    repo: input.repo,
+    selector,
+  });
+  if (!membership.ok) {
+    return { ok: false, detail: membership.detail };
+  }
+  const observedIssues = membership.issue_ids;
+
+  // PR identity slots: re-verify each contracted PR still exists independently.
+  // (PR membership is not selector-derived; absence → fail closed.)
   const missingPrs: string[] = [];
   const observedPrs: string[] = [];
   for (const raw of contracted.pr_ids) {
@@ -337,54 +539,70 @@ export async function observeFactoryGithubSnapshot(
     };
   }
 
-  const liveMilestoneTitles = await deps.listMilestones(input.repo);
-  const liveMilestoneSet = new Set(liveMilestoneTitles.map(String));
-  const observedMilestones = contracted.milestones.filter((m) =>
-    liveMilestoneSet.has(String(m)),
-  );
-  if (observedMilestones.length !== contracted.milestones.length) {
-    const missing = contracted.milestones.filter((m) => !liveMilestoneSet.has(String(m)));
-    return {
-      ok: false,
-      detail: `contracted milestones not present in ${input.repo}: ${missing.join(", ")}`,
-    };
+  // Milestones: assigned on live matched open issues only (never copy
+  // contracted.milestones). For milestone selectors, also require the selector
+  // title still exists as a repo milestone title.
+  const milestoneTitles = new Set<string>();
+  for (const row of membership.matched_open) {
+    if (row.milestone) milestoneTitles.add(String(row.milestone));
   }
-
-  // Selector backing identity: milestone/label/issues must still be live.
-  const selector = {
-    type: contracted.selector.type,
-    value: contracted.selector.value,
-  };
+  if (selector.type === "issues" || selector.type === "explicit") {
+    // Existence selectors have no matched_open rows — project open-issue
+    // milestone assignments for the live-readable membership set when listing
+    // is available. Listing failure fails closed (do not invent titles).
+    const openIssues = await deps.listOpenIssues(input.repo);
+    if (openIssues == null) {
+      return {
+        ok: false,
+        detail: `open-issue listing unavailable for ${input.repo} — cannot observe milestone assignments`,
+      };
+    }
+    const idSet = new Set(observedIssues.map(String));
+    for (const row of openIssues) {
+      if (idSet.has(String(row.number)) && row.milestone) {
+        milestoneTitles.add(String(row.milestone));
+      }
+    }
+  }
   if (selector.type === "milestone" && selector.value) {
-    if (!liveMilestoneSet.has(selector.value)) {
+    const liveMilestoneTitles = await deps.listMilestones(input.repo);
+    if (liveMilestoneTitles == null) {
+      return {
+        ok: false,
+        detail: `milestone listing unavailable for ${input.repo}`,
+      };
+    }
+    if (!liveMilestoneTitles.map(String).includes(selector.value)) {
       return {
         ok: false,
         detail: `selector milestone "${selector.value}" not present in ${input.repo}`,
       };
     }
+    milestoneTitles.add(selector.value);
   }
-  if (selector.type === "issues" || selector.type === "explicit") {
-    // Membership is the issue list already verified above.
-  }
-
-  // Dependency edges: both endpoints must remain among observed issues.
-  const issueSet = new Set(observedIssues.map(String));
-  const observedEdges = contracted.dependency_edges.filter(
-    (e) => issueSet.has(String(e.from)) && issueSet.has(String(e.to)),
+  const observedMilestones = [...milestoneTitles].sort((a, b) =>
+    a < b ? -1 : a > b ? 1 : 0,
   );
-  if (observedEdges.length !== contracted.dependency_edges.length) {
+
+  // Dependency edges: independent discovery — never filter contracted edges.
+  const liveEdges = await deps.listDependencyEdges(input.repo, observedIssues);
+  if (liveEdges == null) {
     return {
       ok: false,
-      detail: `dependency edge endpoints missing from live issues in ${input.repo}`,
+      detail: `dependency-edge discovery unavailable for ${input.repo}`,
     };
   }
+  const observedEdges = liveEdges.map((e) => ({
+    from: String(e.from),
+    to: String(e.to),
+  }));
 
   const observed: FactoryGithubIdentitySnapshot = {
-    selector,
+    selector: { type: selector.type, value: selector.value },
     issue_ids: observedIssues,
     pr_ids: observedPrs,
     milestones: observedMilestones,
-    dependency_edges: observedEdges.map((e) => ({ from: e.from, to: e.to })),
+    dependency_edges: observedEdges,
   };
   return { ok: true, observed };
 }
@@ -470,6 +688,9 @@ export function buildFactoryMacroDeps(
     git: input.observers?.git ?? base.git,
     getIssue: input.observers?.getIssue ?? base.getIssue,
     getPull: input.observers?.getPull ?? base.getPull,
+    listOpenIssues: input.observers?.listOpenIssues ?? base.listOpenIssues,
+    listDependencyEdges:
+      input.observers?.listDependencyEdges ?? base.listDependencyEdges,
     listMilestones: input.observers?.listMilestones ?? base.listMilestones,
     readEnginePin: input.observers?.readEnginePin ?? base.readEnginePin,
     now: input.observers?.now ?? base.now,

@@ -193,15 +193,41 @@ function contractedGithub(
 
 function githubObserverDeps(
   overrides: Partial<
-    Pick<FactoryLiveObserverDeps, "getIssue" | "getPull" | "listMilestones">
+    Pick<
+      FactoryLiveObserverDeps,
+      | "getIssue"
+      | "getPull"
+      | "listOpenIssues"
+      | "listDependencyEdges"
+      | "listMilestones"
+    >
   > = {},
-): Pick<FactoryLiveObserverDeps, "getIssue" | "getPull" | "listMilestones"> {
+): Pick<
+  FactoryLiveObserverDeps,
+  | "getIssue"
+  | "getPull"
+  | "listOpenIssues"
+  | "listDependencyEdges"
+  | "listMilestones"
+> {
   return {
     async getIssue(_repo, n) {
       return { number: n, state: "open" };
     },
     async getPull(_repo, n) {
       return { number: n, state: "OPEN" };
+    },
+    async listOpenIssues() {
+      return [
+        { number: 1, labels: [], milestone: "v2" },
+        { number: 3, labels: [], milestone: "v2" },
+      ];
+    },
+    async listDependencyEdges(_repo, issueIds) {
+      const s = new Set(issueIds.map(String));
+      const edges: { from: string; to: string }[] = [];
+      if (s.has("1") && s.has("3")) edges.push({ from: "1", to: "3" });
+      return edges;
     },
     async listMilestones() {
       return ["v2", "v3"];
@@ -210,35 +236,33 @@ function githubObserverDeps(
   };
 }
 
-test("observeFactoryGithubSnapshot verifies issues/PRs/milestones/edges via injected seams", async () => {
-  const seen: number[] = [];
+test("observeFactoryGithubSnapshot resolves membership and edges from live queries", async () => {
+  const listCalls: string[] = [];
   const deps = githubObserverDeps({
-    async getIssue(repo, n) {
-      assert.equal(repo, "acme/widgets");
-      seen.push(n);
-      if (n === 2) return null;
-      return { number: n, state: "open" };
+    async listOpenIssues(repo) {
+      listCalls.push(repo);
+      return [
+        { number: 1, labels: [], milestone: "v2" },
+        { number: 3, labels: [], milestone: "v2" },
+        { number: 9, labels: [], milestone: "v3" },
+      ];
     },
   });
   const ok = await observeFactoryGithubSnapshot(deps, {
     repo: "acme/widgets",
-    contracted: contractedGithub({ issue_ids: ["1", "3"] }),
+    // Contracted issue_ids deliberately stale — live membership must win.
+    contracted: contractedGithub({ issue_ids: ["1", "3", "999"], dependency_edges: [] }),
   });
   assert.equal(ok.ok, true);
   assert.deepEqual(ok.observed?.issue_ids, ["1", "3"]);
   assert.deepEqual(ok.observed?.milestones, ["v2"]);
   assert.deepEqual(ok.observed?.dependency_edges, [{ from: "1", to: "3" }]);
-  assert.deepEqual(seen, [1, 3]);
-
-  const bad = await observeFactoryGithubSnapshot(deps, {
-    repo: "acme/widgets",
-    contracted: contractedGithub({ issue_ids: ["1", "2"], dependency_edges: [] }),
-  });
-  assert.equal(bad.ok, false);
-  assert.match(bad.detail ?? "", /2/);
+  assert.deepEqual(listCalls, ["acme/widgets"]);
+  // Contracted issue 999 must not be copied into observed.
+  assert.ok(!ok.observed?.issue_ids.includes("999"));
 });
 
-test("observeFactoryGithubSnapshot fails closed when contracted PR or milestone is missing", async () => {
+test("observeFactoryGithubSnapshot fails closed when contracted PR is missing", async () => {
   const missingPr = await observeFactoryGithubSnapshot(
     githubObserverDeps({
       async getPull() {
@@ -252,18 +276,35 @@ test("observeFactoryGithubSnapshot fails closed when contracted PR or milestone 
   );
   assert.equal(missingPr.ok, false);
   assert.match(missingPr.detail ?? "", /9/);
+});
 
-  const missingMs = await observeFactoryGithubSnapshot(githubObserverDeps(), {
-    repo: "acme/widgets",
-    contracted: contractedGithub({ milestones: ["gone"], dependency_edges: [] }),
-  });
+test("observeFactoryGithubSnapshot fails closed when selector milestone title is gone", async () => {
+  const missingMs = await observeFactoryGithubSnapshot(
+    githubObserverDeps({
+      async listMilestones() {
+        return ["v3"];
+      },
+      async listOpenIssues() {
+        return [];
+      },
+    }),
+    {
+      repo: "acme/widgets",
+      contracted: contractedGithub({
+        selector: { type: "milestone", value: "gone" },
+        issue_ids: [],
+        milestones: ["gone"],
+        dependency_edges: [],
+      }),
+    },
+  );
   assert.equal(missingMs.ok, false);
   assert.match(missingMs.detail ?? "", /gone/);
 });
 
 test("observeFactoryGithubSnapshot never invents success for empty/invalid repo", async () => {
   const deps = githubObserverDeps({
-    async getIssue() {
+    async listOpenIssues() {
       throw new Error("should not be called for invalid repo");
     },
   });
@@ -272,6 +313,86 @@ test("observeFactoryGithubSnapshot never invents success for empty/invalid repo"
     contracted: contractedGithub({ issue_ids: [] }),
   });
   assert.equal(r.ok, false);
+});
+
+test("regression: live membership drift is observed (not contract-echoed) when label selection changes", async () => {
+  // Bite check for finding 9d28f0d2: observing only contracted issue existence
+  // would still return issue_ids ["1","3"] when the label membership shrank.
+  const deps = githubObserverDeps({
+    async listOpenIssues() {
+      // Only #1 still has label "ship"; #3 lost it.
+      return [
+        { number: 1, labels: ["ship"], milestone: null },
+        { number: 3, labels: ["other"], milestone: null },
+      ];
+    },
+    async listDependencyEdges(_repo, issueIds) {
+      assert.deepEqual(issueIds, ["1"]);
+      return [];
+    },
+  });
+  const snap = await observeFactoryGithubSnapshot(deps, {
+    repo: "acme/widgets",
+    contracted: contractedGithub({
+      selector: { type: "label", value: "ship" },
+      issue_ids: ["1", "3"],
+      milestones: [],
+      dependency_edges: [{ from: "1", to: "3" }],
+    }),
+  });
+  assert.equal(snap.ok, true);
+  assert.deepEqual(snap.observed?.issue_ids, ["1"]);
+  assert.deepEqual(snap.observed?.dependency_edges, []);
+  assert.notDeepEqual(snap.observed?.issue_ids, ["1", "3"]);
+});
+
+test("regression: dependency edges come from live discovery, not contract edge filter", async () => {
+  const deps = githubObserverDeps({
+    async listOpenIssues() {
+      return [
+        { number: 1, labels: [], milestone: "v2" },
+        { number: 3, labels: [], milestone: "v2" },
+      ];
+    },
+    async listDependencyEdges(_repo, issueIds) {
+      assert.deepEqual([...issueIds].sort(), ["1", "3"]);
+      // Live graph differs from contracted {from:1,to:3}.
+      return [{ from: "3", to: "1" }];
+    },
+  });
+  const snap = await observeFactoryGithubSnapshot(deps, {
+    repo: "acme/widgets",
+    contracted: contractedGithub({
+      issue_ids: ["1", "3"],
+      dependency_edges: [{ from: "1", to: "3" }],
+    }),
+  });
+  assert.equal(snap.ok, true);
+  assert.deepEqual(snap.observed?.dependency_edges, [{ from: "3", to: "1" }]);
+});
+
+test("observeFactoryGithubSnapshot fails closed when open-issue or dependency queries are unavailable", async () => {
+  const noList = await observeFactoryGithubSnapshot(
+    githubObserverDeps({
+      async listOpenIssues() {
+        return null;
+      },
+    }),
+    { repo: "acme/widgets", contracted: contractedGithub() },
+  );
+  assert.equal(noList.ok, false);
+  assert.match(noList.detail ?? "", /open-issue listing unavailable/);
+
+  const noDeps = await observeFactoryGithubSnapshot(
+    githubObserverDeps({
+      async listDependencyEdges() {
+        return null;
+      },
+    }),
+    { repo: "acme/widgets", contracted: contractedGithub() },
+  );
+  assert.equal(noDeps.ok, false);
+  assert.match(noDeps.detail ?? "", /dependency-edge discovery unavailable/);
 });
 
 test("computeEffectiveConfigFingerprints is stable and pin-sensitive", () => {
@@ -321,6 +442,12 @@ test("buildFactoryMacroDeps wires real observers — no synthetic unknown/ok:tru
       },
       async getPull(_repo, n) {
         return { number: n, state: "OPEN" };
+      },
+      async listOpenIssues() {
+        return [{ number: 42, labels: [], milestone: null }];
+      },
+      async listDependencyEdges() {
+        return [];
       },
       async listMilestones() {
         return ["v2"];
@@ -442,6 +569,12 @@ test("regression: synthetic unknown fingerprints and ok:true without getIssue mu
       async getPull() {
         return null;
       },
+      async listOpenIssues() {
+        return [];
+      },
+      async listDependencyEdges() {
+        return [];
+      },
       async listMilestones() {
         return [];
       },
@@ -467,6 +600,9 @@ test("regression: synthetic unknown fingerprints and ok:true without getIssue mu
       selector: { type: "issues", value: "99" },
     }),
   });
-  assert.equal(snap.ok, false, "missing issue must fail closed, not fabricate ok:true");
+  // Explicit selector with unreadable #99 → empty membership + ok snapshot that
+  // will drift vs contract (or empty edges). Membership is observed, not echoed.
+  assert.equal(snap.ok, true);
+  assert.deepEqual(snap.observed?.issue_ids, []);
   assert.equal(issueCalls.length, 1);
 });
