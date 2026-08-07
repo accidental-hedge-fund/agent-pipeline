@@ -19,6 +19,7 @@ import {
   adoptOrReplan,
   claimAction,
   tryAcquireDispatchLease,
+  tryAcquireOrRecoverDispatchLease,
   updateClaim,
   readCurrentRevision,
   readRevision,
@@ -28,11 +29,13 @@ import {
   resolveFactoryStateHome,
   factoryRunDir,
   readFactoryEvents,
+  readPhaseEvidence,
   type FactoryStoreDeps,
 } from "../scripts/factory/store.ts";
 import {
   adoptFactoryContract,
   derivePhaseAndNextAction,
+  reconcileLiveIdentity,
   tickFactory,
   factoryStatus,
   FACTORY_CHILD_OPERATIONS,
@@ -181,21 +184,44 @@ function makeMacroDeps(
     loopStatus?: ChildRunStatus;
     startCalls?: string[];
     fault?: FactoryMacroDeps["_fault"];
+    baseSha?: string;
+    github?: { ok: boolean; detail?: string };
+    configFingerprints?: {
+      authority_policy: string;
+      engine_pin: string;
+      configuration: string;
+      treatment: string;
+    };
+    /** Shared map so idempotent start survives across makeMacroDeps instances. */
+    startedByActionId?: Map<string, string>;
   } = {},
 ): FactoryMacroDeps {
   const startCalls = opts.startCalls ?? [];
   let loopStatus: ChildRunStatus = opts.loopStatus ?? { state: "not_found" };
+  const startedByActionId = opts.startedByActionId ?? new Map<string, string>();
+  const children = new Map<string, ChildRunStatus>();
   return {
     store,
-    observeBaseSha: async () => "abc123deadbeef",
+    observeBaseSha: async () => opts.baseSha ?? "abc123deadbeef",
+    observeGithubSnapshot: opts.github
+      ? async () => opts.github!
+      : undefined,
+    readConfigFingerprints: opts.configFingerprints
+      ? async () => opts.configFingerprints!
+      : undefined,
     now: () => store.now(),
-    startOrResumeLoop: async ({ loop_run_id, factory_run_id }) => {
-      startCalls.push(`loop:${loop_run_id ?? "new"}:${factory_run_id}`);
-      const id = loop_run_id ?? `loop-from-${factory_run_id}`;
+    startOrResumeLoop: async ({ loop_run_id, factory_run_id, action_id }) => {
+      startCalls.push(`loop:${loop_run_id ?? "new"}:${factory_run_id}:${action_id}`);
+      // Idempotent on action_id — crash recovery re-entry must not mint a second child.
+      const existing = startedByActionId.get(action_id);
+      const id = existing ?? loop_run_id ?? `loop-from-${factory_run_id}`;
+      startedByActionId.set(action_id, id);
       loopStatus = { state: "running", run_id: id };
+      children.set(id, loopStatus);
       return { loop_run_id: id };
     },
     observeLoop: async (id) => {
+      if (children.has(id)) return children.get(id)!;
       if (loopStatus.state === "not_found") return { state: "not_found" };
       return { ...loopStatus, run_id: "run_id" in loopStatus ? loopStatus.run_id : id } as ChildRunStatus;
     },
@@ -463,6 +489,45 @@ test("dispatch lease is exclusive", async () => {
   assert.equal(await tryAcquireDispatchLease(deps, "frun-1", "r1-start_loop-0"), false);
 });
 
+test("unfinished dispatch lease is recoverable when claim has no child_run_id", async () => {
+  const { deps } = fakeStore();
+  await adoptFresh(deps);
+  const { claim } = await claimAction(deps, {
+    factory_run_id: "frun-1",
+    revision: 1,
+    action_id: "r1-start_loop-0",
+    action: "start_loop",
+    service_controller: FACTORY_SERVICE_CONTROLLER_ID,
+  });
+  assert.equal(await tryAcquireDispatchLease(deps, "frun-1", "r1-start_loop-0"), true);
+  const recovered = await tryAcquireOrRecoverDispatchLease(
+    deps,
+    "frun-1",
+    "r1-start_loop-0",
+    claim,
+  );
+  assert.equal(recovered.acquired, true);
+  assert.equal(recovered.recovered, true);
+  // Once child is linked, recovery must not re-grant dispatch.
+  await updateClaim(deps, "frun-1", "r1-start_loop-0", {
+    state: "started",
+    child_run_id: "loop-1",
+  });
+  const linked = await tryAcquireOrRecoverDispatchLease(
+    deps,
+    "frun-1",
+    "r1-start_loop-0",
+    (await claimAction(deps, {
+      factory_run_id: "frun-1",
+      revision: 1,
+      action_id: "r1-start_loop-0",
+      action: "start_loop",
+      service_controller: FACTORY_SERVICE_CONTROLLER_ID,
+    })).claim,
+  );
+  assert.equal(linked.acquired, false);
+});
+
 test("factory lock acquire/release with token", async () => {
   const { deps } = fakeStore();
   await adoptFresh(deps);
@@ -557,33 +622,42 @@ test("crash after claim: restart does not free second concurrent dispatch", asyn
   assert.equal(starts.length, 1);
 });
 
-test("crash after child start: restart observes linked child without second start", async () => {
+test("crash after child start (before claim update): restart recovers unfinished lease", async () => {
   const { deps } = fakeStore();
   await adoptFresh(deps, {
     linked_runs: {
-      loop_run_id: "loop-1",
-      loop_contract_hash: "h",
+      loop_run_id: null,
+      loop_contract_hash: null,
       advance_run_id: null,
       legacy_run_identity: null,
     },
   });
   const starts: string[] = [];
+  const startedByActionId = new Map<string, string>();
   const faulting = makeMacroDeps(deps, {
     startCalls: starts,
     fault: { crashAfterChildStart: true },
     loopStatus: { state: "not_found" },
+    startedByActionId,
   });
   await assert.rejects(() => tickFactory(faulting, "frun-1", { repoDir: "/repo" }));
   assert.equal(starts.length, 1);
-  // Restart with running child
+  // Child was created but claim has no child_run_id; dispatch lease is held.
+  // Restart must recover the unfinished lease with the same action_id — not strand.
   const resume = makeMacroDeps(deps, {
     startCalls: starts,
-    loopStatus: { state: "running", run_id: "loop-1" },
+    loopStatus: { state: "not_found" },
+    startedByActionId,
   });
-  // Force observe path: claim already has child from first tick update... first tick crashed after updateClaim started
   const t = await tickFactory(resume, "frun-1", { repoDir: "/repo" });
-  assert.equal(t.dispatched, false);
-  assert.equal(starts.length, 1);
+  assert.equal(t.dispatched, true);
+  assert.equal(starts.length, 2); // re-entry with same action_id (idempotent)
+  assert.ok(t.child_run_id);
+  assert.equal(startedByActionId.get("r1-start_loop-0"), t.child_run_id);
+  // Third tick must not start again once child is linked
+  const t2 = await tickFactory(resume, "frun-1", { repoDir: "/repo" });
+  assert.equal(t2.dispatched, false);
+  assert.equal(starts.length, 2);
 });
 
 test("crash after ambiguous child result: restart re-queries live truth", async () => {
@@ -631,6 +705,166 @@ test("restart reconstructs without conversation memory — status from durable s
   const s = await factoryStatus({ store: deps } as FactoryMacroDeps, "frun-1");
   assert.equal(s?.revision, 1);
   assert.equal(s?.next_action, "start_loop");
+});
+
+test("live base SHA drift fails closed with replan_required (no dispatch)", async () => {
+  const { deps } = fakeStore();
+  await adoptFresh(deps, {
+    linked_runs: {
+      loop_run_id: null,
+      loop_contract_hash: null,
+      advance_run_id: null,
+      legacy_run_identity: null,
+    },
+  });
+  const starts: string[] = [];
+  const macro = makeMacroDeps(deps, {
+    startCalls: starts,
+    baseSha: "DIFFERENT-BASE-SHA",
+  });
+  const t = await tickFactory(macro, "frun-1", { repoDir: "/repo" });
+  assert.equal(t.next_action, "replan_required");
+  assert.equal(t.dispatched, false);
+  assert.equal(starts.length, 0);
+  assert.match(t.derive_reason, /base SHA drift/);
+  const evidence = await readPhaseEvidence(deps, "frun-1");
+  assert.equal(evidence?.next_action, "replan_required");
+  assert.ok(evidence?.replan_reason);
+  // Read-only status reconstructs the same posture without another tick
+  const s = await factoryStatus({ store: deps } as FactoryMacroDeps, "frun-1");
+  assert.equal(s?.next_action, "replan_required");
+  assert.equal(s?.phase_evidence?.next_action, "replan_required");
+});
+
+test("config fingerprint drift fails closed with replan_required", async () => {
+  const { deps } = fakeStore();
+  await adoptFresh(deps);
+  const t = await tickFactory(
+    makeMacroDeps(deps, {
+      configFingerprints: {
+        authority_policy: "auth-fp",
+        engine_pin: "pin-fp",
+        configuration: "CHANGED-CFG",
+        treatment: "treat-fp",
+      },
+    }),
+    "frun-1",
+    { repoDir: "/repo" },
+  );
+  assert.equal(t.next_action, "replan_required");
+  assert.match(t.derive_reason, /configuration fingerprint/);
+});
+
+test("GitHub snapshot mismatch fails closed with replan_required", async () => {
+  const { deps } = fakeStore();
+  await adoptFresh(deps);
+  const t = await tickFactory(
+    makeMacroDeps(deps, {
+      github: { ok: false, detail: "selector issues changed" },
+    }),
+    "frun-1",
+    { repoDir: "/repo" },
+  );
+  assert.equal(t.next_action, "replan_required");
+  assert.match(t.derive_reason, /GitHub snapshot/);
+});
+
+test("reconcileLiveIdentity accepts matching observations", () => {
+  const contract = {
+    repo: { observed_base_sha: "abc" },
+    fingerprints: {
+      authority_policy: "a",
+      engine_pin: "e",
+      configuration: "c",
+      treatment: "t",
+    },
+  } as never;
+  assert.equal(
+    reconcileLiveIdentity({
+      contract,
+      base_sha: "abc",
+      github: { ok: true },
+      configFingerprints: {
+        authority_policy: "a",
+        engine_pin: "e",
+        configuration: "c",
+        treatment: "t",
+      },
+    }).ok,
+    true,
+  );
+});
+
+test("read-only status reconstructs phase after tick records completion disposition", async () => {
+  const { deps } = fakeStore();
+  await adoptFresh(deps, {
+    coarse_phase: "executing",
+    next_action: "observe_loop",
+    linked_runs: {
+      loop_run_id: "loop-1",
+      loop_contract_hash: "h",
+      advance_run_id: null,
+      legacy_run_identity: null,
+    },
+  });
+  await claimAction(deps, {
+    factory_run_id: "frun-1",
+    revision: 1,
+    action_id: "r1-observe_loop-0",
+    action: "observe_loop",
+    service_controller: FACTORY_SERVICE_CONTROLLER_ID,
+  });
+  await updateClaim(deps, "frun-1", "r1-observe_loop-0", {
+    state: "started",
+    child_run_id: "loop-1",
+  });
+  const macro = makeMacroDeps(deps, {
+    loopStatus: {
+      state: "completed",
+      run_id: "loop-1",
+      all_items_terminal: true,
+      all_ready_to_deploy: true,
+    },
+  });
+  const t = await tickFactory(macro, "frun-1", { repoDir: "/repo" });
+  assert.equal(t.next_action, "operator_merge");
+  assert.equal(t.coarse_phase, "merge_prepare");
+  // Contract still has immutable executing snapshot; durable phase evidence
+  // carries the reconciled posture so status needs no live observation.
+  const s = await factoryStatus({ store: deps } as FactoryMacroDeps, "frun-1");
+  assert.equal(s?.next_action, "operator_merge");
+  assert.equal(s?.coarse_phase, "merge_prepare");
+  assert.equal(s?.phase_evidence?.next_action, "operator_merge");
+  assert.equal(s?.phase_evidence?.child_disposition?.all_ready_to_deploy, true);
+  // Status remains non-mutating on a second call
+  const before = JSON.stringify(await readPhaseEvidence(deps, "frun-1"));
+  await factoryStatus({ store: deps } as FactoryMacroDeps, "frun-1");
+  assert.equal(JSON.stringify(await readPhaseEvidence(deps, "frun-1")), before);
+});
+
+test("tickFactory acquires factory-run lock; concurrent holder blocks second tick", async () => {
+  const { deps } = fakeStore();
+  await adoptFresh(deps, {
+    linked_runs: {
+      loop_run_id: null,
+      loop_contract_hash: null,
+      advance_run_id: null,
+      legacy_run_identity: null,
+    },
+  });
+  const held = await acquireFactoryLock(deps, "frun-1");
+  const macro = makeMacroDeps(deps);
+  await assert.rejects(
+    () => tickFactory(macro, "frun-1", { repoDir: "/repo", acquireLock: true }),
+    (e: unknown) => e instanceof FactoryError && e.kind === "lock",
+  );
+  // Escape hatch: already-held lock skips acquire
+  const t = await tickFactory(macro, "frun-1", { repoDir: "/repo", acquireLock: false });
+  assert.equal(t.dispatched, true);
+  await releaseFactoryLock(deps, "frun-1", held.token);
+  // After release, default acquireLock succeeds
+  const t2 = await tickFactory(makeMacroDeps(deps), "frun-1", { repoDir: "/repo" });
+  assert.equal(t2.dispatched, false); // already started
 });
 
 // ---------------------------------------------------------------------------

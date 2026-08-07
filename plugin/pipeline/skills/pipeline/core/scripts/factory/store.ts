@@ -20,6 +20,7 @@ import {
   FACTORY_CONTRACT_SCHEMA,
   FACTORY_CURRENT_SCHEMA,
   FACTORY_LOCK_SCHEMA,
+  FACTORY_PHASE_EVIDENCE_SCHEMA,
   FactoryError,
   type FactoryActionClaim,
   type FactoryClaimState,
@@ -28,6 +29,7 @@ import {
   type FactoryExecutionContractRevision,
   type FactoryLockRecord,
   type FactoryNextAction,
+  type FactoryPhaseEvidence,
   type FactoryStatus,
 } from "./types.ts";
 
@@ -124,6 +126,9 @@ function eventsPath(dir: string): string {
 }
 function lockPath(dir: string): string {
   return path.join(dir, "lock.json");
+}
+function phaseEvidencePath(dir: string): string {
+  return path.join(dir, "phase-evidence.json");
 }
 
 const SAFE_ACTION_ID = /^[A-Za-z0-9._-]+$/;
@@ -530,6 +535,31 @@ export async function tryAcquireDispatchLease(
   );
 }
 
+/**
+ * Acquire a new dispatch lease, or recover an unfinished lease when the claim
+ * has no durable child_run_id yet. Recovery re-dispatches with the same
+ * action_id (idempotency key) so a crash between child creation and claim
+ * update cannot permanently strand the action.
+ */
+export async function tryAcquireOrRecoverDispatchLease(
+  deps: FactoryStoreDeps,
+  factoryRunId: string,
+  actionId: string,
+  claim: FactoryActionClaim,
+): Promise<{ acquired: boolean; recovered: boolean }> {
+  const won = await tryAcquireDispatchLease(deps, factoryRunId, actionId);
+  if (won) return { acquired: true, recovered: false };
+  // Unfinished lease: claim exists without a durable child link — safe to
+  // re-enter start with the same action_id as the idempotency key.
+  if (
+    !claim.child_run_id &&
+    (claim.state === "claimed" || claim.state === "started")
+  ) {
+    return { acquired: true, recovered: true };
+  }
+  return { acquired: false, recovered: false };
+}
+
 export async function updateClaim(
   deps: FactoryStoreDeps,
   factoryRunId: string,
@@ -645,6 +675,57 @@ export async function requireFactoryLockToken(
 }
 
 // ---------------------------------------------------------------------------
+// Phase evidence (durable posture for read-only status)
+// ---------------------------------------------------------------------------
+
+export async function readPhaseEvidence(
+  deps: FactoryStoreDeps,
+  factoryRunId: string,
+): Promise<FactoryPhaseEvidence | null> {
+  const text = await deps.readTextFile(phaseEvidencePath(factoryRunDir(deps, factoryRunId)));
+  if (!text) return null;
+  return JSON.parse(text) as FactoryPhaseEvidence;
+}
+
+/**
+ * Persist the last reconciled coarse phase / next action. Overwrites prior
+ * evidence for the run (reconstructible from the latest record + claims).
+ * Does not mutate contract revisions.
+ */
+export async function writePhaseEvidence(
+  deps: FactoryStoreDeps,
+  evidence: Omit<FactoryPhaseEvidence, "schema" | "recorded_at"> & {
+    recorded_at?: string;
+  },
+): Promise<FactoryPhaseEvidence> {
+  const dir = factoryRunDir(deps, evidence.factory_run_id);
+  await deps.mkdirp(dir);
+  const doc: FactoryPhaseEvidence = {
+    schema: FACTORY_PHASE_EVIDENCE_SCHEMA,
+    factory_run_id: evidence.factory_run_id,
+    revision: evidence.revision,
+    coarse_phase: evidence.coarse_phase,
+    next_action: evidence.next_action,
+    reason: evidence.reason,
+    service_controller: evidence.service_controller,
+    recorded_at: evidence.recorded_at ?? deps.now().toISOString(),
+    child_disposition: evidence.child_disposition ?? null,
+    replan_reason: evidence.replan_reason ?? null,
+  };
+  await deps.writeFileAtomic(phaseEvidencePath(dir), JSON.stringify(doc, null, 2));
+  await appendEvent(deps, evidence.factory_run_id, "factory_phase_evidence", {
+    revision: doc.revision,
+    coarse_phase: doc.coarse_phase,
+    next_action: doc.next_action,
+    reason: doc.reason,
+    service_controller: doc.service_controller,
+    replan_reason: doc.replan_reason ?? null,
+    child_disposition: doc.child_disposition ?? null,
+  });
+  return doc;
+}
+
+// ---------------------------------------------------------------------------
 // Read-only status (non-mutating)
 // ---------------------------------------------------------------------------
 
@@ -656,17 +737,23 @@ export async function getFactoryStatus(
   if (!rev) return null;
   const claims = await listClaims(deps, factoryRunId);
   const lock = await readFactoryLock(deps, factoryRunId);
+  const phase_evidence = await readPhaseEvidence(deps, factoryRunId);
+  // Prefer durable phase evidence for the current revision when present so
+  // read-only status reconstructs post-tick posture without live observation.
+  const useEvidence =
+    phase_evidence && phase_evidence.revision === rev.revision ? phase_evidence : null;
   return {
     factory_run_id: factoryRunId,
     revision: rev.revision,
     canonical_hash: rev.canonical_hash,
-    coarse_phase: rev.coarse_phase,
-    next_action: rev.next_action,
+    coarse_phase: useEvidence?.coarse_phase ?? rev.coarse_phase,
+    next_action: useEvidence?.next_action ?? rev.next_action,
     completion_policy: rev.completion_policy,
     identities: rev.identities,
     linked_runs: rev.linked_runs,
     claims,
     lock,
+    phase_evidence: phase_evidence,
   };
 }
 

@@ -8,6 +8,7 @@ export const FACTORY_CONTRACT_SCHEMA = "pipeline/factory-execution-contract@1";
 export const FACTORY_CLAIM_SCHEMA = "pipeline/factory-action-claim@1";
 export const FACTORY_CURRENT_SCHEMA = "pipeline/factory-current@1";
 export const FACTORY_LOCK_SCHEMA = "pipeline/factory-lock@1";
+export const FACTORY_PHASE_EVIDENCE_SCHEMA = "pipeline/factory-phase-evidence@1";
 
 /** Service controller identity for this implementation revision. */
 export const FACTORY_SERVICE_CONTROLLER_ID = "factory-macro@1";
@@ -56,6 +57,7 @@ export const FACTORY_NEXT_ACTIONS = [
   "operator_merge",
   "operator_release",
   "observe_engine_pin",
+  "replan_required",
   "factory_idle",
   "none",
 ] as const;
@@ -247,6 +249,37 @@ export class FactoryError extends Error {
 }
 
 // ---------------------------------------------------------------------------
+// Phase evidence (durable, reconstructible for read-only status)
+// ---------------------------------------------------------------------------
+
+/**
+ * Last reconciled coarse phase / next action for a factory run, written by
+ * tick after derivation (including child completion dispositions and replan
+ * posture). Read-only status uses this without mutation or live observation.
+ */
+export interface FactoryPhaseEvidence {
+  readonly schema: typeof FACTORY_PHASE_EVIDENCE_SCHEMA;
+  factory_run_id: string;
+  revision: number;
+  coarse_phase: FactoryCoarsePhase;
+  next_action: FactoryNextAction;
+  reason: string;
+  service_controller: string;
+  recorded_at: string;
+  /** Child completion disposition when the evidence came from a terminal child. */
+  child_disposition?: {
+    kind: "loop" | "advance";
+    run_id: string;
+    state: "completed" | "failed" | "running" | "ambiguous" | "not_found";
+    all_items_terminal?: boolean;
+    all_ready_to_deploy?: boolean;
+    detail?: string;
+  } | null;
+  /** Live-identity mismatch detail when next_action is replan_required. */
+  replan_reason?: string | null;
+}
+
+// ---------------------------------------------------------------------------
 // Status projection (read-only)
 // ---------------------------------------------------------------------------
 
@@ -261,6 +294,8 @@ export interface FactoryStatus {
   linked_runs: FactoryLinkedRuns;
   claims: FactoryActionClaim[];
   lock: FactoryLockRecord | null;
+  /** Durable phase evidence when present (reconstructs post-tick posture). */
+  phase_evidence?: FactoryPhaseEvidence | null;
 }
 
 export interface FactoryEvidenceEvent {
