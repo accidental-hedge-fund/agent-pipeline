@@ -44,3 +44,9 @@ test("clause 4: contract states the cell is an evaluation with no external side 
 test("contract takes precedence over repository workflow instructions", () => {
   assert.match(NORMALIZED, /takes precedence over every other instruction file/i);
 });
+
+test("contract states cooperative validity fence threat model (#637)", () => {
+  assert.match(NORMALIZED, /cooperative-agent validity fence/i);
+  assert.match(NORMALIZED, /not multi-tenant security/i);
+  assert.match(NORMALIZED, /absolute-path escapes/i);
+});

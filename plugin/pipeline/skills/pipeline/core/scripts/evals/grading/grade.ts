@@ -180,6 +180,14 @@ export async function gradeExperiment(
       skipped.push({ ...identity, reason: `fixture "${record.fixture_id}" not found` });
       continue;
     }
+    // Smoke-only fixtures never enter graded quality aggregates (#637).
+    if (fixture.smoke_only) {
+      skipped.push({
+        ...identity,
+        reason: `fixture "${fixture.fixture_id}" is smoke_only — harness/isolation smoke only, not graded`,
+      });
+      continue;
+    }
     if (!graderId) {
       // The manifest's mode has no single applicable grader (e.g.
       // `end-to-end`, `plan-review`), but the executor may still have

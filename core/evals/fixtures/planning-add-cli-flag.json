@@ -9,9 +9,12 @@
       "issue_body": "pipeline doctor always executes its full check suite. Add a --dry-run flag that lists the checks it would run, in order, without running them."
     }
   },
-  "public_checks": ["npm run ci"],
+  "public_checks": [
+    "npm run ci"
+  ],
   "grader_refs": [],
   "category": "cli-feature",
   "risk": "low",
-  "provenance": "synthetic"
+  "provenance": "synthetic",
+  "smoke_only": true
 }

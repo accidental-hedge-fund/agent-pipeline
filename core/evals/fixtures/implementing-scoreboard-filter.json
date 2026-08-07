@@ -8,9 +8,12 @@
       "plan": "1. Add a `since` option to the scoreboard CLI flags.\n2. Filter the loaded run records by `run.started_at >= since` before aggregation.\n3. Add a unit test covering the boundary date."
     }
   },
-  "public_checks": ["npm run ci"],
+  "public_checks": [
+    "npm run ci"
+  ],
   "grader_refs": [],
   "category": "cli-feature",
   "risk": "low",
-  "provenance": "synthetic"
+  "provenance": "synthetic",
+  "smoke_only": true
 }

@@ -148,12 +148,22 @@ export function validateFixture(raw: unknown, sourcePath: string): Fixture {
           `defect ${JSON.stringify(defectId)} is missing "expected_severity"`,
         );
       }
+      // Every seeded defect must declare a runnable biting probe so deep
+      // preflight can prove the defect still fails at the pin (#637 ae1fad38).
+      if (typeof d.biting_probe !== "string" || d.biting_probe.trim().length === 0) {
+        throw new FixtureValidationError(
+          fixtureId,
+          "seeded_defects",
+          `defect ${JSON.stringify(defectId)} is missing "biting_probe" (runnable command that must fail at the pin)`,
+        );
+      }
       return {
         defect_id: defectId,
         path: d.path,
         line_start: d.line_start,
         line_end: d.line_end,
         expected_severity: d.expected_severity,
+        biting_probe: d.biting_probe,
       };
     });
   }
@@ -243,6 +253,43 @@ export function validateFixture(raw: unknown, sourcePath: string): Fixture {
     return { grader: r.grader, version: r.version };
   });
 
+  // smoke_only ⇔ empty grader_refs (#637). Explicit mark is required so smoke
+  // fixtures are distinguishable without reading prose docs alone.
+  const smokeOnlyRaw = obj.smoke_only;
+  let smokeOnly = false;
+  if (smokeOnlyRaw !== undefined) {
+    if (typeof smokeOnlyRaw !== "boolean") {
+      throw new FixtureValidationError(fixtureId, "smoke_only", "must be a boolean when present");
+    }
+    smokeOnly = smokeOnlyRaw;
+  }
+  if (graderRefs.length === 0 && !smokeOnly) {
+    throw new FixtureValidationError(
+      fixtureId,
+      "smoke_only",
+      'empty grader_refs requires an explicit smoke-only mark (set "smoke_only": true)',
+    );
+  }
+  if (graderRefs.length > 0 && smokeOnly) {
+    throw new FixtureValidationError(
+      fixtureId,
+      "smoke_only",
+      "a graded fixture (non-empty grader_refs) cannot be marked smoke_only",
+    );
+  }
+
+  let baseCommitBootstrap: string | undefined;
+  if (obj.base_commit_bootstrap !== undefined) {
+    if (typeof obj.base_commit_bootstrap !== "string" || obj.base_commit_bootstrap.length === 0) {
+      throw new FixtureValidationError(
+        fixtureId,
+        "base_commit_bootstrap",
+        "must be a non-empty string when present",
+      );
+    }
+    baseCommitBootstrap = obj.base_commit_bootstrap;
+  }
+
   const provenance = obj.provenance;
   if (provenance !== "synthetic" && provenance !== "harvested") {
     throw new FixtureValidationError(
@@ -305,12 +352,14 @@ export function validateFixture(raw: unknown, sourcePath: string): Fixture {
     acceptance_criteria: acceptanceCriteria,
     allowed_change_paths: allowedChangePaths,
     grader_refs: graderRefs,
+    smoke_only: smokeOnly,
     category: obj.category as string,
     risk: obj.risk as string,
     provenance,
     environment,
     capability_surface: capabilitySurface,
     env_surface_hash: computeEnvSurfaceHash(environment, capabilitySurface),
+    base_commit_bootstrap: baseCommitBootstrap,
   };
 }
 

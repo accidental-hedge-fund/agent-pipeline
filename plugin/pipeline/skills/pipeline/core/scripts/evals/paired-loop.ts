@@ -14,7 +14,6 @@ import {
 } from "../stages/review-parsing.ts";
 import type { PipelineConfig, ReviewFinding } from "../types.ts";
 import { resolveAdapter } from "../harness-adapters/index.ts";
-import type { EvalGhSurface } from "./gh-eval-surface.ts";
 import {
   detectConflictingReviewerDeclarations,
   materializePairedAdversarialReviewPrompt,
@@ -46,7 +45,7 @@ export interface PairedHarnessInvokeArgs {
   timeoutSec: number;
   model?: string;
   effort?: string;
-  gh: EvalGhSurface;
+  /** PATH deny shim + credential strip for the child — not EvalGhSurface (#637). */
   env?: NodeJS.ProcessEnv;
   sandboxMode?: SandboxMode;
 }
@@ -86,7 +85,6 @@ export interface PairedLoopInput {
   fixture: Fixture;
   manifest: ExperimentManifest;
   worktreeDir: string;
-  gh: EvalGhSurface;
   deps: PairedLoopDeps;
   cellDeadlineMs: number;
   trajectoryActions: string[];
@@ -170,7 +168,7 @@ function resolveRole(
  * restores them only after this returns (for clean checks/changed paths).
  */
 export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedLoopResult> {
-  const { cfg, cell, fixture, manifest, worktreeDir, gh, deps, cellDeadlineMs, trajectoryActions, trajectoryStages } =
+  const { cfg, cell, fixture, manifest, worktreeDir, deps, cellDeadlineMs, trajectoryActions, trajectoryStages } =
     input;
   const mode = cell.mode;
   if (mode !== "implementing-paired" && mode !== "pipeline-paired") {
@@ -403,7 +401,6 @@ export async function runPairedCellLoop(input: PairedLoopInput): Promise<PairedL
         timeoutSec,
         model: resolved.model,
         effort: resolved.effort,
-        gh,
         env: deps.isolationEnv(worktreeDir),
         sandboxMode: manifest.sandbox_mode,
       });

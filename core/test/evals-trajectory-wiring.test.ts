@@ -108,7 +108,7 @@ test("runExperiment: a completed cell's record carries a trajectory_artifact des
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "review output text", stderr: "", duration: 1 }),
   });
-  const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
+  const { manifest, executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution } as RunExperimentDeps);
   assert.equal(executed.length, 1);
   const record = executed[0];
   assert.ok(record.trajectory_artifact, "expected a trajectory_artifact descriptor on the cell record");
@@ -136,7 +136,7 @@ test("runExperiment: the treatment trajectory artifact records each stage's mate
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "review output text", stderr: "", duration: 1 }),
   });
-  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
+  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution } as RunExperimentDeps);
   const descriptor = executed[0].trajectory_artifact!;
   const artifact = JSON.parse(outFiles.get(path.join(FAKE_CFG.repo_dir, descriptor.path))!);
   assert.equal(artifact.stages.length, 1);
@@ -151,7 +151,7 @@ test("runExperiment: a timeout cell's trajectory artifact carries the terminal r
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: false, timed_out: true, exit_code: 0, stdout: "", stderr: "", duration: 60 }),
   });
-  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
+  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution } as RunExperimentDeps);
   assert.equal(executed[0].result_class, "timeout");
   const descriptor = executed[0].trajectory_artifact!;
   const artifact = JSON.parse(outFiles.get(path.join(FAKE_CFG.repo_dir, descriptor.path))!);
@@ -175,7 +175,7 @@ test("runExperiment: an artifact collection failure is durably recorded on the c
       return deps.writeFile(p, content);
     },
   } as RunExperimentDeps;
-  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", failingDeps);
+  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...failingDeps, skipFixturePreflight: true });
   assert.equal(executed.length, 1);
   assert.equal(executed[0].result_class, "completed", "a trajectory collection failure must never change result_class");
   assert.equal(executed[0].trajectory_artifact, undefined);
@@ -198,7 +198,7 @@ test("runExperiment: an API-executor cell also emits a trajectory artifact recor
       result: { success: true, timed_out: false, exit_code: 0, stdout: "api output", stderr: "", duration: 0.5 },
     }),
   });
-  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
+  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution } as RunExperimentDeps);
   assert.equal(executed.length, 1);
   assert.equal(executed[0].detail?.execution_class, "api-key");
   assert.ok(executed[0].trajectory_artifact);
@@ -209,7 +209,7 @@ test("runExperiment: an infra_error cell (never reaches a harness) still gets a 
   const cellExecution = baseCellExecution({
     createWorktree: async () => { throw new Error("git worktree add failed"); },
   });
-  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
+  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution } as RunExperimentDeps);
   assert.equal(executed.length, 1);
   assert.equal(executed[0].result_class, "infra_error");
   assert.ok(executed[0].trajectory_artifact, "even an infra_error cell should get a best-effort trajectory artifact");
@@ -223,7 +223,7 @@ test("runExperiment: tool-call telemetry is always marked unavailable (no harnes
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "ok", stderr: "", duration: 1 }),
   });
-  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
+  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution } as RunExperimentDeps);
   const descriptor = executed[0].trajectory_artifact!;
   const artifact = JSON.parse(outFiles.get(path.join(FAKE_CFG.repo_dir, descriptor.path))!);
   assert.equal(artifact.tool_events.availability.available, false);
@@ -235,7 +235,16 @@ test("runExperiment: hidden checks and seeded-defect ground truth never appear i
   const fixtureText = makeFixtureFile({
     public_checks: ["true"],
     hidden_checks: ["grep -q SEEDED_DEFECT_MARKER src/thing.ts"],
-    seeded_defects: [{ defect_id: "d1", path: "src/thing.ts", line_start: 1, line_end: 2, expected_severity: "high" }],
+    seeded_defects: [
+      {
+        defect_id: "d1",
+        path: "src/thing.ts",
+        line_start: 1,
+        line_end: 2,
+        expected_severity: "high",
+        biting_probe: "false",
+      },
+    ],
   });
   const { deps, outFiles } = makeFakeFs(fixtureText, makeManifestFile());
   const cellExecution = baseCellExecution({
@@ -245,7 +254,7 @@ test("runExperiment: hidden checks and seeded-defect ground truth never appear i
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "no hidden material referenced here", stderr: "", duration: 1 }),
     runChecks: async () => ({ true: true, "grep -q SEEDED_DEFECT_MARKER src/thing.ts": true }),
   });
-  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
+  const { executed } = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution } as RunExperimentDeps);
   const descriptor = executed[0].trajectory_artifact!;
   const raw = outFiles.get(path.join(FAKE_CFG.repo_dir, descriptor.path))!;
   assert.doesNotMatch(raw, /SEEDED_DEFECT_MARKER/);
@@ -264,19 +273,28 @@ test("runExperiment: resume never rewrites an existing trajectory artifact", asy
     preflight: async () => ({ ok: true }),
     invokeHarness: async () => ({ success: true, timed_out: false, exit_code: 0, stdout: "stable output", stderr: "", duration: 1 }),
   });
-  const first = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
+  const first = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution } as RunExperimentDeps);
   const descriptor = first.executed[0].trajectory_artifact!;
   const absPath = path.join(FAKE_CFG.repo_dir, descriptor.path);
   const contentAfterFirst = outFiles.get(absPath);
 
-  const second = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, cellExecution } as RunExperimentDeps);
+  const second = await runExperiment(FAKE_CFG, "/manifest.json", "/fixtures", { ...deps, skipFixturePreflight: true, cellExecution } as RunExperimentDeps);
   assert.equal(second.executed.length, 0, "resume must not re-execute the completed cell");
   assert.equal(outFiles.get(absPath), contentAfterFirst, "the artifact file must be byte-identical after resume");
 });
 
 test("gradeExperiment: a grade record carries a verifier_artifact descriptor whose hash verifies, and evidence includes seeded defects (verifier-only material permitted here)", async () => {
   const fixtureText = makeFixtureFile({
-    seeded_defects: [{ defect_id: "d1", path: "src/thing.ts", line_start: 1, line_end: 2, expected_severity: "high" }],
+    seeded_defects: [
+      {
+        defect_id: "d1",
+        path: "src/thing.ts",
+        line_start: 1,
+        line_end: 2,
+        expected_severity: "high",
+        biting_probe: "false",
+      },
+    ],
   });
   const manifestText = makeManifestFile();
   const runsRecord: CellRecord = {

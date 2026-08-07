@@ -15,17 +15,24 @@
       "path": "core/scripts/gh.ts",
       "line_start": 701,
       "line_end": 702,
-      "expected_severity": "high"
+      "expected_severity": "high",
+      "biting_probe": "test -n \"${EVAL_PREFLIGHT_REVIEW_DIFF:-}\" && ! grep -Fq 'result.number ?? -1' \"$EVAL_PREFLIGHT_REVIEW_DIFF\""
     },
     {
       "defect_id": "gh-ts-missing-regression-test",
       "path": "core/test/gh.test.ts",
       "line_start": 1,
       "line_end": 5,
-      "expected_severity": "medium"
+      "expected_severity": "medium",
+      "biting_probe": "test -n \"${EVAL_PREFLIGHT_REVIEW_DIFF:-}\" && grep -E '^diff --git .*/gh\\.test\\.ts' \"$EVAL_PREFLIGHT_REVIEW_DIFF\""
     }
   ],
-  "grader_refs": [{ "grader": "review", "version": "1" }],
+  "grader_refs": [
+    {
+      "grader": "review",
+      "version": "1"
+    }
+  ],
   "category": "review-defect-detection",
   "risk": "medium",
   "provenance": "synthetic"

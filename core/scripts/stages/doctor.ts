@@ -808,6 +808,64 @@ export function buildPreflightChecks(
     },
   });
 
+  // 8b. Eval fixture integrity (static, model-free) — every committed corpus
+  //     fixture under core/evals/fixtures must have a reachable base_commit,
+  //     valid smoke_only labeling (via loader), and path-token sanity (#637).
+  //     Failures are infrastructure, not quality signals.
+  checks.push({
+    id: "eval-fixture-integrity",
+    description: "Committed eval fixtures have reachable base_commit pins and valid path tokens",
+    run: async (deps) => {
+      const fixturesDir = path.join(config.repo_dir, "core", "evals", "fixtures");
+      if (!(await deps.fsExists(fixturesDir))) {
+        return skip("no core/evals/fixtures directory — eval fixture integrity is not applicable");
+      }
+      const names = (await deps.listDirNames(fixturesDir)) ?? [];
+      const jsonNames = names.filter((n) => n.endsWith(".json"));
+      if (jsonNames.length === 0) {
+        return skip("core/evals/fixtures has no JSON fixtures");
+      }
+      // Lazy-import so doctor stays light when the suite is absent; pure
+      // validation + injectable cat-file (no model call).
+      const { loadFixture } = await import("../evals/fixture.ts");
+      const { runStaticCorpusPreflight, formatPreflightFailures } = await import("../evals/preflight.ts");
+      const fixtures = [];
+      for (const name of jsonNames) {
+        const filePath = path.join(fixturesDir, name);
+        const text = await deps.readTextFile(filePath);
+        if (text === null) {
+          return fail(
+            `could not read fixture ${name}`,
+            `Ensure ${filePath} is readable.`,
+          );
+        }
+        try {
+          fixtures.push(loadFixture(filePath, { readFile: () => text }));
+        } catch (err) {
+          return fail(
+            `fixture loader rejected ${name}: ${(err as Error).message}`,
+            `Fix the fixture contract fields (smoke_only, base_commit, grader_refs) on ${name}.`,
+          );
+        }
+      }
+      const catFile = async (sha: string): Promise<string | null> => {
+        const res = await deps.exec("git", ["-C", config.repo_dir, "cat-file", "-t", sha]);
+        if (!res.ok) return null;
+        const t = res.stdout.trim();
+        return t || null;
+      };
+      const result = await runStaticCorpusPreflight(fixtures, { catFile, repoDir: config.repo_dir });
+      if (result.ok) {
+        return pass(`${fixtures.length} eval fixture(s) pass static integrity preflight`);
+      }
+      const detail = formatPreflightFailures(result.failures);
+      return fail(
+        `eval fixture integrity failed (${result.failures.length}): ${detail}`,
+        "Fetch missing base_commit objects (full clone), fix path tokens to core/test/..., mark empty grader_refs fixtures smoke_only, or repair allowed_change_paths for plugin/ mirror outputs.",
+      );
+    },
+  });
+
   // 9. Eval command (conditional) — when the eval gate is enabled with a
   //    configured command, verify its binary resolves on PATH (without running it).
   checks.push({

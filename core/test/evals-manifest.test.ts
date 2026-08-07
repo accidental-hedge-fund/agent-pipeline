@@ -28,6 +28,7 @@ function makeFixture(id: string, sha: string, stage: string): Fixture {
       stage_entry_artifacts: { [stage]: { x: 1 } },
       public_checks: [],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",

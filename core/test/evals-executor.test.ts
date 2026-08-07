@@ -76,6 +76,7 @@ function makeFixture(id = "f1", stage = "review", environment?: unknown[]): Fixt
       stage_entry_artifacts: { [stage]: { diff: "..." } },
       public_checks: [],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -298,20 +299,25 @@ test("runCell: no production GitHub write occurs for a normal cell — ghRefusal
   assert.deepEqual(result.ghRefusals, []);
 });
 
-test("runCell: a stage that attempts a mutating GitHub call is refused and the refusal is recorded", async () => {
+test("runCell: local-CLI invoke path does not inject EvalGhSurface; write denial is process env (#637)", async () => {
+  let seenArgs: { gh?: unknown; env?: NodeJS.ProcessEnv } | undefined;
   const deps: CellExecutionDeps = {
     createWorktree: async (_c, o) => o,
     removeWorktree: async () => {},
     preflight: async () => ({ ok: true }),
     invokeHarness: async (args) => {
-      await assert.rejects(() => args.gh.addLabel(1, "pipeline:ready-to-deploy"));
+      seenArgs = args as { gh?: unknown; env?: NodeJS.ProcessEnv };
       return successResult();
     },
   };
   const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
   assert.equal(result.outcome.result_class, "completed");
-  assert.equal(result.ghRefusals.length, 1);
-  assert.equal(result.ghRefusals[0].operation, "addLabel");
+  // Ornamental gh threading removed — local-CLI children use PATH + credentials.
+  assert.equal((seenArgs as { gh?: unknown }).gh, undefined);
+  assert.ok(seenArgs?.env);
+  assert.equal(seenArgs!.env!.GH_TOKEN, "");
+  assert.equal(seenArgs!.env!.GITHUB_TOKEN, "");
+  assert.equal(result.ghRefusals.length, 0);
 });
 
 test("runCell: two replicates of the same treatment get distinct worktrees/branches", async () => {
@@ -495,6 +501,7 @@ test("runCell: an end-to-end cell shares one deadline across stages, not a fresh
       stage_entry_artifacts: { planning: { a: 1 }, review: { b: 2 } },
       public_checks: [],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -543,6 +550,7 @@ test("runCell: an end-to-end cell that exhausts its deadline mid-run times out w
       stage_entry_artifacts: { planning: { a: 1 }, review: { b: 2 } },
       public_checks: [],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -595,6 +603,7 @@ test("runCell: stage-mode invokes exactly one stage (never the other five)", asy
       },
       public_checks: [],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -627,6 +636,7 @@ test("runCell: checks are run and recorded in detail.checks only when the fixtur
       public_checks: ["npm run ci"],
       hidden_checks: ["node --test hidden.test.ts"],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -659,6 +669,7 @@ test("runCell: checks that would overrun the cell deadline classify as timeout, 
       stage_entry_artifacts: { review: { diff: "..." } },
       public_checks: ["npm run ci"],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -709,6 +720,7 @@ test("runCell: check execution is capped by the cell's remaining deadline, not a
       stage_entry_artifacts: { review: { diff: "..." } },
       public_checks: ["npm run ci"],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -757,6 +769,7 @@ test("runCell: no hidden check name ever reaches the materialized prompt sent to
       public_checks: ["npm run ci"],
       hidden_checks: ["node --test the-hidden-marker-check.ts"],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -796,6 +809,7 @@ test("runCell: changed_paths is recorded only when the fixture declares an allow
       public_checks: [],
       allowed_change_paths: ["core/scripts/gh.ts"],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -1088,7 +1102,14 @@ function fixtureReviewWithDefect(): Fixture {
       stage_entry_artifacts: { review: { diff: "..." } },
       public_checks: [],
       seeded_defects: [
-        { defect_id: "d1", path: "a.ts", line_start: 10, line_end: 12, expected_severity: "high" },
+        {
+          defect_id: "d1",
+          path: "a.ts",
+          line_start: 10,
+          line_end: 12,
+          expected_severity: "high",
+          biting_probe: "false",
+        },
       ],
       grader_refs: [{ grader: "review", version: "1" }],
       category: "c",
@@ -1122,6 +1143,7 @@ test("materializeStagePrompt: non-review stages are byte-identical to their pre-
       },
       public_checks: [],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -1218,9 +1240,17 @@ test("runCell: a review stage inside an end-to-end cell receives the contract-be
       stage_entry_artifacts: { planning: { a: 1 }, review: { diff: "..." } },
       public_checks: [],
       seeded_defects: [
-        { defect_id: "d1", path: "a.ts", line_start: 10, line_end: 12, expected_severity: "high" },
+        {
+          defect_id: "d1",
+          path: "a.ts",
+          line_start: 10,
+          line_end: 12,
+          expected_severity: "high",
+          biting_probe: "false",
+        },
       ],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -1418,6 +1448,7 @@ test("runCell: an end-to-end mode with an API treatment is rejected as infra_err
       stage_entry_artifacts: { planning: {}, review: { diff: "..." } },
       public_checks: [],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -1790,6 +1821,7 @@ test("runCell: contract paths never appear in changed_paths, even if the real di
       public_checks: [],
       allowed_change_paths: ["core/scripts/gh.ts"],
       grader_refs: [],
+      smoke_only: true,
       category: "c",
       risk: "low",
       provenance: "synthetic",
@@ -1859,10 +1891,7 @@ test("runCell: a process-boundary denial is recorded on the trajectory's diagnos
     createWorktree: async (_c, o) => o,
     removeWorktree: async () => {},
     preflight: async () => ({ ok: true }),
-    invokeHarness: async (args) => {
-      await assert.rejects(() => args.gh.addLabel(1, "pipeline:ready-to-deploy"));
-      return successResult();
-    },
+    invokeHarness: async () => successResult(),
     readBoundaryDenials: () => [
       { command: "git", argv: ["worktree", "add", "../nested"], category: "nested-worktree", at: "2026-01-01T00:00:00.000Z" },
     ],
@@ -1871,10 +1900,6 @@ test("runCell: a process-boundary denial is recorded on the trajectory's diagnos
   assert.ok(
     result.trajectory.actions.some((a) => a.includes("nested-worktree")),
     "the process-boundary denial must be recorded on the trajectory's diagnostic actions list",
-  );
-  assert.ok(
-    result.trajectory.actions.some((a) => a.includes("addLabel")),
-    "the gh-surface refusal must be recorded on the trajectory's diagnostic actions list",
   );
 });
 
@@ -1890,19 +1915,23 @@ test("runCell: no denials and no gh refusals → boundaryEvidence is absent, not
   assert.equal(result.boundaryEvidence, undefined);
 });
 
-test("runCell: a gh refusal reaches boundaryEvidence.gh_refusals alongside any process denials", async () => {
+test("runCell: process-boundary denials reach boundaryEvidence without EvalGhSurface injection (#637)", async () => {
   const deps: CellExecutionDeps = {
     createWorktree: async (_c, o) => o,
     removeWorktree: async () => {},
     preflight: async () => ({ ok: true }),
-    invokeHarness: async (args) => {
-      await assert.rejects(() => args.gh.addLabel(1, "pipeline:ready-to-deploy"));
-      return successResult();
-    },
+    invokeHarness: async () => successResult(),
+    readBoundaryDenials: () => [
+      { command: "gh", argv: ["issue", "create"], category: "github-write", at: "2026-01-01T00:00:00.000Z" },
+    ],
   };
   const result = await runCell(FAKE_CFG, makeCell(), makeFixture(), MANIFEST, deps);
-  assert.equal(result.boundaryEvidence?.gh_refusals.length, 1);
-  assert.equal(result.boundaryEvidence?.gh_refusals[0].operation, "addLabel");
+  assert.equal(result.outcome.result_class, "completed");
+  assert.equal(result.boundaryEvidence?.denials.length, 1);
+  assert.equal(result.boundaryEvidence?.denials[0].category, "github-write");
+  // No in-process surface on local-CLI path — gh_refusals stays empty unless
+  // evaluator-owned code invokes createEvalGhSurface (unit-tested separately).
+  assert.equal(result.boundaryEvidence?.gh_refusals.length, 0);
 });
 
 test("runCell: a boundary-evidence collection failure is reported distinctly, never as 'no denials'", async () => {

@@ -9,9 +9,12 @@
       "ci_status": "passing"
     }
   },
-  "public_checks": ["npm run ci"],
+  "public_checks": [
+    "npm run ci"
+  ],
   "grader_refs": [],
   "category": "release-verification",
   "risk": "low",
-  "provenance": "synthetic"
+  "provenance": "synthetic",
+  "smoke_only": true
 }

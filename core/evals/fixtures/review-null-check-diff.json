@@ -12,5 +12,6 @@
   "grader_refs": [],
   "category": "review-defect-detection",
   "risk": "medium",
-  "provenance": "synthetic"
+  "provenance": "synthetic",
+  "smoke_only": true
 }

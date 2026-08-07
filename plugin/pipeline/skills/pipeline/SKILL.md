@@ -354,10 +354,18 @@ yet, in seed-derived order interleaved across harnesses, each in a **fresh
 worktree checked out at the fixture's `base_commit`** (never the current
 branch head) — no two cells, including replicates, share a worktree, branch,
 or session. **Evaluation mode performs zero production GitHub writes**: no
-label, comment, PR, or push — the gh surface used in this mode refuses every
-mutating call rather than relying on a scattered `if (!evalMode)` check.
-Interrupting and re-running `evals run` never re-executes a completed cell or
-rewrites an existing `runs.jsonl`/`failures.jsonl` line.
+label, comment, PR, or push. Local-CLI cells enforce that at the **process
+boundary** (PATH deny shim for `gh`/`git push|commit|worktree`/`pipeline`) and
+by **stripping write credentials** from the harness child env — not by injecting
+a TypeScript `EvalGhSurface` into the child. In-process evaluator code that
+accepts a `gh` dependency still uses a refuse-and-record surface. Isolation is a
+**cooperative-agent validity fence** for measurement correctness, not multi-tenant
+OS security (absolute-path escapes / UID sandbox: deferred). Before treatments,
+`evals run` runs **fixture integrity preflight** (reachable `base_commit`, path
+tokens, baseline/biting probes) and classifies failures as infrastructure.
+Empty-`grader_refs` fixtures must set `smoke_only: true` and never enter graded
+quality aggregates. Interrupting and re-running `evals run` never re-executes a
+completed cell or rewrites an existing `runs.jsonl`/`failures.jsonl` line.
 
 Results land under `<output_dir>/<experiment-id>/`: `manifest.json` (the
 resolved manifest as executed), `plan.json`, `runs.jsonl` (append-only,

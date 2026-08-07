@@ -9,17 +9,33 @@
       "severity": "block"
     }
   },
-  "public_checks": ["npm run ci"],
-  "hidden_checks": ["node --test test/gh.test.ts -- --grep createIssue"],
+  "public_checks": [
+    "npm run ci"
+  ],
+  "hidden_checks": [
+    "node --test core/test/gh.test.ts -- --grep createIssue"
+  ],
   "acceptance_criteria": [
     {
       "id": "null-guard-added",
       "statement": "createIssue throws or returns a typed error when result.number is missing, instead of coercing to NaN.",
-      "check_names": ["node --test test/gh.test.ts -- --grep createIssue"]
+      "check_names": [
+        "node --test core/test/gh.test.ts -- --grep createIssue"
+      ]
     }
   ],
-  "allowed_change_paths": ["core/scripts/gh.ts", "core/test/gh.test.ts"],
-  "grader_refs": [{ "grader": "implementation-fix", "version": "1" }],
+  "allowed_change_paths": [
+    "core/scripts/gh.ts",
+    "core/test/gh.test.ts",
+    "plugin/scripts/gh.ts",
+    "plugin/test/gh.test.ts"
+  ],
+  "grader_refs": [
+    {
+      "grader": "implementation-fix",
+      "version": "1"
+    }
+  ],
   "category": "review-fix-application",
   "risk": "medium",
   "provenance": "synthetic"

@@ -1,8 +1,11 @@
-// The evaluation-mode GitHub surface (openspec/changes/stage-eval-runner, design.md
-// decision 4): a `gh` seam that REFUSES every mutating operation and records the
-// refusal, rather than relying on scattered `if (!evalMode)` guards at each call
-// site. Any stage invoked in evaluation mode that is wired to this surface cannot
-// perform a production write even if it tries.
+// Evaluation-mode in-process GitHub surface (#607 / #637).
+//
+// Refuse-and-record seam for evaluator-owned *in-process* code that accepts a
+// `gh` dependency. Local-CLI harness children do NOT receive this object —
+// child write denial is enforced by the PATH deny shim + credential strip
+// (boundary-shim / isolatedGhEnv), not by injecting EvalGhSurface into the
+// external process. Keep this module for in-process seams and unit tests;
+// do not thread it ornamentally through harness invoke args.
 
 export class GhWriteRefusedError extends Error {
   readonly operation: string;
@@ -66,9 +69,9 @@ export type EvalGhSurface = {
 };
 
 /** Build a `gh` surface where every mutating operation refuses and records
- *  the attempt instead of executing. Read operations are deliberately not
- *  part of this surface — a fixture's frozen issue/PR snapshot is local data,
- *  and evaluation mode restricts writes, not reads (design.md decision 4). */
+ *  the attempt instead of executing. For in-process evaluator code only —
+ *  not injected into local-CLI harness children (see module header). Read
+ *  operations are deliberately not part of this surface. */
 export function createEvalGhSurface(recorder: GhRefusalRecorder): EvalGhSurface {
   const surface = {} as EvalGhSurface;
   for (const op of MUTATING_GH_OPERATIONS) {
