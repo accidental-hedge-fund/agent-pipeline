@@ -80,18 +80,30 @@ export interface FactoryMacroDeps {
     observed?: FactoryGithubIdentitySnapshot;
   }>;
   now(): Date;
-  /** Start/resume durable loop as whole-run (never per-stage). */
+  /**
+   * Start/resume durable loop as whole-run (never per-stage).
+   * Implementations MUST be durable-idempotent on `action_id`: a second call
+   * with the same action_id MUST return the same loop_run_id and MUST NOT
+   * create a second authoritative loop run.
+   */
   startOrResumeLoop(input: {
     factory_run_id: string;
     revision: number;
     loop_run_id: string | null;
     action_id: string;
   }): Promise<{ loop_run_id: string }>;
+  /**
+   * Resolve a loop previously started under a durable factory action_id.
+   * Required so restart after a lost/timeout start response can reconcile
+   * before any re-invocation of {@link startOrResumeLoop}.
+   */
+  lookupLoopByActionId(action_id: string): Promise<{ loop_run_id: string } | null>;
   observeLoop(loopRunId: string): Promise<ChildRunStatus>;
   /**
    * Whole-issue advance child. Optional only for loop-only deps construction;
    * when derivation selects start/resume/observe advance, both advance seams
    * MUST be present or the tick fails closed (no silent strand).
+   * Start MUST be durable-idempotent on `action_id` (same contract as loop).
    */
   startOrResumeAdvance?(input: {
     factory_run_id: string;
@@ -100,6 +112,11 @@ export interface FactoryMacroDeps {
     issue_id: string;
     action_id: string;
   }): Promise<{ advance_run_id: string }>;
+  /**
+   * Resolve an advance run previously started under a durable action_id.
+   * Required whenever {@link startOrResumeAdvance} is provided.
+   */
+  lookupAdvanceByActionId?(action_id: string): Promise<{ advance_run_id: string } | null>;
   observeAdvance?(advanceRunId: string): Promise<ChildRunStatus>;
   /**
    * Intentional isolation: merge/release mutation functions MUST NOT be present
@@ -208,6 +225,16 @@ export function derivePhaseAndNextAction(input: DeriveInput): DeriveResult {
       if (live.loop?.state === "running") {
         return { coarse_phase: "executing", next_action: "observe_loop", reason: "open claim; loop running" };
       }
+      // Ambiguous start with no durable child link: stay on start/resume so the
+      // same action_id is reconciled (lookup-before-retry) rather than switching
+      // to a different observe action_id that cannot recover the lost response.
+      if (c.state === "ambiguous_reconcile" && !c.child_run_id) {
+        return {
+          coarse_phase: contract.coarse_phase === "intake" ? "adopted" : "executing",
+          next_action: c.action === "resume_loop" ? "resume_loop" : "start_loop",
+          reason: "ambiguous child start — reconcile by action_id before retry",
+        };
+      }
       if (live.loop?.state === "ambiguous" || c.state === "ambiguous_reconcile") {
         return {
           coarse_phase: "executing",
@@ -237,6 +264,14 @@ export function derivePhaseAndNextAction(input: DeriveInput): DeriveResult {
     if (c.action === "start_advance" || c.action === "resume_advance" || c.action === "observe_advance") {
       if (live.advance?.state === "running") {
         return { coarse_phase: "executing", next_action: "observe_advance", reason: "advance running" };
+      }
+      // Ambiguous start with no durable child link: stay on start/resume action_id.
+      if (c.state === "ambiguous_reconcile" && !c.child_run_id) {
+        return {
+          coarse_phase: "executing",
+          next_action: c.action === "resume_advance" ? "resume_advance" : "start_advance",
+          reason: "ambiguous child start — reconcile by action_id before retry",
+        };
       }
       // Match the loop path: ambiguous live status or claim state stays on
       // observe_advance — never fall through to contract snapshot (which may
@@ -481,8 +516,8 @@ const NON_DISPATCH_ACTIONS = new Set<FactoryNextAction>([
 ]);
 
 /**
- * When derivation selects an advance whole-item action, both advance seams
- * must be present. Returns a fail-closed reason string, or null when ok.
+ * When derivation selects an advance whole-item action, start/status/lookup
+ * seams must be present. Returns a fail-closed reason string, or null when ok.
  */
 function advanceSeamRequirement(
   nextAction: FactoryNextAction,
@@ -492,10 +527,14 @@ function advanceSeamRequirement(
     nextAction === "start_advance" ||
     nextAction === "resume_advance"
   ) {
-    if (deps.startOrResumeAdvance == null || deps.observeAdvance == null) {
+    if (
+      deps.startOrResumeAdvance == null ||
+      deps.observeAdvance == null ||
+      deps.lookupAdvanceByActionId == null
+    ) {
       return (
-        "single-item advance path requires startOrResumeAdvance and observeAdvance seams — " +
-        "replan to a loop-linked contract or provide advance child seams"
+        "single-item advance path requires startOrResumeAdvance, observeAdvance, and " +
+        "lookupAdvanceByActionId seams — replan to a loop-linked contract or provide advance child seams"
       );
     }
   }
@@ -1064,8 +1103,9 @@ async function tickFactoryLocked(
       child_run_id = child.run_id;
     }
   } else if (isChildStartAction && !claim.child_run_id) {
-    // Exclusive dispatch lease, or recovery of an unfinished lease after a
-    // crash between child creation and durable child_run_id write.
+    // Exclusive dispatch lease, or recovery of an unfinished / ambiguous lease
+    // after a crash or lost start response. Always lookup-by-action_id before
+    // any start retry so a successful-but-unacked create cannot double-dispatch.
     const lease = await tryAcquireOrRecoverDispatchLease(
       deps.store,
       factoryRunId,
@@ -1074,52 +1114,100 @@ async function tickFactoryLocked(
     );
     if (lease.acquired) {
       if (derived.next_action === "start_loop" || derived.next_action === "resume_loop") {
-        const result = await deps.startOrResumeLoop({
-          factory_run_id: factoryRunId,
-          revision: contract.revision,
-          loop_run_id: loopId,
-          action_id: actionId,
-        });
-        child_run_id = result.loop_run_id;
-        dispatched = true;
-        // Crash window: child exists but claim not yet updated — recovery
-        // re-dispatches with the same action_id (idempotent child start).
-        if (deps._fault?.crashAfterChildStart) {
-          throw new FactoryError("validation", "injected fault: crash after child start");
+        const lookedUp = await deps.lookupLoopByActionId(actionId);
+        if (lookedUp) {
+          child_run_id = lookedUp.loop_run_id;
+          await updateClaim(deps.store, factoryRunId, actionId, {
+            state: "started",
+            child_run_id: lookedUp.loop_run_id,
+            outcome_detail: "reconciled via action_id lookup (no re-start)",
+          });
+        } else {
+          try {
+            const result = await deps.startOrResumeLoop({
+              factory_run_id: factoryRunId,
+              revision: contract.revision,
+              loop_run_id: loopId,
+              action_id: actionId,
+            });
+            child_run_id = result.loop_run_id;
+            dispatched = true;
+            // Crash window: child exists but claim not yet updated — recovery
+            // looks up by action_id before any start retry.
+            if (deps._fault?.crashAfterChildStart) {
+              throw new FactoryError("validation", "injected fault: crash after child start");
+            }
+            await updateClaim(deps.store, factoryRunId, actionId, {
+              state: "started",
+              child_run_id: result.loop_run_id,
+            });
+          } catch (err) {
+            // Lost/timeout/rejected response: do not leave a bare claimed lease
+            // that free-retries start. Record ambiguous_reconcile so the next
+            // tick reconciles via lookup before any re-invocation.
+            if (deps._fault?.crashAfterChildStart && err instanceof FactoryError) {
+              throw err;
+            }
+            const detail =
+              err instanceof Error ? err.message : "child start failed with unknown error";
+            await updateClaim(deps.store, factoryRunId, actionId, {
+              state: "ambiguous_reconcile",
+              outcome_detail: `ambiguous child start: ${detail}`,
+            });
+            // Soft-return: durable claim records ambiguity; caller re-ticks.
+          }
         }
-        await updateClaim(deps.store, factoryRunId, actionId, {
-          state: "started",
-          child_run_id: result.loop_run_id,
-        });
       } else if (
         derived.next_action === "start_advance" ||
         derived.next_action === "resume_advance"
       ) {
         // Seam presence already validated above; defense-in-depth fail closed.
-        if (!deps.startOrResumeAdvance) {
+        if (!deps.startOrResumeAdvance || !deps.lookupAdvanceByActionId) {
           await updateClaim(deps.store, factoryRunId, actionId, {
             state: "failed",
             outcome_detail:
-              "startOrResumeAdvance seam unavailable for single-item advance dispatch",
+              "startOrResumeAdvance / lookupAdvanceByActionId seams unavailable for single-item advance dispatch",
           });
         } else {
-          const issueId = contract.issue_ids[0] ?? "0";
-          const result = await deps.startOrResumeAdvance({
-            factory_run_id: factoryRunId,
-            revision: contract.revision,
-            advance_run_id: advanceId,
-            issue_id: issueId,
-            action_id: actionId,
-          });
-          child_run_id = result.advance_run_id;
-          dispatched = true;
-          if (deps._fault?.crashAfterChildStart) {
-            throw new FactoryError("validation", "injected fault: crash after child start");
+          const lookedUp = await deps.lookupAdvanceByActionId(actionId);
+          if (lookedUp) {
+            child_run_id = lookedUp.advance_run_id;
+            await updateClaim(deps.store, factoryRunId, actionId, {
+              state: "started",
+              child_run_id: lookedUp.advance_run_id,
+              outcome_detail: "reconciled via action_id lookup (no re-start)",
+            });
+          } else {
+            try {
+              const issueId = contract.issue_ids[0] ?? "0";
+              const result = await deps.startOrResumeAdvance({
+                factory_run_id: factoryRunId,
+                revision: contract.revision,
+                advance_run_id: advanceId,
+                issue_id: issueId,
+                action_id: actionId,
+              });
+              child_run_id = result.advance_run_id;
+              dispatched = true;
+              if (deps._fault?.crashAfterChildStart) {
+                throw new FactoryError("validation", "injected fault: crash after child start");
+              }
+              await updateClaim(deps.store, factoryRunId, actionId, {
+                state: "started",
+                child_run_id: result.advance_run_id,
+              });
+            } catch (err) {
+              if (deps._fault?.crashAfterChildStart && err instanceof FactoryError) {
+                throw err;
+              }
+              const detail =
+                err instanceof Error ? err.message : "child start failed with unknown error";
+              await updateClaim(deps.store, factoryRunId, actionId, {
+                state: "ambiguous_reconcile",
+                outcome_detail: `ambiguous child start: ${detail}`,
+              });
+            }
           }
-          await updateClaim(deps.store, factoryRunId, actionId, {
-            state: "started",
-            child_run_id: result.advance_run_id,
-          });
         }
       }
     }
@@ -1193,8 +1281,10 @@ export async function factoryStatus(
  */
 export const FACTORY_CHILD_OPERATIONS = [
   "startOrResumeLoop",
+  "lookupLoopByActionId",
   "observeLoop",
   "startOrResumeAdvance",
+  "lookupAdvanceByActionId",
   "observeAdvance",
 ] as const;
 

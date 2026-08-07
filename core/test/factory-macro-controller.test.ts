@@ -259,13 +259,17 @@ function makeMacroDeps(
     now: () => store.now(),
     startOrResumeLoop: async ({ loop_run_id, factory_run_id, action_id }) => {
       startCalls.push(`loop:${loop_run_id ?? "new"}:${factory_run_id}:${action_id}`);
-      // Idempotent on action_id — crash recovery re-entry must not mint a second child.
+      // Durable-idempotent on action_id — start must not mint a second child.
       const existing = startedByActionId.get(action_id);
       const id = existing ?? loop_run_id ?? `loop-from-${factory_run_id}`;
       startedByActionId.set(action_id, id);
       loopStatus = { state: "running", run_id: id };
       children.set(id, loopStatus);
       return { loop_run_id: id };
+    },
+    lookupLoopByActionId: async (action_id) => {
+      const id = startedByActionId.get(action_id);
+      return id ? { loop_run_id: id } : null;
     },
     observeLoop: async (id) => {
       if (children.has(id)) return children.get(id)!;
@@ -292,6 +296,10 @@ function makeMacroDeps(
       advanceStatus = { state: "running", run_id: id };
       children.set(id, advanceStatus);
       return { advance_run_id: id };
+    };
+    deps.lookupAdvanceByActionId = async (action_id) => {
+      const id = startedByActionId.get(action_id);
+      return id ? { advance_run_id: id } : null;
     };
     deps.observeAdvance = async (id) => {
       if (children.has(id)) return children.get(id)!;
@@ -698,7 +706,7 @@ test("crash after claim: restart does not free second concurrent dispatch", asyn
   assert.equal(starts.length, 1);
 });
 
-test("crash after child start (before claim update): restart recovers unfinished lease", async () => {
+test("crash after child start (before claim update): restart reconciles via action_id lookup", async () => {
   const { deps } = fakeStore();
   await adoptFresh(deps, {
     linked_runs: {
@@ -719,21 +727,74 @@ test("crash after child start (before claim update): restart recovers unfinished
   await assert.rejects(() => tickFactory(faulting, "frun-1", { repoDir: "/repo" }));
   assert.equal(starts.length, 1);
   // Child was created but claim has no child_run_id; dispatch lease is held.
-  // Restart must recover the unfinished lease with the same action_id — not strand.
+  // Restart must lookup by action_id and link without a second start invocation.
   const resume = makeMacroDeps(deps, {
     startCalls: starts,
     loopStatus: { state: "not_found" },
     startedByActionId,
   });
   const t = await tickFactory(resume, "frun-1", { repoDir: "/repo" });
-  assert.equal(t.dispatched, true);
-  assert.equal(starts.length, 2); // re-entry with same action_id (idempotent)
+  assert.equal(t.dispatched, false); // lookup link, not a new start side-effect
+  assert.equal(starts.length, 1); // no second start
   assert.ok(t.child_run_id);
   assert.equal(startedByActionId.get("r1-start_loop-0"), t.child_run_id);
   // Third tick must not start again once child is linked
   const t2 = await tickFactory(resume, "frun-1", { repoDir: "/repo" });
   assert.equal(t2.dispatched, false);
-  assert.equal(starts.length, 2);
+  assert.equal(starts.length, 1);
+});
+
+test("timeout after child creation: marks ambiguous_reconcile and lookup prevents double start", async () => {
+  const { deps } = fakeStore();
+  await adoptFresh(deps, {
+    linked_runs: {
+      loop_run_id: null,
+      loop_contract_hash: null,
+      advance_run_id: null,
+      legacy_run_identity: null,
+    },
+  });
+  const starts: string[] = [];
+  const startedByActionId = new Map<string, string>();
+  let startCount = 0;
+  // Non-idempotent starter: each call mints a new id unless we prevent re-entry.
+  // Proves the controller must not re-invoke start after a lost response when
+  // lookup can recover the first child.
+  const timeouting: FactoryMacroDeps = {
+    store: deps,
+    observeBaseSha: async () => "abc123deadbeef",
+    observeRepoIdentity: async () => ({ name: "acme/widgets", base_branch: "main" }),
+    observeGithubSnapshot: async ({ contracted }) => ({ ok: true, observed: contracted }),
+    readConfigFingerprints: async () => DEFAULT_FINGERPRINTS,
+    now: () => deps.now(),
+    startOrResumeLoop: async ({ action_id }) => {
+      startCount += 1;
+      starts.push(`start#${startCount}:${action_id}`);
+      const id = `loop-created-${startCount}`;
+      startedByActionId.set(action_id, id);
+      // Child exists under action_id, but response is lost (timeout).
+      throw new Error("timeout after child creation");
+    },
+    lookupLoopByActionId: async (action_id) => {
+      const id = startedByActionId.get(action_id);
+      return id ? { loop_run_id: id } : null;
+    },
+    observeLoop: async (id) => ({ state: "running", run_id: id }),
+  };
+  const t1 = await tickFactory(timeouting, "frun-1", { repoDir: "/repo" });
+  assert.equal(startCount, 1);
+  assert.equal(t1.dispatched, false);
+  assert.equal(t1.claim?.state, "ambiguous_reconcile");
+  assert.equal(t1.child_run_id, null);
+  assert.match(t1.claim?.outcome_detail ?? "", /timeout after child creation/);
+
+  // Restart: must reconcile via lookup, never mint loop-created-2.
+  const t2 = await tickFactory(timeouting, "frun-1", { repoDir: "/repo" });
+  assert.equal(startCount, 1, "must not re-invoke start after ambiguous timeout");
+  assert.equal(t2.dispatched, false);
+  assert.equal(t2.child_run_id, "loop-created-1");
+  assert.equal(t2.claim?.state, "started");
+  assert.equal(startedByActionId.size, 1);
 });
 
 test("crash after ambiguous child result: restart re-queries live truth", async () => {
@@ -1067,7 +1128,7 @@ test("single-item start_advance without advance seams fails closed (no silent st
   assert.equal(t.next_action, "replan_required");
   assert.equal(t.dispatched, false);
   assert.equal(starts.length, 0);
-  assert.match(t.derive_reason, /startOrResumeAdvance and observeAdvance/);
+  assert.match(t.derive_reason, /startOrResumeAdvance, observeAdvance, and lookupAdvanceByActionId/);
   // Second tick remains fail-closed (no permanent silent wedge with claimed action).
   const t2 = await tickFactory(macro, "frun-1", { repoDir: "/repo" });
   assert.equal(t2.next_action, "replan_required");
@@ -1370,6 +1431,7 @@ test("macro controller does not inject concurrency budget into start call", asyn
       payloads.push(input);
       return { loop_run_id: "loop-x" };
     },
+    lookupLoopByActionId: async () => null,
     observeLoop: async () => ({ state: "not_found" }),
   };
   await tickFactory(macro, "frun-1", { repoDir: "/repo" });

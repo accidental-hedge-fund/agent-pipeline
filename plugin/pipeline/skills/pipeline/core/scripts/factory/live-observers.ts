@@ -710,6 +710,8 @@ export function buildFactoryMacroDeps(
     startOrResumeLoop: async ({ loop_run_id, factory_run_id }) => {
       // CLI does not mint new durable loop runs. Linked loop ids are observed
       // and resumed by identity only; creation is via pipeline loop / library.
+      // action_id is accepted for the durable-idempotency contract; production
+      // mapping is owned by callers that create loops under factory action keys.
       if (loop_run_id) return { loop_run_id };
       throw new FactoryError(
         "validation",
@@ -717,6 +719,13 @@ export function buildFactoryMacroDeps(
           `adopt/replan with linked_runs.loop_run_id or start the loop via pipeline loop`,
       );
     },
+    /**
+     * Production CLI has no side-effecting loop creator, so there is no
+     * action_id→loop mapping to recover. Returns null; linked loop ids are
+     * still observed via contract/claim child_run_id. Injected deps in tests
+     * and future creators MUST implement durable action_id indexing.
+     */
+    lookupLoopByActionId: async () => null,
     observeLoop: async (loopRunId) => {
       try {
         const status = await getStatus(obs.loopStore, loopRunId);

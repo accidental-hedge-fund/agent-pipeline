@@ -172,6 +172,14 @@ Before performing an external side effect for a coarse factory action (including
 - **THEN** a restarted controller SHALL re-derive from durable state and live truth
 - **AND** MAY create the first claim and dispatch exactly once
 
+#### Scenario: Lost or timed-out child-start response reconciles by action id
+
+- **WHEN** a child whole-run start succeeds at the child service but the start response is lost, rejected, or times out before the claim records a child run id
+- **THEN** the controller SHALL record the claim in an `ambiguous_reconcile` state for that action identity
+- **AND** a subsequent tick SHALL look up any existing child by the durable action id before re-invoking the child-start seam
+- **AND** when that lookup returns an existing child run id, the controller SHALL link it on the claim and SHALL NOT create a second child run for the same action identity
+- **AND** child-start seams SHALL be durable-idempotent on action id as a second line of defense
+
 ---
 
 ### Requirement: Restart SHALL reconstruct phase and next action without conversation memory

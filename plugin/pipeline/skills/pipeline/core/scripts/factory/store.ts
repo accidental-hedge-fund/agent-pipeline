@@ -548,9 +548,9 @@ export async function tryAcquireDispatchLease(
 
 /**
  * Acquire a new dispatch lease, or recover an unfinished lease when the claim
- * has no durable child_run_id yet. Recovery re-dispatches with the same
- * action_id (idempotency key) so a crash between child creation and claim
- * update cannot permanently strand the action.
+ * has no durable child_run_id yet. Recovery re-enters the start path for the
+ * same action_id so the controller can lookup-by-action before any start retry
+ * (crash / lost response between child creation and claim update).
  */
 export async function tryAcquireOrRecoverDispatchLease(
   deps: FactoryStoreDeps,
@@ -560,11 +560,13 @@ export async function tryAcquireOrRecoverDispatchLease(
 ): Promise<{ acquired: boolean; recovered: boolean }> {
   const won = await tryAcquireDispatchLease(deps, factoryRunId, actionId);
   if (won) return { acquired: true, recovered: false };
-  // Unfinished lease: claim exists without a durable child link — safe to
-  // re-enter start with the same action_id as the idempotency key.
+  // Unfinished or ambiguous lease without a durable child link — re-enter so
+  // the controller can reconcile via action_id lookup before any start retry.
   if (
     !claim.child_run_id &&
-    (claim.state === "claimed" || claim.state === "started")
+    (claim.state === "claimed" ||
+      claim.state === "started" ||
+      claim.state === "ambiguous_reconcile")
   ) {
     return { acquired: true, recovered: true };
   }
