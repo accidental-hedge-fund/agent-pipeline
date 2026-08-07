@@ -178,37 +178,55 @@ async function adoptFresh(store: FactoryStoreDeps, overrides: Record<string, unk
   });
 }
 
+const DEFAULT_FINGERPRINTS = {
+  authority_policy: "auth-fp",
+  engine_pin: "pin-fp",
+  configuration: "cfg-fp",
+  treatment: "treat-fp",
+};
+
 function makeMacroDeps(
   store: FactoryStoreDeps,
   opts: {
     loopStatus?: ChildRunStatus;
+    advanceStatus?: ChildRunStatus;
     startCalls?: string[];
     fault?: FactoryMacroDeps["_fault"];
     baseSha?: string;
-    github?: { ok: boolean; detail?: string };
+    repoIdentity?: { name: string; base_branch: string };
+    /** When true, omit observeRepoIdentity (runtime fail-closed path). */
+    omitRepoIdentity?: boolean;
+    github?: { ok: boolean; detail?: string } | null;
+    /** When true, omit observeGithubSnapshot. */
+    omitGithub?: boolean;
     configFingerprints?: {
       authority_policy: string;
       engine_pin: string;
       configuration: string;
       treatment: string;
-    };
+    } | null;
+    /** When true, omit readConfigFingerprints. */
+    omitConfigFingerprints?: boolean;
+    /** When true, provide advance start/status seams. */
+    withAdvance?: boolean;
+    /** When true, omit advance seams even if withAdvance would apply. */
+    omitAdvance?: boolean;
     /** Shared map so idempotent start survives across makeMacroDeps instances. */
     startedByActionId?: Map<string, string>;
   } = {},
 ): FactoryMacroDeps {
   const startCalls = opts.startCalls ?? [];
   let loopStatus: ChildRunStatus = opts.loopStatus ?? { state: "not_found" };
+  let advanceStatus: ChildRunStatus = opts.advanceStatus ?? { state: "not_found" };
   const startedByActionId = opts.startedByActionId ?? new Map<string, string>();
   const children = new Map<string, ChildRunStatus>();
-  return {
+  const deps: FactoryMacroDeps = {
     store,
     observeBaseSha: async () => opts.baseSha ?? "abc123deadbeef",
-    observeGithubSnapshot: opts.github
-      ? async () => opts.github!
-      : undefined,
-    readConfigFingerprints: opts.configFingerprints
-      ? async () => opts.configFingerprints!
-      : undefined,
+    observeRepoIdentity: async () =>
+      opts.repoIdentity ?? { name: "acme/widgets", base_branch: "main" },
+    observeGithubSnapshot: async () => opts.github ?? { ok: true },
+    readConfigFingerprints: async () => opts.configFingerprints ?? DEFAULT_FINGERPRINTS,
     now: () => store.now(),
     startOrResumeLoop: async ({ loop_run_id, factory_run_id, action_id }) => {
       startCalls.push(`loop:${loop_run_id ?? "new"}:${factory_run_id}:${action_id}`);
@@ -227,6 +245,35 @@ function makeMacroDeps(
     },
     _fault: opts.fault,
   };
+  if (opts.omitRepoIdentity) {
+    delete (deps as { observeRepoIdentity?: unknown }).observeRepoIdentity;
+  }
+  if (opts.omitGithub) {
+    delete (deps as { observeGithubSnapshot?: unknown }).observeGithubSnapshot;
+  }
+  if (opts.omitConfigFingerprints) {
+    delete (deps as { readConfigFingerprints?: unknown }).readConfigFingerprints;
+  }
+  if (opts.withAdvance && !opts.omitAdvance) {
+    deps.startOrResumeAdvance = async ({ advance_run_id, factory_run_id, action_id }) => {
+      startCalls.push(`advance:${advance_run_id ?? "new"}:${factory_run_id}:${action_id}`);
+      const existing = startedByActionId.get(action_id);
+      const id = existing ?? advance_run_id ?? `advance-from-${factory_run_id}`;
+      startedByActionId.set(action_id, id);
+      advanceStatus = { state: "running", run_id: id };
+      children.set(id, advanceStatus);
+      return { advance_run_id: id };
+    };
+    deps.observeAdvance = async (id) => {
+      if (children.has(id)) return children.get(id)!;
+      if (advanceStatus.state === "not_found") return { state: "not_found" };
+      return {
+        ...advanceStatus,
+        run_id: "run_id" in advanceStatus ? advanceStatus.run_id : id,
+      } as ChildRunStatus;
+    };
+  }
+  return deps;
 }
 
 // ---------------------------------------------------------------------------
@@ -771,7 +818,7 @@ test("GitHub snapshot mismatch fails closed with replan_required", async () => {
 
 test("reconcileLiveIdentity accepts matching observations", () => {
   const contract = {
-    repo: { observed_base_sha: "abc" },
+    repo: { name: "acme/widgets", base_branch: "main", observed_base_sha: "abc" },
     fingerprints: {
       authority_policy: "a",
       engine_pin: "e",
@@ -783,6 +830,7 @@ test("reconcileLiveIdentity accepts matching observations", () => {
     reconcileLiveIdentity({
       contract,
       base_sha: "abc",
+      live_repo: { name: "acme/widgets", base_branch: "main" },
       github: { ok: true },
       configFingerprints: {
         authority_policy: "a",
@@ -793,6 +841,148 @@ test("reconcileLiveIdentity accepts matching observations", () => {
     }).ok,
     true,
   );
+});
+
+test("reconcileLiveIdentity fails closed when GitHub observation is absent", () => {
+  const contract = {
+    repo: { name: "acme/widgets", base_branch: "main", observed_base_sha: "abc" },
+    fingerprints: DEFAULT_FINGERPRINTS,
+  } as never;
+  const r = reconcileLiveIdentity({
+    contract,
+    base_sha: "abc",
+    live_repo: { name: "acme/widgets", base_branch: "main" },
+    github: null,
+    configFingerprints: DEFAULT_FINGERPRINTS,
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.match(r.reason, /GitHub snapshot observation required/);
+});
+
+test("reconcileLiveIdentity fails closed when configuration observation is absent", () => {
+  const contract = {
+    repo: { name: "acme/widgets", base_branch: "main", observed_base_sha: "abc" },
+    fingerprints: DEFAULT_FINGERPRINTS,
+  } as never;
+  const r = reconcileLiveIdentity({
+    contract,
+    base_sha: "abc",
+    live_repo: { name: "acme/widgets", base_branch: "main" },
+    github: { ok: true },
+    configFingerprints: null,
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.match(r.reason, /configuration fingerprint observation required/);
+});
+
+test("reconcileLiveIdentity fails closed on repository identity drift", () => {
+  const contract = {
+    repo: { name: "acme/widgets", base_branch: "main", observed_base_sha: "abc" },
+    fingerprints: DEFAULT_FINGERPRINTS,
+  } as never;
+  const r = reconcileLiveIdentity({
+    contract,
+    base_sha: "abc",
+    live_repo: { name: "other/repo", base_branch: "main" },
+    github: { ok: true },
+    configFingerprints: DEFAULT_FINGERPRINTS,
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.match(r.reason, /repository identity drift/);
+});
+
+test("tick fails closed when required live-observation seams are omitted", async () => {
+  const { deps } = fakeStore();
+  await adoptFresh(deps);
+  const t = await tickFactory(
+    makeMacroDeps(deps, { omitGithub: true }),
+    "frun-1",
+    { repoDir: "/repo" },
+  );
+  assert.equal(t.next_action, "replan_required");
+  assert.equal(t.dispatched, false);
+  assert.match(t.derive_reason, /GitHub snapshot observation required/);
+});
+
+test("ambiguous open advance claim derives observe_advance — never start_loop", () => {
+  const contract = {
+    revision: 1,
+    coarse_phase: "executing",
+    next_action: "start_loop", // contract snapshot would choose loop if fallthrough
+    completion_policy: "all_items_ready_to_deploy",
+    issue_ids: ["42"],
+    linked_runs: { loop_run_id: null, advance_run_id: "adv-1" },
+  } as never;
+  const d = derivePhaseAndNextAction({
+    contract,
+    claims: [
+      {
+        revision: 1,
+        action: "start_advance",
+        state: "ambiguous_reconcile",
+        child_run_id: "adv-1",
+      } as never,
+    ],
+    live: {
+      base_sha: "x",
+      loop: null,
+      advance: { state: "ambiguous", run_id: "adv-1", detail: "unknown" },
+      observed_at: "t",
+    },
+  });
+  assert.equal(d.next_action, "observe_advance");
+  assert.equal(d.coarse_phase, "executing");
+  assert.match(d.reason, /ambiguous/);
+});
+
+test("single-item start_advance without advance seams fails closed (no silent strand)", async () => {
+  const { deps } = fakeStore();
+  await adoptFresh(deps, {
+    issue_ids: ["42"],
+    linked_runs: {
+      loop_run_id: null,
+      loop_contract_hash: null,
+      advance_run_id: null,
+      legacy_run_identity: null,
+    },
+    next_action: "start_advance",
+    coarse_phase: "adopted",
+  });
+  const starts: string[] = [];
+  // Loop seams present; advance seams intentionally omitted.
+  const macro = makeMacroDeps(deps, { startCalls: starts, omitAdvance: true });
+  const t = await tickFactory(macro, "frun-1", { repoDir: "/repo" });
+  assert.equal(t.next_action, "replan_required");
+  assert.equal(t.dispatched, false);
+  assert.equal(starts.length, 0);
+  assert.match(t.derive_reason, /startOrResumeAdvance and observeAdvance/);
+  // Second tick remains fail-closed (no permanent silent wedge with claimed action).
+  const t2 = await tickFactory(macro, "frun-1", { repoDir: "/repo" });
+  assert.equal(t2.next_action, "replan_required");
+  assert.equal(t2.dispatched, false);
+  assert.equal(starts.length, 0);
+});
+
+test("single-item with advance seams dispatches start_advance once", async () => {
+  const { deps } = fakeStore();
+  await adoptFresh(deps, {
+    issue_ids: ["42"],
+    linked_runs: {
+      loop_run_id: null,
+      loop_contract_hash: null,
+      advance_run_id: null,
+      legacy_run_identity: null,
+    },
+    next_action: "start_advance",
+    coarse_phase: "adopted",
+  });
+  const starts: string[] = [];
+  const macro = makeMacroDeps(deps, { startCalls: starts, withAdvance: true });
+  const t = await tickFactory(macro, "frun-1", { repoDir: "/repo" });
+  assert.equal(t.dispatched, true);
+  assert.ok(t.child_run_id);
+  assert.ok(starts.some((s) => s.startsWith("advance:")));
+  assert.equal(starts.filter((s) => s.startsWith("loop:")).length, 0);
 });
 
 test("read-only status reconstructs phase after tick records completion disposition", async () => {
@@ -987,6 +1177,9 @@ test("macro controller does not inject concurrency budget into start call", asyn
   const macro: FactoryMacroDeps = {
     store: deps,
     observeBaseSha: async () => "abc123deadbeef",
+    observeRepoIdentity: async () => ({ name: "acme/widgets", base_branch: "main" }),
+    observeGithubSnapshot: async () => ({ ok: true }),
+    readConfigFingerprints: async () => DEFAULT_FINGERPRINTS,
     now: () => deps.now(),
     startOrResumeLoop: async (input) => {
       payloads.push(input);

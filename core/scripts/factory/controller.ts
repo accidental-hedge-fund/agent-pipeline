@@ -53,8 +53,19 @@ export interface FactoryMacroDeps {
   store: FactoryStoreDeps;
   /** Fresh base SHA observation (git). */
   observeBaseSha(repoDir: string, baseBranch: string): Promise<string>;
-  /** Optional GitHub selector/live checks — not authoritative for contract body. */
-  observeGithubSnapshot?(input: {
+  /**
+   * Fresh repository name + base branch for live reconciliation (required on
+   * every enabled tick; compared against the accepted contract).
+   */
+  observeRepoIdentity(input: {
+    repoDir: string;
+    baseBranch: string;
+  }): Promise<{ name: string; base_branch: string }>;
+  /**
+   * Fresh GitHub selector/live checks — required on every enabled tick; not
+   * authoritative for contract body content.
+   */
+  observeGithubSnapshot(input: {
     repo: string;
     issue_ids: string[];
   }): Promise<{ ok: boolean; detail?: string }>;
@@ -67,7 +78,11 @@ export interface FactoryMacroDeps {
     action_id: string;
   }): Promise<{ loop_run_id: string }>;
   observeLoop(loopRunId: string): Promise<ChildRunStatus>;
-  /** Optional whole-issue advance child. */
+  /**
+   * Whole-issue advance child. Optional only for loop-only deps construction;
+   * when derivation selects start/resume/observe advance, both advance seams
+   * MUST be present or the tick fails closed (no silent strand).
+   */
   startOrResumeAdvance?(input: {
     factory_run_id: string;
     revision: number;
@@ -80,7 +95,8 @@ export interface FactoryMacroDeps {
    * Intentional isolation: merge/release mutation functions MUST NOT be present
    * on this deps surface. Tests assert the tick path never calls them.
    */
-  readConfigFingerprints?(): Promise<FactoryFingerprints>;
+  /** Fresh configuration fingerprints — required on every enabled tick. */
+  readConfigFingerprints(): Promise<FactoryFingerprints>;
   /** Injected fault hooks for crash-matrix tests only. */
   _fault?: {
     crashBeforeClaim?: boolean;
@@ -212,6 +228,16 @@ export function derivePhaseAndNextAction(input: DeriveInput): DeriveResult {
       if (live.advance?.state === "running") {
         return { coarse_phase: "executing", next_action: "observe_advance", reason: "advance running" };
       }
+      // Match the loop path: ambiguous live status or claim state stays on
+      // observe_advance — never fall through to contract snapshot (which may
+      // select start_loop and launch an unrelated whole-item child).
+      if (live.advance?.state === "ambiguous" || c.state === "ambiguous_reconcile") {
+        return {
+          coarse_phase: "executing",
+          next_action: "observe_advance",
+          reason: "ambiguous child — re-query live truth",
+        };
+      }
       if (live.advance?.state === "completed") {
         return completeFromLoop(live.advance, policy);
       }
@@ -222,13 +248,19 @@ export function derivePhaseAndNextAction(input: DeriveInput): DeriveResult {
           reason: `advance failed: ${live.advance.detail}`,
         };
       }
-      if (c.state === "claimed") {
+      if (c.state === "claimed" && (!live.advance || live.advance.state === "not_found")) {
         return {
           coarse_phase: "executing",
           next_action: c.action === "resume_advance" ? "resume_advance" : "start_advance",
           reason: "claimed advance; child not yet observed",
         };
       }
+      // Any other open advance claim: re-observe only — do not select a different child kind.
+      return {
+        coarse_phase: "executing",
+        next_action: "observe_advance",
+        reason: "open advance claim — re-query live truth",
+      };
     }
   }
 
@@ -296,6 +328,13 @@ export function derivePhaseAndNextAction(input: DeriveInput): DeriveResult {
     }
     if (live.advance.state === "running") {
       return { coarse_phase: "executing", next_action: "observe_advance", reason: "advance in progress" };
+    }
+    if (live.advance.state === "ambiguous") {
+      return {
+        coarse_phase: "executing",
+        next_action: "observe_advance",
+        reason: "ambiguous advance status",
+      };
     }
     if (live.advance.state === "completed") {
       return completeFromLoop(live.advance, policy);
@@ -431,6 +470,34 @@ const NON_DISPATCH_ACTIONS = new Set<FactoryNextAction>([
   "replan_required",
 ]);
 
+/**
+ * When derivation selects an advance whole-item action, both advance seams
+ * must be present. Returns a fail-closed reason string, or null when ok.
+ */
+function advanceSeamRequirement(
+  nextAction: FactoryNextAction,
+  deps: FactoryMacroDeps,
+): string | null {
+  if (
+    nextAction === "start_advance" ||
+    nextAction === "resume_advance"
+  ) {
+    if (deps.startOrResumeAdvance == null || deps.observeAdvance == null) {
+      return (
+        "single-item advance path requires startOrResumeAdvance and observeAdvance seams — " +
+        "replan to a loop-linked contract or provide advance child seams"
+      );
+    }
+  }
+  if (nextAction === "observe_advance" && deps.observeAdvance == null) {
+    return (
+      "observe_advance requires observeAdvance seam — " +
+      "replan to a loop-linked contract or provide advance child seams"
+    );
+  }
+  return null;
+}
+
 function resolveReportedPhase(derived: DeriveResult): FactoryCoarsePhase {
   if (derived.next_action === "operator_merge" && derived.coarse_phase === "items_complete") {
     return "merge_prepare";
@@ -504,17 +571,39 @@ async function persistPhaseEvidence(
 }
 
 /**
- * Compare live observations against the accepted contract. On mismatch, return
- * a non-dispatchable replan_required posture (CAS replan is required to adopt
- * the new live identity into a retained revision).
+ * Compare live observations against the accepted contract. On mismatch or
+ * missing required observations, return a non-dispatchable replan_required
+ * posture (CAS replan is required to adopt the new live identity into a
+ * retained revision). Absent GitHub, configuration, or repository-identity
+ * observations fail closed — they are not treated as successful reconciliation.
  */
 export function reconcileLiveIdentity(input: {
   contract: FactoryExecutionContractRevision;
   base_sha: string;
+  /** Fresh repo name + base_branch; null/undefined fails closed. */
+  live_repo?: { name: string; base_branch: string } | null;
   github?: { ok: boolean; detail?: string } | null;
   configFingerprints?: FactoryFingerprints | null;
 }): { ok: true } | { ok: false; reason: string } {
-  const { contract, base_sha, github, configFingerprints } = input;
+  const { contract, base_sha, live_repo, github, configFingerprints } = input;
+  if (live_repo == null) {
+    return {
+      ok: false,
+      reason:
+        "repository identity observation required before dispatch — CAS replan required",
+    };
+  }
+  if (
+    live_repo.name !== contract.repo.name ||
+    live_repo.base_branch !== contract.repo.base_branch
+  ) {
+    return {
+      ok: false,
+      reason:
+        `repository identity drift: live ${live_repo.name}@${live_repo.base_branch} !== ` +
+        `contract ${contract.repo.name}@${contract.repo.base_branch} — CAS replan required`,
+    };
+  }
   if (base_sha !== contract.repo.observed_base_sha) {
     return {
       ok: false,
@@ -522,13 +611,27 @@ export function reconcileLiveIdentity(input: {
         `base SHA drift: live ${base_sha} !== contract ${contract.repo.observed_base_sha} — CAS replan required`,
     };
   }
-  if (github && !github.ok) {
+  if (github == null) {
+    return {
+      ok: false,
+      reason:
+        "GitHub snapshot observation required before dispatch — CAS replan required",
+    };
+  }
+  if (!github.ok) {
     return {
       ok: false,
       reason: `GitHub snapshot mismatch: ${github.detail ?? "ok=false"} — CAS replan required`,
     };
   }
-  if (configFingerprints) {
+  if (configFingerprints == null) {
+    return {
+      ok: false,
+      reason:
+        "configuration fingerprint observation required before dispatch — CAS replan required",
+    };
+  }
+  {
     const c = contract.fingerprints;
     if (
       configFingerprints.configuration !== c.configuration ||
@@ -590,8 +693,17 @@ async function tickFactoryLocked(
   const serviceController =
     contract.identities.service_controller || FACTORY_SERVICE_CONTROLLER_ID;
 
-  // Observe live truth (git base, optional GitHub/config, child runs)
+  // Observe live truth (git base, repository identity, GitHub, config, children).
+  // All four external-truth seams are required; missing providers fail closed
+  // via reconcileLiveIdentity (null is not a successful reconciliation).
   const base_sha = await deps.observeBaseSha(opts.repoDir, contract.repo.base_branch);
+  const live_repo =
+    deps.observeRepoIdentity != null
+      ? await deps.observeRepoIdentity({
+          repoDir: opts.repoDir,
+          baseBranch: contract.repo.base_branch,
+        })
+      : null;
   const github =
     deps.observeGithubSnapshot != null
       ? await deps.observeGithubSnapshot({
@@ -644,6 +756,7 @@ async function tickFactoryLocked(
   const liveOk = reconcileLiveIdentity({
     contract,
     base_sha,
+    live_repo,
     github,
     configFingerprints,
   });
@@ -677,6 +790,49 @@ async function tickFactoryLocked(
 
   const derived = derivePhaseAndNextAction({ contract, claims, live });
   const reportedPhase = resolveReportedPhase(derived);
+
+  // Single-item advance path: fail closed when child seams are absent so a
+  // claimed action cannot strand forever with no child id and no error.
+  const advanceSeamMissingReason = advanceSeamRequirement(derived.next_action, deps);
+  if (advanceSeamMissingReason) {
+    const actionId = actionIdFor(contract.revision, derived.next_action);
+    const existingClaim = await readClaim(deps.store, factoryRunId, actionId);
+    if (
+      existingClaim &&
+      (existingClaim.state === "claimed" ||
+        existingClaim.state === "started" ||
+        existingClaim.state === "ambiguous_reconcile")
+    ) {
+      await updateClaim(deps.store, factoryRunId, actionId, {
+        state: "failed",
+        outcome_detail: advanceSeamMissingReason,
+      });
+    }
+    const failedClaim = await readClaim(deps.store, factoryRunId, actionId);
+    await persistPhaseEvidence(deps, {
+      factory_run_id: factoryRunId,
+      revision: contract.revision,
+      coarse_phase: reportedPhase,
+      next_action: "replan_required",
+      reason: advanceSeamMissingReason,
+      service_controller: serviceController,
+      live,
+      replan_reason: advanceSeamMissingReason,
+    });
+    const status = (await getFactoryStatus(deps.store, factoryRunId))!;
+    return {
+      factory_run_id: factoryRunId,
+      revision: contract.revision,
+      coarse_phase: reportedPhase,
+      next_action: "replan_required",
+      derive_reason: advanceSeamMissingReason,
+      claim: failedClaim,
+      claim_won: false,
+      dispatched: false,
+      child_run_id: failedClaim?.child_run_id ?? null,
+      status,
+    };
+  }
 
   // Operator-only / non-dispatch next actions: durable phase evidence, no merge.
   if (NON_DISPATCH_ACTIONS.has(derived.next_action)) {
@@ -808,26 +964,35 @@ async function tickFactoryLocked(
           child_run_id: result.loop_run_id,
         });
       } else if (
-        (derived.next_action === "start_advance" || derived.next_action === "resume_advance") &&
-        deps.startOrResumeAdvance
+        derived.next_action === "start_advance" ||
+        derived.next_action === "resume_advance"
       ) {
-        const issueId = contract.issue_ids[0] ?? "0";
-        const result = await deps.startOrResumeAdvance({
-          factory_run_id: factoryRunId,
-          revision: contract.revision,
-          advance_run_id: advanceId,
-          issue_id: issueId,
-          action_id: actionId,
-        });
-        child_run_id = result.advance_run_id;
-        dispatched = true;
-        if (deps._fault?.crashAfterChildStart) {
-          throw new FactoryError("validation", "injected fault: crash after child start");
+        // Seam presence already validated above; defense-in-depth fail closed.
+        if (!deps.startOrResumeAdvance) {
+          await updateClaim(deps.store, factoryRunId, actionId, {
+            state: "failed",
+            outcome_detail:
+              "startOrResumeAdvance seam unavailable for single-item advance dispatch",
+          });
+        } else {
+          const issueId = contract.issue_ids[0] ?? "0";
+          const result = await deps.startOrResumeAdvance({
+            factory_run_id: factoryRunId,
+            revision: contract.revision,
+            advance_run_id: advanceId,
+            issue_id: issueId,
+            action_id: actionId,
+          });
+          child_run_id = result.advance_run_id;
+          dispatched = true;
+          if (deps._fault?.crashAfterChildStart) {
+            throw new FactoryError("validation", "injected fault: crash after child start");
+          }
+          await updateClaim(deps.store, factoryRunId, actionId, {
+            state: "started",
+            child_run_id: result.advance_run_id,
+          });
         }
-        await updateClaim(deps.store, factoryRunId, actionId, {
-          state: "started",
-          child_run_id: result.advance_run_id,
-        });
       }
     }
   }

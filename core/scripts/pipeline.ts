@@ -5419,10 +5419,24 @@ export async function handleFactoryCommand(
       return;
     }
     try {
+      // Live-observation seams are mandatory on enabled ticks. This CLI path is
+      // a thin dogfood stub — library callers must inject real git/GitHub/config
+      // observers. Stub observations intentionally fail closed against real contracts.
       const result = await tickFactory(
         {
           store,
           observeBaseSha: async () => "unknown",
+          observeRepoIdentity: async () => ({
+            name: "unknown/unknown",
+            base_branch: "main",
+          }),
+          observeGithubSnapshot: async () => ({ ok: true }),
+          readConfigFingerprints: async () => ({
+            authority_policy: "unknown",
+            engine_pin: "unknown",
+            configuration: "unknown",
+            treatment: "unknown",
+          }),
           now: () => new Date(),
           startOrResumeLoop: async ({ loop_run_id, factory_run_id }) => {
             // Delegation only: operator must have linked a loop or start is a no-op link.
