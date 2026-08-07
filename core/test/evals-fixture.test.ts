@@ -544,6 +544,102 @@ test("validateFixture: held-out verifier body in task_input is rejected as leaka
   );
 });
 
+
+test("validateFixture: held-out verifier body in fixture-level task_input is rejected", () => {
+  const secretCheck = "node -e \"require('fs').accessSync('hidden-oracle-root')\"";
+  assert.throws(
+    () =>
+      validateFixture(
+        multiChangeRaw({
+          task_input: `Synopsis leaks oracle: ${secretCheck}`,
+          checkpoints: [
+            {
+              checkpoint_id: "C1",
+              task_input: "Implement without secrets.",
+              held_out_verifiers: [{ verifier_id: "C1.v1", check: secretCheck }],
+            },
+          ],
+        }),
+        "mc.json",
+      ),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /held-out verifier check body/.test((err as Error).message),
+  );
+});
+
+test("validateFixture: held-out verifier id in stage_entry_artifacts is rejected", () => {
+  assert.throws(
+    () =>
+      validateFixture(
+        multiChangeRaw({
+          stage_entry_artifacts: {
+            implementing: { plan: "Pass C1.secret_oracle to ship" },
+          },
+          checkpoints: [
+            {
+              checkpoint_id: "C1",
+              task_input: "Implement the feature.",
+              held_out_verifiers: [{ verifier_id: "C1.secret_oracle", check: "node -e \"process.exit(0)\"" }],
+            },
+          ],
+        }),
+        "mc.json",
+      ),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /held-out verifier id/.test((err as Error).message) &&
+      /C1\.secret_oracle/.test((err as Error).message),
+  );
+});
+
+test("validateFixture: public_checks wrapper containing held-out body is rejected", () => {
+  const secretCheck = "node -e \"require('fs').accessSync('wrapped-oracle')\"";
+  assert.throws(
+    () =>
+      validateFixture(
+        multiChangeRaw({
+          // Wrapper embeds the exact held-out command body (not merely equal to it).
+          public_checks: [`bash -lc 'set -e; ${secretCheck}'`],
+          checkpoints: [
+            {
+              checkpoint_id: "C1",
+              task_input: "Implement the feature.",
+              held_out_verifiers: [{ verifier_id: "C1.v1", check: secretCheck }],
+            },
+          ],
+        }),
+        "mc.json",
+      ),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /held-out verifier check body/.test((err as Error).message),
+  );
+});
+
+test("validateFixture: checkpoint public_checks wrapper containing held-out body is rejected", () => {
+  const secretCheck = "node -e \"require('fs').accessSync('cp-wrapped-oracle')\"";
+  assert.throws(
+    () =>
+      validateFixture(
+        multiChangeRaw({
+          checkpoints: [
+            {
+              checkpoint_id: "C1",
+              task_input: "Implement the feature.",
+              public_checks: [`sh -c 'set -e; ${secretCheck}'`],
+              held_out_verifiers: [{ verifier_id: "C1.v1", check: secretCheck }],
+            },
+          ],
+        }),
+        "mc.json",
+      ),
+    (err: unknown) =>
+      err instanceof FixtureValidationError &&
+      /held-out verifier check body/.test((err as Error).message) &&
+      /"C1"/.test((err as Error).message),
+  );
+});
 test("validateFixture: portability override scoped to checkpoint is accepted", () => {
   const fixture = validateFixture(
     multiChangeRaw({

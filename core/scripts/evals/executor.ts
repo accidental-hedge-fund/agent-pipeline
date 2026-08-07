@@ -45,7 +45,9 @@ import {
   type Treatment,
 } from "./types.ts";
 import {
+  buildStructuralTelemetry,
   computeGrowthFromPaths,
+  contentAddressedRepoFingerprint,
   hashPrompt,
   inheritedVerifiers,
   materializeMultiChangeCheckpointPrompt,
@@ -257,19 +259,27 @@ export interface CellExecutionDeps {
    *  `allowed_change_paths` (out-of-scope-change grading needs it). */
   getChangedPaths?: (args: { worktreeDir: string; baseSha: string }) => Promise<string[]>;
   /** Fingerprint the worktree tree state for multi-change evidence trails
-   *  (#577). Defaults to hashing `git status --porcelain` + `git rev-parse HEAD`. */
+   *  (#577). Defaults to a content-addressed digest (HEAD + tracked diff +
+   *  untracked content hashes). */
   getRepoFingerprint?: (args: { worktreeDir: string }) => Promise<string>;
   /** Full unified diff text for the worktree vs baseSha — used by paired modes
    *  so the reviewer sees the actual primary implementation (#601). */
   getDiff?: (args: { worktreeDir: string; baseSha: string }) => Promise<string>;
   /**
-   * Disposable copy of the post-treatment worktree for multi-change held-out
-   * verifier execution (#577). Verifier side effects must not persist into the
-   * treatment lineage; defaults to a recursive copy under os.tmpdir.
+   * Disposable isolated (non-Git, symlink-safe) copy of the post-treatment
+   * worktree for multi-change held-out verifier execution (#577). Verifier
+   * side effects must not persist into the treatment lineage; defaults to
+   * {@link copyIsolatedVerifierTree} under os.tmpdir. Called once per
+   * held-out verifier so side effects cannot cascade across checks.
    */
   createVerifierSnapshot?: (worktreeDir: string) => Promise<string>;
   /** Remove a verifier snapshot directory from {@link createVerifierSnapshot}. */
   removeVerifierSnapshot?: (snapshotDir: string) => Promise<void>;
+  /** Read source files from the post-step worktree for maintainability telemetry (#577). */
+  collectWorktreeSourceFiles?: (args: {
+    worktreeDir: string;
+    changedPaths: string[];
+  }) => Promise<Array<{ path: string; content: string }>>;
   /** Dispatch an API treatment through a named `model-endpoint` executor
    *  (#434 task 6). Only invoked when the cell's treatment declares
    *  `executor`. */
@@ -348,33 +358,206 @@ async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: stri
   }
 }
 
+/**
+ * Content-addressed worktree fingerprint: HEAD + full tracked diff vs HEAD +
+ * per-path content hashes of untracked files. Path-only porcelain status is
+ * insufficient — two distinct edits to the same path must not alias.
+ */
 async function defaultGetRepoFingerprint(args: { worktreeDir: string }): Promise<string> {
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const execFileAsync = promisify(execFile);
   try {
-    const [head, status] = await Promise.all([
-      execFileAsync("git", ["rev-parse", "HEAD"], { cwd: args.worktreeDir, timeout: 15_000 }),
-      execFileAsync("git", ["status", "--porcelain"], { cwd: args.worktreeDir, timeout: 15_000 }),
-    ]);
-    return createHash("sha256")
-      .update(`${head.stdout.trim()}\n${status.stdout}`)
-      .digest("hex");
+    const head = await execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: args.worktreeDir,
+      timeout: 15_000,
+    });
+    // Full patch covers staged + unstaged tracked content relative to HEAD.
+    let trackedDiff = "";
+    try {
+      const diff = await execFileAsync("git", ["diff", "HEAD"], {
+        cwd: args.worktreeDir,
+        timeout: 60_000,
+        maxBuffer: 40 * 1024 * 1024,
+      });
+      trackedDiff = diff.stdout;
+    } catch (err) {
+      const e = err as { stdout?: string; code?: number };
+      // git diff exits 0 even with differences; nonzero is a real failure unless stdout present.
+      if (typeof e.stdout === "string") trackedDiff = e.stdout;
+      else throw err;
+    }
+    const untrackedList = await execFileAsync(
+      "git",
+      ["ls-files", "--others", "--exclude-standard", "-z"],
+      { cwd: args.worktreeDir, timeout: 30_000, maxBuffer: 10 * 1024 * 1024 },
+    );
+    const untrackedPaths = untrackedList.stdout
+      .split("\0")
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0)
+      .sort();
+    const untrackedFiles: Array<{ path: string; contentSha256: string }> = [];
+    for (const rel of untrackedPaths) {
+      const abs = path.join(args.worktreeDir, rel);
+      let contentSha256: string;
+      try {
+        const st = await fs.promises.lstat(abs);
+        if (st.isSymbolicLink()) {
+          const target = await fs.promises.readlink(abs);
+          contentSha256 = createHash("sha256").update(`symlink:${target}`).digest("hex");
+        } else if (st.isFile()) {
+          const buf = await fs.promises.readFile(abs);
+          contentSha256 = createHash("sha256").update(buf).digest("hex");
+        } else {
+          contentSha256 = createHash("sha256").update(`special:${st.mode}`).digest("hex");
+        }
+      } catch (err) {
+        contentSha256 = createHash("sha256")
+          .update(`missing:${(err as Error).message}`)
+          .digest("hex");
+      }
+      untrackedFiles.push({ path: rel, contentSha256 });
+    }
+    return contentAddressedRepoFingerprint({
+      headSha: head.stdout.trim(),
+      trackedDiff,
+      untrackedFiles,
+    });
   } catch (err) {
     return createHash("sha256").update(`fingerprint-error:${(err as Error).message}`).digest("hex");
   }
 }
 
-/** Disposable filesystem copy of the treatment worktree for held-out verifiers. */
+/**
+ * Copy a treatment worktree into an independent, non-Git filesystem tree for
+ * held-out verifier execution. Skips `.git` metadata (gitfile or directory)
+ * so verifier git commands cannot mutate lineage refs, and materializes
+ * symlinks as regular file/directory copies of their targets when the target
+ * resolves inside the source tree (external or broken links are omitted).
+ */
+export async function copyIsolatedVerifierTree(srcDir: string, destDir: string): Promise<void> {
+  await fs.promises.mkdir(destDir, { recursive: true });
+  const root = path.resolve(srcDir);
+
+  function isInsideRoot(resolved: string): boolean {
+    return resolved === root || resolved.startsWith(root + path.sep);
+  }
+
+  async function materialize(srcPath: string, destPath: string): Promise<void> {
+    let st: fs.Stats;
+    try {
+      st = await fs.promises.lstat(srcPath);
+    } catch {
+      return;
+    }
+    if (st.isSymbolicLink()) {
+      let target: string;
+      try {
+        target = await fs.promises.readlink(srcPath);
+      } catch {
+        return;
+      }
+      const resolved = path.resolve(path.dirname(srcPath), target);
+      if (!isInsideRoot(resolved)) {
+        // External symlink — omit rather than escape the snapshot boundary.
+        return;
+      }
+      try {
+        const targetSt = await fs.promises.stat(resolved);
+        if (targetSt.isDirectory()) {
+          await fs.promises.mkdir(destPath, { recursive: true });
+          const entries = await fs.promises.readdir(resolved);
+          for (const name of entries) {
+            if (name === ".git") continue;
+            await materialize(path.join(resolved, name), path.join(destPath, name));
+          }
+        } else if (targetSt.isFile()) {
+          await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+          await fs.promises.copyFile(resolved, destPath);
+        }
+      } catch {
+        // Broken link — omit.
+      }
+      return;
+    }
+    if (st.isDirectory()) {
+      await fs.promises.mkdir(destPath, { recursive: true });
+      const entries = await fs.promises.readdir(srcPath);
+      for (const name of entries) {
+        if (name === ".git") continue;
+        await materialize(path.join(srcPath, name), path.join(destPath, name));
+      }
+      return;
+    }
+    if (st.isFile()) {
+      await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+      await fs.promises.copyFile(srcPath, destPath);
+    }
+  }
+
+  await materialize(root, destDir);
+}
+
+/** Disposable isolated filesystem copy of the treatment worktree for held-out verifiers. */
 async function defaultCreateVerifierSnapshot(worktreeDir: string): Promise<string> {
   const os = await import("node:os");
   const snapshotDir = path.join(os.tmpdir(), `pipeline-eval-mc-verifier-${randomUUID()}`);
-  await fs.promises.cp(worktreeDir, snapshotDir, { recursive: true, force: true });
+  await copyIsolatedVerifierTree(worktreeDir, snapshotDir);
   return snapshotDir;
 }
 
 async function defaultRemoveVerifierSnapshot(snapshotDir: string): Promise<void> {
   await fs.promises.rm(snapshotDir, { recursive: true, force: true });
+}
+
+/**
+ * Read source-like files under the worktree for maintainability telemetry.
+ * Unions changed paths with multi-change sandbox modules so cumulative LOC
+ * reflects the post-step tree before teardown.
+ */
+async function defaultCollectWorktreeSourceFiles(args: {
+  worktreeDir: string;
+  changedPaths: string[];
+}): Promise<Array<{ path: string; content: string }>> {
+  const out: Array<{ path: string; content: string }> = [];
+  const seen = new Set<string>();
+  const tryRead = async (rel: string) => {
+    const norm = rel.replace(/\\/g, "/");
+    if (seen.has(norm)) return;
+    seen.add(norm);
+    if (norm.includes("..") || path.isAbsolute(norm)) return;
+    const abs = path.join(args.worktreeDir, norm);
+    try {
+      const st = await fs.promises.lstat(abs);
+      if (!st.isFile() || st.isSymbolicLink()) return;
+      const content = await fs.promises.readFile(abs, "utf8");
+      out.push({ path: norm, content });
+    } catch {
+      // missing / unreadable
+    }
+  };
+  for (const p of args.changedPaths) await tryRead(p);
+
+  const sandboxRoot = path.join(args.worktreeDir, "core/evals/sandboxes");
+  try {
+    const walkSandbox = async (dir: string, relFromSandbox: string) => {
+      const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+      for (const ent of entries) {
+        const rel = relFromSandbox ? `${relFromSandbox}/${ent.name}` : ent.name;
+        if (ent.isDirectory()) {
+          if (ent.name === ".git" || ent.name === "node_modules") continue;
+          await walkSandbox(path.join(dir, ent.name), rel);
+        } else if (ent.isFile()) {
+          await tryRead(`core/evals/sandboxes/${rel}`);
+        }
+      }
+    };
+    await walkSandbox(sandboxRoot, "");
+  } catch {
+    // no sandbox tree in this worktree
+  }
+  return out;
 }
 
 /** Hard cap on total reviewable paired-mode diff size (tracked + untracked).
@@ -761,12 +944,15 @@ async function runMultiChangeLineage(args: {
   const evidence: MultiChangeCheckpointEvidence[] = [];
   const promptParts: string[] = [];
   let previousChangedPaths: string[] = [];
+  let previousProductionLoc = 0;
+  let previousTestLoc = 0;
   const getChangedPathsFn = deps.getChangedPaths ?? defaultGetChangedPaths;
   const getRepoFingerprintFn = deps.getRepoFingerprint ?? defaultGetRepoFingerprint;
   const runChecksFn = deps.runChecks ?? defaultRunChecks;
   const getDiffFn = deps.getDiff ?? defaultGetDiff;
   const createVerifierSnapshotFn = deps.createVerifierSnapshot ?? defaultCreateVerifierSnapshot;
   const removeVerifierSnapshotFn = deps.removeVerifierSnapshot ?? defaultRemoveVerifierSnapshot;
+  const collectSourceFilesFn = deps.collectWorktreeSourceFiles ?? defaultCollectWorktreeSourceFiles;
 
   for (let k = 0; k < checkpoints.length; k++) {
     const checkpoint = checkpoints[k];
@@ -925,7 +1111,6 @@ async function runMultiChangeLineage(args: {
     const newVerifiers = checkpoint.held_out_verifiers;
     const inherited = inheritedVerifiers(checkpoints, k);
     const allVerifiers = [...inherited, ...newVerifiers];
-    const checkCommands = allVerifiers.map((v) => v.check);
     const remainingForChecks = cellDeadlineMs - Date.now();
     if (remainingForChecks <= 0) {
       const error = `multi-change cell exceeded its ${manifest.timeout}s timeout before verifiers at "${checkpoint.checkpoint_id}"`;
@@ -943,16 +1128,25 @@ async function runMultiChangeLineage(args: {
       });
     }
 
-    let checkResults: Record<string, boolean> = {};
-    if (checkCommands.length > 0) {
+    // Each held-out verifier runs in its own clean isolated snapshot so one
+    // check's side effects cannot cascade into another or into the lineage.
+    const checkResults: Record<string, boolean> = {};
+    const deadlineAtStart = Date.now();
+    for (const v of allVerifiers) {
+      const remaining = remainingForChecks - (Date.now() - deadlineAtStart);
+      if (remaining <= 0) {
+        checkResults[v.check] = false;
+        continue;
+      }
       let snapshotDir: string | undefined;
       try {
         snapshotDir = await createVerifierSnapshotFn(identity.worktreePath);
-        checkResults = await runChecksFn({
+        const one = await runChecksFn({
           worktreeDir: snapshotDir,
-          checks: checkCommands,
-          deadlineMs: remainingForChecks,
+          checks: [v.check],
+          deadlineMs: remaining,
         });
+        checkResults[v.check] = one[v.check] === true;
       } catch (err) {
         const error = `checkpoint "${checkpoint.checkpoint_id}" held-out verifier isolation failed: ${(err as Error).message}`;
         trajectoryActions.push(error);
@@ -997,8 +1191,33 @@ async function runMultiChangeLineage(args: {
       worktreeDir: identity.worktreePath,
       baseSha: cell.base_sha,
     });
-    const growth = computeGrowthFromPaths(previousChangedPaths, changedPaths);
+
+    // Collect deterministic content metrics before worktree teardown.
+    let sourceFiles: Array<{ path: string; content: string }> = [];
+    try {
+      sourceFiles = await collectSourceFilesFn({
+        worktreeDir: identity.worktreePath,
+        changedPaths,
+      });
+    } catch (err) {
+      trajectoryActions.push(
+        `checkpoint "${checkpoint.checkpoint_id}" telemetry collection failed (non-fatal): ${(err as Error).message}`,
+      );
+      sourceFiles = [];
+    }
+    const { structural, production_loc, test_loc } = buildStructuralTelemetry({
+      files: sourceFiles,
+      changedPaths,
+    });
+    const growth = computeGrowthFromPaths(previousChangedPaths, changedPaths, {
+      beforeProductionLoc: previousProductionLoc,
+      afterProductionLoc: production_loc,
+      beforeTestLoc: previousTestLoc,
+      afterTestLoc: test_loc,
+    });
     previousChangedPaths = changedPaths;
+    previousProductionLoc = production_loc;
+    previousTestLoc = test_loc;
 
     const fingerprint = await getRepoFingerprintFn({ worktreeDir: identity.worktreePath });
 
@@ -1026,12 +1245,7 @@ async function runMultiChangeLineage(args: {
       portability_probe: coords.portability,
       preserved_evidence_keys: ["repository_state", "pipeline_evidence_bundle"],
       growth,
-      structural_telemetry: {
-        touch_points: changedPaths.slice(0, 50),
-        metrics: {
-          changed_path_count: changedPaths.length,
-        },
-      },
+      structural_telemetry: structural,
     };
     evidence.push(stepEvidence);
   }

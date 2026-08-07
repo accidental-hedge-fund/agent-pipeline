@@ -4,7 +4,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  analyzeSourceText,
+  buildStructuralTelemetry,
+  classifyCodePath,
   computeDefectState,
+  contentAddressedRepoFingerprint,
+  detectHeldOutLeakage,
   gradeMultiChangeLineage,
   inheritedVerifiers,
   materializeMultiChangeCheckpointPrompt,
@@ -14,7 +19,7 @@ import {
   type MultiChangeCheckpointEvidence,
 } from "../scripts/evals/multi-change.ts";
 import { validateFixture } from "../scripts/evals/fixture.ts";
-import { runCell, type CellExecutionDeps } from "../scripts/evals/executor.ts";
+import { copyIsolatedVerifierTree, runCell, type CellExecutionDeps } from "../scripts/evals/executor.ts";
 import { gradeExperiment } from "../scripts/evals/grading/grade.ts";
 import { buildMultiChangeReport, generateSummary } from "../scripts/evals/reporting/report.ts";
 import { qualityScore } from "../scripts/evals/reporting/quality.ts";
@@ -562,11 +567,12 @@ test("runCell multi-change: held-out verifiers run on disposable snapshot, not l
 
   const result = await runCell(FAKE_CFG, cell, fixture, manifest, deps);
   assert.equal(result.outcome.result_class, "completed");
-  assert.equal(checkDirs.length, 3);
+  // Per-verifier isolation: C1 has 2, C2 re-runs 2+1, C3 re-runs 3+1 → 9 snapshots.
+  assert.equal(checkDirs.length, 9);
   for (const d of checkDirs) {
     assert.notEqual(d, lineagePath);
   }
-  assert.equal(snapshotsCreated.length, 3);
+  assert.equal(snapshotsCreated.length, 9);
   assert.deepEqual(snapshotsRemoved.sort(), snapshotsCreated.sort());
 });
 
@@ -1066,3 +1072,236 @@ test("generateSummary: multi_change section present; no forbidden maintainabilit
   // qualityScore path for multi-change does not throw.
   assert.ok(qualityScore(grade) > 0);
 });
+
+
+// --- review 2 regression: fingerprint, isolation, leakage channels, telemetry ---
+
+test("contentAddressedRepoFingerprint: distinct edits to same path differ", () => {
+  const base = {
+    headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    untrackedFiles: [] as Array<{ path: string; contentSha256: string }>,
+  };
+  const a = contentAddressedRepoFingerprint({
+    ...base,
+    trackedDiff: "diff --git a/x b/x\n+const a = 1;\n",
+  });
+  const b = contentAddressedRepoFingerprint({
+    ...base,
+    trackedDiff: "diff --git a/x b/x\n+const a = 2;\n",
+  });
+  assert.notEqual(a, b);
+  const c = contentAddressedRepoFingerprint({
+    ...base,
+    trackedDiff: "",
+    untrackedFiles: [{ path: "new.js", contentSha256: "hash-one" }],
+  });
+  const d = contentAddressedRepoFingerprint({
+    ...base,
+    trackedDiff: "",
+    untrackedFiles: [{ path: "new.js", contentSha256: "hash-two" }],
+  });
+  assert.notEqual(c, d);
+  // Path-only identity with different content must not alias (both untracked same path).
+  assert.equal(
+    contentAddressedRepoFingerprint({
+      ...base,
+      trackedDiff: "same",
+      untrackedFiles: [{ path: "p", contentSha256: "x" }],
+    }),
+    contentAddressedRepoFingerprint({
+      ...base,
+      trackedDiff: "same",
+      untrackedFiles: [{ path: "p", contentSha256: "x" }],
+    }),
+  );
+});
+
+test("detectHeldOutLeakage: verifier id and public wrapper channels", () => {
+  const verifiers = [{ verifier_id: "C1.hidden_oracle", check: "node -e \"process.exit(0)\"" }];
+  assert.equal(
+    detectHeldOutLeakage([{ label: "task_input", text: "safe prompt" }], verifiers),
+    null,
+  );
+  assert.match(
+    detectHeldOutLeakage(
+      [{ label: "fixture task_input", text: "see C1.hidden_oracle for truth" }],
+      verifiers,
+    ) ?? "",
+    /verifier id/,
+  );
+  assert.match(
+    detectHeldOutLeakage(
+      [{ label: "public_checks[0]", text: "bash -lc 'node -e \"process.exit(0)\"'" }],
+      verifiers,
+    ) ?? "",
+    /check body/,
+  );
+});
+
+test("buildStructuralTelemetry: production vs test LOC and unavailable metrics as null", () => {
+  const { structural, production_loc, test_loc } = buildStructuralTelemetry({
+    files: [
+      {
+        path: "core/evals/sandboxes/shortcut-filter/store.js",
+        content: "function createStore() {\n  if (true) { return {}; }\n}\nexport { createStore };\n",
+      },
+      {
+        path: "core/evals/sandboxes/shortcut-filter/store.test.js",
+        content: "test('x', () => { assert.ok(1); });\n",
+      },
+    ],
+    changedPaths: [
+      "core/evals/sandboxes/shortcut-filter/store.js",
+      "core/evals/sandboxes/shortcut-filter/store.test.js",
+    ],
+  });
+  assert.ok(production_loc > 0);
+  assert.ok(test_loc > 0);
+  assert.equal(structural.production_loc, production_loc);
+  assert.equal(structural.test_loc, test_loc);
+  assert.equal(typeof structural.metrics?.function_count, "number");
+  assert.equal(structural.metrics?.duplication, null);
+  assert.equal(structural.metrics?.dependency_cycles, null);
+  assert.equal(structural.metrics?.symbol_churn, null);
+  assert.equal(structural.metrics?.single_use_wrappers, null);
+  assert.equal(structural.metrics?.propagation_cost, null);
+  assert.equal(classifyCodePath("core/foo.ts"), "production");
+  assert.equal(classifyCodePath("core/test/foo.test.ts"), "test");
+  assert.ok(analyzeSourceText("function f(){ if (x) return 1; }").branch_complexity >= 1);
+});
+
+test("copyIsolatedVerifierTree: omits .git and materializes internal symlinks without escaping", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "mc-iso-src-"));
+  const dest = fs.mkdtempSync(path.join(os.tmpdir(), "mc-iso-dst-"));
+  try {
+    fs.writeFileSync(path.join(root, "config.json"), '{"ok":true}');
+    fs.writeFileSync(path.join(root, "real-data.txt"), "secret-lineage-data");
+    fs.symlinkSync("real-data.txt", path.join(root, "link-data.txt"));
+    // gitfile-style pointer (worktree .git)
+    fs.writeFileSync(path.join(root, ".git"), "gitdir: /tmp/lineage-git-dir\n");
+    // external symlink escape
+    const outside = path.join(os.tmpdir(), `mc-iso-outside-${Date.now()}`);
+    fs.writeFileSync(outside, "outside-payload");
+    fs.symlinkSync(outside, path.join(root, "escape-link"));
+
+    await copyIsolatedVerifierTree(root, dest);
+
+    assert.equal(fs.existsSync(path.join(dest, ".git")), false, "snapshot must not retain .git");
+    assert.equal(fs.readFileSync(path.join(dest, "config.json"), "utf8"), '{"ok":true}');
+    // Internal symlink materialized as a regular file with target contents.
+    const linkStat = fs.lstatSync(path.join(dest, "link-data.txt"));
+    assert.equal(linkStat.isSymbolicLink(), false);
+    assert.equal(fs.readFileSync(path.join(dest, "link-data.txt"), "utf8"), "secret-lineage-data");
+    // External symlink omitted (no escape).
+    assert.equal(fs.existsSync(path.join(dest, "escape-link")), false);
+
+    // Mutating the snapshot must not affect the lineage file via retained symlink.
+    fs.writeFileSync(path.join(dest, "link-data.txt"), "mutated-in-snapshot");
+    assert.equal(fs.readFileSync(path.join(root, "real-data.txt"), "utf8"), "secret-lineage-data");
+    fs.unlinkSync(outside);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(dest, { recursive: true, force: true });
+  }
+});
+
+test("runCell multi-change: each held-out verifier gets its own snapshot", async () => {
+  const fixture = multiChangeFixture();
+  const cell: Cell = {
+    cell_id: "exp/mc1/profile=bare/1",
+    experiment_id: "exp",
+    fixture_id: "mc1",
+    treatment_id: "profile=bare",
+    treatment: { harness: "claude", model: "strong-model", profile: "bare" },
+    replicate: 1,
+    mode: "implementing",
+    base_sha: SHA,
+  };
+  const manifest = {
+    schema_version: 1,
+    experiment_id: "exp",
+    fixture_ids: ["mc1"],
+    mode: "implementing",
+    treatments: { profile: ["bare"] },
+    replicates: 1,
+    seed: 1,
+    concurrency: 1,
+    timeout: 60,
+    output_dir: "/out",
+    sandbox_mode: "managed",
+  } as ExperimentManifest;
+
+  const snapshotsCreated: string[] = [];
+  const deps: CellExecutionDeps = {
+    contractIO: fakeContractIO(),
+    installBoundaryShim: (d) => `${d}/.shim`,
+    readBoundaryDenials: () => [],
+    removeBoundaryShim: () => {},
+    createWorktree: async (_c, o) => ({ path: o.path, branch: o.branch }),
+    removeWorktree: async () => {},
+    preflight: async () => ({ ok: true }),
+    invokeHarness: async () => ({
+      success: true,
+      timed_out: false,
+      exit_code: 0,
+      stdout: "ok",
+      stderr: "",
+      duration: 0.1,
+    }),
+    createVerifierSnapshot: async (worktreeDir) => {
+      const snap = `${worktreeDir}__snap_${snapshotsCreated.length}`;
+      snapshotsCreated.push(snap);
+      return snap;
+    },
+    removeVerifierSnapshot: async () => {},
+    runChecks: async ({ checks }) => Object.fromEntries(checks.map((c) => [c, true])),
+    getChangedPaths: async () => ["core/evals/sandboxes/x.js"],
+    getRepoFingerprint: async () => "fp",
+    collectWorktreeSourceFiles: async () => [
+      { path: "core/evals/sandboxes/x.js", content: "function f(){ return 1; }\n" },
+    ],
+  };
+
+  const result = await runCell(FAKE_CFG, cell, fixture, manifest, deps);
+  assert.equal(result.outcome.result_class, "completed");
+  // C1:2 verifiers, C2:1+2 inherited = 3, C3:1+3 inherited = 4 → 2+3+4 = 9
+  assert.equal(snapshotsCreated.length, 9);
+  const mc = result.outcome.detail?.multi_change as {
+    checkpoints: Array<{
+      structural_telemetry?: { metrics?: Record<string, number | null>; production_loc?: number };
+      growth?: { production_loc_delta?: number | null };
+    }>;
+  };
+  const step0 = mc.checkpoints[0];
+  assert.ok(step0.structural_telemetry?.metrics);
+  assert.equal(typeof step0.structural_telemetry?.metrics?.production_loc, "number");
+  assert.equal(step0.structural_telemetry?.metrics?.duplication, null);
+  assert.equal(typeof step0.growth?.production_loc_delta, "number");
+});
+
+test("mc-shortcut-debt-filter: C1 smoke can pass under identity list while C2 requires typed query rework", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const { dirname, join } = await import("node:path");
+  const fixturePath = join(
+    dirname(fileURLToPath(import.meta.url)),
+    "../evals/fixtures/mc-shortcut-debt-filter.json",
+  );
+  const raw = JSON.parse(readFileSync(fixturePath, "utf8"));
+  const fixture = validateFixture(raw, "mc-shortcut-debt-filter.json");
+  assert.equal(fixture.roles?.shortcut_debt, true);
+  assert.equal(fixture.checkpoints?.[0].introduces_shortcut_debt, true);
+  // C1 must not require inactive exclusion (identity list over all-active data can pass).
+  const c1Checks = fixture.checkpoints![0].held_out_verifiers.map((v) => v.check).join("\n");
+  assert.doesNotMatch(c1Checks, /inactive/);
+  // C2 must introduce typed equality + query ops that a lossy flat map cannot satisfy cheaply.
+  const c2 = fixture.checkpoints![1];
+  assert.ok(c2.held_out_verifiers.some((v) => /typed_number|score/.test(v.verifier_id + v.check)));
+  assert.ok(c2.held_out_verifiers.some((v) => /query/.test(v.check)));
+  // Inherited C1 verifiers remain in the fixture closure for regression pressure.
+  assert.ok(fixture.checkpoints![0].held_out_verifiers.length >= 2);
+});
+

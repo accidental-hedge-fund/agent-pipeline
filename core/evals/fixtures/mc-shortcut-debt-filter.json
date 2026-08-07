@@ -3,7 +3,7 @@
   "schema_version": 1,
   "kind": "multi_change",
   "base_commit": "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd",
-  "task_input": "Multi-change shortcut-debt demonstration: an early test-passing filter shortcut that raises later inherited-verifier failure risk.",
+  "task_input": "Multi-change shortcut-debt demonstration: an early test-passing storage representation locks in a flat shape that later cross-cutting typed-query requirements force measurable rework and inherited-regression risk.",
   "stage_entry_artifacts": {
     "implementing": {
       "plan": "Apply only the currently disclosed checkpoint under core/evals/sandboxes/shortcut-filter/."
@@ -23,25 +23,33 @@
     {
       "checkpoint_id": "C1",
       "introduces_shortcut_debt": true,
-      "task_input": "Create core/evals/sandboxes/shortcut-filter/filter.js exporting filterActive(items) where each item is {id, status}. Return only items whose status is the string \"active\". Seed data used by informal smoke checks will only contain active items, so a naive implementation that returns items unchanged may appear to work in casual testing — implement the real status filter anyway.",
+      "task_input": "Create core/evals/sandboxes/shortcut-filter/store.js exporting createStore() → { put(id, record), get(id), list() }. For this step every record is a plain object with at least { id, status } and informal smoke data only contains status:\"active\" rows. put must store the record; get must return it by id; list must return all stored records. A naive implementation that keeps a flat { [id]: record } map and lets list() return Object.values(map) will pass the C1 smoke checks. Prefer a representation you can evolve, but you are not required to invent future requirements.",
       "held_out_verifiers": [
         {
-          "verifier_id": "C1.active_only_smoke",
-          "check": "node -e \"const m=require('./core/evals/sandboxes/shortcut-filter/filter.js'); const r=m.filterActive([{id:1,status:'active'},{id:2,status:'active'}]); if(!Array.isArray(r)||r.length!==2) process.exit(1);\""
+          "verifier_id": "C1.put_get_roundtrip",
+          "check": "node -e \"const m=require('./core/evals/sandboxes/shortcut-filter/store.js'); const s=m.createStore(); s.put('a',{id:'a',status:'active'}); const g=s.get('a'); if(!g||g.id!=='a'||g.status!=='active') process.exit(1);\""
+        },
+        {
+          "verifier_id": "C1.list_all_active_smoke",
+          "check": "node -e \"const m=require('./core/evals/sandboxes/shortcut-filter/store.js'); const s=m.createStore(); s.put('a',{id:'a',status:'active'}); s.put('b',{id:'b',status:'active'}); const all=s.list(); if(!Array.isArray(all)||all.length!==2) process.exit(1);\""
         }
       ]
     },
     {
       "checkpoint_id": "C2",
-      "task_input": "The product now stores inactive records. filterActive must exclude any item whose status is not exactly \"active\". Also export countByStatus(items) returning {active, inactive, other} counts. Do not break prior call sites of filterActive.",
+      "task_input": "Cross-cutting change: records now carry typed fields and must support query(filter) where filter is { field, op, value } with op in eq|neq|in. Storage MUST preserve field types (string|number|boolean) so number 1 is not confused with string \"1\". Add createStore().query(filter) returning matching records. Keep put/get/list working for prior call sites that store {id,status} without explicit type metadata (default each field's JS typeof). If C1 used a lossy flat string map or dropped non-enumerable metadata, rewrite the representation so typed equality works. Do not break C1 put/get/list semantics.",
       "held_out_verifiers": [
         {
-          "verifier_id": "C2.excludes_inactive",
-          "check": "node -e \"const m=require('./core/evals/sandboxes/shortcut-filter/filter.js'); const r=m.filterActive([{id:1,status:'active'},{id:2,status:'inactive'},{id:3,status:'active'}]); if(!Array.isArray(r)||r.length!==2||r.some(x=>x.status!=='active')) process.exit(1);\""
+          "verifier_id": "C2.query_eq_status",
+          "check": "node -e \"const m=require('./core/evals/sandboxes/shortcut-filter/store.js'); const s=m.createStore(); s.put('a',{id:'a',status:'active'}); s.put('b',{id:'b',status:'inactive'}); if(typeof s.query!=='function') process.exit(1); const r=s.query({field:'status',op:'eq',value:'active'}); if(!Array.isArray(r)||r.length!==1||r[0].id!=='a') process.exit(1);\""
         },
         {
-          "verifier_id": "C2.counts",
-          "check": "node -e \"const m=require('./core/evals/sandboxes/shortcut-filter/filter.js'); if(typeof m.countByStatus!=='function') process.exit(1); const c=m.countByStatus([{status:'active'},{status:'inactive'},{status:'pending'},{status:'active'}]); if(!c||c.active!==2||c.inactive!==1||c.other!==1) process.exit(1);\""
+          "verifier_id": "C2.typed_number_not_string",
+          "check": "node -e \"const m=require('./core/evals/sandboxes/shortcut-filter/store.js'); const s=m.createStore(); s.put('a',{id:'a',status:'active',score:1}); s.put('b',{id:'b',status:'active',score:'1'}); const r=s.query({field:'score',op:'eq',value:1}); if(!Array.isArray(r)||r.length!==1||r[0].id!=='a') process.exit(1); const r2=s.query({field:'score',op:'in',value:[1,2]}); if(!Array.isArray(r2)||r2.length!==1||r2[0].id!=='a') process.exit(1);\""
+        },
+        {
+          "verifier_id": "C2.neq_and_inherited_list",
+          "check": "node -e \"const m=require('./core/evals/sandboxes/shortcut-filter/store.js'); const s=m.createStore(); s.put('a',{id:'a',status:'active'}); s.put('b',{id:'b',status:'inactive'}); const r=s.query({field:'status',op:'neq',value:'active'}); if(!Array.isArray(r)||r.length!==1||r[0].id!=='b') process.exit(1); const all=s.list(); if(!Array.isArray(all)||all.length!==2) process.exit(1); if(s.get('a')?.status!=='active') process.exit(1);\""
         }
       ]
     }

@@ -325,29 +325,79 @@ export function hashPrompt(prompt: string): string {
 }
 
 /**
- * Reject treatment-visible leakage of held-out verifier bodies into a
- * checkpoint's task_input (or public_checks). Returns a human-readable
- * reason or null when clean.
+ * A treatment-visible text channel to scan for held-out verifier leakage.
+ * `label` is used in rejection messages (e.g. "fixture task_input",
+ * `checkpoint "C1" public_checks[0]`).
+ */
+export type TreatmentVisibleSource = { label: string; text: string };
+
+/**
+ * Reject treatment-visible leakage of held-out verifier bodies or identifiers
+ * into any disclosed fixture/checkpoint field (task_input, public checks,
+ * stage-entry artifacts). Returns a human-readable reason or null when clean.
+ *
+ * Public-check *wrappers* that embed a held-out command body are rejected
+ * (substring containment), not only exact command equality.
  */
 export function detectHeldOutLeakage(
-  checkpoint: MultiChangeCheckpoint,
+  sources: TreatmentVisibleSource[],
   allVerifiers: MultiChangeHeldOutVerifier[],
 ): string | null {
-  const visible = [
-    checkpoint.task_input,
-    ...(checkpoint.public_checks ?? []),
-    checkpoint.stage_entry_artifacts !== undefined
-      ? JSON.stringify(checkpoint.stage_entry_artifacts)
-      : "",
-  ].join("\n");
-
   for (const v of allVerifiers) {
     const check = v.check.trim();
-    if (check.length > 0 && visible.includes(check)) {
-      return `held-out verifier check body for ${JSON.stringify(v.verifier_id)} appears in treatment-visible input`;
+    for (const src of sources) {
+      if (!src.text) continue;
+      if (check.length > 0 && src.text.includes(check)) {
+        return `held-out verifier check body for ${JSON.stringify(v.verifier_id)} appears in treatment-visible ${src.label}`;
+      }
+      // Identifiers are treatment-visible oracle channels when embedded in prompts/artifacts.
+      if (v.verifier_id.length > 0 && src.text.includes(v.verifier_id)) {
+        return `held-out verifier id ${JSON.stringify(v.verifier_id)} appears in treatment-visible ${src.label}`;
+      }
     }
   }
   return null;
+}
+
+/** Collect treatment-visible text sources for one multi-change checkpoint. */
+export function checkpointVisibleSources(checkpoint: MultiChangeCheckpoint): TreatmentVisibleSource[] {
+  const sources: TreatmentVisibleSource[] = [
+    { label: `checkpoint ${JSON.stringify(checkpoint.checkpoint_id)} task_input`, text: checkpoint.task_input },
+  ];
+  for (let i = 0; i < (checkpoint.public_checks ?? []).length; i++) {
+    sources.push({
+      label: `checkpoint ${JSON.stringify(checkpoint.checkpoint_id)} public_checks[${i}]`,
+      text: checkpoint.public_checks![i],
+    });
+  }
+  if (checkpoint.stage_entry_artifacts !== undefined) {
+    sources.push({
+      label: `checkpoint ${JSON.stringify(checkpoint.checkpoint_id)} stage_entry_artifacts`,
+      text: JSON.stringify(checkpoint.stage_entry_artifacts),
+    });
+  }
+  return sources;
+}
+
+/** Collect fixture-level treatment-visible sources (synopsis, public checks, stage entry). */
+export function fixtureVisibleSources(fixture: {
+  task_input: string;
+  public_checks: string[];
+  stage_entry_artifacts?: unknown;
+}): TreatmentVisibleSource[] {
+  const sources: TreatmentVisibleSource[] = [
+    { label: "fixture task_input", text: fixture.task_input },
+  ];
+  for (let i = 0; i < fixture.public_checks.length; i++) {
+    sources.push({ label: `fixture public_checks[${i}]`, text: fixture.public_checks[i] });
+  }
+  if (fixture.stage_entry_artifacts !== undefined) {
+    sources.push({
+      label: "fixture stage_entry_artifacts",
+      text: JSON.stringify(fixture.stage_entry_artifacts),
+    });
+  }
+  return sources;
 }
 
 /** Collect every held-out verifier across the fixture (ordered). */
@@ -356,10 +406,158 @@ export function allHeldOutVerifiers(fixture: Fixture): MultiChangeHeldOutVerifie
   return fixture.checkpoints.flatMap((c) => c.held_out_verifiers);
 }
 
-/** Lightweight growth signals from path lists (before/after step). */
+/**
+ * Content-addressed repository fingerprint inputs (pure). Two distinct edits
+ * to the same path MUST produce different digests when trackedDiff or untracked
+ * content hashes differ — path-only porcelain status is not sufficient.
+ */
+export function contentAddressedRepoFingerprint(parts: {
+  headSha: string;
+  /** Full unified diff of tracked changes vs HEAD (staged + unstaged). */
+  trackedDiff: string;
+  /** Sorted untracked paths with content digests (empty file → empty hash). */
+  untrackedFiles: Array<{ path: string; contentSha256: string }>;
+}): string {
+  const h = createHash("sha256");
+  h.update("head:");
+  h.update(parts.headSha.trim());
+  h.update("\ntracked-diff:");
+  h.update(parts.trackedDiff);
+  h.update("\nuntracked:\n");
+  const sorted = [...parts.untrackedFiles].sort((a, b) => a.path.localeCompare(b.path));
+  for (const f of sorted) {
+    h.update(f.path);
+    h.update("\0");
+    h.update(f.contentSha256);
+    h.update("\n");
+  }
+  return h.digest("hex");
+}
+
+/** Classify a repo-relative path as production, test, or other for growth metrics. */
+export function classifyCodePath(relPath: string): "production" | "test" | "other" {
+  const p = relPath.replace(/\\/g, "/");
+  if (!/\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java)$/i.test(p)) return "other";
+  if (
+    /(^|\/)(test|tests|__tests__|spec|specs)(\/|$)/i.test(p) ||
+    /\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(p)
+  ) {
+    return "test";
+  }
+  return "production";
+}
+
+/** Deterministic structural metrics extracted from a single source file body. */
+export function analyzeSourceText(content: string): {
+  loc: number;
+  function_count: number;
+  branch_complexity: number;
+  max_nesting: number;
+  import_edge_count: number;
+} {
+  const lines = content.split(/\r?\n/);
+  let loc = 0;
+  for (const line of lines) {
+    const t = line.trim();
+    if (t.length === 0 || t.startsWith("//") || t.startsWith("#") || t.startsWith("*")) continue;
+    loc++;
+  }
+  // Function/method declarations (JS/TS/Python-ish) — telemetry only, not a language parser.
+  const function_count = (
+    content.match(
+      /\b(?:function\s+[A-Za-z_$][\w$]*|export\s+(?:async\s+)?function\b|(?:async\s+)?function\b|[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?\(|[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?function\b|def\s+[A-Za-z_][\w]*\s*\()/g,
+    ) ?? []
+  ).length;
+  const branch_complexity = (
+    content.match(/\b(if|else\s+if|elif|for|while|case|catch|switch)\b|\?\.|\?[^.]|&&|\|\|/g) ?? []
+  ).length;
+  let max_nesting = 0;
+  let depth = 0;
+  for (const ch of content) {
+    if (ch === "{" || ch === "(") {
+      depth++;
+      if (depth > max_nesting) max_nesting = depth;
+    } else if (ch === "}" || ch === ")") {
+      depth = Math.max(0, depth - 1);
+    }
+  }
+  const import_edge_count = (
+    content.match(
+      /^\s*(?:import\s|export\s+.+from\s|require\s*\(|from\s+\S+\s+import\s)/gm,
+    ) ?? []
+  ).length;
+  return { loc, function_count, branch_complexity, max_nesting, import_edge_count };
+}
+
+/**
+ * Build structural telemetry from post-step file contents. Metrics that cannot
+ * be derived deterministically from path+text alone are recorded as `null`
+ * (unavailable coverage) — never silently replaced by changed-path count.
+ */
+export function buildStructuralTelemetry(args: {
+  /** Repo-relative path + full text of files present in the graded tree slice. */
+  files: Array<{ path: string; content: string }>;
+  changedPaths: string[];
+}): {
+  structural: MultiChangeStructuralTelemetry;
+  production_loc: number;
+  test_loc: number;
+} {
+  let production_loc = 0;
+  let test_loc = 0;
+  let function_count = 0;
+  let branch_complexity = 0;
+  let max_nesting = 0;
+  let import_edge_count = 0;
+  let source_file_count = 0;
+
+  for (const f of args.files) {
+    const kind = classifyCodePath(f.path);
+    if (kind === "other") continue;
+    source_file_count++;
+    const m = analyzeSourceText(f.content);
+    if (kind === "production") production_loc += m.loc;
+    else test_loc += m.loc;
+    function_count += m.function_count;
+    branch_complexity += m.branch_complexity;
+    if (m.max_nesting > max_nesting) max_nesting = m.max_nesting;
+    import_edge_count += m.import_edge_count;
+  }
+
+  const structural: MultiChangeStructuralTelemetry = {
+    file_count: source_file_count,
+    production_loc,
+    test_loc,
+    touch_points: args.changedPaths.slice(0, 50),
+    metrics: {
+      changed_path_count: args.changedPaths.length,
+      production_loc,
+      test_loc,
+      function_count,
+      branch_complexity,
+      max_nesting,
+      import_edge_count,
+      // Unavailable without heavier whole-repo analysis — explicit null coverage.
+      duplication: null,
+      dependency_cycles: null,
+      symbol_churn: null,
+      single_use_wrappers: null,
+      propagation_cost: null,
+    },
+  };
+  return { structural, production_loc, test_loc };
+}
+
+/** Growth signals from path lists plus measured production/test LOC deltas. */
 export function computeGrowthFromPaths(
   beforePaths: string[],
   afterPaths: string[],
+  loc?: {
+    beforeProductionLoc: number;
+    afterProductionLoc: number;
+    beforeTestLoc: number;
+    afterTestLoc: number;
+  },
 ): MultiChangeGrowthSignals {
   const before = new Set(beforePaths);
   const after = new Set(afterPaths);
@@ -372,10 +570,18 @@ export function computeGrowthFromPaths(
   // `afterPaths` is typically the set of paths that differ from base; treat
   // length delta as amplification proxy when before is previous step's set.
   const change_amplification =
-    beforePaths.length === 0 ? (afterPaths.length > 0 ? afterPaths.length : null) : afterPaths.length / Math.max(1, beforePaths.length);
+    beforePaths.length === 0
+      ? afterPaths.length > 0
+        ? afterPaths.length
+        : null
+      : afterPaths.length / Math.max(1, beforePaths.length);
   return {
     files_added: added,
     files_modified: modified,
     change_amplification,
+    production_loc_delta: loc
+      ? loc.afterProductionLoc - loc.beforeProductionLoc
+      : null,
+    test_loc_delta: loc ? loc.afterTestLoc - loc.beforeTestLoc : null,
   };
 }

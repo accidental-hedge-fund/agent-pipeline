@@ -23,7 +23,11 @@ import {
   type PortabilityModelOverride,
   type SeededDefect,
 } from "./types.ts";
-import { detectHeldOutLeakage } from "./multi-change.ts";
+import {
+  checkpointVisibleSources,
+  detectHeldOutLeakage,
+  fixtureVisibleSources,
+} from "./multi-change.ts";
 import { stableStringify } from "./manifest.ts";
 
 const FULL_SHA_RE = /^[0-9a-f]{40}$/;
@@ -606,9 +610,19 @@ function validateMultiChangeForm(
     };
   });
 
-  // Leakage: held-out verifier bodies must not appear in treatment-visible inputs.
+  // Leakage: held-out verifier bodies/ids must not appear in any treatment-visible
+  // channel (fixture-level synopsis/artifacts/public checks + per-checkpoint fields).
+  const rootVisible = fixtureVisibleSources({
+    task_input: typeof obj.task_input === "string" ? obj.task_input : "",
+    public_checks: publicChecks,
+    stage_entry_artifacts: obj.stage_entry_artifacts,
+  });
+  const rootLeak = detectHeldOutLeakage(rootVisible, allVerifiers);
+  if (rootLeak) {
+    throw new FixtureValidationError(fixtureId, "task_input", rootLeak);
+  }
   for (const cp of checkpoints) {
-    const leak = detectHeldOutLeakage(cp, allVerifiers);
+    const leak = detectHeldOutLeakage(checkpointVisibleSources(cp), allVerifiers);
     if (leak) {
       throw new FixtureValidationError(
         fixtureId,
