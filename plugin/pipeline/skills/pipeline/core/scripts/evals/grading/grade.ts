@@ -21,6 +21,8 @@ import { gradePlanning } from "./graders/planning.ts";
 import { buildVerifierEvidenceArtifact } from "../trajectory/collect.ts";
 import { writeContentAddressedArtifact, type ArtifactStoreDeps } from "../trajectory/store.ts";
 import type { CellRecord, EvalMode, ExperimentManifest, Fixture } from "../types.ts";
+import { isMultiChangeFixture } from "../types.ts";
+import { gradeMultiChangeLineage, type MultiChangeCheckpointEvidence } from "../multi-change.ts";
 import type { BoundCeilings } from "../trajectory/bound.ts";
 import type { ArtifactDescriptor } from "../trajectory/types.ts";
 import type { PipelineConfig } from "../../types.ts";
@@ -65,7 +67,9 @@ function parseJsonl<T>(text: string): T[] {
 
 /** The grader applicable to a manifest's mode, if any. `plan-review`,
  *  `shipcheck`, and `end-to-end` have no single grader; paired modes grade
- *  the final worktree via the implementation-fix grader (#601). */
+ *  the final worktree via the implementation-fix grader (#601). Multi-change
+ *  fixtures (#577) are graded by fixture kind, not mode — see
+ *  `graderIdForCell`. */
 export function graderIdForMode(mode: EvalMode): string | null {
   if (mode === "implementing" || mode === "fix") return "implementation-fix";
   // Paired cells complete with a final worktree state — grade that tree the
@@ -74,6 +78,13 @@ export function graderIdForMode(mode: EvalMode): string | null {
   if (mode === "review") return "review";
   if (mode === "planning") return "planning";
   return null;
+}
+
+/** Resolve the grader for a completed cell: multi-change fixtures always use
+ *  the multi-change grader (#577); otherwise the mode's default grader. */
+export function graderIdForCell(mode: EvalMode, fixture: Fixture): string | null {
+  if (isMultiChangeFixture(fixture)) return "multi-change";
+  return graderIdForMode(mode);
 }
 
 export interface GradeExperimentResult {
@@ -155,7 +166,6 @@ export async function gradeExperiment(
   const failuresText = await readFileFn(path.join(dir, "failures.jsonl"));
   const failures = failuresText ? parseJsonl<CellRecord>(failuresText) : [];
 
-  const graderId = graderIdForMode(manifest.mode);
   const grades: GradeRecord[] = [];
   const skipped: SkippedCell[] = [];
   const baselineCache = new Map<string, Record<string, boolean>>();
@@ -188,6 +198,7 @@ export async function gradeExperiment(
       });
       continue;
     }
+    const graderId = graderIdForCell(manifest.mode, fixture);
     if (!graderId) {
       // The manifest's mode has no single applicable grader (e.g.
       // `end-to-end`, `plan-review`), but the executor may still have
@@ -266,7 +277,36 @@ export async function gradeExperiment(
     }
 
     const detail = record.detail ?? {};
-    if (graderId === "implementation-fix") {
+    if (graderId === "multi-change") {
+      const mc = detail.multi_change as { checkpoints?: MultiChangeCheckpointEvidence[] } | undefined;
+      const evidence = mc?.checkpoints ?? [];
+      if (evidence.length === 0) {
+        skipped.push({
+          ...identity,
+          reason: `multi-change cell has no checkpoint evidence trail to grade`,
+        });
+        continue;
+      }
+      const grade = gradeMultiChangeLineage(fixture, evidence);
+      const { descriptor: verifierArtifact, error: verifierArtifactError } = await emitVerifierArtifact(
+        identity,
+        ref.grader,
+        ref.version,
+        { checkpoint_count: evidence.length, profile: (mc as { profile?: string } | undefined)?.profile },
+        evidence.map((e) => ({
+          checkpoint_id: e.checkpoint_id,
+          verifier_results: e.verifier_results,
+        })),
+        grade,
+      );
+      grades.push({
+        ...identity,
+        graders: [{ grader: ref.grader, version: ref.version }],
+        payload: { kind: "multi-change", grade },
+        ...(verifierArtifact ? { verifier_artifact: verifierArtifact } : {}),
+        ...(verifierArtifactError ? { verifier_artifact_error: verifierArtifactError } : {}),
+      });
+    } else if (graderId === "implementation-fix") {
       const candidateChecks = (detail.checks as Record<string, boolean>) ?? {};
       const allChecks = [...fixture.public_checks, ...(fixture.hidden_checks ?? [])];
       let baseline = baselineCache.get(fixture.fixture_id);

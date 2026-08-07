@@ -14,11 +14,16 @@ import { paretoFrontier, type ParetoPoint } from "./pareto.ts";
 import { groupBy, type GroupableEntry } from "./grouping.ts";
 import { costFromDetail, summarizeCost } from "./cost.ts";
 import type { CellRecord, ExperimentManifest, Fixture, RunPlan } from "../types.ts";
+import { MULTI_CHANGE_TREATMENT_PROFILES } from "../types.ts";
 import type { ArtifactDescriptor } from "../trajectory/types.ts";
-import type { GradeRecord, JudgeDisagreementRecord, ReviewGrade } from "../grading/types.ts";
+import type { GradeRecord, JudgeDisagreementRecord, MultiChangeGradePayload, ReviewGrade } from "../grading/types.ts";
 import type {
   GroupDimension,
   LinkedArtifactEntry,
+  MultiChangeCheckpointReport,
+  MultiChangeCheckpointTreatmentMetrics,
+  MultiChangeReport,
+  MultiChangeTreatmentLineageSummary,
   PairedTreatmentDiagnostics,
   ReliabilityRates,
   Summary,
@@ -344,6 +349,8 @@ export function generateSummary(
     groups[dimension] = groupBy(groupableEntries, dimension);
   }
 
+  const multiChange = buildMultiChangeReport(grades, runs, opts.baselineTreatmentId, intervalMethod, underpoweredThreshold);
+
   return {
     schema_version: SUMMARY_SCHEMA_VERSION,
     experiment_id: manifest.experiment_id,
@@ -359,6 +366,227 @@ export function generateSummary(
     ...(opts.linkArtifacts
       ? { linked_artifacts: computeLinkedArtifacts(runs, failures, grades, disagreements, qualityByTreatmentFlat) }
       : {}),
+    ...(multiChange ? { multi_change: multiChange } : {}),
+  };
+}
+
+/**
+ * Build multi-change comparative metrics (#577): pair within fixture ×
+ * checkpoint index; separate defect states, effort, growth, and structural
+ * telemetry; never emit a synthetic maintainability/slop score.
+ */
+export function buildMultiChangeReport(
+  grades: GradeRecord[],
+  runs: CellRecord[],
+  baselineTreatmentId: string,
+  intervalMethod: ReturnType<typeof defaultIntervalMethod>,
+  underpoweredThreshold: number,
+): MultiChangeReport | null {
+  const mcGrades = grades.filter((g) => g.payload.kind === "multi-change");
+  if (mcGrades.length === 0) return null;
+
+  const runByCell = new Map(runs.map((r) => [r.cell_id, r]));
+
+  // Key: fixture_id|checkpoint_index|checkpoint_id → treatment metrics accumulators
+  type Acc = {
+    fixture_id: string;
+    checkpoint_id: string;
+    checkpoint_index: number;
+    treatment_id: string;
+    strict: number[];
+    current: number[];
+    inherited: number[];
+    accumulated: number[];
+    recovered: number[];
+    durations: number[];
+    costs: ReturnType<typeof costFromDetail>[];
+    retries: number[];
+    interventions: number[];
+    filesAdded: number[];
+    amplification: number[];
+    models: (string | null)[];
+    portability: boolean;
+    structural: Record<string, number[]>;
+  };
+  const accByKey = new Map<string, Acc>();
+
+  const lineageTerminal = new Map<string, boolean[]>(); // treatment_id → terminal flags
+
+  for (const grade of mcGrades) {
+    const payload = grade.payload as { kind: "multi-change"; grade: MultiChangeGradePayload };
+    const g = payload.grade;
+    if (!lineageTerminal.has(grade.treatment_id)) lineageTerminal.set(grade.treatment_id, []);
+    lineageTerminal.get(grade.treatment_id)!.push(g.terminal_all_green);
+
+    for (const cp of g.checkpoints) {
+      const key = `${grade.fixture_id}|${cp.checkpoint_index}|${cp.checkpoint_id}|${grade.treatment_id}`;
+      let acc = accByKey.get(key);
+      if (!acc) {
+        acc = {
+          fixture_id: grade.fixture_id,
+          checkpoint_id: cp.checkpoint_id,
+          checkpoint_index: cp.checkpoint_index,
+          treatment_id: grade.treatment_id,
+          strict: [],
+          current: [],
+          inherited: [],
+          accumulated: [],
+          recovered: [],
+          durations: [],
+          costs: [],
+          retries: [],
+          interventions: [],
+          filesAdded: [],
+          amplification: [],
+          models: [],
+          portability: cp.portability_probe,
+          structural: {},
+        };
+        accByKey.set(key, acc);
+      }
+      acc.strict.push(cp.strict_pass ? 1 : 0);
+      acc.current.push(cp.current_step_defects.length);
+      acc.inherited.push(cp.inherited_defects.length);
+      acc.accumulated.push(cp.accumulated_unresolved.length);
+      acc.recovered.push(cp.recovered_defects.length);
+      acc.models.push(cp.model);
+      if (cp.portability_probe) acc.portability = true;
+      if (typeof cp.resource.duration_sec === "number") acc.durations.push(cp.resource.duration_sec);
+      if (typeof cp.resource.retries === "number") acc.retries.push(cp.resource.retries);
+      if (typeof cp.resource.interventions === "number") acc.interventions.push(cp.resource.interventions);
+      // Per-step cost: prefer checkpoint resource, fall back to cell detail.
+      if (cp.resource.cost_source === "actual" || cp.resource.cost_source === "estimated") {
+        acc.costs.push({
+          cost_source: cp.resource.cost_source,
+          cost_usd: typeof cp.resource.cost_usd === "number" ? cp.resource.cost_usd : null,
+        });
+      } else {
+        const run = runByCell.get(grade.cell_id);
+        acc.costs.push(costFromDetail(run?.detail));
+      }
+      const growth = cp.growth as { files_added?: number; change_amplification?: number } | undefined;
+      if (typeof growth?.files_added === "number") acc.filesAdded.push(growth.files_added);
+      if (typeof growth?.change_amplification === "number") acc.amplification.push(growth.change_amplification);
+      const st = cp.structural_telemetry as { metrics?: Record<string, number | null> } | undefined;
+      if (st?.metrics) {
+        for (const [mk, mv] of Object.entries(st.metrics)) {
+          if (typeof mv === "number") {
+            if (!acc.structural[mk]) acc.structural[mk] = [];
+            acc.structural[mk].push(mv);
+          }
+        }
+      }
+    }
+  }
+
+  const mean = (xs: number[]): number | null =>
+    xs.length === 0 ? null : xs.reduce((a, b) => a + b, 0) / xs.length;
+
+  // Group by fixture × checkpoint for aligned pairing.
+  const byCpKey = new Map<string, Acc[]>();
+  for (const acc of accByKey.values()) {
+    const k = `${acc.fixture_id}|${acc.checkpoint_index}|${acc.checkpoint_id}`;
+    if (!byCpKey.has(k)) byCpKey.set(k, []);
+    byCpKey.get(k)!.push(acc);
+  }
+
+  const by_checkpoint: MultiChangeCheckpointReport[] = [...byCpKey.entries()]
+    .map(([, accs]) => {
+      const first = accs[0];
+      const treatments: MultiChangeCheckpointTreatmentMetrics[] = accs
+        .map((acc) => {
+          const model =
+            acc.models.find((m) => m !== null && m !== undefined) ??
+            acc.models[0] ??
+            null;
+          const structural_telemetry: Record<string, number | null> = {};
+          for (const [mk, vals] of Object.entries(acc.structural)) {
+            structural_telemetry[mk] = mean(vals);
+          }
+          return {
+            treatment_id: acc.treatment_id,
+            model,
+            portability_probe: acc.portability,
+            strict_pass_rate: mean(acc.strict) ?? 0,
+            n: acc.strict.length,
+            current_step_defects_mean: mean(acc.current) ?? 0,
+            inherited_defects_mean: mean(acc.inherited) ?? 0,
+            accumulated_unresolved_mean: mean(acc.accumulated) ?? 0,
+            recovered_defects_mean: mean(acc.recovered) ?? 0,
+            mean_duration_sec: mean(acc.durations),
+            cost: summarizeCost(acc.costs),
+            mean_retries: mean(acc.retries),
+            mean_interventions: mean(acc.interventions),
+            growth: {
+              mean_files_added: mean(acc.filesAdded),
+              mean_change_amplification: mean(acc.amplification),
+            },
+            ...(Object.keys(structural_telemetry).length > 0
+              ? { structural_telemetry }
+              : {}),
+          };
+        })
+        .sort((a, b) => a.treatment_id.localeCompare(b.treatment_id));
+      return {
+        fixture_id: first.fixture_id,
+        checkpoint_id: first.checkpoint_id,
+        checkpoint_index: first.checkpoint_index,
+        treatments,
+      };
+    })
+    .sort((a, b) =>
+      a.fixture_id.localeCompare(b.fixture_id) ||
+      a.checkpoint_index - b.checkpoint_index,
+    );
+
+  const lineages: MultiChangeTreatmentLineageSummary[] = [...lineageTerminal.entries()]
+    .map(([treatment_id, flags]) => {
+      const rate = flags.length === 0 ? 0 : flags.filter(Boolean).length / flags.length;
+      const isBaseline = treatment_id === baselineTreatmentId;
+      let quality_delta_vs_baseline = null;
+      if (!isBaseline) {
+        const baseFlags = lineageTerminal.get(baselineTreatmentId) ?? [];
+        // Pair by index when lengths match; otherwise unpaired mean delta.
+        const n = Math.min(flags.length, baseFlags.length);
+        const deltas: number[] = [];
+        for (let i = 0; i < n; i++) {
+          deltas.push((flags[i] ? 1 : 0) - (baseFlags[i] ? 1 : 0));
+        }
+        quality_delta_vs_baseline = bootstrapEffect(deltas, intervalMethod, underpoweredThreshold);
+      }
+      return {
+        treatment_id,
+        terminal_all_green_rate: rate,
+        n_lineages: flags.length,
+        baseline_treatment_id: isBaseline ? null : baselineTreatmentId,
+        quality_delta_vs_baseline,
+      };
+    })
+    .sort((a, b) => a.treatment_id.localeCompare(b.treatment_id));
+
+  // Optional variants not present → not-run (never zeroed quality).
+  const presentProfiles = new Set<string>();
+  for (const g of mcGrades) {
+    const run = runByCell.get(g.cell_id);
+    const profile = (run?.detail?.multi_change as { profile?: string } | undefined)?.profile;
+    if (profile) presentProfiles.add(profile);
+    // Also infer from treatment_id profile= axis.
+    const m = /profile=([^,/]+)/.exec(g.treatment_id);
+    if (m) presentProfiles.add(m[1]);
+  }
+  const variants_not_run = MULTI_CHANGE_TREATMENT_PROFILES.filter(
+    (p) =>
+      p !== "bare" &&
+      p !== "just-solve" &&
+      p !== "pipeline-current" &&
+      !presentProfiles.has(p),
+  );
+
+  return {
+    by_checkpoint,
+    lineages,
+    variants_not_run: [...variants_not_run].sort(),
+    structural_telemetry_is_not_ground_truth: true,
   };
 }
 

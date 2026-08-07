@@ -137,14 +137,94 @@ export interface GraderRef {
   version: string;
 }
 
+/** Fixture form discriminator (#577 multi-change maintainability). Absent or
+ *  `"single_task"` is the legacy single-task shape; `"multi_change"` requires
+ *  a non-empty ordered `checkpoints` list. */
+export type FixtureKind = "single_task" | "multi_change";
+
+/** One deterministic held-out verifier on a multi-change checkpoint (#577).
+ *  Never exposed to the treatment; run only by the runner/grader. */
+export interface MultiChangeHeldOutVerifier {
+  /** Stable id for defect accounting across the lineage. Unique within the
+   *  fixture's full verifier closure. */
+  verifier_id: string;
+  /** Shell command; exit 0 = pass. Bodies must not appear in task_input. */
+  check: string;
+}
+
+/** Optional weaker/cheaper model override applied only at a portability-probe
+ *  checkpoint (#577). Coordinates the runner can honor for that step alone. */
+export interface PortabilityModelOverride {
+  model: string;
+  harness?: string;
+  effort?: string;
+}
+
+/** One ordered step in a multi-change maintainability fixture (#577). */
+export interface MultiChangeCheckpoint {
+  /** Stable id unique within the fixture. */
+  checkpoint_id: string;
+  /** Requirement disclosed only at this step (incremental disclosure). */
+  task_input: string;
+  /** Held-out verifiers for newly requested behavior at this step. */
+  held_out_verifiers: MultiChangeHeldOutVerifier[];
+  /** Optional stage-entry artifacts for this step only. When absent, the
+   *  fixture-level `stage_entry_artifacts` are used. */
+  stage_entry_artifacts?: Partial<Record<EvalStageName, unknown>>;
+  /** Optional public checks the treatment may run itself (never held-out). */
+  public_checks?: string[];
+  /** When true, this checkpoint is designed so a test-passing shortcut can
+   *  raise later inherited-verifier or amplification cost. */
+  introduces_shortcut_debt?: boolean;
+  /** Portability probe: apply a weaker/cheaper model only at this step. */
+  portability?: PortabilityModelOverride;
+}
+
+/** Optional corpus/role metadata on a multi-change fixture (#577). Not
+ *  required for validation. */
+export interface MultiChangeRoles {
+  /** Fixture demonstrates early test-passing shortcut debt. */
+  shortcut_debt?: boolean;
+  /** Curated external canary packaging mark. */
+  external_canary?: boolean;
+  /** Provenance/label for an external canary (e.g. "slopcodebench-curated"). */
+  external_canary_provenance?: string;
+}
+
+/**
+ * Controlled multi-change treatment profiles (#577). Same checkpoint prompts
+ * and verifiers; only the harness graph / feedback path differs. `#575`
+ * design-dossier is optional and never required for bare-vs-pipeline.
+ */
+export const MULTI_CHANGE_TREATMENT_PROFILES = [
+  "bare",
+  "just-solve",
+  "pipeline-current",
+  "adversarial-review",
+  "quality-feedback",
+  "design-dossier",
+] as const;
+export type MultiChangeTreatmentProfile = (typeof MULTI_CHANGE_TREATMENT_PROFILES)[number];
+
+/** True when a treatment profile is the minimal bare / just-solve path. */
+export function isBareMultiChangeProfile(profile: string | undefined): boolean {
+  return profile === undefined || profile === "bare" || profile === "just-solve";
+}
+
 /** One frozen task. Self-contained: entering any stage it supports requires
  *  no data beyond the fixture and the repository at base_commit. */
 export interface Fixture {
   fixture_id: string;
   schema_version: number;
+  /**
+   * Fixture form (#577). Absent means single-task (backward compatible).
+   * `"multi_change"` requires a non-empty ordered `checkpoints` array.
+   */
+  kind?: FixtureKind;
   /** Full, immutable 40-char commit SHA. */
   base_commit: string;
-  /** The issue/spec text under evaluation. */
+  /** The issue/spec text under evaluation. For multi-change fixtures this is
+   *  a sequence synopsis only — treatments receive per-checkpoint task_input. */
   task_input: string;
   /** Frozen inputs keyed by the stage they let the runner enter directly. */
   stage_entry_artifacts: Partial<Record<EvalStageName, unknown>>;
@@ -153,6 +233,10 @@ export interface Fixture {
   /** Checks resolvable only by the grading layer — never exposed to a
    *  treatment. Disjoint from `public_checks` by construction (fixture.ts). */
   hidden_checks?: string[];
+  /** Ordered multi-change checkpoints (#577). Present iff kind is multi_change. */
+  checkpoints?: MultiChangeCheckpoint[];
+  /** Optional multi-change role metadata (#577). */
+  roles?: MultiChangeRoles;
   /** Ground truth for review grading. */
   seeded_defects?: SeededDefect[];
   /** Checkable statements a correct implementation/fix or planning result
@@ -186,6 +270,11 @@ export interface Fixture {
   base_commit_bootstrap?: string;
 }
 
+/** True when the fixture is a multi-change maintainability sequence (#577). */
+export function isMultiChangeFixture(fixture: Fixture): boolean {
+  return fixture.kind === "multi_change";
+}
+
 export const SUPPORTED_FIXTURE_SCHEMA_VERSIONS = [1] as const;
 export const SUPPORTED_MANIFEST_SCHEMA_VERSIONS = [1] as const;
 
@@ -198,6 +287,9 @@ export const SUPPORTED_GRADER_VERSIONS: Record<string, readonly string[]> = {
   "implementation-fix": ["1"],
   review: ["1"],
   planning: ["1"],
+  /** Multi-change maintainability grader: new + inherited held-out verifiers
+   *  and defect-state accounting (#577). */
+  "multi-change": ["1"],
 };
 
 /** One value on the treatment matrix. Every axis is optional — a manifest may
@@ -215,6 +307,13 @@ export interface TreatmentAxes {
    *  values are uniformly string[]; manifest.ts parses and validates each
    *  entry against the same allowlist a committed executor's `params:` uses). */
   params?: string[];
+  /**
+   * Multi-change treatment profile axis (#577): `bare` / `just-solve` vs
+   * `pipeline-current` and optional controlled variants. Same checkpoint
+   * prompts and verifiers; only the execution graph differs. Ignored for
+   * single-task fixtures.
+   */
+  profile?: string[];
 }
 
 /** One concrete point in the treatment matrix, after expansion.
@@ -228,6 +327,11 @@ export interface Treatment {
   executor?: string;
   /** Parsed from the manifest's JSON-encoded `params` axis value (#434 task 6.1). */
   params?: ModelEndpointParams;
+  /**
+   * Multi-change treatment profile (#577). When set on a multi-change cell,
+   * selects bare vs pipeline-current (or an optional controlled variant).
+   */
+  profile?: string;
   /** Named-pair treatment id (equals the pair's declared `id`). */
   id?: string;
   /** Primary (implementer) role coordinates for a named-pair treatment. */

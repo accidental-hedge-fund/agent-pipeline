@@ -193,6 +193,14 @@ export async function runStaticFixturePreflight(
 
   // 2. Static path-token sanity on public + hidden check commands.
   const allChecks = [...fixture.public_checks, ...(fixture.hidden_checks ?? [])];
+  // Multi-change held-out verifiers (#577) are also deterministic check commands.
+  if (fixture.kind === "multi_change" && fixture.checkpoints) {
+    for (const cp of fixture.checkpoints) {
+      for (const v of cp.held_out_verifiers) {
+        allChecks.push(v.check);
+      }
+    }
+  }
   for (const cmd of allChecks) {
     const bad = findDisallowedTestRootTokens(cmd);
     for (const tok of bad) {
@@ -204,6 +212,49 @@ export async function runStaticFixturePreflight(
           `Rewrite the check on fixture "${fixture.fixture_id}" to use core/test/... (not root test/...).`,
         ),
       );
+    }
+  }
+
+  // 2b. Multi-change structural integrity (#577): non-empty checkpoints already
+  // validated at load; re-assert verifier_id uniqueness and non-empty checks
+  // without model spend.
+  if (fixture.kind === "multi_change") {
+    if (!fixture.checkpoints || fixture.checkpoints.length === 0) {
+      failures.push(
+        fail(
+          fixture.fixture_id,
+          "multi_change_checkpoints",
+          `multi_change fixture declares no checkpoints`,
+          `Add a non-empty checkpoints array to fixture "${fixture.fixture_id}".`,
+        ),
+      );
+    } else {
+      const ids = new Set<string>();
+      for (const cp of fixture.checkpoints) {
+        if (cp.held_out_verifiers.length === 0) {
+          failures.push(
+            fail(
+              fixture.fixture_id,
+              "multi_change_verifiers",
+              `checkpoint ${JSON.stringify(cp.checkpoint_id)} has no held_out_verifiers`,
+              `Add at least one held-out verifier to checkpoint "${cp.checkpoint_id}".`,
+            ),
+          );
+        }
+        for (const v of cp.held_out_verifiers) {
+          if (ids.has(v.verifier_id)) {
+            failures.push(
+              fail(
+                fixture.fixture_id,
+                "multi_change_verifiers",
+                `duplicate verifier_id ${JSON.stringify(v.verifier_id)}`,
+                `Make verifier_id unique across the multi-change fixture.`,
+              ),
+            );
+          }
+          ids.add(v.verifier_id);
+        }
+      }
     }
   }
 

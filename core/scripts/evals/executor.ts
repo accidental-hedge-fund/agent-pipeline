@@ -29,6 +29,7 @@ import { runPairedCellLoop } from "./paired-loop.ts";
 import { isJsonVerdictShaped, parseProseReview, parseStrictVerdict, parseStructuredVerdict } from "../stages/review-parsing.ts";
 import type { BuildTreatmentTrajectoryInput, RawStageEntry } from "./trajectory/collect.ts";
 import {
+  isMultiChangeFixture,
   isPairedEvalMode,
   type BoundaryDenial,
   type BoundaryEvidence,
@@ -43,6 +44,16 @@ import {
   type SandboxMode,
   type Treatment,
 } from "./types.ts";
+import {
+  computeGrowthFromPaths,
+  hashPrompt,
+  inheritedVerifiers,
+  materializeMultiChangeCheckpointPrompt,
+  resolveCheckpointCoordinates,
+  resolveMultiChangeProfile,
+  type MultiChangeCheckpointEvidence,
+} from "./multi-change.ts";
+import { createHash } from "node:crypto";
 
 function sanitizeForPath(cellId: string): string {
   return cellId.replace(/[^a-zA-Z0-9._-]/g, "-");
@@ -244,6 +255,9 @@ export interface CellExecutionDeps {
    *  given worktree. Only invoked when the fixture declares
    *  `allowed_change_paths` (out-of-scope-change grading needs it). */
   getChangedPaths?: (args: { worktreeDir: string; baseSha: string }) => Promise<string[]>;
+  /** Fingerprint the worktree tree state for multi-change evidence trails
+   *  (#577). Defaults to hashing `git status --porcelain` + `git rev-parse HEAD`. */
+  getRepoFingerprint?: (args: { worktreeDir: string }) => Promise<string>;
   /** Full unified diff text for the worktree vs baseSha — used by paired modes
    *  so the reviewer sees the actual primary implementation (#601). */
   getDiff?: (args: { worktreeDir: string; baseSha: string }) => Promise<string>;
@@ -322,6 +336,23 @@ async function defaultGetChangedPaths(args: { worktreeDir: string; baseSha: stri
     return stdout.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
   } catch {
     return [];
+  }
+}
+
+async function defaultGetRepoFingerprint(args: { worktreeDir: string }): Promise<string> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileAsync = promisify(execFile);
+  try {
+    const [head, status] = await Promise.all([
+      execFileAsync("git", ["rev-parse", "HEAD"], { cwd: args.worktreeDir, timeout: 15_000 }),
+      execFileAsync("git", ["status", "--porcelain"], { cwd: args.worktreeDir, timeout: 15_000 }),
+    ]);
+    return createHash("sha256")
+      .update(`${head.stdout.trim()}\n${status.stdout}`)
+      .digest("hex");
+  } catch (err) {
+    return createHash("sha256").update(`fingerprint-error:${(err as Error).message}`).digest("hex");
   }
 }
 
@@ -659,10 +690,395 @@ export interface CellExecutionResult {
   trajectory: BuildTreatmentTrajectoryInput;
 }
 
+/**
+ * Multi-change lineage (#577): ordered checkpoints on one worktree with fresh
+ * session context each step. Quality non-strict failures continue the lineage;
+ * infra/auth/timeout abort with the existing non-quality result classes.
+ */
+async function runMultiChangeLineage(args: {
+  cfg: PipelineConfig;
+  cell: Cell;
+  fixture: Fixture;
+  manifest: ExperimentManifest;
+  identity: CellIdentity;
+  cellDeadlineMs: number;
+  trajectoryActions: string[];
+  trajectoryStages: RawStageEntry[];
+  environmentDetail: unknown;
+  invokeHarnessFn: NonNullable<CellExecutionDeps["invokeHarness"]>;
+  preflightFn: NonNullable<CellExecutionDeps["preflight"]>;
+  deps: CellExecutionDeps;
+  finish: (outcome: CellOutcome) => CellExecutionResult;
+  setMaterializedPrompt: (prompt: string) => void;
+}): Promise<CellExecutionResult> {
+  const {
+    cell,
+    fixture,
+    manifest,
+    identity,
+    cellDeadlineMs,
+    trajectoryActions,
+    trajectoryStages,
+    environmentDetail,
+    invokeHarnessFn,
+    preflightFn,
+    deps,
+    finish,
+    setMaterializedPrompt,
+  } = args;
+
+  const checkpoints = fixture.checkpoints ?? [];
+  if (checkpoints.length === 0) {
+    return finish({
+      result_class: "infra_error",
+      error: `multi-change fixture "${fixture.fixture_id}" has no checkpoints`,
+    });
+  }
+
+  const profile = resolveMultiChangeProfile(cell.treatment, cell.mode);
+  const evidence: MultiChangeCheckpointEvidence[] = [];
+  const promptParts: string[] = [];
+  let previousChangedPaths: string[] = [];
+  const getChangedPathsFn = deps.getChangedPaths ?? defaultGetChangedPaths;
+  const getRepoFingerprintFn = deps.getRepoFingerprint ?? defaultGetRepoFingerprint;
+  const runChecksFn = deps.runChecks ?? defaultRunChecks;
+
+  for (let k = 0; k < checkpoints.length; k++) {
+    const checkpoint = checkpoints[k];
+    const remainingMs = cellDeadlineMs - Date.now();
+    if (remainingMs <= 0) {
+      const error = `multi-change cell exceeded its ${manifest.timeout}s timeout before checkpoint "${checkpoint.checkpoint_id}"`;
+      trajectoryActions.push(error);
+      return finish({
+        result_class: "timeout",
+        error,
+        detail: {
+          multi_change: {
+            profile,
+            checkpoints: evidence,
+            aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "timeout" },
+          },
+          ...(environmentDetail !== undefined ? { environment: environmentDetail } : {}),
+        },
+      });
+    }
+
+    // Fresh session identity per checkpoint — no chat carry-over.
+    const sessionId = `${identity.sessionId}-cp-${checkpoint.checkpoint_id}`;
+    const coords = resolveCheckpointCoordinates(cell.treatment, checkpoint);
+    const effectiveHarness = coords.harness ?? cell.treatment.harness ?? "claude";
+    const resolvedModel = resolveTreatmentModel(effectiveHarness, {
+      provider: cell.treatment.provider,
+      model: coords.model,
+    });
+    if (!resolvedModel.ok) {
+      trajectoryActions.push(resolvedModel.error);
+      return finish({
+        result_class: "infra_error",
+        error: resolvedModel.error,
+        detail: {
+          multi_change: {
+            profile,
+            checkpoints: evidence,
+            aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "infra_error" },
+          },
+        },
+      });
+    }
+
+    const prompt = materializeMultiChangeCheckpointPrompt(fixture, checkpoint, profile);
+    promptParts.push(prompt);
+    setMaterializedPrompt(promptParts.join("\n\n---\n\n"));
+
+    // Optional preflight for harness credentials (auth classification).
+    if (coords.harness ?? cell.treatment.harness) {
+      try {
+        const preflightResult = await preflightFn(effectiveHarness, {
+          model: resolvedModel.model,
+          effort: coords.effort,
+        });
+        if (!preflightResult.ok) {
+          const resultClass = preflightResult.failure === "unauthenticated" ? "auth_error" : "infra_error";
+          const error = preflightResult.message ?? preflightResult.failure ?? "preflight failed";
+          trajectoryActions.push(`checkpoint "${checkpoint.checkpoint_id}" preflight failed: ${error}`);
+          return finish({
+            result_class: resultClass,
+            error,
+            detail: {
+              multi_change: {
+                profile,
+                checkpoints: evidence,
+                aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: resultClass },
+              },
+            },
+          });
+        }
+      } catch (err) {
+        const error = `preflight failed: ${(err as Error).message}`;
+        trajectoryActions.push(`checkpoint "${checkpoint.checkpoint_id}": ${error}`);
+        return finish({
+          result_class: "infra_error",
+          error,
+          detail: {
+            multi_change: {
+              profile,
+              checkpoints: evidence,
+              aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "infra_error" },
+            },
+          },
+        });
+      }
+    }
+
+    // Pipeline-current / adversarial: one implement invoke; optional second
+    // review-oriented invoke for non-bare profiles (still fresh context each
+    // sub-step is not required — the checkpoint boundary is the fresh context).
+    const stepStart = Date.now();
+    const invokes: Array<{ role: string; prompt: string }> = [{ role: "implement", prompt }];
+    if (profile === "pipeline-current" || profile === "adversarial-review") {
+      invokes.push({
+        role: profile === "adversarial-review" ? "adversarial-review" : "review",
+        prompt: [
+          profile === "adversarial-review"
+            ? "Adversarially review the current worktree changes for the requirement below. Return findings as structured JSON if possible."
+            : "Review the current worktree changes for the requirement below. Return findings as structured JSON if possible.",
+          "",
+          "## Requirement under review",
+          checkpoint.task_input,
+        ].join("\n"),
+      });
+    }
+
+    let stepDuration = 0;
+    let stepTokens: number | null = null;
+    let stepCost: number | null = null;
+    let stepCostSource: "actual" | "estimated" | "unknown" = "unknown";
+
+    for (const inv of invokes) {
+      const invRemaining = cellDeadlineMs - Date.now();
+      if (invRemaining <= 0) {
+        const error = `multi-change cell exceeded its ${manifest.timeout}s timeout during checkpoint "${checkpoint.checkpoint_id}"`;
+        trajectoryActions.push(error);
+        return finish({
+          result_class: "timeout",
+          error,
+          detail: {
+            multi_change: {
+              profile,
+              checkpoints: evidence,
+              aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "timeout" },
+            },
+          },
+        });
+      }
+
+      let result: HarnessInvokeResultLike;
+      try {
+        result = await invokeHarnessFn({
+          harness: effectiveHarness,
+          worktreeDir: identity.worktreePath,
+          prompt: inv.prompt,
+          timeoutSec: Math.max(1, Math.ceil(invRemaining / 1000)),
+          model: resolvedModel.model,
+          effort: coords.effort,
+          // Fresh session id per checkpoint — never reuse prior checkpoint chat.
+          env: {
+            ...evalIsolationEnv(identity.worktreePath),
+            PIPELINE_EVAL_SESSION_ID: sessionId,
+            PIPELINE_EVAL_CHECKPOINT_ID: checkpoint.checkpoint_id,
+          },
+          sandboxMode: manifest.sandbox_mode,
+        });
+      } catch (err) {
+        const error = `harness invocation failed: ${(err as Error).message}`;
+        trajectoryActions.push(`checkpoint "${checkpoint.checkpoint_id}" ${inv.role}: ${error}`);
+        return finish({
+          result_class: "infra_error",
+          error,
+          detail: {
+            multi_change: {
+              profile,
+              checkpoints: evidence,
+              aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "infra_error" },
+            },
+          },
+        });
+      }
+
+      stepDuration += result.duration;
+      trajectoryStages.push({
+        stage: inv.role,
+        message: inv.prompt,
+        output: result.stdout,
+        error: result.success ? undefined : result.stderr,
+        duration_ms: Math.round(result.duration * 1000),
+        success: result.success,
+      });
+
+      if (result.timed_out) {
+        return finish({
+          result_class: "timeout",
+          error: `checkpoint "${checkpoint.checkpoint_id}" ${inv.role} exceeded the per-cell timeout`,
+          detail: {
+            multi_change: {
+              profile,
+              checkpoints: evidence,
+              aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "timeout" },
+            },
+          },
+        });
+      }
+      if (result.spawn_error) {
+        return finish({
+          result_class: "infra_error",
+          error: `checkpoint "${checkpoint.checkpoint_id}" ${inv.role} failed to spawn the harness process`,
+          detail: {
+            multi_change: {
+              profile,
+              checkpoints: evidence,
+              aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "infra_error" },
+            },
+          },
+        });
+      }
+      if (!result.success) {
+        const authFailure = await classifyPostInvocationFailure(result, preflightFn, effectiveHarness, {
+          model: resolvedModel.model,
+          effort: coords.effort,
+        });
+        if (authFailure) {
+          return finish({
+            result_class: "auth_error",
+            error: `checkpoint "${checkpoint.checkpoint_id}" ${inv.role} ${authFailure}`,
+            detail: {
+              multi_change: {
+                profile,
+                checkpoints: evidence,
+                aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "auth_error" },
+              },
+            },
+          });
+        }
+      }
+      trajectoryActions.push(
+        `checkpoint "${checkpoint.checkpoint_id}" ${inv.role} via "${effectiveHarness}" ` +
+          `(session ${sessionId}, model ${resolvedModel.model ?? "default"}, ${result.success ? "success" : "failure"})`,
+      );
+    }
+
+    // Wall time includes verifier runs below.
+    void stepStart;
+
+    // Held-out verifiers: new + inherited. Never passed to the treatment.
+    const newVerifiers = checkpoint.held_out_verifiers;
+    const inherited = inheritedVerifiers(checkpoints, k);
+    const allVerifiers = [...inherited, ...newVerifiers];
+    const checkCommands = allVerifiers.map((v) => v.check);
+    const remainingForChecks = cellDeadlineMs - Date.now();
+    if (remainingForChecks <= 0) {
+      const error = `multi-change cell exceeded its ${manifest.timeout}s timeout before verifiers at "${checkpoint.checkpoint_id}"`;
+      trajectoryActions.push(error);
+      return finish({
+        result_class: "timeout",
+        error,
+        detail: {
+          multi_change: {
+            profile,
+            checkpoints: evidence,
+            aborted: { checkpoint_id: checkpoint.checkpoint_id, result_class: "timeout" },
+          },
+        },
+      });
+    }
+
+    const checkResults =
+      checkCommands.length > 0
+        ? await runChecksFn({
+            worktreeDir: identity.worktreePath,
+            checks: checkCommands,
+            deadlineMs: remainingForChecks,
+          })
+        : {};
+
+    const verifier_results: Record<string, boolean> = {};
+    for (const v of allVerifiers) {
+      verifier_results[v.verifier_id] = checkResults[v.check] === true;
+    }
+
+    // Quality non-strict does NOT abort — continue for recovery diagnostics.
+    const anyFail = Object.values(verifier_results).some((ok) => !ok);
+    trajectoryActions.push(
+      `checkpoint "${checkpoint.checkpoint_id}" verifiers: ` +
+        `${Object.values(verifier_results).filter(Boolean).length}/${allVerifiers.length} passed` +
+        (anyFail ? " (non-strict; lineage continues)" : ""),
+    );
+
+    const changedPaths = await getChangedPathsFn({
+      worktreeDir: identity.worktreePath,
+      baseSha: cell.base_sha,
+    });
+    const growth = computeGrowthFromPaths(previousChangedPaths, changedPaths);
+    previousChangedPaths = changedPaths;
+
+    const fingerprint = await getRepoFingerprintFn({ worktreeDir: identity.worktreePath });
+
+    const stepEvidence: MultiChangeCheckpointEvidence = {
+      checkpoint_id: checkpoint.checkpoint_id,
+      checkpoint_index: k,
+      prompt_hash: hashPrompt(prompt),
+      treatment_id: cell.treatment_id,
+      treatment_profile: profile,
+      model: resolvedModel.model ?? null,
+      harness: effectiveHarness,
+      session_id: sessionId,
+      repo_fingerprint: fingerprint,
+      verifier_results,
+      new_verifier_ids: newVerifiers.map((v) => v.verifier_id),
+      inherited_verifier_ids: inherited.map((v) => v.verifier_id),
+      resource: {
+        duration_sec: stepDuration,
+        tokens: stepTokens,
+        cost_usd: stepCost,
+        cost_source: stepCostSource,
+        retries: 0,
+        interventions: 0,
+      },
+      portability_probe: coords.portability,
+      preserved_evidence_keys: ["repository_state", "pipeline_evidence_bundle"],
+      growth,
+      structural_telemetry: {
+        touch_points: changedPaths.slice(0, 50),
+        metrics: {
+          changed_path_count: changedPaths.length,
+        },
+      },
+    };
+    evidence.push(stepEvidence);
+  }
+
+  // Restore contract before completing so checks above already ran with it in place —
+  // verifiers ran with contract still installed; restoration happens in finish().
+  const detail: Record<string, unknown> = {
+    execution_class: "local-cli" as CellExecutionClass,
+    multi_change: {
+      profile,
+      checkpoints: evidence,
+      // Fresh context guarantee: one distinct session_id per checkpoint.
+      fresh_context_sessions: evidence.map((e) => e.session_id),
+    },
+  };
+  if (environmentDetail !== undefined) detail.environment = environmentDetail;
+  // Aggregate cost unknown coverage at cell level.
+  detail.cost_source = "unknown";
+
+  return finish({ result_class: "completed", detail });
+}
+
 /** Execute exactly one cell: fresh isolated worktree at the fixture's
  *  base_commit, run the stage(s) its mode requires from frozen inputs, tear
  *  the worktree down, and classify the outcome. Never throws — every failure
- *  mode is captured as a result_class. */
+ *  mode is captured as a result_class. Multi-change fixtures (#577) reuse one
+ *  worktree across ordered checkpoints with fresh model context each step. */
 export async function runCell(
   cfg: PipelineConfig,
   cell: Cell,
@@ -856,6 +1272,30 @@ export async function runCell(
         return finish({ result_class: "infra_error", error });
       }
       trajectoryActions.push(`ran setup for simulated dependency ${JSON.stringify(dep.name)}`);
+    }
+
+    // Multi-change maintainability lineage (#577): one worktree, ordered
+    // checkpoints with fresh model context each step, held-out + inherited
+    // verifiers, continue after quality non-strict failures.
+    if (isMultiChangeFixture(fixture)) {
+      return await runMultiChangeLineage({
+        cfg,
+        cell,
+        fixture,
+        manifest,
+        identity,
+        cellDeadlineMs: Date.now() + manifest.timeout * 1000,
+        trajectoryActions,
+        trajectoryStages,
+        environmentDetail,
+        invokeHarnessFn,
+        preflightFn,
+        deps,
+        finish,
+        setMaterializedPrompt: (p) => {
+          materializedPrompt = p;
+        },
+      });
     }
 
     // Paired multi-role graphs (#601): keep the eval contract + command boundary

@@ -5,6 +5,7 @@ import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import {
   EVAL_STAGE_NAMES,
+  MULTI_CHANGE_TREATMENT_PROFILES,
   PAIRED_EVAL_MODES,
   ROLE_COORDINATE_FIELDS,
   SANDBOX_MODES,
@@ -32,7 +33,7 @@ export class ManifestValidationError extends Error {
   }
 }
 
-const AXIS_KEYS = ["harness", "provider", "model", "effort", "executor", "params"] as const;
+const AXIS_KEYS = ["harness", "provider", "model", "effort", "executor", "params", "profile"] as const;
 
 const PAIRED_MODE_LIST = PAIRED_EVAL_MODES.join(", ");
 
@@ -172,6 +173,16 @@ function validateCartesianTreatments(raw: Record<string, unknown>, mode: EvalMod
     if (key === "params") {
       for (const entry of values as string[]) {
         parseParamsAxisEntry(entry, "treatments");
+      }
+    }
+    if (key === "profile") {
+      for (const entry of values as string[]) {
+        if (!(MULTI_CHANGE_TREATMENT_PROFILES as readonly string[]).includes(entry)) {
+          throw new ManifestValidationError(
+            "treatments",
+            `profile ${JSON.stringify(entry)} is not supported (expected one of: ${MULTI_CHANGE_TREATMENT_PROFILES.join(", ")})`,
+          );
+        }
       }
     }
     treatments[key as keyof TreatmentAxes] = values as string[];
