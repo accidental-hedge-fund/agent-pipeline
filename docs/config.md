@@ -376,6 +376,19 @@ Nested fields:
 - **Default:** `{}`
 - **Description:** Named executor definitions (agent-system or model-endpoint) that stage_executors can reference by name.
 
+### `factory`
+
+- **Type:** object
+- **Default:** `{"macro_controller":{"enabled":false}}`
+- **Description:** Factory lifecycle controller (#890). Disabled by default; sole Pipeline authority when enabled.
+
+Nested fields:
+
+#### `factory.macro_controller`
+
+- **Type:** object
+- **Description:** Factory macro-controller settings (#890). No auto_merge key.
+
 ### `fix_timeout`
 
 - **Type:** integer

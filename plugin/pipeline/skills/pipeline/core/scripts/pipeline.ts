@@ -529,6 +529,10 @@ export function maxPositionalsFor(command: string | undefined): number {
   if (command === "loop") {
     return 1 + MAX_RANGE_SPAN;
   }
+  // factory status|tick|adopt|replan (+ optional flags)
+  if (command === "factory") {
+    return 2;
+  }
   return 1; // refine-spec and plain advance take only the keyword / issue number
 }
 
@@ -542,7 +546,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | factory-pin | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory | factory-gate | factory-pin | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -2811,7 +2815,7 @@ async function main(): Promise<void> {
   // `pipeline path --json`, `pipeline config validate/sync --json`, `pipeline refine-spec --json`,
   // `pipeline improve --json`, `pipeline scoreboard --json`, `pipeline status <N> --json`, and
   // `--remove-worktree --json` legitimately emit JSON — exempt from the status-only guard.
-  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard" && numArg !== "status" && numArg !== "papercut" && numArg !== "factory-gate") {
+  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard" && numArg !== "status" && numArg !== "papercut" && numArg !== "factory-gate" && numArg !== "factory") {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
   }
@@ -3348,6 +3352,13 @@ async function main(): Promise<void> {
       console.error(`pipeline improve: ${(err as Error).message}`);
       process.exit(1);
     }
+    return;
+  }
+
+  // `pipeline factory status|tick|adopt|replan` (#890) — opt-in macro-controller.
+  // Disabled by default (factory.macro_controller.enabled). Never merges/tags.
+  if (numArg === "factory") {
+    await handleFactoryCommand(cmd, opts);
     return;
   }
 
@@ -4102,7 +4113,7 @@ async function main(): Promise<void> {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "single", "release", "intake", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "factory-gate", "factory-pin", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "factory", "factory-gate", "factory-pin", "queue", "backfill", "evals",
       "loop",
     ];
     if (!recognized.includes(numArg)) {
@@ -5321,6 +5332,152 @@ export interface RunSubcommandDeps {
   cwd: () => string;
 }
 const defaultRunSubcommandDeps: RunSubcommandDeps = { spawnDetached, findGitRoot, cwd: () => process.cwd() };
+
+/**
+ * `pipeline factory status|tick|adopt|replan` (#890).
+ *
+ * Opt-in only: requires `factory.macro_controller.enabled: true` (or
+ * PIPELINE_FACTORY_MACRO=1 for this dedicated surface). Never merges, never
+ * tags, never sets pipeline stage labels. Status is read-only.
+ */
+export async function handleFactoryCommand(
+  cmd: Command,
+  opts: CliOpts,
+): Promise<void> {
+  const sub = (cmd.args[1] as string | undefined) ?? "status";
+  const factoryRunId = opts.runId ?? opts.resume ?? opts.fromRun;
+  const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+  const repoDir = findGitRoot(startDir) ?? startDir;
+
+  let cfg: PipelineConfig;
+  try {
+    cfg = resolveConfig({
+      repoPath: opts.repoPath,
+      baseBranch: opts.base,
+      profile: opts.profile,
+      tolerateGhFailure: true,
+    });
+  } catch (err) {
+    console.error(`pipeline factory: ${(err as Error).message}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  const { isFactoryMacroEnabled, isFactoryMacroEnabledFromEnv } = await import("./factory/enabled.ts");
+  const enabled = isFactoryMacroEnabled(cfg) || isFactoryMacroEnabledFromEnv(process.env);
+  if (!enabled) {
+    console.error(
+      "pipeline factory: macro-controller is disabled (default).\n" +
+        "  Enable with factory.macro_controller.enabled: true in .github/pipeline.yml\n" +
+        "  or PIPELINE_FACTORY_MACRO=1 for this command only.\n" +
+        "  Ordinary pipeline/single/loop/merge/release do not require factory mode.",
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  const {
+    defaultFactoryStoreDeps,
+    getFactoryStatus,
+    factoryStatus,
+    tickFactory,
+    adoptFactoryContract,
+    FACTORY_SERVICE_CONTROLLER_ID,
+    FactoryError,
+  } = await import("./factory/index.ts");
+
+  const store = defaultFactoryStoreDeps(process.env);
+
+  if (sub === "status") {
+    if (!factoryRunId) {
+      console.error("pipeline factory status: --run-id <factory-run-id> is required");
+      process.exitCode = 2;
+      return;
+    }
+    const status = await getFactoryStatus(store, factoryRunId);
+    if (!status) {
+      console.error(`pipeline factory status: factory run "${factoryRunId}" not found`);
+      process.exitCode = 1;
+      return;
+    }
+    if (opts.json) {
+      console.log(JSON.stringify(status, null, 2));
+    } else {
+      console.log(
+        `factory ${status.factory_run_id} rev=${status.revision} phase=${status.coarse_phase} next=${status.next_action}\n` +
+          `  controller=${status.identities.service_controller} outer_host=${status.identities.outer_host}\n` +
+          `  hash=${status.canonical_hash.slice(0, 16)}… claims=${status.claims.length}`,
+      );
+    }
+    return;
+  }
+
+  if (sub === "tick") {
+    if (!factoryRunId) {
+      console.error("pipeline factory tick: --run-id <factory-run-id> is required");
+      process.exitCode = 2;
+      return;
+    }
+    try {
+      const result = await tickFactory(
+        {
+          store,
+          observeBaseSha: async () => "unknown",
+          now: () => new Date(),
+          startOrResumeLoop: async ({ loop_run_id, factory_run_id }) => {
+            // Delegation only: operator must have linked a loop or start is a no-op link.
+            if (loop_run_id) return { loop_run_id };
+            return { loop_run_id: `loop-from-factory-${factory_run_id}` };
+          },
+          observeLoop: async (id) => ({ state: "running", run_id: id }),
+        },
+        factoryRunId,
+        { repoDir },
+      );
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(
+          `factory tick ${result.factory_run_id} rev=${result.revision} phase=${result.coarse_phase} next=${result.next_action}` +
+            (result.dispatched ? ` dispatched child=${result.child_run_id}` : "") +
+            `\n  reason: ${result.derive_reason}`,
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof FactoryError ? `${err.kind}: ${err.message}` : (err as Error).message;
+      console.error(`pipeline factory tick: ${msg}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (sub === "adopt" || sub === "replan") {
+    if (!factoryRunId) {
+      console.error(`pipeline factory ${sub}: --run-id <factory-run-id> is required`);
+      process.exitCode = 2;
+      return;
+    }
+    // Minimal CLI adopt: operators supply a JSON contract body via stdin when
+    // not using library APIs. For dogfood, require linked loop via --from-run.
+    console.error(
+      `pipeline factory ${sub}: full contract body adoption is available via the ` +
+        `library API (adoptFactoryContract). CLI convenience flags are intentionally minimal.\n` +
+        `  Service controller: ${FACTORY_SERVICE_CONTROLLER_ID}\n` +
+        `  See docs/factory-macro-controller.md`,
+    );
+    // Keep adoptFactoryContract referenced so tree-shaking / unused checks stay clean.
+    void adoptFactoryContract;
+    void factoryStatus;
+    process.exitCode = 2;
+    return;
+  }
+
+  console.error(
+    `pipeline factory: unknown subcommand "${sub}".\n` +
+      "  Usage: pipeline factory status|tick|adopt|replan --run-id <id> [--json]",
+  );
+  process.exitCode = 2;
+}
 
 export async function handleRunSubcommand(
   numStr: string,

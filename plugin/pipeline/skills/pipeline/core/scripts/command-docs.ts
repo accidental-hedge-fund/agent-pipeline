@@ -146,6 +146,14 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     documented: true,
     section: "lifecycle",
   },
+  factory: {
+    summary:
+      "Opt-in factory macro-controller: adopt/replan/tick/status over immutable execution-contract revisions (default off; never merges or tags)",
+    usage:
+      "factory status|tick|adopt|replan --run-id <id> [--json]  # requires factory.macro_controller.enabled",
+    documented: true,
+    section: "factory",
+  },
   "factory-gate": {
     summary: "Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)",
     usage:

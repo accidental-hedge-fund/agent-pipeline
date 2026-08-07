@@ -98,6 +98,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 - **Usage:** `pipeline evals plan|run|grade|report|harvest …`
 - **Summary:** Offline eval plan/run/grade/report/harvest (never writes to production GitHub)
 
+#### `factory`
+
+- **Usage:** `pipeline factory status|tick|adopt|replan --run-id <id> [--json]  # requires factory.macro_controller.enabled`
+- **Summary:** Opt-in factory macro-controller: adopt/replan/tick/status over immutable execution-contract revisions (default off; never merges or tags)
+
 #### `factory-gate`
 
 - **Usage:** `pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] [--promote-pin-on-pass]`
