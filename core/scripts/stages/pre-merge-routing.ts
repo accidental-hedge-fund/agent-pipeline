@@ -672,6 +672,40 @@ export async function advance(
       }
     }
 
+    // Empty rollup is not immediately "green CI" (#882 pre-merge review).
+    // `gh pr checks` reports "no checks reported" / [] both for repos with no
+    // CI and for the normal lag before an asynchronously queued workflow
+    // creates its first check-run. Wait through the same bounded start window
+    // as no-run recovery (`ci_no_run_grace_s`, default 60s). After the window,
+    // an still-empty rollup remains passable for true no-CI repos (#95).
+    // Without a polling session there is no durable timer — fail closed by
+    // waiting unless grace is explicitly 0.
+    if (checks.length === 0) {
+      const graceMs = (cfg.ci_no_run_grace_s ?? 60) * 1000;
+      const emptyCtx = opts.pollingCtx;
+      let emptyReady = graceMs <= 0;
+      if (!emptyReady && emptyCtx) {
+        if (emptyCtx.ciGateEnteredAt === undefined) emptyCtx.ciGateEnteredAt = nowMsFn();
+        emptyReady = nowMsFn() - emptyCtx.ciGateEnteredAt >= graceMs;
+      }
+      if (!emptyReady) {
+        if (!emptyCtx?.ciWaitingGateRecorded) {
+          if (emptyCtx) emptyCtx.ciWaitingGateRecorded = true;
+          await recordPreMergeGateResult(
+            { runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+            "ci",
+            "partial",
+            "waiting for CI checks to appear",
+          );
+        }
+        return {
+          advanced: false,
+          status: "waiting",
+          reason: "waiting for CI checks to appear",
+        };
+      }
+    }
+
     const agg = parseChecksAggregate(checks);
 
     // Record CI check result evidence; skip when still pending (no result yet).

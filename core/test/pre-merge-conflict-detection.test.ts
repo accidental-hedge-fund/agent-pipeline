@@ -268,15 +268,20 @@ test("post-CI BEHIND invokes tryRebaseAndPush instead of returning waiting indef
   assert.doesNotMatch(rec.blocked[0], /merge conflict/, "must not use merge-conflict wording for an out-of-date branch");
 });
 
-test("non-conflicting PR with zero checks (no CI workflow) still advances (#95)", async (t) => {
+test("non-conflicting PR with zero checks (no CI workflow) still advances after grace (#95)", async (t) => {
+  // Empty rollup is only passable after the check-start grace window (#882 review).
+  // Polling session with grace already elapsed → no-CI pass (#95).
   const { deps, rec } = makeDeps({ mergeable: true, mergeable_state: "CLEAN" });
   deps.getPrChecks = async () => {
     rec.ciPolls++;
     return [];
   };
+  deps.nowMs = () => 60_000;
+  const cfg = { ...makeCfg(), ci_no_run_grace_s: 60 } as ReturnType<typeof makeCfg>;
+  const pollingCtx = { ciGateEnteredAt: 0 };
   let out;
   await quiet(t, async () => {
-    out = await advance(makeCfg(), ISSUE, {}, deps);
+    out = await advance(cfg, ISSUE, { pollingCtx }, deps);
   });
   assert.deepEqual(out, {
     advanced: true,
@@ -284,14 +289,39 @@ test("non-conflicting PR with zero checks (no CI workflow) still advances (#95)"
     to: "visual-gate",
     summary: `PR #${PR_NUMBER} pre-merge gates passed`,
   });
-  assert.equal(rec.ciPolls, 1, "zero checks treated as passing, exactly one consult");
+  assert.equal(rec.ciPolls, 1, "zero checks treated as passing after grace, exactly one consult");
   assert.equal(rec.rebaseCalls, 0);
   assert.deepEqual(rec.blocked, []);
 });
 
-test("non-conflicting PR: getPrChecks throws 'no checks reported' still advances (#882)", async (t) => {
+test("empty check rollup within grace window waits — does not advance as green CI (#882)", async (t) => {
+  // First "no checks reported" / [] observation must not greenlight pre-merge
+  // before Actions can attach check-runs for the reviewed SHA.
+  const { deps, rec } = makeDeps({ mergeable: true, mergeable_state: "CLEAN" });
+  deps.getPrChecks = async () => {
+    rec.ciPolls++;
+    return [];
+  };
+  deps.nowMs = () => 0;
+  const cfg = { ...makeCfg(), ci_no_run_grace_s: 60 } as ReturnType<typeof makeCfg>;
+  const pollingCtx: { ciGateEnteredAt?: number } = {};
+  let out;
+  await quiet(t, async () => {
+    out = await advance(cfg, ISSUE, { pollingCtx }, deps);
+  });
+  assert.deepEqual(out, {
+    advanced: false,
+    status: "waiting",
+    reason: "waiting for CI checks to appear",
+  });
+  assert.equal(rec.ciPolls, 1);
+  assert.equal(pollingCtx.ciGateEnteredAt, 0, "grace timer starts on first empty observation");
+  assert.deepEqual(rec.blocked, []);
+});
+
+test("non-conflicting PR: getPrChecks throws 'no checks reported' advances after grace (#882)", async (t) => {
   // Live gh exits non-zero with this message when a PR has zero check-runs.
-  // Pre-merge must not treat that as an indefinite wait (ci_timeout spin).
+  // Normalize to empty, then apply the same check-start grace as [] (#882 review).
   const { deps, rec } = makeDeps({ mergeable: true, mergeable_state: "CLEAN" });
   deps.getPrChecks = async () => {
     rec.ciPolls++;
@@ -299,9 +329,12 @@ test("non-conflicting PR: getPrChecks throws 'no checks reported' still advances
       "gh pr checks 883 failed: no checks reported on the 'pipeline/882-x' branch",
     );
   };
+  deps.nowMs = () => 60_000;
+  const cfg = { ...makeCfg(), ci_no_run_grace_s: 60 } as ReturnType<typeof makeCfg>;
+  const pollingCtx = { ciGateEnteredAt: 0 };
   let out;
   await quiet(t, async () => {
-    out = await advance(makeCfg(), ISSUE, {}, deps);
+    out = await advance(cfg, ISSUE, { pollingCtx }, deps);
   });
   assert.deepEqual(out, {
     advanced: true,
@@ -309,6 +342,31 @@ test("non-conflicting PR: getPrChecks throws 'no checks reported' still advances
     to: "visual-gate",
     summary: `PR #${PR_NUMBER} pre-merge gates passed`,
   });
-  assert.equal(rec.ciPolls, 1, "exactly one consult — no wait loop on empty-check CLI error");
+  assert.equal(rec.ciPolls, 1, "exactly one consult after grace — no ci_timeout spin");
+  assert.deepEqual(rec.blocked, []);
+});
+
+test("getPrChecks throws 'no checks reported' within grace window waits (#882)", async (t) => {
+  const { deps, rec } = makeDeps({ mergeable: true, mergeable_state: "CLEAN" });
+  deps.getPrChecks = async () => {
+    rec.ciPolls++;
+    throw new Error(
+      "gh pr checks 883 failed: no checks reported on the 'pipeline/882-x' branch",
+    );
+  };
+  deps.nowMs = () => 1_000;
+  const cfg = { ...makeCfg(), ci_no_run_grace_s: 60 } as ReturnType<typeof makeCfg>;
+  const pollingCtx: { ciGateEnteredAt?: number } = {};
+  let out;
+  await quiet(t, async () => {
+    out = await advance(cfg, ISSUE, { pollingCtx }, deps);
+  });
+  assert.deepEqual(out, {
+    advanced: false,
+    status: "waiting",
+    reason: "waiting for CI checks to appear",
+  });
+  assert.equal(rec.ciPolls, 1);
+  assert.equal(pollingCtx.ciGateEnteredAt, 1_000);
   assert.deepEqual(rec.blocked, []);
 });
