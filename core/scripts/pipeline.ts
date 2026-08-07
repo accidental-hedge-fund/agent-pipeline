@@ -5382,6 +5382,7 @@ export async function handleFactoryCommand(
     factoryStatus,
     tickFactory,
     adoptFactoryContract,
+    buildFactoryMacroDeps,
     FACTORY_SERVICE_CONTROLLER_ID,
     FactoryError,
   } = await import("./factory/index.ts");
@@ -5419,35 +5420,11 @@ export async function handleFactoryCommand(
       return;
     }
     try {
-      // Live-observation seams are mandatory on enabled ticks. This CLI path is
-      // a thin dogfood stub — library callers must inject real git/GitHub/config
-      // observers. Stub observations intentionally fail closed against real contracts.
-      const result = await tickFactory(
-        {
-          store,
-          observeBaseSha: async () => "unknown",
-          observeRepoIdentity: async () => ({
-            name: "unknown/unknown",
-            base_branch: "main",
-          }),
-          observeGithubSnapshot: async () => ({ ok: true }),
-          readConfigFingerprints: async () => ({
-            authority_policy: "unknown",
-            engine_pin: "unknown",
-            configuration: "unknown",
-            treatment: "unknown",
-          }),
-          now: () => new Date(),
-          startOrResumeLoop: async ({ loop_run_id, factory_run_id }) => {
-            // Delegation only: operator must have linked a loop or start is a no-op link.
-            if (loop_run_id) return { loop_run_id };
-            return { loop_run_id: `loop-from-factory-${factory_run_id}` };
-          },
-          observeLoop: async (id) => ({ state: "running", run_id: id }),
-        },
-        factoryRunId,
-        { repoDir },
-      );
+      // Authoritative live observers (git base SHA, repo identity from resolveConfig,
+      // GitHub issue snapshot, effective configuration fingerprints) — never synthetic
+      // "unknown"/ok:true placeholders. Same sources adoption uses for live identity.
+      const macroDeps = buildFactoryMacroDeps({ store, cfg, repoDir });
+      const result = await tickFactory(macroDeps, factoryRunId, { repoDir });
       if (opts.json) {
         console.log(JSON.stringify(result, null, 2));
       } else {
