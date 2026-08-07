@@ -18,8 +18,9 @@ import type { ModelEndpointOverride, ModelInvokingStage, PipelineConfig } from "
 import type { GhRefusalRecord } from "./gh-eval-surface.ts";
 import { EVAL_AGENT_CONTRACT_PATHS, EVAL_AGENT_CONTRACT_TEXT } from "./agent-contract.ts";
 import {
-  boundaryEnv,
+  evalIsolationEnv,
   installBoundaryShim as installBoundaryShimReal,
+  isolatedGhEnv,
   readBoundaryDenials as readBoundaryDenialsReal,
   removeBoundaryShim as removeBoundaryShimReal,
 } from "./boundary-shim.ts";
@@ -80,51 +81,6 @@ function resolveTreatmentModel(
     };
   }
   return { ok: true, model: `${treatment.provider}/${treatment.model}` };
-}
-
-/** Env overrides that strip GitHub/git write credentials from the harness
- *  child process (#607 / #637). Local-CLI children never receive the
- *  in-process `EvalGhSurface`; write denial for shell-outs is this credential
- *  strip plus the PATH deny shim (`boundary-shim`). Redirecting
- *  `GH_CONFIG_DIR` to an empty, cell-scoped directory makes `gh` see no
- *  stored login; blanking the token env vars defeats env-based `gh`/git auth;
- *  dropping `SSH_AUTH_SOCK` defeats agent-based `git push` over SSH.
- *
- *  `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL` point git at an empty,
- *  cell-scoped config instead of the operator's real system/global
- *  gitconfig, so a global `credential.helper` (stored HTTPS credentials)
- *  cannot be found; `GIT_SSH_COMMAND` forces ssh to use a nonexistent
- *  identity file and refuse any fallback to a default `~/.ssh` key, so `git
- *  push` over SSH has no usable identity either. Deliberately does NOT
- *  redirect `HOME` itself: the harness CLI's own model-provider credentials
- *  (e.g. `~/.claude`, `~/.codex`, an OS keychain) live under the operator's
- *  real `$HOME`, and the eval runner's job is to exercise that CLI, not lock
- *  it out of its own auth — these vars scope the block to git/ssh/gh
- *  specifically, at the actual process boundary rather than a prompt-only
- *  convention. This is a cooperative-agent validity fence, not multi-tenant
- *  OS isolation (#618). */
-function isolatedGhEnv(worktreeDir: string): NodeJS.ProcessEnv {
-  return {
-    GH_TOKEN: "",
-    GITHUB_TOKEN: "",
-    GH_ENTERPRISE_TOKEN: "",
-    GH_CONFIG_DIR: path.join(worktreeDir, ".eval-gh-config-empty"),
-    SSH_AUTH_SOCK: "",
-    GIT_TERMINAL_PROMPT: "0",
-    GIT_ASKPASS: "",
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: path.join(worktreeDir, ".eval-gitconfig-empty"),
-    GIT_SSH_COMMAND: "ssh -o IdentitiesOnly=yes -o IdentityFile=/dev/null -o BatchMode=yes -o StrictHostKeyChecking=no",
-  };
-}
-
-/** Full env override for a cell's harness child process (#607): the existing
- *  GitHub/git credential-stripping (`isolatedGhEnv`) composed with the
- *  process-level command boundary's PATH shim + denial-log location
- *  (`boundaryEnv`). Both are cell-scoped; neither affects any other cell,
- *  the evaluator process, or an ordinary (non-eval) pipeline run. */
-function evalIsolationEnv(worktreeDir: string): NodeJS.ProcessEnv {
-  return { ...isolatedGhEnv(worktreeDir), ...boundaryEnv(worktreeDir) };
 }
 
 /** Injectable I/O for reading/writing/removing the eval agent contract's
@@ -328,6 +284,10 @@ async function defaultRunChecks(
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const execFileAsync = promisify(execFile);
+  // Same isolation fence as harness children / deep preflight (#637): PATH
+  // deny shim + credential strip. Boundary shim must already be installed on
+  // the worktree (runCell installs it before checks).
+  const env = { ...process.env, ...evalIsolationEnv(args.worktreeDir) };
   const results: Record<string, boolean> = {};
   const deadline = Date.now() + args.deadlineMs;
   for (const check of args.checks) {
@@ -337,7 +297,11 @@ async function defaultRunChecks(
       continue;
     }
     try {
-      await execFileAsync("sh", ["-c", check], { cwd: args.worktreeDir, timeout: Math.min(300_000, remainingMs) });
+      await execFileAsync("sh", ["-c", check], {
+        cwd: args.worktreeDir,
+        timeout: Math.min(300_000, remainingMs),
+        env,
+      });
       results[check] = true;
     } catch {
       results[check] = false;

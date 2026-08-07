@@ -14,7 +14,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { PipelineConfig } from "../types.ts";
-import type { Fixture } from "./types.ts";
+import {
+  evalIsolationEnv,
+  installBoundaryShim as installBoundaryShimReal,
+  removeBoundaryShim as removeBoundaryShimReal,
+} from "./boundary-shim.ts";
+import type { Fixture, SandboxMode } from "./types.ts";
 
 /** Stable reason prefix for infrastructure classification (#637). */
 export const FIXTURE_PREFLIGHT_REASON_PREFIX = "fixture_preflight";
@@ -245,12 +250,36 @@ export interface DeepPreflightDeps {
     baseCommit: string;
   }) => Promise<void>;
   removeWorktree?: (opts: { path: string; branch: string }) => Promise<void>;
-  /** Run a check command; return true if exit 0. */
-  runCheck?: (args: { worktreeDir: string; check: string; deadlineMs: number }) => Promise<boolean>;
+  /** Run a check command under the cell-like env; return true if exit 0. */
+  runCheck?: (args: {
+    worktreeDir: string;
+    check: string;
+    deadlineMs: number;
+    /** Cell isolation env (PATH deny shim + credential strip). */
+    env: NodeJS.ProcessEnv;
+  }) => Promise<boolean>;
   /** Whether a path exists under the worktree (repo-relative). */
   pathExists?: (worktreeDir: string, relPath: string) => Promise<boolean>;
   /** Optional bootstrap for deep tier (reuse static). */
   staticDeps?: StaticPreflightDeps;
+  /**
+   * Manifest sandbox mode for the experiment (#607 / #637). Deep preflight
+   * accepts the same policy a real cell would; process-boundary isolation is
+   * always applied for check commands (matching runCell), independent of the
+   * harness CLI sandbox switch.
+   */
+  sandboxMode?: SandboxMode;
+  /** Materialize the PATH deny shim for the preflight worktree. */
+  installBoundaryShim?: (worktreeDir: string) => string;
+  /** Tear down the cell-scoped boundary control directory. */
+  removeBoundaryShim?: (worktreeDir: string) => void;
+  /**
+   * Dependency/bootstrap surface public checks assume (e.g. `npm ci` via
+   * `detectAndInstall`). Runs after worktree creation, before checks.
+   */
+  bootstrapWorktree?: (worktreeDir: string) => Promise<void>;
+  /** Build cell isolation env overrides (defaults to {@link evalIsolationEnv}). */
+  isolationEnv?: (worktreeDir: string) => NodeJS.ProcessEnv;
 }
 
 function extractPathTokensFromCheck(command: string): string[] {
@@ -265,7 +294,9 @@ function extractPathTokensFromCheck(command: string): string[] {
   return tokens;
 }
 
-/** Deep cell-like preflight for one fixture. No model invocation. */
+/** Deep cell-like preflight for one fixture. No model invocation.
+ *  Uses the same worktree layout, dependency bootstrap, PATH deny shim, and
+ *  credential-strip env a real cell applies to checks (#637 review). */
 export async function runDeepFixturePreflight(
   cfg: PipelineConfig,
   fixture: Fixture,
@@ -282,6 +313,10 @@ export async function runDeepFixturePreflight(
   const slug = `preflight-${fixture.fixture_id}`.replace(/[^a-zA-Z0-9._-]/g, "-");
   const worktreePath = path.join(cfg.repo_dir, ".worktrees", "evals", slug);
   const branch = `pipeline-eval-preflight/${slug}`;
+  // sandboxMode is accepted for cell-policy parity with runCell / the
+  // experiment manifest; check isolation always applies the process boundary
+  // (same as runCell, which installs the shim regardless of sandbox_mode).
+  void deps.sandboxMode;
 
   const createWorktreeFn =
     deps.createWorktree ??
@@ -299,6 +334,15 @@ export async function runDeepFixturePreflight(
       const { removeWorktreeAt } = await import("../worktree.ts");
       await removeWorktreeAt(cfg, { path: opts.path, branch: opts.branch });
     });
+  const bootstrapWorktreeFn =
+    deps.bootstrapWorktree ??
+    (async (dir: string) => {
+      const { detectAndInstall } = await import("../worktree-setup.ts");
+      await detectAndInstall(dir, cfg);
+    });
+  const installBoundaryShimFn = deps.installBoundaryShim ?? installBoundaryShimReal;
+  const removeBoundaryShimFn = deps.removeBoundaryShim ?? removeBoundaryShimReal;
+  const isolationEnvFn = deps.isolationEnv ?? evalIsolationEnv;
   const runCheckFn =
     deps.runCheck ??
     (async (args) => {
@@ -309,6 +353,7 @@ export async function runDeepFixturePreflight(
         await execFileAsync("sh", ["-c", args.check], {
           cwd: args.worktreeDir,
           timeout: Math.max(1, args.deadlineMs),
+          env: args.env,
         });
         return true;
       } catch {
@@ -327,6 +372,7 @@ export async function runDeepFixturePreflight(
     });
 
   let created = false;
+  let boundaryInstalled = false;
   try {
     await createWorktreeFn({
       path: worktreePath,
@@ -334,6 +380,26 @@ export async function runDeepFixturePreflight(
       baseCommit: fixture.base_commit,
     });
     created = true;
+
+    // Same dependency/bootstrap surface public checks assume (npm ci / setup).
+    try {
+      await bootstrapWorktreeFn(worktreePath);
+    } catch (err) {
+      failures.push(
+        fail(
+          fixture.fixture_id,
+          "bootstrap",
+          `cell dependency bootstrap failed at base_commit ${fixture.base_commit}: ${(err as Error).message}`,
+          `Fix worktree install/setup for fixture "${fixture.fixture_id}" (lockfile, setup_command, or pin) so public checks can run under the cell surface.`,
+        ),
+      );
+      return { ok: false, failures };
+    }
+
+    // PATH deny shim + isolation env — same surface as runCell checks.
+    installBoundaryShimFn(worktreePath);
+    boundaryInstalled = true;
+    const cellEnv = { ...process.env, ...isolationEnvFn(worktreePath) };
 
     // Path resolution for check commands + seeded defect paths.
     for (const cmd of [...fixture.public_checks, ...(fixture.hidden_checks ?? [])]) {
@@ -372,7 +438,7 @@ export async function runDeepFixturePreflight(
     // Public baseline must be healthy at the pin (no treatment).
     const deadlineMs = 600_000;
     for (const check of fixture.public_checks) {
-      const ok = await runCheckFn({ worktreeDir: worktreePath, check, deadlineMs });
+      const ok = await runCheckFn({ worktreeDir: worktreePath, check, deadlineMs, env: cellEnv });
       if (!ok) {
         failures.push(
           fail(
@@ -387,7 +453,7 @@ export async function runDeepFixturePreflight(
 
     // Hidden checks declared as biting probes must FAIL at the pin.
     for (const check of fixture.hidden_checks ?? []) {
-      const ok = await runCheckFn({ worktreeDir: worktreePath, check, deadlineMs });
+      const ok = await runCheckFn({ worktreeDir: worktreePath, check, deadlineMs, env: cellEnv });
       if (ok) {
         failures.push(
           fail(
@@ -409,6 +475,13 @@ export async function runDeepFixturePreflight(
       ),
     );
   } finally {
+    if (boundaryInstalled) {
+      try {
+        removeBoundaryShimFn(worktreePath);
+      } catch {
+        // Best-effort; control dir is outside the worktree.
+      }
+    }
     if (created) {
       try {
         await removeWorktreeFn({ path: worktreePath, branch });
@@ -444,16 +517,10 @@ export async function runDeepExperimentPreflight(
       );
       continue;
     }
-    // Smoke-only fixtures still need static reachability + path tokens, but
-    // skip expensive public-baseline deep checks that assume graded CI surface.
-    if (fixture.smoke_only) {
-      const staticOnly = await runStaticFixturePreflight(fixture, {
-        ...(deps.staticDeps ?? {}),
-        repoDir: deps.staticDeps?.repoDir ?? cfg.repo_dir,
-      });
-      failures.push(...staticOnly.failures);
-      continue;
-    }
+    // Smoke-only fixtures are excluded from graded quality aggregates, but
+    // still require full deep cell-like integrity preflight (baseline, path
+    // resolution, isolation/bootstrap surface) before harness/isolation smoke
+    // may run (#637 review 1 finding 235a716c).
     const result = await runDeepFixturePreflight(cfg, fixture, deps);
     failures.push(...result.failures);
   }

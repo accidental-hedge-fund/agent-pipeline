@@ -10,11 +10,33 @@ import {
   preflightReason,
   publicChecksRequirePluginMirror,
   allowsPluginMirrorPaths,
+  runDeepExperimentPreflight,
   runDeepFixturePreflight,
   runStaticFixturePreflight,
+  type DeepPreflightDeps,
 } from "../scripts/evals/preflight.ts";
 import { validateFixture } from "../scripts/evals/fixture.ts";
 import type { Fixture } from "../scripts/evals/types.ts";
+
+/** Injectable cell-surface fakes for deep preflight unit tests (no real fs). */
+function cellSurfaceFakes(extra: DeepPreflightDeps = {}): DeepPreflightDeps {
+  return {
+    staticDeps: { catFile: async () => "commit" },
+    createWorktree: async () => {},
+    removeWorktree: async () => {},
+    bootstrapWorktree: async () => {},
+    installBoundaryShim: () => "/fake-shim",
+    removeBoundaryShim: () => {},
+    isolationEnv: () => ({
+      PATH: "/fake-shim:/usr/bin",
+      GH_TOKEN: "",
+      GITHUB_TOKEN: "",
+      EVAL_BOUNDARY_DENIAL_LOG: "/fake/denials.jsonl",
+    }),
+    pathExists: async () => true,
+    ...extra,
+  };
+}
 
 const SHA = "b63d9ba64a4ec72a583a1795ef9ca0d3a57bddcd";
 const MISSING = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -126,13 +148,11 @@ test("deep preflight: red public baseline blocks treatments (infra)", async () =
     smoke_only: false,
     allowed_change_paths: ["core/scripts/gh.ts", "plugin/scripts/gh.ts"],
   });
-  const result = await runDeepFixturePreflight(cfg, fixture, {
-    staticDeps: { catFile: async () => "commit" },
-    createWorktree: async () => {},
-    removeWorktree: async () => {},
-    runCheck: async () => false, // baseline red
-    pathExists: async () => true,
-  });
+  const result = await runDeepFixturePreflight(
+    cfg,
+    fixture,
+    cellSurfaceFakes({ runCheck: async () => false }),
+  );
   assert.equal(result.ok, false);
   assert.ok(result.failures.some((f) => f.check === "public_baseline"));
   assert.match(result.failures[0].reason, /fixture_preflight:public_baseline:fx/);
@@ -145,13 +165,11 @@ test("deep preflight: non-biting hidden probe fails preflight", async () => {
     grader_refs: [{ grader: "implementation-fix", version: "1" }],
     smoke_only: false,
   });
-  const result = await runDeepFixturePreflight(cfg, fixture, {
-    staticDeps: { catFile: async () => "commit" },
-    createWorktree: async () => {},
-    removeWorktree: async () => {},
-    runCheck: async () => true, // already passes = non-biting
-    pathExists: async () => true,
-  });
+  const result = await runDeepFixturePreflight(
+    cfg,
+    fixture,
+    cellSurfaceFakes({ runCheck: async () => true }), // already passes = non-biting
+  );
   assert.equal(result.ok, false);
   assert.ok(result.failures.some((f) => f.check === "biting_probe"));
 });
@@ -162,13 +180,14 @@ test("deep preflight: unresolvable path fails naming fixture", async () => {
     grader_refs: [{ grader: "implementation-fix", version: "1" }],
     smoke_only: false,
   });
-  const result = await runDeepFixturePreflight(cfg, fixture, {
-    staticDeps: { catFile: async () => "commit" },
-    createWorktree: async () => {},
-    removeWorktree: async () => {},
-    runCheck: async () => true,
-    pathExists: async (_wt, rel) => rel !== "core/test/missing.test.ts",
-  });
+  const result = await runDeepFixturePreflight(
+    cfg,
+    fixture,
+    cellSurfaceFakes({
+      runCheck: async () => true,
+      pathExists: async (_wt, rel) => rel !== "core/test/missing.test.ts",
+    }),
+  );
   assert.equal(result.ok, false);
   assert.ok(result.failures.some((f) => f.check === "unresolvable_path"));
 });
@@ -180,13 +199,145 @@ test("deep preflight: healthy baseline and biting hidden probe pass", async () =
     grader_refs: [{ grader: "implementation-fix", version: "1" }],
     smoke_only: false,
   });
-  const result = await runDeepFixturePreflight(cfg, fixture, {
-    staticDeps: { catFile: async () => "commit" },
-    createWorktree: async () => {},
-    removeWorktree: async () => {},
-    // public passes, hidden fails (biting)
-    runCheck: async ({ check }) => !check.includes("hidden"),
-    pathExists: async () => true,
+  const result = await runDeepFixturePreflight(
+    cfg,
+    fixture,
+    cellSurfaceFakes({
+      // public passes, hidden fails (biting)
+      runCheck: async ({ check }) => !check.includes("hidden"),
+    }),
+  );
+  assert.equal(result.ok, true, formatPreflightFailures(result.failures));
+});
+
+// --- #637 review 1: smoke-only must not bypass deep preflight (235a716c) ---
+
+test("deep experiment preflight: smoke_only fixtures still run deep cell-like checks", async () => {
+  const events: string[] = [];
+  const fixture = makeFixture({
+    smoke_only: true,
+    grader_refs: [],
+    public_checks: ["true"],
+  });
+  const fixtures = new Map([["fx", fixture]]);
+  const result = await runDeepExperimentPreflight(cfg, fixtures, ["fx"], {
+    ...cellSurfaceFakes({
+      createWorktree: async () => {
+        events.push("createWorktree");
+      },
+      bootstrapWorktree: async () => {
+        events.push("bootstrap");
+      },
+      installBoundaryShim: () => {
+        events.push("shim");
+        return "/fake-shim";
+      },
+      runCheck: async ({ env }) => {
+        events.push("check");
+        assert.ok(env, "deep checks must receive cell isolation env");
+        assert.equal(env.GH_TOKEN, "");
+        return true;
+      },
+    }),
   });
   assert.equal(result.ok, true, formatPreflightFailures(result.failures));
+  assert.ok(events.includes("createWorktree"), "smoke_only must allocate a cell-like worktree");
+  assert.ok(events.includes("bootstrap"), "smoke_only must run dependency bootstrap surface");
+  assert.ok(events.includes("shim"), "smoke_only must install PATH deny shim");
+  assert.ok(events.includes("check"), "smoke_only must run deep public baseline checks");
+});
+
+// --- #637 review 1: deep checks use cell isolation + bootstrap (f386edda) ---
+
+test("deep preflight: bootstrap, boundary shim, then checks with isolation env", async () => {
+  const events: string[] = [];
+  let seenEnv: NodeJS.ProcessEnv | undefined;
+  const fixture = makeFixture({
+    public_checks: ["npm test"],
+    grader_refs: [{ grader: "implementation-fix", version: "1" }],
+    smoke_only: false,
+  });
+  const result = await runDeepFixturePreflight(
+    cfg,
+    fixture,
+    cellSurfaceFakes({
+      sandboxMode: "managed",
+      createWorktree: async () => {
+        events.push("createWorktree");
+      },
+      bootstrapWorktree: async () => {
+        events.push("bootstrap");
+      },
+      installBoundaryShim: () => {
+        events.push("shim");
+        return "/fake-shim";
+      },
+      removeBoundaryShim: () => {
+        events.push("removeShim");
+      },
+      isolationEnv: () => {
+        events.push("isolationEnv");
+        return {
+          PATH: "/fake-shim:/usr/bin",
+          GH_TOKEN: "",
+          GITHUB_TOKEN: "",
+          GH_ENTERPRISE_TOKEN: "",
+          SSH_AUTH_SOCK: "",
+          EVAL_BOUNDARY_DENIAL_LOG: "/fake/denials.jsonl",
+        };
+      },
+      runCheck: async ({ env }) => {
+        events.push("check");
+        seenEnv = env;
+        return true;
+      },
+      removeWorktree: async () => {
+        events.push("removeWorktree");
+      },
+    }),
+  );
+  assert.equal(result.ok, true, formatPreflightFailures(result.failures));
+  // Cell surface order: worktree → bootstrap → shim → isolation env → check → cleanup.
+  const createIdx = events.indexOf("createWorktree");
+  const bootIdx = events.indexOf("bootstrap");
+  const shimIdx = events.indexOf("shim");
+  const envIdx = events.indexOf("isolationEnv");
+  const checkIdx = events.indexOf("check");
+  const removeShimIdx = events.indexOf("removeShim");
+  const removeWtIdx = events.indexOf("removeWorktree");
+  assert.ok(createIdx >= 0 && bootIdx > createIdx, "bootstrap after worktree");
+  assert.ok(shimIdx > bootIdx, "boundary shim after bootstrap");
+  assert.ok(envIdx > shimIdx, "isolation env after shim");
+  assert.ok(checkIdx > envIdx, "checks after isolation env");
+  assert.ok(removeShimIdx > checkIdx, "shim removed after checks");
+  assert.ok(removeWtIdx > removeShimIdx, "worktree removed last");
+  assert.ok(seenEnv);
+  assert.equal(seenEnv!.GH_TOKEN, "", "checks must not observe ambient GH credentials");
+  assert.match(String(seenEnv!.PATH), /fake-shim/, "checks must run with PATH deny shim prepended");
+});
+
+test("deep preflight: bootstrap failure is infrastructure and skips checks", async () => {
+  let checkRan = false;
+  const fixture = makeFixture({
+    public_checks: ["npm test"],
+    grader_refs: [{ grader: "implementation-fix", version: "1" }],
+    smoke_only: false,
+  });
+  const result = await runDeepFixturePreflight(
+    cfg,
+    fixture,
+    cellSurfaceFakes({
+      bootstrapWorktree: async () => {
+        throw new Error("npm ci failed");
+      },
+      runCheck: async () => {
+        checkRan = true;
+        return true;
+      },
+    }),
+  );
+  assert.equal(result.ok, false);
+  assert.equal(checkRan, false, "checks must not run after bootstrap failure");
+  assert.ok(result.failures.some((f) => f.check === "bootstrap"));
+  assert.match(result.failures[0].detail, /npm ci failed/);
 });

@@ -151,14 +151,19 @@ export async function runExperiment(
   await writePlanArtifacts(outputDir, manifest, plan, deps);
 
   // Fixture integrity preflight (#637): static reachability + deep cell-like
-  // checks for graded fixtures, before any treatment or model invocation.
-  // Failures are infrastructure and abort the experiment (no quality pooling).
+  // checks for every referenced fixture (including smoke_only), before any
+  // treatment or model invocation. Failures are infrastructure and abort the
+  // experiment (no quality pooling). Deep checks use the same isolation /
+  // bootstrap surface as real cells (sandbox_mode from the manifest).
   if (!deps.skipFixturePreflight) {
     const preflight = await runDeepExperimentPreflight(
       cfg,
       fixtures,
       manifest.fixture_ids,
-      deps.fixturePreflight ?? {},
+      {
+        sandboxMode: manifest.sandbox_mode,
+        ...(deps.fixturePreflight ?? {}),
+      },
     );
     if (!preflight.ok) {
       const detail = formatPreflightFailures(preflight.failures);

@@ -151,13 +151,37 @@ export function removeBoundaryShim(worktreeDir: string, rm: (dir: string) => voi
  *  prepend the shim directory to PATH (so `gh`/`pipeline`/`git` resolve to
  *  the interceptors first) and point the denial log at the cell-scoped
  *  file. Cell-scoped by construction — composes with, never replaces, other
- *  env overrides (e.g. isolatedGhEnv in executor.ts). */
+ *  env overrides (e.g. {@link isolatedGhEnv}). */
 export function boundaryEnv(worktreeDir: string): NodeJS.ProcessEnv {
   const dir = boundaryShimDir(worktreeDir);
   return {
     PATH: `${dir}:${process.env.PATH ?? ""}`,
     EVAL_BOUNDARY_DENIAL_LOG: boundaryDenialLogPath(worktreeDir),
   };
+}
+
+/** Env overrides that strip GitHub/git write credentials from a cell child
+ *  process (#607 / #637). Shared by harness invoke, cell checks, and deep
+ *  fixture preflight so they observe the same cooperative validity fence. */
+export function isolatedGhEnv(worktreeDir: string): NodeJS.ProcessEnv {
+  return {
+    GH_TOKEN: "",
+    GITHUB_TOKEN: "",
+    GH_ENTERPRISE_TOKEN: "",
+    GH_CONFIG_DIR: path.join(worktreeDir, ".eval-gh-config-empty"),
+    SSH_AUTH_SOCK: "",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_ASKPASS: "",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: path.join(worktreeDir, ".eval-gitconfig-empty"),
+    GIT_SSH_COMMAND: "ssh -o IdentitiesOnly=yes -o IdentityFile=/dev/null -o BatchMode=yes -o StrictHostKeyChecking=no",
+  };
+}
+
+/** Full env override for a cell-scoped child: credential strip + PATH deny
+ *  shim. Used by harness invoke, default check runners, and deep preflight. */
+export function evalIsolationEnv(worktreeDir: string): NodeJS.ProcessEnv {
+  return { ...isolatedGhEnv(worktreeDir), ...boundaryEnv(worktreeDir) };
 }
 
 export interface DenialLogIO {
