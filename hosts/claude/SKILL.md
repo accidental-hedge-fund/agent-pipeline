@@ -15,8 +15,8 @@ description: |
 Self-contained TypeScript skill that advances a GitHub issue (or PR's linked
 issue) through a 16-stage label-driven state machine, ending at
 `pipeline:ready-to-deploy` on the happy path (or parking at `pipeline:needs-human`
-when review ceilings / similar paths exhaust). The pipeline does NOT auto-merge —
-the user owns the merge button.
+when review ceilings / similar paths exhaust). The ordinary advance path never
+merges. Merge commands require separate operator authority.
 
 ## Developing this skill itself (core/ → plugin/ mirror)
 
@@ -55,6 +55,20 @@ at `ready` and only acts on items that already carry a `pipeline:*` label.
 `needs-human` is a terminal park state (review-ceiling punch list, etc.); the
 advance loop never auto-advances from it to `ready-to-deploy`.
 
+### Merge authority boundary
+
+`/pipeline`, `/pipeline:single`, and `/pipeline:loop` never invoke merge.
+`/pipeline:merge <pr>` and `/pipeline:merge-queue --apply` are loop-isolated,
+operator-authorized surfaces. `merge-queue` is dry-run by default.
+
+A disabled external deployment wrapper may act as an operator delegate only
+after the wrapper validates an authenticated, immutable, expiring grant for the
+exact action. The grant is machine-local state, not `.github/pipeline.yml`.
+`/pipeline:merge` does not validate Buzz events or deployment grants and keeps
+all existing merge gates. This exception adds no `auto_merge` key or merge
+stage. In the current Grok factory profile, Grok planning, implementation, and
+fixes use only `grok-4.5`, with no Grok fallback. Codex performs review.
+
 ## Modes
 
 The primary invocation is the advance loop; all other operations are available as
@@ -69,8 +83,8 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline cleanup                               Sweep merged-PR worktrees and delete their local branches
 /pipeline doctor [--json|--is-ok] [--fail-fast] [--harness-smoke] Deterministic preflight check; print summary, exit 0/1. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment
 /pipeline init                                  Ensure pipeline labels and scaffold .github/pipeline.yml
-/pipeline merge <pr>                            Human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
-/pipeline merge-queue --milestone <m> [--apply] [--release-when-complete --release-version <ver>] Human-gated sequential merge of ready-to-deploy PRs; optional prepare-only release-when-complete
+/pipeline merge <pr>                            Operator-authorized squash merge of a ready-to-deploy PR (never called by the advance loop)
+/pipeline merge-queue --milestone <m> [--apply] [--release-when-complete --release-version <ver>] Operator-authorized sequential merge of ready-to-deploy PRs; dry-run by default; optional prepare-only release-when-complete
 /pipeline override <n> "<key>: <reason>"        Disposition a review finding and auto-resume the advance loop
 /pipeline release <version> [--theme "..."] [--dry-run] Prepare a release PR for the given version (never tags, merges, or publishes)
 /pipeline remove-worktree <n> [--force]         Remove a managed pipeline worktree for an issue (optional --force)
@@ -1378,7 +1392,7 @@ When the loop ends, the skill prints:
 
 ## What this skill never does
 
-- Auto-merge PRs autonomously — the advance loop never merges and there is no `auto_merge` config key. The human-invoked `/pipeline merge <pr>` command is the controlled, explicit surface for merging after `pipeline:ready-to-deploy`; it is never called by the advance loop. `/pipeline:merge-queue --milestone <m>` is a dry-run planner only (ordered R2D candidates); it never merges and is never called by advance.
+- Merge from the advance path — there is no `auto_merge` config key or merge stage. `/pipeline:merge <pr>` is a separate operator-authorized command after `pipeline:ready-to-deploy`; advance never calls it. `/pipeline:merge-queue --milestone <m>` is dry-run by default; only the separate `--apply` form can merge. A deployment wrapper, not either merge command, validates any external scoped grant.
 - Bypass the `pipeline:*` opt-in label gate.
 - Run more than one transition under `--once`.
 - Touch the GitHub repo in `--dry-run` mode.

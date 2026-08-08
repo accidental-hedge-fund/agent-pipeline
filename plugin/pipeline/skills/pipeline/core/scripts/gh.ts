@@ -970,10 +970,10 @@ export async function addIssueComment(
 }
 
 /**
- * Post a comment on the PULL REQUEST (not the linked issue). The pipeline does all
- * its review bookkeeping on the issue, but a human merges the PR — so findings the
- * pipeline advanced past as advisory can slip the merge button if they live only
- * on the issue. This surfaces them where the merge decision is made.
+ * Post a comment on the PULL REQUEST (not the linked issue). The pipeline does
+ * its review bookkeeping on the issue, but merge authority is separate from the
+ * advance path. Findings that advanced as advisory can be missed if they live
+ * only on the issue. This surfaces them where the merge decision is made.
  */
 export async function postPrComment(
   cfg: PipelineConfig,

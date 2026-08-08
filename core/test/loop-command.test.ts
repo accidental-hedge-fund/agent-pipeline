@@ -249,7 +249,7 @@ test("runLoopCommand — a stop carrying outstanding_ready names the stranded it
     runLoopCommand({ milestone: "v2", profile: "claude" } as CliOpts, [], deps),
   );
   assert.equal(process.exitCode, 1);
-  assert.match(err.join("\n"), /stranded at ready-to-deploy/);
+  assert.match(err.join("\n"), /stopped with 1 item\(s\) at ready-to-deploy, awaiting an operator-authorized merge/);
   assert.match(err.join("\n"), /100/);
   const parsed = JSON.parse(out[0]);
   assert.deepEqual(parsed.stop.outstanding_ready, ["100"]);

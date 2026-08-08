@@ -915,6 +915,6 @@ function buildRoadmapPRBody(added: number[], errors: Array<{ issueNum: number; e
     "",
     "Review the placement, adjust release slots as needed, then merge when satisfied.",
     "",
-    "_The pipeline never merges — a human owns this button._",
+    "_The advance path never merges. Integration requires an operator-authorized merge surface._",
   ].join("\n");
 }

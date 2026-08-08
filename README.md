@@ -1,6 +1,6 @@
 # agent-pipeline
 
-**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 16-stage state machine — backlog → ready → planning → plan-review → implementing → design-gate → review-1 → fix-1 → review-2 → fix-2 → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy, with `needs-human` as the terminal park off-ramp. It does **not** auto-merge; you own the merge button.
+**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 16-stage state machine — backlog → ready → planning → plan-review → implementing → design-gate → review-1 → fix-1 → review-2 → fix-2 → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy, with `needs-human` as the terminal park off-ramp. The ordinary advance path does **not** merge. An operator must authorize a separate merge command.
 
 It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)** from a single shared TypeScript core. **Both harnesses are required for every run**: one implements, and the other cross-reviews. By default, `/pipeline` uses Claude to implement and Codex to review; `$pipeline` inverts this. The pipeline is cross-harness by design — you cannot skip the reviewer install.
 
@@ -8,7 +8,7 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 
 ![agent-pipeline state machine — ready → deploy-ready, no human writes the code](docs/assets/state-machine.png)
 
-`ready` is the queue/opt-in entry point. Once a run starts, long-running work is labelled and recorded under the concrete stages that are doing it: `planning`, `plan-review`, and `implementing`. Recoverable stops keep the active `pipeline:*` stage plus `blocked`; exhausted or ambiguous paths park at `needs-human`. The pipeline never guesses past uncertainty and never presses merge.
+`ready` is the queue/opt-in entry point. Once a run starts, long-running work is labelled and recorded under the concrete stages that are doing it: `planning`, `plan-review`, and `implementing`. Recoverable stops keep the active `pipeline:*` stage plus `blocked`; exhausted or ambiguous paths park at `needs-human`. The advance path never guesses past uncertainty and never invokes a merge command.
 
 | Band | What happens |
 | --- | --- |
@@ -17,18 +17,19 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 | Bounded convergence | Review/fix rounds are capped by policy and guarded against recurring findings. If the run cannot converge cleanly, it stops with evidence instead of looping indefinitely. |
 | Surgical fixes | `fix-1` and `fix-2` are scoped to reviewer findings. No opportunistic refactors, no scope creep, no destructive cleanup. |
 | Gated stop | `pre-merge` checks CI, conflicts, mergeability, and spec archive. `visual-gate` can run a repo-defined E2E/visual suite (e.g. Playwright) and captures its artifacts as PR-visible evidence. `eval-gate` can run a repo-defined eval/scoring suite. `shipcheck-gate` lets the reviewer apply an acceptance rubric. |
-| Human merge | `ready-to-deploy` is the happy-path terminal for the autonomous loop; `needs-human` is the park terminal when review ceilings or similar paths exhaust. A human owns the merge button. |
+| Operator-authorized merge | `ready-to-deploy` is the happy-path terminal for the autonomous loop; `needs-human` is the park terminal when review ceilings or similar paths exhaust. A direct operator can use `pipeline merge` or dry-run-first `merge-queue --apply`. |
 
 | Naive AI loop | agent-pipeline lifecycle |
 | --- | --- |
 | `prompt -> code -> merge` | `plan -> build -> review/fix -> gated stop` |
-| Unreviewed, unbounded, opaque | Reviewed, bounded, audited, human-gated |
+| Unreviewed, unbounded, opaque | Reviewed, bounded, audited, operator-authorized |
 
 ## Contents
 
 - [Prerequisites](#prerequisites)
 - [Quickstart](#quickstart)
 - [Install](#install)
+- [External factory supervisors](#external-factory-supervisors)
 - [Where to go next](#where-to-go-next)
 - [Onboarding a new repo](#onboarding-a-new-repo)
 - [Development](#development)
@@ -42,7 +43,7 @@ The pipeline is **cross-harness** — each run uses one CLI to implement and the
 - **`git`** and **`gh`** on PATH, with `gh auth status` authenticated against the target repo.
 - **Both `claude` and `codex` CLIs** on PATH and **authenticated** — each run uses one to implement and the other to review.
 - **Review runs on the *other* harness, invoked directly** (`reviewMode: prompt-harness`): the reviewer CLI is called with the pipeline's own JSON-returning review prompt. **No review plugin is required** — you just need the other harness's CLI installed and authenticated.
-- **Same-harness fallback (if the reviewer CLI is missing).** Cross-harness review is the design and the recommended setup — keep both CLIs installed. But if the configured reviewer CLI is *not installed / not spawnable* at review time, the pipeline does not stall: the implementing harness reviews its own work instead, and every such review is **prominently labeled as a same-harness self-review**. A self-reviewed item still advances normally (the pipeline never merges — a human owns that). If *neither* harness is spawnable, the item blocks. A reviewer that runs but times out or errors is a genuine failure and still blocks — only a missing CLI triggers the fallback.
+- **Same-harness fallback (if the reviewer CLI is missing).** Cross-harness review is the design and the recommended setup — keep both CLIs installed. But if the configured reviewer CLI is *not installed / not spawnable* at review time, the pipeline does not stall: the implementing harness reviews its own work instead, and every such review is **prominently labeled as a same-harness self-review**. A self-reviewed item still advances normally. The advance path never merges. If *neither* harness is spawnable, the item blocks. A reviewer that runs but times out or errors is a genuine failure and still blocks — only a missing CLI triggers the fallback.
 - `~/.agent-operating-contract.md` and a per-repo conventions file: `CLAUDE.md` (Claude) or `AGENTS.md` (Codex).
 - **Optional:** the [OpenSpec](https://openspec.dev/) CLI (`npm i -g @fission-ai/openspec`) — only needed for repos that opt into the OpenSpec planning flow.
 - No API keys — LLM budget comes from your `claude` / `codex` subscriptions.
@@ -101,7 +102,26 @@ Or from Codex (after restarting it):
 $pipeline N
 ```
 
-The pipeline advances the issue through planning, implementation, cross-harness review, fix rounds, and pre-merge checks — without further manual input — and stops at `pipeline:ready-to-deploy` for a human merge.
+The pipeline advances the issue through planning, implementation, cross-harness review, fix rounds, and pre-merge checks — without further manual input — and stops at `pipeline:ready-to-deploy` for an operator-authorized merge.
+
+## External factory supervisors
+
+An external supervisor such as Hermes can compose the current Pipeline CLI. This
+profile is opt-in and disabled by default. It does not add an MCP server, a public
+factory API, an `auto_merge` setting, or a merge stage.
+
+One authenticated, immutable, expiring operator grant must bind the repository,
+base branch, release version, ordered issue list, permitted actions, and expiry.
+The deployment wrapper validates that machine-local grant before each action. The
+`pipeline merge` command does not validate Buzz events or deployment grants and
+keeps all of its normal ready-to-deploy, check, mergeability, and exact-head gates.
+Repository content in `.github/pipeline.yml` cannot grant this authority.
+
+For the current Grok factory profile, planning, implementation, and fixes use only
+`grok-4.5`, with no Grok model fallback. Codex performs independent review. See
+[the scoped factory plan](docs/grok-supervised-factory-plan.md) for the contract
+and [the deployment runbook](docs/runbooks/hermes-factory-deployment.md) for the
+exact same-user trust boundary, calibration, monitoring, and rollback steps.
 
 ## Install
 

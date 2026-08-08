@@ -21,6 +21,15 @@ import {
   type LoopLedger,
   type LoopItemState,
 } from "./loop/types.ts";
+import {
+  FRG_HYBRID_LIVE_COMPOSITION_IDS,
+  FRG_HYBRID_LIVE_SCENARIO_IDS,
+  FRG_HYBRID_PILOT_POLICY_ID,
+  FRG_HYBRID_PILOT_VERSION,
+  FRG_HYBRID_REPLACEMENT_ISSUE,
+  type FrgPackProofSource,
+  type FrgPackProvenance,
+} from "./frg-pack-observations.ts";
 
 // ---------------------------------------------------------------------------
 // Schema + thresholds
@@ -160,6 +169,10 @@ export interface FrgScenarioOutcome {
   observed?: number | null;
   /** Optional threshold used for this scenario. */
   threshold?: number | null;
+  /** Exact proof class. Required on the v1.33.0 hybrid pilot path. */
+  source?: FrgPackProofSource;
+  /** Identities resolved against pack_provenance.proofs. */
+  proof_ids?: string[];
 }
 
 export interface FrgScoreboard {
@@ -198,7 +211,7 @@ export type FrgCompositionDimensionId = (typeof FRG_COMPOSITION_DIMENSION_IDS)[n
 
 export type FrgCompositionStatus = "pass" | "fail" | "not_observed";
 
-export type FrgCompositionSource = "ledger" | "observation" | "layer_a" | "derived";
+export type FrgCompositionSource = "live" | "ledger" | "observation" | "layer_a" | "derived";
 
 export interface FrgCompositionDimension {
   id: FrgCompositionDimensionId;
@@ -207,6 +220,8 @@ export interface FrgCompositionDimension {
   detail: string;
   /** Optional numeric proof (e.g. capacity N, controller entry counts). */
   observed?: number | null;
+  /** Identities resolved against pack_provenance.proofs. */
+  proof_ids?: string[];
 }
 
 export interface FrgComposition {
@@ -240,6 +255,8 @@ export interface FrgIntegrity {
   producer: "pipeline-factory-gate";
   scoreboard_fingerprint: string;
   composition_fingerprint: string;
+  /** Present when structured pack provenance is part of the evidence. */
+  pack_provenance_fingerprint?: string;
   /**
    * HMAC attestation binding evidence to a producer that holds
    * {@link FRG_ATTESTATION_KEY_ENV}. Required for release-eligible `pass: true`
@@ -322,6 +339,8 @@ export interface FrgEvidence {
    * Required for release-eligible `pass: true` (fingerprints must recompute).
    */
   integrity: FrgIntegrity;
+  /** Structured fresh-pack and candidate-probe provenance. */
+  pack_provenance: FrgPackProvenance | null;
 }
 
 export type FrgLookupResult =
@@ -418,15 +437,26 @@ export function computeCompositionFingerprint(composition: FrgComposition): stri
   });
 }
 
+export function computePackProvenanceFingerprint(
+  provenance: FrgPackProvenance,
+): string {
+  return frgStableFingerprint(provenance);
+}
+
 export function buildFrgIntegrity(
   scoreboard: FrgScoreboard,
   composition: FrgComposition,
+  packProvenance?: FrgPackProvenance | null,
 ): FrgIntegrity {
-  return {
+  const integrity: FrgIntegrity = {
     producer: "pipeline-factory-gate",
     scoreboard_fingerprint: computeScoreboardFingerprint(scoreboard),
     composition_fingerprint: computeCompositionFingerprint(composition),
   };
+  if (packProvenance) {
+    integrity.pack_provenance_fingerprint = computePackProvenanceFingerprint(packProvenance);
+  }
+  return integrity;
 }
 
 /** Resolve the FRG attestation key from an env map (injectable for tests). */
@@ -460,8 +490,10 @@ export function buildFrgAttestationPayload(input: {
   recovery_aggregates?: FrgRecoveryAggregates | null;
   scoreboard_fingerprint: string;
   composition_fingerprint: string;
+  pack_provenance: FrgPackProvenance | null;
+  pack_provenance_fingerprint?: string;
 }): Record<string, unknown> {
-  return {
+  const payload: Record<string, unknown> = {
     producer: "pipeline-factory-gate",
     alg: FRG_ATTESTATION_ALG,
     schema_version: input.schema_version,
@@ -478,6 +510,13 @@ export function buildFrgAttestationPayload(input: {
     scoreboard_fingerprint: input.scoreboard_fingerprint,
     composition_fingerprint: input.composition_fingerprint,
   };
+  // Preserve hmac-sha256-v1 byte compatibility for pre-pilot evidence. The
+  // new fields exist only on the v1.33.0 hybrid path, where both are required.
+  if (input.pack_provenance) {
+    payload.pack_provenance = input.pack_provenance;
+    payload.pack_provenance_fingerprint = input.pack_provenance_fingerprint ?? null;
+  }
+  return payload;
 }
 
 /** Deterministic JSON bytes for HMAC (sorted object keys, same as fingerprints). */
@@ -518,6 +557,7 @@ export interface FrgAttestationSignInput {
   scoreboard: FrgScoreboard;
   composition: FrgComposition;
   recovery_aggregates?: FrgRecoveryAggregates | null;
+  pack_provenance?: FrgPackProvenance | null;
   attestationKey: string;
 }
 
@@ -536,6 +576,8 @@ export function signFrgIntegrity(input: FrgAttestationSignInput): FrgIntegrity {
     recovery_aggregates: input.recovery_aggregates,
     scoreboard_fingerprint: input.integrity.scoreboard_fingerprint,
     composition_fingerprint: input.integrity.composition_fingerprint,
+    pack_provenance: input.pack_provenance ?? null,
+    pack_provenance_fingerprint: input.integrity.pack_provenance_fingerprint,
   });
   return {
     ...input.integrity,
@@ -576,6 +618,7 @@ export function verifyFrgAttestation(
     scoreboard: FrgScoreboard;
     composition: FrgComposition;
     recovery_aggregates?: FrgRecoveryAggregates | null;
+    pack_provenance?: FrgPackProvenance | null;
     integrity: FrgIntegrity;
   },
   attestationKey: string,
@@ -606,6 +649,8 @@ export function verifyFrgAttestation(
     recovery_aggregates: evidence.recovery_aggregates,
     scoreboard_fingerprint: evidence.integrity.scoreboard_fingerprint,
     composition_fingerprint: evidence.integrity.composition_fingerprint,
+    pack_provenance: evidence.pack_provenance ?? null,
+    pack_provenance_fingerprint: evidence.integrity.pack_provenance_fingerprint,
   });
   const expected = computeFrgAttestationMac(payload, attestationKey);
   return timingSafeEqualHex(expected, att.mac);
@@ -799,12 +844,36 @@ function parseFrgScenarioOutcome(raw: unknown, index: number): FrgScenarioOutcom
         : (() => {
             throw new Error(`FRG evidence.scenarios[${index}].threshold must be a number or null`);
           })();
+  let source: FrgPackProofSource | undefined;
+  if (s.source !== undefined) {
+    if (
+      typeof s.source !== "string" ||
+      !new Set(["live", "ledger", "derived", "layer_a"]).has(s.source)
+    ) {
+      throw new Error(`FRG evidence.scenarios[${index}].source is invalid`);
+    }
+    source = s.source as FrgPackProofSource;
+  }
+  let proofIds: string[] | undefined;
+  if (s.proof_ids !== undefined) {
+    if (
+      !Array.isArray(s.proof_ids) ||
+      s.proof_ids.length === 0 ||
+      !s.proof_ids.every((id) => typeof id === "string" && id.trim() !== "") ||
+      new Set(s.proof_ids).size !== s.proof_ids.length
+    ) {
+      throw new Error(`FRG evidence.scenarios[${index}].proof_ids must be unique non-empty strings`);
+    }
+    proofIds = [...s.proof_ids] as string[];
+  }
   return {
     id: s.id as FrgScenarioId,
     status: s.status as FrgScenarioStatus,
     detail: s.detail,
     observed,
     threshold,
+    ...(source ? { source } : {}),
+    ...(proofIds ? { proof_ids: proofIds } : {}),
   };
 }
 
@@ -941,6 +1010,7 @@ const FRG_VALID_COMPOSITION_STATUSES: ReadonlySet<FrgCompositionStatus> = new Se
 ]);
 
 const FRG_VALID_COMPOSITION_SOURCES: ReadonlySet<FrgCompositionSource> = new Set([
+  "live",
   "ledger",
   "observation",
   "layer_a",
@@ -973,7 +1043,7 @@ function parseFrgCompositionDimension(raw: unknown, index: number): FrgCompositi
     !FRG_VALID_COMPOSITION_SOURCES.has(d.source as FrgCompositionSource)
   ) {
     throw new Error(
-      `FRG evidence.composition.dimensions[${index}].source must be ledger|observation|layer_a|derived`,
+      `FRG evidence.composition.dimensions[${index}].source must be live|ledger|observation|layer_a|derived`,
     );
   }
   if (typeof d.detail !== "string") {
@@ -989,12 +1059,27 @@ function parseFrgCompositionDimension(raw: unknown, index: number): FrgCompositi
               `FRG evidence.composition.dimensions[${index}].observed must be a number or null`,
             );
           })();
+  let proofIds: string[] | undefined;
+  if (d.proof_ids !== undefined) {
+    if (
+      !Array.isArray(d.proof_ids) ||
+      d.proof_ids.length === 0 ||
+      !d.proof_ids.every((id) => typeof id === "string" && id.trim() !== "") ||
+      new Set(d.proof_ids).size !== d.proof_ids.length
+    ) {
+      throw new Error(
+        `FRG evidence.composition.dimensions[${index}].proof_ids must be unique non-empty strings`,
+      );
+    }
+    proofIds = [...d.proof_ids] as string[];
+  }
   return {
     id: d.id as FrgCompositionDimensionId,
     status: d.status as FrgCompositionStatus,
     source: d.source as FrgCompositionSource,
     detail: d.detail,
     observed,
+    ...(proofIds ? { proof_ids: proofIds } : {}),
   };
 }
 
@@ -1065,6 +1150,15 @@ function parseFrgIntegrity(raw: unknown): FrgIntegrity {
   if (typeof i.composition_fingerprint !== "string" || i.composition_fingerprint.trim() === "") {
     throw new Error("FRG evidence.integrity.composition_fingerprint must be a non-empty string");
   }
+  if (
+    i.pack_provenance_fingerprint !== undefined &&
+    (typeof i.pack_provenance_fingerprint !== "string" ||
+      !/^[0-9a-f]{64}$/.test(i.pack_provenance_fingerprint))
+  ) {
+    throw new Error(
+      "FRG evidence.integrity.pack_provenance_fingerprint must be a lowercase SHA-256 digest when present",
+    );
+  }
   let attestation: FrgAttestation | undefined;
   if (i.attestation !== undefined && i.attestation !== null) {
     if (typeof i.attestation !== "object" || Array.isArray(i.attestation)) {
@@ -1088,6 +1182,9 @@ function parseFrgIntegrity(raw: unknown): FrgIntegrity {
     scoreboard_fingerprint: i.scoreboard_fingerprint.trim(),
     composition_fingerprint: i.composition_fingerprint.trim(),
   };
+  if (typeof i.pack_provenance_fingerprint === "string") {
+    integrity.pack_provenance_fingerprint = i.pack_provenance_fingerprint;
+  }
   if (attestation) integrity.attestation = attestation;
   return integrity;
 }
@@ -1138,6 +1235,113 @@ export function frgScenariosPermitPass(scenarios: readonly FrgScenarioOutcome[])
 }
 
 /**
+ * Validate the temporary v1.33.0 hybrid proof boundary. This check does not
+ * turn digests into truth. It proves that the signed evidence contains the
+ * exact live/Layer A split that the closed runner is allowed to emit.
+ */
+export function hybridPilotProofValid(evidence: {
+  version?: string;
+  loop_run_id: string | null;
+  pack_id: string | null;
+  scenarios: readonly FrgScenarioOutcome[];
+  scoreboard?: FrgScoreboard;
+  composition?: FrgComposition;
+  pack_provenance?: FrgPackProvenance | null;
+}): boolean {
+  if (evidence.version !== FRG_HYBRID_PILOT_VERSION) {
+    return evidence.pack_provenance == null;
+  }
+  const provenance = evidence.pack_provenance;
+  if (
+    !provenance ||
+    provenance.policy_id !== FRG_HYBRID_PILOT_POLICY_ID ||
+    provenance.replacement_issue !== FRG_HYBRID_REPLACEMENT_ISSUE ||
+    provenance.release_version !== FRG_HYBRID_PILOT_VERSION ||
+    provenance.pack_id !== FRG_PACK_MANIFEST.pack_id ||
+    provenance.pack_id !== evidence.pack_id ||
+    provenance.loop_run_id !== evidence.loop_run_id ||
+    provenance.issues.length !== 2 ||
+    !evidence.scoreboard ||
+    !evidence.composition
+  ) {
+    return false;
+  }
+  const issueIds = [...provenance.issues.map((issue) => String(issue.issue_number))].sort();
+  const scoreboardIds = [...evidence.scoreboard.per_item.map((item) => item.item_id)].sort();
+  if (
+    issueIds.length !== scoreboardIds.length ||
+    issueIds.some((value, index) => value !== scoreboardIds[index])
+  ) {
+    return false;
+  }
+  const templates = new Set(provenance.issues.map((issue) => issue.template_id));
+  if (!templates.has("clean-docs") || !templates.has("clean-openspec") || templates.size !== 2) {
+    return false;
+  }
+  if (
+    provenance.probes.length === 0 ||
+    provenance.probes.some((probe) => probe.candidate_git_sha !== provenance.candidate_git_sha)
+  ) {
+    return false;
+  }
+  const proofs = new Map(provenance.proofs.map((proof) => [proof.id, proof] as const));
+  if (
+    !proofs.has("live:contract") ||
+    !proofs.has("ledger:final") ||
+    !proofs.has("live:events") ||
+    !proofs.has("live:action-evidence") ||
+    provenance.probes.some((probe) => !proofs.has(`probe:${probe.id}`))
+  ) {
+    return false;
+  }
+  const liveScenarioIds = new Set<string>(FRG_HYBRID_LIVE_SCENARIO_IDS);
+  for (const scenario of evidence.scenarios) {
+    const expectedSource: FrgPackProofSource =
+      scenario.id === "clean-item-throughput" || scenario.id === "blocker-taxonomy"
+        ? "ledger"
+        : scenario.id === "empty-depends-on-stack-honesty"
+          ? "derived"
+          : "layer_a";
+    if (scenario.source !== expectedSource || !scenario.proof_ids?.length) return false;
+    if (liveScenarioIds.has(scenario.id)) {
+      const exactProof = scenario.id === "empty-depends-on-stack-honesty"
+        ? "live:contract"
+        : "ledger:final";
+      if (scenario.proof_ids.length !== 1 || scenario.proof_ids[0] !== exactProof) return false;
+    } else if (scenario.proof_ids.some((id) => !id.startsWith("probe:"))) {
+      return false;
+    }
+    for (const id of scenario.proof_ids) {
+      const proof = proofs.get(id);
+      if (!proof) return false;
+      if (expectedSource === "layer_a" && proof.source !== "layer_a") return false;
+    }
+  }
+  const liveComposition = new Set<string>(FRG_HYBRID_LIVE_COMPOSITION_IDS);
+  for (const dimension of evidence.composition.dimensions) {
+    const expectedSource: FrgCompositionSource = liveComposition.has(dimension.id)
+      ? "live"
+      : "layer_a";
+    if (dimension.source !== expectedSource || !dimension.proof_ids?.length) return false;
+    if (expectedSource === "live") {
+      if (
+        dimension.proof_ids.length !== 1 ||
+        !dimension.proof_ids[0]!.startsWith("live:openspec-pr:")
+      ) {
+        return false;
+      }
+    } else if (dimension.proof_ids.some((id) => !id.startsWith("probe:"))) {
+      return false;
+    }
+    for (const id of dimension.proof_ids) {
+      const proof = proofs.get(id);
+      if (!proof || proof.source !== expectedSource) return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Release-eligible pass requires scenario criteria + live durable loop provenance
  * (non-empty loop_run_id) + validated fixed-pack identity + scoreboard integrity +
  * representative composition + integrity fingerprints + attestation presence (#757).
@@ -1154,6 +1358,7 @@ export function frgScenariosPermitPass(scenarios: readonly FrgScenarioOutcome[])
  */
 export function isReleaseEligibleFrgPass(
   evidence: {
+    version?: string;
     pass: boolean;
     scenarios: readonly FrgScenarioOutcome[];
     loop_run_id: string | null;
@@ -1162,6 +1367,7 @@ export function isReleaseEligibleFrgPass(
     scoreboard?: FrgScoreboard;
     composition?: FrgComposition;
     integrity?: FrgIntegrity;
+    pack_provenance?: FrgPackProvenance | null;
     run_id?: string;
   },
   opts?: {
@@ -1178,6 +1384,7 @@ export function isReleaseEligibleFrgPass(
     return false;
   }
   if (evidence.pack_id !== FRG_PACK_MANIFEST.pack_id) return false;
+  if (!hybridPilotProofValid(evidence)) return false;
   if (!capacityScenarioMeetsNumericCriterion(evidence.scenarios, evidence.thresholds)) {
     return false;
   }
@@ -1195,6 +1402,15 @@ export function isReleaseEligibleFrgPass(
   const expectedComp = computeCompositionFingerprint(evidence.composition);
   if (evidence.integrity.scoreboard_fingerprint !== expectedSb) return false;
   if (evidence.integrity.composition_fingerprint !== expectedComp) return false;
+  if (evidence.version === FRG_HYBRID_PILOT_VERSION) {
+    if (
+      !evidence.pack_provenance ||
+      evidence.integrity.pack_provenance_fingerprint !==
+        computePackProvenanceFingerprint(evidence.pack_provenance)
+    ) {
+      return false;
+    }
+  }
   if (typeof evidence.run_id === "string" && evidence.run_id.trim() === "") return false;
   // Attestation must be present for release-eligible pass (MAC verified on tag path).
   if (opts?.requireAttestation !== false && !frgAttestationPresent(evidence.integrity)) {
@@ -1454,6 +1670,9 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
     throw new Error("FRG evidence.composition is required");
   }
   const composition = parseFrgComposition(o.composition);
+  const packProvenance = o.pack_provenance === undefined || o.pack_provenance === null
+    ? null
+    : parseFrgPackProvenance(o.pack_provenance);
   if (o.integrity === undefined || o.integrity === null) {
     throw new Error("FRG evidence.integrity is required");
   }
@@ -1471,6 +1690,18 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
       "FRG evidence.integrity.composition_fingerprint does not match recomputed composition fingerprint",
     );
   }
+  if (packProvenance) {
+    const expectedPackFp = computePackProvenanceFingerprint(packProvenance);
+    if (integrity.pack_provenance_fingerprint !== expectedPackFp) {
+      throw new Error(
+        "FRG evidence.integrity.pack_provenance_fingerprint does not match recomputed pack provenance fingerprint",
+      );
+    }
+  } else if (integrity.pack_provenance_fingerprint !== undefined) {
+    throw new Error(
+      "FRG evidence.integrity.pack_provenance_fingerprint is present without pack_provenance",
+    );
+  }
   const recovery_aggregates = parseFrgRecoveryAggregates(o.recovery_aggregates);
 
   // Re-apply numeric/skip criteria so forged overrides cannot parse as pass.
@@ -1483,6 +1714,7 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
         : null;
   const releaseEligible = isReleaseEligibleFrgPass({
     pass: true, // evaluate eligibility of the scenario/provenance fields
+    version: o.version,
     scenarios: enforced,
     loop_run_id: loopRunId,
     pack_id: packId,
@@ -1490,6 +1722,7 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
     scoreboard,
     composition,
     integrity,
+    pack_provenance: packProvenance,
     run_id: typeof o.run_id === "string" ? o.run_id : "",
   });
 
@@ -1529,6 +1762,7 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
     notes: o.notes as string[],
     composition,
     integrity,
+    pack_provenance: packProvenance,
   };
   if (recovery_aggregates) evidence.recovery_aggregates = recovery_aggregates;
   return evidence;
@@ -1808,6 +2042,8 @@ export interface FrgScenarioOverride {
   detail: string;
   observed?: number | null;
   threshold?: number | null;
+  source?: FrgPackProofSource;
+  proof_ids?: string[];
 }
 
 /**
@@ -1876,6 +2112,7 @@ export interface FrgCompositionOverride {
   detail: string;
   source?: FrgCompositionSource;
   observed?: number | null;
+  proof_ids?: string[];
 }
 
 /**
@@ -1933,6 +2170,7 @@ export function buildFrgComposition(input: {
       source: o.source ?? "ledger",
       detail: o.detail,
       observed: o.observed ?? null,
+      ...(o.proof_ids ? { proof_ids: [...o.proof_ids] } : {}),
     });
   }
   for (const o of input.overrides ?? []) {
@@ -1942,6 +2180,7 @@ export function buildFrgComposition(input: {
       source: o.source ?? "observation",
       detail: o.detail,
       observed: o.observed ?? null,
+      ...(o.proof_ids ? { proof_ids: [...o.proof_ids] } : {}),
     });
   }
   const dimensions = FRG_COMPOSITION_DIMENSION_IDS.map((id) => byId.get(id)!);
@@ -2029,6 +2268,163 @@ export interface FrgObservationsFile {
   composition?: FrgCompositionOverride[];
   false_human_authority_count?: number;
   recovery_aggregates?: FrgRecoveryAggregates;
+  pack_provenance?: FrgPackProvenance;
+}
+
+function requiredObservationString(
+  value: unknown,
+  field: string,
+  pattern?: RegExp,
+): string {
+  if (typeof value !== "string" || value.trim() === "" || (pattern && !pattern.test(value))) {
+    throw new Error(`FRG observations.${field} is invalid`);
+  }
+  return value;
+}
+
+function requiredObservationStringArray(value: unknown, field: string): string[] {
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    !value.every((entry) => typeof entry === "string" && entry.trim() !== "") ||
+    new Set(value).size !== value.length
+  ) {
+    throw new Error(`FRG observations.${field} must be unique non-empty strings`);
+  }
+  return [...value] as string[];
+}
+
+/** Strict parser for the candidate/run/manifest proof block emitted by the runner. */
+export function parseFrgPackProvenance(raw: unknown): FrgPackProvenance {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("FRG observations.pack_provenance must be an object");
+  }
+  const p = raw as Record<string, unknown>;
+  if (
+    p.schema_version !== 1 ||
+    p.policy_id !== FRG_HYBRID_PILOT_POLICY_ID ||
+    p.replacement_issue !== FRG_HYBRID_REPLACEMENT_ISSUE ||
+    p.pack_id !== FRG_PACK_MANIFEST.pack_id ||
+    p.manifest_version !== 1 ||
+    p.release_version !== FRG_HYBRID_PILOT_VERSION
+  ) {
+    throw new Error("FRG observations.pack_provenance does not match the v1.33.0/#908 pilot policy");
+  }
+  const digest = /^[0-9a-f]{64}$/;
+  const gitSha = /^[0-9a-f]{40,64}$/;
+  const safeId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
+  const manifestSha = requiredObservationString(p.manifest_sha256, "pack_provenance.manifest_sha256", digest);
+  const candidateSha = requiredObservationString(p.candidate_git_sha, "pack_provenance.candidate_git_sha", gitSha);
+  const packRunId = requiredObservationString(p.pack_run_id, "pack_provenance.pack_run_id", safeId);
+  const loopRunId = requiredObservationString(p.loop_run_id, "pack_provenance.loop_run_id", safeId);
+  const repository = requiredObservationString(p.repository, "pack_provenance.repository", /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/);
+  const baseBranch = requiredObservationString(p.base_branch, "pack_provenance.base_branch");
+  const startedAt = requiredObservationString(p.started_at, "pack_provenance.started_at");
+  if (!Number.isFinite(Date.parse(startedAt))) throw new Error("FRG observations.pack_provenance.started_at is invalid");
+  const contractSha = requiredObservationString(p.contract_sha256, "pack_provenance.contract_sha256", digest);
+  const ledgerSha = requiredObservationString(p.ledger_sha256, "pack_provenance.ledger_sha256", digest);
+  const eventsSha = requiredObservationString(p.events_sha256, "pack_provenance.events_sha256", digest);
+  const actionSha = requiredObservationString(p.action_evidence_sha256, "pack_provenance.action_evidence_sha256", digest);
+  if (!Array.isArray(p.issues) || p.issues.length < FRG_PACK_MANIFEST.min_item_count) {
+    throw new Error("FRG observations.pack_provenance.issues must contain the fresh pack items");
+  }
+  const issues = p.issues.map((entry, index) => {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`FRG observations.pack_provenance.issues[${index}] must be an object`);
+    }
+    const issue = entry as Record<string, unknown>;
+    const issueNumber = issue.issue_number;
+    const prNumber = issue.pr_number;
+    if (!Number.isSafeInteger(issueNumber) || (issueNumber as number) <= 0 || !Number.isSafeInteger(prNumber) || (prNumber as number) <= 0) {
+      throw new Error(`FRG observations.pack_provenance.issues[${index}] has invalid issue or PR identity`);
+    }
+    const createdAt = requiredObservationString(issue.created_at, `pack_provenance.issues[${index}].created_at`);
+    if (!Number.isFinite(Date.parse(createdAt)) || Date.parse(createdAt) < Date.parse(startedAt)) {
+      throw new Error(`FRG observations.pack_provenance.issues[${index}] is not fresh`);
+    }
+    return {
+      issue_number: issueNumber as number,
+      issue_node_id: requiredObservationString(issue.issue_node_id, `pack_provenance.issues[${index}].issue_node_id`, safeId),
+      template_id: requiredObservationString(issue.template_id, `pack_provenance.issues[${index}].template_id`, safeId),
+      template_sha256: requiredObservationString(issue.template_sha256, `pack_provenance.issues[${index}].template_sha256`, digest),
+      created_at: new Date(Date.parse(createdAt)).toISOString(),
+      advance_run_id: requiredObservationString(issue.advance_run_id, `pack_provenance.issues[${index}].advance_run_id`, safeId),
+      pr_number: prNumber as number,
+      pr_node_id: requiredObservationString(issue.pr_node_id, `pack_provenance.issues[${index}].pr_node_id`, safeId),
+      pr_head_sha: requiredObservationString(issue.pr_head_sha, `pack_provenance.issues[${index}].pr_head_sha`, gitSha),
+      pr_files_sha256: requiredObservationString(issue.pr_files_sha256, `pack_provenance.issues[${index}].pr_files_sha256`, digest),
+      check_run_ids: requiredObservationStringArray(issue.check_run_ids, `pack_provenance.issues[${index}].check_run_ids`),
+    };
+  });
+  if (new Set(issues.map((issue) => issue.issue_number)).size !== issues.length || new Set(issues.map((issue) => issue.template_id)).size !== issues.length) {
+    throw new Error("FRG observations.pack_provenance.issues has duplicate issue or template identities");
+  }
+  if (!Array.isArray(p.probes) || p.probes.length === 0) {
+    throw new Error("FRG observations.pack_provenance.probes must be non-empty");
+  }
+  const probes = p.probes.map((entry, index) => {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`FRG observations.pack_provenance.probes[${index}] must be an object`);
+    }
+    const probe = entry as Record<string, unknown>;
+    const probeCandidate = requiredObservationString(probe.candidate_git_sha, `pack_provenance.probes[${index}].candidate_git_sha`, gitSha);
+    if (probeCandidate !== candidateSha) throw new Error(`FRG observations.pack_provenance.probes[${index}] is bound to another candidate`);
+    return {
+      id: requiredObservationString(probe.id, `pack_provenance.probes[${index}].id`, safeId),
+      test_file: requiredObservationString(probe.test_file, `pack_provenance.probes[${index}].test_file`, /^core\/test\/[A-Za-z0-9._-]+\.test\.ts$/),
+      test_name: requiredObservationString(probe.test_name, `pack_provenance.probes[${index}].test_name`),
+      candidate_git_sha: probeCandidate,
+      command_argv_sha256: requiredObservationString(probe.command_argv_sha256, `pack_provenance.probes[${index}].command_argv_sha256`, digest),
+      stdout_sha256: requiredObservationString(probe.stdout_sha256, `pack_provenance.probes[${index}].stdout_sha256`, digest),
+      stderr_sha256: requiredObservationString(probe.stderr_sha256, `pack_provenance.probes[${index}].stderr_sha256`, digest),
+    };
+  });
+  if (new Set(probes.map((probe) => probe.id)).size !== probes.length) {
+    throw new Error("FRG observations.pack_provenance.probes has duplicate ids");
+  }
+  if (!Array.isArray(p.proofs) || p.proofs.length === 0) {
+    throw new Error("FRG observations.pack_provenance.proofs must be non-empty");
+  }
+  const validSources = new Set<FrgPackProofSource>(["live", "ledger", "derived", "layer_a"]);
+  const proofs = p.proofs.map((entry, index) => {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`FRG observations.pack_provenance.proofs[${index}] must be an object`);
+    }
+    const proof = entry as Record<string, unknown>;
+    if (typeof proof.source !== "string" || !validSources.has(proof.source as FrgPackProofSource)) {
+      throw new Error(`FRG observations.pack_provenance.proofs[${index}].source is invalid`);
+    }
+    return {
+      id: requiredObservationString(proof.id, `pack_provenance.proofs[${index}].id`),
+      source: proof.source as FrgPackProofSource,
+      artifact_sha256: requiredObservationString(proof.artifact_sha256, `pack_provenance.proofs[${index}].artifact_sha256`, digest),
+    };
+  });
+  if (new Set(proofs.map((proof) => proof.id)).size !== proofs.length) {
+    throw new Error("FRG observations.pack_provenance.proofs has duplicate ids");
+  }
+  return {
+    schema_version: 1,
+    policy_id: FRG_HYBRID_PILOT_POLICY_ID,
+    replacement_issue: FRG_HYBRID_REPLACEMENT_ISSUE,
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    manifest_version: 1,
+    manifest_sha256: manifestSha,
+    release_version: FRG_HYBRID_PILOT_VERSION,
+    candidate_git_sha: candidateSha,
+    pack_run_id: packRunId,
+    loop_run_id: loopRunId,
+    repository,
+    base_branch: baseBranch,
+    started_at: new Date(Date.parse(startedAt)).toISOString(),
+    contract_sha256: contractSha,
+    ledger_sha256: ledgerSha,
+    events_sha256: eventsSha,
+    action_evidence_sha256: actionSha,
+    issues,
+    probes,
+    proofs,
+  };
 }
 
 /**
@@ -2095,12 +2491,36 @@ export function parseFrgObservationsFile(raw: unknown): FrgObservationsFile {
                   `FRG observations.scenarios[${i}].threshold must be a number or null`,
                 );
               })();
+      let source: FrgPackProofSource | undefined;
+      if (rec.source !== undefined) {
+        if (
+          typeof rec.source !== "string" ||
+          !new Set(["live", "ledger", "derived", "layer_a"]).has(rec.source)
+        ) {
+          throw new Error(`FRG observations.scenarios[${i}].source is invalid`);
+        }
+        source = rec.source as FrgPackProofSource;
+      }
+      let proofIds: string[] | undefined;
+      if (rec.proof_ids !== undefined) {
+        if (
+          !Array.isArray(rec.proof_ids) ||
+          rec.proof_ids.length === 0 ||
+          !rec.proof_ids.every((id) => typeof id === "string" && id.trim() !== "") ||
+          new Set(rec.proof_ids).size !== rec.proof_ids.length
+        ) {
+          throw new Error(`FRG observations.scenarios[${i}].proof_ids must be unique non-empty strings`);
+        }
+        proofIds = [...rec.proof_ids] as string[];
+      }
       scenarios.push({
         id: rec.id as FrgScenarioId,
         status: rec.status as FrgScenarioStatus,
         detail: rec.detail,
         observed,
         threshold,
+        ...(source ? { source } : {}),
+        ...(proofIds ? { proof_ids: proofIds } : {}),
       });
     }
   }
@@ -2144,12 +2564,32 @@ export function parseFrgObservationsFile(raw: unknown): FrgObservationsFile {
                   `FRG observations.composition[${i}].observed must be a number or null`,
                 );
               })();
+      const source = rec.source === undefined ? "observation" : rec.source;
+      if (
+        typeof source !== "string" ||
+        !FRG_VALID_COMPOSITION_SOURCES.has(source as FrgCompositionSource)
+      ) {
+        throw new Error(`FRG observations.composition[${i}].source is invalid`);
+      }
+      let proofIds: string[] | undefined;
+      if (rec.proof_ids !== undefined) {
+        if (
+          !Array.isArray(rec.proof_ids) ||
+          rec.proof_ids.length === 0 ||
+          !rec.proof_ids.every((id) => typeof id === "string" && id.trim() !== "") ||
+          new Set(rec.proof_ids).size !== rec.proof_ids.length
+        ) {
+          throw new Error(`FRG observations.composition[${i}].proof_ids must be unique non-empty strings`);
+        }
+        proofIds = [...rec.proof_ids] as string[];
+      }
       composition.push({
         id: rec.id as FrgCompositionDimensionId,
         status: rec.status as FrgCompositionStatus,
         detail: rec.detail,
-        source: "observation",
+        source: source as FrgCompositionSource,
         observed,
+        ...(proofIds ? { proof_ids: proofIds } : {}),
       });
     }
   }
@@ -2163,12 +2603,16 @@ export function parseFrgObservationsFile(raw: unknown): FrgObservationsFile {
     false_human_authority_count = o.false_human_authority_count;
   }
   const recovery_aggregates = parseFrgRecoveryAggregates(o.recovery_aggregates);
+  const pack_provenance = o.pack_provenance === undefined
+    ? undefined
+    : parseFrgPackProvenance(o.pack_provenance);
   return {
     schema_version: FRG_OBSERVATIONS_SCHEMA_VERSION,
     scenarios,
     composition,
     false_human_authority_count,
     recovery_aggregates,
+    pack_provenance,
   };
 }
 
@@ -2240,6 +2684,8 @@ export interface ComputeFrgInput {
   false_human_authority_count?: number;
   /** Optional recovery aggregates by reason code. */
   recovery_aggregates?: FrgRecoveryAggregates;
+  /** Candidate/run/manifest proof block from the closed pack runner. */
+  pack_provenance?: FrgPackProvenance | null;
   notes?: string[];
   now?: () => Date;
   /**
@@ -2302,6 +2748,8 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
         detail: o.detail,
         observed: o.observed ?? null,
         threshold: o.threshold ?? null,
+        ...(o.source ? { source: o.source } : {}),
+        ...(o.proof_ids ? { proof_ids: [...o.proof_ids] } : {}),
       };
     }
     if (id === "clean-item-throughput") {
@@ -2314,6 +2762,9 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
           : `${readyCleanCount} clean ready items < K=${thresholds.min_clean_ready_to_deploy}`,
         observed: readyCleanCount,
         threshold: thresholds.min_clean_ready_to_deploy,
+        ...(version === FRG_HYBRID_PILOT_VERSION
+          ? { source: "ledger" as const, proof_ids: ["ledger:final"] }
+          : {}),
       };
     }
     if (id === "blocker-taxonomy") {
@@ -2337,6 +2788,9 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
           : `engine-class rate ${(rate * 100).toFixed(1)}% (${engine}/${itemCount}) > max ${(thresholds.max_engine_class_rate * 100).toFixed(0)}%`,
         observed: rate,
         threshold: thresholds.max_engine_class_rate,
+        ...(version === FRG_HYBRID_PILOT_VERSION
+          ? { source: "ledger" as const, proof_ids: ["ledger:final"] }
+          : {}),
       };
     }
     return {
@@ -2380,7 +2834,8 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
     overrides: input.composition_overrides,
     false_human_authority_count: input.false_human_authority_count ?? 0,
   });
-  let integrity = buildFrgIntegrity(scoreboard, composition);
+  const packProvenance = input.pack_provenance ?? null;
+  let integrity = buildFrgIntegrity(scoreboard, composition, packProvenance);
 
   // Sign when a producer key is available (env or explicit). Without a key,
   // attestation is omitted and release-eligible pass cannot be true (#757).
@@ -2400,6 +2855,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
   const structuralPass = isReleaseEligibleFrgPass(
     {
       pass: true,
+      version,
       scenarios,
       loop_run_id: loopRunId,
       pack_id: packId,
@@ -2407,6 +2863,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       scoreboard,
       composition,
       integrity,
+      pack_provenance: packProvenance,
       run_id: runId,
     },
     { requireAttestation: false },
@@ -2428,6 +2885,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       scoreboard,
       composition,
       recovery_aggregates: input.recovery_aggregates ?? null,
+      pack_provenance: packProvenance,
       attestationKey: attestationKey!,
     });
   }
@@ -2456,6 +2914,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
     ],
     composition,
     integrity,
+    pack_provenance: packProvenance,
   };
   if (input.recovery_aggregates) {
     evidence.recovery_aggregates = input.recovery_aggregates;
@@ -2512,7 +2971,10 @@ export type FrgPackValidation =
  * (selector + multi-item inventory). Call before writing release evidence
  * from `--from-run`.
  */
-export function validateFrgPackContract(contract: LoopContract): FrgPackValidation {
+export function validateFrgPackContract(
+  contract: LoopContract,
+  expectedIssueNumbers?: readonly number[],
+): FrgPackValidation {
   if (!isAllowedFrgPackSelector(contract.selector)) {
     return {
       ok: false,
@@ -2534,6 +2996,21 @@ export function validateFrgPackContract(contract: LoopContract): FrgPackValidati
         `(got ${items.length}); multi-item composition is mandatory ` +
         `(pack_id=${FRG_PACK_MANIFEST.pack_id})`,
     };
+  }
+  if (expectedIssueNumbers) {
+    const expected = [...expectedIssueNumbers].map(String).sort();
+    const actual = items.map((item) => item.id).sort();
+    if (
+      expected.length !== actual.length ||
+      expected.some((value, index) => value !== actual[index])
+    ) {
+      return {
+        ok: false,
+        detail:
+          `FRG fixed pack contract items [${actual.join(",")}] do not equal ` +
+          `the fresh manifest issue set [${expected.join(",")}]`,
+      };
+    }
   }
   return { ok: true };
 }
@@ -2773,6 +3250,8 @@ export interface FactoryGateOpts {
   compositionOverrides?: FrgCompositionOverride[];
   falseHumanAuthorityCount?: number;
   recoveryAggregates?: FrgRecoveryAggregates;
+  /** Structured proof block from the closed v1.33.0 pack runner. */
+  packProvenance?: FrgPackProvenance;
   thresholds?: FrgThresholds;
   now?: () => Date;
   /**
@@ -2836,6 +3315,8 @@ export async function runFactoryGate(
         opts.scoreInput.false_human_authority_count,
       recovery_aggregates:
         opts.recoveryAggregates ?? opts.scoreInput.recovery_aggregates,
+      pack_provenance:
+        opts.packProvenance ?? opts.scoreInput.pack_provenance,
       attestation_key:
         opts.scoreInput.attestation_key !== undefined
           ? opts.scoreInput.attestation_key
@@ -2860,7 +3341,10 @@ export async function runFactoryGate(
           `cannot validate FRG fixed-pack membership (pack_id=${FRG_PACK_MANIFEST.pack_id})`,
       );
     }
-    const packCheck = validateFrgPackContract(contract);
+    const packCheck = validateFrgPackContract(
+      contract,
+      opts.packProvenance?.issues.map((issue) => issue.issue_number),
+    );
     if (!packCheck.ok) {
       throw new Error(
         `pipeline factory-gate: refused to score non-pack run ${opts.fromRun}: ${packCheck.detail}`,
@@ -2891,6 +3375,7 @@ export async function runFactoryGate(
       composition_overrides: opts.compositionOverrides,
       false_human_authority_count: opts.falseHumanAuthorityCount,
       recovery_aggregates: opts.recoveryAggregates,
+      pack_provenance: opts.packProvenance,
       notes,
       thresholds: opts.thresholds,
       now: opts.now,
@@ -2945,7 +3430,10 @@ export async function runFactoryGate(
     if (opts.loadContract) {
       const contract = await opts.loadContract(loop_run_id);
       if (contract) {
-        const packCheck = validateFrgPackContract(contract);
+        const packCheck = validateFrgPackContract(
+          contract,
+          opts.packProvenance?.issues.map((issue) => issue.issue_number),
+        );
         if (!packCheck.ok) {
           throw new Error(
             `pipeline factory-gate: started loop ${loop_run_id} is not FRG fixed pack: ${packCheck.detail}`,
@@ -2970,6 +3458,7 @@ export async function runFactoryGate(
       composition_overrides: opts.compositionOverrides,
       false_human_authority_count: opts.falseHumanAuthorityCount,
       recovery_aggregates: opts.recoveryAggregates,
+      pack_provenance: opts.packProvenance,
       notes,
       thresholds: opts.thresholds,
       now: opts.now,
@@ -2984,6 +3473,28 @@ export async function runFactoryGate(
         "  2) Score + write evidence:\n" +
         "       pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> [--json]\n" +
         "  See docs/factory-reliability-gate-runbook.md",
+    );
+  }
+
+  if (version === FRG_HYBRID_PILOT_VERSION) {
+    const provenance = computeInput.pack_provenance;
+    if (!provenance) {
+      throw new Error(
+        `pipeline factory-gate: v${FRG_HYBRID_PILOT_VERSION} requires the closed ` +
+          `${FRG_HYBRID_PILOT_POLICY_ID} runner provenance; CLI scenario claims are not release evidence`,
+      );
+    }
+    if (
+      provenance.release_version !== version ||
+      provenance.loop_run_id !== computeInput.loop_run_id ||
+      provenance.pack_id !== computeInput.pack_id
+    ) {
+      throw new Error("pipeline factory-gate: pack provenance does not match the scored version, loop, or pack");
+    }
+  } else if (computeInput.pack_provenance) {
+    throw new Error(
+      `pipeline factory-gate: ${FRG_HYBRID_PILOT_POLICY_ID} expires after ` +
+        `v${FRG_HYBRID_PILOT_VERSION}; issue #${FRG_HYBRID_REPLACEMENT_ISSUE} owns its replacement`,
     );
   }
 

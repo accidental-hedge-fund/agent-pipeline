@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "recipe_id": "openspec-and-worktree",
+  "summary": "Exercise OpenSpec archive coherence and known managed-worktree dirt without creating a human hold.",
+  "steps": [
+    {
+      "id": "inject-lockfile-dirt",
+      "action": "Create the documented lockfile side effect after the implementation head advances."
+    },
+    {
+      "id": "exercise-openspec",
+      "action": "Run pre-merge archive with the synthetic issue change and record the residual active-change check."
+    },
+    {
+      "id": "observe-stack-honesty",
+      "action": "Record the empty-dependency stack assessment for the pack contract."
+    }
+  ],
+  "required_evidence": [
+    { "kind": "action-result", "minimum": 3 },
+    { "kind": "pipeline-events", "minimum": 2 },
+    { "kind": "check-observation", "minimum": 1 }
+  ],
+  "scenario_outputs": [
+    { "id": "openspec-multi-change" },
+    { "id": "implement-lockfile-dirt" },
+    { "id": "empty-depends-on-stack-honesty" }
+  ],
+  "composition_outputs": [
+    { "id": "openspec-bearing-item" },
+    { "id": "managed-worktree-dirt" }
+  ]
+}

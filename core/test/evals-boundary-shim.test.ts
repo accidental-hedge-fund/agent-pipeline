@@ -31,7 +31,7 @@ function mkWorktree(): string {
 
 async function run(cmd: string, args: string[], env: NodeJS.ProcessEnv, cwd: string) {
   try {
-    const { stdout, stderr } = await execFileAsync(cmd, args, { env, cwd });
+    const { stdout, stderr } = await execFileAsync(cmd, args, { env, cwd, timeout: 5_000 });
     return { code: 0, stdout, stderr };
   } catch (err) {
     const e = err as { code?: number; stdout?: string; stderr?: string };
@@ -99,6 +99,24 @@ test("git shim: a permitted operation (git status) is passed through to the real
   assert.equal(result.code, 0, "a permitted git operation must succeed through the shim");
   const denials = readBoundaryDenials(worktreeDir);
   assert.equal(denials.length, 0, "a permitted operation must not be recorded as a denial");
+});
+
+test("git shim: a symlinked PATH spelling cannot recurse into the same shim", async () => {
+  const worktreeDir = mkWorktree();
+  await execFileAsync("git", ["init", "-q"], { cwd: worktreeDir });
+  installBoundaryShim(worktreeDir);
+  const aliasRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-boundary-shim-alias-"));
+  const aliasDir = path.join(aliasRoot, "shim");
+  fs.symlinkSync(boundaryShimDir(worktreeDir), aliasDir, "dir");
+  const env = { ...process.env, ...boundaryEnv(worktreeDir) };
+  const entries = (env.PATH ?? "").split(path.delimiter);
+  entries[0] = aliasDir;
+  env.PATH = entries.join(path.delimiter);
+
+  const result = await run("git", ["status", "--short"], env, worktreeDir);
+
+  assert.equal(result.code, 0, "a permitted git operation must not recurse through a path alias");
+  assert.deepEqual(readBoundaryDenials(worktreeDir), []);
 });
 
 test("readBoundaryDenials: an absent log means no denial occurred, not a collection failure", () => {

@@ -1,15 +1,35 @@
-# #757 — FRG representative pack (plan revision)
+# Scoped autonomous Hermes/Buzz factory
 
-## Status
+## Plan
 
-Plan revised after Codex NEEDS_REVISION review. Implementation not started.
+- [x] Create a fresh task worktree from `origin/main`.
+- [x] Read the shared contract, repository rules, selected skills, and living specs.
+- [x] Capture live GitHub, `agent-box`, Buzz, Hermes, Pipeline, and FRG truth.
+- [x] Create and validate the OpenSpec change for scoped factory authority.
+- [x] Rewrite the factory plan and forward SemVer roadmap.
+- [x] Correct the roadmap so every open issue has one representative SemVer milestone.
+- [x] Update authority, release, self-hosting, and operator documentation.
+- [x] Add the agent-box deployment assets, run contract, monitor, and rollback runbook.
+- [x] Add tests and validation for all repository-owned behavior.
+- [x] Replace caller-authored FRG receipts with the v1.33.0 live-plus-candidate-bound hybrid runner.
+- [x] Prove two-release continuity: v1.33.0 installs itself, then the stable wrapper uses the v1.34.0 candidate-native release-preparation command without manual wrapper replacement.
+- [x] Rebuild generated mirrors when `core/` changes.
+- [x] Run `npm run ci` and all focused verification.
+- [x] Commit, push, open PR #912, obtain review, and make CI green.
+- [x] Apply and verify the corrected all-issue GitHub milestone migration.
+- [ ] Deploy Hermes and Buzz access on `agent-box`.
+- [ ] Verify the current v1.31.1 production pin, the v1.32.0 code base, and a live Grok 4.5/Codex smoke.
+- [ ] Start the scoped v1.33.0 goal-loop for #905, #874, and #870.
+- [ ] Merge each exact issue PR only after Pipeline reaches ready-to-deploy.
+- [ ] Run full FRG, cut v1.33.0, verify publication, and install the new release.
 
-## Artifacts
+## Review
 
-- `openspec/changes/frg-representative-pack-requirements/design.md` — strengthened
-- `openspec/changes/frg-representative-pack-requirements/tasks.md` — strengthened
-- Spec deltas already present under `openspec/changes/frg-representative-pack-requirements/specs/`
-
-## Next
-
-Implement per revised plan (engine rate → composition validator → ledger → CLI → auto-tag → waivers → runbook → `npm run ci` + plugin mirror).
+- GitHub roadmap audit on 2026-08-08: 103 open issues, 103 milestone assignments, and zero unmilestoned issues.
+- #908 and #909 moved to v1.34.0 so the native release-preparation seam lands before the factory needs to prepare its second release. The empty v1.33.1 milestone was closed.
+- Repository verification on 2026-08-08: `npm run ci` passed, including the core suite, 118 factory tests, generated mirror checks, installer/launcher smoke tests, strict OpenSpec validation, docs checks, and script tests.
+- Full CI exposed and verified a macOS `/var` versus `/private/var` recursion defect in the evaluation git shim. The fix canonicalizes PATH entries and has a symlink-path regression test.
+- Final bounded implementation review found no P0 defects and one P1 defect: the shipped Hermes
+  grant example omitted the required milestone. The example now includes the milestone, and a
+  regression test parses and validates the actual shipped envelope. `npm run ci:ops` passes 119/119.
+- Pull request #912 opened from commit `0c73aca0`; its required GitHub CI job passed in 2m38s.

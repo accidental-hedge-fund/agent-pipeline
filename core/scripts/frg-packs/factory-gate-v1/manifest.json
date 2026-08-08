@@ -1,0 +1,258 @@
+{
+  "schema_version": 1,
+  "pack_id": "factory-gate-v1",
+  "manifest_version": 1,
+  "selector": {
+    "type": "label",
+    "value": "factory-gate"
+  },
+  "issue_labels": [
+    "factory-gate",
+    "pipeline:ready"
+  ],
+  "minimum_fresh_issues": 2,
+  "required_scenario_ids": [
+    "capacity-blocked-retain",
+    "resume-mid-flight",
+    "openspec-multi-change",
+    "implement-lockfile-dirt",
+    "local-docs-parity",
+    "clean-item-throughput",
+    "blocker-taxonomy",
+    "pr-supersession",
+    "release-plan-row",
+    "empty-depends-on-stack-honesty"
+  ],
+  "auto_scored_scenario_ids": [
+    "clean-item-throughput",
+    "blocker-taxonomy"
+  ],
+  "required_composition_ids": [
+    "openspec-bearing-item",
+    "fix-rereview-cycle",
+    "concurrency-contention",
+    "managed-worktree-dirt",
+    "process-restart-hydration",
+    "forge-http-5xx-backoff",
+    "ci-pending-red-recovery",
+    "same-head-noop-reentry",
+    "capacity-live-run-coexistence",
+    "recovery-controller-one-item",
+    "recovery-controller-multi-item"
+  ],
+  "pilot_policy": {
+    "id": "factory-gate-v1-hybrid-v1",
+    "release_version": "1.33.0",
+    "replacement_issue": 908,
+    "live_scenario_ids": [
+      "clean-item-throughput",
+      "blocker-taxonomy",
+      "empty-depends-on-stack-honesty"
+    ],
+    "live_composition_ids": [
+      "openspec-bearing-item"
+    ],
+    "layer_a_probes": [
+      {
+        "id": "capacity-blocked-retain",
+        "test_file": "core/test/factory-reliability-gate-layer-a.test.ts",
+        "test_name": "FRG Layer A capacity-blocked-retain: capacity error is worktree capacity, not needs-human cascade",
+        "scenario_outputs": [
+          { "id": "capacity-blocked-retain", "observed": 2, "threshold": 2 }
+        ],
+        "composition_outputs": [
+          { "id": "concurrency-contention", "observed": 2 },
+          { "id": "capacity-live-run-coexistence", "observed": 2 }
+        ]
+      },
+      {
+        "id": "restart-hydration",
+        "test_file": "core/test/loop-supervisor.test.ts",
+        "test_name": "resume reconciles and continues after a same-host dead-pid lock, with no second store",
+        "scenario_outputs": [
+          { "id": "resume-mid-flight" }
+        ],
+        "composition_outputs": [
+          { "id": "process-restart-hydration" }
+        ]
+      },
+      {
+        "id": "openspec-multi-change",
+        "test_file": "core/test/factory-reliability-gate-layer-a.test.ts",
+        "test_name": "FRG Layer A openspec-multi-change: residual still-active after partial archive is fail not skip",
+        "scenario_outputs": [
+          { "id": "openspec-multi-change" }
+        ],
+        "composition_outputs": []
+      },
+      {
+        "id": "managed-worktree-dirt",
+        "test_file": "core/test/factory-reliability-gate-layer-a.test.ts",
+        "test_name": "FRG Layer A implement-lockfile-dirt: dirty lock after HEAD advance is folded (not left for human at 0 attempts)",
+        "scenario_outputs": [
+          { "id": "implement-lockfile-dirt" }
+        ],
+        "composition_outputs": [
+          { "id": "managed-worktree-dirt" }
+        ]
+      },
+      {
+        "id": "local-docs-parity",
+        "test_file": "core/test/docs-freshness.test.ts",
+        "test_name": "resumeFromImplementing: red docs blocks createPr and push (deliberate stale / #597-class)",
+        "scenario_outputs": [
+          { "id": "local-docs-parity" }
+        ],
+        "composition_outputs": []
+      },
+      {
+        "id": "forge-http-5xx-backoff",
+        "test_file": "core/test/escalation-dispositions.test.ts",
+        "test_name": "transient label edit: 504 then success does not park",
+        "scenario_outputs": [],
+        "composition_outputs": [
+          { "id": "forge-http-5xx-backoff" }
+        ]
+      },
+      {
+        "id": "ci-pending-red-recovery",
+        "test_file": "core/test/pre-merge-ci-recovery.test.ts",
+        "test_name": "flake fail → re-run → green advances without needs-human",
+        "scenario_outputs": [],
+        "composition_outputs": [
+          { "id": "ci-pending-red-recovery" }
+        ]
+      },
+      {
+        "id": "fix-rereview-cycle",
+        "test_file": "core/test/pre-merge-autofix.test.ts",
+        "test_name": "pre-merge auto-fix 5.1: all-correctness blocks → auto-fix → re-review approves → return null",
+        "scenario_outputs": [],
+        "composition_outputs": [
+          { "id": "fix-rereview-cycle" }
+        ]
+      },
+      {
+        "id": "same-head-noop-reentry",
+        "test_file": "core/test/pre-merge-autofix.test.ts",
+        "test_name": "pre-merge auto-fix #787: residual re-entry preflight failure posts no marker; retry at same head still runs the implementer",
+        "scenario_outputs": [],
+        "composition_outputs": [
+          { "id": "same-head-noop-reentry" }
+        ]
+      },
+      {
+        "id": "pr-supersession",
+        "test_file": "core/test/supersede-issue-prs.test.ts",
+        "test_name": "disposeSupersededIssuePrs close mode: closes only stale associated same-base PR",
+        "scenario_outputs": [
+          { "id": "pr-supersession" }
+        ],
+        "composition_outputs": []
+      },
+      {
+        "id": "release-plan-row",
+        "test_file": "core/test/release.test.ts",
+        "test_name": "scaffoldRoadmap: missing unshipped plan row is scaffolded then ship-marked",
+        "scenario_outputs": [
+          { "id": "release-plan-row" }
+        ],
+        "composition_outputs": []
+      },
+      {
+        "id": "release-tag-guard",
+        "test_file": "core/test/auto-tag-release-workflow.test.ts",
+        "test_name": "auto-tag-release workflow has FRG verification step ordered before tag create/push",
+        "scenario_outputs": [
+          { "id": "release-plan-row" }
+        ],
+        "composition_outputs": []
+      },
+      {
+        "id": "recovery-controller-one-item-route",
+        "test_file": "core/test/single-issue-command.test.ts",
+        "test_name": "single issue command routes the resolved issue through the durable one-item controller",
+        "scenario_outputs": [],
+        "composition_outputs": [
+          { "id": "recovery-controller-one-item" }
+        ]
+      },
+      {
+        "id": "recovery-controller-one-item-action",
+        "test_file": "core/test/loop-supervisor.test.ts",
+        "test_name": "serialized dispatch rejection enters bounded recovery and redispatches the same item",
+        "scenario_outputs": [],
+        "composition_outputs": [
+          { "id": "recovery-controller-one-item" }
+        ]
+      },
+      {
+        "id": "recovery-controller-multi-item",
+        "test_file": "core/test/durable-run-two-item-live-pilot.test.ts",
+        "test_name": "two-item durable pilot: recoverable blocker + same-item resume + merge-refresh barrier + evidence bundle + no duplicate external action, with zero real network/git/subprocess access",
+        "scenario_outputs": [],
+        "composition_outputs": [
+          { "id": "recovery-controller-multi-item" }
+        ]
+      }
+    ]
+  },
+  "templates": [
+    {
+      "id": "clean-docs",
+      "title": "test(frg): {{release_version}} {{pack_run_id}} clean docs path",
+      "file": "templates/clean-docs.md",
+      "sha256": "8decc9764176047b6168f1b9f39e675f84a797615d02ff3d7aba1a0c9b840cd8",
+      "clean_path": true
+    },
+    {
+      "id": "clean-openspec",
+      "title": "test(frg): {{release_version}} {{pack_run_id}} clean OpenSpec path",
+      "file": "templates/clean-openspec.md",
+      "sha256": "601bb2f7730d374dab08a4faa2115b8400276f0aeddb027d8bfa6e95dd2bf476",
+      "clean_path": true
+    }
+  ],
+  "fault_recipes": [
+    {
+      "id": "capacity-and-coexistence",
+      "file": "faults/capacity-and-coexistence.json",
+      "sha256": "a30ab6c107e7baafb29d7a0e95e0c44709620fe983cec918e917d7295ee4110f"
+    },
+    {
+      "id": "restart-and-reentry",
+      "file": "faults/restart-and-reentry.json",
+      "sha256": "467aad0de77371c61780ac445d463c37b50326496b38e8945a7921884647fb40"
+    },
+    {
+      "id": "openspec-and-worktree",
+      "file": "faults/openspec-and-worktree.json",
+      "sha256": "67fdcb5faa405e408f2598bcc91e1b4b5b79fb4c166e7a14652ad5fb17ac3399"
+    },
+    {
+      "id": "forge-backoff",
+      "file": "faults/forge-backoff.json",
+      "sha256": "5011068d9b147860841ddc2b88f163ba084e2c49de18fa30b4bf684d89d9a0be"
+    },
+    {
+      "id": "ci-review-and-docs",
+      "file": "faults/ci-review-and-docs.json",
+      "sha256": "a2ace7866ea7f40bc50e380d1634290b2e82c188bdce92d3e47e85e232b77b3d"
+    },
+    {
+      "id": "pr-supersession",
+      "file": "faults/pr-supersession.json",
+      "sha256": "6aef2f6a5e06008f10130789d7167fea2139a875b7f05100a6087842dcd4974d"
+    },
+    {
+      "id": "release-plan-row",
+      "file": "faults/release-plan-row.json",
+      "sha256": "cfef1bf2d995667be3a84f19e342a0f1fec21d649ce1f138f2c7a518aa3b2b49"
+    },
+    {
+      "id": "recovery-controllers",
+      "file": "faults/recovery-controllers.json",
+      "sha256": "50b0b64748711169281aebcd4b3e59f529565dcc23e50c12d243908117528d09"
+    }
+  ]
+}

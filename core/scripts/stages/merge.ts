@@ -1,12 +1,14 @@
-// Human-invoked merge sub-command (#217): squash-merges a ready-to-deploy PR and
-// deletes its head branch. NEVER called from the autonomous advance loop — the
-// loop-isolation guarantee is structural (no import from any stage handler) and is
-// backed by a unit test in core/test/merge.test.ts.
+// Operator-authorized merge sub-command (#217): squash-merges a
+// ready-to-deploy PR and deletes its head branch. NEVER called from the
+// autonomous advance loop — the loop-isolation guarantee is structural (no
+// import from any stage handler) and is backed by a unit test in
+// core/test/merge.test.ts.
 //
-// This is the controlled, explicit surface for pipeline operators (or pipeline-desk
-// on a human button click) to merge after ready-to-deploy. Rule #4 from CLAUDE.md
-// ("The pipeline never merges") refers to the autonomous loop; this sub-command is
-// the human-gated exception.
+// This is the controlled, explicit surface for direct pipeline operators,
+// pipeline-desk on an operator button click, or an external wrapper that has
+// already validated a scoped operator grant. This command does not validate
+// Buzz events or deployment grants. Rule #4 from CLAUDE.md applies to the
+// autonomous advance loop; this sub-command remains loop-isolated.
 //
 // gh pr view field shapes (confirmed 2026-06-17 against agent-pipeline PR #219):
 //   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN"

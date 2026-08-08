@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "recipe_id": "forge-backoff",
+  "summary": "Inject a bounded forge HTTP 5xx response and prove that the configured recovery path retries and succeeds.",
+  "steps": [
+    {
+      "id": "inject-http-5xx",
+      "action": "Return one controlled HTTP 5xx response through the documented forge fault seam."
+    },
+    {
+      "id": "observe-backoff",
+      "action": "Record the typed recovery attempt, eligibility deadline, and later success."
+    }
+  ],
+  "required_evidence": [
+    { "kind": "action-result", "minimum": 2 },
+    { "kind": "pipeline-events", "minimum": 2 }
+  ],
+  "scenario_outputs": [],
+  "composition_outputs": [
+    { "id": "forge-http-5xx-backoff" }
+  ]
+}

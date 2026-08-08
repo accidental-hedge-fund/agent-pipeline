@@ -1264,7 +1264,7 @@ test("runCapped: the fd handed to spawn already references the complete, on-disk
   });
   const spawnFn = ((_cmd: string, _args: string[], options: { stdio?: unknown[] }) => {
     const fd = (options.stdio ?? [])[0] as number;
-    observedFdContent = fs.readFileSync(`/proc/self/fd/${fd}`, "utf8");
+    observedFdContent = fs.readFileSync(fd, "utf8");
     setImmediate(() => fakeChild.emit("close", 0));
     return fakeChild;
   }) as unknown as typeof import("node:child_process").spawn;

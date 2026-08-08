@@ -10,9 +10,9 @@
 // 8. Committing on a new branch and opening a release PR (body includes FRG run_id
 //    and, when used, open-soak-defect override evidence)
 //
-// Stops at the open PR — does not tag, merge, or publish (the post-merge
-// release.yml workflow handles those after a human merges). FRG and open-soak
-// preflights also never merge or tag.
+// Stops at the open PR — does not tag, merge, or publish. The post-merge
+// release.yml workflow handles those after a separately authorized release-PR
+// merge. FRG and open-soak preflights also never merge or tag.
 
 import * as path from "node:path";
 import * as fs from "node:fs";

@@ -765,6 +765,6 @@ function buildPRBody(
     "",
     `This PR was opened by \`pipeline intake\`. Review the roadmap placement and merge when satisfied.`,
     "",
-    "_The pipeline never merges — a human owns this button._",
+    "_The advance path never merges. Integration requires an operator-authorized merge surface._",
   ].join("\n");
 }

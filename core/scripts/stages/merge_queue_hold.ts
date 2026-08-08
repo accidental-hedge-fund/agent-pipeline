@@ -1,6 +1,6 @@
 // Pure merge-queue hold / repair-budget helpers (#675).
 //
-// Typed holds for human-gated merge-queue drive when a candidate is
+// Typed holds for operator-authorized merge-queue drive when a candidate is
 // non-mergeable (conflict/dirty) or has blocking required checks. Optional
 // surgical repair is opt-in elsewhere; this module stays pure and injectable.
 //
@@ -405,7 +405,7 @@ export function buildSurgicalRepairPrompt(input: {
   return [
     `## Merge-queue surgical repair (PR #${input.prNumber}, ${issue})`,
     "",
-    "You are performing a **bounded surgical repair** for the human-gated merge queue.",
+    "You are performing a **bounded surgical repair** for the operator-authorized merge queue.",
     goal + head,
     evidence,
     "",

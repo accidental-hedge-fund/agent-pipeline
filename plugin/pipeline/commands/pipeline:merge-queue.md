@@ -1,5 +1,5 @@
 ---
-description: Human-gated sequential merge of ready-to-deploy PRs; optional prepare-only release-when-complete
+description: Operator-authorized sequential merge of ready-to-deploy PRs; dry-run by default; optional prepare-only release-when-complete
 argument-hint: '--milestone <title> [--apply] [--release-when-complete --release-version <v>]'
 ---
 

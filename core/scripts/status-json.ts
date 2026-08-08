@@ -100,7 +100,7 @@ export function deriveNextAction(stage: string | null, blocked: boolean): string
     "pre-merge": "Pre-merge checks (CI, docs) will run next.",
     "eval-gate": "Eval gate will run next.",
     "shipcheck-gate": "Shipcheck will run next.",
-    "ready-to-deploy": "Ready to deploy — awaiting human merge.",
+    "ready-to-deploy": "Ready to deploy — awaiting an operator-authorized merge.",
     "needs-human":
       "Human decision required — use `--override \"<key>: <reason>\"` or fix residual findings.",
   };

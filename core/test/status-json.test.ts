@@ -383,8 +383,8 @@ test("deriveNextAction: needs-human → human decision required", () => {
   assert.match(deriveNextAction("needs-human", false), /human decision/i);
 });
 
-test("deriveNextAction: ready-to-deploy → awaiting human merge", () => {
-  assert.match(deriveNextAction("ready-to-deploy", false), /awaiting human merge/i);
+test("deriveNextAction: ready-to-deploy → awaiting operator-authorized merge", () => {
+  assert.match(deriveNextAction("ready-to-deploy", false), /operator-authorized merge/i);
 });
 
 test("deriveNextAction: unknown stage → fallback with stage name", () => {

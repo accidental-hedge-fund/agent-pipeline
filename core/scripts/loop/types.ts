@@ -635,8 +635,8 @@ export interface LoopStopRecord {
   /** Set when `reason === "dependency_deadlock"` — for each stuck item, the dependency (in-run
    *  or external) it waits on and that dependency's observed state. */
   deadlock_chain?: LoopDeadlockChainEntry[];
-  /** Every item id in the `ready` state (`pipeline:ready-to-deploy`, awaiting the human merge
-   *  the pipeline never performs) at the moment this stop was recorded — capability
+  /** Every item id in the `ready` state (`pipeline:ready-to-deploy`, awaiting an
+   *  operator-authorized merge that the advance path never performs) at the moment this stop was recorded — capability
    *  `loop-needs-human-blocker-disposition`. Additive disclosure only: it never alters the stop
    *  `reason` or which items are considered done. Always present (empty when no item is
    *  `ready`) on a stop recorded after this capability landed; see

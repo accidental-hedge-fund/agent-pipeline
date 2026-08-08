@@ -286,7 +286,7 @@ export async function openRoadmapPr(
       "",
       `This PR updates \`${relPath}\` with the current dependency-aware, scored roadmap.`,
       "",
-      "_The pipeline never merges — a human owns this button._",
+      "_The advance path never merges. Integration requires an operator-authorized merge surface._",
     ].join("\n");
 
     // createPr cwd can be either path; head branch is already pushed. Prefer

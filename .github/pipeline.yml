@@ -24,7 +24,7 @@ harnesses:
   implementer: grok
   reviewer: codex
 
-models: # per-phase model alias — honored when the resolved role's harness supports model selection. Each key also accepts "auto" (#366, #608).
+models: # current Grok factory roles use exactly grok-4.5; no Grok fallback is configured
   planning: grok-4.5 # implementer harness
   implementing: grok-4.5 # implementer harness
   review: gpt-5.6-terra # reviewer harness
