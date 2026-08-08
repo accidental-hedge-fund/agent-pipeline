@@ -108,6 +108,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 - **Usage:** `pipeline factory-pin show|init --from-frg <X.Y.Z>|promote --for <X.Y.Z>|rollback [--to <X.Y.Z>] [--git-sha <sha>] [--force]`
 - **Summary:** Show / init / promote / rollback the factory production engine pin (last FRG-passed release; never merges or tags)
 
+#### `factory-status`
+
+- **Usage:** `pipeline factory status [--json] [--run-id <loop-run-id>]`
+- **Summary:** Read-only factory aggregate status and controller health (allowlisted remote-safe snapshot; never mutates)
+
 #### `improve`
 
 - **Usage:** `pipeline improve [--apply] [--top <n>] [--json]`

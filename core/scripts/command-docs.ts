@@ -161,6 +161,13 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     documented: true,
     section: "factory",
   },
+  "factory-status": {
+    summary:
+      "Read-only factory aggregate status and controller health (allowlisted remote-safe snapshot; never mutates)",
+    usage: "factory status [--json] [--run-id <loop-run-id>]",
+    documented: true,
+    section: "factory",
+  },
   logs: {
     summary: "List or stream pipeline run logs (events --follow exits 0 on terminal run_complete)",
     usage: "logs [<run-id>] [--events] [-f] [--no-until-terminal]",

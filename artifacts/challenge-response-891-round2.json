@@ -1,0 +1,395 @@
+{
+  "responses": [
+    {
+      "challengeKey": "8e098cf4",
+      "disposition": "revised",
+      "evidence": "Confirmed gap in assembleFactoryStatus run/controller assembly (factory-status.ts): factory_run_id/loop_run_id/contract_hash/engine_pin are OR-merged from macro, loop, process, and pin without equality checks, so contradictory active run or contract identities can form one false snapshot. Revised d1: pure assembler gains explicit correlation keys (loop_run_id/process run_id, contract/canonical hashes, factory_run_id, process boot binding), precedence by source role when consistent, and degraded source_identity_conflict behavior that refuses to blend mismatched subsets; injected tests required for match, mismatched run, and mismatched contract."
+    },
+    {
+      "challengeKey": "47297690",
+      "disposition": "revised",
+      "evidence": "Key allowlisting alone is insufficient: mode, service_controller, run ids, contract hashes, fingerprints, operation ids, advance_run_id, hostname, and lock staleness currently pass typeof===string checks (factory-status.ts assembly) while canary fixtures only seed forbidden token/prompt fields. Revised d3: every emitted scalar must be a closed enum, validated identifier/fingerprint, finite number, or parseable ISO timestamp; validators cover controller/service identity, revision, contract/run ids, fingerprints, item stage/links, and attribution details; canary matrix must inject canaries into every public-capable scalar source field and prove absence from JSON, prose, and errors."
+    },
+    {
+      "challengeKey": "7c60ea85",
+      "disposition": "revised",
+      "evidence": "Confirmed race: startIndependentHeartbeat does const next={...base, heartbeat_at} then writeProcess(next) while markControllerOperation concurrently writes a full updated record (supervisor.ts / factory-status.ts). A delayed heartbeat can restore stale operation/wait/progress or revive post-terminal state. Revised d4: monotonic record_version (or CAS generation), identity-bound heartbeat merge that only patches heartbeat_at on matching run_id+boot_id+token non-terminal records, rebase-on-version-move, terminal/lock-loss no-op, and interleaving tests for delayed/reordered heartbeat vs dispatch/wait/failure/terminal."
+    },
+    {
+      "challengeKey": "35a49bf7",
+      "disposition": "revised",
+      "evidence": "Prior d4 required a durable failure marker but did not specify schema, controller/run/boot binding, write ordering, expiry, or recovery clear \u2014 so an old marker could degrade a replacement controller. Revised d4 failure-marker contract: allowlisted schema with run_id+boot_id+hostname+pid+failed_at+error_code; honor only when bound to the observed identity; clear/supersede on successful same-identity write; ignore other boot_ids and markers older than a newer successful heartbeat_at; restart tests for stale marker vs recovered persistence."
+    },
+    {
+      "challengeKey": "9447538d",
+      "disposition": "revised",
+      "evidence": "Prior d5 matrix still allowed stale+pid-absent+no service -> dead. That falsely declares an unmanaged same-host restart dead when a replacement controller holds the same run. Revised d5: public dead is recorded-identity death (detail recorded_identity_absent), not global factory absence; replacement evidence (lock holder different pid/boot for same run, fresher process identity, active service) forces unknown; unmanaged pid-absent dead only when no replacement evidence is present."
+    },
+    {
+      "challengeKey": "5f0162e5",
+      "disposition": "revised",
+      "evidence": "Macro health ownership was only a generalization_boundary note (adopt heartbeat when #890 owns the run) without a falsifiable writer interface or explicit unknown fallback \u2014 status could not prove macro-as-driver health and might over-trust identity fields. Revised d6+d8: shared ControllerHealthEvidenceWriter (heartbeat merge, mark operation/wait, failure marker); loop supervisor implements now; hybrid macro-identity + loop writer is supported; exclusive macro drive MUST implement the writer with injected integration-style tests; macro without processIdentity writer evidence => liveness/operation/wait are legacy/unknown, never healthy from identity alone."
+    }
+  ],
+  "decision_record": {
+    "schema_version": 1,
+    "decisions": [
+      {
+        "id": "d1",
+        "title": "Pure allowlisted assembler over injected readers with explicit multi-source correlation",
+        "surface": "core/scripts/factory-status.ts (`assembleFactoryStatus`, `FactoryStatusSources`, `FactoryStatusProbes`, `FactoryStatusClock`, source-correlation helper); CLI wiring in core/scripts/pipeline.ts; OpenSpec design Decision 1",
+        "alternatives": [
+          {
+            "option": "Persist a second durable factory-status ledger that status writes and re-reads",
+            "rejected_because": "Acceptance requires zero mutation of ledger/events/run artifacts; a write path would make status a control surface and couple observability to a new durable schema."
+          },
+          {
+            "option": "Expose the raw loop-store status projection as the remote/CLI contract",
+            "rejected_because": "Loop status and supervisor records include lock tokens and unbounded free text; issue non-goals forbid shipping raw loop status over remote-safe surfaces."
+          },
+          {
+            "option": "Merge every present source field by independent per-field precedence without run/contract correlation (prior d1)",
+            "rejected_because": "Contradictory macro/loop/process/pin/provider inputs can be stitched into one false active contract/run snapshot; challenge 8e098cf4 requires explicit correlation or degraded conflict."
+          }
+        ],
+        "assumptions": [
+          "Existing controller/process, loop status, pin, provider, write-health, and cost sources can be projected through injected seams without live network/git/subprocess in unit tests.",
+          "CLI is responsible only for mapping filesystem/config into seams and printing the envelope.",
+          "Correlation keys are available as plain identifiers on the injected sources (run_id, contract/canonical hash, factory_run_id, process boot_id) without status mutation."
+        ],
+        "invariants": [
+          "`assembleFactoryStatus` is pure: no GitHub, git, service, control, ledger, event, or run-artifact mutation.",
+          "Unit tests inject clocks, process probes, and source objects; no real network/git/subprocess.",
+          "Correlation keys (when present): `loop_run_id` / process `run_id`, `contract_hash` / loop `canonical_hash` / macro `linked_runs.loop_contract_hash` / macro `canonical_hash`, optional `factory_run_id`, and process identity binding (`hostname`,`pid`,`boot_id`) for the live driver.",
+          "Precedence when consistent: processIdentity is authoritative for liveness/operation/wait/progress; loopStatus is authoritative for item rows and loop run_id/engine when present; macroController is authoritative for factory_run_id, mode, revision, service identity, coarse_phase, and macro fingerprints; pin is authoritative for engine_pin when macro pin fingerprint is absent; provider is authoritative for cooldown.",
+          "Conflict rule: if any two present correlation keys disagree on the same dimension (mismatched loop_run_id across macro.linked_runs / loopStatus / processIdentity; mismatched contract_hash across macro / loop; process.run_id vs loop.run_id), the envelope MUST NOT blend the mismatched subsets into one active snapshot. Top-level `status` becomes `degraded`, a structured allowlisted conflict code is recorded (e.g. sources attribution / detail code `source_identity_conflict`), and for each conflicted dimension the assembler emits null/unknown for the blended field set rather than picking a silent winner that invents a false joint contract/run.",
+          "Health classification still runs on the processIdentity-bound subset when that source is present and self-consistent; it does not borrow operation/wait from a run_id-mismatched peer.",
+          "Injected-source tests cover: matching keys -> single coherent snapshot; mismatched active run ids -> degraded conflict without false merge; mismatched contract hashes -> degraded conflict; pin-only disagreement does not invent run identity but may degrade pin attribution only."
+        ],
+        "evidence": [
+          "Prior assembly (factory-status.ts run block) used OR-precedence across macro/loop/proc without equality checks \u2014 revised by this decision.",
+          "core/scripts/factory-status.ts module header: pure function over injected sources/clock/probes.",
+          "openspec/changes/factory-aggregate-status-and-controller-health/design.md Decision 1 intent (pure assembler); correlation is additive to purity, not a second ledger."
+        ],
+        "generalization_boundary": "Does not replace scoreboard (#301), per-issue status (#154), audit logs, or run artifacts; does not implement HTTP/MCP exposure of the raw store. Correlation is observational only \u2014 no auto-repair of source stores.",
+        "uncertainty": "Low for purity requirement (acceptance-bound). Medium that #890 will always populate linked_runs.loop_run_id/contract when both macro and loop are live; falsified if production routinely omits link fields while both run \u2014 then conflict detection must treat missing links as unknown rather than conflict."
+      },
+      {
+        "id": "d2",
+        "title": "Versioned envelope with ok/degraded/error and additive v1 fields",
+        "surface": "core/scripts/factory-status.ts (`FACTORY_STATUS_SCHEMA_VERSION`, `FactoryStatusEnvelope`, `status: ok|degraded|error`, `sources` attribution, `error` field)",
+        "alternatives": [
+          {
+            "option": "Throw unstructured stderr-only failures for machine consumers",
+            "rejected_because": "Acceptance requires exactly one unfenced versioned JSON object including structured error/degraded states parseable via `JSON.parse(stdout)`."
+          },
+          {
+            "option": "Bump schema_version on every additive optional field",
+            "rejected_because": "Design allows optional/unknown-safe additives within schema_version \"1\" so legacy and partial sources stay readable without forcing consumer version churn."
+          }
+        ],
+        "assumptions": [
+          "Partial source failure should surface as degraded with per-source attribution rather than look fully healthy.",
+          "Total assembly failure still emits a valid error envelope.",
+          "Source identity conflicts (d1) use degraded, not hard error, when a partial consistent subset remains readable."
+        ],
+        "invariants": [
+          "`schema_version` is the string `\"1\"` for this contract.",
+          "Top-level `status` is exactly `ok` | `degraded` | `error`.",
+          "Missing optional sources are attributed (`unknown` / `legacy` / `not_applicable` / `error`), not silently invented as healthy presence.",
+          "Top-level `error` (when present) is an allowlisted error code only \u2014 never residual free text (see d3)."
+        ],
+        "evidence": [
+          "core/scripts/factory-status.ts: `FACTORY_STATUS_SCHEMA_VERSION = \"1\"`, `FactoryStatusTopLevel`, forceError error-envelope path.",
+          "openspec/changes/factory-aggregate-status-and-controller-health/design.md Decision 2.",
+          "core/test/factory-status.test.ts: error/degraded envelope and missing-source attribution tests."
+        ],
+        "generalization_boundary": "Additive optional fields stay on v1 only while they remain optional/unknown-safe; breaking renames or required new fields need a schema bump.",
+        "uncertainty": "Low. Falsified if a consumer needs a hard break (required new field with no unknown default) without a version change."
+      },
+      {
+        "id": "d3",
+        "title": "Allowlist-built public envelope; every emitted scalar is enum, validated id/fingerprint, number, or timestamp; errors are allowlisted codes only",
+        "surface": "core/scripts/factory-status.ts (public key allowlist, closed enums, per-field scalar validators, `mapFactoryStatusErrorCode`, `projectLoopSourcesForFactoryStatus`); canary suite in core/test/factory-status.test.ts covering every public-capable scalar source field; CLI catch path in core/scripts/pipeline.ts",
+        "alternatives": [
+          {
+            "option": "Regex/denylist redaction alone over the raw loop status JSON",
+            "rejected_because": "Denylist is incomplete against new secret shapes and free-text prompt injection; acceptance requires an explicit allowlist and canary proof that secrets and instruction-like text never appear."
+          },
+          {
+            "option": "Pass through issue titles, hold reasons, comments, and next-action prose for operator richness",
+            "rejected_because": "Remote-safe contract forbids unsanitized issue/comment/reason text and instruction-like free text in JSON, prose, and error paths."
+          },
+          {
+            "option": "Allowlist top-level/nested keys only and pass raw strings for mode, revision strings, run ids, fingerprints, stages, links, and attribution details (prior partial d3)",
+            "rejected_because": "Key allowlisting does not make allowed scalar values safe; canaries in public-capable source scalars can still appear in JSON/human output (challenge 47297690)."
+          },
+          {
+            "option": "Cap and denylist-redact thrown error messages into the public `error` field",
+            "rejected_because": "Residual free text after partial redaction still can carry canaries or prompt-like instructions; remote-safe contract requires fixed allowlisted error codes only."
+          }
+        ],
+        "assumptions": [
+          "Operators can obtain rich free text from existing audit/logs/status surfaces; factory status is the coarse remote-safe projection.",
+          "Registered source keys and every public-capable scalar field on those sources must receive canary fixtures.",
+          "A closed set of factory-status error codes is sufficient for machine consumers; operators use logs for exception detail."
+        ],
+        "invariants": [
+          "Only named public fields are assembled; source objects are never dumped wholesale onto the envelope.",
+          "Lock/bearer tokens, credentials, secret refs, env maps, prompts, tool dumps, and raw supervisor token fields never copy into the public model.",
+          "Projection table for every emitted scalar: (1) closed enum (status, health states, wait kinds, next_action codes, attribution, cost coverage, host_class, controller.kind, item state, coarse health, error codes, wait/operation detail codes); (2) validated identifier/fingerprint matching a tight pattern (e.g. run/item/contract/engine/pin/service/mode/stage/fingerprint/candidate: printable token class with max length; reject otherwise -> null/unknown); (3) finite numeric (revision, pid, pr, counts, usd) with type/range checks; (4) parseable ISO-8601 timestamp or null. No other free-text residual.",
+          "Controller/service identity, revision, contract/run identifiers, fingerprints, item stage/link fields, lock staleness codes, write_health summary, operation ids, and source-attribution detail codes all pass through the validators above \u2014 not only next_action, wait-kind, and error.",
+          "Public error surfaces emit only allowlisted error codes \u2014 never source exception messages or redacted residual free text.",
+          "Source `{ __error }` inputs map through the same code allowlist; raw `__error` strings never appear in JSON/human/stderr.",
+          "Canary matrix covers: every source key; every public-capable scalar source field (mode, service_controller, run ids, hashes, fingerprints, stage, advance_run_id, candidate, operation id, hostnames, staleness, summaries, timestamps filled with canary strings); forceError paths; CLI catch-before-assembly; canaries at start/middle/end of adversarial exception strings. Proof: no canary appears in JSON.stringify(envelope), human prose, or error output."
+        ],
+        "evidence": [
+          "Current code already enum-sanitizes next_action, wait kinds, item states, stages (partial), candidates (partial), and write_health summary_code \u2014 incomplete for mode/run ids/fingerprints/operation id/staleness/advance_run_id.",
+          "Prior canary suite seeded forbidden fields (tokens/prompts) but not public-capable scalars \u2014 revised contract requires full scalar canary matrix (challenge 47297690).",
+          "openspec/.../design.md Decision 3 intent (allowlist over denylist); this revision tightens value-level validation."
+        ],
+        "generalization_boundary": "Does not sanitize or redefine non-factory-status surfaces (audit, logs, evidence bundles, scoreboard). Exception detail stays in process logs, not the remote envelope. Identifier patterns are intentionally lossy for remote safety.",
+        "uncertainty": "Low on the remote-safety requirement. Medium that identifier max-length/pattern will need a few additive tweaks as real engine pin / treatment fingerprint formats appear; additives stay pattern-compatible within schema_version \"1\"."
+      },
+      {
+        "id": "d4",
+        "title": "Independent heartbeat with concurrent async refresh, monotonic merge persistence, and identity-bound durable failure marker",
+        "surface": "core/scripts/factory-status.ts (`DEFAULT_INDEPENDENT_HEARTBEAT_MS`, `startIndependentHeartbeat`, failure-marker reader); core/scripts/loop/supervisor.ts (`driveSupervisor` wiring, `markControllerOperation`, independent heartbeat); process fields in core/scripts/loop/types.ts; durable failure-marker seam distinct from process-identity record",
+        "alternatives": [
+          {
+            "option": "Keep only cycle-end heartbeat refresh",
+            "rejected_because": "Long blocking whole-item dispatch stalls cycle-bound refresh and makes a live process look dead; acceptance requires independent cadence during dispatch/wait/backoff."
+          },
+          {
+            "option": "Infer liveness solely from model/worker progress messages",
+            "rejected_because": "Acceptance forbids requiring model/worker progress messages for heartbeat advance."
+          },
+          {
+            "option": "Share `recoverySleep` for independent heartbeat sleeps",
+            "rejected_because": "Would couple recovery-backoff accounting/tests to liveness cadence; supervisor explicitly separates the channels."
+          },
+          {
+            "option": "Full-record heartbeat write from a stale getRecord snapshot without versioning (prior d4)",
+            "rejected_because": "Concurrent operation/wait/progress/terminal writes can be overwritten by a delayed heartbeat snapshot (challenge 7c60ea85)."
+          },
+          {
+            "option": "Record heartbeat_write_error only in-memory or only on the failed process-identity write",
+            "rejected_because": "A failed process-record write cannot durably publish its own failure; status on another process can still see a prior fresh heartbeat_at (challenge 39e18c4b)."
+          },
+          {
+            "option": "Unbounded failure markers without identity binding or recovery clear (unspecified lifecycle)",
+            "rejected_because": "A stale marker from a prior boot can falsely degrade a replacement controller after successful heartbeats (challenge 35a49bf7)."
+          },
+          {
+            "option": "Require a dedicated OS thread/process for heartbeat independent of the Node event loop",
+            "rejected_because": "Production dispatch is Promise-based harness wait and yields the event loop; concurrent async heartbeat is sufficient."
+          }
+        ],
+        "assumptions": [
+          "Controller holds the run lock and owns process-identity persistence while driving.",
+          "Default wall-clock interval of 15s is an acceptable production bound; tests inject shorter intervals and sleeps.",
+          "`dispatchItem` and other long controller waits are async (Promise) and yield the Node event loop during child/I/O wait.",
+          "A durable failure-marker path can succeed when the process-identity write path fails, or marker failure is itself observable as non-healthy."
+        ],
+        "invariants": [
+          "Heartbeat refreshes on bounded independent cadence without model progress messages.",
+          "Independent heartbeat is a concurrent async task started before the cycle/dispatch loop (`startIndependentHeartbeat` + injectable sleep).",
+          "Refresh stops after lock loss / terminal exit (`shouldContinue` / `stop()`).",
+          "Persistence protocol (monotonic merge, not blind full-record replace from a stale snapshot):",
+          "  - Process-identity record carries a monotonic `record_version` (or equivalent CAS generation) incremented on every successful durable write.",
+          "  - Operation/wait/progress/lock-loss/terminal writers always write the full intentional field set and bump version.",
+          "  - Heartbeat writer performs identity-bound merge: re-read latest record immediately before write; apply only `heartbeat_at` (and clear same-identity write-error) when `run_id`, `boot_id`, and lock `token` still match the driving identity and the controller is not terminal; refuse to write if version moved mid-flight unless the merge is rebased onto the newer version; never copy a stale operation/wait/progress/terminal snapshot over a newer one.",
+          "  - Terminal stop / lock loss sets a durable terminal or driving=false condition; subsequent heartbeat merges MUST no-op and MUST NOT revive a stopped controller record.",
+          "  - Interleaving unit tests inject delayed/reordered writes for heartbeat vs dispatch/wait vs failure vs terminal and prove no lost operation fields and no post-terminal revival.",
+          "Durable failure-marker schema (side channel, not only in-memory):",
+          "  - Fields: schema_version, run_id, boot_id, hostname, pid, failed_at (ISO), error_code (allowlisted only).",
+          "  - Written after process-identity heartbeat/operation write failure; best-effort; if marker write also fails, status must not report healthy solely from a within-bound prior heartbeat when independent refresh is overdue (unknown/write_failed policy).",
+          "  - Status honors a marker only when it binds to the exact controller instance under observation (run_id + boot_id match the process-identity record being classified).",
+          "  - Recovery clear: a successful process-identity write by that same run_id+boot_id clears/supersedes the marker (delete or overwrite with cleared generation). A replacement controller with a new boot_id ignores prior markers for other boot_ids.",
+          "  - Stale markers: if process-identity shows a successful heartbeat_at newer than marker.failed_at for the same boot_id, ignore marker; if marker boot_id is absent from current process record (restart), ignore marker.",
+          "  - Restart tests cover: marker from dead boot does not degrade new boot after successful heartbeat; same-boot marker after write failure degrades status; cleared after recovery write."
+        ],
+        "evidence": [
+          "Current startIndependentHeartbeat spreads full `base` then overwrites heartbeat_at and writeProcess(next) \u2014 racy vs markControllerOperation full-record writes (supervisor.ts); revised by monotonic merge protocol.",
+          "Failure marker lifecycle was named in prior d4 but schema/binding/clear were unspecified \u2014 revised for challenge 35a49bf7.",
+          "openspec/.../specs/controller-independent-health/spec.md: independent cadence and failed-persistence requirements."
+        ],
+        "generalization_boundary": "Wired on the durable loop supervisor path first; #890 macro-controller must use the same writer + marker seams when it is the exclusive drive owner (see d6/d8). Not a cross-host liveness claim. Not a multi-threaded runtime redesign.",
+        "uncertainty": "Medium on 15s default vs write contention; medium on exact store CAS primitive (dedicated record_version field vs store-level generation) \u2014 implementation may pick either if interleaving tests pass. Low on concurrent-async sufficiency for Promise-based dispatch."
+      },
+      {
+        "id": "d5",
+        "title": "Three independent health dimensions; dead is recorded-identity death with same-host absence and replacement-safe unknown",
+        "surface": "core/scripts/factory-status.ts (`classifyFactoryHealth`, probes: `isPidAlive`, optional `isServiceActive`, identity hostname/pid/boot_id/service_controller, lock/process correlation); public JSON `health` block",
+        "alternatives": [
+          {
+            "option": "Single boolean \"alive\" / \"stuck\" conflating wait and wedge",
+            "rejected_because": "Acceptance requires process liveness, durable progress, and expected waiting as separable dimensions."
+          },
+          {
+            "option": "Classify stuck from wall-clock age of last event alone",
+            "rejected_because": "Creates false positives on long legal waits (CI, provider cooldown, backoff, capacity, human)."
+          },
+          {
+            "option": "Classify dead from stale heartbeat alone, including cross-host holders",
+            "rejected_because": "Single-host process evidence cannot prove remote death; design and concurrency scope forbid cross-host death claims."
+          },
+          {
+            "option": "Classify dead from stale heartbeat + recorded pid-absent alone, including unmanaged same-host restarts (prior d5)",
+            "rejected_because": "A replacement unmanaged controller on the same host leaves the old pid absent while the factory is live; declaring factory-wide dead is a false positive (challenge 9447538d)."
+          }
+        ],
+        "assumptions": [
+          "Process identity authoritative binding is (hostname, pid, boot_id, run_id) on the process-identity record; optional service identity is service_controller when macro/service-managed.",
+          "Same-host hostname match is required before any local process/service probe is trusted for death.",
+          "Operations used for stuck detection are explicitly started with both start time and deadline recorded.",
+          "Liveness bound default 90s is the freshness window for independent heartbeats.",
+          "Public coarse `dead` means the recorded controller identity is dead, not a global claim that no factory controller exists on the host."
+        ],
+        "invariants": [
+          "`suspected_stuck` requires live liveness AND explicitly started operation past deadline AND no durable progress since operation start AND not healthy waiting before a wait deadline.",
+          "`dead` (recorded identity) requires ALL of: (1) heartbeat stale/absent past bound for that identity, (2) same-host hostname match, (3) identity-bound absence proof for the recorded pid/boot/service instance, (4) no replacement evidence for the same run_id on the same host.",
+          "Replacement evidence (any one => not factory-live-dead; prefer `unknown` for coarse when the observed record is stale but a successor may exist): lockSummary shows holder_present for the same run with a different pid/boot; a fresher process-identity for the same run_id with different boot_id is present; service_controller is active while recorded pid is absent.",
+          "Unmanaged (no service identity): stale + pid-absent + same-host + NO replacement evidence => coarse `dead` with detail code `recorded_identity_absent` (documented as recorded-identity death). If replacement evidence exists => `unknown` (not dead).",
+          "Service-managed: running service with replaced process alone MUST NOT classify as `dead` -> `unknown` until new identity is observed or service is stopped; service stopped + recorded identity absent may be `dead`.",
+          "PID reuse: pid-alive without binding that the live process is the recorded boot_id/controller instance is insufficient for `dead` and insufficient for healthy live upgrade from stale -> `unknown`.",
+          "Cross-host or insufficient evidence is `unknown`, never `dead`.",
+          "Expected wait with future deadline is healthy waiting, not stuck.",
+          "Heartbeat write failure (durable failure marker per d4, identity-bound) surfaces as non-healthy (`write_failed` / coarse `unknown`).",
+          "Classification matrix tests cover: stale+pid absent+no service+no replacement -> dead(recorded); stale+pid absent+replacement lock/process -> unknown; stale+pid absent+service active -> unknown; stale+pid alive (reuse) -> unknown; stale+service stopped -> dead when service identity present; cross-host -> unknown; probes unavailable -> unknown."
+        ],
+        "evidence": [
+          "Prior classifyFactoryHealth upgraded stale->dead on same_host && pidAlive===false only \u2014 false-dead on unmanaged restart (challenge 9447538d).",
+          "LoopSupervisorProcess carries boot_id and run_id for restart/replacement distinction.",
+          "openspec/.../design.md Decision 5 and controller-independent-health dead/unknown scenarios; concurrency scope single-host only."
+        ],
+        "generalization_boundary": "Does not authorize automated remediation from suspected_stuck/dead. Not a multi-host consensus health model. Service probe is host-local when service identity is present.",
+        "uncertainty": "Medium on exact service-manager probe shape until #890 service records stabilize. Low on stuck/waiting rules (acceptance-locked). Low on recorded-identity semantics for dead once replacement evidence rules are implemented."
+      },
+      {
+        "id": "d6",
+        "title": "Shared ControllerHealthEvidenceWriter; owned expected-wait lifecycle; macro is identity-only until it implements the writer",
+        "surface": "shared writer seam (mark operation/wait/progress + independent heartbeat + failure marker) implemented by loop supervisor now and required for #890 when macro is exclusive drive owner; core/scripts/loop/types.ts wait kinds; core/scripts/loop/supervisor.ts concrete call sites; factory-status readers",
+        "alternatives": [
+          {
+            "option": "Require a new mandatory process-identity schema version that rejects pre-#891 supervisor.json",
+            "rejected_because": "Acceptance requires legacy runs and missing optional sources remain readable with explicit unknown/legacy attribution."
+          },
+          {
+            "option": "Store operation/wait evidence only in-memory or only in action-evidence free text",
+            "rejected_because": "Stuck classification needs durable start/deadline/progress timestamps independent of free text; free text is also forbidden on the remote-safe surface."
+          },
+          {
+            "option": "Omit default dispatch deadline and only mark operations that callers specially configure",
+            "rejected_because": "Stuck classification cannot fire without an explicit deadline; long dispatches would remain unclassifiable forever."
+          },
+          {
+            "option": "Only mark dispatch/recovery waits without named owners for other acceptance kinds",
+            "rejected_because": "Acceptance lists CI, provider cooldown, recovery backoff, dependency, capacity, and human waits as healthy-waiting categories."
+          },
+          {
+            "option": "Defer macro-controller health ownership without a writer interface or explicit unknown fallback (prior d6/d8 gap)",
+            "rejected_because": "Challenge 5f0162e5: without a designed #890->#891 writer contract, macro-as-driver has no path to independent heartbeat/operation/wait evidence and status could misread identity-only macro fields as live health."
+          }
+        ],
+        "assumptions": [
+          "Process-identity record remains the durable liveness/progress/wait evidence surface (distinct from lock token ownership).",
+          "Two-hour default dispatch operation deadline is a coarse backstop, not a product SLA.",
+          "Until #890 implements the writer, production may run hybrid: macro for identity/contract, loop supervisor as exclusive drive owner and health writer."
+        ],
+        "invariants": [
+          "Optional fields load on older records without migration.",
+          "Shared interface `ControllerHealthEvidenceWriter` (name may vary) exposes: independent heartbeat start/stop with d4 merge protocol; `markControllerOperation` / wait set-clear; durable failure-marker write/clear; identity fields (run_id, boot_id, hostname, pid).",
+          "Loop supervisor implements the writer now and remains the health writer whenever it is the exclusive item driver (including hybrid #890 outer + loop inner).",
+          "When #890 macro-controller is the exclusive drive owner, it MUST implement the same writer and advance heartbeat/operation/wait during long dispatch and provider wait without relying on a loop-supervisor writer. Injected integration-style tests MUST prove that path with fakes of the #890 driver.",
+          "When macro source is present for identity only and processIdentity is absent or not written by any implementer, factory status MUST attribute process_liveness / operation / expected_waiting as `legacy` or `unknown` \u2014 never invent healthy live macro health from identity/mode/revision fields alone.",
+          "Owned wait writers and lifecycle (set -> hold with future deadline -> clear) without raw reason text:",
+          "  - dispatch: set at whole-item dispatchItem start (operation dispatch_item + wait kind dispatch + default 2h deadline); clear on success/failure.",
+          "  - recovery_backoff: set before recovery sleep chunks with deadline = now+min(retryAfter,60s); clear after sleep stretch.",
+          "  - capacity: set on pure worktree capacity_wait / admission stop with future recheck deadline; clear when capacity clears or run stops.",
+          "  - human: set on hold-outstanding / blocked_needs_human park with future check deadline; clear on resume/unblock/terminal.",
+          "  - dependency: set when frontier is dependency-gated (not deadlock-stopped) with future recheck deadline; clear when eligibility unblocks or terminal.",
+          "  - ci: set when in-flight item waits on CI with future deadline; clear on CI terminal or dispatch end.",
+          "  - provider_cooldown: set when provider/rate-limit cooldown is the wait reason with cooldown_until as deadline; clear when cooldown ends.",
+          "Nested waits during an active dispatch MAY specialize expected_wait_kind/deadline while keeping dispatch operation id/start/deadline for stuck detection.",
+          "Absence of operation deadline cannot yield suspected_stuck from age alone.",
+          "Wait kinds on the public envelope are allowlisted only; no free-text reasons."
+        ],
+        "evidence": [
+          "Loop supervisor already owns markControllerOperation + startIndependentHeartbeat for the drive path.",
+          "Prior design deferred macro health ownership to generalization_boundary without a falsifiable writer contract \u2014 revised for challenge 5f0162e5.",
+          "Types enumerate all wait kinds (loop/types.ts LoopExpectedWaitKind).",
+          "openspec/.../specs/durable-loop-supervisor/spec.md already allows supervisor to remain item driver when macro is outer owner \u2014 hybrid path is in-spec."
+        ],
+        "generalization_boundary": "Does not implement #890 service control plane. Does not change lock ownership or advance-stage internal deadlines. Does not require campaign-specific (#654) progress ownership. Deadlock terminal stops are stop records, not expected waits.",
+        "uncertainty": "Medium on exact default recheck deadlines for capacity/human/dependency/ci when upstream signals lack an explicit deadline \u2014 implementation MUST pick a bounded documented default per kind. Medium until #890 production drive ownership is stable; hybrid writer path is the supported interim."
+      },
+      {
+        "id": "d7",
+        "title": "Honest cost/telemetry tri-state; no quota or zero-cost invention",
+        "surface": "core/scripts/factory-status.ts (`CostCoverageKind`, envelope `cost` block, provider source forbidding `remaining_quota_percent`)",
+        "alternatives": [
+          {
+            "option": "Emit 0 cost or 100% remaining quota when telemetry is missing for prettier dashboards",
+            "rejected_because": "Acceptance forbids remaining-quota percentage and zero-cost inference from absence; missing data must stay unknown."
+          },
+          {
+            "option": "Omit the cost block entirely when data is missing",
+            "rejected_because": "Snapshot field checklist expects cost coverage present as actual/estimated/unknown with attribution rather than silent absence."
+          }
+        ],
+        "assumptions": [
+          "Upstream cost sources, when present, already distinguish actual vs estimated vs unknown.",
+          "Provider cooldown is a separate boolean/deadline signal, not a quota percentage."
+        ],
+        "invariants": [
+          "Cost coverage is only `actual` | `estimated` | `unknown`.",
+          "Assembler does not invent remaining-quota percentages or zero USD from missing sources."
+        ],
+        "evidence": [
+          "core/scripts/factory-status.ts: `CostCoverageKind`, `FactoryCostSource` / `FactoryProviderSource` comments forbidding remaining_quota_percent.",
+          "openspec/.../design.md Decision 6.",
+          "Issue acceptance criteria and proposal honesty section."
+        ],
+        "generalization_boundary": "Does not implement a cost accounting system; only projects allowlisted coverage fields when provided.",
+        "uncertainty": "Low. Falsified if a later product requirement mandates inventing synthetic cost/quota and contradicts this issue."
+      },
+      {
+        "id": "d8",
+        "title": "Graceful #890 absence: loop supervisor primary writer when macro missing or identity-only",
+        "surface": "core/scripts/factory-status.ts (`FactoryMacroControllerSource` optional, controller.kind macro|loop_supervisor|unknown, run/controller attribution); CLI assembly path; health writer ownership rules in d6",
+        "alternatives": [
+          {
+            "option": "Block #891 until #890 macro-controller is always present in production",
+            "rejected_because": "Issue depends on #890 for full identity but acceptance requires readable status with explicit unknown/legacy for missing optional controller fields."
+          },
+          {
+            "option": "Invent synthetic macro-controller identity when none is running",
+            "rejected_because": "Design Decision 7 forbids inventing a macro-controller that is not running."
+          },
+          {
+            "option": "Treat macro identity fields as sufficient health evidence without a writer",
+            "rejected_because": "Would report live/healthy without independent heartbeat/operation/wait evidence (challenge 5f0162e5)."
+          }
+        ],
+        "assumptions": [
+          "Narrow #890-shaped interface is sufficient to fill identity/mode/revision/contract when present.",
+          "Loop supervisor process identity + durable loop status remain available for pre-#890 and hybrid deployments."
+        ],
+        "invariants": [
+          "Missing macro controller yields explicit attribution, not fabricated service identity.",
+          "Status remains pure observation over whatever subset of sources exists.",
+          "Macro-present without processIdentity writer evidence => controller identity may be `macro` but health dimensions stay unknown/legacy until d6 writer evidence exists.",
+          "Correlation rules in d1 still apply when both macro and loop/process sources are present."
+        ],
+        "evidence": [
+          "core/scripts/factory-status.ts: optional macroController source and controller/run attribution paths.",
+          "openspec/.../design.md Decision 7 and Impact section.",
+          "proposal.md depends-on #890 with legacy-safe readability; d6 now binds the writer contract."
+        ],
+        "generalization_boundary": "Does not implement #890 service control; only consumes a narrow read projection when available. Campaign-specific progress (#654) is out of scope.",
+        "uncertainty": "Medium until #890 production shapes stabilize; falsified if real #890 records cannot map into FactoryMacroControllerSource without secret-bearing public fields."
+      }
+    ]
+  }
+}

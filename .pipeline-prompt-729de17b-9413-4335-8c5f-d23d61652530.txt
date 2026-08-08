@@ -1,0 +1,967 @@
+You are implementing a GitHub issue for agent-pipeline, a cross-tool GitHub issue→ready-to-deploy pipeline skill (Claude Code + Codex).
+
+# agent-pipeline — working conventions
+
+A self-contained TypeScript skill that advances a GitHub issue through a label-driven
+state machine to `pipeline:ready-to-deploy`. It develops **itself** through this same
+pipeline, so these conventions are what the pipeline's own planning / implementation /
+review steps must follow.
+
+## Golden rules (read first)
+
+1. **Edit `core/`, never `plugin/` directly.** `plugin/` is a generated mirror of `core/`
+   (+ `hosts/claude`). After any change under `core/`, regenerate it:
+   `node scripts/build.mjs`, and commit the regenerated `plugin/` in the same change. CI
+   fails the build if the mirror is stale (`node scripts/build.mjs --check`). A core-only
+   commit that forgets the mirror is the single most common wasted review/CI round.
+2. **`npm run ci` must pass before a change is done.** It runs: `ci:core` (`cd core && npm ci
+   && npm test`) → `build.mjs --check` (mirror in sync) → `ci:install-smoke` →
+   `ci:openspec` (`openspec validate --all` when an `openspec/` directory is present) →
+   **conditional docs freshness** (`ci:docs`: no-op when the generator is absent; real
+   `docs:check` / `generate-docs --check` when `scripts/generate-docs.mjs` is present) →
+   `ci:scripts`. Green unit tests alone do not mask stale generated docs. GitHub Actions
+   PR/main CI checks out **full history and tags** (`fetch-depth: 0`, `fetch-tags: true`) so
+   tag-dependent generators match a full local clone. Run `npm run ci` from the repo root;
+   treat a red `ci` as not-done.
+3. **Rigor over latency.** This pipeline's product *is* its review rigor. Do not disable or
+   default-demote review steps to go faster. Speed work must be rigor-preserving (better
+   prompts, removing dead/deterministic asks, fixing real convergence bugs) — never by
+   removing review coverage.
+4. **No autonomous merges.** The advance loop stops at `pipeline:ready-to-deploy`.
+   Merging happens only through explicit operator invocation (`/pipeline:merge` per-PR;
+   `merge-queue --apply` batch, dry-run default); the invoking operator is the
+   session-bound merge authority. There is no `auto_merge` config key and no unattended
+   merge path — don't add either. Unattended merge remains gated on #662's
+   shadow-calibrated evidence standard.
+5. **Verify external shapes; never guess.** Especially `gh --json` field names: confirm the
+   real output (`gh pr view N --json <field>`) before coding against it. Guessing gh field
+   shapes has caused multiple wasted review rounds.
+
+## Layout
+
+- `core/scripts/` — the engine (Node 24+ TypeScript, run via native type-stripping, **no build
+  step**). `pipeline.ts` (CLI + loop), `config.ts`, `gh.ts` (typed `gh` wrappers), `harness.ts`,
+  `profile.ts`, `review-policy.ts`, `stages/*.ts` (one file per stage: planning, review, fix,
+  pre_merge, eval, deploy_ready, auto_recover), `prompts/*.md` (templates with `{{placeholders}}`).
+- `core/test/` — co-located `*.test.ts`.
+- `hosts/` — per-host packaging (`claude`, `codex`, `_shared`); the SKILL.md variants live here.
+- `plugin/` — **generated** mirror (do not hand-edit).
+- `openspec/` — spec-driven-development specs (`specs/`) and in-flight changes (`changes/`).
+- `scripts/` — `build.mjs` (generate/check the mirror), `install.mjs`, `ci-install-smoke.mjs`.
+
+## Build & test
+
+- Tests: `node --test --experimental-strip-types test/*.test.ts` (from `core/`). Run all via
+  `npm test` (core) or `npm run ci` (full gate) from root. There is **no `tsc` step** — types are
+  stripped, not checked, so a type-only guarantee (e.g. `Record<keyof I, …>`) is NOT enforced at
+  runtime; back such invariants with a real runtime test.
+- New features need unit tests of the core logic; bug fixes need a regression test that would have
+  caught the bug. Prove the test bites (it should fail without the fix).
+- Tests inject I/O via dependency seams (a `deps`/`Deps` parameter with `gh`/harness/worktree
+  fakes) — see `AdvanceReviewDeps`, `ShaGateDeps`, `VerifyDeps`. Unit tests do **no real network,
+  git, or subprocess** calls. Mirror this pattern for new stage logic.
+
+## OpenSpec
+
+If working an OpenSpec change: author/keep exactly one change under `openspec/changes/<id>/`
+(`proposal.md`, `design.md`, `tasks.md`, `specs/<capability>/spec.md` deltas). Every requirement
+needs `SHALL`/`MUST` and at least one `#### Scenario:`; lead the requirement text with the subject +
+`SHALL` (a wrapped second-line `SHALL` can fail strict validation). Pre-merge archives the change
+into the living specs and runs `openspec validate --all` — a structurally invalid change blocks
+`ready-to-deploy`.
+
+## Review layer & convergence (hard-won)
+
+- Review runs `reviewMode: prompt-harness` by default: the reviewer CLI is invoked directly with a
+  JSON-returning prompt; the verdict JSON schema is single-sourced (`review-schema.ts` →
+  `{{schema_block}}`) and drift-guarded by a test. Keep prompts and the schema constant in sync.
+- The pre-merge **review-SHA gate (#16)** re-reviews only when a *developer/fix* commit lands after a
+  verdict; the pipeline's own commits (`docs:`/`chore: archive OpenSpec …`) are classified internal
+  and do **not** invalidate the verdict (`isPipelineInternalCommit`). Do not regress this to
+  "re-review on any SHA change" — it caused a non-converging cascade.
+- A `review_policy` (severity `block_threshold` + `min_confidence`) governs which findings block vs.
+  advise; `--override "<key>: <reason>"` records an audited disposition. Use these instead of looser
+  reviews.
+- When a reviewer finding is out of an issue's stated scope, defer it to a tracked follow-up issue
+  rather than expanding the change — but if the reviewer reliably re-flags a real design smell, fix
+  the smell (don't fight the reviewer).
+- **Surgical-fix discipline** (`fix.md`, #235): fix rounds SHALL make the **minimal diff** that
+  resolves the specific finding — no refactors, scope-broadening, unrelated changes, or opportunistic
+  cleanup. When a fix touches a destructive/irreversible operation (`git worktree remove --force`,
+  `git push --force`, branch/worktree deletion, the merge surface), the prompt requires an explicit
+  safety scope or written justification confirming the operation is scoped to the **managed worktree
+  root** or the **reviewed head**. Before committing, the harness performs a pre-commit self-check:
+  if the diff appears to introduce a higher-severity problem than the finding it resolves, it surfaces
+  the concern and withholds the push. All three disciplines are drift-guarded by tests in
+  `prompt-loader.test.ts`.
+
+## Concurrency scope (#459 / #634)
+
+- The engine's host-local PID locks (`lock.ts`) — the **unified issue-run lock** used by both
+  foreground advance and detach (keyed by **domain + issue**, path
+  `/tmp/pipeline-{domain}-{N}.lock`; never issue-number-only), the queue-batch serialization, and
+  the live-planning marker — are **host-local**: they provide mutual exclusion only between
+  processes on the same machine, none across distinct hosts. **Single-host operation is the
+  supported concurrency scope for these lock sites.** Each guards host-local state (one host's
+  worktrees, run-state dir, detach wrapper runs, queue) whose cross-host failure mode is two hosts
+  each doing their own thing in their own worktree — not a persistent, irreversible shared
+  artifact — so this is a documented engineering disposition, not an oversight (see
+  `openspec/changes/cross-host-auto-file-serialization/design.md` and
+  `openspec/changes/detach-lock-domain-scope/design.md` for per-site assessment). Unifying advance
+  and detach onto one domain+issue key does **not** expand the lock to cross-host scope.
+- **Per-site dispositions (single-host):**
+  - **Issue-run lock** (advance + detach): guards one host's worktrees / run-state / exclusive
+    dispatch for `(domain, issue)`. Cross-host failure: two hosts advance the same issue in
+    separate worktrees (GitHub labels last-writer-wins).
+  - **Queue-batch serialization:** one h
+
+[…conventions truncated]
+
+## Issue #891: feat(factory): add aggregate status and independent controller health
+
+Depends on: #890
+
+## Problem
+
+Factory state is currently split across per-issue JSON status, loop audit/status, controller process records, run artifacts, provider state, engine pinning, and service-manager state. An operator or external supervisor cannot obtain one authoritative snapshot, and the raw loop projection cannot be exposed remotely because it includes lock/supervisor bearer tokens and unbounded internal evidence.
+
+The current supervisor heartbeat is refreshed around completed cycles. A long blocking dispatch can therefore look stale even when its process is live, while a future provider cooldown may be legitimate waiting rather than a wedge.
+
+## Required outcome
+
+Add `pipeline factory status --json` plus human-readable output as a pure, versioned, allowlisted read model over #890's controller and existing durable evidence. Add controller-owned heartbeat/operation evidence sufficient to distinguish process liveness, durable progress, and expected waiting.
+
+## Acceptance criteria
+
+- [ ] `pipeline factory status --json` writes exactly one unfenced versioned JSON object, including structured error/degraded states.
+- [ ] Status performs no GitHub, git, service, control, ledger, event, or run-artifact mutation.
+- [ ] The snapshot includes controller/service identity, mode/revision, active contract/run, engine/treatment/authority fingerprints, active/queued/held counts, per-item coarse state and stage, linked advance run/PR/candidate, current operation/deadline, last durable progress, expected wait/deadline, provider cooldown, next action, lock/liveness projection, event/write-health, and actual/estimated/unknown cost coverage.
+- [ ] Remote output is assembled from an explicit allowlist; raw lock/supervisor records, bearer tokens, credentials, secret references, process environments, prompts/tool output, local auth material, and unsanitized issue/comment/reason text never appear.
+- [ ] Tests inject canary secrets and prompt-like issue/reason text into every source object and prove no canary or raw instruction appears in JSON, prose, or error output.
+- [ ] A controller-owned heartbeat advances on a bounded independent cadence during long item dispatches, waits, and recovery backoff without requiring model/worker progress messages.
+- [ ] Heartbeat refresh stops after lock loss/terminal exit and failed persistence is visible rather than reported healthy.
+- [ ] Health represents process liveness, durable workflow progress, and expected waiting independently.
+- [ ] `suspected_stuck` requires fresh controller liveness plus an explicitly started operation past its deadline with no durable progress.
+- [ ] `dead` requires stale heartbeat plus same-host process/service absence proof; cross-host or insufficient evidence is `unknown`.
+- [ ] CI/provider/backoff/dependency/capacity/human waiting before a recorded deadline is healthy waiting, not stuck.
+- [ ] Missing telemetry and cost remain unknown; no remaining-quota percentage or zero-cost inference is emitted.
+- [ ] Legacy runs and missing optional sources remain readable with explicit unknown/legacy attribution.
+- [ ] Unit tests use injected clocks, process probes, stores, status readers, and no real network/git/subprocess calls.
+- [ ] Generated CLI/config/host docs and `plugin/` mirror remain current; `npm run ci` passes.
+
+## Non-goals
+
+- A dashboard, notification system, or mutating command.
+- Exposing the raw loop-store status object over HTTP/MCP.
+- Replacing run artifacts, per-issue status, audit, logs, or scoreboard.
+- Claiming cross-host process death from host-local evidence.
+
+## Related
+
+- #154 and #155 shipped per-issue JSON status and stable run/event surfaces.
+- #301 shipped historical factory scoreboard reporting.
+- #398 addressed indefinite harness termination but not factory health projection.
+- #654 requests campaign-specific progress and must not become the generic factory health owner.
+
+
+## Implementation Plan
+
+Implement OpenSpec change `factory-aggregate-status-and-controller-health`. Work through the checklist in `openspec/changes/factory-aggregate-status-and-controller-health/tasks.md`, keep that change folder committed, and satisfy its spec deltas.
+
+## Why
+
+Factory state is split across per-issue JSON status, loop audit/status, controller process
+records, run artifacts, provider state, engine pinning, and (with #890) service/controller
+records. Operators and external supervisors cannot obtain one authoritative, safe snapshot, and
+the raw loop/status projection cannot be exposed remotely because it includes lock/supervisor
+bearer tokens and unbounded internal evidence. Cycle-bound heartbeats also make long blocking
+dispatches look stale even when the process is live, while expected waits (provider cooldown,
+CI, backoff, capacity, human) look like wedges.
+
+## What Changes
+
+- **`pipeline factory status`** — a pure, versioned, allowlisted factory-level status command
+  with human-readable output and `--json` that writes exactly one unfenced JSON object
+  (including structured error/degraded envelopes).
+- **Allowlisted remote-safe read model** — assemble the snapshot from an explicit field
+  allowlist over #890 controller/service evidence (when present) plus existing durable
+  loop/run/pin/provider sources. Never emit raw lock/supervisor records, bearer tokens,
+  credentials, secret references, process environments, prompts/tool output, local auth
+  material, or unsanitized issue/comment/reason text.
+- **Independent controller health** — controller-owned heartbeat and operation evidence that
+  advances on a bounded independent cadence during long item dispatches, waits, and recovery
+  backoff (without requiring model/worker progress messages). Health represents process
+  liveness, durable workflow progress, and expected waiting as independent dimensions.
+- **Stuck/dead classification rules** — `suspected_stuck` only when the controller is live and
+  an explicitly started operation is past deadline with no durable progress; `dead` only with
+  stale heartbeat plus same-host process/service absence proof; cross-host or insufficient
+  evidence is `unknown`. Expected waiting before a recorded deadline is healthy, not stuck.
+- **Honest unknowns** — missing telemetry and cost remain unknown; no remaining-quota
+  percentage or zero-cost inference. Legacy runs and missing optional sources stay readable
+  with explicit unknown/legacy attribution.
+- **Docs/registry/mirror** — register the command, keep generated CLI/config/host docs and
+  `plugin/` current; `npm run ci` green.
+
+**Non-goals:** dashboard, notifications, mutating status commands; exposing the raw loop-store
+status object over HTTP/MCP; replacing run artifacts, per-issue status, audit, logs, or
+scoreboard (#301); claiming cross-host process death from host-local evidence; campaign-specific
+progress ownership (#654).
+
+## Capabilities
+
+### New Capabilities
+
+- `factory-aggregate-status`: Versioned allowlisted factory status read model and
+  `pipeline factory status` CLI (human + `--json`); pure observation over controller and
+  durable evidence; structured degraded/error envelopes; canary-guarded sanitization.
+- `controller-independent-health`: Controller-owned independent heartbeat cadence and
+  operation/deadline evidence; independent process-liveness, durable-progress, and
+  expected-waiting dimensions; `suspected_stuck` / `dead` / `unknown` / healthy-waiting
+  classification; failed heartbeat persistence visibility.
+
+### Modified Capabilities
+
+- `command-registry`: Register `factory status` (or equivalent keyword routing) as a
+  non-mutating command with a strict `allowedFlags` allowlist including `--json`.
+- `durable-loop-supervisor`: When the active controller is the loop supervisor (pre-#890 or as
+  the delegated item driver), independent heartbeat/operation evidence applies so long
+  dispatches do not falsely appear dead; compose with, do not remove, cycle-bound evidence.
+- `durable-loop-store`: Status/audit consumers may project allowlisted lock/liveness summaries
+  without exposing lock tokens; optional operation/heartbeat fields remain readable when present
+  and unknown when absent (legacy-safe).
+- `generated-cli-reference` (when docs generator present): Document `pipeline factory status`
+  and flags.
+
+## Impact
+
+- **Depends on #890** for full macro-controller/service identity in the snapshot; when the
+  macro-controller is disabled or absent, status remains readable over loop-supervisor + durable
+  store + pin/provider sources with explicit unknown/legacy attribution for missing controller
+  fields.
+- **CLI surface:** new read-only factory status command; no mutation of GitHub, git, ledger,
+  events, service control, or run artifacts.
+- **Security:** remote-safe allowlist + canary tests are first-class; raw secrets and
+  instruction-like free text must never appear in JSON, prose, or error paths.
+- **Health model:** separates process liveness from workflow progress and expected wait so
+  external supervisors can act without false wedges.
+- **Tests:** unit tests with injected clocks, process probes, stores, and status readers; no
+  real network/git/subprocess.
+- **Does not:** introduce dashboards, HTTP/MCP exposure of raw store status, auto-merge, or
+  cross-host death claims.
+
+## Acceptance criteria
+
+Observable, falsifiable outcomes that make #891 done:
+
+- [ ] `pipeline factory status --json` writes exactly one unfenced versioned JSON object,
+      including structured error/degraded states (`JSON.parse(stdout)` succeeds).
+- [ ] Status performs no GitHub, git, service, control, ledger, event, or run-artifact mutation
+      (exercised via injected seams recording zero write/mutate calls).
+- [ ] The snapshot includes controller/service identity, mode/revision, active contract/run,
+      engine/treatment/authority fingerprints, active/queued/held counts, per-item coarse state
+      and stage, linked advance run/PR/candidate, current operation/deadline, last durable
+      progress, expected wait/deadline, provider cooldown, next action, lock/liveness projection,
+      event/write-health, and actual/estimated/unknown cost coverage (or explicit unknown for
+      each optional field when source is absent).
+- [ ] Remote output is assembled from an explicit allowlist; raw lock/supervisor records, bearer
+      tokens, credentials, secret references, process environments, prompts/tool output, local
+      auth material, and unsanitized issue/comment/reason text never appear.
+- [ ] Tests inject canary secrets and prompt-like issue/reason text into every source object and
+      prove no canary or raw instruction appears in JSON, prose, or error output.
+- [ ] A controller-owned heartbeat advances on a bounded independent cadence during long item
+      dispatches, waits, and recovery backoff without requiring model/worker progress messages.
+- [ ] Heartbeat refresh stops after lock loss/terminal exit; failed heartbeat persistence is
+      visible rather than reported healthy.
+- [ ] Health represents process liveness, durable workflow progress, and expected waiting
+      independently (three separable dimensions in the read model).
+- [ ] `suspected_stuck` requires fresh controller liveness plus an explicitly started operation
+      past its deadline with no durable progress.
+- [ ] `dead` requires stale heartbeat plus same-host process/service absence proof; cross-host or
+      insufficient evidence is `unknown`.
+- [ ] CI/provider/backoff/dependency/capacity/human waiting before a recorded deadline is healthy
+      waiting, not stuck.
+- [ ] Missing telemetry and cost remain unknown; no remaining-quota percentage or zero-cost
+      inference is emitted.
+- [ ] Legacy runs and missing optional sources remain readable with explicit unknown/legacy
+      attribution.
+- [ ] Unit tests use injected clocks, process probes, stores, status readers, and no real
+      network/git/subprocess calls.
+- [ ] Generated CLI/config/host docs and `plugin/` mirror remain current; `npm run ci` passes.
+
+## Tasks
+
+## 1. Allowlisted factory status read model
+
+- [ ] 1.1 Define `FactoryStatusEnvelope` (`schema_version`, `status` ok|degraded|error,
+      `generated_at`, health dimensions, identity/run/items/cost/source-attribution blocks) and
+      an explicit public field allowlist module.
+- [ ] 1.2 Implement pure `assembleFactoryStatus(sources, clock, probes)` that maps injected
+      controller/service, loop status, process-identity, pin, provider/cooldown, write-health,
+      and cost readers into the allowlisted envelope only.
+- [ ] 1.3 Sanitize free text: drop or coarse-code issue titles, comments, hold reasons,
+      next-action prose; never copy lock tokens, bearer tokens, credentials, secret refs, env
+      maps, prompts, or tool transcripts.
+- [ ] 1.4 Structured `error` / `degraded` paths always return valid envelope JSON with sanitized
+      messages.
+- [ ] 1.5 Unit tests: full snapshot field categories; unknown/legacy for missing optional
+      sources; zero mutation calls on injected seams; frozen `generated_at` from injected clock.
+
+## 2. Canary and secret non-leakage guards
+
+- [ ] 2.1 Build a canary fixture that injects unique `CANARY_SECRET_*` values and prompt-like
+      strings into **every** registered status source object shape.
+- [ ] 2.2 Assert canaries and raw prompt-like text are absent from JSON.stringify(envelope),
+      human rendering, and error-path strings.
+- [ ] 2.3 Guard: adding a source key without canary coverage fails the suite.
+
+## 3. Independent controller health and classification
+
+- [ ] 3.1 Define health dimensions (process liveness, durable progress, expected waiting) and
+      coarse classes (`healthy`/`waiting`, `suspected_stuck`, `dead`, `unknown`).
+- [ ] 3.2 Implement classification pure functions with injected clock and process/service probes.
+- [ ] 3.3 Enforce rules: `suspected_stuck` requires fresh liveness + started operation past
+      deadline + no durable progress; `dead` requires stale heartbeat + same-host absence proof;
+      cross-host / insufficient evidence → `unknown`.
+- [ ] 3.4 Expected CI/provider/backoff/dependency/capacity/human waits before deadline classify
+      as healthy waiting, not stuck.
+- [ ] 3.5 Cost/telemetry honesty: actual|estimated|unknown only; no remaining-quota %; no
+      zero-cost invention from absence.
+- [ ] 3.6 Unit tests matrix for waiting, stuck, same-host dead, cross-host unknown,
+      insufficient-evidence unknown, and cost-unknown.
+
+## 4. Controller-owned independent heartbeat
+
+- [ ] 4.1 Add bounded independent heartbeat refresh on the live controller path (loop
+      supervisor now; #890 macro-controller seam when present) during dispatch, expected wait,
+      and recovery backoff without requiring model/worker messages.
+- [ ] 4.2 Stop refresh after lock loss or terminal exit; surface failed heartbeat persistence as
+      non-healthy (not silent healthy).
+- [ ] 4.3 Compose with existing cycle-bound process-identity heartbeat; do not replace lock or
+      action-evidence contracts.
+- [ ] 4.4 Optional operation id/deadline and wait kind/deadline fields on process/controller
+      evidence; legacy records without them remain loadable.
+- [ ] 4.5 Unit tests with injected interval, clock, and store seam (no real subprocess/network).
+
+## 5. CLI command and registry
+
+- [ ] 5.1 Register factory status in `COMMAND_REGISTRY` (`mutatesGitHub: false`, tight
+      `allowedFlags` including `--json`, non-mutating handler).
+- [ ] 5.2 Wire `pipeline factory status` human output and `--json` single-object stdout (exact
+      nesting matches existing factory-gate/pin command style).
+- [ ] 5.3 CLI handler maps real readers into assembler seams; default path remains pure
+      observation.
+- [ ] 5.4 Registry/flag tests: accepted `--json`, rejected unknown flags (exit 2), handler not
+      advance/merge/deploy.
+
+## 6. #890 and legacy source attribution
+
+- [ ] 6.1 When macro-controller/service records exist, fill controller identity, mode/revision,
+      active contract, and coarse phase from them.
+- [ ] 6.2 When absent/disabled, emit explicit unknown/legacy/not_applicable; still assemble from
+      loop supervisor + durable store + pin/provider sources.
+- [ ] 6.3 Never invent a running macro-controller or cross-host death.
+
+## 7. Documentation, mirror, and gates
+
+- [ ] 7.1 Ensure factory status is documented in generator inventory so `docs/cli.md` and host
+      SKILL tables include it after regenerate.
+- [ ] 7.2 After any `core/` change: `node scripts/build.mjs` and commit regenerated `plugin/`.
+- [ ] 7.3 `npm run ci` green (`ci:core`, mirror check, install smoke, openspec validate, docs
+      check when present, scripts).
+- [ ] 7.4 Confirm no dashboard/HTTP raw-status exposure, no auto-merge path, and no
+      cross-host death claim was introduced.
+
+## OpenSpec — Intended Behavior (spec deltas)
+
+This work must stay consistent with these requirement changes.
+
+#### command-registry/spec.md
+
+## ADDED Requirements
+
+### Requirement: The command registry SHALL include a non-mutating factory status entry
+
+The `COMMAND_REGISTRY` in `core/scripts/command-registry.ts` SHALL include an entry that routes
+`pipeline factory status` (either as a dedicated keyword or as a documented factory subcommand
+path consistent with existing `factory-gate` / `factory-pin` registration patterns) so dispatch
+and allowlist-based flag validation cover it through the single authoritative registry. The
+entry SHALL declare `mutatesGitHub: false` and SHALL NOT reuse advance, merge, deploy, unblock,
+or override handlers. Its `allowedFlags` SHALL include the Commander attribute for `--json` and
+SHALL NOT use the `"all"` sentinel.
+
+#### Scenario: Factory status is a recognized non-mutating command
+
+- **WHEN** the `COMMAND_REGISTRY` is inspected for the factory status command entry
+- **THEN** lookup SHALL return a non-null entry
+- **AND** the entry SHALL declare `mutatesGitHub: false`
+
+#### Scenario: Unsupported flags are rejected before side effects
+
+- **WHEN** factory status is invoked with a flag not in its `allowedFlags`
+- **THEN** the CLI SHALL reject it with exit code 2 before any status assembly side effect
+- **AND** rejection SHALL use the same allowlist-based validation as other registered commands
+
+#### Scenario: `--json` is accepted
+
+- **WHEN** `validateFlags` is called with the factory status entry and `--json` provided on the
+  CLI
+- **THEN** it SHALL return an empty array of offending flags
+
+#### Scenario: Factory status is not wired to a mutating handler
+
+- **WHEN** the factory status entry's handler is inspected
+- **THEN** it SHALL NOT be the advance, merge, deploy, unblock, or override handler
+
+#### controller-independent-health/spec.md
+
+## ADDED Requirements
+
+### Requirement: The controller SHALL advance a process heartbeat on a bounded independent cadence
+
+While a factory controller (the #890 macro-controller when active, otherwise the durable loop supervisor acting as the live item driver) holds a run and has not exited terminally, it SHALL refresh controller-owned heartbeat evidence on a bounded independent cadence during long item dispatches, expected waits, and recovery backoff. Heartbeat advance SHALL NOT require model or worker progress messages. The cadence bound SHALL be injectable for unit tests.
+
+#### Scenario: Heartbeat advances during a long blocking dispatch
+
+- **WHEN** the controller holds a run and a whole-item dispatch remains in progress longer than
+  one independent heartbeat interval
+- **AND** no model/worker progress message is observed
+- **THEN** the controller-owned `heartbeat_at` (or equivalent) SHALL advance at least once before
+  the dispatch completes
+
+#### Scenario: Heartbeat advances during expected wait and recovery backoff
+
+- **WHEN** the controller is sleeping or waiting inside an expected wait or recovery backoff
+  window longer than one independent heartbeat interval
+- **THEN** the heartbeat evidence SHALL continue to advance on the independent cadence
+- **AND** SHALL NOT require a durable ledger transition to refresh
+
+#### Scenario: Cadence is injectable in tests
+
+- **WHEN** a unit test injects a short heartbeat interval and a controllable clock
+- **THEN** the test SHALL observe heartbeat refreshes without real wall-clock multi-second waits
+  beyond the test's injected progression
+
+---
+
+### Requirement: Heartbeat refresh SHALL stop after lock loss or terminal exit and failed persistence SHALL be visible
+
+After the controller loses the run lock or records a terminal exit, it SHALL stop refreshing
+heartbeat evidence for that run. If a heartbeat persistence attempt fails while the controller
+still believes it is live, health projection SHALL surface the persistence failure and SHALL
+NOT report healthy liveness solely from an in-memory belief that the write succeeded.
+
+#### Scenario: Heartbeat stops after terminal exit
+
+- **WHEN** the controller records a terminal stop and exits the run loop
+- **THEN** no further independent heartbeat refresh for that run SHALL be attempted after the
+  terminal exit path completes
+
+#### Scenario: Heartbeat stops after lock loss
+
+- **WHEN** the controller detects it no longer holds the run lock
+- **THEN** independent heartbeat refresh for that run SHALL stop
+- **AND** subsequent status SHALL NOT claim a fresh healthy heartbeat from that controller
+  instance
+
+#### Scenario: Failed heartbeat persistence is not reported healthy
+
+- **WHEN** a heartbeat write fails through the injected store seam
+- **THEN** factory health projection SHALL expose a non-healthy or degraded liveness/write signal
+- **AND** SHALL NOT claim healthy process liveness as if the heartbeat were durably fresh
+
+---
+
+### Requirement: Health SHALL represent process liveness, durable progress, and expected waiting independently
+
+Controller health projection SHALL expose three independent dimensions:
+
+1. **Process liveness** — whether controller heartbeat and same-host process/service probes
+   indicate a live controller.
+2. **Durable workflow progress** — whether durable ledger/event/action evidence has advanced.
+3. **Expected waiting** — whether the controller is in a recorded expected wait (including CI,
+   provider cooldown, recovery backoff, dependency, capacity, or human) with a deadline.
+
+A single conflated boolean MUST NOT be the only health signal. Factory status consumers SHALL be
+able to observe each dimension without inferring the others.
+
+#### Scenario: Live process with no recent durable progress during expected wait
+
+- **WHEN** the controller heartbeat is fresh
+- **AND** an expected wait with a future deadline is recorded
+- **AND** no durable progress has occurred during the wait
+- **THEN** process liveness SHALL report live
+- **AND** expected waiting SHALL report waiting with that kind and deadline
+- **AND** durable progress MAY report idle or not-recent
+- **AND** the coarse classification SHALL NOT be `suspected_stuck` solely for lack of progress
+  during the wait
+
+#### Scenario: Dimensions remain separable in the read model
+
+- **WHEN** factory status JSON is assembled
+- **THEN** the health block SHALL include distinct fields or nested objects for liveness,
+  durable progress, and expected waiting
+- **AND** a change to one dimension's evidence SHALL NOT force the others to identical values
+
+---
+
+### Requirement: `suspected_stuck` SHALL require live controller plus overdue started operation without durable progress
+
+The coarse classification `suspected_stuck` SHALL be emitted only when all of the following hold:
+
+- controller liveness evidence is fresh (independent heartbeat within the liveness bound)
+- an operation was **explicitly started** and recorded with a deadline
+- the injected clock is past that deadline
+- no durable progress has been recorded since the operation start
+
+Absence of an operation deadline SHALL NOT produce `suspected_stuck` by wall-clock age alone.
+
+#### Scenario: Overdue operation with live controller and no progress is stuck
+
+- **WHEN** heartbeat is fresh
+- **AND** operation `dispatch_item` started with deadline T1
+- **AND** clock is after T1
+- **AND** no durable progress exists after the operation start
+- **THEN** coarse health SHALL be `suspected_stuck`
+
+#### Scenario: Fresh heartbeat alone is not stuck
+
+- **WHEN** heartbeat is fresh
+- **AND** no operation with a past deadline is recorded
+- **THEN** coarse health SHALL NOT be `suspected_stuck`
+
+#### Scenario: Overdue operation with durable progress is not stuck
+
+- **WHEN** an operation is past its deadline
+- **AND** durable progress was recorded after the operation start
+- **THEN** coarse health SHALL NOT be `suspected_stuck` solely from the deadline breach
+
+---
+
+### Requirement: `dead` SHALL require stale heartbeat plus same-host absence proof; otherwise `unknown`
+
+The coarse classification `dead` SHALL be emitted only when heartbeat evidence is stale (or
+absent past the liveness bound) **and** a same-host process/service probe proves the recorded
+controller process or service is not present. When the recorded holder is on a different host,
+or when process/service evidence is insufficient to prove absence, classification SHALL be
+`unknown` and SHALL NOT be upgraded to `dead`.
+
+#### Scenario: Stale heartbeat and dead same-host pid is dead
+
+- **WHEN** heartbeat is older than the liveness bound
+- **AND** the process record hostname matches the local host
+- **AND** the recorded pid is proven not alive by the injected probe
+- **THEN** coarse health SHALL be `dead`
+
+#### Scenario: Cross-host holder is unknown not dead
+
+- **WHEN** heartbeat is stale
+- **AND** the process record hostname differs from the local host
+- **THEN** coarse health SHALL be `unknown`
+- **AND** SHALL NOT be `dead`
+
+#### Scenario: Insufficient process evidence is unknown
+
+- **WHEN** heartbeat is stale
+- **AND** no reliable same-host process or service probe result is available
+- **THEN** coarse health SHALL be `unknown`
+- **AND** SHALL NOT be `dead`
+
+---
+
+### Requirement: Expected waiting before a recorded deadline SHALL be healthy waiting not stuck
+
+When the controller records an expected wait of kind CI, provider cooldown, recovery backoff, dependency, capacity, or human, and the injected clock is still before the wait's recorded deadline, coarse health SHALL classify the situation as healthy waiting (or an equivalent non-stuck waiting state) rather than `suspected_stuck` or `dead`, provided liveness evidence is consistent with a live or intentionally paused controller as defined by the wait record.
+
+#### Scenario: Provider cooldown before deadline is waiting
+
+- **WHEN** provider cooldown wait is recorded with deadline T2
+- **AND** clock is before T2
+- **AND** heartbeat remains fresh on the independent cadence
+- **THEN** expected waiting SHALL report provider cooldown
+- **AND** coarse health SHALL NOT be `suspected_stuck`
+
+#### Scenario: CI wait before deadline is waiting
+
+- **WHEN** a CI wait with future deadline is recorded
+- **THEN** coarse health SHALL NOT be `suspected_stuck` solely because durable item progress is
+  idle during that CI wait
+
+#### Scenario: Human wait before deadline is waiting
+
+- **WHEN** a human-authority wait or hold with a recorded future check deadline is present
+- **THEN** coarse health SHALL NOT be `suspected_stuck` solely for lack of autonomous progress
+  before that deadline
+
+---
+
+### Requirement: Independent health classification SHALL be unit-tested with injected clocks and probes
+
+Classification of liveness, progress, waiting, `suspected_stuck`, `dead`, and `unknown` SHALL be
+covered by unit tests that inject clocks, process/service probes, and durable evidence fakes.
+Tests SHALL perform no real network, git, or subprocess calls.
+
+#### Scenario: Matrix covers stuck dead unknown and waiting
+
+- **WHEN** the health classification unit tests run
+- **THEN** they SHALL include at least one case each for healthy waiting, `suspected_stuck`,
+  same-host `dead`, cross-host `unknown`, and insufficient-evidence `unknown`
+- **AND** each case SHALL use injected seams only
+
+#### durable-loop-store/spec.md
+
+## ADDED Requirements
+
+### Requirement: Factory-facing lock and liveness projection SHALL omit lock tokens and raw supervisor secrets
+
+When the durable loop store's status projection or related process-identity records are consumed to build the allowlisted factory status read model, the public projection path used by factory status SHALL expose only allowlisted lock/liveness summary fields (for example holder host, staleness classification, and liveness class). It SHALL NOT place lock tokens, supervisor bearer tokens, or other secret-bearing fields into the factory status output. The internal store projection used by trusted same-host tooling MAY retain token fields for recovery logic, but those fields MUST NOT be the remote factory status contract.
+
+#### Scenario: Factory status consumer never receives the lock token
+
+- **WHEN** a run lock record contains a holder token
+- **AND** factory status is assembled from store status/process readers
+- **THEN** the factory status JSON SHALL NOT include that token value
+
+#### Scenario: Allowlisted liveness summary remains available
+
+- **WHEN** status is requested for a locked run with a same-host holder
+- **THEN** factory status SHALL still be able to report an allowlisted lock/liveness summary
+  (holder presence, host class, staleness/unknown/dead classification inputs)
+- **AND** producing that summary SHALL perform no lock acquisition and no GitHub call
+
+---
+
+### Requirement: Optional operation and independent-heartbeat fields SHALL be legacy-safe
+
+When process-identity or controller health evidence gains optional fields for independent heartbeat freshness, current operation identity, operation deadline, expected wait kind, or expected wait deadline, the store SHALL accept and re-read records that omit those fields. Consumers SHALL treat missing optional fields as unknown/legacy rather than failing schema validation for older runs.
+
+#### Scenario: Older process record without operation deadline still loads
+
+- **WHEN** a process-identity record written before operation-deadline fields exists
+- **THEN** the store SHALL load it successfully
+- **AND** factory status SHALL attribute operation/deadline as unknown or legacy
+
+#### Scenario: Newer record with operation fields round-trips
+
+- **WHEN** a process or controller health record includes current operation id and deadline
+- **THEN** the store SHALL re-read those fields intact for status assembly
+
+#### durable-loop-supervisor/spec.md
+
+## ADDED Requirements
+
+### Requirement: The supervisor process-identity heartbeat SHALL compose with an independent cadence refresh
+
+In addition to refreshing the process-identity heartbeat on cycle completion, the durable loop supervisor SHALL support controller-owned independent cadence heartbeat refresh while a cycle is blocked in whole-item dispatch, expected wait, or recovery backoff, as required by `controller-independent-health`. Independent cadence refresh SHALL compose with cycle-bound refresh and SHALL NOT replace the process-identity record, the run lock, or the action-evidence trail. When the #890 macro-controller is the outer owner, the supervisor MAY remain the item driver whose process evidence feeds factory status; requirements here still apply whenever the supervisor is the live holder refreshing process identity.
+
+#### Scenario: Long dispatch no longer freezes heartbeat until cycle end
+
+- **WHEN** the supervisor is inside a single long dispatch that exceeds the independent
+  heartbeat interval
+- **THEN** process-identity `heartbeat_at` SHALL advance before that dispatch returns
+- **AND** the advance SHALL NOT require completing the supervisor cycle
+
+#### Scenario: Cycle-bound evidence remains intact
+
+- **WHEN** independent heartbeat refreshes occur during a cycle
+- **THEN** the supervisor SHALL still write normal cycle-completion action-evidence when the
+  cycle finishes
+- **AND** the process-identity record SHALL remain distinct from the run lock
+
+#### Scenario: Independent heartbeat uses the injectable store seam
+
+- **WHEN** unit tests drive supervisor heartbeat refresh
+- **THEN** they SHALL do so through the store's injectable seam with no real process, network,
+  or git call
+
+#### factory-aggregate-status/spec.md
+
+## ADDED Requirements
+
+### Requirement: `pipeline factory status --json` SHALL write exactly one unfenced versioned JSON object
+
+The pipeline CLI SHALL provide a factory-level status command invocable as
+`pipeline factory status` (or an equivalent registry-routed factory status keyword that
+preserves the same semantics). When `--json` is supplied, the command SHALL write exactly one
+JSON object to stdout with no surrounding markdown fence, no leading prose, and no trailing
+non-JSON bytes. The object SHALL include a `schema_version` string (initially `"1"`) and a
+top-level `status` discriminant whose values include at least `ok`, `degraded`, and `error`.
+Structured failures and partial source failures SHALL still yield valid JSON parseable by
+`JSON.parse(stdout)`.
+
+#### Scenario: JSON mode emits a single parseable object
+
+- **WHEN** `pipeline factory status --json` is invoked against an injectable status assembler
+- **THEN** stdout SHALL contain exactly one JSON object with no code fences or prose
+- **AND** `JSON.parse(stdout)` SHALL succeed
+- **AND** the object SHALL include `schema_version` and `status`
+
+#### Scenario: Error state remains valid JSON
+
+- **WHEN** the assembler cannot read any required factory status source and classifies the
+  outcome as error
+- **THEN** stdout SHALL still be a valid JSON object
+- **AND** `status` SHALL equal `"error"`
+- **AND** the object SHALL include a sanitized `error` string field
+- **AND** the command SHALL exit non-zero
+
+#### Scenario: Degraded state when optional sources fail
+
+- **WHEN** the primary run projection is readable but an optional source (for example cost or
+  write-health) fails to load
+- **THEN** `status` SHALL be `"degraded"` or `"ok"` with explicit per-source unknown/failure
+  attribution
+- **AND** stdout SHALL remain a single valid JSON object
+
+#### Scenario: Human mode without `--json` is non-JSON prose
+
+- **WHEN** `pipeline factory status` is invoked without `--json`
+- **THEN** stdout SHALL be human-readable prose derived from the same allowlisted model
+- **AND** SHALL NOT be required to be valid JSON
+
+---
+
+### Requirement: Factory status SHALL perform no mutating side effects
+
+Producing factory status SHALL perform no GitHub mutation, no git mutation, no service or
+control mutation, no ledger write, no event append, no lock acquisition that changes
+ownership, and no run-artifact create/modify/delete. Unit tests SHALL exercise the assembler
+and CLI handler through injected seams and record zero write/mutate calls.
+
+#### Scenario: Status records zero mutations through injected seams
+
+- **WHEN** factory status runs with injected GitHub, git, store, service, and filesystem seams
+- **THEN** those seams SHALL record zero mutating calls
+- **AND** no ledger, event, lock-token, or run-artifact write SHALL occur
+
+#### Scenario: Status of a locked run does not require or steal the lock
+
+- **WHEN** factory status is requested for a run whose lock is held by another process
+- **THEN** status SHALL be produced without acquiring the holder token
+- **AND** the lock record SHALL remain unchanged
+
+---
+
+### Requirement: The factory status snapshot SHALL include the minimum allowlisted field set
+
+The versioned JSON snapshot SHALL include, either as concrete values or as explicit
+unknown/legacy/not-applicable attribution, the following categories:
+
+- controller and/or service identity
+- controller mode and revision (when a macro-controller or equivalent is present)
+- active contract and/or durable run identity
+- engine, treatment, and authority fingerprints when recorded
+- counts of active, queued, and held items
+- per-item coarse state and stage projection when recorded
+- linked advance run id, PR identity, and candidate/track identity when recorded
+- current operation and its deadline when recorded
+- last durable progress timestamp or equivalent marker
+- expected wait kind and deadline when recorded
+- provider cooldown when recorded
+- next action as a coarse allowlisted summary or code (not unsanitized free text)
+- lock/liveness projection (allowlisted summary only; never raw tokens)
+- event-stream or write-health summary when recorded
+- cost coverage as actual, estimated, or unknown (never invented zero or quota percent)
+
+Additive optional fields within the same `schema_version` SHALL be permitted when they remain
+allowlisted and unknown-safe.
+
+#### Scenario: Minimum categories present on a fully instrumented factory
+
+- **WHEN** factory status is assembled from complete controller, loop, pin, provider, and
+  write-health fakes
+- **THEN** the JSON object SHALL include every minimum category above as a non-null structured
+  value or nested object
+- **AND** `schema_version` SHALL equal `"1"`
+
+#### Scenario: Missing optional sources become explicit unknown
+
+- **WHEN** factory status is assembled without cost telemetry and without a macro-controller
+  record
+- **THEN** cost coverage SHALL be marked unknown
+- **AND** controller mode/revision SHALL be marked unknown, legacy, or not_applicable
+- **AND** the command SHALL still emit a valid snapshot rather than failing solely for those
+  absences
+
+#### Scenario: Legacy run without operation deadlines remains readable
+
+- **WHEN** status is assembled for a legacy run that lacks current-operation deadline fields
+- **THEN** the snapshot SHALL remain valid JSON
+- **AND** operation/deadline fields SHALL carry explicit unknown or legacy attribution
+- **AND** the assembler SHALL NOT invent deadlines
+
+---
+
+### Requirement: Remote factory status output SHALL be assembled only from an explicit allowlist
+
+The public JSON object and the human rendering derived from it SHALL include only fields on an
+explicit output allowlist. The following MUST NEVER appear in JSON, human prose, or error
+output:
+
+- raw lock or supervisor records
+- lock bearer tokens or supervisor bearer tokens
+- credentials, secret values, or secret references
+- process environment maps
+- prompts, tool transcripts, or raw model/worker output
+- local auth material
+- unsanitized issue titles, comment bodies, hold reasons, or other free-text instruction-like
+  payloads copied from source objects
+
+Free-text sources SHALL be dropped, replaced with coarse enums/codes, or reduced to a short
+allowlisted summary that cannot carry secrets or prompt payloads.
+
+#### Scenario: Allowlist drops raw lock token fields
+
+- **WHEN** the underlying process or lock record contains a lock token or bearer field
+- **AND** factory status is assembled
+- **THEN** the public JSON and human output SHALL NOT contain that token value or the raw
+  record dump
+
+#### Scenario: Unsanitized hold reason does not pass through
+
+- **WHEN** a ledger or audit source contains a free-text hold reason
+- **AND** factory status is assembled
+- **THEN** the public output SHALL NOT include the raw reason string
+- **AND** MAY include a coarse hold/wait code or truncated allowlisted summary only
+
+---
+
+### Requirement: Factory status sanitization SHALL be proven with canary injection tests
+
+Unit tests SHALL inject distinctive canary secret strings and prompt-like issue/reason text into
+every registered status source object and SHALL assert that no canary string and no raw
+prompt/instruction payload appears in the JSON serialization, the human-readable rendering, or
+error-path output. Adding a new source object type without covering it in the canary suite
+SHALL fail the guard.
+
+#### Scenario: Canary secret in every source is stripped
+
+- **WHEN** each status source object is seeded with a unique canary secret string
+- **AND** factory status JSON and human output are produced
+- **THEN** neither stdout form nor error output SHALL contain any of those canary strings
+
+#### Scenario: Prompt-like free text in issue or reason fields is stripped
+
+- **WHEN** a source object includes prompt-like text in an issue title, comment, or reason field
+- **AND** factory status is produced
+- **THEN** the public output SHALL NOT contain that raw prompt-like text
+
+---
+
+### Requirement: Missing telemetry and cost SHALL remain unknown without inference
+
+When cost or telemetry data is absent, unreadable, or incomplete, factory status SHALL report
+coverage as unknown (or partial with unknown components). The assembler SHALL NOT emit a
+remaining-quota percentage and SHALL NOT invent a zero cost, zero token count, or other numeric
+success metric solely from absence of data.
+
+#### Scenario: Absent cost data is unknown not zero
+
+- **WHEN** no cost accounting artifact is available for the active run
+- **THEN** cost coverage SHALL be `unknown` (or equivalent)
+- **AND** the snapshot SHALL NOT report `cost_usd: 0` as if measured
+
+#### Scenario: No remaining-quota percentage from missing telemetry
+
+- **WHEN** provider telemetry does not include remaining quota
+- **THEN** the snapshot SHALL NOT invent a remaining-quota percentage field from absence
+
+---
+
+### Requirement: Factory status assembly SHALL be unit-tested with injected seams only
+
+The status assembler and classification helpers SHALL be exercisable with injected clocks,
+process probes, stores, controller/service readers, pin readers, provider readers, and
+write-health readers. Unit tests SHALL perform no real network, git, or subprocess calls.
+
+#### Scenario: Injected clock freezes generated_at
+
+- **WHEN** a unit test injects a clock that returns a fixed instant
+- **AND** assembles factory status
+- **THEN** `generated_at` SHALL equal that instant's ISO-8601 representation
+
+#### Scenario: No real I/O in unit tests
+
+- **WHEN** the factory status unit test suite runs
+- **THEN** it SHALL not open real GitHub, git, or subprocess channels
+- **AND** all external effects SHALL go through fakes
+
+#### generated-cli-reference/spec.md
+
+## ADDED Requirements
+
+### Requirement: Generated CLI and host docs SHALL document factory status
+
+When the CLI reference generator and host SKILL command-table generators run against a registry that includes the factory status command as a documented entry, `docs/cli.md` and the host SKILL generated regions SHALL include factory status usage (including `--json`) with the host's invocation token. The generator SHALL NOT invent factory status if it is absent from the registry, and SHALL NOT document it as a mutating command.
+
+#### Scenario: Documented factory status appears in docs/cli.md
+
+- **WHEN** the CLI reference generator runs after factory status is registered as documented
+- **THEN** `docs/cli.md` SHALL contain a usage synopsis that includes factory status and
+  `--json`
+
+#### Scenario: Host SKILL tables list factory status
+
+- **WHEN** the host SKILL command-table regions are regenerated for Claude and Codex
+- **THEN** both regions SHALL list factory status among documented commands
+- **AND** each region SHALL use only that host's invocation token form
+
+## Instructions
+
+1. Read this repo's conventions file (`CLAUDE.md` or `AGENTS.md`, depending on your host) for the full conventions — an excerpt is already included above.
+2. Implement the plan above. Write clean, well-tested code appropriate to the repo stack.
+3. Reuse existing repo patterns for routing, shared utilities, schema changes, tests, and CI-facing checks instead of inventing parallel paths.
+4. Write or update tests that cover the new or changed behavior, focusing on the smallest relevant suites for the touched surfaces.
+5. Run the relevant formatter, typecheck, and test commands already used by this repo's CI for the files you changed.
+6. Commit all changes with a descriptive message referencing #891.
+   Append these two git trailers to the bottom of every commit message, after a
+   blank line (standard git trailer format):
+
+       Issue: #891
+       Pipeline-Run: 891/2026-08-07T20:40:22Z
+7. Do NOT push — the pipeline handles pushing after review.
+
+## Documentation Updates
+
+Documentation is part of this change — update it in the same commit(s) so reviewers see code and docs together. Check and update where affected:
+- **README.md** — if user-visible setup, workflows, features, or operations changed
+- **Config docs and examples** — if config keys, flags, env vars, or setup steps were added or changed
+- **Docstrings/comments in the files you changed** — if they are now inaccurate
+- **Repo-local ops docs or runbooks** — if the change touches what they describe
+
+### Generated docs (required)
+
+This repository has a docs generator (`scripts/generate-docs.mjs`). If you change the generator, its templates, or any source that feeds generated outputs (CLI inventory, config schema, changelog sources, SKILL command tables, etc.), you MUST regenerate and commit **all** generator outputs in the same change as the source edits — never open a PR with stale generated docs.
+
+Run after regenerating (or to verify):
+
+    npm run docs:check
+    # equivalent: node scripts/generate-docs.mjs --check
+
+If check fails, run write mode (`npm run docs:generate` or `node scripts/generate-docs.mjs`), commit the outputs, and re-run check until green. Green unit tests alone do **not** satisfy this contract.
+
+If no documentation is affected, change nothing — do not add boilerplate docs.
+
+
+## Papercuts (Minor Friction)
+
+If you hit minor friction you worked around — a flaky command you retried, a misleading error, an undocumented setup step, a dead-end tool call — log it and continue. Do NOT stop the run for it:
+
+    pipeline papercut --run "$PIPELINE_RUN_ID" -m "<short description of the friction>"
+
+The run id is available via the `PIPELINE_RUN_ID` environment variable. This command is best-effort and never blocks — do not treat its exit code as significant.
+
+Do not confuse a papercut with the other two channels:
+- **A defect in the code under review** is a review finding — report it through the review verdict, not a papercut.
+- **Something that prevents you from continuing at all** is a blocker — raise it as a blocker, not a papercut.
+
+## Design-Interrogation Gate (may run after this stage)
+
+This repo has a risk-triggered design-interrogation gate armed. If your implementation makes a material design decision not already settled by the plan (a lock granularity, a storage shape, an auth boundary, a migration ordering, a concurrency model, or similar) for a risky surface (concurrency, storage, auth, migrations, infrastructure, public APIs, or a large architectural change), keep track of: the alternatives you considered and why you rejected them, the assumptions/invariants it depends on, and your honest uncertainty. If the gate fires, you will be asked to state these explicitly in a follow-up step — you do not need to produce anything for it now.
+## Single-Turn Invocation (required)
+This invocation is single-turn: there is no later turn in which deferred work can complete. Do NOT end your turn while committing still depends on a background task (e.g. a test suite launched in the background and not yet awaited) — wait synchronously for that work to finish, then commit, before ending the turn. A notification that arrives after your turn ends will never reach you. Per instruction 7 above, do NOT push — the pipeline handles pushing after review.
+
+## Important
+- Keep changes minimal and focused on the issue scope.
+- Do not make migrations, infra changes, or product-scope expansions unless the issue/plan actually calls for them.
+- If you encounter a blocker that prevents completion, describe it clearly in your final output.
+- **Injectable-dep rule:** Any new code path that calls an external CLI or API (`gh`, `git`, network, auth) MUST go through an injectable dep — never call the module-level function directly when a seam already exists on the `Deps` type. If no seam exists, add one. Tests that only pass because local auth is active are NOT passing tests — they will fail in CI. Every new test must cover the unauthenticated/no-network path and prove it fails without the injected fake.

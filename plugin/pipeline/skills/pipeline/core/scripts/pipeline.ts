@@ -542,7 +542,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | factory-pin | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | factory-pin | factory-status | factory | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -2757,10 +2757,15 @@ async function main(): Promise<void> {
   // The override only applies when numArg is absent or numeric — if a named subcommand
   // (e.g. "intake", "release") is in numArg, the subcommand entry governs validation.
   const isNumericOrAbsent = !numArg || /^\d+$/.test(numArg);
+  // `pipeline factory status` (two tokens) maps to the factory-status registry entry (#891).
+  const isFactoryStatusCommand =
+    numArg === "factory-status" ||
+    (numArg === "factory" && (cmd.args[1] as string | undefined) === "status");
   const effectiveCommandKey: string | undefined =
     (opts.removeWorktree && isNumericOrAbsent) ? "remove-worktree" :
     (opts.cleanup && isNumericOrAbsent)        ? "cleanup" :
     (opts.init && isNumericOrAbsent)           ? "init" :
+    isFactoryStatusCommand                     ? "factory-status" :
     numArg;
   const entry = lookupCommand(effectiveCommandKey);
   if (entry !== null) {
@@ -2811,7 +2816,24 @@ async function main(): Promise<void> {
   // `pipeline path --json`, `pipeline config validate/sync --json`, `pipeline refine-spec --json`,
   // `pipeline improve --json`, `pipeline scoreboard --json`, `pipeline status <N> --json`, and
   // `--remove-worktree --json` legitimately emit JSON — exempt from the status-only guard.
-  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard" && numArg !== "status" && numArg !== "papercut" && numArg !== "factory-gate") {
+  if (
+    opts.json &&
+    !isDoctorCommand &&
+    !opts.status &&
+    !opts.removeWorktree &&
+    numArg !== "path" &&
+    numArg !== "config" &&
+    numArg !== "refine-spec" &&
+    numArg !== "improve" &&
+    numArg !== "scoreboard" &&
+    numArg !== "status" &&
+    numArg !== "papercut" &&
+    numArg !== "factory-gate" &&
+    numArg !== "factory-pin" &&
+    numArg !== "factory-status" &&
+    numArg !== "factory" &&
+    numArg !== "loop"
+  ) {
     console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
     process.exit(2);
   }
@@ -3495,6 +3517,159 @@ async function main(): Promise<void> {
     return;
   }
 
+  // `pipeline factory status` / `pipeline factory-status` (#891).
+  // Pure allowlisted aggregate status — no GitHub/git/ledger/lock/service mutation.
+  if (isFactoryStatusCommand) {
+    const {
+      assembleFactoryStatus,
+      formatFactoryStatusHuman,
+      projectLoopSourcesForFactoryStatus,
+    } = await import("./factory-status.ts");
+    const { defaultLoopStoreDeps, getStatus } = await import("./loop/store.ts");
+    const { listLoopRunIds } = await import("./loop/logs.ts");
+    const { resolveProductionPin } = await import("./production-engine-pin.ts");
+    try {
+      const store = defaultLoopStoreDeps();
+      // Prefer explicit --run-id; else most recent durable loop run when present.
+      let runId =
+        (typeof opts.runId === "string" && opts.runId.trim().length > 0
+          ? opts.runId.trim()
+          : null) ??
+        null;
+      if (!runId) {
+        const ids = await listLoopRunIds({
+          env: store.env,
+          listDir: store.listDir,
+          fsExists: store.fsExists,
+          mtimeMs: async (p: string) => {
+            try {
+              const st = await fsPromises.stat(p);
+              return st.mtimeMs;
+            } catch {
+              return null;
+            }
+          },
+          readTextFile: store.readTextFile,
+          followFile: async () => null,
+          stdoutWrite: () => {},
+          stderrWrite: () => {},
+        }).catch(() => [] as string[]);
+        runId = ids[0] ?? null;
+      }
+
+
+      let loopStatus: Awaited<ReturnType<typeof getStatus>> | null = null;
+      let loopError: string | null = null;
+      if (runId) {
+        try {
+          loopStatus = await getStatus(store, runId);
+        } catch (err) {
+          loopError = err instanceof Error ? err.message : String(err);
+        }
+      }
+
+      // Pin is optional — read only; never invent.
+      let pin: { version?: string; tag?: string; track?: string } | null = null;
+      let pinError: string | null = null;
+      try {
+        const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+        const repoDir = findGitRoot(startDir) ?? startDir;
+        const load = await resolveProductionPin({
+          repoDir,
+          readTextFile: async (p) => {
+            try {
+              return await fsPromises.readFile(p, "utf8");
+            } catch {
+              return null;
+            }
+          },
+        });
+        if (load.kind === "ok") {
+          pin = {
+            version: load.pin.version,
+            tag: load.pin.tag,
+            track: "pinned",
+          };
+        } else {
+          pin = null;
+        }
+      } catch (err) {
+        pinError = err instanceof Error ? err.message : String(err);
+      }
+
+      const sources = projectLoopSourcesForFactoryStatus({
+        loopStatus: loopStatus
+          ? {
+              run_id: loopStatus.run_id,
+              engine: loopStatus.engine,
+              canonical_hash: loopStatus.canonical_hash,
+              items: loopStatus.items,
+              active_items: loopStatus.active_items,
+              stop: loopStatus.stop,
+              lock: loopStatus.lock,
+              supervisor: loopStatus.supervisor,
+              action_evidence: loopStatus.action_evidence,
+            }
+          : null,
+        pin: pinError ? undefined : pin,
+        writeHealth: null,
+        cost: null, // honest unknown — never invent zero
+        provider: null,
+        macroController: null, // #890 optional; unknown/not_applicable when absent
+      });
+
+      if (loopError) {
+        sources.loopStatus = { __error: loopError };
+      }
+      if (pinError) {
+        sources.pin = { __error: pinError };
+      }
+
+      const envelope = assembleFactoryStatus({
+        sources,
+        clock: { now: () => new Date() },
+        probes: {
+          localHostname: () => store.hostname(),
+          isPidAlive: (pid) => {
+            // Sync probe for same-host liveness (mirrors store.isPidAlive).
+            try {
+              process.kill(pid, 0);
+              return true;
+            } catch {
+              return false;
+            }
+          },
+        },
+      });
+
+      if (opts.json) {
+        // Exactly one unfenced JSON object — no prose, no fences.
+        process.stdout.write(JSON.stringify(envelope) + "\n");
+      } else {
+        console.log(formatFactoryStatusHuman(envelope));
+      }
+      if (envelope.status === "error") process.exitCode = 1;
+    } catch (err) {
+      const {
+        assembleFactoryStatus: assembleErr,
+        formatFactoryStatusHuman: formatErr,
+      } = await import("./factory-status.ts");
+      const envelope = assembleErr({
+        sources: {},
+        clock: { now: () => new Date() },
+        probes: { localHostname: () => "unknown" },
+        forceError: err instanceof Error ? err.message : String(err),
+      });
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(envelope) + "\n");
+      } else {
+        console.error(formatErr(envelope));
+      }
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   // `pipeline factory-pin show|init|promote|rollback` (#762).
   // Manages the production engine pin on factory pin authority only.
   // Never merges or tags. Never writes a product-local pin by cwd accident.
@@ -4102,7 +4277,7 @@ async function main(): Promise<void> {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "single", "release", "intake", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "factory-gate", "factory-pin", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "factory-gate", "factory-pin", "factory-status", "factory", "queue", "backfill", "evals",
       "loop",
     ];
     if (!recognized.includes(numArg)) {
