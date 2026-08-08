@@ -15,7 +15,7 @@
 - [x] Prove two-release continuity: v1.33.0 installs itself, then the stable wrapper uses the v1.34.0 candidate-native release-preparation command without manual wrapper replacement.
 - [x] Rebuild generated mirrors when `core/` changes.
 - [x] Run `npm run ci` and all focused verification.
-- [ ] Commit, push, open a PR, obtain review, and make CI green.
+- [x] Commit, push, open PR #912, obtain review, and make CI green.
 - [x] Apply and verify the corrected all-issue GitHub milestone migration.
 - [ ] Deploy Hermes and Buzz access on `agent-box`.
 - [ ] Verify the current v1.31.1 production pin, the v1.32.0 code base, and a live Grok 4.5/Codex smoke.
@@ -32,3 +32,4 @@
 - Final bounded implementation review found no P0 defects and one P1 defect: the shipped Hermes
   grant example omitted the required milestone. The example now includes the milestone, and a
   regression test parses and validates the actual shipped envelope. `npm run ci:ops` passes 119/119.
+- Pull request #912 opened from commit `0c73aca0`; its required GitHub CI job passed in 2m38s.

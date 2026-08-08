@@ -39,7 +39,7 @@
 
 - [x] 6.1 Regenerate generated docs and the plugin mirror after source changes.
 - [x] 6.2 Run strict OpenSpec validation, focused tests, `npm run ci`, and secret/path drift checks.
-- [ ] 6.3 Run an adversarial review, fix all valid findings, open a pull request, and prove required CI is green.
+- [x] 6.3 Run an adversarial review, fix all valid findings, open a pull request, and prove required CI is green.
 
 ## 7. Live factory calibration and first release
 
