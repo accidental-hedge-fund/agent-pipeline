@@ -122,13 +122,19 @@ test("the repository factory profile pins only grok-4.5 for Grok roles", () => {
   const source = read(".github/pipeline.yml");
   const parsed = yaml.load(source) as {
     harnesses?: { implementer?: string; reviewer?: string };
-    models?: { planning?: string; implementing?: string; fix?: string };
+    models?: { planning?: string; implementing?: string; fix?: string; intake?: string; sweep?: string };
   };
   assert.equal(parsed.harnesses?.implementer, "grok");
   assert.equal(parsed.harnesses?.reviewer, "codex");
   assert.deepEqual(
-    [parsed.models?.planning, parsed.models?.implementing, parsed.models?.fix],
-    ["grok-4.5", "grok-4.5", "grok-4.5"],
+    [
+      parsed.models?.planning,
+      parsed.models?.implementing,
+      parsed.models?.fix,
+      parsed.models?.intake,
+      parsed.models?.sweep,
+    ],
+    ["grok-4.5", "grok-4.5", "grok-4.5", "grok-4.5", "grok-4.5"],
   );
   assert.doesNotMatch(source, /grok-(?!4\.5\b)[\w.-]+/i, "no other Grok model may be configured");
 });

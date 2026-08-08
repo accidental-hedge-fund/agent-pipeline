@@ -1,5 +1,13 @@
 # Scoped autonomous Hermes/Buzz factory
 
+## Grok smoke configuration correction
+
+- [x] Reproduce the live doctor failure from inherited `sonnet` intake and sweep treatments.
+- [x] Configure all Grok implementer model slots as `grok-4.5`.
+- [x] Extend the repository policy regression to cover all five Grok model slots.
+- [x] Run focused tests and full repository CI.
+- [ ] Merge and fast-forward the factory control checkout, then resume the existing grant.
+
 ## Bootstrap compatibility correction
 
 - [x] Reproduce the live v1.33.0 grant startup failure without changing an issue or PR.
