@@ -55,3 +55,4 @@
 - Live factory calibration must use the exact pinned Pipeline command and the exact Buzz channel-and-thread target. A nearby smoke test does not prove the deployed command shape.
 - A chat command that starts a long systemd unit must use a nonblocking start. The factory controller owns progress messages; the Hermes tool turn must return after admission instead of emitting terminal wait timers.
 - A factory model pin must cover every treatment that `doctor --harness-smoke` enumerates, including optional intake and sweep slots. An omitted slot can inherit an incompatible model even when the main issue stages are pinned correctly.
+- A pinned bootstrap engine can be healthy while doctor reports a version-freshness warning. Validate each check result; do not turn a warning-only envelope into a factory failure.

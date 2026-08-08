@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { FactoryController, FactoryStop, validateProductionPinRecord } from "../lib/controller.mjs";
+import {
+  FactoryController,
+  FactoryStop,
+  validateDoctorEnvelope,
+  validateProductionPinRecord,
+} from "../lib/controller.mjs";
 import { CommandError } from "../lib/runtime.mjs";
 import { durableCommandPaths, durableUnitName } from "../lib/durable-command.mjs";
 import { admittedJournal, config, fail, NOW, ok } from "./helpers.mjs";
@@ -57,6 +62,29 @@ function recordPromotion(harness, previousPin, mergeOid = "2".repeat(40)) {
     result: { version: harness.grant.grant.release_version, tag: `v${harness.grant.grant.release_version}`, git_sha: mergeOid },
   };
 }
+
+function doctorEnvelope(status = "ok", checks = []) {
+  return {
+    schema_version: "1",
+    status,
+    checks: [
+      { name: "harness-smoke:grok:implementer:grok-4.5:high", status: "pass", ok: true },
+      { name: "harness-smoke:codex:reviewer:gpt-5.6-terra:high", status: "pass", ok: true },
+      ...checks,
+    ],
+  };
+}
+
+test("doctor accepts warning-only results from a valid pinned engine", () => {
+  const warning = { name: "install:version-freshness", status: "warn", ok: true };
+  assert.equal(validateDoctorEnvelope(doctorEnvelope("warnings", [warning])).status, "warnings");
+});
+
+test("doctor still rejects failed checks and error results", () => {
+  const failed = { name: "harness-smoke:grok:implementer:grok-4.5", status: "fail", ok: false };
+  assert.throws(() => validateDoctorEnvelope(doctorEnvelope("warnings", [failed])), /failed check/);
+  assert.throws(() => validateDoctorEnvelope(doctorEnvelope("error")), /did not return an ok envelope/);
+});
 
 test("production pin reads the machine file and expands its verified tag commit", async () => {
   const harness = await controllerHarness();
