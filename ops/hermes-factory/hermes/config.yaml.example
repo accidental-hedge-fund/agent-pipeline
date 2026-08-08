@@ -1,0 +1,77 @@
+# Copy this file to:
+#   ~/.hermes/profiles/pipeline-factory/config.yaml
+# Replace every REPLACE value with machine-local data. Do not commit the
+# completed file.
+
+model:
+  provider: xai-oauth
+  default: grok-4.5
+  base_url: https://api.x.ai/v1
+
+# Do not configure fallback_model. An empty current fallback chain makes a
+# Grok error visible instead of changing the model.
+fallback_providers: []
+
+# The pinned v2026.8.3 gateway resolves this list for Buzz. `no_mcp` is a
+# sentinel. It prevents globally configured MCP servers from entering this
+# profile. The effective model tool catalog must be exactly terminal/process.
+platform_toolsets:
+  buzz:
+    - terminal
+    - no_mcp
+
+# Do not let Hermes modify the installed factory skill in the background.
+# The slash-command policy below also denies /skills, /learn, /curator,
+# /reload-skills, /config, /model, and /update to the operator.
+skills:
+  inline_shell: false
+  write_approval: true
+
+curator:
+  enabled: false
+
+display:
+  platforms:
+    buzz:
+      interim_assistant_messages: false
+      tool_progress: "off"
+
+security:
+  redact_secrets: true
+
+terminal:
+  backend: local
+  cwd: /REPLACE/WITH/ABSOLUTE/PATH/TO/agent-pipeline
+
+gateway:
+  platforms:
+    buzz:
+      enabled: true
+      extra:
+        relay_url: https://REPLACE_WITH_BUZZ_FQDN
+        transport: websocket
+        channels:
+          - REPLACE_WITH_PIPELINE_FACTORY_CHANNEL_UUID
+        home_channel: REPLACE_WITH_PIPELINE_FACTORY_CHANNEL_UUID
+        cli_path: /REPLACE/WITH/ABSOLUTE/PATH/TO/buzz-v0.5.2/bin/buzz
+        credentials_file: /home/mcomardo/.hermes/profiles/pipeline-factory/buzz-credentials.json
+        allowed_users:
+          - REPLACE_WITH_OPERATOR_64_HEX_PUBKEY
+        require_mention: true
+        allow_all_users: false
+        poll_interval: 4
+
+        # The Hermes v2026.8.3 Buzz gateway enables /update by default. Set a
+        # non-caller as the admin so slash-command gating is active. The
+        # factory identity cannot receive its own events. The operator gets
+        # read-only /status plus the always-available /help and /whoami
+        # commands. Skill slash commands are still filtered by the outer exact
+        # Buzz user/channel allowlists.
+        allow_admin_from:
+          - REPLACE_WITH_FACTORY_64_HEX_PUBKEY
+        user_allowed_commands:
+          - status
+        group_allow_admin_from:
+          - REPLACE_WITH_FACTORY_64_HEX_PUBKEY
+        group_user_allowed_commands:
+          - status

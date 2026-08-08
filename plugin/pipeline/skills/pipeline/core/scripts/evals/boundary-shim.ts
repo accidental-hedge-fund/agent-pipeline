@@ -73,6 +73,7 @@ process.exit(1);
 function gitShimScript(): string {
   return `#!/usr/bin/env node
 const fs = require("fs");
+const path = require("path");
 const { spawnSync } = require("child_process");
 const argv = process.argv.slice(2);
 const DENIED = { worktree: "nested-worktree", commit: "commit", push: "push", remote: "remote-mutation" };
@@ -98,7 +99,11 @@ if (category) {
   process.exit(1);
 }
 const shimDir = __dirname;
-const restPath = (process.env.PATH || "").split(":").filter((p) => p && p !== shimDir).join(":");
+const canonicalPath = (entry) => {
+  try { return fs.realpathSync(entry); } catch { return path.resolve(entry); }
+};
+const canonicalShimDir = canonicalPath(shimDir);
+const restPath = (process.env.PATH || "").split(":").filter((p) => p && canonicalPath(p) !== canonicalShimDir).join(":");
 const result = spawnSync("git", argv, { stdio: "inherit", env: Object.assign({}, process.env, { PATH: restPath }) });
 process.exit(result.status === null || result.status === undefined ? 1 : result.status);
 `;

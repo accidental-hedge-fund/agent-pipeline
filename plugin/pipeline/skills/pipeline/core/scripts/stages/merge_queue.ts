@@ -1,8 +1,8 @@
-// Human-invoked merge-queue dry-run (#673): select ordered ready-to-deploy PRs
+// Operator-invoked merge-queue dry-run (#673): select ordered ready-to-deploy PRs
 // for a milestone and print a plan. NEVER merges; NEVER called from the advance
 // loop. Sequential drive is a follow-up (#674) and will call `pipeline merge`.
 //
-// Rule #4: the pipeline never merges autonomously. This command only plans.
+// Rule #4: the advance path never merges. This command only plans.
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";

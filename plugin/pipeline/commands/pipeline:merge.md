@@ -1,5 +1,5 @@
 ---
-description: Human-only squash merge of a ready-to-deploy PR
+description: Operator-authorized squash merge of a ready-to-deploy PR
 argument-hint: '<pr>'
 ---
 

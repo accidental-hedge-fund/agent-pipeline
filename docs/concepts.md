@@ -10,6 +10,7 @@ A newcomer who completed Prerequisites, Install, and Quickstart in the README ha
 - [Onboarding details](#onboarding-details)
 - [Test/build gate](#testbuild-gate-optional-default-on)
 - [Configurable steps (optional)](#configurable-steps-optional)
+- [Scoped external factory grants (optional, default off)](#scoped-external-factory-grants-optional-default-off)
 - [Human plan feedback (optional)](#human-plan-feedback-optional)
 - [Review severity policy & audited overrides](#review-severity-policy--audited-overrides)
 - [Design-interrogation gate (optional, default off)](#design-interrogation-gate-optional-default-off)
@@ -58,6 +59,29 @@ Structural safety steps (planning, implementing, pre-merge CI/mergeability) are 
 
 Review verdicts are pinned to the commit they evaluated. Before pre-merge acts on a prior approval it re-checks that SHA against HEAD; a developer/fix commit after the verdict invalidates it and re-enters review. Pipeline-internal commits (docs/chore archive, etc.) do not.
 
+## Scoped external factory grants (optional, default off)
+
+An external supervisor can compose the existing Pipeline CLI after an operator
+enables a separate deployment profile. This profile is disabled by default. It
+does not add a Pipeline stage, scheduler, MCP server, public factory API, or
+`auto_merge` setting. Ordinary `pipeline advance`, `pipeline single`, and
+`pipeline loop` still stop at `pipeline:ready-to-deploy` and never merge.
+
+The external deployment wrapper can act as an operator delegate only after it
+validates one authenticated, immutable, expiring grant. The grant must name the
+exact repository, base, release, ordered issue list, permitted actions, and
+expiry. The grant is machine-local deployment state. Repository content in
+`.github/pipeline.yml` cannot create or widen it.
+
+For an issue PR, the wrapper invokes `pipeline merge <pr>` only after grant
+validation. `pipeline merge` does not read or validate Buzz events or deployment
+grants. It keeps its normal ready-to-deploy, mergeability, required-check, and
+exact-head gates. `pipeline merge-queue` is dry-run by default; `--apply` is a
+separate operator-authorized batch surface and is never called by advance.
+
+The current Grok factory profile must use exactly `grok-4.5` for planning,
+implementation, and fixes. It has no Grok fallback. Codex remains the reviewer.
+
 ### Human plan feedback
 
 When `plan_review` is on, the pipeline posts an `## Implementation Plan` comment and runs agent plan review via the configured reviewer / secondary harness. When that reviewer is available, this is **independent agent plan review** — the plan-review control when the step is enabled, agent evidence, **not** human approval or human sign-off. If the reviewer CLI is missing or unspawnable, the same-harness fallback applies instead: the implementing harness reviews its own plan, and the posted plan review is **prominently labeled as a same-harness self-review**. That degraded path is still plan-review evidence and still advances (the pipeline never merges), but it is **not** independent agent plan review.
@@ -68,7 +92,7 @@ When the feedback window ends with **no** human comments, plan revision proceeds
 
 When human comments are present, the revised plan comment attributes contributors, and the revision **must** end with a `## Human Feedback Acknowledgement` section listing each commenter as `addressed — <reason>` or `declined — <reason>`.
 
-**Authority boundary:** when the reviewer harness runs, independent agent plan review is the plan-review control; when same-harness fallback applies, the labeled self-review is the plan-review evidence and is **not** independent; the human feedback window is optional steering; **human attestation** (pipeline output markers / operator capability attestations) is provenance, not plan sign-off; **human approval / sign-off** remains the merge button at `ready-to-deploy` (and other true human-approval gates such as `needs-human` dispositions).
+**Authority boundary:** when the reviewer harness runs, independent agent plan review is the plan-review control; when same-harness fallback applies, the labeled self-review is the plan-review evidence and is **not** independent; the human feedback window is optional steering; **human attestation** (pipeline output markers / operator capability attestations) is provenance, not plan sign-off. Merge authority remains outside the advance path. A direct operator can invoke a merge surface. A disabled external wrapper can act as the operator's delegate only for an exact valid grant. True human-decision gates such as `needs-human` dispositions remain human-owned.
 
 ## Review severity policy & audited overrides
 
@@ -81,7 +105,7 @@ When human comments are present, the revised plan comment attributes contributor
 /pipeline N --override "category:rollback-safety: deferred #90 — tracked separately"
 ```
 
-Overrides are audited in issue comments. The pipeline still never merges.
+Overrides are audited in issue comments. The advance path still never merges.
 
 ## Design-interrogation gate (optional, default off)
 

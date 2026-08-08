@@ -815,9 +815,9 @@ export interface PipelineConfig {
   // as if approved. Operator overrides of individual blocking findings are
   // audited via `pipeline-override` comment sentinels. The default
   // (`block_threshold: "medium"`, `min_confidence: 0.7`) blocks medium-and-above
-  // so real issues are fixed or explicitly overridden — not silently advised past
-  // at the merge button (review comments land on the issue, but a human merges the
-  // PR). Set `block_threshold: "high"` to also advise medium findings (more
+  // so real issues are fixed or explicitly overridden — not silently advised
+  // past at the merge boundary (review comments also land on the PR for the
+  // authorized merger). Set `block_threshold: "high"` to also advise medium findings (more
   // throughput, less rigor) or `"low"` to block on every finding.
   // `max_adversarial_rounds` caps
   // how many times a review round may re-run before still-blocking findings are
@@ -1018,10 +1018,11 @@ export interface PipelineConfig {
     min_confidence: number;
   };
   /**
-   * Human-gated merge-queue defaults (#676/#675). Opt-in release-when-complete
-   * (prepare a release PR after a complete drive; never tags/publishes/merges)
-   * and opt-in surgical repair of conflict/CI holds. Defaults false.
-   * No `auto_merge` key.
+   * Operator-authorized merge-queue defaults (#676/#675). Opt-in
+   * release-when-complete (prepare a release PR after a complete drive; never
+   * tags/publishes/merges) and opt-in surgical repair of conflict/CI holds.
+   * Defaults false. External grants are wrapper state. No `auto_merge` key or
+   * deployment-grant key.
    */
   merge_queue: {
     release_when_complete: boolean;

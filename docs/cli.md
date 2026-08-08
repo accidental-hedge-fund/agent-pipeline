@@ -54,12 +54,12 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `merge`
 
 - **Usage:** `pipeline merge <pr>`
-- **Summary:** Human-only squash merge of a ready-to-deploy PR (never called by the advance loop)
+- **Summary:** Operator-authorized squash merge of a ready-to-deploy PR (never called by the advance loop)
 
 #### `merge-queue`
 
 - **Usage:** `pipeline merge-queue --milestone <m> [--apply] [--release-when-complete --release-version <ver>]`
-- **Summary:** Human-gated sequential merge of ready-to-deploy PRs; optional prepare-only release-when-complete
+- **Summary:** Operator-authorized sequential merge of ready-to-deploy PRs; dry-run by default; optional prepare-only release-when-complete
 
 #### `override`
 

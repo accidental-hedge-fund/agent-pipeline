@@ -6,6 +6,7 @@ Generated from the Zod `PartialConfigSchema` surface in `core/scripts/config.ts`
 (via `generateConfigSchema()` / `pipeline config schema`). Commit
 `.github/pipeline.yml` to override defaults. Keys rejected by the schema
 (for example `auto_merge`) are **not** documented here.
+Machine-local deployment grants are outside this schema and cannot be set here.
 
 Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
@@ -466,7 +467,7 @@ Nested fields:
 
 - **Type:** object
 - **Default:** `{"release_when_complete":false,"repair":false,"repair_max_attempts":1}`
-- **Description:** Human-gated merge-queue defaults (#676/#675). Opt-in release-when-complete and optional repair; no auto_merge.
+- **Description:** Operator-authorized merge-queue defaults (#676/#675). Opt-in release-when-complete and optional repair; no auto_merge or deployment-grant key.
 
 Nested fields:
 

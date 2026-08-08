@@ -294,7 +294,7 @@ test("command-registry: lookupCommand('cleanup') returns cleanup entry with need
   assert.equal(entry.needsIssueNumber, false);
 });
 
-test("command-registry: merge-queue entry is human-gated sequential merge surface (#676)", () => {
+test("command-registry: merge-queue entry is an operator-authorized sequential merge surface (#676)", () => {
   const entry = COMMAND_REGISTRY["merge-queue"];
   assert.ok(entry, "merge-queue must be registered");
   assert.equal(entry.needsIssueNumber, false);

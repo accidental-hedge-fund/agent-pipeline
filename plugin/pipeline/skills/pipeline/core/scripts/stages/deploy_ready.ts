@@ -46,7 +46,7 @@ export function buildPipelineCompleteComment(
         ]
       : []),
     "",
-    "Ready to merge. The pipeline does NOT auto-merge — push the merge button when you're satisfied.",
+    "Ready to merge. The advance path stops here; use a separately operator-authorized merge command.",
     "",
     "---",
     cfg.marker_footer,
@@ -73,15 +73,15 @@ export async function finalize(
     const prRef = prNumber ? `PR #${prNumber}` : "(no PR found)";
     // Surface unresolved advisory findings at the merge point. Each advisory
     // advance posts a "advanced under severity policy" comment; if any exist, the
-    // human should weigh them before merging (they were not fixed).
+    // merge authority should account for them before merging (they were not fixed).
     const advisoryRounds = detail.comments.filter(
       (c) => c.body.startsWith("## Pipeline: Review") && c.body.includes("advanced under severity policy"),
     ).length;
     const summary = buildPipelineCompleteComment(cfg, issueNumber, detail.title, prRef, advisoryRounds);
     await postComment(cfg, issueNumber, summary);
     console.log(`[pipeline] #${issueNumber}: final summary posted`);
-    // Mirror the summary onto the PR — the merge decision happens there, not on
-    // the issue. Best-effort; the issue copy is authoritative.
+    // Mirror the summary onto the PR — the merge decision happens there, not
+    // on the issue. Best-effort; the issue copy is authoritative.
     if (prNumber) {
       try {
         await postPrComment(cfg, prNumber, summary);

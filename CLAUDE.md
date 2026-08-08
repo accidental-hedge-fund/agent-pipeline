@@ -25,12 +25,15 @@ review steps must follow.
    default-demote review steps to go faster. Speed work must be rigor-preserving (better
    prompts, removing dead/deterministic asks, fixing real convergence bugs) — never by
    removing review coverage.
-4. **No autonomous merges.** The advance loop stops at `pipeline:ready-to-deploy`.
-   Merging happens only through explicit operator invocation (`/pipeline:merge` per-PR;
-   `merge-queue --apply` batch, dry-run default); the invoking operator is the
-   session-bound merge authority. There is no `auto_merge` config key and no unattended
-   merge path — don't add either. Unattended merge remains gated on #662's
-   shadow-calibrated evidence standard.
+4. **Advance never merges.** `/pipeline`, `/pipeline:single`, and `/pipeline:loop`
+   stop at `pipeline:ready-to-deploy` and never invoke a merge. Merging uses
+   loop-isolated, operator-authorized commands only: `/pipeline:merge` per PR, or
+   `/pipeline:merge-queue --apply` for a batch (`merge-queue` is dry-run by default).
+   A disabled-by-default deployment wrapper may act as the operator's delegate only
+   after the wrapper validates an authenticated, immutable, expiring grant for the
+   exact action. `/pipeline:merge` does not validate Buzz events or deployment grants.
+   The grant is machine-local deployment state, not repository configuration. Do not
+   add an `auto_merge` config key or a merge stage.
 5. **Verify external shapes; never guess.** Especially `gh --json` field names: confirm the
    real output (`gh pr view N --json <field>`) before coding against it. Guessing gh field
    shapes has caused multiple wasted review rounds.

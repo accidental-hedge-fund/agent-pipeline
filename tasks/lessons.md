@@ -43,3 +43,12 @@
 # Installer command discovery
 
 - `scripts/install.mjs` does not implement `--help`; invoking it with that flag falls through to the default all-host install. Read its usage header/docs or use an explicit supported dry run when inspecting installer behavior, and never run command-discovery probes from an unmerged worktree.
+
+# Autonomous factory intent
+
+- Do not turn an autonomous delivery-factory request into a supervised PR generator. Preserve the full outcome: integrate prerequisite work, release it, promote the verified pin, install that exact release, and continue with the new engine.
+- For current Grok routing, use only `grok-4.5`. Do not infer a model from stale provider documentation and do not configure an automatic Grok fallback.
+- A self-building Pipeline release is incomplete until the factory host updates both its base checkout and its pinned installed Pipeline engine, passes role-aware doctor smoke, and records the new engine on the next run.
+- A bootstrap supervisor is not self-building if its release version, candidate identity, or FRG path is fixed to the first release. Prove two consecutive releases: the first installed engine must supply the candidate-native release seam for the second without manual wrapper or config replacement.
+- When the operator asks to rebase all milestones, assign every open issue to one explicit SemVer release milestone. Do not replace later milestones with theme-only backlog labels unless the operator asks for a rolling horizon.
+- After the operator approves a small startup path, freeze that boundary. Do not turn later review findings into new architecture unless they block the approved path, and report the remaining gate count before adding work.

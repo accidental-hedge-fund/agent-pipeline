@@ -720,14 +720,44 @@ export function buildCmd(): Command {
   return cmd;
 }
 
-/** Derives a deterministic run id for an explicit issue-number selector
- *  (`--range` or a bare issue list) — the only selector the in-repo compiler
- *  below resolves without a GitHub query. Stable across repeated invocations
- *  of the same list so a second `pipeline loop 100 101` naturally resumes the
- *  same run instead of creating a duplicate. */
+/** Derives a deterministic run id from a resolved issue-number list. Stable
+ *  across repeated invocations of the same resolved list so a second run
+ *  naturally resumes instead of creating a duplicate. Selector provenance is
+ *  stored separately on the immutable contract. */
 export function workListRunId(repo: string, engine: LoopEngine, issues: readonly string[]): string {
   const hash = crypto.createHash("sha256").update(`${repo}:${engine}:${issues.join(",")}`).digest("hex").slice(0, 16);
   return `loop-${hash}`;
+}
+
+/** Return the selector identity that is stored after a selector resolves to an
+ * issue list. Work-list values use the resolved list so range and explicit-list
+ * callers keep their existing canonical contract shape. */
+export function resolvedContractSelector(
+  sourceSelector: LoopSelector | undefined,
+  issues: readonly string[],
+): LoopSelector {
+  return sourceSelector
+    ? sourceSelector.type === "work-list"
+      ? { type: "work-list", value: [...issues] }
+      : { ...sourceSelector }
+    : { type: "work-list", value: [...issues] };
+}
+
+/** Canonical run ids predate selector provenance and are based on the resolved
+ * issue list. Refuse silent reuse when another selector produced the same list;
+ * an explicit terminal `--new-run` can then mint the corrected contract. */
+export function canonicalSelectorMatches(
+  existing: LoopSelector,
+  sourceSelector: LoopSelector | undefined,
+  issues: readonly string[],
+): boolean {
+  const requested = resolvedContractSelector(sourceSelector, issues);
+  if (existing.type !== requested.type) return false;
+  if (existing.type === "work-list" && requested.type === "work-list") {
+    return existing.value.length === requested.value.length &&
+      existing.value.every((value, index) => value === requested.value[index]);
+  }
+  return existing.value === requested.value;
 }
 
 /** Compiles a `LoopContractInit` + seeded `LoopLedger` for an already-resolved
@@ -745,13 +775,20 @@ export function compileWorkListRun(
   issues: readonly string[],
   runId: string,
   rawItems?: readonly RawContractItem[],
+  sourceSelector?: LoopSelector,
 ): { contract: import("./loop/recovery.ts").LoopContractInit; ledger: LoopLedger } {
+  // Resolution turns every selector into an issue list for dependency
+  // discovery. Keep the normalized source selector on the immutable contract;
+  // otherwise a label/milestone FRG pack becomes indistinguishable from an
+  // ad-hoc work list after fresh compilation. Callers that supply only a list
+  // retain the existing work-list contract shape.
+  const contractSelector = resolvedContractSelector(sourceSelector, issues);
   const contract: import("./loop/recovery.ts").LoopContractInit = {
     schema: LOOP_CONTRACT_SCHEMA,
     run_id: runId,
     engine,
     repo: { name: cfg.repo, base_branch: cfg.base_branch },
-    selector: { type: "work-list", value: issues },
+    selector: contractSelector,
     objective: `advance ${issues.join(", ")} to pipeline:ready-to-deploy`,
     worktree_policy: "default",
     done_definition: "pipeline:ready-to-deploy",
@@ -798,9 +835,10 @@ export async function compileWorkListRunFresh(
   issues: readonly string[],
   runId: string,
   discoverDeps: WorkListDependencyDiscoverDeps = realWorkListDependencyDiscoverDeps(cfg),
+  sourceSelector?: LoopSelector,
 ): Promise<{ contract: import("./loop/recovery.ts").LoopContractInit; ledger: LoopLedger }> {
   const rawItems = await discoverDeclaredDependencies(issues, discoverDeps);
-  return compileWorkListRun(cfg, engine, issues, runId, rawItems);
+  return compileWorkListRun(cfg, engine, issues, runId, rawItems, sourceSelector);
 }
 
 /** The real `pipeline/loop-execution@1` dispatch seam: runs the per-item
@@ -2029,6 +2067,25 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     const canonicalRunId = workListRunId(cfg.repo, input.engine, issues);
 
     const canonicalExists = await loopRunExists(store, canonicalRunId);
+    if (canonicalExists && !input.newRun) {
+      let existingContract: Awaited<ReturnType<typeof readContract>>;
+      try {
+        existingContract = await readContract(store, canonicalRunId);
+      } catch (err) {
+        return {
+          kind: "error",
+          message: `canonical run selector check failed: ${(err as Error).message}`,
+        };
+      }
+      if (!canonicalSelectorMatches(existingContract.selector, input.selector, issues)) {
+        return {
+          kind: "error",
+          message:
+            `canonical run "${canonicalRunId}" was created by another selector and cannot be ` +
+            "silently reused; stop the existing run if needed, then use --new-run to preserve the requested selector",
+        };
+      }
+    }
     if (input.newRun || (input.autoSupersedeTerminal && canonicalExists)) {
       if (!canonicalExists) {
         return {
@@ -2077,7 +2134,14 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
         if (repair.plan.initNewRun) {
           let compiled: Awaited<ReturnType<typeof compileWorkListRunFresh>>;
           try {
-            compiled = await compileWorkListRunFresh(cfg, input.engine, issues, newRunId, discoverDeps);
+            compiled = await compileWorkListRunFresh(
+              cfg,
+              input.engine,
+              issues,
+              newRunId,
+              discoverDeps,
+              input.selector,
+            );
           } catch (err) {
             return {
               kind: "error",
@@ -2098,7 +2162,14 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
       if (!canonicalExists) {
         let compiled: Awaited<ReturnType<typeof compileWorkListRunFresh>>;
         try {
-          compiled = await compileWorkListRunFresh(cfg, input.engine, issues, runId, discoverDeps);
+          compiled = await compileWorkListRunFresh(
+            cfg,
+            input.engine,
+            issues,
+            runId,
+            discoverDeps,
+            input.selector,
+          );
         } catch (err) {
           return {
             kind: "error",
@@ -2323,7 +2394,7 @@ export function renderLoopDriveResult(
   const outstandingReady = result.stop?.outstanding_ready ?? [];
   if (outstandingReady.length > 0) {
     console.error(
-      `${commandLabel}: stopped with ${outstandingReady.length} item(s) stranded at ready-to-deploy, awaiting human merge: ${outstandingReady.join(", ")}`,
+      `${commandLabel}: stopped with ${outstandingReady.length} item(s) at ready-to-deploy, awaiting an operator-authorized merge: ${outstandingReady.join(", ")}`,
     );
   }
 
@@ -3211,7 +3282,7 @@ async function main(): Promise<void> {
       process.exitCode = 2;
       return;
     }
-    // #499 review-2 finding 34d10c78: the manual command is human-only —
+    // #499 review-2 finding 34d10c78: the command is operator-authorized —
     // `retry`/`repair` are reserved for the Pipeline-owned recovery and
     // repair paths (which derive actor_kind: "pipeline"); accepting them here
     // would let an operator record a manual correction that misattributes
@@ -3410,6 +3481,9 @@ async function main(): Promise<void> {
       let recoveryAggregates:
         | import("./factory-reliability-gate.ts").FrgRecoveryAggregates
         | undefined;
+      let packProvenance:
+        | import("./frg-pack-observations.ts").FrgPackProvenance
+        | undefined;
       if (opts.observations) {
         const obsPath = path.resolve(repoDir, opts.observations as string);
         const text = await fsPromises.readFile(obsPath, "utf8");
@@ -3418,6 +3492,7 @@ async function main(): Promise<void> {
         compositionOverrides = obs.composition;
         falseHumanAuthorityCount = obs.false_human_authority_count;
         recoveryAggregates = obs.recovery_aggregates;
+        packProvenance = obs.pack_provenance;
       }
       const scenarioTokens: string[] = Array.isArray(opts.scenario)
         ? (opts.scenario as string[])
@@ -3444,6 +3519,7 @@ async function main(): Promise<void> {
         compositionOverrides,
         falseHumanAuthorityCount,
         recoveryAggregates,
+        packProvenance,
         packCloseDeps: noClosePack
           ? undefined
           : {
@@ -4046,7 +4122,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Early merge-queue dispatch — human-gated sequential R2D merges + optional
+  // Early merge-queue dispatch — operator-authorized sequential R2D merges + optional
   // release-when-complete prepare (#676). Never tags/publishes/merges a release.
   if (isMergeQueueCommand) {
     if (!opts.milestone || String(opts.milestone).trim() === "") {

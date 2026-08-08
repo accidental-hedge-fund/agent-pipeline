@@ -1,4 +1,4 @@
-// Human-gated merge-queue drive with optional release-when-complete (#676)
+// Operator-authorized merge-queue drive with optional release-when-complete (#676)
 // and typed conflict/CI repair holds (#675).
 //
 // Walks selector-scoped pipeline:ready-to-deploy PRs one at a time through the
@@ -154,7 +154,7 @@ export interface MergeQueueDeps {
     candidateIssueNumbers: ReadonlySet<number>,
   ): Promise<MergeQueueNonCandidate[]>;
   /**
-   * Merge one candidate via the existing human merge surface.
+   * Merge one candidate via the existing operator-authorized merge surface.
    * On throw, the drive holds the item and continues.
    */
   mergeCandidate(candidate: MergeQueueCandidate): Promise<void>;

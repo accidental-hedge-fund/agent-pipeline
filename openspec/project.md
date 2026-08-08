@@ -25,7 +25,11 @@ from a single shared TypeScript core; the two hosts differ only by a JSON profil
   `{{placeholders}}`, opt-in/auto-detected config) over novel approaches.
 
 ## Out of scope
-- Unattended / autonomous merging of PRs — the advance loop stops at
-  `pipeline:ready-to-deploy`. Explicit operator commands (`pipeline merge`,
-  `merge-queue --apply`) may merge under session authority; no `auto_merge`
-  config key and no unattended merge path.
+- Repository-configured or advance-loop merging of PRs. `pipeline advance`,
+  `pipeline single`, and `pipeline loop` stop at `pipeline:ready-to-deploy`.
+  Loop-isolated commands (`pipeline merge`, `merge-queue --apply`) may merge
+  under direct operator authority. A disabled deployment wrapper may invoke an
+  allowed command only after it validates an authenticated, immutable, expiring
+  operator grant for the exact action. The wrapper, not Pipeline, validates the
+  grant. The grant is machine-local deployment state. No `auto_merge` config key
+  or merge stage exists.

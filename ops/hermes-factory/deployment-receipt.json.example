@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "host": "agent-box",
+  "created_at": "REPLACE_WITH_CANONICAL_UTC_TIME",
+  "hermes": {
+    "tag": "v2026.8.3",
+    "package_version": "0.20.0",
+    "git_commit": "3c27eb6234bf91b8ceee9e9071591b31e9b148cb",
+    "installer_sha256": "45f589461248c7a6ec3aecd7522a69dd49c5c8dbf4798ba1296af5c0c5e7ccd3"
+  },
+  "buzz": {
+    "tag": "v0.5.2",
+    "git_commit": "3e48f1b2365d326ee1c9582448d86a99b44ecd5d",
+    "binary_sha256": "REPLACE_WITH_AGENT_BOX_BINARY_SHA256"
+  },
+  "wrapper": {
+    "git_commit": "REPLACE_WITH_MERGED_898_COMMIT",
+    "manifest_sha256": "REPLACE_WITH_INSTALLED_WRAPPER_MANIFEST_SHA256"
+  },
+  "pipeline": {
+    "production_pin_file": "/home/mcomardo/.local/state/hermes-factory/production-engine-pin.json",
+    "production_version_at_start": "1.31.1",
+    "production_launcher": [
+      "/usr/bin/node",
+      "/home/mcomardo/.codex/skills/pipeline/scripts/pipeline.mjs"
+    ],
+    "bootstrap_base_git_sha": "REPLACE_WITH_STARTING_MAIN_COMMIT",
+    "integrated_candidate_git_sha": "REPLACE_AFTER_ISSUE_TRAIN",
+    "candidate_version": "1.32.0",
+    "candidate_launcher": [
+      "/usr/bin/node",
+      "--experimental-strip-types",
+      "/home/mcomardo/dev/agent-pipeline-factory-control/core/scripts/pipeline.ts"
+    ]
+  },
+  "calibration": {
+    "profile_path": "/home/mcomardo/.hermes/profiles/pipeline-factory",
+    "scope_check_sha256": "REPLACE_WITH_SCOPE_CHECK_OUTPUT_SHA256",
+    "frg_key_challenge": "REPLACE_WITH_PUBLIC_CHALLENGE",
+    "frg_key_hmac_sha256": "REPLACE_WITH_MATCHED_NON_SECRET_HMAC",
+    "github_actions_run_url": "REPLACE_WITH_CHALLENGE_RUN_URL"
+  }
+}

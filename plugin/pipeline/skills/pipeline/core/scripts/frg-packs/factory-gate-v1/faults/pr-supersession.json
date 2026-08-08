@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "recipe_id": "pr-supersession",
+  "summary": "Create a controlled stale pull-request candidate and prove that the configured close policy leaves one current pull request.",
+  "steps": [
+    {
+      "id": "create-stale-candidate",
+      "action": "Record two pull-request identities for one synthetic issue with different heads."
+    },
+    {
+      "id": "observe-close",
+      "action": "Run supersession handling and record that only the current pull request remains open."
+    }
+  ],
+  "required_evidence": [
+    { "kind": "action-result", "minimum": 2 },
+    { "kind": "pipeline-events", "minimum": 1 },
+    { "kind": "github-observation", "minimum": 2 }
+  ],
+  "scenario_outputs": [
+    { "id": "pr-supersession" }
+  ],
+  "composition_outputs": []
+}

@@ -72,6 +72,77 @@ pipeline doctor
 | **A. Hermetic** | Every PR that can break composition; always in `npm test` / `npm run ci` | Fake-deps composition tests for capacity, resume, OpenSpec archive coherence, lockfold, docs parity, supersede_mode, auto-tag FRG guard |
 | **B. Live** | **Every release** (patch / minor / major) | Multi-item durable `pipeline:loop` against a **representative** fixed scenario pack; immutable evidence artifact |
 
+### v1.33.0 hybrid pilot boundary
+
+The current CLI has no safe production switch for controlled process death, forge 5xx,
+CI red-to-green, stale pull-request creation, or forced recoverable outcomes. Do not add
+an unsafe public injection switch only to run this release.
+
+For v1.33.0 only, `factory-gate-v1` uses this fixed hybrid rule:
+
+- The live candidate loop must contain exactly the two fresh manifest issues.
+- Both issues must reach ready-to-deploy with real pull requests, exact heads, and green checks.
+- At least one final pull-request tree must prove the real OpenSpec path.
+- The live ledger must prove clean throughput and blocker taxonomy.
+- Only the closed `pilot_probes` list in the manifest may prove the remaining unsafe fault classes.
+- Each probe must run its exact named test on the same clean candidate commit. It must pass,
+  must not skip, and must retain a hash of the actual TAP output.
+- Evidence must label each proof as `live`, `ledger`, `derived`, or `layer_a`.
+- The FRG HMAC must bind the release, candidate commit, manifest hash, loop run, exact issue
+  set, and proof digests.
+- A Layer A probe is not a live fault injection. Reports must not describe it as one.
+- The runner accepts no caller-written pass, status, metric, or evidence receipt.
+
+This rule expires after v1.33.0. In v1.34.0, #890 and #891 land before #908 and #909.
+Issue #908 owns the durable replacement, real live fault seams, and this exact
+candidate-native prepare interface:
+
+```text
+pipeline factory-release prepare --request <absolute-request.json> --json
+```
+
+This is an idempotent two-call protocol. The first call runs without the FRG
+credential and returns `awaiting_frg_attestation` with unsigned artifact
+identities and digests. The wrapper submits those closed artifacts to the fixed
+trusted attestor. The second call uses the unchanged request and returns
+`complete` with one exact release pull request. Repeated calls must reconcile
+the same checkpoint without another pack, attestation, branch, or pull request.
+
+Any later release must fail closed until that replacement or another reviewed policy is
+present. It must not reuse static bootstrap-base or candidate-version config as release
+evidence. The two-release integration test must start from the verified v1.33.0 pin,
+prepare and install v1.34.0 through the candidate interface, and prove that the next grant
+uses v1.34.0 without a wrapper or config replacement.
+
+### Factory attestation boundary
+
+The factory does not place the FRG key or its path in the candidate
+environment, inherited file descriptors, the candidate-action cgroup's
+credential mount, a request, a result, an error, a log, or a notice. The
+existing scorer unit runs only a fixed wrapper-local trusted attestor. It starts
+no child process, uses no network, and does not import or execute candidate code
+or other request-selected code.
+
+The request contains only versioned identity fields, closed data paths under
+fixed allowed roots, and expected digests. It contains no executable path,
+module, command, network target, pass claim, or candidate-selected signer. The
+attestor independently reads the evidence, verifies the digests, computes the
+policy result, and returns only the bounded attestation.
+
+For v1.33.0, the scorer uses the policy snapshot pinned with #898. For later
+releases, it uses the signer from the verified current production engine. It
+stops if the request schema, evidence schema, signer, or policy is unsupported.
+It never imports a signer from candidate code. Tests must prove no automatic
+key or key-path propagation through the candidate environment, inherited file
+descriptors, candidate-action cgroup credential mount, request, or result; no
+candidate import or execution by the attestor; request-selected import and
+network denial; and secret redaction in errors, logs, and notices.
+
+The pilot accepts that `mcomardo` and passwordless sudo have broad local
+authority. A malicious same-user process can read or control local resources.
+These process controls do not provide privilege separation. Issues #618, #899,
+or later hardening own that boundary.
+
 ## Numeric thresholds (bootstrap / provisional)
 
 | Key | Symbol | Value | Meaning |
@@ -207,8 +278,11 @@ Integrity fingerprints are recomputed on parse; a minimal forged `{ "pass": true
 
 - Env / secret: `PIPELINE_FRG_ATTESTATION_KEY` (same value as repo Actions secret used by
   `auto-tag-release.yml`).
-- Mint: export the key before `pipeline factory-gate …` so `integrity.attestation` is written
-  (`alg: hmac-sha256-v1`, hex MAC over version/run_id/loop_run_id/pack_id + fingerprints).
+- Direct trusted operator use may export the key before `pipeline factory-gate …` so
+  `integrity.attestation` is written. The scoped factory candidate must never use this path;
+  its fixed scorer unit owns attestation.
+- Mint: trusted code writes the attestation (`alg: hmac-sha256-v1`, hex MAC over
+  version/run_id/loop_run_id/pack_id + fingerprints).
 - Without the key, the driver will **not** mint release-eligible `pass: true`.
 - Auto-tag verifies the MAC with the secret; self-consistent hand-authored JSON that only
   recomputes public fingerprints is **rejected** (fail closed, no tag).

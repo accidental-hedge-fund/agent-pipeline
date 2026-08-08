@@ -134,14 +134,14 @@ export const OPERATION_SURFACE = [
   },
   {
     name: "merge",
-    desc: "Human-only squash merge of a ready-to-deploy PR",
+    desc: "Operator-authorized squash merge of a ready-to-deploy PR",
     argHint: "<pr>",
     cliArgs: "merge $ARGUMENTS",
     fast: true,
   },
   {
     name: "merge-queue",
-    desc: "Human-gated sequential merge of ready-to-deploy PRs; optional prepare-only release-when-complete",
+    desc: "Operator-authorized sequential merge of ready-to-deploy PRs; dry-run by default; optional prepare-only release-when-complete",
     argHint: "--milestone <title> [--apply] [--release-when-complete --release-version <v>]",
     cliArgs: "merge-queue $ARGUMENTS",
     fast: false,

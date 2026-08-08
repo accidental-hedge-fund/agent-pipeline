@@ -129,13 +129,13 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     section: "factory",
   },
   merge: {
-    summary: "Human-only squash merge of a ready-to-deploy PR (never called by the advance loop)",
+    summary: "Operator-authorized squash merge of a ready-to-deploy PR (never called by the advance loop)",
     usage: "merge <pr>",
     documented: true,
     section: "lifecycle",
   },
   "merge-queue": {
-    summary: "Human-gated sequential merge of ready-to-deploy PRs; optional prepare-only release-when-complete",
+    summary: "Operator-authorized sequential merge of ready-to-deploy PRs; dry-run by default; optional prepare-only release-when-complete",
     usage: "merge-queue --milestone <m> [--apply] [--release-when-complete --release-version <ver>]",
     documented: true,
     section: "lifecycle",

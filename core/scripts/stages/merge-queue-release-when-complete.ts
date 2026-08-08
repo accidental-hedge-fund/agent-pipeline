@@ -1,4 +1,4 @@
-// Opt-in release-when-complete for the human-gated merge queue (#676).
+// Opt-in release-when-complete for the operator-authorized merge queue (#676).
 //
 // After a merge-queue drive finishes, operators may ask the tool to prepare
 // the next release PR (version bump, ROADMAP, mirror) for human review — never
@@ -264,7 +264,7 @@ export async function maybePrepareReleaseWhenComplete(
     // runRelease itself does not tag, publish, or merge the release PR.
     await deps.runRelease(version, { noEdit: true }, releaseCfg);
     deps.log(
-      `[merge-queue] release prepare succeeded for ${version} — release PR is open for human review`,
+      `[merge-queue] release prepare succeeded for ${version} — release PR is open for separate authorized finalization`,
     );
     return {
       status: "prepared",
