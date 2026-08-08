@@ -560,20 +560,26 @@ function isErrorSource(v: unknown): v is { __error: string } {
   );
 }
 
-/** Strip anything that looks like a secret/canary/prompt from error messages. */
+/**
+ * Public error codes only. Reader-provided free text (secrets, prompts,
+ * issue/reason payloads) MUST NOT appear in remote status or error output.
+ */
+export const ALLOWED_PUBLIC_ERROR_CODES = new Set([
+  "status_assembly_failed",
+  "primary_source_unavailable",
+  "heartbeat_persistence_failed",
+  "source_read_failed",
+]);
+
+/**
+ * Map failures to a small allowlisted error-code set for the public status
+ * contract. Never pass through arbitrary reader or exception text.
+ */
 export function sanitizeErrorMessage(msg: unknown): string {
   if (typeof msg !== "string" || msg.length === 0) return "status_assembly_failed";
-  // Drop secret-looking tokens and instruction-like free text.
-  let s = msg.replace(/CANARY_SECRET_\w+/g, "[redacted]");
-  s = s.replace(/Bearer\s+\S+/gi, "Bearer [redacted]");
-  s = s.replace(/sk-[A-Za-z0-9_-]{8,}/g, "[redacted]");
-  s = s.replace(/secret:\/\/\S+/gi, "[redacted]");
-  // Instruction-like payloads must never ride through error strings.
-  s = s.replace(/ignore\s+previous\s+instructions[\s\S]{0,200}/gi, "[redacted]");
-  s = s.replace(/exfiltrate\s+\w+/gi, "[redacted]");
-  // Cap length so residual free text cannot carry full prompts.
-  if (s.length > 120) s = s.slice(0, 120) + "…";
-  return s;
+  const trimmed = msg.trim();
+  if (ALLOWED_PUBLIC_ERROR_CODES.has(trimmed)) return trimmed;
+  return "status_assembly_failed";
 }
 
 // ---------------------------------------------------------------------------
@@ -898,15 +904,9 @@ export function assembleFactoryStatus(opts: AssembleFactoryStatusOptions): Facto
   );
 
   // Hard error only when every primary reader failed (not merely absent).
+  // Public contract: allowlisted code only — never reader __error free text.
   if (!hasPrimary && primaryErrors && !loop && !proc && !macro) {
-    const errKey = (["loopStatus", "processIdentity", "macroController"] as const).find((k) =>
-      isErrorSource(sources[k]),
-    );
-    const errMsg =
-      errKey && isErrorSource(sources[errKey])
-        ? sources[errKey].__error
-        : "primary_source_unavailable";
-    return assembleFactoryStatus({ ...opts, forceError: errMsg });
+    return assembleFactoryStatus({ ...opts, forceError: "primary_source_unavailable" });
   }
 
   // Controller identity
@@ -1381,10 +1381,12 @@ export function startIndependentHeartbeat(deps: IndependentHeartbeatDeps): Indep
         lastWriteError = null;
         deps.setRecord(next);
       } catch (err) {
+        // Keep full detail in-memory for local diagnostics only; public/status
+        // projection and process-record field use an allowlisted code.
         lastWriteError = err instanceof Error ? err.message : String(err);
         const failed = {
           ...base,
-          heartbeat_write_error: sanitizeErrorMessage(lastWriteError),
+          heartbeat_write_error: "heartbeat_persistence_failed",
         };
         deps.setRecord(failed as import("./loop/types.ts").LoopSupervisorProcess);
         // Do not claim healthy liveness after a failed write.
