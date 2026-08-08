@@ -29,8 +29,8 @@ models: # current Grok factory roles use exactly grok-4.5; no Grok fallback is c
   implementing: grok-4.5 # implementer harness
   review: gpt-5.6-terra # reviewer harness
   fix: grok-4.5 # implementer harness
-#   intake: sonnet # intake spec-generation — always the claude harness (never inert)
-#   sweep: sonnet # sweep spec-generation — always the claude harness (never inert)
+  intake: grok-4.5 # implementer harness; explicit so doctor smoke never inherits a non-Grok default
+  sweep: grok-4.5 # implementer harness; explicit so doctor smoke never inherits a non-Grok default
 
 effort: # per-phase reasoning effort — passed through each resolved harness adapter (#366, #608).
   planning: high # implementer harness — also sources plan-review's effort (Adversarial/Definitive)
