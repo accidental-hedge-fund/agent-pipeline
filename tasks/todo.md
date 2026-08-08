@@ -1,5 +1,14 @@
 # Scoped autonomous Hermes/Buzz factory
 
+## Bootstrap compatibility correction
+
+- [x] Reproduce the live v1.33.0 grant startup failure without changing an issue or PR.
+- [x] Read the external production pin without depending on the installed Pipeline JSON argument guard.
+- [x] Keep pin promotion and rollback compatible with the pinned v1.31.1 CLI.
+- [x] Add regressions for abbreviated pin identity and mutation command compatibility.
+- [x] Run the factory tests and full repository CI.
+- [ ] Deploy an exact, hashed correction and resume the admitted grant.
+
 ## Plan
 
 - [x] Create a fresh task worktree from `origin/main`.
@@ -33,3 +42,5 @@
   grant example omitted the required milestone. The example now includes the milestone, and a
   regression test parses and validates the actual shipped envelope. `npm run ci:ops` passes 119/119.
 - Pull request #912 opened from commit `0c73aca0`; its required GitHub CI job passed in 2m38s.
+- Live Buzz verification on 2026-08-08 proved the repeated three-minute messages were Hermes terminal wait timers, not Pipeline events. The deployed skill now starts the factory service with `systemctl --user start --no-block`, and the gateway was restarted to stop the old turn.
+- Bootstrap correction verification on 2026-08-08: focused controller tests passed 28/28, `npm run ci:ops` passed 122/122, and full `npm run ci` passed.
