@@ -142,6 +142,19 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: true,
   },
 
+  // Factory aggregate status (#891): pure allowlisted read model over controller
+  // + durable loop/pin/provider evidence. Never mutates GitHub, git, ledger,
+  // lock ownership, service control, or run artifacts.
+  // Invoked as `pipeline factory status` or `pipeline factory-status`.
+  "factory-status": {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile", "json", "runId"]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
   intake: {
     needsIssueNumber: false,
     allowedFlags: new Set(["repoPath", "base", "dryRun", "description", "release"]),

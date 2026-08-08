@@ -18,6 +18,7 @@ import {
   type LoopContract,
   type DurableBlockerClass,
   type LoopEngineName,
+  type LoopExpectedWaitKind,
   type LoopItemLedgerEntry,
   type LoopLedger,
   type LoopPreconditionExclusion,
@@ -25,6 +26,10 @@ import {
   type LoopSupervisorProcess,
   type RecoveryRecipe,
 } from "./types.ts";
+import {
+  DEFAULT_INDEPENDENT_HEARTBEAT_MS,
+  startIndependentHeartbeat,
+} from "../factory-status.ts";
 import {
   acquireLock,
   appendActionEvidence,
@@ -151,6 +156,11 @@ export const DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT = 5;
  *  watchdog or a terminal condition. */
 const MAX_CYCLES_SAFETY = 10_000;
 
+/** Default deadline for an in-flight whole-item `dispatch_item` operation (#891).
+ *  Stuck classification requires an explicit deadline; this bound is recorded when
+ *  dispatch starts so long work is not misread as un-deadline'd. */
+export const DEFAULT_DISPATCH_OPERATION_DEADLINE_MS = 2 * 60 * 60 * 1000;
+
 // ---------------------------------------------------------------------------
 // Injected seam.
 // ---------------------------------------------------------------------------
@@ -186,6 +196,32 @@ export interface SupervisorDeps {
    *  deadline is eligible. Never called from the item recovery path while a
    *  dependency-independent sibling remains schedulable. */
   recoverySleep?(ms: number): Promise<void>;
+  /**
+   * #891: optional controller process mutator for operation/wait evidence and
+   * composition with independent heartbeat. Production `driveSupervisor` wires
+   * this from the live process-identity record; unit tests may inject a fake.
+   */
+  markControllerOperation?(fields: {
+    current_operation?: string | null;
+    operation_started_at?: string | null;
+    operation_deadline?: string | null;
+    expected_wait_kind?: LoopExpectedWaitKind | null;
+    expected_wait_deadline?: string | null;
+    last_durable_progress_at?: string | null;
+    clear_operation?: boolean;
+    clear_wait?: boolean;
+  }): Promise<void>;
+  /**
+   * #891: independent heartbeat interval override (ms). When omitted, production
+   * uses {@link DEFAULT_INDEPENDENT_HEARTBEAT_MS}. Injectable for unit tests.
+   */
+  independentHeartbeatMs?: number;
+  /**
+   * #891: sleep used by the independent heartbeat only. Defaults to wall-clock
+   * `setTimeout` — never shares `recoverySleep`, so recovery-backoff accounting
+   * and tests stay independent of the liveness cadence.
+   */
+  independentHeartbeatSleep?(ms: number): Promise<void>;
   /**
    * Host-local live-advance probe (#770). When omitted, production uses
    * {@link probeLiveAdvance} against the per-issue lock path, freshness-bounded
@@ -1824,6 +1860,22 @@ export async function runSupervisorCycle(
       };
 
       try {
+        // #891: record an explicitly started dispatch operation with deadline so
+        // factory health can distinguish long live work from wedges.
+        if (deps.markControllerOperation) {
+          const startedAt = deps.store.now();
+          await deps.markControllerOperation({
+            current_operation: "dispatch_item",
+            operation_started_at: startedAt.toISOString(),
+            operation_deadline: new Date(
+              startedAt.getTime() + DEFAULT_DISPATCH_OPERATION_DEADLINE_MS,
+            ).toISOString(),
+            expected_wait_kind: "dispatch",
+            expected_wait_deadline: new Date(
+              startedAt.getTime() + DEFAULT_DISPATCH_OPERATION_DEADLINE_MS,
+            ).toISOString(),
+          }).catch(() => {});
+        }
         const response = await deps.dispatchItem(buildRequest(itemId), {
           onAdvanceLinked: async (linkage) => {
             startLinkage = linkage;
@@ -1873,6 +1925,13 @@ export async function runSupervisorCycle(
             startObserver();
           },
         });
+        if (deps.markControllerOperation) {
+          await deps.markControllerOperation({
+            clear_operation: true,
+            clear_wait: true,
+            last_durable_progress_at: deps.store.now().toISOString(),
+          }).catch(() => {});
+        }
         await stopMirror();
         stopObserve = true;
         await observePromise.catch(() => {});
@@ -1893,6 +1952,12 @@ export async function runSupervisorCycle(
         }).catch(() => {});
         return response;
       } catch (err) {
+        if (deps.markControllerOperation) {
+          await deps.markControllerOperation({
+            clear_operation: true,
+            clear_wait: true,
+          }).catch(() => {});
+        }
         await stopMirror();
         stopObserve = true;
         await observePromise.catch(() => {});
@@ -2566,6 +2631,82 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
   const limit = input.consecutiveNoProgressLimit ?? contract.consecutive_no_progress_limit ?? DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT;
   const cyclesSafetyCap = input.maxCyclesSafety ?? MAX_CYCLES_SAFETY;
 
+  // #891: independent controller heartbeat advances on a bounded cadence during
+  // long dispatch / wait / recovery without requiring model/worker messages.
+  // Stops after lock release or terminal exit (driving=false in finally).
+  let driving = true;
+  const markControllerOperation = async (fields: {
+    current_operation?: string | null;
+    operation_started_at?: string | null;
+    operation_deadline?: string | null;
+    expected_wait_kind?: LoopExpectedWaitKind | null;
+    expected_wait_deadline?: string | null;
+    last_durable_progress_at?: string | null;
+    clear_operation?: boolean;
+    clear_wait?: boolean;
+  }): Promise<void> => {
+    if (!driving) return;
+    const next: LoopSupervisorProcess = { ...record };
+    if (fields.clear_operation) {
+      next.current_operation = null;
+      next.operation_started_at = null;
+      next.operation_deadline = null;
+    } else {
+      if (fields.current_operation !== undefined) next.current_operation = fields.current_operation;
+      if (fields.operation_started_at !== undefined) next.operation_started_at = fields.operation_started_at;
+      if (fields.operation_deadline !== undefined) next.operation_deadline = fields.operation_deadline;
+    }
+    if (fields.clear_wait) {
+      next.expected_wait_kind = null;
+      next.expected_wait_deadline = null;
+    } else {
+      if (fields.expected_wait_kind !== undefined) next.expected_wait_kind = fields.expected_wait_kind;
+      if (fields.expected_wait_deadline !== undefined) next.expected_wait_deadline = fields.expected_wait_deadline;
+    }
+    if (fields.last_durable_progress_at !== undefined) {
+      next.last_durable_progress_at = fields.last_durable_progress_at;
+    }
+    next.heartbeat_at = deps.store.now().toISOString();
+    try {
+      delete next.heartbeat_write_error;
+      await writeSupervisorProcess(deps.store, next, token);
+      record = next;
+    } catch (err) {
+      const failed = {
+        ...record,
+        heartbeat_write_error:
+          err instanceof Error ? err.message.slice(0, 200) : "heartbeat_write_failed",
+      };
+      record = failed;
+      throw err;
+    }
+  };
+
+  const cycleDeps: SupervisorDeps = {
+    ...deps,
+    markControllerOperation: deps.markControllerOperation ?? markControllerOperation,
+  };
+
+  // Heartbeat sleep is independent of recoverySleep: recovery backoff tests and
+  // production recovery timing must not share a channel with liveness cadence.
+  // Default is wall-clock setTimeout; inject independentHeartbeatSleep only in tests.
+  const hbSleep =
+    deps.independentHeartbeatSleep ??
+    ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const hb = startIndependentHeartbeat({
+    writeProcess: async (r) => {
+      await writeSupervisorProcess(deps.store, r, token);
+    },
+    now: () => deps.store.now(),
+    sleep: hbSleep,
+    intervalMs: deps.independentHeartbeatMs ?? DEFAULT_INDEPENDENT_HEARTBEAT_MS,
+    getRecord: () => record,
+    setRecord: (r) => {
+      record = r;
+    },
+    shouldContinue: () => driving,
+  });
+
   try {
     await appendEvent(deps.store, input.runId, token, "loop_drive_started", {
       drive_id: record.boot_id,
@@ -2608,14 +2749,27 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
 
     while (cycles < cyclesSafetyCap) {
       cycles++;
-      const result = await runSupervisorCycle(deps, input.runId, token, input.engine);
+      const result = await runSupervisorCycle(cycleDeps, input.runId, token, input.engine);
 
       record = {
         ...record,
         heartbeat_at: deps.store.now().toISOString(),
         consecutive_no_progress: result.progress ? 0 : record.consecutive_no_progress + 1,
+        ...(result.progress
+          ? { last_durable_progress_at: deps.store.now().toISOString() }
+          : {}),
       };
-      await writeSupervisorProcess(deps.store, record, token);
+      try {
+        delete record.heartbeat_write_error;
+        await writeSupervisorProcess(deps.store, record, token);
+      } catch (err) {
+        record = {
+          ...record,
+          heartbeat_write_error:
+            err instanceof Error ? err.message.slice(0, 200) : "heartbeat_write_failed",
+        };
+        // Surface persistence failure on the in-memory record; do not pretend healthy.
+      }
 
       if (result.stop) {
         stop = result.stop;
@@ -2646,14 +2800,34 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
         // within bounded latency, while API pressure stays 12x below the
         // pre-#787 5s re-poll. If the deadline is still ahead on re-entry the
         // cycle returns a fresh retryAfterMs and the next stretch is slept.
+        //
+        // #891: also record expected recovery_backoff wait so factory health
+        // classifies this as healthy waiting, not stuck.
+        const backoffDeadline = new Date(
+          deps.store.now().getTime() + Math.min(result.retryAfterMs, 60_000),
+        ).toISOString();
+        await markControllerOperation({
+          expected_wait_kind: "recovery_backoff",
+          expected_wait_deadline: backoffDeadline,
+        }).catch(() => {});
         let remainingMs = Math.min(result.retryAfterMs, 60_000);
         while (remainingMs > 0) {
           const chunk = Math.min(remainingMs, 5_000);
           await deps.recoverySleep(chunk);
           remainingMs -= chunk;
           record = { ...record, heartbeat_at: deps.store.now().toISOString() };
-          await writeSupervisorProcess(deps.store, record, token);
+          try {
+            delete record.heartbeat_write_error;
+            await writeSupervisorProcess(deps.store, record, token);
+          } catch (err) {
+            record = {
+              ...record,
+              heartbeat_write_error:
+                err instanceof Error ? err.message.slice(0, 200) : "heartbeat_write_failed",
+            };
+          }
         }
+        await markControllerOperation({ clear_wait: true }).catch(() => {});
       }
 
       if (record.consecutive_no_progress >= limit) {
@@ -2765,6 +2939,10 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
     }
     return result;
   } finally {
+    // #891: stop independent heartbeat before lock release so no further writes
+    // claim a fresh healthy heartbeat after terminal exit / lock loss.
+    driving = false;
+    await hb.stop();
     await releaseLock(deps.store, input.runId, token);
   }
 }

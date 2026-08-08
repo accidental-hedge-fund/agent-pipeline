@@ -858,11 +858,23 @@ export class LoopError extends Error {
 // loop/supervisor.ts and openspec/changes/in-repo-loop-supervisor/design.md.
 // ---------------------------------------------------------------------------
 
+/** Expected wait kinds recorded on process identity for factory health (#891).
+ *  Optional on the record for legacy-safe load of pre-#891 supervisor.json. */
+export type LoopExpectedWaitKind =
+  | "ci"
+  | "provider_cooldown"
+  | "recovery_backoff"
+  | "dependency"
+  | "capacity"
+  | "human"
+  | "dispatch";
+
 /** A durable process-identity record — distinct from {@link LoopLockRecord}
  *  (design.md decision 1): the lock answers "who may write"; this record
  *  answers "who is driving right now and is it still alive and progressing."
  *  Written at attach and refreshed every cycle through the store's injected
- *  seam. */
+ *  seam. Optional operation / independent-heartbeat fields (#891) are
+ *  legacy-safe: older records without them still load. */
 export interface LoopSupervisorProcess {
   run_id: string;
   engine: LoopEngineName;
@@ -878,6 +890,28 @@ export interface LoopSupervisorProcess {
   /** The run-level watchdog's current consecutive-no-progress count — reset
    *  to 0 on any progress cycle (design.md decision 2/3). */
   consecutive_no_progress: number;
+  /**
+   * Optional (#891): identity of the currently started controller operation
+   * (e.g. `dispatch_item`). Absent on legacy records → factory status attributes
+   * operation as unknown/legacy.
+   */
+  current_operation?: string | null;
+  /** ISO-8601 when {@link current_operation} was started. */
+  operation_started_at?: string | null;
+  /** ISO-8601 deadline for the current operation (stuck classification input). */
+  operation_deadline?: string | null;
+  /** Optional expected wait kind while the controller is intentionally idle. */
+  expected_wait_kind?: LoopExpectedWaitKind | null;
+  /** ISO-8601 deadline for the expected wait (healthy waiting while before it). */
+  expected_wait_deadline?: string | null;
+  /** Last durable progress timestamp observed by the controller. */
+  last_durable_progress_at?: string | null;
+  /**
+   * When set, the last independent heartbeat persistence attempt failed.
+   * Factory health must surface this as non-healthy rather than claiming a
+   * fresh durable heartbeat.
+   */
+  heartbeat_write_error?: string | null;
 }
 
 export const LOOP_SUPERVISOR_ACTIONS = [
