@@ -123,6 +123,22 @@ function normalizedPin(value, name) {
   return { version: value.version, tag: value.tag, git_sha: value.git_sha };
 }
 
+export function validateProductionPinRecord(value, resolvedGitSha) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    value.schema_version !== 1 ||
+    !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value.version ?? "") ||
+    value.tag !== `v${value.version}` ||
+    !/^[a-f0-9]{7,64}$/i.test(value.git_sha ?? "") ||
+    !validOid(resolvedGitSha) ||
+    !resolvedGitSha.toLowerCase().startsWith(value.git_sha.toLowerCase())
+  ) {
+    throw new FactoryStop("pin-invalid", "the current production pin is missing or invalid");
+  }
+  return { version: value.version, tag: value.tag, git_sha: resolvedGitSha };
+}
+
 function samePin(left, right) {
   return left.version === right.version && left.tag === right.tag && left.git_sha === right.git_sha;
 }
@@ -2428,23 +2444,51 @@ export class FactoryController {
   }
 
   async readProductionPin({ compensationPin = null } = {}) {
-    const args = [
+    const record = await this.readJson(this.config.production_pin_file, "production engine pin");
+    const tagArgs = ["rev-parse", `refs/tags/${record.tag}^{}`];
+    const tagResult = compensationPin
+      ? await this.compensationProcess(
+        compensationPin,
+        this.config.git_command,
+        tagArgs,
+        { cwd: this.config.repo_dir, envRole: "git" },
+      )
+      : await this.git(tagArgs);
+    const resolvedGitSha = requireSuccess(
+      tagResult,
+      "production pin tag resolution",
+      [],
+      { definitive: true },
+    ).stdout.trim();
+    return validateProductionPinRecord(record, resolvedGitSha);
+  }
+
+  factoryPinPromoteArgs(version, gitSha) {
+    return [
       "factory-pin",
-      "show",
-      "--json",
+      "promote",
+      "--for",
+      version,
+      "--git-sha",
+      gitSha,
       "--repo-path",
       this.config.repo_dir,
       "--profile",
       this.config.profile,
     ];
-    const result = compensationPin
-      ? await this.compensationPipeline(compensationPin, args)
-      : await this.pipeline(args);
-    const data = parseJson(requireSuccess(result, "pipeline factory-pin show", [], { definitive: true }).stdout, "factory pin");
-    if (data.kind !== "ok" || !data.pin?.version || !data.pin?.tag || !validOid(data.pin?.git_sha)) {
-      throw new FactoryStop("pin-invalid", "the current production pin is missing or invalid");
-    }
-    return data.pin;
+  }
+
+  factoryPinRollbackArgs(version) {
+    return [
+      "factory-pin",
+      "rollback",
+      "--to",
+      version,
+      "--repo-path",
+      this.config.repo_dir,
+      "--profile",
+      this.config.profile,
+    ];
   }
 
   async promotePin(publication, previousPin) {
@@ -2478,19 +2522,7 @@ export class FactoryController {
           actionId,
           "pin-promote",
           this.config.pipeline_command[0],
-          this.pipelineArgs([
-            "factory-pin",
-            "promote",
-            "--for",
-            version,
-            "--git-sha",
-            publication.merge_oid,
-            "--json",
-            "--repo-path",
-            this.config.repo_dir,
-            "--profile",
-            this.config.profile,
-          ]),
+          this.pipelineArgs(this.factoryPinPromoteArgs(version, publication.merge_oid)),
         );
         requireSuccess(result, "pipeline factory-pin promote", [], { definitive: true });
       },
@@ -2608,15 +2640,7 @@ export class FactoryController {
           this.config.node_command,
           [
             this.compensationPipelineEntrypoint(target),
-            "factory-pin",
-            "rollback",
-            "--to",
-            previousPin.version,
-            "--json",
-            "--repo-path",
-            this.config.repo_dir,
-            "--profile",
-            this.config.profile,
+            ...this.factoryPinRollbackArgs(previousPin.version),
           ],
         );
         requireSuccess(pinResult, "pipeline factory-pin rollback", [], { definitive: true });

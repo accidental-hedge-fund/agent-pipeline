@@ -52,3 +52,5 @@
 - A bootstrap supervisor is not self-building if its release version, candidate identity, or FRG path is fixed to the first release. Prove two consecutive releases: the first installed engine must supply the candidate-native release seam for the second without manual wrapper or config replacement.
 - When the operator asks to rebase all milestones, assign every open issue to one explicit SemVer release milestone. Do not replace later milestones with theme-only backlog labels unless the operator asks for a rolling horizon.
 - After the operator approves a small startup path, freeze that boundary. Do not turn later review findings into new architecture unless they block the approved path, and report the remaining gate count before adding work.
+- Live factory calibration must use the exact pinned Pipeline command and the exact Buzz channel-and-thread target. A nearby smoke test does not prove the deployed command shape.
+- A chat command that starts a long systemd unit must use a nonblocking start. The factory controller owns progress messages; the Hermes tool turn must return after admission instead of emitting terminal wait timers.

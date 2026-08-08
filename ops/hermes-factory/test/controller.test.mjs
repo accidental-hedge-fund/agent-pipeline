@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { FactoryController, FactoryStop } from "../lib/controller.mjs";
+import { FactoryController, FactoryStop, validateProductionPinRecord } from "../lib/controller.mjs";
 import { CommandError } from "../lib/runtime.mjs";
 import { durableCommandPaths, durableUnitName } from "../lib/durable-command.mjs";
 import { admittedJournal, config, fail, NOW, ok } from "./helpers.mjs";
@@ -57,6 +57,52 @@ function recordPromotion(harness, previousPin, mergeOid = "2".repeat(40)) {
     result: { version: harness.grant.grant.release_version, tag: `v${harness.grant.grant.release_version}`, git_sha: mergeOid },
   };
 }
+
+test("production pin reads the machine file and expands its verified tag commit", async () => {
+  const harness = await controllerHarness();
+  const resolved = "f".repeat(40);
+  harness.fs.files.set(harness.machine.production_pin_file, JSON.stringify({
+    schema_version: 1,
+    version: "1.31.1",
+    tag: "v1.31.1",
+    git_sha: resolved.slice(0, 10),
+  }));
+  harness.controller.pipeline = async () => {
+    throw new Error("the installed Pipeline CLI must not be used to read the pin");
+  };
+  harness.controller.git = async (args) => {
+    assert.deepEqual(args, ["rev-parse", "refs/tags/v1.31.1^{}"]);
+    return ok(`${resolved}\n`);
+  };
+
+  assert.deepEqual(await harness.controller.readProductionPin(), {
+    version: "1.31.1",
+    tag: "v1.31.1",
+    git_sha: resolved,
+  });
+});
+
+test("production pin rejects an abbreviated commit that does not match the tag", () => {
+  assert.throws(
+    () => validateProductionPinRecord({
+      schema_version: 1,
+      version: "1.31.1",
+      tag: "v1.31.1",
+      git_sha: "a".repeat(10),
+    }, "b".repeat(40)),
+    /production pin is missing or invalid/,
+  );
+});
+
+test("pin mutation commands stay compatible with the pinned v1.31.1 CLI", async () => {
+  const harness = await controllerHarness();
+  const promote = harness.controller.factoryPinPromoteArgs("1.33.0", "c".repeat(40));
+  const rollback = harness.controller.factoryPinRollbackArgs("1.31.1");
+  assert.deepEqual(promote.slice(0, 4), ["factory-pin", "promote", "--for", "1.33.0"]);
+  assert.deepEqual(rollback.slice(0, 4), ["factory-pin", "rollback", "--to", "1.31.1"]);
+  assert.equal(promote.includes("--json"), false);
+  assert.equal(rollback.includes("--json"), false);
+});
 
 async function authorityLossCompensationHarness({ getStopReason, now }) {
   const previous = { version: "1.32.0", tag: "v1.32.0", git_sha: "1".repeat(40) };
@@ -120,6 +166,10 @@ async function authorityLossCompensationHarness({ getStopReason, now }) {
     },
   });
   harnessFs = harness.fs;
+  harnessFs.files.set(harness.machine.production_pin_file, JSON.stringify({
+    schema_version: 1,
+    ...previous,
+  }));
   recordPromotion(harness, previous);
   return {
     ...harness,
