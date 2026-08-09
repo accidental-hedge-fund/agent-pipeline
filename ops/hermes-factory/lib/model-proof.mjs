@@ -4,6 +4,7 @@ import { envForRole } from "./config.mjs";
 import { requireSuccess, runProcess } from "./runtime.mjs";
 
 export const REQUIRED_EFFECTIVE_GROK_MODEL = "grok-4.5";
+const GROK_45_TELEMETRY_IDS = new Set([REQUIRED_EFFECTIVE_GROK_MODEL, "grok-4.5-build"]);
 
 export function parseEffectiveGrokModel(stdout) {
   let terminal = null;
@@ -20,10 +21,10 @@ export function parseEffectiveGrokModel(stdout) {
   if (models.length !== 1) {
     throw new Error(`Grok terminal telemetry reported ${models.length} effective models`);
   }
-  if (models[0] !== REQUIRED_EFFECTIVE_GROK_MODEL) {
+  if (!GROK_45_TELEMETRY_IDS.has(models[0])) {
     throw new Error(`Grok effective model is ${models[0]}, expected ${REQUIRED_EFFECTIVE_GROK_MODEL}`);
   }
-  return models[0];
+  return REQUIRED_EFFECTIVE_GROK_MODEL;
 }
 
 export async function probeEffectiveGrokModel(
