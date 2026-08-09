@@ -243,6 +243,7 @@ test("resolveProductionPin: pin authority can differ from target product repo", 
   const fromProduct = await resolveProductionPin({
     repoDir: productDir,
     readTextFile,
+    env: {},
   });
   assert.equal(fromProduct.kind, "missing");
 
@@ -257,6 +258,7 @@ test("resolveProductionPin: pin authority can differ from target product repo", 
   const fromAuthority = await resolveProductionPin({
     repoDir: authority.dir,
     readTextFile,
+    env: {},
   });
   assert.equal(fromAuthority.kind, "ok");
   if (fromAuthority.kind === "ok") {

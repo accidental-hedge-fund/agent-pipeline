@@ -33,7 +33,27 @@ import {
   type CliOpts,
   type PreflightCliDeps,
 } from "../scripts/pipeline.ts";
+import {
+  FACTORY_CONTROL_DIR_ENV,
+  PRODUCTION_PIN_ENV,
+} from "../scripts/production-engine-pin.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+
+/** Clear host pin-authority env so unit tests stay hermetic under a live factory. */
+function withoutHostPinAuthorityEnv<T>(fn: () => T | Promise<T>): Promise<T> {
+  const savedPin = process.env[PRODUCTION_PIN_ENV];
+  const savedControl = process.env[FACTORY_CONTROL_DIR_ENV];
+  delete process.env[PRODUCTION_PIN_ENV];
+  delete process.env[FACTORY_CONTROL_DIR_ENV];
+  return Promise.resolve()
+    .then(() => fn())
+    .finally(() => {
+      if (savedPin === undefined) delete process.env[PRODUCTION_PIN_ENV];
+      else process.env[PRODUCTION_PIN_ENV] = savedPin;
+      if (savedControl === undefined) delete process.env[FACTORY_CONTROL_DIR_ENV];
+      else process.env[FACTORY_CONTROL_DIR_ENV] = savedControl;
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1335,17 +1355,19 @@ test("check install:engine-track — missing pin under pinned intent → fail wi
 test("check install:engine-track — product pinned without factory authority → fail", async () => {
   // Explicit pinned on a product target without factory-control dir or pin path
   // must not treat a product-local pin as production authority.
-  const r = await getCheck(
-    makeConfig({ engine_track: "pinned" }),
-    "install:engine-track",
-    "1.29.1",
-  ).run(engineTrackDeps(pinJson("1.29.1"), {}, "1.29.1"));
-  assert.equal(r.status, "fail");
-  assert.match(r.detail, /authority|non-factory|not configured/i);
-  assert.match(
-    r.remediation!,
-    /AGENT_PIPELINE_FACTORY_CONTROL|production_engine_pin_path|AGENT_PIPELINE_PRODUCTION_PIN/,
-  );
+  await withoutHostPinAuthorityEnv(async () => {
+    const r = await getCheck(
+      makeConfig({ engine_track: "pinned" }),
+      "install:engine-track",
+      "1.29.1",
+    ).run(engineTrackDeps(pinJson("1.29.1"), {}, "1.29.1"));
+    assert.equal(r.status, "fail");
+    assert.match(r.detail, /authority|non-factory|not configured/i);
+    assert.match(
+      r.remediation!,
+      /AGENT_PIPELINE_FACTORY_CONTROL|production_engine_pin_path|AGENT_PIPELINE_PRODUCTION_PIN/,
+    );
+  });
 });
 
 test("check install:engine-track — product pinned with pin path override uses override", async () => {
@@ -1390,14 +1412,16 @@ test("check install:engine-track — factory control repo defaults to pinned enf
 
 test("check install:engine-track — candidate intent with mismatch does not fail for mismatch alone", async () => {
   // Candidate without factory authority: pin not loaded from product target.
-  const cfg = makeConfig({ engine_track: "candidate" });
-  const r = await getCheck(cfg, "install:engine-track", "1.30.0").run(
-    engineTrackDeps(pinJson("1.29.1"), {}, null),
-  );
-  assert.equal(r.status, "pass");
-  assert.match(r.detail, /candidate/);
-  // Product-local pin must not be treated as authority without control/override.
-  assert.match(r.detail, /pin absent|absent/i);
+  await withoutHostPinAuthorityEnv(async () => {
+    const cfg = makeConfig({ engine_track: "candidate" });
+    const r = await getCheck(cfg, "install:engine-track", "1.30.0").run(
+      engineTrackDeps(pinJson("1.29.1"), {}, null),
+    );
+    assert.equal(r.status, "pass");
+    assert.match(r.detail, /candidate/);
+    // Product-local pin must not be treated as authority without control/override.
+    assert.match(r.detail, /pin absent|absent/i);
+  });
 });
 
 test("check install:engine-track — additive stable id alongside coherence and freshness", () => {

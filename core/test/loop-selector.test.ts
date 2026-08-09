@@ -352,14 +352,22 @@ test("realDispatchItem publishes start linkage only after store becomes ready mi
         const ee = new EventEmitter() as ChildProcess;
         queueMicrotask(() => {
           ee.emit("spawn");
-          // Store appears mid-wait (after spawn, before exit).
+          // Store appears mid-wait (after spawn, before exit). Exit only after
+          // start linkage is observed (or a generous deadline) so full-suite
+          // timer load cannot race the 5ms poll past a fixed 40ms exit.
           setTimeout(() => {
             storeReady = true;
+            const deadline = Date.now() + 250;
+            const waitForLinkage = () => {
+              if (linked.length === 1 || Date.now() >= deadline) {
+                sawStartBeforeExit = linked.length === 1;
+                ee.emit("exit", 0, null);
+                return;
+              }
+              setTimeout(waitForLinkage, 5);
+            };
+            setTimeout(waitForLinkage, 5);
           }, 15);
-          setTimeout(() => {
-            sawStartBeforeExit = linked.length === 1;
-            ee.emit("exit", 0, null);
-          }, 40);
         });
         return ee;
       }) as typeof import("node:child_process").spawn,

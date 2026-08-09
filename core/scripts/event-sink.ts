@@ -92,7 +92,14 @@ async function defaultDeliver(command: string, line: string): Promise<void> {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      // Defer kill: write()+end() can both queue async stdin errors on the same
+      // tick. Killing/destroying immediately drops the error listener so the
+      // second queued emit becomes an uncaughtException (Node test runner and
+      // long-lived hosts). The listener must still be attached for any already
+      // queued error events; kill on the next tick after they drain.
+      process.nextTick(() => {
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      });
       reject(err);
     });
 
@@ -107,7 +114,9 @@ async function defaultDeliver(command: string, line: string): Promise<void> {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      process.nextTick(() => {
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      });
       reject(err instanceof Error ? err : new Error(String(err)));
     }
   });
