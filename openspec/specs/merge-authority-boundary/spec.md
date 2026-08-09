@@ -6,9 +6,7 @@ Defines the product boundary between autonomous advance (stop at ready-to-deploy
 and loop-isolated operator-authorized merge surfaces. The repository does not ship
 a Hermes/Buzz grant factory; external supervisors may only compose the same merge
 commands an operator would run.
-
 ## Requirements
-
 ### Requirement: Public product positioning SHALL state autonomous-through-ready-to-deploy with operator-owned merge
 
 Operator-facing product docs (at minimum the repository `README.md` front-door summary and the host skill entry summaries under `hosts/*/SKILL.md`) SHALL describe Agent Pipeline as autonomous from issue intake through a green, current, mergeable `pipeline:ready-to-deploy` result. They SHALL state that ordinary merging requires explicit session-bound operator authority via loop-isolated commands. They MAY document that external supervisors can compose those commands. They SHALL NOT document a shipped Hermes/Buzz grant factory control plane as a product requirement. They SHALL NOT imply that the ordinary advance path merges or deploys, or that repository configuration can enable unattended merge.
@@ -80,3 +78,26 @@ The test suite SHALL continue to enforce that `mergePr` (and merge-queue plan/dr
 - **WHEN** an advance-path stage handler file imports the merge module for the purpose of merging during a stage transition
 - **THEN** the loop-isolation unit test SHALL fail
 - **AND** the human-gated `merge.ts` / `merge-queue.ts` modules themselves MAY remain excluded from that import scan
+
+### Requirement: Integrated train merge mode SHALL be a loop-isolated operator surface
+
+Operator-facing product docs and golden-rule conventions SHALL name `pipeline train --merge` as an explicit, loop-isolated merge orchestration surface in the same class as `pipeline merge` and `pipeline merge-queue --apply`. Invoking train merge mode SHALL NOT make merge reachable from `pipeline advance` stage dispatch. Repository configuration SHALL NOT enable train merge mode via an `auto_merge` key or equivalent.
+
+#### Scenario: Docs list train merge with other non-advance merge surfaces
+
+- **WHEN** README and host skill policy text describe merge surfaces
+- **THEN** they SHALL include `pipeline train --merge` as opt-in and explicit
+- **AND** they SHALL state that default advance and default loop still stop at ready-to-deploy
+
+#### Scenario: Golden rule forbids auto_merge and still allows train
+
+- **WHEN** CLAUDE.md and AGENTS.md golden-rule merge text is read
+- **THEN** they SHALL forbid an `auto_merge` config key and a merge stage
+- **AND** they SHALL allow loop-isolated `pipeline train --merge` as an operator-invoked surface
+
+#### Scenario: Advance isolation tests still pass
+
+- **WHEN** the isolation test suite scans advance dispatch and stage handlers
+- **THEN** those paths SHALL remain free of merge mutations
+- **AND** the train command module MAY call the merge surface without failing the advance isolation scan
+

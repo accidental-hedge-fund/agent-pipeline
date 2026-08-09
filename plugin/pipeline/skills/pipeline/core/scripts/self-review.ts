@@ -1,4 +1,4 @@
-// Same-harness self-review fallback (#39).
+// Same-harness self-review fallback (#39) + auto entitlement model retry (#870).
 //
 // The pipeline's value is cross-harness review: one harness implements, the
 // *other* reviews it. But if the configured reviewer CLI is not installed or
@@ -10,9 +10,16 @@
 //
 // Trigger is precise: only a `spawn_error` (the CLI could not be spawned at all,
 // see harness.ts) falls back. A reviewer that ran but timed out or exited
-// nonzero is a genuine failure and is returned as-is for the caller to block on.
+// nonzero is a genuine failure and is returned as-is for the caller to block on
+// — except for #870 auto-sourced Claude Fable entitlement refusals, which get
+// exactly one allowlisted in-process retry with `sonnet` (explicit models never
+// rewrite).
 
 import { invoke, type HarnessResult, type InvokeOptions } from "./harness.ts";
+import {
+  AUTO_ENTITLEMENT_FALLBACK_MODEL,
+  shouldRetryAutoEntitlementFallback,
+} from "./model-entitlement.ts";
 import { resolveReviewerModelForHarness } from "./stage-routing.ts";
 import type { Harness } from "./types.ts";
 
@@ -26,6 +33,12 @@ export interface ReviewerInvocation {
   /** True when the configured cross-harness reviewer was unavailable and the
    *  implementing harness reviewed its own work instead. */
   selfReview: boolean;
+  /** True when #870 auto entitlement fallback rewrote the model to sonnet. */
+  entitlementFallback?: boolean;
+  /** Model requested on the first attempt (before entitlement rewrite). */
+  preferredModel?: string | undefined;
+  /** Model actually used for the result returned to the caller. */
+  resolvedModel?: string | undefined;
 }
 
 /**
@@ -65,7 +78,55 @@ export async function invokeReviewer(
   inv: typeof invoke = invoke,
 ): Promise<ReviewerInvocation> {
   const primaryModel = resolveReviewerModelForHarness(opts.model, reviewer, !!opts.modelWasAuto);
-  const result = await inv(reviewer, worktreeDir, prompt, { ...opts, model: primaryModel });
+  const primaryAccounting =
+    opts.accounting !== undefined
+      ? {
+          ...opts.accounting,
+          model: opts.accounting.model ?? primaryModel ?? null,
+        }
+      : undefined;
+  const result = await inv(reviewer, worktreeDir, prompt, {
+    ...opts,
+    model: primaryModel,
+    accounting: primaryAccounting,
+  });
+
+  // #870: auto-sourced Claude reviewer + Fable usage-credit entitlement → one
+  // allowlisted retry with sonnet. Explicit models never rewrite. Ordinary
+  // throttle without entitlement text does not rewrite either.
+  if (
+    shouldRetryAutoEntitlementFallback({
+      reviewerHarness: reviewer,
+      modelWasAuto: !!opts.modelWasAuto,
+      preferredModel: primaryModel,
+      result,
+    })
+  ) {
+    const fallbackAccounting =
+      opts.accounting !== undefined
+        ? {
+            ...opts.accounting,
+            model: AUTO_ENTITLEMENT_FALLBACK_MODEL,
+            fallback: true as const,
+          }
+        : undefined;
+    const fallbackResult = await inv(reviewer, worktreeDir, prompt, {
+      ...opts,
+      model: AUTO_ENTITLEMENT_FALLBACK_MODEL,
+      // Retry is an explicit allowlisted model, not auto expansion.
+      modelWasAuto: false,
+      accounting: fallbackAccounting,
+    });
+    return {
+      result: fallbackResult,
+      effectiveReviewer: reviewer,
+      selfReview: false,
+      entitlementFallback: true,
+      preferredModel: primaryModel,
+      resolvedModel: AUTO_ENTITLEMENT_FALLBACK_MODEL,
+    };
+  }
+
   if (result.spawn_error && reviewer !== implementer) {
     const configuredReviewerStderr = result.stderr;
     const fallbackModel = resolveReviewerModelForHarness(opts.model, implementer, !!opts.modelWasAuto);
@@ -86,11 +147,84 @@ export async function invokeReviewer(
         result: { ...fallback, success: false, stderr: mergedStderr },
         effectiveReviewer: implementer,
         selfReview: true,
+        preferredModel: primaryModel,
+        resolvedModel: fallbackModel,
       };
     }
-    return { result: fallback, effectiveReviewer: implementer, selfReview: true };
+    return {
+      result: fallback,
+      effectiveReviewer: implementer,
+      selfReview: true,
+      preferredModel: primaryModel,
+      resolvedModel: fallbackModel,
+    };
   }
-  return { result, effectiveReviewer: reviewer, selfReview: false };
+  return {
+    result,
+    effectiveReviewer: reviewer,
+    selfReview: false,
+    preferredModel: primaryModel,
+    resolvedModel: primaryModel,
+  };
+}
+
+/**
+ * Invoke a Claude reviewer once, with the same auto entitlement allowlisted
+ * retry used by {@link invokeReviewer}. Used by design-gate (which does not go
+ * through the same-harness self-review path) so unstructured `models.review: auto`
+ * shares one recovery contract with plan-review / review rounds (#870).
+ */
+export async function invokeClaudeReviewerWithEntitlementFallback(
+  worktreeDir: string,
+  prompt: string,
+  opts: InvokeOptions = {},
+  inv: typeof invoke = invoke,
+): Promise<{ result: HarnessResult; entitlementFallback: boolean; preferredModel?: string; resolvedModel?: string }> {
+  const primaryModel = opts.model;
+  const primaryAccounting =
+    opts.accounting !== undefined
+      ? { ...opts.accounting, model: opts.accounting.model ?? primaryModel ?? null }
+      : undefined;
+  const result = await inv("claude", worktreeDir, prompt, {
+    ...opts,
+    model: primaryModel,
+    accounting: primaryAccounting,
+  });
+  if (
+    shouldRetryAutoEntitlementFallback({
+      reviewerHarness: "claude",
+      modelWasAuto: !!opts.modelWasAuto,
+      preferredModel: primaryModel,
+      result,
+    })
+  ) {
+    const fallbackAccounting =
+      opts.accounting !== undefined
+        ? {
+            ...opts.accounting,
+            model: AUTO_ENTITLEMENT_FALLBACK_MODEL,
+            fallback: true as const,
+          }
+        : undefined;
+    const fallbackResult = await inv("claude", worktreeDir, prompt, {
+      ...opts,
+      model: AUTO_ENTITLEMENT_FALLBACK_MODEL,
+      modelWasAuto: false,
+      accounting: fallbackAccounting,
+    });
+    return {
+      result: fallbackResult,
+      entitlementFallback: true,
+      preferredModel: primaryModel,
+      resolvedModel: AUTO_ENTITLEMENT_FALLBACK_MODEL,
+    };
+  }
+  return {
+    result,
+    entitlementFallback: false,
+    preferredModel: primaryModel,
+    resolvedModel: primaryModel,
+  };
 }
 
 /**

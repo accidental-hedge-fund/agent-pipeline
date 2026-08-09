@@ -372,6 +372,11 @@ export interface InvokeOptions {
     estimatedCostUsd?: number | null;
     /** Optional role for the treatment fingerprint (#778). Null/absent = unknown. */
     role?: AdapterRole | null;
+    /**
+     * When true, records `fallback: true` on the stage accounting record (#870
+     * auto entitlement retry to sonnet). Overrides adapter-reported null when set.
+     */
+    fallback?: boolean | null;
   };
   /**
    * Injectable version-probe deps (#778). Tests pass fakes; production uses
@@ -700,12 +705,17 @@ export async function invoke(
       adapter: treatment?.adapter ?? null,
       adapterCliVersion: treatment?.cliVersion ?? null,
       providerAuthClass: treatment?.providerAuthClass ?? null,
-      requestedModel: treatment?.requestedModel ?? null,
+      requestedModel: treatment?.requestedModel ?? opts.accounting.model ?? opts.model ?? null,
       resolvedModel: treatment?.resolvedModel ?? null,
       requestedEffort: treatment?.requestedEffort ?? null,
       resolvedEffort: treatment?.resolvedEffort ?? null,
       nativeFlags: treatment?.nativeFlags ?? null,
-      fallback: treatment?.fallback ?? null,
+      // #870: call-site entitlement fallback sets accounting.fallback; adapters
+      // still report null when they cannot observe provider fallback.
+      fallback:
+        typeof opts.accounting.fallback === "boolean"
+          ? opts.accounting.fallback
+          : (treatment?.fallback ?? null),
       throttled: treatment?.throttled ?? null,
       terminationReason: outcome,
       treatmentFingerprint: fingerprint,

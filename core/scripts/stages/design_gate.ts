@@ -59,6 +59,17 @@ import {
   buildDesignResponsePrompt,
 } from "../prompts/index.ts";
 import { recordDesignInterrogation } from "../evidence-bundle.ts";
+import { invokeClaudeReviewerWithEntitlementFallback } from "../self-review.ts";
+import {
+  expandAutoEffort,
+  resolveReviewerModelForHarness,
+  reviewerModelSourceWasAuto,
+} from "../stage-routing.ts";
+import {
+  classifyReviewerHarnessFailure,
+  isClaudeModelEntitlementFailure,
+} from "../model-entitlement.ts";
+import { buildStageDiagnostic, type StageDiagnostic } from "../stage-diagnostic.ts";
 import { extractPlan } from "./review-acquisition.ts";
 import { attestPipelineComment, diffFilePaths } from "./review-parsing.ts";
 import type {
@@ -115,6 +126,53 @@ export interface AdvanceDesignGateOpts {
 
 function isHarnessUnavailable(result: HarnessResult): boolean {
   return !result.success && (result.spawn_error === true || result.timed_out);
+}
+
+/**
+ * Reviewer invoke failures that must short-circuit before verdict parse / re-ask
+ * (#870). Entitlement and ordinary throttle are first-class; other unsuccessful
+ * harness results are also typed via {@link classifyReviewerHarnessFailure}.
+ * Successful responses that are merely malformed still take the bounded re-ask path.
+ */
+function isReviewerInvocationFailure(result: HarnessResult): boolean {
+  if (isClaudeModelEntitlementFailure(result.stdout, result.stderr, result)) return true;
+  if (result.throttled) return true;
+  if (isHarnessUnavailable(result)) return true;
+  return !result.success;
+}
+
+function reviewerInvocationFailureBlock(
+  result: HarnessResult,
+  reviewerHarness: string,
+  roundNum: number,
+): { blocked: string; diagnostic: StageDiagnostic } {
+  const reasonCode = classifyReviewerHarnessFailure(result);
+  const excerpt = `${result.stderr || result.stdout}`.trim().slice(0, 400);
+  let blocked: string;
+  if (isHarnessUnavailable(result)) {
+    blocked = `reviewer harness (${reviewerHarness}) unavailable during interrogation round ${roundNum}`;
+  } else if (reasonCode === "model-entitlement-required") {
+    blocked =
+      `reviewer model entitlement failure during interrogation round ${roundNum}` +
+      (excerpt ? `: ${excerpt}` : "");
+  } else if (reasonCode === "transient-infra") {
+    blocked =
+      `reviewer harness throttled during interrogation round ${roundNum}` +
+      (excerpt ? `: ${excerpt}` : "");
+  } else if (reasonCode === "harness-timeout") {
+    blocked = `reviewer harness timed out during interrogation round ${roundNum}`;
+  } else {
+    blocked =
+      `reviewer harness (${reviewerHarness}) failed during interrogation round ${roundNum}` +
+      (excerpt ? `: ${excerpt}` : "");
+  }
+  const diagnostic = buildStageDiagnostic({
+    reasonCode,
+    blockerKind: "harness-failure",
+    reason: blocked,
+    stage: "design-gate",
+  });
+  return { blocked, diagnostic };
 }
 
 /**
@@ -318,21 +376,70 @@ export async function advanceDesignGate(
   const plan = extractPlan(issue.comments);
   const implementerHarness = cfg.harnesses.implementer;
   const reviewerHarness = cfg.harnesses.reviewer;
+  // Shared reviewer model chain (#870): structured review_harness.model when set,
+  // else models.review after auto expansion / resolveReviewerModelForHarness.
+  // Never leave model undefined under auto so Claude does not inherit a host
+  // Fable default by omitting --model.
+  const reviewerModelWasAuto = reviewerModelSourceWasAuto(cfg, undefined);
+  const resolvedReviewerModel = resolveReviewerModelForHarness(
+    cfg.harnesses.reviewerModel ?? cfg.models.review,
+    reviewerHarness,
+    reviewerModelWasAuto,
+  );
+  const resolvedReviewerEffort =
+    expandAutoEffort(
+      cfg.harnesses.reviewerEffort ?? cfg.effort?.review,
+      "review-2",
+      "claude",
+    ) ?? cfg.harnesses.reviewerEffort;
   if (!state.reviewerIdentity) {
     state.reviewerIdentity = {
       harness: reviewerHarness,
-      model: cfg.harnesses.reviewerModel,
-      effort: cfg.harnesses.reviewerEffort,
+      model: resolvedReviewerModel,
+      effort: resolvedReviewerEffort,
       independence: reviewerHarness === implementerHarness ? "same-harness-fallback" : "independent",
+    };
+  } else if (
+    // Prior gate comments may have decoded null/empty model under unstructured auto.
+    (!state.reviewerIdentity.model || state.reviewerIdentity.model === "") &&
+    reviewerModelWasAuto
+  ) {
+    state.reviewerIdentity = {
+      ...state.reviewerIdentity,
+      harness: state.reviewerIdentity.harness || reviewerHarness,
+      model: resolvedReviewerModel,
+      effort: state.reviewerIdentity.effort ?? resolvedReviewerEffort,
     };
   }
 
-  async function blockAndReturn(reason: string): Promise<Outcome> {
+  async function blockAndReturn(
+    reason: string,
+    opts?: { diagnostic?: StageDiagnostic; blockerKind?: BlockerKind },
+  ): Promise<Outcome> {
     state.outcome = "blocked";
     await postCommentFn(cfg, issueNumber, buildDesignGateComment(state, reason)).catch(() => {});
+    // Literal blocker kinds keep the escalation inventory drift-guard honest
+    // (dynamic variables become site_id …:dynamic#N).
+    if (opts?.blockerKind === "harness-failure") {
+      await setBlockedFn(cfg, issueNumber, `design-gate: ${reason}`, "design-gate", "harness-failure");
+      await record(state);
+      return {
+        advanced: false,
+        status: "blocked",
+        reason,
+        blockerKind: "harness-failure",
+        ...(opts.diagnostic ? { diagnostic: opts.diagnostic } : {}),
+      };
+    }
     await setBlockedFn(cfg, issueNumber, `design-gate: ${reason}`, "design-gate", "design-gate-failed");
     await record(state);
-    return { advanced: false, status: "blocked", reason, blockerKind: "design-gate-failed" };
+    return {
+      advanced: false,
+      status: "blocked",
+      reason,
+      blockerKind: "design-gate-failed",
+      ...(opts?.diagnostic ? { diagnostic: opts.diagnostic } : {}),
+    };
   }
 
   // Step 1: obtain a validated, bounded, redacted decision record if we don't have one yet.
@@ -383,34 +490,57 @@ export async function advanceDesignGate(
 
   const policy = { block_threshold: cfg.design_gate.block_threshold, min_confidence: cfg.design_gate.min_confidence };
 
+  async function invokeReviewerRound(prompt: string): Promise<HarnessResult> {
+    const model = state.reviewerIdentity?.model;
+    const effort = state.reviewerIdentity?.effort;
+    const invokeOpts: InvokeOptions = {
+      timeoutSec: cfg.review_timeout,
+      model,
+      reasoningEffort: effort,
+      modelWasAuto: reviewerModelWasAuto,
+    };
+    // #870: share auto entitlement allowlisted retry with plan-review when
+    // the effective reviewer is claude and the model originated from auto.
+    if (reviewerHarness === "claude") {
+      const { result, entitlementFallback, resolvedModel } =
+        await invokeClaudeReviewerWithEntitlementFallback(wt.path, prompt, invokeOpts, invokeFn);
+      if (entitlementFallback && resolvedModel && state.reviewerIdentity) {
+        // Record the successful fallback model on identity for later rounds /
+        // evidence, without mutating config-load auto preference.
+        state.reviewerIdentity = { ...state.reviewerIdentity, model: resolvedModel };
+      }
+      return result;
+    }
+    return invokeFn(reviewerHarness, wt.path, prompt, invokeOpts);
+  }
+
   async function getVerdict(
     roundNum: number,
     priorRound: DesignGateRound | null,
-  ): Promise<{ round: DesignGateRound } | { blocked: string }> {
+  ): Promise<
+    | { round: DesignGateRound }
+    | { blocked: string; diagnostic?: StageDiagnostic }
+  > {
     const prompt = buildDesignInterrogationPrompt({
       body: issue.body,
       plan,
       decisionRecordJson: decisionRecordJson(state),
       priorDispositions: priorRound ? formatPriorDispositions(priorRound) : undefined,
     });
-    let result = await invokeFn(reviewerHarness, wt.path, prompt, {
-      timeoutSec: cfg.review_timeout,
-      model: state.reviewerIdentity?.model,
-      reasoningEffort: state.reviewerIdentity?.effort,
-    });
-    if (isHarnessUnavailable(result)) {
-      return { blocked: `reviewer harness (${reviewerHarness}) unavailable during interrogation round ${roundNum}` };
+    let result = await invokeReviewerRound(prompt);
+    // Invocation failures (entitlement, throttle, spawn, timeout, non-success)
+    // are first-class typed outcomes — never parse as verdicts or consume re-ask (#870).
+    if (isReviewerInvocationFailure(result)) {
+      return reviewerInvocationFailureBlock(result, reviewerHarness, roundNum);
     }
     let verdict = parseDesignVerdict(result.stdout);
     if (!verdict) {
+      // Bounded re-ask is reserved for successful reviewer responses that are
+      // merely malformed — not for harness/throttle/entitlement failures.
       const reaskPrompt = `${prompt}\n\nYour previous response could not be parsed into a valid verdict. Return ONLY the valid JSON object described above — no other text.`;
-      result = await invokeFn(reviewerHarness, wt.path, reaskPrompt, {
-        timeoutSec: cfg.review_timeout,
-        model: state.reviewerIdentity?.model,
-        reasoningEffort: state.reviewerIdentity?.effort,
-      });
-      if (isHarnessUnavailable(result)) {
-        return { blocked: `reviewer harness (${reviewerHarness}) unavailable during interrogation round ${roundNum}` };
+      result = await invokeReviewerRound(reaskPrompt);
+      if (isReviewerInvocationFailure(result)) {
+        return reviewerInvocationFailureBlock(result, reviewerHarness, roundNum);
       }
       verdict = parseDesignVerdict(result.stdout);
     }
@@ -460,7 +590,14 @@ export async function advanceDesignGate(
   // Step 2: bounded interrogation/response loop.
   if (state.rounds.length === 0) {
     const result = await getVerdict(1, null);
-    if ("blocked" in result) return blockAndReturn(result.blocked);
+    if ("blocked" in result) {
+      return blockAndReturn(
+        result.blocked,
+        result.diagnostic
+          ? { diagnostic: result.diagnostic, blockerKind: "harness-failure" }
+          : undefined,
+      );
+    }
     state.rounds.push(result.round);
     await postCommentFn(cfg, issueNumber, buildDesignGateComment(state, "Round 1 interrogation complete.")).catch(() => {});
   }
@@ -508,7 +645,14 @@ export async function advanceDesignGate(
     }
 
     const verdictResult = await getVerdict(current.round + 1, current);
-    if ("blocked" in verdictResult) return blockAndReturn(verdictResult.blocked);
+    if ("blocked" in verdictResult) {
+      return blockAndReturn(
+        verdictResult.blocked,
+        verdictResult.diagnostic
+          ? { diagnostic: verdictResult.diagnostic, blockerKind: "harness-failure" }
+          : undefined,
+      );
+    }
     const nextRound = verdictResult.round;
     const priorBlockingKeys = new Set(blocking.map((c) => c.challengeKey));
     const recurring = nextRound.challenges.filter((c) => c.blocking && priorBlockingKeys.has(c.challengeKey));
