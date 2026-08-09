@@ -50,3 +50,4 @@ Phase 1 OpenSpec: `openspec/changes/add-integrated-train-mode/`
 - Approved plan locked into `docs/factory-simplification-plan.md`.
 - Phase 1 OpenSpec artifacts created under `openspec/changes/add-integrated-train-mode/`.
 - Implementation not started in this session beyond planning artifacts.
+- PR: https://github.com/accidental-hedge-fund/agent-pipeline/pull/920
