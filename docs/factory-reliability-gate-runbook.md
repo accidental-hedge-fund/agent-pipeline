@@ -279,7 +279,7 @@ Integrity fingerprints are recomputed on parse; a minimal forged `{ "pass": true
 - Env / secret: `PIPELINE_FRG_ATTESTATION_KEY` (same value as repo Actions secret used by
   `auto-tag-release.yml`).
 - Direct trusted operator use may export the key before `pipeline factory-gate …` so
-  `integrity.attestation` is written. The scoped factory candidate must never use this path;
+  `integrity.attestation` is written. A release candidate must never use this path;
   its fixed scorer unit owns attestation.
 - Mint: trusted code writes the attestation (`alg: hmac-sha256-v1`, hex MAC over
   version/run_id/loop_run_id/pack_id + fingerprints).

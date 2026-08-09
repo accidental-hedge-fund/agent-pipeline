@@ -24,11 +24,11 @@ conventions. Keep it in sync with `CLAUDE.md`.
    `pipeline loop` stop at `pipeline:ready-to-deploy` and never invoke a merge.
    Merging uses loop-isolated, operator-authorized commands only: `pipeline merge`
    per PR, or `pipeline merge-queue --apply` for a batch (`merge-queue` is dry-run
-   by default). A disabled-by-default deployment wrapper may act as the operator's
-   delegate only after the wrapper validates an authenticated, immutable, expiring
-   grant for the exact action. `pipeline merge` does not validate Buzz events or
-   deployment grants. The grant is machine-local deployment state, not repository
-   configuration. Do not add an `auto_merge` config key or a merge stage.
+   by default). External supervisors may invoke those same commands under operator
+   authority. This repository does not ship a Hermes/Buzz factory control plane,
+   grant schema, or second durable scheduler. Merge authority is not repository
+   configuration (`.github/pipeline.yml` cannot authorize merges). Do not add an
+   `auto_merge` config key or a merge stage.
 5. **Verify external shapes; never guess.** Confirm `gh --json` field names with
    a real call before coding against them.
 

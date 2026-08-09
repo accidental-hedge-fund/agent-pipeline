@@ -10,7 +10,7 @@ Operator-facing product documentation, host skill guidance, CLI help, status pro
 1. **Independent agent plan review** is evidence from the configured secondary reviewer. It is not human approval and is not same-harness fallback evidence.
 2. **Human feedback window** is an optional interval in which human comments can steer plan revision. It is not approval.
 3. **Human attestation** is provenance or capability evidence. It is not plan sign-off.
-4. **Human approval** or **human sign-off** is an affirmative human action that a control requires. It MAY be a direct per-action approval or one authenticated, immutable, expiring factory grant that names the later actions. A grant authorizes only its closed scope; it does not turn plan review into approval.
+4. **Human approval** or **human sign-off** is an affirmative human action that a control requires. It MAY be a direct per-action approval. Optional external supervisor automation does not turn plan review into approval.
 
 #### Scenario: Plan-review is described as independent agent review
 
@@ -26,7 +26,7 @@ Operator-facing product documentation, host skill guidance, CLI help, status pro
 
 #### Scenario: Attestation, grant, and plan-review remain distinct
 
-- **WHEN** documentation describes Pipeline attestations or a signed scoped factory grant
+- **WHEN** documentation describes Pipeline attestations or operator-authorized merge surfaces
 - **THEN** it SHALL distinguish evidence from the human authorization event
 - **AND** it SHALL NOT present agent plan-review evidence as the factory grant
 - **AND** it SHALL state that the grant may authorize only the exact later mutations that it names

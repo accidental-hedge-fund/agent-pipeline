@@ -215,7 +215,7 @@ export function renderConfigMarkdown(opts: RenderConfigOptions): string {
     "(via `generateConfigSchema()` / `pipeline config schema`). Commit",
     "`.github/pipeline.yml` to override defaults. Keys rejected by the schema",
     "(for example `auto_merge`) are **not** documented here.",
-    "Machine-local deployment grants are outside this schema and cannot be set here.",
+    "Merge authority is not repository configuration and cannot be set here.",
     "",
     "Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).",
     "",

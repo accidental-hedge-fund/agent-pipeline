@@ -116,7 +116,7 @@ The merge-queue SHALL, when release-when-complete is enabled and the queue is co
 
 ### Requirement: Release-when-complete SHALL NOT tag, publish, or merge the release
 
-The release-when-complete path SHALL NOT create or push a git tag, create or publish a GitHub Release, publish to npm, or merge the release pull request. A separate direct operator action or a disabled scoped factory finalizer with a valid exact operator grant MAY merge that release pull request. Tag and publish remain the existing post-merge release workflows.
+The release-when-complete path SHALL NOT create or push a git tag, create or publish a GitHub Release, publish to npm, or merge the release pull request. A separate direct operator action (or external supervisor under operator authority) MAY merge that release pull request. Tag and publish remain the existing post-merge release workflows.
 
 #### Scenario: Successful prepare stops at open PR
 

@@ -29,7 +29,7 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 - [Prerequisites](#prerequisites)
 - [Quickstart](#quickstart)
 - [Install](#install)
-- [External factory supervisors](#external-factory-supervisors)
+- [External supervisors](#external-supervisors)
 - [Where to go next](#where-to-go-next)
 - [Onboarding a new repo](#onboarding-a-new-repo)
 - [Development](#development)
@@ -104,24 +104,23 @@ $pipeline N
 
 The pipeline advances the issue through planning, implementation, cross-harness review, fix rounds, and pre-merge checks — without further manual input — and stops at `pipeline:ready-to-deploy` for an operator-authorized merge.
 
-## External factory supervisors
+## External supervisors
 
-An external supervisor such as Hermes can compose the current Pipeline CLI. This
-profile is opt-in and disabled by default. It does not add an MCP server, a public
-factory API, an `auto_merge` setting, or a merge stage.
+An external supervisor (chat bot, host agent, or shell automation) may compose the
+existing Pipeline CLI: `pipeline single`, `pipeline loop`, `pipeline merge`,
+`pipeline merge-queue --apply`, `pipeline release`, and related read-only commands.
+This repository does **not** ship a Hermes/Buzz factory control plane, grant schema,
+or second durable scheduler under `ops/`.
 
-One authenticated, immutable, expiring operator grant must bind the repository,
-base branch, release version, ordered issue list, permitted actions, and expiry.
-The deployment wrapper validates that machine-local grant before each action. The
-`pipeline merge` command does not validate Buzz events or deployment grants and
-keeps all of its normal ready-to-deploy, check, mergeability, and exact-head gates.
-Repository content in `.github/pipeline.yml` cannot grant this authority.
+Ordinary `pipeline advance`, `pipeline single`, and `pipeline loop` still stop at
+`pipeline:ready-to-deploy` and never merge. Merge remains loop-isolated and
+operator-authorized. Repository content in `.github/pipeline.yml` cannot authorize
+merges and cannot set `auto_merge`.
 
-For the current Grok factory profile, planning, implementation, and fixes use only
+For the current Grok profile, planning, implementation, and fixes use only
 `grok-4.5`, with no Grok model fallback. Codex performs independent review. See
-[the scoped factory plan](docs/grok-supervised-factory-plan.md) for the contract
-and [the deployment runbook](docs/runbooks/hermes-factory-deployment.md) for the
-exact same-user trust boundary, calibration, monitoring, and rollback steps.
+[the factory simplification plan](docs/factory-simplification-plan.md) for product
+direction (integrated train mode; thin supervisors).
 
 ## Install
 
