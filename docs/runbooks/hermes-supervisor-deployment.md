@@ -118,6 +118,30 @@ should return doctor/status, not factory grant admit.
   allowlisted operator, understanding chat is not a strong security boundary
   on the same UID as `gh`.
 
+## 8. Self-host engine promote (Phase 4)
+
+After a release PR is merged and GitHub has published the Release for `vX.Y.Z`:
+
+```bash
+set -a && source "$HOME/.config/pipeline-supervisor/env" && set +a
+cd "$REPO_DIR"
+# Optional: pin path for factory layouts
+# export AGENT_PIPELINE_PRODUCTION_PIN=...
+
+$PIPELINE engine-promote --for X.Y.Z --host codex --json
+```
+
+This verifies the published release, promotes the production engine pin (requires
+FRG pass evidence for that version), runs `npx …#vX.Y.Z install`, and checks
+the installed version. On install failure after pin promote, it rolls the pin
+back and attempts to reinstall the previous tag.
+
+Dry-run:
+
+```bash
+$PIPELINE engine-promote --for X.Y.Z --dry-run --json
+```
+
 ## Rollback
 
 ```bash

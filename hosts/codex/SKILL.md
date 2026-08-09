@@ -93,6 +93,7 @@ $pipeline status <n>                            Read-only — print stage, block
 $pipeline train --milestone <m>|--issues <n,n> [--merge] [--json] Operator-authorized integrate train: dependency-order issues, advance each to ready-to-deploy, optionally merge and prove base containment before the next (never called by the advance loop)
 $pipeline unblock <n> "<answer>"                Post an answer and clear the blocked label
 $pipeline backfill [--apply] [--capability <name>] Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
+$pipeline engine-promote --for <X.Y.Z> [--host codex|claude|all] [--dry-run] [--json] [--skip-install] Self-host: verify published release, promote production pin, install exact tag, verify version (rollback pin on install failure)
 $pipeline evals plan|run|grade|report|harvest … Offline eval plan/run/grade/report/harvest (never writes to production GitHub)
 $pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] [--promote-pin-on-pass] Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)
 $pipeline factory-pin show|init --from-frg <X.Y.Z>|promote --for <X.Y.Z>|rollback [--to <X.Y.Z>] [--git-sha <sha>] [--force] Show / init / promote / rollback the factory production engine pin (last FRG-passed release; never merges or tags)
