@@ -38,6 +38,10 @@ export const STAGE_DIAGNOSTIC_REASON_CODES = [
   // Distinct from environment-auth: missing forge capability/permission (e.g. 403
   // resource not accessible) vs credential/authentication failure.
   "capability-refusal",
+  // #870: Claude model entitlement / usage-credit refusal (Fable credits).
+  // Projects to environment-auth so metrics separate account entitlement from
+  // forge credential failures, without collapsing to workflow-engine-defect.
+  "model-entitlement-required",
 ] as const;
 
 export type StageDiagnosticReasonCode = (typeof STAGE_DIAGNOSTIC_REASON_CODES)[number];
@@ -196,6 +200,11 @@ export function projectPipelineReasonCode(reasonCode: unknown): StageDiagnosticP
       // distinct canonical reason so metrics and operator guidance can tell
       // permission/capability refusals from credential failures.
       return { blockerClass: "environment-auth", disposition: "recover" };
+    case "model-entitlement-required":
+      // #870: Fable/usage-credit model entitlement — account setup, not an
+      // engine protocol defect. Distinct reason under environment-auth so
+      // metrics can separate entitlement from forge credentials.
+      return { blockerClass: "environment-auth", disposition: "recover" };
     case "worktree-capacity":
       return { blockerClass: "workflow-state", disposition: "capacity" };
     case "human-decision-required":
@@ -310,7 +319,8 @@ export function projectStageDiagnostic(value: unknown): StageDiagnosticProjectio
       candidate.reason_code === "repair-budget-exhausted" ||
       candidate.reason_code === "external-wait" ||
       candidate.reason_code === "human-context-required" ||
-      candidate.reason_code === "capability-refusal"
+      candidate.reason_code === "capability-refusal" ||
+      candidate.reason_code === "model-entitlement-required"
     ) &&
     detail.offramp_class === undefined &&
     (

@@ -59,6 +59,13 @@ import {
   buildDesignResponsePrompt,
 } from "../prompts/index.ts";
 import { recordDesignInterrogation } from "../evidence-bundle.ts";
+import { invokeClaudeReviewerWithEntitlementFallback } from "../self-review.ts";
+import {
+  expandAutoEffort,
+  resolveReviewerModelForHarness,
+  reviewerModelSourceWasAuto,
+} from "../stage-routing.ts";
+import { isClaudeModelEntitlementFailure } from "../model-entitlement.ts";
 import { extractPlan } from "./review-acquisition.ts";
 import { attestPipelineComment, diffFilePaths } from "./review-parsing.ts";
 import type {
@@ -318,12 +325,39 @@ export async function advanceDesignGate(
   const plan = extractPlan(issue.comments);
   const implementerHarness = cfg.harnesses.implementer;
   const reviewerHarness = cfg.harnesses.reviewer;
+  // Shared reviewer model chain (#870): structured review_harness.model when set,
+  // else models.review after auto expansion / resolveReviewerModelForHarness.
+  // Never leave model undefined under auto so Claude does not inherit a host
+  // Fable default by omitting --model.
+  const reviewerModelWasAuto = reviewerModelSourceWasAuto(cfg, undefined);
+  const resolvedReviewerModel = resolveReviewerModelForHarness(
+    cfg.harnesses.reviewerModel ?? cfg.models.review,
+    reviewerHarness,
+    reviewerModelWasAuto,
+  );
+  const resolvedReviewerEffort =
+    expandAutoEffort(
+      cfg.harnesses.reviewerEffort ?? cfg.effort?.review,
+      "review-2",
+      "claude",
+    ) ?? cfg.harnesses.reviewerEffort;
   if (!state.reviewerIdentity) {
     state.reviewerIdentity = {
       harness: reviewerHarness,
-      model: cfg.harnesses.reviewerModel,
-      effort: cfg.harnesses.reviewerEffort,
+      model: resolvedReviewerModel,
+      effort: resolvedReviewerEffort,
       independence: reviewerHarness === implementerHarness ? "same-harness-fallback" : "independent",
+    };
+  } else if (
+    // Prior gate comments may have decoded null/empty model under unstructured auto.
+    (!state.reviewerIdentity.model || state.reviewerIdentity.model === "") &&
+    reviewerModelWasAuto
+  ) {
+    state.reviewerIdentity = {
+      ...state.reviewerIdentity,
+      harness: state.reviewerIdentity.harness || reviewerHarness,
+      model: resolvedReviewerModel,
+      effort: state.reviewerIdentity.effort ?? resolvedReviewerEffort,
     };
   }
 
@@ -383,6 +417,30 @@ export async function advanceDesignGate(
 
   const policy = { block_threshold: cfg.design_gate.block_threshold, min_confidence: cfg.design_gate.min_confidence };
 
+  async function invokeReviewerRound(prompt: string): Promise<HarnessResult> {
+    const model = state.reviewerIdentity?.model;
+    const effort = state.reviewerIdentity?.effort;
+    const invokeOpts: InvokeOptions = {
+      timeoutSec: cfg.review_timeout,
+      model,
+      reasoningEffort: effort,
+      modelWasAuto: reviewerModelWasAuto,
+    };
+    // #870: share auto entitlement allowlisted retry with plan-review when
+    // the effective reviewer is claude and the model originated from auto.
+    if (reviewerHarness === "claude") {
+      const { result, entitlementFallback, resolvedModel } =
+        await invokeClaudeReviewerWithEntitlementFallback(wt.path, prompt, invokeOpts, invokeFn);
+      if (entitlementFallback && resolvedModel && state.reviewerIdentity) {
+        // Record the successful fallback model on identity for later rounds /
+        // evidence, without mutating config-load auto preference.
+        state.reviewerIdentity = { ...state.reviewerIdentity, model: resolvedModel };
+      }
+      return result;
+    }
+    return invokeFn(reviewerHarness, wt.path, prompt, invokeOpts);
+  }
+
   async function getVerdict(
     roundNum: number,
     priorRound: DesignGateRound | null,
@@ -393,24 +451,40 @@ export async function advanceDesignGate(
       decisionRecordJson: decisionRecordJson(state),
       priorDispositions: priorRound ? formatPriorDispositions(priorRound) : undefined,
     });
-    let result = await invokeFn(reviewerHarness, wt.path, prompt, {
-      timeoutSec: cfg.review_timeout,
-      model: state.reviewerIdentity?.model,
-      reasoningEffort: state.reviewerIdentity?.effort,
-    });
+    let result = await invokeReviewerRound(prompt);
     if (isHarnessUnavailable(result)) {
       return { blocked: `reviewer harness (${reviewerHarness}) unavailable during interrogation round ${roundNum}` };
     }
+    // Entitlement text is not a valid interrogation verdict (#870).
+    if (isClaudeModelEntitlementFailure(result.stdout, result.stderr, result)) {
+      return {
+        blocked:
+          `reviewer model entitlement failure during interrogation round ${roundNum}: ` +
+          `${(result.stderr || result.stdout).trim().slice(0, 400)}`,
+      };
+    }
     let verdict = parseDesignVerdict(result.stdout);
     if (!verdict) {
+      // Do not re-ask when the raw body is the entitlement message — that is
+      // not a parseable-verdict recovery path.
+      if (isClaudeModelEntitlementFailure(result.stdout, result.stderr, result)) {
+        return {
+          blocked:
+            `reviewer model entitlement failure during interrogation round ${roundNum}: ` +
+            `${(result.stderr || result.stdout).trim().slice(0, 400)}`,
+        };
+      }
       const reaskPrompt = `${prompt}\n\nYour previous response could not be parsed into a valid verdict. Return ONLY the valid JSON object described above — no other text.`;
-      result = await invokeFn(reviewerHarness, wt.path, reaskPrompt, {
-        timeoutSec: cfg.review_timeout,
-        model: state.reviewerIdentity?.model,
-        reasoningEffort: state.reviewerIdentity?.effort,
-      });
+      result = await invokeReviewerRound(reaskPrompt);
       if (isHarnessUnavailable(result)) {
         return { blocked: `reviewer harness (${reviewerHarness}) unavailable during interrogation round ${roundNum}` };
+      }
+      if (isClaudeModelEntitlementFailure(result.stdout, result.stderr, result)) {
+        return {
+          blocked:
+            `reviewer model entitlement failure during interrogation round ${roundNum}: ` +
+            `${(result.stderr || result.stdout).trim().slice(0, 400)}`,
+        };
       }
       verdict = parseDesignVerdict(result.stdout);
     }

@@ -48,6 +48,7 @@ import {
   appendTesterEvidenceSection,
   loadTesterEvidenceForReview,
 } from "../tester-evidence.ts";
+import { extractPlan } from "./review-acquisition.ts";
 import {
   branchName,
   createWorktree,
@@ -99,7 +100,8 @@ import {
   validateOpenspecChangeSingular,
 } from "../stage-output-contract.ts";
 import type { BlockerKind, Harness, Outcome, PipelineConfig, Stage, StageOutcome } from "../types.ts";
-import type { StageDiagnostic } from "../stage-diagnostic.ts";
+import { buildStageDiagnostic, type StageDiagnostic } from "../stage-diagnostic.ts";
+import { classifyHarnessFailure } from "../escalation-classify.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import { recordStage } from "../evidence-bundle.ts";
 import { INJECTION_PATTERNS } from "../artifact-sanitize.ts";
@@ -281,6 +283,12 @@ export interface AdvanceOpts {
   /** Injectable HTTP deps for external stage executor dispatch (#314). Tests
    *  supply a fake `fetchImpl` so no real network call is made. */
   executorHttpDeps?: ExecutorHttpDeps;
+  /**
+   * #870: re-enter at plan-review using an already-posted Implementation Plan.
+   * Skips ready→planning author work and reuses the completed plan artifact so
+   * entitlement/throttle recovery does not re-run planning harness work.
+   */
+  resumePlanReview?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -561,10 +569,17 @@ export async function runPlanningPhases(
 
   const primary: Harness = cfg.harnesses.implementer;
   const reviewer: string = cfg.harnesses.reviewer;
+  const resumePlanReview = opts.resumePlanReview === true;
   let wt: { path: string; branch: string } | undefined;
-  let activeLifecycle = await startPlanningLifecycle(cfg, issueNumber, "planning", opts, deps);
+  let activeLifecycle = await startPlanningLifecycle(
+    cfg,
+    issueNumber,
+    resumePlanReview ? "plan-review" : "planning",
+    opts,
+    deps,
+  );
 
-  if (!opts.dryRun) {
+  if (!opts.dryRun && !resumePlanReview) {
     await doTransition(cfg, issueNumber, "ready", "planning", `Planning started by ${primary}.`);
   }
 
@@ -595,7 +610,8 @@ export async function runPlanningPhases(
         : bootstrap.tag === "worktree-creation-failed"
           ? `Worktree creation failed: ${bootstrap.reason}`
           : `Worktree setup failed: ${bootstrap.reason}`;
-    await doSetBlocked(cfg, issueNumber, bootstrapMsg, "planning", bootstrap.tag);
+    const blockStage: Stage = resumePlanReview ? "plan-review" : "planning";
+    await doSetBlocked(cfg, issueNumber, bootstrapMsg, blockStage, bootstrap.tag);
     await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked");
     return blockedOutcome(bootstrap.reason, bootstrap.tag);
   }
@@ -609,48 +625,81 @@ export async function runPlanningPhases(
   // Gathered after bootstrap so comments posted during the bootstrap window are included.
   const contextSnapshot = await gatherContextSnapshot(cfg, issueNumber, body, deps);
 
-  // ---- Author the planning artifact ----
-  const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot, crossRepoContext);
-  if (!authorResult.ok) {
-    await doSetBlocked(cfg, issueNumber, authorResult.reason, "planning", authorResult.tag);
-    await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-    return blockedOutcome(authorResult.reason, authorResult.tag, authorResult.diagnostic);
-  }
-  let planText = authorResult.planText;
-  // `promptPlanText` is the version passed to review/revision prompts — for OpenSpec
-  // the comment includes a decorative header that should not appear in prompts.
-  let promptPlanText = authorResult.promptPlanText ?? planText;
-  let specContext = authorResult.specContext;
+  let planText: string;
+  let promptPlanText: string;
+  let specContext: string | undefined;
+  /** Body of the posted plan comment — used to detect human feedback deltas. */
+  let planComment: string;
 
-  // ---- Validate the artifact structurally ----
-  const validateResult = await hooks.validateArtifact(wt);
-  if (!validateResult.ok) {
-    await doSetBlocked(cfg, issueNumber, validateResult.reason, validateResult.blockStage, validateResult.tag);
-    await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-    return blockedOutcome(validateResult.reason, validateResult.tag);
-  }
-  // #352 (round 2): openspec.validateItem inside validateArtifact can also trigger
-  // ensureDefaultConfig, leaving config.yaml dirty after the authorArtifact commit.
-  // Repeat the config-commit so no validate call leaves the file untracked.
-  await commitOpenspecProjectConfig(wt.path, issueNumber, pipelineRunId, deps);
+  if (resumePlanReview) {
+    // #870: reuse the completed plan — do not re-invoke the planning harness.
+    const detail = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber);
+    const existingPlan = extractPlan(detail.comments ?? []);
+    if (!existingPlan || existingPlan === "(plan not found in comments)") {
+      await doSetBlocked(
+        cfg,
+        issueNumber,
+        "plan-review resume requested but no ## Implementation Plan comment found",
+        "plan-review",
+        "plan-gen-failed",
+      );
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+      return blockedOutcome("no completed plan to resume for plan-review", "plan-gen-failed");
+    }
+    // existingPlan is the full comment body starting with ## Implementation Plan.
+    planComment = existingPlan;
+    // Strip the markdown header for prompts when present.
+    planText = existingPlan.replace(/^## (?:Revised )?Implementation Plan\s*\n+/, "");
+    promptPlanText = planText;
+    console.log(
+      `[pipeline] #${issueNumber}: resuming plan-review from completed plan (skipping planning harness)`,
+    );
+  } else {
+    // ---- Author the planning artifact ----
+    const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot, crossRepoContext);
+    if (!authorResult.ok) {
+      await doSetBlocked(cfg, issueNumber, authorResult.reason, "planning", authorResult.tag);
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+      return blockedOutcome(authorResult.reason, authorResult.tag, authorResult.diagnostic);
+    }
+    planText = authorResult.planText;
+    // `promptPlanText` is the version passed to review/revision prompts — for OpenSpec
+    // the comment includes a decorative header that should not appear in prompts.
+    promptPlanText = authorResult.promptPlanText ?? planText;
+    specContext = authorResult.specContext;
 
-  // ---- Post plan comment ----
-  const planComment = `## Implementation Plan\n\n${planText}${footer(cfg)}`;
-  await doPostComment(cfg, issueNumber, planComment);
+    // ---- Validate the artifact structurally ----
+    const validateResult = await hooks.validateArtifact(wt);
+    if (!validateResult.ok) {
+      await doSetBlocked(cfg, issueNumber, validateResult.reason, validateResult.blockStage, validateResult.tag);
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+      return blockedOutcome(validateResult.reason, validateResult.tag);
+    }
+    // #352 (round 2): openspec.validateItem inside validateArtifact can also trigger
+    // ensureDefaultConfig, leaving config.yaml dirty after the authorArtifact commit.
+    // Repeat the config-commit so no validate call leaves the file untracked.
+    await commitOpenspecProjectConfig(wt.path, issueNumber, pipelineRunId, deps);
+
+    // ---- Post plan comment ----
+    planComment = `## Implementation Plan\n\n${planText}${footer(cfg)}`;
+    await doPostComment(cfg, issueNumber, planComment);
+  }
 
   // ---- Plan review + revision (skippable via steps.plan_review) ----
   let revisedPlan = planText;
-  let preImplStage: Stage = "planning";
+  let preImplStage: Stage = resumePlanReview ? "plan-review" : "planning";
   if (cfg.steps.plan_review) {
-    await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "advanced", wt.path);
-    await doTransition(
-      cfg,
-      issueNumber,
-      "planning",
-      "plan-review",
-      hooks.planToReviewMsg(primary, reviewer),
-    );
-    activeLifecycle = await startPlanningLifecycle(cfg, issueNumber, "plan-review", opts, deps, wt.path);
+    if (!resumePlanReview) {
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "advanced", wt.path);
+      await doTransition(
+        cfg,
+        issueNumber,
+        "planning",
+        "plan-review",
+        hooks.planToReviewMsg(primary, reviewer),
+      );
+      activeLifecycle = await startPlanningLifecycle(cfg, issueNumber, "plan-review", opts, deps, wt.path);
+    }
     preImplStage = "plan-review";
 
     let reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, reviewer, implementer: primary, specContext, contextSnapshot });
@@ -677,10 +726,11 @@ export async function runPlanningPhases(
       cfg,
     );
     reviewPrompt = appendTesterEvidenceSection(reviewPrompt, planTesterAcq);
+    const planReviewModelWasAuto = reviewerModelSourceWasAuto(cfg, opts.model);
     const planReviewModel = resolveReviewerModelForHarness(
       opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review,
       reviewer,
-      reviewerModelSourceWasAuto(cfg, opts.model),
+      planReviewModelWasAuto,
     );
     // Plan-review's effort is sourced from cfg.plan_review_effort (derived from
     // effort.planning, classified Adversarial/Definitive — see stage-routing.ts),
@@ -707,6 +757,8 @@ export async function runPlanningPhases(
           kind: "plan-review",
           timeoutSec: cfg.plan_review_timeout,
           model: planReviewModel,
+          // #870: preserve auto provenance so entitlement fallback can fire.
+          modelWasAuto: planReviewModelWasAuto,
           reasoningEffort: planReviewEffort,
           promptDelivery: cfg.harnesses.reviewerPromptDelivery,
           invokeOpts: {
@@ -744,9 +796,26 @@ export async function runPlanningPhases(
       const blockMsg = planSelfReview
         ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}${stderrExcerpt}${ensembleNote}`
         : `Plan-review harness (${reviewer}) failed: ${reason}${stderrExcerpt}${ensembleNote}`;
+      const diagnostic = buildStageDiagnostic({
+        reasonCode: classifyHarnessFailure({
+          timed_out: reviewResult.timed_out,
+          spawn_error: reviewResult.spawn_error,
+          capture_error: reviewResult.capture_error,
+          oversize_argv: reviewResult.oversize_argv,
+          stdin_error: reviewResult.stdin_error,
+          throttled: reviewResult.throttled ?? undefined,
+          exit_code: reviewResult.exit_code,
+          stdout: reviewResult.stdout,
+          stderr: reviewResult.stderr,
+          success: reviewResult.success,
+        }),
+        blockerKind: "harness-failure",
+        reason: blockMsg,
+        stage: "plan-review",
+      });
       await doSetBlocked(cfg, issueNumber, blockMsg, "plan-review", "harness-failure");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-      return blockedOutcome(reason, "harness-failure");
+      return blockedOutcome(reason, "harness-failure", diagnostic);
     }
     const planReview = reviewResult.stdout.trim();
     if (!planReview.includes("## Plan Review Verdict")) {

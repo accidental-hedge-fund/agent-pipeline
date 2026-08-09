@@ -6,6 +6,10 @@
 import { isTransientGhError } from "./gh.ts";
 import type { HarnessResult } from "./harness.ts";
 import {
+  isClaudeModelEntitlementFailure,
+  classifyReviewerHarnessFailure,
+} from "./model-entitlement.ts";
+import {
   projectPipelineReasonCode,
   type StageDiagnosticReasonCode,
 } from "./stage-diagnostic.ts";
@@ -23,11 +27,18 @@ export interface HarnessFailureSignals {
   stdin_error?: boolean;
   throttled?: boolean;
   code?: number | null;
+  /** Optional product text for entitlement detection (#870). */
+  stdout?: string;
+  stderr?: string;
+  exit_code?: number;
+  success?: boolean;
 }
 
 /**
  * Classify a harness result into a closed stage-diagnostic reason code using
- * only structured flags (not stderr prose).
+ * structured flags. When stdout/stderr are present, Fable/usage-credit
+ * entitlement refusals project to `model-entitlement-required` (#870) rather
+ * than ordinary throttle or workflow-engine-defect.
  */
 export function classifyHarnessFailure(
   result: HarnessFailureSignals | Pick<
@@ -37,8 +48,22 @@ export function classifyHarnessFailure(
     oversize_argv?: boolean;
     stdin_error?: boolean;
     throttled?: boolean;
+    stdout?: string;
+    stderr?: string;
+    exit_code?: number;
+    success?: boolean;
   },
 ): StageDiagnosticReasonCode {
+  // Entitlement text wins over bare throttled so zero-token Fable 429s stay typed.
+  if (
+    isClaudeModelEntitlementFailure(
+      (result as { stdout?: string }).stdout,
+      (result as { stderr?: string }).stderr,
+      result as Pick<HarnessResult, "exit_code" | "throttled" | "success">,
+    )
+  ) {
+    return "model-entitlement-required";
+  }
   if (result.throttled) return "transient-infra";
   if (result.timed_out) return "harness-timeout";
   if (result.oversize_argv || result.stdin_error || result.capture_error) {
@@ -47,9 +72,18 @@ export function classifyHarnessFailure(
   if (result.spawn_error) return "harness-contract";
   // Non-zero exit without structured flags: still engine-owned harness contract,
   // not product judgment.
-  if (typeof result.code === "number" && result.code !== 0) return "harness-contract";
+  const exitCode =
+    typeof (result as { code?: number | null }).code === "number"
+      ? (result as { code: number }).code
+      : typeof (result as { exit_code?: number }).exit_code === "number"
+        ? (result as { exit_code: number }).exit_code
+        : null;
+  if (exitCode !== null && exitCode !== 0) return "harness-contract";
   return "workflow-engine-defect";
 }
+
+/** Re-export for reviewer call sites that want the full HarnessResult shape. */
+export { classifyReviewerHarnessFailure };
 
 export type GhErrorClass =
   | "transient-infra"
@@ -160,6 +194,7 @@ export function interventionKindFromReason(
       return "test-build-failure";
     case "environment-auth":
     case "capability-refusal":
+    case "model-entitlement-required":
       return "auth-tooling-preflight-failure";
     case "harness-timeout":
     case "harness-contract":
@@ -219,6 +254,7 @@ export function isMechanicalInfrastructureReason(reasonCode: StageDiagnosticReas
     reasonCode === "worktree-capacity" ||
     reasonCode === "environment-auth" ||
     reasonCode === "capability-refusal" ||
+    reasonCode === "model-entitlement-required" ||
     reasonCode === "workflow-engine-defect"
   );
 }

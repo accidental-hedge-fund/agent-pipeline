@@ -600,10 +600,37 @@ export interface PlanningRecoveryDeps {
   isLivePlanningActive?: (repo: string, issueNumber: number) => boolean;
   /** Atomically claim the live-planning marker; returns false if a live process already holds it. */
   tryAcquireLivePlanningMarker?: (repo: string, issueNumber: number) => boolean;
+  /**
+   * #870: true when the issue already has a completed Implementation Plan
+   * comment so plan-review recovery can resume without re-planning.
+   */
+  hasCompletedPlan?: (cfg: PipelineConfig, issueNumber: number) => Promise<boolean>;
+}
+
+/** True when issue comments already include a completed plan artifact (#870). */
+export async function hasCompletedPlanComment(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  getDetail: typeof getIssueDetail = getIssueDetail,
+): Promise<boolean> {
+  const detail = await getDetail(cfg, issueNumber);
+  const comments = detail.comments ?? [];
+  return comments.some(
+    (c) =>
+      typeof c.body === "string" &&
+      (c.body.startsWith("## Implementation Plan") ||
+        c.body.startsWith("## Revised Implementation Plan")),
+  );
 }
 
 export function realPlanningRecoveryDeps(): PlanningRecoveryDeps {
-  return { transition, planningAdvance: planningStage.advance, isLivePlanningActive, tryAcquireLivePlanningMarker };
+  return {
+    transition,
+    planningAdvance: planningStage.advance,
+    isLivePlanningActive,
+    tryAcquireLivePlanningMarker,
+    hasCompletedPlan: hasCompletedPlanComment,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +842,28 @@ export async function dispatch(
           status: "waiting",
           reason: `planning is active under a different domain — waiting for it to complete`,
         };
+      }
+      // #870: plan-review with a completed plan artifact reuses that plan and
+      // re-runs plan-review only — never re-author planning from scratch solely
+      // because the reviewer could not start (entitlement/throttle recovery).
+      // `hasCompletedPlan` is always present on real deps; test fakes that omit
+      // it keep the crash-stranded replan path for isolation.
+      if (stage === "plan-review" && deps.hasCompletedPlan) {
+        const hasPlan = await deps.hasCompletedPlan(cfg, issueNumber);
+        if (hasPlan) {
+          console.log(
+            `[pipeline] #${issueNumber}: plan-review recovery — resuming plan-review without re-planning`,
+          );
+          return deps.planningAdvance(cfg, issueNumber, {
+            dryRun,
+            model,
+            pipelineRunId,
+            stateDir,
+            runDir,
+            runStoreDeps,
+            resumePlanReview: true,
+          });
+        }
       }
       console.log(
         `[pipeline] #${issueNumber}: recovered stranded planning attempt — restarting from ready`,

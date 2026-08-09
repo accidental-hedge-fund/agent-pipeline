@@ -611,6 +611,11 @@ effort:                          # per-phase reasoning effort — codex via -c m
   implementing: low              # planning also sources plan-review's effort (classified separately).
   review: high                   # review is resolved round-aware (review-1 vs. review-2).
   fix: low
+# models.review: auto prefers claude-fable-5 for a Claude reviewer (adversarial rigor).
+# On a Claude subscription without Fable usage credits, the engine performs one
+# allowlisted in-process retry with sonnet when the preferred auto model returns
+# the Fable/usage-credit entitlement 429. Explicit non-auto models are never
+# silently rewritten. Claude CLI --fallback-model is not used for this recovery.
 conventions_md_path: CLAUDE.md   # excerpt embedded in prompts
 domain_name: lyric-utils
 domain_description: a quantitative finance Python library

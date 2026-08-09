@@ -351,3 +351,62 @@ test("planning crash recovery: absent live marker still triggers recovery (crash
   assert.equal(transitionCalls.length, 1, "must call transition to roll back to ready");
   assert.equal(planningCalled, 1, "must call planningAdvance to restart");
 });
+
+// ---------------------------------------------------------------------------
+// #870: plan-review with completed plan resumes without re-planning
+// ---------------------------------------------------------------------------
+
+test("plan-review recovery with completed plan resumes without rolling back to ready (#870)", async () => {
+  const cfg = makeCfg();
+  const advanceOpts: unknown[] = [];
+  let planningCalled = 0;
+  const transitionCalls: Array<{ from: Stage; to: Stage }> = [];
+  const deps: PlanningRecoveryDeps = {
+    transition: async (_c, _n, from, to) => {
+      transitionCalls.push({ from, to });
+    },
+    planningAdvance: async (_c, _n, o) => {
+      planningCalled++;
+      advanceOpts.push(o);
+      return ADVANCING_OUTCOME;
+    },
+    isLivePlanningActive: () => false,
+    hasCompletedPlan: async () => true,
+  };
+
+  const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(planningCalled, 1);
+  assert.equal(transitionCalls.length, 0, "must not roll back to ready when plan exists");
+  assert.equal(
+    (advanceOpts[0] as { resumePlanReview?: boolean })?.resumePlanReview,
+    true,
+    "must pass resumePlanReview so planning harness is not re-invoked",
+  );
+});
+
+test("plan-review recovery without completed plan still restarts from ready", async () => {
+  const cfg = makeCfg();
+  let planningCalled = 0;
+  const transitionCalls: Array<{ from: Stage; to: Stage }> = [];
+  const deps: PlanningRecoveryDeps = {
+    transition: async (_c, _n, from, to) => {
+      transitionCalls.push({ from, to });
+    },
+    planningAdvance: async () => {
+      planningCalled++;
+      return ADVANCING_OUTCOME;
+    },
+    isLivePlanningActive: () => false,
+    hasCompletedPlan: async () => false,
+  };
+
+  const out = await dispatch(cfg, ISSUE, "plan-review", OPTS, RUN_ID, undefined, undefined, undefined, deps);
+
+  assert.equal(out.advanced, true);
+  assert.equal(planningCalled, 1);
+  assert.equal(transitionCalls.length, 1);
+  assert.equal(transitionCalls[0].from, "plan-review");
+  assert.equal(transitionCalls[0].to, "ready");
+});
