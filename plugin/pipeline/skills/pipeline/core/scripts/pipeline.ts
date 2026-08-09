@@ -105,6 +105,12 @@ import { runSweep, realSweepDeps } from "./stages/sweep.ts";
 import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
 import { mergePr, realMergeDeps } from "./stages/merge.ts";
 import { runMergeQueue, realMergeQueueDeps } from "./stages/merge-queue.ts";
+import {
+  parseIssueList,
+  realTrainDeps,
+  runTrain,
+  type AdvanceOutcome,
+} from "./stages/train.ts";
 import * as reviewStage from "./stages/review.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
 import {
@@ -420,8 +426,12 @@ export interface CliOpts {
   maxFailureRate?: number;
   /** queue: filter eligible issues to those carrying all specified labels (repeatable). */
   label?: string[];
-  /** queue / merge-queue: filter eligible issues to those belonging to this milestone title. */
+  /** queue / merge-queue / train / loop: filter issues to this milestone title. */
   milestone?: string;
+  /** train: comma- or space-separated issue list (e.g. "10,11,12"). */
+  issues?: string;
+  /** train: after ready-to-deploy, merge via existing merge surface and prove base containment. */
+  merge?: boolean;
   /** queue: filter eligible issues to those at or below this risk level (low|medium|high). */
   risk?: string;
   /**
@@ -519,6 +529,7 @@ export function maxPositionalsFor(command: string | undefined): number {
     command === "triage" ||
     command === "merge" ||
     command === "merge-queue" ||
+    command === "train" ||
     command === "status" ||
     command === "papercut" ||
     command === "correction"
@@ -545,7 +556,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | factory-pin | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | factory-pin | intake | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -667,7 +678,12 @@ export function buildCmd(): Command {
     .option("--concurrency <C>", "queue: maximum simultaneous pipeline runs (default: 1)", Number)
     .option("--max-failure-rate <R>", "queue: halt new launches when failure rate meets this threshold 0.0–1.0 (default: 1.0)", Number)
     .option("--label <L>", "queue: filter eligible issues to those carrying this label (repeatable)", collectRepeatable, [])
-    .option("--milestone <M>", "queue / merge-queue / loop: filter issues to this milestone title")
+    .option("--milestone <M>", "queue / merge-queue / train / loop: filter issues to this milestone title")
+    .option("--issues <list>", "train: comma- or space-separated issue numbers (e.g. 10,11,12)")
+    .option(
+      "--merge",
+      "train: after each issue reaches ready-to-deploy, merge via pipeline merge and prove base containment before the next item",
+    )
     .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)")
     .option(
       "--release-when-complete",
@@ -2789,6 +2805,8 @@ async function main(): Promise<void> {
   const isMergeCommand = numArg === "merge";
   // `pipeline merge-queue --milestone <m> [--apply] [--release-when-complete] …` (#676).
   const isMergeQueueCommand = numArg === "merge-queue";
+  // `pipeline train --milestone <m>|--issues <n,n> [--merge] [--json]` — integrate train.
+  const isTrainCommand = numArg === "train";
   // `pipeline loop ...` (#451) — deterministic preflight + delegation to goal-loop.
   // Needs no PipelineConfig and calls no gh at all (see command-registry.ts).
   const isLoopCommand = numArg === "loop";
@@ -2896,6 +2914,11 @@ async function main(): Promise<void> {
           `pipeline: 'pipeline merge-queue' does not support ${flags}. ` +
             `Allowed: --milestone, --apply, --dry-run, --repair, --release-when-complete, ` +
             `--release-version, --repo-path, --base, --profile.`,
+        );
+      } else if (isTrainCommand) {
+        console.error(
+          `pipeline: 'pipeline train' does not support ${flags}. ` +
+            `Allowed: --milestone, --issues, --merge, --json, --dry-run, --repo-path, --base, --profile.`,
         );
       } else if (opts.removeWorktree && isNumericOrAbsent) {
         console.error(`pipeline: '--remove-worktree' mode does not support ${flags}. These are separate modes.`);
@@ -4218,13 +4241,123 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early train dispatch — ordered advance + optional integrate merges (factory Phase 1).
+  if (isTrainCommand) {
+    let trainCfg: import("./types.ts").PipelineConfig;
+    try {
+      trainCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
+    } catch (err) {
+      console.error(`pipeline train: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    let issueNumbers: number[] = [];
+    try {
+      issueNumbers = parseIssueList(opts.issues);
+    } catch (err) {
+      console.error(`pipeline train: ${(err as Error).message}`);
+      process.exit(2);
+    }
+    const milestone = opts.milestone ? String(opts.milestone).trim() : "";
+    if (issueNumbers.length === 0 && !milestone) {
+      console.error(
+        "pipeline train: --issues <n,n> and/or --milestone <title> is required.\n" +
+          "  Usage: pipeline train --issues 10,11,12 [--merge] [--json]\n" +
+          "         pipeline train --milestone v1.34.0 [--merge] [--json]\n" +
+          "  Without --merge: advances each issue to ready-to-deploy only.\n" +
+          "  With --merge: merges each ready-to-deploy PR via the existing merge surface,\n" +
+          "  proves squash-aware base containment, then starts the next issue.\n" +
+          "  Never called from the advance loop. No auto_merge config key.",
+      );
+      process.exit(2);
+    }
+    if (opts.dryRun) {
+      console.error("pipeline train: --dry-run is not supported for train; omit it.");
+      process.exit(2);
+    }
+    try {
+      const baseDeps = realTrainDeps({
+        repoDir: trainCfg.repo_dir,
+        repo: trainCfg.repo,
+        baseBranch: trainCfg.base_branch,
+        advanceIssue: async () => {
+          throw new Error("advanceIssue must be overridden");
+        },
+      });
+      const trainResult = await runTrain(
+        {
+          issues: issueNumbers.length > 0 ? issueNumbers : undefined,
+          milestone: milestone || undefined,
+          merge: !!opts.merge,
+          baseBranch: trainCfg.base_branch,
+          repoDir: trainCfg.repo_dir,
+          repo: trainCfg.repo,
+        },
+        {
+          ...baseDeps,
+          async advanceIssue(issue): Promise<AdvanceOutcome> {
+            const prevExit = process.exitCode;
+            process.exitCode = 0;
+            try {
+              await runSingleIssueCommand(String(issue), opts);
+            } catch (err) {
+              return { ok: false, error: (err as Error).message };
+            }
+            const exit = process.exitCode ?? 0;
+            process.exitCode = prevExit ?? 0;
+            const snap = await baseDeps.getIssue(issue);
+            const stageLabel = snap.labels.find((l) => l.startsWith("pipeline:"));
+            const stage = stageLabel?.slice("pipeline:".length) ?? null;
+            if (stage === "ready-to-deploy") {
+              return { ok: true, terminal: "ready-to-deploy", labels: snap.labels };
+            }
+            if (stage === "needs-human") {
+              return { ok: true, terminal: "needs-human", labels: snap.labels };
+            }
+            if (snap.labels.includes("blocked")) {
+              return { ok: true, terminal: "blocked", labels: snap.labels };
+            }
+            if (exit !== 0) {
+              return { ok: false, error: `pipeline single exited with code ${exit}` };
+            }
+            return { ok: true, terminal: "other", labels: snap.labels };
+          },
+        },
+      );
+      if (opts.json) {
+        console.log(JSON.stringify(trainResult.status, null, 2));
+      } else {
+        const s = trainResult.status;
+        console.log(
+          `[train] complete=${s.complete} merge_mode=${s.merge_mode} ` +
+            `items=${s.items.length}/${s.ordered_issues.length}` +
+            (s.blocker ? ` blocker=${JSON.stringify(s.blocker)}` : ""),
+        );
+        for (const item of s.items) {
+          console.log(
+            `  #${item.issue}` +
+              (item.pr != null ? ` PR #${item.pr}` : "") +
+              ` ${item.terminal}` +
+              (item.integrated ? " integrated" : "") +
+              (item.merge_result_oid ? ` merge=${item.merge_result_oid.slice(0, 12)}` : "") +
+              (item.error ? ` err=${item.error}` : ""),
+          );
+        }
+      }
+      if (trainResult.exitCode !== 0) process.exit(trainResult.exitCode);
+    } catch (err) {
+      console.error(`pipeline train: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "single", "release", "intake", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "factory-gate", "factory-pin", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "summary", "improve", "scoreboard", "factory-gate", "factory-pin", "queue", "backfill", "evals",
       "loop",
     ];
     if (!recognized.includes(numArg)) {

@@ -140,6 +140,13 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     documented: true,
     section: "lifecycle",
   },
+  train: {
+    summary:
+      "Operator-authorized integrate train: dependency-order issues, advance each to ready-to-deploy, optionally merge and prove base containment before the next (never called by the advance loop)",
+    usage: "train --milestone <m>|--issues <n,n> [--merge] [--json]",
+    documented: true,
+    section: "lifecycle",
+  },
   release: {
     summary: "Prepare a release PR for the given version (never tags, merges, or publishes)",
     usage: 'release <version> [--theme "..."] [--dry-run]',

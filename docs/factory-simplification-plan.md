@@ -46,7 +46,7 @@ Harvested invariants (still product goals):
 ## Phases
 
 1. **Remove pilot tree** (this cleanup) — drop `ops/`, CI coupling, grant-centric docs.
-2. **`pipeline train --merge`** — integrate between issues in agent-pipeline (OpenSpec: integrated train mode).
+2. **`pipeline train --merge`** — integrate between issues in agent-pipeline (**implemented**: `pipeline train --milestone <m>|--issues <n,n> [--merge] [--json]`).
 3. **Thin supervisor skill** — Buzz/Hermes (or any host) parses intent and invokes CLI only.
 4. **Release finish** — authorized completion after prepare-only `pipeline release` (optional).
 5. **Self-host pin/install** — optional later; not required for ordinary trains.

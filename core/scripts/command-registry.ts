@@ -196,6 +196,27 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
+  // Integrated train (factory simplification Phase 1): ordered advance, optional
+  // merge-between via existing merge surface + squash-aware base containment.
+  // Loop-isolated — never called from advance stage dispatch. No auto_merge.
+  train: {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "profile",
+      "milestone",
+      "issues",
+      "merge",
+      "json",
+      "dryRun",
+    ]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: true,
+  },
+
   sweep: {
     needsIssueNumber: false,
     allowedFlags: new Set(["repoPath", "base", "profile", "apply", "repo", "dryRun"]),
