@@ -575,6 +575,7 @@ test("visual-gate: missing worktree + rematerialize pass continues (not false wo
   const cfg = baseCfg({ enabled: true, command: "npx playwright test", mode: "gate", max_attempts: 1 });
   const deps = makeDeps(log, [passResult()], null);
   let ensureCalls = 0;
+  let runCwd: string | undefined;
   deps.ensureManagedWorktree = async () => {
     ensureCalls += 1;
     return {
@@ -583,12 +584,45 @@ test("visual-gate: missing worktree + rematerialize pass continues (not false wo
       reason: "recreated from open PR head 93d8f70",
     };
   };
+  deps.runVisual = async (_cmd, cwd) => {
+    runCwd = cwd;
+    return passResult();
+  };
 
   const out = await advanceVisual(cfg, 50, {}, deps);
 
   assert.equal(ensureCalls, 1);
   assert.equal(log.blocked.length, 0, `must not park after successful rematerialize; got: ${JSON.stringify(log.blocked)}`);
   assert.equal(out.advanced, true);
+  assert.equal(runCwd, "/tmp/wt-remat", "visual runner must use rematerialized path");
+});
+
+test("visual-gate: missing worktree + rematerialize skipped with path continues (#874)", async () => {
+  // "skipped" with a present worktree is a success variant (race recreate / already present).
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, command: "npx playwright test", mode: "gate", max_attempts: 1 });
+  const deps = makeDeps(log, [passResult()], null);
+  let ensureCalls = 0;
+  let runCwd: string | undefined;
+  deps.ensureManagedWorktree = async () => {
+    ensureCalls += 1;
+    return {
+      result: "skipped" as const,
+      worktree: { path: "/tmp/wt-skipped", slug: "874-slug", branch: "pipeline/874-slug" },
+      reason: "already present at /tmp/wt-skipped",
+    };
+  };
+  deps.runVisual = async (_cmd, cwd) => {
+    runCwd = cwd;
+    return passResult();
+  };
+
+  const out = await advanceVisual(cfg, 50, {}, deps);
+
+  assert.equal(ensureCalls, 1);
+  assert.equal(log.blocked.length, 0, `must not park after skipped rematerialize with path; got: ${JSON.stringify(log.blocked)}`);
+  assert.equal(out.advanced, true);
+  assert.equal(runCwd, "/tmp/wt-skipped", "visual runner must use skipped rematerialize path");
 });
 
 test("visual-gate: rematerialize skipped with null worktree → worktree-missing (no throw)", async () => {

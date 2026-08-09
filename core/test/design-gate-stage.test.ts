@@ -212,6 +212,30 @@ test("design-gate: missing worktree + rematerialize pass continues (not false wo
   assert.equal(log.invokeCalls, 2, "decision record + challenge verdict must still run on rematerialized tree");
 });
 
+test("design-gate: missing worktree + rematerialize skipped with path continues (#874)", async () => {
+  // EnsureManagedWorktreeResult "skipped" (already present / race recreate) is a
+  // success variant when worktree path is present — must not false-park.
+  const log = makeLog();
+  const deps = makeDeps(log, [harnessOk(decisionRecordOutput()), harnessOk(verdictOutput("approve"))]);
+  deps.getForIssue = async () => null;
+  let ensureCalls = 0;
+  deps.ensureManagedWorktree = async () => {
+    ensureCalls += 1;
+    return {
+      result: "skipped",
+      worktree: { path: "/tmp/wt-skipped", slug: "874-slug", branch: "pipeline/874-slug" },
+      reason: "already present at /tmp/wt-skipped",
+    };
+  };
+  const cfg = baseCfg();
+  const result = await advanceDesignGate(cfg, 42, {}, deps);
+  assert.equal(ensureCalls, 1);
+  assert.equal(log.blocked.length, 0, `must not park after skipped rematerialize with path; got: ${JSON.stringify(log.blocked)}`);
+  assert.equal(result.advanced, true);
+  if (result.advanced) assert.equal(result.to, "review-1");
+  assert.equal(log.invokeCalls, 2, "gate work must run from the skipped rematerialize path");
+});
+
 test("design-gate: missing worktree + rematerialize fail → worktree-missing park", async () => {
   const log = makeLog();
   const deps = makeDeps(log, []);
