@@ -26,6 +26,11 @@ export const LEXICAL_FIXTURE_ROWS: readonly LexicalFixtureRow[] = [
     expected: ["12", "13"],
   },
   {
+    name: "Oxford-comma multi-reference (comma-plus-and)",
+    text: "Depends on: #12, #13, and #14",
+    expected: ["12", "13", "14"],
+  },
+  {
     name: "colon-form list begins on next line (LF)",
     text: "Depends on:\n#12, #13",
     expected: ["12", "13"],

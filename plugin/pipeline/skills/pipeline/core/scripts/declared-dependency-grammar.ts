@@ -46,7 +46,9 @@ function consumeReferenceList(text: string, start: number): string[] {
     const rest = text.slice(pos);
     // Separator only when the next token is another `#N` — prevents absorbing
     // `and needs #3` as a list continuation after `blocked by #12`.
-    const sep = /^(?:\s*,\s*|\s+and\s+|\s+)(?=#\d)/i.exec(rest);
+    // Comma-plus-`and` (Oxford comma: `, and #N`) must be tried before bare
+    // comma so the final prerequisite is not dropped at `, and`.
+    const sep = /^(?:\s*,\s*and\s+|\s*,\s*|\s+and\s+|\s+)(?=#\d)/i.exec(rest);
     if (!sep) break;
     pos += sep[0].length;
     const next = /^#(\d+)/.exec(text.slice(pos));

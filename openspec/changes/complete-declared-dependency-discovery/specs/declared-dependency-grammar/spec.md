@@ -44,6 +44,11 @@ prerequisite when scanned as dependency prose.
 - **WHEN** text contains `Depends on #12 and #13`
 - **THEN** the parser result SHALL include both `12` and `13`
 
+#### Scenario: Oxford-comma multi-reference form
+
+- **WHEN** text contains `Depends on: #12, #13, and #14`
+- **THEN** the parser result SHALL include `12`, `13`, and `14`
+
 #### Scenario: Equivalent phrase forms preserve every reference
 
 - **WHEN** text contains `requires #1, #2` or `blocked by #3 and #4` or `needs #5, #6 and #7`

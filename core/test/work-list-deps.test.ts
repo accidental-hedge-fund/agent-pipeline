@@ -46,6 +46,8 @@ test("parseDeclaredDependencyIds: multi-reference colon/comma and and-joined for
   assert.deepEqual(parseDeclaredDependencyIds("Depends on: #12, #13"), ["12", "13"]);
   assert.deepEqual(parseDeclaredDependencyIds("Depends on #12 and #13"), ["12", "13"]);
   assert.deepEqual(parseDeclaredDependencyIds("needs #5, #6 and #7"), ["5", "6", "7"]);
+  // Oxford comma: final prerequisite after `, and` must not be dropped (#905 ffaec452).
+  assert.deepEqual(parseDeclaredDependencyIds("Depends on: #12, #13, and #14"), ["12", "13", "14"]);
 });
 
 test("parseDeclaredDependencyIds: colon-form list may begin on the next line (#905 80cd834a)", () => {
