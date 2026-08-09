@@ -29,11 +29,11 @@ review steps must follow.
    stop at `pipeline:ready-to-deploy` and never invoke a merge. Merging uses
    loop-isolated, operator-authorized commands only: `/pipeline:merge` per PR, or
    `/pipeline:merge-queue --apply` for a batch (`merge-queue` is dry-run by default).
-   A disabled-by-default deployment wrapper may act as the operator's delegate only
-   after the wrapper validates an authenticated, immutable, expiring grant for the
-   exact action. `/pipeline:merge` does not validate Buzz events or deployment grants.
-   The grant is machine-local deployment state, not repository configuration. Do not
-   add an `auto_merge` config key or a merge stage.
+   External supervisors may invoke those same commands under operator authority.
+   This repository does not ship a Hermes/Buzz factory control plane, grant schema,
+   or second durable scheduler. Merge authority is not repository configuration
+   (`.github/pipeline.yml` cannot authorize merges). Do not add an `auto_merge`
+   config key or a merge stage.
 5. **Verify external shapes; never guess.** Especially `gh --json` field names: confirm the
    real output (`gh pr view N --json <field>`) before coding against it. Guessing gh field
    shapes has caused multiple wasted review rounds.

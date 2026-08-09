@@ -68,13 +68,12 @@ advance loop never auto-advances from it to `ready-to-deploy`.
 `/pipeline merge <pr>` and `/pipeline merge-queue --apply` are loop-isolated,
 operator-authorized surfaces. `merge-queue` is dry-run by default.
 
-A disabled external deployment wrapper may act as an operator delegate only
-after the wrapper validates an authenticated, immutable, expiring grant for the
-exact action. The grant is machine-local state, not `.github/pipeline.yml`.
-`/pipeline merge` does not validate Buzz events or deployment grants and keeps
-all existing merge gates. This exception adds no `auto_merge` key or merge
-stage. In the current Grok factory profile, Grok planning, implementation, and
-fixes use only `grok-4.5`, with no Grok fallback. Codex performs review.
+External supervisors may invoke those same loop-isolated merge commands
+under operator authority. This repository does not ship a Hermes/Buzz factory
+control plane, grant schema, or second durable scheduler. Merge authority is
+not repository configuration (`.github/pipeline.yml` cannot authorize merges).
+Do not add an `auto_merge` key or merge stage. In the current Grok factory
+profile, Grok planning, implementation, and fixes use only `grok-4.5`, with no Grok fallback. Codex performs review.
 
 ## Modes
 
@@ -1372,7 +1371,7 @@ When the loop ends, the skill prints:
 
 ## What this skill never does
 
-- Merge from the advance path — there is no `auto_merge` config key or merge stage. `/pipeline merge <pr>` is a separate operator-authorized command after `pipeline:ready-to-deploy`; advance never calls it. `/pipeline merge-queue --milestone <m>` is dry-run by default; only the separate `--apply` form can merge. A deployment wrapper, not either merge command, validates any external scoped grant.
+- Merge from the advance path — there is no `auto_merge` config key or merge stage. `/pipeline merge <pr>` is a separate operator-authorized command after `pipeline:ready-to-deploy`; advance never calls it. `/pipeline merge-queue --milestone <m>` is dry-run by default; only the separate `--apply` form can merge. External supervisors may call merge commands under operator authority; the repository does not ship a factory grant control plane.
 - Bypass the `pipeline:*` opt-in label gate.
 - Run more than one transition under `--once`.
 - Touch the GitHub repo in `--dry-run` mode.

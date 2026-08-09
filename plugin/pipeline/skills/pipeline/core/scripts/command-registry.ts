@@ -88,11 +88,12 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   release: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "base", "dryRun", "edit", "release"]),
+    // prepare: version + dryRun/edit; finish: pr number + json (positional finish <pr>)
+    allowedFlags: new Set(["repoPath", "base", "dryRun", "edit", "release", "json"]),
     needsConfig: false,
     needsGhAuth: true,
     mutatesGitHub: true,
-    supportsJson: false,
+    supportsJson: true,
   },
 
   // Factory Reliability Gate (#723): score a durable loop / fixture pack and
@@ -123,6 +124,24 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   // Two-track production pin (#762): show / init / promote / rollback.
   // Never merges or tags. Writes only the repo pin JSON under .agent-pipeline/.
+  "engine-promote": {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "for",
+      "host",
+      "json",
+      "dryRun",
+      "gitSha",
+      "skipInstall",
+    ]),
+    needsConfig: false,
+    needsGhAuth: true,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
   "factory-pin": {
     needsIssueNumber: false,
     allowedFlags: new Set([
@@ -174,7 +193,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
   // Operator-authorized merge-queue (#676/#675): sequential R2D merges +
   // optional prepare-only release-when-complete + optional surgical repair
   // holds. Dry-run remains the default. A caller validates any external
-  // deployment grant; this command does not load grant state.
+  // operator authority; this command does not load external grant state.
   // Allowlist keeps merge/release/repair flags explicit; never auto_merge.
   // mutatesGitHub true when --apply (merges/repair) or release prepare runs.
   "merge-queue": {
@@ -194,6 +213,27 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     needsGhAuth: true,
     mutatesGitHub: true,
     supportsJson: false,
+  },
+
+  // Integrated train (factory simplification Phase 1): ordered advance, optional
+  // merge-between via existing merge surface + squash-aware base containment.
+  // Loop-isolated — never called from advance stage dispatch. No auto_merge.
+  train: {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "profile",
+      "milestone",
+      "issues",
+      "merge",
+      "json",
+      "dryRun",
+    ]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: true,
   },
 
   sweep: {

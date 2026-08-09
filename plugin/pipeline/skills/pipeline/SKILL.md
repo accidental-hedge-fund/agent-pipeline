@@ -61,13 +61,12 @@ advance loop never auto-advances from it to `ready-to-deploy`.
 `/pipeline:merge <pr>` and `/pipeline:merge-queue --apply` are loop-isolated,
 operator-authorized surfaces. `merge-queue` is dry-run by default.
 
-A disabled external deployment wrapper may act as an operator delegate only
-after the wrapper validates an authenticated, immutable, expiring grant for the
-exact action. The grant is machine-local state, not `.github/pipeline.yml`.
-`/pipeline:merge` does not validate Buzz events or deployment grants and keeps
-all existing merge gates. This exception adds no `auto_merge` key or merge
-stage. In the current Grok factory profile, Grok planning, implementation, and
-fixes use only `grok-4.5`, with no Grok fallback. Codex performs review.
+External supervisors may invoke those same loop-isolated merge commands
+under operator authority. This repository does not ship a Hermes/Buzz factory
+control plane, grant schema, or second durable scheduler. Merge authority is
+not repository configuration (`.github/pipeline.yml` cannot authorize merges).
+Do not add an `auto_merge` key or merge stage. In the current Grok factory
+profile, Grok planning, implementation, and fixes use only `grok-4.5`, with no Grok fallback. Codex performs review.
 
 ## Modes
 
@@ -86,11 +85,13 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline merge <pr>                            Operator-authorized squash merge of a ready-to-deploy PR (never called by the advance loop)
 /pipeline merge-queue --milestone <m> [--apply] [--release-when-complete --release-version <ver>] Operator-authorized sequential merge of ready-to-deploy PRs; dry-run by default; optional prepare-only release-when-complete
 /pipeline override <n> "<key>: <reason>"        Disposition a review finding and auto-resume the advance loop
-/pipeline release <version> [--theme "..."] [--dry-run] Prepare a release PR for the given version (never tags, merges, or publishes)
+/pipeline release <version> [--theme "..."] [--dry-run] [--no-edit] | release finish <pr> [--json] Prepare a release PR (version) or finish-merge one (finish <pr>); never tags or publishes (workflows do)
 /pipeline remove-worktree <n> [--force]         Remove a managed pipeline worktree for an issue (optional --force)
 /pipeline status <n>                            Read-only — print stage, blocker, PR, last review
+/pipeline train --milestone <m>|--issues <n,n> [--merge] [--json] Operator-authorized integrate train: dependency-order issues, advance each to ready-to-deploy, optionally merge and prove base containment before the next (never called by the advance loop)
 /pipeline unblock <n> "<answer>"                Post an answer and clear the blocked label
 /pipeline backfill [--apply] [--capability <name>] Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
+/pipeline engine-promote --for <X.Y.Z> [--host codex|claude|all] [--dry-run] [--json] [--skip-install] Self-host: verify published release, promote production pin, install exact tag, verify version (rollback pin on install failure)
 /pipeline evals plan|run|grade|report|harvest … Offline eval plan/run/grade/report/harvest (never writes to production GitHub)
 /pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] [--promote-pin-on-pass] Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)
 /pipeline factory-pin show|init --from-frg <X.Y.Z>|promote --for <X.Y.Z>|rollback [--to <X.Y.Z>] [--git-sha <sha>] [--force] Show / init / promote / rollback the factory production engine pin (last FRG-passed release; never merges or tags)
@@ -1392,7 +1393,7 @@ When the loop ends, the skill prints:
 
 ## What this skill never does
 
-- Merge from the advance path — there is no `auto_merge` config key or merge stage. `/pipeline:merge <pr>` is a separate operator-authorized command after `pipeline:ready-to-deploy`; advance never calls it. `/pipeline:merge-queue --milestone <m>` is dry-run by default; only the separate `--apply` form can merge. A deployment wrapper, not either merge command, validates any external scoped grant.
+- Merge from the advance path — there is no `auto_merge` config key or merge stage. `/pipeline:merge <pr>` is a separate operator-authorized command after `pipeline:ready-to-deploy`; advance never calls it. `/pipeline:merge-queue --milestone <m>` is dry-run by default; only the separate `--apply` form can merge. External supervisors may call merge commands under operator authority; the repository does not ship a factory grant control plane.
 - Bypass the `pipeline:*` opt-in label gate.
 - Run more than one transition under `--once`.
 - Touch the GitHub repo in `--dry-run` mode.

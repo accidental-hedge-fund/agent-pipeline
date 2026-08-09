@@ -1,0 +1,203 @@
+# External supervisor contract
+
+This document is the **portable bootstrap** for multi-issue / milestone automation
+from any outer host: Hermes, OpenClaw, Slack bots, shell cron, or a human.
+
+**Rule:** supervisors compose the Pipeline CLI. They do not invent a second state
+machine, model matrix, or merge authority in chat.
+
+Related:
+
+- [Factory simplification plan](./factory-simplification-plan.md)
+- [CLI reference](./cli.md) (`train`, `single`, `merge`, `status`, `logs`)
+- Examples: [`examples/supervisor/`](../examples/supervisor/)
+
+## Goals
+
+| Goal | How |
+|---|---|
+| Single issue | `pipeline single <N>` |
+| Ordered group / milestone | `pipeline train --issues …` or `--milestone …` |
+| Integrate between items | `pipeline train … --merge` |
+| Status without re-prompting | Poll train/loop JSON or `pipeline logs` / events |
+| Other users / platforms | Same CLI; only the adapter I/O changes |
+
+## Non-goals
+
+- Shipping a Hermes/Buzz/Slack **product** inside this repository
+- Grant schemas, durable outer journals, or MCP as a startup requirement
+- `auto_merge` in `.github/pipeline.yml`
+- Supervisors choosing implementer/reviewer models (those live in `pipeline.yml`)
+
+## Prerequisites (any deployment)
+
+1. Install agent-pipeline for the host that will run CLI processes.
+2. `gh` authenticated to the target repo with enough permission to advance and (if using `--merge`) merge.
+3. Repo has `.github/pipeline.yml` (models, harnesses, base branch).
+4. Prove the path once by hand:
+
+```bash
+pipeline doctor --json
+pipeline train --issues <N> --json          # no merge
+# only after you accept merge authority for that session/machine:
+pipeline train --milestone vX.Y.Z --merge --json
+```
+
+5. Optional: wire a messenger that can run a command or call a small wrapper script.
+
+## Intent → CLI map
+
+Supervisors SHOULD parse operator text into one of these intents. Prefer
+**explicit** flags over free-form LLM invention of issue sets.
+
+| Intent | Example phrases | Command |
+|---|---|---|
+| Single issue | `do #874`, `pipeline 874` | `pipeline single 874` |
+| Issue list train | `train 905 874 870` | `pipeline train --issues 905,874,870` |
+| Milestone train | `run milestone v1.34.0` | `pipeline train --milestone v1.34.0` |
+| Integrate train | same + `and merge` / `integrate` | add `--merge` |
+| Status | `status`, `train status` | last train JSON, or `pipeline status <N>` / loop logs |
+| Stop | `stop` | stop the host process / systemd unit running train; do not invent force-merge cleanup |
+| Release prepare | `release prepare 1.34.0` | `pipeline release 1.34.0 --no-edit` (opens PR; no merge/tag) |
+| Release finish | `release finish 123` | `pipeline release finish 123` (merge release PR only; workflows tag) |
+| Engine promote | `engine-promote 1.34.0` | `pipeline engine-promote --for 1.34.0` (pin + install after published Release) |
+
+**Merge is opt-in.** Never default `--merge` from a vague “run the milestone”
+unless the deployment policy explicitly allows it for that channel and operator.
+
+## Authority boundary
+
+| Action | Who may invoke |
+|---|---|
+| `pipeline single` / `train` without `--merge` | Operator session or supervised worker with normal advance rights |
+| `pipeline train --merge`, `pipeline merge`, `merge-queue --apply` | Same, but only when the **deployment** intentionally allows automated merge (private channel, allowlisted sender, or human in the loop) |
+| Models / effort | **Only** `.github/pipeline.yml` — supervisors MUST NOT pass ad-hoc model overrides unless the operator explicitly requested a documented CLI flag |
+
+Chat identity is **not** a cryptographic security boundary on a shared UID.
+Document allowlists and tokens in the **host** config, not in repository files.
+
+## Stable train status JSON (`schema_version: 1`)
+
+`pipeline train … --json` prints one JSON object on stdout (human progress on stderr).
+
+```json
+{
+  "schema_version": 1,
+  "kind": "train_status",
+  "ordered_issues": [1, 2],
+  "current_issue": 2,
+  "current_index": 1,
+  "next_action": "merge",
+  "merge_mode": true,
+  "items": [
+    {
+      "issue": 1,
+      "pr": 101,
+      "terminal": "ready-to-deploy",
+      "merge_result_oid": "abc…",
+      "integrated": true
+    }
+  ],
+  "blocker": null,
+  "complete": false
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | Always `1` for this shape |
+| `kind` | Always `"train_status"` |
+| `ordered_issues` | Dependency-ordered issue numbers |
+| `current_issue` / `current_index` | Item in progress, or `null` / last when complete |
+| `next_action` | `advance` \| `merge` \| `wait-for-base` \| `next-item` \| `complete` \| `stopped` \| … |
+| `merge_mode` | Whether this run used `--merge` |
+| `items[]` | Per-issue terminal, PR, merge oid, `integrated` |
+| `blocker` | Human-readable stop reason, or `null` |
+| `complete` | All items finished successfully for this mode |
+
+**Source of truth** remains GitHub labels, PRs, and base history. Status JSON is
+observational. A supervisor MUST NOT treat chat memory as stage authority.
+
+Exit codes: `0` success; non-zero stop (needs-human, merge failure, containment, etc.).
+
+## Progress without prompting
+
+Recommended pattern:
+
+1. Start train in a long-lived process (foreground, `systemd`, or host job runner).
+2. On a timer (e.g. 5–15 minutes) or on process exit, post a short summary:
+   - issue list / milestone
+   - `complete` / `blocker` / current issue
+   - link to PR if known
+3. Prefer `pipeline train --json` final output and/or `pipeline loop logs <run-id> --events --follow` for mid-flight detail when using `single`/`loop`.
+
+Do not spam full logs or secrets into chat.
+
+## Failure and stop semantics
+
+| Situation | Supervisor action |
+|---|---|
+| `needs-human` / blocked | Report `blocker`; wait for human; re-run train (already-integrated items are skipped when safe) |
+| Merge / checks / containment failure | Report exact error; do not force-merge or delete worktrees |
+| Process crash mid-train | Re-run the same selector; rely on GitHub + train idempotency for merged items |
+| Operator stop | Kill the train process only; do not run destructive git cleanup |
+
+## Multi-platform bootstrap
+
+```text
+Messenger (Slack / Buzz / OpenClaw / …)
+    → thin adapter (auth, channel, format reply)
+        → same intent → CLI map
+            → pipeline …
+```
+
+| Piece | Location |
+|---|---|
+| Intent map + status schema | This doc (product contract) |
+| Shell wrapper | `examples/supervisor/shell/` |
+| Hermes / OpenClaw skill sketches | `examples/supervisor/hermes/`, `examples/supervisor/openclaw/` |
+| Slack notes | `examples/supervisor/slack/` |
+| Production secrets & allowlists | Your host — never commit |
+
+Copy an example; point `PIPELINE` at your installed launcher; set `REPO_DIR`.
+Do not fork the engine into the chat product.
+
+## Minimal checklist for a new team
+
+- [ ] `pipeline doctor` green in the service environment  
+- [ ] Hand-run `train` without `--merge` on one issue  
+- [ ] Decide whether this deployment may use `--merge`  
+- [ ] Wire one adapter from `examples/supervisor/`  
+- [ ] Heartbeat posts status, not raw logs  
+- [ ] Document who can send merge-capable commands  
+
+## Release finish JSON (`schema_version: 1`)
+
+`pipeline release finish <pr> --json`:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "release_finish",
+  "pr": 123,
+  "version": "1.34.0",
+  "title": "release: 1.34.0 — theme",
+  "headRefOid": "…",
+  "mergeCommitOid": "…",
+  "alreadyMerged": false
+}
+```
+
+Does **not** create git tags or GitHub Releases. Existing `auto-tag-release` and
+`release` workflows run after the merge lands on the base branch.
+
+## Hermes production (Phase 2b)
+
+Host runbook: [runbooks/hermes-supervisor-deployment.md](./runbooks/hermes-supervisor-deployment.md).  
+Skill template: [examples/supervisor/hermes/SKILL.md](../examples/supervisor/hermes/SKILL.md).
+
+## Versioning
+
+- Intent map and CLI flags may grow; prefer additive changes.
+- `train_status.schema_version` bumps only on breaking JSON shape changes.
+- Outer adapters SHOULD tolerate unknown fields on status objects.

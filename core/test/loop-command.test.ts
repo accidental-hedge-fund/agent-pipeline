@@ -492,7 +492,7 @@ test("maxPositionalsFor — loop accepts keyword + up to MAX_RANGE_SPAN issue nu
 
 test("maxPositionalsFor — other commands keep their existing positional caps (#554)", () => {
   assert.equal(maxPositionalsFor("run"), 2);
-  assert.equal(maxPositionalsFor("release"), 2);
+  assert.equal(maxPositionalsFor("release"), 3); // release <version> | release finish <pr>
   assert.equal(maxPositionalsFor("status"), 2);
   assert.equal(maxPositionalsFor("papercut"), 2);
   assert.equal(maxPositionalsFor("correction"), 2);

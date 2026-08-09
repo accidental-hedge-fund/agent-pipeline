@@ -140,9 +140,18 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     documented: true,
     section: "lifecycle",
   },
+  train: {
+    summary:
+      "Operator-authorized integrate train: dependency-order issues, advance each to ready-to-deploy, optionally merge and prove base containment before the next (never called by the advance loop)",
+    usage: "train --milestone <m>|--issues <n,n> [--merge] [--json]",
+    documented: true,
+    section: "lifecycle",
+  },
   release: {
-    summary: "Prepare a release PR for the given version (never tags, merges, or publishes)",
-    usage: 'release <version> [--theme "..."] [--dry-run]',
+    summary:
+      "Prepare a release PR (version) or finish-merge one (finish <pr>); never tags or publishes (workflows do)",
+    usage:
+      'release <version> [--theme "..."] [--dry-run] [--no-edit] | release finish <pr> [--json]',
     documented: true,
     section: "lifecycle",
   },
@@ -158,6 +167,13 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
       "Show / init / promote / rollback the factory production engine pin (last FRG-passed release; never merges or tags)",
     usage:
       "factory-pin show|init --from-frg <X.Y.Z>|promote --for <X.Y.Z>|rollback [--to <X.Y.Z>] [--git-sha <sha>] [--force]",
+    documented: true,
+    section: "factory",
+  },
+  "engine-promote": {
+    summary:
+      "Self-host: verify published release, promote production pin, install exact tag, verify version (rollback pin on install failure)",
+    usage: "engine-promote --for <X.Y.Z> [--host codex|claude|all] [--dry-run] [--json] [--skip-install]",
     documented: true,
     section: "factory",
   },

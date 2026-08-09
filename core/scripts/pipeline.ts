@@ -90,6 +90,7 @@ import {
   type RunStoreDeps,
   type TerminalLogTee,
 } from "./run-store.ts";
+import { finishReleasePr, realReleaseFinishDeps } from "./stages/release-finish.ts";
 import { runRelease } from "./stages/release.ts";
 import { runIntake, realIntakeDeps } from "./stages/intake.ts";
 import { runRefineSpec, realRefineSpecDeps } from "./stages/refine-spec.ts";
@@ -105,6 +106,12 @@ import { runSweep, realSweepDeps } from "./stages/sweep.ts";
 import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
 import { mergePr, realMergeDeps } from "./stages/merge.ts";
 import { runMergeQueue, realMergeQueueDeps } from "./stages/merge-queue.ts";
+import {
+  parseIssueList,
+  realTrainDeps,
+  runTrain,
+  type AdvanceOutcome,
+} from "./stages/train.ts";
 import * as reviewStage from "./stages/review.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
 import {
@@ -385,6 +392,10 @@ export interface CliOpts {
   gitSha?: string;
   /** factory-pin init: bootstrap from FRG pass for this version. */
   fromFrg?: string;
+  /** factory-pin / engine-promote: install host (codex|claude|all). */
+  host?: string;
+  /** engine-promote: skip skill install (pin-only). */
+  skipInstall?: boolean;
   /** factory-pin rollback: target version (default: pin.previous). */
   to?: string;
   /** scoreboard: restrict analysis to runs on or before this ISO date. */
@@ -420,8 +431,12 @@ export interface CliOpts {
   maxFailureRate?: number;
   /** queue: filter eligible issues to those carrying all specified labels (repeatable). */
   label?: string[];
-  /** queue / merge-queue: filter eligible issues to those belonging to this milestone title. */
+  /** queue / merge-queue / train / loop: filter issues to this milestone title. */
   milestone?: string;
+  /** train: comma- or space-separated issue list (e.g. "10,11,12"). */
+  issues?: string;
+  /** train: after ready-to-deploy, merge via existing merge surface and prove base containment. */
+  merge?: boolean;
   /** queue: filter eligible issues to those at or below this risk level (low|medium|high). */
   risk?: string;
   /**
@@ -514,16 +529,20 @@ export function maxPositionalsFor(command: string | undefined): number {
   if (
     command === "run" ||
     command === "single" ||
-    command === "release" ||
     command === "intake" ||
     command === "triage" ||
     command === "merge" ||
     command === "merge-queue" ||
+    command === "train" ||
     command === "status" ||
     command === "papercut" ||
     command === "correction"
   ) {
     return 2;
+  }
+  // release <version> OR release finish <pr>
+  if (command === "release") {
+    return 3;
   }
   if (command === "unblock" || command === "override" || command === "evals") {
     return 3;
@@ -545,7 +564,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | factory-pin | intake | triage | roadmap | sweep | merge | merge-queue | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | factory-pin | engine-promote | intake | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -614,7 +633,12 @@ export function buildCmd(): Command {
     // descriptions/visibility, so it never appears anywhere in --help output.
     .addOption(new Option("--run <run-id>", "run-store run id to record an event against, or scope a report to").hideHelp())
     .addOption(new Option("-m, --message <text>", "free-text friction message to record").hideHelp())
-    .option("--for <version>", "factory-gate / factory-pin promote: target release version X.Y.Z", undefined)
+    .option("--for <version>", "factory-gate / factory-pin / engine-promote: target release version X.Y.Z", undefined)
+    .option(
+      "--host <name>",
+      "engine-promote: skill install host (codex|claude|grok|opencode|all; default codex)",
+    )
+    .option("--skip-install", "engine-promote: promote pin only; do not run npx install")
     .option("--from-run <run-id>", "factory-gate: score an existing durable loop run id")
     .option(
       "--engine-track <track>",
@@ -667,7 +691,12 @@ export function buildCmd(): Command {
     .option("--concurrency <C>", "queue: maximum simultaneous pipeline runs (default: 1)", Number)
     .option("--max-failure-rate <R>", "queue: halt new launches when failure rate meets this threshold 0.0–1.0 (default: 1.0)", Number)
     .option("--label <L>", "queue: filter eligible issues to those carrying this label (repeatable)", collectRepeatable, [])
-    .option("--milestone <M>", "queue / merge-queue / loop: filter issues to this milestone title")
+    .option("--milestone <M>", "queue / merge-queue / train / loop: filter issues to this milestone title")
+    .option("--issues <list>", "train: comma- or space-separated issue numbers (e.g. 10,11,12)")
+    .option(
+      "--merge",
+      "train: after each issue reaches ready-to-deploy, merge via pipeline merge and prove base containment before the next item",
+    )
     .option("--risk <level>", "queue: filter eligible issues to those at or below this risk level (low|medium|high)")
     .option(
       "--release-when-complete",
@@ -2789,6 +2818,8 @@ async function main(): Promise<void> {
   const isMergeCommand = numArg === "merge";
   // `pipeline merge-queue --milestone <m> [--apply] [--release-when-complete] …` (#676).
   const isMergeQueueCommand = numArg === "merge-queue";
+  // `pipeline train --milestone <m>|--issues <n,n> [--merge] [--json]` — integrate train.
+  const isTrainCommand = numArg === "train";
   // `pipeline loop ...` (#451) — deterministic preflight + delegation to goal-loop.
   // Needs no PipelineConfig and calls no gh at all (see command-registry.ts).
   const isLoopCommand = numArg === "loop";
@@ -2897,6 +2928,11 @@ async function main(): Promise<void> {
             `Allowed: --milestone, --apply, --dry-run, --repair, --release-when-complete, ` +
             `--release-version, --repo-path, --base, --profile.`,
         );
+      } else if (isTrainCommand) {
+        console.error(
+          `pipeline: 'pipeline train' does not support ${flags}. ` +
+            `Allowed: --milestone, --issues, --merge, --json, --dry-run, --repo-path, --base, --profile.`,
+        );
       } else if (opts.removeWorktree && isNumericOrAbsent) {
         console.error(`pipeline: '--remove-worktree' mode does not support ${flags}. These are separate modes.`);
       } else if (opts.cleanup && isNumericOrAbsent) {
@@ -2957,27 +2993,35 @@ async function main(): Promise<void> {
       }
     }
   }
-  // Validate the release version argument early (before config resolution) so a
-  // malformed invocation fails cleanly without requiring gh auth or a valid config.
+  // Validate release args early. Subcommands: prepare (`release <version>`) or
+  // finish (`release finish <pr>`).
   if (isReleaseCommand) {
-    const versionArgEarly = cmd.args[1];
-    if (!versionArgEarly) {
+    const subEarly = cmd.args[1];
+    if (!subEarly) {
       console.error(
-        "pipeline release: a version argument is required.\n" +
+        "pipeline release: a version argument or 'finish <pr>' is required.\n" +
           "  Usage: pipeline release <X.Y.Z | major | minor | patch> [--theme \"...\"] [--dry-run] [--no-edit]\n" +
+          "         pipeline release finish <pr> [--json]\n" +
           "         [--allow-open-soak-defects \"<reason>\"]\n" +
-          "  Example: pipeline release 1.6.0  OR  pipeline release minor\n" +
-          "  Unshipped release-plan row shape (auto-scaffolded when missing if `| *(none)* |` is present):\n" +
-          "    | **vX.Y.Z** | major|minor|patch | <theme> | #N, #M | <why> |\n" +
-          "  Columns: Release | Bump | Theme | Issues | Why this bump. Shipped rows use `✅ shipped` and are never overwritten.\n" +
-          "  If the plan row cannot be inserted, release fails before any version bump with a copy-pasteable row for ROADMAP.md.",
+          "  Prepare stops at an open release PR (never tags/merges).\n" +
+          "  finish merges an open release PR after checks (never tags — workflows do).",
       );
       process.exit(2);
     }
-    if (/^\d+$/.test(versionArgEarly)) {
+    if (subEarly === "finish") {
+      const prArg = cmd.args[2];
+      if (!prArg || !/^[1-9][0-9]*$/.test(prArg)) {
+        console.error(
+          "pipeline release finish: a positive PR number is required.\n" +
+            "  Usage: pipeline release finish <pr> [--json]",
+        );
+        process.exit(2);
+      }
+    } else if (/^\d+$/.test(subEarly)) {
       console.error(
-        `pipeline release: "${versionArgEarly}" looks like an issue number, not a version.\n` +
-          `  Provide a semver string (e.g., 1.6.0) or an alias (major, minor, patch).`,
+        `pipeline release: "${subEarly}" looks like an issue/PR number, not a version.\n` +
+          `  Prepare: pipeline release <X.Y.Z | major | minor | patch>\n` +
+          `  Finish:  pipeline release finish <pr>`,
       );
       process.exit(2);
     }
@@ -3084,9 +3128,7 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  // Early release dispatch — derives repo_dir/base_branch from local git state
-  // only; no `gh` call. This means dry-run and CI-failure paths never call any
-  // GitHub API before runRelease itself gates on CI passing.
+  // Early release dispatch — prepare (version) or finish (merge release PR).
   if (isReleaseCommand) {
     const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
     const repoDir = findGitRoot(startDir);
@@ -3097,6 +3139,31 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     const localCfg = resolveReleaseConfig(repoDir, opts.base, opts.profile);
+
+    // finish: operator-authorized merge of a prepared release PR (no tag).
+    if (cmd.args[1] === "finish") {
+      const pr = Number.parseInt(String(cmd.args[2]), 10);
+      try {
+        const result = await finishReleasePr(
+          pr,
+          realReleaseFinishDeps(localCfg.repo, localCfg.repo_dir),
+        );
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, kind: "release_finish", ...result }, null, 2));
+        } else {
+          console.log(
+            `[pipeline release finish] PR #${result.pr} v${result.version}` +
+              (result.alreadyMerged ? " (already merged)" : " merged") +
+              (result.mergeCommitOid ? ` merge=${result.mergeCommitOid.slice(0, 12)}` : ""),
+          );
+        }
+      } catch (err) {
+        console.error(`pipeline release finish: ${(err as Error).message}`);
+        process.exit(1);
+      }
+      return;
+    }
+
     const versionArg = cmd.args[1] as string;
     try {
       await runRelease(
@@ -3612,6 +3679,68 @@ async function main(): Promise<void> {
       if (result.exitCode !== 0) process.exitCode = result.exitCode;
     } catch (err) {
       console.error(`pipeline factory-gate: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // `pipeline engine-promote --for X.Y.Z` — Phase 4 self-host pin + install.
+  if (numArg === "engine-promote") {
+    const version = opts.for ? String(opts.for).trim() : "";
+    if (!version) {
+      console.error(
+        "pipeline engine-promote: --for <X.Y.Z> is required.\n" +
+          "  Usage: pipeline engine-promote --for <X.Y.Z> [--host codex|claude|all] [--dry-run] [--json] [--skip-install]\n" +
+          "  Verifies the GitHub Release, promotes the production pin (FRG-gated), installs the exact tag,\n" +
+          "  and verifies installed version. Rolls the pin back if install/verify fails after promote.\n" +
+          "  Never merges PRs or creates tags.",
+      );
+      process.exit(2);
+    }
+    const startDirEp = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDirEp = findGitRoot(startDirEp);
+    if (!repoDirEp) {
+      console.error(
+        `pipeline engine-promote: no git repo at ${startDirEp}. Run from a checkout or pass --repo-path.`,
+      );
+      process.exit(2);
+    }
+    try {
+      const { runEnginePromote, realEnginePromoteDeps } = await import("./stages/engine-promote.ts");
+      const hostRaw = opts.host ? String(opts.host).trim() : "codex";
+      const allowedHosts = new Set(["codex", "claude", "grok", "opencode", "all"]);
+      if (!allowedHosts.has(hostRaw)) {
+        console.error(`pipeline engine-promote: invalid --host ${hostRaw}`);
+        process.exit(2);
+      }
+      const result = await runEnginePromote(
+        {
+          version,
+          repoDir: repoDirEp,
+          host: hostRaw as "codex" | "claude" | "grok" | "opencode" | "all",
+          dryRun: !!opts.dryRun,
+          skipInstall: !!opts.skipInstall,
+          gitSha: opts.gitSha ?? null,
+          pinPath: process.env.AGENT_PIPELINE_PRODUCTION_PIN ?? null,
+        },
+        realEnginePromoteDeps(repoDirEp),
+      );
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(
+          `[engine-promote] version=${result.version} tag=${result.tag} ` +
+            `release_ok=${result.release_verified} pin_promoted=${result.pin_promoted} ` +
+            `install_ran=${result.install_ran} verified=${result.verified}` +
+            (result.rolled_back ? " rolled_back=true" : "") +
+            (result.error ? ` error=${result.error}` : ""),
+        );
+        for (const s of result.steps) console.log(`  - ${s}`);
+        if (result.reinstall_hint) console.log(`  reinstall: ${result.reinstall_hint}`);
+      }
+      if (result.error) process.exit(1);
+    } catch (err) {
+      console.error(`pipeline engine-promote: ${(err as Error).message}`);
       process.exit(1);
     }
     return;
@@ -4218,13 +4347,123 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early train dispatch — ordered advance + optional integrate merges (factory Phase 1).
+  if (isTrainCommand) {
+    let trainCfg: import("./types.ts").PipelineConfig;
+    try {
+      trainCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
+    } catch (err) {
+      console.error(`pipeline train: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    let issueNumbers: number[] = [];
+    try {
+      issueNumbers = parseIssueList(opts.issues);
+    } catch (err) {
+      console.error(`pipeline train: ${(err as Error).message}`);
+      process.exit(2);
+    }
+    const milestone = opts.milestone ? String(opts.milestone).trim() : "";
+    if (issueNumbers.length === 0 && !milestone) {
+      console.error(
+        "pipeline train: --issues <n,n> and/or --milestone <title> is required.\n" +
+          "  Usage: pipeline train --issues 10,11,12 [--merge] [--json]\n" +
+          "         pipeline train --milestone v1.34.0 [--merge] [--json]\n" +
+          "  Without --merge: advances each issue to ready-to-deploy only.\n" +
+          "  With --merge: merges each ready-to-deploy PR via the existing merge surface,\n" +
+          "  proves squash-aware base containment, then starts the next issue.\n" +
+          "  Never called from the advance loop. No auto_merge config key.",
+      );
+      process.exit(2);
+    }
+    if (opts.dryRun) {
+      console.error("pipeline train: --dry-run is not supported for train; omit it.");
+      process.exit(2);
+    }
+    try {
+      const baseDeps = realTrainDeps({
+        repoDir: trainCfg.repo_dir,
+        repo: trainCfg.repo,
+        baseBranch: trainCfg.base_branch,
+        advanceIssue: async () => {
+          throw new Error("advanceIssue must be overridden");
+        },
+      });
+      const trainResult = await runTrain(
+        {
+          issues: issueNumbers.length > 0 ? issueNumbers : undefined,
+          milestone: milestone || undefined,
+          merge: !!opts.merge,
+          baseBranch: trainCfg.base_branch,
+          repoDir: trainCfg.repo_dir,
+          repo: trainCfg.repo,
+        },
+        {
+          ...baseDeps,
+          async advanceIssue(issue): Promise<AdvanceOutcome> {
+            const prevExit = process.exitCode;
+            process.exitCode = 0;
+            try {
+              await runSingleIssueCommand(String(issue), opts);
+            } catch (err) {
+              return { ok: false, error: (err as Error).message };
+            }
+            const exit = process.exitCode ?? 0;
+            process.exitCode = prevExit ?? 0;
+            const snap = await baseDeps.getIssue(issue);
+            const stageLabel = snap.labels.find((l) => l.startsWith("pipeline:"));
+            const stage = stageLabel?.slice("pipeline:".length) ?? null;
+            if (stage === "ready-to-deploy") {
+              return { ok: true, terminal: "ready-to-deploy", labels: snap.labels };
+            }
+            if (stage === "needs-human") {
+              return { ok: true, terminal: "needs-human", labels: snap.labels };
+            }
+            if (snap.labels.includes("blocked")) {
+              return { ok: true, terminal: "blocked", labels: snap.labels };
+            }
+            if (exit !== 0) {
+              return { ok: false, error: `pipeline single exited with code ${exit}` };
+            }
+            return { ok: true, terminal: "other", labels: snap.labels };
+          },
+        },
+      );
+      if (opts.json) {
+        console.log(JSON.stringify(trainResult.status, null, 2));
+      } else {
+        const s = trainResult.status;
+        console.log(
+          `[train] complete=${s.complete} merge_mode=${s.merge_mode} ` +
+            `items=${s.items.length}/${s.ordered_issues.length}` +
+            (s.blocker ? ` blocker=${JSON.stringify(s.blocker)}` : ""),
+        );
+        for (const item of s.items) {
+          console.log(
+            `  #${item.issue}` +
+              (item.pr != null ? ` PR #${item.pr}` : "") +
+              ` ${item.terminal}` +
+              (item.integrated ? " integrated" : "") +
+              (item.merge_result_oid ? ` merge=${item.merge_result_oid.slice(0, 12)}` : "") +
+              (item.error ? ` err=${item.error}` : ""),
+          );
+        }
+      }
+      if (trainResult.exitCode !== 0) process.exit(trainResult.exitCode);
+    } catch (err) {
+      console.error(`pipeline train: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Guard: reject unrecognized non-digit positional arguments before resolveConfig()
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "single", "release", "intake", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "merge-queue", "summary", "improve", "scoreboard", "factory-gate", "factory-pin", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "summary", "improve", "scoreboard", "factory-gate", "factory-pin", "engine-promote", "queue", "backfill", "evals",
       "loop",
     ];
     if (!recognized.includes(numArg)) {

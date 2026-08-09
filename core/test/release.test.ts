@@ -1322,7 +1322,7 @@ test("runRelease: milestone theme used when --theme absent and plan row missing"
   assert.ok(saw.includes("#723") || saw.includes("#730"), `milestone issues on plan row: ${saw.match(/\| \*\*v1\.6\.0\*\*[^\n]*/)?.[0]}`);
 });
 
-test("CLI: release usage documents unshipped plan-row shape", () => {
+test("CLI: release usage documents prepare and finish surfaces", () => {
   const result = spawnSync(
     process.execPath,
     ["--experimental-strip-types", PIPELINE_SCRIPT, "release"],
@@ -1330,8 +1330,11 @@ test("CLI: release usage documents unshipped plan-row shape", () => {
   );
   assert.notEqual(result.status, 0);
   const combined = (result.stdout ?? "") + (result.stderr ?? "");
-  assert.ok(combined.includes("| **vX.Y.Z** |"), `got: ${combined}`);
-  assert.ok(combined.includes("scaffold") || combined.includes("auto-scaffold") || combined.includes("*(none)*"), `got: ${combined}`);
+  assert.ok(combined.includes("pipeline release finish"), `got: ${combined}`);
+  assert.ok(
+    combined.includes("X.Y.Z") || combined.includes("major") || combined.includes("Prepare"),
+    `got: ${combined}`,
+  );
 });
 
 test("runRelease dry-run: fetchPRClosingIssues is never called", async () => {
@@ -1637,8 +1640,14 @@ test("CLI: 'pipeline release' with no version exits non-zero with usage message 
   );
   assert.notEqual(result.status, 0, "should exit non-zero");
   const combined = (result.stdout ?? "") + (result.stderr ?? "");
-  assert.ok(combined.includes("version argument is required"), `got: ${combined}`);
-  assert.ok(combined.includes("| **vX.Y.Z** |"), `usage should document plan-row shape: ${combined}`);
+  assert.ok(
+    combined.includes("version argument") || combined.includes("finish <pr>"),
+    `got: ${combined}`,
+  );
+  assert.ok(
+    combined.includes("pipeline release finish") || combined.includes("Prepare stops"),
+    `usage should mention finish: ${combined}`,
+  );
 });
 
 test("CLI: 'pipeline release 42' (numeric) exits non-zero with ambiguity message (early check, no config needed)", () => {
@@ -1651,7 +1660,21 @@ test("CLI: 'pipeline release 42' (numeric) exits non-zero with ambiguity message
   );
   assert.notEqual(result.status, 0, "should exit non-zero");
   const combined = (result.stdout ?? "") + (result.stderr ?? "");
-  assert.ok(combined.includes("issue number") || combined.includes("semver"), `got: ${combined}`);
+  assert.ok(
+    combined.includes("issue") || combined.includes("PR number") || combined.includes("semver") || combined.includes("version"),
+    `got: ${combined}`,
+  );
+});
+
+test("CLI: 'pipeline release finish' without PR exits non-zero", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "release", "finish"],
+    { encoding: "utf8", env: { ...process.env, PATH: "" } },
+  );
+  assert.notEqual(result.status, 0, "should exit non-zero");
+  const combined = (result.stdout ?? "") + (result.stderr ?? "");
+  assert.ok(combined.includes("finish") && combined.includes("PR"), `got: ${combined}`);
 });
 
 test("CLI: 'pipeline release --cleanup' exits non-zero with conflict message", () => {

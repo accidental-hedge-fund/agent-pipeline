@@ -28,9 +28,9 @@ import { buildCmd } from "../scripts/pipeline.ts";
 // These are the named keywords the dispatch block in pipeline.ts recognizes.
 const DISPATCH_KEYWORDS = [
   "init", "doctor", "status", "unblock", "override", "cleanup",
-  "release", "intake", "sweep", "triage", "merge", "merge-queue",
+  "release", "intake", "sweep", "triage", "merge", "merge-queue", "train",
   "refine-spec", "logs", "summary", "path", "config", "run", "single", "improve",
-  "scoreboard", "roadmap", "loop", "correction", "report",
+  "scoreboard", "roadmap", "loop", "correction", "report", "engine-promote",
 ];
 
 test("command-registry: every recognized dispatch keyword has a registry entry", () => {
@@ -245,7 +245,7 @@ test("command-registry: needsIssueNumber is false for named sub-commands that op
   // Commands that act on the repo/environment, not a specific issue.
   const issueAgnosticKeys = [
     "init", "doctor", "cleanup", "release", "intake", "sweep",
-    "triage", "merge", "merge-queue", "refine-spec", "logs", "summary", "path",
+    "triage", "merge", "merge-queue", "train", "refine-spec", "logs", "summary", "path",
     "config", "improve", "scoreboard", "roadmap", "correction",
   ];
   for (const key of issueAgnosticKeys) {

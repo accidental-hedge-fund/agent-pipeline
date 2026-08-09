@@ -68,8 +68,8 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `release`
 
-- **Usage:** `pipeline release <version> [--theme "..."] [--dry-run]`
-- **Summary:** Prepare a release PR for the given version (never tags, merges, or publishes)
+- **Usage:** `pipeline release <version> [--theme "..."] [--dry-run] [--no-edit] | release finish <pr> [--json]`
+- **Summary:** Prepare a release PR (version) or finish-merge one (finish <pr>); never tags or publishes (workflows do)
 
 #### `remove-worktree`
 
@@ -80,6 +80,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 - **Usage:** `pipeline status <n>`
 - **Summary:** Read-only — print stage, blocker, PR, last review
+
+#### `train`
+
+- **Usage:** `pipeline train --milestone <m>|--issues <n,n> [--merge] [--json]`
+- **Summary:** Operator-authorized integrate train: dependency-order issues, advance each to ready-to-deploy, optionally merge and prove base containment before the next (never called by the advance loop)
 
 #### `unblock`
 
@@ -92,6 +97,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 - **Usage:** `pipeline backfill [--apply] [--capability <name>]`
 - **Summary:** Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
+
+#### `engine-promote`
+
+- **Usage:** `pipeline engine-promote --for <X.Y.Z> [--host codex|claude|all] [--dry-run] [--json] [--skip-install]`
+- **Summary:** Self-host: verify published release, promote production pin, install exact tag, verify version (rollback pin on install failure)
 
 #### `evals`
 
