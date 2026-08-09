@@ -1,6 +1,8 @@
 // Phase 3: Dependency graph construction with source verification and topo sort.
 // All external I/O is injectable via DepgraphDeps for unit testing.
+// Textual candidate extraction uses the shared declared-dependency grammar (#905).
 
+import { parseDeclaredDependencyIds } from "../declared-dependency-grammar.ts";
 import type { InventoryItem, DepGraph, DepEdge, CycleReport, OpenQuestion, IssueNumber, RoadmapConfig } from "./types.ts";
 import { runPool } from "./pool.ts";
 
@@ -83,26 +85,31 @@ export function parseDepVerifyResult(output: string): DepVerifyResult | null {
 }
 
 /**
- * Check whether there are any textual dependency hints in issue bodies
- * (e.g., "depends on #42", "requires #10").
+ * Check whether there are any textual dependency hints in issue title/body
+ * via the shared declared-dependency grammar (#905). Multi-reference phrases
+ * and dependency sections contribute every listed in-inventory prerequisite.
  * Returns pairs [prerequisite, depender] so the edge {from: prerequisite, to: depender}
  * means "prerequisite must precede depender".
+ *
+ * Does NOT maintain a private phrase regular expression — only inventory
+ * membership and edge orientation after parse.
  */
 export function findTextualDepCandidates(items: InventoryItem[]): Array<[IssueNumber, IssueNumber]> {
   const issueNumbers = new Set(items.map((i) => i.issue.number));
   const candidates: Array<[IssueNumber, IssueNumber]> = [];
-  const depRe = /(?:depends on|requires|blocked by|needs)\s+#(\d+)/gi;
+  const seen = new Set<string>();
 
   for (const item of items) {
+    const selfId = String(item.issue.number);
     const text = `${item.issue.title}\n${item.issue.body}`;
-    depRe.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = depRe.exec(text)) !== null) {
-      const depNum = Number.parseInt(m[1], 10);
-      if (issueNumbers.has(depNum) && depNum !== item.issue.number) {
-        // item.issue depends on depNum → depNum (prerequisite) must precede item.issue (depender)
-        candidates.push([depNum, item.issue.number]);
-      }
+    for (const depId of parseDeclaredDependencyIds(text, selfId)) {
+      const depNum = Number.parseInt(depId, 10);
+      if (!issueNumbers.has(depNum) || depNum === item.issue.number) continue;
+      const key = `${depNum}:${item.issue.number}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      // item.issue depends on depNum → depNum (prerequisite) must precede item.issue (depender)
+      candidates.push([depNum, item.issue.number]);
     }
   }
   return candidates;

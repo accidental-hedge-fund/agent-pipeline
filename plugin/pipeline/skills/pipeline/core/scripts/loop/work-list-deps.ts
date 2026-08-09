@@ -1,22 +1,29 @@
-// Work-list declared-dependency population (#615, capability
-// `work-list-declared-dependency-population`).
+// Work-list declared-dependency population (#615 / #905, capabilities
+// `work-list-declared-dependency-population`, `dependency-discovery-source-status`).
 //
-// Production work-list compilation used to hardcode `depends_on: []` for every
-// resolved issue after milestone/label/roadmap-slice/explicit-list selection,
-// so the durable dependency machinery never saw body/native/roadmap edges.
-// This module discovers **declared** prerequisite ids (lexical conventions,
-// GitHub native blockedBy, optional roadmap edges), unions them per depender,
-// and returns `RawContractItem[]` for `compileContractItems`.
+// Discovers **declared** prerequisite ids (lexical conventions via the shared
+// grammar, GitHub native blockedBy, optional roadmap edges), unions them per
+// depender, and returns compile-ready raw items plus observation/provenance
+// records. Fresh multi-item admission refuses when any enabled source is
+// unavailable or incomplete (#905).
 //
-// Pure parsing is network-free. Live reads go only through
-// {@link WorkListDependencyDiscoverDeps} — unit tests inject fakes and perform
-// zero real network, git, or subprocess calls.
+// Pure lexical parsing lives in `declared-dependency-grammar.ts`. Live reads go
+// only through {@link WorkListDependencyDiscoverDeps} — unit tests inject fakes
+// and perform zero real network, git, or subprocess calls.
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import {
+  isCanonicalIssueId,
+  parseDeclaredDependencyIds,
+} from "../declared-dependency-grammar.ts";
 import { getIssueDetail, type GhApiRunner } from "../gh.ts";
 import type { PipelineConfig } from "../types.ts";
 import { type RawContractItem } from "./dependencies.ts";
+import { LoopError } from "./types.ts";
+
+// Re-export the shared grammar so existing import sites keep working.
+export { parseDeclaredDependencyIds, isCanonicalIssueId } from "../declared-dependency-grammar.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -29,65 +36,93 @@ const defaultGhApiRunner: GhApiRunner = async (args) => {
   return typeof stdout === "string" ? stdout : stdout.toString("utf8");
 };
 
-// Canonical GitHub issue id: plain decimal digits, no leading zero (same gate
-// spirit as external-dependency verification in dependencies.ts).
-const CANONICAL_ISSUE_ID_RE = /^[1-9][0-9]*$/;
+// ---------------------------------------------------------------------------
+// Source status + provenance (#905)
+// ---------------------------------------------------------------------------
 
-/** Phrase forms already used by roadmap depgraph (`findTextualDepCandidates`). */
-const PHRASE_DEP_RE = /(?:depends on|requires|blocked by|needs)\s+#(\d+)/gi;
+/** Closed observation vocabulary for an authoritative discovery source. */
+export type DiscoverySourceStatus =
+  | "observed-empty"
+  | "observed-with-edges"
+  | "unavailable"
+  | "incomplete";
 
-/** ATX heading for a dedicated dependency section (any heading level). */
-const DEP_SECTION_HEADING_RE = /^#{1,6}\s+dependenc(?:y|ies)\b[^\n]*$/gim;
-
-const ISSUE_REF_RE = /#(\d+)/g;
+/** Authoritative declaration sources for work-list population (v1). */
+export type DependencyEdgeSource = "lexical" | "native-blocked-by" | "roadmap-declared";
 
 /**
- * Extracts prerequisite issue ids from free text (title and/or body).
- *
- * Matches:
- * - Case-insensitive phrases: `depends on|requires|blocked by|needs` + `#N`
- * - `#N` references under a `## Dependency` / `## Dependencies` (any ATX level)
- *   section body (until the next ATX heading)
- *
- * Ignores self-references when `selfId` is provided, non-canonical ids, and
- * bare `#N` mentions outside phrase or dependency-section context. Returns
- * stable deduped string ids in first-seen order.
+ * One fully-classified observation of an enabled discovery source for a scope
+ * (per-issue for lexical/native; list-level `*` for roadmap edges).
  */
-export function parseDeclaredDependencyIds(text: string, selfId?: string): string[] {
-  if (!text) return [];
+export interface SourceObservation {
+  source: DependencyEdgeSource;
+  /** Issue id for per-item sources, or `"*"` for list-level roadmap observation. */
+  scope: string;
+  status: DiscoverySourceStatus;
+  /** Stable identity for this observation decision (source + scope + status). */
+  observation_id: string;
+  /** Optional machine-readable reason when status is unavailable/incomplete. */
+  reason?: string;
+}
 
-  const seen = new Set<string>();
-  const out: string[] = [];
+/** Contributing source(s) for one directed declared edge. */
+export interface DeclaredEdgeProvenance {
+  depender: string;
+  prerequisite: string;
+  sources: DependencyEdgeSource[];
+}
 
-  const add = (raw: string): void => {
-    if (!CANONICAL_ISSUE_ID_RE.test(raw)) return;
-    if (selfId !== undefined && raw === selfId) return;
-    if (seen.has(raw)) return;
-    seen.add(raw);
-    out.push(raw);
+/** Result of declared-dependency discovery for a work-list snapshot. */
+export interface DeclaredDependencyDiscoveryResult {
+  items: RawContractItem[];
+  observations: SourceObservation[];
+  edge_provenance: DeclaredEdgeProvenance[];
+  /** True when any enabled observation is unavailable or incomplete. */
+  has_incomplete: boolean;
+}
+
+/** Build a stable observation identity string. */
+export function observationIdentity(
+  source: DependencyEdgeSource,
+  scope: string,
+  status: DiscoverySourceStatus,
+): string {
+  return `${source}:${scope}:${status}`;
+}
+
+function observation(
+  source: DependencyEdgeSource,
+  scope: string,
+  status: DiscoverySourceStatus,
+  reason?: string,
+): SourceObservation {
+  return {
+    source,
+    scope,
+    status,
+    observation_id: observationIdentity(source, scope, status),
+    ...(reason ? { reason } : {}),
   };
+}
 
-  PHRASE_DEP_RE.lastIndex = 0;
-  let phraseMatch: RegExpExecArray | null;
-  while ((phraseMatch = PHRASE_DEP_RE.exec(text)) !== null) {
-    add(phraseMatch[1]!);
+function isIncompleteStatus(status: DiscoverySourceStatus): boolean {
+  return status === "unavailable" || status === "incomplete";
+}
+
+/**
+ * Typed refusal when fresh multi-item (or forced) admission cannot fully observe
+ * an enabled authoritative discovery source. No contract/ledger is initialized.
+ */
+export class IncompleteDependencyDiscoveryError extends LoopError {
+  readonly observations: readonly SourceObservation[];
+  readonly incomplete: readonly SourceObservation[];
+
+  constructor(message: string, observations: readonly SourceObservation[]) {
+    super("validation", message);
+    this.name = "IncompleteDependencyDiscoveryError";
+    this.observations = observations;
+    this.incomplete = observations.filter((o) => isIncompleteStatus(o.status));
   }
-
-  DEP_SECTION_HEADING_RE.lastIndex = 0;
-  let headingMatch: RegExpExecArray | null;
-  while ((headingMatch = DEP_SECTION_HEADING_RE.exec(text)) !== null) {
-    const sectionStart = headingMatch.index + headingMatch[0].length;
-    const rest = text.slice(sectionStart);
-    const nextHeading = rest.search(/\n#{1,6}\s+\S/);
-    const section = nextHeading === -1 ? rest : rest.slice(0, nextHeading);
-    ISSUE_REF_RE.lastIndex = 0;
-    let refMatch: RegExpExecArray | null;
-    while ((refMatch = ISSUE_REF_RE.exec(section)) !== null) {
-      add(refMatch[1]!);
-    }
-  }
-
-  return out;
 }
 
 /** One declared edge from a roadmap / slice graph when available at compile time. */
@@ -103,10 +138,11 @@ export interface RoadmapDeclaredEdge {
  * roadmap/slice markdown) when present. Pure and network-free.
  *
  * Per line, the first `#N` is treated as the depender; prerequisite ids are
- * taken from the same lexical dependency conventions as issue bodies
- * (`depends on` / `requires` / `blocked by` / `needs` + `#M`, including the
- * roadmap writeback annotation `_(blocked by #M)_`). Self-references and
- * non-canonical ids are ignored. List order alone never invents an edge.
+ * taken from the shared lexical dependency grammar on the remainder of the
+ * line (`depends on` / `requires` / `blocked by` / `needs` + multi-ref lists,
+ * including the roadmap writeback annotation `_(blocked by #M)_`).
+ * Self-references and non-canonical ids are ignored. List order alone never
+ * invents an edge.
  */
 export function extractRoadmapDeclaredEdges(roadmapText: string): RoadmapDeclaredEdge[] {
   if (!roadmapText) return [];
@@ -121,7 +157,7 @@ export function extractRoadmapDeclaredEdges(roadmapText: string): RoadmapDeclare
     const firstRef = /#(\d+)/.exec(line);
     if (!firstRef || firstRef[1] === undefined) continue;
     const depender = firstRef[1];
-    if (!CANONICAL_ISSUE_ID_RE.test(depender)) continue;
+    if (!isCanonicalIssueId(depender)) continue;
 
     // Phrases after the depender id (writeback annotations + freeform table cells).
     const rest = line.slice(firstRef.index! + firstRef[0].length);
@@ -145,91 +181,219 @@ export interface WorkListDependencyDiscoverDeps {
   getIssueTitleBody(issueNumber: number): Promise<{ title: string; body: string } | null>;
   /**
    * Same-repo GitHub native `blockedBy` issue numbers for the depender.
-   * Null when the relationship cannot be observed (fail closed: no edges from this source).
+   * Null when the relationship cannot be fully observed.
    */
   getBlockedByIssueNumbers(issueNumber: number): Promise<readonly number[] | null>;
   /**
    * Optional issue-level edges already present in a roadmap/slice graph.
-   * Omitted or null contributes no roadmap edges.
+   * Omitted means the roadmap source is not enabled for this compile.
+   * Null means the source was enabled but could not be fully observed.
    */
   getRoadmapDeclaredEdges?(): Promise<readonly RoadmapDeclaredEdge[] | null>;
 }
 
 /**
  * Resolves declared raw dependencies for each work-list issue id by unioning
- * lexical body/title conventions, native blockedBy, and optional roadmap edges.
- * Always returns one {@link RawContractItem} per input id (empty `depends_on`
- * when nothing is declared). Per-source IO failure contributes no edges from
- * that source (fail closed toward independent) without aborting the whole list.
+ * successfully observed edges from lexical body/title conventions, native
+ * blockedBy, and optional roadmap edges. Returns observation records and edge
+ * provenance alongside raw items. Does not invent edges from list order.
+ *
+ * Callers that admit a fresh multi-item run must refuse when
+ * `result.has_incomplete` is true (see {@link assertDiscoveryCompleteForAdmission}).
  */
 export async function discoverDeclaredDependencies(
   issueIds: readonly string[],
   deps: WorkListDependencyDiscoverDeps,
-): Promise<RawContractItem[]> {
-  const roadmapEdges = await loadRoadmapEdges(deps);
+): Promise<DeclaredDependencyDiscoveryResult> {
+  const observations: SourceObservation[] = [];
+  // depender → prerequisite → contributing sources
+  const provenance = new Map<string, Map<string, Set<DependencyEdgeSource>>>();
+
+  const addEdge = (depender: string, prerequisite: string, source: DependencyEdgeSource): void => {
+    if (depender === prerequisite) return;
+    if (!isCanonicalIssueId(prerequisite)) return;
+    let byPrereq = provenance.get(depender);
+    if (!byPrereq) {
+      byPrereq = new Map();
+      provenance.set(depender, byPrereq);
+    }
+    let sources = byPrereq.get(prerequisite);
+    if (!sources) {
+      sources = new Set();
+      byPrereq.set(prerequisite, sources);
+    }
+    sources.add(source);
+  };
+
+  // --- Roadmap (list-level) ---
+  const roadmapEnabled = typeof deps.getRoadmapDeclaredEdges === "function";
   const roadmapByDepender = new Map<string, string[]>();
-  for (const edge of roadmapEdges) {
-    if (!CANONICAL_ISSUE_ID_RE.test(edge.depender) || !CANONICAL_ISSUE_ID_RE.test(edge.prerequisite)) {
+  if (roadmapEnabled) {
+    try {
+      const edges = await deps.getRoadmapDeclaredEdges!();
+      if (edges === null) {
+        observations.push(
+          observation("roadmap-declared", "*", "unavailable", "roadmap edges returned null"),
+        );
+      } else {
+        let edgeCount = 0;
+        for (const edge of edges) {
+          if (!isCanonicalIssueId(edge.depender) || !isCanonicalIssueId(edge.prerequisite)) {
+            continue;
+          }
+          if (edge.depender === edge.prerequisite) continue;
+          const list = roadmapByDepender.get(edge.depender) ?? [];
+          if (!list.includes(edge.prerequisite)) list.push(edge.prerequisite);
+          roadmapByDepender.set(edge.depender, list);
+          addEdge(edge.depender, edge.prerequisite, "roadmap-declared");
+          edgeCount += 1;
+        }
+        observations.push(
+          observation(
+            "roadmap-declared",
+            "*",
+            edgeCount > 0 ? "observed-with-edges" : "observed-empty",
+          ),
+        );
+      }
+    } catch (err) {
+      observations.push(
+        observation(
+          "roadmap-declared",
+          "*",
+          "unavailable",
+          err instanceof Error ? err.message : "roadmap edges threw",
+        ),
+      );
+    }
+  }
+
+  // --- Per-issue lexical + native ---
+  for (const id of issueIds) {
+    if (!isCanonicalIssueId(id)) {
+      // Non-canonical snapshot ids still produce an empty raw item; no source
+      // observation can be issued for them.
       continue;
     }
-    if (edge.depender === edge.prerequisite) continue;
-    const list = roadmapByDepender.get(edge.depender) ?? [];
-    if (!list.includes(edge.prerequisite)) list.push(edge.prerequisite);
-    roadmapByDepender.set(edge.depender, list);
-  }
+    const issueNumber = Number(id);
 
-  const items: RawContractItem[] = [];
-  for (const id of issueIds) {
-    const dependsOn = new Set<string>();
-
-    if (CANONICAL_ISSUE_ID_RE.test(id)) {
-      const issueNumber = Number(id);
-
-      try {
-        const text = await deps.getIssueTitleBody(issueNumber);
-        if (text) {
-          const combined = `${text.title ?? ""}\n${text.body ?? ""}`;
-          for (const dep of parseDeclaredDependencyIds(combined, id)) {
-            dependsOn.add(dep);
-          }
+    // Lexical
+    try {
+      const text = await deps.getIssueTitleBody(issueNumber);
+      if (text === null) {
+        observations.push(
+          observation("lexical", id, "unavailable", "issue title/body unobservable (null)"),
+        );
+      } else {
+        const combined = `${text.title ?? ""}\n${text.body ?? ""}`;
+        const depsIds = parseDeclaredDependencyIds(combined, id);
+        for (const dep of depsIds) {
+          addEdge(id, dep, "lexical");
         }
-      } catch {
-        // Fail closed for this source.
+        observations.push(
+          observation(
+            "lexical",
+            id,
+            depsIds.length > 0 ? "observed-with-edges" : "observed-empty",
+          ),
+        );
       }
-
-      try {
-        const blockedBy = await deps.getBlockedByIssueNumbers(issueNumber);
-        if (blockedBy) {
-          for (const n of blockedBy) {
-            const depId = String(n);
-            if (!CANONICAL_ISSUE_ID_RE.test(depId) || depId === id) continue;
-            dependsOn.add(depId);
-          }
-        }
-      } catch {
-        // Fail closed for this source.
-      }
+    } catch (err) {
+      observations.push(
+        observation(
+          "lexical",
+          id,
+          "unavailable",
+          err instanceof Error ? err.message : "lexical discovery threw",
+        ),
+      );
     }
 
-    for (const dep of roadmapByDepender.get(id) ?? []) {
-      if (dep !== id) dependsOn.add(dep);
+    // Native blockedBy
+    try {
+      const blockedBy = await deps.getBlockedByIssueNumbers(issueNumber);
+      if (blockedBy === null) {
+        observations.push(
+          observation("native-blocked-by", id, "unavailable", "blockedBy unobservable (null)"),
+        );
+      } else {
+        const contributed: string[] = [];
+        for (const n of blockedBy) {
+          const depId = String(n);
+          if (!isCanonicalIssueId(depId) || depId === id) continue;
+          addEdge(id, depId, "native-blocked-by");
+          contributed.push(depId);
+        }
+        observations.push(
+          observation(
+            "native-blocked-by",
+            id,
+            contributed.length > 0 ? "observed-with-edges" : "observed-empty",
+          ),
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "native blockedBy threw";
+      const status: DiscoverySourceStatus =
+        /truncat|pagination|safety bound|incomplete/i.test(msg) ? "incomplete" : "unavailable";
+      observations.push(observation("native-blocked-by", id, status, msg));
     }
-
-    items.push({ id, depends_on: [...dependsOn] });
   }
-  return items;
+
+  const items: RawContractItem[] = issueIds.map((id) => {
+    const byPrereq = provenance.get(id);
+    const depends_on = byPrereq ? [...byPrereq.keys()] : [];
+    return { id, depends_on };
+  });
+
+  const edge_provenance: DeclaredEdgeProvenance[] = [];
+  for (const [depender, byPrereq] of provenance) {
+    for (const [prerequisite, sources] of byPrereq) {
+      edge_provenance.push({
+        depender,
+        prerequisite,
+        sources: [...sources],
+      });
+    }
+  }
+  // Stable order for audit diffs
+  edge_provenance.sort((a, b) => {
+    if (a.depender !== b.depender) return a.depender.localeCompare(b.depender, "en");
+    return a.prerequisite.localeCompare(b.prerequisite, "en");
+  });
+
+  const has_incomplete = observations.some((o) => isIncompleteStatus(o.status));
+
+  return { items, observations, edge_provenance, has_incomplete };
 }
 
-async function loadRoadmapEdges(
-  deps: WorkListDependencyDiscoverDeps,
-): Promise<readonly RoadmapDeclaredEdge[]> {
-  if (!deps.getRoadmapDeclaredEdges) return [];
-  try {
-    const edges = await deps.getRoadmapDeclaredEdges();
-    return edges ?? [];
-  } catch {
-    return [];
-  }
+/**
+ * Refuses fresh multi-item admission when any enabled source is incomplete.
+ * Single-item packs report observations but do not hard-refuse (exploratory
+ * advance); multi-item and factory-owned packs must pass `forceRefuse: true`
+ * or have `issueIds.length >= 2`.
+ *
+ * When refused, throws {@link IncompleteDependencyDiscoveryError} — callers
+ * must not write a run contract or ledger.
+ */
+export function assertDiscoveryCompleteForAdmission(
+  issueIds: readonly string[],
+  result: DeclaredDependencyDiscoveryResult,
+  opts: { forceRefuse?: boolean } = {},
+): void {
+  if (!result.has_incomplete) return;
+  const multiItem = issueIds.length >= 2;
+  if (!multiItem && !opts.forceRefuse) return;
+
+  const incomplete = result.observations.filter((o) => isIncompleteStatus(o.status));
+  const detail = incomplete
+    .map((o) => `${o.source} scope=${o.scope} status=${o.status}${o.reason ? ` (${o.reason})` : ""}`)
+    .join("; ");
+  throw new IncompleteDependencyDiscoveryError(
+    `declared-dependency discovery incomplete for fresh multi-item admission — ` +
+      `refusing contract/ledger init. Incomplete sources: ${detail}`,
+    result.observations,
+  );
 }
 
 /** Page size for GraphQL `Issue.blockedBy` (GitHub connection default max is 100). */
@@ -237,7 +401,7 @@ const BLOCKED_BY_PAGE_SIZE = 100;
 /**
  * Safety bound only — 50 pages × 100 = 5000 native blockers per issue, far above
  * realistic dependency fan-in. Hitting the bound without exhausting pages fails
- * visibly rather than treating a truncated list as authoritative (#615).
+ * visibly rather than treating a truncated list as authoritative (#615 / #905).
  */
 const BLOCKED_BY_MAX_PAGES = 50;
 
@@ -286,6 +450,9 @@ export function collectBlockedByIssueNumbers(
  * (paginated `blockedBy` until exhausted, cached). Falls back to REST
  * `getIssueDetail` for text when GraphQL is unavailable. Roadmap edges default
  * to none unless the caller injects `getRoadmapDeclaredEdges`.
+ *
+ * Incomplete pagination throws (does not cache a truncated set). Null cache
+ * entries mean the issue was unobservable — callers classify as unavailable.
  */
 export function realWorkListDependencyDiscoverDeps(
   cfg: PipelineConfig,
@@ -296,7 +463,12 @@ export function realWorkListDependencyDiscoverDeps(
     getRoadmapDeclaredEdges?: WorkListDependencyDiscoverDeps["getRoadmapDeclaredEdges"];
   } = {},
 ): WorkListDependencyDiscoverDeps {
-  type Cached = { title: string; body: string; blockedBy: number[] };
+  type Cached = {
+    title: string;
+    body: string;
+    /** Null when native blockedBy was not fully observed (e.g. REST-only fallback). */
+    blockedBy: number[] | null;
+  };
   const cache = new Map<number, Cached | null>();
 
   const runGhApi: GhApiRunner = options.runGhApi ?? defaultGhApiRunner;
@@ -391,7 +563,9 @@ export function realWorkListDependencyDiscoverDeps(
   async function loadViaRest(issueNumber: number): Promise<Cached | null> {
     try {
       const detail = await getIssueDetail(cfg, issueNumber);
-      return { title: detail.title, body: detail.body ?? "", blockedBy: [] };
+      // REST has no blockedBy connection — mark native as unobserved (null),
+      // never as an authoritative empty list (#905).
+      return { title: detail.title, body: detail.body ?? "", blockedBy: null };
     } catch {
       return null;
     }
@@ -408,7 +582,8 @@ export function realWorkListDependencyDiscoverDeps(
       options.getBlockedByIssueNumbers ??
       (async (issueNumber) => {
         const row = await load(issueNumber);
-        return row ? row.blockedBy : null;
+        if (!row) return null;
+        return row.blockedBy;
       }),
     getRoadmapDeclaredEdges: options.getRoadmapDeclaredEdges,
   };

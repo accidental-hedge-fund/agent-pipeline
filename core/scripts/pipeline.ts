@@ -182,9 +182,11 @@ import {
 import * as openspec from "./openspec.ts";
 import { compileContractItems, type RawContractItem } from "./loop/dependencies.ts";
 import {
+  assertDiscoveryCompleteForAdmission,
   discoverDeclaredDependencies,
   extractRoadmapDeclaredEdges,
   realWorkListDependencyDiscoverDeps,
+  type DeclaredDependencyDiscoveryResult,
   type RoadmapDeclaredEdge,
   type WorkListDependencyDiscoverDeps,
 } from "./loop/work-list-deps.ts";
@@ -828,6 +830,12 @@ export function compileWorkListRun(
  * Resume paths must NOT call this — they keep the on-disk contract (no silent
  * re-discover overwrite). Run id remains {@link workListRunId} of the issue
  * list only (deps do not change run identity).
+ *
+ * Multi-item packs refuse admission with
+ * {@link IncompleteDependencyDiscoveryError} when any enabled authoritative
+ * source is unavailable or incomplete — no contract/ledger is produced (#905).
+ * Successful compiles attach additive `dependency_discovery` audit identity
+ * (edge provenance + source observations) on the contract.
  */
 export async function compileWorkListRunFresh(
   cfg: PipelineConfig,
@@ -836,9 +844,41 @@ export async function compileWorkListRunFresh(
   runId: string,
   discoverDeps: WorkListDependencyDiscoverDeps = realWorkListDependencyDiscoverDeps(cfg),
   sourceSelector?: LoopSelector,
-): Promise<{ contract: import("./loop/recovery.ts").LoopContractInit; ledger: LoopLedger }> {
-  const rawItems = await discoverDeclaredDependencies(issues, discoverDeps);
-  return compileWorkListRun(cfg, engine, issues, runId, rawItems, sourceSelector);
+  opts?: { forceRefuseIncomplete?: boolean },
+): Promise<{
+  contract: import("./loop/recovery.ts").LoopContractInit;
+  ledger: LoopLedger;
+  discovery: DeclaredDependencyDiscoveryResult;
+}> {
+  const discovery = await discoverDeclaredDependencies(issues, discoverDeps);
+  assertDiscoveryCompleteForAdmission(issues, discovery, {
+    forceRefuse: opts?.forceRefuseIncomplete,
+  });
+  const { contract, ledger } = compileWorkListRun(
+    cfg,
+    engine,
+    issues,
+    runId,
+    discovery.items,
+    sourceSelector,
+  );
+  // Additive provenance — older on-disk contracts omit this field and remain
+  // readable on resume without re-discovery.
+  contract.dependency_discovery = {
+    observations: discovery.observations.map((o) => ({
+      source: o.source,
+      scope: o.scope,
+      status: o.status,
+      observation_id: o.observation_id,
+      ...(o.reason ? { reason: o.reason } : {}),
+    })),
+    edge_provenance: discovery.edge_provenance.map((e) => ({
+      depender: e.depender,
+      prerequisite: e.prerequisite,
+      sources: [...e.sources],
+    })),
+  };
+  return { contract, ledger, discovery };
 }
 
 /** The real `pipeline/loop-execution@1` dispatch seam: runs the per-item
