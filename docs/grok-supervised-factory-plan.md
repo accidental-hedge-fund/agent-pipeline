@@ -1,11 +1,18 @@
 # Hermes/Buzz supervised factory plan
 
-This file keeps its original name for link continuity. It now describes the current Hermes and Buzz factory plan.
+> **Startup architecture superseded (2026-08-09).**  
+> Product direction is the [factory simplification plan](./factory-simplification-plan.md):  
+> freeze growth of `ops/hermes-factory`, implement `pipeline train --merge` in agent-pipeline,  
+> and keep Hermes as a thin Buzz adapter. This file remains as the **pilot design record**  
+> and deployment history for the scoped grant wrapper. Do not extend it as the foundation  
+> for the next factory release.
+
+This file keeps its original name for link continuity. It describes the Hermes/Buzz **pilot** factory plan (scoped grant wrapper).
 
 Use [the deployment runbook](runbooks/hermes-factory-deployment.md) for the exact
 host commands, the accepted same-user trust boundary, calibration, and rollback.
 
-The factory is a disabled-by-default deployment wrapper for `agent-pipeline`. Hermes coordinates one exact release. Pipeline and GitHub remain the sources of truth. This plan does not add a Pipeline stage, scheduler, MCP server, public factory API, or `auto_merge` setting.
+The pilot factory is a disabled-by-default deployment wrapper for `agent-pipeline`. Hermes coordinates one exact release. Pipeline and GitHub remain the sources of truth. This plan does not add a Pipeline stage, scheduler, MCP server, public factory API, or `auto_merge` setting.
 
 Until the scoped factory change is implemented, reviewed, and calibrated, the normal rule stays in force: `pipeline advance`, `pipeline single`, and `pipeline loop` stop at `pipeline:ready-to-deploy`, and an operator performs each merge.
 

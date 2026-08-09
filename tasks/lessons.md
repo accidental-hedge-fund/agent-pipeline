@@ -1,5 +1,12 @@
 # Lessons
 
+- When an outer supervisor reimplements advance, merge, journals, and recovery around Pipeline,
+  stop and put the missing product primitive in the CLI instead (for example integrate train mode).
+  A second durable control plane on the same host multiplies ownership artifacts and ambiguous
+  states; grant/FRG theater does not fix that when the UID trust boundary is already wide.
+- Freeze a pilot that fails operationally rather than growing its roadmap. Harvest correct
+  invariants (one-item integrate waves, squash merge-result containment) and delete or park the
+  rest as startup scope.
 - When several stage failures all become `blocked`, inspect the outer supervisor before adding
   stage-local retries. A configured recovery policy with untouched budgets is evidence that the
   orchestration contract is dead or bypassed.
