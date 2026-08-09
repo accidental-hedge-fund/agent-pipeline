@@ -38,16 +38,18 @@ Harvested invariants (still product goals):
 ## Authority boundary
 
 - Default `advance` / `single` / `loop` stop at `pipeline:ready-to-deploy`.
-- Merge is loop-isolated: `pipeline merge`, `pipeline merge-queue --apply`.
-- A future `pipeline train --merge` is the planned integrate-train surface.
+- Merge is loop-isolated: `pipeline merge`, `pipeline merge-queue --apply`, and
+  opt-in `pipeline train --merge`.
 - No `auto_merge` config key. `.github/pipeline.yml` cannot authorize merges.
 - External supervisors may call loop-isolated commands under operator authority.
 
 ## Phases
 
-1. **Remove pilot tree** (this cleanup) — drop `ops/`, CI coupling, grant-centric docs.
-2. **`pipeline train --merge`** — integrate between issues in agent-pipeline (**implemented**: `pipeline train --milestone <m>|--issues <n,n> [--merge] [--json]`).
-3. **Thin supervisor skill** — Buzz/Hermes (or any host) parses intent and invokes CLI only.
+1. **Remove pilot tree** — done (#921).
+2. **`pipeline train --merge`** — done (#922): `pipeline train --milestone <m>|--issues <n,n> [--merge] [--json]`.
+3. **Thin multi-platform supervisor bootstrap** — done in-repo as contract + examples:
+   [supervisor.md](./supervisor.md), [`examples/supervisor/`](../examples/supervisor/)
+   (shell / Hermes / OpenClaw / Slack notes). Platform bots stay out of core.
 4. **Release finish** — authorized completion after prepare-only `pipeline release` (optional).
 5. **Self-host pin/install** — optional later; not required for ordinary trains.
 
