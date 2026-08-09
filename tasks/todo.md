@@ -1,5 +1,13 @@
 # Scoped autonomous Hermes/Buzz factory
 
+## Grok runtime identity correction
+
+- [x] Verify that the installed Grok catalog exposes only `grok-4.5`.
+- [x] Reproduce the provider telemetry identity `grok-4.5-build` for an exact `grok-4.5` request.
+- [x] Normalize only that verified runtime identity and reject every other model.
+- [x] Run focused factory tests and full repository CI.
+- [ ] Merge, deploy the exact wrapper correction, and resume the existing grant.
+
 ## Doctor warning compatibility correction
 
 - [x] Reproduce the wrapper rejection of a warning-only doctor result.
@@ -49,6 +57,8 @@
 - [ ] Run full FRG, cut v1.33.0, verify publication, and install the new release.
 
 ## Review
+
+- Live mutation-free preflight on 2026-08-08 passed repository config validation, warning-only pinned-engine doctor, all Grok 4.5 and Codex smoke treatments, and an exact direct Grok request. The provider reported `grok-4.5-build` for the only installed model, `grok-4.5`; no issue action ran.
 
 - GitHub roadmap audit on 2026-08-08: 103 open issues, 103 milestone assignments, and zero unmilestoned issues.
 - #908 and #909 moved to v1.34.0 so the native release-preparation seam lands before the factory needs to prepare its second release. The empty v1.33.1 milestone was closed.

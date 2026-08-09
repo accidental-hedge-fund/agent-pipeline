@@ -7,6 +7,8 @@ import { config, ok } from "./helpers.mjs";
 test("requires provider-reported effective grok-4.5 telemetry", () => {
   const exact = `${JSON.stringify({ type: "end", modelUsage: { "grok-4.5": { requests: 1 } } })}\n`;
   assert.equal(parseEffectiveGrokModel(exact), "grok-4.5");
+  const runtimeId = `${JSON.stringify({ type: "end", modelUsage: { "grok-4.5-build": { requests: 1 } } })}\n`;
+  assert.equal(parseEffectiveGrokModel(runtimeId), "grok-4.5");
   assert.throws(() => parseEffectiveGrokModel(JSON.stringify({ type: "end" })), /effective model/);
   assert.throws(
     () => parseEffectiveGrokModel(JSON.stringify({ type: "end", modelUsage: { "grok-4.4": {} } })),
@@ -27,7 +29,7 @@ test("model probe requests exact grok-4.5 without passing service secrets", asyn
   const result = await probeEffectiveGrokModel(machine, {
     run: async (command, args, options) => {
       calls.push({ command, args, options });
-      return ok(JSON.stringify({ type: "end", modelUsage: { "grok-4.5": {} } }));
+      return ok(JSON.stringify({ type: "end", modelUsage: { "grok-4.5-build": {} } }));
     },
     mkdir: async () => {},
     mkdtemp: async () => "/state/model-probes/probe-1",
