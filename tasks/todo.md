@@ -1,5 +1,13 @@
 # Scoped autonomous Hermes/Buzz factory
 
+## Doctor warning compatibility correction
+
+- [x] Reproduce the wrapper rejection of a warning-only doctor result.
+- [x] Accept `warnings` only when every doctor check remains successful.
+- [x] Add regressions for warning-only success and real failure rejection.
+- [x] Run the focused factory tests and full repository CI.
+- [ ] Merge, deploy the exact wrapper correction, and resume the existing grant.
+
 ## Grok smoke configuration correction
 
 - [x] Reproduce the live doctor failure from inherited `sonnet` intake and sweep treatments.

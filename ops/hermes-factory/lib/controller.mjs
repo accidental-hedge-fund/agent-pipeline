@@ -279,7 +279,11 @@ export function validateFrgRunnerReceipt(receipt, { version, manifestSha256, can
 }
 
 export function validateDoctorEnvelope(envelope, version = null) {
-  if (envelope?.schema_version !== "1" || envelope?.status !== "ok" || !Array.isArray(envelope.checks)) {
+  if (
+    envelope?.schema_version !== "1" ||
+    !["ok", "warnings"].includes(envelope?.status) ||
+    !Array.isArray(envelope.checks)
+  ) {
     throw new FactoryStop("doctor-failed", "Pipeline doctor did not return an ok envelope");
   }
   const failed = envelope.checks.filter((check) => check?.ok === false || check?.status === "fail");
