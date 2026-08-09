@@ -88,11 +88,12 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   release: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "base", "dryRun", "edit", "release"]),
+    // prepare: version + dryRun/edit; finish: pr number + json (positional finish <pr>)
+    allowedFlags: new Set(["repoPath", "base", "dryRun", "edit", "release", "json"]),
     needsConfig: false,
     needsGhAuth: true,
     mutatesGitHub: true,
-    supportsJson: false,
+    supportsJson: true,
   },
 
   // Factory Reliability Gate (#723): score a durable loop / fixture pack and

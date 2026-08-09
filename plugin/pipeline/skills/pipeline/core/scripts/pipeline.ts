@@ -90,6 +90,7 @@ import {
   type RunStoreDeps,
   type TerminalLogTee,
 } from "./run-store.ts";
+import { finishReleasePr, realReleaseFinishDeps } from "./stages/release-finish.ts";
 import { runRelease } from "./stages/release.ts";
 import { runIntake, realIntakeDeps } from "./stages/intake.ts";
 import { runRefineSpec, realRefineSpecDeps } from "./stages/refine-spec.ts";
@@ -524,7 +525,6 @@ export function maxPositionalsFor(command: string | undefined): number {
   if (
     command === "run" ||
     command === "single" ||
-    command === "release" ||
     command === "intake" ||
     command === "triage" ||
     command === "merge" ||
@@ -535,6 +535,10 @@ export function maxPositionalsFor(command: string | undefined): number {
     command === "correction"
   ) {
     return 2;
+  }
+  // release <version> OR release finish <pr>
+  if (command === "release") {
+    return 3;
   }
   if (command === "unblock" || command === "override" || command === "evals") {
     return 3;
@@ -2980,27 +2984,35 @@ async function main(): Promise<void> {
       }
     }
   }
-  // Validate the release version argument early (before config resolution) so a
-  // malformed invocation fails cleanly without requiring gh auth or a valid config.
+  // Validate release args early. Subcommands: prepare (`release <version>`) or
+  // finish (`release finish <pr>`).
   if (isReleaseCommand) {
-    const versionArgEarly = cmd.args[1];
-    if (!versionArgEarly) {
+    const subEarly = cmd.args[1];
+    if (!subEarly) {
       console.error(
-        "pipeline release: a version argument is required.\n" +
+        "pipeline release: a version argument or 'finish <pr>' is required.\n" +
           "  Usage: pipeline release <X.Y.Z | major | minor | patch> [--theme \"...\"] [--dry-run] [--no-edit]\n" +
+          "         pipeline release finish <pr> [--json]\n" +
           "         [--allow-open-soak-defects \"<reason>\"]\n" +
-          "  Example: pipeline release 1.6.0  OR  pipeline release minor\n" +
-          "  Unshipped release-plan row shape (auto-scaffolded when missing if `| *(none)* |` is present):\n" +
-          "    | **vX.Y.Z** | major|minor|patch | <theme> | #N, #M | <why> |\n" +
-          "  Columns: Release | Bump | Theme | Issues | Why this bump. Shipped rows use `✅ shipped` and are never overwritten.\n" +
-          "  If the plan row cannot be inserted, release fails before any version bump with a copy-pasteable row for ROADMAP.md.",
+          "  Prepare stops at an open release PR (never tags/merges).\n" +
+          "  finish merges an open release PR after checks (never tags — workflows do).",
       );
       process.exit(2);
     }
-    if (/^\d+$/.test(versionArgEarly)) {
+    if (subEarly === "finish") {
+      const prArg = cmd.args[2];
+      if (!prArg || !/^[1-9][0-9]*$/.test(prArg)) {
+        console.error(
+          "pipeline release finish: a positive PR number is required.\n" +
+            "  Usage: pipeline release finish <pr> [--json]",
+        );
+        process.exit(2);
+      }
+    } else if (/^\d+$/.test(subEarly)) {
       console.error(
-        `pipeline release: "${versionArgEarly}" looks like an issue number, not a version.\n` +
-          `  Provide a semver string (e.g., 1.6.0) or an alias (major, minor, patch).`,
+        `pipeline release: "${subEarly}" looks like an issue/PR number, not a version.\n` +
+          `  Prepare: pipeline release <X.Y.Z | major | minor | patch>\n` +
+          `  Finish:  pipeline release finish <pr>`,
       );
       process.exit(2);
     }
@@ -3107,9 +3119,7 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  // Early release dispatch — derives repo_dir/base_branch from local git state
-  // only; no `gh` call. This means dry-run and CI-failure paths never call any
-  // GitHub API before runRelease itself gates on CI passing.
+  // Early release dispatch — prepare (version) or finish (merge release PR).
   if (isReleaseCommand) {
     const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
     const repoDir = findGitRoot(startDir);
@@ -3120,6 +3130,31 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     const localCfg = resolveReleaseConfig(repoDir, opts.base, opts.profile);
+
+    // finish: operator-authorized merge of a prepared release PR (no tag).
+    if (cmd.args[1] === "finish") {
+      const pr = Number.parseInt(String(cmd.args[2]), 10);
+      try {
+        const result = await finishReleasePr(
+          pr,
+          realReleaseFinishDeps(localCfg.repo, localCfg.repo_dir),
+        );
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, kind: "release_finish", ...result }, null, 2));
+        } else {
+          console.log(
+            `[pipeline release finish] PR #${result.pr} v${result.version}` +
+              (result.alreadyMerged ? " (already merged)" : " merged") +
+              (result.mergeCommitOid ? ` merge=${result.mergeCommitOid.slice(0, 12)}` : ""),
+          );
+        }
+      } catch (err) {
+        console.error(`pipeline release finish: ${(err as Error).message}`);
+        process.exit(1);
+      }
+      return;
+    }
+
     const versionArg = cmd.args[1] as string;
     try {
       await runRelease(

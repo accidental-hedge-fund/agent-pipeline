@@ -68,8 +68,8 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `release`
 
-- **Usage:** `pipeline release <version> [--theme "..."] [--dry-run]`
-- **Summary:** Prepare a release PR for the given version (never tags, merges, or publishes)
+- **Usage:** `pipeline release <version> [--theme "..."] [--dry-run] [--no-edit] | release finish <pr> [--json]`
+- **Summary:** Prepare a release PR (version) or finish-merge one (finish <pr>); never tags or publishes (workflows do)
 
 #### `remove-worktree`
 

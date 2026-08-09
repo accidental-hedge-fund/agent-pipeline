@@ -148,8 +148,10 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     section: "lifecycle",
   },
   release: {
-    summary: "Prepare a release PR for the given version (never tags, merges, or publishes)",
-    usage: 'release <version> [--theme "..."] [--dry-run]',
+    summary:
+      "Prepare a release PR (version) or finish-merge one (finish <pr>); never tags or publishes (workflows do)",
+    usage:
+      'release <version> [--theme "..."] [--dry-run] [--no-edit] | release finish <pr> [--json]',
     documented: true,
     section: "lifecycle",
   },
