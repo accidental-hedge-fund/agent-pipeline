@@ -111,6 +111,18 @@
       "emitter": "setBlocked"
     },
     {
+      "site_id": "stages.design_gate:harness-failure#0",
+      "module": "scripts/stages/design_gate.ts",
+      "line": 420,
+      "occurrence": 0,
+      "match": "design-gate: ${reason}",
+      "disposition": "transient-retryable",
+      "blocker_kind": "harness-failure",
+      "canonical_reason": "harness-contract",
+      "notes": "reviewer harness/entitlement/throttle with typed StageDiagnostic (#870)",
+      "emitter": "setBlocked"
+    },
+    {
       "site_id": "stages.eval:eval-gate-misconfigured#0",
       "module": "scripts/stages/eval.ts",
       "line": 523,

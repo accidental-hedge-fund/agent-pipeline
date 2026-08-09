@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { advanceDesignGate, type DesignGateDeps } from "../scripts/stages/design_gate.ts";
 import { encodeDesignGateState, DESIGN_GATE_COMMENT_HEADING, challengeKey } from "../scripts/design-gate.ts";
 import { readBundle } from "../scripts/evidence-bundle.ts";
+import { projectStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 import type { PipelineConfig, DesignGateState } from "../scripts/types.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 
@@ -606,4 +607,116 @@ test("design-gate: prior null model identity is re-resolved under auto", async (
   );
   const claude = log.invokeModels.find((c) => c.harness === "claude");
   assert.equal(claude?.model, "claude-fable-5");
+});
+
+// ---------------------------------------------------------------------------
+// #870 — design-gate typed durable classification for entitlement / throttle
+// (review finding 0a6eda58: do not collapse into untyped design-gate-failed)
+// ---------------------------------------------------------------------------
+
+test("design-gate: exhausted entitlement fails closed with model-entitlement-required diagnostic", async () => {
+  const log = makeLog();
+  const entitlement: HarnessResult = {
+    success: false,
+    stdout: "Fable 5 requires usage credits. Run /usage-credits to continue.",
+    stderr: "HTTP 429",
+    exit_code: 1,
+    duration: 2,
+    timed_out: false,
+    throttled: true,
+  };
+  // Explicit (non-auto) model — no sonnet rewrite; single reviewer fail.
+  const deps = makeDeps(log, [harnessOk(decisionRecordOutput()), entitlement]);
+  const cfg = baseCfg();
+  cfg.models.review = "claude-fable-5";
+  (cfg.models as { reviewWasAuto?: boolean }).reviewWasAuto = false;
+  const result = await advanceDesignGate(cfg, 42, {}, deps);
+  assert.equal(result.advanced, false);
+  if (result.advanced) throw new Error("expected blocked");
+  assert.equal(result.status, "blocked");
+  assert.equal(result.blockerKind, "harness-failure");
+  assert.ok(result.diagnostic, "must carry StageDiagnostic for durable projection");
+  assert.equal(result.diagnostic!.reason_code, "model-entitlement-required");
+  const proj = projectStageDiagnostic(result.diagnostic);
+  assert.equal(proj.blockerClass, "environment-auth");
+  assert.notEqual(proj.blockerClass, "workflow-engine-defect");
+  // One implementer + one reviewer — no bounded re-ask on entitlement (#870).
+  assert.equal(log.invokeCalls, 2);
+  assert.equal(log.blocked[0]?.kind, "harness-failure");
+});
+
+test("design-gate: ordinary throttle fails closed with transient-infra diagnostic (no re-ask)", async () => {
+  const log = makeLog();
+  const throttle: HarnessResult = {
+    success: false,
+    stdout: "",
+    stderr: "rate_limit_event: overloaded — try again later",
+    exit_code: 1,
+    duration: 1,
+    timed_out: false,
+    throttled: true,
+  };
+  const deps = makeDeps(log, [harnessOk(decisionRecordOutput()), throttle]);
+  const cfg = baseCfg();
+  const result = await advanceDesignGate(cfg, 42, {}, deps);
+  assert.equal(result.advanced, false);
+  if (result.advanced) throw new Error("expected blocked");
+  assert.equal(result.status, "blocked");
+  assert.equal(result.blockerKind, "harness-failure");
+  assert.ok(result.diagnostic, "must carry StageDiagnostic for durable projection");
+  assert.equal(result.diagnostic!.reason_code, "transient-infra");
+  const proj = projectStageDiagnostic(result.diagnostic);
+  assert.equal(proj.blockerClass, "transient-rate-limit");
+  assert.notEqual(proj.blockerClass, "workflow-engine-defect");
+  // Throttle must not consume the parse re-ask path (would be 3 invokes).
+  assert.equal(log.invokeCalls, 2, "must not re-ask on ordinary throttle");
+  assert.match(result.reason, /throttled/i);
+});
+
+test("design-gate: reviewer entitlement after decision record does not re-run implementer", async () => {
+  const state: DesignGateState = {
+    schema_version: 1,
+    trigger: { triggered: true, matched: [{ trigger: "storage", evidence: "path" }], reason: "triggered" },
+    reviewerIdentity: { harness: "claude", model: "claude-fable-5", independence: "independent" },
+    decisionRecordVersions: [DECISION_RECORD as any],
+    bounding: {
+      fieldsTruncated: 0,
+      decisionsDropped: 0,
+      artifactBytesTruncated: false,
+      decisionsDroppedByByteCeiling: 0,
+      arrayEntriesDroppedByByteCeiling: 0,
+    },
+    rounds: [],
+    outcome: null,
+  };
+  const priorComment = `${DESIGN_GATE_COMMENT_HEADING}\n\nDecision record recorded.\n\n${encodeDesignGateState(state)}`;
+  const log = makeLog();
+  const entitlement: HarnessResult = {
+    success: false,
+    stdout: "Fable 5 requires usage credits. Run /usage-credits to continue.",
+    stderr: "HTTP 429",
+    exit_code: 1,
+    duration: 2,
+    timed_out: false,
+    throttled: true,
+  };
+  const deps = makeDeps(log, [entitlement], {
+    issueComments: [
+      { author: "bot", body: "## Implementation Plan\n\nDo the thing." },
+      { author: "bot", body: priorComment },
+    ],
+  });
+  const cfg = baseCfg();
+  cfg.models.review = "claude-fable-5";
+  (cfg.models as { reviewWasAuto?: boolean }).reviewWasAuto = false;
+  const result = await advanceDesignGate(cfg, 42, {}, deps);
+  assert.equal(result.advanced, false);
+  if (result.advanced) throw new Error("expected blocked");
+  assert.equal(result.diagnostic?.reason_code, "model-entitlement-required");
+  assert.equal(
+    log.invokeModels.filter((c) => c.harness === "codex").length,
+    0,
+    "must not re-extract decision record on reviewer entitlement",
+  );
+  assert.equal(log.invokeCalls, 1, "only the reviewer interrogation invoke");
 });
