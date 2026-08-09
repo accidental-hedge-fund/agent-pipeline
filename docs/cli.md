@@ -81,6 +81,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 - **Usage:** `pipeline status <n>`
 - **Summary:** Read-only — print stage, blocker, PR, last review
 
+#### `train`
+
+- **Usage:** `pipeline train --milestone <m>|--issues <n,n> [--merge] [--json]`
+- **Summary:** Operator-authorized integrate train: dependency-order issues, advance each to ready-to-deploy, optionally merge and prove base containment before the next (never called by the advance loop)
+
 #### `unblock`
 
 - **Usage:** `pipeline unblock <n> "<answer>"`

@@ -90,6 +90,7 @@ $pipeline override <n> "<key>: <reason>"        Disposition a review finding and
 $pipeline release <version> [--theme "..."] [--dry-run] Prepare a release PR for the given version (never tags, merges, or publishes)
 $pipeline remove-worktree <n> [--force]         Remove a managed pipeline worktree for an issue (optional --force)
 $pipeline status <n>                            Read-only — print stage, blocker, PR, last review
+$pipeline train --milestone <m>|--issues <n,n> [--merge] [--json] Operator-authorized integrate train: dependency-order issues, advance each to ready-to-deploy, optionally merge and prove base containment before the next (never called by the advance loop)
 $pipeline unblock <n> "<answer>"                Post an answer and clear the blocked label
 $pipeline backfill [--apply] [--capability <name>] Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
 $pipeline evals plan|run|grade|report|harvest … Offline eval plan/run/grade/report/harvest (never writes to production GitHub)

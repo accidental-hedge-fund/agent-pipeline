@@ -753,6 +753,7 @@ test("merge: loop-isolation — no stage handler imports merge or merge-queue", 
   // - merge-queue.ts / merge_queue.ts — operator merge-queue plan/drive
   // - merge-queue-release-when-complete.ts — prepare-only hook used by merge-queue
   // - merge_queue_hold.ts — pure hold/repair-budget helpers for operator drive (#675)
+  // - train.ts — operator integrate train (composes merge; not advance)
   //   (same exempt set as merge-queue.test.ts loop-isolation)
   const checkFiles = stageFiles.filter(
     (f) =>
@@ -760,7 +761,8 @@ test("merge: loop-isolation — no stage handler imports merge or merge-queue", 
       f !== "merge-queue.ts" &&
       f !== "merge_queue.ts" &&
       f !== "merge-queue-release-when-complete.ts" &&
-      f !== "merge_queue_hold.ts",
+      f !== "merge_queue_hold.ts" &&
+      f !== "train.ts",
   );
 
   for (const file of checkFiles) {
