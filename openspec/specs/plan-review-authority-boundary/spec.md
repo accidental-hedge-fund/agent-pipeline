@@ -5,33 +5,31 @@ TBD - created by archiving change docs-distinguish-plan-review-authority. Update
 ## Requirements
 ### Requirement: Operator surfaces SHALL use a closed authority vocabulary for plan-review
 
-Operator-facing product documentation, host skill guidance, CLI help, status prose, and architecture language that describe the `plan-review` stage SHALL use the following closed vocabulary and SHALL NOT treat any two of these terms as synonyms:
+Operator-facing product documentation, host skill guidance, CLI help, status prose, and architecture language that describe `plan-review` SHALL use the following closed vocabulary and SHALL NOT treat these terms as synonyms:
 
-1. **Independent agent plan review** — the secondary/reviewer harness (or configured reviewer) successfully reviews the posted implementation plan and produces plan-review evidence (for example a `## Plan Review` comment with a structured verdict). This is agent evidence, not human approval. The term applies only when the configured reviewer actually ran; it does **not** apply to same-harness self-review fallback evidence.
-2. **Human feedback window** — the interval after the `## Implementation Plan` comment is posted during which non-pipeline human comments are eligible to be collected for plan revision. Human comments are optional steering, not a required control.
-3. **Human attestation** — verifiable pipeline output markers (for example `pipeline-attest` / review-artifact body hashes) or operator capability attestations (for example loop/native-goal attestation config). Attestation is provenance or capability evidence, not plan sign-off.
-4. **Human approval** (also called **human sign-off**) — an affirmative human action that a control actually requires before proceeding (for example human merge at `ready-to-deploy`, a `needs-human` disposition, or a shipped graduated-autonomy approval checkpoint). Plan-review SHALL NOT be described as human approval unless an affirmative human action is actually required for that control.
+1. **Independent agent plan review** is evidence from the configured secondary reviewer. It is not human approval and is not same-harness fallback evidence.
+2. **Human feedback window** is an optional interval in which human comments can steer plan revision. It is not approval.
+3. **Human attestation** is provenance or capability evidence. It is not plan sign-off.
+4. **Human approval** or **human sign-off** is an affirmative human action that a control requires. It MAY be a direct per-action approval or one authenticated, immutable, expiring factory grant that names the later actions. A grant authorizes only its closed scope; it does not turn plan review into approval.
 
 #### Scenario: Plan-review is described as independent agent review
 
-- **WHEN** operator-facing documentation describes the `plan-review` stage under the designed cross-harness path
-- **THEN** it SHALL describe that stage as independent agent plan review (cross-harness or configured reviewer) of the implementation plan
+- **WHEN** operator-facing documentation describes `plan-review` under the cross-harness path
+- **THEN** it SHALL describe independent agent review of the implementation plan
 - **AND** it SHALL NOT state that plan-review is human sign-off or human approval
 
 #### Scenario: Human feedback window is named separately from approval
 
 - **WHEN** operator-facing documentation describes human comments on the posted plan
-- **THEN** it SHALL name that opportunity as a human feedback window (or equivalent phrasing that means optional feedback)
-- **AND** it SHALL NOT equate that window with human approval or sign-off
+- **THEN** it SHALL name an optional human feedback window or equivalent
+- **AND** it SHALL NOT equate that window with approval or sign-off
 
-#### Scenario: Attestation and approval remain distinct from plan-review
+#### Scenario: Attestation, grant, and plan-review remain distinct
 
-- **WHEN** documentation describes pipeline output attestation markers or operator capability attestation
-- **THEN** it SHALL use attestation language
-- **AND** it SHALL NOT present those controls as plan-review human sign-off
-- **AND** human merge at `ready-to-deploy` (or other true human-approval controls) SHALL remain named as human approval / human-owned merge, not as plan-review
-
----
+- **WHEN** documentation describes Pipeline attestations or a signed scoped factory grant
+- **THEN** it SHALL distinguish evidence from the human authorization event
+- **AND** it SHALL NOT present agent plan-review evidence as the factory grant
+- **AND** it SHALL state that the grant may authorize only the exact later mutations that it names
 
 ### Requirement: Operator surfaces SHALL NOT overstate independence on the same-harness plan-review fallback
 
@@ -72,24 +70,22 @@ Operator-facing documentation of plan-review SHALL state what happens when the h
 
 ### Requirement: High-traffic operator copy SHALL NOT equate plan-review with human sign-off
 
-The repository's front-door and packaging surfaces that introduce the lifecycle (at minimum `README.md`, and host skill lifecycle/architecture language when they assert plan-review authority) SHALL NOT claim that `plan-review` is human sign-off or human approval. When those surfaces need a one-line lifecycle summary, they SHALL describe plan-review as independent agent review of the plan (with same-harness self-review disclosed when the reviewer CLI is missing) with an optional human feedback window before implementation.
+The repository's front-door and packaging surfaces that introduce the lifecycle SHALL NOT claim that `plan-review` is human sign-off or human approval. They SHALL describe plan-review as independent agent review of the plan, with same-harness fallback disclosed when applicable, and an optional human feedback window before implementation. When they describe a scoped factory, they MAY state that a separate signed operator grant supplies human approval for the exact named issue merges and release actions.
 
 #### Scenario: README Lifecycle band uses correct authority language
 
-- **WHEN** a reader opens the README Lifecycle section (or equivalent front-door band table)
-- **THEN** the plan-review row or sentence SHALL describe independent agent plan review plus an optional human feedback window
-- **AND** that surface SHALL NOT contain a claim that plan-review is the human sign-off before implementation
-- **AND** when the surface asserts independence, it SHALL not omit the same-harness fallback qualification (or a clear pointer to where that qualification is stated)
+- **WHEN** a reader opens the README Lifecycle section or equivalent summary
+- **THEN** the plan-review text SHALL describe independent agent plan review plus an optional human feedback window
+- **AND** it SHALL NOT claim that plan-review is the human sign-off before implementation
+- **AND** any scoped grant SHALL be described as a separate authorization event
 
 #### Scenario: Examples show the authority boundary
 
-- **WHEN** README or skill examples describe `steps.plan_review` or the plan → review → revise → implement path
-- **THEN** the example SHALL show that agent plan-review is the review control when enabled
-- **AND** human comments are optional steering inside the feedback window
-- **AND** human merge remains a separate terminal human-approval control at `ready-to-deploy`
-- **AND** when independence is asserted, same-harness self-review fallback SHALL NOT be presented as equivalent independent evidence
-
----
+- **WHEN** README or skill examples describe `steps.plan_review` or the plan-review path
+- **THEN** agent plan-review SHALL remain the review evidence when enabled
+- **AND** human comments SHALL remain optional steering
+- **AND** a direct operator action or a separate valid scoped grant SHALL remain the merge authorization
+- **AND** same-harness fallback SHALL NOT be presented as equivalent independent evidence
 
 ### Requirement: A drift-guard SHALL fail if plan-review is re-equated with human sign-off
 

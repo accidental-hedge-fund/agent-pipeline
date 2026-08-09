@@ -1,48 +1,31 @@
-# work-list-declared-dependency-population Specification
+## ADDED Requirements
 
-## Purpose
-TBD - created by archiving change work-list-declared-dependency-population. Update Purpose after archive.
-## Requirements
-### Requirement: Work-list compilation SHALL populate declared dependencies before contract item compilation
+### Requirement: Work-list lexical discovery SHALL use the shared multi-reference grammar
 
-Work-list compilation SHALL resolve each item's **declared** prerequisite issue ids from
-authoritative sources and pass those declarations into `compileContractItems` (or an
-equivalent partition that preserves the same in-snapshot / external split) whenever
-Pipeline compiles a durable run from a resolved work-list of issue ids — whether that list
-originated from a milestone, label, roadmap-slice, or explicit work-list selector. It SHALL
-NOT hardcode an empty `depends_on` list for every item when declarations exist. An item with
-no declaration from any authoritative source SHALL compile with empty `depends_on` and empty
-`external_depends_on` (independent by default). Population SHALL NOT invent prerequisites
-from shared files, ranking heuristics, AI inference, or list position alone.
+Work-list declared-dependency population SHALL obtain lexical prerequisite ids only through
+the shared `declared-dependency-grammar` export. Phrase declarations that list multiple
+issue references (including punctuated forms such as `Depends on: #12, #13` and
+`Depends on #12 and #13`) SHALL contribute every listed prerequisite to the raw declared
+set before in-snapshot / external partition. Work-list population SHALL NOT keep a private
+phrase regular expression that can drop trailing references.
 
-#### Scenario: An in-snapshot body declaration becomes depends_on
+#### Scenario: Multi-reference body declaration is fully preserved
 
-- **WHEN** a work-list containing issues `607` and `608` is compiled
-- **AND** issue `608` declares a dependency on `#607` via an authoritative source
-- **THEN** the compiled contract item for `608` SHALL include `607` in its in-snapshot
+- **WHEN** issue `900` body declares `Depends on: #899, #662` (or equivalent multi-reference
+  form)
+- **AND** a work-list containing `900` is compiled with successful lexical observation
+- **THEN** both `899` and `662` SHALL appear in `900`'s raw declared dependencies before
+  partition
+
+#### Scenario: In-snapshot and external partition still apply after multi-ref parse
+
+- **WHEN** a work-list snapshot contains `899` and `900` but not `662`
+- **AND** `900` declares both `899` and `662`
+- **THEN** the compiled contract item for `900` SHALL include `899` in in-snapshot
   `depends_on`
-- **AND** `607` SHALL NOT appear on `608`'s `external_depends_on`
+- **AND** SHALL include `662` on `external_depends_on`
 
-#### Scenario: An out-of-snapshot declaration becomes external_depends_on
-
-- **WHEN** a work-list containing only issue `608` is compiled
-- **AND** issue `608` declares a dependency on `#607`
-- **THEN** the compiled contract item for `608` SHALL record `607` on
-  `external_depends_on`
-- **AND** `607` SHALL be absent from `608`'s in-snapshot `depends_on`
-
-#### Scenario: No declaration yields independent items
-
-- **WHEN** a work-list of issues is compiled and no authoritative source declares a
-  dependency for any item
-- **THEN** every compiled item SHALL have empty `depends_on` and empty
-  `external_depends_on`
-
-#### Scenario: List position alone is not a dependency
-
-- **WHEN** a work-list is compiled in any input order and no authoritative source declares
-  edges among its issues
-- **THEN** the compiler SHALL NOT invent `depends_on` edges from that order
+## MODIFIED Requirements
 
 ### Requirement: Declared dependency sources SHALL be the documented authoritative set and SHALL be unioned
 
@@ -150,49 +133,3 @@ admission rules.
 - **WHEN** a run already exists on disk and is resumed
 - **THEN** Pipeline SHALL NOT re-discover and overwrite that run's contract dependency edges
   as part of ordinary resume
-
-### Requirement: Population SHALL preserve deterministic cycle-checked compilation
-
-Population SHALL leave compilation subject to the `durable-loop-engine` dependency-ordering
-rules after raw declarations are collected: deterministic topological order for in-snapshot
-edges, refusal of duplicate item ids, refusal of in-snapshot cycles as a validation failure,
-and preservation of out-of-snapshot ids on `external_depends_on` without participating in
-cycle detection. Population SHALL NOT weaken those rules.
-
-#### Scenario: In-snapshot cycle still fails compile
-
-- **WHEN** discovered declarations form a cycle among snapshot items
-- **THEN** compilation SHALL fail as a validation error naming the cycle
-- **AND** no run SHALL be initialized from that compile attempt
-
-#### Scenario: Repeated compile of the same declarations is stable
-
-- **WHEN** the same issue list and same declared edge set are compiled repeatedly
-- **THEN** every item SHALL appear after its in-snapshot dependencies
-- **AND** the resulting item order SHALL be identical on every compilation
-
-### Requirement: Work-list lexical discovery SHALL use the shared multi-reference grammar
-
-Work-list declared-dependency population SHALL obtain lexical prerequisite ids only through
-the shared `declared-dependency-grammar` export. Phrase declarations that list multiple
-issue references (including punctuated forms such as `Depends on: #12, #13` and
-`Depends on #12 and #13`) SHALL contribute every listed prerequisite to the raw declared
-set before in-snapshot / external partition. Work-list population SHALL NOT keep a private
-phrase regular expression that can drop trailing references.
-
-#### Scenario: Multi-reference body declaration is fully preserved
-
-- **WHEN** issue `900` body declares `Depends on: #899, #662` (or equivalent multi-reference
-  form)
-- **AND** a work-list containing `900` is compiled with successful lexical observation
-- **THEN** both `899` and `662` SHALL appear in `900`'s raw declared dependencies before
-  partition
-
-#### Scenario: In-snapshot and external partition still apply after multi-ref parse
-
-- **WHEN** a work-list snapshot contains `899` and `900` but not `662`
-- **AND** `900` declares both `899` and `662`
-- **THEN** the compiled contract item for `900` SHALL include `899` in in-snapshot
-  `depends_on`
-- **AND** SHALL include `662` on `external_depends_on`
-

@@ -93,6 +93,17 @@ describe("findTextualDepCandidates", () => {
     assert.ok(candidates.some(([prereq, depender]) => prereq === 15 && depender === 20));
   });
 
+  it("preserves every multi-reference prerequisite via shared grammar (#905)", () => {
+    const items: InventoryItem[] = [
+      makeItem(10, "Depends on: #5, #6"),
+      makeItem(5, "a"),
+      makeItem(6, "b"),
+    ];
+    const candidates = findTextualDepCandidates(items);
+    assert.ok(candidates.some(([p, d]) => p === 5 && d === 10));
+    assert.ok(candidates.some(([p, d]) => p === 6 && d === 10));
+  });
+
   it("ignores references to issues not in the backlog", () => {
     const items: InventoryItem[] = [makeItem(1, "Depends on #999")];
     const candidates = findTextualDepCandidates(items);

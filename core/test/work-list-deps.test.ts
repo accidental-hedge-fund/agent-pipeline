@@ -1,14 +1,17 @@
-// Tests for work-list declared-dependency population (#615, capability
-// `work-list-declared-dependency-population`). Every discovery test injects
-// WorkListDependencyDiscoverDeps fakes — zero real network, git, or subprocess.
+// Tests for work-list declared-dependency population (#615 / #905, capabilities
+// `work-list-declared-dependency-population`, `dependency-discovery-source-status`).
+// Every discovery test injects WorkListDependencyDiscoverDeps fakes — zero real
+// network, git, or subprocess.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { compileContractItems } from "../scripts/loop/dependencies.ts";
 import {
+  assertDiscoveryCompleteForAdmission,
   collectBlockedByIssueNumbers,
   discoverDeclaredDependencies,
   extractRoadmapDeclaredEdges,
+  IncompleteDependencyDiscoveryError,
   parseDeclaredDependencyIds,
   realWorkListDependencyDiscoverDeps,
   type WorkListDependencyDiscoverDeps,
@@ -23,6 +26,8 @@ import {
   type SelectorResolveDeps,
 } from "../scripts/pipeline.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+import { FACTORY_CONTROL_REPO } from "../scripts/production-engine-pin.ts";
+import { LEXICAL_FIXTURE_ROWS } from "./fixtures/declared-deps/lexical-fixtures.ts";
 
 // ---------------------------------------------------------------------------
 // Pure parser
@@ -35,6 +40,30 @@ test("parseDeclaredDependencyIds: phrase forms (depends on / requires / blocked 
     "It is blocked by #12 and needs #3 before merge.",
   ].join("\n");
   assert.deepEqual(parseDeclaredDependencyIds(text), ["607", "100", "12", "3"]);
+});
+
+test("parseDeclaredDependencyIds: multi-reference colon/comma and and-joined forms (#905)", () => {
+  assert.deepEqual(parseDeclaredDependencyIds("Depends on: #12, #13"), ["12", "13"]);
+  assert.deepEqual(parseDeclaredDependencyIds("Depends on #12 and #13"), ["12", "13"]);
+  assert.deepEqual(parseDeclaredDependencyIds("needs #5, #6 and #7"), ["5", "6", "7"]);
+  // Oxford comma: final prerequisite after `, and` must not be dropped (#905 ffaec452).
+  assert.deepEqual(parseDeclaredDependencyIds("Depends on: #12, #13, and #14"), ["12", "13", "14"]);
+});
+
+test("parseDeclaredDependencyIds: colon-form list may begin on the next line (#905 80cd834a)", () => {
+  assert.deepEqual(parseDeclaredDependencyIds("Depends on:\n#12, #13"), ["12", "13"]);
+  assert.deepEqual(parseDeclaredDependencyIds("Depends on:\r\n#12 and #13"), ["12", "13"]);
+  assert.deepEqual(parseDeclaredDependencyIds("requires:\n#5\n#6"), ["5", "6"]);
+});
+
+test("parseDeclaredDependencyIds: shared lexical fixtures (table-driven)", () => {
+  for (const row of LEXICAL_FIXTURE_ROWS) {
+    assert.deepEqual(
+      parseDeclaredDependencyIds(row.text, row.selfId),
+      [...row.expected],
+      row.name,
+    );
+  }
 });
 
 test("parseDeclaredDependencyIds: ## Dependency / ## Dependencies section captures bare #N", () => {
@@ -143,7 +172,7 @@ function fakeDiscoverDeps(opts: {
 }
 
 test("discoverDeclaredDependencies: body section declaration becomes raw depends_on", async () => {
-  const raw = await discoverDeclaredDependencies(
+  const result = await discoverDeclaredDependencies(
     ["607", "608"],
     fakeDiscoverDeps({
       bodies: {
@@ -155,13 +184,16 @@ test("discoverDeclaredDependencies: body section declaration becomes raw depends
       },
     }),
   );
-  const byId = Object.fromEntries(raw.map((i) => [i.id, i]));
+  const byId = Object.fromEntries(result.items.map((i) => [i.id, i]));
   assert.deepEqual(byId["608"]!.depends_on, ["607"]);
   assert.deepEqual(byId["607"]!.depends_on, []);
+  assert.equal(result.has_incomplete, false);
+  const lex608 = result.observations.find((o) => o.source === "lexical" && o.scope === "608");
+  assert.equal(lex608?.status, "observed-with-edges");
 });
 
 test("discoverDeclaredDependencies: multi-source union (body + native) dedupes", async () => {
-  const raw = await discoverDeclaredDependencies(
+  const result = await discoverDeclaredDependencies(
     ["608"],
     fakeDiscoverDeps({
       bodies: {
@@ -172,11 +204,17 @@ test("discoverDeclaredDependencies: multi-source union (body + native) dedupes",
       },
     }),
   );
-  assert.deepEqual(raw[0]!.depends_on, ["607", "609"]);
+  assert.deepEqual(result.items[0]!.depends_on, ["607", "609"]);
+  const edge607 = result.edge_provenance.find(
+    (e) => e.depender === "608" && e.prerequisite === "607",
+  );
+  assert.ok(edge607);
+  assert.ok(edge607!.sources.includes("lexical"));
+  assert.ok(edge607!.sources.includes("native-blocked-by"));
 });
 
 test("discoverDeclaredDependencies: roadmap edges union when provided", async () => {
-  const raw = await discoverDeclaredDependencies(
+  const result = await discoverDeclaredDependencies(
     ["10", "20"],
     fakeDiscoverDeps({
       bodies: {
@@ -189,11 +227,13 @@ test("discoverDeclaredDependencies: roadmap edges union when provided", async ()
       ],
     }),
   );
-  assert.deepEqual(raw.find((i) => i.id === "20")!.depends_on, ["10", "99"]);
+  assert.deepEqual(result.items.find((i) => i.id === "20")!.depends_on, ["10", "99"]);
+  const road = result.observations.find((o) => o.source === "roadmap-declared");
+  assert.equal(road?.status, "observed-with-edges");
 });
 
-test("discoverDeclaredDependencies: per-source IO failure contributes no edges (fail closed)", async () => {
-  const raw = await discoverDeclaredDependencies(
+test("discoverDeclaredDependencies: source throw marks unavailable and keeps other sources' edges", async () => {
+  const result = await discoverDeclaredDependencies(
     ["1", "2"],
     fakeDiscoverDeps({
       bodies: {
@@ -205,11 +245,102 @@ test("discoverDeclaredDependencies: per-source IO failure contributes no edges (
     }),
   );
   // Body failed for 2, but native blockedBy still contributes 1.
-  assert.deepEqual(raw.find((i) => i.id === "2")!.depends_on, ["1"]);
+  assert.deepEqual(result.items.find((i) => i.id === "2")!.depends_on, ["1"]);
+  assert.equal(result.has_incomplete, true);
+  const lex2 = result.observations.find((o) => o.source === "lexical" && o.scope === "2");
+  assert.equal(lex2?.status, "unavailable");
+  // Multi-item admission must refuse — edges from other sources do not override.
+  assert.throws(
+    () => assertDiscoveryCompleteForAdmission(["1", "2"], result),
+    (err: unknown) => {
+      assert.ok(err instanceof IncompleteDependencyDiscoveryError);
+      assert.equal(err.loopFailureClass, "validation");
+      assert.match(err.message, /incomplete/i);
+      return true;
+    },
+  );
+});
+
+test("discoverDeclaredDependencies: null observation is unavailable not observed-empty", async () => {
+  const result = await discoverDeclaredDependencies(
+    ["10", "20"],
+    fakeDiscoverDeps({
+      bodies: {
+        "10": { title: "", body: "" },
+        "20": null,
+      },
+      blockedBy: {
+        "10": [],
+        "20": null,
+      },
+    }),
+  );
+  const lex20 = result.observations.find((o) => o.source === "lexical" && o.scope === "20");
+  const nat20 = result.observations.find((o) => o.source === "native-blocked-by" && o.scope === "20");
+  assert.equal(lex20?.status, "unavailable");
+  assert.equal(nat20?.status, "unavailable");
+  assert.notEqual(lex20?.status, "observed-empty");
+  assert.equal(result.has_incomplete, true);
+});
+
+test("discoverDeclaredDependencies: fully observed empty is observed-empty", async () => {
+  const result = await discoverDeclaredDependencies(
+    ["100", "200"],
+    fakeDiscoverDeps({
+      bodies: {
+        "100": { title: "a", body: "No deps." },
+        "200": { title: "b", body: "Also independent. Mentions #100 in prose only." },
+      },
+      blockedBy: { "100": [], "200": [] },
+    }),
+  );
+  assert.deepEqual(
+    result.items.map((i) => i.depends_on),
+    [[], []],
+  );
+  assert.equal(result.has_incomplete, false);
+  for (const o of result.observations) {
+    assert.equal(o.status, "observed-empty");
+  }
+  // Admission proceeds — independent items, no invented edges.
+  assert.doesNotThrow(() => assertDiscoveryCompleteForAdmission(["100", "200"], result));
+});
+
+test("discoverDeclaredDependencies: lexical edge retained when native is observed-empty", async () => {
+  const result = await discoverDeclaredDependencies(
+    ["607", "608"],
+    fakeDiscoverDeps({
+      bodies: {
+        "607": { title: "", body: "" },
+        "608": { title: "", body: "Depends on #607." },
+      },
+      blockedBy: { "607": [], "608": [] },
+    }),
+  );
+  assert.deepEqual(result.items.find((i) => i.id === "608")!.depends_on, ["607"]);
+  assert.equal(result.has_incomplete, false);
+  const nat = result.observations.find((o) => o.source === "native-blocked-by" && o.scope === "608");
+  assert.equal(nat?.status, "observed-empty");
+  const lex = result.observations.find((o) => o.source === "lexical" && o.scope === "608");
+  assert.equal(lex?.status, "observed-with-edges");
+});
+
+test("discoverDeclaredDependencies: multi-ref body fully preserved before partition", async () => {
+  const result = await discoverDeclaredDependencies(
+    ["899", "900"],
+    fakeDiscoverDeps({
+      bodies: {
+        "899": { title: "", body: "" },
+        "900": { title: "", body: "Depends on: #899, #662" },
+      },
+      blockedBy: { "899": [], "900": [] },
+    }),
+  );
+  assert.deepEqual(result.items.find((i) => i.id === "900")!.depends_on, ["899", "662"]);
 });
 
 test("discoverDeclaredDependencies: no declarations → empty depends_on (independent-by-default)", async () => {
-  const raw = await discoverDeclaredDependencies(
+  const result = await discoverDeclaredDependencies(
     ["100", "200"],
     fakeDiscoverDeps({
       bodies: {
@@ -219,7 +350,7 @@ test("discoverDeclaredDependencies: no declarations → empty depends_on (indepe
     }),
   );
   assert.deepEqual(
-    raw.map((i) => i.depends_on),
+    result.items.map((i) => i.depends_on),
     [[], []],
   );
 });
@@ -228,9 +359,9 @@ test("discoverDeclaredDependencies: no declarations → empty depends_on (indepe
 // Compile partition (discover → compileContractItems / compileWorkListRunFresh)
 // ---------------------------------------------------------------------------
 
-function fakeCfg(): PipelineConfig {
+function fakeCfg(repo = "owner/repo"): PipelineConfig {
   return {
-    repo: "owner/repo",
+    repo,
     base_branch: "main",
     repo_dir: "/tmp/never-used-work-list-deps",
   } as PipelineConfig;
@@ -243,7 +374,13 @@ test("compile: in-snapshot declaration → depends_on, not external_depends_on",
       "608": { title: "dep", body: "## Dependency\n#607" },
     },
   });
-  const { contract } = await compileWorkListRunFresh(fakeCfg(), "claude", ["608", "607"], "run-in", deps);
+  const { contract, discovery } = await compileWorkListRunFresh(
+    fakeCfg(),
+    "claude",
+    ["608", "607"],
+    "run-in",
+    deps,
+  );
   const item608 = contract.items.find((i) => i.id === "608")!;
   const item607 = contract.items.find((i) => i.id === "607")!;
   assert.deepEqual(item608.depends_on, ["607"]);
@@ -253,6 +390,35 @@ test("compile: in-snapshot declaration → depends_on, not external_depends_on",
   assert.ok(
     contract.items.findIndex((i) => i.id === "607") < contract.items.findIndex((i) => i.id === "608"),
   );
+  // Provenance on accepted contract
+  assert.ok(contract.dependency_discovery);
+  assert.ok(
+    contract.dependency_discovery!.edge_provenance.some(
+      (e) => e.depender === "608" && e.prerequisite === "607" && e.sources.includes("lexical"),
+    ),
+  );
+  assert.ok(contract.dependency_discovery!.observations.every((o) => o.observation_id));
+  assert.equal(discovery.has_incomplete, false);
+});
+
+test("compile: multi-ref partitions in-snapshot vs external (#900 style)", async () => {
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "899": { title: "", body: "" },
+      "900": { title: "", body: "Depends on: #899, #662" },
+    },
+    blockedBy: { "899": [], "900": [] },
+  });
+  const { contract } = await compileWorkListRunFresh(
+    fakeCfg(),
+    "claude",
+    ["899", "900"],
+    "run-900",
+    deps,
+  );
+  const item900 = contract.items.find((i) => i.id === "900")!;
+  assert.deepEqual(item900.depends_on, ["899"]);
+  assert.deepEqual(item900.external_depends_on, ["662"]);
 });
 
 test("compile: out-of-snapshot declaration → external_depends_on only", async () => {
@@ -266,6 +432,84 @@ test("compile: out-of-snapshot declaration → external_depends_on only", async 
   assert.equal(item.id, "608");
   assert.deepEqual(item.depends_on, []);
   assert.deepEqual(item.external_depends_on, ["607"]);
+});
+
+test("compile: multi-item refuses incomplete discovery and produces no contract", async () => {
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "1": { title: "", body: "" },
+      "2": { title: "", body: "Depends on #1." },
+    },
+    blockedBy: {
+      "1": [],
+      "2": null, // native unobservable
+    },
+  });
+  await assert.rejects(
+    () => compileWorkListRunFresh(fakeCfg(), "claude", ["1", "2"], "run-refuse", deps),
+    (err: unknown) => {
+      assert.ok(err instanceof IncompleteDependencyDiscoveryError);
+      assert.equal(err.loopFailureClass, "validation");
+      assert.match(err.message, /native-blocked-by/);
+      assert.match(err.message, /incomplete|unavailable/i);
+      return true;
+    },
+  );
+});
+
+test("compile: factory-owned single-item refuses incomplete discovery (no contract/ledger) (#905 0f108c73)", async () => {
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "42": { title: "solo", body: "" },
+    },
+    blockedBy: {
+      "42": null, // native unobservable — incomplete, not observed-empty
+    },
+  });
+  await assert.rejects(
+    () =>
+      compileWorkListRunFresh(
+        fakeCfg(FACTORY_CONTROL_REPO),
+        "claude",
+        ["42"],
+        "run-factory-single-refuse",
+        deps,
+      ),
+    (err: unknown) => {
+      assert.ok(err instanceof IncompleteDependencyDiscoveryError);
+      assert.equal(err.loopFailureClass, "validation");
+      assert.match(err.message, /factory-owned|incomplete/i);
+      assert.match(err.message, /native-blocked-by/);
+      assert.ok(
+        err.incomplete.some(
+          (o) => o.source === "native-blocked-by" && o.scope === "42",
+        ),
+      );
+      return true;
+    },
+  );
+});
+
+test("compile: non-factory single-item still admits when a source is incomplete (exploratory)", async () => {
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "42": { title: "solo", body: "Depends on #99." },
+    },
+    blockedBy: {
+      "42": null,
+    },
+  });
+  const { contract, ledger, discovery } = await compileWorkListRunFresh(
+    fakeCfg("acme/widget"),
+    "claude",
+    ["42"],
+    "run-exploratory-single",
+    deps,
+  );
+  assert.equal(discovery.has_incomplete, true);
+  assert.equal(contract.items.length, 1);
+  assert.equal(contract.items[0]!.id, "42");
+  assert.ok(ledger.items["42"]);
 });
 
 test("compile: no declarations → empty lists; input order does not invent edges", async () => {
@@ -564,9 +808,9 @@ test("realWorkListDependencyDiscoverDeps: paginates blockedBy past first 100 (62
   assert.equal(calls.length, 2, "must issue a follow-up cursor query");
 
   // Discovery union path also sees the beyond-first-page id.
-  const raw = await discoverDeclaredDependencies(["608"], deps);
-  assert.ok(raw[0]!.depends_on.includes("101"));
-  assert.ok(raw[0]!.depends_on.includes("1"));
+  const result = await discoverDeclaredDependencies(["608"], deps);
+  assert.ok(result.items[0]!.depends_on.includes("101"));
+  assert.ok(result.items[0]!.depends_on.includes("1"));
 });
 
 test("realWorkListDependencyDiscoverDeps: single-page blockedBy needs no after cursor", async () => {

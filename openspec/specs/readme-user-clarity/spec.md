@@ -59,22 +59,31 @@ The README SHALL be skimmable and anchor-navigable: it SHALL use a consistent he
 
 ### Requirement: All instructions are accurate to current tool behavior
 
-Every instruction, command, flag, and description in the README and in the linked operator docs companions it presents as authoritative (`docs/cli.md`, `docs/config.md`, and `docs/concepts.md`) SHALL reflect the tool's actual behavior as of the change. No step SHALL contradict how the installer, pipeline commands, reviewer wiring, or config keys currently work.
+Every instruction, command, flag, and description in the README and in the linked authoritative operator docs (`docs/cli.md`, `docs/config.md`, and `docs/concepts.md`) SHALL reflect current behavior. No step SHALL contradict the installer, Pipeline commands, reviewer wiring, configuration schema, release path, or deployment boundary. The README SHALL distinguish ordinary stop-at-ready behavior from a disabled-by-default scoped external factory. It SHALL NOT imply that the scoped factory is a Pipeline config key, a merge stage, or a default capability.
 
 #### Scenario: Install commands match installer implementation
 
-- **WHEN** a reader runs any install command shown in the README
-- **THEN** the command SHALL execute without error against the current installer (flags, env vars, and host names used in examples SHALL be valid)
+- **WHEN** a reader runs an install command shown in the README
+- **THEN** the command SHALL execute against the current installer with valid flags, environment names, and host names
 
 #### Scenario: Reviewer wiring description matches default behavior
 
-- **WHEN** the README or `docs/concepts.md` describes how review is invoked
-- **THEN** it SHALL accurately describe the `reviewMode: prompt-harness` path (direct CLI invocation with a JSON prompt, no plugin required); the companion modes (`claude-companion`, `codex-companion`) SHALL NOT be mentioned as valid or optional alternatives
+- **WHEN** the README or `docs/concepts.md` describes review invocation
+- **THEN** it SHALL accurately describe the configured prompt-harness path
+- **AND** it SHALL NOT present removed companion modes as valid alternatives
 
 #### Scenario: Config key examples are valid
 
-- **WHEN** the README or `docs/config.md` shows a `.github/pipeline.yml` example block
-- **THEN** every key shown SHALL be a currently recognized config key; no schema-rejected or non-existent keys (for example `auto_merge`) SHALL appear as supported options
+- **WHEN** the README or `docs/config.md` shows a `.github/pipeline.yml` block
+- **THEN** every key shown SHALL be recognized by the current schema
+- **AND** no schema-rejected key such as `auto_merge` or a deployment grant SHALL appear as supported configuration
+
+#### Scenario: Default and scoped factory behavior are distinct
+
+- **WHEN** the README describes Hermes completing merges and a release
+- **THEN** it SHALL first state that normal advance and loop commands stop at `pipeline:ready-to-deploy`
+- **AND** it SHALL identify the Hermes factory as an external, opt-in, disabled-by-default deployment that requires a separate authenticated grant
+- **AND** it SHALL link the exact trust boundary and runbook
 
 ### Requirement: Formatting and code blocks render correctly on GitHub
 All Markdown formatting SHALL follow GitHub-Flavored Markdown conventions: fenced code blocks SHALL specify a language hint where appropriate, inline code SHALL use backticks, links SHALL be valid and resolvable, and no mixed or inconsistent heading/list styles SHALL appear in the same section.

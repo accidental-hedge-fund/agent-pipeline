@@ -237,10 +237,17 @@ test("buildEventSinkDeps (default deliver): a non-EPIPE stdin error still reject
   const result = buildEventSinkDeps(cfg);
 
   const origWrite = net.Socket.prototype.write;
+  // Inject exactly once. write()+end() both go through Socket.write; a second
+  // synthetic emit after the first error destroys the stream (listeners cleared)
+  // and would surface as uncaughtException in the test runner.
+  let injected = false;
   net.Socket.prototype.write = function (this: import("node:net").Socket) {
-    process.nextTick(() => {
-      this.emit("error", Object.assign(new Error("synthetic stdin failure"), { code: "ECONNRESET" }));
-    });
+    if (!injected) {
+      injected = true;
+      process.nextTick(() => {
+        this.emit("error", Object.assign(new Error("synthetic stdin failure"), { code: "ECONNRESET" }));
+      });
+    }
     return true;
   };
   try {
@@ -248,6 +255,9 @@ test("buildEventSinkDeps (default deliver): a non-EPIPE stdin error still reject
       () => Promise.resolve(result.eventSink!("line\n")),
       /synthetic stdin failure/,
     );
+    // Allow the deliver path's deferred kill nextTick to run before the test
+    // runner treats the file as finished.
+    await new Promise<void>((resolve) => process.nextTick(resolve));
   } finally {
     net.Socket.prototype.write = origWrite;
   }

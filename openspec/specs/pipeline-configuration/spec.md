@@ -33,11 +33,19 @@ For each field, an explicit CLI override (e.g. `--base`) SHALL win over the file
 - **THEN** the resolved `base_branch` SHALL be `develop`
 
 ### Requirement: Never-auto-merge safety floor is structural, not config-forced
-The pipeline SHALL never merge automatically: there is no merge stage and no merge command (see `pipeline-state-machine`). The `auto_merge` key SHALL be absent from `PartialConfigSchema`; a repo that sets it SHALL receive a strict-schema parse error identifying the offending key. The never-auto-merge guarantee is not config-governed — it is structural.
+
+Repository configuration SHALL NOT authorize merge. There is no merge stage, and the autonomous advance path stops at `pipeline:ready-to-deploy`. The `auto_merge` key SHALL be absent from `PartialConfigSchema`; a repository that sets it SHALL receive a strict-schema parse error that identifies the offending key. The existing loop-isolated `pipeline merge` and `pipeline merge-queue --apply` commands remain explicit authority surfaces. A disabled deployment wrapper MAY validate a scoped operator grant before it invokes a permitted command, but that grant SHALL be machine-local deployment state and SHALL NOT be loaded from `.github/pipeline.yml`.
 
 #### Scenario: auto_merge key rejected
+
 - **WHEN** `.github/pipeline.yml` sets `auto_merge: true`
-- **THEN** `resolveConfig()` SHALL throw with a parse error identifying `auto_merge` as an unknown key
+- **THEN** `resolveConfig()` SHALL throw with a parse error that identifies `auto_merge` as an unknown key
+
+#### Scenario: Factory authority cannot be set in repository config
+
+- **WHEN** `.github/pipeline.yml` sets a grant, delegated merge, or factory-authority key
+- **THEN** strict schema validation SHALL reject that key
+- **AND** repository content SHALL NOT grant a supervisor mutation authority
 
 ### Requirement: Protected steps cannot be disabled via config
 The `steps:` block SHALL accept only the four toggleable keys (`plan_review`, `standard_review`, `adversarial_review`, `docs`); any other key (e.g. an attempt to disable a structural step) SHALL be rejected at validation time.

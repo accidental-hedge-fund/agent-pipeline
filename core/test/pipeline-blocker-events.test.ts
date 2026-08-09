@@ -20,9 +20,29 @@ import {
   type StageDiagnostic,
 } from "../scripts/stage-diagnostic.ts";
 import { setBlocked } from "../scripts/gh.ts";
+import {
+  FACTORY_CONTROL_DIR_ENV,
+  PRODUCTION_PIN_ENV,
+} from "../scripts/production-engine-pin.ts";
 import type { BlockerKind, Outcome, PipelineConfig } from "../scripts/types.ts";
 
 const runStoreDeps = {} as RunStoreDeps;
+
+/** Clear host pin-authority env so unit tests stay hermetic under a live factory. */
+function withoutHostPinAuthorityEnv<T>(fn: () => T | Promise<T>): Promise<T> {
+  const savedPin = process.env[PRODUCTION_PIN_ENV];
+  const savedControl = process.env[FACTORY_CONTROL_DIR_ENV];
+  delete process.env[PRODUCTION_PIN_ENV];
+  delete process.env[FACTORY_CONTROL_DIR_ENV];
+  return Promise.resolve()
+    .then(() => fn())
+    .finally(() => {
+      if (savedPin === undefined) delete process.env[PRODUCTION_PIN_ENV];
+      else process.env[PRODUCTION_PIN_ENV] = savedPin;
+      if (savedControl === undefined) delete process.env[FACTORY_CONTROL_DIR_ENV];
+      else process.env[FACTORY_CONTROL_DIR_ENV] = savedControl;
+    });
+}
 
 function blocked(
   blockerKind: BlockerKind,
@@ -745,106 +765,108 @@ test("runAdvance: factory pin authority uses override path not product target (#
 test("runAdvance: product pinned without factory authority refuses (#762)", async () => {
   // Explicit pinned intent on a product target without factory-control dir or
   // pin path must refuse — must not treat product-local pin as authority.
-  const productDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-run-noauth-"));
-  const domain = `pin-noauth-${process.pid}-${Date.now()}`;
-  const stateDir = `/tmp/pipeline-${domain}`;
-  // Place a product-local pin that must NOT become authority.
-  fs.mkdirSync(path.join(productDir, ".agent-pipeline"), { recursive: true });
-  fs.writeFileSync(
-    path.join(productDir, ".agent-pipeline", "production-engine-pin.json"),
-    JSON.stringify({
-      schema_version: 1,
-      version: "1.29.1",
-      tag: "v1.29.1",
-      git_sha: null,
-      git_sha_source: "unknown",
-      frg_run_id: "frg-product-local",
-      promoted_at: "2026-01-01T00:00:00Z",
-    }),
-  );
-  let enforceCalls = 0;
-  let dispatchCalls = 0;
-  const cfg = {
-    repo: "acme/widget",
-    domain,
-    repo_dir: productDir,
-    base_branch: "main",
-    invocation: "pipeline",
-    marker_footer: "*Automated by Claude Code Pipeline Skill*",
-    engine_track: "pinned",
-    harnesses: {
-      implementer: "claude",
-      implementerSource: "default",
-      reviewer: "codex",
-      reviewerSource: "default",
-    },
-    steps: { standard_review: true, adversarial_review: true },
-    auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
-    papercuts: { enabled: false, auto_file: false },
-    corrections: { auto_file: false },
-  } as unknown as PipelineConfig;
-  const detail = {
-    number: 11,
-    type: "issue",
-    title: "T",
-    body: "B",
-    state: "open",
-    url: "https://example.test/11",
-    labels: ["pipeline:ready"],
-    comments: [],
-  };
-  const runId = "11-2026-08-05T00-00-00-000Z";
-  const deps: AdvanceDeps = {
-    resolvePinnedEngineIdentity: () => ({
-      version: "1.29.1",
-      root: "/skill/core",
-      templates_fingerprint: "abc",
-    }),
-    probeEngineIdentity: () => null,
-    enforceEngineTrack: async () => {
-      enforceCalls += 1;
-      return {
-        ok: true as const,
-        track: "pinned" as const,
-        pin_version: "1.29.1",
-        git_sha: undefined,
-      };
-    },
-    releaseParkedWorktree: async () => ({
-      action: "absent",
-      reason: "no managed worktree",
-      branch: null,
-      worktree: null,
-    }),
-    ensurePipelineLabels: async () => {},
-    getIssueDetail: (async () => detail) as AdvanceDeps["getIssueDetail"],
-    getGhActor: async () => "pipeline-bot",
-    getPrForIssue: async () => null,
-    getOnDiskForIssue: async () => null,
-    postComment: async () => {},
-    postPrComment: async () => {},
-    dispatch: async () => {
-      dispatchCalls += 1;
-      return {
-        advanced: false,
-        status: "blocked",
-        reason: "merge conflict with base",
-        blockerKind: "merge-conflict",
-      };
-    },
-  };
-  try {
-    await runAdvance(cfg, 11, { runId }, deps);
-    assert.equal(
-      enforceCalls,
-      0,
-      "must refuse before enforce when product has no factory pin authority",
+  await withoutHostPinAuthorityEnv(async () => {
+    const productDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-run-noauth-"));
+    const domain = `pin-noauth-${process.pid}-${Date.now()}`;
+    const stateDir = `/tmp/pipeline-${domain}`;
+    // Place a product-local pin that must NOT become authority.
+    fs.mkdirSync(path.join(productDir, ".agent-pipeline"), { recursive: true });
+    fs.writeFileSync(
+      path.join(productDir, ".agent-pipeline", "production-engine-pin.json"),
+      JSON.stringify({
+        schema_version: 1,
+        version: "1.29.1",
+        tag: "v1.29.1",
+        git_sha: null,
+        git_sha_source: "unknown",
+        frg_run_id: "frg-product-local",
+        promoted_at: "2026-01-01T00:00:00Z",
+      }),
     );
-    assert.equal(dispatchCalls, 0, "must not reach stages without factory pin authority");
-  } finally {
-    fs.rmSync(productDir, { recursive: true, force: true });
-    fs.rmSync(stateDir, { recursive: true, force: true });
-  }
+    let enforceCalls = 0;
+    let dispatchCalls = 0;
+    const cfg = {
+      repo: "acme/widget",
+      domain,
+      repo_dir: productDir,
+      base_branch: "main",
+      invocation: "pipeline",
+      marker_footer: "*Automated by Claude Code Pipeline Skill*",
+      engine_track: "pinned",
+      harnesses: {
+        implementer: "claude",
+        implementerSource: "default",
+        reviewer: "codex",
+        reviewerSource: "default",
+      },
+      steps: { standard_review: true, adversarial_review: true },
+      auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
+      papercuts: { enabled: false, auto_file: false },
+      corrections: { auto_file: false },
+    } as unknown as PipelineConfig;
+    const detail = {
+      number: 11,
+      type: "issue",
+      title: "T",
+      body: "B",
+      state: "open",
+      url: "https://example.test/11",
+      labels: ["pipeline:ready"],
+      comments: [],
+    };
+    const runId = "11-2026-08-05T00-00-00-000Z";
+    const deps: AdvanceDeps = {
+      resolvePinnedEngineIdentity: () => ({
+        version: "1.29.1",
+        root: "/skill/core",
+        templates_fingerprint: "abc",
+      }),
+      probeEngineIdentity: () => null,
+      enforceEngineTrack: async () => {
+        enforceCalls += 1;
+        return {
+          ok: true as const,
+          track: "pinned" as const,
+          pin_version: "1.29.1",
+          git_sha: undefined,
+        };
+      },
+      releaseParkedWorktree: async () => ({
+        action: "absent",
+        reason: "no managed worktree",
+        branch: null,
+        worktree: null,
+      }),
+      ensurePipelineLabels: async () => {},
+      getIssueDetail: (async () => detail) as AdvanceDeps["getIssueDetail"],
+      getGhActor: async () => "pipeline-bot",
+      getPrForIssue: async () => null,
+      getOnDiskForIssue: async () => null,
+      postComment: async () => {},
+      postPrComment: async () => {},
+      dispatch: async () => {
+        dispatchCalls += 1;
+        return {
+          advanced: false,
+          status: "blocked",
+          reason: "merge conflict with base",
+          blockerKind: "merge-conflict",
+        };
+      },
+    };
+    try {
+      await runAdvance(cfg, 11, { runId }, deps);
+      assert.equal(
+        enforceCalls,
+        0,
+        "must refuse before enforce when product has no factory pin authority",
+      );
+      assert.equal(dispatchCalls, 0, "must not reach stages without factory pin authority");
+    } finally {
+      fs.rmSync(productDir, { recursive: true, force: true });
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 });
 
 test("auto-loop exhaustion branch does not transition or emit generic human intervention", () => {

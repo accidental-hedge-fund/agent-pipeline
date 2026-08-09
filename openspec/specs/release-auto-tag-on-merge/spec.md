@@ -218,7 +218,8 @@ validation failure the workflow SHALL exit non-zero and SHALL NOT create or push
 validation success the workflow MAY proceed to resolve notes and push the annotated tag as
 already specified. Non-release pushes remain successful no-ops and SHALL NOT require FRG
 evidence. The FRG check SHALL NOT merge pull requests, enable auto-merge, or substitute for
-human ownership of the release merge itself.
+independent authority to merge the release pull request. That authority SHALL come from a direct
+operator action or a valid authenticated scoped factory grant.
 
 #### Scenario: Missing FRG evidence blocks the tag
 

@@ -3,23 +3,6 @@
 ## Purpose
 TBD - created by archiving change pipeline-merge-pr-human-invoked. Update Purpose after archive.
 ## Requirements
-### Requirement: The `merge` sub-command is a human-only CLI surface
-The pipeline CLI SHALL accept `merge` as a positional sub-command keyword that takes a single PR number argument and that is never invoked by the autonomous `advance` loop. It SHALL be dispatched when the first positional argument is the string `merge` (case-sensitive).
-
-#### Scenario: Invoked by a human with a PR number
-- **WHEN** the user runs `pipeline merge 42`
-- **THEN** the command dispatches the merge handler with PR number 42 and does not advance any pipeline stage label
-
-#### Scenario: Missing PR number exits with a usage error
-- **WHEN** the user runs `pipeline merge` with no PR number
-- **THEN** the command SHALL exit non-zero with a usage error indicating that a PR number is required
-
-#### Scenario: Non-numeric argument is rejected
-- **WHEN** the user runs `pipeline merge foo` where `foo` is not a positive integer
-- **THEN** the command SHALL exit non-zero with an error indicating that a numeric PR number is required
-
----
-
 ### Requirement: The `merge` sub-command SHALL reject every global flag outside its allowlist
 The `merge` handler resolves configuration from only `--repo-path`, `--base`, and `--profile`. The CLI SHALL therefore enforce these three as an explicit allowlist: any other CLI option that is explicitly provided on a `pipeline merge` invocation SHALL be rejected with exit code 2 and an error naming the offending flag(s), evaluated BEFORE the irreversible squash merge — and before any other mode-specific flag validation — is reached. The check SHALL be allowlist-based (reject everything not allowed) rather than denylist-based, so that a newly added global option cannot silently leak into the merge path.
 
@@ -152,4 +135,29 @@ candidate under explicit operator drive, without relaxing those gates.
 - **WHEN** the operator runs `pipeline merge 42` on a PR that passes merge gates
 - **THEN** the existing merge sub-command behavior SHALL apply unchanged by this
   change’s dry-run queue surface
+
+### Requirement: The `merge` sub-command is an operator-authorized CLI surface
+
+The Pipeline CLI SHALL accept `merge` as a positional sub-command keyword that takes one pull-request number and that is never invoked by the autonomous `advance` loop. It SHALL be dispatched when the first positional argument is the string `merge` (case-sensitive). The command is an explicit operator-authorized surface: the operator MAY invoke it directly, or a disabled deployment wrapper MAY invoke it as an operator delegate after that wrapper validates an authenticated, immutable, expiring grant for the exact repository, base, issue, and action. Before invocation, the wrapper SHALL deterministically resolve that issue's one linked pull request and SHALL bind and revalidate its exact head. The `merge` command itself SHALL NOT claim to validate a Buzz event or deployment grant, and all of its existing merge gates SHALL remain in effect.
+
+#### Scenario: Invoked directly by an operator with a PR number
+
+- **WHEN** the operator runs `pipeline merge 42`
+- **THEN** the command dispatches the merge handler with pull-request number 42 and does not advance any Pipeline stage label
+
+#### Scenario: Invoked by a scoped operator delegate
+
+- **WHEN** a deployment wrapper has validated an active grant for the issue, resolved its one linked pull request as 42, bound its current head, and invokes `pipeline merge 42`
+- **THEN** the command SHALL apply the same mergeability, check, issue-stage, and exact-head gates as a direct operator invocation
+- **AND** the advance loop SHALL remain uninvolved
+
+#### Scenario: Missing PR number exits with a usage error
+
+- **WHEN** the user runs `pipeline merge` with no pull-request number
+- **THEN** the command SHALL exit non-zero with a usage error that states that a pull-request number is required
+
+#### Scenario: Non-numeric argument is rejected
+
+- **WHEN** the user runs `pipeline merge foo` where `foo` is not a positive integer
+- **THEN** the command SHALL exit non-zero with an error that states that a numeric pull-request number is required
 

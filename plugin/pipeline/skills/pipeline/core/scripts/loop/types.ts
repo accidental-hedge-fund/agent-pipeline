@@ -384,6 +384,46 @@ export interface LoopContractItem {
   ownership?: OwnershipDeclaration;
 }
 
+/**
+ * Authoritative discovery source that contributed a declared dependency edge
+ * (#905, capability `dependency-discovery-source-status`).
+ */
+export type DependencyEdgeSource = "lexical" | "native-blocked-by" | "roadmap-declared";
+
+/** Closed observation status for one enabled discovery source scope. */
+export type DiscoverySourceStatus =
+  | "observed-empty"
+  | "observed-with-edges"
+  | "unavailable"
+  | "incomplete";
+
+/** One observation record written on a successfully accepted fresh compile. */
+export interface DependencyDiscoveryObservation {
+  source: DependencyEdgeSource;
+  /** Issue id for per-item sources, or `"*"` for list-level roadmap observation. */
+  scope: string;
+  status: DiscoverySourceStatus;
+  /** Stable identity for this observation decision. */
+  observation_id: string;
+  reason?: string;
+}
+
+/** Contributing source(s) for one directed declared edge on the accepted contract. */
+export interface DependencyEdgeProvenance {
+  depender: string;
+  prerequisite: string;
+  sources: DependencyEdgeSource[];
+}
+
+/**
+ * Additive discovery audit attached to a freshly compiled contract (#905).
+ * Absent on older on-disk contracts — resume must not re-discover or rewrite.
+ */
+export interface DependencyDiscoveryAudit {
+  observations: DependencyDiscoveryObservation[];
+  edge_provenance: DependencyEdgeProvenance[];
+}
+
 export interface LoopContract {
   readonly schema: typeof LOOP_CONTRACT_SCHEMA;
   run_id: string;
@@ -431,6 +471,14 @@ export interface LoopContract {
    *  concurrency above one is admitted only when {@link selectSchedulableSet} (loop/schedule.ts)
    *  can additionally prove the extra items independent. */
   concurrency?: LoopConcurrencyPolicy;
+  /**
+   * Additive discovery audit from the fresh compile that accepted this contract
+   * (#905, capability `dependency-discovery-source-status`). Names the source of
+   * every declared dependency edge and the observation identity/status used
+   * during admission. Absent on older contracts; ordinary resume must not
+   * re-discover or rewrite this field.
+   */
+  dependency_discovery?: DependencyDiscoveryAudit;
 }
 
 // ---------------------------------------------------------------------------
