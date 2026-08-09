@@ -126,7 +126,14 @@ function makeDelivery(config, secrets, notificationEnv) {
   };
 }
 
-export async function makeRuntime(config, validated, store, journal, childEnvs, { readFile = fs.readFile } = {}) {
+export async function makeRuntime(
+  config,
+  validated,
+  store,
+  journal,
+  childEnvs,
+  { readFile = fs.readFile, now = () => new Date() } = {},
+) {
   const secrets = secretValuesFromEnv(config.secret_env_names);
   const notices = new NoticeSink({
     validated,
@@ -143,7 +150,9 @@ export async function makeRuntime(config, validated, store, journal, childEnvs, 
   };
   const getStopReason = async () => {
     if (localStopReason) return localStopReason;
-    if (Date.now() > Date.parse(validated.grant.expires_at)) return "grant expired";
+    // Use the same injectable clock as FactoryController so unit tests can freeze
+    // time against fixture grant expires_at without depending on wall clock.
+    if (now().getTime() > Date.parse(validated.grant.expires_at)) return "grant expired";
     let raw;
     try {
       raw = JSON.parse(await readFile(controlReceiptPath(config, validated.fingerprint), "utf8"));
