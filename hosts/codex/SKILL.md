@@ -87,7 +87,7 @@ $pipeline init                                  Ensure pipeline labels and scaff
 $pipeline merge <pr>                            Operator-authorized squash merge of a ready-to-deploy PR (never called by the advance loop)
 $pipeline merge-queue --milestone <m> [--apply] [--release-when-complete --release-version <ver>] Operator-authorized sequential merge of ready-to-deploy PRs; dry-run by default; optional prepare-only release-when-complete
 $pipeline override <n> "<key>: <reason>"        Disposition a review finding and auto-resume the advance loop
-$pipeline release <version> [--theme "..."] [--dry-run] Prepare a release PR for the given version (never tags, merges, or publishes)
+$pipeline release <version> [--theme "..."] [--dry-run] [--no-edit] | release finish <pr> [--json] Prepare a release PR (version) or finish-merge one (finish <pr>); never tags or publishes (workflows do)
 $pipeline remove-worktree <n> [--force]         Remove a managed pipeline worktree for an issue (optional --force)
 $pipeline status <n>                            Read-only — print stage, blocker, PR, last review
 $pipeline train --milestone <m>|--issues <n,n> [--merge] [--json] Operator-authorized integrate train: dependency-order issues, advance each to ready-to-deploy, optionally merge and prove base containment before the next (never called by the advance loop)

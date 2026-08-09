@@ -1,50 +1,99 @@
 ---
 name: pipeline-supervisor
 description: >
-  Thin Hermes skill: map operator messages to the agent-pipeline CLI.
-  Use only after the operator has installed pipeline and authenticated gh.
-  Does not implement a second state machine or grant factory.
+  Thin Hermes skill for the private pipeline-factory Buzz channel.
+  Maps operator messages to the agent-pipeline CLI (train / single / status).
+  Does not use the removed hermes-factory grant wrapper.
 ---
 
-# Pipeline supervisor (Hermes example)
+# Pipeline supervisor (Hermes production)
 
-Read [docs/supervisor.md](../../../docs/supervisor.md) first.
+Use this skill only in the private **pipeline-factory** Buzz channel, via
+`/pipeline-supervisor` (or your host’s equivalent skill invocation).
 
-## Rules
+Read the contract: [docs/supervisor.md](../../../docs/supervisor.md).
 
-1. Call the installed `pipeline` CLI only. Do not invent stages, models, or effort.
-2. Prefer the shell wrapper for intent parsing when available:
+## Absolute rules
+
+1. Call only the installed **pipeline** CLI (or `run-intent.sh`). Never call
+   `~/.local/lib/hermes-factory/factory.mjs` — that pilot is retired.
+2. Do **not** invent models, effort, stage labels, or a second state machine.
+3. Do **not** default to merge. Only pass merge when the operator is explicit
+   **and** `ALLOW_MERGE=1` is set in the host environment.
+4. Prefer **non-blocking** long runs: start train in the background and report
+   the command line + how to check status. Do not block the chat tool for hours.
+5. Never paste secrets, credential paths’ contents, or full harness logs into Buzz.
+
+## Environment (host)
+
+Expect these on the Hermes process PATH / env (set by the deployment profile):
+
+| Variable | Purpose |
+|---|---|
+| `REPO_DIR` | Target checkout (e.g. factory control clone) |
+| `PIPELINE` | Absolute launcher, e.g. `node …/pipeline.mjs` |
+| `ALLOW_MERGE` | `1` only if this channel may run `train --merge` / `release finish` |
+| `AGENT_PIPELINE_ROOT` | Clone of agent-pipeline containing `examples/supervisor/shell/` |
+
+## Commands
+
+### Status (read-only)
 
 ```bash
-export REPO_DIR=/path/to/target/repo
-export PIPELINE=/path/to/pipeline   # or `pipeline` on PATH
-# export ALLOW_MERGE=1   # only if this deployment may merge
+# Single issue
+"$PIPELINE" status <N> --json
 
-/path/to/agent-pipeline/examples/supervisor/shell/run-intent.sh '<intent>'
+# Or doctor in the service env
+"$PIPELINE" doctor --json
 ```
 
-3. Never default to `--merge` / `ALLOW_MERGE=1` from a vague “run the milestone.”
-4. Post short status summaries. Never paste secrets, env dumps, or full harness logs.
-5. On `needs-human` or non-zero exit, report the error and stop. Do not force-merge.
+### Single issue (no merge)
 
-## Suggested intents
+```bash
+cd "$REPO_DIR"
+nohup "$PIPELINE" single <N> >"$HOME/.local/state/pipeline-supervisor/single-<N>.log" 2>&1 &
+echo "started single <N> pid $!"
+```
 
-| Operator message | Wrapper intent |
+### Train (milestone or issues)
+
+Prefer the portable wrapper:
+
+```bash
+export REPO_DIR PIPELINE ALLOW_MERGE
+"$AGENT_PIPELINE_ROOT/examples/supervisor/shell/run-intent.sh" "train milestone v1.34.0"
+# or: "train issues 905,874,870"
+# merge only when operator said so AND ALLOW_MERGE=1:
+# "$AGENT_PIPELINE_ROOT/examples/supervisor/shell/run-intent.sh" "train milestone v1.34.0 and merge"
+```
+
+For long trains, wrap with `nohup` / systemd-run and post the log path.
+
+### Release (after train / FRG)
+
+```bash
+# Prepare only (opens PR; never merges)
+"$PIPELINE" release <X.Y.Z> --no-edit
+
+# Finish: merge the open release PR (never tags — GitHub workflows tag)
+"$PIPELINE" release finish <pr> --json
+```
+
+## Operator message → intent
+
+| Message | Action |
 |---|---|
-| `single 42` / `do #42` | `single 42` |
-| `train issues 10 11 12` | `train issues 10,11,12` |
-| `train milestone v1.34.0` | `train milestone v1.34.0` |
-| `… and merge` (explicit) | same + requires `ALLOW_MERGE=1` |
-
-## Long runs
-
-Start train with a non-blocking host job if your chat tool times out (e.g.
-`systemctl --user start --no-block …` or background process). The **factory
-controller is the pipeline process**, not the chat turn. Heartbeat by reading
-the process exit status and last `--json` output, or by `pipeline status <N>`.
+| `status 874` / `status` | `pipeline status` / doctor summary |
+| `single 874` / `do #874` | background `pipeline single 874` |
+| `train milestone vX.Y.Z` | `run-intent.sh 'train milestone vX.Y.Z'` |
+| `train issues 1 2 3` | `run-intent.sh 'train issues 1,2,3'` |
+| same + `and merge` | only if `ALLOW_MERGE=1` |
+| `release prepare 1.34.0` | `pipeline release 1.34.0 --no-edit` |
+| `release finish 123` | `pipeline release finish 123` if `ALLOW_MERGE=1` |
+| `stop` | do not force-merge; tell operator how to kill the logged pid / unit |
 
 ## What this skill is not
 
-- Not the removed `ops/hermes-factory` grant runner  
-- Not a durable ledger  
-- Not authorization for merge — `gh` credentials on the host are  
+- Not the removed grant-envelope factory under `ops/hermes-factory`
+- Not authorization by itself — `gh` on this host is the GitHub authority
+- Not a durable outer ledger — GitHub + pipeline run state are truth

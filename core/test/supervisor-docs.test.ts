@@ -22,6 +22,7 @@ test("supervisor.md documents train_status schema_version 1", () => {
   assert.match(doc, /--merge/);
   assert.match(doc, /ALLOW_MERGE|opt-in/i);
   assert.match(doc, /examples\/supervisor/);
+  assert.match(doc, /release finish|release_finish/);
 });
 
 test("buildTrainStatus still emits schema_version 1 envelope", () => {
@@ -46,6 +47,7 @@ test("supervisor examples exist and stay thin", () => {
     "examples/supervisor/hermes/SKILL.md",
     "examples/supervisor/openclaw/SKILL.md",
     "examples/supervisor/slack/README.md",
+    "docs/runbooks/hermes-supervisor-deployment.md",
   ]) {
     assert.ok(fs.existsSync(path.join(repoRoot, rel)), `missing ${rel}`);
   }

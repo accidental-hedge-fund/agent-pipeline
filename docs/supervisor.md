@@ -58,6 +58,8 @@ Supervisors SHOULD parse operator text into one of these intents. Prefer
 | Integrate train | same + `and merge` / `integrate` | add `--merge` |
 | Status | `status`, `train status` | last train JSON, or `pipeline status <N>` / loop logs |
 | Stop | `stop` | stop the host process / systemd unit running train; do not invent force-merge cleanup |
+| Release prepare | `release prepare 1.34.0` | `pipeline release 1.34.0 --no-edit` (opens PR; no merge/tag) |
+| Release finish | `release finish 123` | `pipeline release finish 123` (merge release PR only; workflows tag) |
 
 **Merge is opt-in.** Never default `--merge` from a vague “run the milestone”
 unless the deployment policy explicitly allows it for that channel and operator.
@@ -167,6 +169,31 @@ Do not fork the engine into the chat product.
 - [ ] Wire one adapter from `examples/supervisor/`  
 - [ ] Heartbeat posts status, not raw logs  
 - [ ] Document who can send merge-capable commands  
+
+## Release finish JSON (`schema_version: 1`)
+
+`pipeline release finish <pr> --json`:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "release_finish",
+  "pr": 123,
+  "version": "1.34.0",
+  "title": "release: 1.34.0 — theme",
+  "headRefOid": "…",
+  "mergeCommitOid": "…",
+  "alreadyMerged": false
+}
+```
+
+Does **not** create git tags or GitHub Releases. Existing `auto-tag-release` and
+`release` workflows run after the merge lands on the base branch.
+
+## Hermes production (Phase 2b)
+
+Host runbook: [runbooks/hermes-supervisor-deployment.md](./runbooks/hermes-supervisor-deployment.md).  
+Skill template: [examples/supervisor/hermes/SKILL.md](../examples/supervisor/hermes/SKILL.md).
 
 ## Versioning
 
