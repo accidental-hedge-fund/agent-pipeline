@@ -69,7 +69,26 @@ export REPO_DIR PIPELINE ALLOW_MERGE
 
 For long trains, wrap with `nohup` / systemd-run and post the log path.
 
-### Release (after train / FRG)
+### Ship milestone (train → release → promote)
+
+Prefer the durable playbook (serial multi-milestone supported):
+
+```bash
+export REPO_DIR PIPELINE ALLOW_MERGE
+export SHIP_NOTIFY_HEARTBEAT_S=0   # stage-watch for progress; no generic heartbeats
+"$AGENT_PIPELINE_ROOT/examples/supervisor/shell/ship-milestone.sh" \
+  --milestone vX.Y.Z --detach
+"$AGENT_PIPELINE_ROOT/examples/supervisor/shell/ship-milestone.sh" \
+  --milestone vX.Y.Z --status
+# Multi: --milestones v1.34.0 v1.35.0  (promote between each)
+```
+
+Runbook: [docs/runbooks/ship-milestone.md](../../../docs/runbooks/ship-milestone.md).  
+FRG stop: if `.agent-pipeline/frg/<ver>/latest.json` is missing, the playbook
+stops after train — use [frg-pack-checklist.md](../../../docs/runbooks/frg-pack-checklist.md).
+Do not invent FRG files.
+
+### Release (manual steps after train / FRG)
 
 ```bash
 # Prepare only (opens PR; never merges)
@@ -83,19 +102,30 @@ cd "$REPO_DIR"
 "$PIPELINE" engine-promote --for <X.Y.Z> --host codex --json
 ```
 
+### Stage posts (train or single)
+
+```bash
+# While ship-milestone or pipeline single is running:
+nohup "$AGENT_PIPELINE_ROOT/examples/supervisor/shell/ship-stage-watch.sh" \
+  --milestone vX.Y.Z >>"$PIPELINE_SUPERVISOR_STATE/stage-watch.log" 2>&1 &
+# or: --issue 870 --label "single #870"
+```
+
 ## Operator message → intent
 
 | Message | Action |
 |---|---|
 | `status 874` / `status` | `pipeline status` / doctor summary |
-| `single 874` / `do #874` | background `pipeline single 874` |
+| `single 874` / `do #874` | background `pipeline single 874` (+ optional stage-watch `--issue`) |
 | `train milestone vX.Y.Z` | `run-intent.sh 'train milestone vX.Y.Z'` |
 | `train issues 1 2 3` | `run-intent.sh 'train issues 1,2,3'` |
 | same + `and merge` | only if `ALLOW_MERGE=1` |
+| `ship milestone vX.Y.Z` | `ship-milestone.sh --milestone vX.Y.Z --detach` if `ALLOW_MERGE=1` |
+| `ship milestones vA vB` | serial full ships with promote between |
+| `ship status vX.Y.Z` | `ship-milestone.sh --milestone vX.Y.Z --status` |
 | `release prepare 1.34.0` | `pipeline release 1.34.0 --no-edit` |
 | `release finish 123` | `pipeline release finish 123` if `ALLOW_MERGE=1` |
 | `stop` | do not force-merge; tell operator how to kill the logged pid / unit |
-
 ## What this skill is not
 
 - Not the removed grant-envelope factory under `ops/hermes-factory`

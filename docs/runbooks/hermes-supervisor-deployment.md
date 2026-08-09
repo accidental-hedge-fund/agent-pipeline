@@ -142,6 +142,41 @@ Dry-run:
 $PIPELINE engine-promote --for X.Y.Z --dry-run --json
 ```
 
+## 9. Ship playbook + stage notify (examples)
+
+Install portable scripts from the agent-pipeline clone (no host secrets in git):
+
+```bash
+ROOT="${AGENT_PIPELINE_ROOT:-/path/to/agent-pipeline}"
+install -d -m 0755 "$HOME/.local/bin"
+for s in ship-milestone ship-notify ship-stage-watch pipeline-launcher; do
+  install -m 0755 "$ROOT/examples/supervisor/shell/${s}.sh" "$HOME/.local/bin/$s"
+done
+```
+
+Env (already partially covered in §2):
+
+```bash
+export SHIP_NOTIFY=1
+export SHIP_NOTIFY_HEARTBEAT_S=0   # prefer stage-watch over heartbeats
+# Optional Buzz — leave unset for silent no-op notify:
+# BUZZ_BIN BUZZ_RELAY_URL BUZZ_CHANNEL BUZZ_CREDENTIALS_FILE
+```
+
+```bash
+# Durable ship (ALLOW_MERGE=1 required)
+ship-milestone --milestone vX.Y.Z --detach
+ship-milestone --milestone vX.Y.Z --status
+
+# Manual stage-watch for a single issue
+ship-stage-watch --issue 870 --label "single #870" &
+```
+
+See [ship-milestone.md](./ship-milestone.md) and
+[frg-pack-checklist.md](./frg-pack-checklist.md).  
+Refresh the Hermes skill from `examples/supervisor/hermes/SKILL.md` after pull
+so “ship milestone …” phrases map to the playbook.
+
 ## Rollback
 
 ```bash
