@@ -62,11 +62,12 @@ Review verdicts are pinned to the commit they evaluated. Before pre-merge acts o
 ## External supervisors (compose the CLI)
 
 An external supervisor can compose the existing Pipeline CLI (`pipeline single`,
-`pipeline loop`, `pipeline merge`, `pipeline merge-queue --apply`, release and
-status commands). The repository does not ship a Hermes/Buzz factory control plane,
-grant schema, or second durable scheduler. Ordinary `pipeline advance`,
-`pipeline single`, and `pipeline loop` still stop at `pipeline:ready-to-deploy`
-and never merge.
+`pipeline train`, `pipeline loop`, `pipeline merge`, `pipeline merge-queue --apply`,
+release and status commands). The repository does not ship a Hermes/Buzz/Slack
+factory control plane, grant schema, or second durable scheduler. Ordinary
+`pipeline advance`, `pipeline single`, and `pipeline loop` still stop at
+`pipeline:ready-to-deploy` and never merge. Multi-issue integrate trains use
+opt-in `pipeline train --merge`.
 
 `pipeline merge` keeps its normal ready-to-deploy, mergeability, required-check,
 and exact-head gates. `pipeline merge-queue` is dry-run by default; `--apply` is
@@ -74,10 +75,12 @@ a separate operator-authorized batch surface and is never called by advance.
 Repository content in `.github/pipeline.yml` cannot authorize merges or set
 `auto_merge`.
 
+Portable supervisor contract (intent → CLI, status JSON, multi-platform bootstrap):
+[supervisor.md](./supervisor.md). Thin examples: [`examples/supervisor/`](../examples/supervisor/).
+
 The current Grok profile must use exactly `grok-4.5` for planning,
 implementation, and fixes. It has no Grok fallback. Codex remains the reviewer.
-Product direction for multi-issue integrate trains is documented in
-[factory-simplification-plan.md](./factory-simplification-plan.md).
+Product direction: [factory-simplification-plan.md](./factory-simplification-plan.md).
 
 ### Human plan feedback
 

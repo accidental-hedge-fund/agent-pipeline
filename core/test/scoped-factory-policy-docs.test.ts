@@ -39,7 +39,12 @@ test("golden rules keep advance isolated and deny a shipped factory plane", () =
 test("README and concepts describe CLI composition without a grant factory", () => {
   const readme = read("README.md");
   assert.match(readme, /ordinary advance path does \*\*not\*\* merge/i);
-  assert.match(readme, /does \*\*not\*\* ship a Hermes\/Buzz factory|does not ship a Hermes\/Buzz factory/i);
+  assert.match(
+    readme,
+    /does \*\*not\*\* ship a Hermes\/Buzz(?:\/Slack)? factory|does not ship a Hermes\/Buzz(?:\/Slack)? factory/i,
+  );
+  assert.match(readme, /docs\/supervisor\.md|supervisor contract/i);
+  assert.match(readme, /examples\/supervisor/);
   assert.match(readme, /cannot authorize\s+merges/i);
   assert.match(readme, /cannot set `auto_merge`/i);
   assert.match(readme, /`grok-4\.5`, with no Grok model fallback/i);
@@ -47,7 +52,8 @@ test("README and concepts describe CLI composition without a grant factory", () 
 
   const concepts = read("docs/concepts.md");
   assert.match(concepts, /External supervisors \(compose the CLI\)/);
-  assert.match(concepts, /does not ship a Hermes\/Buzz factory control\s+plane/i);
+  assert.match(concepts, /does not ship a Hermes\/Buzz(?:\/Slack)?\s+factory control\s+plane/i);
+  assert.match(concepts, /supervisor\.md/);
   assert.match(concepts, /exactly `grok-4\.5`/i);
   assert.match(concepts, /no Grok fallback/i);
 });

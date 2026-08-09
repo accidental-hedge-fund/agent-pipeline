@@ -107,20 +107,24 @@ The pipeline advances the issue through planning, implementation, cross-harness 
 ## External supervisors
 
 An external supervisor (chat bot, host agent, or shell automation) may compose the
-existing Pipeline CLI: `pipeline single`, `pipeline loop`, `pipeline merge`,
-`pipeline merge-queue --apply`, `pipeline release`, and related read-only commands.
-This repository does **not** ship a Hermes/Buzz factory control plane, grant schema,
-or second durable scheduler under `ops/`.
+existing Pipeline CLI: `pipeline single`, `pipeline train`, `pipeline loop`,
+`pipeline merge`, `pipeline merge-queue --apply`, `pipeline release`, and related
+read-only commands. This repository does **not** ship a Hermes/Buzz/Slack factory
+control plane, grant schema, or second durable scheduler.
 
 Ordinary `pipeline advance`, `pipeline single`, and `pipeline loop` still stop at
-`pipeline:ready-to-deploy` and never merge. Merge remains loop-isolated and
-operator-authorized. Repository content in `.github/pipeline.yml` cannot authorize
-merges and cannot set `auto_merge`.
+`pipeline:ready-to-deploy` and never merge. Multi-issue integrate trains use
+opt-in `pipeline train --merge`. Repository content in `.github/pipeline.yml`
+cannot authorize merges and cannot set `auto_merge`.
+
+**Bootstrap for any platform:** [supervisor contract](docs/supervisor.md) and
+thin examples under [`examples/supervisor/`](examples/supervisor/) (shell, Hermes,
+OpenClaw, Slack notes). Adapters only map intent → CLI.
 
 For the current Grok profile, planning, implementation, and fixes use only
 `grok-4.5`, with no Grok model fallback. Codex performs independent review. See
 [the factory simplification plan](docs/factory-simplification-plan.md) for product
-direction (integrated train mode; thin supervisors).
+direction.
 
 ## Install
 
