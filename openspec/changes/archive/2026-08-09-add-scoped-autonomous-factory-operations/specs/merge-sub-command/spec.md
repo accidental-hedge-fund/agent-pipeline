@@ -1,7 +1,7 @@
 ## RENAMED Requirements
 
-- FROM: `### Requirement: The \`merge\` sub-command is a human-only CLI surface`
-- TO: `### Requirement: The \`merge\` sub-command is an operator-authorized CLI surface`
+- FROM: ### Requirement: The `merge` sub-command is a human-only CLI surface
+- TO: ### Requirement: The `merge` sub-command is an operator-authorized CLI surface
 
 ## MODIFIED Requirements
 

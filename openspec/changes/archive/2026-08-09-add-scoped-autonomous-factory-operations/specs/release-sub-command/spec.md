@@ -34,6 +34,8 @@ The release prepare path SHALL remain prepare-only when invoked from merge-queue
 - **THEN** the prepare function SHALL return after it creates or reconciles the open release pull request
 - **AND** a separate finalizer SHALL revalidate the grant, exact release head, FRG evidence, checks, and merge state before any merge
 
+## ADDED Requirements
+
 ### Requirement: The candidate-native factory handoff SHALL use one stable prepare interface
 
 Issue #908 SHALL add the candidate-native interface in v1.34.0 after #890 and #891. The exact non-interactive command SHALL be `pipeline factory-release prepare --request <absolute-request.json> --json`. The stable #898 wrapper SHALL invoke this command from the clean exact integrated candidate, because the currently installed engine can be one release behind the candidate that provides the command. The unchanged request SHALL be versioned, secret-free, and bound to the verified installed production pin, freshly observed base, exact integrated candidate, active release grant, and stable action identity.
