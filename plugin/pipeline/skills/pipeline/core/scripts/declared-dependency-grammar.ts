@@ -32,7 +32,10 @@ function consumeReferenceList(text: string, start: number): string[] {
   let pos = start;
   const len = text.length;
 
-  while (pos < len && (text[pos] === " " || text[pos] === "\t")) pos += 1;
+  // List-leading whitespace includes CR/LF so colon-form declarations whose
+  // reference list begins on the next line (`Depends on:\n#12, #13`) parse
+  // completely — same whitespace class as inter-reference separators below.
+  while (pos < len && /\s/.test(text[pos]!)) pos += 1;
 
   const first = /^#(\d+)/.exec(text.slice(pos));
   if (!first || first[1] === undefined) return ids;

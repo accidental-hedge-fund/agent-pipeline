@@ -368,10 +368,12 @@ export async function discoverDeclaredDependencies(
 }
 
 /**
- * Refuses fresh multi-item admission when any enabled source is incomplete.
- * Single-item packs report observations but do not hard-refuse (exploratory
- * advance); multi-item and factory-owned packs must pass `forceRefuse: true`
- * or have `issueIds.length >= 2`.
+ * Refuses fresh multi-item or forced (factory-owned) admission when any
+ * enabled source is incomplete. Single-item non-factory packs report
+ * observations but do not hard-refuse (exploratory advance). Callers for
+ * multi-item packs (`issueIds.length >= 2`) or factory-owned packs must pass
+ * `forceRefuse: true` (or rely on multi-item size) so incomplete sources
+ * refuse contract/ledger init.
  *
  * When refused, throws {@link IncompleteDependencyDiscoveryError} — callers
  * must not write a run contract or ledger.
@@ -390,7 +392,7 @@ export function assertDiscoveryCompleteForAdmission(
     .map((o) => `${o.source} scope=${o.scope} status=${o.status}${o.reason ? ` (${o.reason})` : ""}`)
     .join("; ");
   throw new IncompleteDependencyDiscoveryError(
-    `declared-dependency discovery incomplete for fresh multi-item admission — ` +
+    `declared-dependency discovery incomplete for fresh multi-item or factory-owned admission — ` +
       `refusing contract/ledger init. Incomplete sources: ${detail}`,
     result.observations,
   );

@@ -190,6 +190,7 @@ import {
   type RoadmapDeclaredEdge,
   type WorkListDependencyDiscoverDeps,
 } from "./loop/work-list-deps.ts";
+import { isFactoryControlRepo } from "./production-engine-pin.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type LoopLedger } from "./loop/types.ts";
 import {
   formatLoopRunHandoff,
@@ -831,11 +832,11 @@ export function compileWorkListRun(
  * re-discover overwrite). Run id remains {@link workListRunId} of the issue
  * list only (deps do not change run identity).
  *
- * Multi-item packs refuse admission with
- * {@link IncompleteDependencyDiscoveryError} when any enabled authoritative
- * source is unavailable or incomplete — no contract/ledger is produced (#905).
- * Successful compiles attach additive `dependency_discovery` audit identity
- * (edge provenance + source observations) on the contract.
+ * Multi-item packs and factory-owned runs (factory control repo) refuse
+ * admission with {@link IncompleteDependencyDiscoveryError} when any enabled
+ * authoritative source is unavailable or incomplete — no contract/ledger is
+ * produced (#905). Successful compiles attach additive `dependency_discovery`
+ * audit identity (edge provenance + source observations) on the contract.
  */
 export async function compileWorkListRunFresh(
   cfg: PipelineConfig,
@@ -851,8 +852,13 @@ export async function compileWorkListRunFresh(
   discovery: DeclaredDependencyDiscoveryResult;
 }> {
   const discovery = await discoverDeclaredDependencies(issues, discoverDeps);
+  // Factory-owned fresh admission always refuses incomplete discovery, even
+  // for a single-item pack (spec: multi-item OR factory-owned). Callers may
+  // also force refuse via opts for non-factory exploratory paths.
+  const forceRefuseIncomplete =
+    opts?.forceRefuseIncomplete === true || isFactoryControlRepo(cfg.repo);
   assertDiscoveryCompleteForAdmission(issues, discovery, {
-    forceRefuse: opts?.forceRefuseIncomplete,
+    forceRefuse: forceRefuseIncomplete,
   });
   const { contract, ledger } = compileWorkListRun(
     cfg,

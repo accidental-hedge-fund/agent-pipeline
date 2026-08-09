@@ -26,6 +26,7 @@ import {
   type SelectorResolveDeps,
 } from "../scripts/pipeline.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+import { FACTORY_CONTROL_REPO } from "../scripts/production-engine-pin.ts";
 import { LEXICAL_FIXTURE_ROWS } from "./fixtures/declared-deps/lexical-fixtures.ts";
 
 // ---------------------------------------------------------------------------
@@ -45,6 +46,12 @@ test("parseDeclaredDependencyIds: multi-reference colon/comma and and-joined for
   assert.deepEqual(parseDeclaredDependencyIds("Depends on: #12, #13"), ["12", "13"]);
   assert.deepEqual(parseDeclaredDependencyIds("Depends on #12 and #13"), ["12", "13"]);
   assert.deepEqual(parseDeclaredDependencyIds("needs #5, #6 and #7"), ["5", "6", "7"]);
+});
+
+test("parseDeclaredDependencyIds: colon-form list may begin on the next line (#905 80cd834a)", () => {
+  assert.deepEqual(parseDeclaredDependencyIds("Depends on:\n#12, #13"), ["12", "13"]);
+  assert.deepEqual(parseDeclaredDependencyIds("Depends on:\r\n#12 and #13"), ["12", "13"]);
+  assert.deepEqual(parseDeclaredDependencyIds("requires:\n#5\n#6"), ["5", "6"]);
 });
 
 test("parseDeclaredDependencyIds: shared lexical fixtures (table-driven)", () => {
@@ -350,9 +357,9 @@ test("discoverDeclaredDependencies: no declarations → empty depends_on (indepe
 // Compile partition (discover → compileContractItems / compileWorkListRunFresh)
 // ---------------------------------------------------------------------------
 
-function fakeCfg(): PipelineConfig {
+function fakeCfg(repo = "owner/repo"): PipelineConfig {
   return {
-    repo: "owner/repo",
+    repo,
     base_branch: "main",
     repo_dir: "/tmp/never-used-work-list-deps",
   } as PipelineConfig;
@@ -446,6 +453,61 @@ test("compile: multi-item refuses incomplete discovery and produces no contract"
       return true;
     },
   );
+});
+
+test("compile: factory-owned single-item refuses incomplete discovery (no contract/ledger) (#905 0f108c73)", async () => {
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "42": { title: "solo", body: "" },
+    },
+    blockedBy: {
+      "42": null, // native unobservable — incomplete, not observed-empty
+    },
+  });
+  await assert.rejects(
+    () =>
+      compileWorkListRunFresh(
+        fakeCfg(FACTORY_CONTROL_REPO),
+        "claude",
+        ["42"],
+        "run-factory-single-refuse",
+        deps,
+      ),
+    (err: unknown) => {
+      assert.ok(err instanceof IncompleteDependencyDiscoveryError);
+      assert.equal(err.loopFailureClass, "validation");
+      assert.match(err.message, /factory-owned|incomplete/i);
+      assert.match(err.message, /native-blocked-by/);
+      assert.ok(
+        err.incomplete.some(
+          (o) => o.source === "native-blocked-by" && o.scope === "42",
+        ),
+      );
+      return true;
+    },
+  );
+});
+
+test("compile: non-factory single-item still admits when a source is incomplete (exploratory)", async () => {
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "42": { title: "solo", body: "Depends on #99." },
+    },
+    blockedBy: {
+      "42": null,
+    },
+  });
+  const { contract, ledger, discovery } = await compileWorkListRunFresh(
+    fakeCfg("acme/widget"),
+    "claude",
+    ["42"],
+    "run-exploratory-single",
+    deps,
+  );
+  assert.equal(discovery.has_incomplete, true);
+  assert.equal(contract.items.length, 1);
+  assert.equal(contract.items[0]!.id, "42");
+  assert.ok(ledger.items["42"]);
 });
 
 test("compile: no declarations → empty lists; input order does not invent edges", async () => {

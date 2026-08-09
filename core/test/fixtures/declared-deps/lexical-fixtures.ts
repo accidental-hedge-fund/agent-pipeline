@@ -26,6 +26,16 @@ export const LEXICAL_FIXTURE_ROWS: readonly LexicalFixtureRow[] = [
     expected: ["12", "13"],
   },
   {
+    name: "colon-form list begins on next line (LF)",
+    text: "Depends on:\n#12, #13",
+    expected: ["12", "13"],
+  },
+  {
+    name: "colon-form list begins on next line (CRLF)",
+    text: "Depends on:\r\n#12 and #13",
+    expected: ["12", "13"],
+  },
+  {
     name: "unpunctuated and-joined multi-reference",
     text: "Depends on #12 and #13",
     expected: ["12", "13"],
