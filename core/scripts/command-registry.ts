@@ -124,6 +124,24 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   // Two-track production pin (#762): show / init / promote / rollback.
   // Never merges or tags. Writes only the repo pin JSON under .agent-pipeline/.
+  "engine-promote": {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "for",
+      "host",
+      "json",
+      "dryRun",
+      "gitSha",
+      "skipInstall",
+    ]),
+    needsConfig: false,
+    needsGhAuth: true,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
   "factory-pin": {
     needsIssueNumber: false,
     allowedFlags: new Set([

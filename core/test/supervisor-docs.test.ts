@@ -23,6 +23,7 @@ test("supervisor.md documents train_status schema_version 1", () => {
   assert.match(doc, /ALLOW_MERGE|opt-in/i);
   assert.match(doc, /examples\/supervisor/);
   assert.match(doc, /release finish|release_finish/);
+  assert.match(doc, /engine-promote/);
 });
 
 test("buildTrainStatus still emits schema_version 1 envelope", () => {

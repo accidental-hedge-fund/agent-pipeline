@@ -98,6 +98,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 - **Usage:** `pipeline backfill [--apply] [--capability <name>]`
 - **Summary:** Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
 
+#### `engine-promote`
+
+- **Usage:** `pipeline engine-promote --for <X.Y.Z> [--host codex|claude|all] [--dry-run] [--json] [--skip-install]`
+- **Summary:** Self-host: verify published release, promote production pin, install exact tag, verify version (rollback pin on install failure)
+
 #### `evals`
 
 - **Usage:** `pipeline evals plan|run|grade|report|harvest …`

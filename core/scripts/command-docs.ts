@@ -170,6 +170,13 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     documented: true,
     section: "factory",
   },
+  "engine-promote": {
+    summary:
+      "Self-host: verify published release, promote production pin, install exact tag, verify version (rollback pin on install failure)",
+    usage: "engine-promote --for <X.Y.Z> [--host codex|claude|all] [--dry-run] [--json] [--skip-install]",
+    documented: true,
+    section: "factory",
+  },
   logs: {
     summary: "List or stream pipeline run logs (events --follow exits 0 on terminal run_complete)",
     usage: "logs [<run-id>] [--events] [-f] [--no-until-terminal]",

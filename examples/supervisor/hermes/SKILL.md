@@ -77,6 +77,10 @@ For long trains, wrap with `nohup` / systemd-run and post the log path.
 
 # Finish: merge the open release PR (never tags — GitHub workflows tag)
 "$PIPELINE" release finish <pr> --json
+
+# After the published GitHub Release exists: pin + install on this host
+cd "$REPO_DIR"
+"$PIPELINE" engine-promote --for <X.Y.Z> --host codex --json
 ```
 
 ## Operator message → intent

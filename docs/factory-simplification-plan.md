@@ -52,7 +52,9 @@ Harvested invariants (still product goals):
    [runbooks/hermes-supervisor-deployment.md](./runbooks/hermes-supervisor-deployment.md).
 4. **Release finish** — `pipeline release finish <pr>` merges a prepared release PR
    (never tags; workflows tag/publish).
-5. **Self-host pin/install** — optional later; not required for ordinary trains.
+5. **Self-host pin/install** — `pipeline engine-promote --for X.Y.Z`: verify GitHub
+   Release, promote production pin (FRG-gated), install exact tag, verify version;
+   roll pin back if install fails.
 
 ## What stays in core
 

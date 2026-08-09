@@ -392,6 +392,10 @@ export interface CliOpts {
   gitSha?: string;
   /** factory-pin init: bootstrap from FRG pass for this version. */
   fromFrg?: string;
+  /** factory-pin / engine-promote: install host (codex|claude|all). */
+  host?: string;
+  /** engine-promote: skip skill install (pin-only). */
+  skipInstall?: boolean;
   /** factory-pin rollback: target version (default: pin.previous). */
   to?: string;
   /** scoreboard: restrict analysis to runs on or before this ISO date. */
@@ -560,7 +564,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | factory-pin | intake | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | factory-pin | engine-promote | intake | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -629,7 +633,12 @@ export function buildCmd(): Command {
     // descriptions/visibility, so it never appears anywhere in --help output.
     .addOption(new Option("--run <run-id>", "run-store run id to record an event against, or scope a report to").hideHelp())
     .addOption(new Option("-m, --message <text>", "free-text friction message to record").hideHelp())
-    .option("--for <version>", "factory-gate / factory-pin promote: target release version X.Y.Z", undefined)
+    .option("--for <version>", "factory-gate / factory-pin / engine-promote: target release version X.Y.Z", undefined)
+    .option(
+      "--host <name>",
+      "engine-promote: skill install host (codex|claude|grok|opencode|all; default codex)",
+    )
+    .option("--skip-install", "engine-promote: promote pin only; do not run npx install")
     .option("--from-run <run-id>", "factory-gate: score an existing durable loop run id")
     .option(
       "--engine-track <track>",
@@ -3675,6 +3684,68 @@ async function main(): Promise<void> {
     return;
   }
 
+  // `pipeline engine-promote --for X.Y.Z` — Phase 4 self-host pin + install.
+  if (numArg === "engine-promote") {
+    const version = opts.for ? String(opts.for).trim() : "";
+    if (!version) {
+      console.error(
+        "pipeline engine-promote: --for <X.Y.Z> is required.\n" +
+          "  Usage: pipeline engine-promote --for <X.Y.Z> [--host codex|claude|all] [--dry-run] [--json] [--skip-install]\n" +
+          "  Verifies the GitHub Release, promotes the production pin (FRG-gated), installs the exact tag,\n" +
+          "  and verifies installed version. Rolls the pin back if install/verify fails after promote.\n" +
+          "  Never merges PRs or creates tags.",
+      );
+      process.exit(2);
+    }
+    const startDirEp = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDirEp = findGitRoot(startDirEp);
+    if (!repoDirEp) {
+      console.error(
+        `pipeline engine-promote: no git repo at ${startDirEp}. Run from a checkout or pass --repo-path.`,
+      );
+      process.exit(2);
+    }
+    try {
+      const { runEnginePromote, realEnginePromoteDeps } = await import("./stages/engine-promote.ts");
+      const hostRaw = opts.host ? String(opts.host).trim() : "codex";
+      const allowedHosts = new Set(["codex", "claude", "grok", "opencode", "all"]);
+      if (!allowedHosts.has(hostRaw)) {
+        console.error(`pipeline engine-promote: invalid --host ${hostRaw}`);
+        process.exit(2);
+      }
+      const result = await runEnginePromote(
+        {
+          version,
+          repoDir: repoDirEp,
+          host: hostRaw as "codex" | "claude" | "grok" | "opencode" | "all",
+          dryRun: !!opts.dryRun,
+          skipInstall: !!opts.skipInstall,
+          gitSha: opts.gitSha ?? null,
+          pinPath: process.env.AGENT_PIPELINE_PRODUCTION_PIN ?? null,
+        },
+        realEnginePromoteDeps(repoDirEp),
+      );
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(
+          `[engine-promote] version=${result.version} tag=${result.tag} ` +
+            `release_ok=${result.release_verified} pin_promoted=${result.pin_promoted} ` +
+            `install_ran=${result.install_ran} verified=${result.verified}` +
+            (result.rolled_back ? " rolled_back=true" : "") +
+            (result.error ? ` error=${result.error}` : ""),
+        );
+        for (const s of result.steps) console.log(`  - ${s}`);
+        if (result.reinstall_hint) console.log(`  reinstall: ${result.reinstall_hint}`);
+      }
+      if (result.error) process.exit(1);
+    } catch (err) {
+      console.error(`pipeline engine-promote: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // `pipeline factory-pin show|init|promote|rollback` (#762).
   // Manages the production engine pin on factory pin authority only.
   // Never merges or tags. Never writes a product-local pin by cwd accident.
@@ -4392,7 +4463,7 @@ async function main(): Promise<void> {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "single", "release", "intake", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "summary", "improve", "scoreboard", "factory-gate", "factory-pin", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "summary", "improve", "scoreboard", "factory-gate", "factory-pin", "engine-promote", "queue", "backfill", "evals",
       "loop",
     ];
     if (!recognized.includes(numArg)) {
