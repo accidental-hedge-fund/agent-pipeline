@@ -138,7 +138,7 @@ candidate under explicit operator drive, without relaxing those gates.
 
 ### Requirement: The `merge` sub-command is an operator-authorized CLI surface
 
-The Pipeline CLI SHALL accept `merge` as a positional sub-command keyword that takes one pull-request number and that is never invoked by the autonomous `advance` loop. It SHALL be dispatched when the first positional argument is the string `merge` (case-sensitive). The command is an explicit operator-authorized surface: the operator MAY invoke it directly, or a disabled deployment wrapper MAY invoke it as an operator delegate after that wrapper validates an authenticated, immutable, expiring grant for the exact repository, base, issue, and action. Before invocation, the wrapper SHALL deterministically resolve that issue's one linked pull request and SHALL bind and revalidate its exact head. The `merge` command itself SHALL NOT claim to validate a Buzz event or deployment grant, and all of its existing merge gates SHALL remain in effect.
+The Pipeline CLI SHALL accept `merge` as a positional sub-command keyword that takes one pull-request number and that is never invoked by the autonomous `advance` loop. It SHALL be dispatched when the first positional argument is the string `merge` (case-sensitive). The command is an explicit operator-authorized surface: the operator MAY invoke it directly, and an external supervisor MAY invoke it under operator authority. All of its existing merge gates SHALL remain in effect for every caller.
 
 #### Scenario: Invoked directly by an operator with a PR number
 
@@ -147,7 +147,7 @@ The Pipeline CLI SHALL accept `merge` as a positional sub-command keyword that t
 
 #### Scenario: Invoked by a scoped operator delegate
 
-- **WHEN** a deployment wrapper has validated an active grant for the issue, resolved its one linked pull request as 42, bound its current head, and invokes `pipeline merge 42`
+- **WHEN** an external supervisor under operator authority invokes `pipeline merge 42` for a ready-to-deploy issue
 - **THEN** the command SHALL apply the same mergeability, check, issue-stage, and exact-head gates as a direct operator invocation
 - **AND** the advance loop SHALL remain uninvolved
 

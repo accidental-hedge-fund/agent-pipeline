@@ -28,8 +28,7 @@ from a single shared TypeScript core; the two hosts differ only by a JSON profil
 - Repository-configured or advance-loop merging of PRs. `pipeline advance`,
   `pipeline single`, and `pipeline loop` stop at `pipeline:ready-to-deploy`.
   Loop-isolated commands (`pipeline merge`, `merge-queue --apply`) may merge
-  under direct operator authority. A disabled deployment wrapper may invoke an
-  allowed command only after it validates an authenticated, immutable, expiring
-  operator grant for the exact action. The wrapper, not Pipeline, validates the
-  grant. The grant is machine-local deployment state. No `auto_merge` config key
-  or merge stage exists.
+  under direct operator authority. External supervisors may call those same
+  commands; the repository does not ship a Hermes/Buzz factory control plane
+  or grant schema. Merge authority is not repository configuration. No
+  `auto_merge` config key or merge stage exists.

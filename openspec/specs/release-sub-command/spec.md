@@ -336,11 +336,11 @@ The release prepare implementation used by `pipeline release` SHALL remain avail
 
 - **WHEN** an explicit-authority caller invokes the shared release prepare entry with non-interactive options
 - **THEN** the prepare path SHALL NOT wait on `$EDITOR`
-- **AND** on success it SHALL open a release pull request for separate operator or scoped-factory finalization
+- **AND** on success it SHALL open a release pull request for separate operator finalization
 
 ### Requirement: The release prepare path SHALL NOT gain tag, publish, or merge authority via merge-queue callers
 
-The release prepare path SHALL remain prepare-only when invoked from merge-queue release-when-complete, a scoped factory, or any other programmatic caller. It SHALL NOT create or push git tags, publish npm packages, create GitHub Releases, or merge the release pull request. A separate direct operator action or a disabled factory finalizer with a valid exact operator grant MAY merge the prepared release pull request. Existing post-merge tag and publish workflows remain the only automated tag and publish path.
+The release prepare path SHALL remain prepare-only when invoked from merge-queue release-when-complete or any other programmatic caller. It SHALL NOT create or push git tags, publish npm packages, create GitHub Releases, or merge the release pull request. A separate direct operator action (or external supervisor under operator authority) MAY merge the prepared release pull request. Existing post-merge tag and publish workflows remain the only automated tag and publish path.
 
 #### Scenario: Merge-queue-triggered prepare does not merge or tag
 
@@ -349,11 +349,11 @@ The release prepare path SHALL remain prepare-only when invoked from merge-queue
 - **AND** it SHALL NOT merge that pull request
 - **AND** it SHALL NOT create or push a version tag as part of that invocation
 
-#### Scenario: Scoped factory preparation remains separate from finalization
+#### Scenario: Programmatic prepare remains separate from finalization
 
-- **WHEN** a scoped factory invokes the prepare path under a valid grant
+- **WHEN** a programmatic caller invokes the prepare path
 - **THEN** the prepare function SHALL return after it creates or reconciles the open release pull request
-- **AND** a separate finalizer SHALL revalidate the grant, exact release head, FRG evidence, checks, and merge state before any merge
+- **AND** a separate operator-authorized step SHALL revalidate the release head, FRG evidence, checks, and merge state before any merge
 
 ### Requirement: The `release` sub-command SHALL require a Factory Reliability Gate pass for the resolved version
 

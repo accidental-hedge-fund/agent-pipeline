@@ -34,7 +34,7 @@ For each field, an explicit CLI override (e.g. `--base`) SHALL win over the file
 
 ### Requirement: Never-auto-merge safety floor is structural, not config-forced
 
-Repository configuration SHALL NOT authorize merge. There is no merge stage, and the autonomous advance path stops at `pipeline:ready-to-deploy`. The `auto_merge` key SHALL be absent from `PartialConfigSchema`; a repository that sets it SHALL receive a strict-schema parse error that identifies the offending key. The existing loop-isolated `pipeline merge` and `pipeline merge-queue --apply` commands remain explicit authority surfaces. A disabled deployment wrapper MAY validate a scoped operator grant before it invokes a permitted command, but that grant SHALL be machine-local deployment state and SHALL NOT be loaded from `.github/pipeline.yml`.
+Repository configuration SHALL NOT authorize merge. There is no merge stage, and the autonomous advance path stops at `pipeline:ready-to-deploy`. The `auto_merge` key SHALL be absent from `PartialConfigSchema`; a repository that sets it SHALL receive a strict-schema parse error that identifies the offending key. The existing loop-isolated `pipeline merge` and `pipeline merge-queue --apply` commands remain explicit authority surfaces. External supervisors MAY invoke those same surfaces under operator authority. The repository SHALL NOT load merge authority from `.github/pipeline.yml`.
 
 #### Scenario: auto_merge key rejected
 

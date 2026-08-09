@@ -219,7 +219,7 @@ validation success the workflow MAY proceed to resolve notes and push the annota
 already specified. Non-release pushes remain successful no-ops and SHALL NOT require FRG
 evidence. The FRG check SHALL NOT merge pull requests, enable auto-merge, or substitute for
 independent authority to merge the release pull request. That authority SHALL come from a direct
-operator action or a valid authenticated scoped factory grant.
+operator action or an external supervisor under operator authority.
 
 #### Scenario: Missing FRG evidence blocks the tag
 

@@ -174,7 +174,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
   // Operator-authorized merge-queue (#676/#675): sequential R2D merges +
   // optional prepare-only release-when-complete + optional surgical repair
   // holds. Dry-run remains the default. A caller validates any external
-  // deployment grant; this command does not load grant state.
+  // operator authority; this command does not load external grant state.
   // Allowlist keeps merge/release/repair flags explicit; never auto_merge.
   // mutatesGitHub true when --apply (merges/repair) or release prepare runs.
   "merge-queue": {

@@ -1,4 +1,4 @@
-// Drift guards for the scoped external factory authority boundary.
+// Drift guards for advance/merge authority and the removal of the Hermes factory pilot.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -18,51 +18,48 @@ function read(relPath: string): string {
   return fs.readFileSync(path.join(repoRoot, relPath), "utf8");
 }
 
-function assertGrantBoundary(source: string, label: string): void {
+function assertMergeIsolation(source: string, label: string): void {
   assert.match(source, /ready-to-deploy/i, `${label}: must name the advance terminal`);
   assert.match(source, /never (?:invoke(?:s)? )?(?:a )?merge/i, `${label}: advance must never merge`);
-  assert.match(source, /disabled(?:-by-default)? (?:external )?deployment wrapper|disabled-by-default deployment wrapper/i, `${label}: wrapper must be disabled by default`);
-  assert.match(source, /authenticated, immutable, expiring/i, `${label}: grant properties must stay explicit`);
-  assert.match(source, /machine-local/i, `${label}: grant must remain machine-local`);
+  assert.match(source, /loop-isolated|operator-authorized/i, `${label}: must name loop-isolated/operator-authorized merge`);
+  assert.match(source, /does not ship a Hermes\/Buzz factory|does not ship a factory grant control plane|does not ship a Hermes\/Buzz factory control plane/i, `${label}: must deny shipping the grant factory`);
   assert.match(source, /not\s+`?(?:repository\s+configuration|\.github\/pipeline\.yml)/i, `${label}: repository config must not grant authority`);
   assert.match(source, /auto_merge/i, `${label}: must forbid auto_merge`);
   assert.match(source, /merge stage/i, `${label}: must forbid a merge stage`);
 }
 
-test("golden rules keep advance isolated and describe only the scoped delegate", () => {
+test("golden rules keep advance isolated and deny a shipped factory plane", () => {
   for (const relPath of ["AGENTS.md", "CLAUDE.md"]) {
     const source = read(relPath);
-    assertGrantBoundary(source, relPath);
-    assert.match(source, /does not validate Buzz events or\s+deployment grants/is);
+    assertMergeIsolation(source, relPath);
     assert.match(source, /merge-queue`?[\s\S]{0,80}dry-run\s+by default/i);
   }
 });
 
-test("README and concepts distinguish ordinary use from the opt-in factory", () => {
+test("README and concepts describe CLI composition without a grant factory", () => {
   const readme = read("README.md");
   assert.match(readme, /ordinary advance path does \*\*not\*\* merge/i);
-  assert.match(readme, /opt-in and disabled by default/i);
-  assert.match(readme, /repository,\s*base branch,\s*release version,\s*ordered issue list,\s*permitted actions,\s*and expiry/is);
-  assert.match(readme, /does not add an MCP server,\s+a public\s+factory API, an `auto_merge` setting, or a merge stage/i);
+  assert.match(readme, /does \*\*not\*\* ship a Hermes\/Buzz factory|does not ship a Hermes\/Buzz factory/i);
+  assert.match(readme, /cannot authorize\s+merges/i);
+  assert.match(readme, /cannot set `auto_merge`/i);
   assert.match(readme, /`grok-4\.5`, with no Grok model fallback/i);
+  assert.match(readme, /factory-simplification-plan\.md/);
 
   const concepts = read("docs/concepts.md");
-  assert.match(concepts, /Scoped external factory grants \(optional, default off\)/);
-  assert.match(concepts, /wrapper[\s\S]{0,180}validates/i);
-  assert.match(concepts, /`pipeline merge` does not read or validate Buzz events or\s+deployment\s+grants/i);
+  assert.match(concepts, /External supervisors \(compose the CLI\)/);
+  assert.match(concepts, /does not ship a Hermes\/Buzz factory control\s+plane/i);
   assert.match(concepts, /exactly `grok-4\.5`/i);
   assert.match(concepts, /no Grok fallback/i);
 });
 
-test("all host skills assign grant validation to the wrapper", () => {
+test("all host skills keep merge loop-isolated without a grant factory", () => {
   for (const relPath of [
     "hosts/claude/SKILL.md",
     "hosts/codex/SKILL.md",
     "hosts/opencode/SKILL.md",
   ]) {
     const source = read(relPath);
-    assertGrantBoundary(source, relPath);
-    assert.match(source, /deployment wrapper, not either merge command|merge`? does not validate Buzz events or deployment grants/is);
+    assertMergeIsolation(source, relPath);
     assert.match(source, /merge-queue`? is dry-run by default/i);
     assert.match(source, /only `grok-4\.5`, with no Grok fallback/i);
   }
@@ -114,8 +111,19 @@ test("repository config has no merge or factory authority key and stages have no
   assert.equal(STAGES.includes("merge" as never), false, "the state machine must not gain a merge stage");
 
   const rendered = renderConfigMarkdown({ schema });
-  assert.match(rendered, /Machine-local deployment grants are outside this schema and cannot be set here/i);
+  assert.match(rendered, /Merge authority is not repository configuration and cannot be set here/i);
   assert.ok(!rendered.includes("### `auto_merge`"));
+});
+
+test("the repository does not ship the Hermes factory pilot package", () => {
+  assert.equal(fs.existsSync(path.join(repoRoot, "ops/hermes-factory")), false);
+  const pkg = JSON.parse(read("package.json")) as {
+    files?: string[];
+    scripts?: Record<string, string>;
+  };
+  assert.equal(pkg.files?.includes("ops"), false, "package files must not ship ops/");
+  assert.equal("ci:ops" in (pkg.scripts ?? {}), false, "ci:ops must be removed");
+  assert.doesNotMatch(pkg.scripts?.ci ?? "", /ci:ops/, "default ci must not call ci:ops");
 });
 
 test("the repository factory profile pins only grok-4.5 for Grok roles", () => {
