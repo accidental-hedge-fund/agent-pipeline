@@ -155,6 +155,21 @@ test("pipeline-cli: single rejects raw advance-only controls", () => {
   assert.deepEqual(roundTrip(["single", "42", "--once", "--dry-run"]), ["once", "dryRun"]);
 });
 
+test("pipeline-cli: train — --milestone and --json are allowed (ship playbook)", () => {
+  assert.deepEqual(roundTrip(["train", "--milestone", "v1.33.0", "--json"]), []);
+});
+
+test("pipeline-cli: train — --issues --merge --json → []", () => {
+  assert.deepEqual(roundTrip(["train", "--issues", "870", "--merge", "--json"]), []);
+});
+
+test("pipeline-cli: train --json parses onto opts.json", () => {
+  const { opts, numArg } = parseCli(["train", "--milestone", "v1.0.0", "--json"]);
+  assert.equal(numArg, "train");
+  assert.equal(opts.json, true);
+  assert.equal(opts.milestone, "v1.0.0");
+});
+
 // ---------------------------------------------------------------------------
 // 5.2  Unsupported global flag on a restricted command
 // ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   COMMAND_REGISTRY,
+  allowsJsonFlag,
   lookupCommand,
   validateFlags,
   UNIVERSAL_FLAGS,
@@ -425,4 +426,45 @@ test("pipeline --help output contains no papercut entry", async () => {
     !/\bpapercut\b/.test(help),
     `--help output should not mention "papercut":\n${help}`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// allowsJsonFlag — early --json guard must track registry supportsJson
+// (regression: train --json was rejected while supportsJson:true)
+// ---------------------------------------------------------------------------
+
+test("allowsJsonFlag: train supportsJson allows --json", () => {
+  assert.equal(allowsJsonFlag({ entry: lookupCommand("train") }), true);
+});
+
+test("allowsJsonFlag: engine-promote and release allow --json", () => {
+  assert.equal(allowsJsonFlag({ entry: lookupCommand("engine-promote") }), true);
+  assert.equal(allowsJsonFlag({ entry: lookupCommand("release") }), true);
+});
+
+test("allowsJsonFlag: advance rejects bare --json", () => {
+  assert.equal(allowsJsonFlag({ entry: lookupCommand("42") }), false);
+  assert.equal(allowsJsonFlag({ entry: lookupCommand(undefined) }), false);
+});
+
+test("allowsJsonFlag: numeric advance with statusMode allows --json", () => {
+  assert.equal(
+    allowsJsonFlag({ entry: lookupCommand("42"), statusMode: true }),
+    true,
+  );
+});
+
+test("allowsJsonFlag: doctor mode allows --json even without entry", () => {
+  assert.equal(allowsJsonFlag({ entry: null, isDoctor: true }), true);
+});
+
+test("allowsJsonFlag: every registry entry with supportsJson:true is allowed", () => {
+  for (const [name, entry] of Object.entries(COMMAND_REGISTRY)) {
+    if (!entry.supportsJson) continue;
+    assert.equal(
+      allowsJsonFlag({ entry }),
+      true,
+      `supportsJson entry "${name}" must pass allowsJsonFlag`,
+    );
+  }
 });

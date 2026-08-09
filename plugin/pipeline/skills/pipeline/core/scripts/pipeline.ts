@@ -234,7 +234,7 @@ import {
   type Stage,
   type StageOutcome,
 } from "./types.ts";
-import { lookupCommand, validateFlags } from "./command-registry.ts";
+import { allowsJsonFlag, lookupCommand, validateFlags } from "./command-registry.ts";
 import {
   dispatch,
   isAutoLoopRecoverable,
@@ -2961,11 +2961,24 @@ async function main(): Promise<void> {
     console.error("pipeline doctor: --json and --is-ok are mutually exclusive — use one or the other.");
     process.exit(2);
   }
-  // `pipeline path --json`, `pipeline config validate/sync --json`, `pipeline refine-spec --json`,
-  // `pipeline improve --json`, `pipeline scoreboard --json`, `pipeline status <N> --json`, and
-  // `--remove-worktree --json` legitimately emit JSON — exempt from the status-only guard.
-  if (opts.json && !isDoctorCommand && !opts.status && !opts.removeWorktree && numArg !== "path" && numArg !== "config" && numArg !== "refine-spec" && numArg !== "improve" && numArg !== "scoreboard" && numArg !== "status" && numArg !== "papercut" && numArg !== "factory-gate") {
-    console.error("pipeline: --json requires --status or the doctor command. Usage: pipeline <N> --status --json  OR  pipeline doctor --json");
+  // `--json` is allowed when the resolved command registry entry declares
+  // supportsJson (train, doctor, path, release finish, engine-promote, …) or when
+  // a flag-only JSON mode applies (`pipeline <N> --status --json`, doctor).
+  // Do not hand-maintain a parallel allowlist of command names here — it drifts
+  // from COMMAND_REGISTRY and blocks ship/supervisor callers (train --json).
+  if (
+    opts.json &&
+    !allowsJsonFlag({
+      entry,
+      isDoctor: isDoctorCommand,
+      statusMode: !!opts.status,
+    })
+  ) {
+    console.error(
+      "pipeline: --json is not valid for this invocation. " +
+        "Use a JSON-capable command (registry supportsJson), " +
+        "`pipeline doctor --json`, or `pipeline <N> --status --json`.",
+    );
     process.exit(2);
   }
   // --force is scoped to --remove-worktree; using it alone is a usage error.

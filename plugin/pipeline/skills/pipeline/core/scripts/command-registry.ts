@@ -528,6 +528,24 @@ export function lookupCommand(keyword: string | undefined): CommandEntry | null 
 }
 
 /**
+ * Whether the early CLI `--json` guard should allow this invocation.
+ *
+ * Prefer the registry's `supportsJson` bit so new JSON-capable commands (e.g.
+ * `train`, `engine-promote`) do not need a hand-maintained string list in
+ * `pipeline.ts`. Flag-only modes still need explicit overrides:
+ * - `pipeline doctor --json` / `isDoctor`
+ * - `pipeline <N> --status --json` (numeric path → advance entry, supportsJson false)
+ */
+export function allowsJsonFlag(input: {
+  entry: CommandEntry | null;
+  isDoctor?: boolean;
+  statusMode?: boolean;
+}): boolean {
+  if (input.isDoctor || input.statusMode) return true;
+  return input.entry?.supportsJson === true;
+}
+
+/**
  * Return the attribute names of options that were explicitly provided on the CLI
  * (via `cmd.getOptionValueSource(key) === "cli"`) but are not in
  * `entry.allowedFlags`. Returns an empty array when `allowedFlags === "all"`.
