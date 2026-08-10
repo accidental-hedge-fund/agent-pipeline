@@ -15,18 +15,19 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import {
-  FRG_COMPOSITION_DIMENSION_IDS,
   FRG_PACK_MANIFEST,
   FRG_SCENARIO_IDS,
   computeFrgEvidence,
+  detectEmptyDependsOnStackHonesty,
   isAllowedFrgPackSelector,
   isReleaseEligibleFrgPass,
   itemsFromLoopLedger,
   normalizeFrgVersion,
   parseFrgEvidenceJson,
+  parseFrgObservationsJson,
+  projectCompositionFromScoreboard,
+  validateFrgPackContract,
   validateReleaseEligibleFrgEvidence,
   type FrgCompositionOverride,
   type FrgEvidence,
@@ -36,23 +37,23 @@ import {
   defaultFrgPackRoot,
   FRG_HYBRID_PILOT_VERSION,
   loadFrgPack,
-  type FrgPackProbeManifest,
   type LoadedFrgPack,
 } from "./frg-pack-observations.ts";
 import {
   defaultLoopStoreDeps,
+  readActionEvidence,
   readContract,
+  readEvents,
   readLedger,
   resolveStateHome,
   runDir,
 } from "./loop/store.ts";
+import type { LoopContract } from "./loop/types.ts";
 import {
   runRelease,
   type ReleaseOpts,
   type ReleasePrepareResult,
 } from "./stages/release.ts";
-
-const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
 // Constants / types
@@ -611,17 +612,12 @@ export async function refuseSyntheticTrivialPack(
       (`factory-release prepare: durable FRG generator did not produce release-eligible ` +
         `unsigned artifacts for ${request.target_version}. Synthetic trivial docs/fixture ` +
         `packs are not release-eligible after v${FRG_HYBRID_PILOT_VERSION}. ` +
-        `Run a fixed-pack factory-gate loop and Layer A probes from the exact candidate.`),
+        `Bind a fixed-pack factory-gate durable loop to the request fingerprint from the exact candidate.`),
   };
 }
 
-export interface DurableProbeResult {
-  id: string;
-  passed: boolean;
-  stdout_sha256: string;
-  stderr_sha256: string;
-  detail: string;
-}
+/** Runner-derived live/ledger/derived observations only — never Layer A for post-pilot. */
+export type DurableAllowedProofSource = "live" | "ledger" | "derived" | "observation";
 
 export interface DurablePackLoopArtifacts {
   loop_run_id: string;
@@ -629,126 +625,381 @@ export interface DurablePackLoopArtifacts {
   ledger_text: string;
   events_text: string;
   action_evidence_text: string;
+  /** Optional runner-owned observations JSON (sources live|ledger|derived|observation only). */
+  runner_observations_text?: string;
+}
+
+export interface FactoryReleasePackInstance {
+  schema_version: 1;
+  kind: "factory_release_pack_instance";
+  request_fingerprint: string;
+  target_version: string;
+  candidate_git_sha: string;
+  pack_id: string;
+  manifest_sha256: string;
+  pack_run_id: string;
+  frg_run_id: string;
+  loop_run_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Closed binding the production attestor MUST copy into signed evidence. */
+export interface FactoryReleaseUnsignedDigestBinding {
+  schema_version: 1;
+  kind: "factory_release_unsigned_digest_binding";
+  request_fingerprint: string;
+  target_version: string;
+  candidate_git_sha: string;
+  pack_id: string;
+  pack_run_id: string;
+  loop_run_id: string;
+  frg_run_id: string;
+  artifacts: {
+    observations_sha256: string;
+    evidence_bundle_sha256: string;
+    contract_sha256: string;
+    ledger_sha256: string;
+    events_sha256: string;
+    action_evidence_sha256: string;
+  };
 }
 
 export interface DurableGenerateOptions {
-  /** Injectable probe runner (default: node --test for the exact named test). */
-  runProbe?: (
-    probe: FrgPackProbeManifest,
-    ctx: { repoDir: string; candidateGitSha: string },
-  ) => Promise<DurableProbeResult>;
-  /** Injectable factory-gate loop discovery (default: newest matching loop store). */
-  loadPackLoop?: (ctx: {
-    repoDir: string;
-  }) => Promise<DurablePackLoopArtifacts | null>;
+  /**
+   * Reconcile a pack loop bound to this exact request fingerprint / candidate /
+   * version / manifest. Default never reuses an unbound newest factory-gate loop.
+   */
+  reconcilePackLoop?: (
+    ctx: DurableReconcilePackLoopCtx,
+  ) => Promise<DurablePackLoopArtifacts | null>;
+  /**
+   * Optional start of a fresh fixed-pack durable loop for this request.
+   * When provided and no bound loop exists, called once then re-reconciled.
+   */
+  startBoundPackLoop?: (
+    ctx: DurableReconcilePackLoopCtx,
+  ) => Promise<{ loop_run_id: string } | null>;
   writeFile?: (path: string, body: string, mode?: number) => Promise<void>;
   mkdir?: (path: string, opts?: { recursive?: boolean; mode?: number }) => Promise<void>;
+  readFile?: (path: string) => Promise<string>;
+  fileExists?: (path: string) => Promise<boolean>;
   now?: () => Date;
 }
 
-async function defaultRunLayerAProbe(
-  probe: FrgPackProbeManifest,
-  ctx: { repoDir: string; candidateGitSha: string },
-): Promise<DurableProbeResult> {
-  const testPath = path.join(ctx.repoDir, probe.test_file);
-  try {
-    const { stdout, stderr } = await execFileAsync(
-      process.execPath,
-      [
-        "--test",
-        "--experimental-strip-types",
-        "--test-name-pattern",
-        `^${probe.test_name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
-        testPath,
-      ],
-      {
-        cwd: ctx.repoDir,
-        timeout: 120_000,
-        maxBuffer: 20 * 1024 * 1024,
-        env: {
-          ...process.env,
-          // Never pass FRG signing material into probe children.
-          PIPELINE_FRG_ATTESTATION_KEY: "",
-          PIPELINE_FRG_ATTESTATION_KEY_FILE: "",
-        },
-      },
+export interface DurableReconcilePackLoopCtx {
+  repoDir: string;
+  workDir: string;
+  request: FactoryReleasePrepareRequest;
+  pack: LoadedFrgPack;
+  packRunId: string;
+  frgRunId: string;
+  requestFingerprint: string;
+  writeFile: (path: string, body: string, mode?: number) => Promise<void>;
+  readFile: (path: string) => Promise<string>;
+  fileExists: (path: string) => Promise<boolean>;
+  now: () => Date;
+}
+
+const POST_PILOT_ALLOWED_SOURCES = new Set<string>([
+  "live",
+  "ledger",
+  "derived",
+  "observation",
+]);
+
+export function factoryReleasePackInstancePath(workDir: string): string {
+  return path.join(workDir, "pack-instance.json");
+}
+
+export function factoryReleaseLoopBindingPath(loopRunId: string): string {
+  return path.join(runDir(defaultLoopStoreDeps(), loopRunId), "factory-release-binding.json");
+}
+
+export function buildFactoryReleaseUnsignedDigestBinding(
+  request: FactoryReleasePrepareRequest,
+  unsigned: FactoryReleaseFrgPayload,
+): FactoryReleaseUnsignedDigestBinding {
+  return {
+    schema_version: 1,
+    kind: "factory_release_unsigned_digest_binding",
+    request_fingerprint: factoryReleaseRequestFingerprint(request),
+    target_version: request.target_version,
+    candidate_git_sha: request.integrated_candidate.git_sha,
+    pack_id: unsigned.pack_id,
+    pack_run_id: unsigned.pack_run_id,
+    loop_run_id: unsigned.loop_run_id,
+    frg_run_id: unsigned.frg_run_id,
+    artifacts: {
+      observations_sha256: unsigned.observations.sha256,
+      evidence_bundle_sha256: unsigned.evidence_bundle.sha256,
+      contract_sha256: unsigned.contract.sha256,
+      ledger_sha256: unsigned.ledger.sha256,
+      events_sha256: unsigned.events.sha256,
+      action_evidence_sha256: unsigned.action_evidence.sha256,
+    },
+  };
+}
+
+/**
+ * Compare production attestation binding against closed unsigned digests.
+ * Returns null when matched; otherwise a defect class detail.
+ */
+export function unsignedDigestBindingMismatch(
+  expected: FactoryReleaseUnsignedDigestBinding,
+  observed: unknown,
+): string | null {
+  if (observed === null || typeof observed !== "object" || Array.isArray(observed)) {
+    return "factory_release_binding missing or not an object";
+  }
+  const o = observed as Record<string, unknown>;
+  if (o.kind !== "factory_release_unsigned_digest_binding") {
+    return "factory_release_binding.kind mismatch";
+  }
+  if (o.request_fingerprint !== expected.request_fingerprint) {
+    return "factory_release_binding.request_fingerprint mismatch";
+  }
+  if (o.target_version !== expected.target_version) {
+    return "factory_release_binding.target_version mismatch";
+  }
+  if (o.candidate_git_sha !== expected.candidate_git_sha) {
+    return "factory_release_binding.candidate_git_sha mismatch";
+  }
+  if (o.pack_id !== expected.pack_id) return "factory_release_binding.pack_id mismatch";
+  if (o.pack_run_id !== expected.pack_run_id) {
+    return "factory_release_binding.pack_run_id mismatch";
+  }
+  if (o.loop_run_id !== expected.loop_run_id) {
+    return "factory_release_binding.loop_run_id mismatch";
+  }
+  if (o.frg_run_id !== expected.frg_run_id) {
+    return "factory_release_binding.frg_run_id mismatch";
+  }
+  const arts = o.artifacts;
+  if (arts === null || typeof arts !== "object" || Array.isArray(arts)) {
+    return "factory_release_binding.artifacts missing";
+  }
+  const a = arts as Record<string, unknown>;
+  for (const [key, value] of Object.entries(expected.artifacts)) {
+    if (a[key] !== value) return `factory_release_binding.artifacts.${key} mismatch`;
+  }
+  return null;
+}
+
+function refuseLayerASource(source: unknown, field: string): void {
+  if (source === "layer_a") {
+    throw new Error(
+      `factory-release prepare: ${field} uses forbidden source layer_a after v${FRG_HYBRID_PILOT_VERSION}; ` +
+        `durable full-current FRG policy requires live|ledger|derived|observation only`,
     );
-    const out = String(stdout);
-    const err = String(stderr);
-    const passed =
-      /\nok \d+/m.test(out) &&
-      !/\nnot ok \d+/m.test(out) &&
-      !/# skip/i.test(out);
-    return {
-      id: probe.id,
-      passed,
-      stdout_sha256: sha256(out),
-      stderr_sha256: sha256(err),
-      detail: passed
-        ? `Layer A probe ${probe.id} passed on candidate ${ctx.candidateGitSha}`
-        : `Layer A probe ${probe.id} failed or skipped`,
-    };
-  } catch (err) {
-    const e = err as { stdout?: string; stderr?: string; message?: string };
-    const out = String(e.stdout ?? "");
-    const errout = String(e.stderr ?? e.message ?? "");
-    return {
-      id: probe.id,
-      passed: false,
-      stdout_sha256: sha256(out),
-      stderr_sha256: sha256(errout),
-      detail: `Layer A probe ${probe.id} errored: ${e.message ?? "unknown"}`,
-    };
+  }
+  if (source !== undefined && typeof source === "string" && !POST_PILOT_ALLOWED_SOURCES.has(source)) {
+    throw new Error(
+      `factory-release prepare: ${field} has unsupported source ${source} (allowed: live|ledger|derived|observation)`,
+    );
   }
 }
 
-async function defaultLoadFactoryGateLoop(
-  _ctx: { repoDir: string },
+function packInstanceMatchesRequest(
+  instance: FactoryReleasePackInstance,
+  request: FactoryReleasePrepareRequest,
+  fingerprint: string,
+  packRunId: string,
+): boolean {
+  return (
+    instance.request_fingerprint === fingerprint &&
+    instance.target_version === request.target_version &&
+    instance.candidate_git_sha === request.integrated_candidate.git_sha &&
+    instance.pack_id === request.frg_manifest.pack_id &&
+    instance.manifest_sha256 === request.frg_manifest.sha256 &&
+    instance.pack_run_id === packRunId
+  );
+}
+
+async function loadBoundLoopArtifacts(
+  loopRunId: string,
+  request: FactoryReleasePrepareRequest,
+  fingerprint: string,
+  readFile: (p: string) => Promise<string>,
+  fileExists: (p: string) => Promise<boolean>,
 ): Promise<DurablePackLoopArtifacts | null> {
   const storeDeps = defaultLoopStoreDeps();
-  const home = resolveStateHome(storeDeps);
-  const runsRoot = path.join(home, "loop", "runs");
-  let entries: string[];
   try {
-    entries = await storeDeps.listDir(runsRoot);
+    void runDir(storeDeps, loopRunId);
+    const bindingPath = path.join(runDir(storeDeps, loopRunId), "factory-release-binding.json");
+    if (!(await fileExists(bindingPath))) {
+      // Also accept binding written into the factory-release work tree only when
+      // the pack-instance already names this exact loop (checked by caller).
+      // Without a loop-side binding, refuse unless pack-instance already bound it.
+    } else {
+      const bindingText = await readFile(bindingPath);
+      let binding: Record<string, unknown>;
+      try {
+        binding = JSON.parse(bindingText) as Record<string, unknown>;
+      } catch {
+        return null;
+      }
+      if (
+        binding.request_fingerprint !== fingerprint ||
+        binding.target_version !== request.target_version ||
+        binding.candidate_git_sha !== request.integrated_candidate.git_sha ||
+        binding.manifest_sha256 !== request.frg_manifest.sha256 ||
+        binding.pack_id !== request.frg_manifest.pack_id
+      ) {
+        return null;
+      }
+    }
+
+    const contract = await readContract(storeDeps, loopRunId);
+    if (!isAllowedFrgPackSelector(contract.selector)) return null;
+    const packCheck = validateFrgPackContract(contract);
+    if (!packCheck.ok) return null;
+    const ledger = await readLedger(storeDeps, loopRunId);
+    let eventsText = "";
+    try {
+      const events = await readEvents(storeDeps, loopRunId);
+      eventsText = events.map((e) => JSON.stringify(e)).join("\n") + (events.length ? "\n" : "");
+    } catch {
+      eventsText = "";
+    }
+    let actionEvidenceText = "{}\n";
+    try {
+      const actions = await readActionEvidence(storeDeps, loopRunId);
+      actionEvidenceText = `${JSON.stringify(actions, null, 2)}\n`;
+    } catch {
+      actionEvidenceText = "{}\n";
+    }
+
+    // Optional runner observations colocated with the loop run.
+    let runnerObs: string | undefined;
+    const runnerObsPath = path.join(runDir(storeDeps, loopRunId), "runner-observations.json");
+    if (await fileExists(runnerObsPath)) {
+      runnerObs = await readFile(runnerObsPath);
+    }
+
+    return {
+      loop_run_id: loopRunId,
+      contract_text: `${JSON.stringify(contract, null, 2)}\n`,
+      ledger_text: `${JSON.stringify(ledger, null, 2)}\n`,
+      events_text: eventsText,
+      action_evidence_text: actionEvidenceText,
+      runner_observations_text: runnerObs,
+    };
   } catch {
     return null;
   }
-  // Prefer newest loop-* directories by reverse lexical order of run id.
+}
+
+/**
+ * Instantiate or reconcile a pack instance keyed by request fingerprint.
+ * Never discovers an unbound newest factory-gate loop as evidence.
+ */
+export async function defaultReconcileBoundPackLoop(
+  ctx: DurableReconcilePackLoopCtx,
+): Promise<DurablePackLoopArtifacts | null> {
+  const instancePath = factoryReleasePackInstancePath(ctx.workDir);
+  let instance: FactoryReleasePackInstance | null = null;
+  if (await ctx.fileExists(instancePath)) {
+    try {
+      const raw = JSON.parse(await ctx.readFile(instancePath)) as FactoryReleasePackInstance;
+      if (
+        raw.kind === "factory_release_pack_instance" &&
+        packInstanceMatchesRequest(raw, ctx.request, ctx.requestFingerprint, ctx.packRunId)
+      ) {
+        instance = raw;
+      } else {
+        throw new Error(
+          "factory-release prepare: pack-instance.json does not match the active request binding",
+        );
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("does not match")) throw err;
+      instance = null;
+    }
+  }
+
+  if (!instance) {
+    // Instantiate a fresh pack instance bound to this exact request.
+    instance = {
+      schema_version: 1,
+      kind: "factory_release_pack_instance",
+      request_fingerprint: ctx.requestFingerprint,
+      target_version: ctx.request.target_version,
+      candidate_git_sha: ctx.request.integrated_candidate.git_sha,
+      pack_id: ctx.request.frg_manifest.pack_id,
+      manifest_sha256: ctx.request.frg_manifest.sha256,
+      pack_run_id: ctx.packRunId,
+      frg_run_id: ctx.frgRunId,
+      loop_run_id: null,
+      created_at: isoNow(ctx.now()),
+      updated_at: isoNow(ctx.now()),
+    };
+    await ctx.writeFile(instancePath, canonicalJson(instance), 0o600);
+  }
+
+  if (instance.loop_run_id) {
+    const loaded = await loadBoundLoopArtifacts(
+      instance.loop_run_id,
+      ctx.request,
+      ctx.requestFingerprint,
+      ctx.readFile,
+      ctx.fileExists,
+    );
+    if (loaded) return loaded;
+    // Stale loop id — clear and fall through.
+    instance = {
+      ...instance,
+      loop_run_id: null,
+      updated_at: isoNow(ctx.now()),
+    };
+    await ctx.writeFile(instancePath, canonicalJson(instance), 0o600);
+  }
+
+  // Scan only runs that carry an explicit factory-release-binding for this fingerprint.
+  const storeDeps = defaultLoopStoreDeps();
+  const home = resolveStateHome(storeDeps);
+  const runsRoot = path.join(home, "runs");
+  let entries: string[] = [];
+  try {
+    entries = await storeDeps.listDir(runsRoot);
+  } catch {
+    entries = [];
+  }
   const runIds = entries
     .filter((name) => name.startsWith("loop-") && !name.startsWith("archived-"))
     .sort()
     .reverse();
   for (const runId of runIds) {
-    try {
-      // Ensure the directory exists under the store layout.
-      void runDir(storeDeps, runId);
-      const contract = await readContract(storeDeps, runId);
-      if (!isAllowedFrgPackSelector(contract.selector)) continue;
-      const ledger = await readLedger(storeDeps, runId);
-      const contractText = `${JSON.stringify(contract, null, 2)}\n`;
-      const ledgerText = `${JSON.stringify(ledger, null, 2)}\n`;
-      return {
-        loop_run_id: runId,
-        contract_text: contractText,
-        ledger_text: ledgerText,
-        events_text: "",
-        action_evidence_text: "",
-      };
-    } catch {
-      continue;
-    }
+    const bindingPath = path.join(runDir(storeDeps, runId), "factory-release-binding.json");
+    if (!(await ctx.fileExists(bindingPath))) continue; // unbound — refuse
+    const loaded = await loadBoundLoopArtifacts(
+      runId,
+      ctx.request,
+      ctx.requestFingerprint,
+      ctx.readFile,
+      ctx.fileExists,
+    );
+    if (!loaded) continue;
+    instance = {
+      ...instance,
+      loop_run_id: runId,
+      updated_at: isoNow(ctx.now()),
+    };
+    await ctx.writeFile(instancePath, canonicalJson(instance), 0o600);
+    return loaded;
   }
+
   return null;
 }
 
 /**
  * Durable post-pilot unsigned FRG generator.
  *
- * Constructs Layer A probes from the fixed pack manifest (no caller pass claims),
- * requires a factory-gate durable loop, scores structural eligibility without
- * the FRG signing key, and writes closed artifact digests under workDir.
- * Synthetic trivial docs packs are never accepted.
+ * Instantiates a request-bound pack instance, collects evidence only from the
+ * durable loop + live-run artifacts (never Layer A / pilot hybrid), scores
+ * structural eligibility without the FRG signing key, and writes closed
+ * artifact digests under workDir. Synthetic trivial docs packs are never
+ * accepted as release-eligible.
  */
 export async function generateDurableUnsignedFrg(
   request: FactoryReleasePrepareRequest,
@@ -766,9 +1017,12 @@ export async function generateDurableUnsignedFrg(
     (async (p, o) => {
       await fs.mkdir(p, { recursive: o?.recursive ?? true, mode: o?.mode ?? 0o700 });
     });
-  const runProbe = opts.runProbe ?? defaultRunLayerAProbe;
-  const loadPackLoop = opts.loadPackLoop ?? defaultLoadFactoryGateLoop;
+  const readFile =
+    opts.readFile ?? ((p: string) => fs.readFile(p, "utf8"));
+  const fileExists = opts.fileExists ?? defaultFileExists;
+  const reconcilePackLoop = opts.reconcilePackLoop ?? defaultReconcileBoundPackLoop;
 
+  const requestFingerprint = factoryReleaseRequestFingerprint(request);
   const packRunId = `pack-${request.target_version.replace(/\./g, "")}-${request.action_id}`.slice(
     0,
     200,
@@ -776,12 +1030,14 @@ export async function generateDurableUnsignedFrg(
   const frgRunId = `frg-${sha256(`${request.action_id}:${request.integrated_candidate.git_sha}:${request.target_version}`).slice(0, 24)}`;
   const artDir = path.join(ctx.workDir, "unsigned");
   await mkdir(artDir, { recursive: true, mode: 0o700 });
+  await mkdir(ctx.workDir, { recursive: true, mode: 0o700 });
 
   // Fresh pack binding record (version + candidate + action) — refuse reuse of
   // earlier-version evidence by never reading foreign frg/<old-version> trees here.
   const binding = {
     schema_version: 1,
     kind: "factory_release_pack_binding",
+    request_fingerprint: requestFingerprint,
     target_version: request.target_version,
     candidate_git_sha: request.integrated_candidate.git_sha,
     action_id: request.action_id,
@@ -793,85 +1049,102 @@ export async function generateDurableUnsignedFrg(
   };
   await writeFile(path.join(artDir, "pack-binding.json"), canonicalJson(binding), 0o600);
 
-  const loop = await loadPackLoop({ repoDir: ctx.repoDir });
+  const reconcileCtx: DurableReconcilePackLoopCtx = {
+    repoDir: ctx.repoDir,
+    workDir: ctx.workDir,
+    request,
+    pack: ctx.pack,
+    packRunId,
+    frgRunId,
+    requestFingerprint,
+    writeFile,
+    readFile,
+    fileExists,
+    now,
+  };
+
+  let loop = await reconcilePackLoop(reconcileCtx);
+  if (!loop && opts.startBoundPackLoop) {
+    const started = await opts.startBoundPackLoop(reconcileCtx);
+    if (started?.loop_run_id) {
+      // Persist binding on the started loop so later reconcile accepts only this run.
+      const storeDeps = defaultLoopStoreDeps();
+      const loopBindingPath = path.join(
+        runDir(storeDeps, started.loop_run_id),
+        "factory-release-binding.json",
+      );
+      await writeFile(
+        loopBindingPath,
+        canonicalJson({
+          schema_version: 1,
+          kind: "factory_release_loop_binding",
+          request_fingerprint: requestFingerprint,
+          target_version: request.target_version,
+          candidate_git_sha: request.integrated_candidate.git_sha,
+          pack_id: request.frg_manifest.pack_id,
+          manifest_sha256: request.frg_manifest.sha256,
+          pack_run_id: packRunId,
+          frg_run_id: frgRunId,
+          loop_run_id: started.loop_run_id,
+        }),
+        0o600,
+      );
+      const instancePath = factoryReleasePackInstancePath(ctx.workDir);
+      await writeFile(
+        instancePath,
+        canonicalJson({
+          schema_version: 1,
+          kind: "factory_release_pack_instance",
+          request_fingerprint: requestFingerprint,
+          target_version: request.target_version,
+          candidate_git_sha: request.integrated_candidate.git_sha,
+          pack_id: request.frg_manifest.pack_id,
+          manifest_sha256: request.frg_manifest.sha256,
+          pack_run_id: packRunId,
+          frg_run_id: frgRunId,
+          loop_run_id: started.loop_run_id,
+          created_at: isoNow(now()),
+          updated_at: isoNow(now()),
+        } satisfies FactoryReleasePackInstance),
+        0o600,
+      );
+      loop = await reconcilePackLoop(reconcileCtx);
+    }
+  }
+
   if (!loop) {
     return refuseSyntheticTrivialPack(request, {
       defect_class: "pack_loop_missing",
       message:
-        `factory-release prepare: no factory-gate durable loop found for ${request.target_version}. ` +
-        `Start the fixed pack with: pipeline loop --label factory-gate ` +
-        `(from the exact integrated candidate), then re-run factory-release prepare. ` +
-        `Synthetic trivial docs packs are not release-eligible after v${FRG_HYBRID_PILOT_VERSION}.`,
+        `factory-release prepare: no request-bound factory-gate pack loop for ${request.target_version} ` +
+        `(fingerprint=${requestFingerprint.slice(0, 12)}…, candidate=${request.integrated_candidate.git_sha}). ` +
+        `A fresh pack instance was created under the factory-release work dir; bind a durable loop ` +
+        `with factory-release-binding.json (request fingerprint, candidate, version, manifest) and re-run. ` +
+        `Unbound prior loops and synthetic trivial docs packs are not release-eligible after v${FRG_HYBRID_PILOT_VERSION}.`,
     });
   }
 
-  const probes = ctx.pack.manifest.pilot_policy.layer_a_probes;
-  const probeResults: DurableProbeResult[] = [];
-  for (const probe of probes) {
-    probeResults.push(
-      await runProbe(probe, {
-        repoDir: ctx.repoDir,
-        candidateGitSha: request.integrated_candidate.git_sha,
-      }),
-    );
-  }
-  const failedProbes = probeResults.filter((p) => !p.passed);
-  if (failedProbes.length > 0) {
+  let contract: LoopContract;
+  try {
+    contract = JSON.parse(loop.contract_text) as LoopContract;
+  } catch (err) {
     return refuseSyntheticTrivialPack(request, {
-      defect_class: "probe_failed",
-      message:
-        `factory-release prepare: ${failedProbes.length} Layer A probe(s) failed for ` +
-        `${request.target_version}: ${failedProbes.map((p) => p.id).join(", ")}. ` +
-        `The runner constructs probes itself; caller-authored pass claims are refused.`,
+      defect_class: "contract_unparsable",
+      message: `factory-release prepare: pack loop contract unparsable: ${(err as Error).message}`,
     });
   }
-
-  // Map probe outputs → scenario / composition overrides (runner-owned only).
-  const scenarioById = new Map<string, FrgScenarioOverride>();
-  const compositionById = new Map<string, FrgCompositionOverride>();
-  for (const probe of probes) {
-    const result = probeResults.find((r) => r.id === probe.id)!;
-    for (const out of probe.scenario_outputs) {
-      scenarioById.set(out.id, {
-        id: out.id as FrgScenarioOverride["id"],
-        status: "pass",
-        detail: result.detail,
-        observed: out.observed ?? null,
-        threshold: out.threshold ?? null,
-        source: "layer_a",
-      });
-    }
-    for (const out of probe.composition_outputs) {
-      compositionById.set(out.id, {
-        id: out.id as FrgCompositionOverride["id"],
-        status: "pass",
-        detail: result.detail,
-        observed: out.observed ?? null,
-        source: "layer_a",
-      });
-    }
-  }
-  // Live/ledger auto-scored scenarios still come from the loop scoreboard.
-  // openspec-bearing is required composition: mark from live if not already set.
-  if (!compositionById.has("openspec-bearing-item")) {
-    compositionById.set("openspec-bearing-item", {
-      id: "openspec-bearing-item",
-      status: "pass",
-      detail: "factory-gate pack loop contract validated as fixed pack",
-      observed: null,
-      source: "live",
+  const packCheck = validateFrgPackContract(contract);
+  if (!packCheck.ok) {
+    return refuseSyntheticTrivialPack(request, {
+      defect_class: "pack_contract_invalid",
+      message: `factory-release prepare: bound loop is not FRG fixed pack: ${packCheck.detail}`,
     });
-  }
-  // Ensure every required composition id has a runner-owned observation when probes cover them.
-  for (const id of FRG_COMPOSITION_DIMENSION_IDS) {
-    if (!compositionById.has(id)) {
-      // Leave missing so structural eligibility fails closed (hard gate).
-    }
   }
 
   let ledgerItems;
+  let ledger;
   try {
-    const ledger = JSON.parse(loop.ledger_text);
+    ledger = JSON.parse(loop.ledger_text);
     ledgerItems = itemsFromLoopLedger(ledger);
   } catch (err) {
     return refuseSyntheticTrivialPack(request, {
@@ -880,33 +1153,129 @@ export async function generateDurableUnsignedFrg(
     });
   }
 
+  // Collect runner-owned observations from the bound loop / pack work dir only.
+  // Refuse Layer A provenance and caller-authored pass claims in the request
+  // (request already filtered); here we only accept live/ledger/derived/observation.
+  const scenarioById = new Map<string, FrgScenarioOverride>();
+  const compositionById = new Map<string, FrgCompositionOverride>();
+  let falseHumanAuthorityCount = 0;
+  let recoveryAggregates: Parameters<typeof computeFrgEvidence>[0]["recovery_aggregates"];
+
+  const observationCandidates: string[] = [];
+  if (loop.runner_observations_text) observationCandidates.push(loop.runner_observations_text);
+  const workRunnerPath = path.join(ctx.workDir, "runner-observations.json");
+  if (await fileExists(workRunnerPath)) {
+    try {
+      observationCandidates.push(await readFile(workRunnerPath));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  for (const text of observationCandidates) {
+    let parsed;
+    try {
+      parsed = parseFrgObservationsJson(text);
+    } catch (err) {
+      return refuseSyntheticTrivialPack(request, {
+        defect_class: "runner_observations_invalid",
+        message:
+          `factory-release prepare: runner observations unusable: ${(err as Error).message}`,
+      });
+    }
+    if (parsed.pack_provenance != null) {
+      return refuseSyntheticTrivialPack(request, {
+        defect_class: "hybrid_provenance_refused",
+        message:
+          `factory-release prepare: hybrid pack_provenance is not accepted for ` +
+          `${request.target_version}; durable full-current FRG policy applies after v${FRG_HYBRID_PILOT_VERSION}`,
+      });
+    }
+    for (const s of parsed.scenarios ?? []) {
+      try {
+        refuseLayerASource(s.source, `scenario ${s.id}`);
+      } catch (err) {
+        return refuseSyntheticTrivialPack(request, {
+          defect_class: "layer_a_refused",
+          message: (err as Error).message,
+        });
+      }
+      scenarioById.set(s.id, s);
+    }
+    for (const c of parsed.composition ?? []) {
+      try {
+        refuseLayerASource(c.source, `composition ${c.id}`);
+      } catch (err) {
+        return refuseSyntheticTrivialPack(request, {
+          defect_class: "layer_a_refused",
+          message: (err as Error).message,
+        });
+      }
+      compositionById.set(c.id, c);
+    }
+    if (typeof parsed.false_human_authority_count === "number") {
+      falseHumanAuthorityCount = parsed.false_human_authority_count;
+    }
+    if (parsed.recovery_aggregates) recoveryAggregates = parsed.recovery_aggregates;
+  }
+
+  // Contract-derived honesty scenario (ledger/derived — never Layer A).
+  const stackHonesty = detectEmptyDependsOnStackHonesty(contract, ledger);
+  if (stackHonesty && !scenarioById.has("empty-depends-on-stack-honesty")) {
+    scenarioById.set("empty-depends-on-stack-honesty", {
+      ...stackHonesty,
+      source: "derived",
+    });
+  }
+
   const scenarioOverrides = FRG_SCENARIO_IDS.map((id) => {
     if (id === "clean-item-throughput" || id === "blocker-taxonomy") {
       // Auto-scored from ledger items inside computeFrgEvidence.
       return null;
     }
-    if (id === "empty-depends-on-stack-honesty") {
-      return {
+    return (
+      scenarioById.get(id) ?? {
         id,
-        status: "pass" as const,
-        detail: "derived from factory-gate pack contract (durable generator)",
+        status: "not_observed" as const,
+        detail: "not observed by durable loop / live-run collector",
         observed: null,
         threshold: null,
         source: "derived" as const,
-      };
-    }
-    return scenarioById.get(id) ?? {
-      id,
-      status: "not_observed" as const,
-      detail: "not observed by durable generator probes",
-      observed: null,
-      threshold: null,
-    };
+      }
+    );
   }).filter((s): s is FrgScenarioOverride => s !== null);
 
-  const compositionOverrides = [...compositionById.values()];
+  // First score for auto scenarios + scoreboard-derived composition projections.
+  const partial = computeFrgEvidence({
+    version: request.target_version,
+    run_id: frgRunId,
+    loop_run_id: loop.loop_run_id,
+    pack_id: request.frg_manifest.pack_id,
+    items: ledgerItems,
+    scenario_overrides: scenarioOverrides,
+    composition_overrides: [...compositionById.values()],
+    false_human_authority_count: falseHumanAuthorityCount,
+    recovery_aggregates: recoveryAggregates,
+    attestation_key: null,
+    notes: [
+      `durable factory-release prepare unsigned pack for ${request.target_version}`,
+      `candidate=${request.integrated_candidate.git_sha}`,
+      `request_fingerprint=${requestFingerprint}`,
+      `pack_run_id=${packRunId}`,
+    ],
+  });
 
-  // Score without attestation key → structural check only (unsigned).
+  const projected = projectCompositionFromScoreboard(
+    partial.scenarios,
+    partial.scoreboard,
+    partial.thresholds,
+  );
+  for (const p of projected) {
+    if (!compositionById.has(p.id)) compositionById.set(p.id, p);
+  }
+  // Leave missing composition dimensions not_observed so eligibility fails closed.
+
+  const compositionOverrides = [...compositionById.values()];
   const scored = computeFrgEvidence({
     version: request.target_version,
     run_id: frgRunId,
@@ -915,15 +1284,29 @@ export async function generateDurableUnsignedFrg(
     items: ledgerItems,
     scenario_overrides: scenarioOverrides,
     composition_overrides: compositionOverrides,
-    false_human_authority_count: 0,
+    false_human_authority_count: falseHumanAuthorityCount,
+    recovery_aggregates: recoveryAggregates,
     // Explicit null: never sign in the candidate prepare process.
     attestation_key: null,
     notes: [
       `durable factory-release prepare unsigned pack for ${request.target_version}`,
       `candidate=${request.integrated_candidate.git_sha}`,
+      `request_fingerprint=${requestFingerprint}`,
       `pack_run_id=${packRunId}`,
     ],
   });
+
+  // Refuse any Layer A that slipped into scored outcomes.
+  const layerAScenario = scored.scenarios.find((s) => s.source === "layer_a");
+  const layerAComp = scored.composition.dimensions.find((d) => d.source === "layer_a");
+  if (layerAScenario || layerAComp) {
+    return refuseSyntheticTrivialPack(request, {
+      defect_class: "layer_a_refused",
+      message:
+        `factory-release prepare: Layer A proof source is forbidden for ${request.target_version} ` +
+        `(scenario=${layerAScenario?.id ?? "none"}, composition=${layerAComp?.id ?? "none"})`,
+    });
+  }
 
   const structural = isReleaseEligibleFrgPass(
     {
@@ -932,7 +1315,6 @@ export async function generateDurableUnsignedFrg(
     },
     { requireAttestation: false },
   );
-  // Prefer the real structural path: scenarios must actually permit pass.
   const scenariosOk = scored.scenarios.every(
     (s) => s.status === "pass" || s.status === "warn",
   );
@@ -942,9 +1324,32 @@ export async function generateDurableUnsignedFrg(
     scored.composition.missing.length === 0 &&
     scored.pack_provenance == null;
 
+  const eventsBody = loop.events_text || "\n";
+  const actionBody = loop.action_evidence_text || "{}\n";
+  const contractBody = loop.contract_text;
+  const ledgerBody = loop.ledger_text;
+
+  const paths = {
+    observations: path.join(artDir, "observations.json"),
+    evidence_bundle: path.join(artDir, "evidence-bundle.json"),
+    contract: path.join(artDir, "contract.json"),
+    ledger: path.join(artDir, "ledger.json"),
+    events: path.join(artDir, "events.jsonl"),
+    action_evidence: path.join(artDir, "action-evidence.json"),
+  };
+
+  await writeFile(paths.contract, contractBody, 0o600);
+  await writeFile(paths.ledger, ledgerBody, 0o600);
+  await writeFile(paths.events, eventsBody, 0o600);
+  await writeFile(paths.action_evidence, actionBody, 0o600);
+
+  // Observations first (no self-digest). Evidence-bundle lists identity + score
+  // summary; the closed six-digest binding is carried on signed evidence via
+  // factory_release_binding and on the awaiting FRG payload digests.
   const observationsBody = canonicalJson({
     schema_version: 1,
     kind: "factory_release_unsigned_observations",
+    request_fingerprint: requestFingerprint,
     target_version: request.target_version,
     candidate_git_sha: request.integrated_candidate.git_sha,
     pack_run_id: packRunId,
@@ -952,12 +1357,14 @@ export async function generateDurableUnsignedFrg(
     frg_run_id: frgRunId,
     scenarios: scenarioOverrides,
     composition: compositionOverrides,
-    probes: probeResults,
-    // Explicitly no pack_provenance / hybrid policy for post-pilot.
+    // Explicitly no pack_provenance / hybrid Layer A policy for post-pilot.
   });
+  await writeFile(paths.observations, observationsBody, 0o600);
+
   const evidenceBundleBody = canonicalJson({
     schema_version: 1,
     kind: "factory_release_unsigned_evidence_bundle",
+    request_fingerprint: requestFingerprint,
     target_version: request.target_version,
     candidate_git_sha: request.integrated_candidate.git_sha,
     structural_pass: eligible,
@@ -969,21 +1376,7 @@ export async function generateDurableUnsignedFrg(
       composition_missing: scored.composition.missing,
     },
   });
-
-  const paths = {
-    observations: path.join(artDir, "observations.json"),
-    evidence_bundle: path.join(artDir, "evidence-bundle.json"),
-    contract: path.join(artDir, "contract.json"),
-    ledger: path.join(artDir, "ledger.json"),
-    events: path.join(artDir, "events.jsonl"),
-    action_evidence: path.join(artDir, "action-evidence.json"),
-  };
-  await writeFile(paths.observations, observationsBody, 0o600);
   await writeFile(paths.evidence_bundle, evidenceBundleBody, 0o600);
-  await writeFile(paths.contract, loop.contract_text, 0o600);
-  await writeFile(paths.ledger, loop.ledger_text, 0o600);
-  await writeFile(paths.events, loop.events_text || "\n", 0o600);
-  await writeFile(paths.action_evidence, loop.action_evidence_text || "{}\n", 0o600);
 
   const frg: FactoryReleaseFrgPayload = {
     pack_id: request.frg_manifest.pack_id,
@@ -995,13 +1388,10 @@ export async function generateDurableUnsignedFrg(
     evidence_created_at: isoNow(now()),
     observations: { path: paths.observations, sha256: sha256(observationsBody) },
     evidence_bundle: { path: paths.evidence_bundle, sha256: sha256(evidenceBundleBody) },
-    contract: { path: paths.contract, sha256: sha256(loop.contract_text) },
-    ledger: { path: paths.ledger, sha256: sha256(loop.ledger_text) },
-    events: { path: paths.events, sha256: sha256(loop.events_text || "\n") },
-    action_evidence: {
-      path: paths.action_evidence,
-      sha256: sha256(loop.action_evidence_text || "{}\n"),
-    },
+    contract: { path: paths.contract, sha256: sha256(contractBody) },
+    ledger: { path: paths.ledger, sha256: sha256(ledgerBody) },
+    events: { path: paths.events, sha256: sha256(eventsBody) },
+    action_evidence: { path: paths.action_evidence, sha256: sha256(actionBody) },
   };
 
   if (!eligible) {
@@ -1014,6 +1404,12 @@ export async function generateDurableUnsignedFrg(
         (scored.composition.missing.length
           ? ` (composition missing: ${scored.composition.missing.join(", ")})`
           : "") +
+        (scenariosOk
+          ? ""
+          : ` (scenarios not all pass/warn: ${scored.scenarios
+              .filter((s) => s.status !== "pass" && s.status !== "warn")
+              .map((s) => `${s.id}=${s.status}`)
+              .join(", ")})`) +
         `. Hard gate: release preparation blocked.`,
     };
   }
@@ -1022,8 +1418,88 @@ export async function generateDurableUnsignedFrg(
 }
 
 /**
+ * Try to load and validate release-eligible attested evidence from a path.
+ * Requires factory_release_binding digests to match the unsigned payload.
+ */
+async function tryLoadAttestedEvidence(
+  evidencePath: string,
+  request: FactoryReleasePrepareRequest,
+  unsigned: FactoryReleaseFrgPayload,
+  readFile: (p: string) => Promise<string>,
+  fileExists: (p: string) => Promise<boolean>,
+): Promise<{ evidence: FrgEvidence; text: string; path: string } | null> {
+  if (!(await fileExists(evidencePath))) return null;
+  let text: string;
+  try {
+    text = await readFile(evidencePath);
+  } catch {
+    return null;
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const rawObj = raw as Record<string, unknown>;
+
+  let evidence: FrgEvidence;
+  try {
+    evidence = validateReleaseEligibleFrgEvidence(parseFrgEvidenceJson(text), request.target_version);
+  } catch {
+    try {
+      const parsed = parseFrgEvidenceJson(text);
+      if (parsed.version !== request.target_version || parsed.run_id !== unsigned.frg_run_id) {
+        return null;
+      }
+      if (!parsed.pass || !isReleaseEligibleFrgPass(parsed)) return null;
+      evidence = parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  if (evidence.run_id !== unsigned.frg_run_id) return null;
+  if (evidence.loop_run_id !== unsigned.loop_run_id) return null;
+  if (evidence.pack_id !== unsigned.pack_id) return null;
+  if (evidence.version !== request.target_version) return null;
+  if (evidence.pack_provenance != null) {
+    throw new Error(
+      `factory-release prepare: hybrid pack_provenance is not accepted for ${request.target_version}; ` +
+        `durable path required after v${FRG_HYBRID_PILOT_VERSION}`,
+    );
+  }
+  if (!evidence.integrity?.attestation) return null;
+
+  // Exact-artifact two-call handoff: attestation must bind request fingerprint
+  // and every unsigned artifact digest.
+  const expected = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
+  const binding =
+    rawObj.factory_release_binding ??
+    // Allow notes entry as a last-resort carrier: factory_release_binding:<json>
+    (() => {
+      for (const note of evidence.notes ?? []) {
+        if (typeof note === "string" && note.startsWith("factory_release_binding:")) {
+          try {
+            return JSON.parse(note.slice("factory_release_binding:".length));
+          } catch {
+            return null;
+          }
+        }
+      }
+      return null;
+    })();
+  const mismatch = unsignedDigestBindingMismatch(expected, binding);
+  if (mismatch) return null;
+
+  return { evidence, text, path: evidencePath };
+}
+
+/**
  * Observe release-eligible attested evidence under the version FRG tree.
- * Matches the unsigned frg_run_id and refuses foreign/stale versions.
+ * Matches the unsigned frg_run_id and every closed unsigned artifact digest.
+ * Handoff is a single non-recursive hint: re-read referenced paths once.
  */
 export async function defaultObserveAttestation(
   request: FactoryReleasePrepareRequest,
@@ -1042,71 +1518,61 @@ export async function defaultObserveAttestation(
     unsigned.frg_run_id,
     "evidence.json",
   );
-  // Prefer run-scoped evidence; fall back to latest.json when digests match.
-  const candidates = [evidencePath, latestPath];
-  for (const p of candidates) {
-    if (!(await fileExists(p))) continue;
-    let text: string;
-    try {
-      text = await readFile(p);
-    } catch {
-      continue;
-    }
-    let evidence: FrgEvidence;
-    try {
-      evidence = validateReleaseEligibleFrgEvidence(parseFrgEvidenceJson(text), version);
-    } catch {
-      // Not release-eligible yet (missing MAC, fail, etc.)
-      try {
-        const raw = parseFrgEvidenceJson(text);
-        if (raw.version !== version || raw.run_id !== unsigned.frg_run_id) continue;
-        if (!raw.pass || !isReleaseEligibleFrgPass(raw)) continue;
-        evidence = raw;
-      } catch {
-        continue;
-      }
-    }
-    if (evidence.run_id !== unsigned.frg_run_id) continue;
-    if (evidence.loop_run_id !== unsigned.loop_run_id) continue;
-    if (evidence.pack_id !== unsigned.pack_id) continue;
-    if (evidence.version !== version) continue;
-    // Refuse hybrid provenance on post-pilot releases.
-    if (evidence.pack_provenance != null) {
-      throw new Error(
-        `factory-release prepare: hybrid pack_provenance is not accepted for ${version}; ` +
-          `durable path required after v${FRG_HYBRID_PILOT_VERSION}`,
-      );
-    }
-    if (!evidence.integrity?.attestation) continue;
-    const digest = sha256(text);
+
+  const tryPaths = [evidencePath, latestPath];
+  for (const p of tryPaths) {
+    const loaded = await tryLoadAttestedEvidence(p, request, unsigned, readFile, fileExists);
+    if (!loaded) continue;
+    const digest = sha256(loaded.text);
     return {
-      frg_run_id: evidence.run_id,
+      frg_run_id: loaded.evidence.run_id,
       evidence_path: p === latestPath ? evidencePath : p,
       evidence_sha256: digest,
       latest_path: latestPath,
       latest_sha256: digest,
-      evidence,
+      evidence: loaded.evidence,
     };
   }
 
-  // Optional handoff file written by the trusted attestor next to the checkpoint.
+  // Optional handoff: single hint to re-observe referenced evidence paths once.
+  // Never recurse into defaultObserveAttestation (crash-window must return null).
   const handoffPath = path.join(ctx.workDir, "attestation-handoff.json");
   if (await fileExists(handoffPath)) {
-    const handoffText = await readFile(handoffPath);
     let handoff: Record<string, unknown>;
     try {
-      handoff = JSON.parse(handoffText) as Record<string, unknown>;
+      handoff = JSON.parse(await readFile(handoffPath)) as Record<string, unknown>;
     } catch {
       return null;
     }
     if (
       handoff.kind === "frg_attestation_handoff" &&
       handoff.status === "complete" &&
-      handoff.frg_run_id === unsigned.frg_run_id &&
-      typeof handoff.frg_latest_path === "string" &&
-      typeof handoff.frg_evidence_path === "string"
+      handoff.frg_run_id === unsigned.frg_run_id
     ) {
-      return defaultObserveAttestation(request, unsigned, ctx, readFile, fileExists);
+      const hintPaths: string[] = [];
+      if (typeof handoff.frg_evidence_path === "string") {
+        hintPaths.push(handoff.frg_evidence_path);
+      }
+      if (typeof handoff.frg_latest_path === "string") {
+        hintPaths.push(handoff.frg_latest_path);
+      }
+      for (const p of hintPaths) {
+        // Skip paths already attempted above.
+        if (p === evidencePath || p === latestPath) continue;
+        const loaded = await tryLoadAttestedEvidence(p, request, unsigned, readFile, fileExists);
+        if (!loaded) continue;
+        const digest = sha256(loaded.text);
+        return {
+          frg_run_id: loaded.evidence.run_id,
+          evidence_path: loaded.path,
+          evidence_sha256: digest,
+          latest_path: typeof handoff.frg_latest_path === "string" ? handoff.frg_latest_path : latestPath,
+          latest_sha256: digest,
+          evidence: loaded.evidence,
+        };
+      }
+      // Handoff present but evidence still absent/invalid — awaiting, not recurse.
+      return null;
     }
   }
   return null;
@@ -1535,7 +2001,7 @@ export async function runFactoryReleasePrepare(
     };
   }
 
-  // Stale / foreign attestation binding
+  // Stale / foreign attestation binding (ids + exact unsigned artifact digests).
   if (
     attestation.frg_run_id !== unsigned.frg_run_id ||
     attestation.evidence.loop_run_id !== unsigned.loop_run_id ||
@@ -1548,6 +2014,42 @@ export async function runFactoryReleasePrepare(
       exitCode: 1,
       result: failedResult(request, "attestation_mismatch", msg, checkpointId("failed", fingerprint)),
     };
+  }
+  // Exact-artifact two-call handoff: attestation must bind request fingerprint
+  // and every closed unsigned artifact digest (even when observeAttestation is injected).
+  {
+    const expectedBinding = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
+    const evidenceRec = attestation.evidence as FrgEvidence & {
+      factory_release_binding?: unknown;
+    };
+    let observedBinding: unknown = evidenceRec.factory_release_binding ?? null;
+    if (observedBinding == null) {
+      for (const note of attestation.evidence.notes ?? []) {
+        if (typeof note === "string" && note.startsWith("factory_release_binding:")) {
+          try {
+            observedBinding = JSON.parse(note.slice("factory_release_binding:".length));
+          } catch {
+            observedBinding = null;
+          }
+          break;
+        }
+      }
+    }
+    const mismatch = unsignedDigestBindingMismatch(expectedBinding, observedBinding);
+    if (mismatch) {
+      const msg =
+        `factory-release prepare: attested evidence unsigned digest binding failed ` +
+        `for ${request.target_version}: ${mismatch}`;
+      return {
+        exitCode: 1,
+        result: failedResult(
+          request,
+          "attestation_digest_mismatch",
+          msg,
+          checkpointId("failed", fingerprint),
+        ),
+      };
+    }
   }
 
   // --- Release prepare via shared runRelease (idempotent) ---

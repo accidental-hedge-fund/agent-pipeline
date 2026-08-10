@@ -5,13 +5,17 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as crypto from "node:crypto";
 import {
+  buildFactoryReleaseUnsignedDigestBinding,
   compareSemver,
   defaultFactoryReleasePrepareDeps,
+  defaultObserveAttestation,
   factoryReleaseRequestFingerprint,
+  generateDurableUnsignedFrg,
   isPostPilotReleaseVersion,
   parseFactoryReleasePrepareRequest,
   rejectForbiddenRequestFields,
   runFactoryReleasePrepare,
+  unsignedDigestBindingMismatch,
   type FactoryReleaseFrgPayload,
   type FactoryReleasePrepareDeps,
   type FactoryReleasePrepareRequest,
@@ -107,9 +111,14 @@ function unsignedPayload(over: Partial<FactoryReleaseFrgPayload> = {}): FactoryR
   };
 }
 
-function releaseEligibleEvidence(version = "1.34.0"): FrgEvidence {
+function releaseEligibleEvidence(
+  version = "1.34.0",
+  opts?: { unsigned?: FactoryReleaseFrgPayload; request?: FactoryReleasePrepareRequest },
+): FrgEvidence {
   // Build via computeFrgEvidence so fingerprints + attestation match.
   // Post-pilot: no pack_provenance (hybrid is 1.33.0-only).
+  const unsigned = opts?.unsigned ?? unsignedPayload();
+  const request = opts?.request ?? baseRequest();
   const scenarioPass = (id: (typeof FRG_SCENARIO_IDS)[number]) => ({
     id,
     status: "pass" as const,
@@ -117,10 +126,11 @@ function releaseEligibleEvidence(version = "1.34.0"): FrgEvidence {
     observed: id === "capacity-blocked-retain" ? 2 : null,
     threshold: id === "capacity-blocked-retain" ? 2 : null,
   });
+  const binding = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
   const evidence = computeFrgEvidence({
     version,
-    run_id: "frg-134",
-    loop_run_id: "loop-134",
+    run_id: unsigned.frg_run_id,
+    loop_run_id: unsigned.loop_run_id,
     pack_id: "factory-gate-v1",
     items: [
       { item_id: "1", state: "ready", ready_clean: true },
@@ -148,10 +158,29 @@ function releaseEligibleEvidence(version = "1.34.0"): FrgEvidence {
     })),
     false_human_authority_count: 0,
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+    notes: [`factory_release_binding:${JSON.stringify(binding)}`],
   });
   assert.equal(evidence.pass, true);
   assert.equal(evidence.pack_provenance, null);
+  // Attach binding for prepare orchestration (notes also carry it for observers).
+  (evidence as FrgEvidence & { factory_release_binding?: unknown }).factory_release_binding =
+    binding;
   return evidence;
+}
+
+function observeForUnsigned(
+  unsigned: FactoryReleaseFrgPayload,
+  request: FactoryReleasePrepareRequest = baseRequest(),
+): ObservedAttestation {
+  const evidence = releaseEligibleEvidence(request.target_version, { unsigned, request });
+  return {
+    frg_run_id: unsigned.frg_run_id,
+    evidence_path: `/repo/.agent-pipeline/frg/${request.target_version}/${unsigned.frg_run_id}/evidence.json`,
+    evidence_sha256: crypto.createHash("sha256").update("e").digest("hex"),
+    latest_path: `/repo/.agent-pipeline/frg/${request.target_version}/latest.json`,
+    latest_sha256: crypto.createHash("sha256").update("e").digest("hex"),
+    evidence,
+  };
 }
 
 function memoryFs() {
@@ -328,23 +357,17 @@ test("second call after attestation returns complete via shared runRelease", asy
   await mem.writeFile(requestPath, JSON.stringify(request));
   const releaseCalls = { n: 0 };
   const generateCalls = { n: 0 };
-  const evidence = releaseEligibleEvidence();
   let attested = false;
+  let boundUnsigned: FactoryReleaseFrgPayload | null = null;
 
   const deps = makeDeps({
     fs: mem,
     releaseCalls,
     generateCalls,
-    observe: async () => {
+    observe: async (_req, unsigned) => {
       if (!attested) return null;
-      return {
-        frg_run_id: "frg-134",
-        evidence_path: "/repo/.agent-pipeline/frg/1.34.0/frg-134/evidence.json",
-        evidence_sha256: crypto.createHash("sha256").update("e").digest("hex"),
-        latest_path: "/repo/.agent-pipeline/frg/1.34.0/latest.json",
-        latest_sha256: crypto.createHash("sha256").update("e").digest("hex"),
-        evidence,
-      } satisfies ObservedAttestation;
+      boundUnsigned = unsigned;
+      return observeForUnsigned(unsigned, request);
     },
   });
 
@@ -365,7 +388,7 @@ test("second call after attestation returns complete via shared runRelease", asy
   if (second.result.status !== "complete") return;
   assert.equal(second.result.release_pr.number, 1340);
   assert.equal(second.result.release_pr.base_oid, CANDIDATE);
-  assert.equal(second.result.frg.run_id, "frg-134");
+  assert.equal(second.result.frg.run_id, boundUnsigned?.frg_run_id ?? "frg-134");
   assert.equal(releaseCalls.n, 1);
   // Idempotent: generate only once across both calls
   assert.equal(generateCalls.n, 1);
@@ -397,19 +420,11 @@ test("idempotent re-entry at complete does not open a second PR", async () => {
   await mem.writeFile(requestPath, JSON.stringify(request));
   const releaseCalls = { n: 0 };
   const generateCalls = { n: 0 };
-  const evidence = releaseEligibleEvidence();
   const deps = makeDeps({
     fs: mem,
     releaseCalls,
     generateCalls,
-    observe: async () => ({
-      frg_run_id: "frg-134",
-      evidence_path: "/repo/e.json",
-      evidence_sha256: "e".repeat(64),
-      latest_path: "/repo/l.json",
-      latest_sha256: "e".repeat(64),
-      evidence,
-    }),
+    observe: async (_req, unsigned) => observeForUnsigned(unsigned, request),
   });
 
   const a = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
@@ -490,6 +505,231 @@ test("stale foreign evidence (wrong frg_run_id) is refused at attestation", asyn
   if (outcome.result.status === "failed") {
     assert.equal(outcome.result.defect_class, "attestation_mismatch");
   }
+});
+
+// ---------------------------------------------------------------------------
+// Review 1 regressions (#953)
+// ---------------------------------------------------------------------------
+
+test("post-pilot generator refuses Layer A runner observations (f5a999cf)", async () => {
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const workDir = "/tmp/frg-work-layer-a";
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: fakePack(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: async (p, body) => {
+        files.set(p, body);
+      },
+      mkdir: async () => {},
+      readFile: async (p) => {
+        const v = files.get(p);
+        if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return v;
+      },
+      fileExists: async (p) => files.has(p),
+      reconcilePackLoop: async () => ({
+        loop_run_id: "loop-bound-134",
+        contract_text: JSON.stringify({
+          schema: "pipeline.loop.contract/v1",
+          run_id: "loop-bound-134",
+          selector: { type: "label", value: "factory-gate" },
+          items: [
+            { id: "1", depends_on: [] },
+            { id: "2", depends_on: [] },
+          ],
+        }),
+        ledger_text: JSON.stringify({
+          items: {
+            "1": { state: "ready" },
+            "2": { state: "ready" },
+          },
+        }),
+        events_text: "\n",
+        action_evidence_text: "{}\n",
+        runner_observations_text: JSON.stringify({
+          schema_version: 1,
+          scenarios: [
+            {
+              id: "capacity-blocked-retain",
+              status: "pass",
+              detail: "layer a leak",
+              source: "layer_a",
+              observed: 2,
+              threshold: 2,
+            },
+          ],
+        }),
+      }),
+    },
+  );
+  assert.equal(result.structurally_eligible, false);
+  assert.equal(result.defect_class, "layer_a_refused");
+  assert.match(result.message ?? "", /layer_a/i);
+});
+
+test("generator never treats unbound newest loop as evidence (ba5b5ff5)", async () => {
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const workDir = "/tmp/frg-work-unbound";
+  // Default reconcile with no bound loop / no factory-release-binding → missing.
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: fakePack(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: async (p, body) => {
+        files.set(p, body);
+      },
+      mkdir: async () => {},
+      readFile: async (p) => {
+        const v = files.get(p);
+        if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return v;
+      },
+      fileExists: async (p) => files.has(p),
+      // Explicitly no reconcile that invents an unbound loop.
+    },
+  );
+  assert.equal(result.structurally_eligible, false);
+  assert.equal(result.defect_class, "pack_loop_missing");
+  assert.match(result.message ?? "", /request-bound|fingerprint/i);
+  // Pack instance was instantiated for this request.
+  assert.ok(
+    [...files.keys()].some((k) => k.endsWith("pack-instance.json")),
+    "expected pack-instance.json to be created",
+  );
+});
+
+test("attestation without unsigned digest binding is refused (5782ec4d)", async () => {
+  const request = baseRequest();
+  const unsigned = unsignedPayload();
+  const expected = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
+  assert.equal(
+    unsignedDigestBindingMismatch(expected, null),
+    "factory_release_binding missing or not an object",
+  );
+  assert.ok(
+    unsignedDigestBindingMismatch(expected, {
+      ...expected,
+      artifacts: { ...expected.artifacts, observations_sha256: "f".repeat(64) },
+    })?.includes("observations_sha256"),
+  );
+
+  const mem = memoryFs();
+  // Evidence present with matching ids but NO factory_release_binding digests.
+  const evidence = computeFrgEvidence({
+    version: "1.34.0",
+    run_id: unsigned.frg_run_id,
+    loop_run_id: unsigned.loop_run_id,
+    pack_id: "factory-gate-v1",
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    scenario_overrides: FRG_SCENARIO_IDS.map((id) => ({
+      id,
+      status: "pass" as const,
+      detail: "unit",
+      observed: id === "capacity-blocked-retain" ? 2 : null,
+      threshold: id === "capacity-blocked-retain" ? 2 : null,
+    })),
+    composition_overrides: [
+      "openspec-bearing-item",
+      "fix-rereview-cycle",
+      "concurrency-contention",
+      "managed-worktree-dirt",
+      "process-restart-hydration",
+      "forge-http-5xx-backoff",
+      "ci-pending-red-recovery",
+      "same-head-noop-reentry",
+      "capacity-live-run-coexistence",
+      "recovery-controller-one-item",
+      "recovery-controller-multi-item",
+    ].map((id) => ({
+      id: id as never,
+      status: "pass" as const,
+      detail: "unit",
+      source: "observation" as const,
+      observed: null,
+    })),
+    false_human_authority_count: 0,
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  const evidencePath = `/repo/.agent-pipeline/frg/1.34.0/${unsigned.frg_run_id}/evidence.json`;
+  await mem.writeFile(evidencePath, JSON.stringify(evidence));
+
+  const observed = await defaultObserveAttestation(
+    request,
+    unsigned,
+    { repoDir: "/repo", workDir: "/tmp/work" },
+    (p) => mem.readFile(p),
+    (p) => mem.fileExists(p),
+  );
+  assert.equal(observed, null, "missing digest binding must not unlock prepare");
+});
+
+test("handoff without evidence returns awaiting null without recursion (90ccb9ff)", async () => {
+  const mem = memoryFs();
+  const request = baseRequest();
+  const unsigned = unsignedPayload();
+  const workDir = "/tmp/handoff-crash-window";
+  await mem.writeFile(
+    `${workDir}/attestation-handoff.json`,
+    JSON.stringify({
+      kind: "frg_attestation_handoff",
+      status: "complete",
+      frg_run_id: unsigned.frg_run_id,
+      frg_evidence_path: `/repo/.agent-pipeline/frg/1.34.0/${unsigned.frg_run_id}/evidence.json`,
+      frg_latest_path: "/repo/.agent-pipeline/frg/1.34.0/latest.json",
+    }),
+  );
+  // Evidence files intentionally absent — crash window after handoff store.
+  const observed = await defaultObserveAttestation(
+    request,
+    unsigned,
+    { repoDir: "/repo", workDir },
+    (p) => mem.readFile(p),
+    (p) => mem.fileExists(p),
+  );
+  assert.equal(observed, null);
+});
+
+test("attestation with matching unsigned digests is accepted (5782ec4d positive)", async () => {
+  const mem = memoryFs();
+  const request = baseRequest();
+  const unsigned = unsignedPayload();
+  const binding = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
+  const evidence = releaseEligibleEvidence("1.34.0", { unsigned, request });
+  const evidencePath = `/repo/.agent-pipeline/frg/1.34.0/${unsigned.frg_run_id}/evidence.json`;
+  // Serialize with factory_release_binding field for the observer.
+  const wire = {
+    ...evidence,
+    factory_release_binding: binding,
+  };
+  await mem.writeFile(evidencePath, JSON.stringify(wire));
+
+  const observed = await defaultObserveAttestation(
+    request,
+    unsigned,
+    { repoDir: "/repo", workDir: "/tmp/work" },
+    (p) => mem.readFile(p),
+    (p) => mem.fileExists(p),
+  );
+  assert.ok(observed);
+  assert.equal(observed?.frg_run_id, unsigned.frg_run_id);
 });
 
 test("default generateUnsigned refuses synthetic trivial pack as release-eligible", async () => {
