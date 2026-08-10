@@ -1,7 +1,7 @@
 # FRG pack checklist (operator)
 
-**Goal:** produce `.agent-pipeline/frg/<X.Y.Z>/latest.json` so  
-`pipeline release <X.Y.Z>` and the ship playbook release phase can proceed.
+**Goal:** diagnose or manually produce `.agent-pipeline/frg/<X.Y.Z>/latest.json`
+when Pipeline ship status identifies FRG evidence as the blocking input.
 
 **Authoritative runbook:** [factory-reliability-gate-runbook.md](../factory-reliability-gate-runbook.md)  
 If this checklist conflicts with the runbook, **the runbook wins**.
@@ -66,30 +66,30 @@ Optional observations / scenarios: see the main FRG runbook.
 python3 -c "import json; d=json.load(open('.agent-pipeline/frg/<X.Y.Z>/latest.json')); print(d.get('pass'), d.get('run_id'), d.get('version'))"
 ```
 
-## 4. Land FRG evidence in git
+## 4. Keep FRG evidence for release prepare
 
-`pipeline release` and auto-tag expect FRG files **in the tree** that gets released.
+`pipeline release` and auto-tag expect FRG files **in the tree** that gets
+released. The ship coordinator stages only `.agent-pipeline/frg/<X.Y.Z>/` on
+the release branch.
 
-- [ ] Commit `.agent-pipeline/frg/<X.Y.Z>/` (and required run evidence) on a PR to the integration branch  
-- [ ] Merge that PR before or as part of the release flow  
+- [ ] Leave the validated version directory in the control checkout
+- [ ] Do not merge a separate evidence PR into the base after the candidate is
+      recorded; that would move the candidate before release prepare
 
-## 5. Finish the ship (after FRG is on disk)
+## 5. Resume the Pipeline-owned ship (after FRG is on disk)
 
 ```bash
-# Option A — full ship resume (train no-ops when milestone empty / already complete):
 export ALLOW_MERGE=1 REPO_DIR PIPELINE
-examples/supervisor/shell/ship-milestone.sh --milestone v<X.Y.Z> --detach
-
-# Option B — manual:
-pipeline release <X.Y.Z> --no-edit
-pipeline release finish <release-pr> --json
-# wait for GitHub Release v<X.Y.Z>
-pipeline engine-promote --for <X.Y.Z> --host codex --json
+examples/supervisor/shell/ship-milestone.sh \
+  --milestone v<X.Y.Z> \
+  --for <X.Y.Z> \
+  --authorization /absolute/path/to/current-authorization.json \
+  --detach
 ```
 
-- [ ] Release PR opened and finished  
-- [ ] `gh release view v<X.Y.Z>` published (not draft)  
-- [ ] `pipeline --version` matches after promote (or pin policy as designed)  
+- [ ] `pipeline ship status --milestone v<X.Y.Z> --for <X.Y.Z> --json` reports
+      the expected resumed checkpoint
+- [ ] Final typed status reports completion and the promoted engine identity
 
 ## 6. If factory-gate refuses the run
 
@@ -102,5 +102,5 @@ pipeline engine-promote --for <X.Y.Z> --host codex --json
 ## Pointers
 
 - Runbook: `docs/factory-reliability-gate-runbook.md`
-- Ship state (host): `$PIPELINE_SUPERVISOR_STATE/ship-v<X.Y.Z>/`
+- Ship state: use `pipeline ship status`; do not infer it from host files
 - Do **not** invent FRG pass files to unblock release

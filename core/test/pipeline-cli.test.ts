@@ -19,8 +19,21 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildCmd, resolveHarvestOutPath, resolveHarvestFixturesDir, type CliOpts } from "../scripts/pipeline.ts";
+import {
+  advanceIssueThroughSingle,
+  buildCmd,
+  normalizeShipCliInput,
+  resolveHarvestOutPath,
+  resolveHarvestFixturesDir,
+  selectPersistedShipFailureStatus,
+  validateShipAuthorizationPublicKeyFile,
+  validateReleaseMachineOutputMode,
+  runTrainCommand,
+  type CliOpts,
+  type TrainCommandDeps,
+} from "../scripts/pipeline.ts";
 import { lookupCommand, validateFlags, COMMAND_REGISTRY } from "../scripts/command-registry.ts";
+import type { PipelineConfig } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -87,6 +100,14 @@ test("pipeline-cli: doctor --harness-smoke is parsed onto opts.harnessSmoke (#78
 
 test("pipeline-cli: release — version argument → []", () => {
   assert.deepEqual(roundTrip(["release", "1.0.0"]), []);
+});
+
+test("pipeline-cli: release machine output rejects the multi-section dry-run preview", () => {
+  assert.doesNotThrow(() => validateReleaseMachineOutputMode({ json: true }));
+  assert.throws(
+    () => validateReleaseMachineOutputMode({ json: true, dryRun: true }),
+    /cannot be combined/,
+  );
 });
 
 test("pipeline-cli: intake — no flags → []", () => {
@@ -168,6 +189,231 @@ test("pipeline-cli: train --json parses onto opts.json", () => {
   assert.equal(numArg, "train");
   assert.equal(opts.json, true);
   assert.equal(opts.milestone, "v1.0.0");
+});
+
+test("pipeline-cli: train --json emits one train_status document after two nested issue runs", async () => {
+  const { opts, numArg } = parseCli(["train", "--issues", "10,11", "--json"]);
+  assert.equal(numArg, "train");
+
+  const ready = new Set<number>();
+  const advanced: number[] = [];
+  const trainCfg = {
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    base_branch: "main",
+  } as PipelineConfig;
+  const deps: TrainCommandDeps = {
+    makeTrainDeps: () => ({
+      log: () => {},
+      listMilestoneIssues: async () => [],
+      getIssue: async (issue) => ({
+        number: issue,
+        title: `Issue ${issue}`,
+        body: "",
+        labels: ready.has(issue) ? ["pipeline:ready-to-deploy"] : ["pipeline:ready"],
+        state: "open",
+      }),
+      advanceIssue: async () => {
+        throw new Error("the command must replace the base advanceIssue seam");
+      },
+      getPrForIssue: async () => null,
+      mergeIssuePr: async () => {},
+      observePr: async () => ({ state: "open", mergeCommitOid: null, headRefOid: null }),
+      fetchBase: async () => {},
+      baseTip: async () => "base-tip",
+      isAncestor: async () => false,
+    }),
+    async runSingleIssue(rawIssue, _opts, _deps, output) {
+      const issue = Number(rawIssue);
+      advanced.push(issue);
+      if (output?.emitMachineOutput !== false) {
+        console.log(JSON.stringify({ schema_version: "1", kind: "loop_run_handoff", issue }));
+        console.log(JSON.stringify({ schema_version: "1", kind: "drive", issue }));
+      }
+      ready.add(issue);
+      process.exitCode = 0;
+    },
+  };
+
+  const stdout: string[] = [];
+  const originalLog = console.log;
+  const priorExitCode = process.exitCode;
+  console.log = (...args: unknown[]) => {
+    stdout.push(`${args.map(String).join(" ")}\n`);
+  };
+  process.exitCode = undefined;
+  try {
+    const exitCode = await runTrainCommand(opts, trainCfg, deps);
+    assert.equal(exitCode, 0);
+    assert.deepEqual(advanced, [10, 11], "both ordered issues must use the nested single command");
+
+    const emitted = stdout.join("");
+    const document = JSON.parse(emitted) as { kind?: string; ordered_issues?: number[]; items?: unknown[] };
+    assert.equal(document.kind, "train_status");
+    assert.deepEqual(document.ordered_issues, [10, 11]);
+    assert.equal(document.items?.length, 2);
+    assert.doesNotMatch(emitted, /loop_run_handoff|\"kind\":\"drive\"/);
+  } finally {
+    console.log = originalLog;
+    process.exitCode = priorExitCode;
+  }
+});
+
+test("pipeline-cli: ship accepts exact authorization coordinates", () => {
+  assert.deepEqual(
+    roundTrip([
+      "ship",
+      "--milestone", "v1.34.0",
+      "--for", "1.34.0",
+      "--authorization", "/run/user/1000/ship.json",
+      "--json",
+    ]),
+    [],
+  );
+});
+
+test("pipeline-cli: ship status is read-only by shape and needs no authorization flag", () => {
+  const { opts, numArg } = parseCli([
+    "ship", "status", "--milestone", "v1.34.0", "--for", "1.34.0", "--json",
+  ]);
+  assert.equal(numArg, "ship");
+  assert.equal(opts.authorization, undefined);
+  assert.equal(opts.milestone, "v1.34.0");
+  assert.equal(opts.for, "1.34.0");
+  assert.deepEqual(roundTrip([
+    "ship", "status", "--milestone", "v1.34.0", "--for", "1.34.0", "--json",
+  ]), []);
+});
+
+test("pipeline-cli: ship rejects unrelated lifecycle flags", () => {
+  assert.deepEqual(
+    roundTrip([
+      "ship",
+      "--milestone", "v1.34.0",
+      "--for", "1.34.0",
+      "--authorization", "/run/user/1000/ship.json",
+      "--json-events",
+    ]),
+    ["jsonEvents"],
+  );
+});
+
+test("pipeline-cli: ship input requires JSON and an absolute authorization path", () => {
+  assert.throws(
+    () => normalizeShipCliInput(["ship"], {
+      milestone: "v1.34.0",
+      for: "1.34.0",
+      authorization: "relative.json",
+      json: true,
+    }),
+    /absolute path/,
+  );
+  assert.throws(
+    () => normalizeShipCliInput(["ship"], {
+      milestone: "v1.34.0",
+      for: "1.34.0",
+      authorization: "/run/user/1000/ship.json",
+      json: false,
+    }),
+    /--json is required/,
+  );
+  assert.deepEqual(
+    normalizeShipCliInput(["ship"], {
+      milestone: "v1.34.0",
+      for: "v1.34.0",
+      authorization: "/run/user/1000/ship.json",
+      json: true,
+    }),
+    {
+      mode: "run",
+      milestone: "v1.34.0",
+      version: "1.34.0",
+      authorizationPath: "/run/user/1000/ship.json",
+    },
+  );
+});
+
+test("pipeline-cli: ship status rejects authorization and unstable positionals", () => {
+  assert.throws(
+    () => normalizeShipCliInput(["ship", "status"], {
+      milestone: "v1.34.0",
+      for: "1.34.0",
+      authorization: "/run/user/1000/ship.json",
+      json: true,
+    }),
+    /does not accept --authorization/,
+  );
+  assert.throws(
+    () => normalizeShipCliInput(["ship", "latest"], {
+      milestone: "v1.34.0",
+      for: "1.34.0",
+      json: true,
+    }),
+    /expected 'status'/,
+  );
+});
+
+test("pipeline-cli: nested single failure restores the owning command exit state", async () => {
+  const original = process.exitCode;
+  process.exitCode = 17;
+  try {
+    const result = await advanceIssueThroughSingle(
+      42,
+      { json: true },
+      async () => ({ number: 42, title: "", body: "", labels: [], state: "open" }),
+      async () => {
+        process.exitCode = 1;
+        throw new Error("nested failure");
+      },
+    );
+    assert.deepEqual(result, { ok: false, error: "nested failure" });
+    assert.equal(process.exitCode, 17);
+  } finally {
+    process.exitCode = original;
+  }
+});
+
+test("pipeline-cli: ship emits only the failure status persisted by this authorization", () => {
+  const status = {
+    kind: "ship_status",
+    authorization_fingerprint: "a".repeat(64),
+    last_error: "FRG evidence missing",
+  };
+  assert.equal(
+    selectPersistedShipFailureStatus(status, "a".repeat(64), "FRG evidence missing"),
+    status,
+  );
+  assert.equal(
+    selectPersistedShipFailureStatus(status, "b".repeat(64), "FRG evidence missing"),
+    null,
+    "an old authorization status must not leak into stdout",
+  );
+  assert.equal(
+    selectPersistedShipFailureStatus(status, "a".repeat(64), "authorization expired"),
+    null,
+    "a pre-admission error must remain stderr-only",
+  );
+});
+
+test("pipeline-cli: ship trusts only a root-owned, non-writable regular public-key file", () => {
+  const regular = { isFile: () => true, isSymbolicLink: () => false, uid: 0, mode: 0o100644 };
+  assert.doesNotThrow(() => validateShipAuthorizationPublicKeyFile("/etc/agent-pipeline/key.pem", regular));
+  assert.throws(
+    () => validateShipAuthorizationPublicKeyFile("relative.pem", regular),
+    /absolute/,
+  );
+  assert.throws(
+    () => validateShipAuthorizationPublicKeyFile("/tmp/key.pem", { ...regular, uid: process.getuid?.() ?? 501 }),
+    /root-owned/,
+  );
+  assert.throws(
+    () => validateShipAuthorizationPublicKeyFile("/etc/key.pem", { ...regular, mode: 0o100666 }),
+    /not writable/,
+  );
+  assert.throws(
+    () => validateShipAuthorizationPublicKeyFile("/etc/key.pem", { ...regular, isSymbolicLink: () => true }),
+    /not a symlink/,
+  );
 });
 
 // ---------------------------------------------------------------------------

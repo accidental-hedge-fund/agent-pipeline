@@ -39,6 +39,7 @@ import { readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 const files = readdirSync(tmpdir()).filter((f) => /^pipeline-starting-\\d+\\.lock$/.test(f));
 console.log("RESERVED:" + JSON.stringify(files));
+console.log("STARTING_LOCK_PID:" + String(process.env.PIPELINE_STARTING_LOCK_PID || ""));
 process.exit(0);
 `;
 
@@ -58,6 +59,13 @@ test("shim: reserves a pipeline-starting-<pid>.lock slot visible to the engine, 
     assert.ok(match, `expected a RESERVED: line in stdout, got:\n${result.stdout}`);
     const files = JSON.parse(match[1]);
     assert.equal(files.length, 1, "engine subprocess must observe exactly one reservation slot while running");
+    const pidMatch = result.stdout.match(/STARTING_LOCK_PID:(\d+)/);
+    assert.ok(pidMatch, `engine subprocess must receive the reservation PID, got:\n${result.stdout}`);
+    assert.equal(
+      files[0],
+      `pipeline-starting-${pidMatch[1]}.lock`,
+      "the propagated PID must identify the exact launcher reservation",
+    );
 
     const remaining = fs
       .readdirSync(isolatedTmp)
@@ -166,6 +174,11 @@ test("shim: a logs-shaped invocation reserves no pipeline-starting-<pid>.lock, e
     assert.ok(match, `expected a RESERVED: line in stdout, got:\n${result.stdout}`);
     const files = JSON.parse(match[1]);
     assert.deepEqual(files, [], "a read-only `logs --follow` invocation must hold no run-liveness lock");
+    assert.match(
+      result.stdout,
+      /STARTING_LOCK_PID:\r?\n/,
+      "a read-only launcher must not forward a stale reservation PID",
+    );
 
     const remaining = fs
       .readdirSync(isolatedTmp)

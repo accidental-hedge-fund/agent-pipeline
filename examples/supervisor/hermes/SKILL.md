@@ -2,7 +2,7 @@
 name: pipeline-supervisor
 description: >
   Thin Hermes skill for the private pipeline-factory Buzz channel.
-  Maps operator messages to the agent-pipeline CLI (train / single / status).
+  Maps operator messages to the agent-pipeline CLI (ship / train / single / status).
   Does not use the removed hermes-factory grant wrapper.
 ---
 
@@ -23,6 +23,10 @@ Read the contract: [docs/supervisor.md](../../../docs/supervisor.md).
 4. Prefer **non-blocking** long runs: start train in the background and report
    the command line + how to check status. Do not block the chat tool for hours.
 5. Never paste secrets, credential paths’ contents, or full harness logs into Buzz.
+6. For `ship`, pass only the absolute authorization file created by the
+   authenticated command-admission path. Never synthesize or edit authorization.
+7. Do not discover “latest” event directories. Observe only an exact event path
+   returned by Pipeline status.
 
 ## Environment (host)
 
@@ -34,6 +38,7 @@ Expect these on the Hermes process PATH / env (set by the deployment profile):
 | `PIPELINE` | Absolute launcher, e.g. `node …/pipeline.mjs` |
 | `ALLOW_MERGE` | `1` only if this channel may run `train --merge` / `release finish` |
 | `AGENT_PIPELINE_ROOT` | Clone of agent-pipeline containing `examples/supervisor/shell/` |
+| `PIPELINE_MATERIAL_FILTER` | Installed `material-filter.mjs` used for exact-run progress |
 
 ## Commands
 
@@ -69,24 +74,27 @@ export REPO_DIR PIPELINE ALLOW_MERGE
 
 For long trains, wrap with `nohup` / systemd-run and post the log path.
 
-### Ship milestone (train → release → promote)
+### Ship milestone
 
-Prefer the durable playbook (serial multi-milestone supported):
+The authenticated ingress must first validate the signed Buzz command and
+materialize its immutable, expiring authorization as an absolute file. Then
+submit exactly one Pipeline-owned ship operation:
 
 ```bash
 export REPO_DIR PIPELINE ALLOW_MERGE
-export SHIP_NOTIFY_HEARTBEAT_S=0   # stage-watch for progress; no generic heartbeats
 "$AGENT_PIPELINE_ROOT/examples/supervisor/shell/ship-milestone.sh" \
-  --milestone vX.Y.Z --detach
+  --milestone vX.Y.Z \
+  --for X.Y.Z \
+  --authorization "$VALIDATED_AUTHORIZATION_FILE" \
+  --detach
 "$AGENT_PIPELINE_ROOT/examples/supervisor/shell/ship-milestone.sh" \
-  --milestone vX.Y.Z --status
-# Multi: --milestones v1.34.0 v1.35.0  (promote between each)
+  --milestone vX.Y.Z --for X.Y.Z --status
 ```
 
 Runbook: [docs/runbooks/ship-milestone.md](../../../docs/runbooks/ship-milestone.md).  
-FRG stop: if `.agent-pipeline/frg/<ver>/latest.json` is missing, the playbook
-stops after train — use [frg-pack-checklist.md](../../../docs/runbooks/frg-pack-checklist.md).
-Do not invent FRG files.
+Pipeline owns train, recovery, FRG, release, publication verification, and
+engine promotion. Hermes does not parse a release PR, poll releases, or decide
+how to resume.
 
 ### Release (manual steps after train / FRG)
 
@@ -102,14 +110,16 @@ cd "$REPO_DIR"
 "$PIPELINE" engine-promote --for <X.Y.Z> --host codex --json
 ```
 
-### Stage posts (train or single)
+### Exact-run material posts
 
 ```bash
-# While ship-milestone or pipeline single is running:
-nohup "$AGENT_PIPELINE_ROOT/examples/supervisor/shell/ship-stage-watch.sh" \
-  --milestone vX.Y.Z >>"$PIPELINE_SUPERVISOR_STATE/stage-watch.log" 2>&1 &
-# or: --issue 870 --label "single #870"
+# Only when typed status returns an exact absolute events_file:
+"$AGENT_PIPELINE_ROOT/examples/supervisor/shell/ship-stage-watch.sh" \
+  --events-file "$EXACT_EVENTS_FILE" --label "ship vX.Y.Z"
 ```
+
+The watcher uses the shared material filter. If status has no exact event path,
+report typed status and do not guess one.
 
 ## Operator message → intent
 
@@ -120,14 +130,15 @@ nohup "$AGENT_PIPELINE_ROOT/examples/supervisor/shell/ship-stage-watch.sh" \
 | `train milestone vX.Y.Z` | `run-intent.sh 'train milestone vX.Y.Z'` |
 | `train issues 1 2 3` | `run-intent.sh 'train issues 1,2,3'` |
 | same + `and merge` | only if `ALLOW_MERGE=1` |
-| `ship milestone vX.Y.Z` | `ship-milestone.sh --milestone vX.Y.Z --detach` if `ALLOW_MERGE=1` |
-| `ship milestones vA vB` | serial full ships with promote between |
+| `ship milestone vX.Y.Z` | validate the signed command, then `ship-milestone.sh --milestone vX.Y.Z --authorization <absolute-file> --detach` if `ALLOW_MERGE=1` |
 | `ship status vX.Y.Z` | `ship-milestone.sh --milestone vX.Y.Z --status` |
 | `release prepare 1.34.0` | `pipeline release 1.34.0 --no-edit` |
 | `release finish 123` | `pipeline release finish 123` if `ALLOW_MERGE=1` |
-| `stop` | do not force-merge; tell operator how to kill the logged pid / unit |
+| `stop` | stop the named `pipeline-ship-…` user-systemd unit; do not invent rollback |
 ## What this skill is not
 
 - Not the removed grant-envelope factory under `ops/hermes-factory`
-- Not authorization by itself — `gh` on this host is the GitHub authority
+- Not authorization by itself — Pipeline must validate the exact bounded
+  authorization; ambient `gh` access alone is not approval
 - Not a durable outer ledger — GitHub + pipeline run state are truth
+- Not a lifecycle controller — `pipeline ship` owns every ship transition

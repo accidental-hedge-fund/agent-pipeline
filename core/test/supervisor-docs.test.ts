@@ -62,8 +62,14 @@ test("supervisor examples exist and stay thin", () => {
   const hermes = read("examples/supervisor/hermes/SKILL.md");
   assert.match(hermes, /does not implement a second state machine|Not the removed/i);
   const stageWatch = read("examples/supervisor/shell/ship-stage-watch.sh");
-  assert.match(stageWatch, /--since/);
-  assert.match(stageWatch, /ordered_issues|issues-file/);
+  assert.match(stageWatch, /--events-file/);
+  assert.match(stageWatch, /PIPELINE_MATERIAL_FILTER/);
+  assert.doesNotMatch(stageWatch, /AGENT_PIPELINE_LOOP_ROOT|\.local\/state\/agent-pipeline|ps -eo|ls -t/);
+  const ship = read("examples/supervisor/shell/ship-milestone.sh");
+  assert.match(ship, /pipeline.*ship|ship_args/s);
+  assert.match(ship, /systemd-run/);
+  assert.doesNotMatch(ship, /release finish|engine-promote|gh release view/);
   const shipDoc = read("docs/runbooks/ship-milestone.md");
-  assert.match(shipDoc, /Since watermark|since watermark/i);
+  assert.match(shipDoc, /exact.*events\.jsonl|events\.jsonl.*exact/i);
+  assert.match(shipDoc, /material-filter\.mjs/);
 });

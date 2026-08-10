@@ -57,3 +57,10 @@
 - A factory model pin must cover every treatment that `doctor --harness-smoke` enumerates, including optional intake and sweep slots. An omitted slot can inherit an incompatible model even when the main issue stages are pinned correctly.
 - A pinned bootstrap engine can be healthy while doctor reports a version-freshness warning. Validate each check result; do not turn a warning-only envelope into a factory failure.
 - Model admission must distinguish the configured model name from a provider-reported canonical runtime name. Accept only a live-verified one-to-one alias; do not broaden the model allowlist.
+- A nested self-update must exempt only the invoking launcher's validated reservation lock. Do not use a broad force option that permits file replacement under unrelated live runs.
+- A deterministic digest proves a document is internally unchanged, not that an authorized
+  gateway created it. Mutation authority needs an independently trusted signature key, and
+  long-running coordinators must revalidate expiry at every side-effect boundary.
+- Temporal proximity cannot bind reliability evidence to a release candidate. If the
+  producer does not record the exact repository, base, and candidate OID, the release must
+  stop instead of rebinding the evidence in a downstream adapter.

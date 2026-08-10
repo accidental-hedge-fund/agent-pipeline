@@ -6,8 +6,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  installArgsForTag,
   installCommandForTag,
   runEnginePromote,
+  startingLockPidFromEnv,
   tagForVersion,
   type EnginePromoteDeps,
   type EnginePromoteOpts,
@@ -101,6 +103,35 @@ test("tagForVersion and installCommandForTag", () => {
   assert.match(installCommandForTag("v1.2.3", "codex"), /#v1\.2\.3 install --host codex/);
 });
 
+test("engine-promote: nested installer exempts only the launcher reservation passed by the shim", () => {
+  assert.equal(startingLockPidFromEnv(undefined), null);
+  assert.equal(startingLockPidFromEnv(""), null);
+  assert.equal(startingLockPidFromEnv("12x"), null);
+  assert.equal(startingLockPidFromEnv("12345"), 12345);
+  assert.deepEqual(installArgsForTag("v1.2.3", "codex", 12345), [
+    "-y",
+    "github:accidental-hedge-fund/agent-pipeline#v1.2.3",
+    "install",
+    "--host",
+    "codex",
+    "--yes-deps",
+    "--internal-starting-lock-pid",
+    "12345",
+  ]);
+  assert.deepEqual(installArgsForTag("v1.2.3", "codex"), [
+    "-y",
+    "github:accidental-hedge-fund/agent-pipeline#v1.2.3",
+    "install",
+    "--host",
+    "codex",
+    "--yes-deps",
+  ]);
+  assert.match(
+    installCommandForTag("v1.2.3", "codex", 12345),
+    /--yes-deps --internal-starting-lock-pid 12345$/,
+  );
+});
+
 test("engine-promote: happy path promotes, installs, verifies", async () => {
   const deps = makeDeps();
   const result = await runEnginePromote(opts(), deps);
@@ -183,6 +214,8 @@ test("engine-promote isolation: advance stages do not import", () => {
     "merge_queue.ts",
     "merge-queue-release-when-complete.ts",
     "merge_queue_hold.ts",
+    // Operator-authorized ship composition; never imported by advance dispatch.
+    "ship-adapter.ts",
     "train.ts",
   ]);
   for (const f of fs.readdirSync(stagesDir).filter((x) => x.endsWith(".ts"))) {

@@ -86,6 +86,12 @@ function makeDeps(overrides: Partial<ReleaseDeps> = {}): ReleaseDeps {
     fetchPRTitle: async (n) => `Title of PR #${n}`,
     classifyPR: async (_n) => ({ kind: "pr" }),
     fetchPRClosingIssues: async (_n) => [],
+    inspectCreatedPR: async (_branch) => ({
+      number: 300,
+      baseRefName: "main",
+      headRefName: "release/v1.6.0",
+      headRefOid: "a".repeat(40),
+    }),
     today: () => "2026-06-16",
     stdout: (msg) => { stdoutLines.push(msg); },
     stderr: (msg) => { stderrLines.push(msg); },
@@ -1364,6 +1370,7 @@ test("runRelease dry-run: fetchPRClosingIssues is never called", async () => {
 
 test("runRelease: uses cfg.base_branch for gh pr create", async () => {
   const prCreateArgs: string[] = [];
+  let inspectedBranch = "";
 
   const deps = makeDeps({
     readFile: (p) => {
@@ -1388,9 +1395,18 @@ test("runRelease: uses cfg.base_branch for gh pr create", async () => {
       return { code: 0, stdout: "", stderr: "" };
     },
     fetchPRTitle: async (n) => `Title #${n}`,
+    inspectCreatedPR: async (branch) => {
+      inspectedBranch = branch;
+      return {
+        number: 200,
+        baseRefName: "staging",
+        headRefName: "release/v1.6.0",
+        headRefOid: "b".repeat(40),
+      };
+    },
   });
 
-  await runRelease(
+  const result = await runRelease(
     "1.6.0",
     { noEdit: true },
     { repo_dir: "/repo", repo: "org/repo", base_branch: "staging" },
@@ -1400,6 +1416,15 @@ test("runRelease: uses cfg.base_branch for gh pr create", async () => {
   const baseIdx = prCreateArgs.indexOf("--base");
   assert.ok(baseIdx >= 0, "--base flag present in gh pr create call");
   assert.equal(prCreateArgs[baseIdx + 1], "staging", "configured base_branch 'staging' is used");
+  assert.equal(inspectedBranch, "release/v1.6.0", "identity lookup uses the known release branch");
+  assert.deepEqual(result, {
+    schema_version: 1,
+    kind: "release_prepare",
+    version: "1.6.0",
+    pr: 200,
+    base: "staging",
+    head_oid: "b".repeat(40),
+  });
 });
 
 test("runRelease: defaults to main when base_branch is not configured", async () => {
@@ -2005,6 +2030,65 @@ test("runRelease: FRG pass attaches run_id to PR body (live path)", async () => 
   assert.match(prBody, /Factory Reliability Gate/);
   assert.match(prBody, /frg-test-pass/);
   assert.match(prBody, /pass/);
+});
+
+test("runRelease: release commit stages only the validated version FRG directory", async () => {
+  const commands: string[][] = [];
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
+    runCommand: (cmd, args) => {
+      commands.push([cmd, ...args]);
+      if (cmd === "git" && args[0] === "log") {
+        return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "describe") {
+        return { code: 0, stdout: "v1.5.0", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  await runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+
+  const add = commands.find((command) => command[0] === "git" && command[1] === "add");
+  assert.ok(add, "release must stage its commit inputs");
+  assert.ok(add.includes(".agent-pipeline/frg/1.6.0"));
+  assert.ok(!add.includes(".agent-pipeline/frg"), "must not stage evidence for every version");
+  assert.ok(!add.some((part) => part.includes("1.5.0")), "must not stage prior-version evidence");
+});
+
+test("runRelease: a post-staging failure preserves the validated FRG input", async () => {
+  const commands: string[][] = [];
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
+    runCommand: (cmd, args) => {
+      commands.push([cmd, ...args]);
+      if (cmd === "git" && args[0] === "log") {
+        return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "describe") {
+        return { code: 0, stdout: "v1.5.0", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "commit") {
+        return { code: 1, stdout: "", stderr: "commit failed" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  await assert.rejects(
+    runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /git commit failed/,
+  );
+
+  const add = commands.find((command) => command[0] === "git" && command[1] === "add");
+  assert.ok(add?.includes(".agent-pipeline/frg/1.6.0"));
+  assert.ok(!commands.some((command) =>
+    command[0] === "git" && command[1] === "clean" &&
+    command.some((part) => part.includes(".agent-pipeline/frg"))));
+  assert.ok(!commands.some((command) =>
+    command[0] === "git" && command[1] === "checkout" && command[2] === "--" &&
+    command.some((part) => part.includes(".agent-pipeline/frg"))));
 });
 
 test("runRelease: FRG check does not invoke merge or tag commands", async () => {

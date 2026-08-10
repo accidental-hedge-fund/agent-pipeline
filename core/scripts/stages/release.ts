@@ -19,6 +19,7 @@ import * as fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import {
   classifyFrgBlocker,
+  FRG_EVIDENCE_ROOT_REL,
   formatFrgPrSection,
   requireFrgPassForRelease,
   type FrgEvidence,
@@ -63,6 +64,23 @@ export interface ReleaseOpts {
    * release PR body. There is no silent env/config skip.
    */
   allowOpenSoakDefects?: string;
+}
+
+/** Stable machine-readable identity of the release PR created by prepare. */
+export interface ReleasePrepareResult {
+  schema_version: 1;
+  kind: "release_prepare";
+  version: string;
+  pr: number;
+  base: string;
+  head_oid: string;
+}
+
+export interface CreatedReleasePrIdentity {
+  number: number;
+  baseRefName: string;
+  headRefName: string;
+  headRefOid: string;
 }
 
 export interface ShippedPR {
@@ -145,6 +163,8 @@ export interface ReleaseDeps {
   classifyPR(num: number): Promise<PRClassification>;
   /** Fetch the issue numbers closed by a given PR via `gh pr view --json closingIssuesReferences`. */
   fetchPRClosingIssues(num: number): Promise<number[]>;
+  /** Resolve the GitHub-authored identity of the PR for the known release branch. */
+  inspectCreatedPR?(branch: string): Promise<CreatedReleasePrIdentity>;
   today(): string;
   stdout(msg: string): void;
   stderr(msg: string): void;
@@ -265,6 +285,26 @@ export function realReleaseDeps(repoDir?: string): ReleaseDeps {
         .split("\n")
         .map(Number)
         .filter((n) => Number.isFinite(n) && n > 0);
+    },
+    inspectCreatedPR: async (branch) => {
+      const result = spawnSync(
+        "gh",
+        ["pr", "view", branch, "--json", "number,baseRefName,headRefName,headRefOid"],
+        { encoding: "utf8", stdio: "pipe", cwd: repoDir },
+      );
+      if (result.status !== 0) {
+        throw new Error(
+          `gh pr view ${branch} --json number,baseRefName,headRefName,headRefOid failed ` +
+            `(exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+        );
+      }
+      const data = JSON.parse(result.stdout || "{}") as Record<string, unknown>;
+      return {
+        number: Number(data.number),
+        baseRefName: String(data.baseRefName ?? ""),
+        headRefName: String(data.headRefName ?? ""),
+        headRefOid: String(data.headRefOid ?? ""),
+      };
     },
     today: () => new Date().toISOString().slice(0, 10),
     stdout: (msg) => process.stdout.write(msg + "\n"),
@@ -1505,7 +1545,7 @@ export async function runRelease(
   opts: ReleaseOpts,
   cfg: { repo_dir: string; repo: string; base_branch?: string; release_model?: 'semver' | 'continuous' },
   deps?: ReleaseDeps,
-): Promise<void> {
+): Promise<ReleasePrepareResult | null> {
   const d = deps ?? realReleaseDeps(cfg.repo_dir);
   const repoDir = cfg.repo_dir;
   const rootPkgPath = path.join(repoDir, "package.json");
@@ -1559,6 +1599,10 @@ export async function runRelease(
     `[pipeline release] FRG pass: run_id=${frgEvidence.run_id}` +
       (frgEvidence.loop_run_id ? ` loop_run_id=${frgEvidence.loop_run_id}` : ""),
   );
+  // The release PR must carry the exact evidence that passed the gate. Keep
+  // this path version-scoped so evidence for another candidate cannot enter
+  // the release commit through a broad `.agent-pipeline/frg` add.
+  const releaseFrgDir = path.join(FRG_EVIDENCE_ROOT_REL, resolvedVersion);
 
   // 3. Find last git tag for git-log range (local git call, safe in all modes).
   const tagResult = d.runCommand("git", ["describe", "--tags", "--abbrev=0"], { cwd: repoDir });
@@ -1685,7 +1729,7 @@ export async function runRelease(
     d.stdout(`\nNOTE: per-issue ROADMAP table stamping is omitted in dry-run (requires GitHub API for closing-issue lookup).`);
     d.stdout(`\n=== PR body ===`);
     d.stdout(prBody);
-    return;
+    return null;
   }
 
   // --- Live path ---
@@ -1863,7 +1907,7 @@ export async function runRelease(
   d.stdout("[pipeline release] staging release files...");
   const addResult = d.runCommand(
     "git",
-    ["add", "package.json", "core/package.json", "ROADMAP.md", "plugin/"],
+    ["add", "package.json", "core/package.json", "ROADMAP.md", "plugin/", releaseFrgDir],
     { cwd: repoDir },
   );
   if (addResult.code !== 0) {
@@ -1897,4 +1941,45 @@ export async function runRelease(
 
   const prUrl = prResult.stdout.trim();
   d.stdout(`[pipeline release] release PR opened: ${prUrl}`);
+
+  // Do not make a supervisor scrape the human URL or infer the branch head.
+  // Re-read the GitHub-authored PR identity and return one stable contract.
+  if (!d.inspectCreatedPR) {
+    throw new Error(
+      "[pipeline release] release dependency cannot inspect the created PR identity",
+    );
+  }
+  const created = await d.inspectCreatedPR(branch);
+  if (!Number.isSafeInteger(created.number) || created.number <= 0) {
+    throw new Error(
+      `[pipeline release] created PR has an invalid number: ${JSON.stringify(created.number)}`,
+    );
+  }
+  if (created.baseRefName !== baseBranch) {
+    throw new Error(
+      `[pipeline release] created PR #${created.number} targets ${JSON.stringify(created.baseRefName)}, ` +
+        `expected ${JSON.stringify(baseBranch)} — refusing to return a mismatched release identity.`,
+    );
+  }
+  if (created.headRefName !== branch) {
+    throw new Error(
+      `[pipeline release] created PR #${created.number} has head ${JSON.stringify(created.headRefName)}, ` +
+        `expected ${JSON.stringify(branch)} — refusing to return a mismatched release identity.`,
+    );
+  }
+  if (!/^[0-9a-f]{40,64}$/i.test(created.headRefOid)) {
+    throw new Error(
+      `[pipeline release] created PR #${created.number} has an invalid headRefOid: ` +
+        `${JSON.stringify(created.headRefOid)}`,
+    );
+  }
+
+  return {
+    schema_version: 1,
+    kind: "release_prepare",
+    version: resolvedVersion,
+    pr: created.number,
+    base: created.baseRefName,
+    head_oid: created.headRefOid,
+  };
 }

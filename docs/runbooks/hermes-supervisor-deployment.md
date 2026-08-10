@@ -16,7 +16,7 @@ Skill template: [examples/supervisor/hermes/SKILL.md](../../examples/supervisor/
 | `gh` + pipeline skill install | FRG attestor units for the outer wrapper |
 | Control checkout for `REPO_DIR` | Grant JSON envelopes in inbox |
 
-## 1. Install current pipeline (needs `train` + `release finish`)
+## 1. Install current pipeline (needs `ship`)
 
 On the agent host, as the service user:
 
@@ -28,7 +28,7 @@ npx --yes . install --host codex --yes-deps
 # or: npx -y github:accidental-hedge-fund/agent-pipeline install --host codex --yes-deps
 
 /usr/bin/node "$HOME/.codex/skills/pipeline/scripts/pipeline.mjs" --version
-# Expect a version that includes train (post-#922) and release finish (this change)
+# Expect a version that includes the Pipeline-owned ship coordinator.
 ```
 
 Do **not** use a stale `/usr/local/bin/pipeline` if it points at an old install.
@@ -142,7 +142,7 @@ Dry-run:
 $PIPELINE engine-promote --for X.Y.Z --dry-run --json
 ```
 
-## 9. Ship playbook + stage notify (examples)
+## 9. Ship submission + exact-run notify
 
 Install portable scripts from the agent-pipeline clone (no host secrets in git):
 
@@ -158,24 +158,35 @@ Env (already partially covered in §2):
 
 ```bash
 export SHIP_NOTIFY=1
-export SHIP_NOTIFY_HEARTBEAT_S=0   # prefer stage-watch over heartbeats
+export PIPELINE_MATERIAL_FILTER="$HOME/.codex/skills/pipeline/scripts/material-filter.mjs"
+export PIPELINE_SHIP_AUTH_PUBLIC_KEY_FILE=/etc/agent-pipeline/ship-authority.pem
 # Optional Buzz — leave unset for silent no-op notify:
 # BUZZ_BIN BUZZ_RELAY_URL BUZZ_CHANNEL BUZZ_CREDENTIALS_FILE
 ```
 
 ```bash
-# Durable ship (ALLOW_MERGE=1 required)
-ship-milestone --milestone vX.Y.Z --detach
+# The authenticated ingress supplies this exact, immutable, expiring file.
+# Hermes must not create it from free-form message text.
+VALIDATED_AUTHORIZATION_FILE=/absolute/path/from/command-admission.json
+
+# Submit one durable ship to user systemd (ALLOW_MERGE=1 required).
+ship-milestone --milestone vX.Y.Z --for X.Y.Z \
+  --authorization "$VALIDATED_AUTHORIZATION_FILE" --detach
 ship-milestone --milestone vX.Y.Z --status
 
-# Manual stage-watch for a single issue
-ship-stage-watch --issue 870 --label "single #870" &
+# Optional: use only an exact events_file returned by Pipeline status.
+ship-stage-watch --events-file "$EXACT_EVENTS_FILE" --label "ship vX.Y.Z" \
+  --channel "$AUTH_CHANNEL_ID" --reply-to "$AUTH_EVENT_ID"
 ```
 
 See [ship-milestone.md](./ship-milestone.md) and
 [frg-pack-checklist.md](./frg-pack-checklist.md).  
 Refresh the Hermes skill from `examples/supervisor/hermes/SKILL.md` after pull
-so “ship milestone …” phrases map to the playbook.
+so “ship milestone …” phrases map to the thin adapter.
+
+The adapter uses `systemd-run --user --collect`. Use `systemctl --user` and
+`journalctl --user-unit` for process status, logs, and stop. Pipeline owns
+lifecycle state and resume; do not add PID files, host locks, or release polling.
 
 ## Rollback
 

@@ -5,7 +5,7 @@ They only map intent → `pipeline` CLI. They are **not** a second control plane
 
 | Path | Purpose |
 |---|---|
-| [`shell/`](./shell/) | Portable shell entrypoints (intent, ship playbook, notify, stage-watch) |
+| [`shell/`](./shell/) | Portable shell entrypoints (intent, ship adapter, notify, exact-run watch) |
 | [`hermes/`](./hermes/) | Hermes skill sketch (Buzz or other Hermes channels) |
 | [`openclaw/`](./openclaw/) | OpenClaw skill sketch |
 | [`slack/`](./slack/) | How to hang a Slack bot or slash command on the shell wrapper |
@@ -15,9 +15,9 @@ They only map intent → `pipeline` CLI. They are **not** a second control plane
 | Script | Purpose |
 |---|---|
 | `run-intent.sh` | Map a short intent string → `pipeline train` / `single` |
-| `ship-milestone.sh` | Durable train→release→wait→engine-promote (serial multi-milestone) |
+| `ship-milestone.sh` | Forward one authorized request/status call to `pipeline ship`; optional systemd detach |
 | `ship-notify.sh` | Optional Buzz status posts; **no-op** without messenger env |
-| `ship-stage-watch.sh` | Stage-transition posts from loop/advance events |
+| `ship-stage-watch.sh` | Stream one explicit run event file through `material-filter.mjs` |
 | `pipeline-launcher.sh` | Resolve installed `pipeline` without hardcoding host paths |
 
 Ship runbook: [docs/runbooks/ship-milestone.md](../../docs/runbooks/ship-milestone.md)  
@@ -29,7 +29,7 @@ FRG checklist: [docs/runbooks/frg-pack-checklist.md](../../docs/runbooks/frg-pac
 2. Do not hardcode implementer models; use the target repo’s `.github/pipeline.yml`.
 3. Do not default to `--merge` unless the deployment config sets `ALLOW_MERGE=1` (or equivalent).
 4. Never put tokens, FRG keys, private channel IDs, or host home paths in the repository.
-5. Prefer `ship-stage-watch` + phase-change notify over generic heartbeats (`SHIP_NOTIFY_HEARTBEAT_S=0`).
+5. Observe only an exact event path returned by Pipeline. Never discover a host-global “latest run.”
 
 ## Quick start
 
@@ -42,8 +42,12 @@ export PIPELINE=pipeline   # or absolute path to pipeline.mjs
 ./examples/supervisor/shell/run-intent.sh 'train milestone v1.34.0'
 ./examples/supervisor/shell/run-intent.sh 'single 42'
 
-# Full ship (requires ALLOW_MERGE=1 + FRG for release phase):
+# Full ship (requires ALLOW_MERGE=1 and an exact validated authorization):
 export ALLOW_MERGE=1
-./examples/supervisor/shell/ship-milestone.sh --milestone v1.34.0 --detach
-./examples/supervisor/shell/ship-milestone.sh --milestone v1.34.0 --status
+./examples/supervisor/shell/ship-milestone.sh \
+  --milestone v1.34.0 \
+  --authorization /absolute/path/to/authorization.json \
+  --detach
+./examples/supervisor/shell/ship-milestone.sh \
+  --milestone v1.34.0 --status
 ```

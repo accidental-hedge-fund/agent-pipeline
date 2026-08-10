@@ -4,8 +4,8 @@
 
 Defines the product boundary between autonomous advance (stop at ready-to-deploy)
 and loop-isolated operator-authorized merge surfaces. The repository does not ship
-a Hermes/Buzz grant factory; external supervisors may only compose the same merge
-commands an operator would run.
+a Hermes/Buzz factory control plane; external supervisors may invoke explicit
+Pipeline coordinator commands under bounded operator authority.
 ## Requirements
 ### Requirement: Public product positioning SHALL state autonomous-through-ready-to-deploy with operator-owned merge
 
@@ -21,7 +21,8 @@ Operator-facing product docs (at minimum the repository `README.md` front-door s
 
 - **WHEN** the README describes an external supervisor
 - **THEN** it SHALL state that supervisors compose the existing Pipeline CLI
-- **AND** it SHALL state that the repository does not ship a Hermes/Buzz factory control plane or grant schema
+- **AND** it SHALL state that the repository does not ship a Hermes/Buzz factory
+  control plane or repository-configured grant schema
 - **AND** it SHALL NOT present supervisor composition as an `auto_merge` setting or ordinary advance behavior
 
 #### Scenario: Host skills do not over-claim advance autonomy
@@ -32,7 +33,7 @@ Operator-facing product docs (at minimum the repository `README.md` front-door s
 
 ### Requirement: Golden-rule conventions SHALL state no-autonomous-merge with operator carve-out
 
-CLAUDE.md golden rule 4 and the AGENTS.md twin SHALL state that the advance loop stops at `pipeline:ready-to-deploy` and never merges. Merging happens only through loop-isolated commands: direct operator invocation (`pipeline merge` per pull request; `merge-queue --apply` batch with dry-run default). External supervisors may invoke those same commands under operator authority. The repository SHALL NOT ship a Hermes/Buzz factory control plane or grant schema as product. No `auto_merge` config key or merge stage SHALL be added. Merge authority is not repository configuration.
+CLAUDE.md golden rule 4 and the AGENTS.md twin SHALL state that the advance loop stops at `pipeline:ready-to-deploy` and never merges. Merging happens only through loop-isolated commands: direct operator invocation (`pipeline merge` per pull request; `merge-queue --apply` batch with dry-run default), or the explicit `pipeline ship` coordinator under its exact bounded operator authorization. The repository SHALL NOT ship a Hermes/Buzz factory control plane, durable grant journal, or repository-configured grant schema as product. No `auto_merge` config key or merge stage SHALL be added. Merge authority is not repository configuration.
 
 #### Scenario: CLAUDE.md and AGENTS.md agree
 
@@ -48,17 +49,19 @@ CLAUDE.md golden rule 4 and the AGENTS.md twin SHALL state that the advance loop
 
 ### Requirement: Operator skill copy SHALL name merge and merge-queue --apply as explicit, non-advance surfaces
 
-Host skill documentation that lists merge-related commands SHALL present `pipeline merge` (or `/pipeline:merge`) and `pipeline merge-queue` with `--apply` as explicit authority surfaces that are never called by the advance loop. Merge-queue documentation SHALL keep dry-run as the default. If a host skill mentions external supervisors, it SHALL state that supervisors compose those same surfaces and that the repository does not ship a factory grant control plane.
+Host skill documentation that lists merge-related commands SHALL present `pipeline merge` (or `/pipeline:merge`), `pipeline merge-queue` with `--apply`, and the authorized `pipeline ship` coordinator as explicit authority surfaces that are never called by the advance loop. Merge-queue documentation SHALL keep dry-run as the default. If a host skill mentions external supervisors, it SHALL state that supervisors invoke those Pipeline-owned surfaces and that the repository does not ship a factory control plane.
 
-#### Scenario: Skill lists both direct operator merge surfaces
+#### Scenario: Skill lists explicit operator merge surfaces
 
 - **WHEN** the host skill command list and policy text are inspected
-- **THEN** they SHALL name per-PR merge and merge-queue apply as explicit non-advance surfaces
+- **THEN** they SHALL name per-PR merge, merge-queue apply, and authorized ship as
+  explicit non-advance surfaces
 - **AND** they SHALL state that the advance loop never invokes them
 
 #### Scenario: Supervisors do not invent a second merge path
 
-- **WHEN** a host skill describes an external supervisor invoking `pipeline merge`
+- **WHEN** a host skill describes an external supervisor invoking a Pipeline
+  merge or ship surface
 - **THEN** it SHALL preserve every existing `pipeline merge` gate
 - **AND** it SHALL NOT invent a merge path outside the loop-isolated CLI surface
 
@@ -100,4 +103,3 @@ Operator-facing product docs and golden-rule conventions SHALL name `pipeline tr
 - **WHEN** the isolation test suite scans advance dispatch and stage handlers
 - **THEN** those paths SHALL remain free of merge mutations
 - **AND** the train command module MAY call the merge surface without failing the advance isolation scan
-

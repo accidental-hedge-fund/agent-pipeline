@@ -151,7 +151,15 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     summary:
       "Prepare a release PR (version) or finish-merge one (finish <pr>); never tags or publishes (workflows do)",
     usage:
-      'release <version> [--theme "..."] [--dry-run] [--no-edit] | release finish <pr> [--json]',
+      'release <version> [--theme "..."] [--dry-run|--json] [--no-edit] | release finish <pr> [--json]',
+    documented: true,
+    section: "lifecycle",
+  },
+  ship: {
+    summary:
+      "Run or inspect one exact, Buzz-authorized release shipment through train, FRG, release, and engine promotion",
+    usage:
+      "ship --milestone <m> --for <X.Y.Z> --authorization <absolute-json> --json | ship status --milestone <m> --for <X.Y.Z> --json",
     documented: true,
     section: "lifecycle",
   },

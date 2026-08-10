@@ -207,6 +207,29 @@ truth.
 - **AND** SHALL NOT require a pipeline-owned external push service for default
   operation
 
+### Requirement: External ship progress SHALL follow exact run identities
+
+A channel adapter that reports `pipeline ship` progress SHALL read the typed
+ship status and the exact train, loop, or advance event paths recorded by that
+ship run. It SHALL apply the shared material filter. It SHALL NOT infer
+ownership from a host-global latest-run directory, process start time, issue
+number alone, PR title search, or unrelated events.
+
+#### Scenario: Concurrent unrelated run is excluded
+
+- **WHEN** an unrelated Pipeline run emits material events while a ship is
+  active
+- **THEN** the ship adapter SHALL report only events from run identities stored
+  by that ship
+- **AND** no unrelated event SHALL appear in the ship's channel thread
+
+#### Scenario: Notification replay uses the exact run cursor
+
+- **WHEN** notification delivery fails and later recovers
+- **THEN** the adapter MAY replay missed material events from the exact run
+  cursor
+- **AND** delivery failure SHALL NOT stop, advance, or fail the ship
+
 ---
 
 ### Requirement: Drift-guards SHALL protect host notify maps and material kind alignment
@@ -265,4 +288,3 @@ extension mechanism via shared `if host == …` branches.
   observation
 - **THEN** the declared fallback SHALL use stdout and/or filtered `events.jsonl` material lines
 - **AND** shared orchestration SHALL NOT hard-require Claude `PushNotification` for that host
-

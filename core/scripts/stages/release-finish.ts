@@ -39,6 +39,44 @@ export interface ReleaseFinishResult {
   alreadyMerged: boolean;
 }
 
+/** Identity emitted by release prepare and required by automated finalizers. */
+export interface ReleaseFinishExpectedIdentity {
+  pr: number;
+  version: string;
+  base: string;
+  head_oid: string;
+}
+
+function validateExpectedIdentity(
+  pr: number,
+  version: string,
+  base: string,
+  headOid: string,
+  expected: ReleaseFinishExpectedIdentity,
+): void {
+  if (expected.pr !== pr) {
+    throw new Error(
+      `release identity PR mismatch: requested #${pr}, expected #${expected.pr}`,
+    );
+  }
+  if (version !== expected.version) {
+    throw new Error(
+      `PR #${pr} version changed: expected ${expected.version}, observed ${version}`,
+    );
+  }
+  if (base !== expected.base) {
+    throw new Error(
+      `PR #${pr} base changed: expected ${JSON.stringify(expected.base)}, ` +
+        `observed ${JSON.stringify(base)}`,
+    );
+  }
+  if (headOid !== expected.head_oid) {
+    throw new Error(
+      `PR #${pr} head changed: expected ${expected.head_oid}, observed ${headOid || "(empty)"}`,
+    );
+  }
+}
+
 export function parseReleasePrTitle(title: string): { version: string } | null {
   const m = RELEASE_PR_TITLE_RE.exec(String(title ?? "").trim());
   if (!m || !m[1]) return null;
@@ -81,9 +119,15 @@ function checkStatusChecks(checks: ReleaseFinishCheck[]): string | null {
 export async function finishReleasePr(
   pr: number,
   deps: ReleaseFinishDeps,
+  expected?: ReleaseFinishExpectedIdentity,
 ): Promise<ReleaseFinishResult> {
   if (!Number.isSafeInteger(pr) || pr <= 0) {
     throw new Error(`invalid PR number ${pr}`);
+  }
+  if (expected && expected.pr !== pr) {
+    throw new Error(
+      `release identity PR mismatch: requested #${pr}, expected #${expected.pr}`,
+    );
   }
 
   deps.log(`[pipeline release finish] #${pr}: inspecting…`);
@@ -110,6 +154,12 @@ export async function finishReleasePr(
     );
   }
 
+  const baseRefName = String(data.baseRefName ?? "");
+  const headRefOid = String(data.headRefOid ?? "");
+  if (expected) {
+    validateExpectedIdentity(pr, parsed.version, baseRefName, headRefOid, expected);
+  }
+
   const state = String(data.state ?? "").toUpperCase();
   const mergeCommit = data.mergeCommit as { oid?: string } | null | undefined;
   const alreadyMerged =
@@ -122,7 +172,7 @@ export async function finishReleasePr(
       pr,
       version: parsed.version,
       title,
-      headRefOid: String(data.headRefOid ?? ""),
+      headRefOid,
       mergeCommitOid: mergeCommit?.oid ?? null,
       alreadyMerged: true,
     };
@@ -140,7 +190,6 @@ export async function finishReleasePr(
     throw new Error(mergeabilityError);
   }
 
-  const headRefOid = String(data.headRefOid ?? "");
   if (!headRefOid) {
     throw new Error(`PR #${pr}: empty headRefOid — cannot bind merge`);
   }
@@ -184,10 +233,36 @@ export async function finishReleasePr(
     if (checksError) throw new Error(checksError);
   }
 
+  let mergeHeadRefOid = headRefOid;
+  if (expected) {
+    // Checks can take long enough for the PR to be retargeted or updated. Bind
+    // the final mutation to a fresh observation, not only the initial view.
+    const fresh = await deps.ghPrView(pr, ["title", "state", "baseRefName", "headRefOid"]);
+    const freshTitle = String(fresh.title ?? "");
+    const freshParsed = parseReleasePrTitle(freshTitle);
+    if (!freshParsed) {
+      throw new Error(`PR #${pr} is no longer a pipeline release PR`);
+    }
+    const freshState = String(fresh.state ?? "").toUpperCase();
+    if (freshState !== "OPEN") {
+      throw new Error(
+        `PR #${pr} changed state before merge (state=${freshState || "UNKNOWN"}); retry to reconcile`,
+      );
+    }
+    mergeHeadRefOid = String(fresh.headRefOid ?? "");
+    validateExpectedIdentity(
+      pr,
+      freshParsed.version,
+      String(fresh.baseRefName ?? ""),
+      mergeHeadRefOid,
+      expected,
+    );
+  }
+
   deps.log(
-    `[pipeline release finish] #${pr}: merging release v${parsed.version} at ${headRefOid.slice(0, 12)}…`,
+    `[pipeline release finish] #${pr}: merging release v${parsed.version} at ${mergeHeadRefOid.slice(0, 12)}…`,
   );
-  await deps.ghPrMerge(pr, headRefOid);
+  await deps.ghPrMerge(pr, mergeHeadRefOid);
 
   const after = await deps.ghPrView(pr, ["state", "mergedAt", "mergeCommit", "headRefOid"]);
   const afterMerge = after.mergeCommit as { oid?: string } | null | undefined;
