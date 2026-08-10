@@ -340,8 +340,9 @@ The release prepare implementation used by `pipeline release` SHALL remain avail
 
 ### Requirement: Release prepare JSON SHALL return typed candidate identity
 
+The release prepare machine interface SHALL return one typed result from
 `pipeline release <version> --no-edit --json` and the shared programmatic
-prepare entry SHALL return one typed result containing at least
+prepare entry containing at least
 `schema_version`, `kind: "release_prepare"`, the resolved `version`, release
 pull-request number `pr`, target `base`, and exact release pull-request
 `head_oid`. Machine consumers SHALL use this result instead of parsing prose,
