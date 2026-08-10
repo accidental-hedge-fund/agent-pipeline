@@ -196,6 +196,26 @@ Does **not** create git tags or GitHub Releases. Existing `auto-tag-release` and
 Host runbook: [runbooks/hermes-supervisor-deployment.md](./runbooks/hermes-supervisor-deployment.md).  
 Skill template: [examples/supervisor/hermes/SKILL.md](../examples/supervisor/hermes/SKILL.md).
 
+## Ship milestone (example playbook)
+
+For durable **train → release → wait → engine-promote** on a host, copy the
+shell examples rather than inventing a second scheduler:
+
+| Script | Role |
+|---|---|
+| `examples/supervisor/shell/ship-milestone.sh` | Serial playbook; state under `PIPELINE_SUPERVISOR_STATE` |
+| `examples/supervisor/shell/ship-notify.sh` | Optional messenger posts; no-op without Buzz env |
+| `examples/supervisor/shell/ship-stage-watch.sh` | Stage-transition posts from loop/advance events |
+
+Runbooks: [runbooks/ship-milestone.md](./runbooks/ship-milestone.md),  
+[runbooks/frg-pack-checklist.md](./runbooks/frg-pack-checklist.md).
+
+**FRG hard stop:** release prepare requires `.agent-pipeline/frg/<version>/latest.json`.
+Supervisors MUST surface that stop; they MUST NOT invent FRG pass artifacts.
+
+**Notify policy:** prefer stage-watch over generic heartbeats
+(`SHIP_NOTIFY_HEARTBEAT_S=0`). Filter `#None` / stale precondition noise.
+
 ## Versioning
 
 - Intent map and CLI flags may grow; prefer additive changes.
