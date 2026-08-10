@@ -487,13 +487,19 @@ write_state "train" "running" "pipeline train --milestone $milestone --merge --j
 log "phase train: start"
 STAGE_WATCH_PID_FILE="$RUN_DIR/stage-watch.pid"
 if [[ -x "$SHIP_STAGE_WATCH_BIN" ]]; then
+  # Bind stage-watch to this ship session clock + train.json issue list so
+  # historical loop/FRG events are never rebroadcast under this ship label.
+  SHIP_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   nohup env PATH="$(dirname "$SHIP_STAGE_WATCH_BIN"):$PATH" \
     REPO_DIR="$REPO_DIR" SHIP_NOTIFY_BIN="$SHIP_NOTIFY_BIN" \
     PIPELINE_SUPERVISOR_STATE="$STATE_ROOT" \
     "$SHIP_STAGE_WATCH_BIN" \
-    --milestone "$milestone" --pid-file "$STAGE_WATCH_PID_FILE" \
+    --milestone "$milestone" \
+    --since "$SHIP_SINCE" \
+    --issues-file "$RUN_DIR/train.json" \
+    --pid-file "$STAGE_WATCH_PID_FILE" \
     >>"$RUN_DIR/stage-watch.log" 2>&1 &
-  log "stage-watch started pid=$!"
+  log "stage-watch started pid=$! since=$SHIP_SINCE"
 fi
 set +e
 "$PIPELINE" train --milestone "$milestone" --merge --json >"$RUN_DIR/train.json" 2>"$RUN_DIR/train.stderr"
@@ -588,14 +594,33 @@ if [[ -f "$RUN_DIR/stage-watch.pid" ]]; then
   fi
 fi
 
-# B: release prepare (requires FRG)
+# B: release prepare (requires FRG) — auto-generate when evidence is missing
 FRG_LATEST="$REPO_DIR/.agent-pipeline/frg/$version/latest.json"
 if [[ ! -f "$FRG_LATEST" ]]; then
-  write_state "release-prepare" "failed" "FRG missing for $version"
-  log "FAIL: Factory Reliability Gate pass missing at $FRG_LATEST"
-  log "  See docs/runbooks/frg-pack-checklist.md and docs/factory-reliability-gate-runbook.md"
-  ship_notify "ship $milestone: STOPPED — FRG missing for $version (need $FRG_LATEST). Train may be done; release blocked." "frg-missing-$version-$$" --force
-  exit 2
+  write_state "release-prepare" "running" "FRG missing — auto-generating via pipeline-ship-frg $version"
+  log "FRG missing at $FRG_LATEST — invoking pipeline-ship-frg $version"
+  FRG_BIN="${FRG_BIN:-$SCRIPT_DIR/pipeline-ship-frg}"
+  if [[ -x "$FRG_BIN" ]]; then
+    ship_notify "ship $milestone: FRG missing — running pipeline-ship-frg $version (auto-generate)" "frg-missing-$version-$$" --force
+    set +e
+    "$FRG_BIN" "$version" >>"$LOG_FILE" 2>&1
+    frg_ec=$?
+    set -e
+    if [[ $frg_ec -ne 0 || ! -f "$FRG_LATEST" ]]; then
+      write_state "release-prepare" "failed" "FRG auto-generate failed (exit $frg_ec) for $version"
+      log "FAIL: pipeline-ship-frg $version exit $frg_ec; still missing $FRG_LATEST"
+      log "  Check attestation key (PIPELINE_FRG_ATTESTATION_KEY_FILE) and frg.log in $STATE_ROOT/frg-$version/"
+      ship_notify "ship $milestone: STOPPED — FRG auto-generate FAILED for $version (exit $frg_ec). See $STATE_ROOT/frg-$version/frg.log" "frg-missing-$version-$$" --force
+      exit 2
+    fi
+  else
+    write_state "release-prepare" "failed" "FRG missing for $version and no pipeline-ship-frg at $FRG_BIN"
+    log "FAIL: Factory Reliability Gate pass missing at $FRG_LATEST and $FRG_BIN not found"
+    log "  See docs/runbooks/frg-pack-checklist.md and docs/factory-reliability-gate-runbook.md"
+    ship_notify "ship $milestone: STOPPED — FRG missing for $version (need $FRG_LATEST) and pipeline-ship-frg unavailable." "frg-missing-$version-$$" --force
+    exit 2
+  fi
+  log "FRG auto-generated ok for $version"
 fi
 write_state "release-prepare" "running" "pipeline release $version --no-edit"
 log "phase release-prepare: start"
