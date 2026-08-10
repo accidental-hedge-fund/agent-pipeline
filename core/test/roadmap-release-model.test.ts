@@ -199,21 +199,38 @@ describe("config: roadmap.release_model", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildSemverLanes", () => {
-  it("returns non-empty milestones when backlog has rankable issues", () => {
+  it("returns non-empty milestones when backlog has rankable resolved issues", () => {
     const roadmap = [makeEntry(1), makeEntry(2), makeEntry(3)];
-    const lanes = buildSemverLanes(roadmap, "v1.6.0");
+    const items = [
+      makeInventoryItem(1, ["semver:minor"]),
+      makeInventoryItem(2, ["semver:minor"]),
+      makeInventoryItem(3, ["semver:patch"]),
+    ];
+    const lanes = buildSemverLanes(roadmap, "v1.6.0", items);
     assert.ok(lanes.length > 0, "expected at least one lane");
   });
 
   it("returns empty array when all issues are in blocked_pending_decision", () => {
     const roadmap = [makeEntry(1, "enablers"), makeEntry(2, "enablers")];
-    const lanes = buildSemverLanes(roadmap, "v1.6.0", [], undefined, new Set([1, 2]));
+    const items = [
+      makeInventoryItem(1, ["semver:minor"]),
+      makeInventoryItem(2, ["semver:minor"]),
+    ];
+    const lanes = buildSemverLanes(roadmap, "v1.6.0", items, undefined, new Set([1, 2]));
+    assert.equal(lanes.length, 0);
+  });
+
+  it("returns empty array when rankable issues lack resolved SemVer impact", () => {
+    const roadmap = [makeEntry(1), makeEntry(2)];
+    const items = [makeInventoryItem(1, ["bug"]), makeInventoryItem(2, [])];
+    const lanes = buildSemverLanes(roadmap, "v1.6.0", items);
     assert.equal(lanes.length, 0);
   });
 
   it("all titles match v<M>.<N>.<P> semver pattern", () => {
     const roadmap = Array.from({ length: 12 }, (_, i) => makeEntry(i + 1));
-    const lanes = buildSemverLanes(roadmap, "v1.6.0");
+    const items = Array.from({ length: 12 }, (_, i) => makeInventoryItem(i + 1, ["semver:minor"]));
+    const lanes = buildSemverLanes(roadmap, "v1.6.0", items);
     for (const lane of lanes) {
       assert.match(lane.title, /^v\d+\.\d+\.\d+$/, `title "${lane.title}" not semver`);
     }
@@ -221,7 +238,8 @@ describe("buildSemverLanes", () => {
 
   it("no issue number appears in more than one lane", () => {
     const roadmap = Array.from({ length: 12 }, (_, i) => makeEntry(i + 1));
-    const lanes = buildSemverLanes(roadmap, "v1.6.0");
+    const items = Array.from({ length: 12 }, (_, i) => makeInventoryItem(i + 1, ["semver:minor"]));
+    const lanes = buildSemverLanes(roadmap, "v1.6.0", items);
     const seen = new Set<number>();
     for (const lane of lanes) {
       for (const n of lane.issue_numbers) {
@@ -231,28 +249,36 @@ describe("buildSemverLanes", () => {
     }
   });
 
-  it("starts from the version after the latest tag minor", () => {
+  it("starts from the version after the latest tag minor for resolved minor impact", () => {
     const roadmap = [makeEntry(1)];
-    const lanes = buildSemverLanes(roadmap, "v1.6.0");
+    const items = [makeInventoryItem(1, ["semver:minor"])];
+    const lanes = buildSemverLanes(roadmap, "v1.6.0", items);
     assert.equal(lanes[0].title, "v1.7.0");
   });
 
-  it("handles missing tag (empty string) by starting at v0.1.0", () => {
+  it("handles missing tag (empty string) by starting at v0.1.0 for minor", () => {
     const roadmap = [makeEntry(1)];
-    const lanes = buildSemverLanes(roadmap, "");
+    const items = [makeInventoryItem(1, ["semver:minor"])];
+    const lanes = buildSemverLanes(roadmap, "", items);
     assert.equal(lanes[0].title, "v0.1.0");
   });
 
   it("handles tag without v prefix", () => {
     const roadmap = [makeEntry(1)];
-    const lanes = buildSemverLanes(roadmap, "1.5.0");
+    const items = [makeInventoryItem(1, ["semver:minor"])];
+    const lanes = buildSemverLanes(roadmap, "1.5.0", items);
     assert.equal(lanes[0].title, "v1.6.0");
   });
 
   it("issues in blocked_pending_decision are excluded from lanes", () => {
     const roadmap = [makeEntry(1), makeEntry(2, "enablers"), makeEntry(3)];
+    const items = [
+      makeInventoryItem(1, ["semver:minor"]),
+      makeInventoryItem(2, ["semver:minor"]),
+      makeInventoryItem(3, ["semver:minor"]),
+    ];
     // Issue 2 is an unresolved/external blocked decision
-    const lanes = buildSemverLanes(roadmap, "v1.0.0", [], undefined, new Set([2]));
+    const lanes = buildSemverLanes(roadmap, "v1.0.0", items, undefined, new Set([2]));
     const allNums = lanes.flatMap((l) => l.issue_numbers);
     assert.ok(!allNums.includes(2), "blocked issue #2 should be excluded");
     assert.ok(allNums.includes(1));

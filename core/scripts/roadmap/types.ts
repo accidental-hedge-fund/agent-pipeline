@@ -128,13 +128,50 @@ export interface HygieneItem {
   applied?: boolean;
 }
 
+export type CompatibilityImpact = "major" | "minor" | "patch";
+
+/** Applied SemVer classification status for one issue. */
+export type CompatibilityStatus =
+  | "resolved"
+  | "unresolved_missing"
+  | "unresolved_conflict";
+
+/** Non-binding type-label hint; never sets applied impact or milestone versioning. */
+export interface CompatibilityRecommendation {
+  impact: CompatibilityImpact;
+  /** Label (or short source key) that produced the recommendation. */
+  source: string;
+}
+
+/**
+ * Per-issue compatibility classification under `release_model: semver`.
+ * Applied impact comes only from exclusive `semver:major|minor|patch` labels.
+ */
+export interface CompatibilityClassification {
+  issue_number: IssueNumber;
+  status: CompatibilityStatus;
+  /** Resolved applied impact, or null when status is unresolved. */
+  applied_impact: CompatibilityImpact | null;
+  /** Winning `semver:*` label when resolved; null when unresolved. */
+  source_label: string | null;
+  /** True when applied impact is not resolved (missing or conflicting labels). */
+  uncertain: boolean;
+  /** Optional non-binding recommendation from generic type labels when missing. */
+  recommendation?: CompatibilityRecommendation;
+  /** Distinct conflicting `semver:*` labels when status is unresolved_conflict. */
+  conflict_labels?: string[];
+}
+
 export interface MilestoneSpec {
   title: string;
   issue_numbers: IssueNumber[];
   rationale: string;
   /** Compatibility impact driving the semver increment for this milestone. */
-  version_impact?: 'major' | 'minor' | 'patch';
-  /** Present when sparse metadata required a conservative classification. */
+  version_impact?: CompatibilityImpact;
+  /**
+   * Optional operator note (e.g. summary of excluded unresolved issues).
+   * Must not invent applied impact for issues placed in the milestone.
+   */
   uncertainty?: string;
 }
 
@@ -184,6 +221,11 @@ export interface PlanJson {
   new_issue_drafts: NewIssueDraft[];
   critique: CritiqueEntry[];
   open_questions: OpenQuestion[];
+  /**
+   * Per-issue SemVer compatibility classifications (present under release_model
+   * semver / default). Continuous runs omit this field.
+   */
+  compatibility_classifications?: CompatibilityClassification[];
   /** Present only when release_model === 'continuous'. CalVer format: YYYY.0M.MICRO */
   continuous_version_marker?: string;
   run_stats?: RunStats;
@@ -192,7 +234,10 @@ export interface PlanJson {
 export interface ReleaseCapacity {
   /** Per-milestone effort-points budget (XS=1 S=2 M=3 L=5 XL=8; default: 8). */
   effort_budget?: number;
-  /** Give each breaking-change issue its own milestone (default: true). */
+  /**
+   * Give each resolved `semver:major` issue its own milestone (default: true).
+   * Prose-only or recommendation-only issues are never treated as breaking.
+   */
   isolate_breaking?: boolean;
 }
 

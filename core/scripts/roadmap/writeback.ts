@@ -11,6 +11,7 @@ import type {
   Tier,
   EffortSize,
   CrossRepoDep,
+  CompatibilityClassification,
 } from "./types.ts";
 
 /**
@@ -143,6 +144,61 @@ export function renderRoadmapMd(plan: PlanJson): string {
       if (entry.risks.length > 0) {
         lines.push(`  - **Risks:** ${entry.risks.join("; ")}`);
       }
+    }
+    lines.push("");
+  }
+
+  // Release milestones (semver or continuous groupings)
+  if (plan.milestones.length > 0) {
+    lines.push("---");
+    lines.push("");
+    lines.push("## Release milestones");
+    lines.push("");
+    for (const m of plan.milestones) {
+      const impact =
+        m.version_impact !== undefined ? ` · impact: \`${m.version_impact}\`` : "";
+      lines.push(`### ${m.title}${impact}`);
+      lines.push("");
+      lines.push(`- **Issues:** ${m.issue_numbers.map((n) => `#${n}`).join(", ")}`);
+      lines.push(`- **Rationale:** ${m.rationale}`);
+      if (m.uncertainty) {
+        lines.push(`- **Note:** ${m.uncertainty}`);
+      }
+      lines.push("");
+    }
+  }
+
+  // Per-issue SemVer compatibility classification (semver model only)
+  const classifications: CompatibilityClassification[] =
+    plan.compatibility_classifications ?? [];
+  if (classifications.length > 0) {
+    lines.push("---");
+    lines.push("");
+    lines.push("## Compatibility impact");
+    lines.push("");
+    lines.push(
+      "_Applied impact comes only from exclusive `semver:major` / `semver:minor` / `semver:patch` labels. " +
+        "Title and body text do not set the class. Unresolved issues are not auto-assigned to SemVer milestones._",
+    );
+    lines.push("");
+    lines.push("| Issue | Status | Applied | Source | Uncertainty | Recommendation |");
+    lines.push("|-------|--------|---------|--------|-------------|----------------|");
+    for (const c of classifications) {
+      const applied = c.applied_impact ?? "—";
+      const source = c.source_label ?? "—";
+      const uncertainty =
+        c.status === "unresolved_conflict"
+          ? `conflict: ${(c.conflict_labels ?? []).join(", ")}`
+          : c.status === "unresolved_missing"
+            ? "missing explicit semver:* label"
+            : "—";
+      const recommendation =
+        c.recommendation !== undefined
+          ? `${c.recommendation.impact} (from \`${c.recommendation.source}\`, non-applied)`
+          : "—";
+      lines.push(
+        `| #${c.issue_number} | \`${c.status}\` | \`${applied}\` | \`${source}\` | ${uncertainty} | ${recommendation} |`,
+      );
     }
     lines.push("");
   }
@@ -311,7 +367,11 @@ export async function applyMilestones(
   if (!apply) {
     deps.log(`[roadmap] dry-run: ${milestones.length} milestone(s) would be created/assigned`);
     for (const m of milestones) {
-      deps.log(`[roadmap] dry-run: milestone "${m.title}" — issues: ${m.issue_numbers.join(", ")}`);
+      const impact =
+        m.version_impact !== undefined ? ` version_impact=${m.version_impact}` : "";
+      deps.log(
+        `[roadmap] dry-run: milestone "${m.title}"${impact} — issues: ${m.issue_numbers.join(", ")}`,
+      );
     }
     return;
   }

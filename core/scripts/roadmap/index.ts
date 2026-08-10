@@ -19,6 +19,9 @@ import type {
   InventoryItem,
   CrossRepoDep,
   DepGraph,
+  CompatibilityClassification,
+  CompatibilityImpact,
+  CompatibilityRecommendation,
 } from "./types.ts";
 import { buildInventory, computeBacklogSha } from "./inventory.ts";
 import type { InventoryDeps } from "./inventory.ts";
@@ -86,45 +89,128 @@ function parseSemverTag(tag: string): [number, number, number] {
   return [0, 0, 0];
 }
 
+/** Authoritative applied-impact labels (mutually exclusive). Case-insensitive match. */
+const EXPLICIT_SEMVER_LABELS = ["semver:major", "semver:minor", "semver:patch"] as const;
+const IMPACT_FROM_SEMVER_LABEL: Record<(typeof EXPLICIT_SEMVER_LABELS)[number], CompatibilityImpact> = {
+  "semver:major": "major",
+  "semver:minor": "minor",
+  "semver:patch": "patch",
+};
+
+const FEATURE_LABELS = new Set(["feature", "enhancement", "feat"]);
+const MAINTENANCE_LABELS = new Set([
+  "chore",
+  "maintenance",
+  "bug",
+  "bugfix",
+  "refactor",
+  "documentation",
+  "docs",
+]);
+const RECOMMEND_MAJOR_LABELS = new Set(["breaking-change", "breaking"]);
+
 /**
- * Classify compatibility impact of an issue from its labels and text.
- * Returns impact level and whether the classification is uncertain (sparse metadata).
- * Conservative default: `minor` with `uncertain: true` when no signals are found.
+ * Non-binding recommendation from generic type / signal labels only.
+ * Never sets applied impact. Title/body text is not consulted.
+ */
+function recommendFromTypeLabels(labelsLower: string[]): CompatibilityRecommendation | undefined {
+  for (const l of labelsLower) {
+    if (RECOMMEND_MAJOR_LABELS.has(l)) {
+      return { impact: "major", source: l };
+    }
+  }
+  for (const l of labelsLower) {
+    if (FEATURE_LABELS.has(l)) {
+      return { impact: "minor", source: l };
+    }
+  }
+  for (const l of labelsLower) {
+    if (MAINTENANCE_LABELS.has(l)) {
+      return { impact: "patch", source: l };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Classify applied SemVer compatibility impact from exclusive `semver:*` labels only.
+ *
+ * - Exactly one of `semver:major` | `semver:minor` | `semver:patch` → resolved
+ * - None → unresolved_missing (optional non-binding recommendation from type labels)
+ * - Two or more distinct classes → unresolved_conflict
+ *
+ * Title and body text never set, upgrade, or downgrade applied impact.
+ * `entry` is accepted for call-site stability; applied class does not use tier/score.
  */
 export function classifyCompatibilityImpact(
   entry: RoadmapEntry,
   item: InventoryItem,
-): { impact: "major" | "minor" | "patch"; uncertain: boolean } {
-  const labels = item.issue.labels.map((l) => l.toLowerCase());
-  const text = `${item.issue.title} ${item.issue.body}`.toLowerCase();
+): CompatibilityClassification {
+  void entry;
+  const issueNumber = item.issue.number;
+  const labelsLower = item.issue.labels.map((l) => l.toLowerCase());
 
-  // Breaking change signals → major
-  const BREAKING_LABELS = ["breaking-change", "breaking", "semver:major"];
-  if (labels.some((l) => BREAKING_LABELS.includes(l))) {
-    return { impact: "major", uncertain: false };
-  }
-  if (/\bbreaking[\s-]change\b|\bmigration\b/.test(text)) {
-    return { impact: "major", uncertain: false };
-  }
+  const presentExplicit = EXPLICIT_SEMVER_LABELS.filter((name) => labelsLower.includes(name));
 
-  // Explicit semver:* labels take precedence over generic type labels (semver:major already handled above)
-  if (labels.includes("semver:minor")) {
-    return { impact: "minor", uncertain: false };
-  }
-  if (labels.includes("semver:patch")) {
-    return { impact: "patch", uncertain: false };
+  if (presentExplicit.length >= 2) {
+    return {
+      issue_number: issueNumber,
+      status: "unresolved_conflict",
+      applied_impact: null,
+      source_label: null,
+      uncertain: true,
+      conflict_labels: [...presentExplicit],
+    };
   }
 
-  // Generic labels: compute highest impact — minor beats patch
-  const FEATURE_LABELS = ["feature", "enhancement", "feat"];
-  const MAINTENANCE_LABELS = ["chore", "maintenance", "bug", "bugfix", "refactor", "documentation", "docs"];
-  const hasFeature = labels.some((l) => FEATURE_LABELS.includes(l));
-  const hasMaintenance = labels.some((l) => MAINTENANCE_LABELS.includes(l)) || entry.tier === "cleanup";
-  if (hasFeature) return { impact: "minor", uncertain: false };
-  if (hasMaintenance) return { impact: "patch", uncertain: false };
+  if (presentExplicit.length === 1) {
+    const source = presentExplicit[0];
+    return {
+      issue_number: issueNumber,
+      status: "resolved",
+      applied_impact: IMPACT_FROM_SEMVER_LABEL[source],
+      source_label: source,
+      uncertain: false,
+    };
+  }
 
-  // Sparse metadata → conservative minor + uncertainty marker
-  return { impact: "minor", uncertain: true };
+  const recommendation = recommendFromTypeLabels(labelsLower);
+  return {
+    issue_number: issueNumber,
+    status: "unresolved_missing",
+    applied_impact: null,
+    source_label: null,
+    uncertain: true,
+    ...(recommendation !== undefined ? { recommendation } : {}),
+  };
+}
+
+/**
+ * Classify every roadmap issue (inventory missing → unresolved_missing).
+ * Blocked issues remain classified for visibility; they are still excluded from lanes separately.
+ */
+export function buildCompatibilityClassifications(
+  roadmap: RoadmapEntry[],
+  items: InventoryItem[] = [],
+): CompatibilityClassification[] {
+  const itemByIssue = new Map<number, InventoryItem>();
+  for (const item of items) {
+    itemByIssue.set(item.issue.number, item);
+  }
+
+  return roadmap.map((entry) => {
+    const item = itemByIssue.get(entry.issue_number);
+    if (!item) {
+      return {
+        issue_number: entry.issue_number,
+        status: "unresolved_missing" as const,
+        applied_impact: null,
+        source_label: null,
+        uncertain: true,
+      };
+    }
+    return classifyCompatibilityImpact(entry, item);
+  });
 }
 
 /**
@@ -133,15 +219,14 @@ export function classifyCompatibilityImpact(
  */
 function buildMilestoneRationale(
   entries: RoadmapEntry[],
-  impact: "major" | "minor" | "patch",
-  uncertainCount: number,
+  impact: CompatibilityImpact,
 ): string {
   const impactPhrase =
     impact === "major"
-      ? "Breaking-change compatibility impact"
+      ? "Breaking-change compatibility impact (explicit semver:major)"
       : impact === "minor"
-        ? "Backward-compatible feature work"
-        : "Maintenance-only work (patch compatibility)";
+        ? "Backward-compatible feature work (explicit semver:minor)"
+        : "Maintenance-only work (explicit semver:patch)";
 
   const tiers = [...new Set(entries.map((e) => e.tier))];
   const cohesionPhrase =
@@ -152,21 +237,16 @@ function buildMilestoneRationale(
   const capacityPhrase = `${entries.length} issue(s) within release capacity`;
   const issues = entries.map((e) => `#${e.issue_number}`).join(", ");
 
-  const parts = [impactPhrase, cohesionPhrase, capacityPhrase];
-  if (uncertainCount > 0) {
-    parts.push(`${uncertainCount} issue(s) with sparse metadata (conservative minor classification)`);
-  }
-
-  return `${parts.join("; ")}. Issues: ${issues}.`;
+  return `${[impactPhrase, cohesionPhrase, capacityPhrase].join("; ")}. Issues: ${issues}.`;
 }
 
 /**
- * Bundle ranked, non-blocked roadmap issues into capacity-aware, compatibility-impact-driven
- * version-numbered release milestones. Replaces the fixed SEMVER_LANE_SIZE cap:
- * - Milestone boundaries are determined by effort-weighted capacity budget.
- * - Breaking-change or oversized issues are isolated into their own milestone.
- * - Semver increment (patch/minor/major) reflects the highest compatibility impact in the milestone.
- * - Each milestone carries a product-term rationale and optional uncertainty marker.
+ * Bundle ranked issues with **resolved** applied SemVer impact into capacity-aware,
+ * compatibility-impact-driven version-numbered release milestones:
+ * - Only issues with resolved applied impact from exclusive `semver:*` labels enter lanes.
+ * - Unresolved (missing / conflicting) issues are omitted from automatic assignment.
+ * - Milestone boundaries use effort-weighted capacity; resolved major + isolate_breaking isolates.
+ * - Semver increment reflects the highest **resolved applied** impact in the milestone.
  */
 export function buildSemverLanes(
   roadmap: RoadmapEntry[],
@@ -187,27 +267,42 @@ export function buildSemverLanes(
     itemByIssue.set(item.issue.number, item);
   }
 
+  // Only resolved applied-impact issues participate in packing / version walk.
+  const classificationByIssue = new Map<number, CompatibilityClassification>();
+  const eligible: RoadmapEntry[] = [];
+  for (const entry of unblocked) {
+    const item = itemByIssue.get(entry.issue_number);
+    const classification = item
+      ? classifyCompatibilityImpact(entry, item)
+      : {
+          issue_number: entry.issue_number,
+          status: "unresolved_missing" as const,
+          applied_impact: null,
+          source_label: null,
+          uncertain: true,
+        };
+    classificationByIssue.set(entry.issue_number, classification);
+    if (classification.status === "resolved" && classification.applied_impact !== null) {
+      eligible.push(entry);
+    }
+  }
+  if (eligible.length === 0) return [];
+
   let [curMajor, curMinor, curPatch] = parseSemverTag(latestTag);
   const milestones: MilestoneSpec[] = [];
 
   function closeMilestone(entries: RoadmapEntry[]): void {
     if (entries.length === 0) return;
 
-    let milestoneImpact: "major" | "minor" | "patch" = "patch";
-    let uncertainCount = 0;
+    let milestoneImpact: CompatibilityImpact = "patch";
 
     for (const entry of entries) {
-      const item = itemByIssue.get(entry.issue_number);
-      const { impact, uncertain } = item
-        ? classifyCompatibilityImpact(entry, item)
-        : { impact: "minor" as const, uncertain: true };
-      if (uncertain) uncertainCount++;
+      const impact = classificationByIssue.get(entry.issue_number)?.applied_impact;
       if (impact === "major") {
         milestoneImpact = "major";
       } else if (impact === "minor" && milestoneImpact !== "major") {
         milestoneImpact = "minor";
       }
-      // patch remains only if no higher impact found
     }
 
     if (milestoneImpact === "major") {
@@ -222,32 +317,24 @@ export function buildSemverLanes(
     }
 
     const title = `v${curMajor}.${curMinor}.${curPatch}`;
-    const rationale = buildMilestoneRationale(entries, milestoneImpact, uncertainCount);
-    const uncertainty =
-      uncertainCount > 0
-        ? `${uncertainCount} of ${entries.length} issue(s) had sparse metadata; conservative 'minor' compatibility classification applied`
-        : undefined;
+    const rationale = buildMilestoneRationale(entries, milestoneImpact);
 
     milestones.push({
       title,
       issue_numbers: entries.map((e) => e.issue_number),
       rationale,
       version_impact: milestoneImpact,
-      ...(uncertainty !== undefined ? { uncertainty } : {}),
     });
   }
 
   let current: RoadmapEntry[] = [];
   let currentPoints = 0;
 
-  for (const entry of unblocked) {
+  for (const entry of eligible) {
     const points = EFFORT_POINTS[entry.effort] ?? 3;
-    const item = itemByIssue.get(entry.issue_number);
-    const { impact: issueImpact } = item
-      ? classifyCompatibilityImpact(entry, item)
-      : { impact: "minor" as const };
+    const applied = classificationByIssue.get(entry.issue_number)?.applied_impact;
 
-    const isBreaking = issueImpact === "major" && isolateBreaking;
+    const isBreaking = applied === "major" && isolateBreaking;
     const isOversized = points >= budget;
     const isHighRisk = entry.risks.some((r) => HIGH_RISK_SIGNALS.includes(r));
 
@@ -268,6 +355,22 @@ export function buildSemverLanes(
 
   closeMilestone(current);
   return milestones;
+}
+
+/** Human-readable one-line summary for logs / Markdown / apply preview. */
+export function formatClassificationLine(c: CompatibilityClassification): string {
+  if (c.status === "resolved") {
+    return `#${c.issue_number}: applied=${c.applied_impact} source=${c.source_label}`;
+  }
+  if (c.status === "unresolved_conflict") {
+    const labels = (c.conflict_labels ?? []).join(", ");
+    return `#${c.issue_number}: unresolved_conflict labels=[${labels}] (no automatic milestone assignment)`;
+  }
+  const rec =
+    c.recommendation !== undefined
+      ? ` recommendation=${c.recommendation.impact} (from ${c.recommendation.source}, non-applied)`
+      : "";
+  return `#${c.issue_number}: unresolved_missing (no explicit semver:* label)${rec}`;
 }
 
 /**
@@ -901,6 +1004,7 @@ export async function runRoadmap(
   const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   let milestones: MilestoneSpec[];
   let continuousVersionMarker: string | undefined;
+  let compatibilityClassifications: CompatibilityClassification[] | undefined;
 
   if (releaseModel === "continuous") {
     milestones = buildContinuousGroups(roadmap, items);
@@ -911,14 +1015,40 @@ export async function runRoadmap(
     deps.log(`[roadmap] continuous model: ${milestones.length} theme group(s), marker=${continuousVersionMarker}`);
   } else {
     const latestTag = await deps.getLatestTag(repoDir);
-    milestones = buildSemverLanes(roadmap, latestTag, items, config.release_capacity, new Set(depGraph.blocked_pending_decision));
-    deps.log(`[roadmap] semver model: ${milestones.length} lane(s) (latest tag: ${latestTag || "(none)"})`);
-    for (const m of milestones) {
-      if (m.uncertainty) {
+    const blockedSet = new Set(depGraph.blocked_pending_decision);
+    compatibilityClassifications = buildCompatibilityClassifications(roadmap, items);
+    milestones = buildSemverLanes(
+      roadmap,
+      latestTag,
+      items,
+      config.release_capacity,
+      blockedSet,
+    );
+    deps.log(
+      `[roadmap] semver model: ${milestones.length} lane(s) (latest tag: ${latestTag || "(none)"}); ` +
+        `${compatibilityClassifications.filter((c) => c.status === "resolved").length} resolved / ` +
+        `${compatibilityClassifications.filter((c) => c.status !== "resolved").length} unresolved impact`,
+    );
+    for (const c of compatibilityClassifications) {
+      if (c.status === "unresolved_conflict") {
         openQuestions.push({
-          description: `Milestone "${m.title}" has sparse-metadata issues: ${m.uncertainty}`,
-          related_issues: m.issue_numbers,
-          rationale: "Conservative minor compatibility classification applied; review and promote boundary if needed",
+          description:
+            `Issue #${c.issue_number} has conflicting explicit SemVer labels ` +
+            `(${(c.conflict_labels ?? []).join(", ")}); applied impact unresolved — no automatic milestone assignment`,
+          related_issues: [c.issue_number],
+          rationale: "Resolve to exactly one of semver:major, semver:minor, or semver:patch",
+        });
+      } else if (c.status === "unresolved_missing") {
+        const recNote =
+          c.recommendation !== undefined
+            ? ` Non-binding recommendation: ${c.recommendation.impact} (from ${c.recommendation.source}).`
+            : "";
+        openQuestions.push({
+          description:
+            `Issue #${c.issue_number} has no explicit semver:* compatibility-impact label; ` +
+            `applied impact unresolved — no automatic milestone assignment.${recNote}`,
+          related_issues: [c.issue_number],
+          rationale: "Add exactly one of semver:major, semver:minor, or semver:patch",
         });
       }
     }
@@ -937,6 +1067,9 @@ export async function runRoadmap(
     new_issue_drafts: [],
     critique: critiqueEntries,
     open_questions: openQuestions,
+    ...(compatibilityClassifications !== undefined
+      ? { compatibility_classifications: compatibilityClassifications }
+      : {}),
     ...(continuousVersionMarker !== undefined ? { continuous_version_marker: continuousVersionMarker } : {}),
     run_stats: runStats,
   };
@@ -946,6 +1079,13 @@ export async function runRoadmap(
   await deps.writeFile(path.join(outputDir, ".gitkeep"), "");
   await writePlanJson(plan, outputDir, deps);
   await writeRoadmapMd(plan, outputDir, deps);
+
+  if (plan.compatibility_classifications && plan.compatibility_classifications.length > 0) {
+    deps.log(`\n[roadmap] compatibility classifications:`);
+    for (const c of plan.compatibility_classifications) {
+      deps.log(`  ${formatClassificationLine(c)}`);
+    }
+  }
 
   if (opts.dryRun || !opts.apply) {
     deps.log(`\n[roadmap] dry-run: top 10 roadmap items:`);
@@ -961,13 +1101,16 @@ export async function runRoadmap(
     if (plan.milestones.length > 0) {
       deps.log(`\n[roadmap] dry-run: ${plan.milestones.length} milestone(s) (not applied):`);
       for (const m of plan.milestones) {
-        deps.log(`  - "${m.title}": ${m.issue_numbers.join(", ")}`);
+        deps.log(
+          `  - "${m.title}" (version_impact=${m.version_impact ?? "n/a"}): ${m.issue_numbers.join(", ")}`,
+        );
       }
     }
     deps.log(`\n[roadmap] dry-run complete. Run with --apply to execute GitHub write-backs.`);
     return;
   }
 
+  deps.log(`\n[roadmap] apply preview: milestones and classifications above will be written.`);
   await applyHygiene(plan.hygiene, repo, { apply: true }, deps);
   await applyMilestones(plan.milestones, repo, true, deps);
 
