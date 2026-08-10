@@ -28,7 +28,9 @@ from a single shared TypeScript core; the two hosts differ only by a JSON profil
 - Repository-configured or advance-loop merging of PRs. `pipeline advance`,
   `pipeline single`, and `pipeline loop` stop at `pipeline:ready-to-deploy`.
   Loop-isolated commands (`pipeline merge`, `merge-queue --apply`) may merge
-  under direct operator authority. External supervisors may call those same
-  commands; the repository does not ship a Hermes/Buzz factory control plane
-  or grant schema. Merge authority is not repository configuration. No
-  `auto_merge` config key or merge stage exists.
+  under direct operator authority. The explicit ship coordinator may compose
+  those commands after it validates a minimal, immutable, event-bound,
+  expiring authorization document supplied by a trusted channel adapter. The
+  repository does not ship a Hermes/Buzz transport client, durable factory
+  action bus, or second scheduler. Merge authority is not repository
+  configuration. No `auto_merge` config key or merge stage exists.

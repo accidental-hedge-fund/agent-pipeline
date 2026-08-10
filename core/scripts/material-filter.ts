@@ -12,6 +12,7 @@
 //   loop_item_started, loop_item_transitioned, loop_item_blocked,
 //   loop_item_advance_linked, loop_item_advance_finished,
 //   loop_item_stage_progress, loop_item_progress, loop_run_stopped, …
+// - Ship (`stages/ship.ts`): `ship_phase` objects bound to one ship run.
 
 import * as fs from "node:fs";
 import * as readline from "node:readline";
@@ -72,9 +73,15 @@ export const LOOP_OPTIONAL_MATERIAL_KINDS = [
 
 export type LoopOptionalMaterialKind = (typeof LOOP_OPTIONAL_MATERIAL_KINDS)[number];
 
+/** Pipeline-owned shipment phase transitions. */
+export const SHIP_MATERIAL_KINDS = ["ship_phase"] as const;
+
+export type ShipMaterialKind = (typeof SHIP_MATERIAL_KINDS)[number];
+
 const ADVANCE_SET = new Set<string>(ADVANCE_MATERIAL_KINDS);
 const LOOP_MUST_SET = new Set<string>(LOOP_MATERIAL_KINDS);
 const LOOP_OPTIONAL_SET = new Set<string>(LOOP_OPTIONAL_MATERIAL_KINDS);
+const SHIP_SET = new Set<string>(SHIP_MATERIAL_KINDS);
 
 /** Definitive pre-merge progress statuses (always material when on loop stream). */
 export const LOOP_PROGRESS_DEFINITIVE_STATUSES = [
@@ -102,6 +109,8 @@ export interface MaterialFilterOptions {
    * of a human one-liner. Default false (one-liners for host bubbles).
    */
   jsonl?: boolean;
+  /** Stop a streaming observer after the exact ship reports complete. */
+  untilShipTerminal?: boolean;
 }
 
 export interface MaterialFilterState {
@@ -154,7 +163,19 @@ export function filterMaterialLine(
   if (loopKind && LOOP_OPTIONAL_SET.has(loopKind)) {
     return filterLoopOptional(loopKind, obj, state, opts, trimmed);
   }
+  if (loopKind && SHIP_SET.has(loopKind)) {
+    return emit(opts, trimmed, formatShipOneLiner(obj));
+  }
   return null;
+}
+
+function formatShipOneLiner(obj: Record<string, unknown>): string {
+  const phase = typeof obj.phase === "string" ? obj.phase : "?";
+  const status = typeof obj.status === "string" ? obj.status : "?";
+  const detail = typeof obj.detail === "string" && obj.detail.trim() !== ""
+    ? ` — ${obj.detail.trim()}`
+    : "";
+  return `[ship_phase] ${phase} → ${status}${detail}`;
 }
 
 function emit(
@@ -434,6 +455,16 @@ export async function pumpMaterialFilter(
   for await (const line of rl) {
     const emitted = filterMaterialLine(line, state, opts);
     if (emitted != null) write(emitted.endsWith("\n") ? emitted : emitted + "\n");
+    if (opts.untilShipTerminal && isShipTerminalEventLine(line)) break;
+  }
+}
+
+export function isShipTerminalEventLine(line: string): boolean {
+  try {
+    const event = JSON.parse(line) as Record<string, unknown>;
+    return event?.kind === "ship_phase" && event.phase === "complete" && event.status === "completed";
+  } catch {
+    return false;
   }
 }
 
@@ -451,12 +482,14 @@ function isMain(): boolean {
 async function main(argv: string[]): Promise<void> {
   const args = argv.slice(2);
   let jsonl = false;
+  let untilShipTerminal = false;
   let file: string | undefined;
   for (const a of args) {
     if (a === "--jsonl") jsonl = true;
+    else if (a === "--until-ship-terminal") untilShipTerminal = true;
     else if (a === "-h" || a === "--help") {
       process.stdout.write(
-        "Usage: material-filter [--jsonl] [file|-]\n" +
+        "Usage: material-filter [--jsonl] [--until-ship-terminal] [file|-]\n" +
           "  Read advance/loop events.jsonl lines from file or stdin;\n" +
           "  print material one-liners (or JSONL with --jsonl).\n" +
           "  Observation only — does not modify the source file.\n",
@@ -467,7 +500,7 @@ async function main(argv: string[]): Promise<void> {
     }
   }
 
-  const opts: MaterialFilterOptions = { jsonl };
+  const opts: MaterialFilterOptions = { jsonl, untilShipTerminal };
   const write = (s: string) => {
     process.stdout.write(s);
   };

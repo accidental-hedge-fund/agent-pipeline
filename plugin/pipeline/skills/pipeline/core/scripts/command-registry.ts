@@ -96,6 +96,25 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: true,
   },
 
+  // Exact, event-authorized release shipment. Pipeline owns lifecycle
+  // convergence; the host process supervisor owns only restart policy.
+  ship: {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "profile",
+      "milestone",
+      "for",
+      "authorization",
+      "json",
+    ]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: true,
+  },
+
   // Factory Reliability Gate (#723): score a durable loop / fixture pack and
   // write immutable evidence under .agent-pipeline/frg/<version>/. Never merges
   // or tags. --from-run scores an existing loop; no gh required for scoring.

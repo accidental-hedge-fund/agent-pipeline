@@ -309,6 +309,8 @@ test("train: loop-isolation — stage handlers do not import train", () => {
     "merge_queue.ts",
     "merge-queue-release-when-complete.ts",
     "merge_queue_hold.ts",
+    // Operator-authorized ship composition; never imported by advance dispatch.
+    "ship-adapter.ts",
     "train.ts",
   ]);
   for (const file of fs.readdirSync(stagesDir).filter((f) => f.endsWith(".ts"))) {

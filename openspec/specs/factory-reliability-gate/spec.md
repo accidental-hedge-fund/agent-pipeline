@@ -830,7 +830,7 @@ The representative pack SHALL provide a collector that creates the documented ob
 
 ### Requirement: The v1.33.0 pilot MAY use candidate-bound Layer A proof for unsafe fault classes
 
-For release v1.33.0 only, pack `factory-gate-v1` MAY prove fault classes that have no safe production injection seam with a closed manifest list of exact Layer A probes. Live proof remains mandatory for fresh manifest issues, the exact loop item set, two clean ready items, blocker taxonomy, one real OpenSpec-bearing item, pull-request heads, and final checks. The runner SHALL execute every Layer A probe from the same clean candidate commit. It SHALL construct each command from the manifest and SHALL NOT accept a caller-supplied status, metric, receipt, or pass result. This temporary rule SHALL expire after v1.33.0. Issue #908 SHALL replace it in v1.34.0 after #890 and #891 through the idempotent two-call `pipeline factory-release prepare --request <absolute-request.json> --json` interface.
+For release v1.33.0 only, pack `factory-gate-v1` MAY prove fault classes that have no safe production injection seam with a closed manifest list of exact Layer A probes. Live proof remains mandatory for fresh manifest issues, the exact loop item set, two clean ready items, blocker taxonomy, one real OpenSpec-bearing item, pull-request heads, and final checks. The runner SHALL execute every Layer A probe from the same clean candidate commit. It SHALL construct each command from the manifest and SHALL NOT accept a caller-supplied status, metric, receipt, or pass result. This temporary rule SHALL expire after v1.33.0. Later releases SHALL use the full current FRG policy through the existing fixed pack and `pipeline factory-gate` surfaces.
 
 #### Scenario: Candidate-bound hybrid evidence may pass for v1.33.0
 
@@ -851,7 +851,8 @@ For release v1.33.0 only, pack `factory-gate-v1` MAY prove fault classes that ha
 - **WHEN** the target release is not exactly `1.33.0`
 - **THEN** the hybrid rule SHALL fail closed
 - **AND** the wrapper SHALL NOT reinterpret static bootstrap or candidate-version config as current proof
-- **AND** the full current FRG policy or the #908 candidate-native replacement SHALL apply
+- **AND** the full current FRG policy SHALL apply through the existing fixed
+  pack and scorer
 
 #### Scenario: Unverified probe output fails closed
 
@@ -899,4 +900,3 @@ The attestation request SHALL contain only versioned identity fields, wrapper-ap
 - **WHEN** candidate output includes a pass claim, MAC, signer identity, or other field outside the unsigned artifact contract
 - **THEN** the wrapper and trusted attestor SHALL ignore or reject that field according to the closed schema
 - **AND** only a policy result recomputed by the trusted attestor MAY be signed
-

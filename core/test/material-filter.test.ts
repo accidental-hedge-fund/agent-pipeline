@@ -6,11 +6,19 @@ import assert from "node:assert/strict";
 import {
   ADVANCE_MATERIAL_KINDS,
   LOOP_MATERIAL_KINDS,
+  SHIP_MATERIAL_KINDS,
   createMaterialFilterState,
   filterMaterialLine,
   filterMaterialLines,
   filterMaterialText,
+  isShipTerminalEventLine,
 } from "../scripts/material-filter.ts";
+
+test("ship terminal detection stops only on the exact completed phase", () => {
+  assert.equal(isShipTerminalEventLine(JSON.stringify({ kind: "ship_phase", phase: "complete", status: "completed" })), true);
+  assert.equal(isShipTerminalEventLine(JSON.stringify({ kind: "ship_phase", phase: "engine_promote", status: "completed" })), false);
+  assert.equal(isShipTerminalEventLine("not json"), false);
+});
 
 function adv(type: string, extra: Record<string, unknown> = {}): string {
   return JSON.stringify({
@@ -67,6 +75,25 @@ test("LOOP_MATERIAL_KINDS covers the issue allow-list", () => {
       `missing loop kind ${k}`,
     );
   }
+});
+
+test("ship phase transitions are material and keep their typed detail", () => {
+  assert.deepEqual(SHIP_MATERIAL_KINDS, ["ship_phase"]);
+  const line = JSON.stringify({
+    schema_version: 1,
+    kind: "ship_phase",
+    run_id: "ship-1",
+    event_id: "a".repeat(64),
+    at: "2026-08-10T12:00:00.000Z",
+    phase: "release_prepare",
+    status: "failed",
+    detail: "FRG evidence missing",
+  });
+  assert.equal(
+    filterMaterialLine(line),
+    "[ship_phase] release_prepare → failed — FRG evidence missing",
+  );
+  assert.equal(filterMaterialLine(line, createMaterialFilterState(), { jsonl: true }), line);
 });
 
 test("advance material kinds pass the filter among noise", () => {

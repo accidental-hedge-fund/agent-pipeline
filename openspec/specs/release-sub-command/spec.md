@@ -338,6 +338,37 @@ The release prepare implementation used by `pipeline release` SHALL remain avail
 - **THEN** the prepare path SHALL NOT wait on `$EDITOR`
 - **AND** on success it SHALL open a release pull request for separate operator finalization
 
+### Requirement: Release prepare JSON SHALL return typed candidate identity
+
+The release prepare machine interface SHALL return one typed result from
+`pipeline release <version> --no-edit --json` and the shared programmatic
+prepare entry containing at least
+`schema_version`, `kind: "release_prepare"`, the resolved `version`, release
+pull-request number `pr`, target `base`, and exact release pull-request
+`head_oid`. Machine consumers SHALL use this result instead of parsing prose,
+the PR title, or a repository-wide PR search.
+
+#### Scenario: Prepare returns one bound release result
+
+- **WHEN** non-interactive release prepare creates or reconciles a release PR
+  with `--json`
+- **THEN** stdout SHALL parse as exactly one unfenced JSON object
+- **AND** the object SHALL bind the resolved version, PR, base, and exact head
+
+#### Scenario: Finalization revalidates prepare identity
+
+- **WHEN** a coordinator finalizes a release from a prepare result
+- **THEN** it SHALL supply that typed identity to the existing release-finish
+  implementation and re-observe the PR before merge
+- **AND** a version, base, or head mismatch SHALL fail closed before merge
+
+#### Scenario: Prose is not a machine interface
+
+- **WHEN** release prepare logs human-readable progress or changes its prose
+- **THEN** machine consumers SHALL continue to use the typed result
+- **AND** they SHALL NOT discover the release PR by regular expression or title
+  search
+
 ### Requirement: The release prepare path SHALL NOT gain tag, publish, or merge authority via merge-queue callers
 
 The release prepare path SHALL remain prepare-only when invoked from merge-queue release-when-complete or any other programmatic caller. It SHALL NOT create or push git tags, publish npm packages, create GitHub Releases, or merge the release pull request. A separate direct operator action (or external supervisor under operator authority) MAY merge the prepared release pull request. Existing post-merge tag and publish workflows remain the only automated tag and publish path.
@@ -617,38 +648,25 @@ without the flag SHALL NOT be available.
 - **THEN** the release PR MAY omit the open-soak-defect waiver section
 - **AND** preparation SHALL NOT fail for lack of that section
 
-### Requirement: The candidate-native factory handoff SHALL use one stable prepare interface
+### Requirement: Ship coordination SHALL reuse the normal release prepare interface
 
-Issue #908 SHALL add the candidate-native interface in v1.34.0 after #890 and #891. The exact non-interactive command SHALL be `pipeline factory-release prepare --request <absolute-request.json> --json`. The stable #898 wrapper SHALL invoke this command from the clean exact integrated candidate, because the currently installed engine can be one release behind the candidate that provides the command. The unchanged request SHALL be versioned, secret-free, and bound to the verified installed production pin, freshly observed base, exact integrated candidate, active release grant, and stable action identity.
+The ship coordinator SHALL invoke the same shared release prepare entry used by
+`pipeline release`; it SHALL NOT add a `factory-release` command, alternate
+release builder, wrapper-local PR discovery protocol, or second release state
+machine. It SHALL store the typed prepare result and pass that identity into
+release finalization after all existing FRG and release gates pass.
 
-The command SHALL implement an idempotent two-call protocol. The first call SHALL create or reconcile fresh unsigned FRG artifacts without an FRG credential or credential path in its environment, inherited file descriptors, candidate-action cgroup credential mount, request, or result. When those artifacts are ready, it SHALL return JSON with `status: "awaiting_frg_attestation"`, their closed identities and digests, and the stable restart checkpoint. It SHALL NOT accept or return a pass claim, open the release pull request, or receive the signing credential through this interface.
+#### Scenario: Ship prepare uses the shared implementation
 
-The wrapper SHALL submit those artifacts to the fixed trusted attestor defined by the Factory Reliability Gate contract. After the wrapper stores the verified production-owned attestation, it SHALL invoke the same command with the unchanged request. The second call SHALL verify the bound attestation, invoke the existing prepare-only release implementation, and return `status: "complete"` with the exact FRG run, release pull request, release head, base commit, and restart checkpoint. Repeated calls before or after attestation SHALL return the same proved state without creating a second pack, attestation, branch, or pull request.
+- **WHEN** an authorized ship reaches release preparation
+- **THEN** it SHALL call the shared `runRelease` implementation or its stable
+  equivalent
+- **AND** the returned typed version, PR, base, and head SHALL become the
+  finalization identity
 
-The command SHALL grant no attestation, release-PR merge, publication, pin, install, or rollback authority. The v1.33.0 bootstrap MAY use its documented hybrid path, but no later release MAY fall back to that path.
+#### Scenario: Ship prepare grants no finalization authority by itself
 
-#### Scenario: Stable wrapper calls a one-release-newer candidate
-
-- **WHEN** the verified installed production engine is v1.33.0 and fresh `main` contains the v1.34.0 candidate implementation of #908
-- **THEN** the unchanged #898 wrapper SHALL invoke `pipeline factory-release prepare --request <absolute-request.json> --json` from that exact candidate before and after trusted attestation as needed
-- **AND** it SHALL NOT require a manual wrapper or config replacement
-
-#### Scenario: First call waits for trusted attestation
-
-- **WHEN** the unchanged request has produced complete unsigned FRG artifacts but no verified production-owned attestation exists
-- **THEN** the command SHALL return `status: "awaiting_frg_attestation"` with only the bound unsigned artifact identities, digests, and restart checkpoint
-- **AND** it SHALL NOT create the release pull request
-
-#### Scenario: Second call returns the complete release pull request
-
-- **WHEN** the trusted attestor has stored a valid attestation for the unchanged request and exact unsigned artifacts
-- **THEN** the next call SHALL prepare or reconcile one release pull request and return `status: "complete"` with its exact identity and head
-- **AND** a repeat call SHALL return the same proved result without another mutation
-
-#### Scenario: Candidate prepare does not acquire signing or finalization authority
-
-- **WHEN** the candidate-native prepare command returns a successful JSON result
-- **THEN** the factory SHALL have passed no FRG signing credential or credential path through the candidate environment, inherited file descriptors, candidate-action cgroup credential mount, request, or result
-- **AND** the trusted attestor SHALL have imported or executed no candidate code
-- **AND** a separate granted wrapper action SHALL still be required for merge, publication verification, pin promotion, install, or rollback
-
+- **WHEN** release prepare returns its typed identity
+- **THEN** it SHALL NOT merge, tag, publish, promote, or install as a side effect
+- **AND** the ship coordinator SHALL revalidate its authorization and observed
+  release identity before each later mutation

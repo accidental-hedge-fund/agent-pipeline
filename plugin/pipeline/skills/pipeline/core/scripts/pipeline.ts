@@ -91,7 +91,7 @@ import {
   type TerminalLogTee,
 } from "./run-store.ts";
 import { finishReleasePr, realReleaseFinishDeps } from "./stages/release-finish.ts";
-import { runRelease } from "./stages/release.ts";
+import { realReleaseDeps, runRelease } from "./stages/release.ts";
 import { runIntake, realIntakeDeps } from "./stages/intake.ts";
 import { runRefineSpec, realRefineSpecDeps } from "./stages/refine-spec.ts";
 import {
@@ -111,6 +111,7 @@ import {
   realTrainDeps,
   runTrain,
   type AdvanceOutcome,
+  type TrainDeps,
 } from "./stages/train.ts";
 import * as reviewStage from "./stages/review.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
@@ -376,6 +377,8 @@ export interface CliOpts {
   since?: string;
   /** factory-gate: target release version X.Y.Z (#723). Commander maps --for → for. */
   for?: string;
+  /** ship: absolute path to the gateway-authenticated authorization document. */
+  authorization?: string;
   /** factory-gate: durable loop run id to score (#723). */
   fromRun?: string;
   /**
@@ -514,6 +517,83 @@ export interface CliOpts {
   yes?: boolean;
 }
 
+export interface ShipCliInput {
+  mode: "run" | "status";
+  milestone: string;
+  version: string;
+  authorizationPath: string | null;
+}
+
+export const DEFAULT_SHIP_AUTH_PUBLIC_KEY_FILE = "/etc/agent-pipeline/ship-authority.pem";
+
+export function validateShipAuthorizationPublicKeyFile(
+  filePath: string,
+  metadata: { isFile(): boolean; isSymbolicLink(): boolean; uid: number; mode: number },
+): void {
+  if (!path.isAbsolute(filePath)) {
+    throw new Error("trusted public key path must be absolute");
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error("trusted public key must be a regular file, not a symlink");
+  }
+  if (metadata.uid !== 0 || (metadata.mode & 0o022) !== 0) {
+    throw new Error("trusted public key must be root-owned and not writable by group or other");
+  }
+}
+
+/** Validate only the public ship command shape. Stage code validates identity and authorization contents. */
+export function normalizeShipCliInput(
+  positionals: readonly string[],
+  opts: Pick<CliOpts, "milestone" | "for" | "authorization" | "json">,
+): ShipCliInput {
+  const verb = positionals[1];
+  if (verb !== undefined && verb !== "status") {
+    throw new Error(`unexpected argument ${JSON.stringify(verb)}; expected 'status' or no subcommand`);
+  }
+  const mode = verb === "status" ? "status" : "run";
+  const milestone = String(opts.milestone ?? "").trim();
+  const version = String(opts.for ?? "").trim().replace(/^[vV]/, "");
+  if (!milestone) throw new Error("--milestone <m> is required");
+  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) {
+    throw new Error("--for <X.Y.Z> is required and must be a semantic version");
+  }
+  if (!opts.json) throw new Error("--json is required");
+
+  const authorization = String(opts.authorization ?? "").trim();
+  if (mode === "status") {
+    if (authorization) throw new Error("status does not accept --authorization");
+    return { mode, milestone, version, authorizationPath: null };
+  }
+  if (!authorization) throw new Error("--authorization <absolute-json> is required");
+  if (!path.isAbsolute(authorization)) throw new Error("--authorization must be an absolute path");
+  return { mode, milestone, version, authorizationPath: authorization };
+}
+
+export function validateReleaseMachineOutputMode(
+  opts: Pick<CliOpts, "json" | "dryRun">,
+): void {
+  if (opts.json && opts.dryRun) {
+    throw new Error(
+      "--dry-run and --json cannot be combined; dry-run prints a multi-section preview, " +
+        "while --json emits one release identity object",
+    );
+  }
+}
+
+/** Select only the status that the failed coordinator call persisted. */
+export function selectPersistedShipFailureStatus(
+  status: unknown,
+  authorizationFingerprint: string,
+  errorMessage: string,
+): unknown | null {
+  if (!status || typeof status !== "object" || Array.isArray(status)) return null;
+  const record = status as Record<string, unknown>;
+  return record.authorization_fingerprint === authorizationFingerprint &&
+      record.last_error === errorMessage
+    ? status
+    : null;
+}
+
 /**
  * Build and return the configured Commander program (without parsing).
  * Exported so tests can parse synthetic argv slices and verify CLI behaviour.
@@ -534,6 +614,7 @@ export function maxPositionalsFor(command: string | undefined): number {
     command === "merge" ||
     command === "merge-queue" ||
     command === "train" ||
+    command === "ship" ||
     command === "status" ||
     command === "papercut" ||
     command === "correction"
@@ -564,7 +645,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | factory-gate | factory-pin | engine-promote | intake | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | ship | factory-gate | factory-pin | engine-promote | intake | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -633,7 +714,8 @@ export function buildCmd(): Command {
     // descriptions/visibility, so it never appears anywhere in --help output.
     .addOption(new Option("--run <run-id>", "run-store run id to record an event against, or scope a report to").hideHelp())
     .addOption(new Option("-m, --message <text>", "free-text friction message to record").hideHelp())
-    .option("--for <version>", "factory-gate / factory-pin / engine-promote: target release version X.Y.Z", undefined)
+    .option("--for <version>", "ship / factory-gate / factory-pin / engine-promote: target release version X.Y.Z", undefined)
+    .option("--authorization <path>", "ship: absolute path to the gateway-authenticated authorization JSON")
     .option(
       "--host <name>",
       "engine-promote: skill install host (codex|claude|grok|opencode|all; default codex)",
@@ -691,7 +773,7 @@ export function buildCmd(): Command {
     .option("--concurrency <C>", "queue: maximum simultaneous pipeline runs (default: 1)", Number)
     .option("--max-failure-rate <R>", "queue: halt new launches when failure rate meets this threshold 0.0–1.0 (default: 1.0)", Number)
     .option("--label <L>", "queue: filter eligible issues to those carrying this label (repeatable)", collectRepeatable, [])
-    .option("--milestone <M>", "queue / merge-queue / train / loop: filter issues to this milestone title")
+    .option("--milestone <M>", "ship / queue / merge-queue / train / loop: filter issues to this milestone title")
     .option("--issues <list>", "train: comma- or space-separated issue numbers (e.g. 10,11,12)")
     .option(
       "--merge",
@@ -2465,6 +2547,7 @@ export function renderLoopDriveResult(
   engine: LoopEngine,
   result: Extract<LoopEngineResult, { kind: "drive" }>["result"],
   commandLabel = "pipeline loop",
+  emitMachineOutput = true,
 ): number {
   const outstandingReady = result.stop?.outstanding_ready ?? [];
   if (outstandingReady.length > 0) {
@@ -2491,24 +2574,26 @@ export function renderLoopDriveResult(
     );
   }
 
-  console.log(
-    JSON.stringify({
-      schema_version: "1",
-      engine,
-      run_id: result.runId,
-      cycles: result.cycles,
-      stop: result.stop,
-      hold_outstanding: result.holdOutstanding,
-      held_item_ids: heldItemIds,
-      all_done: result.allDone,
-      resumed: result.resumed,
-      dispatched: result.dispatched,
-      excluded: excludedItemIds.length,
-      excluded_item_ids: excludedItemIds,
-      exclusion_reason: result.exclusionReason,
-      completion: result.completion,
-    }),
-  );
+  if (emitMachineOutput) {
+    console.log(
+      JSON.stringify({
+        schema_version: "1",
+        engine,
+        run_id: result.runId,
+        cycles: result.cycles,
+        stop: result.stop,
+        hold_outstanding: result.holdOutstanding,
+        held_item_ids: heldItemIds,
+        all_done: result.allDone,
+        resumed: result.resumed,
+        dispatched: result.dispatched,
+        excluded: excludedItemIds.length,
+        excluded_item_ids: excludedItemIds,
+        exclusion_reason: result.exclusionReason,
+        completion: result.completion,
+      }),
+    );
+  }
   return result.stop || result.holdOutstanding
     ? 1
     : result.completion === "none_dispatchable"
@@ -2530,6 +2615,14 @@ const defaultSingleIssueCommandDeps: SingleIssueCommandDeps = {
   writeStdoutLine: writeFlushedStdoutLine,
 };
 
+export interface SingleIssueCommandOutput {
+  /**
+   * Emit the early run handoff and terminal drive object to stdout. Nested
+   * machine-readable commands disable this so they retain one JSON document.
+   */
+  emitMachineOutput?: boolean;
+}
+
 /** Canonical one-item autonomous drive. The stage machine still performs every
  * normal transition; this facade supplies the same durable supervisor and
  * recovery controller used by `pipeline loop` without requiring an outer
@@ -2538,6 +2631,7 @@ export async function runSingleIssueCommand(
   rawNumber: string | undefined,
   opts: CliOpts,
   deps: SingleIssueCommandDeps = defaultSingleIssueCommandDeps,
+  output: SingleIssueCommandOutput = {},
 ): Promise<void> {
   const parsed = Number.parseInt(rawNumber ?? "", 10);
   if (!Number.isSafeInteger(parsed) || parsed <= 0 || String(parsed) !== rawNumber) {
@@ -2576,7 +2670,14 @@ export async function runSingleIssueCommand(
     autoSupersedeTerminal: true,
     repoDir: cfg.repo_dir,
     onRunReady: async (ctx) => {
-      await deps.writeStdoutLine(formatLoopRunHandoff({ ...ctx, selector: { type: "work-list", value: [String(issueNumber)] } }));
+      if (output.emitMachineOutput !== false) {
+        await deps.writeStdoutLine(
+          formatLoopRunHandoff({
+            ...ctx,
+            selector: { type: "work-list", value: [String(issueNumber)] },
+          }),
+        );
+      }
       console.error(`pipeline single: run ready ${ctx.runId}; events ${ctx.events}`);
     },
   });
@@ -2590,7 +2691,148 @@ export async function runSingleIssueCommand(
     process.exitCode = 1;
     return;
   }
-  process.exitCode = renderLoopDriveResult(engine, engineResult.result, "pipeline single");
+  process.exitCode = renderLoopDriveResult(
+    engine,
+    engineResult.result,
+    "pipeline single",
+    output.emitMachineOutput !== false,
+  );
+}
+
+export interface TrainCommandDeps {
+  makeTrainDeps(input: {
+    repoDir: string;
+    repo: string;
+    baseBranch: string;
+  }): TrainDeps;
+  runSingleIssue: typeof runSingleIssueCommand;
+}
+
+const defaultTrainCommandDeps: TrainCommandDeps = {
+  makeTrainDeps(input) {
+    return realTrainDeps({
+      ...input,
+      advanceIssue: async () => {
+        throw new Error("advanceIssue must be overridden");
+      },
+    });
+  },
+  runSingleIssue: runSingleIssueCommand,
+};
+
+export async function advanceIssueThroughSingle(
+  issue: number,
+  opts: CliOpts,
+  getIssue: TrainDeps["getIssue"],
+  runSingleIssue: typeof runSingleIssueCommand = runSingleIssueCommand,
+): Promise<AdvanceOutcome> {
+  const previousExit = process.exitCode;
+  process.exitCode = 0;
+  let exit = 0;
+  try {
+    await runSingleIssue(String(issue), opts, undefined, {
+      // The owning command emits its own single JSON document.
+      emitMachineOutput: !opts.json,
+    });
+    exit = process.exitCode ?? 0;
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  } finally {
+    process.exitCode = previousExit ?? 0;
+  }
+
+  const snap = await getIssue(issue);
+  const stageLabel = snap.labels.find((label) => label.startsWith("pipeline:"));
+  const stage = stageLabel?.slice("pipeline:".length) ?? null;
+  if (stage === "ready-to-deploy") {
+    return { ok: true, terminal: "ready-to-deploy", labels: snap.labels };
+  }
+  if (stage === "needs-human") {
+    return { ok: true, terminal: "needs-human", labels: snap.labels };
+  }
+  if (snap.labels.includes("blocked")) {
+    return { ok: true, terminal: "blocked", labels: snap.labels };
+  }
+  if (exit !== 0) {
+    return { ok: false, error: `pipeline single exited with code ${exit}` };
+  }
+  return { ok: true, terminal: "other", labels: snap.labels };
+}
+
+/** Execute parsed `pipeline train` options through the ordered train engine.
+ * The dependency seam keeps the CLI output contract testable without GitHub. */
+export async function runTrainCommand(
+  opts: CliOpts,
+  trainCfg: PipelineConfig,
+  deps: TrainCommandDeps = defaultTrainCommandDeps,
+): Promise<number> {
+  let issueNumbers: number[];
+  try {
+    issueNumbers = parseIssueList(opts.issues);
+  } catch (err) {
+    console.error(`pipeline train: ${(err as Error).message}`);
+    return 2;
+  }
+  const milestone = opts.milestone ? String(opts.milestone).trim() : "";
+  if (issueNumbers.length === 0 && !milestone) {
+    console.error(
+      "pipeline train: --issues <n,n> and/or --milestone <title> is required.\n" +
+        "  Usage: pipeline train --issues 10,11,12 [--merge] [--json]\n" +
+        "         pipeline train --milestone v1.34.0 [--merge] [--json]\n" +
+        "  Without --merge: advances each issue to ready-to-deploy only.\n" +
+        "  With --merge: merges each ready-to-deploy PR via the existing merge surface,\n" +
+        "  proves squash-aware base containment, then starts the next issue.\n" +
+        "  Never called from the advance loop. No auto_merge config key.",
+    );
+    return 2;
+  }
+  if (opts.dryRun) {
+    console.error("pipeline train: --dry-run is not supported for train; omit it.");
+    return 2;
+  }
+
+  const baseDeps = deps.makeTrainDeps({
+    repoDir: trainCfg.repo_dir,
+    repo: trainCfg.repo,
+    baseBranch: trainCfg.base_branch,
+  });
+  const trainResult = await runTrain(
+    {
+      issues: issueNumbers.length > 0 ? issueNumbers : undefined,
+      milestone: milestone || undefined,
+      merge: !!opts.merge,
+      baseBranch: trainCfg.base_branch,
+      repoDir: trainCfg.repo_dir,
+      repo: trainCfg.repo,
+    },
+    {
+      ...baseDeps,
+      advanceIssue: (issue) =>
+        advanceIssueThroughSingle(issue, opts, baseDeps.getIssue, deps.runSingleIssue),
+    },
+  );
+
+  if (opts.json) {
+    console.log(JSON.stringify(trainResult.status, null, 2));
+  } else {
+    const status = trainResult.status;
+    console.log(
+      `[train] complete=${status.complete} merge_mode=${status.merge_mode} ` +
+        `items=${status.items.length}/${status.ordered_issues.length}` +
+        (status.blocker ? ` blocker=${JSON.stringify(status.blocker)}` : ""),
+    );
+    for (const item of status.items) {
+      console.log(
+        `  #${item.issue}` +
+          (item.pr != null ? ` PR #${item.pr}` : "") +
+          ` ${item.terminal}` +
+          (item.integrated ? " integrated" : "") +
+          (item.merge_result_oid ? ` merge=${item.merge_result_oid.slice(0, 12)}` : "") +
+          (item.error ? ` err=${item.error}` : ""),
+      );
+    }
+  }
+  return trainResult.exitCode;
 }
 
 /** Renders a machine-readable `precondition:required=<stage>,observed=<stage>` exclusion reason
@@ -2806,6 +3048,8 @@ async function main(): Promise<void> {
   const isDoctorCommand = numArg === "doctor";
   // `pipeline release <version>` prepares a release PR — no issue number required.
   const isReleaseCommand = numArg === "release";
+  // `pipeline ship` owns one exact, event-authorized release shipment.
+  const isShipCommand = numArg === "ship";
   // `pipeline intake [--description "<text>"] [--release vX.Y.Z]` — no issue number.
   const isIntakeCommand = numArg === "intake";
   // `pipeline sweep [--apply] [--repo <owner/repo>]` — batch backlog re-spec + roadmap reconciliation.
@@ -3013,7 +3257,7 @@ async function main(): Promise<void> {
     if (!subEarly) {
       console.error(
         "pipeline release: a version argument or 'finish <pr>' is required.\n" +
-          "  Usage: pipeline release <X.Y.Z | major | minor | patch> [--theme \"...\"] [--dry-run] [--no-edit]\n" +
+          "  Usage: pipeline release <X.Y.Z | major | minor | patch> [--theme \"...\"] [--dry-run|--json] [--no-edit]\n" +
           "         pipeline release finish <pr> [--json]\n" +
           "         [--allow-open-soak-defects \"<reason>\"]\n" +
           "  Prepare stops at an open release PR (never tags/merges).\n" +
@@ -3141,6 +3385,148 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  // Pipeline-owned shipment coordinator. JSON stdout is reserved for one
+  // terminal status object; all stage progress goes to stderr through the
+  // production adapter.
+  if (isShipCommand) {
+    let shipInput: ShipCliInput;
+    try {
+      shipInput = normalizeShipCliInput(cmd.args, opts);
+    } catch (err) {
+      console.error(`pipeline ship: ${(err as Error).message}`);
+      process.exit(2);
+    }
+
+    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(startDir);
+    if (!repoDir) {
+      console.error(
+        `pipeline ship: no git repo found at or above ${startDir}. Run from inside a checkout, or pass --repo-path.`,
+      );
+      process.exit(2);
+    }
+    // Repository identity is part of the stable status key. Use the normal
+    // config resolver so the key binds the same explicit/gh-resolved owner/name
+    // as every GitHub-mutating stage. Status remains read-only, but requires
+    // repository access instead of guessing identity from a remote URL.
+    let shipCfg: PipelineConfig;
+    try {
+      shipCfg = resolveConfig({
+        repoPath: repoDir,
+        baseBranch: opts.base,
+        profile: opts.profile,
+      });
+    } catch (err) {
+      console.error(`pipeline ship: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    const coordinates = {
+      repository: shipCfg.repo,
+      base_branch: shipCfg.base_branch,
+      milestone: shipInput.milestone,
+      version: shipInput.version,
+    };
+
+    try {
+      const {
+        defaultShipStateStore,
+        runShipCoordinator,
+        shipKey,
+        validateBuzzShipAuthorization,
+      } = await import("./stages/ship.ts");
+
+      if (shipInput.mode === "status") {
+        const key = shipKey(coordinates);
+        const status = await defaultShipStateStore().read(key);
+        if (!status || status.ship_key !== key) {
+          throw new Error(
+            `no status exists for ${coordinates.repository} ${coordinates.base_branch} ` +
+              `${coordinates.milestone} v${coordinates.version}`,
+          );
+        }
+        console.log(JSON.stringify(status, null, 2));
+        return;
+      }
+
+      const authorizationText = await fsPromises.readFile(shipInput.authorizationPath!, "utf8");
+      let authorization: unknown;
+      try {
+        authorization = JSON.parse(authorizationText);
+      } catch (err) {
+        throw new Error(`authorization file is not valid JSON: ${(err as Error).message}`);
+      }
+      if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) {
+        throw new Error("authorization file must contain one JSON object");
+      }
+      const authRecord = authorization as Record<string, unknown>;
+      const intent = {
+        ...coordinates,
+        event_id: String(authRecord.event_id ?? ""),
+        sender_id: String(authRecord.sender_id ?? ""),
+        channel_id: String(authRecord.channel_id ?? ""),
+        thread_id: String(authRecord.thread_id ?? ""),
+      };
+      const authorizationPublicKeyPath =
+        String(process.env.PIPELINE_SHIP_AUTH_PUBLIC_KEY_FILE ?? DEFAULT_SHIP_AUTH_PUBLIC_KEY_FILE).trim();
+      const publicKeyMetadata = await fsPromises.lstat(authorizationPublicKeyPath);
+      validateShipAuthorizationPublicKeyFile(authorizationPublicKeyPath, publicKeyMetadata);
+      const authorizationPublicKey = await fsPromises.readFile(authorizationPublicKeyPath, "utf8");
+      // Validate before admission so syntax, expiry, and identity failures do
+      // not cause an old coordinate status to be emitted as this request's
+      // failure result. The coordinator repeats this check at its trust edge.
+      const validatedAuthorization = validateBuzzShipAuthorization(
+        authorization,
+        intent,
+        new Date(),
+        authorizationPublicKey,
+      );
+      const { realShipCoordinatorDeps } = await import("./stages/ship-adapter.ts");
+      const shipState = defaultShipStateStore();
+      const shipTrainReadDeps = realTrainDeps({
+        repoDir: shipCfg.repo_dir,
+        repo: shipCfg.repo,
+        baseBranch: shipCfg.base_branch,
+        advanceIssue: async () => {
+          throw new Error("ship advanceIssue must be supplied by the CLI adapter");
+        },
+      });
+      const coordinatorDeps = realShipCoordinatorDeps({
+        repoDir: shipCfg.repo_dir,
+        repo: shipCfg.repo,
+        baseBranch: shipCfg.base_branch,
+        profile: opts.profile,
+        progress: (message: string) => process.stderr.write(`${message}\n`),
+        authorizationPublicKey,
+        advanceIssue: (issue: number) =>
+          advanceIssueThroughSingle(issue, opts, shipTrainReadDeps.getIssue),
+        state: shipState,
+      });
+      try {
+        const status = await runShipCoordinator(intent, authorization, coordinatorDeps);
+        console.log(JSON.stringify(status, null, 2));
+      } catch (err) {
+        // A lifecycle-stage failure is part of the machine contract when the
+        // coordinator persisted it. Print exactly that status once. Failures
+        // before admission remain stderr-only.
+        const failedStatus = await shipState.read(shipKey(coordinates));
+        const message = err instanceof Error ? err.message : String(err);
+        const persistedFailure = selectPersistedShipFailureStatus(
+          failedStatus,
+          validatedAuthorization.fingerprint,
+          message,
+        );
+        if (persistedFailure) {
+          console.log(JSON.stringify(persistedFailure, null, 2));
+        }
+        throw err;
+      }
+    } catch (err) {
+      console.error(`pipeline ship: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Early release dispatch — prepare (version) or finish (merge release PR).
   if (isReleaseCommand) {
     const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
@@ -3179,7 +3565,20 @@ async function main(): Promise<void> {
 
     const versionArg = cmd.args[1] as string;
     try {
-      await runRelease(
+      validateReleaseMachineOutputMode(opts);
+    } catch (err) {
+      console.error(`pipeline release: ${(err as Error).message}`);
+      process.exit(2);
+    }
+    try {
+      const releaseDeps = realReleaseDeps(localCfg.repo_dir);
+      if (opts.json) {
+        // Keep stdout as a one-document machine contract. Release preparation
+        // progress remains visible on stderr.
+        releaseDeps.stdout = (message) => console.error(message);
+        releaseDeps.stderr = (message) => console.error(message);
+      }
+      const result = await runRelease(
         versionArg,
         {
           dryRun: opts.dryRun,
@@ -3191,7 +3590,12 @@ async function main(): Promise<void> {
               : undefined,
         },
         localCfg,
+        releaseDeps,
       );
+      if (opts.json) {
+        if (!result) throw new Error("release prepare returned no identity");
+        console.log(JSON.stringify(result, null, 2));
+      }
     } catch (err) {
       console.error(`pipeline release: ${(err as Error).message}`);
       process.exit(1);
@@ -4369,100 +4773,9 @@ async function main(): Promise<void> {
       console.error(`pipeline train: config error: ${(err as Error).message}`);
       process.exit(1);
     }
-    let issueNumbers: number[] = [];
     try {
-      issueNumbers = parseIssueList(opts.issues);
-    } catch (err) {
-      console.error(`pipeline train: ${(err as Error).message}`);
-      process.exit(2);
-    }
-    const milestone = opts.milestone ? String(opts.milestone).trim() : "";
-    if (issueNumbers.length === 0 && !milestone) {
-      console.error(
-        "pipeline train: --issues <n,n> and/or --milestone <title> is required.\n" +
-          "  Usage: pipeline train --issues 10,11,12 [--merge] [--json]\n" +
-          "         pipeline train --milestone v1.34.0 [--merge] [--json]\n" +
-          "  Without --merge: advances each issue to ready-to-deploy only.\n" +
-          "  With --merge: merges each ready-to-deploy PR via the existing merge surface,\n" +
-          "  proves squash-aware base containment, then starts the next issue.\n" +
-          "  Never called from the advance loop. No auto_merge config key.",
-      );
-      process.exit(2);
-    }
-    if (opts.dryRun) {
-      console.error("pipeline train: --dry-run is not supported for train; omit it.");
-      process.exit(2);
-    }
-    try {
-      const baseDeps = realTrainDeps({
-        repoDir: trainCfg.repo_dir,
-        repo: trainCfg.repo,
-        baseBranch: trainCfg.base_branch,
-        advanceIssue: async () => {
-          throw new Error("advanceIssue must be overridden");
-        },
-      });
-      const trainResult = await runTrain(
-        {
-          issues: issueNumbers.length > 0 ? issueNumbers : undefined,
-          milestone: milestone || undefined,
-          merge: !!opts.merge,
-          baseBranch: trainCfg.base_branch,
-          repoDir: trainCfg.repo_dir,
-          repo: trainCfg.repo,
-        },
-        {
-          ...baseDeps,
-          async advanceIssue(issue): Promise<AdvanceOutcome> {
-            const prevExit = process.exitCode;
-            process.exitCode = 0;
-            try {
-              await runSingleIssueCommand(String(issue), opts);
-            } catch (err) {
-              return { ok: false, error: (err as Error).message };
-            }
-            const exit = process.exitCode ?? 0;
-            process.exitCode = prevExit ?? 0;
-            const snap = await baseDeps.getIssue(issue);
-            const stageLabel = snap.labels.find((l) => l.startsWith("pipeline:"));
-            const stage = stageLabel?.slice("pipeline:".length) ?? null;
-            if (stage === "ready-to-deploy") {
-              return { ok: true, terminal: "ready-to-deploy", labels: snap.labels };
-            }
-            if (stage === "needs-human") {
-              return { ok: true, terminal: "needs-human", labels: snap.labels };
-            }
-            if (snap.labels.includes("blocked")) {
-              return { ok: true, terminal: "blocked", labels: snap.labels };
-            }
-            if (exit !== 0) {
-              return { ok: false, error: `pipeline single exited with code ${exit}` };
-            }
-            return { ok: true, terminal: "other", labels: snap.labels };
-          },
-        },
-      );
-      if (opts.json) {
-        console.log(JSON.stringify(trainResult.status, null, 2));
-      } else {
-        const s = trainResult.status;
-        console.log(
-          `[train] complete=${s.complete} merge_mode=${s.merge_mode} ` +
-            `items=${s.items.length}/${s.ordered_issues.length}` +
-            (s.blocker ? ` blocker=${JSON.stringify(s.blocker)}` : ""),
-        );
-        for (const item of s.items) {
-          console.log(
-            `  #${item.issue}` +
-              (item.pr != null ? ` PR #${item.pr}` : "") +
-              ` ${item.terminal}` +
-              (item.integrated ? " integrated" : "") +
-              (item.merge_result_oid ? ` merge=${item.merge_result_oid.slice(0, 12)}` : "") +
-              (item.error ? ` err=${item.error}` : ""),
-          );
-        }
-      }
-      if (trainResult.exitCode !== 0) process.exit(trainResult.exitCode);
+      const exitCode = await runTrainCommand(opts, trainCfg);
+      if (exitCode !== 0) process.exit(exitCode);
     } catch (err) {
       console.error(`pipeline train: ${(err as Error).message}`);
       process.exit(1);
@@ -4476,7 +4789,7 @@ async function main(): Promise<void> {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "single", "release", "intake", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "summary", "improve", "scoreboard", "factory-gate", "factory-pin", "engine-promote", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "ship", "summary", "improve", "scoreboard", "factory-gate", "factory-pin", "engine-promote", "queue", "backfill", "evals",
       "loop",
     ];
     if (!recognized.includes(numArg)) {

@@ -45,10 +45,13 @@ test("supervisor examples exist and stay thin", () => {
   for (const rel of [
     "examples/supervisor/README.md",
     "examples/supervisor/shell/run-intent.sh",
+    "examples/supervisor/shell/ship-stage-watch.sh",
+    "examples/supervisor/shell/ship-milestone.sh",
     "examples/supervisor/hermes/SKILL.md",
     "examples/supervisor/openclaw/SKILL.md",
     "examples/supervisor/slack/README.md",
     "docs/runbooks/hermes-supervisor-deployment.md",
+    "docs/runbooks/ship-milestone.md",
   ]) {
     assert.ok(fs.existsSync(path.join(repoRoot, rel)), `missing ${rel}`);
   }
@@ -58,4 +61,15 @@ test("supervisor examples exist and stay thin", () => {
   assert.doesNotMatch(shell, /ops\/hermes-factory|grant_fingerprint|auto_merge/);
   const hermes = read("examples/supervisor/hermes/SKILL.md");
   assert.match(hermes, /does not implement a second state machine|Not the removed/i);
+  const stageWatch = read("examples/supervisor/shell/ship-stage-watch.sh");
+  assert.match(stageWatch, /--events-file/);
+  assert.match(stageWatch, /PIPELINE_MATERIAL_FILTER/);
+  assert.doesNotMatch(stageWatch, /AGENT_PIPELINE_LOOP_ROOT|\.local\/state\/agent-pipeline|ps -eo|ls -t/);
+  const ship = read("examples/supervisor/shell/ship-milestone.sh");
+  assert.match(ship, /pipeline.*ship|ship_args/s);
+  assert.match(ship, /systemd-run/);
+  assert.doesNotMatch(ship, /release finish|engine-promote|gh release view/);
+  const shipDoc = read("docs/runbooks/ship-milestone.md");
+  assert.match(shipDoc, /exact.*events\.jsonl|events\.jsonl.*exact/i);
+  assert.match(shipDoc, /material-filter\.mjs/);
 });

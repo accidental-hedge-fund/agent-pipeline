@@ -38,6 +38,7 @@ function driveResult(runId = "loop-single") {
 test("single issue command routes the resolved issue through the durable one-item controller", async () => {
   let input: RunLoopEngineInput | undefined;
   const handoffs: string[] = [];
+  const output: string[] = [];
   const deps: SingleIssueCommandDeps = {
     resolveConfig: () => cfg(),
     resolveIssueNumber: async (_cfg, number) => {
@@ -63,7 +64,7 @@ test("single issue command routes the resolved issue through the durable one-ite
   const originalLog = console.log;
   const originalError = console.error;
   const priorExitCode = process.exitCode;
-  console.log = () => {};
+  console.log = (line) => output.push(String(line));
   console.error = () => {};
   process.exitCode = undefined;
   try {
@@ -84,6 +85,52 @@ test("single issue command routes the resolved issue through the durable one-ite
       selector: { type: "work-list", value: ["99"] },
       resumed: false,
     });
+    assert.equal(output.length, 1);
+    assert.equal(JSON.parse(output[0]!).run_id, "loop-single");
+    assert.equal(process.exitCode, 0);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    process.exitCode = priorExitCode;
+  }
+});
+
+test("nested single issue command can suppress machine stdout for train --json", async () => {
+  const handoffs: string[] = [];
+  const output: string[] = [];
+  let readyCallbackRan = false;
+  const deps: SingleIssueCommandDeps = {
+    resolveConfig: () => cfg(),
+    resolveIssueNumber: async () => 42,
+    runLoopEngine: async (received) => {
+      await received.onRunReady?.({
+        runId: "loop-nested",
+        runDir: "/state/loop-nested",
+        events: "/state/loop-nested/events.jsonl",
+        engine: "codex",
+        selector: received.selector ?? null,
+        resumed: false,
+      });
+      readyCallbackRan = true;
+      return driveResult("loop-nested");
+    },
+    writeStdoutLine: (line) => {
+      handoffs.push(line);
+    },
+  };
+  const originalLog = console.log;
+  const originalError = console.error;
+  const priorExitCode = process.exitCode;
+  console.log = (line) => output.push(String(line));
+  console.error = () => {};
+  process.exitCode = undefined;
+  try {
+    await runSingleIssueCommand("42", { profile: "codex" }, deps, {
+      emitMachineOutput: false,
+    });
+    assert.equal(readyCallbackRan, true, "suppression must not skip the durable-run handoff callback");
+    assert.deepEqual(handoffs, [], "nested handoff must not leak to stdout");
+    assert.deepEqual(output, [], "nested terminal result must not leak to stdout");
     assert.equal(process.exitCode, 0);
   } finally {
     console.log = originalLog;

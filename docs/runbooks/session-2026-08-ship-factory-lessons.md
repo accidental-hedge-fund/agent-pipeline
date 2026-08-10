@@ -1,15 +1,54 @@
-# Session notes: v1.33.0 ship, v1.34.0 thrash, supervisor architecture
+# Historical session notes: v1.33.0 ship and v1.34.0 notifier incident
 
 **Date:** 2026-08-09 → 2026-08-10  
 **Hosts:** Grok Build (this session), Hermes/Buzz on `agent-ubuntu-us-den-01`, agent-pipeline repo  
-**Outcome:** Product ship of **v1.33.0** (FRG + release + promote) completed; v1.34.0 first ship attempt failed correctly on milestone hygiene while **stage-watch mis-notified** unrelated FRG history; stage-watch scope fixed (PR #944) and deployed to the agent box.
+**Historical outcome:** Product ship of **v1.33.0** (FRG + release + promote)
+completed; the first v1.34.0 ship attempt failed correctly on milestone hygiene
+while stage-watch mis-notified unrelated FRG history.
 
-This document is a **session postmortem + architecture map**. Normative contracts remain:
+This document preserves the incident record. Its host paths, command sequences, and
+architecture diagrams describe the system **at the time of the incident** and are not
+current operating instructions. PR #946 replaced that architecture with a signed,
+Pipeline-owned ship coordinator after PR #944 fixed the immediate notifier scope bug.
+Normative contracts are:
 
 - [supervisor.md](../supervisor.md) — thin supervisor CLI contract  
 - [ship-milestone.md](./ship-milestone.md) — train → release → promote playbook  
 - [frg-pack-checklist.md](./frg-pack-checklist.md) — Factory Reliability Gate  
 - [hermes-supervisor-deployment.md](./hermes-supervisor-deployment.md) — Hermes/Buzz host  
+
+---
+
+## Current correction after PR #946
+
+The current path deliberately removes the host-side lifecycle described later in this
+postmortem:
+
+```text
+Buzz gateway verifies sender/channel/thread and signs one exact, expiring request
+    → thin ship-milestone adapter submits pipeline ship to bounded user systemd
+        → Pipeline freezes the milestone plan and owns train/reconciliation
+        → candidate-bound FRG validation
+        → typed release prepare + exact release finish
+        → published-release verification
+        → engine-promote exact version
+```
+
+- A root-owned Ed25519 public key is the Pipeline trust root. A document fingerprint
+  proves integrity only; it is not authorization.
+- Pipeline serializes shipments by repository and base branch, persists one coordinate-
+  keyed status record, and rechecks authorization expiry before every mutating phase.
+- Progress follows only the exact `events_file` returned by typed ship status through
+  `material-filter.mjs`. The watcher neither scans global run history nor parses train
+  output to infer scope.
+- The nested engine-promotion installer lock noted below is fixed with a targeted
+  launcher-lock exemption; the broad `--skip-install` workaround is no longer the
+  recommended path.
+- Post-v1.33 FRG evidence still needs producer-native candidate provenance. Ship fails
+  closed at that boundary rather than rebinding provenance-free evidence.
+
+Use the normative runbooks above for commands and deployment. The remaining sections are
+historical evidence explaining why those contracts exist.
 
 ---
 
@@ -42,7 +81,7 @@ product work on milestone (train / loop / single)
 
 ---
 
-## 2. Current architecture (agent-pipeline + supervisor)
+## 2. Architecture at the time of the incident (superseded)
 
 ### 2.1 Layers (inside-out)
 
@@ -117,7 +156,7 @@ product work on milestone (train / loop / single)
 
 `train_status` JSON (`schema_version: 1`, `kind: train_status`) is the machine-readable ship progress contract for outer adapters.
 
-### 2.4 Ship playbook (host)
+### 2.4 Historical host ship playbook (superseded)
 
 Source of truth in-repo: `examples/supervisor/shell/ship-milestone.sh`  
 On agent-box often installed as `pipeline-ship-playbook`.
@@ -150,7 +189,7 @@ $PIPELINE_SUPERVISOR_STATE/ship-v1.34.0/
 4. GitHub release / PRs  
 5. Hermes chat narrative (lowest — session memory goes stale)
 
-### 2.5 Stage-watch (notify path, not work path)
+### 2.5 Historical stage-watch behavior
 
 `ship-stage-watch` **does not advance issues**. It only:
 
@@ -159,7 +198,7 @@ $PIPELINE_SUPERVISOR_STATE/ship-v1.34.0/
 
 **Bug (pre-#944):** milestone mode had no issue filter and a **fresh** `seen-keys` file. On ship start it scanned host-wide loop history and stamped every “new” key with `ship v1.34.0`, including hours-old FRG pack issues (#938/#939).
 
-**Fix (PR #944, deployed to agent-box):**
+**Immediate fix (PR #944, later superseded by exact-run observation in #946):**
 
 1. **`--since` watermark** (default: process start UTC) — events before start are ignored; missing timestamp → fail closed (no notify).  
 2. **Train issue allowlist** — when `train.json` has `ordered_issues` / work-list handoff, only those issues notify.  
@@ -194,7 +233,9 @@ On `agent-ubuntu-us-den-01` during this session:
 | Production pin | `$REPO_DIR/.agent-pipeline/production-engine-pin.json` | Source of truth for “what is promoted” |
 | Node | Prefer `/usr/bin/node` **v24+**; npx under wrong PATH saw Node 22 warnings | engine-promote install |
 
-**engine-promote self-lock:** full `engine-promote` can create a `/tmp/pipeline-starting-*.lock` that the nested `npx … install` then refuses. Worked around with `--skip-install` then install outside the lock, or install after pin. Worth a durable engine fix later.
+**engine-promote self-lock (fixed by #946):** full `engine-promote` could create a
+`/tmp/pipeline-starting-*.lock` that the nested install then refused. The durable fix
+exempts only the invoking launcher's validated reservation lock.
 
 ---
 
@@ -249,7 +290,7 @@ Operator message: `ship milestone v1.34.0`.
 
 ---
 
-## 4. Architecture integration diagram (ship path)
+## 4. Historical integration diagram (superseded)
 
 ```text
                     Buzz: "Ship milestone v1.34.0"
@@ -349,7 +390,7 @@ Operator message: `ship milestone v1.34.0`.
 
 ---
 
-## 6. Current state snapshot (end of session work)
+## 6. Historical state snapshot (end of the incident session)
 
 | Item | State |
 |---|---|
@@ -364,7 +405,9 @@ Operator message: `ship milestone v1.34.0`.
 
 ---
 
-## 7. Recommended next actions
+## 7. Actions recorded at the time (historical)
+
+These items are retained for incident chronology; they are not the current runbook.
 
 1. **Do not re-ship 1.33.0.**  
 2. Before next `Ship milestone v1.34.0`:  

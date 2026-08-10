@@ -69,13 +69,76 @@ test("parseReleasePrTitle accepts release.ts format", () => {
 
 test("finishReleasePr: happy path merges exact head", async () => {
   const deps = makeDeps();
-  const result = await finishReleasePr(99, deps);
+  const result = await finishReleasePr(99, deps, {
+    pr: 99,
+    version: "1.34.0",
+    base: "main",
+    head_oid: "a".repeat(40),
+  });
   assert.equal(result.version, "1.34.0");
   assert.equal(result.alreadyMerged, false);
   assert.equal(deps.merges.length, 1);
   assert.equal(deps.merges[0]!.pr, 99);
   assert.equal(deps.merges[0]!.head, "a".repeat(40));
   assert.equal(result.mergeCommitOid, "b".repeat(40));
+});
+
+for (const mismatch of [
+  {
+    name: "PR",
+    expected: { pr: 100, version: "1.34.0", base: "main", head_oid: "a".repeat(40) },
+    error: /PR mismatch/,
+  },
+  {
+    name: "version",
+    expected: { pr: 99, version: "1.35.0", base: "main", head_oid: "a".repeat(40) },
+    error: /version changed/,
+  },
+  {
+    name: "base",
+    expected: { pr: 99, version: "1.34.0", base: "staging", head_oid: "a".repeat(40) },
+    error: /base changed/,
+  },
+  {
+    name: "head",
+    expected: { pr: 99, version: "1.34.0", base: "main", head_oid: "c".repeat(40) },
+    error: /head changed/,
+  },
+] as const) {
+  test(`finishReleasePr: rejects expected ${mismatch.name} identity drift before merge`, async () => {
+    const deps = makeDeps();
+    await assert.rejects(() => finishReleasePr(99, deps, mismatch.expected), mismatch.error);
+    assert.equal(deps.merges.length, 0);
+  });
+}
+
+test("finishReleasePr: rejects identity drift after checks and before merge", async () => {
+  let views = 0;
+  const deps = makeDeps({
+    async ghPrView() {
+      views++;
+      return {
+        title: "release: 1.34.0 — test",
+        state: "OPEN",
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "main",
+        headRefOid: (views === 1 ? "a" : "b").repeat(40),
+        mergedAt: null,
+        mergeCommit: null,
+      };
+    },
+  });
+  await assert.rejects(
+    () => finishReleasePr(99, deps, {
+      pr: 99,
+      version: "1.34.0",
+      base: "main",
+      head_oid: "a".repeat(40),
+    }),
+    /head changed/,
+  );
+  assert.equal(deps.merges.length, 0);
 });
 
 test("finishReleasePr: rejects non-release title", async () => {
@@ -140,6 +203,31 @@ test("finishReleasePr: already merged is idempotent", async () => {
   assert.equal(result.mergeCommitOid, "c".repeat(40));
 });
 
+test("finishReleasePr: already-merged success still requires the expected identity", async () => {
+  const deps = makeDeps({
+    async ghPrView() {
+      return {
+        title: "release: 1.34.0 — test",
+        state: "MERGED",
+        baseRefName: "main",
+        headRefOid: "a".repeat(40),
+        mergedAt: "2026-08-09T00:00:00Z",
+        mergeCommit: { oid: "c".repeat(40) },
+      };
+    },
+  });
+  await assert.rejects(
+    () => finishReleasePr(5, deps, {
+      pr: 5,
+      version: "1.34.0",
+      base: "main",
+      head_oid: "d".repeat(40),
+    }),
+    /head changed/,
+  );
+  assert.equal(deps.merges.length, 0);
+});
+
 test("release finish isolation: advance stages do not import release-finish", () => {
   const stagesDir = path.join(__dirname, "..", "scripts", "stages");
   const exempt = new Set([
@@ -150,6 +238,8 @@ test("release finish isolation: advance stages do not import release-finish", ()
     "merge_queue.ts",
     "merge-queue-release-when-complete.ts",
     "merge_queue_hold.ts",
+    // Operator-authorized ship composition; never imported by advance dispatch.
+    "ship-adapter.ts",
     "train.ts",
   ]);
   for (const f of fs.readdirSync(stagesDir).filter((x) => x.endsWith(".ts"))) {
