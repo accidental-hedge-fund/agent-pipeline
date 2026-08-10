@@ -3,7 +3,8 @@
 // The factory maintains a machine-readable pin for the last FRG-passed release
 // that has been promoted into production dogfood. Ordinary production runs
 // execute that pin (track `pinned`); FRG Layer B / eval soaks use track
-// `candidate`. Promote requires FRG pass evidence; never merges or tags.
+// `candidate`. Promote defaults to requiring FRG pass evidence; thin ship may
+// set allowWithoutFrg after a published GitHub Release. Never merges or tags.
 //
 // The live pin lives on the factory control checkout
 // (`.agent-pipeline/production-engine-pin.json`), not inside the frozen skill
@@ -1207,6 +1208,37 @@ function buildPinFromFrgPass(opts: {
   return pin;
 }
 
+/** Thin-ship pin when FRG is advisory (no latest.json pass required). */
+function buildPinWithoutFrg(opts: {
+  version: string;
+  gitSha?: string | null;
+  gitShaSource?: GitShaSource | null;
+  previous?: ProductionEnginePinPrevious | null;
+  now: () => Date;
+}): ProductionEnginePin {
+  const version = normalizeFrgVersion(opts.version);
+  const pin: ProductionEnginePin = {
+    schema_version: PRODUCTION_PIN_SCHEMA_VERSION,
+    version,
+    tag: tagForVersion(version),
+    // Stable non-empty marker — schema requires frg_run_id; not a real FRG score.
+    frg_run_id: `no-frg-${version}`,
+    frg_evidence_path: null,
+    promoted_at: opts.now().toISOString().replace(/\.\d{3}Z$/, "Z"),
+  };
+  if (opts.gitSha && opts.gitSha.trim()) {
+    pin.git_sha = opts.gitSha.trim();
+    pin.git_sha_source = opts.gitShaSource ?? "promote-arg";
+  } else {
+    pin.git_sha = null;
+    pin.git_sha_source = "unknown";
+  }
+  if (opts.previous !== undefined) {
+    pin.previous = opts.previous;
+  }
+  return pin;
+}
+
 async function atomicWritePin(
   pinPath: string,
   pin: ProductionEnginePin,
@@ -1283,6 +1315,11 @@ export async function promoteProductionPin(opts: {
   /** Injected clock for promoted_at. */
   now?: () => Date;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Thin ship: promote after a published release without FRG latest.json.
+   * Default false (FRG still required for factory-gate --promote-pin-on-pass).
+   */
+  allowWithoutFrg?: boolean;
 }): Promise<PromotePinResult> {
   const fsDeps = opts.fsDeps ?? defaultProductionPinFsDeps;
   const lookup = opts.lookupFrg ?? lookupFrgPass;
@@ -1293,6 +1330,44 @@ export async function promoteProductionPin(opts: {
     target = normalizeFrgVersion(opts.version);
   } catch (err) {
     return { ok: false, code: "invalid_target", message: (err as Error).message };
+  }
+
+  let pin: ProductionEnginePin;
+  if (opts.allowWithoutFrg) {
+    const pinPathEarly = productionPinPath(opts.repoDir, opts.overridePath, opts.env);
+    let previous: ProductionEnginePinPrevious | null = null;
+    try {
+      const existingText = await fsDeps.readFile(pinPathEarly);
+      try {
+        previous = pinWithoutPrevious(parseProductionEnginePin(existingText));
+      } catch {
+        previous = null;
+      }
+    } catch {
+      previous = null;
+    }
+    pin = buildPinWithoutFrg({
+      version: target,
+      gitSha: opts.gitSha,
+      gitShaSource: opts.gitSha ? "promote-arg" : "unknown",
+      previous,
+      now,
+    });
+    try {
+      await atomicWritePin(pinPathEarly, pin, fsDeps);
+    } catch (err) {
+      return {
+        ok: false,
+        code: "write_error",
+        message: `failed to write production pin: ${(err as Error).message}`,
+      };
+    }
+    return {
+      ok: true,
+      pin,
+      path: pinPathEarly,
+      reinstall_hint: reinstallHint(pin.tag),
+    };
   }
 
   const look = await lookup(opts.repoDir, target);
@@ -1321,7 +1396,7 @@ export async function promoteProductionPin(opts: {
     }
   }
 
-  const pin = buildPinFromFrgPass({
+  pin = buildPinFromFrgPass({
     evidence: look.evidence,
     version: target,
     gitSha: opts.gitSha,

@@ -865,6 +865,31 @@ test("promoteProductionPin: refuses missing FRG — no mutation", async () => {
   assert.equal(files.get(PIN_PATH), before);
 });
 
+test("promoteProductionPin: allowWithoutFrg promotes without FRG evidence", async () => {
+  const existing = validPin({ version: "1.29.1", tag: "v1.29.1" });
+  const { deps, files } = memFs({ [PIN_PATH]: JSON.stringify(existing) });
+  let lookupCalls = 0;
+  const result = await promoteProductionPin({
+    repoDir: REPO,
+    version: "1.34.0",
+    allowWithoutFrg: true,
+    fsDeps: deps,
+    lookupFrg: async () => {
+      lookupCalls += 1;
+      return { kind: "missing", path: "/nope" };
+    },
+  });
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.pin.version, "1.34.0");
+  assert.equal(result.pin.frg_run_id, "no-frg-1.34.0");
+  assert.equal(result.pin.frg_evidence_path, null);
+  assert.equal(lookupCalls, 0, "must not consult FRG when allowWithoutFrg");
+  const written = JSON.parse(files.get(PIN_PATH)!);
+  assert.equal(written.version, "1.34.0");
+  assert.equal(written.previous.version, "1.29.1");
+});
+
 test("promoteProductionPin: refuses pass:false — no mutation", async () => {
   const existing = validPin();
   const before = JSON.stringify(existing);

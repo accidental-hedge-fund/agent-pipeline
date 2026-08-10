@@ -699,6 +699,10 @@ export function buildCmd(): Command {
       "--allow-open-soak-defects <reason>",
       "release: audited override to prepare a release PR despite open candidate-linked engine-class soak defects; reason is required and recorded on the PR body (#755). Silent skip is not available.",
     )
+    .option(
+      "--skip-frg",
+      "release / engine-promote: thin-ship opt-out — do not require Factory Reliability Gate latest.json (FRG remains available via factory-gate)",
+    )
     .option("--description <text>", "intake: short free-text description to spec into a GitHub issue")
     .option("--title <text>", "refine-spec: existing issue title to refine")
     .option("--body <markdown>", "refine-spec: existing issue body to refine")
@@ -3266,7 +3270,7 @@ async function main(): Promise<void> {
     if (!subEarly) {
       console.error(
         "pipeline release: a version argument or 'finish <pr>' is required.\n" +
-          "  Usage: pipeline release <X.Y.Z | major | minor | patch> [--theme \"...\"] [--dry-run|--json] [--no-edit]\n" +
+          "  Usage: pipeline release <X.Y.Z | major | minor | patch> [--theme \"...\"] [--dry-run|--json] [--no-edit] [--skip-frg]\n" +
           "         pipeline release finish <pr> [--json]\n" +
           "         [--allow-open-soak-defects \"<reason>\"]\n" +
           "  Prepare stops at an open release PR (never tags/merges).\n" +
@@ -3597,6 +3601,7 @@ async function main(): Promise<void> {
             typeof opts.allowOpenSoakDefects === "string"
               ? opts.allowOpenSoakDefects
               : undefined,
+          skipFrg: !!opts.skipFrg,
         },
         localCfg,
         releaseDeps,
@@ -4215,6 +4220,7 @@ async function main(): Promise<void> {
           host: hostRaw as "codex" | "claude" | "grok" | "opencode" | "all",
           dryRun: !!opts.dryRun,
           skipInstall: !!opts.skipInstall,
+          allowWithoutFrg: !!opts.skipFrg,
           gitSha: opts.gitSha ?? null,
           pinPath: process.env.AGENT_PIPELINE_PRODUCTION_PIN ?? null,
         },
