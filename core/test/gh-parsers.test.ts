@@ -4,7 +4,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   addIssueComment,
+  buildBlockedComment,
+  buildTransitionComment,
   createIssue,
+  desiredPipelineLabels,
   extractHumanPlanComments,
   getHarnessLabel,
   getIssueLabelEvents,
@@ -29,6 +32,7 @@ import {
   type GhApiRunner,
   type PrCandidate,
 } from "../scripts/gh.ts";
+import { BUILTIN_ADAPTER_NAMES } from "../scripts/harness-adapters/registry.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import {
   formatReviewComment,
@@ -60,11 +64,83 @@ test("isBlocked: detects blocked label", () => {
   assert.equal(isBlocked(["pipeline:ready"]), false);
 });
 
-test("getHarnessLabel: parses harness:claude / harness:codex", () => {
+test("getHarnessLabel: parses any non-empty harness: suffix (#954)", () => {
   assert.equal(getHarnessLabel(["harness:claude"]), "claude");
   assert.equal(getHarnessLabel(["harness:codex"]), "codex");
-  assert.equal(getHarnessLabel(["harness:other"]), null);
+  assert.equal(getHarnessLabel(["harness:grok"]), "grok");
+  assert.equal(getHarnessLabel(["harness:opencode"]), "opencode");
+  assert.equal(getHarnessLabel(["harness:pi"]), "pi");
+  assert.equal(getHarnessLabel(["harness:other"]), "other");
+  assert.equal(getHarnessLabel(["harness:"]), null, "empty suffix is absent");
   assert.equal(getHarnessLabel(["pipeline:ready"]), null);
+  assert.equal(getHarnessLabel([]), null);
+});
+
+test("desiredPipelineLabels: includes harness labels for every built-in adapter (#954)", () => {
+  const names = new Set(desiredPipelineLabels().map((l) => l.name));
+  for (const adapter of BUILTIN_ADAPTER_NAMES) {
+    assert.ok(names.has(`harness:${adapter}`), `missing harness:${adapter}`);
+  }
+  assert.ok(names.has("harness:claude"));
+  assert.ok(names.has("harness:codex"));
+  assert.ok(names.has("harness:grok"));
+  assert.ok(names.has("harness:opencode"));
+  assert.ok(names.has("harness:pi"));
+  assert.ok(names.has("blocked"));
+});
+
+test("buildTransitionComment: shows parsed harness and config marker_footer (#954)", () => {
+  const codexFooter = "*Automated by Codex Pipeline Skill*";
+  const body = buildTransitionComment({
+    fromStage: "planning",
+    toStage: "implementing",
+    harness: getHarnessLabel(["harness:grok"]) ?? "unassigned",
+    ts: "2026-08-10T00:00:00Z",
+    summary: "Planning started by grok.",
+    runId: "954/2026-08-10T00:00:00Z",
+    markerFooter: codexFooter,
+  });
+  assert.match(body, /\*\*Harness\*\*: grok/);
+  assert.ok(!body.includes("**Harness**: unassigned"), "stamped harness:grok must not render unassigned");
+  assert.ok(body.includes(codexFooter), "transition body must use configured marker_footer");
+  assert.ok(
+    !body.includes("*Automated by Claude Code Pipeline Skill*"),
+    "configured non-Claude footer must not fall back to Claude hardcode",
+  );
+  assert.match(body, /---\n\*Automated by Codex Pipeline Skill\*/);
+});
+
+test("buildTransitionComment: falls back to unassigned when no harness label (#954)", () => {
+  const body = buildTransitionComment({
+    fromStage: "ready",
+    toStage: "planning",
+    harness: getHarnessLabel(["pipeline:ready"]) ?? "unassigned",
+    ts: "2026-08-10T00:00:00Z",
+    summary: "",
+    runId: "run-1",
+    markerFooter: "*Custom Footer*",
+  });
+  assert.match(body, /\*\*Harness\*\*: unassigned/);
+  assert.ok(body.includes("*Custom Footer*"));
+});
+
+test("buildBlockedComment: uses config marker_footer (#954)", () => {
+  const custom = "*Automated by Codex Pipeline Skill*";
+  const body = buildBlockedComment({
+    issueNumber: 954,
+    stageStr: "planning",
+    harness: "grok",
+    ts: "2026-08-10T00:00:00Z",
+    reason: "capacity",
+    kind: "worktree-capacity",
+    markerFooter: custom,
+  });
+  assert.ok(body.includes(custom));
+  assert.ok(
+    !body.includes("*Automated by Claude Code Pipeline Skill*"),
+    "blocked comment must not append Claude-only hardcode when config footer is set",
+  );
+  assert.match(body, /\*\*Harness\*\*: grok/);
 });
 
 test("parseChecksAggregate: all pass + skipping → passed", () => {

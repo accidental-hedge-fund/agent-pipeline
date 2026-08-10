@@ -79,11 +79,15 @@ When the file `/tmp/pipeline-<domain>.disabled` exists, the pipeline SHALL exit 
 - **THEN** the pipeline SHALL exit without dispatching any stage
 
 ### Requirement: Pipeline labels are bootstrapped idempotently
-`ensurePipelineLabels` SHALL idempotently create the labels the state machine relies on: `blocked`, the `harness:*` labels, and one `pipeline:<stage>` label per entry in `STAGES`. Re-running SHALL create no duplicates.
+`ensurePipelineLabels` SHALL idempotently create the labels the state machine relies on: `blocked`, one `harness:<name>` label for every built-in harness-adapter name shipped with the engine (at least `claude`, `codex`, `grok`, `opencode`, and `pi`), and one `pipeline:<stage>` label per entry in `STAGES`. Re-running SHALL create no duplicates.
 
 #### Scenario: labels ensured
 - **WHEN** `ensurePipelineLabels` runs against a repo missing some pipeline labels
 - **THEN** the missing labels SHALL be created and already-present labels SHALL be left unchanged
+
+#### Scenario: built-in harness labels are included
+- **WHEN** `ensurePipelineLabels` runs against a repo missing `harness:grok`, `harness:opencode`, or `harness:pi`
+- **THEN** each missing built-in harness label SHALL be created
 
 ### Requirement: Create-time reclaim SHALL share operator remove safety
 Before `createWorktree` destroys any same-issue managed worktree (retry, title/slug change, multi-stale accumulation) or clears a colliding path at the computed target, the pipeline SHALL apply the same safety policy as `removeWorktreeForIssue` / `worktree-per-run-removal` **without force**: (1) when the path is on disk, treat a dirty workdir as blocking; (2) evaluate local-only (unpushed) commits with the same tier results (`true` / `"unverifiable"` / `null` / clean); (3) refuse reclaim on any blocking result and leave the worktree and local branch intact. Reclaim SHALL NOT pass an implicit force flag that discards dirty work or bypasses local-only verification failure. Clean candidates with no local-only commits MAY be removed so create can proceed. Records with `underManagedRoot === false` SHALL continue to be skipped (never force-reclaimed). The safety policy SHALL be single-sourced with operator remove so the two paths cannot silently diverge.
