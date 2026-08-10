@@ -215,6 +215,11 @@ Supervisors MUST surface that stop; they MUST NOT invent FRG pass artifacts.
 
 **Notify policy:** prefer stage-watch over generic heartbeats
 (`SHIP_NOTIFY_HEARTBEAT_S=0`). Filter `#None` / stale precondition noise.
+Stage-watch must scope by **session `--since`** and train **`ordered_issues`**
+so a new ship never rebroadcasts unrelated loop/FRG history under the ship label.
+
+**Session postmortem (v1.33 ship + v1.34 stage-watch thrash + architecture map):**
+[runbooks/session-2026-08-ship-factory-lessons.md](./runbooks/session-2026-08-ship-factory-lessons.md).
 
 ## Versioning
 

@@ -5,7 +5,9 @@ Replace the retired **grant factory** (`hermes-factory.service` +
 the agent-pipeline CLI.
 
 Contract: [supervisor.md](../supervisor.md)  
-Skill template: [examples/supervisor/hermes/SKILL.md](../../examples/supervisor/hermes/SKILL.md)
+Skill template: [examples/supervisor/hermes/SKILL.md](../../examples/supervisor/hermes/SKILL.md)  
+Session lessons (v1.33/v1.34 ship, Buzz thrash, PATH/pin ground truth):
+[session-2026-08-ship-factory-lessons.md](./session-2026-08-ship-factory-lessons.md).
 
 ## What stays vs goes
 
