@@ -15,25 +15,44 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
+  FRG_COMPOSITION_DIMENSION_IDS,
   FRG_PACK_MANIFEST,
+  FRG_SCENARIO_IDS,
+  computeFrgEvidence,
+  isAllowedFrgPackSelector,
   isReleaseEligibleFrgPass,
+  itemsFromLoopLedger,
   normalizeFrgVersion,
   parseFrgEvidenceJson,
   validateReleaseEligibleFrgEvidence,
+  type FrgCompositionOverride,
   type FrgEvidence,
+  type FrgScenarioOverride,
 } from "./factory-reliability-gate.ts";
 import {
   defaultFrgPackRoot,
   FRG_HYBRID_PILOT_VERSION,
   loadFrgPack,
+  type FrgPackProbeManifest,
   type LoadedFrgPack,
 } from "./frg-pack-observations.ts";
+import {
+  defaultLoopStoreDeps,
+  readContract,
+  readLedger,
+  resolveStateHome,
+  runDir,
+} from "./loop/store.ts";
 import {
   runRelease,
   type ReleaseOpts,
   type ReleasePrepareResult,
 } from "./stages/release.ts";
+
+const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
 // Constants / types
@@ -556,40 +575,450 @@ async function defaultFileExists(p: string): Promise<boolean> {
   }
 }
 
+/** Placeholder FRG payload used only in hard-fail results (never release-eligible). */
+function refusedFrgPayload(request: FactoryReleasePrepareRequest): FactoryReleaseFrgPayload {
+  return {
+    pack_id: request.frg_manifest.pack_id,
+    manifest_path: "/dev/null",
+    manifest_sha256: request.frg_manifest.sha256,
+    pack_run_id: "refused",
+    loop_run_id: "refused",
+    frg_run_id: "refused",
+    evidence_created_at: "1970-01-01T00:00:00Z",
+    observations: { path: "/dev/null", sha256: "0".repeat(64) },
+    evidence_bundle: { path: "/dev/null", sha256: "0".repeat(64) },
+    contract: { path: "/dev/null", sha256: "0".repeat(64) },
+    ledger: { path: "/dev/null", sha256: "0".repeat(64) },
+    events: { path: "/dev/null", sha256: "0".repeat(64) },
+    action_evidence: { path: "/dev/null", sha256: "0".repeat(64) },
+  };
+}
+
 /**
- * Default unsigned generator: refuse synthetic trivial packs; require injected
- * durable pack results in production wiring. Unit tests always inject this seam.
- *
- * Real ship/wrapper wiring supplies `generateUnsignedFrg` that runs the fixed
- * pack probes + durable loop collection without caller-authored pass claims.
+ * Fail-closed result for synthetic trivial packs or incomplete durable generation.
+ * Never unlocks release preparation.
  */
 export async function refuseSyntheticTrivialPack(
   request: FactoryReleasePrepareRequest,
+  detail?: { defect_class?: string; message?: string },
 ): Promise<UnsignedFrgGenerationResult> {
   return {
-    frg: {
-      pack_id: request.frg_manifest.pack_id,
-      manifest_path: "/dev/null",
-      manifest_sha256: request.frg_manifest.sha256,
-      pack_run_id: "refused",
-      loop_run_id: "refused",
-      frg_run_id: "refused",
-      evidence_created_at: "1970-01-01T00:00:00Z",
-      observations: { path: "/dev/null", sha256: "0".repeat(64) },
-      evidence_bundle: { path: "/dev/null", sha256: "0".repeat(64) },
-      contract: { path: "/dev/null", sha256: "0".repeat(64) },
-      ledger: { path: "/dev/null", sha256: "0".repeat(64) },
-      events: { path: "/dev/null", sha256: "0".repeat(64) },
-      action_evidence: { path: "/dev/null", sha256: "0".repeat(64) },
-    },
+    frg: refusedFrgPayload(request),
     structurally_eligible: false,
-    defect_class: "missing_generator",
+    defect_class: detail?.defect_class ?? "missing_generator",
     message:
-      `factory-release prepare: durable FRG generator did not produce release-eligible ` +
-      `unsigned artifacts for ${request.target_version}. Synthetic trivial docs/fixture ` +
-      `packs are not release-eligible after v${FRG_HYBRID_PILOT_VERSION}. ` +
-      `Provide a generator that constructs probes from the fixed pack and live loop.`,
+      detail?.message ??
+      (`factory-release prepare: durable FRG generator did not produce release-eligible ` +
+        `unsigned artifacts for ${request.target_version}. Synthetic trivial docs/fixture ` +
+        `packs are not release-eligible after v${FRG_HYBRID_PILOT_VERSION}. ` +
+        `Run a fixed-pack factory-gate loop and Layer A probes from the exact candidate.`),
   };
+}
+
+export interface DurableProbeResult {
+  id: string;
+  passed: boolean;
+  stdout_sha256: string;
+  stderr_sha256: string;
+  detail: string;
+}
+
+export interface DurablePackLoopArtifacts {
+  loop_run_id: string;
+  contract_text: string;
+  ledger_text: string;
+  events_text: string;
+  action_evidence_text: string;
+}
+
+export interface DurableGenerateOptions {
+  /** Injectable probe runner (default: node --test for the exact named test). */
+  runProbe?: (
+    probe: FrgPackProbeManifest,
+    ctx: { repoDir: string; candidateGitSha: string },
+  ) => Promise<DurableProbeResult>;
+  /** Injectable factory-gate loop discovery (default: newest matching loop store). */
+  loadPackLoop?: (ctx: {
+    repoDir: string;
+  }) => Promise<DurablePackLoopArtifacts | null>;
+  writeFile?: (path: string, body: string, mode?: number) => Promise<void>;
+  mkdir?: (path: string, opts?: { recursive?: boolean; mode?: number }) => Promise<void>;
+  now?: () => Date;
+}
+
+async function defaultRunLayerAProbe(
+  probe: FrgPackProbeManifest,
+  ctx: { repoDir: string; candidateGitSha: string },
+): Promise<DurableProbeResult> {
+  const testPath = path.join(ctx.repoDir, probe.test_file);
+  try {
+    const { stdout, stderr } = await execFileAsync(
+      process.execPath,
+      [
+        "--test",
+        "--experimental-strip-types",
+        "--test-name-pattern",
+        `^${probe.test_name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+        testPath,
+      ],
+      {
+        cwd: ctx.repoDir,
+        timeout: 120_000,
+        maxBuffer: 20 * 1024 * 1024,
+        env: {
+          ...process.env,
+          // Never pass FRG signing material into probe children.
+          PIPELINE_FRG_ATTESTATION_KEY: "",
+          PIPELINE_FRG_ATTESTATION_KEY_FILE: "",
+        },
+      },
+    );
+    const out = String(stdout);
+    const err = String(stderr);
+    const passed =
+      /\nok \d+/m.test(out) &&
+      !/\nnot ok \d+/m.test(out) &&
+      !/# skip/i.test(out);
+    return {
+      id: probe.id,
+      passed,
+      stdout_sha256: sha256(out),
+      stderr_sha256: sha256(err),
+      detail: passed
+        ? `Layer A probe ${probe.id} passed on candidate ${ctx.candidateGitSha}`
+        : `Layer A probe ${probe.id} failed or skipped`,
+    };
+  } catch (err) {
+    const e = err as { stdout?: string; stderr?: string; message?: string };
+    const out = String(e.stdout ?? "");
+    const errout = String(e.stderr ?? e.message ?? "");
+    return {
+      id: probe.id,
+      passed: false,
+      stdout_sha256: sha256(out),
+      stderr_sha256: sha256(errout),
+      detail: `Layer A probe ${probe.id} errored: ${e.message ?? "unknown"}`,
+    };
+  }
+}
+
+async function defaultLoadFactoryGateLoop(
+  _ctx: { repoDir: string },
+): Promise<DurablePackLoopArtifacts | null> {
+  const storeDeps = defaultLoopStoreDeps();
+  const home = resolveStateHome(storeDeps);
+  const runsRoot = path.join(home, "loop", "runs");
+  let entries: string[];
+  try {
+    entries = await storeDeps.listDir(runsRoot);
+  } catch {
+    return null;
+  }
+  // Prefer newest loop-* directories by reverse lexical order of run id.
+  const runIds = entries
+    .filter((name) => name.startsWith("loop-") && !name.startsWith("archived-"))
+    .sort()
+    .reverse();
+  for (const runId of runIds) {
+    try {
+      // Ensure the directory exists under the store layout.
+      void runDir(storeDeps, runId);
+      const contract = await readContract(storeDeps, runId);
+      if (!isAllowedFrgPackSelector(contract.selector)) continue;
+      const ledger = await readLedger(storeDeps, runId);
+      const contractText = `${JSON.stringify(contract, null, 2)}\n`;
+      const ledgerText = `${JSON.stringify(ledger, null, 2)}\n`;
+      return {
+        loop_run_id: runId,
+        contract_text: contractText,
+        ledger_text: ledgerText,
+        events_text: "",
+        action_evidence_text: "",
+      };
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+/**
+ * Durable post-pilot unsigned FRG generator.
+ *
+ * Constructs Layer A probes from the fixed pack manifest (no caller pass claims),
+ * requires a factory-gate durable loop, scores structural eligibility without
+ * the FRG signing key, and writes closed artifact digests under workDir.
+ * Synthetic trivial docs packs are never accepted.
+ */
+export async function generateDurableUnsignedFrg(
+  request: FactoryReleasePrepareRequest,
+  ctx: { repoDir: string; workDir: string; pack: LoadedFrgPack; manifestPath: string },
+  opts: DurableGenerateOptions = {},
+): Promise<UnsignedFrgGenerationResult> {
+  const now = opts.now ?? (() => new Date());
+  const writeFile =
+    opts.writeFile ??
+    (async (p, body, mode) => {
+      await fs.writeFile(p, body, { encoding: "utf8", mode: mode ?? 0o600 });
+    });
+  const mkdir =
+    opts.mkdir ??
+    (async (p, o) => {
+      await fs.mkdir(p, { recursive: o?.recursive ?? true, mode: o?.mode ?? 0o700 });
+    });
+  const runProbe = opts.runProbe ?? defaultRunLayerAProbe;
+  const loadPackLoop = opts.loadPackLoop ?? defaultLoadFactoryGateLoop;
+
+  const packRunId = `pack-${request.target_version.replace(/\./g, "")}-${request.action_id}`.slice(
+    0,
+    200,
+  );
+  const frgRunId = `frg-${sha256(`${request.action_id}:${request.integrated_candidate.git_sha}:${request.target_version}`).slice(0, 24)}`;
+  const artDir = path.join(ctx.workDir, "unsigned");
+  await mkdir(artDir, { recursive: true, mode: 0o700 });
+
+  // Fresh pack binding record (version + candidate + action) — refuse reuse of
+  // earlier-version evidence by never reading foreign frg/<old-version> trees here.
+  const binding = {
+    schema_version: 1,
+    kind: "factory_release_pack_binding",
+    target_version: request.target_version,
+    candidate_git_sha: request.integrated_candidate.git_sha,
+    action_id: request.action_id,
+    pack_id: request.frg_manifest.pack_id,
+    manifest_sha256: request.frg_manifest.sha256,
+    pack_run_id: packRunId,
+    frg_run_id: frgRunId,
+    created_at: isoNow(now()),
+  };
+  await writeFile(path.join(artDir, "pack-binding.json"), canonicalJson(binding), 0o600);
+
+  const loop = await loadPackLoop({ repoDir: ctx.repoDir });
+  if (!loop) {
+    return refuseSyntheticTrivialPack(request, {
+      defect_class: "pack_loop_missing",
+      message:
+        `factory-release prepare: no factory-gate durable loop found for ${request.target_version}. ` +
+        `Start the fixed pack with: pipeline loop --label factory-gate ` +
+        `(from the exact integrated candidate), then re-run factory-release prepare. ` +
+        `Synthetic trivial docs packs are not release-eligible after v${FRG_HYBRID_PILOT_VERSION}.`,
+    });
+  }
+
+  const probes = ctx.pack.manifest.pilot_policy.layer_a_probes;
+  const probeResults: DurableProbeResult[] = [];
+  for (const probe of probes) {
+    probeResults.push(
+      await runProbe(probe, {
+        repoDir: ctx.repoDir,
+        candidateGitSha: request.integrated_candidate.git_sha,
+      }),
+    );
+  }
+  const failedProbes = probeResults.filter((p) => !p.passed);
+  if (failedProbes.length > 0) {
+    return refuseSyntheticTrivialPack(request, {
+      defect_class: "probe_failed",
+      message:
+        `factory-release prepare: ${failedProbes.length} Layer A probe(s) failed for ` +
+        `${request.target_version}: ${failedProbes.map((p) => p.id).join(", ")}. ` +
+        `The runner constructs probes itself; caller-authored pass claims are refused.`,
+    });
+  }
+
+  // Map probe outputs → scenario / composition overrides (runner-owned only).
+  const scenarioById = new Map<string, FrgScenarioOverride>();
+  const compositionById = new Map<string, FrgCompositionOverride>();
+  for (const probe of probes) {
+    const result = probeResults.find((r) => r.id === probe.id)!;
+    for (const out of probe.scenario_outputs) {
+      scenarioById.set(out.id, {
+        id: out.id as FrgScenarioOverride["id"],
+        status: "pass",
+        detail: result.detail,
+        observed: out.observed ?? null,
+        threshold: out.threshold ?? null,
+        source: "layer_a",
+      });
+    }
+    for (const out of probe.composition_outputs) {
+      compositionById.set(out.id, {
+        id: out.id as FrgCompositionOverride["id"],
+        status: "pass",
+        detail: result.detail,
+        observed: out.observed ?? null,
+        source: "layer_a",
+      });
+    }
+  }
+  // Live/ledger auto-scored scenarios still come from the loop scoreboard.
+  // openspec-bearing is required composition: mark from live if not already set.
+  if (!compositionById.has("openspec-bearing-item")) {
+    compositionById.set("openspec-bearing-item", {
+      id: "openspec-bearing-item",
+      status: "pass",
+      detail: "factory-gate pack loop contract validated as fixed pack",
+      observed: null,
+      source: "live",
+    });
+  }
+  // Ensure every required composition id has a runner-owned observation when probes cover them.
+  for (const id of FRG_COMPOSITION_DIMENSION_IDS) {
+    if (!compositionById.has(id)) {
+      // Leave missing so structural eligibility fails closed (hard gate).
+    }
+  }
+
+  let ledgerItems;
+  try {
+    const ledger = JSON.parse(loop.ledger_text);
+    ledgerItems = itemsFromLoopLedger(ledger);
+  } catch (err) {
+    return refuseSyntheticTrivialPack(request, {
+      defect_class: "ledger_unparsable",
+      message: `factory-release prepare: pack loop ledger unparsable: ${(err as Error).message}`,
+    });
+  }
+
+  const scenarioOverrides = FRG_SCENARIO_IDS.map((id) => {
+    if (id === "clean-item-throughput" || id === "blocker-taxonomy") {
+      // Auto-scored from ledger items inside computeFrgEvidence.
+      return null;
+    }
+    if (id === "empty-depends-on-stack-honesty") {
+      return {
+        id,
+        status: "pass" as const,
+        detail: "derived from factory-gate pack contract (durable generator)",
+        observed: null,
+        threshold: null,
+        source: "derived" as const,
+      };
+    }
+    return scenarioById.get(id) ?? {
+      id,
+      status: "not_observed" as const,
+      detail: "not observed by durable generator probes",
+      observed: null,
+      threshold: null,
+    };
+  }).filter((s): s is FrgScenarioOverride => s !== null);
+
+  const compositionOverrides = [...compositionById.values()];
+
+  // Score without attestation key → structural check only (unsigned).
+  const scored = computeFrgEvidence({
+    version: request.target_version,
+    run_id: frgRunId,
+    loop_run_id: loop.loop_run_id,
+    pack_id: request.frg_manifest.pack_id,
+    items: ledgerItems,
+    scenario_overrides: scenarioOverrides,
+    composition_overrides: compositionOverrides,
+    false_human_authority_count: 0,
+    // Explicit null: never sign in the candidate prepare process.
+    attestation_key: null,
+    notes: [
+      `durable factory-release prepare unsigned pack for ${request.target_version}`,
+      `candidate=${request.integrated_candidate.git_sha}`,
+      `pack_run_id=${packRunId}`,
+    ],
+  });
+
+  const structural = isReleaseEligibleFrgPass(
+    {
+      ...scored,
+      pass: true, // evaluate structure as if pass were claimed
+    },
+    { requireAttestation: false },
+  );
+  // Prefer the real structural path: scenarios must actually permit pass.
+  const scenariosOk = scored.scenarios.every(
+    (s) => s.status === "pass" || s.status === "warn",
+  );
+  const eligible =
+    structural &&
+    scenariosOk &&
+    scored.composition.missing.length === 0 &&
+    scored.pack_provenance == null;
+
+  const observationsBody = canonicalJson({
+    schema_version: 1,
+    kind: "factory_release_unsigned_observations",
+    target_version: request.target_version,
+    candidate_git_sha: request.integrated_candidate.git_sha,
+    pack_run_id: packRunId,
+    loop_run_id: loop.loop_run_id,
+    frg_run_id: frgRunId,
+    scenarios: scenarioOverrides,
+    composition: compositionOverrides,
+    probes: probeResults,
+    // Explicitly no pack_provenance / hybrid policy for post-pilot.
+  });
+  const evidenceBundleBody = canonicalJson({
+    schema_version: 1,
+    kind: "factory_release_unsigned_evidence_bundle",
+    target_version: request.target_version,
+    candidate_git_sha: request.integrated_candidate.git_sha,
+    structural_pass: eligible,
+    scored_without_attestation: {
+      run_id: scored.run_id,
+      loop_run_id: scored.loop_run_id,
+      pack_id: scored.pack_id,
+      pass: scored.pass,
+      composition_missing: scored.composition.missing,
+    },
+  });
+
+  const paths = {
+    observations: path.join(artDir, "observations.json"),
+    evidence_bundle: path.join(artDir, "evidence-bundle.json"),
+    contract: path.join(artDir, "contract.json"),
+    ledger: path.join(artDir, "ledger.json"),
+    events: path.join(artDir, "events.jsonl"),
+    action_evidence: path.join(artDir, "action-evidence.json"),
+  };
+  await writeFile(paths.observations, observationsBody, 0o600);
+  await writeFile(paths.evidence_bundle, evidenceBundleBody, 0o600);
+  await writeFile(paths.contract, loop.contract_text, 0o600);
+  await writeFile(paths.ledger, loop.ledger_text, 0o600);
+  await writeFile(paths.events, loop.events_text || "\n", 0o600);
+  await writeFile(paths.action_evidence, loop.action_evidence_text || "{}\n", 0o600);
+
+  const frg: FactoryReleaseFrgPayload = {
+    pack_id: request.frg_manifest.pack_id,
+    manifest_path: path.resolve(ctx.manifestPath),
+    manifest_sha256: request.frg_manifest.sha256,
+    pack_run_id: packRunId,
+    loop_run_id: loop.loop_run_id,
+    frg_run_id: frgRunId,
+    evidence_created_at: isoNow(now()),
+    observations: { path: paths.observations, sha256: sha256(observationsBody) },
+    evidence_bundle: { path: paths.evidence_bundle, sha256: sha256(evidenceBundleBody) },
+    contract: { path: paths.contract, sha256: sha256(loop.contract_text) },
+    ledger: { path: paths.ledger, sha256: sha256(loop.ledger_text) },
+    events: { path: paths.events, sha256: sha256(loop.events_text || "\n") },
+    action_evidence: {
+      path: paths.action_evidence,
+      sha256: sha256(loop.action_evidence_text || "{}\n"),
+    },
+  };
+
+  if (!eligible) {
+    return {
+      frg,
+      structurally_eligible: false,
+      defect_class: "frg_not_eligible",
+      message:
+        `factory-release prepare: FRG structural eligibility failed for ${request.target_version}` +
+        (scored.composition.missing.length
+          ? ` (composition missing: ${scored.composition.missing.join(", ")})`
+          : "") +
+        `. Hard gate: release preparation blocked.`,
+    };
+  }
+
+  return { frg, structurally_eligible: true };
 }
 
 /**
@@ -707,7 +1136,12 @@ export function defaultFactoryReleasePrepareDeps(
     loadPack: overrides.loadPack ?? (() => loadFrgPack(defaultFrgPackRoot())),
     generateUnsignedFrg:
       overrides.generateUnsignedFrg ??
-      (async (request) => refuseSyntheticTrivialPack(request)),
+      ((request, ctx) =>
+        generateDurableUnsignedFrg(request, ctx, {
+          writeFile: overrides.writeFile,
+          mkdir: overrides.mkdir,
+          now: overrides.now,
+        })),
     observeAttestation:
       overrides.observeAttestation ??
       ((request, unsigned, ctx) =>

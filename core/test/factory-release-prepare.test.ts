@@ -518,8 +518,16 @@ test("default generateUnsigned refuses synthetic trivial pack as release-eligibl
   assert.equal(outcome.exitCode, 1);
   assert.equal(outcome.result.status, "failed");
   if (outcome.result.status === "failed") {
-    assert.match(outcome.result.message, /Synthetic trivial/);
-    assert.equal(outcome.result.defect_class, "missing_generator");
+    // Default durable generator fails closed without a factory-gate loop;
+    // it never invents a synthetic trivial pack pass.
+    assert.match(outcome.result.message, /factory-gate|Synthetic trivial|not release-eligible/i);
+    assert.ok(
+      ["missing_generator", "pack_loop_missing", "probe_failed", "frg_not_eligible"].includes(
+        outcome.result.defect_class,
+      ),
+      `unexpected defect_class ${outcome.result.defect_class}`,
+    );
+    assert.notEqual(outcome.result.defect_class, "complete");
   }
 });
 
