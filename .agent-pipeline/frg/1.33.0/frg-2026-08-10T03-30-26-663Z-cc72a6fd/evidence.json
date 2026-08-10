@@ -1,0 +1,569 @@
+{
+  "schema_version": 1,
+  "version": "1.33.0",
+  "run_id": "frg-2026-08-10T03-30-26-663Z-cc72a6fd",
+  "pass": false,
+  "scenarios": [
+    {
+      "id": "capacity-blocked-retain",
+      "status": "pass",
+      "detail": "candidate-bound Layer A probes: probe:capacity-blocked-retain",
+      "observed": 2,
+      "threshold": 2,
+      "source": "layer_a",
+      "proof_ids": [
+        "probe:capacity-blocked-retain"
+      ]
+    },
+    {
+      "id": "resume-mid-flight",
+      "status": "pass",
+      "detail": "candidate-bound Layer A probes: probe:restart-hydration",
+      "observed": null,
+      "threshold": null,
+      "source": "layer_a",
+      "proof_ids": [
+        "probe:restart-hydration"
+      ]
+    },
+    {
+      "id": "openspec-multi-change",
+      "status": "pass",
+      "detail": "candidate-bound Layer A probes: probe:openspec-multi-change",
+      "observed": null,
+      "threshold": null,
+      "source": "layer_a",
+      "proof_ids": [
+        "probe:openspec-multi-change"
+      ]
+    },
+    {
+      "id": "implement-lockfile-dirt",
+      "status": "pass",
+      "detail": "candidate-bound Layer A probes: probe:managed-worktree-dirt",
+      "observed": null,
+      "threshold": null,
+      "source": "layer_a",
+      "proof_ids": [
+        "probe:managed-worktree-dirt"
+      ]
+    },
+    {
+      "id": "local-docs-parity",
+      "status": "pass",
+      "detail": "candidate-bound Layer A probes: probe:local-docs-parity",
+      "observed": null,
+      "threshold": null,
+      "source": "layer_a",
+      "proof_ids": [
+        "probe:local-docs-parity"
+      ]
+    },
+    {
+      "id": "clean-item-throughput",
+      "status": "pass",
+      "detail": "2 clean ready items meet K=2",
+      "observed": 2,
+      "threshold": 2,
+      "source": "ledger",
+      "proof_ids": [
+        "ledger:final"
+      ]
+    },
+    {
+      "id": "blocker-taxonomy",
+      "status": "pass",
+      "detail": "engine-class rate 0.0% (0/2) ≤ max 25%",
+      "observed": 0,
+      "threshold": 0.25,
+      "source": "ledger",
+      "proof_ids": [
+        "ledger:final"
+      ]
+    },
+    {
+      "id": "pr-supersession",
+      "status": "pass",
+      "detail": "candidate-bound Layer A probes: probe:pr-supersession",
+      "observed": null,
+      "threshold": null,
+      "source": "layer_a",
+      "proof_ids": [
+        "probe:pr-supersession"
+      ]
+    },
+    {
+      "id": "release-plan-row",
+      "status": "pass",
+      "detail": "candidate-bound Layer A probes: probe:release-plan-row,probe:release-tag-guard",
+      "observed": null,
+      "threshold": null,
+      "source": "layer_a",
+      "proof_ids": [
+        "probe:release-plan-row",
+        "probe:release-tag-guard"
+      ]
+    },
+    {
+      "id": "empty-depends-on-stack-honesty",
+      "status": "warn",
+      "detail": "2 items have empty depends_on while the pack has 2 items — verify OpenSpec changes are not stacked across independent branches (process honesty)",
+      "observed": 2,
+      "threshold": null
+    }
+  ],
+  "scoreboard": {
+    "item_count": 2,
+    "ready_clean_count": 2,
+    "engine_class_count": 0,
+    "product_class_count": 0,
+    "human_authority_count": 0,
+    "engine_class_rate": 0,
+    "per_item": [
+      {
+        "item_id": "938",
+        "state": "ready",
+        "ready_clean": true,
+        "blocker_theme": null,
+        "blocker_class": null
+      },
+      {
+        "item_id": "939",
+        "state": "ready",
+        "ready_clean": true,
+        "blocker_theme": null,
+        "blocker_class": null
+      }
+    ]
+  },
+  "thresholds": {
+    "min_clean_ready_to_deploy": 2,
+    "capacity_stress_n": 2,
+    "max_engine_class_rate": 0.25
+  },
+  "loop_run_id": "loop-e81ac1295a8a4eca",
+  "pack_id": "factory-gate-v1",
+  "created_at": "2026-08-10T03:30:26Z",
+  "notes": [
+    "Projected from durable loop run loop-e81ac1295a8a4eca",
+    "FRG fixed pack validated: pack_id=factory-gate-v1 selector={\"type\":\"label\",\"value\":\"factory-gate\"}",
+    "Scenario pack selection: reliability label/fixture pack (not full product milestone)"
+  ],
+  "composition": {
+    "dimensions": [
+      {
+        "id": "openspec-bearing-item",
+        "status": "pass",
+        "source": "live",
+        "detail": "fresh issue #939 PR #941 contains archived OpenSpec and spec files on head 69da48beddc6658e296916f03c353dfd5815e435",
+        "observed": null,
+        "proof_ids": [
+          "live:openspec-pr:941"
+        ]
+      },
+      {
+        "id": "fix-rereview-cycle",
+        "status": "pass",
+        "source": "layer_a",
+        "detail": "candidate-bound Layer A probes: probe:fix-rereview-cycle",
+        "observed": null,
+        "proof_ids": [
+          "probe:fix-rereview-cycle"
+        ]
+      },
+      {
+        "id": "concurrency-contention",
+        "status": "pass",
+        "source": "layer_a",
+        "detail": "candidate-bound Layer A probes: probe:capacity-blocked-retain",
+        "observed": 2,
+        "proof_ids": [
+          "probe:capacity-blocked-retain"
+        ]
+      },
+      {
+        "id": "managed-worktree-dirt",
+        "status": "pass",
+        "source": "layer_a",
+        "detail": "candidate-bound Layer A probes: probe:managed-worktree-dirt",
+        "observed": null,
+        "proof_ids": [
+          "probe:managed-worktree-dirt"
+        ]
+      },
+      {
+        "id": "process-restart-hydration",
+        "status": "pass",
+        "source": "layer_a",
+        "detail": "candidate-bound Layer A probes: probe:restart-hydration",
+        "observed": null,
+        "proof_ids": [
+          "probe:restart-hydration"
+        ]
+      },
+      {
+        "id": "forge-http-5xx-backoff",
+        "status": "pass",
+        "source": "layer_a",
+        "detail": "candidate-bound Layer A probes: probe:forge-http-5xx-backoff",
+        "observed": null,
+        "proof_ids": [
+          "probe:forge-http-5xx-backoff"
+        ]
+      },
+      {
+        "id": "ci-pending-red-recovery",
+        "status": "pass",
+        "source": "layer_a",
+        "detail": "candidate-bound Layer A probes: probe:ci-pending-red-recovery",
+        "observed": null,
+        "proof_ids": [
+          "probe:ci-pending-red-recovery"
+        ]
+      },
+      {
+        "id": "same-head-noop-reentry",
+        "status": "pass",
+        "source": "layer_a",
+        "detail": "candidate-bound Layer A probes: probe:same-head-noop-reentry",
+        "observed": null,
+        "proof_ids": [
+          "probe:same-head-noop-reentry"
+        ]
+      },
+      {
+        "id": "capacity-live-run-coexistence",
+        "status": "pass",
+        "source": "layer_a",
+        "detail": "candidate-bound Layer A probes: probe:capacity-blocked-retain",
+        "observed": 2,
+        "proof_ids": [
+          "probe:capacity-blocked-retain"
+        ]
+      },
+      {
+        "id": "recovery-controller-one-item",
+        "status": "pass",
+        "source": "layer_a",
+        "detail": "candidate-bound Layer A probes: probe:recovery-controller-one-item-action,probe:recovery-controller-one-item-route",
+        "observed": null,
+        "proof_ids": [
+          "probe:recovery-controller-one-item-action",
+          "probe:recovery-controller-one-item-route"
+        ]
+      },
+      {
+        "id": "recovery-controller-multi-item",
+        "status": "pass",
+        "source": "layer_a",
+        "detail": "candidate-bound Layer A probes: probe:recovery-controller-multi-item",
+        "observed": null,
+        "proof_ids": [
+          "probe:recovery-controller-multi-item"
+        ]
+      }
+    ],
+    "false_human_authority_count": 0,
+    "missing": []
+  },
+  "integrity": {
+    "producer": "pipeline-factory-gate",
+    "scoreboard_fingerprint": "3ba033920cf9463e12087be515902ae74d3314b514f2e03660a5264b1aeb87a5",
+    "composition_fingerprint": "a69c8bddd0003d322c0404971fa69ae29f641bbf18ee6f705dd1520535ab71d4",
+    "pack_provenance_fingerprint": "7d9726a5087bb4a3be5837cfb1721941dd00dfc0447a0c0e0018ebcfbdd07d7f",
+    "attestation": {
+      "alg": "hmac-sha256-v1",
+      "mac": "695466fce7fc17da2b6745f3aa26928c26b4dd8163350bca26b4951aee1dfe7c"
+    }
+  },
+  "pack_provenance": {
+    "schema_version": 1,
+    "policy_id": "factory-gate-v1-hybrid-v1",
+    "replacement_issue": 908,
+    "pack_id": "factory-gate-v1",
+    "manifest_version": 1,
+    "manifest_sha256": "d1fc4bfb4852a600875693e666ffbede65314dda045846d1513fb13da03f9b6a",
+    "release_version": "1.33.0",
+    "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+    "pack_run_id": "frg-1-33-0-f66627485c58a658c444ae3b",
+    "loop_run_id": "loop-e81ac1295a8a4eca",
+    "repository": "accidental-hedge-fund/agent-pipeline",
+    "base_branch": "main",
+    "started_at": "2026-08-10T02:36:30.590Z",
+    "contract_sha256": "512b07e52d38caeac7f928b0c8c426de5dbada0782a2ca03b3714b85e88ed84a",
+    "ledger_sha256": "032269136205cdf6f3088fb36be1f3ef9b37368c6e8471ee176097f01161af38",
+    "events_sha256": "72b562e00d87d02bc88e36e7c6584a4664d715c6238e6b28820aff91fbdf2fdf",
+    "action_evidence_sha256": "a6343b003a7381a31354d258b25d709536de1bbdcae9c0fec1b24540a32d32d3",
+    "issues": [
+      {
+        "issue_number": 938,
+        "issue_node_id": "I_kwDOSwJsNc8AAAABMFiezA",
+        "template_id": "clean-docs",
+        "template_sha256": "8decc9764176047b6168f1b9f39e675f84a797615d02ff3d7aba1a0c9b840cd8",
+        "created_at": "2026-08-10T02:36:32.000Z",
+        "advance_run_id": "938-2026-08-10T02-36-44-575Z",
+        "pr_number": 940,
+        "pr_node_id": "PR_kwDOSwJsNc78zV2T",
+        "pr_head_sha": "88e1b5091c374de90bbb6bcf71d11b07c778565e",
+        "pr_files_sha256": "a45f0e02fdb1f50565092c3b663da6aa00cdf44a99011b65aaed42f6b6ccb37f",
+        "check_run_ids": [
+          "93340875283"
+        ]
+      },
+      {
+        "issue_number": 939,
+        "issue_node_id": "I_kwDOSwJsNc8AAAABMFifJQ",
+        "template_id": "clean-openspec",
+        "template_sha256": "601bb2f7730d374dab08a4faa2115b8400276f0aeddb027d8bfa6e95dd2bf476",
+        "created_at": "2026-08-10T02:36:33.000Z",
+        "advance_run_id": "939-2026-08-10T02-50-46-238Z",
+        "pr_number": 941,
+        "pr_node_id": "PR_kwDOSwJsNc78zlYi",
+        "pr_head_sha": "69da48beddc6658e296916f03c353dfd5815e435",
+        "pr_files_sha256": "2781beae3ea0151c961f7ea98475abd077aaa90fd06d51e4e81ba6e72b345fa5",
+        "check_run_ids": [
+          "93343144451"
+        ]
+      }
+    ],
+    "probes": [
+      {
+        "id": "capacity-blocked-retain",
+        "test_file": "core/test/factory-reliability-gate-layer-a.test.ts",
+        "test_name": "FRG Layer A capacity-blocked-retain: capacity error is worktree capacity, not needs-human cascade",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "4f3dffdfa9e0d3993e35c314ddee311d3e002da8da4e253e973d15dde5fc6a8f",
+        "stdout_sha256": "4144d30986c7b1ca69e5641d7ec12732d761fa6954df496354381cc4ee4d54b0",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "ci-pending-red-recovery",
+        "test_file": "core/test/pre-merge-ci-recovery.test.ts",
+        "test_name": "flake fail → re-run → green advances without needs-human",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "6d0516f3476c61ff567fc6a4c6b4c566f28b12b6feb814277476201eedad0da2",
+        "stdout_sha256": "b6a350f5a6d9f48dd87786bf4a9d05401e4c0c809b81a52a2f2fb992c629bf3a",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "fix-rereview-cycle",
+        "test_file": "core/test/pre-merge-autofix.test.ts",
+        "test_name": "pre-merge auto-fix 5.1: all-correctness blocks → auto-fix → re-review approves → return null",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "c058679b4fadeccf11868d18d673097dc45faeceb62b2d94b99c15c1e8c65b95",
+        "stdout_sha256": "40916cadc4d93c47cdd0476f251234cd03753d5eae6a65b3c0b0605c4a114e25",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "forge-http-5xx-backoff",
+        "test_file": "core/test/escalation-dispositions.test.ts",
+        "test_name": "transient label edit: 504 then success does not park",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "e5f13d40f2f81c84701ad0bb45c8a74abe080c67b2d5c4cd9f0bff79c45a4062",
+        "stdout_sha256": "6c92874d3b50bfb37efb4fdef825066e41f17f72249239b922f0c8d5870be178",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "local-docs-parity",
+        "test_file": "core/test/docs-freshness.test.ts",
+        "test_name": "resumeFromImplementing: red docs blocks createPr and push (deliberate stale / #597-class)",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "93c96eaabc2dc666dbfe7b9bd032ad7cfab7db287512b195c42c18092b45e23a",
+        "stdout_sha256": "61f32ae1b1f50df4d31907faa24043239263b17657695fee8bae1fa6cad3e951",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "managed-worktree-dirt",
+        "test_file": "core/test/factory-reliability-gate-layer-a.test.ts",
+        "test_name": "FRG Layer A implement-lockfile-dirt: dirty lock after HEAD advance is folded (not left for human at 0 attempts)",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "6fca019c120b21904e526dea0dcf2a0732022cecc8bd10ca138b01ffe75e4fbe",
+        "stdout_sha256": "ed7515bb245e886fbcd150c3bc6d4e27245f4ca633c56be4a7fd4d848d43810e",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "openspec-multi-change",
+        "test_file": "core/test/factory-reliability-gate-layer-a.test.ts",
+        "test_name": "FRG Layer A openspec-multi-change: residual still-active after partial archive is fail not skip",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "94516273c28985c4e803180e9df79766d2341622c6f82338a4d035e570fbfd00",
+        "stdout_sha256": "72930344463cd78a64a5d998ed9a890071d26f1f705ab3b94d1114b0b4c5175d",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "pr-supersession",
+        "test_file": "core/test/supersede-issue-prs.test.ts",
+        "test_name": "disposeSupersededIssuePrs close mode: closes only stale associated same-base PR",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "e9ba7c8535cf0721c4825525c9d8395a011e16dbc29a82f887decf386bdb0891",
+        "stdout_sha256": "014f2c54ca5175197a2b3eab52b91bf29b8890c00674d2326832c52f56621737",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "recovery-controller-multi-item",
+        "test_file": "core/test/durable-run-two-item-live-pilot.test.ts",
+        "test_name": "two-item durable pilot: recoverable blocker + same-item resume + merge-refresh barrier + evidence bundle + no duplicate external action, with zero real network/git/subprocess access",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "b747941dcfe2e491a7d12f6e0be1d0b368b4611c3f5516661e92078f0519ece6",
+        "stdout_sha256": "ea92bbdc294c64c2d9d02ea09e8fe07150aa45bfe4368dd6410a371ef917991b",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "recovery-controller-one-item-action",
+        "test_file": "core/test/loop-supervisor.test.ts",
+        "test_name": "serialized dispatch rejection enters bounded recovery and redispatches the same item",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "c26c301d62cb572dadace94e28c59dd8badf22e39807c1e059a9b6096cb81379",
+        "stdout_sha256": "4356d3d878db1683ed4fb73ab241f3477f2b274a4aed29b34b32d538452508e0",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "recovery-controller-one-item-route",
+        "test_file": "core/test/single-issue-command.test.ts",
+        "test_name": "single issue command routes the resolved issue through the durable one-item controller",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "3ccf9ecfd910b051fc02201f4d92606945cc2ce0d1c3b695ca92eab032caa31f",
+        "stdout_sha256": "c5c77e8edaf0f17808a852ca1bc6739561bd6ad07818348ea78de9af32ccbe41",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "release-plan-row",
+        "test_file": "core/test/release.test.ts",
+        "test_name": "scaffoldRoadmap: missing unshipped plan row is scaffolded then ship-marked",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "a7f7a6da2e614d52c7b920275b80df3d29e5c4b7ac673fb309e55fad588514f3",
+        "stdout_sha256": "d1b34f52e282616a7904d79356a32c52d83e01cd62812edac5ca942af1e5fdde",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "release-tag-guard",
+        "test_file": "core/test/auto-tag-release-workflow.test.ts",
+        "test_name": "auto-tag-release workflow has FRG verification step ordered before tag create/push",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "be31e66f1e15e0d9ff6b5226f77d7f87bd2d755deb271bd0dfac59efc91b12d3",
+        "stdout_sha256": "ca4b7f5cb5518f9483a0433742bd5b9f06afb4f5e3f4eb2bb8e2e3cff42a017d",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "restart-hydration",
+        "test_file": "core/test/loop-supervisor.test.ts",
+        "test_name": "resume reconciles and continues after a same-host dead-pid lock, with no second store",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "7bc7a0a07e1c14bac5d45f5286549e6074ac03a2c705cb9f9075d6914a644573",
+        "stdout_sha256": "66584e3f0ed61b6ec5efc9cadb88e26d18800e75e160b9d0e1e04595634b20c6",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "same-head-noop-reentry",
+        "test_file": "core/test/pre-merge-autofix.test.ts",
+        "test_name": "pre-merge auto-fix #787: residual re-entry preflight failure posts no marker; retry at same head still runs the implementer",
+        "candidate_git_sha": "c331e8f393d5f93f1e9b9ba91728195ec89377af",
+        "command_argv_sha256": "34f78f1c5044ea45c00d21f2cb894c6104cbd29d891a8092ba7a21ec3d2a01a7",
+        "stdout_sha256": "cf1a9ad0f7d40835c9c2956ce2ab58094af849fde5297043822d174adaba504e",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ],
+    "proofs": [
+      {
+        "id": "ledger:final",
+        "source": "ledger",
+        "artifact_sha256": "032269136205cdf6f3088fb36be1f3ef9b37368c6e8471ee176097f01161af38"
+      },
+      {
+        "id": "live:action-evidence",
+        "source": "live",
+        "artifact_sha256": "a6343b003a7381a31354d258b25d709536de1bbdcae9c0fec1b24540a32d32d3"
+      },
+      {
+        "id": "live:contract",
+        "source": "live",
+        "artifact_sha256": "512b07e52d38caeac7f928b0c8c426de5dbada0782a2ca03b3714b85e88ed84a"
+      },
+      {
+        "id": "live:events",
+        "source": "live",
+        "artifact_sha256": "72b562e00d87d02bc88e36e7c6584a4664d715c6238e6b28820aff91fbdf2fdf"
+      },
+      {
+        "id": "live:openspec-pr:941",
+        "source": "live",
+        "artifact_sha256": "2781beae3ea0151c961f7ea98475abd077aaa90fd06d51e4e81ba6e72b345fa5"
+      },
+      {
+        "id": "probe:capacity-blocked-retain",
+        "source": "layer_a",
+        "artifact_sha256": "20631a360ca4c5a8a0598ca06dab97a9a01fbe9976b4f11bc4af2ed1dfff6ea3"
+      },
+      {
+        "id": "probe:ci-pending-red-recovery",
+        "source": "layer_a",
+        "artifact_sha256": "82cce2f5ca9de820745ba80a3780894fb7222c14e238eee5f7a10ef6ba384594"
+      },
+      {
+        "id": "probe:fix-rereview-cycle",
+        "source": "layer_a",
+        "artifact_sha256": "ba4c14362df3871209317a2360c0628ad05484cfda671df2f71397aee06d526b"
+      },
+      {
+        "id": "probe:forge-http-5xx-backoff",
+        "source": "layer_a",
+        "artifact_sha256": "37db325c56da4fe46e9c1ac21c25eab8b064a17a8f69becea96ed52f40050a4a"
+      },
+      {
+        "id": "probe:local-docs-parity",
+        "source": "layer_a",
+        "artifact_sha256": "a0738bd07039e21f183f5fe0c344760b3ee2077235253fcb5171658811c5d454"
+      },
+      {
+        "id": "probe:managed-worktree-dirt",
+        "source": "layer_a",
+        "artifact_sha256": "b3ab49d10b10101e017b11a25b65f7b128da4a616f31cad3f9c95966aabbde8b"
+      },
+      {
+        "id": "probe:openspec-multi-change",
+        "source": "layer_a",
+        "artifact_sha256": "6ef0b2baa70d19b6c7c0e9ef877108f9e1e8464bd621fffb3632ebe19916dd99"
+      },
+      {
+        "id": "probe:pr-supersession",
+        "source": "layer_a",
+        "artifact_sha256": "19f1c663709b1c327fd08779b5f3dd1c6abe34e2d59a0cd0fc686f341d600d54"
+      },
+      {
+        "id": "probe:recovery-controller-multi-item",
+        "source": "layer_a",
+        "artifact_sha256": "1cead609629cc582719cea9bcf06345a29443cf87f49f9327a727a8e1aef991f"
+      },
+      {
+        "id": "probe:recovery-controller-one-item-action",
+        "source": "layer_a",
+        "artifact_sha256": "b84d9c69e1663d828fba81b5997b50043454c9c3b94d971e57875728f893496b"
+      },
+      {
+        "id": "probe:recovery-controller-one-item-route",
+        "source": "layer_a",
+        "artifact_sha256": "095ea39d147a095751a12ab3b2d40e13fdb9b8bf6dd81ec531d29c9ea19ce096"
+      },
+      {
+        "id": "probe:release-plan-row",
+        "source": "layer_a",
+        "artifact_sha256": "8825a10e163d5ea57c190e64b3951f22d469a0abfc3fd0efc982bcd6e495620d"
+      },
+      {
+        "id": "probe:release-tag-guard",
+        "source": "layer_a",
+        "artifact_sha256": "fa40dee7c9d4961722b380cb0fac5b02fae1b99c5a5e6eb875f5204965eaf397"
+      },
+      {
+        "id": "probe:restart-hydration",
+        "source": "layer_a",
+        "artifact_sha256": "4dd120dfac26d5c407f48d466d5cd299256cdcbf45b6335f8e01abde1079c7b7"
+      },
+      {
+        "id": "probe:same-head-noop-reentry",
+        "source": "layer_a",
+        "artifact_sha256": "bdd1694c22d944ccae833c6d607a7dbcd0039c96cb7a48bcd7839a258be0e690"
+      }
+    ]
+  }
+}
