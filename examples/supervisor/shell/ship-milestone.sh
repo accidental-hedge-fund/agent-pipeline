@@ -487,13 +487,19 @@ write_state "train" "running" "pipeline train --milestone $milestone --merge --j
 log "phase train: start"
 STAGE_WATCH_PID_FILE="$RUN_DIR/stage-watch.pid"
 if [[ -x "$SHIP_STAGE_WATCH_BIN" ]]; then
+  # Bind stage-watch to this ship session clock + train.json issue list so
+  # historical loop/FRG events are never rebroadcast under this ship label.
+  SHIP_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   nohup env PATH="$(dirname "$SHIP_STAGE_WATCH_BIN"):$PATH" \
     REPO_DIR="$REPO_DIR" SHIP_NOTIFY_BIN="$SHIP_NOTIFY_BIN" \
     PIPELINE_SUPERVISOR_STATE="$STATE_ROOT" \
     "$SHIP_STAGE_WATCH_BIN" \
-    --milestone "$milestone" --pid-file "$STAGE_WATCH_PID_FILE" \
+    --milestone "$milestone" \
+    --since "$SHIP_SINCE" \
+    --issues-file "$RUN_DIR/train.json" \
+    --pid-file "$STAGE_WATCH_PID_FILE" \
     >>"$RUN_DIR/stage-watch.log" 2>&1 &
-  log "stage-watch started pid=$!"
+  log "stage-watch started pid=$! since=$SHIP_SINCE"
 fi
 set +e
 "$PIPELINE" train --milestone "$milestone" --merge --json >"$RUN_DIR/train.json" 2>"$RUN_DIR/train.stderr"

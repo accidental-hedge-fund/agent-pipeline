@@ -4,6 +4,7 @@
 #   ship-stage-watch.sh --milestone v1.33.0
 #   ship-stage-watch.sh --issue 870 [--label "single #870"]
 #   ship-stage-watch.sh --milestone v1.33.0 --once
+#   ship-stage-watch.sh --milestone v1.34.0 --since 2026-08-10T13:24:00Z
 #
 # Environment:
 #   SHIP_NOTIFY_BIN           path to ship-notify.sh (default: sibling script)
@@ -13,8 +14,14 @@
 #   REPO_DIR                  used to derive RUNS_ROOT when unset
 #   SHIP_STAGE_WATCH_POLL_S   poll interval (default 5)
 #
-# Filters: drops #None / #null issue noise; skips stale precondition exclusions
-# once an issue later starts or advances.
+# Scope (critical — avoids rebroadcasting unrelated history under a ship label):
+#   1. Events older than --since (default: this process start, UTC) are ignored.
+#   2. With --issue N, only that issue is eligible.
+#   3. With --milestone and no --issue, when train.json (or --issues-file) lists
+#      ordered_issues, only those issues are eligible. Until that list exists,
+#      only the since-watermark applies (still no pre-ship history).
+#   4. Drops #None / #null; skips stale precondition exclusions once an issue
+#      later starts or advances (within the scoped event set).
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -35,16 +42,20 @@ MILESTONE=""
 ISSUE=""
 LABEL=""
 PID_FILE=""
+SINCE=""
+ISSUES_FILE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --milestone|-m) MILESTONE=${2:-}; shift 2 ;;
     --issue|-i) ISSUE=${2:-}; shift 2 ;;
     --label|-l) LABEL=${2:-}; shift 2 ;;
+    --since) SINCE=${2:-}; shift 2 ;;
+    --issues-file) ISSUES_FILE=${2:-}; shift 2 ;;
     --once) ONCE=1; shift ;;
     --pid-file) PID_FILE=${2:-}; shift 2 ;;
     -h|--help)
-      sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "unknown: $1" >&2; exit 2 ;;
@@ -61,6 +72,9 @@ fi
 if [[ -n "$MILESTONE" ]]; then
   safe=$(echo "$MILESTONE" | tr '/' '-')
   SEEN_DIR="$STATE_ROOT/ship-$safe/stage-watch"
+  if [[ -z "$ISSUES_FILE" ]]; then
+    ISSUES_FILE="$STATE_ROOT/ship-$safe/train.json"
+  fi
 else
   safe=$(echo "issue-$ISSUE" | tr '/' '-')
   SEEN_DIR="$STATE_ROOT/stage-watch/$safe"
@@ -70,6 +84,14 @@ SEEN_FILE="$SEEN_DIR/seen-keys.txt"
 touch "$SEEN_FILE"
 [[ -n "$PID_FILE" ]] && echo $$ >"$PID_FILE"
 
+# Session watermark: never notify events strictly before this process started
+# (unless operator passed --since). Written for debugging; not reused across
+# processes so a re-ship for the same milestone does not inherit a stale clock.
+if [[ -z "$SINCE" ]]; then
+  SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+fi
+printf '%s\n' "$SINCE" >"$SEEN_DIR/session-since.txt"
+
 notify() {
   [[ -x "$SHIP_NOTIFY_BIN" ]] || return 0
   "$SHIP_NOTIFY_BIN" "$1" "$2" --force || true
@@ -77,16 +99,104 @@ notify() {
 already() { grep -Fxq "$1" "$SEEN_FILE" 2>/dev/null; }
 mark() { echo "$1" >>"$SEEN_FILE"; }
 
+# Scan every loop run that may hold in-scope events (not only "latest").
+# A ship that starts while an older loop is still the newest dir would otherwise
+# stamp that whole history with the new ship label when seen-keys is empty.
 scan() {
-  local loop
-  loop=$(ls -td "$LOOP_ROOT"/loop-* 2>/dev/null | head -1 || true)
-  [[ -n "$loop" && -f "$loop/events.jsonl" ]] || return 0
-  python3 - "$loop/events.jsonl" "$SEEN_FILE" "$LABEL" "${ISSUE:-}" "${RUNS_ROOT:-}" <<'PY'
+  local loops=()
+  local d
+  if [[ -d "$LOOP_ROOT" ]]; then
+    while IFS= read -r d; do
+      [[ -n "$d" && -f "$d/events.jsonl" ]] && loops+=("$d")
+    done < <(ls -td "$LOOP_ROOT"/loop-* 2>/dev/null || true)
+  fi
+  if [[ ${#loops[@]} -eq 0 ]]; then
+    return 0
+  fi
+  # Cap: newest 20 loop dirs (ships are short; avoids scanning ancient archives)
+  local limited=("${loops[@]:0:20}")
+  python3 - "$SEEN_FILE" "$LABEL" "${ISSUE:-}" "${RUNS_ROOT:-}" "$SINCE" "${ISSUES_FILE:-}" "${limited[@]}" <<'PY'
 import json, sys, os, re
+from datetime import datetime, timezone
 
-ev_path, seen_path, label, issue_filter, runs_root = sys.argv[1:6]
-issue_filter = str(issue_filter).strip() if issue_filter else ""
+seen_path = sys.argv[1]
+label = sys.argv[2]
+issue_filter = str(sys.argv[3]).strip() if sys.argv[3] else ""
+runs_root = sys.argv[4] or ""
+since_raw = (sys.argv[5] or "").strip()
+issues_file = (sys.argv[6] or "").strip()
+loop_dirs = sys.argv[7:]
+
+def parse_ts(s):
+    if not s or not isinstance(s, str):
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    # Accept ...Z and ...+00:00; drop sub-second noise for compare
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        # truncate fractional seconds if present beyond fromisoformat comfort
+        if "." in s and "+" in s[s.find("T"):]:
+            head, rest = s.split(".", 1)
+            # rest like 089Z already normalized, or 089+00:00
+            frac_and_tz = rest
+            m = re.match(r"^(\d+)(.*)$", frac_and_tz)
+            if m:
+                s = head + m.group(2)
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+since = parse_ts(since_raw)
+if since is None and since_raw:
+    # Fail closed: refuse to emit anything if --since is unparsable
+    sys.stderr.write(f"ship-stage-watch: invalid --since {since_raw!r}\n")
+    sys.exit(2)
+
 seen = {l.strip() for l in open(seen_path) if l.strip()} if os.path.exists(seen_path) else set()
+
+allow_issues = None  # None = no train allowlist yet; set() would mean empty list
+if issues_file and os.path.isfile(issues_file):
+    try:
+        raw = open(issues_file).read().strip()
+        if raw:
+            dec = json.JSONDecoder()
+            i = 0
+            objs = []
+            while i < len(raw):
+                while i < len(raw) and raw[i].isspace():
+                    i += 1
+                if i >= len(raw):
+                    break
+                try:
+                    o, j = dec.raw_decode(raw, i)
+                    objs.append(o)
+                    i = j
+                except Exception:
+                    n = raw.find("{", i + 1)
+                    if n < 0:
+                        break
+                    i = n
+            for o in reversed(objs):
+                if not isinstance(o, dict):
+                    continue
+                if o.get("kind") == "train_status" and "ordered_issues" in o:
+                    allow_issues = {
+                        str(x) for x in (o.get("ordered_issues") or []) if x is not None
+                    }
+                    break
+                if o.get("kind") == "loop_run_handoff":
+                    sel = o.get("selector") or {}
+                    if sel.get("type") == "work-list" and sel.get("value"):
+                        allow_issues = {str(x) for x in sel["value"] if x is not None}
+                        break
+    except Exception:
+        allow_issues = None
 
 def fmt_issue(issue):
     if issue is None or str(issue) in ("None", "null", ""):
@@ -97,9 +207,21 @@ def want(issue):
     issue = fmt_issue(issue)
     if not issue:
         return False
-    if not issue_filter:
+    if issue_filter and issue != issue_filter:
+        return False
+    if allow_issues is not None and issue not in allow_issues:
+        return False
+    return True
+
+def fresh(ts_str):
+    """True if event is at/after since (or no since / unparsable → drop when since set)."""
+    if since is None:
         return True
-    return issue == issue_filter
+    ts = parse_ts(ts_str)
+    if ts is None:
+        # Fail closed for historical rebroadcast: no timestamp = not notify
+        return False
+    return ts >= since
 
 def issue_from_run_id(rid):
     if not rid:
@@ -112,21 +234,34 @@ def issue_from_path(path):
     m = re.match(r"^(\d+)", base)
     return m.group(1) if m else None
 
+def load_events(path):
+    out = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+    except OSError:
+        pass
+    return out
+
 events = []
-with open(ev_path) as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            events.append(json.loads(line))
-        except Exception:
-            continue
+for ld in loop_dirs:
+    ep = os.path.join(ld, "events.jsonl")
+    events.extend(load_events(ep))
 
 later_ok = set()
 for ev in events:
     k = ev.get("kind")
     d = ev.get("data") or {}
+    t = ev.get("time") or ""
+    if not fresh(t):
+        continue
     if k in ("loop_item_started", "loop_item_stage_progress", "loop_item_advance_linked"):
         issue = fmt_issue(d.get("item_id"))
         if issue:
@@ -140,6 +275,8 @@ for ev in events:
     k = ev.get("kind")
     d = ev.get("data") or {}
     t = ev.get("time") or ""
+    if not fresh(t):
+        continue
     if k == "loop_item_stage_progress":
         issue = fmt_issue(d.get("item_id"))
         stage, at = d.get("stage"), d.get("at") or t
@@ -171,13 +308,23 @@ for ev in events:
 
 adv_by_item = {}
 for ev in events:
+    t = ev.get("time") or ""
+    if not fresh(t):
+        continue
     if ev.get("kind") != "loop_item_advance_linked":
         continue
     d = ev.get("data") or {}
     item = fmt_issue(d.get("item_id"))
     path = d.get("events")
-    if path and (not issue_filter or item == issue_filter or item is None):
-        adv_by_item[item or "_"] = path
+    if not path:
+        continue
+    # Null item only allowed when no issue scope is active
+    if item is None:
+        if issue_filter or allow_issues is not None:
+            continue
+    elif not want(item):
+        continue
+    adv_by_item[item or "_"] = path
 
 if issue_filter and runs_root and os.path.isdir(runs_root):
     cands = [
@@ -189,6 +336,17 @@ if issue_filter and runs_root and os.path.isdir(runs_root):
     if cands:
         cands.sort(key=os.path.getmtime, reverse=True)
         adv_by_item[issue_filter] = cands[0]
+elif allow_issues and runs_root and os.path.isdir(runs_root):
+    for iss in allow_issues:
+        cands = [
+            os.path.join(runs_root, d, "events.jsonl")
+            for d in os.listdir(runs_root)
+            if d.startswith(iss + "-")
+        ]
+        cands = [c for c in cands if os.path.isfile(c)]
+        if cands:
+            cands.sort(key=os.path.getmtime, reverse=True)
+            adv_by_item[iss] = cands[0]
 
 for item_key, adv in adv_by_item.items():
     if not adv or not os.path.isfile(adv):
@@ -210,6 +368,8 @@ for item_key, adv in adv_by_item.items():
                 continue
             typ = ev.get("type") or ev.get("kind")
             at = ev.get("at") or ""
+            if not fresh(at):
+                continue
             stage = ev.get("stage")
             issue = (
                 fmt_issue(ev.get("issue"))
