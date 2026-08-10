@@ -165,14 +165,16 @@ function recommendFromTypeLabels(labelsLower: string[]): CompatibilityRecommenda
  * Title and body text never set, upgrade, or downgrade applied impact.
  * `entry` is accepted for call-site stability; applied class does not use tier/score.
  */
-export function classifyCompatibilityImpact(
-  entry: RoadmapEntry,
-  item: InventoryItem,
+/**
+ * Classify applied SemVer impact from explicit labels only (no inventory item).
+ * Used for open issues present in the full repository snapshot but absent from
+ * filtered inventory so coverage blockers still reflect label state.
+ */
+export function classifyCompatibilityFromLabels(
+  issueNumber: number,
+  labels: string[],
 ): CompatibilityClassification {
-  void entry;
-  const issueNumber = item.issue.number;
-  const labelsLower = item.issue.labels.map((l) => l.toLowerCase());
-
+  const labelsLower = labels.map((l) => l.toLowerCase());
   const presentExplicit = EXPLICIT_SEMVER_LABELS.filter((name) => labelsLower.includes(name));
 
   if (presentExplicit.length >= 2) {
@@ -206,6 +208,14 @@ export function classifyCompatibilityImpact(
     uncertain: true,
     ...(recommendation !== undefined ? { recommendation } : {}),
   };
+}
+
+export function classifyCompatibilityImpact(
+  entry: RoadmapEntry,
+  item: InventoryItem,
+): CompatibilityClassification {
+  void entry;
+  return classifyCompatibilityFromLabels(item.issue.number, item.issue.labels);
 }
 
 /**
@@ -1087,7 +1097,10 @@ export async function runRoadmap(
       }
     }
 
-    // Full SemVer reconciliation manifest (#910)
+    // Full SemVer reconciliation manifest (#910).
+    // Coverage + fingerprint use the full repository open-issue snapshot — not
+    // inventory-filtered items — so newly opened or filter-excluded issues still
+    // block incomplete manifests (b2694882).
     const tagList =
       deps.listSemverTags !== undefined
         ? await deps.listSemverTags(repoDir)
@@ -1095,19 +1108,34 @@ export async function runRoadmap(
           ? [latestTag]
           : [];
     const shipped = parseShippedSemverTitles(tagList);
-    const scope = new Set(items.map((i) => i.issue.number));
-    reconcileLive = await loadLiveState(repo, shipped, deps, scope);
+    reconcileLive = await loadLiveState(repo, shipped, deps);
+    const openIssueNumbers = reconcileLive.openIssues
+      .filter((i) => i.state === "open")
+      .map((i) => i.number);
+    // Classify open issues outside inventory from snapshot labels so coverage
+    // blockers reflect true applied impact (or unresolved missing).
+    const classByIssue = new Map(
+      compatibilityClassifications.map((c) => [c.issue_number, c]),
+    );
+    const reconClassifications = [...compatibilityClassifications];
+    for (const issue of reconcileLive.openIssues) {
+      if (issue.state !== "open" || classByIssue.has(issue.number)) continue;
+      reconClassifications.push(
+        classifyCompatibilityFromLabels(issue.number, issue.labels ?? []),
+      );
+    }
     reconciliation = buildReconciliationManifest({
       milestones,
-      classifications: compatibilityClassifications,
-      openIssueNumbers: items.map((i) => i.issue.number),
+      classifications: reconClassifications,
+      openIssueNumbers,
       live: reconcileLive,
       generatedAt: now,
     });
     deps.log(
       `[roadmap] reconciliation: identity=${reconciliation.identity} ` +
         `fingerprint=${reconciliation.live_state_fingerprint} ` +
-        `actions=${reconciliation.actions.length} blockers=${reconciliation.coverage_blockers.length}`,
+        `actions=${reconciliation.actions.length} blockers=${reconciliation.coverage_blockers.length} ` +
+        `open_issues=${openIssueNumbers.length}`,
     );
   }
 
@@ -1207,19 +1235,15 @@ export async function runRoadmap(
 
     // Refresh live state before any write-back; gate fingerprint/coverage first
     // so hygiene cannot mutate on a stale or blocked reconciliation (8420b97a).
-    const scope = new Set(items.map((i) => i.issue.number));
+    // Full open-issue snapshot (no inventory scope filter) — b2694882.
     const tagList =
       deps.listSemverTags !== undefined
         ? await deps.listSemverTags(repoDir)
         : (await deps.getLatestTag(repoDir))
           ? [await deps.getLatestTag(repoDir)]
           : [];
-    const freshLive = await loadLiveState(
-      repo,
-      parseShippedSemverTitles(tagList),
-      deps,
-      scope,
-    );
+    const shippedTitles = parseShippedSemverTitles(tagList);
+    const freshLive = await loadLiveState(repo, shippedTitles, deps);
     const existingProgress = await loadProgress(outputDir, deps);
     const gate = validateSemverApplyReady(reviewed, freshLive, {
       expectedIdentity,
@@ -1230,7 +1254,10 @@ export async function runRoadmap(
       throw new Error(`SemVer reconciliation apply refused: ${gate.reason}`);
     }
 
+    // Hygiene only after the stale-preview gate (8420b97a). Then refresh live so
+    // apply-start / resume fingerprints seed post-hygiene timestamps (bcdee39b).
     await applyHygiene(plan.hygiene, repo, { apply: true }, deps);
+    const postHygieneLive = await loadLiveState(repo, shippedTitles, deps);
 
     const result = await applySemverReconciliation(
       reviewed,
@@ -1238,7 +1265,7 @@ export async function runRoadmap(
       outputDir,
       deps,
       {
-        live: freshLive,
+        live: postHygieneLive,
         expectedIdentity,
         gatesAlreadyChecked: true,
       },

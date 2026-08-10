@@ -97,7 +97,10 @@ export interface CoverageBlocker {
  * Apply executes only this action list against a matching live-state fingerprint.
  */
 export interface ReconciliationManifest {
-  /** Content hash of the reviewed target state (not live fingerprint). */
+  /**
+   * Content hash of the full reviewed package: targets, ordered actions,
+   * coverage blockers, and live-state fingerprint (not a targets-only hash).
+   */
   identity: string;
   /** Live-state fingerprint captured at preview / plan build time. */
   live_state_fingerprint: string;

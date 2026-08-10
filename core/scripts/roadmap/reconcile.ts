@@ -22,6 +22,16 @@ const PROGRESS_FILE = "reconciliation-progress.json";
 /** Persisted reviewed preview artifact; apply loads this exact manifest. */
 export const REVIEWED_MANIFEST_FILE = "reconciliation-manifest.json";
 
+const ACTION_KINDS = new Set<ReconciliationAction["kind"]>([
+  "create",
+  "reuse",
+  "reopen",
+  "rename",
+  "update_description",
+  "assign",
+  "clear_stale",
+]);
+
 export interface ReconcileLiveState {
   milestones: MilestoneCatalogEntry[];
   openIssues: IssueMilestoneSnapshot[];
@@ -32,7 +42,9 @@ export interface ReconcileLiveState {
 export interface BuildManifestInput {
   milestones: MilestoneSpec[];
   classifications: CompatibilityClassification[];
-  /** Open issues in roadmap scope (filtered inventory). */
+  /**
+   * Every open issue in repository scope (full open-issue snapshot, not inventory filter).
+   */
   openIssueNumbers: IssueNumber[];
   live: ReconcileLiveState;
   generatedAt?: string;
@@ -54,11 +66,16 @@ function sha12(payload: string): string {
   return crypto.createHash("sha256").update(payload).digest("hex").slice(0, 12);
 }
 
-/**
- * Content hash of reviewed target state (identity). Live fingerprint is separate.
- */
-export function computeManifestIdentity(targets: ReconciliationTargetMilestone[]): string {
-  const normalized = [...targets]
+function normalizeTargetsForIdentity(
+  targets: ReconciliationTargetMilestone[],
+): Array<{
+  number: number | null;
+  title: string;
+  description: string;
+  version_impact: string | null;
+  issue_numbers: number[];
+}> {
+  return [...targets]
     .map((t) => ({
       number: t.number ?? null,
       title: t.title,
@@ -67,7 +84,101 @@ export function computeManifestIdentity(targets: ReconciliationTargetMilestone[]
       issue_numbers: [...t.issue_numbers].sort((a, b) => a - b),
     }))
     .sort((a, b) => a.title.localeCompare(b.title));
-  return sha12(JSON.stringify(normalized));
+}
+
+function normalizeActionsForIdentity(
+  actions: ReconciliationAction[],
+): Array<{
+  id: string;
+  kind: string;
+  milestone_number: number | null;
+  milestone_title: string | null;
+  new_title: string | null;
+  description: string | null;
+  issue_number: number | null;
+  detail: string | null;
+}> {
+  // Preserve order — action sequence is part of the reviewed plan.
+  return actions.map((a) => ({
+    id: a.id,
+    kind: a.kind,
+    milestone_number: a.milestone_number ?? null,
+    milestone_title: a.milestone_title ?? null,
+    new_title: a.new_title ?? null,
+    description: a.description ?? null,
+    issue_number: a.issue_number ?? null,
+    detail: a.detail ?? null,
+  }));
+}
+
+function normalizeBlockersForIdentity(
+  blockers: CoverageBlocker[],
+): Array<{ issue_number: number | null; reason: string; detail: string }> {
+  return [...blockers]
+    .map((b) => ({
+      issue_number: b.issue_number ?? null,
+      reason: b.reason,
+      detail: b.detail,
+    }))
+    .sort((a, b) => {
+      const n = (a.issue_number ?? 0) - (b.issue_number ?? 0);
+      if (n !== 0) return n;
+      return `${a.reason}:${a.detail}`.localeCompare(`${b.reason}:${b.detail}`);
+    });
+}
+
+/**
+ * Content hash of the full reviewed package: targets, ordered actions, blockers,
+ * and live-state fingerprint. Binding actions prevents identity-valid action injection.
+ */
+export function computeManifestIdentity(
+  targets: ReconciliationTargetMilestone[],
+  actions: ReconciliationAction[] = [],
+  coverage_blockers: CoverageBlocker[] = [],
+  live_state_fingerprint = "",
+): string {
+  return sha12(
+    JSON.stringify({
+      targets: normalizeTargetsForIdentity(targets),
+      actions: normalizeActionsForIdentity(actions),
+      coverage_blockers: normalizeBlockersForIdentity(coverage_blockers),
+      live_state_fingerprint,
+    }),
+  );
+}
+
+/**
+ * Recompute identity from loaded fields; false when the stored identity does not
+ * match the canonical package (tamper / partial edit).
+ */
+export function manifestIdentityMatches(manifest: ReconciliationManifest): boolean {
+  const expected = computeManifestIdentity(
+    manifest.targets,
+    manifest.actions,
+    manifest.coverage_blockers,
+    manifest.live_state_fingerprint,
+  );
+  return expected === manifest.identity;
+}
+
+/** Schema-check a loaded action list; false when any entry is not executable shape. */
+export function isValidActionList(actions: unknown): actions is ReconciliationAction[] {
+  if (!Array.isArray(actions)) return false;
+  for (const a of actions) {
+    if (a === null || typeof a !== "object") return false;
+    const rec = a as Record<string, unknown>;
+    if (typeof rec.id !== "string" || rec.id.length === 0) return false;
+    if (typeof rec.kind !== "string" || !ACTION_KINDS.has(rec.kind as ReconciliationAction["kind"])) {
+      return false;
+    }
+    if (rec.milestone_number !== undefined && typeof rec.milestone_number !== "number") return false;
+    if (rec.milestone_title !== undefined && typeof rec.milestone_title !== "string") return false;
+    if (rec.new_title !== undefined && typeof rec.new_title !== "string") return false;
+    if (rec.description !== undefined && typeof rec.description !== "string") return false;
+    if (rec.issue_number !== undefined && typeof rec.issue_number !== "number") return false;
+    if (rec.detail !== undefined && typeof rec.detail !== "string") return false;
+  }
+  return true;
 }
 
 /**
@@ -494,8 +605,13 @@ export function buildReconciliationManifest(input: BuildManifestInput): Reconcil
     ...coverageBlockers,
     ...bindBlockers,
   ]);
-  const identity = computeManifestIdentity(targets);
   const live_state_fingerprint = computeLiveStateFingerprint(input.live);
+  const identity = computeManifestIdentity(
+    targets,
+    actions,
+    blockers,
+    live_state_fingerprint,
+  );
   return {
     identity,
     live_state_fingerprint,
@@ -522,7 +638,7 @@ export async function saveReviewedManifest(
   );
 }
 
-/** Load the reviewed preview manifest; null when missing or unparseable. */
+/** Load the reviewed preview manifest; null when missing, unparseable, or tampered. */
 export async function loadReviewedManifest(
   outputDir: string,
   deps: Pick<WritebackDeps, "readFile">,
@@ -534,9 +650,14 @@ export async function loadReviewedManifest(
     if (
       typeof parsed?.identity !== "string" ||
       typeof parsed?.live_state_fingerprint !== "string" ||
-      !Array.isArray(parsed?.actions) ||
-      !Array.isArray(parsed?.targets)
+      !Array.isArray(parsed?.targets) ||
+      !Array.isArray(parsed?.coverage_blockers) ||
+      !isValidActionList(parsed?.actions)
     ) {
+      return null;
+    }
+    // Cryptographic bind: stored identity must match canonical package.
+    if (!manifestIdentityMatches(parsed)) {
       return null;
     }
     return parsed;
@@ -582,6 +703,17 @@ export function validateSemverApplyReady(
     return { ok: false, code: "title_collision", reason: collision.detail };
   }
 
+  // Integrity: refuse packages whose actions/targets/blockers do not match identity.
+  if (!manifestIdentityMatches(manifest)) {
+    return {
+      ok: false,
+      code: "manifest_identity_mismatch",
+      reason:
+        "Manifest identity does not match canonical targets/actions/blockers/fingerprint; " +
+        "run a new dry-run preview",
+    };
+  }
+
   const freshFp = computeLiveStateFingerprint(live);
   const existingProgress = opts.resumeProgress ?? null;
   const resuming =
@@ -605,13 +737,17 @@ export function validateSemverApplyReady(
     existingProgress?.status === "complete" &&
     existingProgress.manifest_identity === manifest.identity
   ) {
-    // Prior complete with same identity — allow re-check of fresh plan vs live
-    // via apply path (may noop). Still require match to reviewed preview fp when
-    // not resuming incomplete work — fall through to preview fingerprint.
-    if (freshFp !== manifest.live_state_fingerprint) {
-      // Converged re-apply often rebuilds live after mutations; apply will
-      // recompute actions via the saved complete path. Gate only incomplete resume
-      // and first apply against preview fingerprint below when not complete.
+    // Completed progress is a no-op only while live still matches the
+    // post-apply fingerprint chain. Later live drift requires a new preview.
+    const expectedFp =
+      existingProgress.last_fingerprint ?? existingProgress.apply_start_fingerprint;
+    if (freshFp !== expectedFp) {
+      return {
+        ok: false,
+        code: "fingerprint_drift",
+        reason:
+          "Live state drifted after a completed apply; run a new dry-run preview before apply",
+      };
     }
   } else {
     if (freshFp !== manifest.live_state_fingerprint) {
@@ -626,18 +762,17 @@ export function validateSemverApplyReady(
   return { ok: true };
 }
 
+/**
+ * Load full repository open-issue + milestone catalog for SemVer reconciliation.
+ * Does not inventory-filter: coverage and fingerprint require every open issue.
+ */
 export async function loadLiveState(
   repo: string,
   shippedTitles: Iterable<string>,
   deps: Pick<WritebackDeps, "listMilestonesDetailed" | "listOpenIssueMilestoneSnapshots">,
-  /** When set, restrict open-issue snapshots to this scope (roadmap filter). */
-  scopeIssueNumbers?: Set<number>,
 ): Promise<ReconcileLiveState> {
   const milestones = await deps.listMilestonesDetailed(repo);
-  let openIssues = await deps.listOpenIssueMilestoneSnapshots(repo);
-  if (scopeIssueNumbers) {
-    openIssues = openIssues.filter((i) => scopeIssueNumbers.has(i.number));
-  }
+  const openIssues = await deps.listOpenIssueMilestoneSnapshots(repo);
   return {
     milestones,
     openIssues,
@@ -721,12 +856,25 @@ export async function applySemverReconciliation(
       }
       return gate;
     }
-  } else if (opts.expectedIdentity !== undefined && opts.expectedIdentity !== manifest.identity) {
-    return {
-      ok: false,
-      code: "manifest_identity_mismatch",
-      reason: `Manifest identity changed; run a new dry-run preview (expected ${opts.expectedIdentity}, got ${manifest.identity})`,
-    };
+  } else {
+    // Caller gated before controlled write-backs (e.g. hygiene). Still bind identity
+    // and resume/complete fingerprint chains against the live snapshot we will seed.
+    if (opts.expectedIdentity !== undefined && opts.expectedIdentity !== manifest.identity) {
+      return {
+        ok: false,
+        code: "manifest_identity_mismatch",
+        reason: `Manifest identity changed; run a new dry-run preview (expected ${opts.expectedIdentity}, got ${manifest.identity})`,
+      };
+    }
+    if (!manifestIdentityMatches(manifest)) {
+      return {
+        ok: false,
+        code: "manifest_identity_mismatch",
+        reason:
+          "Manifest identity does not match canonical targets/actions/blockers/fingerprint; " +
+          "run a new dry-run preview",
+      };
+    }
   }
 
   const freshFp = computeLiveStateFingerprint(opts.live);
@@ -742,8 +890,8 @@ export async function applySemverReconciliation(
     existingProgress.status === "complete";
 
   // When resume is in progress, execute the saved action list (not a re-planned one).
-  // When prior complete for the same identity, treat as converged noop (do not re-fire
-  // the reviewed action list against post-apply live state).
+  // When prior complete for the same identity and live still matches the completed
+  // fingerprint chain, treat as converged noop (do not re-fire the reviewed list).
   const actionList: ReconciliationAction[] =
     resuming && existingProgress
       ? existingProgress.actions
@@ -768,20 +916,33 @@ export async function applySemverReconciliation(
         reason: "Live state drifted; run a new dry-run preview before apply",
       };
     }
-  } else if (priorComplete) {
-    // Prior complete with same identity — exact no-op convergence path
+  } else if (priorComplete && existingProgress) {
+    // Completed progress is no-op only while live still matches the post-apply chain.
+    const expectedFp =
+      existingProgress.last_fingerprint ?? existingProgress.apply_start_fingerprint;
+    if (freshFp !== expectedFp) {
+      deps.log(
+        `[roadmap] refuse apply: live state drifted after completed reconciliation ` +
+          `(expected ${expectedFp}, now ${freshFp}); run a new preview`,
+      );
+      return {
+        ok: false,
+        code: "fingerprint_drift",
+        reason:
+          "Live state drifted after a completed apply; run a new dry-run preview before apply",
+      };
+    }
   } else if (!opts.gatesAlreadyChecked) {
     // Fresh apply fingerprint already validated in validateSemverApplyReady
   } else if (freshFp !== manifest.live_state_fingerprint) {
-    deps.log(
-      `[roadmap] refuse apply: live-state fingerprint drift ` +
-        `(preview ${manifest.live_state_fingerprint}, fresh ${freshFp}); run a new preview`,
-    );
-    return {
-      ok: false,
-      code: "fingerprint_drift",
-      reason: "Live state changed after preview; run a new dry-run preview before apply",
-    };
+    // Fresh apply after caller gate: when live was refreshed after controlled
+    // hygiene, apply-start seeds from this freshFp below — only refuse when the
+    // caller claimed gatesAlreadyChecked without reconciling post-hygiene drift
+    // for a non-resume first apply. Resume/complete handled above.
+    //
+    // Post-hygiene refresh intentionally diverges from the preview fingerprint
+    // (updatedAt). For first apply with gatesAlreadyChecked, accept the provided
+    // live snapshot as apply-start (caller must refresh after hygiene).
   }
 
   const completedIds = new Set(
@@ -892,9 +1053,26 @@ export async function applySemverReconciliation(
       await saveProgress(outputDir, progress, deps);
     }
 
+    // Re-read live state so last_fingerprint matches a later GH snapshot
+    // (our own assigns/creates update issue.updatedAt on the server).
+    let finalFp = progress.last_fingerprint ?? freshFp;
+    try {
+      const postLive: ReconcileLiveState = {
+        milestones: await deps.listMilestonesDetailed(repo),
+        openIssues: await deps.listOpenIssueMilestoneSnapshots(repo),
+        shippedTitles: opts.live.shippedTitles,
+      };
+      opts.live.milestones = postLive.milestones;
+      opts.live.openIssues = postLive.openIssues;
+      finalFp = computeLiveStateFingerprint(postLive);
+    } catch {
+      // Keep chained fingerprint if refresh fails; resume/no-op may re-preview.
+    }
+
     progress = {
       ...progress,
       next_pending_id: null,
+      last_fingerprint: finalFp,
       status: "complete",
       updated_at: new Date().toISOString(),
     };

@@ -52,7 +52,9 @@ manifest** derived from the plan. The manifest records:
   version_impact, issue set)
 - ordered **actions** (create | reuse | reopen | rename | update_description |
   assign | clear_stale)
-- **manifest identity** (content hash of the reviewed target state)
+- **manifest identity** (content hash of the full reviewed package: targets,
+  ordered actions, coverage blockers, and live-state fingerprint — so action
+  injection cannot preserve a valid identity)
 - **live-state fingerprint** captured at preview time
 - optional **progress** (completed/pending action ids) for resume
 

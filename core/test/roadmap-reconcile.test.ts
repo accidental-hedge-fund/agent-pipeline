@@ -7,6 +7,7 @@ import {
   applySemverReconciliation,
   computeLiveStateFingerprint,
   computeManifestIdentity,
+  manifestIdentityMatches,
   resolveMilestoneIdentity,
   parseShippedSemverTitles,
   saveReviewedManifest,
@@ -19,6 +20,7 @@ import type {
   MilestoneCatalogEntry,
   MilestoneSpec,
   IssueMilestoneSnapshot,
+  ReconciliationAction,
   ReconciliationManifest,
   ReconciliationProgress,
 } from "../scripts/roadmap/types.ts";
@@ -660,21 +662,24 @@ describe("applySemverReconciliation", () => {
       ["v1.9.0"],
     );
     const { deps: deps2, reopened: reopened2 } = makeDeps(live2);
+    const targets2 = [{ number: 20, title: "v1.9.0", description: "d", issue_numbers: [3] }];
+    const actions2: ReconciliationAction[] = [
+      {
+        id: "001-reopen-20",
+        kind: "reopen",
+        milestone_number: 20,
+        milestone_title: "v1.9.0",
+      },
+    ];
+    const fp2 = computeLiveStateFingerprint(live2);
     await assert.rejects(
       () =>
         applySemverReconciliation(
           {
-            identity: "x",
-            live_state_fingerprint: computeLiveStateFingerprint(live2),
-            targets: [{ number: 20, title: "v1.9.0", description: "d", issue_numbers: [3] }],
-            actions: [
-              {
-                id: "001-reopen-20",
-                kind: "reopen",
-                milestone_number: 20,
-                milestone_title: "v1.9.0",
-              },
-            ],
+            identity: computeManifestIdentity(targets2, actions2, [], fp2),
+            live_state_fingerprint: fp2,
+            targets: targets2,
+            actions: actions2,
             coverage_blockers: [],
             generated_at: "2026-08-10T00:00:00Z",
           },
@@ -757,13 +762,20 @@ describe("applySemverReconciliation", () => {
 });
 
 describe("fingerprint and identity", () => {
-  it("identity is stable for same targets; fingerprint changes with issue milestone", () => {
+  it("identity is stable for same full package; fingerprint changes with issue milestone", () => {
     const live1 = makeLive([], [snap(1)]);
     const live2 = makeLive([], [snap(1, { milestone_title: "v1.2.0", milestone_number: 3 })]);
     const targets = [
       { title: "v1.2.0", description: "d", issue_numbers: [1], version_impact: "minor" as const },
     ];
-    assert.equal(computeManifestIdentity(targets), computeManifestIdentity(targets));
+    const actions: ReconciliationAction[] = [
+      { id: "001-create-v1.2.0", kind: "create", milestone_title: "v1.2.0" },
+    ];
+    const fp = "abc123";
+    assert.equal(
+      computeManifestIdentity(targets, actions, [], fp),
+      computeManifestIdentity(targets, actions, [], fp),
+    );
     assert.notEqual(
       computeLiveStateFingerprint(live1),
       computeLiveStateFingerprint(live2),
@@ -777,5 +789,201 @@ describe("fingerprint and identity", () => {
       computeLiveStateFingerprint(live1),
       computeLiveStateFingerprint(live2),
     );
+  });
+});
+
+describe("review 2 regressions (#910)", () => {
+  it("f33c51de: completed progress refuses silent no-op after later live-state drift", async () => {
+    const live = makeLive([], [snap(1, { labels: ["semver:patch"] })]);
+    const manifest = buildSimpleManifest(
+      live,
+      [{ title: "v1.0.1", issue_numbers: [1], rationale: "r", version_impact: "patch" }],
+      [classification(1, "patch")],
+    );
+    const { deps, files } = makeDeps(live);
+    const r1 = await applySemverReconciliation(manifest, "o/r", "/out", deps, { live });
+    assert.equal(r1.ok, true);
+    const progress = JSON.parse(files.get("/out/reconciliation-progress.json")!) as ReconciliationProgress;
+    assert.equal(progress.status, "complete");
+
+    // Post-completion drift: issue unassigned / moved
+    live.openIssues[0].milestone_title = null;
+    live.openIssues[0].milestone_number = null;
+    live.openIssues[0].updatedAt = "2026-08-10T99:00:00Z";
+
+    const r2 = await applySemverReconciliation(manifest, "o/r", "/out", deps, { live });
+    assert.equal(r2.ok, false, "must not report successful no-op after drift");
+    if (!r2.ok) assert.equal(r2.code, "fingerprint_drift");
+
+    // Gate path agrees
+    const gate = validateSemverApplyReady(manifest, live, {
+      expectedIdentity: manifest.identity,
+      resumeProgress: progress,
+    });
+    assert.equal(gate.ok, false);
+    if (!gate.ok) assert.equal(gate.code, "fingerprint_drift");
+  });
+
+  it("b2694882: full open-issue snapshot covers issues outside inventory filter", () => {
+    // Live snapshot has #99 not present in inventory-scoped openIssueNumbers.
+    const live = makeLive(
+      [],
+      [
+        snap(1, { labels: ["semver:patch"] }),
+        snap(99, { labels: ["semver:minor"] }), // newly opened / inventory-filtered out
+      ],
+    );
+    // Inventory-only view would pass openIssueNumbers: [1] only
+    const inventoryOnly = buildSimpleManifest(
+      live,
+      [{ title: "v1.0.1", issue_numbers: [1], rationale: "r", version_impact: "patch" }],
+      [classification(1, "patch")],
+      [1],
+    );
+    assert.ok(
+      !inventoryOnly.coverage_blockers.some((b) => b.issue_number === 99),
+      "control: inventory-only openIssueNumbers omits #99 from coverage",
+    );
+
+    // Full repository scope: every open issue from the live snapshot
+    const full = buildSimpleManifest(
+      live,
+      [{ title: "v1.0.1", issue_numbers: [1], rationale: "r", version_impact: "patch" }],
+      [classification(1, "patch"), classification(99, "minor")],
+      live.openIssues.map((i) => i.number),
+    );
+    assert.ok(
+      full.coverage_blockers.some(
+        (b) => b.issue_number === 99 && (b.reason === "unmilestoned" || b.reason === "unresolved_missing"),
+      ),
+      "full open-issue scope must surface #99 as a coverage blocker when not in plan lanes",
+    );
+    // Fingerprint must include #99
+    const without99 = makeLive([], [snap(1, { labels: ["semver:patch"] })]);
+    assert.notEqual(
+      computeLiveStateFingerprint(live),
+      computeLiveStateFingerprint(without99),
+      "fingerprint must include newly opened / filter-excluded open issues",
+    );
+  });
+
+  it("451c582a: identity binds actions; altered action artifact is refused", async () => {
+    const live = makeLive([], [snap(1, { labels: ["semver:patch"] })]);
+    const reviewed = buildSimpleManifest(
+      live,
+      [{ title: "v1.0.1", issue_numbers: [1], rationale: "reviewed", version_impact: "patch" }],
+      [classification(1, "patch")],
+    );
+    assert.ok(manifestIdentityMatches(reviewed));
+
+    // Inject an extra assign action without retargeting — identity must change
+    const tampered: ReconciliationManifest = {
+      ...reviewed,
+      actions: [
+        ...reviewed.actions,
+        {
+          id: "999-assign-injected",
+          kind: "assign",
+          issue_number: 1,
+          milestone_title: "v9.9.9",
+          detail: "injected",
+        },
+      ],
+    };
+    assert.equal(
+      manifestIdentityMatches(tampered),
+      false,
+      "actions are part of identity — injection must break the bind",
+    );
+
+    const { deps, files, created } = makeDeps(live);
+    // Persist tampered package with its *claimed* (stale) identity
+    await deps.writeFile(
+      "/out/reconciliation-manifest.json",
+      JSON.stringify(tampered, null, 2) + "\n",
+    );
+    const loaded = await loadReviewedManifest("/out", deps);
+    assert.equal(loaded, null, "loadReviewedManifest must reject identity/action mismatch");
+
+    // Even if loaded by force, apply refuses
+    const forced = await applySemverReconciliation(tampered, "o/r", "/out2", deps, {
+      live,
+      expectedIdentity: reviewed.identity,
+    });
+    assert.equal(forced.ok, false);
+    if (!forced.ok) {
+      assert.ok(
+        forced.code === "manifest_identity_mismatch" || forced.code === "fingerprint_drift",
+      );
+    }
+    assert.equal(created.length, 0);
+    assert.ok(!files.has("/out2/reconciliation-progress.json") || forced.ok === false);
+  });
+
+  it("bcdee39b: first-action resume uses post-hygiene fingerprint, not pre-hygiene", async () => {
+    // Simulate: apply starts with post-hygiene live (updatedAt already advanced by hygiene).
+    // First recon action fails before any completion is saved after the first mutation's
+    // post-action fp. Retry with the same post-hygiene live must resume, not refuse as drift.
+    const live = makeLive([], [
+      snap(7, { labels: ["semver:minor"], updatedAt: "2026-08-10T12:00:00Z" }),
+      snap(8, { labels: ["semver:minor"], updatedAt: "2026-08-10T12:00:00Z" }),
+    ]);
+    const manifest = buildSimpleManifest(
+      live,
+      [{ title: "v1.9.0", issue_numbers: [7, 8], rationale: "r", version_impact: "minor" }],
+      [classification(7, "minor"), classification(8, "minor")],
+    );
+
+    // Hygiene-like timestamp advance already reflected in the live snapshot used for apply
+    live.openIssues[0].updatedAt = "2026-08-10T12:05:00Z";
+    live.openIssues[1].updatedAt = "2026-08-10T12:05:00Z";
+    // Rebuild fingerprint on the reviewed package is not required for resume — progress
+    // seeds apply_start from the live passed to apply (post-hygiene).
+    const postHygieneFp = computeLiveStateFingerprint(live);
+    // Reviewed artifact still has pre-hygiene fingerprint (preview time).
+    assert.notEqual(postHygieneFp, manifest.live_state_fingerprint);
+
+    let failOnce = true;
+    const { deps, created, assigned, files } = makeDeps(live, {
+      createMilestone: async (_repo, title, description) => {
+        if (failOnce) {
+          failOnce = false;
+          throw new Error("simulated first-action failure after hygiene");
+        }
+        const number = 100;
+        created.push(title);
+        live.milestones.push(ms(number, title, { description: description ?? "", state: "open" }));
+        return number;
+      },
+    });
+
+    // First apply with gatesAlreadyChecked (as index does after hygiene refresh)
+    await assert.rejects(
+      () =>
+        applySemverReconciliation(manifest, "o/r", "/out", deps, {
+          live,
+          gatesAlreadyChecked: true,
+        }),
+      /simulated first-action failure after hygiene/,
+    );
+    const progress = JSON.parse(files.get("/out/reconciliation-progress.json")!) as ReconciliationProgress;
+    assert.equal(progress.status, "failed");
+    // apply_start must be the post-hygiene fingerprint, not the preview fingerprint
+    assert.equal(
+      progress.apply_start_fingerprint,
+      postHygieneFp,
+      "progress must seed from post-hygiene live so resume is not poisoned",
+    );
+
+    // Retry: same post-hygiene live — must resume, not fingerprint_drift
+    const r2 = await applySemverReconciliation(manifest, "o/r", "/out", deps, {
+      live,
+      gatesAlreadyChecked: true,
+    });
+    assert.equal(r2.ok, true, "resume must succeed when live still matches post-hygiene apply-start");
+    if (r2.ok) assert.equal(r2.resumed, true);
+    assert.equal(created.length, 1);
+    assert.ok(assigned.some((a) => a.issue === 7));
+    assert.ok(assigned.some((a) => a.issue === 8));
   });
 });
