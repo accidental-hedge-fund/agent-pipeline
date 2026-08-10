@@ -73,12 +73,19 @@ ship-milestone --milestones v1.34.0 v1.35.0 --detach
 | `ship-stage-watch` | Poll loop/advance events; post **stage transitions** only |
 | Phase heartbeats | Off by default (`SHIP_NOTIFY_HEARTBEAT_S=0`) |
 
-Stage-watch filters: drop `#None` / `#null`, skip stale precondition exclusions
-once an issue later advances. Prefer stage posts over generic “still running”
-heartbeats.
+Stage-watch filters (so a ship does **not** rebroadcast unrelated history):
+
+- **Since watermark:** only events at/after process start (or `--since`);
+  pre-ship loop/FRG history is ignored even when `seen-keys` is empty.
+- **Issue scope:** `--issue N`, or for milestones the `ordered_issues` from
+  `train.json` (`--issues-file`) once train writes it.
+- Drop `#None` / `#null`; skip stale precondition exclusions once an issue
+  later advances within the scoped set.
+
+Prefer stage posts over generic “still running” heartbeats.
 
 For a **single** issue advance, supervisors can start stage-watch with
-`--issue N` while `pipeline single N` runs — same filter rules.
+`--issue N` while `pipeline single N` runs — same since/filter rules.
 
 ## FRG hard stop
 
