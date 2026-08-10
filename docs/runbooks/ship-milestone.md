@@ -65,10 +65,20 @@ cp "$ROOT/examples/supervisor/shell/pipeline-ship-playbook.sh" \
   "$HOME/.local/bin/pipeline-ship-playbook"
 ```
 
-The playbook auto-generates the FRG release gate via `pipeline-ship-frg <ver>`
-when `.agent-pipeline/frg/<ver>/latest.json` is missing (a real gate — it runs
-the actual `factory-gate` scorer and never fabricates a pass), so no manual FRG
-pack setup is required before a `Ship milestone vX.Y.Z`.
+When `.agent-pipeline/frg/<ver>/latest.json` is missing:
+
+- **Exactly `1.33.0`:** the playbook may call `pipeline-ship-frg` (hybrid pilot).
+- **After `1.33.0` (1.34+):** use the durable engine path — do **not** use a
+  synthetic trivial docs pack:
+
+  ```bash
+  pipeline factory-release prepare --request <absolute-request.json> --json
+  ```
+
+  Two-call protocol: first call returns `awaiting_frg_attestation`; the
+  production-owned attestor signs those exact digests; the second call with the
+  unchanged request returns `complete` (shared `runRelease`). See
+  `docs/factory-reliability-gate-runbook.md` (#953 / #908).
 
 ## Submit and inspect one ship
 

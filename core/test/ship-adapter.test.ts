@@ -259,14 +259,34 @@ test("ship adapter fails closed with the exact existing FRG next action", async 
 
   await assert.rejects(
     deps.convergeFrgPack(intent, train),
-    /pipeline factory-gate --for 1\.34\.0 --from-run <loop-run-id> --observations <file>/,
+    /pipeline factory-release prepare --request <absolute-request\.json> --json/,
   );
 });
 
 test("ship adapter never rebinds provenance-free FRG evidence to a candidate", () => {
+  // Post-pilot (1.34+) without durable binding fails closed.
   assert.throws(
     () => assertFrgCandidateProvenance(frg, train, intent),
-    /no candidate provenance/,
+    /no durable candidate binding/,
+  );
+  // Post-pilot with matching durable binding is accepted (no hybrid provenance).
+  assert.doesNotThrow(() =>
+    assertFrgCandidateProvenance(frg, train, intent, {
+      durableCandidateGitSha: train.integrated_head_oid,
+    }),
+  );
+  // Hybrid provenance on post-pilot is refused.
+  const hybridOnPostPilot = {
+    ...frg,
+    pack_provenance: {
+      candidate_git_sha: train.integrated_head_oid,
+      repository: intent.repository,
+      base_branch: intent.base_branch,
+    },
+  } as unknown as FrgEvidence;
+  assert.throws(
+    () => assertFrgCandidateProvenance(hybridOnPostPilot, train, intent),
+    /hybrid pack_provenance is valid only for v1\.33\.0/,
   );
   const mismatched = {
     ...frg,
@@ -277,7 +297,10 @@ test("ship adapter never rebinds provenance-free FRG evidence to a candidate", (
     },
   } as unknown as FrgEvidence;
   assert.throws(
-    () => assertFrgCandidateProvenance(mismatched, train, intent),
+    () => assertFrgCandidateProvenance(mismatched, train, {
+      ...intent,
+      version: "1.33.0",
+    }),
     /does not match the exact train candidate/,
   );
 });

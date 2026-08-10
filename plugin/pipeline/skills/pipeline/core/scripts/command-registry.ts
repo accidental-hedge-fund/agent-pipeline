@@ -141,6 +141,20 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: true,
   },
 
+  // Durable 1.34+ FRG generation + prepare-only release handoff (#953 / #908).
+  // Nested verb: factory-release prepare --request <abs> --json.
+  // Two-call protocol; never merges/tags/promotes. mutatesGitHub true only on
+  // the post-attestation call that opens/reconciles the release PR via shared
+  // runRelease.
+  "factory-release": {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile", "json", "request"]),
+    needsConfig: false,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: true,
+  },
+
   // Two-track production pin (#762): show / init / promote / rollback.
   // Never merges or tags. Writes only the repo pin JSON under .agent-pipeline/.
   "engine-promote": {

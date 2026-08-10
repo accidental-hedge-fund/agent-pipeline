@@ -123,6 +123,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 - **Usage:** `pipeline factory-pin show|init --from-frg <X.Y.Z>|promote --for <X.Y.Z>|rollback [--to <X.Y.Z>] [--git-sha <sha>] [--force]`
 - **Summary:** Show / init / promote / rollback the factory production engine pin (last FRG-passed release; never merges or tags)
 
+#### `factory-release`
+
+- **Usage:** `pipeline factory-release prepare --request <absolute-request.json> --json`
+- **Summary:** Durable post-pilot FRG generation + prepare-only release handoff (two-call: awaiting_frg_attestation → complete; never merges/tags)
+
 #### `improve`
 
 - **Usage:** `pipeline improve [--apply] [--top <n>] [--json]`
