@@ -184,6 +184,44 @@ test("OpenSpec skipped gate_result is suppressed", () => {
   assert.ok(pass != null);
 });
 
+test("any skipped gate suppresses the whole stage lifecycle (visual-gate)", () => {
+  const state = createMaterialFilterState();
+  const lines = [
+    adv("stage_start", { stage: "visual-gate", at: "2026-07-31T00:10:00Z" }),
+    adv("gate_result", { gate: "visual-gate", result: "skipped", reason: "disabled" }),
+    adv("stage_complete", { stage: "visual-gate", outcome: "advanced", at: "2026-07-31T00:10:02Z" }),
+  ];
+  const out = filterMaterialLines(lines, undefined, state);
+  assert.deepEqual(out, [], "skipped stage start + complete must not surface");
+});
+
+test("stage_complete carries wall time when paired with stage_start", () => {
+  const state = createMaterialFilterState();
+  const out = filterMaterialLines([
+    adv("stage_start", { stage: "planning", at: "2026-07-31T00:00:00Z" }),
+    adv("stage_complete", { stage: "planning", outcome: "advanced", at: "2026-07-31T00:03:32Z" }),
+  ], undefined, state);
+  assert.equal(out.length, 1);
+  assert.match(out[0]!, /\[stage_start\] planning/);
+  assert.match(out[0]!, /\[stage_complete\] planning → advanced/);
+  assert.match(out[0]!, /3m32s/);
+});
+
+test("skipped eval-gate does not suppress an unrelated later stage", () => {
+  const state = createMaterialFilterState();
+  const lines = [
+    adv("stage_start", { stage: "eval-gate", at: "2026-07-31T00:20:00Z" }),
+    adv("gate_result", { gate: "eval-gate", result: "skipped", reason: "disabled" }),
+    adv("stage_complete", { stage: "eval-gate", outcome: "advanced", at: "2026-07-31T00:20:02Z" }),
+    adv("stage_start", { stage: "ready-to-deploy", at: "2026-07-31T00:21:00Z" }),
+    adv("stage_complete", { stage: "ready-to-deploy", outcome: "advanced", at: "2026-07-31T00:21:05Z" }),
+  ];
+  const out = filterMaterialLines(lines, undefined, state);
+  assert.equal(out.length, 1, "only ready-to-deploy lifecycle remains");
+  assert.match(out[0]!, /ready-to-deploy/);
+  assert.ok(!out[0]!.includes("eval-gate"));
+});
+
 test("loop_item_progress: first CI waiting only per stretch; definitive always", () => {
   const state = createMaterialFilterState();
   const waiting = loop("loop_item_progress", {
