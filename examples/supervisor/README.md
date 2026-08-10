@@ -16,6 +16,7 @@ They only map intent → `pipeline` CLI. They are **not** a second control plane
 |---|---|
 | `run-intent.sh` | Map a short intent string → `pipeline train` / `single` |
 | `ship-milestone.sh` | Forward one authorized request/status call to `pipeline ship`; optional systemd detach |
+| `pipeline-ship-playbook.sh` | **Chain-to-existing-tools ship** for builds without the `ship` subcommand: trains the milestone, releases, finishes, waits, and engine-promotes by composing existing `pipeline` commands (auto-generates the FRG release gate via `pipeline-ship-frg` when missing) |
 | `ship-notify.sh` | Optional Buzz status posts; **no-op** without messenger env |
 | `ship-stage-watch.sh` | Stream one explicit run event file through `material-filter.mjs` |
 | `pipeline-launcher.sh` | Resolve installed `pipeline` without hardcoding host paths |
