@@ -32,6 +32,11 @@ export interface EnginePromoteOpts {
   skipPromoteIfCurrent?: boolean;
   /** Skip the install step (pin-only). Default false. */
   skipInstall?: boolean;
+  /**
+   * Thin ship: promote pin without FRG latest.json (after published release).
+   * Default false.
+   */
+  allowWithoutFrg?: boolean;
   gitSha?: string | null;
   /** Absolute pin path override (AGENT_PIPELINE_PRODUCTION_PIN). */
   pinPath?: string | null;
@@ -65,6 +70,7 @@ export interface EnginePromoteDeps {
     version: string;
     gitSha?: string | null;
     overridePath?: string | null;
+    allowWithoutFrg?: boolean;
   }): Promise<PromotePinResult>;
   rollback(opts: {
     repoDir: string;
@@ -198,6 +204,7 @@ export async function runEnginePromote(
       version,
       gitSha: opts.gitSha,
       overridePath: opts.pinPath,
+      allowWithoutFrg: opts.allowWithoutFrg,
     });
     if (!promo.ok) {
       return {
@@ -329,6 +336,7 @@ export function realEnginePromoteDeps(repoDir: string): EnginePromoteDeps {
         version: opts.version,
         gitSha: opts.gitSha,
         overridePath: opts.overridePath,
+        allowWithoutFrg: opts.allowWithoutFrg,
       });
     },
     async rollback(opts) {

@@ -1988,6 +1988,49 @@ test("runRelease: missing FRG pass aborts before package.json mutation", async (
   assert.equal(written.length, 0, "must not write package files when FRG is missing");
 });
 
+test("runRelease: skipFrg proceeds without FRG and does not call requireFrgPass", async () => {
+  let frgCalls = 0;
+  let prBody = "";
+  const commands: string[][] = [];
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
+    requireFrgPass: async () => {
+      frgCalls += 1;
+      throw new Error("requireFrgPass must not run when skipFrg is set");
+    },
+    runCommand: (cmd, args) => {
+      commands.push([cmd, ...args]);
+      if (cmd === "git" && args[0] === "log") {
+        return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "create") {
+        const bodyIdx = args.indexOf("--body");
+        prBody = bodyIdx >= 0 ? args[bodyIdx + 1]! : "";
+        return { code: 0, stdout: "https://github.com/org/repo/pull/300", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  const result = await runRelease(
+    "1.6.0",
+    { noEdit: true, skipFrg: true },
+    { repo_dir: "/repo", repo: "org/repo" },
+    deps,
+  );
+  assert.ok(result);
+  assert.equal(result!.pr, 300);
+  assert.equal(frgCalls, 0, "FRG gate must be skipped");
+  assert.ok(!/Factory Reliability Gate/.test(prBody), "PR body should omit FRG section when skipped");
+  const add = commands.find((c) => c[0] === "git" && c[1] === "add");
+  assert.ok(add, "must stage release files");
+  assert.ok(
+    !add.some((a) => a.includes(".agent-pipeline/frg/")),
+    "must not stage FRG evidence dir when skipFrg",
+  );
+});
+
 test("runRelease: failed FRG aborts and is distinguishable from missing", async () => {
   const deps = makeDeps({
     readFile: (p) => {

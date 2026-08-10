@@ -66,3 +66,7 @@ Harvested invariants (still product goals):
 
 Older pilot design and host runbooks may remain as **historical** notes only.
 They are not the install or startup path.
+
+## Thin ship and FRG (2026-08-10)
+
+Milestone ship uses `train --merge` → `release --skip-frg` → `release finish` → `engine-promote --skip-frg`. FRG remains an explicit optional command (`factory-gate` / durable `factory-release prepare`), not a hard dependency of cutting a release after a successful integrate train.

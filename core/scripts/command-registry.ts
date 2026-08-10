@@ -89,7 +89,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
   release: {
     needsIssueNumber: false,
     // prepare: version + dryRun/edit; finish: pr number + json (positional finish <pr>)
-    allowedFlags: new Set(["repoPath", "base", "dryRun", "edit", "release", "json"]),
+    allowedFlags: new Set(["repoPath", "base", "dryRun", "edit", "release", "json", "skipFrg", "allowOpenSoakDefects"]),
     needsConfig: false,
     needsGhAuth: true,
     mutatesGitHub: true,
@@ -168,6 +168,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
       "dryRun",
       "gitSha",
       "skipInstall",
+      "skipFrg",
     ]),
     needsConfig: false,
     needsGhAuth: true,

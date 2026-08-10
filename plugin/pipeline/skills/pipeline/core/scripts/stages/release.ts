@@ -1,7 +1,9 @@
 // Release sub-command (#170): prepares a release PR by:
 // 1. Resolving the version (alias → semver)
-// 2. Requiring a Factory Reliability Gate pass for that version (#723)
+// 2. Factory Reliability Gate for that version (#723) — default required;
+//    opt out with ReleaseOpts.skipFrg for thin ship (train→release→promote)
 // 2c. Failing closed on open candidate-linked engine-class soak defects (#755)
+//    (skipped when skipFrg — soak attribution is FRG-linked)
 // 3. Bumping both package.json files
 // 4. Regenerating the plugin/ mirror (node scripts/build.mjs)
 // 5. Running the CI gate (npm run ci)
@@ -64,6 +66,12 @@ export interface ReleaseOpts {
    * release PR body. There is no silent env/config skip.
    */
   allowOpenSoakDefects?: string;
+  /**
+   * Thin-ship opt-out: do not require `.agent-pipeline/frg/<ver>/latest.json`.
+   * FRG remains available via `pipeline factory-gate` / durable prepare; it is
+   * no longer a hard dependency of milestone ship. Default false (gate on).
+   */
+  skipFrg?: boolean;
 }
 
 /** Stable machine-readable identity of the release PR created by prepare. */
@@ -1574,35 +1582,40 @@ export async function runRelease(
   const resolvedVersion = resolveVersion(versionArg, previousVersion);
   d.stdout(`[pipeline release] resolved version: ${resolvedVersion}`);
 
-  // 2b. Factory Reliability Gate (#723) — fail closed before any mutation when
-  // evidence is missing, unparsable, or pass:false. Additive to npm run ci.
-  // Does not merge or tag. Dry-run still checks so operators learn early.
-  d.stdout(`[pipeline release] checking Factory Reliability Gate for ${resolvedVersion}...`);
-  const frgRequire =
-    d.requireFrgPass ??
-    ((dir: string, ver: string) => {
-      const fsDeps: FrgFsDeps = {
-        readFile: async (p) => d.readFile(p),
-        writeFile: async () => {},
-        mkdir: async () => {},
-        rename: async () => {},
-      };
-      return requireFrgPassForRelease(dir, ver, fsDeps);
-    });
-  const frgEvidence = await frgRequire(repoDir, resolvedVersion);
-  if (!frgEvidence.pass || !frgEvidence.run_id.trim()) {
-    throw new Error(
-      `[pipeline release] Factory Reliability Gate for ${resolvedVersion} lacks a usable pass run_id — refusing release preparation.`,
+  // 2b. Factory Reliability Gate (#723) — default fail-closed; opt out with skipFrg
+  // for thin milestone ship (train --merge → release → engine-promote). FRG stays
+  // available as an explicit factory-gate / durable-prepare command.
+  let frgEvidence: FrgEvidence | null = null;
+  const releaseFrgDir = path.join(FRG_EVIDENCE_ROOT_REL, resolvedVersion);
+  if (opts.skipFrg) {
+    d.stdout(
+      `[pipeline release] skipping Factory Reliability Gate for ${resolvedVersion} (--skip-frg); ` +
+        `FRG is advisory for thin ship — run \`pipeline factory-gate --for ${resolvedVersion}\` separately if desired`,
+    );
+  } else {
+    d.stdout(`[pipeline release] checking Factory Reliability Gate for ${resolvedVersion}...`);
+    const frgRequire =
+      d.requireFrgPass ??
+      ((dir: string, ver: string) => {
+        const fsDeps: FrgFsDeps = {
+          readFile: async (p) => d.readFile(p),
+          writeFile: async () => {},
+          mkdir: async () => {},
+          rename: async () => {},
+        };
+        return requireFrgPassForRelease(dir, ver, fsDeps);
+      });
+    frgEvidence = await frgRequire(repoDir, resolvedVersion);
+    if (!frgEvidence.pass || !frgEvidence.run_id.trim()) {
+      throw new Error(
+        `[pipeline release] Factory Reliability Gate for ${resolvedVersion} lacks a usable pass run_id — refusing release preparation.`,
+      );
+    }
+    d.stdout(
+      `[pipeline release] FRG pass: run_id=${frgEvidence.run_id}` +
+        (frgEvidence.loop_run_id ? ` loop_run_id=${frgEvidence.loop_run_id}` : ""),
     );
   }
-  d.stdout(
-    `[pipeline release] FRG pass: run_id=${frgEvidence.run_id}` +
-      (frgEvidence.loop_run_id ? ` loop_run_id=${frgEvidence.loop_run_id}` : ""),
-  );
-  // The release PR must carry the exact evidence that passed the gate. Keep
-  // this path version-scoped so evidence for another candidate cannot enter
-  // the release commit through a broad `.agent-pipeline/frg` add.
-  const releaseFrgDir = path.join(FRG_EVIDENCE_ROOT_REL, resolvedVersion);
 
   // 3. Find last git tag for git-log range (local git call, safe in all modes).
   const tagResult = d.runCommand("git", ["describe", "--tags", "--abbrev=0"], { cwd: repoDir });
@@ -1613,53 +1626,63 @@ export async function runRelease(
     d.stdout("[pipeline release] no previous tag found; git log range: HEAD");
   }
 
-  // 3b. Open soak-defect preflight (#755) — after FRG identity is known and the
-  // previous tag is resolved, before any version-file mutation. Live and dry-run.
-  // Merge-queue release-when-complete reuses this same runRelease gate (no bypass).
+  // 3b. Open soak-defect preflight (#755) — FRG-linked; skipped when skipFrg.
   const previousTagCreatedAt = lastTag
     ? resolvePreviousTagCreatedAt(lastTag, d.runCommand, repoDir)
     : null;
 
-  d.stdout("[pipeline release] checking open engine-class soak defects for candidate...");
-  const listOpen =
-    d.listOpenSoakDefectCandidates ?? (async () => [] as SoakDefectCandidateIssue[]);
-  const listClosed =
-    d.listClosedSoakDefectCandidates ?? (async () => [] as SoakDefectCandidateIssue[]);
-  const listTyped =
-    d.listTypedSoakEvidence ??
-    (async () => [] as TypedSoakEvidence[]);
-  const soakPreflight = await runOpenSoakDefectPreflight(
-    {
-      version: resolvedVersion,
-      frgRunId: frgEvidence.run_id,
-      loopRunId: frgEvidence.loop_run_id,
-      previousTag: lastTag || null,
-      previousTagCreatedAt,
-      overrideReason: opts.allowOpenSoakDefects,
-    },
-    {
-      listOpenIssues: listOpen,
-      listClosedIssues: listClosed,
-      listTypedSoakEvidence: () =>
-        listTyped({
-          loopRunId: frgEvidence.loop_run_id,
-          frgRunId: frgEvidence.run_id,
-        }),
-    },
-  );
-  if (!soakPreflight.ok) {
-    throw new Error(soakPreflight.message);
-  }
-  const openSoakWaiver =
-    soakPreflight.waived != null
-      ? { waived: soakPreflight.waived, blocking: soakPreflight.blocking }
-      : null;
-  if (openSoakWaiver) {
+  let openSoakWaiver: {
+    waived: OpenSoakDefectWaiver;
+    blocking: BlockingSoakDefect[];
+  } | null = null;
+  if (opts.skipFrg) {
     d.stdout(
-      `[pipeline release] open-soak-defect override accepted for ${openSoakWaiver.waived.issueNumbers.map((n) => `#${n}`).join(", ") || "(defects)"} — reason recorded on PR body`,
+      "[pipeline release] skipping open soak-defect preflight (--skip-frg; soak attribution is FRG-linked)",
     );
   } else {
-    d.stdout("[pipeline release] open-soak-defect preflight: no blocking open engine-class defects");
+    d.stdout("[pipeline release] checking open engine-class soak defects for candidate...");
+    const listOpen =
+      d.listOpenSoakDefectCandidates ?? (async () => [] as SoakDefectCandidateIssue[]);
+    const listClosed =
+      d.listClosedSoakDefectCandidates ?? (async () => [] as SoakDefectCandidateIssue[]);
+    const listTyped =
+      d.listTypedSoakEvidence ??
+      (async () => [] as TypedSoakEvidence[]);
+    const frgRunId = frgEvidence!.run_id;
+    const loopRunId = frgEvidence!.loop_run_id;
+    const soakPreflight = await runOpenSoakDefectPreflight(
+      {
+        version: resolvedVersion,
+        frgRunId,
+        loopRunId,
+        previousTag: lastTag || null,
+        previousTagCreatedAt,
+        overrideReason: opts.allowOpenSoakDefects,
+      },
+      {
+        listOpenIssues: listOpen,
+        listClosedIssues: listClosed,
+        listTypedSoakEvidence: () =>
+          listTyped({
+            loopRunId,
+            frgRunId,
+          }),
+      },
+    );
+    if (!soakPreflight.ok) {
+      throw new Error(soakPreflight.message);
+    }
+    openSoakWaiver =
+      soakPreflight.waived != null
+        ? { waived: soakPreflight.waived, blocking: soakPreflight.blocking }
+        : null;
+    if (openSoakWaiver) {
+      d.stdout(
+        `[pipeline release] open-soak-defect override accepted for ${openSoakWaiver.waived.issueNumbers.map((n) => `#${n}`).join(", ") || "(defects)"} — reason recorded on PR body`,
+      );
+    } else {
+      d.stdout("[pipeline release] open-soak-defect preflight: no blocking open engine-class defects");
+    }
   }
 
   // 4. Read ROADMAP and resolve theme / plan-row issue sources.
@@ -1905,9 +1928,12 @@ export async function runRelease(
   }
 
   d.stdout("[pipeline release] staging release files...");
+  const addPaths = ["package.json", "core/package.json", "ROADMAP.md", "plugin/"];
+  // Only stage FRG evidence when the gate ran and produced a pass artifact.
+  if (frgEvidence) addPaths.push(releaseFrgDir);
   const addResult = d.runCommand(
     "git",
-    ["add", "package.json", "core/package.json", "ROADMAP.md", "plugin/", releaseFrgDir],
+    ["add", ...addPaths],
     { cwd: repoDir },
   );
   if (addResult.code !== 0) {

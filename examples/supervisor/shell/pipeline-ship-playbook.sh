@@ -599,57 +599,14 @@ if [[ -f "$RUN_DIR/stage-watch.pid" ]]; then
   fi
 fi
 
-# B: release prepare (requires FRG) — auto-generate when evidence is missing
-# Post-1.33.0 (#953): durable engine path is
-#   pipeline factory-release prepare --request <abs.json> --json
-# (two-call: awaiting_frg_attestation → production attestor → complete).
-# Do NOT use synthetic trivial docs packs for 1.34+. Hybrid frg-runner remains
-# valid only for exactly 1.33.0.
-FRG_LATEST="$REPO_DIR/.agent-pipeline/frg/$version/latest.json"
-if [[ ! -f "$FRG_LATEST" ]]; then
-  if [[ "$version" == "1.33.0" ]]; then
-    write_state "release-prepare" "running" "FRG missing — auto-generating via pipeline-ship-frg $version (hybrid pilot)"
-    log "FRG missing at $FRG_LATEST — invoking pipeline-ship-frg $version (1.33.0 hybrid only)"
-    FRG_BIN="${FRG_BIN:-$SCRIPT_DIR/pipeline-ship-frg}"
-    if [[ -x "$FRG_BIN" ]]; then
-      ship_notify "ship $milestone: FRG missing — running pipeline-ship-frg $version (auto-generate)" "frg-missing-$version-$$" --force
-      set +e
-      "$FRG_BIN" "$version" >>"$LOG_FILE" 2>&1
-      frg_ec=$?
-      set -e
-      if [[ $frg_ec -ne 0 || ! -f "$FRG_LATEST" ]]; then
-        write_state "release-prepare" "failed" "FRG auto-generate failed (exit $frg_ec) for $version"
-        log "FAIL: pipeline-ship-frg $version exit $frg_ec; still missing $FRG_LATEST"
-        log "  Check attestation key (PIPELINE_FRG_ATTESTATION_KEY_FILE) and frg.log in $STATE_ROOT/frg-$version/"
-        ship_notify "ship $milestone: STOPPED — FRG auto-generate FAILED for $version (exit $frg_ec). See $STATE_ROOT/frg-$version/frg.log" "frg-missing-$version-$$" --force
-        exit 2
-      fi
-    else
-      write_state "release-prepare" "failed" "FRG missing for $version and no pipeline-ship-frg at $FRG_BIN"
-      log "FAIL: Factory Reliability Gate pass missing at $FRG_LATEST and $FRG_BIN not found"
-      log "  See docs/runbooks/frg-pack-checklist.md and docs/factory-reliability-gate-runbook.md"
-      ship_notify "ship $milestone: STOPPED — FRG missing for $version (need $FRG_LATEST) and pipeline-ship-frg unavailable." "frg-missing-$version-$$" --force
-      exit 2
-    fi
-    log "FRG auto-generated ok for $version"
-  else
-    write_state "release-prepare" "failed" "FRG missing for $version — use durable factory-release prepare (no synthetic pack)"
-    log "FAIL: Factory Reliability Gate pass missing at $FRG_LATEST for post-pilot version $version"
-    log "  Durable path (required for 1.34+; synthetic trivial packs are not release-eligible):"
-    log "    1) Build secret-free request bound to pin, base, candidate, version"
-    log "    2) pipeline factory-release prepare --request <absolute-request.json> --json"
-    log "       → status awaiting_frg_attestation (unsigned digests; no release PR)"
-    log "    3) Production-owned attestor signs those exact artifacts"
-    log "    4) Same command + unchanged request → status complete (shared runRelease)"
-    log "  See docs/factory-reliability-gate-runbook.md (#953 / #908)"
-    ship_notify "ship $milestone: STOPPED — FRG missing for $version. Use pipeline factory-release prepare (durable 1.34+ path), not a synthetic pack." "frg-missing-$version-$$" --force
-    exit 2
-  fi
-fi
-write_state "release-prepare" "running" "pipeline release $version --no-edit"
-log "phase release-prepare: start"
+# B: release prepare — thin ship path (train --merge already finished).
+# FRG is NOT a hard gate for milestone ship. Optional advisory FRG remains:
+#   pipeline factory-gate --for <ver> --from-run <loop>
+# Release uses --skip-frg so missing/broken FRG tooling cannot block a clean train.
+write_state "release-prepare" "running" "pipeline release $version --no-edit --skip-frg"
+log "phase release-prepare: start (thin ship; FRG not required)"
 set +e
-"$PIPELINE" release "$version" --no-edit >"$RUN_DIR/release-prepare.out" 2>"$RUN_DIR/release-prepare.err"
+"$PIPELINE" release "$version" --no-edit --skip-frg >"$RUN_DIR/release-prepare.out" 2>"$RUN_DIR/release-prepare.err"
 rel_ec=$?
 set -e
 cat "$RUN_DIR/release-prepare.out" >>"$LOG_FILE" 2>/dev/null || true
@@ -680,13 +637,6 @@ if [[ -z "$pr" ]]; then
   rel_err=$(cat "$RUN_DIR/release-prepare.err" 2>/dev/null || true)
   rel_out=$(cat "$RUN_DIR/release-prepare.out" 2>/dev/null || true)
   combined="$rel_err"$'\n'"$rel_out"
-  if echo "$combined" | grep -qi 'Factory Reliability Gate pass missing\|frg/.*/latest.json\|factory-gate --for'; then
-    write_state "release-prepare" "failed" "FRG missing for $version"
-    log "FAIL: FRG pass missing for $version — run factory-gate pack then: pipeline factory-gate --for $version --from-run <pack-run-id>"
-    log "  See docs/runbooks/frg-pack-checklist.md"
-    ship_notify "ship $milestone: STOPPED — Factory Reliability Gate missing for $version. Issue train may be done; release needs .agent-pipeline/frg/$version/latest.json." "frg-missing-$version-$$" --force
-    exit 2
-  fi
   write_state "release-prepare" "failed" "could not determine release PR number"
   log "FAIL: no release PR number; release out/err:"
   log "$combined"
@@ -744,10 +694,10 @@ fi
 write_state "wait-release" "ok" "v$version published"
 
 # E: engine-promote
-write_state "engine-promote" "running" "pipeline engine-promote --for $version --host $HOST --json"
+write_state "engine-promote" "running" "pipeline engine-promote --for $version --host $HOST --skip-frg --json"
 log "phase engine-promote: start"
 set +e
-"$PIPELINE" engine-promote --for "$version" --host "$HOST" --json >"$RUN_DIR/engine-promote.json" 2>"$RUN_DIR/engine-promote.err"
+"$PIPELINE" engine-promote --for "$version" --host "$HOST" --skip-frg --json >"$RUN_DIR/engine-promote.json" 2>"$RUN_DIR/engine-promote.err"
 pro_ec=$?
 set -e
 cat "$RUN_DIR/engine-promote.err" >>"$LOG_FILE" 2>/dev/null || true

@@ -65,20 +65,31 @@ cp "$ROOT/examples/supervisor/shell/pipeline-ship-playbook.sh" \
   "$HOME/.local/bin/pipeline-ship-playbook"
 ```
 
-When `.agent-pipeline/frg/<ver>/latest.json` is missing:
+## FRG is not part of thin ship
 
-- **Exactly `1.33.0`:** the playbook may call `pipeline-ship-frg` (hybrid pilot).
-- **After `1.33.0` (1.34+):** use the durable engine path — do **not** use a
-  synthetic trivial docs pack:
+Milestone ship is:
 
-  ```bash
-  pipeline factory-release prepare --request <absolute-request.json> --json
-  ```
+```bash
+pipeline train --milestone vX.Y.Z --merge
+pipeline release X.Y.Z --no-edit --skip-frg
+pipeline release finish <pr>
+pipeline engine-promote --for X.Y.Z --host all --skip-frg
+```
 
-  Two-call protocol: first call returns `awaiting_frg_attestation`; the
-  production-owned attestor signs those exact digests; the second call with the
-  unchanged request returns `complete` (shared `runRelease`). See
-  `docs/factory-reliability-gate-runbook.md` (#953 / #908).
+(`pipeline-ship-playbook` runs that chain.)
+
+**Factory Reliability Gate is optional / advisory** for this path. Release and
+engine-promote accept `--skip-frg` so missing or incomplete FRG tooling cannot
+block a clean train. To run FRG deliberately:
+
+```bash
+pipeline factory-gate --for X.Y.Z --from-run <loop-run-id>
+# or durable prepare (1.34+ factory tooling):
+pipeline factory-release prepare --request <absolute-request.json> --json
+```
+
+See `docs/factory-reliability-gate-runbook.md`. Do not invent synthetic FRG
+passes to unblock ship.
 
 ## Submit and inspect one ship
 
