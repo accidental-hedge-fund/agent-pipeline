@@ -2,16 +2,17 @@
 
 ### Requirement: `pipeline roadmap --apply` SHALL create GitHub milestones from `milestones[]` and assign issues
 
-When `pipeline roadmap --apply` is run under `release_model: semver` (or when
-`release_model` is absent), the engine SHALL perform **full SemVer milestone
-reconciliation** against one reviewed reconciliation manifest derived from the
-plan (see the full-reconciliation requirements in this capability). The default
-dry-run run (no `--apply`) SHALL NOT create any milestone, rename or reopen any
-milestone, update any milestone description, assign any issue, or clear any
-milestone assignment. Under SemVer, milestone write-back SHALL be idempotent
-with respect to the reviewed target state: an existing reusable milestone with
-the approved identity SHALL be reused rather than duplicated, and a second apply
-against already-converged state SHALL perform no further mutations.
+The engine SHALL perform **full SemVer milestone reconciliation** when
+`pipeline roadmap --apply` runs under `release_model: semver` (or when
+`release_model` is absent), against one reviewed reconciliation manifest derived
+from the plan (see the full-reconciliation requirements in this capability). The
+default dry-run run (no `--apply`) SHALL NOT create any milestone, rename or
+reopen any milestone, update any milestone description, assign any issue, or
+clear any milestone assignment. Under SemVer, milestone write-back SHALL be
+idempotent with respect to the reviewed target state: an existing reusable
+milestone with the approved identity SHALL be reused rather than duplicated, and
+a second apply against already-converged state SHALL perform no further
+mutations.
 
 When `release_model` is `continuous`, the engine SHALL create one GitHub
 milestone per entry in `plan.json.milestones[]` and assign each listed issue to
@@ -75,10 +76,10 @@ coverage) in this requirement.
 
 ### Requirement: Full SemVer reconciliation SHALL cover every open issue with exactly one release milestone
 
-Under `release_model: semver` (or when `release_model` is absent), a successful
-full-reconciliation apply SHALL leave every open issue in the repository scope
-with exactly one full SemVer milestone whose title matches
-`v<MAJOR>.<MINOR>.<PATCH>`. The reviewed reconciliation manifest SHALL name that
+Full SemVer reconciliation apply SHALL leave every open issue in the repository
+scope with exactly one full SemVer milestone whose title matches
+`v<MAJOR>.<MINOR>.<PATCH>` under `release_model: semver` (or when
+`release_model` is absent). The reviewed reconciliation manifest SHALL name that
 assignment for each open issue. No open issue SHALL remain unmilestoned after
 successful apply. An open issue SHALL NOT be assigned to two milestones. Theme
 labels, epic labels, and other non-milestone metadata SHALL NOT count as
@@ -105,15 +106,15 @@ satisfying this invariant.
 
 ### Requirement: SemVer reconciliation version selection SHALL use only #909 applied classification
 
-Under full SemVer reconciliation, the engine SHALL select each issue’s target
-milestone version using only the resolved applied compatibility impact owned by
-the exclusive `semver:major` / `semver:minor` / `semver:patch` classification
-rules. Free-form issue title text and body text SHALL NOT set, upgrade, or
-downgrade the version used for reconciliation. When an open issue has unresolved
-applied impact (missing or conflicting explicit `semver:*` labels), the engine
-SHALL record a visible coverage blocker in dry-run output and SHALL NOT apply
-full reconciliation until that issue has resolved applied impact and a valid
-manifest assignment.
+The engine SHALL select each issue’s target milestone version using only the
+resolved applied compatibility impact owned by the exclusive `semver:major` /
+`semver:minor` / `semver:patch` classification rules under full SemVer
+reconciliation. Free-form issue title text and body text SHALL NOT set, upgrade,
+or downgrade the version used for reconciliation. When an open issue has
+unresolved applied impact (missing or conflicting explicit `semver:*` labels),
+the engine SHALL record a visible coverage blocker in dry-run output and SHALL
+NOT apply full reconciliation until that issue has resolved applied impact and a
+valid manifest assignment.
 
 #### Scenario: Explicit label drives recon version, not prose
 
@@ -134,9 +135,9 @@ manifest assignment.
 
 ### Requirement: Dry-run SHALL list every planned SemVer reconciliation action before mutation
 
-When `pipeline roadmap` runs without `--apply` under SemVer full reconciliation,
-the engine SHALL emit a preview that lists every planned action in the
-reconciliation manifest. The listed kinds SHALL include, when applicable:
+The engine SHALL emit a dry-run preview that lists every planned action in the
+reconciliation manifest when `pipeline roadmap` runs without `--apply` under
+SemVer full reconciliation. The listed kinds SHALL include, when applicable:
 milestone create, reuse, reopen, rename, description update, issue assignment,
 and stale assignment removal. Each listed action SHALL identify the affected
 milestone identity and/or issue number with enough detail for an operator to
@@ -260,11 +261,11 @@ shipped milestone identity for a new planning lane.
 
 ### Requirement: Partial SemVer apply failure SHALL record progress and resume safely
 
-When full SemVer reconciliation apply fails after completing one or more
-actions, the engine SHALL record which actions completed and which remain
-pending, together with the manifest identity and the fingerprint in force at
-apply start. A subsequent resume or retry with the same manifest identity SHALL
-continue from the first pending action without creating duplicate milestones for
+The engine SHALL record which actions completed and which remain pending when
+full SemVer reconciliation apply fails after completing one or more actions,
+together with the manifest identity and the fingerprint in force at apply start.
+A subsequent resume or retry with the same manifest identity SHALL continue from
+the first pending action without creating duplicate milestones for
 already-completed creates and without repeating assignments that already match
 the target. If live state has drifted such that the pending plan is no longer
 valid under the fingerprint rules, the engine SHALL abort resume and require a

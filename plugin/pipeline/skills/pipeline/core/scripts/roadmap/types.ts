@@ -10,12 +10,113 @@ export interface Issue {
   url: string;
   state: "open" | "closed";
   updatedAt?: string;
+  /** Current GitHub milestone when known (inventory / recon fingerprint). */
+  milestone?: { number: number; title: string } | null;
 }
 
 export interface Milestone {
   id: number;
   number: number;
   title: string;
+}
+
+/** Live milestone catalog entry for SemVer full reconciliation (#910). */
+export interface MilestoneCatalogEntry {
+  id: number;
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  description: string;
+  open_issues: number;
+  closed_issues: number;
+}
+
+/** Open-issue snapshot used for live-state fingerprinting and stale detection (#910). */
+export interface IssueMilestoneSnapshot {
+  number: IssueNumber;
+  state: "open" | "closed";
+  milestone_number: number | null;
+  milestone_title: string | null;
+  updatedAt?: string;
+  labels: string[];
+}
+
+/** Reconciliation mutation kinds under full SemVer milestone reconciliation. */
+export type ReconciliationActionKind =
+  | "create"
+  | "reuse"
+  | "reopen"
+  | "rename"
+  | "update_description"
+  | "assign"
+  | "clear_stale";
+
+export interface ReconciliationAction {
+  /** Stable id within one manifest (used for progress / resume). */
+  id: string;
+  kind: ReconciliationActionKind;
+  /** GitHub milestone number when known. */
+  milestone_number?: number;
+  /** Current or target milestone title. */
+  milestone_title?: string;
+  /** Target title for rename. */
+  new_title?: string;
+  /** Target description for create / update_description. */
+  description?: string;
+  /** Affected issue for assign / clear_stale. */
+  issue_number?: IssueNumber;
+  /** Operator-facing detail for dry-run listing. */
+  detail?: string;
+}
+
+export interface ReconciliationTargetMilestone {
+  /** Stable GitHub milestone number when bound to an existing identity. */
+  number?: number;
+  title: string;
+  description: string;
+  version_impact?: CompatibilityImpact;
+  issue_numbers: IssueNumber[];
+}
+
+export type CoverageBlockerReason =
+  | "unresolved_missing"
+  | "unresolved_conflict"
+  | "unmilestoned"
+  | "dual_membership"
+  | "title_collision"
+  | "shipped_immutable";
+
+export interface CoverageBlocker {
+  issue_number?: IssueNumber;
+  reason: CoverageBlockerReason;
+  detail: string;
+}
+
+/**
+ * Reviewed reconciliation manifest: sole apply target for SemVer full recon (#910).
+ * Apply executes only this action list against a matching live-state fingerprint.
+ */
+export interface ReconciliationManifest {
+  /** Content hash of the reviewed target state (not live fingerprint). */
+  identity: string;
+  /** Live-state fingerprint captured at preview / plan build time. */
+  live_state_fingerprint: string;
+  targets: ReconciliationTargetMilestone[];
+  actions: ReconciliationAction[];
+  coverage_blockers: CoverageBlocker[];
+  generated_at: string;
+}
+
+/** Durable apply progress for safe partial-failure resume (#910). */
+export interface ReconciliationProgress {
+  manifest_identity: string;
+  apply_start_fingerprint: string;
+  /** Full ordered action list from the reviewed manifest (resume uses this, not a re-plan). */
+  actions: ReconciliationAction[];
+  completed: Array<{ id: string; result?: { milestone_number?: number } }>;
+  next_pending_id: string | null;
+  status: "in_progress" | "failed" | "complete";
+  updated_at: string;
 }
 
 export interface InventoryItem {
@@ -226,6 +327,11 @@ export interface PlanJson {
    * semver / default). Continuous runs omit this field.
    */
   compatibility_classifications?: CompatibilityClassification[];
+  /**
+   * Full SemVer milestone reconciliation manifest (semver / default only).
+   * Dry-run and apply share this reviewed target; continuous runs omit it.
+   */
+  reconciliation?: ReconciliationManifest;
   /** Present only when release_model === 'continuous'. CalVer format: YYYY.0M.MICRO */
   continuous_version_marker?: string;
   run_stats?: RunStats;

@@ -151,7 +151,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `roadmap`
 
 - **Usage:** `pipeline roadmap [--apply] [--next <n>]`
-- **Summary:** Analyze open backlog into a dependency-aware scored roadmap
+- **Summary:** Analyze open backlog into a dependency-aware scored roadmap; under SemVer, dry-run lists full milestone reconciliation actions and --apply converges open issues to the reviewed manifest (fingerprint-gated)
 
 #### `sweep`
 
