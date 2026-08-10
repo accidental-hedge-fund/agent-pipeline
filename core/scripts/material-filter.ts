@@ -120,6 +120,14 @@ export interface MaterialFilterState {
   ciWaitingOpen: boolean;
   /** Last optional-kind decision fingerprint (schedule/reconcile bursts). */
   lastOptionalFp: string | null;
+  /**
+   * Buffered `stage_start` for the current stage, emitted only when the stage
+   * proves material (its gate did not report skipped). Lets a skipped stage
+   * (e.g. disabled visual-gate/eval-gate) be dropped as a whole lifecycle.
+   */
+  pendingStageStart: { stage: string; line: string; tsMs: number } | null;
+  /** Stages whose gate_result reported `skipped` — suppress their completion. */
+  skippedStages: Set<string>;
 }
 
 export function createMaterialFilterState(): MaterialFilterState {
@@ -127,6 +135,8 @@ export function createMaterialFilterState(): MaterialFilterState {
     lastBurstFp: null,
     ciWaitingOpen: false,
     lastOptionalFp: null,
+    pendingStageStart: null,
+    skippedStages: new Set(),
   };
 }
 
@@ -193,13 +203,61 @@ function filterAdvance(
   opts: MaterialFilterOptions,
   raw: string,
 ): string | null {
+  if (type === "stage_start") {
+    // In jsonl mode, pass raw material lines through verbatim (debug contract).
+    if (opts.jsonl) return emit(opts, raw, formatAdvanceOneLiner(type, obj));
+    // Buffer the start until the stage proves material (gate not skipped). This
+    // lets a disabled gate's whole lifecycle (start + complete) be dropped.
+    const stage = typeof obj.stage === "string" ? obj.stage : "?";
+    state.pendingStageStart = {
+      stage,
+      line: formatAdvanceOneLiner(type, obj),
+      tsMs: parseEpochMs(obj.at),
+    };
+    return null;
+  }
+
+  if (type === "stage_complete") {
+    const stage = typeof obj.stage === "string" ? obj.stage : "?";
+    // In jsonl mode, pass raw material lines through verbatim (debug contract).
+    if (opts.jsonl) return emit(opts, raw, formatAdvanceOneLiner(type, obj));
+    const pending = state.pendingStageStart;
+    state.pendingStageStart = null;
+
+    // A stage whose gate reported skipped (visual-gate/eval-gate disabled) is
+    // not material: drop its start and completion together.
+    if (state.skippedStages.has(stage)) {
+      state.skippedStages.delete(stage);
+      return null;
+    }
+
+    let line = formatAdvanceOneLiner(type, obj);
+    // Wall time from the buffered start, when both timestamps are usable.
+    if (
+      pending != null &&
+      pending.stage === stage &&
+      Number.isFinite(pending.tsMs)
+    ) {
+      const endMs = parseEpochMs(obj.at);
+      if (Number.isFinite(endMs) && endMs >= pending.tsMs) {
+        line += ` (${formatWallMs(endMs - pending.tsMs)})`;
+      }
+    }
+    const out: string[] = [];
+    if (pending != null && pending.stage === stage) out.push(pending.line);
+    out.push(line);
+    return out.join("\n");
+  }
+
   if (type === "gate_result") {
     const gate = typeof obj.gate === "string" ? obj.gate : "";
     const result = typeof obj.result === "string" ? obj.result : "";
     const reason = typeof obj.reason === "string" ? obj.reason : "";
 
-    // Suppress OpenSpec skipped spam entirely (re-poll noise).
-    if (/openspec/i.test(gate) && result === "skipped") {
+    // Any skipped gate (not just OpenSpec) marks its stage as non-material;
+    // the stage_complete (and buffered start) will be dropped.
+    if (result === "skipped") {
+      if (gate !== "") state.skippedStages.add(gate);
       return null;
     }
 
@@ -208,18 +266,17 @@ function filterAdvance(
       const fp = `gate|${gate}|${result}|${reason}`;
       if (state.lastBurstFp === fp) return null;
       state.lastBurstFp = fp;
-      return emit(opts, raw, formatAdvanceOneLiner(type, obj));
+      return flushPendingStart(state, emit(opts, raw, formatAdvanceOneLiner(type, obj)));
     }
 
     // Definitive gate outcomes clear partial-burst state.
     state.lastBurstFp = null;
-    return emit(opts, raw, formatAdvanceOneLiner(type, obj));
+    return flushPendingStart(state, emit(opts, raw, formatAdvanceOneLiner(type, obj)));
   }
 
-  // stage_accounting / polling-shaped stage_complete spam is not in the allow
-  // list. For allow-listed kinds, collapse exact identical consecutive bursts
-  // (e.g. repeated pre_merge.advancePolling-shaped gate-adjacent noise if it
-  // ever lands on an allow-listed type with the same fingerprint).
+  // Other advance events (run_start, pr_created, review_verdict, blocker_*,
+  // run_complete) pass through; flush any buffered stage start first so the
+  // stream reads in true order.
   const fp = advanceFingerprint(type, obj);
   if (fp && state.lastBurstFp === fp) return null;
   // Only sticky-fingerprint kinds that re-poll; lifecycle events always pass.
@@ -232,7 +289,37 @@ function filterAdvance(
   if (type === "stage_complete" || type === "blocker_set" || type === "run_complete") {
     state.ciWaitingOpen = false;
   }
-  return emit(opts, raw, formatAdvanceOneLiner(type, obj));
+  return flushPendingStart(state, emit(opts, raw, formatAdvanceOneLiner(type, obj)));
+}
+
+/** Flush a buffered stage_start ahead of the current emitted line, if any. */
+function flushPendingStart(
+  state: MaterialFilterState,
+  current: string | null,
+): string | null {
+  if (current == null) return null;
+  const pending = state.pendingStageStart;
+  if (pending == null) return current;
+  state.pendingStageStart = null;
+  return `${pending.line}\n${current}`;
+}
+
+/** Parse an ISO `at`/`time` to epoch ms (NaN when unparsable). */
+function parseEpochMs(v: unknown): number {
+  if (typeof v !== "string") return NaN;
+  const ms = Date.parse(v);
+  return Number.isFinite(ms) ? ms : NaN;
+}
+
+/** Human wall-clock duration from a ms delta: 42s / 3m32s / 1h05m02s. */
+export function formatWallMs(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const s = total % 60;
+  const m = Math.floor(total / 60) % 60;
+  const h = Math.floor(total / 3600);
+  if (h > 0) return `${h}h${String(m).padStart(2, "0")}m${String(s).padStart(2, "0")}s`;
+  if (m > 0) return `${m}m${String(s).padStart(2, "0")}s`;
+  return `${s}s`;
 }
 
 function advanceFingerprint(type: string, obj: Record<string, unknown>): string {
