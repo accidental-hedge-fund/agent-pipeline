@@ -42,6 +42,10 @@ import {
   loadLiveState,
   applySemverReconciliation,
   parseShippedSemverTitles,
+  saveReviewedManifest,
+  loadReviewedManifest,
+  loadProgress,
+  validateSemverApplyReady,
 } from "./reconcile.ts";
 import type { ReconciliationManifest } from "./types.ts";
 import { ROADMAP_ARTIFACT, artifactSubdir } from "../artifact-ignore.ts";
@@ -1162,20 +1166,47 @@ export async function runRoadmap(
         }
       }
     } else if (plan.reconciliation) {
+      // Persist the exact reviewed preview artifact for --apply (finding c33d6a3c).
+      await saveReviewedManifest(outputDir, plan.reconciliation, deps);
       logReconciliationPreview(plan.reconciliation, deps);
+      deps.log(
+        `[roadmap] reviewed reconciliation manifest saved for --apply ` +
+          `(identity=${plan.reconciliation.identity})`,
+      );
     }
     deps.log(`\n[roadmap] dry-run complete. Run with --apply to execute GitHub write-backs.`);
     return;
   }
 
   deps.log(`\n[roadmap] apply: executing GitHub write-backs...`);
-  await applyHygiene(plan.hygiene, repo, { apply: true }, deps);
 
   if (releaseModel === "continuous") {
+    await applyHygiene(plan.hygiene, repo, { apply: true }, deps);
     // Continuous keeps title-idempotent create/reuse/assign only (#910 non-goal).
     await applyMilestones(plan.milestones, repo, true, deps);
-  } else if (plan.reconciliation && reconcileLive) {
-    // Refresh live fingerprint immediately before first mutation.
+  } else {
+    // SemVer: load the exact reviewed preview manifest; never apply a freshly
+    // regenerated action list (finding c33d6a3c).
+    const reviewed = await loadReviewedManifest(outputDir, deps);
+    if (!reviewed) {
+      const msg =
+        "No reviewed reconciliation manifest found; run a dry-run preview first " +
+        "so --apply can execute the exact reviewed artifact";
+      deps.log(`[roadmap] SemVer reconciliation apply refused: ${msg}`);
+      throw new Error(`SemVer reconciliation apply refused: ${msg}`);
+    }
+    const expectedIdentity =
+      opts.expectedReconciliationIdentity ?? reviewed.identity;
+    if (plan.reconciliation && plan.reconciliation.identity !== reviewed.identity) {
+      const msg =
+        `Plan identity ${plan.reconciliation.identity} differs from reviewed preview ` +
+        `${reviewed.identity}; run a new dry-run preview before apply`;
+      deps.log(`[roadmap] SemVer reconciliation apply refused: ${msg}`);
+      throw new Error(`SemVer reconciliation apply refused: ${msg}`);
+    }
+
+    // Refresh live state before any write-back; gate fingerprint/coverage first
+    // so hygiene cannot mutate on a stale or blocked reconciliation (8420b97a).
     const scope = new Set(items.map((i) => i.issue.number));
     const tagList =
       deps.listSemverTags !== undefined
@@ -1189,14 +1220,27 @@ export async function runRoadmap(
       deps,
       scope,
     );
+    const existingProgress = await loadProgress(outputDir, deps);
+    const gate = validateSemverApplyReady(reviewed, freshLive, {
+      expectedIdentity,
+      resumeProgress: existingProgress,
+    });
+    if (!gate.ok) {
+      deps.log(`[roadmap] SemVer reconciliation apply refused: ${gate.reason}`);
+      throw new Error(`SemVer reconciliation apply refused: ${gate.reason}`);
+    }
+
+    await applyHygiene(plan.hygiene, repo, { apply: true }, deps);
+
     const result = await applySemverReconciliation(
-      plan.reconciliation,
+      reviewed,
       repo,
       outputDir,
       deps,
       {
         live: freshLive,
-        expectedIdentity: opts.expectedReconciliationIdentity,
+        expectedIdentity,
+        gatesAlreadyChecked: true,
       },
     );
     if (!result.ok) {

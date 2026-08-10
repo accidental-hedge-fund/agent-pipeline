@@ -111,6 +111,12 @@ export interface ReconciliationManifest {
 export interface ReconciliationProgress {
   manifest_identity: string;
   apply_start_fingerprint: string;
+  /**
+   * Live-state fingerprint after the last successful action (or apply-start when
+   * none completed). Resume requires the fresh fingerprint to match this value
+   * so external drift after any completed mutation aborts safely.
+   */
+  last_fingerprint?: string;
   /** Full ordered action list from the reviewed manifest (resume uses this, not a re-plan). */
   actions: ReconciliationAction[];
   completed: Array<{ id: string; result?: { milestone_number?: number } }>;

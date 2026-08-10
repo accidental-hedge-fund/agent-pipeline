@@ -485,12 +485,16 @@ describe("runRoadmap --apply: milestone write-back", () => {
   it("--apply creates SemVer milestones and assigns classified issues", async () => {
     const created: string[] = [];
     const assigned: Array<{ title: string; issue: number }> = [];
+    const files = new Map<string, string>();
     const issues = [
       makeInventoryItem(1, ["semver:minor"]).issue,
       makeInventoryItem(2, ["semver:patch"]).issue,
     ];
     const deps = makeRoadmapDeps({
-      writeFile: async () => {},
+      writeFile: async (p, c) => {
+        files.set(p, c);
+      },
+      readFile: async (p) => files.get(p) ?? null,
       getLatestTag: async () => "v1.0.0",
       listSemverTags: async () => ["v1.0.0"],
       getOpenIssues: async () => issues,
@@ -504,12 +508,21 @@ describe("runRoadmap --apply: milestone write-back", () => {
           labels: i.labels,
         })),
       listMilestonesDetailed: async () => [],
-      createMilestone: async (_repo, title) => { created.push(title); return created.length; },
+      createMilestone: async (_repo, title) => {
+        created.push(title);
+        return created.length;
+      },
       getMilestones: async () => [],
       assignIssueMilestone: async (_repo, issueNumber, milestoneTitle) => {
         assigned.push({ title: milestoneTitle, issue: issueNumber });
       },
     });
+    // SemVer apply requires a prior dry-run that persists the reviewed manifest.
+    await runRoadmap("example/repo", "/repo", "main", {}, { apply: false, dryRun: true }, deps);
+    assert.ok(
+      [...files.keys()].some((k) => k.endsWith("reconciliation-manifest.json")),
+      "dry-run must persist reviewed reconciliation-manifest.json",
+    );
     await runRoadmap("example/repo", "/repo", "main", {}, { apply: true }, deps);
     assert.ok(created.length >= 1, "should create at least one SemVer milestone");
     assert.ok(assigned.length >= 1, "should assign at least one issue");

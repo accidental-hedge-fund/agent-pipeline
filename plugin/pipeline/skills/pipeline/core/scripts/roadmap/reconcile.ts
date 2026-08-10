@@ -19,6 +19,8 @@ import type { WritebackDeps } from "./writeback.ts";
 
 const SEMVER_TITLE_RE = /^v\d+\.\d+\.\d+$/;
 const PROGRESS_FILE = "reconciliation-progress.json";
+/** Persisted reviewed preview artifact; apply loads this exact manifest. */
+export const REVIEWED_MANIFEST_FILE = "reconciliation-manifest.json";
 
 export interface ReconcileLiveState {
   milestones: MilestoneCatalogEntry[];
@@ -69,7 +71,8 @@ export function computeManifestIdentity(targets: ReconciliationTargetMilestone[]
 }
 
 /**
- * Live-state fingerprint over open-issue milestone assignments and relevant milestones.
+ * Live-state fingerprint over open-issue milestone assignments, relevant milestones,
+ * and shipped-title observations (so a tag added after preview invalidates apply).
  */
 export function computeLiveStateFingerprint(live: ReconcileLiveState): string {
   const issues = [...live.openIssues]
@@ -89,9 +92,11 @@ export function computeLiveStateFingerprint(live: ReconcileLiveState): string {
       s: m.state,
       d: sha12(m.description ?? ""),
       o: m.open_issues,
+      c: m.closed_issues,
     }))
     .sort((a, b) => a.n - b.n);
-  return sha12(JSON.stringify({ issues, milestones }));
+  const shipped = [...live.shippedTitles].sort();
+  return sha12(JSON.stringify({ issues, milestones, shipped }));
 }
 
 function isShipped(m: MilestoneCatalogEntry, shippedTitles: Set<string>): boolean {
@@ -103,16 +108,28 @@ function isShipped(m: MilestoneCatalogEntry, shippedTitles: Set<string>): boolea
   return shippedTitles.has(withV);
 }
 
+/**
+ * Closed empty unshipped planning milestone: no open issues AND no closed
+ * historical issues (closed_issues === 0). Shipped milestones are never reusable.
+ */
 function isReusableClosedEmpty(
   m: MilestoneCatalogEntry,
   shippedTitles: Set<string>,
 ): boolean {
-  return m.state === "closed" && m.open_issues === 0 && !isShipped(m, shippedTitles);
+  return (
+    m.state === "closed" &&
+    m.open_issues === 0 &&
+    m.closed_issues === 0 &&
+    !isShipped(m, shippedTitles)
+  );
 }
 
 /**
- * Resolve a unique reusable milestone for a target title.
- * Prefers stable number when provided; title match only when unambiguous.
+ * Resolve a unique reusable milestone for a target.
+ * Prefers stable number when provided.
+ * Closed reopen/reuse is allowed ONLY when the reviewed target names a stable
+ * milestone number — title-only matching never reopens closed milestones.
+ * Title match alone reuses open non-shipped milestones when unambiguous.
  * Returns a blocker on collision without stable identity.
  */
 export function resolveMilestoneIdentity(
@@ -168,49 +185,75 @@ export function resolveMilestoneIdentity(
   }
   const uniqueCatalog = [...byNumber.values()];
 
-  const matches = uniqueCatalog.filter((m) => m.title === target.title && !isShipped(m, shippedTitles));
-  if (matches.length === 0) {
-    // Also consider closed empty unshipped with same title for reopen
-    const closedMatches = uniqueCatalog.filter(
-      (m) => m.title === target.title && isReusableClosedEmpty(m, shippedTitles),
-    );
-    if (closedMatches.length === 1) {
-      return { ok: true, entry: closedMatches[0], mode: "reopen" };
-    }
-    if (closedMatches.length > 1) {
-      return {
-        ok: false,
-        blocker: {
-          reason: "title_collision",
-          detail: `Ambiguous closed milestones titled "${target.title}" (numbers: ${closedMatches.map((m) => m.number).join(", ")}); name a stable identity`,
-        },
-      };
-    }
+  // Title-only: open non-shipped reuse only — never opportunistic closed reopen.
+  const openMatches = uniqueCatalog.filter(
+    (m) => m.title === target.title && m.state === "open" && !isShipped(m, shippedTitles),
+  );
+  if (openMatches.length === 0) {
     return { ok: true, entry: null, mode: "create" };
   }
-  if (matches.length > 1) {
+  if (openMatches.length > 1) {
     return {
       ok: false,
       blocker: {
         reason: "title_collision",
-        detail: `Ambiguous milestones titled "${target.title}" (numbers: ${matches.map((m) => m.number).join(", ")}); name a stable identity`,
+        detail: `Ambiguous milestones titled "${target.title}" (numbers: ${openMatches.map((m) => m.number).join(", ")}); name a stable identity`,
       },
     };
   }
-  const only = matches[0];
-  if (only.state === "closed") {
-    if (!isReusableClosedEmpty(only, shippedTitles)) {
-      return {
-        ok: false,
-        blocker: {
-          reason: "shipped_immutable",
-          detail: `Closed milestone #${only.number} ("${only.title}") cannot be reopened`,
-        },
-      };
-    }
-    return { ok: true, entry: only, mode: "reopen" };
+  return { ok: true, entry: openMatches[0], mode: "reuse" };
+}
+
+/**
+ * Stamp stable milestone numbers onto targets when a unique reusable live
+ * identity exists (open same-title, or closed empty unshipped same-title).
+ * Generated manifests then name identities so reopen is never title-opportunistic.
+ */
+export function bindTargetMilestoneIdentities(
+  targets: ReconciliationTargetMilestone[],
+  live: ReconcileLiveState,
+): { targets: ReconciliationTargetMilestone[]; blockers: CoverageBlocker[] } {
+  const blockers: CoverageBlocker[] = [];
+  const byNumber = new Map<number, MilestoneCatalogEntry>();
+  for (const m of live.milestones) {
+    if (!byNumber.has(m.number)) byNumber.set(m.number, m);
   }
-  return { ok: true, entry: only, mode: "reuse" };
+  const uniqueCatalog = [...byNumber.values()];
+
+  const bound = targets.map((target) => {
+    if (target.number !== undefined) return target;
+
+    const openMatches = uniqueCatalog.filter(
+      (m) => m.title === target.title && m.state === "open" && !isShipped(m, live.shippedTitles),
+    );
+    if (openMatches.length === 1) {
+      return { ...target, number: openMatches[0].number };
+    }
+    if (openMatches.length > 1) {
+      blockers.push({
+        reason: "title_collision",
+        detail: `Ambiguous open milestones titled "${target.title}" (numbers: ${openMatches.map((m) => m.number).join(", ")}); name a stable identity`,
+      });
+      return target;
+    }
+
+    const closedMatches = uniqueCatalog.filter((m) =>
+      m.title === target.title && isReusableClosedEmpty(m, live.shippedTitles),
+    );
+    if (closedMatches.length === 1) {
+      // Explicitly name the closed empty unshipped planning identity for reopen.
+      return { ...target, number: closedMatches[0].number };
+    }
+    if (closedMatches.length > 1) {
+      blockers.push({
+        reason: "title_collision",
+        detail: `Ambiguous closed milestones titled "${target.title}" (numbers: ${closedMatches.map((m) => m.number).join(", ")}); name a stable identity`,
+      });
+    }
+    return target;
+  });
+
+  return { targets: bound, blockers };
 }
 
 /**
@@ -433,15 +476,24 @@ export function planReconciliationActions(
 
 /**
  * Build the full reviewed reconciliation manifest from plan lanes + live state.
+ * Targets receive stable milestone numbers when a unique reusable identity exists
+ * so apply/reopen never relies on opportunistic title-only closed matching.
  */
 export function buildReconciliationManifest(input: BuildManifestInput): ReconciliationManifest {
   const generated_at = input.generatedAt ?? new Date().toISOString().replace(/\.\d+Z$/, "Z");
-  const { targets, blockers: coverageBlockers } = buildReconciliationTargets(
+  const { targets: rawTargets, blockers: coverageBlockers } = buildReconciliationTargets(
     input.milestones,
     input.classifications,
     input.openIssueNumbers,
   );
-  const { actions, blockers } = planReconciliationActions(targets, input.live, coverageBlockers);
+  const { targets, blockers: bindBlockers } = bindTargetMilestoneIdentities(
+    rawTargets,
+    input.live,
+  );
+  const { actions, blockers } = planReconciliationActions(targets, input.live, [
+    ...coverageBlockers,
+    ...bindBlockers,
+  ]);
   const identity = computeManifestIdentity(targets);
   const live_state_fingerprint = computeLiveStateFingerprint(input.live);
   return {
@@ -452,6 +504,126 @@ export function buildReconciliationManifest(input: BuildManifestInput): Reconcil
     coverage_blockers: blockers,
     generated_at,
   };
+}
+
+function reviewedManifestPath(outputDir: string): string {
+  return `${outputDir.replace(/\/$/, "")}/${REVIEWED_MANIFEST_FILE}`;
+}
+
+/** Persist the reviewed preview manifest for exact apply execution. */
+export async function saveReviewedManifest(
+  outputDir: string,
+  manifest: ReconciliationManifest,
+  deps: Pick<WritebackDeps, "writeFile">,
+): Promise<void> {
+  await deps.writeFile(
+    reviewedManifestPath(outputDir),
+    JSON.stringify(manifest, null, 2) + "\n",
+  );
+}
+
+/** Load the reviewed preview manifest; null when missing or unparseable. */
+export async function loadReviewedManifest(
+  outputDir: string,
+  deps: Pick<WritebackDeps, "readFile">,
+): Promise<ReconciliationManifest | null> {
+  const raw = await deps.readFile(reviewedManifestPath(outputDir));
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as ReconciliationManifest;
+    if (
+      typeof parsed?.identity !== "string" ||
+      typeof parsed?.live_state_fingerprint !== "string" ||
+      !Array.isArray(parsed?.actions) ||
+      !Array.isArray(parsed?.targets)
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Gate SemVer apply without mutating: coverage blockers, identity, fingerprint.
+ * Used before any apply-side write-back (including hygiene).
+ */
+export function validateSemverApplyReady(
+  manifest: ReconciliationManifest,
+  live: ReconcileLiveState,
+  opts: {
+    expectedIdentity?: string;
+    /**
+     * When resuming, the progress record supplies the expected fingerprint
+     * (last successful post-action fingerprint, else apply-start).
+     */
+    resumeProgress?: ReconciliationProgress | null;
+  } = {},
+): ApplyReconciliationResult | { ok: true } {
+  if (opts.expectedIdentity !== undefined && opts.expectedIdentity !== manifest.identity) {
+    return {
+      ok: false,
+      code: "manifest_identity_mismatch",
+      reason: `Manifest identity changed; run a new dry-run preview (expected ${opts.expectedIdentity}, got ${manifest.identity})`,
+    };
+  }
+
+  if (manifest.coverage_blockers.length > 0) {
+    return {
+      ok: false,
+      code: "coverage_blockers",
+      reason: `Coverage blockers present (${manifest.coverage_blockers.length}); resolve classifications and regenerate the manifest`,
+    };
+  }
+
+  const collision = manifest.coverage_blockers.find((b) => b.reason === "title_collision");
+  if (collision) {
+    return { ok: false, code: "title_collision", reason: collision.detail };
+  }
+
+  const freshFp = computeLiveStateFingerprint(live);
+  const existingProgress = opts.resumeProgress ?? null;
+  const resuming =
+    existingProgress !== null &&
+    existingProgress.manifest_identity === manifest.identity &&
+    (existingProgress.status === "in_progress" || existingProgress.status === "failed") &&
+    Array.isArray(existingProgress.actions) &&
+    existingProgress.actions.length > 0;
+
+  if (resuming && existingProgress) {
+    const expectedFp =
+      existingProgress.last_fingerprint ?? existingProgress.apply_start_fingerprint;
+    if (freshFp !== expectedFp) {
+      return {
+        ok: false,
+        code: "fingerprint_drift",
+        reason: "Live state drifted; run a new dry-run preview before apply",
+      };
+    }
+  } else if (
+    existingProgress?.status === "complete" &&
+    existingProgress.manifest_identity === manifest.identity
+  ) {
+    // Prior complete with same identity — allow re-check of fresh plan vs live
+    // via apply path (may noop). Still require match to reviewed preview fp when
+    // not resuming incomplete work — fall through to preview fingerprint.
+    if (freshFp !== manifest.live_state_fingerprint) {
+      // Converged re-apply often rebuilds live after mutations; apply will
+      // recompute actions via the saved complete path. Gate only incomplete resume
+      // and first apply against preview fingerprint below when not complete.
+    }
+  } else {
+    if (freshFp !== manifest.live_state_fingerprint) {
+      return {
+        ok: false,
+        code: "fingerprint_drift",
+        reason: "Live state changed after preview; run a new dry-run preview before apply",
+      };
+    }
+  }
+
+  return { ok: true };
 }
 
 export async function loadLiveState(
@@ -500,6 +672,8 @@ export async function saveProgress(
 
 /**
  * Execute a reviewed reconciliation manifest with fingerprint gate and resume.
+ * Callers MUST pass the exact reviewed preview manifest (from
+ * loadReviewedManifest), not a freshly regenerated plan.
  */
 export async function applySemverReconciliation(
   manifest: ReconciliationManifest,
@@ -514,13 +688,40 @@ export async function applySemverReconciliation(
      * Used when apply loads a previously reviewed identity.
      */
     expectedIdentity?: string;
+    /**
+     * When true, skip the internal ready-gate (caller already ran
+     * validateSemverApplyReady before other write-backs such as hygiene).
+     */
+    gatesAlreadyChecked?: boolean;
   },
 ): Promise<ApplyReconciliationResult> {
-  if (opts.expectedIdentity !== undefined && opts.expectedIdentity !== manifest.identity) {
-    deps.log(
-      `[roadmap] refuse apply: manifest identity mismatch ` +
-        `(expected ${opts.expectedIdentity}, got ${manifest.identity})`,
-    );
+  const existingProgress = await loadProgress(outputDir, deps);
+
+  if (!opts.gatesAlreadyChecked) {
+    const gate = validateSemverApplyReady(manifest, opts.live, {
+      expectedIdentity: opts.expectedIdentity,
+      resumeProgress: existingProgress,
+    });
+    if (!gate.ok) {
+      if (gate.code === "manifest_identity_mismatch") {
+        deps.log(
+          `[roadmap] refuse apply: manifest identity mismatch ` +
+            `(expected ${opts.expectedIdentity}, got ${manifest.identity})`,
+        );
+      } else if (gate.code === "coverage_blockers") {
+        deps.log(
+          `[roadmap] refuse apply: ${manifest.coverage_blockers.length} coverage blocker(s) — see dry-run listing`,
+        );
+        for (const b of manifest.coverage_blockers) {
+          const issue = b.issue_number !== undefined ? `#${b.issue_number} ` : "";
+          deps.log(`  - ${issue}[${b.reason}] ${b.detail}`);
+        }
+      } else if (gate.code === "fingerprint_drift") {
+        deps.log(`[roadmap] refuse apply: ${gate.reason}`);
+      }
+      return gate;
+    }
+  } else if (opts.expectedIdentity !== undefined && opts.expectedIdentity !== manifest.identity) {
     return {
       ok: false,
       code: "manifest_identity_mismatch",
@@ -528,48 +729,38 @@ export async function applySemverReconciliation(
     };
   }
 
-  if (manifest.coverage_blockers.length > 0) {
-    deps.log(
-      `[roadmap] refuse apply: ${manifest.coverage_blockers.length} coverage blocker(s) — see dry-run listing`,
-    );
-    for (const b of manifest.coverage_blockers) {
-      const issue = b.issue_number !== undefined ? `#${b.issue_number} ` : "";
-      deps.log(`  - ${issue}[${b.reason}] ${b.detail}`);
-    }
-    return {
-      ok: false,
-      code: "coverage_blockers",
-      reason: `Coverage blockers present (${manifest.coverage_blockers.length}); resolve classifications and regenerate the manifest`,
-    };
-  }
-
-  const collision = manifest.coverage_blockers.find((b) => b.reason === "title_collision");
-  if (collision) {
-    return { ok: false, code: "title_collision", reason: collision.detail };
-  }
-
   const freshFp = computeLiveStateFingerprint(opts.live);
-  const existingProgress = await loadProgress(outputDir, deps);
   const resuming =
     existingProgress !== null &&
     existingProgress.manifest_identity === manifest.identity &&
     (existingProgress.status === "in_progress" || existingProgress.status === "failed") &&
     Array.isArray(existingProgress.actions) &&
     existingProgress.actions.length > 0;
+  const priorComplete =
+    existingProgress !== null &&
+    existingProgress.manifest_identity === manifest.identity &&
+    existingProgress.status === "complete";
 
   // When resume is in progress, execute the saved action list (not a re-planned one).
+  // When prior complete for the same identity, treat as converged noop (do not re-fire
+  // the reviewed action list against post-apply live state).
   const actionList: ReconciliationAction[] =
-    resuming && existingProgress ? existingProgress.actions : manifest.actions;
+    resuming && existingProgress
+      ? existingProgress.actions
+      : priorComplete && existingProgress
+        ? existingProgress.actions
+        : manifest.actions;
 
+  // Resume: always require live state matches last post-action fingerprint chain
+  // (or apply-start when no actions completed). Prevents pending clear_stale/assign
+  // from running after external drift mid-apply.
   if (resuming && existingProgress) {
-    // Resume: reject if live drifted from apply-start before any mutation completed.
-    if (
-      existingProgress.completed.length === 0 &&
-      freshFp !== existingProgress.apply_start_fingerprint
-    ) {
+    const expectedFp =
+      existingProgress.last_fingerprint ?? existingProgress.apply_start_fingerprint;
+    if (freshFp !== expectedFp) {
       deps.log(
-        `[roadmap] refuse resume: live-state fingerprint drifted before any mutation ` +
-          `(had ${existingProgress.apply_start_fingerprint}, now ${freshFp}); run a new preview`,
+        `[roadmap] refuse resume: live-state fingerprint drifted ` +
+          `(expected ${expectedFp}, now ${freshFp}); run a new preview`,
       );
       return {
         ok: false,
@@ -577,25 +768,28 @@ export async function applySemverReconciliation(
         reason: "Live state drifted; run a new dry-run preview before apply",
       };
     }
-  } else if (existingProgress?.status === "complete" && existingProgress.manifest_identity === manifest.identity) {
-    // Prior complete with same identity — re-apply uses fresh action list (should be empty / noop)
-  } else {
-    // Fresh apply: require fingerprint match to reviewed preview
-    if (freshFp !== manifest.live_state_fingerprint) {
-      deps.log(
-        `[roadmap] refuse apply: live-state fingerprint drift ` +
-          `(preview ${manifest.live_state_fingerprint}, fresh ${freshFp}); run a new preview`,
-      );
-      return {
-        ok: false,
-        code: "fingerprint_drift",
-        reason: "Live state changed after preview; run a new dry-run preview before apply",
-      };
-    }
+  } else if (priorComplete) {
+    // Prior complete with same identity — exact no-op convergence path
+  } else if (!opts.gatesAlreadyChecked) {
+    // Fresh apply fingerprint already validated in validateSemverApplyReady
+  } else if (freshFp !== manifest.live_state_fingerprint) {
+    deps.log(
+      `[roadmap] refuse apply: live-state fingerprint drift ` +
+        `(preview ${manifest.live_state_fingerprint}, fresh ${freshFp}); run a new preview`,
+    );
+    return {
+      ok: false,
+      code: "fingerprint_drift",
+      reason: "Live state changed after preview; run a new dry-run preview before apply",
+    };
   }
 
   const completedIds = new Set(
-    resuming && existingProgress ? existingProgress.completed.map((c) => c.id) : [],
+    resuming && existingProgress
+      ? existingProgress.completed.map((c) => c.id)
+      : priorComplete && existingProgress
+        ? existingProgress.actions.map((a) => a.id)
+        : [],
   );
   // Bind titles created in prior partial run
   const createdTitleToNumber = new Map<string, number>();
@@ -618,6 +812,7 @@ export async function applySemverReconciliation(
       apply_start_fingerprint: resuming && existingProgress
         ? existingProgress.apply_start_fingerprint
         : freshFp,
+      last_fingerprint: freshFp,
       actions: actionList,
       completed: existingProgress?.completed ?? actionList.map((a) => ({ id: a.id })),
       next_pending_id: null,
@@ -638,6 +833,7 @@ export async function applySemverReconciliation(
     : {
         manifest_identity: manifest.identity,
         apply_start_fingerprint: freshFp,
+        last_fingerprint: freshFp,
         actions: actionList,
         completed: [],
         next_pending_id: pending[0]?.id ?? null,
@@ -676,6 +872,8 @@ export async function applySemverReconciliation(
       }
       if (result.mutated) mutations += 1;
 
+      // Chain fingerprint after each successful action so resume detects external drift.
+      const postFp = computeLiveStateFingerprint(opts.live);
       progress = {
         ...progress,
         completed: [
@@ -688,6 +886,7 @@ export async function applySemverReconciliation(
                 : undefined,
           },
         ],
+        last_fingerprint: postFp,
         updated_at: new Date().toISOString(),
       };
       await saveProgress(outputDir, progress, deps);
@@ -763,6 +962,16 @@ async function executeAction(
       const n = action.milestone_number;
       if (n === undefined) throw new Error(`reopen action ${action.id} missing milestone_number`);
       const entry = live.milestones.find((m) => m.number === n);
+      if (entry && isShipped(entry, live.shippedTitles)) {
+        throw new Error(
+          `refusing to reopen shipped milestone #${n} ("${entry.title}") — release history is immutable`,
+        );
+      }
+      if (entry && !isReusableClosedEmpty(entry, live.shippedTitles) && entry.state === "closed") {
+        throw new Error(
+          `refusing to reopen non-empty or non-reusable closed milestone #${n} ("${entry.title}")`,
+        );
+      }
       if (entry?.state === "open") {
         deps.log(`[roadmap] reopen skipped — milestone #${n} already open`);
         return { mutated: false, milestone_number: n };

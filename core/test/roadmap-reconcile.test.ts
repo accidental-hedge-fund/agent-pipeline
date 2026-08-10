@@ -9,6 +9,9 @@ import {
   computeManifestIdentity,
   resolveMilestoneIdentity,
   parseShippedSemverTitles,
+  saveReviewedManifest,
+  loadReviewedManifest,
+  validateSemverApplyReady,
   type ReconcileLiveState,
 } from "../scripts/roadmap/reconcile.ts";
 import type {
@@ -17,6 +20,7 @@ import type {
   MilestoneSpec,
   IssueMilestoneSnapshot,
   ReconciliationManifest,
+  ReconciliationProgress,
 } from "../scripts/roadmap/types.ts";
 import type { WritebackDeps } from "../scripts/roadmap/writeback.ts";
 
@@ -405,11 +409,16 @@ describe("applySemverReconciliation", () => {
       [snap(3, { labels: ["semver:minor"] })],
       ["v1.0.0"],
     );
-    // Named by unique title match → reopen 20
+    // Preview binds stable number into targets so reopen is named, not opportunistic
     const manifest = buildSimpleManifest(
       live,
       [{ title: "v1.9.0", issue_numbers: [3], rationale: "reuse plan", version_impact: "minor" }],
       [classification(3, "minor")],
+    );
+    assert.equal(
+      manifest.targets.find((t) => t.title === "v1.9.0")?.number,
+      20,
+      "reviewed target must name stable milestone identity",
     );
     assert.ok(manifest.actions.some((a) => a.kind === "reopen" && a.milestone_number === 20));
     assert.ok(!manifest.actions.some((a) => a.kind === "reopen" && a.milestone_number === 21));
@@ -506,6 +515,245 @@ describe("applySemverReconciliation", () => {
     assert.equal(result.ok, false);
     if (!result.ok) assert.equal(result.code, "coverage_blockers");
   });
+
+  it("c33d6a3c: apply uses persisted reviewed manifest, not a regenerated plan", async () => {
+    const live = makeLive([], [snap(1, { labels: ["semver:patch"] })]);
+    const reviewed = buildSimpleManifest(
+      live,
+      [{ title: "v1.0.1", issue_numbers: [1], rationale: "reviewed", version_impact: "patch" }],
+      [classification(1, "patch")],
+    );
+    const { deps, files, created } = makeDeps(live);
+    await saveReviewedManifest("/out", reviewed, deps);
+    const loaded = await loadReviewedManifest("/out", deps);
+    assert.ok(loaded);
+    assert.equal(loaded!.identity, reviewed.identity);
+    assert.ok(files.has("/out/reconciliation-manifest.json"));
+
+    // A regenerated plan with different targets must not be applied silently
+    const regenerated = buildSimpleManifest(
+      live,
+      [{ title: "v9.9.9", issue_numbers: [1], rationale: "regenerated", version_impact: "major" }],
+      [classification(1, "patch")],
+    );
+    assert.notEqual(regenerated.identity, reviewed.identity);
+
+    const result = await applySemverReconciliation(loaded!, "o/r", "/out", deps, {
+      live,
+      expectedIdentity: reviewed.identity,
+    });
+    assert.equal(result.ok, true);
+    assert.ok(created.includes("v1.0.1"));
+    assert.ok(!created.includes("v9.9.9"), "must not execute regenerated plan");
+
+    // Identity mismatch refuses
+    const mismatch = await applySemverReconciliation(regenerated, "o/r", "/out2", deps, {
+      live: makeLive([], [snap(1, { labels: ["semver:patch"] })]),
+      expectedIdentity: reviewed.identity,
+    });
+    assert.equal(mismatch.ok, false);
+    if (!mismatch.ok) assert.equal(mismatch.code, "manifest_identity_mismatch");
+  });
+
+  it("49e7f682: title-only resolve never reopens closed milestones; reopen needs number", () => {
+    const closed = ms(20, "v1.9.0", {
+      state: "closed",
+      open_issues: 0,
+      closed_issues: 0,
+    });
+    // Without stable number: create, do not reopen
+    const byTitle = resolveMilestoneIdentity(
+      { title: "v1.9.0", description: "x", issue_numbers: [1] },
+      [closed],
+      new Set(["v1.0.0"]),
+    );
+    assert.equal(byTitle.ok, true);
+    if (byTitle.ok) {
+      assert.equal(byTitle.mode, "create");
+      assert.equal(byTitle.entry, null);
+    }
+    // With stable number: reopen allowed for empty unshipped
+    const byNumber = resolveMilestoneIdentity(
+      { number: 20, title: "v1.9.0", description: "x", issue_numbers: [1] },
+      [closed],
+      new Set(["v1.0.0"]),
+    );
+    assert.equal(byNumber.ok, true);
+    if (byNumber.ok) {
+      assert.equal(byNumber.mode, "reopen");
+      assert.equal(byNumber.entry?.number, 20);
+    }
+  });
+
+  it("9ec3c09a: resume refuses after completed action when live state drifts", async () => {
+    const live = makeLive([], [
+      snap(7, { labels: ["semver:minor"] }),
+      snap(8, { labels: ["semver:minor"] }),
+    ]);
+    const manifest = buildSimpleManifest(
+      live,
+      [{ title: "v1.9.0", issue_numbers: [7, 8], rationale: "r", version_impact: "minor" }],
+      [classification(7, "minor"), classification(8, "minor")],
+    );
+    let failAfterCreate = true;
+    const { deps, created, files } = makeDeps(live, {
+      assignIssueMilestone: async () => {
+        if (failAfterCreate) throw new Error("simulated assign failure");
+      },
+    });
+
+    await assert.rejects(
+      () => applySemverReconciliation(manifest, "o/r", "/out", deps, { live }),
+      /simulated assign failure/,
+    );
+    assert.equal(created.length, 1);
+    const progress = JSON.parse(files.get("/out/reconciliation-progress.json")!) as ReconciliationProgress;
+    assert.equal(progress.status, "failed");
+    assert.ok(progress.completed.length >= 1);
+    assert.ok(progress.last_fingerprint, "must record post-action fingerprint chain");
+
+    // External drift after partial apply: reassign issue before resume
+    live.openIssues[0].milestone_title = "external-hijack";
+    live.openIssues[0].milestone_number = 999;
+    failAfterCreate = false;
+    const result = await applySemverReconciliation(manifest, "o/r", "/out", deps, { live });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, "fingerprint_drift");
+  });
+
+  it("77c17499: shipped title added after preview changes fingerprint and blocks reopen", async () => {
+    const closed = ms(20, "v1.9.0", {
+      state: "closed",
+      open_issues: 0,
+      closed_issues: 0,
+      description: "plan",
+    });
+    const live = makeLive(
+      [closed],
+      [snap(3, { labels: ["semver:minor"] })],
+      ["v1.0.0"],
+    );
+    const manifest = buildSimpleManifest(
+      live,
+      [{ title: "v1.9.0", issue_numbers: [3], rationale: "reuse", version_impact: "minor" }],
+      [classification(3, "minor")],
+    );
+    assert.ok(manifest.actions.some((a) => a.kind === "reopen" && a.milestone_number === 20));
+
+    // Tag appears after preview → fingerprint must change
+    live.shippedTitles.add("v1.9.0");
+    assert.notEqual(
+      computeLiveStateFingerprint(live),
+      manifest.live_state_fingerprint,
+      "shippedTitles must be part of live-state fingerprint",
+    );
+    const { deps, reopened } = makeDeps(live);
+    const result = await applySemverReconciliation(manifest, "o/r", "/out", deps, { live });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, "fingerprint_drift");
+    assert.equal(reopened.length, 0);
+
+    // Defensive: even if fingerprint were bypassed, executor refuses shipped reopen
+    const live2 = makeLive(
+      [ms(20, "v1.9.0", { state: "closed", open_issues: 0, closed_issues: 0 })],
+      [snap(3, { labels: ["semver:minor"] })],
+      ["v1.9.0"],
+    );
+    const { deps: deps2, reopened: reopened2 } = makeDeps(live2);
+    await assert.rejects(
+      () =>
+        applySemverReconciliation(
+          {
+            identity: "x",
+            live_state_fingerprint: computeLiveStateFingerprint(live2),
+            targets: [{ number: 20, title: "v1.9.0", description: "d", issue_numbers: [3] }],
+            actions: [
+              {
+                id: "001-reopen-20",
+                kind: "reopen",
+                milestone_number: 20,
+                milestone_title: "v1.9.0",
+              },
+            ],
+            coverage_blockers: [],
+            generated_at: "2026-08-10T00:00:00Z",
+          },
+          "o/r",
+          "/out-shipped",
+          deps2,
+          { live: live2 },
+        ),
+      /shipped milestone/,
+    );
+    assert.equal(reopened2.length, 0);
+  });
+
+  it("66a181f2: closed milestone with completed issues is not reusable empty", () => {
+    const closedWithHistory = ms(30, "v1.5.0", {
+      state: "closed",
+      open_issues: 0,
+      closed_issues: 4,
+    });
+    const result = resolveMilestoneIdentity(
+      { number: 30, title: "v1.8.0", description: "rewrite history", issue_numbers: [1] },
+      [closedWithHistory],
+      new Set(["v1.0.0"]),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.blocker.reason, "shipped_immutable");
+      assert.match(result.blocker.detail, /not a reusable empty/);
+    }
+
+    // Preview must create rather than reopen history-bearing closed milestone by title
+    const live = makeLive(
+      [closedWithHistory],
+      [snap(1, { labels: ["semver:minor"] })],
+      ["v1.0.0"],
+    );
+    const manifest = buildSimpleManifest(
+      live,
+      [{ title: "v1.5.0", issue_numbers: [1], rationale: "r", version_impact: "minor" }],
+      [classification(1, "minor")],
+    );
+    assert.ok(
+      !manifest.actions.some((a) => a.kind === "reopen"),
+      "must not reopen closed milestone that has closed_issues > 0",
+    );
+    assert.ok(manifest.actions.some((a) => a.kind === "create"));
+  });
+
+  it("8420b97a: validateSemverApplyReady gates before any write-back", () => {
+    const live = makeLive([], [snap(1, { labels: ["semver:patch"] })]);
+    const manifest = buildSimpleManifest(
+      live,
+      [{ title: "v1.0.1", issue_numbers: [1], rationale: "r", version_impact: "patch" }],
+      [classification(1, "patch")],
+    );
+    // Matching → ready
+    const ok = validateSemverApplyReady(manifest, live, {
+      expectedIdentity: manifest.identity,
+    });
+    assert.equal(ok.ok, true);
+
+    // Drift → refuse (caller must not run hygiene/mutations)
+    live.openIssues[0].milestone_title = "drifted";
+    const refused = validateSemverApplyReady(manifest, live, {
+      expectedIdentity: manifest.identity,
+    });
+    assert.equal(refused.ok, false);
+    if (!refused.ok) assert.equal(refused.code, "fingerprint_drift");
+
+    // Coverage blockers → refuse
+    const blocked = buildSimpleManifest(
+      makeLive([], [snap(2, { labels: [] })]),
+      [],
+      [classification(2, null)],
+    );
+    const blockGate = validateSemverApplyReady(blocked, makeLive([], [snap(2)]), {});
+    assert.equal(blockGate.ok, false);
+    if (!blockGate.ok) assert.equal(blockGate.code, "coverage_blockers");
+  });
 });
 
 describe("fingerprint and identity", () => {
@@ -516,6 +764,15 @@ describe("fingerprint and identity", () => {
       { title: "v1.2.0", description: "d", issue_numbers: [1], version_impact: "minor" as const },
     ];
     assert.equal(computeManifestIdentity(targets), computeManifestIdentity(targets));
+    assert.notEqual(
+      computeLiveStateFingerprint(live1),
+      computeLiveStateFingerprint(live2),
+    );
+  });
+
+  it("fingerprint changes when shippedTitles change", () => {
+    const live1 = makeLive([ms(1, "v1.9.0", { state: "closed" })], [snap(1)], ["v1.0.0"]);
+    const live2 = makeLive([ms(1, "v1.9.0", { state: "closed" })], [snap(1)], ["v1.0.0", "v1.9.0"]);
     assert.notEqual(
       computeLiveStateFingerprint(live1),
       computeLiveStateFingerprint(live2),
