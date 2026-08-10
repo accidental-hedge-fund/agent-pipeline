@@ -382,6 +382,11 @@ export interface CliOpts {
   /** factory-gate: durable loop run id to score (#723). */
   fromRun?: string;
   /**
+   * factory-release prepare: absolute path to the secret-free request JSON (#953).
+   * Commander maps `--request` → request.
+   */
+  request?: string;
+  /**
    * Two-track engine intent (#762). Commander maps `--engine-track` → engineTrack.
    * Values: `pinned` | `candidate`.
    */
@@ -645,7 +650,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | ship | factory-gate | factory-pin | engine-promote | intake | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -722,6 +727,10 @@ export function buildCmd(): Command {
     )
     .option("--skip-install", "engine-promote: promote pin only; do not run npx install")
     .option("--from-run <run-id>", "factory-gate: score an existing durable loop run id")
+    .option(
+      "--request <absolute-path>",
+      "factory-release prepare: absolute path to the secret-free request JSON (#953)",
+    )
     .option(
       "--engine-track <track>",
       "two-track engine intent: pinned (production pin) or candidate (FRG/eval soak) (#762)",
@@ -3952,6 +3961,75 @@ async function main(): Promise<void> {
     return;
   }
 
+  // `pipeline factory-release prepare --request <abs.json> --json` (#953 / #908).
+  // Durable post-pilot FRG generation + prepare-only release handoff.
+  // Two-call protocol; never merges/tags/promotes/installs.
+  if (numArg === "factory-release") {
+    const verb = cmd.args[1] as string | undefined;
+    if (verb !== "prepare") {
+      console.error(
+        "pipeline factory-release: expected subcommand 'prepare'.\n" +
+          "  Usage: pipeline factory-release prepare --request <absolute-request.json> --json\n" +
+          "  Idempotent two-call protocol for versions after 1.33.0:\n" +
+          "    1) returns status awaiting_frg_attestation with unsigned artifact digests\n" +
+          "    2) after production-owned attestation, returns status complete with release PR\n" +
+          "  See docs/factory-reliability-gate-runbook.md",
+      );
+      process.exit(2);
+    }
+    if (!opts.json) {
+      console.error(
+        "pipeline factory-release prepare: --json is required (machine-readable two-call protocol).",
+      );
+      process.exit(2);
+    }
+    const requestPath = opts.request ? String(opts.request).trim() : "";
+    if (!requestPath) {
+      console.error(
+        "pipeline factory-release prepare: --request <absolute-request.json> is required.\n" +
+          "  Usage: pipeline factory-release prepare --request <absolute-request.json> --json",
+      );
+      process.exit(2);
+    }
+    const startDirFr = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDirFr = findGitRoot(startDirFr) ?? startDirFr;
+    try {
+      const {
+        runFactoryReleasePrepare,
+        defaultFactoryReleasePrepareDeps,
+        FACTORY_RELEASE_PREPARE_HELP,
+      } = await import("./factory-release-prepare.ts");
+      if (process.argv.includes("--help") || process.argv.includes("-h")) {
+        console.log(FACTORY_RELEASE_PREPARE_HELP);
+        process.exit(0);
+      }
+      if (!path.isAbsolute(requestPath)) {
+        console.error(
+          "pipeline factory-release prepare: --request must be an absolute path " +
+            `(got ${JSON.stringify(requestPath)})`,
+        );
+        process.exit(2);
+      }
+      const outcome = await runFactoryReleasePrepare(
+        {
+          requestPath,
+          repoDir: repoDirFr,
+          json: true,
+          baseBranch: opts.base,
+        },
+        defaultFactoryReleasePrepareDeps({
+          log: (msg) => console.error(msg),
+        }),
+      );
+      console.log(JSON.stringify(outcome.result, null, 2));
+      if (outcome.exitCode !== 0) process.exitCode = outcome.exitCode;
+    } catch (err) {
+      console.error(`pipeline factory-release prepare: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // `pipeline factory-gate --for <version> [--from-run <id>] [--observations <file>]
   // [--scenario …] [--json] [--no-close-pack]` (#723/#754/#757).
   // Scores a durable loop (or refuses without --from-run) and writes FRG evidence.
@@ -4789,7 +4867,7 @@ async function main(): Promise<void> {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "single", "release", "intake", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "ship", "summary", "improve", "scoreboard", "factory-gate", "factory-pin", "engine-promote", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "ship", "summary", "improve", "scoreboard", "factory-gate", "factory-release", "factory-pin", "engine-promote", "queue", "backfill", "evals",
       "loop",
     ];
     if (!recognized.includes(numArg)) {

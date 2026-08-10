@@ -5,11 +5,17 @@
 // evidence producer. Each converge operation first observes external truth.
 
 import { execFile } from "node:child_process";
+import * as fs from "node:fs/promises";
 import { promisify } from "node:util";
 import {
   validateFrgEvidenceFileForTag,
   type FrgEvidence,
 } from "../factory-reliability-gate.ts";
+import { FRG_HYBRID_PILOT_VERSION } from "../frg-pack-observations.ts";
+import {
+  factoryReleaseVersionIndexPath,
+  isPostPilotReleaseVersion,
+} from "../factory-release-prepare.ts";
 import { resolveReleaseConfig } from "../config.ts";
 import { getPrForIssueAnyState } from "../gh.ts";
 import { withLock } from "../lock.ts";
@@ -152,12 +158,48 @@ export function assertFrgCandidateProvenance(
   evidence: FrgEvidence,
   train: ShipTrainEvidence,
   intent: ShipIntent,
+  opts?: {
+    /**
+     * Post-pilot durable path may bind the candidate via the factory-release
+     * version index instead of hybrid pack_provenance. When provided, the index
+     * candidate OID is checked against the train head.
+     */
+    durableCandidateGitSha?: string | null;
+  },
 ): void {
   const provenance = evidence.pack_provenance;
   if (!provenance) {
+    // Hybrid pack_provenance is v1.33.0-only. Later releases use durable
+    // factory-release prepare binding (version index / request checkpoint).
+    if (isPostPilotReleaseVersion(intent.version)) {
+      if (provenance != null) {
+        throw new Error(
+          `ship FRG: hybrid pack_provenance is not accepted for v${intent.version}; ` +
+            `use durable factory-release prepare after v${FRG_HYBRID_PILOT_VERSION}`,
+        );
+      }
+      const bound = opts?.durableCandidateGitSha?.toLowerCase() ?? null;
+      if (!bound) {
+        throw new Error(
+          "ship FRG: post-pilot release evidence has no durable candidate binding; " +
+            "run pipeline factory-release prepare --request <absolute-request.json> --json " +
+            "from the exact integrated candidate",
+        );
+      }
+      if (bound !== train.integrated_head_oid) {
+        throw new Error("ship FRG: durable candidate binding does not match the exact train candidate");
+      }
+      return;
+    }
     throw new Error(
       "ship FRG: release evidence has no candidate provenance; " +
         "the fixed-pack producer must bind the exact repository, base branch, and candidate OID",
+    );
+  }
+  if (intent.version !== FRG_HYBRID_PILOT_VERSION) {
+    throw new Error(
+      `ship FRG: hybrid pack_provenance is valid only for v${FRG_HYBRID_PILOT_VERSION}; ` +
+        `got ${intent.version}`,
     );
   }
   if (provenance.candidate_git_sha.toLowerCase() !== train.integrated_head_oid ||
@@ -322,6 +364,17 @@ export function shipCoordinatorDepsFromOperations(
       const retainedTrain = rememberTrain({ ...train, completed_at: trainEvidence.completed_at });
       const evidence = await observeValidatedFrg(intent, retainedTrain, true);
       if (!evidence) {
+        if (isPostPilotReleaseVersion(intent.version)) {
+          throw new Error(
+            `ship FRG: no release-eligible candidate artifact for v${intent.version}. ` +
+              `Auto-generate genuine FRG via the durable path (not a synthetic trivial pack):\n` +
+              `  pipeline factory-release prepare --request <absolute-request.json> --json\n` +
+              `Two-call protocol: first call returns awaiting_frg_attestation; after the ` +
+              `production-owned attestor stores the MAC, the second unchanged call returns ` +
+              `complete (or write attested latest.json and retry ship). ` +
+              `Hybrid pilot remains valid only for exactly v${FRG_HYBRID_PILOT_VERSION}.`,
+          );
+        }
         throw new Error(
           `ship FRG: no release-eligible candidate artifact for v${intent.version}. ` +
             `Complete the shipped fixed pack, run ` +
@@ -526,7 +579,28 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
       if ((err as Error).message.includes("evidence missing")) return null;
       throw err;
     }
-    assertFrgCandidateProvenance(evidence, train, intent);
+    let durableCandidate: string | null = null;
+    if (isPostPilotReleaseVersion(intent.version) && !evidence.pack_provenance) {
+      const indexPath = factoryReleaseVersionIndexPath(opts.repoDir, intent.version);
+      try {
+        const indexRaw = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
+          candidate_git_sha?: string;
+          version?: string;
+        };
+        if (
+          indexRaw.version === intent.version &&
+          typeof indexRaw.candidate_git_sha === "string" &&
+          /^[0-9a-f]{40,64}$/i.test(indexRaw.candidate_git_sha)
+        ) {
+          durableCandidate = indexRaw.candidate_git_sha.toLowerCase();
+        }
+      } catch {
+        durableCandidate = null;
+      }
+    }
+    assertFrgCandidateProvenance(evidence, train, intent, {
+      durableCandidateGitSha: durableCandidate,
+    });
     const after = await observeBase();
     if (after !== before) throw new Error("ship FRG: base advanced while FRG evidence was checked");
     return evidence;

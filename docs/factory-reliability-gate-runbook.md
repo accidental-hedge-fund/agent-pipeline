@@ -93,9 +93,8 @@ For v1.33.0 only, `factory-gate-v1` uses this fixed hybrid rule:
 - A Layer A probe is not a live fault injection. Reports must not describe it as one.
 - The runner accepts no caller-written pass, status, metric, or evidence receipt.
 
-This rule expires after v1.33.0. In v1.34.0, #890 and #891 land before #908 and #909.
-Issue #908 owns the durable replacement, real live fault seams, and this exact
-candidate-native prepare interface:
+This rule expires after v1.33.0. Later releases use the durable engine command
+implemented for #953 / #908:
 
 ```text
 pipeline factory-release prepare --request <absolute-request.json> --json
@@ -103,14 +102,30 @@ pipeline factory-release prepare --request <absolute-request.json> --json
 
 This is an idempotent two-call protocol. The first call runs without the FRG
 credential and returns `awaiting_frg_attestation` with unsigned artifact
-identities and digests. The wrapper submits those closed artifacts to the fixed
-trusted attestor. The second call uses the unchanged request and returns
-`complete` with one exact release pull request. Repeated calls must reconcile
-the same checkpoint without another pack, attestation, branch, or pull request.
+identities and digests. It does **not** open a release PR. Checkpoint state is
+stored under `.agent-pipeline/factory-release/<request-fingerprint>/checkpoint.json`
+(keyed by repository, version, candidate commit, and action identity). The
+wrapper submits those closed artifacts to the fixed trusted attestor. The second
+call uses the **unchanged** request, verifies the production-owned attestation,
+invokes shared `runRelease` (prepare-only), and returns `complete` with one exact
+release pull request, FRG run id, head, base, and restart checkpoint. Repeated
+calls must reconcile the same checkpoint without another pack, attestation,
+branch, or pull request.
 
-Any later release must fail closed until that replacement or another reviewed policy is
-present. It must not reuse static bootstrap-base or candidate-version config as release
-evidence. The two-release integration test must start from the verified v1.33.0 pin,
+**Hard gate:** missing, stale, failed, mismatched, skipped, or waived required
+evidence yields non-zero exit / non-`complete` status and blocks release
+preparation. Synthetic trivial docs/fixture packs are **not** release-eligible
+for versions after v1.33.0. Hybrid Layer A provenance is refused for any version
+other than exactly `1.33.0`.
+
+Request JSON (`schema_version: 1`, `kind: "factory_release_prepare_request"`)
+binds at least: `action_id`, `repository`, `base_branch`, `target_version`,
+`integrated_candidate.git_sha`, `frg_manifest.{pack_id,sha256}`. Optional:
+`grant_fingerprint`, `milestone`, `ordered_merges`, `production_pin`,
+fingerprints. Forbidden: credentials, executable paths, modules, network
+targets, and caller-authored `pass` / status / metric / receipt claims.
+
+The two-release integration test must start from the verified v1.33.0 pin,
 prepare and install v1.34.0 through the candidate interface, and prove that the next grant
 uses v1.34.0 without a wrapper or config replacement.
 

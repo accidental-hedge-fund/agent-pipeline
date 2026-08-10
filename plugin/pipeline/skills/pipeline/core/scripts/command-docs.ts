@@ -170,6 +170,14 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     documented: true,
     section: "factory",
   },
+  "factory-release": {
+    summary:
+      "Durable post-pilot FRG generation + prepare-only release handoff (two-call: awaiting_frg_attestation → complete; never merges/tags)",
+    usage:
+      "factory-release prepare --request <absolute-request.json> --json",
+    documented: true,
+    section: "factory",
+  },
   "factory-pin": {
     summary:
       "Show / init / promote / rollback the factory production engine pin (last FRG-passed release; never merges or tags)",
