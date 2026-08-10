@@ -17,7 +17,7 @@ This file is the forward-looking source of truth for open work. Every open issue
 
 | Release | Bump | Theme | Issues | Why this bump |
 |---|---|---|---|---|
-| **v1.33.0** | minor | Scoped Hermes factory and startup corrections | #898, #905, #874, #870 | Add the disabled Hermes/Buzz factory and correct the loop paths needed by its first release. |
+| **v1.33.0** ✅ shipped | minor | Scoped Hermes factory and startup corrections | #898, #905, #874, #870 | Shipped 2026-08-10 (tag `v1.33.0`). See CHANGELOG.md. |
 | **v1.34.0** | minor | Durable factory core and native release preparation | #890, #891, #908, #909 | Add the durable macro-controller, aggregate health, native FRG and release preparation, and explicit SemVer classification. |
 | **v1.35.0** | minor | Integrated completion | #901, #765 | Add a durable integrated-base frontier and an optional post-loop integration workflow. |
 | **v1.36.0** | minor | Roadmap reconciliation | #910 | Add dry-run-first, full SemVer milestone reconciliation. |
@@ -43,10 +43,10 @@ This file is the forward-looking source of truth for open work. Every open issue
 
 | # | Impact | Config | Theme | → Release | Depends on |
 |---|--------|--------|-------|-----------|------------|
-| #898 | minor | machine-local, default off | Hermes/Buzz factory | v1.33.0 | — |
-| #905 | patch | none | dependency discovery | v1.33.0 | — |
-| #874 | patch | none | gate recovery | v1.33.0 | #905 |
-| #870 | patch | none | review routing | v1.33.0 | #905, #874 |
+| #898 | minor | machine-local, default off | Hermes/Buzz factory | ✅ v1.33.0 | — |
+| #905 | patch | none | dependency discovery | ✅ v1.33.0 | — |
+| #874 | patch | none | gate recovery | ✅ v1.33.0 | #905 |
+| #870 | patch | none | review routing | ✅ v1.33.0 | #905, #874 |
 | #890 | minor | none | durable factory core | v1.34.0 | — |
 | #891 | minor | none | factory health | v1.34.0 | #890 |
 | #908 | minor | default off | FRG and release preparation | v1.34.0 | #890, #891 |
