@@ -96,8 +96,40 @@ export function tagForVersion(version: string): string {
   return `v${normalizeVersion(version)}`;
 }
 
-export function installCommandForTag(tag: string, host: EnginePromoteHost): string {
-  return `npx -y github:accidental-hedge-fund/agent-pipeline#${tag} install --host ${host} --yes-deps`;
+export function startingLockPidFromEnv(raw: string | undefined): number | null {
+  if (typeof raw !== "string" || !/^[1-9]\d*$/.test(raw)) return null;
+  const pid = Number(raw);
+  return Number.isSafeInteger(pid) ? pid : null;
+}
+
+export function installArgsForTag(
+  tag: string,
+  host: EnginePromoteHost,
+  startingLockPid: number | null = null,
+): string[] {
+  const args = [
+    "-y",
+    `github:accidental-hedge-fund/agent-pipeline#${tag}`,
+    "install",
+    "--host",
+    host,
+    "--yes-deps",
+  ];
+  if (startingLockPid !== null) {
+    if (!Number.isSafeInteger(startingLockPid) || startingLockPid <= 0) {
+      throw new Error("starting lock PID must be a safe positive integer");
+    }
+    args.push("--internal-starting-lock-pid", String(startingLockPid));
+  }
+  return args;
+}
+
+export function installCommandForTag(
+  tag: string,
+  host: EnginePromoteHost,
+  startingLockPid: number | null = null,
+): string {
+  return `npx ${installArgsForTag(tag, host, startingLockPid).join(" ")}`;
 }
 
 export async function runEnginePromote(
@@ -111,7 +143,8 @@ export async function runEnginePromote(
   const skipPromoteIfCurrent = opts.skipPromoteIfCurrent !== false;
   const skipInstall = !!opts.skipInstall;
   const steps: string[] = [];
-  const installCmd = installCommandForTag(tag, host);
+  const startingLockPid = startingLockPidFromEnv(process.env.PIPELINE_STARTING_LOCK_PID);
+  const installCmd = installCommandForTag(tag, host, startingLockPid);
 
   const base: EnginePromoteResult = {
     schema_version: 1,
@@ -320,18 +353,13 @@ export function realEnginePromoteDeps(repoDir: string): EnginePromoteDeps {
       });
     },
     async installFromTag(tag, host) {
-      const cmd = installCommandForTag(tag, host);
-      // Use shell-free argv: npx -y github:…#tag install --host X --yes-deps
+      const startingLockPid = startingLockPidFromEnv(process.env.PIPELINE_STARTING_LOCK_PID);
+      const cmd = installCommandForTag(tag, host, startingLockPid);
+      // Use shell-free argv. The internal PID exemption names only this
+      // launcher's validated reservation; unrelated live runs still block.
       const { stdout, stderr } = await execFileAsync(
         "npx",
-        [
-          "-y",
-          `github:accidental-hedge-fund/agent-pipeline#${tag}`,
-          "install",
-          "--host",
-          host,
-          "--yes-deps",
-        ],
+        installArgsForTag(tag, host, startingLockPid),
         {
           cwd: repoDir,
           timeout: 600_000,

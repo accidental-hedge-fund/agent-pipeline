@@ -1135,6 +1135,22 @@ test("parseArgs: --force sets force:true, otherwise false", () => {
   assert.equal(parseArgs(["node", "install.mjs", "update"]).force, false);
 });
 
+test("parseArgs: validates the internal launcher reservation PID", () => {
+  assert.equal(
+    parseArgs(["node", "install.mjs", "update", "--internal-starting-lock-pid", "12345"])
+      .internalStartingLockPid,
+    12345,
+  );
+  assert.throws(
+    () => parseArgs(["node", "install.mjs", "update", "--internal-starting-lock-pid", "12x"]),
+    /positive integer PID/,
+  );
+  assert.throws(
+    () => parseArgs(["node", "install.mjs", "update", "--internal-starting-lock-pid"]),
+    /positive integer PID/,
+  );
+});
+
 test("findLiveRunLocks: reports a lock whose PID is live (fakes only, no real I/O)", () => {
   const live = findLiveRunLocks({
     listLocks: () => ["/tmp/pipeline-lyric-utils-420.lock"],
@@ -1254,6 +1270,36 @@ test("findLiveRunLocks: multiple live locks are all reported", () => {
     { path: "/tmp/pipeline-a-1.lock", pid: 111 },
     { path: "/tmp/pipeline-b-2.lock", pid: 222 },
   ]);
+});
+
+test("findLiveRunLocks: exempts only the exact live launcher reservation with matching PID contents", () => {
+  const ownPid = 12345;
+  const ownPath = join(tmpdir(), `pipeline-starting-${ownPid}.lock`);
+  const unrelatedPath = join(tmpdir(), "pipeline-agent-pipeline-945.lock");
+  const live = findLiveRunLocks({
+    listLocks: () => [ownPath, unrelatedPath],
+    readLock: () => String(ownPid),
+    isPidLive: () => true,
+    internalStartingLockPid: ownPid,
+  });
+  assert.deepEqual(
+    live,
+    [{ path: unrelatedPath, pid: ownPid }],
+    "a different live lock must still block even when it contains the same PID",
+  );
+});
+
+test("findLiveRunLocks: a launcher-shaped path with mismatched contents is not exempt", () => {
+  const claimedPid = 12345;
+  const actualPid = 54321;
+  const lockPath = join(tmpdir(), `pipeline-starting-${claimedPid}.lock`);
+  const live = findLiveRunLocks({
+    listLocks: () => [lockPath],
+    readLock: () => String(actualPid),
+    isPidLive: () => true,
+    internalStartingLockPid: claimedPid,
+  });
+  assert.deepEqual(live, [{ path: lockPath, pid: actualPid }]);
 });
 
 test("formatLiveRunMessage: refusal names every blocking lock path and PID, and mentions --force", () => {
@@ -1429,6 +1475,58 @@ test("install update: a shim-style pipeline-starting-<pid>.lock blocks the updat
       "before-update",
       "a blocked update must copy no file",
     );
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install update: internal launcher PID exempts only its matching reservation", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    stubExistingCoreInstall(claudeTmp);
+    writeFileSync(join(lockTmp, `pipeline-starting-${process.pid}.lock`), String(process.pid));
+
+    const result = runInstaller(
+      ["update", "--host", "claude", "--internal-starting-lock-pid", String(process.pid)],
+      {
+        CLAUDE_CONFIG_DIR: claudeTmp,
+        TMPDIR: lockTmp,
+        TMP: lockTmp,
+        TEMP: lockTmp,
+      },
+    );
+
+    assert.equal(result.status, 0, `the invoking launcher's reservation must be exempt: ${result.stderr}`);
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install update: internal launcher PID does not exempt an unrelated live run", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const dest = stubExistingCoreInstall(claudeTmp);
+    writeFileSync(join(lockTmp, `pipeline-starting-${process.pid}.lock`), String(process.pid));
+    const unrelatedPath = join(lockTmp, "pipeline-agent-pipeline-945.lock");
+    writeFileSync(unrelatedPath, String(process.pid));
+
+    const result = runInstaller(
+      ["update", "--host", "claude", "--internal-starting-lock-pid", String(process.pid)],
+      {
+        CLAUDE_CONFIG_DIR: claudeTmp,
+        TMPDIR: lockTmp,
+        TMP: lockTmp,
+        TEMP: lockTmp,
+      },
+    );
+
+    assert.notEqual(result.status, 0, "an unrelated live run must still block the update");
+    assert.match(`${result.stdout}${result.stderr}`, /pipeline-agent-pipeline-945\.lock/);
+    assert.equal(readFileSync(join(dest, "sentinel.txt"), "utf8"), "before-update");
   } finally {
     cleanup(claudeTmp);
     cleanup(lockTmp);

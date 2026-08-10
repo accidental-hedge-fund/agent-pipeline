@@ -9,6 +9,7 @@
 #   BUZZ_BIN                 path to buzz CLI (required to post)
 #   BUZZ_RELAY_URL           relay URL
 #   BUZZ_CHANNEL             channel id
+#   BUZZ_REPLY_TO            authenticated event id for exact thread routing
 #   BUZZ_CREDENTIALS_FILE    JSON with nsec (never commit real credentials)
 #   PIPELINE_SUPERVISOR_STATE state root for dedupe files
 #   SHIP_NOTIFY_DEDUP_TTL_S  dedupe window seconds (default 120)
@@ -22,6 +23,7 @@ SHIP_NOTIFY="${SHIP_NOTIFY:-1}"
 BUZZ_BIN="${BUZZ_BIN:-}"
 BUZZ_RELAY_URL="${BUZZ_RELAY_URL:-}"
 BUZZ_CHANNEL="${BUZZ_CHANNEL:-}"
+BUZZ_REPLY_TO="${BUZZ_REPLY_TO:-}"
 BUZZ_CREDENTIALS_FILE="${BUZZ_CREDENTIALS_FILE:-}"
 STATE_ROOT="${PIPELINE_SUPERVISOR_STATE:-$HOME/.local/state/pipeline-supervisor}"
 DEDUP_DIR="$STATE_ROOT/notify"
@@ -74,5 +76,7 @@ export BUZZ_PRIVATE_KEY
 BUZZ_PRIVATE_KEY=$(python3 -c "import json; print(json.load(open('$BUZZ_CREDENTIALS_FILE'))['nsec'])")
 msg="🚢 $content"
 set +e
-"$BUZZ_BIN" messages send --channel "$BUZZ_CHANNEL" --content "$msg" >/dev/null 2>&1 || true
+notify_args=(messages send --channel "$BUZZ_CHANNEL" --content "$msg")
+[[ -z "$BUZZ_REPLY_TO" ]] || notify_args+=(--reply-to "$BUZZ_REPLY_TO")
+"$BUZZ_BIN" "${notify_args[@]}" >/dev/null 2>&1 || true
 exit 0

@@ -89,6 +89,28 @@ The train SHALL expose a status read model (CLI status and/or JSON events) that 
 - **THEN** those events SHALL be observational only
 - **AND** they SHALL NOT grant merge or advance authority
 
+### Requirement: Train JSON mode SHALL emit one final object on stdout
+
+When `pipeline train` is invoked with `--json`, stdout SHALL contain exactly one
+unfenced JSON object whose `kind` is `train_status`. Nested `single` runs SHALL
+NOT write handoff, status, or terminal JSON objects to that stdout stream.
+Human diagnostics and child progress MAY use stderr or the existing run event
+streams.
+
+#### Scenario: Successful train output parses once
+
+- **WHEN** a train advances two issues successfully with `--json`
+- **THEN** one `JSON.parse` of the complete stdout SHALL return the final
+  `train_status` object
+- **AND** no child-run JSON SHALL precede or follow that object
+
+#### Scenario: Child progress remains observable
+
+- **WHEN** a child issue run emits handoff or stage progress during a JSON train
+- **THEN** that progress SHALL remain available through stderr and/or the exact
+  child run's events
+- **AND** it SHALL NOT corrupt the final train JSON object
+
 ---
 
 ### Requirement: Train SHALL reconcile from GitHub and Pipeline truth on restart
@@ -106,4 +128,3 @@ On restart or resume of a named train, the implementation SHALL re-read live iss
 - **WHEN** live ownership artifacts for the current issue are split or unreadable (for example conflicting active run records that block advance)
 - **THEN** the train SHALL stop with a typed ownership or reconcile error
 - **AND** it SHALL NOT delete unpushed commits to force progress
-

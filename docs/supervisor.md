@@ -162,6 +162,21 @@ Messenger (Slack / Buzz / OpenClaw / …)
 Copy an example; point `PIPELINE` at your installed launcher; set `REPO_DIR`.
 Do not fork the engine into the chat product.
 
+## Self-correction boundary
+
+Pipeline's durable `single` and loop recovery controllers own regressions on an
+issue that is already in the authorized train. Buzz does not classify the
+failure, select a model, or add stage-specific retries.
+
+New papercut, correction, and durable-run blocker issues remain
+`pipeline:backlog` by design. They do not silently join the current signed
+shipment. An operator or one deterministic policy step must triage the issue
+and assign its GitHub milestone before a later ship can include it. Free-form
+feature requests can use `pipeline intake --description … --release vX.Y.Z`;
+existing issues can use `pipeline triage <N> --stage ready|backlog` plus explicit
+milestone assignment. This keeps self-correction useful without letting a model
+widen release authority.
+
 ## Minimal checklist for a new team
 
 - [ ] `pipeline doctor` green in the service environment  
@@ -172,6 +187,23 @@ Do not fork the engine into the chat product.
 - [ ] Document who can send merge-capable commands  
 
 ## Release finish JSON (`schema_version: 1`)
+
+`pipeline release <X.Y.Z> --no-edit --json` emits one prepare identity after it
+creates and re-reads the release PR:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "release_prepare",
+  "version": "1.34.0",
+  "pr": 123,
+  "base": "main",
+  "head_oid": "…"
+}
+```
+
+Automated finalization binds to this exact PR, base, version, and head. It does
+not scrape human output or search for a title match.
 
 `pipeline release finish <pr> --json`:
 
@@ -196,25 +228,28 @@ Does **not** create git tags or GitHub Releases. Existing `auto-tag-release` and
 Host runbook: [runbooks/hermes-supervisor-deployment.md](./runbooks/hermes-supervisor-deployment.md).  
 Skill template: [examples/supervisor/hermes/SKILL.md](../examples/supervisor/hermes/SKILL.md).
 
-## Ship milestone (example playbook)
+## Ship milestone (thin host adapter)
 
-For durable **train → release → wait → engine-promote** on a host, copy the
-shell examples rather than inventing a second scheduler:
+Use the shell examples to submit and observe the Pipeline-owned coordinator.
+Do not implement the ship lifecycle in an outer shell or chat agent:
 
 | Script | Role |
 |---|---|
-| `examples/supervisor/shell/ship-milestone.sh` | Serial playbook; state under `PIPELINE_SUPERVISOR_STATE` |
+| `examples/supervisor/shell/ship-milestone.sh` | Authorized `pipeline ship` request/status adapter; systemd detach |
 | `examples/supervisor/shell/ship-notify.sh` | Optional messenger posts; no-op without Buzz env |
-| `examples/supervisor/shell/ship-stage-watch.sh` | Stage-transition posts from loop/advance events |
+| `examples/supervisor/shell/ship-stage-watch.sh` | One exact event file through installed `material-filter.mjs` |
 
 Runbooks: [runbooks/ship-milestone.md](./runbooks/ship-milestone.md),  
 [runbooks/frg-pack-checklist.md](./runbooks/frg-pack-checklist.md).
 
-**FRG hard stop:** release prepare requires `.agent-pipeline/frg/<version>/latest.json`.
-Supervisors MUST surface that stop; they MUST NOT invent FRG pass artifacts.
+`pipeline ship` owns train, bounded recovery, candidate-bound FRG validation,
+release, publication verification, and engine promotion. It fails closed when
+the existing fixed-pack tooling has not produced candidate-bound evidence. Its typed status and GitHub state are
+authoritative. The host owns authenticated admission and process supervision.
 
-**Notify policy:** prefer stage-watch over generic heartbeats
-(`SHIP_NOTIFY_HEARTBEAT_S=0`). Filter `#None` / stale precondition noise.
+**Notify policy:** observe only an exact `events_file` returned by Pipeline.
+Pass it through `material-filter.mjs`; never search host-global run stores.
+Notification failures are observational and cannot alter the ship.
 
 ## Versioning
 

@@ -238,6 +238,15 @@ const passthrough = process.argv.slice(2);
 const args = ["--experimental-strip-types", entry, ...passthrough];
 if (!passthrough.includes("--profile")) args.push("--profile", PROFILE);
 
-const run = spawnSync(process.execPath, args, { stdio: "inherit" });
+const childEnv = { ...process.env };
+if (reserved) {
+  // Let a nested engine-promote identify only this launcher's reservation.
+  // The installer validates the PID against the exact lock path and contents.
+  childEnv.PIPELINE_STARTING_LOCK_PID = String(process.pid);
+} else {
+  // Do not forward a stale value through read-only or nested launchers.
+  delete childEnv.PIPELINE_STARTING_LOCK_PID;
+}
+const run = spawnSync(process.execPath, args, { stdio: "inherit", env: childEnv });
 if (reserved) releaseRunSlot();
 process.exit(run.status ?? 1);

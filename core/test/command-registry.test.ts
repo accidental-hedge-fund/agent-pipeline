@@ -29,7 +29,7 @@ import { buildCmd } from "../scripts/pipeline.ts";
 // These are the named keywords the dispatch block in pipeline.ts recognizes.
 const DISPATCH_KEYWORDS = [
   "init", "doctor", "status", "unblock", "override", "cleanup",
-  "release", "intake", "sweep", "triage", "merge", "merge-queue", "train",
+  "release", "ship", "intake", "sweep", "triage", "merge", "merge-queue", "train",
   "refine-spec", "logs", "summary", "path", "config", "run", "single", "improve",
   "scoreboard", "roadmap", "loop", "correction", "report", "engine-promote",
 ];
@@ -245,7 +245,7 @@ test("command-registry: needsIssueNumber is true for issue-scoped commands", () 
 test("command-registry: needsIssueNumber is false for named sub-commands that operate without an issue", () => {
   // Commands that act on the repo/environment, not a specific issue.
   const issueAgnosticKeys = [
-    "init", "doctor", "cleanup", "release", "intake", "sweep",
+    "init", "doctor", "cleanup", "release", "ship", "intake", "sweep",
     "triage", "merge", "merge-queue", "train", "refine-spec", "logs", "summary", "path",
     "config", "improve", "scoreboard", "roadmap", "correction",
   ];
@@ -440,6 +440,19 @@ test("allowsJsonFlag: train supportsJson allows --json", () => {
 test("allowsJsonFlag: engine-promote and release allow --json", () => {
   assert.equal(allowsJsonFlag({ entry: lookupCommand("engine-promote") }), true);
   assert.equal(allowsJsonFlag({ entry: lookupCommand("release") }), true);
+});
+
+test("command-registry: ship is an exact JSON-capable mutating surface", () => {
+  const entry = lookupCommand("ship");
+  assert.equal(entry, COMMAND_REGISTRY.ship);
+  assert.equal(entry?.needsIssueNumber, false);
+  assert.equal(entry?.needsGhAuth, true);
+  assert.equal(entry?.mutatesGitHub, true);
+  assert.equal(entry?.supportsJson, true);
+  assert.deepEqual(
+    [...(entry?.allowedFlags as Set<string>)].sort(),
+    ["authorization", "base", "for", "json", "milestone", "profile", "repoPath"],
+  );
 });
 
 test("allowsJsonFlag: advance rejects bare --json", () => {

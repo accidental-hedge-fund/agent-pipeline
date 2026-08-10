@@ -264,13 +264,25 @@ function parseArgs(argv) {
   let dryRun = false;
   let yesDeps = false;
   let force = false;
+  let internalStartingLockPid = null;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--host") host = args[++i];
     else if (args[i] === "--dry-run") dryRun = true;
     else if (args[i] === "--yes-deps") yesDeps = true;
     else if (args[i] === "--force") force = true;
+    else if (args[i] === "--internal-starting-lock-pid") {
+      const raw = args[++i];
+      if (typeof raw !== "string" || !/^[1-9]\d*$/.test(raw)) {
+        throw new Error("--internal-starting-lock-pid requires a positive integer PID");
+      }
+      const parsed = Number(raw);
+      if (!Number.isSafeInteger(parsed)) {
+        throw new Error("--internal-starting-lock-pid requires a safe positive integer PID");
+      }
+      internalStartingLockPid = parsed;
+    }
   }
-  return { verb, host, dryRun, yesDeps, force };
+  return { verb, host, dryRun, yesDeps, force, internalStartingLockPid };
 }
 
 function selectedHosts(hostArg) {
@@ -443,14 +455,20 @@ const defaultLockSeams = {
  *  liveness semantics as PipelineLock, so a live or EPERM (conservatively
  *  live) lock is never swept and still blocks. Performs no real
  *  filesystem/process-signal call when `listLocks`/`readLock`/`isPidLive`/
- *  `removeLock` are all overridden (unit-test seam). */
+ *  `removeLock` are all overridden (unit-test seam). A validated
+ *  `internalStartingLockPid` exempts only that launcher's exact reservation
+ *  path with matching PID contents; it does not exempt any other live lock. */
 function findLiveRunLocks({
   listLocks = defaultLockSeams.listLocks,
   readLock = defaultLockSeams.readLock,
   isPidLive = defaultLockSeams.isPidLive,
   removeLock = defaultLockSeams.removeLock,
+  internalStartingLockPid = null,
 } = {}) {
   const live = [];
+  const exemptPath = Number.isSafeInteger(internalStartingLockPid) && internalStartingLockPid > 0
+    ? join(tmpdir(), `pipeline-starting-${internalStartingLockPid}.lock`)
+    : null;
   for (const lockPath of listLocks()) {
     const raw = readLock(lockPath);
     if (raw === null) continue; // unreadable → treat as stale, leave in place
@@ -460,6 +478,12 @@ function findLiveRunLocks({
       continue;
     }
     if (isPidLive(pid)) {
+      // A launcher-owned engine-promote may replace its installed engine while
+      // its own reservation remains live. Exempt only the exact path whose
+      // contents match the validated PID; every other live run still blocks.
+      if (exemptPath !== null && lockPath === exemptPath && pid === internalStartingLockPid) {
+        continue;
+      }
       live.push({ path: lockPath, pid });
     } else {
       removeLock(lockPath); // ESRCH → provably dead, sweep it
@@ -1492,7 +1516,7 @@ function printDepSummary(results) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const { verb, host, dryRun, yesDeps, force } = parseArgs(process.argv);
+  const { verb, host, dryRun, yesDeps, force, internalStartingLockPid } = parseArgs(process.argv);
   const hosts = selectedHosts(host);
 
   if (verb === "install" || verb === "update") {
@@ -1519,7 +1543,7 @@ async function main() {
         fail("Another install/update displaced the update lock. Retry once it finishes.");
       }
       holdingUpdateLock = true;
-      const liveLocks = findLiveRunLocks();
+      const liveLocks = findLiveRunLocks({ internalStartingLockPid });
       if (liveLocks.length > 0) {
         if (force) {
           warn(formatLiveRunMessage(liveLocks, { asWarning: true }));
