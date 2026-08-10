@@ -122,6 +122,9 @@ same authorized request asks Pipeline to reconcile its durable state.
 Submit several milestones as separate authorized requests. Do not add a host
 batch loop; Pipeline must own ordering and dependency decisions.
 
+Historical context for the notifier failures that led to this design is in
+[session-2026-08-ship-factory-lessons.md](./session-2026-08-ship-factory-lessons.md).
+
 ## Exact-run progress
 
 Prefer `pipeline ship status … --json`. If typed status supplies an absolute

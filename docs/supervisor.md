@@ -251,6 +251,9 @@ authoritative. The host owns authenticated admission and process supervision.
 Pass it through `material-filter.mjs`; never search host-global run stores.
 Notification failures are observational and cannot alter the ship.
 
+Historical context for the v1.33 ship and v1.34 notifier-attribution incident:
+[runbooks/session-2026-08-ship-factory-lessons.md](./runbooks/session-2026-08-ship-factory-lessons.md).
+
 ## Versioning
 
 - Intent map and CLI flags may grow; prefer additive changes.

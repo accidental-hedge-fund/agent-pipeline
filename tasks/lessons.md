@@ -67,3 +67,6 @@
 - A globally installed validation CLI can be newer and more permissive than CI's pinned
   fallback. When CI pins a tool version, reproduce failures with that exact version before
   treating a newer local validator as authoritative.
+- When asked to update relevant PRs, do not silently replace or close an explicitly named
+  PR. Preserve its distinct deliverable, stack it on prerequisite implementation when
+  appropriate, and let the user decide whether it should be superseded.
