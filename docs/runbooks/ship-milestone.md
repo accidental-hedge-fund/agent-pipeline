@@ -44,6 +44,32 @@ export PIPELINE_SHIP_AUTH_PUBLIC_KEY_FILE=/etc/agent-pipeline/ship-authority.pem
 `PIPELINE` must name one executable. Use `pipeline-launcher.sh` when the
 installed command otherwise needs several shell words.
 
+### Chain-to-existing-tools path (`pipeline-ship-playbook.sh`)
+
+The scripts above drive the `pipeline ship` coordinator. Hosts running a
+pipeline build **without** the `ship` subcommand can deploy the alternative
+chain playbook instead (or alongside) — it composes only existing tools
+(`train --merge` → `release` → `release finish` → wait GitHub Release →
+`engine-promote`) and needs no signed authorization document:
+
+```bash
+install -m 0755 "$ROOT/examples/supervisor/shell/pipeline-ship-playbook.sh" \
+  "$HOME/.local/bin/pipeline-ship-playbook"
+```
+
+Keep the installed copy in sync with the source after updating the repo — the
+host file is not generated, so refresh it manually when `main` changes it:
+
+```bash
+cp "$ROOT/examples/supervisor/shell/pipeline-ship-playbook.sh" \
+  "$HOME/.local/bin/pipeline-ship-playbook"
+```
+
+The playbook auto-generates the FRG release gate via `pipeline-ship-frg <ver>`
+when `.agent-pipeline/frg/<ver>/latest.json` is missing (a real gate — it runs
+the actual `factory-gate` scorer and never fabricates a pass), so no manual FRG
+pack setup is required before a `Ship milestone vX.Y.Z`.
+
 ## Submit and inspect one ship
 
 The authorization path must be absolute. The authorization must come from the
