@@ -13,6 +13,7 @@ import {
   extractPipelineAttestation,
   isVerifiedPipelineAttestation,
 } from "./stages/review-parsing.ts";
+import { BUILTIN_ADAPTER_NAMES } from "./harness-adapters/registry.ts";
 import {
   BLOCKED_LABEL,
   BLOCKER_RECIPES,
@@ -204,7 +205,16 @@ const STAGE_PRIORITY: Record<string, number> = (() => {
   return m;
 })();
 
-const COMMENT_FOOTER = "\n\n---\n*Automated by Claude Code Pipeline Skill*";
+/**
+ * Config-sourced skill footer block shared by stage-transition and blocked
+ * comments. Matches the `---` separator style used by planning / review /
+ * deploy_ready builders. Falls back only when callers omit a footer (pure
+ * unit tests); production paths pass `cfg.marker_footer`.
+ */
+function commentFooterBlock(markerFooter?: string | null): string {
+  const footer = (markerFooter ?? "*Automated by Claude Code Pipeline Skill*").trim();
+  return `\n\n---\n${footer}`;
+}
 
 /**
  * Classify a gh CLI error string as transient (worth retrying) or deterministic.
@@ -797,22 +807,34 @@ export function isBlocked(labels: string[]): boolean {
   return labels.includes(BLOCKED_LABEL);
 }
 
-export function getHarnessLabel(labels: string[]): "claude" | "codex" | null {
+/**
+ * Parse the first `harness:<name>` issue label with a non-empty suffix.
+ * Accepts any harness name (claude, codex, grok, opencode, pi, …) — not only
+ * the historical claude/codex pair (#954).
+ */
+export function getHarnessLabel(labels: string[]): string | null {
   for (const name of labels) {
     if (name.startsWith("harness:")) {
       const h = name.slice("harness:".length);
-      if (h === "claude" || h === "codex") return h;
+      if (h) return h;
     }
   }
   return null;
 }
 
-
-export async function ensurePipelineLabels(cfg: PipelineConfig): Promise<void> {
-  const desired: { name: string; color: string; description: string }[] = [
+/**
+ * Desired pipeline labels for bootstrap (blocked + every built-in harness + stages).
+ * Pure + exported so unit tests can assert the harness set without network I/O.
+ */
+export function desiredPipelineLabels(): { name: string; color: string; description: string }[] {
+  return [
     { name: BLOCKED_LABEL, color: "D73A4A", description: "Pipeline blocked awaiting human or external action" },
-    { name: "harness:claude", color: "6F42C1", description: "Pipeline item owned by Claude primary harness" },
-    { name: "harness:codex", color: "0052CC", description: "Pipeline item owned by Codex primary harness" },
+    ...BUILTIN_ADAPTER_NAMES.map((name) => ({
+      name: `harness:${name}`,
+      // Preserve historical colors for the original pair; other adapters share purple.
+      color: name === "codex" ? "0052CC" : "6F42C1",
+      description: `Pipeline item owned by ${name.charAt(0).toUpperCase()}${name.slice(1)} primary harness`,
+    })),
     ...STAGES.map((stage) => ({
       name: `${LABEL_PREFIX}${stage}`,
       color:
@@ -826,6 +848,10 @@ export async function ensurePipelineLabels(cfg: PipelineConfig): Promise<void> {
       description: `Pipeline stage: ${stage}`,
     })),
   ];
+}
+
+export async function ensurePipelineLabels(cfg: PipelineConfig): Promise<void> {
+  const desired = desiredPipelineLabels();
 
   const stdout = await ghRun([
     "label",
@@ -1007,6 +1033,8 @@ export function buildTransitionComment(args: {
   ts: string;
   summary: string;
   runId: string;
+  /** Active config `marker_footer`. Production always passes this. */
+  markerFooter?: string | null;
 }): string {
   const lines = [
     `## Pipeline: ${args.toStage.replace(/-/g, " ")}`,
@@ -1018,7 +1046,11 @@ export function buildTransitionComment(args: {
   if (args.summary) {
     lines.push("", "### Summary", args.summary);
   }
-  const rendered = lines.join("\n") + COMMENT_FOOTER + "\n" + buildAuditSentinel(args.runId, args.toStage);
+  const rendered =
+    lines.join("\n") +
+    commentFooterBlock(args.markerFooter) +
+    "\n" +
+    buildAuditSentinel(args.runId, args.toStage);
   return attestPipelineComment("stage-transition", rendered);
 }
 
@@ -1048,7 +1080,15 @@ export async function transition(
   ) ?? "unassigned";
 
   const effectiveRunId = _activeRunId ?? "unknown";
-  const comment = buildTransitionComment({ fromStage, toStage, harness, ts, summary, runId: effectiveRunId });
+  const comment = buildTransitionComment({
+    fromStage,
+    toStage,
+    harness,
+    ts,
+    summary,
+    runId: effectiveRunId,
+    markerFooter: cfg.marker_footer,
+  });
 
   await _editLabels(cfg, issueNumber, fromStage, toStage);
   await retryComment(() => _postComment(cfg, issueNumber, comment), 3, _sleep);
@@ -1096,6 +1136,8 @@ export function buildBlockedComment(args: {
   ts: string;
   reason: string;
   kind: BlockerKind;
+  /** Active config `marker_footer`. Production always passes this. */
+  markerFooter?: string | null;
   /** Engine version for attribution stamp (#763). Defaults to unknown. */
   engineVersion?: string | null;
   /** Engine commit SHA for attribution stamp (#763). Defaults to unknown. */
@@ -1129,18 +1171,23 @@ export function buildBlockedComment(args: {
       `\n<!-- pipeline:engine version=unknown sha=unknown -->` +
       `\n<!-- pipeline:discovery-channel live-run -->`;
   }
-  return [
-    `## Pipeline: Blocked at ${String(args.stageStr).replace(/-/g, " ")}`,
-    "",
-    `**Harness**: ${args.harness}`,
-    `**Blocked since**: ${args.ts}`,
-    "",
-    "### Why",
-    args.reason,
-    "",
-    "### How to unblock",
-    renderRecipe(args.kind, args.issueNumber),
-  ].join("\n") + COMMENT_FOOTER + `\n<!-- pipeline-blocker-kind: ${args.kind} -->` + attribution;
+  return (
+    [
+      `## Pipeline: Blocked at ${String(args.stageStr).replace(/-/g, " ")}`,
+      "",
+      `**Harness**: ${args.harness}`,
+      `**Blocked since**: ${args.ts}`,
+      "",
+      "### Why",
+      args.reason,
+      "",
+      "### How to unblock",
+      renderRecipe(args.kind, args.issueNumber),
+    ].join("\n") +
+    commentFooterBlock(args.markerFooter) +
+    `\n<!-- pipeline-blocker-kind: ${args.kind} -->` +
+    attribution
+  );
 }
 
 /**
@@ -1274,6 +1321,7 @@ export function buildAttestedBlockedComment(args: {
   reason: string;
   kind: BlockerKind;
   runId: string;
+  markerFooter?: string | null;
   engineVersion?: string | null;
   engineCommitSha?: string | null;
   discoveryChannel?: import("./engine-attribution.ts").DiscoveryChannel | null;
@@ -1351,6 +1399,7 @@ export async function setBlocked(
     reason,
     kind,
     runId: effectiveRunId,
+    markerFooter: cfg.marker_footer,
     engineVersion,
     engineCommitSha,
     discoveryChannel,
