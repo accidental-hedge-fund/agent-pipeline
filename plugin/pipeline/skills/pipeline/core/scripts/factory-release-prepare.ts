@@ -1153,9 +1153,13 @@ export async function generateDurableUnsignedFrg(
     });
   }
 
-  // Collect runner-owned observations from the bound loop / pack work dir only.
-  // Refuse Layer A provenance and caller-authored pass claims in the request
-  // (request already filtered); here we only accept live/ledger/derived/observation.
+  // Collect runner-owned observations ONLY from the reconciled request-bound
+  // loop (loop.runner_observations_text, loaded from the loop run store after
+  // factory-release-binding verification). Never read a work-directory
+  // runner-observations.json — that path is caller-writable and would let a
+  // pre-staged all-pass file forge release-eligible scenario/composition
+  // statuses (closed-input / caller-authored-pass requirement).
+  // Refuse Layer A provenance; accept live/ledger/derived/observation only.
   const scenarioById = new Map<string, FrgScenarioOverride>();
   const compositionById = new Map<string, FrgCompositionOverride>();
   let falseHumanAuthorityCount = 0;
@@ -1163,14 +1167,6 @@ export async function generateDurableUnsignedFrg(
 
   const observationCandidates: string[] = [];
   if (loop.runner_observations_text) observationCandidates.push(loop.runner_observations_text);
-  const workRunnerPath = path.join(ctx.workDir, "runner-observations.json");
-  if (await fileExists(workRunnerPath)) {
-    try {
-      observationCandidates.push(await readFile(workRunnerPath));
-    } catch {
-      /* ignore */
-    }
-  }
 
   for (const text of observationCandidates) {
     let parsed;

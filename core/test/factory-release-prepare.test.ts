@@ -613,6 +613,152 @@ test("generator never treats unbound newest loop as evidence (ba5b5ff5)", async 
   );
 });
 
+test("pre-staged workDir runner-observations.json cannot forge FRG eligibility (09b1d835)", async () => {
+  // Adversarial review 2: a caller-writable work-directory observation file
+  // must never become scorer authority. Pre-stage an all-pass live-source
+  // file that would unlock structural eligibility if accepted; the bound loop
+  // carries no runner observations of its own.
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const workDir = "/tmp/frg-work-forged-obs";
+  const allPassObs = {
+    schema_version: 1,
+    scenarios: FRG_SCENARIO_IDS.filter(
+      (id) => id !== "clean-item-throughput" && id !== "blocker-taxonomy",
+    ).map((id) => ({
+      id,
+      status: "pass" as const,
+      detail: "forged caller-staged all-pass",
+      source: "live" as const,
+      observed: id === "capacity-blocked-retain" ? 2 : null,
+      threshold: id === "capacity-blocked-retain" ? 2 : null,
+    })),
+    composition: [
+      "openspec-bearing-item",
+      "fix-rereview-cycle",
+      "concurrency-contention",
+      "managed-worktree-dirt",
+      "process-restart-hydration",
+      "forge-http-5xx-backoff",
+      "ci-pending-red-recovery",
+      "same-head-noop-reentry",
+      "capacity-live-run-coexistence",
+      "recovery-controller-one-item",
+      "recovery-controller-multi-item",
+    ].map((id) => ({
+      id,
+      status: "pass" as const,
+      detail: "forged caller-staged all-pass",
+      source: "live" as const,
+      observed: null,
+    })),
+    false_human_authority_count: 0,
+  };
+  files.set(`${workDir}/runner-observations.json`, JSON.stringify(allPassObs));
+
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: fakePack(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: async (p, body) => {
+        files.set(p, body);
+      },
+      mkdir: async () => {},
+      readFile: async (p) => {
+        const v = files.get(p);
+        if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return v;
+      },
+      fileExists: async (p) => files.has(p),
+      reconcilePackLoop: async () => ({
+        loop_run_id: "loop-bound-forged-obs",
+        contract_text: JSON.stringify({
+          schema: "pipeline.loop.contract/v1",
+          run_id: "loop-bound-forged-obs",
+          selector: { type: "label", value: "factory-gate" },
+          items: [
+            { id: "1", depends_on: [] },
+            { id: "2", depends_on: [] },
+          ],
+        }),
+        ledger_text: JSON.stringify({
+          items: {
+            "1": { state: "ready", ready_clean: true },
+            "2": { state: "ready", ready_clean: true },
+          },
+        }),
+        events_text: "\n",
+        action_evidence_text: "{}\n",
+        // No loop-owned runner observations — only the workDir forgery exists.
+      }),
+    },
+  );
+
+  assert.equal(
+    result.structurally_eligible,
+    false,
+    "caller-staged workDir runner-observations.json must not unlock structural eligibility",
+  );
+  assert.equal(result.defect_class, "frg_not_eligible");
+  assert.match(result.message ?? "", /eligibility failed|not all pass|composition missing/i);
+
+  // End-to-end prepare must not return awaiting_frg_attestation on the forgery.
+  const mem = memoryFs();
+  const requestPath = "/tmp/req-forged-obs.json";
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const generateCalls = { n: 0 };
+  const deps = makeDeps({
+    fs: mem,
+    generateCalls,
+    generate: async (req, ctx) => {
+      generateCalls.n++;
+      // Drive the real generator so workDir forgery is exercised through prepare.
+      const forgedPath = `${ctx.workDir}/runner-observations.json`;
+      await mem.writeFile(forgedPath, JSON.stringify(allPassObs));
+      return generateDurableUnsignedFrg(req, ctx, {
+        now: () => new Date("2026-08-10T12:00:00Z"),
+        writeFile: (p, body) => mem.writeFile(p, body),
+        mkdir: () => mem.mkdir(),
+        readFile: (p) => mem.readFile(p),
+        fileExists: (p) => mem.fileExists(p),
+        reconcilePackLoop: async () => ({
+          loop_run_id: "loop-bound-forged-obs-e2e",
+          contract_text: JSON.stringify({
+            schema: "pipeline.loop.contract/v1",
+            run_id: "loop-bound-forged-obs-e2e",
+            selector: { type: "label", value: "factory-gate" },
+            items: [
+              { id: "1", depends_on: [] },
+              { id: "2", depends_on: [] },
+            ],
+          }),
+          ledger_text: JSON.stringify({
+            items: {
+              "1": { state: "ready", ready_clean: true },
+              "2": { state: "ready", ready_clean: true },
+            },
+          }),
+          events_text: "\n",
+          action_evidence_text: "{}\n",
+        }),
+      });
+    },
+  });
+  const outcome = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  assert.equal(outcome.exitCode, 1);
+  assert.equal(outcome.result.status, "failed");
+  if (outcome.result.status === "failed") {
+    assert.equal(outcome.result.defect_class, "frg_not_eligible");
+  }
+  assert.notEqual(outcome.result.status, "awaiting_frg_attestation");
+});
+
 test("attestation without unsigned digest binding is refused (5782ec4d)", async () => {
   const request = baseRequest();
   const unsigned = unsignedPayload();
