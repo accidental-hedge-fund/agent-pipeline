@@ -258,6 +258,10 @@ classification) and the [trend ledger](#trend-ledger) when available from the pa
 The pack uses a **dedicated** synthetic / labeled work-list (`factory-gate` label or
 reliability selector) — **not** the full product milestone backlog.
 
+**Pack provenance (1.34.0):** clean composition pack item 1 — synthetic
+`factory-gate-v1` / factory-gate contributor for Layer B scenario
+`clean-item-throughput` (docs-only; no product or FRG scoring change). Issue #959.
+
 ### Layer A waivers
 
 | Scenario id | Tracking issue |
