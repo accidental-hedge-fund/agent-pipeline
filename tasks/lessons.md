@@ -64,3 +64,6 @@
 - Temporal proximity cannot bind reliability evidence to a release candidate. If the
   producer does not record the exact repository, base, and candidate OID, the release must
   stop instead of rebinding the evidence in a downstream adapter.
+- A globally installed validation CLI can be newer and more permissive than CI's pinned
+  fallback. When CI pins a tool version, reproduce failures with that exact version before
+  treating a newer local validator as authoritative.
