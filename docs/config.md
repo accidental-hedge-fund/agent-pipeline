@@ -813,12 +813,12 @@ Nested fields:
 #### `roadmap.release_capacity`
 
 - **Type:** object
-- **Description:** Capacity policy for the semver release model. Controls per-milestone effort budget and breaking-change isolation. Absent block uses capacity-aware defaults.
+- **Description:** Capacity policy for the semver release model. Controls per-milestone effort budget and isolation of resolved semver:major issues. Applied SemVer impact uses only exclusive semver:major|minor|patch labels (not title/body keywords). Absent block uses capacity-aware defaults.
 
 #### `roadmap.release_model`
 
 - **Type:** enum
-- **Description:** How the roadmap groups issues into milestones: 'semver' (default) bundles into version-numbered release lanes; 'continuous' groups by theme/epic for continuous delivery.
+- **Description:** How the roadmap groups issues into milestones: 'semver' (default) bundles issues with exclusive semver:major|minor|patch labels into version-numbered release lanes; 'continuous' groups by theme/epic for continuous delivery (no SemVer impact classification).
 
 - **Allowed values:** `semver`, `continuous`
 

@@ -730,15 +730,15 @@ const PartialConfigSchema = z.object({
         .describe("Multiplier overrides for each scoring sub-factor (default: 1.0 each)."),
       hygiene_auto_apply: z.boolean().optional().describe("When true, hygiene actions are applied automatically with --apply (default: false)."),
       pr_docs: z.boolean().optional().describe("When false, skip opening the roadmap.md PR (default: true)."),
-      release_model: z.enum(["semver", "continuous"]).optional().describe("How the roadmap groups issues into milestones: 'semver' (default) bundles into version-numbered release lanes; 'continuous' groups by theme/epic for continuous delivery."),
+      release_model: z.enum(["semver", "continuous"]).optional().describe("How the roadmap groups issues into milestones: 'semver' (default) bundles issues with exclusive semver:major|minor|patch labels into version-numbered release lanes; 'continuous' groups by theme/epic for continuous delivery (no SemVer impact classification)."),
       release_capacity: z
         .object({
           effort_budget: z.number().positive().optional().describe("Per-milestone effort-points capacity budget for the semver model (XS=1 S=2 M=3 L=5 XL=8). An issue with effort_points ≥ budget is isolated into its own milestone. Default: 8."),
-          isolate_breaking: z.boolean().optional().describe("When true (default), each breaking-change issue is given its own milestone instead of sharing one with unrelated issues. Tunes capacity-aware semver milestone grouping."),
+          isolate_breaking: z.boolean().optional().describe("When true (default), each issue with resolved applied impact major (explicit semver:major) is given its own milestone instead of sharing one with unrelated issues. Title/body prose and type-label recommendations never mark an issue as breaking."),
         })
         .strict()
         .optional()
-        .describe("Capacity policy for the semver release model. Controls per-milestone effort budget and breaking-change isolation. Absent block uses capacity-aware defaults."),
+        .describe("Capacity policy for the semver release model. Controls per-milestone effort budget and isolation of resolved semver:major issues. Applied SemVer impact uses only exclusive semver:major|minor|patch labels (not title/body keywords). Absent block uses capacity-aware defaults."),
       inventory_concurrency: z.number().int().positive().optional().describe("Maximum concurrent harness calls during inventory phase (default: 4)."),
       depgraph_concurrency: z.number().int().positive().optional().describe("Maximum concurrent harness calls during dependency verification (default: 4)."),
       depgraph_verify_cap: z.number().int().positive().optional().describe("Maximum candidates to source-verify; excess go to open_questions (default: 20)."),
@@ -2826,7 +2826,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         `#   release_model: semver # ${sd("roadmap.release_model", "how the roadmap groups issues into milestones")}`,
         `#   release_capacity: # ${sd("roadmap.release_capacity", "capacity policy for the semver release model")}`,
         `#     effort_budget: 8 # ${sd("roadmap.release_capacity.effort_budget", "per-milestone effort-points capacity budget for the semver model")}`,
-        `#     isolate_breaking: true # ${sd("roadmap.release_capacity.isolate_breaking", "give each breaking-change issue its own milestone instead of sharing one with unrelated issues")}`,
+        `#     isolate_breaking: true # ${sd("roadmap.release_capacity.isolate_breaking", "give each resolved semver:major issue its own milestone instead of sharing one with unrelated issues")}`,
         `#   inventory_concurrency: 4 # ${sd("roadmap.inventory_concurrency", "maximum concurrent harness calls during inventory phase (default: 4)")}`,
         `#   depgraph_concurrency: 4 # ${sd("roadmap.depgraph_concurrency", "maximum concurrent harness calls during dependency verification (default: 4)")}`,
         `#   depgraph_verify_cap: 20 # ${sd("roadmap.depgraph_verify_cap", "maximum candidates to source-verify; excess go to open_questions (default: 20)")}`,

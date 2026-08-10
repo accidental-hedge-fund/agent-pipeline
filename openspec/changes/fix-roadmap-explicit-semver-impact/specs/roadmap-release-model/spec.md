@@ -50,8 +50,8 @@ milestone assignment.
 
 ### Requirement: Applied SemVer compatibility impact SHALL come only from exclusive `semver:*` labels
 
-Under the `semver` release model (or when `release_model` is absent), the engine
-SHALL determine **applied** compatibility impact for each issue solely from the
+The engine SHALL determine **applied** compatibility impact for each issue under
+the `semver` release model (or when `release_model` is absent) solely from the
 mutually exclusive labels `semver:major`, `semver:minor`, and `semver:patch`
 (label name match SHALL be case-insensitive). Exactly one distinct class among
 those three present on the issue SHALL resolve applied impact to `major`,
@@ -93,9 +93,9 @@ applied impact.
 
 ### Requirement: Conflicting explicit SemVer labels SHALL be unresolved and SHALL block automatic milestone assignment
 
-When an issue carries two or more distinct labels from the set
-`{semver:major, semver:minor, semver:patch}`, the engine SHALL classify applied
-impact as unresolved with a conflict status. It SHALL NOT pick a winner, SHALL
+The engine SHALL classify applied impact as unresolved with a conflict status
+when an issue carries two or more distinct labels from the set
+`{semver:major, semver:minor, semver:patch}`. It SHALL NOT pick a winner, SHALL
 NOT assign the issue to any SemVer milestone automatically, and SHALL surface
 the conflict in plan artifacts.
 
@@ -111,13 +111,14 @@ the conflict in plan artifacts.
 
 ### Requirement: Missing explicit SemVer labels SHALL remain visibly uncertain for applied impact
 
-When an issue carries none of `semver:major`, `semver:minor`, or `semver:patch`,
-the engine SHALL treat applied impact as unresolved (missing). It SHALL record
-uncertainty on the classification. It SHALL NOT silently default applied impact
-to `major`, `minor`, or `patch` for the release plan. It MAY emit a non-binding
-**recommendation** derived only from generic type labels (and optional
-non-authoritative `breaking` / `breaking-change` labels), but that recommendation
-SHALL NOT replace explicit impact for applied milestone versioning or assignment.
+The engine SHALL treat applied impact as unresolved (missing) when an issue
+carries none of `semver:major`, `semver:minor`, or `semver:patch`. It SHALL
+record uncertainty on the classification. It SHALL NOT silently default applied
+impact to `major`, `minor`, or `patch` for the release plan. It MAY emit a
+non-binding **recommendation** derived only from generic type labels (and
+optional non-authoritative `breaking` / `breaking-change` labels), but that
+recommendation SHALL NOT replace explicit impact for applied milestone
+versioning or assignment.
 
 #### Scenario: Missing SemVer label is unresolved even with type labels
 
@@ -169,11 +170,11 @@ can audit classification without opening only `plan.json`.
 
 ### Requirement: Semver milestone version_impact SHALL use only resolved applied classifications
 
-Under the `semver` model, each milestone's machine-readable `version_impact` and
-the version title walk (major / minor / patch bump from the latest released tag)
-SHALL reflect the highest **resolved applied** impact among issues actually
-placed in that milestone. Unresolved issues and recommendations SHALL NOT
-contribute to `version_impact` or to major/minor/patch title selection.
+The engine SHALL set each SemVer milestone's machine-readable `version_impact`
+and version title walk from the highest **resolved applied** impact among issues
+actually placed in that milestone (major / minor / patch bump from the latest
+released tag). Unresolved issues and recommendations SHALL NOT contribute to
+`version_impact` or to major/minor/patch title selection.
 
 #### Scenario: Explicit major issue drives major bump
 
