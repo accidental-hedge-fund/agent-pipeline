@@ -251,3 +251,75 @@ test("release finish isolation: advance stages do not import release-finish", ()
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// Optional post-tag docs heal (#978) — injectable; does not create tags
+// ---------------------------------------------------------------------------
+
+test("finishReleasePr: optional post-tag heal is idempotent no-op when docs already fresh", async () => {
+  let refreshCalls = 0;
+  const deps = makeDeps({
+    async waitForReleaseTag() {
+      return true;
+    },
+    async refreshPostTagDocs(version) {
+      refreshCalls++;
+      assert.equal(version, "1.34.0");
+      return { ok: true, committed: false, reason: "clean" };
+    },
+  });
+  const result = await finishReleasePr(99, deps);
+  assert.equal(result.alreadyMerged, false);
+  assert.equal(deps.merges.length, 1, "merge still happens");
+  assert.equal(refreshCalls, 1);
+  assert.deepEqual(result.docsRefresh, { ok: true, committed: false, reason: "clean" });
+});
+
+test("finishReleasePr: heal failure after merge surfaces retry error and does not unmerge", async () => {
+  const deps = makeDeps({
+    async waitForReleaseTag() {
+      return true;
+    },
+    async refreshPostTagDocs() {
+      return {
+        ok: false,
+        committed: false,
+        error: "generate failed (simulated)",
+      };
+    },
+  });
+  await assert.rejects(
+    () => finishReleasePr(99, deps),
+    /merge succeeded.*post-tag docs refresh failed|Heal with:/i,
+  );
+  assert.equal(deps.merges.length, 1, "PR was already merged; heal failure must not roll back merge");
+});
+
+test("finishReleasePr: tag not visible yet skips heal without failing merge", async () => {
+  let refreshCalls = 0;
+  const deps = makeDeps({
+    async waitForReleaseTag() {
+      return false;
+    },
+    async refreshPostTagDocs() {
+      refreshCalls++;
+      return { ok: true, committed: true, paths: ["CHANGELOG.md"], commitMessage: "docs: x" };
+    },
+  });
+  const result = await finishReleasePr(99, deps);
+  assert.equal(result.alreadyMerged, false);
+  assert.equal(deps.merges.length, 1);
+  assert.equal(refreshCalls, 0);
+  assert.deepEqual(result.docsRefresh, { skipped: true, reason: "tag not visible yet" });
+});
+
+test("finishReleasePr without refresh deps: merge-only (no tag authority)", async () => {
+  const deps = makeDeps();
+  const result = await finishReleasePr(99, deps);
+  assert.equal(result.alreadyMerged, false);
+  assert.equal(deps.merges.length, 1);
+  assert.deepEqual(result.docsRefresh, {
+    skipped: true,
+    reason: "no refresh dep configured",
+  });
+});

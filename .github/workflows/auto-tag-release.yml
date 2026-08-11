@@ -1,28 +1,34 @@
 name: auto-tag-release
 
 # Auto-tags a release-PR merge commit (#411) so `release.yml` can publish the GitHub
-# Release without a trailing manual `git tag` step. This workflow only creates and
-# pushes the annotated tag; it never publishes a Release itself — that stays entirely
-# in release.yml, reached only via the `v*` tag push this workflow produces.
+# Release without a trailing manual `git tag` step. This workflow creates and pushes
+# the annotated tag, then regenerates tag-derived generator-owned docs (#978) so
+# CHANGELOG.md includes the new version before the next PR hits docs:check. It never
+# publishes a GitHub Release itself — that stays entirely in release.yml, reached
+# only via the `v*` tag push this workflow produces.
 #
 # GitHub does not re-trigger other workflows for events created by the default
-# GITHUB_TOKEN, so the tag push below authenticates with the RELEASE_TAG_TOKEN repo
-# secret (a fine-grained PAT / GitHub App token with `contents: write`, or a
-# write-scoped SSH deploy key) instead. GITHUB_TOKEN alone would push the tag but
-# release.yml would silently never run — reproducing the exact bug this fixes.
+# GITHUB_TOKEN, so the tag push and the follow-up docs commit push authenticate with
+# the RELEASE_TAG_TOKEN repo secret (a fine-grained PAT / GitHub App token with
+# `contents: write`, or a write-scoped SSH deploy key) instead. GITHUB_TOKEN alone
+# would push the tag but release.yml would silently never run — reproducing the
+# exact bug the tag step fixes. The same contents:write secret is required for the
+# post-tag CHANGELOG commit push; if the secret can push tags but not commits,
+# the docs-refresh step fails closed with an explicit error (tag remains).
 #
 # Detection requires BOTH the commit subject matching the `pipeline release` title
 # format AND core/package.json's version agreeing with the subject's version, so a
 # feature commit that happens to start with "release:" can never tag by accident.
 # The detection pattern below is single-sourced and drift-guarded by
 # core/test/auto-tag-release-workflow.test.ts against release.ts's title format.
+# A subsequent push of the docs regenerate commit (subject `docs: regenerate
+# CHANGELOG for vX.Y.Z`) is a successful no-op for tagging (subject does not match).
 #
 # Setup: RELEASE_TAG_TOKEN must be provisioned (a fine-grained PAT with
 # `contents: read` + `contents: write` on this repo, added as a repository Actions
-# secret named RELEASE_TAG_TOKEN) before a release merge can push the tag. It is
-# consumed ONLY by the "Create and push annotated tag" step below — checkout uses
-# the default GITHUB_TOKEN, so non-release pushes to main are unaffected by whether
-# the secret is provisioned.
+# secret named RELEASE_TAG_TOKEN) before a release merge can push the tag or the
+# post-tag docs commit. Checkout uses the default GITHUB_TOKEN, so non-release
+# pushes to main are unaffected by whether the secret is provisioned.
 
 on:
   push:
@@ -141,3 +147,53 @@ jobs:
           git config --local --unset-all http.https://github.com/.extraheader || true
           git tag -a "v${version}" -F /tmp/release-notes.md "${{ github.sha }}"
           git push "https://x-access-token:${RELEASE_TAG_TOKEN}@github.com/${{ github.repository }}.git" "refs/tags/v${version}"
+
+      # #978: CHANGELOG.md is generated from git tags. After the annotated tag
+      # exists, regenerate generator-owned docs and push a non-empty commit when
+      # dirt is present so the next PR does not fail docs:check solely for a
+      # missing just-shipped version section. Fail closed without deleting the tag.
+      - name: Install core deps for docs generator
+        if: steps.version_check.outputs.matched == 'true'
+        run: cd core && npm ci --no-audit --no-fund
+
+      - name: Regenerate tag-derived CHANGELOG
+        if: steps.version_check.outputs.matched == 'true'
+        env:
+          RELEASE_TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_TAG_TOKEN" ]; then
+            echo "::error::RELEASE_TAG_TOKEN is empty/absent — cannot push post-tag CHANGELOG refresh. Provision a fine-grained PAT with 'contents: read' and 'contents: write' on this repository (same secret used for tag push), and add it as RELEASE_TAG_TOKEN."
+            exit 1
+          fi
+          version="${{ steps.detect.outputs.version }}"
+          # Tag may already have existed (race) or was just pushed above — ensure
+          # this checkout can observe refs/tags/vX.Y.Z for the generator.
+          git fetch --tags origin
+          if ! git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            echo "::error::Annotated tag v${version} is not visible after fetch — cannot regenerate tag-derived CHANGELOG. Tag was not deleted; heal after the tag is present."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Same extraheader pitfall as the tag-push step: clear checkout's
+          # GITHUB_TOKEN so commit push authenticates with RELEASE_TAG_TOKEN.
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git remote set-url origin "https://x-access-token:${RELEASE_TAG_TOKEN}@github.com/${{ github.repository }}.git"
+          # actions/checkout leaves a detached SHA. Attach a local branch that
+          # tracks origin/<default> so release-docs-refresh's bare `git push`
+          # can update the default branch (detached HEAD rejects a bare push).
+          # Fail closed if sync fails — do not leave main stale silently.
+          branch="${{ github.ref_name }}"
+          if ! git fetch origin "${branch}"; then
+            echo "::error::Could not fetch origin/${branch} for post-tag CHANGELOG refresh. Tag was not deleted."
+            exit 1
+          fi
+          if ! git checkout -B "${branch}" "origin/${branch}"; then
+            echo "::error::Could not check out local branch '${branch}' tracking origin/${branch} — post-tag CHANGELOG commit cannot be pushed from a detached Actions checkout. Tag was not deleted."
+            exit 1
+          fi
+          if [ "$(git branch --show-current)" != "${branch}" ]; then
+            echo "::error::Expected HEAD on branch '${branch}' for docs push; got '$(git branch --show-current || echo detached)'. Tag was not deleted."
+            exit 1
+          fi
+          node scripts/release-docs-refresh.mjs --version "${version}" --push

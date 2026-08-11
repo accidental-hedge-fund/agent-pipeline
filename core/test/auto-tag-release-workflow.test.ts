@@ -255,33 +255,124 @@ test("RELEASE_TAG_TOKEN is never referenced by actions/checkout", () => {
   );
 });
 
-test("RELEASE_TAG_TOKEN is referenced only within the tag-push step (excluding comments)", () => {
-  const workflowSrc = readFileSync(WORKFLOW_PATH, "utf-8");
-  const lines = workflowSrc.split("\n");
-  const tagPushStepIdx = lines.findIndex(
-    (l) => l.trim() === "- name: Create and push annotated tag",
-  );
-  assert.notEqual(tagPushStepIdx, -1, "expected a 'Create and push annotated tag' step");
-
-  let tagPushStepEnd = lines.length;
-  for (let i = tagPushStepIdx + 1; i < lines.length; i++) {
+/** Inclusive step body range for a named `- name:` step (until next step). */
+function stepLineRange(lines: string[], stepName: string): { start: number; end: number } {
+  const start = lines.findIndex((l) => l.trim() === `- name: ${stepName}`);
+  if (start === -1) {
+    throw new Error(`expected a '${stepName}' step`);
+  }
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
     if (/^\s*- (uses|name): /.test(lines[i])) {
-      tagPushStepEnd = i;
+      end = i;
       break;
     }
   }
+  return { start, end };
+}
+
+function lineInRanges(i: number, ranges: Array<{ start: number; end: number }>): boolean {
+  return ranges.some((r) => i >= r.start && i < r.end);
+}
+
+test("RELEASE_TAG_TOKEN is referenced only within tag-push and post-tag docs-refresh steps (excluding comments)", () => {
+  const workflowSrc = readFileSync(WORKFLOW_PATH, "utf-8");
+  const lines = workflowSrc.split("\n");
+  const allowed = [
+    stepLineRange(lines, "Create and push annotated tag"),
+    stepLineRange(lines, "Regenerate tag-derived CHANGELOG"),
+  ];
 
   // Header comments documenting the secret (its purpose, provisioning) are fine —
   // this test pins where the secret is actually *consumed* by the YAML, not every
-  // prose mention of its name.
+  // prose mention of its name. #978 also consumes the secret for the docs commit push.
   lines.forEach((line, i) => {
     if (line.trim().startsWith("#")) return;
     if (!line.includes("RELEASE_TAG_TOKEN")) return;
     assert.ok(
-      i >= tagPushStepIdx && i < tagPushStepEnd,
-      `expected RELEASE_TAG_TOKEN reference at line ${i + 1} to be within the tag-push step (lines ${tagPushStepIdx + 1}-${tagPushStepEnd}), got: ${line}`,
+      lineInRanges(i, allowed),
+      `expected RELEASE_TAG_TOKEN reference at line ${i + 1} to be within the tag-push or ` +
+        `docs-refresh step, got: ${line}`,
     );
   });
+});
+
+// ---------------------------------------------------------------------------
+// Post-tag CHANGELOG refresh (#978) — drift guards
+// ---------------------------------------------------------------------------
+
+test("auto-tag-release runs post-tag docs refresh after the tag-push step", () => {
+  const workflowSrc = readFileSync(WORKFLOW_PATH, "utf-8");
+  const tagStep = workflowSrc.indexOf("- name: Create and push annotated tag");
+  const docsStep = workflowSrc.indexOf("- name: Regenerate tag-derived CHANGELOG");
+  assert.notEqual(tagStep, -1, "expected tag create/push step");
+  assert.notEqual(docsStep, -1, "expected post-tag CHANGELOG regenerate step (#978)");
+  assert.ok(
+    docsStep > tagStep,
+    "docs refresh must run after annotated tag create/push so the generator can see the tag",
+  );
+  assert.match(
+    workflowSrc,
+    /node scripts\/release-docs-refresh\.mjs --version .* --push/,
+    "expected release-docs-refresh.mjs invoker with --push",
+  );
+  // Guard against removing the step while leaving a comment that mentions CHANGELOG.
+  // Slice is large enough for branch-attach + refresh (detached-HEAD fix #978 review 1).
+  const docsSlice = workflowSrc.slice(docsStep, docsStep + 4000);
+  assert.match(docsSlice, /release-docs-refresh\.mjs/);
+  assert.match(docsSlice, /RELEASE_TAG_TOKEN/);
+});
+
+// Regression (#978 review 1): actions/checkout leaves detached HEAD. Bare
+// `git push` from the refresh helper fails unless the step attaches a local
+// branch tracking origin/${{ github.ref_name }} first.
+test("post-tag docs-refresh attaches local default branch before bare git push (detached checkout)", () => {
+  const script = extractStepScript("Regenerate tag-derived CHANGELOG");
+  const refreshIdx = script.indexOf("release-docs-refresh.mjs");
+  assert.notEqual(refreshIdx, -1, "expected release-docs-refresh invoker");
+
+  assert.match(
+    script,
+    /git checkout -B /,
+    "expected git checkout -B to attach a local branch for the docs push",
+  );
+  const checkoutIdx = script.indexOf("git checkout -B ");
+  assert.ok(
+    checkoutIdx < refreshIdx,
+    "local branch attach must happen before release-docs-refresh --push",
+  );
+
+  // Branch target must come from the workflow default-branch ref.
+  assert.match(
+    script,
+    /github\.ref_name/,
+    "expected docs-refresh to target github.ref_name (default branch)",
+  );
+  assert.match(
+    script,
+    /origin\/\$\{branch\}|origin\/"\$\{branch\}"|origin\/\$\{\{\s*github\.ref_name\s*\}\}/,
+    "expected checkout to track origin/<default-branch>",
+  );
+
+  // Fail closed on attach — must not swallow with || true (old pull line did).
+  const checkoutLine = script.split("\n").find((l) => l.includes("git checkout -B"));
+  assert.ok(checkoutLine, "expected checkout -B line");
+  assert.equal(
+    checkoutLine.includes("|| true"),
+    false,
+    `branch attach must fail closed (no || true): ${checkoutLine}`,
+  );
+});
+
+test("auto-tag detection pattern rejects post-tag docs regenerate commit subject (no tag loop)", () => {
+  const pattern = extractDetectionPattern();
+  const subject = "docs: regenerate CHANGELOG for v1.34.0";
+  assert.equal(
+    pattern.test(subject),
+    false,
+    `expected docs-refresh subject NOT to match release detection (would re-tag): ${subject}`,
+  );
+  assert.equal(pattern.test("docs: regenerate generated docs (#716)"), false);
 });
 
 // ---------------------------------------------------------------------------

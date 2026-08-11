@@ -3274,7 +3274,8 @@ async function main(): Promise<void> {
           "         pipeline release finish <pr> [--json]\n" +
           "         [--allow-open-soak-defects \"<reason>\"]\n" +
           "  Prepare stops at an open release PR (never tags/merges).\n" +
-          "  finish merges an open release PR after checks (never tags — workflows do).",
+          "  finish merges an open release PR after checks (never tags — workflows do).\n" +
+          "  Tag-derived CHANGELOG refresh runs automatically after auto-tag (#978).",
       );
       process.exit(2);
     }
