@@ -35,6 +35,9 @@ import {
   computeUnifiedDiff,
   formatMilestoneStatusLine,
   missingMilestoneError,
+  listReleaseMilestonesApiArgs,
+  parseReleaseMilestonesStdout,
+  findMilestoneMatchingVersion,
   runRelease,
   resolvePreviousTagCreatedAt,
   mapGhIssueToSoakCandidate,
@@ -559,6 +562,52 @@ test("formatMilestoneStatusLine: present / absent / unavailable", () => {
     formatMilestoneStatusLine("1.36.0", "unavailable", undefined, "network down"),
     /milestone: unavailable for 1\.36\.0 \(network down\)/,
   );
+});
+
+// #985 review 1: milestone list must paginate past the first API page so a
+// matching release milestone on page 2+ is not treated as absent (fail-closed
+// live prepare would otherwise block a valid release).
+test("listReleaseMilestonesApiArgs: paginates milestone list to completion", () => {
+  const args = listReleaseMilestonesApiArgs("owner/repo");
+  assert.ok(args.includes("--paginate"), "milestones must paginate past page 1");
+  assert.ok(args.includes("--slurp"), "milestones must --slurp multi-page JSON");
+  assert.ok(
+    args.some((a) => a.includes("milestones") && a.includes("per_page=100")),
+    "must hit the REST milestones endpoint",
+  );
+  assert.ok(
+    args.some((a) => a.includes("state=all")),
+    "must include open and closed milestones",
+  );
+});
+
+test("parseReleaseMilestonesStdout + findMilestoneMatchingVersion: match beyond page 1", () => {
+  // Simulate --paginate --slurp with 100 filler milestones on page 1 and the
+  // version match only on page 2 (the pre-fix page-1-only parse would miss it).
+  const page1 = Array.from({ length: 100 }, (_, i) => ({
+    number: i + 1,
+    title: `unrelated-milestone-${i + 1}`,
+  }));
+  const page2 = [
+    { number: 101, title: "v1.36.0 — beyond first page" },
+    { number: 102, title: "other-later" },
+  ];
+  const slurped = JSON.stringify([page1, page2]);
+  const milestones = parseReleaseMilestonesStdout(slurped);
+  assert.equal(milestones.length, 102);
+  const match = findMilestoneMatchingVersion(milestones, "1.36.0");
+  assert.ok(match, "must find milestone on page 2");
+  assert.equal(match!.number, 101);
+  assert.equal(match!.title, "v1.36.0 — beyond first page");
+
+  // Bare single-page array still parses (non-slurp fallback).
+  const single = parseReleaseMilestonesStdout(
+    JSON.stringify([{ number: 7, title: "1.6.0: Intake" }]),
+  );
+  assert.equal(findMilestoneMatchingVersion(single, "1.6.0")?.number, 7);
+
+  // Absent version returns null (empty plan / live fail-closed path).
+  assert.equal(findMilestoneMatchingVersion(milestones, "9.9.9"), null);
 });
 
 test("themeFromMilestoneTitle: strips version prefix", () => {

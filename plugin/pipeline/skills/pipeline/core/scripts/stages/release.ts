@@ -348,7 +348,7 @@ export function realReleaseDeps(repoDir?: string): ReleaseDeps {
 
       const msResult = spawnSync(
         "gh",
-        ["api", `repos/${repo}/milestones?state=all&per_page=100`],
+        listReleaseMilestonesApiArgs(repo),
         { encoding: "utf8", stdio: "pipe", cwd: repoDir, maxBuffer: 10 * 1024 * 1024 },
       );
       if (msResult.status !== 0) {
@@ -356,17 +356,10 @@ export function realReleaseDeps(repoDir?: string): ReleaseDeps {
           `gh api milestones failed (exit ${msResult.status}): ${msResult.stderr?.trim() ?? ""}`,
         );
       }
-      const milestones = JSON.parse(msResult.stdout || "[]") as Array<{
-        number: number;
-        title: string;
-      }>;
-      const match = milestones.find((m) => {
-        const t = m.title ?? "";
-        return (
-          t.includes(`v${version}`) ||
-          new RegExp(`(?:^|[^0-9.])${escapeRegex(version)}(?:[^0-9.]|$)`).test(t)
-        );
-      });
+      // Paginate to completion (#985 review): a match beyond page 1 must not
+      // be treated as absent (fail-closed live prepare would block valid releases).
+      const milestones = parseReleaseMilestonesStdout(msResult.stdout || "[]");
+      const match = findMilestoneMatchingVersion(milestones, version);
       if (!match) return null;
 
       const issuesResult = spawnSync(
@@ -990,6 +983,58 @@ export function resolveReleaseTheme(args: {
     return themeFromMilestoneTitle(args.milestoneTitle.trim(), args.version);
   }
   return PLAN_ROW_THEME_PLACEHOLDER;
+}
+
+/**
+ * `gh api` args for every repo milestone (open+closed), paginated to completion.
+ * `--paginate` follows Link headers past the first `per_page=100` page so a
+ * matching release milestone on a later page is not treated as absent (#985).
+ * `--slurp` yields a JSON array of pages for reliable multi-page parse.
+ */
+export function listReleaseMilestonesApiArgs(repo: string): string[] {
+  return [
+    "api",
+    `repos/${repo}/milestones?state=all&per_page=100`,
+    "--paginate",
+    "--slurp",
+  ];
+}
+
+export type ReleaseMilestoneApiRaw = {
+  number: number;
+  title: string;
+};
+
+/**
+ * Flatten paginated milestone list stdout from `gh api ... --paginate --slurp`
+ * (`[[page1...], [page2...]]`) or a single-page bare array.
+ */
+export function parseReleaseMilestonesStdout(stdout: string): ReleaseMilestoneApiRaw[] {
+  const raw = JSON.parse(stdout.trim() || "[]") as unknown;
+  if (!Array.isArray(raw)) return [];
+  if (raw.length > 0 && Array.isArray(raw[0])) {
+    return (raw as ReleaseMilestoneApiRaw[][]).flat();
+  }
+  // Non-slurp single page, or --paginate concat repaired by callers.
+  return raw as ReleaseMilestoneApiRaw[];
+}
+
+/**
+ * Version-aware milestone title match (title contains `vX.Y.Z` or a bare
+ * `X.Y.Z` token bounded so it does not match a different patch/minor).
+ */
+export function findMilestoneMatchingVersion(
+  milestones: ReleaseMilestoneApiRaw[],
+  version: string,
+): ReleaseMilestoneApiRaw | null {
+  const match = milestones.find((m) => {
+    const t = m.title ?? "";
+    return (
+      t.includes(`v${version}`) ||
+      new RegExp(`(?:^|[^0-9.])${escapeRegex(version)}(?:[^0-9.]|$)`).test(t)
+    );
+  });
+  return match ?? null;
 }
 
 /**
