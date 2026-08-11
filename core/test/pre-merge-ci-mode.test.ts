@@ -554,16 +554,19 @@ test("pre-merge ci_mode: local final SHA re-check: push during Step 2 mergeabili
   // Initial result matches SHA_HEAD → no inline run needed.
   const passEvents: RunEvent[] = [makeStageAccountingEvent("success", SHA_HEAD)];
 
-  let getPrDetailCallCount = 0;
+  // #816 hoists getPrDetail (open validity + post-stack re-fetch) before CI, so
+  // call-index "first vs second" is no longer a stable Step-1/Step-2 signal.
+  // Mark CI entry via readRunEvents; only post-CI detail reads see the push.
+  let enteredCiStep = false;
   const deps = makeBaseDeps({
     getPrChecks: async () => { throw new Error("should not be called"); },
     setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
-    readRunEvents: async () => passEvents,
+    readRunEvents: async () => {
+      enteredCiStep = true;
+      return passEvents;
+    },
     getPrDetail: async () => {
-      getPrDetailCallCount++;
-      const sha = getPrDetailCallCount === 1
-        ? SHA_HEAD          // first fetch (Step 0.5 / Step 1): matches test-gate event
-        : SHA_PUSHED_DURING_STEP2; // second fetch (Step 2): push arrived during mergeability poll
+      const sha = enteredCiStep ? SHA_PUSHED_DURING_STEP2 : SHA_HEAD;
       return { head_sha: sha, mergeable: true, mergeable_state: "CLEAN" } as Awaited<
         ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>
       >;

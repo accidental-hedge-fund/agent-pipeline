@@ -104,6 +104,20 @@ export interface PreMergePollingContext {
    *  poll that reaches the archive step. */
   preArchiveSha?: string;
   /**
+   * PR head SHA for which the **head-bound** pre-CI entry-gate stack
+   * (review-SHA gate, OpenSpec archive, active-change guard) already produced a
+   * clean proceed into the CI step (#816). Session-scoped only; any head
+   * movement invalidates by SHA mismatch. Early-conflict is never memoized.
+   */
+  entryGatesPassedForSha?: string;
+  /**
+   * Session-scoped open PR number for this polling session (#816). Reused only
+   * while a per-tick `getPrDetail` shows the PR is still open; closed / merged /
+   * missing detail clears this and `entryGatesPassedForSha`, then re-resolves
+   * via `getPrForIssue`.
+   */
+  prNumber?: number;
+  /**
    * True after a `gate_result` with `gate: "ci"` / `result: "partial"` was
    * written for the current CI waiting stretch (#682). Prevents per-poll
    * waiting spam on the advance event stream (and therefore on the loop
@@ -324,6 +338,22 @@ async function latestTestGateOutcome(
   };
 }
 
+/**
+ * Early-conflict predicate for pre-merge (#95 / #816).
+ * Byte-stable: only CONFLICTING (`mergeable === false`) or uppercased
+ * `mergeable_state === "DIRTY"` divert to conflict recovery before CI.
+ * UNKNOWN/null mergeable and BEHIND/BLOCKED without DIRTY fall through.
+ */
+export function isEarlyConflictPrDetail(prDetail: {
+  mergeable: boolean | null;
+  mergeable_state?: string | null;
+}): boolean {
+  return (
+    prDetail.mergeable === false ||
+    (prDetail.mergeable_state ?? "").toUpperCase() === "DIRTY"
+  );
+}
+
 export async function advance(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -352,11 +382,31 @@ export async function advance(
   console.log(`[pipeline] #${issueNumber}: pre-merge gate`);
 
   const pipelineRunId = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
+  const pollingCtx = opts.pollingCtx;
 
-  const prNumber = await getPrForIssueFn(cfg, issueNumber);
-  if (!prNumber) {
+  // ---- PR identity (#816): session-cached open PR number with open validity ----
+  const clearPrIdentityCache = (): void => {
+    if (!pollingCtx) return;
+    delete pollingCtx.prNumber;
+    delete pollingCtx.entryGatesPassedForSha;
+  };
+
+  // Single setBlocked call site for the no-PR path (escalation inventory #760).
+  const blockNoPr = async (): Promise<Outcome> => {
     await setBlockedFn(cfg, issueNumber, "No pull request found for pre-merge gate.", "pre-merge", "needs-human");
     return preMergeBlocked("no PR", "needs-human");
+  };
+
+  let prNumber: number | null =
+    pollingCtx && typeof pollingCtx.prNumber === "number" && pollingCtx.prNumber > 0
+      ? pollingCtx.prNumber
+      : null;
+  if (prNumber === null) {
+    prNumber = await getPrForIssueFn(cfg, issueNumber);
+    if (prNumber && pollingCtx) pollingCtx.prNumber = prNumber;
+  }
+  if (!prNumber) {
+    return blockNoPr();
   }
 
   if (opts.dryRun) {
@@ -366,140 +416,229 @@ export async function advance(
     return { advanced: true, from: "pre-merge", to: "visual-gate", summary: "[dry-run]" };
   }
 
-  // ---- Review-SHA gate (#16): runs before any pre-merge work ----
-  // pre-merge is the only stage that acts on a prior review verdict without
-  // re-running review, so it is where a stale approval would slip through. If
-  // HEAD has moved past the reviewed commit via a developer/fix commit, bounce
-  // back to the review round before doing any pre-merge work; pipeline-internal
-  // commits (openspec archive) do not invalidate the verdict.
-
-  // Wire the bounded pre-merge auto-fix dep (#359): when the implementer harness
-  // is configured and no seam is injected by the caller, build a production closure
-  // that invokes `performPreMergeAutoFix` (fix + amend + push) for the gate to call.
-  // Missing managed worktree rematerializes first (#769) so residual re-entry and
-  // normal delta autofix share one factory path (no bare empty `{status:"error"}`).
-  const gitFnForAutoFix = deps.gitInWorktree ?? gitInWorktree;
-  const invokeFnForAutoFix = deps.invokeFn ?? invoke;
-  const getForIssueForAutoFix = deps.getForIssue ?? getOnDiskForIssue;
-  const salvageFnForAutoFix = deps.trySalvageUncommittedWork ?? trySalvageUncommittedWork;
-  const ensureWtForAutoFix = deps.ensureManagedWorktree ?? ensureManagedWorktree;
-  const preAutoFixFn: ShaGateDeps["attemptPreMergeAutoFix"] =
-    deps.attemptPreMergeAutoFix ??
-    (cfg.harnesses?.implementer
-      ? async (blockingFindings, issueTitle, findingsText, claimAttempt) => {
-          let wt = await getForIssueForAutoFix(cfg, issueNumber);
-          if (!wt) {
-            const remat = await ensureWtForAutoFix(cfg, issueNumber, {
-              getOnDiskForIssue: getForIssueForAutoFix,
-              getIssueTitle: async () => issueTitle,
-              runDir: opts.runDir,
-              runStoreDeps: opts.runStoreDeps,
-            });
-            if (remat.result === "fail") {
-              return {
-                status: "rematerialize-failed",
-                blockerKind: remat.blockerKind,
-                diagnostic:
-                  `worktree rematerialize failed (${remat.blockerKind}): ${remat.reason}`,
-              };
-            }
-            wt = { path: remat.worktree.path, slug: remat.worktree.slug };
-          }
-          // `claimAttempt` charges the durable one-attempt marker inside
-          // performPreMergeAutoFix only after the clean-tree preflight, so a
-          // preflight failure here or below never consumes the attempt (#787).
-          return performPreMergeAutoFix(
-            cfg,
-            issueNumber,
-            pipelineRunId,
-            findingsText,
-            issueTitle,
-            wt,
-            gitFnForAutoFix,
-            invokeFnForAutoFix,
-            salvageFnForAutoFix,
-            {},
-            claimAttempt,
-          );
-        }
-      : undefined);
-
-  const shaGate = await enforceReviewShaGate(
-    cfg,
-    issueNumber,
-    prNumber,
-    {
-      ...deps,
-      runDir: opts.runDir,
-      runStoreDeps: opts.runStoreDeps,
-      attemptPreMergeAutoFix: preAutoFixFn,
-    },
-  );
-  if (shaGate) return shaGate;
-
-  // ---- Capture pre-archive SHA for the no-run / archive-only recovery path (#281, #679) ----
-  // Hydrate durable markers first so a restarted process restores preArchiveSha
-  // before this capture can overwrite it with the current (post-archive) head.
-  // Capture runs once per session when still unset: the developer's last commit
-  // before maybeArchiveOpenspec may push an archive commit that moves HEAD.
-  if (opts.pollingCtx) {
-    hydrateCiRecoveryMarkers(opts.pollingCtx, opts.runDir);
-    if (!opts.pollingCtx.preArchiveSha) {
-      try {
-        const preArchiveDetail = await getPrDetailFn(cfg, prNumber);
-        opts.pollingCtx.preArchiveSha = preArchiveDetail.head_sha;
-        // Best-effort: flush baseline early so later recovery markers include it.
-        // Budget-consuming side-effects still require a successful persist of their
-        // own markers via persistCtxCiMarkers before returning waiting.
-        persistCtxCiMarkers(opts.pollingCtx, opts.runDir);
-      } catch {
-        // Fetch failed; no-run recovery will use the non-archive fallback path.
-      }
+  // ---- Hoist PR detail early (#816): head SHA + mergeability + open validity ----
+  const fetchOpenPrDetail = async (
+    candidate: number,
+  ): Promise<{ prNumber: number; prDetail: Awaited<ReturnType<typeof getPrDetailFn>> } | null> => {
+    let detail: Awaited<ReturnType<typeof getPrDetailFn>> | null = null;
+    try {
+      detail = await getPrDetailFn(cfg, candidate);
+    } catch {
+      detail = null;
     }
+    // Missing state (partial test fakes) is treated as open; production always sets state.
+    const state = detail?.state ?? "open";
+    if (detail && state === "open") {
+      return { prNumber: candidate, prDetail: detail };
+    }
+    // Closed / merged / missing: clear session identity and re-resolve.
+    clearPrIdentityCache();
+    const resolved = await getPrForIssueFn(cfg, issueNumber);
+    if (!resolved) return null;
+    if (pollingCtx) pollingCtx.prNumber = resolved;
+    try {
+      const reDetail = await getPrDetailFn(cfg, resolved);
+      const reState = reDetail.state ?? "open";
+      if (reState !== "open") {
+        clearPrIdentityCache();
+        return null;
+      }
+      return { prNumber: resolved, prDetail: reDetail };
+    } catch {
+      clearPrIdentityCache();
+      return null;
+    }
+  };
+
+  const openPr = await fetchOpenPrDetail(prNumber);
+  if (!openPr) {
+    return blockNoPr();
+  }
+  prNumber = openPr.prNumber;
+  let prDetail = openPr.prDetail;
+
+  // CI recovery markers: hydrate every tick so durable ledger projects into ctx
+  // before Step 1; preArchive capture remains once-per-session (below, full stack).
+  if (pollingCtx) {
+    hydrateCiRecoveryMarkers(pollingCtx, opts.runDir);
   }
 
-  // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
-  const archiveOutcome = await maybeArchiveOpenspec(
-    cfg,
-    issueNumber,
-    pipelineRunId,
-    { ...deps, runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
-    opts.stateDir,
-    prNumber,
-  );
-  if (archiveOutcome) return archiveOutcome;
+  // ---- Head-bound entry gates (#816): once per head SHA per polling session ----
+  // Memo hit skips only review-SHA gate, OpenSpec archive, and active-change guard.
+  // Early-conflict and Step 1 CI always run (base can move without head change).
+  // Any observed head movement invalidates the memo immediately so a later
+  // force-push/revert back to a prior proceed SHA cannot reuse a stale hit
+  // after an intervening non-proceed head (review finding 9a76bc08).
+  if (
+    pollingCtx &&
+    typeof pollingCtx.entryGatesPassedForSha === "string" &&
+    pollingCtx.entryGatesPassedForSha.length > 0 &&
+    pollingCtx.entryGatesPassedForSha !== prDetail.head_sha
+  ) {
+    delete pollingCtx.entryGatesPassedForSha;
+  }
+  const entryGatesMemoHit =
+    !!pollingCtx &&
+    typeof pollingCtx.entryGatesPassedForSha === "string" &&
+    pollingCtx.entryGatesPassedForSha.length > 0 &&
+    pollingCtx.entryGatesPassedForSha === prDetail.head_sha;
 
-  // ---- Step 0.6: head-side active-change guard (#467) ----
-  // Worktree-independent postcondition: even if the archive step above no-opped
-  // for a reason not yet enumerated, pre-merge must never advance while the PR's
-  // own changed-file list still carries an unarchived `openspec/changes/<id>/`
-  // path it introduced. Behaves identically on a first run, an override-resumed
-  // run, a fresh process, or after the worktree has been removed. Skipped when
-  // `openspec.enabled: off` explicitly disables the integration (matches
-  // maybeArchiveOpenspec's own off-mode skip above).
-  if (cfg.openspec?.enabled !== "off") {
-    const openspecGuardOutcome = await enforceOpenspecActiveChangeGuard(cfg, issueNumber, prNumber, deps);
-    if (openspecGuardOutcome) return openspecGuardOutcome;
+  // Head SHA the head-bound stack validated this tick (or already memoized).
+  // Only this value may become `entryGatesPassedForSha` on clean proceed — an
+  // unrecognized post-stack head change must not acquire a proceed memo
+  // (#816 review 2 / override-key 22170497).
+  let entryGateProceedSha: string | undefined = entryGatesMemoHit
+    ? prDetail.head_sha
+    : undefined;
+
+  if (!entryGatesMemoHit) {
+    // Head observed before the stack; gates below validate this SHA only.
+    const stackEntryHeadSha = prDetail.head_sha;
+
+    // ---- Review-SHA gate (#16): runs before any pre-merge work ----
+    // pre-merge is the only stage that acts on a prior review verdict without
+    // re-running review, so it is where a stale approval would slip through. If
+    // HEAD has moved past the reviewed commit via a developer/fix commit, bounce
+    // back to the review round before doing any pre-merge work; pipeline-internal
+    // commits (openspec archive) do not invalidate the verdict.
+
+    // Wire the bounded pre-merge auto-fix dep (#359): when the implementer harness
+    // is configured and no seam is injected by the caller, build a production closure
+    // that invokes `performPreMergeAutoFix` (fix + amend + push) for the gate to call.
+    // Missing managed worktree rematerializes first (#769) so residual re-entry and
+    // normal delta autofix share one factory path (no bare empty `{status:"error"}`).
+    const gitFnForAutoFix = deps.gitInWorktree ?? gitInWorktree;
+    const invokeFnForAutoFix = deps.invokeFn ?? invoke;
+    const getForIssueForAutoFix = deps.getForIssue ?? getOnDiskForIssue;
+    const salvageFnForAutoFix = deps.trySalvageUncommittedWork ?? trySalvageUncommittedWork;
+    const ensureWtForAutoFix = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+    const preAutoFixFn: ShaGateDeps["attemptPreMergeAutoFix"] =
+      deps.attemptPreMergeAutoFix ??
+      (cfg.harnesses?.implementer
+        ? async (blockingFindings, issueTitle, findingsText, claimAttempt) => {
+            let wt = await getForIssueForAutoFix(cfg, issueNumber);
+            if (!wt) {
+              const remat = await ensureWtForAutoFix(cfg, issueNumber, {
+                getOnDiskForIssue: getForIssueForAutoFix,
+                getIssueTitle: async () => issueTitle,
+                runDir: opts.runDir,
+                runStoreDeps: opts.runStoreDeps,
+              });
+              if (remat.result === "fail") {
+                return {
+                  status: "rematerialize-failed",
+                  blockerKind: remat.blockerKind,
+                  diagnostic:
+                    `worktree rematerialize failed (${remat.blockerKind}): ${remat.reason}`,
+                };
+              }
+              wt = { path: remat.worktree.path, slug: remat.worktree.slug };
+            }
+            // `claimAttempt` charges the durable one-attempt marker inside
+            // performPreMergeAutoFix only after the clean-tree preflight, so a
+            // preflight failure here or below never consumes the attempt (#787).
+            return performPreMergeAutoFix(
+              cfg,
+              issueNumber,
+              pipelineRunId,
+              findingsText,
+              issueTitle,
+              wt,
+              gitFnForAutoFix,
+              invokeFnForAutoFix,
+              salvageFnForAutoFix,
+              {},
+              claimAttempt,
+            );
+          }
+        : undefined);
+
+    const shaGate = await enforceReviewShaGate(
+      cfg,
+      issueNumber,
+      prNumber,
+      {
+        ...deps,
+        runDir: opts.runDir,
+        runStoreDeps: opts.runStoreDeps,
+        attemptPreMergeAutoFix: preAutoFixFn,
+      },
+    );
+    if (shaGate) return shaGate;
+
+    // ---- Capture pre-archive SHA for the no-run / archive-only recovery path (#281, #679) ----
+    // Capture runs once per session when still unset: the developer's last commit
+    // before maybeArchiveOpenspec may push an archive commit that moves HEAD.
+    // Prefer the already-hoisted open prDetail head when available (#816).
+    if (pollingCtx && !pollingCtx.preArchiveSha) {
+      pollingCtx.preArchiveSha = prDetail.head_sha;
+      // Best-effort: flush baseline early so later recovery markers include it.
+      // Budget-consuming side-effects still require a successful persist of their
+      // own markers via persistCtxCiMarkers before returning waiting.
+      persistCtxCiMarkers(pollingCtx, opts.runDir);
+    }
+
+    // ---- Step 0: OpenSpec archive (once; folds change deltas into living specs) ----
+    const archiveOutcome = await maybeArchiveOpenspec(
+      cfg,
+      issueNumber,
+      pipelineRunId,
+      { ...deps, runDir: opts.runDir, runStoreDeps: opts.runStoreDeps },
+      opts.stateDir,
+      prNumber,
+    );
+    if (archiveOutcome) return archiveOutcome;
+
+    // ---- Step 0.6: head-side active-change guard (#467) ----
+    // Worktree-independent postcondition: even if the archive step above no-opped
+    // for a reason not yet enumerated, pre-merge must never advance while the PR's
+    // own changed-file list still carries an unarchived `openspec/changes/<id>/`
+    // path it introduced. Behaves identically on a first run, an override-resumed
+    // run, a fresh process, or after the worktree has been removed. Skipped when
+    // `openspec.enabled: off` explicitly disables the integration (matches
+    // maybeArchiveOpenspec's own off-mode skip above).
+    if (cfg.openspec?.enabled !== "off") {
+      const openspecGuardOutcome = await enforceOpenspecActiveChangeGuard(cfg, issueNumber, prNumber, deps);
+      if (openspecGuardOutcome) return openspecGuardOutcome;
+    }
+
+    // Re-fetch after the stack: mergeability may change; stack steps may move HEAD.
+    // Only the stack-entry head is memo-eligible unless a future channel proves a
+    // stack-produced post-stack SHA. An external push/force-push between stack
+    // completion and this re-fetch must not become a proceed memo (#816 review 2).
+    try {
+      prDetail = await getPrDetailFn(cfg, prNumber);
+    } catch {
+      // Detail fetch failed post-stack; keep pre-stack detail for early-conflict/CI.
+    }
+    if (prDetail.head_sha === stackEntryHeadSha) {
+      entryGateProceedSha = stackEntryHeadSha;
+    }
+    // else: leave entryGateProceedSha unset — next tick re-runs the full stack
+    // for the new head before it can become a memo hit.
   }
 
-  // ---- Step 0.5: early conflict detection (#95) ----
+  // ---- Step 0.5: early conflict detection (#95) — every tick, including memo hits ----
   // GitHub cannot build the pull_request merge ref for a CONFLICTING PR, so
   // no pull_request-triggered check runs are ever created — polling for
-  // checks would wait out ci_timeout for runs that cannot appear. Fetch PR
-  // detail and route a conflict straight to the rebase path. UNKNOWN (GitHub
-  // still computing mergeability) is NOT a conflict and falls through to the
-  // CI poll.
-  const prDetail = await getPrDetailFn(cfg, prNumber);
+  // checks would wait out ci_timeout for runs that cannot appear. Base branch
+  // movement can make a PR DIRTY without changing head_sha, so this must not
+  // be skipped under the entry-gate proceed memo (#816).
   // Narrow predicate: only CONFLICTING (mergeable === false) or an explicit DIRTY
   // merge state bypasses the CI poll. BEHIND/BLOCKED map to "conflict" in the
   // broader parseMergeable() but represent out-of-date branch or branch protection —
   // not a real merge conflict — so they must fall through to the CI poll.
-  const isEarlyConflict =
-    prDetail.mergeable === false ||
-    (prDetail.mergeable_state ?? "").toUpperCase() === "DIRTY";
-  if (isEarlyConflict) {
+  if (isEarlyConflictPrDetail(prDetail)) {
     console.log(`[pipeline] #${issueNumber}: PR #${prNumber} is conflicting; skipping CI poll`);
     return recoverFromMergeConflict(cfg, issueNumber, opts.stateDir, deps, prNumber, opts.runDir);
+  }
+
+  // Clean proceed into Step 1: record head-bound entry-gate memo only for a head
+  // the stack validated this tick (or an existing memo hit). Non-null gate
+  // returns above never reach here; unproven post-stack head changes leave the
+  // memo unset (#816 review 2).
+  if (pollingCtx && entryGateProceedSha) {
+    pollingCtx.entryGatesPassedForSha = entryGateProceedSha;
   }
 
   // ---- Step 1: CI ----

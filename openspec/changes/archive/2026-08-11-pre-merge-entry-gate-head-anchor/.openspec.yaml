@@ -1,0 +1,6 @@
+schema: spec-driven
+created: 2026-08-11
+goal: Memoize entry-gate proceed verdicts on PreMergePollingContext keyed by PR
+  head SHA so advancePolling re-ticks only pay for CI check polling (and related
+  load-bearing reads), while any head movement invalidates and re-runs the full
+  stack.
