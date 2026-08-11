@@ -4,17 +4,17 @@ When a change touches `.github/workflows/**`, ship/advance often sets a false `p
 
 ## What Changes
 
-- Add a config key (e.g. `git.push_auth`) to `.github/pipeline.yml` that selects the push authentication mechanism:
-  - **`ssh`** (default) — use the worktree’s existing SSH `origin` / `pushurl` (deploy key or SSH agent). No GitHub `workflow` scope required.
-  - **`https-token:<env>`** — push over HTTPS using the token from a named env var / secret reference (never a literal secret). Operators who expect workflow-file updates supply a fine-grained PAT or App token **with `workflow` scope**.
-  - **`app`** — reserved for a future GitHub App installation-token path; schema may accept or reject it per design (no full implementation required in this change if deferred).
-- Resolve the mechanism at invocation time from env-var **names** / secret references only, matching the existing `credential` env-var pattern in config.
-- Apply the resolved mechanism to **every** git push the pipeline performs from a managed worktree (engine stage pushes and model-harness guidance / environment), so SSH and HTTPS no longer diverge ad hoc.
-- Prefer SSH origin by default; only use HTTPS-token when the operator explicitly configures it. Stop treating ambient `gh auth git-credential` HTTPS fallback as the authoritative push path for pipeline worktrees.
-- When HTTPS-token is configured with a token lacking `workflow` scope and the change touches `.github/workflows/**`, fail fast with a clear, operator-actionable message (a real push/auth error), not a silent or misleading false block after a successful branch delivery.
-- Admit the config in schema validation and `pipeline doctor`.
-- Document each mechanism, when to use which, and the required scope for workflow-file changes.
-- Unit tests: config round-trip + transport selection for `ssh` and `https-token`.
+- Add `git.push_auth` under a strict optional `git` block in `.github/pipeline.yml`:
+  - **`ssh`** (default) — use the worktree’s existing SSH `origin` / **`pushurl` first** (deploy key or SSH agent). No GitHub `workflow` scope required.
+  - **`https-token:<env>`** — push over HTTPS using the token from a named env var (never a literal secret). Operators who expect workflow-file updates supply a PAT/App token **with `workflow` scope**.
+  - **`app`** — **rejected at schema/resolve time** in this change (reserved future; not a no-op accept).
+- Resolve the mechanism from env-var **names** only, matching the existing executor `credential` env-var pattern in `config.ts`.
+- Route **every** authoritative pipeline-owned push through one centralized helper (`runConfiguredGitPush`), including implement/fix/eval/visual, pre-merge archive/autofix/rebase, loop repair, intake/sweep/backfill/roadmap/merge-queue delivery — no stage keeps an ambient-credential bypass.
+- HTTPS-token auth is injected without token-bearing durable remote URLs, argv secrets, or logged secret values; ambient `gh auth git-credential` must not win over the configured token for that push.
+- Prepare worktree/harness env so harness-initiated `git push` inherits the same transport; a non-authoritative harness HTTPS workflow-scope rejection must not set `push-failed` after successful engine delivery.
+- Fail fast when HTTPS env is missing (before Git) or when GitHub refuses missing `workflow` scope (clear message naming mechanism + env-var name).
+- Admit the config in schema validation and `pipeline doctor` (HTTPS missing env = doctor fail).
+- Docs + unit tests: config round-trip, pure transport selection, **and** execution-seam assertions (git env/argv/helper setup, mapped workflow-scope errors).
 
 ## Capabilities
 
@@ -29,24 +29,27 @@ When a change touches `.github/workflows/**`, ship/advance often sets a false `p
 
 ## Acceptance criteria
 
-- [ ] Config admits `git.push_auth` (or equivalent) with default `ssh`, schema-validated; invalid values fail `resolveConfig()` with a parse error that names the field.
-- [ ] `pipeline doctor` admits the key and reports the resolved mechanism; when `https-token:<env>` is selected and the named env var is unset, doctor fails (or warns per design) with a message that names the missing env var (never the secret value).
-- [ ] With default `ssh`, a worktree push that modifies `.github/workflows/**` succeeds over SSH origin without requiring a PAT `workflow` scope, and the implementing stage does **not** set a false `pipeline:blocked` / `push-failed` solely because an HTTPS/`gh` credential path lacked that scope.
-- [ ] When `https-token:<env>` is configured, engine (and harness-guided) pushes from managed worktrees use HTTPS with the token from that env var only — not ambient `gh auth git-credential` as the selected transport.
-- [ ] When `https-token:<env>` is configured with a token lacking `workflow` scope and the change touches `.github/workflows/**`, the failure is fail-fast with a clear message that names the missing `workflow` scope (or equivalent GitHub rejection text) as a real push/auth error — not a silent false block after the branch already delivered.
-- [ ] Config never stores a literal secret; only env-var names / secret references are accepted for the HTTPS-token path (same pattern as existing `credential` fields).
-- [ ] Unit tests cover: config round-trip for `ssh` and `https-token:<env>`; transport selection returns SSH vs HTTPS-token accordingly; invalid mechanism values are rejected.
-- [ ] Docs include a short section describing each mechanism, when to use which, and the required scope for workflow-file changes.
-- [ ] `npm run ci` passes from the repo root (including mirror check when `core/` is edited at implementation time).
+- [ ] `resolveConfig()` admits `git.push_auth: ssh` and `https-token:<ENV>` (ENV env-name grammar only); absent `git` defaults to structured `{ mechanism: "ssh" }`.
+- [ ] `resolveConfig()` rejects `app`, empty/malformed `https-token:` forms, raw-token-looking values, and unknown keys under `git`, with errors that identify `git.push_auth` (or the unknown key).
+- [ ] Resolved config never stores a secret token value — only mechanism + optional env-var **name**.
+- [ ] `pipeline doctor` reports the resolved mechanism; SSH check passes; HTTPS-token with unset/empty env **fails** naming the env var and never printing its value; HTTPS-token with set env passes presence readiness.
+- [ ] Every authoritative pipeline-owned delivery push listed in `design.md` routes through the centralized push helper (no bypass ambient path for those sites).
+- [ ] With default `ssh`, authoritative push uses SSH `origin`/`pushurl` without requiring a PAT `workflow` scope; implementing (or equivalent) does **not** set `pipeline:blocked` / `push-failed` solely because a non-authoritative HTTPS/`gh` path lacked that scope after engine delivery succeeded.
+- [ ] When `https-token:<env>` is configured, authoritative pushes authenticate with that env var only — not ambient `gh auth git-credential` — and do not leave a durable token-bearing remote URL.
+- [ ] Missing/empty HTTPS env fails before Git with a message that names the env var.
+- [ ] HTTPS-token + missing `workflow` scope on a workflow-file push fails fast as a real `push-failed` (or equivalent push failure) naming mechanism, env-var name, and `workflow` scope — never the token.
+- [ ] Unit tests cover config round-trip, pure transport selection, invalid rejections, execution-seam git env/invocation, workflow-scope mapping, doctor cases, and harness false-block regression.
+- [ ] Docs describe `ssh`, `https-token:<env>`, when to use which, `workflow` scope for workflow files, env-name-only secrets, and that `app` is not implemented.
+- [ ] `npm run ci` passes from the repo root (including `plugin/` mirror check when `core/` is edited).
 
 ## Impact
 
-- `core/scripts/config.ts` / `types.ts` — schema, defaults, resolved `PipelineConfig` field(s).
-- Engine push call sites that run `git push` from managed worktrees (e.g. implementing via `pushWithCurrencyCheck`, fix, eval/visual fix rounds, and other stage pushes that share the same transport expectations) — resolve and apply the configured mechanism.
-- Harness stage prompts / environment so model subprocesses do not silently fall back to HTTPS via `gh auth git-credential` against operator intent.
-- `pipeline doctor` preflight checks.
-- Config scaffold comments, README / generated config reference (when present).
-- Unit tests co-located under `core/test/`.
-- `plugin/` mirror regeneration only when implementation edits `core/`.
+- `core/scripts/config.ts` / `types.ts` — schema, defaults, structured push-auth on `PipelineConfig`.
+- New central helper module (e.g. `core/scripts/git-push-auth.ts`) + wiring at every delivery push site in `design.md`.
+- Harness env preparation (`InvokeOptions.env` / worktree prep) for implement/fix and related stages; classification guard against false `push-failed`.
+- `pipeline doctor` preflight check.
+- Config scaffold comments, README / config reference.
+- Unit tests under `core/test/`.
+- `plugin/` mirror regeneration when `core/` is edited.
 - No change to merge authority, review policy, or the never-auto-merge floor.
-- Full GitHub App installation-token path (`app`) may be schema-reserved and documented as future without shipping a complete App flow in this change.
+- Full GitHub App installation-token path remains future work; `app` is schema-rejected now.

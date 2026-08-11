@@ -20,6 +20,11 @@ import { spawnSync } from "node:child_process";
 import { invoke } from "../harness.ts";
 import { buildBackfillPrompt } from "../prompts/index.ts";
 import { isInitialized, listChangeDirs, readSpecDeltas, validate } from "../openspec.ts";
+import type { GitPushAuth, PipelineConfig } from "../types.ts";
+import {
+  DEFAULT_GIT_PUSH_AUTH,
+  runConfiguredGitPushSync,
+} from "../git-push-auth.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -98,7 +103,9 @@ export function realBackfillDeps(
   repoDir: string,
   model = "claude-sonnet-4-5",
   implementerHarness: string = "claude",
+  pushAuth: GitPushAuth = DEFAULT_GIT_PUSH_AUTH,
 ): BackfillDeps {
+  const auth = pushAuth;
   return {
     runHarness: async (prompt, timeoutSec) => {
       const result = await invoke(implementerHarness, repoDir, prompt, {
@@ -236,10 +243,14 @@ export function realBackfillDeps(
     },
 
     gitPushBranch: (dir, branch) => {
-      const result = spawnSync("git", ["push", "-u", "origin", branch], { encoding: "utf8", stdio: "pipe", cwd: dir });
-      if (result.status !== 0) {
+      const result = runConfiguredGitPushSync({
+        cwd: dir,
+        auth,
+        args: ["push", "-u", "origin", branch],
+      });
+      if (result.code !== 0) {
         throw new Error(
-          `[pipeline backfill] git push origin ${branch} failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+          `[pipeline backfill] git push origin ${branch} failed (exit ${result.code}): ${(result.errorMessage ?? result.stderr)?.trim() ?? ""}`,
         );
       }
     },
@@ -602,10 +613,24 @@ function buildSpecMd(slice: ClassifiedCandidate[]): string {
 
 export async function runBackfill(
   opts: BackfillOpts,
-  cfg: { repo_dir: string; repo: string; base_branch: string },
+  cfg: {
+    repo_dir: string;
+    repo: string;
+    base_branch: string;
+    git?: PipelineConfig["git"];
+    models?: PipelineConfig["models"];
+    harnesses?: PipelineConfig["harnesses"];
+  },
   deps?: BackfillDeps,
 ): Promise<void> {
-  const d = deps ?? realBackfillDeps(cfg.repo_dir);
+  const d =
+    deps ??
+    realBackfillDeps(
+      cfg.repo_dir,
+      cfg.models?.implementing ?? "claude-sonnet-4-5",
+      cfg.harnesses?.implementer ?? "claude",
+      cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH,
+    );
   const repoDir = cfg.repo_dir;
 
   d.log("[pipeline backfill] starting...");

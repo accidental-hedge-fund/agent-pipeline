@@ -27,6 +27,7 @@ import { branchName, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import type { InvokeFn } from "../openspec-consistency.ts";
 import type { PipelineConfig, ReviewFinding } from "../types.ts";
+import { DEFAULT_GIT_PUSH_AUTH, runConfiguredGitPush } from "../git-push-auth.ts";
 import {
   declaredScopeFromFindingPaths,
   runCoveredCandidateMutation,
@@ -741,9 +742,21 @@ export async function performPreMergeAutoFix(
         return { status: "error" };
       }
 
-      // Push the fix commit to the PR head.
+      // Push the fix commit to the PR head (configured push-auth, #980).
       const branch = branchName(issueNumber, wt.slug);
-      const pushRes = await gitFn(wt.path, ["push", "origin", branch], { ignoreFailure: true });
+      const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
+      const pushRes = await runConfiguredGitPush({
+        cwd: wt.path,
+        auth: pushAuth,
+        args: ["push", "origin", branch],
+        deps: {
+          gitConfigGet: async (cwd, key) => {
+            const r = await gitFn(cwd, ["config", "--get", key], { ignoreFailure: true });
+            return r.code === 0 ? r.stdout.trim() || null : null;
+          },
+          gitExec: async ({ args }) => gitFn(wt.path, args, { ignoreFailure: true }),
+        },
+      });
       if (pushRes.code !== 0) {
         // Rollback: push failed, remove the local commit so the next attempt is clean.
         await gitFn(wt.path, ["reset", "--hard", headBefore], { ignoreFailure: true });

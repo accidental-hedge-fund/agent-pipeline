@@ -38,6 +38,11 @@ import {
 } from "../gh.ts";
 import { invoke as defaultInvoke, runCapped, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { buildEvalFixPrompt } from "../prompts/index.ts";
+import {
+  DEFAULT_GIT_PUSH_AUTH,
+  runConfiguredGitPush,
+  type GitPushAuth,
+} from "../git-push-auth.ts";
 import { extractReviewedSha } from "./review-parsing.ts";
 import {
   verifyHarnessCommits,
@@ -486,7 +491,8 @@ export async function advanceEval(
   const invokeFn = deps.invoke ?? defaultInvoke;
   const gitHeadFn = deps.gitHead ?? defaultGitHead;
   const gitDirtyFn = deps.gitDirty ?? defaultGitDirty;
-  const gitPushFn = deps.gitPush ?? defaultGitPush;
+  const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
+  const gitPushFn = deps.gitPush ?? ((cwd: string, branch: string) => defaultGitPush(cwd, branch, pushAuth));
   const gitCommitMessagesFn = deps.gitCommitMessages ?? defaultGitCommitMessages;
   const salvageFn = deps.salvage ?? trySalvageUncommittedWork;
   const verifyEvalFixFn =
@@ -902,9 +908,24 @@ async function defaultGitDirty(cwd: string): Promise<boolean> {
   return res.stdout.trim().length > 0;
 }
 
-async function defaultGitPush(cwd: string, branch: string): Promise<{ code: number; stderr: string }> {
-  const res = await gitInWorktree(cwd, ["push", "origin", branch], { ignoreFailure: true });
-  return { code: res.code, stderr: res.stderr };
+async function defaultGitPush(
+  cwd: string,
+  branch: string,
+  auth: GitPushAuth = DEFAULT_GIT_PUSH_AUTH,
+): Promise<{ code: number; stderr: string }> {
+  const res = await runConfiguredGitPush({
+    cwd,
+    auth,
+    args: ["push", "origin", branch],
+    deps: {
+      gitConfigGet: async (c, key) => {
+        const r = await gitInWorktree(c, ["config", "--get", key], { ignoreFailure: true });
+        return r.code === 0 ? r.stdout.trim() || null : null;
+      },
+      gitExec: async ({ args }) => gitInWorktree(cwd, args, { ignoreFailure: true }),
+    },
+  });
+  return { code: res.code, stderr: res.errorMessage ?? res.stderr };
 }
 
 /** Return the full commit messages for commits reachable from HEAD but not from

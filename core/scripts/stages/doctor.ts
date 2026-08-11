@@ -590,6 +590,36 @@ export function buildPreflightChecks(
     });
   }
 
+  // 5b. Git push-auth configuration admission (#980). Reports the resolved
+  //     mechanism; HTTPS-token fails when the named env var is unset/empty.
+  //     Never prints secret values. No network push.
+  checks.push({
+    id: "git-push-auth",
+    description: "Git push authentication mechanism is configured and resolvable",
+    run: async () => {
+      const auth = config.git?.push_auth ?? { mechanism: "ssh" as const };
+      if (auth.mechanism === "ssh") {
+        return pass(
+          "git.push_auth=ssh (worktree origin/pushurl; no GitHub workflow scope required)",
+        );
+      }
+      const envName = auth.tokenEnv;
+      const raw = process.env[envName];
+      if (raw === undefined || raw.trim() === "") {
+        return fail(
+          `git.push_auth=https-token:${envName} but environment variable ${envName} is unset or empty`,
+          `Export a non-empty token in ${envName} (env-var name only in config — never put the secret in pipeline.yml). ` +
+            `If you push changes under .github/workflows/**, the token must include the GitHub \`workflow\` scope. ` +
+            `Or set git.push_auth: ssh to use deploy-key / SSH-agent push instead.`,
+        );
+      }
+      // Presence readiness only — do not print or log the value.
+      return pass(
+        `git.push_auth=https-token:${envName} (env present; grant workflow scope when pushing .github/workflows/**)`,
+      );
+    },
+  });
+
   // 6. Install version coherence — the VERSION constant loaded by pipeline.ts at startup
   //    must match the version field in core/package.json at the install root. A mismatch
   //    means the running binary is from a different (usually older) install than the code

@@ -12,6 +12,10 @@ import { resolveReviewerModelForHarness, reviewerModelSourceWasAuto } from "../s
 import { getOpenIssues, createMilestone, getMilestones } from "../gh.ts";
 import type { RoadmapDeps } from "../roadmap/index.ts";
 import type { PipelineConfig } from "../types.ts";
+import {
+  DEFAULT_GIT_PUSH_AUTH,
+  runConfiguredGitPushSync,
+} from "../git-push-auth.ts";
 
 /**
  * Explicit refspec so `refs/remotes/origin/<branch>` itself is updated.
@@ -290,12 +294,16 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
     gitPushBranch: async (repoDir, branch) => {
       // Detached throwaway HEAD → day-branch (FF only). Never attach the worktree
       // to the shared day-branch ref (#632 review-2 62b576be).
-      const r = spawnSync(
-        "git",
-        ["push", "origin", roadmapDayBranchPushRefspec(branch)],
-        { cwd: repoDir, encoding: "utf8" },
-      );
-      if (r.status !== 0) throw new Error(`git push failed: ${r.stderr}`);
+      // Configured push-auth (#980) owns the transport.
+      const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
+      const r = runConfiguredGitPushSync({
+        cwd: repoDir,
+        auth: pushAuth,
+        args: ["push", "origin", roadmapDayBranchPushRefspec(branch)],
+      });
+      if (r.code !== 0) {
+        throw new Error(`git push failed: ${r.errorMessage ?? r.stderr}`);
+      }
     },
 
     findPrByHead: async (repo, head) => {

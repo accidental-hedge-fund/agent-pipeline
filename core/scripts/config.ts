@@ -15,12 +15,14 @@ import {
   MODEL_ENDPOINT_ROUTING_PARAM_KEYS,
   MODEL_ENDPOINT_RESERVED_HEADERS,
   DESIGN_GATE_TRIGGER_CLASSES,
+  type GitPushAuth,
   type Harness,
   type HarnessRoleSource,
   type PipelineConfig,
   type ModelEndpointDialect,
   type ModelEndpointParams,
 } from "./types.ts";
+import { parseGitPushAuth, GitPushAuthConfigError } from "./git-push-auth.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
 import { expandAutoEffort, expandAutoModel, isClaudeOnlyModelAlias } from "./stage-routing.ts";
 import {
@@ -880,9 +882,44 @@ const PartialConfigSchema = z.object({
     .partialRecord(z.enum(MODEL_INVOKING_STAGES), z.string())
     .optional()
     .describe("Assigns a named executor (from executors:) to a model-invoking stage, delegating that stage's execution to it instead of the local harness."),
+  // Git push authentication mechanism (#980). Strict optional block; absent
+  // defaults to SSH. Values are env-var names / mechanism ids only — never
+  // literal secrets. Reserved `app` is rejected at resolve time (not implemented).
+  git: z
+    .object({
+      push_auth: z
+        .string()
+        .optional()
+        .describe(
+          'Git push authentication: "ssh" (default; worktree origin/pushurl, deploy key or SSH agent — no GitHub workflow scope) or "https-token:<ENV_NAME>" (HTTPS with the token from the named env var; grant workflow scope when pushing .github/workflows/**). Env-var NAME only — never a literal secret. "app" is reserved and not implemented.',
+        ),
+    })
+    .strict()
+    .optional()
+    .describe(
+      "Git push authentication for every authoritative pipeline-owned delivery push (#980). Default when absent: ssh.",
+    ),
 }).strict();
 
 type PartialConfig = z.infer<typeof PartialConfigSchema>;
+
+/**
+ * Resolve `git.push_auth` string (or absent) into structured {@link GitPushAuth}.
+ * Throws a parse error identifying `git.push_auth` on invalid forms.
+ */
+export function resolveGitPushAuth(raw: string | undefined): GitPushAuth {
+  if (raw === undefined || raw === null || raw === "") {
+    return { mechanism: "ssh" };
+  }
+  try {
+    return parseGitPushAuth(raw);
+  } catch (err) {
+    if (err instanceof GitPushAuthConfigError) {
+      throw new Error(`Invalid .github/pipeline.yml: ${err.message}`);
+    }
+    throw err;
+  }
+}
 
 const EXECUTION_ENVIRONMENT_STAGE_SET = new Set<string>(EXECUTION_ENVIRONMENT_STAGES);
 
@@ -1535,6 +1572,9 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     product_fault: fileConfig.product_fault,
     executors: fileConfig.executors ?? DEFAULT_CONFIG.executors,
     stage_executors: fileConfig.stage_executors ?? DEFAULT_CONFIG.stage_executors,
+    git: {
+      push_auth: resolveGitPushAuth(fileConfig.git?.push_auth),
+    },
   };
   if (!opts.quiet) {
     warnInertModelAliases(fileConfig.models, merged.harnesses);
@@ -2808,6 +2848,23 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         "#   intake_endpoint: \"https://intake.example.com/product-fault\" # maintainer-controlled intake service URL; absent -> pipeline report prepares a manual GitHub issue draft instead of submitting",
         "#   intake_auth_env: \"PRODUCT_FAULT_INTAKE_TOKEN\" # name of an env var holding a submission-scoped credential — never a GitHub token, never stored here",
       ].join("\n"),
+    "",
+    config.git !== undefined
+      ? [
+        "git: # git push authentication for every authoritative pipeline-owned delivery push (#980). SECURITY: push_auth holds an env-var NAME only for https-token — never a literal secret",
+        `  push_auth: ${yamlScalar(
+          config.git.push_auth === undefined
+            ? "ssh"
+            : typeof config.git.push_auth === "string"
+              ? config.git.push_auth
+              : "ssh",
+        )} # ${sd("git.push_auth", 'ssh (default) or https-token:<ENV_NAME>; app is reserved and not implemented')}`,
+      ].join("\n")
+      : [
+        "# git: # git push authentication for every authoritative pipeline-owned delivery push (#980). Default when absent: ssh (worktree origin/pushurl).",
+        `#   push_auth: ssh # ${sd("git.push_auth", 'ssh (default; deploy key / SSH agent — no GitHub workflow scope) or https-token:<ENV_NAME> (HTTPS token from named env var; grant workflow scope when pushing .github/workflows/**). Env-var NAME only — never a literal secret. "app" is reserved and not implemented.')}`,
+        "#   # push_auth: https-token:GITHUB_PUSH_TOKEN  # example: HTTPS with token from GITHUB_PUSH_TOKEN",
+      ].join("\n"),
     config.roadmap !== undefined
       ? `\nroadmap: # backlog roadmap engine overrides (#171)\n${yamlBlock(config.roadmap, 2)}`
       : [
@@ -3009,6 +3066,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     product_fault: config.product_fault,
     executors: config.executors,
     stage_executors: config.stage_executors,
+    git: config.git,
   };
 }
 

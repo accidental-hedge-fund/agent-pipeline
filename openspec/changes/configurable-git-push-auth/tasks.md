@@ -1,38 +1,54 @@
 ## 1. Config schema and resolved types
 
-- [ ] 1.1 Add a strict optional `git` block to `PartialConfigSchema` with `push_auth` string (`ssh` | `https-token:<ENV_NAME>`); reject unknown keys, reserved `app`, empty/invalid env names, and secret-like forms
-- [ ] 1.2 Extend `PipelineConfig` / `DEFAULT_CONFIG` with structured push-auth (default `{ mechanism: "ssh" }`) and resolve it in `resolveConfig()`
-- [ ] 1.3 Add config scaffold comments (and generated config reference touchpoints if present) documenting `git.push_auth`
-- [ ] 1.4 Unit tests: round-trip for `ssh` and `https-token:ENV`; absent default; invalid forms fail with field identity
+- [x] 1.1 Add strict optional `git` block to `PartialConfigSchema` with `push_auth` string; admit only `ssh` and `https-token:<ENV>` (`ENV` = `^[A-Za-z_][A-Za-z0-9_]*$`)
+- [x] 1.2 Reject: unknown keys under `git`, reserved `app`, empty/malformed env names, raw-token-looking values, unknown prefixes/suffixes — errors identify `git.push_auth` / offending field
+- [x] 1.3 Extend `PipelineConfig` / `DEFAULT_CONFIG` with structured push-auth default `{ mechanism: "ssh" }` and resolve in `resolveConfig()`
+- [x] 1.4 Scaffold comments + config-template / generated reference touchpoints for `git.push_auth`
+- [x] 1.5 Unit tests: absent → SSH; explicit SSH; valid HTTPS env; `app` reject; empty/malformed env; literal-like values; unknown `git` keys; round-trip equality of structured form
 
-## 2. Transport selection and push apply seam
+## 2. Central transport selection + push apply seam
 
-- [ ] 2.1 Implement pure transport selection from structured push-auth (`ssh` → SSH; `https-token` → HTTPS bound to env name)
-- [ ] 2.2 Implement worktree push apply helper: SSH uses existing origin without injecting a PAT; HTTPS-token uses short-lived credential path from env (no durable token-in-remote-URL)
-- [ ] 2.3 On GitHub workflow-scope HTTPS refusal, augment the push failure reason with mechanism, env-var **name**, and missing `workflow` scope guidance
-- [ ] 2.4 Unit tests: transport selection; missing HTTPS env fails clearly; workflow-scope stderr produces augmented message (no secret leakage)
+- [x] 2.1 Pure `selectPushTransport` (ssh / https-token bound to env name)
+- [x] 2.2 `runConfiguredGitPush`: single authoritative push executor
+  - SSH: honor `remote.origin.pushurl` if set, else `origin` URL; no PAT injection
+  - HTTPS-token: fail before Git if env unset/empty; short-lived env/askpass auth; no durable token-in-remote-URL; ambient `gh auth git-credential` must not win
+- [x] 2.3 `formatPushAuthFailure`: workflow-scope refusal → push failure message naming mechanism, env-var **name** (for https-token), missing `workflow` scope; never token value
+- [x] 2.4 Unit tests at **execution seam** (injectable git/env): SSH invocation shape; HTTPS env/helper setup; missing env fails pre-Git; workflow-scope stderr mapping; secret never in argv/recorded errors/durable remote URL
 
-## 3. Wire managed-worktree push call sites
+## 3. Wire every authoritative push call site
 
-- [ ] 3.1 Inventory authoritative managed-worktree push paths (implementing `pushWithCurrencyCheck`, fix-round push, eval/visual fix push, shared helpers)
-- [ ] 3.2 Route those paths through the configured push-auth seam so default SSH is consistent and HTTPS-token is opt-in only
-- [ ] 3.3 Ensure ambient `gh auth git-credential` is not the selected transport when mechanism is `ssh`
-- [ ] 3.4 Regression: with mechanism `ssh`, a successful SSH delivery is not classified as `push-failed` solely due to a non-authoritative HTTPS workflow-scope rejection
+- [x] 3.1 Route through `runConfiguredGitPush` (directly or via `pushWithCurrencyCheck` git callback):
+  - `stages/planning.ts` (implement / resume push)
+  - `stages/fix.ts`
+  - `stages/eval.ts` `defaultGitPush`
+  - `stages/visual.ts` `defaultGitPush`
+  - `stages/pre-merge-openspec-archive.ts`
+  - `stages/pre-merge-autofix.ts`
+  - `stages/pre-merge-conflict-rebase.ts`
+  - `loop/repair-pipeline-item.ts`
+  - `stages/intake.ts` (reserve + publish)
+  - `stages/sweep.ts` (reserve + publish)
+  - `stages/backfill.ts`
+  - `stages/roadmap-deps.ts`
+  - `stages/merge-queue.ts` (repair push)
+- [x] 3.2 Grep gate: no remaining production managed-delivery `git push` that bypasses the seam
+- [x] 3.3 Regression: mechanism `ssh` + successful authoritative push is **not** `push-failed` solely due to non-authoritative HTTPS workflow-scope rejection
 
-## 4. Harness environment and guidance
+## 4. Harness environment (enforceable) + guidance
 
-- [ ] 4.1 Prepare implement/fix (and other push-capable) harness worktree env so git push prefers the configured mechanism
-- [ ] 4.2 Update stage prompts (as needed) so harnesses do not reconfigure origin to ambient HTTPS/`gh` credentials against operator intent
-- [ ] 4.3 Unit or prompt-loader drift test covering the guidance/env contract where the repo already tests prompts
+- [x] 4.1 `prepareWorktreePushAuthEnv` for implement/fix (and other push-capable harness stages); pass aligned `InvokeOptions.env` into harness spawn
+- [x] 4.2 Prompt touch-ups only as secondary reinforcement (do not reconfigure origin to ambient HTTPS/`gh` as selected mechanism)
+- [x] 4.3 Classification guard: harness-only workflow-scope HTTPS failure does not mark `push-failed` after successful engine delivery
+- [x] 4.4 Tests: harness-stage path separate from engine delivery (env prep + false-block regression)
 
 ## 5. Doctor preflight
 
-- [ ] 5.1 Add doctor check: report resolved mechanism; for `https-token`, fail when env unset/empty; never print secret values
-- [ ] 5.2 Unit tests with injectable doctor deps for `ssh` pass, `https-token` missing env fail, `https-token` present pass
+- [x] 5.1 Check reports mechanism; SSH pass; HTTPS-token missing env fail (name only); HTTPS-token present pass
+- [x] 5.2 Unit tests via `DoctorDeps` injectable seam — no network push; assert output never contains secret values
 
 ## 6. Docs, mirror, and CI
 
-- [ ] 6.1 Document mechanisms, when to use which, workflow-scope requirement for HTTPS, and env-var-name-only security rule
-- [ ] 6.2 Run `node scripts/build.mjs` if `core/` changed; commit regenerated `plugin/` in the same change
-- [ ] 6.3 Run `npm run ci` from the repo root and fix failures until green
-- [ ] 6.4 Run `openspec validate configurable-git-push-auth` (and `openspec validate --all` as part of CI) and keep the change structurally valid
+- [x] 6.1 Document `ssh`, `https-token:<env>`, when to use which, `workflow` scope for workflow files, env-name-only rule, `app` not implemented
+- [x] 6.2 `node scripts/build.mjs` after `core/` edits; commit regenerated `plugin/` in same change
+- [x] 6.3 `npm run ci` from repo root until green
+- [x] 6.4 `openspec validate configurable-git-push-auth` (and `--all` via CI)

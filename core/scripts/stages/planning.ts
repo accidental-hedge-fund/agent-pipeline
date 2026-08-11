@@ -61,6 +61,12 @@ import {
   slugify,
 } from "../worktree.ts";
 import { pushWithCurrencyCheck } from "../transient-wrappers.ts";
+import {
+  DEFAULT_GIT_PUSH_AUTH,
+  formatPushAuthFailure,
+  prepareWorktreePushAuthEnv,
+  runConfiguredGitPush,
+} from "../git-push-auth.ts";
 import { detectAndInstall, type SetupResult } from "../worktree-setup.ts";
 import {
   buildImplementingPrompt,
@@ -1930,6 +1936,9 @@ export async function resumeFromImplementing(
   }
 
   // ---- Push (#760: transient-retryable with currency re-sync; no force-push) ----
+  // Authoritative delivery uses configured git.push_auth (#980) so ambient
+  // HTTPS/gh PAT paths cannot false-block workflow-file pushes under SSH.
+  const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
   const localHead = (await gitOp(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
   const pushResult = await pushWithCurrencyCheck(branch, {
     // Planning push shares the transient-retryable push class. Site id gates
@@ -1938,20 +1947,40 @@ export async function resumeFromImplementing(
     expectedLocalSha: localHead || null,
     git: async (args) => {
       if (args[0] === "push") {
-        return gitOp(wt.path, ["push", "-u", "origin", branch], { ignoreFailure: true });
+        // Route through the same injectable gitOp seam tests use, with
+        // configured push-auth transport selection (#980).
+        const res = await runConfiguredGitPush({
+          cwd: wt.path,
+          auth: pushAuth,
+          args: ["push", "-u", "origin", branch],
+          deps: {
+            gitConfigGet: async (cwd, key) => {
+              const r = await gitOp(cwd, ["config", "--get", key], { ignoreFailure: true });
+              return r.code === 0 ? r.stdout.trim() || null : null;
+            },
+            gitExec: async ({ args: gitArgs }) =>
+              gitOp(wt.path, gitArgs, { ignoreFailure: true }),
+          },
+        });
+        return {
+          code: res.code,
+          stdout: res.stdout,
+          stderr: res.errorMessage ?? res.stderr,
+        };
       }
       return gitOp(wt.path, args, { ignoreFailure: true });
     },
   });
   if (!pushResult.ok) {
+    const pushMsg = formatPushAuthFailure(pushAuth, pushResult.reason);
     await blocker(
       cfg,
       issueNumber,
-      `Git push failed: ${pushResult.reason}`,
+      pushMsg,
       "implementing",
       "push-failed",
     );
-    return blockedOutcome(`push failed: ${pushResult.reason}`, "push-failed");
+    return blockedOutcome(pushMsg, "push-failed");
   }
 
   // ---- Create or find PR (exact-branch check first to avoid duplicates on resume) ----
@@ -2230,6 +2259,14 @@ export async function invokeImplementer(
   }
   const inv = deps.invoke ?? invoke;
   const model = opts.model ?? cfg.models.implementing;
+  const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
+  const baseEnv = papercutIdentityEnv(cfg, {
+    runId: opts.runDir ? path.basename(opts.runDir) : null,
+    issue: accounting?.issue ?? null,
+    stage: accounting?.stage ?? "implementing",
+    harness,
+    model,
+  });
   return inv(harness, wtPath, prompt, {
     timeoutSec: cfg.implementation_timeout,
     model,
@@ -2238,13 +2275,8 @@ export async function invokeImplementer(
     accounting: accounting
       ? accountingForInvoke(opts, accounting.issue, accounting.stage, "implementing", model)
       : undefined,
-    env: papercutIdentityEnv(cfg, {
-      runId: opts.runDir ? path.basename(opts.runDir) : null,
-      issue: accounting?.issue ?? null,
-      stage: accounting?.stage ?? "implementing",
-      harness,
-      model,
-    }),
+    // Align harness-initiated git push with configured mechanism (#980).
+    env: prepareWorktreePushAuthEnv(pushAuth, baseEnv),
   });
 }
 

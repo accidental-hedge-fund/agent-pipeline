@@ -23,7 +23,7 @@ You are implementing a GitHub issue for {{domain_name}}, {{domain_description}}.
 
        Issue: #{{issue_number}}
        Pipeline-Run: {{pipeline_run_id}}
-7. Do NOT push — the pipeline handles pushing after review.
+7. Do NOT push — the pipeline handles pushing after review. If you do push, use the worktree's existing origin/pushurl as prepared by the pipeline; do not reconfigure origin to HTTPS via ambient `gh auth setup-git` / `gh auth git-credential` (classic PATs often lack the GitHub `workflow` scope and reject `.github/workflows/**` updates).
 {{docs_instruction}}{{papercut_instruction}}{{design_gate_instruction}}
 ## Single-Turn Invocation (required)
 This invocation is single-turn: there is no later turn in which deferred work can complete. Do NOT end your turn while committing still depends on a background task (e.g. a test suite launched in the background and not yet awaited) — wait synchronously for that work to finish, then commit, before ending the turn. A notification that arrives after your turn ends will never reach you. Per instruction 7 above, do NOT push — the pipeline handles pushing after review.

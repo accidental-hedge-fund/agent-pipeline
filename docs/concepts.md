@@ -47,6 +47,32 @@ Before opening a PR, the pipeline can run the repo's own tests/build (`test_gate
 
 The repo's own `test_gate.command` is typically `npm run ci`, which includes core tests, the `plugin/` mirror check, install-smoke, OpenSpec validation when present, **conditional docs freshness** (`ci:docs`), and scripts tests.
 
+## Git push authentication (`git.push_auth`)
+
+Every authoritative pipeline-owned delivery push (implement, fix, eval/visual
+fix, OpenSpec archive, intake/sweep publish, merge-queue repair, and related
+sites) uses one configured authentication mechanism:
+
+| Mechanism | Config | When to use | Workflow files (`.github/workflows/**`) |
+|-----------|--------|-------------|----------------------------------------|
+| **ssh** (default) | omit `git:` or `git.push_auth: ssh` | Deploy key or SSH agent already on the host | Preferred — SSH has no GitHub `workflow` scope requirement |
+| **https-token** | `git.push_auth: https-token:ENV_NAME` | Host must push over HTTPS | Token in `ENV_NAME` **must** include the GitHub `workflow` scope |
+| **app** | — | Future GitHub App tokens | **Not implemented** — schema rejects `app` |
+
+Rules:
+
+- Config stores the **env-var name** only for HTTPS-token mode — never a
+  literal secret in `.github/pipeline.yml`.
+- Default is SSH so existing deploy-key hosts need no config change.
+- `pipeline doctor` reports the resolved mechanism; HTTPS-token with an unset
+  or empty env var fails the `git-push-auth` check (message names the env var,
+  never the secret).
+- Ambient `gh auth git-credential` is not the selected transport for the
+  authoritative push path. Prefer not reconfiguring worktree remotes to
+  HTTPS via `gh auth setup-git` when using SSH.
+
+See [config.md](config.md) for the generated field description.
+
 ## Configurable steps (optional)
 
 The `steps` block turns thoroughness steps on or off per repo:

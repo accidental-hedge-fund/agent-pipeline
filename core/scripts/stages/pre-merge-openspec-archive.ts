@@ -37,6 +37,11 @@ import {
 } from "../openspec-consistency.ts";
 import { invoke } from "../harness.ts";
 import {
+  DEFAULT_GIT_PUSH_AUTH,
+  formatPushAuthFailure,
+  runConfiguredGitPush,
+} from "../git-push-auth.ts";
+import {
   OPENSPEC_ARCHIVE_PREFIX,
 } from "../pipeline-commits.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
@@ -689,9 +694,19 @@ export async function maybeArchiveOpenspec(
   // Plain push, deliberately never `--force`/`--force-with-lease` (#579): a
   // non-fast-forward rejection here means the remote moved again since the
   // sync guard above ran, and that is a block signal, not a cue to overwrite
-  // the reviewed head.
-  const push = await gitFn(wt.path, ["push", "origin", branch], {
-    ignoreFailure: true,
+  // the reviewed head. Configured push-auth (#980) owns the transport.
+  const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
+  const push = await runConfiguredGitPush({
+    cwd: wt.path,
+    auth: pushAuth,
+    args: ["push", "origin", branch],
+    deps: {
+      gitConfigGet: async (cwd, key) => {
+        const r = await gitFn(cwd, ["config", "--get", key], { ignoreFailure: true });
+        return r.code === 0 ? r.stdout.trim() || null : null;
+      },
+      gitExec: async ({ args }) => gitFn(wt.path, args, { ignoreFailure: true }),
+    },
   });
   if (stateDir) {
     await recordCommand(
@@ -702,15 +717,21 @@ export async function maybeArchiveOpenspec(
         `git push origin ${branch}`,
         push.code,
         0,
-        push.code !== 0 ? push.stderr.trim() : "OpenSpec archive pushed; CI will re-run",
+        push.code !== 0
+          ? (push.errorMessage ?? push.stderr.trim())
+          : "OpenSpec archive pushed; CI will re-run",
       ),
     ).catch(() => {});
   }
   if (push.code !== 0) {
+    const pushMsg = formatPushAuthFailure(
+      pushAuth,
+      push.errorMessage ?? (push.stderr.trim() || "push failed after archive"),
+    );
     await setBlockedFn(
       cfg,
       issueNumber,
-      `Git push failed after OpenSpec archive: ${push.stderr.trim()}`,
+      pushMsg,
       "pre-merge",
       "push-failed",
     );

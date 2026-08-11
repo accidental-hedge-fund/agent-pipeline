@@ -16,8 +16,12 @@ import * as fs from "node:fs";
 import * as crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { invoke } from "../harness.ts";
-import { DEFAULT_CONFIG } from "../types.ts";
+import { DEFAULT_CONFIG, type GitPushAuth, type PipelineConfig } from "../types.ts";
 import { buildSweepPrompt } from "../prompts/index.ts";
+import {
+  DEFAULT_GIT_PUSH_AUTH,
+  runConfiguredGitPushSync,
+} from "../git-push-auth.ts";
 import {
   insertReleasePlanRow,
   insertPerIssueRow,
@@ -105,7 +109,9 @@ export function realSweepDeps(
   model: string = DEFAULT_CONFIG.models.sweep,
   reasoningEffort?: string,
   implementerHarness: string = "claude",
+  pushAuth: GitPushAuth = DEFAULT_GIT_PUSH_AUTH,
 ): SweepDeps {
+  const auth = pushAuth;
   return {
     listIssues: async (repo) => {
       // Paginate via gh api to fetch all open issues regardless of count.
@@ -219,15 +225,15 @@ export function realSweepDeps(
       }
     },
     reserveRemoteBranch: (dir, branch, sha) => {
-      const result = spawnSync("git", reservePushArgs(branch, sha), {
-        encoding: "utf8",
-        stdio: "pipe",
+      const result = runConfiguredGitPushSync({
         cwd: dir,
+        auth,
+        args: reservePushArgs(branch, sha),
       });
       const out = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
       const statusLine = out.split("\n").find((l) => l.includes(`:refs/heads/${branch}`)) ?? "";
       const flag = statusLine.charAt(0);
-      if (result.status === 0 && flag === "*") return; // newly created — reserved
+      if (result.code === 0 && flag === "*") return; // newly created — reserved
       if (flag === "!" || flag === "=" || /stale info/i.test(out)) {
         throw new Error(
           `[pipeline sweep] branch ${branch} already exists on origin — aborting before any issue writes.\n` +
@@ -235,19 +241,19 @@ export function realSweepDeps(
         );
       }
       throw new Error(
-        `[pipeline sweep] could not reserve origin/${branch} via git push (exit ${result.status}): ${(result.stderr || result.stdout || "").trim()}\n` +
+        `[pipeline sweep] could not reserve origin/${branch} via git push (exit ${result.code}): ${(result.errorMessage || result.stderr || result.stdout || "").trim()}\n` +
           `  The branch may already exist, or push credentials are missing or read-only.`,
       );
     },
     gitPushBranch: (dir, branch) => {
-      const result = spawnSync("git", ["push", "-u", "origin", branch], {
-        encoding: "utf8",
-        stdio: "pipe",
+      const result = runConfiguredGitPushSync({
         cwd: dir,
+        auth,
+        args: ["push", "-u", "origin", branch],
       });
-      if (result.status !== 0) {
+      if (result.code !== 0) {
         throw new Error(
-          `[pipeline sweep] git push origin ${branch} failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+          `[pipeline sweep] git push origin ${branch} failed (exit ${result.code}): ${(result.errorMessage ?? result.stderr)?.trim() ?? ""}`,
         );
       }
     },
@@ -422,11 +428,28 @@ export function validateSweepSpecBody(body: string): void {
 
 export async function runSweep(
   opts: SweepOpts,
-  cfg: { repo_dir: string; repo: string; base_branch: string; sweep_timeout?: number },
+  cfg: {
+    repo_dir: string;
+    repo: string;
+    base_branch: string;
+    sweep_timeout?: number;
+    git?: PipelineConfig["git"];
+    models?: PipelineConfig["models"];
+    effort?: PipelineConfig["effort"];
+    harnesses?: PipelineConfig["harnesses"];
+  },
   sweepConfig: SweepConfig,
   deps?: SweepDeps,
 ): Promise<void> {
-  const d = deps ?? realSweepDeps(cfg.repo_dir);
+  const d =
+    deps ??
+    realSweepDeps(
+      cfg.repo_dir,
+      cfg.models?.sweep ?? DEFAULT_CONFIG.models.sweep,
+      cfg.effort?.sweep,
+      cfg.harnesses?.implementer ?? "claude",
+      cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH,
+    );
   const repoDir = cfg.repo_dir;
   const targetRepo = opts.repo ?? cfg.repo;
   const roadmapPath = path.join(repoDir, "ROADMAP.md");
