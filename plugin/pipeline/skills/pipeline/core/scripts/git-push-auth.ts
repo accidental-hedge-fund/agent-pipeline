@@ -196,13 +196,24 @@ export function isSshRemoteUrl(url: string): boolean {
 }
 
 /**
+ * Redact userinfo (user:pass / token) from a remote URL for operator-visible text.
+ * Also strips bare token-looking substrings via {@link sanitizePushErrorText}.
+ */
+export function redactRemoteUrlForDisplay(endpoint: string): string {
+  return sanitizePushErrorText(endpoint.trim());
+}
+
+/**
  * Fail-fast message when `ssh` mechanism would otherwise push a non-SSH remote.
  * Never prints secrets — only the remote URL form (and mechanism identity).
+ * Credential-bearing HTTPS URLs (e.g. `https://x-access-token:<PAT>@…`) are
+ * redacted so a configuration error cannot become credential disclosure.
  */
 export function formatNonSshRemoteFailure(endpoint: string): string {
+  const safe = redactRemoteUrlForDisplay(endpoint);
   return (
     `Git push failed (mechanism=ssh): remote.origin.pushurl/url must be an SSH endpoint ` +
-    `(git@host:path or ssh://...), got ${JSON.stringify(endpoint.trim())}. ` +
+    `(git@host:path or ssh://...), got ${JSON.stringify(safe)}. ` +
     `Configure an SSH remote (deploy key / SSH agent), or set git.push_auth: https-token:<ENV_NAME> ` +
     `for HTTPS token authentication. Do not rely on ambient gh HTTPS credentials under ssh mode.`
   );
@@ -410,20 +421,24 @@ esac
 /**
  * Build child env for an HTTPS-token push so ambient `gh auth git-credential`
  * does not win. Token value is only in {@link PIPELINE_GIT_PUSH_TOKEN_VALUE_ENV}.
+ * When `httpsPushUrl` is set, process-only `remote.origin.pushurl` is overridden
+ * so a harness `git push origin` uses HTTPS even when the durable origin is SSH.
  */
 export function buildHttpsTokenPushEnv(
   baseEnv: NodeJS.ProcessEnv,
   token: string,
   askpassPath: string,
+  opts?: { httpsPushUrl?: string },
 ): NodeJS.ProcessEnv {
   // Disable ambient credential helpers for this child via GIT_CONFIG_* overrides.
-  // GIT_CONFIG_COUNT keys override system/global/local for the process.
-  return {
+  // GIT_CONFIG_COUNT keys override system/global/local for the process only.
+  const httpsPushUrl = opts?.httpsPushUrl?.trim() || "";
+  const env: NodeJS.ProcessEnv = {
     ...baseEnv,
     GIT_TERMINAL_PROMPT: "0",
     GIT_ASKPASS: askpassPath,
     // Empty helper so gh/osxkeychain/etc. do not supply a different PAT.
-    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_COUNT: httpsPushUrl ? "2" : "1",
     GIT_CONFIG_KEY_0: "credential.helper",
     GIT_CONFIG_VALUE_0: "",
     // Private; consumed only by askpass. Not a durable config key.
@@ -431,12 +446,30 @@ export function buildHttpsTokenPushEnv(
     // Discourage GUI credential prompts.
     GCM_INTERACTIVE: "Never",
   };
+  if (httpsPushUrl) {
+    // Process-only pushurl so origin stays SSH on disk but push uses HTTPS+token.
+    env.GIT_CONFIG_KEY_1 = "remote.origin.pushurl";
+    env.GIT_CONFIG_VALUE_1 = httpsPushUrl;
+  }
+  return env;
 }
 
-/** Env fragment for harness children so they inherit the same push-auth intent. */
+export interface PrepareWorktreePushAuthEnvOpts {
+  /** Worktree path used to resolve origin → HTTPS push endpoint for harness. */
+  cwd?: string;
+  deps?: GitPushAuthDeps;
+}
+
+/**
+ * Env fragment for harness children so they inherit the same push-auth intent.
+ * HTTPS-token mode: askpass + disabled ambient helpers + process-only
+ * `remote.origin.pushurl` rewritten to the derived HTTPS endpoint (when `cwd`
+ * is provided) so `git push origin <branch>` does not stay on SSH origin.
+ */
 export function prepareWorktreePushAuthEnv(
   auth: GitPushAuth,
   baseEnv: NodeJS.ProcessEnv = process.env,
+  opts: PrepareWorktreePushAuthEnvOpts = {},
 ): NodeJS.ProcessEnv {
   const transport = selectPushTransport(auth);
   if (transport.transport === "ssh") {
@@ -456,10 +489,33 @@ export function prepareWorktreePushAuthEnv(
   // Only inject askpass material when the token is present — missing token
   // fails at the authoritative engine push with a clear pre-git message.
   if (token) {
-    const askpassPath = defaultWriteAskpass(askpassScriptBody());
-    Object.assign(env, buildHttpsTokenPushEnv(env, token, askpassPath));
+    const writeAsk = opts.deps?.writeAskpassScript ?? defaultWriteAskpass;
+    const askpassPath = writeAsk(askpassScriptBody());
+    let httpsPushUrl: string | undefined;
+    if (opts.cwd) {
+      const originUrl = resolveSshPushEndpointSync(opts.cwd, opts.deps ?? {});
+      httpsPushUrl = originUrl ? (toHttpsRemoteUrl(originUrl) ?? undefined) : undefined;
+    }
+    Object.assign(env, buildHttpsTokenPushEnv(env, token, askpassPath, { httpsPushUrl }));
   }
   return env;
+}
+
+/**
+ * Stage adapter for {@link runConfiguredGitPush} `gitExec`: forward the
+ * prepared child `env` (GIT_ASKPASS / token private env / GIT_CONFIG_*) into a
+ * gitInWorktree-style seam. Without this, HTTPS-token mode builds askpass env
+ * that never reaches the actual git child.
+ */
+export function gitExecForwardingEnv(
+  cwd: string,
+  git: (
+    cwd: string,
+    args: string[],
+    opts?: { ignoreFailure?: boolean; env?: NodeJS.ProcessEnv },
+  ) => Promise<{ stdout: string; stderr: string; code: number }>,
+): NonNullable<GitPushAuthDeps["gitExec"]> {
+  return async ({ args, env }) => git(cwd, args, { ignoreFailure: true, env });
 }
 
 /**
@@ -495,7 +551,8 @@ export async function runConfiguredGitPush(
         stdout: "",
         stderr: ssh.errorMessage,
         errorMessage: ssh.errorMessage,
-        endpoint: resolved ?? undefined,
+        // Never persist credential-bearing remote URLs in diagnostics.
+        endpoint: resolved ? redactRemoteUrlForDisplay(resolved) : undefined,
       };
     }
     const endpoint = ssh.endpoint;
@@ -535,7 +592,7 @@ export async function runConfiguredGitPush(
   if (!httpsUrl) {
     const msg =
       `Git push failed (mechanism=https-token, env=${tokenEnv}): ` +
-      `could not derive an HTTPS remote URL from origin (got ${JSON.stringify(originUrl ?? "")})`;
+      `could not derive an HTTPS remote URL from origin (got ${JSON.stringify(redactRemoteUrlForDisplay(originUrl ?? ""))})`;
     return { code: 1, stdout: "", stderr: msg, errorMessage: msg };
   }
 
@@ -543,7 +600,7 @@ export async function runConfiguredGitPush(
   const cleanup = deps.cleanupAskpassScript ?? defaultCleanupAskpass;
   const askpassPath = writeAsk(askpassScriptBody());
   try {
-    const childEnv = buildHttpsTokenPushEnv(env, token, askpassPath);
+    const childEnv = buildHttpsTokenPushEnv(env, token, askpassPath, { httpsPushUrl: httpsUrl });
     childEnv[PIPELINE_GIT_PUSH_AUTH_ENV] = `https-token:${tokenEnv}`;
     const finalArgs = rewriteOriginRemote(opts.args, httpsUrl);
     // Also clear credential.helper via -c so system config cannot re-enable gh.
@@ -602,7 +659,7 @@ export function runConfiguredGitPushSync(opts: RunConfiguredGitPushOpts): RunCon
         stdout: "",
         stderr: ssh.errorMessage,
         errorMessage: ssh.errorMessage,
-        endpoint: resolved ?? undefined,
+        endpoint: resolved ? redactRemoteUrlForDisplay(resolved) : undefined,
       };
     }
     const endpoint = ssh.endpoint;
@@ -641,7 +698,7 @@ export function runConfiguredGitPushSync(opts: RunConfiguredGitPushOpts): RunCon
   if (!httpsUrl) {
     const msg =
       `Git push failed (mechanism=https-token, env=${tokenEnv}): ` +
-      `could not derive an HTTPS remote URL from origin (got ${JSON.stringify(originUrl ?? "")})`;
+      `could not derive an HTTPS remote URL from origin (got ${JSON.stringify(redactRemoteUrlForDisplay(originUrl ?? ""))})`;
     return { code: 1, stdout: "", stderr: msg, errorMessage: msg };
   }
 
@@ -649,7 +706,7 @@ export function runConfiguredGitPushSync(opts: RunConfiguredGitPushOpts): RunCon
   const cleanup = deps.cleanupAskpassScript ?? defaultCleanupAskpass;
   const askpassPath = writeAsk(askpassScriptBody());
   try {
-    const childEnv = buildHttpsTokenPushEnv(env, token, askpassPath);
+    const childEnv = buildHttpsTokenPushEnv(env, token, askpassPath, { httpsPushUrl: httpsUrl });
     childEnv[PIPELINE_GIT_PUSH_AUTH_ENV] = `https-token:${tokenEnv}`;
     const finalArgs = rewriteOriginRemote(opts.args, httpsUrl);
     const argsWithCred = ["-c", "credential.helper=", ...finalArgs];

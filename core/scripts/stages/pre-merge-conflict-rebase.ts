@@ -25,7 +25,7 @@ import {
   runCoveredCandidateMutation,
 } from "../candidate-integrity.ts";
 import { appendEvent, defaultRunStoreDeps } from "../run-store.ts";
-import { DEFAULT_GIT_PUSH_AUTH, runConfiguredGitPush } from "../git-push-auth.ts";
+import { DEFAULT_GIT_PUSH_AUTH, gitExecForwardingEnv, runConfiguredGitPush } from "../git-push-auth.ts";
 
 /** Residual legacy marker path — salvage exclusion only; engine does not write it (#759). */
 export const REBASE_MARKER_FILE = PIPELINE_INTERNAL_MARKER_FILES[0];
@@ -420,7 +420,7 @@ export async function tryRebaseAndPush(
         const r = await gitInWorktree(cwd, ["config", "--get", key], { ignoreFailure: true });
         return r.code === 0 ? r.stdout.trim() || null : null;
       },
-      gitExec: async ({ args }) => gitInWorktree(wt.path, args, { ignoreFailure: true }),
+      gitExec: gitExecForwardingEnv(wt.path, gitInWorktree),
     },
   });
   return push.code === 0;

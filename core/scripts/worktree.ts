@@ -1342,13 +1342,16 @@ export async function reattachIfDetached(
 export async function gitInWorktree(
   cwd: string,
   args: string[],
-  opts: { ignoreFailure?: boolean; timeoutMs?: number } = {},
+  opts: { ignoreFailure?: boolean; timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   try {
     const { stdout, stderr } = await execFileAsync("git", args, {
       cwd,
       timeout: opts.timeoutMs ?? 60_000,
       maxBuffer: 50 * 1024 * 1024,
+      // Forward child env when provided (e.g. HTTPS-token askpass from
+      // runConfiguredGitPush). Omit when unset so process.env is inherited.
+      ...(opts.env ? { env: opts.env } : {}),
     });
     return { stdout: stdout ?? "", stderr: stderr ?? "", code: 0 };
   } catch (err) {

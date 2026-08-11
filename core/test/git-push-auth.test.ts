@@ -9,12 +9,15 @@ import * as path from "node:path";
 import {
   buildHttpsTokenPushEnv,
   DEFAULT_GIT_PUSH_AUTH,
+  formatNonSshRemoteFailure,
   formatPushAuthFailure,
+  gitExecForwardingEnv,
   isNonAuthoritativeWorkflowScopeNoise,
   isWorkflowScopePushRejection,
   parseGitPushAuth,
   PIPELINE_GIT_PUSH_TOKEN_VALUE_ENV,
   prepareWorktreePushAuthEnv,
+  redactRemoteUrlForDisplay,
   rewriteOriginRemote,
   runConfiguredGitPush,
   runConfiguredGitPushSync,
@@ -205,6 +208,37 @@ test("runConfiguredGitPush: ssh rejects HTTPS origin/pushurl pre-git (no silent 
   assert.match(res.errorMessage ?? "", /https-token/);
 });
 
+test("formatNonSshRemoteFailure / redaction: credential-bearing HTTPS URL never leaks PAT", () => {
+  const patUrl = "https://x-access-token:ghp_SUPER_SECRET_PAT_VALUE@github.com/owner/repo.git";
+  const msg = formatNonSshRemoteFailure(patUrl);
+  assert.match(msg, /mechanism=ssh/);
+  assert.match(msg, /REDACTED/i);
+  assert.doesNotMatch(msg, /ghp_SUPER_SECRET_PAT_VALUE/);
+  assert.doesNotMatch(msg, /x-access-token:ghp_/);
+  assert.equal(redactRemoteUrlForDisplay(patUrl).includes("ghp_SUPER_SECRET"), false);
+});
+
+test("runConfiguredGitPush: ssh preflight with token-in-URL does not leak into error or endpoint", async () => {
+  const patUrl = `https://x-access-token:${SECRET}@github.com/owner/repo.git`;
+  const res = await runConfiguredGitPush({
+    cwd: "/tmp/wt",
+    auth: { mechanism: "ssh" },
+    args: ["push", "origin", "b"],
+    deps: {
+      env: { PATH: "/usr/bin" },
+      gitConfigGet: async () => patUrl,
+      gitExec: async () => {
+        throw new Error("git must not run");
+      },
+    },
+  });
+  assert.equal(res.code, 1);
+  assert.doesNotMatch(res.errorMessage ?? "", new RegExp(SECRET));
+  assert.doesNotMatch(res.stderr ?? "", new RegExp(SECRET));
+  assert.doesNotMatch(res.endpoint ?? "", new RegExp(SECRET));
+  assert.match(res.errorMessage ?? "", /REDACTED/i);
+});
+
 test("runConfiguredGitPush: ssh with unset origin falls back to remote name origin", async () => {
   const recorded: string[][] = [];
   const res = await runConfiguredGitPush({
@@ -300,9 +334,43 @@ test("runConfiguredGitPush: https-token sets askpass env and disables helper; se
   assert.equal(env.GIT_ASKPASS, askpassPath);
   assert.equal(env[PIPELINE_GIT_PUSH_TOKEN_VALUE_ENV], SECRET);
   assert.equal(env.GIT_CONFIG_VALUE_0, "");
+  assert.equal(env.GIT_CONFIG_KEY_1, "remote.origin.pushurl");
+  assert.equal(env.GIT_CONFIG_VALUE_1, "https://github.com/owner/repo.git");
   assert.match(res.errorMessage ?? "", /GITHUB_PUSH_TOKEN/);
   assert.match(res.errorMessage ?? "", /workflow/i);
   assert.doesNotMatch(res.errorMessage ?? "", new RegExp(SECRET));
+});
+
+test("gitExecForwardingEnv: stage adapter forwards GIT_ASKPASS and token env to git seam", async () => {
+  // Mirrors the stage-adapter pattern (fix/planning/eval/repair) so a future
+  // regression that drops `env` is caught without a real network push.
+  const seen: { args: string[]; env?: NodeJS.ProcessEnv }[] = [];
+  const fakeGit = async (
+    _cwd: string,
+    args: string[],
+    opts?: { ignoreFailure?: boolean; env?: NodeJS.ProcessEnv },
+  ) => {
+    seen.push({ args, env: opts?.env });
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const res = await runConfiguredGitPush({
+    cwd: "/tmp/wt-adapter",
+    auth: { mechanism: "https-token", tokenEnv: "GITHUB_PUSH_TOKEN" },
+    args: ["push", "origin", "branch"],
+    deps: {
+      env: { PATH: "/usr/bin", GITHUB_PUSH_TOKEN: SECRET },
+      gitConfigGet: async () => "git@github.com:owner/repo.git",
+      writeAskpassScript: () => "/tmp/askpass-adapter-980.sh",
+      cleanupAskpassScript: () => {},
+      gitExec: gitExecForwardingEnv("/tmp/wt-adapter", fakeGit),
+    },
+  });
+  assert.equal(res.code, 0);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].env?.GIT_ASKPASS, "/tmp/askpass-adapter-980.sh");
+  assert.equal(seen[0].env?.[PIPELINE_GIT_PUSH_TOKEN_VALUE_ENV], SECRET);
+  assert.equal(seen[0].env?.GIT_CONFIG_VALUE_0, "");
+  assert.ok(seen[0].args.some((a) => a.startsWith("https://github.com/")));
 });
 
 test("runConfiguredGitPushSync: ssh path", () => {
@@ -333,6 +401,32 @@ test("buildHttpsTokenPushEnv: disables ambient helper", () => {
 test("prepareWorktreePushAuthEnv: ssh marks mechanism", () => {
   const env = prepareWorktreePushAuthEnv({ mechanism: "ssh" }, { PATH: "/bin" });
   assert.equal(env.PIPELINE_GIT_PUSH_AUTH, "ssh");
+});
+
+test("prepareWorktreePushAuthEnv: https-token with SSH origin sets process-only HTTPS pushurl", () => {
+  // Harness `git push origin <branch>` must resolve to HTTPS-token transport
+  // when durable origin is SSH (#980 review-2 finding 6ca04bdd).
+  const env = prepareWorktreePushAuthEnv(
+    { mechanism: "https-token", tokenEnv: "GITHUB_PUSH_TOKEN" },
+    { PATH: "/bin", GITHUB_PUSH_TOKEN: SECRET },
+    {
+      cwd: "/tmp/wt-harness",
+      deps: {
+        gitConfigGetSync: (_cwd, key) =>
+          key === "remote.origin.url" ? "git@github.com:owner/repo.git" : null,
+        writeAskpassScript: () => "/tmp/harness-askpass-980.sh",
+      },
+    },
+  );
+  assert.equal(env.PIPELINE_GIT_PUSH_AUTH, "https-token:GITHUB_PUSH_TOKEN");
+  assert.equal(env.GIT_ASKPASS, "/tmp/harness-askpass-980.sh");
+  assert.equal(env[PIPELINE_GIT_PUSH_TOKEN_VALUE_ENV], SECRET);
+  assert.equal(env.GIT_CONFIG_KEY_0, "credential.helper");
+  assert.equal(env.GIT_CONFIG_VALUE_0, "");
+  assert.equal(env.GIT_CONFIG_KEY_1, "remote.origin.pushurl");
+  assert.equal(env.GIT_CONFIG_VALUE_1, "https://github.com/owner/repo.git");
+  // Secret must not appear in the process-only pushurl value.
+  assert.doesNotMatch(env.GIT_CONFIG_VALUE_1 ?? "", new RegExp(SECRET));
 });
 
 // ---------------------------------------------------------------------------

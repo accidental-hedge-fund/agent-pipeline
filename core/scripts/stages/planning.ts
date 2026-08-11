@@ -64,6 +64,7 @@ import { pushWithCurrencyCheck } from "../transient-wrappers.ts";
 import {
   DEFAULT_GIT_PUSH_AUTH,
   formatPushAuthFailure,
+  gitExecForwardingEnv,
   prepareWorktreePushAuthEnv,
   runConfiguredGitPush,
 } from "../git-push-auth.ts";
@@ -1958,8 +1959,8 @@ export async function resumeFromImplementing(
               const r = await gitOp(cwd, ["config", "--get", key], { ignoreFailure: true });
               return r.code === 0 ? r.stdout.trim() || null : null;
             },
-            gitExec: async ({ args: gitArgs }) =>
-              gitOp(wt.path, gitArgs, { ignoreFailure: true }),
+            // Forward GIT_ASKPASS / token child env into the git process (#980).
+            gitExec: gitExecForwardingEnv(wt.path, gitOp),
           },
         });
         return {
@@ -2276,7 +2277,7 @@ export async function invokeImplementer(
       ? accountingForInvoke(opts, accounting.issue, accounting.stage, "implementing", model)
       : undefined,
     // Align harness-initiated git push with configured mechanism (#980).
-    env: prepareWorktreePushAuthEnv(pushAuth, baseEnv),
+    env: prepareWorktreePushAuthEnv(pushAuth, baseEnv, { cwd: wtPath }),
   });
 }
 

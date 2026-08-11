@@ -47,7 +47,7 @@ This self-check is a targeted scan of your own changes against the findings you 
 
 ## Git push auth (pipeline-configured)
 
-Push authentication is configured by the pipeline (`git.push_auth` in `.github/pipeline.yml`). Prefer the worktree's existing `origin` / `pushurl` as prepared for this stage. Do **not** reconfigure origin to HTTPS via ambient `gh auth setup-git` / `gh auth git-credential` as the selected mechanism — that classic PAT often lacks the GitHub `workflow` scope and rejects pushes that touch `.github/workflows/**`. When you push, use the remotes and environment the pipeline prepared.
+Push authentication is configured by the pipeline (`git.push_auth` in `.github/pipeline.yml`). Prefer the worktree's existing `origin` / `pushurl` and the process environment the pipeline prepared for this stage (including any process-only HTTPS pushurl / askpass when `https-token` is configured). Do **not** reconfigure origin to HTTPS via ambient `gh auth setup-git` / `gh auth git-credential` as the selected mechanism — that classic PAT often lacks the GitHub `workflow` scope and rejects pushes that touch `.github/workflows/**`. When you push, use `git push origin <branch>` with the remotes and environment the pipeline prepared — do not invent a separate remote.
 
 ## Single-Turn Invocation (required)
 

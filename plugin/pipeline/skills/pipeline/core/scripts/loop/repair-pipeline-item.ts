@@ -28,7 +28,7 @@ import {
   gitInWorktree,
 } from "../worktree.ts";
 import { appendEvent, defaultRunStoreDeps, runDirPath } from "../run-store.ts";
-import { DEFAULT_GIT_PUSH_AUTH, runConfiguredGitPush } from "../git-push-auth.ts";
+import { DEFAULT_GIT_PUSH_AUTH, gitExecForwardingEnv, runConfiguredGitPush } from "../git-push-auth.ts";
 
 export interface RepairPipelineItemInput {
   runId: string;
@@ -338,7 +338,7 @@ export function createRepairPipelineItemExecutor(
               const r = await git(cwd, ["config", "--get", key], { ignoreFailure: true });
               return r.code === 0 ? r.stdout.trim() || null : null;
             },
-            gitExec: async ({ args }) => git(wt.path, args, { ignoreFailure: true }),
+            gitExec: gitExecForwardingEnv(wt.path, git),
           },
         });
         const verifiedRemote = await git(

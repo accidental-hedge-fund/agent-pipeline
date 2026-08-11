@@ -15,7 +15,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { invoke } from "../harness.ts";
 import type { PipelineConfig } from "../types.ts";
-import { DEFAULT_GIT_PUSH_AUTH, runConfiguredGitPush } from "../git-push-auth.ts";
+import { DEFAULT_GIT_PUSH_AUTH, gitExecForwardingEnv, runConfiguredGitPush } from "../git-push-auth.ts";
 import {
   branchName,
   ensureManagedWorktree,
@@ -624,7 +624,7 @@ export async function runDeterministicConflictRebase(
           const r = await git(cwd, ["config", "--get", key], { ignoreFailure: true });
           return r.code === 0 ? r.stdout.trim() || null : null;
         },
-        gitExec: async ({ args }) => git(managedRoot, args, { ignoreFailure: true }),
+        gitExec: gitExecForwardingEnv(managedRoot, git),
       },
     });
     if (push.code !== 0) {

@@ -40,6 +40,7 @@ import { invoke as defaultInvoke, runCapped, type HarnessResult, type InvokeOpti
 import { buildEvalFixPrompt } from "../prompts/index.ts";
 import {
   DEFAULT_GIT_PUSH_AUTH,
+  gitExecForwardingEnv,
   runConfiguredGitPush,
   type GitPushAuth,
 } from "../git-push-auth.ts";
@@ -922,7 +923,7 @@ async function defaultGitPush(
         const r = await gitInWorktree(c, ["config", "--get", key], { ignoreFailure: true });
         return r.code === 0 ? r.stdout.trim() || null : null;
       },
-      gitExec: async ({ args }) => gitInWorktree(cwd, args, { ignoreFailure: true }),
+      gitExec: gitExecForwardingEnv(cwd, gitInWorktree),
     },
   });
   return { code: res.code, stderr: res.errorMessage ?? res.stderr };

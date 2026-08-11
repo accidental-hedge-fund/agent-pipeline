@@ -27,7 +27,7 @@ import { branchName, gitInWorktree, reattachIfDetached } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
 import type { InvokeFn } from "../openspec-consistency.ts";
 import type { PipelineConfig, ReviewFinding } from "../types.ts";
-import { DEFAULT_GIT_PUSH_AUTH, runConfiguredGitPush } from "../git-push-auth.ts";
+import { DEFAULT_GIT_PUSH_AUTH, gitExecForwardingEnv, runConfiguredGitPush } from "../git-push-auth.ts";
 import {
   declaredScopeFromFindingPaths,
   runCoveredCandidateMutation,
@@ -754,7 +754,7 @@ export async function performPreMergeAutoFix(
             const r = await gitFn(cwd, ["config", "--get", key], { ignoreFailure: true });
             return r.code === 0 ? r.stdout.trim() || null : null;
           },
-          gitExec: async ({ args }) => gitFn(wt.path, args, { ignoreFailure: true }),
+          gitExec: gitExecForwardingEnv(wt.path, gitFn),
         },
       });
       if (pushRes.code !== 0) {

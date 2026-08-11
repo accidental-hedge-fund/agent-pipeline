@@ -39,6 +39,7 @@ import { invoke } from "../harness.ts";
 import {
   DEFAULT_GIT_PUSH_AUTH,
   formatPushAuthFailure,
+  gitExecForwardingEnv,
   runConfiguredGitPush,
 } from "../git-push-auth.ts";
 import {
@@ -705,7 +706,7 @@ export async function maybeArchiveOpenspec(
         const r = await gitFn(cwd, ["config", "--get", key], { ignoreFailure: true });
         return r.code === 0 ? r.stdout.trim() || null : null;
       },
-      gitExec: async ({ args }) => gitFn(wt.path, args, { ignoreFailure: true }),
+      gitExec: gitExecForwardingEnv(wt.path, gitFn),
     },
   });
   if (stateDir) {

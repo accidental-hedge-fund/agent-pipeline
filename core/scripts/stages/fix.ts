@@ -94,6 +94,7 @@ import {
 import {
   DEFAULT_GIT_PUSH_AUTH,
   formatPushAuthFailure,
+  gitExecForwardingEnv,
   prepareWorktreePushAuthEnv,
   runConfiguredGitPush,
 } from "../git-push-auth.ts";
@@ -741,6 +742,7 @@ export async function advanceFix(
           harness,
           model,
         }),
+        { cwd: wt.path },
       ),
     });
   };
@@ -1384,8 +1386,8 @@ export async function advanceFix(
               });
               return r.code === 0 ? r.stdout.trim() || null : null;
             },
-            gitExec: async ({ args: gitArgs }) =>
-              gitInWorktree(wt.path, gitArgs, { ignoreFailure: true }),
+            // Forward GIT_ASKPASS / token child env into the git process (#980).
+            gitExec: gitExecForwardingEnv(wt.path, gitInWorktree),
           },
         });
         return {
