@@ -195,6 +195,38 @@ export function isSshRemoteUrl(url: string): boolean {
   return /^git@[^:]+:/.test(u) || /^ssh:\/\//i.test(u);
 }
 
+/**
+ * Fail-fast message when `ssh` mechanism would otherwise push a non-SSH remote.
+ * Never prints secrets — only the remote URL form (and mechanism identity).
+ */
+export function formatNonSshRemoteFailure(endpoint: string): string {
+  return (
+    `Git push failed (mechanism=ssh): remote.origin.pushurl/url must be an SSH endpoint ` +
+    `(git@host:path or ssh://...), got ${JSON.stringify(endpoint.trim())}. ` +
+    `Configure an SSH remote (deploy key / SSH agent), or set git.push_auth: https-token:<ENV_NAME> ` +
+    `for HTTPS token authentication. Do not rely on ambient gh HTTPS credentials under ssh mode.`
+  );
+}
+
+/**
+ * Validate a resolved origin/pushurl for the `ssh` mechanism.
+ * - Unset → ok with remote name `"origin"` (git resolves the worktree remote).
+ * - SSH URL → ok with that concrete endpoint.
+ * - Non-SSH URL (e.g. HTTPS) → pre-git failure so ssh mode never executes HTTPS.
+ */
+export function requireSshPushEndpoint(
+  endpoint: string | null | undefined,
+): { ok: true; endpoint: string } | { ok: false; errorMessage: string } {
+  const value = endpoint?.trim() || "";
+  if (!value) {
+    return { ok: true, endpoint: "origin" };
+  }
+  if (!isSshRemoteUrl(value)) {
+    return { ok: false, errorMessage: formatNonSshRemoteFailure(value) };
+  }
+  return { ok: true, endpoint: value };
+}
+
 // ---------------------------------------------------------------------------
 // Invocation building + execution
 // ---------------------------------------------------------------------------
@@ -452,9 +484,23 @@ export async function runConfiguredGitPush(
   }
 
   if (transport.transport === "ssh") {
-    const endpoint = (await resolveSshPushEndpoint(opts.cwd, deps)) ?? "origin";
-    // Prefer pushurl/url as the push endpoint; fall back to remote name "origin".
-    const finalArgs = endpoint === "origin" ? opts.args : rewriteOriginRemote(opts.args, endpoint);
+    // Prefer pushurl, else origin url. Reject non-SSH URLs so mechanism=ssh
+    // never silently executes HTTPS (ambient gh PAT / workflow-scope path).
+    // When unset, keep remote name "origin" and let git resolve it.
+    const resolved = await resolveSshPushEndpoint(opts.cwd, deps);
+    const ssh = requireSshPushEndpoint(resolved);
+    if (!ssh.ok) {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: ssh.errorMessage,
+        errorMessage: ssh.errorMessage,
+        endpoint: resolved ?? undefined,
+      };
+    }
+    const endpoint = ssh.endpoint;
+    const finalArgs =
+      endpoint === "origin" ? opts.args : rewriteOriginRemote(opts.args, endpoint);
     const gitExec = deps.gitExec ?? defaultGitExec;
     const childEnv: NodeJS.ProcessEnv = {
       ...env,
@@ -548,8 +594,20 @@ export function runConfiguredGitPushSync(opts: RunConfiguredGitPushOpts): RunCon
   }
 
   if (transport.transport === "ssh") {
-    const endpoint = resolveSshPushEndpointSync(opts.cwd, deps) ?? "origin";
-    const finalArgs = endpoint === "origin" ? opts.args : rewriteOriginRemote(opts.args, endpoint);
+    const resolved = resolveSshPushEndpointSync(opts.cwd, deps);
+    const ssh = requireSshPushEndpoint(resolved);
+    if (!ssh.ok) {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: ssh.errorMessage,
+        errorMessage: ssh.errorMessage,
+        endpoint: resolved ?? undefined,
+      };
+    }
+    const endpoint = ssh.endpoint;
+    const finalArgs =
+      endpoint === "origin" ? opts.args : rewriteOriginRemote(opts.args, endpoint);
     const gitExec = deps.gitExecSync ?? defaultGitExecSync;
     const childEnv: NodeJS.ProcessEnv = {
       ...env,

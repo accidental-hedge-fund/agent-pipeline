@@ -178,6 +178,73 @@ test("runConfiguredGitPush: ssh uses pushurl endpoint, no PAT in argv", async ()
   assert.equal(recorded[0].env[PIPELINE_GIT_PUSH_TOKEN_VALUE_ENV], undefined);
 });
 
+test("runConfiguredGitPush: ssh rejects HTTPS origin/pushurl pre-git (no silent HTTPS)", async () => {
+  let gitCalled = false;
+  const res = await runConfiguredGitPush({
+    cwd: "/tmp/wt",
+    auth: { mechanism: "ssh" },
+    args: ["push", "-u", "origin", "pipeline/1-x"],
+    deps: {
+      env: { PATH: "/usr/bin" },
+      gitConfigGet: async (_cwd, key) => {
+        if (key === "remote.origin.pushurl") return null;
+        if (key === "remote.origin.url") return "https://github.com/owner/repo.git";
+        return null;
+      },
+      gitExec: async () => {
+        gitCalled = true;
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    },
+  });
+  assert.equal(res.code, 1);
+  assert.equal(gitCalled, false, "must not invoke git when remote is HTTPS under ssh");
+  assert.match(res.errorMessage ?? "", /mechanism=ssh/);
+  assert.match(res.errorMessage ?? "", /SSH endpoint|ssh:\/\//i);
+  assert.match(res.errorMessage ?? "", /https:\/\/github\.com\/owner\/repo\.git/);
+  assert.match(res.errorMessage ?? "", /https-token/);
+});
+
+test("runConfiguredGitPush: ssh with unset origin falls back to remote name origin", async () => {
+  const recorded: string[][] = [];
+  const res = await runConfiguredGitPush({
+    cwd: "/tmp/wt",
+    auth: { mechanism: "ssh" },
+    args: ["push", "origin", "b"],
+    deps: {
+      env: { PATH: "/usr/bin" },
+      gitConfigGet: async () => null,
+      gitExec: async ({ args }) => {
+        recorded.push(args);
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    },
+  });
+  assert.equal(res.code, 0);
+  assert.deepEqual(recorded[0], ["push", "origin", "b"]);
+  assert.equal(res.endpoint, "origin");
+});
+
+test("runConfiguredGitPushSync: ssh rejects HTTPS origin pre-git", () => {
+  let gitCalled = false;
+  const res = runConfiguredGitPushSync({
+    cwd: "/tmp/wt",
+    auth: { mechanism: "ssh" },
+    args: ["push", "origin", "b"],
+    deps: {
+      gitConfigGetSync: () => "https://github.com/o/r.git",
+      gitExecSync: () => {
+        gitCalled = true;
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    },
+  });
+  assert.equal(res.code, 1);
+  assert.equal(gitCalled, false);
+  assert.match(res.errorMessage ?? "", /mechanism=ssh/);
+  assert.match(res.errorMessage ?? "", /https:\/\/github\.com\/o\/r\.git/);
+});
+
 test("runConfiguredGitPush: https-token missing env fails pre-git", async () => {
   let gitCalled = false;
   const res = await runConfiguredGitPush({

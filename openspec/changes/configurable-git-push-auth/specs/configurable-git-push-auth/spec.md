@@ -64,6 +64,13 @@ Every git push the pipeline performs as the authoritative delivery of a managed 
 - **THEN** the authoritative pipeline push SHALL use the SSH transport
 - **AND** success SHALL NOT depend on a GitHub PAT having the `workflow` scope
 
+#### Scenario: SSH mechanism rejects a non-SSH origin or pushurl before push
+
+- **WHEN** push-auth is `ssh` and the worktree `remote.origin.pushurl` / `remote.origin.url` resolves to a non-SSH URL (for example `https://github.com/owner/repo.git`)
+- **THEN** the authoritative pipeline push SHALL fail before invoking `git push` against that HTTPS endpoint
+- **AND** the failure message SHALL identify mechanism `ssh` and that an SSH remote is required
+- **AND** the pipeline SHALL NOT silently perform an HTTPS push under the `ssh` mechanism
+
 #### Scenario: HTTPS-token push uses the named env var
 
 - **WHEN** push-auth is `https-token:GITHUB_PUSH_TOKEN` and `GITHUB_PUSH_TOKEN` is set in the environment
