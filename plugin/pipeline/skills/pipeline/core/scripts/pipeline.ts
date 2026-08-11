@@ -97,6 +97,7 @@ import {
   runDecompose,
   realDecomposeDeps,
   isEpicLabeled,
+  EPIC_LABEL,
   type EffortBand,
 } from "./stages/decompose.ts";
 import { runRefineSpec, realRefineSpecDeps } from "./stages/refine-spec.ts";
@@ -2064,16 +2065,20 @@ export async function resolveSelectorWorkList(
     throw new Error(`roadmap slice "${selector.value}" was not found in ROADMAP.md, or references no issues`);
   }
   // Exclude pipeline:epic parents listed in a slice; children remain eligible (#766).
-  let filtered = matches;
+  // Fail closed when inventory cannot be loaded — fail-open would schedule umbrella
+  // epics contrary to deterministic exclusion (review finding ff4513be).
+  let open: SelectorOpenIssue[];
   try {
-    const open = await deps.listOpenIssues(cfg);
-    const epicIds = new Set(
-      open.filter((i) => isEpicLabeled(i.labels)).map((i) => i.number),
+    open = await deps.listOpenIssues(cfg);
+  } catch (err) {
+    throw new Error(
+      `roadmap slice "${selector.value}": cannot load open-issue inventory to exclude ${EPIC_LABEL} parents: ${(err as Error).message}`,
     );
-    filtered = matches.filter((n) => !epicIds.has(n));
-  } catch {
-    // If inventory is unavailable, keep the slice numbers (fail open on slice path only).
   }
+  const epicIds = new Set(
+    open.filter((i) => isEpicLabeled(i.labels)).map((i) => i.number),
+  );
+  const filtered = matches.filter((n) => !epicIds.has(n));
   if (filtered.length === 0) {
     throw new Error(`roadmap slice "${selector.value}" was not found in ROADMAP.md, or references no issues`);
   }

@@ -149,8 +149,8 @@ function makeDeps(overrides: Partial<DecomposeDeps> = {}): DecomposeDeps & {
       throw new Error(`readFile not mocked for ${p}`);
     },
     writeFile: () => {},
-    gitEnsureClean: () => {},
-    gitCreateBranch: () => {},
+    withThrowawayWorktree: async (_repoDir, _branch, _baseRef, fn) =>
+      fn("/tmp/decompose-throwaway-wt"),
     reserveRemoteBranch: () => {},
     gitPushBranch: () => {},
     gitCommit: () => {},
@@ -528,4 +528,103 @@ test("decompose: milestone selector excludes pipeline:epic; work-list keeps it",
   );
   assert.deepEqual(label, ["10", "11"]);
   assert.ok(isEpicLabeled([EPIC_LABEL]));
+});
+
+test("decompose: apply ROADMAP delivery uses throwaway worktree, not operator repo_dir", async () => {
+  const operatorDir = "/fake/repo";
+  const throwawayDir = "/tmp/decompose-throwaway-wt";
+  const writePaths: string[] = [];
+  const commitDirs: string[] = [];
+  const pushDirs: string[] = [];
+  const prDirs: string[] = [];
+  let withWtCalls = 0;
+
+  const deps = makeDeps({
+    withThrowawayWorktree: async (repoDir, _branch, _baseRef, fn) => {
+      withWtCalls += 1;
+      assert.equal(repoDir, operatorDir, "withThrowawayWorktree is rooted at operator repo");
+      return fn(throwawayDir);
+    },
+    writeFile: (p) => {
+      writePaths.push(p);
+    },
+    gitCommit: (dir) => {
+      commitDirs.push(dir);
+    },
+    gitPushBranch: (dir) => {
+      pushDirs.push(dir);
+    },
+    createPR: async (dir, title, body, base, head) => {
+      prDirs.push(dir);
+      return `https://github.com/owner/repo/pull/77?title=${encodeURIComponent(title)}&base=${base}&head=${head}&body=${body.length}`;
+    },
+  });
+
+  await runDecompose(
+    { epic: 123, apply: true, release: "1.42.0" },
+    { ...DEFAULT_CFG, repo_dir: operatorDir },
+    deps,
+  );
+
+  assert.equal(withWtCalls, 1, "must open a throwaway worktree for ROADMAP delivery");
+  assert.ok(
+    writePaths.every((p) => p.startsWith(throwawayDir)),
+    `ROADMAP writes must be in throwaway, got: ${writePaths.join(", ")}`,
+  );
+  assert.ok(
+    !writePaths.some((p) => p === `${operatorDir}/ROADMAP.md` || p.startsWith(`${operatorDir}/`)),
+    "must not write ROADMAP into operator checkout",
+  );
+  assert.deepEqual(commitDirs, [throwawayDir]);
+  assert.deepEqual(pushDirs, [throwawayDir]);
+  assert.deepEqual(prDirs, [throwawayDir]);
+  assert.equal(deps._createIssueCalls.length, 2);
+});
+
+test("decompose: roadmap-slice excludes pipeline:epic parents", async () => {
+  const roadmap = [
+    "**v1.42.0 — Slice:**",
+    "| # | What | Why |",
+    "|---|------|-----|",
+    "| #9 | Epic umbrella | parent |",
+    "| #10 | Child A | work |",
+    "| #11 | Child B | work |",
+  ].join("\n");
+  const deps: SelectorResolveDeps = {
+    listOpenIssues: async () => [
+      { number: 9, labels: [EPIC_LABEL], milestone: null },
+      { number: 10, labels: ["pipeline:ready"], milestone: null },
+      { number: 11, labels: ["pipeline:ready"], milestone: null },
+    ],
+    readRoadmap: async () => roadmap,
+  };
+  const cfg = { repo: "acme/w", repo_dir: "/tmp/x" } as unknown as PipelineConfig;
+  const issues = await resolveSelectorIssues(
+    cfg,
+    { type: "roadmap-slice", value: "v1.42.0" },
+    deps,
+  );
+  assert.deepEqual(issues, ["10", "11"]);
+});
+
+test("decompose: roadmap-slice fails closed when epic inventory cannot load", async () => {
+  const roadmap = [
+    "**v1.42.0 — Slice:**",
+    "| # | What | Why |",
+    "|---|------|-----|",
+    "| #9 | Epic umbrella | parent |",
+    "| #10 | Child A | work |",
+  ].join("\n");
+  const deps: SelectorResolveDeps = {
+    listOpenIssues: async () => {
+      throw new Error("gh api rate limited");
+    },
+    readRoadmap: async () => roadmap,
+  };
+  const cfg = { repo: "acme/w", repo_dir: "/tmp/x" } as unknown as PipelineConfig;
+  await assert.rejects(
+    () =>
+      resolveSelectorIssues(cfg, { type: "roadmap-slice", value: "v1.42.0" }, deps),
+    /cannot load open-issue inventory|pipeline:epic/,
+  );
 });

@@ -28,6 +28,14 @@ import {
   isLabelAlreadyExists,
   reservePushArgs,
 } from "./intake.ts";
+import {
+  planRoadmapThrowawayWorktreePath,
+  planRoadmapThrowawayWorktreeAdd,
+  shouldForceRemoveRoadmapWorktree,
+  roadmapThrowawayWorktreeDir,
+  roadmapBranchFetchRefspec,
+  roadmapDayBranchPushRefspec,
+} from "./roadmap-deps.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -103,8 +111,18 @@ export interface DecomposeDeps {
   readFileAtBase(repoDir: string, ref: string, relPath: string): string;
   readFile(p: string): string;
   writeFile(p: string, content: string): void;
-  gitEnsureClean(repoDir: string): void;
-  gitCreateBranch(repoDir: string, branch: string, fromRef: string): void;
+  /**
+   * Run `fn` inside a throwaway linked worktree of `branch` (created from
+   * `baseRef` when the branch is missing). Always attempts removal after `fn`
+   * settles. ROADMAP write/commit/push/PR run here so the operator `repoDir`
+   * checkout is never branch-switched or committed into (#766).
+   */
+  withThrowawayWorktree<T>(
+    repoDir: string,
+    branch: string,
+    baseRef: string,
+    fn: (worktreeDir: string) => Promise<T>,
+  ): Promise<T>;
   reserveRemoteBranch(repoDir: string, branch: string, sha: string): void;
   gitPushBranch(repoDir: string, branch: string): void;
   gitCommit(repoDir: string, files: string[], message: string): void;
@@ -312,24 +330,82 @@ export function realDecomposeDeps(
       return result.stdout;
     },
     readFile: (p) => fs.readFileSync(p, "utf8"),
-    writeFile: (p, content) => fs.writeFileSync(p, content, "utf8"),
-    gitEnsureClean: (dir) => {
-      const result = spawnSync(
+    writeFile: (p, content) => {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, content, "utf8");
+    },
+    /**
+     * Throwaway detached linked worktree for ROADMAP PR delivery (#766).
+     * Never switches the operator checkout. Safety scope: only the managed
+     * throwaway path under `<repoDir>/.worktrees/` created by this invocation
+     * is force-removed in `finally`.
+     */
+    withThrowawayWorktree: async (operatorRepoDir, branch, baseRef, fn) => {
+      const invocationId = crypto.randomBytes(8).toString("hex");
+      const pathPlan = planRoadmapThrowawayWorktreePath({
+        repoDir: operatorRepoDir,
+        branch,
+        invocationId,
+        pathExists: fs.existsSync(
+          roadmapThrowawayWorktreeDir(operatorRepoDir, branch, invocationId),
+        ),
+      });
+      if (pathPlan.kind === "error") {
+        throw new Error(`[pipeline decompose] ${pathPlan.message}`);
+      }
+      const wtDir = pathPlan.wtDir;
+      fs.mkdirSync(path.dirname(wtDir), { recursive: true });
+
+      const fetch = spawnSync(
         "git",
-        ["status", "--porcelain", "--", "ROADMAP.md"],
-        { encoding: "utf8", stdio: "pipe", cwd: dir },
+        ["fetch", "origin", roadmapBranchFetchRefspec(branch)],
+        { cwd: operatorRepoDir, encoding: "utf8" },
       );
-      if (result.status !== 0) {
+      const localBranchExists =
+        spawnSync("git", ["rev-parse", "--verify", `refs/heads/${branch}`], {
+          cwd: operatorRepoDir,
+          encoding: "utf8",
+        }).status === 0;
+      const plan = planRoadmapThrowawayWorktreeAdd({
+        branch,
+        baseRef,
+        wtDir,
+        fetchStatus: fetch.status ?? 1,
+        fetchStderr: `${fetch.stderr || ""}${fetch.stdout || ""}`,
+        localBranchExists,
+      });
+      if (plan.kind === "error") {
+        throw new Error(`[pipeline decompose] ${plan.message}`);
+      }
+
+      let createdByThisInvocation = false;
+      const add = spawnSync("git", plan.addArgs, {
+        cwd: operatorRepoDir,
+        encoding: "utf8",
+      });
+      if (add.status !== 0) {
         throw new Error(
-          `[pipeline decompose] git status failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+          `[pipeline decompose] git worktree add for branch ${branch} failed: ${add.stderr || add.stdout}`,
         );
       }
-      const dirty = result.stdout.trim();
-      if (dirty) {
-        throw new Error(
-          `[pipeline decompose] ROADMAP.md has uncommitted local changes — stash or commit them before --apply.\n` +
-            `  Dirty: ${dirty}`,
-        );
+      createdByThisInvocation = true;
+
+      try {
+        return await fn(wtDir);
+      } finally {
+        // Safety scope: managed throwaway root only — path created above.
+        if (shouldForceRemoveRoadmapWorktree(createdByThisInvocation)) {
+          const rm = spawnSync(
+            "git",
+            ["worktree", "remove", "--force", wtDir],
+            { cwd: operatorRepoDir, encoding: "utf8" },
+          );
+          if (rm.status !== 0) {
+            process.stderr.write(
+              `[pipeline decompose] failed to remove throwaway worktree ${wtDir}: ${rm.stderr || rm.stdout}\n`,
+            );
+          }
+        }
       }
     },
     reserveRemoteBranch: (dir, branch, sha) => {
@@ -354,18 +430,6 @@ export function realDecomposeDeps(
           `  The branch may already exist, or this checkout's origin push credentials are missing or read-only.`,
       );
     },
-    gitCreateBranch: (dir, branch, fromRef) => {
-      const result = spawnSync("git", ["checkout", "-b", branch, fromRef], {
-        encoding: "utf8",
-        stdio: "pipe",
-        cwd: dir,
-      });
-      if (result.status !== 0) {
-        throw new Error(
-          `[pipeline decompose] git checkout -b ${branch} ${fromRef} failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
-        );
-      }
-    },
     gitCommit: (dir, files, message) => {
       const addResult = spawnSync("git", ["add", "--", ...files], {
         encoding: "utf8",
@@ -389,10 +453,12 @@ export function realDecomposeDeps(
       }
     },
     gitPushBranch: (dir, branch) => {
+      // Detached throwaway HEAD → reserved branch (FF only). Never attach the
+      // worktree to the branch ref so the operator checkout is never moved.
       const result = runConfiguredGitPushSync({
         cwd: dir,
         auth,
-        args: ["push", "origin", branch],
+        args: ["push", "origin", roadmapDayBranchPushRefspec(branch)],
       });
       if (result.code !== 0) {
         throw new Error(
@@ -957,16 +1023,12 @@ export async function runDecompose(
     }
   }
 
-  d.gitEnsureClean(repoDir);
-
-  // Reserve branch before irreversible creates (intake pattern).
+  // Reserve remote branch before irreversible creates (intake pattern). Local
+  // checkout is NOT switched — ROADMAP write/commit/push run in a throwaway
+  // worktree after child creation (#766 review finding 43fc6aeb).
   const branch = `decompose/${opts.epic}-${baseSha.slice(0, 7)}-${d.randomToken()}`;
   d.log(
-    `[pipeline decompose] creating branch ${branch} from base ${baseSha.slice(0, 12)}...`,
-  );
-  d.gitCreateBranch(repoDir, branch, baseSha);
-  d.log(
-    `[pipeline decompose] reserving origin/${branch} (proves push capability) before issue creation...`,
+    `[pipeline decompose] reserving origin/${branch} from base ${baseSha.slice(0, 12)} (proves push capability) before issue creation...`,
   );
   d.reserveRemoteBranch(repoDir, branch, baseSha);
 
@@ -1068,41 +1130,50 @@ export async function runDecompose(
     }
   }
 
-  const roadmapPath = path.join(repoDir, "ROADMAP.md");
   const prTitle = `decompose: ROADMAP for epic #${opts.epic} — ${childNumbers.length} children`;
   const childList = childNumbers
     .map(({ child, number }) => `- #${number} (\`${child.key}\`) — ${child.title}`)
     .join("\n");
   try {
-    d.writeFile(roadmapPath, mutated);
-    d.log(`[pipeline decompose] wrote ROADMAP.md`);
-    const commitMsg =
-      `docs: ROADMAP — decompose epic #${opts.epic}\n\n` +
-      `Issue: #766\nPipeline-Run: 766/2026-08-11T22:06:15Z`;
-    d.gitCommit(repoDir, ["ROADMAP.md"], commitMsg);
-    d.gitPushBranch(repoDir, branch);
-    const prBody = [
-      `## ROADMAP update: epic #${opts.epic}`,
-      "",
-      `**Parent epic:** #${opts.epic} — ${epic.title}`,
-      version ? `**Release:** v${version}` : "**Release:** (unpinned)",
-      "",
-      "### Children",
-      "",
-      childList,
-      "",
-      "---",
-      "",
-      "This PR was opened by `pipeline decompose`. Review the roadmap placement and merge when satisfied.",
-      "",
-      "_The advance path never merges. Integration requires an operator-authorized merge surface._",
-    ].join("\n");
-    const prUrl = await d.createPR(
+    // Isolation: write/commit/push/PR only inside throwaway worktree — never
+    // mutate operator primary checkout (#766).
+    const prUrl = await d.withThrowawayWorktree(
       repoDir,
-      prTitle,
-      prBody,
-      cfg.base_branch,
       branch,
+      baseSha,
+      async (worktreeDir) => {
+        const roadmapPath = path.join(worktreeDir, "ROADMAP.md");
+        d.writeFile(roadmapPath, mutated);
+        d.log(`[pipeline decompose] wrote ROADMAP.md in throwaway worktree`);
+        const commitMsg =
+          `docs: ROADMAP — decompose epic #${opts.epic}\n\n` +
+          `Issue: #766\nPipeline-Run: 766/2026-08-11T22:06:15Z`;
+        d.gitCommit(worktreeDir, ["ROADMAP.md"], commitMsg);
+        d.gitPushBranch(worktreeDir, branch);
+        const prBody = [
+          `## ROADMAP update: epic #${opts.epic}`,
+          "",
+          `**Parent epic:** #${opts.epic} — ${epic.title}`,
+          version ? `**Release:** v${version}` : "**Release:** (unpinned)",
+          "",
+          "### Children",
+          "",
+          childList,
+          "",
+          "---",
+          "",
+          "This PR was opened by `pipeline decompose`. Review the roadmap placement and merge when satisfied.",
+          "",
+          "_The advance path never merges. Integration requires an operator-authorized merge surface._",
+        ].join("\n");
+        return d.createPR(
+          worktreeDir,
+          prTitle,
+          prBody,
+          cfg.base_branch,
+          branch,
+        );
+      },
     );
     d.log(`[pipeline decompose] roadmap PR opened: ${prUrl}`);
     d.log(
@@ -1115,8 +1186,10 @@ export async function runDecompose(
     d.log(
       `\n[pipeline decompose] ERROR: children may have been created and branch ${branch} reserved, but the roadmap PR step failed.\n` +
         `  Recovery — finish the roadmap PR manually from the reserved branch:\n` +
-        `    git add ROADMAP.md && git commit -m "docs: ROADMAP — decompose epic #${opts.epic}"\n` +
-        `    git push origin ${branch}\n` +
+        `    git worktree add --detach /tmp/decompose-roadmap-fix ${baseSha}\n` +
+        `    # write ROADMAP.md, then:\n` +
+        `    git -C /tmp/decompose-roadmap-fix add ROADMAP.md && git -C /tmp/decompose-roadmap-fix commit -m "docs: ROADMAP — decompose epic #${opts.epic}"\n` +
+        `    git -C /tmp/decompose-roadmap-fix push origin HEAD:refs/heads/${branch}\n` +
         `    gh pr create --title "${prTitle}" --base ${cfg.base_branch} --head ${branch}`,
     );
     throw err;
