@@ -426,12 +426,70 @@ LOG_FILE="$RUN_DIR/playbook.log"
 PID_FILE="$RUN_DIR/playbook.pid"
 lock_dir="$RUN_DIR/lock"
 
+# Extract a concise, operator-useful failure reason for a ship phase from its
+# captured output. Returns an empty string when no meaningful reason is found
+# (the caller then keeps its own terse detail). Reads per-phase capture files
+# written earlier in the run: the train blocker sidecar, the phase's *.err /
+# *.json / *.out captures, or the phase's stderr log.
+failure_detail() {
+  local phase=$1
+  local f reason
+  case "$phase" in
+    train)
+      # Blocker sidecar is authoritative for train failures.
+      if [[ -s "$RUN_DIR/train.json.blocker" ]]; then
+        cat "$RUN_DIR/train.json.blocker" 2>/dev/null | head -c 300; return
+      fi
+      f="$RUN_DIR/train.stderr"
+      ;;
+    release-prepare) f="$RUN_DIR/release-prepare.err" ;;
+    release-finish)  f="$RUN_DIR/release-finish.err" ;;
+    wait-release)    f="$RUN_DIR/gh-release.err" ;;
+    engine-promote)  f="$RUN_DIR/engine-promote.err" ;;
+    precheck)        f="" ;;
+    *)               f="$RUN_DIR/$phase.err" ;;
+  esac
+  # Extract the most specific failure line from the capture: prefer a line
+  # mentioning error/fail/block/refus/denied/pending/not green; else last line.
+  if [[ -s "$f" ]]; then
+    reason=$(grep -iE 'error|fail|block|refus|denied|pending|not green|invalid|missing|cannot|could not|exit [1-9]' "$f" 2>/dev/null | grep -viE '^\s*-' | tail -1)
+    if [[ -z "$reason" ]]; then
+      reason=$(grep -iE 'error|fail|block|refus|denied|pending|not green|invalid|missing|cannot|could not|exit [1-9]' "$f" 2>/dev/null | tail -1)
+    fi
+    if [[ -z "$reason" ]]; then
+      reason=$(tail -1 "$f" 2>/dev/null)
+    fi
+    # A single-line reason is enough for a Buzz post; strip leading noise.
+    echo "$reason" | sed 's/^\[pipeline[^]]*\] *//' | head -c 400
+    return
+  fi
+  # Fallback: last error-ish line of the playbook log for this phase.
+  if [[ -s "$LOG_FILE" ]]; then
+    reason=$(grep -iE '\[pipeline[^]]*\] .*(error|fail|block|refus|denied|not green|exit [1-9])' "$LOG_FILE" 2>/dev/null | tail -1)
+    [[ -n "$reason" ]] && echo "$reason" | sed 's/^\[[0-9TZ:-]*\] *//' | head -c 400
+  fi
+}
+
 write_state() {
   local phase=$1 status=$2
   local detail=${3:-}
   local now
   now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   mkdir -p "$RUN_DIR"
+  # On failure, enrich the posted detail with the actual reason pulled from the
+  # phase's captured output (blocker file, *.err, *.json) so Buzz operators do
+  # not have to open the log to learn what failed.
+  if [[ "$status" == "failed" && -n "$phase" ]]; then
+    local reason
+    reason=$(failure_detail "$phase")
+    if [[ -n "$reason" ]]; then
+      if [[ -n "$detail" ]]; then
+        detail="${detail}; ${reason}"
+      else
+        detail="$reason"
+      fi
+    fi
+  fi
   cat > "$STATE_FILE" <<JSON
 {
   "schema_version": 1,
