@@ -69,7 +69,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `release`
 
 - **Usage:** `pipeline release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | release finish <pr> [--json]`
-- **Summary:** Prepare a release PR (version) or finish-merge one (finish <pr>); never tags or publishes (workflows do)
+- **Summary:** Prepare a release PR (version) or finish-merge one (finish <pr>); never tags or publishes (workflows do; auto-tag also refreshes tag-derived CHANGELOG)
 
 #### `remove-worktree`
 

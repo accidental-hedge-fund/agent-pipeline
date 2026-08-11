@@ -1435,6 +1435,11 @@ export function insertDetailSectionBullet(
  * helpers `patchIntroLine` / `prependShippedBlock` remain exported for
  * regression tests and one-off recovery, but are no longer called here.
  *
+ * Tag-derived CHANGELOG for the version being released is **not** written at
+ * prepare time: the annotated `vX.Y.Z` tag does not exist until after merge.
+ * Post-tag refresh is owned by auto-tag-release.yml via
+ * `scripts/release-docs-refresh.mjs` / `release-docs-refresh.ts` (#978).
+ *
  * Throws with a named-anchor error on the first missing site (or plan-row
  * remediation when insert is impossible).
  * The optional `warn` callback is forwarded to stampPerIssueTable for
@@ -1455,8 +1460,10 @@ export function scaffoldRoadmap(
     issues: planIssues,
     why: planRowScaffoldWhy(ctx.version),
   });
-  // #597: do not call patchIntroLine / prependShippedBlock — CHANGELOG.md is
-  // the history surface; ROADMAP keeps only forward plan + compact ✅ markers.
+  // #597 / #978: do not call patchIntroLine / prependShippedBlock — CHANGELOG.md
+  // is generator-owned from git tags; the shipped ## [X.Y.Z] section is written
+  // by post-tag docs refresh (auto-tag), not prepare. ROADMAP keeps only
+  // forward plan + compact ✅ markers.
   text = patchReleasePlanRow(text, ctx);
   text = stampPerIssueTable(text, ctx, warn);
   return text;

@@ -149,7 +149,7 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   release: {
     summary:
-      "Prepare a release PR (version) or finish-merge one (finish <pr>); never tags or publishes (workflows do)",
+      "Prepare a release PR (version) or finish-merge one (finish <pr>); never tags or publishes (workflows do; auto-tag also refreshes tag-derived CHANGELOG)",
     usage:
       'release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | release finish <pr> [--json]',
     documented: true,

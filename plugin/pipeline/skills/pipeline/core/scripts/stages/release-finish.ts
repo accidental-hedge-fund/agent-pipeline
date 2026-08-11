@@ -4,12 +4,19 @@
 // and check gates. Does NOT create tags or GitHub Releases — those remain the
 // existing auto-tag-release + release workflows after the merge lands on base.
 //
+// After a successful merge, finish MAY best-effort observe the annotated tag
+// and invoke the shared post-tag docs refresh helper (#978) when the local
+// environment can write the default branch. Heal failure does not unmerge the
+// PR; it surfaces a clear retry message. Primary CHANGELOG refresh remains the
+// auto-tag workflow path.
+//
 // Loop-isolated: never called from advance stage dispatch. Distinct from
 // `pipeline merge` (issue PRs at ready-to-deploy) because release PRs have no
 // pipeline stage label and correctly fail the issue-stage gate.
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import type { ReleaseDocsRefreshResult } from "../release-docs-refresh.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -28,6 +35,17 @@ export interface ReleaseFinishDeps {
   ghPrChecksAll(pr: number): Promise<ReleaseFinishCheck[]>;
   /** Squash-merge with exact head binding (same as issue merge surface). */
   ghPrMerge(pr: number, headRefOid: string): Promise<void>;
+  /**
+   * Optional post-tag docs heal (#978). When provided, finish may call this
+   * after a successful merge (or already-merged observation) once the version
+   * tag is visible. Must not create tags. Injectable for tests.
+   */
+  refreshPostTagDocs?: (version: string) => Promise<ReleaseDocsRefreshResult>;
+  /**
+   * Optional wait/observe for annotated tag `vX.Y.Z` after merge.
+   * Return true when the tag is visible and heal may run.
+   */
+  waitForReleaseTag?: (version: string) => Promise<boolean>;
 }
 
 export interface ReleaseFinishResult {
@@ -37,6 +55,8 @@ export interface ReleaseFinishResult {
   headRefOid: string;
   mergeCommitOid: string | null;
   alreadyMerged: boolean;
+  /** Present when optional post-tag docs heal ran (or attempted). */
+  docsRefresh?: ReleaseDocsRefreshResult | { skipped: true; reason: string };
 }
 
 /** Identity emitted by release prepare and required by automated finalizers. */
@@ -113,8 +133,58 @@ function checkStatusChecks(checks: ReleaseFinishCheck[]): string | null {
 }
 
 /**
+ * Optional post-tag docs heal after merge. Never creates tags; never unmerges.
+ * When the auto-tag path already committed an identical tree, refresh is a no-op.
+ */
+async function maybeHealPostTagDocs(
+  version: string,
+  deps: ReleaseFinishDeps,
+): Promise<ReleaseFinishResult["docsRefresh"]> {
+  if (!deps.refreshPostTagDocs) {
+    return { skipped: true, reason: "no refresh dep configured" };
+  }
+  if (deps.waitForReleaseTag) {
+    deps.log(
+      `[pipeline release finish] v${version}: waiting for annotated tag before optional docs heal…`,
+    );
+    const present = await deps.waitForReleaseTag(version);
+    if (!present) {
+      deps.log(
+        `[pipeline release finish] v${version}: tag not visible yet — ` +
+          `skipping local docs heal (auto-tag-release owns primary CHANGELOG refresh).`,
+      );
+      return { skipped: true, reason: "tag not visible yet" };
+    }
+  }
+  deps.log(
+    `[pipeline release finish] v${version}: optional post-tag docs refresh (idempotent if already fresh)…`,
+  );
+  const result = await deps.refreshPostTagDocs(version);
+  if (!result.ok) {
+    // Merge already succeeded — do not imply unmerge. Surface a retryable heal error.
+    throw new Error(
+      `Release PR merge succeeded for v${version}, but post-tag docs refresh failed. ` +
+        `The version tag was not deleted. Heal with:\n` +
+        `  node scripts/release-docs-refresh.mjs --version ${version} --push\n` +
+        `or wait for auto-tag-release's regenerate step. Detail:\n${result.error}`,
+    );
+  }
+  if (result.committed) {
+    deps.log(
+      `[pipeline release finish] v${version}: docs refresh committed ${result.commitMessage}`,
+    );
+  } else {
+    deps.log(
+      `[pipeline release finish] v${version}: docs already fresh after tag — no commit`,
+    );
+  }
+  return result;
+}
+
+/**
  * Finish a prepared release PR: validate release title + gates, merge exact head.
- * Does not tag or publish.
+ * Does not tag or publish. May optionally heal tag-derived CHANGELOG after tag
+ * observation (#978) without owning tag creation.
  */
 export async function finishReleasePr(
   pr: number,
@@ -168,6 +238,7 @@ export async function finishReleasePr(
 
   if (alreadyMerged) {
     deps.log(`[pipeline release finish] #${pr}: already merged — idempotent success`);
+    const docsRefresh = await maybeHealPostTagDocs(parsed.version, deps);
     return {
       pr,
       version: parsed.version,
@@ -175,6 +246,7 @@ export async function finishReleasePr(
       headRefOid,
       mergeCommitOid: mergeCommit?.oid ?? null,
       alreadyMerged: true,
+      docsRefresh,
     };
   }
 
@@ -278,8 +350,11 @@ export async function finishReleasePr(
 
   deps.log(
     `[pipeline release finish] #${pr}: merged v${parsed.version}. ` +
-      `Tag/publish remain auto-tag-release + release workflows — this command does not tag.`,
+      `Tag/publish remain auto-tag-release + release workflows — this command does not tag. ` +
+      `Tag-derived CHANGELOG refresh is automatic after auto-tag (#978).`,
   );
+
+  const docsRefresh = await maybeHealPostTagDocs(parsed.version, deps);
 
   return {
     pr,
@@ -288,6 +363,7 @@ export async function finishReleasePr(
     headRefOid,
     mergeCommitOid: afterMerge?.oid ?? null,
     alreadyMerged: false,
+    docsRefresh,
   };
 }
 
@@ -297,6 +373,16 @@ function withRepo(repo: string, args: string[]): string[] {
   return args;
 }
 
+/**
+ * Production deps for merge-only finish. Tag/publish remain workflows.
+ *
+ * Post-tag CHANGELOG refresh (#978) is **not** wired here by default: the
+ * primary writer is auto-tag-release.yml on the default-branch checkout. Local
+ * operator heal (when the workflow step failed) uses the shared helper:
+ *   `node scripts/release-docs-refresh.mjs --version X.Y.Z --push`
+ * Callers that intentionally heal after finish may inject `waitForReleaseTag`
+ * + `refreshPostTagDocs` (see unit tests).
+ */
 export function realReleaseFinishDeps(repo: string, cwd?: string): ReleaseFinishDeps {
   const runOpts = { timeout: 30_000, maxBuffer: 50 * 1024 * 1024, ...(cwd ? { cwd } : {}) };
   return {
