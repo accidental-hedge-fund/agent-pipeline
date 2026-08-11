@@ -60,7 +60,7 @@ Supervisors SHOULD parse operator text into one of these intents. Prefer
 | Stop | `stop` | stop the host process / systemd unit running train; do not invent force-merge cleanup |
 | Release prepare | `release prepare 1.34.0` | `pipeline release 1.34.0 --no-edit` (opens PR; no merge/tag) |
 | Release finish | `release finish 123` | `pipeline release finish 123` (merge release PR only; workflows tag) |
-| Engine promote | `engine-promote 1.34.0` | `pipeline engine-promote --for 1.34.0` (pin + install after published Release) |
+| Engine promote | `engine-promote 1.34.0` | `pipeline engine-promote --for 1.34.0` (pin + install to **all** hosts by default after published Release; `--host <name>` to scope) |
 
 **Merge is opt-in.** Never default `--merge` from a vague “run the milestone”
 unless the deployment policy explicitly allows it for that channel and operator.

@@ -6,17 +6,20 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  DEFAULT_ENGINE_PROMOTE_HOST,
   installArgsForTag,
   installCommandForTag,
   runEnginePromote,
   startingLockPidFromEnv,
   tagForVersion,
   type EnginePromoteDeps,
+  type EnginePromoteHost,
   type EnginePromoteOpts,
 } from "../scripts/stages/engine-promote.ts";
 import type { ProductionEnginePin, PromotePinResult } from "../scripts/production-engine-pin.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(__dirname, "../..");
 
 function pin(v: string, prev?: string): ProductionEnginePin {
   const p: ProductionEnginePin = {
@@ -40,10 +43,12 @@ function pin(v: string, prev?: string): ProductionEnginePin {
 
 function makeDeps(over: Partial<EnginePromoteDeps> = {}): EnginePromoteDeps & {
   installs: string[];
+  installHosts: EnginePromoteHost[];
   promotes: number;
   rollbacks: number;
 } {
   const installs: string[] = [];
+  const installHosts: EnginePromoteHost[] = [];
   let promotes = 0;
   let rollbacks = 0;
   let current: ProductionEnginePin | null = pin("1.31.1");
@@ -69,9 +74,10 @@ function makeDeps(over: Partial<EnginePromoteDeps> = {}): EnginePromoteDeps & {
       if (!current) return { kind: "missing", path: "/pin.json" };
       return { kind: "ok", pin: current, path: "/pin.json" };
     },
-    async installFromTag(tag) {
+    async installFromTag(tag, host) {
       installs.push(tag);
-      return { command: installCommandForTag(tag, "codex"), stdout: "ok" };
+      installHosts.push(host);
+      return { command: installCommandForTag(tag, host), stdout: "ok" };
     },
     async installedVersion() {
       const last = installs[installs.length - 1];
@@ -81,6 +87,7 @@ function makeDeps(over: Partial<EnginePromoteDeps> = {}): EnginePromoteDeps & {
   };
   return Object.assign(base, {
     installs,
+    installHosts,
     get promotes() {
       return promotes;
     },
@@ -101,6 +108,55 @@ test("tagForVersion and installCommandForTag", () => {
   assert.equal(tagForVersion("1.2.3"), "v1.2.3");
   assert.equal(tagForVersion("v1.2.3"), "v1.2.3");
   assert.match(installCommandForTag("v1.2.3", "codex"), /#v1\.2\.3 install --host codex/);
+  assert.match(installCommandForTag("v1.2.3", "all"), /#v1\.2\.3 install --host all/);
+  assert.equal(DEFAULT_ENGINE_PROMOTE_HOST, "all");
+});
+
+test("engine-promote: omitted host defaults to all (not silent codex) (#989)", async () => {
+  const deps = makeDeps();
+  const result = await runEnginePromote(
+    { version: "1.34.0", repoDir: "/repo", dryRun: true },
+    deps,
+  );
+  assert.equal(result.error, undefined);
+  assert.match(result.install_command, /--host all\b/);
+  assert.doesNotMatch(result.install_command, /--host codex\b/);
+  assert.ok(result.steps.some((s) => s.includes("would_install:") && s.includes("--host all")));
+});
+
+test("engine-promote: explicit single-host override is preserved (#989)", async () => {
+  const deps = makeDeps();
+  const result = await runEnginePromote(opts({ host: "claude" }), deps);
+  assert.equal(result.error, undefined);
+  assert.match(result.install_command, /--host claude\b/);
+  assert.doesNotMatch(result.install_command, /--host all\b/);
+  assert.deepEqual(deps.installHosts, ["claude"]);
+});
+
+test("engine-promote: explicit --host codex stays scoped (#989)", async () => {
+  const deps = makeDeps();
+  const result = await runEnginePromote(opts({ host: "codex", dryRun: true }), deps);
+  assert.match(result.install_command, /--host codex\b/);
+  assert.doesNotMatch(result.install_command, /--host all\b/);
+});
+
+test("ship playbook: ENGINE_PROMOTE_HOST defaults to all and passes --host (#989)", () => {
+  const playbook = path.join(
+    repoRoot,
+    "examples/supervisor/shell/pipeline-ship-playbook.sh",
+  );
+  assert.ok(fs.existsSync(playbook), "missing pipeline-ship-playbook.sh");
+  const body = fs.readFileSync(playbook, "utf8");
+  // Unset default must be all — fail if someone restores codex-only ship default.
+  assert.match(body, /HOST="\$\{ENGINE_PROMOTE_HOST:-all\}"/);
+  assert.doesNotMatch(body, /HOST="\$\{ENGINE_PROMOTE_HOST:-codex\}"/);
+  // Header documents default all and valid values including single hosts.
+  assert.match(body, /ENGINE_PROMOTE_HOST\s+codex\|claude\|grok\|opencode\|all \(default all\)/);
+  // Promote always passes explicit --host (no silent omission).
+  assert.match(
+    body,
+    /engine-promote --for "\$version" --host "\$HOST" --skip-frg --json/,
+  );
 });
 
 test("engine-promote: nested installer exempts only the launcher reservation passed by the shim", () => {
