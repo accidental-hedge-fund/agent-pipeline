@@ -466,6 +466,17 @@ export async function advance(
   // ---- Head-bound entry gates (#816): once per head SHA per polling session ----
   // Memo hit skips only review-SHA gate, OpenSpec archive, and active-change guard.
   // Early-conflict and Step 1 CI always run (base can move without head change).
+  // Any observed head movement invalidates the memo immediately so a later
+  // force-push/revert back to a prior proceed SHA cannot reuse a stale hit
+  // after an intervening non-proceed head (review finding 9a76bc08).
+  if (
+    pollingCtx &&
+    typeof pollingCtx.entryGatesPassedForSha === "string" &&
+    pollingCtx.entryGatesPassedForSha.length > 0 &&
+    pollingCtx.entryGatesPassedForSha !== prDetail.head_sha
+  ) {
+    delete pollingCtx.entryGatesPassedForSha;
+  }
   const entryGatesMemoHit =
     !!pollingCtx &&
     typeof pollingCtx.entryGatesPassedForSha === "string" &&

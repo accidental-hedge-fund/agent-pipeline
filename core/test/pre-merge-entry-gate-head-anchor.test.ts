@@ -339,6 +339,63 @@ test("#816 head invalidation: H1 memo then H2 re-runs head-bound entry gates", a
 });
 
 // ---------------------------------------------------------------------------
+// 3.2b Revert-to-prior-SHA: H1 proceed → H2 non-proceed → H1 re-runs stack
+// Stale memo must not survive the intervening head movement (9a76bc08).
+// ---------------------------------------------------------------------------
+
+test("#816 head invalidation: H1 proceed → H2 non-proceed → H1 re-runs all head-bound gates", async (t) => {
+  const headSha = { current: SHA_H1 };
+  // Force active-change guard only while observing H2 (non-proceed).
+  let forceGuard = false;
+  const { deps, rec } = makeHarness({ headSha, checksBucket: "pending" });
+  deps.listPrHeadChangeDirs = async () => {
+    rec.listPrHeadChangeDirs++;
+    return forceGuard ? ["still-active-change"] : [];
+  };
+
+  const pollingCtx: PreMergePollingContext = {};
+  const cfg = makeCfg();
+
+  await quiet(t, async () => {
+    // Tick 1: H1 clean proceed into CI → memo = H1.
+    const o1 = await runTick(cfg, deps, rec, pollingCtx);
+    assert.equal(o1.reason, "CI still running");
+    assert.equal(pollingCtx.entryGatesPassedForSha, SHA_H1);
+
+    // Tick 2: head moves to H2; entry gate blocks (non-proceed).
+    // Memo must be cleared on mismatch — not retained as H1.
+    headSha.current = SHA_H2;
+    forceGuard = true;
+    const o2 = await runTick(cfg, deps, rec, pollingCtx);
+    assert.notEqual(o2.reason, "CI still running");
+    assert.equal(o2.status, "blocked");
+    assert.equal(
+      pollingCtx.entryGatesPassedForSha,
+      undefined,
+      "H2 non-proceed must not leave a prior H1 proceed memo after head movement",
+    );
+
+    // Tick 3: force-push/revert back to H1. Stale H1 memo would skip gates;
+    // invalidation on mismatch requires a full re-run.
+    headSha.current = SHA_H1;
+    forceGuard = false;
+    const o3 = await runTick(cfg, deps, rec, pollingCtx);
+    assert.equal(o3.reason, "CI still running");
+    assert.equal(pollingCtx.entryGatesPassedForSha, SHA_H1);
+  });
+
+  const tick3 = rec.ticks[2]!;
+  assert.ok(
+    tick3.getIssueDetail >= 1,
+    "final H1 tick after H2 intervening must re-run SHA gate (not stale memo hit)",
+  );
+  assert.ok(
+    tick3.listPrHeadChangeDirs >= 1,
+    "final H1 tick after H2 intervening must re-run archive/active-change listing",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // 3.3 Non-proceed does not set memo
 // ---------------------------------------------------------------------------
 

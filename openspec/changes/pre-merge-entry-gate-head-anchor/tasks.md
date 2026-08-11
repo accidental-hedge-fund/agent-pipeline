@@ -19,6 +19,7 @@
 
 - [x] 3.1 Multi-tick pending-CI test (shared `pollingCtx`, stub `getPrChecks` pending ≥10 ticks, unchanged open head): head-bound entry-gate deps run on first proceed only; later ticks stay at CI-path reads (PR detail + checks)
 - [x] 3.2 Head-invalidation regression: memo for H1, then head H2 → full head-bound stack re-runs; structure so removing the SHA equality check fails the test
+- [x] 3.2b Revert-to-prior-SHA regression: H1 proceed → H2 non-proceed clears memo → H1 again re-runs full head-bound stack (no stale memo hit)
 - [x] 3.3 Non-proceed test: forced non-null SHA-gate / archive / guard / early-conflict recovery does not set `entryGatesPassedForSha`; next same-head tick still runs the stack
 - [x] 3.4 Unchanged head + base-driven DIRTY / `mergeable === false` still takes conflict recovery (memo hit does not skip early-conflict)
 - [x] 3.5 Archive-induced head movement in one pass records post-archive SHA on `entryGatesPassedForSha`

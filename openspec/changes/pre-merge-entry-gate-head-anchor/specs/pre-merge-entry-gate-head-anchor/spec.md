@@ -75,7 +75,7 @@ The pipeline SHALL set `entryGatesPassedForSha` only when the full head-bound en
 #### Scenario: Blocking or waiting entry-gate outcome does not set the memo
 
 - **WHEN** the review-SHA gate, OpenSpec archive, or active-change guard returns a non-null outcome that ends the current `advance` call
-- **THEN** `entryGatesPassedForSha` SHALL remain unset for that head (or retain only a prior proceed for a different head)
+- **THEN** `entryGatesPassedForSha` SHALL remain unset for that head (any prior memo for a different head SHALL already have been cleared when this head was first observed)
 - **AND** the next `advance` in the same session with the same head SHALL re-run the head-bound entry-gate stack
 
 #### Scenario: Early-conflict recovery return does not set the memo
@@ -95,14 +95,23 @@ The pipeline SHALL set `entryGatesPassedForSha` only when the full head-bound en
 
 ### Requirement: Any head movement SHALL invalidate the entry-gate memo
 
-The pipeline SHALL treat any change of the PR head SHA as memo invalidation. Developer pushes, fix commits, auto-fix commits, archive commits, rebases, and any other head movement SHALL cause a full re-run of the head-bound entry-gate stack on the next `advance` that observes the new head. Equality of head SHA is the sole positive skip condition for those gates; the pipeline SHALL NOT skip them based on wall-clock, tick count, or CI pending state alone.
+The pipeline SHALL treat any change of the PR head SHA as memo invalidation. When a tick observes a current head SHA that differs from a populated `entryGatesPassedForSha`, the pipeline SHALL clear that field before evaluating the memo hit. Developer pushes, fix commits, auto-fix commits, archive commits, rebases, force-pushes, reverts to a prior SHA, and any other head movement SHALL cause a full re-run of the head-bound entry-gate stack on the next `advance` that observes the new (or restored) head. Equality of head SHA is the sole positive skip condition for those gates; the pipeline SHALL NOT skip them based on wall-clock, tick count, or CI pending state alone, and SHALL NOT reuse a prior proceed memo after an intervening different head.
 
 #### Scenario: Head SHA change re-runs every head-bound entry gate
 
 - **WHEN** `entryGatesPassedForSha` is set to head H1
 - **AND** a later tick observes PR head SHA H2 where H2 ≠ H1
-- **THEN** the pipeline SHALL run the full head-bound entry-gate stack for H2
+- **THEN** the pipeline SHALL clear `entryGatesPassedForSha` before the memo hit check
+- **AND** SHALL run the full head-bound entry-gate stack for H2
 - **AND** SHALL NOT skip those gates solely because a memo exists for H1
+
+#### Scenario: Revert to a prior proceed SHA re-runs entry gates after intervening head
+
+- **WHEN** a polling session records a clean proceed memo for head H1
+- **AND** a later tick observes head H2 where H2 ≠ H1 and that tick does not cleanly proceed (memo remains unset)
+- **AND** a subsequent tick observes head H1 again (force-push/revert or equivalent)
+- **THEN** the pipeline SHALL run the full head-bound entry-gate stack for H1 on that final tick
+- **AND** SHALL NOT treat the earlier H1 proceed memo as still valid after the intervening head movement
 
 #### Scenario: Invalidation regression fails if head check is removed
 
